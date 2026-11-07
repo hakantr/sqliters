@@ -1038,6 +1038,15 @@ impl<'a> Parser<'a> {
                 let v = parse_int_literal(tok.text)?.unwrap_or(0) * neg;
                 Ok(PragmaValue::Integer(v))
             }
+            TokenKind::Float => {
+                self.advance();
+                let s = if neg < 0 {
+                    format!("-{}", tok.text)
+                } else {
+                    tok.text.to_owned()
+                };
+                Ok(PragmaValue::String(s))
+            }
             TokenKind::StringLiteral => {
                 self.advance();
                 Ok(PragmaValue::String(dequote(tok.text)))
@@ -1053,6 +1062,18 @@ impl<'a> Parser<'a> {
             TokenKind::On => {
                 self.advance();
                 Ok(PragmaValue::Ident("ON".into()))
+            }
+            TokenKind::Delete => {
+                self.advance();
+                Ok(PragmaValue::Ident("DELETE".into()))
+            }
+            TokenKind::Default => {
+                self.advance();
+                Ok(PragmaValue::Ident("DEFAULT".into()))
+            }
+            TokenKind::Null => {
+                self.advance();
+                Ok(PragmaValue::Ident("NULL".into()))
             }
             k if Self::can_be_ident(k) => Ok(PragmaValue::Ident(self.parse_ident()?)),
             _ => Err(self.syntax_err_at(tok, "invalid PRAGMA value")),

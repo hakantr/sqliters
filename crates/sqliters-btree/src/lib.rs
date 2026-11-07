@@ -15,8 +15,10 @@ use sqliters_types::{
 use sqliters_vfs::{OpenFlags, Vfs};
 
 pub use page::{
-    BtreePageType, IndexInteriorCell, IndexLeafCell, ParsedPage, PayloadBounds, TableInteriorCell,
-    TableLeafCell,
+    BtreePageType, IndexInteriorCell, IndexLeafCell, ParsedPage, PayloadBounds,
+    RawLeafDeleteOutcome, TableInteriorCell, TableLeafCell, find_table_interior_child,
+    last_table_leaf_rowid, peek_page_type, seek_table_leaf_cell, table_interior_right_child,
+    try_delete_table_leaf_in_place, try_insert_table_leaf_in_place,
 };
 
 /// SQLite B-Tree storage manager over a [`Pager`].
@@ -434,38 +436,38 @@ impl Btree {
         if self.pager.page_count() == 0 {
             return Ok(None);
         }
+        let usable = self.pager.usable_size();
         let mut cur_pgno = root_pgno;
         loop {
-            let parsed = self.read_parsed_page(cur_pgno)?;
-            match parsed {
-                ParsedPage::TableLeaf { cells } => {
-                    return match cells.binary_search_by_key(&rowid, |c| c.rowid) {
-                        Ok(idx) => {
-                            let c = &cells[idx];
-                            let full = self.read_full_payload(
-                                c.total_payload_len,
-                                &c.local_payload,
-                                c.overflow_page,
-                            )?;
-                            Ok(Some(full))
+            let hit_or_next = {
+                let raw = self.pager.read_page(cur_pgno)?;
+                match peek_page_type(cur_pgno, usable, raw)? {
+                    BtreePageType::TableLeaf => {
+                        match seek_table_leaf_cell(cur_pgno, usable, raw, rowid)? {
+                            Some(cell_hit) => Ok(Some(cell_hit)),
+                            None => return Ok(None),
                         }
-                        Err(_) => Ok(None),
-                    };
+                    }
+                    BtreePageType::TableInterior => {
+                        let (_, next_pgno) =
+                            find_table_interior_child(cur_pgno, usable, raw, rowid)?;
+                        Err(next_pgno)
+                    }
+                    _ => {
+                        return Err(SqliteError::corrupt(format!(
+                            "expected table page at {cur_pgno}"
+                        )));
+                    }
                 }
-                ParsedPage::TableInterior { cells, right_child } => {
-                    // Find first cell with key >= rowid
-                    let idx = cells.partition_point(|c| c.key < rowid);
-                    cur_pgno = if idx < cells.len() {
-                        cells[idx].left_child
-                    } else {
-                        right_child
-                    };
+            };
+            match hit_or_next {
+                Ok(Some((total_payload_len, local_payload, overflow_page))) => {
+                    let full =
+                        self.read_full_payload(total_payload_len, &local_payload, overflow_page)?;
+                    return Ok(Some(full));
                 }
-                _ => {
-                    return Err(SqliteError::corrupt(format!(
-                        "expected table page at {cur_pgno}"
-                    )));
-                }
+                Ok(None) => return Ok(None),
+                Err(next_pgno) => cur_pgno = next_pgno,
             }
         }
     }
@@ -475,12 +477,15 @@ impl Btree {
         if self.pager.page_count() == 0 {
             return Ok(None);
         }
+        let usable = self.pager.usable_size();
         let mut cur_pgno = root_pgno;
         loop {
-            let parsed = self.read_parsed_page(cur_pgno)?;
-            match parsed {
-                ParsedPage::TableLeaf { cells } => return Ok(cells.last().map(|c| c.rowid)),
-                ParsedPage::TableInterior { right_child, .. } => cur_pgno = right_child,
+            let raw = self.pager.read_page(cur_pgno)?;
+            match peek_page_type(cur_pgno, usable, raw)? {
+                BtreePageType::TableLeaf => return last_table_leaf_rowid(cur_pgno, usable, raw),
+                BtreePageType::TableInterior => {
+                    cur_pgno = table_interior_right_child(cur_pgno, usable, raw)?;
+                }
                 _ => return Err(SqliteError::corrupt("expected table page in max_table_rowid")),
             }
         }
@@ -547,8 +552,87 @@ impl Btree {
         cell: TableLeafCell,
     ) -> Result<Option<(i64, Pgno)>> {
         let usable = self.pager.usable_size();
-        let parsed = self.read_parsed_page(pgno)?;
+        let ptype = {
+            let raw = self.pager.read_page(pgno)?;
+            peek_page_type(pgno, usable, raw)?
+        };
 
+        if ptype == BtreePageType::TableInterior {
+            let (idx, target_child) = {
+                let raw = self.pager.read_page(pgno)?;
+                find_table_interior_child(pgno, usable, raw, cell.rowid)?
+            };
+            let Some((div_key, new_right_child)) = self.insert_table_rec(target_child, cell)?
+            else {
+                return Ok(None);
+            };
+
+            let ParsedPage::TableInterior {
+                mut cells,
+                mut right_child,
+            } = self.read_parsed_page(pgno)?
+            else {
+                return Err(SqliteError::corrupt("expected table interior page"));
+            };
+
+            if idx < cells.len() {
+                cells[idx].left_child = new_right_child;
+                cells.insert(
+                    idx,
+                    TableInteriorCell {
+                        left_child: target_child,
+                        key: div_key,
+                    },
+                );
+            } else {
+                cells.push(TableInteriorCell {
+                    left_child: target_child,
+                    key: div_key,
+                });
+                right_child = new_right_child;
+            }
+
+            let candidate = ParsedPage::TableInterior { cells, right_child };
+            if candidate.fits_in_page(pgno, usable) {
+                self.write_parsed_page(pgno, &candidate)?;
+                return Ok(None);
+            }
+
+            let ParsedPage::TableInterior {
+                mut cells,
+                right_child: orig_right,
+            } = candidate
+            else {
+                unreachable!()
+            };
+            let mid = cells.len() / 2;
+            let right_cells = cells.split_off(mid + 1);
+            let promoted = cells.pop().expect("mid exists");
+
+            let left_page = ParsedPage::TableInterior {
+                cells,
+                right_child: promoted.left_child,
+            };
+            let right_page = ParsedPage::TableInterior {
+                cells: right_cells,
+                right_child: orig_right,
+            };
+
+            let right_pgno = self.allocate_page()?;
+            self.write_parsed_page(pgno, &left_page)?;
+            self.write_parsed_page(right_pgno, &right_page)?;
+            return Ok(Some((promoted.key, right_pgno)));
+        }
+
+        if ptype == BtreePageType::TableLeaf {
+            // Fast path: O(1) zero-allocation in-place insert when page is defragmented and has room!
+            let raw_mut = self.pager.write_page(pgno)?;
+            if try_insert_table_leaf_in_place(pgno, usable, raw_mut, &cell)? {
+                return Ok(None);
+            }
+        }
+
+        let parsed = self.read_parsed_page(pgno)?;
         match parsed {
             ParsedPage::TableLeaf { mut cells } => {
                 match cells.binary_search_by_key(&cell.rowid, |c| c.rowid) {
@@ -583,74 +667,6 @@ impl Btree {
                 self.write_parsed_page(right_pgno, &right_page)?;
                 Ok(Some((divider_key, right_pgno)))
             }
-            ParsedPage::TableInterior {
-                mut cells,
-                mut right_child,
-            } => {
-                let idx = cells.partition_point(|c| c.key < cell.rowid);
-                let target_child = if idx < cells.len() {
-                    cells[idx].left_child
-                } else {
-                    right_child
-                };
-
-                let Some((div_key, new_right_child)) =
-                    self.insert_table_rec(target_child, cell)?
-                else {
-                    return Ok(None);
-                };
-
-                if idx < cells.len() {
-                    // `target_child` kept the left half (<= div_key); `new_right_child` got (> div_key, <= old_key)
-                    cells[idx].left_child = new_right_child;
-                    cells.insert(
-                        idx,
-                        TableInteriorCell {
-                            left_child: target_child,
-                            key: div_key,
-                        },
-                    );
-                } else {
-                    // `right_child` split into `target_child (<= div_key)` and `new_right_child (> div_key)`
-                    cells.push(TableInteriorCell {
-                        left_child: target_child,
-                        key: div_key,
-                    });
-                    right_child = new_right_child;
-                }
-
-                let candidate = ParsedPage::TableInterior { cells, right_child };
-                if candidate.fits_in_page(pgno, usable) {
-                    self.write_parsed_page(pgno, &candidate)?;
-                    return Ok(None);
-                }
-
-                // Split interior page!
-                let ParsedPage::TableInterior {
-                    mut cells,
-                    right_child: orig_right,
-                } = candidate
-                else {
-                    unreachable!()
-                };
-                let mid = cells.len() / 2;
-                let right_cells = cells.split_off(mid + 1);
-                let promoted = cells.pop().expect("mid exists");
-
-                let left_page = ParsedPage::TableInterior {
-                    cells,
-                    right_child: promoted.left_child,
-                };
-                let right_page = ParsedPage::TableInterior {
-                    cells: right_cells,
-                    right_child: orig_right,
-                };
-
-                let right_pgno = self.allocate_page()?;
-                self.write_parsed_page(pgno, &left_page)?;
-                self.write_parsed_page(right_pgno, &right_page)?;
-                Ok(Some((promoted.key, right_pgno)))
-            }
             _ => Err(SqliteError::corrupt("expected table B-tree page in insert")),
         }
     }
@@ -672,8 +688,90 @@ impl Btree {
         is_root: bool,
     ) -> Result<(bool, Option<Pgno>)> {
         let usable = self.pager.usable_size();
-        let parsed = self.read_parsed_page(pgno)?;
+        let ptype = {
+            let raw = self.pager.read_page(pgno)?;
+            peek_page_type(pgno, usable, raw)?
+        };
 
+        if ptype == BtreePageType::TableInterior {
+            let (idx, target_child) = {
+                let raw = self.pager.read_page(pgno)?;
+                find_table_interior_child(pgno, usable, raw, rowid)?
+            };
+            let (deleted, replacement) = self.delete_table_rec(target_child, rowid, false)?;
+            if !deleted || replacement.is_none() {
+                return Ok((deleted, None));
+            }
+
+            let rep = replacement.unwrap();
+            let ParsedPage::TableInterior {
+                mut cells,
+                mut right_child,
+            } = self.read_parsed_page(pgno)?
+            else {
+                return Err(SqliteError::corrupt("expected table interior page"));
+            };
+
+            if rep == 0 {
+                if idx < cells.len() {
+                    cells.remove(idx);
+                } else if let Some(last) = cells.pop() {
+                    right_child = last.left_child;
+                }
+            } else if idx < cells.len() {
+                cells[idx].left_child = rep;
+            } else {
+                right_child = rep;
+            }
+
+            if cells.is_empty() {
+                if !is_root {
+                    self.free_page(pgno)?;
+                    return Ok((true, Some(right_child)));
+                }
+                let child_parsed = self.read_parsed_page(right_child)?;
+                if child_parsed.fits_in_page(pgno, usable) {
+                    self.write_parsed_page(pgno, &child_parsed)?;
+                    self.free_page(right_child)?;
+                    return Ok((true, None));
+                }
+            }
+
+            self.write_parsed_page(pgno, &ParsedPage::TableInterior { cells, right_child })?;
+            return Ok((true, None));
+        }
+
+        if ptype == BtreePageType::TableLeaf {
+            // Probe existence first via read_page so missing-key deletes don't dirty pages!
+            let exists = {
+                let raw = self.pager.read_page(pgno)?;
+                seek_table_leaf_cell(pgno, usable, raw, rowid)?.is_some()
+            };
+            if !exists {
+                return Ok((false, None));
+            }
+            let outcome = {
+                let raw_mut = self.pager.write_page(pgno)?;
+                try_delete_table_leaf_in_place(pgno, usable, raw_mut, rowid, is_root)?
+            };
+            match outcome {
+                RawLeafDeleteOutcome::NotFound => return Ok((false, None)),
+                RawLeafDeleteOutcome::DeletedInPlace {
+                    overflow_page,
+                    now_empty,
+                } => {
+                    self.free_overflow_chain(overflow_page)?;
+                    if now_empty && !is_root {
+                        self.free_page(pgno)?;
+                        return Ok((true, Some(0)));
+                    }
+                    return Ok((true, None));
+                }
+                RawLeafDeleteOutcome::Fallback => {}
+            }
+        }
+
+        let parsed = self.read_parsed_page(pgno)?;
         match parsed {
             ParsedPage::TableLeaf { mut cells } => {
                 let Ok(idx) = cells.binary_search_by_key(&rowid, |c| c.rowid) else {
@@ -688,57 +786,6 @@ impl Btree {
                 }
 
                 self.write_parsed_page(pgno, &ParsedPage::TableLeaf { cells })?;
-                Ok((true, None))
-            }
-            ParsedPage::TableInterior {
-                mut cells,
-                mut right_child,
-            } => {
-                let idx = cells.partition_point(|c| c.key < rowid);
-                let target_child = if idx < cells.len() {
-                    cells[idx].left_child
-                } else {
-                    right_child
-                };
-
-                let (deleted, replacement) = self.delete_table_rec(target_child, rowid, false)?;
-                if !deleted {
-                    return Ok((false, None));
-                }
-
-                if let Some(rep) = replacement {
-                    if rep == 0 {
-                        // Child leaf became empty and was freed!
-                        if idx < cells.len() {
-                            cells.remove(idx);
-                        } else if let Some(last) = cells.pop() {
-                            right_child = last.left_child;
-                        }
-                    } else {
-                        // Child interior collapsed to `rep`
-                        if idx < cells.len() {
-                            cells[idx].left_child = rep;
-                        } else {
-                            right_child = rep;
-                        }
-                    }
-                }
-
-                if cells.is_empty() {
-                    if !is_root {
-                        self.free_page(pgno)?;
-                        return Ok((true, Some(right_child)));
-                    }
-                    // Root interior page has 0 cells: collapse `right_child` into `root_pgno` if it fits!
-                    let child_parsed = self.read_parsed_page(right_child)?;
-                    if child_parsed.fits_in_page(pgno, usable) {
-                        self.write_parsed_page(pgno, &child_parsed)?;
-                        self.free_page(right_child)?;
-                        return Ok((true, None));
-                    }
-                }
-
-                self.write_parsed_page(pgno, &ParsedPage::TableInterior { cells, right_child })?;
                 Ok((true, None))
             }
             _ => Err(SqliteError::corrupt("expected table page in delete")),

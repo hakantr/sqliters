@@ -52,6 +52,7 @@ pub struct Pager {
     journal_file: Option<Box<dyn VfsFile>>,
     in_memory: bool,
     readonly: bool,
+    synchronous: u8,
 
     header: DatabaseHeader,
     page_size_fixed: bool,
@@ -125,6 +126,7 @@ impl Pager {
             journal_file: None,
             in_memory: is_mem,
             readonly,
+            synchronous: 2,
             header: DatabaseHeader::new_with_page_size(SQLITE_DEFAULT_PAGE_SIZE),
             page_size_fixed: false,
             page_count: 0,
@@ -215,6 +217,16 @@ impl Pager {
     #[inline]
     pub const fn is_in_memory(&self) -> bool {
         self.in_memory
+    }
+
+    #[inline]
+    pub const fn synchronous(&self) -> u8 {
+        self.synchronous
+    }
+
+    #[inline]
+    pub fn set_synchronous(&mut self, level: u8) {
+        self.synchronous = level.min(3);
     }
 
     #[inline]
@@ -614,7 +626,9 @@ impl Pager {
                 // Step 1: Finalize and fsync rollback journal BEFORE touching the main DB file!
                 if let Some(ref jfile) = self.journal_file {
                     self.write_journal_header(&**jfile, self.journal_records_written)?;
-                    jfile.sync(SyncFlags::Normal)?;
+                    if self.synchronous > 0 {
+                        jfile.sync(SyncFlags::Normal)?;
+                    }
                 }
 
                 // Step 2: Acquire EXCLUSIVE lock on main DB file and write all dirty pages in Pgno order
@@ -641,7 +655,7 @@ impl Pager {
                     self.file.truncate(target_size)?;
                 }
 
-                if !self.in_memory {
+                if !self.in_memory && self.synchronous > 0 {
                     self.file.sync(SyncFlags::Normal)?;
                 }
 

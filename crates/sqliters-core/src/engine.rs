@@ -2145,6 +2145,9 @@ fn remove_row_and_indexes(
     rowid: i64,
     params: &[Value],
 ) -> Result<bool> {
+    if indexes.is_empty() {
+        return ctx.btree.delete_table(tbl.root_pgno, rowid);
+    }
     let Some(old_payload) = ctx.btree.seek_table_rowid(tbl.root_pgno, rowid)? else {
         return Ok(false);
     };
@@ -3581,11 +3584,11 @@ fn exec_delete(
     let mut stmt_fk_suspects = Vec::new();
 
     for (rowid, old_vals, scope) in targets {
-        // Re-check row existence in case a self-referential ON DELETE CASCADE already removed it
-        if ctx.btree.seek_table_rowid(tbl.root_pgno, rowid)?.is_none() {
-            continue;
-        }
         if *ctx.foreign_keys {
+            // Re-check row existence in case a self-referential ON DELETE CASCADE already removed it
+            if ctx.btree.seek_table_rowid(tbl.root_pgno, rowid)?.is_none() {
+                continue;
+            }
             check_parent_delete_restrict(ctx, &tbl, &old_vals, params)?;
         }
         if remove_row_and_indexes(ctx, &tbl, &indexes, rowid, params)? {
@@ -4891,8 +4894,13 @@ fn exec_pragma(
         }),
         "PAGE_SIZE" => {
             if let Some(pv) = value {
-                let sz = pragma_to_i64(pv) as u32;
-                ctx.btree.pager_mut().set_page_size(sz)?;
+                let raw = pragma_to_i64(pv);
+                if let Ok(sz) = u32::try_from(raw)
+                    && sqliters_pager::DatabaseHeader::is_valid_page_size(sz)
+                    && is_in_autocommit(ctx)
+                {
+                    let _ = ctx.btree.pager_mut().set_page_size(sz);
+                }
                 Ok(QueryOutput::default())
             } else {
                 Ok(single_col(
@@ -5073,10 +5081,31 @@ fn exec_pragma(
             })
         }),
         "SYNCHRONOUS" => {
-            if value.is_some() {
+            if let Some(pv) = value {
+                if is_in_autocommit(ctx) {
+                    let level = match pv {
+                        PragmaValue::Integer(i) if (0..=3).contains(i) => Some(*i as u8),
+                        PragmaValue::Ident(s) | PragmaValue::String(s) => {
+                            match s.trim().to_ascii_uppercase().as_str() {
+                                "0" | "OFF" | "FALSE" | "NO" => Some(0),
+                                "1" | "NORMAL" | "ON" | "TRUE" | "YES" => Some(1),
+                                "2" | "FULL" => Some(2),
+                                "3" | "EXTRA" => Some(3),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(lvl) = level {
+                        ctx.btree.pager_mut().set_synchronous(lvl);
+                    }
+                }
                 Ok(QueryOutput::default())
             } else {
-                Ok(single_col("synchronous", Value::Integer(2)))
+                Ok(single_col(
+                    "synchronous",
+                    Value::Integer(i64::from(ctx.btree.pager().synchronous())),
+                ))
             }
         }
         "CACHE_SIZE" => {

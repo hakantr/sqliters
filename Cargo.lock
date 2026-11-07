@@ -10,6 +10,7 @@ dependencies = [
  "sqliters-core",
  "sqliters-pager",
  "sqliters-syntax",
+ "sqliters-tcltest",
  "sqliters-types",
  "sqliters-vdbe",
  "sqliters-vfs",
@@ -56,6 +57,19 @@ name = "sqliters-syntax"
 version = "0.1.0"
 dependencies = [
  "sqliters-types",
+]
+
+[[package]]
+name = "sqliters-tcltest"
+version = "0.1.0"
+dependencies = [
+ "sqliters-btree",
+ "sqliters-core",
+ "sqliters-pager",
+ "sqliters-syntax",
+ "sqliters-types",
+ "sqliters-vdbe",
+ "sqliters-vfs",
 ]
 
 [[package]]

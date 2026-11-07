@@ -44,3 +44,7 @@ sqliters-core = { path = "crates/sqliters-core" }
 
 [dev-dependencies]
 sqliters-tcltest = { path = "crates/sqliters-tcltest" }
+
+[profile.test]
+opt-level = 2
+
