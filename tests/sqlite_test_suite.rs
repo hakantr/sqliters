@@ -28,3 +28,6 @@ mod join6;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/joinE.rs"]
 mod joinE;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/like2.rs"]
+mod like2;
