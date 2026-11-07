@@ -55,3 +55,6 @@ mod selectF;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/selectG.rs"]
 mod selectG;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/unique.rs"]
+mod unique;
