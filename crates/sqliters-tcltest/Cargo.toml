@@ -1,0 +1,18 @@
+[package]
+name = "sqliters-tcltest"
+description = "Pure safe Rust SQLite TCL/testfixture test runner for executing SQLite .test suites 1-to-1"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sqliters-types = { path = "../sqliters-types" }
+sqliters-vfs = { path = "../sqliters-vfs" }
+sqliters-pager = { path = "../sqliters-pager" }
+sqliters-btree = { path = "../sqliters-btree" }
+sqliters-syntax = { path = "../sqliters-syntax" }
+sqliters-vdbe = { path = "../sqliters-vdbe" }
+sqliters-core = { path = "../sqliters-core" }

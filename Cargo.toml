@@ -9,6 +9,7 @@ members = [
     "crates/sqliters-vdbe",
     "crates/sqliters-core",
     "crates/sqliters-cli",
+    "crates/sqliters-tcltest",
     ".",
 ]
 
@@ -40,3 +41,6 @@ sqliters-btree = { path = "crates/sqliters-btree" }
 sqliters-syntax = { path = "crates/sqliters-syntax" }
 sqliters-vdbe = { path = "crates/sqliters-vdbe" }
 sqliters-core = { path = "crates/sqliters-core" }
+
+[dev-dependencies]
+sqliters-tcltest = { path = "crates/sqliters-tcltest" }

@@ -652,11 +652,34 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token<'_>>> {
             }
             b':' | b'@' | b'$' | b'#' => {
                 i += 1;
-                let name_start = i;
-                while i < bytes.len() && is_id_char(bytes[i]) {
-                    i += 1;
+                let mut n = 0usize;
+                while i < bytes.len() {
+                    let c = bytes[i];
+                    if is_id_char(c) {
+                        n += 1;
+                        i += 1;
+                    } else if c == b'(' && n > 0 {
+                        i += 1;
+                        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b')'
+                        {
+                            i += 1;
+                        }
+                        if i < bytes.len() && bytes[i] == b')' {
+                            i += 1;
+                        } else {
+                            return Err(SqliteError::syntax(
+                                format!("unrecognized token: \"{}\"", &sql[start..i]),
+                                start,
+                            ));
+                        }
+                        break;
+                    } else if c == b':' && i + 1 < bytes.len() && bytes[i + 1] == b':' {
+                        i += 2;
+                    } else {
+                        break;
+                    }
                 }
-                if i == name_start {
+                if n == 0 {
                     return Err(SqliteError::syntax(
                         format!("unrecognized token: \"{}\"", &sql[start..i]),
                         start,

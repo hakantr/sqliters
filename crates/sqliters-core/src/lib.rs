@@ -400,6 +400,12 @@ impl<'conn> Statement<'conn> {
         self.params.len()
     }
 
+    /// Named parameter map (`:name` / `$name` / `@name` -> 1-based parameter index).
+    #[inline]
+    pub fn named_parameters(&self) -> &HashMap<String, usize> {
+        &self.named_params
+    }
+
     /// Binds a 1-based parameter (`?1`, `?`, etc.) (`sqlite3_bind_*`).
     pub fn bind(&mut self, index_1_based: usize, value: impl Into<Value>) -> Result<&mut Self> {
         if index_1_based == 0 || index_1_based > self.params.len() {
