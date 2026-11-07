@@ -7,13 +7,15 @@ use std::cmp::Ordering;
 
 use sqliters_btree::Btree;
 use sqliters_types::{
-    Collation, ErrorCode, KeySortOrder, Pgno, Result, SqliteError, TypeAffinity, Value,
-    decode_record, decode_record_column, encode_record,
+    Collation, ErrorCode, KeySortOrder, Pgno, Result, SqliteError, TextEncoding, TypeAffinity,
+    Value, decode_record_column_with_encoding, decode_record_with_encoding,
+    encode_record_with_encoding,
 };
 
 pub use functions::{
-    AggregateAccumulator, AggregateKind, VmRuntimeContext, eval_scalar_function,
-    parse_escape_char, sqlite_glob_match, sqlite_like_match,
+    AggregateAccumulator, AggregateKind, VmRuntimeContext, eval_scalar_function, format_utc_date,
+    format_utc_time, format_utc_timestamp, parse_escape_char, sqlite_glob_match,
+    sqlite_like_match, system_utc_millis, utc_ymdhms_from_unix_ms,
 };
 
 /// Fourth operand (`P4`) payload for a VDBE instruction (`p4union` in `sqlite/src/vdbe.h`).
@@ -632,16 +634,18 @@ impl VdbeVm {
                             } else {
                                 entries[*pos].1.as_slice()
                             };
-                            let val = decode_record_column(payload, col_idx)?.unwrap_or_else(|| {
-                                // Default fallback from P4 if column was added via ALTER TABLE ADD COLUMN
-                                match &ins.p4 {
-                                    P4::Int64(i) => Value::Integer(*i),
-                                    P4::Real(r) => Value::real(*r),
-                                    P4::Str(s) => Value::Text(s.clone()),
-                                    P4::Blob(b) => Value::Blob(b.clone()),
-                                    _ => Value::Null,
-                                }
-                            });
+                            let enc = btree.encoding();
+                            let val = decode_record_column_with_encoding(payload, col_idx, enc)?
+                                .unwrap_or_else(|| {
+                                    // Default fallback from P4 if column was added via ALTER TABLE ADD COLUMN
+                                    match &ins.p4 {
+                                        P4::Int64(i) => Value::Integer(*i),
+                                        P4::Real(r) => Value::real(*r),
+                                        P4::Str(s) => Value::Text(s.clone()),
+                                        P4::Blob(b) => Value::Blob(b.clone()),
+                                        _ => Value::Null,
+                                    }
+                                });
                             self.regs[dest] = val;
                         }
                         CursorState::Index { matches, pos, .. } => {
@@ -662,7 +666,9 @@ impl VdbeVm {
                     let start = ins.p1 as usize;
                     let count = ins.p2 as usize;
                     let dest = ins.p3 as usize;
-                    let bytes = encode_record(&self.regs[start..start + count]);
+                    let enc = btree.encoding();
+                    let bytes =
+                        encode_record_with_encoding(&self.regs[start..start + count], enc);
                     self.regs[dest] = Value::Blob(bytes);
                 }
                 Opcode::NewRowid => {
@@ -742,7 +748,8 @@ impl VdbeVm {
                     };
                     if ins.p5 != 0 {
                         // UNIQUE constraint check: indexed columns (excluding trailing rowid!) if all non-NULL!
-                        let vals = decode_record(&payload)?;
+                        let enc = btree.encoding();
+                        let vals = decode_record_with_encoding(&payload, enc)?;
                         if vals.len() > 1 {
                             let indexed_cols = &vals[..vals.len() - 1];
                             if indexed_cols.iter().all(|v| !v.is_null()) {
@@ -922,7 +929,8 @@ impl VdbeVm {
                     };
                     let lhs = &self.regs[ins.p1 as usize];
                     let rhs = &self.regs[ins.p2 as usize];
-                    self.regs[ins.p3 as usize] = eval_comparison(ins.opcode, lhs, rhs, coll);
+                    self.regs[ins.p3 as usize] =
+                        eval_comparison_with_encoding(ins.opcode, lhs, rhs, coll, btree.encoding());
                 }
                 Opcode::And => {
                     let a = self.regs[ins.p1 as usize].truthiness();
@@ -1050,7 +1058,8 @@ impl VdbeVm {
                             next_pc = jump_empty;
                         } else {
                             let specs = orders.clone();
-                            rows.sort_by(|a, b| compare_sorter_rows(a, b, &specs));
+                            let enc = btree.encoding();
+                            rows.sort_by(|a, b| compare_sorter_rows(a, b, &specs, enc));
                             *pos = 0;
                         }
                     } else {
@@ -1187,11 +1196,21 @@ fn shift_right_sqlite(a: i64, b: i64) -> i64 {
 /// Evaluates SQLite comparison operators (`=`, `!=`, `<`, `<=`, `>`, `>=`, `IS`, `IS NOT`),
 /// including SQLite numeric/text affinity coercion when one side is numeric and the other is text!
 pub fn eval_comparison(op: Opcode, lhs: &Value, rhs: &Value, coll: Collation) -> Value {
+    eval_comparison_with_encoding(op, lhs, rhs, coll, TextEncoding::Utf8)
+}
+
+pub fn eval_comparison_with_encoding(
+    op: Opcode,
+    lhs: &Value,
+    rhs: &Value,
+    coll: Collation,
+    enc: TextEncoding,
+) -> Value {
     if matches!(op, Opcode::Is | Opcode::IsNot) {
         let eq = match (lhs.is_null(), rhs.is_null()) {
             (true, true) => true,
             (true, false) | (false, true) => false,
-            (false, false) => compare_with_affinity(lhs, rhs, coll) == Ordering::Equal,
+            (false, false) => compare_with_affinity(lhs, rhs, coll, enc) == Ordering::Equal,
         };
         let res = if op == Opcode::Is { eq } else { !eq };
         return Value::Integer(i64::from(res));
@@ -1201,7 +1220,7 @@ pub fn eval_comparison(op: Opcode, lhs: &Value, rhs: &Value, coll: Collation) ->
         return Value::Null;
     }
 
-    let ord = compare_with_affinity(lhs, rhs, coll);
+    let ord = compare_with_affinity(lhs, rhs, coll, enc);
     let b = match op {
         Opcode::Eq => ord == Ordering::Equal,
         Opcode::Ne => ord != Ordering::Equal,
@@ -1214,23 +1233,28 @@ pub fn eval_comparison(op: Opcode, lhs: &Value, rhs: &Value, coll: Collation) ->
     Value::Integer(i64::from(b))
 }
 
-fn compare_with_affinity(lhs: &Value, rhs: &Value, coll: Collation) -> Ordering {
+fn compare_with_affinity(
+    lhs: &Value,
+    rhs: &Value,
+    coll: Collation,
+    enc: TextEncoding,
+) -> Ordering {
     match (lhs, rhs) {
         (Value::Integer(_) | Value::Real(_), Value::Text(s)) => {
             if let Some(coerced) = sqliters_types::parse_numeric_text(s) {
-                lhs.cmp_sqlite(&coerced, coll)
+                lhs.cmp_sqlite_with_encoding(&coerced, coll, enc)
             } else {
-                lhs.cmp_sqlite(rhs, coll)
+                lhs.cmp_sqlite_with_encoding(rhs, coll, enc)
             }
         }
         (Value::Text(s), Value::Integer(_) | Value::Real(_)) => {
             if let Some(coerced) = sqliters_types::parse_numeric_text(s) {
-                coerced.cmp_sqlite(rhs, coll)
+                coerced.cmp_sqlite_with_encoding(rhs, coll, enc)
             } else {
-                lhs.cmp_sqlite(rhs, coll)
+                lhs.cmp_sqlite_with_encoding(rhs, coll, enc)
             }
         }
-        _ => lhs.cmp_sqlite(rhs, coll),
+        _ => lhs.cmp_sqlite_with_encoding(rhs, coll, enc),
     }
 }
 
@@ -1265,7 +1289,12 @@ pub fn eval_cast(val: Value, type_name: &str) -> Value {
     }
 }
 
-fn compare_sorter_rows(a: &[Value], b: &[Value], specs: &[(usize, KeySortOrder)]) -> Ordering {
+fn compare_sorter_rows(
+    a: &[Value],
+    b: &[Value],
+    specs: &[(usize, KeySortOrder)],
+    enc: TextEncoding,
+) -> Ordering {
     for &(col_idx, spec) in specs {
         let va = &a[col_idx];
         let vb = &b[col_idx];
@@ -1286,7 +1315,7 @@ fn compare_sorter_rows(a: &[Value], b: &[Value], specs: &[(usize, KeySortOrder)]
                 }
             }
             (false, false) => {
-                let raw = va.cmp_sqlite(vb, spec.collation);
+                let raw = va.cmp_sqlite_with_encoding(vb, spec.collation, enc);
                 if spec.desc { raw.reverse() } else { raw }
             }
         };

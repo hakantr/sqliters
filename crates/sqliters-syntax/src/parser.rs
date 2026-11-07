@@ -536,10 +536,13 @@ impl<'a> Parser<'a> {
                     }
                     self.expect(TokenKind::Rp)?;
                 }
-                self.skip_fk_tail();
+                let (on_delete, on_update, deferred) = self.parse_fk_tail()?;
                 constraints.push(ColumnConstraint::ForeignKey {
                     ref_table,
                     ref_columns,
+                    on_delete,
+                    on_update,
+                    deferred,
                 });
             } else {
                 break;
@@ -624,11 +627,14 @@ impl<'a> Parser<'a> {
                 }
                 self.expect(TokenKind::Rp)?;
             }
-            self.skip_fk_tail();
+            let (on_delete, on_update, deferred) = self.parse_fk_tail()?;
             Ok(TableConstraint::ForeignKey {
                 columns,
                 ref_table,
                 ref_columns,
+                on_delete,
+                on_update,
+                deferred,
             })
         } else {
             let tok = self.peek();
@@ -636,28 +642,86 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn skip_fk_tail(&mut self) {
+    fn parse_fk_tail(&mut self) -> Result<(FkAction, FkAction, bool)> {
+        let mut on_delete = FkAction::NoAction;
+        let mut on_update = FkAction::NoAction;
+        let mut deferred = false;
+
         loop {
-            if self.eat(TokenKind::On) {
-                let _ = self.eat(TokenKind::Delete) || self.eat(TokenKind::Update);
-                if self.eat(TokenKind::Set) {
-                    let _ = self.eat(TokenKind::Null) || self.eat(TokenKind::Default);
-                } else if self.eat(TokenKind::No) {
-                    let _ = self.eat(TokenKind::Action);
+            if self.at(TokenKind::On)
+                && matches!(self.peek_n(1).kind, TokenKind::Delete | TokenKind::Update)
+            {
+                self.advance();
+                let is_delete = if self.eat(TokenKind::Delete) {
+                    true
                 } else {
-                    let _ = self.eat(TokenKind::Cascade) || self.eat(TokenKind::Restrict);
+                    self.expect(TokenKind::Update)?;
+                    false
+                };
+                let act = self.parse_fk_action()?;
+                if is_delete {
+                    on_delete = act;
+                } else {
+                    on_update = act;
                 }
-            } else if self.eat(TokenKind::Not) && self.eat(TokenKind::Deferrable) {
-                if self.eat(TokenKind::Initially) {
-                    let _ = self.eat(TokenKind::Deferred) || self.eat(TokenKind::Immediate);
+            } else if self.eat(TokenKind::Match) {
+                let tok = self.peek();
+                if tok.kind == TokenKind::Eof {
+                    return Err(self.syntax_err_at(tok, "expected MATCH type"));
                 }
+                self.advance();
+            } else if self.at(TokenKind::Not) && self.peek_n(1).kind == TokenKind::Deferrable {
+                self.advance();
+                self.advance();
+                if self.eat(TokenKind::Initially)
+                    && !self.eat(TokenKind::Deferred)
+                    && !self.eat(TokenKind::Immediate)
+                {
+                    let tok = self.peek();
+                    return Err(self.syntax_err_at(tok, "expected DEFERRED or IMMEDIATE"));
+                }
+                deferred = false;
             } else if self.eat(TokenKind::Deferrable) {
                 if self.eat(TokenKind::Initially) {
-                    let _ = self.eat(TokenKind::Deferred) || self.eat(TokenKind::Immediate);
+                    if self.eat(TokenKind::Deferred) {
+                        deferred = true;
+                    } else if self.eat(TokenKind::Immediate) {
+                        deferred = false;
+                    } else {
+                        let tok = self.peek();
+                        return Err(self.syntax_err_at(tok, "expected DEFERRED or IMMEDIATE"));
+                    }
+                } else {
+                    deferred = false;
                 }
             } else {
                 break;
             }
+        }
+
+        Ok((on_delete, on_update, deferred))
+    }
+
+    fn parse_fk_action(&mut self) -> Result<FkAction> {
+        if self.eat(TokenKind::Set) {
+            if self.eat(TokenKind::Null) {
+                Ok(FkAction::SetNull)
+            } else if self.eat(TokenKind::Default) {
+                Ok(FkAction::SetDefault)
+            } else {
+                let tok = self.peek();
+                Err(self.syntax_err_at(tok, "expected NULL or DEFAULT after SET"))
+            }
+        } else if self.eat(TokenKind::Cascade) {
+            Ok(FkAction::Cascade)
+        } else if self.eat(TokenKind::Restrict) {
+            Ok(FkAction::Restrict)
+        } else if self.eat(TokenKind::No) {
+            self.expect(TokenKind::Action)?;
+            Ok(FkAction::NoAction)
+        } else {
+            let tok = self.peek();
+            Err(self.syntax_err_at(tok, "expected foreign key action"))
         }
     }
 

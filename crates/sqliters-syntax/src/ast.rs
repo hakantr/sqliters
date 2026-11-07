@@ -60,6 +60,28 @@ pub enum ConflictAction {
     Replace,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FkAction {
+    #[default]
+    NoAction,
+    Restrict,
+    SetNull,
+    SetDefault,
+    Cascade,
+}
+
+impl FkAction {
+    pub const fn as_sql_str(self) -> &'static str {
+        match self {
+            Self::NoAction => "NO ACTION",
+            Self::Restrict => "RESTRICT",
+            Self::SetNull => "SET NULL",
+            Self::SetDefault => "SET DEFAULT",
+            Self::Cascade => "CASCADE",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateTableStmt {
     pub temp: bool,
@@ -100,6 +122,9 @@ pub enum ColumnConstraint {
     ForeignKey {
         ref_table: String,
         ref_columns: Vec<String>,
+        on_delete: FkAction,
+        on_update: FkAction,
+        deferred: bool,
     },
 }
 
@@ -118,6 +143,9 @@ pub enum TableConstraint {
         columns: Vec<String>,
         ref_table: String,
         ref_columns: Vec<String>,
+        on_delete: FkAction,
+        on_update: FkAction,
+        deferred: bool,
     },
 }
 

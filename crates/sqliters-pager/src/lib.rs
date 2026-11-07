@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use sqliters_types::{
     Bitvec, ErrorCode, Pgno, Result, SQLITE_DEFAULT_PAGE_SIZE, SQLITE_VERSION_NUMBER, SqliteError,
+    TextEncoding, extended,
 };
 use sqliters_vfs::{LockLevel, MemoryVfs, OpenFlags, OsVfs, SyncFlags, Vfs, VfsFile};
 
@@ -46,6 +47,7 @@ pub struct Pager {
     vfs: Arc<dyn Vfs>,
     db_path: Option<PathBuf>,
     journal_path: Option<PathBuf>,
+    wal_path: Option<PathBuf>,
     file: Box<dyn VfsFile>,
     journal_file: Option<Box<dyn VfsFile>>,
     in_memory: bool,
@@ -105,6 +107,11 @@ impl Pager {
             os.push("-journal");
             PathBuf::from(os)
         });
+        let wal_path = full_path.as_ref().map(|p| {
+            let mut os = p.as_os_str().to_os_string();
+            os.push("-wal");
+            PathBuf::from(os)
+        });
 
         let file = vfs.open(full_path.as_deref(), flags)?;
         let readonly = file.is_readonly() || flags.is_readonly();
@@ -113,6 +120,7 @@ impl Pager {
             vfs,
             db_path: full_path,
             journal_path,
+            wal_path,
             file,
             journal_file: None,
             in_memory: is_mem,
@@ -131,12 +139,24 @@ impl Pager {
             savepoints: Vec::new(),
         };
 
-        // Recover hot rollback journal if a previous writer crashed mid-transaction!
-        if !pager.in_memory && !pager.readonly {
-            pager.recover_hot_journal_if_present()?;
-        }
+        pager.reject_if_wal_present()?;
 
-        pager.load_initial_header()?;
+        // Note: Never touch or delete `<db>-journal` during `open_with_vfs` without holding
+        // `SHARED` lock and verifying `check_reserved_lock()` (`pager.c:hasHotJournal`).
+        let journal_exists = match pager.journal_path.as_deref() {
+            Some(jp) => pager.vfs.exists(jp).unwrap_or(false),
+            None => false,
+        };
+        match pager.load_initial_header() {
+            Ok(()) => {}
+            Err(e)
+                if journal_exists
+                    && matches!(e.code, ErrorCode::NotADb | ErrorCode::Corrupt) =>
+            {
+                // Defer header validation until `begin_read()` checks/replays any crashed hot journal.
+            }
+            Err(e) => return Err(e),
+        }
         Ok(pager)
     }
 
@@ -198,8 +218,27 @@ impl Pager {
     }
 
     #[inline]
+    pub fn vfs(&self) -> &Arc<dyn Vfs> {
+        &self.vfs
+    }
+
+    #[inline]
     pub fn db_path(&self) -> Option<&Path> {
         self.db_path.as_deref()
+    }
+
+    #[inline]
+    pub const fn encoding(&self) -> TextEncoding {
+        self.header.encoding()
+    }
+
+    /// Sets the database text encoding before the database is initialized (`PRAGMA encoding`).
+    /// Per SQLite semantics, changing encoding after pages exist is a no-op.
+    pub fn set_encoding(&mut self, enc: TextEncoding) -> Result<()> {
+        if !self.page_size_fixed && self.page_count == 0 {
+            self.header.text_encoding = enc as u32;
+        }
+        Ok(())
     }
 
     #[inline]
@@ -254,27 +293,62 @@ impl Pager {
         Ok(())
     }
 
-    /// Starts a read transaction (`SHARED` lock).
+    fn reject_if_wal_present(&self) -> Result<()> {
+        if let Some(ref wpath) = self.wal_path
+            && self.vfs.exists(wpath)?
+            && let Ok(wfile) = self.vfs.open(Some(wpath), OpenFlags::READONLY)
+            && wfile.file_size()? > 0
+        {
+            return Err(SqliteError::new(
+                ErrorCode::CantOpen,
+                "WAL mode databases are not supported; checkpoint in SQLite with PRAGMA journal_mode=DELETE first",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Starts a read transaction (`SHARED` lock + safe hot-journal check/recovery).
     pub fn begin_read(&mut self) -> Result<()> {
         if self.state != TransactionState::Open {
             return Ok(());
         }
         self.file.lock(LockLevel::Shared)?;
+        if let Err(e) = self.begin_read_under_shared_lock() {
+            let _ = self.file.unlock(LockLevel::NoLock);
+            return Err(e);
+        }
+        self.state = TransactionState::Read;
+        Ok(())
+    }
+
+    fn begin_read_under_shared_lock(&mut self) -> Result<()> {
+        self.reject_if_wal_present()?;
         if !self.in_memory {
-            // Re-validate header if file changed externally while unlocked
+            let recovered = self.recover_hot_journal_under_shared_lock()?;
             let prev_counter = self.header.change_counter;
             let file_len = self.file.file_size()?;
-            if file_len >= DB_HEADER_SIZE as u64 {
+            if file_len == 0 {
+                if recovered || self.page_count != 0 {
+                    self.cache.clear();
+                    self.page_count = 0;
+                    self.header.database_size_pages = 0;
+                    self.page_size_fixed = false;
+                }
+            } else if file_len >= DB_HEADER_SIZE as u64 {
                 let mut hdr_bytes = [0u8; DB_HEADER_SIZE];
                 self.file.read_at(&mut hdr_bytes, 0)?;
                 let disk_hdr = DatabaseHeader::parse(&hdr_bytes)?;
-                if disk_hdr.change_counter != prev_counter || !self.page_size_fixed {
+                if recovered || disk_hdr.change_counter != prev_counter || !self.page_size_fixed {
                     self.cache.clear();
                     self.load_initial_header()?;
                 }
+            } else {
+                return Err(SqliteError::new(
+                    ErrorCode::NotADb,
+                    "file is not a database",
+                ));
             }
         }
-        self.state = TransactionState::Read;
         Ok(())
     }
 
@@ -288,10 +362,17 @@ impl Pager {
         if self.state == TransactionState::Write {
             return Ok(());
         }
-        if self.state == TransactionState::Open {
+        let acquired_read_here = self.state == TransactionState::Open;
+        if acquired_read_here {
             self.begin_read()?;
         }
-        self.file.lock(LockLevel::Reserved)?;
+        if let Err(e) = self.file.lock(LockLevel::Reserved) {
+            if acquired_read_here {
+                let _ = self.file.unlock(LockLevel::NoLock);
+                self.state = TransactionState::Open;
+            }
+            return Err(e);
+        }
 
         self.tx_orig_page_count = self.page_count;
         self.tx_orig_header = self.header.clone();
@@ -304,12 +385,28 @@ impl Pager {
         self.journal_nonce = u32::from_be_bytes(nonce_bytes);
 
         if let Some(ref jpath) = self.journal_path {
-            let jfile = self.vfs.open(
-                Some(jpath),
-                OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_JOURNAL,
-            )?;
-            self.write_journal_header(&*jfile, 0)?;
-            self.journal_file = Some(jfile);
+            let jopen_res = self
+                .vfs
+                .open(
+                    Some(jpath),
+                    OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_JOURNAL,
+                )
+                .and_then(|jfile| {
+                    self.write_journal_header(&*jfile, 0)?;
+                    Ok(jfile)
+                });
+            match jopen_res {
+                Ok(jfile) => self.journal_file = Some(jfile),
+                Err(e) => {
+                    if acquired_read_here {
+                        let _ = self.file.unlock(LockLevel::NoLock);
+                        self.state = TransactionState::Open;
+                    } else {
+                        let _ = self.file.unlock(LockLevel::Shared);
+                    }
+                    return Err(e);
+                }
+            }
         }
 
         self.state = TransactionState::Write;
@@ -331,7 +428,9 @@ impl Pager {
         self.header.change_counter = 1;
         self.header.version_valid_for = 1;
         self.header.schema_format = 4;
-        self.header.text_encoding = 1;
+        if self.header.text_encoding == 0 {
+            self.header.text_encoding = 1;
+        }
         self.header.sqlite_version_number = SQLITE_VERSION_NUMBER;
         self.header.write_into(&mut page1[0..DB_HEADER_SIZE]);
 
@@ -745,22 +844,52 @@ impl Pager {
         Ok(())
     }
 
-    /// Hot-journal recovery: if `<db>-journal` exists when opening the database, replays valid
-    /// pre-images back into the main database file, truncates to `orig_page_count`, fsyncs, and removes journal.
-    fn recover_hot_journal_if_present(&mut self) -> Result<()> {
+    /// Safe hot-journal detection and recovery (`hasHotJournal` + `pagerPlayback` in `sqlite/src/pager.c`),
+    /// called ONLY while holding at least `LockLevel::Shared` on the main database file!
+    fn recover_hot_journal_under_shared_lock(&mut self) -> Result<bool> {
         let Some(ref jpath) = self.journal_path else {
-            return Ok(());
+            return Ok(false);
         };
         if !self.vfs.exists(jpath)? {
-            return Ok(());
+            return Ok(false);
         }
 
-        let jfile = self.vfs.open(Some(jpath), OpenFlags::READONLY)?;
+        // CRITICAL (`pager.c:5254`): If ANY handle/process holds RESERVED (or higher),
+        // an active writer owns `<db>-journal`. It is NOT a hot journal — do not touch it!
+        if self.file.check_reserved_lock()? {
+            return Ok(false);
+        }
+
+        let Ok(jfile) = self.vfs.open(Some(jpath), OpenFlags::READONLY) else {
+            return Ok(false);
+        };
         let jsize = jfile.file_size()?;
+        if jsize == 0 {
+            return Ok(false);
+        }
+
+        let mut first_byte = [0u8; 1];
+        if jfile.read_at(&mut first_byte, 0)? == 0 || first_byte[0] == 0 {
+            // `journal_mode=PERSIST` zeroes byte 0 to mark an inactive journal.
+            return Ok(false);
+        }
+
+        if self.readonly {
+            return Err(SqliteError::with_extended(
+                extended::SQLITE_READONLY_ROLLBACK,
+                "unable to open database: hot journal requires write access for recovery",
+            ));
+        }
+
+        // Upgrade directly from SHARED -> EXCLUSIVE (`pager.c:5606`); fails with SQLITE_BUSY
+        // if another reader also holds SHARED, leaving the hot journal intact for retry.
+        self.file.lock(LockLevel::Exclusive)?;
+
         if jsize < JOURNAL_HEADER_BYTES as u64 {
             drop(jfile);
             self.vfs.delete(jpath, true)?;
-            return Ok(());
+            self.file.unlock(LockLevel::Shared)?;
+            return Ok(true);
         }
 
         let mut hdr = [0u8; JOURNAL_HEADER_BYTES];
@@ -768,7 +897,8 @@ impl Pager {
         if hdr[0..8] != JOURNAL_MAGIC {
             drop(jfile);
             self.vfs.delete(jpath, true)?;
-            return Ok(());
+            self.file.unlock(LockLevel::Shared)?;
+            return Ok(true);
         }
 
         let record_count = u32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
@@ -779,7 +909,8 @@ impl Pager {
         if !DatabaseHeader::is_valid_page_size(page_size) {
             drop(jfile);
             self.vfs.delete(jpath, true)?;
-            return Ok(());
+            self.file.unlock(LockLevel::Shared)?;
+            return Ok(true);
         }
 
         let ps = page_size as usize;
@@ -791,7 +922,6 @@ impl Pager {
             record_count.min(avail_records)
         };
 
-        self.file.lock(LockLevel::Exclusive)?;
         let mut rec_buf = vec![0u8; rec_size as usize];
         for idx in 0..to_replay {
             let off = (JOURNAL_HEADER_BYTES as u64) + u64::from(idx) * rec_size;
@@ -813,11 +943,15 @@ impl Pager {
 
         self.file
             .truncate(u64::from(orig_pages) * u64::from(page_size))?;
-        self.file.sync(SyncFlags::Normal)?;
-        self.file.unlock(LockLevel::NoLock)?;
+        if !self.in_memory {
+            self.file.sync(SyncFlags::Normal)?;
+        }
         drop(jfile);
         self.vfs.delete(jpath, true)?;
-        Ok(())
+        self.cache.clear();
+        self.page_size_fixed = false;
+        self.file.unlock(LockLevel::Shared)?;
+        Ok(true)
     }
 }
 

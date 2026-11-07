@@ -3,12 +3,12 @@
 
 use sqliters_btree::Btree;
 use sqliters_syntax::{
-    ColumnConstraint, ColumnDef, ConflictAction, CreateIndexStmt, CreateTableStmt, Expr,
+    ColumnConstraint, ColumnDef, ConflictAction, CreateIndexStmt, CreateTableStmt, Expr, FkAction,
     IndexedColumn, Stmt, TableConstraint, parse_one,
 };
 use sqliters_types::{
     Collation, ErrorCode, KeySortOrder, Pgno, Result, SqliteError, TypeAffinity, Value,
-    decode_record, encode_record,
+    decode_record_with_encoding, encode_record_with_encoding,
 };
 use sqliters_vdbe::P4;
 
@@ -49,6 +49,18 @@ impl ColumnSchema {
 }
 
 #[derive(Debug, Clone)]
+pub struct ForeignKeySchema {
+    pub id: usize,
+    pub from_cols: Vec<usize>,
+    pub from_col_names: Vec<String>,
+    pub ref_table: String,
+    pub ref_cols: Option<Vec<String>>,
+    pub on_delete: FkAction,
+    pub on_update: FkAction,
+    pub deferred: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct TableSchema {
     pub schema_rowid: i64,
     pub name: String,
@@ -61,6 +73,7 @@ pub struct TableSchema {
     pub without_rowid: bool,
     pub strict: bool,
     pub checks: Vec<Expr>,
+    pub foreign_keys: Vec<ForeignKeySchema>,
     pub raw_sql: String,
 }
 
@@ -94,6 +107,7 @@ impl TableSchema {
             without_rowid: false,
             strict: false,
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
             raw_sql: "CREATE TABLE sqlite_schema(type text,name text,tbl_name text,rootpage int,sql text)".to_owned(),
         }
     }
@@ -253,13 +267,14 @@ impl Schema {
     }
 
     fn load_inner(btree: &mut Btree) -> Result<Self> {
+        let enc = btree.encoding();
         let raw_rows = btree.scan_table(1)?;
         let mut tables = Vec::new();
         let mut pending_auto_by_table: Vec<(String, Vec<PendingAutoIndex>)> = Vec::new();
         let mut raw_index_rows: Vec<(i64, String, String, Pgno, Option<String>)> = Vec::new();
 
         for (rowid, payload) in raw_rows {
-            let cols = decode_record(&payload)?;
+            let cols = decode_record_with_encoding(&payload, enc)?;
             if cols.len() < 5 {
                 continue;
             }
@@ -356,6 +371,7 @@ pub fn build_table_schema_from_ast(
 ) -> Result<(TableSchema, Vec<PendingAutoIndex>)> {
     let mut columns = Vec::with_capacity(ct.columns.len());
     let mut checks = Vec::new();
+    let mut foreign_keys = Vec::new();
     let mut rowid_alias_col: Option<usize> = None;
     let mut rowid_pk_conflict = ConflictAction::Abort;
     let mut autoincrement = false;
@@ -424,7 +440,35 @@ pub fn build_table_schema_from_ast(
                         )
                     })?;
                 }
-                ColumnConstraint::ForeignKey { .. } => {}
+                ColumnConstraint::ForeignKey {
+                    ref_table,
+                    ref_columns,
+                    on_delete,
+                    on_update,
+                    deferred,
+                } => {
+                    if ref_columns.len() > 1 {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            "number of columns in foreign key does not match the number of columns in the referenced table",
+                        ));
+                    }
+                    let fk_id = foreign_keys.len();
+                    foreign_keys.push(ForeignKeySchema {
+                        id: fk_id,
+                        from_cols: vec![col_idx],
+                        from_col_names: vec![cdef.name.clone()],
+                        ref_table: ref_table.clone(),
+                        ref_cols: if ref_columns.is_empty() {
+                            None
+                        } else {
+                            Some(ref_columns.clone())
+                        },
+                        on_delete: *on_delete,
+                        on_update: *on_update,
+                        deferred: *deferred,
+                    });
+                }
             }
         }
 
@@ -553,7 +597,52 @@ pub fn build_table_schema_from_ast(
             TableConstraint::Check(expr) => {
                 checks.push(expr.clone());
             }
-            TableConstraint::ForeignKey { .. } => {}
+            TableConstraint::ForeignKey {
+                columns: fk_cols,
+                ref_table,
+                ref_columns,
+                on_delete,
+                on_update,
+                deferred,
+            } => {
+                let mut from_cols = Vec::with_capacity(fk_cols.len());
+                let mut from_col_names = Vec::with_capacity(fk_cols.len());
+                for cname in fk_cols {
+                    let Some((ci, cs)) = columns
+                        .iter()
+                        .enumerate()
+                        .find(|(_, c)| c.name.eq_ignore_ascii_case(cname))
+                    else {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("unknown column \"{cname}\" in foreign key definition"),
+                        ));
+                    };
+                    from_cols.push(ci);
+                    from_col_names.push(cs.name.clone());
+                }
+                if !ref_columns.is_empty() && ref_columns.len() != from_cols.len() {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "number of columns in foreign key does not match the number of columns in the referenced table",
+                    ));
+                }
+                let fk_id = foreign_keys.len();
+                foreign_keys.push(ForeignKeySchema {
+                    id: fk_id,
+                    from_cols,
+                    from_col_names,
+                    ref_table: ref_table.clone(),
+                    ref_cols: if ref_columns.is_empty() {
+                        None
+                    } else {
+                        Some(ref_columns.clone())
+                    },
+                    on_delete: *on_delete,
+                    on_update: *on_update,
+                    deferred: *deferred,
+                });
+            }
         }
     }
 
@@ -568,6 +657,7 @@ pub fn build_table_schema_from_ast(
         without_rowid: ct.without_rowid,
         strict: ct.strict,
         checks,
+        foreign_keys,
         raw_sql: ct.raw_sql.clone(),
     };
 
@@ -701,14 +791,18 @@ pub fn insert_schema_entry(
     rootpage: Pgno,
     sql: Option<&str>,
 ) -> Result<i64> {
+    let enc = btree.encoding();
     let rowid = btree.next_rowid(1)?;
-    let rec = encode_record(&[
-        Value::Text(obj_type.to_owned()),
-        Value::Text(name.to_owned()),
-        Value::Text(tbl_name.to_owned()),
-        Value::Integer(i64::from(rootpage)),
-        sql.map_or(Value::Null, |s| Value::Text(s.to_owned())),
-    ]);
+    let rec = encode_record_with_encoding(
+        &[
+            Value::Text(obj_type.to_owned()),
+            Value::Text(name.to_owned()),
+            Value::Text(tbl_name.to_owned()),
+            Value::Integer(i64::from(rootpage)),
+            sql.map_or(Value::Null, |s| Value::Text(s.to_owned())),
+        ],
+        enc,
+    );
     btree.insert_table(1, rowid, &rec)?;
     bump_schema_cookie(btree)?;
     Ok(rowid)
@@ -723,13 +817,17 @@ pub fn update_schema_entry(
     rootpage: Pgno,
     sql: Option<&str>,
 ) -> Result<()> {
-    let rec = encode_record(&[
-        Value::Text(obj_type.to_owned()),
-        Value::Text(name.to_owned()),
-        Value::Text(tbl_name.to_owned()),
-        Value::Integer(i64::from(rootpage)),
-        sql.map_or(Value::Null, |s| Value::Text(s.to_owned())),
-    ]);
+    let enc = btree.encoding();
+    let rec = encode_record_with_encoding(
+        &[
+            Value::Text(obj_type.to_owned()),
+            Value::Text(name.to_owned()),
+            Value::Text(tbl_name.to_owned()),
+            Value::Integer(i64::from(rootpage)),
+            sql.map_or(Value::Null, |s| Value::Text(s.to_owned())),
+        ],
+        enc,
+    );
     btree.insert_table(1, schema_rowid, &rec)?;
     bump_schema_cookie(btree)
 }

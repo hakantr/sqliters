@@ -2,18 +2,80 @@
 //! ported from `sqlite/src/func.c`.
 
 use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqliters_types::{
     Collation, ErrorCode, Result, SQLITE_SOURCE_ID, SQLITE_VERSION, SqliteError, Value,
     format_sqlite_real,
 };
 
-/// Connection-level execution metadata exposed to SQL functions (`last_insert_rowid()`, `changes()`, etc.).
+/// Connection-level execution metadata exposed to SQL functions (`last_insert_rowid()`, `changes()`,
+/// and statement-consistent UTC timestamp `stmt_timestamp_ms`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VmRuntimeContext {
     pub last_insert_rowid: i64,
     pub last_changes: u64,
     pub total_changes: u64,
+    /// UTC Unix epoch milliseconds captured at the start of statement execution (`sqlite3StmtCurrentTime`).
+    pub stmt_timestamp_ms: Option<i64>,
+}
+
+impl VmRuntimeContext {
+    /// Returns the statement's frozen UTC timestamp in Unix epoch milliseconds,
+    /// falling back to `SystemTime::now()` if not explicitly initialized.
+    #[inline]
+    pub fn effective_timestamp_ms(&self) -> i64 {
+        self.stmt_timestamp_ms.unwrap_or_else(system_utc_millis)
+    }
+}
+
+/// Current OS UTC clock in Unix epoch milliseconds.
+pub fn system_utc_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Converts Unix epoch seconds into proleptic Gregorian `(year, month 1..=12, day 1..=31, hour, min, sec)` in UTC
+/// (Howard Hinnant's `civil_from_days` algorithm, matching SQLite `computeYMD` / `computeHMS` in `date.c`).
+pub fn utc_ymdhms_from_unix_ms(unix_ms: i64) -> (i32, u32, u32, u32, u32, u32) {
+    let total_secs = unix_ms.div_euclid(1_000);
+    let days = total_secs.div_euclid(86_400);
+    let sec_of_day = total_secs.rem_euclid(86_400) as u32;
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32; // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let mut y = i64::from(yoe) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    if m <= 2 {
+        y += 1;
+    }
+
+    let hh = sec_of_day / 3_600;
+    let mm = (sec_of_day % 3_600) / 60;
+    let ss = sec_of_day % 60;
+    (y as i32, m, d, hh, mm, ss)
+}
+
+pub fn format_utc_date(unix_ms: i64) -> String {
+    let (y, m, d, _, _, _) = utc_ymdhms_from_unix_ms(unix_ms);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+pub fn format_utc_time(unix_ms: i64) -> String {
+    let (_, _, _, hh, mm, ss) = utc_ymdhms_from_unix_ms(unix_ms);
+    format!("{hh:02}:{mm:02}:{ss:02}")
+}
+
+pub fn format_utc_timestamp(unix_ms: i64) -> String {
+    let (y, m, d, hh, mm, ss) = utc_ymdhms_from_unix_ms(unix_ms);
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}")
 }
 
 /// Evaluates a built-in SQLite scalar function (`func.c`).
@@ -383,6 +445,23 @@ pub fn eval_scalar_function(
             check_arity(name, args, 0, 0)?;
             Ok(Value::Integer(ctx.total_changes as i64))
         }
+        "CURRENT_DATE" => {
+            check_arity(name, args, 0, 0)?;
+            Ok(Value::Text(format_utc_date(ctx.effective_timestamp_ms())))
+        }
+        "CURRENT_TIME" => {
+            check_arity(name, args, 0, 0)?;
+            Ok(Value::Text(format_utc_time(ctx.effective_timestamp_ms())))
+        }
+        "CURRENT_TIMESTAMP" => {
+            check_arity(name, args, 0, 0)?;
+            Ok(Value::Text(format_utc_timestamp(
+                ctx.effective_timestamp_ms(),
+            )))
+        }
+        "DATE" | "TIME" | "DATETIME" | "UNIXEPOCH" | "JULIANDAY" => {
+            eval_datetime_function(&upper, args, ctx)
+        }
         _ => Err(SqliteError::new(
             ErrorCode::Error,
             format!("no such function: {name}"),
@@ -398,6 +477,157 @@ fn check_arity(name: &str, args: &[Value], min: usize, max: usize) -> Result<()>
         ))
     } else {
         Ok(())
+    }
+}
+
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = y - i64::from(m <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + i64::from(doe) - 719_468
+}
+
+fn parse_time_value_to_unix_ms(val: &Value, modifiers: &[Value], ctx: &VmRuntimeContext) -> Option<i64> {
+    if val.is_null() || modifiers.iter().any(Value::is_null) {
+        return None;
+    }
+    let has_unixepoch = modifiers
+        .iter()
+        .any(|m| m.to_text_lossy().trim().eq_ignore_ascii_case("unixepoch"));
+
+    let mut ms = match val {
+        Value::Integer(i) if has_unixepoch => i.saturating_mul(1_000),
+        Value::Real(r) if has_unixepoch => (*r * 1_000.0).round() as i64,
+        Value::Integer(jd) => {
+            // Julian day -> Unix ms (`2440587.5` JD = Unix epoch)
+            ((*jd as f64 - 2_440_587.5) * 86_400_000.0).round() as i64
+        }
+        Value::Real(jd) => ((*jd - 2_440_587.5) * 86_400_000.0).round() as i64,
+        Value::Text(s) => {
+            let t = s.trim();
+            if t.eq_ignore_ascii_case("now") {
+                ctx.effective_timestamp_ms()
+            } else if has_unixepoch && let Ok(f) = t.parse::<f64>() {
+                (f * 1_000.0).round() as i64
+            } else {
+                parse_iso_datetime_ms(t)?
+            }
+        }
+        Value::Null | Value::Blob(_) => return None,
+    };
+
+    for m in modifiers {
+        let mod_str = m.to_text_lossy();
+        let mt = mod_str.trim();
+        if mt.eq_ignore_ascii_case("unixepoch") || mt.eq_ignore_ascii_case("utc") {
+            continue;
+        }
+        if let Some(delta_ms) = parse_relative_modifier_ms(mt) {
+            ms = ms.saturating_add(delta_ms);
+        } else {
+            return None;
+        }
+    }
+    Some(ms)
+}
+
+fn parse_iso_datetime_ms(s: &str) -> Option<i64> {
+    // Supports "YYYY-MM-DD", "YYYY-MM-DD HH:MM[:SS]", "YYYY-MM-DDTHH:MM[:SS][Z]", or "HH:MM[:SS]"
+    let s = s.strip_suffix('Z').or_else(|| s.strip_suffix('z')).unwrap_or(s);
+    if s.len() >= 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-' {
+        let y: i64 = s[0..4].parse().ok()?;
+        let m: u32 = s[5..7].parse().ok()?;
+        let d: u32 = s[8..10].parse().ok()?;
+        if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+            return None;
+        }
+        let days = days_from_civil(y, m, d);
+        let rest = s[10..].trim_start_matches([' ', 'T', 't']);
+        let hms_ms = if rest.is_empty() {
+            0
+        } else {
+            parse_hms_ms(rest)?
+        };
+        Some(days * 86_400_000 + hms_ms)
+    } else if s.contains(':') {
+        // SQLite treats bare "HH:MM:SS" as on 2000-01-01
+        let days = days_from_civil(2000, 1, 1);
+        Some(days * 86_400_000 + parse_hms_ms(s)?)
+    } else {
+        None
+    }
+}
+
+fn parse_hms_ms(s: &str) -> Option<i64> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return None;
+    }
+    let hh: u32 = parts[0].parse().ok()?;
+    let mm: u32 = parts[1].parse().ok()?;
+    let (ss, ms) = if parts.len() == 3 {
+        if let Some((sec_part, frac_part)) = parts[2].split_once('.') {
+            let sec: u32 = sec_part.parse().ok()?;
+            let mut frac_digits = String::from(frac_part);
+            frac_digits.truncate(3);
+            while frac_digits.len() < 3 {
+                frac_digits.push('0');
+            }
+            let millis: u32 = frac_digits.parse().ok()?;
+            (sec, millis)
+        } else {
+            (parts[2].parse().ok()?, 0)
+        }
+    } else {
+        (0, 0)
+    };
+    if hh > 23 || mm > 59 || ss > 59 {
+        return None;
+    }
+    Some((i64::from(hh) * 3_600 + i64::from(mm) * 60 + i64::from(ss)) * 1_000 + i64::from(ms))
+}
+
+fn parse_relative_modifier_ms(s: &str) -> Option<i64> {
+    let mut parts = s.split_whitespace();
+    let num: f64 = parts.next()?.parse().ok()?;
+    let unit = parts.next()?.to_ascii_lowercase();
+    if parts.next().is_some() {
+        return None;
+    }
+    let mult_ms = match unit.trim_end_matches('s') {
+        "second" => 1_000.0,
+        "minute" => 60_000.0,
+        "hour" => 3_600_000.0,
+        "day" => 86_400_000.0,
+        _ => return None,
+    };
+    Some((num * mult_ms).round() as i64)
+}
+
+fn eval_datetime_function(
+    upper_name: &str,
+    args: &[Value],
+    ctx: &VmRuntimeContext,
+) -> Result<Value> {
+    let unix_ms = if args.is_empty() {
+        ctx.effective_timestamp_ms()
+    } else {
+        let Some(ms) = parse_time_value_to_unix_ms(&args[0], &args[1..], ctx) else {
+            return Ok(Value::Null);
+        };
+        ms
+    };
+
+    match upper_name {
+        "DATE" => Ok(Value::Text(format_utc_date(unix_ms))),
+        "TIME" => Ok(Value::Text(format_utc_time(unix_ms))),
+        "DATETIME" => Ok(Value::Text(format_utc_timestamp(unix_ms))),
+        "UNIXEPOCH" => Ok(Value::Integer(unix_ms.div_euclid(1_000))),
+        "JULIANDAY" => Ok(Value::real((unix_ms as f64) / 86_400_000.0 + 2_440_587.5)),
+        _ => unreachable!(),
     }
 }
 

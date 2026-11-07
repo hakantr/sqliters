@@ -102,6 +102,116 @@ impl TypeAffinity {
     }
 }
 
+/// On-disk database text encoding (`SQLITE_UTF8 = 1`, `SQLITE_UTF16LE = 2`, `SQLITE_UTF16BE = 3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(u32)]
+pub enum TextEncoding {
+    #[default]
+    Utf8 = 1,
+    Utf16Le = 2,
+    Utf16Be = 3,
+}
+
+impl TextEncoding {
+    /// Parses the 4-byte integer at offset 56 of the SQLite database header.
+    /// `0` (uninitialized header) normalizes to `Utf8`; values outside `0..=3` return `None`.
+    #[inline]
+    pub const fn from_header_u32(raw: u32) -> Option<Self> {
+        match raw {
+            0 | 1 => Some(Self::Utf8),
+            2 => Some(Self::Utf16Le),
+            3 => Some(Self::Utf16Be),
+            _ => None,
+        }
+    }
+
+    /// Parses a `PRAGMA encoding` string (`UTF-8`, `UTF-16`, `UTF-16le`, `UTF-16be`).
+    pub fn from_pragma_name(name: &str) -> Option<Self> {
+        let trimmed = name.trim().trim_matches(|c| c == '\'' || c == '"');
+        if trimmed.eq_ignore_ascii_case("UTF-8") || trimmed.eq_ignore_ascii_case("UTF8") {
+            Some(Self::Utf8)
+        } else if trimmed.eq_ignore_ascii_case("UTF-16") || trimmed.eq_ignore_ascii_case("UTF16") {
+            if cfg!(target_endian = "little") {
+                Some(Self::Utf16Le)
+            } else {
+                Some(Self::Utf16Be)
+            }
+        } else if trimmed.eq_ignore_ascii_case("UTF-16le")
+            || trimmed.eq_ignore_ascii_case("UTF16le")
+        {
+            Some(Self::Utf16Le)
+        } else if trimmed.eq_ignore_ascii_case("UTF-16be")
+            || trimmed.eq_ignore_ascii_case("UTF16be")
+        {
+            Some(Self::Utf16Be)
+        } else {
+            None
+        }
+    }
+
+    /// Canonical string returned by `PRAGMA encoding`.
+    #[inline]
+    pub const fn as_pragma_str(self) -> &'static str {
+        match self {
+            Self::Utf8 => "UTF-8",
+            Self::Utf16Le => "UTF-16le",
+            Self::Utf16Be => "UTF-16be",
+        }
+    }
+
+    /// Byte length of `s` when serialized in this database encoding.
+    #[inline]
+    pub fn encoded_byte_len(self, s: &str) -> usize {
+        match self {
+            Self::Utf8 => s.len(),
+            Self::Utf16Le | Self::Utf16Be => s.encode_utf16().count() * 2,
+        }
+    }
+
+    /// Appends `s` encoded in this database encoding into `out`.
+    pub fn encode_into(self, s: &str, out: &mut Vec<u8>) {
+        match self {
+            Self::Utf8 => out.extend_from_slice(s.as_bytes()),
+            Self::Utf16Le => {
+                for u in s.encode_utf16() {
+                    out.extend_from_slice(&u.to_le_bytes());
+                }
+            }
+            Self::Utf16Be => {
+                for u in s.encode_utf16() {
+                    out.extend_from_slice(&u.to_be_bytes());
+                }
+            }
+        }
+    }
+
+    /// Decodes raw record payload bytes into a UTF-8 Rust `String` according to this encoding.
+    pub fn decode_bytes(self, buf: &[u8]) -> String {
+        match self {
+            Self::Utf8 => match std::str::from_utf8(buf) {
+                Ok(s) => s.to_owned(),
+                Err(_) => String::from_utf8_lossy(buf).into_owned(),
+            },
+            Self::Utf16Le => {
+                let iter = buf
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]));
+                char::decode_utf16(iter)
+                    .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+                    .collect()
+            }
+            Self::Utf16Be => {
+                let iter = buf
+                    .chunks_exact(2)
+                    .map(|c| u16::from_be_bytes([c[0], c[1]]));
+                char::decode_utf16(iter)
+                    .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+                    .collect()
+            }
+        }
+    }
+}
+
 /// Built-in SQLite collating sequences (`BINARY`, `NOCASE`, `RTRIM`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Collation {
@@ -125,8 +235,49 @@ impl Collation {
     }
 
     pub fn compare_str(self, a: &str, b: &str) -> Ordering {
+        self.compare_str_with_encoding(a, b, TextEncoding::Utf8)
+    }
+
+    /// Compares `a` and `b` using SQLite's exact collation rules for the database's [`TextEncoding`].
+    /// In SQLite (`main.c`), `BINARY` runs `memcmp` on the database's native text encoding
+    /// (`UTF-8`, `UTF-16le`, or `UTF-16be`), while `NOCASE` and `RTRIM` operate on UTF-8.
+    pub fn compare_str_with_encoding(self, a: &str, b: &str, enc: TextEncoding) -> Ordering {
         match self {
-            Self::Binary => a.as_bytes().cmp(b.as_bytes()),
+            Self::Binary => match enc {
+                TextEncoding::Utf8 => a.as_bytes().cmp(b.as_bytes()),
+                TextEncoding::Utf16Le => {
+                    let mut ia = a.encode_utf16();
+                    let mut ib = b.encode_utf16();
+                    loop {
+                        match (ia.next(), ib.next()) {
+                            (Some(ua), Some(ub)) => {
+                                match ua.to_le_bytes().cmp(&ub.to_le_bytes()) {
+                                    Ordering::Equal => continue,
+                                    non_eq => return non_eq,
+                                }
+                            }
+                            (None, Some(_)) => return Ordering::Less,
+                            (Some(_), None) => return Ordering::Greater,
+                            (None, None) => return Ordering::Equal,
+                        }
+                    }
+                }
+                TextEncoding::Utf16Be => {
+                    let mut ia = a.encode_utf16();
+                    let mut ib = b.encode_utf16();
+                    loop {
+                        match (ia.next(), ib.next()) {
+                            (Some(ua), Some(ub)) => match ua.cmp(&ub) {
+                                Ordering::Equal => continue,
+                                non_eq => return non_eq,
+                            },
+                            (None, Some(_)) => return Ordering::Less,
+                            (Some(_), None) => return Ordering::Greater,
+                            (None, None) => return Ordering::Equal,
+                        }
+                    }
+                }
+            },
             Self::NoCase => {
                 for (&ba, &bb) in a.as_bytes().iter().zip(b.as_bytes().iter()) {
                     let la = ba.to_ascii_lowercase();
@@ -291,6 +442,16 @@ impl Value {
     ///
     /// Order: `NULL < (Integer / Real) < Text < Blob`.
     pub fn cmp_sqlite(&self, other: &Self, collation: Collation) -> Ordering {
+        self.cmp_sqlite_with_encoding(other, collation, TextEncoding::Utf8)
+    }
+
+    /// Compares two values using SQLite's exact B-tree / `ORDER BY` sort rules under `enc`.
+    pub fn cmp_sqlite_with_encoding(
+        &self,
+        other: &Self,
+        collation: Collation,
+        enc: TextEncoding,
+    ) -> Ordering {
         match (self, other) {
             (Self::Null, Self::Null) => Ordering::Equal,
             (Self::Null, _) => Ordering::Less,
@@ -304,7 +465,7 @@ impl Value {
             (Self::Integer(_) | Self::Real(_), Self::Text(_) | Self::Blob(_)) => Ordering::Less,
             (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Real(_)) => Ordering::Greater,
 
-            (Self::Text(a), Self::Text(b)) => collation.compare_str(a, b),
+            (Self::Text(a), Self::Text(b)) => collation.compare_str_with_encoding(a, b, enc),
             (Self::Text(_), Self::Blob(_)) => Ordering::Less,
             (Self::Blob(_), Self::Text(_)) => Ordering::Greater,
 

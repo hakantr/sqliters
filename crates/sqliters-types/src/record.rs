@@ -12,14 +12,20 @@
 use std::cmp::Ordering;
 
 use crate::error::{Result, SqliteError};
-use crate::value::{Collation, Value};
+use crate::value::{Collation, TextEncoding, Value};
 use crate::varint::{get_varint, push_varint, varint_len};
 
 const MAX_6BYTE_INT: u64 = (0x0000_8000_u64 << 32) - 1; // 140_737_488_355_327
 
-/// Computes `(serial_type, data_byte_len)` for `value` under SQLite file format 4 (`vdbeaux.c:3919`).
+/// Computes `(serial_type, data_byte_len)` for `value` under UTF-8 SQLite file format 4 (`vdbeaux.c:3919`).
 #[inline]
 pub fn serial_type_for(value: &Value) -> (u64, usize) {
+    serial_type_for_with_encoding(value, TextEncoding::Utf8)
+}
+
+/// Computes `(serial_type, data_byte_len)` for `value` under `enc` (`UTF-8`, `UTF-16le`, or `UTF-16be`).
+#[inline]
+pub fn serial_type_for_with_encoding(value: &Value, enc: TextEncoding) -> (u64, usize) {
     match value {
         Value::Null => (0, 0),
         Value::Integer(i) => {
@@ -57,7 +63,7 @@ pub fn serial_type_for(value: &Value) -> (u64, usize) {
             ((n as u64) * 2 + 12, n)
         }
         Value::Text(s) => {
-            let n = s.len();
+            let n = enc.encoded_byte_len(s);
             ((n as u64) * 2 + 13, n)
         }
     }
@@ -81,14 +87,19 @@ pub fn serial_type_len(serial_type: u64) -> Result<usize> {
     }
 }
 
-/// Serializes a slice of [`Value`]s into an SQLite Format-3 record (`OP_MakeRecord`).
+/// Serializes a slice of [`Value`]s into an SQLite Format-3 record using UTF-8 (`OP_MakeRecord`).
 pub fn encode_record(values: &[Value]) -> Vec<u8> {
+    encode_record_with_encoding(values, TextEncoding::Utf8)
+}
+
+/// Serializes a slice of [`Value`]s into an SQLite Format-3 record using `enc` (`OP_MakeRecord`).
+pub fn encode_record_with_encoding(values: &[Value], enc: TextEncoding) -> Vec<u8> {
     let mut serials = Vec::with_capacity(values.len());
     let mut serial_bytes_len = 0usize;
     let mut body_len = 0usize;
 
     for v in values {
-        let (st, len) = serial_type_for(v);
+        let (st, len) = serial_type_for_with_encoding(v, enc);
         serial_bytes_len += varint_len(st);
         body_len += len;
         serials.push(st);
@@ -109,13 +120,13 @@ pub fn encode_record(values: &[Value]) -> Vec<u8> {
     debug_assert_eq!(out.len(), hdr_len);
 
     for (v, &st) in values.iter().zip(serials.iter()) {
-        write_serial_value(&mut out, v, st);
+        write_serial_value(&mut out, v, st, enc);
     }
 
     out
 }
 
-fn write_serial_value(out: &mut Vec<u8>, value: &Value, serial_type: u64) {
+fn write_serial_value(out: &mut Vec<u8>, value: &Value, serial_type: u64, enc: TextEncoding) {
     match (value, serial_type) {
         (Value::Null, _) | (_, 0 | 8 | 9) => {}
         (Value::Integer(i), 1) => out.push(*i as u8),
@@ -132,13 +143,22 @@ fn write_serial_value(out: &mut Vec<u8>, value: &Value, serial_type: u64) {
         (Value::Integer(i), 6) => out.extend_from_slice(&i.to_be_bytes()),
         (Value::Real(r), 7) => out.extend_from_slice(&r.to_bits().to_be_bytes()),
         (Value::Blob(b), _) => out.extend_from_slice(b),
-        (Value::Text(s), _) => out.extend_from_slice(s.as_bytes()),
+        (Value::Text(s), _) => enc.encode_into(s, out),
         _ => unreachable!("serial_type matched value in encode_record"),
     }
 }
 
-/// Decodes a single value given its `serial_type` and exact byte slice (`sqlite3VdbeSerialGet`).
+/// Decodes a single value given its `serial_type` and exact byte slice under UTF-8 (`sqlite3VdbeSerialGet`).
 pub fn decode_serial_value(serial_type: u64, buf: &[u8]) -> Result<Value> {
+    decode_serial_value_with_encoding(serial_type, buf, TextEncoding::Utf8)
+}
+
+/// Decodes a single value given its `serial_type` and exact byte slice under `enc` (`sqlite3VdbeSerialGet`).
+pub fn decode_serial_value_with_encoding(
+    serial_type: u64,
+    buf: &[u8],
+    enc: TextEncoding,
+) -> Result<Value> {
     match serial_type {
         0 => Ok(Value::Null),
         1 => Ok(Value::Integer(i64::from(buf[0] as i8))),
@@ -181,19 +201,17 @@ pub fn decode_serial_value(serial_type: u64, buf: &[u8]) -> Result<Value> {
             "reserved serial type {serial_type}"
         ))),
         n if (n & 1) == 0 => Ok(Value::Blob(buf.to_vec())),
-        _ => {
-            // SQLite stores UTF-8 text; tolerate invalid UTF-8 from legacy/external files lossily if needed,
-            // preferring zero-copy String::from_utf8 when valid.
-            match std::str::from_utf8(buf) {
-                Ok(s) => Ok(Value::Text(s.to_owned())),
-                Err(_) => Ok(Value::Text(String::from_utf8_lossy(buf).into_owned())),
-            }
-        }
+        _ => Ok(Value::Text(enc.decode_bytes(buf))),
     }
 }
 
-/// Decodes all columns from a serialized SQLite record.
+/// Decodes all columns from a serialized UTF-8 SQLite record.
 pub fn decode_record(record: &[u8]) -> Result<Vec<Value>> {
+    decode_record_with_encoding(record, TextEncoding::Utf8)
+}
+
+/// Decodes all columns from a serialized SQLite record using `enc`.
+pub fn decode_record_with_encoding(record: &[u8], enc: TextEncoding) -> Result<Vec<Value>> {
     if record.is_empty() {
         return Ok(Vec::new());
     }
@@ -216,16 +234,29 @@ pub fn decode_record(record: &[u8]) -> Result<Vec<Value>> {
         if end > record.len() {
             return Err(SqliteError::corrupt("record payload truncated"));
         }
-        values.push(decode_serial_value(st, &record[body_pos..end])?);
+        values.push(decode_serial_value_with_encoding(
+            st,
+            &record[body_pos..end],
+            enc,
+        )?);
         body_pos = end;
     }
     Ok(values)
 }
 
-/// Fast single-column extraction (`OP_Column`): decodes only column `col_idx` (0-based).
+/// Fast single-column extraction (`OP_Column`) under UTF-8: decodes only column `col_idx` (0-based).
+pub fn decode_record_column(record: &[u8], col_idx: usize) -> Result<Option<Value>> {
+    decode_record_column_with_encoding(record, col_idx, TextEncoding::Utf8)
+}
+
+/// Fast single-column extraction (`OP_Column`) under `enc`: decodes only column `col_idx` (0-based).
 /// If the record has fewer columns than `col_idx + 1` (e.g. after `ALTER TABLE ADD COLUMN`),
 /// returns `Ok(None)` so the caller can substitute the column's `DEFAULT` value (`NULL` if none).
-pub fn decode_record_column(record: &[u8], col_idx: usize) -> Result<Option<Value>> {
+pub fn decode_record_column_with_encoding(
+    record: &[u8],
+    col_idx: usize,
+    enc: TextEncoding,
+) -> Result<Option<Value>> {
     if record.is_empty() {
         return Ok(None);
     }
@@ -249,7 +280,11 @@ pub fn decode_record_column(record: &[u8], col_idx: usize) -> Result<Option<Valu
             return Err(SqliteError::corrupt("record payload truncated"));
         }
         if idx == col_idx {
-            return Ok(Some(decode_serial_value(st, &record[body_pos..end])?));
+            return Ok(Some(decode_serial_value_with_encoding(
+                st,
+                &record[body_pos..end],
+                enc,
+            )?));
         }
         body_pos = end;
         idx += 1;
@@ -275,14 +310,24 @@ impl Default for KeySortOrder {
     }
 }
 
-/// Compares two serialized SQLite index records (`sqlite3VdbeRecordCompare`).
-/// If `rhs_fields` has fewer fields than `lhs` (e.g. prefix index search), compares up to `min(lhs, rhs)`.
+/// Compares two serialized SQLite index records under UTF-8 (`sqlite3VdbeRecordCompare`).
 pub fn compare_records(
     lhs_record: &[u8],
     rhs_values: &[Value],
     orders: &[KeySortOrder],
 ) -> Result<Ordering> {
-    let lhs_values = decode_record(lhs_record)?;
+    compare_records_with_encoding(lhs_record, rhs_values, orders, TextEncoding::Utf8)
+}
+
+/// Compares two serialized SQLite index records under `enc` (`sqlite3VdbeRecordCompare`).
+/// If `rhs_fields` has fewer fields than `lhs` (e.g. prefix index search), compares up to `min(lhs, rhs)`.
+pub fn compare_records_with_encoding(
+    lhs_record: &[u8],
+    rhs_values: &[Value],
+    orders: &[KeySortOrder],
+    enc: TextEncoding,
+) -> Result<Ordering> {
+    let lhs_values = decode_record_with_encoding(lhs_record, enc)?;
     let n = lhs_values.len().min(rhs_values.len());
     for i in 0..n {
         let spec = orders.get(i).copied().unwrap_or_default();
@@ -305,7 +350,7 @@ pub fn compare_records(
                 }
             }
             (false, false) => {
-                let raw = a.cmp_sqlite(b, spec.collation);
+                let raw = a.cmp_sqlite_with_encoding(b, spec.collation, enc);
                 if spec.desc { raw.reverse() } else { raw }
             }
         };

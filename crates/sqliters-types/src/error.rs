@@ -127,8 +127,11 @@ pub mod extended {
     pub const SQLITE_IOERR_TRUNCATE: i32 = (ErrorCode::IoErr as i32) | (6 << 8);
     pub const SQLITE_IOERR_FSTAT: i32 = (ErrorCode::IoErr as i32) | (7 << 8);
     pub const SQLITE_IOERR_UNLOCK: i32 = (ErrorCode::IoErr as i32) | (8 << 8);
+    pub const SQLITE_IOERR_RDLOCK: i32 = (ErrorCode::IoErr as i32) | (9 << 8);
     pub const SQLITE_IOERR_DELETE: i32 = (ErrorCode::IoErr as i32) | (10 << 8);
+    pub const SQLITE_IOERR_CHECKRESERVEDLOCK: i32 = (ErrorCode::IoErr as i32) | (14 << 8);
     pub const SQLITE_IOERR_LOCK: i32 = (ErrorCode::IoErr as i32) | (15 << 8);
+    pub const SQLITE_READONLY_ROLLBACK: i32 = (ErrorCode::ReadOnly as i32) | (3 << 8);
     pub const SQLITE_CORRUPT_INDEX: i32 = (ErrorCode::Corrupt as i32) | (3 << 8);
     pub const SQLITE_CONSTRAINT_CHECK: i32 = (ErrorCode::Constraint as i32) | (1 << 8);
     pub const SQLITE_CONSTRAINT_FOREIGNKEY: i32 = (ErrorCode::Constraint as i32) | (3 << 8);
@@ -139,6 +142,18 @@ pub mod extended {
     pub const SQLITE_CONSTRAINT_DATATYPE: i32 = (ErrorCode::Constraint as i32) | (12 << 8);
 }
 
+/// Transaction/statement rollback behavior attached to a constraint error (`OE_Abort`, `OE_Fail`, `OE_Rollback`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ConflictResolutionEffect {
+    /// Roll back only the current SQL statement's savepoint (`OR ABORT`, SQLite's default).
+    #[default]
+    Abort,
+    /// Stop the current statement immediately **without** rolling back prior row changes made by it (`OR FAIL`).
+    Fail,
+    /// Roll back the entire enclosing transaction and return the connection to autocommit mode (`OR ROLLBACK`).
+    Rollback,
+}
+
 /// Rich error returned across all `sqliters` subsystems.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqliteError {
@@ -146,6 +161,7 @@ pub struct SqliteError {
     pub extended_code: i32,
     pub message: String,
     pub offset: Option<usize>,
+    pub conflict_effect: ConflictResolutionEffect,
 }
 
 impl SqliteError {
@@ -155,6 +171,7 @@ impl SqliteError {
             extended_code: code as i32,
             message: message.into(),
             offset: None,
+            conflict_effect: ConflictResolutionEffect::Abort,
         }
     }
 
@@ -164,11 +181,17 @@ impl SqliteError {
             extended_code,
             message: message.into(),
             offset: None,
+            conflict_effect: ConflictResolutionEffect::Abort,
         }
     }
 
     pub fn with_offset(mut self, offset: usize) -> Self {
         self.offset = Some(offset);
+        self
+    }
+
+    pub fn with_conflict_effect(mut self, effect: ConflictResolutionEffect) -> Self {
+        self.conflict_effect = effect;
         self
     }
 

@@ -10,14 +10,16 @@ pub mod value;
 pub mod varint;
 
 pub use bitvec::Bitvec;
-pub use error::{ErrorCode, Result, SqliteError, extended};
+pub use error::{ConflictResolutionEffect, ErrorCode, Result, SqliteError, extended};
 pub use limits::*;
 pub use record::{
-    KeySortOrder, compare_records, decode_record, decode_record_column, decode_serial_value,
-    encode_record, serial_type_for, serial_type_len,
+    KeySortOrder, compare_records, compare_records_with_encoding, decode_record,
+    decode_record_column, decode_record_column_with_encoding, decode_record_with_encoding,
+    decode_serial_value, decode_serial_value_with_encoding, encode_record,
+    encode_record_with_encoding, serial_type_for, serial_type_for_with_encoding, serial_type_len,
 };
 pub use value::{
-    Collation, StorageClass, TypeAffinity, Value, cmp_int_float, format_sqlite_real,
+    Collation, StorageClass, TextEncoding, TypeAffinity, Value, cmp_int_float, format_sqlite_real,
     parse_numeric_text,
 };
 pub use varint::{

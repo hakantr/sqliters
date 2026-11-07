@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use sqliters_pager::{Pager, TransactionState};
 use sqliters_types::{
-    Bitvec, ErrorCode, KeySortOrder, Pgno, Result, SqliteError, Value, compare_records,
-    decode_record,
+    Bitvec, ErrorCode, KeySortOrder, Pgno, Result, SqliteError, TextEncoding, Value,
+    compare_records_with_encoding, decode_record_with_encoding,
 };
 use sqliters_vfs::{OpenFlags, Vfs};
 
@@ -78,6 +78,11 @@ impl Btree {
     #[inline]
     pub const fn transaction_state(&self) -> TransactionState {
         self.pager.transaction_state()
+    }
+
+    #[inline]
+    pub const fn encoding(&self) -> TextEncoding {
+        self.pager.encoding()
     }
 
     // ========================================================================
@@ -801,6 +806,7 @@ impl Btree {
         orders: &[KeySortOrder],
         out: &mut Vec<Vec<Value>>,
     ) -> Result<()> {
+        let enc = self.encoding();
         let parsed = self.read_parsed_page(pgno)?;
         match parsed {
             ParsedPage::IndexLeaf { cells } => {
@@ -810,9 +816,9 @@ impl Btree {
                         &c.local_payload,
                         c.overflow_page,
                     )?;
-                    match compare_records(&rec, prefix_values, orders)? {
+                    match compare_records_with_encoding(&rec, prefix_values, orders, enc)? {
                         Ordering::Less => continue,
-                        Ordering::Equal => out.push(decode_record(&rec)?),
+                        Ordering::Equal => out.push(decode_record_with_encoding(&rec, enc)?),
                         Ordering::Greater => break,
                     }
                 }
@@ -826,7 +832,7 @@ impl Btree {
                         &c.local_payload,
                         c.overflow_page,
                     )?;
-                    match compare_records(&rec, prefix_values, orders)? {
+                    match compare_records_with_encoding(&rec, prefix_values, orders, enc)? {
                         Ordering::Less => continue,
                         Ordering::Equal => {
                             self.seek_index_equal_rec(
@@ -835,7 +841,7 @@ impl Btree {
                                 orders,
                                 out,
                             )?;
-                            out.push(decode_record(&rec)?);
+                            out.push(decode_record_with_encoding(&rec, enc)?);
                         }
                         Ordering::Greater => {
                             self.seek_index_equal_rec(
@@ -865,7 +871,8 @@ impl Btree {
         record_bytes: &[u8],
         orders: &[KeySortOrder],
     ) -> Result<()> {
-        let key_vals = decode_record(record_bytes)?;
+        let enc = self.encoding();
+        let key_vals = decode_record_with_encoding(record_bytes, enc)?;
         let usable = self.pager.usable_size();
         let bounds = PayloadBounds::for_index(usable);
         let (total_len, local_payload, overflow_page) =
@@ -904,6 +911,7 @@ impl Btree {
         key_vals: &[Value],
         orders: &[KeySortOrder],
     ) -> Result<Option<(IndexLeafCell, Pgno)>> {
+        let enc = self.encoding();
         let usable = self.pager.usable_size();
         let parsed = self.read_parsed_page(pgno)?;
 
@@ -916,7 +924,7 @@ impl Btree {
                         &existing.local_payload,
                         existing.overflow_page,
                     )?;
-                    match compare_records(&rec, key_vals, orders)? {
+                    match compare_records_with_encoding(&rec, key_vals, orders, enc)? {
                         Ordering::Less => continue,
                         Ordering::Equal => {
                             let old = std::mem::replace(&mut cells[i], new_cell);
@@ -959,7 +967,7 @@ impl Btree {
                         &existing.local_payload,
                         existing.overflow_page,
                     )?;
-                    match compare_records(&rec, key_vals, orders)? {
+                    match compare_records_with_encoding(&rec, key_vals, orders, enc)? {
                         Ordering::Less => continue,
                         Ordering::Equal => {
                             let old_ovfl = existing.overflow_page;
@@ -1105,11 +1113,14 @@ impl Btree {
         }
 
         // Structural delete (interior cell hit or 1-cell leaf underflow): collect remaining entries and rewrite cleanly!
+        let enc = self.encoding();
         let all_records = self.scan_index(root_pgno)?;
         let mut remaining = Vec::with_capacity(all_records.len());
         let mut removed = false;
         for rec in all_records {
-            if !removed && compare_records(&rec, key_vals, orders)? == Ordering::Equal {
+            if !removed
+                && compare_records_with_encoding(&rec, key_vals, orders, enc)? == Ordering::Equal
+            {
                 removed = true;
                 continue;
             }
@@ -1131,6 +1142,7 @@ impl Btree {
         key_vals: &[Value],
         orders: &[KeySortOrder],
     ) -> Result<Option<bool>> {
+        let enc = self.encoding();
         let mut cur_pgno = root_pgno;
         loop {
             let parsed = self.read_parsed_page(cur_pgno)?;
@@ -1143,7 +1155,7 @@ impl Btree {
                             &c.local_payload,
                             c.overflow_page,
                         )?;
-                        match compare_records(&rec, key_vals, orders)? {
+                        match compare_records_with_encoding(&rec, key_vals, orders, enc)? {
                             Ordering::Less => continue,
                             Ordering::Equal => {
                                 found_idx = Some(i);
@@ -1172,7 +1184,7 @@ impl Btree {
                             &c.local_payload,
                             c.overflow_page,
                         )?;
-                        match compare_records(&rec, key_vals, orders)? {
+                        match compare_records_with_encoding(&rec, key_vals, orders, enc)? {
                             Ordering::Less => continue,
                             Ordering::Equal => return Ok(None), // Interior cell hit -> structural path
                             Ordering::Greater => {
@@ -1370,6 +1382,7 @@ fn choose_table_leaf_split(cells: &[TableLeafCell]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqliters_types::decode_record;
     use sqliters_types::encode_record;
 
     #[test]

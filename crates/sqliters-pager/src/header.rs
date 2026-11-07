@@ -2,7 +2,7 @@
 
 use sqliters_types::{
     ErrorCode, Pgno, Result, SQLITE_DEFAULT_PAGE_SIZE, SQLITE_FILE_HEADER, SQLITE_MAX_PAGE_SIZE,
-    SQLITE_MIN_PAGE_SIZE, SQLITE_VERSION_NUMBER, SqliteError,
+    SQLITE_MIN_PAGE_SIZE, SQLITE_VERSION_NUMBER, SqliteError, TextEncoding,
 };
 
 /// Size in bytes of the database file header on Page 1.
@@ -67,6 +67,15 @@ impl DatabaseHeader {
         self.page_size - (self.reserved_bytes as u32)
     }
 
+    /// Validated [`TextEncoding`] of this database (`UTF-8`, `UTF-16le`, or `UTF-16be`).
+    #[inline]
+    pub const fn encoding(&self) -> TextEncoding {
+        match TextEncoding::from_header_u32(self.text_encoding) {
+            Some(enc) => enc,
+            None => TextEncoding::Utf8,
+        }
+    }
+
     /// Validates whether `page_size` is a legal SQLite page size (power of 2 in `512..=65536`).
     #[inline]
     pub const fn is_valid_page_size(page_size: u32) -> bool {
@@ -105,10 +114,18 @@ impl DatabaseHeader {
 
         let write_version = buf[18];
         let read_version = buf[19];
-        if read_version > 2 {
+        if write_version == 2 || read_version == 2 {
+            return Err(SqliteError::new(
+                ErrorCode::CantOpen,
+                "WAL mode databases are not supported; checkpoint in SQLite with PRAGMA journal_mode=DELETE first",
+            ));
+        }
+        if write_version != 1 || read_version != 1 {
             return Err(SqliteError::new(
                 ErrorCode::NotADb,
-                format!("unsupported SQLite read format version: {read_version}"),
+                format!(
+                    "unsupported SQLite format versions: write={write_version}, read={read_version}"
+                ),
             ));
         }
 
@@ -137,8 +154,13 @@ impl DatabaseHeader {
         };
 
         let text_encoding = get_u32(56);
-        // Empty freshly initialized DBs may have 0 before first schema write; treat 0 as 1 (UTF-8).
-        let normalized_encoding = if text_encoding == 0 { 1 } else { text_encoding };
+        let Some(enc) = TextEncoding::from_header_u32(text_encoding) else {
+            return Err(SqliteError::new(
+                ErrorCode::NotADb,
+                format!("invalid SQLite text encoding in header: {text_encoding}"),
+            ));
+        };
+        let normalized_encoding = enc as u32;
 
         Ok(Self {
             page_size,

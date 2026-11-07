@@ -1038,13 +1038,16 @@ fn compile_expr(
             prog.emit(Instruction::new(Opcode::Blob, 0, dest, 0).with_p4(P4::Blob(b.clone())));
         }
         Expr::CurrentTimeKw(kind) => {
-            let lit = match kind {
-                CurrentTimeKind::Date => "2026-11-08",
-                CurrentTimeKind::Time => "00:00:00",
-                CurrentTimeKind::Timestamp => "2026-11-08 00:00:00",
+            let fn_name = match kind {
+                CurrentTimeKind::Date => "CURRENT_DATE",
+                CurrentTimeKind::Time => "CURRENT_TIME",
+                CurrentTimeKind::Timestamp => "CURRENT_TIMESTAMP",
             };
             prog.emit(
-                Instruction::new(Opcode::String8, 0, dest, 0).with_p4(P4::Str(lit.to_owned())),
+                Instruction::new(Opcode::Function, 0, 0, dest).with_p4(P4::Func {
+                    name: fn_name.to_owned(),
+                    argc: 0,
+                }),
             );
         }
         Expr::Bind(bp) => {

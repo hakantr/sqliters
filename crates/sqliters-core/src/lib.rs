@@ -12,15 +12,15 @@ use std::sync::Arc;
 use sqliters_btree::Btree;
 use sqliters_pager::TransactionState;
 use sqliters_syntax::{
-    BindParam, Expr, FunctionArgs, InsertSource, ResultColumn, SelectCore, SelectStmt, Stmt,
-    TableOrSubquery, parse_one,
+    BindParam, Expr, FromClause, FunctionArgs, InsertSource, JoinConstraint, ResultColumn,
+    SelectCore, SelectStmt, Stmt, TableOrSubquery, parse_one,
 };
 use sqliters_types::{ErrorCode, Pgno, Result, SqliteError, Value};
 use sqliters_vdbe::{VdbeProgram, VdbeVm, VmRuntimeContext, VmStep};
 use sqliters_vfs::{OpenFlags, Vfs};
 
 pub use engine::QueryOutput;
-pub use schema::{ColumnSchema, IndexSchema, Schema, TableSchema};
+pub use schema::{ColumnSchema, ForeignKeySchema, IndexSchema, Schema, TableSchema};
 
 /// Single result row returned by a query (`sqlite3_column_*`).
 #[derive(Debug, Clone, PartialEq)]
@@ -107,10 +107,12 @@ pub enum StepResult {
 pub struct Connection {
     btree: Btree,
     schema: Schema,
+    schema_loaded: bool,
     runtime: VmRuntimeContext,
     explicit_tx: bool,
     implicit_savepoint_tx: bool,
     foreign_keys: bool,
+    deferred_fk_suspects: Vec<(String, i64, usize)>,
 }
 
 impl Connection {
@@ -146,15 +148,34 @@ impl Connection {
     }
 
     fn from_btree(mut btree: Btree) -> Result<Self> {
-        let schema = Schema::load(&mut btree)?;
+        // Eagerly load schema when possible; if another connection currently holds an EXCLUSIVE lock,
+        // defer schema loading until the first statement (`sqlite3_open` behavior).
+        let (schema, schema_loaded) = match Schema::load(&mut btree) {
+            Ok(s) => (s, true),
+            Err(e) if e.code == ErrorCode::Busy => (Schema::default(), false),
+            Err(e) => return Err(e),
+        };
         Ok(Self {
             btree,
             schema,
+            schema_loaded,
             runtime: VmRuntimeContext::default(),
             explicit_tx: false,
             implicit_savepoint_tx: false,
             foreign_keys: false,
+            deferred_fk_suspects: Vec::new(),
         })
+    }
+
+    fn ensure_schema_loaded(&mut self) -> Result<()> {
+        if !self.schema_loaded
+            || (self.btree.pager().page_count() > 0
+                && self.btree.pager().header().schema_cookie != self.schema.schema_cookie)
+        {
+            self.schema = Schema::load(&mut self.btree)?;
+            self.schema_loaded = true;
+        }
+        Ok(())
     }
 
     /// Executes one or more semicolon-separated SQL statements (`sqlite3_exec`) and returns `self.changes()`.
@@ -191,8 +212,8 @@ impl Connection {
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult> {
         let mut stmt = self.prepare(sql)?;
         stmt.bind_all(params)?;
-        let cols = stmt.column_names().to_vec();
         let rows = stmt.collect_rows()?;
+        let cols = stmt.column_names().to_vec();
         Ok(QueryResult {
             column_names: cols,
             rows,
@@ -212,17 +233,14 @@ impl Connection {
     /// Compiles the first SQL statement in `sql` into a steppable [`Statement`] (`sqlite3_prepare_v2`).
     pub fn prepare(&mut self, sql: &str) -> Result<Statement<'_>> {
         let (stmt_opt, tail) = parse_one(sql)?;
-        if self.btree.pager().page_count() > 0
-            && self.btree.pager().header().schema_cookie != self.schema.schema_cookie
-        {
-            self.schema = Schema::load(&mut self.btree)?;
-        }
+        self.ensure_schema_loaded()?;
         Statement::new(self, stmt_opt, tail.to_owned())
     }
 
     /// Reloads the in-memory schema catalog from Page 1 (`sqlite_schema`).
     pub fn reload_schema(&mut self) -> Result<()> {
         self.schema = Schema::load(&mut self.btree)?;
+        self.schema_loaded = true;
         Ok(())
     }
 
@@ -281,15 +299,25 @@ impl Connection {
     }
 
     fn run_stmt(&mut self, stmt: &Stmt, params: &[Value]) -> Result<QueryOutput> {
-        let mut ctx = engine::ExecContext {
-            btree: &mut self.btree,
-            schema: &mut self.schema,
-            runtime: &mut self.runtime,
-            explicit_tx: &mut self.explicit_tx,
-            implicit_savepoint_tx: &mut self.implicit_savepoint_tx,
-            foreign_keys: &mut self.foreign_keys,
+        self.ensure_schema_loaded()?;
+        let prev_ts = self.runtime.stmt_timestamp_ms;
+        if prev_ts.is_none() {
+            self.runtime.stmt_timestamp_ms = Some(self.btree.pager().vfs().current_unix_millis());
+        }
+        let res = {
+            let mut ctx = engine::ExecContext {
+                btree: &mut self.btree,
+                schema: &mut self.schema,
+                runtime: &mut self.runtime,
+                explicit_tx: &mut self.explicit_tx,
+                implicit_savepoint_tx: &mut self.implicit_savepoint_tx,
+                foreign_keys: &mut self.foreign_keys,
+                deferred_fk_suspects: &mut self.deferred_fk_suspects,
+            };
+            engine::execute_statement(&mut ctx, stmt, params)
         };
-        engine::execute_statement(&mut ctx, stmt, params)
+        self.runtime.stmt_timestamp_ms = prev_ts;
+        res
     }
 }
 
@@ -344,26 +372,8 @@ impl<'conn> Statement<'conn> {
         {
             column_names.clone_from(&prog.column_names);
             compiled_vdbe = Some(prog);
-        } else if let Some(Stmt::Explain { query_plan, .. }) = stmt {
-            column_names = if query_plan {
-                vec![
-                    "id".into(),
-                    "parent".into(),
-                    "notused".into(),
-                    "detail".into(),
-                ]
-            } else {
-                vec![
-                    "addr".into(),
-                    "opcode".into(),
-                    "p1".into(),
-                    "p2".into(),
-                    "p3".into(),
-                    "p4".into(),
-                    "p5".into(),
-                    "comment".into(),
-                ]
-            };
+        } else if let Some(ref s) = stmt {
+            column_names = infer_stmt_column_names(s, &conn.schema);
         }
 
         Ok(Self {
@@ -452,7 +462,10 @@ impl<'conn> Statement<'conn> {
             if let Some(ref prog) = self.compiled_vdbe {
                 let started_read = self.conn.btree.transaction_state() == TransactionState::Open
                     && self.conn.is_autocommit();
-                let vm = VdbeVm::new(prog.clone(), self.params.clone(), self.conn.runtime);
+                let mut vm_rt = self.conn.runtime;
+                vm_rt.stmt_timestamp_ms =
+                    Some(self.conn.btree.pager().vfs().current_unix_millis());
+                let vm = VdbeVm::new(prog.clone(), self.params.clone(), vm_rt);
                 self.state = StatementExecState::Vdbe {
                     vm,
                     started_autocommit_read: started_read,
@@ -460,7 +473,9 @@ impl<'conn> Statement<'conn> {
             } else {
                 let stmt_clone = stmt.clone();
                 let out = self.conn.run_stmt(&stmt_clone, &self.params)?;
-                self.column_names = out.column_names;
+                if !out.column_names.is_empty() {
+                    self.column_names = out.column_names;
+                }
                 self.state = StatementExecState::Materialized {
                     rows: out.rows.into_iter(),
                 };
@@ -474,10 +489,12 @@ impl<'conn> Statement<'conn> {
             } => match vm.step(&mut self.conn.btree) {
                 Ok(VmStep::Row(vals)) => {
                     self.conn.runtime = vm.runtime_ctx;
+                    self.conn.runtime.stmt_timestamp_ms = None;
                     Ok(StepResult::Row(Row::new(vals)))
                 }
                 Ok(VmStep::Done) => {
                     self.conn.runtime = vm.runtime_ctx;
+                    self.conn.runtime.stmt_timestamp_ms = None;
                     if *started_autocommit_read
                         && self.conn.is_autocommit()
                         && self.conn.btree.transaction_state() == TransactionState::Read
@@ -488,6 +505,7 @@ impl<'conn> Statement<'conn> {
                     Ok(StepResult::Done)
                 }
                 Err(e) => {
+                    self.conn.runtime.stmt_timestamp_ms = None;
                     if *started_autocommit_read
                         && self.conn.is_autocommit()
                         && self.conn.btree.transaction_state() == TransactionState::Read
@@ -536,6 +554,252 @@ impl<'conn> Statement<'conn> {
 impl Drop for Statement<'_> {
     fn drop(&mut self) {
         self.finish_vdbe_read_if_needed();
+    }
+}
+
+// ============================================================================
+// Prepare-Time Result Column Name Inference (`sqlite3_column_name`)
+// ============================================================================
+
+fn infer_stmt_column_names(stmt: &Stmt, schema: &Schema) -> Vec<String> {
+    match stmt {
+        Stmt::Explain { query_plan, .. } => {
+            if *query_plan {
+                vec![
+                    "id".into(),
+                    "parent".into(),
+                    "notused".into(),
+                    "detail".into(),
+                ]
+            } else {
+                vec![
+                    "addr".into(),
+                    "opcode".into(),
+                    "p1".into(),
+                    "p2".into(),
+                    "p3".into(),
+                    "p4".into(),
+                    "p5".into(),
+                    "comment".into(),
+                ]
+            }
+        }
+        Stmt::Select(sel) => infer_select_column_names(sel, schema, &[]),
+        Stmt::Insert(ins) => infer_returning_column_names(&ins.table, &ins.returning, schema),
+        Stmt::Update(upd) => infer_returning_column_names(&upd.table, &upd.returning, schema),
+        Stmt::Delete(del) => infer_returning_column_names(&del.table, &del.returning, schema),
+        Stmt::Pragma { name, value, .. } => infer_pragma_column_names(name, value.is_some()),
+        _ => Vec::new(),
+    }
+}
+
+fn infer_select_column_names(
+    sel: &SelectStmt,
+    schema: &Schema,
+    outer_ctes: &[(String, Vec<String>)],
+) -> Vec<String> {
+    let mut ctes = outer_ctes.to_vec();
+    for cte in &sel.ctes {
+        let cols = cte
+            .columns
+            .clone()
+            .unwrap_or_else(|| infer_select_column_names(&cte.query, schema, &ctes));
+        ctes.push((cte.name.clone(), cols));
+    }
+    infer_select_core_column_names(&sel.body.head, schema, &ctes)
+}
+
+fn infer_select_core_column_names(
+    core: &SelectCore,
+    schema: &Schema,
+    ctes: &[(String, Vec<String>)],
+) -> Vec<String> {
+    match core {
+        SelectCore::Values(rows) => {
+            let width = rows.first().map_or(0, Vec::len);
+            (1..=width).map(|i| format!("column{i}")).collect()
+        }
+        SelectCore::Select {
+            projection, from, ..
+        } => {
+            let from_cols = from
+                .as_ref()
+                .map(|fc| infer_from_columns(fc, schema, ctes))
+                .unwrap_or_default();
+            expand_result_column_names(projection, &from_cols)
+        }
+    }
+}
+
+fn infer_from_columns(
+    fc: &FromClause,
+    schema: &Schema,
+    ctes: &[(String, Vec<String>)],
+) -> Vec<(Option<String>, String)> {
+    let mut left = infer_tos_columns(&fc.head, schema, ctes);
+    for j in &fc.joins {
+        let right = infer_tos_columns(&j.right, schema, ctes);
+        let using_cols: Vec<String> = if j.natural {
+            let mut shared = Vec::new();
+            for (_, lname) in &left {
+                if right.iter().any(|(_, rname)| rname.eq_ignore_ascii_case(lname))
+                    && !shared.iter().any(|s: &String| s.eq_ignore_ascii_case(lname))
+                {
+                    shared.push(lname.clone());
+                }
+            }
+            shared
+        } else if let Some(JoinConstraint::Using(cols)) = &j.constraint {
+            cols.clone()
+        } else {
+            Vec::new()
+        };
+        for (ralias, rname) in right {
+            if using_cols.iter().any(|u| u.eq_ignore_ascii_case(&rname)) {
+                continue;
+            }
+            left.push((ralias, rname));
+        }
+    }
+    left
+}
+
+fn infer_tos_columns(
+    tos: &TableOrSubquery,
+    schema: &Schema,
+    ctes: &[(String, Vec<String>)],
+) -> Vec<(Option<String>, String)> {
+    match tos {
+        TableOrSubquery::Table { name, alias } => {
+            let eff = alias.clone().unwrap_or_else(|| name.clone());
+            if let Some((_, cte_cols)) = ctes.iter().rev().find(|(n, _)| n.eq_ignore_ascii_case(name))
+            {
+                return cte_cols
+                    .iter()
+                    .map(|c| (Some(eff.clone()), c.clone()))
+                    .collect();
+            }
+            if let Some(tbl) = schema.find_table(name) {
+                return tbl
+                    .columns
+                    .iter()
+                    .map(|c| (Some(eff.clone()), c.name.clone()))
+                    .collect();
+            }
+            Vec::new()
+        }
+        TableOrSubquery::Subquery { query, alias } => {
+            let sub_cols = infer_select_column_names(query, schema, ctes);
+            sub_cols
+                .into_iter()
+                .map(|c| (alias.clone(), c))
+                .collect()
+        }
+    }
+}
+
+fn expand_result_column_names(
+    projection: &[ResultColumn],
+    from_cols: &[(Option<String>, String)],
+) -> Vec<String> {
+    let mut names = Vec::new();
+    for rc in projection {
+        match rc {
+            ResultColumn::Star => {
+                for (_, cname) in from_cols {
+                    names.push(cname.clone());
+                }
+            }
+            ResultColumn::TableStar(tname) => {
+                for (talias, cname) in from_cols {
+                    if talias
+                        .as_ref()
+                        .is_some_and(|ta| ta.eq_ignore_ascii_case(tname))
+                    {
+                        names.push(cname.clone());
+                    }
+                }
+            }
+            ResultColumn::Expr { expr, alias } => {
+                names.push(
+                    alias
+                        .clone()
+                        .unwrap_or_else(|| compiler::expr_column_label(expr)),
+                );
+            }
+        }
+    }
+    names
+}
+
+fn infer_returning_column_names(
+    table_name: &str,
+    returning: &[ResultColumn],
+    schema: &Schema,
+) -> Vec<String> {
+    if returning.is_empty() {
+        return Vec::new();
+    }
+    let from_cols: Vec<(Option<String>, String)> = schema
+        .find_table(table_name)
+        .map(|tbl| {
+            tbl.columns
+                .into_iter()
+                .map(|c| (Some(table_name.to_owned()), c.name))
+                .collect()
+        })
+        .unwrap_or_default();
+    expand_result_column_names(returning, &from_cols)
+}
+
+fn infer_pragma_column_names(name: &str, has_arg: bool) -> Vec<String> {
+    let upper = name.to_ascii_uppercase();
+    match upper.as_str() {
+        "INTEGRITY_CHECK" | "QUICK_CHECK" => vec!["integrity_check".into()],
+        "JOURNAL_MODE" => vec!["journal_mode".into()],
+        "PAGE_SIZE" | "PAGE_COUNT" | "FREELIST_COUNT" | "USER_VERSION" | "APPLICATION_ID"
+        | "SCHEMA_VERSION" | "ENCODING" | "FOREIGN_KEYS" | "SYNCHRONOUS" | "CACHE_SIZE" => {
+            if has_arg {
+                Vec::new()
+            } else {
+                vec![upper.to_ascii_lowercase()]
+            }
+        }
+        "DATABASE_LIST" => vec!["seq".into(), "name".into(), "file".into()],
+        "TABLE_INFO" if has_arg => vec![
+            "cid".into(),
+            "name".into(),
+            "type".into(),
+            "notnull".into(),
+            "dflt_value".into(),
+            "pk".into(),
+        ],
+        "INDEX_LIST" if has_arg => vec![
+            "seq".into(),
+            "name".into(),
+            "unique".into(),
+            "origin".into(),
+            "partial".into(),
+        ],
+        "INDEX_INFO" if has_arg => vec!["seqno".into(), "cid".into(), "name".into()],
+        "FOREIGN_KEY_LIST" if has_arg => vec![
+            "id".into(),
+            "seq".into(),
+            "table".into(),
+            "from".into(),
+            "to".into(),
+            "on_update".into(),
+            "on_delete".into(),
+            "match".into(),
+        ],
+        "FOREIGN_KEY_CHECK" => vec![
+            "table".into(),
+            "rowid".into(),
+            "parent".into(),
+            "fkid".into(),
+        ],
+        "COMPILE_OPTIONS" => vec!["compile_options".into()],
+        _ => Vec::new(),
     }
 }
 
