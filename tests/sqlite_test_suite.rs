@@ -37,3 +37,6 @@ mod numcast;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/orderby3.rs"]
 mod orderby3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/orderby4.rs"]
+mod orderby4;
