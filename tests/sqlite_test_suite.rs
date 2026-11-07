@@ -58,3 +58,6 @@ mod selectG;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/unique.rs"]
 mod unique;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/unique2.rs"]
+mod unique2;
