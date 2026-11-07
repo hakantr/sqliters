@@ -13,3 +13,6 @@ mod expr2;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/fkey3.rs"]
 mod fkey3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/in2.rs"]
+mod in2;
