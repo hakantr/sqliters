@@ -19,3 +19,6 @@ mod in2;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/index2.rs"]
 mod index2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/join4.rs"]
+mod join4;
