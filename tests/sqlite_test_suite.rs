@@ -25,3 +25,6 @@ mod join4;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/join6.rs"]
 mod join6;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/joinE.rs"]
+mod joinE;
