@@ -1,0 +1,14 @@
+[package]
+name = "sqliters-btree"
+description = "SQLite Format 3 B-Tree and B+Tree storage engine (slotted pages, overflow chains, freelist, splitting, integrity check) ported from btree.c"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sqliters-types = { path = "../sqliters-types" }
+sqliters-vfs = { path = "../sqliters-vfs" }
+sqliters-pager = { path = "../sqliters-pager" }

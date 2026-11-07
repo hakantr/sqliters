@@ -1,0 +1,13 @@
+[package]
+name = "sqliters-vdbe"
+description = "Virtual Database Engine (VDBE) bytecode VM, opcodes, registers, cursors, sorters, and built-in SQL functions ported from vdbe.c/func.c"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sqliters-types = { path = "../sqliters-types" }
+sqliters-btree = { path = "../sqliters-btree" }

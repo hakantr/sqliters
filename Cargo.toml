@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sqliters-types",
+    "crates/sqliters-vfs",
+    "crates/sqliters-pager",
+    "crates/sqliters-btree",
+    "crates/sqliters-syntax",
+    "crates/sqliters-vdbe",
+    "crates/sqliters-core",
+    "crates/sqliters-cli",
+    ".",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Unlicense OR CC0-1.0"
+authors = ["sqliters contributors"]
+repository = "https://github.com/hakanbiris/sqliters"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[package]
+name = "sqliters"
+description = "Pure safe Rust port of SQLite 3.54.1, binary-compatible with SQLite format 3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sqliters-types = { path = "crates/sqliters-types" }
+sqliters-vfs = { path = "crates/sqliters-vfs" }
+sqliters-pager = { path = "crates/sqliters-pager" }
+sqliters-btree = { path = "crates/sqliters-btree" }
+sqliters-syntax = { path = "crates/sqliters-syntax" }
+sqliters-vdbe = { path = "crates/sqliters-vdbe" }
+sqliters-core = { path = "crates/sqliters-core" }

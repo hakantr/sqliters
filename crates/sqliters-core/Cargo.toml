@@ -1,0 +1,17 @@
+[package]
+name = "sqliters-core"
+description = "Schema catalog, SQL-to-VDBE compiler, query engine, PRAGMAs, and Connection/Statement API for sqliters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sqliters-types = { path = "../sqliters-types" }
+sqliters-vfs = { path = "../sqliters-vfs" }
+sqliters-pager = { path = "../sqliters-pager" }
+sqliters-btree = { path = "../sqliters-btree" }
+sqliters-syntax = { path = "../sqliters-syntax" }
+sqliters-vdbe = { path = "../sqliters-vdbe" }

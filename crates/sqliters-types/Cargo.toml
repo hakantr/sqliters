@@ -1,0 +1,9 @@
+[package]
+name = "sqliters-types"
+description = "Core SQLite 3.54.1 types, error codes, limits, varint, record format, and bitvec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

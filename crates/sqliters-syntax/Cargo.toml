@@ -1,0 +1,12 @@
+[package]
+name = "sqliters-syntax"
+description = "SQLite 3.54.1 lexical scanner, sqlite3_complete state machine, SQL AST, and Pratt/recursive-descent parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sqliters-types = { path = "../sqliters-types" }
