@@ -43,3 +43,6 @@ mod orderby4;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/orderby8.rs"]
 mod orderby8;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/savepoint5.rs"]
+mod savepoint5;
