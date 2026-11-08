@@ -128,6 +128,9 @@ mod selectG;
 #[path = "sqlite_test/subquery2.rs"]
 mod subquery2;
 #[allow(non_snake_case)]
+#[path = "sqlite_test/trans3.rs"]
+mod trans3;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/unique.rs"]
 mod unique;
 #[allow(non_snake_case)]
