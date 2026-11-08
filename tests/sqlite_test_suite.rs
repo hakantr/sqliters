@@ -149,5 +149,8 @@ mod where5;
 #[path = "sqlite_test/where6.rs"]
 mod where6;
 #[allow(non_snake_case)]
+#[path = "sqlite_test/whereB.rs"]
+mod whereB;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/whereJ.rs"]
 mod whereJ;
