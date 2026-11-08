@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::Arc;
 
-use sqliters_pager::{Pager, TransactionState};
+use sqliters_pager::{Pager, PagerOpenOptions, TransactionState};
 use sqliters_types::{
     Bitvec, ErrorCode, KeySortOrder, Pgno, Result, SqliteError, TextEncoding, Value,
     compare_records_with_encoding, decode_record_with_encoding,
@@ -42,6 +42,30 @@ impl Btree {
 
     pub fn open_with_vfs(vfs: Arc<dyn Vfs>, path: Option<&Path>, flags: OpenFlags) -> Result<Self> {
         Ok(Self::new(Pager::open_with_vfs(vfs, path, flags)?))
+    }
+
+    pub fn open_with_options(
+        vfs: Arc<dyn Vfs>,
+        path: Option<&Path>,
+        flags: OpenFlags,
+        options: PagerOpenOptions,
+    ) -> Result<Self> {
+        Ok(Self::new(Pager::open_with_options(
+            vfs, path, flags, options,
+        )?))
+    }
+
+    pub fn open_private_temporary(vfs: Arc<dyn Vfs>, options: PagerOpenOptions) -> Result<Self> {
+        Ok(Self::new(Pager::open_private_temporary(vfs, options)?))
+    }
+
+    #[inline]
+    pub const fn lock_byte_page(&self) -> Pgno {
+        self.pager.lock_byte_page()
+    }
+
+    pub fn close(&mut self) -> Result<()> {
+        self.pager.close()
     }
 
     #[inline]
@@ -1289,16 +1313,20 @@ impl Btree {
         let mut seen = Bitvec::new(total_pages);
         let mut errors = Vec::new();
         let usable = self.pager.usable_size() as usize;
+        let lock_byte_pgno = self.lock_byte_page();
 
         fn mark_page(
             seen: &mut Bitvec,
             total_pages: Pgno,
+            lock_byte_pgno: Pgno,
             pgno: Pgno,
             label: &str,
             errs: &mut Vec<String>,
         ) {
             if pgno == 0 || pgno > total_pages {
                 errs.push(format!("{label} references out-of-range page {pgno}"));
+            } else if pgno == lock_byte_pgno {
+                errs.push(format!("{label} references lock-byte page {pgno}"));
             } else if let Ok(newly_set) = seen.set(pgno)
                 && !newly_set
             {
@@ -1309,6 +1337,7 @@ impl Btree {
         fn walk_ovfl(
             mut ovfl: Option<Pgno>,
             total_pages: Pgno,
+            lock_byte_pgno: Pgno,
             seen: &mut Bitvec,
             btree: &mut Btree,
             errs: &mut Vec<String>,
@@ -1316,6 +1345,10 @@ impl Btree {
             while let Some(opg) = ovfl.filter(|&p| p != 0) {
                 if opg > total_pages {
                     errs.push(format!("overflow page {opg} out of range"));
+                    break;
+                }
+                if opg == lock_byte_pgno {
+                    errs.push(format!("overflow page {opg} references lock-byte page"));
                     break;
                 }
                 if let Ok(newly) = seen.set(opg)
@@ -1335,9 +1368,16 @@ impl Btree {
         let mut trunk = self.pager.header().first_freelist_trunk_page;
         let mut counted_free = 0u32;
         while trunk != 0 {
-            mark_page(&mut seen, total_pages, trunk, "freelist trunk", &mut errors);
+            mark_page(
+                &mut seen,
+                total_pages,
+                lock_byte_pgno,
+                trunk,
+                "freelist trunk",
+                &mut errors,
+            );
             counted_free += 1;
-            if trunk > total_pages {
+            if trunk > total_pages || trunk == lock_byte_pgno {
                 break;
             }
             let raw = self.pager.read_page(trunk)?.to_vec();
@@ -1350,7 +1390,14 @@ impl Btree {
                     break;
                 }
                 let leaf = u32::from_be_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
-                mark_page(&mut seen, total_pages, leaf, "freelist leaf", &mut errors);
+                mark_page(
+                    &mut seen,
+                    total_pages,
+                    lock_byte_pgno,
+                    leaf,
+                    "freelist leaf",
+                    &mut errors,
+                );
                 counted_free += 1;
             }
             trunk = next_trunk;
@@ -1365,8 +1412,15 @@ impl Btree {
         // 2. Walk every B-tree root
         let mut stack: Vec<(Pgno, bool)> = roots.iter().map(|&r| (r, true)).collect();
         while let Some((pgno, is_root)) = stack.pop() {
-            mark_page(&mut seen, total_pages, pgno, "btree page", &mut errors);
-            if pgno == 0 || pgno > total_pages {
+            mark_page(
+                &mut seen,
+                total_pages,
+                lock_byte_pgno,
+                pgno,
+                "btree page",
+                &mut errors,
+            );
+            if pgno == 0 || pgno > total_pages || pgno == lock_byte_pgno {
                 continue;
             }
             let parsed = match self.read_parsed_page(pgno) {
@@ -1389,7 +1443,14 @@ impl Btree {
                         }
                     }
                     for c in cells {
-                        walk_ovfl(c.overflow_page, total_pages, &mut seen, self, &mut errors)?;
+                        walk_ovfl(
+                            c.overflow_page,
+                            total_pages,
+                            lock_byte_pgno,
+                            &mut seen,
+                            self,
+                            &mut errors,
+                        )?;
                     }
                 }
                 ParsedPage::TableInterior { cells, right_child } => {
@@ -1406,12 +1467,26 @@ impl Btree {
                 }
                 ParsedPage::IndexLeaf { cells } => {
                     for c in cells {
-                        walk_ovfl(c.overflow_page, total_pages, &mut seen, self, &mut errors)?;
+                        walk_ovfl(
+                            c.overflow_page,
+                            total_pages,
+                            lock_byte_pgno,
+                            &mut seen,
+                            self,
+                            &mut errors,
+                        )?;
                     }
                 }
                 ParsedPage::IndexInterior { cells, right_child } => {
                     for c in cells {
-                        walk_ovfl(c.overflow_page, total_pages, &mut seen, self, &mut errors)?;
+                        walk_ovfl(
+                            c.overflow_page,
+                            total_pages,
+                            lock_byte_pgno,
+                            &mut seen,
+                            self,
+                            &mut errors,
+                        )?;
                         stack.push((c.left_child, false));
                     }
                     stack.push((right_child, false));
@@ -1420,8 +1495,6 @@ impl Btree {
         }
 
         // 3. Check for unreferenced pages
-        let ps = u64::from(self.pager.page_size());
-        let lock_byte_pgno = ((sqliters_types::PENDING_BYTE_OFFSET / ps) + 1) as Pgno;
         for pgno in 1..=total_pages {
             if pgno == lock_byte_pgno {
                 continue;
