@@ -107,8 +107,6 @@ impl Default for PagerOpenOptions {
 
 #[derive(Debug, Clone)]
 struct SubsavepointSlot {
-    /// Optional legacy savepoint name used only by `#[doc(hidden)]` compatibility shims until Step 1.1-D.
-    legacy_name: Option<String>,
     orig_page_count: Pgno,
     orig_header: DatabaseHeader,
     /// Pre-images of pages (`<= orig_page_count`) modified since this subsavepoint opened.
@@ -1749,7 +1747,6 @@ impl Pager {
         }
         while self.subsavepoints.len() < target_depth {
             self.subsavepoints.push(SubsavepointSlot {
-                legacy_name: None,
                 orig_page_count: self.page_count,
                 orig_header: self.header.clone(),
                 saved_pages: HashMap::new(),
@@ -1818,58 +1815,6 @@ impl Pager {
             }
         }
         Ok(())
-    }
-
-    // Temporary compatibility bridge for `sqliters-core` until Step 1.1-D migrates SQL savepoints.
-
-    #[doc(hidden)]
-    #[inline]
-    pub fn savepoint_depth(&self) -> usize {
-        self.subsavepoint_depth()
-    }
-
-    #[doc(hidden)]
-    pub fn savepoint(&mut self, name: &str) -> Result<()> {
-        if self.state != TransactionState::Write {
-            self.begin_write()?;
-        }
-        self.subsavepoints.push(SubsavepointSlot {
-            legacy_name: Some(name.to_owned()),
-            orig_page_count: self.page_count,
-            orig_header: self.header.clone(),
-            saved_pages: HashMap::new(),
-        });
-        Ok(())
-    }
-
-    #[doc(hidden)]
-    pub fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
-        let Some(pos) = self.subsavepoints.iter().rposition(|sp| {
-            sp.legacy_name
-                .as_deref()
-                .is_some_and(|n| n.eq_ignore_ascii_case(name))
-        }) else {
-            return Err(SqliteError::new(
-                ErrorCode::Error,
-                format!("no such savepoint: {name}"),
-            ));
-        };
-        self.rollback_to_subsavepoint(pos)
-    }
-
-    #[doc(hidden)]
-    pub fn release_savepoint(&mut self, name: &str) -> Result<()> {
-        let Some(pos) = self.subsavepoints.iter().rposition(|sp| {
-            sp.legacy_name
-                .as_deref()
-                .is_some_and(|n| n.eq_ignore_ascii_case(name))
-        }) else {
-            return Err(SqliteError::new(
-                ErrorCode::Error,
-                format!("no such savepoint: {name}"),
-            ));
-        };
-        self.release_subsavepoint(pos)
     }
 
     // ========================================================================

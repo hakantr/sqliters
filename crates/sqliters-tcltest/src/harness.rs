@@ -367,7 +367,7 @@ pub fn invoke_host_cmd(
                 fmt.replace('\'', "''"),
                 parse_tcl_int(sec).unwrap_or(0)
             );
-            if let Ok(mut conn) = Connection::open_in_memory()
+            if let Ok(conn) = Connection::open_in_memory()
                 && let Ok(Some(row)) = conn.query_row(&sql, &[])
             {
                 return Some(Ok(value_to_tcl_str(&row[0], "")));

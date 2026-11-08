@@ -172,7 +172,7 @@ fn main() -> ExitCode {
         }
 
         if is_complete(&sql_buf) {
-            if let Err(e) = execute_sql_buffer(&mut conn, &cfg, &sql_buf) {
+            if let Err(e) = execute_sql_buffer(&conn, &cfg, &sql_buf) {
                 eprintln!("Error: {e}");
             }
             sql_buf.clear();
@@ -189,7 +189,7 @@ fn main() -> ExitCode {
     if !sql_buf.trim().is_empty() {
         // Flush trailing statement even if final semicolon was omitted in batch mode
         sql_buf.push(';');
-        if let Err(e) = execute_sql_buffer(&mut conn, &cfg, &sql_buf) {
+        if let Err(e) = execute_sql_buffer(&conn, &cfg, &sql_buf) {
             eprintln!("Parse error: {e}");
             return ExitCode::from(1);
         }
@@ -199,8 +199,10 @@ fn main() -> ExitCode {
 }
 
 fn open_db(target: &str, readonly: bool) -> sqliters::Result<Connection> {
-    if target == ":memory:" || target.is_empty() {
+    if target == ":memory:" {
         Connection::open_in_memory()
+    } else if target.is_empty() {
+        Connection::open_private_temporary()
     } else if readonly {
         Connection::open_with_flags(target, OpenFlags::READONLY)
     } else {
@@ -232,11 +234,7 @@ fn execute_shell_input(
     Ok(())
 }
 
-fn execute_sql_buffer(
-    conn: &mut Connection,
-    cfg: &ShellConfig,
-    mut sql: &str,
-) -> sqliters::Result<()> {
+fn execute_sql_buffer(conn: &Connection, cfg: &ShellConfig, mut sql: &str) -> sqliters::Result<()> {
     while !sql.trim().is_empty() {
         let (_, tail) = parse_one(sql)?;
         let consumed_len = sql.len() - tail.len();
@@ -267,69 +265,86 @@ fn handle_dot_command(conn: &mut Connection, cfg: &mut ShellConfig, cmd_line: &s
     match cmd {
         ".quit" | ".exit" | ".q" => return true,
         ".help" => print_dot_help(),
-        ".tables" => {
-            let filter = parts.get(1).copied();
-            let mut names: Vec<String> = conn
-                .schema()
-                .tables
-                .iter()
-                .map(|t| t.name.clone())
-                .filter(|n| {
-                    if let Some(pat) = filter {
-                        sqliters::vdbe::sqlite_like_match(pat, n, None)
-                    } else {
-                        true
-                    }
-                })
-                .collect();
-            names.sort();
-            if !names.is_empty() {
-                println!("{}", names.join("  "));
-            }
-        }
-        ".schema" => {
-            let filter = parts.get(1).copied();
-            for tbl in &conn.schema().tables {
-                if filter.is_none_or(|f| tbl.name.eq_ignore_ascii_case(f)) {
-                    println!("{};", tbl.raw_sql.trim_end_matches(';'));
-                }
-            }
-            for idx in &conn.schema().indexes {
-                if let Some(ref raw) = idx.raw_sql
-                    && filter.is_none_or(|f| {
-                        idx.table_name.eq_ignore_ascii_case(f) || idx.name.eq_ignore_ascii_case(f)
+        ".tables" => match conn.schema_snapshot() {
+            Ok(schema) => {
+                let filter = parts.get(1).copied();
+                let mut names: Vec<String> = schema
+                    .tables
+                    .iter()
+                    .map(|t| t.name.clone())
+                    .filter(|n| {
+                        if let Some(pat) = filter {
+                            sqliters::vdbe::sqlite_like_match(pat, n, None)
+                        } else {
+                            true
+                        }
                     })
-                {
-                    println!("{};", raw.trim_end_matches(';'));
+                    .collect();
+                names.sort();
+                if !names.is_empty() {
+                    println!("{}", names.join("  "));
                 }
             }
-        }
-        ".indexes" => {
-            let filter = parts.get(1).copied();
-            for idx in &conn.schema().indexes {
-                if filter.is_none_or(|f| idx.table_name.eq_ignore_ascii_case(f)) {
-                    println!("{}", idx.name);
+            Err(e) => eprintln!("Error: {e}"),
+        },
+        ".schema" => match conn.schema_snapshot() {
+            Ok(schema) => {
+                let filter = parts.get(1).copied();
+                for tbl in &schema.tables {
+                    if filter.is_none_or(|f| tbl.name.eq_ignore_ascii_case(f)) {
+                        println!("{};", tbl.raw_sql.trim_end_matches(';'));
+                    }
+                }
+                for idx in &schema.indexes {
+                    if let Some(ref raw) = idx.raw_sql
+                        && filter.is_none_or(|f| {
+                            idx.table_name.eq_ignore_ascii_case(f)
+                                || idx.name.eq_ignore_ascii_case(f)
+                        })
+                    {
+                        println!("{};", raw.trim_end_matches(';'));
+                    }
                 }
             }
-        }
-        ".dbinfo" => {
-            let hdr = conn.btree_mut().pager().header().clone();
-            println!("database page size:  {}", hdr.page_size);
-            println!("write format:        {}", hdr.write_version);
-            println!("read format:         {}", hdr.read_version);
-            println!("reserved bytes:      {}", hdr.reserved_bytes);
-            println!("file change counter: {}", hdr.change_counter);
-            println!("database page count: {}", conn.page_count());
-            println!("freelist page count: {}", hdr.total_freelist_pages);
-            println!("schema cookie:       {}", hdr.schema_cookie);
-            println!("schema format:       {}", hdr.schema_format);
-            println!("text encoding:       {} (utf8)", hdr.text_encoding);
-            println!("user version:        {}", hdr.user_version);
-            println!("application id:      {}", hdr.application_id);
-            println!("software version:    {}", hdr.sqlite_version_number);
-            println!("number of tables:    {}", conn.schema().tables.len());
-            println!("number of indexes:   {}", conn.schema().indexes.len());
-        }
+            Err(e) => eprintln!("Error: {e}"),
+        },
+        ".indexes" => match conn.schema_snapshot() {
+            Ok(schema) => {
+                let filter = parts.get(1).copied();
+                for idx in &schema.indexes {
+                    if filter.is_none_or(|f| idx.table_name.eq_ignore_ascii_case(f)) {
+                        println!("{}", idx.name);
+                    }
+                }
+            }
+            Err(e) => eprintln!("Error: {e}"),
+        },
+        ".dbinfo" => match (
+            conn.database_header(),
+            conn.page_count(),
+            conn.schema_snapshot(),
+        ) {
+            (Ok(hdr), Ok(pg_cnt), Ok(schema)) => {
+                println!("database page size:  {}", hdr.page_size);
+                println!("write format:        {}", hdr.write_version);
+                println!("read format:         {}", hdr.read_version);
+                println!("reserved bytes:      {}", hdr.reserved_bytes);
+                println!("file change counter: {}", hdr.change_counter);
+                println!("database page count: {pg_cnt}");
+                println!("freelist page count: {}", hdr.total_freelist_pages);
+                println!("schema cookie:       {}", hdr.schema_cookie);
+                println!("schema format:       {}", hdr.schema_format);
+                println!("text encoding:       {} (utf8)", hdr.text_encoding);
+                println!("user version:        {}", hdr.user_version);
+                println!("application id:      {}", hdr.application_id);
+                println!("software version:    {}", hdr.sqlite_version_number);
+                println!("number of tables:    {}", schema.tables.len());
+                println!("number of indexes:   {}", schema.indexes.len());
+            }
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                eprintln!("Error: {e}");
+            }
+        },
         ".mode" => {
             if let Some(&m) = parts.get(1) {
                 match m.to_ascii_lowercase().as_str() {
@@ -382,28 +397,29 @@ fn handle_dot_command(conn: &mut Connection, cfg: &mut ShellConfig, cmd_line: &s
                 Err(e) => eprintln!("Error: cannot read \"{fpath}\": {e}"),
             }
         }
-        ".dump" => {
-            println!("PRAGMA foreign_keys=OFF;");
-            println!("BEGIN TRANSACTION;");
-            let tables = conn.schema().tables.clone();
-            let indexes = conn.schema().indexes.clone();
-            for tbl in &tables {
-                println!("{};", tbl.raw_sql.trim_end_matches(';'));
-                if let Ok(qres) = conn.query(&format!("SELECT * FROM \"{}\"", tbl.name), &[]) {
-                    for row in &qres.rows {
-                        let vals: Vec<String> =
-                            row.values().iter().map(format_sql_literal).collect();
-                        println!("INSERT INTO {} VALUES({});", tbl.name, vals.join(","));
+        ".dump" => match conn.schema_snapshot() {
+            Ok(schema) => {
+                println!("PRAGMA foreign_keys=OFF;");
+                println!("BEGIN TRANSACTION;");
+                for tbl in &schema.tables {
+                    println!("{};", tbl.raw_sql.trim_end_matches(';'));
+                    if let Ok(qres) = conn.query(&format!("SELECT * FROM \"{}\"", tbl.name), &[]) {
+                        for row in &qres.rows {
+                            let vals: Vec<String> =
+                                row.values().iter().map(format_sql_literal).collect();
+                            println!("INSERT INTO {} VALUES({});", tbl.name, vals.join(","));
+                        }
                     }
                 }
-            }
-            for idx in &indexes {
-                if let Some(ref raw) = idx.raw_sql {
-                    println!("{};", raw.trim_end_matches(';'));
+                for idx in &schema.indexes {
+                    if let Some(ref raw) = idx.raw_sql {
+                        println!("{};", raw.trim_end_matches(';'));
+                    }
                 }
+                println!("COMMIT;");
             }
-            println!("COMMIT;");
-        }
+            Err(e) => eprintln!("Error: {e}"),
+        },
         other => {
             eprintln!(
                 "Error: unknown command or invalid arguments: \"{other}\". Enter \".help\" for help"

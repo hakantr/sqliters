@@ -6,22 +6,89 @@ pub mod compiler;
 pub mod engine;
 pub mod schema;
 
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use sqliters_btree::Btree;
-use sqliters_pager::TransactionState;
+use sqliters_btree::{Btree, BtreeCursorState, CursorId};
+use sqliters_pager::{DatabaseHeader, PagerOpenOptions, TransactionState};
 use sqliters_syntax::{
-    BindParam, Expr, FromClause, FunctionArgs, InsertSource, JoinConstraint, ResultColumn,
-    SelectCore, SelectStmt, Stmt, TableOrSubquery, parse_one,
+    BindParam, Expr, FunctionArgs, InsertSource, ResultColumn, SelectCore, SelectStmt, Stmt,
+    TableOrSubquery, parse_one,
 };
-use sqliters_types::{ErrorCode, Pgno, Result, SqliteError, Value};
+use sqliters_types::{
+    ConflictResolutionEffect, DatabaseKind, ErrorCode, LockGeometry, Pgno, Result,
+    SQLITE_DEFAULT_PAGE_SIZE, SqliteError, Value, extended,
+};
 use sqliters_vdbe::{VdbeProgram, VdbeVm, VmRuntimeContext, VmStep};
-use sqliters_vfs::{OpenFlags, Vfs};
+use sqliters_vfs::{MemoryVfs, OpenFlags, OsVfs, Vfs};
 
+use crate::engine::{
+    ActivitySummary, ExecContext, LeaseCursorSpec, SqlSavepoint, StmtCategory, check_deferred_fks,
+    classify_stmt_category, collect_select_referenced_roots, commit_transaction,
+    execute_control_stmt, execute_nolock_stmt, execute_read_body, execute_write_body,
+    release_savepoint_op, stmt_requires_schema, validate_and_infer_columns,
+};
 pub use engine::QueryOutput;
 pub use schema::{ColumnSchema, ForeignKeySchema, IndexSchema, Schema, TableSchema};
+
+/// Maximum automatic `PrepareMode::V2` schema-change reprepare retries (`SQLITE_MAX_SCHEMA_RETRY`).
+const SQLITE_MAX_SCHEMA_RETRY: usize = 50;
+
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    static ACTIVE_CONN_STACK: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+struct ActiveConnStackGuard {
+    conn_id: u64,
+}
+
+impl ActiveConnStackGuard {
+    fn push(conn_id: u64) -> Self {
+        ACTIVE_CONN_STACK.with(|stack| {
+            if let Ok(mut s) = stack.try_borrow_mut() {
+                s.push(conn_id);
+            }
+        });
+        Self { conn_id }
+    }
+}
+
+impl Drop for ActiveConnStackGuard {
+    fn drop(&mut self) {
+        let cid = self.conn_id;
+        let _ = ACTIVE_CONN_STACK.try_with(|stack| {
+            if let Ok(mut s) = stack.try_borrow_mut()
+                && let Some(pos) = s.iter().rposition(|&id| id == cid)
+            {
+                s.remove(pos);
+            }
+        });
+    }
+}
+
+fn is_conn_active_on_current_thread(conn_id: u64) -> bool {
+    ACTIVE_CONN_STACK
+        .try_with(|stack| stack.try_borrow().is_ok_and(|s| s.contains(&conn_id)))
+        .unwrap_or(false)
+}
+
+/// Compile-time `Send` / `Sync` guarantees achieved purely with safe `std` synchronization.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    const fn assert_sync<T: Sync>() {}
+    assert_send::<Connection>();
+    assert_sync::<Connection>();
+    assert_send::<Statement>();
+    assert_send::<InterruptHandle>();
+    assert_sync::<InterruptHandle>();
+    assert_send::<TestBlobHandle>();
+};
 
 /// Single result row returned by a query (`sqlite3_column_*`).
 #[derive(Debug, Clone, PartialEq)]
@@ -104,323 +171,1821 @@ pub enum StepResult {
     Done,
 }
 
-/// SQLite database handle (`sqlite3*` in `sqlite.h.in`).
-pub struct Connection {
+/// Statement preparation mode (`sqlite3_prepare_v2` vs legacy `sqlite3_prepare`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PrepareMode {
+    /// Modern `sqlite3_prepare_v2` mode: automatically reprepares on schema changes.
+    #[default]
+    V2,
+    /// Legacy `sqlite3_prepare` mode: does NOT auto-reprepare on schema changes (`ErrorCode::Schema`).
+    V1,
+}
+
+/// Connection open options configuring initial page-size candidate, lock-byte geometry, and
+/// private-temporary backing policy (`PagerOpenOptions`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionOpenOptions {
+    pub default_page_size: u32,
+    pub lock_geometry: LockGeometry,
+    pub temp_store_memory: bool,
+}
+
+impl Default for ConnectionOpenOptions {
+    fn default() -> Self {
+        Self {
+            default_page_size: SQLITE_DEFAULT_PAGE_SIZE,
+            lock_geometry: LockGeometry::default(),
+            temp_store_memory: false,
+        }
+    }
+}
+
+impl ConnectionOpenOptions {
+    fn to_pager_options(self, db_kind: DatabaseKind) -> PagerOpenOptions {
+        PagerOpenOptions {
+            default_page_size: self.default_page_size,
+            lock_geometry: Some(self.lock_geometry),
+            db_kind: Some(db_kind),
+            temp_in_memory: self.temp_store_memory,
+        }
+    }
+}
+
+/// Error returned by [`Connection::try_close`] when the connection cannot be closed yet
+/// (for example, `SQLITE_BUSY` due to unfinalized [`Statement`] handles), returning ownership
+/// of the intact [`Connection`] facade alongside the [`SqliteError`].
+#[derive(Debug)]
+pub struct CloseError<T> {
+    pub connection: T,
+    pub error: SqliteError,
+}
+
+impl<T> fmt::Display for CloseError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Display::fmt(&self.error, f)
+    }
+}
+
+use fmt::Display;
+
+impl<T: fmt::Debug> std::error::Error for CloseError<T> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// Lock-free, cloneable handle for signaling `sqlite3_interrupt` from another thread or callback
+/// without entering the connection execution gate or locking `ConnectionInner`.
+#[derive(Debug, Clone)]
+pub struct InterruptHandle {
+    flag: Arc<AtomicBool>,
+}
+
+impl InterruptHandle {
+    /// Signals an asynchronous interrupt (`SQLITE_INTERRUPT`) to any in-progress operation.
+    #[inline]
+    pub fn interrupt(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+    }
+
+    /// Clears a previously signaled interrupt flag.
+    #[inline]
+    pub fn reset(&self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+
+    /// Returns `true` if the interrupt flag is currently set.
+    #[inline]
+    pub fn is_interrupted(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    /// Returns a reference to the underlying atomic flag.
+    #[inline]
+    pub fn flag(&self) -> &Arc<AtomicBool> {
+        &self.flag
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct HandleId(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandleKind {
+    Statement,
+    TestBlob { writable: bool },
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ActiveLease {
+    is_reader: bool,
+    is_writer: bool,
+}
+
+#[derive(Debug, Default)]
+struct ActivityTracker {
+    leases: BTreeMap<HandleId, ActiveLease>,
+}
+
+impl ActivityTracker {
+    fn start(&mut self, id: HandleId, is_reader: bool, is_writer: bool) {
+        self.leases.insert(
+            id,
+            ActiveLease {
+                is_reader: is_reader || is_writer,
+                is_writer,
+            },
+        );
+    }
+
+    fn remove(&mut self, id: HandleId) -> Option<ActiveLease> {
+        self.leases.remove(&id)
+    }
+
+    fn summary_excluding(&self, exclude: HandleId) -> ActivitySummary {
+        let mut other_active = 0usize;
+        let mut other_readers = 0usize;
+        let mut other_writers = 0usize;
+        for (&hid, lease) in &self.leases {
+            if hid == exclude {
+                continue;
+            }
+            other_active += 1;
+            if lease.is_reader {
+                other_readers += 1;
+            }
+            if lease.is_writer {
+                other_writers += 1;
+            }
+        }
+        ActivitySummary {
+            other_active,
+            other_readers,
+            other_writers,
+        }
+    }
+
+    fn has_no_active_tx(&self) -> bool {
+        !self.leases.values().any(|l| l.is_reader || l.is_writer)
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ConnectionState {
+    Open,
+    Closing,
+    Poisoned(SqliteError),
+    Closed,
+}
+
+#[derive(Clone)]
+struct WriteAbortSnapshot {
+    stmt_sp_slot: Option<usize>,
+    fk_before: Vec<(String, schema::TableRowKey, usize)>,
+    rt_before: VmRuntimeContext,
+    schema_before: Schema,
+    schema_gen_before: u64,
+    schema_changed_before: bool,
+}
+
+enum RunningExec {
+    Vdbe {
+        vm: VdbeVm,
+    },
+    MaterializedRead {
+        rows: std::vec::IntoIter<Vec<Value>>,
+        lease_cursors: Vec<CursorId>,
+    },
+    MaterializedNoLock {
+        rows: std::vec::IntoIter<Vec<Value>>,
+    },
+    ReturningWrite {
+        rows: std::vec::IntoIter<Vec<Value>>,
+        abort_snapshot: WriteAbortSnapshot,
+    },
+    PendingCommit {
+        release_savepoint: Option<String>,
+        last_busy: SqliteError,
+    },
+}
+
+enum StatementLifecycle {
+    Ready,
+    Running(RunningExec),
+    Halted { last_error: Option<SqliteError> },
+}
+
+enum PendingDrop {
+    Statement {
+        handle_id: HandleId,
+        running: Option<RunningExec>,
+    },
+    TestBlob {
+        handle_id: HandleId,
+        lease_cursor: Option<CursorId>,
+        writable: bool,
+    },
+}
+
+enum ActivityFinish {
+    NoLock,
+    ReadDone { lease_cursors: Vec<CursorId> },
+    ReadAborted { lease_cursors: Vec<CursorId> },
+    WriteCompleted { abort_snapshot: WriteAbortSnapshot },
+    PendingCommitAborted,
+}
+
+struct ConnectionInner {
     btree: Btree,
     schema: Schema,
     schema_loaded: bool,
+    state: ConnectionState,
+    next_handle_id: u64,
+    open_handles: BTreeMap<HandleId, HandleKind>,
+    activity: ActivityTracker,
+    savepoints: Vec<SqlSavepoint>,
     runtime: VmRuntimeContext,
     explicit_tx: bool,
     implicit_savepoint_tx: bool,
+    in_user_btree_tx: bool,
+    schema_changed_in_tx: bool,
     foreign_keys: bool,
     count_changes: bool,
     rollback_count: u64,
     deferred_fk_suspects: Vec<(String, schema::TableRowKey, usize)>,
+    schema_generation: u64,
+    simulated_cleanup_io_error: Option<SqliteError>,
+    panic_on_next_pending_drop: bool,
+}
+
+struct ConnectionShared {
+    conn_id: u64,
+    db_path: Option<PathBuf>,
+    database_kind: DatabaseKind,
+    is_readonly: bool,
+    open_options: ConnectionOpenOptions,
+    interrupt_flag: Arc<AtomicBool>,
+    gate_busy: AtomicBool,
+    mirror_last_insert_rowid: AtomicI64,
+    mirror_changes: AtomicU64,
+    mirror_total_changes: AtomicU64,
+    mirror_autocommit: AtomicBool,
+    mirror_rollback_count: AtomicU64,
+    pending_drops: Mutex<Vec<PendingDrop>>,
+    inner: Mutex<ConnectionInner>,
+}
+
+impl ConnectionShared {
+    fn publish_mirrors(
+        &self,
+        rt: &VmRuntimeContext,
+        explicit_tx: bool,
+        implicit_savepoint_tx: bool,
+        rollback_count: u64,
+    ) {
+        self.mirror_last_insert_rowid
+            .store(rt.last_insert_rowid, Ordering::Release);
+        self.mirror_changes
+            .store(rt.last_changes, Ordering::Release);
+        self.mirror_total_changes
+            .store(rt.total_changes, Ordering::Release);
+        self.mirror_autocommit
+            .store(!explicit_tx && !implicit_savepoint_tx, Ordering::Release);
+        self.mirror_rollback_count
+            .store(rollback_count, Ordering::Release);
+    }
+
+    fn lock_pending_drops(&self) -> MutexGuard<'_, Vec<PendingDrop>> {
+        self.pending_drops
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn lock_inner(&self) -> MutexGuard<'_, ConnectionInner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn enter(&self) -> Result<ConnSession<'_>> {
+        if is_conn_active_on_current_thread(self.conn_id) {
+            return Err(SqliteError::misuse(
+                "reentrant call into active Connection on the same thread",
+            ));
+        }
+        if self
+            .gate_busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(SqliteError::new(
+                ErrorCode::Busy,
+                "database connection is busy",
+            ));
+        }
+
+        let mut gate_unwind = GateReleaseOnUnwind {
+            shared: self,
+            armed: true,
+        };
+        let stack_guard = ActiveConnStackGuard::push(self.conn_id);
+        let inner_guard = self.lock_inner();
+        // Transfer gate release responsibility to `ConnSession` BEFORE running `process_pending_drops`!
+        gate_unwind.armed = false;
+        let mut session = ConnSession {
+            shared: self,
+            guard: Some(inner_guard),
+            _stack_guard: stack_guard,
+        };
+        let initial_drops = {
+            let mut pq = self.lock_pending_drops();
+            std::mem::take(&mut *pq)
+        };
+        if !initial_drops.is_empty() {
+            session
+                .inner_mut()
+                .process_pending_drops(initial_drops, self);
+        }
+        Ok(session)
+    }
+
+    fn enqueue_or_run_drop(&self, item: PendingDrop) {
+        let claimed = {
+            let mut pq = self.lock_pending_drops();
+            pq.push(item);
+            self.gate_busy
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        };
+        if claimed {
+            let _stack_guard = ActiveConnStackGuard::push(self.conn_id);
+            self.drain_and_release_gate();
+        }
+    }
+
+    fn drain_and_release_gate(&self) {
+        let mut gate_unwind = GateReleaseOnUnwind {
+            shared: self,
+            armed: true,
+        };
+        loop {
+            let batch = {
+                let mut pq = self.lock_pending_drops();
+                std::mem::take(&mut *pq)
+            };
+            if !batch.is_empty() {
+                let mut inner = self.lock_inner();
+                inner.process_pending_drops(batch, self);
+                drop(inner);
+                continue;
+            }
+            let pq = self.lock_pending_drops();
+            if pq.is_empty() {
+                self.gate_busy.store(false, Ordering::Release);
+                gate_unwind.armed = false;
+                drop(pq);
+                break;
+            }
+            drop(pq);
+        }
+    }
+}
+
+struct GateReleaseOnUnwind<'a> {
+    shared: &'a ConnectionShared,
+    armed: bool,
+}
+
+impl Drop for GateReleaseOnUnwind<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.shared.gate_busy.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for ConnectionShared {
+    fn drop(&mut self) {
+        let inner = self.inner.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let pending = self
+            .pending_drops
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        let batch = std::mem::take(pending);
+        for item in batch {
+            match item {
+                PendingDrop::Statement { handle_id, running } => {
+                    if let Some(RunningExec::Vdbe { mut vm }) = running {
+                        vm.close_cursors(&mut inner.btree);
+                    } else if let Some(RunningExec::MaterializedRead { lease_cursors, .. }) =
+                        running
+                    {
+                        for cid in lease_cursors {
+                            inner.btree.close_cursor(cid);
+                        }
+                    }
+                    inner.activity.remove(handle_id);
+                    inner.open_handles.remove(&handle_id);
+                }
+                PendingDrop::TestBlob {
+                    handle_id,
+                    lease_cursor,
+                    ..
+                } => {
+                    if let Some(cid) = lease_cursor {
+                        inner.btree.close_cursor(cid);
+                    }
+                    inner.activity.remove(handle_id);
+                    inner.open_handles.remove(&handle_id);
+                }
+            }
+        }
+        if !matches!(inner.state, ConnectionState::Closed) {
+            inner.btree.close_all_cursors();
+            if inner.btree.transaction_state() != TransactionState::Open {
+                let _ =
+                    inner
+                        .btree
+                        .rollback_with_trip(extended::SQLITE_ABORT_ROLLBACK, false, false);
+            }
+            let _ = inner.btree.close();
+            inner.state = ConnectionState::Closed;
+        }
+    }
+}
+
+struct ConnSession<'a> {
+    shared: &'a ConnectionShared,
+    guard: Option<MutexGuard<'a, ConnectionInner>>,
+    _stack_guard: ActiveConnStackGuard,
+}
+
+impl ConnSession<'_> {
+    #[inline]
+    fn inner_mut(&mut self) -> &mut ConnectionInner {
+        self.guard
+            .as_mut()
+            .expect("ConnSession inner guard is live")
+    }
+
+    #[inline]
+    fn inner(&self) -> &ConnectionInner {
+        self.guard
+            .as_ref()
+            .expect("ConnSession inner guard is live")
+    }
+}
+
+impl Drop for ConnSession<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        self.shared.drain_and_release_gate();
+    }
+}
+
+impl ConnectionInner {
+    fn ensure_usable(&self) -> Result<()> {
+        match &self.state {
+            ConnectionState::Open => Ok(()),
+            ConnectionState::Closing | ConnectionState::Closed => {
+                Err(SqliteError::misuse("cannot use a closed connection"))
+            }
+            ConnectionState::Poisoned(err) => Err(err.clone()),
+        }
+    }
+
+    fn publish(&self, shared: &ConnectionShared) {
+        shared.publish_mirrors(
+            &self.runtime,
+            self.explicit_tx,
+            self.implicit_savepoint_tx,
+            self.rollback_count,
+        );
+    }
+
+    fn is_autocommit(&self) -> bool {
+        !self.explicit_tx && !self.implicit_savepoint_tx
+    }
+
+    fn register_handle(&mut self, kind: HandleKind) -> HandleId {
+        let id = HandleId(self.next_handle_id);
+        self.next_handle_id += 1;
+        self.open_handles.insert(id, kind);
+        id
+    }
+
+    fn take_simulated_cleanup_error(&mut self) -> Option<SqliteError> {
+        self.simulated_cleanup_io_error.take()
+    }
+
+    fn poison_with(&mut self, err: SqliteError) -> SqliteError {
+        if !matches!(self.state, ConnectionState::Poisoned(_)) {
+            self.state = ConnectionState::Poisoned(err.clone());
+        }
+        err
+    }
+
+    /// Ensures `sqlite_schema` is loaded for `prepare`, releasing any temporary `Read` transaction
+    /// immediately if no user/statement B-tree transaction was active (`sqlite3InitOne.openedTransaction`).
+    fn ensure_schema_loaded_for_prepare(&mut self) -> Result<bool> {
+        if self.btree.transaction_state() == TransactionState::Open {
+            self.btree.begin_read()?;
+            let prev_cookie = self.schema.schema_cookie;
+            let prev_had_pages = self.schema.had_pages;
+            let prev_loaded = self.schema.loaded;
+            let load_res = self.schema.ensure_fresh_in_tx(&mut self.btree);
+            let end_res = if !self.in_user_btree_tx && self.activity.has_no_active_tx() {
+                self.btree.pager_mut().end_read_if_unused()
+            } else {
+                Ok(())
+            };
+            load_res?;
+            end_res?;
+            let changed = !self.schema_loaded
+                || !prev_loaded
+                || prev_cookie != self.schema.schema_cookie
+                || prev_had_pages != self.schema.had_pages;
+            self.schema_loaded = true;
+            if changed {
+                self.schema_generation += 1;
+            }
+            Ok(changed)
+        } else {
+            let prev_cookie = self.schema.schema_cookie;
+            let prev_had_pages = self.schema.had_pages;
+            let prev_loaded = self.schema.loaded;
+            self.schema.ensure_fresh_in_tx(&mut self.btree)?;
+            let changed = !self.schema_loaded
+                || !prev_loaded
+                || prev_cookie != self.schema.schema_cookie
+                || prev_had_pages != self.schema.had_pages;
+            self.schema_loaded = true;
+            if changed {
+                self.schema_generation += 1;
+            }
+            Ok(changed)
+        }
+    }
+
+    fn refresh_schema_in_open_tx(&mut self) -> Result<()> {
+        let has_pages = self.btree.pager().page_count() > 0;
+        let cur_cookie = self.btree.pager().header().schema_cookie;
+        if !self.schema_loaded
+            || !self.schema.loaded
+            || self.schema.had_pages != has_pages
+            || self.schema.schema_cookie != cur_cookie
+        {
+            self.schema.ensure_fresh_in_tx(&mut self.btree)?;
+            self.schema_loaded = true;
+            self.schema_generation += 1;
+        }
+        Ok(())
+    }
+
+    fn finish_activity(
+        &mut self,
+        hid: HandleId,
+        outcome: ActivityFinish,
+        shared: &ConnectionShared,
+    ) -> Result<()> {
+        let _removed = self.activity.remove(hid);
+        let summary = self.activity.summary_excluding(hid);
+
+        if let Some(sim_err) = self.take_simulated_cleanup_error() {
+            match outcome {
+                ActivityFinish::ReadDone { lease_cursors }
+                | ActivityFinish::ReadAborted { lease_cursors } => {
+                    for cid in lease_cursors {
+                        self.btree.close_cursor(cid);
+                    }
+                }
+                _ => {}
+            }
+            return Err(self.poison_with(sim_err));
+        }
+
+        match outcome {
+            ActivityFinish::NoLock | ActivityFinish::PendingCommitAborted => Ok(()),
+
+            ActivityFinish::ReadDone { lease_cursors }
+            | ActivityFinish::ReadAborted { lease_cursors } => {
+                for cid in lease_cursors {
+                    self.btree.close_cursor(cid);
+                }
+                if summary.other_readers == 0
+                    && summary.other_writers == 0
+                    && !self.in_user_btree_tx
+                    && self.btree.transaction_state() == TransactionState::Read
+                    && let Err(e) = self.btree.pager_mut().end_read_if_unused()
+                {
+                    return Err(self.poison_with(e));
+                }
+                Ok(())
+            }
+
+            ActivityFinish::WriteCompleted { abort_snapshot } => {
+                if !self.is_autocommit() {
+                    if let Some(slot) = abort_snapshot.stmt_sp_slot
+                        && self.btree.transaction_state() == TransactionState::Write
+                        && let Err(e) = self.btree.pager_mut().release_subsavepoint(slot)
+                    {
+                        return Err(self.poison_with(e));
+                    }
+                    self.publish(shared);
+                    return Ok(());
+                }
+
+                if summary.other_writers > 0 {
+                    if let Some(slot) = abort_snapshot.stmt_sp_slot
+                        && self.btree.transaction_state() == TransactionState::Write
+                        && let Err(e) = self.btree.pager_mut().release_subsavepoint(slot)
+                    {
+                        return Err(self.poison_with(e));
+                    }
+                    self.publish(shared);
+                    return Ok(());
+                }
+
+                // Autocommit write completion with no other active writers: verify deferred FKs first!
+                let fk_res = {
+                    let mut publish_fn = |rt: &VmRuntimeContext, exp: bool, imp: bool, rb: u64| {
+                        shared.publish_mirrors(rt, exp, imp, rb);
+                    };
+                    let mut ctx = ExecContext {
+                        btree: &mut self.btree,
+                        schema: &mut self.schema,
+                        runtime: &mut self.runtime,
+                        explicit_tx: &mut self.explicit_tx,
+                        implicit_savepoint_tx: &mut self.implicit_savepoint_tx,
+                        in_user_btree_tx: &mut self.in_user_btree_tx,
+                        savepoints: &mut self.savepoints,
+                        schema_generation: &mut self.schema_generation,
+                        schema_changed_in_tx: &mut self.schema_changed_in_tx,
+                        activity: summary,
+                        foreign_keys: &mut self.foreign_keys,
+                        count_changes: &mut self.count_changes,
+                        rollback_count: &mut self.rollback_count,
+                        deferred_fk_suspects: &mut self.deferred_fk_suspects,
+                        publish_mirrors: &mut publish_fn,
+                    };
+                    check_deferred_fks(&mut ctx)
+                };
+                if let Err(fk_err) = fk_res {
+                    let write_only = !self.schema_changed_in_tx;
+                    let retain_read = summary.other_readers > 0 && write_only;
+                    if let Err(rb_err) = self.btree.rollback_with_trip(
+                        extended::SQLITE_ABORT_ROLLBACK,
+                        write_only,
+                        retain_read,
+                    ) {
+                        return Err(self.poison_with(rb_err));
+                    }
+                    self.runtime.last_changes = abort_snapshot.rt_before.last_changes;
+                    self.runtime.total_changes = abort_snapshot.rt_before.total_changes;
+                    self.runtime.last_insert_rowid = abort_snapshot.rt_before.last_insert_rowid;
+                    self.deferred_fk_suspects.clear();
+                    if self.schema_changed_in_tx {
+                        self.schema = abort_snapshot.schema_before;
+                        self.schema_generation += 1;
+                        self.schema_changed_in_tx = false;
+                    }
+                    self.publish(shared);
+                    return Err(fk_err);
+                }
+
+                let retain_read = summary.other_readers > 0;
+                if self.btree.transaction_state() == TransactionState::Write
+                    && let Err(cm_err) = self.btree.pager_mut().commit_retaining_read(retain_read)
+                {
+                    let write_only = !self.schema_changed_in_tx;
+                    if let Err(rb_err) = self.btree.rollback_with_trip(
+                        extended::SQLITE_ABORT_ROLLBACK,
+                        write_only,
+                        retain_read && write_only,
+                    ) {
+                        let root_err = if cm_err.code == ErrorCode::Busy {
+                            rb_err
+                        } else {
+                            cm_err
+                        };
+                        self.deferred_fk_suspects.clear();
+                        self.schema_changed_in_tx = false;
+                        self.publish(shared);
+                        return Err(self.poison_with(root_err));
+                    }
+                    self.runtime.last_changes = abort_snapshot.rt_before.last_changes;
+                    self.runtime.total_changes = abort_snapshot.rt_before.total_changes;
+                    self.runtime.last_insert_rowid = abort_snapshot.rt_before.last_insert_rowid;
+                    self.deferred_fk_suspects.clear();
+                    if self.schema_changed_in_tx {
+                        self.schema = abort_snapshot.schema_before;
+                        self.schema_generation += 1;
+                        self.schema_changed_in_tx = false;
+                    }
+                    self.publish(shared);
+                    return Err(cm_err);
+                }
+                self.schema_changed_in_tx = false;
+                self.deferred_fk_suspects.clear();
+                self.publish(shared);
+                Ok(())
+            }
+        }
+    }
+
+    fn abort_write_statement(
+        &mut self,
+        hid: HandleId,
+        err: &SqliteError,
+        snap: WriteAbortSnapshot,
+        shared: &ConnectionShared,
+    ) -> SqliteError {
+        self.activity.remove(hid);
+        let summary = self.activity.summary_excluding(hid);
+
+        if let Some(sim_err) = self.take_simulated_cleanup_error() {
+            return self.poison_with(sim_err);
+        }
+
+        match err.conflict_effect {
+            ConflictResolutionEffect::Rollback => {
+                let schema_changed =
+                    self.schema_changed_in_tx || self.schema_generation != snap.schema_gen_before;
+                let write_only = !schema_changed;
+                let retain_read = summary.other_readers > 0 && write_only;
+                if self.btree.transaction_state() == TransactionState::Write
+                    && let Err(rb_err) = self.btree.rollback_with_trip(
+                        extended::SQLITE_ABORT_ROLLBACK,
+                        write_only,
+                        retain_read,
+                    )
+                {
+                    return self.poison_with(rb_err);
+                }
+                self.explicit_tx = false;
+                self.implicit_savepoint_tx = false;
+                self.in_user_btree_tx = false;
+                self.savepoints.clear();
+                self.deferred_fk_suspects.clear();
+                self.rollback_count += 1;
+                self.runtime.last_changes = snap.rt_before.last_changes;
+                self.runtime.last_insert_rowid = snap.rt_before.last_insert_rowid;
+                if schema_changed {
+                    self.schema_changed_in_tx = false;
+                    if let Ok(s) = Schema::load(&mut self.btree) {
+                        self.schema = s;
+                    } else {
+                        self.schema = snap.schema_before;
+                    }
+                    self.schema_generation += 1;
+                }
+                self.publish(shared);
+                err.clone()
+            }
+
+            ConflictResolutionEffect::Fail => {
+                if !self.is_autocommit() || summary.other_writers > 0 {
+                    if let Some(slot) = snap.stmt_sp_slot
+                        && self.btree.transaction_state() == TransactionState::Write
+                        && let Err(sp_err) = self.btree.pager_mut().release_subsavepoint(slot)
+                    {
+                        return self.poison_with(sp_err);
+                    }
+                } else if self.btree.transaction_state() == TransactionState::Write {
+                    let retain_read = summary.other_readers > 0;
+                    if let Err(cm_err) = self.btree.pager_mut().commit_retaining_read(retain_read) {
+                        let write_only = !self.schema_changed_in_tx;
+                        if let Err(rb_err) = self.btree.rollback_with_trip(
+                            extended::SQLITE_ABORT_ROLLBACK,
+                            write_only,
+                            retain_read && write_only,
+                        ) {
+                            let root_err = if cm_err.code == ErrorCode::Busy {
+                                rb_err
+                            } else {
+                                cm_err
+                            };
+                            self.deferred_fk_suspects.clear();
+                            self.schema_changed_in_tx = false;
+                            self.publish(shared);
+                            return self.poison_with(root_err);
+                        }
+                        self.runtime.last_changes = snap.rt_before.last_changes;
+                        self.runtime.total_changes = snap.rt_before.total_changes;
+                        self.runtime.last_insert_rowid = snap.rt_before.last_insert_rowid;
+                        self.deferred_fk_suspects.clear();
+                        if self.schema_changed_in_tx {
+                            self.schema = snap.schema_before;
+                            self.schema_generation += 1;
+                            self.schema_changed_in_tx = false;
+                        }
+                        self.publish(shared);
+                        return cm_err;
+                    }
+                    self.schema_changed_in_tx = false;
+                    self.deferred_fk_suspects.clear();
+                }
+                self.publish(shared);
+                err.clone()
+            }
+
+            ConflictResolutionEffect::Abort => {
+                let stmt_changed_schema = self.schema_generation != snap.schema_gen_before;
+                self.runtime.last_changes = snap.rt_before.last_changes;
+                self.runtime.total_changes = snap.rt_before.total_changes;
+                self.runtime.last_insert_rowid = snap.rt_before.last_insert_rowid;
+                self.deferred_fk_suspects = snap.fk_before;
+
+                if let Some(slot) = snap.stmt_sp_slot {
+                    let _ = self
+                        .btree
+                        .trip_cursors(extended::SQLITE_ABORT_ROLLBACK, !stmt_changed_schema);
+                    if self.btree.transaction_state() == TransactionState::Write {
+                        if let Err(rb_err) = self.btree.pager_mut().rollback_to_subsavepoint(slot) {
+                            return self.poison_with(rb_err);
+                        }
+                        if let Err(rel_err) = self.btree.pager_mut().release_subsavepoint(slot) {
+                            return self.poison_with(rel_err);
+                        }
+                    }
+                    if stmt_changed_schema {
+                        self.schema = snap.schema_before;
+                        self.schema_generation += 1;
+                    }
+                    self.schema_changed_in_tx = snap.schema_changed_before;
+                } else {
+                    let write_only = !stmt_changed_schema && !self.schema_changed_in_tx;
+                    let retain_read = summary.other_readers > 0 && write_only;
+                    if self.btree.transaction_state() == TransactionState::Write
+                        && let Err(rb_err) = self.btree.rollback_with_trip(
+                            extended::SQLITE_ABORT_ROLLBACK,
+                            write_only,
+                            retain_read,
+                        )
+                    {
+                        return self.poison_with(rb_err);
+                    }
+                    if stmt_changed_schema || self.schema_changed_in_tx {
+                        self.schema = snap.schema_before;
+                        self.schema_generation += 1;
+                        self.schema_changed_in_tx = false;
+                    }
+                }
+                self.publish(shared);
+                err.clone()
+            }
+        }
+    }
+
+    fn finish_running_exec(
+        &mut self,
+        hid: HandleId,
+        running: RunningExec,
+        shared: &ConnectionShared,
+    ) -> Result<()> {
+        match running {
+            RunningExec::Vdbe { mut vm } => {
+                vm.close_cursors(&mut self.btree);
+                self.finish_activity(
+                    hid,
+                    ActivityFinish::ReadDone {
+                        lease_cursors: Vec::new(),
+                    },
+                    shared,
+                )
+            }
+            RunningExec::MaterializedRead { lease_cursors, .. } => {
+                self.finish_activity(hid, ActivityFinish::ReadDone { lease_cursors }, shared)
+            }
+            RunningExec::MaterializedNoLock { .. } => {
+                self.finish_activity(hid, ActivityFinish::NoLock, shared)
+            }
+            RunningExec::ReturningWrite { abort_snapshot, .. } => self.finish_activity(
+                hid,
+                ActivityFinish::WriteCompleted { abort_snapshot },
+                shared,
+            ),
+            RunningExec::PendingCommit { last_busy, .. } => {
+                let _ = self.finish_activity(hid, ActivityFinish::PendingCommitAborted, shared);
+                Err(last_busy)
+            }
+        }
+    }
+
+    fn process_pending_drops(&mut self, items: Vec<PendingDrop>, shared: &ConnectionShared) {
+        for item in items {
+            match item {
+                PendingDrop::Statement { handle_id, running } => {
+                    if let Some(run) = running {
+                        let _ = self.finish_running_exec(handle_id, run, shared);
+                    }
+                    self.open_handles.remove(&handle_id);
+                }
+                PendingDrop::TestBlob {
+                    handle_id,
+                    lease_cursor,
+                    writable,
+                } => {
+                    if writable {
+                        let dummy_snap = WriteAbortSnapshot {
+                            stmt_sp_slot: None,
+                            fk_before: self.deferred_fk_suspects.clone(),
+                            rt_before: self.runtime,
+                            schema_before: self.schema.clone(),
+                            schema_gen_before: self.schema_generation,
+                            schema_changed_before: self.schema_changed_in_tx,
+                        };
+                        let _ = self.finish_activity(
+                            handle_id,
+                            ActivityFinish::WriteCompleted {
+                                abort_snapshot: dummy_snap,
+                            },
+                            shared,
+                        );
+                    } else {
+                        let cursors = lease_cursor.into_iter().collect();
+                        let _ = self.finish_activity(
+                            handle_id,
+                            ActivityFinish::ReadDone {
+                                lease_cursors: cursors,
+                            },
+                            shared,
+                        );
+                    }
+                    self.open_handles.remove(&handle_id);
+                }
+            }
+        }
+        if std::mem::replace(&mut self.panic_on_next_pending_drop, false) {
+            panic!("simulated panic during process_pending_drops");
+        }
+    }
+}
+
+/// SQLite database connection facade (`sqlite3*` in `sqlite.h.in`).
+///
+/// Wraps a thread-safe `Arc<ConnectionShared>` (`Connection: Send + Sync`) while [`Statement`]s
+/// borrow no `'conn` lifetime and coordinate access through the connection entry gate.
+pub struct Connection {
+    shared: Arc<ConnectionShared>,
+}
+
+impl fmt::Debug for Connection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Connection")
+            .field("conn_id", &self.shared.conn_id)
+            .field("database_kind", &self.shared.database_kind)
+            .field("db_path", &self.shared.db_path)
+            .field("is_readonly", &self.shared.is_readonly)
+            .finish()
+    }
 }
 
 impl Connection {
-    /// Opens or creates a SQLite Format 3 database file on disk (or `:memory:` if `path` is `":memory:"` or `""`).
+    /// Opens or creates a SQLite Format 3 database (`":memory:"` -> [`DatabaseKind::Memory`],
+    /// `""` -> isolated [`DatabaseKind::PrivateTemporary`], named path -> [`DatabaseKind::NamedDisk`]).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let p = path.as_ref();
-        if p == Path::new(":memory:") || p.as_os_str().is_empty() {
-            return Self::open_in_memory();
-        }
-        Self::open_with_flags(p, OpenFlags::READWRITE | OpenFlags::CREATE)
+        Self::open_with_options(
+            path,
+            OpenFlags::READWRITE | OpenFlags::CREATE,
+            ConnectionOpenOptions::default(),
+        )
     }
 
-    /// Opens an isolated in-memory database.
+    /// Opens an isolated in-memory database (`":memory:"`, [`DatabaseKind::Memory`]).
     pub fn open_in_memory() -> Result<Self> {
-        let btree = Btree::open_in_memory()?;
-        Self::from_btree(btree)
+        Self::open_in_memory_with_options(ConnectionOpenOptions::default())
     }
 
-    /// Opens a database file with explicit [`OpenFlags`] (e.g., `OpenFlags::READONLY`).
+    /// Opens an isolated in-memory database with explicit [`ConnectionOpenOptions`].
+    pub fn open_in_memory_with_options(options: ConnectionOpenOptions) -> Result<Self> {
+        let pager_opts = options.to_pager_options(DatabaseKind::Memory);
+        let vfs: Arc<dyn Vfs> = Arc::new(MemoryVfs::with_lock_geometry(options.lock_geometry));
+        let btree = Btree::open_with_options(
+            vfs,
+            Some(Path::new(":memory:")),
+            OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MEMORY,
+            pager_opts,
+        )?;
+        Self::from_btree(btree, options)
+    }
+
+    /// Opens an isolated private temporary database (`""`, [`DatabaseKind::PrivateTemporary`]).
+    pub fn open_private_temporary() -> Result<Self> {
+        Self::open_private_temporary_with_options(ConnectionOpenOptions::default())
+    }
+
+    /// Opens an isolated private temporary database (`""`) with explicit [`ConnectionOpenOptions`].
+    pub fn open_private_temporary_with_options(options: ConnectionOpenOptions) -> Result<Self> {
+        let pager_opts = options.to_pager_options(DatabaseKind::PrivateTemporary);
+        let vfs: Arc<dyn Vfs> = Arc::new(OsVfs::with_lock_geometry(options.lock_geometry));
+        let btree = Btree::open_private_temporary(vfs, pager_opts)?;
+        Self::from_btree(btree, options)
+    }
+
+    /// Opens a database with explicit [`OpenFlags`] (e.g., `OpenFlags::READONLY`).
     pub fn open_with_flags(path: impl AsRef<Path>, flags: OpenFlags) -> Result<Self> {
-        let btree = Btree::open_file(path, flags)?;
-        Self::from_btree(btree)
+        Self::open_with_options(path, flags, ConnectionOpenOptions::default())
+    }
+
+    /// Opens a database with explicit [`OpenFlags`] and [`ConnectionOpenOptions`].
+    pub fn open_with_options(
+        path: impl AsRef<Path>,
+        flags: OpenFlags,
+        options: ConnectionOpenOptions,
+    ) -> Result<Self> {
+        let p = path.as_ref();
+        let vfs: Arc<dyn Vfs> = if p == Path::new(":memory:") || flags.contains(OpenFlags::MEMORY) {
+            Arc::new(MemoryVfs::with_lock_geometry(options.lock_geometry))
+        } else {
+            Arc::new(OsVfs::with_lock_geometry(options.lock_geometry))
+        };
+        Self::open_with_vfs_and_options(vfs, Some(p), flags, options)
     }
 
     /// Opens a database backed by a custom [`Vfs`].
     pub fn open_with_vfs(vfs: Arc<dyn Vfs>, path: Option<&Path>, flags: OpenFlags) -> Result<Self> {
-        let btree = Btree::open_with_vfs(vfs, path, flags)?;
-        Self::from_btree(btree)
+        let options = ConnectionOpenOptions {
+            lock_geometry: vfs.lock_geometry(),
+            ..ConnectionOpenOptions::default()
+        };
+        Self::open_with_vfs_and_options(vfs, path, flags, options)
     }
 
-    fn from_btree(mut btree: Btree) -> Result<Self> {
-        // Eagerly load schema when possible; if another connection currently holds an EXCLUSIVE lock,
-        // defer schema loading until the first statement (`sqlite3_open` behavior).
-        let (schema, schema_loaded) = match Schema::load(&mut btree) {
-            Ok(s) => (s, true),
-            Err(e) if e.code == ErrorCode::Busy => (Schema::default(), false),
-            Err(e) => return Err(e),
+    /// Opens a database backed by a custom [`Vfs`] and [`ConnectionOpenOptions`].
+    pub fn open_with_vfs_and_options(
+        vfs: Arc<dyn Vfs>,
+        path: Option<&Path>,
+        flags: OpenFlags,
+        options: ConnectionOpenOptions,
+    ) -> Result<Self> {
+        let inferred_kind = if flags.contains(OpenFlags::MEMORY) {
+            DatabaseKind::Memory
+        } else {
+            match path {
+                None => DatabaseKind::PrivateTemporary,
+                Some(p) if p.as_os_str().is_empty() => DatabaseKind::PrivateTemporary,
+                Some(p) if p == Path::new(":memory:") => DatabaseKind::Memory,
+                Some(_) => DatabaseKind::NamedDisk,
+            }
         };
-        Ok(Self {
+        let pager_opts = options.to_pager_options(inferred_kind);
+        let btree = Btree::open_with_options(vfs, path, flags, pager_opts)?;
+        Self::from_btree(btree, options)
+    }
+
+    fn from_btree(mut btree: Btree, open_options: ConnectionOpenOptions) -> Result<Self> {
+        let interrupt_flag = Arc::new(AtomicBool::new(false));
+        btree.set_interrupt_flag(Some(Arc::clone(&interrupt_flag)));
+
+        let db_path = btree.pager().db_path().map(Path::to_path_buf);
+        let database_kind = btree.pager().db_kind();
+        let is_readonly = btree.pager().is_readonly();
+
+        let inner = ConnectionInner {
             btree,
-            schema,
-            schema_loaded,
+            schema: Schema::default(),
+            schema_loaded: false,
+            state: ConnectionState::Open,
+            next_handle_id: 1,
+            open_handles: BTreeMap::new(),
+            activity: ActivityTracker::default(),
+            savepoints: Vec::new(),
             runtime: VmRuntimeContext::default(),
             explicit_tx: false,
             implicit_savepoint_tx: false,
+            in_user_btree_tx: false,
+            schema_changed_in_tx: false,
             foreign_keys: false,
             count_changes: false,
             rollback_count: 0,
             deferred_fk_suspects: Vec::new(),
-        })
+            schema_generation: 0,
+            simulated_cleanup_io_error: None,
+            panic_on_next_pending_drop: false,
+        };
+
+        let shared = Arc::new(ConnectionShared {
+            conn_id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed),
+            db_path,
+            database_kind,
+            is_readonly,
+            open_options,
+            interrupt_flag,
+            gate_busy: AtomicBool::new(false),
+            mirror_last_insert_rowid: AtomicI64::new(0),
+            mirror_changes: AtomicU64::new(0),
+            mirror_total_changes: AtomicU64::new(0),
+            mirror_autocommit: AtomicBool::new(true),
+            mirror_rollback_count: AtomicU64::new(0),
+            pending_drops: Mutex::new(Vec::new()),
+            inner: Mutex::new(inner),
+        });
+
+        Ok(Self { shared })
     }
 
-    fn ensure_schema_loaded(&mut self) -> Result<()> {
-        if self.btree.transaction_state() == TransactionState::Open {
-            self.btree.begin_read()?;
-            let res = self.schema.ensure_fresh_in_tx(&mut self.btree);
-            let _ = self.btree.commit();
-            res?;
-        } else {
-            self.schema.ensure_fresh_in_tx(&mut self.btree)?;
+    /// Consumes this [`Connection`] facade and attempts to close the underlying database
+    /// (`sqlite3_close`).
+    ///
+    /// If any prepared [`Statement`] or open handle remains unfinalized (or if the connection gate
+    /// is busy / reentered), returns `Err(CloseError { connection: self, error })` with `self`
+    /// completely intact and usable.
+    pub fn try_close(self) -> std::result::Result<(), CloseError<Self>> {
+        let shared = Arc::clone(&self.shared);
+        let mut session = match shared.enter() {
+            Ok(s) => s,
+            Err(error) => {
+                return Err(CloseError {
+                    connection: self,
+                    error,
+                });
+            }
+        };
+
+        let inner = session.inner_mut();
+        if matches!(inner.state, ConnectionState::Closed) {
+            drop(session);
+            return Ok(());
         }
-        self.schema_loaded = true;
+
+        if !inner.open_handles.is_empty() {
+            drop(session);
+            return Err(CloseError {
+                connection: self,
+                error: SqliteError::new(
+                    ErrorCode::Busy,
+                    "unable to close due to unfinalized statements or unfinished backups",
+                ),
+            });
+        }
+
+        inner.state = ConnectionState::Closing;
+        inner.btree.close_all_cursors();
+        if inner.btree.transaction_state() != TransactionState::Open {
+            let _ = inner
+                .btree
+                .rollback_with_trip(extended::SQLITE_ABORT_ROLLBACK, false, false);
+            inner.rollback_count += 1;
+        }
+        inner.explicit_tx = false;
+        inner.implicit_savepoint_tx = false;
+        inner.in_user_btree_tx = false;
+        inner.savepoints.clear();
+        inner.deferred_fk_suspects.clear();
+        inner.publish(&self.shared);
+
+        if let Err(close_err) = inner.btree.close() {
+            let poisoned = inner.poison_with(close_err);
+            drop(session);
+            return Err(CloseError {
+                connection: self,
+                error: poisoned,
+            });
+        }
+
+        inner.state = ConnectionState::Closed;
+        drop(session);
         Ok(())
     }
 
+    /// Compiles the first SQL statement in `sql` into a steppable [`Statement`] using
+    /// [`PrepareMode::V2`] (`sqlite3_prepare_v2`).
+    pub fn prepare(&self, sql: &str) -> Result<Statement> {
+        self.prepare_with_mode(sql, PrepareMode::V2)
+    }
+
+    /// Compiles the first SQL statement in `sql` using legacy [`PrepareMode::V1`]
+    /// (`sqlite3_prepare` — does not auto-reprepare on schema change).
+    pub fn prepare_v1(&self, sql: &str) -> Result<Statement> {
+        self.prepare_with_mode(sql, PrepareMode::V1)
+    }
+
+    /// Compiles the first SQL statement in `sql` with explicit [`PrepareMode`].
+    pub fn prepare_with_mode(&self, sql: &str, mode: PrepareMode) -> Result<Statement> {
+        let mut session = self.shared.enter()?;
+        session.inner().ensure_usable()?;
+        Statement::prepare_in_session(&self.shared, session.inner_mut(), sql, mode)
+    }
+
     /// Executes one or more semicolon-separated SQL statements (`sqlite3_exec`) and returns `self.changes()`.
-    pub fn execute(&mut self, sql: &str) -> Result<u64> {
+    pub fn execute(&self, sql: &str) -> Result<u64> {
         self.execute_batch(sql)?;
         Ok(self.changes())
     }
 
     /// Executes a single parameterized SQL statement and returns `self.changes()`.
-    pub fn execute_params(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
-        let (maybe_stmt, _) = parse_one(sql)?;
-        if let Some(stmt) = maybe_stmt {
-            self.run_stmt(&stmt, params)?;
-        }
+    pub fn execute_params(&self, sql: &str, params: &[Value]) -> Result<u64> {
+        let mut session = self.shared.enter()?;
+        session.inner().ensure_usable()?;
+        let mut stmt =
+            Statement::prepare_in_session(&self.shared, session.inner_mut(), sql, PrepareMode::V2)?;
+        let res = (|| -> Result<()> {
+            stmt.bind_all_in_session(session.inner(), params)?;
+            while let StepResult::Row(_) =
+                stmt.step_in_session(&self.shared, session.inner_mut())?
+            {}
+            Ok(())
+        })();
+        let fin_res = stmt.finalize_in_session(&self.shared, session.inner_mut());
+        res?;
+        fin_res?;
         Ok(self.changes())
     }
 
     /// Executes an arbitrary multi-statement SQL script (`sqlite3_exec`).
-    pub fn execute_batch(&mut self, mut sql: &str) -> Result<()> {
+    pub fn execute_batch(&self, mut sql: &str) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        session.inner().ensure_usable()?;
         while !sql.is_empty() {
-            let (maybe_stmt, tail) = parse_one(sql)?;
-            if let Some(stmt) = maybe_stmt {
-                self.run_stmt(&stmt, &[])?;
-            }
-            if tail.len() == sql.len() {
+            let mut stmt = Statement::prepare_in_session(
+                &self.shared,
+                session.inner_mut(),
+                sql,
+                PrepareMode::V2,
+            )?;
+            let next_tail_len = stmt.unparsed_tail.len();
+            let cur_len = sql.len();
+            let step_res = (|| -> Result<()> {
+                while let StepResult::Row(_) =
+                    stmt.step_in_session(&self.shared, session.inner_mut())?
+                {}
+                Ok(())
+            })();
+            let fin_res = stmt.finalize_in_session(&self.shared, session.inner_mut());
+            step_res?;
+            fin_res?;
+            if next_tail_len == cur_len {
                 break;
             }
-            sql = tail;
+            sql = &sql[(cur_len - next_tail_len)..];
         }
         Ok(())
     }
 
     /// Executes a query with optional positional parameters and returns all columns & rows.
-    pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult> {
-        let mut stmt = self.prepare(sql)?;
-        stmt.bind_all(params)?;
-        let rows = stmt.collect_rows()?;
-        let cols = stmt.column_names().to_vec();
-        Ok(QueryResult {
-            column_names: cols,
-            rows,
-        })
+    pub fn query(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
+        let mut session = self.shared.enter()?;
+        session.inner().ensure_usable()?;
+        let mut stmt =
+            Statement::prepare_in_session(&self.shared, session.inner_mut(), sql, PrepareMode::V2)?;
+        let res = (|| -> Result<QueryResult> {
+            stmt.bind_all_in_session(session.inner(), params)?;
+            let mut rows = Vec::new();
+            while let StepResult::Row(r) =
+                stmt.step_in_session(&self.shared, session.inner_mut())?
+            {
+                rows.push(r);
+            }
+            Ok(QueryResult {
+                column_names: stmt.column_names.clone(),
+                rows,
+            })
+        })();
+        let fin_res = stmt.finalize_in_session(&self.shared, session.inner_mut());
+        let out = res?;
+        fin_res?;
+        Ok(out)
     }
 
     /// Executes a query and returns the first [`Row`] if any (`None` if 0 rows).
-    pub fn query_row(&mut self, sql: &str, params: &[Value]) -> Result<Option<Row>> {
-        let mut stmt = self.prepare(sql)?;
-        stmt.bind_all(params)?;
-        match stmt.step()? {
-            StepResult::Row(r) => Ok(Some(r)),
-            StepResult::Done => Ok(None),
-        }
-    }
-
-    /// Compiles the first SQL statement in `sql` into a steppable [`Statement`] (`sqlite3_prepare_v2`).
-    pub fn prepare(&mut self, sql: &str) -> Result<Statement<'_>> {
-        let (stmt_opt, tail) = parse_one(sql)?;
-        self.ensure_schema_loaded()?;
-        Statement::new(self, stmt_opt, tail.to_owned())
+    pub fn query_row(&self, sql: &str, params: &[Value]) -> Result<Option<Row>> {
+        let mut session = self.shared.enter()?;
+        session.inner().ensure_usable()?;
+        let mut stmt =
+            Statement::prepare_in_session(&self.shared, session.inner_mut(), sql, PrepareMode::V2)?;
+        let res = (|| -> Result<Option<Row>> {
+            stmt.bind_all_in_session(session.inner(), params)?;
+            match stmt.step_in_session(&self.shared, session.inner_mut())? {
+                StepResult::Row(r) => Ok(Some(r)),
+                StepResult::Done => Ok(None),
+            }
+        })();
+        let fin_res = stmt.finalize_in_session(&self.shared, session.inner_mut());
+        let out = res?;
+        fin_res?;
+        Ok(out)
     }
 
     /// Reloads the in-memory schema catalog from Page 1 (`sqlite_schema`).
-    pub fn reload_schema(&mut self) -> Result<()> {
-        self.schema = Schema::load(&mut self.btree)?;
-        self.schema_loaded = true;
+    pub fn reload_schema(&self) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        inner.schema = Schema::load(&mut inner.btree)?;
+        inner.schema_loaded = true;
+        inner.schema_generation += 1;
         Ok(())
     }
 
+    /// Returns an owned snapshot of the current in-memory [`Schema`] catalog, loading or
+    /// refreshing it from disk if needed.
+    pub fn schema_snapshot(&self) -> Result<Schema> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        let _ = inner.ensure_schema_loaded_for_prepare()?;
+        Ok(inner.schema.clone())
+    }
+
+    /// Returns an owned copy of the authoritative 100-byte [`DatabaseHeader`], performing a brief
+    /// locked header read if the connection is currently in `Open` (`NoLock`) state.
+    pub fn database_header(&self) -> Result<DatabaseHeader> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        if inner.btree.transaction_state() == TransactionState::Open {
+            inner.btree.begin_read()?;
+            let hdr = inner.btree.pager().header().clone();
+            if !inner.in_user_btree_tx && inner.activity.has_no_active_tx() {
+                inner.btree.pager_mut().end_read_if_unused()?;
+            }
+            Ok(hdr)
+        } else {
+            Ok(inner.btree.pager().header().clone())
+        }
+    }
+
+    /// Returns the authoritative database page size (`512..=65536`), performing a brief locked
+    /// header read if needed.
+    pub fn page_size(&self) -> Result<u32> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        inner.btree.pager_mut().effective_page_size()
+    }
+
+    /// Returns the authoritative database page count, performing a brief locked header read if
+    /// the connection is currently in `Open` (`NoLock`) state.
+    pub fn page_count(&self) -> Result<Pgno> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        if inner.btree.transaction_state() == TransactionState::Open {
+            inner.btree.begin_read()?;
+            let cnt = inner.btree.pager().page_count();
+            if !inner.in_user_btree_tx && inner.activity.has_no_active_tx() {
+                inner.btree.pager_mut().end_read_if_unused()?;
+            }
+            Ok(cnt)
+        } else {
+            Ok(inner.btree.pager().page_count())
+        }
+    }
+
     /// Rowid of the most recent successful `INSERT` into a rowid table (`sqlite3_last_insert_rowid`).
+    /// Lock-free atomic load safe to call from callbacks/hooks and other threads.
     #[inline]
-    pub const fn last_insert_rowid(&self) -> i64 {
-        self.runtime.last_insert_rowid
+    pub fn last_insert_rowid(&self) -> i64 {
+        self.shared.mirror_last_insert_rowid.load(Ordering::Acquire)
     }
 
     /// Number of rows modified by the most recent `INSERT`, `UPDATE`, or `DELETE` (`sqlite3_changes64`).
+    /// Lock-free atomic load safe to call from callbacks/hooks and other threads.
     #[inline]
-    pub const fn changes(&self) -> u64 {
-        self.runtime.last_changes
+    pub fn changes(&self) -> u64 {
+        self.shared.mirror_changes.load(Ordering::Acquire)
     }
 
     /// Total number of rows modified since this connection was opened (`sqlite3_total_changes64`).
+    /// Lock-free atomic load safe to call from callbacks/hooks and other threads.
     #[inline]
-    pub const fn total_changes(&self) -> u64 {
-        self.runtime.total_changes
+    pub fn total_changes(&self) -> u64 {
+        self.shared.mirror_total_changes.load(Ordering::Acquire)
     }
 
     /// Returns `true` if the connection is in autocommit mode (`sqlite3_get_autocommit`).
+    /// Lock-free atomic load safe to call from callbacks/hooks and other threads.
     #[inline]
-    pub const fn is_autocommit(&self) -> bool {
-        !self.explicit_tx && !self.implicit_savepoint_tx
+    pub fn is_autocommit(&self) -> bool {
+        self.shared.mirror_autocommit.load(Ordering::Acquire)
     }
 
-    /// Monotonic counter incremented on every transaction-level `ROLLBACK` (`sqlite3RollbackAll`).
+    /// Monotonic counter incremented on every transaction/savepoint `ROLLBACK`.
+    /// Lock-free atomic load safe to call from callbacks/hooks and other threads.
     #[inline]
-    pub const fn rollback_count(&self) -> u64 {
-        self.rollback_count
+    pub fn rollback_count(&self) -> u64 {
+        self.shared.mirror_rollback_count.load(Ordering::Acquire)
     }
 
+    /// Returns `true` if this connection was opened read-only.
     #[inline]
-    pub const fn is_readonly(&self) -> bool {
-        self.btree.pager().is_readonly()
+    pub fn is_readonly(&self) -> bool {
+        self.shared.is_readonly
     }
 
+    /// Returns the canonical path of the main database file (`None` for `:memory:` and `""`).
     #[inline]
     pub fn db_path(&self) -> Option<&Path> {
-        self.btree.pager().db_path()
+        self.shared.db_path.as_deref()
     }
 
+    /// Returns the [`DatabaseKind`] (`NamedDisk`, `Memory`, or `PrivateTemporary`) of `main`.
     #[inline]
-    pub const fn page_size(&self) -> u32 {
-        self.btree.pager().page_size()
+    pub fn database_kind(&self) -> DatabaseKind {
+        self.shared.database_kind
     }
 
+    /// Returns the [`ConnectionOpenOptions`] used to open this connection.
     #[inline]
-    pub const fn page_count(&self) -> Pgno {
-        self.btree.pager().page_count()
+    pub fn open_options(&self) -> ConnectionOpenOptions {
+        self.shared.open_options
     }
 
+    /// Returns a lock-free [`InterruptHandle`] (`Send + Sync + Clone`) for `sqlite3_interrupt`.
     #[inline]
-    pub const fn schema(&self) -> &Schema {
-        &self.schema
-    }
-
-    #[inline]
-    pub const fn btree(&self) -> &Btree {
-        &self.btree
-    }
-
-    #[inline]
-    pub fn btree_mut(&mut self) -> &mut Btree {
-        &mut self.btree
-    }
-
-    /// Attaches or clears a shared atomic interrupt flag (`sqlite3_interrupt`).
-    #[inline]
-    pub fn set_interrupt_flag(&mut self, flag: Option<Arc<std::sync::atomic::AtomicBool>>) {
-        self.btree.set_interrupt_flag(flag);
-    }
-
-    /// Returns the attached atomic interrupt flag, if any.
-    #[inline]
-    pub fn interrupt_flag(&self) -> Option<&Arc<std::sync::atomic::AtomicBool>> {
-        self.btree.interrupt_flag()
-    }
-
-    fn run_stmt(&mut self, stmt: &Stmt, params: &[Value]) -> Result<QueryOutput> {
-        if self.btree.transaction_state() != TransactionState::Open {
-            self.schema.ensure_fresh_in_tx(&mut self.btree)?;
-            self.schema_loaded = true;
-        } else if !self.schema_loaded {
-            self.ensure_schema_loaded()?;
+    pub fn interrupt_handle(&self) -> InterruptHandle {
+        InterruptHandle {
+            flag: Arc::clone(&self.shared.interrupt_flag),
         }
-        let prev_ts = self.runtime.stmt_timestamp_ms;
-        if prev_ts.is_none() {
-            self.runtime.stmt_timestamp_ms = Some(self.btree.pager().vfs().current_unix_millis());
+    }
+
+    /// Returns the default atomic interrupt flag attached to this connection.
+    #[inline]
+    pub fn interrupt_flag(&self) -> &Arc<AtomicBool> {
+        &self.shared.interrupt_flag
+    }
+
+    /// Replaces or restores the `Btree` atomic interrupt flag under the connection gate.
+    pub fn set_interrupt_flag(&self, flag: Option<Arc<AtomicBool>>) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        let eff = flag.or_else(|| Some(Arc::clone(&self.shared.interrupt_flag)));
+        inner.btree.set_interrupt_flag(eff);
+        Ok(())
+    }
+
+    /// Test/internal hook invoking `f(self)` while holding the active execution gate and
+    /// `ConnectionInner` guard (simulating an in-engine UDF / commit / progress callback).
+    #[doc(hidden)]
+    pub fn with_active_execution_hook_for_testing<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&Connection) -> R,
+    {
+        let session = self.shared.enter()?;
+        session.inner().ensure_usable()?;
+        let out = f(self);
+        drop(session);
+        Ok(out)
+    }
+
+    /// Test/internal hook executing `sql` and then invoking `f(self)` inside the SAME active
+    /// execution lease and `ConnectionInner` guard so callback scalar mirror visibility,
+    /// same-thread `Misuse`, cross-thread `Busy`, and `pending_drops` handoff can be verified.
+    #[doc(hidden)]
+    pub fn execute_and_invoke_hook_for_testing<F, R>(&self, sql: &str, f: F) -> Result<R>
+    where
+        F: FnOnce(&Connection) -> R,
+    {
+        let mut session = self.shared.enter()?;
+        session.inner().ensure_usable()?;
+        if !sql.trim().is_empty() {
+            let mut stmt = Statement::prepare_in_session(
+                &self.shared,
+                session.inner_mut(),
+                sql,
+                PrepareMode::V2,
+            )?;
+            let step_res = (|| -> Result<()> {
+                while let StepResult::Row(_) =
+                    stmt.step_in_session(&self.shared, session.inner_mut())?
+                {}
+                Ok(())
+            })();
+            let fin_res = stmt.finalize_in_session(&self.shared, session.inner_mut());
+            step_res?;
+            fin_res?;
         }
-        let res = {
-            let mut ctx = engine::ExecContext {
-                btree: &mut self.btree,
-                schema: &mut self.schema,
-                runtime: &mut self.runtime,
-                explicit_tx: &mut self.explicit_tx,
-                implicit_savepoint_tx: &mut self.implicit_savepoint_tx,
-                foreign_keys: &mut self.foreign_keys,
-                count_changes: &mut self.count_changes,
-                rollback_count: &mut self.rollback_count,
-                deferred_fk_suspects: &mut self.deferred_fk_suspects,
+        let out = f(self);
+        drop(session);
+        Ok(out)
+    }
+
+    /// Opens a representative active `Blob` handle (`writable` or read-only) for Phase 1.1
+    /// `ActivityTracker`, `try_close` `Busy`, and `pending_drops` lifecycle testing before full
+    /// `sqlite3_blob` arrives in Phase 6.
+    #[doc(hidden)]
+    pub fn open_test_blob_handle(&self, writable: bool) -> Result<TestBlobHandle> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        if writable {
+            if inner.btree.transaction_state() != TransactionState::Write {
+                inner
+                    .btree
+                    .pager_mut()
+                    .begin_write_with_savepoint_depth(inner.savepoints.len())?;
+            }
+            if !inner.is_autocommit() {
+                inner.in_user_btree_tx = true;
+            }
+            let hid = inner.register_handle(HandleKind::TestBlob { writable: true });
+            inner.activity.start(hid, true, true);
+            Ok(TestBlobHandle {
+                shared: Arc::clone(&self.shared),
+                handle_id: Some(hid),
+                lease_cursor: None,
+                writable: true,
+            })
+        } else {
+            if inner.btree.transaction_state() == TransactionState::Open {
+                inner.btree.begin_read()?;
+            }
+            if !inner.is_autocommit() {
+                inner.in_user_btree_tx = true;
+            }
+            let cid = inner.btree.open_table_cursor(1, false);
+            if inner.btree.pager().page_count() >= 1 {
+                let _ = inner.btree.cursor_first(cid);
+            }
+            let hid = inner.register_handle(HandleKind::TestBlob { writable: false });
+            inner.activity.start(hid, true, false);
+            Ok(TestBlobHandle {
+                shared: Arc::clone(&self.shared),
+                handle_id: Some(hid),
+                lease_cursor: Some(cid),
+                writable: false,
+            })
+        }
+    }
+
+    /// Injects a one-shot simulated I/O error into the next `finish_activity` / `abort_write_statement`
+    /// cleanup path to deterministically test `ConnectionState::Poisoned(SqliteError)`.
+    #[doc(hidden)]
+    pub fn set_simulated_cleanup_io_error_for_testing(
+        &self,
+        err: Option<SqliteError>,
+    ) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        session.inner_mut().simulated_cleanup_io_error = err;
+        Ok(())
+    }
+
+    /// Returns the number of currently open low-level `BtreeCursor`s under the connection gate.
+    #[doc(hidden)]
+    pub fn open_cursor_count_for_testing(&self) -> Result<usize> {
+        let session = self.shared.enter()?;
+        session.inner().ensure_usable()?;
+        Ok(session.inner().btree.open_cursor_count())
+    }
+
+    /// Arms a one-shot panic inside `process_pending_drops` to deterministically verify that
+    /// `gate_busy` and `ACTIVE_CONN_STACK` never leak across unwinds in `enter()` or
+    /// `drain_and_release_gate()`.
+    #[doc(hidden)]
+    pub fn arm_panic_on_next_pending_drop_for_testing(&self) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        session.inner_mut().panic_on_next_pending_drop = true;
+        Ok(())
+    }
+
+    /// Enqueues `stmt` onto `pending_drops` without draining immediately and arms a one-shot
+    /// panic so the next `ConnectionShared::enter()` exercises the `initial_drops` unwind path.
+    #[doc(hidden)]
+    pub fn enqueue_pending_drop_for_enter_unwind_testing(&self, mut stmt: Statement) -> Result<()> {
+        {
+            let mut session = self.shared.enter()?;
+            session.inner_mut().panic_on_next_pending_drop = true;
+        }
+        if let Some(hid) = stmt.handle_id.take() {
+            let prev = std::mem::replace(&mut stmt.lifecycle, StatementLifecycle::Ready);
+            let running = match prev {
+                StatementLifecycle::Running(r) => Some(r),
+                _ => None,
             };
-            engine::execute_statement(&mut ctx, stmt, params)
+            let mut pq = self.shared.lock_pending_drops();
+            pq.push(PendingDrop::Statement {
+                handle_id: hid,
+                running,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Internal/test handle representing an open `sqlite3_blob` lease for Phase 1.1 ownership,
+/// `try_close` `Busy`, `ActivityTracker`, and `pending_drops` tests.
+#[doc(hidden)]
+pub struct TestBlobHandle {
+    shared: Arc<ConnectionShared>,
+    handle_id: Option<HandleId>,
+    lease_cursor: Option<CursorId>,
+    writable: bool,
+}
+
+impl TestBlobHandle {
+    pub fn close(mut self) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let Some(hid) = self.handle_id.take() else {
+            return Ok(());
         };
-        self.runtime.stmt_timestamp_ms = prev_ts;
+        let lc = self.lease_cursor.take();
+        let inner = session.inner_mut();
+        let res = if self.writable {
+            let snap = WriteAbortSnapshot {
+                stmt_sp_slot: None,
+                fk_before: inner.deferred_fk_suspects.clone(),
+                rt_before: inner.runtime,
+                schema_before: inner.schema.clone(),
+                schema_gen_before: inner.schema_generation,
+                schema_changed_before: inner.schema_changed_in_tx,
+            };
+            inner.finish_activity(
+                hid,
+                ActivityFinish::WriteCompleted {
+                    abort_snapshot: snap,
+                },
+                &self.shared,
+            )
+        } else {
+            inner.finish_activity(
+                hid,
+                ActivityFinish::ReadDone {
+                    lease_cursors: lc.into_iter().collect(),
+                },
+                &self.shared,
+            )
+        };
+        inner.open_handles.remove(&hid);
         res
     }
 }
 
-impl Drop for Connection {
+impl Drop for TestBlobHandle {
     fn drop(&mut self) {
-        if self.btree.transaction_state() != TransactionState::Open {
-            let _ = self.btree.rollback();
+        if let Some(hid) = self.handle_id.take() {
+            self.shared.enqueue_or_run_drop(PendingDrop::TestBlob {
+                handle_id: hid,
+                lease_cursor: self.lease_cursor.take(),
+                writable: self.writable,
+            });
         }
     }
 }
 
-enum StatementExecState {
-    Unstarted,
-    Vdbe {
-        vm: VdbeVm,
-        started_autocommit_read: bool,
-    },
-    Materialized {
-        rows: std::vec::IntoIter<Vec<Value>>,
-    },
-    Finished,
-}
-
-/// Prepared SQL statement (`sqlite3_stmt` in `sqlite.h.in`).
-pub struct Statement<'conn> {
-    conn: &'conn mut Connection,
+/// Prepared SQL statement (`sqlite3_stmt*` in `sqlite.h.in`).
+///
+/// Owns an `Arc` reference to the shared connection state (`Statement: Send`, no `'conn` lifetime).
+pub struct Statement {
+    shared: Arc<ConnectionShared>,
+    handle_id: Option<HandleId>,
+    mode: PrepareMode,
+    raw_sql: String,
     stmt: Option<Stmt>,
+    requires_schema: bool,
+    category: Option<StmtCategory>,
     compiled_vdbe: Option<VdbeProgram>,
+    compiled_schema_generation: u64,
     compiled_cookie: u32,
     compiled_had_pages: bool,
+    expired: bool,
     column_names: Vec<String>,
     params: Vec<Value>,
     named_params: HashMap<String, usize>,
     unparsed_tail: String,
-    state: StatementExecState,
+    lifecycle: StatementLifecycle,
 }
 
-impl<'conn> Statement<'conn> {
-    fn new(conn: &'conn mut Connection, stmt: Option<Stmt>, unparsed_tail: String) -> Result<Self> {
-        let mut max_param = 0usize;
-        let mut named = HashMap::new();
-        if let Some(ref s) = stmt {
-            collect_stmt_params(s, &mut max_param, &mut named);
+impl fmt::Debug for Statement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Statement")
+            .field("mode", &self.mode)
+            .field("raw_sql", &self.raw_sql)
+            .field("column_names", &self.column_names)
+            .field("parameter_count", &self.params.len())
+            .finish()
+    }
+}
+
+struct CompiledArtifacts {
+    stmt: Option<Stmt>,
+    requires_schema: bool,
+    category: Option<StmtCategory>,
+    compiled_vdbe: Option<VdbeProgram>,
+    column_names: Vec<String>,
+    max_param: usize,
+    named_params: HashMap<String, usize>,
+}
+
+fn compile_first_sql(
+    raw_sql: &str,
+    schema: &Schema,
+    foreign_keys: bool,
+    count_changes: bool,
+) -> Result<CompiledArtifacts> {
+    let (stmt_opt, _) = parse_one(raw_sql)?;
+    compile_parsed_stmt(stmt_opt, schema, foreign_keys, count_changes)
+}
+
+fn compile_parsed_stmt(
+    stmt_opt: Option<Stmt>,
+    schema: &Schema,
+    foreign_keys: bool,
+    count_changes: bool,
+) -> Result<CompiledArtifacts> {
+    let Some(stmt) = stmt_opt else {
+        return Ok(CompiledArtifacts {
+            stmt: None,
+            requires_schema: false,
+            category: None,
+            compiled_vdbe: None,
+            column_names: Vec::new(),
+            max_param: 0,
+            named_params: HashMap::new(),
+        });
+    };
+
+    let requires_schema = stmt_requires_schema(&stmt);
+    let category = Some(classify_stmt_category(&stmt));
+    let mut max_param = 0usize;
+    let mut named_params = HashMap::new();
+    collect_stmt_params(&stmt, &mut max_param, &mut named_params);
+
+    let column_names = validate_and_infer_columns(&stmt, schema, foreign_keys, count_changes)?;
+    let mut compiled_vdbe = None;
+    if let Stmt::Select(ref sel) = stmt
+        && let Some(prog) = compiler::try_compile_select(sel, schema)?
+    {
+        compiled_vdbe = Some(prog);
+    }
+
+    Ok(CompiledArtifacts {
+        stmt: Some(stmt),
+        requires_schema,
+        category,
+        compiled_vdbe,
+        column_names,
+        max_param,
+        named_params,
+    })
+}
+
+impl Statement {
+    fn prepare_in_session(
+        shared: &Arc<ConnectionShared>,
+        inner: &mut ConnectionInner,
+        sql: &str,
+        mode: PrepareMode,
+    ) -> Result<Self> {
+        let (stmt_opt, tail) = parse_one(sql)?;
+        let consumed_len = sql.len().saturating_sub(tail.len());
+        let raw_sql = sql[..consumed_len].to_owned();
+        let unparsed_tail = tail.to_owned();
+
+        let needs_schema = stmt_opt.as_ref().is_some_and(stmt_requires_schema);
+        if needs_schema {
+            if !inner.schema_loaded {
+                let _ = inner.ensure_schema_loaded_for_prepare()?;
+            } else if inner.btree.transaction_state() != TransactionState::Open {
+                inner.refresh_schema_in_open_tx()?;
+            }
         }
 
-        let mut compiled_vdbe = None;
-        let mut column_names = Vec::new();
-        if let Some(Stmt::Select(ref sel)) = stmt
-            && let Some(prog) = compiler::try_compile_select(sel, &conn.schema)?
-        {
-            column_names.clone_from(&prog.column_names);
-            compiled_vdbe = Some(prog);
-        } else if let Some(ref s) = stmt {
-            column_names = infer_stmt_column_names(s, &conn.schema);
-        }
+        let artifacts = match compile_parsed_stmt(
+            stmt_opt.clone(),
+            &inner.schema,
+            inner.foreign_keys,
+            inner.count_changes,
+        ) {
+            Ok(a) => a,
+            Err(err)
+                if needs_schema
+                    && err.code == ErrorCode::Error
+                    && inner.btree.transaction_state() == TransactionState::Open =>
+            {
+                // Cached schema might be stale due to an external writer: check on-disk cookie once!
+                if inner.ensure_schema_loaded_for_prepare()? {
+                    compile_parsed_stmt(
+                        stmt_opt,
+                        &inner.schema,
+                        inner.foreign_keys,
+                        inner.count_changes,
+                    )?
+                } else {
+                    return Err(err);
+                }
+            }
+            Err(err) => return Err(err),
+        };
 
-        let compiled_cookie = conn.schema.schema_cookie;
-        let compiled_had_pages = conn.schema.had_pages;
-
+        let hid = inner.register_handle(HandleKind::Statement);
         Ok(Self {
-            conn,
-            stmt,
-            compiled_vdbe,
-            compiled_cookie,
-            compiled_had_pages,
-            column_names,
-            params: vec![Value::Null; max_param],
-            named_params: named,
+            shared: Arc::clone(shared),
+            handle_id: Some(hid),
+            mode,
+            raw_sql,
+            stmt: artifacts.stmt,
+            requires_schema: artifacts.requires_schema,
+            category: artifacts.category,
+            compiled_vdbe: artifacts.compiled_vdbe,
+            compiled_schema_generation: inner.schema_generation,
+            compiled_cookie: inner.schema.schema_cookie,
+            compiled_had_pages: inner.schema.had_pages,
+            expired: false,
+            column_names: artifacts.column_names,
+            params: vec![Value::Null; artifacts.max_param],
+            named_params: artifacts.named_params,
             unparsed_tail,
-            state: StatementExecState::Unstarted,
+            lifecycle: StatementLifecycle::Ready,
         })
     }
 
@@ -428,6 +1993,18 @@ impl<'conn> Statement<'conn> {
     #[inline]
     pub fn tail(&self) -> &str {
         &self.unparsed_tail
+    }
+
+    /// Original SQL text compiled for this statement (`sqlite3_sql`).
+    #[inline]
+    pub fn sql(&self) -> &str {
+        &self.raw_sql
+    }
+
+    /// Preparation mode (`V2` or `V1`).
+    #[inline]
+    pub fn prepare_mode(&self) -> PrepareMode {
+        self.mode
     }
 
     /// Number of bind parameters in this statement (`sqlite3_bind_parameter_count`).
@@ -442,195 +2019,1095 @@ impl<'conn> Statement<'conn> {
         &self.named_params
     }
 
-    /// Binds a 1-based parameter (`?1`, `?`, etc.) (`sqlite3_bind_*`).
-    pub fn bind(&mut self, index_1_based: usize, value: impl Into<Value>) -> Result<&mut Self> {
-        if index_1_based == 0 || index_1_based > self.params.len() {
-            return Err(SqliteError::new(
-                ErrorCode::Range,
-                format!("column/bind index {index_1_based} out of range"),
-            ));
-        }
-        self.params[index_1_based - 1] = value.into();
-        Ok(self)
-    }
-
-    /// Binds a named parameter (`:name`, `@name`, or `$name`).
-    pub fn bind_named(&mut self, name: &str, value: impl Into<Value>) -> Result<&mut Self> {
-        let Some(&idx) = self.named_params.get(name) else {
-            return Err(SqliteError::new(
-                ErrorCode::Range,
-                format!("unknown bind parameter: {name}"),
-            ));
-        };
-        self.bind(idx, value)
-    }
-
-    /// Binds a slice of positional parameters (`1..=values.len()`).
-    pub fn bind_all(&mut self, values: &[Value]) -> Result<&mut Self> {
-        if values.len() > self.params.len() {
-            self.params.resize(values.len(), Value::Null);
-        }
-        for (i, v) in values.iter().enumerate() {
-            self.params[i] = v.clone();
-        }
-        Ok(self)
-    }
-
     /// Result column names (`sqlite3_column_name`).
     #[inline]
     pub fn column_names(&self) -> &[String] {
         &self.column_names
     }
 
-    /// Resets execution back to the start while preserving bound parameter values (`sqlite3_reset`).
-    pub fn reset(&mut self) {
-        self.finish_vdbe_read_if_needed();
-        self.state = StatementExecState::Unstarted;
+    /// Returns `true` if this statement is currently paused in `Running` (`SQLITE_ROW` / retryable `Busy`)
+    /// (`sqlite3_stmt_busy`).
+    #[inline]
+    pub fn is_busy(&self) -> bool {
+        matches!(self.lifecycle, StatementLifecycle::Running(_))
     }
 
-    /// Clears all bound parameters back to `NULL` (`sqlite3_clear_bindings`).
-    pub fn clear_bindings(&mut self) {
+    fn ensure_ready_for_bind(&self) -> Result<()> {
+        if !matches!(self.lifecycle, StatementLifecycle::Ready) {
+            return Err(SqliteError::misuse(format!(
+                "bind on a busy prepared statement: [{}]",
+                self.raw_sql.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    fn bind_one_in_session(
+        &mut self,
+        inner: &ConnectionInner,
+        index_1_based: usize,
+        value: Value,
+    ) -> Result<()> {
+        inner.ensure_usable()?;
+        self.ensure_ready_for_bind()?;
+        if index_1_based == 0 || index_1_based > self.params.len() {
+            return Err(SqliteError::new(
+                ErrorCode::Range,
+                format!("column/bind index {index_1_based} out of range"),
+            ));
+        }
+        self.params[index_1_based - 1] = value;
+        Ok(())
+    }
+
+    fn bind_all_in_session(&mut self, inner: &ConnectionInner, values: &[Value]) -> Result<()> {
+        inner.ensure_usable()?;
+        self.ensure_ready_for_bind()?;
+        if values.len() > self.params.len() {
+            return Err(SqliteError::new(
+                ErrorCode::Range,
+                format!(
+                    "bind_all supplied {} values for {} parameters",
+                    values.len(),
+                    self.params.len()
+                ),
+            ));
+        }
+        for (i, v) in values.iter().enumerate() {
+            self.params[i] = v.clone();
+        }
+        Ok(())
+    }
+
+    /// Binds a 1-based parameter (`?1`, `?`, etc.) (`sqlite3_bind_*`).
+    /// Requires the statement to be in `Ready` state (`ErrorCode::Misuse` if `Running` or `Halted` without `reset()`).
+    pub fn bind(&mut self, index_1_based: usize, value: impl Into<Value>) -> Result<&mut Self> {
+        let shared = Arc::clone(&self.shared);
+        let session = shared.enter()?;
+        self.bind_one_in_session(session.inner(), index_1_based, value.into())?;
+        drop(session);
+        Ok(self)
+    }
+
+    /// Binds a named parameter (`:name`, `@name`, or `$name`).
+    /// Requires the statement to be in `Ready` state (`ErrorCode::Misuse` if `Running` or `Halted` without `reset()`).
+    pub fn bind_named(&mut self, name: &str, value: impl Into<Value>) -> Result<&mut Self> {
+        let shared = Arc::clone(&self.shared);
+        let session = shared.enter()?;
+        session.inner().ensure_usable()?;
+        self.ensure_ready_for_bind()?;
+        let Some(&idx) = self.named_params.get(name) else {
+            return Err(SqliteError::new(
+                ErrorCode::Range,
+                format!("unknown bind parameter: {name}"),
+            ));
+        };
+        self.params[idx - 1] = value.into();
+        drop(session);
+        Ok(self)
+    }
+
+    /// Binds a slice of positional parameters (`1..=values.len()`).
+    /// Requires `Ready` state and `values.len() <= self.parameter_count()`.
+    pub fn bind_all(&mut self, values: &[Value]) -> Result<&mut Self> {
+        let shared = Arc::clone(&self.shared);
+        let session = shared.enter()?;
+        self.bind_all_in_session(session.inner(), values)?;
+        drop(session);
+        Ok(self)
+    }
+
+    /// Clears all bound parameters to `NULL` (`sqlite3_clear_bindings`).
+    ///
+    /// Matches C `vdbeapi.c:sqlite3_clear_bindings`: enters the connection gate, does **not**
+    /// require `Ready` state (`Ok(())` in `Ready`, `Running`, and `Halted`), and does **not**
+    /// reset execution position, close cursors, or end active `ActivityTracker` leases.
+    pub fn clear_bindings(&mut self) -> Result<()> {
+        let shared = Arc::clone(&self.shared);
+        let session = shared.enter()?;
+        session.inner().ensure_usable()?;
         self.params.fill(Value::Null);
+        Ok(())
+    }
+
+    /// Resets execution back to `Ready` while preserving bound parameter values (`sqlite3_reset`).
+    ///
+    /// Surfaces any error recorded on the prior `step()` or encountered while halting/committing
+    /// active execution (`sqlite3VdbeReset`), while leaving the statement rewound to `Ready`
+    /// (unless cleanup I/O poisoned the connection).
+    pub fn reset(&mut self) -> Result<()> {
+        let shared = Arc::clone(&self.shared);
+        let mut session = shared.enter()?;
+        self.reset_in_session(&shared, session.inner_mut())
+    }
+
+    fn reset_in_session(
+        &mut self,
+        shared: &Arc<ConnectionShared>,
+        inner: &mut ConnectionInner,
+    ) -> Result<()> {
+        let Some(hid) = self.handle_id else {
+            return Err(SqliteError::misuse("statement already finalized"));
+        };
+        if let ConnectionState::Poisoned(ref p_err) = inner.state {
+            let p_err = p_err.clone();
+            let prev = std::mem::replace(&mut self.lifecycle, StatementLifecycle::Ready);
+            if let StatementLifecycle::Running(run) = prev {
+                let _ = inner.finish_running_exec(hid, run, shared);
+            }
+            return Err(p_err);
+        }
+        inner.ensure_usable()?;
+
+        let prev = std::mem::replace(&mut self.lifecycle, StatementLifecycle::Ready);
+        match prev {
+            StatementLifecycle::Ready => Ok(()),
+            StatementLifecycle::Halted { last_error } => match last_error {
+                Some(err) => Err(err),
+                None => Ok(()),
+            },
+            StatementLifecycle::Running(run) => inner.finish_running_exec(hid, run, shared),
+        }
+    }
+
+    /// Explicitly finalizes and consumes this [`Statement`] (`sqlite3_finalize`), finishing any
+    /// active execution, unregistering the handle from the connection **once** (`Drop` becomes a
+    /// no-op), and returning any prior execution or halt/cleanup error.
+    pub fn finalize(mut self) -> Result<()> {
+        let shared = Arc::clone(&self.shared);
+        let mut session = shared.enter()?;
+        self.finalize_in_session(&shared, session.inner_mut())
+    }
+
+    fn finalize_in_session(
+        &mut self,
+        shared: &Arc<ConnectionShared>,
+        inner: &mut ConnectionInner,
+    ) -> Result<()> {
+        let Some(hid) = self.handle_id.take() else {
+            return Ok(());
+        };
+        let prev = std::mem::replace(&mut self.lifecycle, StatementLifecycle::Ready);
+        let res = match prev {
+            StatementLifecycle::Ready => {
+                if let ConnectionState::Poisoned(ref p_err) = inner.state {
+                    Err(p_err.clone())
+                } else {
+                    Ok(())
+                }
+            }
+            StatementLifecycle::Halted { last_error } => match last_error {
+                Some(err) => Err(err),
+                None => {
+                    if let ConnectionState::Poisoned(ref p_err) = inner.state {
+                        Err(p_err.clone())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            StatementLifecycle::Running(run) => inner.finish_running_exec(hid, run, shared),
+        };
+        inner.open_handles.remove(&hid);
+        res
+    }
+
+    fn needs_reprepare(&self, inner: &ConnectionInner) -> bool {
+        if self.expired {
+            return true;
+        }
+        if !self.requires_schema {
+            return false;
+        }
+        self.compiled_schema_generation != inner.schema_generation
+            || self.compiled_cookie != inner.schema.schema_cookie
+            || self.compiled_had_pages != inner.schema.had_pages
+    }
+
+    fn reprepare_in_open_tx(&mut self, inner: &mut ConnectionInner) -> Result<()> {
+        for _ in 0..SQLITE_MAX_SCHEMA_RETRY {
+            inner.refresh_schema_in_open_tx()?;
+            let artifacts = compile_first_sql(
+                &self.raw_sql,
+                &inner.schema,
+                inner.foreign_keys,
+                inner.count_changes,
+            )?;
+            let mut transferred = vec![Value::Null; artifacts.max_param];
+            let copy_len = self.params.len().min(artifacts.max_param);
+            transferred[..copy_len].clone_from_slice(&self.params[..copy_len]);
+
+            self.stmt = artifacts.stmt;
+            self.requires_schema = artifacts.requires_schema;
+            self.category = artifacts.category;
+            self.compiled_vdbe = artifacts.compiled_vdbe;
+            self.column_names = artifacts.column_names;
+            self.params = transferred;
+            self.named_params = artifacts.named_params;
+            self.compiled_schema_generation = inner.schema_generation;
+            self.compiled_cookie = inner.schema.schema_cookie;
+            self.compiled_had_pages = inner.schema.had_pages;
+            self.expired = false;
+            if !self.needs_reprepare(inner) {
+                return Ok(());
+            }
+        }
+        Err(SqliteError::new(
+            ErrorCode::Schema,
+            "database schema has changed",
+        ))
     }
 
     /// Advances statement execution by one step (`sqlite3_step`).
+    ///
+    /// Implements C SQLite default **autoreset** (`SQLITE_OMIT_AUTORESET` off): calling `step()`
+    /// on a statement in `Halted` (`Done` or post-error) automatically rewinds under the held
+    /// connection lease, preserves bound parameters, and starts a fresh execution.
     pub fn step(&mut self) -> Result<StepResult> {
-        let Some(ref stmt) = self.stmt else {
-            self.state = StatementExecState::Finished;
-            return Ok(StepResult::Done);
+        let shared = Arc::clone(&self.shared);
+        let mut session = shared.enter()?;
+        self.step_in_session(&shared, session.inner_mut())
+    }
+
+    fn step_in_session(
+        &mut self,
+        shared: &Arc<ConnectionShared>,
+        inner: &mut ConnectionInner,
+    ) -> Result<StepResult> {
+        inner.ensure_usable()?;
+        let Some(hid) = self.handle_id else {
+            return Err(SqliteError::misuse("statement already finalized"));
         };
 
-        if matches!(self.state, StatementExecState::Unstarted) {
-            if self.compiled_vdbe.is_some() {
-                let was_open = self.conn.btree.transaction_state() == TransactionState::Open;
-                let started_read = was_open && self.conn.is_autocommit();
-                if was_open {
-                    self.conn.btree.begin_read()?;
-                }
-                let has_pages = self.conn.btree.pager().page_count() > 0;
-                let cur_cookie = self.conn.btree.pager().header().schema_cookie;
-                if !self.conn.schema.loaded
-                    || self.compiled_had_pages != has_pages
-                    || self.compiled_cookie != cur_cookie
-                {
-                    if let Err(e) = self.conn.schema.ensure_fresh_in_tx(&mut self.conn.btree) {
-                        if started_read
-                            && self.conn.btree.transaction_state() == TransactionState::Read
-                        {
-                            let _ = self.conn.btree.commit();
-                        }
-                        self.state = StatementExecState::Finished;
-                        return Err(e);
-                    }
-                    self.conn.schema_loaded = true;
-                    if let Some(Stmt::Select(ref sel)) = self.stmt {
-                        match compiler::try_compile_select(sel, &self.conn.schema) {
-                            Ok(Some(new_prog)) => {
-                                self.column_names.clone_from(&new_prog.column_names);
-                                self.compiled_vdbe = Some(new_prog);
-                                self.compiled_cookie = self.conn.schema.schema_cookie;
-                                self.compiled_had_pages = self.conn.schema.had_pages;
-                            }
-                            Ok(None) => {
-                                self.compiled_vdbe = None;
-                            }
-                            Err(e) => {
-                                if started_read
-                                    && self.conn.btree.transaction_state() == TransactionState::Read
-                                {
-                                    let _ = self.conn.btree.commit();
-                                }
-                                self.state = StatementExecState::Finished;
-                                return Err(e);
-                            }
-                        }
-                    }
-                }
-
-                if let Some(ref prog) = self.compiled_vdbe {
-                    let mut vm_rt = self.conn.runtime;
-                    vm_rt.stmt_timestamp_ms =
-                        Some(self.conn.btree.pager().vfs().current_unix_millis());
-                    let vm = VdbeVm::new(prog.clone(), self.params.clone(), vm_rt);
-                    self.state = StatementExecState::Vdbe {
-                        vm,
-                        started_autocommit_read: started_read,
-                    };
-                } else {
-                    let stmt_clone = stmt.clone();
-                    let run_res = self.conn.run_stmt(&stmt_clone, &self.params);
-                    if started_read
-                        && self.conn.is_autocommit()
-                        && self.conn.btree.transaction_state() == TransactionState::Read
-                    {
-                        let _ = self.conn.btree.commit();
-                    }
-                    let out = run_res?;
-                    if !out.column_names.is_empty() {
-                        self.column_names = out.column_names;
-                    }
-                    self.state = StatementExecState::Materialized {
-                        rows: out.rows.into_iter(),
-                    };
-                }
-            } else {
-                let stmt_clone = stmt.clone();
-                let out = self.conn.run_stmt(&stmt_clone, &self.params)?;
-                if !out.column_names.is_empty() {
-                    self.column_names = out.column_names;
-                }
-                self.state = StatementExecState::Materialized {
-                    rows: out.rows.into_iter(),
-                };
-            }
+        // Autoreset if previously `Halted` (`Done` or post-error): internal rewind preserving `params`!
+        if matches!(self.lifecycle, StatementLifecycle::Halted { .. }) {
+            self.lifecycle = StatementLifecycle::Ready;
         }
 
-        match &mut self.state {
-            StatementExecState::Vdbe {
-                vm,
-                started_autocommit_read,
-            } => match vm.step(&mut self.conn.btree) {
+        // Empty / comment-only SQL (`stmt.is_none()`)
+        if self.stmt.is_none() {
+            self.lifecycle = StatementLifecycle::Halted { last_error: None };
+            return Ok(StepResult::Done);
+        }
+
+        if matches!(self.lifecycle, StatementLifecycle::Ready) {
+            return self.start_execution_in_session(hid, shared, inner);
+        }
+
+        // Advance already-running execution (`StatementLifecycle::Running`)
+        self.advance_running_in_session(hid, shared, inner)
+    }
+
+    fn start_execution_in_session(
+        &mut self,
+        hid: HandleId,
+        shared: &Arc<ConnectionShared>,
+        inner: &mut ConnectionInner,
+    ) -> Result<StepResult> {
+        let category = self.category.expect("non-empty statement has category");
+
+        match category {
+            StmtCategory::Control => {
+                let stmt_clone = self.stmt.clone().expect("non-empty statement");
+                inner.activity.start(hid, false, false);
+                let summary = inner.activity.summary_excluding(hid);
+                let res = {
+                    let mut publish_fn = |rt: &VmRuntimeContext, exp: bool, imp: bool, rb: u64| {
+                        shared.publish_mirrors(rt, exp, imp, rb);
+                    };
+                    let mut ctx = ExecContext {
+                        btree: &mut inner.btree,
+                        schema: &mut inner.schema,
+                        runtime: &mut inner.runtime,
+                        explicit_tx: &mut inner.explicit_tx,
+                        implicit_savepoint_tx: &mut inner.implicit_savepoint_tx,
+                        in_user_btree_tx: &mut inner.in_user_btree_tx,
+                        savepoints: &mut inner.savepoints,
+                        schema_generation: &mut inner.schema_generation,
+                        schema_changed_in_tx: &mut inner.schema_changed_in_tx,
+                        activity: summary,
+                        foreign_keys: &mut inner.foreign_keys,
+                        count_changes: &mut inner.count_changes,
+                        rollback_count: &mut inner.rollback_count,
+                        deferred_fk_suspects: &mut inner.deferred_fk_suspects,
+                        publish_mirrors: &mut publish_fn,
+                    };
+                    execute_control_stmt(&mut ctx, &stmt_clone)
+                };
+                match res {
+                    Ok(()) => {
+                        inner.activity.remove(hid);
+                        self.lifecycle = StatementLifecycle::Halted { last_error: None };
+                        Ok(StepResult::Done)
+                    }
+                    Err(e)
+                        if e.code == ErrorCode::Busy
+                            && summary.other_writers == 0
+                            && matches!(stmt_clone, Stmt::Commit | Stmt::Release(_)) =>
+                    {
+                        let rel_sp = match stmt_clone {
+                            Stmt::Release(name) => Some(name),
+                            _ => None,
+                        };
+                        self.lifecycle = StatementLifecycle::Running(RunningExec::PendingCommit {
+                            release_savepoint: rel_sp,
+                            last_busy: e.clone(),
+                        });
+                        Err(e)
+                    }
+                    Err(e) => {
+                        inner.activity.remove(hid);
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        Err(e)
+                    }
+                }
+            }
+
+            StmtCategory::NoLockPragma => {
+                let stmt_clone = self.stmt.clone().expect("non-empty statement");
+                inner.activity.start(hid, false, false);
+                let summary = inner.activity.summary_excluding(hid);
+                let prev_ts = inner.runtime.stmt_timestamp_ms;
+                if prev_ts.is_none() {
+                    inner.runtime.stmt_timestamp_ms =
+                        Some(inner.btree.pager().vfs().current_unix_millis());
+                }
+                let res = {
+                    let mut publish_fn = |rt: &VmRuntimeContext, exp: bool, imp: bool, rb: u64| {
+                        shared.publish_mirrors(rt, exp, imp, rb);
+                    };
+                    let mut ctx = ExecContext {
+                        btree: &mut inner.btree,
+                        schema: &mut inner.schema,
+                        runtime: &mut inner.runtime,
+                        explicit_tx: &mut inner.explicit_tx,
+                        implicit_savepoint_tx: &mut inner.implicit_savepoint_tx,
+                        in_user_btree_tx: &mut inner.in_user_btree_tx,
+                        savepoints: &mut inner.savepoints,
+                        schema_generation: &mut inner.schema_generation,
+                        schema_changed_in_tx: &mut inner.schema_changed_in_tx,
+                        activity: summary,
+                        foreign_keys: &mut inner.foreign_keys,
+                        count_changes: &mut inner.count_changes,
+                        rollback_count: &mut inner.rollback_count,
+                        deferred_fk_suspects: &mut inner.deferred_fk_suspects,
+                        publish_mirrors: &mut publish_fn,
+                    };
+                    execute_nolock_stmt(&mut ctx, &stmt_clone)
+                };
+                inner.runtime.stmt_timestamp_ms = prev_ts;
+                match res {
+                    Ok(out) => {
+                        if !out.column_names.is_empty() {
+                            self.column_names = out.column_names;
+                        }
+                        let mut iter = out.rows.into_iter();
+                        if let Some(first_row) = iter.next() {
+                            self.lifecycle =
+                                StatementLifecycle::Running(RunningExec::MaterializedNoLock {
+                                    rows: iter,
+                                });
+                            Ok(StepResult::Row(Row::new(first_row)))
+                        } else {
+                            let _ = inner.finish_activity(hid, ActivityFinish::NoLock, shared);
+                            self.lifecycle = StatementLifecycle::Halted { last_error: None };
+                            Ok(StepResult::Done)
+                        }
+                    }
+                    Err(e) => {
+                        let _ = inner.finish_activity(hid, ActivityFinish::NoLock, shared);
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        Err(e)
+                    }
+                }
+            }
+
+            StmtCategory::Vacuum => {
+                inner.activity.start(hid, true, true);
+                let summary = inner.activity.summary_excluding(hid);
+                let res = {
+                    let mut publish_fn = |rt: &VmRuntimeContext, exp: bool, imp: bool, rb: u64| {
+                        shared.publish_mirrors(rt, exp, imp, rb);
+                    };
+                    let mut ctx = ExecContext {
+                        btree: &mut inner.btree,
+                        schema: &mut inner.schema,
+                        runtime: &mut inner.runtime,
+                        explicit_tx: &mut inner.explicit_tx,
+                        implicit_savepoint_tx: &mut inner.implicit_savepoint_tx,
+                        in_user_btree_tx: &mut inner.in_user_btree_tx,
+                        savepoints: &mut inner.savepoints,
+                        schema_generation: &mut inner.schema_generation,
+                        schema_changed_in_tx: &mut inner.schema_changed_in_tx,
+                        activity: summary,
+                        foreign_keys: &mut inner.foreign_keys,
+                        count_changes: &mut inner.count_changes,
+                        rollback_count: &mut inner.rollback_count,
+                        deferred_fk_suspects: &mut inner.deferred_fk_suspects,
+                        publish_mirrors: &mut publish_fn,
+                    };
+                    engine::exec_vacuum_checked(&mut ctx)
+                };
+                inner.activity.remove(hid);
+                if let Some(sim_err) = inner.take_simulated_cleanup_error() {
+                    let p_err = inner.poison_with(sim_err);
+                    self.lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(p_err.clone()),
+                    };
+                    return Err(p_err);
+                }
+                match res {
+                    Ok(_) => {
+                        inner.schema_loaded = true;
+                        self.compiled_schema_generation = inner.schema_generation;
+                        self.compiled_cookie = inner.schema.schema_cookie;
+                        self.compiled_had_pages = inner.schema.had_pages;
+                        self.lifecycle = StatementLifecycle::Halted { last_error: None };
+                        Ok(StepResult::Done)
+                    }
+                    Err(engine::VacuumFail::Clean(e)) => {
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        Err(e)
+                    }
+                    Err(engine::VacuumFail::Poison(e)) => {
+                        let p_err = inner.poison_with(e);
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(p_err.clone()),
+                        };
+                        Err(p_err)
+                    }
+                }
+            }
+
+            StmtCategory::Read => {
+                let opened_read_here = inner.btree.transaction_state() == TransactionState::Open;
+                if opened_read_here && let Err(e) = inner.btree.begin_read() {
+                    self.lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(e.clone()),
+                    };
+                    return Err(e);
+                }
+
+                if self.requires_schema
+                    && let Err(e) = inner.refresh_schema_in_open_tx()
+                {
+                    if opened_read_here
+                        && !inner.in_user_btree_tx
+                        && inner.activity.has_no_active_tx()
+                    {
+                        let _ = inner.btree.pager_mut().end_read_if_unused();
+                    }
+                    self.lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(e.clone()),
+                    };
+                    return Err(e);
+                }
+
+                if self.needs_reprepare(inner) {
+                    if self.mode == PrepareMode::V1 {
+                        if opened_read_here
+                            && !inner.in_user_btree_tx
+                            && inner.activity.has_no_active_tx()
+                        {
+                            let _ = inner.btree.pager_mut().end_read_if_unused();
+                        }
+                        let err =
+                            SqliteError::new(ErrorCode::Schema, "database schema has changed");
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(err.clone()),
+                        };
+                        return Err(err);
+                    }
+                    if let Err(e) = self.reprepare_in_open_tx(inner) {
+                        if opened_read_here
+                            && !inner.in_user_btree_tx
+                            && inner.activity.has_no_active_tx()
+                        {
+                            let _ = inner.btree.pager_mut().end_read_if_unused();
+                        }
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        return Err(e);
+                    }
+                }
+
+                if !inner.is_autocommit() {
+                    inner.in_user_btree_tx = true;
+                }
+                inner.activity.start(hid, true, false);
+
+                if let Some(ref prog) = self.compiled_vdbe {
+                    let mut vm_rt = inner.runtime;
+                    vm_rt.stmt_timestamp_ms = Some(inner.btree.pager().vfs().current_unix_millis());
+                    let vm = VdbeVm::new(prog.clone(), self.params.clone(), vm_rt);
+                    self.lifecycle = StatementLifecycle::Running(RunningExec::Vdbe { vm });
+                    return self.advance_running_in_session(hid, shared, inner);
+                }
+
+                // Interpreter `Read` path (`SELECT`, `EXPLAIN`, or read `PRAGMA`):
+                if let Err(e) = inner.btree.check_interrupted() {
+                    let _ = inner.finish_activity(
+                        hid,
+                        ActivityFinish::ReadAborted {
+                            lease_cursors: Vec::new(),
+                        },
+                        shared,
+                    );
+                    self.lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(e.clone()),
+                    };
+                    return Err(e);
+                }
+
+                let stmt_clone = self.stmt.clone().expect("non-empty statement");
+                let specs = collect_select_referenced_roots(&stmt_clone, &inner.schema);
+                let mut lease_cursors = Vec::with_capacity(specs.len());
+                let page_cnt = inner.btree.pager().page_count();
+                for spec in specs {
+                    match spec {
+                        LeaseCursorSpec::Table(root) => {
+                            let cid = inner.btree.open_table_cursor(root, false);
+                            if page_cnt >= root
+                                && let Err(e) = inner.btree.cursor_first(cid)
+                            {
+                                lease_cursors.push(cid);
+                                let _ = inner.finish_activity(
+                                    hid,
+                                    ActivityFinish::ReadAborted { lease_cursors },
+                                    shared,
+                                );
+                                self.lifecycle = StatementLifecycle::Halted {
+                                    last_error: Some(e.clone()),
+                                };
+                                return Err(e);
+                            }
+                            lease_cursors.push(cid);
+                        }
+                        LeaseCursorSpec::Index(root, orders) => {
+                            let cid = inner.btree.open_index_cursor(root, orders, false);
+                            if page_cnt >= root
+                                && let Err(e) = inner.btree.cursor_first(cid)
+                            {
+                                lease_cursors.push(cid);
+                                let _ = inner.finish_activity(
+                                    hid,
+                                    ActivityFinish::ReadAborted { lease_cursors },
+                                    shared,
+                                );
+                                self.lifecycle = StatementLifecycle::Halted {
+                                    last_error: Some(e.clone()),
+                                };
+                                return Err(e);
+                            }
+                            lease_cursors.push(cid);
+                        }
+                    }
+                }
+
+                let summary = inner.activity.summary_excluding(hid);
+                let prev_ts = inner.runtime.stmt_timestamp_ms;
+                if prev_ts.is_none() {
+                    inner.runtime.stmt_timestamp_ms =
+                        Some(inner.btree.pager().vfs().current_unix_millis());
+                }
+                let exec_res = {
+                    let mut publish_fn = |rt: &VmRuntimeContext, exp: bool, imp: bool, rb: u64| {
+                        shared.publish_mirrors(rt, exp, imp, rb);
+                    };
+                    let mut ctx = ExecContext {
+                        btree: &mut inner.btree,
+                        schema: &mut inner.schema,
+                        runtime: &mut inner.runtime,
+                        explicit_tx: &mut inner.explicit_tx,
+                        implicit_savepoint_tx: &mut inner.implicit_savepoint_tx,
+                        in_user_btree_tx: &mut inner.in_user_btree_tx,
+                        savepoints: &mut inner.savepoints,
+                        schema_generation: &mut inner.schema_generation,
+                        schema_changed_in_tx: &mut inner.schema_changed_in_tx,
+                        activity: summary,
+                        foreign_keys: &mut inner.foreign_keys,
+                        count_changes: &mut inner.count_changes,
+                        rollback_count: &mut inner.rollback_count,
+                        deferred_fk_suspects: &mut inner.deferred_fk_suspects,
+                        publish_mirrors: &mut publish_fn,
+                    };
+                    execute_read_body(&mut ctx, &stmt_clone, &self.params)
+                };
+                inner.runtime.stmt_timestamp_ms = prev_ts;
+
+                match exec_res {
+                    Ok(out) => {
+                        if !out.column_names.is_empty() {
+                            self.column_names = out.column_names;
+                        }
+                        let mut iter = out.rows.into_iter();
+                        if let Some(first_row) = iter.next() {
+                            self.lifecycle =
+                                StatementLifecycle::Running(RunningExec::MaterializedRead {
+                                    rows: iter,
+                                    lease_cursors,
+                                });
+                            Ok(StepResult::Row(Row::new(first_row)))
+                        } else {
+                            let fin_res = inner.finish_activity(
+                                hid,
+                                ActivityFinish::ReadDone { lease_cursors },
+                                shared,
+                            );
+                            if let Err(e) = fin_res {
+                                self.lifecycle = StatementLifecycle::Halted {
+                                    last_error: Some(e.clone()),
+                                };
+                                return Err(e);
+                            }
+                            self.lifecycle = StatementLifecycle::Halted { last_error: None };
+                            Ok(StepResult::Done)
+                        }
+                    }
+                    Err(e) => {
+                        let _ = inner.finish_activity(
+                            hid,
+                            ActivityFinish::ReadAborted { lease_cursors },
+                            shared,
+                        );
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        Err(e)
+                    }
+                }
+            }
+
+            StmtCategory::Write => {
+                let prev_tx_state = inner.btree.transaction_state();
+                let opened_write_here = prev_tx_state != TransactionState::Write;
+                let base_sp_depth = inner.savepoints.len();
+                if opened_write_here {
+                    if let Err(e) = inner
+                        .btree
+                        .pager_mut()
+                        .begin_write_with_savepoint_depth(base_sp_depth)
+                    {
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        return Err(e);
+                    }
+                } else if base_sp_depth > 0
+                    && let Err(e) = inner.btree.pager_mut().ensure_subsavepoints(base_sp_depth)
+                {
+                    self.lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(e.clone()),
+                    };
+                    return Err(e);
+                }
+
+                let pre_summary = inner.activity.summary_excluding(hid);
+                let cleanup_unstarted_write = |inner: &mut ConnectionInner| {
+                    if opened_write_here && pre_summary.other_writers == 0 {
+                        let retain_read = prev_tx_state == TransactionState::Read
+                            || pre_summary.other_readers > 0;
+                        if let Err(rb_err) = inner.btree.rollback_with_trip(
+                            extended::SQLITE_ABORT_ROLLBACK,
+                            true,
+                            retain_read,
+                        ) {
+                            let _ = inner.poison_with(rb_err);
+                        }
+                    }
+                };
+
+                if self.requires_schema
+                    && let Err(e) = inner.refresh_schema_in_open_tx()
+                {
+                    cleanup_unstarted_write(inner);
+                    self.lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(e.clone()),
+                    };
+                    return Err(e);
+                }
+
+                if self.needs_reprepare(inner) {
+                    if self.mode == PrepareMode::V1 {
+                        cleanup_unstarted_write(inner);
+                        let err =
+                            SqliteError::new(ErrorCode::Schema, "database schema has changed");
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(err.clone()),
+                        };
+                        return Err(err);
+                    }
+                    if let Err(e) = self.reprepare_in_open_tx(inner) {
+                        cleanup_unstarted_write(inner);
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        return Err(e);
+                    }
+                }
+
+                // Open an anonymous statement subsavepoint whenever an outer tx or another writer exists!
+                let stmt_sp_slot = if !inner.is_autocommit() || pre_summary.other_writers > 0 {
+                    let slot = inner.savepoints.len();
+                    if let Err(e) = inner.btree.pager_mut().ensure_subsavepoints(slot + 1) {
+                        cleanup_unstarted_write(inner);
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        return Err(e);
+                    }
+                    Some(slot)
+                } else {
+                    None
+                };
+
+                if !inner.is_autocommit() {
+                    inner.in_user_btree_tx = true;
+                }
+
+                let abort_snapshot = WriteAbortSnapshot {
+                    stmt_sp_slot,
+                    fk_before: inner.deferred_fk_suspects.clone(),
+                    rt_before: inner.runtime,
+                    schema_before: inner.schema.clone(),
+                    schema_gen_before: inner.schema_generation,
+                    schema_changed_before: inner.schema_changed_in_tx,
+                };
+
+                inner.activity.start(hid, true, true);
+                let summary = inner.activity.summary_excluding(hid);
+
+                if let Err(e) = inner.btree.check_interrupted() {
+                    let final_err = inner.abort_write_statement(hid, &e, abort_snapshot, shared);
+                    self.lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(final_err.clone()),
+                    };
+                    return Err(final_err);
+                }
+
+                let stmt_clone = self.stmt.clone().expect("non-empty statement");
+                let prev_ts = inner.runtime.stmt_timestamp_ms;
+                if prev_ts.is_none() {
+                    inner.runtime.stmt_timestamp_ms =
+                        Some(inner.btree.pager().vfs().current_unix_millis());
+                }
+                let exec_res = {
+                    let mut publish_fn = |rt: &VmRuntimeContext, exp: bool, imp: bool, rb: u64| {
+                        shared.publish_mirrors(rt, exp, imp, rb);
+                    };
+                    let mut ctx = ExecContext {
+                        btree: &mut inner.btree,
+                        schema: &mut inner.schema,
+                        runtime: &mut inner.runtime,
+                        explicit_tx: &mut inner.explicit_tx,
+                        implicit_savepoint_tx: &mut inner.implicit_savepoint_tx,
+                        in_user_btree_tx: &mut inner.in_user_btree_tx,
+                        savepoints: &mut inner.savepoints,
+                        schema_generation: &mut inner.schema_generation,
+                        schema_changed_in_tx: &mut inner.schema_changed_in_tx,
+                        activity: summary,
+                        foreign_keys: &mut inner.foreign_keys,
+                        count_changes: &mut inner.count_changes,
+                        rollback_count: &mut inner.rollback_count,
+                        deferred_fk_suspects: &mut inner.deferred_fk_suspects,
+                        publish_mirrors: &mut publish_fn,
+                    };
+                    execute_write_body(&mut ctx, &stmt_clone, &self.params)
+                };
+                inner.runtime.stmt_timestamp_ms = prev_ts;
+
+                match exec_res {
+                    Ok(out) => {
+                        if !out.column_names.is_empty() {
+                            self.column_names = out.column_names;
+                        }
+                        self.compiled_schema_generation = inner.schema_generation;
+                        self.compiled_cookie = inner.schema.schema_cookie;
+                        self.compiled_had_pages = inner.schema.had_pages;
+
+                        let mut iter = out.rows.into_iter();
+                        if let Some(first_row) = iter.next() {
+                            // Keep write lease & transaction open while paused at `StepResult::Row`!
+                            self.lifecycle =
+                                StatementLifecycle::Running(RunningExec::ReturningWrite {
+                                    rows: iter,
+                                    abort_snapshot,
+                                });
+                            Ok(StepResult::Row(Row::new(first_row)))
+                        } else {
+                            match inner.finish_activity(
+                                hid,
+                                ActivityFinish::WriteCompleted { abort_snapshot },
+                                shared,
+                            ) {
+                                Ok(()) => {
+                                    self.lifecycle =
+                                        StatementLifecycle::Halted { last_error: None };
+                                    Ok(StepResult::Done)
+                                }
+                                Err(e) => {
+                                    self.lifecycle = StatementLifecycle::Halted {
+                                        last_error: Some(e.clone()),
+                                    };
+                                    Err(e)
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let final_err =
+                            inner.abort_write_statement(hid, &err, abort_snapshot, shared);
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(final_err.clone()),
+                        };
+                        Err(final_err)
+                    }
+                }
+            }
+        }
+    }
+
+    fn advance_running_in_session(
+        &mut self,
+        hid: HandleId,
+        shared: &Arc<ConnectionShared>,
+        inner: &mut ConnectionInner,
+    ) -> Result<StepResult> {
+        let StatementLifecycle::Running(ref mut running) = self.lifecycle else {
+            unreachable!("advance_running_in_session requires Running state");
+        };
+
+        match running {
+            RunningExec::Vdbe { vm } => match vm.step(&mut inner.btree) {
                 Ok(VmStep::Row(vals)) => {
-                    self.conn.runtime = vm.runtime_ctx;
-                    self.conn.runtime.stmt_timestamp_ms = None;
+                    inner.runtime = vm.runtime_ctx;
+                    inner.runtime.stmt_timestamp_ms = None;
+                    inner.publish(shared);
                     Ok(StepResult::Row(Row::new(vals)))
                 }
                 Ok(VmStep::Done) => {
-                    vm.close_cursors(&mut self.conn.btree);
-                    self.conn.runtime = vm.runtime_ctx;
-                    self.conn.runtime.stmt_timestamp_ms = None;
-                    if *started_autocommit_read
-                        && self.conn.is_autocommit()
-                        && self.conn.btree.transaction_state() == TransactionState::Read
-                    {
-                        let _ = self.conn.btree.commit();
+                    vm.close_cursors(&mut inner.btree);
+                    inner.runtime = vm.runtime_ctx;
+                    inner.runtime.stmt_timestamp_ms = None;
+                    inner.publish(shared);
+                    let fin_res = inner.finish_activity(
+                        hid,
+                        ActivityFinish::ReadDone {
+                            lease_cursors: Vec::new(),
+                        },
+                        shared,
+                    );
+                    if let Err(e) = fin_res {
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        return Err(e);
                     }
-                    self.state = StatementExecState::Finished;
+                    self.lifecycle = StatementLifecycle::Halted { last_error: None };
                     Ok(StepResult::Done)
                 }
                 Err(e) => {
-                    vm.close_cursors(&mut self.conn.btree);
-                    self.conn.runtime.stmt_timestamp_ms = None;
-                    if *started_autocommit_read
-                        && self.conn.is_autocommit()
-                        && self.conn.btree.transaction_state() == TransactionState::Read
-                    {
-                        let _ = self.conn.btree.commit();
-                    }
-                    self.state = StatementExecState::Finished;
+                    vm.close_cursors(&mut inner.btree);
+                    inner.runtime.stmt_timestamp_ms = None;
+                    let _ = inner.finish_activity(
+                        hid,
+                        ActivityFinish::ReadAborted {
+                            lease_cursors: Vec::new(),
+                        },
+                        shared,
+                    );
+                    self.lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(e.clone()),
+                    };
                     Err(e)
                 }
             },
-            StatementExecState::Materialized { rows } => {
+
+            RunningExec::MaterializedRead {
+                rows,
+                lease_cursors,
+            } => {
+                if let Err(e) = inner.btree.check_interrupted() {
+                    let cursors = std::mem::take(lease_cursors);
+                    let _ = inner.finish_activity(
+                        hid,
+                        ActivityFinish::ReadAborted {
+                            lease_cursors: cursors,
+                        },
+                        shared,
+                    );
+                    self.lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(e.clone()),
+                    };
+                    return Err(e);
+                }
+
+                for &cid in lease_cursors.iter() {
+                    if let Some(&BtreeCursorState::Fault(code)) = inner.btree.cursor_state(cid) {
+                        let msg = if code == extended::SQLITE_ABORT_ROLLBACK {
+                            "abort due to ROLLBACK"
+                        } else {
+                            ErrorCode::from_raw_primary(code).as_str()
+                        };
+                        let err = SqliteError::with_extended(code, msg);
+                        let cursors = std::mem::take(lease_cursors);
+                        let _ = inner.finish_activity(
+                            hid,
+                            ActivityFinish::ReadAborted {
+                                lease_cursors: cursors,
+                            },
+                            shared,
+                        );
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(err.clone()),
+                        };
+                        return Err(err);
+                    }
+                    if let Err(e) = inner.btree.restore_cursor_position(cid) {
+                        let cursors = std::mem::take(lease_cursors);
+                        let _ = inner.finish_activity(
+                            hid,
+                            ActivityFinish::ReadAborted {
+                                lease_cursors: cursors,
+                            },
+                            shared,
+                        );
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        return Err(e);
+                    }
+                }
+
                 if let Some(vals) = rows.next() {
                     Ok(StepResult::Row(Row::new(vals)))
                 } else {
-                    self.state = StatementExecState::Finished;
+                    let cursors = std::mem::take(lease_cursors);
+                    let fin_res = inner.finish_activity(
+                        hid,
+                        ActivityFinish::ReadDone {
+                            lease_cursors: cursors,
+                        },
+                        shared,
+                    );
+                    if let Err(e) = fin_res {
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        return Err(e);
+                    }
+                    self.lifecycle = StatementLifecycle::Halted { last_error: None };
                     Ok(StepResult::Done)
                 }
             }
-            StatementExecState::Finished => Ok(StepResult::Done),
-            StatementExecState::Unstarted => unreachable!(),
+
+            RunningExec::MaterializedNoLock { rows } => {
+                if let Some(vals) = rows.next() {
+                    Ok(StepResult::Row(Row::new(vals)))
+                } else {
+                    let _ = inner.finish_activity(hid, ActivityFinish::NoLock, shared);
+                    self.lifecycle = StatementLifecycle::Halted { last_error: None };
+                    Ok(StepResult::Done)
+                }
+            }
+
+            RunningExec::ReturningWrite {
+                rows,
+                abort_snapshot,
+            } => {
+                if let Err(e) = inner.btree.check_interrupted() {
+                    let snap = abort_snapshot.clone();
+                    let final_err = inner.abort_write_statement(hid, &e, snap, shared);
+                    self.lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(final_err.clone()),
+                    };
+                    return Err(final_err);
+                }
+
+                if let Some(vals) = rows.next() {
+                    Ok(StepResult::Row(Row::new(vals)))
+                } else {
+                    let snap = abort_snapshot.clone();
+                    match inner.finish_activity(
+                        hid,
+                        ActivityFinish::WriteCompleted {
+                            abort_snapshot: snap,
+                        },
+                        shared,
+                    ) {
+                        Ok(()) => {
+                            self.lifecycle = StatementLifecycle::Halted { last_error: None };
+                            Ok(StepResult::Done)
+                        }
+                        Err(e) => {
+                            self.lifecycle = StatementLifecycle::Halted {
+                                last_error: Some(e.clone()),
+                            };
+                            Err(e)
+                        }
+                    }
+                }
+            }
+
+            RunningExec::PendingCommit {
+                release_savepoint,
+                last_busy,
+            } => {
+                let summary = inner.activity.summary_excluding(hid);
+                let rel_opt = release_savepoint.clone();
+                let res = {
+                    let mut publish_fn = |rt: &VmRuntimeContext, exp: bool, imp: bool, rb: u64| {
+                        shared.publish_mirrors(rt, exp, imp, rb);
+                    };
+                    let mut ctx = ExecContext {
+                        btree: &mut inner.btree,
+                        schema: &mut inner.schema,
+                        runtime: &mut inner.runtime,
+                        explicit_tx: &mut inner.explicit_tx,
+                        implicit_savepoint_tx: &mut inner.implicit_savepoint_tx,
+                        in_user_btree_tx: &mut inner.in_user_btree_tx,
+                        savepoints: &mut inner.savepoints,
+                        schema_generation: &mut inner.schema_generation,
+                        schema_changed_in_tx: &mut inner.schema_changed_in_tx,
+                        activity: summary,
+                        foreign_keys: &mut inner.foreign_keys,
+                        count_changes: &mut inner.count_changes,
+                        rollback_count: &mut inner.rollback_count,
+                        deferred_fk_suspects: &mut inner.deferred_fk_suspects,
+                        publish_mirrors: &mut publish_fn,
+                    };
+                    match rel_opt {
+                        Some(ref sp) => release_savepoint_op(&mut ctx, sp),
+                        None => commit_transaction(&mut ctx),
+                    }
+                };
+
+                match res {
+                    Ok(()) => {
+                        inner.activity.remove(hid);
+                        self.lifecycle = StatementLifecycle::Halted { last_error: None };
+                        Ok(StepResult::Done)
+                    }
+                    Err(e) if e.code == ErrorCode::Busy && summary.other_writers == 0 => {
+                        *last_busy = e.clone();
+                        Err(e)
+                    }
+                    Err(e) => {
+                        inner.activity.remove(hid);
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        Err(e)
+                    }
+                }
+            }
         }
     }
 
@@ -642,277 +3119,22 @@ impl<'conn> Statement<'conn> {
         }
         Ok(rows)
     }
-
-    fn finish_vdbe_read_if_needed(&mut self) {
-        if let StatementExecState::Vdbe {
-            ref mut vm,
-            started_autocommit_read,
-        } = self.state
-        {
-            vm.close_cursors(&mut self.conn.btree);
-            if started_autocommit_read
-                && self.conn.is_autocommit()
-                && self.conn.btree.transaction_state() == TransactionState::Read
-            {
-                let _ = self.conn.btree.commit();
-            }
-        }
-    }
 }
 
-impl Drop for Statement<'_> {
+impl Drop for Statement {
     fn drop(&mut self) {
-        self.finish_vdbe_read_if_needed();
-    }
-}
-
-// ============================================================================
-// Prepare-Time Result Column Name Inference (`sqlite3_column_name`)
-// ============================================================================
-
-fn infer_stmt_column_names(stmt: &Stmt, schema: &Schema) -> Vec<String> {
-    match stmt {
-        Stmt::Explain { query_plan, .. } => {
-            if *query_plan {
-                vec![
-                    "id".into(),
-                    "parent".into(),
-                    "notused".into(),
-                    "detail".into(),
-                ]
-            } else {
-                vec![
-                    "addr".into(),
-                    "opcode".into(),
-                    "p1".into(),
-                    "p2".into(),
-                    "p3".into(),
-                    "p4".into(),
-                    "p5".into(),
-                    "comment".into(),
-                ]
-            }
-        }
-        Stmt::Select(sel) => infer_select_column_names(sel, schema, &[]),
-        Stmt::Insert(ins) => infer_returning_column_names(&ins.table, &ins.returning, schema),
-        Stmt::Update(upd) => infer_returning_column_names(&upd.table, &upd.returning, schema),
-        Stmt::Delete(del) => infer_returning_column_names(&del.table, &del.returning, schema),
-        Stmt::Pragma { name, value, .. } => infer_pragma_column_names(name, value.is_some()),
-        _ => Vec::new(),
-    }
-}
-
-fn infer_select_column_names(
-    sel: &SelectStmt,
-    schema: &Schema,
-    outer_ctes: &[(String, Vec<String>)],
-) -> Vec<String> {
-    let mut ctes = outer_ctes.to_vec();
-    for cte in &sel.ctes {
-        let cols = cte
-            .columns
-            .clone()
-            .unwrap_or_else(|| infer_select_column_names(&cte.query, schema, &ctes));
-        ctes.push((cte.name.clone(), cols));
-    }
-    infer_select_core_column_names(&sel.body.head, schema, &ctes)
-}
-
-fn infer_select_core_column_names(
-    core: &SelectCore,
-    schema: &Schema,
-    ctes: &[(String, Vec<String>)],
-) -> Vec<String> {
-    match core {
-        SelectCore::Values(rows) => {
-            let width = rows.first().map_or(0, Vec::len);
-            (1..=width).map(|i| format!("column{i}")).collect()
-        }
-        SelectCore::Select {
-            projection, from, ..
-        } => {
-            let from_cols = from
-                .as_ref()
-                .map(|fc| infer_from_columns(fc, schema, ctes))
-                .unwrap_or_default();
-            expand_result_column_names(projection, &from_cols)
-        }
-    }
-}
-
-fn infer_from_columns(
-    fc: &FromClause,
-    schema: &Schema,
-    ctes: &[(String, Vec<String>)],
-) -> Vec<(Option<String>, String)> {
-    let mut left = infer_tos_columns(&fc.head, schema, ctes);
-    for j in &fc.joins {
-        let right = infer_tos_columns(&j.right, schema, ctes);
-        let using_cols: Vec<String> = if j.natural {
-            let mut shared = Vec::new();
-            for (_, lname) in &left {
-                if right
-                    .iter()
-                    .any(|(_, rname)| rname.eq_ignore_ascii_case(lname))
-                    && !shared
-                        .iter()
-                        .any(|s: &String| s.eq_ignore_ascii_case(lname))
-                {
-                    shared.push(lname.clone());
-                }
-            }
-            shared
-        } else if let Some(JoinConstraint::Using(cols)) = &j.constraint {
-            cols.clone()
-        } else {
-            Vec::new()
+        let Some(hid) = self.handle_id.take() else {
+            return;
         };
-        for (ralias, rname) in right {
-            if using_cols.iter().any(|u| u.eq_ignore_ascii_case(&rname)) {
-                continue;
-            }
-            left.push((ralias, rname));
-        }
-    }
-    left
-}
-
-fn infer_tos_columns(
-    tos: &TableOrSubquery,
-    schema: &Schema,
-    ctes: &[(String, Vec<String>)],
-) -> Vec<(Option<String>, String)> {
-    match tos {
-        TableOrSubquery::Table { name, alias, .. } => {
-            let eff = alias.clone().unwrap_or_else(|| name.clone());
-            if let Some((_, cte_cols)) = ctes
-                .iter()
-                .rev()
-                .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            {
-                return cte_cols
-                    .iter()
-                    .map(|c| (Some(eff.clone()), c.clone()))
-                    .collect();
-            }
-            if let Some(tbl) = schema.find_table(name) {
-                return tbl
-                    .columns
-                    .iter()
-                    .map(|c| (Some(eff.clone()), c.name.clone()))
-                    .collect();
-            }
-            Vec::new()
-        }
-        TableOrSubquery::Subquery { query, alias } => {
-            let sub_cols = infer_select_column_names(query, schema, ctes);
-            sub_cols.into_iter().map(|c| (alias.clone(), c)).collect()
-        }
-    }
-}
-
-fn expand_result_column_names(
-    projection: &[ResultColumn],
-    from_cols: &[(Option<String>, String)],
-) -> Vec<String> {
-    let mut names = Vec::new();
-    for rc in projection {
-        match rc {
-            ResultColumn::Star => {
-                for (_, cname) in from_cols {
-                    names.push(cname.clone());
-                }
-            }
-            ResultColumn::TableStar(tname) => {
-                for (talias, cname) in from_cols {
-                    if talias
-                        .as_ref()
-                        .is_some_and(|ta| ta.eq_ignore_ascii_case(tname))
-                    {
-                        names.push(cname.clone());
-                    }
-                }
-            }
-            ResultColumn::Expr { expr, alias } => {
-                names.push(
-                    alias
-                        .clone()
-                        .unwrap_or_else(|| compiler::expr_column_label(expr)),
-                );
-            }
-        }
-    }
-    names
-}
-
-fn infer_returning_column_names(
-    table_name: &str,
-    returning: &[ResultColumn],
-    schema: &Schema,
-) -> Vec<String> {
-    if returning.is_empty() {
-        return Vec::new();
-    }
-    let from_cols: Vec<(Option<String>, String)> = schema
-        .find_table(table_name)
-        .map(|tbl| {
-            tbl.columns
-                .into_iter()
-                .map(|c| (Some(table_name.to_owned()), c.name))
-                .collect()
-        })
-        .unwrap_or_default();
-    expand_result_column_names(returning, &from_cols)
-}
-
-fn infer_pragma_column_names(name: &str, has_arg: bool) -> Vec<String> {
-    let upper = name.to_ascii_uppercase();
-    match upper.as_str() {
-        "INTEGRITY_CHECK" | "QUICK_CHECK" => vec!["integrity_check".into()],
-        "JOURNAL_MODE" => vec!["journal_mode".into()],
-        "PAGE_SIZE" | "PAGE_COUNT" | "FREELIST_COUNT" | "USER_VERSION" | "APPLICATION_ID"
-        | "SCHEMA_VERSION" | "ENCODING" | "FOREIGN_KEYS" | "SYNCHRONOUS" | "CACHE_SIZE" => {
-            if has_arg {
-                Vec::new()
-            } else {
-                vec![upper.to_ascii_lowercase()]
-            }
-        }
-        "DATABASE_LIST" => vec!["seq".into(), "name".into(), "file".into()],
-        "TABLE_INFO" if has_arg => vec![
-            "cid".into(),
-            "name".into(),
-            "type".into(),
-            "notnull".into(),
-            "dflt_value".into(),
-            "pk".into(),
-        ],
-        "INDEX_LIST" if has_arg => vec![
-            "seq".into(),
-            "name".into(),
-            "unique".into(),
-            "origin".into(),
-            "partial".into(),
-        ],
-        "INDEX_INFO" if has_arg => vec!["seqno".into(), "cid".into(), "name".into()],
-        "FOREIGN_KEY_LIST" if has_arg => vec![
-            "id".into(),
-            "seq".into(),
-            "table".into(),
-            "from".into(),
-            "to".into(),
-            "on_update".into(),
-            "on_delete".into(),
-            "match".into(),
-        ],
-        "FOREIGN_KEY_CHECK" => vec![
-            "table".into(),
-            "rowid".into(),
-            "parent".into(),
-            "fkid".into(),
-        ],
-        "COMPILE_OPTIONS" => vec!["compile_options".into()],
-        _ => Vec::new(),
+        let prev = std::mem::replace(&mut self.lifecycle, StatementLifecycle::Ready);
+        let running = match prev {
+            StatementLifecycle::Running(run) => Some(run),
+            StatementLifecycle::Ready | StatementLifecycle::Halted { .. } => None,
+        };
+        self.shared.enqueue_or_run_drop(PendingDrop::Statement {
+            handle_id: hid,
+            running,
+        });
     }
 }
 

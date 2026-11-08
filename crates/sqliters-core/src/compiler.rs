@@ -2,15 +2,16 @@
 //! `EXPLAIN` / `EXPLAIN QUERY PLAN` planner.
 
 use sqliters_syntax::{
-    BinaryOp, BindParam, CurrentTimeKind, DeleteStmt, Expr, FromClause, FunctionArgs, InsertSource,
-    InsertStmt, LikeOp, LimitClause, OrderByTerm, ResultColumn, SelectCore, SelectStmt, Stmt,
-    TableOrSubquery, UnaryOp, UpdateStmt,
+    BinaryOp, BindParam, CurrentTimeKind, DeleteStmt, Expr, FromClause, FunctionArgs, IndexHint,
+    InsertSource, InsertStmt, LikeOp, LimitClause, OrderByTerm, ResultColumn, SelectCore,
+    SelectStmt, Stmt, TableOrSubquery, UnaryOp, UpdateStmt,
 };
 use sqliters_types::{
     Collation, ErrorCode, KeySortOrder, Result, SqliteError, TypeAffinity, Value,
 };
 use sqliters_vdbe::{
     AggregateKind, Instruction, Opcode, P4, VdbeProgram, affinity_to_p5, sqlite_compare_affinity,
+    validate_function_call,
 };
 
 use crate::schema::{IndexSchema, Schema, TableSchema};
@@ -551,7 +552,7 @@ pub fn try_compile_select(stmt: &SelectStmt, schema: &Schema) -> Result<Option<V
             else {
                 return Ok(None);
             };
-            if indexed_by.is_some() {
+            if matches!(indexed_by, Some(IndexHint::IndexedBy(_))) {
                 return Ok(None);
             }
             let Some(tbl) = schema.find_table(name) else {
@@ -560,12 +561,15 @@ pub fn try_compile_select(stmt: &SelectStmt, schema: &Schema) -> Result<Option<V
                     format!("no such table: {name}"),
                 ));
             };
-            if tbl.without_rowid || tbl.columns.iter().any(|c| c.generated.is_some()) {
+            if tbl.columns.iter().any(|c| c.generated.is_some()) {
                 return Ok(None);
             }
             compile_single_table_select(
-                &tbl,
-                alias.as_deref(),
+                SingleTableSource {
+                    tbl: &tbl,
+                    alias: alias.as_deref(),
+                    indexed_by: indexed_by.as_ref(),
+                },
                 projection,
                 selection.as_ref(),
                 &stmt.order_by,
@@ -646,15 +650,25 @@ fn compile_tableless_select(
     Ok(prog)
 }
 
+struct SingleTableSource<'a> {
+    tbl: &'a TableSchema,
+    alias: Option<&'a str>,
+    indexed_by: Option<&'a IndexHint>,
+}
+
 fn compile_single_table_select(
-    tbl: &TableSchema,
-    alias: Option<&str>,
+    source: SingleTableSource<'_>,
     projection: &[ResultColumn],
     selection: Option<&Expr>,
     order_by: &[OrderByTerm],
     limit: Option<&LimitClause>,
     schema: &Schema,
 ) -> Result<Option<VdbeProgram>> {
+    let SingleTableSource {
+        tbl,
+        alias,
+        indexed_by,
+    } = source;
     let mut prog = VdbeProgram::new();
     let init_addr = prog.emit(Instruction::new(Opcode::Init, 0, 0, 0));
 
@@ -711,15 +725,23 @@ fn compile_single_table_select(
 
     let body_start = prog.current_addr();
     prog.emit(Instruction::new(Opcode::Transaction, 0, 0, 0));
-    prog.emit(
-        Instruction::new(
-            Opcode::OpenRead,
-            tbl_cursor,
-            tbl.root_pgno as i32,
-            tbl.columns.len() as i32,
-        )
-        .with_comment(tbl.name.clone()),
-    );
+    if tbl.without_rowid {
+        prog.emit(
+            Instruction::new(Opcode::OpenReadIndex, tbl_cursor, tbl.root_pgno as i32, 0)
+                .with_p4(P4::KeyInfo(tbl.without_rowid_pk_orders()))
+                .with_comment(tbl.name.clone()),
+        );
+    } else {
+        prog.emit(
+            Instruction::new(
+                Opcode::OpenRead,
+                tbl_cursor,
+                tbl.root_pgno as i32,
+                tbl.columns.len() as i32,
+            )
+            .with_comment(tbl.name.clone()),
+        );
+    }
 
     // Optional LIMIT / OFFSET registers initialized before loop
     let limit_regs = if let Some(lim) = limit {
@@ -741,21 +763,23 @@ fn compile_single_table_select(
         None
     };
 
-    let plan = choose_access_plan(tbl, alias, selection, schema);
+    let plan = match indexed_by {
+        Some(IndexHint::NotIndexed) => AccessPlan::FullScan,
+        None => choose_access_plan(tbl, alias, selection, schema),
+        Some(IndexHint::IndexedBy(_)) => return Ok(None),
+    };
 
-    // Optional Sorter setup for ORDER BY (elided when a natural ascending rowid scan already satisfies `ORDER BY`!)
+    // Optional Sorter setup for ORDER BY (elided when a natural ascending rowid scan or
+    // `WITHOUT ROWID` primary B-Tree scan already satisfies `ORDER BY`!)
     let sorter_setup = if !order_by.is_empty() {
         let mut sort_sources = Vec::with_capacity(order_by.len());
         let mut sort_orders = Vec::with_capacity(order_by.len());
-        let mut first_resolved_expr: Option<Expr> = None;
-        for (idx, ob) in order_by.iter().enumerate() {
+        let mut resolved_exprs = Vec::with_capacity(order_by.len());
+        for ob in order_by {
             let Some((src, coll_ref_expr)) = resolve_order_by_source(&ob.expr, &expanded, tbl)
             else {
                 return Ok(None);
             };
-            if idx == 0 {
-                first_resolved_expr = Some(coll_ref_expr.clone());
-            }
             let coll = if let Expr::Collate { collation, .. } = &ob.expr {
                 Collation::from_name(collation).unwrap_or_default()
             } else {
@@ -763,6 +787,7 @@ fn compile_single_table_select(
             };
             let desc = ob.desc;
             let nulls_last = ob.nulls_last.unwrap_or(desc);
+            resolved_exprs.push(coll_ref_expr);
             sort_sources.push(src);
             sort_orders.push(KeySortOrder {
                 desc,
@@ -774,11 +799,25 @@ fn compile_single_table_select(
         let natural_rowid_order = order_by.len() == 1
             && !order_by[0].desc
             && matches!(plan, AccessPlan::FullScan | AccessPlan::RowidSeek { .. })
-            && first_resolved_expr
-                .as_ref()
+            && resolved_exprs
+                .first()
                 .is_some_and(|e| is_table_rowid_column_expr(e, tbl, alias));
 
-        if natural_rowid_order {
+        let natural_without_rowid_order = tbl.without_rowid
+            && matches!(plan, AccessPlan::FullScan)
+            && order_by.len() <= tbl.without_rowid_pk_cols.len()
+            && resolved_exprs
+                .iter()
+                .zip(sort_orders.iter())
+                .zip(tbl.without_rowid_pk_cols.iter())
+                .all(|((re, so), pk_ic)| {
+                    *so == pk_ic.sort_order
+                        && pk_ic
+                            .col_idx
+                            .is_some_and(|pk_ci| is_exact_table_column_expr(re, tbl, alias, pk_ci))
+                });
+
+        if natural_rowid_order || natural_without_rowid_order {
             None
         } else {
             let s_cursor = prog.alloc_cursor();
@@ -800,6 +839,7 @@ fn compile_single_table_select(
     let mut jumps_after_scan = Vec::new();
     let mut jumps_next_row = Vec::new();
     let mut idx_cursor_opt = None;
+    let mut seek_advance_cursor = None;
 
     // Early check: if LIMIT == 0 and no sorter needed, jump straight past scan
     if sorter_setup.is_none()
@@ -827,39 +867,93 @@ fn compile_single_table_select(
             index,
             prefix_exprs,
         } => {
-            let icur = prog.alloc_cursor();
-            idx_cursor_opt = Some(icur);
-            prog.emit(
-                Instruction::new(Opcode::OpenReadIndex, icur, index.root_pgno as i32, 0)
-                    .with_p4(P4::KeyInfo(index.key_sort_orders()))
-                    .with_comment(index.name.clone()),
-            );
-            let key_base = prog.alloc_registers(prefix_exprs.len());
-            for (i, ke) in prefix_exprs.iter().enumerate() {
-                let r = key_base + i as i32;
-                compile_expr(&mut prog, ke, None, r)?;
-                let col_aff = index.columns[i]
-                    .col_idx
-                    .map_or(sqliters_types::TypeAffinity::Blob, |ci| {
-                        tbl.columns[ci].affinity
-                    });
-                prog.emit(
-                    Instruction::new(Opcode::Affinity, r, 1, 0)
-                        .with_p4(P4::Affinity(vec![col_aff])),
-                );
-            }
-            let seek_ge = prog.emit(
-                Instruction::new(Opcode::SeekIndexEqual, icur, 0, key_base)
-                    .with_p5(prefix_exprs.len() as u16),
-            );
-            jumps_after_scan.push(seek_ge);
+            let is_primary_without_rowid =
+                tbl.without_rowid && index.origin == "pk" && index.root_pgno == tbl.root_pgno;
 
-            let top = prog.current_addr();
-            let rid_reg = prog.alloc_register();
-            prog.emit(Instruction::new(Opcode::Rowid, icur, rid_reg, 0));
-            let seek_tbl = prog.emit(Instruction::new(Opcode::SeekRowid, tbl_cursor, 0, rid_reg));
-            jumps_next_row.push(seek_tbl);
-            top
+            if is_primary_without_rowid {
+                let key_base = prog.alloc_registers(prefix_exprs.len());
+                for (i, ke) in prefix_exprs.iter().enumerate() {
+                    let r = key_base + i as i32;
+                    compile_expr(&mut prog, ke, None, r)?;
+                    jumps_after_scan.push(prog.emit(Instruction::new(Opcode::JumpIfNull, r, 0, 0)));
+                    let col_aff = index.columns[i]
+                        .col_idx
+                        .map_or(TypeAffinity::Blob, |ci| tbl.columns[ci].affinity);
+                    prog.emit(
+                        Instruction::new(Opcode::Affinity, r, 1, 0)
+                            .with_p4(P4::Affinity(vec![col_aff])),
+                    );
+                }
+                let seek_ge = prog.emit(
+                    Instruction::new(Opcode::SeekIndexEqual, tbl_cursor, 0, key_base)
+                        .with_p5(prefix_exprs.len() as u16),
+                );
+                jumps_after_scan.push(seek_ge);
+                seek_advance_cursor = Some(tbl_cursor);
+                prog.current_addr()
+            } else {
+                let mut pk_slots_in_idx = Vec::new();
+                if tbl.without_rowid {
+                    for pk_col in &tbl.without_rowid_pk_cols {
+                        let Some(slot) = index.without_rowid_pk_slot_in_index(pk_col) else {
+                            return Ok(None);
+                        };
+                        pk_slots_in_idx.push(slot);
+                    }
+                }
+
+                let icur = prog.alloc_cursor();
+                idx_cursor_opt = Some(icur);
+                seek_advance_cursor = Some(icur);
+                prog.emit(
+                    Instruction::new(Opcode::OpenReadIndex, icur, index.root_pgno as i32, 0)
+                        .with_p4(P4::KeyInfo(index.key_sort_orders()))
+                        .with_comment(index.name.clone()),
+                );
+                let key_base = prog.alloc_registers(prefix_exprs.len());
+                for (i, ke) in prefix_exprs.iter().enumerate() {
+                    let r = key_base + i as i32;
+                    compile_expr(&mut prog, ke, None, r)?;
+                    jumps_after_scan.push(prog.emit(Instruction::new(Opcode::JumpIfNull, r, 0, 0)));
+                    let col_aff = index.columns[i]
+                        .col_idx
+                        .map_or(TypeAffinity::Blob, |ci| tbl.columns[ci].affinity);
+                    prog.emit(
+                        Instruction::new(Opcode::Affinity, r, 1, 0)
+                            .with_p4(P4::Affinity(vec![col_aff])),
+                    );
+                }
+                let seek_ge = prog.emit(
+                    Instruction::new(Opcode::SeekIndexEqual, icur, 0, key_base)
+                        .with_p5(prefix_exprs.len() as u16),
+                );
+                jumps_after_scan.push(seek_ge);
+
+                let top = prog.current_addr();
+                if tbl.without_rowid {
+                    let pk_base = prog.alloc_registers(pk_slots_in_idx.len());
+                    for (k, &slot) in pk_slots_in_idx.iter().enumerate() {
+                        prog.emit(Instruction::new(
+                            Opcode::Column,
+                            icur,
+                            slot as i32,
+                            pk_base + k as i32,
+                        ));
+                    }
+                    let seek_tbl = prog.emit(
+                        Instruction::new(Opcode::SeekIndexEqual, tbl_cursor, 0, pk_base)
+                            .with_p5(pk_slots_in_idx.len() as u16),
+                    );
+                    jumps_next_row.push(seek_tbl);
+                } else {
+                    let rid_reg = prog.alloc_register();
+                    prog.emit(Instruction::new(Opcode::Rowid, icur, rid_reg, 0));
+                    let seek_tbl =
+                        prog.emit(Instruction::new(Opcode::SeekRowid, tbl_cursor, 0, rid_reg));
+                    jumps_next_row.push(seek_tbl);
+                }
+                top
+            }
         }
     };
 
@@ -968,10 +1062,10 @@ fn compile_single_table_select(
             // Single point lookup: falls straight through!
         }
         AccessPlan::IndexSeek { .. } => {
-            let icur = idx_cursor_opt.expect("index cursor allocated");
+            let adv_cur = seek_advance_cursor.expect("index seek cursor allocated");
             prog.emit(Instruction::new(
                 Opcode::IndexMatchNext,
-                icur,
+                adv_cur,
                 loop_top as i32,
                 0,
             ));
@@ -1094,6 +1188,26 @@ fn is_table_rowid_column_expr(expr: &Expr, tbl: &TableSchema, alias: Option<&str
         || tbl
             .rowid_alias_col
             .is_some_and(|ipk| tbl.columns[ipk].name.eq_ignore_ascii_case(column))
+}
+
+fn is_exact_table_column_expr(
+    expr: &Expr,
+    tbl: &TableSchema,
+    alias: Option<&str>,
+    target_col_idx: usize,
+) -> bool {
+    let Expr::Column { table, column } = expr else {
+        return false;
+    };
+    if let Some(t) = table {
+        let expected = alias.unwrap_or(&tbl.name);
+        if !t.eq_ignore_ascii_case(expected) {
+            return false;
+        }
+    }
+    tbl.columns
+        .get(target_col_idx)
+        .is_some_and(|c| c.name.eq_ignore_ascii_case(column))
 }
 
 fn resolve_order_by_source(
@@ -1316,9 +1430,10 @@ fn compile_expr(
                             .with_comment(col_schema.name.clone()),
                     );
                 } else {
+                    let phys_slot = b.tbl.physical_record_slot(col_idx);
                     prog.emit(
-                        Instruction::new(Opcode::Column, b.cursor, col_idx as i32, dest)
-                            .with_p4(col_schema.default_p4())
+                        Instruction::new(Opcode::Column, b.cursor, phys_slot as i32, dest)
+                            .with_p4(col_schema.default_p4_for_table(b.tbl.strict))
                             .with_comment(col_schema.name.clone()),
                     );
                 }
@@ -1602,11 +1717,24 @@ fn compile_expr(
                 prog.patch_p2(j, end_addr);
             }
         }
-        Expr::FunctionCall { name, args, .. } => {
-            let expr_list = match args {
-                FunctionArgs::Star => Vec::new(),
-                FunctionArgs::Exprs(es) => es.clone(),
+        Expr::FunctionCall {
+            name,
+            distinct,
+            args,
+            filter,
+        } => {
+            let (star_args, expr_list) = match args {
+                FunctionArgs::Star => (true, Vec::new()),
+                FunctionArgs::Exprs(es) => (false, es.clone()),
             };
+            validate_function_call(
+                name,
+                star_args,
+                expr_list.len(),
+                *distinct,
+                filter.is_some(),
+                false,
+            )?;
             let arg_base = prog.alloc_registers(expr_list.len().max(1));
             for (i, a) in expr_list.iter().enumerate() {
                 compile_expr(prog, a, binding, arg_base + i as i32)?;
@@ -1913,11 +2041,17 @@ pub fn explain_query_plan(stmt: &Stmt, schema: &Schema) -> Result<Vec<Vec<Value>
             } = &sel.body.head
             {
                 if fc.joins.is_empty()
-                    && let TableOrSubquery::Table { name, alias, .. } = &fc.head
+                    && let TableOrSubquery::Table {
+                        name,
+                        alias,
+                        indexed_by,
+                    } = &fc.head
                     && let Some(tbl) = schema.find_table(name)
                 {
-                    let plan =
-                        choose_access_plan(&tbl, alias.as_deref(), selection.as_ref(), schema);
+                    let plan = match indexed_by {
+                        Some(IndexHint::NotIndexed) => AccessPlan::FullScan,
+                        _ => choose_access_plan(&tbl, alias.as_deref(), selection.as_ref(), schema),
+                    };
                     let disp = alias.as_deref().unwrap_or(&tbl.name);
                     push_detail(plan.explain_detail(disp));
                 } else {

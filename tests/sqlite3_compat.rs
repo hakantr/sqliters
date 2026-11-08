@@ -101,9 +101,9 @@ fn test_c_sqlite3_writes_db_sqliters_reads_and_mutates() {
 
     // 2. Open with `sqliters::Connection` and verify integrity, schema, primary key seeks, index seeks, and overflows!
     {
-        let mut conn = Connection::open(tmp.path()).expect("open C sqlite3 db");
-        assert_eq!(conn.page_size(), 1024);
-        assert!(conn.page_count() > 20);
+        let conn = Connection::open(tmp.path()).expect("open C sqlite3 db");
+        assert_eq!(conn.page_size().unwrap(), 1024);
+        assert!(conn.page_count().unwrap() > 20);
 
         let ic = conn.query("PRAGMA integrity_check;", &[]).unwrap();
         assert_eq!(ic.rows[0][0], Value::Text("ok".into()));
@@ -214,7 +214,7 @@ fn test_sqliters_writes_complex_db_c_sqlite3_verifies_integrity_and_queries() {
     let tmp = TempDb::new("rust_to_c");
 
     {
-        let mut conn = Connection::open(tmp.path()).unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
         conn.execute(
             "
             PRAGMA page_size = 1024;
@@ -347,7 +347,7 @@ fn test_sqliters_writes_complex_db_c_sqlite3_verifies_integrity_and_queries() {
 #[test]
 fn test_sql_features_joins_aggregates_ctes_subqueries_alter_vacuum_and_savepoints() {
     let tmp = TempDb::new("full_sql");
-    let mut conn = Connection::open(tmp.path()).unwrap();
+    let conn = Connection::open(tmp.path()).unwrap();
 
     // 1. SQLite 3.54 `_` numeric separators, STRICT tables, conflict clauses, RETURNING
     conn.execute(
@@ -467,7 +467,7 @@ fn test_sql_features_joins_aggregates_ctes_subqueries_alter_vacuum_and_savepoint
         }
         assert_eq!(first_run, vec!["SKU-5", "SKU-1", "SKU-2"]);
 
-        stmt.reset();
+        stmt.reset().unwrap();
         stmt.bind_named(":min_p", 2000i64).unwrap();
         let second_run = stmt.collect_rows().unwrap();
         assert_eq!(second_run.len(), 1);
@@ -532,7 +532,7 @@ fn test_sql_features_joins_aggregates_ctes_subqueries_alter_vacuum_and_savepoint
 fn test_disk_transaction_rollback_and_vdbe_explain_bytecode() {
     let tmp = TempDb::new("tx_rollback");
     {
-        let mut conn = Connection::open(tmp.path()).unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
         conn.execute(
             "
             CREATE TABLE accounts (id INTEGER PRIMARY KEY, owner TEXT UNIQUE, balance INT);

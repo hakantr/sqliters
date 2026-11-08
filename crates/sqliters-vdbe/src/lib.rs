@@ -15,7 +15,7 @@ use sqliters_types::{
 pub use functions::{
     AggregateAccumulator, AggregateKind, VmRuntimeContext, eval_scalar_function, format_utc_date,
     format_utc_time, format_utc_timestamp, parse_escape_char, sqlite_glob_match, sqlite_like_match,
-    system_utc_millis, utc_ymdhms_from_unix_ms,
+    system_utc_millis, utc_ymdhms_from_unix_ms, validate_function_call,
 };
 
 /// Fourth operand (`P4`) payload for a VDBE instruction (`p4union` in `sqlite/src/vdbe.h`).
@@ -675,7 +675,8 @@ impl VdbeVm {
                     let col_idx = ins.p2 as usize;
                     let dest = ins.p3 as usize;
                     match &self.cursors[cid] {
-                        CursorState::Table { cursor_id, .. } => {
+                        CursorState::Table { cursor_id, .. }
+                        | CursorState::Index { cursor_id, .. } => {
                             let val =
                                 btree
                                     .cursor_column(*cursor_id, col_idx)?
@@ -690,11 +691,6 @@ impl VdbeVm {
                                         }
                                     });
                             self.regs[dest] = val;
-                        }
-                        CursorState::Index { cursor_id, .. } => {
-                            self.regs[dest] = btree
-                                .cursor_column(*cursor_id, col_idx)?
-                                .unwrap_or(Value::Null);
                         }
                         CursorState::Ephemeral { rows, pos } => {
                             self.regs[dest] =

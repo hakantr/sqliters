@@ -196,7 +196,7 @@ fn test_bulgu_1_cross_process_posix_locks_and_in_process_busy() {
     );
 
     {
-        let mut conn = Connection::open(tmp.path()).unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
         let read_res = conn
             .query("SELECT id, val FROM t ORDER BY id;", &[])
             .unwrap();
@@ -218,7 +218,7 @@ fn test_bulgu_1_cross_process_posix_locks_and_in_process_busy() {
     let mut c_excl = InteractiveSqlProc::spawn_c_sqlite3(tmp.path());
     c_excl.send_and_wait_marker("BEGIN EXCLUSIVE;", "LOCKED_EXCLUSIVE");
 
-    let mut conn2 = Connection::open(tmp.path()).unwrap();
+    let conn2 = Connection::open(tmp.path()).unwrap();
     let sel_err = conn2.query("SELECT * FROM t;", &[]).unwrap_err();
     assert_eq!(sel_err.code, ErrorCode::Busy);
 
@@ -230,10 +230,10 @@ fn test_bulgu_1_cross_process_posix_locks_and_in_process_busy() {
     let mem_vfs = Arc::new(MemoryVfs::new());
     let db_virtual_path = Path::new("/mem/shared.db");
     let flags = OpenFlags::READWRITE | OpenFlags::CREATE;
-    let mut m1 = Connection::open_with_vfs(mem_vfs.clone(), Some(db_virtual_path), flags).unwrap();
+    let m1 = Connection::open_with_vfs(mem_vfs.clone(), Some(db_virtual_path), flags).unwrap();
     m1.execute("CREATE TABLE items(x INT); INSERT INTO items VALUES (10);")
         .unwrap();
-    let mut m2 = Connection::open_with_vfs(mem_vfs, Some(db_virtual_path), flags).unwrap();
+    let m2 = Connection::open_with_vfs(mem_vfs, Some(db_virtual_path), flags).unwrap();
 
     m1.execute("BEGIN IMMEDIATE; INSERT INTO items VALUES (20);")
         .unwrap();
@@ -257,7 +257,7 @@ fn test_bulgu_1_cross_process_posix_locks_and_in_process_busy() {
 fn test_bulgu_2_active_journal_not_clobbered_and_crashed_hot_journal_recovered() {
     // Child helper entrypoint for cross-process RESERVED lock + live `-journal` test
     if let Some(db_os) = std::env::var_os("SQLITERS_TEST_WRITER_DB") {
-        let mut conn = Connection::open(Path::new(&db_os)).unwrap();
+        let conn = Connection::open(Path::new(&db_os)).unwrap();
         conn.execute("BEGIN IMMEDIATE; UPDATE accounts SET balance = 999 WHERE id = 1;")
             .unwrap();
         println!("WRITER_ACTIVE");
@@ -293,7 +293,7 @@ fn test_bulgu_2_active_journal_not_clobbered_and_crashed_hot_journal_recovered()
     // Now open `tmp.path()` in a reader connection while `writer_proc` is STILL active:
     // MUST NOT delete or roll back `tmp.journal_path()`!
     {
-        let mut reader = Connection::open(tmp.path()).unwrap();
+        let reader = Connection::open(tmp.path()).unwrap();
         let row = reader
             .query_row("SELECT balance FROM accounts WHERE id = 1;", &[])
             .unwrap()
@@ -328,7 +328,7 @@ fn test_bulgu_2_active_journal_not_clobbered_and_crashed_hot_journal_recovered()
     }
     assert!(crash_tmp.journal_path().exists());
 
-    let mut recovered = Connection::open(crash_tmp.path()).unwrap();
+    let recovered = Connection::open(crash_tmp.path()).unwrap();
     let bal = recovered
         .query_row("SELECT balance FROM accounts WHERE id = 1;", &[])
         .unwrap()
@@ -358,17 +358,21 @@ fn test_bulgu_3_wal_database_explicitly_rejected() {
         "PRAGMA journal_mode = WAL; CREATE TABLE t(x INT); INSERT INTO t VALUES (42);",
     );
 
-    let err = match Connection::open(tmp.path()) {
-        Ok(_) => {
-            panic!("opening WAL database must fail explicitly rather than returning stale data")
-        }
-        Err(e) => e,
-    };
+    // Phase 1.1 opens lazily (`Open/NoLock`, `schema_loaded = false`); the first locked read/schema
+    // access must fail explicitly with `ErrorCode::CantOpen` rather than returning stale data.
+    let conn = Connection::open(tmp.path()).expect("lazy open succeeds without reading header");
+    let err = conn
+        .query("SELECT * FROM t;", &[])
+        .expect_err("querying WAL database must fail explicitly rather than returning stale data");
     assert_eq!(err.code, ErrorCode::CantOpen);
     assert!(
         err.message.contains("WAL"),
         "expected WAL mention in error message, got: {}",
         err.message
+    );
+    assert_eq!(
+        conn.database_header().unwrap_err().code,
+        ErrorCode::CantOpen
     );
 }
 
@@ -378,7 +382,7 @@ fn test_bulgu_3_wal_database_explicitly_rejected() {
 
 #[test]
 fn test_bulgu_4_foreign_keys_enforcement_actions_and_deferred() {
-    let mut conn = Connection::open_in_memory().unwrap();
+    let conn = Connection::open_in_memory().unwrap();
 
     // Exact reproducer from `bulgular.md`
     conn.execute(
@@ -477,7 +481,7 @@ fn test_bulgu_4_foreign_keys_enforcement_actions_and_deferred() {
 
 #[test]
 fn test_bulgu_5_or_fail_and_or_rollback_semantics() {
-    let mut conn = Connection::open_in_memory().unwrap();
+    let conn = Connection::open_in_memory().unwrap();
 
     // 1. Exact `OR FAIL` reproducer inside explicit transaction: keeps `(1), (2), (3)` and stays in tx!
     conn.execute("CREATE TABLE t(x INT UNIQUE); INSERT INTO t VALUES (1);")
@@ -554,7 +558,7 @@ fn test_bulgu_5_or_fail_and_or_rollback_semantics() {
 fn test_bulgu_6_alter_table_rename_column_updates_indexes_constraints_and_fks() {
     let tmp = TempDb::new("f6_alter");
     {
-        let mut conn = Connection::open(tmp.path()).unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
 
         // Exact reproducer from `bulgular.md` + partial index + CHECK + child FK!
         conn.execute(
@@ -603,7 +607,7 @@ fn test_bulgu_6_alter_table_rename_column_updates_indexes_constraints_and_fks() 
 
 #[test]
 fn test_bulgu_7_current_timestamp_uses_real_utc_clock() {
-    let mut conn = Connection::open_in_memory().unwrap();
+    let conn = Connection::open_in_memory().unwrap();
     conn.execute("CREATE TABLE dual_rows(id INT); INSERT INTO dual_rows VALUES (1), (2);")
         .unwrap();
 
@@ -672,7 +676,7 @@ fn test_bulgu_8_utf16le_and_utf16be_bidirectional_interoperability() {
         );
 
         {
-            let mut conn = Connection::open(tmp_c.path()).unwrap();
+            let conn = Connection::open(tmp_c.path()).unwrap();
             let enc_pragma = conn
                 .query_row("PRAGMA encoding;", &[])
                 .unwrap()
@@ -713,7 +717,7 @@ fn test_bulgu_8_utf16le_and_utf16be_bidirectional_interoperability() {
         // 2. `sqliters` creates a brand-new UTF-16 database from scratch; C `sqlite3` verifies it!
         let tmp_r = TempDb::new(&format!("f8_r_{label}"));
         {
-            let mut conn = Connection::open(tmp_r.path()).unwrap();
+            let conn = Connection::open(tmp_r.path()).unwrap();
             conn.execute(&format!(
                 "PRAGMA encoding = '{enc_name}';
                  CREATE TABLE cities(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
@@ -737,7 +741,7 @@ fn test_bulgu_8_utf16le_and_utf16be_bidirectional_interoperability() {
 
 #[test]
 fn test_bulgu_9_query_and_statement_column_names_populated_everywhere() {
-    let mut conn = Connection::open_in_memory().unwrap();
+    let conn = Connection::open_in_memory().unwrap();
     conn.execute("CREATE TABLE t(a INT, b TEXT); INSERT INTO t VALUES (1, 'x');")
         .unwrap();
 
@@ -949,7 +953,7 @@ fn test_bulgu_y1_failed_commit_partial_writes_rolled_back_atomically() {
 
     // 1. Exact scenario from `bulgular.md` Y1: fail on the 3rd main-DB `write_at` during COMMIT, then ROLLBACK!
     {
-        let mut conn = Connection::open_with_vfs(vfs.clone(), Some(tmp.path()), rw_flags).unwrap();
+        let conn = Connection::open_with_vfs(vfs.clone(), Some(tmp.path()), rw_flags).unwrap();
         conn.execute(
             "CREATE TABLE t1(x); CREATE TABLE t2(y);
              INSERT INTO t1 VALUES (10); INSERT INTO t2 VALUES (20);",
@@ -984,7 +988,7 @@ fn test_bulgu_y1_failed_commit_partial_writes_rolled_back_atomically() {
 
     // 2. Test failure on `truncate`, `sync`, and `journal delete` during COMMIT followed by ROLLBACK!
     for mode in ["truncate", "sync", "delete"] {
-        let mut conn = Connection::open_with_vfs(vfs.clone(), Some(tmp.path()), rw_flags).unwrap();
+        let conn = Connection::open_with_vfs(vfs.clone(), Some(tmp.path()), rw_flags).unwrap();
         conn.execute("BEGIN; UPDATE t1 SET x = 99; CREATE TABLE extra_tbl(z); INSERT INTO extra_tbl VALUES ('grow');")
             .unwrap();
         {
@@ -1031,7 +1035,7 @@ fn test_bulgu_y1_failed_commit_partial_writes_rolled_back_atomically() {
             assert_eq!(run_c_sqlite3(tmp.path(), "SELECT x FROM t1;"), "99");
             assert_eq!(run_c_sqlite3(tmp.path(), "PRAGMA integrity_check;"), "ok");
             // Reset t1 back to 10 and compact cleanly
-            let mut clean = Connection::open(tmp.path()).unwrap();
+            let clean = Connection::open(tmp.path()).unwrap();
             clean.execute("UPDATE t1 SET x = 10; VACUUM;").unwrap();
         } else {
             let err = conn.execute("COMMIT;").unwrap_err();
@@ -1049,7 +1053,7 @@ fn test_bulgu_y1_failed_commit_partial_writes_rolled_back_atomically() {
     // 3. Test persistent disk write failure DURING `ROLLBACK` after partial `COMMIT`:
     //    `<db>-journal` MUST be preserved on disk so the next reopen recovers `(10, 20)`!
     {
-        let mut conn = Connection::open_with_vfs(vfs.clone(), Some(tmp.path()), rw_flags).unwrap();
+        let conn = Connection::open_with_vfs(vfs.clone(), Some(tmp.path()), rw_flags).unwrap();
         conn.execute("BEGIN; UPDATE t1 SET x = 555; UPDATE t2 SET y = 666;")
             .unwrap();
         {
@@ -1075,7 +1079,7 @@ fn test_bulgu_y1_failed_commit_partial_writes_rolled_back_atomically() {
 
     // Reopening now recovers from the preserved hot journal!
     {
-        let mut recovered = Connection::open(tmp.path()).unwrap();
+        let recovered = Connection::open(tmp.path()).unwrap();
         let row = recovered
             .query_row("SELECT (SELECT x FROM t1), (SELECT y FROM t2);", &[])
             .unwrap()
@@ -1132,7 +1136,7 @@ fn test_bulgu_y2_multi_header_spilled_journal_and_bidirectional_c_recovery() {
     );
 
     {
-        let mut r_conn = Connection::open(copy_for_r.path()).unwrap();
+        let r_conn = Connection::open(copy_for_r.path()).unwrap();
         let row = r_conn
             .query_row("SELECT count(*), sum(x) FROM t;", &[])
             .unwrap()
@@ -1159,7 +1163,7 @@ fn test_bulgu_y2_multi_header_spilled_journal_and_bidirectional_c_recovery() {
     let (vfs, fault) = FaultVfs::new();
     let rw_flags = OpenFlags::READWRITE | OpenFlags::CREATE;
     {
-        let mut conn =
+        let conn =
             Connection::open_with_vfs(vfs.clone(), Some(tmp_r_crash.path()), rw_flags).unwrap();
         conn.execute("CREATE TABLE t(x INT); INSERT INTO t VALUES (10);")
             .unwrap();
@@ -1191,8 +1195,8 @@ fn test_bulgu_y2_multi_header_spilled_journal_and_bidirectional_c_recovery() {
 #[test]
 fn test_bulgu_y3_cross_connection_ddl_refreshes_schema_and_prevents_wrong_table_write() {
     let tmp = TempDb::new("y3_schema_cookie");
-    let mut conn_a = Connection::open(tmp.path()).unwrap();
-    let mut conn_b = Connection::open(tmp.path()).unwrap();
+    let conn_a = Connection::open(tmp.path()).unwrap();
+    let conn_b = Connection::open(tmp.path()).unwrap();
 
     // Exact reproduction from `bulgular.md` Y3:
     conn_a
@@ -1208,7 +1212,7 @@ fn test_bulgu_y3_cross_connection_ddl_refreshes_schema_and_prevents_wrong_table_
         b_prepared_sel.step().unwrap(),
         sqliters::StepResult::Row(_)
     ));
-    b_prepared_sel.reset();
+    b_prepared_sel.reset().unwrap();
 
     conn_a
         .execute("DROP TABLE t; CREATE TABLE u(x); INSERT INTO u VALUES (99);")
@@ -1257,7 +1261,7 @@ fn test_bulgu_y4_auto_vacuum_databases_read_cleanly_and_reject_writes_safely() {
         );
 
         {
-            let mut conn = Connection::open(tmp.path()).unwrap();
+            let conn = Connection::open(tmp.path()).unwrap();
             // Reading an auto-vacuum database works seamlessly
             let r = conn.query("SELECT x FROM t;", &[]).unwrap();
             assert_eq!(r.rows.len(), 1);
@@ -1291,7 +1295,7 @@ fn test_bulgu_y5_without_rowid_index_btree_bidirectional_c_compatibility() {
     //    `CREATE TABLE t(a TEXT PRIMARY KEY) WITHOUT ROWID; INSERT INTO t VALUES('a');`
     let tmp_exact = TempDb::new("y5_exact_repro");
     {
-        let mut conn = Connection::open(tmp_exact.path()).unwrap();
+        let conn = Connection::open(tmp_exact.path()).unwrap();
         conn.execute(
             "CREATE TABLE t(a TEXT PRIMARY KEY) WITHOUT ROWID;
              INSERT INTO t VALUES ('a');",
@@ -1329,7 +1333,7 @@ fn test_bulgu_y5_without_rowid_index_btree_bidirectional_c_compatibility() {
     //    multi-page splits, OR REPLACE / OR IGNORE, UPDATE, DELETE, ALTER TABLE ADD COLUMN, and VACUUM!
     let tmp_complex = TempDb::new("y5_rust_to_c_complex");
     {
-        let mut conn = Connection::open(tmp_complex.path()).unwrap();
+        let conn = Connection::open(tmp_complex.path()).unwrap();
         conn.execute(
             "PRAGMA page_size = 1024;
              CREATE TABLE comp(
@@ -1402,7 +1406,7 @@ fn test_bulgu_y5_without_rowid_index_btree_bidirectional_c_compatibility() {
          INSERT INTO wr VALUES ('alpha', 1, 'one', 100), ('beta', 1, 'two', 200), ('gamma', 2, 'one', 300);",
     );
     {
-        let mut conn = Connection::open(tmp_c_to_r.path()).unwrap();
+        let conn = Connection::open(tmp_c_to_r.path()).unwrap();
         // Point PK seek
         let r = conn
             .query_row(
@@ -1451,7 +1455,7 @@ fn test_bulgu_y5_without_rowid_index_btree_bidirectional_c_compatibility() {
 fn test_bulgu_y6_unicode_identifiers_no_utf8_slice_panic() {
     let tmp = TempDb::new("y6_unicode_ident");
     {
-        let mut conn = Connection::open(tmp.path()).unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
         // `"çççç"` is 8 bytes (four 2-byte UTF-8 chars: byte 7 is inside the 4th `'ç'`)!
         conn.execute(
             r#"
@@ -1495,7 +1499,7 @@ fn test_bulgu_y6_unicode_identifiers_no_utf8_slice_panic() {
 fn test_bulgu_y7_strict_any_preserves_storage_class_and_leading_zeros() {
     let tmp = TempDb::new("y7_strict_any");
     {
-        let mut conn = Connection::open(tmp.path()).unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
         conn.execute(
             "CREATE TABLE t(
                 id INTEGER PRIMARY KEY,
@@ -1558,7 +1562,7 @@ fn test_bulgu_y7_strict_any_preserves_storage_class_and_leading_zeros() {
 fn test_bulgu_y8_alter_table_add_column_validates_existing_rows() {
     let tmp = TempDb::new("y8_add_col_check");
     {
-        let mut conn = Connection::open(tmp.path()).unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
         conn.execute("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
             .unwrap();
 
@@ -1596,7 +1600,7 @@ fn test_bulgu_y8_alter_table_add_column_validates_existing_rows() {
 #[test]
 fn test_bulgu_y9_begin_exclusive_blocks_external_readers_and_conflicts_with_shared() {
     let tmp = TempDb::new("y9_begin_excl");
-    let mut conn1 = Connection::open(tmp.path()).unwrap();
+    let conn1 = Connection::open(tmp.path()).unwrap();
     conn1
         .execute("CREATE TABLE t(x INT); INSERT INTO t VALUES (1);")
         .unwrap();
@@ -1625,7 +1629,7 @@ fn test_bulgu_y9_begin_exclusive_blocks_external_readers_and_conflicts_with_shar
 
     // 2. Conversely, if another connection holds a SHARED read lock (both in-process and cross-process),
     // `BEGIN EXCLUSIVE` MUST fail immediately with `Busy`!
-    let mut conn2 = Connection::open(tmp.path()).unwrap();
+    let conn2 = Connection::open(tmp.path()).unwrap();
     conn2.execute("INSERT INTO t VALUES (2);").unwrap();
     let mut active_scan = conn2.prepare("SELECT x FROM t;").unwrap();
     assert!(matches!(
@@ -1680,7 +1684,7 @@ fn test_bulgu_y9_begin_exclusive_blocks_external_readers_and_conflicts_with_shar
 
 #[test]
 fn test_bulgu_y10_min_max_bare_column_selected_from_extremum_row() {
-    let mut conn = Connection::open_in_memory().unwrap();
+    let conn = Connection::open_in_memory().unwrap();
     conn.execute(
         "CREATE TABLE t(grp TEXT, a INT, b TEXT);
          INSERT INTO t VALUES
@@ -1747,7 +1751,7 @@ fn test_bulgu_y10_min_max_bare_column_selected_from_extremum_row() {
 
 #[test]
 fn test_bulgu_y11_begin_rejected_inside_savepoint_transaction() {
-    let mut conn = Connection::open_in_memory().unwrap();
+    let conn = Connection::open_in_memory().unwrap();
     conn.execute("CREATE TABLE t(x INT);").unwrap();
 
     conn.execute("SAVEPOINT x;").unwrap();
@@ -1789,7 +1793,7 @@ fn test_bulgu_y11_begin_rejected_inside_savepoint_transaction() {
 fn test_bulgu_y12_negative_max_rowid_increment_vs_autoincrement() {
     let tmp = TempDb::new("y12_neg_rowid");
     {
-        let mut conn = Connection::open(tmp.path()).unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
 
         // 1. Normal rowid table: `-5` -> `-4` -> `-3`, `-1` -> `0` -> `1`
         conn.execute(

@@ -8,6 +8,9 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+test-diagnostics = []
+
 [dependencies]
 sqliters-types = { path = "../sqliters-types" }
 sqliters-vfs = { path = "../sqliters-vfs" }

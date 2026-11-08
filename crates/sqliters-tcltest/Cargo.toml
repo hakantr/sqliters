@@ -15,4 +15,4 @@ sqliters-pager = { path = "../sqliters-pager" }
 sqliters-btree = { path = "../sqliters-btree" }
 sqliters-syntax = { path = "../sqliters-syntax" }
 sqliters-vdbe = { path = "../sqliters-vdbe" }
-sqliters-core = { path = "../sqliters-core" }
+sqliters-core = { path = "../sqliters-core", features = ["test-diagnostics"] }

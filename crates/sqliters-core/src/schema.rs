@@ -33,25 +33,54 @@ pub struct ColumnSchema {
 }
 
 impl ColumnSchema {
-    /// Extracts a constant `P4` fallback for `OP_Column` when reading rows written prior to
-    /// `ALTER TABLE ... ADD COLUMN`.
-    pub fn default_p4(&self) -> P4 {
-        match &self.default_expr {
-            Some(Expr::Integer(i)) => P4::Int64(*i),
-            Some(Expr::Bool(b)) => P4::Int64(i64::from(*b)),
-            Some(Expr::Float(f)) => P4::Real(*f),
-            Some(Expr::String(s)) => P4::Str(s.clone()),
-            Some(Expr::Blob(b)) => P4::Blob(b.clone()),
+    /// Extracts a constant `P4` fallback (with column affinity + `STRICT` `REAL` coercion) for
+    /// `OP_Column` when reading rows written prior to `ALTER TABLE ... ADD COLUMN`.
+    pub fn default_p4_for_table(&self, table_strict: bool) -> P4 {
+        let raw_val = match &self.default_expr {
+            Some(Expr::Integer(i)) => Some(Value::Integer(*i)),
+            Some(Expr::Bool(b)) => Some(Value::Integer(i64::from(*b))),
+            Some(Expr::Float(f)) => Some(Value::real(*f)),
+            Some(Expr::String(s)) => Some(Value::Text(s.clone())),
+            Some(Expr::Blob(b)) => Some(Value::Blob(b.clone())),
+            Some(Expr::Unary {
+                op: sqliters_syntax::UnaryOp::Plus,
+                expr,
+            }) => match expr.as_ref() {
+                Expr::Integer(i) => Some(Value::Integer(*i)),
+                Expr::Float(f) => Some(Value::real(*f)),
+                _ => None,
+            },
             Some(Expr::Unary {
                 op: sqliters_syntax::UnaryOp::Negate,
                 expr,
             }) => match expr.as_ref() {
-                Expr::Integer(i) => P4::Int64(i.wrapping_neg()),
-                Expr::Float(f) => P4::Real(-*f),
-                _ => P4::None,
+                Expr::Integer(i) => Some(Value::Integer(i.wrapping_neg())),
+                Expr::Float(f) => Some(Value::real(-*f)),
+                _ => None,
             },
-            _ => P4::None,
+            _ => None,
+        };
+        let Some(v) = raw_val else {
+            return P4::None;
+        };
+        let mut coerced = self.affinity.apply(v);
+        if table_strict
+            && self.type_name.trim().eq_ignore_ascii_case("REAL")
+            && let Value::Integer(iv) = coerced
+        {
+            coerced = Value::real(iv as f64);
         }
+        match coerced {
+            Value::Null => P4::None,
+            Value::Integer(i) => P4::Int64(i),
+            Value::Real(r) => P4::Real(r),
+            Value::Text(s) => P4::Str(s),
+            Value::Blob(b) => P4::Blob(b),
+        }
+    }
+
+    pub fn default_p4(&self) -> P4 {
+        self.default_p4_for_table(false)
     }
 }
 
@@ -182,6 +211,30 @@ impl TableSchema {
             .collect()
     }
 
+    /// Maps a 0-based logical table column index (`col_idx`) to its physical record slot in
+    /// `root_pgno` (`[without_rowid_pk_cols..., without_rowid_extra_cols...]` on `WITHOUT ROWID`
+    /// tables without virtual columns; `col_idx` on rowid tables without virtual columns).
+    pub fn physical_record_slot(&self, col_idx: usize) -> usize {
+        if !self.without_rowid {
+            return col_idx;
+        }
+        if let Some(pk_pos) = self
+            .without_rowid_pk_cols
+            .iter()
+            .position(|ic| ic.col_idx == Some(col_idx))
+        {
+            return pk_pos;
+        }
+        if let Some(extra_pos) = self
+            .without_rowid_extra_cols
+            .iter()
+            .position(|&ci| ci == col_idx)
+        {
+            return self.without_rowid_pk_cols.len() + extra_pos;
+        }
+        col_idx
+    }
+
     /// Synthesizes an [`IndexSchema`] descriptor representing the `WITHOUT ROWID` primary B-Tree
     /// (`root_pgno`) for query planning (`IndexSeek`) and `PRAGMA index_list`.
     pub fn without_rowid_pk_as_index(&self) -> Option<IndexSchema> {
@@ -261,25 +314,30 @@ impl IndexSchema {
         }
         let mut pk = Vec::with_capacity(tbl.without_rowid_pk_cols.len());
         for pk_col in &tbl.without_rowid_pk_cols {
-            if let Some(pos) = self.columns.iter().position(|ic| {
-                ic.col_idx == pk_col.col_idx
-                    && ic.sort_order.collation == pk_col.sort_order.collation
-            }) {
-                pk.push(hit.get(pos).cloned().unwrap_or(Value::Null));
-            } else if let Some(tpos) = self.trailing_pk_cols.iter().position(|tc| {
-                tc.col_idx == pk_col.col_idx
-                    && tc.sort_order.collation == pk_col.sort_order.collation
-            }) {
-                pk.push(
-                    hit.get(self.columns.len() + tpos)
-                        .cloned()
-                        .unwrap_or(Value::Null),
-                );
+            if let Some(slot) = self.without_rowid_pk_slot_in_index(pk_col) {
+                pk.push(hit.get(slot).cloned().unwrap_or(Value::Null));
             } else {
                 pk.push(Value::Null);
             }
         }
         pk
+    }
+
+    /// Locates the physical record slot (`[columns..., trailing_pk_cols...]`) in this secondary
+    /// index that stores `pk_col` of its `WITHOUT ROWID` table.
+    pub fn without_rowid_pk_slot_in_index(&self, pk_col: &IndexedColSchema) -> Option<usize> {
+        if let Some(pos) = self.columns.iter().position(|ic| {
+            ic.col_idx == pk_col.col_idx && ic.sort_order.collation == pk_col.sort_order.collation
+        }) {
+            return Some(pos);
+        }
+        self.trailing_pk_cols
+            .iter()
+            .position(|tc| {
+                tc.col_idx == pk_col.col_idx
+                    && tc.sort_order.collation == pk_col.sort_order.collation
+            })
+            .map(|tpos| self.columns.len() + tpos)
     }
 }
 
@@ -404,14 +462,14 @@ impl Schema {
         };
 
         if need_read_tx {
-            let _ = btree.commit();
+            let _ = btree.pager_mut().end_read_if_unused();
         }
         res
     }
 
     fn load_inner(btree: &mut Btree) -> Result<Self> {
         let enc = btree.encoding();
-        let raw_rows = btree.scan_table(1)?;
+        let raw_rows = scan_table_incremental(btree, 1)?;
         let mut tables = Vec::new();
         let mut pending_auto_by_table: Vec<(String, Vec<PendingAutoIndex>)> = Vec::new();
         let mut raw_index_rows: Vec<(i64, String, String, Pgno, Option<String>)> = Vec::new();
@@ -1224,4 +1282,56 @@ pub fn bump_schema_cookie(btree: &mut Btree) -> Result<()> {
         hdr.schema_format = 4;
     }
     Ok(())
+}
+
+/// Scans all `(rowid, payload)` entries of a Table B+Tree using an incremental `BtreeCursor`,
+/// checking the connection interrupt flag on every row and closing the cursor before returning.
+pub(crate) fn scan_table_incremental(
+    btree: &mut Btree,
+    root_pgno: Pgno,
+) -> Result<Vec<(i64, Vec<u8>)>> {
+    let cid = btree.open_table_cursor(root_pgno, false);
+    let res = (|| {
+        let mut out = Vec::new();
+        if !btree.cursor_first(cid)? {
+            return Ok(out);
+        }
+        loop {
+            let rowid = btree.cursor_rowid(cid)?;
+            let payload = btree.cursor_payload(cid)?;
+            out.push((rowid, payload));
+            if !btree.cursor_next(cid)? {
+                break;
+            }
+        }
+        Ok(out)
+    })();
+    btree.close_cursor(cid);
+    res
+}
+
+/// Scans all key payloads of an Index B-Tree using an incremental `BtreeCursor`,
+/// checking the connection interrupt flag on every entry and closing the cursor before returning.
+pub(crate) fn scan_index_incremental(
+    btree: &mut Btree,
+    root_pgno: Pgno,
+    orders: Vec<KeySortOrder>,
+) -> Result<Vec<Vec<u8>>> {
+    let cid = btree.open_index_cursor(root_pgno, orders, false);
+    let res = (|| {
+        let mut out = Vec::new();
+        if !btree.cursor_first(cid)? {
+            return Ok(out);
+        }
+        loop {
+            let payload = btree.cursor_payload(cid)?;
+            out.push(payload);
+            if !btree.cursor_next(cid)? {
+                break;
+            }
+        }
+        Ok(out)
+    })();
+    btree.close_cursor(cid);
+    res
 }

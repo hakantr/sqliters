@@ -555,7 +555,7 @@ fn test_select_limit_1_and_cursor_column_lazy_page_and_overflow_guarantee() {
     // Populate a 240-row table on 512-byte pages where every row carries a 2,400-byte overflow BLOB
     // (5+ overflow pages per row => > 1,200 pages total!).
     let (tbl_root, tree_height, total_pages) = {
-        let mut conn = Connection::open_with_vfs(
+        let conn = Connection::open_with_vfs(
             Arc::clone(&vfs) as Arc<dyn Vfs>,
             Some(db_path),
             OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB,
@@ -590,11 +590,24 @@ fn test_select_limit_1_and_cursor_column_lazy_page_and_overflow_guarantee() {
         }
         conn.execute("COMMIT;").unwrap();
 
-        let root = conn.schema().find_table("big").unwrap().root_pgno;
-        conn.btree_mut().begin_read().unwrap();
-        let height = measure_table_tree_height(conn.btree_mut(), root);
-        let pcnt = conn.page_count();
-        conn.btree_mut().commit().unwrap();
+        let root = conn
+            .schema_snapshot()
+            .unwrap()
+            .find_table("big")
+            .unwrap()
+            .root_pgno;
+        let pcnt = conn.page_count().unwrap();
+        drop(conn);
+
+        let mut bt = Btree::open_with_vfs(
+            Arc::clone(&vfs) as Arc<dyn Vfs>,
+            Some(db_path),
+            OpenFlags::READONLY | OpenFlags::MAIN_DB,
+        )
+        .unwrap();
+        bt.begin_read().unwrap();
+        let height = measure_table_tree_height(&mut bt, root);
+        bt.commit().unwrap();
         assert!(
             height >= 2,
             "expected multi-level B+Tree, got height={height}"
@@ -609,14 +622,15 @@ fn test_select_limit_1_and_cursor_column_lazy_page_and_overflow_guarantee() {
     // Open a completely fresh Connection with a cold Pager cache!
     vfs.tracker.reset();
     {
-        let mut conn = Connection::open_with_vfs(
+        let conn = Connection::open_with_vfs(
             Arc::clone(&vfs) as Arc<dyn Vfs>,
             Some(db_path),
             OpenFlags::READWRITE | OpenFlags::MAIN_DB,
         )
         .unwrap();
-        // Schema was loaded once during `open_with_vfs`; reset SpyVfs counter to measure
-        // ONLY `prepare("SELECT id, short_col FROM big ORDER BY id LIMIT 1")` + first `step()`!
+        // Warm schema once, then reset SpyVfs counter to measure ONLY
+        // `prepare("SELECT id, short_col FROM big ORDER BY id LIMIT 1")` + first `step()`!
+        let _ = conn.schema_snapshot().unwrap();
         vfs.tracker.reset();
 
         let mut stmt = conn
@@ -644,7 +658,7 @@ fn test_select_limit_1_and_cursor_column_lazy_page_and_overflow_guarantee() {
         // Step to Done and ensure zero cursors remain open!
         assert_eq!(stmt.step().unwrap(), StepResult::Done);
         drop(stmt);
-        assert_eq!(conn.btree().open_cursor_count(), 0);
+        assert_eq!(conn.open_cursor_count_for_testing().unwrap(), 0);
     }
 
     // Also verify cold-cache BtreeCursor `cursor_column` directly:
@@ -707,7 +721,7 @@ fn test_select_limit_1_and_cursor_column_lazy_page_and_overflow_guarantee() {
 // ============================================================================
 
 fn seed_differential_mutation_db(path: &Path) {
-    let mut conn = Connection::open(path).unwrap();
+    let conn = Connection::open(path).unwrap();
     conn.execute(
         "PRAGMA page_size = 512;
          CREATE TABLE t (id INTEGER PRIMARY KEY, payload BLOB NOT NULL);
@@ -771,17 +785,25 @@ fn test_table_cursor_mid_scan_mutations_forward_and_reverse_match_c_sqlite() {
         parse_c_helper_lines(&String::from_utf8(c_out.stdout).unwrap());
 
     let (rs_visited_fwd, rs_final_fwd) = {
-        let mut conn = Connection::open(&rs_fwd_db).unwrap();
-        let tbl_root = conn.schema().find_table("t").unwrap().root_pgno;
-        conn.execute("BEGIN IMMEDIATE;").unwrap();
+        let tbl_root = {
+            let conn = Connection::open(&rs_fwd_db).unwrap();
+            conn.schema_snapshot()
+                .unwrap()
+                .find_table("t")
+                .unwrap()
+                .root_pgno
+        };
+
+        let mut bt =
+            Btree::open_file(&rs_fwd_db, OpenFlags::READWRITE | OpenFlags::MAIN_DB).unwrap();
+        bt.begin_write().unwrap();
 
         let mut visited = Vec::new();
-        let cur = conn.btree_mut().open_table_cursor(tbl_root, false);
-        let mut has_row = conn.btree_mut().cursor_first(cur).unwrap();
+        let cur = bt.open_table_cursor(tbl_root, false);
+        let mut has_row = bt.cursor_first(cur).unwrap();
         while has_row {
-            let id = conn.btree_mut().cursor_rowid(cur).unwrap();
-            let Value::Blob(blob_bytes) = conn.btree_mut().cursor_column(cur, 1).unwrap().unwrap()
-            else {
+            let id = bt.cursor_rowid(cur).unwrap();
+            let Value::Blob(blob_bytes) = bt.cursor_column(cur, 1).unwrap().unwrap() else {
                 panic!("expected Blob payload");
             };
             let plen = blob_bytes.len() as i64;
@@ -789,41 +811,43 @@ fn test_table_cursor_mid_scan_mutations_forward_and_reverse_match_c_sqlite() {
 
             if id == 25 {
                 for del_id in 26..=40i64 {
-                    conn.btree_mut().delete_table(tbl_root, del_id).unwrap();
+                    bt.delete_table(tbl_root, del_id).unwrap();
                 }
                 // Verify mutation invalidated `cur` into `RequireSeek`
                 assert!(matches!(
-                    conn.btree().cursor_state(cur),
+                    bt.cursor_state(cur),
                     Some(BtreeCursorState::RequireSeek { .. })
                 ));
                 for k in -20..=-1i64 {
                     let rec = encode_record(&[Value::Null, Value::Blob(vec![0u8; 900])]);
-                    conn.btree_mut().insert_table(tbl_root, k, &rec).unwrap();
+                    bt.insert_table(tbl_root, k, &rec).unwrap();
                 }
                 for k in 501..=530i64 {
                     let rec = encode_record(&[Value::Null, Value::Blob(vec![0u8; 900])]);
-                    conn.btree_mut().insert_table(tbl_root, k, &rec).unwrap();
+                    bt.insert_table(tbl_root, k, &rec).unwrap();
                 }
             }
             if id == 90 {
                 for k in 910..=925i64 {
                     let rec = encode_record(&[Value::Null, Value::Blob(vec![0u8; 900])]);
-                    conn.btree_mut().insert_table(tbl_root, k, &rec).unwrap();
+                    bt.insert_table(tbl_root, k, &rec).unwrap();
                 }
             }
             if id > 0 && id % 3 == 0 {
-                assert!(conn.btree_mut().delete_table(tbl_root, id).unwrap());
+                assert!(bt.delete_table(tbl_root, id).unwrap());
             }
 
-            has_row = conn.btree_mut().cursor_next(cur).unwrap();
+            has_row = bt.cursor_next(cur).unwrap();
         }
-        conn.btree_mut().close_cursor(cur);
+        bt.close_cursor(cur);
         assert_eq!(
-            conn.btree_mut().integrity_check(&[1, tbl_root]).unwrap(),
+            bt.integrity_check(&[1, tbl_root]).unwrap(),
             Vec::<String>::new()
         );
-        conn.execute("COMMIT;").unwrap();
+        bt.commit().unwrap();
+        drop(bt);
 
+        let conn = Connection::open(&rs_fwd_db).unwrap();
         let q = conn
             .query("SELECT id, length(payload) FROM t ORDER BY id ASC", &[])
             .unwrap();
@@ -864,17 +888,25 @@ fn test_table_cursor_mid_scan_mutations_forward_and_reverse_match_c_sqlite() {
         parse_c_helper_lines(&String::from_utf8(c_rev_out.stdout).unwrap());
 
     let (rs_visited_rev, rs_final_rev) = {
-        let mut conn = Connection::open(&rs_rev_db).unwrap();
-        let tbl_root = conn.schema().find_table("t").unwrap().root_pgno;
-        conn.execute("BEGIN IMMEDIATE;").unwrap();
+        let tbl_root = {
+            let conn = Connection::open(&rs_rev_db).unwrap();
+            conn.schema_snapshot()
+                .unwrap()
+                .find_table("t")
+                .unwrap()
+                .root_pgno
+        };
+
+        let mut bt =
+            Btree::open_file(&rs_rev_db, OpenFlags::READWRITE | OpenFlags::MAIN_DB).unwrap();
+        bt.begin_write().unwrap();
 
         let mut visited = Vec::new();
-        let cur = conn.btree_mut().open_table_cursor(tbl_root, false);
-        let mut has_row = conn.btree_mut().cursor_last(cur).unwrap();
+        let cur = bt.open_table_cursor(tbl_root, false);
+        let mut has_row = bt.cursor_last(cur).unwrap();
         while has_row {
-            let id = conn.btree_mut().cursor_rowid(cur).unwrap();
-            let Value::Blob(blob_bytes) = conn.btree_mut().cursor_column(cur, 1).unwrap().unwrap()
-            else {
+            let id = bt.cursor_rowid(cur).unwrap();
+            let Value::Blob(blob_bytes) = bt.cursor_column(cur, 1).unwrap().unwrap() else {
                 panic!("expected Blob payload");
             };
             let plen = blob_bytes.len() as i64;
@@ -882,30 +914,32 @@ fn test_table_cursor_mid_scan_mutations_forward_and_reverse_match_c_sqlite() {
 
             if id == 95 {
                 for del_id in 75..=88i64 {
-                    conn.btree_mut().delete_table(tbl_root, del_id).unwrap();
+                    bt.delete_table(tbl_root, del_id).unwrap();
                 }
                 for k in 600..=620i64 {
                     let rec = encode_record(&[Value::Null, Value::Blob(vec![0u8; 900])]);
-                    conn.btree_mut().insert_table(tbl_root, k, &rec).unwrap();
+                    bt.insert_table(tbl_root, k, &rec).unwrap();
                 }
                 for k in -15..=-1i64 {
                     let rec = encode_record(&[Value::Null, Value::Blob(vec![0u8; 900])]);
-                    conn.btree_mut().insert_table(tbl_root, k, &rec).unwrap();
+                    bt.insert_table(tbl_root, k, &rec).unwrap();
                 }
             }
             if id > 0 && id % 4 == 0 {
-                assert!(conn.btree_mut().delete_table(tbl_root, id).unwrap());
+                assert!(bt.delete_table(tbl_root, id).unwrap());
             }
 
-            has_row = conn.btree_mut().cursor_prev(cur).unwrap();
+            has_row = bt.cursor_prev(cur).unwrap();
         }
-        conn.btree_mut().close_cursor(cur);
+        bt.close_cursor(cur);
         assert_eq!(
-            conn.btree_mut().integrity_check(&[1, tbl_root]).unwrap(),
+            bt.integrity_check(&[1, tbl_root]).unwrap(),
             Vec::<String>::new()
         );
-        conn.execute("COMMIT;").unwrap();
+        bt.commit().unwrap();
+        drop(bt);
 
+        let conn = Connection::open(&rs_rev_db).unwrap();
         let q = conn
             .query("SELECT id, length(payload) FROM t ORDER BY id ASC", &[])
             .unwrap();
@@ -1434,7 +1468,7 @@ fn test_atomic_interrupt_hook_aborts_btree_cursor_overflow_and_vdbe_step() {
     let vfs = Arc::new(SpyVfs::new());
     let db_path = Path::new("/interrupt_test.db");
 
-    let mut conn = Connection::open_with_vfs(
+    let conn = Connection::open_with_vfs(
         Arc::clone(&vfs) as Arc<dyn Vfs>,
         Some(db_path),
         OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB,
@@ -1454,7 +1488,12 @@ fn test_atomic_interrupt_hook_aborts_btree_cursor_overflow_and_vdbe_step() {
         .unwrap();
     }
     conn.execute("COMMIT;").unwrap();
-    let tbl_root = conn.schema().find_table("heavy").unwrap().root_pgno;
+    let tbl_root = conn
+        .schema_snapshot()
+        .unwrap()
+        .find_table("heavy")
+        .unwrap()
+        .root_pgno;
     drop(conn);
 
     // 1. Interrupt a cold `BtreeCursor` right in the middle of reassembling a 6-page overflow BLOB!
@@ -1502,13 +1541,14 @@ fn test_atomic_interrupt_hook_aborts_btree_cursor_overflow_and_vdbe_step() {
     // 2. Interrupt `VdbeVm::step` / `Statement::step` mid-table-scan (e.g. `WHERE id = 999999` scanning rows)
     {
         let flag = Arc::new(AtomicBool::new(false));
-        let mut conn = Connection::open_with_vfs(
+        let conn = Connection::open_with_vfs(
             Arc::clone(&vfs) as Arc<dyn Vfs>,
             Some(db_path),
             OpenFlags::READONLY | OpenFlags::MAIN_DB,
         )
         .unwrap();
-        conn.set_interrupt_flag(Some(Arc::clone(&flag)));
+        let _ = conn.schema_snapshot().unwrap();
+        conn.set_interrupt_flag(Some(Arc::clone(&flag))).unwrap();
 
         vfs.tracker.reset();
         *vfs.tracker.interrupt_target.lock().unwrap() = Some(Arc::clone(&flag));
@@ -1522,7 +1562,7 @@ fn test_atomic_interrupt_hook_aborts_btree_cursor_overflow_and_vdbe_step() {
         drop(stmt);
 
         // Zero leaked cursors after interrupted `VdbeVm::step`!
-        assert_eq!(conn.btree().open_cursor_count(), 0);
+        assert_eq!(conn.open_cursor_count_for_testing().unwrap(), 0);
 
         // Reset flag and confirm subsequent query succeeds
         vfs.tracker.interrupt_after_reads.store(0, Ordering::SeqCst);
@@ -1534,7 +1574,7 @@ fn test_atomic_interrupt_hook_aborts_btree_cursor_overflow_and_vdbe_step() {
             .unwrap();
         assert_eq!(row.get_i64(0), Some(1));
         assert_eq!(row.get_i64(1), Some(3_000));
-        assert_eq!(conn.btree().open_cursor_count(), 0);
+        assert_eq!(conn.open_cursor_count_for_testing().unwrap(), 0);
     }
 }
 
@@ -1648,7 +1688,7 @@ fn test_zero_cursor_leak_across_done_reset_halt_error_and_statement_drop() {
     bt.rollback().unwrap();
 
     // Case 5: High-level `Connection` / `Statement` early `reset()` and `drop()` mid-scan!
-    let mut conn = Connection::open_in_memory().unwrap();
+    let conn = Connection::open_in_memory().unwrap();
     conn.execute(
         "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT UNIQUE);
          INSERT INTO items VALUES (1, 'a'), (2, 'b'), (3, 'c');",
@@ -1659,12 +1699,12 @@ fn test_zero_cursor_leak_across_done_reset_halt_error_and_statement_drop() {
             .prepare("SELECT id, name FROM items WHERE name = 'b'")
             .unwrap();
         assert!(matches!(stmt.step().unwrap(), StepResult::Row(_)));
-        stmt.reset();
+        stmt.reset().unwrap();
         // Re-step after reset: if `stmt.reset()` leaked old cursors, we would see >0 after dropping!
         assert!(matches!(stmt.step().unwrap(), StepResult::Row(_)));
-        stmt.reset();
+        stmt.reset().unwrap();
     }
-    assert_eq!(conn.btree().open_cursor_count(), 0);
+    assert_eq!(conn.open_cursor_count_for_testing().unwrap(), 0);
     {
         let mut stmt = conn
             .prepare("SELECT id, name FROM items WHERE name = 'b'")
@@ -1672,7 +1712,7 @@ fn test_zero_cursor_leak_across_done_reset_halt_error_and_statement_drop() {
         assert!(matches!(stmt.step().unwrap(), StepResult::Row(_)));
         // Drop `stmt` while paused at `StepResult::Row`!
     }
-    assert_eq!(conn.btree().open_cursor_count(), 0);
+    assert_eq!(conn.open_cursor_count_for_testing().unwrap(), 0);
 }
 
 #[test]

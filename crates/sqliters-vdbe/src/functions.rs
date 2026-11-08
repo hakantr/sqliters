@@ -143,7 +143,7 @@ pub fn eval_scalar_function(name: &str, args: &[Value], ctx: &VmRuntimeContext) 
             }
         }
         "COALESCE" | "IFNULL" => {
-            let min = if upper == "IFNULL" { 2 } else { 1 };
+            let min = 2;
             let max = if upper == "IFNULL" { 2 } else { usize::MAX };
             check_arity(name, args, min, max)?;
             for v in args {
@@ -525,6 +525,149 @@ fn check_arity(name: &str, args: &[Value], min: usize, max: usize) -> Result<()>
         ))
     } else {
         Ok(())
+    }
+}
+
+fn scalar_function_arity(upper: &str) -> Option<(usize, usize)> {
+    match upper {
+        "TYPEOF" | "ABS" | "SIGN" | "LENGTH" | "OCTET_LENGTH" | "LOWER" | "UPPER" | "HEX"
+        | "UNHEX" | "UNICODE" | "QUOTE" | "ZEROBLOB" | "RANDOMBLOB" => Some((1, 1)),
+        "RANDOM" | "SQLITE_VERSION" | "SQLITE_SOURCE_ID" | "LAST_INSERT_ROWID" | "CHANGES"
+        | "TOTAL_CHANGES" | "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" => Some((0, 0)),
+        "COALESCE" => Some((2, usize::MAX)),
+        "IFNULL" | "NULLIF" | "INSTR" | "GLOB" => Some((2, 2)),
+        "IIF" | "REPLACE" => Some((3, 3)),
+        "TRIM" | "LTRIM" | "RTRIM" | "ROUND" => Some((1, 2)),
+        "SUBSTR" | "SUBSTRING" | "LIKE" => Some((2, 3)),
+        "CHAR" | "DATE" | "TIME" | "DATETIME" | "UNIXEPOCH" | "JULIANDAY" | "STRFTIME" => {
+            Some((0, usize::MAX))
+        }
+        "PRINTF" | "FORMAT" => Some((1, usize::MAX)),
+        _ => None,
+    }
+}
+
+/// Validates a SQL function call (`name`, `*` vs `arg_count`, `DISTINCT`, `FILTER`, and whether
+/// aggregate functions are permitted in the enclosing SQL clause) at `prepare` time.
+pub fn validate_function_call(
+    name: &str,
+    star_args: bool,
+    arg_count: usize,
+    distinct: bool,
+    has_filter: bool,
+    allow_aggregates: bool,
+) -> Result<()> {
+    let upper = name.to_ascii_uppercase();
+    match upper.as_str() {
+        "COUNT" => {
+            if !star_args && arg_count > 1 {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("wrong number of arguments to function {name}()"),
+                ));
+            }
+            if (star_args || arg_count == 0) && distinct {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    "DISTINCT aggregates must have exactly one argument",
+                ));
+            }
+            if !allow_aggregates {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("misuse of aggregate function {name}()"),
+                ));
+            }
+            Ok(())
+        }
+        "SUM" | "TOTAL" | "AVG" => {
+            if star_args || arg_count != 1 {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("wrong number of arguments to function {name}()"),
+                ));
+            }
+            if !allow_aggregates {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("misuse of aggregate function {name}()"),
+                ));
+            }
+            Ok(())
+        }
+        "GROUP_CONCAT" | "STRING_AGG" => {
+            if star_args || arg_count == 0 || arg_count > 2 {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("wrong number of arguments to function {name}()"),
+                ));
+            }
+            if distinct && arg_count != 1 {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    "DISTINCT aggregates must have exactly one argument",
+                ));
+            }
+            if !allow_aggregates {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("misuse of aggregate function {name}()"),
+                ));
+            }
+            Ok(())
+        }
+        "MIN" | "MAX" => {
+            if star_args || arg_count == 0 {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("wrong number of arguments to function {name}()"),
+                ));
+            }
+            if arg_count == 1 {
+                if !allow_aggregates {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("misuse of aggregate function {name}()"),
+                    ));
+                }
+                Ok(())
+            } else {
+                if distinct {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "DISTINCT aggregates must have exactly one argument",
+                    ));
+                }
+                if has_filter {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("{name}() is not an aggregate function"),
+                    ));
+                }
+                Ok(())
+            }
+        }
+        _ => {
+            let Some((min, max)) = scalar_function_arity(&upper) else {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such function: {name}"),
+                ));
+            };
+            if distinct || has_filter {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("{name}() is not an aggregate function"),
+                ));
+            }
+            if star_args || arg_count < min || arg_count > max {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("wrong number of arguments to function {name}()"),
+                ));
+            }
+            Ok(())
+        }
     }
 }
 

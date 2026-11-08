@@ -15,7 +15,7 @@ use sqliters_syntax::{
     keyword_kind, parse_one, tokenize,
 };
 use sqliters_types::{
-    Collation, ConflictResolutionEffect, ErrorCode, KeySortOrder, Result, SqliteError,
+    Collation, ConflictResolutionEffect, ErrorCode, KeySortOrder, Pgno, Result, SqliteError,
     TextEncoding, TypeAffinity, Value, decode_record_with_encoding, encode_record_with_encoding,
     extended,
 };
@@ -23,7 +23,7 @@ use sqliters_vdbe::{
     AggregateAccumulator, AggregateKind, Opcode, VmRuntimeContext, eval_cast_with_encoding,
     eval_comparison_with_affinity, eval_comparison_with_encoding, eval_scalar_function,
     eval_unary_negate, format_utc_date, format_utc_time, format_utc_timestamp, parse_escape_char,
-    sqlite_compare_affinity, sqlite_glob_match, sqlite_like_match,
+    sqlite_compare_affinity, sqlite_glob_match, sqlite_like_match, validate_function_call,
 };
 
 use crate::compiler::{
@@ -33,7 +33,8 @@ use crate::compiler::{
 use crate::schema::{
     ColumnSchema, ForeignKeySchema, IndexSchema, Schema, TableRowKey, TableSchema,
     build_column_schema_from_def, build_index_schema_from_ast, build_table_schema_from_ast,
-    delete_schema_entry, insert_schema_entry, update_schema_entry,
+    delete_schema_entry, insert_schema_entry, scan_index_incremental, scan_table_incremental,
+    update_schema_entry,
 };
 
 /// Materialized result set (`column_names` + `rows`) produced by executing a statement.
@@ -43,6 +44,29 @@ pub struct QueryOutput {
     pub rows: Vec<Vec<Value>>,
 }
 
+/// Connection-level named SQL savepoint (`sqlite/src/vdbe.c` `OP_Savepoint`).
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct SqlSavepoint {
+    pub name: String,
+    /// 0-based physical `Pager` subsavepoint slot index corresponding to this savepoint.
+    pub subsavepoint_depth: usize,
+    /// `true` when opened in autocommit mode (marking an implicit transaction savepoint).
+    pub is_transaction_savepoint: bool,
+    pub schema_at_open: Schema,
+    pub schema_gen_at_open: u64,
+    pub deferred_fk_suspects: Vec<(String, TableRowKey, usize)>,
+}
+
+/// Snapshot of other active statements on the connection (excluding the currently executing handle).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ActivitySummary {
+    pub other_active: usize,
+    pub other_readers: usize,
+    pub other_writers: usize,
+}
+
 /// Mutable database state passed into statement execution.
 pub struct ExecContext<'a> {
     pub btree: &'a mut Btree,
@@ -50,10 +74,28 @@ pub struct ExecContext<'a> {
     pub runtime: &'a mut VmRuntimeContext,
     pub explicit_tx: &'a mut bool,
     pub implicit_savepoint_tx: &'a mut bool,
+    pub in_user_btree_tx: &'a mut bool,
+    pub savepoints: &'a mut Vec<SqlSavepoint>,
+    pub schema_generation: &'a mut u64,
+    pub schema_changed_in_tx: &'a mut bool,
+    pub activity: ActivitySummary,
     pub foreign_keys: &'a mut bool,
     pub count_changes: &'a mut bool,
     pub rollback_count: &'a mut u64,
     pub deferred_fk_suspects: &'a mut Vec<(String, TableRowKey, usize)>,
+    pub publish_mirrors: &'a mut dyn FnMut(&VmRuntimeContext, bool, bool, u64),
+}
+
+impl ExecContext<'_> {
+    #[inline]
+    pub(crate) fn publish(&mut self) {
+        (self.publish_mirrors)(
+            self.runtime,
+            *self.explicit_tx,
+            *self.implicit_savepoint_tx,
+            *self.rollback_count,
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -207,18 +249,341 @@ impl CteStore {
     }
 }
 
-/// Top-level statement dispatcher for all SQL statements (`SELECT`, DML, DDL, `EXPLAIN`, `PRAGMA`, transactions).
-pub fn execute_statement(
+///Statement execution category used by `Statement` (`sqliters-core`) to coordinate `ActivityTracker`
+/// and `Pager` transaction leases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StmtCategory {
+    /// `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`
+    Control,
+    /// Pragmas / `ANALYZE` that do not open a B-tree read/write transaction on `step()`
+    NoLockPragma,
+    /// `SELECT`, `EXPLAIN`, and read-transaction `PRAGMA`s
+    Read,
+    /// `INSERT`, `UPDATE`, `DELETE`, DDL, `REINDEX`, and header-writing `PRAGMA`s
+    Write,
+    /// `VACUUM`
+    Vacuum,
+}
+
+/// Returns `true` when `stmt` requires `sqlite_schema` to be loaded (`PragFlg_NeedSchema` / `prepare.c`).
+pub(crate) fn stmt_requires_schema(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Begin { .. }
+        | Stmt::Commit
+        | Stmt::Rollback { .. }
+        | Stmt::Savepoint(_)
+        | Stmt::Release(_) => false,
+        Stmt::Pragma { name, .. } => matches!(
+            name.to_ascii_uppercase().as_str(),
+            "TABLE_INFO"
+                | "INDEX_LIST"
+                | "INDEX_INFO"
+                | "FOREIGN_KEY_LIST"
+                | "FOREIGN_KEY_CHECK"
+                | "INTEGRITY_CHECK"
+                | "QUICK_CHECK"
+        ),
+        _ => true,
+    }
+}
+
+/// Classifies `stmt` into its execution lease category.
+pub(crate) fn classify_stmt_category(stmt: &Stmt) -> StmtCategory {
+    match stmt {
+        Stmt::Begin { .. }
+        | Stmt::Commit
+        | Stmt::Rollback { .. }
+        | Stmt::Savepoint(_)
+        | Stmt::Release(_) => StmtCategory::Control,
+        Stmt::Analyze(_) => StmtCategory::NoLockPragma,
+        Stmt::Vacuum => StmtCategory::Vacuum,
+        Stmt::Select(_) | Stmt::Explain { .. } => StmtCategory::Read,
+        Stmt::Pragma { name, value, .. } => match name.to_ascii_uppercase().as_str() {
+            "INTEGRITY_CHECK" | "QUICK_CHECK" | "PAGE_COUNT" | "FREELIST_COUNT"
+            | "SCHEMA_VERSION" | "FOREIGN_KEY_LIST" | "FOREIGN_KEY_CHECK" | "TABLE_INFO"
+            | "INDEX_LIST" | "INDEX_INFO" => StmtCategory::Read,
+            "USER_VERSION" | "APPLICATION_ID" => {
+                if value.is_some() {
+                    StmtCategory::Write
+                } else {
+                    StmtCategory::Read
+                }
+            }
+            _ => StmtCategory::NoLockPragma,
+        },
+        Stmt::Insert(_)
+        | Stmt::Update(_)
+        | Stmt::Delete(_)
+        | Stmt::CreateTable(_)
+        | Stmt::CreateTableAs { .. }
+        | Stmt::DropTable { .. }
+        | Stmt::CreateIndex(_)
+        | Stmt::DropIndex { .. }
+        | Stmt::AlterTable { .. }
+        | Stmt::Reindex(_) => StmtCategory::Write,
+    }
+}
+
+/// Checks all outstanding deferred foreign key suspects (`sqlite3VdbeCheckFkDeferred`).
+pub(crate) fn check_deferred_fks(ctx: &mut ExecContext<'_>) -> Result<()> {
+    if *ctx.foreign_keys && !ctx.deferred_fk_suspects.is_empty() {
+        let suspects = ctx.deferred_fk_suspects.clone();
+        verify_fk_suspects(ctx, &suspects)?;
+    }
+    Ok(())
+}
+
+/// Executes `COMMIT` (`OP_AutoCommit` with `desiredAutoCommit = 1, iRollback = 0`).
+/// If `commit_retaining_read` returns `ErrorCode::Busy`, leaves the transaction open so it can be retried.
+pub(crate) fn commit_transaction(ctx: &mut ExecContext<'_>) -> Result<()> {
+    if !*ctx.explicit_tx && !*ctx.implicit_savepoint_tx {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            "cannot commit - no transaction is active",
+        ));
+    }
+    if ctx.activity.other_writers > 0 {
+        return Err(SqliteError::new(
+            ErrorCode::Busy,
+            "cannot commit transaction - SQL statements in progress",
+        ));
+    }
+    check_deferred_fks(ctx)?;
+
+    let retain_read = ctx.activity.other_readers > 0;
+    match ctx.btree.transaction_state() {
+        TransactionState::Open => {}
+        TransactionState::Read => {
+            if !retain_read {
+                ctx.btree.pager_mut().end_read_if_unused()?;
+            }
+        }
+        TransactionState::Write => {
+            ctx.btree.pager_mut().commit_retaining_read(retain_read)?;
+        }
+    }
+
+    *ctx.explicit_tx = false;
+    *ctx.implicit_savepoint_tx = false;
+    *ctx.in_user_btree_tx = false;
+    ctx.savepoints.clear();
+    *ctx.schema_changed_in_tx = false;
+    ctx.deferred_fk_suspects.clear();
+    ctx.publish();
+    Ok(())
+}
+
+/// Executes `RELEASE [SAVEPOINT] <name>` (`OP_Savepoint` `SAVEPOINT_RELEASE`).
+pub(crate) fn release_savepoint_op(ctx: &mut ExecContext<'_>, sp_name: &str) -> Result<()> {
+    let Some(pos) = ctx
+        .savepoints
+        .iter()
+        .rposition(|sp| sp.name.eq_ignore_ascii_case(sp_name))
+    else {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("no such savepoint: {sp_name}"),
+        ));
+    };
+    if ctx.activity.other_writers > 0 {
+        return Err(SqliteError::new(
+            ErrorCode::Busy,
+            "cannot release savepoint - SQL statements in progress",
+        ));
+    }
+
+    let is_tx_sp = pos == 0 && ctx.savepoints[0].is_transaction_savepoint;
+    if is_tx_sp {
+        check_deferred_fks(ctx)?;
+        let retain_read = ctx.activity.other_readers > 0;
+        match ctx.btree.transaction_state() {
+            TransactionState::Open => {}
+            TransactionState::Read => {
+                if !retain_read {
+                    ctx.btree.pager_mut().end_read_if_unused()?;
+                }
+            }
+            TransactionState::Write => {
+                ctx.btree.pager_mut().commit_retaining_read(retain_read)?;
+            }
+        }
+        *ctx.implicit_savepoint_tx = false;
+        *ctx.in_user_btree_tx = false;
+        ctx.savepoints.clear();
+        *ctx.schema_changed_in_tx = false;
+        ctx.deferred_fk_suspects.clear();
+        ctx.publish();
+        Ok(())
+    } else {
+        if ctx.btree.transaction_state() == TransactionState::Write {
+            let slot = ctx.savepoints[pos].subsavepoint_depth;
+            ctx.btree.pager_mut().release_subsavepoint(slot)?;
+        }
+        ctx.savepoints.truncate(pos);
+        Ok(())
+    }
+}
+
+/// Executes transaction / savepoint control statements (`BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`).
+pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Result<()> {
+    match stmt {
+        Stmt::Begin { mode } => {
+            if !is_in_autocommit(ctx) {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    "cannot start a transaction within a transaction",
+                ));
+            }
+            match mode {
+                sqliters_syntax::TransactionMode::Deferred => {
+                    *ctx.explicit_tx = true;
+                    *ctx.implicit_savepoint_tx = false;
+                    ctx.publish();
+                }
+                sqliters_syntax::TransactionMode::Immediate => {
+                    ctx.btree.begin_write()?;
+                    *ctx.explicit_tx = true;
+                    *ctx.implicit_savepoint_tx = false;
+                    *ctx.in_user_btree_tx = true;
+                    ctx.publish();
+                }
+                sqliters_syntax::TransactionMode::Exclusive => {
+                    ctx.btree.begin_exclusive()?;
+                    *ctx.explicit_tx = true;
+                    *ctx.implicit_savepoint_tx = false;
+                    *ctx.in_user_btree_tx = true;
+                    ctx.publish();
+                }
+            }
+            Ok(())
+        }
+        Stmt::Commit => commit_transaction(ctx),
+        Stmt::Rollback { savepoint } => {
+            if let Some(sp_name) = savepoint {
+                let Some(pos) = ctx
+                    .savepoints
+                    .iter()
+                    .rposition(|sp| sp.name.eq_ignore_ascii_case(sp_name))
+                else {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("no such savepoint: {sp_name}"),
+                    ));
+                };
+                let sp = ctx.savepoints[pos].clone();
+                let schema_changed_since_sp = *ctx.schema_generation != sp.schema_gen_at_open;
+                let write_only = !schema_changed_since_sp;
+                let trip_res = ctx
+                    .btree
+                    .trip_cursors(extended::SQLITE_ABORT_ROLLBACK, write_only);
+                if ctx.btree.transaction_state() == TransactionState::Write {
+                    ctx.btree
+                        .pager_mut()
+                        .rollback_to_subsavepoint(sp.subsavepoint_depth)?;
+                }
+                *ctx.deferred_fk_suspects = sp.deferred_fk_suspects;
+                ctx.savepoints.truncate(pos + 1);
+                if schema_changed_since_sp {
+                    *ctx.schema = sp.schema_at_open;
+                    *ctx.schema_generation += 1;
+                }
+                *ctx.rollback_count += 1;
+                ctx.publish();
+                trip_res?;
+                Ok(())
+            } else {
+                if !*ctx.explicit_tx && !*ctx.implicit_savepoint_tx {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "cannot rollback - no transaction is active",
+                    ));
+                }
+                let write_only = !*ctx.schema_changed_in_tx;
+                let retain_read = ctx.activity.other_readers > 0 && write_only;
+                match ctx.btree.transaction_state() {
+                    TransactionState::Open => {}
+                    TransactionState::Read => {
+                        let trip_res = ctx
+                            .btree
+                            .trip_cursors(extended::SQLITE_ABORT_ROLLBACK, write_only);
+                        if !retain_read {
+                            ctx.btree.pager_mut().end_read_if_unused()?;
+                        }
+                        trip_res?;
+                    }
+                    TransactionState::Write => {
+                        ctx.btree.rollback_with_trip(
+                            extended::SQLITE_ABORT_ROLLBACK,
+                            write_only,
+                            retain_read,
+                        )?;
+                    }
+                }
+                let had_schema_change = *ctx.schema_changed_in_tx;
+                *ctx.rollback_count += 1;
+                *ctx.explicit_tx = false;
+                *ctx.implicit_savepoint_tx = false;
+                *ctx.in_user_btree_tx = false;
+                ctx.savepoints.clear();
+                *ctx.schema_changed_in_tx = false;
+                ctx.deferred_fk_suspects.clear();
+                if had_schema_change {
+                    *ctx.schema = Schema::load(ctx.btree)?;
+                    *ctx.schema_generation += 1;
+                }
+                ctx.publish();
+                Ok(())
+            }
+        }
+        Stmt::Savepoint(name) => {
+            if ctx.activity.other_writers > 0 {
+                return Err(SqliteError::new(
+                    ErrorCode::Busy,
+                    "cannot open savepoint - SQL statements in progress",
+                ));
+            }
+            let was_autocommit = is_in_autocommit(ctx);
+            let slot_idx = ctx.savepoints.len();
+            if ctx.btree.transaction_state() == TransactionState::Write {
+                ctx.btree.pager_mut().ensure_subsavepoints(slot_idx + 1)?;
+            }
+            ctx.savepoints.push(SqlSavepoint {
+                name: name.clone(),
+                subsavepoint_depth: slot_idx,
+                is_transaction_savepoint: was_autocommit,
+                schema_at_open: ctx.schema.clone(),
+                schema_gen_at_open: *ctx.schema_generation,
+                deferred_fk_suspects: ctx.deferred_fk_suspects.clone(),
+            });
+            if was_autocommit {
+                *ctx.implicit_savepoint_tx = true;
+                ctx.publish();
+            }
+            Ok(())
+        }
+        Stmt::Release(name) => release_savepoint_op(ctx, name),
+        _ => unreachable!("execute_control_stmt called on non-control statement"),
+    }
+}
+
+/// Executes non-locking pragmas (`LOCK_STATUS`, `JOURNAL_MODE`, `SYNCHRONOUS`, etc.) and `ANALYZE`.
+pub(crate) fn execute_nolock_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Result<QueryOutput> {
+    match stmt {
+        Stmt::Analyze(_) => Ok(QueryOutput::default()),
+        Stmt::Pragma { name, value, .. } => exec_pragma(ctx, name, value.as_ref()),
+        _ => unreachable!("execute_nolock_stmt called on non-nolock statement"),
+    }
+}
+
+/// Executes a `Read` statement body (`SELECT`, `EXPLAIN`, or read `PRAGMA`) inside an already-open
+/// `Read` or `Write` B-tree transaction without ending the transaction.
+pub(crate) fn execute_read_body(
     ctx: &mut ExecContext<'_>,
     stmt: &Stmt,
     params: &[Value],
 ) -> Result<QueryOutput> {
-    if ctx.btree.transaction_state() != TransactionState::Open {
-        ctx.schema.ensure_fresh_in_tx(ctx.btree)?;
-    }
-
     match stmt {
-        Stmt::Explain { query_plan, stmt } => run_read_autocommit(ctx, |ctx| {
+        Stmt::Explain { query_plan, stmt } => {
             if *query_plan {
                 let rows = explain_query_plan(stmt, ctx.schema)?;
                 Ok(QueryOutput {
@@ -246,151 +611,132 @@ pub fn execute_statement(
                     rows: prog.explain_rows(),
                 })
             }
-        }),
-        Stmt::Begin { mode } => {
-            if !is_in_autocommit(ctx) {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    "cannot start a transaction within a transaction",
-                ));
-            }
-            match mode {
-                sqliters_syntax::TransactionMode::Deferred => {}
-                sqliters_syntax::TransactionMode::Immediate => {
-                    ctx.btree.begin_write()?;
-                    if let Err(e) = ctx.schema.ensure_fresh_in_tx(ctx.btree) {
-                        let _ = ctx.btree.rollback();
-                        return Err(e);
-                    }
-                }
-                sqliters_syntax::TransactionMode::Exclusive => {
-                    ctx.btree.begin_exclusive()?;
-                    if let Err(e) = ctx.schema.ensure_fresh_in_tx(ctx.btree) {
-                        let _ = ctx.btree.rollback();
-                        return Err(e);
-                    }
-                }
-            }
-            *ctx.explicit_tx = true;
-            *ctx.implicit_savepoint_tx = false;
-            Ok(QueryOutput::default())
         }
-        Stmt::Commit => {
-            if !*ctx.explicit_tx && !*ctx.implicit_savepoint_tx {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    "cannot commit - no transaction is active",
-                ));
-            }
-            if *ctx.foreign_keys && !ctx.deferred_fk_suspects.is_empty() {
-                verify_fk_suspects(ctx, &ctx.deferred_fk_suspects.clone())?;
-            }
-            ctx.btree.commit()?;
-            *ctx.explicit_tx = false;
-            *ctx.implicit_savepoint_tx = false;
-            ctx.deferred_fk_suspects.clear();
-            Ok(QueryOutput::default())
-        }
-        Stmt::Rollback { savepoint } => {
-            if let Some(sp_name) = savepoint {
-                let trip_res = ctx
-                    .btree
-                    .trip_cursors(sqliters_types::extended::SQLITE_ABORT_ROLLBACK, true);
-                ctx.btree.pager_mut().rollback_to_savepoint(sp_name)?;
-                *ctx.rollback_count += 1;
-                *ctx.schema = Schema::load(ctx.btree)?;
-                trip_res?;
-                Ok(QueryOutput::default())
-            } else {
-                if !*ctx.explicit_tx && !*ctx.implicit_savepoint_tx {
-                    return Err(SqliteError::new(
-                        ErrorCode::Error,
-                        "cannot rollback - no transaction is active",
-                    ));
-                }
-                ctx.btree.rollback()?;
-                *ctx.rollback_count += 1;
-                *ctx.explicit_tx = false;
-                *ctx.implicit_savepoint_tx = false;
-                ctx.deferred_fk_suspects.clear();
-                *ctx.schema = Schema::load(ctx.btree)?;
-                Ok(QueryOutput::default())
-            }
-        }
-        Stmt::Savepoint(name) => {
-            let was_autocommit = !*ctx.explicit_tx && ctx.btree.pager().savepoint_depth() == 0;
-            ctx.btree.pager_mut().savepoint(name)?;
-            if was_autocommit {
-                *ctx.implicit_savepoint_tx = true;
-            }
-            Ok(QueryOutput::default())
-        }
-        Stmt::Release(name) => {
-            if *ctx.implicit_savepoint_tx
-                && ctx.btree.pager().savepoint_depth() == 1
-                && *ctx.foreign_keys
-                && !ctx.deferred_fk_suspects.is_empty()
-            {
-                verify_fk_suspects(ctx, &ctx.deferred_fk_suspects.clone())?;
-            }
-            ctx.btree.pager_mut().release_savepoint(name)?;
-            if *ctx.implicit_savepoint_tx && ctx.btree.pager().savepoint_depth() == 0 {
-                ctx.btree.commit()?;
-                *ctx.implicit_savepoint_tx = false;
-                ctx.deferred_fk_suspects.clear();
-            }
-            Ok(QueryOutput::default())
-        }
-        Stmt::Select(sel) => run_read_autocommit(ctx, |ctx| {
-            exec_select(ctx, sel, params, &[], &CteStore::default())
-        }),
-        Stmt::Insert(ins) => run_write_autocommit(ctx, |ctx| exec_insert(ctx, ins, params)),
-        Stmt::Update(upd) => run_write_autocommit(ctx, |ctx| exec_update(ctx, upd, params)),
-        Stmt::Delete(del) => run_write_autocommit(ctx, |ctx| exec_delete(ctx, del, params)),
-        Stmt::CreateTable(ct) => run_write_autocommit(ctx, |ctx| {
+        Stmt::Select(sel) => exec_select(ctx, sel, params, &[], &CteStore::default()),
+        Stmt::Pragma { name, value, .. } => exec_pragma(ctx, name, value.as_ref()),
+        _ => unreachable!("execute_read_body called on non-read statement"),
+    }
+}
+
+/// Executes a `Write` statement body (`INSERT`, `UPDATE`, `DELETE`, DDL, `REINDEX`, or header-writing `PRAGMA`)
+/// inside an already-open `Write` B-tree transaction without committing or rolling back.
+pub(crate) fn execute_write_body(
+    ctx: &mut ExecContext<'_>,
+    stmt: &Stmt,
+    params: &[Value],
+) -> Result<QueryOutput> {
+    match stmt {
+        Stmt::Insert(ins) => exec_insert(ctx, ins, params),
+        Stmt::Update(upd) => exec_update(ctx, upd, params),
+        Stmt::Delete(del) => exec_delete(ctx, del, params),
+        Stmt::CreateTable(ct) => {
             exec_create_table(ctx, ct)?;
             Ok(QueryOutput::default())
-        }),
+        }
         Stmt::CreateTableAs {
             if_not_exists,
             name,
             query,
-        } => run_write_autocommit(ctx, |ctx| {
+        } => {
             exec_create_table_as(ctx, *if_not_exists, name, query, params)?;
             Ok(QueryOutput::default())
-        }),
-        Stmt::DropTable { if_exists, name } => run_write_autocommit(ctx, |ctx| {
+        }
+        Stmt::DropTable { if_exists, name } => {
             exec_drop_table(ctx, *if_exists, name)?;
             Ok(QueryOutput::default())
-        }),
-        Stmt::CreateIndex(ci) => run_write_autocommit(ctx, |ctx| {
+        }
+        Stmt::CreateIndex(ci) => {
             exec_create_index(ctx, ci)?;
             Ok(QueryOutput::default())
-        }),
-        Stmt::DropIndex { if_exists, name } => run_write_autocommit(ctx, |ctx| {
+        }
+        Stmt::DropIndex { if_exists, name } => {
             exec_drop_index(ctx, *if_exists, name)?;
             Ok(QueryOutput::default())
-        }),
-        Stmt::AlterTable { table, action } => run_write_autocommit(ctx, |ctx| {
+        }
+        Stmt::AlterTable { table, action } => {
             exec_alter_table(ctx, table, action)?;
             Ok(QueryOutput::default())
-        }),
-        Stmt::Pragma {
-            schema: _,
-            name,
-            value,
-        } => exec_pragma(ctx, name, value.as_ref()),
-        Stmt::Vacuum => exec_vacuum(ctx),
-        Stmt::Analyze(_) => Ok(QueryOutput::default()),
-        Stmt::Reindex(target) => run_write_autocommit(ctx, |ctx| {
+        }
+        Stmt::Reindex(target) => {
             exec_reindex(ctx, target.as_deref())?;
             Ok(QueryOutput::default())
-        }),
+        }
+        Stmt::Pragma { name, value, .. } => {
+            let Some(pv) = value.as_ref() else {
+                return Ok(QueryOutput::default());
+            };
+            let v = pragma_to_i64(pv) as i32;
+            match name.to_ascii_uppercase().as_str() {
+                "USER_VERSION" => {
+                    ctx.btree.pager_mut().header_mut()?.user_version = v;
+                    Ok(QueryOutput::default())
+                }
+                "APPLICATION_ID" => {
+                    ctx.btree.pager_mut().header_mut()?.application_id = v;
+                    Ok(QueryOutput::default())
+                }
+                _ => exec_pragma(ctx, name, value.as_ref()),
+            }
+        }
+        _ => unreachable!("execute_write_body called on non-write statement"),
+    }
+}
+
+/// Top-level statement dispatcher for all SQL statements (`SELECT`, DML, DDL, `EXPLAIN`, `PRAGMA`, transactions).
+pub fn execute_statement(
+    ctx: &mut ExecContext<'_>,
+    stmt: &Stmt,
+    params: &[Value],
+) -> Result<QueryOutput> {
+    if stmt_requires_schema(stmt) && ctx.btree.transaction_state() != TransactionState::Open {
+        ctx.schema.ensure_fresh_in_tx(ctx.btree)?;
+    }
+
+    match classify_stmt_category(stmt) {
+        StmtCategory::Control => {
+            execute_control_stmt(ctx, stmt)?;
+            Ok(QueryOutput::default())
+        }
+        StmtCategory::NoLockPragma => execute_nolock_stmt(ctx, stmt),
+        StmtCategory::Vacuum => exec_vacuum(ctx),
+        StmtCategory::Read => {
+            if stmt_requires_schema(stmt) {
+                run_read_autocommit(ctx, |ctx| execute_read_body(ctx, stmt, params))
+            } else {
+                run_header_read_autocommit(ctx, |ctx| execute_read_body(ctx, stmt, params))
+            }
+        }
+        StmtCategory::Write => {
+            run_write_autocommit(ctx, |ctx| execute_write_body(ctx, stmt, params))
+        }
     }
 }
 
 fn is_in_autocommit(ctx: &ExecContext<'_>) -> bool {
     !*ctx.explicit_tx && !*ctx.implicit_savepoint_tx
+}
+
+fn run_header_read_autocommit<F>(ctx: &mut ExecContext<'_>, f: F) -> Result<QueryOutput>
+where
+    F: FnOnce(&mut ExecContext<'_>) -> Result<QueryOutput>,
+{
+    let started = ctx.btree.transaction_state() == TransactionState::Open;
+    if started {
+        ctx.btree.begin_read()?;
+        if !is_in_autocommit(ctx) {
+            *ctx.in_user_btree_tx = true;
+        }
+    }
+    let res = f(ctx);
+    if started
+        && !*ctx.in_user_btree_tx
+        && ctx.activity.other_readers == 0
+        && ctx.activity.other_writers == 0
+        && ctx.btree.transaction_state() == TransactionState::Read
+    {
+        let _ = ctx.btree.pager_mut().end_read_if_unused();
+    }
+    res
 }
 
 fn run_read_autocommit<F>(ctx: &mut ExecContext<'_>, f: F) -> Result<QueryOutput>
@@ -400,13 +746,21 @@ where
     let started = ctx.btree.transaction_state() == TransactionState::Open;
     if started {
         ctx.btree.begin_read()?;
+        if !is_in_autocommit(ctx) {
+            *ctx.in_user_btree_tx = true;
+        }
     }
     let res = ctx
         .schema
         .ensure_fresh_in_tx(ctx.btree)
         .and_then(|()| f(ctx));
-    if started && is_in_autocommit(ctx) && ctx.btree.transaction_state() == TransactionState::Read {
-        let _ = ctx.btree.commit();
+    if started
+        && !*ctx.in_user_btree_tx
+        && ctx.activity.other_readers == 0
+        && ctx.activity.other_writers == 0
+        && ctx.btree.transaction_state() == TransactionState::Read
+    {
+        let _ = ctx.btree.pager_mut().end_read_if_unused();
     }
     res
 }
@@ -416,109 +770,177 @@ where
     F: FnOnce(&mut ExecContext<'_>) -> Result<QueryOutput>,
 {
     let autocommit = is_in_autocommit(ctx);
-    // Use an internal statement savepoint so statement-level ABORT rolls back partial statement writes
-    // while keeping an enclosing explicit transaction alive (exact SQLite statement journal behavior!).
-    let sp_name = "__sqliters_stmt_sp";
-    ctx.btree.begin_write()?;
-    if let Err(e) = ctx.schema.ensure_fresh_in_tx(ctx.btree) {
-        if autocommit {
-            let _ = ctx.btree.rollback();
-        }
-        return Err(e);
+    let need_stmt_sp = !autocommit || ctx.activity.other_writers > 0;
+    let sql_sp_depth = ctx.savepoints.len();
+    let stmt_sp_slot = need_stmt_sp.then_some(sql_sp_depth);
+    let required_depth = sql_sp_depth + usize::from(need_stmt_sp);
+
+    if ctx.btree.transaction_state() == TransactionState::Write {
+        ctx.btree.pager_mut().ensure_subsavepoints(required_depth)?;
+    } else {
+        ctx.btree
+            .pager_mut()
+            .begin_write_with_savepoint_depth(required_depth)?;
     }
     if !autocommit {
-        ctx.btree.pager_mut().savepoint(sp_name)?;
+        *ctx.in_user_btree_tx = true;
+    }
+
+    if let Err(e) = ctx.schema.ensure_fresh_in_tx(ctx.btree) {
+        if let Some(slot) = stmt_sp_slot {
+            let _ = ctx.btree.pager_mut().rollback_to_subsavepoint(slot);
+            let _ = ctx.btree.pager_mut().release_subsavepoint(slot);
+        } else if autocommit && ctx.activity.other_writers == 0 {
+            let retain_read = ctx.activity.other_readers > 0;
+            let _ = ctx.btree.pager_mut().rollback_retaining_read(retain_read);
+        }
+        return Err(e);
     }
 
     let prev_total_changes = ctx.runtime.total_changes;
     let prev_last_rowid = ctx.runtime.last_insert_rowid;
-    let prev_deferred_len = ctx.deferred_fk_suspects.len();
+    let prev_deferred = ctx.deferred_fk_suspects.clone();
+    let prev_schema = ctx.schema.clone();
+    let prev_schema_gen = *ctx.schema_generation;
+    let prev_schema_changed = *ctx.schema_changed_in_tx;
 
-    let step_res = f(ctx).and_then(|out| {
-        if autocommit && *ctx.foreign_keys && !ctx.deferred_fk_suspects.is_empty() {
-            verify_fk_suspects(ctx, &ctx.deferred_fk_suspects.clone())?;
-            ctx.deferred_fk_suspects.clear();
-        }
-        Ok(out)
-    });
+    let step_res = f(ctx);
+    let retain_read = ctx.activity.other_readers > 0;
 
     match step_res {
         Ok(out) => {
-            if autocommit {
-                if let Err(commit_err) = ctx.btree.commit() {
-                    let _ = ctx.btree.rollback();
+            if let Some(slot) = stmt_sp_slot {
+                ctx.btree.pager_mut().release_subsavepoint(slot)?;
+            }
+            if autocommit && ctx.activity.other_writers == 0 {
+                if let Err(fk_err) = check_deferred_fks(ctx) {
+                    let write_only = !*ctx.schema_changed_in_tx;
+                    let _ = ctx.btree.rollback_with_trip(
+                        extended::SQLITE_ABORT_ROLLBACK,
+                        write_only,
+                        retain_read && write_only,
+                    );
+                    *ctx.schema_changed_in_tx = false;
                     ctx.deferred_fk_suspects.clear();
                     ctx.runtime.total_changes = prev_total_changes;
                     ctx.runtime.last_changes = 0;
                     ctx.runtime.last_insert_rowid = prev_last_rowid;
-                    if let Ok(s) = Schema::load(ctx.btree) {
-                        *ctx.schema = s;
+                    if *ctx.schema_generation != prev_schema_gen {
+                        *ctx.schema = prev_schema;
+                        *ctx.schema_generation += 1;
                     }
+                    ctx.publish();
+                    return Err(fk_err);
+                }
+                if let Err(commit_err) = ctx.btree.pager_mut().commit_retaining_read(retain_read) {
+                    let write_only = !*ctx.schema_changed_in_tx;
+                    let _ = ctx.btree.rollback_with_trip(
+                        extended::SQLITE_ABORT_ROLLBACK,
+                        write_only,
+                        retain_read && write_only,
+                    );
+                    *ctx.schema_changed_in_tx = false;
+                    ctx.deferred_fk_suspects.clear();
+                    ctx.runtime.total_changes = prev_total_changes;
+                    ctx.runtime.last_changes = 0;
+                    ctx.runtime.last_insert_rowid = prev_last_rowid;
+                    if *ctx.schema_generation != prev_schema_gen {
+                        *ctx.schema = prev_schema;
+                        *ctx.schema_generation += 1;
+                    }
+                    ctx.publish();
                     return Err(commit_err);
                 }
+                *ctx.schema_changed_in_tx = false;
                 ctx.deferred_fk_suspects.clear();
-            } else {
-                ctx.btree.pager_mut().release_savepoint(sp_name)?;
             }
+            ctx.publish();
             Ok(out)
         }
         Err(err) => {
             if err.conflict_effect == ConflictResolutionEffect::Fail
                 && err.code == ErrorCode::Constraint
             {
-                // SQLite `OR FAIL`: do NOT roll back changes already made by prior rows of this statement,
-                // and do NOT end an enclosing explicit transaction!
-                // Note: if in autocommit and deferred FK violations remain, check them before committing.
-                if autocommit {
-                    if *ctx.foreign_keys
-                        && !ctx.deferred_fk_suspects.is_empty()
-                        && verify_fk_suspects(ctx, &ctx.deferred_fk_suspects.clone()).is_err()
-                    {
-                        let _ = ctx.btree.rollback();
+                if let Some(slot) = stmt_sp_slot {
+                    ctx.btree.pager_mut().release_subsavepoint(slot)?;
+                }
+                if autocommit && ctx.activity.other_writers == 0 {
+                    if check_deferred_fks(ctx).is_err() {
+                        let write_only = !*ctx.schema_changed_in_tx;
+                        let _ = ctx.btree.rollback_with_trip(
+                            extended::SQLITE_ABORT_ROLLBACK,
+                            write_only,
+                            retain_read && write_only,
+                        );
                         *ctx.explicit_tx = false;
                         *ctx.implicit_savepoint_tx = false;
+                        *ctx.in_user_btree_tx = false;
+                        ctx.savepoints.clear();
+                        *ctx.schema_changed_in_tx = false;
                         ctx.deferred_fk_suspects.clear();
                         ctx.runtime.total_changes = prev_total_changes;
                         ctx.runtime.last_changes = 0;
                         ctx.runtime.last_insert_rowid = prev_last_rowid;
-                        *ctx.schema = Schema::load(ctx.btree)?;
+                        if *ctx.schema_generation != prev_schema_gen {
+                            *ctx.schema = prev_schema;
+                            *ctx.schema_generation += 1;
+                        }
+                        ctx.publish();
                         return Err(err);
                     }
-                    ctx.btree.commit()?;
+                    ctx.btree.pager_mut().commit_retaining_read(retain_read)?;
+                    *ctx.schema_changed_in_tx = false;
                     ctx.deferred_fk_suspects.clear();
-                } else {
-                    ctx.btree.pager_mut().release_savepoint(sp_name)?;
                 }
+                ctx.publish();
                 Err(err)
             } else if err.conflict_effect == ConflictResolutionEffect::Rollback
-                || autocommit
+                || (autocommit && ctx.activity.other_writers == 0)
                 || err.code == ErrorCode::Full
             {
-                // SQLite `OR ROLLBACK` (or autocommit abort / SQLITE_FULL): roll back the entire transaction!
-                let _ = ctx.btree.rollback();
+                let write_only = !*ctx.schema_changed_in_tx;
+                let _ = ctx.btree.rollback_with_trip(
+                    extended::SQLITE_ABORT_ROLLBACK,
+                    write_only,
+                    retain_read && write_only,
+                );
                 if !autocommit {
                     *ctx.rollback_count += 1;
                 }
                 *ctx.explicit_tx = false;
                 *ctx.implicit_savepoint_tx = false;
+                *ctx.in_user_btree_tx = false;
+                ctx.savepoints.clear();
+                *ctx.schema_changed_in_tx = false;
                 ctx.deferred_fk_suspects.clear();
                 ctx.runtime.total_changes = prev_total_changes;
                 ctx.runtime.last_changes = 0;
                 ctx.runtime.last_insert_rowid = prev_last_rowid;
-                *ctx.schema = Schema::load(ctx.btree)?;
+                if *ctx.schema_generation != prev_schema_gen {
+                    *ctx.schema = prev_schema;
+                    *ctx.schema_generation += 1;
+                }
+                ctx.publish();
                 Err(err)
             } else {
-                // SQLite `OR ABORT` inside an explicit transaction: roll back statement savepoint only!
+                let stmt_changed_schema = *ctx.schema_generation != prev_schema_gen;
                 let _ = ctx
                     .btree
-                    .trip_cursors(sqliters_types::extended::SQLITE_ABORT_ROLLBACK, true);
-                let _ = ctx.btree.pager_mut().rollback_to_savepoint(sp_name);
-                let _ = ctx.btree.pager_mut().release_savepoint(sp_name);
-                ctx.deferred_fk_suspects.truncate(prev_deferred_len);
+                    .trip_cursors(extended::SQLITE_ABORT_ROLLBACK, !stmt_changed_schema);
+                if let Some(slot) = stmt_sp_slot {
+                    let _ = ctx.btree.pager_mut().rollback_to_subsavepoint(slot);
+                    let _ = ctx.btree.pager_mut().release_subsavepoint(slot);
+                }
+                *ctx.deferred_fk_suspects = prev_deferred;
                 ctx.runtime.total_changes = prev_total_changes;
                 ctx.runtime.last_changes = 0;
                 ctx.runtime.last_insert_rowid = prev_last_rowid;
-                *ctx.schema = Schema::load(ctx.btree)?;
+                if stmt_changed_schema {
+                    *ctx.schema = prev_schema;
+                    *ctx.schema_generation += 1;
+                    *ctx.schema_changed_in_tx = prev_schema_changed;
+                }
+                ctx.publish();
                 Err(err)
             }
         }
@@ -1105,6 +1527,7 @@ fn exec_recursive_cte(
     let mut steps = 0usize;
 
     while let Some((cur_row, _)) = queue.pop_front() {
+        ctx.btree.check_interrupted()?;
         steps += 1;
         if steps > MAX_RECURSIVE_CTE_STEPS {
             return Err(SqliteError::new(
@@ -2322,7 +2745,8 @@ fn read_table_with_plan(
                     return Ok(Vec::new());
                 }
                 let enc = ctx.btree.encoding();
-                let entries = ctx.btree.scan_index(idx.root_pgno)?;
+                let entries =
+                    scan_index_incremental(ctx.btree, idx.root_pgno, idx.key_sort_orders())?;
                 let mut rows = Vec::with_capacity(entries.len());
                 for rec_bytes in entries {
                     let fields = decode_record_with_encoding(&rec_bytes, enc)?;
@@ -2748,6 +3172,7 @@ fn apply_join(
     let mut right_matched = vec![false; right_rows.len()];
 
     for l in &left_rows {
+        ctx.btree.check_interrupted()?;
         let mut any_match = false;
         let mut left_ok = true;
         if !right_rows.is_empty() && !left_only_conjuncts.is_empty() {
@@ -5286,14 +5711,14 @@ fn scan_table_raw_entries(
     tbl: &TableSchema,
 ) -> Result<Vec<(TableRowKey, Vec<u8>)>> {
     if !tbl.without_rowid {
-        let rows = ctx.btree.scan_table(tbl.root_pgno)?;
+        let rows = scan_table_incremental(ctx.btree, tbl.root_pgno)?;
         return Ok(rows
             .into_iter()
             .map(|(rid, p)| (TableRowKey::Rowid(rid), p))
             .collect());
     }
     let enc = ctx.btree.encoding();
-    let entries = ctx.btree.scan_index(tbl.root_pgno)?;
+    let entries = scan_index_incremental(ctx.btree, tbl.root_pgno, tbl.without_rowid_pk_orders())?;
     let n_pk = tbl.without_rowid_pk_cols.len();
     let mut out = Vec::with_capacity(entries.len());
     for rec in entries {
@@ -6122,6 +6547,7 @@ fn validate_and_write_row(
         ctx.runtime.last_changes += 1;
     }
     ctx.runtime.total_changes += 1;
+    ctx.publish();
 
     Ok(Some((final_key, raw_vals)))
 }
@@ -6135,7 +6561,7 @@ fn allocate_table_rowid(ctx: &mut ExecContext<'_>, tbl: &TableSchema) -> Result<
     let mut prev_seq = 0i64;
     if let Some(seq_tbl) = ctx.schema.find_user_table("sqlite_sequence").cloned() {
         let enc = ctx.btree.encoding();
-        let rows = ctx.btree.scan_table(seq_tbl.root_pgno)?;
+        let rows = scan_table_incremental(ctx.btree, seq_tbl.root_pgno)?;
         for (_, payload) in rows {
             let cols = decode_record_with_encoding(&payload, enc)?;
             if cols.len() >= 2 && cols[0].as_str() == Some(tbl.name.as_str()) {
@@ -6155,7 +6581,7 @@ fn update_sqlite_sequence(ctx: &mut ExecContext<'_>, tbl_name: &str, rowid: i64)
         return Ok(());
     };
     let enc = ctx.btree.encoding();
-    let rows = ctx.btree.scan_table(seq_tbl.root_pgno)?;
+    let rows = scan_table_incremental(ctx.btree, seq_tbl.root_pgno)?;
     for (seq_rid, payload) in rows {
         let cols = decode_record_with_encoding(&payload, enc)?;
         if cols.len() >= 2 && cols[0].as_str() == Some(tbl_name) {
@@ -6974,6 +7400,7 @@ fn exec_insert(
     };
 
     ctx.runtime.last_changes = 0;
+    ctx.publish();
 
     let sample_scope =
         make_single_table_scope(&tbl, None, 0, &vec![Value::Null; tbl.columns.len()]);
@@ -7205,6 +7632,7 @@ fn exec_update(
     }
 
     ctx.runtime.last_changes = 0;
+    ctx.publish();
 
     let sample_scope = make_single_table_scope(
         &tbl,
@@ -7311,9 +7739,10 @@ fn exec_delete(
         && del.indexed_by.is_none()
     {
         let count = if tbl.without_rowid {
-            ctx.btree.scan_index(tbl.root_pgno)?.len() as u64
+            scan_index_incremental(ctx.btree, tbl.root_pgno, tbl.without_rowid_pk_orders())?.len()
+                as u64
         } else {
-            ctx.btree.scan_table(tbl.root_pgno)?.len() as u64
+            scan_table_incremental(ctx.btree, tbl.root_pgno)?.len() as u64
         };
         ctx.btree.clear_tree(tbl.root_pgno)?;
         for idx in &indexes {
@@ -7321,6 +7750,7 @@ fn exec_delete(
         }
         ctx.runtime.last_changes = count;
         ctx.runtime.total_changes += count;
+        ctx.publish();
         return Ok(maybe_count_changes_output(ctx, QueryOutput::default()));
     }
 
@@ -7357,6 +7787,7 @@ fn exec_delete(
     }
 
     ctx.runtime.last_changes = 0;
+    ctx.publish();
 
     let sample_scope = make_single_table_scope(
         &tbl,
@@ -7383,6 +7814,7 @@ fn exec_delete(
         if remove_row_and_indexes(ctx, &tbl, &indexes, &rkey, params)? {
             ctx.runtime.last_changes += 1;
             ctx.runtime.total_changes += 1;
+            ctx.publish();
             if *ctx.foreign_keys {
                 apply_parent_delete_fk_actions(
                     ctx,
@@ -7485,6 +7917,8 @@ fn exec_create_table(ctx: &mut ExecContext<'_>, ct: &CreateTableStmt) -> Result<
     }
 
     *ctx.schema = Schema::load(ctx.btree)?;
+    *ctx.schema_generation += 1;
+    *ctx.schema_changed_in_tx = true;
     Ok(())
 }
 
@@ -7613,6 +8047,12 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &str) -> Re
             format!("no such table: {name}"),
         ));
     };
+    if ctx.activity.other_readers > 0 || ctx.btree.has_any_other_open_cursor(None) {
+        return Err(SqliteError::new(
+            ErrorCode::Locked,
+            "database table is locked",
+        ));
+    }
     // Per SQLite `sqlite3FkDropTable`, when `foreign_keys = ON`, delete rows first so FK constraints / actions fire!
     if *ctx.foreign_keys {
         let existing_rows = scan_table_raw_entries(ctx, &tbl)?;
@@ -7653,7 +8093,7 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &str) -> Re
     // Also delete entry from `sqlite_sequence` if present
     if let Some(seq_tbl) = ctx.schema.find_user_table("sqlite_sequence").cloned() {
         let enc = ctx.btree.encoding();
-        let rows = ctx.btree.scan_table(seq_tbl.root_pgno)?;
+        let rows = scan_table_incremental(ctx.btree, seq_tbl.root_pgno)?;
         for (rid, payload) in rows {
             let cols = decode_record_with_encoding(&payload, enc)?;
             if cols.first().and_then(Value::as_str) == Some(tbl.name.as_str()) {
@@ -7663,6 +8103,8 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &str) -> Re
     }
 
     *ctx.schema = Schema::load(ctx.btree)?;
+    *ctx.schema_generation += 1;
+    *ctx.schema_changed_in_tx = true;
     Ok(())
 }
 
@@ -7702,6 +8144,8 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
         Some(&ci.raw_sql),
     )?;
     *ctx.schema = Schema::load(ctx.btree)?;
+    *ctx.schema_generation += 1;
+    *ctx.schema_changed_in_tx = true;
     Ok(())
 }
 
@@ -7799,8 +8243,8 @@ fn exec_reindex(ctx: &mut ExecContext<'_>, target: Option<&str>) -> Result<()> {
     };
 
     for tbl in primary_without_rowid_tables {
-        let entries = ctx.btree.scan_index(tbl.root_pgno)?;
         let pk_orders = tbl.without_rowid_pk_orders();
+        let entries = scan_index_incremental(ctx.btree, tbl.root_pgno, pk_orders.clone())?;
         ctx.btree.clear_tree(tbl.root_pgno)?;
         for rec in entries {
             ctx.btree.insert_index(tbl.root_pgno, &rec, &pk_orders)?;
@@ -7833,9 +8277,17 @@ fn exec_drop_index(ctx: &mut ExecContext<'_>, if_exists: bool, name: &str) -> Re
             "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped",
         ));
     }
+    if ctx.activity.other_readers > 0 || ctx.btree.has_any_other_open_cursor(None) {
+        return Err(SqliteError::new(
+            ErrorCode::Locked,
+            "database table is locked",
+        ));
+    }
     ctx.btree.drop_tree(idx.root_pgno)?;
     delete_schema_entry(ctx.btree, idx.schema_rowid)?;
     *ctx.schema = Schema::load(ctx.btree)?;
+    *ctx.schema_generation += 1;
+    *ctx.schema_changed_in_tx = true;
     Ok(())
 }
 
@@ -7943,7 +8395,7 @@ fn exec_alter_table(
             // Update `sqlite_sequence` entry if present
             if let Some(seq_tbl) = ctx.schema.find_user_table("sqlite_sequence").cloned() {
                 let enc = ctx.btree.encoding();
-                let rows = ctx.btree.scan_table(seq_tbl.root_pgno)?;
+                let rows = scan_table_incremental(ctx.btree, seq_tbl.root_pgno)?;
                 for (rid, payload) in rows {
                     let cols = decode_record_with_encoding(&payload, enc)?;
                     if cols.len() >= 2 && cols[0].as_str() == Some(tbl.name.as_str()) {
@@ -8152,6 +8604,8 @@ fn exec_alter_table(
     }
 
     *ctx.schema = Schema::load(ctx.btree)?;
+    *ctx.schema_generation += 1;
+    *ctx.schema_changed_in_tx = true;
     Ok(())
 }
 
@@ -8890,26 +9344,50 @@ fn append_column_to_create_table_sql(sql: &str, rendered_col: &str) -> Result<St
 // `VACUUM` & `PRAGMA` Execution (`vacuum.c`, `pragma.c`)
 // ============================================================================
 
-fn exec_vacuum(ctx: &mut ExecContext<'_>) -> Result<QueryOutput> {
+pub(crate) enum VacuumFail {
+    Clean(SqliteError),
+    Poison(SqliteError),
+}
+
+pub(crate) fn exec_vacuum(ctx: &mut ExecContext<'_>) -> Result<QueryOutput> {
+    exec_vacuum_checked(ctx).map_err(|vf| match vf {
+        VacuumFail::Clean(e) | VacuumFail::Poison(e) => e,
+    })
+}
+
+pub(crate) fn exec_vacuum_checked(
+    ctx: &mut ExecContext<'_>,
+) -> std::result::Result<QueryOutput, VacuumFail> {
     if !is_in_autocommit(ctx) {
-        return Err(SqliteError::new(
+        return Err(VacuumFail::Clean(SqliteError::new(
             ErrorCode::Error,
             "cannot VACUUM from within a transaction",
-        ));
+        )));
     }
-    ctx.btree.begin_write()?;
+    if ctx.activity.other_active > 0 {
+        return Err(VacuumFail::Clean(SqliteError::new(
+            ErrorCode::Error,
+            "cannot VACUUM - SQL statements in progress",
+        )));
+    }
+    ctx.btree.begin_write().map_err(VacuumFail::Clean)?;
     if let Err(e) = ctx.schema.ensure_fresh_in_tx(ctx.btree) {
-        let _ = ctx.btree.rollback();
-        return Err(e);
+        if let Err(rb_err) = ctx.btree.rollback() {
+            return Err(VacuumFail::Poison(rb_err));
+        }
+        return Err(VacuumFail::Clean(e));
     }
     if ctx.btree.pager().page_count() == 0 {
-        let _ = ctx.btree.rollback();
+        if let Err(rb_err) = ctx.btree.rollback() {
+            return Err(VacuumFail::Poison(rb_err));
+        }
         return Ok(QueryOutput::default());
     }
 
     // Build a fresh compacted in-memory Btree with identical page_size, encoding & header metadata,
-    // copy all tables and rebuild all indexes cleanly, then write pages back!
-    let res = (|| -> Result<()> {
+    // copy all tables and rebuild all indexes cleanly, then write pages back and reload `Schema`
+    // while `TransactionState::Write` is still held!
+    let res = (|| -> Result<Schema> {
         let page_size = ctx.btree.pager().page_size();
         let orig_hdr = ctx.btree.pager().header().clone();
 
@@ -8937,7 +9415,7 @@ fn exec_vacuum(ctx: &mut ExecContext<'_>) -> Result<QueryOutput> {
                     Some(&tbl.raw_sql),
                 )?;
                 let pk_orders = tbl.without_rowid_pk_orders();
-                let entries = ctx.btree.scan_index(tbl.root_pgno)?;
+                let entries = scan_index_incremental(ctx.btree, tbl.root_pgno, pk_orders.clone())?;
                 for rec in entries {
                     fresh.insert_index(new_tbl_root, &rec, &pk_orders)?;
                 }
@@ -8951,7 +9429,7 @@ fn exec_vacuum(ctx: &mut ExecContext<'_>) -> Result<QueryOutput> {
                     new_tbl_root,
                     Some(&tbl.raw_sql),
                 )?;
-                let rows = ctx.btree.scan_table(tbl.root_pgno)?;
+                let rows = scan_table_incremental(ctx.btree, tbl.root_pgno)?;
                 for (rid, payload) in rows {
                     fresh.insert_table(new_tbl_root, rid, &payload)?;
                 }
@@ -8969,7 +9447,7 @@ fn exec_vacuum(ctx: &mut ExecContext<'_>) -> Result<QueryOutput> {
                 idx.raw_sql.as_deref(),
             )?;
             let orders = idx.key_sort_orders();
-            let entries = ctx.btree.scan_index(idx.root_pgno)?;
+            let entries = scan_index_incremental(ctx.btree, idx.root_pgno, orders.clone())?;
             for rec in entries {
                 fresh.insert_index(new_idx_root, &rec, &orders)?;
             }
@@ -8999,18 +9477,31 @@ fn exec_vacuum(ctx: &mut ExecContext<'_>) -> Result<QueryOutput> {
         if cur_total > compacted_count {
             ctx.btree.pager_mut().shrink_page_count(compacted_count)?;
         }
-        Ok(())
+        Schema::load(ctx.btree)
     })();
 
-    if let Err(e) = res {
-        let _ = ctx.btree.rollback();
-        return Err(e);
+    let new_schema = match res {
+        Ok(s) => s,
+        Err(e) => {
+            if let Err(rb_err) = ctx.btree.rollback() {
+                return Err(VacuumFail::Poison(rb_err));
+            }
+            return Err(VacuumFail::Clean(e));
+        }
+    };
+    if let Err(cm_err) = ctx.btree.pager_mut().commit_retaining_read(false) {
+        if let Err(rb_err) = ctx.btree.rollback() {
+            let root = if cm_err.code == ErrorCode::Busy {
+                rb_err
+            } else {
+                cm_err
+            };
+            return Err(VacuumFail::Poison(root));
+        }
+        return Err(VacuumFail::Clean(cm_err));
     }
-    if let Err(e) = ctx.btree.commit() {
-        let _ = ctx.btree.rollback();
-        return Err(e);
-    }
-    *ctx.schema = Schema::load(ctx.btree)?;
+    *ctx.schema = new_schema;
+    *ctx.schema_generation += 1;
     Ok(QueryOutput::default())
 }
 
@@ -9050,19 +9541,17 @@ fn exec_pragma(
                 }
                 Ok(QueryOutput::default())
             } else {
-                Ok(single_col(
-                    "page_size",
-                    Value::Integer(i64::from(ctx.btree.pager().page_size())),
-                ))
+                let ps = ctx.btree.pager_mut().effective_page_size()?;
+                Ok(single_col("page_size", Value::Integer(i64::from(ps))))
             }
         }
-        "PAGE_COUNT" => run_read_autocommit(ctx, |ctx| {
+        "PAGE_COUNT" => run_header_read_autocommit(ctx, |ctx| {
             Ok(single_col(
                 "page_count",
                 Value::Integer(i64::from(ctx.btree.pager().page_count())),
             ))
         }),
-        "FREELIST_COUNT" => run_read_autocommit(ctx, |ctx| {
+        "FREELIST_COUNT" => run_header_read_autocommit(ctx, |ctx| {
             Ok(single_col(
                 "freelist_count",
                 Value::Integer(i64::from(ctx.btree.pager().header().total_freelist_pages)),
@@ -9076,7 +9565,7 @@ fn exec_pragma(
                     Ok(QueryOutput::default())
                 })
             } else {
-                run_read_autocommit(ctx, |ctx| {
+                run_header_read_autocommit(ctx, |ctx| {
                     Ok(single_col(
                         "user_version",
                         Value::Integer(i64::from(ctx.btree.pager().header().user_version)),
@@ -9092,7 +9581,7 @@ fn exec_pragma(
                     Ok(QueryOutput::default())
                 })
             } else {
-                run_read_autocommit(ctx, |ctx| {
+                run_header_read_autocommit(ctx, |ctx| {
                     Ok(single_col(
                         "application_id",
                         Value::Integer(i64::from(ctx.btree.pager().header().application_id)),
@@ -9100,7 +9589,7 @@ fn exec_pragma(
                 })
             }
         }
-        "SCHEMA_VERSION" => run_read_autocommit(ctx, |ctx| {
+        "SCHEMA_VERSION" => run_header_read_autocommit(ctx, |ctx| {
             Ok(single_col(
                 "schema_version",
                 Value::Integer(i64::from(ctx.btree.pager().header().schema_cookie)),
@@ -9116,19 +9605,48 @@ fn exec_pragma(
                 }
                 Ok(QueryOutput::default())
             } else {
+                let enc = ctx.btree.pager_mut().effective_encoding()?;
                 Ok(single_col(
                     "encoding",
-                    Value::Text(ctx.btree.encoding().as_pragma_str().to_owned()),
+                    Value::Text(enc.as_pragma_str().to_owned()),
                 ))
             }
         }
         "JOURNAL_MODE" => {
-            let mode = if ctx.btree.pager().is_in_memory() {
-                "memory"
+            let active = if let Some(pv) = value {
+                let s = pragma_to_string(pv);
+                if let Some(target) = sqliters_pager::JournalMode::from_pragma_str(s.trim()) {
+                    ctx.btree.pager_mut().set_journal_mode(target)?
+                } else {
+                    ctx.btree.pager().journal_mode()
+                }
             } else {
-                "delete"
+                ctx.btree.pager().journal_mode()
             };
-            Ok(single_col("journal_mode", Value::Text(mode.to_owned())))
+            Ok(single_col(
+                "journal_mode",
+                Value::Text(active.as_str().to_owned()),
+            ))
+        }
+        #[cfg(feature = "test-diagnostics")]
+        "LOCK_STATUS" => {
+            let main_status = match ctx.btree.pager().lock_state_for_diagnostics()? {
+                Some(lvl) => lvl.as_diagnostic_str(),
+                None => "unknown",
+            };
+            Ok(QueryOutput {
+                column_names: vec!["database".to_owned(), "status".to_owned()],
+                rows: vec![
+                    vec![
+                        Value::Text("main".to_owned()),
+                        Value::Text(main_status.to_owned()),
+                    ],
+                    vec![
+                        Value::Text("temp".to_owned()),
+                        Value::Text("closed".to_owned()),
+                    ],
+                ],
+            })
         }
         "FOREIGN_KEYS" => {
             if let Some(pv) = value {
@@ -9391,8 +9909,12 @@ fn exec_pragma(
                 return Ok(QueryOutput::default());
             };
             let iname = pragma_to_string(pv);
+            let cols = vec!["seqno".to_owned(), "cid".to_owned(), "name".to_owned()];
             let Some(idx) = ctx.schema.find_index_including_without_rowid_pk(&iname) else {
-                return Ok(QueryOutput::default());
+                return Ok(QueryOutput {
+                    column_names: cols,
+                    rows: Vec::new(),
+                });
             };
             let rows = idx
                 .columns
@@ -9412,7 +9934,7 @@ fn exec_pragma(
                 })
                 .collect();
             Ok(QueryOutput {
-                column_names: vec!["seqno".to_owned(), "cid".to_owned(), "name".to_owned()],
+                column_names: cols,
                 rows,
             })
         }),
@@ -9453,5 +9975,2432 @@ fn pragma_to_string(pv: &PragmaValue) -> String {
     match pv {
         PragmaValue::Integer(i) => i.to_string(),
         PragmaValue::Ident(s) | PragmaValue::String(s) => s.clone(),
+    }
+}
+
+// ============================================================================
+// Prepare-Time Static Semantic Validation & Column Metadata Inference (`prepare.c`)
+// ============================================================================
+
+/// Lease cursor descriptor opened for interpreter `Read` statements so cursor-trip and
+/// `OP_Destroy` table-lock semantics match VDBE cursors.
+#[derive(Debug, Clone)]
+pub(crate) enum LeaseCursorSpec {
+    Table(Pgno),
+    Index(Pgno, Vec<KeySortOrder>),
+}
+
+/// Collects B-tree roots referenced by a `Read` statement (`SELECT` / `PRAGMA`) so interpreter
+/// queries keep open read cursors alive while paused at `StepResult::Row`.
+pub(crate) fn collect_select_referenced_roots(
+    stmt: &Stmt,
+    schema: &Schema,
+) -> Vec<LeaseCursorSpec> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    match stmt {
+        Stmt::Select(sel) => {
+            let mut cte_names = Vec::new();
+            collect_select_roots_rec(sel, schema, &mut cte_names, &mut seen, &mut out);
+        }
+        Stmt::Pragma { name, .. } => {
+            let upper = name.to_ascii_uppercase();
+            if matches!(
+                upper.as_str(),
+                "TABLE_INFO"
+                    | "INDEX_LIST"
+                    | "INDEX_INFO"
+                    | "FOREIGN_KEY_LIST"
+                    | "FOREIGN_KEY_CHECK"
+                    | "INTEGRITY_CHECK"
+                    | "QUICK_CHECK"
+            ) && seen.insert(1)
+            {
+                out.push(LeaseCursorSpec::Table(1));
+            }
+        }
+        _ => {}
+    }
+    if out.is_empty() {
+        out.push(LeaseCursorSpec::Table(1));
+    }
+    out
+}
+
+fn collect_select_roots_rec(
+    sel: &SelectStmt,
+    schema: &Schema,
+    cte_stack: &mut Vec<String>,
+    seen: &mut HashSet<Pgno>,
+    out: &mut Vec<LeaseCursorSpec>,
+) {
+    let base_len = cte_stack.len();
+    for cte in &sel.ctes {
+        cte_stack.push(cte.name.clone());
+        collect_select_roots_rec(&cte.query, schema, cte_stack, seen, out);
+    }
+    collect_core_roots_rec(&sel.body.head, schema, cte_stack, seen, out);
+    for (_, rhs) in &sel.body.compounds {
+        collect_core_roots_rec(rhs, schema, cte_stack, seen, out);
+    }
+    for ob in &sel.order_by {
+        collect_expr_roots_rec(&ob.expr, schema, cte_stack, seen, out);
+    }
+    if let Some(ref lim) = sel.limit {
+        collect_expr_roots_rec(&lim.limit, schema, cte_stack, seen, out);
+        if let Some(ref off) = lim.offset {
+            collect_expr_roots_rec(off, schema, cte_stack, seen, out);
+        }
+    }
+    cte_stack.truncate(base_len);
+}
+
+fn collect_core_roots_rec(
+    core: &SelectCore,
+    schema: &Schema,
+    cte_stack: &mut Vec<String>,
+    seen: &mut HashSet<Pgno>,
+    out: &mut Vec<LeaseCursorSpec>,
+) {
+    match core {
+        SelectCore::Values(rows) => {
+            for r in rows {
+                for e in r {
+                    collect_expr_roots_rec(e, schema, cte_stack, seen, out);
+                }
+            }
+        }
+        SelectCore::Select {
+            projection,
+            from,
+            selection,
+            group_by,
+            having,
+            ..
+        } => {
+            if let Some(fc) = from {
+                collect_tos_roots_rec(&fc.head, schema, cte_stack, seen, out);
+                for j in &fc.joins {
+                    collect_tos_roots_rec(&j.right, schema, cte_stack, seen, out);
+                    if let Some(JoinConstraint::On(ref e)) = j.constraint {
+                        collect_expr_roots_rec(e, schema, cte_stack, seen, out);
+                    }
+                }
+            }
+            for rc in projection {
+                if let ResultColumn::Expr { expr, .. } = rc {
+                    collect_expr_roots_rec(expr, schema, cte_stack, seen, out);
+                }
+            }
+            if let Some(w) = selection {
+                collect_expr_roots_rec(w, schema, cte_stack, seen, out);
+            }
+            for g in group_by {
+                collect_expr_roots_rec(g, schema, cte_stack, seen, out);
+            }
+            if let Some(h) = having {
+                collect_expr_roots_rec(h, schema, cte_stack, seen, out);
+            }
+        }
+    }
+}
+
+fn collect_tos_roots_rec(
+    tos: &TableOrSubquery,
+    schema: &Schema,
+    cte_stack: &mut Vec<String>,
+    seen: &mut HashSet<Pgno>,
+    out: &mut Vec<LeaseCursorSpec>,
+) {
+    match tos {
+        TableOrSubquery::Table { name, .. } => {
+            if cte_stack.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+                return;
+            }
+            if let Some(tbl) = schema.find_table(name)
+                && seen.insert(tbl.root_pgno)
+            {
+                if tbl.without_rowid {
+                    out.push(LeaseCursorSpec::Index(
+                        tbl.root_pgno,
+                        tbl.without_rowid_pk_orders(),
+                    ));
+                } else {
+                    out.push(LeaseCursorSpec::Table(tbl.root_pgno));
+                }
+            }
+        }
+        TableOrSubquery::Subquery { query, .. } => {
+            collect_select_roots_rec(query, schema, cte_stack, seen, out);
+        }
+    }
+}
+
+fn collect_expr_roots_rec(
+    expr: &Expr,
+    schema: &Schema,
+    cte_stack: &mut Vec<String>,
+    seen: &mut HashSet<Pgno>,
+    out: &mut Vec<LeaseCursorSpec>,
+) {
+    match expr {
+        Expr::Unary { expr: e, .. }
+        | Expr::Collate { expr: e, .. }
+        | Expr::IsNull { expr: e, .. }
+        | Expr::Cast { expr: e, .. } => collect_expr_roots_rec(e, schema, cte_stack, seen, out),
+        Expr::RowValue(es) => {
+            for e in es {
+                collect_expr_roots_rec(e, schema, cte_stack, seen, out);
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_expr_roots_rec(left, schema, cte_stack, seen, out);
+            collect_expr_roots_rec(right, schema, cte_stack, seen, out);
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            collect_expr_roots_rec(e, schema, cte_stack, seen, out);
+            collect_expr_roots_rec(low, schema, cte_stack, seen, out);
+            collect_expr_roots_rec(high, schema, cte_stack, seen, out);
+        }
+        Expr::InList { expr: e, list, .. } => {
+            collect_expr_roots_rec(e, schema, cte_stack, seen, out);
+            for x in list {
+                collect_expr_roots_rec(x, schema, cte_stack, seen, out);
+            }
+        }
+        Expr::InSubquery {
+            expr: e, subquery, ..
+        } => {
+            collect_expr_roots_rec(e, schema, cte_stack, seen, out);
+            collect_select_roots_rec(subquery, schema, cte_stack, seen, out);
+        }
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_expr_roots_rec(e, schema, cte_stack, seen, out);
+            collect_expr_roots_rec(pattern, schema, cte_stack, seen, out);
+            if let Some(esc) = escape {
+                collect_expr_roots_rec(esc, schema, cte_stack, seen, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                collect_expr_roots_rec(op, schema, cte_stack, seen, out);
+            }
+            for (w, t) in branches {
+                collect_expr_roots_rec(w, schema, cte_stack, seen, out);
+                collect_expr_roots_rec(t, schema, cte_stack, seen, out);
+            }
+            if let Some(el) = else_expr {
+                collect_expr_roots_rec(el, schema, cte_stack, seen, out);
+            }
+        }
+        Expr::FunctionCall { args, filter, .. } => {
+            if let FunctionArgs::Exprs(es) = args {
+                for e in es {
+                    collect_expr_roots_rec(e, schema, cte_stack, seen, out);
+                }
+            }
+            if let Some(f) = filter {
+                collect_expr_roots_rec(f, schema, cte_stack, seen, out);
+            }
+        }
+        Expr::Subquery(sub) | Expr::Exists { subquery: sub, .. } => {
+            collect_select_roots_rec(sub, schema, cte_stack, seen, out);
+        }
+        _ => {}
+    }
+}
+
+/// Validates semantic bindings (tables, columns, functions, subqueries, DML/DDL widths) with
+/// ZERO side effects and returns the exact result column names for `Connection::prepare`.
+pub(crate) fn validate_and_infer_columns(
+    stmt: &Stmt,
+    schema: &Schema,
+    foreign_keys: bool,
+    count_changes: bool,
+) -> Result<Vec<String>> {
+    match stmt {
+        Stmt::Begin { .. }
+        | Stmt::Commit
+        | Stmt::Rollback { .. }
+        | Stmt::Savepoint(_)
+        | Stmt::Release(_)
+        | Stmt::Vacuum
+        | Stmt::Analyze(_) => Ok(Vec::new()),
+
+        Stmt::Reindex(target) => {
+            if let Some(raw_name) = target {
+                let clean = raw_name
+                    .strip_prefix("main.")
+                    .or_else(|| raw_name.strip_prefix("MAIN."))
+                    .unwrap_or(raw_name);
+                let ok = Collation::from_name(clean).is_some()
+                    || schema.find_user_table(clean).is_some()
+                    || schema.find_index(clean).is_some();
+                if !ok {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "unable to identify the object to be reindexed",
+                    ));
+                }
+            }
+            Ok(Vec::new())
+        }
+
+        Stmt::Pragma { name, value, .. } => Ok(infer_pragma_columns(name, value.as_ref())),
+
+        Stmt::Explain { query_plan, stmt } => {
+            let _ = validate_and_infer_columns(stmt, schema, foreign_keys, count_changes)?;
+            if *query_plan {
+                Ok(vec![
+                    "id".to_owned(),
+                    "parent".to_owned(),
+                    "notused".to_owned(),
+                    "detail".to_owned(),
+                ])
+            } else {
+                Ok(vec![
+                    "addr".to_owned(),
+                    "opcode".to_owned(),
+                    "p1".to_owned(),
+                    "p2".to_owned(),
+                    "p3".to_owned(),
+                    "p4".to_owned(),
+                    "p5".to_owned(),
+                    "comment".to_owned(),
+                ])
+            }
+        }
+
+        Stmt::Select(sel) => {
+            let mut visited = Vec::new();
+            validate_select_stmt_static(sel, &[], schema, &CteStore::default(), &mut visited)
+        }
+
+        Stmt::CreateTable(ct) => {
+            if is_reserved_sqlite_name(&ct.name) {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("object name reserved for internal use: {}", ct.name),
+                ));
+            }
+            if schema.find_user_table(&ct.name).is_some() || schema.find_index(&ct.name).is_some() {
+                if ct.if_not_exists {
+                    return Ok(Vec::new());
+                }
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("table {} already exists", ct.name),
+                ));
+            }
+            let (tbl_preview, _) = build_table_schema_from_ast(ct, 2)?;
+            let tbl_scope = make_static_table_scope(&tbl_preview, None);
+            let mut visited = Vec::new();
+            for col in &tbl_preview.columns {
+                if let Some(ref de) = col.default_expr {
+                    validate_expr_static(
+                        de,
+                        &[],
+                        schema,
+                        &CteStore::default(),
+                        false,
+                        false,
+                        &mut visited,
+                    )?;
+                }
+                if let Some((ref ge, _)) = col.generated {
+                    validate_expr_static(
+                        ge,
+                        std::slice::from_ref(&tbl_scope),
+                        schema,
+                        &CteStore::default(),
+                        false,
+                        false,
+                        &mut visited,
+                    )?;
+                }
+            }
+            for chk in &tbl_preview.checks {
+                validate_expr_static(
+                    &chk.expr,
+                    std::slice::from_ref(&tbl_scope),
+                    schema,
+                    &CteStore::default(),
+                    false,
+                    false,
+                    &mut visited,
+                )?;
+            }
+            Ok(Vec::new())
+        }
+
+        Stmt::CreateTableAs {
+            if_not_exists,
+            name,
+            query,
+        } => {
+            if is_reserved_sqlite_name(name) {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("object name reserved for internal use: {name}"),
+                ));
+            }
+            if schema.find_user_table(name).is_some() || schema.find_index(name).is_some() {
+                if *if_not_exists {
+                    let mut visited = Vec::new();
+                    let _ = validate_select_stmt_static(
+                        query,
+                        &[],
+                        schema,
+                        &CteStore::default(),
+                        &mut visited,
+                    )?;
+                    return Ok(Vec::new());
+                }
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("table {name} already exists"),
+                ));
+            }
+            let mut visited = Vec::new();
+            let _ = validate_select_stmt_static(
+                query,
+                &[],
+                schema,
+                &CteStore::default(),
+                &mut visited,
+            )?;
+            Ok(Vec::new())
+        }
+
+        Stmt::DropTable { if_exists, name } => {
+            if Schema::is_schema_table_name(name) {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("table {name} may not be dropped"),
+                ));
+            }
+            if schema.find_user_table(name).is_none() && !if_exists {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such table: {name}"),
+                ));
+            }
+            Ok(Vec::new())
+        }
+
+        Stmt::CreateIndex(ci) => {
+            if is_reserved_sqlite_name(&ci.name) {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("object name reserved for internal use: {}", ci.name),
+                ));
+            }
+            if schema.find_index(&ci.name).is_some() || schema.find_user_table(&ci.name).is_some() {
+                if ci.if_not_exists {
+                    if schema.find_user_table(&ci.table_name).is_none() {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("no such table: {}", ci.table_name),
+                        ));
+                    }
+                    return Ok(Vec::new());
+                }
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("index {} already exists", ci.name),
+                ));
+            }
+            let Some(tbl) = schema.find_user_table(&ci.table_name) else {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such table: {}", ci.table_name),
+                ));
+            };
+            let idx_preview = build_index_schema_from_ast(ci, tbl, 2)?;
+            let tbl_scope = make_static_table_scope(tbl, None);
+            let mut visited = Vec::new();
+            for ic in &idx_preview.columns {
+                if let Some(ref ie) = ic.expr {
+                    validate_expr_static(
+                        ie,
+                        std::slice::from_ref(&tbl_scope),
+                        schema,
+                        &CteStore::default(),
+                        false,
+                        false,
+                        &mut visited,
+                    )?;
+                }
+            }
+            if let Some(ref wc) = idx_preview.where_clause {
+                validate_expr_static(
+                    wc,
+                    std::slice::from_ref(&tbl_scope),
+                    schema,
+                    &CteStore::default(),
+                    false,
+                    false,
+                    &mut visited,
+                )?;
+            }
+            Ok(Vec::new())
+        }
+
+        Stmt::DropIndex { if_exists, name } => {
+            match schema.find_index_including_without_rowid_pk(name) {
+                None => {
+                    if !if_exists {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("no such index: {name}"),
+                        ));
+                    }
+                }
+                Some(idx) => {
+                    if idx.is_autoindex {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped",
+                        ));
+                    }
+                }
+            }
+            Ok(Vec::new())
+        }
+
+        Stmt::AlterTable { table, action } => {
+            let Some(tbl) = schema.find_user_table(table) else {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such table: {table}"),
+                ));
+            };
+            match action {
+                AlterTableAction::RenameTo(new_name) => {
+                    if is_reserved_sqlite_name(new_name) {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("object name reserved for internal use: {new_name}"),
+                        ));
+                    }
+                    if schema.find_user_table(new_name).is_some()
+                        || schema.find_index(new_name).is_some()
+                    {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!(
+                                "there is already another table or index with this name: {new_name}"
+                            ),
+                        ));
+                    }
+                }
+                AlterTableAction::RenameColumn { old_name, new_name } => {
+                    if tbl.find_column(old_name).is_none() {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("no such column: \"{old_name}\""),
+                        ));
+                    }
+                    if !old_name.eq_ignore_ascii_case(new_name)
+                        && tbl.find_column(new_name).is_some()
+                    {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("duplicate column name: {new_name}"),
+                        ));
+                    }
+                }
+                AlterTableAction::AddColumn(cdef) => {
+                    if tbl.find_column(&cdef.name).is_some() {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("duplicate column name: {}", cdef.name),
+                        ));
+                    }
+                    let validated = build_column_schema_from_def(&tbl.name, tbl.strict, cdef)?;
+                    if validated
+                        .generated
+                        .as_ref()
+                        .is_some_and(|(_, stored)| *stored)
+                    {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            "cannot add a STORED column",
+                        ));
+                    }
+                    let has_fk = cdef
+                        .constraints
+                        .iter()
+                        .any(|c| matches!(c, sqliters_syntax::ColumnConstraint::ForeignKey { .. }));
+                    if has_fk
+                        && foreign_keys
+                        && validated
+                            .default_expr
+                            .as_ref()
+                            .is_some_and(|e| !matches!(e, Expr::Null))
+                    {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            "Cannot add a REFERENCES column with non-NULL default value",
+                        ));
+                    }
+                }
+            }
+            Ok(Vec::new())
+        }
+
+        Stmt::Insert(ins) => validate_insert_static(ins, schema, count_changes),
+        Stmt::Update(upd) => validate_update_static(upd, schema, count_changes),
+        Stmt::Delete(del) => validate_delete_static(del, schema, count_changes),
+    }
+}
+
+fn infer_pragma_columns(name: &str, value: Option<&PragmaValue>) -> Vec<String> {
+    match name.to_ascii_uppercase().as_str() {
+        "INTEGRITY_CHECK" | "QUICK_CHECK" => vec!["integrity_check".to_owned()],
+        "PAGE_SIZE" => {
+            if value.is_some() {
+                Vec::new()
+            } else {
+                vec!["page_size".to_owned()]
+            }
+        }
+        "PAGE_COUNT" => vec!["page_count".to_owned()],
+        "FREELIST_COUNT" => vec!["freelist_count".to_owned()],
+        "USER_VERSION" => {
+            if value.is_some() {
+                Vec::new()
+            } else {
+                vec!["user_version".to_owned()]
+            }
+        }
+        "APPLICATION_ID" => {
+            if value.is_some() {
+                Vec::new()
+            } else {
+                vec!["application_id".to_owned()]
+            }
+        }
+        "SCHEMA_VERSION" => vec!["schema_version".to_owned()],
+        "ENCODING" => {
+            if value.is_some() {
+                Vec::new()
+            } else {
+                vec!["encoding".to_owned()]
+            }
+        }
+        "JOURNAL_MODE" => vec!["journal_mode".to_owned()],
+        #[cfg(feature = "test-diagnostics")]
+        "LOCK_STATUS" => vec!["database".to_owned(), "status".to_owned()],
+        "FOREIGN_KEYS" => {
+            if value.is_some() {
+                Vec::new()
+            } else {
+                vec!["foreign_keys".to_owned()]
+            }
+        }
+        "FOREIGN_KEY_LIST" => {
+            if value.is_none() {
+                Vec::new()
+            } else {
+                vec![
+                    "id".to_owned(),
+                    "seq".to_owned(),
+                    "table".to_owned(),
+                    "from".to_owned(),
+                    "to".to_owned(),
+                    "on_update".to_owned(),
+                    "on_delete".to_owned(),
+                    "match".to_owned(),
+                ]
+            }
+        }
+        "FOREIGN_KEY_CHECK" => vec![
+            "table".to_owned(),
+            "rowid".to_owned(),
+            "parent".to_owned(),
+            "fkid".to_owned(),
+        ],
+        "SYNCHRONOUS" => {
+            if value.is_some() {
+                Vec::new()
+            } else {
+                vec!["synchronous".to_owned()]
+            }
+        }
+        "CACHE_SIZE" => {
+            if value.is_some() {
+                Vec::new()
+            } else {
+                vec!["cache_size".to_owned()]
+            }
+        }
+        "DATABASE_LIST" => vec!["seq".to_owned(), "name".to_owned(), "file".to_owned()],
+        "TABLE_INFO" => {
+            if value.is_none() {
+                Vec::new()
+            } else {
+                vec![
+                    "cid".to_owned(),
+                    "name".to_owned(),
+                    "type".to_owned(),
+                    "notnull".to_owned(),
+                    "dflt_value".to_owned(),
+                    "pk".to_owned(),
+                ]
+            }
+        }
+        "INDEX_LIST" => {
+            if value.is_none() {
+                Vec::new()
+            } else {
+                vec![
+                    "seq".to_owned(),
+                    "name".to_owned(),
+                    "unique".to_owned(),
+                    "origin".to_owned(),
+                    "partial".to_owned(),
+                ]
+            }
+        }
+        "COUNT_CHANGES" => {
+            if value.is_some() {
+                Vec::new()
+            } else {
+                vec!["count_changes".to_owned()]
+            }
+        }
+        "INDEX_INFO" => {
+            if value.is_none() {
+                Vec::new()
+            } else {
+                vec!["seqno".to_owned(), "cid".to_owned(), "name".to_owned()]
+            }
+        }
+        "COMPILE_OPTIONS" => vec!["compile_options".to_owned()],
+        _ => Vec::new(),
+    }
+}
+
+fn make_static_table_scope(tbl: &TableSchema, alias: Option<&str>) -> EvalRow {
+    make_single_table_scope(tbl, alias, 0, &vec![Value::Null; tbl.columns.len()])
+}
+
+fn validate_index_hint_static(
+    schema: &Schema,
+    tbl: &TableSchema,
+    indexed_by: Option<&IndexHint>,
+    where_hint: Option<&Expr>,
+) -> Result<()> {
+    if let Some(IndexHint::IndexedBy(idx_name)) = indexed_by {
+        let Some(idx) = schema
+            .indexes_for_table(&tbl.name)
+            .into_iter()
+            .find(|i| !i.is_autoindex && i.name.eq_ignore_ascii_case(idx_name))
+        else {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such index: {idx_name}"),
+            ));
+        };
+        if let Some(ref pw) = idx.where_clause {
+            let usable = where_hint.is_some_and(|wh| expr_contains_conjunct(wh, pw));
+            if !usable {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("cannot use index: {idx_name}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_cte_scope_static(ctes_list: &[CommonTableExpr]) -> Result<()> {
+    let mut seen: Vec<&str> = Vec::with_capacity(ctes_list.len());
+    for cte in ctes_list {
+        if seen.iter().any(|s| s.eq_ignore_ascii_case(&cte.name)) {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("duplicate WITH table name: {}", cte.name),
+            ));
+        }
+        seen.push(&cte.name);
+        if let Some(ref cols) = cte.columns {
+            let mut cseen: Vec<&str> = Vec::with_capacity(cols.len());
+            for cn in cols {
+                if cseen.iter().any(|x| x.eq_ignore_ascii_case(cn)) {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("duplicate column name: {cn}"),
+                    ));
+                }
+                cseen.push(cn);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_insert_static(
+    ins: &InsertStmt,
+    schema: &Schema,
+    count_changes: bool,
+) -> Result<Vec<String>> {
+    validate_cte_scope_static(&ins.ctes)?;
+    if Schema::is_schema_table_name(&ins.table) {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("table {} may not be modified", ins.table),
+        ));
+    }
+    let Some(tbl) = schema.find_table(&ins.table) else {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("no such table: {}", ins.table),
+        ));
+    };
+    let dml_ctes = CteStore::default().with_scope(&ins.ctes);
+    let mut visited = Vec::new();
+
+    let expected_width = if let Some(ref cnames) = ins.columns {
+        for cn in cnames {
+            if let Some((_, col)) = tbl.find_column(cn) {
+                if col.generated.is_some() {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("cannot INSERT into generated column \"{}\"", col.name),
+                    ));
+                }
+            } else if !tbl.is_implicit_rowid_name(cn) {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("table {} has no column named {cn}", tbl.name),
+                ));
+            }
+        }
+        cnames.len()
+    } else {
+        tbl.columns.iter().filter(|c| c.generated.is_none()).count()
+    };
+
+    match &ins.source {
+        InsertSource::DefaultValues => {}
+        InsertSource::Values(expr_rows) => {
+            for erow in expr_rows {
+                if erow.len() != expected_width {
+                    if ins.columns.is_some() {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("{} values for {} columns", erow.len(), expected_width),
+                        ));
+                    }
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!(
+                            "table {} has {} columns but {} values were supplied",
+                            tbl.name,
+                            expected_width,
+                            erow.len()
+                        ),
+                    ));
+                }
+                for e in erow {
+                    validate_expr_static(e, &[], schema, &dml_ctes, false, false, &mut visited)?;
+                }
+            }
+        }
+        InsertSource::Select(sel) => {
+            let sel_cols = validate_select_stmt_static(sel, &[], schema, &dml_ctes, &mut visited)?;
+            if sel_cols.len() != expected_width {
+                if ins.columns.is_some() {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("{} values for {} columns", sel_cols.len(), expected_width),
+                    ));
+                }
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!(
+                        "table {} has {} columns but {} values were supplied",
+                        tbl.name,
+                        expected_width,
+                        sel_cols.len()
+                    ),
+                ));
+            }
+        }
+    }
+
+    if !ins.returning.is_empty() {
+        let sample_scope = make_static_table_scope(&tbl, None);
+        let (ret_cols, ret_expanded) = expand_projection(&ins.returning, &sample_scope.cols)?;
+        for (pe, _, _) in &ret_expanded {
+            validate_expr_static(
+                pe,
+                std::slice::from_ref(&sample_scope),
+                schema,
+                &dml_ctes,
+                false,
+                false,
+                &mut visited,
+            )?;
+        }
+        return Ok(ret_cols);
+    }
+
+    if count_changes {
+        Ok(vec!["count".to_owned()])
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+fn validate_update_static(
+    upd: &UpdateStmt,
+    schema: &Schema,
+    count_changes: bool,
+) -> Result<Vec<String>> {
+    validate_cte_scope_static(&upd.ctes)?;
+    if Schema::is_schema_table_name(&upd.table) {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("table {} may not be modified", upd.table),
+        ));
+    }
+    let Some(tbl) = schema.find_table(&upd.table) else {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("no such table: {}", upd.table),
+        ));
+    };
+    validate_index_hint_static(
+        schema,
+        &tbl,
+        upd.indexed_by.as_ref(),
+        upd.selection.as_ref(),
+    )?;
+    let dml_ctes = CteStore::default().with_scope(&upd.ctes);
+    let scope = make_static_table_scope(&tbl, upd.alias.as_deref());
+    let mut visited = Vec::new();
+
+    for (cname, expr) in &upd.assignments {
+        if let Some((_, col)) = tbl.find_column(cname) {
+            if col.generated.is_some() {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("cannot UPDATE generated column \"{}\"", col.name),
+                ));
+            }
+        } else if !tbl.is_implicit_rowid_name(cname) {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such column: {cname}"),
+            ));
+        }
+        validate_expr_static(
+            expr,
+            std::slice::from_ref(&scope),
+            schema,
+            &dml_ctes,
+            false,
+            false,
+            &mut visited,
+        )?;
+    }
+
+    if let Some(ref w) = upd.selection {
+        validate_expr_static(
+            w,
+            std::slice::from_ref(&scope),
+            schema,
+            &dml_ctes,
+            false,
+            false,
+            &mut visited,
+        )?;
+    }
+
+    if !upd.returning.is_empty() {
+        let ret_scope = make_static_table_scope(&tbl, upd.alias.as_deref());
+        let (ret_cols, ret_expanded) = expand_projection(&upd.returning, &ret_scope.cols)?;
+        for (pe, _, _) in &ret_expanded {
+            validate_expr_static(
+                pe,
+                std::slice::from_ref(&ret_scope),
+                schema,
+                &dml_ctes,
+                false,
+                false,
+                &mut visited,
+            )?;
+        }
+        return Ok(ret_cols);
+    }
+
+    if count_changes {
+        Ok(vec!["count".to_owned()])
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+fn validate_delete_static(
+    del: &DeleteStmt,
+    schema: &Schema,
+    count_changes: bool,
+) -> Result<Vec<String>> {
+    validate_cte_scope_static(&del.ctes)?;
+    if Schema::is_schema_table_name(&del.table) {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("table {} may not be modified", del.table),
+        ));
+    }
+    let Some(tbl) = schema.find_table(&del.table) else {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("no such table: {}", del.table),
+        ));
+    };
+    validate_index_hint_static(
+        schema,
+        &tbl,
+        del.indexed_by.as_ref(),
+        del.selection.as_ref(),
+    )?;
+    let dml_ctes = CteStore::default().with_scope(&del.ctes);
+    let scope = make_static_table_scope(&tbl, del.alias.as_deref());
+    let mut visited = Vec::new();
+
+    if let Some(ref w) = del.selection {
+        validate_expr_static(
+            w,
+            std::slice::from_ref(&scope),
+            schema,
+            &dml_ctes,
+            false,
+            false,
+            &mut visited,
+        )?;
+    }
+
+    if !del.returning.is_empty() {
+        let ret_scope = make_static_table_scope(&tbl, del.alias.as_deref());
+        let (ret_cols, ret_expanded) = expand_projection(&del.returning, &ret_scope.cols)?;
+        for (pe, _, _) in &ret_expanded {
+            validate_expr_static(
+                pe,
+                std::slice::from_ref(&ret_scope),
+                schema,
+                &dml_ctes,
+                false,
+                false,
+                &mut visited,
+            )?;
+        }
+        return Ok(ret_cols);
+    }
+
+    if count_changes {
+        Ok(vec!["count".to_owned()])
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+fn validate_select_stmt_static(
+    stmt: &SelectStmt,
+    outer_scopes: &[EvalRow],
+    schema: &Schema,
+    parent_ctes: &CteStore,
+    visited_ctes: &mut Vec<(usize, usize)>,
+) -> Result<Vec<String>> {
+    validate_cte_scope_static(&stmt.ctes)?;
+    let ctes = parent_ctes.with_scope(&stmt.ctes);
+
+    if let Some(ref lim) = stmt.limit {
+        validate_expr_static(
+            &lim.limit,
+            outer_scopes,
+            schema,
+            &ctes,
+            false,
+            false,
+            visited_ctes,
+        )?;
+        if let Some(ref off) = lim.offset {
+            validate_expr_static(off, outer_scopes, schema, &ctes, false, false, visited_ctes)?;
+        }
+    }
+
+    if stmt.body.compounds.is_empty() {
+        validate_single_select_core_static(
+            &stmt.body.head,
+            &stmt.order_by,
+            outer_scopes,
+            schema,
+            &ctes,
+            visited_ctes,
+        )
+    } else {
+        let head_cols = validate_single_select_core_static(
+            &stmt.body.head,
+            &[],
+            outer_scopes,
+            schema,
+            &ctes,
+            visited_ctes,
+        )?;
+        let mut all_arm_cols = vec![head_cols.clone()];
+        for (op, rhs_core) in &stmt.body.compounds {
+            let rhs_cols = validate_single_select_core_static(
+                rhs_core,
+                &[],
+                outer_scopes,
+                schema,
+                &ctes,
+                visited_ctes,
+            )?;
+            if rhs_cols.len() != head_cols.len() {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!(
+                        "SELECTs to the left and right of {} do not have the same number of result columns",
+                        op.as_sql_str()
+                    ),
+                ));
+            }
+            all_arm_cols.push(rhs_cols);
+        }
+
+        let width = head_cols.len();
+        for (ob_idx, ob) in stmt.order_by.iter().enumerate() {
+            let mut inner = &ob.expr;
+            while let Expr::Collate { expr, .. } = inner {
+                inner = expr.as_ref();
+            }
+            if let Some(ord) = strip_collate_and_unary_plus(inner) {
+                if ord < 1 || (ord as usize) > width {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!(
+                            "{} ORDER BY term out of range - should be between 1 and {}",
+                            ordinal_suffix(ob_idx + 1),
+                            width
+                        ),
+                    ));
+                }
+                continue;
+            }
+            let target_label = match inner {
+                Expr::Column {
+                    table: None,
+                    column,
+                } => column.clone(),
+                other => expr_column_label(other),
+            };
+            let matched = all_arm_cols
+                .iter()
+                .any(|arm| arm.iter().any(|cn| cn.eq_ignore_ascii_case(&target_label)));
+            if !matched {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!(
+                        "{} ORDER BY term does not match any column in the result set",
+                        ordinal_suffix(ob_idx + 1)
+                    ),
+                ));
+            }
+        }
+        Ok(head_cols)
+    }
+}
+
+fn validate_single_select_core_static(
+    core: &SelectCore,
+    order_by: &[OrderByTerm],
+    outer_scopes: &[EvalRow],
+    schema: &Schema,
+    ctes: &CteStore,
+    visited_ctes: &mut Vec<(usize, usize)>,
+) -> Result<Vec<String>> {
+    match core {
+        SelectCore::Values(expr_rows) => {
+            let Some(first) = expr_rows.first() else {
+                return Ok(Vec::new());
+            };
+            let width = first.len();
+            for erow in expr_rows {
+                if erow.len() != width {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "all VALUES must have the same number of terms",
+                    ));
+                }
+                for e in erow {
+                    validate_expr_static(
+                        e,
+                        outer_scopes,
+                        schema,
+                        ctes,
+                        false,
+                        false,
+                        visited_ctes,
+                    )?;
+                }
+            }
+            let col_names: Vec<String> = (1..=width).map(|i| format!("column{i}")).collect();
+            if !order_by.is_empty() {
+                for (ob_idx, ob) in order_by.iter().enumerate() {
+                    let mut inner = &ob.expr;
+                    while let Expr::Collate { expr, .. } = inner {
+                        inner = expr.as_ref();
+                    }
+                    if let Some(ord) = strip_collate_and_unary_plus(inner) {
+                        if ord < 1 || (ord as usize) > width {
+                            return Err(SqliteError::new(
+                                ErrorCode::Error,
+                                format!(
+                                    "{} ORDER BY term out of range - should be between 1 and {}",
+                                    ordinal_suffix(ob_idx + 1),
+                                    width
+                                ),
+                            ));
+                        }
+                        continue;
+                    }
+                    let target_label = match inner {
+                        Expr::Column {
+                            table: None,
+                            column,
+                        } => column.clone(),
+                        other => expr_column_label(other),
+                    };
+                    if !col_names
+                        .iter()
+                        .any(|cn| cn.eq_ignore_ascii_case(&target_label))
+                    {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!(
+                                "{} ORDER BY term does not match any column in the result set",
+                                ordinal_suffix(ob_idx + 1)
+                            ),
+                        ));
+                    }
+                }
+            }
+            Ok(col_names)
+        }
+        SelectCore::Select {
+            projection,
+            from,
+            selection,
+            group_by,
+            having,
+            ..
+        } => {
+            let sample_cols = match from {
+                None => Vec::new(),
+                Some(fc) => validate_from_clause_static(
+                    fc,
+                    selection.as_ref(),
+                    outer_scopes,
+                    schema,
+                    ctes,
+                    visited_ctes,
+                )?,
+            };
+
+            let (col_names, expanded_proj) = expand_projection(projection, &sample_cols)?;
+            let row_eval = EvalRow {
+                cols: Rc::from(sample_cols.as_slice()),
+                vals: vec![Value::Null; sample_cols.len()],
+            };
+            let full_scopes = push_scope(outer_scopes, &row_eval);
+
+            if let Some(where_expr) = selection {
+                validate_expr_static(
+                    where_expr,
+                    &full_scopes,
+                    schema,
+                    ctes,
+                    false,
+                    false,
+                    visited_ctes,
+                )?;
+            }
+
+            let is_agg = !group_by.is_empty()
+                || having.is_some()
+                || projection.iter().any(|rc| match rc {
+                    ResultColumn::Expr { expr, .. } => expr_contains_aggregate(expr),
+                    _ => false,
+                })
+                || order_by.iter().any(|ob| expr_contains_aggregate(&ob.expr));
+
+            for (pe, _, _) in &expanded_proj {
+                validate_expr_static(pe, &full_scopes, schema, ctes, is_agg, false, visited_ctes)?;
+            }
+
+            for (gi, ge) in group_by.iter().enumerate() {
+                if let Some(ord) = strip_collate_and_unary_plus(ge) {
+                    if ord < 1 || (ord as usize) > expanded_proj.len() {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!(
+                                "{} GROUP BY term out of range - should be between 1 and {}",
+                                ordinal_suffix(gi + 1),
+                                expanded_proj.len()
+                            ),
+                        ));
+                    }
+                } else {
+                    let subst = subst_select_aliases_in_expr(
+                        ge,
+                        &expanded_proj,
+                        &sample_cols,
+                        outer_scopes,
+                    );
+                    validate_expr_static(
+                        &subst,
+                        &full_scopes,
+                        schema,
+                        ctes,
+                        false,
+                        false,
+                        visited_ctes,
+                    )?;
+                }
+            }
+
+            if let Some(hav) = having {
+                let subst =
+                    subst_select_aliases_in_expr(hav, &expanded_proj, &sample_cols, outer_scopes);
+                validate_expr_static(
+                    &subst,
+                    &full_scopes,
+                    schema,
+                    ctes,
+                    true,
+                    false,
+                    visited_ctes,
+                )?;
+            }
+
+            for (oi, ob) in order_by.iter().enumerate() {
+                if let Some(ord) = strip_collate_and_unary_plus(&ob.expr) {
+                    if ord < 1 || (ord as usize) > expanded_proj.len() {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!(
+                                "{} ORDER BY term out of range - should be between 1 and {}",
+                                ordinal_suffix(oi + 1),
+                                expanded_proj.len()
+                            ),
+                        ));
+                    }
+                } else {
+                    let subst = subst_order_by_aliases_static(
+                        &ob.expr,
+                        &expanded_proj,
+                        &sample_cols,
+                        outer_scopes,
+                    );
+                    validate_expr_static(
+                        &subst,
+                        &full_scopes,
+                        schema,
+                        ctes,
+                        is_agg,
+                        false,
+                        visited_ctes,
+                    )?;
+                }
+            }
+
+            Ok(col_names)
+        }
+    }
+}
+
+fn subst_order_by_aliases_static(
+    expr: &Expr,
+    expanded_proj: &[(Expr, String, Option<String>)],
+    sample_cols: &[ScopedColumn],
+    outer_scopes: &[EvalRow],
+) -> Expr {
+    match expr {
+        Expr::Column {
+            table: None,
+            column,
+        } => {
+            let in_sample = sample_cols.iter().any(|sc| {
+                if sc.hidden_rowid {
+                    column.eq_ignore_ascii_case("rowid")
+                        || column.eq_ignore_ascii_case("_rowid_")
+                        || column.eq_ignore_ascii_case("oid")
+                } else {
+                    sc.name.eq_ignore_ascii_case(column)
+                }
+            });
+            let in_outer = outer_scopes
+                .iter()
+                .rev()
+                .any(|s| s.lookup(None, column).ok().flatten().is_some());
+            if !in_sample
+                && !in_outer
+                && expanded_proj.iter().any(|(_, label, al)| {
+                    al.as_ref().is_some_and(|a| a.eq_ignore_ascii_case(column))
+                        || label.eq_ignore_ascii_case(column)
+                })
+            {
+                return Expr::Null;
+            }
+            expr.clone()
+        }
+        Expr::Unary { op, expr: inner } => Expr::Unary {
+            op: *op,
+            expr: Box::new(subst_order_by_aliases_static(
+                inner,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+        },
+        Expr::Collate {
+            expr: inner,
+            collation,
+        } => Expr::Collate {
+            expr: Box::new(subst_order_by_aliases_static(
+                inner,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            collation: collation.clone(),
+        },
+        Expr::Cast {
+            expr: inner,
+            type_name,
+        } => Expr::Cast {
+            expr: Box::new(subst_order_by_aliases_static(
+                inner,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            type_name: type_name.clone(),
+        },
+        Expr::IsNull {
+            expr: inner,
+            negated,
+        } => Expr::IsNull {
+            expr: Box::new(subst_order_by_aliases_static(
+                inner,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            negated: *negated,
+        },
+        Expr::Binary { left, op, right } => Expr::Binary {
+            left: Box::new(subst_order_by_aliases_static(
+                left,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            op: *op,
+            right: Box::new(subst_order_by_aliases_static(
+                right,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+        },
+        Expr::Between {
+            expr: val,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: Box::new(subst_order_by_aliases_static(
+                val,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            low: Box::new(subst_order_by_aliases_static(
+                low,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            high: Box::new(subst_order_by_aliases_static(
+                high,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            negated: *negated,
+        },
+        Expr::InList {
+            expr: val,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(subst_order_by_aliases_static(
+                val,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            list: list
+                .iter()
+                .map(|e| subst_order_by_aliases_static(e, expanded_proj, sample_cols, outer_scopes))
+                .collect(),
+            negated: *negated,
+        },
+        Expr::Like {
+            expr: val,
+            pattern,
+            escape,
+            op,
+            negated,
+        } => Expr::Like {
+            expr: Box::new(subst_order_by_aliases_static(
+                val,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            pattern: Box::new(subst_order_by_aliases_static(
+                pattern,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            escape: escape.as_ref().map(|e| {
+                Box::new(subst_order_by_aliases_static(
+                    e,
+                    expanded_proj,
+                    sample_cols,
+                    outer_scopes,
+                ))
+            }),
+            op: *op,
+            negated: *negated,
+        },
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => Expr::Case {
+            operand: operand.as_ref().map(|e| {
+                Box::new(subst_order_by_aliases_static(
+                    e,
+                    expanded_proj,
+                    sample_cols,
+                    outer_scopes,
+                ))
+            }),
+            branches: branches
+                .iter()
+                .map(|(w, t)| {
+                    (
+                        subst_order_by_aliases_static(w, expanded_proj, sample_cols, outer_scopes),
+                        subst_order_by_aliases_static(t, expanded_proj, sample_cols, outer_scopes),
+                    )
+                })
+                .collect(),
+            else_expr: else_expr.as_ref().map(|e| {
+                Box::new(subst_order_by_aliases_static(
+                    e,
+                    expanded_proj,
+                    sample_cols,
+                    outer_scopes,
+                ))
+            }),
+        },
+        Expr::FunctionCall {
+            name,
+            distinct,
+            args,
+            filter,
+        } => Expr::FunctionCall {
+            name: name.clone(),
+            distinct: *distinct,
+            args: match args {
+                FunctionArgs::Star => FunctionArgs::Star,
+                FunctionArgs::Exprs(es) => FunctionArgs::Exprs(
+                    es.iter()
+                        .map(|e| {
+                            subst_order_by_aliases_static(
+                                e,
+                                expanded_proj,
+                                sample_cols,
+                                outer_scopes,
+                            )
+                        })
+                        .collect(),
+                ),
+            },
+            filter: filter.as_ref().map(|e| {
+                Box::new(subst_order_by_aliases_static(
+                    e,
+                    expanded_proj,
+                    sample_cols,
+                    outer_scopes,
+                ))
+            }),
+        },
+        Expr::RowValue(elems) => Expr::RowValue(
+            elems
+                .iter()
+                .map(|e| subst_order_by_aliases_static(e, expanded_proj, sample_cols, outer_scopes))
+                .collect(),
+        ),
+        _ => expr.clone(),
+    }
+}
+
+fn validate_from_clause_static(
+    fc: &FromClause,
+    where_hint: Option<&Expr>,
+    outer_scopes: &[EvalRow],
+    schema: &Schema,
+    ctes: &CteStore,
+    visited_ctes: &mut Vec<(usize, usize)>,
+) -> Result<Vec<ScopedColumn>> {
+    let head_hint = if fc.joins.is_empty() {
+        where_hint
+    } else {
+        None
+    };
+    let mut cur_cols = validate_tos_static(
+        &fc.head,
+        head_hint,
+        outer_scopes,
+        schema,
+        ctes,
+        visited_ctes,
+    )?;
+
+    for join in &fc.joins {
+        let right_cols =
+            validate_tos_static(&join.right, None, outer_scopes, schema, ctes, visited_ctes)?;
+
+        if join.natural && join.constraint.is_some() {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                "a NATURAL join may not have an ON or USING clause",
+            ));
+        }
+
+        if let Some(JoinConstraint::Using(ref ucols)) = join.constraint {
+            for u in ucols {
+                let in_left = cur_cols
+                    .iter()
+                    .any(|c| !c.hidden_rowid && c.name.eq_ignore_ascii_case(u));
+                let in_right = right_cols
+                    .iter()
+                    .any(|c| !c.hidden_rowid && c.name.eq_ignore_ascii_case(u));
+                if !in_left || !in_right {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("cannot join using column {u} - column not present in both tables"),
+                    ));
+                }
+            }
+        }
+
+        let merged_cols = merge_join_scoped_columns(&cur_cols, &right_cols, join);
+        if let Some(JoinConstraint::On(ref on_expr)) = join.constraint {
+            let join_eval = EvalRow {
+                cols: Rc::from(merged_cols.as_slice()),
+                vals: vec![Value::Null; merged_cols.len()],
+            };
+            let join_scopes = push_scope(outer_scopes, &join_eval);
+            validate_expr_static(
+                on_expr,
+                &join_scopes,
+                schema,
+                ctes,
+                false,
+                false,
+                visited_ctes,
+            )?;
+        }
+        cur_cols = merged_cols;
+    }
+
+    Ok(cur_cols)
+}
+
+fn validate_tos_static(
+    tos: &TableOrSubquery,
+    where_hint: Option<&Expr>,
+    outer_scopes: &[EvalRow],
+    schema: &Schema,
+    ctes: &CteStore,
+    visited_ctes: &mut Vec<(usize, usize)>,
+) -> Result<Vec<ScopedColumn>> {
+    match tos {
+        TableOrSubquery::Table {
+            name,
+            alias,
+            indexed_by,
+        } => {
+            let eff_alias = alias.clone().unwrap_or_else(|| name.clone());
+            if let Some((s_idx, c_idx)) = ctes.locate(name) {
+                if indexed_by.is_some() {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        match indexed_by {
+                            Some(IndexHint::NotIndexed) => {
+                                format!("cannot use NOT INDEXED on CTE: {name}")
+                            }
+                            Some(IndexHint::IndexedBy(idx)) => format!("no such index: {idx}"),
+                            None => unreachable!(),
+                        },
+                    ));
+                }
+                let cte_cols = resolve_cte_columns_static(
+                    s_idx,
+                    c_idx,
+                    outer_scopes,
+                    schema,
+                    ctes,
+                    visited_ctes,
+                )?;
+                let meta = infer_cte_meta_by_name(name, outer_scopes, schema, ctes);
+                return Ok(cte_cols
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, cn)| {
+                        let (aff, coll) = meta.get(i).copied().unwrap_or((None, Collation::Binary));
+                        ScopedColumn {
+                            table_alias: Some(eff_alias.clone()),
+                            name: cn,
+                            collation: coll,
+                            affinity: aff,
+                            hidden_rowid: false,
+                            merged_using: false,
+                        }
+                    })
+                    .collect());
+            }
+
+            let Some(tbl) = schema.find_table(name) else {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such table: {name}"),
+                ));
+            };
+            validate_index_hint_static(schema, &tbl, indexed_by.as_ref(), where_hint)?;
+            let mut cols: Vec<ScopedColumn> = tbl
+                .columns
+                .iter()
+                .map(|c| ScopedColumn {
+                    table_alias: Some(eff_alias.clone()),
+                    name: c.name.clone(),
+                    collation: c.collation,
+                    affinity: Some(c.affinity),
+                    hidden_rowid: false,
+                    merged_using: false,
+                })
+                .collect();
+            if !tbl.without_rowid {
+                cols.push(ScopedColumn {
+                    table_alias: Some(eff_alias),
+                    name: "rowid".to_owned(),
+                    collation: Collation::Binary,
+                    affinity: Some(TypeAffinity::Integer),
+                    hidden_rowid: true,
+                    merged_using: false,
+                });
+            }
+            Ok(cols)
+        }
+        TableOrSubquery::Subquery { query, alias } => {
+            let sub_cols =
+                validate_select_stmt_static(query, outer_scopes, schema, ctes, visited_ctes)?;
+            let sub_meta = infer_select_stmt_meta(query, outer_scopes, schema, ctes);
+            Ok(sub_cols
+                .into_iter()
+                .enumerate()
+                .map(|(i, cn)| {
+                    let (aff, coll) = sub_meta
+                        .get(i)
+                        .copied()
+                        .unwrap_or((None, Collation::Binary));
+                    ScopedColumn {
+                        table_alias: alias.clone(),
+                        name: cn,
+                        collation: coll,
+                        affinity: aff,
+                        hidden_rowid: false,
+                        merged_using: false,
+                    }
+                })
+                .collect())
+        }
+    }
+}
+
+fn resolve_cte_columns_static(
+    s_idx: usize,
+    c_idx: usize,
+    outer_scopes: &[EvalRow],
+    schema: &Schema,
+    ctes: &CteStore,
+    visited_ctes: &mut Vec<(usize, usize)>,
+) -> Result<Vec<String>> {
+    if let Some(w) = ctes.find_working(s_idx, c_idx) {
+        return Ok(w.column_names.clone());
+    }
+    let cte = &ctes.scopes[s_idx][c_idx];
+    if visited_ctes.contains(&(s_idx, c_idx)) {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("circular reference: {}", cte.name),
+        ));
+    }
+    visited_ctes.push((s_idx, c_idx));
+
+    let eval_ctes = CteStore {
+        scopes: ctes.scopes[..=s_idx].to_vec(),
+        working: ctes.working.clone(),
+        resolving: Vec::new(),
+        limit_hint: None,
+    };
+
+    let res = match classify_cte_recursion(cte) {
+        CteRecursionKind::InvalidCircular => Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("circular reference: {}", cte.name),
+        )),
+        CteRecursionKind::MultipleRecursive => Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("multiple recursive references: {}", cte.name),
+        )),
+        CteRecursionKind::NonRecursive => {
+            let q_cols = validate_select_stmt_static(
+                &cte.query,
+                outer_scopes,
+                schema,
+                &eval_ctes,
+                visited_ctes,
+            )?;
+            if let Some(ref explicit_cols) = cte.columns {
+                if explicit_cols.len() != q_cols.len() {
+                    Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!(
+                            "table {} has {} values for {} columns",
+                            cte.name,
+                            q_cols.len(),
+                            explicit_cols.len()
+                        ),
+                    ))
+                } else {
+                    Ok(explicit_cols.clone())
+                }
+            } else {
+                Ok(q_cols)
+            }
+        }
+        CteRecursionKind::Recursive => {
+            let n_comp = cte.query.body.compounds.len();
+            let seed_body = SelectBody {
+                head: cte.query.body.head.clone(),
+                compounds: cte.query.body.compounds[..(n_comp - 1)].to_vec(),
+            };
+            let seed_stmt = SelectStmt {
+                ctes: cte.query.ctes.clone(),
+                body: seed_body,
+                order_by: Vec::new(),
+                limit: None,
+            };
+            let seed_cols = validate_select_stmt_static(
+                &seed_stmt,
+                outer_scopes,
+                schema,
+                &eval_ctes,
+                visited_ctes,
+            )?;
+            let working_cols = if let Some(ref explicit_cols) = cte.columns {
+                if explicit_cols.len() != seed_cols.len() {
+                    visited_ctes.pop();
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!(
+                            "table {} has {} values for {} columns",
+                            cte.name,
+                            seed_cols.len(),
+                            explicit_cols.len()
+                        ),
+                    ));
+                }
+                explicit_cols.clone()
+            } else {
+                seed_cols
+            };
+
+            let (rec_op, rec_core) = &cte.query.body.compounds[n_comp - 1];
+            if matches!(rec_core, SelectCore::Select { distinct: true, .. })
+                && *rec_op == CompoundOp::UnionAll
+            {
+                // Valid in SQLite (`UNION ALL` with `SELECT DISTINCT` is disallowed in recursive term? Let runtime check if needed)
+            }
+            if let SelectCore::Select {
+                projection,
+                group_by,
+                having,
+                ..
+            } = rec_core
+            {
+                let has_agg = !group_by.is_empty()
+                    || having.is_some()
+                    || projection.iter().any(|rc| match rc {
+                        ResultColumn::Expr { expr, .. } => expr_contains_aggregate(expr),
+                        _ => false,
+                    });
+                if has_agg {
+                    visited_ctes.pop();
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "recursive aggregate queries not supported",
+                    ));
+                }
+            }
+
+            let mut rec_ctes = eval_ctes.with_scope(&cte.query.ctes);
+            rec_ctes.working.push((
+                s_idx,
+                c_idx,
+                QueryOutput {
+                    column_names: working_cols.clone(),
+                    rows: Vec::new(),
+                },
+            ));
+            let rhs_cols = validate_single_select_core_static(
+                rec_core,
+                &[],
+                outer_scopes,
+                schema,
+                &rec_ctes,
+                visited_ctes,
+            )?;
+            if rhs_cols.len() != working_cols.len() {
+                visited_ctes.pop();
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!(
+                        "SELECTs to the left and right of {} do not have the same number of result columns",
+                        rec_op.as_sql_str()
+                    ),
+                ));
+            }
+            if let Some(ref lim) = cte.query.limit {
+                validate_expr_static(
+                    &lim.limit,
+                    outer_scopes,
+                    schema,
+                    &rec_ctes,
+                    false,
+                    false,
+                    visited_ctes,
+                )?;
+                if let Some(ref off) = lim.offset {
+                    validate_expr_static(
+                        off,
+                        outer_scopes,
+                        schema,
+                        &rec_ctes,
+                        false,
+                        false,
+                        visited_ctes,
+                    )?;
+                }
+            }
+            Ok(working_cols)
+        }
+    };
+
+    visited_ctes.pop();
+    res
+}
+
+fn validate_expr_static(
+    expr: &Expr,
+    scopes: &[EvalRow],
+    schema: &Schema,
+    ctes: &CteStore,
+    allow_agg: bool,
+    inside_agg: bool,
+    visited_ctes: &mut Vec<(usize, usize)>,
+) -> Result<()> {
+    match expr {
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Integer(_)
+        | Expr::Float(_)
+        | Expr::String(_)
+        | Expr::Blob(_)
+        | Expr::CurrentTimeKw(_)
+        | Expr::Bind(_) => Ok(()),
+
+        Expr::Column { table, column } => {
+            for scope in scopes.iter().rev() {
+                if scope.lookup_full(table.as_deref(), column)?.is_some() {
+                    return Ok(());
+                }
+            }
+            let full = match table {
+                Some(t) => format!("{t}.{column}"),
+                None => column.clone(),
+            };
+            Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such column: {full}"),
+            ))
+        }
+
+        Expr::Collate { expr: inner, .. }
+        | Expr::Unary { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => validate_expr_static(
+            inner,
+            scopes,
+            schema,
+            ctes,
+            allow_agg,
+            inside_agg,
+            visited_ctes,
+        ),
+
+        Expr::RowValue(elems) => {
+            if elems.len() == 1 {
+                validate_expr_static(
+                    &elems[0],
+                    scopes,
+                    schema,
+                    ctes,
+                    allow_agg,
+                    inside_agg,
+                    visited_ctes,
+                )
+            } else {
+                Err(SqliteError::new(ErrorCode::Error, "row value misused"))
+            }
+        }
+
+        Expr::Binary { left, op, right } => {
+            if matches!(
+                op,
+                BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Is
+                    | BinaryOp::IsNot
+            ) && (is_row_value_expr(left) || is_row_value_expr(right))
+            {
+                let lw = validate_tuple_expr_static(
+                    left,
+                    scopes,
+                    schema,
+                    ctes,
+                    allow_agg,
+                    inside_agg,
+                    visited_ctes,
+                )?;
+                let rw = validate_tuple_expr_static(
+                    right,
+                    scopes,
+                    schema,
+                    ctes,
+                    allow_agg,
+                    inside_agg,
+                    visited_ctes,
+                )?;
+                if lw != rw {
+                    let is_left_sub = matches!(left.as_ref(), Expr::Subquery(_));
+                    let is_right_sub = matches!(right.as_ref(), Expr::Subquery(_));
+                    if is_left_sub && !is_right_sub {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("sub-select returns {lw} columns - expected {rw}"),
+                        ));
+                    }
+                    if is_right_sub && !is_left_sub {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("sub-select returns {rw} columns - expected {lw}"),
+                        ));
+                    }
+                    return Err(SqliteError::new(ErrorCode::Error, "row value misused"));
+                }
+                return Ok(());
+            }
+            validate_expr_static(
+                left,
+                scopes,
+                schema,
+                ctes,
+                allow_agg,
+                inside_agg,
+                visited_ctes,
+            )?;
+            validate_expr_static(
+                right,
+                scopes,
+                schema,
+                ctes,
+                allow_agg,
+                inside_agg,
+                visited_ctes,
+            )
+        }
+
+        Expr::Between {
+            expr: val_e,
+            low,
+            high,
+            ..
+        } => {
+            if is_row_value_expr(val_e) || is_row_value_expr(low) || is_row_value_expr(high) {
+                let vw = validate_tuple_expr_static(
+                    val_e,
+                    scopes,
+                    schema,
+                    ctes,
+                    allow_agg,
+                    inside_agg,
+                    visited_ctes,
+                )?;
+                let lw = validate_tuple_expr_static(
+                    low,
+                    scopes,
+                    schema,
+                    ctes,
+                    allow_agg,
+                    inside_agg,
+                    visited_ctes,
+                )?;
+                let hw = validate_tuple_expr_static(
+                    high,
+                    scopes,
+                    schema,
+                    ctes,
+                    allow_agg,
+                    inside_agg,
+                    visited_ctes,
+                )?;
+                if vw != lw || vw != hw {
+                    return Err(SqliteError::new(ErrorCode::Error, "row value misused"));
+                }
+                return Ok(());
+            }
+            validate_expr_static(
+                val_e,
+                scopes,
+                schema,
+                ctes,
+                allow_agg,
+                inside_agg,
+                visited_ctes,
+            )?;
+            validate_expr_static(
+                low,
+                scopes,
+                schema,
+                ctes,
+                allow_agg,
+                inside_agg,
+                visited_ctes,
+            )?;
+            validate_expr_static(
+                high,
+                scopes,
+                schema,
+                ctes,
+                allow_agg,
+                inside_agg,
+                visited_ctes,
+            )
+        }
+
+        Expr::InList {
+            expr: lhs_e, list, ..
+        } => {
+            let n = validate_tuple_expr_static(
+                lhs_e,
+                scopes,
+                schema,
+                ctes,
+                allow_agg,
+                inside_agg,
+                visited_ctes,
+            )?;
+            for item in list {
+                let m = validate_tuple_expr_static(
+                    item,
+                    scopes,
+                    schema,
+                    ctes,
+                    allow_agg,
+                    inside_agg,
+                    visited_ctes,
+                )?;
+                if m != n {
+                    if n >= 2 {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!(
+                                "IN(...) element has {m} term{} - expected {n}",
+                                if m == 1 { "" } else { "s" }
+                            ),
+                        ));
+                    }
+                    return Err(SqliteError::new(ErrorCode::Error, "row value misused"));
+                }
+            }
+            Ok(())
+        }
+
+        Expr::InSubquery {
+            expr: lhs_e,
+            subquery,
+            ..
+        } => {
+            let n = validate_tuple_expr_static(
+                lhs_e,
+                scopes,
+                schema,
+                ctes,
+                allow_agg,
+                inside_agg,
+                visited_ctes,
+            )?;
+            let sub_cols =
+                validate_select_stmt_static(subquery, scopes, schema, ctes, visited_ctes)?;
+            if !sub_cols.is_empty() && sub_cols.len() != n {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!(
+                        "sub-select returns {} columns - expected {n}",
+                        sub_cols.len()
+                    ),
+                ));
+            }
+            Ok(())
+        }
+
+        Expr::Like {
+            expr: txt_e,
+            pattern,
+            escape,
+            ..
+        } => {
+            validate_expr_static(
+                txt_e,
+                scopes,
+                schema,
+                ctes,
+                allow_agg,
+                inside_agg,
+                visited_ctes,
+            )?;
+            validate_expr_static(
+                pattern,
+                scopes,
+                schema,
+                ctes,
+                allow_agg,
+                inside_agg,
+                visited_ctes,
+            )?;
+            if let Some(esc) = escape {
+                validate_expr_static(
+                    esc,
+                    scopes,
+                    schema,
+                    ctes,
+                    allow_agg,
+                    inside_agg,
+                    visited_ctes,
+                )?;
+            }
+            Ok(())
+        }
+
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                validate_expr_static(
+                    op,
+                    scopes,
+                    schema,
+                    ctes,
+                    allow_agg,
+                    inside_agg,
+                    visited_ctes,
+                )?;
+            }
+            for (w, t) in branches {
+                validate_expr_static(w, scopes, schema, ctes, allow_agg, inside_agg, visited_ctes)?;
+                validate_expr_static(t, scopes, schema, ctes, allow_agg, inside_agg, visited_ctes)?;
+            }
+            if let Some(el) = else_expr {
+                validate_expr_static(
+                    el,
+                    scopes,
+                    schema,
+                    ctes,
+                    allow_agg,
+                    inside_agg,
+                    visited_ctes,
+                )?;
+            }
+            Ok(())
+        }
+
+        Expr::FunctionCall {
+            name,
+            distinct,
+            args,
+            filter,
+        } => {
+            let (is_star, arg_count) = match args {
+                FunctionArgs::Star => (true, 0),
+                FunctionArgs::Exprs(es) => (false, es.len()),
+            };
+            validate_function_call(
+                name,
+                is_star,
+                arg_count,
+                *distinct,
+                filter.is_some(),
+                allow_agg && !inside_agg,
+            )?;
+            let is_agg_fn = match name.to_ascii_uppercase().as_str() {
+                "COUNT" | "SUM" | "TOTAL" | "AVG" | "GROUP_CONCAT" | "STRING_AGG" => true,
+                "MIN" | "MAX" => arg_count == 1,
+                _ => false,
+            };
+            if is_agg_fn {
+                if inside_agg || !allow_agg {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("misuse of aggregate function {name}()"),
+                    ));
+                }
+                if let FunctionArgs::Exprs(es) = args {
+                    for ae in es {
+                        validate_expr_static(ae, scopes, schema, ctes, false, true, visited_ctes)?;
+                    }
+                }
+                if let Some(fe) = filter {
+                    validate_expr_static(fe, scopes, schema, ctes, false, true, visited_ctes)?;
+                }
+            } else {
+                if let FunctionArgs::Exprs(es) = args {
+                    for ae in es {
+                        validate_expr_static(
+                            ae,
+                            scopes,
+                            schema,
+                            ctes,
+                            allow_agg,
+                            inside_agg,
+                            visited_ctes,
+                        )?;
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        Expr::Subquery(sub) => {
+            let sub_cols = validate_select_stmt_static(sub, scopes, schema, ctes, visited_ctes)?;
+            if sub_cols.len() > 1 {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("sub-select returns {} columns - expected 1", sub_cols.len()),
+                ));
+            }
+            Ok(())
+        }
+
+        Expr::Exists { subquery, .. } => {
+            let _ = validate_select_stmt_static(subquery, scopes, schema, ctes, visited_ctes)?;
+            Ok(())
+        }
+    }
+}
+
+fn validate_tuple_expr_static(
+    mut expr: &Expr,
+    scopes: &[EvalRow],
+    schema: &Schema,
+    ctes: &CteStore,
+    allow_agg: bool,
+    inside_agg: bool,
+    visited_ctes: &mut Vec<(usize, usize)>,
+) -> Result<usize> {
+    while let Expr::Collate { expr: inner, .. } = expr {
+        expr = inner;
+    }
+    match expr {
+        Expr::RowValue(elems) => {
+            for el in elems {
+                validate_expr_static(
+                    el,
+                    scopes,
+                    schema,
+                    ctes,
+                    allow_agg,
+                    inside_agg,
+                    visited_ctes,
+                )?;
+            }
+            Ok(elems.len())
+        }
+        Expr::Subquery(sub) => {
+            let sub_cols = validate_select_stmt_static(sub, scopes, schema, ctes, visited_ctes)?;
+            Ok(sub_cols.len().max(1))
+        }
+        other => {
+            validate_expr_static(
+                other,
+                scopes,
+                schema,
+                ctes,
+                allow_agg,
+                inside_agg,
+                visited_ctes,
+            )?;
+            Ok(1)
+        }
     }
 }

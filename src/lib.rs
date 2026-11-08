@@ -7,7 +7,7 @@
 //! ```
 //! use sqliters::{Connection, Value};
 //!
-//! let mut conn = Connection::open_in_memory()?;
+//! let conn = Connection::open_in_memory()?;
 //! conn.execute("
 //!     PRAGMA foreign_keys = ON;
 //!     CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
@@ -48,10 +48,14 @@ pub use sqliters_types as types;
 pub use sqliters_vdbe as vdbe;
 pub use sqliters_vfs as vfs;
 
+#[doc(hidden)]
+pub use sqliters_core::TestBlobHandle;
 pub use sqliters_core::{
-    ColumnSchema, Connection, ForeignKeySchema, IndexSchema, QueryOutput, QueryResult, Row, Schema,
-    Statement, StepResult, TableSchema,
+    CloseError, ColumnSchema, Connection, ConnectionOpenOptions, ForeignKeySchema, IndexSchema,
+    InterruptHandle, PrepareMode, QueryOutput, QueryResult, Row, Schema, Statement, StepResult,
+    TableSchema,
 };
+pub use sqliters_pager::DatabaseHeader;
 pub use sqliters_syntax::{FkAction, is_complete, parse_one, parse_statements};
 pub use sqliters_types::{
     Collation, ConflictResolutionEffect, DatabaseKind, ErrorCode, LockGeometry, Pgno, Result,
