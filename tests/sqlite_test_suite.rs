@@ -137,6 +137,9 @@ mod unique;
 #[path = "sqlite_test/unique2.rs"]
 mod unique2;
 #[allow(non_snake_case)]
+#[path = "sqlite_test/vacuum4.rs"]
+mod vacuum4;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/where5.rs"]
 mod where5;
 #[allow(non_snake_case)]
