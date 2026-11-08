@@ -86,6 +86,9 @@ mod pragma5;
 #[path = "sqlite_test/rowvalue2.rs"]
 mod rowvalue2;
 #[allow(non_snake_case)]
+#[path = "sqlite_test/rowvalue3.rs"]
+mod rowvalue3;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/savepoint5.rs"]
 mod savepoint5;
 #[allow(non_snake_case)]
