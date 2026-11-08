@@ -80,6 +80,9 @@ mod orderby8;
 #[path = "sqlite_test/orderby9.rs"]
 mod orderby9;
 #[allow(non_snake_case)]
+#[path = "sqlite_test/pragma5.rs"]
+mod pragma5;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/savepoint5.rs"]
 mod savepoint5;
 #[allow(non_snake_case)]
