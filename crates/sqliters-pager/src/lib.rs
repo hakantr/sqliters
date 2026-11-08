@@ -17,8 +17,11 @@ pub use header::{DB_HEADER_SIZE, DatabaseHeader};
 /// Magic 8-byte string at the start of an SQLite rollback journal (`aJournalMagic` in `pager.c`).
 pub const JOURNAL_MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
 
-/// Size of the SQLite rollback journal header (padded to sector or minimum 512 bytes; core fields occupy 28 bytes).
-const JOURNAL_HEADER_BYTES: usize = 512;
+/// Minimum size of the SQLite rollback journal header (`MIN_SECTOR_SIZE` in `pager.c`; core fields occupy 28 bytes).
+const MIN_JOURNAL_HEADER_BYTES: usize = 512;
+
+/// Maximum sector size accepted in rollback journal headers (`MAX_SECTOR_SIZE` in `pager.c`).
+const MAX_JOURNAL_SECTOR_BYTES: u32 = 65_536;
 
 /// Transaction state of the [`Pager`] (`PAGER_OPEN`, `PAGER_READER`, `PAGER_WRITER_*` in `pager.c`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +71,9 @@ pub struct Pager {
     tx_preimages: HashMap<Pgno, Vec<u8>>,
     journal_records_written: u32,
     journal_nonce: u32,
+    journal_sector_size: u32,
+    /// True once `commit()` has started writing/truncating the main database file (`PAGER_WRITER_DBMOD`).
+    db_file_modified: bool,
 
     savepoints: Vec<SavepointFrame>,
 }
@@ -138,6 +144,8 @@ impl Pager {
             tx_preimages: HashMap::new(),
             journal_records_written: 0,
             journal_nonce: 0,
+            journal_sector_size: MIN_JOURNAL_HEADER_BYTES as u32,
+            db_file_modified: false,
             savepoints: Vec::new(),
         };
 
@@ -344,13 +352,19 @@ impl Pager {
                     self.cache.clear();
                     self.page_count = 0;
                     self.header.database_size_pages = 0;
+                    self.header.change_counter = 0;
+                    self.header.schema_cookie = 0;
                     self.page_size_fixed = false;
                 }
             } else if file_len >= DB_HEADER_SIZE as u64 {
                 let mut hdr_bytes = [0u8; DB_HEADER_SIZE];
                 self.file.read_at(&mut hdr_bytes, 0)?;
                 let disk_hdr = DatabaseHeader::parse(&hdr_bytes)?;
-                if recovered || disk_hdr.change_counter != prev_counter || !self.page_size_fixed {
+                if recovered
+                    || disk_hdr.change_counter != prev_counter
+                    || disk_hdr.schema_cookie != self.header.schema_cookie
+                    || !self.page_size_fixed
+                {
                     self.cache.clear();
                     self.load_initial_header()?;
                 }
@@ -366,6 +380,21 @@ impl Pager {
 
     /// Starts or upgrades to a write transaction (`RESERVED` lock + journal initialization).
     pub fn begin_write(&mut self) -> Result<()> {
+        self.begin_write_with_lock(LockLevel::Reserved)
+    }
+
+    /// Starts or upgrades to an exclusive write transaction (`BEGIN EXCLUSIVE`: acquires `EXCLUSIVE` lock immediately).
+    pub fn begin_exclusive(&mut self) -> Result<()> {
+        if self.state == TransactionState::Write {
+            if !self.in_memory {
+                self.file.lock(LockLevel::Exclusive)?;
+            }
+            return Ok(());
+        }
+        self.begin_write_with_lock(LockLevel::Exclusive)
+    }
+
+    fn begin_write_with_lock(&mut self, target_lock: LockLevel) -> Result<()> {
         if self.readonly {
             return Err(SqliteError::readonly(
                 "attempt to write a readonly database",
@@ -378,10 +407,32 @@ impl Pager {
         if acquired_read_here {
             self.begin_read()?;
         }
-        if let Err(e) = self.file.lock(LockLevel::Reserved) {
+
+        // Reject writing to auto-vacuum (`FULL` / `INCREMENTAL`) pointer-map databases until ptrmap maintenance is implemented.
+        if self.page_count > 0 && self.header.largest_root_btree_page != 0 {
             if acquired_read_here {
                 let _ = self.file.unlock(LockLevel::NoLock);
                 self.state = TransactionState::Open;
+            }
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                "writing to auto_vacuum (pointer-map) databases is not supported",
+            ));
+        }
+
+        let lock_res = if target_lock >= LockLevel::Exclusive {
+            self.file
+                .lock(LockLevel::Reserved)
+                .and_then(|()| self.file.lock(LockLevel::Exclusive))
+        } else {
+            self.file.lock(LockLevel::Reserved)
+        };
+        if let Err(e) = lock_res {
+            if acquired_read_here {
+                let _ = self.file.unlock(LockLevel::NoLock);
+                self.state = TransactionState::Open;
+            } else {
+                let _ = self.file.unlock(LockLevel::Shared);
             }
             return Err(e);
         }
@@ -391,6 +442,8 @@ impl Pager {
         self.tx_journaled = Bitvec::new(self.page_count.max(64));
         self.tx_preimages.clear();
         self.journal_records_written = 0;
+        self.journal_sector_size = self.effective_sector_size();
+        self.db_file_modified = false;
 
         let mut nonce_bytes = [0u8; 4];
         self.vfs.randomness(&mut nonce_bytes);
@@ -596,6 +649,28 @@ impl Pager {
         Ok(allocated_pgno)
     }
 
+    /// Shrinks the database page count to `new_count` within a write transaction (used by `VACUUM`),
+    /// journaling all truncated pages first so `rollback()` / hot-journal recovery can restore them.
+    pub fn shrink_page_count(&mut self, new_count: Pgno) -> Result<()> {
+        if self.state != TransactionState::Write {
+            return Err(SqliteError::misuse(
+                "cannot shrink page count outside write transaction",
+            ));
+        }
+        if new_count < self.page_count {
+            for pgno in (new_count + 1)..=self.page_count {
+                self.mark_page_writable(pgno)?;
+            }
+            self.cache.retain(|&pgno, _| pgno <= new_count);
+            self.page_count = new_count;
+            self.header.database_size_pages = new_count;
+            if new_count > 0 {
+                self.mark_page_writable(1)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Commits the active write transaction (or releases read lock if in read transaction).
     pub fn commit(&mut self) -> Result<()> {
         match self.state {
@@ -631,23 +706,23 @@ impl Pager {
                     }
                 }
 
-                // Step 2: Acquire EXCLUSIVE lock on main DB file and write all dirty pages in Pgno order
+                // Step 2: Acquire EXCLUSIVE lock on main DB file and write all dirty pages in Pgno order.
+                // Do NOT clear `page.dirty` or undo state until all writes, truncate, sync, and journal deletion succeed!
                 self.file.lock(LockLevel::Exclusive)?;
+                self.db_file_modified = true;
+
                 let ps = u64::from(self.header.page_size);
                 let mut dirty_pgnos: Vec<Pgno> = self
                     .cache
                     .iter()
-                    .filter_map(|(&pgno, p)| if p.dirty { Some(pgno) } else { None })
+                    .filter_map(|(&pgno, p)| if p.dirty && pgno <= self.page_count { Some(pgno) } else { None })
                     .collect();
                 dirty_pgnos.sort_unstable();
 
-                for pgno in dirty_pgnos {
-                    if pgno <= self.page_count {
-                        let page = self.cache.get_mut(&pgno).expect("dirty page exists");
-                        let offset = u64::from(pgno - 1) * ps;
-                        self.file.write_at(&page.data, offset)?;
-                        page.dirty = false;
-                    }
+                for &pgno in &dirty_pgnos {
+                    let page = self.cache.get(&pgno).expect("dirty page exists");
+                    let offset = u64::from(pgno - 1) * ps;
+                    self.file.write_at(&page.data, offset)?;
                 }
 
                 let target_size = u64::from(self.page_count) * ps;
@@ -665,7 +740,13 @@ impl Pager {
                     self.vfs.delete(jpath, true)?;
                 }
 
-                // Step 4: Clear undo state and unlock
+                // Step 4: Mark all committed pages clean, clear undo state, and unlock
+                for pgno in dirty_pgnos {
+                    if let Some(page) = self.cache.get_mut(&pgno) {
+                        page.dirty = false;
+                    }
+                }
+                self.db_file_modified = false;
                 self.tx_preimages.clear();
                 self.tx_journaled.clear_all();
                 self.savepoints.clear();
@@ -676,7 +757,8 @@ impl Pager {
         }
     }
 
-    /// Rolls back the active transaction, restoring pre-images and original page count.
+    /// Rolls back the active transaction, restoring pre-images and original page count
+    /// (including replaying pre-images back to disk if `commit()` partially modified the main DB file).
     pub fn rollback(&mut self) -> Result<()> {
         match self.state {
             TransactionState::Open => Ok(()),
@@ -686,8 +768,40 @@ impl Pager {
                 Ok(())
             }
             TransactionState::Write => {
-                // Remove any pages allocated during the aborted transaction
                 let orig_count = self.tx_orig_page_count;
+
+                // If `commit()` already started modifying the main DB file (`db_file_modified`),
+                // we MUST restore all pre-images and original file size on disk and sync BEFORE
+                // unlinking `<db>-journal`. If any disk operation fails here, keep `<db>-journal`
+                // intact on disk so hot-journal recovery can still restore atomicity!
+                if self.db_file_modified && !self.in_memory {
+                    self.file.lock(LockLevel::Exclusive)?;
+                    let ps = u64::from(self.tx_orig_header.page_size);
+                    let mut restore_pgnos: Vec<Pgno> = self
+                        .tx_preimages
+                        .keys()
+                        .copied()
+                        .filter(|&pgno| pgno > 0 && pgno <= orig_count)
+                        .collect();
+                    restore_pgnos.sort_unstable();
+
+                    for pgno in restore_pgnos {
+                        let orig_data = self.tx_preimages.get(&pgno).expect("key exists");
+                        let offset = u64::from(pgno - 1) * ps;
+                        self.file.write_at(orig_data, offset)?;
+                    }
+
+                    let orig_size = u64::from(orig_count) * ps;
+                    if self.file.file_size()? != orig_size {
+                        self.file.truncate(orig_size)?;
+                    }
+                    if self.synchronous > 0 {
+                        self.file.sync(SyncFlags::Normal)?;
+                    }
+                    self.db_file_modified = false;
+                }
+
+                // Remove any pages allocated during the aborted transaction
                 self.cache.retain(|&pgno, _| pgno <= orig_count);
 
                 // Restore pre-images into cache
@@ -707,9 +821,10 @@ impl Pager {
                 self.header = self.tx_orig_header.clone();
                 self.page_size_fixed = orig_count > 0;
                 self.tx_journaled.clear_all();
+                self.db_file_modified = false;
                 self.savepoints.clear();
 
-                // Close & remove journal file (main DB file was never modified prior to commit!)
+                // Close & remove journal file now that main DB file is verified clean
                 self.journal_file = None;
                 if let Some(ref jpath) = self.journal_path {
                     let _ = self.vfs.delete(jpath, false);
@@ -813,22 +928,36 @@ impl Pager {
     }
 
     // ========================================================================
-    // Rollback Journal Binary Format (matches SQLite `pager.c` 28-byte header)
+    // Rollback Journal Binary Format (`writeJournalHdr`, `readJournalHdr`, `pager_playback` in `sqlite/src/pager.c`)
     // ========================================================================
 
+    fn effective_sector_size(&self) -> u32 {
+        let raw = self
+            .file
+            .sector_size()
+            .clamp(MIN_JOURNAL_HEADER_BYTES as u32, MAX_JOURNAL_SECTOR_BYTES);
+        if raw.is_power_of_two() {
+            raw
+        } else {
+            raw.next_power_of_two()
+                .clamp(MIN_JOURNAL_HEADER_BYTES as u32, MAX_JOURNAL_SECTOR_BYTES)
+        }
+    }
+
     fn write_journal_header(&self, jfile: &dyn VfsFile, record_count: u32) -> Result<()> {
-        let mut hdr = [0u8; JOURNAL_HEADER_BYTES];
+        let hdr_sz = (self.journal_sector_size as usize).max(MIN_JOURNAL_HEADER_BYTES);
+        let mut hdr = vec![0u8; hdr_sz];
         hdr[0..8].copy_from_slice(&JOURNAL_MAGIC);
         hdr[8..12].copy_from_slice(&record_count.to_be_bytes());
         hdr[12..16].copy_from_slice(&self.journal_nonce.to_be_bytes());
         hdr[16..20].copy_from_slice(&self.tx_orig_page_count.to_be_bytes());
-        hdr[20..24].copy_from_slice(&self.file.sector_size().to_be_bytes());
+        hdr[20..24].copy_from_slice(&self.journal_sector_size.to_be_bytes());
         hdr[24..28].copy_from_slice(&self.header.page_size.to_be_bytes());
         jfile.write_at(&hdr, 0)
     }
 
     fn journal_checksum(nonce: u32, page_data: &[u8]) -> u32 {
-        // Matches ` pager_cksum ` in `sqlite/src/pager.c`: stride backwards by 200 bytes from page_size - 200.
+        // Matches `pager_cksum` in `sqlite/src/pager.c`: stride backwards by 200 bytes from page_size - 200.
         let mut cksum = nonce;
         let mut i = page_data.len();
         while i >= 200 {
@@ -842,10 +971,10 @@ impl Pager {
         let Some(ref jfile) = self.journal_file else {
             return Ok(());
         };
+        let hdr_sz = u64::from(self.journal_sector_size.max(MIN_JOURNAL_HEADER_BYTES as u32));
         let ps = page_data.len();
         let rec_size = 4 + ps + 4;
-        let offset = (JOURNAL_HEADER_BYTES as u64)
-            + u64::from(self.journal_records_written) * (rec_size as u64);
+        let offset = hdr_sz + u64::from(self.journal_records_written) * (rec_size as u64);
 
         let cksum = Self::journal_checksum(self.journal_nonce, page_data);
         let mut buf = Vec::with_capacity(rec_size);
@@ -858,8 +987,8 @@ impl Pager {
         Ok(())
     }
 
-    /// Safe hot-journal detection and recovery (`hasHotJournal` + `pagerPlayback` in `sqlite/src/pager.c`),
-    /// called ONLY while holding at least `LockLevel::Shared` on the main database file!
+    /// Safe hot-journal detection and multi-section recovery (`hasHotJournal` + `readJournalHdr` + `pager_playback`
+    /// in `sqlite/src/pager.c`), called ONLY while holding at least `LockLevel::Shared` on the main database file!
     fn recover_hot_journal_under_shared_lock(&mut self) -> Result<bool> {
         let Some(ref jpath) = self.journal_path else {
             return Ok(false);
@@ -899,64 +1028,115 @@ impl Pager {
         // if another reader also holds SHARED, leaving the hot journal intact for retry.
         self.file.lock(LockLevel::Exclusive)?;
 
-        if jsize < JOURNAL_HEADER_BYTES as u64 {
+        if jsize < 28 {
             drop(jfile);
             self.vfs.delete(jpath, true)?;
             self.file.unlock(LockLevel::Shared)?;
             return Ok(true);
         }
 
-        let mut hdr = [0u8; JOURNAL_HEADER_BYTES];
-        jfile.read_at(&mut hdr, 0)?;
-        if hdr[0..8] != JOURNAL_MAGIC {
+        let mut hdr0 = [0u8; 28];
+        jfile.read_at(&mut hdr0, 0)?;
+        if hdr0[0..8] != JOURNAL_MAGIC {
             drop(jfile);
             self.vfs.delete(jpath, true)?;
             self.file.unlock(LockLevel::Shared)?;
             return Ok(true);
         }
 
-        let record_count = u32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
-        let nonce = u32::from_be_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]);
-        let orig_pages = u32::from_be_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]);
-        let page_size = u32::from_be_bytes([hdr[24], hdr[25], hdr[26], hdr[27]]);
+        let orig_pages = u32::from_be_bytes([hdr0[16], hdr0[17], hdr0[18], hdr0[19]]);
+        let raw_sector_size = u32::from_be_bytes([hdr0[20], hdr0[21], hdr0[22], hdr0[23]]);
+        let raw_page_size = u32::from_be_bytes([hdr0[24], hdr0[25], hdr0[26], hdr0[27]]);
+        let page_size = if raw_page_size == 0 {
+            self.header.page_size
+        } else {
+            raw_page_size
+        };
 
-        if !DatabaseHeader::is_valid_page_size(page_size) {
+        // Validate `page_size` and `sector_size` per `readJournalHdr` (`pager.c:1700-1710`).
+        let valid_sector = (32..=MAX_JOURNAL_SECTOR_BYTES).contains(&raw_sector_size)
+            && raw_sector_size.is_power_of_two();
+        let hdr_sz = u64::from(raw_sector_size);
+        if !DatabaseHeader::is_valid_page_size(page_size) || !valid_sector || jsize < hdr_sz {
             drop(jfile);
             self.vfs.delete(jpath, true)?;
             self.file.unlock(LockLevel::Shared)?;
             return Ok(true);
         }
+
+        // Truncate main DB back to its pre-transaction size (`pager.c:2959`).
+        self.file
+            .truncate(u64::from(orig_pages) * u64::from(page_size))?;
 
         let ps = page_size as usize;
         let rec_size = (4 + ps + 4) as u64;
-        let avail_records = ((jsize - JOURNAL_HEADER_BYTES as u64) / rec_size) as u32;
-        let to_replay = if record_count == 0 {
-            avail_records
-        } else {
-            record_count.min(avail_records)
-        };
-
+        let sj_pgno = ((sqliters_types::PENDING_BYTE_OFFSET / u64::from(page_size)) + 1) as Pgno;
+        let mut replayed_pages = Bitvec::new(orig_pages.max(1));
         let mut rec_buf = vec![0u8; rec_size as usize];
-        for idx in 0..to_replay {
-            let off = (JOURNAL_HEADER_BYTES as u64) + u64::from(idx) * rec_size;
-            jfile.read_at(&mut rec_buf, off)?;
-            let pgno = u32::from_be_bytes([rec_buf[0], rec_buf[1], rec_buf[2], rec_buf[3]]);
-            let data = &rec_buf[4..4 + ps];
-            let stored_cksum = u32::from_be_bytes([
-                rec_buf[4 + ps],
-                rec_buf[4 + ps + 1],
-                rec_buf[4 + ps + 2],
-                rec_buf[4 + ps + 3],
-            ]);
-            if pgno == 0 || Self::journal_checksum(nonce, data) != stored_cksum {
+        let mut journal_off: u64 = 0;
+
+        // Multi-section playback loop (`pager.c:2913-3003`):
+        // C SQLite writes a new sector-aligned journal header each time its page cache spills.
+        'sections: loop {
+            if journal_off > 0 {
+                journal_off = ((journal_off - 1) / hdr_sz + 1) * hdr_sz;
+            }
+            if journal_off.saturating_add(hdr_sz) > jsize {
                 break;
             }
-            let db_off = u64::from(pgno - 1) * u64::from(page_size);
-            self.file.write_at(data, db_off)?;
+
+            let mut sec_hdr = [0u8; 28];
+            jfile.read_at(&mut sec_hdr, journal_off)?;
+            if sec_hdr[0..8] != JOURNAL_MAGIC {
+                break;
+            }
+
+            let raw_nrec = u32::from_be_bytes([sec_hdr[8], sec_hdr[9], sec_hdr[10], sec_hdr[11]]);
+            let nonce = u32::from_be_bytes([sec_hdr[12], sec_hdr[13], sec_hdr[14], sec_hdr[15]]);
+            journal_off += hdr_sz;
+
+            let nrec: u64 = if raw_nrec == 0xffff_ffff || raw_nrec == 0 {
+                (jsize.saturating_sub(journal_off)) / rec_size
+            } else {
+                u64::from(raw_nrec)
+            };
+
+            for _ in 0..nrec {
+                if journal_off.saturating_add(rec_size) > jsize {
+                    // Truncated record at tail (`SQLITE_IOERR_SHORT_READ` in `pager.c:2985`): stop playback cleanly.
+                    break 'sections;
+                }
+                jfile.read_at(&mut rec_buf, journal_off)?;
+                journal_off += rec_size;
+
+                let pgno = u32::from_be_bytes([rec_buf[0], rec_buf[1], rec_buf[2], rec_buf[3]]);
+                if pgno == 0 || pgno == sj_pgno {
+                    break 'sections;
+                }
+                if pgno > orig_pages || replayed_pages.test(pgno) {
+                    continue;
+                }
+                let data = &rec_buf[4..4 + ps];
+                let stored_cksum = u32::from_be_bytes([
+                    rec_buf[4 + ps],
+                    rec_buf[4 + ps + 1],
+                    rec_buf[4 + ps + 2],
+                    rec_buf[4 + ps + 3],
+                ]);
+                if Self::journal_checksum(nonce, data) != stored_cksum {
+                    break 'sections;
+                }
+                let db_off = u64::from(pgno - 1) * u64::from(page_size);
+                self.file.write_at(data, db_off)?;
+                replayed_pages.set(pgno)?;
+            }
+
+            // Both `0xffffffff` (no-sync mode) and `0` (active un-spilled tail section) consume up to EOF.
+            if raw_nrec == 0xffff_ffff || raw_nrec == 0 {
+                break;
+            }
         }
 
-        self.file
-            .truncate(u64::from(orig_pages) * u64::from(page_size))?;
         if !self.in_memory {
             self.file.sync(SyncFlags::Normal)?;
         }
@@ -966,6 +1146,18 @@ impl Pager {
         self.page_size_fixed = false;
         self.file.unlock(LockLevel::Shared)?;
         Ok(true)
+    }
+}
+
+impl Drop for Pager {
+    fn drop(&mut self) {
+        if self.state != TransactionState::Open && self.rollback().is_err() {
+            // Rollback failed (e.g. persistent disk I/O error after partial commit):
+            // preserve `<db>-journal` on disk for future hot-journal recovery and release OS locks.
+            self.journal_file = None;
+            let _ = self.file.unlock(LockLevel::NoLock);
+            self.state = TransactionState::Open;
+        }
     }
 }
 

@@ -114,7 +114,7 @@ pub struct Connection {
     foreign_keys: bool,
     count_changes: bool,
     rollback_count: u64,
-    deferred_fk_suspects: Vec<(String, i64, usize)>,
+    deferred_fk_suspects: Vec<(String, schema::TableRowKey, usize)>,
 }
 
 impl Connection {
@@ -172,13 +172,15 @@ impl Connection {
     }
 
     fn ensure_schema_loaded(&mut self) -> Result<()> {
-        if !self.schema_loaded
-            || (self.btree.pager().page_count() > 0
-                && self.btree.pager().header().schema_cookie != self.schema.schema_cookie)
-        {
-            self.schema = Schema::load(&mut self.btree)?;
-            self.schema_loaded = true;
+        if self.btree.transaction_state() == TransactionState::Open {
+            self.btree.begin_read()?;
+            let res = self.schema.ensure_fresh_in_tx(&mut self.btree);
+            let _ = self.btree.commit();
+            res?;
+        } else {
+            self.schema.ensure_fresh_in_tx(&mut self.btree)?;
         }
+        self.schema_loaded = true;
         Ok(())
     }
 
@@ -309,7 +311,12 @@ impl Connection {
     }
 
     fn run_stmt(&mut self, stmt: &Stmt, params: &[Value]) -> Result<QueryOutput> {
-        self.ensure_schema_loaded()?;
+        if self.btree.transaction_state() != TransactionState::Open {
+            self.schema.ensure_fresh_in_tx(&mut self.btree)?;
+            self.schema_loaded = true;
+        } else if !self.schema_loaded {
+            self.ensure_schema_loaded()?;
+        }
         let prev_ts = self.runtime.stmt_timestamp_ms;
         if prev_ts.is_none() {
             self.runtime.stmt_timestamp_ms = Some(self.btree.pager().vfs().current_unix_millis());
@@ -358,6 +365,8 @@ pub struct Statement<'conn> {
     conn: &'conn mut Connection,
     stmt: Option<Stmt>,
     compiled_vdbe: Option<VdbeProgram>,
+    compiled_cookie: u32,
+    compiled_had_pages: bool,
     column_names: Vec<String>,
     params: Vec<Value>,
     named_params: HashMap<String, usize>,
@@ -388,10 +397,15 @@ impl<'conn> Statement<'conn> {
             column_names = infer_stmt_column_names(s, &conn.schema);
         }
 
+        let compiled_cookie = conn.schema.schema_cookie;
+        let compiled_had_pages = conn.schema.had_pages;
+
         Ok(Self {
             conn,
             stmt,
             compiled_vdbe,
+            compiled_cookie,
+            compiled_had_pages,
             column_names,
             params: vec![Value::Null; max_param],
             named_params: named,
@@ -477,17 +491,78 @@ impl<'conn> Statement<'conn> {
         };
 
         if matches!(self.state, StatementExecState::Unstarted) {
-            if let Some(ref prog) = self.compiled_vdbe {
-                let started_read = self.conn.btree.transaction_state() == TransactionState::Open
-                    && self.conn.is_autocommit();
-                let mut vm_rt = self.conn.runtime;
-                vm_rt.stmt_timestamp_ms =
-                    Some(self.conn.btree.pager().vfs().current_unix_millis());
-                let vm = VdbeVm::new(prog.clone(), self.params.clone(), vm_rt);
-                self.state = StatementExecState::Vdbe {
-                    vm,
-                    started_autocommit_read: started_read,
-                };
+            if self.compiled_vdbe.is_some() {
+                let was_open = self.conn.btree.transaction_state() == TransactionState::Open;
+                let started_read = was_open && self.conn.is_autocommit();
+                if was_open {
+                    self.conn.btree.begin_read()?;
+                }
+                let has_pages = self.conn.btree.pager().page_count() > 0;
+                let cur_cookie = self.conn.btree.pager().header().schema_cookie;
+                if !self.conn.schema.loaded
+                    || self.compiled_had_pages != has_pages
+                    || self.compiled_cookie != cur_cookie
+                {
+                    if let Err(e) = self.conn.schema.ensure_fresh_in_tx(&mut self.conn.btree) {
+                        if started_read
+                            && self.conn.btree.transaction_state() == TransactionState::Read
+                        {
+                            let _ = self.conn.btree.commit();
+                        }
+                        self.state = StatementExecState::Finished;
+                        return Err(e);
+                    }
+                    self.conn.schema_loaded = true;
+                    if let Some(Stmt::Select(ref sel)) = self.stmt {
+                        match compiler::try_compile_select(sel, &self.conn.schema) {
+                            Ok(Some(new_prog)) => {
+                                self.column_names.clone_from(&new_prog.column_names);
+                                self.compiled_vdbe = Some(new_prog);
+                                self.compiled_cookie = self.conn.schema.schema_cookie;
+                                self.compiled_had_pages = self.conn.schema.had_pages;
+                            }
+                            Ok(None) => {
+                                self.compiled_vdbe = None;
+                            }
+                            Err(e) => {
+                                if started_read
+                                    && self.conn.btree.transaction_state() == TransactionState::Read
+                                {
+                                    let _ = self.conn.btree.commit();
+                                }
+                                self.state = StatementExecState::Finished;
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+
+                if let Some(ref prog) = self.compiled_vdbe {
+                    let mut vm_rt = self.conn.runtime;
+                    vm_rt.stmt_timestamp_ms =
+                        Some(self.conn.btree.pager().vfs().current_unix_millis());
+                    let vm = VdbeVm::new(prog.clone(), self.params.clone(), vm_rt);
+                    self.state = StatementExecState::Vdbe {
+                        vm,
+                        started_autocommit_read: started_read,
+                    };
+                } else {
+                    let stmt_clone = stmt.clone();
+                    let run_res = self.conn.run_stmt(&stmt_clone, &self.params);
+                    if started_read
+                        && self.conn.is_autocommit()
+                        && self.conn.btree.transaction_state() == TransactionState::Read
+                    {
+                        let _ = self.conn.btree.commit();
+                    }
+                    let out = run_res?;
+                    if !out.column_names.is_empty() {
+                        self.column_names = out.column_names;
+                    }
+                    self.state = StatementExecState::Materialized {
+                        rows: out.rows.into_iter(),
+                    };
+                }
             } else {
                 let stmt_clone = stmt.clone();
                 let out = self.conn.run_stmt(&stmt_clone, &self.params)?;

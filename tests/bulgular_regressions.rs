@@ -1,4 +1,4 @@
-//! Regression test suite verifying fixes for all 9 findings in `bulgular.md`.
+//! Regression test suite verifying fixes for all original findings (1..9) and re-review findings (Y1..Y12) in `bulgular.md`.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -8,7 +8,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sqliters::{Connection, ErrorCode, MemoryVfs, OpenFlags, Value};
+use sqliters::types::extended;
+use sqliters::{
+    Connection, ErrorCode, LockLevel, MemoryVfs, OpenFlags, OsVfs, SqliteError, SyncFlags, Value,
+    Vfs, VfsFile,
+};
 
 static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -752,4 +756,1027 @@ fn test_bulgu_9_query_and_statement_column_names_populated_everywhere() {
         let r_vals = conn.query("VALUES (10, 20), (30, 40);", &[]).unwrap();
         assert_eq!(r_vals.column_names, vec!["column1", "column2"]);
     }
+}
+
+// ============================================================================
+// Finding Y1: Failed `COMMIT` I/O (`write_at`, `truncate`, `sync`, `delete`) + `ROLLBACK` atomicity
+// ============================================================================
+
+#[derive(Default)]
+struct FaultState {
+    main_writes_seen: usize,
+    fail_on_main_write_nth: Option<usize>,
+    fail_all_main_writes: bool,
+    fail_next_truncate: bool,
+    fail_next_main_sync: bool,
+    fail_next_journal_delete: bool,
+}
+
+struct FaultVfs {
+    inner: OsVfs,
+    state: Arc<std::sync::Mutex<FaultState>>,
+}
+
+impl FaultVfs {
+    fn new() -> (Arc<Self>, Arc<std::sync::Mutex<FaultState>>) {
+        let state = Arc::new(std::sync::Mutex::new(FaultState::default()));
+        (
+            Arc::new(Self {
+                inner: OsVfs::new(),
+                state: Arc::clone(&state),
+            }),
+            state,
+        )
+    }
+}
+
+struct FaultFile {
+    inner: Box<dyn VfsFile>,
+    is_main_db: bool,
+    state: Arc<std::sync::Mutex<FaultState>>,
+}
+
+impl VfsFile for FaultFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> sqliters::Result<usize> {
+        self.inner.read_at(buf, offset)
+    }
+
+    fn write_at(&self, buf: &[u8], offset: u64) -> sqliters::Result<()> {
+        if self.is_main_db {
+            let mut st = self.state.lock().unwrap();
+            if st.fail_all_main_writes {
+                return Err(SqliteError::new(
+                    ErrorCode::IoErr,
+                    "injected persistent main DB write error",
+                ));
+            }
+            st.main_writes_seen += 1;
+            if st.fail_on_main_write_nth == Some(st.main_writes_seen) {
+                st.fail_on_main_write_nth = None;
+                return Err(SqliteError::new(
+                    ErrorCode::IoErr,
+                    "injected one-shot main DB write_at error",
+                ));
+            }
+        }
+        self.inner.write_at(buf, offset)
+    }
+
+    fn truncate(&self, size: u64) -> sqliters::Result<()> {
+        if self.is_main_db {
+            let mut st = self.state.lock().unwrap();
+            if st.fail_next_truncate {
+                st.fail_next_truncate = false;
+                return Err(SqliteError::new(
+                    ErrorCode::IoErr,
+                    "injected main DB truncate error",
+                ));
+            }
+        }
+        self.inner.truncate(size)
+    }
+
+    fn sync(&self, flags: SyncFlags) -> sqliters::Result<()> {
+        if self.is_main_db {
+            let mut st = self.state.lock().unwrap();
+            if st.fail_next_main_sync {
+                st.fail_next_main_sync = false;
+                return Err(SqliteError::new(
+                    ErrorCode::IoErr,
+                    "injected main DB sync error",
+                ));
+            }
+        }
+        self.inner.sync(flags)
+    }
+
+    fn file_size(&self) -> sqliters::Result<u64> {
+        self.inner.file_size()
+    }
+
+    fn lock(&self, level: LockLevel) -> sqliters::Result<()> {
+        self.inner.lock(level)
+    }
+
+    fn unlock(&self, level: LockLevel) -> sqliters::Result<()> {
+        self.inner.unlock(level)
+    }
+
+    fn lock_level(&self) -> LockLevel {
+        self.inner.lock_level()
+    }
+
+    fn check_reserved_lock(&self) -> sqliters::Result<bool> {
+        self.inner.check_reserved_lock()
+    }
+
+    fn sector_size(&self) -> u32 {
+        self.inner.sector_size()
+    }
+
+    fn is_readonly(&self) -> bool {
+        self.inner.is_readonly()
+    }
+}
+
+impl Vfs for FaultVfs {
+    fn name(&self) -> &'static str {
+        "fault-vfs"
+    }
+
+    fn open(&self, path: Option<&Path>, flags: OpenFlags) -> sqliters::Result<Box<dyn VfsFile>> {
+        let is_main_db = path.is_some_and(|p| !p.to_string_lossy().ends_with("-journal"))
+            && !flags.contains(OpenFlags::MAIN_JOURNAL);
+        let inner = self.inner.open(path, flags)?;
+        Ok(Box::new(FaultFile {
+            inner,
+            is_main_db,
+            state: Arc::clone(&self.state),
+        }))
+    }
+
+    fn delete(&self, path: &Path, sync_dir: bool) -> sqliters::Result<()> {
+        if path.to_string_lossy().ends_with("-journal") {
+            let mut st = self.state.lock().unwrap();
+            if st.fail_next_journal_delete {
+                st.fail_next_journal_delete = false;
+                return Err(SqliteError::new(
+                    ErrorCode::IoErr,
+                    "injected journal delete error",
+                ));
+            }
+        }
+        self.inner.delete(path, sync_dir)
+    }
+
+    fn exists(&self, path: &Path) -> sqliters::Result<bool> {
+        self.inner.exists(path)
+    }
+
+    fn full_pathname(&self, path: &Path) -> sqliters::Result<PathBuf> {
+        self.inner.full_pathname(path)
+    }
+}
+
+#[test]
+fn test_bulgu_y1_failed_commit_partial_writes_rolled_back_atomically() {
+    let tmp = TempDb::new("y1_commit_ioerr");
+    let (vfs, fault) = FaultVfs::new();
+    let rw_flags = OpenFlags::READWRITE | OpenFlags::CREATE;
+
+    // 1. Exact scenario from `bulgular.md` Y1: fail on the 3rd main-DB `write_at` during COMMIT, then ROLLBACK!
+    {
+        let mut conn = Connection::open_with_vfs(vfs.clone(), Some(tmp.path()), rw_flags).unwrap();
+        conn.execute(
+            "CREATE TABLE t1(x); CREATE TABLE t2(y);
+             INSERT INTO t1 VALUES (10); INSERT INTO t2 VALUES (20);",
+        )
+        .unwrap();
+
+        conn.execute("BEGIN; UPDATE t1 SET x = 11; UPDATE t2 SET y = 21;")
+            .unwrap();
+        {
+            let mut st = fault.lock().unwrap();
+            st.main_writes_seen = 0;
+            st.fail_on_main_write_nth = Some(3);
+        }
+
+        let commit_err = conn.execute("COMMIT;").unwrap_err();
+        assert_eq!(commit_err.code, ErrorCode::IoErr);
+        assert!(!conn.is_autocommit(), "tx must remain active after failed COMMIT");
+
+        conn.execute("ROLLBACK;").unwrap();
+        assert!(conn.is_autocommit());
+    }
+
+    // Reopen fresh from disk and verify BOTH Rust and C `sqlite3` see `(10, 20)` and `integrity_check = ok`!
+    assert_eq!(
+        run_c_sqlite3(tmp.path(), "SELECT (SELECT x FROM t1), (SELECT y FROM t2);"),
+        "10|20"
+    );
+    assert_eq!(run_c_sqlite3(tmp.path(), "PRAGMA integrity_check;"), "ok");
+
+    // 2. Test failure on `truncate`, `sync`, and `journal delete` during COMMIT followed by ROLLBACK!
+    for mode in ["truncate", "sync", "delete"] {
+        let mut conn = Connection::open_with_vfs(vfs.clone(), Some(tmp.path()), rw_flags).unwrap();
+        conn.execute("BEGIN; UPDATE t1 SET x = 99; CREATE TABLE extra_tbl(z); INSERT INTO extra_tbl VALUES ('grow');")
+            .unwrap();
+        {
+            let mut st = fault.lock().unwrap();
+            match mode {
+                "truncate" => {
+                    // Drop or grow to trigger truncate on commit or rollback
+                    st.fail_next_truncate = true;
+                }
+                "sync" => st.fail_next_main_sync = true,
+                "delete" => st.fail_next_journal_delete = true,
+                _ => unreachable!(),
+            }
+        }
+        if mode == "truncate" {
+            // Commit the growth first, then drop `extra_tbl` so `VACUUM` shrinks `page_count` and
+            // triggers `file.truncate` inside `Pager::commit()`, and ALSO test `BEGIN ... COMMIT`
+            // hitting `file.truncate` when trailing bytes exist on disk!
+            fault.lock().unwrap().fail_next_truncate = false;
+            conn.execute("COMMIT;").unwrap();
+            conn.execute("DROP TABLE extra_tbl;").unwrap();
+
+            // (a) `VACUUM` commit hitting `file.truncate` I/O error -> rolls back cleanly!
+            fault.lock().unwrap().fail_next_truncate = true;
+            let vac_err = conn.execute("VACUUM;").unwrap_err();
+            assert_eq!(vac_err.code, ErrorCode::IoErr);
+            assert!(conn.is_autocommit());
+
+            // (b) Explicit `BEGIN ... COMMIT` hitting `file.truncate` I/O error -> `ROLLBACK` restores `(99, 20)`!
+            let cur_len = fs::metadata(tmp.path()).unwrap().len();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(tmp.path())
+                .unwrap()
+                .set_len(cur_len + 4096)
+                .unwrap();
+            conn.execute("BEGIN; UPDATE t1 SET x = 77;").unwrap();
+            fault.lock().unwrap().fail_next_truncate = true;
+            let err = conn.execute("COMMIT;").unwrap_err();
+            assert_eq!(err.code, ErrorCode::IoErr);
+            // `ROLLBACK;` restores `t1 = 99` and truncates trailing bytes back to `cur_len`!
+            conn.execute("ROLLBACK;").unwrap();
+            drop(conn);
+            assert_eq!(run_c_sqlite3(tmp.path(), "SELECT x FROM t1;"), "99");
+            assert_eq!(run_c_sqlite3(tmp.path(), "PRAGMA integrity_check;"), "ok");
+            // Reset t1 back to 10 and compact cleanly
+            let mut clean = Connection::open(tmp.path()).unwrap();
+            clean.execute("UPDATE t1 SET x = 10; VACUUM;").unwrap();
+        } else {
+            let err = conn.execute("COMMIT;").unwrap_err();
+            assert_eq!(err.code, ErrorCode::IoErr);
+            conn.execute("ROLLBACK;").unwrap();
+            drop(conn);
+            assert_eq!(
+                run_c_sqlite3(tmp.path(), "SELECT (SELECT x FROM t1), (SELECT y FROM t2);"),
+                "10|20"
+            );
+            assert_eq!(run_c_sqlite3(tmp.path(), "PRAGMA integrity_check;"), "ok");
+        }
+    }
+
+    // 3. Test persistent disk write failure DURING `ROLLBACK` after partial `COMMIT`:
+    //    `<db>-journal` MUST be preserved on disk so the next reopen recovers `(10, 20)`!
+    {
+        let mut conn = Connection::open_with_vfs(vfs.clone(), Some(tmp.path()), rw_flags).unwrap();
+        conn.execute("BEGIN; UPDATE t1 SET x = 555; UPDATE t2 SET y = 666;")
+            .unwrap();
+        {
+            let mut st = fault.lock().unwrap();
+            st.main_writes_seen = 0;
+            st.fail_on_main_write_nth = Some(2);
+        }
+        assert_eq!(conn.execute("COMMIT;").unwrap_err().code, ErrorCode::IoErr);
+
+        // Inject persistent write failure so `ROLLBACK;` itself fails to restore `.db`
+        fault.lock().unwrap().fail_all_main_writes = true;
+        assert_eq!(conn.execute("ROLLBACK;").unwrap_err().code, ErrorCode::IoErr);
+        drop(conn);
+    }
+    assert!(
+        tmp.journal_path().exists(),
+        "hot journal MUST be preserved when rollback disk writes fail!"
+    );
+    fault.lock().unwrap().fail_all_main_writes = false;
+
+    // Reopening now recovers from the preserved hot journal!
+    {
+        let mut recovered = Connection::open(tmp.path()).unwrap();
+        let row = recovered
+            .query_row("SELECT (SELECT x FROM t1), (SELECT y FROM t2);", &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.get_i64(0), Some(10));
+        assert_eq!(row.get_i64(1), Some(20));
+    }
+    assert_eq!(run_c_sqlite3(tmp.path(), "PRAGMA integrity_check;"), "ok");
+}
+
+// ============================================================================
+// Finding Y2: Multi-header C SQLite spilled journal playback & sector-aligned Rust journal
+// ============================================================================
+
+#[test]
+fn test_bulgu_y2_multi_header_spilled_journal_and_bidirectional_c_recovery() {
+    // 1. Exact C SQLite crash reproducer from `bulgular.md` Y2:
+    //    `page_size=1024`, 200 rows with 400-char padding, `cache_size=5; BEGIN IMMEDIATE; UPDATE t SET x=1`,
+    //    kill C `sqlite3` before COMMIT so a multi-header spilled rollback journal is left on disk!
+    let tmp_base = TempDb::new("y2_c_spill_base");
+    run_c_sqlite3(
+        tmp_base.path(),
+        "PRAGMA page_size = 1024;
+         CREATE TABLE t(id INTEGER PRIMARY KEY, x INT, pad TEXT);
+         WITH RECURSIVE cnt(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM cnt WHERE i < 200)
+         INSERT INTO t SELECT i, 0, zeroblob(0) || replace(hex(zeroblob(200)), '00', 'ab') FROM cnt;",
+    );
+
+    let mut c_proc = InteractiveSqlProc::spawn_c_sqlite3(tmp_base.path());
+    c_proc.send_and_wait_marker(
+        "PRAGMA cache_size = 5;\nBEGIN IMMEDIATE;\nUPDATE t SET x = 1;",
+        "SPILLED_UNCOMMITTED",
+    );
+    // Kill C `sqlite3` abruptly (SIGKILL via `Child::kill`) before COMMIT!
+    let _ = c_proc.child.kill();
+    let _ = c_proc.child.wait();
+    assert!(tmp_base.journal_path().exists());
+
+    // Copy crashed `(db, -journal)` to two separate paths and recover one with C `sqlite3` and one with Rust!
+    let copy_for_c = TempDb::new("y2_copy_c");
+    let copy_for_r = TempDb::new("y2_copy_r");
+    fs::copy(tmp_base.path(), copy_for_c.path()).unwrap();
+    fs::copy(tmp_base.journal_path(), copy_for_c.journal_path()).unwrap();
+    fs::copy(tmp_base.path(), copy_for_r.path()).unwrap();
+    fs::copy(tmp_base.journal_path(), copy_for_r.journal_path()).unwrap();
+
+    assert_eq!(
+        run_c_sqlite3(copy_for_c.path(), "SELECT count(*), sum(x) FROM t;"),
+        "200|0"
+    );
+    assert_eq!(run_c_sqlite3(copy_for_c.path(), "PRAGMA integrity_check;"), "ok");
+
+    {
+        let mut r_conn = Connection::open(copy_for_r.path()).unwrap();
+        let row = r_conn
+            .query_row("SELECT count(*), sum(x) FROM t;", &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.get_i64(0), Some(200));
+        assert_eq!(
+            row.get_i64(1),
+            Some(0),
+            "Rust MUST replay ALL spilled journal headers back to sum(x)=0!"
+        );
+    }
+    assert_eq!(run_c_sqlite3(copy_for_r.path(), "PRAGMA integrity_check;"), "ok");
+    assert_eq!(
+        run_c_sqlite3(copy_for_r.path(), "SELECT count(*), sum(x) FROM t;"),
+        "200|0"
+    );
+
+    // 2. Reverse direction: crash/fail Rust mid-COMMIT (with finalized journal header & default 4096 sector size),
+    //    and let C `/usr/bin/sqlite3` recover the Rust-written hot journal!
+    let tmp_r_crash = TempDb::new("y2_rust_journal_for_c");
+    let (vfs, fault) = FaultVfs::new();
+    let rw_flags = OpenFlags::READWRITE | OpenFlags::CREATE;
+    {
+        let mut conn =
+            Connection::open_with_vfs(vfs.clone(), Some(tmp_r_crash.path()), rw_flags).unwrap();
+        conn.execute("CREATE TABLE t(x INT); INSERT INTO t VALUES (10);")
+            .unwrap();
+        conn.execute("BEGIN; UPDATE t SET x = 999;").unwrap();
+        {
+            let mut st = fault.lock().unwrap();
+            st.main_writes_seen = 0;
+            // Let Page 1 write succeed, fail on Page 2 write AND block rollback writes so finalized Rust journal stays on disk!
+            st.fail_on_main_write_nth = Some(2);
+        }
+        assert!(conn.execute("COMMIT;").is_err());
+        fault.lock().unwrap().fail_all_main_writes = true;
+        drop(conn);
+    }
+    assert!(tmp_r_crash.journal_path().exists());
+
+    // C `sqlite3` opens and recovers the Rust hot journal cleanly!
+    assert_eq!(run_c_sqlite3(tmp_r_crash.path(), "SELECT x FROM t;"), "10");
+    assert_eq!(
+        run_c_sqlite3(tmp_r_crash.path(), "PRAGMA integrity_check;"),
+        "ok"
+    );
+}
+
+// ============================================================================
+// Finding Y3: External DDL across connections invalidates cached schema & prepared statements
+// ============================================================================
+
+#[test]
+fn test_bulgu_y3_cross_connection_ddl_refreshes_schema_and_prevents_wrong_table_write() {
+    let tmp = TempDb::new("y3_schema_cookie");
+    let mut conn_a = Connection::open(tmp.path()).unwrap();
+    let mut conn_b = Connection::open(tmp.path()).unwrap();
+
+    // Exact reproduction from `bulgular.md` Y3:
+    conn_a
+        .execute("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+        .unwrap();
+    let b_initial = conn_b.query("SELECT * FROM t;", &[]).unwrap();
+    assert_eq!(b_initial.rows.len(), 1);
+    assert_eq!(b_initial.rows[0].get_i64(0), Some(1));
+
+    // Also prepare a SELECT statement on B BEFORE A drops `t`!
+    let mut b_prepared_sel = conn_b.prepare("SELECT * FROM t;").unwrap();
+    assert!(matches!(b_prepared_sel.step().unwrap(), sqliters::StepResult::Row(_)));
+    b_prepared_sel.reset();
+
+    conn_a
+        .execute("DROP TABLE t; CREATE TABLE u(x); INSERT INTO u VALUES (99);")
+        .unwrap();
+
+    // Prepared SELECT on B must detect schema change on next `step()` and fail with `no such table: t`!
+    let prep_err = b_prepared_sel.step().unwrap_err();
+    assert!(
+        prep_err.message.contains("no such table: t"),
+        "expected no such table: t, got: {}",
+        prep_err.message
+    );
+    drop(b_prepared_sel);
+
+    // `INSERT INTO t` on B MUST fail with `no such table: t` and NEVER write into `u`!
+    let ins_err = conn_b.execute("INSERT INTO t VALUES (2);").unwrap_err();
+    assert!(
+        ins_err.message.contains("no such table: t"),
+        "expected no such table: t, got: {}",
+        ins_err.message
+    );
+
+    // Verify `u` only contains `99` and `integrity_check` is `ok`!
+    let u_rows = conn_a.query("SELECT x FROM u;", &[]).unwrap();
+    assert_eq!(u_rows.rows.len(), 1);
+    assert_eq!(u_rows.rows[0].get_i64(0), Some(99));
+    assert_eq!(run_c_sqlite3(tmp.path(), "PRAGMA integrity_check;"), "ok");
+}
+
+// ============================================================================
+// Finding Y4: `auto_vacuum` (`FULL` & `INCREMENTAL`) databases protected against ptrmap corruption
+// ============================================================================
+
+#[test]
+fn test_bulgu_y4_auto_vacuum_databases_read_cleanly_and_reject_writes_safely() {
+    for (mode_num, label) in [(1, "full"), (2, "incremental")] {
+        let tmp = TempDb::new(&format!("y4_autovac_{label}"));
+        run_c_sqlite3(
+            tmp.path(),
+            &format!(
+                "PRAGMA page_size = 512;
+                 PRAGMA auto_vacuum = {mode_num};
+                 CREATE TABLE t(x TEXT);
+                 INSERT INTO t VALUES ('initial');"
+            ),
+        );
+
+        {
+            let mut conn = Connection::open(tmp.path()).unwrap();
+            // Reading an auto-vacuum database works seamlessly
+            let r = conn.query("SELECT x FROM t;", &[]).unwrap();
+            assert_eq!(r.rows.len(), 1);
+            assert_eq!(r.rows[0].get_str(0), Some("initial"));
+
+            // Writing to an auto-vacuum database is explicitly rejected before modifying any page
+            let long_str = "z".repeat(180);
+            let err = conn
+                .execute_params("INSERT INTO t VALUES (?1);", &[Value::Text(long_str)])
+                .unwrap_err();
+            assert!(
+                err.message.contains("auto_vacuum"),
+                "expected auto_vacuum error, got: {}",
+                err.message
+            );
+        }
+
+        // C `PRAGMA integrity_check` remains 100% `ok`!
+        assert_eq!(run_c_sqlite3(tmp.path(), "PRAGMA integrity_check;"), "ok");
+        assert_eq!(run_c_sqlite3(tmp.path(), "SELECT count(*) FROM t;"), "1");
+    }
+}
+
+// ============================================================================
+// Finding Y5: Genuine Index-B-Tree `WITHOUT ROWID` storage & bidirectional C compatibility
+// ============================================================================
+
+#[test]
+fn test_bulgu_y5_without_rowid_index_btree_bidirectional_c_compatibility() {
+    // 1. Exact reproduction from `bulgular.md` Y5:
+    //    `CREATE TABLE t(a TEXT PRIMARY KEY) WITHOUT ROWID; INSERT INTO t VALUES('a');`
+    let tmp_exact = TempDb::new("y5_exact_repro");
+    {
+        let mut conn = Connection::open(tmp_exact.path()).unwrap();
+        conn.execute(
+            "CREATE TABLE t(a TEXT PRIMARY KEY) WITHOUT ROWID;
+             INSERT INTO t VALUES ('a');",
+        )
+        .unwrap();
+
+        // Implicit `rowid` does not exist on WITHOUT ROWID tables, and PK is implicitly NOT NULL
+        assert!(conn.query("SELECT rowid FROM t;", &[]).is_err());
+        let nn_err = conn.execute("INSERT INTO t VALUES (NULL);").unwrap_err();
+        assert_eq!(nn_err.extended_code, extended::SQLITE_CONSTRAINT_NOTNULL);
+        let pk_err = conn.execute("INSERT INTO t VALUES ('a');").unwrap_err();
+        assert_eq!(pk_err.extended_code, extended::SQLITE_CONSTRAINT_PRIMARYKEY);
+
+        // Error checks for invalid WITHOUT ROWID definitions
+        let missing_pk = conn
+            .execute("CREATE TABLE no_pk(x INT, y TEXT) WITHOUT ROWID;")
+            .unwrap_err();
+        assert!(missing_pk.message.contains("PRIMARY KEY missing"));
+        let bad_autoinc = conn
+            .execute("CREATE TABLE bad_ai(x INTEGER PRIMARY KEY AUTOINCREMENT) WITHOUT ROWID;")
+            .unwrap_err();
+        assert!(bad_autoinc.message.contains("AUTOINCREMENT"));
+    }
+    assert_eq!(
+        run_c_sqlite3(tmp_exact.path(), "PRAGMA integrity_check;"),
+        "ok"
+    );
+    assert_eq!(run_c_sqlite3(tmp_exact.path(), "SELECT a FROM t;"), "a");
+    assert_eq!(
+        run_c_sqlite3(tmp_exact.path(), "SELECT count(*) FROM sqlite_schema;"),
+        "1"
+    );
+
+    // 2. Split composite PK out of column declaration order + secondary UNIQUE & non-unique indexes,
+    //    multi-page splits, OR REPLACE / OR IGNORE, UPDATE, DELETE, ALTER TABLE ADD COLUMN, and VACUUM!
+    let tmp_complex = TempDb::new("y5_rust_to_c_complex");
+    {
+        let mut conn = Connection::open(tmp_complex.path()).unwrap();
+        conn.execute(
+            "PRAGMA page_size = 1024;
+             CREATE TABLE comp(
+                 v1 TEXT,
+                 k1 INT,
+                 u_tag TEXT UNIQUE,
+                 k2 TEXT COLLATE NOCASE,
+                 PRIMARY KEY(k1, k2 DESC)
+             ) WITHOUT ROWID;
+             CREATE INDEX idx_comp_v1 ON comp(v1);",
+        )
+        .unwrap();
+
+        for i in 1..=80 {
+            conn.execute_params(
+                "INSERT INTO comp VALUES (?1, ?2, ?3, ?4);",
+                &[
+                    Value::Text(format!("val_{}", i % 10)),
+                    Value::Integer(i % 8),
+                    Value::Text(format!("tag_{i}")),
+                    Value::Text(format!("key_{i:03}_") + &"x".repeat(40)),
+                ],
+            )
+            .unwrap();
+        }
+
+        // Case-insensitive PK collision (`k2 COLLATE NOCASE`) resolved via OR REPLACE
+        conn.execute(
+            "INSERT OR REPLACE INTO comp VALUES ('replaced', 1, 'tag_rep', 'KEY_001_' || replace(hex(zeroblob(20)), '00', 'xx'));",
+        )
+        .unwrap();
+        // Secondary UNIQUE conflict resolved via OR IGNORE
+        conn.execute(
+            "INSERT OR IGNORE INTO comp VALUES ('ignored', 99, 'tag_2', 'unique_k2');",
+        )
+        .unwrap();
+        // UPDATE both PK and non-PK columns, DELETE a subset, ADD COLUMN with DEFAULT, and VACUUM
+        conn.execute(
+            "UPDATE comp SET k1 = 100, v1 = 'moved' WHERE u_tag = 'tag_3';
+             DELETE FROM comp WHERE k1 = 0;
+             ALTER TABLE comp ADD COLUMN extra_num INT DEFAULT 77;
+             VACUUM;",
+        )
+        .unwrap();
+
+        let chk = conn.query("PRAGMA integrity_check;", &[]).unwrap();
+        assert_eq!(chk.rows[0].get_str(0), Some("ok"));
+    }
+    assert_eq!(
+        run_c_sqlite3(tmp_complex.path(), "PRAGMA integrity_check;"),
+        "ok"
+    );
+    assert_eq!(
+        run_c_sqlite3(
+            tmp_complex.path(),
+            "SELECT k1, v1, extra_num FROM comp WHERE u_tag = 'tag_3';"
+        ),
+        "100|moved|77"
+    );
+    assert_eq!(
+        run_c_sqlite3(tmp_complex.path(), "SELECT count(*) FROM comp;"),
+        "70"
+    );
+
+    // 3. Reverse direction: C `sqlite3` creates and populates a `WITHOUT ROWID` database,
+    //    Rust reads/updates/deletes/inserts on it, and C `PRAGMA integrity_check` verifies `ok`!
+    let tmp_c_to_r = TempDb::new("y5_c_to_rust");
+    run_c_sqlite3(
+        tmp_c_to_r.path(),
+        "CREATE TABLE wr(payload TEXT, p1 INT, p2 TEXT, uniq_code INT UNIQUE, PRIMARY KEY(p1, p2)) WITHOUT ROWID;
+         CREATE INDEX idx_wr_payload ON wr(payload);
+         INSERT INTO wr VALUES ('alpha', 1, 'one', 100), ('beta', 1, 'two', 200), ('gamma', 2, 'one', 300);",
+    );
+    {
+        let mut conn = Connection::open(tmp_c_to_r.path()).unwrap();
+        // Point PK seek
+        let r = conn
+            .query_row(
+                "SELECT payload, uniq_code FROM wr WHERE p1 = 1 AND p2 = 'two';",
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.get_str(0), Some("beta"));
+        assert_eq!(r.get_i64(1), Some(200));
+
+        // Secondary index seek
+        let r2 = conn
+            .query_row("SELECT p1, p2 FROM wr WHERE payload = 'gamma';", &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(r2.get_i64(0), Some(2));
+        assert_eq!(r2.get_str(1), Some("one"));
+
+        // Mutate in Rust
+        conn.execute(
+            "UPDATE wr SET p2 = 'TWO_UPDATED', payload = 'beta2' WHERE uniq_code = 200;
+             DELETE FROM wr WHERE p1 = 1 AND p2 = 'one';
+             INSERT INTO wr VALUES ('delta', 3, 'three', 400);",
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        run_c_sqlite3(tmp_c_to_r.path(), "PRAGMA integrity_check;"),
+        "ok"
+    );
+    assert_eq!(
+        run_c_sqlite3(
+            tmp_c_to_r.path(),
+            "SELECT p1, p2, payload, uniq_code FROM wr ORDER BY p1, p2;"
+        ),
+        "1|TWO_UPDATED|beta2|200\n2|one|gamma|300\n3|three|delta|400"
+    );
+}
+
+// ============================================================================
+// Finding Y6: Turkish / Unicode identifiers around 7-byte UTF-8 boundaries never panic
+// ============================================================================
+
+#[test]
+fn test_bulgu_y6_unicode_identifiers_no_utf8_slice_panic() {
+    let tmp = TempDb::new("y6_unicode_ident");
+    {
+        let mut conn = Connection::open(tmp.path()).unwrap();
+        // `"çççç"` is 8 bytes (four 2-byte UTF-8 chars: byte 7 is inside the 4th `'ç'`)!
+        conn.execute(
+            r#"
+            CREATE TABLE "çççç"(x INT);
+            INSERT INTO "çççç" VALUES (1);
+            CREATE INDEX "ğğğğ" ON "çççç"(x);
+            CREATE TABLE "öööö" AS SELECT x FROM "çççç";
+            ALTER TABLE "öööö" RENAME TO "şşşş";
+            "#,
+        )
+        .unwrap();
+
+        let r1 = conn.query(r#"SELECT x FROM "çççç";"#, &[]).unwrap();
+        assert_eq!(r1.rows[0].get_i64(0), Some(1));
+        let r2 = conn.query(r#"SELECT x FROM "şşşş";"#, &[]).unwrap();
+        assert_eq!(r2.rows[0].get_i64(0), Some(1));
+
+        // Reserved `sqlite_` prefix check still works properly
+        assert!(conn.execute("CREATE TABLE sqlite_bad(x);").is_err());
+        assert!(conn.execute(r#"ALTER TABLE "çççç" RENAME TO sqlite_bad;"#).is_err());
+
+        // Also test date/time functions with multi-byte strings around byte 10 / fractional seconds
+        let dt = conn
+            .query_row("SELECT date('2026-01-çç'), time('12:30:00.1çç');", &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(dt.get(0), Some(&Value::Null));
+        assert_eq!(dt.get(1), Some(&Value::Null));
+    }
+    assert_eq!(run_c_sqlite3(tmp.path(), "PRAGMA integrity_check;"), "ok");
+}
+
+// ============================================================================
+// Finding Y7: `STRICT` table `ANY` column preserves storage class & text leading zeros
+// ============================================================================
+
+#[test]
+fn test_bulgu_y7_strict_any_preserves_storage_class_and_leading_zeros() {
+    let tmp = TempDb::new("y7_strict_any");
+    {
+        let mut conn = Connection::open(tmp.path()).unwrap();
+        conn.execute(
+            "CREATE TABLE t(
+                id INTEGER PRIMARY KEY,
+                x ANY,
+                g ANY GENERATED ALWAYS AS (x) VIRTUAL
+             ) STRICT;
+             INSERT INTO t(id, x) VALUES
+                (1, '000123'),
+                (2, 456),
+                (3, 3.25),
+                (4, X'CAFE'),
+                (5, NULL);",
+        )
+        .unwrap();
+
+        let rows = conn
+            .query("SELECT typeof(x), x, typeof(g), g FROM t ORDER BY id;", &[])
+            .unwrap()
+            .rows;
+        assert_eq!(rows[0].get_str(0), Some("text"));
+        assert_eq!(rows[0].get_str(1), Some("000123"));
+        assert_eq!(rows[0].get_str(2), Some("text"));
+        assert_eq!(rows[0].get_str(3), Some("000123"));
+
+        assert_eq!(rows[1].get_str(0), Some("integer"));
+        assert_eq!(rows[1].get_i64(1), Some(456));
+        assert_eq!(rows[2].get_str(0), Some("real"));
+        assert_eq!(rows[3].get_str(0), Some("blob"));
+        assert_eq!(rows[4].get_str(0), Some("null"));
+
+        // UPDATE on STRICT ANY also preserves `'007'` as `text`!
+        conn.execute("UPDATE t SET x = '007' WHERE id = 2;").unwrap();
+        let u = conn
+            .query_row("SELECT typeof(x), x FROM t WHERE id = 2;", &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(u.get_str(0), Some("text"));
+        assert_eq!(u.get_str(1), Some("007"));
+
+        // Invalid datatype in STRICT table is rejected
+        assert!(conn.execute("CREATE TABLE bad_strict(a VARCHAR(10)) STRICT;").is_err());
+        assert!(conn.execute("CREATE TABLE bad_strict2(a) STRICT;").is_err());
+    }
+    assert_eq!(run_c_sqlite3(tmp.path(), "PRAGMA integrity_check;"), "ok");
+    assert_eq!(
+        run_c_sqlite3(tmp.path(), "SELECT typeof(x), x FROM t WHERE id = 1;"),
+        "text|000123"
+    );
+}
+
+// ============================================================================
+// Finding Y8: `ALTER TABLE ADD COLUMN` validates `CHECK`, virtual `NOT NULL`, and `STRICT` on existing rows
+// ============================================================================
+
+#[test]
+fn test_bulgu_y8_alter_table_add_column_validates_existing_rows() {
+    let tmp = TempDb::new("y8_add_col_check");
+    {
+        let mut conn = Connection::open(tmp.path()).unwrap();
+        conn.execute("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+            .unwrap();
+
+        // Exact reproducer from `bulgular.md` Y8:
+        let err = conn
+            .execute("ALTER TABLE t ADD COLUMN y INT CHECK(y > 0) DEFAULT -1;")
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Constraint);
+        assert!(err.message.contains("CHECK constraint failed"));
+
+        // Schema must remain unchanged (`t` still has only column `x`)!
+        let r = conn.query("SELECT * FROM t;", &[]).unwrap();
+        assert_eq!(r.column_names, vec!["x"]);
+        assert_eq!(r.rows[0].get_i64(0), Some(1));
+
+        // Virtual generated NOT NULL column evaluating to NULL on existing row must also fail!
+        let g_err = conn
+            .execute("ALTER TABLE t ADD COLUMN z INT GENERATED ALWAYS AS (NULL) VIRTUAL NOT NULL;")
+            .unwrap_err();
+        assert_eq!(g_err.code, ErrorCode::Constraint);
+
+        // Valid `ADD COLUMN` with satisfied `CHECK` succeeds!
+        conn.execute("ALTER TABLE t ADD COLUMN y INT CHECK(y > 0) DEFAULT 5;")
+            .unwrap();
+        let r2 = conn.query("SELECT x, y FROM t;", &[]).unwrap();
+        assert_eq!(r2.rows[0].get_i64(1), Some(5));
+    }
+    assert_eq!(run_c_sqlite3(tmp.path(), "PRAGMA integrity_check;"), "ok");
+}
+
+// ============================================================================
+// Finding Y9: `BEGIN EXCLUSIVE` acquires `EXCLUSIVE` lock immediately (blocks readers & fails on active reader)
+// ============================================================================
+
+#[test]
+fn test_bulgu_y9_begin_exclusive_blocks_external_readers_and_conflicts_with_shared() {
+    let tmp = TempDb::new("y9_begin_excl");
+    let mut conn1 = Connection::open(tmp.path()).unwrap();
+    conn1
+        .execute("CREATE TABLE t(x INT); INSERT INTO t VALUES (1);")
+        .unwrap();
+
+    // 1. While `BEGIN EXCLUSIVE` is held in Rust, an external `/usr/bin/sqlite3` `SELECT` MUST fail with `database is locked`!
+    conn1.execute("BEGIN EXCLUSIVE;").unwrap();
+    let c_out = Command::new("sqlite3")
+        .arg("-batch")
+        .arg(tmp.path())
+        .arg("SELECT * FROM t;")
+        .output()
+        .expect("spawn sqlite3");
+    assert!(
+        !c_out.status.success(),
+        "external C sqlite3 SELECT must fail while Rust holds BEGIN EXCLUSIVE"
+    );
+    let stderr = String::from_utf8_lossy(&c_out.stderr);
+    assert!(
+        stderr.contains("database is locked"),
+        "expected 'database is locked', got: {stderr}"
+    );
+    conn1.execute("COMMIT;").unwrap();
+
+    // After COMMIT, external C `sqlite3` `SELECT` succeeds!
+    assert_eq!(run_c_sqlite3(tmp.path(), "SELECT * FROM t;"), "1");
+
+    // 2. Conversely, if another connection holds a SHARED read lock (both in-process and cross-process),
+    // `BEGIN EXCLUSIVE` MUST fail immediately with `Busy`!
+    let mut conn2 = Connection::open(tmp.path()).unwrap();
+    conn2.execute("INSERT INTO t VALUES (2);").unwrap();
+    let mut active_scan = conn2.prepare("SELECT x FROM t;").unwrap();
+    assert!(matches!(
+        active_scan.step().unwrap(),
+        sqliters::StepResult::Row(_)
+    ));
+    // `active_scan` currently holds a SHARED read lock on `conn2`!
+    let excl_err = conn1.execute("BEGIN EXCLUSIVE;").unwrap_err();
+    assert_eq!(excl_err.code, ErrorCode::Busy);
+    assert!(conn1.is_autocommit());
+    drop(active_scan);
+
+    // Cross-process C/Python `sqlite3` holding a `SHARED` read lock via unclosed cursor inside `BEGIN`:
+    let mut py_reader = Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sqlite3, sys\n\
+             conn = sqlite3.connect(sys.argv[1], isolation_level=None)\n\
+             conn.execute('BEGIN')\n\
+             cur = conn.execute('SELECT x FROM t')\n\
+             cur.fetchone()\n\
+             print('HOLDING_SHARED', flush=True)\n\
+             sys.stdin.readline()\n\
+             cur.close()\n\
+             conn.execute('ROLLBACK')\n\
+             conn.close()\n",
+        )
+        .arg(tmp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn python3 sqlite3 reader");
+    {
+        let mut reader_out = BufReader::new(py_reader.stdout.take().unwrap());
+        let mut line = String::new();
+        reader_out.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "HOLDING_SHARED");
+    }
+    let excl_err_cross = conn1.execute("BEGIN EXCLUSIVE;").unwrap_err();
+    assert_eq!(excl_err_cross.code, ErrorCode::Busy);
+    assert!(conn1.is_autocommit());
+    drop(py_reader.stdin.take());
+    assert!(py_reader.wait().unwrap().success());
+
+    // Once reader finishes, `BEGIN EXCLUSIVE` succeeds!
+    conn1.execute("BEGIN EXCLUSIVE; COMMIT;").unwrap();
+}
+
+// ============================================================================
+// Finding Y10: Bare column with `MIN(x)` / `MAX(x)` comes from the extremum row
+// ============================================================================
+
+#[test]
+fn test_bulgu_y10_min_max_bare_column_selected_from_extremum_row() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute(
+        "CREATE TABLE t(grp TEXT, a INT, b TEXT);
+         INSERT INTO t VALUES
+            ('g1', 1, 'one'),
+            ('g1', 3, 'three'),
+            ('g1', 2, 'two'),
+            ('g2', 10, 'ten'),
+            ('g2', 5, 'five');",
+    )
+    .unwrap();
+
+    // Exact ungrouped reproducer from `bulgular.md` Y10
+    let r_max = conn.query_row("SELECT max(a), b FROM t;", &[]).unwrap().unwrap();
+    assert_eq!(r_max.get_i64(0), Some(10));
+    assert_eq!(r_max.get_str(1), Some("ten"));
+
+    let r_min = conn.query_row("SELECT min(a), b FROM t;", &[]).unwrap().unwrap();
+    assert_eq!(r_min.get_i64(0), Some(1));
+    assert_eq!(r_min.get_str(1), Some("one"));
+
+    // Grouped `GROUP BY` with `MAX` and `MIN`
+    let g_max = conn
+        .query("SELECT grp, max(a), b FROM t GROUP BY grp ORDER BY grp;", &[])
+        .unwrap()
+        .rows;
+    assert_eq!(g_max[0].get_i64(1), Some(3));
+    assert_eq!(g_max[0].get_str(2), Some("three"));
+    assert_eq!(g_max[1].get_i64(1), Some(10));
+    assert_eq!(g_max[1].get_str(2), Some("ten"));
+
+    let g_min = conn
+        .query("SELECT grp, min(a), b FROM t GROUP BY grp ORDER BY grp;", &[])
+        .unwrap()
+        .rows;
+    assert_eq!(g_min[0].get_i64(1), Some(1));
+    assert_eq!(g_min[0].get_str(2), Some("one"));
+    assert_eq!(g_min[1].get_i64(1), Some(5));
+    assert_eq!(g_min[1].get_str(2), Some("five"));
+
+    // With `FILTER (WHERE ...)`
+    let r_filt = conn
+        .query_row("SELECT max(a) FILTER (WHERE a < 10), b FROM t;", &[])
+        .unwrap()
+        .unwrap();
+    assert_eq!(r_filt.get_i64(0), Some(5));
+    assert_eq!(r_filt.get_str(1), Some("five"));
+}
+
+// ============================================================================
+// Finding Y11: `BEGIN` rejected inside an implicit `SAVEPOINT` transaction
+// ============================================================================
+
+#[test]
+fn test_bulgu_y11_begin_rejected_inside_savepoint_transaction() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute("CREATE TABLE t(x INT);").unwrap();
+
+    conn.execute("SAVEPOINT x;").unwrap();
+    assert!(!conn.is_autocommit());
+
+    let err = conn.execute("BEGIN;").unwrap_err();
+    assert!(
+        err.message.contains("cannot start a transaction within a transaction"),
+        "unexpected error: {}",
+        err.message
+    );
+    assert!(!conn.is_autocommit());
+
+    // Even after `ROLLBACK TO x`, the implicit savepoint transaction is still open!
+    conn.execute("INSERT INTO t VALUES (1); ROLLBACK TO x;")
+        .unwrap();
+    assert!(conn.execute("BEGIN IMMEDIATE;").is_err());
+
+    // Releasing top-level savepoint returns to autocommit, after which `BEGIN` succeeds!
+    conn.execute("RELEASE x;").unwrap();
+    assert!(conn.is_autocommit());
+    conn.execute("BEGIN; INSERT INTO t VALUES (42); COMMIT;")
+        .unwrap();
+    assert_eq!(
+        conn.query_row("SELECT x FROM t;", &[])
+            .unwrap()
+            .unwrap()
+            .get_i64(0),
+        Some(42)
+    );
+}
+
+// ============================================================================
+// Finding Y12: Automatic rowid after negative maximum rowid (`-5` -> `-4` vs `AUTOINCREMENT` -> `1`)
+// ============================================================================
+
+#[test]
+fn test_bulgu_y12_negative_max_rowid_increment_vs_autoincrement() {
+    let tmp = TempDb::new("y12_neg_rowid");
+    {
+        let mut conn = Connection::open(tmp.path()).unwrap();
+
+        // 1. Normal rowid table: `-5` -> `-4` -> `-3`, `-1` -> `0` -> `1`
+        conn.execute(
+            "CREATE TABLE t(a TEXT);
+             INSERT INTO t(rowid, a) VALUES (-5, 'old');
+             INSERT INTO t(a) VALUES ('new');",
+        )
+        .unwrap();
+        let rows = conn
+            .query("SELECT rowid, a FROM t ORDER BY rowid;", &[])
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get_i64(0), Some(-5));
+        assert_eq!(rows[0].get_str(1), Some("old"));
+        assert_eq!(rows[1].get_i64(0), Some(-4));
+        assert_eq!(rows[1].get_str(1), Some("new"));
+
+        conn.execute("INSERT INTO t(rowid, a) VALUES (-1, 'minus_one'); INSERT INTO t(a) VALUES ('zero'); INSERT INTO t(a) VALUES ('one');")
+            .unwrap();
+        let rids: Vec<i64> = conn
+            .query("SELECT rowid FROM t ORDER BY rowid;", &[])
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r.get_i64(0).unwrap())
+            .collect();
+        assert_eq!(rids, vec![-5, -4, -1, 0, 1]);
+
+        // 2. `AUTOINCREMENT` table: `sqlite_sequence` starts at `0`, so after `-5` next rowid is `1`!
+        conn.execute(
+            "CREATE TABLE t_ai(id INTEGER PRIMARY KEY AUTOINCREMENT, a TEXT);
+             INSERT INTO t_ai VALUES (-5, 'old');
+             INSERT INTO t_ai(a) VALUES ('new');",
+        )
+        .unwrap();
+        let ai_rows = conn
+            .query("SELECT id, a FROM t_ai ORDER BY id;", &[])
+            .unwrap()
+            .rows;
+        assert_eq!(ai_rows[0].get_i64(0), Some(-5));
+        assert_eq!(ai_rows[1].get_i64(0), Some(1));
+    }
+
+    assert_eq!(run_c_sqlite3(tmp.path(), "PRAGMA integrity_check;"), "ok");
 }

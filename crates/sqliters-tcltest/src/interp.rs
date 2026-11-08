@@ -2700,12 +2700,12 @@ pub fn parse_tcl_index(spec: &str, len: usize) -> Result<i64, String> {
     if let Some(i) = parse_tcl_int(t) {
         return Ok(i);
     }
-    if let Some(plus) = t[1..].find('+').map(|p| p + 1) {
+    if let Some(plus) = t.get(1..).and_then(|s| s.find('+')).map(|p| p + 1) {
         let a = parse_tcl_int(&t[..plus]).ok_or_else(|| format!("bad index \"{spec}\""))?;
         let b = parse_tcl_int(&t[plus + 1..]).ok_or_else(|| format!("bad index \"{spec}\""))?;
         return Ok(a + b);
     }
-    if let Some(minus) = t[1..].find('-').map(|p| p + 1) {
+    if let Some(minus) = t.get(1..).and_then(|s| s.find('-')).map(|p| p + 1) {
         let a = parse_tcl_int(&t[..minus]).ok_or_else(|| format!("bad index \"{spec}\""))?;
         let b = parse_tcl_int(&t[minus + 1..]).ok_or_else(|| format!("bad index \"{spec}\""))?;
         return Ok(a - b);

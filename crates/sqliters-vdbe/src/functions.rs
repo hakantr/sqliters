@@ -585,14 +585,14 @@ fn parse_iso_datetime_ms(s: &str) -> Option<i64> {
     // Supports "YYYY-MM-DD", "YYYY-MM-DD HH:MM[:SS]", "YYYY-MM-DDTHH:MM[:SS][Z]", or "HH:MM[:SS]"
     let s = s.strip_suffix('Z').or_else(|| s.strip_suffix('z')).unwrap_or(s);
     if s.len() >= 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-' {
-        let y: i64 = s[0..4].parse().ok()?;
-        let m: u32 = s[5..7].parse().ok()?;
-        let d: u32 = s[8..10].parse().ok()?;
+        let y: i64 = s.get(0..4)?.parse().ok()?;
+        let m: u32 = s.get(5..7)?.parse().ok()?;
+        let d: u32 = s.get(8..10)?.parse().ok()?;
         if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
             return None;
         }
         let days = days_from_civil(y, m, d);
-        let rest = s[10..].trim_start_matches([' ', 'T', 't']);
+        let rest = s.get(10..)?.trim_start_matches([' ', 'T', 't']);
         let hms_ms = if rest.is_empty() {
             0
         } else {
@@ -618,8 +618,10 @@ fn parse_hms_ms(s: &str) -> Option<i64> {
     let (ss, ms) = if parts.len() == 3 {
         if let Some((sec_part, frac_part)) = parts[2].split_once('.') {
             let sec: u32 = sec_part.parse().ok()?;
-            let mut frac_digits = String::from(frac_part);
-            frac_digits.truncate(3);
+            if !frac_part.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let mut frac_digits: String = frac_part.chars().take(3).collect();
             while frac_digits.len() < 3 {
                 frac_digits.push('0');
             }
@@ -1015,7 +1017,9 @@ impl AggregateKind {
 pub struct AggregateAccumulator {
     kind: AggregateKind,
     distinct: bool,
+    collation: Collation,
     seen: HashSet<Vec<u8>>,
+    seen_collated: Vec<Value>,
     count: i64,
     int_sum: i128,
     float_sum: f64,
@@ -1026,10 +1030,16 @@ pub struct AggregateAccumulator {
 
 impl AggregateAccumulator {
     pub fn new(kind: AggregateKind, distinct: bool) -> Self {
+        Self::new_with_collation(kind, distinct, Collation::Binary)
+    }
+
+    pub fn new_with_collation(kind: AggregateKind, distinct: bool, collation: Collation) -> Self {
         Self {
             kind,
             distinct,
+            collation,
             seen: HashSet::new(),
+            seen_collated: Vec::new(),
             count: 0,
             int_sum: 0,
             float_sum: 0.0,
@@ -1051,9 +1061,20 @@ impl AggregateAccumulator {
             return Ok(());
         }
         if self.distinct {
-            let key = sqliters_types::encode_record(&[first.clone()]);
-            if !self.seen.insert(key) {
-                return Ok(());
+            if self.collation == Collation::Binary {
+                let key = sqliters_types::encode_record(&[first.clone()]);
+                if !self.seen.insert(key) {
+                    return Ok(());
+                }
+            } else {
+                if self
+                    .seen_collated
+                    .iter()
+                    .any(|v| v.cmp_sqlite(first, self.collation).is_eq())
+                {
+                    return Ok(());
+                }
+                self.seen_collated.push(first.clone());
             }
         }
 
@@ -1087,7 +1108,7 @@ impl AggregateAccumulator {
             AggregateKind::Min => {
                 let replace = match &self.best {
                     None => true,
-                    Some(cur) => first.cmp_sqlite(cur, Collation::Binary).is_lt(),
+                    Some(cur) => first.cmp_sqlite(cur, self.collation).is_lt(),
                 };
                 if replace {
                     self.best = Some(first.clone());
@@ -1096,7 +1117,7 @@ impl AggregateAccumulator {
             AggregateKind::Max => {
                 let replace = match &self.best {
                     None => true,
-                    Some(cur) => first.cmp_sqlite(cur, Collation::Binary).is_gt(),
+                    Some(cur) => first.cmp_sqlite(cur, self.collation).is_gt(),
                 };
                 if replace {
                     self.best = Some(first.clone());

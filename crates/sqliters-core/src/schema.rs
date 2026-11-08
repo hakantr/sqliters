@@ -67,6 +67,24 @@ pub struct ForeignKeySchema {
     pub deferred: bool,
 }
 
+/// Physical primary key identifying a single row in either a normal rowid Table B+Tree
+/// or an index-organized `WITHOUT ROWID` Index B-Tree.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableRowKey {
+    Rowid(i64),
+    WithoutRowidPk(Vec<Value>),
+}
+
+impl TableRowKey {
+    #[inline]
+    pub fn rowid_or_zero(&self) -> i64 {
+        match self {
+            Self::Rowid(r) => *r,
+            Self::WithoutRowidPk(_) => 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TableSchema {
     pub schema_rowid: i64,
@@ -78,6 +96,12 @@ pub struct TableSchema {
     pub rowid_pk_conflict: ConflictAction,
     pub autoincrement: bool,
     pub without_rowid: bool,
+    /// Deduplicated `PRIMARY KEY` columns in PK key order for `WITHOUT ROWID` tables (`pPk->aiColumn[0..nKeyCol]`).
+    pub without_rowid_pk_cols: Vec<IndexedColSchema>,
+    /// Non-VIRTUAL non-PK column indices in table declaration order stored after `without_rowid_pk_cols` in `root_pgno`.
+    pub without_rowid_extra_cols: Vec<usize>,
+    pub without_rowid_pk_conflict: ConflictAction,
+    pub without_rowid_pk_autoindex_name: String,
     pub strict: bool,
     pub checks: Vec<CheckSchema>,
     pub foreign_keys: Vec<ForeignKeySchema>,
@@ -113,6 +137,10 @@ impl TableSchema {
             rowid_pk_conflict: ConflictAction::Abort,
             autoincrement: false,
             without_rowid: false,
+            without_rowid_pk_cols: Vec::new(),
+            without_rowid_extra_cols: Vec::new(),
+            without_rowid_pk_conflict: ConflictAction::Abort,
+            without_rowid_pk_autoindex_name: String::new(),
             strict: false,
             checks: Vec::new(),
             foreign_keys: Vec::new(),
@@ -136,6 +164,45 @@ impl TableSchema {
         name.eq_ignore_ascii_case("rowid")
             || name.eq_ignore_ascii_case("_rowid_")
             || name.eq_ignore_ascii_case("oid")
+    }
+
+    /// Key sort orders of the primary Index B-Tree (`nKeyField == without_rowid_pk_cols.len()`) for `WITHOUT ROWID`.
+    pub fn without_rowid_pk_orders(&self) -> Vec<KeySortOrder> {
+        self.without_rowid_pk_cols
+            .iter()
+            .map(|ic| ic.sort_order)
+            .collect()
+    }
+
+    /// Extracts the `nPk` primary key values from a full logical table row (`columns.len()`).
+    pub fn extract_without_rowid_pk(&self, logical_vals: &[Value]) -> Vec<Value> {
+        self.without_rowid_pk_cols
+            .iter()
+            .map(|ic| logical_vals[ic.col_idx.expect("PK col has col_idx")].clone())
+            .collect()
+    }
+
+    /// Synthesizes an [`IndexSchema`] descriptor representing the `WITHOUT ROWID` primary B-Tree
+    /// (`root_pgno`) for query planning (`IndexSeek`) and `PRAGMA index_list`.
+    pub fn without_rowid_pk_as_index(&self) -> Option<IndexSchema> {
+        if !self.without_rowid {
+            return None;
+        }
+        Some(IndexSchema {
+            schema_rowid: 0,
+            name: self.without_rowid_pk_autoindex_name.clone(),
+            table_name: self.name.clone(),
+            root_pgno: self.root_pgno,
+            unique: true,
+            conflict: self.without_rowid_pk_conflict,
+            columns: self.without_rowid_pk_cols.clone(),
+            where_clause: None,
+            is_autoindex: true,
+            origin: "pk",
+            raw_sql: None,
+            table_without_rowid: true,
+            trailing_pk_cols: Vec::new(),
+        })
     }
 }
 
@@ -161,16 +228,54 @@ pub struct IndexSchema {
     /// `"pk"` (PRIMARY KEY), `"u"` (UNIQUE), or `"c"` (CREATE INDEX), matching `PRAGMA index_list`.
     pub origin: &'static str,
     pub raw_sql: Option<String>,
+    pub table_without_rowid: bool,
+    /// Non-redundant PK columns appended after `columns` on secondary indexes of `WITHOUT ROWID` tables.
+    pub trailing_pk_cols: Vec<IndexedColSchema>,
 }
 
 impl IndexSchema {
-    /// Returns the full `KeySortOrder` slice for the on-disk Index B-Tree record
-    /// (`[indexed_col_0, ..., indexed_col_{k-1}, trailing_rowid]`).
+    /// Returns the full `KeySortOrder` slice for the on-disk Index B-Tree record:
+    /// - Rowid table index: `[indexed_col_0, ..., indexed_col_{k-1}, trailing_rowid]`
+    /// - `WITHOUT ROWID` index: `[indexed_col_0, ..., indexed_col_{k-1}, trailing_pk_cols...]`
     pub fn key_sort_orders(&self) -> Vec<KeySortOrder> {
         let mut orders: Vec<KeySortOrder> = self.columns.iter().map(|c| c.sort_order).collect();
-        // Trailing table rowid tie-breaker is always ASC BINARY
-        orders.push(KeySortOrder::default());
+        if self.table_without_rowid {
+            orders.extend(self.trailing_pk_cols.iter().map(|c| c.sort_order));
+        } else {
+            // Trailing table rowid tie-breaker is always ASC BINARY
+            orders.push(KeySortOrder::default());
+        }
         orders
+    }
+
+    /// Reconstructs the `nPk` primary key tuple of `tbl` from a decoded index record `hit`
+    /// (`[columns..., trailing_pk_cols...]`, or `[pk_cols..., extra_cols...]` when `self.root_pgno == tbl.root_pgno`).
+    pub fn extract_without_rowid_pk_from_hit(&self, tbl: &TableSchema, hit: &[Value]) -> Vec<Value> {
+        if self.origin == "pk" && self.root_pgno == tbl.root_pgno {
+            let n = tbl.without_rowid_pk_cols.len().min(hit.len());
+            return hit[..n].to_vec();
+        }
+        let mut pk = Vec::with_capacity(tbl.without_rowid_pk_cols.len());
+        for pk_col in &tbl.without_rowid_pk_cols {
+            if let Some(pos) = self.columns.iter().position(|ic| {
+                ic.col_idx == pk_col.col_idx
+                    && ic.sort_order.collation == pk_col.sort_order.collation
+            }) {
+                pk.push(hit.get(pos).cloned().unwrap_or(Value::Null));
+            } else if let Some(tpos) = self.trailing_pk_cols.iter().position(|tc| {
+                tc.col_idx == pk_col.col_idx
+                    && tc.sort_order.collation == pk_col.sort_order.collation
+            }) {
+                pk.push(
+                    hit.get(self.columns.len() + tpos)
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                );
+            } else {
+                pk.push(Value::Null);
+            }
+        }
+        pk
     }
 }
 
@@ -182,6 +287,7 @@ pub struct PendingAutoIndex {
     pub conflict: ConflictAction,
     pub origin: &'static str,
     pub columns: Vec<IndexedColSchema>,
+    pub trailing_pk_cols: Vec<IndexedColSchema>,
 }
 
 /// Complete in-memory catalog of tables and indexes loaded from `sqlite_schema` (Page 1).
@@ -190,6 +296,8 @@ pub struct Schema {
     pub tables: Vec<TableSchema>,
     pub indexes: Vec<IndexSchema>,
     pub schema_cookie: u32,
+    pub loaded: bool,
+    pub had_pages: bool,
 }
 
 impl Schema {
@@ -228,6 +336,16 @@ impl Schema {
             .find(|idx| idx.name.eq_ignore_ascii_case(name))
     }
 
+    pub fn find_index_including_without_rowid_pk(&self, name: &str) -> Option<IndexSchema> {
+        if let Some(idx) = self.find_index(name) {
+            return Some(idx.clone());
+        }
+        self.tables
+            .iter()
+            .filter_map(TableSchema::without_rowid_pk_as_index)
+            .find(|idx| idx.name.eq_ignore_ascii_case(name))
+    }
+
     pub fn indexes_for_table(&self, table_name: &str) -> Vec<IndexSchema> {
         self.indexes
             .iter()
@@ -252,22 +370,34 @@ impl Schema {
         roots
     }
 
+    /// Ensures `self` matches the on-disk `schema_cookie` and page presence inside an active read/write transaction.
+    pub fn ensure_fresh_in_tx(&mut self, btree: &mut Btree) -> Result<()> {
+        let has_pages = btree.pager().page_count() > 0;
+        let cur_cookie = btree.pager().header().schema_cookie;
+        if !self.loaded || self.had_pages != has_pages || self.schema_cookie != cur_cookie {
+            *self = Self::load(btree)?;
+        }
+        Ok(())
+    }
+
     /// Loads the schema catalog from Page 1 (`sqlite_schema`).
     pub fn load(btree: &mut Btree) -> Result<Self> {
-        if btree.pager().page_count() == 0 {
-            return Ok(Self {
-                tables: Vec::new(),
-                indexes: Vec::new(),
-                schema_cookie: btree.pager().header().schema_cookie,
-            });
-        }
-
         let need_read_tx = btree.transaction_state() == sqliters_pager::TransactionState::Open;
         if need_read_tx {
             btree.begin_read()?;
         }
 
-        let res = Self::load_inner(btree);
+        let res = if btree.pager().page_count() == 0 {
+            Ok(Self {
+                tables: Vec::new(),
+                indexes: Vec::new(),
+                schema_cookie: btree.pager().header().schema_cookie,
+                loaded: true,
+                had_pages: false,
+            })
+        } else {
+            Self::load_inner(btree)
+        };
 
         if need_read_tx {
             let _ = btree.commit();
@@ -359,6 +489,8 @@ impl Schema {
                         is_autoindex: true,
                         origin: auto.origin,
                         raw_sql: None,
+                        table_without_rowid: tbl.without_rowid,
+                        trailing_pk_cols: auto.trailing_pk_cols.clone(),
                     });
                 }
             }
@@ -368,6 +500,8 @@ impl Schema {
             tables,
             indexes,
             schema_cookie: btree.pager().header().schema_cookie,
+            loaded: true,
+            had_pages: true,
         })
     }
 }
@@ -399,7 +533,7 @@ pub fn build_table_schema_from_ast(
             ));
         }
 
-        let affinity = TypeAffinity::from_declared_type(&cdef.type_name);
+        let affinity = resolve_column_affinity(&ct.name, &cdef.name, &cdef.type_name, ct.strict)?;
         let mut collation = Collation::Binary;
         let mut not_null = None;
         let mut default_expr = None;
@@ -515,18 +649,19 @@ pub fn build_table_schema_from_ast(
                 autoincrement = pk_autoinc;
             } else {
                 if pk_autoinc {
-                    return Err(SqliteError::new(
-                        ErrorCode::Error,
-                        "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY",
-                    ));
+                    let msg = if ct.without_rowid {
+                        "AUTOINCREMENT not allowed on WITHOUT ROWID tables"
+                    } else {
+                        "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY"
+                    };
+                    return Err(SqliteError::new(ErrorCode::Error, msg));
                 }
-                let idx_num = inline_autos.len() + 1;
-                inline_autos.push(PendingAutoIndex {
-                    name: format!("sqlite_autoindex_{}_{}", ct.name, idx_num),
-                    unique: true,
-                    conflict: pk_conflict,
-                    origin: "pk",
-                    columns: vec![IndexedColSchema {
+                push_inline_autoindex(
+                    &ct.name,
+                    &mut inline_autos,
+                    pk_conflict,
+                    "pk",
+                    vec![IndexedColSchema {
                         col_idx: Some(col_idx),
                         expr: None,
                         name: cdef.name.clone(),
@@ -536,18 +671,17 @@ pub fn build_table_schema_from_ast(
                             collation,
                         },
                     }],
-                });
+                )?;
             }
         }
 
         for u_conflict in unique_constraints {
-            let idx_num = inline_autos.len() + 1;
-            inline_autos.push(PendingAutoIndex {
-                name: format!("sqlite_autoindex_{}_{}", ct.name, idx_num),
-                unique: true,
-                conflict: u_conflict,
-                origin: "u",
-                columns: vec![IndexedColSchema {
+            push_inline_autoindex(
+                &ct.name,
+                &mut inline_autos,
+                u_conflict,
+                "u",
+                vec![IndexedColSchema {
                     col_idx: Some(col_idx),
                     expr: None,
                     name: cdef.name.clone(),
@@ -557,7 +691,7 @@ pub fn build_table_schema_from_ast(
                         collation,
                     },
                 }],
-            });
+            )?;
         }
     }
 
@@ -596,14 +730,7 @@ pub fn build_table_schema_from_ast(
                     rowid_alias_col = Some(pk_ci);
                     rowid_pk_conflict = *conflict;
                 } else {
-                    let idx_num = inline_autos.len() + 1;
-                    inline_autos.push(PendingAutoIndex {
-                        name: format!("sqlite_autoindex_{}_{}", ct.name, idx_num),
-                        unique: true,
-                        conflict: *conflict,
-                        origin: "pk",
-                        columns: resolved,
-                    });
+                    push_inline_autoindex(&ct.name, &mut inline_autos, *conflict, "pk", resolved)?;
                 }
             }
             TableConstraint::Unique {
@@ -611,14 +738,7 @@ pub fn build_table_schema_from_ast(
                 conflict,
             } => {
                 let resolved = resolve_indexed_columns(&columns, u_cols, false)?;
-                let idx_num = inline_autos.len() + 1;
-                inline_autos.push(PendingAutoIndex {
-                    name: format!("sqlite_autoindex_{}_{}", ct.name, idx_num),
-                    unique: true,
-                    conflict: *conflict,
-                    origin: "u",
-                    columns: resolved,
-                });
+                push_inline_autoindex(&ct.name, &mut inline_autos, *conflict, "u", resolved)?;
             }
             TableConstraint::Check {
                 name: cname,
@@ -679,6 +799,89 @@ pub fn build_table_schema_from_ast(
         }
     }
 
+    if ct.strict || ct.without_rowid {
+        for (ci, col) in columns.iter_mut().enumerate() {
+            if col.is_primary_key && rowid_alias_col != Some(ci) && col.not_null.is_none() {
+                col.not_null = Some(ConflictAction::Abort);
+            }
+        }
+    }
+
+    let mut without_rowid_pk_cols = Vec::new();
+    let mut without_rowid_extra_cols = Vec::new();
+    let mut without_rowid_pk_conflict = ConflictAction::Abort;
+    let mut without_rowid_pk_autoindex_name = String::new();
+
+    if ct.without_rowid {
+        if !has_pk {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("PRIMARY KEY missing on table {}", ct.name),
+            ));
+        }
+        // `convertToWithoutRowidTable` in `sqlite/src/build.c`:
+        // 1. Locate the `"pk"` autoindex and deduplicate repeated `(col_idx, collation)` columns.
+        let Some(pk_pos) = inline_autos.iter().position(|a| a.origin == "pk") else {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("PRIMARY KEY missing on table {}", ct.name),
+            ));
+        };
+        let pk_auto = inline_autos.remove(pk_pos);
+        without_rowid_pk_conflict = pk_auto.conflict;
+        without_rowid_pk_autoindex_name = pk_auto.name;
+
+        for ic in pk_auto.columns {
+            if let Some(ci) = ic.col_idx
+                && columns[ci]
+                    .generated
+                    .as_ref()
+                    .is_some_and(|(_, stored)| !*stored)
+            {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    "cannot use VIRTUAL columns in PRIMARY KEY",
+                ));
+            }
+            let is_dup = without_rowid_pk_cols.iter().any(|prev: &IndexedColSchema| {
+                prev.col_idx == ic.col_idx && prev.sort_order.collation == ic.sort_order.collation
+            });
+            if !is_dup {
+                without_rowid_pk_cols.push(ic);
+            }
+        }
+
+        // 2. Append non-redundant PK columns (`desc = false` per `build.c:2558`) to all inline `UNIQUE` autoindexes.
+        for u_auto in &mut inline_autos {
+            for pk_ic in &without_rowid_pk_cols {
+                let is_dup = u_auto.columns.iter().any(|ic| {
+                    ic.col_idx == pk_ic.col_idx
+                        && ic.sort_order.collation == pk_ic.sort_order.collation
+                });
+                if !is_dup {
+                    let mut trailing = pk_ic.clone();
+                    trailing.sort_order.desc = false;
+                    trailing.sort_order.nulls_last = false;
+                    u_auto.trailing_pk_cols.push(trailing);
+                }
+            }
+        }
+
+        // 3. Collect remaining non-VIRTUAL columns in table declaration order (`build.c:2572-2587`).
+        for (ci, col) in columns.iter().enumerate() {
+            let is_virt = col.generated.as_ref().is_some_and(|(_, stored)| !*stored);
+            if is_virt {
+                continue;
+            }
+            let in_pk = without_rowid_pk_cols
+                .iter()
+                .any(|pk_ic| pk_ic.col_idx == Some(ci));
+            if !in_pk {
+                without_rowid_extra_cols.push(ci);
+            }
+        }
+    }
+
     let tbl = TableSchema {
         schema_rowid: 0,
         name: ct.name.clone(),
@@ -688,6 +891,10 @@ pub fn build_table_schema_from_ast(
         rowid_pk_conflict,
         autoincrement,
         without_rowid: ct.without_rowid,
+        without_rowid_pk_cols,
+        without_rowid_extra_cols,
+        without_rowid_pk_conflict,
+        without_rowid_pk_autoindex_name,
         strict: ct.strict,
         checks,
         foreign_keys,
@@ -697,12 +904,72 @@ pub fn build_table_schema_from_ast(
     Ok((tbl, inline_autos))
 }
 
+fn push_inline_autoindex(
+    tbl_name: &str,
+    inline_autos: &mut Vec<PendingAutoIndex>,
+    conflict: ConflictAction,
+    origin: &'static str,
+    columns: Vec<IndexedColSchema>,
+) -> Result<()> {
+    // Per `sqlite/src/build.c:4425-4458`: suppress duplicate inline UNIQUE/PK constraints
+    // that have identical column indices and collating sequences.
+    for existing in inline_autos.iter_mut() {
+        if existing.columns.len() == columns.len()
+            && existing
+                .columns
+                .iter()
+                .zip(columns.iter())
+                .all(|(a, b)| a.col_idx == b.col_idx && a.sort_order.collation == b.sort_order.collation)
+        {
+            if origin == "pk" {
+                existing.origin = "pk";
+                existing.columns = columns;
+            }
+            if existing.conflict != conflict {
+                if existing.conflict == ConflictAction::Abort {
+                    existing.conflict = conflict;
+                } else if conflict != ConflictAction::Abort {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "conflicting ON CONFLICT clauses specified",
+                    ));
+                }
+            }
+            return Ok(());
+        }
+    }
+    let idx_num = inline_autos.len() + 1;
+    inline_autos.push(PendingAutoIndex {
+        name: format!("sqlite_autoindex_{tbl_name}_{idx_num}"),
+        unique: true,
+        conflict,
+        origin,
+        columns,
+        trailing_pk_cols: Vec::new(),
+    });
+    Ok(())
+}
+
 pub fn build_index_schema_from_ast(
     ci: &CreateIndexStmt,
     tbl: &TableSchema,
     root_pgno: Pgno,
 ) -> Result<IndexSchema> {
     let resolved = resolve_indexed_columns(&tbl.columns, &ci.columns, true)?;
+    let mut trailing_pk_cols = Vec::new();
+    if tbl.without_rowid {
+        // Per `sqlite3CreateIndex` (`sqlite/src/build.c:4359-4372`): append non-duplicate PK columns
+        // preserving `pPk->aSortOrder[j]`!
+        for pk_ic in &tbl.without_rowid_pk_cols {
+            let is_dup = resolved.iter().any(|ic| {
+                ic.col_idx == pk_ic.col_idx
+                    && ic.sort_order.collation == pk_ic.sort_order.collation
+            });
+            if !is_dup {
+                trailing_pk_cols.push(pk_ic.clone());
+            }
+        }
+    }
     Ok(IndexSchema {
         schema_rowid: 0,
         name: ci.name.clone(),
@@ -715,11 +982,45 @@ pub fn build_index_schema_from_ast(
         is_autoindex: false,
         origin: "c",
         raw_sql: Some(ci.raw_sql.clone()),
+        table_without_rowid: tbl.without_rowid,
+        trailing_pk_cols,
     })
 }
 
-pub fn build_column_schema_from_def(cdef: &ColumnDef) -> Result<ColumnSchema> {
-    let affinity = TypeAffinity::from_declared_type(&cdef.type_name);
+pub fn resolve_column_affinity(
+    tbl_name: &str,
+    col_name: &str,
+    type_name: &str,
+    strict: bool,
+) -> Result<TypeAffinity> {
+    if !strict {
+        return Ok(TypeAffinity::from_declared_type(type_name));
+    }
+    let trimmed = type_name.trim();
+    if trimmed.is_empty() {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("missing datatype for {tbl_name}.{col_name}"),
+        ));
+    }
+    match trimmed.to_ascii_uppercase().as_str() {
+        "INT" | "INTEGER" => Ok(TypeAffinity::Integer),
+        "REAL" => Ok(TypeAffinity::Real),
+        "TEXT" => Ok(TypeAffinity::Text),
+        "BLOB" | "ANY" => Ok(TypeAffinity::Blob),
+        _ => Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("unknown datatype for {tbl_name}.{col_name}: \"{trimmed}\""),
+        )),
+    }
+}
+
+pub fn build_column_schema_from_def(
+    tbl_name: &str,
+    strict: bool,
+    cdef: &ColumnDef,
+) -> Result<ColumnSchema> {
+    let affinity = resolve_column_affinity(tbl_name, &cdef.name, &cdef.type_name, strict)?;
     let mut collation = Collation::Binary;
     let mut not_null = None;
     let mut default_expr = None;

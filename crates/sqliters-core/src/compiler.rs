@@ -83,8 +83,12 @@ pub fn choose_access_plan(
         }
     }
 
-    // 2. Check secondary indexes (preferring UNIQUE indexes and longer matched key prefixes!)
-    let indexes = schema.indexes_for_table(&tbl.name);
+    // 2. Check secondary indexes (and primary Index B-Tree for `WITHOUT ROWID` tables),
+    //    preferring UNIQUE indexes and longer matched key prefixes!
+    let mut indexes = schema.indexes_for_table(&tbl.name);
+    if let Some(pk_idx) = tbl.without_rowid_pk_as_index() {
+        indexes.insert(0, pk_idx);
+    }
     let mut best: Option<(usize, bool, IndexSchema, Vec<Expr>)> = None;
 
     for idx in indexes {
@@ -551,7 +555,7 @@ pub fn try_compile_select(stmt: &SelectStmt, schema: &Schema) -> Result<Option<V
                     format!("no such table: {name}"),
                 ));
             };
-            if tbl.columns.iter().any(|c| c.generated.is_some()) {
+            if tbl.without_rowid || tbl.columns.iter().any(|c| c.generated.is_some()) {
                 return Ok(None);
             }
             compile_single_table_select(

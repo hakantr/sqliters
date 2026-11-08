@@ -30,7 +30,7 @@ Workspace, SQLite'ın temel katmanlarını modüler crate'lere ayırır:
 - **Depolama, Kodlama & Eşzamanlı Kilitleme**:
   - 512..=65536 bayt sayfa boyutları, `UTF-8`, `UTF-16le` ve `UTF-16be` metin kodlamaları (`PRAGMA encoding`)
   - POSIX `fcntl` uyumlu dosya kilitleme protokolü (`SHARED`, `RESERVED`, `PENDING`, `EXCLUSIVE`) ve aktif yazıcı işlemlerine zarar vermeyen sıcak günlük (*hot-journal*) çökme kurtarması
-  - `INTEGER PRIMARY KEY` (`rowid` takma adı), `AUTOINCREMENT` (`sqlite_sequence`), ikincil `UNIQUE` / kısmi (`WHERE ...`) B-Tree indeksler, taşma sayfaları, *freelist* geri kazanımı ve `VACUUM`
+  - `INTEGER PRIMARY KEY` (`rowid` takma adı), `AUTOINCREMENT` (`sqlite_sequence`), indeks tabanlı `WITHOUT ROWID` tablolar, ikincil `UNIQUE` / kısmi (`WHERE ...`) B-Tree indeksler, taşma sayfaları, *freelist* geri kazanımı ve `VACUUM`
   - `BEGIN [DEFERRED | IMMEDIATE | EXCLUSIVE]`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `ROLLBACK TO`, `RELEASE`
 - **Kısıtlayıcılar & Çakışma Çözümü**:
   - `PRAGMA foreign_keys = ON` ile ebeveyn/çocuk yabancı anahtar denetimi (`NO ACTION`, `RESTRICT`, `SET NULL`, `SET DEFAULT`, `CASCADE` ve `DEFERRABLE INITIALLY DEFERRED`), `PRAGMA foreign_key_list`, `PRAGMA foreign_key_check`
@@ -50,7 +50,8 @@ Workspace, SQLite'ın temel katmanlarını modüler crate'lere ayırır:
 ## Kapsam Dışı / Desteklenmeyen Özellikler
 
 - **WAL kipi (`PRAGMA journal_mode = WAL`)**: WAL kipindeki veritabanları (`read_version = 2` / `write_version = 2` veya dolu `-wal` dosyası) sessizce eksik veri döndürmek yerine açıkça `ErrorCode::CantOpen` hatasıyla reddedilir. Açmadan önce SQLite'ta `PRAGMA journal_mode = DELETE;` ile kontrol noktası alınmalıdır.
-- **Henüz uygulanmayan SQL özellikleri**: `CREATE VIEW`, `CREATE TRIGGER`, pencere fonksiyonları (`OVER (...)`), sanal tablolar ve uzantılar (`FTS3/4/5`, `RTREE`), `ATTACH` / `DETACH DATABASE`, `WITHOUT ROWID` indeks tabanlı yazım, özyinelemeli `WITH RECURSIVE` yürütümü ve `ALTER TABLE DROP COLUMN`.
+- **Auto-vacuum (`PRAGMA auto_vacuum = FULL | INCREMENTAL`)**: Pointer-map (`ptrmap`) sayfaları içeren mevcut veritabanları salt-okunur olarak açılıp sorgulanabilir; ancak pointer-map bütünlüğünü bozmamak için bu dosyalarda yazma işlemleri açık hatayla reddedilir.
+- **Henüz uygulanmayan SQL özellikleri**: `CREATE VIEW`, `CREATE TRIGGER`, pencere fonksiyonları (`OVER (...)`), sanal tablolar ve uzantılar (`FTS3/4/5`, `RTREE`), `ATTACH` / `DETACH DATABASE` ve `ALTER TABLE DROP COLUMN`.
 
 ---
 
@@ -99,7 +100,7 @@ cargo run -p sqliters-cli -- -json ornek.db "SELECT sqlite_version();"
 
 ### Derleme ve Testler
 
-Test paketi; birim testlerini, dokümantasyon testlerini (`cargo test --doc`) ve `/usr/bin/sqlite3` ile eşzamanlı kilitleme, UTF-8/UTF-16 kodlama ve `PRAGMA integrity_check` uyumluluk testlerini çalıştırır:
+Varsayılan test koşusu; crate birim testlerini, dokümantasyon testlerini (`cargo test --doc`), `/usr/bin/sqlite3` ile eşzamanlı kilitleme, sıcak günlük (*hot-journal*) kurtarma, UTF-8/UTF-16 kodlama ve `PRAGMA integrity_check` uyumluluk/regresyon testlerini (`tests/bulgular_regressions.rs`, `tests/integration_sqlite3.rs`) ve şu an tamamen geçen 53 SQLite `.test` uyarlama modülünü çalıştırır. Henüz kapsam dışı SQL özelliklerine veya eksik Tcl/`testfixture` komutlarına bağlı 168 `.test` uyarlama modülü `#[ignore]` olarak işaretlidir; bu nedenle varsayılan test koşusu tam C SQLite test paketi eşdeğerliği anlamına gelmez:
 
 ```bash
 cargo test --workspace

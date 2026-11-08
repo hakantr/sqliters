@@ -68,6 +68,11 @@ impl Btree {
     }
 
     #[inline]
+    pub fn begin_exclusive(&mut self) -> Result<()> {
+        self.pager.begin_exclusive()
+    }
+
+    #[inline]
     pub fn commit(&mut self) -> Result<()> {
         self.pager.commit()
     }
@@ -491,12 +496,22 @@ impl Btree {
         }
     }
 
-    /// Allocates the next available `rowid` (`max_rowid + 1`, or `1` if empty; falls back to random if `i64::MAX` is used).
+    /// Allocates the next available `rowid` (`max_rowid + 1`, or `1` if empty; falls back to unused positive probe if `i64::MAX` is used).
     pub fn next_rowid(&mut self, root_pgno: Pgno) -> Result<i64> {
         match self.max_table_rowid(root_pgno)? {
             None => Ok(1),
-            Some(max_id) if max_id < i64::MAX => Ok((max_id + 1).max(1)),
+            Some(max_id) if max_id < i64::MAX => Ok(max_id + 1),
             Some(_) => {
+                let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+                for _ in 0..100 {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    let probe = ((state & 0x7fff_ffff_ffff_ffff) as i64).max(1);
+                    if self.seek_table_rowid(root_pgno, probe)?.is_none() {
+                        return Ok(probe);
+                    }
+                }
                 for probe in 1..10_000i64 {
                     if self.seek_table_rowid(root_pgno, probe)?.is_none() {
                         return Ok(probe);
@@ -504,7 +519,7 @@ impl Btree {
                 }
                 Err(SqliteError::new(
                     ErrorCode::Full,
-                    "database or disk is full (exhausted rowids)",
+                    "database or disk is full",
                 ))
             }
         }
@@ -841,17 +856,32 @@ impl Btree {
         prefix_values: &[Value],
         orders: &[KeySortOrder],
     ) -> Result<Vec<Vec<Value>>> {
+        let enc = self.encoding();
+        let raw_matches = self.seek_index_equal_raw(root_pgno, prefix_values, orders)?;
+        raw_matches
+            .into_iter()
+            .map(|rec| decode_record_with_encoding(&rec, enc))
+            .collect()
+    }
+
+    /// Searches an Index B-Tree for all raw serialized records whose leading columns match `prefix_values` under `orders`.
+    pub fn seek_index_equal_raw(
+        &mut self,
+        root_pgno: Pgno,
+        prefix_values: &[Value],
+        orders: &[KeySortOrder],
+    ) -> Result<Vec<Vec<u8>>> {
         let mut matches = Vec::new();
-        self.seek_index_equal_rec(root_pgno, prefix_values, orders, &mut matches)?;
+        self.seek_index_equal_raw_rec(root_pgno, prefix_values, orders, &mut matches)?;
         Ok(matches)
     }
 
-    fn seek_index_equal_rec(
+    fn seek_index_equal_raw_rec(
         &mut self,
         pgno: Pgno,
         prefix_values: &[Value],
         orders: &[KeySortOrder],
-        out: &mut Vec<Vec<Value>>,
+        out: &mut Vec<Vec<u8>>,
     ) -> Result<()> {
         let enc = self.encoding();
         let parsed = self.read_parsed_page(pgno)?;
@@ -865,7 +895,7 @@ impl Btree {
                     )?;
                     match compare_records_with_encoding(&rec, prefix_values, orders, enc)? {
                         Ordering::Less => continue,
-                        Ordering::Equal => out.push(decode_record_with_encoding(&rec, enc)?),
+                        Ordering::Equal => out.push(rec),
                         Ordering::Greater => break,
                     }
                 }
@@ -882,16 +912,16 @@ impl Btree {
                     match compare_records_with_encoding(&rec, prefix_values, orders, enc)? {
                         Ordering::Less => continue,
                         Ordering::Equal => {
-                            self.seek_index_equal_rec(
+                            self.seek_index_equal_raw_rec(
                                 c.left_child,
                                 prefix_values,
                                 orders,
                                 out,
                             )?;
-                            out.push(decode_record_with_encoding(&rec, enc)?);
+                            out.push(rec);
                         }
                         Ordering::Greater => {
-                            self.seek_index_equal_rec(
+                            self.seek_index_equal_raw_rec(
                                 c.left_child,
                                 prefix_values,
                                 orders,
@@ -903,7 +933,7 @@ impl Btree {
                     }
                 }
                 if visit_right {
-                    self.seek_index_equal_rec(right_child, prefix_values, orders, out)?;
+                    self.seek_index_equal_raw_rec(right_child, prefix_values, orders, out)?;
                 }
                 Ok(())
             }
@@ -919,7 +949,9 @@ impl Btree {
         orders: &[KeySortOrder],
     ) -> Result<()> {
         let enc = self.encoding();
-        let key_vals = decode_record_with_encoding(record_bytes, enc)?;
+        let full_vals = decode_record_with_encoding(record_bytes, enc)?;
+        let key_len = orders.len().min(full_vals.len());
+        let key_vals = &full_vals[..key_len];
         let usable = self.pager.usable_size();
         let bounds = PayloadBounds::for_index(usable);
         let (total_len, local_payload, overflow_page) =
@@ -931,7 +963,7 @@ impl Btree {
         };
 
         if let Some((promoted_cell, right_pgno)) =
-            self.insert_index_rec(root_pgno, leaf_cell, &key_vals, orders)?
+            self.insert_index_rec(root_pgno, leaf_cell, key_vals, orders)?
         {
             let left_parsed = self.read_parsed_page(root_pgno)?;
             let left_pgno = self.allocate_page()?;

@@ -2,6 +2,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 
 use sqliters_btree::Btree;
 use sqliters_pager::TransactionState;
@@ -30,7 +31,7 @@ use crate::compiler::{
     expr_column_label, expr_contains_aggregate,
 };
 use crate::schema::{
-    ColumnSchema, ForeignKeySchema, IndexSchema, Schema, TableSchema,
+    ColumnSchema, ForeignKeySchema, IndexSchema, Schema, TableRowKey, TableSchema,
     build_column_schema_from_def, build_index_schema_from_ast, build_table_schema_from_ast,
     delete_schema_entry, insert_schema_entry, update_schema_entry,
 };
@@ -52,7 +53,7 @@ pub struct ExecContext<'a> {
     pub foreign_keys: &'a mut bool,
     pub count_changes: &'a mut bool,
     pub rollback_count: &'a mut u64,
-    pub deferred_fk_suspects: &'a mut Vec<(String, i64, usize)>,
+    pub deferred_fk_suspects: &'a mut Vec<(String, TableRowKey, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,10 +66,19 @@ struct ScopedColumn {
     merged_using: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct EvalRow {
-    cols: Vec<ScopedColumn>,
+    cols: Rc<[ScopedColumn]>,
     vals: Vec<Value>,
+}
+
+impl Default for EvalRow {
+    fn default() -> Self {
+        Self {
+            cols: Rc::from([]),
+            vals: Vec::new(),
+        }
+    }
 }
 
 impl EvalRow {
@@ -207,15 +217,12 @@ pub fn execute_statement(
     stmt: &Stmt,
     params: &[Value],
 ) -> Result<QueryOutput> {
-    // Reload schema if schema_cookie changed externally
-    if ctx.btree.pager().page_count() > 0
-        && ctx.btree.pager().header().schema_cookie != ctx.schema.schema_cookie
-    {
-        *ctx.schema = Schema::load(ctx.btree)?;
+    if ctx.btree.transaction_state() != TransactionState::Open {
+        ctx.schema.ensure_fresh_in_tx(ctx.btree)?;
     }
 
     match stmt {
-        Stmt::Explain { query_plan, stmt } => {
+        Stmt::Explain { query_plan, stmt } => run_read_autocommit(ctx, |ctx| {
             if *query_plan {
                 let rows = explain_query_plan(stmt, ctx.schema)?;
                 Ok(QueryOutput {
@@ -243,9 +250,9 @@ pub fn execute_statement(
                     rows: prog.explain_rows(),
                 })
             }
-        }
+        }),
         Stmt::Begin { mode } => {
-            if *ctx.explicit_tx {
+            if !is_in_autocommit(ctx) {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     "cannot start a transaction within a transaction",
@@ -253,9 +260,19 @@ pub fn execute_statement(
             }
             match mode {
                 sqliters_syntax::TransactionMode::Deferred => {}
-                sqliters_syntax::TransactionMode::Immediate
-                | sqliters_syntax::TransactionMode::Exclusive => {
+                sqliters_syntax::TransactionMode::Immediate => {
                     ctx.btree.begin_write()?;
+                    if let Err(e) = ctx.schema.ensure_fresh_in_tx(ctx.btree) {
+                        let _ = ctx.btree.rollback();
+                        return Err(e);
+                    }
+                }
+                sqliters_syntax::TransactionMode::Exclusive => {
+                    ctx.btree.begin_exclusive()?;
+                    if let Err(e) = ctx.schema.ensure_fresh_in_tx(ctx.btree) {
+                        let _ = ctx.btree.rollback();
+                        return Err(e);
+                    }
                 }
             }
             *ctx.explicit_tx = true;
@@ -381,10 +398,13 @@ where
     F: FnOnce(&mut ExecContext<'_>) -> Result<QueryOutput>,
 {
     let started = ctx.btree.transaction_state() == TransactionState::Open;
-    if started && ctx.btree.pager().page_count() > 0 {
+    if started {
         ctx.btree.begin_read()?;
     }
-    let res = f(ctx);
+    let res = ctx
+        .schema
+        .ensure_fresh_in_tx(ctx.btree)
+        .and_then(|()| f(ctx));
     if started && is_in_autocommit(ctx) && ctx.btree.transaction_state() == TransactionState::Read {
         let _ = ctx.btree.commit();
     }
@@ -400,6 +420,12 @@ where
     // while keeping an enclosing explicit transaction alive (exact SQLite statement journal behavior!).
     let sp_name = "__sqliters_stmt_sp";
     ctx.btree.begin_write()?;
+    if let Err(e) = ctx.schema.ensure_fresh_in_tx(ctx.btree) {
+        if autocommit {
+            let _ = ctx.btree.rollback();
+        }
+        return Err(e);
+    }
     if !autocommit {
         ctx.btree.pager_mut().savepoint(sp_name)?;
     }
@@ -419,7 +445,17 @@ where
     match step_res {
         Ok(out) => {
             if autocommit {
-                ctx.btree.commit()?;
+                if let Err(commit_err) = ctx.btree.commit() {
+                    let _ = ctx.btree.rollback();
+                    ctx.deferred_fk_suspects.clear();
+                    ctx.runtime.total_changes = prev_total_changes;
+                    ctx.runtime.last_changes = 0;
+                    ctx.runtime.last_insert_rowid = prev_last_rowid;
+                    if let Ok(s) = Schema::load(ctx.btree) {
+                        *ctx.schema = s;
+                    }
+                    return Err(commit_err);
+                }
                 ctx.deferred_fk_suspects.clear();
             } else {
                 ctx.btree.pager_mut().release_savepoint(sp_name)?;
@@ -977,7 +1013,7 @@ fn exec_recursive_cte(
         })
         .collect();
 
-    let row_scoped_cols: Vec<ScopedColumn> = working_col_names
+    let row_scoped_cols: Rc<[ScopedColumn]> = working_col_names
         .iter()
         .map(|cn| ScopedColumn {
             table_alias: Some(cte.name.clone()),
@@ -987,14 +1023,15 @@ fn exec_recursive_cte(
             hidden_rowid: false,
             merged_using: false,
         })
-        .collect();
+        .collect::<Vec<_>>()
+        .into();
 
     let compute_sort_keys = |ctx: &mut ExecContext<'_>, row: &[Value]| -> Result<Vec<Value>> {
         if order_by.is_empty() {
             return Ok(Vec::new());
         }
         let erow = EvalRow {
-            cols: row_scoped_cols.clone(),
+            cols: Rc::clone(&row_scoped_cols),
             vals: row.to_vec(),
         };
         let scopes = push_scope(outer_scopes, &erow);
@@ -1332,8 +1369,8 @@ fn exec_single_select_core(
                 })
                 || order_by.iter().any(|ob| expr_contains_aggregate(&ob.expr));
 
-            let sample_cols = match filtered.first() {
-                Some(r) => r.cols.clone(),
+            let sample_cols: Vec<ScopedColumn> = match filtered.first() {
+                Some(r) => r.cols.to_vec(),
                 None => match from {
                     Some(fc) => schema_cols_preview(ctx, fc, params, outer_scopes, ctes)
                         .unwrap_or_default(),
@@ -1396,6 +1433,20 @@ fn exec_single_select_core(
             let mut result_rows_with_sort: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
 
             if is_agg {
+                let mut minmax_specs: Vec<(AggregateKind, Expr, Option<Expr>, Collation)> =
+                    Vec::new();
+                for (pe, _, _) in &expanded_proj {
+                    collect_minmax_aggregates(pe, &sample_cols, &mut minmax_specs);
+                }
+                if minmax_specs.is_empty() {
+                    if let Some(ref hav) = resolved_having {
+                        collect_minmax_aggregates(hav, &sample_cols, &mut minmax_specs);
+                    }
+                    for ob in order_by {
+                        collect_minmax_aggregates(&ob.expr, &sample_cols, &mut minmax_specs);
+                    }
+                }
+
                 let groups = build_groups(
                     ctx,
                     filtered,
@@ -1405,10 +1456,15 @@ fn exec_single_select_core(
                     ctes,
                 )?;
                 for group_rows in groups {
-                    let rep_row = group_rows.first().cloned().unwrap_or_else(|| EvalRow {
-                        cols: sample_cols.clone(),
-                        vals: vec![Value::Null; sample_cols.len()],
-                    });
+                    let rep_row = choose_aggregate_representative_row(
+                        ctx,
+                        &group_rows,
+                        &sample_cols,
+                        &minmax_specs,
+                        params,
+                        outer_scopes,
+                        ctes,
+                    )?;
                     let scopes = push_scope(outer_scopes, &rep_row);
                     if let Some(ref hav) = resolved_having {
                         let hv = eval_expr(
@@ -1456,7 +1512,7 @@ fn exec_single_select_core(
                 if filtered.is_empty() && !sample_cols.is_empty() {
                     // Validate projection & ORDER BY column resolution even when 0 rows match!
                     let dummy_row = EvalRow {
-                        cols: sample_cols.clone(),
+                        cols: Rc::from(sample_cols.as_slice()),
                         vals: vec![Value::Null; sample_cols.len()],
                     };
                     let scopes = push_scope(outer_scopes, &dummy_row);
@@ -1578,6 +1634,360 @@ fn exec_single_select_core(
     }
 }
 
+fn collect_minmax_aggregates(
+    expr: &Expr,
+    sample_cols: &[ScopedColumn],
+    out: &mut Vec<(AggregateKind, Expr, Option<Expr>, Collation)>,
+) {
+    match expr {
+        Expr::FunctionCall {
+            name,
+            distinct: _,
+            args: FunctionArgs::Exprs(es),
+            filter,
+        } if es.len() == 1
+            && (name.eq_ignore_ascii_case("MIN") || name.eq_ignore_ascii_case("MAX")) =>
+        {
+            let kind = if name.eq_ignore_ascii_case("MIN") {
+                AggregateKind::Min
+            } else {
+                AggregateKind::Max
+            };
+            let coll = infer_expr_collation_from_cols(&es[0], sample_cols);
+            out.push((
+                kind,
+                es[0].clone(),
+                filter.as_deref().cloned(),
+                coll,
+            ));
+        }
+        Expr::FunctionCall {
+            args: FunctionArgs::Exprs(es),
+            filter,
+            ..
+        } => {
+            if !expr_contains_aggregate(expr) {
+                for a in es {
+                    collect_minmax_aggregates(a, sample_cols, out);
+                }
+                if let Some(f) = filter {
+                    collect_minmax_aggregates(f, sample_cols, out);
+                }
+            }
+        }
+        Expr::Unary { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => collect_minmax_aggregates(inner, sample_cols, out),
+        Expr::Binary { left, right, .. } => {
+            collect_minmax_aggregates(left, sample_cols, out);
+            collect_minmax_aggregates(right, sample_cols, out);
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            collect_minmax_aggregates(e, sample_cols, out);
+            collect_minmax_aggregates(low, sample_cols, out);
+            collect_minmax_aggregates(high, sample_cols, out);
+        }
+        Expr::InList { expr: e, list, .. } => {
+            collect_minmax_aggregates(e, sample_cols, out);
+            for item in list {
+                collect_minmax_aggregates(item, sample_cols, out);
+            }
+        }
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_minmax_aggregates(e, sample_cols, out);
+            collect_minmax_aggregates(pattern, sample_cols, out);
+            if let Some(esc) = escape {
+                collect_minmax_aggregates(esc, sample_cols, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                collect_minmax_aggregates(op, sample_cols, out);
+            }
+            for (w, t) in branches {
+                collect_minmax_aggregates(w, sample_cols, out);
+                collect_minmax_aggregates(t, sample_cols, out);
+            }
+            if let Some(el) = else_expr {
+                collect_minmax_aggregates(el, sample_cols, out);
+            }
+        }
+        Expr::RowValue(elems) => {
+            for el in elems {
+                collect_minmax_aggregates(el, sample_cols, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Chooses the group representative row for bare columns per SQLite `select.c` (`updateAccumulator`):
+/// when `MIN(x)` or `MAX(x)` is present, bare columns come from the row achieving the extremum.
+fn choose_aggregate_representative_row(
+    ctx: &mut ExecContext<'_>,
+    group_rows: &[EvalRow],
+    sample_cols: &[ScopedColumn],
+    minmax_specs: &[(AggregateKind, Expr, Option<Expr>, Collation)],
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    ctes: &CteStore,
+) -> Result<EvalRow> {
+    let Some(first_row) = group_rows.first() else {
+        return Ok(EvalRow {
+            cols: Rc::from(sample_cols),
+            vals: vec![Value::Null; sample_cols.len()],
+        });
+    };
+    let Some((kind, arg_expr, filt_expr, coll)) = minmax_specs.last() else {
+        return Ok(first_row.clone());
+    };
+
+    let mut best_val: Option<Value> = None;
+    let mut best_idx: Option<usize> = None;
+    for (idx, gr) in group_rows.iter().enumerate() {
+        let row_scopes = push_scope(outer_scopes, gr);
+        if let Some(fe) = filt_expr {
+            let fv = eval_expr(ctx, fe, params, &row_scopes, ctes, None)?;
+            if fv.truthiness() != Some(true) {
+                continue;
+            }
+        }
+        let val = eval_expr(ctx, arg_expr, params, &row_scopes, ctes, None)?;
+        if val.is_null() {
+            continue;
+        }
+        let is_better = match &best_val {
+            None => true,
+            Some(cur) => match kind {
+                AggregateKind::Min => val.cmp_sqlite(cur, *coll).is_lt(),
+                AggregateKind::Max => val.cmp_sqlite(cur, *coll).is_gt(),
+                _ => false,
+            },
+        };
+        if is_better {
+            best_val = Some(val);
+            best_idx = Some(idx);
+        }
+    }
+
+    Ok(group_rows[best_idx.unwrap_or(0)].clone())
+}
+
+fn split_where_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    if let Expr::Binary {
+        left,
+        op: BinaryOp::And,
+        right,
+    } = expr
+    {
+        split_where_conjuncts(left, out);
+        split_where_conjuncts(right, out);
+    } else {
+        out.push(expr);
+    }
+}
+
+fn resolve_unique_col_idx(
+    cols: &[ScopedColumn],
+    qual: Option<&str>,
+    col_name: &str,
+) -> Result<Option<usize>> {
+    let mut found = Vec::new();
+    for (i, sc) in cols.iter().enumerate() {
+        if sc.hidden_rowid {
+            continue;
+        }
+        if let Some(q) = qual {
+            let Some(ref ta) = sc.table_alias else {
+                continue;
+            };
+            if !ta.eq_ignore_ascii_case(q) {
+                continue;
+            }
+        }
+        if sc.name.eq_ignore_ascii_case(col_name) {
+            if qual.is_none() && sc.merged_using {
+                return Ok(Some(i));
+            }
+            found.push(i);
+        }
+    }
+    if found.len() == 1 {
+        return Ok(Some(found[0]));
+    }
+    if found.len() > 1 {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("ambiguous column name: {col_name}"),
+        ));
+    }
+    if col_name.eq_ignore_ascii_case("rowid")
+        || col_name.eq_ignore_ascii_case("_rowid_")
+        || col_name.eq_ignore_ascii_case("oid")
+    {
+        for (i, sc) in cols.iter().enumerate() {
+            if !sc.hidden_rowid {
+                continue;
+            }
+            if let Some(q) = qual {
+                let Some(ref ta) = sc.table_alias else {
+                    continue;
+                };
+                if !ta.eq_ignore_ascii_case(q) {
+                    continue;
+                }
+            }
+            found.push(i);
+        }
+        if found.len() == 1 {
+            return Ok(Some(found[0]));
+        }
+        if found.len() > 1 {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("ambiguous column name: {col_name}"),
+            ));
+        }
+    }
+    Ok(None)
+}
+
+fn expr_can_eval_with_cols(
+    expr: &Expr,
+    avail_cols: &[ScopedColumn],
+    full_scope_cols: &[ScopedColumn],
+    outer_scopes: &[EvalRow],
+) -> bool {
+    match expr {
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Integer(_)
+        | Expr::Float(_)
+        | Expr::String(_)
+        | Expr::Blob(_)
+        | Expr::CurrentTimeKw(_)
+        | Expr::Bind(_) => true,
+        Expr::Subquery(_) | Expr::Exists { .. } => false,
+        Expr::Column { table, column } => {
+            match resolve_unique_col_idx(full_scope_cols, table.as_deref(), column) {
+                Err(_) => false, // Ambiguous in full join scope: do NOT push down!
+                Ok(Some(full_idx)) => {
+                    let full_sc = &full_scope_cols[full_idx];
+                    if full_sc.merged_using {
+                        return false;
+                    }
+                    match resolve_unique_col_idx(avail_cols, table.as_deref(), column) {
+                        Ok(Some(avail_idx)) => {
+                            let avail_sc = &avail_cols[avail_idx];
+                            !avail_sc.merged_using
+                                && avail_sc.table_alias == full_sc.table_alias
+                                && avail_sc.name == full_sc.name
+                                && avail_sc.hidden_rowid == full_sc.hidden_rowid
+                        }
+                        _ => false,
+                    }
+                }
+                Ok(None) => {
+                    // Not in `full_scope_cols`: resolves in `outer_scopes` iff unambiguous there
+                    // and not accidentally matching anything in `avail_cols`.
+                    if resolve_unique_col_idx(avail_cols, table.as_deref(), column)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                    {
+                        return false;
+                    }
+                    outer_scopes
+                        .iter()
+                        .rev()
+                        .find_map(|os| match os.lookup_full(table.as_deref(), column) {
+                            Err(_) => Some(false),
+                            Ok(Some(_)) => Some(true),
+                            Ok(None) => None,
+                        })
+                        .unwrap_or(false)
+                }
+            }
+        }
+        Expr::Unary { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => {
+            expr_can_eval_with_cols(inner, avail_cols, full_scope_cols, outer_scopes)
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_can_eval_with_cols(left, avail_cols, full_scope_cols, outer_scopes)
+                && expr_can_eval_with_cols(right, avail_cols, full_scope_cols, outer_scopes)
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            expr_can_eval_with_cols(e, avail_cols, full_scope_cols, outer_scopes)
+                && expr_can_eval_with_cols(low, avail_cols, full_scope_cols, outer_scopes)
+                && expr_can_eval_with_cols(high, avail_cols, full_scope_cols, outer_scopes)
+        }
+        Expr::InList { expr: e, list, .. } => {
+            expr_can_eval_with_cols(e, avail_cols, full_scope_cols, outer_scopes)
+                && list.iter().all(|it| {
+                    expr_can_eval_with_cols(it, avail_cols, full_scope_cols, outer_scopes)
+                })
+        }
+        Expr::InSubquery { .. } => false,
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_can_eval_with_cols(e, avail_cols, full_scope_cols, outer_scopes)
+                && expr_can_eval_with_cols(pattern, avail_cols, full_scope_cols, outer_scopes)
+                && escape.as_deref().is_none_or(|esc| {
+                    expr_can_eval_with_cols(esc, avail_cols, full_scope_cols, outer_scopes)
+                })
+        }
+        Expr::FunctionCall { args, filter, .. } => {
+            if expr_contains_aggregate(expr) || filter.is_some() {
+                return false;
+            }
+            match args {
+                FunctionArgs::Star => true,
+                FunctionArgs::Exprs(es) => es
+                    .iter()
+                    .all(|a| expr_can_eval_with_cols(a, avail_cols, full_scope_cols, outer_scopes)),
+            }
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand.as_deref().is_none_or(|op| {
+                expr_can_eval_with_cols(op, avail_cols, full_scope_cols, outer_scopes)
+            }) && branches.iter().all(|(w, t)| {
+                expr_can_eval_with_cols(w, avail_cols, full_scope_cols, outer_scopes)
+                    && expr_can_eval_with_cols(t, avail_cols, full_scope_cols, outer_scopes)
+            }) && else_expr.as_deref().is_none_or(|el| {
+                expr_can_eval_with_cols(el, avail_cols, full_scope_cols, outer_scopes)
+            })
+        }
+        Expr::RowValue(elems) => elems
+            .iter()
+            .all(|el| expr_can_eval_with_cols(el, avail_cols, full_scope_cols, outer_scopes)),
+    }
+}
+
 fn eval_from_clause(
     ctx: &mut ExecContext<'_>,
     fc: &FromClause,
@@ -1592,6 +2002,21 @@ fn eval_from_clause(
             "at most 64 tables in a join",
         ));
     }
+    let no_using_anywhere = fc
+        .joins
+        .iter()
+        .all(|j| !j.natural && !matches!(j.constraint, Some(JoinConstraint::Using(_))));
+    let full_from_cols_opt = if no_using_anywhere && !fc.joins.is_empty() && where_hint.is_some() {
+        schema_cols_preview(ctx, fc, params, outer_scopes, ctes)
+    } else {
+        None
+    };
+    let mut pushable_conjuncts: Vec<&Expr> = Vec::new();
+    if let (Some(wh), Some(_)) = (where_hint, &full_from_cols_opt) {
+        split_where_conjuncts(wh, &mut pushable_conjuncts);
+    }
+    let mut applied = vec![false; pushable_conjuncts.len()];
+
     let single_table_hint = if fc.joins.is_empty() {
         where_hint
     } else {
@@ -1599,20 +2024,67 @@ fn eval_from_clause(
     };
     let mut left_rows =
         eval_table_or_subquery(ctx, &fc.head, single_table_hint, params, outer_scopes, ctes)?;
-    let mut left_cols_fallback = left_rows
+    let mut left_cols_fallback: Vec<ScopedColumn> = left_rows
         .first()
-        .map(|r| r.cols.clone())
+        .map(|r| r.cols.to_vec())
         .or_else(|| schema_cols_for_tos(ctx, &fc.head, params, outer_scopes, ctes))
         .unwrap_or_default();
 
-    for join in &fc.joins {
+    // Push single-table WHERE conjuncts on `fc.head` when no later join is RIGHT or FULL
+    let no_right_or_full_after_head = fc
+        .joins
+        .iter()
+        .all(|j| !matches!(j.join_type, JoinType::Right | JoinType::Full));
+    if no_right_or_full_after_head
+        && let Some(ref full_cols) = full_from_cols_opt
+    {
+        for (ci, &conj) in pushable_conjuncts.iter().enumerate() {
+            if !applied[ci]
+                && expr_can_eval_with_cols(conj, &left_cols_fallback, full_cols, outer_scopes)
+            {
+                applied[ci] = true;
+                let mut kept = Vec::with_capacity(left_rows.len());
+                for r in left_rows {
+                    let sc = push_scope(outer_scopes, &r);
+                    if eval_expr(ctx, conj, params, &sc, ctes, None)?.truthiness() == Some(true) {
+                        kept.push(r);
+                    }
+                }
+                left_rows = kept;
+            }
+        }
+    }
+
+    for (j_idx, join) in fc.joins.iter().enumerate() {
         let right_rows =
             eval_table_or_subquery(ctx, &join.right, None, params, outer_scopes, ctes)?;
-        let right_cols_fallback = right_rows
+        let right_cols_fallback: Vec<ScopedColumn> = right_rows
             .first()
-            .map(|r| r.cols.clone())
+            .map(|r| r.cols.to_vec())
             .or_else(|| schema_cols_for_tos(ctx, &join.right, params, outer_scopes, ctes))
             .unwrap_or_default();
+        let next_merged_cols =
+            merge_join_scoped_columns(&left_cols_fallback, &right_cols_fallback, join);
+
+        let no_later_right_or_full = fc.joins[(j_idx + 1)..]
+            .iter()
+            .all(|j| !matches!(j.join_type, JoinType::Right | JoinType::Full));
+
+        let mut in_join_where_conjuncts: Vec<&Expr> = Vec::new();
+        if no_later_right_or_full
+            && matches!(join.join_type, JoinType::Inner | JoinType::Cross)
+            && let Some(ref full_cols) = full_from_cols_opt
+        {
+            for (ci, &conj) in pushable_conjuncts.iter().enumerate() {
+                if !applied[ci]
+                    && expr_can_eval_with_cols(conj, &next_merged_cols, full_cols, outer_scopes)
+                {
+                    applied[ci] = true;
+                    in_join_where_conjuncts.push(conj);
+                }
+            }
+        }
+
         left_rows = apply_join(
             ctx,
             left_rows,
@@ -1620,12 +2092,52 @@ fn eval_from_clause(
             &left_cols_fallback,
             &right_cols_fallback,
             join,
+            &in_join_where_conjuncts,
             params,
             outer_scopes,
             ctes,
         )?;
-        left_cols_fallback =
-            merge_join_scoped_columns(&left_cols_fallback, &right_cols_fallback, join);
+        left_cols_fallback = next_merged_cols;
+
+        // Post-join WHERE pushdown whenever all remaining joins in `fc.joins[(j_idx + 1)..]`
+        // are `INNER`/`CROSS`/`LEFT` (none can NULL-extend or right-match `left_rows`)!
+        if no_later_right_or_full
+            && let Some(ref full_cols) = full_from_cols_opt
+        {
+            for (ci, &conj) in pushable_conjuncts.iter().enumerate() {
+                if !applied[ci]
+                    && expr_can_eval_with_cols(conj, &left_cols_fallback, full_cols, outer_scopes)
+                {
+                    applied[ci] = true;
+                    let mut kept = Vec::with_capacity(left_rows.len());
+                    for r in left_rows {
+                        if outer_scopes.is_empty() {
+                            if eval_expr(
+                                ctx,
+                                conj,
+                                params,
+                                std::slice::from_ref(&r),
+                                ctes,
+                                None,
+                            )?
+                            .truthiness()
+                                == Some(true)
+                            {
+                                kept.push(r);
+                            }
+                        } else {
+                            let sc = push_scope(outer_scopes, &r);
+                            if eval_expr(ctx, conj, params, &sc, ctes, None)?.truthiness()
+                                == Some(true)
+                            {
+                                kept.push(r);
+                            }
+                        }
+                    }
+                    left_rows = kept;
+                }
+            }
+        }
     }
 
     Ok(left_rows)
@@ -1654,7 +2166,7 @@ fn eval_table_or_subquery(
                     ));
                 }
                 let cte_meta = infer_cte_meta_by_name(name, outer_scopes, ctx.schema, ctes);
-                let cols: Vec<ScopedColumn> = cte_out
+                let cols: Rc<[ScopedColumn]> = cte_out
                     .column_names
                     .iter()
                     .enumerate()
@@ -1672,12 +2184,13 @@ fn eval_table_or_subquery(
                             merged_using: false,
                         }
                     })
-                    .collect();
+                    .collect::<Vec<_>>()
+                    .into();
                 return Ok(cte_out
                     .rows
                     .into_iter()
                     .map(|r| EvalRow {
-                        cols: cols.clone(),
+                        cols: Rc::clone(&cols),
                         vals: r,
                     })
                     .collect());
@@ -1724,14 +2237,15 @@ fn eval_table_or_subquery(
                 });
             }
 
+            let shared_cols: Rc<[ScopedColumn]> = cols.into();
             let mut out = Vec::with_capacity(raw_entries.len());
-            for (rowid, payload) in raw_entries {
-                let mut vals = decode_table_logical_row(ctx, &tbl, rowid, &payload, params)?;
-                if !tbl.without_rowid {
+            for (rkey, payload) in raw_entries {
+                let mut vals = decode_table_logical_row(ctx, &tbl, &rkey, &payload, params)?;
+                if let TableRowKey::Rowid(rowid) = rkey {
                     vals.push(Value::Integer(rowid));
                 }
                 out.push(EvalRow {
-                    cols: cols.clone(),
+                    cols: Rc::clone(&shared_cols),
                     vals,
                 });
             }
@@ -1740,7 +2254,7 @@ fn eval_table_or_subquery(
         TableOrSubquery::Subquery { query, alias } => {
             let sub_meta = infer_select_stmt_meta(query, outer_scopes, ctx.schema, ctes);
             let sub_out = exec_select(ctx, query, params, outer_scopes, ctes)?;
-            let cols: Vec<ScopedColumn> = sub_out
+            let cols: Rc<[ScopedColumn]> = sub_out
                 .column_names
                 .iter()
                 .enumerate()
@@ -1758,12 +2272,13 @@ fn eval_table_or_subquery(
                         merged_using: false,
                     }
                 })
-                .collect();
+                .collect::<Vec<_>>()
+                .into();
             Ok(sub_out
                 .rows
                 .into_iter()
                 .map(|vals| EvalRow {
-                    cols: cols.clone(),
+                    cols: Rc::clone(&cols),
                     vals,
                 })
                 .collect())
@@ -1781,14 +2296,14 @@ fn read_table_with_plan(
     params: &[Value],
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
-) -> Result<Vec<(i64, Vec<u8>)>> {
+) -> Result<Vec<(TableRowKey, Vec<u8>)>> {
     if let Some(hint) = indexed_by {
         match hint {
             IndexHint::NotIndexed => {
                 if ctx.btree.pager().page_count() == 0 {
                     return Ok(Vec::new());
                 }
-                return ctx.btree.scan_table(tbl.root_pgno);
+                return scan_table_raw_entries(ctx, tbl);
             }
             IndexHint::IndexedBy(idx_name) => {
                 let Some(idx) = ctx
@@ -1819,10 +2334,16 @@ fn read_table_with_plan(
                 let mut rows = Vec::with_capacity(entries.len());
                 for rec_bytes in entries {
                     let fields = decode_record_with_encoding(&rec_bytes, enc)?;
-                    if let Some(Value::Integer(rid)) = fields.last()
+                    if tbl.without_rowid {
+                        let pk = idx.extract_without_rowid_pk_from_hit(tbl, &fields);
+                        let rkey = TableRowKey::WithoutRowidPk(pk);
+                        if let Some(payload) = seek_table_raw_entry(ctx, tbl, &rkey)? {
+                            rows.push((rkey, payload));
+                        }
+                    } else if let Some(Value::Integer(rid)) = fields.last()
                         && let Some(payload) = ctx.btree.seek_table_rowid(tbl.root_pgno, *rid)?
                     {
-                        rows.push((*rid, payload));
+                        rows.push((TableRowKey::Rowid(*rid), payload));
                     }
                 }
                 return Ok(rows);
@@ -1835,7 +2356,7 @@ fn read_table_with_plan(
     }
     let plan = choose_access_plan(tbl, alias, where_hint, ctx.schema);
     match plan {
-        AccessPlan::FullScan => ctx.btree.scan_table(tbl.root_pgno),
+        AccessPlan::FullScan => scan_table_raw_entries(ctx, tbl),
         AccessPlan::RowidSeek { key_expr } => {
             let kv = eval_expr(ctx, &key_expr, params, outer_scopes, ctes, None)?;
             let target = match kv {
@@ -1852,7 +2373,7 @@ fn read_table_with_plan(
                 return Ok(Vec::new());
             };
             if let Some(payload) = ctx.btree.seek_table_rowid(tbl.root_pgno, rid)? {
-                Ok(vec![(rid, payload)])
+                Ok(vec![(TableRowKey::Rowid(rid), payload)])
             } else {
                 Ok(Vec::new())
             }
@@ -1874,16 +2395,39 @@ fn read_table_with_plan(
                 }
                 prefix_vals.push(coerced);
             }
+            if tbl.without_rowid && index.origin == "pk" && index.root_pgno == tbl.root_pgno {
+                let pk_orders = tbl.without_rowid_pk_orders();
+                let enc = ctx.btree.encoding();
+                let raw_hits = ctx.btree.seek_index_equal_raw(
+                    tbl.root_pgno,
+                    &prefix_vals,
+                    &pk_orders[..prefix_vals.len()],
+                )?;
+                let n_pk = tbl.without_rowid_pk_cols.len();
+                let mut rows = Vec::with_capacity(raw_hits.len());
+                for rec_bytes in raw_hits {
+                    let decoded = decode_record_with_encoding(&rec_bytes, enc)?;
+                    let pk = decoded[..n_pk.min(decoded.len())].to_vec();
+                    rows.push((TableRowKey::WithoutRowidPk(pk), rec_bytes));
+                }
+                return Ok(rows);
+            }
             let orders = index.key_sort_orders();
             let idx_hits = ctx
                 .btree
                 .seek_index_equal(index.root_pgno, &prefix_vals, &orders)?;
             let mut rows = Vec::with_capacity(idx_hits.len());
             for hit in idx_hits {
-                if let Some(Value::Integer(rid)) = hit.last()
+                if tbl.without_rowid {
+                    let pk = index.extract_without_rowid_pk_from_hit(tbl, &hit);
+                    let rkey = TableRowKey::WithoutRowidPk(pk);
+                    if let Some(payload) = seek_table_raw_entry(ctx, tbl, &rkey)? {
+                        rows.push((rkey, payload));
+                    }
+                } else if let Some(Value::Integer(rid)) = hit.last()
                     && let Some(payload) = ctx.btree.seek_table_rowid(tbl.root_pgno, *rid)?
                 {
-                    rows.push((*rid, payload));
+                    rows.push((TableRowKey::Rowid(*rid), payload));
                 }
             }
             Ok(rows)
@@ -1951,6 +2495,154 @@ fn merge_join_scoped_columns(
     cols
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum HashJoinKey {
+    Null,
+    Int(i64),
+    RealBits(u64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+impl HashJoinKey {
+    fn from_value_exact(val: &Value, comp_aff: TypeAffinity) -> Option<Self> {
+        const MAX_EXACT_F64_INT: i64 = 9_007_199_254_740_992; // 2^53
+        let coerced;
+        let v = if comp_aff != TypeAffinity::Blob {
+            coerced = comp_aff.apply(val.clone());
+            &coerced
+        } else {
+            val
+        };
+        match v {
+            Value::Null => Some(Self::Null),
+            Value::Integer(i) => {
+                if *i < -MAX_EXACT_F64_INT || *i > MAX_EXACT_F64_INT {
+                    None
+                } else {
+                    Some(Self::Int(*i))
+                }
+            }
+            Value::Real(r) => {
+                if !r.is_finite()
+                    || *r < -(MAX_EXACT_F64_INT as f64)
+                    || *r > (MAX_EXACT_F64_INT as f64)
+                {
+                    None
+                } else if r.fract() == 0.0 {
+                    Some(Self::Int(*r as i64))
+                } else if *r == 0.0 {
+                    Some(Self::RealBits(0.0f64.to_bits()))
+                } else {
+                    Some(Self::RealBits(r.to_bits()))
+                }
+            }
+            Value::Text(s) => Some(Self::Text(s.clone())),
+            Value::Blob(b) => Some(Self::Blob(b.clone())),
+        }
+    }
+}
+
+struct EquiHashIndex {
+    l_idx: usize,
+    is_null_eq: bool,
+    comp_aff: TypeAffinity,
+    buckets: HashMap<HashJoinKey, Vec<usize>>,
+}
+
+fn try_build_equi_hash_index(
+    conjuncts: &[&Expr],
+    left_cols: &[ScopedColumn],
+    right_cols: &[ScopedColumn],
+    merged_cols: &[ScopedColumn],
+    left_rows: &[EvalRow],
+    right_rows: &[EvalRow],
+    eligible_right: &[usize],
+) -> Option<EquiHashIndex> {
+    let resolve_side = |e: &Expr| -> Option<(bool, usize)> {
+        let Expr::Column { table, column } = e else {
+            return None;
+        };
+        // Must resolve unambiguously in `merged_cols` first!
+        let m_idx = resolve_unique_col_idx(merged_cols, table.as_deref(), column)
+            .ok()
+            .flatten()?;
+        let m_sc = &merged_cols[m_idx];
+        if m_sc.merged_using || m_sc.collation != Collation::Binary {
+            return None;
+        }
+        let in_l = resolve_unique_col_idx(left_cols, table.as_deref(), column)
+            .ok()
+            .flatten();
+        let in_r = resolve_unique_col_idx(right_cols, table.as_deref(), column)
+            .ok()
+            .flatten();
+        match (in_l, in_r) {
+            (Some(li), None) if left_cols[li].collation == Collation::Binary => Some((true, li)),
+            (None, Some(ri)) if right_cols[ri].collation == Collation::Binary => Some((false, ri)),
+            _ => None,
+        }
+    };
+
+    for &conj in conjuncts {
+        let Expr::Binary { left, op, right } = conj else {
+            continue;
+        };
+        let is_null_eq = match op {
+            BinaryOp::Eq => false,
+            BinaryOp::Is => true,
+            _ => continue,
+        };
+        let Some((l_is_left, a_idx)) = resolve_side(left) else {
+            continue;
+        };
+        let Some((r_is_left, b_idx)) = resolve_side(right) else {
+            continue;
+        };
+        if l_is_left == r_is_left {
+            continue;
+        }
+        let (l_idx, r_idx) = if l_is_left {
+            (a_idx, b_idx)
+        } else {
+            (b_idx, a_idx)
+        };
+        let comp_aff = sqlite_compare_affinity(left_cols[l_idx].affinity, right_cols[r_idx].affinity);
+
+        // Verify all values in `left_rows[..][l_idx]` fit exact HashJoinKey representation
+        if left_rows
+            .iter()
+            .any(|lr| HashJoinKey::from_value_exact(&lr.vals[l_idx], comp_aff).is_none())
+        {
+            continue;
+        }
+
+        let mut buckets: HashMap<HashJoinKey, Vec<usize>> =
+            HashMap::with_capacity(eligible_right.len());
+        let mut exact_ok = true;
+        for &ri in eligible_right {
+            let rv = &right_rows[ri].vals[r_idx];
+            let Some(key) = HashJoinKey::from_value_exact(rv, comp_aff) else {
+                exact_ok = false;
+                break;
+            };
+            if matches!(key, HashJoinKey::Null) && !is_null_eq {
+                continue;
+            }
+            buckets.entry(key).or_default().push(ri);
+        }
+        if exact_ok {
+            return Some(EquiHashIndex {
+                l_idx,
+                is_null_eq,
+                comp_aff,
+                buckets,
+            });
+        }
+    }
+    None
+}
+
 fn apply_join(
     ctx: &mut ExecContext<'_>,
     left_rows: Vec<EvalRow>,
@@ -1958,60 +2650,122 @@ fn apply_join(
     left_cols_fallback: &[ScopedColumn],
     right_cols_fallback: &[ScopedColumn],
     join: &JoinClause,
+    extra_where_conjuncts: &[&Expr],
     params: &[Value],
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
 ) -> Result<Vec<EvalRow>> {
-    let left_sample_cols = left_rows
+    let left_sample_cols: Vec<ScopedColumn> = left_rows
         .first()
-        .map_or_else(|| left_cols_fallback.to_vec(), |r| r.cols.clone());
-    let right_sample_cols = right_rows
+        .map_or_else(|| left_cols_fallback.to_vec(), |r| r.cols.to_vec());
+    let right_sample_cols: Vec<ScopedColumn> = right_rows
         .first()
-        .map_or_else(|| right_cols_fallback.to_vec(), |r| r.cols.clone());
+        .map_or_else(|| right_cols_fallback.to_vec(), |r| r.cols.to_vec());
 
     let using_cols = compute_join_using_cols(&left_sample_cols, &right_sample_cols, join);
-
-    let combine_rows = |l: Option<&EvalRow>, r: Option<&EvalRow>| -> EvalRow {
-        let mut cols = Vec::new();
-        let mut vals = Vec::new();
-
-        let l_cols = l.map_or(left_sample_cols.as_slice(), |row| row.cols.as_slice());
-        let r_cols = r.map_or(right_sample_cols.as_slice(), |row| row.cols.as_slice());
-
-        for (i, lc) in l_cols.iter().enumerate() {
-            let mut sc = lc.clone();
-            let mut val = l.map_or(Value::Null, |row| row.vals[i].clone());
-            if !sc.hidden_rowid
-                && using_cols
-                    .iter()
-                    .any(|u| u.eq_ignore_ascii_case(&sc.name))
-            {
-                sc.merged_using = true;
-                if val.is_null()
-                    && let Some(r_row) = r
-                    && let Some((rv, _)) = r_row.lookup(None, &sc.name).ok().flatten()
-                {
-                    val = rv;
-                }
-            }
-            cols.push(sc);
-            vals.push(val);
-        }
-
-        for (j, rc) in r_cols.iter().enumerate() {
+    let merged_cols = merge_join_scoped_columns(&left_sample_cols, &right_sample_cols, join);
+    let shared_merged_cols: Rc<[ScopedColumn]> = Rc::from(merged_cols.as_slice());
+    let right_keep_indices: Vec<usize> = right_sample_cols
+        .iter()
+        .enumerate()
+        .filter_map(|(j, rc)| {
             if !rc.hidden_rowid
                 && using_cols
                     .iter()
                     .any(|u| u.eq_ignore_ascii_case(&rc.name))
             {
-                // Omit duplicate USING / NATURAL column from unqualified expansion
-                continue;
+                None
+            } else {
+                Some(j)
             }
-            cols.push(rc.clone());
+        })
+        .collect();
+    let left_is_using: Vec<bool> = left_sample_cols
+        .iter()
+        .map(|lc| {
+            !lc.hidden_rowid
+                && using_cols
+                    .iter()
+                    .any(|u| u.eq_ignore_ascii_case(&lc.name))
+        })
+        .collect();
+
+    let combine_rows = |l: Option<&EvalRow>, r: Option<&EvalRow>| -> EvalRow {
+        let mut vals = Vec::with_capacity(merged_cols.len());
+        for (i, lc) in left_sample_cols.iter().enumerate() {
+            let mut val = l.map_or(Value::Null, |row| row.vals[i].clone());
+            if left_is_using[i]
+                && val.is_null()
+                && let Some(r_row) = r
+                && let Some((rv, _)) = r_row.lookup(None, &lc.name).ok().flatten()
+            {
+                val = rv;
+            }
+            vals.push(val);
+        }
+        for &j in &right_keep_indices {
             vals.push(r.map_or(Value::Null, |row| row.vals[j].clone()));
         }
+        EvalRow {
+            cols: Rc::clone(&shared_merged_cols),
+            vals,
+        }
+    };
 
-        EvalRow { cols, vals }
+    let mut all_conjuncts: Vec<&Expr> = Vec::new();
+    if using_cols.is_empty() {
+        if let Some(JoinConstraint::On(on_expr)) = &join.constraint {
+            split_where_conjuncts(on_expr, &mut all_conjuncts);
+        }
+        all_conjuncts.extend_from_slice(extra_where_conjuncts);
+    }
+
+    let mut left_only_conjuncts: Vec<&Expr> = Vec::new();
+    let mut right_only_conjuncts: Vec<&Expr> = Vec::new();
+    if using_cols.is_empty() && !left_rows.is_empty() && !right_rows.is_empty() {
+        for &c in &all_conjuncts {
+            if expr_can_eval_with_cols(c, &left_sample_cols, &merged_cols, outer_scopes) {
+                left_only_conjuncts.push(c);
+            } else if expr_can_eval_with_cols(c, &right_sample_cols, &merged_cols, outer_scopes) {
+                right_only_conjuncts.push(c);
+            }
+        }
+    }
+
+    let mut eligible_right: Vec<usize> = Vec::with_capacity(right_rows.len());
+    if !left_rows.is_empty() {
+        for (ri, r) in right_rows.iter().enumerate() {
+            let mut ok = true;
+            if !right_only_conjuncts.is_empty() {
+                let r_scopes = push_scope(outer_scopes, r);
+                for &rc in &right_only_conjuncts {
+                    if eval_expr(ctx, rc, params, &r_scopes, ctes, None)?.truthiness()
+                        != Some(true)
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                eligible_right.push(ri);
+            }
+        }
+    }
+
+    let hash_index = if using_cols.is_empty() && !left_rows.is_empty() && !eligible_right.is_empty()
+    {
+        try_build_equi_hash_index(
+            &all_conjuncts,
+            &left_sample_cols,
+            &right_sample_cols,
+            &merged_cols,
+            &left_rows,
+            &right_rows,
+            &eligible_right,
+        )
+    } else {
+        None
     };
 
     let mut out = Vec::new();
@@ -2019,50 +2773,119 @@ fn apply_join(
 
     for l in &left_rows {
         let mut any_match = false;
-        for (ri, r) in right_rows.iter().enumerate() {
-            let matches = if !using_cols.is_empty() {
-                let mut ok = true;
-                for u in &using_cols {
-                    let (lv, lcoll, laff) = l
-                        .lookup_full(None, u)?
-                        .unwrap_or((Value::Null, Collation::Binary, None));
-                    let (rv, rcoll, raff) = r
-                        .lookup_full(None, u)?
-                        .unwrap_or((Value::Null, Collation::Binary, None));
-                    let coll = if lcoll != Collation::Binary {
-                        lcoll
-                    } else {
-                        rcoll
-                    };
-                    let comp_aff = sqlite_compare_affinity(laff, raff);
-                    if eval_comparison_with_affinity(
-                        Opcode::Eq,
-                        &lv,
-                        &rv,
-                        comp_aff,
-                        coll,
-                        ctx.btree.encoding(),
-                    )
-                    .truthiness()
-                        != Some(true)
-                    {
-                        ok = false;
-                        break;
-                    }
+        let mut left_ok = true;
+        if !right_rows.is_empty() && !left_only_conjuncts.is_empty() {
+            let l_scopes = push_scope(outer_scopes, l);
+            for &lc in &left_only_conjuncts {
+                if eval_expr(ctx, lc, params, &l_scopes, ctes, None)?.truthiness() != Some(true) {
+                    left_ok = false;
+                    break;
                 }
-                ok
-            } else if let Some(JoinConstraint::On(on_expr)) = &join.constraint {
-                let candidate = combine_rows(Some(l), Some(r));
-                let scopes = push_scope(outer_scopes, &candidate);
-                eval_expr(ctx, on_expr, params, &scopes, ctes, None)?.truthiness() == Some(true)
+            }
+        }
+
+        if left_ok && !eligible_right.is_empty() {
+            let candidates: &[usize] = if let Some(ref hi) = hash_index {
+                let key = HashJoinKey::from_value_exact(&l.vals[hi.l_idx], hi.comp_aff)
+                    .expect("verified exact key");
+                if matches!(key, HashJoinKey::Null) && !hi.is_null_eq {
+                    &[]
+                } else {
+                    hi.buckets.get(&key).map_or(&[][..], Vec::as_slice)
+                }
             } else {
-                true
+                &eligible_right
             };
 
-            if matches {
-                any_match = true;
-                right_matched[ri] = true;
-                out.push(combine_rows(Some(l), Some(r)));
+            for &ri in candidates {
+                let r = &right_rows[ri];
+                let mut candidate_opt: Option<EvalRow> = None;
+                let matches = if !using_cols.is_empty() {
+                    let mut ok = true;
+                    for u in &using_cols {
+                        let (lv, lcoll, laff) = l
+                            .lookup_full(None, u)?
+                            .unwrap_or((Value::Null, Collation::Binary, None));
+                        let (rv, rcoll, raff) = r
+                            .lookup_full(None, u)?
+                            .unwrap_or((Value::Null, Collation::Binary, None));
+                        let coll = if lcoll != Collation::Binary {
+                            lcoll
+                        } else {
+                            rcoll
+                        };
+                        let comp_aff = sqlite_compare_affinity(laff, raff);
+                        if eval_comparison_with_affinity(
+                            Opcode::Eq,
+                            &lv,
+                            &rv,
+                            comp_aff,
+                            coll,
+                            ctx.btree.encoding(),
+                        )
+                        .truthiness()
+                            != Some(true)
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
+                } else if join.constraint.is_some() || !extra_where_conjuncts.is_empty() {
+                    let cand = combine_rows(Some(l), Some(r));
+                    let mut ok = true;
+                    if outer_scopes.is_empty() {
+                        let single_scope = std::slice::from_ref(&cand);
+                        if let Some(JoinConstraint::On(on_expr)) = &join.constraint
+                            && eval_expr(ctx, on_expr, params, single_scope, ctes, None)?
+                                .truthiness()
+                                != Some(true)
+                        {
+                            ok = false;
+                        }
+                        if ok {
+                            for &wc in extra_where_conjuncts {
+                                if eval_expr(ctx, wc, params, single_scope, ctes, None)?
+                                    .truthiness()
+                                    != Some(true)
+                                {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        let scopes = push_scope(outer_scopes, &cand);
+                        if let Some(JoinConstraint::On(on_expr)) = &join.constraint
+                            && eval_expr(ctx, on_expr, params, &scopes, ctes, None)?.truthiness()
+                                != Some(true)
+                        {
+                            ok = false;
+                        }
+                        if ok {
+                            for &wc in extra_where_conjuncts {
+                                if eval_expr(ctx, wc, params, &scopes, ctes, None)?.truthiness()
+                                    != Some(true)
+                                {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if ok {
+                        candidate_opt = Some(cand);
+                    }
+                    ok
+                } else {
+                    true
+                };
+
+                if matches {
+                    any_match = true;
+                    right_matched[ri] = true;
+                    out.push(candidate_opt.unwrap_or_else(|| combine_rows(Some(l), Some(r))));
+                }
             }
         }
 
@@ -3170,7 +3993,7 @@ fn infer_select_core_meta(
                 return Vec::new();
             };
             let dummy_row = EvalRow {
-                cols: sample_cols.clone(),
+                cols: Rc::from(sample_cols.as_slice()),
                 vals: vec![Value::Null; sample_cols.len()],
             };
             let full_scopes = push_scope(outer_scopes, &dummy_row);
@@ -4002,7 +4825,15 @@ fn eval_expr(
                         format!("misuse of aggregate function {name}()"),
                     ));
                 };
-                let mut acc = AggregateAccumulator::new(agg_kind, *distinct);
+                let arg_coll = match args {
+                    FunctionArgs::Exprs(es) if es.len() == 1 => {
+                        let ref_cols = group_rows.first().map_or(&[][..], |r| &r.cols[..]);
+                        infer_expr_collation_from_cols(&es[0], ref_cols)
+                    }
+                    _ => Collation::Binary,
+                };
+                let mut acc =
+                    AggregateAccumulator::new_with_collation(agg_kind, *distinct, arg_coll);
                 for gr in group_rows {
                     let row_scopes = push_scope(base_outer, gr);
                     if let Some(f_expr) = filter {
@@ -4420,15 +5251,134 @@ fn eval_binary_arith(op: BinaryOp, lhs: &Value, rhs: &Value) -> Value {
 // Table Record <-> Logical Row Helpers & Constraints / Indexes
 // ============================================================================
 
+fn scan_table_raw_entries(
+    ctx: &mut ExecContext<'_>,
+    tbl: &TableSchema,
+) -> Result<Vec<(TableRowKey, Vec<u8>)>> {
+    if !tbl.without_rowid {
+        let rows = ctx.btree.scan_table(tbl.root_pgno)?;
+        return Ok(rows
+            .into_iter()
+            .map(|(rid, p)| (TableRowKey::Rowid(rid), p))
+            .collect());
+    }
+    let enc = ctx.btree.encoding();
+    let entries = ctx.btree.scan_index(tbl.root_pgno)?;
+    let n_pk = tbl.without_rowid_pk_cols.len();
+    let mut out = Vec::with_capacity(entries.len());
+    for rec in entries {
+        let decoded = decode_record_with_encoding(&rec, enc)?;
+        let pk = decoded[..n_pk.min(decoded.len())].to_vec();
+        out.push((TableRowKey::WithoutRowidPk(pk), rec));
+    }
+    Ok(out)
+}
+
+fn seek_table_raw_entry(
+    ctx: &mut ExecContext<'_>,
+    tbl: &TableSchema,
+    rkey: &TableRowKey,
+) -> Result<Option<Vec<u8>>> {
+    match rkey {
+        TableRowKey::Rowid(rid) => ctx.btree.seek_table_rowid(tbl.root_pgno, *rid),
+        TableRowKey::WithoutRowidPk(pk) => {
+            let pk_orders = tbl.without_rowid_pk_orders();
+            Ok(ctx
+                .btree
+                .seek_index_equal_raw(tbl.root_pgno, pk, &pk_orders)?
+                .into_iter()
+                .next())
+        }
+    }
+}
+
+fn table_keys_equal(
+    tbl: &TableSchema,
+    a: &TableRowKey,
+    b: &TableRowKey,
+    enc: TextEncoding,
+) -> bool {
+    match (a, b) {
+        (TableRowKey::Rowid(r1), TableRowKey::Rowid(r2)) => r1 == r2,
+        (TableRowKey::WithoutRowidPk(pk1), TableRowKey::WithoutRowidPk(pk2)) => {
+            if pk1.len() != pk2.len() {
+                return false;
+            }
+            pk1.iter()
+                .zip(pk2.iter())
+                .zip(tbl.without_rowid_pk_cols.iter())
+                .all(|((v1, v2), ic)| {
+                    v1.cmp_sqlite_with_encoding(v2, ic.sort_order.collation, enc)
+                        == Ordering::Equal
+                })
+        }
+        _ => false,
+    }
+}
+
 fn decode_table_logical_row(
     ctx: &mut ExecContext<'_>,
     tbl: &TableSchema,
-    rowid: i64,
+    rkey: &TableRowKey,
     payload: &[u8],
     params: &[Value],
 ) -> Result<Vec<Value>> {
     let enc = ctx.btree.encoding();
     let phys_vals = decode_record_with_encoding(payload, enc)?;
+
+    if tbl.without_rowid {
+        let mut logical_vals = vec![Value::Null; tbl.columns.len()];
+        let mut assigned = vec![false; tbl.columns.len()];
+        for (pk_slot, ic) in tbl.without_rowid_pk_cols.iter().enumerate() {
+            if let Some(ci) = ic.col_idx
+                && !assigned[ci]
+                && pk_slot < phys_vals.len()
+            {
+                logical_vals[ci] = phys_vals[pk_slot].clone();
+                assigned[ci] = true;
+            }
+        }
+        let n_pk = tbl.without_rowid_pk_cols.len();
+        for (extra_slot, &ci) in tbl.without_rowid_extra_cols.iter().enumerate() {
+            let phys_pos = n_pk + extra_slot;
+            let col = &tbl.columns[ci];
+            let v = if phys_pos < phys_vals.len() {
+                phys_vals[phys_pos].clone()
+            } else {
+                let def_val = match &col.default_expr {
+                    Some(de) => eval_expr(ctx, de, params, &[], &CteStore::default(), None)?,
+                    None => Value::Null,
+                };
+                let mut coerced = col.affinity.apply(def_val);
+                if tbl.strict
+                    && col.type_name.trim().eq_ignore_ascii_case("REAL")
+                    && let Value::Integer(iv) = coerced
+                {
+                    coerced = Value::real(iv as f64);
+                }
+                coerced
+            };
+            logical_vals[ci] = v;
+            assigned[ci] = true;
+        }
+        for ci in 0..tbl.columns.len() {
+            if let Some((ref gexpr, false)) = tbl.columns[ci].generated {
+                let scope = make_single_table_scope(tbl, None, 0, &logical_vals);
+                let gv = eval_expr(ctx, gexpr, params, &[scope], &CteStore::default(), None)?;
+                let mut coerced = tbl.columns[ci].affinity.apply(gv);
+                if tbl.strict
+                    && tbl.columns[ci].type_name.trim().eq_ignore_ascii_case("REAL")
+                    && let Value::Integer(iv) = coerced
+                {
+                    coerced = Value::real(iv as f64);
+                }
+                logical_vals[ci] = coerced;
+            }
+        }
+        return Ok(logical_vals);
+    }
+
+    let rowid = rkey.rowid_or_zero();
     let has_virtual = tbl
         .columns
         .iter()
@@ -4438,11 +5388,19 @@ fn decode_table_logical_row(
         let mut vals = phys_vals;
         while vals.len() < tbl.columns.len() {
             let missing_idx = vals.len();
-            let def_val = match &tbl.columns[missing_idx].default_expr {
+            let col = &tbl.columns[missing_idx];
+            let def_val = match &col.default_expr {
                 Some(de) => eval_expr(ctx, de, params, &[], &CteStore::default(), None)?,
                 None => Value::Null,
             };
-            vals.push(tbl.columns[missing_idx].affinity.apply(def_val));
+            let mut coerced = col.affinity.apply(def_val);
+            if tbl.strict
+                && col.type_name.trim().eq_ignore_ascii_case("REAL")
+                && let Value::Integer(iv) = coerced
+            {
+                coerced = Value::real(iv as f64);
+            }
+            vals.push(coerced);
         }
         vals.truncate(tbl.columns.len());
         if let Some(ipk) = tbl.rowid_alias_col
@@ -4472,7 +5430,14 @@ fn decode_table_logical_row(
                     Some(de) => eval_expr(ctx, de, params, &[], &CteStore::default(), None)?,
                     None => Value::Null,
                 };
-                col.affinity.apply(def_val)
+                let mut coerced = col.affinity.apply(def_val);
+                if tbl.strict
+                    && col.type_name.trim().eq_ignore_ascii_case("REAL")
+                    && let Value::Integer(iv) = coerced
+                {
+                    coerced = Value::real(iv as f64);
+                }
+                coerced
             };
             logical_vals.push(v);
         }
@@ -4500,6 +5465,19 @@ fn encode_table_physical_record(
     logical_vals: &[Value],
     enc: TextEncoding,
 ) -> Vec<u8> {
+    if tbl.without_rowid {
+        let mut slots =
+            Vec::with_capacity(tbl.without_rowid_pk_cols.len() + tbl.without_rowid_extra_cols.len());
+        for ic in &tbl.without_rowid_pk_cols {
+            let ci = ic.col_idx.expect("WITHOUT ROWID PK col has col_idx");
+            slots.push(logical_vals[ci].clone());
+        }
+        for &ci in &tbl.without_rowid_extra_cols {
+            slots.push(logical_vals[ci].clone());
+        }
+        return encode_record_with_encoding(&slots, enc);
+    }
+
     let mut slots = Vec::with_capacity(logical_vals.len());
     for (i, v) in logical_vals.iter().enumerate() {
         let is_virt = tbl
@@ -4547,7 +5525,7 @@ fn make_single_table_scope(tbl: &TableSchema, alias: Option<&str>, rowid: i64, v
         row_vals.push(Value::Integer(rowid));
     }
     EvalRow {
-        cols,
+        cols: cols.into(),
         vals: row_vals,
     }
 }
@@ -4633,12 +5611,20 @@ fn eval_index_key_values(
     ctx: &mut ExecContext<'_>,
     tbl: &TableSchema,
     idx: &IndexSchema,
-    rowid: i64,
+    rkey: &TableRowKey,
     logical_vals: &[Value],
     params: &[Value],
 ) -> Result<Vec<Value>> {
+    let rowid = rkey.rowid_or_zero();
     let mut keys = eval_index_column_values(ctx, tbl, idx, rowid, logical_vals, params)?;
-    keys.push(Value::Integer(rowid));
+    if tbl.without_rowid {
+        for tc in &idx.trailing_pk_cols {
+            let ci = tc.col_idx.expect("WITHOUT ROWID trailing PK col has col_idx");
+            keys.push(logical_vals[ci].clone());
+        }
+    } else {
+        keys.push(Value::Integer(rowid));
+    }
     Ok(keys)
 }
 
@@ -4655,34 +5641,47 @@ fn format_unique_index_failure(tbl: &TableSchema, idx: &IndexSchema) -> String {
     }
 }
 
-/// Deletes `rowid` AND all its secondary index entries from `tbl`.
+/// Deletes `rkey` AND all its secondary index entries from `tbl`.
 fn remove_row_and_indexes(
     ctx: &mut ExecContext<'_>,
     tbl: &TableSchema,
     indexes: &[IndexSchema],
-    rowid: i64,
+    rkey: &TableRowKey,
     params: &[Value],
 ) -> Result<bool> {
     if indexes.is_empty() {
-        return ctx.btree.delete_table(tbl.root_pgno, rowid);
+        return match rkey {
+            TableRowKey::Rowid(rowid) => ctx.btree.delete_table(tbl.root_pgno, *rowid),
+            TableRowKey::WithoutRowidPk(pk) => {
+                let pk_orders = tbl.without_rowid_pk_orders();
+                ctx.btree.delete_index(tbl.root_pgno, pk, &pk_orders)
+            }
+        };
     }
-    let Some(old_payload) = ctx.btree.seek_table_rowid(tbl.root_pgno, rowid)? else {
+    let Some(old_payload) = seek_table_raw_entry(ctx, tbl, rkey)? else {
         return Ok(false);
     };
-    let old_vals = decode_table_logical_row(ctx, tbl, rowid, &old_payload, params)?;
+    let old_vals = decode_table_logical_row(ctx, tbl, rkey, &old_payload, params)?;
+    let rowid = rkey.rowid_or_zero();
     for idx in indexes {
         if index_row_passes_partial_where(ctx, tbl, idx, rowid, &old_vals, params)? {
-            let keys = eval_index_key_values(ctx, tbl, idx, rowid, &old_vals, params)?;
+            let keys = eval_index_key_values(ctx, tbl, idx, rkey, &old_vals, params)?;
             let orders = idx.key_sort_orders();
             ctx.btree.delete_index(idx.root_pgno, &keys, &orders)?;
         }
     }
-    ctx.btree.delete_table(tbl.root_pgno, rowid)
+    match rkey {
+        TableRowKey::Rowid(rid) => ctx.btree.delete_table(tbl.root_pgno, *rid),
+        TableRowKey::WithoutRowidPk(pk) => {
+            let pk_orders = tbl.without_rowid_pk_orders();
+            ctx.btree.delete_index(tbl.root_pgno, pk, &pk_orders)
+        }
+    }
 }
 
-/// Validates constraints (NOT NULL, STRICT, CHECK, Rowid PK, UNIQUE indexes), applies conflict resolution
+/// Validates constraints (NOT NULL, STRICT, CHECK, Rowid/WITHOUT ROWID PK, UNIQUE indexes), applies conflict resolution
 /// (`IGNORE` / `REPLACE` / error with `ConflictResolutionEffect`), and writes the row + secondary index entries!
-/// Returns `Ok(Some((final_rowid, final_logical_vals)))` if written, or `Ok(None)` if skipped via `IGNORE`.
+/// Returns `Ok(Some((final_key, final_logical_vals)))` if written, or `Ok(None)` if skipped via `IGNORE`.
 #[allow(clippy::too_many_arguments)]
 fn validate_and_write_row(
     ctx: &mut ExecContext<'_>,
@@ -4691,36 +5690,39 @@ fn validate_and_write_row(
     candidate_rowid: Option<i64>,
     mut raw_vals: Vec<Value>,
     stmt_conflict: Option<ConflictAction>,
-    existing_self_rowid: Option<i64>,
+    existing_self_key: Option<&TableRowKey>,
     params: &[Value],
     bump_last_rowid: bool,
     count_as_top_level_change: bool,
-    stmt_fk_suspects: &mut Vec<(String, i64, usize)>,
+    stmt_fk_suspects: &mut Vec<(String, TableRowKey, usize)>,
     fk_depth: usize,
-) -> Result<Option<(i64, Vec<Value>)>> {
-    // 1. Determine final rowid & apply column affinities
-    let mut final_rowid = match candidate_rowid {
-        Some(r) => Some(r),
-        None => match tbl.rowid_alias_col {
-            Some(ipk) => {
-                if raw_vals[ipk].is_null() {
-                    None
-                } else {
-                    let coerced = TypeAffinity::Integer.apply(raw_vals[ipk].clone());
-                    let Some(i) = coerced.as_i64() else {
-                        return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
-                    };
-                    Some(i)
+) -> Result<Option<(TableRowKey, Vec<Value>)>> {
+    // 1. Determine final rowid (for rowid tables) & apply column affinities
+    let rowid = if tbl.without_rowid {
+        0
+    } else {
+        let mut final_rowid = match candidate_rowid {
+            Some(r) => Some(r),
+            None => match tbl.rowid_alias_col {
+                Some(ipk) => {
+                    if raw_vals[ipk].is_null() {
+                        None
+                    } else {
+                        let coerced = TypeAffinity::Integer.apply(raw_vals[ipk].clone());
+                        let Some(i) = coerced.as_i64() else {
+                            return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
+                        };
+                        Some(i)
+                    }
                 }
-            }
-            None => None,
-        },
+                None => None,
+            },
+        };
+        if final_rowid.is_none() {
+            final_rowid = Some(allocate_table_rowid(ctx, tbl)?);
+        }
+        final_rowid.unwrap()
     };
-
-    if final_rowid.is_none() {
-        final_rowid = Some(allocate_table_rowid(ctx, tbl)?);
-    }
-    let rowid = final_rowid.unwrap();
 
     for (i, col) in tbl.columns.iter().enumerate() {
         if col.generated.is_some() {
@@ -4791,7 +5793,14 @@ fn validate_and_write_row(
                             format!("NOT NULL constraint failed: {}.{}", tbl.name, col.name),
                         ));
                     }
-                    raw_vals[i] = col.affinity.apply(dv);
+                    let mut coerced = col.affinity.apply(dv);
+                    if tbl.strict
+                        && col.type_name.trim().eq_ignore_ascii_case("REAL")
+                        && let Value::Integer(iv) = coerced
+                    {
+                        coerced = Value::real(iv as f64);
+                    }
+                    raw_vals[i] = coerced;
                 }
                 _ => {
                     return Err(SqliteError::constraint(
@@ -4830,20 +5839,81 @@ fn validate_and_write_row(
         }
     }
 
-    // 5. Rowid / INTEGER PRIMARY KEY uniqueness check
-    if existing_self_rowid != Some(rowid)
+    let enc = ctx.btree.encoding();
+    let final_key = if tbl.without_rowid {
+        TableRowKey::WithoutRowidPk(tbl.extract_without_rowid_pk(&raw_vals))
+    } else {
+        TableRowKey::Rowid(rowid)
+    };
+
+    // 5. Primary B-Tree uniqueness check (Rowid / INTEGER PRIMARY KEY or WITHOUT ROWID PRIMARY KEY)
+    if tbl.without_rowid {
+        let is_self =
+            existing_self_key.is_some_and(|sk| table_keys_equal(tbl, &final_key, sk, enc));
+        if !is_self
+            && let Some(conflict_payload) = seek_table_raw_entry(ctx, tbl, &final_key)?
+        {
+            let decoded_conflict = decode_record_with_encoding(&conflict_payload, enc)?;
+            let n_pk = tbl.without_rowid_pk_cols.len();
+            let conflict_key =
+                TableRowKey::WithoutRowidPk(decoded_conflict[..n_pk.min(decoded_conflict.len())].to_vec());
+            let eff = stmt_conflict.unwrap_or(tbl.without_rowid_pk_conflict);
+            match eff {
+                ConflictAction::Ignore => return Ok(None),
+                ConflictAction::Replace => {
+                    let conflict_vals = decode_table_logical_row(
+                        ctx,
+                        tbl,
+                        &conflict_key,
+                        &conflict_payload,
+                        params,
+                    )?;
+                    if *ctx.foreign_keys {
+                        check_parent_delete_restrict(ctx, tbl, &conflict_vals, params)?;
+                    }
+                    remove_row_and_indexes(ctx, tbl, indexes, &conflict_key, params)?;
+                    if *ctx.foreign_keys {
+                        apply_parent_delete_fk_actions(
+                            ctx,
+                            tbl,
+                            &conflict_vals,
+                            params,
+                            stmt_fk_suspects,
+                            fk_depth + 1,
+                        )?;
+                    }
+                }
+                _ => {
+                    let pk_idx = tbl
+                        .without_rowid_pk_as_index()
+                        .expect("WITHOUT ROWID table has PK");
+                    return Err(SqliteError::constraint(
+                        extended::SQLITE_CONSTRAINT_PRIMARYKEY,
+                        format_unique_index_failure(tbl, &pk_idx),
+                    )
+                    .with_conflict_effect(conflict_action_to_effect(eff)));
+                }
+            }
+        }
+    } else if existing_self_key != Some(&final_key)
         && let Some(conflict_payload) = ctx.btree.seek_table_rowid(tbl.root_pgno, rowid)?
     {
+        let conflict_key = TableRowKey::Rowid(rowid);
         let eff = stmt_conflict.unwrap_or(tbl.rowid_pk_conflict);
         match eff {
             ConflictAction::Ignore => return Ok(None),
             ConflictAction::Replace => {
-                let conflict_vals =
-                    decode_table_logical_row(ctx, tbl, rowid, &conflict_payload, params)?;
+                let conflict_vals = decode_table_logical_row(
+                    ctx,
+                    tbl,
+                    &conflict_key,
+                    &conflict_payload,
+                    params,
+                )?;
                 if *ctx.foreign_keys {
                     check_parent_delete_restrict(ctx, tbl, &conflict_vals, params)?;
                 }
-                remove_row_and_indexes(ctx, tbl, indexes, rowid, params)?;
+                remove_row_and_indexes(ctx, tbl, indexes, &conflict_key, params)?;
                 if *ctx.foreign_keys {
                     apply_parent_delete_fk_actions(
                         ctx,
@@ -4891,27 +5961,37 @@ fn validate_and_write_row(
             &indexed_vals,
             &orders[..indexed_vals.len()],
         )?;
-        let mut conflicting_rowids = Vec::new();
+        let mut conflicting_keys = Vec::new();
         for hit in hits {
-            if let Some(Value::Integer(existing_rid)) = hit.last()
-                && Some(*existing_rid) != existing_self_rowid
-                && *existing_rid != rowid
-            {
-                conflicting_rowids.push(*existing_rid);
+            let hit_key_opt = if tbl.without_rowid {
+                Some(TableRowKey::WithoutRowidPk(
+                    idx.extract_without_rowid_pk_from_hit(tbl, &hit),
+                ))
+            } else {
+                hit.last().and_then(Value::as_i64).map(TableRowKey::Rowid)
+            };
+            if let Some(hit_key) = hit_key_opt {
+                let is_self =
+                    existing_self_key.is_some_and(|sk| table_keys_equal(tbl, &hit_key, sk, enc));
+                let is_same_target = table_keys_equal(tbl, &hit_key, &final_key, enc);
+                if !is_self && !is_same_target {
+                    conflicting_keys.push(hit_key);
+                }
             }
         }
-        if !conflicting_rowids.is_empty() {
+        if !conflicting_keys.is_empty() {
             let eff = stmt_conflict.unwrap_or(idx.conflict);
             match eff {
                 ConflictAction::Ignore => return Ok(None),
                 ConflictAction::Replace => {
-                    for crid in conflicting_rowids {
-                        if let Some(cpayload) = ctx.btree.seek_table_rowid(tbl.root_pgno, crid)? {
-                            let cvals = decode_table_logical_row(ctx, tbl, crid, &cpayload, params)?;
+                    for ckey in conflicting_keys {
+                        if let Some(cpayload) = seek_table_raw_entry(ctx, tbl, &ckey)? {
+                            let cvals =
+                                decode_table_logical_row(ctx, tbl, &ckey, &cpayload, params)?;
                             if *ctx.foreign_keys {
                                 check_parent_delete_restrict(ctx, tbl, &cvals, params)?;
                             }
-                            remove_row_and_indexes(ctx, tbl, indexes, crid, params)?;
+                            remove_row_and_indexes(ctx, tbl, indexes, &ckey, params)?;
                             if *ctx.foreign_keys {
                                 apply_parent_delete_fk_actions(
                                     ctx,
@@ -4941,10 +6021,10 @@ fn validate_and_write_row(
         }
     }
 
-    // 7. If updating an existing row in-place or moving rowids, check parent UPDATE RESTRICT before mutating
-    let old_logical_vals_opt = if let Some(old_rid) = existing_self_rowid {
-        let old_vals = if let Some(op) = ctx.btree.seek_table_rowid(tbl.root_pgno, old_rid)? {
-            Some(decode_table_logical_row(ctx, tbl, old_rid, &op, params)?)
+    // 7. If updating an existing row in-place or moving keys, check parent UPDATE RESTRICT before mutating
+    let old_logical_vals_opt = if let Some(old_key) = existing_self_key {
+        let old_vals = if let Some(op) = seek_table_raw_entry(ctx, tbl, old_key)? {
+            Some(decode_table_logical_row(ctx, tbl, old_key, &op, params)?)
         } else {
             None
         };
@@ -4953,20 +6033,25 @@ fn validate_and_write_row(
         {
             check_parent_update_restrict(ctx, tbl, ov, &raw_vals, params)?;
         }
-        remove_row_and_indexes(ctx, tbl, indexes, old_rid, params)?;
+        remove_row_and_indexes(ctx, tbl, indexes, old_key, params)?;
         old_vals
     } else {
         None
     };
 
-    // 8. Write table B+Tree record & secondary index records
-    let enc = ctx.btree.encoding();
+    // 8. Write table primary B-Tree record & secondary index records
     let phys_rec = encode_table_physical_record(tbl, &raw_vals, enc);
-    ctx.btree.insert_table(tbl.root_pgno, rowid, &phys_rec)?;
+    if tbl.without_rowid {
+        let pk_orders = tbl.without_rowid_pk_orders();
+        ctx.btree
+            .insert_index(tbl.root_pgno, &phys_rec, &pk_orders)?;
+    } else {
+        ctx.btree.insert_table(tbl.root_pgno, rowid, &phys_rec)?;
+    }
 
     for idx in indexes {
         if index_row_passes_partial_where(ctx, tbl, idx, rowid, &raw_vals, params)? {
-            let keys = eval_index_key_values(ctx, tbl, idx, rowid, &raw_vals, params)?;
+            let keys = eval_index_key_values(ctx, tbl, idx, &final_key, &raw_vals, params)?;
             let idx_rec = encode_record_with_encoding(&keys, enc);
             let orders = idx.key_sort_orders();
             ctx.btree.insert_index(idx.root_pgno, &idx_rec, &orders)?;
@@ -4979,7 +6064,7 @@ fn validate_and_write_row(
 
     // 9. Foreign key checks on child row & cascading parent UPDATE actions
     if *ctx.foreign_keys {
-        register_child_fk_checks(ctx, tbl, rowid, &raw_vals, stmt_fk_suspects)?;
+        register_child_fk_checks(ctx, tbl, &final_key, &raw_vals, stmt_fk_suspects)?;
         if let Some(ref old_vals) = old_logical_vals_opt {
             apply_parent_update_fk_actions(
                 ctx,
@@ -4993,7 +6078,7 @@ fn validate_and_write_row(
         }
     }
 
-    if bump_last_rowid {
+    if bump_last_rowid && !tbl.without_rowid {
         ctx.runtime.last_insert_rowid = rowid;
     }
     if count_as_top_level_change {
@@ -5001,30 +6086,31 @@ fn validate_and_write_row(
     }
     ctx.runtime.total_changes += 1;
 
-    Ok(Some((rowid, raw_vals)))
+    Ok(Some((final_key, raw_vals)))
 }
 
 fn allocate_table_rowid(ctx: &mut ExecContext<'_>, tbl: &TableSchema) -> Result<i64> {
-    let base_next = ctx.btree.next_rowid(tbl.root_pgno)?;
     if !tbl.autoincrement {
-        return Ok(base_next);
+        return ctx.btree.next_rowid(tbl.root_pgno);
     }
-    let Some(seq_tbl) = ctx.schema.find_user_table("sqlite_sequence").cloned() else {
-        return Ok(base_next);
-    };
-    let enc = ctx.btree.encoding();
-    let rows = ctx.btree.scan_table(seq_tbl.root_pgno)?;
-    for (_, payload) in rows {
-        let cols = decode_record_with_encoding(&payload, enc)?;
-        if cols.len() >= 2 && cols[0].as_str() == Some(tbl.name.as_str()) {
-            let prev_seq = cols[1].to_integer_lossy();
-            let candidate = prev_seq.checked_add(1).ok_or_else(|| {
-                SqliteError::new(ErrorCode::Full, "database or disk is full")
-            })?;
-            return Ok(candidate.max(base_next));
+
+    let max_existing = ctx.btree.max_table_rowid(tbl.root_pgno)?.unwrap_or(0);
+    let mut prev_seq = 0i64;
+    if let Some(seq_tbl) = ctx.schema.find_user_table("sqlite_sequence").cloned() {
+        let enc = ctx.btree.encoding();
+        let rows = ctx.btree.scan_table(seq_tbl.root_pgno)?;
+        for (_, payload) in rows {
+            let cols = decode_record_with_encoding(&payload, enc)?;
+            if cols.len() >= 2 && cols[0].as_str() == Some(tbl.name.as_str()) {
+                prev_seq = cols[1].to_integer_lossy();
+                break;
+            }
         }
     }
-    Ok(base_next)
+    prev_seq
+        .max(max_existing)
+        .checked_add(1)
+        .ok_or_else(|| SqliteError::new(ErrorCode::Full, "database or disk is full"))
 }
 
 fn update_sqlite_sequence(ctx: &mut ExecContext<'_>, tbl_name: &str, rowid: i64) -> Result<()> {
@@ -5127,7 +6213,11 @@ fn resolve_fk_parent_cols(
             let has_matching_unique_idx = if is_rowid_pk {
                 true
             } else {
-                schema.indexes_for_table(&ptbl.name).iter().any(|idx| {
+                let mut cand_idxs = schema.indexes_for_table(&ptbl.name);
+                if let Some(pk_idx) = ptbl.without_rowid_pk_as_index() {
+                    cand_idxs.push(pk_idx);
+                }
+                cand_idxs.iter().any(|idx| {
                     idx.unique
                         && idx.where_clause.is_none()
                         && idx.columns.len() == idxs.len()
@@ -5180,9 +6270,9 @@ fn parent_row_exists_for_fk(
         })
         .collect();
 
-    let raw_rows = ctx.btree.scan_table(ptbl.root_pgno)?;
-    for (prid, ppayload) in raw_rows {
-        let pvals = decode_table_logical_row(ctx, ptbl, prid, &ppayload, &[])?;
+    let raw_rows = scan_table_raw_entries(ctx, ptbl)?;
+    for (pkey, ppayload) in raw_rows {
+        let pvals = decode_table_logical_row(ctx, ptbl, &pkey, &ppayload, &[])?;
         let matches = parent_col_idxs
             .iter()
             .zip(coerced_keys.iter())
@@ -5233,9 +6323,9 @@ fn child_row_matches_parent_key(
 fn register_child_fk_checks(
     ctx: &mut ExecContext<'_>,
     tbl: &TableSchema,
-    rowid: i64,
+    rkey: &TableRowKey,
     written_vals: &[Value],
-    stmt_fk_suspects: &mut Vec<(String, i64, usize)>,
+    stmt_fk_suspects: &mut Vec<(String, TableRowKey, usize)>,
 ) -> Result<()> {
     for fk in &tbl.foreign_keys {
         let (ptbl, parent_col_idxs) = resolve_fk_parent_cols(ctx.schema, &tbl.name, fk)?;
@@ -5245,11 +6335,11 @@ fn register_child_fk_checks(
         if !parent_row_exists_for_fk(ctx, &ptbl, &parent_col_idxs, written_vals, &fk.from_cols)? {
             if fk.deferred {
                 ctx.deferred_fk_suspects
-                    .push((tbl.name.clone(), rowid, fk.id));
+                    .push((tbl.name.clone(), rkey.clone(), fk.id));
             } else {
                 // Per SQLite `OP_FkCounter` / `sqlite3VdbeCheckFkImmediate`, non-RESTRICT immediate FKs
                 // are verified at statement completion so multi-row / multi-cascade updates settle cleanly.
-                stmt_fk_suspects.push((tbl.name.clone(), rowid, fk.id));
+                stmt_fk_suspects.push((tbl.name.clone(), rkey.clone(), fk.id));
             }
         }
     }
@@ -5258,19 +6348,19 @@ fn register_child_fk_checks(
 
 fn verify_fk_suspects(
     ctx: &mut ExecContext<'_>,
-    suspects: &[(String, i64, usize)],
+    suspects: &[(String, TableRowKey, usize)],
 ) -> Result<()> {
-    for (ctbl_name, crid, fk_id) in suspects {
+    for (ctbl_name, ckey, fk_id) in suspects {
         let Some(ctbl) = ctx.schema.find_user_table(ctbl_name).cloned() else {
             continue;
         };
         let Some(fk) = ctbl.foreign_keys.iter().find(|f| f.id == *fk_id).cloned() else {
             continue;
         };
-        let Some(cpayload) = ctx.btree.seek_table_rowid(ctbl.root_pgno, *crid)? else {
+        let Some(cpayload) = seek_table_raw_entry(ctx, &ctbl, ckey)? else {
             continue;
         };
-        let cvals = decode_table_logical_row(ctx, &ctbl, *crid, &cpayload, &[])?;
+        let cvals = decode_table_logical_row(ctx, &ctbl, ckey, &cpayload, &[])?;
         let (ptbl, parent_col_idxs) = resolve_fk_parent_cols(ctx.schema, &ctbl.name, &fk)?;
         if !parent_row_exists_for_fk(ctx, &ptbl, &parent_col_idxs, &cvals, &fk.from_cols)? {
             return Err(fk_constraint_err());
@@ -5307,9 +6397,9 @@ fn check_parent_delete_restrict(
         if parent_col_idxs.iter().any(|&pi| old_parent_vals[pi].is_null()) {
             continue;
         }
-        let crows = ctx.btree.scan_table(ctbl.root_pgno)?;
-        for (crid, cpayload) in crows {
-            let cvals = decode_table_logical_row(ctx, &ctbl, crid, &cpayload, params)?;
+        let crows = scan_table_raw_entries(ctx, &ctbl)?;
+        for (ckey, cpayload) in crows {
+            let cvals = decode_table_logical_row(ctx, &ctbl, &ckey, &cpayload, params)?;
             if child_row_matches_parent_key(
                 ptbl,
                 &parent_col_idxs,
@@ -5365,9 +6455,9 @@ fn check_parent_update_restrict(
         if parent_col_idxs.iter().any(|&pi| old_parent_vals[pi].is_null()) {
             continue;
         }
-        let crows = ctx.btree.scan_table(ctbl.root_pgno)?;
-        for (crid, cpayload) in crows {
-            let cvals = decode_table_logical_row(ctx, &ctbl, crid, &cpayload, params)?;
+        let crows = scan_table_raw_entries(ctx, &ctbl)?;
+        for (ckey, cpayload) in crows {
+            let cvals = decode_table_logical_row(ctx, &ctbl, &ckey, &cpayload, params)?;
             if child_row_matches_parent_key(
                 ptbl,
                 &parent_col_idxs,
@@ -5388,7 +6478,7 @@ fn apply_parent_delete_fk_actions(
     ptbl: &TableSchema,
     old_parent_vals: &[Value],
     params: &[Value],
-    stmt_fk_suspects: &mut Vec<(String, i64, usize)>,
+    stmt_fk_suspects: &mut Vec<(String, TableRowKey, usize)>,
     fk_depth: usize,
 ) -> Result<()> {
     if fk_depth > MAX_FK_CASCADE_DEPTH {
@@ -5405,10 +6495,10 @@ fn apply_parent_delete_fk_actions(
         if parent_col_idxs.iter().any(|&pi| old_parent_vals[pi].is_null()) {
             continue;
         }
-        let crows = ctx.btree.scan_table(ctbl.root_pgno)?;
+        let crows = scan_table_raw_entries(ctx, &ctbl)?;
         let mut matching_children = Vec::new();
-        for (crid, cpayload) in crows {
-            let cvals = decode_table_logical_row(ctx, &ctbl, crid, &cpayload, params)?;
+        for (ckey, cpayload) in crows {
+            let cvals = decode_table_logical_row(ctx, &ctbl, &ckey, &cpayload, params)?;
             if child_row_matches_parent_key(
                 ptbl,
                 &parent_col_idxs,
@@ -5417,7 +6507,7 @@ fn apply_parent_delete_fk_actions(
                 &fk.from_cols,
                 enc,
             ) {
-                matching_children.push((crid, cvals));
+                matching_children.push((ckey, cvals));
             }
         }
         if matching_children.is_empty() {
@@ -5427,25 +6517,26 @@ fn apply_parent_delete_fk_actions(
         match fk.on_delete {
             FkAction::Restrict => return Err(fk_constraint_err()),
             FkAction::NoAction => {
-                for (crid, _) in matching_children {
+                for (ckey, _) in matching_children {
                     if fk.deferred {
                         ctx.deferred_fk_suspects
-                            .push((ctbl.name.clone(), crid, fk.id));
+                            .push((ctbl.name.clone(), ckey, fk.id));
                     } else {
-                        stmt_fk_suspects.push((ctbl.name.clone(), crid, fk.id));
+                        stmt_fk_suspects.push((ctbl.name.clone(), ckey, fk.id));
                     }
                 }
             }
             FkAction::Cascade => {
                 let cindexes = ctx.schema.indexes_for_table(&ctbl.name);
-                for (crid, _) in matching_children {
+                for (ckey, _) in matching_children {
                     // Re-check child existence in case an earlier cascade already deleted it
-                    let Some(cpayload) = ctx.btree.seek_table_rowid(ctbl.root_pgno, crid)? else {
+                    let Some(cpayload) = seek_table_raw_entry(ctx, &ctbl, &ckey)? else {
                         continue;
                     };
-                    let cur_cvals = decode_table_logical_row(ctx, &ctbl, crid, &cpayload, params)?;
+                    let cur_cvals =
+                        decode_table_logical_row(ctx, &ctbl, &ckey, &cpayload, params)?;
                     check_parent_delete_restrict(ctx, &ctbl, &cur_cvals, params)?;
-                    if remove_row_and_indexes(ctx, &ctbl, &cindexes, crid, params)? {
+                    if remove_row_and_indexes(ctx, &ctbl, &cindexes, &ckey, params)? {
                         ctx.runtime.total_changes += 1;
                         apply_parent_delete_fk_actions(
                             ctx,
@@ -5460,13 +6551,16 @@ fn apply_parent_delete_fk_actions(
             }
             FkAction::SetNull => {
                 let cindexes = ctx.schema.indexes_for_table(&ctbl.name);
-                for (crid, _) in matching_children {
-                    let Some(cpayload) = ctx.btree.seek_table_rowid(ctbl.root_pgno, crid)? else {
+                for (ckey, _) in matching_children {
+                    let Some(cpayload) = seek_table_raw_entry(ctx, &ctbl, &ckey)? else {
                         continue;
                     };
                     let mut new_cvals =
-                        decode_table_logical_row(ctx, &ctbl, crid, &cpayload, params)?;
-                    let mut new_crid_opt = Some(crid);
+                        decode_table_logical_row(ctx, &ctbl, &ckey, &cpayload, params)?;
+                    let new_crid_opt = match &ckey {
+                        TableRowKey::Rowid(r) => Some(*r),
+                        TableRowKey::WithoutRowidPk(_) => None,
+                    };
                     for &fcol in &fk.from_cols {
                         new_cvals[fcol] = Value::Null;
                         if ctbl.rowid_alias_col == Some(fcol) {
@@ -5474,7 +6568,6 @@ fn apply_parent_delete_fk_actions(
                             return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
                         }
                     }
-                    let _ = new_crid_opt.as_mut();
                     validate_and_write_row(
                         ctx,
                         &ctbl,
@@ -5482,7 +6575,7 @@ fn apply_parent_delete_fk_actions(
                         new_crid_opt,
                         new_cvals,
                         Some(ConflictAction::Abort),
-                        Some(crid),
+                        Some(&ckey),
                         params,
                         false,
                         false,
@@ -5493,13 +6586,16 @@ fn apply_parent_delete_fk_actions(
             }
             FkAction::SetDefault => {
                 let cindexes = ctx.schema.indexes_for_table(&ctbl.name);
-                for (crid, _) in matching_children {
-                    let Some(cpayload) = ctx.btree.seek_table_rowid(ctbl.root_pgno, crid)? else {
+                for (ckey, _) in matching_children {
+                    let Some(cpayload) = seek_table_raw_entry(ctx, &ctbl, &ckey)? else {
                         continue;
                     };
                     let mut new_cvals =
-                        decode_table_logical_row(ctx, &ctbl, crid, &cpayload, params)?;
-                    let mut new_crid_opt = Some(crid);
+                        decode_table_logical_row(ctx, &ctbl, &ckey, &cpayload, params)?;
+                    let mut new_crid_opt = match &ckey {
+                        TableRowKey::Rowid(r) => Some(*r),
+                        TableRowKey::WithoutRowidPk(_) => None,
+                    };
                     for &fcol in &fk.from_cols {
                         let dval = match &ctbl.columns[fcol].default_expr {
                             Some(de) => eval_expr(ctx, de, params, &[], &CteStore::default(), None)?,
@@ -5523,7 +6619,7 @@ fn apply_parent_delete_fk_actions(
                         new_crid_opt,
                         new_cvals,
                         Some(ConflictAction::Abort),
-                        Some(crid),
+                        Some(&ckey),
                         params,
                         false,
                         false,
@@ -5543,7 +6639,7 @@ fn apply_parent_update_fk_actions(
     old_parent_vals: &[Value],
     new_parent_vals: &[Value],
     params: &[Value],
-    stmt_fk_suspects: &mut Vec<(String, i64, usize)>,
+    stmt_fk_suspects: &mut Vec<(String, TableRowKey, usize)>,
     fk_depth: usize,
 ) -> Result<()> {
     if fk_depth > MAX_FK_CASCADE_DEPTH {
@@ -5563,10 +6659,10 @@ fn apply_parent_update_fk_actions(
         if parent_col_idxs.iter().any(|&pi| old_parent_vals[pi].is_null()) {
             continue;
         }
-        let crows = ctx.btree.scan_table(ctbl.root_pgno)?;
+        let crows = scan_table_raw_entries(ctx, &ctbl)?;
         let mut matching_children = Vec::new();
-        for (crid, cpayload) in crows {
-            let cvals = decode_table_logical_row(ctx, &ctbl, crid, &cpayload, params)?;
+        for (ckey, cpayload) in crows {
+            let cvals = decode_table_logical_row(ctx, &ctbl, &ckey, &cpayload, params)?;
             if child_row_matches_parent_key(
                 ptbl,
                 &parent_col_idxs,
@@ -5575,7 +6671,7 @@ fn apply_parent_update_fk_actions(
                 &fk.from_cols,
                 enc,
             ) {
-                matching_children.push(crid);
+                matching_children.push(ckey);
             }
         }
         if matching_children.is_empty() {
@@ -5585,24 +6681,27 @@ fn apply_parent_update_fk_actions(
         match fk.on_update {
             FkAction::Restrict => return Err(fk_constraint_err()),
             FkAction::NoAction => {
-                for crid in matching_children {
+                for ckey in matching_children {
                     if fk.deferred {
                         ctx.deferred_fk_suspects
-                            .push((ctbl.name.clone(), crid, fk.id));
+                            .push((ctbl.name.clone(), ckey, fk.id));
                     } else {
-                        stmt_fk_suspects.push((ctbl.name.clone(), crid, fk.id));
+                        stmt_fk_suspects.push((ctbl.name.clone(), ckey, fk.id));
                     }
                 }
             }
             FkAction::Cascade => {
                 let cindexes = ctx.schema.indexes_for_table(&ctbl.name);
-                for crid in matching_children {
-                    let Some(cpayload) = ctx.btree.seek_table_rowid(ctbl.root_pgno, crid)? else {
+                for ckey in matching_children {
+                    let Some(cpayload) = seek_table_raw_entry(ctx, &ctbl, &ckey)? else {
                         continue;
                     };
                     let mut new_cvals =
-                        decode_table_logical_row(ctx, &ctbl, crid, &cpayload, params)?;
-                    let mut new_crid_opt = Some(crid);
+                        decode_table_logical_row(ctx, &ctbl, &ckey, &cpayload, params)?;
+                    let mut new_crid_opt = match &ckey {
+                        TableRowKey::Rowid(r) => Some(*r),
+                        TableRowKey::WithoutRowidPk(_) => None,
+                    };
                     for (&fcol, &pcol) in fk.from_cols.iter().zip(parent_col_idxs.iter()) {
                         let nv = new_parent_vals[pcol].clone();
                         if ctbl.rowid_alias_col == Some(fcol) {
@@ -5623,7 +6722,7 @@ fn apply_parent_update_fk_actions(
                         new_crid_opt,
                         new_cvals,
                         Some(ConflictAction::Abort),
-                        Some(crid),
+                        Some(&ckey),
                         params,
                         false,
                         false,
@@ -5634,12 +6733,16 @@ fn apply_parent_update_fk_actions(
             }
             FkAction::SetNull => {
                 let cindexes = ctx.schema.indexes_for_table(&ctbl.name);
-                for crid in matching_children {
-                    let Some(cpayload) = ctx.btree.seek_table_rowid(ctbl.root_pgno, crid)? else {
+                for ckey in matching_children {
+                    let Some(cpayload) = seek_table_raw_entry(ctx, &ctbl, &ckey)? else {
                         continue;
                     };
                     let mut new_cvals =
-                        decode_table_logical_row(ctx, &ctbl, crid, &cpayload, params)?;
+                        decode_table_logical_row(ctx, &ctbl, &ckey, &cpayload, params)?;
+                    let new_crid_opt = match &ckey {
+                        TableRowKey::Rowid(r) => Some(*r),
+                        TableRowKey::WithoutRowidPk(_) => None,
+                    };
                     for &fcol in &fk.from_cols {
                         if ctbl.rowid_alias_col == Some(fcol) {
                             return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
@@ -5650,10 +6753,10 @@ fn apply_parent_update_fk_actions(
                         ctx,
                         &ctbl,
                         &cindexes,
-                        Some(crid),
+                        new_crid_opt,
                         new_cvals,
                         Some(ConflictAction::Abort),
-                        Some(crid),
+                        Some(&ckey),
                         params,
                         false,
                         false,
@@ -5664,13 +6767,16 @@ fn apply_parent_update_fk_actions(
             }
             FkAction::SetDefault => {
                 let cindexes = ctx.schema.indexes_for_table(&ctbl.name);
-                for crid in matching_children {
-                    let Some(cpayload) = ctx.btree.seek_table_rowid(ctbl.root_pgno, crid)? else {
+                for ckey in matching_children {
+                    let Some(cpayload) = seek_table_raw_entry(ctx, &ctbl, &ckey)? else {
                         continue;
                     };
                     let mut new_cvals =
-                        decode_table_logical_row(ctx, &ctbl, crid, &cpayload, params)?;
-                    let mut new_crid_opt = Some(crid);
+                        decode_table_logical_row(ctx, &ctbl, &ckey, &cpayload, params)?;
+                    let mut new_crid_opt = match &ckey {
+                        TableRowKey::Rowid(r) => Some(*r),
+                        TableRowKey::WithoutRowidPk(_) => None,
+                    };
                     for &fcol in &fk.from_cols {
                         let dval = match &ctbl.columns[fcol].default_expr {
                             Some(de) => eval_expr(ctx, de, params, &[], &CteStore::default(), None)?,
@@ -5694,7 +6800,7 @@ fn apply_parent_update_fk_actions(
                         new_crid_opt,
                         new_cvals,
                         Some(ConflictAction::Abort),
-                        Some(crid),
+                        Some(&ckey),
                         params,
                         false,
                         false,
@@ -5884,10 +6990,15 @@ fn exec_insert(
                 return Err(e);
             }
         };
-        if let Some((written_rid, written_vals)) = written_opt
+        if let Some((written_key, written_vals)) = written_opt
             && !ret_expanded.is_empty()
         {
-            let rscope = make_single_table_scope(&tbl, None, written_rid, &written_vals);
+            let rscope = make_single_table_scope(
+                &tbl,
+                None,
+                written_key.rowid_or_zero(),
+                &written_vals,
+            );
             let mut rrow = Vec::with_capacity(ret_expanded.len());
             for (pe, _, _) in &ret_expanded {
                 rrow.push(eval_expr(
@@ -5968,11 +7079,16 @@ fn exec_update(
         &dml_ctes,
     )?;
 
-    // Two-phase update: collect all matching `(old_rowid, new_rowid_opt, new_col_vals)` before mutating B-Trees!
+    // Two-phase update: collect all matching `(old_key, new_rowid_opt, new_col_vals)` before mutating B-Trees!
     let mut pending_updates = Vec::new();
-    for (old_rowid, payload) in candidates {
-        let old_vals = decode_table_logical_row(ctx, &tbl, old_rowid, &payload, params)?;
-        let scope = make_single_table_scope(&tbl, upd.alias.as_deref(), old_rowid, &old_vals);
+    for (old_key, payload) in candidates {
+        let old_vals = decode_table_logical_row(ctx, &tbl, &old_key, &payload, params)?;
+        let scope = make_single_table_scope(
+            &tbl,
+            upd.alias.as_deref(),
+            old_key.rowid_or_zero(),
+            &old_vals,
+        );
         if let Some(ref w) = upd.selection {
             let cond = eval_expr(ctx, w, params, &[scope.clone()], &dml_ctes, None)?;
             if cond.truthiness() != Some(true) {
@@ -5981,7 +7097,10 @@ fn exec_update(
         }
 
         let mut new_vals = old_vals.clone();
-        let mut new_rowid_opt = Some(old_rowid);
+        let mut new_rowid_opt = match &old_key {
+            TableRowKey::Rowid(r) => Some(*r),
+            TableRowKey::WithoutRowidPk(_) => None,
+        };
         for &(target_idx, val_expr) in &resolved_assigns {
             let v = eval_expr(
                 ctx,
@@ -6008,7 +7127,7 @@ fn exec_update(
                 }
             }
         }
-        pending_updates.push((old_rowid, new_rowid_opt, new_vals));
+        pending_updates.push((old_key, new_rowid_opt, new_vals));
     }
 
     ctx.runtime.last_changes = 0;
@@ -6027,7 +7146,7 @@ fn exec_update(
     let mut ret_rows = Vec::new();
     let mut stmt_fk_suspects = Vec::new();
 
-    for (old_rowid, new_rowid_opt, new_vals) in pending_updates {
+    for (old_key, new_rowid_opt, new_vals) in pending_updates {
         let write_res = validate_and_write_row(
             ctx,
             &tbl,
@@ -6035,7 +7154,7 @@ fn exec_update(
             new_rowid_opt,
             new_vals,
             upd.or_conflict,
-            Some(old_rowid),
+            Some(&old_key),
             params,
             false,
             true,
@@ -6054,13 +7173,13 @@ fn exec_update(
                 return Err(e);
             }
         };
-        if let Some((written_rid, written_vals)) = written_opt
+        if let Some((written_key, written_vals)) = written_opt
             && !ret_expanded.is_empty()
         {
             let rscope = make_single_table_scope(
                 &tbl,
                 upd.alias.as_deref(),
-                written_rid,
+                written_key.rowid_or_zero(),
                 &written_vals,
             );
             let mut rrow = Vec::with_capacity(ret_expanded.len());
@@ -6117,7 +7236,11 @@ fn exec_delete(
         && !*ctx.foreign_keys
         && del.indexed_by.is_none()
     {
-        let count = ctx.btree.scan_table(tbl.root_pgno)?.len() as u64;
+        let count = if tbl.without_rowid {
+            ctx.btree.scan_index(tbl.root_pgno)?.len() as u64
+        } else {
+            ctx.btree.scan_table(tbl.root_pgno)?.len() as u64
+        };
         ctx.btree.clear_tree(tbl.root_pgno)?;
         for idx in &indexes {
             ctx.btree.clear_tree(idx.root_pgno)?;
@@ -6139,16 +7262,21 @@ fn exec_delete(
     )?;
 
     let mut targets = Vec::new();
-    for (rowid, payload) in candidates {
-        let vals = decode_table_logical_row(ctx, &tbl, rowid, &payload, params)?;
-        let scope = make_single_table_scope(&tbl, del.alias.as_deref(), rowid, &vals);
+    for (rkey, payload) in candidates {
+        let vals = decode_table_logical_row(ctx, &tbl, &rkey, &payload, params)?;
+        let scope = make_single_table_scope(
+            &tbl,
+            del.alias.as_deref(),
+            rkey.rowid_or_zero(),
+            &vals,
+        );
         if let Some(ref w) = del.selection {
             let cond = eval_expr(ctx, w, params, &[scope.clone()], &dml_ctes, None)?;
             if cond.truthiness() != Some(true) {
                 continue;
             }
         }
-        targets.push((rowid, vals, scope));
+        targets.push((rkey, vals, scope));
     }
 
     ctx.runtime.last_changes = 0;
@@ -6167,15 +7295,15 @@ fn exec_delete(
     let mut ret_rows = Vec::new();
     let mut stmt_fk_suspects = Vec::new();
 
-    for (rowid, old_vals, scope) in targets {
+    for (rkey, old_vals, scope) in targets {
         if *ctx.foreign_keys {
             // Re-check row existence in case a self-referential ON DELETE CASCADE already removed it
-            if ctx.btree.seek_table_rowid(tbl.root_pgno, rowid)?.is_none() {
+            if seek_table_raw_entry(ctx, &tbl, &rkey)?.is_none() {
                 continue;
             }
             check_parent_delete_restrict(ctx, &tbl, &old_vals, params)?;
         }
-        if remove_row_and_indexes(ctx, &tbl, &indexes, rowid, params)? {
+        if remove_row_and_indexes(ctx, &tbl, &indexes, &rkey, params)? {
             ctx.runtime.last_changes += 1;
             ctx.runtime.total_changes += 1;
             if *ctx.foreign_keys {
@@ -6222,8 +7350,14 @@ fn exec_delete(
 // DDL Executors: `CREATE/DROP TABLE`, `CREATE/DROP INDEX`, `ALTER TABLE`
 // ============================================================================
 
+fn is_reserved_sqlite_name(name: &str) -> bool {
+    name.as_bytes()
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"sqlite_"))
+}
+
 fn exec_create_table(ctx: &mut ExecContext<'_>, ct: &CreateTableStmt) -> Result<()> {
-    if ct.name.len() >= 7 && ct.name[..7].eq_ignore_ascii_case("sqlite_") {
+    if is_reserved_sqlite_name(&ct.name) {
         return Err(SqliteError::new(
             ErrorCode::Error,
             format!("object name reserved for internal use: {}", ct.name),
@@ -6241,7 +7375,11 @@ fn exec_create_table(ctx: &mut ExecContext<'_>, ct: &CreateTableStmt) -> Result<
 
     // Validate AST & inline autoindexes before allocating pages
     let (tbl_preview, pending_autos) = build_table_schema_from_ast(ct, 2)?;
-    let tbl_root = ctx.btree.create_table()?;
+    let tbl_root = if tbl_preview.without_rowid {
+        ctx.btree.create_index()?
+    } else {
+        ctx.btree.create_table()?
+    };
     insert_schema_entry(
         ctx.btree,
         "table",
@@ -6280,7 +7418,7 @@ fn exec_create_table_as(
     query: &SelectStmt,
     params: &[Value],
 ) -> Result<()> {
-    if name.len() >= 7 && name[..7].eq_ignore_ascii_case("sqlite_") {
+    if is_reserved_sqlite_name(name) {
         return Err(SqliteError::new(
             ErrorCode::Error,
             format!("object name reserved for internal use: {name}"),
@@ -6398,20 +7536,19 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &str) -> Re
             format!("no such table: {name}"),
         ));
     };
-
     // Per SQLite `sqlite3FkDropTable`, when `foreign_keys = ON`, delete rows first so FK constraints / actions fire!
     if *ctx.foreign_keys {
-        let existing_rows = ctx.btree.scan_table(tbl.root_pgno)?;
+        let existing_rows = scan_table_raw_entries(ctx, &tbl)?;
         if !existing_rows.is_empty() {
             let indexes = ctx.schema.indexes_for_table(&tbl.name);
             let mut stmt_fk_suspects = Vec::new();
-            for (rowid, payload) in existing_rows {
-                if ctx.btree.seek_table_rowid(tbl.root_pgno, rowid)?.is_none() {
+            for (rkey, payload) in existing_rows {
+                if seek_table_raw_entry(ctx, &tbl, &rkey)?.is_none() {
                     continue;
                 }
-                let old_vals = decode_table_logical_row(ctx, &tbl, rowid, &payload, &[])?;
+                let old_vals = decode_table_logical_row(ctx, &tbl, &rkey, &payload, &[])?;
                 check_parent_delete_restrict(ctx, &tbl, &old_vals, &[])?;
-                if remove_row_and_indexes(ctx, &tbl, &indexes, rowid, &[])? {
+                if remove_row_and_indexes(ctx, &tbl, &indexes, &rkey, &[])? {
                     apply_parent_delete_fk_actions(
                         ctx,
                         &tbl,
@@ -6453,7 +7590,7 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &str) -> Re
 }
 
 fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<()> {
-    if ci.name.len() >= 7 && ci.name[..7].eq_ignore_ascii_case("sqlite_") {
+    if is_reserved_sqlite_name(&ci.name) {
         return Err(SqliteError::new(
             ErrorCode::Error,
             format!("object name reserved for internal use: {}", ci.name),
@@ -6497,9 +7634,10 @@ fn populate_index_btree(
     idx_schema: &IndexSchema,
 ) -> Result<()> {
     let orders = idx_schema.key_sort_orders();
-    let existing_rows = ctx.btree.scan_table(tbl.root_pgno)?;
-    for (rowid, payload) in existing_rows {
-        let vals = decode_table_logical_row(ctx, tbl, rowid, &payload, &[])?;
+    let existing_rows = scan_table_raw_entries(ctx, tbl)?;
+    for (rkey, payload) in existing_rows {
+        let vals = decode_table_logical_row(ctx, tbl, &rkey, &payload, &[])?;
+        let rowid = rkey.rowid_or_zero();
         if !index_row_passes_partial_where(ctx, tbl, idx_schema, rowid, &vals, &[])? {
             continue;
         }
@@ -6522,8 +7660,7 @@ fn populate_index_btree(
                 ));
             }
         }
-        let mut keys = indexed_only;
-        keys.push(Value::Integer(rowid));
+        let keys = eval_index_key_values(ctx, tbl, idx_schema, &rkey, &vals, &[])?;
         let idx_rec = encode_record_with_encoding(&keys, ctx.btree.encoding());
         ctx.btree
             .insert_index(idx_schema.root_pgno, &idx_rec, &orders)?;
@@ -6532,21 +7669,46 @@ fn populate_index_btree(
 }
 
 fn exec_reindex(ctx: &mut ExecContext<'_>, target: Option<&str>) -> Result<()> {
+    let mut primary_without_rowid_tables: Vec<TableSchema> = Vec::new();
     let targets: Vec<IndexSchema> = match target {
-        None => ctx.schema.indexes.clone(),
+        None => {
+            primary_without_rowid_tables = ctx
+                .schema
+                .tables
+                .iter()
+                .filter(|t| t.without_rowid)
+                .cloned()
+                .collect();
+            ctx.schema.indexes.clone()
+        }
         Some(raw_name) => {
             let clean = raw_name
                 .strip_prefix("main.")
                 .or_else(|| raw_name.strip_prefix("MAIN."))
                 .unwrap_or(raw_name);
             if let Some(coll) = Collation::from_name(clean) {
+                primary_without_rowid_tables = ctx
+                    .schema
+                    .tables
+                    .iter()
+                    .filter(|t| {
+                        t.without_rowid
+                            && t.without_rowid_pk_cols
+                                .iter()
+                                .any(|c| c.sort_order.collation == coll)
+                    })
+                    .cloned()
+                    .collect();
                 ctx.schema
                     .indexes
                     .iter()
                     .filter(|idx| idx.columns.iter().any(|c| c.sort_order.collation == coll))
                     .cloned()
                     .collect()
-            } else if ctx.schema.find_user_table(clean).is_some() {
+            } else if let Some(tbl) = ctx.schema.find_user_table(clean).cloned() {
+                if tbl.without_rowid {
+                    primary_without_rowid_tables.push(tbl);
+                }
                 ctx.schema.indexes_for_table(clean)
             } else if let Some(idx) = ctx.schema.find_index(clean).cloned() {
                 vec![idx]
@@ -6559,6 +7721,15 @@ fn exec_reindex(ctx: &mut ExecContext<'_>, target: Option<&str>) -> Result<()> {
         }
     };
 
+    for tbl in primary_without_rowid_tables {
+        let entries = ctx.btree.scan_index(tbl.root_pgno)?;
+        let pk_orders = tbl.without_rowid_pk_orders();
+        ctx.btree.clear_tree(tbl.root_pgno)?;
+        for rec in entries {
+            ctx.btree.insert_index(tbl.root_pgno, &rec, &pk_orders)?;
+        }
+    }
+
     for idx in targets {
         let Some(tbl) = ctx.schema.find_user_table(&idx.table_name).cloned() else {
             continue;
@@ -6570,7 +7741,7 @@ fn exec_reindex(ctx: &mut ExecContext<'_>, target: Option<&str>) -> Result<()> {
 }
 
 fn exec_drop_index(ctx: &mut ExecContext<'_>, if_exists: bool, name: &str) -> Result<()> {
-    let Some(idx) = ctx.schema.find_index(name).cloned() else {
+    let Some(idx) = ctx.schema.find_index_including_without_rowid_pk(name) else {
         if if_exists {
             return Ok(());
         }
@@ -6605,7 +7776,7 @@ fn exec_alter_table(
 
     match action {
         AlterTableAction::RenameTo(new_name) => {
-            if new_name.len() >= 7 && new_name[..7].eq_ignore_ascii_case("sqlite_") {
+            if is_reserved_sqlite_name(new_name) {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!("object name reserved for internal use: {new_name}"),
@@ -6634,7 +7805,13 @@ fn exec_alter_table(
             for idx in indexes {
                 if idx.is_autoindex {
                     auto_n += 1;
-                    let new_auto = format!("sqlite_autoindex_{new_name}_{auto_n}");
+                    let suffix_num = idx
+                        .name
+                        .rsplit('_')
+                        .next()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(auto_n);
+                    let new_auto = format!("sqlite_autoindex_{new_name}_{suffix_num}");
                     update_schema_entry(
                         ctx.btree,
                         idx.schema_rowid,
@@ -6797,7 +7974,7 @@ fn exec_alter_table(
                     format!("duplicate column name: {}", cdef.name),
                 ));
             }
-            let validated = build_column_schema_from_def(cdef)?;
+            let validated = build_column_schema_from_def(&tbl.name, tbl.strict, cdef)?;
             if validated
                 .generated
                 .as_ref()
@@ -6826,6 +8003,68 @@ fn exec_alter_table(
             }
             let rendered_col = render_column_def_sql(cdef);
             let new_sql = append_column_to_create_table_sql(&tbl.raw_sql, &rendered_col)?;
+            let (Some(Stmt::CreateTable(new_ct)), _) = parse_one(&new_sql)? else {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("error in table {} after add column", tbl.name),
+                ));
+            };
+            let (mut new_tbl, _) = build_table_schema_from_ast(&new_ct, tbl.root_pgno)?;
+            new_tbl.name.clone_from(&tbl.name);
+
+            let has_new_check = cdef
+                .constraints
+                .iter()
+                .any(|c| matches!(c, sqliters_syntax::ColumnConstraint::Check { .. }));
+            let new_col_idx = new_tbl.columns.len() - 1;
+            if has_new_check
+                || validated.not_null.is_some()
+                || new_tbl.strict
+                || validated.generated.is_some()
+            {
+                let existing_rows = scan_table_raw_entries(ctx, &tbl)?;
+                for (rkey, payload) in existing_rows {
+                    let vals = decode_table_logical_row(ctx, &new_tbl, &rkey, &payload, &[])?;
+                    let new_col = &new_tbl.columns[new_col_idx];
+                    if new_tbl.strict {
+                        check_strict_column_type(&new_tbl.name, new_col, &vals[new_col_idx])?;
+                    }
+                    if new_col.not_null.is_some() && vals[new_col_idx].is_null() {
+                        return Err(SqliteError::constraint(
+                            extended::SQLITE_CONSTRAINT_NOTNULL,
+                            format!(
+                                "NOT NULL constraint failed: {}.{}",
+                                new_tbl.name, new_col.name
+                            ),
+                        ));
+                    }
+                    if has_new_check {
+                        let scope = make_single_table_scope(
+                            &new_tbl,
+                            None,
+                            rkey.rowid_or_zero(),
+                            &vals,
+                        );
+                        for chk in &new_tbl.checks[tbl.checks.len()..] {
+                            let cv = eval_expr(
+                                ctx,
+                                &chk.expr,
+                                &[],
+                                &[scope.clone()],
+                                &CteStore::default(),
+                                None,
+                            )?;
+                            if cv.truthiness() == Some(false) {
+                                return Err(SqliteError::constraint(
+                                    extended::SQLITE_CONSTRAINT_CHECK,
+                                    format!("CHECK constraint failed: {}", chk.label),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
             update_schema_entry(
                 ctx.btree,
                 tbl.schema_rowid,
@@ -7525,12 +8764,55 @@ fn append_column_to_create_table_sql(sql: &str, rendered_col: &str) -> Result<St
     let Some(outer_rp_idx) = find_matching_rparen(&tokens, outer_lp) else {
         return Err(SqliteError::corrupt("CREATE TABLE missing closing ')'"));
     };
-    let rparen = tokens[outer_rp_idx].offset;
+
+    // Match C SQLite `addColOffset` (`sqlite/src/parse.y:223,461`, `sqlite/src/alter.c:442-449`):
+    // Insert right before the comma that introduces the first top-level table constraint
+    // (`CONSTRAINT | PRIMARY | UNIQUE | CHECK | FOREIGN`), or before the closing `)`
+    // if there are no table-level constraints.
+    let mut insert_offset = tokens[outer_rp_idx].offset;
+    let mut depth = 0usize;
+    let mut last_comma_idx: Option<usize> = None;
+    let mut item_start = true;
+    for idx in (outer_lp + 1)..outer_rp_idx {
+        match tokens[idx].kind {
+            TokenKind::Lp => {
+                if depth == 0 {
+                    item_start = false;
+                }
+                depth += 1;
+            }
+            TokenKind::Rp => {
+                depth = depth.saturating_sub(1);
+            }
+            TokenKind::Comma if depth == 0 => {
+                last_comma_idx = Some(idx);
+                item_start = true;
+            }
+            kind if depth == 0 && item_start => {
+                if matches!(
+                    kind,
+                    TokenKind::Constraint
+                        | TokenKind::Primary
+                        | TokenKind::Unique
+                        | TokenKind::Check
+                        | TokenKind::Foreign
+                ) {
+                    insert_offset = last_comma_idx
+                        .map(|c| tokens[c].offset)
+                        .unwrap_or(tokens[idx].offset);
+                    break;
+                }
+                item_start = false;
+            }
+            _ => {}
+        }
+    }
+
     let mut out = String::with_capacity(sql.len() + rendered_col.len() + 4);
-    out.push_str(sql[..rparen].trim_end());
+    out.push_str(sql[..insert_offset].trim_end());
     out.push_str(", ");
     out.push_str(rendered_col);
-    out.push_str(&sql[rparen..]);
+    out.push_str(&sql[insert_offset..]);
     Ok(out)
 }
 
@@ -7545,89 +8827,119 @@ fn exec_vacuum(ctx: &mut ExecContext<'_>) -> Result<QueryOutput> {
             "cannot VACUUM from within a transaction",
         ));
     }
+    ctx.btree.begin_write()?;
+    if let Err(e) = ctx.schema.ensure_fresh_in_tx(ctx.btree) {
+        let _ = ctx.btree.rollback();
+        return Err(e);
+    }
     if ctx.btree.pager().page_count() == 0 {
+        let _ = ctx.btree.rollback();
         return Ok(QueryOutput::default());
     }
 
     // Build a fresh compacted in-memory Btree with identical page_size, encoding & header metadata,
     // copy all tables and rebuild all indexes cleanly, then write pages back!
-    let page_size = ctx.btree.pager().page_size();
-    let orig_hdr = ctx.btree.pager().header().clone();
+    let res = (|| -> Result<()> {
+        let page_size = ctx.btree.pager().page_size();
+        let orig_hdr = ctx.btree.pager().header().clone();
 
-    let mut fresh = Btree::open_in_memory()?;
-    fresh.pager_mut().set_page_size(page_size)?;
-    fresh.pager_mut().set_encoding(orig_hdr.encoding())?;
-    fresh.begin_write()?;
-    {
-        let fhdr = fresh.pager_mut().header_mut()?;
-        fhdr.user_version = orig_hdr.user_version;
-        fhdr.application_id = orig_hdr.application_id;
-        fhdr.text_encoding = orig_hdr.text_encoding;
-        fhdr.schema_cookie = orig_hdr.schema_cookie.wrapping_add(1);
-    }
-
-    for tbl in &ctx.schema.tables {
-        let new_tbl_root = fresh.create_table()?;
-        insert_schema_entry(
-            &mut fresh,
-            "table",
-            &tbl.name,
-            &tbl.name,
-            new_tbl_root,
-            Some(&tbl.raw_sql),
-        )?;
-        let rows = ctx.btree.scan_table(tbl.root_pgno)?;
-        for (rid, payload) in rows {
-            fresh.insert_table(new_tbl_root, rid, &payload)?;
+        let mut fresh = Btree::open_in_memory()?;
+        fresh.pager_mut().set_page_size(page_size)?;
+        fresh.pager_mut().set_encoding(orig_hdr.encoding())?;
+        fresh.begin_write()?;
+        {
+            let fhdr = fresh.pager_mut().header_mut()?;
+            fhdr.user_version = orig_hdr.user_version;
+            fhdr.application_id = orig_hdr.application_id;
+            fhdr.text_encoding = orig_hdr.text_encoding;
+            fhdr.schema_cookie = orig_hdr.schema_cookie.wrapping_add(1);
         }
-    }
 
-    for idx in &ctx.schema.indexes {
-        let new_idx_root = fresh.create_index()?;
-        insert_schema_entry(
-            &mut fresh,
-            "index",
-            &idx.name,
-            &idx.table_name,
-            new_idx_root,
-            idx.raw_sql.as_deref(),
-        )?;
-        let orders = idx.key_sort_orders();
-        let entries = ctx.btree.scan_index(idx.root_pgno)?;
-        for rec in entries {
-            fresh.insert_index(new_idx_root, &rec, &orders)?;
+        for tbl in &ctx.schema.tables {
+            if tbl.without_rowid {
+                let new_tbl_root = fresh.create_index()?;
+                insert_schema_entry(
+                    &mut fresh,
+                    "table",
+                    &tbl.name,
+                    &tbl.name,
+                    new_tbl_root,
+                    Some(&tbl.raw_sql),
+                )?;
+                let pk_orders = tbl.without_rowid_pk_orders();
+                let entries = ctx.btree.scan_index(tbl.root_pgno)?;
+                for rec in entries {
+                    fresh.insert_index(new_tbl_root, &rec, &pk_orders)?;
+                }
+            } else {
+                let new_tbl_root = fresh.create_table()?;
+                insert_schema_entry(
+                    &mut fresh,
+                    "table",
+                    &tbl.name,
+                    &tbl.name,
+                    new_tbl_root,
+                    Some(&tbl.raw_sql),
+                )?;
+                let rows = ctx.btree.scan_table(tbl.root_pgno)?;
+                for (rid, payload) in rows {
+                    fresh.insert_table(new_tbl_root, rid, &payload)?;
+                }
+            }
         }
-    }
 
-    // Copy compacted pages into `ctx.btree` inside a single atomic write transaction!
-    let compacted_count = fresh.pager().page_count();
-    let compacted_hdr = fresh.pager().header().clone();
-
-    ctx.btree.begin_write()?;
-    while ctx.btree.pager().page_count() < compacted_count {
-        ctx.btree.pager_mut().allocate_raw_page()?;
-    }
-    for pgno in 1..=compacted_count {
-        let src = fresh.pager_mut().read_page(pgno)?.to_vec();
-        let dst = ctx.btree.pager_mut().write_page(pgno)?;
-        dst.copy_from_slice(&src);
-    }
-    {
-        let hdr = ctx.btree.pager_mut().header_mut()?;
-        hdr.first_freelist_trunk_page = 0;
-        hdr.total_freelist_pages = 0;
-        hdr.user_version = compacted_hdr.user_version;
-        hdr.application_id = compacted_hdr.application_id;
-        hdr.text_encoding = compacted_hdr.text_encoding;
-        hdr.schema_cookie = compacted_hdr.schema_cookie;
-    }
-    let cur_total = ctx.btree.pager().page_count();
-    if cur_total > compacted_count {
-        for extra_pg in (compacted_count + 1)..=cur_total {
-            ctx.btree.free_page(extra_pg)?;
+        for idx in &ctx.schema.indexes {
+            let new_idx_root = fresh.create_index()?;
+            insert_schema_entry(
+                &mut fresh,
+                "index",
+                &idx.name,
+                &idx.table_name,
+                new_idx_root,
+                idx.raw_sql.as_deref(),
+            )?;
+            let orders = idx.key_sort_orders();
+            let entries = ctx.btree.scan_index(idx.root_pgno)?;
+            for rec in entries {
+                fresh.insert_index(new_idx_root, &rec, &orders)?;
+            }
         }
+
+        let compacted_count = fresh.pager().page_count();
+        let compacted_hdr = fresh.pager().header().clone();
+
+        while ctx.btree.pager().page_count() < compacted_count {
+            ctx.btree.pager_mut().allocate_raw_page()?;
+        }
+        for pgno in 1..=compacted_count {
+            let src = fresh.pager_mut().read_page(pgno)?.to_vec();
+            let dst = ctx.btree.pager_mut().write_page(pgno)?;
+            dst.copy_from_slice(&src);
+        }
+        {
+            let hdr = ctx.btree.pager_mut().header_mut()?;
+            hdr.first_freelist_trunk_page = 0;
+            hdr.total_freelist_pages = 0;
+            hdr.user_version = compacted_hdr.user_version;
+            hdr.application_id = compacted_hdr.application_id;
+            hdr.text_encoding = compacted_hdr.text_encoding;
+            hdr.schema_cookie = compacted_hdr.schema_cookie;
+        }
+        let cur_total = ctx.btree.pager().page_count();
+        if cur_total > compacted_count {
+            ctx.btree.pager_mut().shrink_page_count(compacted_count)?;
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = res {
+        let _ = ctx.btree.rollback();
+        return Err(e);
     }
-    ctx.btree.commit()?;
+    if let Err(e) = ctx.btree.commit() {
+        let _ = ctx.btree.rollback();
+        return Err(e);
+    }
     *ctx.schema = Schema::load(ctx.btree)?;
     Ok(QueryOutput::default())
 }
@@ -7674,14 +8986,18 @@ fn exec_pragma(
                 ))
             }
         }
-        "PAGE_COUNT" => Ok(single_col(
-            "page_count",
-            Value::Integer(i64::from(ctx.btree.pager().page_count())),
-        )),
-        "FREELIST_COUNT" => Ok(single_col(
-            "freelist_count",
-            Value::Integer(i64::from(ctx.btree.pager().header().total_freelist_pages)),
-        )),
+        "PAGE_COUNT" => run_read_autocommit(ctx, |ctx| {
+            Ok(single_col(
+                "page_count",
+                Value::Integer(i64::from(ctx.btree.pager().page_count())),
+            ))
+        }),
+        "FREELIST_COUNT" => run_read_autocommit(ctx, |ctx| {
+            Ok(single_col(
+                "freelist_count",
+                Value::Integer(i64::from(ctx.btree.pager().header().total_freelist_pages)),
+            ))
+        }),
         "USER_VERSION" => {
             if let Some(pv) = value {
                 let v = pragma_to_i64(pv) as i32;
@@ -7690,10 +9006,12 @@ fn exec_pragma(
                     Ok(QueryOutput::default())
                 })
             } else {
-                Ok(single_col(
-                    "user_version",
-                    Value::Integer(i64::from(ctx.btree.pager().header().user_version)),
-                ))
+                run_read_autocommit(ctx, |ctx| {
+                    Ok(single_col(
+                        "user_version",
+                        Value::Integer(i64::from(ctx.btree.pager().header().user_version)),
+                    ))
+                })
             }
         }
         "APPLICATION_ID" => {
@@ -7704,16 +9022,20 @@ fn exec_pragma(
                     Ok(QueryOutput::default())
                 })
             } else {
-                Ok(single_col(
-                    "application_id",
-                    Value::Integer(i64::from(ctx.btree.pager().header().application_id)),
-                ))
+                run_read_autocommit(ctx, |ctx| {
+                    Ok(single_col(
+                        "application_id",
+                        Value::Integer(i64::from(ctx.btree.pager().header().application_id)),
+                    ))
+                })
             }
         }
-        "SCHEMA_VERSION" => Ok(single_col(
-            "schema_version",
-            Value::Integer(i64::from(ctx.btree.pager().header().schema_cookie)),
-        )),
+        "SCHEMA_VERSION" => run_read_autocommit(ctx, |ctx| {
+            Ok(single_col(
+                "schema_version",
+                Value::Integer(i64::from(ctx.btree.pager().header().schema_cookie)),
+            ))
+        }),
         "ENCODING" => {
             if let Some(pv) = value {
                 let s = pragma_to_string(pv);
@@ -7752,7 +9074,7 @@ fn exec_pragma(
                 ))
             }
         }
-        "FOREIGN_KEY_LIST" => {
+        "FOREIGN_KEY_LIST" => run_read_autocommit(ctx, |ctx| {
             let Some(pv) = value else {
                 return Ok(QueryOutput::default());
             };
@@ -7797,7 +9119,7 @@ fn exec_pragma(
                 column_names: cols,
                 rows,
             })
-        }
+        }),
         "FOREIGN_KEY_CHECK" => run_read_autocommit(ctx, |ctx| {
             let target_tbl = value.map(pragma_to_string);
             let tables: Vec<TableSchema> = ctx
@@ -7816,18 +9138,22 @@ fn exec_pragma(
                 if tbl.foreign_keys.is_empty() {
                     continue;
                 }
-                let raw_rows = ctx.btree.scan_table(tbl.root_pgno)?;
-                for (rid, payload) in raw_rows {
-                    let cvals = decode_table_logical_row(ctx, &tbl, rid, &payload, &[])?;
+                let raw_rows = scan_table_raw_entries(ctx, &tbl)?;
+                for (rkey, payload) in raw_rows {
+                    let cvals = decode_table_logical_row(ctx, &tbl, &rkey, &payload, &[])?;
                     for fk in &tbl.foreign_keys {
                         if fk.from_cols.iter().any(|&ci| cvals[ci].is_null()) {
                             continue;
                         }
                         let (ptbl, pcols) = resolve_fk_parent_cols(ctx.schema, &tbl.name, fk)?;
                         if !parent_row_exists_for_fk(ctx, &ptbl, &pcols, &cvals, &fk.from_cols)? {
+                            let rowid_val = match &rkey {
+                                TableRowKey::Rowid(rid) => Value::Integer(*rid),
+                                TableRowKey::WithoutRowidPk(_) => Value::Null,
+                            };
                             rows.push(vec![
                                 Value::Text(tbl.name.clone()),
-                                Value::Integer(rid),
+                                rowid_val,
                                 Value::Text(fk.ref_table.clone()),
                                 Value::Integer(fk.id as i64),
                             ]);
@@ -7895,7 +9221,7 @@ fn exec_pragma(
                 ]],
             })
         }
-        "TABLE_INFO" => {
+        "TABLE_INFO" => run_read_autocommit(ctx, |ctx| {
             let Some(pv) = value else {
                 return Ok(QueryOutput::default());
             };
@@ -7943,13 +9269,18 @@ fn exec_pragma(
                 ],
                 rows,
             })
-        }
-        "INDEX_LIST" => {
+        }),
+        "INDEX_LIST" => run_read_autocommit(ctx, |ctx| {
             let Some(pv) = value else {
                 return Ok(QueryOutput::default());
             };
             let tname = pragma_to_string(pv);
-            let idxs = ctx.schema.indexes_for_table(&tname);
+            let mut idxs = ctx.schema.indexes_for_table(&tname);
+            if let Some(tbl) = ctx.schema.find_user_table(&tname)
+                && let Some(pk_idx) = tbl.without_rowid_pk_as_index()
+            {
+                idxs.insert(0, pk_idx);
+            }
             let rows = idxs
                 .iter()
                 .enumerate()
@@ -7973,7 +9304,7 @@ fn exec_pragma(
                 ],
                 rows,
             })
-        }
+        }),
         "COUNT_CHANGES" => {
             if let Some(pv) = value {
                 *ctx.count_changes = pragma_to_bool(pv);
@@ -7985,12 +9316,12 @@ fn exec_pragma(
                 ))
             }
         }
-        "INDEX_INFO" => {
+        "INDEX_INFO" => run_read_autocommit(ctx, |ctx| {
             let Some(pv) = value else {
                 return Ok(QueryOutput::default());
             };
             let iname = pragma_to_string(pv);
-            let Some(idx) = ctx.schema.find_index(&iname) else {
+            let Some(idx) = ctx.schema.find_index_including_without_rowid_pk(&iname) else {
                 return Ok(QueryOutput::default());
             };
             let rows = idx
@@ -8014,7 +9345,7 @@ fn exec_pragma(
                 column_names: vec!["seqno".to_owned(), "cid".to_owned(), "name".to_owned()],
                 rows,
             })
-        }
+        }),
         "COMPILE_OPTIONS" => Ok(QueryOutput {
             column_names: vec!["compile_options".to_owned()],
             rows: vec![

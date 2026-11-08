@@ -851,9 +851,14 @@ impl VfsFile for OsFile {
                 return Ok(());
             }
 
-            // Acquire PENDING_BYTE when entering SHARED or upgrading RESERVED -> EXCLUSIVE
+            if level == LockLevel::Exclusive && inode.n_shared > 1 {
+                return Err(SqliteError::new(ErrorCode::Busy, "database is locked"));
+            }
+
+            // Acquire PENDING_BYTE when entering SHARED or upgrading SHARED/RESERVED -> EXCLUSIVE
             if level == LockLevel::Shared
-                || (level == LockLevel::Exclusive && *file_lock == LockLevel::Reserved)
+                || (level == LockLevel::Exclusive
+                    && (*file_lock == LockLevel::Shared || *file_lock == LockLevel::Reserved))
             {
                 let l_type = if level == LockLevel::Shared {
                     sys_unix::F_RDLCK
@@ -896,10 +901,6 @@ impl VfsFile for OsFile {
                 inode.n_lock += 1;
                 inode.n_shared = 1;
                 return Ok(());
-            }
-
-            if level == LockLevel::Exclusive && inode.n_shared > 1 {
-                return Err(SqliteError::new(ErrorCode::Busy, "database is locked"));
             }
 
             let (start, len) = match level {
