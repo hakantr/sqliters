@@ -927,10 +927,17 @@ impl VdbeVm {
                         P4::Collation(c) => c,
                         _ => Collation::Binary,
                     };
+                    let aff = p5_to_affinity(ins.p5);
                     let lhs = &self.regs[ins.p1 as usize];
                     let rhs = &self.regs[ins.p2 as usize];
-                    self.regs[ins.p3 as usize] =
-                        eval_comparison_with_encoding(ins.opcode, lhs, rhs, coll, btree.encoding());
+                    self.regs[ins.p3 as usize] = eval_comparison_with_affinity(
+                        ins.opcode,
+                        lhs,
+                        rhs,
+                        aff,
+                        coll,
+                        btree.encoding(),
+                    );
                 }
                 Opcode::And => {
                     let a = self.regs[ins.p1 as usize].truthiness();
@@ -1194,8 +1201,56 @@ fn shift_right_sqlite(a: i64, b: i64) -> i64 {
     }
 }
 
-/// Evaluates SQLite comparison operators (`=`, `!=`, `<`, `<=`, `>`, `>=`, `IS`, `IS NOT`),
-/// including SQLite numeric/text affinity coercion when one side is numeric and the other is text!
+/// Computes SQLite's comparison affinity (`sqlite3CompareAffinity` in `sqlite/src/expr.c`).
+///
+/// `None` represents `SQLITE_AFF_NONE` (an expression without column/CAST affinity, such as a
+/// literal, arithmetic expression, or `+col`); `Some(TypeAffinity::Blob)` represents `SQLITE_AFF_BLOB`
+/// (an untyped column or `CAST(... AS BLOB)`).
+pub const fn sqlite_compare_affinity(
+    aff1: Option<TypeAffinity>,
+    aff2: Option<TypeAffinity>,
+) -> TypeAffinity {
+    match (aff1, aff2) {
+        (Some(a1), Some(a2)) => {
+            if matches!(
+                a1,
+                TypeAffinity::Numeric | TypeAffinity::Integer | TypeAffinity::Real
+            ) || matches!(
+                a2,
+                TypeAffinity::Numeric | TypeAffinity::Integer | TypeAffinity::Real
+            ) {
+                TypeAffinity::Numeric
+            } else {
+                TypeAffinity::Blob
+            }
+        }
+        (Some(a), None) | (None, Some(a)) => a,
+        (None, None) => TypeAffinity::Blob,
+    }
+}
+
+pub const fn affinity_to_p5(aff: TypeAffinity) -> u8 {
+    match aff {
+        TypeAffinity::Blob => 0,
+        TypeAffinity::Text => 1,
+        TypeAffinity::Numeric => 2,
+        TypeAffinity::Integer => 3,
+        TypeAffinity::Real => 4,
+    }
+}
+
+pub const fn p5_to_affinity(p5: u16) -> TypeAffinity {
+    match p5 & 0x07 {
+        1 => TypeAffinity::Text,
+        2 => TypeAffinity::Numeric,
+        3 => TypeAffinity::Integer,
+        4 => TypeAffinity::Real,
+        _ => TypeAffinity::Blob,
+    }
+}
+
+/// Evaluates SQLite comparison operators (`=`, `!=`, `<`, `<=`, `>`, `>=`, `IS`, `IS NOT`)
+/// with `TypeAffinity::Blob` (no implicit affinity conversion).
 pub fn eval_comparison(op: Opcode, lhs: &Value, rhs: &Value, coll: Collation) -> Value {
     eval_comparison_with_encoding(op, lhs, rhs, coll, TextEncoding::Utf8)
 }
@@ -1207,11 +1262,22 @@ pub fn eval_comparison_with_encoding(
     coll: Collation,
     enc: TextEncoding,
 ) -> Value {
+    eval_comparison_with_affinity(op, lhs, rhs, TypeAffinity::Blob, coll, enc)
+}
+
+pub fn eval_comparison_with_affinity(
+    op: Opcode,
+    lhs: &Value,
+    rhs: &Value,
+    aff: TypeAffinity,
+    coll: Collation,
+    enc: TextEncoding,
+) -> Value {
     if matches!(op, Opcode::Is | Opcode::IsNot) {
         let eq = match (lhs.is_null(), rhs.is_null()) {
             (true, true) => true,
             (true, false) | (false, true) => false,
-            (false, false) => compare_with_affinity(lhs, rhs, coll, enc) == Ordering::Equal,
+            (false, false) => compare_with_affinity(lhs, rhs, aff, coll, enc) == Ordering::Equal,
         };
         let res = if op == Opcode::Is { eq } else { !eq };
         return Value::Integer(i64::from(res));
@@ -1221,7 +1287,7 @@ pub fn eval_comparison_with_encoding(
         return Value::Null;
     }
 
-    let ord = compare_with_affinity(lhs, rhs, coll, enc);
+    let ord = compare_with_affinity(lhs, rhs, aff, coll, enc);
     let b = match op {
         Opcode::Eq => ord == Ordering::Equal,
         Opcode::Ne => ord != Ordering::Equal,
@@ -1237,26 +1303,16 @@ pub fn eval_comparison_with_encoding(
 fn compare_with_affinity(
     lhs: &Value,
     rhs: &Value,
+    aff: TypeAffinity,
     coll: Collation,
     enc: TextEncoding,
 ) -> Ordering {
-    match (lhs, rhs) {
-        (Value::Integer(_) | Value::Real(_), Value::Text(s)) => {
-            if let Some(coerced) = sqliters_types::parse_numeric_text(s) {
-                lhs.cmp_sqlite_with_encoding(&coerced, coll, enc)
-            } else {
-                lhs.cmp_sqlite_with_encoding(rhs, coll, enc)
-            }
-        }
-        (Value::Text(s), Value::Integer(_) | Value::Real(_)) => {
-            if let Some(coerced) = sqliters_types::parse_numeric_text(s) {
-                coerced.cmp_sqlite_with_encoding(rhs, coll, enc)
-            } else {
-                lhs.cmp_sqlite_with_encoding(rhs, coll, enc)
-            }
-        }
-        _ => lhs.cmp_sqlite_with_encoding(rhs, coll, enc),
+    if aff == TypeAffinity::Blob {
+        return lhs.cmp_sqlite_with_encoding(rhs, coll, enc);
     }
+    let lc = aff.apply(lhs.clone());
+    let rc = aff.apply(rhs.clone());
+    lc.cmp_sqlite_with_encoding(&rc, coll, enc)
 }
 
 pub fn eval_cast(val: Value, type_name: &str) -> Value {

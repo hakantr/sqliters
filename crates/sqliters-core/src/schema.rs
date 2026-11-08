@@ -13,6 +13,12 @@ use sqliters_types::{
 use sqliters_vdbe::P4;
 
 #[derive(Debug, Clone)]
+pub struct CheckSchema {
+    pub label: String,
+    pub expr: Expr,
+}
+
+#[derive(Debug, Clone)]
 pub struct ColumnSchema {
     pub name: String,
     pub type_name: String,
@@ -20,6 +26,7 @@ pub struct ColumnSchema {
     pub collation: Collation,
     pub not_null: Option<ConflictAction>,
     pub default_expr: Option<Expr>,
+    pub generated: Option<(Expr, bool)>,
     pub is_primary_key: bool,
     /// 1-based position within PRIMARY KEY (`0` if not part of PK), matching `PRAGMA table_info`.
     pub pk_order: usize,
@@ -72,7 +79,7 @@ pub struct TableSchema {
     pub autoincrement: bool,
     pub without_rowid: bool,
     pub strict: bool,
-    pub checks: Vec<Expr>,
+    pub checks: Vec<CheckSchema>,
     pub foreign_keys: Vec<ForeignKeySchema>,
     pub raw_sql: String,
 }
@@ -87,6 +94,7 @@ impl TableSchema {
             collation: Collation::Binary,
             not_null: None,
             default_expr: None,
+            generated: None,
             is_primary_key: false,
             pk_order: 0,
         };
@@ -395,6 +403,7 @@ pub fn build_table_schema_from_ast(
         let mut collation = Collation::Binary;
         let mut not_null = None;
         let mut default_expr = None;
+        let mut generated = None;
         let mut is_pk = false;
         let mut pk_desc = false;
         let mut pk_conflict = ConflictAction::Abort;
@@ -430,8 +439,18 @@ pub fn build_table_schema_from_ast(
                 ColumnConstraint::Default(expr) => {
                     default_expr = Some(expr.clone());
                 }
-                ColumnConstraint::Check(expr) => {
-                    checks.push(expr.clone());
+                ColumnConstraint::Check {
+                    name: cname,
+                    expr_sql,
+                    expr,
+                } => {
+                    checks.push(CheckSchema {
+                        label: cname.clone().unwrap_or_else(|| expr_sql.clone()),
+                        expr: expr.clone(),
+                    });
+                }
+                ColumnConstraint::Generated { expr, stored } => {
+                    generated = Some((expr.clone(), *stored));
                 }
                 ColumnConstraint::Collate(cname) => {
                     collation = Collation::from_name(cname).ok_or_else(|| {
@@ -481,6 +500,7 @@ pub fn build_table_schema_from_ast(
             collation,
             not_null,
             default_expr,
+            generated,
             is_primary_key: is_pk,
             pk_order,
         });
@@ -600,8 +620,15 @@ pub fn build_table_schema_from_ast(
                     columns: resolved,
                 });
             }
-            TableConstraint::Check(expr) => {
-                checks.push(expr.clone());
+            TableConstraint::Check {
+                name: cname,
+                expr_sql,
+                expr,
+            } => {
+                checks.push(CheckSchema {
+                    label: cname.clone().unwrap_or_else(|| expr_sql.clone()),
+                    expr: expr.clone(),
+                });
             }
             TableConstraint::ForeignKey {
                 columns: fk_cols,
@@ -696,6 +723,7 @@ pub fn build_column_schema_from_def(cdef: &ColumnDef) -> Result<ColumnSchema> {
     let mut collation = Collation::Binary;
     let mut not_null = None;
     let mut default_expr = None;
+    let mut generated = None;
     for cons in &cdef.constraints {
         match cons {
             ColumnConstraint::PrimaryKey { .. } => {
@@ -716,6 +744,15 @@ pub fn build_column_schema_from_def(cdef: &ColumnDef) -> Result<ColumnSchema> {
             ColumnConstraint::Default(e) => {
                 default_expr = Some(e.clone());
             }
+            ColumnConstraint::Generated { expr, stored } => {
+                if *stored {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "cannot add a STORED column",
+                    ));
+                }
+                generated = Some((expr.clone(), false));
+            }
             ColumnConstraint::Collate(cname) => {
                 collation = Collation::from_name(cname).ok_or_else(|| {
                     SqliteError::new(
@@ -727,7 +764,7 @@ pub fn build_column_schema_from_def(cdef: &ColumnDef) -> Result<ColumnSchema> {
             _ => {}
         }
     }
-    if not_null.is_some() && default_expr.is_none() {
+    if not_null.is_some() && default_expr.is_none() && generated.is_none() {
         return Err(SqliteError::new(
             ErrorCode::Error,
             "Cannot add a NOT NULL column with default value NULL",
@@ -740,6 +777,7 @@ pub fn build_column_schema_from_def(cdef: &ColumnDef) -> Result<ColumnSchema> {
         collation,
         not_null,
         default_expr,
+        generated,
         is_primary_key: false,
         pk_order: 0,
     })

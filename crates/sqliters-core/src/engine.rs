@@ -6,12 +6,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use sqliters_btree::Btree;
 use sqliters_pager::TransactionState;
 use sqliters_syntax::{
-    AlterTableAction, BinaryOp, BindParam, CommonTableExpr, CompoundOp, ConflictAction,
+    AlterTableAction, BinaryOp, BindParam, ColumnDef, CommonTableExpr, CompoundOp, ConflictAction,
     CreateIndexStmt, CreateTableStmt, CurrentTimeKind, DeleteStmt, Expr, FkAction, FromClause,
-    FunctionArgs, InsertSource, InsertStmt, JoinClause, JoinConstraint, JoinType, LikeOp,
-    LimitClause, OrderByTerm, PragmaValue, ResultColumn, SelectBody, SelectCore, SelectStmt, Stmt,
-    TableOrSubquery, Token, TokenKind, UnaryOp, UpdateStmt, dequote, keyword_kind, parse_one,
-    tokenize,
+    FunctionArgs, IndexHint, InsertSource, InsertStmt, JoinClause, JoinConstraint, JoinType,
+    LikeOp, LimitClause, OrderByTerm, PragmaValue, ResultColumn, SelectBody, SelectCore,
+    SelectStmt, Stmt, TableOrSubquery, Token, TokenKind, UnaryOp, UpdateStmt, dequote,
+    keyword_kind, parse_one, tokenize,
 };
 use sqliters_types::{
     Collation, ConflictResolutionEffect, ErrorCode, KeySortOrder, Result, SqliteError,
@@ -20,8 +20,9 @@ use sqliters_types::{
 };
 use sqliters_vdbe::{
     AggregateAccumulator, AggregateKind, Opcode, VmRuntimeContext, eval_cast_with_encoding,
-    eval_comparison_with_encoding, eval_scalar_function, format_utc_date, format_utc_time,
-    format_utc_timestamp, parse_escape_char, sqlite_glob_match, sqlite_like_match,
+    eval_comparison_with_affinity, eval_comparison_with_encoding, eval_scalar_function,
+    format_utc_date, format_utc_time, format_utc_timestamp, parse_escape_char,
+    sqlite_compare_affinity, sqlite_glob_match, sqlite_like_match,
 };
 
 use crate::compiler::{
@@ -59,6 +60,7 @@ struct ScopedColumn {
     table_alias: Option<String>,
     name: String,
     collation: Collation,
+    affinity: Option<TypeAffinity>,
     hidden_rowid: bool,
     merged_using: bool,
 }
@@ -71,6 +73,14 @@ struct EvalRow {
 
 impl EvalRow {
     fn lookup(&self, qual: Option<&str>, col_name: &str) -> Result<Option<(Value, Collation)>> {
+        Ok(self.lookup_full(qual, col_name)?.map(|(v, c, _)| (v, c)))
+    }
+
+    fn lookup_full(
+        &self,
+        qual: Option<&str>,
+        col_name: &str,
+    ) -> Result<Option<(Value, Collation, Option<TypeAffinity>)>> {
         let mut matches = Vec::new();
         for (i, sc) in self.cols.iter().enumerate() {
             if sc.hidden_rowid {
@@ -85,16 +95,25 @@ impl EvalRow {
                 }
             }
             if sc.name.eq_ignore_ascii_case(col_name) {
-                matches.push((self.vals[i].clone(), sc.collation, sc.merged_using));
+                matches.push((
+                    self.vals[i].clone(),
+                    sc.collation,
+                    sc.affinity,
+                    sc.merged_using,
+                ));
                 if qual.is_none() && sc.merged_using {
                     // Deduplicated USING / NATURAL column takes unambiguous precedence
-                    return Ok(Some((self.vals[i].clone(), sc.collation)));
+                    return Ok(Some((self.vals[i].clone(), sc.collation, sc.affinity)));
                 }
             }
         }
 
         if matches.len() == 1 {
-            return Ok(Some((matches[0].0.clone(), matches[0].1)));
+            return Ok(Some((
+                matches[0].0.clone(),
+                matches[0].1,
+                matches[0].2,
+            )));
         }
         if matches.len() > 1 {
             return Err(SqliteError::new(
@@ -120,10 +139,19 @@ impl EvalRow {
                         continue;
                     }
                 }
-                matches.push((self.vals[i].clone(), Collation::Binary, false));
+                matches.push((
+                    self.vals[i].clone(),
+                    Collation::Binary,
+                    Some(TypeAffinity::Integer),
+                    false,
+                ));
             }
             if matches.len() == 1 {
-                return Ok(Some((matches[0].0.clone(), Collation::Binary)));
+                return Ok(Some((
+                    matches[0].0.clone(),
+                    Collation::Binary,
+                    Some(TypeAffinity::Integer),
+                )));
             }
         }
 
@@ -253,6 +281,7 @@ pub fn execute_statement(
         Stmt::Rollback { savepoint } => {
             if let Some(sp_name) = savepoint {
                 ctx.btree.pager_mut().rollback_to_savepoint(sp_name)?;
+                *ctx.rollback_count += 1;
                 *ctx.schema = Schema::load(ctx.btree)?;
                 Ok(QueryOutput::default())
             } else {
@@ -303,6 +332,14 @@ pub fn execute_statement(
         Stmt::Delete(del) => run_write_autocommit(ctx, |ctx| exec_delete(ctx, del, params)),
         Stmt::CreateTable(ct) => run_write_autocommit(ctx, |ctx| {
             exec_create_table(ctx, ct)?;
+            Ok(QueryOutput::default())
+        }),
+        Stmt::CreateTableAs {
+            if_not_exists,
+            name,
+            query,
+        } => run_write_autocommit(ctx, |ctx| {
+            exec_create_table_as(ctx, *if_not_exists, name, query, params)?;
             Ok(QueryOutput::default())
         }),
         Stmt::DropTable { if_exists, name } => run_write_autocommit(ctx, |ctx| {
@@ -946,6 +983,7 @@ fn exec_recursive_cte(
             table_alias: Some(cte.name.clone()),
             name: cn.clone(),
             collation: Collation::Binary,
+            affinity: None,
             hidden_rowid: false,
             merged_using: false,
         })
@@ -1088,10 +1126,22 @@ fn exec_compound_select(
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
 ) -> Result<QueryOutput> {
+    let body_meta = infer_select_body_meta(body, outer_scopes, ctx.schema, ctes);
     let head_out = exec_single_select_core(ctx, &body.head, &[], None, params, outer_scopes, ctes)?;
     let col_names = head_out.column_names;
+    let mut all_arm_col_names = vec![col_names.clone()];
     let mut acc_rows = head_out.rows;
-    let default_specs = vec![KeySortOrder::default(); col_names.len()];
+    let col_collations: Vec<Collation> = (0..col_names.len())
+        .map(|i| body_meta.get(i).map_or(Collation::Binary, |(_, c)| *c))
+        .collect();
+    let default_specs: Vec<KeySortOrder> = col_collations
+        .iter()
+        .map(|&coll| KeySortOrder {
+            desc: false,
+            nulls_last: false,
+            collation: coll,
+        })
+        .collect();
 
     for (op, rhs_core) in &body.compounds {
         let rhs_out =
@@ -1105,6 +1155,7 @@ fn exec_compound_select(
                 ),
             ));
         }
+        all_arm_col_names.push(rhs_out.column_names);
         let enc = ctx.btree.encoding();
         match op {
             CompoundOp::UnionAll => {
@@ -1112,41 +1163,49 @@ fn exec_compound_select(
             }
             CompoundOp::Union => {
                 acc_rows.extend(rhs_out.rows);
-                acc_rows = dedup_rows_sorted_or_seen(acc_rows, enc);
                 acc_rows.sort_by(|a, b| compare_value_slices(a, b, &default_specs, enc));
+                acc_rows.dedup_by(|a, b| {
+                    compare_value_slices(a, b, &default_specs, enc) == Ordering::Equal
+                });
             }
             CompoundOp::Intersect => {
-                let rhs_keys: HashSet<Vec<u8>> = rhs_out
-                    .rows
-                    .iter()
-                    .map(|r| encode_record_with_encoding(r, enc))
-                    .collect();
-                let mut seen = HashSet::new();
-                acc_rows.retain(|r| {
-                    let k = encode_record_with_encoding(r, enc);
-                    rhs_keys.contains(&k) && seen.insert(k)
-                });
+                let mut rhs_sorted = rhs_out.rows;
+                rhs_sorted.sort_by(|a, b| compare_value_slices(a, b, &default_specs, enc));
                 acc_rows.sort_by(|a, b| compare_value_slices(a, b, &default_specs, enc));
+                acc_rows.dedup_by(|a, b| {
+                    compare_value_slices(a, b, &default_specs, enc) == Ordering::Equal
+                });
+                acc_rows.retain(|r| {
+                    rhs_sorted
+                        .binary_search_by(|probe| compare_value_slices(probe, r, &default_specs, enc))
+                        .is_ok()
+                });
             }
             CompoundOp::Except => {
-                let rhs_keys: HashSet<Vec<u8>> = rhs_out
-                    .rows
-                    .iter()
-                    .map(|r| encode_record_with_encoding(r, enc))
-                    .collect();
-                let mut seen = HashSet::new();
-                acc_rows.retain(|r| {
-                    let k = encode_record_with_encoding(r, enc);
-                    !rhs_keys.contains(&k) && seen.insert(k)
-                });
+                let mut rhs_sorted = rhs_out.rows;
+                rhs_sorted.sort_by(|a, b| compare_value_slices(a, b, &default_specs, enc));
                 acc_rows.sort_by(|a, b| compare_value_slices(a, b, &default_specs, enc));
+                acc_rows.dedup_by(|a, b| {
+                    compare_value_slices(a, b, &default_specs, enc) == Ordering::Equal
+                });
+                acc_rows.retain(|r| {
+                    rhs_sorted
+                        .binary_search_by(|probe| compare_value_slices(probe, r, &default_specs, enc))
+                        .is_err()
+                });
             }
         }
     }
 
     if !order_by.is_empty() {
         let enc = ctx.btree.encoding();
-        sort_materialized_output(&mut acc_rows, &col_names, order_by, enc)?;
+        sort_materialized_output(
+            &mut acc_rows,
+            &all_arm_col_names,
+            &col_collations,
+            order_by,
+            enc,
+        )?;
     }
     let acc_rows = apply_limit_offset(ctx, acc_rows, limit, params, outer_scopes, ctes)?;
     Ok(QueryOutput {
@@ -1219,7 +1278,9 @@ fn exec_single_select_core(
             }
             if !order_by.is_empty() {
                 let enc = ctx.btree.encoding();
-                sort_materialized_output(&mut rows, &col_names, order_by, enc)?;
+                let arm_cols = vec![col_names.clone()];
+                let default_colls = vec![Collation::Binary; col_names.len()];
+                sort_materialized_output(&mut rows, &arm_cols, &default_colls, order_by, enc)?;
             }
             let rows = apply_limit_offset(ctx, rows, limit, params, outer_scopes, ctes)?;
             Ok(QueryOutput {
@@ -1282,7 +1343,7 @@ fn exec_single_select_core(
 
             let (col_names, expanded_proj) = expand_projection(projection, &sample_cols)?;
 
-            // Validate & resolve GROUP BY / ORDER BY integer ordinals (1..=N)
+            // Validate & resolve GROUP BY / ORDER BY integer ordinals (1..=N) & SELECT aliases
             let mut resolved_group_by = Vec::with_capacity(group_by.len());
             for (gi, ge) in group_by.iter().enumerate() {
                 if let Some(ord) = strip_collate_and_unary_plus(ge) {
@@ -1306,9 +1367,17 @@ fn exec_single_select_core(
                         resolved_group_by.push(target_expr);
                     }
                 } else {
-                    resolved_group_by.push(ge.clone());
+                    resolved_group_by.push(subst_select_aliases_in_expr(
+                        ge,
+                        &expanded_proj,
+                        &sample_cols,
+                        outer_scopes,
+                    ));
                 }
             }
+            let resolved_having = having.as_ref().map(|hav| {
+                subst_select_aliases_in_expr(hav, &expanded_proj, &sample_cols, outer_scopes)
+            });
             for (oi, ob) in order_by.iter().enumerate() {
                 if let Some(ord) = strip_collate_and_unary_plus(&ob.expr)
                     && (ord < 1 || (ord as usize) > expanded_proj.len())
@@ -1341,7 +1410,7 @@ fn exec_single_select_core(
                         vals: vec![Value::Null; sample_cols.len()],
                     });
                     let scopes = push_scope(outer_scopes, &rep_row);
-                    if let Some(hav) = having {
+                    if let Some(ref hav) = resolved_having {
                         let hv = eval_expr(
                             ctx,
                             hav,
@@ -1435,9 +1504,48 @@ fn exec_single_select_core(
 
             if *distinct {
                 let enc = ctx.btree.encoding();
-                let mut seen = HashSet::new();
-                result_rows_with_sort
-                    .retain(|(proj, _)| seen.insert(encode_record_with_encoding(proj, enc)));
+                let dist_specs: Vec<KeySortOrder> = expanded_proj
+                    .iter()
+                    .map(|(pe, _, _)| KeySortOrder {
+                        desc: false,
+                        nulls_last: false,
+                        collation: infer_expr_collation_from_cols(pe, &sample_cols),
+                    })
+                    .collect();
+                let has_custom_coll = dist_specs.iter().any(|s| s.collation != Collation::Binary);
+                if !has_custom_coll {
+                    let mut unique_rows: Vec<Vec<Value>> = Vec::new();
+                    let mut seen_bytes = HashSet::new();
+                    result_rows_with_sort.retain(|(proj, _)| {
+                        let norm: Vec<Value> = proj
+                            .iter()
+                            .map(|v| match v {
+                                Value::Real(r)
+                                    if (*r as i64 as f64) == *r
+                                        && *r >= (i64::MIN as f64)
+                                        && *r < 9223372036854775808.0 =>
+                                {
+                                    Value::Integer(*r as i64)
+                                }
+                                other => other.clone(),
+                            })
+                            .collect();
+                        let _ = &mut unique_rows;
+                        seen_bytes.insert(encode_record_with_encoding(&norm, enc))
+                    });
+                } else {
+                    let mut seen_rows: Vec<Vec<Value>> = Vec::new();
+                    result_rows_with_sort.retain(|(proj, _)| {
+                        if seen_rows.iter().any(|prev| {
+                            compare_value_slices(prev, proj, &dist_specs, enc) == Ordering::Equal
+                        }) {
+                            false
+                        } else {
+                            seen_rows.push(proj.clone());
+                            true
+                        }
+                    });
+                }
             }
 
             if !order_by.is_empty() {
@@ -1532,18 +1640,37 @@ fn eval_table_or_subquery(
     ctes: &CteStore,
 ) -> Result<Vec<EvalRow>> {
     match tos {
-        TableOrSubquery::Table { name, alias } => {
+        TableOrSubquery::Table {
+            name,
+            alias,
+            indexed_by,
+        } => {
             let eff_alias = alias.clone().unwrap_or_else(|| name.clone());
             if let Some(cte_out) = resolve_cte(ctx, ctes, name, params, outer_scopes)? {
+                if indexed_by.is_some() {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "cannot use INDEXED BY or NOT INDEXED on CTE or view",
+                    ));
+                }
+                let cte_meta = infer_cte_meta_by_name(name, outer_scopes, ctx.schema, ctes);
                 let cols: Vec<ScopedColumn> = cte_out
                     .column_names
                     .iter()
-                    .map(|cn| ScopedColumn {
-                        table_alias: Some(eff_alias.clone()),
-                        name: cn.clone(),
-                        collation: Collation::Binary,
-                        hidden_rowid: false,
-                        merged_using: false,
+                    .enumerate()
+                    .map(|(i, cn)| {
+                        let (aff, coll) = cte_meta
+                            .get(i)
+                            .copied()
+                            .unwrap_or((None, Collation::Binary));
+                        ScopedColumn {
+                            table_alias: Some(eff_alias.clone()),
+                            name: cn.clone(),
+                            collation: coll,
+                            affinity: aff,
+                            hidden_rowid: false,
+                            merged_using: false,
+                        }
                     })
                     .collect();
                 return Ok(cte_out
@@ -1567,6 +1694,7 @@ fn eval_table_or_subquery(
                 ctx,
                 &tbl,
                 alias.as_deref(),
+                indexed_by.as_ref(),
                 where_hint,
                 params,
                 outer_scopes,
@@ -1580,6 +1708,7 @@ fn eval_table_or_subquery(
                     table_alias: Some(eff_alias.clone()),
                     name: c.name.clone(),
                     collation: c.collation,
+                    affinity: Some(c.affinity),
                     hidden_rowid: false,
                     merged_using: false,
                 })
@@ -1589,6 +1718,7 @@ fn eval_table_or_subquery(
                     table_alias: Some(eff_alias),
                     name: "rowid".to_owned(),
                     collation: Collation::Binary,
+                    affinity: Some(TypeAffinity::Integer),
                     hidden_rowid: true,
                     merged_using: false,
                 });
@@ -1608,16 +1738,25 @@ fn eval_table_or_subquery(
             Ok(out)
         }
         TableOrSubquery::Subquery { query, alias } => {
+            let sub_meta = infer_select_stmt_meta(query, outer_scopes, ctx.schema, ctes);
             let sub_out = exec_select(ctx, query, params, outer_scopes, ctes)?;
             let cols: Vec<ScopedColumn> = sub_out
                 .column_names
                 .iter()
-                .map(|cn| ScopedColumn {
-                    table_alias: alias.clone(),
-                    name: cn.clone(),
-                    collation: Collation::Binary,
-                    hidden_rowid: false,
-                    merged_using: false,
+                .enumerate()
+                .map(|(i, cn)| {
+                    let (aff, coll) = sub_meta
+                        .get(i)
+                        .copied()
+                        .unwrap_or((None, Collation::Binary));
+                    ScopedColumn {
+                        table_alias: alias.clone(),
+                        name: cn.clone(),
+                        collation: coll,
+                        affinity: aff,
+                        hidden_rowid: false,
+                        merged_using: false,
+                    }
                 })
                 .collect();
             Ok(sub_out
@@ -1632,15 +1771,65 @@ fn eval_table_or_subquery(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_table_with_plan(
     ctx: &mut ExecContext<'_>,
     tbl: &TableSchema,
     alias: Option<&str>,
+    indexed_by: Option<&IndexHint>,
     where_hint: Option<&Expr>,
     params: &[Value],
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
 ) -> Result<Vec<(i64, Vec<u8>)>> {
+    if let Some(hint) = indexed_by {
+        match hint {
+            IndexHint::NotIndexed => {
+                if ctx.btree.pager().page_count() == 0 {
+                    return Ok(Vec::new());
+                }
+                return ctx.btree.scan_table(tbl.root_pgno);
+            }
+            IndexHint::IndexedBy(idx_name) => {
+                let Some(idx) = ctx
+                    .schema
+                    .indexes_for_table(&tbl.name)
+                    .into_iter()
+                    .find(|i| !i.is_autoindex && i.name.eq_ignore_ascii_case(idx_name))
+                else {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("no such index: {idx_name}"),
+                    ));
+                };
+                if let Some(ref pw) = idx.where_clause {
+                    let usable = where_hint.is_some_and(|wh| expr_contains_conjunct(wh, pw));
+                    if !usable {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("cannot use index: {idx_name}"),
+                        ));
+                    }
+                }
+                if ctx.btree.pager().page_count() == 0 {
+                    return Ok(Vec::new());
+                }
+                let enc = ctx.btree.encoding();
+                let entries = ctx.btree.scan_index(idx.root_pgno)?;
+                let mut rows = Vec::with_capacity(entries.len());
+                for rec_bytes in entries {
+                    let fields = decode_record_with_encoding(&rec_bytes, enc)?;
+                    if let Some(Value::Integer(rid)) = fields.last()
+                        && let Some(payload) = ctx.btree.seek_table_rowid(tbl.root_pgno, *rid)?
+                    {
+                        rows.push((*rid, payload));
+                    }
+                }
+                return Ok(rows);
+            }
+        }
+    }
+
     if ctx.btree.pager().page_count() == 0 {
         return Ok(Vec::new());
     }
@@ -1834,13 +2023,24 @@ fn apply_join(
             let matches = if !using_cols.is_empty() {
                 let mut ok = true;
                 for u in &using_cols {
-                    let lv = l.lookup(None, u)?.map_or(Value::Null, |(v, _)| v);
-                    let rv = r.lookup(None, u)?.map_or(Value::Null, |(v, _)| v);
-                    if eval_comparison_with_encoding(
+                    let (lv, lcoll, laff) = l
+                        .lookup_full(None, u)?
+                        .unwrap_or((Value::Null, Collation::Binary, None));
+                    let (rv, rcoll, raff) = r
+                        .lookup_full(None, u)?
+                        .unwrap_or((Value::Null, Collation::Binary, None));
+                    let coll = if lcoll != Collation::Binary {
+                        lcoll
+                    } else {
+                        rcoll
+                    };
+                    let comp_aff = sqlite_compare_affinity(laff, raff);
+                    if eval_comparison_with_affinity(
                         Opcode::Eq,
                         &lv,
                         &rv,
-                        Collation::Binary,
+                        comp_aff,
+                        coll,
                         ctx.btree.encoding(),
                     )
                     .truthiness()
@@ -1906,18 +2106,27 @@ fn schema_cols_for_tos(
     ctes: &CteStore,
 ) -> Option<Vec<ScopedColumn>> {
     match tos {
-        TableOrSubquery::Table { name, alias } => {
+        TableOrSubquery::Table { name, alias, .. } => {
             let eff = alias.clone().unwrap_or_else(|| name.clone());
             if let Ok(Some(cte)) = resolve_cte(ctx, ctes, name, params, outer_scopes) {
+                let cte_meta = infer_cte_meta_by_name(name, outer_scopes, ctx.schema, ctes);
                 return Some(
                     cte.column_names
                         .iter()
-                        .map(|cn| ScopedColumn {
-                            table_alias: Some(eff.clone()),
-                            name: cn.clone(),
-                            collation: Collation::Binary,
-                            hidden_rowid: false,
-                            merged_using: false,
+                        .enumerate()
+                        .map(|(i, cn)| {
+                            let (aff, coll) = cte_meta
+                                .get(i)
+                                .copied()
+                                .unwrap_or((None, Collation::Binary));
+                            ScopedColumn {
+                                table_alias: Some(eff.clone()),
+                                name: cn.clone(),
+                                collation: coll,
+                                affinity: aff,
+                                hidden_rowid: false,
+                                merged_using: false,
+                            }
                         })
                         .collect(),
                 );
@@ -1930,6 +2139,7 @@ fn schema_cols_for_tos(
                     table_alias: Some(eff.clone()),
                     name: c.name.clone(),
                     collation: c.collation,
+                    affinity: Some(c.affinity),
                     hidden_rowid: false,
                     merged_using: false,
                 })
@@ -1939,6 +2149,7 @@ fn schema_cols_for_tos(
                     table_alias: Some(eff),
                     name: "rowid".to_owned(),
                     collation: Collation::Binary,
+                    affinity: Some(TypeAffinity::Integer),
                     hidden_rowid: true,
                     merged_using: false,
                 });
@@ -1946,17 +2157,26 @@ fn schema_cols_for_tos(
             Some(cols)
         }
         TableOrSubquery::Subquery { query, alias } => {
+            let sub_meta = infer_select_stmt_meta(query, outer_scopes, ctx.schema, ctes);
             let sub_out = exec_select(ctx, query, params, outer_scopes, ctes).ok()?;
             Some(
                 sub_out
                     .column_names
                     .iter()
-                    .map(|cn| ScopedColumn {
-                        table_alias: alias.clone(),
-                        name: cn.clone(),
-                        collation: Collation::Binary,
-                        hidden_rowid: false,
-                        merged_using: false,
+                    .enumerate()
+                    .map(|(i, cn)| {
+                        let (aff, coll) = sub_meta
+                            .get(i)
+                            .copied()
+                            .unwrap_or((None, Collation::Binary));
+                        ScopedColumn {
+                            table_alias: alias.clone(),
+                            name: cn.clone(),
+                            collation: coll,
+                            affinity: aff,
+                            hidden_rowid: false,
+                            merged_using: false,
+                        }
                     })
                     .collect(),
             )
@@ -2200,10 +2420,12 @@ fn eval_order_term_in_scope(
 
 fn sort_materialized_output(
     rows: &mut [Vec<Value>],
-    col_names: &[String],
+    all_arm_col_names: &[Vec<String>],
+    col_collations: &[Collation],
     order_by: &[OrderByTerm],
     enc: TextEncoding,
 ) -> Result<()> {
+    let width = all_arm_col_names.first().map_or(0, Vec::len);
     let mut specs = Vec::with_capacity(order_by.len());
     for (ob_idx, ob) in order_by.iter().enumerate() {
         let mut inner = &ob.expr;
@@ -2211,24 +2433,25 @@ fn sort_materialized_output(
             inner = expr.as_ref();
         }
         if let Some(ord) = strip_collate_and_unary_plus(inner) {
-            if ord < 1 || (ord as usize) > col_names.len() {
+            if ord < 1 || (ord as usize) > width {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!(
                         "{} ORDER BY term out of range - should be between 1 and {}",
                         ordinal_suffix(ob_idx + 1),
-                        col_names.len()
+                        width
                     ),
                 ));
             }
+            let cidx = (ord as usize) - 1;
             let coll = match &ob.expr {
                 Expr::Collate { collation, .. } => {
                     Collation::from_name(collation).unwrap_or_default()
                 }
-                _ => Collation::Binary,
+                _ => col_collations.get(cidx).copied().unwrap_or(Collation::Binary),
             };
             specs.push((
-                (ord as usize) - 1,
+                cidx,
                 KeySortOrder {
                     desc: ob.desc,
                     nulls_last: ob.nulls_last.unwrap_or(ob.desc),
@@ -2237,30 +2460,34 @@ fn sort_materialized_output(
             ));
             continue;
         }
-        let col_idx = match inner {
+        let target_label = match inner {
             Expr::Column {
                 table: None,
                 column,
-            } => col_names
-                .iter()
-                .position(|cn| cn.eq_ignore_ascii_case(column)),
-            other => {
-                let lbl = expr_column_label(other);
-                col_names.iter().position(|cn| cn.eq_ignore_ascii_case(&lbl))
-            }
-        }
-        .ok_or_else(|| {
-            SqliteError::new(
-                ErrorCode::Error,
-                format!(
-                    "{} ORDER BY term does not match any column in the result set",
-                    ordinal_suffix(ob_idx + 1)
-                ),
-            )
-        })?;
+            } => Some(column.clone()),
+            other => Some(expr_column_label(other)),
+        };
+        let col_idx = target_label
+            .and_then(|lbl| {
+                all_arm_col_names.iter().find_map(|arm_cols| {
+                    arm_cols.iter().position(|cn| cn.eq_ignore_ascii_case(&lbl))
+                })
+            })
+            .ok_or_else(|| {
+                SqliteError::new(
+                    ErrorCode::Error,
+                    format!(
+                        "{} ORDER BY term does not match any column in the result set",
+                        ordinal_suffix(ob_idx + 1)
+                    ),
+                )
+            })?;
         let coll = match &ob.expr {
             Expr::Collate { collation, .. } => Collation::from_name(collation).unwrap_or_default(),
-            _ => Collation::Binary,
+            _ => col_collations
+                .get(col_idx)
+                .copied()
+                .unwrap_or(Collation::Binary),
         };
         specs.push((
             col_idx,
@@ -2311,15 +2538,652 @@ fn apply_limit_offset(
     }
 }
 
-fn dedup_rows_sorted_or_seen(rows: Vec<Vec<Value>>, enc: TextEncoding) -> Vec<Vec<Value>> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::with_capacity(rows.len());
-    for r in rows {
-        if seen.insert(encode_record_with_encoding(&r, enc)) {
-            out.push(r);
+fn expr_contains_conjunct(haystack: &Expr, needle: &Expr) -> bool {
+    if haystack == needle {
+        return true;
+    }
+    if let Expr::Binary {
+        left,
+        op: BinaryOp::And,
+        right,
+    } = haystack
+    {
+        return expr_contains_conjunct(left, needle) || expr_contains_conjunct(right, needle);
+    }
+    false
+}
+
+fn subst_select_aliases_in_expr(
+    expr: &Expr,
+    expanded_proj: &[(Expr, String, Option<String>)],
+    sample_cols: &[ScopedColumn],
+    outer_scopes: &[EvalRow],
+) -> Expr {
+    match expr {
+        Expr::Column {
+            table: None,
+            column,
+        } => {
+            let in_sample = sample_cols.iter().any(|sc| {
+                if sc.hidden_rowid {
+                    column.eq_ignore_ascii_case("rowid")
+                        || column.eq_ignore_ascii_case("_rowid_")
+                        || column.eq_ignore_ascii_case("oid")
+                } else {
+                    sc.name.eq_ignore_ascii_case(column)
+                }
+            });
+            let in_outer = outer_scopes
+                .iter()
+                .rev()
+                .any(|s| s.lookup(None, column).ok().flatten().is_some());
+            if !in_sample
+                && !in_outer
+                && let Some((pe, _, _)) = expanded_proj.iter().find(|(_, _, al)| {
+                    al.as_ref().is_some_and(|a| a.eq_ignore_ascii_case(column))
+                })
+            {
+                return pe.clone();
+            }
+            expr.clone()
+        }
+        Expr::Collate {
+            expr: inner,
+            collation,
+        } => Expr::Collate {
+            expr: Box::new(subst_select_aliases_in_expr(
+                inner,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            collation: collation.clone(),
+        },
+        Expr::Unary { op, expr: inner } => Expr::Unary {
+            op: *op,
+            expr: Box::new(subst_select_aliases_in_expr(
+                inner,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+        },
+        Expr::Binary { left, op, right } => Expr::Binary {
+            left: Box::new(subst_select_aliases_in_expr(
+                left,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            op: *op,
+            right: Box::new(subst_select_aliases_in_expr(
+                right,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+        },
+        Expr::IsNull {
+            expr: inner,
+            negated,
+        } => Expr::IsNull {
+            expr: Box::new(subst_select_aliases_in_expr(
+                inner,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            negated: *negated,
+        },
+        Expr::Between {
+            expr: ve,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: Box::new(subst_select_aliases_in_expr(
+                ve,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            low: Box::new(subst_select_aliases_in_expr(
+                low,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            high: Box::new(subst_select_aliases_in_expr(
+                high,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            negated: *negated,
+        },
+        Expr::InList {
+            expr: le,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(subst_select_aliases_in_expr(
+                le,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            list: list
+                .iter()
+                .map(|e| {
+                    subst_select_aliases_in_expr(e, expanded_proj, sample_cols, outer_scopes)
+                })
+                .collect(),
+            negated: *negated,
+        },
+        Expr::InSubquery {
+            expr: le,
+            subquery,
+            negated,
+        } => Expr::InSubquery {
+            expr: Box::new(subst_select_aliases_in_expr(
+                le,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            subquery: subquery.clone(),
+            negated: *negated,
+        },
+        Expr::Like {
+            expr: te,
+            pattern,
+            escape,
+            op,
+            negated,
+        } => Expr::Like {
+            expr: Box::new(subst_select_aliases_in_expr(
+                te,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            pattern: Box::new(subst_select_aliases_in_expr(
+                pattern,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            escape: escape.as_ref().map(|ee| {
+                Box::new(subst_select_aliases_in_expr(
+                    ee,
+                    expanded_proj,
+                    sample_cols,
+                    outer_scopes,
+                ))
+            }),
+            op: *op,
+            negated: *negated,
+        },
+        Expr::Cast {
+            expr: inner,
+            type_name,
+        } => Expr::Cast {
+            expr: Box::new(subst_select_aliases_in_expr(
+                inner,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            type_name: type_name.clone(),
+        },
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => Expr::Case {
+            operand: operand.as_ref().map(|oe| {
+                Box::new(subst_select_aliases_in_expr(
+                    oe,
+                    expanded_proj,
+                    sample_cols,
+                    outer_scopes,
+                ))
+            }),
+            branches: branches
+                .iter()
+                .map(|(w, t)| {
+                    (
+                        subst_select_aliases_in_expr(w, expanded_proj, sample_cols, outer_scopes),
+                        subst_select_aliases_in_expr(t, expanded_proj, sample_cols, outer_scopes),
+                    )
+                })
+                .collect(),
+            else_expr: else_expr.as_ref().map(|ee| {
+                Box::new(subst_select_aliases_in_expr(
+                    ee,
+                    expanded_proj,
+                    sample_cols,
+                    outer_scopes,
+                ))
+            }),
+        },
+        Expr::FunctionCall {
+            name,
+            distinct,
+            args,
+            filter,
+        } => Expr::FunctionCall {
+            name: name.clone(),
+            distinct: *distinct,
+            args: match args {
+                FunctionArgs::Star => FunctionArgs::Star,
+                FunctionArgs::Exprs(es) => FunctionArgs::Exprs(
+                    es.iter()
+                        .map(|e| {
+                            subst_select_aliases_in_expr(
+                                e,
+                                expanded_proj,
+                                sample_cols,
+                                outer_scopes,
+                            )
+                        })
+                        .collect(),
+                ),
+            },
+            filter: filter.as_ref().map(|fe| {
+                Box::new(subst_select_aliases_in_expr(
+                    fe,
+                    expanded_proj,
+                    sample_cols,
+                    outer_scopes,
+                ))
+            }),
+        },
+        Expr::RowValue(elems) => Expr::RowValue(
+            elems
+                .iter()
+                .map(|e| {
+                    subst_select_aliases_in_expr(e, expanded_proj, sample_cols, outer_scopes)
+                })
+                .collect(),
+        ),
+        _ => expr.clone(),
+    }
+}
+
+fn infer_cte_meta_by_name(
+    name: &str,
+    outer_scopes: &[EvalRow],
+    schema: &Schema,
+    ctes: &CteStore,
+) -> Vec<(Option<TypeAffinity>, Collation)> {
+    let mut visited = Vec::new();
+    infer_cte_meta_guarded(name, outer_scopes, schema, ctes, &mut visited)
+}
+
+fn infer_cte_meta_guarded(
+    name: &str,
+    outer_scopes: &[EvalRow],
+    schema: &Schema,
+    ctes: &CteStore,
+    visited: &mut Vec<(usize, usize)>,
+) -> Vec<(Option<TypeAffinity>, Collation)> {
+    let Some((s_idx, c_idx)) = ctes.locate(name) else {
+        return Vec::new();
+    };
+    if visited.contains(&(s_idx, c_idx)) {
+        return Vec::new();
+    }
+    visited.push((s_idx, c_idx));
+    let cte = &ctes.scopes[s_idx][c_idx];
+    let mut sub_ctes = CteStore {
+        scopes: ctes.scopes[..=s_idx].to_vec(),
+        working: Vec::new(),
+        resolving: Vec::new(),
+        limit_hint: None,
+    };
+    if !cte.query.ctes.is_empty() {
+        sub_ctes.scopes.push(cte.query.ctes.clone());
+    }
+    let res = infer_select_body_meta_guarded(
+        &cte.query.body,
+        outer_scopes,
+        schema,
+        &sub_ctes,
+        visited,
+    );
+    visited.pop();
+    res
+}
+
+fn infer_select_stmt_meta(
+    sel: &SelectStmt,
+    outer_scopes: &[EvalRow],
+    schema: &Schema,
+    ctes: &CteStore,
+) -> Vec<(Option<TypeAffinity>, Collation)> {
+    let mut visited = Vec::new();
+    let sub_ctes = ctes.with_scope(&sel.ctes);
+    infer_select_body_meta_guarded(&sel.body, outer_scopes, schema, &sub_ctes, &mut visited)
+}
+
+fn infer_select_body_meta(
+    body: &SelectBody,
+    outer_scopes: &[EvalRow],
+    schema: &Schema,
+    ctes: &CteStore,
+) -> Vec<(Option<TypeAffinity>, Collation)> {
+    let mut visited = Vec::new();
+    infer_select_body_meta_guarded(body, outer_scopes, schema, ctes, &mut visited)
+}
+
+fn infer_select_body_meta_guarded(
+    body: &SelectBody,
+    outer_scopes: &[EvalRow],
+    schema: &Schema,
+    ctes: &CteStore,
+    visited: &mut Vec<(usize, usize)>,
+) -> Vec<(Option<TypeAffinity>, Collation)> {
+    let head_meta = infer_select_core_meta(&body.head, outer_scopes, schema, ctes, visited);
+    let mut combined: Vec<(Option<TypeAffinity>, Option<Collation>)> = head_meta;
+    for (_, rhs_core) in &body.compounds {
+        let rhs_meta = infer_select_core_meta(rhs_core, outer_scopes, schema, ctes, visited);
+        for (i, (r_aff, r_coll)) in rhs_meta.into_iter().enumerate() {
+            if let Some((c_aff, c_coll)) = combined.get_mut(i) {
+                if c_coll.is_none() && r_coll.is_some() {
+                    *c_coll = r_coll;
+                }
+                if *c_aff != r_aff {
+                    // Per SQLite `select.c` (`multiSelect`): if compound arms disagree on affinity, check numeric compatibility or fall back to BLOB/None
+                    *c_aff = match (*c_aff, r_aff) {
+                        (Some(a), Some(b)) if a == b => Some(a),
+                        (Some(a), None) | (None, Some(a)) => Some(a),
+                        _ => Some(TypeAffinity::Blob),
+                    };
+                }
+            }
         }
     }
-    out
+    combined
+        .into_iter()
+        .map(|(a, c)| (a, c.unwrap_or(Collation::Binary)))
+        .collect()
+}
+
+fn infer_select_core_meta(
+    core: &SelectCore,
+    outer_scopes: &[EvalRow],
+    schema: &Schema,
+    ctes: &CteStore,
+    visited: &mut Vec<(usize, usize)>,
+) -> Vec<(Option<TypeAffinity>, Option<Collation>)> {
+    match core {
+        SelectCore::Values(rows) => {
+            let Some(first) = rows.first() else {
+                return Vec::new();
+            };
+            first
+                .iter()
+                .map(|e| {
+                    let aff = infer_expr_affinity_in_scopes_guarded(
+                        e,
+                        outer_scopes,
+                        schema,
+                        ctes,
+                        visited,
+                    );
+                    let coll = infer_expr_explicit_or_col_collation(e, &[], outer_scopes);
+                    (aff, coll)
+                })
+                .collect()
+        }
+        SelectCore::Select {
+            projection, from, ..
+        } => {
+            let sample_cols = from
+                .as_ref()
+                .and_then(|fc| static_schema_cols_for_from(fc, outer_scopes, schema, ctes, visited))
+                .unwrap_or_default();
+            let Ok((_, expanded)) = expand_projection(projection, &sample_cols) else {
+                return Vec::new();
+            };
+            let dummy_row = EvalRow {
+                cols: sample_cols.clone(),
+                vals: vec![Value::Null; sample_cols.len()],
+            };
+            let full_scopes = push_scope(outer_scopes, &dummy_row);
+            expanded
+                .into_iter()
+                .map(|(pe, _, _)| {
+                    let aff = infer_expr_affinity_in_scopes_guarded(
+                        &pe,
+                        &full_scopes,
+                        schema,
+                        ctes,
+                        visited,
+                    );
+                    let coll =
+                        infer_expr_explicit_or_col_collation(&pe, &sample_cols, outer_scopes);
+                    (aff, coll)
+                })
+                .collect()
+        }
+    }
+}
+
+fn static_schema_cols_for_from(
+    fc: &FromClause,
+    outer_scopes: &[EvalRow],
+    schema: &Schema,
+    ctes: &CteStore,
+    visited: &mut Vec<(usize, usize)>,
+) -> Option<Vec<ScopedColumn>> {
+    let mut cols = static_schema_cols_for_tos(&fc.head, outer_scopes, schema, ctes, visited)?;
+    for j in &fc.joins {
+        if let Some(rcols) =
+            static_schema_cols_for_tos(&j.right, outer_scopes, schema, ctes, visited)
+        {
+            cols = merge_join_scoped_columns(&cols, &rcols, j);
+        }
+    }
+    Some(cols)
+}
+
+fn static_schema_cols_for_tos(
+    tos: &TableOrSubquery,
+    outer_scopes: &[EvalRow],
+    schema: &Schema,
+    ctes: &CteStore,
+    visited: &mut Vec<(usize, usize)>,
+) -> Option<Vec<ScopedColumn>> {
+    match tos {
+        TableOrSubquery::Table { name, alias, .. } => {
+            let eff = alias.clone().unwrap_or_else(|| name.clone());
+            if let Some((s_idx, c_idx)) = ctes.locate(name) {
+                let cte = &ctes.scopes[s_idx][c_idx];
+                let meta = infer_cte_meta_guarded(name, outer_scopes, schema, ctes, visited);
+                let cnames: Vec<String> = if let Some(ref explicit) = cte.columns {
+                    explicit.clone()
+                } else {
+                    static_select_col_names(&cte.query.body, outer_scopes, schema, ctes, visited)
+                };
+                return Some(
+                    cnames
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, cn)| {
+                            let (aff, coll) =
+                                meta.get(i).copied().unwrap_or((None, Collation::Binary));
+                            ScopedColumn {
+                                table_alias: Some(eff.clone()),
+                                name: cn,
+                                collation: coll,
+                                affinity: aff,
+                                hidden_rowid: false,
+                                merged_using: false,
+                            }
+                        })
+                        .collect(),
+                );
+            }
+            let tbl = schema.find_table(name)?;
+            let mut cols: Vec<ScopedColumn> = tbl
+                .columns
+                .iter()
+                .map(|c| ScopedColumn {
+                    table_alias: Some(eff.clone()),
+                    name: c.name.clone(),
+                    collation: c.collation,
+                    affinity: Some(c.affinity),
+                    hidden_rowid: false,
+                    merged_using: false,
+                })
+                .collect();
+            if !tbl.without_rowid {
+                cols.push(ScopedColumn {
+                    table_alias: Some(eff),
+                    name: "rowid".to_owned(),
+                    collation: Collation::Binary,
+                    affinity: Some(TypeAffinity::Integer),
+                    hidden_rowid: true,
+                    merged_using: false,
+                });
+            }
+            Some(cols)
+        }
+        TableOrSubquery::Subquery { query, alias } => {
+            let sub_ctes = ctes.with_scope(&query.ctes);
+            let meta =
+                infer_select_body_meta_guarded(&query.body, outer_scopes, schema, &sub_ctes, visited);
+            let cnames =
+                static_select_col_names(&query.body, outer_scopes, schema, &sub_ctes, visited);
+            Some(
+                cnames
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, cn)| {
+                        let (aff, coll) =
+                            meta.get(i).copied().unwrap_or((None, Collation::Binary));
+                        ScopedColumn {
+                            table_alias: alias.clone(),
+                            name: cn,
+                            collation: coll,
+                            affinity: aff,
+                            hidden_rowid: false,
+                            merged_using: false,
+                        }
+                    })
+                    .collect(),
+            )
+        }
+    }
+}
+
+fn static_select_col_names(
+    body: &SelectBody,
+    outer_scopes: &[EvalRow],
+    schema: &Schema,
+    ctes: &CteStore,
+    visited: &mut Vec<(usize, usize)>,
+) -> Vec<String> {
+    match &body.head {
+        SelectCore::Values(rows) => {
+            let w = rows.first().map_or(0, Vec::len);
+            (1..=w).map(|i| format!("column{i}")).collect()
+        }
+        SelectCore::Select {
+            projection, from, ..
+        } => {
+            let sample_cols = from
+                .as_ref()
+                .and_then(|fc| static_schema_cols_for_from(fc, outer_scopes, schema, ctes, visited))
+                .unwrap_or_default();
+            expand_projection(projection, &sample_cols)
+                .map(|(names, _)| names)
+                .unwrap_or_default()
+        }
+    }
+}
+
+fn infer_expr_explicit_or_col_collation(
+    expr: &Expr,
+    sample_cols: &[ScopedColumn],
+    outer_scopes: &[EvalRow],
+) -> Option<Collation> {
+    match expr {
+        Expr::Collate { collation, .. } => Some(Collation::from_name(collation).unwrap_or_default()),
+        Expr::RowValue(elems) if elems.len() == 1 => {
+            infer_expr_explicit_or_col_collation(&elems[0], sample_cols, outer_scopes)
+        }
+        Expr::Column { table, column } => {
+            for sc in sample_cols {
+                if sc.hidden_rowid {
+                    continue;
+                }
+                if let Some(q) = table
+                    && !sc
+                        .table_alias
+                        .as_ref()
+                        .is_some_and(|ta| ta.eq_ignore_ascii_case(q))
+                {
+                    continue;
+                }
+                if sc.name.eq_ignore_ascii_case(column) {
+                    return Some(sc.collation);
+                }
+            }
+            for s in outer_scopes.iter().rev() {
+                if let Ok(Some((_, c))) = s.lookup(table.as_deref(), column) {
+                    return Some(c);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn infer_expr_affinity_in_scopes(
+    expr: &Expr,
+    scopes: &[EvalRow],
+    schema: &Schema,
+    ctes: &CteStore,
+) -> Option<TypeAffinity> {
+    let mut visited = Vec::new();
+    infer_expr_affinity_in_scopes_guarded(expr, scopes, schema, ctes, &mut visited)
+}
+
+fn infer_expr_affinity_in_scopes_guarded(
+    expr: &Expr,
+    scopes: &[EvalRow],
+    schema: &Schema,
+    ctes: &CteStore,
+    visited: &mut Vec<(usize, usize)>,
+) -> Option<TypeAffinity> {
+    match expr {
+        Expr::Collate { expr: inner, .. } => {
+            infer_expr_affinity_in_scopes_guarded(inner, scopes, schema, ctes, visited)
+        }
+        Expr::RowValue(elems) if elems.len() == 1 => {
+            infer_expr_affinity_in_scopes_guarded(&elems[0], scopes, schema, ctes, visited)
+        }
+        Expr::Cast { type_name, .. } => Some(TypeAffinity::from_declared_type(type_name)),
+        Expr::Column { table, column } => {
+            for s in scopes.iter().rev() {
+                if let Ok(Some((_, _, aff))) = s.lookup_full(table.as_deref(), column) {
+                    return aff;
+                }
+            }
+            None
+        }
+        Expr::Subquery(sub) => {
+            let sub_ctes = ctes.with_scope(&sub.ctes);
+            infer_select_body_meta_guarded(&sub.body, scopes, schema, &sub_ctes, visited)
+                .first()
+                .and_then(|(aff, _)| *aff)
+        }
+        _ => None,
+    }
 }
 
 fn compare_value_slices(
@@ -2562,6 +3426,9 @@ fn eval_expr(
                 | BinaryOp::Is
                 | BinaryOp::IsNot => {
                     let coll = infer_comparison_collation(left, right, scopes);
+                    let laff = infer_expr_affinity_in_scopes(left, scopes, ctx.schema, ctes);
+                    let raff = infer_expr_affinity_in_scopes(right, scopes, ctx.schema, ctes);
+                    let comp_aff = sqlite_compare_affinity(laff, raff);
                     let vdbe_op = match op {
                         BinaryOp::Lt => Opcode::Lt,
                         BinaryOp::Le => Opcode::Le,
@@ -2573,10 +3440,11 @@ fn eval_expr(
                         BinaryOp::IsNot => Opcode::IsNot,
                         _ => unreachable!(),
                     };
-                    Ok(eval_comparison_with_encoding(
+                    Ok(eval_comparison_with_affinity(
                         vdbe_op,
                         &lv,
                         &rv,
+                        comp_aff,
                         coll,
                         ctx.btree.encoding(),
                     ))
@@ -2634,10 +3502,22 @@ fn eval_expr(
             let v = eval_expr(ctx, val_e, params, scopes, ctes, agg_group)?;
             let lo = eval_expr(ctx, low, params, scopes, ctes, agg_group)?;
             let hi = eval_expr(ctx, high, params, scopes, ctes, agg_group)?;
-            let coll = infer_comparison_collation(val_e, low, scopes);
+            let coll_lo = infer_comparison_collation(val_e, low, scopes);
+            let coll_hi = infer_comparison_collation(val_e, high, scopes);
+            let v_aff = infer_expr_affinity_in_scopes(val_e, scopes, ctx.schema, ctes);
+            let lo_aff = sqlite_compare_affinity(
+                v_aff,
+                infer_expr_affinity_in_scopes(low, scopes, ctx.schema, ctes),
+            );
+            let hi_aff = sqlite_compare_affinity(
+                v_aff,
+                infer_expr_affinity_in_scopes(high, scopes, ctx.schema, ctes),
+            );
             let enc = ctx.btree.encoding();
-            let ge = eval_comparison_with_encoding(Opcode::Ge, &v, &lo, coll, enc).truthiness();
-            let le = eval_comparison_with_encoding(Opcode::Le, &v, &hi, coll, enc).truthiness();
+            let ge = eval_comparison_with_affinity(Opcode::Ge, &v, &lo, lo_aff, coll_lo, enc)
+                .truthiness();
+            let le = eval_comparison_with_affinity(Opcode::Le, &v, &hi, hi_aff, coll_hi, enc)
+                .truthiness();
             let res = match (ge, le) {
                 (Some(false), _) | (_, Some(false)) => Some(false),
                 (Some(true), Some(true)) => Some(true),
@@ -2653,60 +3533,66 @@ fn eval_expr(
             list,
             negated,
         } => {
-            if is_row_value_expr(lhs_e) {
-                let lv_vec = eval_row_value_tuple(ctx, lhs_e, params, scopes, ctes, agg_group)?;
-                if list.is_empty() {
-                    return Ok(Value::Integer(i64::from(*negated)));
-                }
-                let enc = ctx.btree.encoding();
-                let mut saw_null = false;
-                for item in list {
-                    let iv_vec = eval_row_value_tuple(ctx, item, params, scopes, ctes, agg_group)?;
-                    if iv_vec.len() != lv_vec.len() {
-                        return Err(SqliteError::new(ErrorCode::Error, "row value misused"));
+            let lv_vec = if is_row_value_expr(lhs_e) {
+                eval_row_value_tuple(ctx, lhs_e, params, scopes, ctes, agg_group)?
+            } else {
+                vec![eval_expr(ctx, lhs_e, params, scopes, ctes, agg_group)?]
+            };
+            let n = lv_vec.len();
+            // Validate RHS element tuple widths upfront before short-circuiting (`rowvalueA-2.0..2.3`)
+            for item in list {
+                let m = static_row_value_width(item, scopes, ctx.schema, ctes);
+                if m != n {
+                    if n >= 2 {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!(
+                                "IN(...) element has {m} term{} - expected {n}",
+                                if m == 1 { "" } else { "s" }
+                            ),
+                        ));
                     }
-                    match compare_row_value_eq(&lv_vec, &iv_vec, &[], enc) {
-                        Some(true) => return Ok(Value::Integer(i64::from(!*negated))),
-                        None => saw_null = true,
-                        Some(false) => {}
-                    }
+                    return Err(SqliteError::new(ErrorCode::Error, "row value misused"));
                 }
-                return Ok(if saw_null {
-                    Value::Null
-                } else {
-                    Value::Integer(i64::from(*negated))
-                });
             }
-            let lv = eval_expr(ctx, lhs_e, params, scopes, ctes, agg_group)?;
             if list.is_empty() {
                 return Ok(Value::Integer(i64::from(*negated)));
             }
-            if lv.is_null() {
-                return Ok(Value::Null);
-            }
+            let l_meta = infer_row_value_elem_meta(lhs_e, n, scopes, ctx.schema, ctes);
+            let enc = ctx.btree.encoding();
             let mut saw_null = false;
             for item in list {
-                let iv = eval_expr(ctx, item, params, scopes, ctes, agg_group)?;
-                if iv.is_null() {
-                    saw_null = true;
-                } else if eval_comparison_with_encoding(
-                    Opcode::Eq,
-                    &lv,
-                    &iv,
-                    Collation::Binary,
-                    ctx.btree.encoding(),
-                )
-                .truthiness()
-                    == Some(true)
-                {
-                    return Ok(Value::Integer(i64::from(!*negated)));
+                let iv_vec = if is_row_value_expr(item) {
+                    eval_row_value_tuple(ctx, item, params, scopes, ctes, agg_group)?
+                } else {
+                    vec![eval_expr(ctx, item, params, scopes, ctes, agg_group)?]
+                };
+                if iv_vec.len() != n {
+                    if n >= 2 {
+                        let m = iv_vec.len();
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!(
+                                "IN(...) element has {m} term{} - expected {n}",
+                                if m == 1 { "" } else { "s" }
+                            ),
+                        ));
+                    }
+                    return Err(SqliteError::new(ErrorCode::Error, "row value misused"));
+                }
+                let r_meta = infer_row_value_elem_meta(item, n, scopes, ctx.schema, ctes);
+                let (affs, colls) = combine_row_value_meta(&l_meta, &r_meta);
+                match compare_row_value_eq(&lv_vec, &iv_vec, &affs, &colls, enc) {
+                    Some(true) => return Ok(Value::Integer(i64::from(!*negated))),
+                    None => saw_null = true,
+                    Some(false) => {}
                 }
             }
-            if saw_null {
-                Ok(Value::Null)
+            Ok(if saw_null {
+                Value::Null
             } else {
-                Ok(Value::Integer(i64::from(*negated)))
-            }
+                Value::Integer(i64::from(*negated))
+            })
         }
         Expr::InSubquery {
             expr: lhs_e,
@@ -2718,24 +3604,45 @@ fn eval_expr(
             } else {
                 vec![eval_expr(ctx, lhs_e, params, scopes, ctes, agg_group)?]
             };
+            let n = lv_vec.len();
+            let sub_meta = infer_select_stmt_meta(subquery, scopes, ctx.schema, ctes);
             let sub_out = exec_select(ctx, subquery, params, scopes, ctes)?;
-            if !sub_out.column_names.is_empty() && sub_out.column_names.len() != lv_vec.len() {
+            if !sub_out.column_names.is_empty() && sub_out.column_names.len() != n {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!(
                         "sub-select returns {} columns - expected {}",
                         sub_out.column_names.len(),
-                        lv_vec.len()
+                        n
                     ),
                 ));
             }
             if sub_out.rows.is_empty() {
                 return Ok(Value::Integer(i64::from(*negated)));
             }
+            let l_meta = infer_row_value_elem_meta(lhs_e, n, scopes, ctx.schema, ctes);
+            let mut affs = Vec::with_capacity(n);
+            let mut colls = Vec::with_capacity(n);
+            for i in 0..n {
+                let (laff, lcoll, lexp) = l_meta.get(i).copied().unwrap_or((None, None, false));
+                let (raff, rcoll) = sub_meta
+                    .get(i)
+                    .copied()
+                    .unwrap_or((None, Collation::Binary));
+                affs.push(sqlite_compare_affinity(laff, raff));
+                let c = if lexp {
+                    lcoll.unwrap_or(Collation::Binary)
+                } else if let Some(lc) = lcoll {
+                    lc
+                } else {
+                    rcoll
+                };
+                colls.push(c);
+            }
             let enc = ctx.btree.encoding();
             let mut saw_null = false;
             for r in &sub_out.rows {
-                match compare_row_value_eq(&lv_vec, r, &[], enc) {
+                match compare_row_value_eq(&lv_vec, r, &affs, &colls, enc) {
                     Some(true) => return Ok(Value::Integer(i64::from(!*negated))),
                     None => saw_null = true,
                     Some(false) => {}
@@ -2790,14 +3697,21 @@ fn eval_expr(
                 Some(oe) => Some(eval_expr(ctx, oe, params, scopes, ctes, agg_group)?),
                 None => None,
             };
+            let op_aff = operand
+                .as_ref()
+                .and_then(|oe| infer_expr_affinity_in_scopes(oe, scopes, ctx.schema, ctes));
             for (we, te) in branches {
-                let cond_true = if let Some(ref base) = op_val {
+                let cond_true = if let (Some(base), Some(oe)) = (&op_val, operand.as_ref()) {
                     let wv = eval_expr(ctx, we, params, scopes, ctes, agg_group)?;
-                    eval_comparison_with_encoding(
+                    let coll = infer_comparison_collation(oe, we, scopes);
+                    let w_aff = infer_expr_affinity_in_scopes(we, scopes, ctx.schema, ctes);
+                    let comp_aff = sqlite_compare_affinity(op_aff, w_aff);
+                    eval_comparison_with_affinity(
                         Opcode::Eq,
                         base,
                         &wv,
-                        Collation::Binary,
+                        comp_aff,
+                        coll,
                         ctx.btree.encoding(),
                     )
                     .truthiness()
@@ -2954,16 +3868,115 @@ fn eval_row_value_tuple(
     }
 }
 
+fn static_row_value_width(
+    mut e: &Expr,
+    scopes: &[EvalRow],
+    schema: &Schema,
+    ctes: &CteStore,
+) -> usize {
+    while let Expr::Collate { expr, .. } = e {
+        e = expr;
+    }
+    match e {
+        Expr::RowValue(elems) => elems.len(),
+        Expr::Subquery(sub) => infer_select_stmt_meta(sub, scopes, schema, ctes).len().max(1),
+        _ => 1,
+    }
+}
+
+fn infer_row_value_elem_meta(
+    mut expr: &Expr,
+    n: usize,
+    scopes: &[EvalRow],
+    schema: &Schema,
+    ctes: &CteStore,
+) -> Vec<(Option<TypeAffinity>, Option<Collation>, bool)> {
+    let mut top_collate: Option<Collation> = None;
+    while let Expr::Collate {
+        expr: inner,
+        collation,
+    } = expr
+    {
+        if top_collate.is_none() {
+            top_collate = Some(Collation::from_name(collation).unwrap_or_default());
+        }
+        expr = inner;
+    }
+    match expr {
+        Expr::RowValue(elems) if elems.len() == n => elems
+            .iter()
+            .map(|el| {
+                let aff = infer_expr_affinity_in_scopes(el, scopes, schema, ctes);
+                let is_exp = matches!(el, Expr::Collate { .. });
+                let coll = infer_expr_explicit_or_col_collation(el, &[], scopes);
+                (aff, coll, is_exp)
+            })
+            .collect(),
+        Expr::Subquery(sub) => {
+            // Note: scalar/row-value `(SELECT ...)` propagates column affinities, NOT collations (`rowvalueA 6.1..6.10`)!
+            let sub_meta = infer_select_stmt_meta(sub, scopes, schema, ctes);
+            (0..n)
+                .map(|i| {
+                    let aff = sub_meta.get(i).and_then(|(a, _)| *a);
+                    let (coll, is_exp) = if n == 1 && top_collate.is_some() {
+                        (top_collate, true)
+                    } else {
+                        (None, false)
+                    };
+                    (aff, coll, is_exp)
+                })
+                .collect()
+        }
+        other if n == 1 => {
+            let aff = infer_expr_affinity_in_scopes(other, scopes, schema, ctes);
+            if let Some(tc) = top_collate {
+                vec![(aff, Some(tc), true)]
+            } else {
+                let coll = infer_expr_explicit_or_col_collation(other, &[], scopes);
+                vec![(aff, coll, false)]
+            }
+        }
+        _ => vec![(None, None, false); n],
+    }
+}
+
+fn combine_row_value_meta(
+    l_meta: &[(Option<TypeAffinity>, Option<Collation>, bool)],
+    r_meta: &[(Option<TypeAffinity>, Option<Collation>, bool)],
+) -> (Vec<TypeAffinity>, Vec<Collation>) {
+    let n = l_meta.len().max(r_meta.len());
+    let mut affs = Vec::with_capacity(n);
+    let mut colls = Vec::with_capacity(n);
+    for i in 0..n {
+        let (la, lc, le) = l_meta.get(i).copied().unwrap_or((None, None, false));
+        let (ra, rc, re) = r_meta.get(i).copied().unwrap_or((None, None, false));
+        affs.push(sqlite_compare_affinity(la, ra));
+        let c = if le {
+            lc.unwrap_or(Collation::Binary)
+        } else if re {
+            rc.unwrap_or(Collation::Binary)
+        } else {
+            lc.or(rc).unwrap_or(Collation::Binary)
+        };
+        colls.push(c);
+    }
+    (affs, colls)
+}
+
 fn compare_row_value_eq(
     lhs: &[Value],
     rhs: &[Value],
+    affs: &[TypeAffinity],
     colls: &[Collation],
     enc: TextEncoding,
 ) -> Option<bool> {
     let mut saw_null = false;
     for i in 0..lhs.len() {
+        let aff = affs.get(i).copied().unwrap_or(TypeAffinity::Blob);
         let coll = colls.get(i).copied().unwrap_or(Collation::Binary);
-        match eval_comparison_with_encoding(Opcode::Eq, &lhs[i], &rhs[i], coll, enc).truthiness() {
+        match eval_comparison_with_affinity(Opcode::Eq, &lhs[i], &rhs[i], aff, coll, enc)
+            .truthiness()
+        {
             Some(false) => return Some(false),
             None => saw_null = true,
             Some(true) => {}
@@ -3012,32 +4025,23 @@ fn eval_row_value_comparison(
     }
 
     let n = lv.len();
-    let mut colls = vec![Collation::Binary; n];
-    match (left, right) {
-        (Expr::RowValue(le), Expr::RowValue(re)) if le.len() == n && re.len() == n => {
-            for i in 0..n {
-                colls[i] = infer_comparison_collation(&le[i], &re[i], scopes);
-            }
-        }
-        _ if n == 1 => {
-            colls[0] = infer_comparison_collation(left, right, scopes);
-        }
-        _ => {}
-    }
+    let l_meta = infer_row_value_elem_meta(left, n, scopes, ctx.schema, ctes);
+    let r_meta = infer_row_value_elem_meta(right, n, scopes, ctx.schema, ctes);
+    let (affs, colls) = combine_row_value_meta(&l_meta, &r_meta);
     let enc = ctx.btree.encoding();
 
     match op {
-        BinaryOp::Eq => Ok(match compare_row_value_eq(&lv, &rv, &colls, enc) {
+        BinaryOp::Eq => Ok(match compare_row_value_eq(&lv, &rv, &affs, &colls, enc) {
             None => Value::Null,
             Some(b) => Value::Integer(i64::from(b)),
         }),
-        BinaryOp::Ne => Ok(match compare_row_value_eq(&lv, &rv, &colls, enc) {
+        BinaryOp::Ne => Ok(match compare_row_value_eq(&lv, &rv, &affs, &colls, enc) {
             None => Value::Null,
             Some(b) => Value::Integer(i64::from(!b)),
         }),
         BinaryOp::Is => {
             let all_eq = (0..n).all(|i| {
-                eval_comparison_with_encoding(Opcode::Is, &lv[i], &rv[i], colls[i], enc)
+                eval_comparison_with_affinity(Opcode::Is, &lv[i], &rv[i], affs[i], colls[i], enc)
                     .truthiness()
                     == Some(true)
             });
@@ -3045,7 +4049,7 @@ fn eval_row_value_comparison(
         }
         BinaryOp::IsNot => {
             let any_diff = (0..n).any(|i| {
-                eval_comparison_with_encoding(Opcode::Is, &lv[i], &rv[i], colls[i], enc)
+                eval_comparison_with_affinity(Opcode::Is, &lv[i], &rv[i], affs[i], colls[i], enc)
                     .truthiness()
                     != Some(true)
             });
@@ -3062,8 +4066,10 @@ fn eval_row_value_comparison(
                 if lv[i].is_null() || rv[i].is_null() {
                     return Ok(Value::Null);
                 }
-                if eval_comparison_with_encoding(Opcode::Eq, &lv[i], &rv[i], colls[i], enc)
-                    .truthiness()
+                if eval_comparison_with_affinity(
+                    Opcode::Eq, &lv[i], &rv[i], affs[i], colls[i], enc,
+                )
+                .truthiness()
                     == Some(true)
                 {
                     if i + 1 == n {
@@ -3071,8 +4077,8 @@ fn eval_row_value_comparison(
                     }
                     continue;
                 }
-                return Ok(eval_comparison_with_encoding(
-                    strict_op, &lv[i], &rv[i], colls[i], enc,
+                return Ok(eval_comparison_with_affinity(
+                    strict_op, &lv[i], &rv[i], affs[i], colls[i], enc,
                 ));
             }
             Ok(Value::Integer(i64::from(inclusive)))
@@ -3185,22 +4191,71 @@ fn decode_table_logical_row(
     params: &[Value],
 ) -> Result<Vec<Value>> {
     let enc = ctx.btree.encoding();
-    let mut vals = decode_record_with_encoding(payload, enc)?;
-    while vals.len() < tbl.columns.len() {
-        let missing_idx = vals.len();
-        let def_val = match &tbl.columns[missing_idx].default_expr {
-            Some(de) => eval_expr(ctx, de, params, &[], &CteStore::default(), None)?,
-            None => Value::Null,
-        };
-        vals.push(tbl.columns[missing_idx].affinity.apply(def_val));
+    let phys_vals = decode_record_with_encoding(payload, enc)?;
+    let has_virtual = tbl
+        .columns
+        .iter()
+        .any(|c| c.generated.as_ref().is_some_and(|(_, stored)| !*stored));
+
+    if !has_virtual {
+        let mut vals = phys_vals;
+        while vals.len() < tbl.columns.len() {
+            let missing_idx = vals.len();
+            let def_val = match &tbl.columns[missing_idx].default_expr {
+                Some(de) => eval_expr(ctx, de, params, &[], &CteStore::default(), None)?,
+                None => Value::Null,
+            };
+            vals.push(tbl.columns[missing_idx].affinity.apply(def_val));
+        }
+        vals.truncate(tbl.columns.len());
+        if let Some(ipk) = tbl.rowid_alias_col
+            && ipk < vals.len()
+        {
+            vals[ipk] = Value::Integer(rowid);
+        }
+        return Ok(vals);
     }
-    vals.truncate(tbl.columns.len());
-    if let Some(ipk) = tbl.rowid_alias_col
-        && ipk < vals.len()
-    {
-        vals[ipk] = Value::Integer(rowid);
+
+    let mut logical_vals = Vec::with_capacity(tbl.columns.len());
+    let mut phys_idx = 0usize;
+    for (ci, col) in tbl.columns.iter().enumerate() {
+        let is_virt = col.generated.as_ref().is_some_and(|(_, stored)| !*stored);
+        if is_virt {
+            logical_vals.push(Value::Null);
+        } else {
+            let v = if tbl.rowid_alias_col == Some(ci) {
+                phys_idx += 1;
+                Value::Integer(rowid)
+            } else if phys_idx < phys_vals.len() {
+                let pv = phys_vals[phys_idx].clone();
+                phys_idx += 1;
+                pv
+            } else {
+                let def_val = match &col.default_expr {
+                    Some(de) => eval_expr(ctx, de, params, &[], &CteStore::default(), None)?,
+                    None => Value::Null,
+                };
+                col.affinity.apply(def_val)
+            };
+            logical_vals.push(v);
+        }
     }
-    Ok(vals)
+
+    for ci in 0..tbl.columns.len() {
+        if let Some((ref gexpr, false)) = tbl.columns[ci].generated {
+            let scope = make_single_table_scope(tbl, None, rowid, &logical_vals);
+            let gv = eval_expr(ctx, gexpr, params, &[scope], &CteStore::default(), None)?;
+            let mut coerced = tbl.columns[ci].affinity.apply(gv);
+            if tbl.strict
+                && tbl.columns[ci].type_name.trim().eq_ignore_ascii_case("REAL")
+                && let Value::Integer(iv) = coerced
+            {
+                coerced = Value::real(iv as f64);
+            }
+            logical_vals[ci] = coerced;
+        }
+    }
+    Ok(logical_vals)
 }
 
 fn encode_table_physical_record(
@@ -3208,12 +4263,22 @@ fn encode_table_physical_record(
     logical_vals: &[Value],
     enc: TextEncoding,
 ) -> Vec<u8> {
-    let mut slots = logical_vals.to_vec();
-    // Per C SQLite `insert.c:1361`: put NULL in the INTEGER PRIMARY KEY slot of the on-disk record!
-    if let Some(ipk) = tbl.rowid_alias_col
-        && ipk < slots.len()
-    {
-        slots[ipk] = Value::Null;
+    let mut slots = Vec::with_capacity(logical_vals.len());
+    for (i, v) in logical_vals.iter().enumerate() {
+        let is_virt = tbl
+            .columns
+            .get(i)
+            .and_then(|c| c.generated.as_ref())
+            .is_some_and(|(_, stored)| !*stored);
+        if is_virt {
+            continue;
+        }
+        // Per C SQLite `insert.c:1361`: put NULL in the INTEGER PRIMARY KEY slot of the on-disk record!
+        if tbl.rowid_alias_col == Some(i) {
+            slots.push(Value::Null);
+        } else {
+            slots.push(v.clone());
+        }
     }
     encode_record_with_encoding(&slots, enc)
 }
@@ -3227,6 +4292,7 @@ fn make_single_table_scope(tbl: &TableSchema, alias: Option<&str>, rowid: i64, v
             table_alias: Some(eff.clone()),
             name: c.name.clone(),
             collation: c.collation,
+            affinity: Some(c.affinity),
             hidden_rowid: false,
             merged_using: false,
         })
@@ -3237,6 +4303,7 @@ fn make_single_table_scope(tbl: &TableSchema, alias: Option<&str>, rowid: i64, v
             table_alias: Some(eff),
             name: "rowid".to_owned(),
             collation: Collation::Binary,
+            affinity: Some(TypeAffinity::Integer),
             hidden_rowid: true,
             merged_using: false,
         });
@@ -3419,6 +4486,9 @@ fn validate_and_write_row(
     let rowid = final_rowid.unwrap();
 
     for (i, col) in tbl.columns.iter().enumerate() {
+        if col.generated.is_some() {
+            continue;
+        }
         if tbl.rowid_alias_col == Some(i) {
             raw_vals[i] = Value::Integer(rowid);
         } else {
@@ -3429,6 +4499,22 @@ fn validate_and_write_row(
             {
                 raw_vals[i] = Value::real(iv as f64);
             }
+        }
+    }
+
+    // Evaluate VIRTUAL and STORED generated columns in declaration order
+    for i in 0..tbl.columns.len() {
+        if let Some((ref gexpr, _)) = tbl.columns[i].generated {
+            let scope = make_single_table_scope(tbl, None, rowid, &raw_vals);
+            let gv = eval_expr(ctx, gexpr, params, &[scope], &CteStore::default(), None)?;
+            let mut coerced = tbl.columns[i].affinity.apply(gv);
+            if tbl.strict
+                && tbl.columns[i].type_name.trim().eq_ignore_ascii_case("REAL")
+                && let Value::Integer(iv) = coerced
+            {
+                coerced = Value::real(iv as f64);
+            }
+            raw_vals[i] = coerced;
         }
     }
 
@@ -3486,14 +4572,21 @@ fn validate_and_write_row(
         let eff = stmt_conflict.unwrap_or(ConflictAction::Abort);
         let scope = make_single_table_scope(tbl, None, rowid, &raw_vals);
         for chk in &tbl.checks {
-            let cv = eval_expr(ctx, chk, params, &[scope.clone()], &CteStore::default(), None)?;
+            let cv = eval_expr(
+                ctx,
+                &chk.expr,
+                params,
+                &[scope.clone()],
+                &CteStore::default(),
+                None,
+            )?;
             if cv.truthiness() == Some(false) {
                 if eff == ConflictAction::Ignore {
                     return Ok(None);
                 }
                 return Err(SqliteError::constraint(
                     extended::SQLITE_CONSTRAINT_CHECK,
-                    format!("CHECK constraint failed: {}", tbl.name),
+                    format!("CHECK constraint failed: {}", chk.label),
                 )
                 .with_conflict_effect(conflict_action_to_effect(eff)));
             }
@@ -3526,11 +4619,15 @@ fn validate_and_write_row(
                 }
             }
             _ => {
-                let col_label = tbl
-                    .rowid_alias_col
-                    .map_or("rowid", |ipk| tbl.columns[ipk].name.as_str());
+                let (ext_code, col_label) = match tbl.rowid_alias_col {
+                    Some(ipk) => (
+                        extended::SQLITE_CONSTRAINT_PRIMARYKEY,
+                        tbl.columns[ipk].name.as_str(),
+                    ),
+                    None => (extended::SQLITE_CONSTRAINT_ROWID, "rowid"),
+                };
                 return Err(SqliteError::constraint(
-                    extended::SQLITE_CONSTRAINT_PRIMARYKEY,
+                    ext_code,
                     format!("UNIQUE constraint failed: {}.{}", tbl.name, col_label),
                 )
                 .with_conflict_effect(conflict_action_to_effect(eff)));
@@ -4409,11 +5506,17 @@ fn exec_insert(
     let indexes = ctx.schema.indexes_for_table(&tbl.name);
     let dml_ctes = CteStore::default().with_scope(&ins.ctes);
 
-    // Resolve target column mapping (`None` = all columns in order; `Some(names)` = mapped columns, `usize::MAX` for implicit `rowid`)
+    // Resolve target column mapping (`None` = all non-generated columns in order; `Some(names)` = mapped columns, `usize::MAX` for implicit `rowid`)
     let col_targets: Option<Vec<usize>> = if let Some(ref cnames) = ins.columns {
         let mut idxs = Vec::with_capacity(cnames.len());
         for cn in cnames {
-            if let Some((ci, _)) = tbl.find_column(cn) {
+            if let Some((ci, col)) = tbl.find_column(cn) {
+                if col.generated.is_some() {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("cannot INSERT into generated column \"{}\"", col.name),
+                    ));
+                }
                 idxs.push(ci);
             } else if tbl.is_implicit_rowid_name(cn) {
                 idxs.push(usize::MAX);
@@ -4428,6 +5531,13 @@ fn exec_insert(
     } else {
         None
     };
+    let implicit_non_gen_cols: Vec<usize> = tbl
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.generated.is_none())
+        .map(|(i, _)| i)
+        .collect();
 
     // Materialize input value rows BEFORE mutating target table (handles `INSERT INTO t SELECT * FROM t` safely!)
     let source_value_rows: Vec<Vec<Value>> = match &ins.source {
@@ -4495,18 +5605,20 @@ fn exec_insert(
                 }
             }
         } else {
-            if src_row.len() != tbl.columns.len() {
+            if src_row.len() != implicit_non_gen_cols.len() {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!(
                         "table {} has {} columns but {} values were supplied",
                         tbl.name,
-                        tbl.columns.len(),
+                        implicit_non_gen_cols.len(),
                         src_row.len()
                     ),
                 ));
             }
-            col_vals = src_row;
+            for (&ci, val) in implicit_non_gen_cols.iter().zip(src_row.into_iter()) {
+                col_vals[ci] = val;
+            }
         }
 
         let write_res = validate_and_write_row(
@@ -4590,7 +5702,13 @@ fn exec_update(
     // Resolve assignment target columns (`usize::MAX` = implicit `rowid`)
     let mut resolved_assigns = Vec::with_capacity(upd.assignments.len());
     for (cname, expr) in &upd.assignments {
-        if let Some((ci, _)) = tbl.find_column(cname) {
+        if let Some((ci, col)) = tbl.find_column(cname) {
+            if col.generated.is_some() {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("cannot UPDATE generated column \"{}\"", col.name),
+                ));
+            }
             resolved_assigns.push((ci, expr));
         } else if tbl.is_implicit_rowid_name(cname) {
             resolved_assigns.push((usize::MAX, expr));
@@ -4606,6 +5724,7 @@ fn exec_update(
         ctx,
         &tbl,
         upd.alias.as_deref(),
+        upd.indexed_by.as_ref(),
         upd.selection.as_ref(),
         params,
         &[],
@@ -4756,7 +5875,11 @@ fn exec_delete(
     let dml_ctes = CteStore::default().with_scope(&del.ctes);
 
     // Fast path (`OP_Clear`) for unconditional `DELETE FROM tbl` without `RETURNING` when no FKs reference `tbl`!
-    if del.selection.is_none() && del.returning.is_empty() && !*ctx.foreign_keys {
+    if del.selection.is_none()
+        && del.returning.is_empty()
+        && !*ctx.foreign_keys
+        && del.indexed_by.is_none()
+    {
         let count = ctx.btree.scan_table(tbl.root_pgno)?.len() as u64;
         ctx.btree.clear_tree(tbl.root_pgno)?;
         for idx in &indexes {
@@ -4771,6 +5894,7 @@ fn exec_delete(
         ctx,
         &tbl,
         del.alias.as_deref(),
+        del.indexed_by.as_ref(),
         del.selection.as_ref(),
         params,
         &[],
@@ -4909,6 +6033,115 @@ fn exec_create_table(ctx: &mut ExecContext<'_>, ct: &CreateTableStmt) -> Result<
     }
 
     *ctx.schema = Schema::load(ctx.btree)?;
+    Ok(())
+}
+
+fn exec_create_table_as(
+    ctx: &mut ExecContext<'_>,
+    if_not_exists: bool,
+    name: &str,
+    query: &SelectStmt,
+    params: &[Value],
+) -> Result<()> {
+    if name.len() >= 7 && name[..7].eq_ignore_ascii_case("sqlite_") {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("object name reserved for internal use: {name}"),
+        ));
+    }
+    if ctx.schema.find_user_table(name).is_some() || ctx.schema.find_index(name).is_some() {
+        if if_not_exists {
+            return Ok(());
+        }
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("table {name} already exists"),
+        ));
+    }
+
+    let meta = infer_select_stmt_meta(query, &[], ctx.schema, &CteStore::default());
+    let q_out = exec_select(ctx, query, params, &[], &CteStore::default())?;
+
+    let mut dedup_names: Vec<String> = Vec::with_capacity(q_out.column_names.len());
+    for raw_cn in &q_out.column_names {
+        if !dedup_names
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(raw_cn))
+        {
+            dedup_names.push(raw_cn.clone());
+        } else {
+            let mut k = 1usize;
+            loop {
+                let candidate = format!("{raw_cn}:{k}");
+                if !dedup_names
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(&candidate))
+                {
+                    dedup_names.push(candidate);
+                    break;
+                }
+                k += 1;
+            }
+        }
+    }
+
+    let mut columns = Vec::with_capacity(dedup_names.len());
+    let mut rendered_cols = Vec::with_capacity(dedup_names.len());
+    for (i, cname) in dedup_names.into_iter().enumerate() {
+        let aff = meta.get(i).and_then(|(a, _)| *a);
+        let type_str = match aff {
+            Some(TypeAffinity::Integer) => "INT",
+            Some(TypeAffinity::Text) => "TEXT",
+            Some(TypeAffinity::Real) => "REAL",
+            Some(TypeAffinity::Numeric) => "NUM",
+            Some(TypeAffinity::Blob) | None => "",
+        };
+        let cdef = ColumnDef {
+            name: cname,
+            type_name: type_str.to_owned(),
+            constraints: Vec::new(),
+        };
+        rendered_cols.push(render_column_def_sql(&cdef));
+        columns.push(cdef);
+    }
+
+    let raw_sql = format!(
+        "CREATE TABLE {}({})",
+        format_replacement_ident("", name),
+        rendered_cols.join(",")
+    );
+    let ct = CreateTableStmt {
+        temp: false,
+        if_not_exists: false,
+        name: name.to_owned(),
+        columns,
+        constraints: Vec::new(),
+        without_rowid: false,
+        strict: false,
+        raw_sql,
+    };
+    exec_create_table(ctx, &ct)?;
+
+    let Some(tbl) = ctx.schema.find_user_table(name).cloned() else {
+        return Ok(());
+    };
+    let mut stmt_fk_suspects = Vec::new();
+    for row in q_out.rows {
+        validate_and_write_row(
+            ctx,
+            &tbl,
+            &[],
+            None,
+            row,
+            None,
+            None,
+            params,
+            false,
+            false,
+            &mut stmt_fk_suspects,
+            0,
+        )?;
+    }
     Ok(())
 }
 
@@ -5328,6 +6561,16 @@ fn exec_alter_table(
                 ));
             }
             let validated = build_column_schema_from_def(cdef)?;
+            if validated
+                .generated
+                .as_ref()
+                .is_some_and(|(_, stored)| *stored)
+            {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    "cannot add a STORED column",
+                ));
+            }
             let has_fk = cdef
                 .constraints
                 .iter()
@@ -5975,8 +7218,24 @@ fn render_column_def_sql(cdef: &sqliters_syntax::ColumnDef) -> String {
             sqliters_syntax::ColumnConstraint::Default(e) => {
                 parts.push(format!("DEFAULT ({})", expr_column_label(e)));
             }
-            sqliters_syntax::ColumnConstraint::Check(e) => {
-                parts.push(format!("CHECK ({})", expr_column_label(e)));
+            sqliters_syntax::ColumnConstraint::Check {
+                name, expr_sql, ..
+            } => {
+                if let Some(n) = name {
+                    parts.push(format!(
+                        "CONSTRAINT {} CHECK ({expr_sql})",
+                        format_replacement_ident("", n)
+                    ));
+                } else {
+                    parts.push(format!("CHECK ({expr_sql})"));
+                }
+            }
+            sqliters_syntax::ColumnConstraint::Generated { expr, stored } => {
+                parts.push(format!(
+                    "GENERATED ALWAYS AS ({}) {}",
+                    expr_column_label(expr),
+                    if *stored { "STORED" } else { "VIRTUAL" }
+                ));
             }
             sqliters_syntax::ColumnConstraint::Collate(c) => parts.push(format!("COLLATE {c}")),
             sqliters_syntax::ColumnConstraint::ForeignKey {

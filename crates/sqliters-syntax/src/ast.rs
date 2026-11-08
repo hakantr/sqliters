@@ -16,6 +16,11 @@ pub enum Stmt {
     Savepoint(String),
     Release(String),
     CreateTable(CreateTableStmt),
+    CreateTableAs {
+        if_not_exists: bool,
+        name: String,
+        query: Box<SelectStmt>,
+    },
     DropTable {
         if_exists: bool,
         name: String,
@@ -118,7 +123,15 @@ pub enum ColumnConstraint {
         conflict: ConflictAction,
     },
     Default(Expr),
-    Check(Expr),
+    Check {
+        name: Option<String>,
+        expr_sql: String,
+        expr: Expr,
+    },
+    Generated {
+        expr: Expr,
+        stored: bool,
+    },
     Collate(String),
     ForeignKey {
         ref_table: String,
@@ -139,7 +152,11 @@ pub enum TableConstraint {
         columns: Vec<IndexedColumn>,
         conflict: ConflictAction,
     },
-    Check(Expr),
+    Check {
+        name: Option<String>,
+        expr_sql: String,
+        expr: Expr,
+    },
     ForeignKey {
         columns: Vec<String>,
         ref_table: String,
@@ -194,12 +211,19 @@ pub enum InsertSource {
     DefaultValues,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexHint {
+    IndexedBy(String),
+    NotIndexed,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateStmt {
     pub ctes: Vec<CommonTableExpr>,
     pub or_conflict: Option<ConflictAction>,
     pub table: String,
     pub alias: Option<String>,
+    pub indexed_by: Option<IndexHint>,
     pub assignments: Vec<(String, Expr)>,
     pub selection: Option<Expr>,
     pub returning: Vec<ResultColumn>,
@@ -210,6 +234,7 @@ pub struct DeleteStmt {
     pub ctes: Vec<CommonTableExpr>,
     pub table: String,
     pub alias: Option<String>,
+    pub indexed_by: Option<IndexHint>,
     pub selection: Option<Expr>,
     pub returning: Vec<ResultColumn>,
 }
@@ -296,6 +321,7 @@ pub enum TableOrSubquery {
     Table {
         name: String,
         alias: Option<String>,
+        indexed_by: Option<IndexHint>,
     },
     Subquery {
         query: Box<SelectStmt>,

@@ -688,7 +688,7 @@ fn infer_tos_columns(
     ctes: &[(String, Vec<String>)],
 ) -> Vec<(Option<String>, String)> {
     match tos {
-        TableOrSubquery::Table { name, alias } => {
+        TableOrSubquery::Table { name, alias, .. } => {
             let eff = alias.clone().unwrap_or_else(|| name.clone());
             if let Some((_, cte_cols)) = ctes.iter().rev().find(|(n, _)| n.eq_ignore_ascii_case(name))
             {
@@ -833,6 +833,7 @@ fn collect_stmt_params(
     match stmt {
         Stmt::Explain { stmt: inner, .. } => collect_stmt_params(inner, max_idx, named),
         Stmt::Select(sel) => collect_select_params(sel, max_idx, named),
+        Stmt::CreateTableAs { query, .. } => collect_select_params(query, max_idx, named),
         Stmt::Insert(ins) => {
             for cte in &ins.ctes {
                 collect_select_params(&cte.query, max_idx, named);

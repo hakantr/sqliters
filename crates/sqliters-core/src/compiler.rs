@@ -7,9 +7,11 @@ use sqliters_syntax::{
     TableOrSubquery, UnaryOp, UpdateStmt,
 };
 use sqliters_types::{
-    Collation, ErrorCode, KeySortOrder, Result, SqliteError, Value,
+    Collation, ErrorCode, KeySortOrder, Result, SqliteError, TypeAffinity, Value,
 };
-use sqliters_vdbe::{AggregateKind, Instruction, Opcode, P4, VdbeProgram};
+use sqliters_vdbe::{
+    AggregateKind, Instruction, Opcode, P4, VdbeProgram, affinity_to_p5, sqlite_compare_affinity,
+};
 
 use crate::schema::{IndexSchema, Schema, TableSchema};
 
@@ -103,7 +105,14 @@ pub fn choose_access_plan(
             let matched = conjuncts.iter().find_map(|conj| {
                 let (cname, rhs) = extract_table_col_eq(conj, tbl, alias)?;
                 if cname.eq_ignore_ascii_case(&ic.name) {
-                    Some(rhs)
+                    let idx_aff = tbl.columns[ci].affinity;
+                    let rhs_aff = compiler_expr_affinity(&rhs, Some(tbl), alias);
+                    let comp_aff = sqlite_compare_affinity(Some(idx_aff), rhs_aff);
+                    if index_affinity_ok(comp_aff, idx_aff) {
+                        Some(rhs)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -525,15 +534,26 @@ pub fn try_compile_select(stmt: &SelectStmt, schema: &Schema) -> Result<Option<V
             Ok(Some(prog))
         }
         Some(FromClause { head, joins }) if joins.is_empty() => {
-            let TableOrSubquery::Table { name, alias } = head else {
+            let TableOrSubquery::Table {
+                name,
+                alias,
+                indexed_by,
+            } = head
+            else {
                 return Ok(None);
             };
+            if indexed_by.is_some() {
+                return Ok(None);
+            }
             let Some(tbl) = schema.find_table(name) else {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!("no such table: {name}"),
                 ));
             };
+            if tbl.columns.iter().any(|c| c.generated.is_some()) {
+                return Ok(None);
+            }
             let prog = compile_single_table_select(
                 &tbl,
                 alias.as_deref(),
@@ -1169,7 +1189,20 @@ fn compile_expr(
                     | Opcode::IsNot
             ) {
                 let coll = resolve_binary_collation(left, right, binding);
-                ins = ins.with_p4(P4::Collation(coll));
+                let l_aff = compiler_expr_affinity(
+                    left,
+                    binding.map(|b| b.tbl),
+                    binding.and_then(|b| b.alias),
+                );
+                let r_aff = compiler_expr_affinity(
+                    right,
+                    binding.map(|b| b.tbl),
+                    binding.and_then(|b| b.alias),
+                );
+                let comp_aff = sqlite_compare_affinity(l_aff, r_aff);
+                ins = ins
+                    .with_p4(P4::Collation(coll))
+                    .with_p5(u16::from(affinity_to_p5(comp_aff)));
             }
             prog.emit(ins);
         }
@@ -1325,7 +1358,24 @@ fn compile_expr(
                 if let Some(base_r) = op_reg {
                     let w_reg = prog.alloc_register();
                     compile_expr(prog, when_e, binding, w_reg)?;
-                    prog.emit(Instruction::new(Opcode::Eq, base_r, w_reg, cond_reg));
+                    let op_e = operand.as_ref().unwrap();
+                    let coll = resolve_binary_collation(op_e, when_e, binding);
+                    let l_aff = compiler_expr_affinity(
+                        op_e,
+                        binding.map(|b| b.tbl),
+                        binding.and_then(|b| b.alias),
+                    );
+                    let r_aff = compiler_expr_affinity(
+                        when_e,
+                        binding.map(|b| b.tbl),
+                        binding.and_then(|b| b.alias),
+                    );
+                    let comp_aff = sqlite_compare_affinity(l_aff, r_aff);
+                    prog.emit(
+                        Instruction::new(Opcode::Eq, base_r, w_reg, cond_reg)
+                            .with_p4(P4::Collation(coll))
+                            .with_p5(u16::from(affinity_to_p5(comp_aff))),
+                    );
                 } else {
                     compile_expr(prog, when_e, binding, cond_reg)?;
                 }
@@ -1393,6 +1443,45 @@ fn resolve_binary_collation(
         }
     }
     Collation::Binary
+}
+
+pub const fn index_affinity_ok(comp_aff: TypeAffinity, idx_aff: TypeAffinity) -> bool {
+    match comp_aff {
+        TypeAffinity::Blob => true,
+        TypeAffinity::Text => matches!(idx_aff, TypeAffinity::Text),
+        TypeAffinity::Numeric | TypeAffinity::Integer | TypeAffinity::Real => matches!(
+            idx_aff,
+            TypeAffinity::Numeric | TypeAffinity::Integer | TypeAffinity::Real
+        ),
+    }
+}
+
+fn compiler_expr_affinity(
+    expr: &Expr,
+    tbl: Option<&TableSchema>,
+    alias: Option<&str>,
+) -> Option<TypeAffinity> {
+    match expr {
+        Expr::Collate { expr: inner, .. } => compiler_expr_affinity(inner, tbl, alias),
+        Expr::Cast { type_name, .. } => Some(TypeAffinity::from_declared_type(type_name)),
+        Expr::Column { table, column } => {
+            let t = tbl?;
+            if let Some(qual) = table {
+                let expected = alias.unwrap_or(&t.name);
+                if !qual.eq_ignore_ascii_case(expected) {
+                    return None;
+                }
+            }
+            if let Some((_, c)) = t.find_column(column) {
+                Some(c.affinity)
+            } else if t.is_implicit_rowid_name(column) {
+                Some(TypeAffinity::Integer)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 // ============================================================================
@@ -1599,21 +1688,21 @@ pub fn explain_query_plan(stmt: &Stmt, schema: &Schema) -> Result<Vec<Vec<Value>
             } = &sel.body.head
             {
                 if fc.joins.is_empty()
-                    && let TableOrSubquery::Table { name, alias } = &fc.head
+                    && let TableOrSubquery::Table { name, alias, .. } = &fc.head
                     && let Some(tbl) = schema.find_table(name)
                 {
                     let plan = choose_access_plan(&tbl, alias.as_deref(), selection.as_ref(), schema);
                     let disp = alias.as_deref().unwrap_or(&tbl.name);
                     push_detail(plan.explain_detail(disp));
                 } else {
-                    if let TableOrSubquery::Table { name, alias } = &fc.head {
+                    if let TableOrSubquery::Table { name, alias, .. } = &fc.head {
                         push_detail(format!("SCAN {}", alias.as_deref().unwrap_or(name)));
                     } else {
                         push_detail("SCAN SUBQUERY".to_owned());
                     }
                     for j in &fc.joins {
                         match &j.right {
-                            TableOrSubquery::Table { name, alias } => {
+                            TableOrSubquery::Table { name, alias, .. } => {
                                 push_detail(format!("SCAN {}", alias.as_deref().unwrap_or(name)));
                             }
                             TableOrSubquery::Subquery { .. } => {

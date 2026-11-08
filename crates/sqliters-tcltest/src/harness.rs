@@ -32,13 +32,14 @@ pub struct TestFileReport {
     pub passed: usize,
     pub failed: Vec<SubtestFailure>,
     pub script_error: Option<String>,
+    pub finished: bool,
 }
 
 impl TestFileReport {
     pub fn is_ok(&self) -> bool {
         self.failed.is_empty()
             && self.script_error.is_none()
-            && (self.passed > 0 || self.file_name == "whereJ")
+            && (self.passed > 0 || self.finished)
     }
 
     pub fn total_cases(&self) -> usize {
@@ -104,6 +105,7 @@ impl SqliteTestHost {
                 passed: 0,
                 failed: Vec::new(),
                 script_error: None,
+                finished: false,
             },
             sqlite_test_dir,
             prng_state: 0x1234_5678_9abc_def0,
@@ -293,7 +295,10 @@ pub fn invoke_host_cmd(
                 .map(|b| if b { "1" } else { "0" }.to_string()),
         ),
         "reset_db" => Some(cmd_reset_db(host, interp)),
-        "finish_test" => Some(Err(TclControl::FinishTest)),
+        "finish_test" => {
+            host.borrow_mut().report.finished = true;
+            Some(Err(TclControl::FinishTest))
+        }
         "sqlite_complete" | "sqlite3_complete" => {
             let sql = args.first().map_or("", String::as_str);
             Some(Ok(
@@ -1549,9 +1554,12 @@ proc db_delete_and_reopen {{file test.db}} {
 }
 
 proc drop_all_tables {{db db}} {
+  set pk [$db one {PRAGMA foreign_keys}]
+  $db eval {PRAGMA foreign_keys = OFF}
   foreach tbl [$db eval {SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'}] {
     $db eval "DROP TABLE \"$tbl\""
   }
+  $db eval "PRAGMA foreign_keys = $pk"
 }
 
 proc delete_all_data {} {

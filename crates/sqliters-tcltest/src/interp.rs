@@ -1279,11 +1279,15 @@ impl TclInterp {
         let mut do_cmds = true;
         let mut i = 0;
         while i + 1 < args.len() && args[i].starts_with('-') {
-            match args[i].as_str() {
-                "-nobackslashes" => do_bs = false,
-                "-novariables" => do_vars = false,
-                "-nocommands" => do_cmds = false,
-                _ => break,
+            let opt = args[i].as_str();
+            if opt.len() >= 4 && "-nobackslashes".starts_with(opt) {
+                do_bs = false;
+            } else if opt.len() >= 4 && "-novariables".starts_with(opt) {
+                do_vars = false;
+            } else if opt.len() >= 4 && "-nocommands".starts_with(opt) {
+                do_cmds = false;
+            } else {
+                break;
             }
             i += 1;
         }

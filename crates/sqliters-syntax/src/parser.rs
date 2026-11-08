@@ -115,10 +115,7 @@ impl<'a> Parser<'a> {
             self.advance();
             Ok(tok)
         } else {
-            Err(self.syntax_err_at(
-                tok,
-                format!("near \"{}\": syntax error (expected {kind:?})", tok.text),
-            ))
+            Err(self.syntax_err_at(tok, format!("near \"{}\": syntax error", tok.text)))
         }
     }
 
@@ -133,10 +130,7 @@ impl<'a> Parser<'a> {
             self.advance();
             Ok(dequote(tok.text))
         } else {
-            Err(self.syntax_err_at(
-                tok,
-                format!("near \"{}\": syntax error (expected identifier)", tok.text),
-            ))
+            Err(self.syntax_err_at(tok, format!("near \"{}\": syntax error", tok.text)))
         }
     }
 
@@ -360,6 +354,20 @@ impl<'a> Parser<'a> {
                 false
             };
             let (_schema, name) = self.parse_qualified_name()?;
+            if self.eat(TokenKind::As) {
+                if temp {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "TEMP tables are not yet supported",
+                    ));
+                }
+                let query = self.parse_select_stmt()?;
+                return Ok(Stmt::CreateTableAs {
+                    if_not_exists,
+                    name,
+                    query: Box::new(query),
+                });
+            }
             self.expect(TokenKind::Lp)?;
 
             let mut columns = Vec::new();
@@ -494,9 +502,11 @@ impl<'a> Parser<'a> {
         let type_name = type_parts.join(" ");
         let mut constraints = Vec::new();
         while self.is_column_constraint_start() || self.at(TokenKind::Null) {
-            if self.eat(TokenKind::Constraint) {
-                let _ = self.parse_ident()?;
-            }
+            let cname = if self.eat(TokenKind::Constraint) {
+                Some(self.parse_ident()?)
+            } else {
+                None
+            };
             if self.eat(TokenKind::Primary) {
                 self.expect(TokenKind::Key)?;
                 let mut desc = false;
@@ -523,9 +533,42 @@ impl<'a> Parser<'a> {
                 constraints.push(ColumnConstraint::Unique { conflict });
             } else if self.eat(TokenKind::Check) {
                 self.expect(TokenKind::Lp)?;
+                let expr_start = self.peek().offset;
+                let e = self.parse_expr()?;
+                let expr_end = self.peek().offset;
+                let expr_sql = self.sql[expr_start..expr_end].trim().to_owned();
+                self.expect(TokenKind::Rp)?;
+                constraints.push(ColumnConstraint::Check {
+                    name: cname,
+                    expr_sql,
+                    expr: e,
+                });
+            } else if self.eat(TokenKind::Generated) {
+                self.expect(TokenKind::Always)?;
+                self.expect(TokenKind::As)?;
+                self.expect(TokenKind::Lp)?;
                 let e = self.parse_expr()?;
                 self.expect(TokenKind::Rp)?;
-                constraints.push(ColumnConstraint::Check(e));
+                let mut stored = false;
+                if self.eat(TokenKind::Virtual) {
+                    stored = false;
+                } else if self.peek().text.eq_ignore_ascii_case("STORED") {
+                    self.advance();
+                    stored = true;
+                }
+                constraints.push(ColumnConstraint::Generated { expr: e, stored });
+            } else if self.eat(TokenKind::As) {
+                self.expect(TokenKind::Lp)?;
+                let e = self.parse_expr()?;
+                self.expect(TokenKind::Rp)?;
+                let mut stored = false;
+                if self.eat(TokenKind::Virtual) {
+                    stored = false;
+                } else if self.peek().text.eq_ignore_ascii_case("STORED") {
+                    self.advance();
+                    stored = true;
+                }
+                constraints.push(ColumnConstraint::Generated { expr: e, stored });
             } else if self.eat(TokenKind::Default) {
                 let expr = if self.eat(TokenKind::Lp) {
                     let e = self.parse_expr()?;
@@ -592,13 +635,17 @@ impl<'a> Parser<'a> {
                 | TokenKind::Default
                 | TokenKind::Collate
                 | TokenKind::References
+                | TokenKind::Generated
+                | TokenKind::As
         )
     }
 
     fn parse_table_constraint(&mut self) -> Result<TableConstraint> {
-        if self.eat(TokenKind::Constraint) {
-            let _ = self.parse_ident()?;
-        }
+        let cname = if self.eat(TokenKind::Constraint) {
+            Some(self.parse_ident()?)
+        } else {
+            None
+        };
         if self.eat(TokenKind::Primary) {
             self.expect(TokenKind::Key)?;
             self.expect(TokenKind::Lp)?;
@@ -626,9 +673,18 @@ impl<'a> Parser<'a> {
             Ok(TableConstraint::Unique { columns, conflict })
         } else if self.eat(TokenKind::Check) {
             self.expect(TokenKind::Lp)?;
+            let expr_start = self.peek().offset;
             let expr = self.parse_expr()?;
+            let expr_end = self.peek().offset;
+            let expr_sql = self.sql[expr_start..expr_end].trim().to_owned();
             self.expect(TokenKind::Rp)?;
-            Ok(TableConstraint::Check(expr))
+            // SQLite legacy quirk (`conflict-16.2`): ON CONFLICT is allowed on table CHECK constraints (ignored)
+            let _ = self.parse_optional_on_conflict()?;
+            Ok(TableConstraint::Check {
+                name: cname,
+                expr_sql,
+                expr,
+            })
         } else if self.eat(TokenKind::Foreign) {
             self.expect(TokenKind::Key)?;
             self.expect(TokenKind::Lp)?;
@@ -1006,6 +1062,7 @@ impl<'a> Parser<'a> {
         };
         let (_schema, table) = self.parse_qualified_name()?;
         let alias = self.parse_optional_table_alias(&[TokenKind::Set])?;
+        let indexed_by = self.parse_optional_index_hint()?;
         self.expect(TokenKind::Set)?;
 
         let mut assignments = Vec::new();
@@ -1031,6 +1088,7 @@ impl<'a> Parser<'a> {
             or_conflict,
             table,
             alias,
+            indexed_by,
             assignments,
             selection,
             returning,
@@ -1042,6 +1100,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::From)?;
         let (_schema, table) = self.parse_qualified_name()?;
         let alias = self.parse_optional_table_alias(&[TokenKind::Where, TokenKind::Returning])?;
+        let indexed_by = self.parse_optional_index_hint()?;
         let selection = if self.eat(TokenKind::Where) {
             Some(self.parse_expr()?)
         } else {
@@ -1052,6 +1111,7 @@ impl<'a> Parser<'a> {
             ctes,
             table,
             alias,
+            indexed_by,
             selection,
             returning,
         })
@@ -1437,7 +1497,25 @@ impl<'a> Parser<'a> {
 
         let (_schema, name) = self.parse_qualified_name()?;
         let alias = self.parse_optional_table_alias(&[])?;
-        Ok(TableOrSubquery::Table { name, alias })
+        let indexed_by = self.parse_optional_index_hint()?;
+        Ok(TableOrSubquery::Table {
+            name,
+            alias,
+            indexed_by,
+        })
+    }
+
+    fn parse_optional_index_hint(&mut self) -> Result<Option<IndexHint>> {
+        if self.eat(TokenKind::Indexed) {
+            self.expect(TokenKind::By)?;
+            Ok(Some(IndexHint::IndexedBy(self.parse_ident()?)))
+        } else if self.at(TokenKind::Not) && self.peek_n(1).kind == TokenKind::Indexed {
+            self.advance();
+            self.advance();
+            Ok(Some(IndexHint::NotIndexed))
+        } else {
+            Ok(None)
+        }
     }
 
     fn parse_optional_table_alias(&mut self, stop_tokens: &[TokenKind]) -> Result<Option<String>> {
@@ -1682,6 +1760,7 @@ impl<'a> Parser<'a> {
                                             head: TableOrSubquery::Table {
                                                 name: tbl_name,
                                                 alias: None,
+                                                indexed_by: None,
                                             },
                                             joins: Vec::new(),
                                         }),
@@ -2037,7 +2116,7 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.syntax_err_at(
                 tok,
-                format!("near \"{}\": syntax error in expression", tok.text),
+                format!("near \"{}\": syntax error", tok.text),
             )),
         }
     }
