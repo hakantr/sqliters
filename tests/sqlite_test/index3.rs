@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "4/11 subtests passed; pending: EQP/optimizer"]
 fn test_index3() {
-    sqliters_tcltest::run_test_script("index3", r#"
+    sqliters_tcltest::run_test_script(
+        "index3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test index3-1.1 {
@@ -62,5 +64,6 @@ do_test index3-99.1 {
   catchsql { DROP INDEX t1c }
 } {1 {malformed database schema (t1d)}}
 finish_test
-"#);
+"#,
+    );
 }

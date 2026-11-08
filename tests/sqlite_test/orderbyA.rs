@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "80/98 subtests passed; pending: EQP/optimizer"]
 fn test_orderbyA() {
-    sqliters_tcltest::run_test_script("orderbyA", r#"
+    sqliters_tcltest::run_test_script(
+        "orderbyA",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix orderbyA
@@ -120,5 +122,6 @@ foreach {tn idx} {
   } $nSort { 2 one 27  2 two 30  1 one 9  1 two 12  {} one 45 {} two 48 }
 }
 finish_test
-"#);
+"#,
+    );
 }

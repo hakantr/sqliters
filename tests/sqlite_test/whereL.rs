@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "15/27 subtests passed; pending: VIEW, EQP/optimizer"]
 fn test_whereL() {
-    sqliters_tcltest::run_test_script("whereL", r#"
+    sqliters_tcltest::run_test_script(
+        "whereL",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix whereL
@@ -225,5 +227,6 @@ do_execsql_test 950 {
     LEFT JOIN t1 ON ((subQuery.col_0) == (false)) WHERE t1.c0;
 } {0.0 {} 1 0.0 {} 1}
 finish_test
-"#);
+"#,
+    );
 }

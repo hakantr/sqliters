@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "15/25 subtests passed; pending: TRIGGER"]
 fn test_conflict4() {
-    sqliters_tcltest::run_test_script("conflict4", r#"
+    sqliters_tcltest::run_test_script(
+        "conflict4",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix conflict4
@@ -129,5 +131,6 @@ do_execsql_test 3.3 {
   SELECT * FROM t1 ORDER BY +a;
 } {ok 100 abcde}
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "51/64 subtests passed; pending: ATTACH, VIRTUAL TABLE"]
 fn test_fkey5() {
-    sqliters_tcltest::run_test_script("fkey5", r#"
+    sqliters_tcltest::run_test_script(
+        "fkey5",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix fkey5
@@ -416,5 +418,6 @@ ifcapable vtab {
   } {t1 9 t2 0 | t3 2 t1 0 |}
 }
 finish_test
-"#);
+"#,
+    );
 }

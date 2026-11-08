@@ -7,6 +7,7 @@ license.workspace = true
 
 [lints.rust]
 unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
 
 [dependencies]
 sqliters-types = { path = "../sqliters-types" }

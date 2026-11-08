@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "25/37 subtests passed; pending: lock5 edge cases"]
 fn test_lock5() {
-    sqliters_tcltest::run_test_script("lock5", r#"
+    sqliters_tcltest::run_test_script(
+        "lock5",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix lock5
@@ -266,5 +268,6 @@ if {[permutation]!="inmemory_journal"} {
   } {0 1000}
 }
 finish_test
-"#);
+"#,
+    );
 }

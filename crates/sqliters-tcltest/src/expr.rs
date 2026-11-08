@@ -248,7 +248,10 @@ impl<'a> ExprParser<'a> {
             let b = self.bytes[self.pos];
             if b.is_ascii_whitespace() {
                 self.pos += 1;
-            } else if b == b'\\' && self.pos + 1 < self.bytes.len() && self.bytes[self.pos + 1] == b'\n' {
+            } else if b == b'\\'
+                && self.pos + 1 < self.bytes.len()
+                && self.bytes[self.pos + 1] == b'\n'
+            {
                 self.pos += 2;
             } else {
                 break;
@@ -439,8 +442,8 @@ impl<'a> ExprParser<'a> {
                     "ne" => left.to_tcl_string() != right.to_tcl_string(),
                     "in" | "ni" => {
                         let needle = left.to_tcl_string();
-                        let haystack = parse_list(&right.to_tcl_string())
-                            .map_err(|e| self.err(e))?;
+                        let haystack =
+                            parse_list(&right.to_tcl_string()).map_err(|e| self.err(e))?;
                         let found = haystack.iter().any(|x| x == &needle);
                         if op == "in" { found } else { !found }
                     }
@@ -477,13 +480,19 @@ impl<'a> ExprParser<'a> {
             let right = self.parse_shift(eval)?;
             if eval {
                 let ord = cmp_tcl_vals(&left, &right);
-                let res = match (op, ord) {
-                    ("<", Some(std::cmp::Ordering::Less)) => true,
-                    ("<=", Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)) => true,
-                    (">", Some(std::cmp::Ordering::Greater)) => true,
-                    (">=", Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)) => true,
-                    _ => false,
-                };
+                let res = matches!(
+                    (op, ord),
+                    ("<", Some(std::cmp::Ordering::Less))
+                        | (
+                            "<=",
+                            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                        )
+                        | (">", Some(std::cmp::Ordering::Greater))
+                        | (
+                            ">=",
+                            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+                        )
+                );
                 left = ExprVal::Int(i128::from(res));
             }
         }
@@ -581,7 +590,7 @@ impl<'a> ExprParser<'a> {
                     .coerce_numeric()
                     .ok_or_else(|| self.err("non-numeric operand to **"))?;
                 match (b_num, e_num) {
-                    (ExprVal::Int(bi), ExprVal::Int(ei)) if ei >= 0 && ei <= 62 => {
+                    (ExprVal::Int(bi), ExprVal::Int(ei)) if (0..=62).contains(&ei) => {
                         Ok(ExprVal::Int(bi.wrapping_pow(ei as u32)))
                     }
                     (bv, ev) => Ok(ExprVal::Float(
@@ -608,10 +617,9 @@ impl<'a> ExprParser<'a> {
                 if !eval {
                     return Ok(ExprVal::Int(0));
                 }
-                match v
-                    .coerce_numeric()
-                    .ok_or_else(|| self.err(format!("can't use non-numeric string as operand of \"-\"")))?
-                {
+                match v.coerce_numeric().ok_or_else(|| {
+                    self.err("can't use non-numeric string as operand of \"-\"".to_string())
+                })? {
                     ExprVal::Int(i) => Ok(ExprVal::Int(i.wrapping_neg())),
                     ExprVal::Float(f) => Ok(ExprVal::Float(-f)),
                     ExprVal::Str(_) => unreachable!(),
@@ -737,7 +745,10 @@ impl<'a> ExprParser<'a> {
                 let start = self.pos;
                 if self.bytes[self.pos] == b'0'
                     && self.pos + 1 < self.bytes.len()
-                    && matches!(self.bytes[self.pos + 1], b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
+                    && matches!(
+                        self.bytes[self.pos + 1],
+                        b'x' | b'X' | b'o' | b'O' | b'b' | b'B'
+                    )
                 {
                     self.pos += 2;
                     while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_hexdigit() {
@@ -848,10 +859,10 @@ impl<'a> ExprParser<'a> {
 
 fn str_to_expr_val(s: String) -> ExprVal {
     let t = s.trim();
-    if let Some(i) = parse_tcl_int128(t) {
-        if t == i.to_string() {
-            return ExprVal::Int(i);
-        }
+    if let Some(i) = parse_tcl_int128(t)
+        && t == i.to_string()
+    {
+        return ExprVal::Int(i);
     }
     ExprVal::Str(s)
 }
@@ -876,12 +887,18 @@ fn cmp_tcl_vals(a: &ExprVal, b: &ExprVal) -> Option<std::cmp::Ordering> {
 }
 
 fn arith_binop(a: &ExprVal, b: &ExprVal, op: u8) -> Result<ExprVal, String> {
-    let na = a
-        .coerce_numeric()
-        .ok_or_else(|| format!("can't use non-numeric string \"{}\" as operand", a.to_tcl_string()))?;
-    let nb = b
-        .coerce_numeric()
-        .ok_or_else(|| format!("can't use non-numeric string \"{}\" as operand", b.to_tcl_string()))?;
+    let na = a.coerce_numeric().ok_or_else(|| {
+        format!(
+            "can't use non-numeric string \"{}\" as operand",
+            a.to_tcl_string()
+        )
+    })?;
+    let nb = b.coerce_numeric().ok_or_else(|| {
+        format!(
+            "can't use non-numeric string \"{}\" as operand",
+            b.to_tcl_string()
+        )
+    })?;
 
     match (na, nb) {
         (ExprVal::Int(ia), ExprVal::Int(ib)) => match op {
@@ -970,11 +987,19 @@ fn eval_math_func(name: &str, args: &[ExprVal]) -> Result<ExprVal, String> {
             }
             Ok(ExprVal::Int(args[0].as_float()?.round() as i128))
         }
-        "floor" => Ok(ExprVal::Float(args.first().ok_or("arg")?.as_float()?.floor())),
-        "ceil" => Ok(ExprVal::Float(args.first().ok_or("arg")?.as_float()?.ceil())),
-        "sqrt" => Ok(ExprVal::Float(args.first().ok_or("arg")?.as_float()?.sqrt())),
+        "floor" => Ok(ExprVal::Float(
+            args.first().ok_or("arg")?.as_float()?.floor(),
+        )),
+        "ceil" => Ok(ExprVal::Float(
+            args.first().ok_or("arg")?.as_float()?.ceil(),
+        )),
+        "sqrt" => Ok(ExprVal::Float(
+            args.first().ok_or("arg")?.as_float()?.sqrt(),
+        )),
         "log" => Ok(ExprVal::Float(args.first().ok_or("arg")?.as_float()?.ln())),
-        "log10" => Ok(ExprVal::Float(args.first().ok_or("arg")?.as_float()?.log10())),
+        "log10" => Ok(ExprVal::Float(
+            args.first().ok_or("arg")?.as_float()?.log10(),
+        )),
         "exp" => Ok(ExprVal::Float(args.first().ok_or("arg")?.as_float()?.exp())),
         "sin" => Ok(ExprVal::Float(args.first().ok_or("arg")?.as_float()?.sin())),
         "cos" => Ok(ExprVal::Float(args.first().ok_or("arg")?.as_float()?.cos())),
@@ -982,7 +1007,9 @@ fn eval_math_func(name: &str, args: &[ExprVal]) -> Result<ExprVal, String> {
             if args.len() != 2 {
                 return Err("wrong # args to mathfunc pow".to_string());
             }
-            Ok(ExprVal::Float(args[0].as_float()?.powf(args[1].as_float()?)))
+            Ok(ExprVal::Float(
+                args[0].as_float()?.powf(args[1].as_float()?),
+            ))
         }
         "fmod" => {
             if args.len() != 2 {
@@ -1014,11 +1041,15 @@ fn eval_math_func(name: &str, args: &[ExprVal]) -> Result<ExprVal, String> {
             }
             Ok(best)
         }
-        "isnan" => Ok(ExprVal::Int(i128::from(args.first().ok_or("arg")?.as_float()?.is_nan()))),
+        "isnan" => Ok(ExprVal::Int(i128::from(
+            args.first().ok_or("arg")?.as_float()?.is_nan(),
+        ))),
         "isinf" => Ok(ExprVal::Int(i128::from(
             args.first().ok_or("arg")?.as_float()?.is_infinite(),
         ))),
-        "bool" => Ok(ExprVal::Int(i128::from(args.first().ok_or("arg")?.as_bool()?))),
+        "bool" => Ok(ExprVal::Int(i128::from(
+            args.first().ok_or("arg")?.as_bool()?,
+        ))),
         "srand" => {
             static SRAND: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0x9e37_79b9_7f4a_7c15);

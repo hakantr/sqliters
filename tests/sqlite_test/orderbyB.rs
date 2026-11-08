@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "3/5 subtests passed; pending: orderbyB edge cases"]
 fn test_orderbyB() {
-    sqliters_tcltest::run_test_script("orderbyB", r#"
+    sqliters_tcltest::run_test_script(
+        "orderbyB",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix orderbyb
@@ -74,5 +76,6 @@ do_eqp_execsql_test 1.2 {
   dd    aa    1
 }
 finish_test
-"#);
+"#,
+    );
 }

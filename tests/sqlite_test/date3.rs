@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "112/126 subtests passed; pending: date3 edge cases"]
 fn test_date3() {
-    sqliters_tcltest::run_test_script("date3", r#"
+    sqliters_tcltest::run_test_script(
+        "date3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable {!datetime} {
@@ -63,5 +65,6 @@ do_execsql_test date3-5.0 {
      <> datetime(unixepoch('1970-01-01',format('%+d days',x)),'auto');
 } {63}
 finish_test
-"#);
+"#,
+    );
 }

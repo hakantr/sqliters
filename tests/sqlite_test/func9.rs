@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "0/15 subtests passed; pending: func9 edge cases"]
 fn test_func9() {
-    sqliters_tcltest::run_test_script("func9", r#"
+    sqliters_tcltest::run_test_script(
+        "func9",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_execsql_test func9-100 {
@@ -50,5 +52,6 @@ do_execsql_test func9-300 {
   SELECT hex( unistr('\UFFFFFFFF') )
 } {F7BFBFBF}
 finish_test
-"#);
+"#,
+    );
 }

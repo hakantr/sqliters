@@ -113,10 +113,7 @@ pub fn format_list_elem(s: &str) -> String {
     let needs_quoting = s.starts_with('#')
         || s.bytes().any(|b| {
             is_tcl_list_space(b)
-                || matches!(
-                    b,
-                    b'{' | b'}' | b'[' | b']' | b'$' | b';' | b'"' | b'\\'
-                )
+                || matches!(b, b'{' | b'}' | b'[' | b']' | b'$' | b';' | b'"' | b'\\')
         });
 
     if !needs_quoting {
@@ -366,8 +363,7 @@ pub fn fpnum_compare(a: &str, b: &str) -> bool {
             }
 
             if za[i].is_ascii_digit() && zb[j].is_ascii_digit() {
-                if za[i] == zb[j] + 1 && !za[i + 1].is_ascii_digit() && zb[j + 1].is_ascii_digit()
-                {
+                if za[i] == zb[j] + 1 && !za[i + 1].is_ascii_digit() && zb[j + 1].is_ascii_digit() {
                     j += 1;
                     while zb[j] == b'9' {
                         j += 1;
@@ -466,9 +462,9 @@ pub fn fpnum_compare(a: &str, b: &str) -> bool {
 /// Pure safe Rust RFC 1321 MD5 digest (hex lowercase), matching SQLite's `test_md5.c`.
 pub fn md5_hex(data: &[u8]) -> String {
     const S: [u32; 64] = [
-        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20,
-        5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
-        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
     ];
     const K: [u32; 64] = [
         0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
@@ -496,7 +492,7 @@ pub fn md5_hex(data: &[u8]) -> String {
     }
     msg.extend_from_slice(&bit_len.to_le_bytes());
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut m = [0u32; 16];
         for (i, w) in m.iter_mut().enumerate() {
             let off = i * 4;

@@ -1,6 +1,8 @@
 #[test]
 fn test_index2() {
-    sqliters_tcltest::run_test_script("index2", r#"
+    sqliters_tcltest::run_test_script(
+        "index2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test index2-1.1 {
@@ -53,5 +55,6 @@ do_test index2-2.2 {
   execsql {SELECT c9 FROM t1 ORDER BY c1, c2, c3, c4, c5, c6 LIMIT 5}
 } {9 10009 20009 30009 40009}
 finish_test
-"#);
+"#,
+    );
 }

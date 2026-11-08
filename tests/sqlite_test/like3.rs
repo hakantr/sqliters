@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "203/215 subtests passed; pending: EQP/optimizer"]
 fn test_like3() {
-    sqliters_tcltest::run_test_script("like3", r#"
+    sqliters_tcltest::run_test_script(
+        "like3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !like_match_blobs {
@@ -299,5 +301,6 @@ foreach enc {
   }
 }
 finish_test
-"#);
+"#,
+    );
 }

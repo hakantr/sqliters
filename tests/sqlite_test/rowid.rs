@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "130/248 subtests passed; pending: VIEW, TRIGGER, C testfixture hooks"]
 fn test_rowid() {
-    sqliters_tcltest::run_test_script("rowid", r#"
+    sqliters_tcltest::run_test_script(
+        "rowid",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix rowid
@@ -736,5 +738,6 @@ do_catchsql_test 16.9 {
   SELECT rowid FROM t1, t3; 
 } {1 {ambiguous column name: rowid}}
 finish_test
-"#);
+"#,
+    );
 }

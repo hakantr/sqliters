@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "90/109 subtests passed; pending: ANALYZE/sqlite_stat1, EQP/optimizer, C testfixture hooks"]
 fn test_intpkey() {
-    sqliters_tcltest::run_test_script("intpkey", r#"
+    sqliters_tcltest::run_test_script(
+        "intpkey",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix intpkey
@@ -588,5 +590,6 @@ do_execsql_test 19.1 {
   SELECT count(*) FROM t1, t2 WHERE b = a AND b <> 5;
 } {0 0}
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "2009/2026 subtests passed; pending: EQP/optimizer"]
 fn test_where7() {
-    sqliters_tcltest::run_test_script("where7", r#"
+    sqliters_tcltest::run_test_script(
+        "where7",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !or_opt {
@@ -23355,5 +23357,6 @@ do_execsql_test 4.1 {
      AND (false OR EXISTS(SELECT 1 FROM t0 WHERE t1.y));
 } {111}
 finish_test
-"#);
+"#,
+    );
 }

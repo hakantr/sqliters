@@ -1,4 +1,5 @@
 //! Rollback journal (`pager.c`), page cache (`pcache1.c`), transactions, and savepoints.
+#![forbid(unsafe_code)]
 
 pub mod header;
 
@@ -96,11 +97,7 @@ impl Pager {
     }
 
     /// Opens a database on a custom [`Vfs`] implementation.
-    pub fn open_with_vfs(
-        vfs: Arc<dyn Vfs>,
-        path: Option<&Path>,
-        flags: OpenFlags,
-    ) -> Result<Self> {
+    pub fn open_with_vfs(vfs: Arc<dyn Vfs>, path: Option<&Path>, flags: OpenFlags) -> Result<Self> {
         let is_mem = path.is_none()
             || path == Some(Path::new(":memory:"))
             || flags.contains(OpenFlags::MEMORY);
@@ -160,8 +157,7 @@ impl Pager {
         match pager.load_initial_header() {
             Ok(()) => {}
             Err(e)
-                if journal_exists
-                    && matches!(e.code, ErrorCode::NotADb | ErrorCode::Corrupt) =>
+                if journal_exists && matches!(e.code, ErrorCode::NotADb | ErrorCode::Corrupt) =>
             {
                 // Defer header validation until `begin_read()` checks/replays any crashed hot journal.
             }
@@ -540,7 +536,12 @@ impl Pager {
                 },
             );
         }
-        Ok(self.cache.get(&pgno).expect("just inserted").data.as_slice())
+        Ok(self
+            .cache
+            .get(&pgno)
+            .expect("just inserted")
+            .data
+            .as_slice())
     }
 
     /// Journals the pre-image of `pgno` (if not yet journaled in this tx/savepoints) and marks it dirty.
@@ -715,7 +716,13 @@ impl Pager {
                 let mut dirty_pgnos: Vec<Pgno> = self
                     .cache
                     .iter()
-                    .filter_map(|(&pgno, p)| if p.dirty && pgno <= self.page_count { Some(pgno) } else { None })
+                    .filter_map(|(&pgno, p)| {
+                        if p.dirty && pgno <= self.page_count {
+                            Some(pgno)
+                        } else {
+                            None
+                        }
+                    })
                     .collect();
                 dirty_pgnos.sort_unstable();
 
@@ -971,7 +978,10 @@ impl Pager {
         let Some(ref jfile) = self.journal_file else {
             return Ok(());
         };
-        let hdr_sz = u64::from(self.journal_sector_size.max(MIN_JOURNAL_HEADER_BYTES as u32));
+        let hdr_sz = u64::from(
+            self.journal_sector_size
+                .max(MIN_JOURNAL_HEADER_BYTES as u32),
+        );
         let ps = page_data.len();
         let rec_size = 4 + ps + 4;
         let offset = hdr_sz + u64::from(self.journal_records_written) * (rec_size as u64);

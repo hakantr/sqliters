@@ -120,19 +120,59 @@ impl ErrorCode {
 pub mod extended {
     use super::ErrorCode;
 
+    pub const SQLITE_ERROR_MISSING_COLLSEQ: i32 = (ErrorCode::Error as i32) | (1 << 8);
+    pub const SQLITE_ERROR_RETRY: i32 = (ErrorCode::Error as i32) | (2 << 8);
+    pub const SQLITE_ERROR_SNAPSHOT: i32 = (ErrorCode::Error as i32) | (3 << 8);
+
     pub const SQLITE_IOERR_READ: i32 = (ErrorCode::IoErr as i32) | (1 << 8);
     pub const SQLITE_IOERR_SHORT_READ: i32 = (ErrorCode::IoErr as i32) | (2 << 8);
     pub const SQLITE_IOERR_WRITE: i32 = (ErrorCode::IoErr as i32) | (3 << 8);
     pub const SQLITE_IOERR_FSYNC: i32 = (ErrorCode::IoErr as i32) | (4 << 8);
+    pub const SQLITE_IOERR_DIR_FSYNC: i32 = (ErrorCode::IoErr as i32) | (5 << 8);
     pub const SQLITE_IOERR_TRUNCATE: i32 = (ErrorCode::IoErr as i32) | (6 << 8);
     pub const SQLITE_IOERR_FSTAT: i32 = (ErrorCode::IoErr as i32) | (7 << 8);
     pub const SQLITE_IOERR_UNLOCK: i32 = (ErrorCode::IoErr as i32) | (8 << 8);
     pub const SQLITE_IOERR_RDLOCK: i32 = (ErrorCode::IoErr as i32) | (9 << 8);
     pub const SQLITE_IOERR_DELETE: i32 = (ErrorCode::IoErr as i32) | (10 << 8);
+    pub const SQLITE_IOERR_BLOCKED: i32 = (ErrorCode::IoErr as i32) | (11 << 8);
+    pub const SQLITE_IOERR_NOMEM: i32 = (ErrorCode::IoErr as i32) | (12 << 8);
+    pub const SQLITE_IOERR_ACCESS: i32 = (ErrorCode::IoErr as i32) | (13 << 8);
     pub const SQLITE_IOERR_CHECKRESERVEDLOCK: i32 = (ErrorCode::IoErr as i32) | (14 << 8);
     pub const SQLITE_IOERR_LOCK: i32 = (ErrorCode::IoErr as i32) | (15 << 8);
-    pub const SQLITE_READONLY_ROLLBACK: i32 = (ErrorCode::ReadOnly as i32) | (3 << 8);
+    pub const SQLITE_IOERR_CLOSE: i32 = (ErrorCode::IoErr as i32) | (16 << 8);
+    pub const SQLITE_IOERR_DIR_CLOSE: i32 = (ErrorCode::IoErr as i32) | (17 << 8);
+    pub const SQLITE_IOERR_SHMOPEN: i32 = (ErrorCode::IoErr as i32) | (18 << 8);
+    pub const SQLITE_IOERR_SHMSIZE: i32 = (ErrorCode::IoErr as i32) | (19 << 8);
+    pub const SQLITE_IOERR_SHMLOCK: i32 = (ErrorCode::IoErr as i32) | (20 << 8);
+    pub const SQLITE_IOERR_SHMMAP: i32 = (ErrorCode::IoErr as i32) | (21 << 8);
+    pub const SQLITE_IOERR_SEEK: i32 = (ErrorCode::IoErr as i32) | (22 << 8);
+    pub const SQLITE_IOERR_DELETE_NOENT: i32 = (ErrorCode::IoErr as i32) | (23 << 8);
+    pub const SQLITE_IOERR_MMAP: i32 = (ErrorCode::IoErr as i32) | (24 << 8);
+    pub const SQLITE_IOERR_GETTEMPPATH: i32 = (ErrorCode::IoErr as i32) | (25 << 8);
+    pub const SQLITE_IOERR_CONVPATH: i32 = (ErrorCode::IoErr as i32) | (26 << 8);
+    pub const SQLITE_IOERR_IN_PAGE: i32 = (ErrorCode::IoErr as i32) | (34 << 8);
+
+    pub const SQLITE_BUSY_RECOVERY: i32 = (ErrorCode::Busy as i32) | (1 << 8);
+    pub const SQLITE_BUSY_SNAPSHOT: i32 = (ErrorCode::Busy as i32) | (2 << 8);
+    pub const SQLITE_BUSY_TIMEOUT: i32 = (ErrorCode::Busy as i32) | (3 << 8);
+
+    pub const SQLITE_CANTOPEN_NOTEMPDIR: i32 = (ErrorCode::CantOpen as i32) | (1 << 8);
+    pub const SQLITE_CANTOPEN_ISDIR: i32 = (ErrorCode::CantOpen as i32) | (2 << 8);
+    pub const SQLITE_CANTOPEN_FULLPATH: i32 = (ErrorCode::CantOpen as i32) | (3 << 8);
+    pub const SQLITE_CANTOPEN_CONVPATH: i32 = (ErrorCode::CantOpen as i32) | (4 << 8);
+    pub const SQLITE_CANTOPEN_SYMLINK: i32 = (ErrorCode::CantOpen as i32) | (6 << 8);
+
     pub const SQLITE_CORRUPT_INDEX: i32 = (ErrorCode::Corrupt as i32) | (3 << 8);
+
+    pub const SQLITE_READONLY_RECOVERY: i32 = (ErrorCode::ReadOnly as i32) | (1 << 8);
+    pub const SQLITE_READONLY_CANTLOCK: i32 = (ErrorCode::ReadOnly as i32) | (2 << 8);
+    pub const SQLITE_READONLY_ROLLBACK: i32 = (ErrorCode::ReadOnly as i32) | (3 << 8);
+    pub const SQLITE_READONLY_DBMOVED: i32 = (ErrorCode::ReadOnly as i32) | (4 << 8);
+    pub const SQLITE_READONLY_CANTINIT: i32 = (ErrorCode::ReadOnly as i32) | (5 << 8);
+    pub const SQLITE_READONLY_DIRECTORY: i32 = (ErrorCode::ReadOnly as i32) | (6 << 8);
+
+    pub const SQLITE_ABORT_ROLLBACK: i32 = (ErrorCode::Abort as i32) | (2 << 8);
+
     pub const SQLITE_CONSTRAINT_CHECK: i32 = (ErrorCode::Constraint as i32) | (1 << 8);
     pub const SQLITE_CONSTRAINT_FOREIGNKEY: i32 = (ErrorCode::Constraint as i32) | (3 << 8);
     pub const SQLITE_CONSTRAINT_NOTNULL: i32 = (ErrorCode::Constraint as i32) | (5 << 8);
@@ -140,6 +180,9 @@ pub mod extended {
     pub const SQLITE_CONSTRAINT_UNIQUE: i32 = (ErrorCode::Constraint as i32) | (8 << 8);
     pub const SQLITE_CONSTRAINT_ROWID: i32 = (ErrorCode::Constraint as i32) | (10 << 8);
     pub const SQLITE_CONSTRAINT_DATATYPE: i32 = (ErrorCode::Constraint as i32) | (12 << 8);
+
+    pub const SQLITE_NOTICE_RECOVER_WAL: i32 = (ErrorCode::Notice as i32) | (1 << 8);
+    pub const SQLITE_NOTICE_RECOVER_ROLLBACK: i32 = (ErrorCode::Notice as i32) | (2 << 8);
 }
 
 /// Transaction/statement rollback behavior attached to a constraint error (`OE_Abort`, `OE_Fail`, `OE_Rollback`).

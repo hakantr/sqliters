@@ -1,6 +1,8 @@
 #[test]
 fn test_whereM() {
-    sqliters_tcltest::run_test_script("whereM", r#"
+    sqliters_tcltest::run_test_script(
+        "whereM",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 source $testdir/malloc_common.tcl
@@ -91,5 +93,6 @@ do_execsql_test 1.5.5 {
   SELECT count(*) FROM t1 WHERE e=10.0 AND e LIKE '10.0'
 } {1}
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "129/198 subtests passed; pending: VIEW, EQP/optimizer"]
 fn test_join() {
-    sqliters_tcltest::run_test_script("join", r#"
+    sqliters_tcltest::run_test_script(
+        "join",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test join-1.1 {
@@ -1184,5 +1186,6 @@ do_execsql_test join-36.3 {
   SELECT a,b,c,z,t1.*,t2.*,* FROM t2 LEFT JOIN t1 USING(a,b);
 } {40 50 NULL 90 NULL NULL NULL 40 50 90 40 50 90 NULL}
 finish_test
-"#);
+"#,
+    );
 }

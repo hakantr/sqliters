@@ -1,6 +1,8 @@
 #[test]
 fn test_orderby9() {
-    sqliters_tcltest::run_test_script("orderby9", r#"
+    sqliters_tcltest::run_test_script(
+        "orderby9",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix orderby9
@@ -33,5 +35,6 @@ do_test 1.2 {
   expr {$l1==[lsort -command bigintcompare $l1]}
 } {0}
 finish_test
-"#);
+"#,
+    );
 }

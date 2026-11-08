@@ -65,26 +65,20 @@ impl<'a> Parser<'a> {
 
     #[inline]
     fn peek(&self) -> Token<'a> {
-        self.tokens
-            .get(self.pos)
-            .copied()
-            .unwrap_or(Token {
-                kind: TokenKind::Eof,
-                text: "",
-                offset: self.sql.len(),
-            })
+        self.tokens.get(self.pos).copied().unwrap_or(Token {
+            kind: TokenKind::Eof,
+            text: "",
+            offset: self.sql.len(),
+        })
     }
 
     #[inline]
     fn peek_n(&self, n: usize) -> Token<'a> {
-        self.tokens
-            .get(self.pos + n)
-            .copied()
-            .unwrap_or(Token {
-                kind: TokenKind::Eof,
-                text: "",
-                offset: self.sql.len(),
-            })
+        self.tokens.get(self.pos + n).copied().unwrap_or(Token {
+            kind: TokenKind::Eof,
+            text: "",
+            offset: self.sql.len(),
+        })
     }
 
     #[inline]
@@ -966,9 +960,7 @@ impl<'a> Parser<'a> {
         let source = if self.eat(TokenKind::Default) {
             self.expect(TokenKind::Values)?;
             InsertSource::DefaultValues
-        } else if self.at(TokenKind::Values)
-            && self.peek_n(1).kind == TokenKind::Lp
-        {
+        } else if self.at(TokenKind::Values) && self.peek_n(1).kind == TokenKind::Lp {
             self.advance();
             let rows = self.parse_values_rows()?;
             // If followed by UNION/ORDER BY/LIMIT, treat as Select
@@ -1874,10 +1866,10 @@ impl<'a> Parser<'a> {
                 if let Expr::Float(f) = rhs {
                     return Ok(Expr::Float(-f));
                 }
-                if let Expr::Integer(i) = rhs {
-                    if let Some(neg) = i.checked_neg() {
-                        return Ok(Expr::Integer(neg));
-                    }
+                if let Expr::Integer(i) = rhs
+                    && let Some(neg) = i.checked_neg()
+                {
+                    return Ok(Expr::Integer(neg));
                 }
                 Ok(Expr::Unary {
                     op: UnaryOp::Negate,
@@ -2114,10 +2106,7 @@ impl<'a> Parser<'a> {
                     column: first,
                 })
             }
-            _ => Err(self.syntax_err_at(
-                tok,
-                format!("near \"{}\": syntax error", tok.text),
-            )),
+            _ => Err(self.syntax_err_at(tok, format!("near \"{}\": syntax error", tok.text))),
         }
     }
 

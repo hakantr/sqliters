@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "0/6 subtests passed; pending: VIEW, TRIGGER, ATTACH"]
 fn test_with4() {
-    sqliters_tcltest::run_test_script("with4", r#"
+    sqliters_tcltest::run_test_script(
+        "with4",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix with4
@@ -36,5 +38,6 @@ do_catchsql_test 210 {
   END;
 } {1 {trigger cannot use variables}}
 finish_test
-"#);
+"#,
+    );
 }

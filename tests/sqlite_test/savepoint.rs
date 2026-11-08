@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "67/111 subtests passed; pending: ATTACH"]
 fn test_savepoint() {
-    sqliters_tcltest::run_test_script("savepoint", r#"
+    sqliters_tcltest::run_test_script(
+        "savepoint",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 source $testdir/lock_common.tcl
@@ -925,5 +927,6 @@ do_execsql_test savepoint-17.2 {
   CREATE TABLE t6(a, b);
 } {}
 finish_test
-"#);
+"#,
+    );
 }

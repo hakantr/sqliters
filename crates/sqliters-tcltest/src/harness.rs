@@ -37,9 +37,7 @@ pub struct TestFileReport {
 
 impl TestFileReport {
     pub fn is_ok(&self) -> bool {
-        self.failed.is_empty()
-            && self.script_error.is_none()
-            && (self.passed > 0 || self.finished)
+        self.failed.is_empty() && self.script_error.is_none() && (self.passed > 0 || self.finished)
     }
 
     pub fn total_cases(&self) -> usize {
@@ -126,7 +124,11 @@ impl SqliteTestHost {
     }
 }
 
-pub fn bootstrap_tester(interp: &mut TclInterp, host: &SharedHost, temp_dir: &Path) -> TclResult<()> {
+pub fn bootstrap_tester(
+    interp: &mut TclInterp,
+    host: &SharedHost,
+    temp_dir: &Path,
+) -> TclResult<()> {
     let (test_dir_str, file_name) = {
         let h = host.borrow();
         (
@@ -301,14 +303,12 @@ pub fn invoke_host_cmd(
         }
         "sqlite_complete" | "sqlite3_complete" => {
             let sql = args.first().map_or("", String::as_str);
-            Some(Ok(
-                if sqliters_syntax::is_complete(sql) {
-                    "1"
-                } else {
-                    "0"
-                }
-                .to_string(),
-            ))
+            Some(Ok(if sqliters_syntax::is_complete(sql) {
+                "1"
+            } else {
+                "0"
+            }
+            .to_string()))
         }
         "working_64bit_int" => Some(Ok("1".to_string())),
         "fpnum_compare" => {
@@ -379,9 +379,10 @@ pub fn invoke_host_cmd(
             let data = fs::read(p).unwrap_or_default();
             Some(Ok(md5_hex(&data)))
         }
-        "sqlite3_connection_pointer" => {
-            Some(Ok(args.first().cloned().unwrap_or_else(|| "db".to_string())))
-        }
+        "sqlite3_connection_pointer" => Some(Ok(args
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "db".to_string()))),
         "sqlite3_get_autocommit" => {
             let dbn = args.first().map_or("db", String::as_str);
             let ac = host
@@ -596,9 +597,7 @@ fn dispatch_db_method(
         }
         "changes" => Ok(host.borrow().dbs[db_name].conn.changes().to_string()),
         "total_changes" => Ok(host.borrow().dbs[db_name].conn.total_changes().to_string()),
-        "last_insert_rowid" => Ok(host
-            .borrow()
-            .dbs[db_name]
+        "last_insert_rowid" => Ok(host.borrow().dbs[db_name]
             .conn
             .last_insert_rowid()
             .to_string()),
@@ -625,7 +624,9 @@ fn dispatch_db_method(
             } else if args.len() == 2 {
                 ("deferred", &args[1])
             } else {
-                return Err(TclControl::Error("wrong # args to db transaction".to_string()));
+                return Err(TclControl::Error(
+                    "wrong # args to db transaction".to_string(),
+                ));
             };
             let begin_sql = match mode.to_ascii_lowercase().as_str() {
                 "immediate" => "BEGIN IMMEDIATE",
@@ -657,10 +658,29 @@ fn dispatch_db_method(
             }
         }
         "status" => Ok("0".to_string()),
-        "cache" | "config" | "timeout" | "busy" | "authorizer" | "auth" | "trace" | "profile"
-        | "progress" | "collate" | "collation_needed" | "function" | "func"
-        | "enable_load_extension" | "incrblob" | "restore" | "backup" | "wal_hook"
-        | "update_hook" | "commit_hook" | "rollback_hook" | "rekey" | "key" => Ok(String::new()),
+        "cache"
+        | "config"
+        | "timeout"
+        | "busy"
+        | "authorizer"
+        | "auth"
+        | "trace"
+        | "profile"
+        | "progress"
+        | "collate"
+        | "collation_needed"
+        | "function"
+        | "func"
+        | "enable_load_extension"
+        | "incrblob"
+        | "restore"
+        | "backup"
+        | "wal_hook"
+        | "update_hook"
+        | "commit_hook"
+        | "rollback_hook"
+        | "rekey"
+        | "key" => Ok(String::new()),
         other => Err(TclControl::Error(format!(
             "bad option \"{other}\" to db handle \"{db_name}\""
         ))),
@@ -831,10 +851,11 @@ fn cmd_do_test(host: &SharedHost, interp: &mut TclInterp, args: &[String]) -> Tc
         ));
     }
     let mut name = args[0].clone();
-    if let Ok(pfx) = interp.get_var("::testprefix") {
-        if !pfx.is_empty() && name.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-            name = format!("{pfx}-{name}");
-        }
+    if let Ok(pfx) = interp.get_var("::testprefix")
+        && !pfx.is_empty()
+        && name.chars().next().is_some_and(|c| c.is_ascii_digit())
+    {
+        name = format!("{pfx}-{name}");
     }
     let cmd = &args[1];
     let expected = &args[2];
@@ -964,10 +985,10 @@ fn cmd_reset_db(host: &SharedHost, interp: &mut TclInterp) -> TclResult<String> 
             last_errmsg: "not an error".to_string(),
         },
     );
-    if let Ok(setup) = interp.get_var("::SETUP_SQL") {
-        if !setup.trim().is_empty() {
-            let _ = exec_sql_rows(host, interp, "db", &setup)?;
-        }
+    if let Ok(setup) = interp.get_var("::SETUP_SQL")
+        && !setup.trim().is_empty()
+    {
+        let _ = exec_sql_rows(host, interp, "db", &setup)?;
     }
     Ok(String::new())
 }
@@ -1136,10 +1157,7 @@ fn cmd_hexio_write(interp: &TclInterp, args: &[String]) -> TclResult<String> {
     }
     let p = interp.resolve_path(&args[0]);
     let off = parse_tcl_int(&args[1]).unwrap_or(0).max(0) as u64;
-    let hex: String = args[2]
-        .chars()
-        .filter(|c| c.is_ascii_hexdigit())
-        .collect();
+    let hex: String = args[2].chars().filter(|c| c.is_ascii_hexdigit()).collect();
     let mut bytes = Vec::with_capacity(hex.len() / 2);
     let mut i = 0;
     while i + 1 < hex.len() {
@@ -1152,6 +1170,7 @@ fn cmd_hexio_write(interp: &TclInterp, args: &[String]) -> TclResult<String> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(p)
         .map_err(|e| TclControl::Error(e.to_string()))?;
     f.seek(SeekFrom::Start(off))
@@ -1228,7 +1247,10 @@ fn check_expected(result: &str, expected: &str) -> bool {
                 && expected.len() >= 3);
 
     if is_slash_form {
-        if let Some(inner) = expected.strip_prefix("~/").and_then(|s| s.strip_suffix('/')) {
+        if let Some(inner) = expected
+            .strip_prefix("~/")
+            .and_then(|s| s.strip_suffix('/'))
+        {
             let matched = if inner.starts_with('*') {
                 glob_match(inner, result, false)
             } else {
@@ -1239,7 +1261,10 @@ fn check_expected(result: &str, expected: &str) -> bool {
             };
             return !matched;
         }
-        if let Some(inner) = expected.strip_prefix("#/").and_then(|s| s.strip_suffix('/')) {
+        if let Some(inner) = expected
+            .strip_prefix("#/")
+            .and_then(|s| s.strip_suffix('/'))
+        {
             let Ok(r_items) = parse_list(result) else {
                 return false;
             };

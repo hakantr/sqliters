@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "8/119 subtests passed; pending: collate2 edge cases"]
 fn test_collate2() {
-    sqliters_tcltest::run_test_script("collate2", r#"
+    sqliters_tcltest::run_test_script(
+        "collate2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix collate2
@@ -670,5 +672,6 @@ do_execsql_test 6.7 {
   WHERE +x COLLATE nocase BETWEEN 'a' COLLATE nocase AND 'c' COLLATE nocase;
 } {b B}
 finish_test
-"#);
+"#,
+    );
 }

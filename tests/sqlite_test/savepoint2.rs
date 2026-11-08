@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "0/2 subtests passed; pending: can't read \"::sig(one)\": no such variable"]
 fn test_savepoint2() {
-    sqliters_tcltest::run_test_script("savepoint2", r#"
+    sqliters_tcltest::run_test_script(
+        "savepoint2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 proc signature {} {
@@ -100,5 +102,6 @@ for {set ii 2} {$ii < ($iterations+2)} {incr ii} {
 unset -nocomplain ::sig
 unset -nocomplain SQL
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "21/58 subtests passed; pending: VIEW, EQP/optimizer"]
 fn test_whereG() {
-    sqliters_tcltest::run_test_script("whereG", r#"
+    sqliters_tcltest::run_test_script(
+        "whereG",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix whereG
@@ -334,5 +336,6 @@ do_execsql_test 12.1 {
   SELECT typeof(abs(a)) FROM t1 INDEXED BY t1x2;
 } {real real}
 finish_test
-"#);
+"#,
+    );
 }

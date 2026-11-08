@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "71/122 subtests passed; pending: VIEW"]
 fn test_limit() {
-    sqliters_tcltest::run_test_script("limit", r#"
+    sqliters_tcltest::run_test_script(
+        "limit",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 execsql {
@@ -609,5 +611,6 @@ do_execsql_test limit-15.1 {
   ) FROM t1;
 } {100000}
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,6 +1,8 @@
 #[test]
 fn test_whereJ() {
-    sqliters_tcltest::run_test_script("whereJ", r#"
+    sqliters_tcltest::run_test_script(
+        "whereJ",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix whereJ
@@ -620,5 +622,6 @@ do_test 5.1 {
 do_test 5.2 {set res} {/USING INDEX t1abe/}
 do_test 5.3 {set res} {/USING INDEX t1abf/}
 finish_test
-"#);
+"#,
+    );
 }

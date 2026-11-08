@@ -1,4 +1,5 @@
 //! `sqliters-tcltest`: Pure safe Rust SQLite `testfixture` / TCL test suite runner.
+#![forbid(unsafe_code)]
 
 pub mod expr;
 pub mod harness;
@@ -31,8 +32,8 @@ pub fn evaluate_test_script(test_name: &str, script: &str) -> TestFileReport {
         }
     }
     drop(interp);
-    let report = host.borrow().report.clone();
-    report
+
+    host.borrow().report.clone()
 }
 
 /// Runs an adapted SQLite `.test` script and asserts that **every** subtest passes

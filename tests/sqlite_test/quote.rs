@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "1/29 subtests passed; pending: quote edge cases"]
 fn test_quote() {
-    sqliters_tcltest::run_test_script("quote", r##"
+    sqliters_tcltest::run_test_script(
+        "quote",
+        r##"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix quote
@@ -149,5 +151,6 @@ ifcapable altertable {
   } {0 {}}
 }
 finish_test
-"##);
+"##,
+    );
 }

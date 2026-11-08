@@ -1,6 +1,8 @@
 #[test]
 fn test_coalesce() {
-    sqliters_tcltest::run_test_script("coalesce", r#"
+    sqliters_tcltest::run_test_script(
+        "coalesce",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test coalesce-1.0 {
@@ -68,5 +70,6 @@ pragma vdbe_listing=on;
   }
 } {{} 123 345 4 {} 99 456 44}
 finish_test
-"#);
+"#,
+    );
 }

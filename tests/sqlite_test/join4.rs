@@ -1,6 +1,8 @@
 #[test]
 fn test_join4() {
-    sqliters_tcltest::run_test_script("join4", r#"
+    sqliters_tcltest::run_test_script(
+        "join4",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable tempdb {
@@ -79,5 +81,6 @@ ifcapable subquery {
   } {1 one {} {} {} 2 two 2 niban ok 3 three {} {} {} 4 four {} {} {}}
 }
 finish_test
-"#);
+"#,
+    );
 }

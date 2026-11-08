@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "16/42 subtests passed; pending: TRIGGER, VIRTUAL TABLE"]
 fn test_fkey6() {
-    sqliters_tcltest::run_test_script("fkey6", r#"
+    sqliters_tcltest::run_test_script(
+        "fkey6",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix fkey6
@@ -245,5 +247,6 @@ if {[permutation]!="inmemory_journal"} {
 }
 }
 finish_test
-"#);
+"#,
+    );
 }

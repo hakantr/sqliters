@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "20/1114 subtests passed; pending: enc4 edge cases"]
 fn test_enc4() {
-    sqliters_tcltest::run_test_script("enc4", r#"
+    sqliters_tcltest::run_test_script(
+        "enc4",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable {!utf16} {
@@ -101,5 +103,6 @@ do_test enc4-4.4.2 {
 } {SQLITE_OK}
 db close
 finish_test
-"#);
+"#,
+    );
 }

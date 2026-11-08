@@ -1,5 +1,6 @@
 //! `sqliters-core`: High-level SQLite 3.54.1 database engine, schema catalog, compiler,
 //! and public `Connection` / `Statement` / `Row` API (`main.c`, `legacy.c`, `vdbeapi.c`).
+#![forbid(unsafe_code)]
 
 pub mod compiler;
 pub mod engine;
@@ -140,11 +141,7 @@ impl Connection {
     }
 
     /// Opens a database backed by a custom [`Vfs`].
-    pub fn open_with_vfs(
-        vfs: Arc<dyn Vfs>,
-        path: Option<&Path>,
-        flags: OpenFlags,
-    ) -> Result<Self> {
+    pub fn open_with_vfs(vfs: Arc<dyn Vfs>, path: Option<&Path>, flags: OpenFlags) -> Result<Self> {
         let btree = Btree::open_with_vfs(vfs, path, flags)?;
         Self::from_btree(btree)
     }
@@ -375,11 +372,7 @@ pub struct Statement<'conn> {
 }
 
 impl<'conn> Statement<'conn> {
-    fn new(
-        conn: &'conn mut Connection,
-        stmt: Option<Stmt>,
-        unparsed_tail: String,
-    ) -> Result<Self> {
+    fn new(conn: &'conn mut Connection, stmt: Option<Stmt>, unparsed_tail: String) -> Result<Self> {
         let mut max_param = 0usize;
         let mut named = HashMap::new();
         if let Some(ref s) = stmt {
@@ -735,8 +728,12 @@ fn infer_from_columns(
         let using_cols: Vec<String> = if j.natural {
             let mut shared = Vec::new();
             for (_, lname) in &left {
-                if right.iter().any(|(_, rname)| rname.eq_ignore_ascii_case(lname))
-                    && !shared.iter().any(|s: &String| s.eq_ignore_ascii_case(lname))
+                if right
+                    .iter()
+                    .any(|(_, rname)| rname.eq_ignore_ascii_case(lname))
+                    && !shared
+                        .iter()
+                        .any(|s: &String| s.eq_ignore_ascii_case(lname))
                 {
                     shared.push(lname.clone());
                 }
@@ -765,7 +762,10 @@ fn infer_tos_columns(
     match tos {
         TableOrSubquery::Table { name, alias, .. } => {
             let eff = alias.clone().unwrap_or_else(|| name.clone());
-            if let Some((_, cte_cols)) = ctes.iter().rev().find(|(n, _)| n.eq_ignore_ascii_case(name))
+            if let Some((_, cte_cols)) = ctes
+                .iter()
+                .rev()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
             {
                 return cte_cols
                     .iter()
@@ -783,10 +783,7 @@ fn infer_tos_columns(
         }
         TableOrSubquery::Subquery { query, alias } => {
             let sub_cols = infer_select_column_names(query, schema, ctes);
-            sub_cols
-                .into_iter()
-                .map(|c| (alias.clone(), c))
-                .collect()
+            sub_cols.into_iter().map(|c| (alias.clone(), c)).collect()
         }
     }
 }
@@ -900,11 +897,7 @@ fn infer_pragma_column_names(name: &str, has_arg: bool) -> Vec<String> {
 // AST Bind Parameter Discovery
 // ============================================================================
 
-fn collect_stmt_params(
-    stmt: &Stmt,
-    max_idx: &mut usize,
-    named: &mut HashMap<String, usize>,
-) {
+fn collect_stmt_params(stmt: &Stmt, max_idx: &mut usize, named: &mut HashMap<String, usize>) {
     match stmt {
         Stmt::Explain { stmt: inner, .. } => collect_stmt_params(inner, max_idx, named),
         Stmt::Select(sel) => collect_select_params(sel, max_idx, named),
@@ -986,11 +979,7 @@ fn collect_select_params(
     }
 }
 
-fn collect_core_params(
-    core: &SelectCore,
-    max_idx: &mut usize,
-    named: &mut HashMap<String, usize>,
-) {
+fn collect_core_params(core: &SelectCore, max_idx: &mut usize, named: &mut HashMap<String, usize>) {
     match core {
         SelectCore::Values(rows) => {
             for r in rows {
@@ -1038,11 +1027,7 @@ fn collect_core_params(
     }
 }
 
-fn collect_expr_params(
-    expr: &Expr,
-    max_idx: &mut usize,
-    named: &mut HashMap<String, usize>,
-) {
+fn collect_expr_params(expr: &Expr, max_idx: &mut usize, named: &mut HashMap<String, usize>) {
     match expr {
         Expr::Bind(bp) => match bp {
             BindParam::Anonymous(i) | BindParam::Numbered(i) => {

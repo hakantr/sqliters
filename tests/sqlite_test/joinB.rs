@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "192/512 subtests passed; pending: joinB edge cases"]
 fn test_joinB() {
-    sqliters_tcltest::run_test_script("joinB", r#"
+    sqliters_tcltest::run_test_script(
+        "joinB",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 db nullvalue -
@@ -7096,5 +7098,6 @@ do_execsql_test joinB-512 {
 } {
 }
 finish_test
-"#);
+"#,
+    );
 }

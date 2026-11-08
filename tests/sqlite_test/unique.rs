@@ -1,6 +1,8 @@
 #[test]
 fn test_unique() {
-    sqliters_tcltest::run_test_script("unique", r#"
+    sqliters_tcltest::run_test_script(
+        "unique",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test unique-1.1 {
@@ -224,5 +226,6 @@ do_test unique-5.2 {
 } {1 {UNIQUE constraint failed: t5.first_column_with_long_name, t5.second_column_with_long_name, t5.third_column_with_long_name, t5.fourth_column_with_long_name, t5.fifth_column_with_long_name, t5.sixth_column_with_long_name}}
 verify_ex_errcode unique-5.2b SQLITE_CONSTRAINT_UNIQUE
 finish_test
-"#);
+"#,
+    );
 }

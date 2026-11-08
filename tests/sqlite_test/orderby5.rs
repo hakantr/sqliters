@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "26/39 subtests passed; pending: ANALYZE/sqlite_stat1, EQP/optimizer"]
 fn test_orderby5() {
-    sqliters_tcltest::run_test_script("orderby5", r#"
+    sqliters_tcltest::run_test_script(
+        "orderby5",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix orderby5
@@ -188,5 +190,6 @@ do_execsql_test 5.9 {
   SELECT (SELECT t FROM t1 WHERE +t=+i ORDER BY t) FROM t0;
 } {NULL}
 finish_test
-"#);
+"#,
+    );
 }

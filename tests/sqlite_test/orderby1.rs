@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "55/66 subtests passed; pending: EQP/optimizer"]
 fn test_orderby1() {
-    sqliters_tcltest::run_test_script("orderby1", r#"
+    sqliters_tcltest::run_test_script(
+        "orderby1",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix orderby1
@@ -459,5 +461,6 @@ do_execsql_test 12.1 {
    LIMIT 1;
 } {2}
 finish_test
-"#);
+"#,
+    );
 }

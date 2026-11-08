@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "0/31 subtests passed; pending: ATTACH, TEMP TABLE, EQP/optimizer"]
 fn test_selectD() {
-    sqliters_tcltest::run_test_script("selectD", r#"
+    sqliters_tcltest::run_test_script(
+        "selectD",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 for {set i 1} {$i<=2} {incr i} {
@@ -153,5 +155,6 @@ do_execsql_test selectD-4.1 {
                   ON t41.b=x2.d;
 } {/SEARCH x2 USING AUTOMATIC/}
 finish_test
-"#);
+"#,
+    );
 }

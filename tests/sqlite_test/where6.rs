@@ -1,6 +1,8 @@
 #[test]
 fn test_where6() {
-    sqliters_tcltest::run_test_script("where6", r#"
+    sqliters_tcltest::run_test_script(
+        "where6",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test where6-1.1 {
@@ -121,5 +123,6 @@ do_test where6-3.1 {
   }
 } {abc abc {} 1 abc def 123 {} abc ghi {} {} def abc {} {} def def {} 1 def ghi 456 {} ghi abc {} {} ghi def {} {} ghi ghi {} 1}
 finish_test
-"#);
+"#,
+    );
 }

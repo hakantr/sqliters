@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "25/29 subtests passed; pending: VIEW, WINDOW"]
 fn test_with2() {
-    sqliters_tcltest::run_test_script("with2", r#"
+    sqliters_tcltest::run_test_script(
+        "with2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix with2
@@ -565,5 +567,6 @@ if {$::SQLITE_MAX_EXPR_DEPTH>0} {
   } {1 {VIEWs and/or subqueries nested too deep}}
 }
 finish_test
-"#);
+"#,
+    );
 }

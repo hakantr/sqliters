@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "710/874 subtests passed; pending: date5 edge cases"]
 fn test_date5() {
-    sqliters_tcltest::run_test_script("date5", r#"
+    sqliters_tcltest::run_test_script(
+        "date5",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable {!datetime} {
@@ -58,5 +60,6 @@ foreach {id y m d jd} $date5data {
   }
 }
 finish_test
-"#);
+"#,
+    );
 }

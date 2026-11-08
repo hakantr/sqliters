@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "21/59 subtests passed; pending: VIEW, TRIGGER, ATTACH"]
 fn test_alter3() {
-    sqliters_tcltest::run_test_script("alter3", r#"
+    sqliters_tcltest::run_test_script(
+        "alter3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !altertable {
@@ -386,5 +388,6 @@ do_catchsql_test alter3-9.14 {
   ALTER TABLE t2 ADD COLUMN xtra1 AS (y+1) NOT NULL CHECK(x!=3);
 } {1 {NOT NULL constraint failed}}
 finish_test
-"#);
+"#,
+    );
 }

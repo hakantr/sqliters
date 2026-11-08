@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "0/1 subtests passed; pending: ATTACH, TEMP TABLE, C testfixture hooks"]
 fn test_vacuum5() {
-    sqliters_tcltest::run_test_script("vacuum5", r#"
+    sqliters_tcltest::run_test_script(
+        "vacuum5",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix vacuum5
@@ -124,5 +126,6 @@ if {$::TEMP_STORE<3 && [permutation]!="inmemory_journal"} {
   }
 } 
 finish_test
-"#);
+"#,
+    );
 }

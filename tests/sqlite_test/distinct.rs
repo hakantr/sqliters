@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "55/86 subtests passed; pending: distinct edge cases"]
 fn test_distinct() {
-    sqliters_tcltest::run_test_script("distinct", r#"
+    sqliters_tcltest::run_test_script(
+        "distinct",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !compound {
@@ -340,5 +342,6 @@ do_execsql_test 10.5 {
   SELECT count(*) FROM t2;
 } {1}
 finish_test
-"#);
+"#,
+    );
 }

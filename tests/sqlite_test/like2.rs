@@ -1,6 +1,8 @@
 #[test]
 fn test_like2() {
-    sqliters_tcltest::run_test_script("like2", r#"
+    sqliters_tcltest::run_test_script(
+        "like2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test like2-1.1 {
@@ -996,5 +998,6 @@ do_test like-3.2 {
   db eval "SELECT '\u0080' LIKE '%\x80'"
 } {1}
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "117/123 subtests passed; pending: VIEW, WINDOW"]
 fn test_select4() {
-    sqliters_tcltest::run_test_script("select4", r#"
+    sqliters_tcltest::run_test_script(
+        "select4",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable compound {
@@ -947,5 +949,6 @@ do_execsql_test select4-19.1 {
   SELECT sum((SELECT 1 FROM (SELECT 2 WHERE x IS NULL) WHERE 0)) FROM t1;
 } {{}}
 finish_test
-"#);
+"#,
+    );
 }

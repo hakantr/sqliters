@@ -1,4 +1,5 @@
 //! `sqliters-syntax`: SQLite 3.54.1 lexical scanner, `is_complete` checker, AST, and SQL parser.
+#![forbid(unsafe_code)]
 
 pub mod ast;
 pub mod complete;

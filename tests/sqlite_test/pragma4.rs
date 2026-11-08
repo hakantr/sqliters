@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "44/80 subtests passed; pending: VIEW, ATTACH"]
 fn test_pragma4() {
-    sqliters_tcltest::run_test_script("pragma4", r#"
+    sqliters_tcltest::run_test_script(
+        "pragma4",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix pragma4
@@ -285,5 +287,6 @@ ifcapable vtab {
   } {a a b b}
 }
 finish_test
-"#);
+"#,
+    );
 }

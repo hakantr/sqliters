@@ -1,6 +1,8 @@
 #[test]
 fn test_null() {
-    sqliters_tcltest::run_test_script("null", r#"
+    sqliters_tcltest::run_test_script(
+        "null",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test null-1.0 {
@@ -243,5 +245,6 @@ do_execsql_test null-10.1 {
   SELECT * FROM t0 WHERE t0.c0 > NULL;
 } {}
 finish_test
-"#);
+"#,
+    );
 }

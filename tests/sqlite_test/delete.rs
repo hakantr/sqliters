@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "52/67 subtests passed; pending: TRIGGER"]
 fn test_delete() {
-    sqliters_tcltest::run_test_script("delete", r#"
+    sqliters_tcltest::run_test_script(
+        "delete",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test delete-1.1 {
@@ -366,5 +368,6 @@ do_execsql_test delete-12.0 {
   SELECT * FROM t0;
 } {8 4 95}
 finish_test
-"#);
+"#,
+    );
 }

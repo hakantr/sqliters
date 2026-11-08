@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "389/398 subtests passed; pending: types2 edge cases"]
 fn test_types2() {
-    sqliters_tcltest::run_test_script("types2", r#"
+    sqliters_tcltest::run_test_script(
+        "types2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 execsql {
@@ -245,5 +247,6 @@ ifcapable subquery {
   test_boolset types2-8.8 {o IN (SELECT o FROM t4)} {9 10}
 }
 finish_test
-"#);
+"#,
+    );
 }

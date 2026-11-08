@@ -194,11 +194,7 @@ fn extract_table_col_eq(
     None
 }
 
-fn match_single_table_col(
-    expr: &Expr,
-    tbl: &TableSchema,
-    alias: Option<&str>,
-) -> Option<String> {
+fn match_single_table_col(expr: &Expr, tbl: &TableSchema, alias: Option<&str>) -> Option<String> {
     let Expr::Column { table, column } = expr else {
         return None;
     };
@@ -228,7 +224,9 @@ pub fn expr_is_table_independent(expr: &Expr) -> bool {
         Expr::Column { .. } | Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
             false
         }
-        Expr::Unary { expr, .. } | Expr::Collate { expr, .. } | Expr::IsNull { expr, .. }
+        Expr::Unary { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. } => expr_is_table_independent(expr),
         Expr::Binary { left, right, .. } => {
             expr_is_table_independent(left) && expr_is_table_independent(right)
@@ -402,7 +400,10 @@ pub fn expr_contains_subquery(expr: &Expr) -> bool {
 
 pub fn expr_column_label(expr: &Expr) -> String {
     match expr {
-        Expr::Column { table: None, column } => column.clone(),
+        Expr::Column {
+            table: None,
+            column,
+        } => column.clone(),
         Expr::Column {
             table: Some(t),
             column,
@@ -464,7 +465,11 @@ pub fn expr_column_label(expr: &Expr) -> String {
                 BinaryOp::And => "AND",
                 BinaryOp::Or => "OR",
             };
-            format!("{} {sym} {}", expr_column_label(left), expr_column_label(right))
+            format!(
+                "{} {sym} {}",
+                expr_column_label(left),
+                expr_column_label(right)
+            )
         }
         _ => "?column?".to_owned(),
     }
@@ -521,12 +526,11 @@ pub fn try_compile_select(stmt: &SelectStmt, schema: &Schema) -> Result<Option<V
             return Ok(None);
         }
     }
-    if let Some(lim) = &stmt.limit {
-        if expr_contains_subquery(&lim.limit)
-            || lim.offset.as_ref().is_some_and(expr_contains_subquery)
-        {
-            return Ok(None);
-        }
+    if let Some(lim) = &stmt.limit
+        && (expr_contains_subquery(&lim.limit)
+            || lim.offset.as_ref().is_some_and(expr_contains_subquery))
+    {
+        return Ok(None);
     }
 
     match from {
@@ -534,7 +538,8 @@ pub fn try_compile_select(stmt: &SelectStmt, schema: &Schema) -> Result<Option<V
             if !stmt.order_by.is_empty() {
                 // Trivial 1-row tableless query; ORDER BY is a no-op if valid
             }
-            let prog = compile_tableless_select(projection, selection.as_ref(), stmt.limit.as_ref())?;
+            let prog =
+                compile_tableless_select(projection, selection.as_ref(), stmt.limit.as_ref())?;
             Ok(Some(prog))
         }
         Some(FromClause { head, joins }) if joins.is_empty() => {
@@ -585,15 +590,10 @@ fn compile_tableless_select(
     for rc in projection {
         match rc {
             ResultColumn::Star | ResultColumn::TableStar(_) => {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    "no tables specified",
-                ));
+                return Err(SqliteError::new(ErrorCode::Error, "no tables specified"));
             }
             ResultColumn::Expr { expr, alias } => {
-                let name = alias
-                    .clone()
-                    .unwrap_or_else(|| expr_column_label(expr));
+                let name = alias.clone().unwrap_or_else(|| expr_column_label(expr));
                 col_names.push(name);
                 proj_exprs.push(expr.clone());
             }
@@ -712,8 +712,13 @@ fn compile_single_table_select(
     let body_start = prog.current_addr();
     prog.emit(Instruction::new(Opcode::Transaction, 0, 0, 0));
     prog.emit(
-        Instruction::new(Opcode::OpenRead, tbl_cursor, tbl.root_pgno as i32, tbl.columns.len() as i32)
-            .with_comment(tbl.name.clone()),
+        Instruction::new(
+            Opcode::OpenRead,
+            tbl_cursor,
+            tbl.root_pgno as i32,
+            tbl.columns.len() as i32,
+        )
+        .with_comment(tbl.name.clone()),
     );
 
     // Optional LIMIT / OFFSET registers initialized before loop
@@ -761,8 +766,13 @@ fn compile_single_table_select(
             });
         }
         prog.emit(
-            Instruction::new(Opcode::SorterOpen, s_cursor, (sort_sources.len() + expanded.len()) as i32, 0)
-                .with_p4(P4::KeyInfo(sort_orders)),
+            Instruction::new(
+                Opcode::SorterOpen,
+                s_cursor,
+                (sort_sources.len() + expanded.len()) as i32,
+                0,
+            )
+            .with_p4(P4::KeyInfo(sort_orders)),
         );
         Some((s_cursor, sort_sources))
     } else {
@@ -813,9 +823,12 @@ fn compile_single_table_select(
                 compile_expr(&mut prog, ke, None, r)?;
                 let col_aff = index.columns[i]
                     .col_idx
-                    .map_or(sqliters_types::TypeAffinity::Blob, |ci| tbl.columns[ci].affinity);
+                    .map_or(sqliters_types::TypeAffinity::Blob, |ci| {
+                        tbl.columns[ci].affinity
+                    });
                 prog.emit(
-                    Instruction::new(Opcode::Affinity, r, 1, 0).with_p4(P4::Affinity(vec![col_aff])),
+                    Instruction::new(Opcode::Affinity, r, 1, 0)
+                        .with_p4(P4::Affinity(vec![col_aff])),
                 );
             }
             let seek_ge = prog.emit(
@@ -880,7 +893,12 @@ fn compile_single_table_select(
                 let gt_r = prog.alloc_register();
                 prog.emit(Instruction::new(Opcode::Gt, off_reg, zero_reg, gt_r));
                 let skip_dec = prog.emit(Instruction::new(Opcode::JumpIfFalse, gt_r, 0, 1));
-                prog.emit(Instruction::new(Opcode::Subtract, off_reg, one_reg, off_reg));
+                prog.emit(Instruction::new(
+                    Opcode::Subtract,
+                    off_reg,
+                    one_reg,
+                    off_reg,
+                ));
                 jumps_next_row.push(prog.emit(goto_placeholder()));
                 let after_off = prog.current_addr();
                 prog.patch_p2(skip_dec, after_off);
@@ -892,7 +910,12 @@ fn compile_single_table_select(
             let le_r = prog.alloc_register();
             prog.emit(Instruction::new(Opcode::Le, rem_reg, zero_reg, le_r));
             jumps_after_scan.push(prog.emit(Instruction::new(Opcode::JumpIfTrue, le_r, 0, 0)));
-            prog.emit(Instruction::new(Opcode::Subtract, rem_reg, one_reg, rem_reg));
+            prog.emit(Instruction::new(
+                Opcode::Subtract,
+                rem_reg,
+                one_reg,
+                rem_reg,
+            ));
             let after_lim = prog.current_addr();
             prog.patch_p2(skip_lim, after_lim);
         }
@@ -917,7 +940,12 @@ fn compile_single_table_select(
 
     match &plan {
         AccessPlan::FullScan => {
-            prog.emit(Instruction::new(Opcode::Next, tbl_cursor, loop_top as i32, 0));
+            prog.emit(Instruction::new(
+                Opcode::Next,
+                tbl_cursor,
+                loop_top as i32,
+                0,
+            ));
         }
         AccessPlan::RowidSeek { .. } => {
             // Single point lookup: falls straight through!
@@ -957,7 +985,12 @@ fn compile_single_table_select(
                 let gt_r = prog.alloc_register();
                 prog.emit(Instruction::new(Opcode::Gt, off_reg, zero_reg, gt_r));
                 let skip_dec = prog.emit(Instruction::new(Opcode::JumpIfFalse, gt_r, 0, 1));
-                prog.emit(Instruction::new(Opcode::Subtract, off_reg, one_reg, off_reg));
+                prog.emit(Instruction::new(
+                    Opcode::Subtract,
+                    off_reg,
+                    one_reg,
+                    off_reg,
+                ));
                 jumps_sorter_next.push(prog.emit(goto_placeholder()));
                 let after_off = prog.current_addr();
                 prog.patch_p2(skip_dec, after_off);
@@ -968,7 +1001,12 @@ fn compile_single_table_select(
             let le_r = prog.alloc_register();
             prog.emit(Instruction::new(Opcode::Le, rem_reg, zero_reg, le_r));
             jumps_done.push(prog.emit(Instruction::new(Opcode::JumpIfTrue, le_r, 0, 0)));
-            prog.emit(Instruction::new(Opcode::Subtract, rem_reg, one_reg, rem_reg));
+            prog.emit(Instruction::new(
+                Opcode::Subtract,
+                rem_reg,
+                one_reg,
+                rem_reg,
+            ));
             let after_lim = prog.current_addr();
             prog.patch_p2(skip_lim, after_lim);
         }
@@ -1056,8 +1094,10 @@ fn resolve_order_by_source(
             return Some((OrderBySource::ProjCol(idx), proj_expr.clone()));
         }
     }
-    if let Some((idx, (proj_expr, _, _))) =
-        expanded.iter().enumerate().find(|(_, (pe, _, _))| pe == inner)
+    if let Some((idx, (proj_expr, _, _))) = expanded
+        .iter()
+        .enumerate()
+        .find(|(_, (pe, _, _))| pe == inner)
     {
         return Some((OrderBySource::ProjCol(idx), proj_expr.clone()));
     }
@@ -1103,7 +1143,9 @@ fn expr_uses_select_alias(
         }
         Expr::InList { expr: v, list, .. } => {
             expr_uses_select_alias(v, expanded, tbl)
-                || list.iter().any(|e| expr_uses_select_alias(e, expanded, tbl))
+                || list
+                    .iter()
+                    .any(|e| expr_uses_select_alias(e, expanded, tbl))
         }
         Expr::Like {
             expr: v,
@@ -1541,7 +1583,9 @@ fn compile_expr(
             );
         }
         Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::RowValue(_) => {
-            return Err(SqliteError::misuse("subquery must be evaluated by relational engine"));
+            return Err(SqliteError::misuse(
+                "subquery must be evaluated by relational engine",
+            ));
         }
     }
     Ok(())
@@ -1626,7 +1670,9 @@ pub fn compile_for_explain(stmt: &Stmt, schema: &Schema) -> Result<VdbeProgram> 
             let mut prog = VdbeProgram::new();
             prog.emit(Instruction::new(Opcode::Init, 0, 1, 0));
             prog.emit(Instruction::new(Opcode::Transaction, 0, 0, 0));
-            prog.emit(Instruction::new(Opcode::OpenEphemeral, 0, 0, 0).with_comment("relational query"));
+            prog.emit(
+                Instruction::new(Opcode::OpenEphemeral, 0, 0, 0).with_comment("relational query"),
+            );
             prog.emit(Instruction::new(Opcode::ResultRow, 1, 1, 0));
             prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
             Ok(prog)
@@ -1657,8 +1703,13 @@ fn compile_insert_explain(ins: &InsertStmt, schema: &Schema) -> Result<VdbeProgr
     prog.emit(Instruction::new(Opcode::Transaction, 0, 1, 0));
     let tcur = prog.alloc_cursor();
     prog.emit(
-        Instruction::new(Opcode::OpenWrite, tcur, tbl.root_pgno as i32, tbl.columns.len() as i32)
-            .with_comment(tbl.name.clone()),
+        Instruction::new(
+            Opcode::OpenWrite,
+            tcur,
+            tbl.root_pgno as i32,
+            tbl.columns.len() as i32,
+        )
+        .with_comment(tbl.name.clone()),
     );
     let indexes = schema.indexes_for_table(&tbl.name);
     let mut icurs = Vec::new();
@@ -1745,8 +1796,13 @@ fn compile_update_explain(upd: &UpdateStmt, schema: &Schema) -> Result<VdbeProgr
     prog.emit(Instruction::new(Opcode::Transaction, 0, 1, 0));
     let tcur = prog.alloc_cursor();
     prog.emit(
-        Instruction::new(Opcode::OpenWrite, tcur, tbl.root_pgno as i32, tbl.columns.len() as i32)
-            .with_comment(tbl.name.clone()),
+        Instruction::new(
+            Opcode::OpenWrite,
+            tcur,
+            tbl.root_pgno as i32,
+            tbl.columns.len() as i32,
+        )
+        .with_comment(tbl.name.clone()),
     );
     let rew = prog.emit(Instruction::new(Opcode::Rewind, tcur, 0, 0));
     let rid = prog.alloc_register();
@@ -1780,8 +1836,13 @@ fn compile_delete_explain(del: &DeleteStmt, schema: &Schema) -> Result<VdbeProgr
     prog.emit(Instruction::new(Opcode::Transaction, 0, 1, 0));
     let tcur = prog.alloc_cursor();
     prog.emit(
-        Instruction::new(Opcode::OpenWrite, tcur, tbl.root_pgno as i32, tbl.columns.len() as i32)
-            .with_comment(tbl.name.clone()),
+        Instruction::new(
+            Opcode::OpenWrite,
+            tcur,
+            tbl.root_pgno as i32,
+            tbl.columns.len() as i32,
+        )
+        .with_comment(tbl.name.clone()),
     );
     let rew = prog.emit(Instruction::new(Opcode::Rewind, tcur, 0, 0));
     prog.emit(Instruction::new(Opcode::Delete, tcur, 0, 0).with_p5(0x02));
@@ -1819,7 +1880,8 @@ pub fn explain_query_plan(stmt: &Stmt, schema: &Schema) -> Result<Vec<Vec<Value>
                     && let TableOrSubquery::Table { name, alias, .. } = &fc.head
                     && let Some(tbl) = schema.find_table(name)
                 {
-                    let plan = choose_access_plan(&tbl, alias.as_deref(), selection.as_ref(), schema);
+                    let plan =
+                        choose_access_plan(&tbl, alias.as_deref(), selection.as_ref(), schema);
                     let disp = alias.as_deref().unwrap_or(&tbl.name);
                     push_detail(plan.explain_detail(disp));
                 } else {
@@ -1848,14 +1910,16 @@ pub fn explain_query_plan(stmt: &Stmt, schema: &Schema) -> Result<Vec<Vec<Value>
         }
         Stmt::Update(upd) => {
             if let Some(tbl) = schema.find_table(&upd.table) {
-                let plan = choose_access_plan(&tbl, upd.alias.as_deref(), upd.selection.as_ref(), schema);
+                let plan =
+                    choose_access_plan(&tbl, upd.alias.as_deref(), upd.selection.as_ref(), schema);
                 let disp = upd.alias.as_deref().unwrap_or(&tbl.name);
                 push_detail(plan.explain_detail(disp));
             }
         }
         Stmt::Delete(del) => {
             if let Some(tbl) = schema.find_table(&del.table) {
-                let plan = choose_access_plan(&tbl, del.alias.as_deref(), del.selection.as_ref(), schema);
+                let plan =
+                    choose_access_plan(&tbl, del.alias.as_deref(), del.selection.as_ref(), schema);
                 let disp = del.alias.as_deref().unwrap_or(&tbl.name);
                 push_detail(plan.explain_detail(disp));
             }

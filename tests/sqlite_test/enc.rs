@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "0/0 subtests passed; pending: ATTACH, VIRTUAL TABLE, TEMP TABLE"]
 fn test_enc() {
-    sqliters_tcltest::run_test_script("enc", r#"
+    sqliters_tcltest::run_test_script(
+        "enc",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable {!utf16} {
@@ -198,5 +200,6 @@ do_execsql_test enc-14.1 {
     FROM t14 ORDER BY +n;
 } {1000 2000 1000 5000 10000 5000}
 finish_test
-"#);
+"#,
+    );
 }

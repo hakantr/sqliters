@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "8/46 subtests passed; pending: VIEW, TRIGGER, ATTACH"]
 fn test_alter2() {
-    sqliters_tcltest::run_test_script("alter2", r#"
+    sqliters_tcltest::run_test_script(
+        "alter2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable {!pragma} return
@@ -351,5 +353,6 @@ ifcapable bloblit {
   } {3}
 }
 finish_test
-"#);
+"#,
+    );
 }

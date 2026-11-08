@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "5/39 subtests passed; pending: func3 edge cases"]
 fn test_func3() {
-    sqliters_tcltest::run_test_script("func3", r#"
+    sqliters_tcltest::run_test_script(
+        "func3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable utf16 {
@@ -147,5 +149,6 @@ do_test func3-6.0 {
   sqlite3_create_function_v2 db nofunc 1 utf8
 } {}
 finish_test
-"#);
+"#,
+    );
 }

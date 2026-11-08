@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "8/16 subtests passed; pending: EQP/optimizer"]
 fn test_whereH() {
-    sqliters_tcltest::run_test_script("whereH", r#"
+    sqliters_tcltest::run_test_script(
+        "whereH",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_execsql_test whereH-1.1 {
@@ -114,5 +116,6 @@ do_execsql_test whereH-8.2 {
   SELECT d FROM t1 WHERE a=? AND b=? AND c=? AND d>=? ORDER BY d;
 } {~/TEMP B-TREE FOR ORDER BY/}
 finish_test
-"#);
+"#,
+    );
 }

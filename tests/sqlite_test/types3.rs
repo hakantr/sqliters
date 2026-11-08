@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "2/18 subtests passed; pending: types3 edge cases"]
 fn test_types3() {
-    sqliters_tcltest::run_test_script("types3", r#"
+    sqliters_tcltest::run_test_script(
+        "types3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test types3-1.1 {
@@ -90,5 +92,6 @@ do_execsql_test types3-3.5 {
   SELECT * FROM t1 WHERE NOT x=add_text_type(1.25);
 } {}
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "0/15 subtests passed; pending: VIRTUAL TABLE"]
 fn test_rowvalue5() {
-    sqliters_tcltest::run_test_script("rowvalue5", r#"
+    sqliters_tcltest::run_test_script(
+        "rowvalue5",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix rowvalue5
@@ -96,5 +98,6 @@ foreach {tn where res} {
   do_execsql_test 1.$tn "SELECT expr FROM x1 WHERE $where" $res
 }
 finish_test
-"#);
+"#,
+    );
 }

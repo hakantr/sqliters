@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "0/1 subtests passed; pending: C testfixture hooks"]
 fn test_index5() {
-    sqliters_tcltest::run_test_script("index5", r#"
+    sqliters_tcltest::run_test_script(
+        "index5",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix index5
@@ -64,5 +66,6 @@ do_test 1.3 {
 db close
 tvfs delete
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,6 +1,8 @@
 #[test]
 fn test_in2() {
-    sqliters_tcltest::run_test_script("in2", r#"
+    sqliters_tcltest::run_test_script(
+        "in2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test in2-1 {
@@ -30,5 +32,6 @@ for {set ::ii 3} {$::ii < $::N} {incr ::ii} {
   } {1}
 }
 finish_test
-"#);
+"#,
+    );
 }

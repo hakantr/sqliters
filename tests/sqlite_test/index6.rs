@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "40/73 subtests passed; pending: VIRTUAL TABLE, ANALYZE/sqlite_stat1, EQP/optimizer"]
 fn test_index6() {
-    sqliters_tcltest::run_test_script("index6", r#"
+    sqliters_tcltest::run_test_script(
+        "index6",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !vtab {
@@ -423,5 +425,6 @@ do_execsql_test index6-19.2 {
   SELECT * FROM t2 RIGHT JOIN t3 ON d<>0 LEFT JOIN t1 ON c=3 WHERE t1.a<>0;
 } {}
 finish_test
-"#);
+"#,
+    );
 }

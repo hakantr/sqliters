@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "2/6 subtests passed; pending: FOREIGN KEY constraint failed"]
 fn test_fkey4() {
-    sqliters_tcltest::run_test_script("fkey4", r#"
+    sqliters_tcltest::run_test_script(
+        "fkey4",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable {!foreignkey||!trigger} {
@@ -35,5 +37,6 @@ do_test fkey4-1.4 {
 sqlite3_finalize $::STMT1
 sqlite3_finalize $::STMT2
 finish_test
-"#);
+"#,
+    );
 }

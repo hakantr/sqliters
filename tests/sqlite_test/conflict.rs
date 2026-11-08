@@ -1,6 +1,8 @@
 #[test]
 fn test_conflict() {
-    sqliters_tcltest::run_test_script("conflict", r#"
+    sqliters_tcltest::run_test_script(
+        "conflict",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !conflict {
@@ -752,5 +754,6 @@ do_execsql_test conflict-17.6 {
   SELECT * FROM t1;
 } {1 x 2 y}
 finish_test
-"#);
+"#,
+    );
 }

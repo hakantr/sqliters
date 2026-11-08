@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "272/308 subtests passed; pending: TRIGGER, WINDOW, EQP/optimizer"]
 fn test_rowvalue() {
-    sqliters_tcltest::run_test_script("rowvalue", r#"
+    sqliters_tcltest::run_test_script(
+        "rowvalue",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix rowvalue
@@ -764,5 +766,6 @@ do_execsql_test 36.2 {
   SELECT (max(x),1,23) IN () FROM t1;
 } 0
 finish_test
-"#);
+"#,
+    );
 }

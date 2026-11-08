@@ -194,16 +194,20 @@ impl TextEncoding {
             },
             Self::Utf16Le => {
                 let iter = buf
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]));
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&c| u16::from_le_bytes(c));
                 char::decode_utf16(iter)
                     .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
                     .collect()
             }
             Self::Utf16Be => {
                 let iter = buf
-                    .chunks_exact(2)
-                    .map(|c| u16::from_be_bytes([c[0], c[1]]));
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&c| u16::from_be_bytes(c));
                 char::decode_utf16(iter)
                     .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
                     .collect()
@@ -250,12 +254,10 @@ impl Collation {
                     let mut ib = b.encode_utf16();
                     loop {
                         match (ia.next(), ib.next()) {
-                            (Some(ua), Some(ub)) => {
-                                match ua.to_le_bytes().cmp(&ub.to_le_bytes()) {
-                                    Ordering::Equal => continue,
-                                    non_eq => return non_eq,
-                                }
-                            }
+                            (Some(ua), Some(ub)) => match ua.to_le_bytes().cmp(&ub.to_le_bytes()) {
+                                Ordering::Equal => continue,
+                                non_eq => return non_eq,
+                            },
                             (None, Some(_)) => return Ordering::Less,
                             (Some(_), None) => return Ordering::Greater,
                             (None, None) => return Ordering::Equal,
@@ -606,15 +608,17 @@ pub fn parse_numeric_text(s: &str) -> Option<Value> {
     if trimmed.is_empty() {
         return None;
     }
-    if !trimmed.contains('.') && !trimmed.contains('e') && !trimmed.contains('E') {
-        if let Ok(i) = trimmed.parse::<i64>() {
-            return Some(Value::Integer(i));
-        }
+    if !trimmed.contains('.')
+        && !trimmed.contains('e')
+        && !trimmed.contains('E')
+        && let Ok(i) = trimmed.parse::<i64>()
+    {
+        return Some(Value::Integer(i));
     }
-    if let Ok(r) = trimmed.parse::<f64>() {
-        if r.is_finite() {
-            return Some(Value::real(r));
-        }
+    if let Ok(r) = trimmed.parse::<f64>()
+        && r.is_finite()
+    {
+        return Some(Value::real(r));
     }
     None
 }
@@ -626,11 +630,7 @@ fn real_to_exact_int(r: f64) -> Option<i64> {
         return None;
     }
     let i = r as i64;
-    if (i as f64) == r {
-        Some(i)
-    } else {
-        None
-    }
+    if (i as f64) == r { Some(i) } else { None }
 }
 
 fn parse_leading_i64(s: &str) -> i64 {

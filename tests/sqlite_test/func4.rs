@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "0/0 subtests passed; pending: no such function: tointeger"]
 fn test_func4() {
-    sqliters_tcltest::run_test_script("func4", r#"
+    sqliters_tcltest::run_test_script(
+        "func4",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set saved_tcl_precision $tcl_precision
@@ -748,5 +750,6 @@ ifcapable floatingpoint {
 set tcl_precision $saved_tcl_precision
 unset saved_tcl_precision
 finish_test
-"#);
+"#,
+    );
 }

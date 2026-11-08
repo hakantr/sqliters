@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "83/87 subtests passed; pending: select6 edge cases"]
 fn test_select6() {
-    sqliters_tcltest::run_test_script("select6", r#"
+    sqliters_tcltest::run_test_script(
+        "select6",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !subquery {
@@ -597,5 +599,6 @@ do_execsql_test 13.120 {
     WHERE t1.y
 } {1}
 finish_test
-"#);
+"#,
+    );
 }

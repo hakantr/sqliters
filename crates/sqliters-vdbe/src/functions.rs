@@ -99,11 +99,7 @@ pub fn format_utc_timestamp(unix_ms: i64) -> String {
 }
 
 /// Evaluates a built-in SQLite scalar function (`func.c`).
-pub fn eval_scalar_function(
-    name: &str,
-    args: &[Value],
-    ctx: &VmRuntimeContext,
-) -> Result<Value> {
+pub fn eval_scalar_function(name: &str, args: &[Value], ctx: &VmRuntimeContext) -> Result<Value> {
     let upper = name.to_ascii_uppercase();
     match upper.as_str() {
         "TYPEOF" => {
@@ -114,9 +110,10 @@ pub fn eval_scalar_function(
             check_arity(name, args, 1, 1)?;
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::Integer(i) => i.checked_abs().map(Value::Integer).ok_or_else(|| {
-                    SqliteError::new(ErrorCode::Mismatch, "integer overflow")
-                }),
+                Value::Integer(i) => i
+                    .checked_abs()
+                    .map(Value::Integer)
+                    .ok_or_else(|| SqliteError::new(ErrorCode::Mismatch, "integer overflow")),
                 other => Ok(Value::real(other.to_real_lossy().abs())),
             }
         }
@@ -234,7 +231,7 @@ pub fn eval_scalar_function(
 
             // SQLite 1-based substr indexing rules (including 0 and negative offsets!)
             let (start_idx, count) = if raw_start > 0 {
-                ((raw_start - 1) as i64, raw_len)
+                ((raw_start - 1), raw_len)
             } else if raw_start == 0 {
                 (0, raw_len - 1)
             } else {
@@ -301,13 +298,13 @@ pub fn eval_scalar_function(
                 return Ok(Value::Null);
             }
             let s = args[0].to_text_lossy();
-            if s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Ok(Value::Null);
             }
             let mut out = Vec::with_capacity(s.len() / 2);
-            for pair in s.as_bytes().chunks_exact(2) {
-                let byte = u8::from_str_radix(std::str::from_utf8(pair).unwrap_or("00"), 16)
-                    .unwrap_or(0);
+            for pair in s.as_bytes().as_chunks::<2>().0 {
+                let byte =
+                    u8::from_str_radix(std::str::from_utf8(pair).unwrap_or("00"), 16).unwrap_or(0);
                 out.push(byte);
             }
             Ok(Value::Blob(out))
@@ -388,7 +385,10 @@ pub fn eval_scalar_function(
                 return Ok(Value::Null);
             }
             let x = args[0].to_real_lossy();
-            let digits = args.get(1).map_or(0, Value::to_integer_lossy).clamp(-30, 30);
+            let digits = args
+                .get(1)
+                .map_or(0, Value::to_integer_lossy)
+                .clamp(-30, 30);
             if digits <= 0 {
                 // SQLite rounds half away from zero:
                 let r = if x >= 0.0 {
@@ -460,7 +460,8 @@ pub fn eval_scalar_function(
             } else {
                 None
             };
-            let matched = sqlite_like_match(&args[0].to_text_lossy(), &args[1].to_text_lossy(), esc);
+            let matched =
+                sqlite_like_match(&args[0].to_text_lossy(), &args[1].to_text_lossy(), esc);
             Ok(Value::Integer(i64::from(matched)))
         }
         "GLOB" => {
@@ -537,7 +538,11 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + i64::from(doe) - 719_468
 }
 
-fn parse_time_value_to_unix_ms(val: &Value, modifiers: &[Value], ctx: &VmRuntimeContext) -> Option<i64> {
+fn parse_time_value_to_unix_ms(
+    val: &Value,
+    modifiers: &[Value],
+    ctx: &VmRuntimeContext,
+) -> Option<i64> {
     if val.is_null() || modifiers.iter().any(Value::is_null) {
         return None;
     }
@@ -572,10 +577,9 @@ fn parse_time_value_to_unix_ms(val: &Value, modifiers: &[Value], ctx: &VmRuntime
         if mt.eq_ignore_ascii_case("unixepoch") || mt.eq_ignore_ascii_case("utc") {
             continue;
         }
-        if let Some(delta_ms) = parse_relative_modifier_ms(mt) {
+        {
+            let delta_ms = parse_relative_modifier_ms(mt)?;
             ms = ms.saturating_add(delta_ms);
-        } else {
-            return None;
         }
     }
     Some(ms)
@@ -583,7 +587,10 @@ fn parse_time_value_to_unix_ms(val: &Value, modifiers: &[Value], ctx: &VmRuntime
 
 fn parse_iso_datetime_ms(s: &str) -> Option<i64> {
     // Supports "YYYY-MM-DD", "YYYY-MM-DD HH:MM[:SS]", "YYYY-MM-DDTHH:MM[:SS][Z]", or "HH:MM[:SS]"
-    let s = s.strip_suffix('Z').or_else(|| s.strip_suffix('z')).unwrap_or(s);
+    let s = s
+        .strip_suffix('Z')
+        .or_else(|| s.strip_suffix('z'))
+        .unwrap_or(s);
     if s.len() >= 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-' {
         let y: i64 = s.get(0..4)?.parse().ok()?;
         let m: u32 = s.get(5..7)?.parse().ok()?;
@@ -1062,7 +1069,7 @@ impl AggregateAccumulator {
         }
         if self.distinct {
             if self.collation == Collation::Binary {
-                let key = sqliters_types::encode_record(&[first.clone()]);
+                let key = sqliters_types::encode_record(std::slice::from_ref(first));
                 if !self.seen.insert(key) {
                     return Ok(());
                 }
@@ -1154,9 +1161,9 @@ impl AggregateAccumulator {
                 if self.has_float {
                     Ok(Value::real((self.int_sum as f64) + self.float_sum))
                 } else {
-                    i64::try_from(self.int_sum).map(Value::Integer).map_err(|_| {
-                        SqliteError::new(ErrorCode::Mismatch, "integer overflow")
-                    })
+                    i64::try_from(self.int_sum)
+                        .map(Value::Integer)
+                        .map_err(|_| SqliteError::new(ErrorCode::Mismatch, "integer overflow"))
                 }
             }
             AggregateKind::Total => {
@@ -1171,13 +1178,10 @@ impl AggregateAccumulator {
                     Ok(Value::real(sum / (self.count as f64)))
                 }
             }
-            AggregateKind::Min | AggregateKind::Max => {
-                Ok(self.best.clone().unwrap_or(Value::Null))
+            AggregateKind::Min | AggregateKind::Max => Ok(self.best.clone().unwrap_or(Value::Null)),
+            AggregateKind::GroupConcat => {
+                Ok(self.concat_buf.clone().map_or(Value::Null, Value::Text))
             }
-            AggregateKind::GroupConcat => Ok(self
-                .concat_buf
-                .clone()
-                .map_or(Value::Null, Value::Text)),
         }
     }
 }

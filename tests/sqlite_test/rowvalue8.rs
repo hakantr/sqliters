@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "0/3 subtests passed; pending: rowvalue8 edge cases"]
 fn test_rowvalue8() {
-    sqliters_tcltest::run_test_script("rowvalue8", r#"
+    sqliters_tcltest::run_test_script(
+        "rowvalue8",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix rowvalue8
@@ -44,5 +46,6 @@ do_execsql_test 2.1 {
    ORDER BY +x;
 } {1 - | 2 gimel | 3 bet | 4 aleph | 5 bet | 6 aleph |}
 finish_test
-"#);
+"#,
+    );
 }

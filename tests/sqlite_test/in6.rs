@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "8/10 subtests passed; pending: ANALYZE/sqlite_stat1, C testfixture hooks"]
 fn test_in6() {
-    sqliters_tcltest::run_test_script("in6", r#"
+    sqliters_tcltest::run_test_script(
+        "in6",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix in6
@@ -84,5 +86,6 @@ do_execsql_test in6-3.130 {
     FROM t2 LEFT JOIN t1 ON a=x AND b in (null,0,10);
 } {NULL NULL NULL x '0' '0' '10' x '10' '10' '10' x}
 finish_test
-"#);
+"#,
+    );
 }

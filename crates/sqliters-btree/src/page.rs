@@ -258,7 +258,9 @@ impl ParsedPage {
     pub fn parse(pgno: Pgno, usable_size: u32, raw: &[u8]) -> Result<Self> {
         let usable = usable_size as usize;
         if raw.len() < usable {
-            return Err(SqliteError::corrupt("raw page buffer smaller than usable_size"));
+            return Err(SqliteError::corrupt(
+                "raw page buffer smaller than usable_size",
+            ));
         }
         let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
         let page_type = BtreePageType::from_byte(raw[hdr_off])?;
@@ -346,8 +348,7 @@ impl ParsedPage {
                     if slice.len() < 5 {
                         return Err(SqliteError::corrupt("truncated table interior cell"));
                     }
-                    let left_child =
-                        u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]);
+                    let left_child = u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]);
                     let (key, _) = get_varint_i64(&slice[4..])?;
                     cells.push(TableInteriorCell { left_child, key });
                 }
@@ -399,8 +400,7 @@ impl ParsedPage {
                     if slice.len() < 5 {
                         return Err(SqliteError::corrupt("truncated index interior cell"));
                     }
-                    let left_child =
-                        u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]);
+                    let left_child = u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]);
                     let (payload_u64, n1) = get_varint(&slice[4..])?;
                     let total_payload_len = u32::try_from(payload_u64)
                         .map_err(|_| SqliteError::corrupt("index interior payload > 4GiB"))?;
@@ -642,6 +642,7 @@ pub fn last_table_leaf_rowid(pgno: Pgno, usable_size: u32, raw: &[u8]) -> Result
 }
 
 /// Binary-searches a raw `TableLeaf` (`0x0d`) page for `rowid`, decoding only the matching cell!
+#[allow(clippy::type_complexity)]
 pub fn seek_table_leaf_cell(
     pgno: Pgno,
     usable_size: u32,

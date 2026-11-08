@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "0/4 subtests passed; pending: EQP/optimizer"]
 fn test_whereE() {
-    sqliters_tcltest::run_test_script("whereE", r#"
+    sqliters_tcltest::run_test_script(
+        "whereE",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix whereE
@@ -50,5 +52,6 @@ do_execsql_test 1.4 {
   EXPLAIN QUERY PLAN SELECT x FROM t2, t1 WHERE a=z AND c=x;
 } {/.*SCAN t1.*SEARCH t2.*/}
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,5 +1,6 @@
 //! `sqliters` — Zero-dependency Rust port of SQLite 3.54.1's rollback-journal storage and SQL engine,
 //! interoperable with SQLite Format 3 database files (`UTF-8`, `UTF-16le`, `UTF-16be`).
+#![forbid(unsafe_code)]
 //!
 //! # Quick Start
 //!
@@ -53,9 +54,9 @@ pub use sqliters_core::{
 };
 pub use sqliters_syntax::{FkAction, is_complete, parse_one, parse_statements};
 pub use sqliters_types::{
-    Collation, ConflictResolutionEffect, ErrorCode, Pgno, Result, SQLITE_DEFAULT_PAGE_SIZE,
-    SQLITE_FILE_HEADER, SQLITE_SOURCE_ID, SQLITE_VERSION, SQLITE_VERSION_NUMBER, SqliteError,
-    StorageClass, TextEncoding, TypeAffinity, Value,
+    Collation, ConflictResolutionEffect, DatabaseKind, ErrorCode, LockGeometry, Pgno, Result,
+    SQLITE_DEFAULT_PAGE_SIZE, SQLITE_FILE_HEADER, SQLITE_SOURCE_ID, SQLITE_VERSION,
+    SQLITE_VERSION_NUMBER, SqliteError, StorageClass, TextEncoding, TypeAffinity, Value,
 };
 pub use sqliters_vfs::{LockLevel, MemoryVfs, OpenFlags, OsVfs, SyncFlags, Vfs, VfsFile};
 

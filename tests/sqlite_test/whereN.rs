@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "0/2 subtests passed; pending: ANALYZE/sqlite_stat1, EQP/optimizer"]
 fn test_whereN() {
-    sqliters_tcltest::run_test_script("whereN", r#"
+    sqliters_tcltest::run_test_script(
+        "whereN",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix whereN
@@ -50,5 +52,6 @@ do_eqp_test 1.1 {
   `--SCAN (subquery-xxxxxx)
 }
 finish_test
-"#);
+"#,
+    );
 }

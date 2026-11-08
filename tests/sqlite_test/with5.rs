@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "7/17 subtests passed; pending: with5 edge cases"]
 fn test_with5() {
-    sqliters_tcltest::run_test_script("with5", r#"
+    sqliters_tcltest::run_test_script(
+        "with5",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix with5
@@ -198,5 +200,6 @@ do_execsql_test 410 {
   SELECT * FROM c;
 } {1}
 finish_test
-"#);
+"#,
+    );
 }

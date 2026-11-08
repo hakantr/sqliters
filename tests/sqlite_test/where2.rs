@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "58/106 subtests passed; pending: VIEW, EQP/optimizer, C testfixture hooks"]
 fn test_where2() {
-    sqliters_tcltest::run_test_script("where2", r#"
+    sqliters_tcltest::run_test_script(
+        "where2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test where2-1.0 {
@@ -766,5 +768,6 @@ do_execsql_test where2-17.1 {
   SELECT * FROM t1 WHERE (a='a' COLLATE nocase) OR a='b' ORDER BY +a;
 } {A b}
 finish_test
-"#);
+"#,
+    );
 }

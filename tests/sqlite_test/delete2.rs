@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "12/13 subtests passed; pending: delete2 edge cases"]
 fn test_delete2() {
-    sqliters_tcltest::run_test_script("delete2", r#"
+    sqliters_tcltest::run_test_script(
+        "delete2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test delete2-1.1 {
@@ -70,5 +72,6 @@ do_test delete2-2.2 {
   set res
 } {{} 3 4 {} 5 6}
 finish_test
-"#);
+"#,
+    );
 }

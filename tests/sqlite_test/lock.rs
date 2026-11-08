@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "48/64 subtests passed; pending: TEMP TABLE"]
 fn test_lock() {
-    sqliters_tcltest::run_test_script("lock", r#"
+    sqliters_tcltest::run_test_script(
+        "lock",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test lock-1.0 {
@@ -344,5 +346,6 @@ do_test lock-999.1 {
   rename db2 {}
 } {}
 finish_test
-"#);
+"#,
+    );
 }

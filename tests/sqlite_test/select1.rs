@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "126/195 subtests passed; pending: VIEW"]
 fn test_select1() {
-    sqliters_tcltest::run_test_script("select1", r##"
+    sqliters_tcltest::run_test_script(
+        "select1",
+        r##"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test select1-1.1 {
@@ -1102,5 +1104,6 @@ do_execsql_test select1-24.1 {
    GROUP BY y;
 } {text 0 text}
 finish_test
-"##);
+"##,
+    );
 }

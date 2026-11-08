@@ -177,9 +177,8 @@ pub fn decode_serial_value_with_encoding(
         }
         5 => {
             let sign = if (buf[0] & 0x80) != 0 { 0xff } else { 0x00 };
-            let v = i64::from_be_bytes([
-                sign, sign, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5],
-            ]);
+            let v =
+                i64::from_be_bytes([sign, sign, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]]);
             Ok(Value::Integer(v))
         }
         6 => {

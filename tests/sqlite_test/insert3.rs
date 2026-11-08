@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "3/18 subtests passed; pending: TRIGGER"]
 fn test_insert3() {
-    sqliters_tcltest::run_test_script("insert3", r#"
+    sqliters_tcltest::run_test_script(
+        "insert3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable {trigger} {
@@ -172,5 +174,6 @@ do_test insert3-4.2 {
   }
 } {}
 finish_test
-"#);
+"#,
+    );
 }

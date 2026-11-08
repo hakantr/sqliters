@@ -1,6 +1,8 @@
 #[test]
 fn test_notnull2() {
-    sqliters_tcltest::run_test_script("notnull2", r#"
+    sqliters_tcltest::run_test_script(
+        "notnull2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix notnull2
@@ -87,5 +89,6 @@ do_execsql_test 5.0 {
   SELECT a IS NULL, a IS NOT NULL, count(*) FROM t1;
 } {1 0 0}
 finish_test
-"#);
+"#,
+    );
 }

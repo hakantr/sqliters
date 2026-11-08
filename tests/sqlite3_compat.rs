@@ -108,12 +108,18 @@ fn test_c_sqlite3_writes_db_sqliters_reads_and_mutates() {
         let ic = conn.query("PRAGMA integrity_check;", &[]).unwrap();
         assert_eq!(ic.rows[0][0], Value::Text("ok".into()));
 
-        let cnt = conn.query_row("SELECT COUNT(*) FROM users;", &[]).unwrap().unwrap();
+        let cnt = conn
+            .query_row("SELECT COUNT(*) FROM users;", &[])
+            .unwrap()
+            .unwrap();
         assert_eq!(cnt.get_i64(0), Some(140));
 
         // Seek by INTEGER PRIMARY KEY (`OP_SeekRowid`)
         let plan_pk = conn
-            .query("EXPLAIN QUERY PLAN SELECT full_name FROM users WHERE id = 1;", &[])
+            .query(
+                "EXPLAIN QUERY PLAN SELECT full_name FROM users WHERE id = 1;",
+                &[],
+            )
             .unwrap();
         assert!(
             plan_pk.rows[0][3]
@@ -562,11 +568,7 @@ fn test_disk_transaction_rollback_and_vdbe_explain_bytecode() {
             )
             .unwrap();
         assert_eq!(explain.column_names.len(), 8);
-        let opcodes: Vec<&str> = explain
-            .rows
-            .iter()
-            .filter_map(|r| r.get_str(1))
-            .collect();
+        let opcodes: Vec<&str> = explain.rows.iter().filter_map(|r| r.get_str(1)).collect();
         assert!(opcodes.contains(&"Init"));
         assert!(opcodes.contains(&"OpenRead"));
         assert!(opcodes.contains(&"SeekGE"));
@@ -576,7 +578,10 @@ fn test_disk_transaction_rollback_and_vdbe_explain_bytecode() {
 
     assert_eq!(run_c_sqlite3(tmp.path(), "PRAGMA integrity_check;"), "ok");
     assert_eq!(
-        run_c_sqlite3(tmp.path(), "SELECT id, owner, balance FROM accounts ORDER BY id;"),
+        run_c_sqlite3(
+            tmp.path(),
+            "SELECT id, owner, balance FROM accounts ORDER BY id;"
+        ),
         "1|Ada|1000\n2|Alan|2000"
     );
 }

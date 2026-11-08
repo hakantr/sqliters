@@ -1,6 +1,8 @@
 #[test]
 fn test_selectG() {
-    sqliters_tcltest::run_test_script("selectG", r#"
+    sqliters_tcltest::run_test_script(
+        "selectG",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix selectG
@@ -28,5 +30,6 @@ do_test 120 {
   expr {$n<10}
 } {1}
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "22/61 subtests passed; pending: VIEW, C testfixture hooks"]
 fn test_whereD() {
-    sqliters_tcltest::run_test_script("whereD", r#"
+    sqliters_tcltest::run_test_script(
+        "whereD",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix whereD
@@ -368,5 +370,6 @@ do_execsql_test 7.5 {
   {} {} {} 9
 }
 finish_test
-"#);
+"#,
+    );
 }

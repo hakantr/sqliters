@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "1/22 subtests passed; pending: collate9 edge cases"]
 fn test_collate9() {
-    sqliters_tcltest::run_test_script("collate9", r#"
+    sqliters_tcltest::run_test_script(
+        "collate9",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 proc reverse_sort {lhs rhs} {
@@ -135,5 +137,6 @@ ifcapable reindex {
   } {one three two nosort}
 }
 finish_test
-"#);
+"#,
+    );
 }

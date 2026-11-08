@@ -1,6 +1,8 @@
 #[test]
 fn test_fkey3() {
-    sqliters_tcltest::run_test_script("fkey3", r#"
+    sqliters_tcltest::run_test_script(
+        "fkey3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable {!foreignkey||!trigger} {
@@ -145,5 +147,6 @@ do_catchsql_test 3.6.5 {
   UPDATE TestTable SET parent_id=1000 where id=2;
 } {1 {FOREIGN KEY constraint failed}}
 finish_test
-"#);
+"#,
+    );
 }

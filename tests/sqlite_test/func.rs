@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "2186/2190 subtests passed; pending: VIEW, TRIGGER, TEMP TABLE"]
 fn test_func() {
-    sqliters_tcltest::run_test_script("func", r#"
+    sqliters_tcltest::run_test_script(
+        "func",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix func
@@ -1368,5 +1370,6 @@ for {set i 2} {$i<10} {incr i} {
   } {Inf Inf Inf}
 }
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "54/122 subtests passed; pending: VIEW, TRIGGER, ATTACH"]
 fn test_alter() {
-    sqliters_tcltest::run_test_script("alter", r#"
+    sqliters_tcltest::run_test_script(
+        "alter",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !altertable {
@@ -848,5 +850,6 @@ do_catchsql_test alter-22.2 {
   ALTER TABLE t1 ADD COLUMN c CHECK( if(c<10,1,sqlite_fail('bummer',1)));
 } {1 {error in table t1 after add column: no such function: sqlite_fail}}
 finish_test
-"#);
+"#,
+    );
 }

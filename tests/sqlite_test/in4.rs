@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "64/83 subtests passed; pending: VIRTUAL TABLE, ANALYZE/sqlite_stat1, EQP/optimizer"]
 fn test_in4() {
-    sqliters_tcltest::run_test_script("in4", r#"
+    sqliters_tcltest::run_test_script(
+        "in4",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix in4
@@ -439,5 +441,6 @@ do_execsql_test 14.2 {
   EXPLAIN SELECT count(*) FROM t2 WHERE d IN (SELECT f FROM t3)
 }]
 finish_test
-"#);
+"#,
+    );
 }

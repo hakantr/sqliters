@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "48/81 subtests passed; pending: VIEW"]
 fn test_joinH() {
-    sqliters_tcltest::run_test_script("joinH", r#"
+    sqliters_tcltest::run_test_script(
+        "joinH",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix joinH
@@ -391,5 +393,6 @@ do_execsql_test 17.2 {
   WHERE (t0.c2 IS ( SELECT count(*) FROM e1 WHERE v0.c0=555 ))
 } {0 0}
 finish_test
-"#);
+"#,
+    );
 }

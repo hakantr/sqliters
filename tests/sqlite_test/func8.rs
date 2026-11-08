@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "0/8 subtests passed; pending: func8 edge cases"]
 fn test_func8() {
-    sqliters_tcltest::run_test_script("func8", r#"
+    sqliters_tcltest::run_test_script(
+        "func8",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 proc joinx {args} {return [join $args -]}
@@ -50,5 +52,6 @@ do_execsql_test func8-170 {
   SELECT right(cross,full,inner,left,natural,outer,right) FROM right;
 } right-1-2-3-4-5-6-7
 finish_test
-"#);
+"#,
+    );
 }

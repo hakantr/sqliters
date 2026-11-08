@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "49/158 subtests passed; pending: VIEW, EQP/optimizer, C testfixture hooks"]
 fn test_like() {
-    sqliters_tcltest::run_test_script("like", r#"
+    sqliters_tcltest::run_test_script(
+        "like",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix like
@@ -988,5 +990,6 @@ do_execsql_test 18.2 {
   SELECT * FROM t2;
 } {1 abc}
 finish_test
-"#);
+"#,
+    );
 }

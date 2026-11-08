@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "33/46 subtests passed; pending: whereC edge cases"]
 fn test_whereC() {
-    sqliters_tcltest::run_test_script("whereC", r#"
+    sqliters_tcltest::run_test_script(
+        "whereC",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix whereC
@@ -56,5 +58,6 @@ foreach {tn sql res} {
   do_execsql_test 1.$tn.3 "$sql ORDER BY i DESC" [lsort -integer -dec  $res]
 }
 finish_test
-"#);
+"#,
+    );
 }

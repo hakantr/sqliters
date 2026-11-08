@@ -1,4 +1,5 @@
 //! `sqliters` interactive REPL and batch command-line shell, ported from SQLite's `shell.c.in`.
+#![forbid(unsafe_code)]
 
 use std::env;
 use std::fs;
@@ -102,9 +103,7 @@ fn main() -> ExitCode {
         i += 1;
     }
 
-    let db_target = positional
-        .first()
-        .map_or(":memory:", String::as_str);
+    let db_target = positional.first().map_or(":memory:", String::as_str);
 
     let mut conn = match open_db(db_target, cfg.readonly) {
         Ok(c) => c,
@@ -244,7 +243,9 @@ fn execute_sql_buffer(
         let single_chunk = &sql[..consumed_len];
         if !single_chunk.trim().is_empty() {
             let qres = conn.query(single_chunk, &[])?;
-            if !qres.rows.is_empty() || (cfg.headers && !qres.column_names.is_empty() && cfg.mode == OutputMode::Json) {
+            if !qres.rows.is_empty()
+                || (cfg.headers && !qres.column_names.is_empty() && cfg.mode == OutputMode::Json)
+            {
                 render_query_result(&qres, cfg);
             }
         }
@@ -346,7 +347,10 @@ fn handle_dot_command(conn: &mut Connection, cfg: &mut ShellConfig, cmd_line: &s
         }
         ".headers" | ".header" => {
             if let Some(&arg) = parts.get(1) {
-                cfg.headers = matches!(arg.to_ascii_lowercase().as_str(), "on" | "1" | "true" | "yes");
+                cfg.headers = matches!(
+                    arg.to_ascii_lowercase().as_str(),
+                    "on" | "1" | "true" | "yes"
+                );
             }
         }
         ".separator" => {
@@ -387,7 +391,8 @@ fn handle_dot_command(conn: &mut Connection, cfg: &mut ShellConfig, cmd_line: &s
                 println!("{};", tbl.raw_sql.trim_end_matches(';'));
                 if let Ok(qres) = conn.query(&format!("SELECT * FROM \"{}\"", tbl.name), &[]) {
                     for row in &qres.rows {
-                        let vals: Vec<String> = row.values().iter().map(format_sql_literal).collect();
+                        let vals: Vec<String> =
+                            row.values().iter().map(format_sql_literal).collect();
                         println!("INSERT INTO {} VALUES({});", tbl.name, vals.join(","));
                     }
                 }
@@ -400,7 +405,9 @@ fn handle_dot_command(conn: &mut Connection, cfg: &mut ShellConfig, cmd_line: &s
             println!("COMMIT;");
         }
         other => {
-            eprintln!("Error: unknown command or invalid arguments: \"{other}\". Enter \".help\" for help");
+            eprintln!(
+                "Error: unknown command or invalid arguments: \"{other}\". Enter \".help\" for help"
+            );
         }
     }
     false

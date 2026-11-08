@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "18/37 subtests passed; pending: TRIGGER, ATTACH"]
 fn test_fkey8() {
-    sqliters_tcltest::run_test_script("fkey8", r#"
+    sqliters_tcltest::run_test_script(
+        "fkey8",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix fkey8
@@ -243,5 +245,6 @@ do_execsql_test 7.4 {
   SELECT * FROM aux.c1;
 } {11 100 12 100 21 200 22 200}
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "604/660 subtests passed; pending: expr edge cases"]
 fn test_expr() {
-    sqliters_tcltest::run_test_script("expr", r##"
+    sqliters_tcltest::run_test_script(
+        "expr",
+        r##"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable floatingpoint {
@@ -987,5 +989,6 @@ do_execsql_test expr-16.102 {
   FROM dual LEFT JOIN t1;
 } {1}
 finish_test
-"##);
+"##,
+    );
 }

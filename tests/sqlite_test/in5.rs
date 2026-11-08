@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "37/44 subtests passed; pending: VIEW"]
 fn test_in5() {
-    sqliters_tcltest::run_test_script("in5", r#"
+    sqliters_tcltest::run_test_script(
+        "in5",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix in5
@@ -230,5 +232,6 @@ do_execsql_test 10.3 {
   SELECT rowid FROM t1 WHERE (a, b) IN ( VALUES('abc', 'def'), ('ghi', 'JKL') );
 } {1 2}
 finish_test
-"#);
+"#,
+    );
 }

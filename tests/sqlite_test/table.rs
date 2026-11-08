@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "66/96 subtests passed; pending: ATTACH, TEMP TABLE, ANALYZE/sqlite_stat1"]
 fn test_table() {
-    sqliters_tcltest::run_test_script("table", r#"
+    sqliters_tcltest::run_test_script(
+        "table",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test table-1.1 {
@@ -662,5 +664,6 @@ do_execsql_test table-19.1 {
   SELECT name FROM t19 ORDER BY name;
 } {{} savepoint t10 t11 t12 t13 t16 t2 t3 t3\"xyz t4\"abc t7 t8 t9 tablet8 test1 weird}
 finish_test
-"#);
+"#,
+    );
 }

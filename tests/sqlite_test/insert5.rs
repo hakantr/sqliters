@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "4/12 subtests passed; pending: VIEW"]
 fn test_insert5() {
-    sqliters_tcltest::run_test_script("insert5", r#"
+    sqliters_tcltest::run_test_script(
+        "insert5",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !subquery {
@@ -85,5 +87,6 @@ do_execsql_test insert5-2.10 {
   SELECT (SELECT c FROM t2 ORDER BY coalesce(d,a) LIMIT 1) FROM t1;
 } {10}
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "117/407 subtests passed; pending: trans2 edge cases"]
 fn test_trans2() {
-    sqliters_tcltest::run_test_script("trans2", r#"
+    sqliters_tcltest::run_test_script(
+        "trans2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 proc scramble {inlist} {
@@ -178,5 +180,6 @@ for {set i 2} {$i<=30} {incr i} {
 unset -nocomplain data i max_rowid todel n rec max1 id origres newres
 unset -nocomplain inssql modsql s j z
 finish_test
-"#);
+"#,
+    );
 }

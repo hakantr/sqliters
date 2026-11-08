@@ -1,6 +1,8 @@
 #[test]
 fn test_conflict2() {
-    sqliters_tcltest::run_test_script("conflict2", r#"
+    sqliters_tcltest::run_test_script(
+        "conflict2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !conflict {
@@ -709,5 +711,6 @@ do_execsql_test conflict2-14.2 {
   SELECT x,y,z FROM t1 NOT INDEXED;
 } {ok alpha gamma alpha gamma 1}
 finish_test
-"#);
+"#,
+    );
 }

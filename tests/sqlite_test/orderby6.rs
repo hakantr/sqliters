@@ -1,6 +1,8 @@
 #[test]
 fn test_orderby6() {
-    sqliters_tcltest::run_test_script("orderby6", r#"
+    sqliters_tcltest::run_test_script(
+        "orderby6",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix orderby6
@@ -148,5 +150,6 @@ foreach {tn rowidclause} {1 {} 2 {WITHOUT ROWID}} {
 
 }
 finish_test
-"#);
+"#,
+    );
 }

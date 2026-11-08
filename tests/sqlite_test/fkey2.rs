@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "1019/1216 subtests passed; pending: VIEW, TRIGGER, ATTACH"]
 fn test_fkey2() {
-    sqliters_tcltest::run_test_script("fkey2", r#"
+    sqliters_tcltest::run_test_script(
+        "fkey2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable {!foreignkey||!trigger} {
@@ -1772,5 +1774,6 @@ do_test fkey2-20150416-100 {
   }
 } {1 {foreign key mismatch - "t" referencing "t0"}}
 finish_test
-"#);
+"#,
+    );
 }

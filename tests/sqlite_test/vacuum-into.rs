@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "1/16 subtests passed; pending: C testfixture hooks"]
 fn test_vacuum_into() {
-    sqliters_tcltest::run_test_script("vacuum-into", r#"
+    sqliters_tcltest::run_test_script(
+        "vacuum-into",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable {!vacuum} {
@@ -165,5 +167,6 @@ foreach {tn pragma res} {
 db close
 tvfs delete
 finish_test
-"#);
+"#,
+    );
 }

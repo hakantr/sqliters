@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "68/108 subtests passed; pending: VIEW, VIRTUAL TABLE, ANALYZE/sqlite_stat1"]
 fn test_join8() {
-    sqliters_tcltest::run_test_script("join8", r#"
+    sqliters_tcltest::run_test_script(
+        "join8",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !vtab {
@@ -670,5 +672,6 @@ do_execsql_test join8-26000 {
    UNION SELECT DISTINCT b, c, d FROM t2, t3 WHERE b ISNULL;
 } {99 - - 99 - 99}
 finish_test
-"#);
+"#,
+    );
 }

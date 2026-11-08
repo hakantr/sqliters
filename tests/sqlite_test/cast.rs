@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "110/134 subtests passed; pending: VIEW, WINDOW"]
 fn test_cast() {
-    sqliters_tcltest::run_test_script("cast", r#"
+    sqliters_tcltest::run_test_script(
+        "cast",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !cast {
@@ -468,5 +470,6 @@ ifcapable vtab {
   } {44.0 55}
 }
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,6 +1,8 @@
 #[test]
 fn test_vacuum6() {
-    sqliters_tcltest::run_test_script("vacuum6", r#"
+    sqliters_tcltest::run_test_script(
+        "vacuum6",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix vacuum6
@@ -83,5 +85,6 @@ foreach {tn pgsz av} {
   integrity_check 4.1.$tn.3
 }
 finish_test
-"#);
+"#,
+    );
 }

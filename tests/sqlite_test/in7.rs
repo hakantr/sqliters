@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "38/60 subtests passed; pending: VIEW, TRIGGER, EQP/optimizer"]
 fn test_in7() {
-    sqliters_tcltest::run_test_script("in7", r#"
+    sqliters_tcltest::run_test_script(
+        "in7",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix in7
@@ -358,5 +360,6 @@ do_execsql_test 7.6 {
   SELECT b, a FROM t0 RIGHT JOIN t1 ON true WHERE (b,a) IN (('z',9));
 } {z 9}
 finish_test
-"#);
+"#,
+    );
 }

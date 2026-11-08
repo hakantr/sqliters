@@ -1,6 +1,8 @@
 #[test]
 fn test_collateA() {
-    sqliters_tcltest::run_test_script("collateA", r#"
+    sqliters_tcltest::run_test_script(
+        "collateA",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test collateA-1.1 {
@@ -194,5 +196,6 @@ do_test collateA-3.10 {
   execsql {SELECT a FROM t1 WHERE c='xyzzy                                  '}
 } {2 3 4}
 finish_test
-"#);
+"#,
+    );
 }

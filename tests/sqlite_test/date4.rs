@@ -1,6 +1,8 @@
 #[test]
 fn test_date4() {
-    sqliters_tcltest::run_test_script("date4", r#"
+    sqliters_tcltest::run_test_script(
+        "date4",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable {!datetime} {
@@ -23,5 +25,6 @@ for {set i 0} {$i<=24858} {incr i} {
   } [list [strftime $FMT $TS]]
 }
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "20/24 subtests passed; pending: ANALYZE/sqlite_stat1, C testfixture hooks"]
 fn test_limit2() {
-    sqliters_tcltest::run_test_script("limit2", r#"
+    sqliters_tcltest::run_test_script(
+        "limit2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix limit2
@@ -168,5 +170,6 @@ do_execsql_test 720 {
   ORDER BY t2.dd LIMIT 1;
 } {maroon 0 zero}
 finish_test
-"#);
+"#,
+    );
 }

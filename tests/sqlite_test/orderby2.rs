@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "8/11 subtests passed; pending: EQP/optimizer"]
 fn test_orderby2() {
-    sqliters_tcltest::run_test_script("orderby2", r#"
+    sqliters_tcltest::run_test_script(
+        "orderby2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix orderby2
@@ -90,5 +92,6 @@ do_test 2.3 {
 optimization_control db all on
 db cache flush
 finish_test
-"#);
+"#,
+    );
 }

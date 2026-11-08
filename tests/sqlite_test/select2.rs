@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "17/20 subtests passed; pending: C testfixture hooks"]
 fn test_select2() {
-    sqliters_tcltest::run_test_script("select2", r#"
+    sqliters_tcltest::run_test_script(
+        "select2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 execsql {CREATE TABLE tbl1(f1 int, f2 int)}
@@ -144,5 +146,6 @@ do_test select2-4.7 {
   }
 } {1 4 1 0 3 2 3 0}
 finish_test
-"#);
+"#,
+    );
 }

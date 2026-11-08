@@ -1,6 +1,8 @@
 #[test]
 fn test_orderby3() {
-    sqliters_tcltest::run_test_script("orderby3", r#"
+    sqliters_tcltest::run_test_script(
+        "orderby3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix orderby3
@@ -102,5 +104,6 @@ do_execsql_test 1.321.desc {
    ORDER BY t1.a DESC;
 } {3 2 1}
 finish_test
-"#);
+"#,
+    );
 }

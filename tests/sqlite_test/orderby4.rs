@@ -1,6 +1,8 @@
 #[test]
 fn test_orderby4() {
-    sqliters_tcltest::run_test_script("orderby4", r#"
+    sqliters_tcltest::run_test_script(
+        "orderby4",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix orderby4
@@ -33,5 +35,6 @@ do_execsql_test 2.3 {
   SELECT a, x FROM t4 CROSS JOIN t3 ORDER BY 1, 2;
 } {1 3 1 3 1 4 1 4}
 finish_test
-"#);
+"#,
+    );
 }

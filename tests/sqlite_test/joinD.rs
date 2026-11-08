@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "1168/1170 subtests passed; pending: VIEW, TRIGGER"]
 fn test_joinD() {
-    sqliters_tcltest::run_test_script("joinD", r#"
+    sqliters_tcltest::run_test_script(
+        "joinD",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 db nullvalue -
@@ -34768,5 +34770,6 @@ do_execsql_test joinD-extra-1010 {
    -   -    -   -   -  -  239 39   -  -
 }
 finish_test
-"#);
+"#,
+    );
 }

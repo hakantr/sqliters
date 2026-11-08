@@ -1,6 +1,8 @@
 #[test]
 fn test_numcast() {
-    sqliters_tcltest::run_test_script("numcast", r#"
+    sqliters_tcltest::run_test_script(
+        "numcast",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 foreach enc {utf8 utf16le utf16be} {
@@ -30,5 +32,6 @@ foreach enc {utf8 utf16le utf16be} {
   }
 }
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "1/4 subtests passed; pending: lock4 edge cases"]
 fn test_lock4() {
-    sqliters_tcltest::run_test_script("lock4", r#"
+    sqliters_tcltest::run_test_script(
+        "lock4",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 if {[atomic_batch_write test.db]} {
@@ -77,5 +79,6 @@ do_test lock4-999.1 {
   rename db2 {}
 } {}
 finish_test
-"#);
+"#,
+    );
 }

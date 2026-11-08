@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "46/89 subtests passed; pending: VIEW, TEMP TABLE, EQP/optimizer"]
 fn test_where9() {
-    sqliters_tcltest::run_test_script("where9", r#"
+    sqliters_tcltest::run_test_script(
+        "where9",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !or_opt||!compound {
@@ -895,5 +897,6 @@ do_execsql_test where9-11.1 {
       OR (a=2 AND (SELECT 4 FROM t2,(SELECT 5 FROM t1 ORDER BY a) WHERE a));
 } {}
 finish_test
-"#);
+"#,
+    );
 }

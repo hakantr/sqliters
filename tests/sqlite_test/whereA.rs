@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "11/23 subtests passed; pending: ANALYZE/sqlite_stat1"]
 fn test_whereA() {
-    sqliters_tcltest::run_test_script("whereA", r#"
+    sqliters_tcltest::run_test_script(
+        "whereA",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test whereA-1.1 {
@@ -158,5 +160,6 @@ do_execsql_test whereA-6.1 {
   SELECT a FROM t1 WHERE  a=1 OR a=2;
 } {1}
 finish_test
-"#);
+"#,
+    );
 }

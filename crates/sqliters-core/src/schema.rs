@@ -250,7 +250,11 @@ impl IndexSchema {
 
     /// Reconstructs the `nPk` primary key tuple of `tbl` from a decoded index record `hit`
     /// (`[columns..., trailing_pk_cols...]`, or `[pk_cols..., extra_cols...]` when `self.root_pgno == tbl.root_pgno`).
-    pub fn extract_without_rowid_pk_from_hit(&self, tbl: &TableSchema, hit: &[Value]) -> Vec<Value> {
+    pub fn extract_without_rowid_pk_from_hit(
+        &self,
+        tbl: &TableSchema,
+        hit: &[Value],
+    ) -> Vec<Value> {
         if self.origin == "pk" && self.root_pgno == tbl.root_pgno {
             let n = tbl.without_rowid_pk_cols.len().min(hit.len());
             return hit[..n].to_vec();
@@ -642,7 +646,9 @@ pub fn build_table_schema_from_ast(
         if is_pk {
             // In SQLite, `col INTEGER PRIMARY KEY` (exact declared type `INTEGER` and not `WITHOUT ROWID` and not `DESC`)
             // aliases the B+Tree rowid (`pTab->iPKey = col_idx`) and does NOT create an autoindex!
-            if !ct.without_rowid && !pk_desc && cdef.type_name.trim().eq_ignore_ascii_case("INTEGER")
+            if !ct.without_rowid
+                && !pk_desc
+                && cdef.type_name.trim().eq_ignore_ascii_case("INTEGER")
             {
                 rowid_alias_col = Some(col_idx);
                 rowid_pk_conflict = pk_conflict;
@@ -915,11 +921,9 @@ fn push_inline_autoindex(
     // that have identical column indices and collating sequences.
     for existing in inline_autos.iter_mut() {
         if existing.columns.len() == columns.len()
-            && existing
-                .columns
-                .iter()
-                .zip(columns.iter())
-                .all(|(a, b)| a.col_idx == b.col_idx && a.sort_order.collation == b.sort_order.collation)
+            && existing.columns.iter().zip(columns.iter()).all(|(a, b)| {
+                a.col_idx == b.col_idx && a.sort_order.collation == b.sort_order.collation
+            })
         {
             if origin == "pk" {
                 existing.origin = "pk";
@@ -962,8 +966,7 @@ pub fn build_index_schema_from_ast(
         // preserving `pPk->aSortOrder[j]`!
         for pk_ic in &tbl.without_rowid_pk_cols {
             let is_dup = resolved.iter().any(|ic| {
-                ic.col_idx == pk_ic.col_idx
-                    && ic.sort_order.collation == pk_ic.sort_order.collation
+                ic.col_idx == pk_ic.col_idx && ic.sort_order.collation == pk_ic.sort_order.collation
             });
             if !is_dup {
                 trailing_pk_cols.push(pk_ic.clone());

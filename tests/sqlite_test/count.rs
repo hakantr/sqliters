@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "28/40 subtests passed; pending: VIEW, VIRTUAL TABLE, ANALYZE/sqlite_stat1"]
 fn test_count() {
-    sqliters_tcltest::run_test_script("count", r#"
+    sqliters_tcltest::run_test_script(
+        "count",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test count-0.1 {
@@ -211,5 +213,6 @@ do_catchsql_test count-8.1 {
   ) AND t8.b=0; 
 } {1 {misuse of aggregate: count()}}
 finish_test
-"#);
+"#,
+    );
 }

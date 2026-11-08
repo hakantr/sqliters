@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "20/26 subtests passed; pending: VIEW, TEMP TABLE, EQP/optimizer"]
 fn test_select7() {
-    sqliters_tcltest::run_test_script("select7", r#"
+    sqliters_tcltest::run_test_script(
+        "select7",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix select7
@@ -197,5 +199,6 @@ do_catchsql_test 8.2 {
   EXPLAIN QUERY PLAN SELECT * FROM v0 WHERE x='0' OR y;
 } {1 {SELECTs to the left and right of UNION do not have the same number of result columns}}
 finish_test
-"#);
+"#,
+    );
 }

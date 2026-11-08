@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "0/16 subtests passed; pending: VIEW"]
 fn test_affinity3() {
-    sqliters_tcltest::run_test_script("affinity3", r#"
+    sqliters_tcltest::run_test_script(
+        "affinity3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_execsql_test affinity3-100 {
@@ -97,5 +99,6 @@ do_execsql_test affinity3-260 {
   SELECT * FROM data JOIN mzed USING(id);
 } {4 xyz e}
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,6 +1,7 @@
 //! SQL Abstract Syntax Tree (AST) representing SQLite 3.54.1 statements and expressions.
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Stmt {
     Explain {
         query_plan: bool,
@@ -291,6 +292,7 @@ impl CompoundOp {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum SelectCore {
     Select {
         distinct: bool,

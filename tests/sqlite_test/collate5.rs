@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "6/37 subtests passed; pending: VIEW"]
 fn test_collate5() {
-    sqliters_tcltest::run_test_script("collate5", r#"
+    sqliters_tcltest::run_test_script(
+        "collate5",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix collate5
@@ -251,5 +253,6 @@ do_execsql_test 5.4 {
   SELECT * FROM v2 WHERE c='c';
 } { {} C c }
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "16/41 subtests passed; pending: C testfixture hooks"]
 fn test_where4() {
-    sqliters_tcltest::run_test_script("where4", r#"
+    sqliters_tcltest::run_test_script(
+        "where4",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix where4
@@ -242,5 +244,6 @@ do_execsql_test 8.1 {
 do_execsql_test 8.2 { SELECT * FROM u9 WHERE a IS NULL  } {{} 1 {} 2}
 do_execsql_test 8.2 { SELECT * FROM u9 WHERE a IS $null } {{} 1 {} 2}
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,6 +1,8 @@
 #[test]
 fn test_where5() {
-    sqliters_tcltest::run_test_script("where5", r#"
+    sqliters_tcltest::run_test_script(
+        "where5",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test where5-1.0 {
@@ -264,5 +266,6 @@ do_test where5-4.7 {
   }
 } {1 1 1}
 finish_test
-"#);
+"#,
+    );
 }

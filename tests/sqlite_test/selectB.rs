@@ -1,6 +1,8 @@
 #[test]
 fn test_selectB() {
-    sqliters_tcltest::run_test_script("selectB", r#"
+    sqliters_tcltest::run_test_script(
+        "selectB",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !compound {
@@ -377,5 +379,6 @@ for {set ii 3} {$ii <= 6} {incr ii} {
   } {6 18 30 260.2 600 1800 3000}
 }
 finish_test
-"#);
+"#,
+    );
 }

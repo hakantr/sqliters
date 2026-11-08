@@ -1,6 +1,8 @@
 #[test]
 fn test_select5() {
-    sqliters_tcltest::run_test_script("select5", r#"
+    sqliters_tcltest::run_test_script(
+        "select5",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 execsql {
@@ -211,5 +213,6 @@ do_execsql_test select5-9.1 {
   SELECT quote(a), quote(b), '|' FROM t1 GROUP BY a, abs(b);
 } {NULL NULL | 1 NULL |}
 finish_test
-"#);
+"#,
+    );
 }

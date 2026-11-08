@@ -1,6 +1,8 @@
 #[test]
 fn test_trans3() {
-    sqliters_tcltest::run_test_script("trans3", r#"
+    sqliters_tcltest::run_test_script(
+        "trans3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 unset -nocomplain ecode
@@ -58,5 +60,6 @@ do_test trans3-1.7 {
 } {1 2 3 4}
 unset -nocomplain ecode
 finish_test
-"#);
+"#,
+    );
 }

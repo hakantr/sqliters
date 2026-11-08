@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "223/230 subtests passed; pending: VIEW, WINDOW, EQP/optimizer"]
 fn test_selectA() {
-    sqliters_tcltest::run_test_script("selectA", r#"
+    sqliters_tcltest::run_test_script(
+        "selectA",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix selectA
@@ -1453,5 +1455,6 @@ do_execsql_test 9.2 {
   ) WHERE a||'' = 'ABC';
 } {ABC}
 finish_test
-"#);
+"#,
+    );
 }

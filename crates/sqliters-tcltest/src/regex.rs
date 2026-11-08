@@ -28,12 +28,12 @@ fn glob_match_slice(pat: &[char], txt: &[char], nocase: bool) -> bool {
             pi += 1;
             ti += 1;
         } else if pi < pat.len() && pat[pi] == '[' {
-            if let Some((matched, next_pi)) = match_glob_bracket(&pat[pi..], txt[ti], nocase) {
-                if matched {
-                    pi += next_pi;
-                    ti += 1;
-                    continue;
-                }
+            if let Some((matched, next_pi)) = match_glob_bracket(&pat[pi..], txt[ti], nocase)
+                && matched
+            {
+                pi += next_pi;
+                ti += 1;
+                continue;
             }
             if let Some(sp) = star_pi {
                 pi = sp;
@@ -118,7 +118,7 @@ fn match_glob_bracket(pat: &[char], ch: char, nocase: bool) -> Option<(bool, usi
 #[inline]
 fn chars_eq(a: char, b: char, nocase: bool) -> bool {
     if nocase {
-        a.to_ascii_lowercase() == b.to_ascii_lowercase()
+        a.eq_ignore_ascii_case(&b)
     } else {
         a == b
     }
@@ -403,7 +403,9 @@ impl Regex {
                     return None;
                 }
                 let ch = chars[pos];
-                let hit = items.iter().any(|item| match_class_item(item, ch, self.nocase));
+                let hit = items
+                    .iter()
+                    .any(|item| match_class_item(item, ch, self.nocase));
                 let ok = if *negate { !hit } else { hit };
                 if ok {
                     self.match_seq(tail, chars, pos + 1, groups)
@@ -427,10 +429,10 @@ impl Regex {
         groups: &mut Vec<Option<(usize, usize)>>,
         count: usize,
     ) -> Option<usize> {
-        if let Some(m) = max {
-            if count == m {
-                return self.match_seq(tail, chars, pos, groups);
-            }
+        if let Some(m) = max
+            && count == m
+        {
+            return self.match_seq(tail, chars, pos, groups);
         }
 
         if count < min {
@@ -520,6 +522,7 @@ impl Regex {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn collect_ends(
         &self,
         node: &Node,
@@ -733,21 +736,20 @@ impl<'a> Parser<'a> {
             if self.pos + 2 < self.chars.len()
                 && self.chars[self.pos] == '['
                 && self.chars[self.pos + 1] == ':'
+                && let Some(end_off) = self.find_posix_class_end()
             {
-                if let Some(end_off) = self.find_posix_class_end() {
-                    let name: String = self.chars[self.pos + 2..end_off].iter().collect();
-                    self.pos = end_off + 2;
-                    match name.as_str() {
-                        "digit" => items.push(ClassItem::Digit),
-                        "space" => items.push(ClassItem::Space),
-                        "alpha" => items.push(ClassItem::Alpha),
-                        "alnum" => items.push(ClassItem::Alnum),
-                        "word" => items.push(ClassItem::Word),
-                        "xdigit" => items.push(ClassItem::Xdigit),
-                        _ => {}
-                    }
-                    continue;
+                let name: String = self.chars[self.pos + 2..end_off].iter().collect();
+                self.pos = end_off + 2;
+                match name.as_str() {
+                    "digit" => items.push(ClassItem::Digit),
+                    "space" => items.push(ClassItem::Space),
+                    "alpha" => items.push(ClassItem::Alpha),
+                    "alnum" => items.push(ClassItem::Alnum),
+                    "word" => items.push(ClassItem::Word),
+                    "xdigit" => items.push(ClassItem::Xdigit),
+                    _ => {}
                 }
+                continue;
             }
             let c1 = if self.chars[self.pos] == '\\' && self.pos + 1 < self.chars.len() {
                 self.pos += 1;
@@ -866,7 +868,11 @@ impl<'a> Parser<'a> {
         if i == start_m {
             return None;
         }
-        let min: usize = self.chars[start_m..i].iter().collect::<String>().parse().ok()?;
+        let min: usize = self.chars[start_m..i]
+            .iter()
+            .collect::<String>()
+            .parse()
+            .ok()?;
         if i < self.chars.len() && self.chars[i] == '}' {
             return Some((min, Some(min), i + 1));
         }
@@ -880,7 +886,11 @@ impl<'a> Parser<'a> {
                 i += 1;
             }
             if i > start_n && i < self.chars.len() && self.chars[i] == '}' {
-                let max: usize = self.chars[start_n..i].iter().collect::<String>().parse().ok()?;
+                let max: usize = self.chars[start_n..i]
+                    .iter()
+                    .collect::<String>()
+                    .parse()
+                    .ok()?;
                 return Some((min, Some(max), i + 1));
             }
         }

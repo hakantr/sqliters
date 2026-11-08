@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "49/81 subtests passed; pending: VIEW, ANALYZE/sqlite_stat1, EQP/optimizer"]
 fn test_subquery() {
-    sqliters_tcltest::run_test_script("subquery", r#"
+    sqliters_tcltest::run_test_script(
+        "subquery",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !subquery {
@@ -625,5 +627,6 @@ do_execsql_test subquery-11.14 {
   WITH c(a) AS (SELECT rx FROM t1 UNION SELECT x'b4') SELECT affinity(a) FROM c;
 } {real real real real}
 finish_test
-"#);
+"#,
+    );
 }

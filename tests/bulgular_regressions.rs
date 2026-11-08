@@ -123,7 +123,10 @@ impl InteractiveSqlProc {
         loop {
             line.clear();
             let n = self.stdout.read_line(&mut line).unwrap();
-            assert!(n > 0, "child process exited before printing marker '{marker}'");
+            assert!(
+                n > 0,
+                "child process exited before printing marker '{marker}'"
+            );
             if line.trim() == marker {
                 break;
             }
@@ -140,7 +143,10 @@ impl InteractiveSqlProc {
         loop {
             line.clear();
             let n = self.stdout.read_line(&mut line).unwrap();
-            assert!(n > 0, "child process exited before printing marker '{marker}'");
+            assert!(
+                n > 0,
+                "child process exited before printing marker '{marker}'"
+            );
             if line.trim() == marker {
                 break;
             }
@@ -184,11 +190,16 @@ fn test_bulgu_1_cross_process_posix_locks_and_in_process_busy() {
     //    - `sqliters` concurrent write MUST fail with `ErrorCode::Busy` (`SQLITE_BUSY`)
     //    - `sqliters` concurrent read (`SHARED` lock) MUST succeed!
     let mut c_writer = InteractiveSqlProc::spawn_c_sqlite3(tmp.path());
-    c_writer.send_and_wait_marker("BEGIN IMMEDIATE;\nINSERT INTO t VALUES (2, 'from_c');", "LOCKED_IMMEDIATE");
+    c_writer.send_and_wait_marker(
+        "BEGIN IMMEDIATE;\nINSERT INTO t VALUES (2, 'from_c');",
+        "LOCKED_IMMEDIATE",
+    );
 
     {
         let mut conn = Connection::open(tmp.path()).unwrap();
-        let read_res = conn.query("SELECT id, val FROM t ORDER BY id;", &[]).unwrap();
+        let read_res = conn
+            .query("SELECT id, val FROM t ORDER BY id;", &[])
+            .unwrap();
         assert_eq!(read_res.rows.len(), 1);
         assert_eq!(read_res.rows[0].get_str(1), Some("init"));
 
@@ -200,10 +211,7 @@ fn test_bulgu_1_cross_process_posix_locks_and_in_process_busy() {
 
     c_writer.finish("COMMIT;");
     assert_eq!(run_c_sqlite3(tmp.path(), "PRAGMA integrity_check;"), "ok");
-    assert_eq!(
-        run_c_sqlite3(tmp.path(), "SELECT count(*) FROM t;"),
-        "2"
-    );
+    assert_eq!(run_c_sqlite3(tmp.path(), "SELECT count(*) FROM t;"), "2");
 
     // 2. C `sqlite3` holds an EXCLUSIVE lock (`BEGIN EXCLUSIVE`):
     //    - `Connection::open` defers schema load gracefully, and `SELECT` returns `ErrorCode::Busy`!
@@ -351,7 +359,9 @@ fn test_bulgu_3_wal_database_explicitly_rejected() {
     );
 
     let err = match Connection::open(tmp.path()) {
-        Ok(_) => panic!("opening WAL database must fail explicitly rather than returning stale data"),
+        Ok(_) => {
+            panic!("opening WAL database must fail explicitly rather than returning stale data")
+        }
         Err(e) => e,
     };
     assert_eq!(err.code, ErrorCode::CantOpen);
@@ -432,7 +442,10 @@ fn test_bulgu_4_foreign_keys_enforcement_actions_and_deferred() {
         Some(0)
     );
     let mrow = conn
-        .query_row("SELECT team_id, fallback_org FROM members WHERE id = 100;", &[])
+        .query_row(
+            "SELECT team_id, fallback_org FROM members WHERE id = 100;",
+            &[],
+        )
         .unwrap()
         .unwrap();
     assert_eq!(mrow.get(0), Some(&Value::Null));
@@ -445,7 +458,8 @@ fn test_bulgu_4_foreign_keys_enforcement_actions_and_deferred() {
     )
     .unwrap();
 
-    conn.execute("BEGIN; INSERT INTO child_def VALUES (500);").unwrap();
+    conn.execute("BEGIN; INSERT INTO child_def VALUES (500);")
+        .unwrap();
     // Committing while still orphaned must fail with FOREIGN KEY constraint failed AND keep tx active!
     let commit_err = conn.execute("COMMIT;").unwrap_err();
     assert_eq!(commit_err.code, ErrorCode::Constraint);
@@ -478,7 +492,11 @@ fn test_bulgu_5_or_fail_and_or_rollback_semantics() {
         !conn.is_autocommit(),
         "OR FAIL must keep enclosing explicit transaction open"
     );
-    assert_eq!(conn.changes(), 1, "row (3) written before conflict must count");
+    assert_eq!(
+        conn.changes(),
+        1,
+        "row (3) written before conflict must count"
+    );
 
     conn.execute("COMMIT;").unwrap();
     let vals: Vec<i64> = conn
@@ -560,7 +578,9 @@ fn test_bulgu_6_alter_table_rename_column_updates_indexes_constraints_and_fks() 
         assert_eq!(res.rows.len(), 1);
         assert_eq!(res.rows[0].get_str(1), Some("onbes"));
 
-        let chk_err = conn.execute("INSERT INTO t VALUES (-3, 'neg');").unwrap_err();
+        let chk_err = conn
+            .execute("INSERT INTO t VALUES (-3, 'neg');")
+            .unwrap_err();
         assert_eq!(chk_err.code, ErrorCode::Constraint);
 
         let fk_err = conn
@@ -669,7 +689,10 @@ fn test_bulgu_8_utf16le_and_utf16be_bidirectional_interoperability() {
             assert_eq!(all.rows[1].get_str(1), Some("Çağdaş Şehir 🦀"));
 
             let seek = conn
-                .query("SELECT id FROM t WHERE s = ?1;", &[Value::Text("Türkçe".into())])
+                .query(
+                    "SELECT id FROM t WHERE s = ?1;",
+                    &[Value::Text("Türkçe".into())],
+                )
                 .unwrap();
             assert_eq!(seek.rows.len(), 1);
             assert_eq!(seek.rows[0].get_i64(0), Some(1));
@@ -943,7 +966,10 @@ fn test_bulgu_y1_failed_commit_partial_writes_rolled_back_atomically() {
 
         let commit_err = conn.execute("COMMIT;").unwrap_err();
         assert_eq!(commit_err.code, ErrorCode::IoErr);
-        assert!(!conn.is_autocommit(), "tx must remain active after failed COMMIT");
+        assert!(
+            !conn.is_autocommit(),
+            "tx must remain active after failed COMMIT"
+        );
 
         conn.execute("ROLLBACK;").unwrap();
         assert!(conn.is_autocommit());
@@ -1035,7 +1061,10 @@ fn test_bulgu_y1_failed_commit_partial_writes_rolled_back_atomically() {
 
         // Inject persistent write failure so `ROLLBACK;` itself fails to restore `.db`
         fault.lock().unwrap().fail_all_main_writes = true;
-        assert_eq!(conn.execute("ROLLBACK;").unwrap_err().code, ErrorCode::IoErr);
+        assert_eq!(
+            conn.execute("ROLLBACK;").unwrap_err().code,
+            ErrorCode::IoErr
+        );
         drop(conn);
     }
     assert!(
@@ -1097,7 +1126,10 @@ fn test_bulgu_y2_multi_header_spilled_journal_and_bidirectional_c_recovery() {
         run_c_sqlite3(copy_for_c.path(), "SELECT count(*), sum(x) FROM t;"),
         "200|0"
     );
-    assert_eq!(run_c_sqlite3(copy_for_c.path(), "PRAGMA integrity_check;"), "ok");
+    assert_eq!(
+        run_c_sqlite3(copy_for_c.path(), "PRAGMA integrity_check;"),
+        "ok"
+    );
 
     {
         let mut r_conn = Connection::open(copy_for_r.path()).unwrap();
@@ -1112,7 +1144,10 @@ fn test_bulgu_y2_multi_header_spilled_journal_and_bidirectional_c_recovery() {
             "Rust MUST replay ALL spilled journal headers back to sum(x)=0!"
         );
     }
-    assert_eq!(run_c_sqlite3(copy_for_r.path(), "PRAGMA integrity_check;"), "ok");
+    assert_eq!(
+        run_c_sqlite3(copy_for_r.path(), "PRAGMA integrity_check;"),
+        "ok"
+    );
     assert_eq!(
         run_c_sqlite3(copy_for_r.path(), "SELECT count(*), sum(x) FROM t;"),
         "200|0"
@@ -1169,7 +1204,10 @@ fn test_bulgu_y3_cross_connection_ddl_refreshes_schema_and_prevents_wrong_table_
 
     // Also prepare a SELECT statement on B BEFORE A drops `t`!
     let mut b_prepared_sel = conn_b.prepare("SELECT * FROM t;").unwrap();
-    assert!(matches!(b_prepared_sel.step().unwrap(), sqliters::StepResult::Row(_)));
+    assert!(matches!(
+        b_prepared_sel.step().unwrap(),
+        sqliters::StepResult::Row(_)
+    ));
     b_prepared_sel.reset();
 
     conn_a
@@ -1324,10 +1362,8 @@ fn test_bulgu_y5_without_rowid_index_btree_bidirectional_c_compatibility() {
         )
         .unwrap();
         // Secondary UNIQUE conflict resolved via OR IGNORE
-        conn.execute(
-            "INSERT OR IGNORE INTO comp VALUES ('ignored', 99, 'tag_2', 'unique_k2');",
-        )
-        .unwrap();
+        conn.execute("INSERT OR IGNORE INTO comp VALUES ('ignored', 99, 'tag_2', 'unique_k2');")
+            .unwrap();
         // UPDATE both PK and non-PK columns, DELETE a subset, ADD COLUMN with DEFAULT, and VACUUM
         conn.execute(
             "UPDATE comp SET k1 = 100, v1 = 'moved' WHERE u_tag = 'tag_3';
@@ -1435,7 +1471,10 @@ fn test_bulgu_y6_unicode_identifiers_no_utf8_slice_panic() {
 
         // Reserved `sqlite_` prefix check still works properly
         assert!(conn.execute("CREATE TABLE sqlite_bad(x);").is_err());
-        assert!(conn.execute(r#"ALTER TABLE "çççç" RENAME TO sqlite_bad;"#).is_err());
+        assert!(
+            conn.execute(r#"ALTER TABLE "çççç" RENAME TO sqlite_bad;"#)
+                .is_err()
+        );
 
         // Also test date/time functions with multi-byte strings around byte 10 / fractional seconds
         let dt = conn
@@ -1488,7 +1527,8 @@ fn test_bulgu_y7_strict_any_preserves_storage_class_and_leading_zeros() {
         assert_eq!(rows[4].get_str(0), Some("null"));
 
         // UPDATE on STRICT ANY also preserves `'007'` as `text`!
-        conn.execute("UPDATE t SET x = '007' WHERE id = 2;").unwrap();
+        conn.execute("UPDATE t SET x = '007' WHERE id = 2;")
+            .unwrap();
         let u = conn
             .query_row("SELECT typeof(x), x FROM t WHERE id = 2;", &[])
             .unwrap()
@@ -1497,7 +1537,10 @@ fn test_bulgu_y7_strict_any_preserves_storage_class_and_leading_zeros() {
         assert_eq!(u.get_str(1), Some("007"));
 
         // Invalid datatype in STRICT table is rejected
-        assert!(conn.execute("CREATE TABLE bad_strict(a VARCHAR(10)) STRICT;").is_err());
+        assert!(
+            conn.execute("CREATE TABLE bad_strict(a VARCHAR(10)) STRICT;")
+                .is_err()
+        );
         assert!(conn.execute("CREATE TABLE bad_strict2(a) STRICT;").is_err());
     }
     assert_eq!(run_c_sqlite3(tmp.path(), "PRAGMA integrity_check;"), "ok");
@@ -1650,17 +1693,26 @@ fn test_bulgu_y10_min_max_bare_column_selected_from_extremum_row() {
     .unwrap();
 
     // Exact ungrouped reproducer from `bulgular.md` Y10
-    let r_max = conn.query_row("SELECT max(a), b FROM t;", &[]).unwrap().unwrap();
+    let r_max = conn
+        .query_row("SELECT max(a), b FROM t;", &[])
+        .unwrap()
+        .unwrap();
     assert_eq!(r_max.get_i64(0), Some(10));
     assert_eq!(r_max.get_str(1), Some("ten"));
 
-    let r_min = conn.query_row("SELECT min(a), b FROM t;", &[]).unwrap().unwrap();
+    let r_min = conn
+        .query_row("SELECT min(a), b FROM t;", &[])
+        .unwrap()
+        .unwrap();
     assert_eq!(r_min.get_i64(0), Some(1));
     assert_eq!(r_min.get_str(1), Some("one"));
 
     // Grouped `GROUP BY` with `MAX` and `MIN`
     let g_max = conn
-        .query("SELECT grp, max(a), b FROM t GROUP BY grp ORDER BY grp;", &[])
+        .query(
+            "SELECT grp, max(a), b FROM t GROUP BY grp ORDER BY grp;",
+            &[],
+        )
         .unwrap()
         .rows;
     assert_eq!(g_max[0].get_i64(1), Some(3));
@@ -1669,7 +1721,10 @@ fn test_bulgu_y10_min_max_bare_column_selected_from_extremum_row() {
     assert_eq!(g_max[1].get_str(2), Some("ten"));
 
     let g_min = conn
-        .query("SELECT grp, min(a), b FROM t GROUP BY grp ORDER BY grp;", &[])
+        .query(
+            "SELECT grp, min(a), b FROM t GROUP BY grp ORDER BY grp;",
+            &[],
+        )
         .unwrap()
         .rows;
     assert_eq!(g_min[0].get_i64(1), Some(1));
@@ -1700,7 +1755,8 @@ fn test_bulgu_y11_begin_rejected_inside_savepoint_transaction() {
 
     let err = conn.execute("BEGIN;").unwrap_err();
     assert!(
-        err.message.contains("cannot start a transaction within a transaction"),
+        err.message
+            .contains("cannot start a transaction within a transaction"),
         "unexpected error: {}",
         err.message
     );

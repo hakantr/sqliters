@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "19/30 subtests passed; pending: vacuum2 edge cases"]
 fn test_vacuum2() {
-    sqliters_tcltest::run_test_script("vacuum2", r#"
+    sqliters_tcltest::run_test_script(
+        "vacuum2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix vacuum2
@@ -187,5 +189,6 @@ proc cmp {lhs rhs} { string compare $rhs $lhs }
 do_execsql_test 6.2 VACUUM
 integrity_check 6.3
 finish_test
-"#);
+"#,
+    );
 }

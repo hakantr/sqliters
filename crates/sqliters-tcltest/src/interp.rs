@@ -138,12 +138,12 @@ impl TclInterp {
         } else {
             (false, raw)
         };
-        if let Some(open_paren) = rest.find('(') {
-            if rest.ends_with(')') {
-                let base = &rest[..open_paren];
-                let key = &rest[open_paren + 1..rest.len() - 1];
-                return (is_global, base, Some(key));
-            }
+        if let Some(open_paren) = rest.find('(')
+            && rest.ends_with(')')
+        {
+            let base = &rest[..open_paren];
+            let key = &rest[open_paren + 1..rest.len() - 1];
+            return (is_global, base, Some(key));
         }
         (is_global, rest, None)
     }
@@ -478,7 +478,12 @@ impl TclInterp {
         Ok((out, i))
     }
 
-    pub fn subst_dollar(&mut self, src: &str, idx: usize, do_eval: bool) -> TclResult<(String, usize)> {
+    pub fn subst_dollar(
+        &mut self,
+        src: &str,
+        idx: usize,
+        do_eval: bool,
+    ) -> TclResult<(String, usize)> {
         // src.as_bytes()[idx] == b'$'
         let bytes = src.as_bytes();
         let len = bytes.len();
@@ -495,7 +500,9 @@ impl TclInterp {
                 i += 1;
             }
             if i >= len {
-                return Err(TclControl::Error("missing close-brace for variable name".to_string()));
+                return Err(TclControl::Error(
+                    "missing close-brace for variable name".to_string(),
+                ));
             }
             let name = &src[start..i];
             i += 1;
@@ -562,7 +569,9 @@ impl TclInterp {
                 }
             }
             if !closed {
-                return Err(TclControl::Error("missing ')' in array variable".to_string()));
+                return Err(TclControl::Error(
+                    "missing ')' in array variable".to_string(),
+                ));
             }
             if !do_eval {
                 return Ok((String::new(), i));
@@ -579,7 +588,12 @@ impl TclInterp {
         Ok((val, i))
     }
 
-    pub fn subst_bracket(&mut self, src: &str, idx: usize, do_eval: bool) -> TclResult<(String, usize)> {
+    pub fn subst_bracket(
+        &mut self,
+        src: &str,
+        idx: usize,
+        do_eval: bool,
+    ) -> TclResult<(String, usize)> {
         // Find matching `]` respecting TCL quoting/braces/nested brackets
         let end = find_matching_bracket(src, idx).map_err(TclControl::Error)?;
         let inner = &src[idx + 1..end];
@@ -638,10 +652,10 @@ impl TclInterp {
         }
 
         // 2. Host commands (`sqlite3`, `db`, `do_test`, `hexio_*`, etc.)
-        if let Some(host_rc) = self.host.clone() {
-            if let Some(res) = crate::harness::invoke_host_cmd(&host_rc, self, cmd, args) {
-                return res;
-            }
+        if let Some(host_rc) = self.host.clone()
+            && let Some(res) = crate::harness::invoke_host_cmd(&host_rc, self, cmd, args)
+        {
+            return res;
         }
 
         // 3. Built-in TCL commands
@@ -831,7 +845,8 @@ impl TclInterp {
             }
         }
         for name in &args[idx..] {
-            self.unset_var(name, nocomplain).map_err(TclControl::Error)?;
+            self.unset_var(name, nocomplain)
+                .map_err(TclControl::Error)?;
         }
         Ok(String::new())
     }
@@ -843,8 +858,9 @@ impl TclInterp {
             ));
         }
         let delta = if args.len() == 2 {
-            parse_tcl_int(args[1].trim())
-                .ok_or_else(|| TclControl::Error(format!("expected integer but got \"{}\"", args[1])))?
+            parse_tcl_int(args[1].trim()).ok_or_else(|| {
+                TclControl::Error(format!("expected integer but got \"{}\"", args[1]))
+            })?
         } else {
             1
         };
@@ -921,7 +937,7 @@ impl TclInterp {
             (caller, args)
         };
 
-        for pair in rest.chunks_exact(2) {
+        for pair in rest.as_chunks::<2>().0 {
             let other = &pair[0];
             let my_var = &pair[1];
             let (tf, tname) = self.resolve_target(target_frame, other.clone());
@@ -995,7 +1011,7 @@ impl TclInterp {
                 _ => {
                     return Err(TclControl::Error(format!(
                         "argument with too many fields: \"{p}\""
-                    )))
+                    )));
                 }
             }
         }
@@ -1016,10 +1032,10 @@ impl TclInterp {
         }
         let old = args[0].strip_prefix("::").unwrap_or(&args[0]);
         let new = args[1].strip_prefix("::").unwrap_or(&args[1]);
-        if let Some(p) = self.procs.remove(old) {
-            if !new.is_empty() {
-                self.procs.insert(new.to_string(), p);
-            }
+        if let Some(p) = self.procs.remove(old)
+            && !new.is_empty()
+        {
+            self.procs.insert(new.to_string(), p);
         }
         Ok(String::new())
     }
@@ -1033,7 +1049,9 @@ impl TclInterp {
                 i += 1;
             }
             if i >= args.len() {
-                return Err(TclControl::Error("wrong # args: no script following if condition".to_string()));
+                return Err(TclControl::Error(
+                    "wrong # args: no script following if condition".to_string(),
+                ));
             }
             let body = &args[i];
             i += 1;
@@ -1087,7 +1105,7 @@ impl TclInterp {
     }
 
     fn cmd_foreach(&mut self, args: &[String]) -> TclResult<String> {
-        if args.len() < 3 || args.len() % 2 == 0 {
+        if args.len() < 3 || args.len().is_multiple_of(2) {
             return Err(TclControl::Error(
                 "wrong # args: should be \"foreach varList list ?varList list ...? command\""
                     .to_string(),
@@ -1098,7 +1116,7 @@ impl TclInterp {
         let mut specs: Vec<(Vec<String>, Vec<String>)> = Vec::new();
         let mut max_iters = 0usize;
 
-        for pair in pairs_slice.chunks_exact(2) {
+        for pair in pairs_slice.as_chunks::<2>().0 {
             let vars = parse_list(&pair[0]).map_err(TclControl::Error)?;
             if vars.is_empty() {
                 return Err(TclControl::Error("foreach varlist is empty".to_string()));
@@ -1188,13 +1206,15 @@ impl TclInterp {
         } else {
             rest.to_vec()
         };
-        if branches.len() % 2 != 0 {
-            return Err(TclControl::Error("extra switch pattern with no body".to_string()));
+        if !branches.len().is_multiple_of(2) {
+            return Err(TclControl::Error(
+                "extra switch pattern with no body".to_string(),
+            ));
         }
 
         let mut matched = false;
         let num_pairs = branches.len() / 2;
-        for (pi, pair) in branches.chunks_exact(2).enumerate() {
+        for (pi, pair) in branches.as_chunks::<2>().0.iter().enumerate() {
             let pat = &pair[0];
             let body = &pair[1];
             if !matched {
@@ -1264,10 +1284,10 @@ impl TclInterp {
             Err(TclControl::Break) => (3, String::new()),
             Err(TclControl::Continue) => (4, String::new()),
         };
-        if let Some(var_name) = args.get(1) {
-            if !var_name.is_empty() {
-                self.set_var(var_name, val).map_err(TclControl::Error)?;
-            }
+        if let Some(var_name) = args.get(1)
+            && !var_name.is_empty()
+        {
+            self.set_var(var_name, val).map_err(TclControl::Error)?;
         }
         Ok(code.to_string())
     }
@@ -1565,14 +1585,13 @@ impl TclInterp {
         let mut items = parse_list(list_str).map_err(TclControl::Error)?;
 
         let extract_key = |elem: &str| -> String {
-            if let Some(ref idx_s) = index_opt {
-                if let Ok(sub) = parse_list(elem) {
-                    if let Ok(k) = parse_tcl_index(idx_s, sub.len()) {
-                        if k >= 0 && (k as usize) < sub.len() {
-                            return sub[k as usize].clone();
-                        }
-                    }
-                }
+            if let Some(ref idx_s) = index_opt
+                && let Ok(sub) = parse_list(elem)
+                && let Ok(k) = parse_tcl_index(idx_s, sub.len())
+                && k >= 0
+                && (k as usize) < sub.len()
+            {
+                return sub[k as usize].clone();
             }
             elem.to_string()
         };
@@ -1670,7 +1689,9 @@ impl TclInterp {
             }
             "index" => {
                 if rest.len() != 2 {
-                    return Err(TclControl::Error("wrong # args to string index".to_string()));
+                    return Err(TclControl::Error(
+                        "wrong # args to string index".to_string(),
+                    ));
                 }
                 let chars: Vec<char> = rest[0].chars().collect();
                 let idx = parse_tcl_index(&rest[1], chars.len()).map_err(TclControl::Error)?;
@@ -1682,7 +1703,9 @@ impl TclInterp {
             }
             "range" => {
                 if rest.len() != 3 {
-                    return Err(TclControl::Error("wrong # args to string range".to_string()));
+                    return Err(TclControl::Error(
+                        "wrong # args to string range".to_string(),
+                    ));
                 }
                 let chars: Vec<char> = rest[0].chars().collect();
                 if chars.is_empty() {
@@ -1700,7 +1723,9 @@ impl TclInterp {
             }
             "replace" => {
                 if rest.len() < 3 {
-                    return Err(TclControl::Error("wrong # args to string replace".to_string()));
+                    return Err(TclControl::Error(
+                        "wrong # args to string replace".to_string(),
+                    ));
                 }
                 let mut chars: Vec<char> = rest[0].chars().collect();
                 if chars.is_empty() {
@@ -1720,7 +1745,9 @@ impl TclInterp {
             }
             "repeat" => {
                 if rest.len() != 2 {
-                    return Err(TclControl::Error("wrong # args to string repeat".to_string()));
+                    return Err(TclControl::Error(
+                        "wrong # args to string repeat".to_string(),
+                    ));
                 }
                 let n = parse_tcl_int(rest[1].trim()).unwrap_or(0).max(0) as usize;
                 Ok(rest[0].repeat(n))
@@ -1745,7 +1772,7 @@ impl TclInterp {
                 while pos < target.len() {
                     let rem = &target[pos..];
                     let mut matched = false;
-                    for kv in pairs.chunks_exact(2) {
+                    for kv in pairs.as_chunks::<2>().0 {
                         let k = &kv[0];
                         let v = &kv[1];
                         if k.is_empty() {
@@ -1779,7 +1806,9 @@ impl TclInterp {
                 } else if rest.len() == 2 {
                     (false, &rest[0], &rest[1])
                 } else {
-                    return Err(TclControl::Error("wrong # args to string match".to_string()));
+                    return Err(TclControl::Error(
+                        "wrong # args to string match".to_string(),
+                    ));
                 };
                 Ok(if glob_match(pat, txt, nocase) {
                     "1".to_string()
@@ -1937,7 +1966,7 @@ impl TclInterp {
                         "can't array set \"{arr_name}\": variable isn't array"
                     )));
                 };
-                for kv in items.chunks_exact(2) {
+                for kv in items.as_chunks::<2>().0 {
                     map.insert(kv[0].clone(), kv[1].clone());
                 }
                 Ok(String::new())
@@ -1957,7 +1986,10 @@ impl TclInterp {
                 Ok(format_list(&out))
             }
             "names" => {
-                let pat = args.last().filter(|_| args.len() >= 3).map_or("*", String::as_str);
+                let pat = args
+                    .last()
+                    .filter(|_| args.len() >= 3)
+                    .map_or("*", String::as_str);
                 let mut out = Vec::new();
                 if let Some(VarSlot::Array(map)) = self.frames[fidx].vars.get(&bname) {
                     for k in map.keys() {
@@ -2224,10 +2256,7 @@ impl TclInterp {
                     self.set_var(var, hex).map_err(TclControl::Error)?;
                     Ok("1".to_string())
                 } else if fmt == "c*" {
-                    let nums: Vec<String> = data
-                        .bytes()
-                        .map(|b| (b as i8).to_string())
-                        .collect();
+                    let nums: Vec<String> = data.bytes().map(|b| (b as i8).to_string()).collect();
                     self.set_var(var, format_list(&nums))
                         .map_err(TclControl::Error)?;
                     Ok("1".to_string())
@@ -2263,7 +2292,9 @@ impl TclInterp {
             }
             "size" => {
                 let p = self.resolve_path(args.get(1).map_or("", String::as_str));
-                let sz = fs::metadata(p).map(|m| m.len()).map_err(|e| TclControl::Error(e.to_string()))?;
+                let sz = fs::metadata(p)
+                    .map(|m| m.len())
+                    .map_err(|e| TclControl::Error(e.to_string()))?;
                 Ok(sz.to_string())
             }
             "delete" => {
@@ -2401,7 +2432,9 @@ impl TclInterp {
         }
         matches.sort();
         if matches.is_empty() && !nocomplain {
-            return Err(TclControl::Error("no files matched glob pattern".to_string()));
+            return Err(TclControl::Error(
+                "no files matched glob pattern".to_string(),
+            ));
         }
         Ok(format_list(&matches))
     }
@@ -2455,12 +2488,13 @@ impl TclInterp {
             2 => (rem[0].as_str(), rem[1].as_str()),
             _ => return Ok(String::new()),
         };
-        if chan != "stdout" && chan != "stderr" {
-            if let Some(ch) = self.channels.get_mut(chan) {
-                let _ = ch.file.write_all(msg.as_bytes());
-                if !nonewline {
-                    let _ = ch.file.write_all(b"\n");
-                }
+        if chan != "stdout"
+            && chan != "stderr"
+            && let Some(ch) = self.channels.get_mut(chan)
+        {
+            let _ = ch.file.write_all(msg.as_bytes());
+            if !nonewline {
+                let _ = ch.file.write_all(b"\n");
             }
         }
         Ok(String::new())
@@ -2529,27 +2563,26 @@ impl TclInterp {
     }
 
     fn cmd_seek(&mut self, args: &[String]) -> TclResult<String> {
-        if args.len() >= 2 {
-            if let Some(ch) = self.channels.get_mut(&args[0]) {
-                let off = parse_tcl_int(&args[1]).unwrap_or(0);
-                let pos = match args.get(2).map_or("start", String::as_str) {
-                    "current" => SeekFrom::Current(off),
-                    "end" => SeekFrom::End(off),
-                    _ => SeekFrom::Start(off.max(0) as u64),
-                };
-                let _ = ch.file.seek(pos);
-            }
+        if args.len() >= 2
+            && let Some(ch) = self.channels.get_mut(&args[0])
+        {
+            let off = parse_tcl_int(&args[1]).unwrap_or(0);
+            let pos = match args.get(2).map_or("start", String::as_str) {
+                "current" => SeekFrom::Current(off),
+                "end" => SeekFrom::End(off),
+                _ => SeekFrom::Start(off.max(0) as u64),
+            };
+            let _ = ch.file.seek(pos);
         }
         Ok(String::new())
     }
 
     fn cmd_tell(&mut self, args: &[String]) -> TclResult<String> {
-        if let Some(id) = args.first() {
-            if let Some(ch) = self.channels.get_mut(id) {
-                if let Ok(pos) = ch.file.stream_position() {
-                    return Ok(pos.to_string());
-                }
-            }
+        if let Some(id) = args.first()
+            && let Some(ch) = self.channels.get_mut(id)
+            && let Ok(pos) = ch.file.stream_position()
+        {
+            return Ok(pos.to_string());
         }
         Ok("0".to_string())
     }
@@ -2664,11 +2697,7 @@ fn find_matching_bracket(src: &str, start_idx: usize) -> Result<usize, String> {
                 i += 1;
             }
         } else {
-            while i < len
-                && !is_tcl_list_space(bytes[i])
-                && bytes[i] != b';'
-                && bytes[i] != b']'
-            {
+            while i < len && !is_tcl_list_space(bytes[i]) && bytes[i] != b';' && bytes[i] != b']' {
                 if bytes[i] == b'\\' && i + 1 < len {
                     i += 2;
                 } else if bytes[i] == b'[' {
@@ -2788,13 +2817,7 @@ fn tcl_format(fmt: &str, args: &[String]) -> Result<String, String> {
                 while i < chars.len() && chars[i].is_ascii_digit() {
                     i += 1;
                 }
-                Some(
-                    chars[ps..i]
-                        .iter()
-                        .collect::<String>()
-                        .parse()
-                        .unwrap_or(0),
-                )
+                Some(chars[ps..i].iter().collect::<String>().parse().unwrap_or(0))
             }
         } else {
             None
@@ -2895,7 +2918,9 @@ fn tcl_format(fmt: &str, args: &[String]) -> Result<String, String> {
                     for _ in 0..pad_len {
                         out.push(' ');
                     }
-                } else if zero_pad && matches!(spec, 'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'f' | 'e' | 'g') {
+                } else if zero_pad
+                    && matches!(spec, 'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'f' | 'e' | 'g')
+                {
                     if let Some(rest) = formatted.strip_prefix('-') {
                         out.push('-');
                         for _ in 0..pad_len {

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "95/114 subtests passed; pending: TEMP TABLE"]
 fn test_trans() {
-    sqliters_tcltest::run_test_script("trans", r#"
+    sqliters_tcltest::run_test_script(
+        "trans",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 wal_set_journal_mode
@@ -906,5 +908,6 @@ for {set i 2} {$i<=$limit} {incr i} {
   set ::pager_old_format 0
 }
 finish_test
-"#);
+"#,
+    );
 }

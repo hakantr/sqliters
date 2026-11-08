@@ -27,8 +27,8 @@ use sqliters_vdbe::{
 };
 
 use crate::compiler::{
-    AccessPlan, choose_access_plan, compile_for_explain, explain_query_plan,
-    expr_column_label, expr_contains_aggregate,
+    AccessPlan, choose_access_plan, compile_for_explain, explain_query_plan, expr_column_label,
+    expr_contains_aggregate,
 };
 use crate::schema::{
     ColumnSchema, ForeignKeySchema, IndexSchema, Schema, TableRowKey, TableSchema,
@@ -119,11 +119,7 @@ impl EvalRow {
         }
 
         if matches.len() == 1 {
-            return Ok(Some((
-                matches[0].0.clone(),
-                matches[0].1,
-                matches[0].2,
-            )));
+            return Ok(Some((matches[0].0.clone(), matches[0].1, matches[0].2)));
         }
         if matches.len() > 1 {
             return Err(SqliteError::new(
@@ -789,10 +785,7 @@ fn classify_cte_recursion(cte: &CommonTableExpr) -> CteRecursionKind {
     }
     let rhs_total = count_table_refs_in_core(last_rhs, &cte.name);
     let mut direct_from_refs = 0usize;
-    if let SelectCore::Select {
-        from: Some(fc), ..
-    } = last_rhs
-    {
+    if let SelectCore::Select { from: Some(fc), .. } = last_rhs {
         if matches!(&fc.head, TableOrSubquery::Table { name, .. } if name.eq_ignore_ascii_case(&cte.name))
         {
             direct_from_refs += 1;
@@ -920,7 +913,15 @@ fn exec_recursive_cte(
         compounds: cte.query.body.compounds[..last_idx].to_vec(),
     };
     let seed_out = if seed_body.compounds.is_empty() {
-        exec_single_select_core(ctx, &seed_body.head, &[], None, params, outer_scopes, &rec_ctes)?
+        exec_single_select_core(
+            ctx,
+            &seed_body.head,
+            &[],
+            None,
+            params,
+            outer_scopes,
+            &rec_ctes,
+        )?
     } else {
         exec_compound_select(ctx, &seed_body, &[], None, params, outer_scopes, &rec_ctes)?
     };
@@ -970,8 +971,8 @@ fn exec_recursive_cte(
 
     // Evaluate optional CTE-level `LIMIT` / `OFFSET`
     let (cte_limit_opt, cte_offset) = if let Some(ref lim) = cte.query.limit {
-        let lv = eval_expr(ctx, &lim.limit, params, outer_scopes, &rec_ctes, None)?
-            .to_integer_lossy();
+        let lv =
+            eval_expr(ctx, &lim.limit, params, outer_scopes, &rec_ctes, None)?.to_integer_lossy();
         let ov = match &lim.offset {
             Some(oe) => eval_expr(ctx, oe, params, outer_scopes, &rec_ctes, None)?
                 .to_integer_lossy()
@@ -1214,7 +1215,9 @@ fn exec_compound_select(
                 });
                 acc_rows.retain(|r| {
                     rhs_sorted
-                        .binary_search_by(|probe| compare_value_slices(probe, r, &default_specs, enc))
+                        .binary_search_by(|probe| {
+                            compare_value_slices(probe, r, &default_specs, enc)
+                        })
                         .is_ok()
                 });
             }
@@ -1227,7 +1230,9 @@ fn exec_compound_select(
                 });
                 acc_rows.retain(|r| {
                     rhs_sorted
-                        .binary_search_by(|probe| compare_value_slices(probe, r, &default_specs, enc))
+                        .binary_search_by(|probe| {
+                            compare_value_slices(probe, r, &default_specs, enc)
+                        })
                         .is_err()
                 });
             }
@@ -1336,14 +1341,9 @@ fn exec_single_select_core(
             // 1. Evaluate FROM & JOINs
             let source_rows = match from {
                 None => vec![EvalRow::default()],
-                Some(fc) => eval_from_clause(
-                    ctx,
-                    fc,
-                    selection.as_ref(),
-                    params,
-                    outer_scopes,
-                    ctes,
-                )?,
+                Some(fc) => {
+                    eval_from_clause(ctx, fc, selection.as_ref(), params, outer_scopes, ctes)?
+                }
             };
 
             // 2. Filter via WHERE
@@ -1372,8 +1372,9 @@ fn exec_single_select_core(
             let sample_cols: Vec<ScopedColumn> = match filtered.first() {
                 Some(r) => r.cols.to_vec(),
                 None => match from {
-                    Some(fc) => schema_cols_preview(ctx, fc, params, outer_scopes, ctes)
-                        .unwrap_or_default(),
+                    Some(fc) => {
+                        schema_cols_preview(ctx, fc, params, outer_scopes, ctes).unwrap_or_default()
+                    }
                     None => Vec::new(),
                 },
             };
@@ -1654,12 +1655,7 @@ fn collect_minmax_aggregates(
                 AggregateKind::Max
             };
             let coll = infer_expr_collation_from_cols(&es[0], sample_cols);
-            out.push((
-                kind,
-                es[0].clone(),
-                filter.as_deref().cloned(),
-                coll,
-            ));
+            out.push((kind, es[0].clone(), filter.as_deref().cloned(), coll));
         }
         Expr::FunctionCall {
             args: FunctionArgs::Exprs(es),
@@ -2035,9 +2031,7 @@ fn eval_from_clause(
         .joins
         .iter()
         .all(|j| !matches!(j.join_type, JoinType::Right | JoinType::Full));
-    if no_right_or_full_after_head
-        && let Some(ref full_cols) = full_from_cols_opt
-    {
+    if no_right_or_full_after_head && let Some(ref full_cols) = full_from_cols_opt {
         for (ci, &conj) in pushable_conjuncts.iter().enumerate() {
             if !applied[ci]
                 && expr_can_eval_with_cols(conj, &left_cols_fallback, full_cols, outer_scopes)
@@ -2101,9 +2095,7 @@ fn eval_from_clause(
 
         // Post-join WHERE pushdown whenever all remaining joins in `fc.joins[(j_idx + 1)..]`
         // are `INNER`/`CROSS`/`LEFT` (none can NULL-extend or right-match `left_rows`)!
-        if no_later_right_or_full
-            && let Some(ref full_cols) = full_from_cols_opt
-        {
+        if no_later_right_or_full && let Some(ref full_cols) = full_from_cols_opt {
             for (ci, &conj) in pushable_conjuncts.iter().enumerate() {
                 if !applied[ci]
                     && expr_can_eval_with_cols(conj, &left_cols_fallback, full_cols, outer_scopes)
@@ -2112,15 +2104,8 @@ fn eval_from_clause(
                     let mut kept = Vec::with_capacity(left_rows.len());
                     for r in left_rows {
                         if outer_scopes.is_empty() {
-                            if eval_expr(
-                                ctx,
-                                conj,
-                                params,
-                                std::slice::from_ref(&r),
-                                ctes,
-                                None,
-                            )?
-                            .truthiness()
+                            if eval_expr(ctx, conj, params, std::slice::from_ref(&r), ctes, None)?
+                                .truthiness()
                                 == Some(true)
                             {
                                 kept.push(r);
@@ -2473,21 +2458,13 @@ fn merge_join_scoped_columns(
     let mut cols = Vec::with_capacity(left_cols.len() + right_cols.len());
     for lc in left_cols {
         let mut sc = lc.clone();
-        if !sc.hidden_rowid
-            && using_cols
-                .iter()
-                .any(|u| u.eq_ignore_ascii_case(&sc.name))
-        {
+        if !sc.hidden_rowid && using_cols.iter().any(|u| u.eq_ignore_ascii_case(&sc.name)) {
             sc.merged_using = true;
         }
         cols.push(sc);
     }
     for rc in right_cols {
-        if !rc.hidden_rowid
-            && using_cols
-                .iter()
-                .any(|u| u.eq_ignore_ascii_case(&rc.name))
-        {
+        if !rc.hidden_rowid && using_cols.iter().any(|u| u.eq_ignore_ascii_case(&rc.name)) {
             continue;
         }
         cols.push(rc.clone());
@@ -2607,7 +2584,8 @@ fn try_build_equi_hash_index(
         } else {
             (b_idx, a_idx)
         };
-        let comp_aff = sqlite_compare_affinity(left_cols[l_idx].affinity, right_cols[r_idx].affinity);
+        let comp_aff =
+            sqlite_compare_affinity(left_cols[l_idx].affinity, right_cols[r_idx].affinity);
 
         // Verify all values in `left_rows[..][l_idx]` fit exact HashJoinKey representation
         if left_rows
@@ -2643,6 +2621,7 @@ fn try_build_equi_hash_index(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_join(
     ctx: &mut ExecContext<'_>,
     left_rows: Vec<EvalRow>,
@@ -2669,11 +2648,7 @@ fn apply_join(
         .iter()
         .enumerate()
         .filter_map(|(j, rc)| {
-            if !rc.hidden_rowid
-                && using_cols
-                    .iter()
-                    .any(|u| u.eq_ignore_ascii_case(&rc.name))
-            {
+            if !rc.hidden_rowid && using_cols.iter().any(|u| u.eq_ignore_ascii_case(&rc.name)) {
                 None
             } else {
                 Some(j)
@@ -2682,12 +2657,7 @@ fn apply_join(
         .collect();
     let left_is_using: Vec<bool> = left_sample_cols
         .iter()
-        .map(|lc| {
-            !lc.hidden_rowid
-                && using_cols
-                    .iter()
-                    .any(|u| u.eq_ignore_ascii_case(&lc.name))
-        })
+        .map(|lc| !lc.hidden_rowid && using_cols.iter().any(|u| u.eq_ignore_ascii_case(&lc.name)))
         .collect();
 
     let combine_rows = |l: Option<&EvalRow>, r: Option<&EvalRow>| -> EvalRow {
@@ -2739,8 +2709,7 @@ fn apply_join(
             if !right_only_conjuncts.is_empty() {
                 let r_scopes = push_scope(outer_scopes, r);
                 for &rc in &right_only_conjuncts {
-                    if eval_expr(ctx, rc, params, &r_scopes, ctes, None)?.truthiness()
-                        != Some(true)
+                    if eval_expr(ctx, rc, params, &r_scopes, ctes, None)?.truthiness() != Some(true)
                     {
                         ok = false;
                         break;
@@ -2803,12 +2772,16 @@ fn apply_join(
                 let matches = if !using_cols.is_empty() {
                     let mut ok = true;
                     for u in &using_cols {
-                        let (lv, lcoll, laff) = l
-                            .lookup_full(None, u)?
-                            .unwrap_or((Value::Null, Collation::Binary, None));
-                        let (rv, rcoll, raff) = r
-                            .lookup_full(None, u)?
-                            .unwrap_or((Value::Null, Collation::Binary, None));
+                        let (lv, lcoll, laff) = l.lookup_full(None, u)?.unwrap_or((
+                            Value::Null,
+                            Collation::Binary,
+                            None,
+                        ));
+                        let (rv, rcoll, raff) = r.lookup_full(None, u)?.unwrap_or((
+                            Value::Null,
+                            Collation::Binary,
+                            None,
+                        ));
                         let coll = if lcoll != Collation::Binary {
                             lcoll
                         } else {
@@ -3007,6 +2980,7 @@ fn schema_cols_for_tos(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn expand_projection(
     projection: &[ResultColumn],
     sample_cols: &[ScopedColumn],
@@ -3184,10 +3158,13 @@ fn infer_order_by_collation(
         table: None,
         column,
     } = ob_expr
-        && let Some((idx, _)) = expanded_proj.iter().enumerate().find(|(_, (_, label, al))| {
-            al.as_ref().is_some_and(|a| a.eq_ignore_ascii_case(column))
-                || label.eq_ignore_ascii_case(column)
-        })
+        && let Some((idx, _)) = expanded_proj
+            .iter()
+            .enumerate()
+            .find(|(_, (_, label, al))| {
+                al.as_ref().is_some_and(|a| a.eq_ignore_ascii_case(column))
+                    || label.eq_ignore_ascii_case(column)
+            })
     {
         let in_row = sample_cols
             .iter()
@@ -3224,10 +3201,13 @@ fn eval_order_term_in_scope(
         table: None,
         column,
     } = inner
-        && let Some((idx, _)) = expanded_proj.iter().enumerate().find(|(_, (_, label, al))| {
-            al.as_ref().is_some_and(|a| a.eq_ignore_ascii_case(column))
-                || label.eq_ignore_ascii_case(column)
-        })
+        && let Some((idx, _)) = expanded_proj
+            .iter()
+            .enumerate()
+            .find(|(_, (_, label, al))| {
+                al.as_ref().is_some_and(|a| a.eq_ignore_ascii_case(column))
+                    || label.eq_ignore_ascii_case(column)
+            })
     {
         // Prefer alias match if column is not directly in scope or is an explicit alias
         let in_row = scopes
@@ -3275,10 +3255,14 @@ fn subst_order_by_aliases_in_expr(
                 .and_then(|r| r.lookup(None, column).ok().flatten())
                 .is_some();
             if !in_row
-                && let Some((idx, _)) = expanded_proj.iter().enumerate().find(|(_, (_, label, al))| {
-                    al.as_ref().is_some_and(|a| a.eq_ignore_ascii_case(column))
-                        || label.eq_ignore_ascii_case(column)
-                })
+                && let Some((idx, _)) =
+                    expanded_proj
+                        .iter()
+                        .enumerate()
+                        .find(|(_, (_, label, al))| {
+                            al.as_ref().is_some_and(|a| a.eq_ignore_ascii_case(column))
+                                || label.eq_ignore_ascii_case(column)
+                        })
             {
                 return value_to_literal_expr(&proj_vals[idx]);
             }
@@ -3406,9 +3390,14 @@ fn subst_order_by_aliases_in_expr(
                 expanded_proj,
                 scopes,
             )),
-            escape: escape
-                .as_ref()
-                .map(|e| Box::new(subst_order_by_aliases_in_expr(e, proj_vals, expanded_proj, scopes))),
+            escape: escape.as_ref().map(|e| {
+                Box::new(subst_order_by_aliases_in_expr(
+                    e,
+                    proj_vals,
+                    expanded_proj,
+                    scopes,
+                ))
+            }),
             op: *op,
             negated: *negated,
         },
@@ -3417,9 +3406,14 @@ fn subst_order_by_aliases_in_expr(
             branches,
             else_expr,
         } => Expr::Case {
-            operand: operand
-                .as_ref()
-                .map(|e| Box::new(subst_order_by_aliases_in_expr(e, proj_vals, expanded_proj, scopes))),
+            operand: operand.as_ref().map(|e| {
+                Box::new(subst_order_by_aliases_in_expr(
+                    e,
+                    proj_vals,
+                    expanded_proj,
+                    scopes,
+                ))
+            }),
             branches: branches
                 .iter()
                 .map(|(w, t)| {
@@ -3429,9 +3423,14 @@ fn subst_order_by_aliases_in_expr(
                     )
                 })
                 .collect(),
-            else_expr: else_expr
-                .as_ref()
-                .map(|e| Box::new(subst_order_by_aliases_in_expr(e, proj_vals, expanded_proj, scopes))),
+            else_expr: else_expr.as_ref().map(|e| {
+                Box::new(subst_order_by_aliases_in_expr(
+                    e,
+                    proj_vals,
+                    expanded_proj,
+                    scopes,
+                ))
+            }),
         },
         Expr::FunctionCall {
             name,
@@ -3445,13 +3444,20 @@ fn subst_order_by_aliases_in_expr(
                 FunctionArgs::Star => FunctionArgs::Star,
                 FunctionArgs::Exprs(es) => FunctionArgs::Exprs(
                     es.iter()
-                        .map(|e| subst_order_by_aliases_in_expr(e, proj_vals, expanded_proj, scopes))
+                        .map(|e| {
+                            subst_order_by_aliases_in_expr(e, proj_vals, expanded_proj, scopes)
+                        })
                         .collect(),
                 ),
             },
-            filter: filter
-                .as_ref()
-                .map(|e| Box::new(subst_order_by_aliases_in_expr(e, proj_vals, expanded_proj, scopes))),
+            filter: filter.as_ref().map(|e| {
+                Box::new(subst_order_by_aliases_in_expr(
+                    e,
+                    proj_vals,
+                    expanded_proj,
+                    scopes,
+                ))
+            }),
         },
         Expr::RowValue(elems) => Expr::RowValue(
             elems
@@ -3493,7 +3499,10 @@ fn sort_materialized_output(
                 Expr::Collate { collation, .. } => {
                     Collation::from_name(collation).unwrap_or_default()
                 }
-                _ => col_collations.get(cidx).copied().unwrap_or(Collation::Binary),
+                _ => col_collations
+                    .get(cidx)
+                    .copied()
+                    .unwrap_or(Collation::Binary),
             };
             specs.push((
                 cidx,
@@ -3624,9 +3633,9 @@ fn subst_select_aliases_in_expr(
                 .any(|s| s.lookup(None, column).ok().flatten().is_some());
             if !in_sample
                 && !in_outer
-                && let Some((pe, _, _)) = expanded_proj.iter().find(|(_, _, al)| {
-                    al.as_ref().is_some_and(|a| a.eq_ignore_ascii_case(column))
-                })
+                && let Some((pe, _, _)) = expanded_proj
+                    .iter()
+                    .find(|(_, _, al)| al.as_ref().is_some_and(|a| a.eq_ignore_ascii_case(column)))
             {
                 return pe.clone();
             }
@@ -3719,9 +3728,7 @@ fn subst_select_aliases_in_expr(
             )),
             list: list
                 .iter()
-                .map(|e| {
-                    subst_select_aliases_in_expr(e, expanded_proj, sample_cols, outer_scopes)
-                })
+                .map(|e| subst_select_aliases_in_expr(e, expanded_proj, sample_cols, outer_scopes))
                 .collect(),
             negated: *negated,
         },
@@ -3847,9 +3854,7 @@ fn subst_select_aliases_in_expr(
         Expr::RowValue(elems) => Expr::RowValue(
             elems
                 .iter()
-                .map(|e| {
-                    subst_select_aliases_in_expr(e, expanded_proj, sample_cols, outer_scopes)
-                })
+                .map(|e| subst_select_aliases_in_expr(e, expanded_proj, sample_cols, outer_scopes))
                 .collect(),
         ),
         _ => expr.clone(),
@@ -3890,13 +3895,8 @@ fn infer_cte_meta_guarded(
     if !cte.query.ctes.is_empty() {
         sub_ctes.scopes.push(cte.query.ctes.clone());
     }
-    let res = infer_select_body_meta_guarded(
-        &cte.query.body,
-        outer_scopes,
-        schema,
-        &sub_ctes,
-        visited,
-    );
+    let res =
+        infer_select_body_meta_guarded(&cte.query.body, outer_scopes, schema, &sub_ctes, visited);
     visited.pop();
     res
 }
@@ -4119,8 +4119,13 @@ fn static_schema_cols_for_tos(
         }
         TableOrSubquery::Subquery { query, alias } => {
             let sub_ctes = ctes.with_scope(&query.ctes);
-            let meta =
-                infer_select_body_meta_guarded(&query.body, outer_scopes, schema, &sub_ctes, visited);
+            let meta = infer_select_body_meta_guarded(
+                &query.body,
+                outer_scopes,
+                schema,
+                &sub_ctes,
+                visited,
+            );
             let cnames =
                 static_select_col_names(&query.body, outer_scopes, schema, &sub_ctes, visited);
             Some(
@@ -4128,8 +4133,7 @@ fn static_schema_cols_for_tos(
                     .into_iter()
                     .enumerate()
                     .map(|(i, cn)| {
-                        let (aff, coll) =
-                            meta.get(i).copied().unwrap_or((None, Collation::Binary));
+                        let (aff, coll) = meta.get(i).copied().unwrap_or((None, Collation::Binary));
                         ScopedColumn {
                             table_alias: alias.clone(),
                             name: cn,
@@ -4177,7 +4181,9 @@ fn infer_expr_explicit_or_col_collation(
     outer_scopes: &[EvalRow],
 ) -> Option<Collation> {
     match expr {
-        Expr::Collate { collation, .. } => Some(Collation::from_name(collation).unwrap_or_default()),
+        Expr::Collate { collation, .. } => {
+            Some(Collation::from_name(collation).unwrap_or_default())
+        }
         Expr::RowValue(elems) if elems.len() == 1 => {
             infer_expr_explicit_or_col_collation(&elems[0], sample_cols, outer_scopes)
         }
@@ -4267,12 +4273,7 @@ fn compare_value_slices(
     Ordering::Equal
 }
 
-fn compare_single_value(
-    va: &Value,
-    vb: &Value,
-    spec: KeySortOrder,
-    enc: TextEncoding,
-) -> Ordering {
+fn compare_single_value(va: &Value, vb: &Value, spec: KeySortOrder, enc: TextEncoding) -> Ordering {
     match (va.is_null(), vb.is_null()) {
         (true, true) => Ordering::Equal,
         (true, false) => {
@@ -4455,7 +4456,11 @@ fn eval_expr(
                             BinaryOp::ShiftLeft => {
                                 if b < 0 {
                                     let nb = b.saturating_neg();
-                                    if nb >= 64 { if a < 0 { -1 } else { 0 } } else { a >> (nb as u32) }
+                                    if nb >= 64 {
+                                        if a < 0 { -1 } else { 0 }
+                                    } else {
+                                        a >> (nb as u32)
+                                    }
                                 } else if b >= 64 {
                                     0
                                 } else {
@@ -4465,7 +4470,11 @@ fn eval_expr(
                             BinaryOp::ShiftRight => {
                                 if b < 0 {
                                     let nb = b.saturating_neg();
-                                    if nb >= 64 { 0 } else { a.wrapping_shl(nb as u32) }
+                                    if nb >= 64 {
+                                        0
+                                    } else {
+                                        a.wrapping_shl(nb as u32)
+                                    }
                                 } else if b >= 64 {
                                     if a < 0 { -1 } else { 0 }
                                 } else {
@@ -4518,7 +4527,11 @@ fn eval_expr(
         } => {
             let v = eval_expr(ctx, inner, params, scopes, ctes, agg_group)?;
             let is_n = v.is_null();
-            Ok(Value::Integer(i64::from(if *negated { !is_n } else { is_n })))
+            Ok(Value::Integer(i64::from(if *negated {
+                !is_n
+            } else {
+                is_n
+            })))
         }
         Expr::Between {
             expr: val_e,
@@ -4739,7 +4752,11 @@ fn eval_expr(
                 LikeOp::Like => sqlite_like_match(&pv.to_text_lossy(), &tv.to_text_lossy(), esc),
                 LikeOp::Glob => sqlite_glob_match(&pv.to_text_lossy(), &tv.to_text_lossy()),
             };
-            Ok(Value::Integer(i64::from(if *negated { !matched } else { matched })))
+            Ok(Value::Integer(i64::from(if *negated {
+                !matched
+            } else {
+                matched
+            })))
         }
         Expr::Cast {
             expr: inner,
@@ -4892,7 +4909,11 @@ fn eval_expr(
         Expr::Exists { subquery, negated } => {
             let sub_out = exec_select(ctx, subquery, params, scopes, ctes)?;
             let exists = !sub_out.rows.is_empty();
-            Ok(Value::Integer(i64::from(if *negated { !exists } else { exists })))
+            Ok(Value::Integer(i64::from(if *negated {
+                !exists
+            } else {
+                exists
+            })))
         }
     }
 }
@@ -4932,7 +4953,9 @@ fn eval_row_value_tuple(
                 Ok(vec![Value::Null; width])
             }
         }
-        other => Ok(vec![eval_expr(ctx, other, params, scopes, ctes, agg_group)?]),
+        other => Ok(vec![eval_expr(
+            ctx, other, params, scopes, ctes, agg_group,
+        )?]),
     }
 }
 
@@ -4947,7 +4970,9 @@ fn static_row_value_width(
     }
     match e {
         Expr::RowValue(elems) => elems.len(),
-        Expr::Subquery(sub) => infer_select_stmt_meta(sub, scopes, schema, ctes).len().max(1),
+        Expr::Subquery(sub) => infer_select_stmt_meta(sub, scopes, schema, ctes)
+            .len()
+            .max(1),
         _ => 1,
     }
 }
@@ -5134,10 +5159,8 @@ fn eval_row_value_comparison(
                 if lv[i].is_null() || rv[i].is_null() {
                     return Ok(Value::Null);
                 }
-                if eval_comparison_with_affinity(
-                    Opcode::Eq, &lv[i], &rv[i], affs[i], colls[i], enc,
-                )
-                .truthiness()
+                if eval_comparison_with_affinity(Opcode::Eq, &lv[i], &rv[i], affs[i], colls[i], enc)
+                    .truthiness()
                     == Some(true)
                 {
                     if i + 1 == n {
@@ -5308,8 +5331,7 @@ fn table_keys_equal(
                 .zip(pk2.iter())
                 .zip(tbl.without_rowid_pk_cols.iter())
                 .all(|((v1, v2), ic)| {
-                    v1.cmp_sqlite_with_encoding(v2, ic.sort_order.collation, enc)
-                        == Ordering::Equal
+                    v1.cmp_sqlite_with_encoding(v2, ic.sort_order.collation, enc) == Ordering::Equal
                 })
         }
         _ => false,
@@ -5367,7 +5389,10 @@ fn decode_table_logical_row(
                 let gv = eval_expr(ctx, gexpr, params, &[scope], &CteStore::default(), None)?;
                 let mut coerced = tbl.columns[ci].affinity.apply(gv);
                 if tbl.strict
-                    && tbl.columns[ci].type_name.trim().eq_ignore_ascii_case("REAL")
+                    && tbl.columns[ci]
+                        .type_name
+                        .trim()
+                        .eq_ignore_ascii_case("REAL")
                     && let Value::Integer(iv) = coerced
                 {
                     coerced = Value::real(iv as f64);
@@ -5449,7 +5474,10 @@ fn decode_table_logical_row(
             let gv = eval_expr(ctx, gexpr, params, &[scope], &CteStore::default(), None)?;
             let mut coerced = tbl.columns[ci].affinity.apply(gv);
             if tbl.strict
-                && tbl.columns[ci].type_name.trim().eq_ignore_ascii_case("REAL")
+                && tbl.columns[ci]
+                    .type_name
+                    .trim()
+                    .eq_ignore_ascii_case("REAL")
                 && let Value::Integer(iv) = coerced
             {
                 coerced = Value::real(iv as f64);
@@ -5466,8 +5494,9 @@ fn encode_table_physical_record(
     enc: TextEncoding,
 ) -> Vec<u8> {
     if tbl.without_rowid {
-        let mut slots =
-            Vec::with_capacity(tbl.without_rowid_pk_cols.len() + tbl.without_rowid_extra_cols.len());
+        let mut slots = Vec::with_capacity(
+            tbl.without_rowid_pk_cols.len() + tbl.without_rowid_extra_cols.len(),
+        );
         for ic in &tbl.without_rowid_pk_cols {
             let ci = ic.col_idx.expect("WITHOUT ROWID PK col has col_idx");
             slots.push(logical_vals[ci].clone());
@@ -5498,7 +5527,12 @@ fn encode_table_physical_record(
     encode_record_with_encoding(&slots, enc)
 }
 
-fn make_single_table_scope(tbl: &TableSchema, alias: Option<&str>, rowid: i64, vals: &[Value]) -> EvalRow {
+fn make_single_table_scope(
+    tbl: &TableSchema,
+    alias: Option<&str>,
+    rowid: i64,
+    vals: &[Value],
+) -> EvalRow {
     let eff = alias.unwrap_or(&tbl.name).to_owned();
     let mut cols: Vec<ScopedColumn> = tbl
         .columns
@@ -5619,7 +5653,9 @@ fn eval_index_key_values(
     let mut keys = eval_index_column_values(ctx, tbl, idx, rowid, logical_vals, params)?;
     if tbl.without_rowid {
         for tc in &idx.trailing_pk_cols {
-            let ci = tc.col_idx.expect("WITHOUT ROWID trailing PK col has col_idx");
+            let ci = tc
+                .col_idx
+                .expect("WITHOUT ROWID trailing PK col has col_idx");
             keys.push(logical_vals[ci].clone());
         }
     } else {
@@ -5822,7 +5858,7 @@ fn validate_and_write_row(
                 ctx,
                 &chk.expr,
                 params,
-                &[scope.clone()],
+                std::slice::from_ref(&scope),
                 &CteStore::default(),
                 None,
             )?;
@@ -5850,13 +5886,12 @@ fn validate_and_write_row(
     if tbl.without_rowid {
         let is_self =
             existing_self_key.is_some_and(|sk| table_keys_equal(tbl, &final_key, sk, enc));
-        if !is_self
-            && let Some(conflict_payload) = seek_table_raw_entry(ctx, tbl, &final_key)?
-        {
+        if !is_self && let Some(conflict_payload) = seek_table_raw_entry(ctx, tbl, &final_key)? {
             let decoded_conflict = decode_record_with_encoding(&conflict_payload, enc)?;
             let n_pk = tbl.without_rowid_pk_cols.len();
-            let conflict_key =
-                TableRowKey::WithoutRowidPk(decoded_conflict[..n_pk.min(decoded_conflict.len())].to_vec());
+            let conflict_key = TableRowKey::WithoutRowidPk(
+                decoded_conflict[..n_pk.min(decoded_conflict.len())].to_vec(),
+            );
             let eff = stmt_conflict.unwrap_or(tbl.without_rowid_pk_conflict);
             match eff {
                 ConflictAction::Ignore => return Ok(None),
@@ -5903,13 +5938,8 @@ fn validate_and_write_row(
         match eff {
             ConflictAction::Ignore => return Ok(None),
             ConflictAction::Replace => {
-                let conflict_vals = decode_table_logical_row(
-                    ctx,
-                    tbl,
-                    &conflict_key,
-                    &conflict_payload,
-                    params,
-                )?;
+                let conflict_vals =
+                    decode_table_logical_row(ctx, tbl, &conflict_key, &conflict_payload, params)?;
                 if *ctx.foreign_keys {
                     check_parent_delete_restrict(ctx, tbl, &conflict_vals, params)?;
                 }
@@ -6128,7 +6158,8 @@ fn update_sqlite_sequence(ctx: &mut ExecContext<'_>, tbl_name: &str, rowid: i64)
                     &[Value::Text(tbl_name.to_owned()), Value::Integer(rowid)],
                     enc,
                 );
-                ctx.btree.insert_table(seq_tbl.root_pgno, seq_rid, &updated)?;
+                ctx.btree
+                    .insert_table(seq_tbl.root_pgno, seq_rid, &updated)?;
             }
             return Ok(());
         }
@@ -6208,8 +6239,7 @@ fn resolve_fk_parent_cols(
                 idxs.push(ci);
             }
             // Verify `idxs` is covered by rowid PK or a non-partial UNIQUE/PK index on `ptbl`
-            let is_rowid_pk =
-                idxs.len() == 1 && ptbl.rowid_alias_col == Some(idxs[0]);
+            let is_rowid_pk = idxs.len() == 1 && ptbl.rowid_alias_col == Some(idxs[0]);
             let has_matching_unique_idx = if is_rowid_pk {
                 true
             } else {
@@ -6257,7 +6287,10 @@ fn parent_row_exists_for_fk(
         let Value::Integer(target_rid) = coerced else {
             return Ok(false);
         };
-        return Ok(ctx.btree.seek_table_rowid(ptbl.root_pgno, target_rid)?.is_some());
+        return Ok(ctx
+            .btree
+            .seek_table_rowid(ptbl.root_pgno, target_rid)?
+            .is_some());
     }
 
     let enc = ctx.btree.encoding();
@@ -6266,22 +6299,26 @@ fn parent_row_exists_for_fk(
         .zip(from_cols.iter())
         .map(|(&p_idx, &c_idx)| {
             let pcol = &ptbl.columns[p_idx];
-            (pcol.affinity.apply(child_vals[c_idx].clone()), pcol.collation)
+            (
+                pcol.affinity.apply(child_vals[c_idx].clone()),
+                pcol.collation,
+            )
         })
         .collect();
 
     let raw_rows = scan_table_raw_entries(ctx, ptbl)?;
     for (pkey, ppayload) in raw_rows {
         let pvals = decode_table_logical_row(ctx, ptbl, &pkey, &ppayload, &[])?;
-        let matches = parent_col_idxs
-            .iter()
-            .zip(coerced_keys.iter())
-            .all(|(&p_idx, (ck, coll))| {
-                !pvals[p_idx].is_null()
-                    && eval_comparison_with_encoding(Opcode::Eq, &pvals[p_idx], ck, *coll, enc)
-                        .truthiness()
-                        == Some(true)
-            });
+        let matches =
+            parent_col_idxs
+                .iter()
+                .zip(coerced_keys.iter())
+                .all(|(&p_idx, (ck, coll))| {
+                    !pvals[p_idx].is_null()
+                        && eval_comparison_with_encoding(Opcode::Eq, &pvals[p_idx], ck, *coll, enc)
+                            .truthiness()
+                            == Some(true)
+                });
         if matches {
             return Ok(true);
         }
@@ -6369,7 +6406,10 @@ fn verify_fk_suspects(
     Ok(())
 }
 
-fn find_referencing_fks(schema: &Schema, parent_tbl_name: &str) -> Vec<(TableSchema, ForeignKeySchema)> {
+fn find_referencing_fks(
+    schema: &Schema,
+    parent_tbl_name: &str,
+) -> Vec<(TableSchema, ForeignKeySchema)> {
     let mut out = Vec::new();
     for ctbl in &schema.tables {
         for fk in &ctbl.foreign_keys {
@@ -6394,7 +6434,10 @@ fn check_parent_delete_restrict(
         if fk.on_delete != FkAction::Restrict {
             continue;
         }
-        if parent_col_idxs.iter().any(|&pi| old_parent_vals[pi].is_null()) {
+        if parent_col_idxs
+            .iter()
+            .any(|&pi| old_parent_vals[pi].is_null())
+        {
             continue;
         }
         let crows = scan_table_raw_entries(ctx, &ctbl)?;
@@ -6446,13 +6489,22 @@ fn check_parent_update_restrict(
     let enc = ctx.btree.encoding();
     for (ctbl, fk) in refs {
         let (_, parent_col_idxs) = resolve_fk_parent_cols(ctx.schema, &ctbl.name, &fk)?;
-        if !parent_key_changed(ptbl, &parent_col_idxs, old_parent_vals, new_parent_vals, enc) {
+        if !parent_key_changed(
+            ptbl,
+            &parent_col_idxs,
+            old_parent_vals,
+            new_parent_vals,
+            enc,
+        ) {
             continue;
         }
         if fk.on_update != FkAction::Restrict {
             continue;
         }
-        if parent_col_idxs.iter().any(|&pi| old_parent_vals[pi].is_null()) {
+        if parent_col_idxs
+            .iter()
+            .any(|&pi| old_parent_vals[pi].is_null())
+        {
             continue;
         }
         let crows = scan_table_raw_entries(ctx, &ctbl)?;
@@ -6492,7 +6544,10 @@ fn apply_parent_delete_fk_actions(
 
     for (ctbl, fk) in refs {
         let (_, parent_col_idxs) = resolve_fk_parent_cols(ctx.schema, &ctbl.name, &fk)?;
-        if parent_col_idxs.iter().any(|&pi| old_parent_vals[pi].is_null()) {
+        if parent_col_idxs
+            .iter()
+            .any(|&pi| old_parent_vals[pi].is_null())
+        {
             continue;
         }
         let crows = scan_table_raw_entries(ctx, &ctbl)?;
@@ -6533,8 +6588,7 @@ fn apply_parent_delete_fk_actions(
                     let Some(cpayload) = seek_table_raw_entry(ctx, &ctbl, &ckey)? else {
                         continue;
                     };
-                    let cur_cvals =
-                        decode_table_logical_row(ctx, &ctbl, &ckey, &cpayload, params)?;
+                    let cur_cvals = decode_table_logical_row(ctx, &ctbl, &ckey, &cpayload, params)?;
                     check_parent_delete_restrict(ctx, &ctbl, &cur_cvals, params)?;
                     if remove_row_and_indexes(ctx, &ctbl, &cindexes, &ckey, params)? {
                         ctx.runtime.total_changes += 1;
@@ -6598,7 +6652,9 @@ fn apply_parent_delete_fk_actions(
                     };
                     for &fcol in &fk.from_cols {
                         let dval = match &ctbl.columns[fcol].default_expr {
-                            Some(de) => eval_expr(ctx, de, params, &[], &CteStore::default(), None)?,
+                            Some(de) => {
+                                eval_expr(ctx, de, params, &[], &CteStore::default(), None)?
+                            }
                             None => Value::Null,
                         };
                         if ctbl.rowid_alias_col == Some(fcol) {
@@ -6653,10 +6709,19 @@ fn apply_parent_update_fk_actions(
 
     for (ctbl, fk) in refs {
         let (_, parent_col_idxs) = resolve_fk_parent_cols(ctx.schema, &ctbl.name, &fk)?;
-        if !parent_key_changed(ptbl, &parent_col_idxs, old_parent_vals, new_parent_vals, enc) {
+        if !parent_key_changed(
+            ptbl,
+            &parent_col_idxs,
+            old_parent_vals,
+            new_parent_vals,
+            enc,
+        ) {
             continue;
         }
-        if parent_col_idxs.iter().any(|&pi| old_parent_vals[pi].is_null()) {
+        if parent_col_idxs
+            .iter()
+            .any(|&pi| old_parent_vals[pi].is_null())
+        {
             continue;
         }
         let crows = scan_table_raw_entries(ctx, &ctbl)?;
@@ -6779,7 +6844,9 @@ fn apply_parent_update_fk_actions(
                     };
                     for &fcol in &fk.from_cols {
                         let dval = match &ctbl.columns[fcol].default_expr {
-                            Some(de) => eval_expr(ctx, de, params, &[], &CteStore::default(), None)?,
+                            Some(de) => {
+                                eval_expr(ctx, de, params, &[], &CteStore::default(), None)?
+                            }
                             None => Value::Null,
                         };
                         if ctbl.rowid_alias_col == Some(fcol) {
@@ -6901,7 +6968,8 @@ fn exec_insert(
 
     ctx.runtime.last_changes = 0;
 
-    let sample_scope = make_single_table_scope(&tbl, None, 0, &vec![Value::Null; tbl.columns.len()]);
+    let sample_scope =
+        make_single_table_scope(&tbl, None, 0, &vec![Value::Null; tbl.columns.len()]);
     let (ret_col_names, ret_expanded) = if ins.returning.is_empty() {
         (Vec::new(), Vec::new())
     } else {
@@ -6927,14 +6995,10 @@ fn exec_insert(
             if src_row.len() != targets.len() {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    format!(
-                        "{} values for {} columns",
-                        src_row.len(),
-                        targets.len()
-                    ),
+                    format!("{} values for {} columns", src_row.len(), targets.len()),
                 ));
             }
-            for (&t_idx, val) in targets.iter().zip(src_row.into_iter()) {
+            for (&t_idx, val) in targets.iter().zip(src_row) {
                 if t_idx == usize::MAX {
                     if !val.is_null() {
                         let c = TypeAffinity::Integer.apply(val);
@@ -6959,7 +7023,7 @@ fn exec_insert(
                     ),
                 ));
             }
-            for (&ci, val) in implicit_non_gen_cols.iter().zip(src_row.into_iter()) {
+            for (&ci, val) in implicit_non_gen_cols.iter().zip(src_row) {
                 col_vals[ci] = val;
             }
         }
@@ -6993,19 +7057,15 @@ fn exec_insert(
         if let Some((written_key, written_vals)) = written_opt
             && !ret_expanded.is_empty()
         {
-            let rscope = make_single_table_scope(
-                &tbl,
-                None,
-                written_key.rowid_or_zero(),
-                &written_vals,
-            );
+            let rscope =
+                make_single_table_scope(&tbl, None, written_key.rowid_or_zero(), &written_vals);
             let mut rrow = Vec::with_capacity(ret_expanded.len());
             for (pe, _, _) in &ret_expanded {
                 rrow.push(eval_expr(
                     ctx,
                     pe,
                     params,
-                    &[rscope.clone()],
+                    std::slice::from_ref(&rscope),
                     &dml_ctes,
                     None,
                 )?);
@@ -7090,7 +7150,14 @@ fn exec_update(
             &old_vals,
         );
         if let Some(ref w) = upd.selection {
-            let cond = eval_expr(ctx, w, params, &[scope.clone()], &dml_ctes, None)?;
+            let cond = eval_expr(
+                ctx,
+                w,
+                params,
+                std::slice::from_ref(&scope),
+                &dml_ctes,
+                None,
+            )?;
             if cond.truthiness() != Some(true) {
                 continue;
             }
@@ -7106,7 +7173,7 @@ fn exec_update(
                 ctx,
                 val_expr,
                 params,
-                &[scope.clone()],
+                std::slice::from_ref(&scope),
                 &dml_ctes,
                 None,
             )?;
@@ -7188,7 +7255,7 @@ fn exec_update(
                     ctx,
                     pe,
                     params,
-                    &[rscope.clone()],
+                    std::slice::from_ref(&rscope),
                     &dml_ctes,
                     None,
                 )?);
@@ -7264,14 +7331,17 @@ fn exec_delete(
     let mut targets = Vec::new();
     for (rkey, payload) in candidates {
         let vals = decode_table_logical_row(ctx, &tbl, &rkey, &payload, params)?;
-        let scope = make_single_table_scope(
-            &tbl,
-            del.alias.as_deref(),
-            rkey.rowid_or_zero(),
-            &vals,
-        );
+        let scope =
+            make_single_table_scope(&tbl, del.alias.as_deref(), rkey.rowid_or_zero(), &vals);
         if let Some(ref w) = del.selection {
-            let cond = eval_expr(ctx, w, params, &[scope.clone()], &dml_ctes, None)?;
+            let cond = eval_expr(
+                ctx,
+                w,
+                params,
+                std::slice::from_ref(&scope),
+                &dml_ctes,
+                None,
+            )?;
             if cond.truthiness() != Some(true) {
                 continue;
             }
@@ -7323,7 +7393,7 @@ fn exec_delete(
                         ctx,
                         pe,
                         params,
-                        &[scope.clone()],
+                        std::slice::from_ref(&scope),
                         &dml_ctes,
                         None,
                     )?);
@@ -7790,7 +7860,8 @@ fn exec_alter_table(
                     format!("there is already another table or index with this name: {new_name}"),
                 ));
             }
-            let new_sql = rewrite_table_name_in_create_table_sql(&tbl.raw_sql, &tbl.name, new_name)?;
+            let new_sql =
+                rewrite_table_name_in_create_table_sql(&tbl.raw_sql, &tbl.name, new_name)?;
             update_schema_entry(
                 ctx.btree,
                 tbl.schema_rowid,
@@ -8039,18 +8110,14 @@ fn exec_alter_table(
                         ));
                     }
                     if has_new_check {
-                        let scope = make_single_table_scope(
-                            &new_tbl,
-                            None,
-                            rkey.rowid_or_zero(),
-                            &vals,
-                        );
+                        let scope =
+                            make_single_table_scope(&new_tbl, None, rkey.rowid_or_zero(), &vals);
                         for chk in &new_tbl.checks[tbl.checks.len()..] {
                             let cv = eval_expr(
                                 ctx,
                                 &chk.expr,
                                 &[],
-                                &[scope.clone()],
+                                std::slice::from_ref(&scope),
                                 &CteStore::default(),
                                 None,
                             )?;
@@ -8403,8 +8470,8 @@ fn rewrite_column_in_create_table_sql(
     let mut items = Vec::new();
     let mut depth = 0usize;
     let mut cur_start = outer_lp + 1;
-    for idx in (outer_lp + 1)..outer_rp {
-        match tokens[idx].kind {
+    for (idx, tok) in tokens.iter().enumerate().take(outer_rp).skip(outer_lp + 1) {
+        match tok.kind {
             TokenKind::Lp => depth += 1,
             TokenKind::Rp => depth = depth.saturating_sub(1),
             TokenKind::Comma if depth == 0 => {
@@ -8443,9 +8510,8 @@ fn rewrite_column_in_create_table_sql(
             }
             match tokens[p].kind {
                 TokenKind::Primary | TokenKind::Unique => {
-                    if let Some(rel_lp) = tokens[p..iend]
-                        .iter()
-                        .position(|t| t.kind == TokenKind::Lp)
+                    if let Some(rel_lp) =
+                        tokens[p..iend].iter().position(|t| t.kind == TokenKind::Lp)
                     {
                         let lp = p + rel_lp;
                         if let Some(rp) = find_matching_rparen(&tokens, lp) {
@@ -8473,9 +8539,8 @@ fn rewrite_column_in_create_table_sql(
                 }
                 TokenKind::Foreign => {
                     // `FOREIGN KEY ( <from_cols> ) REFERENCES <ref_tbl> [ ( <ref_cols> ) ]`
-                    if let Some(rel_lp) = tokens[p..iend]
-                        .iter()
-                        .position(|t| t.kind == TokenKind::Lp)
+                    if let Some(rel_lp) =
+                        tokens[p..iend].iter().position(|t| t.kind == TokenKind::Lp)
                     {
                         let lp = p + rel_lp;
                         if let Some(rp) = find_matching_rparen(&tokens, lp) {
@@ -8486,20 +8551,20 @@ fn rewrite_column_in_create_table_sql(
                             while r < iend && tokens[r].kind != TokenKind::References {
                                 r += 1;
                             }
-                            if r + 1 < iend && token_matches_ident(&tokens[r + 1], self_tbl) {
-                                if r + 2 < iend
-                                    && tokens[r + 2].kind == TokenKind::Lp
-                                    && let Some(ref_rp) = find_matching_rparen(&tokens, r + 2)
-                                {
-                                    collect_paren_col_list_edits(
-                                        &tokens,
-                                        r + 2,
-                                        ref_rp,
-                                        old_col,
-                                        new_col,
-                                        &mut edits,
-                                    );
-                                }
+                            if r + 1 < iend
+                                && token_matches_ident(&tokens[r + 1], self_tbl)
+                                && r + 2 < iend
+                                && tokens[r + 2].kind == TokenKind::Lp
+                                && let Some(ref_rp) = find_matching_rparen(&tokens, r + 2)
+                            {
+                                collect_paren_col_list_edits(
+                                    &tokens,
+                                    r + 2,
+                                    ref_rp,
+                                    old_col,
+                                    new_col,
+                                    &mut edits,
+                                );
                             }
                         }
                     }
@@ -8694,9 +8759,7 @@ fn render_column_def_sql(cdef: &sqliters_syntax::ColumnDef) -> String {
             sqliters_syntax::ColumnConstraint::Default(e) => {
                 parts.push(format!("DEFAULT ({})", expr_column_label(e)));
             }
-            sqliters_syntax::ColumnConstraint::Check {
-                name, expr_sql, ..
-            } => {
+            sqliters_syntax::ColumnConstraint::Check { name, expr_sql, .. } => {
                 if let Some(n) = name {
                     parts.push(format!(
                         "CONSTRAINT {} CHECK ({expr_sql})",

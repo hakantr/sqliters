@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "8/17 subtests passed; pending: VIEW"]
 fn test_selectH() {
-    sqliters_tcltest::run_test_script("selectH", r#"
+    sqliters_tcltest::run_test_script(
+        "selectH",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix selectH
@@ -113,5 +115,6 @@ do_execsql_test 5.2 {
   )
 } {2}
 finish_test
-"#);
+"#,
+    );
 }

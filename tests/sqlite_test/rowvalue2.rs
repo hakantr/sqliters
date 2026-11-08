@@ -1,6 +1,8 @@
 #[test]
 fn test_rowvalue2() {
-    sqliters_tcltest::run_test_script("rowvalue2", r#"
+    sqliters_tcltest::run_test_script(
+        "rowvalue2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix rowvalue2
@@ -239,5 +241,6 @@ foreach {tn lhs rhs} {
   }
 }
 finish_test
-"#);
+"#,
+    );
 }

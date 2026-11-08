@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "2/11 subtests passed; pending: func6 edge cases"]
 fn test_func6() {
-    sqliters_tcltest::run_test_script("func6", r#"
+    sqliters_tcltest::run_test_script(
+        "func6",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !offset_sql_func {
@@ -127,5 +129,6 @@ do_execsql_test func6-300 {
   SELECT * FROM t1 WHERE a IN (SELECT sqlite_offset(b) FROM t2);
 } {}
 finish_test
-"#);
+"#,
+    );
 }

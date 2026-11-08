@@ -1,6 +1,8 @@
 #[test]
 fn test_savepoint5() {
-    sqliters_tcltest::run_test_script("savepoint5", r#"
+    sqliters_tcltest::run_test_script(
+        "savepoint5",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test savepoint5-1.1 {
@@ -27,5 +29,6 @@ do_test savepoint5-1.3 {
   }
 } {1 1}
 finish_test
-"#);
+"#,
+    );
 }

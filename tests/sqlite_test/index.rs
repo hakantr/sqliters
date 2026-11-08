@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "91/120 subtests passed; pending: VIEW, TRIGGER, TEMP TABLE"]
 fn test_index() {
-    sqliters_tcltest::run_test_script("index", r#"
+    sqliters_tcltest::run_test_script(
+        "index",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test index-1.1 {
@@ -651,5 +653,6 @@ do_execsql_test index-23.1 {
   REINDEX;
 } {0.1}
 finish_test
-"#);
+"#,
+    );
 }

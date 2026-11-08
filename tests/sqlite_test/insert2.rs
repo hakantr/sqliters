@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "29/31 subtests passed; pending: VIRTUAL TABLE, TEMP TABLE"]
 fn test_insert2() {
-    sqliters_tcltest::run_test_script("insert2", r#"
+    sqliters_tcltest::run_test_script(
+        "insert2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix insert2
@@ -259,5 +261,6 @@ ifcapable fts3 {
   } {0}
 }
 finish_test
-"#);
+"#,
+    );
 }

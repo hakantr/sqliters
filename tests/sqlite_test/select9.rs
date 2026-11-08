@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "34824/36716 subtests passed; pending: VIEW, EQP/optimizer"]
 fn test_select9() {
-    sqliters_tcltest::run_test_script("select9", r#"
+    sqliters_tcltest::run_test_script(
+        "select9",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 proc test_compound_select {testname sql result} {
@@ -343,5 +345,6 @@ do_execsql_test select9-6.3 {
   SELECT a FROM t61 UNION SELECT b FROM t62 WHERE 0;
 } {111}
 finish_test
-"#);
+"#,
+    );
 }

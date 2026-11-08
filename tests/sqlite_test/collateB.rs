@@ -1,6 +1,8 @@
 #[test]
 fn test_collateB() {
-    sqliters_tcltest::run_test_script("collateB", r#"
+    sqliters_tcltest::run_test_script(
+        "collateB",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix collateB
@@ -58,5 +60,6 @@ do_execsql_test 2.1 {
 } 
 integrity_check 2.2
 finish_test
-"#);
+"#,
+    );
 }

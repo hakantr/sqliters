@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "27/42 subtests passed; pending: VIEW"]
 fn test_joinI() {
-    sqliters_tcltest::run_test_script("joinI", r#"
+    sqliters_tcltest::run_test_script(
+        "joinI",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix joinI
@@ -241,5 +243,6 @@ do_execsql_test 10.0 {
    ORDER BY +va;
 } {NULL NULL 1 2 NULL NULL 1 3}
 finish_test
-"#);
+"#,
+    );
 }

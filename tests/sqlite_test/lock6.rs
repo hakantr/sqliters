@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "1/8 subtests passed; pending: lock6 edge cases"]
 fn test_lock6() {
-    sqliters_tcltest::run_test_script("lock6", r#"
+    sqliters_tcltest::run_test_script(
+        "lock6",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 proc launch_testfixture {} {
@@ -133,5 +135,6 @@ ifcapable lock_proxy_pragmas&&prefer_proxy_locking {
   sqlite3_soft_heap_limit $cmdlinearg(soft-heap-limit)
 }
 finish_test
-"#);
+"#,
+    );
 }

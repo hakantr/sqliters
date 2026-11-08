@@ -1,6 +1,8 @@
 #[test]
 fn test_join3() {
-    sqliters_tcltest::run_test_script("join3", r#"
+    sqliters_tcltest::run_test_script(
+        "join3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 catch {unset ::result}
@@ -35,5 +37,6 @@ do_test join3-3.1 {
   catchsql $sql
 } [list 1 "at most $bitmask_size tables in a join"]
 finish_test
-"#);
+"#,
+    );
 }

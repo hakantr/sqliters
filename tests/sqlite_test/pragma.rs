@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "7/26 subtests passed; pending: TRIGGER, ATTACH, TEMP TABLE"]
 fn test_pragma() {
-    sqliters_tcltest::run_test_script("pragma", r#"
+    sqliters_tcltest::run_test_script(
+        "pragma",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix pragma
@@ -1827,5 +1829,6 @@ do_execsql_test 25.0 {
   PRAGMA integrity_check;
 } ok
 finish_test
-"#);
+"#,
+    );
 }

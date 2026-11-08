@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "22/54 subtests passed; pending: TRIGGER, ATTACH, VIRTUAL TABLE"]
 fn test_alter4() {
-    sqliters_tcltest::run_test_script("alter4", r#"
+    sqliters_tcltest::run_test_script(
+        "alter4",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !altertable {
@@ -363,5 +365,6 @@ ifcapable fts5 {
   } {1 {virtual tables may not be altered}}
 }
 finish_test
-"#);
+"#,
+    );
 }

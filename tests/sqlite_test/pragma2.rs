@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "6/24 subtests passed; pending: ATTACH"]
 fn test_pragma2() {
-    sqliters_tcltest::run_test_script("pragma2", r#"
+    sqliters_tcltest::run_test_script(
+        "pragma2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !pragma||!schema_pragmas {
@@ -215,5 +217,6 @@ do_execsql_test pragma2-5.3 {
 } {3}
 test_restore_config_pagecache
 finish_test
-"#);
+"#,
+    );
 }

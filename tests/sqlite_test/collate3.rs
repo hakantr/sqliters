@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "6/39 subtests passed; pending: VIEW"]
 fn test_collate3() {
-    sqliters_tcltest::run_test_script("collate3", r#"
+    sqliters_tcltest::run_test_script(
+        "collate3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test collate3-1.0 {
@@ -436,5 +438,6 @@ do_test collate3-5.9 {
   }
 } {}
 finish_test
-"#);
+"#,
+    );
 }

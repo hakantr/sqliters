@@ -1,6 +1,8 @@
 #[test]
 fn test_expr2() {
-    sqliters_tcltest::run_test_script("expr2", r#"
+    sqliters_tcltest::run_test_script(
+        "expr2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix expr2
@@ -33,5 +35,6 @@ do_execsql_test 1.4.2 {
   SELECT NOT (0 IS FALSE OR (t0.c0 = 1)) FROM t0 
 } {0}
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "0/24 subtests passed; pending: pragma3 edge cases"]
 fn test_pragma3() {
-    sqliters_tcltest::run_test_script("pragma3", r#"
+    sqliters_tcltest::run_test_script(
+        "pragma3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 if {[sqlite3 -has-codec]} {
@@ -215,5 +217,6 @@ foreach {tn sql} {
   } {1}
 }
 finish_test
-"#);
+"#,
+    );
 }

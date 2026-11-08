@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "10/44 subtests passed; pending: VIEW, VIRTUAL TABLE, TEMP TABLE"]
 fn test_index7() {
-    sqliters_tcltest::run_test_script("index7", r##"
+    sqliters_tcltest::run_test_script(
+        "index7",
+        r##"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !vtab {
@@ -286,5 +288,6 @@ do_execsql_test index7-8.1 {
   EXPLAIN QUERY PLAN SELECT 1 FROM t1 WHERE y=5;
 } {/SEARCH t1 USING COVERING INDEX t1y/}
 finish_test
-"##);
+"##,
+    );
 }

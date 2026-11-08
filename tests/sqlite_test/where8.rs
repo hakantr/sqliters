@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "2022/2051 subtests passed; pending: VIRTUAL TABLE, C testfixture hooks"]
 fn test_where8() {
-    sqliters_tcltest::run_test_script("where8", r#"
+    sqliters_tcltest::run_test_script(
+        "where8",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 if {[permutation]=="sorterref"} {
@@ -689,5 +691,6 @@ do_execsql_test where8-6.1 {
   SELECT a, b, '|' FROM t600 WHERE a=='state' OR b='mercury' ORDER BY +a;
 } {green mercury | state screen |}
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "283/297 subtests passed; pending: EQP/optimizer"]
 fn test_rowvalue4() {
-    sqliters_tcltest::run_test_script("rowvalue4", r#"
+    sqliters_tcltest::run_test_script(
+        "rowvalue4",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix rowvalue4
@@ -260,5 +262,6 @@ do_catchsql_test 8.2 {
     ( c == (SELECT x, y FROM c1) AND c3.d = c )
 } {1 {row value misused}}
 finish_test
-"#);
+"#,
+    );
 }

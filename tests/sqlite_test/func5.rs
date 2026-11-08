@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "3/4 subtests passed; pending: no such function: counter2"]
 fn test_func5() {
-    sqliters_tcltest::run_test_script("func5", r#"
+    sqliters_tcltest::run_test_script(
+        "func5",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_execsql_test func5-1.1 {
@@ -35,5 +37,6 @@ do_execsql_test func5-2.3 {
    ORDER BY +x;
 } {1 2 3 4 5 6 7 8}
 finish_test
-"#);
+"#,
+    );
 }

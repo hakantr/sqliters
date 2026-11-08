@@ -1,6 +1,8 @@
 #[test]
 fn test_joinF() {
-    sqliters_tcltest::run_test_script("joinF", r#"
+    sqliters_tcltest::run_test_script(
+        "joinF",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 db nullvalue -
@@ -517,5 +519,6 @@ do_execsql_test joinF-54 {
   - - 30 50
 }
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,6 +1,8 @@
 #[test]
 fn test_rowvalue3() {
-    sqliters_tcltest::run_test_script("rowvalue3", r#"
+    sqliters_tcltest::run_test_script(
+        "rowvalue3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix rowvalue3
@@ -183,5 +185,6 @@ do_execsql_test 5.0 {
                      FROM T1, (SELECT * FROM (SELECT 0 n) T3) V);
 } {aaa 0}
 finish_test
-"#);
+"#,
+    );
 }

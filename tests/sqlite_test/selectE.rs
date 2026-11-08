@@ -1,6 +1,8 @@
 #[test]
 fn test_selectE() {
-    sqliters_tcltest::run_test_script("selectE", r#"
+    sqliters_tcltest::run_test_script(
+        "selectE",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test selectE-1.0 {
@@ -54,5 +56,6 @@ do_catchsql_test selectE-3.1 {
   SELECT 1 EXCEPT SELECT 2 ORDER BY 1 COLLATE nocase EXCEPT SELECT 3;
 } {1 {ORDER BY clause should come after EXCEPT not before}}
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "19/26 subtests passed; pending: ANALYZE/sqlite_stat1"]
 fn test_fkey1() {
-    sqliters_tcltest::run_test_script("fkey1", r#"
+    sqliters_tcltest::run_test_script(
+        "fkey1",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix fkey1
@@ -220,5 +222,6 @@ do_execsql_test 9.1 {
   DELETE FROM """1";
 }
 finish_test
-"#);
+"#,
+    );
 }

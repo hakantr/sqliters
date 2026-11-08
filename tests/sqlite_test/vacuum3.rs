@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "51/64 subtests passed; pending: no such function: md5sum"]
 fn test_vacuum3() {
-    sqliters_tcltest::run_test_script("vacuum3", r#"
+    sqliters_tcltest::run_test_script(
+        "vacuum3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !vacuum {
@@ -303,5 +305,6 @@ if {$MEMDEBUG} {
   } 
 }
 finish_test
-"#);
+"#,
+    );
 }

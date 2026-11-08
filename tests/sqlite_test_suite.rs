@@ -557,9 +557,6 @@ mod utf16align;
 #[path = "sqlite_test/vacuum.rs"]
 mod vacuum;
 #[allow(non_snake_case)]
-#[path = "sqlite_test/vacuum-into.rs"]
-mod vacuum_into;
-#[allow(non_snake_case)]
 #[path = "sqlite_test/vacuum2.rs"]
 mod vacuum2;
 #[allow(non_snake_case)]
@@ -574,6 +571,9 @@ mod vacuum5;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/vacuum6.rs"]
 mod vacuum6;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vacuum-into.rs"]
+mod vacuum_into;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/where.rs"]
 mod r#where;

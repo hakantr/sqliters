@@ -1,6 +1,8 @@
 #[test]
 fn test_index4() {
-    sqliters_tcltest::run_test_script("index4", r#"
+    sqliters_tcltest::run_test_script(
+        "index4",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix index4
@@ -100,5 +102,6 @@ do_catchsql_test 2.2 {
   CREATE UNIQUE INDEX i3 ON t2(x);
 } {1 {UNIQUE constraint failed: t2.x}}
 finish_test
-"#);
+"#,
+    );
 }

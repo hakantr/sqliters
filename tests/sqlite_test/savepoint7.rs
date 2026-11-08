@@ -1,6 +1,8 @@
 #[test]
 fn test_savepoint7() {
-    sqliters_tcltest::run_test_script("savepoint7", r#"
+    sqliters_tcltest::run_test_script(
+        "savepoint7",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test savepoint7-1.1 {
@@ -101,5 +103,6 @@ for {set i 248} {$i<=253} {incr i} {
   } [list $i $i]
 }
 finish_test
-"#);
+"#,
+    );
 }

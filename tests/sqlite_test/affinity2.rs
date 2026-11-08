@@ -1,6 +1,8 @@
 #[test]
 fn test_affinity2() {
-    sqliters_tcltest::run_test_script("affinity2", r#"
+    sqliters_tcltest::run_test_script(
+        "affinity2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix affinity2
@@ -106,5 +108,6 @@ if {![info exists ::G(valgrind)]} {
   } {1}
 }
 finish_test
-"#);
+"#,
+    );
 }

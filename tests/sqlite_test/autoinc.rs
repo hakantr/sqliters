@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "34/87 subtests passed; pending: VIEW, TRIGGER, ATTACH"]
 fn test_autoinc() {
-    sqliters_tcltest::run_test_script("autoinc", r#"
+    sqliters_tcltest::run_test_script(
+        "autoinc",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix autoinc
@@ -776,5 +778,6 @@ do_execsql_test 13.1 {
   SELECT * FROM t3;
 } {3 5}
 finish_test
-"#);
+"#,
+    );
 }

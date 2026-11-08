@@ -1,5 +1,6 @@
 //! `sqliters-vdbe`: SQLite Virtual Database Engine (VDBE) bytecode representation,
 //! disassembler (`EXPLAIN`), and register-based execution machine ported from `sqlite/src/vdbe.c`.
+#![forbid(unsafe_code)]
 
 pub mod functions;
 
@@ -14,8 +15,8 @@ use sqliters_types::{
 
 pub use functions::{
     AggregateAccumulator, AggregateKind, VmRuntimeContext, eval_scalar_function, format_utc_date,
-    format_utc_time, format_utc_timestamp, parse_escape_char, sqlite_glob_match,
-    sqlite_like_match, system_utc_millis, utc_ymdhms_from_unix_ms,
+    format_utc_time, format_utc_timestamp, parse_escape_char, sqlite_glob_match, sqlite_like_match,
+    system_utc_millis, utc_ymdhms_from_unix_ms,
 };
 
 /// Fourth operand (`P4`) payload for a VDBE instruction (`p4union` in `sqlite/src/vdbe.h`).
@@ -44,7 +45,10 @@ impl P4 {
             Self::Int64(i) => i.to_string(),
             Self::Real(r) => r.to_string(),
             Self::Str(s) => s.clone(),
-            Self::Blob(b) => format!("x'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+            Self::Blob(b) => format!(
+                "x'{}'",
+                b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+            ),
             Self::Collation(c) => format!("{c:?}"),
             Self::Affinity(affs) => format!("{affs:?}"),
             Self::KeyInfo(k) => format!("k({})", k.len()),
@@ -649,10 +653,8 @@ impl VdbeVm {
                             self.regs[dest] = val;
                         }
                         CursorState::Index { matches, pos, .. } => {
-                            self.regs[dest] = matches[*pos]
-                                .get(col_idx)
-                                .cloned()
-                                .unwrap_or(Value::Null);
+                            self.regs[dest] =
+                                matches[*pos].get(col_idx).cloned().unwrap_or(Value::Null);
                         }
                         CursorState::Ephemeral { rows, pos } => {
                             self.regs[dest] =
@@ -667,8 +669,7 @@ impl VdbeVm {
                     let count = ins.p2 as usize;
                     let dest = ins.p3 as usize;
                     let enc = btree.encoding();
-                    let bytes =
-                        encode_record_with_encoding(&self.regs[start..start + count], enc);
+                    let bytes = encode_record_with_encoding(&self.regs[start..start + count], enc);
                     self.regs[dest] = Value::Blob(bytes);
                 }
                 Opcode::NewRowid => {
@@ -1027,11 +1028,9 @@ impl VdbeVm {
                     // p1 = cursor, p4 = KeyInfo(orders), IntArray encoded via p2.. or KeyInfo
                     let cid = ins.p1 as usize;
                     let orders = match &ins.p4 {
-                        P4::KeyInfo(k) => k
-                            .iter()
-                            .enumerate()
-                            .map(|(idx, &ord)| (idx, ord))
-                            .collect(),
+                        P4::KeyInfo(k) => {
+                            k.iter().enumerate().map(|(idx, &ord)| (idx, ord)).collect()
+                        }
                         _ => Vec::new(),
                     };
                     self.cursors[cid] = CursorState::Sorter {
@@ -1180,9 +1179,8 @@ pub fn eval_unary_negate(v: &Value) -> Value {
 fn coerce_numeric_for_arith(v: &Value) -> Value {
     match v {
         Value::Integer(_) | Value::Real(_) => v.clone(),
-        Value::Text(s) => {
-            sqliters_types::parse_numeric_text(s).unwrap_or_else(|| Value::Integer(v.to_integer_lossy()))
-        }
+        Value::Text(s) => sqliters_types::parse_numeric_text(s)
+            .unwrap_or_else(|| Value::Integer(v.to_integer_lossy())),
         Value::Blob(_) => Value::Integer(v.to_integer_lossy()),
         Value::Null => Value::Null,
     }
@@ -1370,7 +1368,9 @@ pub fn eval_cast_with_encoding(val: Value, type_name: &str, enc: TextEncoding) -
                     }
                     TextEncoding::Utf16Le => {
                         let units: Vec<u16> = b
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|c| u16::from_le_bytes([c[0], c[1]]))
                             .take_while(|&u| u != 0)
                             .collect();
@@ -1378,7 +1378,9 @@ pub fn eval_cast_with_encoding(val: Value, type_name: &str, enc: TextEncoding) -
                     }
                     TextEncoding::Utf16Be => {
                         let units: Vec<u16> = b
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|c| u16::from_be_bytes([c[0], c[1]]))
                             .take_while(|&u| u != 0)
                             .collect();

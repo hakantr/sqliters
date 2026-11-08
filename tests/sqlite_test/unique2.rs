@@ -1,6 +1,8 @@
 #[test]
 fn test_unique2() {
-    sqliters_tcltest::run_test_script("unique2", r#"
+    sqliters_tcltest::run_test_script(
+        "unique2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 foreach {id sql} {
@@ -44,5 +46,6 @@ do_catchsql_test 13.2 {
   CREATE TABLE err1(a,b,c,PRIMARY KEY(rowid));
 } {1 {no such column: rowid}}
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "113/131 subtests passed; pending: func2 edge cases"]
 fn test_func2() {
-    sqliters_tcltest::run_test_script("func2", r#"
+    sqliters_tcltest::run_test_script(
+        "func2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 proc bin_to_hex {blob} {
@@ -467,5 +469,6 @@ do_test func2-3.10 {
   expr $tm<2000000
 } {1}
 finish_test
-"#);
+"#,
+    );
 }

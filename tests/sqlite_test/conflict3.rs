@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "57/73 subtests passed; pending: TRIGGER"]
 fn test_conflict3() {
-    sqliters_tcltest::run_test_script("conflict3", r#"
+    sqliters_tcltest::run_test_script(
+        "conflict3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix conflict3
@@ -367,5 +369,6 @@ ifcapable trigger {
   } {}
 }
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "20/58 subtests passed; pending: VIEW"]
 fn test_collate1() {
-    sqliters_tcltest::run_test_script("collate1", r#"
+    sqliters_tcltest::run_test_script(
+        "collate1",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix collate1
@@ -367,5 +369,6 @@ do_catchsql_test 10.0 {
   SELECT a,b,z,y,'' FROM t1 JOIN v1a ON b IS NOT FALSE;
 } {1 {no such collation sequence: x}}
 finish_test
-"#);
+"#,
+    );
 }

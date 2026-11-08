@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "6/9 subtests passed; pending: EQP/optimizer"]
 fn test_whereI() {
-    sqliters_tcltest::run_test_script("whereI", r#"
+    sqliters_tcltest::run_test_script(
+        "whereI",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix whereI
@@ -71,5 +73,6 @@ do_execsql_test 3.0 {
   2.1 2.2 1.2
 }
 finish_test
-"#);
+"#,
+    );
 }

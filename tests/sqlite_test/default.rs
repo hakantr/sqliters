@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "15/28 subtests passed; pending: default edge cases"]
 fn test_default() {
-    sqliters_tcltest::run_test_script("default", r#"
+    sqliters_tcltest::run_test_script(
+        "default",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable bloblit {
@@ -188,5 +190,6 @@ ifcapable altertable {
   } {1 2 3}
 }
 finish_test
-"#);
+"#,
+    );
 }

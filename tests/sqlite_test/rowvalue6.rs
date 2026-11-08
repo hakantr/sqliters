@@ -1,6 +1,8 @@
 #[test]
 fn test_rowvalue6() {
-    sqliters_tcltest::run_test_script("rowvalue6", r#"
+    sqliters_tcltest::run_test_script(
+        "rowvalue6",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix rowvalue6
@@ -21,5 +23,6 @@ do_execsql_test 1.2 {
   SELECT c FROM t1 WHERE (a,b) IN (SELECT x,y FROM t2 WHERE z==55);
 } {400}
 finish_test
-"#);
+"#,
+    );
 }

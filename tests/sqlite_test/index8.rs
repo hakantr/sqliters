@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "3/4 subtests passed; pending: EQP/optimizer"]
 fn test_index8() {
-    sqliters_tcltest::run_test_script("index8", r#"
+    sqliters_tcltest::run_test_script(
+        "index8",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_execsql_test 1.0 {
@@ -26,5 +28,6 @@ do_execsql_test 1.1eqp {
   SELECT * FROM t1 WHERE c=4 ORDER BY a, b LIMIT 2;
 } {~/USING INDEX/}
 finish_test
-"#);
+"#,
+    );
 }

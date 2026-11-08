@@ -1,6 +1,8 @@
 #[test]
 fn test_join6() {
-    sqliters_tcltest::run_test_script("join6", r#"
+    sqliters_tcltest::run_test_script(
+        "join6",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test join6-1.1 {
@@ -137,5 +139,6 @@ do_execsql_test join6-5.3 {
   SELECT a FROM ty NATURAL JOIN ty;
 }
 finish_test
-"#);
+"#,
+    );
 }

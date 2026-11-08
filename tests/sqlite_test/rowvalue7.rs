@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "1/8 subtests passed; pending: rowvalue7 edge cases"]
 fn test_rowvalue7() {
-    sqliters_tcltest::run_test_script("rowvalue7", r#"
+    sqliters_tcltest::run_test_script(
+        "rowvalue7",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix rowvalue7
@@ -44,5 +46,6 @@ do_catchsql_test 3.0 {
   UPDATE t1 SET (a,a,a,b)=(SELECT 99,100);
 } {1 {4 columns assigned 2 values}}
 finish_test
-"#);
+"#,
+    );
 }

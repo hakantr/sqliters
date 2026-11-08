@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "20/36 subtests passed; pending: in3 edge cases"]
 fn test_in3() {
-    sqliters_tcltest::run_test_script("in3", r#"
+    sqliters_tcltest::run_test_script(
+        "in3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !subquery {
@@ -201,5 +203,6 @@ do_test in3-5.2 {
   }
 } {1 {no such table: Folder}}
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "44/49 subtests passed; pending: VIEW, TEMP TABLE"]
 fn test_distinct2() {
-    sqliters_tcltest::run_test_script("distinct2", r#"
+    sqliters_tcltest::run_test_script(
+        "distinct2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix distinct2
@@ -340,5 +342,6 @@ do_execsql_test 6050 {
   SELECT DISTINCT * FROM t1 FULL OUTER JOIN t0 ON c0>c1;
 } {1 {} {} 0 {} {}}
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "39/55 subtests passed; pending: types edge cases"]
 fn test_types() {
-    sqliters_tcltest::run_test_script("types", r#"
+    sqliters_tcltest::run_test_script(
+        "types",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 db close
@@ -227,5 +229,6 @@ do_test types-2.5.3 {
   }
 } [list {} $string10 4000 $string500 4000 {} 4000 {} $string500000]
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "2/11 subtests passed; pending: lock2 edge cases"]
 fn test_lock2() {
-    sqliters_tcltest::run_test_script("lock2", r#"
+    sqliters_tcltest::run_test_script(
+        "lock2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 source $testdir/lock_common.tcl
@@ -80,5 +82,6 @@ catch {testfixture $::tf1 {db close}}
 catch {close $::tf1}
 sqlite3_soft_heap_limit $cmdlinearg(soft-heap-limit)
 finish_test
-"#);
+"#,
+    );
 }

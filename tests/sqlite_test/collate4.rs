@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "19/107 subtests passed; pending: C testfixture hooks"]
 fn test_collate4() {
-    sqliters_tcltest::run_test_script("collate4", r#"
+    sqliters_tcltest::run_test_script(
+        "collate4",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 db collate TEXT text_collate
@@ -602,5 +604,6 @@ do_test collate4-6.3 {
   }
 } {10 101 15 sort}
 finish_test
-"#);
+"#,
+    );
 }

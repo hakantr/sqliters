@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "22/42 subtests passed; pending: VIEW"]
 fn test_joinA() {
-    sqliters_tcltest::run_test_script("joinA", r#"
+    sqliters_tcltest::run_test_script(
+        "joinA",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 foreach {id schema} {
@@ -251,5 +253,6 @@ foreach {id schema} {
   }
 }
 finish_test
-"#);
+"#,
+    );
 }

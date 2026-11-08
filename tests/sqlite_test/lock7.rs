@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "4/8 subtests passed; pending: lock7 edge cases"]
 fn test_lock7() {
-    sqliters_tcltest::run_test_script("lock7", r#"
+    sqliters_tcltest::run_test_script(
+        "lock7",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test lock7-1.1 {
@@ -38,5 +40,6 @@ do_test lock7-1.8 {
 db1 close
 db2 close
 finish_test
-"#);
+"#,
+    );
 }

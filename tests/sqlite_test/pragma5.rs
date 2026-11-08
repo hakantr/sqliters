@@ -1,6 +1,8 @@
 #[test]
 fn test_pragma5() {
-    sqliters_tcltest::run_test_script("pragma5", r#"
+    sqliters_tcltest::run_test_script(
+        "pragma5",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix pragma5
@@ -46,5 +48,6 @@ do_execsql_test 3.1 {
   SELECT * FROM pragma_pragma_list WHERE name='pragma_list'
 } {pragma_list}
 finish_test
-"#);
+"#,
+    );
 }

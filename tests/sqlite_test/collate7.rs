@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "2/8 subtests passed; pending: collate7 edge cases"]
 fn test_collate7() {
-    sqliters_tcltest::run_test_script("collate7", r#"
+    sqliters_tcltest::run_test_script(
+        "collate7",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::caseless_del 0
@@ -53,5 +55,6 @@ do_test collate7-2.4 {
   }
 } {1 {no such collation sequence: CASELESS}}
 finish_test
-"#);
+"#,
+    );
 }

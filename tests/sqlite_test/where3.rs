@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "82/103 subtests passed; pending: EQP/optimizer"]
 fn test_where3() {
-    sqliters_tcltest::run_test_script("where3", r#"
+    sqliters_tcltest::run_test_script(
+        "where3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test where3-1.1 {
@@ -431,5 +433,6 @@ do_eqp_test where3-8.2 {
   `--SEARCH t2 USING COVERING INDEX t2xy (x=? AND y=?)
 }
 finish_test
-"#);
+"#,
+    );
 }

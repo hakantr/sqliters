@@ -361,8 +361,7 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token<'_>>> {
         match b {
             b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' => {
                 i += 1;
-                while i < bytes.len()
-                    && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')
+                while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')
                 {
                     i += 1;
                 }
@@ -708,9 +707,7 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token<'_>>> {
                     && bytes[i + 2].is_ascii_hexdigit()
                 {
                     i += 2;
-                    while i < bytes.len()
-                        && (bytes[i].is_ascii_hexdigit() || bytes[i] == b'_')
-                    {
+                    while i < bytes.len() && (bytes[i].is_ascii_hexdigit() || bytes[i] == b'_') {
                         if bytes[i] == b'_'
                             && (bytes[i - 1] == b'_'
                                 || i + 1 >= bytes.len()
@@ -727,22 +724,17 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token<'_>>> {
                     if b == b'.' {
                         kind = TokenKind::Float;
                         i += 1;
-                        while i < bytes.len()
-                            && (bytes[i].is_ascii_digit() || bytes[i] == b'_')
-                        {
+                        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
                             i += 1;
                         }
                     } else {
-                        while i < bytes.len()
-                            && (bytes[i].is_ascii_digit() || bytes[i] == b'_')
-                        {
+                        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
                             i += 1;
                         }
                         if i < bytes.len() && bytes[i] == b'.' {
                             kind = TokenKind::Float;
                             i += 1;
-                            while i < bytes.len()
-                                && (bytes[i].is_ascii_digit() || bytes[i] == b'_')
+                            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_')
                             {
                                 i += 1;
                             }
@@ -762,8 +754,7 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token<'_>>> {
                             if bytes[i] == b'+' || bytes[i] == b'-' {
                                 i += 1;
                             }
-                            while i < bytes.len()
-                                && (bytes[i].is_ascii_digit() || bytes[i] == b'_')
+                            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_')
                             {
                                 i += 1;
                             }
@@ -792,7 +783,7 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token<'_>>> {
                     i += 1;
                 }
                 let hex_len = i - hex_start;
-                if i >= bytes.len() || bytes[i] != b'\'' || (hex_len % 2) != 0 {
+                if i >= bytes.len() || bytes[i] != b'\'' || !hex_len.is_multiple_of(2) {
                     return Err(SqliteError::syntax(
                         format!("unrecognized blob literal starting at offset {start}"),
                         start,
@@ -866,7 +857,7 @@ pub fn decode_blob_literal(raw: &str) -> Result<Vec<u8>> {
     let inner = &raw[2..raw.len() - 1];
     let bytes = inner.as_bytes();
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let hi = hex_nibble(pair[0])?;
         let lo = hex_nibble(pair[1])?;
         out.push((hi << 4) | lo);

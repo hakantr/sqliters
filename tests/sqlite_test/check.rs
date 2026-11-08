@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "76/109 subtests passed; pending: VIEW"]
 fn test_check() {
-    sqliters_tcltest::run_test_script("check", r#"
+    sqliters_tcltest::run_test_script(
+        "check",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix check
@@ -584,5 +586,6 @@ do_execsql_test 13.2.3 {
 } {200000}
 integrity_check 13.2.4
 finish_test
-"#);
+"#,
+    );
 }

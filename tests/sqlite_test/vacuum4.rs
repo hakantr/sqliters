@@ -1,6 +1,8 @@
 #[test]
 fn test_vacuum4() {
-    sqliters_tcltest::run_test_script("vacuum4", r#"
+    sqliters_tcltest::run_test_script(
+        "vacuum4",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !vacuum {
@@ -48,5 +50,6 @@ do_test vacuum4-1.1 {
   }
 } {}
 finish_test
-"#);
+"#,
+    );
 }

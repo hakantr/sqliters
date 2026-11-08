@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "1/2 subtests passed; pending: no such function: repeat"]
 fn test_update2() {
-    sqliters_tcltest::run_test_script("update2", r#"
+    sqliters_tcltest::run_test_script(
+        "update2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix update2
@@ -183,5 +185,6 @@ do_execsql_test 7.110 {
   SELECT quote(x), quote(y), '|' FROM t1;
 } {1 NULL |}
 finish_test
-"#);
+"#,
+    );
 }

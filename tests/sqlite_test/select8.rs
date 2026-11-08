@@ -1,6 +1,8 @@
 #[test]
 fn test_select8() {
-    sqliters_tcltest::run_test_script("select8", r#"
+    sqliters_tcltest::run_test_script(
+        "select8",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 execsql {
@@ -42,5 +44,6 @@ do_test select8-1.3 {
   }
 } [lrange $result 4 end]
 finish_test
-"#);
+"#,
+    );
 }

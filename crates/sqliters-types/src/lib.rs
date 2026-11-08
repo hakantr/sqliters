@@ -1,6 +1,7 @@
 //! `sqliters-types`: foundational types, constants, error codes, varints,
 //! runtime values, collation rules, on-disk record serialization, and bitmaps
 //! ported from SQLite 3.54.1.
+#![forbid(unsafe_code)]
 
 pub mod bitvec;
 pub mod error;
@@ -22,9 +23,7 @@ pub use value::{
     Collation, StorageClass, TextEncoding, TypeAffinity, Value, cmp_int_float, format_sqlite_real,
     parse_numeric_text,
 };
-pub use varint::{
-    get_varint, get_varint_i64, push_varint, put_varint, put_varint_i64, varint_len,
-};
+pub use varint::{get_varint, get_varint_i64, push_varint, put_varint, put_varint_i64, varint_len};
 
 #[cfg(test)]
 mod tests {
@@ -112,7 +111,7 @@ mod tests {
             Value::Integer(-10_000_000_000),       // serial type 5 (6-byte negative!)
             Value::Integer(i64::MAX),              // serial type 6 (8-byte)
             Value::Integer(i64::MIN),              // serial type 6 (8-byte)
-            Value::real(3.141592653589793),        // serial type 7 (IEEE f64)
+            Value::real(std::f64::consts::PI),     // serial type 7 (IEEE f64)
             Value::Text(String::new()),            // serial type 13
             Value::Text("Merhaba SQLite!".into()), // odd >= 13
             Value::Blob(vec![]),                   // serial type 12
@@ -200,5 +199,122 @@ mod tests {
         bv.clear(64);
         assert!(!bv.test(64));
         assert_eq!(bv.len(), 3);
+    }
+
+    #[test]
+    fn test_extended_error_codes_match_sqlite_h() {
+        assert_eq!(extended::SQLITE_ABORT_ROLLBACK, 4 | (2 << 8));
+        assert_eq!(extended::SQLITE_BUSY_RECOVERY, 5 | (1 << 8));
+        assert_eq!(extended::SQLITE_BUSY_SNAPSHOT, 5 | (2 << 8));
+        assert_eq!(extended::SQLITE_BUSY_TIMEOUT, 5 | (3 << 8));
+        assert_eq!(extended::SQLITE_READONLY_RECOVERY, 8 | (1 << 8));
+        assert_eq!(extended::SQLITE_READONLY_CANTLOCK, 8 | (2 << 8));
+        assert_eq!(extended::SQLITE_READONLY_ROLLBACK, 8 | (3 << 8));
+        assert_eq!(extended::SQLITE_READONLY_DBMOVED, 8 | (4 << 8));
+        assert_eq!(extended::SQLITE_READONLY_CANTINIT, 8 | (5 << 8));
+        assert_eq!(extended::SQLITE_READONLY_DIRECTORY, 8 | (6 << 8));
+
+        assert_eq!(extended::SQLITE_IOERR_READ, 10 | (1 << 8));
+        assert_eq!(extended::SQLITE_IOERR_SHORT_READ, 10 | (2 << 8));
+        assert_eq!(extended::SQLITE_IOERR_WRITE, 10 | (3 << 8));
+        assert_eq!(extended::SQLITE_IOERR_FSYNC, 10 | (4 << 8));
+        assert_eq!(extended::SQLITE_IOERR_DIR_FSYNC, 10 | (5 << 8));
+        assert_eq!(extended::SQLITE_IOERR_TRUNCATE, 10 | (6 << 8));
+        assert_eq!(extended::SQLITE_IOERR_FSTAT, 10 | (7 << 8));
+        assert_eq!(extended::SQLITE_IOERR_UNLOCK, 10 | (8 << 8));
+        assert_eq!(extended::SQLITE_IOERR_RDLOCK, 10 | (9 << 8));
+        assert_eq!(extended::SQLITE_IOERR_DELETE, 10 | (10 << 8));
+        assert_eq!(extended::SQLITE_IOERR_CHECKRESERVEDLOCK, 10 | (14 << 8));
+        assert_eq!(extended::SQLITE_IOERR_LOCK, 10 | (15 << 8));
+        assert_eq!(extended::SQLITE_IOERR_CLOSE, 10 | (16 << 8));
+        assert_eq!(extended::SQLITE_IOERR_SHMOPEN, 10 | (18 << 8));
+        assert_eq!(extended::SQLITE_IOERR_SHMSIZE, 10 | (19 << 8));
+        assert_eq!(extended::SQLITE_IOERR_SHMLOCK, 10 | (20 << 8));
+        assert_eq!(extended::SQLITE_IOERR_SHMMAP, 10 | (21 << 8));
+        assert_eq!(extended::SQLITE_IOERR_IN_PAGE, 10 | (34 << 8));
+
+        let err = SqliteError::with_extended(extended::SQLITE_READONLY_CANTINIT, "cantinit");
+        assert_eq!(err.code, ErrorCode::ReadOnly);
+        assert_eq!(err.extended_code, extended::SQLITE_READONLY_CANTINIT);
+    }
+
+    #[test]
+    fn test_lock_geometry_production_and_test_64k() {
+        let prod = LockGeometry::default();
+        assert_eq!(prod, LockGeometry::PRODUCTION);
+        assert_eq!(prod.pending_byte_offset(), 0x4000_0000);
+        assert_eq!(prod.reserved_byte_offset(), 0x4000_0001);
+        assert_eq!(prod.shared_first_offset(), 0x4000_0002);
+        assert_eq!(prod.shared_size(), 510);
+        assert_eq!(prod.lock_byte_page(1024), 1_048_577);
+        assert_eq!(prod.lock_byte_page(4096), 262_145);
+        assert_eq!(prod.lock_byte_page(65_536), 16_385);
+        assert_eq!(prod.sj_pgno(4096), 262_145);
+
+        let test_geom = LockGeometry::test_64k();
+        assert_eq!(test_geom.pending_byte_offset(), 0x0001_0000);
+        assert_eq!(test_geom.reserved_byte_offset(), 0x0001_0001);
+        assert_eq!(test_geom.shared_first_offset(), 0x0001_0002);
+        assert_eq!(test_geom.shared_size(), 510);
+        assert_eq!(test_geom.lock_byte_page(1024), 65);
+        assert_eq!(test_geom.lock_byte_page(4096), 17);
+        assert_eq!(test_geom.lock_byte_page(65_536), 2);
+        assert_eq!(test_geom.sj_pgno(1024), 65);
+
+        assert!(LockGeometry::try_from_pending_byte(0).is_err());
+        assert!(LockGeometry::try_from_pending_byte(u64::from(u32::MAX)).is_err());
+        assert_eq!(
+            LockGeometry::try_from_pending_byte(0x0001_0000).unwrap(),
+            test_geom
+        );
+
+        assert_ne!(DatabaseKind::NamedDisk, DatabaseKind::PrivateTemporary);
+        assert_ne!(DatabaseKind::PrivateTemporary, DatabaseKind::Memory);
+    }
+
+    #[test]
+    fn test_page_size_codecs_including_64k() {
+        let valid_sizes = [512u32, 1024, 2048, 4096, 8192, 16_384, 32_768, 65_536];
+        for sz in valid_sizes {
+            assert!(is_valid_page_size(sz));
+
+            let db_bytes = encode_db_header_page_size(sz).unwrap();
+            if sz == 65_536 {
+                assert_eq!(db_bytes, [0x00, 0x01]);
+            } else {
+                assert_eq!(u16::from_be_bytes(db_bytes), sz as u16);
+            }
+            assert_eq!(decode_db_header_page_size(db_bytes).unwrap(), sz);
+
+            let wal_bytes = encode_wal_header_page_size(sz).unwrap();
+            if sz == 65_536 {
+                assert_eq!(wal_bytes, [0x00, 0x01, 0x00, 0x00]);
+            }
+            assert_eq!(u32::from_be_bytes(wal_bytes), sz);
+            assert_eq!(decode_wal_header_page_size(wal_bytes).unwrap(), sz);
+
+            let shm_u16 = encode_shm_page_size(sz).unwrap();
+            if sz == 65_536 {
+                assert_eq!(shm_u16, 1);
+            } else {
+                assert_eq!(u32::from(shm_u16), sz);
+            }
+            assert_eq!(decode_shm_page_size(shm_u16).unwrap(), sz);
+        }
+
+        // Invalid encodings must fail closed
+        for bad in [0u32, 1, 256, 513, 3000, 65_537, 131_072] {
+            assert!(!is_valid_page_size(bad));
+            assert!(encode_db_header_page_size(bad).is_err());
+            assert!(encode_wal_header_page_size(bad).is_err());
+            assert!(encode_shm_page_size(bad).is_err());
+        }
+        assert!(decode_db_header_page_size([0x00, 0x00]).is_err());
+        assert!(decode_db_header_page_size([0x00, 0x02]).is_err());
+        // WAL header must NOT accept 1 as 65536!
+        assert!(decode_wal_header_page_size([0x00, 0x00, 0x00, 0x01]).is_err());
+        assert!(decode_shm_page_size(0).is_err());
+        assert!(decode_shm_page_size(2).is_err());
+        assert!(decode_shm_page_size(0x0201).is_err());
     }
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "59/89 subtests passed; pending: ATTACH, TEMP TABLE"]
 fn test_enc2() {
-    sqliters_tcltest::run_test_script("enc2", r#"
+    sqliters_tcltest::run_test_script(
+        "enc2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable {!utf16} {
@@ -466,5 +468,6 @@ do_execsql_test enc2-11.10 {
   SELECT * FROM t1;
 } {{this is a test}}
 finish_test
-"#);
+"#,
+    );
 }

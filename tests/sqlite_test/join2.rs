@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "35/59 subtests passed; pending: VIEW, EQP/optimizer"]
 fn test_join2() {
-    sqliters_tcltest::run_test_script("join2", r#"
+    sqliters_tcltest::run_test_script(
+        "join2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix join2
@@ -371,5 +373,6 @@ do_execsql_test 14.0 {
   SELECT *, '|' FROM t1 LEFT JOIN t2 ON y=c AND z IN (5,0) ORDER BY +a;
 } {1 NULL 5 NULL NULL NULL | 2 NULL NULL NULL NULL NULL |}
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "6/11 subtests passed; pending: EQP/optimizer"]
 fn test_whereK() {
-    sqliters_tcltest::run_test_script("whereK", r#"
+    sqliters_tcltest::run_test_script(
+        "whereK",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix whereK
@@ -57,5 +59,6 @@ do_execsql_test 2.1 {
   SELECT count(*) FROM t0, t1 WHERE (x>=y AND x) OR (y BETWEEN 1 AND x);
 } {1 1}
 finish_test
-"#);
+"#,
+    );
 }

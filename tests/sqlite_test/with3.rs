@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "10/16 subtests passed; pending: VIEW, EQP/optimizer"]
 fn test_with3() {
-    sqliters_tcltest::run_test_script("with3", r#"
+    sqliters_tcltest::run_test_script(
+        "with3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix with3
@@ -195,5 +197,6 @@ do_catchsql_test 6.1 {
   select * from cte2, cte1;
 } {1 {table cte1 has 3 values for 2 columns}}
 finish_test
-"#);
+"#,
+    );
 }

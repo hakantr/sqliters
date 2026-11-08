@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "2/3 subtests passed; pending: TEMP TABLE, C testfixture hooks"]
 fn test_pragma6() {
-    sqliters_tcltest::run_test_script("pragma6", r#"
+    sqliters_tcltest::run_test_script(
+        "pragma6",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix pragma6
@@ -56,5 +58,6 @@ do_test 1.2 {
   set {} {}
 } {}
 finish_test
-"#);
+"#,
+    );
 }

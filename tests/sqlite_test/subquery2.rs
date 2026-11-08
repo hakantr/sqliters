@@ -1,6 +1,8 @@
 #[test]
 fn test_subquery2() {
-    sqliters_tcltest::run_test_script("subquery2", r#"
+    sqliters_tcltest::run_test_script(
+        "subquery2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix subquery2
@@ -236,5 +238,6 @@ do_execsql_test 7.4 {
   SELECT (SELECT DISTINCT x FROM t1 ORDER BY +x LIMIT 1 OFFSET 0);
 } {1234}
 finish_test
-"#);
+"#,
+    );
 }

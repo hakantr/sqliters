@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "9/29 subtests passed; pending: VIEW, EQP/optimizer"]
 fn test_with6() {
-    sqliters_tcltest::run_test_script("with6", r#"
+    sqliters_tcltest::run_test_script(
+        "with6",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix with6
@@ -377,5 +379,6 @@ do_eqp_test 410 {
   `--SEARCH i USING AUTOMATIC COVERING INDEX (country=?)
 }
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,5 +1,6 @@
 //! `sqliters-btree`: SQLite Format 3 B-Tree & B+Tree storage engine,
 //! overflow chains, freelist page management, and `PRAGMA integrity_check`.
+#![forbid(unsafe_code)]
 
 pub mod page;
 
@@ -39,11 +40,7 @@ impl Btree {
         Ok(Self::new(Pager::open_in_memory()?))
     }
 
-    pub fn open_with_vfs(
-        vfs: Arc<dyn Vfs>,
-        path: Option<&Path>,
-        flags: OpenFlags,
-    ) -> Result<Self> {
+    pub fn open_with_vfs(vfs: Arc<dyn Vfs>, path: Option<&Path>, flags: OpenFlags) -> Result<Self> {
         Ok(Self::new(Pager::open_with_vfs(vfs, path, flags)?))
     }
 
@@ -119,7 +116,9 @@ impl Btree {
                 let idx = (leaf_count - 1) as usize;
                 let off = 8 + 4 * idx;
                 if off + 4 > usable {
-                    return Err(SqliteError::corrupt("freelist trunk leaf count out of bounds"));
+                    return Err(SqliteError::corrupt(
+                        "freelist trunk leaf count out of bounds",
+                    ));
                 }
                 let leaf_pgno = u32::from_be_bytes([
                     trunk_bytes[off],
@@ -265,7 +264,9 @@ impl Btree {
             };
             hops += 1;
             if hops > max_hops {
-                return Err(SqliteError::corrupt("cycle detected in overflow page chain"));
+                return Err(SqliteError::corrupt(
+                    "cycle detected in overflow page chain",
+                ));
             }
             let raw = self.pager.read_page(ovfl_pgno)?;
             let nxt = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
@@ -283,7 +284,9 @@ impl Btree {
         while let Some(pgno) = first_ovfl.filter(|&p| p != 0) {
             hops += 1;
             if hops > max_hops {
-                return Err(SqliteError::corrupt("cycle detected freeing overflow chain"));
+                return Err(SqliteError::corrupt(
+                    "cycle detected freeing overflow chain",
+                ));
             }
             let nxt = {
                 let raw = self.pager.read_page(pgno)?;
@@ -405,11 +408,7 @@ impl Btree {
         Ok(out)
     }
 
-    fn collect_table_entries(
-        &mut self,
-        pgno: Pgno,
-        out: &mut Vec<(i64, Vec<u8>)>,
-    ) -> Result<()> {
+    fn collect_table_entries(&mut self, pgno: Pgno, out: &mut Vec<(i64, Vec<u8>)>) -> Result<()> {
         let parsed = self.read_parsed_page(pgno)?;
         match parsed {
             ParsedPage::TableLeaf { cells } => {
@@ -491,7 +490,11 @@ impl Btree {
                 BtreePageType::TableInterior => {
                     cur_pgno = table_interior_right_child(cur_pgno, usable, raw)?;
                 }
-                _ => return Err(SqliteError::corrupt("expected table page in max_table_rowid")),
+                _ => {
+                    return Err(SqliteError::corrupt(
+                        "expected table page in max_table_rowid",
+                    ));
+                }
             }
         }
     }
@@ -561,11 +564,7 @@ impl Btree {
 
     /// Inserts `cell` into subtree `pgno`. If `pgno` splits, writes the left half into `pgno`,
     /// allocates `right_pgno` for the right half, and returns `Some((max_left_key, right_pgno))`.
-    fn insert_table_rec(
-        &mut self,
-        pgno: Pgno,
-        cell: TableLeafCell,
-    ) -> Result<Option<(i64, Pgno)>> {
+    fn insert_table_rec(&mut self, pgno: Pgno, cell: TableLeafCell) -> Result<Option<(i64, Pgno)>> {
         let usable = self.pager.usable_size();
         let ptype = {
             let raw = self.pager.read_page(pgno)?;
@@ -1136,12 +1135,7 @@ impl Btree {
 
         let right_pgno = self.allocate_page()?;
         self.write_parsed_page(pgno, &ParsedPage::IndexLeaf { cells })?;
-        self.write_parsed_page(
-            right_pgno,
-            &ParsedPage::IndexLeaf {
-                cells: right_cells,
-            },
-        )?;
+        self.write_parsed_page(right_pgno, &ParsedPage::IndexLeaf { cells: right_cells })?;
         Ok(Some((promoted, right_pgno)))
     }
 
@@ -1355,8 +1349,7 @@ impl Btree {
                     errors.push(format!("freelist trunk {trunk} leaf count corrupt"));
                     break;
                 }
-                let leaf =
-                    u32::from_be_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+                let leaf = u32::from_be_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
                 mark_page(&mut seen, total_pages, leaf, "freelist leaf", &mut errors);
                 counted_free += 1;
             }
@@ -1490,7 +1483,10 @@ mod tests {
         }
 
         assert!(bt.pager().page_count() > 25);
-        assert_eq!(bt.integrity_check(&[1, tbl_root, idx_root]).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            bt.integrity_check(&[1, tbl_root, idx_root]).unwrap(),
+            Vec::<String>::new()
+        );
 
         // Seek every row & verify overflow reassembly
         for i in 1..=200i64 {
@@ -1518,12 +1514,8 @@ mod tests {
             };
             assert!(bt.delete_table(tbl_root, i).unwrap());
             assert!(
-                bt.delete_index(
-                    idx_root,
-                    &[Value::Text(text), Value::Integer(i)],
-                    &orders
-                )
-                .unwrap()
+                bt.delete_index(idx_root, &[Value::Text(text), Value::Integer(i)], &orders)
+                    .unwrap()
             );
         }
 

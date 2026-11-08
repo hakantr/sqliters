@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "7/23 subtests passed; pending: collate8 edge cases"]
 fn test_collate8() {
-    sqliters_tcltest::run_test_script("collate8", r#"
+    sqliters_tcltest::run_test_script(
+        "collate8",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test collate8-1.1 {
@@ -125,5 +127,6 @@ do_execsql_test collate8-3.5 {
                                       ELSE '' COLLATE nocase END);
 } {0}
 finish_test
-"#);
+"#,
+    );
 }

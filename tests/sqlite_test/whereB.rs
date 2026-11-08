@@ -1,6 +1,8 @@
 #[test]
 fn test_whereB() {
-    sqliters_tcltest::run_test_script("whereB", r#"
+    sqliters_tcltest::run_test_script(
+        "whereB",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test whereB-1.1 {
@@ -415,5 +417,6 @@ do_test whereB-9.102 {
   }
 } {}
 finish_test
-"#);
+"#,
+    );
 }

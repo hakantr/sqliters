@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "0/2 subtests passed; pending: VIEW, TRIGGER, ATTACH"]
 fn test_vacuum() {
-    sqliters_tcltest::run_test_script("vacuum", r#"
+    sqliters_tcltest::run_test_script(
+        "vacuum",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable {!vacuum} {
@@ -358,5 +360,6 @@ do_execsql_test vacuum-11.3 {
   PRAGMA page_size;
 } {4096}
 finish_test
-"#);
+"#,
+    );
 }

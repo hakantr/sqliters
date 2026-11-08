@@ -1,6 +1,8 @@
 #[test]
 fn test_delete3() {
-    sqliters_tcltest::run_test_script("delete3", r#"
+    sqliters_tcltest::run_test_script(
+        "delete3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test delete3-1.1 {
@@ -39,5 +41,6 @@ do_test delete3-1.2 {
 } {262144}
 integrity_check delete3-1.3
 finish_test
-"#);
+"#,
+    );
 }

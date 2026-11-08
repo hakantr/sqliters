@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "0/10 subtests passed; pending: VIRTUAL TABLE"]
 fn test_orderby7() {
-    sqliters_tcltest::run_test_script("orderby7", r#"
+    sqliters_tcltest::run_test_script(
+        "orderby7",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix orderby7
@@ -85,5 +87,6 @@ do_execsql_test 2.3 {
    ORDER BY t1.y
 } {{a row that occurs twice} 111}
 finish_test
-"#);
+"#,
+    );
 }

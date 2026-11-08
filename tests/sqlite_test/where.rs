@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "197/322 subtests passed; pending: TEMP TABLE, EQP/optimizer, C testfixture hooks"]
 fn test_where() {
-    sqliters_tcltest::run_test_script("where", r#"
+    sqliters_tcltest::run_test_script(
+        "where",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test where-1.0 {
@@ -1559,5 +1561,6 @@ do_eqp_test where-31.4 {
   `--SEARCH t1 USING COVERING INDEX t1x (x=?)
 }
 finish_test
-"#);
+"#,
+    );
 }

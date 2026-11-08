@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "98/106 subtests passed; pending: notnull edge cases"]
 fn test_notnull() {
-    sqliters_tcltest::run_test_script("notnull", r#"
+    sqliters_tcltest::run_test_script(
+        "notnull",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !conflict {
@@ -576,5 +578,6 @@ do_uses_op_next_test notnull-6.8 "SELECT * FROM t8 WHERE a IS ?" 0
 do_uses_op_next_test notnull-6.9 "SELECT * FROM t8 WHERE a IS ?" 0
 do_uses_op_next_test notnull-6.10 "SELECT * FROM t8 WHERE a IS ?" 0
 finish_test
-"#);
+"#,
+    );
 }

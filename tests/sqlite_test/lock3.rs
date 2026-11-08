@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "2/8 subtests passed; pending: lock3 edge cases"]
 fn test_lock3() {
-    sqliters_tcltest::run_test_script("lock3", r#"
+    sqliters_tcltest::run_test_script(
+        "lock3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test lock3-1.1 {
@@ -43,5 +45,6 @@ do_test lock3-4.3 {
 } {}
 catch {db2 close}
 finish_test
-"#);
+"#,
+    );
 }

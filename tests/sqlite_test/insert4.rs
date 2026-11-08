@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "0/0 subtests passed; pending: VIEW, TEMP TABLE"]
 fn test_insert4() {
-    sqliters_tcltest::run_test_script("insert4", r#"
+    sqliters_tcltest::run_test_script(
+        "insert4",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix insert4
@@ -545,5 +547,6 @@ ifcapable altertable {
   } {1 55 2 66 3 77 4 22 5 33 6 44 ok}
 }
 finish_test
-"#);
+"#,
+    );
 }

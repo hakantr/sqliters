@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "10/15 subtests passed; pending: fkey7 edge cases"]
 fn test_fkey7() {
-    sqliters_tcltest::run_test_script("fkey7", r#"
+    sqliters_tcltest::run_test_script(
+        "fkey7",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix fkey7
@@ -93,5 +95,6 @@ do_execsql_test 4.6 {
   PRAGMA foreign_key_check;
 } {}
 finish_test
-"#);
+"#,
+    );
 }

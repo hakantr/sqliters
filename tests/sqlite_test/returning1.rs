@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "47/90 subtests passed; pending: VIEW, TRIGGER, VIRTUAL TABLE"]
 fn test_returning1() {
-    sqliters_tcltest::run_test_script("returning1", r#"
+    sqliters_tcltest::run_test_script(
+        "returning1",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix returning1
@@ -485,5 +487,6 @@ ifcapable fts5 {
   } {{hello world}}
 }
 finish_test
-"#);
+"#,
+    );
 }

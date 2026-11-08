@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "91/95 subtests passed; pending: EQP/optimizer"]
 fn test_rowvalue9() {
-    sqliters_tcltest::run_test_script("rowvalue9", r#"
+    sqliters_tcltest::run_test_script(
+        "rowvalue9",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix rowvalue9
@@ -278,5 +280,6 @@ do_eqp_test 9.5e {
   *SEARCH t1 USING COVERING INDEX i2*
 }
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "10/11 subtests passed; pending: ATTACH"]
 fn test_enc3() {
-    sqliters_tcltest::run_test_script("enc3", r#"
+    sqliters_tcltest::run_test_script(
+        "enc3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable {utf16} {
@@ -88,5 +90,6 @@ ifcapable {utf16 && shared_cache} {
   sqlite3_enable_shared_cache $::enable_shared_cache
 }
 finish_test
-"#);
+"#,
+    );
 }

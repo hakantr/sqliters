@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "5/73 subtests passed; pending: func7 edge cases"]
 fn test_func7() {
-    sqliters_tcltest::run_test_script("func7", r#"
+    sqliters_tcltest::run_test_script(
+        "func7",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !mathlib {
@@ -232,5 +234,6 @@ do_execsql_test func7-400 {
   SELECT json_quote(coalesce(x,pi())) FROM t1 INDEXED BY t1x;
 } 3.1415926535897931
 finish_test
-"#);
+"#,
+    );
 }

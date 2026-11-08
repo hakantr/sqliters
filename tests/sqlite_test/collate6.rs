@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "5/15 subtests passed; pending: TRIGGER"]
 fn test_collate6() {
-    sqliters_tcltest::run_test_script("collate6", r#"
+    sqliters_tcltest::run_test_script(
+        "collate6",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable {!trigger} {
@@ -110,5 +112,6 @@ do_test collate6-3.2 {
   }
 } {}
 finish_test
-"#);
+"#,
+    );
 }

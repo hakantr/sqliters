@@ -1,6 +1,8 @@
 #[test]
 fn test_select3() {
-    sqliters_tcltest::run_test_script("select3", r#"
+    sqliters_tcltest::run_test_script(
+        "select3",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test select3-1.0 {
@@ -369,5 +371,6 @@ do_execsql_test 12.8 {
   hello 59 60
 }
 finish_test
-"#);
+"#,
+    );
 }

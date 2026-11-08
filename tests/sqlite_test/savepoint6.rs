@@ -1,6 +1,8 @@
 #[test]
 fn test_savepoint6() {
-    sqliters_tcltest::run_test_script("savepoint6", r#"
+    sqliters_tcltest::run_test_script(
+        "savepoint6",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 proc sql {zSql} {
@@ -210,5 +212,6 @@ foreach zSetup [list {
 unset -nocomplain ::lSavepoint
 unset -nocomplain ::aEntry
 finish_test
-"#);
+"#,
+    );
 }

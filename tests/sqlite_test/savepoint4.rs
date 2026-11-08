@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "0/1 subtests passed; pending: no such function: md5sum"]
 fn test_savepoint4() {
-    sqliters_tcltest::run_test_script("savepoint4", r#"
+    sqliters_tcltest::run_test_script(
+        "savepoint4",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !crashtest {
@@ -148,5 +150,6 @@ for {set ii 1} {$ii<=$ITERATIONS2} {incr ii} {
   } {}
 }
 finish_test
-"#);
+"#,
+    );
 }

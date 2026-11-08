@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "1491/1748 subtests passed; pending: date edge cases"]
 fn test_date() {
-    sqliters_tcltest::run_test_script("date", r#"
+    sqliters_tcltest::run_test_script(
+        "date",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_not_use_codec
@@ -614,5 +616,6 @@ datetest 23.20 {datetime('2025-02-28 24:00:00')} {2025-03-01 00:00:00}
 datetest 23.21 {datetime('2024-04-30 24:00:00')} {2024-05-01 00:00:00}
 datetest 23.22 {datetime('2024-12-31 24:00:00')} {2025-01-01 00:00:00}
 finish_test
-"#);
+"#,
+    );
 }

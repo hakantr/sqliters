@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "2/6 subtests passed; pending: utf16align edge cases"]
 fn test_utf16align() {
-    sqliters_tcltest::run_test_script("utf16align", r#"
+    sqliters_tcltest::run_test_script(
+        "utf16align",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable !utf16 {
@@ -60,5 +62,6 @@ do_test utf16align-2.1 {
   }
 } {6EFC}
 finish_test
-"#);
+"#,
+    );
 }

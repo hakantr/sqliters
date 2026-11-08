@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "41/52 subtests passed; pending: VIEW, ANALYZE/sqlite_stat1, EQP/optimizer"]
 fn test_join5() {
-    sqliters_tcltest::run_test_script("join5", r#"
+    sqliters_tcltest::run_test_script(
+        "join5",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix join5
@@ -381,5 +383,6 @@ do_execsql_test 12.2 {
   96  96000  96000000  96  96
 }
 finish_test
-"#);
+"#,
+    );
 }

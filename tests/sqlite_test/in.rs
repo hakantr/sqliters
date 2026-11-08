@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "101/126 subtests passed; pending: VIEW"]
 fn test_in() {
-    sqliters_tcltest::run_test_script("in", r#"
+    sqliters_tcltest::run_test_script(
+        "in",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test in-1.0 {
@@ -763,5 +765,6 @@ do_execsql_test in-23.1 {
   SELECT * FROM t5;
 } 1
 finish_test
-"#);
+"#,
+    );
 }

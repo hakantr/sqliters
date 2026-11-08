@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "12/22 subtests passed; pending: EQP/optimizer"]
 fn test_between() {
-    sqliters_tcltest::run_test_script("between", r#"
+    sqliters_tcltest::run_test_script(
+        "between",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test between-1.0 {
@@ -125,5 +127,6 @@ do_execsql_test between-3.2 {
   SELECT * FROM t1 LEFT JOIN t2 ON (x BETWEEN 5 AND 7);
 } {4 4 {} {}}
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,4 +1,5 @@
 //! Parallel diagnostic runner for SQLite `.test` files using `sqliters-tcltest`.
+#![forbid(unsafe_code)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,11 +9,49 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use sqliters_tcltest::{TestFileReport, evaluate_test_script, strip_test_comments};
 
 pub const CORE_SQL_FAMILIES: &[&str] = &[
-    "select", "insert", "update", "delete", "join", "where", "index", "fkey", "trans", "pragma",
-    "collate", "subquery", "orderby", "in", "between", "cast", "check", "conflict", "default",
-    "null", "notnull", "types", "affinity", "alter", "vacuum", "savepoint", "date", "func",
-    "like", "rowvalue", "unique", "autoinc", "table", "distinct", "limit", "count", "coalesce",
-    "quote", "numcast", "intpkey", "rowid", "enc", "lock",
+    "select",
+    "insert",
+    "update",
+    "delete",
+    "join",
+    "where",
+    "index",
+    "fkey",
+    "trans",
+    "pragma",
+    "collate",
+    "subquery",
+    "orderby",
+    "in",
+    "between",
+    "cast",
+    "check",
+    "conflict",
+    "default",
+    "null",
+    "notnull",
+    "types",
+    "affinity",
+    "alter",
+    "vacuum",
+    "savepoint",
+    "date",
+    "func",
+    "like",
+    "rowvalue",
+    "unique",
+    "autoinc",
+    "table",
+    "distinct",
+    "limit",
+    "count",
+    "coalesce",
+    "quote",
+    "numcast",
+    "intpkey",
+    "rowid",
+    "enc",
+    "lock",
 ];
 
 pub const CORE_SQL_EXACT: &[&str] = &[

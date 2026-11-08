@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "100/148 subtests passed; pending: ANALYZE/sqlite_stat1, EQP/optimizer"]
 fn test_indexA() {
-    sqliters_tcltest::run_test_script("indexA", r#"
+    sqliters_tcltest::run_test_script(
+        "indexA",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix indexA
@@ -304,5 +306,6 @@ do_execsql_test 8.1 {
   1 4 1  2 4 2
 }
 finish_test
-"#);
+"#,
+    );
 }

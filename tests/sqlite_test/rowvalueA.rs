@@ -1,6 +1,8 @@
 #[test]
 fn test_rowvalueA() {
-    sqliters_tcltest::run_test_script("rowvalueA", r#"
+    sqliters_tcltest::run_test_script(
+        "rowvalueA",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix rowvalueA
@@ -134,5 +136,6 @@ do_execsql_test 6.10 {
     END;
 } {i}
 finish_test
-"#);
+"#,
+    );
 }

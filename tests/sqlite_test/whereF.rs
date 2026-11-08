@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "13/27 subtests passed; pending: EQP/optimizer"]
 fn test_whereF() {
-    sqliters_tcltest::run_test_script("whereF", r#"
+    sqliters_tcltest::run_test_script(
+        "whereF",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix whereF
@@ -205,5 +207,6 @@ do_execsql_test 7.3 {
     FROM t1;
 } {~/ (Lt|Ge) /}
 finish_test
-"#);
+"#,
+    );
 }

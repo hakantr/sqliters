@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "18/23 subtests passed; pending: index9 edge cases"]
 fn test_index9() {
-    sqliters_tcltest::run_test_script("index9", r#"
+    sqliters_tcltest::run_test_script(
+        "index9",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix index9
@@ -76,5 +78,6 @@ do_sqluses_test 4.5 { SELECT * FROM t1 WHERE $y=y ORDER BY x } {t1}
 sqlite3_db_config db QPSG 0
 db cache flush
 finish_test
-"#);
+"#,
+    );
 }

@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "11/29 subtests passed; pending: EQP/optimizer"]
 fn test_date2() {
-    sqliters_tcltest::run_test_script("date2", r#"
+    sqliters_tcltest::run_test_script(
+        "date2",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 ifcapable {!datetime} {
@@ -145,5 +147,6 @@ do_catchsql_test date3-620 {
   INSERT INTO t620 VALUES(10);
 } {1 {non-deterministic use of julianday() in a generated column}}
 finish_test
-"#);
+"#,
+    );
 }

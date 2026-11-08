@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "133/141 subtests passed; pending: TRIGGER, EQP/optimizer"]
 fn test_update() {
-    sqliters_tcltest::run_test_script("update", r#"
+    sqliters_tcltest::run_test_script(
+        "update",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test update-1.1 {
@@ -672,5 +674,6 @@ do_execsql_test update-22.0 {
   SELECT x FROM t1 WHERE x<100 ORDER BY x;
 } {4 5}
 finish_test
-"#);
+"#,
+    );
 }

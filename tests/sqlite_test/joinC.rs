@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "0/256 subtests passed; pending: joinC edge cases"]
 fn test_joinC() {
-    sqliters_tcltest::run_test_script("joinC", r#"
+    sqliters_tcltest::run_test_script(
+        "joinC",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 db nullvalue -
@@ -4568,5 +4570,6 @@ do_execsql_test joinC-256 {
 
 }
 finish_test
-"#);
+"#,
+    );
 }

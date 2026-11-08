@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "60/83 subtests passed; pending: TRIGGER, TEMP TABLE"]
 fn test_insert() {
-    sqliters_tcltest::run_test_script("insert", r#"
+    sqliters_tcltest::run_test_script(
+        "insert",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 do_test insert-1.1 {
@@ -493,5 +495,6 @@ do_catchsql_test insert-17.15 {
   REPLACE INTO t3(a,b,c,d) VALUES(5,1,11,2);
 } {1 {UNIQUE constraint failed: t3.d}}
 finish_test
-"#);
+"#,
+    );
 }

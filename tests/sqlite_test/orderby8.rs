@@ -1,6 +1,8 @@
 #[test]
 fn test_orderby8() {
-    sqliters_tcltest::run_test_script("orderby8", r#"
+    sqliters_tcltest::run_test_script(
+        "orderby8",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix orderby8
@@ -22,5 +24,6 @@ for {set i 1} {$i<200} {incr i} {
   } {1 2 3 4 5 6 7 8 9}
 }
 finish_test
-"#);
+"#,
+    );
 }

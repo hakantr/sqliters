@@ -1,7 +1,9 @@
 #[test]
 #[ignore = "88/107 subtests passed; pending: VIEW, TRIGGER, ATTACH"]
 fn test_with1() {
-    sqliters_tcltest::run_test_script("with1", r#"
+    sqliters_tcltest::run_test_script(
+        "with1",
+        r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set ::testprefix with1
@@ -1057,5 +1059,6 @@ do_catchsql_test 29.1 {
   SELECT * FROM cte1;
 } {1 {'cte1' is not a function}}
 finish_test
-"#);
+"#,
+    );
 }
