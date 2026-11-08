@@ -108,18 +108,24 @@ pub fn strip_test_comments(raw_tcl: &str) -> String {
             }
         }
 
+        if !in_quotes
+            && !prev_backslash_cont
+            && trimmed.starts_with("/*")
+            && !trimmed.starts_with("/* QUERY PLAN")
+            && !trimmed.starts_with("/* *")
+        {
+            if !trimmed.contains("*/") {
+                in_block_comment = true;
+            }
+            continue;
+        }
+
         if brace_depth == 0 && !in_quotes && !prev_backslash_cont {
             if trimmed.is_empty() {
                 continue;
             }
             if trimmed.starts_with('#') {
                 prev_backslash_cont = trimmed.ends_with('\\');
-                continue;
-            }
-            if trimmed.starts_with("/*") {
-                if !trimmed.contains("*/") {
-                    in_block_comment = true;
-                }
                 continue;
             }
         } else if !in_quotes && !prev_backslash_cont && trimmed.starts_with('#') {

@@ -46,6 +46,7 @@ enum VarSlot {
 #[derive(Debug, Clone, Default)]
 struct CallFrame {
     vars: HashMap<String, VarSlot>,
+    caller_frame: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -777,6 +778,7 @@ impl TclInterp {
         }
 
         let prev_frame = self.current_frame;
+        frame.caller_frame = prev_frame;
         let new_idx = self.frames.len();
         self.frames.push(frame);
         self.current_frame = new_idx;
@@ -911,7 +913,12 @@ impl TclInterp {
             let lvl = self.resolve_level(&args[0])?;
             (lvl, &args[1..])
         } else {
-            (self.current_frame.saturating_sub(1), args)
+            let caller = if self.current_frame == 0 {
+                0
+            } else {
+                self.frames[self.current_frame].caller_frame
+            };
+            (caller, args)
         };
 
         for pair in rest.chunks_exact(2) {
@@ -936,18 +943,33 @@ impl TclInterp {
             let idx: usize = abs
                 .parse()
                 .map_err(|_| TclControl::Error(format!("bad level \"{spec}\"")))?;
-            if idx >= self.frames.len() {
-                return Err(TclControl::Error(format!("bad level \"{spec}\"")));
+            if idx == 0 {
+                return Ok(0);
             }
-            Ok(idx)
+            let mut chain = Vec::new();
+            let mut cur = self.current_frame;
+            while cur > 0 {
+                chain.push(cur);
+                cur = self.frames[cur].caller_frame;
+            }
+            chain.push(0);
+            chain.reverse();
+            chain
+                .get(idx)
+                .copied()
+                .ok_or_else(|| TclControl::Error(format!("bad level \"{spec}\"")))
         } else {
             let rel: usize = spec
                 .parse()
                 .map_err(|_| TclControl::Error(format!("bad level \"{spec}\"")))?;
-            if rel > self.current_frame {
-                return Err(TclControl::Error(format!("bad level \"{spec}\"")));
+            let mut cur = self.current_frame;
+            for _ in 0..rel {
+                if cur == 0 {
+                    return Err(TclControl::Error(format!("bad level \"{spec}\"")));
+                }
+                cur = self.frames[cur].caller_frame;
             }
-            Ok(self.current_frame - rel)
+            Ok(cur)
         }
     }
 
@@ -1259,7 +1281,12 @@ impl TclInterp {
         {
             (self.resolve_level(&args[0])?, &args[1..])
         } else {
-            (self.current_frame.saturating_sub(1), args)
+            let caller = if self.current_frame == 0 {
+                0
+            } else {
+                self.frames[self.current_frame].caller_frame
+            };
+            (caller, args)
         };
         let script = if script_parts.len() == 1 {
             script_parts[0].clone()
@@ -1504,6 +1531,7 @@ impl TclInterp {
         let mut unique = false;
         let mut nocase = false;
         let mut index_opt: Option<String> = None;
+        let mut command_opt: Option<String> = None;
         let mut i = 0;
         while i + 1 < args.len() && args[i].starts_with('-') {
             match args[i].as_str() {
@@ -1516,6 +1544,10 @@ impl TclInterp {
                 "-nocase" => nocase = true,
                 "-index" if i + 2 < args.len() => {
                     index_opt = Some(args[i + 1].clone());
+                    i += 1;
+                }
+                "-command" if i + 2 < args.len() => {
+                    command_opt = Some(args[i + 1].clone());
                     i += 1;
                 }
                 "--" => {
@@ -1545,30 +1577,56 @@ impl TclInterp {
             elem.to_string()
         };
 
-        items.sort_by(|a, b| {
-            let ka = extract_key(a);
-            let kb = extract_key(b);
-            let ord = match kind {
-                SortKind::Integer => {
-                    let ia = parse_tcl_int(ka.trim()).unwrap_or(0);
-                    let ib = parse_tcl_int(kb.trim()).unwrap_or(0);
-                    ia.cmp(&ib)
-                }
-                SortKind::Real => {
-                    let fa = parse_tcl_float(ka.trim()).unwrap_or(0.0);
-                    let fb = parse_tcl_float(kb.trim()).unwrap_or(0.0);
-                    fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
-                }
-                SortKind::Ascii => {
-                    if nocase {
-                        ka.to_ascii_lowercase().cmp(&kb.to_ascii_lowercase())
+        if let Some(ref cmd_prefix) = command_opt {
+            // Stable merge/insertion sort via custom TCL comparison command
+            for idx in 1..items.len() {
+                let mut pos = idx;
+                while pos > 0 {
+                    let ka = extract_key(&items[pos - 1]);
+                    let kb = extract_key(&items[pos]);
+                    let script = format!(
+                        "{cmd_prefix} {} {}",
+                        format_list(std::slice::from_ref(&ka)),
+                        format_list(std::slice::from_ref(&kb))
+                    );
+                    let res = self.eval(&script)?;
+                    let cmp_n = parse_tcl_int(res.trim()).unwrap_or(0);
+                    let ord = cmp_n.cmp(&0);
+                    let eff = if decreasing { ord.reverse() } else { ord };
+                    if eff == std::cmp::Ordering::Greater {
+                        items.swap(pos - 1, pos);
+                        pos -= 1;
                     } else {
-                        ka.cmp(&kb)
+                        break;
                     }
                 }
-            };
-            if decreasing { ord.reverse() } else { ord }
-        });
+            }
+        } else {
+            items.sort_by(|a, b| {
+                let ka = extract_key(a);
+                let kb = extract_key(b);
+                let ord = match kind {
+                    SortKind::Integer => {
+                        let ia = parse_tcl_int(ka.trim()).unwrap_or(0);
+                        let ib = parse_tcl_int(kb.trim()).unwrap_or(0);
+                        ia.cmp(&ib)
+                    }
+                    SortKind::Real => {
+                        let fa = parse_tcl_float(ka.trim()).unwrap_or(0.0);
+                        let fb = parse_tcl_float(kb.trim()).unwrap_or(0.0);
+                        fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                    SortKind::Ascii => {
+                        if nocase {
+                            ka.to_ascii_lowercase().cmp(&kb.to_ascii_lowercase())
+                        } else {
+                            ka.cmp(&kb)
+                        }
+                    }
+                };
+                if decreasing { ord.reverse() } else { ord }
+            });
+        }
 
         if unique {
             items.dedup_by(|a, b| {
@@ -1963,7 +2021,15 @@ impl TclInterp {
                 hits.sort();
                 Ok(format_list(&hits))
             }
-            "level" => Ok(self.current_frame.to_string()),
+            "level" => {
+                let mut depth = 0usize;
+                let mut c = self.current_frame;
+                while c > 0 {
+                    depth += 1;
+                    c = self.frames[c].caller_frame;
+                }
+                Ok(depth.to_string())
+            }
             "script" => Ok(self.script_path.clone()),
             "nameofexec" => Ok(std::env::current_exe()
                 .map(|p| p.to_string_lossy().into_owned())

@@ -554,7 +554,7 @@ pub fn try_compile_select(stmt: &SelectStmt, schema: &Schema) -> Result<Option<V
             if tbl.columns.iter().any(|c| c.generated.is_some()) {
                 return Ok(None);
             }
-            let prog = compile_single_table_select(
+            compile_single_table_select(
                 &tbl,
                 alias.as_deref(),
                 projection,
@@ -562,8 +562,7 @@ pub fn try_compile_select(stmt: &SelectStmt, schema: &Schema) -> Result<Option<V
                 &stmt.order_by,
                 stmt.limit.as_ref(),
                 schema,
-            )?;
-            Ok(Some(prog))
+            )
         }
         Some(_) => Ok(None),
     }
@@ -651,7 +650,7 @@ fn compile_single_table_select(
     order_by: &[OrderByTerm],
     limit: Option<&LimitClause>,
     schema: &Schema,
-) -> Result<VdbeProgram> {
+) -> Result<Option<VdbeProgram>> {
     let mut prog = VdbeProgram::new();
     let init_addr = prog.emit(Instruction::new(Opcode::Init, 0, 0, 0));
 
@@ -736,14 +735,21 @@ fn compile_single_table_select(
     // Optional Sorter setup for ORDER BY
     let sorter_setup = if !order_by.is_empty() {
         let s_cursor = prog.alloc_cursor();
-        let mut sort_exprs = Vec::with_capacity(order_by.len());
+        let mut sort_sources = Vec::with_capacity(order_by.len());
         let mut sort_orders = Vec::with_capacity(order_by.len());
         for ob in order_by {
-            let resolved_expr = resolve_order_by_expr(&ob.expr, &expanded, tbl);
-            let coll = infer_expr_collation(&resolved_expr, tbl);
+            let Some((src, coll_ref_expr)) = resolve_order_by_source(&ob.expr, &expanded, tbl)
+            else {
+                return Ok(None);
+            };
+            let coll = if let Expr::Collate { collation, .. } = &ob.expr {
+                Collation::from_name(collation).unwrap_or_default()
+            } else {
+                infer_expr_collation(&coll_ref_expr, tbl)
+            };
             let desc = ob.desc;
             let nulls_last = ob.nulls_last.unwrap_or(desc);
-            sort_exprs.push(resolved_expr);
+            sort_sources.push(src);
             sort_orders.push(KeySortOrder {
                 desc,
                 nulls_last,
@@ -751,10 +757,10 @@ fn compile_single_table_select(
             });
         }
         prog.emit(
-            Instruction::new(Opcode::SorterOpen, s_cursor, (sort_exprs.len() + expanded.len()) as i32, 0)
+            Instruction::new(Opcode::SorterOpen, s_cursor, (sort_sources.len() + expanded.len()) as i32, 0)
                 .with_p4(P4::KeyInfo(sort_orders)),
         );
-        Some((s_cursor, sort_exprs))
+        Some((s_cursor, sort_sources))
     } else {
         None
     };
@@ -830,20 +836,32 @@ fn compile_single_table_select(
         jumps_next_row.push(prog.emit(Instruction::new(Opcode::JumpIfFalse, cond_reg, 0, 1)));
     }
 
-    if let Some((s_cursor, ref sort_exprs)) = sorter_setup {
-        // Compute `[sort_keys..., proj_cols...]` and `OP_SorterInsert`
-        let total_cols = sort_exprs.len() + expanded.len();
+    if let Some((s_cursor, ref sort_sources)) = sorter_setup {
+        // Compute `proj_cols` first so `ORDER BY` terms matching result columns reuse them once!
+        let total_cols = sort_sources.len() + expanded.len();
         let row_base = prog.alloc_registers(total_cols);
-        for (i, se) in sort_exprs.iter().enumerate() {
-            compile_expr(&mut prog, se, Some(&binding), row_base + i as i32)?;
-        }
         for (j, (pe, _, _)) in expanded.iter().enumerate() {
             compile_expr(
                 &mut prog,
                 pe,
                 Some(&binding),
-                row_base + (sort_exprs.len() + j) as i32,
+                row_base + (sort_sources.len() + j) as i32,
             )?;
+        }
+        for (i, src) in sort_sources.iter().enumerate() {
+            match src {
+                OrderBySource::ProjCol(pidx) => {
+                    prog.emit(Instruction::new(
+                        Opcode::Copy,
+                        row_base + (sort_sources.len() + *pidx) as i32,
+                        row_base + i as i32,
+                        0,
+                    ));
+                }
+                OrderBySource::Expr(se) => {
+                    compile_expr(&mut prog, se, Some(&binding), row_base + i as i32)?;
+                }
+            }
         }
         prog.emit(Instruction::new(
             Opcode::SorterInsert,
@@ -988,40 +1006,146 @@ fn compile_single_table_select(
 
     prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
     prog.patch_p2(init_addr, body_start);
-    Ok(prog)
+    Ok(Some(prog))
 }
 
 fn goto_placeholder() -> Instruction {
     Instruction::new(Opcode::Goto, 0, 0, 0)
 }
 
-fn resolve_order_by_expr(
+enum OrderBySource {
+    ProjCol(usize),
+    Expr(Expr),
+}
+
+fn resolve_order_by_source(
     ob_expr: &Expr,
     expanded: &[(Expr, String, Option<String>)],
     tbl: &TableSchema,
-) -> Expr {
-    if let Expr::Integer(ord) = ob_expr
+) -> Option<(OrderBySource, Expr)> {
+    let mut inner = ob_expr;
+    while let Expr::Collate { expr, .. } = inner {
+        inner = expr;
+    }
+    if let Expr::Integer(ord) = inner
         && *ord >= 1
         && (*ord as usize) <= expanded.len()
     {
-        return expanded[(*ord as usize) - 1].0.clone();
+        let idx = (*ord as usize) - 1;
+        return Some((OrderBySource::ProjCol(idx), expanded[idx].0.clone()));
     }
     if let Expr::Column {
         table: None,
         column,
-    } = ob_expr
-        && tbl.find_column(column).is_none()
-        && !tbl.is_implicit_rowid_name(column)
-        && let Some((proj_expr, _, _)) = expanded.iter().find(|(_, label, alias)| {
-            alias
-                .as_ref()
-                .is_some_and(|a| a.eq_ignore_ascii_case(column))
-                || label.eq_ignore_ascii_case(column)
-        })
+    } = inner
     {
-        return proj_expr.clone();
+        let in_tbl = tbl.find_column(column).is_some() || tbl.is_implicit_rowid_name(column);
+        if let Some((idx, (proj_expr, _, al))) =
+            expanded.iter().enumerate().find(|(_, (_, label, alias))| {
+                alias
+                    .as_ref()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(column))
+                    || label.eq_ignore_ascii_case(column)
+            })
+            && (al.is_some() || !in_tbl)
+        {
+            return Some((OrderBySource::ProjCol(idx), proj_expr.clone()));
+        }
     }
-    ob_expr.clone()
+    if let Some((idx, (proj_expr, _, _))) =
+        expanded.iter().enumerate().find(|(_, (pe, _, _))| pe == inner)
+    {
+        return Some((OrderBySource::ProjCol(idx), proj_expr.clone()));
+    }
+    if expr_uses_select_alias(ob_expr, expanded, tbl) {
+        return None;
+    }
+    Some((OrderBySource::Expr(ob_expr.clone()), ob_expr.clone()))
+}
+
+fn expr_uses_select_alias(
+    expr: &Expr,
+    expanded: &[(Expr, String, Option<String>)],
+    tbl: &TableSchema,
+) -> bool {
+    match expr {
+        Expr::Column {
+            table: None,
+            column,
+        } => {
+            let in_tbl = tbl.find_column(column).is_some() || tbl.is_implicit_rowid_name(column);
+            !in_tbl
+                && expanded.iter().any(|(_, label, alias)| {
+                    alias
+                        .as_ref()
+                        .is_some_and(|a| a.eq_ignore_ascii_case(column))
+                        || label.eq_ignore_ascii_case(column)
+                })
+        }
+        Expr::Unary { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. } => expr_uses_select_alias(inner, expanded, tbl),
+        Expr::Binary { left, right, .. } => {
+            expr_uses_select_alias(left, expanded, tbl)
+                || expr_uses_select_alias(right, expanded, tbl)
+        }
+        Expr::Between {
+            expr: v, low, high, ..
+        } => {
+            expr_uses_select_alias(v, expanded, tbl)
+                || expr_uses_select_alias(low, expanded, tbl)
+                || expr_uses_select_alias(high, expanded, tbl)
+        }
+        Expr::InList { expr: v, list, .. } => {
+            expr_uses_select_alias(v, expanded, tbl)
+                || list.iter().any(|e| expr_uses_select_alias(e, expanded, tbl))
+        }
+        Expr::Like {
+            expr: v,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_uses_select_alias(v, expanded, tbl)
+                || expr_uses_select_alias(pattern, expanded, tbl)
+                || escape
+                    .as_ref()
+                    .is_some_and(|e| expr_uses_select_alias(e, expanded, tbl))
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|e| expr_uses_select_alias(e, expanded, tbl))
+                || branches.iter().any(|(w, t)| {
+                    expr_uses_select_alias(w, expanded, tbl)
+                        || expr_uses_select_alias(t, expanded, tbl)
+                })
+                || else_expr
+                    .as_ref()
+                    .is_some_and(|e| expr_uses_select_alias(e, expanded, tbl))
+        }
+        Expr::FunctionCall { args, filter, .. } => {
+            let in_args = match args {
+                FunctionArgs::Star => false,
+                FunctionArgs::Exprs(es) => {
+                    es.iter().any(|e| expr_uses_select_alias(e, expanded, tbl))
+                }
+            };
+            in_args
+                || filter
+                    .as_ref()
+                    .is_some_and(|e| expr_uses_select_alias(e, expanded, tbl))
+        }
+        Expr::RowValue(elems) => elems
+            .iter()
+            .any(|e| expr_uses_select_alias(e, expanded, tbl)),
+        _ => false,
+    }
 }
 
 fn infer_expr_collation(expr: &Expr, tbl: &TableSchema) -> Collation {

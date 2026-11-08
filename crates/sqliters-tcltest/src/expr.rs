@@ -5,7 +5,7 @@ use crate::list::{parse_backslash_escape, parse_list};
 
 #[derive(Debug, Clone)]
 pub enum ExprVal {
-    Int(i64),
+    Int(i128),
     Float(f64),
     Str(String),
 }
@@ -19,11 +19,11 @@ impl ExprVal {
         }
     }
 
-    pub fn as_int(&self) -> Result<i64, String> {
+    pub fn as_int(&self) -> Result<i128, String> {
         match self {
             Self::Int(i) => Ok(*i),
-            Self::Float(f) => Ok(*f as i64),
-            Self::Str(s) => parse_tcl_int(s.trim())
+            Self::Float(f) => Ok(*f as i128),
+            Self::Str(s) => parse_tcl_int128(s.trim())
                 .ok_or_else(|| format!("expected integer but got \"{s}\"")),
         }
     }
@@ -67,12 +67,12 @@ impl ExprVal {
             Self::Int(_) | Self::Float(_) => Some(self.clone()),
             Self::Str(s) => {
                 let t = s.trim();
-                if let Some(i) = parse_tcl_int(t) {
+                if let Some(i) = parse_tcl_int128(t) {
                     Some(ExprVal::Int(i))
                 } else if let Some(f) = parse_tcl_float(t) {
                     Some(ExprVal::Float(f))
                 } else if let Ok(b) = parse_tcl_bool_word(t) {
-                    Some(ExprVal::Int(i64::from(b)))
+                    Some(ExprVal::Int(i128::from(b)))
                 } else {
                     None
                 }
@@ -83,7 +83,7 @@ impl ExprVal {
 
 pub fn parse_tcl_bool(s: &str) -> Result<bool, String> {
     let t = s.trim();
-    if let Some(i) = parse_tcl_int(t) {
+    if let Some(i) = parse_tcl_int128(t) {
         return Ok(i != 0);
     }
     if let Some(f) = parse_tcl_float(t) {
@@ -150,6 +150,51 @@ pub fn parse_tcl_int(t: &str) -> Option<i64> {
         }
     } else {
         Some(abs_u as i64)
+    }
+}
+
+pub fn parse_tcl_int128(t: &str) -> Option<i128> {
+    if t.is_empty() {
+        return None;
+    }
+    let (neg, rest) = if let Some(r) = t.strip_prefix('-') {
+        (true, r)
+    } else if let Some(r) = t.strip_prefix('+') {
+        (false, r)
+    } else {
+        (false, t)
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let abs_u: u128 = if let Some(hex) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X"))
+    {
+        u128::from_str_radix(hex, 16).ok()?
+    } else if let Some(oct) = rest.strip_prefix("0o").or_else(|| rest.strip_prefix("0O")) {
+        u128::from_str_radix(oct, 8).ok()?
+    } else if let Some(bin) = rest.strip_prefix("0b").or_else(|| rest.strip_prefix("0B")) {
+        u128::from_str_radix(bin, 2).ok()?
+    } else if rest.len() > 1
+        && rest.starts_with('0')
+        && rest.bytes().all(|b| (b'0'..=b'7').contains(&b))
+    {
+        u128::from_str_radix(rest, 8).ok()?
+    } else if rest.bytes().all(|b| b.is_ascii_digit()) {
+        rest.parse::<u128>().ok()?
+    } else {
+        return None;
+    };
+
+    if neg {
+        if abs_u == (1u128 << 127) {
+            Some(i128::MIN)
+        } else if abs_u < (1u128 << 127) {
+            Some(-(abs_u as i128))
+        } else {
+            None
+        }
+    } else {
+        Some(abs_u as i128)
     }
 }
 
@@ -259,7 +304,7 @@ impl<'a> ExprParser<'a> {
                     } else {
                         right.as_bool().map_err(|e| self.err(e))?
                     };
-                    left = ExprVal::Int(i64::from(lb || rb));
+                    left = ExprVal::Int(i128::from(lb || rb));
                 }
             } else {
                 break;
@@ -289,7 +334,7 @@ impl<'a> ExprParser<'a> {
                     } else {
                         false
                     };
-                    left = ExprVal::Int(i64::from(lb && rb));
+                    left = ExprVal::Int(i128::from(lb && rb));
                 }
             } else {
                 break;
@@ -403,7 +448,7 @@ impl<'a> ExprParser<'a> {
                     "!=" => cmp_tcl_vals(&left, &right) != Some(std::cmp::Ordering::Equal),
                     _ => unreachable!(),
                 };
-                left = ExprVal::Int(i64::from(res));
+                left = ExprVal::Int(i128::from(res));
             }
         }
         Ok(left)
@@ -439,7 +484,7 @@ impl<'a> ExprParser<'a> {
                     (">=", Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)) => true,
                     _ => false,
                 };
-                left = ExprVal::Int(i64::from(res));
+                left = ExprVal::Int(i128::from(res));
             }
         }
         Ok(left)
@@ -463,7 +508,7 @@ impl<'a> ExprParser<'a> {
             if eval {
                 let a = left.as_int().map_err(|e| self.err(e))?;
                 let b = right.as_int().map_err(|e| self.err(e))?;
-                let sh = (b & 63) as u32;
+                let sh = (b & 127) as u32;
                 left = ExprVal::Int(if op == "<<" {
                     a.wrapping_shl(sh)
                 } else {
@@ -588,7 +633,7 @@ impl<'a> ExprParser<'a> {
                     return Ok(ExprVal::Int(0));
                 }
                 let b = v.as_bool().map_err(|e| self.err(e))?;
-                Ok(ExprVal::Int(i64::from(!b)))
+                Ok(ExprVal::Int(i128::from(!b)))
             }
             b'~' => {
                 self.pos += 1;
@@ -699,7 +744,7 @@ impl<'a> ExprParser<'a> {
                         self.pos += 1;
                     }
                     let tok = &self.src[start..self.pos];
-                    let iv = parse_tcl_int(tok)
+                    let iv = parse_tcl_int128(tok)
                         .ok_or_else(|| self.err(format!("invalid integer \"{tok}\"")))?;
                     return Ok(ExprVal::Int(iv));
                 }
@@ -734,7 +779,7 @@ impl<'a> ExprParser<'a> {
                     let fv = parse_tcl_float(tok)
                         .ok_or_else(|| self.err(format!("invalid float \"{tok}\"")))?;
                     Ok(ExprVal::Float(fv))
-                } else if let Some(iv) = parse_tcl_int(tok) {
+                } else if let Some(iv) = parse_tcl_int128(tok) {
                     Ok(ExprVal::Int(iv))
                 } else if let Some(fv) = parse_tcl_float(tok) {
                     Ok(ExprVal::Float(fv))
@@ -773,7 +818,7 @@ impl<'a> ExprParser<'a> {
                     }
                     eval_math_func(ident, &args).map_err(|e| self.err(e))
                 } else if let Ok(b) = parse_tcl_bool_word(ident) {
-                    Ok(ExprVal::Int(i64::from(b)))
+                    Ok(ExprVal::Int(i128::from(b)))
                 } else if let Some(fv) = parse_tcl_float(ident) {
                     Ok(ExprVal::Float(fv))
                 } else {
@@ -803,7 +848,7 @@ impl<'a> ExprParser<'a> {
 
 fn str_to_expr_val(s: String) -> ExprVal {
     let t = s.trim();
-    if let Some(i) = parse_tcl_int(t) {
+    if let Some(i) = parse_tcl_int128(t) {
         if t == i.to_string() {
             return ExprVal::Int(i);
         }
@@ -901,7 +946,13 @@ fn eval_math_func(name: &str, args: &[ExprVal]) -> Result<ExprVal, String> {
                 ExprVal::Str(_) => unreachable!(),
             }
         }
-        "int" | "wide" | "entier" => {
+        "wide" => {
+            if args.len() != 1 {
+                return Err("wrong # args to mathfunc wide".to_string());
+            }
+            Ok(ExprVal::Int((args[0].as_int()? as i64) as i128))
+        }
+        "int" | "entier" => {
             if args.len() != 1 {
                 return Err(format!("wrong # args to mathfunc {name}"));
             }
@@ -917,7 +968,7 @@ fn eval_math_func(name: &str, args: &[ExprVal]) -> Result<ExprVal, String> {
             if args.len() != 1 {
                 return Err("wrong # args to mathfunc round".to_string());
             }
-            Ok(ExprVal::Int(args[0].as_float()?.round() as i64))
+            Ok(ExprVal::Int(args[0].as_float()?.round() as i128))
         }
         "floor" => Ok(ExprVal::Float(args.first().ok_or("arg")?.as_float()?.floor())),
         "ceil" => Ok(ExprVal::Float(args.first().ok_or("arg")?.as_float()?.ceil())),
@@ -963,11 +1014,11 @@ fn eval_math_func(name: &str, args: &[ExprVal]) -> Result<ExprVal, String> {
             }
             Ok(best)
         }
-        "isnan" => Ok(ExprVal::Int(i64::from(args.first().ok_or("arg")?.as_float()?.is_nan()))),
-        "isinf" => Ok(ExprVal::Int(i64::from(
+        "isnan" => Ok(ExprVal::Int(i128::from(args.first().ok_or("arg")?.as_float()?.is_nan()))),
+        "isinf" => Ok(ExprVal::Int(i128::from(
             args.first().ok_or("arg")?.as_float()?.is_infinite(),
         ))),
-        "bool" => Ok(ExprVal::Int(i64::from(args.first().ok_or("arg")?.as_bool()?))),
+        "bool" => Ok(ExprVal::Int(i128::from(args.first().ok_or("arg")?.as_bool()?))),
         "srand" => {
             static SRAND: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0x9e37_79b9_7f4a_7c15);

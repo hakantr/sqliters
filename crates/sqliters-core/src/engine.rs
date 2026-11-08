@@ -21,7 +21,7 @@ use sqliters_types::{
 use sqliters_vdbe::{
     AggregateAccumulator, AggregateKind, Opcode, VmRuntimeContext, eval_cast_with_encoding,
     eval_comparison_with_affinity, eval_comparison_with_encoding, eval_scalar_function,
-    format_utc_date, format_utc_time, format_utc_timestamp, parse_escape_char,
+    eval_unary_negate, format_utc_date, format_utc_time, format_utc_timestamp, parse_escape_char,
     sqlite_compare_affinity, sqlite_glob_match, sqlite_like_match,
 };
 
@@ -2415,7 +2415,229 @@ fn eval_order_term_in_scope(
             return Ok(proj_vals[idx].clone());
         }
     }
-    eval_expr(ctx, ob_expr, params, scopes, ctes, agg_group)
+    if let Some((idx, _)) = expanded_proj
+        .iter()
+        .enumerate()
+        .find(|(_, (pe, _, _))| pe == inner)
+    {
+        return Ok(proj_vals[idx].clone());
+    }
+    let substituted = subst_order_by_aliases_in_expr(ob_expr, proj_vals, expanded_proj, scopes);
+    eval_expr(ctx, &substituted, params, scopes, ctes, agg_group)
+}
+
+fn value_to_literal_expr(v: &Value) -> Expr {
+    match v {
+        Value::Null => Expr::Null,
+        Value::Integer(i) => Expr::Integer(*i),
+        Value::Real(f) => Expr::Float(*f),
+        Value::Text(s) => Expr::String(s.clone()),
+        Value::Blob(b) => Expr::Blob(b.clone()),
+    }
+}
+
+fn subst_order_by_aliases_in_expr(
+    expr: &Expr,
+    proj_vals: &[Value],
+    expanded_proj: &[(Expr, String, Option<String>)],
+    scopes: &[EvalRow],
+) -> Expr {
+    match expr {
+        Expr::Column {
+            table: None,
+            column,
+        } => {
+            let in_row = scopes
+                .last()
+                .and_then(|r| r.lookup(None, column).ok().flatten())
+                .is_some();
+            if !in_row
+                && let Some((idx, _)) = expanded_proj.iter().enumerate().find(|(_, (_, label, al))| {
+                    al.as_ref().is_some_and(|a| a.eq_ignore_ascii_case(column))
+                        || label.eq_ignore_ascii_case(column)
+                })
+            {
+                return value_to_literal_expr(&proj_vals[idx]);
+            }
+            expr.clone()
+        }
+        Expr::Unary { op, expr: inner } => Expr::Unary {
+            op: *op,
+            expr: Box::new(subst_order_by_aliases_in_expr(
+                inner,
+                proj_vals,
+                expanded_proj,
+                scopes,
+            )),
+        },
+        Expr::Collate {
+            expr: inner,
+            collation,
+        } => Expr::Collate {
+            expr: Box::new(subst_order_by_aliases_in_expr(
+                inner,
+                proj_vals,
+                expanded_proj,
+                scopes,
+            )),
+            collation: collation.clone(),
+        },
+        Expr::Cast {
+            expr: inner,
+            type_name,
+        } => Expr::Cast {
+            expr: Box::new(subst_order_by_aliases_in_expr(
+                inner,
+                proj_vals,
+                expanded_proj,
+                scopes,
+            )),
+            type_name: type_name.clone(),
+        },
+        Expr::IsNull {
+            expr: inner,
+            negated,
+        } => Expr::IsNull {
+            expr: Box::new(subst_order_by_aliases_in_expr(
+                inner,
+                proj_vals,
+                expanded_proj,
+                scopes,
+            )),
+            negated: *negated,
+        },
+        Expr::Binary { left, op, right } => Expr::Binary {
+            left: Box::new(subst_order_by_aliases_in_expr(
+                left,
+                proj_vals,
+                expanded_proj,
+                scopes,
+            )),
+            op: *op,
+            right: Box::new(subst_order_by_aliases_in_expr(
+                right,
+                proj_vals,
+                expanded_proj,
+                scopes,
+            )),
+        },
+        Expr::Between {
+            expr: val,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: Box::new(subst_order_by_aliases_in_expr(
+                val,
+                proj_vals,
+                expanded_proj,
+                scopes,
+            )),
+            low: Box::new(subst_order_by_aliases_in_expr(
+                low,
+                proj_vals,
+                expanded_proj,
+                scopes,
+            )),
+            high: Box::new(subst_order_by_aliases_in_expr(
+                high,
+                proj_vals,
+                expanded_proj,
+                scopes,
+            )),
+            negated: *negated,
+        },
+        Expr::InList {
+            expr: val,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(subst_order_by_aliases_in_expr(
+                val,
+                proj_vals,
+                expanded_proj,
+                scopes,
+            )),
+            list: list
+                .iter()
+                .map(|e| subst_order_by_aliases_in_expr(e, proj_vals, expanded_proj, scopes))
+                .collect(),
+            negated: *negated,
+        },
+        Expr::Like {
+            expr: val,
+            pattern,
+            escape,
+            op,
+            negated,
+        } => Expr::Like {
+            expr: Box::new(subst_order_by_aliases_in_expr(
+                val,
+                proj_vals,
+                expanded_proj,
+                scopes,
+            )),
+            pattern: Box::new(subst_order_by_aliases_in_expr(
+                pattern,
+                proj_vals,
+                expanded_proj,
+                scopes,
+            )),
+            escape: escape
+                .as_ref()
+                .map(|e| Box::new(subst_order_by_aliases_in_expr(e, proj_vals, expanded_proj, scopes))),
+            op: *op,
+            negated: *negated,
+        },
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => Expr::Case {
+            operand: operand
+                .as_ref()
+                .map(|e| Box::new(subst_order_by_aliases_in_expr(e, proj_vals, expanded_proj, scopes))),
+            branches: branches
+                .iter()
+                .map(|(w, t)| {
+                    (
+                        subst_order_by_aliases_in_expr(w, proj_vals, expanded_proj, scopes),
+                        subst_order_by_aliases_in_expr(t, proj_vals, expanded_proj, scopes),
+                    )
+                })
+                .collect(),
+            else_expr: else_expr
+                .as_ref()
+                .map(|e| Box::new(subst_order_by_aliases_in_expr(e, proj_vals, expanded_proj, scopes))),
+        },
+        Expr::FunctionCall {
+            name,
+            distinct,
+            args,
+            filter,
+        } => Expr::FunctionCall {
+            name: name.clone(),
+            distinct: *distinct,
+            args: match args {
+                FunctionArgs::Star => FunctionArgs::Star,
+                FunctionArgs::Exprs(es) => FunctionArgs::Exprs(
+                    es.iter()
+                        .map(|e| subst_order_by_aliases_in_expr(e, proj_vals, expanded_proj, scopes))
+                        .collect(),
+                ),
+            },
+            filter: filter
+                .as_ref()
+                .map(|e| Box::new(subst_order_by_aliases_in_expr(e, proj_vals, expanded_proj, scopes))),
+        },
+        Expr::RowValue(elems) => Expr::RowValue(
+            elems
+                .iter()
+                .map(|e| subst_order_by_aliases_in_expr(e, proj_vals, expanded_proj, scopes))
+                .collect(),
+        ),
+        _ => expr.clone(),
+    }
 }
 
 fn sort_materialized_output(
@@ -3315,13 +3537,7 @@ fn eval_expr(
             let v = eval_expr(ctx, inner, params, scopes, ctes, agg_group)?;
             Ok(match op {
                 UnaryOp::Plus => v,
-                UnaryOp::Negate => match v {
-                    Value::Null => Value::Null,
-                    Value::Integer(i) => i
-                        .checked_neg()
-                        .map_or_else(|| Value::real(-(i as f64)), Value::Integer),
-                    other => Value::real(-other.to_real_lossy()),
-                },
+                UnaryOp::Negate => eval_unary_negate(&v),
                 UnaryOp::BitNot => {
                     if v.is_null() {
                         Value::Null

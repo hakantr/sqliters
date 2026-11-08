@@ -895,13 +895,7 @@ impl VdbeVm {
                 }
                 Opcode::Negate => {
                     let v = &self.regs[ins.p1 as usize];
-                    self.regs[ins.p2 as usize] = match v {
-                        Value::Null => Value::Null,
-                        Value::Integer(i) => i
-                            .checked_neg()
-                            .map_or_else(|| Value::real(-(*i as f64)), Value::Integer),
-                        other => Value::real(-other.to_real_lossy()),
-                    };
+                    self.regs[ins.p2 as usize] = eval_unary_negate(v);
                 }
                 Opcode::Concat => {
                     let lhs = &self.regs[ins.p1 as usize];
@@ -1172,6 +1166,17 @@ fn eval_arith(op: Opcode, lhs: &Value, rhs: &Value) -> Value {
     }
 }
 
+pub fn eval_unary_negate(v: &Value) -> Value {
+    match coerce_numeric_for_arith(v) {
+        Value::Null => Value::Null,
+        Value::Integer(i) => i
+            .checked_neg()
+            .map_or_else(|| Value::real(-(i as f64)), Value::Integer),
+        Value::Real(r) => Value::real(-r),
+        other => Value::Integer(other.to_integer_lossy().wrapping_neg()),
+    }
+}
+
 fn coerce_numeric_for_arith(v: &Value) -> Value {
     match v {
         Value::Integer(_) | Value::Real(_) => v.clone(),
@@ -1307,12 +1312,29 @@ fn compare_with_affinity(
     coll: Collation,
     enc: TextEncoding,
 ) -> Ordering {
-    if aff == TypeAffinity::Blob {
-        return lhs.cmp_sqlite_with_encoding(rhs, coll, enc);
+    match aff {
+        TypeAffinity::Blob => lhs.cmp_sqlite_with_encoding(rhs, coll, enc),
+        TypeAffinity::Text => {
+            let lc = TypeAffinity::Text.apply(lhs.clone());
+            let rc = TypeAffinity::Text.apply(rhs.clone());
+            lc.cmp_sqlite_with_encoding(&rc, coll, enc)
+        }
+        TypeAffinity::Numeric | TypeAffinity::Integer | TypeAffinity::Real => {
+            // In C SQLite (`vdbe.c` `OP_Eq..OP_Ge`), numeric comparison affinity only converts
+            // `Text` operands to `Integer` or `Real`, preserving full 64-bit `Integer` vs `Real` precision!
+            let lc = if matches!(lhs, Value::Text(_)) {
+                TypeAffinity::Numeric.apply(lhs.clone())
+            } else {
+                lhs.clone()
+            };
+            let rc = if matches!(rhs, Value::Text(_)) {
+                TypeAffinity::Numeric.apply(rhs.clone())
+            } else {
+                rhs.clone()
+            };
+            lc.cmp_sqlite_with_encoding(&rc, coll, enc)
+        }
     }
-    let lc = aff.apply(lhs.clone());
-    let rc = aff.apply(rhs.clone());
-    lc.cmp_sqlite_with_encoding(&rc, coll, enc)
 }
 
 pub fn eval_cast(val: Value, type_name: &str) -> Value {
