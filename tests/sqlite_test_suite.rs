@@ -11,6 +11,9 @@ mod collateA;
 #[path = "sqlite_test/collateB.rs"]
 mod collateB;
 #[allow(non_snake_case)]
+#[path = "sqlite_test/conflict.rs"]
+mod conflict;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/delete3.rs"]
 mod delete3;
 #[allow(non_snake_case)]
