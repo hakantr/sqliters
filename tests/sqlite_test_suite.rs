@@ -5,6 +5,9 @@ mod affinity2;
 #[path = "sqlite_test/coalesce.rs"]
 mod coalesce;
 #[allow(non_snake_case)]
+#[path = "sqlite_test/collateA.rs"]
+mod collateA;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/collateB.rs"]
 mod collateB;
 #[allow(non_snake_case)]
