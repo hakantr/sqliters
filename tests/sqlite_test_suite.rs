@@ -1,4 +1,7 @@
 #[allow(non_snake_case)]
+#[path = "sqlite_test/affinity2.rs"]
+mod affinity2;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/coalesce.rs"]
 mod coalesce;
 #[allow(non_snake_case)]
