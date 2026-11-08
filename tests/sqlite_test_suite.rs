@@ -92,6 +92,9 @@ mod rowvalue3;
 #[path = "sqlite_test/rowvalue6.rs"]
 mod rowvalue6;
 #[allow(non_snake_case)]
+#[path = "sqlite_test/rowvalueA.rs"]
+mod rowvalueA;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/savepoint5.rs"]
 mod savepoint5;
 #[allow(non_snake_case)]
