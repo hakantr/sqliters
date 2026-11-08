@@ -2,7 +2,27 @@
 //! ported from `sqlite/src/func.c`.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static PRNG_STATE: AtomicU64 = AtomicU64::new(0);
+
+fn next_prng_u64() -> u64 {
+    let mut cur = PRNG_STATE.load(AtomicOrdering::Relaxed);
+    if cur == 0 {
+        cur = (system_utc_millis() as u64) ^ 0x9E37_79B9_7F4A_7C15;
+        if cur == 0 {
+            cur = 0xDEAD_BEEF_CAFE_BABE;
+        }
+    }
+    let mut x = cur;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    let next = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+    PRNG_STATE.store(if next == 0 { 1 } else { next }, AtomicOrdering::Relaxed);
+    next
+}
 
 use sqliters_types::{
     Collation, ErrorCode, Result, SQLITE_SOURCE_ID, SQLITE_VERSION, SqliteError, Value,
@@ -336,6 +356,20 @@ pub fn eval_scalar_function(
             let n = args[0].to_integer_lossy().max(0) as usize;
             Ok(Value::Blob(vec![0u8; n]))
         }
+        "RANDOM" => {
+            check_arity(name, args, 0, 0)?;
+            Ok(Value::Integer(next_prng_u64() as i64))
+        }
+        "RANDOMBLOB" => {
+            check_arity(name, args, 1, 1)?;
+            let n = args[0].to_integer_lossy().max(1) as usize;
+            let mut buf = vec![0u8; n];
+            for chunk in buf.chunks_mut(8) {
+                let bytes = next_prng_u64().to_le_bytes();
+                chunk.copy_from_slice(&bytes[..chunk.len()]);
+            }
+            Ok(Value::Blob(buf))
+        }
         "ROUND" => {
             check_arity(name, args, 1, 2)?;
             if args[0].is_null() || (args.len() == 2 && args[1].is_null()) {
@@ -462,6 +496,7 @@ pub fn eval_scalar_function(
         "DATE" | "TIME" | "DATETIME" | "UNIXEPOCH" | "JULIANDAY" => {
             eval_datetime_function(&upper, args, ctx)
         }
+        "STRFTIME" => eval_strftime_function(args, ctx),
         _ => Err(SqliteError::new(
             ErrorCode::Error,
             format!("no such function: {name}"),
@@ -629,6 +664,77 @@ fn eval_datetime_function(
         "JULIANDAY" => Ok(Value::real((unix_ms as f64) / 86_400_000.0 + 2_440_587.5)),
         _ => unreachable!(),
     }
+}
+
+fn eval_strftime_function(args: &[Value], ctx: &VmRuntimeContext) -> Result<Value> {
+    if args.is_empty() {
+        return Ok(Value::Null);
+    }
+    if args[0].is_null() {
+        return Ok(Value::Null);
+    }
+    let fmt = args[0].to_text_lossy();
+    let unix_ms = if args.len() == 1 {
+        ctx.effective_timestamp_ms()
+    } else {
+        let Some(ms) = parse_time_value_to_unix_ms(&args[1], &args[2..], ctx) else {
+            return Ok(Value::Null);
+        };
+        ms
+    };
+    let (y, m, d, hh, mm, ss) = utc_ymdhms_from_unix_ms(unix_ms);
+    let ms_rem = unix_ms.rem_euclid(1_000) as u32;
+    let total_secs = unix_ms.div_euclid(1_000);
+    let days = total_secs.div_euclid(86_400);
+    let dow = (days + 4).rem_euclid(7); // 1970-01-01 was Thursday (4); Sunday = 0
+    let jan1_days = days_from_civil(i64::from(y), 1, 1);
+    let doy_1_based = (days - jan1_days) + 1;
+    let jd = (unix_ms as f64) / 86_400_000.0 + 2_440_587.5;
+
+    let mut out = String::with_capacity(fmt.len() + 16);
+    let mut chars = fmt.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        let Some(spec) = chars.next() else {
+            break;
+        };
+        match spec {
+            '%' => out.push('%'),
+            'Y' => out.push_str(&format!("{y:04}")),
+            'm' => out.push_str(&format!("{m:02}")),
+            'd' => out.push_str(&format!("{d:02}")),
+            'e' => out.push_str(&format!("{d:2}")),
+            'H' => out.push_str(&format!("{hh:02}")),
+            'I' => {
+                let h12 = match hh % 12 {
+                    0 => 12,
+                    v => v,
+                };
+                out.push_str(&format!("{h12:02}"));
+            }
+            'M' => out.push_str(&format!("{mm:02}")),
+            'S' => out.push_str(&format!("{ss:02}")),
+            'f' => out.push_str(&format!("{ss:02}.{ms_rem:03}")),
+            'F' => out.push_str(&format!("{y:04}-{m:02}-{d:02}")),
+            'T' => out.push_str(&format!("{hh:02}:{mm:02}:{ss:02}")),
+            'R' => out.push_str(&format!("{hh:02}:{mm:02}")),
+            'j' => out.push_str(&format!("{doy_1_based:03}")),
+            'J' => out.push_str(&format!("{jd:.9}")),
+            's' => out.push_str(&format!("{total_secs}")),
+            'w' => out.push_str(&format!("{dow}")),
+            'u' => out.push_str(&format!("{}", if dow == 0 { 7 } else { dow })),
+            'P' => out.push_str(if hh < 12 { "am" } else { "pm" }),
+            'p' => out.push_str(if hh < 12 { "AM" } else { "PM" }),
+            _ => {
+                // Unknown specifier evaluates to NULL in SQLite `strftime`
+                return Ok(Value::Null);
+            }
+        }
+    }
+    Ok(Value::Text(out))
 }
 
 pub fn parse_escape_char(s: &str) -> Result<char> {

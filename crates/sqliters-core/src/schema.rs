@@ -133,7 +133,8 @@ impl TableSchema {
 
 #[derive(Debug, Clone)]
 pub struct IndexedColSchema {
-    pub col_idx: usize,
+    pub col_idx: Option<usize>,
+    pub expr: Option<Expr>,
     pub name: String,
     pub sort_order: KeySortOrder,
 }
@@ -506,7 +507,8 @@ pub fn build_table_schema_from_ast(
                     conflict: pk_conflict,
                     origin: "pk",
                     columns: vec![IndexedColSchema {
-                        col_idx,
+                        col_idx: Some(col_idx),
+                        expr: None,
                         name: cdef.name.clone(),
                         sort_order: KeySortOrder {
                             desc: pk_desc,
@@ -526,7 +528,8 @@ pub fn build_table_schema_from_ast(
                 conflict: u_conflict,
                 origin: "u",
                 columns: vec![IndexedColSchema {
-                    col_idx,
+                    col_idx: Some(col_idx),
+                    expr: None,
                     name: cdef.name.clone(),
                     sort_order: KeySortOrder {
                         desc: false,
@@ -552,22 +555,25 @@ pub fn build_table_schema_from_ast(
                     ));
                 }
                 has_pk = true;
-                let resolved = resolve_indexed_columns(&columns, pk_cols)?;
+                let resolved = resolve_indexed_columns(&columns, pk_cols, false)?;
                 for (ord, ic) in resolved.iter().enumerate() {
-                    columns[ic.col_idx].is_primary_key = true;
-                    columns[ic.col_idx].pk_order = ord + 1;
+                    if let Some(ci) = ic.col_idx {
+                        columns[ci].is_primary_key = true;
+                        columns[ci].pk_order = ord + 1;
+                    }
                 }
 
                 // Single-column `PRIMARY KEY(col)` (ASC) on a column declared `INTEGER` is also a rowid alias!
                 if !ct.without_rowid
                     && resolved.len() == 1
                     && !resolved[0].sort_order.desc
-                    && columns[resolved[0].col_idx]
+                    && let Some(pk_ci) = resolved[0].col_idx
+                    && columns[pk_ci]
                         .type_name
                         .trim()
                         .eq_ignore_ascii_case("INTEGER")
                 {
-                    rowid_alias_col = Some(resolved[0].col_idx);
+                    rowid_alias_col = Some(pk_ci);
                     rowid_pk_conflict = *conflict;
                 } else {
                     let idx_num = inline_autos.len() + 1;
@@ -584,7 +590,7 @@ pub fn build_table_schema_from_ast(
                 columns: u_cols,
                 conflict,
             } => {
-                let resolved = resolve_indexed_columns(&columns, u_cols)?;
+                let resolved = resolve_indexed_columns(&columns, u_cols, false)?;
                 let idx_num = inline_autos.len() + 1;
                 inline_autos.push(PendingAutoIndex {
                     name: format!("sqlite_autoindex_{}_{}", ct.name, idx_num),
@@ -669,7 +675,7 @@ pub fn build_index_schema_from_ast(
     tbl: &TableSchema,
     root_pgno: Pgno,
 ) -> Result<IndexSchema> {
-    let resolved = resolve_indexed_columns(&tbl.columns, &ci.columns)?;
+    let resolved = resolve_indexed_columns(&tbl.columns, &ci.columns, true)?;
     Ok(IndexSchema {
         schema_rowid: 0,
         name: ci.name.clone(),
@@ -742,9 +748,40 @@ pub fn build_column_schema_from_def(cdef: &ColumnDef) -> Result<ColumnSchema> {
 fn resolve_indexed_columns(
     table_cols: &[ColumnSchema],
     idx_cols: &[IndexedColumn],
+    allow_expr: bool,
 ) -> Result<Vec<IndexedColSchema>> {
     let mut out = Vec::with_capacity(idx_cols.len());
     for ic in idx_cols {
+        if let Some(ref e) = ic.expr {
+            if !allow_expr {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    "expressions prohibited in PRIMARY KEY and UNIQUE constraints",
+                ));
+            }
+            let collation = match &ic.collation {
+                Some(cname) => Collation::from_name(cname).ok_or_else(|| {
+                    SqliteError::new(
+                        ErrorCode::Error,
+                        format!("no such collation sequence: {cname}"),
+                    )
+                })?,
+                None => Collation::Binary,
+            };
+            let desc = ic.desc;
+            let nulls_last = ic.nulls_last.unwrap_or(desc);
+            out.push(IndexedColSchema {
+                col_idx: None,
+                expr: Some(e.clone()),
+                name: crate::compiler::expr_column_label(e),
+                sort_order: KeySortOrder {
+                    desc,
+                    nulls_last,
+                    collation,
+                },
+            });
+            continue;
+        }
         let Some((col_idx, col_schema)) = table_cols
             .iter()
             .enumerate()
@@ -767,7 +804,8 @@ fn resolve_indexed_columns(
         let desc = ic.desc;
         let nulls_last = ic.nulls_last.unwrap_or(desc);
         out.push(IndexedColSchema {
-            col_idx,
+            col_idx: Some(col_idx),
+            expr: None,
             name: col_schema.name.clone(),
             sort_order: KeySortOrder {
                 desc,

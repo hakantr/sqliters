@@ -150,6 +150,10 @@ enum Node {
         index: Option<usize>,
         inner: Box<Node>,
     },
+    GroupEnd {
+        index: Option<usize>,
+        start_pos: usize,
+    },
     Literal(char),
     Any,
     AnchorStart,
@@ -320,22 +324,35 @@ impl Regex {
                 None
             }
             Node::Group { index, inner } => {
-                // Match inner, record group span, then match tail (with backtracking if inner has choices)
                 let saved = groups.clone();
-                let mut candidates = Vec::new();
-                self.collect_ends(inner, chars, pos, groups, &mut candidates);
-                for (end_inner, grp_state) in candidates {
-                    *groups = grp_state;
-                    if let Some(idx) = *index {
-                        if idx < groups.len() {
-                            groups[idx] = Some((pos, end_inner));
-                        }
-                    }
-                    if let Some(final_end) = self.match_seq(tail, chars, end_inner, groups) {
-                        return Some(final_end);
-                    }
+                let mut combined = Vec::with_capacity(2 + tail.len());
+                combined.push((**inner).clone());
+                combined.push(Node::GroupEnd {
+                    index: *index,
+                    start_pos: pos,
+                });
+                combined.extend_from_slice(tail);
+                if let Some(final_end) = self.match_seq(&combined, chars, pos, groups) {
+                    return Some(final_end);
                 }
                 *groups = saved;
+                None
+            }
+            Node::GroupEnd { index, start_pos } => {
+                let prev = index.and_then(|idx| groups.get(idx).copied().flatten());
+                if let Some(idx) = *index
+                    && idx < groups.len()
+                {
+                    groups[idx] = Some((*start_pos, pos));
+                }
+                if let Some(final_end) = self.match_seq(tail, chars, pos, groups) {
+                    return Some(final_end);
+                }
+                if let Some(idx) = *index
+                    && idx < groups.len()
+                {
+                    groups[idx] = prev;
+                }
                 None
             }
             Node::Repeat {

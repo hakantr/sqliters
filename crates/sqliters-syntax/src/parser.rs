@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use sqliters_types::{Result, SQLITE_MAX_EXPR_DEPTH, SqliteError};
+use sqliters_types::{ErrorCode, Result, SQLITE_MAX_EXPR_DEPTH, SqliteError};
 
 use crate::ast::*;
 use crate::token::{
@@ -290,12 +290,27 @@ impl<'a> Parser<'a> {
             TokenKind::Create => self.parse_create(start_tok.offset),
             TokenKind::Drop => self.parse_drop(),
             TokenKind::Alter => self.parse_alter(),
-            TokenKind::Insert | TokenKind::Replace => self.parse_insert(),
-            TokenKind::Select | TokenKind::Values | TokenKind::With => {
-                Ok(Stmt::Select(self.parse_select_stmt()?))
+            TokenKind::Insert | TokenKind::Replace => self.parse_insert(Vec::new()),
+            TokenKind::Select | TokenKind::Values => {
+                Ok(Stmt::Select(self.parse_select_after_with(Vec::new())?))
             }
-            TokenKind::Update => Ok(Stmt::Update(self.parse_update()?)),
-            TokenKind::Delete => Ok(Stmt::Delete(self.parse_delete()?)),
+            TokenKind::With => {
+                let ctes = self.parse_with_clause()?;
+                match self.peek().kind {
+                    TokenKind::Select | TokenKind::Values => {
+                        Ok(Stmt::Select(self.parse_select_after_with(ctes)?))
+                    }
+                    TokenKind::Insert | TokenKind::Replace => self.parse_insert(ctes),
+                    TokenKind::Update => Ok(Stmt::Update(self.parse_update(ctes)?)),
+                    TokenKind::Delete => Ok(Stmt::Delete(self.parse_delete(ctes)?)),
+                    _ => {
+                        let tok = self.peek();
+                        Err(self.syntax_err_at(tok, format!("near \"{}\": syntax error", tok.text)))
+                    }
+                }
+            }
+            TokenKind::Update => Ok(Stmt::Update(self.parse_update(Vec::new())?)),
+            TokenKind::Delete => Ok(Stmt::Delete(self.parse_delete(Vec::new())?)),
             TokenKind::Pragma => self.parse_pragma(),
             TokenKind::Vacuum => {
                 self.advance();
@@ -313,6 +328,16 @@ impl<'a> Parser<'a> {
                     None
                 };
                 Ok(Stmt::Analyze(target))
+            }
+            TokenKind::Reindex => {
+                self.advance();
+                let target = if !self.at(TokenKind::Semi) && !self.at(TokenKind::Eof) {
+                    let (_, name) = self.parse_qualified_name()?;
+                    Some(name)
+                } else {
+                    None
+                };
+                Ok(Stmt::Reindex(target))
             }
             _ => Err(self.syntax_err_at(
                 start_tok,
@@ -749,11 +774,21 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_indexed_column(&mut self) -> Result<IndexedColumn> {
-        let name = self.parse_ident()?;
-        let collation = if self.eat(TokenKind::Collate) {
-            Some(self.parse_ident()?)
-        } else {
-            None
+        let mut raw_expr = self.parse_expr()?;
+        let mut collation = None;
+        while let Expr::Collate { expr, collation: c } = raw_expr {
+            collation = Some(c);
+            raw_expr = *expr;
+        }
+        if self.eat(TokenKind::Collate) {
+            collation = Some(self.parse_ident()?);
+        }
+        let (name, expr) = match raw_expr {
+            Expr::Column {
+                table: None,
+                column,
+            } => (column, None),
+            other => (String::new(), Some(other)),
         };
         let mut desc = false;
         if self.eat(TokenKind::Asc) {
@@ -773,6 +808,7 @@ impl<'a> Parser<'a> {
         };
         Ok(IndexedColumn {
             name,
+            expr,
             collation,
             desc,
             nulls_last,
@@ -839,7 +875,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_insert(&mut self) -> Result<Stmt> {
+    fn parse_insert(&mut self, ctes: Vec<CommonTableExpr>) -> Result<Stmt> {
         let or_conflict = if self.eat(TokenKind::Replace) {
             Some(ConflictAction::Replace)
         } else {
@@ -888,12 +924,32 @@ impl<'a> Parser<'a> {
                     | TokenKind::Order
                     | TokenKind::Limit
             ) {
+                let mut order_by = self.parse_optional_order_by()?;
+                let mut limit = self.parse_optional_limit()?;
                 let mut compounds = Vec::new();
                 while let Some(op) = self.eat_compound_op() {
+                    if !order_by.is_empty() {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!(
+                                "ORDER BY clause should come after {} not before",
+                                op.as_sql_str()
+                            ),
+                        ));
+                    }
+                    if limit.is_some() {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!(
+                                "LIMIT clause should come after {} not before",
+                                op.as_sql_str()
+                            ),
+                        ));
+                    }
                     compounds.push((op, self.parse_select_core()?));
+                    order_by = self.parse_optional_order_by()?;
+                    limit = self.parse_optional_limit()?;
                 }
-                let order_by = self.parse_optional_order_by()?;
-                let limit = self.parse_optional_limit()?;
                 InsertSource::Select(Box::new(SelectStmt {
                     ctes: Vec::new(),
                     body: SelectBody {
@@ -912,6 +968,7 @@ impl<'a> Parser<'a> {
 
         let returning = self.parse_optional_returning()?;
         Ok(Stmt::Insert(InsertStmt {
+            ctes,
             or_conflict,
             table,
             columns,
@@ -940,7 +997,7 @@ impl<'a> Parser<'a> {
         Ok(rows)
     }
 
-    fn parse_update(&mut self) -> Result<UpdateStmt> {
+    fn parse_update(&mut self, ctes: Vec<CommonTableExpr>) -> Result<UpdateStmt> {
         self.expect(TokenKind::Update)?;
         let or_conflict = if self.eat(TokenKind::Or) {
             Some(self.parse_conflict_action()?)
@@ -970,6 +1027,7 @@ impl<'a> Parser<'a> {
         let returning = self.parse_optional_returning()?;
 
         Ok(UpdateStmt {
+            ctes,
             or_conflict,
             table,
             alias,
@@ -979,7 +1037,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_delete(&mut self) -> Result<DeleteStmt> {
+    fn parse_delete(&mut self, ctes: Vec<CommonTableExpr>) -> Result<DeleteStmt> {
         self.expect(TokenKind::Delete)?;
         self.expect(TokenKind::From)?;
         let (_schema, table) = self.parse_qualified_name()?;
@@ -991,6 +1049,7 @@ impl<'a> Parser<'a> {
         };
         let returning = self.parse_optional_returning()?;
         Ok(DeleteStmt {
+            ctes,
             table,
             alias,
             selection,
@@ -1059,23 +1118,19 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(PragmaValue::Integer(0))
             }
-            TokenKind::On => {
+            TokenKind::QuotedId | TokenKind::Id => {
                 self.advance();
-                Ok(PragmaValue::Ident("ON".into()))
+                Ok(PragmaValue::Ident(dequote(tok.text)))
             }
-            TokenKind::Delete => {
+            _ if tok
+                .text
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_') =>
+            {
                 self.advance();
-                Ok(PragmaValue::Ident("DELETE".into()))
+                Ok(PragmaValue::Ident(dequote(tok.text)))
             }
-            TokenKind::Default => {
-                self.advance();
-                Ok(PragmaValue::Ident("DEFAULT".into()))
-            }
-            TokenKind::Null => {
-                self.advance();
-                Ok(PragmaValue::Ident("NULL".into()))
-            }
-            k if Self::can_be_ident(k) => Ok(PragmaValue::Ident(self.parse_ident()?)),
             _ => Err(self.syntax_err_at(tok, "invalid PRAGMA value")),
         }
     }
@@ -1084,55 +1139,92 @@ impl<'a> Parser<'a> {
     // SELECT & Clauses
     // ========================================================================
 
-    fn parse_select_stmt(&mut self) -> Result<SelectStmt> {
-        let mut ctes = Vec::new();
-        if self.eat(TokenKind::With) {
-            let _ = self.eat(TokenKind::Recursive);
-            loop {
-                let name = self.parse_ident()?;
-                let columns = if self.eat(TokenKind::Lp) {
-                    let mut cols = Vec::new();
-                    loop {
-                        cols.push(self.parse_ident()?);
-                        if !self.eat(TokenKind::Comma) {
-                            break;
-                        }
-                    }
-                    self.expect(TokenKind::Rp)?;
-                    Some(cols)
-                } else {
-                    None
-                };
-                self.expect(TokenKind::As)?;
-                if Self::can_be_ident(self.peek().kind) {
-                    // Optional MATERIALIZED / NOT MATERIALIZED
-                    let _ = self.eat(TokenKind::Not);
-                    if self.peek().text.eq_ignore_ascii_case("MATERIALIZED") {
-                        self.advance();
+    fn parse_with_clause(&mut self) -> Result<Vec<CommonTableExpr>> {
+        self.expect(TokenKind::With)?;
+        let _ = self.eat(TokenKind::Recursive);
+        let mut ctes: Vec<CommonTableExpr> = Vec::new();
+        loop {
+            let name = self.parse_ident()?;
+            if ctes.iter().any(|c| c.name.eq_ignore_ascii_case(&name)) {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("duplicate WITH table name: {name}"),
+                ));
+            }
+            let columns = if self.eat(TokenKind::Lp) {
+                let mut cols = Vec::new();
+                loop {
+                    cols.push(self.parse_ident()?);
+                    if !self.eat(TokenKind::Comma) {
+                        break;
                     }
                 }
-                self.expect(TokenKind::Lp)?;
-                let query = self.parse_select_stmt()?;
                 self.expect(TokenKind::Rp)?;
-                ctes.push(CommonTableExpr {
-                    name,
-                    columns,
-                    query,
-                });
-                if !self.eat(TokenKind::Comma) {
-                    break;
+                Some(cols)
+            } else {
+                None
+            };
+            self.expect(TokenKind::As)?;
+            if self.at(TokenKind::Not) || Self::can_be_ident(self.peek().kind) {
+                // Optional MATERIALIZED / NOT MATERIALIZED
+                let _ = self.eat(TokenKind::Not);
+                if self.peek().text.eq_ignore_ascii_case("MATERIALIZED") {
+                    self.advance();
                 }
             }
+            self.expect(TokenKind::Lp)?;
+            let query = self.parse_select_stmt()?;
+            self.expect(TokenKind::Rp)?;
+            ctes.push(CommonTableExpr {
+                name,
+                columns,
+                query,
+            });
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
         }
+        Ok(ctes)
+    }
 
+    fn parse_select_stmt(&mut self) -> Result<SelectStmt> {
+        let ctes = if self.at(TokenKind::With) {
+            self.parse_with_clause()?
+        } else {
+            Vec::new()
+        };
+        self.parse_select_after_with(ctes)
+    }
+
+    fn parse_select_after_with(&mut self, ctes: Vec<CommonTableExpr>) -> Result<SelectStmt> {
         let head = self.parse_select_core()?;
+        let mut order_by = self.parse_optional_order_by()?;
+        let mut limit = self.parse_optional_limit()?;
         let mut compounds = Vec::new();
         while let Some(op) = self.eat_compound_op() {
+            if !order_by.is_empty() {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!(
+                        "ORDER BY clause should come after {} not before",
+                        op.as_sql_str()
+                    ),
+                ));
+            }
+            if limit.is_some() {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!(
+                        "LIMIT clause should come after {} not before",
+                        op.as_sql_str()
+                    ),
+                ));
+            }
             let rhs = self.parse_select_core()?;
             compounds.push((op, rhs));
+            order_by = self.parse_optional_order_by()?;
+            limit = self.parse_optional_limit()?;
         }
-        let order_by = self.parse_optional_order_by()?;
-        let limit = self.parse_optional_limit()?;
 
         Ok(SelectStmt {
             ctes,
@@ -1463,12 +1555,21 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
-            // Postfix ISNULL / NOTNULL
+            // Postfix ISNULL / NOTNULL / two-token `NOT NULL`
             if (tok.kind == TokenKind::IsNull || tok.kind == TokenKind::NotNull) && 7 >= min_bp {
                 self.advance();
                 lhs = Expr::IsNull {
                     expr: Box::new(lhs),
                     negated: tok.kind == TokenKind::NotNull,
+                };
+                continue;
+            }
+            if tok.kind == TokenKind::Not && self.peek_n(1).kind == TokenKind::Null && 7 >= min_bp {
+                self.advance();
+                self.advance();
+                lhs = Expr::IsNull {
+                    expr: Box::new(lhs),
+                    negated: true,
                 };
                 continue;
             }
@@ -1535,36 +1636,67 @@ impl<'a> Parser<'a> {
                         };
                     }
                     TokenKind::In => {
-                        self.expect(TokenKind::Lp)?;
-                        if self.eat(TokenKind::Rp) {
-                            lhs = Expr::InList {
-                                expr: Box::new(lhs),
-                                list: Vec::new(),
-                                negated,
+                        if self.eat(TokenKind::Lp) {
+                            if self.eat(TokenKind::Rp) {
+                                lhs = Expr::InList {
+                                    expr: Box::new(lhs),
+                                    list: Vec::new(),
+                                    negated,
+                                };
+                            } else if matches!(
+                                self.peek().kind,
+                                TokenKind::Select | TokenKind::Values | TokenKind::With
+                            ) {
+                                let subq = self.parse_select_stmt()?;
+                                self.expect(TokenKind::Rp)?;
+                                lhs = Expr::InSubquery {
+                                    expr: Box::new(lhs),
+                                    subquery: Box::new(subq),
+                                    negated,
+                                };
+                            } else {
+                                let mut list = Vec::new();
+                                loop {
+                                    list.push(self.parse_expr()?);
+                                    if !self.eat(TokenKind::Comma) {
+                                        break;
+                                    }
+                                }
+                                self.expect(TokenKind::Rp)?;
+                                lhs = Expr::InList {
+                                    expr: Box::new(lhs),
+                                    list,
+                                    negated,
+                                };
+                            }
+                        } else {
+                            // SQLite `expr [NOT] IN [schema.]table_name`
+                            let (_schema, tbl_name) = self.parse_qualified_name()?;
+                            let subq = SelectStmt {
+                                ctes: Vec::new(),
+                                body: SelectBody {
+                                    head: SelectCore::Select {
+                                        distinct: false,
+                                        projection: vec![ResultColumn::Star],
+                                        from: Some(FromClause {
+                                            head: TableOrSubquery::Table {
+                                                name: tbl_name,
+                                                alias: None,
+                                            },
+                                            joins: Vec::new(),
+                                        }),
+                                        selection: None,
+                                        group_by: Vec::new(),
+                                        having: None,
+                                    },
+                                    compounds: Vec::new(),
+                                },
+                                order_by: Vec::new(),
+                                limit: None,
                             };
-                        } else if matches!(
-                            self.peek().kind,
-                            TokenKind::Select | TokenKind::Values | TokenKind::With
-                        ) {
-                            let subq = self.parse_select_stmt()?;
-                            self.expect(TokenKind::Rp)?;
                             lhs = Expr::InSubquery {
                                 expr: Box::new(lhs),
                                 subquery: Box::new(subq),
-                                negated,
-                            };
-                        } else {
-                            let mut list = Vec::new();
-                            loop {
-                                list.push(self.parse_expr()?);
-                                if !self.eat(TokenKind::Comma) {
-                                    break;
-                                }
-                            }
-                            self.expect(TokenKind::Rp)?;
-                            lhs = Expr::InList {
-                                expr: Box::new(lhs),
-                                list,
                                 negated,
                             };
                         }
@@ -1819,9 +1951,20 @@ impl<'a> Parser<'a> {
                     self.expect(TokenKind::Rp)?;
                     return Ok(Expr::Subquery(Box::new(subq)));
                 }
-                let inner = self.parse_expr()?;
+                let first = self.parse_expr()?;
+                if self.eat(TokenKind::Comma) {
+                    let mut elems = vec![first];
+                    loop {
+                        elems.push(self.parse_expr()?);
+                        if !self.eat(TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(TokenKind::Rp)?;
+                    return Ok(Expr::RowValue(elems));
+                }
                 self.expect(TokenKind::Rp)?;
-                Ok(inner)
+                Ok(first)
             }
             k if Self::can_be_ident(k) => {
                 let first = self.parse_ident()?;
@@ -1871,8 +2014,13 @@ impl<'a> Parser<'a> {
                     let second = self.parse_ident()?;
                     if self.eat(TokenKind::Dot) {
                         let third = self.parse_ident()?;
+                        let tbl_qual = if first.eq_ignore_ascii_case("main") {
+                            second
+                        } else {
+                            format!("{first}.{second}")
+                        };
                         return Ok(Expr::Column {
-                            table: Some(second),
+                            table: Some(tbl_qual),
                             column: third,
                         });
                     }

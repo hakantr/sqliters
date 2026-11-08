@@ -40,6 +40,7 @@ pub enum Stmt {
     },
     Vacuum,
     Analyze(Option<String>),
+    Reindex(Option<String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -152,6 +153,7 @@ pub enum TableConstraint {
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexedColumn {
     pub name: String,
+    pub expr: Option<Expr>,
     pub collation: Option<String>,
     pub desc: bool,
     pub nulls_last: Option<bool>,
@@ -177,6 +179,7 @@ pub enum AlterTableAction {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct InsertStmt {
+    pub ctes: Vec<CommonTableExpr>,
     pub or_conflict: Option<ConflictAction>,
     pub table: String,
     pub columns: Option<Vec<String>>,
@@ -193,6 +196,7 @@ pub enum InsertSource {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateStmt {
+    pub ctes: Vec<CommonTableExpr>,
     pub or_conflict: Option<ConflictAction>,
     pub table: String,
     pub alias: Option<String>,
@@ -203,6 +207,7 @@ pub struct UpdateStmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeleteStmt {
+    pub ctes: Vec<CommonTableExpr>,
     pub table: String,
     pub alias: Option<String>,
     pub selection: Option<Expr>,
@@ -247,6 +252,17 @@ pub enum CompoundOp {
     UnionAll,
     Intersect,
     Except,
+}
+
+impl CompoundOp {
+    pub const fn as_sql_str(self) -> &'static str {
+        match self {
+            Self::Union => "UNION",
+            Self::UnionAll => "UNION ALL",
+            Self::Intersect => "INTERSECT",
+            Self::Except => "EXCEPT",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -455,6 +471,7 @@ pub enum Expr {
         subquery: Box<SelectStmt>,
         negated: bool,
     },
+    RowValue(Vec<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -92,8 +92,11 @@ pub fn choose_access_plan(
         }
         let mut prefix_exprs = Vec::new();
         for ic in &idx.columns {
+            let Some(ci) = ic.col_idx else {
+                break;
+            };
             // Only use equality seek if index column collation matches default/column collation
-            let tbl_col_coll = tbl.columns[ic.col_idx].collation;
+            let tbl_col_coll = tbl.columns[ci].collation;
             if ic.sort_order.collation != tbl_col_coll {
                 break;
             }
@@ -248,6 +251,7 @@ pub fn expr_is_table_independent(expr: &Expr) -> bool {
                     .all(|(w, t)| expr_is_table_independent(w) && expr_is_table_independent(t))
                 && else_expr.as_deref().is_none_or(expr_is_table_independent)
         }
+        Expr::RowValue(elems) => elems.iter().all(expr_is_table_independent),
         Expr::FunctionCall {
             name, args, filter, ..
         } => {
@@ -272,6 +276,8 @@ pub fn expr_contains_aggregate(expr: &Expr) -> bool {
                     let upper = name.to_ascii_uppercase();
                     if (upper == "MIN" || upper == "MAX") && es.len() != 1 {
                         false
+                    } else if upper == "COUNT" && es.is_empty() {
+                        true
                     } else {
                         AggregateKind::from_name(name, false).is_some()
                     }
@@ -323,6 +329,7 @@ pub fn expr_contains_aggregate(expr: &Expr) -> bool {
                     .any(|(w, t)| expr_contains_aggregate(w) || expr_contains_aggregate(t))
                 || else_expr.as_deref().is_some_and(expr_contains_aggregate)
         }
+        Expr::RowValue(elems) => elems.iter().any(expr_contains_aggregate),
         _ => false,
     }
 }
@@ -330,6 +337,7 @@ pub fn expr_contains_aggregate(expr: &Expr) -> bool {
 pub fn expr_contains_subquery(expr: &Expr) -> bool {
     match expr {
         Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => true,
+        Expr::RowValue(_) => true, // Force relational engine evaluation for row-value tuples
         Expr::Unary { expr, .. }
         | Expr::Collate { expr, .. }
         | Expr::IsNull { expr, .. }
@@ -773,7 +781,9 @@ fn compile_single_table_select(
             for (i, ke) in prefix_exprs.iter().enumerate() {
                 let r = key_base + i as i32;
                 compile_expr(&mut prog, ke, None, r)?;
-                let col_aff = tbl.columns[index.columns[i].col_idx].affinity;
+                let col_aff = index.columns[i]
+                    .col_idx
+                    .map_or(sqliters_types::TypeAffinity::Blob, |ci| tbl.columns[ci].affinity);
                 prog.emit(
                     Instruction::new(Opcode::Affinity, r, 1, 0).with_p4(P4::Affinity(vec![col_aff])),
                 );
@@ -1352,7 +1362,7 @@ fn compile_expr(
                 }),
             );
         }
-        Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
+        Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::RowValue(_) => {
             return Err(SqliteError::misuse("subquery must be evaluated by relational engine"));
         }
     }

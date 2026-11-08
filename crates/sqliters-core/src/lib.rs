@@ -112,6 +112,8 @@ pub struct Connection {
     explicit_tx: bool,
     implicit_savepoint_tx: bool,
     foreign_keys: bool,
+    count_changes: bool,
+    rollback_count: u64,
     deferred_fk_suspects: Vec<(String, i64, usize)>,
 }
 
@@ -163,6 +165,8 @@ impl Connection {
             explicit_tx: false,
             implicit_savepoint_tx: false,
             foreign_keys: false,
+            count_changes: false,
+            rollback_count: 0,
             deferred_fk_suspects: Vec::new(),
         })
     }
@@ -268,6 +272,12 @@ impl Connection {
         !self.explicit_tx && !self.implicit_savepoint_tx
     }
 
+    /// Monotonic counter incremented on every transaction-level `ROLLBACK` (`sqlite3RollbackAll`).
+    #[inline]
+    pub const fn rollback_count(&self) -> u64 {
+        self.rollback_count
+    }
+
     #[inline]
     pub const fn is_readonly(&self) -> bool {
         self.btree.pager().is_readonly()
@@ -312,6 +322,8 @@ impl Connection {
                 explicit_tx: &mut self.explicit_tx,
                 implicit_savepoint_tx: &mut self.implicit_savepoint_tx,
                 foreign_keys: &mut self.foreign_keys,
+                count_changes: &mut self.count_changes,
+                rollback_count: &mut self.rollback_count,
                 deferred_fk_suspects: &mut self.deferred_fk_suspects,
             };
             engine::execute_statement(&mut ctx, stmt, params)
@@ -822,6 +834,9 @@ fn collect_stmt_params(
         Stmt::Explain { stmt: inner, .. } => collect_stmt_params(inner, max_idx, named),
         Stmt::Select(sel) => collect_select_params(sel, max_idx, named),
         Stmt::Insert(ins) => {
+            for cte in &ins.ctes {
+                collect_select_params(&cte.query, max_idx, named);
+            }
             match &ins.source {
                 InsertSource::Values(rows) => {
                     for r in rows {
@@ -840,6 +855,9 @@ fn collect_stmt_params(
             }
         }
         Stmt::Update(upd) => {
+            for cte in &upd.ctes {
+                collect_select_params(&cte.query, max_idx, named);
+            }
             for (_, e) in &upd.assignments {
                 collect_expr_params(e, max_idx, named);
             }
@@ -853,6 +871,9 @@ fn collect_stmt_params(
             }
         }
         Stmt::Delete(del) => {
+            for cte in &del.ctes {
+                collect_select_params(&cte.query, max_idx, named);
+            }
             if let Some(w) = &del.selection {
                 collect_expr_params(w, max_idx, named);
             }
@@ -1023,6 +1044,11 @@ fn collect_expr_params(
         }
         Expr::Subquery(sub) | Expr::Exists { subquery: sub, .. } => {
             collect_select_params(sub, max_idx, named);
+        }
+        Expr::RowValue(elems) => {
+            for e in elems {
+                collect_expr_params(e, max_idx, named);
+            }
         }
         _ => {}
     }

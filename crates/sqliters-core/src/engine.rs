@@ -1,15 +1,15 @@
 //! Relational SQL query engine, DML/DDL executor, constraint & index manager, `VACUUM`, and `PRAGMA`s.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use sqliters_btree::Btree;
 use sqliters_pager::TransactionState;
 use sqliters_syntax::{
-    AlterTableAction, BinaryOp, BindParam, CompoundOp, ConflictAction, CreateIndexStmt,
-    CreateTableStmt, CurrentTimeKind, DeleteStmt, Expr, FkAction, FromClause, FunctionArgs,
-    InsertSource, InsertStmt, JoinClause, JoinConstraint, JoinType, LikeOp, LimitClause,
-    OrderByTerm, PragmaValue, ResultColumn, SelectBody, SelectCore, SelectStmt, Stmt,
+    AlterTableAction, BinaryOp, BindParam, CommonTableExpr, CompoundOp, ConflictAction,
+    CreateIndexStmt, CreateTableStmt, CurrentTimeKind, DeleteStmt, Expr, FkAction, FromClause,
+    FunctionArgs, InsertSource, InsertStmt, JoinClause, JoinConstraint, JoinType, LikeOp,
+    LimitClause, OrderByTerm, PragmaValue, ResultColumn, SelectBody, SelectCore, SelectStmt, Stmt,
     TableOrSubquery, Token, TokenKind, UnaryOp, UpdateStmt, dequote, keyword_kind, parse_one,
     tokenize,
 };
@@ -19,7 +19,7 @@ use sqliters_types::{
     extended,
 };
 use sqliters_vdbe::{
-    AggregateAccumulator, AggregateKind, Opcode, VmRuntimeContext, eval_cast,
+    AggregateAccumulator, AggregateKind, Opcode, VmRuntimeContext, eval_cast_with_encoding,
     eval_comparison_with_encoding, eval_scalar_function, format_utc_date, format_utc_time,
     format_utc_timestamp, parse_escape_char, sqlite_glob_match, sqlite_like_match,
 };
@@ -49,6 +49,8 @@ pub struct ExecContext<'a> {
     pub explicit_tx: &'a mut bool,
     pub implicit_savepoint_tx: &'a mut bool,
     pub foreign_keys: &'a mut bool,
+    pub count_changes: &'a mut bool,
+    pub rollback_count: &'a mut u64,
     pub deferred_fk_suspects: &'a mut Vec<(String, i64, usize)>,
 }
 
@@ -131,16 +133,43 @@ impl EvalRow {
 
 #[derive(Clone, Default)]
 struct CteStore {
-    tables: Vec<(String, QueryOutput)>,
+    /// Lexical stack of `WITH` scopes (`(scope_idx, cte_idx)`).
+    scopes: Vec<Vec<CommonTableExpr>>,
+    /// Active 1-row working tables during recursive CTE queue steps (`(scope_idx, cte_idx, QueryOutput)`).
+    working: Vec<(usize, usize, QueryOutput)>,
+    /// Active CTE evaluation chain `(scope_idx, cte_idx)` to detect circular references.
+    resolving: Vec<(usize, usize)>,
+    /// Optional outer row limit hint `(scope_idx, cte_idx, max_rows)` for unbounded recursive CTEs.
+    limit_hint: Option<(usize, usize, usize)>,
 }
 
 impl CteStore {
-    fn find(&self, name: &str) -> Option<&QueryOutput> {
-        self.tables
+    fn with_scope(&self, ctes: &[CommonTableExpr]) -> Self {
+        let mut next = self.clone();
+        if !ctes.is_empty() {
+            next.scopes.push(ctes.to_vec());
+        }
+        next.limit_hint = None;
+        next
+    }
+
+    fn locate(&self, name: &str) -> Option<(usize, usize)> {
+        for (s_idx, scope) in self.scopes.iter().enumerate().rev() {
+            for (c_idx, cte) in scope.iter().enumerate() {
+                if cte.name.eq_ignore_ascii_case(name) {
+                    return Some((s_idx, c_idx));
+                }
+            }
+        }
+        None
+    }
+
+    fn find_working(&self, s_idx: usize, c_idx: usize) -> Option<&QueryOutput> {
+        self.working
             .iter()
             .rev()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, q)| q)
+            .find(|(ws, wc, _)| *ws == s_idx && *wc == c_idx)
+            .map(|(_, _, q)| q)
     }
 }
 
@@ -234,6 +263,7 @@ pub fn execute_statement(
                     ));
                 }
                 ctx.btree.rollback()?;
+                *ctx.rollback_count += 1;
                 *ctx.explicit_tx = false;
                 *ctx.implicit_savepoint_tx = false;
                 ctx.deferred_fk_suspects.clear();
@@ -298,6 +328,10 @@ pub fn execute_statement(
         } => exec_pragma(ctx, name, value.as_ref()),
         Stmt::Vacuum => exec_vacuum(ctx),
         Stmt::Analyze(_) => Ok(QueryOutput::default()),
+        Stmt::Reindex(target) => run_write_autocommit(ctx, |ctx| {
+            exec_reindex(ctx, target.as_deref())?;
+            Ok(QueryOutput::default())
+        }),
     }
 }
 
@@ -389,6 +423,9 @@ where
             {
                 // SQLite `OR ROLLBACK` (or autocommit abort / SQLITE_FULL): roll back the entire transaction!
                 let _ = ctx.btree.rollback();
+                if !autocommit {
+                    *ctx.rollback_count += 1;
+                }
                 *ctx.explicit_tx = false;
                 *ctx.implicit_savepoint_tx = false;
                 ctx.deferred_fk_suspects.clear();
@@ -434,24 +471,42 @@ fn exec_select(
     outer_scopes: &[EvalRow],
     parent_ctes: &CteStore,
 ) -> Result<QueryOutput> {
-    let mut ctes = parent_ctes.clone();
-    for cte in &stmt.ctes {
-        let mut cte_out = exec_select(ctx, &cte.query, params, outer_scopes, &ctes)?;
-        if let Some(explicit_cols) = &cte.columns {
-            if explicit_cols.len() != cte_out.column_names.len() {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    format!(
-                        "table {} has {} values for {} columns",
-                        cte.name,
-                        cte_out.column_names.len(),
-                        explicit_cols.len()
-                    ),
-                ));
-            }
-            cte_out.column_names.clone_from(explicit_cols);
+    let mut ctes = parent_ctes.with_scope(&stmt.ctes);
+
+    // Propagate outer `LIMIT [OFFSET]` cap when `SELECT ... FROM <cte> LIMIT k` has no filtering/sorting/grouping,
+    // allowing unbounded recursive CTEs (`WITH i(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM i) SELECT x FROM i LIMIT 10`)
+    // to terminate immediately after `k` rows just like SQLite's co-routine generator.
+    if stmt.body.compounds.is_empty()
+        && stmt.order_by.is_empty()
+        && let Some(ref lim) = stmt.limit
+        && let SelectCore::Select {
+            distinct: false,
+            projection,
+            from: Some(fc),
+            selection: None,
+            group_by,
+            having: None,
+        } = &stmt.body.head
+        && group_by.is_empty()
+        && fc.joins.is_empty()
+        && !projection.iter().any(|rc| match rc {
+            ResultColumn::Expr { expr, .. } => expr_contains_aggregate(expr),
+            _ => false,
+        })
+        && let TableOrSubquery::Table { name, .. } = &fc.head
+        && let Some((s_idx, c_idx)) = ctes.locate(name)
+    {
+        let lim_val =
+            eval_expr(ctx, &lim.limit, params, outer_scopes, &ctes, None)?.to_integer_lossy();
+        if lim_val >= 0 {
+            let off_val = match &lim.offset {
+                Some(oe) => eval_expr(ctx, oe, params, outer_scopes, &ctes, None)?
+                    .to_integer_lossy()
+                    .max(0) as usize,
+                None => 0,
+            };
+            ctes.limit_hint = Some((s_idx, c_idx, off_val.saturating_add(lim_val as usize)));
         }
-        ctes.tables.push((cte.name.clone(), cte_out));
     }
 
     if stmt.body.compounds.is_empty() {
@@ -477,6 +532,553 @@ fn exec_select(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CteRecursionKind {
+    NonRecursive,
+    Recursive,
+    InvalidCircular,
+    MultipleRecursive,
+}
+
+fn count_table_refs_in_select(stmt: &SelectStmt, target: &str) -> usize {
+    if stmt
+        .ctes
+        .iter()
+        .any(|c| c.name.eq_ignore_ascii_case(target))
+    {
+        return 0;
+    }
+    let mut n = 0;
+    for cte in &stmt.ctes {
+        n += count_table_refs_in_select(&cte.query, target);
+    }
+    n += count_table_refs_in_core(&stmt.body.head, target);
+    for (_, rhs) in &stmt.body.compounds {
+        n += count_table_refs_in_core(rhs, target);
+    }
+    for ob in &stmt.order_by {
+        n += count_table_refs_in_expr(&ob.expr, target);
+    }
+    if let Some(ref lim) = stmt.limit {
+        n += count_table_refs_in_expr(&lim.limit, target);
+        if let Some(ref off) = lim.offset {
+            n += count_table_refs_in_expr(off, target);
+        }
+    }
+    n
+}
+
+fn count_table_refs_in_core(core: &SelectCore, target: &str) -> usize {
+    match core {
+        SelectCore::Values(rows) => rows
+            .iter()
+            .flat_map(|r| r.iter())
+            .map(|e| count_table_refs_in_expr(e, target))
+            .sum(),
+        SelectCore::Select {
+            projection,
+            from,
+            selection,
+            group_by,
+            having,
+            ..
+        } => {
+            let mut n = 0;
+            for rc in projection {
+                if let ResultColumn::Expr { expr, .. } = rc {
+                    n += count_table_refs_in_expr(expr, target);
+                }
+            }
+            if let Some(fc) = from {
+                n += count_table_refs_in_tos(&fc.head, target);
+                for j in &fc.joins {
+                    n += count_table_refs_in_tos(&j.right, target);
+                    if let Some(JoinConstraint::On(ref e)) = j.constraint {
+                        n += count_table_refs_in_expr(e, target);
+                    }
+                }
+            }
+            if let Some(w) = selection {
+                n += count_table_refs_in_expr(w, target);
+            }
+            for g in group_by {
+                n += count_table_refs_in_expr(g, target);
+            }
+            if let Some(h) = having {
+                n += count_table_refs_in_expr(h, target);
+            }
+            n
+        }
+    }
+}
+
+fn count_table_refs_in_tos(tos: &TableOrSubquery, target: &str) -> usize {
+    match tos {
+        TableOrSubquery::Table { name, .. } => usize::from(name.eq_ignore_ascii_case(target)),
+        TableOrSubquery::Subquery { query, .. } => count_table_refs_in_select(query, target),
+    }
+}
+
+fn count_table_refs_in_expr(expr: &Expr, target: &str) -> usize {
+    match expr {
+        Expr::Unary { expr: e, .. }
+        | Expr::Collate { expr: e, .. }
+        | Expr::IsNull { expr: e, .. }
+        | Expr::Cast { expr: e, .. } => count_table_refs_in_expr(e, target),
+        Expr::RowValue(es) => es.iter().map(|e| count_table_refs_in_expr(e, target)).sum(),
+        Expr::Binary { left, right, .. } => {
+            count_table_refs_in_expr(left, target) + count_table_refs_in_expr(right, target)
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            count_table_refs_in_expr(e, target)
+                + count_table_refs_in_expr(low, target)
+                + count_table_refs_in_expr(high, target)
+        }
+        Expr::InList { expr: e, list, .. } => {
+            count_table_refs_in_expr(e, target)
+                + list
+                    .iter()
+                    .map(|x| count_table_refs_in_expr(x, target))
+                    .sum::<usize>()
+        }
+        Expr::InSubquery {
+            expr: e, subquery, ..
+        } => count_table_refs_in_expr(e, target) + count_table_refs_in_select(subquery, target),
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            count_table_refs_in_expr(e, target)
+                + count_table_refs_in_expr(pattern, target)
+                + escape
+                    .as_ref()
+                    .map_or(0, |esc| count_table_refs_in_expr(esc, target))
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_ref()
+                .map_or(0, |o| count_table_refs_in_expr(o, target))
+                + branches
+                    .iter()
+                    .map(|(w, t)| {
+                        count_table_refs_in_expr(w, target) + count_table_refs_in_expr(t, target)
+                    })
+                    .sum::<usize>()
+                + else_expr
+                    .as_ref()
+                    .map_or(0, |el| count_table_refs_in_expr(el, target))
+        }
+        Expr::FunctionCall { args, filter, .. } => {
+            let a_cnt = match args {
+                FunctionArgs::Star => 0,
+                FunctionArgs::Exprs(es) => {
+                    es.iter().map(|e| count_table_refs_in_expr(e, target)).sum()
+                }
+            };
+            a_cnt
+                + filter
+                    .as_ref()
+                    .map_or(0, |f| count_table_refs_in_expr(f, target))
+        }
+        Expr::Subquery(sub) | Expr::Exists { subquery: sub, .. } => {
+            count_table_refs_in_select(sub, target)
+        }
+        _ => 0,
+    }
+}
+
+fn classify_cte_recursion(cte: &CommonTableExpr) -> CteRecursionKind {
+    let total_refs = count_table_refs_in_select(&cte.query, &cte.name);
+    if total_refs == 0 {
+        return CteRecursionKind::NonRecursive;
+    }
+    let Some((last_op, last_rhs)) = cte.query.body.compounds.last() else {
+        return CteRecursionKind::InvalidCircular;
+    };
+    if !matches!(last_op, CompoundOp::Union | CompoundOp::UnionAll) {
+        return CteRecursionKind::InvalidCircular;
+    }
+    // Initial arm(s) must not reference the CTE itself
+    let mut prefix_refs = count_table_refs_in_core(&cte.query.body.head, &cte.name);
+    for (_, mid_core) in &cte.query.body.compounds[..cte.query.body.compounds.len() - 1] {
+        prefix_refs += count_table_refs_in_core(mid_core, &cte.name);
+    }
+    if prefix_refs > 0 {
+        return CteRecursionKind::InvalidCircular;
+    }
+    let rhs_total = count_table_refs_in_core(last_rhs, &cte.name);
+    let mut direct_from_refs = 0usize;
+    if let SelectCore::Select {
+        from: Some(fc), ..
+    } = last_rhs
+    {
+        if matches!(&fc.head, TableOrSubquery::Table { name, .. } if name.eq_ignore_ascii_case(&cte.name))
+        {
+            direct_from_refs += 1;
+        }
+        for j in &fc.joins {
+            if matches!(&j.right, TableOrSubquery::Table { name, .. } if name.eq_ignore_ascii_case(&cte.name))
+            {
+                direct_from_refs += 1;
+            }
+        }
+    }
+    if direct_from_refs == 0 {
+        return CteRecursionKind::InvalidCircular;
+    }
+    if rhs_total > 1 {
+        return CteRecursionKind::MultipleRecursive;
+    }
+    CteRecursionKind::Recursive
+}
+
+fn resolve_cte(
+    ctx: &mut ExecContext<'_>,
+    ctes: &CteStore,
+    name: &str,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+) -> Result<Option<QueryOutput>> {
+    let Some((s_idx, c_idx)) = ctes.locate(name) else {
+        return Ok(None);
+    };
+    if let Some(working_out) = ctes.find_working(s_idx, c_idx) {
+        return Ok(Some(working_out.clone()));
+    }
+    let cte = ctes.scopes[s_idx][c_idx].clone();
+    if ctes.resolving.contains(&(s_idx, c_idx)) {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("circular reference: {}", cte.name),
+        ));
+    }
+
+    let outer_limit_opt = match ctes.limit_hint {
+        Some((hs, hc, max_rows)) if hs == s_idx && hc == c_idx => Some(max_rows),
+        _ => None,
+    };
+
+    let mut eval_ctes = CteStore {
+        scopes: ctes.scopes[..=s_idx].to_vec(),
+        working: ctes.working.clone(),
+        resolving: {
+            let mut r = ctes.resolving.clone();
+            r.push((s_idx, c_idx));
+            r
+        },
+        limit_hint: None,
+    };
+
+    let mut cte_out = match classify_cte_recursion(&cte) {
+        CteRecursionKind::NonRecursive => {
+            exec_select(ctx, &cte.query, params, outer_scopes, &eval_ctes)?
+        }
+        CteRecursionKind::InvalidCircular => {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("circular reference: {}", cte.name),
+            ));
+        }
+        CteRecursionKind::MultipleRecursive => {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("multiple recursive references: {}", cte.name),
+            ));
+        }
+        CteRecursionKind::Recursive => exec_recursive_cte(
+            ctx,
+            s_idx,
+            c_idx,
+            &cte,
+            outer_limit_opt,
+            params,
+            outer_scopes,
+            &mut eval_ctes,
+        )?,
+    };
+
+    if let Some(explicit_cols) = &cte.columns {
+        if explicit_cols.len() != cte_out.column_names.len() {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!(
+                    "table {} has {} values for {} columns",
+                    cte.name,
+                    cte_out.column_names.len(),
+                    explicit_cols.len()
+                ),
+            ));
+        }
+        cte_out.column_names.clone_from(explicit_cols);
+    }
+
+    Ok(Some(cte_out))
+}
+
+const MAX_RECURSIVE_CTE_STEPS: usize = 250_000;
+
+#[allow(clippy::too_many_arguments)]
+fn exec_recursive_cte(
+    ctx: &mut ExecContext<'_>,
+    s_idx: usize,
+    c_idx: usize,
+    cte: &CommonTableExpr,
+    outer_limit_opt: Option<usize>,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    eval_ctes: &mut CteStore,
+) -> Result<QueryOutput> {
+    let rec_ctes = eval_ctes.with_scope(&cte.query.ctes);
+    let last_idx = cte.query.body.compounds.len() - 1;
+    let (rec_op, ref rec_core) = cte.query.body.compounds[last_idx];
+    let is_union_distinct = rec_op == CompoundOp::Union;
+
+    // 1. Evaluate non-recursive seed query (`head` + any preceding compound arms)
+    let seed_body = SelectBody {
+        head: cte.query.body.head.clone(),
+        compounds: cte.query.body.compounds[..last_idx].to_vec(),
+    };
+    let seed_out = if seed_body.compounds.is_empty() {
+        exec_single_select_core(ctx, &seed_body.head, &[], None, params, outer_scopes, &rec_ctes)?
+    } else {
+        exec_compound_select(ctx, &seed_body, &[], None, params, outer_scopes, &rec_ctes)?
+    };
+
+    let head_col_names = seed_out.column_names;
+    let working_col_names = match &cte.columns {
+        Some(explicit) => {
+            if explicit.len() != head_col_names.len() {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!(
+                        "table {} has {} values for {} columns",
+                        cte.name,
+                        head_col_names.len(),
+                        explicit.len()
+                    ),
+                ));
+            }
+            explicit.clone()
+        }
+        None => head_col_names.clone(),
+    };
+
+    // Validate recursive arm column count even if seed returns 0 rows!
+    {
+        let mut dry_ctes = rec_ctes.clone();
+        dry_ctes.working.push((
+            s_idx,
+            c_idx,
+            QueryOutput {
+                column_names: working_col_names.clone(),
+                rows: Vec::new(),
+            },
+        ));
+        let dry_rhs =
+            exec_single_select_core(ctx, rec_core, &[], None, params, outer_scopes, &dry_ctes)?;
+        if dry_rhs.column_names.len() != working_col_names.len() {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!(
+                    "SELECTs to the left and right of {} do not have the same number of result columns",
+                    rec_op.as_sql_str()
+                ),
+            ));
+        }
+    }
+
+    // Evaluate optional CTE-level `LIMIT` / `OFFSET`
+    let (cte_limit_opt, cte_offset) = if let Some(ref lim) = cte.query.limit {
+        let lv = eval_expr(ctx, &lim.limit, params, outer_scopes, &rec_ctes, None)?
+            .to_integer_lossy();
+        let ov = match &lim.offset {
+            Some(oe) => eval_expr(ctx, oe, params, outer_scopes, &rec_ctes, None)?
+                .to_integer_lossy()
+                .max(0) as usize,
+            None => 0,
+        };
+        if lv < 0 {
+            (None, ov)
+        } else {
+            (Some(lv as usize), ov)
+        }
+    } else {
+        (None, 0usize)
+    };
+
+    if cte_limit_opt == Some(0) || outer_limit_opt == Some(0) {
+        return Ok(QueryOutput {
+            column_names: working_col_names,
+            rows: Vec::new(),
+        });
+    }
+
+    // Prepare optional `ORDER BY` specs for priority-queue ordering (`with1-5.2.*`)
+    let order_by = &cte.query.order_by;
+    let order_specs: Vec<KeySortOrder> = order_by
+        .iter()
+        .map(|ob| {
+            let coll = match &ob.expr {
+                Expr::Collate { collation, .. } => {
+                    Collation::from_name(collation).unwrap_or_default()
+                }
+                _ => Collation::Binary,
+            };
+            KeySortOrder {
+                desc: ob.desc,
+                nulls_last: ob.nulls_last.unwrap_or(ob.desc),
+                collation: coll,
+            }
+        })
+        .collect();
+
+    let row_scoped_cols: Vec<ScopedColumn> = working_col_names
+        .iter()
+        .map(|cn| ScopedColumn {
+            table_alias: Some(cte.name.clone()),
+            name: cn.clone(),
+            collation: Collation::Binary,
+            hidden_rowid: false,
+            merged_using: false,
+        })
+        .collect();
+
+    let compute_sort_keys = |ctx: &mut ExecContext<'_>, row: &[Value]| -> Result<Vec<Value>> {
+        if order_by.is_empty() {
+            return Ok(Vec::new());
+        }
+        let erow = EvalRow {
+            cols: row_scoped_cols.clone(),
+            vals: row.to_vec(),
+        };
+        let scopes = push_scope(outer_scopes, &erow);
+        let mut keys = Vec::with_capacity(order_by.len());
+        for (i, ob) in order_by.iter().enumerate() {
+            let inner = match &ob.expr {
+                Expr::Collate { expr, .. } => expr.as_ref(),
+                other => other,
+            };
+            let v = match inner {
+                Expr::Integer(ord) => {
+                    if *ord < 1 || (*ord as usize) > working_col_names.len() {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!(
+                                "{} ORDER BY term out of range - should be between 1 and {}",
+                                ordinal_suffix(i + 1),
+                                working_col_names.len()
+                            ),
+                        ));
+                    }
+                    row[(*ord as usize) - 1].clone()
+                }
+                _ => eval_expr(ctx, &ob.expr, params, &scopes, &rec_ctes, None)?,
+            };
+            keys.push(v);
+        }
+        Ok(keys)
+    };
+
+    let enc = ctx.btree.encoding();
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    let mut queue: VecDeque<(Vec<Value>, Vec<Value>)> = VecDeque::new();
+
+    let enqueue_row = |queue: &mut VecDeque<(Vec<Value>, Vec<Value>)>,
+                       seen: &mut HashSet<Vec<u8>>,
+                       row: Vec<Value>,
+                       sort_keys: Vec<Value>| {
+        if is_union_distinct && !seen.insert(encode_record_with_encoding(&row, enc)) {
+            return;
+        }
+        if order_specs.is_empty() {
+            queue.push_back((row, sort_keys));
+        } else {
+            let pos = queue
+                .iter()
+                .position(|(_, existing_sk)| {
+                    compare_value_slices(&sort_keys, existing_sk, &order_specs, enc)
+                        == Ordering::Less
+                })
+                .unwrap_or(queue.len());
+            queue.insert(pos, (row, sort_keys));
+        }
+    };
+
+    for r in seed_out.rows {
+        let sk = compute_sort_keys(ctx, &r)?;
+        enqueue_row(&mut queue, &mut seen, r, sk);
+    }
+
+    let mut out_rows = Vec::new();
+    let mut skipped = 0usize;
+    let mut steps = 0usize;
+
+    while let Some((cur_row, _)) = queue.pop_front() {
+        steps += 1;
+        if steps > MAX_RECURSIVE_CTE_STEPS {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                "recursive query exceeded maximum step limit",
+            ));
+        }
+
+        if skipped < cte_offset {
+            skipped += 1;
+        } else {
+            out_rows.push(cur_row.clone());
+            if let Some(cl) = cte_limit_opt
+                && out_rows.len() >= cl
+            {
+                break;
+            }
+            if let Some(ol) = outer_limit_opt
+                && out_rows.len() >= ol
+            {
+                break;
+            }
+        }
+
+        // Run recursive arm with `cur_row` as the single row in the working table
+        let mut step_ctes = rec_ctes.clone();
+        step_ctes.working.push((
+            s_idx,
+            c_idx,
+            QueryOutput {
+                column_names: working_col_names.clone(),
+                rows: vec![cur_row],
+            },
+        ));
+        let rhs_out =
+            exec_single_select_core(ctx, rec_core, &[], None, params, outer_scopes, &step_ctes)?;
+        if rhs_out.column_names.len() != working_col_names.len() {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!(
+                    "SELECTs to the left and right of {} do not have the same number of result columns",
+                    rec_op.as_sql_str()
+                ),
+            ));
+        }
+        for nr in rhs_out.rows {
+            let sk = compute_sort_keys(ctx, &nr)?;
+            enqueue_row(&mut queue, &mut seen, nr, sk);
+        }
+    }
+
+    Ok(QueryOutput {
+        column_names: working_col_names,
+        rows: out_rows,
+    })
+}
+
 fn exec_compound_select(
     ctx: &mut ExecContext<'_>,
     body: &SelectBody,
@@ -489,6 +1091,7 @@ fn exec_compound_select(
     let head_out = exec_single_select_core(ctx, &body.head, &[], None, params, outer_scopes, ctes)?;
     let col_names = head_out.column_names;
     let mut acc_rows = head_out.rows;
+    let default_specs = vec![KeySortOrder::default(); col_names.len()];
 
     for (op, rhs_core) in &body.compounds {
         let rhs_out =
@@ -496,7 +1099,10 @@ fn exec_compound_select(
         if rhs_out.column_names.len() != col_names.len() {
             return Err(SqliteError::new(
                 ErrorCode::Error,
-                "SELECTs to the left and right of UNION/INTERSECT/EXCEPT do not have the same number of result columns",
+                format!(
+                    "SELECTs to the left and right of {} do not have the same number of result columns",
+                    op.as_sql_str()
+                ),
             ));
         }
         let enc = ctx.btree.encoding();
@@ -507,6 +1113,7 @@ fn exec_compound_select(
             CompoundOp::Union => {
                 acc_rows.extend(rhs_out.rows);
                 acc_rows = dedup_rows_sorted_or_seen(acc_rows, enc);
+                acc_rows.sort_by(|a, b| compare_value_slices(a, b, &default_specs, enc));
             }
             CompoundOp::Intersect => {
                 let rhs_keys: HashSet<Vec<u8>> = rhs_out
@@ -519,6 +1126,7 @@ fn exec_compound_select(
                     let k = encode_record_with_encoding(r, enc);
                     rhs_keys.contains(&k) && seen.insert(k)
                 });
+                acc_rows.sort_by(|a, b| compare_value_slices(a, b, &default_specs, enc));
             }
             CompoundOp::Except => {
                 let rhs_keys: HashSet<Vec<u8>> = rhs_out
@@ -531,6 +1139,7 @@ fn exec_compound_select(
                     let k = encode_record_with_encoding(r, enc);
                     !rhs_keys.contains(&k) && seen.insert(k)
                 });
+                acc_rows.sort_by(|a, b| compare_value_slices(a, b, &default_specs, enc));
             }
         }
     }
@@ -544,6 +1153,38 @@ fn exec_compound_select(
         column_names: col_names,
         rows: acc_rows,
     })
+}
+
+fn strip_collate_and_unary_plus(mut e: &Expr) -> Option<i64> {
+    while let Expr::Collate { expr, .. } = e {
+        e = expr;
+    }
+    match e {
+        Expr::Integer(i) => Some(*i),
+        Expr::Unary {
+            op: UnaryOp::Negate,
+            expr,
+        } => {
+            if let Expr::Integer(i) = expr.as_ref() {
+                Some(i.saturating_neg())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn ordinal_suffix(n: usize) -> String {
+    match n % 100 {
+        11..=13 => format!("{n}th"),
+        _ => match n % 10 {
+            1 => format!("{n}st"),
+            2 => format!("{n}nd"),
+            3 => format!("{n}rd"),
+            _ => format!("{n}th"),
+        },
+    }
 }
 
 fn exec_single_select_core(
@@ -630,20 +1271,75 @@ fn exec_single_select_core(
                 })
                 || order_by.iter().any(|ob| expr_contains_aggregate(&ob.expr));
 
-            let sample_cols = filtered
-                .first()
-                .map(|r| r.cols.clone())
-                .or_else(|| from.as_ref().and_then(|fc| schema_cols_preview(ctx, fc, ctes)))
-                .unwrap_or_default();
+            let sample_cols = match filtered.first() {
+                Some(r) => r.cols.clone(),
+                None => match from {
+                    Some(fc) => schema_cols_preview(ctx, fc, params, outer_scopes, ctes)
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                },
+            };
 
             let (col_names, expanded_proj) = expand_projection(projection, &sample_cols)?;
+
+            // Validate & resolve GROUP BY / ORDER BY integer ordinals (1..=N)
+            let mut resolved_group_by = Vec::with_capacity(group_by.len());
+            for (gi, ge) in group_by.iter().enumerate() {
+                if let Some(ord) = strip_collate_and_unary_plus(ge) {
+                    if ord < 1 || (ord as usize) > expanded_proj.len() {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!(
+                                "{} GROUP BY term out of range - should be between 1 and {}",
+                                ordinal_suffix(gi + 1),
+                                expanded_proj.len()
+                            ),
+                        ));
+                    }
+                    let target_expr = expanded_proj[(ord as usize) - 1].0.clone();
+                    if let Expr::Collate { collation, .. } = ge {
+                        resolved_group_by.push(Expr::Collate {
+                            expr: Box::new(target_expr),
+                            collation: collation.clone(),
+                        });
+                    } else {
+                        resolved_group_by.push(target_expr);
+                    }
+                } else {
+                    resolved_group_by.push(ge.clone());
+                }
+            }
+            for (oi, ob) in order_by.iter().enumerate() {
+                if let Some(ord) = strip_collate_and_unary_plus(&ob.expr)
+                    && (ord < 1 || (ord as usize) > expanded_proj.len())
+                {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!(
+                            "{} ORDER BY term out of range - should be between 1 and {}",
+                            ordinal_suffix(oi + 1),
+                            expanded_proj.len()
+                        ),
+                    ));
+                }
+            }
 
             let mut result_rows_with_sort: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
 
             if is_agg {
-                let groups = build_groups(ctx, filtered, group_by, params, outer_scopes, ctes)?;
+                let groups = build_groups(
+                    ctx,
+                    filtered,
+                    &resolved_group_by,
+                    params,
+                    outer_scopes,
+                    ctes,
+                )?;
                 for group_rows in groups {
-                    let rep_row = group_rows.first().cloned().unwrap_or_default();
+                    let rep_row = group_rows.first().cloned().unwrap_or_else(|| EvalRow {
+                        cols: sample_cols.clone(),
+                        vals: vec![Value::Null; sample_cols.len()],
+                    });
                     let scopes = push_scope(outer_scopes, &rep_row);
                     if let Some(hav) = having {
                         let hv = eval_expr(
@@ -688,6 +1384,30 @@ fn exec_single_select_core(
                     result_rows_with_sort.push((out_vals, sort_vals));
                 }
             } else {
+                if filtered.is_empty() && !sample_cols.is_empty() {
+                    // Validate projection & ORDER BY column resolution even when 0 rows match!
+                    let dummy_row = EvalRow {
+                        cols: sample_cols.clone(),
+                        vals: vec![Value::Null; sample_cols.len()],
+                    };
+                    let scopes = push_scope(outer_scopes, &dummy_row);
+                    let mut dummy_proj = Vec::with_capacity(expanded_proj.len());
+                    for (pe, _, _) in &expanded_proj {
+                        dummy_proj.push(eval_expr(ctx, pe, params, &scopes, ctes, None)?);
+                    }
+                    for ob in order_by {
+                        let _ = eval_order_term_in_scope(
+                            ctx,
+                            &ob.expr,
+                            &dummy_proj,
+                            &expanded_proj,
+                            &scopes,
+                            params,
+                            ctes,
+                            None,
+                        )?;
+                    }
+                }
                 for row in filtered {
                     let scopes = push_scope(outer_scopes, &row);
                     let mut out_vals = Vec::with_capacity(expanded_proj.len());
@@ -725,12 +1445,7 @@ fn exec_single_select_core(
                 let specs: Vec<KeySortOrder> = order_by
                     .iter()
                     .map(|ob| {
-                        let coll = match &ob.expr {
-                            Expr::Collate { collation, .. } => {
-                                Collation::from_name(collation).unwrap_or_default()
-                            }
-                            _ => Collation::Binary,
-                        };
+                        let coll = infer_order_by_collation(&ob.expr, &expanded_proj, &sample_cols);
                         KeySortOrder {
                             desc: ob.desc,
                             nulls_last: ob.nulls_last.unwrap_or(ob.desc),
@@ -763,6 +1478,12 @@ fn eval_from_clause(
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
 ) -> Result<Vec<EvalRow>> {
+    if 1 + fc.joins.len() > 64 {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            "at most 64 tables in a join",
+        ));
+    }
     let single_table_hint = if fc.joins.is_empty() {
         where_hint
     } else {
@@ -770,11 +1491,33 @@ fn eval_from_clause(
     };
     let mut left_rows =
         eval_table_or_subquery(ctx, &fc.head, single_table_hint, params, outer_scopes, ctes)?;
+    let mut left_cols_fallback = left_rows
+        .first()
+        .map(|r| r.cols.clone())
+        .or_else(|| schema_cols_for_tos(ctx, &fc.head, params, outer_scopes, ctes))
+        .unwrap_or_default();
 
     for join in &fc.joins {
         let right_rows =
             eval_table_or_subquery(ctx, &join.right, None, params, outer_scopes, ctes)?;
-        left_rows = apply_join(ctx, left_rows, right_rows, join, params, outer_scopes, ctes)?;
+        let right_cols_fallback = right_rows
+            .first()
+            .map(|r| r.cols.clone())
+            .or_else(|| schema_cols_for_tos(ctx, &join.right, params, outer_scopes, ctes))
+            .unwrap_or_default();
+        left_rows = apply_join(
+            ctx,
+            left_rows,
+            right_rows,
+            &left_cols_fallback,
+            &right_cols_fallback,
+            join,
+            params,
+            outer_scopes,
+            ctes,
+        )?;
+        left_cols_fallback =
+            merge_join_scoped_columns(&left_cols_fallback, &right_cols_fallback, join);
     }
 
     Ok(left_rows)
@@ -791,7 +1534,7 @@ fn eval_table_or_subquery(
     match tos {
         TableOrSubquery::Table { name, alias } => {
             let eff_alias = alias.clone().unwrap_or_else(|| name.clone());
-            if let Some(cte_out) = ctes.find(name) {
+            if let Some(cte_out) = resolve_cte(ctx, ctes, name, params, outer_scopes)? {
                 let cols: Vec<ScopedColumn> = cte_out
                     .column_names
                     .iter()
@@ -805,10 +1548,10 @@ fn eval_table_or_subquery(
                     .collect();
                 return Ok(cte_out
                     .rows
-                    .iter()
+                    .into_iter()
                     .map(|r| EvalRow {
                         cols: cols.clone(),
-                        vals: r.clone(),
+                        vals: r,
                     })
                     .collect());
             }
@@ -932,7 +1675,9 @@ fn read_table_with_plan(
             let mut prefix_vals = Vec::with_capacity(prefix_exprs.len());
             for (i, ke) in prefix_exprs.iter().enumerate() {
                 let raw = eval_expr(ctx, ke, params, outer_scopes, ctes, None)?;
-                let aff = tbl.columns[index.columns[i].col_idx].affinity;
+                let aff = index.columns[i]
+                    .col_idx
+                    .map_or(TypeAffinity::Blob, |ci| tbl.columns[ci].affinity);
                 let coerced = aff.apply(raw);
                 if coerced.is_null() {
                     // `col = NULL` is never true in SQL `WHERE`!
@@ -957,30 +1702,18 @@ fn read_table_with_plan(
     }
 }
 
-fn apply_join(
-    ctx: &mut ExecContext<'_>,
-    left_rows: Vec<EvalRow>,
-    right_rows: Vec<EvalRow>,
+fn compute_join_using_cols(
+    left_cols: &[ScopedColumn],
+    right_cols: &[ScopedColumn],
     join: &JoinClause,
-    params: &[Value],
-    outer_scopes: &[EvalRow],
-    ctes: &CteStore,
-) -> Result<Vec<EvalRow>> {
-    let left_sample_cols = left_rows.first().map(|r| r.cols.clone()).unwrap_or_default();
-    let right_sample_cols = right_rows
-        .first()
-        .map(|r| r.cols.clone())
-        .or_else(|| schema_cols_for_tos(ctx, &join.right, ctes))
-        .unwrap_or_default();
-
-    // Determine USING columns if NATURAL or USING(...)
-    let using_cols: Vec<String> = if join.natural {
+) -> Vec<String> {
+    if join.natural {
         let mut shared = Vec::new();
-        for lc in &left_sample_cols {
+        for lc in left_cols {
             if lc.hidden_rowid {
                 continue;
             }
-            if right_sample_cols
+            if right_cols
                 .iter()
                 .any(|rc| !rc.hidden_rowid && rc.name.eq_ignore_ascii_case(&lc.name))
                 && !shared
@@ -995,7 +1728,59 @@ fn apply_join(
         cols.clone()
     } else {
         Vec::new()
-    };
+    }
+}
+
+fn merge_join_scoped_columns(
+    left_cols: &[ScopedColumn],
+    right_cols: &[ScopedColumn],
+    join: &JoinClause,
+) -> Vec<ScopedColumn> {
+    let using_cols = compute_join_using_cols(left_cols, right_cols, join);
+    let mut cols = Vec::with_capacity(left_cols.len() + right_cols.len());
+    for lc in left_cols {
+        let mut sc = lc.clone();
+        if !sc.hidden_rowid
+            && using_cols
+                .iter()
+                .any(|u| u.eq_ignore_ascii_case(&sc.name))
+        {
+            sc.merged_using = true;
+        }
+        cols.push(sc);
+    }
+    for rc in right_cols {
+        if !rc.hidden_rowid
+            && using_cols
+                .iter()
+                .any(|u| u.eq_ignore_ascii_case(&rc.name))
+        {
+            continue;
+        }
+        cols.push(rc.clone());
+    }
+    cols
+}
+
+fn apply_join(
+    ctx: &mut ExecContext<'_>,
+    left_rows: Vec<EvalRow>,
+    right_rows: Vec<EvalRow>,
+    left_cols_fallback: &[ScopedColumn],
+    right_cols_fallback: &[ScopedColumn],
+    join: &JoinClause,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    ctes: &CteStore,
+) -> Result<Vec<EvalRow>> {
+    let left_sample_cols = left_rows
+        .first()
+        .map_or_else(|| left_cols_fallback.to_vec(), |r| r.cols.clone());
+    let right_sample_cols = right_rows
+        .first()
+        .map_or_else(|| right_cols_fallback.to_vec(), |r| r.cols.clone());
+
+    let using_cols = compute_join_using_cols(&left_sample_cols, &right_sample_cols, join);
 
     let combine_rows = |l: Option<&EvalRow>, r: Option<&EvalRow>| -> EvalRow {
         let mut cols = Vec::new();
@@ -1098,28 +1883,32 @@ fn apply_join(
 }
 
 fn schema_cols_preview(
-    ctx: &ExecContext<'_>,
+    ctx: &mut ExecContext<'_>,
     fc: &FromClause,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
     ctes: &CteStore,
 ) -> Option<Vec<ScopedColumn>> {
-    let mut cols = schema_cols_for_tos(ctx, &fc.head, ctes)?;
+    let mut cols = schema_cols_for_tos(ctx, &fc.head, params, outer_scopes, ctes)?;
     for j in &fc.joins {
-        if let Some(rcols) = schema_cols_for_tos(ctx, &j.right, ctes) {
-            cols.extend(rcols);
+        if let Some(rcols) = schema_cols_for_tos(ctx, &j.right, params, outer_scopes, ctes) {
+            cols = merge_join_scoped_columns(&cols, &rcols, j);
         }
     }
     Some(cols)
 }
 
 fn schema_cols_for_tos(
-    ctx: &ExecContext<'_>,
+    ctx: &mut ExecContext<'_>,
     tos: &TableOrSubquery,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
     ctes: &CteStore,
 ) -> Option<Vec<ScopedColumn>> {
     match tos {
         TableOrSubquery::Table { name, alias } => {
             let eff = alias.clone().unwrap_or_else(|| name.clone());
-            if let Some(cte) = ctes.find(name) {
+            if let Ok(Some(cte)) = resolve_cte(ctx, ctes, name, params, outer_scopes) {
                 return Some(
                     cte.column_names
                         .iter()
@@ -1134,20 +1923,44 @@ fn schema_cols_for_tos(
                 );
             }
             let tbl = ctx.schema.find_table(name)?;
+            let mut cols: Vec<ScopedColumn> = tbl
+                .columns
+                .iter()
+                .map(|c| ScopedColumn {
+                    table_alias: Some(eff.clone()),
+                    name: c.name.clone(),
+                    collation: c.collation,
+                    hidden_rowid: false,
+                    merged_using: false,
+                })
+                .collect();
+            if !tbl.without_rowid {
+                cols.push(ScopedColumn {
+                    table_alias: Some(eff),
+                    name: "rowid".to_owned(),
+                    collation: Collation::Binary,
+                    hidden_rowid: true,
+                    merged_using: false,
+                });
+            }
+            Some(cols)
+        }
+        TableOrSubquery::Subquery { query, alias } => {
+            let sub_out = exec_select(ctx, query, params, outer_scopes, ctes).ok()?;
             Some(
-                tbl.columns
+                sub_out
+                    .column_names
                     .iter()
-                    .map(|c| ScopedColumn {
-                        table_alias: Some(eff.clone()),
-                        name: c.name.clone(),
-                        collation: c.collation,
+                    .map(|cn| ScopedColumn {
+                        table_alias: alias.clone(),
+                        name: cn.clone(),
+                        collation: Collation::Binary,
                         hidden_rowid: false,
                         merged_using: false,
                     })
                     .collect(),
             )
         }
-        TableOrSubquery::Subquery { .. } => None,
     }
 }
 
@@ -1284,6 +2097,65 @@ fn build_groups(
     Ok(groups.into_iter().map(|(_, _, b)| b).collect())
 }
 
+fn infer_expr_collation_from_cols(expr: &Expr, sample_cols: &[ScopedColumn]) -> Collation {
+    match expr {
+        Expr::Collate { collation, .. } => Collation::from_name(collation).unwrap_or_default(),
+        Expr::Column { table, column } => {
+            for sc in sample_cols {
+                if sc.hidden_rowid {
+                    continue;
+                }
+                if let Some(q) = table
+                    && !sc
+                        .table_alias
+                        .as_ref()
+                        .is_some_and(|ta| ta.eq_ignore_ascii_case(q))
+                {
+                    continue;
+                }
+                if sc.name.eq_ignore_ascii_case(column) {
+                    return sc.collation;
+                }
+            }
+            Collation::Binary
+        }
+        _ => Collation::Binary,
+    }
+}
+
+fn infer_order_by_collation(
+    ob_expr: &Expr,
+    expanded_proj: &[(Expr, String, Option<String>)],
+    sample_cols: &[ScopedColumn],
+) -> Collation {
+    if let Expr::Collate { collation, .. } = ob_expr {
+        return Collation::from_name(collation).unwrap_or_default();
+    }
+    if let Expr::Integer(ord) = ob_expr
+        && *ord >= 1
+        && (*ord as usize) <= expanded_proj.len()
+    {
+        return infer_expr_collation_from_cols(&expanded_proj[(*ord as usize) - 1].0, sample_cols);
+    }
+    if let Expr::Column {
+        table: None,
+        column,
+    } = ob_expr
+        && let Some((idx, _)) = expanded_proj.iter().enumerate().find(|(_, (_, label, al))| {
+            al.as_ref().is_some_and(|a| a.eq_ignore_ascii_case(column))
+                || label.eq_ignore_ascii_case(column)
+        })
+    {
+        let in_row = sample_cols
+            .iter()
+            .any(|sc| !sc.hidden_rowid && sc.name.eq_ignore_ascii_case(column));
+        if expanded_proj[idx].2.is_some() || !in_row {
+            return infer_expr_collation_from_cols(&expanded_proj[idx].0, sample_cols);
+        }
+    }
+    infer_expr_collation_from_cols(ob_expr, sample_cols)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn eval_order_term_in_scope(
     ctx: &mut ExecContext<'_>,
@@ -1295,7 +2167,11 @@ fn eval_order_term_in_scope(
     ctes: &CteStore,
     agg_group: Option<(&[EvalRow], &[EvalRow])>,
 ) -> Result<Value> {
-    if let Expr::Integer(ord) = ob_expr
+    let mut inner = ob_expr;
+    while let Expr::Collate { expr, .. } = inner {
+        inner = expr;
+    }
+    if let Expr::Integer(ord) = inner
         && *ord >= 1
         && (*ord as usize) <= proj_vals.len()
     {
@@ -1304,7 +2180,7 @@ fn eval_order_term_in_scope(
     if let Expr::Column {
         table: None,
         column,
-    } = ob_expr
+    } = inner
         && let Some((idx, _)) = expanded_proj.iter().enumerate().find(|(_, (_, label, al))| {
             al.as_ref().is_some_and(|a| a.eq_ignore_ascii_case(column))
                 || label.eq_ignore_ascii_case(column)
@@ -1329,26 +2205,59 @@ fn sort_materialized_output(
     enc: TextEncoding,
 ) -> Result<()> {
     let mut specs = Vec::with_capacity(order_by.len());
-    for ob in order_by {
-        let inner = match &ob.expr {
-            Expr::Collate { expr, .. } => expr.as_ref(),
-            other => other,
-        };
-        let col_idx = match inner {
-            Expr::Integer(ord) if *ord >= 1 && (*ord as usize) <= col_names.len() => {
-                (*ord as usize) - 1
+    for (ob_idx, ob) in order_by.iter().enumerate() {
+        let mut inner = &ob.expr;
+        while let Expr::Collate { expr, .. } = inner {
+            inner = expr.as_ref();
+        }
+        if let Some(ord) = strip_collate_and_unary_plus(inner) {
+            if ord < 1 || (ord as usize) > col_names.len() {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!(
+                        "{} ORDER BY term out of range - should be between 1 and {}",
+                        ordinal_suffix(ob_idx + 1),
+                        col_names.len()
+                    ),
+                ));
             }
-            Expr::Column { column, .. } => col_names
+            let coll = match &ob.expr {
+                Expr::Collate { collation, .. } => {
+                    Collation::from_name(collation).unwrap_or_default()
+                }
+                _ => Collation::Binary,
+            };
+            specs.push((
+                (ord as usize) - 1,
+                KeySortOrder {
+                    desc: ob.desc,
+                    nulls_last: ob.nulls_last.unwrap_or(ob.desc),
+                    collation: coll,
+                },
+            ));
+            continue;
+        }
+        let col_idx = match inner {
+            Expr::Column {
+                table: None,
+                column,
+            } => col_names
                 .iter()
-                .position(|cn| cn.eq_ignore_ascii_case(column))
-                .ok_or_else(|| {
-                    SqliteError::new(
-                        ErrorCode::Error,
-                        format!("1st ORDER BY term does not match any column in the result set: {column}"),
-                    )
-                })?,
-            _ => 0,
-        };
+                .position(|cn| cn.eq_ignore_ascii_case(column)),
+            other => {
+                let lbl = expr_column_label(other);
+                col_names.iter().position(|cn| cn.eq_ignore_ascii_case(&lbl))
+            }
+        }
+        .ok_or_else(|| {
+            SqliteError::new(
+                ErrorCode::Error,
+                format!(
+                    "{} ORDER BY term does not match any column in the result set",
+                    ordinal_suffix(ob_idx + 1)
+                ),
+            )
+        })?;
         let coll = match &ob.expr {
             Expr::Collate { collation, .. } => Collation::from_name(collation).unwrap_or_default(),
             _ => Collation::Binary,
@@ -1541,6 +2450,13 @@ fn eval_expr(
                 },
             })
         }
+        Expr::RowValue(elems) => {
+            if elems.len() == 1 {
+                eval_expr(ctx, &elems[0], params, scopes, ctes, agg_group)
+            } else {
+                Err(SqliteError::new(ErrorCode::Error, "row value misused"))
+            }
+        }
         Expr::Binary { left, op, right } => {
             // Short-circuit AND / OR
             if *op == BinaryOp::And {
@@ -1566,6 +2482,23 @@ fn eval_expr(
                     (Some(false), Some(false)) => Value::Integer(0),
                     _ => Value::Null,
                 });
+            }
+
+            if matches!(
+                op,
+                BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Is
+                    | BinaryOp::IsNot
+            ) && (is_row_value_expr(left) || is_row_value_expr(right))
+            {
+                return eval_row_value_comparison(
+                    ctx, left, *op, right, params, scopes, ctes, agg_group,
+                );
             }
 
             let lv = eval_expr(ctx, left, params, scopes, ctes, agg_group)?;
@@ -1665,6 +2598,39 @@ fn eval_expr(
             high,
             negated,
         } => {
+            if is_row_value_expr(val_e) || is_row_value_expr(low) || is_row_value_expr(high) {
+                let ge = eval_row_value_comparison(
+                    ctx,
+                    val_e,
+                    BinaryOp::Ge,
+                    low,
+                    params,
+                    scopes,
+                    ctes,
+                    agg_group,
+                )?
+                .truthiness();
+                let le = eval_row_value_comparison(
+                    ctx,
+                    val_e,
+                    BinaryOp::Le,
+                    high,
+                    params,
+                    scopes,
+                    ctes,
+                    agg_group,
+                )?
+                .truthiness();
+                let res = match (ge, le) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                };
+                return Ok(match res {
+                    None => Value::Null,
+                    Some(b) => Value::Integer(i64::from(if *negated { !b } else { b })),
+                });
+            }
             let v = eval_expr(ctx, val_e, params, scopes, ctes, agg_group)?;
             let lo = eval_expr(ctx, low, params, scopes, ctes, agg_group)?;
             let hi = eval_expr(ctx, high, params, scopes, ctes, agg_group)?;
@@ -1687,6 +2653,30 @@ fn eval_expr(
             list,
             negated,
         } => {
+            if is_row_value_expr(lhs_e) {
+                let lv_vec = eval_row_value_tuple(ctx, lhs_e, params, scopes, ctes, agg_group)?;
+                if list.is_empty() {
+                    return Ok(Value::Integer(i64::from(*negated)));
+                }
+                let enc = ctx.btree.encoding();
+                let mut saw_null = false;
+                for item in list {
+                    let iv_vec = eval_row_value_tuple(ctx, item, params, scopes, ctes, agg_group)?;
+                    if iv_vec.len() != lv_vec.len() {
+                        return Err(SqliteError::new(ErrorCode::Error, "row value misused"));
+                    }
+                    match compare_row_value_eq(&lv_vec, &iv_vec, &[], enc) {
+                        Some(true) => return Ok(Value::Integer(i64::from(!*negated))),
+                        None => saw_null = true,
+                        Some(false) => {}
+                    }
+                }
+                return Ok(if saw_null {
+                    Value::Null
+                } else {
+                    Value::Integer(i64::from(*negated))
+                });
+            }
             let lv = eval_expr(ctx, lhs_e, params, scopes, ctes, agg_group)?;
             if list.is_empty() {
                 return Ok(Value::Integer(i64::from(*negated)));
@@ -1723,37 +2713,32 @@ fn eval_expr(
             subquery,
             negated,
         } => {
-            let lv = eval_expr(ctx, lhs_e, params, scopes, ctes, agg_group)?;
+            let lv_vec = if is_row_value_expr(lhs_e) {
+                eval_row_value_tuple(ctx, lhs_e, params, scopes, ctes, agg_group)?
+            } else {
+                vec![eval_expr(ctx, lhs_e, params, scopes, ctes, agg_group)?]
+            };
             let sub_out = exec_select(ctx, subquery, params, scopes, ctes)?;
-            if sub_out.column_names.len() != 1 && !sub_out.column_names.is_empty() {
+            if !sub_out.column_names.is_empty() && sub_out.column_names.len() != lv_vec.len() {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    "sub-select returns more than 1 column",
+                    format!(
+                        "sub-select returns {} columns - expected {}",
+                        sub_out.column_names.len(),
+                        lv_vec.len()
+                    ),
                 ));
             }
             if sub_out.rows.is_empty() {
                 return Ok(Value::Integer(i64::from(*negated)));
             }
-            if lv.is_null() {
-                return Ok(Value::Null);
-            }
             let enc = ctx.btree.encoding();
             let mut saw_null = false;
             for r in &sub_out.rows {
-                let iv = &r[0];
-                if iv.is_null() {
-                    saw_null = true;
-                } else if eval_comparison_with_encoding(
-                    Opcode::Eq,
-                    &lv,
-                    iv,
-                    Collation::Binary,
-                    enc,
-                )
-                .truthiness()
-                    == Some(true)
-                {
-                    return Ok(Value::Integer(i64::from(!*negated)));
+                match compare_row_value_eq(&lv_vec, r, &[], enc) {
+                    Some(true) => return Ok(Value::Integer(i64::from(!*negated))),
+                    None => saw_null = true,
+                    Some(false) => {}
                 }
             }
             if saw_null {
@@ -1794,7 +2779,7 @@ fn eval_expr(
             type_name,
         } => {
             let v = eval_expr(ctx, inner, params, scopes, ctes, agg_group)?;
-            Ok(eval_cast(v, type_name))
+            Ok(eval_cast_with_encoding(v, type_name, ctx.btree.encoding()))
         }
         Expr::Case {
             operand,
@@ -1836,21 +2821,30 @@ fn eval_expr(
             args,
             filter,
         } => {
-            // Check if this is an aggregate call
-            let is_star = matches!(args, FunctionArgs::Star);
+            // Check if this is an aggregate call (`count(*)` and 0-arg `count()` are both `CountStar`)
+            let is_count_zero = name.eq_ignore_ascii_case("COUNT")
+                && matches!(args, FunctionArgs::Exprs(es) if es.is_empty());
+            let is_star = matches!(args, FunctionArgs::Star) || is_count_zero;
             let upper = name.to_ascii_uppercase();
-            let agg_kind_opt = match args {
-                FunctionArgs::Star => AggregateKind::from_name(name, true),
-                FunctionArgs::Exprs(es) => {
-                    if (upper == "MIN" || upper == "MAX") && es.len() != 1 {
-                        None
-                    } else {
-                        AggregateKind::from_name(name, false)
-                    }
+            let agg_kind_opt = if is_star {
+                AggregateKind::from_name(name, true)
+            } else if let FunctionArgs::Exprs(es) = args {
+                if (upper == "MIN" || upper == "MAX") && es.len() != 1 {
+                    None
+                } else {
+                    AggregateKind::from_name(name, false)
                 }
+            } else {
+                None
             };
 
             if let Some(agg_kind) = agg_kind_opt {
+                if is_count_zero && *distinct {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "DISTINCT aggregates must have exactly one argument",
+                    ));
+                }
                 let Some((group_rows, base_outer)) = agg_group else {
                     return Err(SqliteError::new(
                         ErrorCode::Error,
@@ -1900,7 +2894,10 @@ fn eval_expr(
             if sub_out.column_names.len() > 1 {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    "sub-select returns more than 1 column",
+                    format!(
+                        "sub-select returns {} columns - expected 1",
+                        sub_out.column_names.len()
+                    ),
                 ));
             }
             Ok(sub_out
@@ -1915,6 +2912,172 @@ fn eval_expr(
             let exists = !sub_out.rows.is_empty();
             Ok(Value::Integer(i64::from(if *negated { !exists } else { exists })))
         }
+    }
+}
+
+fn is_row_value_expr(mut e: &Expr) -> bool {
+    while let Expr::Collate { expr, .. } = e {
+        e = expr;
+    }
+    matches!(e, Expr::RowValue(_) | Expr::Subquery(_))
+}
+
+fn eval_row_value_tuple(
+    ctx: &mut ExecContext<'_>,
+    expr: &Expr,
+    params: &[Value],
+    scopes: &[EvalRow],
+    ctes: &CteStore,
+    agg_group: Option<(&[EvalRow], &[EvalRow])>,
+) -> Result<Vec<Value>> {
+    match expr {
+        Expr::Collate { expr: inner, .. } => {
+            eval_row_value_tuple(ctx, inner, params, scopes, ctes, agg_group)
+        }
+        Expr::RowValue(elems) => {
+            let mut out = Vec::with_capacity(elems.len());
+            for el in elems {
+                out.push(eval_expr(ctx, el, params, scopes, ctes, agg_group)?);
+            }
+            Ok(out)
+        }
+        Expr::Subquery(sub) => {
+            let sub_out = exec_select(ctx, sub, params, scopes, ctes)?;
+            let width = sub_out.column_names.len().max(1);
+            if let Some(first_row) = sub_out.rows.into_iter().next() {
+                Ok(first_row)
+            } else {
+                Ok(vec![Value::Null; width])
+            }
+        }
+        other => Ok(vec![eval_expr(ctx, other, params, scopes, ctes, agg_group)?]),
+    }
+}
+
+fn compare_row_value_eq(
+    lhs: &[Value],
+    rhs: &[Value],
+    colls: &[Collation],
+    enc: TextEncoding,
+) -> Option<bool> {
+    let mut saw_null = false;
+    for i in 0..lhs.len() {
+        let coll = colls.get(i).copied().unwrap_or(Collation::Binary);
+        match eval_comparison_with_encoding(Opcode::Eq, &lhs[i], &rhs[i], coll, enc).truthiness() {
+            Some(false) => return Some(false),
+            None => saw_null = true,
+            Some(true) => {}
+        }
+    }
+    if saw_null { None } else { Some(true) }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_row_value_comparison(
+    ctx: &mut ExecContext<'_>,
+    left: &Expr,
+    op: BinaryOp,
+    right: &Expr,
+    params: &[Value],
+    scopes: &[EvalRow],
+    ctes: &CteStore,
+    agg_group: Option<(&[EvalRow], &[EvalRow])>,
+) -> Result<Value> {
+    let lv = eval_row_value_tuple(ctx, left, params, scopes, ctes, agg_group)?;
+    let rv = eval_row_value_tuple(ctx, right, params, scopes, ctes, agg_group)?;
+    if lv.len() != rv.len() {
+        let is_left_sub = matches!(left, Expr::Subquery(_));
+        let is_right_sub = matches!(right, Expr::Subquery(_));
+        if is_left_sub && !is_right_sub {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!(
+                    "sub-select returns {} columns - expected {}",
+                    lv.len(),
+                    rv.len()
+                ),
+            ));
+        }
+        if is_right_sub && !is_left_sub {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!(
+                    "sub-select returns {} columns - expected {}",
+                    rv.len(),
+                    lv.len()
+                ),
+            ));
+        }
+        return Err(SqliteError::new(ErrorCode::Error, "row value misused"));
+    }
+
+    let n = lv.len();
+    let mut colls = vec![Collation::Binary; n];
+    match (left, right) {
+        (Expr::RowValue(le), Expr::RowValue(re)) if le.len() == n && re.len() == n => {
+            for i in 0..n {
+                colls[i] = infer_comparison_collation(&le[i], &re[i], scopes);
+            }
+        }
+        _ if n == 1 => {
+            colls[0] = infer_comparison_collation(left, right, scopes);
+        }
+        _ => {}
+    }
+    let enc = ctx.btree.encoding();
+
+    match op {
+        BinaryOp::Eq => Ok(match compare_row_value_eq(&lv, &rv, &colls, enc) {
+            None => Value::Null,
+            Some(b) => Value::Integer(i64::from(b)),
+        }),
+        BinaryOp::Ne => Ok(match compare_row_value_eq(&lv, &rv, &colls, enc) {
+            None => Value::Null,
+            Some(b) => Value::Integer(i64::from(!b)),
+        }),
+        BinaryOp::Is => {
+            let all_eq = (0..n).all(|i| {
+                eval_comparison_with_encoding(Opcode::Is, &lv[i], &rv[i], colls[i], enc)
+                    .truthiness()
+                    == Some(true)
+            });
+            Ok(Value::Integer(i64::from(all_eq)))
+        }
+        BinaryOp::IsNot => {
+            let any_diff = (0..n).any(|i| {
+                eval_comparison_with_encoding(Opcode::Is, &lv[i], &rv[i], colls[i], enc)
+                    .truthiness()
+                    != Some(true)
+            });
+            Ok(Value::Integer(i64::from(any_diff)))
+        }
+        BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+            let strict_op = match op {
+                BinaryOp::Lt | BinaryOp::Le => Opcode::Lt,
+                BinaryOp::Gt | BinaryOp::Ge => Opcode::Gt,
+                _ => unreachable!(),
+            };
+            let inclusive = matches!(op, BinaryOp::Le | BinaryOp::Ge);
+            for i in 0..n {
+                if lv[i].is_null() || rv[i].is_null() {
+                    return Ok(Value::Null);
+                }
+                if eval_comparison_with_encoding(Opcode::Eq, &lv[i], &rv[i], colls[i], enc)
+                    .truthiness()
+                    == Some(true)
+                {
+                    if i + 1 == n {
+                        return Ok(Value::Integer(i64::from(inclusive)));
+                    }
+                    continue;
+                }
+                return Ok(eval_comparison_with_encoding(
+                    strict_op, &lv[i], &rv[i], colls[i], enc,
+                ));
+            }
+            Ok(Value::Integer(i64::from(inclusive)))
+        }
+        _ => unreachable!(),
     }
 }
 
@@ -2128,13 +3291,64 @@ fn index_row_passes_partial_where(
     Ok(eval_expr(ctx, w, params, &[scope], &CteStore::default(), None)?.truthiness() == Some(true))
 }
 
-fn build_index_key_values(idx: &IndexSchema, rowid: i64, logical_vals: &[Value]) -> Vec<Value> {
-    let mut keys = Vec::with_capacity(idx.columns.len() + 1);
+fn eval_index_column_values(
+    ctx: &mut ExecContext<'_>,
+    tbl: &TableSchema,
+    idx: &IndexSchema,
+    rowid: i64,
+    logical_vals: &[Value],
+    params: &[Value],
+) -> Result<Vec<Value>> {
+    let mut vals = Vec::with_capacity(idx.columns.len());
+    let needs_scope = idx.columns.iter().any(|ic| ic.col_idx.is_none());
+    let scope_arr = if needs_scope {
+        vec![make_single_table_scope(tbl, None, rowid, logical_vals)]
+    } else {
+        Vec::new()
+    };
     for ic in &idx.columns {
-        keys.push(logical_vals[ic.col_idx].clone());
+        if let Some(ci) = ic.col_idx {
+            vals.push(logical_vals[ci].clone());
+        } else if let Some(ref e) = ic.expr {
+            vals.push(eval_expr(
+                ctx,
+                e,
+                params,
+                &scope_arr,
+                &CteStore::default(),
+                None,
+            )?);
+        } else {
+            vals.push(Value::Null);
+        }
     }
+    Ok(vals)
+}
+
+fn eval_index_key_values(
+    ctx: &mut ExecContext<'_>,
+    tbl: &TableSchema,
+    idx: &IndexSchema,
+    rowid: i64,
+    logical_vals: &[Value],
+    params: &[Value],
+) -> Result<Vec<Value>> {
+    let mut keys = eval_index_column_values(ctx, tbl, idx, rowid, logical_vals, params)?;
     keys.push(Value::Integer(rowid));
-    keys
+    Ok(keys)
+}
+
+fn format_unique_index_failure(tbl: &TableSchema, idx: &IndexSchema) -> String {
+    if idx.columns.iter().any(|c| c.col_idx.is_none()) {
+        format!("UNIQUE constraint failed: index '{}'", idx.name)
+    } else {
+        let cols_str: Vec<String> = idx
+            .columns
+            .iter()
+            .map(|c| format!("{}.{}", tbl.name, c.name))
+            .collect();
+        format!("UNIQUE constraint failed: {}", cols_str.join(", "))
+    }
 }
 
 /// Deletes `rowid` AND all its secondary index entries from `tbl`.
@@ -2154,7 +3368,7 @@ fn remove_row_and_indexes(
     let old_vals = decode_table_logical_row(ctx, tbl, rowid, &old_payload, params)?;
     for idx in indexes {
         if index_row_passes_partial_where(ctx, tbl, idx, rowid, &old_vals, params)? {
-            let keys = build_index_key_values(idx, rowid, &old_vals);
+            let keys = eval_index_key_values(ctx, tbl, idx, rowid, &old_vals, params)?;
             let orders = idx.key_sort_orders();
             ctx.btree.delete_index(idx.root_pgno, &keys, &orders)?;
         }
@@ -2332,11 +3546,7 @@ fn validate_and_write_row(
         if !index_row_passes_partial_where(ctx, tbl, idx, rowid, &raw_vals, params)? {
             continue;
         }
-        let indexed_vals: Vec<Value> = idx
-            .columns
-            .iter()
-            .map(|ic| raw_vals[ic.col_idx].clone())
-            .collect();
+        let indexed_vals = eval_index_column_values(ctx, tbl, idx, rowid, &raw_vals, params)?;
         // SQL standard & SQLite: NULLs are distinct in UNIQUE indexes!
         if indexed_vals.iter().any(Value::is_null) {
             continue;
@@ -2382,11 +3592,6 @@ fn validate_and_write_row(
                     }
                 }
                 _ => {
-                    let cols_str: Vec<String> = idx
-                        .columns
-                        .iter()
-                        .map(|c| format!("{}.{}", tbl.name, c.name))
-                        .collect();
                     let ext_code = if idx.origin == "pk" {
                         extended::SQLITE_CONSTRAINT_PRIMARYKEY
                     } else {
@@ -2394,7 +3599,7 @@ fn validate_and_write_row(
                     };
                     return Err(SqliteError::constraint(
                         ext_code,
-                        format!("UNIQUE constraint failed: {}", cols_str.join(", ")),
+                        format_unique_index_failure(tbl, idx),
                     )
                     .with_conflict_effect(conflict_action_to_effect(eff)));
                 }
@@ -2427,7 +3632,7 @@ fn validate_and_write_row(
 
     for idx in indexes {
         if index_row_passes_partial_where(ctx, tbl, idx, rowid, &raw_vals, params)? {
-            let keys = build_index_key_values(idx, rowid, &raw_vals);
+            let keys = eval_index_key_values(ctx, tbl, idx, rowid, &raw_vals, params)?;
             let idx_rec = encode_record_with_encoding(&keys, enc);
             let orders = idx.key_sort_orders();
             ctx.btree.insert_index(idx.root_pgno, &idx_rec, &orders)?;
@@ -2594,7 +3799,7 @@ fn resolve_fk_parent_cols(
                         && idx.columns.len() == idxs.len()
                         && idxs.iter().all(|&c_idx| {
                             idx.columns.iter().any(|ic| {
-                                ic.col_idx == c_idx
+                                ic.col_idx == Some(c_idx)
                                     && ic.sort_order.collation == ptbl.columns[c_idx].collation
                             })
                         })
@@ -3173,6 +4378,17 @@ fn apply_parent_update_fk_actions(
 // DML Executors: `INSERT`, `UPDATE`, `DELETE`
 // ============================================================================
 
+fn maybe_count_changes_output(ctx: &ExecContext<'_>, out: QueryOutput) -> QueryOutput {
+    if *ctx.count_changes && out.column_names.is_empty() {
+        QueryOutput {
+            column_names: vec!["count".to_owned()],
+            rows: vec![vec![Value::Integer(ctx.runtime.last_changes as i64)]],
+        }
+    } else {
+        out
+    }
+}
+
 fn exec_insert(
     ctx: &mut ExecContext<'_>,
     ins: &InsertStmt,
@@ -3191,6 +4407,7 @@ fn exec_insert(
         ));
     };
     let indexes = ctx.schema.indexes_for_table(&tbl.name);
+    let dml_ctes = CteStore::default().with_scope(&ins.ctes);
 
     // Resolve target column mapping (`None` = all columns in order; `Some(names)` = mapped columns, `usize::MAX` for implicit `rowid`)
     let col_targets: Option<Vec<usize>> = if let Some(ref cnames) = ins.columns {
@@ -3220,15 +4437,13 @@ fn exec_insert(
             for erow in expr_rows {
                 let mut vrow = Vec::with_capacity(erow.len());
                 for e in erow {
-                    vrow.push(eval_expr(ctx, e, params, &[], &CteStore::default(), None)?);
+                    vrow.push(eval_expr(ctx, e, params, &[], &dml_ctes, None)?);
                 }
                 out.push(vrow);
             }
             out
         }
-        InsertSource::Select(sel) => {
-            exec_select(ctx, sel, params, &[], &CteStore::default())?.rows
-        }
+        InsertSource::Select(sel) => exec_select(ctx, sel, params, &[], &dml_ctes)?.rows,
     };
 
     ctx.runtime.last_changes = 0;
@@ -3331,7 +4546,7 @@ fn exec_insert(
                     pe,
                     params,
                     &[rscope.clone()],
-                    &CteStore::default(),
+                    &dml_ctes,
                     None,
                 )?);
             }
@@ -3343,10 +4558,13 @@ fn exec_insert(
         verify_fk_suspects(ctx, &stmt_fk_suspects)?;
     }
 
-    Ok(QueryOutput {
-        column_names: ret_col_names,
-        rows: ret_rows,
-    })
+    Ok(maybe_count_changes_output(
+        ctx,
+        QueryOutput {
+            column_names: ret_col_names,
+            rows: ret_rows,
+        },
+    ))
 }
 
 fn exec_update(
@@ -3367,6 +4585,7 @@ fn exec_update(
         ));
     };
     let indexes = ctx.schema.indexes_for_table(&tbl.name);
+    let dml_ctes = CteStore::default().with_scope(&upd.ctes);
 
     // Resolve assignment target columns (`usize::MAX` = implicit `rowid`)
     let mut resolved_assigns = Vec::with_capacity(upd.assignments.len());
@@ -3390,7 +4609,7 @@ fn exec_update(
         upd.selection.as_ref(),
         params,
         &[],
-        &CteStore::default(),
+        &dml_ctes,
     )?;
 
     // Two-phase update: collect all matching `(old_rowid, new_rowid_opt, new_col_vals)` before mutating B-Trees!
@@ -3399,7 +4618,7 @@ fn exec_update(
         let old_vals = decode_table_logical_row(ctx, &tbl, old_rowid, &payload, params)?;
         let scope = make_single_table_scope(&tbl, upd.alias.as_deref(), old_rowid, &old_vals);
         if let Some(ref w) = upd.selection {
-            let cond = eval_expr(ctx, w, params, &[scope.clone()], &CteStore::default(), None)?;
+            let cond = eval_expr(ctx, w, params, &[scope.clone()], &dml_ctes, None)?;
             if cond.truthiness() != Some(true) {
                 continue;
             }
@@ -3413,7 +4632,7 @@ fn exec_update(
                 val_expr,
                 params,
                 &[scope.clone()],
-                &CteStore::default(),
+                &dml_ctes,
                 None,
             )?;
             if target_idx == usize::MAX {
@@ -3495,7 +4714,7 @@ fn exec_update(
                     pe,
                     params,
                     &[rscope.clone()],
-                    &CteStore::default(),
+                    &dml_ctes,
                     None,
                 )?);
             }
@@ -3507,10 +4726,13 @@ fn exec_update(
         verify_fk_suspects(ctx, &stmt_fk_suspects)?;
     }
 
-    Ok(QueryOutput {
-        column_names: ret_col_names,
-        rows: ret_rows,
-    })
+    Ok(maybe_count_changes_output(
+        ctx,
+        QueryOutput {
+            column_names: ret_col_names,
+            rows: ret_rows,
+        },
+    ))
 }
 
 fn exec_delete(
@@ -3531,6 +4753,7 @@ fn exec_delete(
         ));
     };
     let indexes = ctx.schema.indexes_for_table(&tbl.name);
+    let dml_ctes = CteStore::default().with_scope(&del.ctes);
 
     // Fast path (`OP_Clear`) for unconditional `DELETE FROM tbl` without `RETURNING` when no FKs reference `tbl`!
     if del.selection.is_none() && del.returning.is_empty() && !*ctx.foreign_keys {
@@ -3541,7 +4764,7 @@ fn exec_delete(
         }
         ctx.runtime.last_changes = count;
         ctx.runtime.total_changes += count;
-        return Ok(QueryOutput::default());
+        return Ok(maybe_count_changes_output(ctx, QueryOutput::default()));
     }
 
     let candidates = read_table_with_plan(
@@ -3551,7 +4774,7 @@ fn exec_delete(
         del.selection.as_ref(),
         params,
         &[],
-        &CteStore::default(),
+        &dml_ctes,
     )?;
 
     let mut targets = Vec::new();
@@ -3559,7 +4782,7 @@ fn exec_delete(
         let vals = decode_table_logical_row(ctx, &tbl, rowid, &payload, params)?;
         let scope = make_single_table_scope(&tbl, del.alias.as_deref(), rowid, &vals);
         if let Some(ref w) = del.selection {
-            let cond = eval_expr(ctx, w, params, &[scope.clone()], &CteStore::default(), None)?;
+            let cond = eval_expr(ctx, w, params, &[scope.clone()], &dml_ctes, None)?;
             if cond.truthiness() != Some(true) {
                 continue;
             }
@@ -3612,7 +4835,7 @@ fn exec_delete(
                         pe,
                         params,
                         &[scope.clone()],
-                        &CteStore::default(),
+                        &dml_ctes,
                         None,
                     )?);
                 }
@@ -3625,10 +4848,13 @@ fn exec_delete(
         verify_fk_suspects(ctx, &stmt_fk_suspects)?;
     }
 
-    Ok(QueryOutput {
-        column_names: ret_col_names,
-        rows: ret_rows,
-    })
+    Ok(maybe_count_changes_output(
+        ctx,
+        QueryOutput {
+            column_names: ret_col_names,
+            rows: ret_rows,
+        },
+    ))
 }
 
 // ============================================================================
@@ -3781,42 +5007,7 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
 
     let idx_root = ctx.btree.create_index()?;
     let idx_schema = build_index_schema_from_ast(ci, &tbl, idx_root)?;
-    let orders = idx_schema.key_sort_orders();
-
-    // Backfill existing table rows into the new index B-Tree (and enforce UNIQUE if `ci.unique`!)
-    let existing_rows = ctx.btree.scan_table(tbl.root_pgno)?;
-    for (rowid, payload) in existing_rows {
-        let vals = decode_table_logical_row(ctx, &tbl, rowid, &payload, &[])?;
-        if !index_row_passes_partial_where(ctx, &tbl, &idx_schema, rowid, &vals, &[])? {
-            continue;
-        }
-        let indexed_only: Vec<Value> = idx_schema
-            .columns
-            .iter()
-            .map(|ic| vals[ic.col_idx].clone())
-            .collect();
-        if ci.unique && indexed_only.iter().all(|v| !v.is_null()) {
-            let hits = ctx.btree.seek_index_equal(
-                idx_root,
-                &indexed_only,
-                &orders[..indexed_only.len()],
-            )?;
-            if !hits.is_empty() {
-                let cols_str: Vec<String> = idx_schema
-                    .columns
-                    .iter()
-                    .map(|c| format!("{}.{}", tbl.name, c.name))
-                    .collect();
-                return Err(SqliteError::constraint(
-                    extended::SQLITE_CONSTRAINT_UNIQUE,
-                    format!("UNIQUE constraint failed: {}", cols_str.join(", ")),
-                ));
-            }
-        }
-        let keys = build_index_key_values(&idx_schema, rowid, &vals);
-        let idx_rec = encode_record_with_encoding(&keys, ctx.btree.encoding());
-        ctx.btree.insert_index(idx_root, &idx_rec, &orders)?;
-    }
+    populate_index_btree(ctx, &tbl, &idx_schema)?;
 
     insert_schema_entry(
         ctx.btree,
@@ -3827,6 +5018,84 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
         Some(&ci.raw_sql),
     )?;
     *ctx.schema = Schema::load(ctx.btree)?;
+    Ok(())
+}
+
+fn populate_index_btree(
+    ctx: &mut ExecContext<'_>,
+    tbl: &TableSchema,
+    idx_schema: &IndexSchema,
+) -> Result<()> {
+    let orders = idx_schema.key_sort_orders();
+    let existing_rows = ctx.btree.scan_table(tbl.root_pgno)?;
+    for (rowid, payload) in existing_rows {
+        let vals = decode_table_logical_row(ctx, tbl, rowid, &payload, &[])?;
+        if !index_row_passes_partial_where(ctx, tbl, idx_schema, rowid, &vals, &[])? {
+            continue;
+        }
+        let indexed_only = eval_index_column_values(ctx, tbl, idx_schema, rowid, &vals, &[])?;
+        if idx_schema.unique && indexed_only.iter().all(|v| !v.is_null()) {
+            let hits = ctx.btree.seek_index_equal(
+                idx_schema.root_pgno,
+                &indexed_only,
+                &orders[..indexed_only.len()],
+            )?;
+            if !hits.is_empty() {
+                let ext_code = if idx_schema.origin == "pk" {
+                    extended::SQLITE_CONSTRAINT_PRIMARYKEY
+                } else {
+                    extended::SQLITE_CONSTRAINT_UNIQUE
+                };
+                return Err(SqliteError::constraint(
+                    ext_code,
+                    format_unique_index_failure(tbl, idx_schema),
+                ));
+            }
+        }
+        let mut keys = indexed_only;
+        keys.push(Value::Integer(rowid));
+        let idx_rec = encode_record_with_encoding(&keys, ctx.btree.encoding());
+        ctx.btree
+            .insert_index(idx_schema.root_pgno, &idx_rec, &orders)?;
+    }
+    Ok(())
+}
+
+fn exec_reindex(ctx: &mut ExecContext<'_>, target: Option<&str>) -> Result<()> {
+    let targets: Vec<IndexSchema> = match target {
+        None => ctx.schema.indexes.clone(),
+        Some(raw_name) => {
+            let clean = raw_name
+                .strip_prefix("main.")
+                .or_else(|| raw_name.strip_prefix("MAIN."))
+                .unwrap_or(raw_name);
+            if let Some(coll) = Collation::from_name(clean) {
+                ctx.schema
+                    .indexes
+                    .iter()
+                    .filter(|idx| idx.columns.iter().any(|c| c.sort_order.collation == coll))
+                    .cloned()
+                    .collect()
+            } else if ctx.schema.find_user_table(clean).is_some() {
+                ctx.schema.indexes_for_table(clean)
+            } else if let Some(idx) = ctx.schema.find_index(clean).cloned() {
+                vec![idx]
+            } else {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    "unable to identify the object to be reindexed",
+                ));
+            }
+        }
+    };
+
+    for idx in targets {
+        let Some(tbl) = ctx.schema.find_user_table(&idx.table_name).cloned() else {
+            continue;
+        };
+        ctx.btree.clear_tree(idx.root_pgno)?;
+        populate_index_btree(ctx, &tbl, &idx)?;
+    }
     Ok(())
 }
 
@@ -5209,6 +6478,17 @@ fn exec_pragma(
                 rows,
             })
         }
+        "COUNT_CHANGES" => {
+            if let Some(pv) = value {
+                *ctx.count_changes = pragma_to_bool(pv);
+                Ok(QueryOutput::default())
+            } else {
+                Ok(single_col(
+                    "count_changes",
+                    Value::Integer(i64::from(*ctx.count_changes)),
+                ))
+            }
+        }
         "INDEX_INFO" => {
             let Some(pv) = value else {
                 return Ok(QueryOutput::default());
@@ -5221,12 +6501,17 @@ fn exec_pragma(
                 .columns
                 .iter()
                 .enumerate()
-                .map(|(seqno, ic)| {
-                    vec![
+                .map(|(seqno, ic)| match ic.col_idx {
+                    Some(ci) => vec![
                         Value::Integer(seqno as i64),
-                        Value::Integer(ic.col_idx as i64),
+                        Value::Integer(ci as i64),
                         Value::Text(ic.name.clone()),
-                    ]
+                    ],
+                    None => vec![
+                        Value::Integer(seqno as i64),
+                        Value::Integer(-2),
+                        Value::Null,
+                    ],
                 })
                 .collect();
             Ok(QueryOutput {

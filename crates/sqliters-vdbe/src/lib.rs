@@ -1009,7 +1009,8 @@ impl VdbeVm {
                         P4::Str(s) => s.as_str(),
                         _ => "",
                     };
-                    self.regs[ins.p2 as usize] = eval_cast(src, type_name);
+                    self.regs[ins.p2 as usize] =
+                        eval_cast_with_encoding(src, type_name, btree.encoding());
                 }
                 Opcode::Function => {
                     // p1 = first_arg_reg, p3 = dest_reg, p4 = Func { name, argc }
@@ -1259,15 +1260,57 @@ fn compare_with_affinity(
 }
 
 pub fn eval_cast(val: Value, type_name: &str) -> Value {
+    eval_cast_with_encoding(val, type_name, TextEncoding::Utf8)
+}
+
+pub fn eval_cast_with_encoding(val: Value, type_name: &str, enc: TextEncoding) -> Value {
     if val.is_null() {
         return Value::Null;
     }
     match TypeAffinity::from_declared_type(type_name) {
         TypeAffinity::Blob => match val {
             Value::Blob(_) => val,
-            other => Value::Blob(other.to_text_lossy().into_bytes()),
+            other => {
+                let s = other.to_text_lossy();
+                let bytes = match enc {
+                    TextEncoding::Utf8 => s.into_bytes(),
+                    TextEncoding::Utf16Le => s.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+                    TextEncoding::Utf16Be => s.encode_utf16().flat_map(u16::to_be_bytes).collect(),
+                };
+                Value::Blob(bytes)
+            }
         },
-        TypeAffinity::Text => Value::Text(val.to_text_lossy()),
+        TypeAffinity::Text => match val {
+            Value::Blob(b) => {
+                let s = match enc {
+                    TextEncoding::Utf8 => {
+                        let slice = b
+                            .iter()
+                            .position(|&x| x == 0)
+                            .map_or(b.as_slice(), |p| &b[..p]);
+                        String::from_utf8_lossy(slice).into_owned()
+                    }
+                    TextEncoding::Utf16Le => {
+                        let units: Vec<u16> = b
+                            .chunks_exact(2)
+                            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                            .take_while(|&u| u != 0)
+                            .collect();
+                        String::from_utf16_lossy(&units)
+                    }
+                    TextEncoding::Utf16Be => {
+                        let units: Vec<u16> = b
+                            .chunks_exact(2)
+                            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                            .take_while(|&u| u != 0)
+                            .collect();
+                        String::from_utf16_lossy(&units)
+                    }
+                };
+                Value::Text(s)
+            }
+            other => Value::Text(other.to_text_lossy()),
+        },
         TypeAffinity::Integer => Value::Integer(val.to_integer_lossy()),
         TypeAffinity::Real => Value::real(val.to_real_lossy()),
         TypeAffinity::Numeric => {

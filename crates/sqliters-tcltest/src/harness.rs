@@ -698,7 +698,13 @@ fn db_eval(
     };
 
     // Note: `host` is NOT borrowed during `interp.eval(body)`!
-    for (vals, cols) in rows {
+    let start_rb = host
+        .borrow()
+        .dbs
+        .get(db_name)
+        .map_or(0, |h| h.conn.rollback_count());
+    let total_rows = rows.len();
+    for (row_idx, (vals, cols)) in rows.into_iter().enumerate() {
         if let Some(arr) = arr_name_opt {
             interp.set_array_entry(arr, "*", format_list(&cols));
             for (c, v) in cols.iter().zip(vals.iter()) {
@@ -713,6 +719,17 @@ fn db_eval(
             Ok(_) | Err(TclControl::Continue) => {}
             Err(TclControl::Break) => break,
             Err(other) => return Err(other),
+        }
+        if row_idx + 1 < total_rows {
+            let mut h_guard = host.borrow_mut();
+            if let Some(handle) = h_guard.dbs.get_mut(db_name)
+                && handle.conn.rollback_count() != start_rb
+            {
+                handle.last_errcode = 4; // SQLITE_ABORT
+                handle.last_extended_errcode = 4;
+                handle.last_errmsg = "abort due to ROLLBACK".to_string();
+                return Err(TclControl::Error("abort due to ROLLBACK".to_string()));
+            }
         }
     }
     Ok(String::new())
