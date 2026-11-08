@@ -17,6 +17,9 @@ mod conflict;
 #[path = "sqlite_test/conflict2.rs"]
 mod conflict2;
 #[allow(non_snake_case)]
+#[path = "sqlite_test/date4.rs"]
+mod date4;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/delete3.rs"]
 mod delete3;
 #[allow(non_snake_case)]
