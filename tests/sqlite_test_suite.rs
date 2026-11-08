@@ -154,3 +154,6 @@ mod whereB;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/whereJ.rs"]
 mod whereJ;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/whereM.rs"]
+mod whereM;
