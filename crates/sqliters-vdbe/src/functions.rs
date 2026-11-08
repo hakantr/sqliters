@@ -353,8 +353,14 @@ pub fn eval_scalar_function(
         }
         "ZEROBLOB" => {
             check_arity(name, args, 1, 1)?;
-            let n = args[0].to_integer_lossy().max(0) as usize;
-            Ok(Value::Blob(vec![0u8; n]))
+            let raw_n = args[0].to_integer_lossy().max(0);
+            if raw_n > 1_000_000_000 {
+                return Err(SqliteError::new(
+                    ErrorCode::TooBig,
+                    "string or blob too big",
+                ));
+            }
+            Ok(Value::Blob(vec![0u8; raw_n as usize]))
         }
         "RANDOM" => {
             check_arity(name, args, 0, 0)?;
@@ -362,8 +368,14 @@ pub fn eval_scalar_function(
         }
         "RANDOMBLOB" => {
             check_arity(name, args, 1, 1)?;
-            let n = args[0].to_integer_lossy().max(1) as usize;
-            let mut buf = vec![0u8; n];
+            let raw_n = args[0].to_integer_lossy().max(1);
+            if raw_n > 1_000_000_000 {
+                return Err(SqliteError::new(
+                    ErrorCode::TooBig,
+                    "string or blob too big",
+                ));
+            }
+            let mut buf = vec![0u8; raw_n as usize];
             for chunk in buf.chunks_mut(8) {
                 let bytes = next_prng_u64().to_le_bytes();
                 chunk.copy_from_slice(&bytes[..chunk.len()]);

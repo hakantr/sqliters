@@ -104,23 +104,26 @@ fn main() {
 
     std::thread::scope(|s| {
         for _ in 0..num_threads {
-            s.spawn(|| {
-                loop {
-                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
-                    if idx >= total_files {
-                        break;
+            std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn_scoped(s, || {
+                    loop {
+                        let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                        if idx >= total_files {
+                            break;
+                        }
+                        let path = &files[idx];
+                        let stem = path
+                            .file_stem()
+                            .and_then(|st| st.to_str())
+                            .unwrap_or("unknown");
+                        let raw = fs::read_to_string(path).unwrap_or_default();
+                        let stripped = strip_test_comments(&raw);
+                        let rep = evaluate_test_script(stem, &stripped);
+                        results.lock().unwrap().push(rep);
                     }
-                    let path = &files[idx];
-                    let stem = path
-                        .file_stem()
-                        .and_then(|st| st.to_str())
-                        .unwrap_or("unknown");
-                    let raw = fs::read_to_string(path).unwrap_or_default();
-                    let stripped = strip_test_comments(&raw);
-                    let rep = evaluate_test_script(stem, &stripped);
-                    results.lock().unwrap().push(rep);
-                }
-            });
+                })
+                .expect("failed to spawn tclsuite worker");
         }
     });
 

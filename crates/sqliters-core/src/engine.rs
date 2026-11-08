@@ -3000,12 +3000,33 @@ fn static_schema_cols_for_tos(
         TableOrSubquery::Table { name, alias, .. } => {
             let eff = alias.clone().unwrap_or_else(|| name.clone());
             if let Some((s_idx, c_idx)) = ctes.locate(name) {
+                if visited.contains(&(s_idx, c_idx)) {
+                    return None;
+                }
                 let cte = &ctes.scopes[s_idx][c_idx];
                 let meta = infer_cte_meta_guarded(name, outer_scopes, schema, ctes, visited);
                 let cnames: Vec<String> = if let Some(ref explicit) = cte.columns {
                     explicit.clone()
                 } else {
-                    static_select_col_names(&cte.query.body, outer_scopes, schema, ctes, visited)
+                    visited.push((s_idx, c_idx));
+                    let mut sub_ctes = CteStore {
+                        scopes: ctes.scopes[..=s_idx].to_vec(),
+                        working: Vec::new(),
+                        resolving: Vec::new(),
+                        limit_hint: None,
+                    };
+                    if !cte.query.ctes.is_empty() {
+                        sub_ctes.scopes.push(cte.query.ctes.clone());
+                    }
+                    let names = static_select_col_names(
+                        &cte.query.body,
+                        outer_scopes,
+                        schema,
+                        &sub_ctes,
+                        visited,
+                    );
+                    visited.pop();
+                    names
                 };
                 return Some(
                     cnames
