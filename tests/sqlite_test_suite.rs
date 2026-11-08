@@ -116,6 +116,9 @@ mod select8;
 #[path = "sqlite_test/selectB.rs"]
 mod selectB;
 #[allow(non_snake_case)]
+#[path = "sqlite_test/selectE.rs"]
+mod selectE;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/selectF.rs"]
 mod selectF;
 #[allow(non_snake_case)]
