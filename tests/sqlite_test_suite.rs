@@ -59,6 +59,9 @@ mod like2;
 #[path = "sqlite_test/notnull2.rs"]
 mod notnull2;
 #[allow(non_snake_case)]
+#[path = "sqlite_test/null.rs"]
+mod null;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/numcast.rs"]
 mod numcast;
 #[allow(non_snake_case)]
