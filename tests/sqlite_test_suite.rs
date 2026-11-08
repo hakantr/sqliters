@@ -101,6 +101,9 @@ mod savepoint5;
 #[path = "sqlite_test/savepoint6.rs"]
 mod savepoint6;
 #[allow(non_snake_case)]
+#[path = "sqlite_test/savepoint7.rs"]
+mod savepoint7;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/select8.rs"]
 mod select8;
 #[allow(non_snake_case)]
