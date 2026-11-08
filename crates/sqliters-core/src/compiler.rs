@@ -741,16 +741,21 @@ fn compile_single_table_select(
         None
     };
 
-    // Optional Sorter setup for ORDER BY
+    let plan = choose_access_plan(tbl, alias, selection, schema);
+
+    // Optional Sorter setup for ORDER BY (elided when a natural ascending rowid scan already satisfies `ORDER BY`!)
     let sorter_setup = if !order_by.is_empty() {
-        let s_cursor = prog.alloc_cursor();
         let mut sort_sources = Vec::with_capacity(order_by.len());
         let mut sort_orders = Vec::with_capacity(order_by.len());
-        for ob in order_by {
+        let mut first_resolved_expr: Option<Expr> = None;
+        for (idx, ob) in order_by.iter().enumerate() {
             let Some((src, coll_ref_expr)) = resolve_order_by_source(&ob.expr, &expanded, tbl)
             else {
                 return Ok(None);
             };
+            if idx == 0 {
+                first_resolved_expr = Some(coll_ref_expr.clone());
+            }
             let coll = if let Expr::Collate { collation, .. } = &ob.expr {
                 Collation::from_name(collation).unwrap_or_default()
             } else {
@@ -765,21 +770,33 @@ fn compile_single_table_select(
                 collation: coll,
             });
         }
-        prog.emit(
-            Instruction::new(
-                Opcode::SorterOpen,
-                s_cursor,
-                (sort_sources.len() + expanded.len()) as i32,
-                0,
-            )
-            .with_p4(P4::KeyInfo(sort_orders)),
-        );
-        Some((s_cursor, sort_sources))
+
+        let natural_rowid_order = order_by.len() == 1
+            && !order_by[0].desc
+            && matches!(plan, AccessPlan::FullScan | AccessPlan::RowidSeek { .. })
+            && first_resolved_expr
+                .as_ref()
+                .is_some_and(|e| is_table_rowid_column_expr(e, tbl, alias));
+
+        if natural_rowid_order {
+            None
+        } else {
+            let s_cursor = prog.alloc_cursor();
+            prog.emit(
+                Instruction::new(
+                    Opcode::SorterOpen,
+                    s_cursor,
+                    (sort_sources.len() + expanded.len()) as i32,
+                    0,
+                )
+                .with_p4(P4::KeyInfo(sort_orders)),
+            );
+            Some((s_cursor, sort_sources))
+        }
     } else {
         None
     };
 
-    let plan = choose_access_plan(tbl, alias, selection, schema);
     let mut jumps_after_scan = Vec::new();
     let mut jumps_next_row = Vec::new();
     let mut idx_cursor_opt = None;
@@ -1058,6 +1075,25 @@ fn goto_placeholder() -> Instruction {
 enum OrderBySource {
     ProjCol(usize),
     Expr(Expr),
+}
+
+fn is_table_rowid_column_expr(expr: &Expr, tbl: &TableSchema, alias: Option<&str>) -> bool {
+    if tbl.without_rowid {
+        return false;
+    }
+    let Expr::Column { table, column } = expr else {
+        return false;
+    };
+    if let Some(t) = table {
+        let expected = alias.unwrap_or(&tbl.name);
+        if !t.eq_ignore_ascii_case(expected) {
+            return false;
+        }
+    }
+    tbl.is_implicit_rowid_name(column)
+        || tbl
+            .rowid_alias_col
+            .is_some_and(|ipk| tbl.columns[ipk].name.eq_ignore_ascii_case(column))
 }
 
 fn resolve_order_by_source(

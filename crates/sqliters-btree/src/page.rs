@@ -957,3 +957,301 @@ pub fn try_delete_table_leaf_in_place(
         now_empty: new_n == 0,
     })
 }
+
+/// Borrowed view of a single cell on a raw `TableLeaf` (`0x0d`) page without heap allocation.
+#[derive(Debug, Clone, Copy)]
+pub struct RawTableLeafCell<'a> {
+    pub rowid: i64,
+    pub total_payload_len: u32,
+    pub local_payload: &'a [u8],
+    pub overflow_page: Option<Pgno>,
+}
+
+/// Borrowed view of the payload metadata of a single cell on a raw `IndexLeaf` (`0x0a`)
+/// or `IndexInterior` (`0x02`) page without heap allocation.
+#[derive(Debug, Clone, Copy)]
+pub struct RawIndexCell<'a> {
+    pub total_payload_len: u32,
+    pub local_payload: &'a [u8],
+    pub overflow_page: Option<Pgno>,
+}
+
+/// Reads `(page_type, n_cell, right_child)` from a raw B-tree page header without parsing cells.
+#[inline]
+pub fn raw_page_header(
+    pgno: Pgno,
+    usable_size: u32,
+    raw: &[u8],
+) -> Result<(BtreePageType, usize, Pgno)> {
+    let usable = usable_size as usize;
+    if raw.len() < usable {
+        return Err(SqliteError::corrupt(
+            "raw page buffer smaller than usable_size",
+        ));
+    }
+    let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+    if hdr_off + 8 > usable {
+        return Err(SqliteError::corrupt(format!(
+            "truncated btree page header on page {pgno}"
+        )));
+    }
+    let page_type = BtreePageType::from_byte(raw[hdr_off])?;
+    let hdr_size = page_type.header_size();
+    if hdr_off + hdr_size > usable {
+        return Err(SqliteError::corrupt(format!(
+            "truncated interior btree page header on page {pgno}"
+        )));
+    }
+    let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
+    let ptr_end = (hdr_off + hdr_size)
+        .checked_add(2 * n_cell)
+        .ok_or_else(|| SqliteError::corrupt("cell pointer array overflow"))?;
+    if ptr_end > usable {
+        return Err(SqliteError::corrupt(format!(
+            "cell pointer array ({ptr_end}) exceeds usable page size ({usable}) on page {pgno}"
+        )));
+    }
+    let right_child = if page_type.is_leaf() {
+        0
+    } else {
+        u32::from_be_bytes([
+            raw[hdr_off + 8],
+            raw[hdr_off + 9],
+            raw[hdr_off + 10],
+            raw[hdr_off + 11],
+        ])
+    };
+    Ok((page_type, n_cell, right_child))
+}
+
+/// Resolves and bounds-checks the byte offset of `cell_idx` on `raw`.
+#[inline]
+pub fn raw_cell_offset(
+    pgno: Pgno,
+    usable_size: u32,
+    raw: &[u8],
+    hdr_size: usize,
+    n_cell: usize,
+    cell_idx: usize,
+) -> Result<usize> {
+    if cell_idx >= n_cell {
+        return Err(SqliteError::corrupt(format!(
+            "cell index {cell_idx} out of bounds ({n_cell}) on page {pgno}"
+        )));
+    }
+    let usable = usable_size as usize;
+    let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+    let ptr_base = hdr_off + hdr_size;
+    let ptr_end = ptr_base
+        .checked_add(2 * n_cell)
+        .ok_or_else(|| SqliteError::corrupt("cell pointer array overflow"))?;
+    if ptr_end > usable || raw.len() < usable {
+        return Err(SqliteError::corrupt(format!(
+            "cell pointer array out of bounds on page {pgno}"
+        )));
+    }
+    let p = ptr_base + 2 * cell_idx;
+    let off = u16::from_be_bytes([raw[p], raw[p + 1]]) as usize;
+    if off < ptr_end || off >= usable {
+        return Err(SqliteError::corrupt(format!(
+            "invalid cell offset {off} on page {pgno}"
+        )));
+    }
+    Ok(off)
+}
+
+/// Reads only the `rowid` of `cell_idx` on a raw `TableLeaf` (`0x0d`) page.
+#[inline]
+pub fn read_table_leaf_rowid(
+    pgno: Pgno,
+    usable_size: u32,
+    raw: &[u8],
+    n_cell: usize,
+    cell_idx: usize,
+) -> Result<i64> {
+    let usable = usable_size as usize;
+    let off = raw_cell_offset(pgno, usable_size, raw, 8, n_cell, cell_idx)?;
+    let slice = &raw[off..usable];
+    let (_, n1) = get_varint(slice)?;
+    let (rowid, _) = get_varint_i64(&slice[n1..])?;
+    Ok(rowid)
+}
+
+/// Reads a single borrowed `RawTableLeafCell` at `cell_idx` on a raw `TableLeaf` (`0x0d`) page.
+pub fn read_table_leaf_cell(
+    pgno: Pgno,
+    usable_size: u32,
+    raw: &[u8],
+    n_cell: usize,
+    cell_idx: usize,
+) -> Result<RawTableLeafCell<'_>> {
+    let usable = usable_size as usize;
+    let off = raw_cell_offset(pgno, usable_size, raw, 8, n_cell, cell_idx)?;
+    let slice = &raw[off..usable];
+    let (payload_u64, n1) = get_varint(slice)?;
+    let total_payload_len = u32::try_from(payload_u64)
+        .map_err(|_| SqliteError::corrupt("table cell payload > 4GiB"))?;
+    let (rowid, n2) = get_varint_i64(&slice[n1..])?;
+    let bounds = PayloadBounds::for_table_leaf(usable_size);
+    let body_start = n1 + n2;
+    let local_len = bounds.local_len(total_payload_len);
+    let body_end = body_start + local_len;
+    let has_ovfl = (local_len as u32) < total_payload_len;
+    let needed = body_end + if has_ovfl { 4 } else { 0 };
+    if needed > slice.len() {
+        return Err(SqliteError::corrupt(format!(
+            "table leaf cell extends past end of page {pgno}"
+        )));
+    }
+    let overflow_page = if has_ovfl {
+        Some(u32::from_be_bytes([
+            slice[body_end],
+            slice[body_end + 1],
+            slice[body_end + 2],
+            slice[body_end + 3],
+        ]))
+    } else {
+        None
+    };
+    Ok(RawTableLeafCell {
+        rowid,
+        total_payload_len,
+        local_payload: &slice[body_start..body_end],
+        overflow_page,
+    })
+}
+
+/// Reads `(left_child, key)` at `cell_idx` on a raw `TableInterior` (`0x05`) page.
+#[inline]
+pub fn read_table_interior_cell(
+    pgno: Pgno,
+    usable_size: u32,
+    raw: &[u8],
+    n_cell: usize,
+    cell_idx: usize,
+) -> Result<(Pgno, i64)> {
+    let usable = usable_size as usize;
+    let off = raw_cell_offset(pgno, usable_size, raw, 12, n_cell, cell_idx)?;
+    if off + 5 > usable {
+        return Err(SqliteError::corrupt(format!(
+            "truncated table interior cell on page {pgno}"
+        )));
+    }
+    let left_child = u32::from_be_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+    let (key, _) = get_varint_i64(&raw[off + 4..usable])?;
+    Ok((left_child, key))
+}
+
+/// Reads a single borrowed `RawIndexCell` at `cell_idx` on a raw `IndexLeaf` (`0x0a`) page.
+pub fn read_index_leaf_cell(
+    pgno: Pgno,
+    usable_size: u32,
+    raw: &[u8],
+    n_cell: usize,
+    cell_idx: usize,
+) -> Result<RawIndexCell<'_>> {
+    let usable = usable_size as usize;
+    let off = raw_cell_offset(pgno, usable_size, raw, 8, n_cell, cell_idx)?;
+    let slice = &raw[off..usable];
+    let (payload_u64, n1) = get_varint(slice)?;
+    let total_payload_len = u32::try_from(payload_u64)
+        .map_err(|_| SqliteError::corrupt("index leaf payload > 4GiB"))?;
+    let bounds = PayloadBounds::for_index(usable_size);
+    let local_len = bounds.local_len(total_payload_len);
+    let body_end = n1 + local_len;
+    let has_ovfl = (local_len as u32) < total_payload_len;
+    let needed = body_end + if has_ovfl { 4 } else { 0 };
+    if needed > slice.len() {
+        return Err(SqliteError::corrupt(format!(
+            "index leaf cell extends past end of page {pgno}"
+        )));
+    }
+    let overflow_page = if has_ovfl {
+        Some(u32::from_be_bytes([
+            slice[body_end],
+            slice[body_end + 1],
+            slice[body_end + 2],
+            slice[body_end + 3],
+        ]))
+    } else {
+        None
+    };
+    Ok(RawIndexCell {
+        total_payload_len,
+        local_payload: &slice[n1..body_end],
+        overflow_page,
+    })
+}
+
+/// Reads `(left_child, RawIndexCell)` at `cell_idx` on a raw `IndexInterior` (`0x02`) page.
+pub fn read_index_interior_cell(
+    pgno: Pgno,
+    usable_size: u32,
+    raw: &[u8],
+    n_cell: usize,
+    cell_idx: usize,
+) -> Result<(Pgno, RawIndexCell<'_>)> {
+    let usable = usable_size as usize;
+    let off = raw_cell_offset(pgno, usable_size, raw, 12, n_cell, cell_idx)?;
+    if off + 5 > usable {
+        return Err(SqliteError::corrupt(format!(
+            "truncated index interior cell on page {pgno}"
+        )));
+    }
+    let left_child = u32::from_be_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+    let slice = &raw[off + 4..usable];
+    let (payload_u64, n1) = get_varint(slice)?;
+    let total_payload_len = u32::try_from(payload_u64)
+        .map_err(|_| SqliteError::corrupt("index interior payload > 4GiB"))?;
+    let bounds = PayloadBounds::for_index(usable_size);
+    let local_len = bounds.local_len(total_payload_len);
+    let body_end = n1 + local_len;
+    let has_ovfl = (local_len as u32) < total_payload_len;
+    let needed = body_end + if has_ovfl { 4 } else { 0 };
+    if needed > slice.len() {
+        return Err(SqliteError::corrupt(format!(
+            "index interior cell extends past end of page {pgno}"
+        )));
+    }
+    let overflow_page = if has_ovfl {
+        Some(u32::from_be_bytes([
+            slice[body_end],
+            slice[body_end + 1],
+            slice[body_end + 2],
+            slice[body_end + 3],
+        ]))
+    } else {
+        None
+    };
+    Ok((
+        left_child,
+        RawIndexCell {
+            total_payload_len,
+            local_payload: &slice[n1..body_end],
+            overflow_page,
+        },
+    ))
+}
+
+/// Binary-searches a raw `TableLeaf` (`0x0d`) page for `target_rowid` without allocating,
+/// returning `Ok(exact_idx)` on exact match or `Err(insert_idx)` (`0..=n_cell`) on miss.
+pub fn binary_search_table_leaf(
+    pgno: Pgno,
+    usable_size: u32,
+    raw: &[u8],
+    n_cell: usize,
+    target_rowid: i64,
+) -> Result<std::result::Result<usize, usize>> {
+    let mut lo = 0usize;
+    let mut hi = n_cell;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let cell_rowid = read_table_leaf_rowid(pgno, usable_size, raw, n_cell, mid)?;
+        match cell_rowid.cmp(&target_rowid) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => return Ok(Ok(mid)),
+        }
+    }
+    Ok(Err(lo))
+}

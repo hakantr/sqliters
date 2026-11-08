@@ -6,11 +6,10 @@ pub mod functions;
 
 use std::cmp::Ordering;
 
-use sqliters_btree::Btree;
+use sqliters_btree::{Btree, CursorId};
 use sqliters_types::{
     Collation, ErrorCode, KeySortOrder, Pgno, Result, SqliteError, TextEncoding, TypeAffinity,
-    Value, decode_record_column_with_encoding, decode_record_with_encoding,
-    encode_record_with_encoding,
+    Value, decode_record_with_encoding, encode_record_with_encoding,
 };
 
 pub use functions::{
@@ -344,16 +343,16 @@ pub enum VmStep {
 enum CursorState {
     Closed,
     Table {
+        cursor_id: CursorId,
         root_pgno: Pgno,
-        entries: Vec<(i64, Vec<u8>)>,
-        pos: usize,
-        point_row: Option<(i64, Vec<u8>)>,
+        writable: bool,
     },
     Index {
+        cursor_id: CursorId,
         root_pgno: Pgno,
         orders: Vec<KeySortOrder>,
-        matches: Vec<Vec<Value>>,
-        pos: usize,
+        writable: bool,
+        eq_prefix: Option<Vec<Value>>,
     },
     Ephemeral {
         rows: Vec<Vec<Value>>,
@@ -396,6 +395,40 @@ impl VdbeVm {
         }
     }
 
+    #[inline]
+    fn ensure_cursor_slot(&mut self, cid: usize) {
+        if cid >= self.cursors.len() {
+            self.cursors.resize_with(cid + 1, || CursorState::Closed);
+        }
+    }
+
+    #[inline]
+    fn close_cursor_slot(&mut self, cid: usize, btree: &mut Btree) {
+        if cid < self.cursors.len() {
+            match std::mem::replace(&mut self.cursors[cid], CursorState::Closed) {
+                CursorState::Table { cursor_id, .. } | CursorState::Index { cursor_id, .. } => {
+                    btree.close_cursor(cursor_id);
+                }
+                CursorState::Closed
+                | CursorState::Ephemeral { .. }
+                | CursorState::Sorter { .. } => {}
+            }
+        }
+    }
+
+    /// Closes all open [`Btree`] cursors owned by this VM without resetting program state.
+    pub fn close_cursors(&mut self, btree: &mut Btree) {
+        for cid in 0..self.cursors.len() {
+            self.close_cursor_slot(cid, btree);
+        }
+    }
+
+    /// Closes all open [`Btree`] cursors and resets the VM back to PC 0.
+    pub fn reset_with_btree(&mut self, btree: &mut Btree) {
+        self.close_cursors(btree);
+        self.reset();
+    }
+
     pub fn reset(&mut self) {
         self.pc = 0;
         self.halted = false;
@@ -414,8 +447,24 @@ impl VdbeVm {
         if self.halted {
             return Ok(VmStep::Done);
         }
+        match self.step_inner(btree) {
+            Ok(VmStep::Row(row)) => Ok(VmStep::Row(row)),
+            Ok(VmStep::Done) => {
+                self.halted = true;
+                self.close_cursors(btree);
+                Ok(VmStep::Done)
+            }
+            Err(err) => {
+                self.halted = true;
+                self.close_cursors(btree);
+                Err(err)
+            }
+        }
+    }
 
+    fn step_inner(&mut self, btree: &mut Btree) -> Result<VmStep> {
         while self.pc < self.program.ops.len() {
+            btree.check_interrupted()?;
             let ins = self.program.ops[self.pc].clone();
             let mut next_pc = self.pc + 1;
 
@@ -431,6 +480,7 @@ impl VdbeVm {
                 }
                 Opcode::Halt => {
                     self.halted = true;
+                    self.close_cursors(btree);
                     if ins.p1 != 0 {
                         let code = ErrorCode::from_raw_primary(ins.p1);
                         let msg = match &ins.p4 {
@@ -451,29 +501,39 @@ impl VdbeVm {
                 Opcode::OpenRead | Opcode::OpenWrite => {
                     let cid = ins.p1 as usize;
                     let root_pgno = ins.p2 as Pgno;
+                    let writable = ins.opcode == Opcode::OpenWrite;
+                    self.ensure_cursor_slot(cid);
+                    self.close_cursor_slot(cid, btree);
+                    let cursor_id = btree.open_table_cursor(root_pgno, writable);
                     self.cursors[cid] = CursorState::Table {
+                        cursor_id,
                         root_pgno,
-                        entries: Vec::new(),
-                        pos: 0,
-                        point_row: None,
+                        writable,
                     };
                 }
                 Opcode::OpenReadIndex | Opcode::OpenWriteIndex => {
                     let cid = ins.p1 as usize;
                     let root_pgno = ins.p2 as Pgno;
+                    let writable = ins.opcode == Opcode::OpenWriteIndex;
                     let orders = match &ins.p4 {
                         P4::KeyInfo(k) => k.clone(),
                         _ => Vec::new(),
                     };
+                    self.ensure_cursor_slot(cid);
+                    self.close_cursor_slot(cid, btree);
+                    let cursor_id = btree.open_index_cursor(root_pgno, orders.clone(), writable);
                     self.cursors[cid] = CursorState::Index {
+                        cursor_id,
                         root_pgno,
                         orders,
-                        matches: Vec::new(),
-                        pos: 0,
+                        writable,
+                        eq_prefix: None,
                     };
                 }
                 Opcode::OpenEphemeral => {
                     let cid = ins.p1 as usize;
+                    self.ensure_cursor_slot(cid);
+                    self.close_cursor_slot(cid, btree);
                     self.cursors[cid] = CursorState::Ephemeral {
                         rows: Vec::new(),
                         pos: 0,
@@ -481,24 +541,26 @@ impl VdbeVm {
                 }
                 Opcode::Close => {
                     let cid = ins.p1 as usize;
-                    if cid < self.cursors.len() {
-                        self.cursors[cid] = CursorState::Closed;
-                    }
+                    self.close_cursor_slot(cid, btree);
                 }
                 Opcode::Rewind => {
                     let cid = ins.p1 as usize;
                     let jump_empty = ins.p2 as usize;
                     match &mut self.cursors[cid] {
-                        CursorState::Table {
-                            root_pgno,
-                            entries,
-                            pos,
-                            point_row,
+                        CursorState::Table { cursor_id, .. } => {
+                            let id = *cursor_id;
+                            if !btree.cursor_first(id)? {
+                                next_pc = jump_empty;
+                            }
+                        }
+                        CursorState::Index {
+                            cursor_id,
+                            eq_prefix,
+                            ..
                         } => {
-                            *point_row = None;
-                            *entries = btree.scan_table(*root_pgno)?;
-                            *pos = 0;
-                            if entries.is_empty() {
+                            let id = *cursor_id;
+                            *eq_prefix = None;
+                            if !btree.cursor_first(id)? {
                                 next_pc = jump_empty;
                             }
                         }
@@ -515,9 +577,10 @@ impl VdbeVm {
                     let cid = ins.p1 as usize;
                     let loop_target = ins.p2 as usize;
                     match &mut self.cursors[cid] {
-                        CursorState::Table { entries, pos, .. } => {
-                            *pos += 1;
-                            if *pos < entries.len() {
+                        CursorState::Table { cursor_id, .. }
+                        | CursorState::Index { cursor_id, .. } => {
+                            let id = *cursor_id;
+                            if btree.cursor_next(id)? {
                                 next_pc = loop_target;
                             }
                         }
@@ -544,20 +607,12 @@ impl VdbeVm {
                         self.pc = next_pc;
                         continue;
                     };
-                    if let CursorState::Table {
-                        root_pgno,
-                        point_row,
-                        ..
-                    } = &mut self.cursors[cid]
-                    {
-                        if let Some(payload) = btree.seek_table_rowid(*root_pgno, rowid)? {
-                            *point_row = Some((rowid, payload));
-                        } else {
-                            *point_row = None;
-                            next_pc = jump_miss;
-                        }
-                    } else {
-                        return Err(SqliteError::misuse("SeekRowid on non-table cursor"));
+                    let cursor_id = match &self.cursors[cid] {
+                        CursorState::Table { cursor_id, .. } => *cursor_id,
+                        _ => return Err(SqliteError::misuse("SeekRowid on non-table cursor")),
+                    };
+                    if !btree.cursor_seek_rowid(cursor_id, rowid)? {
+                        next_pc = jump_miss;
                     }
                 }
                 Opcode::SeekIndexEqual => {
@@ -567,32 +622,34 @@ impl VdbeVm {
                     let start_reg = ins.p3 as usize;
                     let n_keys = ins.p5 as usize;
                     let prefix: Vec<Value> = self.regs[start_reg..start_reg + n_keys].to_vec();
-                    if let CursorState::Index {
-                        root_pgno,
-                        orders,
-                        matches,
-                        pos,
-                    } = &mut self.cursors[cid]
-                    {
-                        *matches = btree.seek_index_equal(*root_pgno, &prefix, orders)?;
-                        *pos = 0;
-                        if matches.is_empty() {
-                            next_pc = jump_miss;
+                    let cursor_id = match &mut self.cursors[cid] {
+                        CursorState::Index {
+                            cursor_id,
+                            eq_prefix,
+                            ..
+                        } => {
+                            *eq_prefix = Some(prefix.clone());
+                            *cursor_id
                         }
-                    } else {
-                        return Err(SqliteError::misuse("SeekGE on non-index cursor"));
+                        _ => return Err(SqliteError::misuse("SeekGE on non-index cursor")),
+                    };
+                    if !btree.cursor_seek_index_equal_first(cursor_id, &prefix)? {
+                        next_pc = jump_miss;
                     }
                 }
                 Opcode::IndexMatchNext => {
                     let cid = ins.p1 as usize;
                     let loop_target = ins.p2 as usize;
-                    if let CursorState::Index { matches, pos, .. } = &mut self.cursors[cid] {
-                        *pos += 1;
-                        if *pos < matches.len() {
-                            next_pc = loop_target;
-                        }
-                    } else {
-                        return Err(SqliteError::misuse("IdxNext on non-index cursor"));
+                    let (cursor_id, prefix) = match &self.cursors[cid] {
+                        CursorState::Index {
+                            cursor_id,
+                            eq_prefix,
+                            ..
+                        } => (*cursor_id, eq_prefix.clone().unwrap_or_default()),
+                        _ => return Err(SqliteError::misuse("IdxNext on non-index cursor")),
+                    };
+                    if btree.cursor_next_index_matching(cursor_id, &prefix)? {
+                        next_pc = loop_target;
                     }
                 }
                 Opcode::Rowid => {
@@ -600,23 +657,14 @@ impl VdbeVm {
                     let cid = ins.p1 as usize;
                     let dest = ins.p2 as usize;
                     match &self.cursors[cid] {
-                        CursorState::Table {
-                            entries,
-                            pos,
-                            point_row,
-                            ..
-                        } => {
-                            let rid = if let Some((r, _)) = point_row {
-                                *r
-                            } else {
-                                entries[*pos].0
-                            };
+                        CursorState::Table { cursor_id, .. } => {
+                            let rid = btree.cursor_rowid(*cursor_id)?;
                             self.regs[dest] = Value::Integer(rid);
                         }
-                        CursorState::Index { matches, pos, .. } => {
+                        CursorState::Index { cursor_id, .. } => {
                             // In SQLite secondary indexes, the table rowid is the LAST column of the index record!
-                            let rec = &matches[*pos];
-                            self.regs[dest] = rec.last().cloned().unwrap_or(Value::Null);
+                            self.regs[dest] =
+                                btree.cursor_last_column(*cursor_id)?.unwrap_or(Value::Null);
                         }
                         _ => return Err(SqliteError::misuse("Rowid on unsupported cursor")),
                     }
@@ -627,34 +675,26 @@ impl VdbeVm {
                     let col_idx = ins.p2 as usize;
                     let dest = ins.p3 as usize;
                     match &self.cursors[cid] {
-                        CursorState::Table {
-                            entries,
-                            pos,
-                            point_row,
-                            ..
-                        } => {
-                            let payload = if let Some((_, p)) = point_row {
-                                p.as_slice()
-                            } else {
-                                entries[*pos].1.as_slice()
-                            };
-                            let enc = btree.encoding();
-                            let val = decode_record_column_with_encoding(payload, col_idx, enc)?
-                                .unwrap_or_else(|| {
-                                    // Default fallback from P4 if column was added via ALTER TABLE ADD COLUMN
-                                    match &ins.p4 {
-                                        P4::Int64(i) => Value::Integer(*i),
-                                        P4::Real(r) => Value::real(*r),
-                                        P4::Str(s) => Value::Text(s.clone()),
-                                        P4::Blob(b) => Value::Blob(b.clone()),
-                                        _ => Value::Null,
-                                    }
-                                });
+                        CursorState::Table { cursor_id, .. } => {
+                            let val =
+                                btree
+                                    .cursor_column(*cursor_id, col_idx)?
+                                    .unwrap_or_else(|| {
+                                        // Default fallback from P4 if column was added via ALTER TABLE ADD COLUMN
+                                        match &ins.p4 {
+                                            P4::Int64(i) => Value::Integer(*i),
+                                            P4::Real(r) => Value::real(*r),
+                                            P4::Str(s) => Value::Text(s.clone()),
+                                            P4::Blob(b) => Value::Blob(b.clone()),
+                                            _ => Value::Null,
+                                        }
+                                    });
                             self.regs[dest] = val;
                         }
-                        CursorState::Index { matches, pos, .. } => {
-                            self.regs[dest] =
-                                matches[*pos].get(col_idx).cloned().unwrap_or(Value::Null);
+                        CursorState::Index { cursor_id, .. } => {
+                            self.regs[dest] = btree
+                                .cursor_column(*cursor_id, col_idx)?
+                                .unwrap_or(Value::Null);
                         }
                         CursorState::Ephemeral { rows, pos } => {
                             self.regs[dest] =
@@ -695,10 +735,17 @@ impl VdbeVm {
                         Value::Blob(b) => b.clone(),
                         _ => return Err(SqliteError::misuse("OP_Insert expects record blob")),
                     };
-                    let root_pgno = match &self.cursors[cid] {
-                        CursorState::Table { root_pgno, .. } => *root_pgno,
+                    let (root_pgno, writable) = match &self.cursors[cid] {
+                        CursorState::Table {
+                            root_pgno,
+                            writable,
+                            ..
+                        } => (*root_pgno, *writable),
                         _ => return Err(SqliteError::misuse("Insert on non-table cursor")),
                     };
+                    if !writable {
+                        return Err(SqliteError::misuse("Insert on read-only table cursor"));
+                    }
                     btree.insert_table(root_pgno, rowid, &payload)?;
                     if (ins.p5 & 0x01) != 0 {
                         self.runtime_ctx.last_insert_rowid = rowid;
@@ -711,23 +758,21 @@ impl VdbeVm {
                 Opcode::Delete => {
                     // p1 = table cursor, p2 = rowid_reg (if >0, else current cursor rowid)
                     let cid = ins.p1 as usize;
-                    let (root_pgno, rowid) = match &self.cursors[cid] {
+                    let (cursor_id, root_pgno, writable) = match &self.cursors[cid] {
                         CursorState::Table {
+                            cursor_id,
                             root_pgno,
-                            entries,
-                            pos,
-                            point_row,
-                        } => {
-                            let rid = if ins.p2 > 0 {
-                                self.regs[ins.p2 as usize].to_integer_lossy()
-                            } else if let Some((r, _)) = point_row {
-                                *r
-                            } else {
-                                entries[*pos].0
-                            };
-                            (*root_pgno, rid)
-                        }
+                            writable,
+                        } => (*cursor_id, *root_pgno, *writable),
                         _ => return Err(SqliteError::misuse("Delete on non-table cursor")),
+                    };
+                    if !writable {
+                        return Err(SqliteError::misuse("Delete on read-only table cursor"));
+                    }
+                    let rowid = if ins.p2 > 0 {
+                        self.regs[ins.p2 as usize].to_integer_lossy()
+                    } else {
+                        btree.cursor_rowid(cursor_id)?
                     };
                     if btree.delete_table(root_pgno, rowid)? && (ins.p5 & 0x02) != 0 {
                         self.runtime_ctx.last_changes += 1;
@@ -741,26 +786,48 @@ impl VdbeVm {
                         Value::Blob(b) => b.clone(),
                         _ => return Err(SqliteError::misuse("IdxInsert expects record blob")),
                     };
-                    let (root_pgno, orders) = match &self.cursors[cid] {
+                    let (root_pgno, orders, writable) = match &self.cursors[cid] {
                         CursorState::Index {
-                            root_pgno, orders, ..
-                        } => (*root_pgno, orders.clone()),
+                            root_pgno,
+                            orders,
+                            writable,
+                            ..
+                        } => (*root_pgno, orders.clone(), *writable),
                         _ => return Err(SqliteError::misuse("IdxInsert on non-index cursor")),
                     };
+                    if !writable {
+                        return Err(SqliteError::misuse("IdxInsert on read-only index cursor"));
+                    }
                     if ins.p5 != 0 {
-                        // UNIQUE constraint check: indexed columns (excluding trailing rowid!) if all non-NULL!
+                        // UNIQUE constraint check via incremental BtreeCursor (zero Vec materialization!)
                         let enc = btree.encoding();
                         let vals = decode_record_with_encoding(&payload, enc)?;
                         if vals.len() > 1 {
                             let indexed_cols = &vals[..vals.len() - 1];
                             if indexed_cols.iter().all(|v| !v.is_null()) {
-                                let existing = btree.seek_index_equal(
-                                    root_pgno,
-                                    indexed_cols,
-                                    &orders[..indexed_cols.len().min(orders.len())],
-                                )?;
                                 let new_rowid = vals.last();
-                                if existing.iter().any(|row| row.last() != new_rowid) {
+                                let probe_id =
+                                    btree.open_index_cursor(root_pgno, orders.clone(), false);
+                                let probe_res = (|| -> Result<bool> {
+                                    if !btree
+                                        .cursor_seek_index_equal_first(probe_id, indexed_cols)?
+                                    {
+                                        return Ok(false);
+                                    }
+                                    loop {
+                                        let existing_rowid = btree.cursor_last_column(probe_id)?;
+                                        if existing_rowid.as_ref() != new_rowid {
+                                            return Ok(true);
+                                        }
+                                        if !btree
+                                            .cursor_next_index_matching(probe_id, indexed_cols)?
+                                        {
+                                            return Ok(false);
+                                        }
+                                    }
+                                })();
+                                btree.close_cursor(probe_id);
+                                if probe_res? {
                                     let msg = match &ins.p4 {
                                         P4::Str(s) => s.clone(),
                                         _ => "UNIQUE constraint failed".to_owned(),
@@ -781,12 +848,18 @@ impl VdbeVm {
                     let start = ins.p2 as usize;
                     let count = ins.p3 as usize;
                     let keys = self.regs[start..start + count].to_vec();
-                    let (root_pgno, orders) = match &self.cursors[cid] {
+                    let (root_pgno, orders, writable) = match &self.cursors[cid] {
                         CursorState::Index {
-                            root_pgno, orders, ..
-                        } => (*root_pgno, orders.clone()),
+                            root_pgno,
+                            orders,
+                            writable,
+                            ..
+                        } => (*root_pgno, orders.clone(), *writable),
                         _ => return Err(SqliteError::misuse("IdxDelete on non-index cursor")),
                     };
+                    if !writable {
+                        return Err(SqliteError::misuse("IdxDelete on read-only index cursor"));
+                    }
                     btree.delete_index(root_pgno, &keys, &orders)?;
                 }
                 Opcode::ResultRow => {
@@ -1033,6 +1106,8 @@ impl VdbeVm {
                         }
                         _ => Vec::new(),
                     };
+                    self.ensure_cursor_slot(cid);
+                    self.close_cursor_slot(cid, btree);
                     self.cursors[cid] = CursorState::Sorter {
                         orders,
                         rows: Vec::new(),

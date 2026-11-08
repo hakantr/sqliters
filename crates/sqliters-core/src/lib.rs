@@ -303,8 +303,25 @@ impl Connection {
     }
 
     #[inline]
+    pub const fn btree(&self) -> &Btree {
+        &self.btree
+    }
+
+    #[inline]
     pub fn btree_mut(&mut self) -> &mut Btree {
         &mut self.btree
+    }
+
+    /// Attaches or clears a shared atomic interrupt flag (`sqlite3_interrupt`).
+    #[inline]
+    pub fn set_interrupt_flag(&mut self, flag: Option<Arc<std::sync::atomic::AtomicBool>>) {
+        self.btree.set_interrupt_flag(flag);
+    }
+
+    /// Returns the attached atomic interrupt flag, if any.
+    #[inline]
+    pub fn interrupt_flag(&self) -> Option<&Arc<std::sync::atomic::AtomicBool>> {
+        self.btree.interrupt_flag()
     }
 
     fn run_stmt(&mut self, stmt: &Stmt, params: &[Value]) -> Result<QueryOutput> {
@@ -579,6 +596,7 @@ impl<'conn> Statement<'conn> {
                     Ok(StepResult::Row(Row::new(vals)))
                 }
                 Ok(VmStep::Done) => {
+                    vm.close_cursors(&mut self.conn.btree);
                     self.conn.runtime = vm.runtime_ctx;
                     self.conn.runtime.stmt_timestamp_ms = None;
                     if *started_autocommit_read
@@ -591,6 +609,7 @@ impl<'conn> Statement<'conn> {
                     Ok(StepResult::Done)
                 }
                 Err(e) => {
+                    vm.close_cursors(&mut self.conn.btree);
                     self.conn.runtime.stmt_timestamp_ms = None;
                     if *started_autocommit_read
                         && self.conn.is_autocommit()
@@ -626,13 +645,17 @@ impl<'conn> Statement<'conn> {
 
     fn finish_vdbe_read_if_needed(&mut self) {
         if let StatementExecState::Vdbe {
-            started_autocommit_read: true,
-            ..
+            ref mut vm,
+            started_autocommit_read,
         } = self.state
-            && self.conn.is_autocommit()
-            && self.conn.btree.transaction_state() == TransactionState::Read
         {
-            let _ = self.conn.btree.commit();
+            vm.close_cursors(&mut self.conn.btree);
+            if started_autocommit_read
+                && self.conn.is_autocommit()
+                && self.conn.btree.transaction_state() == TransactionState::Read
+            {
+                let _ = self.conn.btree.commit();
+            }
         }
     }
 }

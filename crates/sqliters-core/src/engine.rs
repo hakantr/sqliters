@@ -293,9 +293,13 @@ pub fn execute_statement(
         }
         Stmt::Rollback { savepoint } => {
             if let Some(sp_name) = savepoint {
+                let trip_res = ctx
+                    .btree
+                    .trip_cursors(sqliters_types::extended::SQLITE_ABORT_ROLLBACK, true);
                 ctx.btree.pager_mut().rollback_to_savepoint(sp_name)?;
                 *ctx.rollback_count += 1;
                 *ctx.schema = Schema::load(ctx.btree)?;
+                trip_res?;
                 Ok(QueryOutput::default())
             } else {
                 if !*ctx.explicit_tx && !*ctx.implicit_savepoint_tx {
@@ -505,6 +509,9 @@ where
                 Err(err)
             } else {
                 // SQLite `OR ABORT` inside an explicit transaction: roll back statement savepoint only!
+                let _ = ctx
+                    .btree
+                    .trip_cursors(sqliters_types::extended::SQLITE_ABORT_ROLLBACK, true);
                 let _ = ctx.btree.pager_mut().rollback_to_savepoint(sp_name);
                 let _ = ctx.btree.pager_mut().release_savepoint(sp_name);
                 ctx.deferred_fk_suspects.truncate(prev_deferred_len);

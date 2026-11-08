@@ -2,34 +2,73 @@
 //! overflow chains, freelist page management, and `PRAGMA integrity_check`.
 #![forbid(unsafe_code)]
 
+pub mod cursor;
 pub mod page;
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use sqliters_pager::{Pager, PagerOpenOptions, TransactionState};
 use sqliters_types::{
     Bitvec, ErrorCode, KeySortOrder, Pgno, Result, SqliteError, TextEncoding, Value,
-    compare_records_with_encoding, decode_record_with_encoding,
+    compare_records_with_encoding, decode_record_with_encoding, extended,
 };
 use sqliters_vfs::{OpenFlags, Vfs};
 
+pub use cursor::{
+    BTCURSOR_MAX_DEPTH, BtreeCursorState, CursorId, CursorKind, CursorPagePos, SavedCursorKey,
+    SkipNext,
+};
 pub use page::{
-    BtreePageType, IndexInteriorCell, IndexLeafCell, ParsedPage, PayloadBounds,
-    RawLeafDeleteOutcome, TableInteriorCell, TableLeafCell, find_table_interior_child,
-    last_table_leaf_rowid, peek_page_type, seek_table_leaf_cell, table_interior_right_child,
-    try_delete_table_leaf_in_place, try_insert_table_leaf_in_place,
+    BtreePageType, IndexInteriorCell, IndexLeafCell, ParsedPage, PayloadBounds, RawIndexCell,
+    RawLeafDeleteOutcome, RawTableLeafCell, TableInteriorCell, TableLeafCell,
+    binary_search_table_leaf, find_table_interior_child, last_table_leaf_rowid, peek_page_type,
+    raw_cell_offset, raw_page_header, read_index_interior_cell, read_index_leaf_cell,
+    read_table_interior_cell, read_table_leaf_cell, read_table_leaf_rowid, seek_table_leaf_cell,
+    table_interior_right_child, try_delete_table_leaf_in_place, try_insert_table_leaf_in_place,
 };
 
 /// SQLite B-Tree storage manager over a [`Pager`].
 pub struct Btree {
     pager: Pager,
+    pub(crate) cursors: BTreeMap<CursorId, cursor::BtreeCursor>,
+    pub(crate) next_cursor_id: u64,
+    interrupt_flag: Option<Arc<AtomicBool>>,
 }
 
 impl Btree {
     pub fn new(pager: Pager) -> Self {
-        Self { pager }
+        Self {
+            pager,
+            cursors: BTreeMap::new(),
+            next_cursor_id: 1,
+            interrupt_flag: None,
+        }
+    }
+
+    /// Attaches or clears a shared atomic interrupt flag (`sqlite3_interrupt`).
+    pub fn set_interrupt_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
+        self.interrupt_flag = flag;
+    }
+
+    /// Returns the attached atomic interrupt flag, if any.
+    #[inline]
+    pub fn interrupt_flag(&self) -> Option<&Arc<AtomicBool>> {
+        self.interrupt_flag.as_ref()
+    }
+
+    /// Checks whether execution has been interrupted (`Ordering::Relaxed`).
+    #[inline]
+    pub fn check_interrupted(&self) -> Result<()> {
+        if let Some(flag) = &self.interrupt_flag
+            && flag.load(AtomicOrdering::Relaxed)
+        {
+            return Err(SqliteError::new(ErrorCode::Interrupt, "interrupted"));
+        }
+        Ok(())
     }
 
     pub fn open_file(path: impl AsRef<Path>, flags: OpenFlags) -> Result<Self> {
@@ -65,6 +104,7 @@ impl Btree {
     }
 
     pub fn close(&mut self) -> Result<()> {
+        self.cursors.clear();
         self.pager.close()
     }
 
@@ -98,9 +138,22 @@ impl Btree {
         self.pager.commit()
     }
 
+    /// Rolls back the write transaction after tripping open cursors (`sqlite3BtreeRollback`).
+    pub fn rollback_with_trip(
+        &mut self,
+        trip_code: i32,
+        write_only: bool,
+        retain_read: bool,
+    ) -> Result<()> {
+        let trip_res = self.trip_cursors(trip_code, write_only);
+        let rb_res = self.pager.rollback_retaining_read(retain_read);
+        rb_res?;
+        trip_res
+    }
+
     #[inline]
     pub fn rollback(&mut self) -> Result<()> {
-        self.pager.rollback()
+        self.rollback_with_trip(extended::SQLITE_ABORT_ROLLBACK, false, false)
     }
 
     #[inline]
@@ -281,6 +334,7 @@ impl Btree {
         let max_hops = self.pager.page_count() as usize + 1;
         let mut hops = 0usize;
         while out.len() < total {
+            self.check_interrupted()?;
             let Some(ovfl_pgno) = next_ovfl.filter(|&p| p != 0) else {
                 return Err(SqliteError::corrupt(
                     "overflow chain ended prematurely before payload length",
@@ -357,6 +411,7 @@ impl Btree {
     /// Empties all entries and child/overflow pages of a B-tree rooted at `root_pgno`,
     /// preserving `root_pgno` itself as an empty leaf page (`OP_Clear`).
     pub fn clear_tree(&mut self, root_pgno: Pgno) -> Result<()> {
+        self.save_cursors_for_mutation(Some(root_pgno), None)?;
         let parsed = self.read_parsed_page(root_pgno)?;
         let is_table = matches!(
             parsed,
@@ -376,6 +431,7 @@ impl Btree {
         if root_pgno <= 1 {
             return Err(SqliteError::misuse("cannot drop sqlite_schema root page 1"));
         }
+        self.save_cursors_for_mutation(Some(root_pgno), None)?;
         let parsed = self.read_parsed_page(root_pgno)?;
         self.free_subtree_children(&parsed)?;
         self.free_page(root_pgno)
@@ -433,10 +489,12 @@ impl Btree {
     }
 
     fn collect_table_entries(&mut self, pgno: Pgno, out: &mut Vec<(i64, Vec<u8>)>) -> Result<()> {
+        self.check_interrupted()?;
         let parsed = self.read_parsed_page(pgno)?;
         match parsed {
             ParsedPage::TableLeaf { cells } => {
                 for c in cells {
+                    self.check_interrupted()?;
                     let payload = self.read_full_payload(
                         c.total_payload_len,
                         &c.local_payload,
@@ -467,6 +525,7 @@ impl Btree {
         let usable = self.pager.usable_size();
         let mut cur_pgno = root_pgno;
         loop {
+            self.check_interrupted()?;
             let hit_or_next = {
                 let raw = self.pager.read_page(cur_pgno)?;
                 match peek_page_type(cur_pgno, usable, raw)? {
@@ -555,6 +614,7 @@ impl Btree {
     /// Inserts or replaces `(rowid, payload)` in the Table B+Tree rooted at `root_pgno`.
     /// Automatically handles overflow chains and multi-level B+Tree splits (preserving `root_pgno`, including Page 1!).
     pub fn insert_table(&mut self, root_pgno: Pgno, rowid: i64, payload: &[u8]) -> Result<()> {
+        self.save_cursors_for_mutation(Some(root_pgno), None)?;
         let usable = self.pager.usable_size();
         let bounds = PayloadBounds::for_table_leaf(usable);
         let (total_len, local_payload, overflow_page) =
@@ -711,6 +771,7 @@ impl Btree {
 
     /// Deletes `rowid` from the Table B+Tree rooted at `root_pgno`. Returns `true` if a row was deleted.
     pub fn delete_table(&mut self, root_pgno: Pgno, rowid: i64) -> Result<bool> {
+        self.save_cursors_for_mutation(Some(root_pgno), None)?;
         let (deleted, _) = self.delete_table_rec(root_pgno, rowid, true)?;
         Ok(deleted)
     }
@@ -842,10 +903,12 @@ impl Btree {
     }
 
     fn collect_index_entries(&mut self, pgno: Pgno, out: &mut Vec<Vec<u8>>) -> Result<()> {
+        self.check_interrupted()?;
         let parsed = self.read_parsed_page(pgno)?;
         match parsed {
             ParsedPage::IndexLeaf { cells } => {
                 for c in cells {
+                    self.check_interrupted()?;
                     let full = self.read_full_payload(
                         c.total_payload_len,
                         &c.local_payload,
@@ -858,6 +921,7 @@ impl Btree {
             ParsedPage::IndexInterior { cells, right_child } => {
                 for c in cells {
                     self.collect_index_entries(c.left_child, out)?;
+                    self.check_interrupted()?;
                     let full = self.read_full_payload(
                         c.total_payload_len,
                         &c.local_payload,
@@ -906,6 +970,7 @@ impl Btree {
         orders: &[KeySortOrder],
         out: &mut Vec<Vec<u8>>,
     ) -> Result<()> {
+        self.check_interrupted()?;
         let enc = self.encoding();
         let parsed = self.read_parsed_page(pgno)?;
         match parsed {
@@ -971,9 +1036,14 @@ impl Btree {
         record_bytes: &[u8],
         orders: &[KeySortOrder],
     ) -> Result<()> {
+        self.save_cursors_for_mutation(Some(root_pgno), None)?;
         let enc = self.encoding();
         let full_vals = decode_record_with_encoding(record_bytes, enc)?;
-        let key_len = orders.len().min(full_vals.len());
+        let key_len = if orders.is_empty() {
+            full_vals.len()
+        } else {
+            orders.len().min(full_vals.len())
+        };
         let key_vals = &full_vals[..key_len];
         let usable = self.pager.usable_size();
         let bounds = PayloadBounds::for_index(usable);
@@ -1202,6 +1272,7 @@ impl Btree {
         key_vals: &[Value],
         orders: &[KeySortOrder],
     ) -> Result<bool> {
+        self.save_cursors_for_mutation(Some(root_pgno), None)?;
         // Simple, rock-solid delete maintaining 100% of SQLite invariants:
         // Locate exact match; if in leaf with >1 cells (or root leaf), remove in place!
         // If structural underflow occurs (rare non-root empty leaf or interior hit), rebuild or rebalance cleanly.
@@ -1343,6 +1414,7 @@ impl Btree {
             errs: &mut Vec<String>,
         ) -> Result<()> {
             while let Some(opg) = ovfl.filter(|&p| p != 0) {
+                btree.check_interrupted()?;
                 if opg > total_pages {
                     errs.push(format!("overflow page {opg} out of range"));
                     break;
@@ -1368,6 +1440,7 @@ impl Btree {
         let mut trunk = self.pager.header().first_freelist_trunk_page;
         let mut counted_free = 0u32;
         while trunk != 0 {
+            self.check_interrupted()?;
             mark_page(
                 &mut seen,
                 total_pages,
@@ -1412,6 +1485,7 @@ impl Btree {
         // 2. Walk every B-tree root
         let mut stack: Vec<(Pgno, bool)> = roots.iter().map(|&r| (r, true)).collect();
         while let Some((pgno, is_root)) = stack.pop() {
+            self.check_interrupted()?;
             mark_page(
                 &mut seen,
                 total_pages,
