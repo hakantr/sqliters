@@ -84,6 +84,19 @@ impl DatabaseHeader {
             && page_size.is_power_of_two()
     }
 
+    /// Returns `true` when `write_version > 2`, which forces the connection into read-only mode
+    /// while permitting reads when `read_version` is in `1..=2` (`BTS_READ_ONLY`, `btree.c:3356`).
+    #[inline]
+    pub const fn forces_readonly(&self) -> bool {
+        self.write_version > 2
+    }
+
+    /// Returns `true` when `read_version == 2`, indicating WAL mode (`btree.c:3371`).
+    #[inline]
+    pub const fn is_wal(&self) -> bool {
+        self.read_version == 2
+    }
+
     /// Parses the 100-byte header from `buf[0..100]`, validating SQLite invariants (`lockBtree`).
     pub fn parse(buf: &[u8]) -> Result<Self> {
         if buf.len() < DB_HEADER_SIZE {
@@ -114,13 +127,7 @@ impl DatabaseHeader {
 
         let write_version = buf[18];
         let read_version = buf[19];
-        if write_version == 2 || read_version == 2 {
-            return Err(SqliteError::new(
-                ErrorCode::CantOpen,
-                "WAL mode databases are not supported; checkpoint in SQLite with PRAGMA journal_mode=DELETE first",
-            ));
-        }
-        if write_version != 1 || read_version != 1 {
+        if write_version == 0 || read_version == 0 || read_version > 2 {
             return Err(SqliteError::new(
                 ErrorCode::NotADb,
                 format!(
@@ -218,5 +225,66 @@ impl DatabaseHeader {
         out[72..92].fill(0);
         out[92..96].copy_from_slice(&self.version_valid_for.to_be_bytes());
         out[96..100].copy_from_slice(&self.sqlite_version_number.to_be_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format3_header_version_validation_rules() {
+        let mut raw = [0u8; DB_HEADER_SIZE];
+        DatabaseHeader::default().write_into(&mut raw);
+
+        // (1, 1), (2, 2), (1, 2), (2, 1) are all valid and writable (`!forces_readonly()`).
+        for (wv, rv) in [(1u8, 1u8), (2, 2), (1, 2), (2, 1)] {
+            raw[18] = wv;
+            raw[19] = rv;
+            let parsed = DatabaseHeader::parse(&raw).unwrap();
+            assert_eq!(parsed.write_version, wv);
+            assert_eq!(parsed.read_version, rv);
+            assert!(!parsed.forces_readonly());
+            assert_eq!(parsed.is_wal(), rv == 2);
+        }
+
+        // `write_version > 2` with `read_version` in `1..=2` parses validly and marks readonly (`btree.c:3356`).
+        for (wv, rv) in [(3u8, 1u8), (3, 2), (255, 1), (255, 2)] {
+            raw[18] = wv;
+            raw[19] = rv;
+            let parsed = DatabaseHeader::parse(&raw).unwrap();
+            assert_eq!(parsed.write_version, wv);
+            assert_eq!(parsed.read_version, rv);
+            assert!(parsed.forces_readonly());
+            assert_eq!(parsed.is_wal(), rv == 2);
+        }
+
+        // `0` in either version or `read_version > 2` fails with `ErrorCode::NotADb`.
+        for (wv, rv) in [
+            (0u8, 0u8),
+            (0, 1),
+            (0, 2),
+            (1, 0),
+            (2, 0),
+            (1, 3),
+            (2, 3),
+            (3, 3),
+        ] {
+            raw[18] = wv;
+            raw[19] = rv;
+            let err = DatabaseHeader::parse(&raw).unwrap_err();
+            assert_eq!(err.code, ErrorCode::NotADb, "wv={wv}, rv={rv}");
+        }
+
+        // 64 KiB page size (`u16 = 1` at `@16..18`) roundtrips with WAL `(2, 2)`.
+        let mut hdr64k = DatabaseHeader::new_with_page_size(65_536);
+        hdr64k.write_version = 2;
+        hdr64k.read_version = 2;
+        hdr64k.write_into(&mut raw);
+        assert_eq!(&raw[16..18], &1u16.to_be_bytes());
+        let parsed64k = DatabaseHeader::parse(&raw).unwrap();
+        assert_eq!(parsed64k.page_size, 65_536);
+        assert!(parsed64k.is_wal());
+        assert!(!parsed64k.forces_readonly());
     }
 }

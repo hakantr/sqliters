@@ -1,4 +1,4 @@
-//! `sqliters` — Zero-dependency Rust port of SQLite 3.54.1's rollback-journal storage and SQL engine,
+//! `sqliters` — Zero-dependency Rust port of SQLite 3.54.1's rollback-journal and WAL storage and SQL engine,
 //! interoperable with SQLite Format 3 database files (`UTF-8`, `UTF-16le`, `UTF-16be`).
 #![forbid(unsafe_code)]
 //!
@@ -55,7 +55,9 @@ pub use sqliters_core::{
     InterruptHandle, PrepareMode, QueryOutput, QueryResult, Row, Schema, Statement, StepResult,
     TableSchema,
 };
-pub use sqliters_pager::DatabaseHeader;
+pub use sqliters_pager::{
+    DatabaseHeader, JournalMode, LockingMode, WalCheckpointMode, WalCheckpointResult,
+};
 pub use sqliters_syntax::{FkAction, is_complete, parse_one, parse_statements};
 pub use sqliters_types::{
     Collation, ConflictResolutionEffect, DatabaseKind, ErrorCode, LockGeometry, Pgno, Result,

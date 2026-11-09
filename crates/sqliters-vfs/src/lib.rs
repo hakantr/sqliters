@@ -25,19 +25,25 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sqliters_types::{ErrorCode, LockGeometry, Result, SqliteError, extended};
 
 pub use shm::{
-    CheckpointMode, CheckpointTxnGuard, HASHTABLE_HASH_PRIME, HASHTABLE_NPAGE, HASHTABLE_NPAGE_ONE,
-    HASHTABLE_NSLOT, MapView, READMARK_NOT_USED, RecoveryTxnGuard, SHM_CHUNK_SIZE, ShmChunk,
-    ShmDmsState, ShmError, ShmLockKind, ShmOpenOptions, WAL_CKPT_BACKFILL_ATTEMPTED_OFFSET,
-    WAL_CKPT_INFO_OFFSET, WAL_CKPT_LOCK, WAL_CKPT_LOCK_ARRAY_OFFSET, WAL_CKPT_NBACKFILL_OFFSET,
-    WAL_CKPT_READMARK_OFFSET, WAL_CKPT_RESERVED_OFFSET, WAL_LOCK_LEN, WAL_LOCK_OFFSET, WAL_NREADER,
-    WAL_READ_LOCK_BASE, WAL_RECOVER_LOCK, WAL_SHM_DMS_OFFSET, WAL_SHM_NLOCK, WAL_WRITE_LOCK,
-    WALINDEX_HDR_COPY_LEN, WALINDEX_HDR_COPY1_OFFSET, WALINDEX_HDR_COPY2_OFFSET,
-    WALINDEX_HDR_TOTAL_SIZE, WALINDEX_MAX_VERSION, WalChecksumEndian, WalCkptGuard,
-    WalCkptInfoSnapshot, WalIndexHeaderData, WalLockMode, WalLockState, WalReadGuard, WalShm,
-    WalShmOps, WalWriteGuard, checked_region_byte_range, shm_barrier, wal_checksum_bytes,
-    wal_checksum_with_endian, wal_frame_page, wal_hash_slot, wal_lock_byte_offset,
-    wal_read_lock_slot,
+    CheckpointMode, CheckpointTxnGuard, CkptRecoveryGuard, HASHTABLE_HASH_PRIME, HASHTABLE_NPAGE,
+    HASHTABLE_NPAGE_ONE, HASHTABLE_NSLOT, InitRecoveryGuard, MapView, OwnedInitWriteGuard,
+    OwnedWalReadGuard, OwnedWriterTxnGuard, READMARK_NOT_USED, ReadonlyHeaderProbe,
+    RecoveryTxnGuard, SHM_CHUNK_SIZE, ShmChunk, ShmDmsState, ShmError, ShmLockKind, ShmOpenOptions,
+    WAL_CKPT_BACKFILL_ATTEMPTED_OFFSET, WAL_CKPT_INFO_OFFSET, WAL_CKPT_LOCK,
+    WAL_CKPT_LOCK_ARRAY_OFFSET, WAL_CKPT_NBACKFILL_OFFSET, WAL_CKPT_READMARK_OFFSET,
+    WAL_CKPT_RESERVED_OFFSET, WAL_LOCK_LEN, WAL_LOCK_OFFSET, WAL_NREADER, WAL_READ_LOCK_BASE,
+    WAL_RECOVER_LOCK, WAL_SHM_DMS_OFFSET, WAL_SHM_NLOCK, WAL_WRITE_LOCK, WALINDEX_HDR_COPY_LEN,
+    WALINDEX_HDR_COPY1_OFFSET, WALINDEX_HDR_COPY2_OFFSET, WALINDEX_HDR_TOTAL_SIZE,
+    WALINDEX_MAX_VERSION, WalChecksumEndian, WalCkptGuard, WalCkptInfoSnapshot, WalIndexHeaderData,
+    WalLockMode, WalLockState, WalReadGuard, WalShm, WalShmOps, WalWriteGuard,
+    checked_region_byte_range, shm_barrier, wal_checksum_bytes, wal_checksum_with_endian,
+    wal_frame_page, wal_hash_slot, wal_lock_byte_offset, wal_read_lock_slot,
 };
+
+/// Device characteristic bit indicating writes occur sequentially (`SQLITE_IOCAP_SEQUENTIAL`).
+pub const IOCAP_SEQUENTIAL: u32 = 0x0000_0400;
+/// Device characteristic bit indicating power-safe overwrites (`SQLITE_IOCAP_POWERSAFE_OVERWRITE`).
+pub const IOCAP_POWERSAFE_OVERWRITE: u32 = 0x0000_1000;
 
 /// SQLite Julian Day millisecond offset for `1970-01-01 00:00:00 UTC`.
 pub const UNIX_EPOCH_JD_MS: i64 = 210_866_760_000_000;
@@ -185,6 +191,16 @@ pub trait VfsFile: Send + Sync {
             extended::SQLITE_IOERR_SHMOPEN,
             "VFS file handle does not support WAL shared memory",
         ))
+    }
+
+    /// Returns whether this file handle implements WAL shared-memory primitives (`sqlite3PagerWalSupported`).
+    fn supports_wal_shm(&self) -> bool {
+        false
+    }
+
+    /// Returns device characteristics bitmask (`xDeviceCharacteristics`, default `0`).
+    fn device_characteristics(&self) -> u32 {
+        0
     }
 
     /// Returns device sector size in bytes (`xSectorSize`, default 4096).
@@ -939,6 +955,10 @@ impl VfsFile for MemFile {
 
     fn is_readonly(&self) -> bool {
         self.readonly
+    }
+
+    fn supports_wal_shm(&self) -> bool {
+        true
     }
 }
 
@@ -3052,6 +3072,15 @@ impl VfsFile for OsFile {
 
     fn is_readonly(&self) -> bool {
         self.readonly
+    }
+
+    fn supports_wal_shm(&self) -> bool {
+        self.path.is_some()
+    }
+
+    fn device_characteristics(&self) -> u32 {
+        // Matches `SQLITE_POWERSAFE_OVERWRITE = 1` (`sqliteInt.h:402`, `os_unix.c:4369`, `os_win.c:4523`).
+        IOCAP_POWERSAFE_OVERWRITE
     }
 }
 

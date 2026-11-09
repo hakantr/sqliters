@@ -15,6 +15,8 @@
 //! unlock during `Drop` never panics; instead it transitions the connection into `poisoned` state.
 #![forbid(unsafe_code)]
 
+use std::sync::Arc;
+
 use sqliters_types::{ErrorCode, Result, SqliteError};
 
 use super::{
@@ -585,6 +587,177 @@ impl<'a> CheckpointTxnGuard<'a> {
             .write_restarted_header_and_marks_internal(base_header, new_salt1)
     }
 
+    /// Reads and verifies `(WalIndexHdr, WalCkptInfo)` if region 0 is mapped and valid, returning
+    /// `Ok(None)` when region 0 is unallocated or header copies/checksum are uninitialized/mismatch,
+    /// and propagating `ErrorCode::CantOpen` on unsupported format version.
+    pub fn try_read_header_and_ckpt_info(
+        &self,
+    ) -> Result<Option<(WalIndexHeaderData, WalCkptInfoSnapshot)>> {
+        self.shm.try_read_header_and_ckpt_info_internal()
+    }
+
+    /// Ensures region 0 is allocated (`extend = true`) while `WAL_WRITE_LOCK` is held and attempts
+    /// to read `(WalIndexHdr, WalCkptInfo)`.
+    pub fn extend_and_try_read_header(
+        &self,
+    ) -> Result<Option<(WalIndexHeaderData, WalCkptInfoSnapshot)>> {
+        let _ = self.shm.ensure_region_writable_internal(0)?;
+        self.shm.try_read_header_and_ckpt_info_internal()
+    }
+
+    /// Temporarily acquires `EXCLUSIVE WAL_WRITE_LOCK` during `Passive` checkpoint header recovery
+    /// (`walIndexReadHdr`, `wal.c:2796`).
+    pub fn acquire_temp_write_lock(&mut self) -> Result<()> {
+        if self.holds_write_lock() {
+            return Ok(());
+        }
+        self.shm
+            .lock_additional_exclusive_internal(WAL_WRITE_LOCK)?;
+        self.acquired_stack.push(WAL_WRITE_LOCK);
+        Ok(())
+    }
+
+    /// Releases a temporary `WAL_WRITE_LOCK` acquired via [`Self::acquire_temp_write_lock`].
+    pub fn release_temp_write_lock(&mut self) -> Result<()> {
+        if self.acquired_stack.last() != Some(&WAL_WRITE_LOCK)
+            || self.mode != CheckpointMode::Passive
+        {
+            return Err(SqliteError::misuse(
+                "release_temp_write_lock is only valid for temporary WRITE on Passive checkpoint",
+            ));
+        }
+        self.acquired_stack.pop();
+        self.shm.unlock_single_exclusive_internal(WAL_WRITE_LOCK)
+    }
+
+    /// Enters `walIndexRecover` from an active checkpoint that already holds `WAL_CKPT_LOCK` and
+    /// `WAL_WRITE_LOCK`, acquiring ONLY `WAL_RECOVER_LOCK` (`wal.c:1436`, never `WAL_READ_LOCK(0)`).
+    pub fn begin_recovery_under_checkpoint(&mut self) -> Result<CkptRecoveryGuard<'_, 'a>> {
+        if !self.holds_write_lock() {
+            return Err(SqliteError::misuse(
+                "checkpoint recovery requires WAL_CKPT_LOCK and WAL_WRITE_LOCK",
+            ));
+        }
+        self.shm
+            .lock_additional_exclusive_internal(WAL_RECOVER_LOCK)?;
+        Ok(CkptRecoveryGuard {
+            ckpt: self,
+            active: true,
+        })
+    }
+
+    /// Computes `mxSafeFrame` across `aReadMark[1..=4]` (`walCheckpoint`, `wal.c:2315-2333`),
+    /// invoking `busy_handler` when `Some` and disabling further waits after the first `Busy` slot.
+    pub fn claim_safe_backfill_frame_with_busy(
+        &mut self,
+        mx_frame: u32,
+        busy_handler: Option<&mut dyn FnMut(u32) -> bool>,
+    ) -> Result<u32> {
+        self.shm
+            .claim_safe_backfill_frame_with_busy_internal(mx_frame, busy_handler)
+    }
+
+    /// Acquires `EXCLUSIVE WAL_READ_LOCK(0)` prior to backfilling pages into `.db` (`wal.c:2342`),
+    /// valid in both `Passive` (`busy_handler = None`) and `Full`/`Restart`/`Truncate`.
+    pub fn lock_read0_for_backfill(
+        &mut self,
+        busy_handler: Option<&mut dyn FnMut(u32) -> bool>,
+    ) -> Result<()> {
+        let lock_idx = wal_read_lock_slot(0).unwrap();
+        if self.acquired_stack.contains(&lock_idx) {
+            return Ok(());
+        }
+        self.shm
+            .lock_additional_exclusive_with_busy_internal(lock_idx, busy_handler)?;
+        self.acquired_stack.push(lock_idx);
+        Ok(())
+    }
+
+    /// Releases `EXCLUSIVE WAL_READ_LOCK(0)` after backfill (`wal.c:2426`).
+    pub fn unlock_read0_after_backfill(&mut self) -> Result<()> {
+        let lock_idx = wal_read_lock_slot(0).unwrap();
+        let Some(pos) = self.acquired_stack.iter().rposition(|&x| x == lock_idx) else {
+            return Ok(());
+        };
+        self.acquired_stack.remove(pos);
+        self.shm.unlock_single_exclusive_internal(lock_idx)
+    }
+
+    /// Reads the live 8-byte `aSalt` (`[u32; 2]`, decoded from big-endian `@32..40` of copy 1) while
+    /// `WAL_READ_LOCK(0)` is held (`wal.c:2354` March 2026 WAL-reset salt guard).
+    pub fn read_live_header_salt(&self) -> Result<[u32; 2]> {
+        self.shm.read_live_header_salt_internal()
+    }
+
+    /// Reads `(frame_no -> pgno)` from the WAL-index `aPgno` array (`1..=max_frame`) for building
+    /// the checkpoint iterator (`walIteratorInit`, `wal.c:1866`).
+    pub fn read_frame_pgno(&self, frame_no: u32) -> Result<u32> {
+        self.shm.read_frame_pgno_internal(frame_no)
+    }
+
+    /// Acquires `EXCLUSIVE WAL_READ_LOCK(1..=4)` for `Restart` or `Truncate` (`wal.c:2456`),
+    /// rolling back any acquired subset if a slot fails or returns `Busy`.
+    pub fn lock_all_positive_readers_with_busy(
+        &mut self,
+        mut busy_handler: Option<&mut dyn FnMut(u32) -> bool>,
+    ) -> Result<()> {
+        if !self.holds_write_lock() {
+            return Err(SqliteError::misuse(
+                "locking WAL_READ_LOCK(1..=4) in checkpoint requires WAL_WRITE_LOCK",
+            ));
+        }
+        let mut newly_locked = Vec::with_capacity(4);
+        for slot in 1..(WAL_NREADER as u8) {
+            let idx = wal_read_lock_slot(slot).unwrap();
+            if self.acquired_stack.contains(&idx) {
+                continue;
+            }
+            let res = self.shm.lock_additional_exclusive_with_busy_internal(
+                idx,
+                match busy_handler.as_mut() {
+                    Some(h) => Some(&mut **h),
+                    None => None,
+                },
+            );
+            match res {
+                Ok(()) => {
+                    self.acquired_stack.push(idx);
+                    newly_locked.push(idx);
+                }
+                Err(err) => {
+                    for &held_idx in newly_locked.iter().rev() {
+                        if let Some(p) = self.acquired_stack.iter().rposition(|&x| x == held_idx) {
+                            self.acquired_stack.remove(p);
+                        }
+                        let _ = self.shm.unlock_single_exclusive_internal(held_idx);
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Releases `EXCLUSIVE WAL_READ_LOCK(1..=4)` in reverse order after `Restart`/`Truncate` (`wal.c:2467`).
+    pub fn unlock_all_positive_readers(&mut self) -> Result<()> {
+        let mut first_err: Option<SqliteError> = None;
+        for slot in (1..(WAL_NREADER as u8)).rev() {
+            let idx = wal_read_lock_slot(slot).unwrap();
+            if let Some(pos) = self.acquired_stack.iter().rposition(|&x| x == idx) {
+                self.acquired_stack.remove(pos);
+                if let Err(e) = self.shm.unlock_single_exclusive_internal(idx)
+                    && first_err.is_none()
+                {
+                    first_err = Some(e);
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     /// Explicitly releases all held checkpoint locks in strict reverse acquisition order.
     pub fn release(mut self) -> Result<()> {
         if !self.active {
@@ -645,6 +818,12 @@ impl<'a> RecoveryTxnGuard<'a> {
     /// Ensures logical 32 KiB WAL-index `region` is allocated and mapped during WAL recovery.
     pub fn ensure_region(&mut self, region: u32) -> Result<ShmChunk> {
         self.shm.ensure_region_writable_internal(region)
+    }
+
+    /// Maps `region` (`extend = true`) and zeroes its `aPgno` + `aHash` payload prior to scanning
+    /// recovery frames (`walIndexRecover`, `wal.c:1528-1595`).
+    pub fn reset_region_for_recovery(&mut self, region: u32) -> Result<()> {
+        self.shm.reset_region_for_recovery_internal(region)
     }
 
     /// Appends `(frame_no -> pgno)` into the WAL-index hash table during recovery.
@@ -722,6 +901,571 @@ impl Drop for RecoveryTxnGuard<'_> {
             let _ = self
                 .shm
                 .release_recovery_all_internal(self.reader_slot, true);
+        }
+    }
+}
+
+/// RAII sub-guard for `walIndexRecover` invoked while `CheckpointTxnGuard` already holds
+/// `WAL_CKPT_LOCK` and `WAL_WRITE_LOCK` (`wal.c:1436`), owning ONLY `WAL_RECOVER_LOCK`.
+#[derive(Debug)]
+pub struct CkptRecoveryGuard<'g, 'a> {
+    ckpt: &'g mut CheckpointTxnGuard<'a>,
+    active: bool,
+}
+
+impl CkptRecoveryGuard<'_, '_> {
+    /// Maps `region` (`extend = true`) and zeroes its `aPgno` + `aHash` payload prior to scanning.
+    pub fn reset_region_for_recovery(&mut self, region: u32) -> Result<()> {
+        self.ckpt.shm.reset_region_for_recovery_internal(region)
+    }
+
+    /// Appends `(frame_no -> pgno)` into the WAL-index hash table during recovery.
+    pub fn record_frame(
+        &mut self,
+        frame_no: u32,
+        pgno: u32,
+        committed_mx_frame: u32,
+    ) -> Result<()> {
+        self.ckpt
+            .shm
+            .record_frame_internal(frame_no, pgno, committed_mx_frame)
+    }
+
+    /// Truncates hash entries strictly above `max_frame`.
+    pub fn truncate_frames_above(&mut self, max_frame: u32) -> Result<()> {
+        self.ckpt.shm.truncate_frames_above_internal(max_frame)
+    }
+
+    /// Publishes the recovered header and updates `WalCkptInfo` + nonblocking `aReadMark[1..=4]`.
+    pub fn finish_recovery_header_and_marks(
+        &mut self,
+        header: &WalIndexHeaderData,
+    ) -> Result<(WalIndexHeaderData, [bool; WAL_NREADER])> {
+        self.ckpt
+            .shm
+            .finish_recovery_header_and_marks_internal(header)
+    }
+
+    /// Explicitly releases `WAL_RECOVER_LOCK` while preserving the parent checkpoint's locks.
+    pub fn finish(mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        self.ckpt
+            .shm
+            .unlock_single_exclusive_internal(WAL_RECOVER_LOCK)
+    }
+}
+
+impl Drop for CkptRecoveryGuard<'_, '_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.active = false;
+            if let Err(e) = self
+                .ckpt
+                .shm
+                .unlock_single_exclusive_internal(WAL_RECOVER_LOCK)
+            {
+                self.ckpt
+                    .shm
+                    .poison_connection(format!("failed to release WAL_RECOVER_LOCK: {e}"));
+            }
+        }
+    }
+}
+
+/// Outcome of probing `WAL_WRITE_LOCK` and `WAL_RECOVER_LOCK` on a read-only `-shm` connection
+/// when `WalIndexHdr` is uninitialized or mismatched (`wal.c:2788-2793, 3191-3196`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadonlyHeaderProbe {
+    /// `SHARED WAL_WRITE_LOCK` succeeded (immediately released): no writer/recovery is active,
+    /// so read-only caller must fail with `SQLITE_READONLY_RECOVERY`.
+    ReadonlyRecovery,
+    /// `WAL_WRITE_LOCK` was busy, `SHARED WAL_RECOVER_LOCK` succeeded (immediately released):
+    /// an ordinary writer is active, so caller should retry (`WAL_RETRY`).
+    WriterActiveRetry,
+    /// Both `WAL_WRITE_LOCK` and `WAL_RECOVER_LOCK` were busy: another process is actively
+    /// recovering the WAL, so caller must fail with `SQLITE_BUSY_RECOVERY`.
+    BusyRecovery,
+}
+
+/// Owned RAII guard holding standalone `EXCLUSIVE WAL_WRITE_LOCK` on an `Arc<WalShm>` for
+/// `walIndexReadHdr` header initialization / `walIndexRecover` (`wal.c:2796-2820`).
+#[derive(Debug)]
+pub struct OwnedInitWriteGuard {
+    shm: Arc<WalShm>,
+    active: bool,
+}
+
+impl OwnedInitWriteGuard {
+    pub(crate) fn new(shm: Arc<WalShm>) -> Self {
+        Self { shm, active: true }
+    }
+
+    /// Maps region 0 (`extend = true`) and attempts to read `(WalIndexHdr, WalCkptInfo)`.
+    pub fn extend_and_try_read_header(
+        &self,
+    ) -> Result<Option<(WalIndexHeaderData, WalCkptInfoSnapshot)>> {
+        let _ = self.shm.ensure_region_writable_internal(0)?;
+        self.shm.try_read_header_and_ckpt_info_internal()
+    }
+
+    /// Enters `walIndexRecover` (`WAL_CKPT_LOCK` + `WAL_RECOVER_LOCK`, never `WAL_READ_LOCK(0)`).
+    pub fn begin_recovery(&mut self) -> Result<InitRecoveryGuard<'_>> {
+        let _ = self.shm.enter_recovery_from_writer_internal(None)?;
+        Ok(InitRecoveryGuard {
+            init: self,
+            active: true,
+        })
+    }
+
+    /// Releases `EXCLUSIVE WAL_WRITE_LOCK` and returns the connection to `Idle`.
+    pub fn release(mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        self.shm.release_writer_internal(None, false)
+    }
+}
+
+/// RAII sub-guard for `walIndexRecover` invoked from [`OwnedInitWriteGuard`], owning ONLY
+/// `WAL_CKPT_LOCK` and `WAL_RECOVER_LOCK` while the parent [`OwnedInitWriteGuard`] retains
+/// `WAL_WRITE_LOCK`.
+#[derive(Debug)]
+pub struct InitRecoveryGuard<'g> {
+    init: &'g mut OwnedInitWriteGuard,
+    active: bool,
+}
+
+impl InitRecoveryGuard<'_> {
+    /// Maps `region` (`extend = true`) and zeroes its `aPgno` + `aHash` payload prior to scanning.
+    pub fn reset_region_for_recovery(&mut self, region: u32) -> Result<()> {
+        self.init.shm.reset_region_for_recovery_internal(region)
+    }
+
+    /// Appends `(frame_no -> pgno)` into the WAL-index hash table during recovery.
+    pub fn record_frame(
+        &mut self,
+        frame_no: u32,
+        pgno: u32,
+        committed_mx_frame: u32,
+    ) -> Result<()> {
+        self.init
+            .shm
+            .record_frame_internal(frame_no, pgno, committed_mx_frame)
+    }
+
+    /// Truncates hash entries strictly above `max_frame`.
+    pub fn truncate_frames_above(&mut self, max_frame: u32) -> Result<()> {
+        self.init.shm.truncate_frames_above_internal(max_frame)
+    }
+
+    /// Publishes the recovered header and updates `WalCkptInfo` + nonblocking `aReadMark[1..=4]`.
+    pub fn finish_recovery_header_and_marks(
+        &mut self,
+        header: &WalIndexHeaderData,
+    ) -> Result<(WalIndexHeaderData, [bool; WAL_NREADER])> {
+        self.init
+            .shm
+            .finish_recovery_header_and_marks_internal(header)
+    }
+
+    /// Releases `WAL_RECOVER_LOCK` and `WAL_CKPT_LOCK` in reverse order, leaving `WAL_WRITE_LOCK`
+    /// owned by the parent [`OwnedInitWriteGuard`].
+    pub fn finish(mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        self.init
+            .shm
+            .exit_recovery_to_writer_internal(None)
+            .map(|_| ())
+    }
+}
+
+impl Drop for InitRecoveryGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.active = false;
+            let _ = self.init.shm.exit_recovery_to_writer_internal(None);
+        }
+    }
+}
+
+impl Drop for OwnedInitWriteGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.active = false;
+            let _ = self.shm.release_writer_internal(None, true);
+        }
+    }
+}
+
+/// Owned `Arc<WalShm>`-backed reader snapshot guard (`Send + Sync`, zero lifetimes).
+#[derive(Debug)]
+pub struct OwnedWalReadGuard {
+    shm: Arc<WalShm>,
+    os_slot: Option<u8>,
+    logical_slot: u8,
+    epoch_at_entry: u64,
+    active: bool,
+}
+
+impl OwnedWalReadGuard {
+    pub(crate) fn new(
+        shm: Arc<WalShm>,
+        os_slot: Option<u8>,
+        logical_slot: u8,
+        epoch_at_entry: u64,
+    ) -> Self {
+        Self {
+            shm,
+            os_slot,
+            logical_slot,
+            epoch_at_entry,
+            active: true,
+        }
+    }
+
+    #[inline]
+    pub const fn slot(&self) -> u8 {
+        self.logical_slot
+    }
+
+    #[inline]
+    pub const fn holds_os_read_lock(&self) -> bool {
+        self.os_slot.is_some()
+    }
+
+    #[inline]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch_at_entry
+    }
+
+    /// Reads and verifies `WalIndexHdr`.
+    pub fn read_header_verified(&self) -> Result<WalIndexHeaderData> {
+        self.shm.read_header_verified_internal()
+    }
+
+    /// Reads `aReadMark[slot]`.
+    pub fn read_mark(&self) -> Result<u32> {
+        self.shm.read_slot_mark_internal(self.logical_slot)
+    }
+
+    /// Reads `WalCkptInfo` (`nBackfill`, `aReadMark[0..5]`, `nBackfillAttempted`).
+    pub fn read_ckpt_info(&self) -> Result<WalCkptInfoSnapshot> {
+        self.shm.read_ckpt_info_internal()
+    }
+
+    /// Post-lock verification (`wal.c:3250, 3315-3320`): executes `shm_barrier()`, verifies
+    /// `aReadMark[slot] == expected_mark` (when `Some`), and compares live `WalIndexHdr` against
+    /// `expected_hdr`.
+    pub fn verify_post_lock(
+        &self,
+        expected_mark: Option<u32>,
+        expected_hdr: &WalIndexHeaderData,
+    ) -> Result<bool> {
+        self.shm
+            .verify_post_read_lock_internal(self.logical_slot, expected_mark, expected_hdr)
+    }
+
+    /// Searches WAL-index hash tables for the latest frame of `pgno` in `[min_frame, max_frame]`.
+    pub fn lookup_page_in_range(
+        &self,
+        pgno: u32,
+        min_frame: u32,
+        max_frame: u32,
+    ) -> Result<Option<u32>> {
+        self.shm.lookup_page_internal(pgno, min_frame, max_frame)
+    }
+
+    /// Releases the OS `SHARED WAL_READ_LOCK(slot)` upon entering `WAL_EXCLUSIVE_MODE` under a
+    /// `.db` `EXCLUSIVE` lock (`sqlite3WalExclusiveMode(pWal, 1)`, `wal.c:4585-4590`).
+    pub fn enter_exclusive_mode(&mut self) -> Result<()> {
+        if let Some(slot) = self.os_slot.take() {
+            self.shm.release_reader_internal(slot, false)?;
+        }
+        Ok(())
+    }
+
+    /// Re-acquires the OS `SHARED WAL_READ_LOCK(slot)` upon leaving `WAL_EXCLUSIVE_MODE` back to
+    /// `WAL_NORMAL_MODE` (`sqlite3WalExclusiveMode(pWal, 0)`, `wal.c:4574-4580`).
+    pub fn exit_exclusive_mode(&mut self) -> Result<()> {
+        if self.os_slot.is_none() {
+            let epoch = self
+                .shm
+                .reacquire_reader_from_idle_internal(self.logical_slot)?;
+            self.os_slot = Some(self.logical_slot);
+            self.epoch_at_entry = epoch;
+        }
+        Ok(())
+    }
+
+    /// Upgrades this reader snapshot into an [`OwnedWriterTxnGuard`] by acquiring
+    /// `EXCLUSIVE WAL_WRITE_LOCK` (`sqlite3WalBeginWriteTransaction`).
+    ///
+    /// If acquiring `WAL_WRITE_LOCK` fails (e.g. `SQLITE_BUSY`), returns `Err((self, err))` with
+    /// this reader guard completely intact!
+    pub fn upgrade_to_writer(
+        mut self,
+    ) -> std::result::Result<OwnedWriterTxnGuard, (Self, SqliteError)> {
+        let res = match self.os_slot {
+            Some(slot) => self.shm.upgrade_reader_to_writer_internal(slot),
+            None => self.shm.acquire_writer_from_idle_internal(),
+        };
+        match res {
+            Ok(epoch) => {
+                self.active = false;
+                Ok(OwnedWriterTxnGuard {
+                    shm: Arc::clone(&self.shm),
+                    os_reader_slot: self.os_slot,
+                    logical_slot: Some(self.logical_slot),
+                    exclusive_db_mode: self.os_slot.is_none(),
+                    epoch_at_entry: epoch,
+                    active: true,
+                })
+            }
+            Err(err) => Err((self, err)),
+        }
+    }
+
+    /// Explicitly releases the reader lock and surfaces any unlock error.
+    pub fn unlock(mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        if let Some(slot) = self.os_slot.take() {
+            self.shm.release_reader_internal(slot, false)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for OwnedWalReadGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.active = false;
+            if let Some(slot) = self.os_slot.take() {
+                let _ = self.shm.release_reader_internal(slot, true);
+            }
+        }
+    }
+}
+
+/// Owned `Arc<WalShm>`-backed writer transaction guard (`Send + Sync`, zero lifetimes).
+#[derive(Debug)]
+pub struct OwnedWriterTxnGuard {
+    shm: Arc<WalShm>,
+    os_reader_slot: Option<u8>,
+    logical_slot: Option<u8>,
+    exclusive_db_mode: bool,
+    epoch_at_entry: u64,
+    active: bool,
+}
+
+impl OwnedWriterTxnGuard {
+    #[inline]
+    pub const fn reader_slot(&self) -> Option<u8> {
+        self.logical_slot
+    }
+
+    #[inline]
+    pub const fn holds_os_read_lock(&self) -> bool {
+        self.os_reader_slot.is_some()
+    }
+
+    #[inline]
+    pub const fn exclusive_db_mode(&self) -> bool {
+        self.exclusive_db_mode
+    }
+
+    #[inline]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch_at_entry
+    }
+
+    /// Reads and verifies live `WalIndexHdr`.
+    pub fn read_header_verified(&self) -> Result<WalIndexHeaderData> {
+        self.shm.read_header_verified_internal()
+    }
+
+    /// Reads live `WalCkptInfo` (`nBackfill`, `aReadMark[0..5]`, `nBackfillAttempted`).
+    pub fn read_ckpt_info(&self) -> Result<WalCkptInfoSnapshot> {
+        self.shm.read_ckpt_info_internal()
+    }
+
+    /// Searches WAL-index hash tables for the latest frame of `pgno` in `[min_frame, max_frame]`.
+    pub fn lookup_page_in_range(
+        &self,
+        pgno: u32,
+        min_frame: u32,
+        max_frame: u32,
+    ) -> Result<Option<u32>> {
+        self.shm.lookup_page_internal(pgno, min_frame, max_frame)
+    }
+
+    /// Appends `(frame_no -> pgno)` into the WAL-index `aPgno` + `aHash` tables (`walIndexAppend`).
+    pub fn record_frame(
+        &mut self,
+        frame_no: u32,
+        pgno: u32,
+        committed_mx_frame: u32,
+    ) -> Result<()> {
+        self.shm
+            .record_frame_internal(frame_no, pgno, committed_mx_frame)
+    }
+
+    /// Removes hash-table slots and `aPgno` entries strictly above `max_frame` (`walCleanupHash`).
+    pub fn truncate_frames_above(&mut self, max_frame: u32) -> Result<()> {
+        self.shm.truncate_frames_above_internal(max_frame)
+    }
+
+    /// Publishes `header` (`copy2 -> shm_barrier -> copy1`).
+    pub fn publish_header(&mut self, header: &WalIndexHeaderData) -> Result<WalIndexHeaderData> {
+        self.shm.publish_header_internal(header)
+    }
+
+    /// Attempts `walRestartHdr` during `walRestartLog` (`wal.c:3972-3981`) when `reader_slot == Some(0)`
+    /// and `nBackfill > 0`: tries nonblocking `EXCLUSIVE WAL_READ_LOCK(1..=4)` across all 4 positive
+    /// slots (rolling back any acquired subset on `Busy`/error).
+    ///
+    /// - Returns `Ok(Some(restarted_hdr))` if all 4 slots were free and header + marks + hash were reset.
+    /// - Returns `Ok(None)` if any slot returned `ErrorCode::Busy` (skipping reset!).
+    /// - Propagates any non-`Busy` error immediately.
+    pub fn try_reset_header_if_no_positive_readers(
+        &mut self,
+        base_header: &WalIndexHeaderData,
+        new_salt1: u32,
+    ) -> Result<Option<WalIndexHeaderData>> {
+        self.shm
+            .try_reset_header_under_write_internal(base_header, new_salt1)
+    }
+
+    /// Drops `WAL_READ_LOCK(0)` while continuing to hold `EXCLUSIVE WAL_WRITE_LOCK` (`wal.c:3984-3985`).
+    pub fn release_read_slot_zero_under_write(&mut self) -> Result<()> {
+        if self.logical_slot != Some(0) {
+            return Err(SqliteError::misuse(
+                "release_read_slot_zero_under_write requires logical_slot == Some(0)",
+            ));
+        }
+        if let Some(0) = self.os_reader_slot.take() {
+            self.shm.release_reader_under_write_internal(0)?;
+        }
+        self.logical_slot = None;
+        Ok(())
+    }
+
+    /// Claims `aReadMark[slot] = mark` (`slot` in `1..=4`) under brief `EXCLUSIVE WAL_READ_LOCK(slot)`
+    /// while continuing to hold `EXCLUSIVE WAL_WRITE_LOCK`, without yet acquiring `SHARED WAL_READ_LOCK(slot)`
+    /// (`walTryBeginRead(..., useWal=1)`, `wal.c:3275-3286`).
+    ///
+    /// Returns `Ok(true)` if claimed, `Ok(false)` on `ErrorCode::Busy`, or `Err` on other errors.
+    pub fn try_claim_positive_read_mark_under_write(
+        &mut self,
+        slot: u8,
+        mark: u32,
+    ) -> Result<bool> {
+        if slot == 0 || usize::from(slot) >= WAL_NREADER {
+            return Err(SqliteError::misuse("positive reader slot must be in 1..=4"));
+        }
+        if self.logical_slot.is_some() {
+            return Err(SqliteError::misuse(
+                "writer already holds a reader slot; release before claiming another",
+            ));
+        }
+        self.shm
+            .try_claim_read_mark_under_write_internal(slot, mark, !self.exclusive_db_mode)
+    }
+
+    /// Acquires a positive reader slot `slot` (`1..=4`) while continuing to hold `EXCLUSIVE WAL_WRITE_LOCK`
+    /// (`walTryBeginRead(..., useWal=1)`, `wal.c:3275-3306`), optionally claiming `aReadMark[slot] = claim_mark`
+    /// under brief `EXCLUSIVE WAL_READ_LOCK(slot)` first.
+    pub fn acquire_positive_read_slot_under_write(
+        &mut self,
+        slot: u8,
+        claim_mark: Option<u32>,
+    ) -> Result<()> {
+        if slot == 0 || usize::from(slot) >= WAL_NREADER {
+            return Err(SqliteError::misuse("positive reader slot must be in 1..=4"));
+        }
+        if self.logical_slot.is_some() {
+            return Err(SqliteError::misuse(
+                "writer already holds a reader slot; release before acquiring another",
+            ));
+        }
+        self.shm
+            .acquire_reader_under_write_internal(slot, claim_mark, !self.exclusive_db_mode)?;
+        self.logical_slot = Some(slot);
+        if !self.exclusive_db_mode {
+            self.os_reader_slot = Some(slot);
+        }
+        Ok(())
+    }
+
+    /// Post-lock verification while `WAL_WRITE_LOCK` is held (`wal.c:3315-3320`).
+    pub fn verify_post_read_lock(
+        &self,
+        expected_mark: Option<u32>,
+        expected_hdr: &WalIndexHeaderData,
+    ) -> Result<bool> {
+        let slot = self
+            .logical_slot
+            .ok_or_else(|| SqliteError::misuse("no logical read slot held for verification"))?;
+        self.shm
+            .verify_post_read_lock_internal(slot, expected_mark, expected_hdr)
+    }
+
+    /// Releases the currently held positive reader slot while keeping `EXCLUSIVE WAL_WRITE_LOCK`
+    /// (used if `verify_post_read_lock` detects a concurrent mark race and retries `walTryBeginRead`).
+    pub fn release_positive_read_slot_under_write(&mut self) -> Result<()> {
+        if let Some(slot) = self.os_reader_slot.take() {
+            self.shm.release_reader_under_write_internal(slot)?;
+        }
+        self.logical_slot = None;
+        Ok(())
+    }
+
+    /// Downgrades this writer guard back to an [`OwnedWalReadGuard`] (`Write -> Read`), releasing
+    /// `WAL_WRITE_LOCK` while RETAINING the connection's reader slot (`1..=4` or `0`).
+    pub fn downgrade_to_reader(mut self) -> Result<OwnedWalReadGuard> {
+        let logical_slot = self.logical_slot.ok_or_else(|| {
+            SqliteError::misuse("cannot downgrade writer without an active reader slot")
+        })?;
+        self.active = false;
+        let epoch = self
+            .shm
+            .downgrade_writer_to_reader_internal(self.os_reader_slot)?;
+        Ok(OwnedWalReadGuard::new(
+            Arc::clone(&self.shm),
+            self.os_reader_slot,
+            logical_slot,
+            epoch,
+        ))
+    }
+
+    /// Releases `WAL_WRITE_LOCK` AND any held reader slot, returning the connection to `Idle`.
+    pub fn unlock_all(mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        self.shm
+            .release_writer_internal(self.os_reader_slot.take(), false)
+    }
+}
+
+impl Drop for OwnedWriterTxnGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.active = false;
+            let _ = self
+                .shm
+                .release_writer_internal(self.os_reader_slot.take(), true);
         }
     }
 }

@@ -1644,17 +1644,101 @@ fn test_group8_pragma_journal_mode_transitions_lock_7_3_and_cli_smoke_test() {
         get_mode(&conn, "PRAGMA journal_mode = TRUNCATE;"),
         "truncate"
     );
-    // Unsupported `WAL` in Phase 1.1 or unknown mode keeps current active mode without error!
-    assert_eq!(get_mode(&conn, "PRAGMA journal_mode = wal;"), "truncate");
+    // `WAL` is supported in Phase 1.2 (and transitions cleanly back to `truncate`), while unknown modes keep current mode!
+    assert_eq!(get_mode(&conn, "PRAGMA journal_mode = wal;"), "wal");
+    assert_eq!(
+        get_mode(&conn, "PRAGMA journal_mode = TRUNCATE;"),
+        "truncate"
+    );
     assert_eq!(get_mode(&conn, "PRAGMA journal_mode = bogus;"), "truncate");
 
-    // `:memory:` supports only `memory` and `off`:
+    // `:memory:` supports only `memory` and `off` (including no-op `WAL` inside an active `BEGIN`!):
     let mem = Connection::open_in_memory().unwrap();
     assert_eq!(get_mode(&mem, "PRAGMA journal_mode;"), "memory");
     assert_eq!(get_mode(&mem, "PRAGMA journal_mode = delete;"), "memory");
+    assert_eq!(get_mode(&mem, "PRAGMA journal_mode = wal;"), "memory");
+    mem.execute("BEGIN;").unwrap();
+    assert_eq!(get_mode(&mem, "PRAGMA journal_mode = wal;"), "memory");
+    mem.execute("COMMIT;").unwrap();
     assert_eq!(get_mode(&mem, "PRAGMA journal_mode = off;"), "off");
     assert_eq!(get_mode(&mem, "PRAGMA journal_mode = memory;"), "memory");
     mem.try_close().unwrap();
+
+    // Audit Item 5:
+    // (a) `!is_in_autocommit` (`BEGIN DEFERRED` with `Pager` still in `Open`!) blocks changing
+    //     INTO or OUT OF `wal`, while no-op `PRAGMA journal_mode = wal;` on an already-`wal` DB succeeds!
+    conn.execute("BEGIN DEFERRED;").unwrap();
+    let into_err = conn
+        .query_row("PRAGMA journal_mode = wal;", &[])
+        .unwrap_err();
+    assert_eq!(into_err.code, ErrorCode::Error);
+    assert_eq!(
+        into_err.message,
+        "cannot change into wal mode from within a transaction"
+    );
+    assert_eq!(
+        get_mode(&conn, "PRAGMA journal_mode = truncate;"),
+        "truncate"
+    );
+    conn.execute("COMMIT;").unwrap();
+
+    assert_eq!(get_mode(&conn, "PRAGMA journal_mode = wal;"), "wal");
+    conn.execute("BEGIN DEFERRED;").unwrap();
+    assert_eq!(
+        get_mode(&conn, "PRAGMA journal_mode = wal;"),
+        "wal",
+        "no-op PRAGMA journal_mode = wal inside BEGIN DEFERRED must succeed"
+    );
+    let out_err = conn
+        .query_row("PRAGMA journal_mode = delete;", &[])
+        .unwrap_err();
+    assert_eq!(out_err.code, ErrorCode::Error);
+    assert_eq!(
+        out_err.message,
+        "cannot change out of wal mode from within a transaction"
+    );
+    conn.execute("COMMIT;").unwrap();
+
+    // (b) Fresh `Connection` opened on an existing `(2, 2)` WAL DB (after clean close unlinked `-wal`/`-shm`):
+    //     - `PRAGMA journal_mode;` immediately discovers `"wal"`!
+    //     - `PRAGMA journal_mode = bogus;` immediately discovers `"wal"`!
+    //     - `PRAGMA journal_mode = truncate;` properly rewrites Page 1 `(2, 2) -> (1, 1)`!
+    let wal_disc_path = sandbox.path().join("wal_lazy_disc.db");
+    {
+        let c_setup = Connection::open(&wal_disc_path).unwrap();
+        c_setup
+            .execute("CREATE TABLE w(x INTEGER PRIMARY KEY); INSERT INTO w VALUES (42);")
+            .unwrap();
+        assert_eq!(get_mode(&c_setup, "PRAGMA journal_mode = wal;"), "wal");
+        c_setup.try_close().unwrap();
+    }
+    assert_eq!(&fs::read(&wal_disc_path).unwrap()[18..20], &[2, 2]);
+    {
+        let c_q = Connection::open(&wal_disc_path).unwrap();
+        assert_eq!(get_mode(&c_q, "PRAGMA journal_mode;"), "wal");
+        c_q.try_close().unwrap();
+    }
+    {
+        let c_bogus = Connection::open(&wal_disc_path).unwrap();
+        assert_eq!(get_mode(&c_bogus, "PRAGMA journal_mode = bogus;"), "wal");
+        c_bogus.try_close().unwrap();
+    }
+    {
+        let c_exit = Connection::open(&wal_disc_path).unwrap();
+        assert_eq!(get_mode(&c_exit, "PRAGMA journal_mode = delete;"), "delete");
+        c_exit.try_close().unwrap();
+    }
+    assert_eq!(
+        &fs::read(&wal_disc_path).unwrap()[18..20],
+        &[1, 1],
+        "fresh Connection PRAGMA journal_mode = delete on existing (2, 2) DB must rewrite Page 1 to (1, 1)"
+    );
+
+    // Restore `conn` back to `truncate` for `lock-7.3` below:
+    assert_eq!(
+        get_mode(&conn, "PRAGMA journal_mode = TRUNCATE;"),
+        "truncate"
+    );
 
     // `lock-7.3`: `journal_mode = truncate` + paused `SELECT` at `Row` +
     // `BEGIN; UPDATE items SET code = 'Z' WHERE 0; COMMIT;` (zero dirty pages!) -> `main | shared`!

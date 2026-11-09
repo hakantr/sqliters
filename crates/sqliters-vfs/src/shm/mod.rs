@@ -19,9 +19,10 @@ use sqliters_types::{
 };
 
 pub use locks::{
-    CheckpointMode, CheckpointTxnGuard, RecoveryTxnGuard, ShmLockKind, WAL_CKPT_LOCK,
-    WAL_READ_LOCK_BASE, WAL_RECOVER_LOCK, WAL_SHM_DMS_OFFSET, WAL_SHM_NLOCK, WAL_WRITE_LOCK,
-    WalLockMode, WalLockState, WalReadGuard, WriterTxnGuard, wal_lock_byte_offset,
+    CheckpointMode, CheckpointTxnGuard, CkptRecoveryGuard, InitRecoveryGuard, OwnedInitWriteGuard,
+    OwnedWalReadGuard, OwnedWriterTxnGuard, ReadonlyHeaderProbe, RecoveryTxnGuard, ShmLockKind,
+    WAL_CKPT_LOCK, WAL_READ_LOCK_BASE, WAL_RECOVER_LOCK, WAL_SHM_DMS_OFFSET, WAL_SHM_NLOCK,
+    WAL_WRITE_LOCK, WalLockMode, WalLockState, WalReadGuard, WriterTxnGuard, wal_lock_byte_offset,
     wal_read_lock_slot,
 };
 pub use mapping::{
@@ -561,8 +562,14 @@ impl WalShm {
 
     /// Explicitly closes this `WalShm` session (`xShmUnmap`), optionally deleting `-shm` if this
     /// is the final open connection on the node. Fails with `SQLITE_BUSY` if any guard lock is
-    /// still active on this connection, and surfaces anyrecorded poison or OS close error.
+    /// still active on this connection, and surfaces any recorded poison or OS close error.
     pub fn close(&mut self, delete_if_last: bool) -> Result<()> {
+        self.close_shared(delete_if_last)
+    }
+
+    /// Explicitly closes this `WalShm` session via `&self` (allowing `Arc<WalShm>` teardown once
+    /// all transaction guards on this connection have been dropped).
+    pub fn close_shared(&self, delete_if_last: bool) -> Result<()> {
         let mut closed_guard = self
             .closed
             .lock()
@@ -599,6 +606,265 @@ impl WalShm {
             return Err(err);
         }
         close_res
+    }
+
+    /// Re-probes Deadman Switch readiness on the underlying `-shm` session (`walBeginShmUnreliable`,
+    /// `wal.c:2923`): returns `Ok(ShmDmsState::ActiveShared)` if a writer has since initialized DMS,
+    /// `Ok(ShmDmsState::ReadonlyCantInit)` if `-shm` remains uninitialized on a read-only handle,
+    /// or `Err` on I/O or lock failure.
+    pub fn reprobe_dms_ready(&self) -> Result<ShmDmsState> {
+        let _ = self.ensure_open_and_healthy()?;
+        match self.backend.ensure_dms_ready() {
+            Ok(()) => Ok(ShmDmsState::ActiveShared),
+            Err(e) if e.extended_code == extended::SQLITE_READONLY_CANTINIT => {
+                Ok(ShmDmsState::ReadonlyCantInit)
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Attempts lock-free dual-copy `WalIndexHdr` + `WalCkptInfo` read (`walIndexTryHdr`,
+    /// `wal.c:2690-2735`):
+    /// - Propagates `SQLITE_READONLY_CANTINIT` if DMS cannot be initialized on a read-only `-shm`.
+    /// - Propagates `ErrorCode::CantOpen` if header checksum is valid with an unsupported version.
+    /// - Returns `Ok(None)` if region 0 is not yet allocated or header copies/checksum are invalid.
+    /// - Returns `Ok(Some((hdr, ckpt)))` when both copies match with valid checksum and version.
+    pub fn try_read_header_and_ckpt_info(
+        &self,
+    ) -> Result<Option<(WalIndexHeaderData, WalCkptInfoSnapshot)>> {
+        self.try_read_header_and_ckpt_info_internal()
+    }
+
+    /// Probes `SHARED WAL_WRITE_LOCK` and (on `Busy`) `SHARED WAL_RECOVER_LOCK` from an `Idle`
+    /// read-only `-shm` connection when `WalIndexHdr` is uninitialized (`wal.c:2788-2793, 3191-3196`).
+    pub fn probe_readonly_bad_header(&self) -> Result<ReadonlyHeaderProbe> {
+        let conn_id = self.begin_idle_transition()?;
+        self.backend.ensure_dms_ready()?;
+        match self
+            .backend
+            .lock_slot(conn_id, WAL_WRITE_LOCK, ShmLockKind::Shared)
+        {
+            Ok(()) => {
+                self.backend
+                    .unlock_slot(conn_id, WAL_WRITE_LOCK, ShmLockKind::Shared)?;
+                Ok(ReadonlyHeaderProbe::ReadonlyRecovery)
+            }
+            Err(e) if e.code == ErrorCode::Busy => self.probe_recover_lock_internal(conn_id),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Probes `SHARED WAL_RECOVER_LOCK` when `WAL_WRITE_LOCK` returned `Busy` (`wal.c:3191-3196`),
+    /// distinguishing an active ordinary writer (`WriterActiveRetry`) from active WAL recovery
+    /// (`BusyRecovery`).
+    pub fn probe_recover_lock(&self) -> Result<ReadonlyHeaderProbe> {
+        let conn_id = self.ensure_open_and_healthy()?;
+        self.probe_recover_lock_internal(conn_id)
+    }
+
+    /// Acquires an [`OwnedInitWriteGuard`] holding `EXCLUSIVE WAL_WRITE_LOCK` from `Idle` for
+    /// `walIndexReadHdr` header initialization / `walIndexRecover` (`wal.c:2796-2820`).
+    pub fn acquire_owned_init_write(shm: &Arc<Self>) -> Result<OwnedInitWriteGuard> {
+        let _ = shm.acquire_writer_from_idle_internal()?;
+        Ok(OwnedInitWriteGuard::new(Arc::clone(shm)))
+    }
+
+    /// Claims `aReadMark[slot] = mark` (`slot` in `1..=4`) under a brief `EXCLUSIVE WAL_READ_LOCK(slot)`
+    /// without acquiring `SHARED WAL_READ_LOCK(slot)` (`wal.c:3275-3286`).
+    ///
+    /// - Returns `Ok(true)` if the slot was claimed and `aReadMark[slot]` updated to `mark`.
+    /// - Returns `Ok(false)` if `EXCLUSIVE WAL_READ_LOCK(slot)` failed with `ErrorCode::Busy`.
+    /// - Propagates any non-`Busy` error immediately.
+    pub fn try_claim_read_mark(
+        &self,
+        slot: u8,
+        mark: u32,
+        exclusive_db_mode: bool,
+    ) -> Result<bool> {
+        if slot == 0 {
+            return Err(SqliteError::misuse(
+                "aReadMark[0] cannot be updated via try_claim_read_mark",
+            ));
+        }
+        let lock_idx =
+            wal_read_lock_slot(slot).ok_or_else(|| SqliteError::misuse("reader slot > 4"))?;
+        let conn_id = self.begin_idle_transition()?;
+        self.backend.ensure_dms_ready()?;
+
+        let chunk0 = self.backend.map_region(0, false)?.ok_or_else(|| {
+            SqliteError::corrupt("WAL-index region 0 missing while updating aReadMark")
+        })?;
+
+        if !exclusive_db_mode {
+            match self
+                .backend
+                .lock_slot(conn_id, lock_idx, ShmLockKind::Exclusive)
+            {
+                Ok(()) => {}
+                Err(e) if e.code == ErrorCode::Busy => return Ok(false),
+                Err(other) => return Err(other),
+            }
+        }
+
+        let store_res = chunk0.store_u32(
+            WAL_CKPT_READMARK_OFFSET + usize::from(slot) * 4,
+            mark,
+            Ordering::Release,
+        );
+        let unlock_res = if !exclusive_db_mode {
+            self.backend
+                .unlock_slot(conn_id, lock_idx, ShmLockKind::Exclusive)
+        } else {
+            Ok(())
+        };
+        if let Err(e) = store_res {
+            if unlock_res.is_err() {
+                self.poison_connection("failed to unlock exclusive read slot after store err");
+            }
+            return Err(e);
+        }
+        unlock_res?;
+        Ok(true)
+    }
+
+    /// Acquires an [`OwnedWalReadGuard`] on `slot` (`0..=4`), optionally claiming `aReadMark[slot]`
+    /// under brief `EXCLUSIVE WAL_READ_LOCK(slot)` first (`walTryBeginRead`), and skipping OS
+    /// `WAL_READ_LOCK` acquisition when `exclusive_db_mode` is `true` (`WAL_EXCLUSIVE_MODE` under
+    /// `.db` `EXCLUSIVE` lock).
+    pub fn acquire_owned_read_slot_with_mark(
+        shm: &Arc<Self>,
+        slot: u8,
+        claim_mark: Option<u32>,
+        exclusive_db_mode: bool,
+    ) -> Result<OwnedWalReadGuard> {
+        let lock_idx =
+            wal_read_lock_slot(slot).ok_or_else(|| SqliteError::misuse("reader slot > 4"))?;
+        let conn_id = shm.begin_idle_transition()?;
+
+        if slot > 0 {
+            shm.backend.ensure_dms_ready()?;
+        }
+
+        if let Some(mark) = claim_mark {
+            if slot == 0 {
+                return Err(SqliteError::misuse(
+                    "aReadMark[0] cannot be updated via acquire_owned_read_slot_with_mark",
+                ));
+            }
+            let chunk0 = shm.backend.map_region(0, false)?.ok_or_else(|| {
+                SqliteError::corrupt("WAL-index region 0 missing while updating aReadMark")
+            })?;
+            if !exclusive_db_mode {
+                shm.backend
+                    .lock_slot(conn_id, lock_idx, ShmLockKind::Exclusive)?;
+            }
+            let store_res = chunk0.store_u32(
+                WAL_CKPT_READMARK_OFFSET + (slot as usize) * 4,
+                mark,
+                Ordering::Release,
+            );
+            let unlock_res = if !exclusive_db_mode {
+                shm.backend
+                    .unlock_slot(conn_id, lock_idx, ShmLockKind::Exclusive)
+            } else {
+                Ok(())
+            };
+            if let Err(e) = store_res {
+                if unlock_res.is_err() {
+                    shm.poison_connection("failed to unlock exclusive read slot after store err");
+                }
+                return Err(e);
+            }
+            unlock_res?;
+        }
+
+        if exclusive_db_mode {
+            let epoch = {
+                let st = shm.lock_state_guard()?;
+                st.epoch()
+            };
+            Ok(OwnedWalReadGuard::new(Arc::clone(shm), None, slot, epoch))
+        } else {
+            shm.backend
+                .lock_slot(conn_id, lock_idx, ShmLockKind::Shared)?;
+            let epoch = {
+                let mut st = shm.lock_state_guard()?;
+                st.record_lock(lock_idx, ShmLockKind::Shared);
+                st.set_mode(WalLockMode::Reading { slot });
+                st.epoch()
+            };
+            Ok(OwnedWalReadGuard::new(
+                Arc::clone(shm),
+                Some(slot),
+                slot,
+                epoch,
+            ))
+        }
+    }
+
+    /// Acquires a [`CheckpointTxnGuard`] matching `sqlite3WalCheckpoint` (`wal.c:4428-4452`):
+    /// - Acquires `EXCLUSIVE WAL_CKPT_LOCK` WITHOUT invoking `busy_handler` (`R-53820-33897`).
+    /// - For `Full`, `Restart`, or `Truncate`, attempts `EXCLUSIVE WAL_WRITE_LOCK` via `busy_handler`:
+    ///   if `WAL_WRITE_LOCK` remains `Busy`, downgrades the guard to `CheckpointMode::Passive` while
+    ///   retaining `WAL_CKPT_LOCK` and returns `Ok((guard, /*downgraded_busy=*/true))`!
+    pub fn acquire_checkpoint_with_busy(
+        &self,
+        mode: CheckpointMode,
+        busy_handler: Option<&mut dyn FnMut(u32) -> bool>,
+    ) -> Result<(CheckpointTxnGuard<'_>, bool)> {
+        let conn_id = self.begin_idle_transition()?;
+        self.backend.ensure_dms_ready()?;
+
+        let mut stack = Vec::with_capacity(7);
+        self.backend
+            .lock_slot(conn_id, WAL_CKPT_LOCK, ShmLockKind::Exclusive)?;
+        stack.push(WAL_CKPT_LOCK);
+
+        let mut effective_mode = mode;
+        let mut downgraded_busy = false;
+
+        if mode != CheckpointMode::Passive {
+            match self.lock_slot_with_busy_internal(
+                conn_id,
+                WAL_WRITE_LOCK,
+                ShmLockKind::Exclusive,
+                busy_handler,
+            ) {
+                Ok(()) => {
+                    stack.push(WAL_WRITE_LOCK);
+                }
+                Err(e) if e.code == ErrorCode::Busy => {
+                    effective_mode = CheckpointMode::Passive;
+                    downgraded_busy = true;
+                }
+                Err(other) => {
+                    if let Err(unlock_err) =
+                        self.backend
+                            .unlock_slot(conn_id, WAL_CKPT_LOCK, ShmLockKind::Exclusive)
+                    {
+                        self.poison_connection(format!(
+                            "failed to roll back WAL_CKPT_LOCK after WRITE failure: {unlock_err}"
+                        ));
+                    }
+                    return Err(other);
+                }
+            }
+        }
+
+        let epoch = {
+            let mut st = self.lock_state_guard()?;
+            for &idx in &stack {
+                st.record_lock(idx, ShmLockKind::Exclusive);
+            }
+            st.set_mode(WalLockMode::Checkpointing {
+                mode: effective_mode,
+            });
+            st.epoch()
+        };
+        Ok((
+            CheckpointTxnGuard::new(self, effective_mode, stack, epoch),
+            downgraded_busy,
+        ))
     }
 
     // ========================================================================
@@ -644,10 +910,360 @@ impl WalShm {
         Ok(st.connection_id())
     }
 
-    fn poison_connection(&self, reason: impl Into<String>) {
+    pub(crate) fn poison_connection(&self, reason: impl Into<String>) {
         if let Ok(mut st) = self.state.lock() {
             st.mark_poisoned(reason);
         }
+    }
+
+    pub(crate) fn try_read_header_and_ckpt_info_internal(
+        &self,
+    ) -> Result<Option<(WalIndexHeaderData, WalCkptInfoSnapshot)>> {
+        let _ = self.ensure_open_and_healthy()?;
+        self.backend.ensure_dms_ready()?;
+        let Some(chunk0) = self.backend.map_region(0, false)? else {
+            return Ok(None);
+        };
+
+        let copy1 = Self::load_raw_header_copy(&chunk0, WALINDEX_HDR_COPY1_OFFSET)?;
+        shm_barrier();
+        let copy2 = Self::load_raw_header_copy(&chunk0, WALINDEX_HDR_COPY2_OFFSET)?;
+        let hdr = match WalIndexHeaderData::decode_verified_pair(&copy1, &copy2) {
+            Ok(h) => h,
+            Err(e) if e.code == ErrorCode::CantOpen => return Err(e),
+            Err(_) => return Ok(None),
+        };
+        let ckpt = self.read_ckpt_info_from_chunk(&chunk0)?;
+        Ok(Some((hdr, ckpt)))
+    }
+
+    fn read_ckpt_info_from_chunk(&self, chunk0: &ShmChunk) -> Result<WalCkptInfoSnapshot> {
+        let n_backfill = chunk0.load_u32(WAL_CKPT_NBACKFILL_OFFSET, Ordering::Acquire)?;
+        let mut read_marks = [0u32; WAL_NREADER];
+        for (i, mark) in read_marks.iter_mut().enumerate() {
+            *mark = chunk0.load_u32(WAL_CKPT_READMARK_OFFSET + i * 4, Ordering::Acquire)?;
+        }
+        let n_backfill_attempted =
+            chunk0.load_u32(WAL_CKPT_BACKFILL_ATTEMPTED_OFFSET, Ordering::Acquire)?;
+        Ok(WalCkptInfoSnapshot {
+            n_backfill,
+            read_marks,
+            n_backfill_attempted,
+        })
+    }
+
+    fn probe_recover_lock_internal(&self, conn_id: u64) -> Result<ReadonlyHeaderProbe> {
+        match self
+            .backend
+            .lock_slot(conn_id, WAL_RECOVER_LOCK, ShmLockKind::Shared)
+        {
+            Ok(()) => {
+                self.backend
+                    .unlock_slot(conn_id, WAL_RECOVER_LOCK, ShmLockKind::Shared)?;
+                Ok(ReadonlyHeaderProbe::WriterActiveRetry)
+            }
+            Err(e) if e.code == ErrorCode::Busy => Ok(ReadonlyHeaderProbe::BusyRecovery),
+            Err(other) => Err(other),
+        }
+    }
+
+    pub(crate) fn acquire_writer_from_idle_internal(&self) -> Result<u64> {
+        let conn_id = self.begin_idle_transition()?;
+        self.backend.ensure_dms_ready()?;
+        self.backend
+            .lock_slot(conn_id, WAL_WRITE_LOCK, ShmLockKind::Exclusive)?;
+        let mut st = self.lock_state_guard()?;
+        st.record_lock(WAL_WRITE_LOCK, ShmLockKind::Exclusive);
+        st.set_mode(WalLockMode::Writing { reader_slot: None });
+        Ok(st.epoch())
+    }
+
+    pub(crate) fn reacquire_reader_from_idle_internal(&self, slot: u8) -> Result<u64> {
+        let lock_idx =
+            wal_read_lock_slot(slot).ok_or_else(|| SqliteError::misuse("reader slot > 4"))?;
+        let conn_id = self.begin_idle_transition()?;
+        if slot > 0 {
+            self.backend.ensure_dms_ready()?;
+        }
+        self.backend
+            .lock_slot(conn_id, lock_idx, ShmLockKind::Shared)?;
+        let mut st = self.lock_state_guard()?;
+        st.record_lock(lock_idx, ShmLockKind::Shared);
+        st.set_mode(WalLockMode::Reading { slot });
+        Ok(st.epoch())
+    }
+
+    pub(crate) fn verify_post_read_lock_internal(
+        &self,
+        slot: u8,
+        expected_mark: Option<u32>,
+        expected_hdr: &WalIndexHeaderData,
+    ) -> Result<bool> {
+        shm_barrier();
+        if let Some(exp_mark) = expected_mark {
+            let live_mark = self.read_slot_mark_internal(slot)?;
+            if live_mark != exp_mark {
+                return Ok(false);
+            }
+        }
+        let Some((live_hdr, _)) = self.try_read_header_and_ckpt_info_internal()? else {
+            return Ok(false);
+        };
+        Ok(live_hdr == *expected_hdr)
+    }
+
+    pub(crate) fn release_reader_under_write_internal(&self, slot: u8) -> Result<()> {
+        let conn_id = self.verify_holds_exclusive(WAL_WRITE_LOCK)?;
+        let lock_idx =
+            wal_read_lock_slot(slot).ok_or_else(|| SqliteError::misuse("reader slot > 4"))?;
+        self.backend
+            .unlock_slot(conn_id, lock_idx, ShmLockKind::Shared)?;
+        let mut st = self.lock_state_guard()?;
+        st.record_unlock(lock_idx, ShmLockKind::Shared);
+        st.set_mode(WalLockMode::Writing { reader_slot: None });
+        Ok(())
+    }
+
+    pub(crate) fn try_claim_read_mark_under_write_internal(
+        &self,
+        slot: u8,
+        mark: u32,
+        lock_os_exclusive: bool,
+    ) -> Result<bool> {
+        let conn_id = self.verify_holds_exclusive(WAL_WRITE_LOCK)?;
+        if slot == 0 {
+            return Err(SqliteError::misuse(
+                "aReadMark[0] cannot be updated via try_claim_read_mark_under_write_internal",
+            ));
+        }
+        let lock_idx =
+            wal_read_lock_slot(slot).ok_or_else(|| SqliteError::misuse("reader slot > 4"))?;
+        let chunk0 = self.ensure_region_writable_internal(0)?;
+
+        if lock_os_exclusive {
+            match self
+                .backend
+                .lock_slot(conn_id, lock_idx, ShmLockKind::Exclusive)
+            {
+                Ok(()) => {}
+                Err(e) if e.code == ErrorCode::Busy => return Ok(false),
+                Err(other) => return Err(other),
+            }
+        }
+
+        let store_res = chunk0.store_u32(
+            WAL_CKPT_READMARK_OFFSET + usize::from(slot) * 4,
+            mark,
+            Ordering::Release,
+        );
+        let unlock_res = if lock_os_exclusive {
+            self.backend
+                .unlock_slot(conn_id, lock_idx, ShmLockKind::Exclusive)
+        } else {
+            Ok(())
+        };
+        if let Err(e) = store_res {
+            if unlock_res.is_err() {
+                self.poison_connection(
+                    "failed to unlock exclusive read slot under write after store err",
+                );
+            }
+            return Err(e);
+        }
+        unlock_res?;
+        Ok(true)
+    }
+
+    pub(crate) fn acquire_reader_under_write_internal(
+        &self,
+        slot: u8,
+        claim_mark: Option<u32>,
+        lock_os_shared: bool,
+    ) -> Result<()> {
+        let conn_id = self.verify_holds_exclusive(WAL_WRITE_LOCK)?;
+        let lock_idx =
+            wal_read_lock_slot(slot).ok_or_else(|| SqliteError::misuse("reader slot > 4"))?;
+
+        if let Some(mark) = claim_mark {
+            if slot == 0 {
+                return Err(SqliteError::misuse(
+                    "aReadMark[0] cannot be updated via acquire_reader_under_write_internal",
+                ));
+            }
+            let chunk0 = self.ensure_region_writable_internal(0)?;
+            if lock_os_shared {
+                self.backend
+                    .lock_slot(conn_id, lock_idx, ShmLockKind::Exclusive)?;
+            }
+            let store_res = chunk0.store_u32(
+                WAL_CKPT_READMARK_OFFSET + usize::from(slot) * 4,
+                mark,
+                Ordering::Release,
+            );
+            let unlock_res = if lock_os_shared {
+                self.backend
+                    .unlock_slot(conn_id, lock_idx, ShmLockKind::Exclusive)
+            } else {
+                Ok(())
+            };
+            if let Err(e) = store_res {
+                if unlock_res.is_err() {
+                    self.poison_connection(
+                        "failed to unlock exclusive read slot under write after store err",
+                    );
+                }
+                return Err(e);
+            }
+            unlock_res?;
+        }
+
+        if lock_os_shared {
+            self.backend
+                .lock_slot(conn_id, lock_idx, ShmLockKind::Shared)?;
+            let mut st = self.lock_state_guard()?;
+            st.record_lock(lock_idx, ShmLockKind::Shared);
+            st.set_mode(WalLockMode::Writing {
+                reader_slot: Some(slot),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn try_reset_header_under_write_internal(
+        &self,
+        base_header: &WalIndexHeaderData,
+        new_salt1: u32,
+    ) -> Result<Option<WalIndexHeaderData>> {
+        let conn_id = self.verify_holds_exclusive(WAL_WRITE_LOCK)?;
+        let mut locked_readers: Vec<u8> = Vec::with_capacity(4);
+        for slot in 1..(WAL_NREADER as u8) {
+            let idx = wal_read_lock_slot(slot).unwrap();
+            match self.backend.lock_slot(conn_id, idx, ShmLockKind::Exclusive) {
+                Ok(()) => locked_readers.push(idx),
+                Err(err) => {
+                    for &held_idx in locked_readers.iter().rev() {
+                        let _ = self
+                            .backend
+                            .unlock_slot(conn_id, held_idx, ShmLockKind::Exclusive);
+                    }
+                    if err.code == ErrorCode::Busy {
+                        return Ok(None);
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        let write_res = self.write_restarted_header_and_marks_internal(base_header, new_salt1);
+
+        let mut unlock_err: Option<SqliteError> = None;
+        for &held_idx in locked_readers.iter().rev() {
+            if let Err(e) = self
+                .backend
+                .unlock_slot(conn_id, held_idx, ShmLockKind::Exclusive)
+                && unlock_err.is_none()
+            {
+                unlock_err = Some(e);
+            }
+        }
+        if let Some(e) = unlock_err {
+            self.poison_connection(format!(
+                "failed to release WAL_READ_LOCK(1..=4) after try_reset_header: {e}"
+            ));
+            return Err(e);
+        }
+        write_res.map(Some)
+    }
+
+    pub(crate) fn lock_slot_with_busy_internal(
+        &self,
+        conn_id: u64,
+        lock_idx: u8,
+        kind: ShmLockKind,
+        busy_handler: Option<&mut dyn FnMut(u32) -> bool>,
+    ) -> Result<()> {
+        let Some(handler) = busy_handler else {
+            return self.backend.lock_slot(conn_id, lock_idx, kind);
+        };
+        let mut n_retry = 0u32;
+        loop {
+            match self.backend.lock_slot(conn_id, lock_idx, kind) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.code == ErrorCode::Busy => {
+                    if !handler(n_retry) {
+                        return Err(err);
+                    }
+                    n_retry = n_retry.saturating_add(1);
+                }
+                Err(other) => return Err(other),
+            }
+        }
+    }
+
+    pub(crate) fn lock_additional_exclusive_with_busy_internal(
+        &self,
+        lock_idx: u8,
+        busy_handler: Option<&mut dyn FnMut(u32) -> bool>,
+    ) -> Result<()> {
+        let conn_id = self.ensure_open_and_healthy()?;
+        self.lock_slot_with_busy_internal(conn_id, lock_idx, ShmLockKind::Exclusive, busy_handler)?;
+        let mut st = self.lock_state_guard()?;
+        st.record_lock(lock_idx, ShmLockKind::Exclusive);
+        Ok(())
+    }
+
+    pub(crate) fn unlock_single_exclusive_internal(&self, lock_idx: u8) -> Result<()> {
+        let conn_id = self.ensure_open_and_healthy()?;
+        self.backend
+            .unlock_slot(conn_id, lock_idx, ShmLockKind::Exclusive)?;
+        let mut st = self.lock_state_guard()?;
+        st.record_unlock(lock_idx, ShmLockKind::Exclusive);
+        Ok(())
+    }
+
+    pub(crate) fn read_live_header_salt_internal(&self) -> Result<[u32; 2]> {
+        let _ = self.verify_holds_exclusive(WAL_CKPT_LOCK)?;
+        let chunk0 = self
+            .backend
+            .map_region(0, false)?
+            .ok_or_else(|| SqliteError::corrupt("WAL-index region 0 is not mapped"))?;
+        let w0 = chunk0.load_u32(32, Ordering::Acquire)?;
+        let w1 = chunk0.load_u32(36, Ordering::Acquire)?;
+        let b0 = w0.to_ne_bytes();
+        let b1 = w1.to_ne_bytes();
+        Ok([u32::from_be_bytes(b0), u32::from_be_bytes(b1)])
+    }
+
+    pub(crate) fn read_frame_pgno_internal(&self, frame_no: u32) -> Result<u32> {
+        let _ = self.ensure_open_and_healthy()?;
+        if frame_no == 0 {
+            return Err(SqliteError::misuse("WAL frame_no must be >= 1"));
+        }
+        self.backend.ensure_dms_ready()?;
+        let region = wal_frame_page(frame_no);
+        let chunk = self.backend.map_region(region, false)?.ok_or_else(|| {
+            SqliteError::corrupt(format!(
+                "WAL-index missing mapped region {region} for frame {frame_no}"
+            ))
+        })?;
+        let (i_zero, pgno_base, capacity) = Self::region_hash_params(region)?;
+        let idx = frame_no - i_zero;
+        if idx == 0 || idx > capacity {
+            return Err(SqliteError::misuse("WAL frame index out of block capacity"));
+        }
+        let pgno_rel = pgno_base + ((idx - 1) as usize) * 4;
+        chunk.load_u32(pgno_rel, Ordering::Acquire)
+    }
+
+    pub(crate) fn reset_region_for_recovery_internal(&self, region: u32) -> Result<()> {
+        self.verify_holds_exclusive(WAL_WRITE_LOCK)?;
+        let chunk = self.ensure_region_writable_internal(region)?;
+        let zero_from = if region == 0 {
+            WALINDEX_HDR_TOTAL_SIZE
+        } else {
+            0
+        };
+        chunk.zero_aligned_u32_range(zero_from, SHM_CHUNK_SIZE)
     }
 
     pub(crate) fn read_header_verified_internal(&self) -> Result<WalIndexHeaderData> {
@@ -1137,8 +1753,9 @@ impl WalShm {
     ) -> Result<WalIndexHeaderData> {
         let chunk0 = self.ensure_region_writable_internal(0)?;
         let mut next = *base_header;
+        // Per `walRestartHdr` (`wal.c:2238-2247`): `mxFrame = 0`, `aSalt[0]++`, `aSalt[1] = salt1`;
+        // `iChange` (`change_counter`) is NOT incremented here (only on `isCommit` in `walFrames`).
         next.mx_frame = 0;
-        next.change_counter = next.change_counter.wrapping_add(1);
         next.salt[0] = next.salt[0].wrapping_add(1);
         next.salt[1] = new_salt1;
 
@@ -1167,6 +1784,14 @@ impl WalShm {
     }
 
     pub(crate) fn claim_safe_backfill_frame_internal(&self, mx_frame: u32) -> Result<u32> {
+        self.claim_safe_backfill_frame_with_busy_internal(mx_frame, None)
+    }
+
+    pub(crate) fn claim_safe_backfill_frame_with_busy_internal(
+        &self,
+        mx_frame: u32,
+        mut busy_handler: Option<&mut dyn FnMut(u32) -> bool>,
+    ) -> Result<u32> {
         let conn_id = self.verify_holds_exclusive(WAL_CKPT_LOCK)?;
         let chunk0 = self
             .backend
@@ -1198,7 +1823,15 @@ impl WalShm {
                     )?;
                     continue;
                 }
-                match self.backend.lock_slot(conn_id, idx, ShmLockKind::Exclusive) {
+                match self.lock_slot_with_busy_internal(
+                    conn_id,
+                    idx,
+                    ShmLockKind::Exclusive,
+                    match busy_handler.as_mut() {
+                        Some(h) => Some(&mut **h),
+                        None => None,
+                    },
+                ) {
                     Ok(()) => {
                         let mark = if slot == 1 {
                             mx_safe
@@ -1218,6 +1851,8 @@ impl WalShm {
                     }
                     Err(e) if e.code == ErrorCode::Busy => {
                         mx_safe = y;
+                        // Per `wal.c:2330`: `xBusy2 = 0` after the first busy reader slot!
+                        busy_handler = None;
                     }
                     Err(other) => return Err(other),
                 }

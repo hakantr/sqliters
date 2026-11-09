@@ -11,7 +11,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
-use sqliters_pager::{Pager, PagerOpenOptions, TransactionState};
+use sqliters_pager::{
+    JournalMode, LockingMode, Pager, PagerOpenOptions, TransactionState, WalCheckpointMode,
+    WalCheckpointResult,
+};
 use sqliters_types::{
     Bitvec, ErrorCode, KeySortOrder, Pgno, Result, SqliteError, TextEncoding, Value,
     compare_records_with_encoding, decode_record_with_encoding, extended,
@@ -164,6 +167,71 @@ impl Btree {
     #[inline]
     pub const fn encoding(&self) -> TextEncoding {
         self.pager.encoding()
+    }
+
+    #[inline]
+    pub const fn journal_mode(&self) -> JournalMode {
+        self.pager.journal_mode()
+    }
+
+    /// Switches journal mode (including rollback-journaled Page 1 `(1, 1) <-> (2, 2)` WAL transitions).
+    pub fn set_journal_mode(&mut self, mode: JournalMode) -> Result<JournalMode> {
+        self.pager.transition_journal_mode(mode)
+    }
+
+    #[inline]
+    pub const fn locking_mode(&self) -> LockingMode {
+        self.pager.locking_mode()
+    }
+
+    #[inline]
+    pub fn set_locking_mode(&mut self, mode: LockingMode) -> LockingMode {
+        self.pager.set_locking_mode(mode)
+    }
+
+    #[inline]
+    pub const fn synchronous(&self) -> u8 {
+        self.pager.synchronous()
+    }
+
+    #[inline]
+    pub fn set_synchronous(&mut self, level: u8) {
+        self.pager.set_synchronous(level);
+    }
+
+    /// Consumes and returns the post-commit WAL frame count (`sqlite3PagerWalCallback`) for
+    /// `wal_autocheckpoint`.
+    #[inline]
+    pub fn take_wal_callback_frame_count(&mut self) -> u32 {
+        self.pager.take_wal_callback_frame_count()
+    }
+
+    /// Runs a WAL checkpoint (`sqlite3BtreeCheckpoint`, `btree.c:11403`), propagating this
+    /// B-tree's attached atomic interrupt flag when present.
+    pub fn wal_checkpoint(
+        &mut self,
+        mode: WalCheckpointMode,
+        busy_handler: Option<&mut dyn FnMut(u32) -> bool>,
+    ) -> Result<WalCheckpointResult> {
+        let interrupt_ref = self.interrupt_flag.as_deref();
+        self.pager.wal_checkpoint(mode, busy_handler, interrupt_ref)
+    }
+
+    /// Runs a WAL checkpoint with a deterministic post-header hook (for race testing).
+    pub fn wal_checkpoint_with_hook(
+        &mut self,
+        mode: WalCheckpointMode,
+        busy_handler: Option<&mut dyn FnMut(u32) -> bool>,
+        after_read_hdr_hook: Option<&mut dyn FnMut()>,
+    ) -> Result<WalCheckpointResult> {
+        let interrupt_ref = self.interrupt_flag.as_deref();
+        self.pager
+            .wal_checkpoint_with_hook(mode, busy_handler, interrupt_ref, after_read_hdr_hook)
+    }
+
+    /// Spills currently dirty cache pages to `<db>-wal` as uncommitted frames (`is_commit = false`).
+    pub fn spill_dirty_pages_to_wal(&mut self) -> Result<usize> {
+        self.pager.spill_dirty_pages_to_wal()
     }
 
     // ========================================================================

@@ -207,6 +207,7 @@ impl ConnectionOpenOptions {
             lock_geometry: Some(self.lock_geometry),
             db_kind: Some(db_kind),
             temp_in_memory: self.temp_store_memory,
+            ..PagerOpenOptions::default()
         }
     }
 }

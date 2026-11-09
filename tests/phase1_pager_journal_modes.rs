@@ -607,7 +607,19 @@ fn test_lazy_open_nolock_concurrent_exclusive_and_deferred_hot_journal_recovery(
     p_bad.close().unwrap();
 
     let wal_file = sandbox.path().join("lazy.db-wal");
-    fs::write(&wal_file, [1u8; 32]).unwrap();
+    let mut unsupported_wal = [0u8; 64];
+    unsupported_wal[0..4].copy_from_slice(&0x377f_0682u32.to_be_bytes());
+    unsupported_wal[4..8].copy_from_slice(&9_999_999u32.to_be_bytes());
+    unsupported_wal[8..12].copy_from_slice(&4096u32.to_be_bytes());
+    let [s0, s1] = sqliters_vfs::wal_checksum_with_endian(
+        sqliters_vfs::WalChecksumEndian::Little,
+        &unsupported_wal[0..24],
+        None,
+    )
+    .unwrap();
+    unsupported_wal[24..28].copy_from_slice(&s0.to_be_bytes());
+    unsupported_wal[28..32].copy_from_slice(&s1.to_be_bytes());
+    fs::write(&wal_file, unsupported_wal).unwrap();
     let mut p_wal = Pager::open_with_options(
         vfs,
         Some(&db_path),
@@ -1346,7 +1358,7 @@ fn test_journal_mode_matrix_memory_off_savepoint134_and_reserved_delete_guard() 
         Some(JournalMode::Memory)
     );
     assert_eq!(JournalMode::from_pragma_str("off"), Some(JournalMode::Off));
-    assert_eq!(JournalMode::from_pragma_str("wal"), None);
+    assert_eq!(JournalMode::from_pragma_str("wal"), Some(JournalMode::Wal));
     assert_eq!(JournalMode::from_pragma_str("bogus"), None);
 
     // 1) In-memory DB mode restrictions (`Memory` & `Off` only) + `Off` rollback keeping pages (`pager.c:6850`)
@@ -1356,6 +1368,7 @@ fn test_journal_mode_matrix_memory_off_savepoint134_and_reserved_delete_guard() 
         JournalMode::Delete,
         JournalMode::Truncate,
         JournalMode::Persist,
+        JournalMode::Wal,
     ] {
         assert_eq!(
             mem_pager.set_journal_mode(disallowed).unwrap(),
@@ -1560,6 +1573,7 @@ fn test_lock_geometry_test_64k_skips_page_65_btree_integrity_and_c_sqlite_intero
         lock_geometry: Some(LockGeometry::TEST_64K),
         db_kind: None,
         temp_in_memory: false,
+        ..PagerOpenOptions::default()
     };
 
     // (A) Direct `Pager::allocate_raw_page()` test: 64 -> 66 (page 65 skipped!)

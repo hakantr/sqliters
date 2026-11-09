@@ -347,33 +347,121 @@ fn test_bulgu_2_active_journal_not_clobbered_and_crashed_hot_journal_recovered()
 }
 
 // ============================================================================
-// Finding 3: Explicit WAL mode rejection (`read_version == 2` / `-wal`)
+// Finding 3: WAL recovery & visibility (`(2, 2)` + uncheckpointed `-wal` frames)
+//            and unknown Format 3 version guards (`btree.c:3356-3386`)
 // ============================================================================
 
 #[test]
-fn test_bulgu_3_wal_database_explicitly_rejected() {
-    let tmp = TempDb::new("f3_wal");
+fn test_bulgu_3_wal_database_recovered_and_unknown_format_versions_guarded() {
+    // ------------------------------------------------------------------------
+    // Part A: Real WAL visibility (uncheckpointed `-wal` frames, never stale `.db`)
+    // ------------------------------------------------------------------------
+    let src_tmp = TempDb::new("f3_wal_src");
+    let wal_tmp = TempDb::new("f3_wal_snap");
+
+    // Seed `.db` with `(10)` in WAL mode (last-connection close backfills `10` into `.db`).
     run_c_sqlite3(
-        tmp.path(),
-        "PRAGMA journal_mode = WAL; CREATE TABLE t(x INT); INSERT INTO t VALUES (42);",
+        src_tmp.path(),
+        "PRAGMA journal_mode = WAL; CREATE TABLE t(x INT); INSERT INTO t VALUES (10);",
     );
 
-    // Phase 1.1 opens lazily (`Open/NoLock`, `schema_loaded = false`); the first locked read/schema
-    // access must fail explicitly with `ErrorCode::CantOpen` rather than returning stale data.
-    let conn = Connection::open(tmp.path()).expect("lazy open succeeds without reading header");
-    let err = conn
-        .query("SELECT * FROM t;", &[])
-        .expect_err("querying WAL database must fail explicitly rather than returning stale data");
-    assert_eq!(err.code, ErrorCode::CantOpen);
+    // Keep an interactive C SQLite 3.54.1 writer open with `wal_autocheckpoint = 0` so
+    // `UPDATE 10 -> 11` and `INSERT 42` commit strictly into `-wal` while `.db` remains at `(10)`!
+    let mut c_writer = InteractiveSqlProc::spawn_c_sqlite3(src_tmp.path());
+    c_writer.send_and_wait_marker(
+        "PRAGMA wal_autocheckpoint = 0; UPDATE t SET x = 11 WHERE x = 10; INSERT INTO t VALUES (42);",
+        "F3_WAL_COMMITTED",
+    );
+
+    let src_wal = PathBuf::from(format!("{}-wal", src_tmp.path().display()));
+    let dst_wal = PathBuf::from(format!("{}-wal", wal_tmp.path().display()));
     assert!(
-        err.message.contains("WAL"),
-        "expected WAL mention in error message, got: {}",
-        err.message
+        src_wal.exists() && fs::metadata(&src_wal).unwrap().len() > 32,
+        "expected uncheckpointed committed frames in -wal"
+    );
+    fs::copy(src_tmp.path(), wal_tmp.path()).unwrap();
+    fs::copy(&src_wal, &dst_wal).unwrap();
+    let _ = c_writer.finish(".quit");
+
+    // `Connection::open` succeeds lazily; first locked read recovers `-wal` and sees `(11, 42)`, NOT stale `(10)`!
+    let conn = Connection::open(wal_tmp.path()).expect("lazy open succeeds without reading header");
+    let qres = conn.query("SELECT x FROM t ORDER BY x;", &[]).unwrap();
+    assert_eq!(qres.rows.len(), 2);
+    assert_eq!(qres.rows[0].values(), &[Value::Integer(11)]);
+    assert_eq!(qres.rows[1].values(), &[Value::Integer(42)]);
+
+    let hdr = conn.database_header().unwrap();
+    assert_eq!((hdr.write_version, hdr.read_version), (2, 2));
+
+    let jmode = conn
+        .query_row("PRAGMA journal_mode;", &[])
+        .unwrap()
+        .unwrap()
+        .get_str(0)
+        .unwrap()
+        .to_owned();
+    assert_eq!(jmode, "wal");
+
+    // Rust `INSERT` commits cleanly into WAL, and C SQLite `PRAGMA integrity_check` verifies `"ok"`!
+    conn.execute("INSERT INTO t VALUES (99);").unwrap();
+    conn.try_close().unwrap();
+
+    assert_eq!(
+        run_c_sqlite3(wal_tmp.path(), "PRAGMA integrity_check;"),
+        "ok"
     );
     assert_eq!(
-        conn.database_header().unwrap_err().code,
-        ErrorCode::CantOpen
+        run_c_sqlite3(wal_tmp.path(), "SELECT x FROM t ORDER BY x;"),
+        "11\n42\n99"
     );
+
+    // ------------------------------------------------------------------------
+    // Part B: Format 3 version guards (`sqlite/src/btree.c:3356-3386`)
+    // ------------------------------------------------------------------------
+    // B1) `read_version > 2` (byte `19 = 3`) -> `ErrorCode::NotADb` on first locked read!
+    let bad_rv = TempDb::new("f3_bad_rv");
+    run_c_sqlite3(
+        bad_rv.path(),
+        "CREATE TABLE t(x INT); INSERT INTO t VALUES (7);",
+    );
+    let mut bad_bytes = fs::read(bad_rv.path()).unwrap();
+    bad_bytes[19] = 3;
+    fs::write(bad_rv.path(), &bad_bytes).unwrap();
+
+    let c_bad = Connection::open(bad_rv.path()).expect("lazy open succeeds");
+    assert_eq!(
+        c_bad.query("SELECT * FROM t;", &[]).unwrap_err().code,
+        ErrorCode::NotADb
+    );
+    assert_eq!(c_bad.database_header().unwrap_err().code, ErrorCode::NotADb);
+    c_bad.try_close().unwrap();
+
+    // B2) `write_version > 2` with `read_version <= 2` (bytes `18..=19 = [3, 2]`)
+    //     -> opens read-only and rejects writes with `ErrorCode::ReadOnly`!
+    let ro_wv = TempDb::new("f3_ro_wv");
+    run_c_sqlite3(
+        ro_wv.path(),
+        "PRAGMA journal_mode = WAL; CREATE TABLE t(x INT); INSERT INTO t VALUES (77);",
+    );
+    let mut ro_bytes = fs::read(ro_wv.path()).unwrap();
+    ro_bytes[18] = 3;
+    ro_bytes[19] = 2;
+    fs::write(ro_wv.path(), &ro_bytes).unwrap();
+
+    let c_ro = Connection::open(ro_wv.path()).expect("lazy open succeeds");
+    let ro_row = c_ro
+        .query_row("SELECT x FROM t;", &[])
+        .unwrap()
+        .unwrap()
+        .get_i64(0);
+    assert_eq!(ro_row, Some(77));
+    let ro_hdr = c_ro.database_header().unwrap();
+    assert_eq!((ro_hdr.write_version, ro_hdr.read_version), (3, 2));
+    assert_eq!(
+        c_ro.execute("INSERT INTO t VALUES (88);").unwrap_err().code,
+        ErrorCode::ReadOnly
+    );
+    c_ro.try_close().unwrap();
 }
 
 // ============================================================================

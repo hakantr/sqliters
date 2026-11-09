@@ -1,20 +1,30 @@
-//! Rollback journal (`pager.c`), page cache (`pcache1.c`), transactions, journal modes,
-//! and indexed anonymous physical sub-savepoints for SQLite 3.54.1.
+//! Rollback journal (`pager.c`), write-ahead log (`wal.c`), page cache (`pcache1.c`),
+//! transactions, journal modes, and indexed anonymous physical sub-savepoints for SQLite 3.54.1.
 #![forbid(unsafe_code)]
 
 pub mod header;
+pub mod wal;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use sqliters_types::{
     Bitvec, DatabaseKind, ErrorCode, LockGeometry, Pgno, Result, SQLITE_DEFAULT_PAGE_SIZE,
     SQLITE_VERSION_NUMBER, SqliteError, TextEncoding, decode_db_header_page_size, extended,
 };
-use sqliters_vfs::{LockLevel, MemoryVfs, OpenFlags, OsVfs, SyncFlags, Vfs, VfsFile};
+use sqliters_vfs::{
+    LockLevel, MemoryVfs, OpenFlags, OsVfs, ShmOpenOptions, SyncFlags, Vfs, VfsFile,
+};
 
 pub use header::{DB_HEADER_SIZE, DatabaseHeader};
+pub use wal::{
+    WAL_FRAME_HDRSIZE, WAL_HDRSIZE, WAL_MAGIC_BE, WAL_MAGIC_LE, WAL_MAX_VERSION,
+    WAL_RETRY_PROTOCOL_LIMIT, WAL_SAVEPOINT_NDATA, Wal, WalCheckpointMode, WalCheckpointResult,
+    WalExclusiveMode, WalFileHeader, WalFrameInput, wal_decode_frame, wal_encode_frame_header,
+    wal_frame_offset,
+};
 
 /// Magic 8-byte string at the start of an SQLite rollback journal (`aJournalMagic` in `pager.c`).
 pub const JOURNAL_MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
@@ -36,7 +46,7 @@ pub enum TransactionState {
     Write,
 }
 
-/// Rollback journal operating mode (`PAGER_JOURNALMODE_*` in `sqlite/src/pager.h`).
+/// Journal operating mode (`PAGER_JOURNALMODE_*` in `sqlite/src/pager.h`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JournalMode {
     Delete,
@@ -44,6 +54,7 @@ pub enum JournalMode {
     Persist,
     Memory,
     Off,
+    Wal,
 }
 
 impl JournalMode {
@@ -56,6 +67,7 @@ impl JournalMode {
             Self::Persist => "persist",
             Self::Memory => "memory",
             Self::Off => "off",
+            Self::Wal => "wal",
         }
     }
 
@@ -71,6 +83,35 @@ impl JournalMode {
             Some(Self::Memory)
         } else if s.eq_ignore_ascii_case("off") {
             Some(Self::Off)
+        } else if s.eq_ignore_ascii_case("wal") {
+            Some(Self::Wal)
+        } else {
+            None
+        }
+    }
+}
+
+/// Database locking mode (`PAGER_LOCKINGMODE_*` in `sqlite/src/pager.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LockingMode {
+    Normal,
+    Exclusive,
+}
+
+impl LockingMode {
+    #[inline]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Exclusive => "exclusive",
+        }
+    }
+
+    pub fn from_pragma_str(s: &str) -> Option<Self> {
+        if s.eq_ignore_ascii_case("normal") {
+            Some(Self::Normal)
+        } else if s.eq_ignore_ascii_case("exclusive") {
+            Some(Self::Exclusive)
         } else {
             None
         }
@@ -92,6 +133,15 @@ pub struct PagerOpenOptions {
     /// For [`DatabaseKind::PrivateTemporary`], selects in-memory backing (`temp_store = MEMORY`)
     /// while preserving `db_kind() == DatabaseKind::PrivateTemporary`.
     pub temp_in_memory: bool,
+    /// Opens a read-only database in `immutable` mode (skips OS locking and shared memory creation).
+    pub immutable: bool,
+    /// Forces `-shm` to open read-only (`WAL_SHM_RDONLY`, testing read-only WAL-index / `bShmUnreliable`).
+    pub readonly_shm: bool,
+    /// Build-default synchronous level applied when entering WAL mode if the user has not explicitly
+    /// overridden `PRAGMA synchronous` (`SQLITE_DEFAULT_WAL_SYNCHRONOUS = 2` in `sqliteInt.h:1501`).
+    pub default_wal_synchronous: u8,
+    /// Retains `<db>-wal` and `<db>-shm` on last-connection close (`SQLITE_FCNTL_PERSIST_WAL`).
+    pub persist_wal: bool,
 }
 
 impl Default for PagerOpenOptions {
@@ -101,6 +151,10 @@ impl Default for PagerOpenOptions {
             lock_geometry: None,
             db_kind: None,
             temp_in_memory: false,
+            immutable: false,
+            readonly_shm: false,
+            default_wal_synchronous: 2,
+            persist_wal: false,
         }
     }
 }
@@ -109,8 +163,10 @@ impl Default for PagerOpenOptions {
 struct SubsavepointSlot {
     orig_page_count: Pgno,
     orig_header: DatabaseHeader,
-    /// Pre-images of pages (`<= orig_page_count`) modified since this subsavepoint opened.
+    /// Pre-images of pages (`<= orig_page_count`) modified or spilled since this subsavepoint opened.
     saved_pages: HashMap<Pgno, Vec<u8>>,
+    /// 4-word WAL savepoint token (`[mx_frame, cksum0, cksum1, n_ckpt]`) when `use_wal` is active.
+    wal_savepoint: Option<[u32; WAL_SAVEPOINT_NDATA]>,
 }
 
 struct CachedPage {
@@ -125,7 +181,8 @@ fn derive_sidecar_path(canonical_db_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(os)
 }
 
-/// Manages page-level reads, writes, caching, rollback journaling, crash recovery, and sub-savepoints.
+/// Manages page-level reads, writes, caching, rollback journaling, WAL protocol, crash recovery,
+/// and sub-savepoints.
 pub struct Pager {
     vfs: Arc<dyn Vfs>,
     lock_geometry: LockGeometry,
@@ -141,10 +198,18 @@ pub struct Pager {
     /// or after [`Pager::close`]).
     file: Option<Box<dyn VfsFile>>,
     journal_file: Option<Box<dyn VfsFile>>,
+    wal: Option<Wal>,
 
     readonly: bool,
+    immutable: bool,
+    readonly_shm: bool,
+    persist_wal: bool,
+    suppress_auto_wal: bool,
     closed: bool,
     synchronous: u8,
+    synchronous_user_set: bool,
+    default_wal_synchronous: u8,
+    locking_mode: LockingMode,
     journal_mode: JournalMode,
     journal_size_limit: i64,
 
@@ -331,6 +396,8 @@ impl Pager {
             }
         };
 
+        let readonly = readonly || options.immutable;
+
         let journal_mode = if is_memdb_backing {
             JournalMode::Memory
         } else {
@@ -351,9 +418,17 @@ impl Pager {
             shm_path,
             file,
             journal_file: None,
+            wal: None,
             readonly,
+            immutable: options.immutable,
+            readonly_shm: options.readonly_shm,
+            persist_wal: options.persist_wal,
+            suppress_auto_wal: false,
             closed: false,
             synchronous: 2,
+            synchronous_user_set: false,
+            default_wal_synchronous: options.default_wal_synchronous.min(3),
+            locking_mode: LockingMode::Normal,
             journal_mode,
             journal_size_limit: -1,
             header: candidate_header,
@@ -396,6 +471,9 @@ impl Pager {
 
     #[inline]
     fn lock_db_file(&self, level: LockLevel) -> Result<()> {
+        if self.immutable {
+            return Ok(());
+        }
         if let Some(ref f) = self.file {
             f.lock(level)?;
         }
@@ -404,10 +482,85 @@ impl Pager {
 
     #[inline]
     fn unlock_db_file(&self, level: LockLevel) -> Result<()> {
+        if self.immutable {
+            return Ok(());
+        }
         if let Some(ref f) = self.file {
             f.unlock(level)?;
         }
         Ok(())
+    }
+
+    /// Acquires `LockLevel::Exclusive` on `.db`, restoring the prior lock level (and releasing any
+    /// intermediate `Pending` lock) on failure (`pagerExclusiveLock` in `sqlite/src/pager.c:7635`).
+    fn acquire_exclusive_lock_or_restore(&self) -> Result<()> {
+        if self.immutable {
+            return Ok(());
+        }
+        if let Some(ref f) = self.file {
+            let orig = f.lock_level();
+            if orig == LockLevel::NoLock {
+                f.lock(LockLevel::Shared)?;
+            }
+            let shared_lvl = f.lock_level();
+            if let Err(e) = f.lock(LockLevel::Exclusive) {
+                let _ = f.unlock(shared_lvl);
+                if orig == LockLevel::NoLock {
+                    let _ = f.unlock(LockLevel::NoLock);
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub const fn use_wal(&self) -> bool {
+        self.wal.is_some()
+    }
+
+    /// Returns a shared reference to the open [`Wal`] session, if active.
+    #[inline]
+    pub const fn wal(&self) -> Option<&Wal> {
+        self.wal.as_ref()
+    }
+
+    #[inline]
+    pub fn wal_mut(&mut self) -> Option<&mut Wal> {
+        self.wal.as_mut()
+    }
+
+    #[inline]
+    fn wal_sync_flags(&self) -> Option<SyncFlags> {
+        if self.is_memdb_backing || self.db_kind == DatabaseKind::PrivateTemporary {
+            None
+        } else if self.synchronous >= 3 {
+            Some(SyncFlags::Full)
+        } else if self.synchronous == 2 {
+            Some(SyncFlags::Normal)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn ckpt_sync_flags(&self) -> Option<SyncFlags> {
+        if self.is_memdb_backing || self.db_kind == DatabaseKind::PrivateTemporary {
+            None
+        } else if self.synchronous >= 3 {
+            Some(SyncFlags::Full)
+        } else if self.synchronous >= 1 {
+            Some(SyncFlags::Normal)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn apply_default_wal_synchronous_if_unset(&mut self) {
+        if !self.synchronous_user_set {
+            self.synchronous = self.default_wal_synchronous;
+        }
     }
 
     #[inline]
@@ -418,6 +571,11 @@ impl Pager {
     #[inline]
     pub const fn is_readonly(&self) -> bool {
         self.readonly
+    }
+
+    #[inline]
+    pub const fn is_immutable(&self) -> bool {
+        self.immutable
     }
 
     #[inline]
@@ -464,8 +622,30 @@ impl Pager {
     }
 
     #[inline]
+    pub const fn is_synchronous_user_set(&self) -> bool {
+        self.synchronous_user_set
+    }
+
+    #[inline]
     pub fn set_synchronous(&mut self, level: u8) {
         self.synchronous = level.min(3);
+        self.synchronous_user_set = true;
+    }
+
+    #[inline]
+    pub const fn locking_mode(&self) -> LockingMode {
+        self.locking_mode
+    }
+
+    /// Updates the pager locking mode (`sqlite3PagerLockingMode`, `pager.c:7404-7415`), returning
+    /// the resulting active [`LockingMode`].
+    pub fn set_locking_mode(&mut self, mode: LockingMode) -> LockingMode {
+        let is_temp = self.db_kind == DatabaseKind::PrivateTemporary && !self.is_memdb_backing;
+        let wal_heap = self.wal.as_ref().is_some_and(Wal::is_heap_memory);
+        if !is_temp && !wal_heap {
+            self.locking_mode = mode;
+        }
+        self.locking_mode
     }
 
     #[inline]
@@ -483,14 +663,34 @@ impl Pager {
         self.journal_size_limit
     }
 
-    /// Gets/sets the size limit for persistent journals (`sqlite3PagerJournalSizeLimit`, `pager.c:7549`).
-    /// Setting `limit >= -1` updates the limit (`-1` = unlimited); `limit < -1` is a query-only no-op.
+    /// Gets/sets the size limit for persistent journals and WAL resets (`sqlite3PagerJournalSizeLimit`,
+    /// `pager.c:7549`). Setting `limit >= -1` updates the limit (`-1` = unlimited); `limit < -1` is query-only.
     #[inline]
     pub fn set_journal_size_limit(&mut self, limit: i64) -> i64 {
         if limit >= -1 {
             self.journal_size_limit = limit;
+            if let Some(ref mut wal) = self.wal {
+                wal.set_journal_size_limit(limit);
+            }
         }
         self.journal_size_limit
+    }
+
+    /// Consumes and returns the post-commit WAL frame count (`sqlite3PagerWalCallback`).
+    pub fn take_wal_callback_frame_count(&mut self) -> u32 {
+        self.wal.as_mut().map_or(0, Wal::take_callback_frame_count)
+    }
+
+    /// Queries `SQLITE_FCNTL_PERSIST_WAL`.
+    #[inline]
+    pub const fn persist_wal(&self) -> bool {
+        self.persist_wal
+    }
+
+    /// Updates `SQLITE_FCNTL_PERSIST_WAL` (`true` keeps `-wal`/`-shm` on last-connection close).
+    #[inline]
+    pub fn set_persist_wal(&mut self, persist: bool) {
+        self.persist_wal = persist;
     }
 
     /// Returns `true` when it is safe to change `journal_mode` (`sqlite3PagerOkToChangeJournalMode`,
@@ -507,30 +707,290 @@ impl Pager {
         true
     }
 
-    /// Updates the rollback journal mode if allowed (`sqlite3PagerSetJournalMode`, `pager.c:7437`),
-    /// returning the resulting active [`JournalMode`].
+    fn wal_supported(&self) -> bool {
+        if self.db_kind != DatabaseKind::NamedDisk || self.is_memdb_backing || self.immutable {
+            return false;
+        }
+        if self.locking_mode == LockingMode::Exclusive {
+            return true;
+        }
+        self.file.as_ref().is_some_and(|f| f.supports_wal_shm())
+    }
+
+    fn open_wal_under_shared_lock(&mut self) -> Result<()> {
+        if self.wal.is_some() {
+            return Ok(());
+        }
+        if !self.immutable && !self.wal_supported() {
+            return Err(SqliteError::new(
+                ErrorCode::CantOpen,
+                "WAL mode is not supported on this database or VFS",
+            ));
+        }
+        if let Some(mut jfd) = self.journal_file.take() {
+            jfd.close()?;
+        }
+        self.journal_off = 0;
+
+        if self.locking_mode == LockingMode::Exclusive && !self.immutable {
+            self.acquire_exclusive_lock_or_restore()?;
+        }
+
+        let wpath = self
+            .wal_path
+            .as_deref()
+            .ok_or_else(|| SqliteError::misuse("NamedDisk database missing wal_path"))?;
+        let db_file = self
+            .file
+            .as_deref()
+            .ok_or_else(|| SqliteError::misuse("NamedDisk database missing file"))?;
+        let no_shm = self.locking_mode == LockingMode::Exclusive || self.immutable;
+        let wal = Wal::open(
+            Arc::clone(&self.vfs),
+            db_file,
+            wpath,
+            no_shm,
+            self.journal_size_limit,
+            ShmOpenOptions {
+                readonly_shm: self.readonly_shm,
+                allow_unreliable_readonly: true,
+            },
+            self.immutable,
+        )?;
+        if wal.is_readonly() {
+            self.readonly = true;
+        }
+        self.wal = Some(wal);
+        self.journal_mode = JournalMode::Wal;
+        self.apply_default_wal_synchronous_if_unset();
+        Ok(())
+    }
+
+    /// Checkpoints and closes the open WAL connection under `LockLevel::Exclusive` prior to
+    /// switching out of WAL mode (`sqlite3PagerCloseWal`, `pager.c:7746-7782`).
+    ///
+    /// If `LockLevel::Exclusive` cannot be obtained due to active readers/writers, returns
+    /// `ErrorCode::Busy` WITHOUT closing `self.wal`!
+    fn close_wal_for_mode_switch(&mut self) -> Result<()> {
+        if self.wal.is_none() {
+            self.lock_db_file(LockLevel::Shared)?;
+            let exists_res = match self.wal_path.as_deref() {
+                Some(wp) => self.vfs.exists(wp),
+                None => Ok(false),
+            };
+            let wal_exists = match exists_res {
+                Ok(v) => v,
+                Err(e) => {
+                    if self.locking_mode == LockingMode::Normal {
+                        let _ = self.unlock_db_file(LockLevel::NoLock);
+                    }
+                    return Err(e);
+                }
+            };
+            if wal_exists && let Err(e) = self.open_wal_under_shared_lock() {
+                if self.locking_mode == LockingMode::Normal {
+                    let _ = self.unlock_db_file(LockLevel::NoLock);
+                }
+                return Err(e);
+            }
+        }
+
+        if self.wal.is_some() {
+            self.acquire_exclusive_lock_or_restore()?;
+            let ckpt_sync = self.ckpt_sync_flags();
+            let wal = self.wal.take().expect("checked Some");
+            let close_res = {
+                let db_f = self.db_file()?;
+                wal.close(db_f, ckpt_sync, false)
+            };
+            if let Err(e) = close_res {
+                if self.locking_mode == LockingMode::Normal {
+                    let _ = self.unlock_db_file(LockLevel::Shared);
+                }
+                return Err(e);
+            }
+        } else {
+            self.acquire_exclusive_lock_or_restore()?;
+        }
+        Ok(())
+    }
+
+    /// Resolves `mode` against backing-store capabilities (`vdbe.c:8261-8272`, `pager.c:7440`),
+    /// returning the current `journal_mode` when `mode` is unsupported on this database (e.g.
+    /// `Wal` on `:memory:` / `PrivateTemporary` / `immutable`, or disk modes on `:memory:`).
+    pub fn effective_journal_mode_target(&self, mode: JournalMode) -> JournalMode {
+        if self.is_memdb_backing {
+            match mode {
+                JournalMode::Memory | JournalMode::Off => mode,
+                JournalMode::Delete
+                | JournalMode::Truncate
+                | JournalMode::Persist
+                | JournalMode::Wal => self.journal_mode,
+            }
+        } else if mode == JournalMode::Wal && !self.wal_supported() {
+            self.journal_mode
+        } else {
+            mode
+        }
+    }
+
+    /// Loads the authoritative on-disk header (discovering any existing `(2, 2)` WAL state) when
+    /// idle on a `NamedDisk` database, then applies [`Self::set_journal_mode`] (`OP_JournalMode` semantics).
+    pub fn transition_journal_mode(&mut self, mode: JournalMode) -> Result<JournalMode> {
+        self.ensure_not_closed()?;
+        if self.state == TransactionState::Open
+            && !self.header_loaded
+            && self.db_kind == DatabaseKind::NamedDisk
+        {
+            let _ = self.ensure_header_loaded()?;
+        }
+        self.set_journal_mode(mode)
+    }
+
+    /// Updates the journal mode if allowed (`OP_JournalMode` in `vdbe.c:8241` + `sqlite3PagerSetJournalMode`
+    /// in `pager.c:7437`), performing rollback-journaled Page 1 `(1, 1) <-> (2, 2)` transitions
+    /// when switching into or out of [`JournalMode::Wal`].
     pub fn set_journal_mode(&mut self, mode: JournalMode) -> Result<JournalMode> {
         self.ensure_not_closed()?;
+
         if !self.ok_to_change_journal_mode() {
             return Ok(self.journal_mode);
         }
 
-        let target_mode = if self.is_memdb_backing {
-            match mode {
-                JournalMode::Memory | JournalMode::Off => mode,
-                JournalMode::Delete | JournalMode::Truncate | JournalMode::Persist => {
-                    self.journal_mode
-                }
-            }
-        } else {
-            mode
-        };
-
         let old_mode = self.journal_mode;
+        let target_mode = self.effective_journal_mode_target(mode);
+
         if target_mode == old_mode {
             return Ok(self.journal_mode);
         }
 
+        if (old_mode == JournalMode::Wal || target_mode == JournalMode::Wal)
+            && self.state != TransactionState::Open
+        {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                if target_mode == JournalMode::Wal {
+                    "cannot change into wal mode from within a transaction"
+                } else {
+                    "cannot change out of wal mode from within a transaction"
+                },
+            ));
+        }
+
+        // Transition 1: `Rollback -> WAL` (`vdbe.c:8296-8315`, `btree.c:11581-11600`)
+        if target_mode == JournalMode::Wal {
+            self.begin_read()?;
+            if self.journal_mode == JournalMode::Wal {
+                // `begin_read` already discovered WAL on disk (`-wal` or `(2, 2)` header)!
+                self.end_read_if_unused()?;
+                return Ok(JournalMode::Wal);
+            }
+            if self.readonly {
+                let _ = self.end_read_if_unused();
+                return Err(SqliteError::readonly(
+                    "attempt to write a readonly database",
+                ));
+            }
+
+            let saved_mode = self.journal_mode;
+            if let Some(mut jfd) = self.journal_file.take() {
+                let _ = jfd.close();
+            }
+            self.journal_off = 0;
+            // Always protect Page 1 `(1, 1) -> (2, 2)` with an on-disk rollback journal (`Delete`),
+            // which also unlinks `<db>-journal` upon `commit()`.
+            self.journal_mode = JournalMode::Delete;
+
+            let step_res: Result<()> = (|| {
+                self.begin_exclusive()?;
+                self.mark_page_writable(1)?;
+                self.header.write_version = 2;
+                self.header.read_version = 2;
+                let hdr_copy = self.header.clone();
+                if let Some(p1) = self.cache.get_mut(&1) {
+                    hdr_copy.write_into(&mut p1.data[0..DB_HEADER_SIZE]);
+                    p1.dirty = true;
+                }
+                self.commit()
+            })();
+
+            if let Err(e) = step_res {
+                let _ = self.rollback_retaining_read(false);
+                self.journal_mode = saved_mode;
+                return Err(e);
+            }
+
+            self.journal_mode = JournalMode::Wal;
+            self.apply_default_wal_synchronous_if_unset();
+            return Ok(JournalMode::Wal);
+        }
+
+        // Transition 2: `WAL -> Rollback` (`vdbe.c:8286-8309`, `pager.c:7746-7782`, `btree.c:11581-11600`)
+        if old_mode == JournalMode::Wal {
+            if self.readonly {
+                return Err(SqliteError::readonly(
+                    "attempt to write a readonly database",
+                ));
+            }
+
+            self.close_wal_for_mode_switch()?;
+
+            // `.db` currently holds `LockLevel::Exclusive`, and `self.wal` is `None`.
+            // Suppress automatic WAL re-open while rewriting Page 1 `(2, 2) -> (1, 1)` under a
+            // rollback journal (`Delete` if target is `Memory`/`Off` so bytes 18..19 are crash-safe!).
+            let tx_rb_mode = match target_mode {
+                JournalMode::Memory | JournalMode::Off => JournalMode::Delete,
+                other => other,
+            };
+            self.journal_mode = tx_rb_mode;
+            self.suppress_auto_wal = true;
+            self.header_loaded = false;
+            self.cache.clear();
+
+            let step_res: Result<()> = (|| {
+                self.begin_read()?;
+                if self.page_count > 0
+                    && (self.header.write_version != 1 || self.header.read_version != 1)
+                {
+                    self.begin_exclusive()?;
+                    self.mark_page_writable(1)?;
+                    self.header.write_version = 1;
+                    self.header.read_version = 1;
+                    let hdr_copy = self.header.clone();
+                    if let Some(p1) = self.cache.get_mut(&1) {
+                        hdr_copy.write_into(&mut p1.data[0..DB_HEADER_SIZE]);
+                        p1.dirty = true;
+                    }
+                    self.commit()?;
+                } else {
+                    self.end_read_if_unused()?;
+                    if self.locking_mode == LockingMode::Normal {
+                        self.unlock_db_file(LockLevel::NoLock)?;
+                    }
+                }
+                Ok(())
+            })();
+
+            self.suppress_auto_wal = false;
+            if let Err(e) = step_res {
+                let _ = self.rollback_retaining_read(false);
+                if self.locking_mode == LockingMode::Normal {
+                    let _ = self.unlock_db_file(LockLevel::NoLock);
+                }
+                return Err(e);
+            }
+
+            if matches!(target_mode, JournalMode::Memory | JournalMode::Off) {
+                if let Some(mut jfd) = self.journal_file.take() {
+                    jfd.close()?;
+                }
+                self.journal_off = 0;
+            }
+            self.journal_mode = target_mode;
+            return Ok(self.journal_mode);
+        }
+
+        // Standard rollback-to-rollback mode switch (`Delete` / `Truncate` / `Persist` / `Memory` / `Off`).
         self.journal_mode = target_mode;
 
         let leaving_persistent = matches!(old_mode, JournalMode::Truncate | JournalMode::Persist)
@@ -585,6 +1045,189 @@ impl Pager {
         }
 
         Ok(self.journal_mode)
+    }
+
+    /// Runs a WAL checkpoint (`sqlite3BtreeCheckpoint` + `sqlite3PagerCheckpoint`, `btree.c:11403`,
+    /// `pager.c:7586`).
+    ///
+    /// Returns `ErrorCode::Locked` if this pager has an active `Read` or `Write` transaction,
+    /// or `WalCheckpointResult { busy: false, n_log: -1, n_ckpt: -1 }` if the database is not in WAL mode.
+    pub fn wal_checkpoint(
+        &mut self,
+        mode: WalCheckpointMode,
+        busy_handler: Option<&mut dyn FnMut(u32) -> bool>,
+        interrupt_flag: Option<&AtomicBool>,
+    ) -> Result<WalCheckpointResult> {
+        self.wal_checkpoint_with_hook(mode, busy_handler, interrupt_flag, None)
+    }
+
+    /// Runs a WAL checkpoint with an optional deterministic hook fired right after `walIndexReadHdr`
+    /// and before `WAL_READ_LOCK(0)` acquisition.
+    pub fn wal_checkpoint_with_hook(
+        &mut self,
+        mode: WalCheckpointMode,
+        busy_handler: Option<&mut dyn FnMut(u32) -> bool>,
+        interrupt_flag: Option<&AtomicBool>,
+        after_read_hdr_hook: Option<&mut dyn FnMut()>,
+    ) -> Result<WalCheckpointResult> {
+        self.ensure_not_closed()?;
+        if self.state != TransactionState::Open {
+            return Err(SqliteError::new(
+                ErrorCode::Locked,
+                "cannot checkpoint while a transaction is active on this connection",
+            ));
+        }
+
+        if self.wal.is_none() && self.db_kind == DatabaseKind::NamedDisk && !self.immutable {
+            self.lock_db_file(LockLevel::Shared)?;
+            let attach_res: Result<()> = (|| {
+                let wpath = self.wal_path.clone().expect("NamedDisk has wal_path");
+                if self.vfs.exists(&wpath)? {
+                    if self.db_file()?.file_size()? > 0 {
+                        self.open_wal_under_shared_lock()?;
+                    } else if !self.readonly {
+                        self.vfs.delete(&wpath, false)?;
+                    }
+                }
+                if self.wal.is_none() {
+                    let flen = self.db_file()?.file_size()?;
+                    if flen >= DB_HEADER_SIZE as u64 {
+                        let mut hdr_bytes = [0u8; DB_HEADER_SIZE];
+                        if self.db_file()?.read_at(&mut hdr_bytes, 0)? == DB_HEADER_SIZE {
+                            let disk_hdr = DatabaseHeader::parse(&hdr_bytes)?;
+                            if disk_hdr.forces_readonly() {
+                                self.readonly = true;
+                            }
+                            if disk_hdr.is_wal() || self.journal_mode == JournalMode::Wal {
+                                self.open_wal_under_shared_lock()?;
+                            }
+                        }
+                    } else if self.journal_mode == JournalMode::Wal {
+                        self.open_wal_under_shared_lock()?;
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(e) = attach_res {
+                if self.wal.is_none() && self.locking_mode == LockingMode::Normal {
+                    let _ = self.unlock_db_file(LockLevel::NoLock);
+                }
+                return Err(e);
+            }
+            if self.wal.is_none() && self.locking_mode == LockingMode::Normal {
+                let _ = self.unlock_db_file(LockLevel::NoLock);
+            }
+        }
+
+        if self.wal.is_none() {
+            return Ok(WalCheckpointResult {
+                busy: false,
+                n_log: -1,
+                n_ckpt: -1,
+            });
+        }
+
+        let ckpt_sync = self.ckpt_sync_flags();
+        let db_f = self
+            .file
+            .as_deref()
+            .ok_or_else(|| SqliteError::misuse("NamedDisk database missing file"))?;
+        let (res, is_changed) = self.wal.as_mut().unwrap().checkpoint_with_hook(
+            db_f,
+            mode,
+            busy_handler,
+            ckpt_sync,
+            interrupt_flag,
+            after_read_hdr_hook,
+        )?;
+        if is_changed {
+            self.cache.clear();
+            self.header_loaded = false;
+        }
+        Ok(res)
+    }
+
+    /// Spills all currently dirty cache pages as uncommitted WAL frames (`is_commit = false`,
+    /// `n_truncate = 0`, `pagerStress` in `pager.c:4700-4732`), recording savepoint pre-images
+    /// (`subjournalPageIfRequired`) and evicting the spilled clean pages from `self.cache` so
+    /// subsequent reads/writes exercise live `-wal` lookup and `iReCksum` frame overwrite.
+    pub fn spill_dirty_pages_to_wal(&mut self) -> Result<usize> {
+        self.ensure_not_closed()?;
+        if self.state != TransactionState::Write {
+            return Err(SqliteError::misuse(
+                "spill_dirty_pages_to_wal requires an active write transaction",
+            ));
+        }
+        if !self.use_wal() {
+            return Ok(0);
+        }
+
+        let lock_byte_pgno = self.lock_byte_page();
+        if self.page_count > 0
+            && let Some(p1) = self.cache.get_mut(&1)
+            && p1.dirty
+        {
+            self.header.write_version = 2;
+            self.header.read_version = 2;
+            self.header.database_size_pages = self.page_count;
+            self.header.write_into(&mut p1.data[0..DB_HEADER_SIZE]);
+        }
+
+        let mut dirty_pgnos: Vec<Pgno> = self
+            .cache
+            .iter()
+            .filter_map(|(&pgno, p)| {
+                if p.dirty && pgno <= self.page_count && pgno != lock_byte_pgno {
+                    Some(pgno)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        dirty_pgnos.sort_unstable();
+        if dirty_pgnos.is_empty() {
+            return Ok(0);
+        }
+
+        // Save pre-spill image into any open sub-savepoint slots (`subjournalPageIfRequired`)!
+        for &pgno in &dirty_pgnos {
+            let cur_img = self.cache.get(&pgno).expect("dirty exists").data.clone();
+            for sp in &mut self.subsavepoints {
+                if pgno <= sp.orig_page_count && !sp.saved_pages.contains_key(&pgno) {
+                    sp.saved_pages.insert(pgno, cur_img.clone());
+                }
+            }
+        }
+
+        let ps = self.header.page_size;
+        let w_sync = self.wal_sync_flags();
+        let c_sync = self.ckpt_sync_flags();
+        let mut spilled = 0usize;
+
+        for pgno in dirty_pgnos {
+            let page_data = self.cache.get(&pgno).expect("dirty exists").data.clone();
+            let db_f = self
+                .file
+                .as_deref()
+                .ok_or_else(|| SqliteError::misuse("missing db file during WAL spill"))?;
+            self.wal.as_mut().unwrap().write_frames(
+                db_f,
+                ps,
+                &[WalFrameInput {
+                    pgno,
+                    data: &page_data,
+                }],
+                0,
+                false,
+                w_sync,
+                c_sync,
+            )?;
+            self.cache.remove(&pgno);
+            spilled += 1;
+        }
+
+        self.cache_modified = true;
+        Ok(spilled)
     }
 
     #[inline]
@@ -705,6 +1348,7 @@ impl Pager {
     }
 
     /// Sets the page size before the database is initialized (`PRAGMA page_size = N`).
+    /// Note that `page_size` is immutable once the database is in WAL mode (`implementation_plan.md:359`).
     pub fn set_page_size(&mut self, new_size: u32) -> Result<()> {
         self.ensure_not_closed()?;
         if !DatabaseHeader::is_valid_page_size(new_size) {
@@ -712,8 +1356,14 @@ impl Pager {
                 "invalid page size {new_size}: must be power of two in 512..=65536"
             )));
         }
+        if self.journal_mode == JournalMode::Wal || self.use_wal() {
+            return Ok(());
+        }
         if self.state == TransactionState::Open && !self.header_loaded {
             let _ = self.ensure_header_loaded()?;
+        }
+        if self.journal_mode == JournalMode::Wal || self.use_wal() {
+            return Ok(());
         }
         if self.page_size_fixed && new_size != self.header.page_size {
             // In SQLite, PRAGMA page_size on an existing DB without VACUUM is a no-op.
@@ -725,26 +1375,8 @@ impl Pager {
         Ok(())
     }
 
-    fn reject_if_wal_present(&self) -> Result<()> {
-        if let Some(ref wpath) = self.wal_path
-            && self.vfs.exists(wpath)?
-            && let Ok(mut wfile) = self.vfs.open(Some(wpath), OpenFlags::READONLY)
-        {
-            let sz_res = wfile.file_size();
-            let _ = wfile.close();
-            if sz_res? > 0 {
-                return Err(SqliteError::new(
-                    ErrorCode::CantOpen,
-                    "WAL mode databases are not supported; checkpoint in SQLite with PRAGMA journal_mode=DELETE first",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Starts a read transaction (`SHARED` lock + WAL check + hot-journal recovery + authoritative
-    /// 100-byte header validation). On any error, releases `.db` back to `NoLock` without publishing
-    /// an unvalidated header.
+    /// Starts a read transaction (`SHARED` lock + two-phase WAL discovery + hot-journal recovery
+    /// + authoritative 100-byte header validation).
     pub fn begin_read(&mut self) -> Result<()> {
         self.ensure_not_closed()?;
         if self.state != TransactionState::Open {
@@ -762,9 +1394,27 @@ impl Pager {
             return Ok(());
         }
 
+        let had_wal_before = self.wal.is_some();
+        let prev_lock = self
+            .file
+            .as_ref()
+            .map_or(LockLevel::NoLock, |f| f.lock_level());
+
         self.lock_db_file(LockLevel::Shared)?;
         if let Err(e) = self.begin_read_under_shared_lock() {
-            let _ = self.unlock_db_file(LockLevel::NoLock);
+            if had_wal_before {
+                if let Some(ref mut wal) = self.wal {
+                    let _ = wal.end_read_transaction();
+                }
+            } else {
+                if let Some(wal) = self.wal.take() {
+                    wal.abort_open();
+                    self.journal_mode = JournalMode::Delete;
+                }
+                if self.locking_mode == LockingMode::Normal || prev_lock == LockLevel::NoLock {
+                    let _ = self.unlock_db_file(LockLevel::NoLock);
+                }
+            }
             return Err(e);
         }
         self.state = TransactionState::Read;
@@ -772,7 +1422,6 @@ impl Pager {
     }
 
     fn begin_read_under_shared_lock(&mut self) -> Result<()> {
-        self.reject_if_wal_present()?;
         if self.is_memdb_backing
             || (self.db_kind == DatabaseKind::PrivateTemporary && self.file.is_none())
         {
@@ -780,10 +1429,134 @@ impl Pager {
             return Ok(());
         }
 
-        let recovered = self.recover_hot_journal_under_shared_lock()?;
+        // Pass 1 (`pagerOpenWalIfPresent`, `pager.c:3393-3421`):
+        // Check `<db>-wal` under `.db` `SHARED` lock BEFORE touching Page 1 or `<db>-journal`.
+        if self.wal.is_none() && self.db_kind == DatabaseKind::NamedDisk && !self.suppress_auto_wal
+        {
+            let wpath = self.wal_path.clone().expect("NamedDisk has wal_path");
+            if self.vfs.exists(&wpath)? {
+                let db_bytes = self.db_file()?.file_size()?;
+                if db_bytes == 0 {
+                    if !self.immutable && !self.readonly {
+                        self.vfs.delete(&wpath, false)?;
+                    }
+                } else {
+                    self.open_wal_under_shared_lock()?;
+                }
+            }
+        }
+
+        if self.wal.is_none() {
+            let recovered = if self.immutable {
+                false
+            } else {
+                self.recover_hot_journal_under_shared_lock()?
+            };
+            let file_len = self.db_file()?.file_size()?;
+            if file_len == 0 {
+                if !self.suppress_auto_wal && self.journal_mode == JournalMode::Wal {
+                    self.open_wal_under_shared_lock()?;
+                } else {
+                    if recovered || self.page_count != 0 {
+                        self.cache.clear();
+                        self.page_count = 0;
+                        self.header.database_size_pages = 0;
+                        self.header.change_counter = 0;
+                        self.header.schema_cookie = 0;
+                        self.page_size_fixed = false;
+                    }
+                    self.header_loaded = true;
+                    return Ok(());
+                }
+            } else {
+                if file_len < DB_HEADER_SIZE as u64 {
+                    return Err(SqliteError::new(
+                        ErrorCode::NotADb,
+                        "file is not a database",
+                    ));
+                }
+
+                let mut hdr_bytes = [0u8; DB_HEADER_SIZE];
+                let n = self.db_file()?.read_at(&mut hdr_bytes, 0)?;
+                if n < DB_HEADER_SIZE {
+                    return Err(SqliteError::new(
+                        ErrorCode::NotADb,
+                        "short read on database header",
+                    ));
+                }
+
+                let mut disk_hdr = DatabaseHeader::parse(&hdr_bytes)?;
+                if disk_hdr.forces_readonly() {
+                    self.readonly = true;
+                }
+
+                // Pass 2 (`lockBtree`, `btree.c:3371-3386`):
+                // If `.db` Page 1 has `read_version == 2` (or `journal_mode == Wal`), attach WAL,
+                // discard pre-WAL Page 1, and re-read Page 1 under the WAL snapshot below!
+                if !self.suppress_auto_wal
+                    && self.db_kind == DatabaseKind::NamedDisk
+                    && (disk_hdr.is_wal() || self.journal_mode == JournalMode::Wal)
+                {
+                    self.open_wal_under_shared_lock()?;
+                } else {
+                    let ps = u64::from(disk_hdr.page_size);
+                    let file_pages = (file_len / ps) as Pgno;
+
+                    // Per btree.c:3330: if header page count is 0 or change_counter != version_valid_for
+                    // (e.g. modified by pre-3.7.0 SQLite), fall back to physical file size in pages.
+                    let effective_pages = if disk_hdr.database_size_pages == 0
+                        || disk_hdr.change_counter != disk_hdr.version_valid_for
+                    {
+                        file_pages.max(1)
+                    } else if disk_hdr.database_size_pages > file_pages && file_pages > 0 {
+                        return Err(SqliteError::corrupt(
+                            "database header page count exceeds file size",
+                        ));
+                    } else {
+                        disk_hdr.database_size_pages
+                    };
+                    disk_hdr.database_size_pages = effective_pages;
+
+                    let invalidate_cache = recovered
+                        || !self.header_loaded
+                        || !self.page_size_fixed
+                        || disk_hdr.page_size != self.header.page_size
+                        || disk_hdr.change_counter != self.header.change_counter
+                        || disk_hdr.schema_cookie != self.header.schema_cookie
+                        || effective_pages != self.page_count;
+                    if invalidate_cache {
+                        self.cache.clear();
+                    }
+
+                    self.header = disk_hdr;
+                    self.page_count = effective_pages;
+                    self.page_size_fixed = true;
+                    self.header_loaded = true;
+                    return Ok(());
+                }
+            }
+        }
+
+        // Active WAL path (`pagerBeginReadTransaction` + `pagerPagecount` + Page 1 read under WAL snapshot).
+        self.wal.as_mut().unwrap().end_read_transaction()?;
+        let changed = {
+            let db_f = self
+                .file
+                .as_deref()
+                .ok_or_else(|| SqliteError::misuse("NamedDisk database missing file"))?;
+            self.wal.as_mut().unwrap().begin_read_transaction(db_f)?
+        };
+        if self.wal.as_ref().unwrap().is_readonly() {
+            self.readonly = true;
+        }
+        if changed || !self.header_loaded {
+            self.cache.clear();
+        }
+
+        let wal_pages = self.wal.as_ref().unwrap().db_size();
         let file_len = self.db_file()?.file_size()?;
-        if file_len == 0 {
-            if recovered || self.page_count != 0 {
+        if wal_pages == 0 && file_len == 0 {
+            if self.page_count != 0 {
                 self.cache.clear();
                 self.page_count = 0;
                 self.header.database_size_pages = 0;
@@ -795,60 +1568,72 @@ impl Pager {
             return Ok(());
         }
 
-        if file_len < DB_HEADER_SIZE as u64 {
-            return Err(SqliteError::new(
-                ErrorCode::NotADb,
-                "file is not a database",
-            ));
-        }
-
         let mut hdr_bytes = [0u8; DB_HEADER_SIZE];
-        let n = self.db_file()?.read_at(&mut hdr_bytes, 0)?;
-        if n < DB_HEADER_SIZE {
-            return Err(SqliteError::new(
-                ErrorCode::NotADb,
-                "short read on database header",
-            ));
+        if let Some(p1_frame) = self.wal.as_ref().unwrap().find_frame(1)? {
+            self.wal
+                .as_ref()
+                .unwrap()
+                .read_frame(p1_frame, &mut hdr_bytes)?;
+        } else {
+            if file_len < DB_HEADER_SIZE as u64 {
+                return Err(SqliteError::new(
+                    ErrorCode::NotADb,
+                    "file is not a database",
+                ));
+            }
+            let n = self.db_file()?.read_at(&mut hdr_bytes, 0)?;
+            if n < DB_HEADER_SIZE {
+                return Err(SqliteError::new(
+                    ErrorCode::NotADb,
+                    "short read on database header",
+                ));
+            }
         }
 
-        let mut disk_hdr = DatabaseHeader::parse(&hdr_bytes)?;
-        let ps = u64::from(disk_hdr.page_size);
-        let file_pages = (file_len / ps) as Pgno;
+        let mut snap_hdr = DatabaseHeader::parse(&hdr_bytes)?;
+        if snap_hdr.forces_readonly() {
+            self.readonly = true;
+        }
 
-        // Per btree.c:3330: if header page count is 0 or change_counter != version_valid_for
-        // (e.g. modified by pre-3.7.0 SQLite), fall back to physical file size in pages.
-        let effective_pages = if disk_hdr.database_size_pages == 0
-            || disk_hdr.change_counter != disk_hdr.version_valid_for
-        {
-            file_pages.max(1)
-        } else if disk_hdr.database_size_pages > file_pages && file_pages > 0 {
-            return Err(SqliteError::corrupt(
-                "database header page count exceeds file size",
-            ));
+        let effective_pages = if wal_pages > 0 {
+            wal_pages
         } else {
-            disk_hdr.database_size_pages
+            let ps = u64::from(snap_hdr.page_size);
+            let file_pages = (file_len.div_ceil(ps)) as Pgno;
+            if snap_hdr.database_size_pages == 0
+                || snap_hdr.change_counter != snap_hdr.version_valid_for
+            {
+                file_pages.max(1)
+            } else if snap_hdr.database_size_pages > file_pages && file_pages > 0 {
+                return Err(SqliteError::corrupt(
+                    "database header page count exceeds file size",
+                ));
+            } else {
+                snap_hdr.database_size_pages
+            }
         };
-        disk_hdr.database_size_pages = effective_pages;
+        snap_hdr.database_size_pages = effective_pages;
 
-        let invalidate_cache = recovered
+        let invalidate_cache = changed
             || !self.header_loaded
             || !self.page_size_fixed
-            || disk_hdr.page_size != self.header.page_size
-            || disk_hdr.change_counter != self.header.change_counter
-            || disk_hdr.schema_cookie != self.header.schema_cookie
+            || snap_hdr.page_size != self.header.page_size
+            || snap_hdr.change_counter != self.header.change_counter
+            || snap_hdr.schema_cookie != self.header.schema_cookie
             || effective_pages != self.page_count;
         if invalidate_cache {
             self.cache.clear();
         }
 
-        self.header = disk_hdr;
+        self.header = snap_hdr;
         self.page_count = effective_pages;
         self.page_size_fixed = true;
         self.header_loaded = true;
         Ok(())
     }
 
-    /// Starts or upgrades to a write transaction (`RESERVED` lock).
+    /// Starts or upgrades to a write transaction (`RESERVED` lock in rollback mode; `WAL_WRITE_LOCK`
+    /// in WAL mode).
     pub fn begin_write(&mut self) -> Result<()> {
         self.begin_write_internal(LockLevel::Reserved, 0)
     }
@@ -871,11 +1656,30 @@ impl Pager {
 
     fn abort_write_upgrade(&mut self, acquired_read_here: bool) {
         self.subsavepoints.clear();
+        if self.use_wal() {
+            if let Some(ref mut wal) = self.wal {
+                let _ = wal.end_write_transaction();
+                if acquired_read_here {
+                    let _ = wal.end_read_transaction();
+                }
+            }
+            if acquired_read_here {
+                self.state = TransactionState::Open;
+            } else {
+                self.state = TransactionState::Read;
+            }
+            return;
+        }
+
         if acquired_read_here {
-            let _ = self.unlock_db_file(LockLevel::NoLock);
+            if self.locking_mode == LockingMode::Normal {
+                let _ = self.unlock_db_file(LockLevel::NoLock);
+            }
             self.state = TransactionState::Open;
         } else {
-            let _ = self.unlock_db_file(LockLevel::Shared);
+            if self.locking_mode == LockingMode::Normal {
+                let _ = self.unlock_db_file(LockLevel::Shared);
+            }
             self.state = TransactionState::Read;
         }
     }
@@ -893,7 +1697,7 @@ impl Pager {
         }
 
         if self.state == TransactionState::Write {
-            if target_lock >= LockLevel::Exclusive && !self.is_memdb_backing {
+            if !self.use_wal() && target_lock >= LockLevel::Exclusive && !self.is_memdb_backing {
                 self.lock_db_file(LockLevel::Exclusive)?;
             }
             self.ensure_subsavepoints(savepoint_depth)?;
@@ -930,6 +1734,14 @@ impl Pager {
             self.begin_read()?;
         }
 
+        // Re-check `self.readonly` after `begin_read` (e.g. `write_version > 2` or read-only WAL/SHM)!
+        if self.readonly {
+            self.abort_write_upgrade(acquired_read_here);
+            return Err(SqliteError::readonly(
+                "attempt to write a readonly database",
+            ));
+        }
+
         // Reject writing to auto-vacuum (`FULL` / `INCREMENTAL`) pointer-map databases until Faz 1.3.
         if self.page_count > 0 && self.header.largest_root_btree_page != 0 {
             self.abort_write_upgrade(acquired_read_here);
@@ -939,15 +1751,39 @@ impl Pager {
             ));
         }
 
-        let lock_res = if target_lock >= LockLevel::Exclusive {
-            self.lock_db_file(LockLevel::Reserved)
-                .and_then(|()| self.lock_db_file(LockLevel::Exclusive))
+        if self.use_wal() {
+            // In `locking_mode = EXCLUSIVE`, acquire `.db` `EXCLUSIVE` lock and transition WAL to
+            // `WalExclusiveMode::Exclusive` if currently in `Normal` (`pager.c:5998-6004`).
+            if self.locking_mode == LockingMode::Exclusive
+                && self.wal.as_mut().unwrap().exclusive_mode_transition(-1)?
+            {
+                if let Err(e) = self.acquire_exclusive_lock_or_restore() {
+                    self.abort_write_upgrade(acquired_read_here);
+                    return Err(e);
+                }
+                if let Err(e) = self.wal.as_mut().unwrap().exclusive_mode_transition(1) {
+                    self.abort_write_upgrade(acquired_read_here);
+                    return Err(e);
+                }
+            }
+
+            if let Err(e) = self.wal.as_mut().unwrap().begin_write_transaction() {
+                self.abort_write_upgrade(acquired_read_here);
+                return Err(e);
+            }
         } else {
-            self.lock_db_file(LockLevel::Reserved)
-        };
-        if let Err(e) = lock_res {
-            self.abort_write_upgrade(acquired_read_here);
-            return Err(e);
+            let lock_res = if target_lock >= LockLevel::Exclusive
+                || self.locking_mode == LockingMode::Exclusive
+            {
+                self.lock_db_file(LockLevel::Reserved)
+                    .and_then(|()| self.lock_db_file(LockLevel::Exclusive))
+            } else {
+                self.lock_db_file(LockLevel::Reserved)
+            };
+            if let Err(e) = lock_res {
+                self.abort_write_upgrade(acquired_read_here);
+                return Err(e);
+            }
         }
 
         self.tx_orig_page_count = self.page_count;
@@ -978,7 +1814,9 @@ impl Pager {
                 .ensure_journal_started()
                 .and_then(|()| self.initialize_empty_database())
         {
-            let _ = self.finalize_journal_after_tx(false);
+            if !self.use_wal() {
+                let _ = self.finalize_journal_after_tx(false);
+            }
             self.cache.remove(&1);
             self.page_count = 0;
             self.header = self.tx_orig_header.clone();
@@ -999,9 +1837,14 @@ impl Pager {
         if self.journal_started_in_tx {
             return Ok(());
         }
+        if self.use_wal() {
+            self.journal_started_in_tx = true;
+            self.cache_modified = true;
+            return Ok(());
+        }
 
         match self.journal_mode {
-            JournalMode::Off | JournalMode::Memory => {
+            JournalMode::Off | JournalMode::Memory | JournalMode::Wal => {
                 self.journal_started_in_tx = true;
                 self.cache_modified = true;
                 Ok(())
@@ -1076,6 +1919,13 @@ impl Pager {
         let usable = self.header.usable_size();
         let mut page1 = vec![0u8; ps];
 
+        let ver = if self.use_wal() || self.journal_mode == JournalMode::Wal {
+            2
+        } else {
+            1
+        };
+        self.header.write_version = ver;
+        self.header.read_version = ver;
         self.header.database_size_pages = 1;
         self.header.change_counter = 1;
         self.header.version_valid_for = 1;
@@ -1125,8 +1975,16 @@ impl Pager {
         if !self.cache.contains_key(&pgno) {
             let ps = self.header.page_size as usize;
             let mut buf = vec![0u8; ps];
-            let offset = u64::from(pgno - 1) * (ps as u64);
-            self.db_file()?.read_at(&mut buf, offset)?;
+            let wal_frame = match self.wal.as_ref() {
+                Some(wal) => wal.find_frame(pgno)?,
+                None => None,
+            };
+            if let Some(fno) = wal_frame {
+                self.wal.as_ref().unwrap().read_frame(fno, &mut buf)?;
+            } else {
+                let offset = u64::from(pgno - 1) * (ps as u64);
+                self.db_file()?.read_at(&mut buf, offset)?;
+            }
             self.cache.insert(
                 pgno,
                 CachedPage {
@@ -1186,7 +2044,7 @@ impl Pager {
             }
 
             if need_tx_preimage {
-                if self.journal_file.is_some() {
+                if !self.use_wal() && self.journal_file.is_some() {
                     self.append_journal_page(pgno, &orig)?;
                 }
                 self.tx_journaled.grow_to(self.tx_orig_page_count.max(pgno));
@@ -1303,50 +2161,188 @@ impl Pager {
         self.commit_retaining_read(retain_read)
     }
 
+    /// Normalizes `.db` and WAL lock state when ending a write transaction (`Write -> Read` or
+    /// `Write -> Open`) or ending a read transaction (`Read -> Read` or `Read -> Open`), matching
+    /// `pager_end_transaction` (`pager.c:2209-2214`) and `pager_unlock` (`pager.c:1901-1940`).
+    fn finish_tx_to_read_or_open(&mut self, retain_read: bool) -> Result<()> {
+        if self.use_wal() {
+            if self.locking_mode == LockingMode::Normal
+                && self.wal.as_mut().unwrap().exclusive_mode_transition(0)?
+            {
+                self.unlock_db_file(LockLevel::Shared)?;
+            }
+            if retain_read {
+                self.state = TransactionState::Read;
+            } else {
+                self.wal.as_mut().unwrap().end_read_transaction()?;
+                self.state = TransactionState::Open;
+            }
+            return Ok(());
+        }
+
+        if self.locking_mode == LockingMode::Normal {
+            if retain_read {
+                self.unlock_db_file(LockLevel::Shared)?;
+                self.state = TransactionState::Read;
+            } else {
+                self.unlock_db_file(LockLevel::NoLock)?;
+                self.state = TransactionState::Open;
+            }
+        } else if retain_read {
+            self.state = TransactionState::Read;
+        } else {
+            self.state = TransactionState::Open;
+        }
+        Ok(())
+    }
+
     /// Commits/finalizes any active write transaction while retaining `LockLevel::Shared`
     /// (`TransactionState::Read`) for remaining active readers (`Write -> Read`).
     pub fn downgrade_to_read(&mut self) -> Result<()> {
         self.ensure_not_closed()?;
         match self.state {
             TransactionState::Open => Ok(()),
-            TransactionState::Read => {
-                self.unlock_db_file(LockLevel::Shared)?;
-                Ok(())
-            }
+            TransactionState::Read => self.finish_tx_to_read_or_open(true),
             TransactionState::Write => self.commit_retaining_read(true),
         }
     }
 
-    /// Releases `LockLevel::Shared` (`Read -> Open/NoLock`) when no active reader remains.
-    /// Does not abort an active `Write` transaction.
+    /// Releases `LockLevel::Shared` (`Read -> Open/NoLock`, or `WAL_READ_LOCK` in WAL mode) when
+    /// no active reader remains. Does not abort an active `Write` transaction.
     pub fn end_read_if_unused(&mut self) -> Result<()> {
         self.ensure_not_closed()?;
         if self.state == TransactionState::Read {
-            self.unlock_db_file(LockLevel::NoLock)?;
-            self.state = TransactionState::Open;
+            self.finish_tx_to_read_or_open(false)?;
         }
         Ok(())
     }
 
-    /// Commits the active transaction. When `retain_read` is `true`, downgrades `.db` lock to
-    /// `LockLevel::Shared` (`TransactionState::Read`); when `false`, unlocks to `LockLevel::NoLock`
-    /// (`TransactionState::Open`).
+    /// Commits the active transaction. When `retain_read` is `true`, downgrades to
+    /// `TransactionState::Read` (retaining `.db` `Shared` and positive `WAL_READ_LOCK(1..=4)` in WAL);
+    /// when `false`, transitions to `TransactionState::Open`.
     pub fn commit_retaining_read(&mut self, retain_read: bool) -> Result<()> {
         self.ensure_not_closed()?;
         match self.state {
             TransactionState::Open => Ok(()),
-            TransactionState::Read => {
-                if retain_read {
-                    self.unlock_db_file(LockLevel::Shared)?;
-                } else {
-                    self.unlock_db_file(LockLevel::NoLock)?;
-                    self.state = TransactionState::Open;
-                }
-                Ok(())
-            }
+            TransactionState::Read => self.finish_tx_to_read_or_open(retain_read),
             TransactionState::Write => {
+                if self.use_wal() {
+                    let lock_byte_pgno = self.lock_byte_page();
+                    let has_dirty_pages = self.cache.iter().any(|(&pgno, p)| {
+                        p.dirty && pgno <= self.page_count && pgno != lock_byte_pgno
+                    });
+                    let needs_db_flush = self.cache_modified
+                        || has_dirty_pages
+                        || self.page_count != self.tx_orig_page_count;
+
+                    if needs_db_flush && self.page_count > 0 {
+                        // Ticket `2d1a5c67dfc2` (`pager.c:6565-6571`): always ensure Page 1 is dirty
+                        // with updated `(2, 2)`, `database_size_pages`, and `change_counter` so even
+                        // transactions whose dirty pages were all spilled earlier emit a commit frame!
+                        self.mark_page_writable(1)?;
+                        self.header.write_version = 2;
+                        self.header.read_version = 2;
+                        self.header.database_size_pages = self.page_count;
+                        if !self.change_counter_bumped {
+                            self.header.change_counter = self.header.change_counter.wrapping_add(1);
+                            if self.header.change_counter == 0 {
+                                self.header.change_counter = 1;
+                            }
+                            self.header.version_valid_for = self.header.change_counter;
+                            self.header.sqlite_version_number = SQLITE_VERSION_NUMBER;
+                            self.change_counter_bumped = true;
+                        }
+
+                        let hdr_copy = self.header.clone();
+                        let p1 = self.cache.get_mut(&1).expect("page 1 in cache");
+                        hdr_copy.write_into(&mut p1.data[0..DB_HEADER_SIZE]);
+                        p1.dirty = true;
+
+                        let mut dirty_pgnos: Vec<Pgno> = self
+                            .cache
+                            .iter()
+                            .filter_map(|(&pgno, p)| {
+                                if p.dirty && pgno <= self.page_count && pgno != lock_byte_pgno {
+                                    Some(pgno)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        dirty_pgnos.sort_unstable();
+
+                        let ps = self.header.page_size;
+                        let w_sync = self.wal_sync_flags();
+                        let c_sync = self.ckpt_sync_flags();
+                        let effective_n_truncate = if self.page_count == lock_byte_pgno {
+                            self.page_count - 1
+                        } else {
+                            self.page_count
+                        };
+
+                        {
+                            let db_f = self
+                                .file
+                                .as_deref()
+                                .ok_or_else(|| SqliteError::misuse("NamedDisk missing file"))?;
+                            let wal = self.wal.as_mut().expect("use_wal checked");
+                            let inputs: Vec<WalFrameInput<'_>> = dirty_pgnos
+                                .iter()
+                                .map(|&pgno| WalFrameInput {
+                                    pgno,
+                                    data: self
+                                        .cache
+                                        .get(&pgno)
+                                        .expect("dirty page exists")
+                                        .data
+                                        .as_slice(),
+                                })
+                                .collect();
+                            wal.write_frames(
+                                db_f,
+                                ps,
+                                &inputs,
+                                effective_n_truncate,
+                                true,
+                                w_sync,
+                                c_sync,
+                            )?;
+                        }
+
+                        self.cache.retain(|&pgno, _| pgno <= self.page_count);
+                        for pgno in dirty_pgnos {
+                            if let Some(page) = self.cache.get_mut(&pgno) {
+                                page.dirty = false;
+                            }
+                        }
+                    } else if self.page_count == 0 {
+                        self.wal
+                            .as_mut()
+                            .expect("use_wal checked")
+                            .undo(|_| Ok(()))?;
+                    }
+
+                    self.wal
+                        .as_mut()
+                        .expect("use_wal checked")
+                        .end_write_transaction()?;
+
+                    self.commit_phase_one_done = false;
+                    self.db_file_modified = false;
+                    self.cache_modified = false;
+                    self.change_counter_bumped = false;
+                    self.journal_started_in_tx = false;
+                    self.tx_preimages.clear();
+                    self.tx_journaled.clear_all();
+                    self.subsavepoints.clear();
+                    self.header_loaded = true;
+                    self.page_size_fixed = self.page_count > 0;
+
+                    return self.finish_tx_to_read_or_open(retain_read);
+                }
+
                 // Phase 1 (`sqlite3PagerCommitPhaseOne` / `PAGER_WRITER_FINISHED`, `pager.c:6740`):
-                //Skipped on retry if Phase 1 already completed and only Phase 2 (`finalize_journal_after_tx`)
+                // Skipped on retry if Phase 1 already completed and only Phase 2 (`finalize_journal_after_tx`)
                 // failed transiently, preventing re-writing `JOURNAL_MAGIC` over a truncated/zeroed journal!
                 if !self.commit_phase_one_done {
                     let lock_byte_pgno = self.lock_byte_page();
@@ -1459,40 +2455,67 @@ impl Pager {
                 self.header_loaded = true;
                 self.page_size_fixed = self.page_count > 0;
 
-                if retain_read {
-                    self.unlock_db_file(LockLevel::Shared)?;
-                    self.state = TransactionState::Read;
-                } else {
-                    self.unlock_db_file(LockLevel::NoLock)?;
-                    self.state = TransactionState::Open;
-                }
-                Ok(())
+                self.finish_tx_to_read_or_open(retain_read)
             }
         }
     }
 
-    /// Rolls back the active transaction, releasing locks back to `TransactionState::Open` (`NoLock`).
+    /// Rolls back the active transaction, releasing locks back to `TransactionState::Open`.
     pub fn rollback(&mut self) -> Result<()> {
         self.rollback_retaining_read(false)
     }
 
     /// Rolls back the active write transaction, restoring pre-images and original page count
-    /// (or discarding dirty disk cache when `JournalMode::Off`), then downgrading `.db` lock to
-    /// `LockLevel::Shared` (`retain_read == true`) or `LockLevel::NoLock` (`retain_read == false`).
+    /// (or discarding dirty disk cache when `JournalMode::Off`), then downgrading to
+    /// `TransactionState::Read` (`retain_read == true`) or `TransactionState::Open` (`retain_read == false`).
     pub fn rollback_retaining_read(&mut self, retain_read: bool) -> Result<()> {
         self.ensure_not_closed()?;
         match self.state {
             TransactionState::Open => Ok(()),
-            TransactionState::Read => {
-                if retain_read {
-                    self.unlock_db_file(LockLevel::Shared)?;
-                } else {
-                    self.unlock_db_file(LockLevel::NoLock)?;
-                    self.state = TransactionState::Open;
-                }
-                Ok(())
-            }
+            TransactionState::Read => self.finish_tx_to_read_or_open(retain_read),
             TransactionState::Write => {
+                if self.use_wal() {
+                    let orig_count = self.tx_orig_page_count;
+                    let mut reverted_pgnos = Vec::new();
+                    self.wal.as_mut().expect("use_wal checked").undo(|pgno| {
+                        reverted_pgnos.push(pgno);
+                        Ok(())
+                    })?;
+                    for pgno in reverted_pgnos {
+                        self.cache.remove(&pgno);
+                    }
+
+                    self.cache.retain(|&pgno, _| pgno <= orig_count);
+                    for (pgno, orig_data) in self.tx_preimages.drain() {
+                        if pgno <= orig_count {
+                            self.cache.insert(
+                                pgno,
+                                CachedPage {
+                                    data: orig_data,
+                                    dirty: false,
+                                },
+                            );
+                        }
+                    }
+
+                    self.page_count = orig_count;
+                    self.header = self.tx_orig_header.clone();
+                    self.page_size_fixed = orig_count > 0;
+                    self.tx_journaled.clear_all();
+                    self.commit_phase_one_done = false;
+                    self.db_file_modified = false;
+                    self.cache_modified = false;
+                    self.change_counter_bumped = false;
+                    self.journal_started_in_tx = false;
+                    self.subsavepoints.clear();
+
+                    self.wal
+                        .as_mut()
+                        .expect("use_wal checked")
+                        .end_write_transaction()?;
+                    return self.finish_tx_to_read_or_open(retain_read);
+                }
+
                 if self.journal_mode == JournalMode::Off {
                     return self.rollback_journal_mode_off(retain_read);
                 }
@@ -1565,14 +2588,7 @@ impl Pager {
                 self.finalize_journal_after_tx(false)?;
                 self.journal_started_in_tx = false;
 
-                if retain_read {
-                    self.unlock_db_file(LockLevel::Shared)?;
-                    self.state = TransactionState::Read;
-                } else {
-                    self.unlock_db_file(LockLevel::NoLock)?;
-                    self.state = TransactionState::Open;
-                }
-                Ok(())
+                self.finish_tx_to_read_or_open(retain_read)
             }
         }
     }
@@ -1627,17 +2643,23 @@ impl Pager {
         self.journal_started_in_tx = false;
 
         if retain_read {
-            self.unlock_db_file(LockLevel::Shared)?;
+            if self.locking_mode == LockingMode::Normal {
+                self.unlock_db_file(LockLevel::Shared)?;
+            }
             if !self.header_loaded
                 && let Err(e) = self.begin_read_under_shared_lock()
             {
-                let _ = self.unlock_db_file(LockLevel::NoLock);
+                if self.locking_mode == LockingMode::Normal {
+                    let _ = self.unlock_db_file(LockLevel::NoLock);
+                }
                 self.state = TransactionState::Open;
                 return Err(e);
             }
             self.state = TransactionState::Read;
         } else {
-            self.unlock_db_file(LockLevel::NoLock)?;
+            if self.locking_mode == LockingMode::Normal {
+                self.unlock_db_file(LockLevel::NoLock)?;
+            }
             self.state = TransactionState::Open;
         }
         Ok(())
@@ -1646,6 +2668,9 @@ impl Pager {
     /// Finalizes `self.journal_file` at the end of commit or rollback (`pager_end_transaction`,
     /// `sqlite/src/pager.c:2117-2161` and `zeroJournalHdr`, `pager.c:1436-1468`).
     fn finalize_journal_after_tx(&mut self, is_commit: bool) -> Result<()> {
+        if self.journal_mode == JournalMode::Wal {
+            return Ok(());
+        }
         if matches!(
             self.journal_mode,
             JournalMode::Delete | JournalMode::Memory | JournalMode::Off
@@ -1722,7 +2747,7 @@ impl Pager {
                 self.journal_off = 0;
                 Ok(())
             }
-            JournalMode::Delete | JournalMode::Memory | JournalMode::Off => {
+            JournalMode::Delete | JournalMode::Memory | JournalMode::Off | JournalMode::Wal => {
                 unreachable!("handled above")
             }
         }
@@ -1750,6 +2775,7 @@ impl Pager {
                 orig_page_count: self.page_count,
                 orig_header: self.header.clone(),
                 saved_pages: HashMap::new(),
+                wal_savepoint: self.wal.as_ref().map(Wal::savepoint),
             });
         }
         Ok(())
@@ -1766,6 +2792,18 @@ impl Pager {
         while self.subsavepoints.len() > index + 1 {
             let sp = self.subsavepoints.pop().expect("len checked");
             self.apply_subsavepoint_undo(&sp);
+        }
+        if self.use_wal()
+            && let Some(mut wsp) = self.subsavepoints[index].wal_savepoint
+        {
+            self.wal
+                .as_mut()
+                .expect("use_wal checked")
+                .savepoint_undo(&mut wsp)?;
+            self.subsavepoints[index].wal_savepoint = Some(wsp);
+            // Evict any clean pages loaded from spilled WAL frames so restored savepoint pages
+            // or committed WAL/DB pages are used instead.
+            self.cache.retain(|_, p| p.dirty);
         }
         let target = self.subsavepoints[index].clone();
         self.apply_subsavepoint_undo(&target);
@@ -1821,7 +2859,8 @@ impl Pager {
     // Explicit Close (`sqlite3PagerClose` with error surfacing)
     // ========================================================================
 
-    /// Explicitly rolls back any active transaction, closes open journal and database file handles,
+    /// Explicitly rolls back any active transaction, checkpoints & unlinks WAL/SHM if this is the
+    /// last open connection (`sqlite3WalClose`), closes open journal and database file handles,
     /// releases OS locks (and deletes `PrivateTemporary` files via `DELETEONCLOSE`), surfacing the
     /// first error encountered.
     pub fn close(&mut self) -> Result<()> {
@@ -1837,6 +2876,20 @@ impl Pager {
             // Preserve `<db>-journal` on disk for future hot-journal recovery if rollback failed!
             first_err = Some(e);
             self.state = TransactionState::Open;
+        }
+
+        if let Some(wal) = self.wal.take() {
+            let ckpt_sync = self.ckpt_sync_flags();
+            let persist_wal = self.persist_wal;
+            if let Some(ref db_fd) = self.file {
+                if let Err(e) = wal.close(db_fd.as_ref(), ckpt_sync, persist_wal)
+                    && first_err.is_none()
+                {
+                    first_err = Some(e);
+                }
+            } else {
+                wal.abort_open();
+            }
         }
 
         if let Some(mut jfd) = self.journal_file.take()

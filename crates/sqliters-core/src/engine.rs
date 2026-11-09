@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use sqliters_btree::Btree;
-use sqliters_pager::TransactionState;
+use sqliters_pager::{JournalMode, TransactionState};
 use sqliters_syntax::{
     AlterTableAction, BinaryOp, BindParam, ColumnDef, CommonTableExpr, CompoundOp, ConflictAction,
     CreateIndexStmt, CreateTableStmt, CurrentTimeKind, DeleteStmt, Expr, FkAction, FromClause,
@@ -15,9 +15,9 @@ use sqliters_syntax::{
     keyword_kind, parse_one, tokenize,
 };
 use sqliters_types::{
-    Collation, ConflictResolutionEffect, ErrorCode, KeySortOrder, Pgno, Result, SqliteError,
-    TextEncoding, TypeAffinity, Value, decode_record_with_encoding, encode_record_with_encoding,
-    extended,
+    Collation, ConflictResolutionEffect, DatabaseKind, ErrorCode, KeySortOrder, Pgno, Result,
+    SqliteError, TextEncoding, TypeAffinity, Value, decode_record_with_encoding,
+    encode_record_with_encoding, extended,
 };
 use sqliters_vdbe::{
     AggregateAccumulator, AggregateKind, Opcode, VmRuntimeContext, eval_cast_with_encoding,
@@ -9637,10 +9637,34 @@ fn exec_pragma(
             }
         }
         "JOURNAL_MODE" => {
+            if ctx.btree.pager().transaction_state() == TransactionState::Open
+                && !ctx.btree.pager().is_header_loaded()
+                && ctx.btree.pager().db_kind() == DatabaseKind::NamedDisk
+            {
+                let _ = ctx.btree.pager_mut().ensure_header_loaded()?;
+            }
+
             let active = if let Some(pv) = value {
                 let s = pragma_to_string(pv);
-                if let Some(target) = sqliters_pager::JournalMode::from_pragma_str(s.trim()) {
-                    ctx.btree.pager_mut().set_journal_mode(target)?
+                if let Some(target) = JournalMode::from_pragma_str(s.trim()) {
+                    if ctx.btree.pager().ok_to_change_journal_mode() {
+                        let old_mode = ctx.btree.pager().journal_mode();
+                        let target_mode = ctx.btree.pager().effective_journal_mode_target(target);
+                        if target_mode != old_mode
+                            && (old_mode == JournalMode::Wal || target_mode == JournalMode::Wal)
+                            && (!is_in_autocommit(ctx) || ctx.activity.other_readers > 0)
+                        {
+                            return Err(SqliteError::new(
+                                ErrorCode::Error,
+                                if target_mode == JournalMode::Wal {
+                                    "cannot change into wal mode from within a transaction"
+                                } else {
+                                    "cannot change out of wal mode from within a transaction"
+                                },
+                            ));
+                        }
+                    }
+                    ctx.btree.set_journal_mode(target)?
                 } else {
                     ctx.btree.pager().journal_mode()
                 }
