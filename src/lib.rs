@@ -51,20 +51,27 @@ pub use sqliters_vfs as vfs;
 #[doc(hidden)]
 pub use sqliters_core::TestBlobHandle;
 pub use sqliters_core::{
-    CloseError, ColumnSchema, Connection, ConnectionOpenOptions, ForeignKeySchema, IndexSchema,
-    InterruptHandle, PrepareMode, QueryOutput, QueryResult, Row, SQLITE_DEFAULT_WAL_AUTOCHECKPOINT,
-    Schema, Statement, StepResult, TableSchema,
+    CloseError, CollationCallback, CollationRegistry, ColumnSchema, Connection,
+    ConnectionOpenOptions, ExecutionContext, ForeignKeySchema, FunctionRegistry, IndexSchema,
+    InterruptHandle, PrepareMode, ProgressCallback, ProgressTracker, QueryOutput, QueryResult, Row,
+    SQLITE_DEFAULT_WAL_AUTOCHECKPOINT, ScalarFunctionCallback, ScalarFunctionDef, Schema,
+    Statement, StepResult, TableSchema,
 };
 pub use sqliters_pager::{
     AutoVacuumMode, DatabaseHeader, JournalMode, LockingMode, WalCheckpointMode,
     WalCheckpointResult,
 };
-pub use sqliters_syntax::{FkAction, is_complete, parse_one, parse_statements};
-pub use sqliters_types::{
-    Collation, ConflictResolutionEffect, DatabaseKind, ErrorCode, LockGeometry, Pgno, Result,
-    SQLITE_DEFAULT_PAGE_SIZE, SQLITE_FILE_HEADER, SQLITE_SOURCE_ID, SQLITE_VERSION,
-    SQLITE_VERSION_NUMBER, SqliteError, StorageClass, TextEncoding, TypeAffinity, Value,
+pub use sqliters_syntax::{
+    ColumnRef, FkAction, QualifiedName, is_complete, parse_one, parse_statements,
 };
+pub use sqliters_types::{
+    AggregateStepId, Collation, ConflictResolutionEffect, DatabaseId, DatabaseKind, ErrorCode,
+    ExecutionServices, FunctionFlags, LockGeometry, MAX_DB_SLOTS, Pgno, Result, RowMutationEvent,
+    RowMutationOp, RuntimeValue, SQLITE_DEFAULT_PAGE_SIZE, SQLITE_FILE_HEADER, SQLITE_MAX_ATTACHED,
+    SQLITE_SOURCE_ID, SQLITE_VERSION, SQLITE_VERSION_NUMBER, SqliteError, StorageClass,
+    TextEncoding, TypeAffinity, Value,
+};
+pub use sqliters_vdbe::BtreeAccess;
 pub use sqliters_vfs::{LockLevel, MemoryVfs, OpenFlags, OsVfs, SyncFlags, Vfs, VfsFile};
 
 /// Returns the SQLite library version string (`"3.54.1"`), matching `sqlite3_libversion()`.

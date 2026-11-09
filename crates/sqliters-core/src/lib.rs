@@ -4,6 +4,7 @@
 
 pub mod compiler;
 pub mod engine;
+pub mod execution_context;
 pub mod schema;
 
 use std::cell::RefCell;
@@ -23,10 +24,16 @@ use sqliters_syntax::{
     BindParam, Expr, FunctionArgs, InsertSource, ResultColumn, SelectCore, SelectStmt, Stmt,
     TableOrSubquery, parse_one,
 };
+pub use sqliters_syntax::{ColumnRef, QualifiedName};
+pub use sqliters_types::{
+    AggregateStepId, DatabaseId, ExecutionServices, FunctionFlags, MAX_DB_SLOTS, RowMutationEvent,
+    RowMutationOp, RuntimeValue, SQLITE_MAX_ATTACHED,
+};
 use sqliters_types::{
     ConflictResolutionEffect, DatabaseKind, ErrorCode, LockGeometry, Pgno, Result,
     SQLITE_DEFAULT_PAGE_SIZE, SqliteError, Value, extended,
 };
+pub use sqliters_vdbe::BtreeAccess;
 use sqliters_vdbe::{TestFunctionsScope, VdbeProgram, VdbeVm, VmRuntimeContext, VmStep};
 use sqliters_vfs::{MemoryVfs, OpenFlags, OsVfs, Vfs};
 
@@ -39,6 +46,10 @@ use crate::engine::{
     validate_and_infer_columns,
 };
 pub use engine::{QueryOutput, SQLITE_DEFAULT_WAL_AUTOCHECKPOINT};
+pub use execution_context::{
+    CollationCallback, CollationRegistry, ExecutionContext, FunctionRegistry, ProgressCallback,
+    ProgressTracker, ScalarFunctionCallback, ScalarFunctionDef,
+};
 pub use schema::{ColumnSchema, ForeignKeySchema, IndexSchema, Schema, TableSchema};
 
 /// Maximum automatic `PrepareMode::V2` schema-change reprepare retries (`SQLITE_MAX_SCHEMA_RETRY`).
@@ -416,6 +427,11 @@ struct ConnectionInner {
     activity: ActivityTracker,
     savepoints: Vec<SqlSavepoint>,
     runtime: VmRuntimeContext,
+    active_interrupt_flag: Arc<AtomicBool>,
+    functions: FunctionRegistry,
+    collations: CollationRegistry,
+    progress: ProgressTracker,
+    strict_subtype: bool,
     explicit_tx: bool,
     implicit_savepoint_tx: bool,
     in_user_btree_tx: bool,
@@ -896,6 +912,11 @@ impl ConnectionInner {
                         btree: &mut self.btree,
                         schema: &mut self.schema,
                         runtime: &mut self.runtime,
+                        interrupt_flag: &self.active_interrupt_flag,
+                        functions: &self.functions,
+                        collations: &self.collations,
+                        progress: &mut self.progress,
+                        strict_subtype: self.strict_subtype,
                         explicit_tx: &mut self.explicit_tx,
                         implicit_savepoint_tx: &mut self.implicit_savepoint_tx,
                         in_user_btree_tx: &mut self.in_user_btree_tx,
@@ -1419,6 +1440,11 @@ impl Connection {
             activity: ActivityTracker::default(),
             savepoints: Vec::new(),
             runtime: VmRuntimeContext::default(),
+            active_interrupt_flag: Arc::clone(&interrupt_flag),
+            functions: FunctionRegistry::default(),
+            collations: CollationRegistry::default(),
+            progress: ProgressTracker::default(),
+            strict_subtype: true,
             explicit_tx: false,
             implicit_savepoint_tx: false,
             in_user_btree_tx: false,
@@ -1841,8 +1867,103 @@ impl Connection {
         let mut session = self.shared.enter()?;
         let inner = session.inner_mut();
         inner.ensure_usable()?;
-        let eff = flag.or_else(|| Some(Arc::clone(&self.shared.interrupt_flag)));
-        inner.btree.set_interrupt_flag(eff);
+        let eff = flag.unwrap_or_else(|| Arc::clone(&self.shared.interrupt_flag));
+        inner.active_interrupt_flag = Arc::clone(&eff);
+        inner.btree.set_interrupt_flag(Some(eff));
+        Ok(())
+    }
+
+    /// Registers or replaces a connection-local scalar SQL function (`sqlite3_create_function_v2`).
+    ///
+    /// Pass `num_args` in `0..=127` for a fixed-arity overload or `num_args == -1` for variadic arity.
+    pub fn register_scalar_function(
+        &self,
+        name: &str,
+        num_args: i32,
+        flags: FunctionFlags,
+        func: impl Fn(&[RuntimeValue]) -> Result<RuntimeValue> + Send + Sync + 'static,
+    ) -> Result<()> {
+        let arity = if num_args == -1 {
+            None
+        } else if (0..=127).contains(&num_args) {
+            Some(num_args as usize)
+        } else {
+            return Err(SqliteError::misuse("invalid function argument count"));
+        };
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        inner.functions.register_scalar(name, arity, flags, func);
+        inner.schema_generation += 1;
+        Ok(())
+    }
+
+    /// Unregisters a connection-local scalar SQL function overload (`sqlite3_create_function_v2`
+    /// with `xFunc == NULL`).
+    pub fn unregister_scalar_function(&self, name: &str, num_args: i32) -> Result<bool> {
+        let arity = if num_args == -1 {
+            None
+        } else if (0..=127).contains(&num_args) {
+            Some(num_args as usize)
+        } else {
+            return Err(SqliteError::misuse("invalid function argument count"));
+        };
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        let removed = inner.functions.unregister_scalar(name, arity);
+        if removed {
+            inner.schema_generation += 1;
+        }
+        Ok(removed)
+    }
+
+    /// Registers or replaces a connection-local collation sequence (`sqlite3_create_collation_v2`).
+    pub fn register_collation(
+        &self,
+        name: &str,
+        cmp: impl Fn(&str, &str) -> std::cmp::Ordering + Send + Sync + 'static,
+    ) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        inner.collations.register_collation(name, cmp);
+        inner.schema_generation += 1;
+        Ok(())
+    }
+
+    /// Installs or clears the periodic VM/engine progress callback (`sqlite3_progress_handler`).
+    ///
+    /// When `period_ops >= 1` and `handler` is `Some(cb)`, `cb` is invoked once every `period_ops`
+    /// VM/interpreter steps; returning `true` aborts the active statement with
+    /// [`ErrorCode::Interrupt`]. Passing `period_ops <= 0` or `None` disables the callback.
+    pub fn progress_handler(
+        &self,
+        period_ops: i32,
+        handler: Option<Box<dyn FnMut() -> bool + Send>>,
+    ) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        let interval = u32::try_from(period_ops).unwrap_or(0);
+        inner.progress.set_handler(interval, handler);
+        Ok(())
+    }
+
+    /// Returns the cumulative VM/interpreter progress-tick count on this connection.
+    pub fn progress_op_count(&self) -> Result<u64> {
+        let session = self.shared.enter()?;
+        let inner = session.inner();
+        inner.ensure_usable()?;
+        Ok(inner.progress.op_count())
+    }
+
+    /// Resets the cumulative VM/interpreter progress-tick counter to `0`.
+    pub fn reset_progress_op_count(&self) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        inner.progress.reset_op_count();
         Ok(())
     }
 
@@ -2213,6 +2334,8 @@ fn compile_first_sql(
     foreign_keys: bool,
     count_changes: bool,
     enable_test_functions: bool,
+    functions: &FunctionRegistry,
+    collations: &CollationRegistry,
 ) -> Result<CompiledArtifacts> {
     let (stmt_opt, _) = parse_one(raw_sql)?;
     compile_parsed_stmt(
@@ -2221,6 +2344,8 @@ fn compile_first_sql(
         foreign_keys,
         count_changes,
         enable_test_functions,
+        functions,
+        collations,
     )
 }
 
@@ -2230,6 +2355,8 @@ fn compile_parsed_stmt(
     foreign_keys: bool,
     count_changes: bool,
     enable_test_functions: bool,
+    functions: &FunctionRegistry,
+    collations: &CollationRegistry,
 ) -> Result<CompiledArtifacts> {
     let _tf_guard = TestFunctionsScope::enter(enable_test_functions);
     let Some(stmt) = stmt_opt else {
@@ -2250,10 +2377,17 @@ fn compile_parsed_stmt(
     let mut named_params = HashMap::new();
     collect_stmt_params(&stmt, &mut max_param, &mut named_params);
 
-    let column_names = validate_and_infer_columns(&stmt, schema, foreign_keys, count_changes)?;
+    let column_names = validate_and_infer_columns(
+        &stmt,
+        schema,
+        foreign_keys,
+        count_changes,
+        functions,
+        collations,
+    )?;
     let mut compiled_vdbe = None;
     if let Stmt::Select(ref sel) = stmt
-        && let Some(prog) = compiler::try_compile_select(sel, schema)?
+        && let Some(prog) = compiler::try_compile_select_with_functions(sel, schema, functions)?
     {
         compiled_vdbe = Some(prog);
     }
@@ -2329,6 +2463,8 @@ impl Statement {
             inner.foreign_keys,
             inner.count_changes,
             inner.runtime.enable_test_functions,
+            &inner.functions,
+            &inner.collations,
         ) {
             Ok(a) => a,
             Err(err)
@@ -2344,6 +2480,8 @@ impl Statement {
                         inner.foreign_keys,
                         inner.count_changes,
                         inner.runtime.enable_test_functions,
+                        &inner.functions,
+                        &inner.collations,
                     )?
                 } else {
                     return Err(err);
@@ -2634,6 +2772,8 @@ impl Statement {
                 inner.foreign_keys,
                 inner.count_changes,
                 inner.runtime.enable_test_functions,
+                &inner.functions,
+                &inner.collations,
             )?;
             apply_prepare_auto_vacuum_pragma(inner, &mut artifacts);
             let mut transferred = vec![Value::Null; artifacts.max_param];
@@ -2744,6 +2884,11 @@ impl Statement {
                         btree: &mut inner.btree,
                         schema: &mut inner.schema,
                         runtime: &mut inner.runtime,
+                        interrupt_flag: &inner.active_interrupt_flag,
+                        functions: &inner.functions,
+                        collations: &inner.collations,
+                        progress: &mut inner.progress,
+                        strict_subtype: inner.strict_subtype,
                         explicit_tx: &mut inner.explicit_tx,
                         implicit_savepoint_tx: &mut inner.implicit_savepoint_tx,
                         in_user_btree_tx: &mut inner.in_user_btree_tx,
@@ -2815,6 +2960,11 @@ impl Statement {
                         btree: &mut inner.btree,
                         schema: &mut inner.schema,
                         runtime: &mut inner.runtime,
+                        interrupt_flag: &inner.active_interrupt_flag,
+                        functions: &inner.functions,
+                        collations: &inner.collations,
+                        progress: &mut inner.progress,
+                        strict_subtype: inner.strict_subtype,
                         explicit_tx: &mut inner.explicit_tx,
                         implicit_savepoint_tx: &mut inner.implicit_savepoint_tx,
                         in_user_btree_tx: &mut inner.in_user_btree_tx,
@@ -2897,6 +3047,11 @@ impl Statement {
                         btree: &mut inner.btree,
                         schema: &mut inner.schema,
                         runtime: &mut inner.runtime,
+                        interrupt_flag: &inner.active_interrupt_flag,
+                        functions: &inner.functions,
+                        collations: &inner.collations,
+                        progress: &mut inner.progress,
+                        strict_subtype: inner.strict_subtype,
                         explicit_tx: &mut inner.explicit_tx,
                         implicit_savepoint_tx: &mut inner.implicit_savepoint_tx,
                         in_user_btree_tx: &mut inner.in_user_btree_tx,
@@ -3102,6 +3257,11 @@ impl Statement {
                         btree: &mut inner.btree,
                         schema: &mut inner.schema,
                         runtime: &mut inner.runtime,
+                        interrupt_flag: &inner.active_interrupt_flag,
+                        functions: &inner.functions,
+                        collations: &inner.collations,
+                        progress: &mut inner.progress,
+                        strict_subtype: inner.strict_subtype,
                         explicit_tx: &mut inner.explicit_tx,
                         implicit_savepoint_tx: &mut inner.implicit_savepoint_tx,
                         in_user_btree_tx: &mut inner.in_user_btree_tx,
@@ -3436,6 +3596,11 @@ impl Statement {
                         btree: &mut inner.btree,
                         schema: &mut inner.schema,
                         runtime: &mut inner.runtime,
+                        interrupt_flag: &inner.active_interrupt_flag,
+                        functions: &inner.functions,
+                        collations: &inner.collations,
+                        progress: &mut inner.progress,
+                        strict_subtype: inner.strict_subtype,
                         explicit_tx: &mut inner.explicit_tx,
                         implicit_savepoint_tx: &mut inner.implicit_savepoint_tx,
                         in_user_btree_tx: &mut inner.in_user_btree_tx,
@@ -3522,50 +3687,66 @@ impl Statement {
         };
 
         match running {
-            RunningExec::Vdbe { vm } => match vm.step(&mut inner.btree) {
-                Ok(VmStep::Row(vals)) => {
-                    inner.runtime = vm.runtime_ctx;
-                    inner.runtime.stmt_timestamp_ms = None;
-                    inner.publish(shared);
-                    Ok(StepResult::Row(Row::new(vals)))
-                }
-                Ok(VmStep::Done) => {
-                    vm.close_cursors(&mut inner.btree);
-                    inner.runtime = vm.runtime_ctx;
-                    inner.runtime.stmt_timestamp_ms = None;
-                    inner.publish(shared);
-                    let fin_res = inner.finish_activity(
-                        hid,
-                        ActivityFinish::ReadDone {
-                            lease_cursors: Vec::new(),
-                        },
-                        shared,
-                    );
-                    if let Err(e) = fin_res {
+            RunningExec::Vdbe { vm } => {
+                let step_res = {
+                    let encoding = inner.btree.encoding();
+                    let rt_snapshot = vm.runtime_ctx;
+                    let mut services = ExecutionContext {
+                        interrupt_flag: &inner.active_interrupt_flag,
+                        runtime: &rt_snapshot,
+                        encoding,
+                        functions: &inner.functions,
+                        collations: &inner.collations,
+                        progress: &mut inner.progress,
+                        strict_subtype: inner.strict_subtype,
+                    };
+                    vm.step(&mut inner.btree, &mut services)
+                };
+                match step_res {
+                    Ok(VmStep::Row(vals)) => {
+                        inner.runtime = vm.runtime_ctx;
+                        inner.runtime.stmt_timestamp_ms = None;
+                        inner.publish(shared);
+                        Ok(StepResult::Row(Row::new(vals)))
+                    }
+                    Ok(VmStep::Done) => {
+                        vm.close_cursors(&mut inner.btree);
+                        inner.runtime = vm.runtime_ctx;
+                        inner.runtime.stmt_timestamp_ms = None;
+                        inner.publish(shared);
+                        let fin_res = inner.finish_activity(
+                            hid,
+                            ActivityFinish::ReadDone {
+                                lease_cursors: Vec::new(),
+                            },
+                            shared,
+                        );
+                        if let Err(e) = fin_res {
+                            self.lifecycle = StatementLifecycle::Halted {
+                                last_error: Some(e.clone()),
+                            };
+                            return Err(e);
+                        }
+                        self.lifecycle = StatementLifecycle::Halted { last_error: None };
+                        Ok(StepResult::Done)
+                    }
+                    Err(e) => {
+                        vm.close_cursors(&mut inner.btree);
+                        inner.runtime.stmt_timestamp_ms = None;
+                        let _ = inner.finish_activity(
+                            hid,
+                            ActivityFinish::ReadAborted {
+                                lease_cursors: Vec::new(),
+                            },
+                            shared,
+                        );
                         self.lifecycle = StatementLifecycle::Halted {
                             last_error: Some(e.clone()),
                         };
-                        return Err(e);
+                        Err(e)
                     }
-                    self.lifecycle = StatementLifecycle::Halted { last_error: None };
-                    Ok(StepResult::Done)
                 }
-                Err(e) => {
-                    vm.close_cursors(&mut inner.btree);
-                    inner.runtime.stmt_timestamp_ms = None;
-                    let _ = inner.finish_activity(
-                        hid,
-                        ActivityFinish::ReadAborted {
-                            lease_cursors: Vec::new(),
-                        },
-                        shared,
-                    );
-                    self.lifecycle = StatementLifecycle::Halted {
-                        last_error: Some(e.clone()),
-                    };
-                    Err(e)
-                }
-            },
+            }
 
             RunningExec::MaterializedRead {
                 rows,
@@ -3778,6 +3959,11 @@ impl Statement {
                         btree: &mut inner.btree,
                         schema: &mut inner.schema,
                         runtime: &mut inner.runtime,
+                        interrupt_flag: &inner.active_interrupt_flag,
+                        functions: &inner.functions,
+                        collations: &inner.collations,
+                        progress: &mut inner.progress,
+                        strict_subtype: inner.strict_subtype,
                         explicit_tx: &mut inner.explicit_tx,
                         implicit_savepoint_tx: &mut inner.implicit_savepoint_tx,
                         in_user_btree_tx: &mut inner.in_user_btree_tx,
@@ -3864,6 +4050,20 @@ fn collect_stmt_params(stmt: &Stmt, max_idx: &mut usize, named: &mut HashMap<Str
         Stmt::Vacuum {
             into: Some(expr), ..
         } => collect_expr_params(expr, max_idx, named),
+        Stmt::AttachDatabase {
+            expr,
+            schema_name,
+            key,
+        } => {
+            collect_expr_params(expr, max_idx, named);
+            collect_expr_params(schema_name, max_idx, named);
+            if let Some(k) = key {
+                collect_expr_params(k, max_idx, named);
+            }
+        }
+        Stmt::DetachDatabase { schema_name } => {
+            collect_expr_params(schema_name, max_idx, named);
+        }
         Stmt::Select(sel) => collect_select_params(sel, max_idx, named),
         Stmt::CreateTableAs { query, .. } => collect_select_params(query, max_idx, named),
         Stmt::Insert(ins) => {
@@ -4028,6 +4228,9 @@ fn collect_expr_params(expr: &Expr, max_idx: &mut usize, named: &mut HashMap<Str
         } => {
             collect_expr_params(v, max_idx, named);
             collect_select_params(subquery, max_idx, named);
+        }
+        Expr::InTable { expr: v, .. } => {
+            collect_expr_params(v, max_idx, named);
         }
         Expr::Like {
             expr: v,

@@ -7,6 +7,7 @@ pub mod bitvec;
 pub mod error;
 pub mod limits;
 pub mod record;
+pub mod runtime_api;
 pub mod value;
 pub mod varint;
 
@@ -18,6 +19,11 @@ pub use record::{
     decode_record_column, decode_record_column_with_encoding, decode_record_with_encoding,
     decode_serial_value, decode_serial_value_with_encoding, encode_record,
     encode_record_with_encoding, serial_type_for, serial_type_for_with_encoding, serial_type_len,
+};
+pub use runtime_api::{
+    AggregateStepId, DatabaseId, ExecutionServices, FunctionFlags, MAX_DB_SLOTS, RowMutationEvent,
+    RowMutationOp, RuntimeValue, SQLITE_MAX_ATTACHED, enforce_result_subtype_contract,
+    strip_unsubscribed_subtypes,
 };
 pub use value::{
     Collation, StorageClass, TextEncoding, TypeAffinity, Value, cmp_int_float, format_sqlite_real,

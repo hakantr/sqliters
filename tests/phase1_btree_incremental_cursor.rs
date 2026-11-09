@@ -26,7 +26,9 @@ use sqliters::types::{
     Collation, ErrorCode, KeySortOrder, LockGeometry, Pgno, Result, Value, decode_record,
     encode_record, extended,
 };
-use sqliters::vdbe::{Instruction, Opcode, P4, VdbeProgram, VdbeVm, VmRuntimeContext, VmStep};
+use sqliters::vdbe::{
+    DefaultVmServices, Instruction, Opcode, P4, VdbeProgram, VdbeVm, VmRuntimeContext, VmStep,
+};
 use sqliters::vfs::{LockLevel, MemoryVfs, OpenFlags, SyncFlags, Vfs, VfsFile};
 use sqliters::{Connection, StepResult};
 
@@ -1358,7 +1360,7 @@ fn test_rollback_trip_cursors_full_and_write_only_abort_rollback() {
 
         let mut vm = VdbeVm::new(prog, Vec::new(), VmRuntimeContext::default());
         assert_eq!(
-            vm.step(&mut bt).unwrap(),
+            vm.step(&mut bt, &mut DefaultVmServices::default()).unwrap(),
             VmStep::Row(vec![Value::Integer(1)])
         );
 
@@ -1388,7 +1390,9 @@ fn test_rollback_trip_cursors_full_and_write_only_abort_rollback() {
         assert_abort_rollback(bt.cursor_seek_rowid(ro_cur, 1), "cursor_seek_rowid");
 
         // Stepping the paused VM must ALSO fail with `SQLITE_ABORT_ROLLBACK` (516) and clean up its cursor!
-        let vm_err = vm.step(&mut bt).unwrap_err();
+        let vm_err = vm
+            .step(&mut bt, &mut DefaultVmServices::default())
+            .unwrap_err();
         assert_eq!(vm_err.code, ErrorCode::Abort);
         assert_eq!(vm_err.extended_code, extended::SQLITE_ABORT_ROLLBACK);
 
@@ -1623,7 +1627,7 @@ fn test_zero_cursor_leak_across_done_reset_halt_error_and_statement_drop() {
 
     // Case 1: Paused at `Row` -> exactly 2 cursors open (slot 0 reopen did NOT leak); early `reset_with_btree` -> 0 cursors!
     assert_eq!(
-        vm.step(&mut bt).unwrap(),
+        vm.step(&mut bt, &mut DefaultVmServices::default()).unwrap(),
         VmStep::Row(vec![Value::Integer(1)])
     );
     assert_eq!(bt.open_cursor_count(), 2);
@@ -1632,7 +1636,7 @@ fn test_zero_cursor_leak_across_done_reset_halt_error_and_statement_drop() {
 
     // Case 2: Run all the way to `VmStep::Done` -> `Halt` closes all cursors (`open_cursor_count() == 0`)!
     let mut count = 0usize;
-    while let VmStep::Row(_) = vm.step(&mut bt).unwrap() {
+    while let VmStep::Row(_) = vm.step(&mut bt, &mut DefaultVmServices::default()).unwrap() {
         count += 1;
     }
     assert_eq!(count, 10);
@@ -1654,7 +1658,9 @@ fn test_zero_cursor_leak_across_done_reset_halt_error_and_statement_drop() {
 
     bt.begin_read().unwrap();
     let mut err_vm = VdbeVm::new(err_prog, Vec::new(), VmRuntimeContext::default());
-    let halt_err = err_vm.step(&mut bt).unwrap_err();
+    let halt_err = err_vm
+        .step(&mut bt, &mut DefaultVmServices::default())
+        .unwrap_err();
     assert_eq!(halt_err.code, ErrorCode::Constraint);
     assert_eq!(halt_err.extended_code, extended::SQLITE_CONSTRAINT_CHECK);
     assert_eq!(bt.open_cursor_count(), 0);
@@ -1681,7 +1687,9 @@ fn test_zero_cursor_leak_across_done_reset_halt_error_and_statement_drop() {
 
     bt.begin_write().unwrap();
     let mut uniq_vm = VdbeVm::new(uniq_prog, Vec::new(), VmRuntimeContext::default());
-    let uerr = uniq_vm.step(&mut bt).unwrap_err();
+    let uerr = uniq_vm
+        .step(&mut bt, &mut DefaultVmServices::default())
+        .unwrap_err();
     assert_eq!(uerr.code, ErrorCode::Constraint);
     assert_eq!(uerr.extended_code, extended::SQLITE_CONSTRAINT_UNIQUE);
     assert_eq!(bt.open_cursor_count(), 0);
@@ -1762,7 +1770,10 @@ fn test_vdbe_delete_under_scan_cursor_and_activity_query_helpers() {
     del_prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
 
     let mut vm = VdbeVm::new(del_prog, Vec::new(), VmRuntimeContext::default());
-    assert_eq!(vm.step(&mut bt).unwrap(), VmStep::Done);
+    assert_eq!(
+        vm.step(&mut bt, &mut DefaultVmServices::default()).unwrap(),
+        VmStep::Done
+    );
     assert_eq!(vm.runtime_ctx.last_changes, 50);
     assert_eq!(bt.scan_table(r1).unwrap().len(), 0);
     assert_eq!(
@@ -2024,7 +2035,11 @@ fn test_index_empty_orders_insert_and_mid_scan_mutation_reseek() {
     wprog.emit(Instruction::new(Opcode::Close, 0, 0, 0));
     wprog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
     let mut wvm = VdbeVm::new(wprog, Vec::new(), VmRuntimeContext::default());
-    assert_eq!(wvm.step(&mut bt).unwrap(), VmStep::Done);
+    assert_eq!(
+        wvm.step(&mut bt, &mut DefaultVmServices::default())
+            .unwrap(),
+        VmStep::Done
+    );
     assert_eq!(bt.scan_index(v_idx).unwrap().len(), 5);
     assert_eq!(
         bt.integrity_check(&[1, idx_root, v_idx]).unwrap(),

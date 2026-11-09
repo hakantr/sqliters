@@ -359,3 +359,23 @@ pub fn compare_records_with_encoding(
     }
     Ok(Ordering::Equal)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::RuntimeValue;
+
+    #[test]
+    fn record_codec_never_persists_runtime_subtype() {
+        let tagged = RuntimeValue::with_subtype(Value::Text("{\"k\":1}".to_owned()), 74);
+        assert_eq!(tagged.subtype, 74);
+        let encoded = encode_record(std::slice::from_ref(&tagged.value));
+        let plain_encoded = encode_record(&[Value::Text("{\"k\":1}".to_owned())]);
+        assert_eq!(encoded, plain_encoded);
+
+        let decoded = decode_record(&encoded).unwrap();
+        assert_eq!(decoded.len(), 1);
+        let rt = RuntimeValue::from(decoded.into_iter().next().unwrap());
+        assert_eq!(rt.subtype, 0);
+    }
+}

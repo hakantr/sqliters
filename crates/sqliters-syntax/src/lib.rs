@@ -40,8 +40,68 @@ mod tests {
         let Stmt::CreateTable(ct) = &stmts[0] else {
             panic!("expected CreateTable");
         };
-        assert_eq!(ct.name, "sqlite_schema");
+        assert_eq!(ct.name, QualifiedName::unqualified("sqlite_schema"));
+        assert_eq!(
+            ct.catalog_sql,
+            "CREATE TABLE sqlite_schema(type text,name text,tbl_name text,rootpage int,sql text)"
+        );
         assert_eq!(ct.columns.len(), 5);
+    }
+
+    #[test]
+    fn test_parse_structural_qualified_names_and_catalog_sql() {
+        let Stmt::CreateTable(ct) = parse_one(
+            "CREATE TABLE IF NOT EXISTS main.\"a.b\"(id INT PRIMARY KEY, \"c.d\" TEXT) STRICT /* comment */;",
+        )
+        .unwrap()
+        .0
+        .unwrap()
+        else {
+            panic!("expected CreateTable");
+        };
+        assert_eq!(ct.name, QualifiedName::qualified("main", "a.b"));
+        assert_eq!(
+            ct.catalog_sql,
+            "CREATE TABLE \"a.b\"(id INT PRIMARY KEY, \"c.d\" TEXT) STRICT"
+        );
+
+        let Stmt::CreateIndex(ci) = parse_one(
+            "CREATE UNIQUE INDEX IF NOT EXISTS main.idx_q ON \"a.b\"(\"c.d\") WHERE \"c.d\" IS NOT NULL;",
+        )
+        .unwrap()
+        .0
+        .unwrap()
+        else {
+            panic!("expected CreateIndex");
+        };
+        assert_eq!(ci.name, QualifiedName::qualified("main", "idx_q"));
+        assert_eq!(ci.table_name, "a.b");
+        assert_eq!(
+            ci.catalog_sql,
+            "CREATE UNIQUE INDEX idx_q ON \"a.b\"(\"c.d\") WHERE \"c.d\" IS NOT NULL"
+        );
+
+        let Stmt::AttachDatabase {
+            expr,
+            schema_name,
+            key,
+        } = parse_one("ATTACH DATABASE 'aux.db' AS aux KEY 'secret';")
+            .unwrap()
+            .0
+            .unwrap()
+        else {
+            panic!("expected AttachDatabase");
+        };
+        assert_eq!(expr, Expr::String("aux.db".to_owned()));
+        assert_eq!(schema_name, Expr::Column(ColumnRef::unqualified("aux")));
+        assert_eq!(key, Some(Expr::String("secret".to_owned())));
+
+        let Stmt::DetachDatabase { schema_name } =
+            parse_one("DETACH DATABASE aux;").unwrap().0.unwrap()
+        else {
+            panic!("expected DetachDatabase");
+        };
+        assert_eq!(schema_name, Expr::Column(ColumnRef::unqualified("aux")));
     }
 
     #[test]

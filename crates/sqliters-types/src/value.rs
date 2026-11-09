@@ -350,6 +350,18 @@ impl Value {
         matches!(self, Self::Null)
     }
 
+    /// Wraps this value in a plain [`crate::RuntimeValue`] (`subtype == 0`).
+    #[inline]
+    pub const fn into_runtime(self) -> crate::RuntimeValue {
+        crate::RuntimeValue::plain(self)
+    }
+
+    /// Wraps this value in a [`crate::RuntimeValue`] with low-8-bit `subtype`.
+    #[inline]
+    pub const fn with_subtype(self, subtype: u32) -> crate::RuntimeValue {
+        crate::RuntimeValue::with_subtype(self, subtype)
+    }
+
     pub const fn as_i64(&self) -> Option<i64> {
         match self {
             Self::Integer(v) => Some(*v),

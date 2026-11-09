@@ -7,8 +7,8 @@ use sqliters_syntax::{
     IndexedColumn, Stmt, TableConstraint, parse_one,
 };
 use sqliters_types::{
-    Collation, ErrorCode, KeySortOrder, Pgno, Result, SqliteError, TypeAffinity, Value,
-    decode_record_with_encoding, encode_record_with_encoding,
+    Collation, ErrorCode, ExecutionServices, KeySortOrder, Pgno, Result, SqliteError, TypeAffinity,
+    Value, decode_record_with_encoding, encode_record_with_encoding,
 };
 use sqliters_vdbe::P4;
 
@@ -370,7 +370,18 @@ impl Schema {
             || name.eq_ignore_ascii_case("sqlite_temp_master")
     }
 
+    pub fn is_temp_schema_table_name(name: &str) -> bool {
+        name.eq_ignore_ascii_case("sqlite_temp_schema")
+            || name.eq_ignore_ascii_case("sqlite_temp_master")
+    }
+
     pub fn find_table(&self, name: &str) -> Option<TableSchema> {
+        if Self::is_temp_schema_table_name(name) {
+            let mut tbl = TableSchema::sqlite_schema_table();
+            tbl.name = "sqlite_temp_schema".to_owned();
+            tbl.root_pgno = 0;
+            return Some(tbl);
+        }
         if Self::is_schema_table_name(name) {
             return Some(TableSchema::sqlite_schema_table());
         }
@@ -574,6 +585,7 @@ pub fn build_table_schema_from_ast(
     ct: &CreateTableStmt,
     root_pgno: Pgno,
 ) -> Result<(TableSchema, Vec<PendingAutoIndex>)> {
+    let tbl_name = ct.name.name.as_str();
     let mut columns = Vec::with_capacity(ct.columns.len());
     let mut checks = Vec::new();
     let mut foreign_keys = Vec::new();
@@ -595,7 +607,7 @@ pub fn build_table_schema_from_ast(
             ));
         }
 
-        let affinity = resolve_column_affinity(&ct.name, &cdef.name, &cdef.type_name, ct.strict)?;
+        let affinity = resolve_column_affinity(tbl_name, &cdef.name, &cdef.type_name, ct.strict)?;
         let mut collation = Collation::Binary;
         let mut not_null = None;
         let mut default_expr = None;
@@ -616,7 +628,7 @@ pub fn build_table_schema_from_ast(
                     if has_pk {
                         return Err(SqliteError::new(
                             ErrorCode::Error,
-                            format!("table \"{}\" has more than one primary key", ct.name),
+                            format!("table \"{tbl_name}\" has more than one primary key"),
                         ));
                     }
                     has_pk = true;
@@ -721,7 +733,7 @@ pub fn build_table_schema_from_ast(
                     return Err(SqliteError::new(ErrorCode::Error, msg));
                 }
                 push_inline_autoindex(
-                    &ct.name,
+                    tbl_name,
                     &mut inline_autos,
                     pk_conflict,
                     "pk",
@@ -741,7 +753,7 @@ pub fn build_table_schema_from_ast(
 
         for u_conflict in unique_constraints {
             push_inline_autoindex(
-                &ct.name,
+                tbl_name,
                 &mut inline_autos,
                 u_conflict,
                 "u",
@@ -769,7 +781,7 @@ pub fn build_table_schema_from_ast(
                 if has_pk {
                     return Err(SqliteError::new(
                         ErrorCode::Error,
-                        format!("table \"{}\" has more than one primary key", ct.name),
+                        format!("table \"{tbl_name}\" has more than one primary key"),
                     ));
                 }
                 has_pk = true;
@@ -794,7 +806,7 @@ pub fn build_table_schema_from_ast(
                     rowid_alias_col = Some(pk_ci);
                     rowid_pk_conflict = *conflict;
                 } else {
-                    push_inline_autoindex(&ct.name, &mut inline_autos, *conflict, "pk", resolved)?;
+                    push_inline_autoindex(tbl_name, &mut inline_autos, *conflict, "pk", resolved)?;
                 }
             }
             TableConstraint::Unique {
@@ -802,7 +814,7 @@ pub fn build_table_schema_from_ast(
                 conflict,
             } => {
                 let resolved = resolve_indexed_columns(&columns, u_cols, false)?;
-                push_inline_autoindex(&ct.name, &mut inline_autos, *conflict, "u", resolved)?;
+                push_inline_autoindex(tbl_name, &mut inline_autos, *conflict, "u", resolved)?;
             }
             TableConstraint::Check {
                 name: cname,
@@ -880,7 +892,7 @@ pub fn build_table_schema_from_ast(
         if !has_pk {
             return Err(SqliteError::new(
                 ErrorCode::Error,
-                format!("PRIMARY KEY missing on table {}", ct.name),
+                format!("PRIMARY KEY missing on table {tbl_name}"),
             ));
         }
         // `convertToWithoutRowidTable` in `sqlite/src/build.c`:
@@ -888,7 +900,7 @@ pub fn build_table_schema_from_ast(
         let Some(pk_pos) = inline_autos.iter().position(|a| a.origin == "pk") else {
             return Err(SqliteError::new(
                 ErrorCode::Error,
-                format!("PRIMARY KEY missing on table {}", ct.name),
+                format!("PRIMARY KEY missing on table {tbl_name}"),
             ));
         };
         let pk_auto = inline_autos.remove(pk_pos);
@@ -948,7 +960,7 @@ pub fn build_table_schema_from_ast(
 
     let tbl = TableSchema {
         schema_rowid: 0,
-        name: ct.name.clone(),
+        name: ct.name.name.clone(),
         root_pgno,
         columns,
         rowid_alias_col,
@@ -962,7 +974,7 @@ pub fn build_table_schema_from_ast(
         strict: ct.strict,
         checks,
         foreign_keys,
-        raw_sql: ct.raw_sql.clone(),
+        raw_sql: ct.catalog_sql.clone(),
     };
 
     Ok((tbl, inline_autos))
@@ -1033,7 +1045,7 @@ pub fn build_index_schema_from_ast(
     }
     Ok(IndexSchema {
         schema_rowid: 0,
-        name: ci.name.clone(),
+        name: ci.name.name.clone(),
         table_name: tbl.name.clone(),
         root_pgno,
         unique: ci.unique,
@@ -1042,7 +1054,7 @@ pub fn build_index_schema_from_ast(
         where_clause: ci.where_clause.clone(),
         is_autoindex: false,
         origin: "c",
-        raw_sql: Some(ci.raw_sql.clone()),
+        raw_sql: Some(ci.catalog_sql.clone()),
         table_without_rowid: tbl.without_rowid,
         trailing_pk_cols,
     })
@@ -1290,6 +1302,9 @@ pub(crate) fn scan_table_incremental(
     btree: &mut Btree,
     root_pgno: Pgno,
 ) -> Result<Vec<(i64, Vec<u8>)>> {
+    if root_pgno == 0 {
+        return Ok(Vec::new());
+    }
     let cid = btree.open_table_cursor(root_pgno, false);
     let res = (|| {
         let mut out = Vec::new();
@@ -1310,6 +1325,40 @@ pub(crate) fn scan_table_incremental(
     res
 }
 
+/// Scans all `(rowid, payload)` entries of a Table B+Tree while driving `services` interrupt and
+/// progress ticks on every row.
+pub(crate) fn scan_table_incremental_with_services(
+    btree: &mut Btree,
+    root_pgno: Pgno,
+    services: &mut dyn ExecutionServices,
+) -> Result<Vec<(i64, Vec<u8>)>> {
+    services.check_interrupted()?;
+    services.tick_progress()?;
+    if root_pgno == 0 {
+        return Ok(Vec::new());
+    }
+    let cid = btree.open_table_cursor(root_pgno, false);
+    let res = (|| {
+        let mut out = Vec::new();
+        if !btree.cursor_first(cid)? {
+            return Ok(out);
+        }
+        loop {
+            services.check_interrupted()?;
+            services.tick_progress()?;
+            let rowid = btree.cursor_rowid(cid)?;
+            let payload = btree.cursor_payload(cid)?;
+            out.push((rowid, payload));
+            if !btree.cursor_next(cid)? {
+                break;
+            }
+        }
+        Ok(out)
+    })();
+    btree.close_cursor(cid);
+    res
+}
+
 /// Scans all key payloads of an Index B-Tree using an incremental `BtreeCursor`,
 /// checking the connection interrupt flag on every entry and closing the cursor before returning.
 pub(crate) fn scan_index_incremental(
@@ -1317,6 +1366,9 @@ pub(crate) fn scan_index_incremental(
     root_pgno: Pgno,
     orders: Vec<KeySortOrder>,
 ) -> Result<Vec<Vec<u8>>> {
+    if root_pgno == 0 {
+        return Ok(Vec::new());
+    }
     let cid = btree.open_index_cursor(root_pgno, orders, false);
     let res = (|| {
         let mut out = Vec::new();
@@ -1324,6 +1376,40 @@ pub(crate) fn scan_index_incremental(
             return Ok(out);
         }
         loop {
+            let payload = btree.cursor_payload(cid)?;
+            out.push(payload);
+            if !btree.cursor_next(cid)? {
+                break;
+            }
+        }
+        Ok(out)
+    })();
+    btree.close_cursor(cid);
+    res
+}
+
+/// Scans all key payloads of an Index B-Tree while driving `services` interrupt and progress
+/// ticks on every entry.
+pub(crate) fn scan_index_incremental_with_services(
+    btree: &mut Btree,
+    root_pgno: Pgno,
+    orders: Vec<KeySortOrder>,
+    services: &mut dyn ExecutionServices,
+) -> Result<Vec<Vec<u8>>> {
+    services.check_interrupted()?;
+    services.tick_progress()?;
+    if root_pgno == 0 {
+        return Ok(Vec::new());
+    }
+    let cid = btree.open_index_cursor(root_pgno, orders, false);
+    let res = (|| {
+        let mut out = Vec::new();
+        if !btree.cursor_first(cid)? {
+            return Ok(out);
+        }
+        loop {
+            services.check_interrupted()?;
+            services.tick_progress()?;
             let payload = btree.cursor_payload(cid)?;
             out.push(payload);
             if !btree.cursor_next(cid)? {

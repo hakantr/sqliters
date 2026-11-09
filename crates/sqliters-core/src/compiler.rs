@@ -2,18 +2,18 @@
 //! `EXPLAIN` / `EXPLAIN QUERY PLAN` planner.
 
 use sqliters_syntax::{
-    BinaryOp, BindParam, CurrentTimeKind, DeleteStmt, Expr, FromClause, FunctionArgs, IndexHint,
-    InsertSource, InsertStmt, LikeOp, LimitClause, OrderByTerm, ResultColumn, SelectCore,
-    SelectStmt, Stmt, TableOrSubquery, UnaryOp, UpdateStmt,
+    BinaryOp, BindParam, ColumnRef, CurrentTimeKind, DeleteStmt, Expr, FromClause, FunctionArgs,
+    IndexHint, InsertSource, InsertStmt, LikeOp, LimitClause, OrderByTerm, QualifiedName,
+    ResultColumn, SelectCore, SelectStmt, Stmt, TableOrSubquery, UnaryOp, UpdateStmt,
 };
 use sqliters_types::{
     Collation, ErrorCode, KeySortOrder, Result, SqliteError, TypeAffinity, Value,
 };
 use sqliters_vdbe::{
     AggregateKind, Instruction, Opcode, P4, VdbeProgram, affinity_to_p5, sqlite_compare_affinity,
-    validate_function_call,
 };
 
+use crate::execution_context::FunctionRegistry;
 use crate::schema::{IndexSchema, Schema, TableSchema};
 
 /// Chosen B-Tree access strategy for a single table (`where.c`).
@@ -183,11 +183,13 @@ fn extract_table_col_eq(
     };
 
     if let Some(cname) = match_single_table_col(left, tbl, alias)
+        && !matches!(right.as_ref(), Expr::Collate { .. })
         && expr_is_table_independent(right)
     {
         return Some((cname, (**right).clone()));
     }
     if let Some(cname) = match_single_table_col(right, tbl, alias)
+        && !matches!(left.as_ref(), Expr::Collate { .. })
         && expr_is_table_independent(left)
     {
         return Some((cname, (**left).clone()));
@@ -195,18 +197,30 @@ fn extract_table_col_eq(
     None
 }
 
-fn match_single_table_col(expr: &Expr, tbl: &TableSchema, alias: Option<&str>) -> Option<String> {
-    let Expr::Column { table, column } = expr else {
-        return None;
-    };
-    if let Some(qual) = table {
+fn cref_matches_single_table(cref: &ColumnRef, tbl: &TableSchema, alias: Option<&str>) -> bool {
+    if let Some(s) = &cref.schema
+        && !s.eq_ignore_ascii_case("main")
+    {
+        return false;
+    }
+    if let Some(qual) = &cref.table {
         let expect = alias.unwrap_or(&tbl.name);
         if !qual.eq_ignore_ascii_case(expect) {
-            return None;
+            return false;
         }
     }
-    if tbl.find_column(column).is_some() || tbl.is_implicit_rowid_name(column) {
-        Some(column.clone())
+    true
+}
+
+fn match_single_table_col(expr: &Expr, tbl: &TableSchema, alias: Option<&str>) -> Option<String> {
+    let Expr::Column(cref) = expr else {
+        return None;
+    };
+    if !cref_matches_single_table(cref, tbl, alias) {
+        return None;
+    }
+    if tbl.find_column(&cref.column).is_some() || tbl.is_implicit_rowid_name(&cref.column) {
+        Some(cref.column.clone())
     } else {
         None
     }
@@ -222,9 +236,11 @@ pub fn expr_is_table_independent(expr: &Expr) -> bool {
         | Expr::Blob(_)
         | Expr::CurrentTimeKw(_)
         | Expr::Bind(_) => true,
-        Expr::Column { .. } | Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
-            false
-        }
+        Expr::Column(_)
+        | Expr::Subquery(_)
+        | Expr::Exists { .. }
+        | Expr::InSubquery { .. }
+        | Expr::InTable { .. } => false,
         Expr::Unary { expr, .. }
         | Expr::Collate { expr, .. }
         | Expr::IsNull { expr, .. }
@@ -320,6 +336,7 @@ pub fn expr_contains_aggregate(expr: &Expr) -> bool {
         Expr::InList { expr, list, .. } => {
             expr_contains_aggregate(expr) || list.iter().any(expr_contains_aggregate)
         }
+        Expr::InTable { expr, .. } => expr_contains_aggregate(expr),
         Expr::Like {
             expr,
             pattern,
@@ -348,7 +365,10 @@ pub fn expr_contains_aggregate(expr: &Expr) -> bool {
 
 pub fn expr_contains_subquery(expr: &Expr) -> bool {
     match expr {
-        Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => true,
+        Expr::Subquery(_)
+        | Expr::Exists { .. }
+        | Expr::InSubquery { .. }
+        | Expr::InTable { .. } => true,
         Expr::RowValue(_) => true, // Force relational engine evaluation for row-value tuples
         Expr::Unary { expr, .. }
         | Expr::Collate { expr, .. }
@@ -401,17 +421,7 @@ pub fn expr_contains_subquery(expr: &Expr) -> bool {
 
 pub fn expr_column_label(expr: &Expr) -> String {
     match expr {
-        Expr::Column {
-            table: None,
-            column,
-        } => column.clone(),
-        Expr::Column {
-            table: Some(t),
-            column,
-        } => {
-            let _ = t;
-            column.clone()
-        }
+        Expr::Column(cref) => cref.column.clone(),
         Expr::Null => "NULL".to_owned(),
         Expr::Bool(b) => if *b { "true" } else { "false" }.to_owned(),
         Expr::Integer(i) => i.to_string(),
@@ -486,10 +496,58 @@ struct TableBinding<'a> {
     cursor: i32,
 }
 
+fn resolve_main_table_for_compiler(
+    name: &QualifiedName,
+    schema: &Schema,
+) -> Result<Option<TableSchema>> {
+    if let Some(s) = &name.schema {
+        if s.eq_ignore_ascii_case("temp") {
+            if Schema::is_schema_table_name(&name.name) {
+                return Ok(None);
+            }
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such table: {}", name.display_name()),
+            ));
+        }
+        if !s.eq_ignore_ascii_case("main") {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such table: {}", name.display_name()),
+            ));
+        }
+        if Schema::is_temp_schema_table_name(&name.name) {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such table: {}", name.display_name()),
+            ));
+        }
+    } else if Schema::is_temp_schema_table_name(&name.name) {
+        return Ok(None);
+    }
+
+    let Some(tbl) = schema.find_table(&name.name) else {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("no such table: {}", name.display_name()),
+        ));
+    };
+    Ok(Some(tbl))
+}
+
 /// Attempts to compile `stmt` into a pure [`VdbeProgram`] for direct step-by-step execution
 /// on [`sqliters_vdbe::VdbeVm`]. Returns `Ok(None)` if the query uses multi-table joins, CTEs,
 /// compound set operations, aggregates/`GROUP BY`, `DISTINCT`, or subqueries (handled by `engine`).
 pub fn try_compile_select(stmt: &SelectStmt, schema: &Schema) -> Result<Option<VdbeProgram>> {
+    try_compile_select_with_functions(stmt, schema, &FunctionRegistry::default())
+}
+
+/// Attempts to compile `stmt` into a [`VdbeProgram`] using connection-registered `functions`.
+pub fn try_compile_select_with_functions(
+    stmt: &SelectStmt,
+    schema: &Schema,
+    functions: &FunctionRegistry,
+) -> Result<Option<VdbeProgram>> {
     if !stmt.ctes.is_empty() || !stmt.body.compounds.is_empty() {
         return Ok(None);
     }
@@ -539,8 +597,12 @@ pub fn try_compile_select(stmt: &SelectStmt, schema: &Schema) -> Result<Option<V
             if !stmt.order_by.is_empty() {
                 // Trivial 1-row tableless query; ORDER BY is a no-op if valid
             }
-            let prog =
-                compile_tableless_select(projection, selection.as_ref(), stmt.limit.as_ref())?;
+            let prog = compile_tableless_select(
+                projection,
+                selection.as_ref(),
+                stmt.limit.as_ref(),
+                functions,
+            )?;
             Ok(Some(prog))
         }
         Some(FromClause { head, joins }) if joins.is_empty() => {
@@ -555,11 +617,8 @@ pub fn try_compile_select(stmt: &SelectStmt, schema: &Schema) -> Result<Option<V
             if matches!(indexed_by, Some(IndexHint::IndexedBy(_))) {
                 return Ok(None);
             }
-            let Some(tbl) = schema.find_table(name) else {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    format!("no such table: {name}"),
-                ));
+            let Some(tbl) = resolve_main_table_for_compiler(name, schema)? else {
+                return Ok(None);
             };
             if tbl.columns.iter().any(|c| c.generated.is_some()) {
                 return Ok(None);
@@ -575,6 +634,7 @@ pub fn try_compile_select(stmt: &SelectStmt, schema: &Schema) -> Result<Option<V
                 &stmt.order_by,
                 stmt.limit.as_ref(),
                 schema,
+                functions,
             )
         }
         Some(_) => Ok(None),
@@ -585,6 +645,7 @@ fn compile_tableless_select(
     projection: &[ResultColumn],
     selection: Option<&Expr>,
     limit: Option<&LimitClause>,
+    functions: &FunctionRegistry,
 ) -> Result<VdbeProgram> {
     let mut prog = VdbeProgram::new();
     let init_addr = prog.emit(Instruction::new(Opcode::Init, 0, 0, 0));
@@ -593,7 +654,7 @@ fn compile_tableless_select(
     let mut col_names = Vec::with_capacity(projection.len());
     for rc in projection {
         match rc {
-            ResultColumn::Star | ResultColumn::TableStar(_) => {
+            ResultColumn::Star | ResultColumn::TableStar { .. } => {
                 return Err(SqliteError::new(ErrorCode::Error, "no tables specified"));
             }
             ResultColumn::Expr { expr, alias } => {
@@ -609,7 +670,7 @@ fn compile_tableless_select(
 
     if let Some(lim) = limit {
         let lim_reg = prog.alloc_register();
-        compile_expr(&mut prog, &lim.limit, None, lim_reg)?;
+        compile_expr(&mut prog, &lim.limit, None, functions, lim_reg)?;
         let zero_reg = prog.alloc_register();
         prog.emit(Instruction::new(Opcode::Integer, 0, zero_reg, 0));
         let le_reg = prog.alloc_register();
@@ -618,7 +679,7 @@ fn compile_tableless_select(
 
         if let Some(off_expr) = &lim.offset {
             let off_reg = prog.alloc_register();
-            compile_expr(&mut prog, off_expr, None, off_reg)?;
+            compile_expr(&mut prog, off_expr, None, functions, off_reg)?;
             let gt_reg = prog.alloc_register();
             prog.emit(Instruction::new(Opcode::Gt, off_reg, zero_reg, gt_reg));
             jumps_to_halt.push(prog.emit(Instruction::new(Opcode::JumpIfTrue, gt_reg, 0, 0)));
@@ -627,13 +688,13 @@ fn compile_tableless_select(
 
     if let Some(w) = selection {
         let cond_reg = prog.alloc_register();
-        compile_expr(&mut prog, w, None, cond_reg)?;
+        compile_expr(&mut prog, w, None, functions, cond_reg)?;
         jumps_to_halt.push(prog.emit(Instruction::new(Opcode::JumpIfFalse, cond_reg, 0, 1)));
     }
 
     let out_base = prog.alloc_registers(proj_exprs.len());
     for (i, e) in proj_exprs.iter().enumerate() {
-        compile_expr(&mut prog, e, None, out_base + i as i32)?;
+        compile_expr(&mut prog, e, None, functions, out_base + i as i32)?;
     }
     prog.emit(Instruction::new(
         Opcode::ResultRow,
@@ -663,6 +724,7 @@ fn compile_single_table_select(
     order_by: &[OrderByTerm],
     limit: Option<&LimitClause>,
     schema: &Schema,
+    functions: &FunctionRegistry,
 ) -> Result<Option<VdbeProgram>> {
     let SingleTableSource {
         tbl,
@@ -672,7 +734,7 @@ fn compile_single_table_select(
     let mut prog = VdbeProgram::new();
     let init_addr = prog.emit(Instruction::new(Opcode::Init, 0, 0, 0));
 
-    // Expand projection (`*`, `t.*`, expressions)
+    // Expand projection (`*`, `t.*`, `s.t.*`, expressions)
     let table_ref_name = alias.unwrap_or(&tbl.name);
     let mut expanded: Vec<(Expr, String, Option<String>)> = Vec::new();
     for rc in projection {
@@ -680,28 +742,36 @@ fn compile_single_table_select(
             ResultColumn::Star => {
                 for c in &tbl.columns {
                     expanded.push((
-                        Expr::Column {
-                            table: None,
-                            column: c.name.clone(),
-                        },
+                        Expr::Column(ColumnRef::unqualified(c.name.clone())),
                         c.name.clone(),
                         None,
                     ));
                 }
             }
-            ResultColumn::TableStar(tname) => {
-                if !tname.eq_ignore_ascii_case(table_ref_name) {
+            ResultColumn::TableStar {
+                schema: star_schema,
+                table: tname,
+            } => {
+                let schema_ok = star_schema
+                    .as_deref()
+                    .is_none_or(|s| s.eq_ignore_ascii_case("main"));
+                if !schema_ok || !tname.eq_ignore_ascii_case(table_ref_name) {
+                    let disp = match star_schema {
+                        Some(s) => format!("{s}.{tname}"),
+                        None => tname.clone(),
+                    };
                     return Err(SqliteError::new(
                         ErrorCode::Error,
-                        format!("no such table: {tname}"),
+                        format!("no such table: {disp}"),
                     ));
                 }
                 for c in &tbl.columns {
                     expanded.push((
-                        Expr::Column {
+                        Expr::Column(ColumnRef {
+                            schema: star_schema.clone(),
                             table: Some(tname.clone()),
                             column: c.name.clone(),
-                        },
+                        }),
                         c.name.clone(),
                         None,
                     ));
@@ -746,10 +816,10 @@ fn compile_single_table_select(
     // Optional LIMIT / OFFSET registers initialized before loop
     let limit_regs = if let Some(lim) = limit {
         let rem_reg = prog.alloc_register();
-        compile_expr(&mut prog, &lim.limit, None, rem_reg)?;
+        compile_expr(&mut prog, &lim.limit, None, functions, rem_reg)?;
         let off_reg = if let Some(off_e) = &lim.offset {
             let r = prog.alloc_register();
-            compile_expr(&mut prog, off_e, None, r)?;
+            compile_expr(&mut prog, off_e, None, functions, r)?;
             Some(r)
         } else {
             None
@@ -781,7 +851,10 @@ fn compile_single_table_select(
                 return Ok(None);
             };
             let coll = if let Expr::Collate { collation, .. } = &ob.expr {
-                Collation::from_name(collation).unwrap_or_default()
+                let Some(c) = Collation::from_name(collation) else {
+                    return Ok(None);
+                };
+                c
             } else {
                 infer_expr_collation(&coll_ref_expr, tbl)
             };
@@ -858,7 +931,7 @@ fn compile_single_table_select(
         }
         AccessPlan::RowidSeek { key_expr } => {
             let key_reg = prog.alloc_register();
-            compile_expr(&mut prog, key_expr, None, key_reg)?;
+            compile_expr(&mut prog, key_expr, None, functions, key_reg)?;
             let seek = prog.emit(Instruction::new(Opcode::SeekRowid, tbl_cursor, 0, key_reg));
             jumps_after_scan.push(seek);
             prog.current_addr()
@@ -874,7 +947,7 @@ fn compile_single_table_select(
                 let key_base = prog.alloc_registers(prefix_exprs.len());
                 for (i, ke) in prefix_exprs.iter().enumerate() {
                     let r = key_base + i as i32;
-                    compile_expr(&mut prog, ke, None, r)?;
+                    compile_expr(&mut prog, ke, None, functions, r)?;
                     jumps_after_scan.push(prog.emit(Instruction::new(Opcode::JumpIfNull, r, 0, 0)));
                     let col_aff = index.columns[i]
                         .col_idx
@@ -913,7 +986,7 @@ fn compile_single_table_select(
                 let key_base = prog.alloc_registers(prefix_exprs.len());
                 for (i, ke) in prefix_exprs.iter().enumerate() {
                     let r = key_base + i as i32;
-                    compile_expr(&mut prog, ke, None, r)?;
+                    compile_expr(&mut prog, ke, None, functions, r)?;
                     jumps_after_scan.push(prog.emit(Instruction::new(Opcode::JumpIfNull, r, 0, 0)));
                     let col_aff = index.columns[i]
                         .col_idx
@@ -960,7 +1033,7 @@ fn compile_single_table_select(
     // Evaluate full WHERE filter (also handles residual conjuncts after index/rowid seek!)
     if let Some(w) = selection {
         let cond_reg = prog.alloc_register();
-        compile_expr(&mut prog, w, Some(&binding), cond_reg)?;
+        compile_expr(&mut prog, w, Some(&binding), functions, cond_reg)?;
         jumps_next_row.push(prog.emit(Instruction::new(Opcode::JumpIfFalse, cond_reg, 0, 1)));
     }
 
@@ -973,6 +1046,7 @@ fn compile_single_table_select(
                 &mut prog,
                 pe,
                 Some(&binding),
+                functions,
                 row_base + (sort_sources.len() + j) as i32,
             )?;
         }
@@ -987,7 +1061,13 @@ fn compile_single_table_select(
                     ));
                 }
                 OrderBySource::Expr(se) => {
-                    compile_expr(&mut prog, se, Some(&binding), row_base + i as i32)?;
+                    compile_expr(
+                        &mut prog,
+                        se,
+                        Some(&binding),
+                        functions,
+                        row_base + i as i32,
+                    )?;
                 }
             }
         }
@@ -1033,7 +1113,13 @@ fn compile_single_table_select(
 
         let out_base = prog.alloc_registers(expanded.len());
         for (j, (pe, _, _)) in expanded.iter().enumerate() {
-            compile_expr(&mut prog, pe, Some(&binding), out_base + j as i32)?;
+            compile_expr(
+                &mut prog,
+                pe,
+                Some(&binding),
+                functions,
+                out_base + j as i32,
+            )?;
         }
         prog.emit(Instruction::new(
             Opcode::ResultRow,
@@ -1175,19 +1261,16 @@ fn is_table_rowid_column_expr(expr: &Expr, tbl: &TableSchema, alias: Option<&str
     if tbl.without_rowid {
         return false;
     }
-    let Expr::Column { table, column } = expr else {
+    let Expr::Column(cref) = expr else {
         return false;
     };
-    if let Some(t) = table {
-        let expected = alias.unwrap_or(&tbl.name);
-        if !t.eq_ignore_ascii_case(expected) {
-            return false;
-        }
+    if !cref_matches_single_table(cref, tbl, alias) {
+        return false;
     }
-    tbl.is_implicit_rowid_name(column)
+    tbl.is_implicit_rowid_name(&cref.column)
         || tbl
             .rowid_alias_col
-            .is_some_and(|ipk| tbl.columns[ipk].name.eq_ignore_ascii_case(column))
+            .is_some_and(|ipk| tbl.columns[ipk].name.eq_ignore_ascii_case(&cref.column))
 }
 
 fn is_exact_table_column_expr(
@@ -1196,18 +1279,15 @@ fn is_exact_table_column_expr(
     alias: Option<&str>,
     target_col_idx: usize,
 ) -> bool {
-    let Expr::Column { table, column } = expr else {
+    let Expr::Column(cref) = expr else {
         return false;
     };
-    if let Some(t) = table {
-        let expected = alias.unwrap_or(&tbl.name);
-        if !t.eq_ignore_ascii_case(expected) {
-            return false;
-        }
+    if !cref_matches_single_table(cref, tbl, alias) {
+        return false;
     }
     tbl.columns
         .get(target_col_idx)
-        .is_some_and(|c| c.name.eq_ignore_ascii_case(column))
+        .is_some_and(|c| c.name.eq_ignore_ascii_case(&cref.column))
 }
 
 fn resolve_order_by_source(
@@ -1226,10 +1306,11 @@ fn resolve_order_by_source(
         let idx = (*ord as usize) - 1;
         return Some((OrderBySource::ProjCol(idx), expanded[idx].0.clone()));
     }
-    if let Expr::Column {
+    if let Expr::Column(ColumnRef {
+        schema: None,
         table: None,
         column,
-    } = inner
+    }) = inner
     {
         let in_tbl = tbl.find_column(column).is_some() || tbl.is_implicit_rowid_name(column);
         if let Some((idx, (proj_expr, _, al))) =
@@ -1263,10 +1344,11 @@ fn expr_uses_select_alias(
     tbl: &TableSchema,
 ) -> bool {
     match expr {
-        Expr::Column {
+        Expr::Column(ColumnRef {
+            schema: None,
             table: None,
             column,
-        } => {
+        }) => {
             let in_tbl = tbl.find_column(column).is_some() || tbl.is_implicit_rowid_name(column);
             !in_tbl
                 && expanded.iter().any(|(_, label, alias)| {
@@ -1279,7 +1361,8 @@ fn expr_uses_select_alias(
         Expr::Unary { expr: inner, .. }
         | Expr::Collate { expr: inner, .. }
         | Expr::Cast { expr: inner, .. }
-        | Expr::IsNull { expr: inner, .. } => expr_uses_select_alias(inner, expanded, tbl),
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::InTable { expr: inner, .. } => expr_uses_select_alias(inner, expanded, tbl),
         Expr::Binary { left, right, .. } => {
             expr_uses_select_alias(left, expanded, tbl)
                 || expr_uses_select_alias(right, expanded, tbl)
@@ -1347,8 +1430,8 @@ fn expr_uses_select_alias(
 fn infer_expr_collation(expr: &Expr, tbl: &TableSchema) -> Collation {
     match expr {
         Expr::Collate { collation, .. } => Collation::from_name(collation).unwrap_or_default(),
-        Expr::Column { column, .. } => tbl
-            .find_column(column)
+        Expr::Column(cref) => tbl
+            .find_column(&cref.column)
             .map_or(Collation::Binary, |(_, c)| c.collation),
         _ => Collation::Binary,
     }
@@ -1362,6 +1445,7 @@ fn compile_expr(
     prog: &mut VdbeProgram,
     expr: &Expr,
     binding: Option<&TableBinding<'_>>,
+    functions: &FunctionRegistry,
     dest: i32,
 ) -> Result<()> {
     match expr {
@@ -1406,23 +1490,20 @@ fn compile_expr(
             };
             prog.emit(Instruction::new(Opcode::Variable, idx as i32, dest, 0));
         }
-        Expr::Column { table, column } => {
+        Expr::Column(cref) => {
             let Some(b) = binding else {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    format!("no such column: {column}"),
+                    format!("no such column: {}", cref.display_name()),
                 ));
             };
-            if let Some(qual) = table {
-                let expected = b.alias.unwrap_or(&b.tbl.name);
-                if !qual.eq_ignore_ascii_case(expected) {
-                    return Err(SqliteError::new(
-                        ErrorCode::Error,
-                        format!("no such column: {qual}.{column}"),
-                    ));
-                }
+            if !cref_matches_single_table(cref, b.tbl, b.alias) {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such column: {}", cref.display_name()),
+                ));
             }
-            if let Some((col_idx, col_schema)) = b.tbl.find_column(column) {
+            if let Some((col_idx, col_schema)) = b.tbl.find_column(&cref.column) {
                 if b.tbl.rowid_alias_col == Some(col_idx) {
                     // C SQLite `insert.c:1361`: INTEGER PRIMARY KEY slot in record is NULL; read from B+Tree rowid!
                     prog.emit(
@@ -1437,44 +1518,44 @@ fn compile_expr(
                             .with_comment(col_schema.name.clone()),
                     );
                 }
-            } else if b.tbl.is_implicit_rowid_name(column) {
+            } else if b.tbl.is_implicit_rowid_name(&cref.column) {
                 prog.emit(Instruction::new(Opcode::Rowid, b.cursor, dest, 0));
             } else {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    format!("no such column: {column}"),
+                    format!("no such column: {}", cref.display_name()),
                 ));
             }
         }
         Expr::Collate { expr: inner, .. } => {
-            compile_expr(prog, inner, binding, dest)?;
+            compile_expr(prog, inner, binding, functions, dest)?;
         }
         Expr::Unary { op, expr: inner } => match op {
             UnaryOp::Plus => {
                 // Unary `+` is a no-op expression wrapper in SQLite (`+col` strips affinity)
-                compile_expr(prog, inner, binding, dest)?;
+                compile_expr(prog, inner, binding, functions, dest)?;
             }
             UnaryOp::Negate => {
                 let tmp = prog.alloc_register();
-                compile_expr(prog, inner, binding, tmp)?;
+                compile_expr(prog, inner, binding, functions, tmp)?;
                 prog.emit(Instruction::new(Opcode::Negate, tmp, dest, 0));
             }
             UnaryOp::BitNot => {
                 let tmp = prog.alloc_register();
-                compile_expr(prog, inner, binding, tmp)?;
+                compile_expr(prog, inner, binding, functions, tmp)?;
                 prog.emit(Instruction::new(Opcode::BitNot, tmp, dest, 0));
             }
             UnaryOp::Not => {
                 let tmp = prog.alloc_register();
-                compile_expr(prog, inner, binding, tmp)?;
+                compile_expr(prog, inner, binding, functions, tmp)?;
                 prog.emit(Instruction::new(Opcode::Not, tmp, dest, 0));
             }
         },
         Expr::Binary { left, op, right } => {
             let lhs = prog.alloc_register();
             let rhs = prog.alloc_register();
-            compile_expr(prog, left, binding, lhs)?;
-            compile_expr(prog, right, binding, rhs)?;
+            compile_expr(prog, left, binding, functions, lhs)?;
+            compile_expr(prog, right, binding, functions, rhs)?;
             let vdbe_op = match op {
                 BinaryOp::Concat => Opcode::Concat,
                 BinaryOp::Multiply => Opcode::Multiply,
@@ -1509,7 +1590,6 @@ fn compile_expr(
                     | Opcode::Is
                     | Opcode::IsNot
             ) {
-                let coll = resolve_binary_collation(left, right, binding);
                 let l_aff = compiler_expr_affinity(
                     left,
                     binding.map(|b| b.tbl),
@@ -1521,9 +1601,16 @@ fn compile_expr(
                     binding.and_then(|b| b.alias),
                 );
                 let comp_aff = sqlite_compare_affinity(l_aff, r_aff);
-                ins = ins
-                    .with_p4(P4::Collation(coll))
-                    .with_p5(u16::from(affinity_to_p5(comp_aff)));
+                if let Some(custom_coll) = resolve_custom_binary_collation(left, right) {
+                    ins = ins
+                        .with_p4(P4::Str(custom_coll))
+                        .with_p5(u16::from(affinity_to_p5(comp_aff)));
+                } else {
+                    let coll = resolve_binary_collation(left, right, binding);
+                    ins = ins
+                        .with_p4(P4::Collation(coll))
+                        .with_p5(u16::from(affinity_to_p5(comp_aff)));
+                }
             }
             prog.emit(ins);
         }
@@ -1532,7 +1619,7 @@ fn compile_expr(
             negated,
         } => {
             let tmp = prog.alloc_register();
-            compile_expr(prog, inner, binding, tmp)?;
+            compile_expr(prog, inner, binding, functions, tmp)?;
             let op = if *negated {
                 Opcode::NotNull
             } else {
@@ -1545,7 +1632,7 @@ fn compile_expr(
             type_name,
         } => {
             let tmp = prog.alloc_register();
-            compile_expr(prog, inner, binding, tmp)?;
+            compile_expr(prog, inner, binding, functions, tmp)?;
             prog.emit(
                 Instruction::new(Opcode::Cast, tmp, dest, 0).with_p4(P4::Str(type_name.clone())),
             );
@@ -1579,10 +1666,11 @@ fn compile_expr(
                         expr: Box::new(combined),
                     },
                     binding,
+                    functions,
                     dest,
                 )?;
             } else {
-                compile_expr(prog, &combined, binding, dest)?;
+                compile_expr(prog, &combined, binding, functions, dest)?;
             }
         }
         Expr::InList {
@@ -1623,7 +1711,7 @@ fn compile_expr(
                 } else {
                     disj.unwrap()
                 };
-                compile_expr(prog, &final_e, binding, dest)?;
+                compile_expr(prog, &final_e, binding, functions, dest)?;
             }
         }
         Expr::Like {
@@ -1640,10 +1728,10 @@ fn compile_expr(
             let argc = if escape.is_some() { 3 } else { 2 };
             let arg_base = prog.alloc_registers(argc);
             // Note: SQLite's LIKE/GLOB function takes `(pattern, string [, escape])`!
-            compile_expr(prog, pattern, binding, arg_base)?;
-            compile_expr(prog, txt_e, binding, arg_base + 1)?;
+            compile_expr(prog, pattern, binding, functions, arg_base)?;
+            compile_expr(prog, txt_e, binding, functions, arg_base + 1)?;
             if let Some(esc) = escape {
-                compile_expr(prog, esc, binding, arg_base + 2)?;
+                compile_expr(prog, esc, binding, functions, arg_base + 2)?;
             }
             let res_reg = if *negated {
                 prog.alloc_register()
@@ -1667,7 +1755,7 @@ fn compile_expr(
         } => {
             let op_reg = if let Some(op_e) = operand {
                 let r = prog.alloc_register();
-                compile_expr(prog, op_e, binding, r)?;
+                compile_expr(prog, op_e, binding, functions, r)?;
                 Some(r)
             } else {
                 None
@@ -1678,9 +1766,8 @@ fn compile_expr(
                 let cond_reg = prog.alloc_register();
                 if let Some(base_r) = op_reg {
                     let w_reg = prog.alloc_register();
-                    compile_expr(prog, when_e, binding, w_reg)?;
+                    compile_expr(prog, when_e, binding, functions, w_reg)?;
                     let op_e = operand.as_ref().unwrap();
-                    let coll = resolve_binary_collation(op_e, when_e, binding);
                     let l_aff = compiler_expr_affinity(
                         op_e,
                         binding.map(|b| b.tbl),
@@ -1692,23 +1779,27 @@ fn compile_expr(
                         binding.and_then(|b| b.alias),
                     );
                     let comp_aff = sqlite_compare_affinity(l_aff, r_aff);
-                    prog.emit(
-                        Instruction::new(Opcode::Eq, base_r, w_reg, cond_reg)
-                            .with_p4(P4::Collation(coll))
-                            .with_p5(u16::from(affinity_to_p5(comp_aff))),
-                    );
+                    let mut ins = Instruction::new(Opcode::Eq, base_r, w_reg, cond_reg)
+                        .with_p5(u16::from(affinity_to_p5(comp_aff)));
+                    if let Some(custom_coll) = resolve_custom_binary_collation(op_e, when_e) {
+                        ins = ins.with_p4(P4::Str(custom_coll));
+                    } else {
+                        let coll = resolve_binary_collation(op_e, when_e, binding);
+                        ins = ins.with_p4(P4::Collation(coll));
+                    }
+                    prog.emit(ins);
                 } else {
-                    compile_expr(prog, when_e, binding, cond_reg)?;
+                    compile_expr(prog, when_e, binding, functions, cond_reg)?;
                 }
                 let j_false = prog.emit(Instruction::new(Opcode::JumpIfFalse, cond_reg, 0, 1));
-                compile_expr(prog, then_e, binding, dest)?;
+                compile_expr(prog, then_e, binding, functions, dest)?;
                 end_jumps.push(prog.emit(goto_placeholder()));
                 let next_branch = prog.current_addr();
                 prog.patch_p2(j_false, next_branch);
             }
 
             if let Some(el) = else_expr {
-                compile_expr(prog, el, binding, dest)?;
+                compile_expr(prog, el, binding, functions, dest)?;
             } else {
                 prog.emit(Instruction::new(Opcode::Null, 0, dest, 0));
             }
@@ -1727,7 +1818,7 @@ fn compile_expr(
                 FunctionArgs::Star => (true, Vec::new()),
                 FunctionArgs::Exprs(es) => (false, es.clone()),
             };
-            validate_function_call(
+            functions.validate_call(
                 name,
                 star_args,
                 expr_list.len(),
@@ -1735,9 +1826,56 @@ fn compile_expr(
                 filter.is_some(),
                 false,
             )?;
+            if !star_args
+                && !*distinct
+                && filter.is_none()
+                && functions.find_scalar(name, expr_list.len()).is_none()
+            {
+                let upper = name.to_ascii_uppercase();
+                match upper.as_str() {
+                    "COALESCE" | "IFNULL" => {
+                        compile_expr(prog, &expr_list[0], binding, functions, dest)?;
+                        let mut end_jumps = Vec::with_capacity(expr_list.len().saturating_sub(1));
+                        for arg in &expr_list[1..] {
+                            end_jumps.push(prog.emit(Instruction::new(
+                                Opcode::NotNull,
+                                dest,
+                                0,
+                                0,
+                            )));
+                            compile_expr(prog, arg, binding, functions, dest)?;
+                        }
+                        let end_addr = prog.current_addr();
+                        for j in end_jumps {
+                            prog.patch_p2(j, end_addr);
+                        }
+                        return Ok(());
+                    }
+                    "IIF" | "IF" => {
+                        let mut branches = Vec::with_capacity(expr_list.len() / 2);
+                        let mut idx = 0;
+                        while idx + 1 < expr_list.len() {
+                            branches.push((expr_list[idx].clone(), expr_list[idx + 1].clone()));
+                            idx += 2;
+                        }
+                        let else_expr = if idx < expr_list.len() {
+                            Some(Box::new(expr_list[idx].clone()))
+                        } else {
+                            None
+                        };
+                        let case_expr = Expr::Case {
+                            operand: None,
+                            branches,
+                            else_expr,
+                        };
+                        return compile_expr(prog, &case_expr, binding, functions, dest);
+                    }
+                    _ => {}
+                }
+            }
             let arg_base = prog.alloc_registers(expr_list.len().max(1));
             for (i, a) in expr_list.iter().enumerate() {
-                compile_expr(prog, a, binding, arg_base + i as i32)?;
+                compile_expr(prog, a, binding, functions, arg_base + i as i32)?;
             }
             prog.emit(
                 Instruction::new(Opcode::Function, arg_base, 0, dest).with_p4(P4::Func {
@@ -1746,13 +1884,35 @@ fn compile_expr(
                 }),
             );
         }
-        Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::RowValue(_) => {
+        Expr::Subquery(_)
+        | Expr::Exists { .. }
+        | Expr::InSubquery { .. }
+        | Expr::InTable { .. }
+        | Expr::RowValue(_) => {
             return Err(SqliteError::misuse(
                 "subquery must be evaluated by relational engine",
             ));
         }
     }
     Ok(())
+}
+
+fn resolve_custom_binary_collation(left: &Expr, right: &Expr) -> Option<String> {
+    if let Expr::Collate { collation, .. } = left {
+        return if Collation::from_name(collation).is_none() {
+            Some(collation.clone())
+        } else {
+            None
+        };
+    }
+    if let Expr::Collate { collation, .. } = right {
+        return if Collation::from_name(collation).is_none() {
+            Some(collation.clone())
+        } else {
+            None
+        };
+    }
+    None
 }
 
 fn resolve_binary_collation(
@@ -1767,13 +1927,13 @@ fn resolve_binary_collation(
         return Collation::from_name(collation).unwrap_or_default();
     }
     if let Some(b) = binding {
-        if let Expr::Column { column, .. } = left
-            && let Some((_, c)) = b.tbl.find_column(column)
+        if let Expr::Column(cref) = left
+            && let Some((_, c)) = b.tbl.find_column(&cref.column)
         {
             return c.collation;
         }
-        if let Expr::Column { column, .. } = right
-            && let Some((_, c)) = b.tbl.find_column(column)
+        if let Expr::Column(cref) = right
+            && let Some((_, c)) = b.tbl.find_column(&cref.column)
         {
             return c.collation;
         }
@@ -1800,17 +1960,14 @@ fn compiler_expr_affinity(
     match expr {
         Expr::Collate { expr: inner, .. } => compiler_expr_affinity(inner, tbl, alias),
         Expr::Cast { type_name, .. } => Some(TypeAffinity::from_declared_type(type_name)),
-        Expr::Column { table, column } => {
+        Expr::Column(cref) => {
             let t = tbl?;
-            if let Some(qual) = table {
-                let expected = alias.unwrap_or(&t.name);
-                if !qual.eq_ignore_ascii_case(expected) {
-                    return None;
-                }
+            if !cref_matches_single_table(cref, t, alias) {
+                return None;
             }
-            if let Some((_, c)) = t.find_column(column) {
+            if let Some((_, c)) = t.find_column(&cref.column) {
                 Some(c.affinity)
-            } else if t.is_implicit_rowid_name(column) {
+            } else if t.is_implicit_rowid_name(&cref.column) {
                 Some(TypeAffinity::Integer)
             } else {
                 None
@@ -1826,9 +1983,18 @@ fn compiler_expr_affinity(
 
 /// Generates a representative [`VdbeProgram`] for `EXPLAIN <stmt>`.
 pub fn compile_for_explain(stmt: &Stmt, schema: &Schema) -> Result<VdbeProgram> {
+    compile_for_explain_with_functions(stmt, schema, &FunctionRegistry::default())
+}
+
+/// Generates a representative [`VdbeProgram`] for `EXPLAIN <stmt>` using connection `functions`.
+pub fn compile_for_explain_with_functions(
+    stmt: &Stmt,
+    schema: &Schema,
+    functions: &FunctionRegistry,
+) -> Result<VdbeProgram> {
     match stmt {
         Stmt::Select(sel) => {
-            if let Some(prog) = try_compile_select(sel, schema)? {
+            if let Some(prog) = try_compile_select_with_functions(sel, schema, functions)? {
                 return Ok(prog);
             }
             let mut prog = VdbeProgram::new();
@@ -1841,7 +2007,7 @@ pub fn compile_for_explain(stmt: &Stmt, schema: &Schema) -> Result<VdbeProgram> 
             prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
             Ok(prog)
         }
-        Stmt::Insert(ins) => compile_insert_explain(ins, schema),
+        Stmt::Insert(ins) => compile_insert_explain(ins, schema, functions),
         Stmt::Update(upd) => compile_update_explain(upd, schema),
         Stmt::Delete(del) => compile_delete_explain(del, schema),
         _ => {
@@ -1854,13 +2020,35 @@ pub fn compile_for_explain(stmt: &Stmt, schema: &Schema) -> Result<VdbeProgram> 
     }
 }
 
-fn compile_insert_explain(ins: &InsertStmt, schema: &Schema) -> Result<VdbeProgram> {
-    let Some(tbl) = schema.find_table(&ins.table) else {
+fn find_table_qualified_main(name: &QualifiedName, schema: &Schema) -> Result<TableSchema> {
+    if let Some(s) = &name.schema
+        && !s.eq_ignore_ascii_case("main")
+    {
         return Err(SqliteError::new(
             ErrorCode::Error,
-            format!("no such table: {}", ins.table),
+            format!("no such table: {}", name.display_name()),
         ));
-    };
+    }
+    if name.schema.is_some() && Schema::is_temp_schema_table_name(&name.name) {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("no such table: {}", name.display_name()),
+        ));
+    }
+    schema.find_table(&name.name).ok_or_else(|| {
+        SqliteError::new(
+            ErrorCode::Error,
+            format!("no such table: {}", name.display_name()),
+        )
+    })
+}
+
+fn compile_insert_explain(
+    ins: &InsertStmt,
+    schema: &Schema,
+    functions: &FunctionRegistry,
+) -> Result<VdbeProgram> {
+    let tbl = find_table_qualified_main(&ins.table, schema)?;
     let mut prog = VdbeProgram::new();
     prog.read_only = false;
     prog.emit(Instruction::new(Opcode::Init, 0, 1, 0));
@@ -1896,10 +2084,10 @@ fn compile_insert_explain(ins: &InsertStmt, schema: &Schema) -> Result<VdbeProgr
             prog.emit(Instruction::new(Opcode::NewRowid, tcur, rid_reg, 0));
             for (i, expr) in row.iter().take(tbl.columns.len()).enumerate() {
                 if tbl.rowid_alias_col == Some(i) {
-                    compile_expr(&mut prog, expr, None, rid_reg)?;
+                    compile_expr(&mut prog, expr, None, functions, rid_reg)?;
                     prog.emit(Instruction::new(Opcode::Null, 0, col_base + i as i32, 0));
                 } else {
-                    compile_expr(&mut prog, expr, None, col_base + i as i32)?;
+                    compile_expr(&mut prog, expr, None, functions, col_base + i as i32)?;
                 }
             }
             let affs: Vec<_> = tbl.columns.iter().map(|c| c.affinity).collect();
@@ -1948,12 +2136,7 @@ fn compile_insert_explain(ins: &InsertStmt, schema: &Schema) -> Result<VdbeProgr
 }
 
 fn compile_update_explain(upd: &UpdateStmt, schema: &Schema) -> Result<VdbeProgram> {
-    let Some(tbl) = schema.find_table(&upd.table) else {
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            format!("no such table: {}", upd.table),
-        ));
-    };
+    let tbl = find_table_qualified_main(&upd.table, schema)?;
     let mut prog = VdbeProgram::new();
     prog.read_only = false;
     prog.emit(Instruction::new(Opcode::Init, 0, 1, 0));
@@ -1988,12 +2171,7 @@ fn compile_update_explain(upd: &UpdateStmt, schema: &Schema) -> Result<VdbeProgr
 }
 
 fn compile_delete_explain(del: &DeleteStmt, schema: &Schema) -> Result<VdbeProgram> {
-    let Some(tbl) = schema.find_table(&del.table) else {
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            format!("no such table: {}", del.table),
-        ));
-    };
+    let tbl = find_table_qualified_main(&del.table, schema)?;
     let mut prog = VdbeProgram::new();
     prog.read_only = false;
     prog.emit(Instruction::new(Opcode::Init, 0, 1, 0));
@@ -2046,7 +2224,11 @@ pub fn explain_query_plan(stmt: &Stmt, schema: &Schema) -> Result<Vec<Vec<Value>
                         alias,
                         indexed_by,
                     } = &fc.head
-                    && let Some(tbl) = schema.find_table(name)
+                    && name
+                        .schema
+                        .as_deref()
+                        .is_none_or(|s| s.eq_ignore_ascii_case("main"))
+                    && let Some(tbl) = schema.find_table(&name.name)
                 {
                     let plan = match indexed_by {
                         Some(IndexHint::NotIndexed) => AccessPlan::FullScan,
@@ -2056,14 +2238,17 @@ pub fn explain_query_plan(stmt: &Stmt, schema: &Schema) -> Result<Vec<Vec<Value>
                     push_detail(plan.explain_detail(disp));
                 } else {
                     if let TableOrSubquery::Table { name, alias, .. } = &fc.head {
-                        push_detail(format!("SCAN {}", alias.as_deref().unwrap_or(name)));
+                        push_detail(format!("SCAN {}", alias.as_deref().unwrap_or(&name.name)));
                     } else {
                         push_detail("SCAN SUBQUERY".to_owned());
                     }
                     for j in &fc.joins {
                         match &j.right {
                             TableOrSubquery::Table { name, alias, .. } => {
-                                push_detail(format!("SCAN {}", alias.as_deref().unwrap_or(name)));
+                                push_detail(format!(
+                                    "SCAN {}",
+                                    alias.as_deref().unwrap_or(&name.name)
+                                ));
                             }
                             TableOrSubquery::Subquery { .. } => {
                                 push_detail("SCAN SUBQUERY".to_owned());
@@ -2079,7 +2264,13 @@ pub fn explain_query_plan(stmt: &Stmt, schema: &Schema) -> Result<Vec<Vec<Value>
             }
         }
         Stmt::Update(upd) => {
-            if let Some(tbl) = schema.find_table(&upd.table) {
+            if upd
+                .table
+                .schema
+                .as_deref()
+                .is_none_or(|s| s.eq_ignore_ascii_case("main"))
+                && let Some(tbl) = schema.find_table(&upd.table.name)
+            {
                 let plan =
                     choose_access_plan(&tbl, upd.alias.as_deref(), upd.selection.as_ref(), schema);
                 let disp = upd.alias.as_deref().unwrap_or(&tbl.name);
@@ -2087,7 +2278,13 @@ pub fn explain_query_plan(stmt: &Stmt, schema: &Schema) -> Result<Vec<Vec<Value>
             }
         }
         Stmt::Delete(del) => {
-            if let Some(tbl) = schema.find_table(&del.table) {
+            if del
+                .table
+                .schema
+                .as_deref()
+                .is_none_or(|s| s.eq_ignore_ascii_case("main"))
+                && let Some(tbl) = schema.find_table(&del.table.name)
+            {
                 let plan =
                     choose_access_plan(&tbl, del.alias.as_deref(), del.selection.as_ref(), schema);
                 let disp = del.alias.as_deref().unwrap_or(&tbl.name);

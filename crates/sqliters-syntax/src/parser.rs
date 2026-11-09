@@ -56,7 +56,6 @@ struct Parser<'a> {
     expr_depth: usize,
     max_param_idx: usize,
     named_params: HashMap<String, usize>,
-    in_vacuum_into: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -68,7 +67,16 @@ impl<'a> Parser<'a> {
             expr_depth: 0,
             max_param_idx: 0,
             named_params: HashMap::new(),
-            in_vacuum_into: false,
+        }
+    }
+
+    #[inline]
+    fn prev_token_end(&self) -> usize {
+        if self.pos == 0 {
+            0
+        } else {
+            let prev = self.tokens[self.pos - 1];
+            prev.offset + prev.text.len()
         }
     }
 
@@ -137,14 +145,21 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parses `[schema.]object_name`, returning `(Option<schema>, object_name)`.
-    fn parse_qualified_name(&mut self) -> Result<(Option<String>, String)> {
+    /// Parses `[schema.]object_name` into a structural [`QualifiedName`].
+    fn parse_qualified_name(&mut self) -> Result<QualifiedName> {
+        Ok(self.parse_qualified_name_with_offset()?.0)
+    }
+
+    /// Parses `[schema.]object_name`, returning `(QualifiedName, byte_offset_of_unqualified_name_token)`.
+    fn parse_qualified_name_with_offset(&mut self) -> Result<(QualifiedName, usize)> {
+        let first_tok = self.peek();
         let first = self.parse_ident()?;
         if self.eat(TokenKind::Dot) {
+            let second_tok = self.peek();
             let second = self.parse_ident()?;
-            Ok((Some(first), second))
+            Ok((QualifiedName::qualified(first, second), second_tok.offset))
         } else {
-            Ok((None, first))
+            Ok((QualifiedName::unqualified(first), first_tok.offset))
         }
     }
 
@@ -284,6 +299,43 @@ impl<'a> Parser<'a> {
                 let _ = self.eat(TokenKind::Savepoint);
                 Ok(Stmt::Release(self.parse_ident()?))
             }
+            TokenKind::Attach => {
+                self.advance();
+                if self.at(TokenKind::Database)
+                    && !matches!(
+                        self.peek_n(1).kind,
+                        TokenKind::As | TokenKind::Dot | TokenKind::Lp
+                    )
+                {
+                    self.advance();
+                }
+                let expr = self.parse_expr()?;
+                self.expect(TokenKind::As)?;
+                let schema_name = self.parse_expr()?;
+                let key = if self.eat(TokenKind::Key) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                Ok(Stmt::AttachDatabase {
+                    expr,
+                    schema_name,
+                    key,
+                })
+            }
+            TokenKind::Detach => {
+                self.advance();
+                if self.at(TokenKind::Database)
+                    && !matches!(
+                        self.peek_n(1).kind,
+                        TokenKind::Semi | TokenKind::Eof | TokenKind::Dot | TokenKind::Lp
+                    )
+                {
+                    self.advance();
+                }
+                let schema_name = self.parse_expr()?;
+                Ok(Stmt::DetachDatabase { schema_name })
+            }
             TokenKind::Create => self.parse_create(start_tok.offset),
             TokenKind::Drop => self.parse_drop(),
             TokenKind::Alter => self.parse_alter(),
@@ -320,10 +372,7 @@ impl<'a> Parser<'a> {
                             schema = Some(dequote(tok.text));
                         } else {
                             self.advance();
-                            self.in_vacuum_into = true;
-                            let res = self.parse_expr();
-                            self.in_vacuum_into = false;
-                            into = Some(res?);
+                            into = Some(self.parse_expr()?);
                         }
                     } else {
                         let schema_tok = self.peek();
@@ -334,10 +383,7 @@ impl<'a> Parser<'a> {
                             Some(self.parse_ident()?)
                         };
                         if self.eat(TokenKind::Into) {
-                            self.in_vacuum_into = true;
-                            let res = self.parse_expr();
-                            self.in_vacuum_into = false;
-                            into = Some(res?);
+                            into = Some(self.parse_expr()?);
                         }
                     }
                 }
@@ -352,8 +398,7 @@ impl<'a> Parser<'a> {
             TokenKind::Analyze => {
                 self.advance();
                 let target = if !self.at(TokenKind::Semi) && !self.at(TokenKind::Eof) {
-                    let (_, name) = self.parse_qualified_name()?;
-                    Some(name)
+                    Some(self.parse_qualified_name()?)
                 } else {
                     None
                 };
@@ -362,8 +407,7 @@ impl<'a> Parser<'a> {
             TokenKind::Reindex => {
                 self.advance();
                 let target = if !self.at(TokenKind::Semi) && !self.at(TokenKind::Eof) {
-                    let (_, name) = self.parse_qualified_name()?;
-                    Some(name)
+                    Some(self.parse_qualified_name()?)
                 } else {
                     None
                 };
@@ -389,16 +433,11 @@ impl<'a> Parser<'a> {
             } else {
                 false
             };
-            let (_schema, name) = self.parse_qualified_name()?;
+            let (name, name_offset) = self.parse_qualified_name_with_offset()?;
             if self.eat(TokenKind::As) {
-                if temp {
-                    return Err(SqliteError::new(
-                        ErrorCode::Error,
-                        "TEMP tables are not yet supported",
-                    ));
-                }
                 let query = self.parse_select_stmt()?;
                 return Ok(Stmt::CreateTableAs {
+                    temp,
                     if_not_exists,
                     name,
                     query: Box::new(query),
@@ -442,7 +481,9 @@ impl<'a> Parser<'a> {
                 }
             }
 
+            let body_end = self.prev_token_end();
             let end_off = self.peek().offset;
+            let catalog_sql = format!("CREATE TABLE {}", &self.sql[name_offset..body_end]);
             let raw_sql = self.sql[stmt_start..end_off].trim().to_owned();
             return Ok(Stmt::CreateTable(CreateTableStmt {
                 temp,
@@ -452,11 +493,12 @@ impl<'a> Parser<'a> {
                 constraints,
                 without_rowid,
                 strict,
+                catalog_sql,
                 raw_sql,
             }));
         }
 
-        if self.eat(TokenKind::Index) {
+        if !temp && self.eat(TokenKind::Index) {
             let if_not_exists = if self.eat(TokenKind::If) {
                 self.expect(TokenKind::Not)?;
                 self.expect(TokenKind::Exists)?;
@@ -464,7 +506,7 @@ impl<'a> Parser<'a> {
             } else {
                 false
             };
-            let (_schema, name) = self.parse_qualified_name()?;
+            let (name, name_offset) = self.parse_qualified_name_with_offset()?;
             self.expect(TokenKind::On)?;
             let table_name = self.parse_ident()?;
             self.expect(TokenKind::Lp)?;
@@ -481,7 +523,14 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+            let body_end = self.prev_token_end();
             let end_off = self.peek().offset;
+            let prefix = if unique {
+                "CREATE UNIQUE INDEX "
+            } else {
+                "CREATE INDEX "
+            };
+            let catalog_sql = format!("{prefix}{}", &self.sql[name_offset..body_end]);
             let raw_sql = self.sql[stmt_start..end_off].trim().to_owned();
             return Ok(Stmt::CreateIndex(CreateIndexStmt {
                 unique,
@@ -490,6 +539,7 @@ impl<'a> Parser<'a> {
                 table_name,
                 columns,
                 where_clause,
+                catalog_sql,
                 raw_sql,
             }));
         }
@@ -876,10 +926,11 @@ impl<'a> Parser<'a> {
             collation = Some(self.parse_ident()?);
         }
         let (name, expr) = match raw_expr {
-            Expr::Column {
+            Expr::Column(ColumnRef {
+                schema: None,
                 table: None,
                 column,
-            } => (column, None),
+            }) => (column, None),
             other => (String::new(), Some(other)),
         };
         let mut desc = false;
@@ -916,7 +967,7 @@ impl<'a> Parser<'a> {
             } else {
                 false
             };
-            let (_schema, name) = self.parse_qualified_name()?;
+            let name = self.parse_qualified_name()?;
             Ok(Stmt::DropTable { if_exists, name })
         } else if self.eat(TokenKind::Index) {
             let if_exists = if self.eat(TokenKind::If) {
@@ -925,7 +976,7 @@ impl<'a> Parser<'a> {
             } else {
                 false
             };
-            let (_schema, name) = self.parse_qualified_name()?;
+            let name = self.parse_qualified_name()?;
             Ok(Stmt::DropIndex { if_exists, name })
         } else {
             let tok = self.peek();
@@ -936,7 +987,7 @@ impl<'a> Parser<'a> {
     fn parse_alter(&mut self) -> Result<Stmt> {
         self.expect(TokenKind::Alter)?;
         self.expect(TokenKind::Table)?;
-        let (_schema, table) = self.parse_qualified_name()?;
+        let table = self.parse_qualified_name()?;
         if self.eat(TokenKind::Rename) {
             if self.eat(TokenKind::To) {
                 let new_name = self.parse_ident()?;
@@ -979,10 +1030,12 @@ impl<'a> Parser<'a> {
             }
         };
         self.expect(TokenKind::Into)?;
-        let (_schema, table) = self.parse_qualified_name()?;
-        if self.eat(TokenKind::As) {
-            let _ = self.parse_ident()?;
-        }
+        let table = self.parse_qualified_name()?;
+        let alias = if self.eat(TokenKind::As) {
+            Some(self.parse_ident()?)
+        } else {
+            None
+        };
 
         let columns = if self.at(TokenKind::Lp) && self.peek_n(1).kind != TokenKind::Select {
             self.expect(TokenKind::Lp)?;
@@ -1061,6 +1114,7 @@ impl<'a> Parser<'a> {
             ctes,
             or_conflict,
             table,
+            alias,
             columns,
             source,
             returning,
@@ -1094,7 +1148,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let (_schema, table) = self.parse_qualified_name()?;
+        let table = self.parse_qualified_name()?;
         let alias = self.parse_optional_table_alias(&[TokenKind::Set])?;
         let indexed_by = self.parse_optional_index_hint()?;
         self.expect(TokenKind::Set)?;
@@ -1132,7 +1186,7 @@ impl<'a> Parser<'a> {
     fn parse_delete(&mut self, ctes: Vec<CommonTableExpr>) -> Result<DeleteStmt> {
         self.expect(TokenKind::Delete)?;
         self.expect(TokenKind::From)?;
-        let (_schema, table) = self.parse_qualified_name()?;
+        let table = self.parse_qualified_name()?;
         let alias = self.parse_optional_table_alias(&[TokenKind::Where, TokenKind::Returning])?;
         let indexed_by = self.parse_optional_index_hint()?;
         let selection = if self.eat(TokenKind::Where) {
@@ -1160,7 +1214,7 @@ impl<'a> Parser<'a> {
 
     fn parse_pragma(&mut self) -> Result<Stmt> {
         self.expect(TokenKind::Pragma)?;
-        let (schema, name) = self.parse_qualified_name()?;
+        let qn = self.parse_qualified_name()?;
         let value = if self.eat(TokenKind::Eq) {
             Some(self.parse_pragma_value()?)
         } else if self.eat(TokenKind::Lp) {
@@ -1171,8 +1225,8 @@ impl<'a> Parser<'a> {
             None
         };
         Ok(Stmt::Pragma {
-            schema,
-            name,
+            schema: qn.schema,
+            name: qn.name,
             value,
         })
     }
@@ -1282,17 +1336,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select_stmt(&mut self) -> Result<SelectStmt> {
-        let prev_vac = std::mem::replace(&mut self.in_vacuum_into, false);
-        let res = (|| {
-            let ctes = if self.at(TokenKind::With) {
-                self.parse_with_clause()?
-            } else {
-                Vec::new()
-            };
-            self.parse_select_after_with(ctes)
-        })();
-        self.in_vacuum_into = prev_vac;
-        res
+        let ctes = if self.at(TokenKind::With) {
+            self.parse_with_clause()?
+        } else {
+            Vec::new()
+        };
+        self.parse_select_after_with(ctes)
     }
 
     fn parse_select_after_with(&mut self, ctes: Vec<CommonTableExpr>) -> Result<SelectStmt> {
@@ -1415,7 +1464,25 @@ impl<'a> Parser<'a> {
                 let tbl = self.parse_ident()?;
                 self.expect(TokenKind::Dot)?;
                 self.expect(TokenKind::Star)?;
-                cols.push(ResultColumn::TableStar(tbl));
+                cols.push(ResultColumn::TableStar {
+                    schema: None,
+                    table: tbl,
+                });
+            } else if Self::can_be_ident(self.peek().kind)
+                && self.peek_n(1).kind == TokenKind::Dot
+                && Self::can_be_ident(self.peek_n(2).kind)
+                && self.peek_n(3).kind == TokenKind::Dot
+                && self.peek_n(4).kind == TokenKind::Star
+            {
+                let schema = self.parse_ident()?;
+                self.expect(TokenKind::Dot)?;
+                let tbl = self.parse_ident()?;
+                self.expect(TokenKind::Dot)?;
+                self.expect(TokenKind::Star)?;
+                cols.push(ResultColumn::TableStar {
+                    schema: Some(schema),
+                    table: tbl,
+                });
             } else {
                 let expr = self.parse_expr()?;
                 let alias = if self.eat(TokenKind::As) {
@@ -1534,7 +1601,7 @@ impl<'a> Parser<'a> {
             return Ok(inner);
         }
 
-        let (_schema, name) = self.parse_qualified_name()?;
+        let name = self.parse_qualified_name()?;
         let alias = self.parse_optional_table_alias(&[])?;
         let indexed_by = self.parse_optional_index_hint()?;
         Ok(TableOrSubquery::Table {
@@ -1788,33 +1855,10 @@ impl<'a> Parser<'a> {
                             }
                         } else {
                             // SQLite `expr [NOT] IN [schema.]table_name`
-                            let (_schema, tbl_name) = self.parse_qualified_name()?;
-                            let subq = SelectStmt {
-                                ctes: Vec::new(),
-                                body: SelectBody {
-                                    head: SelectCore::Select {
-                                        distinct: false,
-                                        projection: vec![ResultColumn::Star],
-                                        from: Some(FromClause {
-                                            head: TableOrSubquery::Table {
-                                                name: tbl_name,
-                                                alias: None,
-                                                indexed_by: None,
-                                            },
-                                            joins: Vec::new(),
-                                        }),
-                                        selection: None,
-                                        group_by: Vec::new(),
-                                        having: None,
-                                    },
-                                    compounds: Vec::new(),
-                                },
-                                order_by: Vec::new(),
-                                limit: None,
-                            };
-                            lhs = Expr::InSubquery {
+                            let table = self.parse_qualified_name()?;
+                            lhs = Expr::InTable {
                                 expr: Box::new(lhs),
-                                subquery: Box::new(subq),
+                                table,
                                 negated,
                             };
                         }
@@ -2127,32 +2171,19 @@ impl<'a> Parser<'a> {
                     });
                 }
 
-                // Qualified column `table.col` (or `schema.table.col`)
+                // Qualified column `table.col` or `schema.table.col`
                 if self.eat(TokenKind::Dot) {
                     let second = self.parse_ident()?;
                     if self.eat(TokenKind::Dot) {
                         let third = self.parse_ident()?;
-                        let tbl_qual = if first.eq_ignore_ascii_case("main") && !self.in_vacuum_into
-                        {
-                            second
-                        } else {
-                            format!("{first}.{second}")
-                        };
-                        return Ok(Expr::Column {
-                            table: Some(tbl_qual),
-                            column: third,
-                        });
+                        return Ok(Expr::Column(ColumnRef::schema_table_qualified(
+                            first, second, third,
+                        )));
                     }
-                    return Ok(Expr::Column {
-                        table: Some(first),
-                        column: second,
-                    });
+                    return Ok(Expr::Column(ColumnRef::table_qualified(first, second)));
                 }
 
-                Ok(Expr::Column {
-                    table: None,
-                    column: first,
-                })
+                Ok(Expr::Column(ColumnRef::unqualified(first)))
             }
             _ => Err(self.syntax_err_at(tok, format!("near \"{}\": syntax error", tok.text))),
         }

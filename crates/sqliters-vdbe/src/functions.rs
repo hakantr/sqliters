@@ -49,8 +49,9 @@ fn next_prng_u64() -> u64 {
 }
 
 use sqliters_types::{
-    Collation, ErrorCode, Result, SQLITE_SOURCE_ID, SQLITE_VERSION, SqliteError, Value,
-    format_sqlite_real,
+    Collation, ErrorCode, FunctionFlags, Result, RuntimeValue, SQLITE_SOURCE_ID, SQLITE_VERSION,
+    SqliteError, Value, enforce_result_subtype_contract, format_sqlite_real,
+    strip_unsubscribed_subtypes,
 };
 
 /// Connection-level execution metadata exposed to SQL functions (`last_insert_rowid()`, `changes()`,
@@ -124,10 +125,186 @@ pub fn format_utc_timestamp(unix_ms: i64) -> String {
     format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}")
 }
 
-/// Evaluates a built-in SQLite scalar function (`func.c`).
-pub fn eval_scalar_function(name: &str, args: &[Value], ctx: &VmRuntimeContext) -> Result<Value> {
+/// Returns the [`FunctionFlags`] metadata for a built-in scalar SQL function (`func.c`), or
+/// `None` if `name` is not a recognized built-in scalar function.
+pub fn builtin_scalar_flags(name: &str, enable_test_functions: bool) -> Option<FunctionFlags> {
     let upper = name.to_ascii_uppercase();
     match upper.as_str() {
+        "SUBTYPE" => {
+            Some(FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS | FunctionFlags::SUBTYPE)
+        }
+        "COALESCE" | "IFNULL" | "NULLIF" | "IIF" | "IF" | "MIN" | "MAX" => Some(
+            FunctionFlags::DETERMINISTIC
+                | FunctionFlags::INNOCUOUS
+                | FunctionFlags::SUBTYPE
+                | FunctionFlags::RESULT_SUBTYPE,
+        ),
+        "TEST_SET_SUBTYPE" if enable_test_functions => Some(
+            FunctionFlags::DETERMINISTIC | FunctionFlags::SUBTYPE | FunctionFlags::RESULT_SUBTYPE,
+        ),
+        "TEST_BAD_SUBTYPE" if enable_test_functions => {
+            Some(FunctionFlags::DETERMINISTIC | FunctionFlags::SUBTYPE)
+        }
+        "TEST_PLAIN_ARG_SUBTYPE" if enable_test_functions => {
+            Some(FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS)
+        }
+        "RANDSTR" if enable_test_functions => Some(FunctionFlags::INNOCUOUS),
+        "RANDOM" | "RANDOMBLOB" | "LAST_INSERT_ROWID" | "CHANGES" | "TOTAL_CHANGES" => {
+            Some(FunctionFlags::INNOCUOUS)
+        }
+        "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" | "DATE" | "TIME" | "DATETIME"
+        | "UNIXEPOCH" | "JULIANDAY" | "STRFTIME" => Some(FunctionFlags::INNOCUOUS),
+        _ => scalar_function_arity_with_flag(&upper, enable_test_functions)
+            .map(|_| FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS),
+    }
+}
+
+/// Evaluates a built-in SQLite scalar function with [`RuntimeValue`] subtype semantics and strict
+/// `SQLITE_STRICT_SUBTYPE` checking enabled (`func.c`, `vdbeapi.c`).
+pub fn eval_scalar_function_rt(
+    name: &str,
+    args: &[RuntimeValue],
+    ctx: &VmRuntimeContext,
+) -> Result<RuntimeValue> {
+    eval_scalar_function_rt_with_strict(name, args, ctx, true)
+}
+
+/// Evaluates a built-in SQLite scalar function with [`RuntimeValue`] subtype semantics and
+/// configurable `strict_subtype` checking.
+pub fn eval_scalar_function_rt_with_strict(
+    name: &str,
+    args: &[RuntimeValue],
+    ctx: &VmRuntimeContext,
+    strict_subtype: bool,
+) -> Result<RuntimeValue> {
+    let flags = builtin_scalar_flags(name, ctx.enable_test_functions)
+        .ok_or_else(|| SqliteError::new(ErrorCode::Error, format!("no such function: {name}")))?;
+    let mut scratch = Vec::new();
+    let filtered = strip_unsubscribed_subtypes(flags, args, &mut scratch);
+    let upper = name.to_ascii_uppercase();
+    let canonical = name.to_ascii_lowercase();
+
+    let raw_out = match upper.as_str() {
+        "SUBTYPE" => {
+            check_arity_rt(name, filtered, 1, 1)?;
+            RuntimeValue::plain(Value::Integer(i64::from(filtered[0].subtype)))
+        }
+        "TEST_SET_SUBTYPE" if ctx.enable_test_functions => {
+            check_arity_rt(name, filtered, 2, 2)?;
+            let sub = filtered[1].value.to_integer_lossy() as u32;
+            RuntimeValue::with_subtype(filtered[0].value.clone(), sub)
+        }
+        "TEST_BAD_SUBTYPE" if ctx.enable_test_functions => {
+            check_arity_rt(name, filtered, 2, 2)?;
+            let sub = filtered[1].value.to_integer_lossy() as u32;
+            RuntimeValue::with_subtype(filtered[0].value.clone(), sub)
+        }
+        "TEST_PLAIN_ARG_SUBTYPE" if ctx.enable_test_functions => {
+            check_arity_rt(name, filtered, 1, 1)?;
+            RuntimeValue::plain(Value::Integer(i64::from(filtered[0].subtype)))
+        }
+        "COALESCE" | "IFNULL" => {
+            let min = 2;
+            let max = if upper == "IFNULL" { 2 } else { usize::MAX };
+            check_arity_rt(name, filtered, min, max)?;
+            filtered
+                .iter()
+                .find(|rv| !rv.value.is_null())
+                .cloned()
+                .unwrap_or_else(RuntimeValue::null)
+        }
+        "NULLIF" => {
+            check_arity_rt(name, filtered, 2, 2)?;
+            if filtered[0]
+                .value
+                .cmp_sqlite(&filtered[1].value, Collation::Binary)
+                .is_eq()
+            {
+                RuntimeValue::null()
+            } else {
+                filtered[0].clone()
+            }
+        }
+        "IIF" | "IF" => {
+            check_arity_rt(name, filtered, 2, usize::MAX)?;
+            let mut idx = 0;
+            let mut matched = None;
+            while idx + 1 < filtered.len() {
+                if filtered[idx].value.truthiness() == Some(true) {
+                    matched = Some(filtered[idx + 1].clone());
+                    break;
+                }
+                idx += 2;
+            }
+            matched.unwrap_or_else(|| {
+                if idx < filtered.len() {
+                    filtered[idx].clone()
+                } else {
+                    RuntimeValue::null()
+                }
+            })
+        }
+        "MAX" => {
+            check_arity_rt(name, filtered, 2, usize::MAX)?;
+            let mut best = &filtered[0];
+            let mut has_null = false;
+            for rv in filtered {
+                if rv.value.is_null() {
+                    has_null = true;
+                    break;
+                }
+                if rv.value.cmp_sqlite(&best.value, Collation::Binary).is_gt() {
+                    best = rv;
+                }
+            }
+            if has_null {
+                RuntimeValue::null()
+            } else {
+                best.clone()
+            }
+        }
+        "MIN" => {
+            check_arity_rt(name, filtered, 2, usize::MAX)?;
+            let mut best = &filtered[0];
+            let mut has_null = false;
+            for rv in filtered {
+                if rv.value.is_null() {
+                    has_null = true;
+                    break;
+                }
+                if rv.value.cmp_sqlite(&best.value, Collation::Binary).is_lt() {
+                    best = rv;
+                }
+            }
+            if has_null {
+                RuntimeValue::null()
+            } else {
+                best.clone()
+            }
+        }
+        _ => {
+            let plain_vals: Vec<Value> = filtered.iter().map(|rv| rv.value.clone()).collect();
+            let v = eval_scalar_function_plain(name, &upper, &plain_vals, ctx)?;
+            RuntimeValue::plain(v)
+        }
+    };
+
+    enforce_result_subtype_contract(&canonical, flags, strict_subtype, raw_out)
+}
+
+/// Evaluates a built-in SQLite scalar function (`func.c`), discarding any ephemeral result subtype.
+pub fn eval_scalar_function(name: &str, args: &[Value], ctx: &VmRuntimeContext) -> Result<Value> {
+    let rt_args: Vec<RuntimeValue> = args.iter().cloned().map(RuntimeValue::plain).collect();
+    eval_scalar_function_rt(name, &rt_args, ctx).map(|rv| rv.value)
+}
+
+fn eval_scalar_function_plain(
+    name: &str,
+    upper: &str,
+    args: &[Value],
+    ctx: &VmRuntimeContext,
+) -> Result<Value> {
+    match upper {
         "TYPEOF" => {
             check_arity(name, args, 1, 1)?;
             Ok(Value::Text(args[0].storage_class().typeof_str().to_owned()))
@@ -187,12 +364,19 @@ pub fn eval_scalar_function(name: &str, args: &[Value], ctx: &VmRuntimeContext) 
                 Ok(args[0].clone())
             }
         }
-        "IIF" => {
-            check_arity(name, args, 3, 3)?;
-            if args[0].truthiness() == Some(true) {
-                Ok(args[1].clone())
+        "IIF" | "IF" => {
+            check_arity(name, args, 2, usize::MAX)?;
+            let mut idx = 0;
+            while idx + 1 < args.len() {
+                if args[idx].truthiness() == Some(true) {
+                    return Ok(args[idx + 1].clone());
+                }
+                idx += 2;
+            }
+            if idx < args.len() {
+                Ok(args[idx].clone())
             } else {
-                Ok(args[2].clone())
+                Ok(Value::Null)
             }
         }
         "LENGTH" => {
@@ -238,7 +422,7 @@ pub fn eval_scalar_function(name: &str, args: &[Value], ctx: &VmRuntimeContext) 
             } else {
                 vec![' ']
             };
-            let trimmed = match upper.as_str() {
+            let trimmed = match upper {
                 "LTRIM" => s.trim_start_matches(cutset.as_slice()),
                 "RTRIM" => s.trim_end_matches(cutset.as_slice()),
                 _ => s.trim_matches(cutset.as_slice()),
@@ -563,13 +747,24 @@ pub fn eval_scalar_function(name: &str, args: &[Value], ctx: &VmRuntimeContext) 
             )))
         }
         "DATE" | "TIME" | "DATETIME" | "UNIXEPOCH" | "JULIANDAY" => {
-            eval_datetime_function(&upper, args, ctx)
+            eval_datetime_function(upper, args, ctx)
         }
         "STRFTIME" => eval_strftime_function(args, ctx),
         _ => Err(SqliteError::new(
             ErrorCode::Error,
             format!("no such function: {name}"),
         )),
+    }
+}
+
+fn check_arity_rt(name: &str, args: &[RuntimeValue], min: usize, max: usize) -> Result<()> {
+    if args.len() < min || args.len() > max {
+        Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("wrong number of arguments to function {name}()"),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -585,15 +780,25 @@ fn check_arity(name: &str, args: &[Value], min: usize, max: usize) -> Result<()>
 }
 
 fn scalar_function_arity(upper: &str) -> Option<(usize, usize)> {
+    scalar_function_arity_with_flag(upper, TEST_FUNCTIONS_ENABLED.with(Cell::get))
+}
+
+fn scalar_function_arity_with_flag(
+    upper: &str,
+    enable_test_functions: bool,
+) -> Option<(usize, usize)> {
     match upper {
-        "TYPEOF" | "ABS" | "SIGN" | "LENGTH" | "OCTET_LENGTH" | "LOWER" | "UPPER" | "HEX"
-        | "UNHEX" | "UNICODE" | "QUOTE" | "ZEROBLOB" | "RANDOMBLOB" => Some((1, 1)),
+        "TYPEOF" | "SUBTYPE" | "ABS" | "SIGN" | "LENGTH" | "OCTET_LENGTH" | "LOWER" | "UPPER"
+        | "HEX" | "UNHEX" | "UNICODE" | "QUOTE" | "ZEROBLOB" | "RANDOMBLOB" => Some((1, 1)),
         "RANDOM" | "SQLITE_VERSION" | "SQLITE_SOURCE_ID" | "LAST_INSERT_ROWID" | "CHANGES"
         | "TOTAL_CHANGES" | "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" => Some((0, 0)),
-        "COALESCE" => Some((2, usize::MAX)),
+        "COALESCE" | "IIF" | "IF" => Some((2, usize::MAX)),
         "IFNULL" | "NULLIF" | "INSTR" | "GLOB" => Some((2, 2)),
-        "RANDSTR" if TEST_FUNCTIONS_ENABLED.with(Cell::get) => Some((2, 2)),
-        "IIF" | "REPLACE" => Some((3, 3)),
+        "RANDSTR" | "TEST_SET_SUBTYPE" | "TEST_BAD_SUBTYPE" if enable_test_functions => {
+            Some((2, 2))
+        }
+        "TEST_PLAIN_ARG_SUBTYPE" if enable_test_functions => Some((1, 1)),
+        "REPLACE" => Some((3, 3)),
         "TRIM" | "LTRIM" | "RTRIM" | "ROUND" => Some((1, 2)),
         "SUBSTR" | "SUBSTRING" | "LIKE" => Some((2, 3)),
         "CHAR" | "DATE" | "TIME" | "DATETIME" | "UNIXEPOCH" | "JULIANDAY" | "STRFTIME" => {

@@ -10,34 +10,38 @@ use sqliters_pager::{
     WalCheckpointResult,
 };
 use sqliters_syntax::{
-    AlterTableAction, BinaryOp, BindParam, ColumnDef, CommonTableExpr, CompoundOp, ConflictAction,
-    CreateIndexStmt, CreateTableStmt, CurrentTimeKind, DeleteStmt, Expr, FkAction, FromClause,
-    FunctionArgs, IndexHint, InsertSource, InsertStmt, JoinClause, JoinConstraint, JoinType,
-    LikeOp, LimitClause, OrderByTerm, PragmaValue, ResultColumn, SelectBody, SelectCore,
-    SelectStmt, Stmt, TableOrSubquery, Token, TokenKind, UnaryOp, UpdateStmt, dequote,
-    keyword_kind, parse_one, tokenize,
+    AlterTableAction, BinaryOp, BindParam, ColumnDef, ColumnRef, CommonTableExpr, CompoundOp,
+    ConflictAction, CreateIndexStmt, CreateTableStmt, CurrentTimeKind, DeleteStmt, Expr, FkAction,
+    FromClause, FunctionArgs, IndexHint, InsertSource, InsertStmt, JoinClause, JoinConstraint,
+    JoinType, LikeOp, LimitClause, OrderByTerm, PragmaValue, QualifiedName, ResultColumn,
+    SelectBody, SelectCore, SelectStmt, Stmt, TableOrSubquery, Token, TokenKind, UnaryOp,
+    UpdateStmt, dequote, keyword_kind, parse_one, tokenize,
 };
 use sqliters_types::{
-    Collation, ConflictResolutionEffect, DatabaseKind, ErrorCode, KeySortOrder, Pgno, Result,
-    SqliteError, TextEncoding, TypeAffinity, Value, decode_record_with_encoding,
-    encode_record_with_encoding, extended,
+    Collation, ConflictResolutionEffect, DatabaseKind, ErrorCode, ExecutionServices, KeySortOrder,
+    Pgno, Result, RuntimeValue, SqliteError, TextEncoding, TypeAffinity, Value,
+    decode_record_with_encoding, encode_record_with_encoding, extended,
 };
 use sqliters_vdbe::{
-    AggregateAccumulator, AggregateKind, Opcode, VmRuntimeContext, eval_cast_with_encoding,
-    eval_comparison_with_affinity, eval_comparison_with_encoding, eval_scalar_function,
+    AggregateAccumulator, AggregateKind, Opcode, VmRuntimeContext, eval_cast_rt_with_encoding,
+    eval_comparison_with_affinity, eval_comparison_with_encoding, eval_comparison_with_services,
     eval_unary_negate, format_utc_date, format_utc_time, format_utc_timestamp, parse_escape_char,
-    sqlite_compare_affinity, sqlite_glob_match, sqlite_like_match, validate_function_call,
+    sqlite_compare_affinity, sqlite_glob_match, sqlite_like_match,
 };
 
 use crate::compiler::{
-    AccessPlan, choose_access_plan, compile_for_explain, explain_query_plan, expr_column_label,
-    expr_contains_aggregate,
+    AccessPlan, choose_access_plan, compile_for_explain_with_functions, explain_query_plan,
+    expr_column_label, expr_contains_aggregate,
+};
+use crate::execution_context::{
+    CollationRegistry, ExecutionContext, FunctionRegistry, ProgressTracker,
 };
 use crate::schema::{
     ColumnSchema, ForeignKeySchema, IndexSchema, Schema, TableRowKey, TableSchema,
     build_column_schema_from_def, build_index_schema_from_ast, build_table_schema_from_ast,
-    delete_schema_entry, insert_schema_entry, scan_index_incremental, scan_table_incremental,
-    update_schema_entry,
+    delete_schema_entry, insert_schema_entry, scan_index_incremental,
+    scan_index_incremental_with_services, scan_table_incremental,
+    scan_table_incremental_with_services, update_schema_entry,
 };
 
 /// Materialized result set (`column_names` + `rows`) produced by executing a statement.
@@ -160,6 +164,11 @@ pub struct ExecContext<'a> {
     pub btree: &'a mut Btree,
     pub schema: &'a mut Schema,
     pub runtime: &'a mut VmRuntimeContext,
+    pub interrupt_flag: &'a std::sync::atomic::AtomicBool,
+    pub functions: &'a FunctionRegistry,
+    pub collations: &'a CollationRegistry,
+    pub progress: &'a mut ProgressTracker,
+    pub strict_subtype: bool,
     pub explicit_tx: &'a mut bool,
     pub implicit_savepoint_tx: &'a mut bool,
     pub in_user_btree_tx: &'a mut bool,
@@ -191,16 +200,155 @@ impl ExecContext<'_> {
             *self.rollback_count,
         );
     }
+
+    #[inline]
+    pub(crate) fn step_tick(&mut self) -> Result<()> {
+        if self
+            .interrupt_flag
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(SqliteError::new(ErrorCode::Interrupt, "interrupted"));
+        }
+        self.progress.tick()
+    }
+
+    pub(crate) fn call_scalar_rt(
+        &mut self,
+        name: &str,
+        args: &[RuntimeValue],
+    ) -> Result<RuntimeValue> {
+        let enc = self.btree.encoding();
+        let mut svc = ExecutionContext {
+            interrupt_flag: self.interrupt_flag,
+            runtime: self.runtime,
+            encoding: enc,
+            functions: self.functions,
+            collations: self.collations,
+            progress: self.progress,
+            strict_subtype: self.strict_subtype,
+        };
+        svc.call_scalar(name, args)
+    }
+
+    pub(crate) fn scan_table(&mut self, root_pgno: Pgno) -> Result<Vec<(i64, Vec<u8>)>> {
+        let enc = self.btree.encoding();
+        let mut svc = ExecutionContext {
+            interrupt_flag: self.interrupt_flag,
+            runtime: self.runtime,
+            encoding: enc,
+            functions: self.functions,
+            collations: self.collations,
+            progress: self.progress,
+            strict_subtype: self.strict_subtype,
+        };
+        scan_table_incremental_with_services(self.btree, root_pgno, &mut svc)
+    }
+
+    pub(crate) fn scan_index(
+        &mut self,
+        root_pgno: Pgno,
+        orders: Vec<KeySortOrder>,
+    ) -> Result<Vec<Vec<u8>>> {
+        let enc = self.btree.encoding();
+        let mut svc = ExecutionContext {
+            interrupt_flag: self.interrupt_flag,
+            runtime: self.runtime,
+            encoding: enc,
+            functions: self.functions,
+            collations: self.collations,
+            progress: self.progress,
+            strict_subtype: self.strict_subtype,
+        };
+        scan_index_incremental_with_services(self.btree, root_pgno, orders, &mut svc)
+    }
+}
+
+/// Resolves `qn` against `schema` for `SELECT` / `IN [schema.]table` (`DatabaseId::MAIN` + empty `temp` catalog).
+/// Returns `(table_schema, resolved_schema_label)`.
+fn resolve_table_for_query(
+    schema: &Schema,
+    qn: &QualifiedName,
+) -> Result<(TableSchema, &'static str)> {
+    if let Some(ref s) = qn.schema {
+        if s.eq_ignore_ascii_case("temp") {
+            if Schema::is_schema_table_name(&qn.name) {
+                let mut t = TableSchema::sqlite_schema_table();
+                t.name = "sqlite_temp_schema".to_owned();
+                t.root_pgno = 0;
+                return Ok((t, "temp"));
+            }
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such table: {}", qn.display_name()),
+            ));
+        }
+        if s.eq_ignore_ascii_case("main") {
+            if Schema::is_temp_schema_table_name(&qn.name) {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such table: {}", qn.display_name()),
+                ));
+            }
+            if let Some(t) = schema.find_table(&qn.name) {
+                return Ok((t, "main"));
+            }
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such table: {}", qn.display_name()),
+            ));
+        }
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("no such table: {}", qn.display_name()),
+        ));
+    }
+    if Schema::is_temp_schema_table_name(&qn.name) {
+        let mut t = TableSchema::sqlite_schema_table();
+        t.name = "sqlite_temp_schema".to_owned();
+        t.root_pgno = 0;
+        return Ok((t, "temp"));
+    }
+    if let Some(t) = schema.find_table(&qn.name) {
+        return Ok((t, "main"));
+    }
+    Err(SqliteError::new(
+        ErrorCode::Error,
+        format!("no such table: {}", qn.name),
+    ))
 }
 
 #[derive(Debug, Clone)]
 struct ScopedColumn {
+    schema_name: Option<String>,
     table_alias: Option<String>,
     name: String,
     collation: Collation,
     affinity: Option<TypeAffinity>,
     hidden_rowid: bool,
     merged_using: bool,
+}
+
+impl ScopedColumn {
+    #[inline]
+    fn matches_qualifier(&self, schema_qual: Option<&str>, table_qual: Option<&str>) -> bool {
+        if let Some(sq) = schema_qual {
+            let Some(ref sn) = self.schema_name else {
+                return false;
+            };
+            if !sn.eq_ignore_ascii_case(sq) {
+                return false;
+            }
+        }
+        if let Some(tq) = table_qual {
+            let Some(ref ta) = self.table_alias else {
+                return false;
+            };
+            if !ta.eq_ignore_ascii_case(tq) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -220,7 +368,9 @@ impl Default for EvalRow {
 
 impl EvalRow {
     fn lookup(&self, qual: Option<&str>, col_name: &str) -> Result<Option<(Value, Collation)>> {
-        Ok(self.lookup_full(qual, col_name)?.map(|(v, c, _)| (v, c)))
+        Ok(self
+            .lookup_qual_full(None, qual, col_name)?
+            .map(|(v, c, _)| (v, c)))
     }
 
     fn lookup_full(
@@ -228,18 +378,35 @@ impl EvalRow {
         qual: Option<&str>,
         col_name: &str,
     ) -> Result<Option<(Value, Collation, Option<TypeAffinity>)>> {
+        self.lookup_qual_full(None, qual, col_name)
+    }
+
+    fn lookup_cref(&self, cref: &ColumnRef) -> Result<Option<(Value, Collation)>> {
+        Ok(self
+            .lookup_qual_full(cref.schema.as_deref(), cref.table.as_deref(), &cref.column)?
+            .map(|(v, c, _)| (v, c)))
+    }
+
+    fn lookup_cref_full(
+        &self,
+        cref: &ColumnRef,
+    ) -> Result<Option<(Value, Collation, Option<TypeAffinity>)>> {
+        self.lookup_qual_full(cref.schema.as_deref(), cref.table.as_deref(), &cref.column)
+    }
+
+    fn lookup_qual_full(
+        &self,
+        schema_qual: Option<&str>,
+        table_qual: Option<&str>,
+        col_name: &str,
+    ) -> Result<Option<(Value, Collation, Option<TypeAffinity>)>> {
         let mut matches = Vec::new();
         for (i, sc) in self.cols.iter().enumerate() {
             if sc.hidden_rowid {
                 continue;
             }
-            if let Some(q) = qual {
-                let Some(ref ta) = sc.table_alias else {
-                    continue;
-                };
-                if !ta.eq_ignore_ascii_case(q) {
-                    continue;
-                }
+            if !sc.matches_qualifier(schema_qual, table_qual) {
+                continue;
             }
             if sc.name.eq_ignore_ascii_case(col_name) {
                 matches.push((
@@ -248,7 +415,7 @@ impl EvalRow {
                     sc.affinity,
                     sc.merged_using,
                 ));
-                if qual.is_none() && sc.merged_using {
+                if schema_qual.is_none() && table_qual.is_none() && sc.merged_using {
                     // Deduplicated USING / NATURAL column takes unambiguous precedence
                     return Ok(Some((self.vals[i].clone(), sc.collation, sc.affinity)));
                 }
@@ -274,13 +441,8 @@ impl EvalRow {
                 if !sc.hidden_rowid {
                     continue;
                 }
-                if let Some(q) = qual {
-                    let Some(ref ta) = sc.table_alias else {
-                        continue;
-                    };
-                    if !ta.eq_ignore_ascii_case(q) {
-                        continue;
-                    }
+                if !sc.matches_qualifier(schema_qual, table_qual) {
+                    continue;
                 }
                 matches.push((
                     self.vals[i].clone(),
@@ -384,7 +546,9 @@ pub(crate) fn stmt_requires_schema(stmt: &Stmt) -> bool {
         | Stmt::Commit
         | Stmt::Rollback { .. }
         | Stmt::Savepoint(_)
-        | Stmt::Release(_) => false,
+        | Stmt::Release(_)
+        | Stmt::AttachDatabase { .. }
+        | Stmt::DetachDatabase { .. } => false,
         Stmt::Pragma { name, .. } => matches!(
             name.to_ascii_uppercase().as_str(),
             "TABLE_INFO"
@@ -450,7 +614,9 @@ pub(crate) fn classify_stmt_category(stmt: &Stmt) -> StmtCategory {
         | Stmt::Rollback { .. }
         | Stmt::Savepoint(_)
         | Stmt::Release(_) => StmtCategory::Control,
-        Stmt::Analyze(_) => StmtCategory::NoLockPragma,
+        Stmt::Analyze(_) | Stmt::AttachDatabase { .. } | Stmt::DetachDatabase { .. } => {
+            StmtCategory::NoLockPragma
+        }
         Stmt::Vacuum { .. } => StmtCategory::Vacuum,
         Stmt::Select(_) | Stmt::Explain { .. } => StmtCategory::Read,
         Stmt::Pragma {
@@ -739,10 +905,66 @@ pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
     }
 }
 
-/// Executes non-locking pragmas (`LOCK_STATUS`, `JOURNAL_MODE`, `SYNCHRONOUS`, etc.) and `ANALYZE`.
+fn validate_analyze_target(schema: &Schema, target: Option<&QualifiedName>) -> Result<()> {
+    let Some(qn) = target else {
+        return Ok(());
+    };
+    if let Some(ref s) = qn.schema {
+        if !s.eq_ignore_ascii_case("main") && !s.eq_ignore_ascii_case("temp") {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("unknown database {s}"),
+            ));
+        }
+        if s.eq_ignore_ascii_case("main") {
+            if !Schema::is_temp_schema_table_name(&qn.name)
+                && (Schema::is_schema_table_name(&qn.name)
+                    || schema.find_table(&qn.name).is_some()
+                    || schema.find_index(&qn.name).is_some())
+            {
+                return Ok(());
+            }
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such table: {}", qn.display_name()),
+            ));
+        }
+        if Schema::is_schema_table_name(&qn.name) {
+            return Ok(());
+        }
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("no such table: {}", qn.display_name()),
+        ));
+    }
+    if qn.name.eq_ignore_ascii_case("main")
+        || qn.name.eq_ignore_ascii_case("temp")
+        || schema.find_table(&qn.name).is_some()
+        || schema.find_index(&qn.name).is_some()
+    {
+        return Ok(());
+    }
+    Err(SqliteError::new(
+        ErrorCode::Error,
+        format!("no such table: {}", qn.name),
+    ))
+}
+
+/// Executes non-locking pragmas (`LOCK_STATUS`, `JOURNAL_MODE`, `SYNCHRONOUS`, etc.), `ANALYZE`, and `ATTACH`/`DETACH`.
 pub(crate) fn execute_nolock_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Result<QueryOutput> {
     match stmt {
-        Stmt::Analyze(_) => Ok(QueryOutput::default()),
+        Stmt::Analyze(target) => {
+            validate_analyze_target(ctx.schema, target.as_ref())?;
+            Ok(QueryOutput::default())
+        }
+        Stmt::AttachDatabase { .. } => Err(SqliteError::new(
+            ErrorCode::Error,
+            "ATTACH DATABASE is not yet supported before DatabaseSet (Step 2-C)",
+        )),
+        Stmt::DetachDatabase { .. } => Err(SqliteError::new(
+            ErrorCode::Error,
+            "DETACH DATABASE is not yet supported before DatabaseSet (Step 2-C)",
+        )),
         Stmt::Pragma {
             schema,
             name,
@@ -773,7 +995,7 @@ pub(crate) fn execute_read_body(
                     rows,
                 })
             } else {
-                let prog = compile_for_explain(stmt, ctx.schema)?;
+                let prog = compile_for_explain_with_functions(stmt, ctx.schema, ctx.functions)?;
                 Ok(QueryOutput {
                     column_names: vec![
                         "addr".to_owned(),
@@ -815,11 +1037,12 @@ pub(crate) fn execute_write_body(
             Ok(QueryOutput::default())
         }
         Stmt::CreateTableAs {
+            temp,
             if_not_exists,
             name,
             query,
         } => {
-            exec_create_table_as(ctx, *if_not_exists, name, query, params)?;
+            exec_create_table_as(ctx, *temp, *if_not_exists, name, query, params)?;
             Ok(QueryOutput::default())
         }
         Stmt::DropTable { if_exists, name } => {
@@ -839,7 +1062,7 @@ pub(crate) fn execute_write_body(
             Ok(QueryOutput::default())
         }
         Stmt::Reindex(target) => {
-            exec_reindex(ctx, target.as_deref())?;
+            exec_reindex(ctx, target.as_ref())?;
             Ok(QueryOutput::default())
         }
         Stmt::Pragma {
@@ -1277,7 +1500,8 @@ fn exec_select(
             _ => false,
         })
         && let TableOrSubquery::Table { name, .. } = &fc.head
-        && let Some((s_idx, c_idx)) = ctes.locate(name)
+        && name.schema.is_none()
+        && let Some((s_idx, c_idx)) = ctes.locate(&name.name)
     {
         let lim_val =
             eval_expr(ctx, &lim.limit, params, outer_scopes, &ctes, None)?.to_integer_lossy();
@@ -1397,7 +1621,9 @@ fn count_table_refs_in_core(core: &SelectCore, target: &str) -> usize {
 
 fn count_table_refs_in_tos(tos: &TableOrSubquery, target: &str) -> usize {
     match tos {
-        TableOrSubquery::Table { name, .. } => usize::from(name.eq_ignore_ascii_case(target)),
+        TableOrSubquery::Table { name, .. } => {
+            usize::from(name.schema.is_none() && name.name.eq_ignore_ascii_case(target))
+        }
         TableOrSubquery::Subquery { query, .. } => count_table_refs_in_select(query, target),
     }
 }
@@ -1429,6 +1655,10 @@ fn count_table_refs_in_expr(expr: &Expr, target: &str) -> usize {
         Expr::InSubquery {
             expr: e, subquery, ..
         } => count_table_refs_in_expr(e, target) + count_table_refs_in_select(subquery, target),
+        Expr::InTable { expr: e, table, .. } => {
+            count_table_refs_in_expr(e, target)
+                + usize::from(table.schema.is_none() && table.name.eq_ignore_ascii_case(target))
+        }
         Expr::Like {
             expr: e,
             pattern,
@@ -1500,12 +1730,12 @@ fn classify_cte_recursion(cte: &CommonTableExpr) -> CteRecursionKind {
     let rhs_total = count_table_refs_in_core(last_rhs, &cte.name);
     let mut direct_from_refs = 0usize;
     if let SelectCore::Select { from: Some(fc), .. } = last_rhs {
-        if matches!(&fc.head, TableOrSubquery::Table { name, .. } if name.eq_ignore_ascii_case(&cte.name))
+        if matches!(&fc.head, TableOrSubquery::Table { name, .. } if name.schema.is_none() && name.name.eq_ignore_ascii_case(&cte.name))
         {
             direct_from_refs += 1;
         }
         for j in &fc.joins {
-            if matches!(&j.right, TableOrSubquery::Table { name, .. } if name.eq_ignore_ascii_case(&cte.name))
+            if matches!(&j.right, TableOrSubquery::Table { name, .. } if name.schema.is_none() && name.name.eq_ignore_ascii_case(&cte.name))
             {
                 direct_from_refs += 1;
             }
@@ -1731,6 +1961,7 @@ fn exec_recursive_cte(
     let row_scoped_cols: Rc<[ScopedColumn]> = working_col_names
         .iter()
         .map(|cn| ScopedColumn {
+            schema_name: None,
             table_alias: Some(cte.name.clone()),
             name: cn.clone(),
             collation: Collation::Binary,
@@ -1812,7 +2043,7 @@ fn exec_recursive_cte(
     let mut steps = 0usize;
 
     while let Some((cur_row, _)) = queue.pop_front() {
-        ctx.btree.check_interrupted()?;
+        ctx.step_tick()?;
         steps += 1;
         if steps > MAX_RECURSIVE_CTE_STEPS {
             return Err(SqliteError::new(
@@ -2065,6 +2296,7 @@ fn exec_single_select_core(
             let mut filtered = Vec::with_capacity(source_rows.len());
             if let Some(where_expr) = selection {
                 for r in source_rows {
+                    ctx.step_tick()?;
                     let scopes = push_scope(outer_scopes, &r);
                     let v = eval_expr(ctx, where_expr, params, &scopes, ctes, None)?;
                     if v.truthiness() == Some(true) {
@@ -2250,6 +2482,7 @@ fn exec_single_select_core(
                     }
                 }
                 for row in filtered {
+                    ctx.step_tick()?;
                     let scopes = push_scope(outer_scopes, &row);
                     let mut out_vals = Vec::with_capacity(expanded_proj.len());
                     for (pe, _, _) in &expanded_proj {
@@ -2322,20 +2555,69 @@ fn exec_single_select_core(
 
             if !order_by.is_empty() {
                 let enc = ctx.btree.encoding();
-                let specs: Vec<KeySortOrder> = order_by
+                let specs: Vec<(KeySortOrder, Option<String>)> = order_by
                     .iter()
                     .map(|ob| {
+                        let custom_coll = match &ob.expr {
+                            Expr::Collate { collation, .. }
+                                if Collation::from_name(collation).is_none() =>
+                            {
+                                Some(collation.clone())
+                            }
+                            _ => None,
+                        };
                         let coll = infer_order_by_collation(&ob.expr, &expanded_proj, &sample_cols);
-                        KeySortOrder {
-                            desc: ob.desc,
-                            nulls_last: ob.nulls_last.unwrap_or(ob.desc),
-                            collation: coll,
-                        }
+                        (
+                            KeySortOrder {
+                                desc: ob.desc,
+                                nulls_last: ob.nulls_last.unwrap_or(ob.desc),
+                                collation: coll,
+                            },
+                            custom_coll,
+                        )
                     })
                     .collect();
 
-                result_rows_with_sort
-                    .sort_by(|(_, sa), (_, sb)| compare_value_slices(sa, sb, &specs, enc));
+                let collations = ctx.collations;
+                result_rows_with_sort.sort_by(|(_, sa), (_, sb)| {
+                    for (i, (spec, custom_opt)) in specs.iter().enumerate() {
+                        let a = &sa[i];
+                        let b = &sb[i];
+                        let ord = match (a.is_null(), b.is_null()) {
+                            (true, true) => Ordering::Equal,
+                            (true, false) => {
+                                if spec.nulls_last {
+                                    Ordering::Greater
+                                } else {
+                                    Ordering::Less
+                                }
+                            }
+                            (false, true) => {
+                                if spec.nulls_last {
+                                    Ordering::Less
+                                } else {
+                                    Ordering::Greater
+                                }
+                            }
+                            (false, false) => {
+                                let raw = if let (Some(cname), Value::Text(ls), Value::Text(rs)) =
+                                    (custom_opt.as_deref(), a, b)
+                                {
+                                    collations
+                                        .compare(cname, ls, rs, enc)
+                                        .unwrap_or(Ordering::Equal)
+                                } else {
+                                    a.cmp_sqlite_with_encoding(b, spec.collation, enc)
+                                };
+                                if spec.desc { raw.reverse() } else { raw }
+                            }
+                        };
+                        if ord != Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    Ordering::Equal
+                });
             }
 
             let out_rows: Vec<Vec<Value>> =
@@ -2510,26 +2792,17 @@ fn split_where_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     }
 }
 
-fn resolve_unique_col_idx(
-    cols: &[ScopedColumn],
-    qual: Option<&str>,
-    col_name: &str,
-) -> Result<Option<usize>> {
+fn resolve_unique_col_idx_cref(cols: &[ScopedColumn], cref: &ColumnRef) -> Result<Option<usize>> {
     let mut found = Vec::new();
     for (i, sc) in cols.iter().enumerate() {
         if sc.hidden_rowid {
             continue;
         }
-        if let Some(q) = qual {
-            let Some(ref ta) = sc.table_alias else {
-                continue;
-            };
-            if !ta.eq_ignore_ascii_case(q) {
-                continue;
-            }
+        if !sc.matches_qualifier(cref.schema.as_deref(), cref.table.as_deref()) {
+            continue;
         }
-        if sc.name.eq_ignore_ascii_case(col_name) {
-            if qual.is_none() && sc.merged_using {
+        if sc.name.eq_ignore_ascii_case(&cref.column) {
+            if cref.schema.is_none() && cref.table.is_none() && sc.merged_using {
                 return Ok(Some(i));
             }
             found.push(i);
@@ -2541,24 +2814,19 @@ fn resolve_unique_col_idx(
     if found.len() > 1 {
         return Err(SqliteError::new(
             ErrorCode::Error,
-            format!("ambiguous column name: {col_name}"),
+            format!("ambiguous column name: {}", cref.column),
         ));
     }
-    if col_name.eq_ignore_ascii_case("rowid")
-        || col_name.eq_ignore_ascii_case("_rowid_")
-        || col_name.eq_ignore_ascii_case("oid")
+    if cref.column.eq_ignore_ascii_case("rowid")
+        || cref.column.eq_ignore_ascii_case("_rowid_")
+        || cref.column.eq_ignore_ascii_case("oid")
     {
         for (i, sc) in cols.iter().enumerate() {
             if !sc.hidden_rowid {
                 continue;
             }
-            if let Some(q) = qual {
-                let Some(ref ta) = sc.table_alias else {
-                    continue;
-                };
-                if !ta.eq_ignore_ascii_case(q) {
-                    continue;
-                }
+            if !sc.matches_qualifier(cref.schema.as_deref(), cref.table.as_deref()) {
+                continue;
             }
             found.push(i);
         }
@@ -2568,7 +2836,7 @@ fn resolve_unique_col_idx(
         if found.len() > 1 {
             return Err(SqliteError::new(
                 ErrorCode::Error,
-                format!("ambiguous column name: {col_name}"),
+                format!("ambiguous column name: {}", cref.column),
             ));
         }
     }
@@ -2591,54 +2859,53 @@ fn expr_can_eval_with_cols(
         | Expr::CurrentTimeKw(_)
         | Expr::Bind(_) => true,
         Expr::Subquery(_) | Expr::Exists { .. } => false,
-        Expr::Column { table, column } => {
-            match resolve_unique_col_idx(full_scope_cols, table.as_deref(), column) {
-                Err(_) => false, // Ambiguous in full join scope: do NOT push down!
-                Ok(Some(full_idx)) => {
-                    let full_sc = &full_scope_cols[full_idx];
-                    if full_sc.merged_using {
-                        return false;
-                    }
-                    match resolve_unique_col_idx(avail_cols, table.as_deref(), column) {
-                        Ok(Some(avail_idx)) => {
-                            let avail_sc = &avail_cols[avail_idx];
-                            !avail_sc.merged_using
-                                && avail_sc.table_alias == full_sc.table_alias
-                                && avail_sc.name == full_sc.name
-                                && avail_sc.hidden_rowid == full_sc.hidden_rowid
-                        }
-                        _ => false,
-                    }
+        Expr::Column(cref) => match resolve_unique_col_idx_cref(full_scope_cols, cref) {
+            Err(_) => false, // Ambiguous in full join scope: do NOT push down!
+            Ok(Some(full_idx)) => {
+                let full_sc = &full_scope_cols[full_idx];
+                if full_sc.merged_using {
+                    return false;
                 }
-                Ok(None) => {
-                    // Not in `full_scope_cols`: resolves in `outer_scopes` iff unambiguous there
-                    // and not accidentally matching anything in `avail_cols`.
-                    if resolve_unique_col_idx(avail_cols, table.as_deref(), column)
-                        .ok()
-                        .flatten()
-                        .is_some()
-                    {
-                        return false;
+                match resolve_unique_col_idx_cref(avail_cols, cref) {
+                    Ok(Some(avail_idx)) => {
+                        let avail_sc = &avail_cols[avail_idx];
+                        !avail_sc.merged_using
+                            && avail_sc.schema_name == full_sc.schema_name
+                            && avail_sc.table_alias == full_sc.table_alias
+                            && avail_sc.name == full_sc.name
+                            && avail_sc.hidden_rowid == full_sc.hidden_rowid
                     }
-                    outer_scopes
-                        .iter()
-                        .rev()
-                        .find_map(|os| match os.lookup_full(table.as_deref(), column) {
-                            Err(_) => Some(false),
-                            Ok(Some(_)) => Some(true),
-                            Ok(None) => None,
-                        })
-                        .unwrap_or(false)
+                    _ => false,
                 }
             }
-        }
+            Ok(None) => {
+                // Not in `full_scope_cols`: resolves in `outer_scopes` iff unambiguous there
+                // and not accidentally matching anything in `avail_cols`.
+                if resolve_unique_col_idx_cref(avail_cols, cref)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    return false;
+                }
+                outer_scopes
+                    .iter()
+                    .rev()
+                    .find_map(|os| match os.lookup_cref_full(cref) {
+                        Err(_) => Some(false),
+                        Ok(Some(_)) => Some(true),
+                        Ok(None) => None,
+                    })
+                    .unwrap_or(false)
+            }
+        },
         Expr::Unary { expr: inner, .. }
         | Expr::Collate { expr: inner, .. }
         | Expr::IsNull { expr: inner, .. }
         | Expr::Cast { expr: inner, .. } => {
             expr_can_eval_with_cols(inner, avail_cols, full_scope_cols, outer_scopes)
         }
-        Expr::Binary { left, right, .. } => {
+        Expr::Binary { left, op: _, right } => {
             expr_can_eval_with_cols(left, avail_cols, full_scope_cols, outer_scopes)
                 && expr_can_eval_with_cols(right, avail_cols, full_scope_cols, outer_scopes)
         }
@@ -2655,7 +2922,7 @@ fn expr_can_eval_with_cols(
                     expr_can_eval_with_cols(it, avail_cols, full_scope_cols, outer_scopes)
                 })
         }
-        Expr::InSubquery { .. } => false,
+        Expr::InSubquery { .. } | Expr::InTable { .. } => false,
         Expr::Like {
             expr: e,
             pattern,
@@ -2857,15 +3124,17 @@ fn eval_table_or_subquery(
             alias,
             indexed_by,
         } => {
-            let eff_alias = alias.clone().unwrap_or_else(|| name.clone());
-            if let Some(cte_out) = resolve_cte(ctx, ctes, name, params, outer_scopes)? {
+            let eff_alias = alias.clone().unwrap_or_else(|| name.name.clone());
+            if name.schema.is_none()
+                && let Some(cte_out) = resolve_cte(ctx, ctes, &name.name, params, outer_scopes)?
+            {
                 if indexed_by.is_some() {
                     return Err(SqliteError::new(
                         ErrorCode::Error,
                         "cannot use INDEXED BY or NOT INDEXED on CTE or view",
                     ));
                 }
-                let cte_meta = infer_cte_meta_by_name(name, outer_scopes, ctx.schema, ctes);
+                let cte_meta = infer_cte_meta_by_name(&name.name, outer_scopes, ctx.schema, ctes);
                 let cols: Rc<[ScopedColumn]> = cte_out
                     .column_names
                     .iter()
@@ -2876,6 +3145,7 @@ fn eval_table_or_subquery(
                             .copied()
                             .unwrap_or((None, Collation::Binary));
                         ScopedColumn {
+                            schema_name: None,
                             table_alias: Some(eff_alias.clone()),
                             name: cn.clone(),
                             collation: coll,
@@ -2896,28 +3166,28 @@ fn eval_table_or_subquery(
                     .collect());
             }
 
-            let Some(tbl) = ctx.schema.find_table(name) else {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    format!("no such table: {name}"),
-                ));
-            };
+            let (tbl, schema_lbl) = resolve_table_for_query(ctx.schema, name)?;
 
-            let raw_entries = read_table_with_plan(
-                ctx,
-                &tbl,
-                alias.as_deref(),
-                indexed_by.as_ref(),
-                where_hint,
-                params,
-                outer_scopes,
-                ctes,
-            )?;
+            let raw_entries = if tbl.root_pgno == 0 {
+                Vec::new()
+            } else {
+                read_table_with_plan(
+                    ctx,
+                    &tbl,
+                    alias.as_deref(),
+                    indexed_by.as_ref(),
+                    where_hint,
+                    params,
+                    outer_scopes,
+                    ctes,
+                )?
+            };
 
             let mut cols: Vec<ScopedColumn> = tbl
                 .columns
                 .iter()
                 .map(|c| ScopedColumn {
+                    schema_name: Some(schema_lbl.to_owned()),
                     table_alias: Some(eff_alias.clone()),
                     name: c.name.clone(),
                     collation: c.collation,
@@ -2928,6 +3198,7 @@ fn eval_table_or_subquery(
                 .collect();
             if !tbl.without_rowid {
                 cols.push(ScopedColumn {
+                    schema_name: Some(schema_lbl.to_owned()),
                     table_alias: Some(eff_alias),
                     name: "rowid".to_owned(),
                     collation: Collation::Binary,
@@ -2964,6 +3235,7 @@ fn eval_table_or_subquery(
                         .copied()
                         .unwrap_or((None, Collation::Binary));
                     ScopedColumn {
+                        schema_name: None,
                         table_alias: alias.clone(),
                         name: cn.clone(),
                         collation: coll,
@@ -3030,8 +3302,7 @@ fn read_table_with_plan(
                     return Ok(Vec::new());
                 }
                 let enc = ctx.btree.encoding();
-                let entries =
-                    scan_index_incremental(ctx.btree, idx.root_pgno, idx.key_sort_orders())?;
+                let entries = ctx.scan_index(idx.root_pgno, idx.key_sort_orders())?;
                 let mut rows = Vec::with_capacity(entries.len());
                 for rec_bytes in entries {
                     let fields = decode_record_with_encoding(&rec_bytes, enc)?;
@@ -3253,23 +3524,19 @@ fn try_build_equi_hash_index(
     eligible_right: &[usize],
 ) -> Option<EquiHashIndex> {
     let resolve_side = |e: &Expr| -> Option<(bool, usize)> {
-        let Expr::Column { table, column } = e else {
+        let Expr::Column(cref) = e else {
             return None;
         };
         // Must resolve unambiguously in `merged_cols` first!
-        let m_idx = resolve_unique_col_idx(merged_cols, table.as_deref(), column)
+        let m_idx = resolve_unique_col_idx_cref(merged_cols, cref)
             .ok()
             .flatten()?;
         let m_sc = &merged_cols[m_idx];
         if m_sc.merged_using || m_sc.collation != Collation::Binary {
             return None;
         }
-        let in_l = resolve_unique_col_idx(left_cols, table.as_deref(), column)
-            .ok()
-            .flatten();
-        let in_r = resolve_unique_col_idx(right_cols, table.as_deref(), column)
-            .ok()
-            .flatten();
+        let in_l = resolve_unique_col_idx_cref(left_cols, cref).ok().flatten();
+        let in_r = resolve_unique_col_idx_cref(right_cols, cref).ok().flatten();
         match (in_l, in_r) {
             (Some(li), None) if left_cols[li].collation == Collation::Binary => Some((true, li)),
             (None, Some(ri)) if right_cols[ri].collation == Collation::Binary => Some((false, ri)),
@@ -3457,7 +3724,7 @@ fn apply_join(
     let mut right_matched = vec![false; right_rows.len()];
 
     for l in &left_rows {
-        ctx.btree.check_interrupted()?;
+        ctx.step_tick()?;
         let mut any_match = false;
         let mut left_ok = true;
         if !right_rows.is_empty() && !left_only_conjuncts.is_empty() {
@@ -3484,6 +3751,7 @@ fn apply_join(
             };
 
             for &ri in candidates {
+                ctx.step_tick()?;
                 let r = &right_rows[ri];
                 let mut candidate_opt: Option<EvalRow> = None;
                 let matches = if !using_cols.is_empty() {
@@ -3620,9 +3888,11 @@ fn schema_cols_for_tos(
 ) -> Option<Vec<ScopedColumn>> {
     match tos {
         TableOrSubquery::Table { name, alias, .. } => {
-            let eff = alias.clone().unwrap_or_else(|| name.clone());
-            if let Ok(Some(cte)) = resolve_cte(ctx, ctes, name, params, outer_scopes) {
-                let cte_meta = infer_cte_meta_by_name(name, outer_scopes, ctx.schema, ctes);
+            let eff = alias.clone().unwrap_or_else(|| name.name.clone());
+            if name.schema.is_none()
+                && let Ok(Some(cte)) = resolve_cte(ctx, ctes, &name.name, params, outer_scopes)
+            {
+                let cte_meta = infer_cte_meta_by_name(&name.name, outer_scopes, ctx.schema, ctes);
                 return Some(
                     cte.column_names
                         .iter()
@@ -3633,6 +3903,7 @@ fn schema_cols_for_tos(
                                 .copied()
                                 .unwrap_or((None, Collation::Binary));
                             ScopedColumn {
+                                schema_name: None,
                                 table_alias: Some(eff.clone()),
                                 name: cn.clone(),
                                 collation: coll,
@@ -3644,11 +3915,12 @@ fn schema_cols_for_tos(
                         .collect(),
                 );
             }
-            let tbl = ctx.schema.find_table(name)?;
+            let (tbl, schema_lbl) = resolve_table_for_query(ctx.schema, name).ok()?;
             let mut cols: Vec<ScopedColumn> = tbl
                 .columns
                 .iter()
                 .map(|c| ScopedColumn {
+                    schema_name: Some(schema_lbl.to_owned()),
                     table_alias: Some(eff.clone()),
                     name: c.name.clone(),
                     collation: c.collation,
@@ -3659,6 +3931,7 @@ fn schema_cols_for_tos(
                 .collect();
             if !tbl.without_rowid {
                 cols.push(ScopedColumn {
+                    schema_name: Some(schema_lbl.to_owned()),
                     table_alias: Some(eff),
                     name: "rowid".to_owned(),
                     collation: Collation::Binary,
@@ -3683,6 +3956,7 @@ fn schema_cols_for_tos(
                             .copied()
                             .unwrap_or((None, Collation::Binary));
                         ScopedColumn {
+                            schema_name: None,
                             table_alias: alias.clone(),
                             name: cn.clone(),
                             collation: coll,
@@ -3695,6 +3969,23 @@ fn schema_cols_for_tos(
             )
         }
     }
+}
+
+#[allow(clippy::type_complexity)]
+fn expand_returning_projection(
+    projection: &[ResultColumn],
+    sample_cols: &[ScopedColumn],
+) -> Result<(Vec<String>, Vec<(Expr, String, Option<String>)>)> {
+    if projection
+        .iter()
+        .any(|rc| matches!(rc, ResultColumn::TableStar { .. }))
+    {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            "RETURNING may not use \"TABLE.*\" wildcards",
+        ));
+    }
+    expand_projection(projection, sample_cols)
 }
 
 #[allow(clippy::type_complexity)]
@@ -3711,42 +4002,51 @@ fn expand_projection(
                     if sc.hidden_rowid {
                         continue;
                     }
-                    let e = Expr::Column {
+                    let e = Expr::Column(ColumnRef {
+                        schema: if sc.merged_using {
+                            None
+                        } else {
+                            sc.schema_name.clone()
+                        },
                         table: if sc.merged_using {
                             None
                         } else {
                             sc.table_alias.clone()
                         },
                         column: sc.name.clone(),
-                    };
+                    });
                     names.push(sc.name.clone());
                     expanded.push((e, sc.name.clone(), None));
                 }
             }
-            ResultColumn::TableStar(tname) => {
+            ResultColumn::TableStar {
+                schema: tschema,
+                table: tname,
+            } => {
                 let mut found = false;
                 for sc in sample_cols {
                     if sc.hidden_rowid {
                         continue;
                     }
-                    if sc
-                        .table_alias
-                        .as_ref()
-                        .is_some_and(|ta| ta.eq_ignore_ascii_case(tname))
-                    {
+                    if sc.matches_qualifier(tschema.as_deref(), Some(tname)) {
                         found = true;
-                        let e = Expr::Column {
+                        let e = Expr::Column(ColumnRef {
+                            schema: tschema.clone(),
                             table: Some(tname.clone()),
                             column: sc.name.clone(),
-                        };
+                        });
                         names.push(sc.name.clone());
                         expanded.push((e, sc.name.clone(), None));
                     }
                 }
-                if !found && !sample_cols.is_empty() {
+                if !found {
+                    let disp = match tschema {
+                        Some(s) => format!("{s}.{tname}"),
+                        None => tname.clone(),
+                    };
                     return Err(SqliteError::new(
                         ErrorCode::Error,
-                        format!("no such table: {tname}"),
+                        format!("no such table: {disp}"),
                     ));
                 }
             }
@@ -3778,6 +4078,7 @@ fn build_groups(
 
     let mut groups: Vec<(Vec<Value>, Vec<Collation>, Vec<EvalRow>)> = Vec::new();
     for row in rows {
+        ctx.step_tick()?;
         let scopes = push_scope(outer_scopes, &row);
         let mut g_vals = Vec::with_capacity(group_by.len());
         let mut g_colls = Vec::with_capacity(group_by.len());
@@ -3787,9 +4088,7 @@ fn build_groups(
                 Expr::Collate { collation, .. } => {
                     Collation::from_name(collation).unwrap_or_default()
                 }
-                Expr::Column { table, column } => row
-                    .lookup(table.as_deref(), column)?
-                    .map_or(Collation::Binary, |(_, c)| c),
+                Expr::Column(cref) => row.lookup_cref(cref)?.map_or(Collation::Binary, |(_, c)| c),
                 _ => Collation::Binary,
             };
             g_vals.push(v);
@@ -3834,20 +4133,15 @@ fn build_groups(
 fn infer_expr_collation_from_cols(expr: &Expr, sample_cols: &[ScopedColumn]) -> Collation {
     match expr {
         Expr::Collate { collation, .. } => Collation::from_name(collation).unwrap_or_default(),
-        Expr::Column { table, column } => {
+        Expr::Column(cref) => {
             for sc in sample_cols {
                 if sc.hidden_rowid {
                     continue;
                 }
-                if let Some(q) = table
-                    && !sc
-                        .table_alias
-                        .as_ref()
-                        .is_some_and(|ta| ta.eq_ignore_ascii_case(q))
-                {
+                if !sc.matches_qualifier(cref.schema.as_deref(), cref.table.as_deref()) {
                     continue;
                 }
-                if sc.name.eq_ignore_ascii_case(column) {
+                if sc.name.eq_ignore_ascii_case(&cref.column) {
                     return sc.collation;
                 }
             }
@@ -3871,10 +4165,11 @@ fn infer_order_by_collation(
     {
         return infer_expr_collation_from_cols(&expanded_proj[(*ord as usize) - 1].0, sample_cols);
     }
-    if let Expr::Column {
+    if let Expr::Column(ColumnRef {
+        schema: None,
         table: None,
         column,
-    } = ob_expr
+    }) = ob_expr
         && let Some((idx, _)) = expanded_proj
             .iter()
             .enumerate()
@@ -3914,10 +4209,11 @@ fn eval_order_term_in_scope(
     {
         return Ok(proj_vals[(*ord as usize) - 1].clone());
     }
-    if let Expr::Column {
+    if let Expr::Column(ColumnRef {
+        schema: None,
         table: None,
         column,
-    } = inner
+    }) = inner
         && let Some((idx, _)) = expanded_proj
             .iter()
             .enumerate()
@@ -3963,10 +4259,11 @@ fn subst_order_by_aliases_in_expr(
     scopes: &[EvalRow],
 ) -> Expr {
     match expr {
-        Expr::Column {
+        Expr::Column(ColumnRef {
+            schema: None,
             table: None,
             column,
-        } => {
+        }) => {
             let in_row = scopes
                 .last()
                 .and_then(|r| r.lookup(None, column).ok().flatten())
@@ -4232,10 +4529,11 @@ fn sort_materialized_output(
             continue;
         }
         let target_label = match inner {
-            Expr::Column {
+            Expr::Column(ColumnRef {
+                schema: None,
                 table: None,
                 column,
-            } => Some(column.clone()),
+            }) => Some(column.clone()),
             other => Some(expr_column_label(other)),
         };
         let col_idx = target_label
@@ -4331,10 +4629,11 @@ fn subst_select_aliases_in_expr(
     outer_scopes: &[EvalRow],
 ) -> Expr {
     match expr {
-        Expr::Column {
+        Expr::Column(ColumnRef {
+            schema: None,
             table: None,
             column,
-        } => {
+        }) => {
             let in_sample = sample_cols.iter().any(|sc| {
                 if sc.hidden_rowid {
                     column.eq_ignore_ascii_case("rowid")
@@ -4461,6 +4760,20 @@ fn subst_select_aliases_in_expr(
                 outer_scopes,
             )),
             subquery: subquery.clone(),
+            negated: *negated,
+        },
+        Expr::InTable {
+            expr: le,
+            table,
+            negated,
+        } => Expr::InTable {
+            expr: Box::new(subst_select_aliases_in_expr(
+                le,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            table: table.clone(),
             negated: *negated,
         },
         Expr::Like {
@@ -4760,13 +5073,15 @@ fn static_schema_cols_for_tos(
 ) -> Option<Vec<ScopedColumn>> {
     match tos {
         TableOrSubquery::Table { name, alias, .. } => {
-            let eff = alias.clone().unwrap_or_else(|| name.clone());
-            if let Some((s_idx, c_idx)) = ctes.locate(name) {
+            let eff = alias.clone().unwrap_or_else(|| name.name.clone());
+            if name.schema.is_none()
+                && let Some((s_idx, c_idx)) = ctes.locate(&name.name)
+            {
                 if visited.contains(&(s_idx, c_idx)) {
                     return None;
                 }
                 let cte = &ctes.scopes[s_idx][c_idx];
-                let meta = infer_cte_meta_guarded(name, outer_scopes, schema, ctes, visited);
+                let meta = infer_cte_meta_guarded(&name.name, outer_scopes, schema, ctes, visited);
                 let cnames: Vec<String> = if let Some(ref explicit) = cte.columns {
                     explicit.clone()
                 } else {
@@ -4798,6 +5113,7 @@ fn static_schema_cols_for_tos(
                             let (aff, coll) =
                                 meta.get(i).copied().unwrap_or((None, Collation::Binary));
                             ScopedColumn {
+                                schema_name: None,
                                 table_alias: Some(eff.clone()),
                                 name: cn,
                                 collation: coll,
@@ -4809,11 +5125,12 @@ fn static_schema_cols_for_tos(
                         .collect(),
                 );
             }
-            let tbl = schema.find_table(name)?;
+            let (tbl, schema_lbl) = resolve_table_for_query(schema, name).ok()?;
             let mut cols: Vec<ScopedColumn> = tbl
                 .columns
                 .iter()
                 .map(|c| ScopedColumn {
+                    schema_name: Some(schema_lbl.to_owned()),
                     table_alias: Some(eff.clone()),
                     name: c.name.clone(),
                     collation: c.collation,
@@ -4824,6 +5141,7 @@ fn static_schema_cols_for_tos(
                 .collect();
             if !tbl.without_rowid {
                 cols.push(ScopedColumn {
+                    schema_name: Some(schema_lbl.to_owned()),
                     table_alias: Some(eff),
                     name: "rowid".to_owned(),
                     collation: Collation::Binary,
@@ -4852,6 +5170,7 @@ fn static_schema_cols_for_tos(
                     .map(|(i, cn)| {
                         let (aff, coll) = meta.get(i).copied().unwrap_or((None, Collation::Binary));
                         ScopedColumn {
+                            schema_name: None,
                             table_alias: alias.clone(),
                             name: cn,
                             collation: coll,
@@ -4904,25 +5223,20 @@ fn infer_expr_explicit_or_col_collation(
         Expr::RowValue(elems) if elems.len() == 1 => {
             infer_expr_explicit_or_col_collation(&elems[0], sample_cols, outer_scopes)
         }
-        Expr::Column { table, column } => {
+        Expr::Column(cref) => {
             for sc in sample_cols {
                 if sc.hidden_rowid {
                     continue;
                 }
-                if let Some(q) = table
-                    && !sc
-                        .table_alias
-                        .as_ref()
-                        .is_some_and(|ta| ta.eq_ignore_ascii_case(q))
-                {
+                if !sc.matches_qualifier(cref.schema.as_deref(), cref.table.as_deref()) {
                     continue;
                 }
-                if sc.name.eq_ignore_ascii_case(column) {
+                if sc.name.eq_ignore_ascii_case(&cref.column) {
                     return Some(sc.collation);
                 }
             }
             for s in outer_scopes.iter().rev() {
-                if let Ok(Some((_, c))) = s.lookup(table.as_deref(), column) {
+                if let Ok(Some((_, c))) = s.lookup_cref(cref) {
                     return Some(c);
                 }
             }
@@ -4957,9 +5271,9 @@ fn infer_expr_affinity_in_scopes_guarded(
             infer_expr_affinity_in_scopes_guarded(&elems[0], scopes, schema, ctes, visited)
         }
         Expr::Cast { type_name, .. } => Some(TypeAffinity::from_declared_type(type_name)),
-        Expr::Column { table, column } => {
+        Expr::Column(cref) => {
             for s in scopes.iter().rev() {
-                if let Ok(Some((_, _, aff))) = s.lookup_full(table.as_deref(), column) {
+                if let Ok(Some((_, _, aff))) = s.lookup_cref_full(cref) {
                     return aff;
                 }
             }
@@ -5022,7 +5336,7 @@ fn push_scope(outer: &[EvalRow], inner: &EvalRow) -> Vec<EvalRow> {
 }
 
 // ============================================================================
-// Expression Evaluator (`eval_expr`)
+// Expression Evaluator (`eval_expr_rt` / `eval_expr`)
 // ============================================================================
 
 fn eval_expr(
@@ -5033,51 +5347,65 @@ fn eval_expr(
     ctes: &CteStore,
     agg_group: Option<(&[EvalRow], &[EvalRow])>,
 ) -> Result<Value> {
+    Ok(eval_expr_rt(ctx, expr, params, scopes, ctes, agg_group)?.value)
+}
+
+fn eval_expr_rt(
+    ctx: &mut ExecContext<'_>,
+    expr: &Expr,
+    params: &[Value],
+    scopes: &[EvalRow],
+    ctes: &CteStore,
+    agg_group: Option<(&[EvalRow], &[EvalRow])>,
+) -> Result<RuntimeValue> {
     match expr {
-        Expr::Null => Ok(Value::Null),
-        Expr::Bool(b) => Ok(Value::Integer(i64::from(*b))),
-        Expr::Integer(i) => Ok(Value::Integer(*i)),
-        Expr::Float(f) => Ok(Value::real(*f)),
-        Expr::String(s) => Ok(Value::Text(s.clone())),
-        Expr::Blob(b) => Ok(Value::Blob(b.clone())),
+        Expr::Null => Ok(RuntimeValue::null()),
+        Expr::Bool(b) => Ok(RuntimeValue::plain(Value::Integer(i64::from(*b)))),
+        Expr::Integer(i) => Ok(RuntimeValue::plain(Value::Integer(*i))),
+        Expr::Float(f) => Ok(RuntimeValue::plain(Value::real(*f))),
+        Expr::String(s) => Ok(RuntimeValue::plain(Value::Text(s.clone()))),
+        Expr::Blob(b) => Ok(RuntimeValue::plain(Value::Blob(b.clone()))),
         Expr::CurrentTimeKw(kind) => {
             let ts_ms = ctx.runtime.effective_timestamp_ms();
-            Ok(Value::Text(match kind {
+            Ok(RuntimeValue::plain(Value::Text(match kind {
                 CurrentTimeKind::Date => format_utc_date(ts_ms),
                 CurrentTimeKind::Time => format_utc_time(ts_ms),
                 CurrentTimeKind::Timestamp => format_utc_timestamp(ts_ms),
-            }))
+            })))
         }
         Expr::Bind(bp) => {
             let idx = match bp {
                 BindParam::Anonymous(i) | BindParam::Numbered(i) | BindParam::Named(_, i) => *i,
             };
-            Ok(params
-                .get(idx.saturating_sub(1))
-                .cloned()
-                .unwrap_or(Value::Null))
+            Ok(RuntimeValue::plain(
+                params
+                    .get(idx.saturating_sub(1))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ))
         }
-        Expr::Column { table, column } => {
+        Expr::Column(cref) => {
             for scope in scopes.iter().rev() {
-                if let Some((val, _)) = scope.lookup(table.as_deref(), column)? {
-                    return Ok(val);
+                if let Some((val, _)) = scope.lookup_cref(cref)? {
+                    return Ok(RuntimeValue::plain(val));
                 }
             }
             // In SQLite, double-quoted string fallback is deprecated; return clear error
-            let full = match table {
-                Some(t) => format!("{t}.{column}"),
-                None => column.clone(),
-            };
             Err(SqliteError::new(
                 ErrorCode::Error,
-                format!("no such column: {full}"),
+                format!("no such column: {}", cref.display_name()),
             ))
         }
-        Expr::Collate { expr: inner, .. } => eval_expr(ctx, inner, params, scopes, ctes, agg_group),
+        Expr::Collate { expr: inner, .. } => {
+            eval_expr_rt(ctx, inner, params, scopes, ctes, agg_group)
+        }
         Expr::Unary { op, expr: inner } => {
+            if *op == UnaryOp::Plus {
+                return eval_expr_rt(ctx, inner, params, scopes, ctes, agg_group);
+            }
             let v = eval_expr(ctx, inner, params, scopes, ctes, agg_group)?;
-            Ok(match op {
-                UnaryOp::Plus => v,
+            Ok(RuntimeValue::plain(match op {
+                UnaryOp::Plus => unreachable!(),
                 UnaryOp::Negate => eval_unary_negate(&v),
                 UnaryOp::BitNot => {
                     if v.is_null() {
@@ -5090,11 +5418,11 @@ fn eval_expr(
                     None => Value::Null,
                     Some(b) => Value::Integer(i64::from(!b)),
                 },
-            })
+            }))
         }
         Expr::RowValue(elems) => {
             if elems.len() == 1 {
-                eval_expr(ctx, &elems[0], params, scopes, ctes, agg_group)
+                eval_expr_rt(ctx, &elems[0], params, scopes, ctes, agg_group)
             } else {
                 Err(SqliteError::new(ErrorCode::Error, "row value misused"))
             }
@@ -5104,26 +5432,30 @@ fn eval_expr(
             if *op == BinaryOp::And {
                 let lv = eval_expr(ctx, left, params, scopes, ctes, agg_group)?;
                 if lv.truthiness() == Some(false) {
-                    return Ok(Value::Integer(0));
+                    return Ok(RuntimeValue::plain(Value::Integer(0)));
                 }
                 let rv = eval_expr(ctx, right, params, scopes, ctes, agg_group)?;
-                return Ok(match (lv.truthiness(), rv.truthiness()) {
-                    (_, Some(false)) => Value::Integer(0),
-                    (Some(true), Some(true)) => Value::Integer(1),
-                    _ => Value::Null,
-                });
+                return Ok(RuntimeValue::plain(
+                    match (lv.truthiness(), rv.truthiness()) {
+                        (_, Some(false)) => Value::Integer(0),
+                        (Some(true), Some(true)) => Value::Integer(1),
+                        _ => Value::Null,
+                    },
+                ));
             }
             if *op == BinaryOp::Or {
                 let lv = eval_expr(ctx, left, params, scopes, ctes, agg_group)?;
                 if lv.truthiness() == Some(true) {
-                    return Ok(Value::Integer(1));
+                    return Ok(RuntimeValue::plain(Value::Integer(1)));
                 }
                 let rv = eval_expr(ctx, right, params, scopes, ctes, agg_group)?;
-                return Ok(match (lv.truthiness(), rv.truthiness()) {
-                    (_, Some(true)) => Value::Integer(1),
-                    (Some(false), Some(false)) => Value::Integer(0),
-                    _ => Value::Null,
-                });
+                return Ok(RuntimeValue::plain(
+                    match (lv.truthiness(), rv.truthiness()) {
+                        (_, Some(true)) => Value::Integer(1),
+                        (Some(false), Some(false)) => Value::Integer(0),
+                        _ => Value::Null,
+                    },
+                ));
             }
 
             if matches!(
@@ -5140,30 +5472,31 @@ fn eval_expr(
             {
                 return eval_row_value_comparison(
                     ctx, left, *op, right, params, scopes, ctes, agg_group,
-                );
+                )
+                .map(RuntimeValue::plain);
             }
 
             let lv = eval_expr(ctx, left, params, scopes, ctes, agg_group)?;
             let rv = eval_expr(ctx, right, params, scopes, ctes, agg_group)?;
 
-            match op {
+            let val = match op {
                 BinaryOp::Concat => {
                     if lv.is_null() || rv.is_null() {
-                        Ok(Value::Null)
+                        Value::Null
                     } else {
                         let mut s = lv.to_text_lossy();
                         s.push_str(&rv.to_text_lossy());
-                        Ok(Value::Text(s))
+                        Value::Text(s)
                     }
                 }
                 BinaryOp::Add
                 | BinaryOp::Subtract
                 | BinaryOp::Multiply
                 | BinaryOp::Divide
-                | BinaryOp::Remainder => Ok(eval_binary_arith(*op, &lv, &rv)),
+                | BinaryOp::Remainder => eval_binary_arith(*op, &lv, &rv),
                 BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::ShiftLeft | BinaryOp::ShiftRight => {
                     if lv.is_null() || rv.is_null() {
-                        Ok(Value::Null)
+                        Value::Null
                     } else {
                         let a = lv.to_integer_lossy();
                         let b = rv.to_integer_lossy();
@@ -5200,7 +5533,7 @@ fn eval_expr(
                             }
                             _ => unreachable!(),
                         };
-                        Ok(Value::Integer(res))
+                        Value::Integer(res)
                     }
                 }
                 BinaryOp::Lt
@@ -5211,7 +5544,6 @@ fn eval_expr(
                 | BinaryOp::Ne
                 | BinaryOp::Is
                 | BinaryOp::IsNot => {
-                    let coll = infer_comparison_collation(left, right, scopes);
                     let laff = infer_expr_affinity_in_scopes(left, scopes, ctx.schema, ctes);
                     let raff = infer_expr_affinity_in_scopes(right, scopes, ctx.schema, ctes);
                     let comp_aff = sqlite_compare_affinity(laff, raff);
@@ -5226,17 +5558,13 @@ fn eval_expr(
                         BinaryOp::IsNot => Opcode::IsNot,
                         _ => unreachable!(),
                     };
-                    Ok(eval_comparison_with_affinity(
-                        vdbe_op,
-                        &lv,
-                        &rv,
-                        comp_aff,
-                        coll,
-                        ctx.btree.encoding(),
-                    ))
+                    eval_scalar_comparison_in_scopes(
+                        ctx, vdbe_op, left, &lv, right, &rv, comp_aff, scopes,
+                    )?
                 }
                 BinaryOp::And | BinaryOp::Or => unreachable!(),
-            }
+            };
+            Ok(RuntimeValue::plain(val))
         }
         Expr::IsNull {
             expr: inner,
@@ -5244,11 +5572,9 @@ fn eval_expr(
         } => {
             let v = eval_expr(ctx, inner, params, scopes, ctes, agg_group)?;
             let is_n = v.is_null();
-            Ok(Value::Integer(i64::from(if *negated {
-                !is_n
-            } else {
-                is_n
-            })))
+            Ok(RuntimeValue::plain(Value::Integer(i64::from(
+                if *negated { !is_n } else { is_n },
+            ))))
         }
         Expr::Between {
             expr: val_e,
@@ -5284,16 +5610,14 @@ fn eval_expr(
                     (Some(true), Some(true)) => Some(true),
                     _ => None,
                 };
-                return Ok(match res {
+                return Ok(RuntimeValue::plain(match res {
                     None => Value::Null,
                     Some(b) => Value::Integer(i64::from(if *negated { !b } else { b })),
-                });
+                }));
             }
             let v = eval_expr(ctx, val_e, params, scopes, ctes, agg_group)?;
             let lo = eval_expr(ctx, low, params, scopes, ctes, agg_group)?;
             let hi = eval_expr(ctx, high, params, scopes, ctes, agg_group)?;
-            let coll_lo = infer_comparison_collation(val_e, low, scopes);
-            let coll_hi = infer_comparison_collation(val_e, high, scopes);
             let v_aff = infer_expr_affinity_in_scopes(val_e, scopes, ctx.schema, ctes);
             let lo_aff = sqlite_compare_affinity(
                 v_aff,
@@ -5303,20 +5627,37 @@ fn eval_expr(
                 v_aff,
                 infer_expr_affinity_in_scopes(high, scopes, ctx.schema, ctes),
             );
-            let enc = ctx.btree.encoding();
-            let ge = eval_comparison_with_affinity(Opcode::Ge, &v, &lo, lo_aff, coll_lo, enc)
-                .truthiness();
-            let le = eval_comparison_with_affinity(Opcode::Le, &v, &hi, hi_aff, coll_hi, enc)
-                .truthiness();
+            let ge = eval_scalar_comparison_in_scopes(
+                ctx,
+                Opcode::Ge,
+                val_e,
+                &v,
+                low,
+                &lo,
+                lo_aff,
+                scopes,
+            )?
+            .truthiness();
+            let le = eval_scalar_comparison_in_scopes(
+                ctx,
+                Opcode::Le,
+                val_e,
+                &v,
+                high,
+                &hi,
+                hi_aff,
+                scopes,
+            )?
+            .truthiness();
             let res = match (ge, le) {
                 (Some(false), _) | (_, Some(false)) => Some(false),
                 (Some(true), Some(true)) => Some(true),
                 _ => None,
             };
-            Ok(match res {
+            Ok(RuntimeValue::plain(match res {
                 None => Value::Null,
                 Some(b) => Value::Integer(i64::from(if *negated { !b } else { b })),
-            })
+            }))
         }
         Expr::InList {
             expr: lhs_e,
@@ -5346,7 +5687,7 @@ fn eval_expr(
                 }
             }
             if list.is_empty() {
-                return Ok(Value::Integer(i64::from(*negated)));
+                return Ok(RuntimeValue::plain(Value::Integer(i64::from(*negated))));
             }
             let l_meta = infer_row_value_elem_meta(lhs_e, n, scopes, ctx.schema, ctes);
             let enc = ctx.btree.encoding();
@@ -5372,17 +5713,44 @@ fn eval_expr(
                 }
                 let r_meta = infer_row_value_elem_meta(item, n, scopes, ctx.schema, ctes);
                 let (affs, colls) = combine_row_value_meta(&l_meta, &r_meta);
-                match compare_row_value_eq(&lv_vec, &iv_vec, &affs, &colls, enc) {
-                    Some(true) => return Ok(Value::Integer(i64::from(!*negated))),
+                let eq_res = if n == 1
+                    && let Some(cname) = resolve_custom_binary_collation_name(lhs_e, item)
+                {
+                    let mut svc = ExecutionContext {
+                        interrupt_flag: ctx.interrupt_flag,
+                        runtime: ctx.runtime,
+                        encoding: enc,
+                        functions: ctx.functions,
+                        collations: ctx.collations,
+                        progress: ctx.progress,
+                        strict_subtype: ctx.strict_subtype,
+                    };
+                    eval_comparison_with_services(
+                        Opcode::Eq,
+                        &lv_vec[0],
+                        &iv_vec[0],
+                        affs[0],
+                        cname,
+                        enc,
+                        &mut svc,
+                    )?
+                    .truthiness()
+                } else {
+                    compare_row_value_eq(&lv_vec, &iv_vec, &affs, &colls, enc)
+                };
+                match eq_res {
+                    Some(true) => {
+                        return Ok(RuntimeValue::plain(Value::Integer(i64::from(!*negated))));
+                    }
                     None => saw_null = true,
                     Some(false) => {}
                 }
             }
-            Ok(if saw_null {
+            Ok(RuntimeValue::plain(if saw_null {
                 Value::Null
             } else {
                 Value::Integer(i64::from(*negated))
-            })
+            }))
         }
         Expr::InSubquery {
             expr: lhs_e,
@@ -5408,7 +5776,7 @@ fn eval_expr(
                 ));
             }
             if sub_out.rows.is_empty() {
-                return Ok(Value::Integer(i64::from(*negated)));
+                return Ok(RuntimeValue::plain(Value::Integer(i64::from(*negated))));
             }
             let l_meta = infer_row_value_elem_meta(lhs_e, n, scopes, ctx.schema, ctes);
             let mut affs = Vec::with_capacity(n);
@@ -5433,16 +5801,107 @@ fn eval_expr(
             let mut saw_null = false;
             for r in &sub_out.rows {
                 match compare_row_value_eq(&lv_vec, r, &affs, &colls, enc) {
-                    Some(true) => return Ok(Value::Integer(i64::from(!*negated))),
+                    Some(true) => {
+                        return Ok(RuntimeValue::plain(Value::Integer(i64::from(!*negated))));
+                    }
                     None => saw_null = true,
                     Some(false) => {}
                 }
             }
-            if saw_null {
-                Ok(Value::Null)
+            Ok(RuntimeValue::plain(if saw_null {
+                Value::Null
             } else {
-                Ok(Value::Integer(i64::from(*negated)))
+                Value::Integer(i64::from(*negated))
+            }))
+        }
+        Expr::InTable {
+            expr: lhs_e,
+            table,
+            negated,
+        } => {
+            let lv_vec = if is_row_value_expr(lhs_e) {
+                eval_row_value_tuple(ctx, lhs_e, params, scopes, ctes, agg_group)?
+            } else {
+                vec![eval_expr(ctx, lhs_e, params, scopes, ctes, agg_group)?]
+            };
+            let n = lv_vec.len();
+            let (rows, rhs_meta) = if table.schema.is_none()
+                && let Some(cte_out) = resolve_cte(ctx, ctes, &table.name, params, scopes)?
+            {
+                let m = cte_out.column_names.len();
+                if m != n {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("sub-select returns {m} columns - expected {n}"),
+                    ));
+                }
+                let meta = infer_cte_meta_by_name(&table.name, scopes, ctx.schema, ctes);
+                (cte_out.rows, meta)
+            } else {
+                let (tbl, _) = resolve_table_for_query(ctx.schema, table)?;
+                let m = tbl.columns.len();
+                if m != n {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("sub-select returns {m} columns - expected {n}"),
+                    ));
+                }
+                let meta: Vec<(Option<TypeAffinity>, Collation)> = tbl
+                    .columns
+                    .iter()
+                    .map(|c| (Some(c.affinity), c.collation))
+                    .collect();
+                let raw = if tbl.root_pgno == 0 {
+                    Vec::new()
+                } else {
+                    scan_table_raw_entries(ctx, &tbl)?
+                };
+                let mut out_rows = Vec::with_capacity(raw.len());
+                for (rkey, payload) in raw {
+                    out_rows.push(decode_table_logical_row(
+                        ctx, &tbl, &rkey, &payload, params,
+                    )?);
+                }
+                (out_rows, meta)
+            };
+            if rows.is_empty() {
+                return Ok(RuntimeValue::plain(Value::Integer(i64::from(*negated))));
             }
+            let l_meta = infer_row_value_elem_meta(lhs_e, n, scopes, ctx.schema, ctes);
+            let mut affs = Vec::with_capacity(n);
+            let mut colls = Vec::with_capacity(n);
+            for i in 0..n {
+                let (laff, lcoll, lexp) = l_meta.get(i).copied().unwrap_or((None, None, false));
+                let (raff, rcoll) = rhs_meta
+                    .get(i)
+                    .copied()
+                    .unwrap_or((None, Collation::Binary));
+                affs.push(sqlite_compare_affinity(laff, raff));
+                let c = if lexp {
+                    lcoll.unwrap_or(Collation::Binary)
+                } else if let Some(lc) = lcoll {
+                    lc
+                } else {
+                    rcoll
+                };
+                colls.push(c);
+            }
+            let enc = ctx.btree.encoding();
+            let mut saw_null = false;
+            for r in &rows {
+                match compare_row_value_eq(&lv_vec, r, &affs, &colls, enc) {
+                    Some(true) => {
+                        return Ok(RuntimeValue::plain(Value::Integer(i64::from(!*negated))));
+                    }
+                    None => saw_null = true,
+                    Some(false) => {}
+                }
+            }
+            Ok(RuntimeValue::plain(if saw_null {
+                Value::Null
+            } else {
+                Value::Integer(i64::from(*negated))
+            }))
         }
         Expr::Like {
             expr: txt_e,
@@ -5454,12 +5913,12 @@ fn eval_expr(
             let tv = eval_expr(ctx, txt_e, params, scopes, ctes, agg_group)?;
             let pv = eval_expr(ctx, pattern, params, scopes, ctes, agg_group)?;
             if tv.is_null() || pv.is_null() {
-                return Ok(Value::Null);
+                return Ok(RuntimeValue::null());
             }
             let esc = if let Some(ee) = escape {
                 let ev = eval_expr(ctx, ee, params, scopes, ctes, agg_group)?;
                 if ev.is_null() {
-                    return Ok(Value::Null);
+                    return Ok(RuntimeValue::null());
                 }
                 Some(parse_escape_char(&ev.to_text_lossy())?)
             } else {
@@ -5469,18 +5928,20 @@ fn eval_expr(
                 LikeOp::Like => sqlite_like_match(&pv.to_text_lossy(), &tv.to_text_lossy(), esc),
                 LikeOp::Glob => sqlite_glob_match(&pv.to_text_lossy(), &tv.to_text_lossy()),
             };
-            Ok(Value::Integer(i64::from(if *negated {
-                !matched
-            } else {
-                matched
-            })))
+            Ok(RuntimeValue::plain(Value::Integer(i64::from(
+                if *negated { !matched } else { matched },
+            ))))
         }
         Expr::Cast {
             expr: inner,
             type_name,
         } => {
-            let v = eval_expr(ctx, inner, params, scopes, ctes, agg_group)?;
-            Ok(eval_cast_with_encoding(v, type_name, ctx.btree.encoding()))
+            let rv = eval_expr_rt(ctx, inner, params, scopes, ctes, agg_group)?;
+            Ok(eval_cast_rt_with_encoding(
+                rv,
+                type_name,
+                ctx.btree.encoding(),
+            ))
         }
         Expr::Case {
             operand,
@@ -5497,30 +5958,31 @@ fn eval_expr(
             for (we, te) in branches {
                 let cond_true = if let (Some(base), Some(oe)) = (&op_val, operand.as_ref()) {
                     let wv = eval_expr(ctx, we, params, scopes, ctes, agg_group)?;
-                    let coll = infer_comparison_collation(oe, we, scopes);
                     let w_aff = infer_expr_affinity_in_scopes(we, scopes, ctx.schema, ctes);
                     let comp_aff = sqlite_compare_affinity(op_aff, w_aff);
-                    eval_comparison_with_affinity(
+                    eval_scalar_comparison_in_scopes(
+                        ctx,
                         Opcode::Eq,
+                        oe,
                         base,
+                        we,
                         &wv,
                         comp_aff,
-                        coll,
-                        ctx.btree.encoding(),
-                    )
+                        scopes,
+                    )?
                     .truthiness()
                         == Some(true)
                 } else {
                     eval_expr(ctx, we, params, scopes, ctes, agg_group)?.truthiness() == Some(true)
                 };
                 if cond_true {
-                    return eval_expr(ctx, te, params, scopes, ctes, agg_group);
+                    return eval_expr_rt(ctx, te, params, scopes, ctes, agg_group);
                 }
             }
             if let Some(el) = else_expr {
-                eval_expr(ctx, el, params, scopes, ctes, agg_group)
+                eval_expr_rt(ctx, el, params, scopes, ctes, agg_group)
             } else {
-                Ok(Value::Null)
+                Ok(RuntimeValue::null())
             }
         }
         Expr::FunctionCall {
@@ -5531,13 +5993,16 @@ fn eval_expr(
         } => {
             // Check if this is an aggregate call (`count(*)` and 0-arg `count()` are both `CountStar`)
             let is_count_zero = name.eq_ignore_ascii_case("COUNT")
-                && matches!(args, FunctionArgs::Exprs(es) if es.is_empty());
+                && matches!(args, FunctionArgs::Exprs(es) if es.is_empty())
+                && ctx.functions.find_scalar(name, 0).is_none();
             let is_star = matches!(args, FunctionArgs::Star) || is_count_zero;
             let upper = name.to_ascii_uppercase();
             let agg_kind_opt = if is_star {
                 AggregateKind::from_name(name, true)
             } else if let FunctionArgs::Exprs(es) = args {
-                if (upper == "MIN" || upper == "MAX") && es.len() != 1 {
+                if ctx.functions.find_scalar(name, es.len()).is_some()
+                    || ((upper == "MIN" || upper == "MAX") && es.len() != 1)
+                {
                     None
                 } else {
                     AggregateKind::from_name(name, false)
@@ -5586,24 +6051,74 @@ fn eval_expr(
                         acc.step(&a_vals)?;
                     }
                 }
-                return acc.finalize();
+                return acc.finalize().map(RuntimeValue::plain);
             }
 
-            if filter.is_some() || *distinct {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    format!("{name}() is not an aggregate function"),
-                ));
-            }
-            let expr_list = match args {
-                FunctionArgs::Star => Vec::new(),
-                FunctionArgs::Exprs(es) => es.clone(),
+            let (star_args, expr_list) = match args {
+                FunctionArgs::Star => (true, &[][..]),
+                FunctionArgs::Exprs(es) => (false, es.as_slice()),
             };
-            let mut a_vals = Vec::with_capacity(expr_list.len());
-            for ae in &expr_list {
-                a_vals.push(eval_expr(ctx, ae, params, scopes, ctes, agg_group)?);
+            {
+                let _tf_guard =
+                    sqliters_vdbe::TestFunctionsScope::enter(ctx.runtime.enable_test_functions);
+                ctx.functions.validate_call(
+                    name,
+                    star_args,
+                    expr_list.len(),
+                    *distinct,
+                    filter.is_some(),
+                    false,
+                )?;
             }
-            eval_scalar_function(name, &a_vals, ctx.runtime)
+
+            if !star_args
+                && !*distinct
+                && filter.is_none()
+                && ctx.functions.find_scalar(name, expr_list.len()).is_none()
+            {
+                match upper.as_str() {
+                    "COALESCE" | "IFNULL" => {
+                        for ae in expr_list {
+                            let rv = eval_expr_rt(ctx, ae, params, scopes, ctes, agg_group)?;
+                            if !rv.value.is_null() {
+                                return Ok(rv);
+                            }
+                        }
+                        return Ok(RuntimeValue::null());
+                    }
+                    "IIF" | "IF" => {
+                        let mut idx = 0;
+                        while idx + 1 < expr_list.len() {
+                            if eval_expr(ctx, &expr_list[idx], params, scopes, ctes, agg_group)?
+                                .truthiness()
+                                == Some(true)
+                            {
+                                return eval_expr_rt(
+                                    ctx,
+                                    &expr_list[idx + 1],
+                                    params,
+                                    scopes,
+                                    ctes,
+                                    agg_group,
+                                );
+                            }
+                            idx += 2;
+                        }
+                        return if idx < expr_list.len() {
+                            eval_expr_rt(ctx, &expr_list[idx], params, scopes, ctes, agg_group)
+                        } else {
+                            Ok(RuntimeValue::null())
+                        };
+                    }
+                    _ => {}
+                }
+            }
+
+            let mut a_vals = Vec::with_capacity(expr_list.len());
+            for ae in expr_list {
+                a_vals.push(eval_expr_rt(ctx, ae, params, scopes, ctes, agg_group)?);
+            }
+            ctx.call_scalar_rt(name, &a_vals)
         }
         Expr::Subquery(sub) => {
             let sub_out = exec_select(ctx, sub, params, scopes, ctes)?;
@@ -5616,21 +6131,21 @@ fn eval_expr(
                     ),
                 ));
             }
-            Ok(sub_out
-                .rows
-                .first()
-                .and_then(|r| r.first())
-                .cloned()
-                .unwrap_or(Value::Null))
+            Ok(RuntimeValue::plain(
+                sub_out
+                    .rows
+                    .first()
+                    .and_then(|r| r.first())
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ))
         }
         Expr::Exists { subquery, negated } => {
             let sub_out = exec_select(ctx, subquery, params, scopes, ctes)?;
             let exists = !sub_out.rows.is_empty();
-            Ok(Value::Integer(i64::from(if *negated {
-                !exists
-            } else {
-                exists
-            })))
+            Ok(RuntimeValue::plain(Value::Integer(i64::from(
+                if *negated { !exists } else { exists },
+            ))))
         }
     }
 }
@@ -5895,6 +6410,55 @@ fn eval_row_value_comparison(
     }
 }
 
+fn resolve_custom_binary_collation_name<'a>(left: &'a Expr, right: &'a Expr) -> Option<&'a str> {
+    if let Expr::Collate { collation, .. } = left {
+        return if Collation::from_name(collation).is_none() {
+            Some(collation.as_str())
+        } else {
+            None
+        };
+    }
+    if let Expr::Collate { collation, .. } = right {
+        return if Collation::from_name(collation).is_none() {
+            Some(collation.as_str())
+        } else {
+            None
+        };
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_scalar_comparison_in_scopes(
+    ctx: &mut ExecContext<'_>,
+    vdbe_op: Opcode,
+    left_expr: &Expr,
+    left_val: &Value,
+    right_expr: &Expr,
+    right_val: &Value,
+    comp_aff: TypeAffinity,
+    scopes: &[EvalRow],
+) -> Result<Value> {
+    let enc = ctx.btree.encoding();
+    if let Some(cname) = resolve_custom_binary_collation_name(left_expr, right_expr) {
+        let mut svc = ExecutionContext {
+            interrupt_flag: ctx.interrupt_flag,
+            runtime: ctx.runtime,
+            encoding: enc,
+            functions: ctx.functions,
+            collations: ctx.collations,
+            progress: ctx.progress,
+            strict_subtype: ctx.strict_subtype,
+        };
+        eval_comparison_with_services(vdbe_op, left_val, right_val, comp_aff, cname, enc, &mut svc)
+    } else {
+        let coll = infer_comparison_collation(left_expr, right_expr, scopes);
+        Ok(eval_comparison_with_affinity(
+            vdbe_op, left_val, right_val, comp_aff, coll, enc,
+        ))
+    }
+}
+
 fn infer_comparison_collation(left: &Expr, right: &Expr, scopes: &[EvalRow]) -> Collation {
     if let Expr::Collate { collation, .. } = left {
         return Collation::from_name(collation).unwrap_or_default();
@@ -5903,9 +6467,9 @@ fn infer_comparison_collation(left: &Expr, right: &Expr, scopes: &[EvalRow]) -> 
         return Collation::from_name(collation).unwrap_or_default();
     }
     for e in [left, right] {
-        if let Expr::Column { table, column } = e {
+        if let Expr::Column(cref) = e {
             for s in scopes.iter().rev() {
-                if let Ok(Some((_, c))) = s.lookup(table.as_deref(), column) {
+                if let Ok(Some((_, c))) = s.lookup_cref(cref) {
                     return c;
                 }
             }
@@ -5996,14 +6560,14 @@ fn scan_table_raw_entries(
     tbl: &TableSchema,
 ) -> Result<Vec<(TableRowKey, Vec<u8>)>> {
     if !tbl.without_rowid {
-        let rows = scan_table_incremental(ctx.btree, tbl.root_pgno)?;
+        let rows = ctx.scan_table(tbl.root_pgno)?;
         return Ok(rows
             .into_iter()
             .map(|(rid, p)| (TableRowKey::Rowid(rid), p))
             .collect());
     }
     let enc = ctx.btree.encoding();
-    let entries = scan_index_incremental(ctx.btree, tbl.root_pgno, tbl.without_rowid_pk_orders())?;
+    let entries = ctx.scan_index(tbl.root_pgno, tbl.without_rowid_pk_orders())?;
     let n_pk = tbl.without_rowid_pk_cols.len();
     let mut out = Vec::with_capacity(entries.len());
     for rec in entries {
@@ -6255,6 +6819,7 @@ fn make_single_table_scope(
         .columns
         .iter()
         .map(|c| ScopedColumn {
+            schema_name: Some("main".to_owned()),
             table_alias: Some(eff.clone()),
             name: c.name.clone(),
             collation: c.collation,
@@ -6266,7 +6831,44 @@ fn make_single_table_scope(
     let mut row_vals = vals.to_vec();
     if !tbl.without_rowid {
         cols.push(ScopedColumn {
+            schema_name: Some("main".to_owned()),
             table_alias: Some(eff),
+            name: "rowid".to_owned(),
+            collation: Collation::Binary,
+            affinity: Some(TypeAffinity::Integer),
+            hidden_rowid: true,
+            merged_using: false,
+        });
+        row_vals.push(Value::Integer(rowid));
+    }
+    EvalRow {
+        cols: cols.into(),
+        vals: row_vals,
+    }
+}
+
+/// Builds the single-table evaluation scope for `RETURNING` (`sqlite/src/trigger.c:1062-1064`,
+/// `sqlite/src/resolve.c:522-536`), where `zDb == 0` and only unqualified column names or
+/// `<table_name>.<col>` (not statement `AS alias` or `schema.table.col`) resolve.
+fn make_returning_table_scope(tbl: &TableSchema, rowid: i64, vals: &[Value]) -> EvalRow {
+    let mut cols: Vec<ScopedColumn> = tbl
+        .columns
+        .iter()
+        .map(|c| ScopedColumn {
+            schema_name: None,
+            table_alias: Some(tbl.name.clone()),
+            name: c.name.clone(),
+            collation: c.collation,
+            affinity: Some(c.affinity),
+            hidden_rowid: false,
+            merged_using: false,
+        })
+        .collect();
+    let mut row_vals = vals.to_vec();
+    if !tbl.without_rowid {
+        cols.push(ScopedColumn {
+            schema_name: None,
+            table_alias: Some(tbl.name.clone()),
             name: "rowid".to_owned(),
             collation: Collation::Binary,
             affinity: Some(TypeAffinity::Integer),
@@ -7614,23 +8216,72 @@ fn maybe_count_changes_output(ctx: &ExecContext<'_>, out: QueryOutput) -> QueryO
     }
 }
 
+fn resolve_dml_target_table<'a>(schema: &'a Schema, qn: &QualifiedName) -> Result<&'a TableSchema> {
+    if let Some(ref s) = qn.schema {
+        if s.eq_ignore_ascii_case("main") {
+            if Schema::is_schema_table_name(&qn.name) {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("table {} may not be modified", qn.name),
+                ));
+            }
+            if !Schema::is_temp_schema_table_name(&qn.name)
+                && let Some(t) = schema.find_user_table(&qn.name)
+            {
+                return Ok(t);
+            }
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such table: {}", qn.display_name()),
+            ));
+        }
+        if s.eq_ignore_ascii_case("temp") && Schema::is_schema_table_name(&qn.name) {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("table {} may not be modified", qn.name),
+            ));
+        }
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("no such table: {}", qn.display_name()),
+        ));
+    }
+    if Schema::is_schema_table_name(&qn.name) || Schema::is_temp_schema_table_name(&qn.name) {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("table {} may not be modified", qn.name),
+        ));
+    }
+    schema
+        .find_user_table(&qn.name)
+        .ok_or_else(|| SqliteError::new(ErrorCode::Error, format!("no such table: {}", qn.name)))
+}
+
+fn validate_create_table_target(temp: bool, qn: &QualifiedName) -> Result<bool> {
+    if let Some(ref s) = qn.schema {
+        if !s.eq_ignore_ascii_case("main") && !s.eq_ignore_ascii_case("temp") {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("unknown database {s}"),
+            ));
+        }
+        if temp && !s.eq_ignore_ascii_case("temp") {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                "temporary table name must be unqualified",
+            ));
+        }
+        return Ok(s.eq_ignore_ascii_case("temp"));
+    }
+    Ok(temp)
+}
+
 fn exec_insert(
     ctx: &mut ExecContext<'_>,
     ins: &InsertStmt,
     params: &[Value],
 ) -> Result<QueryOutput> {
-    if Schema::is_schema_table_name(&ins.table) {
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            format!("table {} may not be modified", ins.table),
-        ));
-    }
-    let Some(tbl) = ctx.schema.find_table(&ins.table) else {
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            format!("no such table: {}", ins.table),
-        ));
-    };
+    let tbl = resolve_dml_target_table(ctx.schema, &ins.table)?.clone();
     let indexes = ctx.schema.indexes_for_table(&tbl.name);
     let dml_ctes = CteStore::default().with_scope(&ins.ctes);
 
@@ -7687,12 +8338,11 @@ fn exec_insert(
     ctx.runtime.last_changes = 0;
     ctx.publish();
 
-    let sample_scope =
-        make_single_table_scope(&tbl, None, 0, &vec![Value::Null; tbl.columns.len()]);
+    let sample_scope = make_returning_table_scope(&tbl, 0, &vec![Value::Null; tbl.columns.len()]);
     let (ret_col_names, ret_expanded) = if ins.returning.is_empty() {
         (Vec::new(), Vec::new())
     } else {
-        expand_projection(&ins.returning, &sample_scope.cols)?
+        expand_returning_projection(&ins.returning, &sample_scope.cols)?
     };
     let mut ret_rows = Vec::new();
     let mut stmt_fk_suspects = Vec::new();
@@ -7777,7 +8427,7 @@ fn exec_insert(
             && !ret_expanded.is_empty()
         {
             let rscope =
-                make_single_table_scope(&tbl, None, written_key.rowid_or_zero(), &written_vals);
+                make_returning_table_scope(&tbl, written_key.rowid_or_zero(), &written_vals);
             let mut rrow = Vec::with_capacity(ret_expanded.len());
             for (pe, _, _) in &ret_expanded {
                 rrow.push(eval_expr(
@@ -7811,18 +8461,7 @@ fn exec_update(
     upd: &UpdateStmt,
     params: &[Value],
 ) -> Result<QueryOutput> {
-    if Schema::is_schema_table_name(&upd.table) {
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            format!("table {} may not be modified", upd.table),
-        ));
-    }
-    let Some(tbl) = ctx.schema.find_table(&upd.table) else {
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            format!("no such table: {}", upd.table),
-        ));
-    };
+    let tbl = resolve_dml_target_table(ctx.schema, &upd.table)?.clone();
     let indexes = ctx.schema.indexes_for_table(&tbl.name);
     let dml_ctes = CteStore::default().with_scope(&upd.ctes);
 
@@ -7919,16 +8558,11 @@ fn exec_update(
     ctx.runtime.last_changes = 0;
     ctx.publish();
 
-    let sample_scope = make_single_table_scope(
-        &tbl,
-        upd.alias.as_deref(),
-        0,
-        &vec![Value::Null; tbl.columns.len()],
-    );
+    let sample_scope = make_returning_table_scope(&tbl, 0, &vec![Value::Null; tbl.columns.len()]);
     let (ret_col_names, ret_expanded) = if upd.returning.is_empty() {
         (Vec::new(), Vec::new())
     } else {
-        expand_projection(&upd.returning, &sample_scope.cols)?
+        expand_returning_projection(&upd.returning, &sample_scope.cols)?
     };
     let mut ret_rows = Vec::new();
     let mut stmt_fk_suspects = Vec::new();
@@ -7963,12 +8597,8 @@ fn exec_update(
         if let Some((written_key, written_vals)) = written_opt
             && !ret_expanded.is_empty()
         {
-            let rscope = make_single_table_scope(
-                &tbl,
-                upd.alias.as_deref(),
-                written_key.rowid_or_zero(),
-                &written_vals,
-            );
+            let rscope =
+                make_returning_table_scope(&tbl, written_key.rowid_or_zero(), &written_vals);
             let mut rrow = Vec::with_capacity(ret_expanded.len());
             for (pe, _, _) in &ret_expanded {
                 rrow.push(eval_expr(
@@ -8002,18 +8632,7 @@ fn exec_delete(
     del: &DeleteStmt,
     params: &[Value],
 ) -> Result<QueryOutput> {
-    if Schema::is_schema_table_name(&del.table) {
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            format!("table {} may not be modified", del.table),
-        ));
-    }
-    let Some(tbl) = ctx.schema.find_table(&del.table) else {
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            format!("no such table: {}", del.table),
-        ));
-    };
+    let tbl = resolve_dml_target_table(ctx.schema, &del.table)?.clone();
     let indexes = ctx.schema.indexes_for_table(&tbl.name);
     let dml_ctes = CteStore::default().with_scope(&del.ctes);
 
@@ -8024,10 +8643,10 @@ fn exec_delete(
         && del.indexed_by.is_none()
     {
         let count = if tbl.without_rowid {
-            scan_index_incremental(ctx.btree, tbl.root_pgno, tbl.without_rowid_pk_orders())?.len()
-                as u64
+            ctx.scan_index(tbl.root_pgno, tbl.without_rowid_pk_orders())?
+                .len() as u64
         } else {
-            scan_table_incremental(ctx.btree, tbl.root_pgno)?.len() as u64
+            ctx.scan_table(tbl.root_pgno)?.len() as u64
         };
         ctx.btree.clear_tree(tbl.root_pgno)?;
         for idx in &indexes {
@@ -8074,21 +8693,16 @@ fn exec_delete(
     ctx.runtime.last_changes = 0;
     ctx.publish();
 
-    let sample_scope = make_single_table_scope(
-        &tbl,
-        del.alias.as_deref(),
-        0,
-        &vec![Value::Null; tbl.columns.len()],
-    );
+    let sample_scope = make_returning_table_scope(&tbl, 0, &vec![Value::Null; tbl.columns.len()]);
     let (ret_col_names, ret_expanded) = if del.returning.is_empty() {
         (Vec::new(), Vec::new())
     } else {
-        expand_projection(&del.returning, &sample_scope.cols)?
+        expand_returning_projection(&del.returning, &sample_scope.cols)?
     };
     let mut ret_rows = Vec::new();
     let mut stmt_fk_suspects = Vec::new();
 
-    for (rkey, old_vals, scope) in targets {
+    for (rkey, old_vals, _where_scope) in targets {
         if *ctx.foreign_keys {
             // Re-check row existence in case a self-referential ON DELETE CASCADE already removed it
             if seek_table_raw_entry(ctx, &tbl, &rkey)?.is_none() {
@@ -8111,13 +8725,14 @@ fn exec_delete(
                 )?;
             }
             if !ret_expanded.is_empty() {
+                let rscope = make_returning_table_scope(&tbl, rkey.rowid_or_zero(), &old_vals);
                 let mut rrow = Vec::with_capacity(ret_expanded.len());
                 for (pe, _, _) in &ret_expanded {
                     rrow.push(eval_expr(
                         ctx,
                         pe,
                         params,
-                        std::slice::from_ref(&scope),
+                        std::slice::from_ref(&rscope),
                         &dml_ctes,
                         None,
                     )?);
@@ -8150,20 +8765,57 @@ fn is_reserved_sqlite_name(name: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"sqlite_"))
 }
 
+fn validate_drop_or_alter_schema_table(name: &QualifiedName, verb: &str) -> Result<()> {
+    let schema_is_main_or_temp = match name.schema.as_deref() {
+        None => true,
+        Some(s) => s.eq_ignore_ascii_case("main") || s.eq_ignore_ascii_case("temp"),
+    };
+    if schema_is_main_or_temp {
+        let is_sys = match name.schema.as_deref() {
+            None => {
+                Schema::is_schema_table_name(&name.name)
+                    || Schema::is_temp_schema_table_name(&name.name)
+            }
+            Some(s) if s.eq_ignore_ascii_case("temp") => {
+                Schema::is_schema_table_name(&name.name)
+                    || Schema::is_temp_schema_table_name(&name.name)
+            }
+            Some(_) => Schema::is_schema_table_name(&name.name),
+        };
+        if is_sys {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("table {} may not be {verb}", name.name),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn exec_create_table(ctx: &mut ExecContext<'_>, ct: &CreateTableStmt) -> Result<()> {
-    if is_reserved_sqlite_name(&ct.name) {
+    let is_temp = validate_create_table_target(ct.temp, &ct.name)?;
+    if is_reserved_sqlite_name(&ct.name.name) {
         return Err(SqliteError::new(
             ErrorCode::Error,
-            format!("object name reserved for internal use: {}", ct.name),
+            format!("object name reserved for internal use: {}", ct.name.name),
         ));
     }
-    if ctx.schema.find_user_table(&ct.name).is_some() || ctx.schema.find_index(&ct.name).is_some() {
+    if is_temp {
+        let _ = build_table_schema_from_ast(ct, 2)?;
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            "TEMP tables are not yet supported before DatabaseSet (Step 2-C)",
+        ));
+    }
+    if ctx.schema.find_user_table(&ct.name.name).is_some()
+        || ctx.schema.find_index(&ct.name.name).is_some()
+    {
         if ct.if_not_exists {
             return Ok(());
         }
         return Err(SqliteError::new(
             ErrorCode::Error,
-            format!("table {} already exists", ct.name),
+            format!("table {} already exists", ct.name.name),
         ));
     }
 
@@ -8177,15 +8829,22 @@ fn exec_create_table(ctx: &mut ExecContext<'_>, ct: &CreateTableStmt) -> Result<
     insert_schema_entry(
         ctx.btree,
         "table",
-        &ct.name,
-        &ct.name,
+        &ct.name.name,
+        &ct.name.name,
         tbl_root,
-        Some(&ct.raw_sql),
+        Some(&ct.catalog_sql),
     )?;
 
     for auto in pending_autos {
         let idx_root = ctx.btree.create_index()?;
-        insert_schema_entry(ctx.btree, "index", &auto.name, &ct.name, idx_root, None)?;
+        insert_schema_entry(
+            ctx.btree,
+            "index",
+            &auto.name,
+            &ct.name.name,
+            idx_root,
+            None,
+        )?;
     }
 
     // Create `sqlite_sequence` table if `AUTOINCREMENT` is used and `sqlite_sequence` doesn't exist yet
@@ -8209,24 +8868,34 @@ fn exec_create_table(ctx: &mut ExecContext<'_>, ct: &CreateTableStmt) -> Result<
 
 fn exec_create_table_as(
     ctx: &mut ExecContext<'_>,
+    temp: bool,
     if_not_exists: bool,
-    name: &str,
+    name: &QualifiedName,
     query: &SelectStmt,
     params: &[Value],
 ) -> Result<()> {
-    if is_reserved_sqlite_name(name) {
+    let is_temp = validate_create_table_target(temp, name)?;
+    if is_reserved_sqlite_name(&name.name) {
         return Err(SqliteError::new(
             ErrorCode::Error,
-            format!("object name reserved for internal use: {name}"),
+            format!("object name reserved for internal use: {}", name.name),
         ));
     }
-    if ctx.schema.find_user_table(name).is_some() || ctx.schema.find_index(name).is_some() {
+    if is_temp {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            "TEMP tables are not yet supported before DatabaseSet (Step 2-C)",
+        ));
+    }
+    if ctx.schema.find_user_table(&name.name).is_some()
+        || ctx.schema.find_index(&name.name).is_some()
+    {
         if if_not_exists {
             return Ok(());
         }
         return Err(SqliteError::new(
             ErrorCode::Error,
-            format!("table {name} already exists"),
+            format!("table {} already exists", name.name),
         ));
     }
 
@@ -8276,24 +8945,25 @@ fn exec_create_table_as(
         columns.push(cdef);
     }
 
-    let raw_sql = format!(
+    let catalog_sql = format!(
         "CREATE TABLE {}({})",
-        format_replacement_ident("", name),
+        format_replacement_ident("", &name.name),
         rendered_cols.join(",")
     );
     let ct = CreateTableStmt {
         temp: false,
         if_not_exists: false,
-        name: name.to_owned(),
+        name: QualifiedName::unqualified(name.name.clone()),
         columns,
         constraints: Vec::new(),
         without_rowid: false,
         strict: false,
-        raw_sql,
+        catalog_sql: catalog_sql.clone(),
+        raw_sql: catalog_sql,
     };
     exec_create_table(ctx, &ct)?;
 
-    let Some(tbl) = ctx.schema.find_user_table(name).cloned() else {
+    let Some(tbl) = ctx.schema.find_user_table(&name.name).cloned() else {
         return Ok(());
     };
     let mut stmt_fk_suspects = Vec::new();
@@ -8353,20 +9023,28 @@ fn apply_root_page_move(btree: &mut Btree, schema: &mut Schema, mv: RootPageMove
     )))
 }
 
-fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &str) -> Result<()> {
-    if Schema::is_schema_table_name(name) {
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            format!("table {name} may not be dropped"),
-        ));
-    }
-    let Some(tbl) = ctx.schema.find_user_table(name).cloned() else {
+fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedName) -> Result<()> {
+    validate_drop_or_alter_schema_table(name, "dropped")?;
+    if name
+        .schema
+        .as_deref()
+        .is_some_and(|s| !s.eq_ignore_ascii_case("main"))
+    {
         if if_exists {
             return Ok(());
         }
         return Err(SqliteError::new(
             ErrorCode::Error,
-            format!("no such table: {name}"),
+            format!("no such table: {}", name.display_name()),
+        ));
+    }
+    let Some(tbl) = ctx.schema.find_user_table(&name.name).cloned() else {
+        if if_exists {
+            return Ok(());
+        }
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("no such table: {}", name.display_name()),
         ));
     };
     if ctx.activity.other_readers > 0 || ctx.btree.has_any_other_open_cursor(None) {
@@ -8472,19 +9150,56 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &str) -> Re
 }
 
 fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<()> {
-    if is_reserved_sqlite_name(&ci.name) {
+    if let Some(ref s) = ci.name.schema
+        && !s.eq_ignore_ascii_case("main")
+        && !s.eq_ignore_ascii_case("temp")
+    {
         return Err(SqliteError::new(
             ErrorCode::Error,
-            format!("object name reserved for internal use: {}", ci.name),
+            format!("unknown database {s}"),
         ));
     }
-    if ctx.schema.find_index(&ci.name).is_some() || ctx.schema.find_user_table(&ci.name).is_some() {
+    if is_reserved_sqlite_name(&ci.name.name) {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("object name reserved for internal use: {}", ci.name.name),
+        ));
+    }
+    if ci
+        .name
+        .schema
+        .as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case("temp"))
+    {
+        if ctx.schema.find_user_table(&ci.table_name).is_some() {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!(
+                    "cannot create a TEMP index on non-TEMP table \"{}\"",
+                    ci.table_name
+                ),
+            ));
+        }
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("no such table: temp.{}", ci.table_name),
+        ));
+    }
+    if ctx.schema.find_index(&ci.name.name).is_some()
+        || ctx.schema.find_user_table(&ci.name.name).is_some()
+    {
         if ci.if_not_exists {
+            if ctx.schema.find_user_table(&ci.table_name).is_none() {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such table: {}", ci.table_name),
+                ));
+            }
             return Ok(());
         }
         return Err(SqliteError::new(
             ErrorCode::Error,
-            format!("index {} already exists", ci.name),
+            format!("index {} already exists", ci.name.name),
         ));
     }
     let Some(tbl) = ctx.schema.find_user_table(&ci.table_name).cloned() else {
@@ -8501,10 +9216,10 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
     insert_schema_entry(
         ctx.btree,
         "index",
-        &ci.name,
+        &ci.name.name,
         &tbl.name,
         idx_root,
-        Some(&ci.raw_sql),
+        Some(&ci.catalog_sql),
     )?;
     *ctx.schema = Schema::load(ctx.btree)?;
     *ctx.schema_generation += 1;
@@ -8552,7 +9267,7 @@ fn populate_index_btree(
     Ok(())
 }
 
-fn exec_reindex(ctx: &mut ExecContext<'_>, target: Option<&str>) -> Result<()> {
+fn exec_reindex(ctx: &mut ExecContext<'_>, target: Option<&QualifiedName>) -> Result<()> {
     let mut primary_without_rowid_tables: Vec<TableSchema> = Vec::new();
     let targets: Vec<IndexSchema> = match target {
         None => {
@@ -8565,12 +9280,35 @@ fn exec_reindex(ctx: &mut ExecContext<'_>, target: Option<&str>) -> Result<()> {
                 .collect();
             ctx.schema.indexes.clone()
         }
-        Some(raw_name) => {
-            let clean = raw_name
-                .strip_prefix("main.")
-                .or_else(|| raw_name.strip_prefix("MAIN."))
-                .unwrap_or(raw_name);
-            if let Some(coll) = Collation::from_name(clean) {
+        Some(qn) => {
+            if let Some(ref s) = qn.schema {
+                if !s.eq_ignore_ascii_case("main") && !s.eq_ignore_ascii_case("temp") {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("unknown database {s}"),
+                    ));
+                }
+                if s.eq_ignore_ascii_case("main") {
+                    if let Some(tbl) = ctx.schema.find_user_table(&qn.name).cloned() {
+                        if tbl.without_rowid {
+                            primary_without_rowid_tables.push(tbl);
+                        }
+                        ctx.schema.indexes_for_table(&qn.name)
+                    } else if let Some(idx) = ctx.schema.find_index(&qn.name).cloned() {
+                        vec![idx]
+                    } else {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            "unable to identify the object to be reindexed",
+                        ));
+                    }
+                } else {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "unable to identify the object to be reindexed",
+                    ));
+                }
+            } else if let Some(coll) = Collation::from_name(&qn.name) {
                 primary_without_rowid_tables = ctx
                     .schema
                     .tables
@@ -8589,12 +9327,14 @@ fn exec_reindex(ctx: &mut ExecContext<'_>, target: Option<&str>) -> Result<()> {
                     .filter(|idx| idx.columns.iter().any(|c| c.sort_order.collation == coll))
                     .cloned()
                     .collect()
-            } else if let Some(tbl) = ctx.schema.find_user_table(clean).cloned() {
+            } else if ctx.collations.has_collation(&qn.name) {
+                Vec::new()
+            } else if let Some(tbl) = ctx.schema.find_user_table(&qn.name).cloned() {
                 if tbl.without_rowid {
                     primary_without_rowid_tables.push(tbl);
                 }
-                ctx.schema.indexes_for_table(clean)
-            } else if let Some(idx) = ctx.schema.find_index(clean).cloned() {
+                ctx.schema.indexes_for_table(&qn.name)
+            } else if let Some(idx) = ctx.schema.find_index(&qn.name).cloned() {
                 vec![idx]
             } else {
                 return Err(SqliteError::new(
@@ -8607,7 +9347,7 @@ fn exec_reindex(ctx: &mut ExecContext<'_>, target: Option<&str>) -> Result<()> {
 
     for tbl in primary_without_rowid_tables {
         let pk_orders = tbl.without_rowid_pk_orders();
-        let entries = scan_index_incremental(ctx.btree, tbl.root_pgno, pk_orders.clone())?;
+        let entries = ctx.scan_index(tbl.root_pgno, pk_orders.clone())?;
         ctx.btree.clear_tree(tbl.root_pgno)?;
         for rec in entries {
             ctx.btree.insert_index(tbl.root_pgno, &rec, &pk_orders)?;
@@ -8624,14 +9364,27 @@ fn exec_reindex(ctx: &mut ExecContext<'_>, target: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn exec_drop_index(ctx: &mut ExecContext<'_>, if_exists: bool, name: &str) -> Result<()> {
-    let Some(idx) = ctx.schema.find_index_including_without_rowid_pk(name) else {
+fn exec_drop_index(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedName) -> Result<()> {
+    if name
+        .schema
+        .as_deref()
+        .is_some_and(|s| !s.eq_ignore_ascii_case("main"))
+    {
         if if_exists {
             return Ok(());
         }
         return Err(SqliteError::new(
             ErrorCode::Error,
-            format!("no such index: {name}"),
+            format!("no such index: {}", name.display_name()),
+        ));
+    }
+    let Some(idx) = ctx.schema.find_index_including_without_rowid_pk(&name.name) else {
+        if if_exists {
+            return Ok(());
+        }
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("no such index: {}", name.display_name()),
         ));
     };
     if idx.is_autoindex {
@@ -8662,13 +9415,24 @@ fn exec_drop_index(ctx: &mut ExecContext<'_>, if_exists: bool, name: &str) -> Re
 
 fn exec_alter_table(
     ctx: &mut ExecContext<'_>,
-    table: &str,
+    table: &QualifiedName,
     action: &AlterTableAction,
 ) -> Result<()> {
-    let Some(tbl) = ctx.schema.find_user_table(table).cloned() else {
+    validate_drop_or_alter_schema_table(table, "altered")?;
+    if table
+        .schema
+        .as_deref()
+        .is_some_and(|s| !s.eq_ignore_ascii_case("main"))
+    {
         return Err(SqliteError::new(
             ErrorCode::Error,
-            format!("no such table: {table}"),
+            format!("no such table: {}", table.display_name()),
+        ));
+    }
+    let Some(tbl) = ctx.schema.find_user_table(&table.name).cloned() else {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("no such table: {}", table.display_name()),
         ));
     };
 
@@ -11064,6 +11828,44 @@ fn collect_core_roots_rec(
     }
 }
 
+fn collect_table_root_spec(
+    name: &QualifiedName,
+    schema: &Schema,
+    cte_stack: &[String],
+    seen: &mut HashSet<Pgno>,
+    out: &mut Vec<LeaseCursorSpec>,
+) {
+    if name.schema.is_none() && cte_stack.iter().any(|c| c.eq_ignore_ascii_case(&name.name)) {
+        return;
+    }
+    if name
+        .schema
+        .as_deref()
+        .is_some_and(|s| !s.eq_ignore_ascii_case("main"))
+    {
+        return;
+    }
+    if Schema::is_schema_table_name(&name.name) {
+        if seen.insert(1) {
+            out.push(LeaseCursorSpec::Table(1));
+        }
+        return;
+    }
+    if let Some(tbl) = schema.find_user_table(&name.name)
+        && tbl.root_pgno != 0
+        && seen.insert(tbl.root_pgno)
+    {
+        if tbl.without_rowid {
+            out.push(LeaseCursorSpec::Index(
+                tbl.root_pgno,
+                tbl.without_rowid_pk_orders(),
+            ));
+        } else {
+            out.push(LeaseCursorSpec::Table(tbl.root_pgno));
+        }
+    }
+}
+
 fn collect_tos_roots_rec(
     tos: &TableOrSubquery,
     schema: &Schema,
@@ -11073,21 +11875,7 @@ fn collect_tos_roots_rec(
 ) {
     match tos {
         TableOrSubquery::Table { name, .. } => {
-            if cte_stack.iter().any(|c| c.eq_ignore_ascii_case(name)) {
-                return;
-            }
-            if let Some(tbl) = schema.find_table(name)
-                && seen.insert(tbl.root_pgno)
-            {
-                if tbl.without_rowid {
-                    out.push(LeaseCursorSpec::Index(
-                        tbl.root_pgno,
-                        tbl.without_rowid_pk_orders(),
-                    ));
-                } else {
-                    out.push(LeaseCursorSpec::Table(tbl.root_pgno));
-                }
-            }
+            collect_table_root_spec(name, schema, cte_stack, seen, out);
         }
         TableOrSubquery::Subquery { query, .. } => {
             collect_select_roots_rec(query, schema, cte_stack, seen, out);
@@ -11135,6 +11923,10 @@ fn collect_expr_roots_rec(
             collect_expr_roots_rec(e, schema, cte_stack, seen, out);
             collect_select_roots_rec(subquery, schema, cte_stack, seen, out);
         }
+        Expr::InTable { expr: e, table, .. } => {
+            collect_expr_roots_rec(e, schema, cte_stack, seen, out);
+            collect_table_root_spec(table, schema, cte_stack, seen, out);
+        }
         Expr::Like {
             expr: e,
             pattern,
@@ -11180,6 +11972,21 @@ fn collect_expr_roots_rec(
     }
 }
 
+/// Rewrites a bare top-level identifier (`Expr::Column(ColumnRef { schema: None, table: None, column })`)
+/// in `ATTACH ... AS <schema_expr>` / `DETACH <schema_expr>` into a string literal (`sqlite/src/attach.c:codeAttach`).
+fn normalize_attach_schema_expr(expr: &Expr) -> std::borrow::Cow<'_, Expr> {
+    if let Expr::Column(ColumnRef {
+        schema: None,
+        table: None,
+        column,
+    }) = expr
+    {
+        std::borrow::Cow::Owned(Expr::String(column.clone()))
+    } else {
+        std::borrow::Cow::Borrowed(expr)
+    }
+}
+
 /// Validates semantic bindings (tables, columns, functions, subqueries, DML/DDL widths) with
 /// ZERO side effects and returns the exact result column names for `Connection::prepare`.
 pub(crate) fn validate_and_infer_columns(
@@ -11187,14 +11994,78 @@ pub(crate) fn validate_and_infer_columns(
     schema: &Schema,
     foreign_keys: bool,
     count_changes: bool,
+    functions: &FunctionRegistry,
+    collations: &CollationRegistry,
 ) -> Result<Vec<String>> {
     match stmt {
         Stmt::Begin { .. }
         | Stmt::Commit
         | Stmt::Rollback { .. }
         | Stmt::Savepoint(_)
-        | Stmt::Release(_)
-        | Stmt::Analyze(_) => Ok(Vec::new()),
+        | Stmt::Release(_) => Ok(Vec::new()),
+
+        Stmt::Analyze(target) => {
+            validate_analyze_target(schema, target.as_ref())?;
+            Ok(Vec::new())
+        }
+
+        Stmt::AttachDatabase {
+            expr,
+            schema_name,
+            key,
+        } => {
+            let mut visited = Vec::new();
+            validate_expr_static(
+                expr,
+                &[],
+                schema,
+                &CteStore::default(),
+                functions,
+                false,
+                false,
+                &mut visited,
+            )?;
+            let norm_schema = normalize_attach_schema_expr(schema_name);
+            validate_expr_static(
+                &norm_schema,
+                &[],
+                schema,
+                &CteStore::default(),
+                functions,
+                false,
+                false,
+                &mut visited,
+            )?;
+            if let Some(k) = key {
+                validate_expr_static(
+                    k,
+                    &[],
+                    schema,
+                    &CteStore::default(),
+                    functions,
+                    false,
+                    false,
+                    &mut visited,
+                )?;
+            }
+            Ok(Vec::new())
+        }
+
+        Stmt::DetachDatabase { schema_name } => {
+            let mut visited = Vec::new();
+            let norm_schema = normalize_attach_schema_expr(schema_name);
+            validate_expr_static(
+                &norm_schema,
+                &[],
+                schema,
+                &CteStore::default(),
+                functions,
+                false,
+                false,
+                &mut visited,
+            )?;
+            Ok(Vec::new())
+        }
 
         Stmt::Vacuum {
             schema: vac_schema,
@@ -11218,6 +12089,7 @@ pub(crate) fn validate_and_infer_columns(
                     &[],
                     schema,
                     &CteStore::default(),
+                    functions,
                     false,
                     false,
                     &mut visited,
@@ -11227,19 +12099,34 @@ pub(crate) fn validate_and_infer_columns(
         }
 
         Stmt::Reindex(target) => {
-            if let Some(raw_name) = target {
-                let clean = raw_name
-                    .strip_prefix("main.")
-                    .or_else(|| raw_name.strip_prefix("MAIN."))
-                    .unwrap_or(raw_name);
-                let ok = Collation::from_name(clean).is_some()
-                    || schema.find_user_table(clean).is_some()
-                    || schema.find_index(clean).is_some();
-                if !ok {
-                    return Err(SqliteError::new(
-                        ErrorCode::Error,
-                        "unable to identify the object to be reindexed",
-                    ));
+            if let Some(qn) = target {
+                if let Some(ref s) = qn.schema {
+                    if !s.eq_ignore_ascii_case("main") && !s.eq_ignore_ascii_case("temp") {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("unknown database {s}"),
+                        ));
+                    }
+                    let ok = s.eq_ignore_ascii_case("main")
+                        && (schema.find_user_table(&qn.name).is_some()
+                            || schema.find_index(&qn.name).is_some());
+                    if !ok {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            "unable to identify the object to be reindexed",
+                        ));
+                    }
+                } else {
+                    let ok = Collation::from_name(&qn.name).is_some()
+                        || collations.has_collation(&qn.name)
+                        || schema.find_user_table(&qn.name).is_some()
+                        || schema.find_index(&qn.name).is_some();
+                    if !ok {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            "unable to identify the object to be reindexed",
+                        ));
+                    }
                 }
             }
             Ok(Vec::new())
@@ -11263,7 +12150,14 @@ pub(crate) fn validate_and_infer_columns(
         }
 
         Stmt::Explain { query_plan, stmt } => {
-            let _ = validate_and_infer_columns(stmt, schema, foreign_keys, count_changes)?;
+            let _ = validate_and_infer_columns(
+                stmt,
+                schema,
+                foreign_keys,
+                count_changes,
+                functions,
+                collations,
+            )?;
             if *query_plan {
                 Ok(vec![
                     "id".to_owned(),
@@ -11287,23 +12181,34 @@ pub(crate) fn validate_and_infer_columns(
 
         Stmt::Select(sel) => {
             let mut visited = Vec::new();
-            validate_select_stmt_static(sel, &[], schema, &CteStore::default(), &mut visited)
+            validate_select_stmt_static(
+                sel,
+                &[],
+                schema,
+                &CteStore::default(),
+                functions,
+                &mut visited,
+            )
         }
 
         Stmt::CreateTable(ct) => {
-            if is_reserved_sqlite_name(&ct.name) {
+            let is_temp = validate_create_table_target(ct.temp, &ct.name)?;
+            if is_reserved_sqlite_name(&ct.name.name) {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    format!("object name reserved for internal use: {}", ct.name),
+                    format!("object name reserved for internal use: {}", ct.name.name),
                 ));
             }
-            if schema.find_user_table(&ct.name).is_some() || schema.find_index(&ct.name).is_some() {
+            if !is_temp
+                && (schema.find_user_table(&ct.name.name).is_some()
+                    || schema.find_index(&ct.name.name).is_some())
+            {
                 if ct.if_not_exists {
                     return Ok(Vec::new());
                 }
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    format!("table {} already exists", ct.name),
+                    format!("table {} already exists", ct.name.name),
                 ));
             }
             let (tbl_preview, _) = build_table_schema_from_ast(ct, 2)?;
@@ -11316,6 +12221,7 @@ pub(crate) fn validate_and_infer_columns(
                         &[],
                         schema,
                         &CteStore::default(),
+                        functions,
                         false,
                         false,
                         &mut visited,
@@ -11327,6 +12233,7 @@ pub(crate) fn validate_and_infer_columns(
                         std::slice::from_ref(&tbl_scope),
                         schema,
                         &CteStore::default(),
+                        functions,
                         false,
                         false,
                         &mut visited,
@@ -11339,6 +12246,7 @@ pub(crate) fn validate_and_infer_columns(
                     std::slice::from_ref(&tbl_scope),
                     schema,
                     &CteStore::default(),
+                    functions,
                     false,
                     false,
                     &mut visited,
@@ -11348,17 +12256,22 @@ pub(crate) fn validate_and_infer_columns(
         }
 
         Stmt::CreateTableAs {
+            temp,
             if_not_exists,
             name,
             query,
         } => {
-            if is_reserved_sqlite_name(name) {
+            let is_temp = validate_create_table_target(*temp, name)?;
+            if is_reserved_sqlite_name(&name.name) {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    format!("object name reserved for internal use: {name}"),
+                    format!("object name reserved for internal use: {}", name.name),
                 ));
             }
-            if schema.find_user_table(name).is_some() || schema.find_index(name).is_some() {
+            if !is_temp
+                && (schema.find_user_table(&name.name).is_some()
+                    || schema.find_index(&name.name).is_some())
+            {
                 if *if_not_exists {
                     let mut visited = Vec::new();
                     let _ = validate_select_stmt_static(
@@ -11366,13 +12279,14 @@ pub(crate) fn validate_and_infer_columns(
                         &[],
                         schema,
                         &CteStore::default(),
+                        functions,
                         &mut visited,
                     )?;
                     return Ok(Vec::new());
                 }
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    format!("table {name} already exists"),
+                    format!("table {} already exists", name.name),
                 ));
             }
             let mut visited = Vec::new();
@@ -11381,35 +12295,67 @@ pub(crate) fn validate_and_infer_columns(
                 &[],
                 schema,
                 &CteStore::default(),
+                functions,
                 &mut visited,
             )?;
             Ok(Vec::new())
         }
 
         Stmt::DropTable { if_exists, name } => {
-            if Schema::is_schema_table_name(name) {
+            validate_drop_or_alter_schema_table(name, "dropped")?;
+            let exists_in_target = name
+                .schema
+                .as_deref()
+                .is_none_or(|s| s.eq_ignore_ascii_case("main"))
+                && schema.find_user_table(&name.name).is_some();
+            if !exists_in_target && !if_exists {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    format!("table {name} may not be dropped"),
-                ));
-            }
-            if schema.find_user_table(name).is_none() && !if_exists {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    format!("no such table: {name}"),
+                    format!("no such table: {}", name.display_name()),
                 ));
             }
             Ok(Vec::new())
         }
 
         Stmt::CreateIndex(ci) => {
-            if is_reserved_sqlite_name(&ci.name) {
+            if let Some(ref s) = ci.name.schema
+                && !s.eq_ignore_ascii_case("main")
+                && !s.eq_ignore_ascii_case("temp")
+            {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    format!("object name reserved for internal use: {}", ci.name),
+                    format!("unknown database {s}"),
                 ));
             }
-            if schema.find_index(&ci.name).is_some() || schema.find_user_table(&ci.name).is_some() {
+            if is_reserved_sqlite_name(&ci.name.name) {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("object name reserved for internal use: {}", ci.name.name),
+                ));
+            }
+            if ci
+                .name
+                .schema
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case("temp"))
+            {
+                if schema.find_user_table(&ci.table_name).is_some() {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!(
+                            "cannot create a TEMP index on non-TEMP table \"{}\"",
+                            ci.table_name
+                        ),
+                    ));
+                }
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such table: temp.{}", ci.table_name),
+                ));
+            }
+            if schema.find_index(&ci.name.name).is_some()
+                || schema.find_user_table(&ci.name.name).is_some()
+            {
                 if ci.if_not_exists {
                     if schema.find_user_table(&ci.table_name).is_none() {
                         return Err(SqliteError::new(
@@ -11421,7 +12367,7 @@ pub(crate) fn validate_and_infer_columns(
                 }
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    format!("index {} already exists", ci.name),
+                    format!("index {} already exists", ci.name.name),
                 ));
             }
             let Some(tbl) = schema.find_user_table(&ci.table_name) else {
@@ -11440,6 +12386,7 @@ pub(crate) fn validate_and_infer_columns(
                         std::slice::from_ref(&tbl_scope),
                         schema,
                         &CteStore::default(),
+                        functions,
                         false,
                         false,
                         &mut visited,
@@ -11452,6 +12399,7 @@ pub(crate) fn validate_and_infer_columns(
                     std::slice::from_ref(&tbl_scope),
                     schema,
                     &CteStore::default(),
+                    functions,
                     false,
                     false,
                     &mut visited,
@@ -11461,12 +12409,25 @@ pub(crate) fn validate_and_infer_columns(
         }
 
         Stmt::DropIndex { if_exists, name } => {
-            match schema.find_index_including_without_rowid_pk(name) {
+            if name
+                .schema
+                .as_deref()
+                .is_some_and(|s| !s.eq_ignore_ascii_case("main"))
+            {
+                if !if_exists {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("no such index: {}", name.display_name()),
+                    ));
+                }
+                return Ok(Vec::new());
+            }
+            match schema.find_index_including_without_rowid_pk(&name.name) {
                 None => {
                     if !if_exists {
                         return Err(SqliteError::new(
                             ErrorCode::Error,
-                            format!("no such index: {name}"),
+                            format!("no such index: {}", name.display_name()),
                         ));
                     }
                 }
@@ -11483,10 +12444,21 @@ pub(crate) fn validate_and_infer_columns(
         }
 
         Stmt::AlterTable { table, action } => {
-            let Some(tbl) = schema.find_user_table(table) else {
+            validate_drop_or_alter_schema_table(table, "altered")?;
+            if table
+                .schema
+                .as_deref()
+                .is_some_and(|s| !s.eq_ignore_ascii_case("main"))
+            {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    format!("no such table: {table}"),
+                    format!("no such table: {}", table.display_name()),
+                ));
+            }
+            let Some(tbl) = schema.find_user_table(&table.name) else {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such table: {}", table.display_name()),
                 ));
             };
             match action {
@@ -11563,9 +12535,9 @@ pub(crate) fn validate_and_infer_columns(
             Ok(Vec::new())
         }
 
-        Stmt::Insert(ins) => validate_insert_static(ins, schema, count_changes),
-        Stmt::Update(upd) => validate_update_static(upd, schema, count_changes),
-        Stmt::Delete(del) => validate_delete_static(del, schema, count_changes),
+        Stmt::Insert(ins) => validate_insert_static(ins, schema, functions, count_changes),
+        Stmt::Update(upd) => validate_update_static(upd, schema, functions, count_changes),
+        Stmt::Delete(del) => validate_delete_static(del, schema, functions, count_changes),
     }
 }
 
@@ -11730,6 +12702,10 @@ fn make_static_table_scope(tbl: &TableSchema, alias: Option<&str>) -> EvalRow {
     make_single_table_scope(tbl, alias, 0, &vec![Value::Null; tbl.columns.len()])
 }
 
+fn make_static_returning_scope(tbl: &TableSchema) -> EvalRow {
+    make_returning_table_scope(tbl, 0, &vec![Value::Null; tbl.columns.len()])
+}
+
 fn validate_index_hint_static(
     schema: &Schema,
     tbl: &TableSchema,
@@ -11789,21 +12765,11 @@ fn validate_cte_scope_static(ctes_list: &[CommonTableExpr]) -> Result<()> {
 fn validate_insert_static(
     ins: &InsertStmt,
     schema: &Schema,
+    functions: &FunctionRegistry,
     count_changes: bool,
 ) -> Result<Vec<String>> {
     validate_cte_scope_static(&ins.ctes)?;
-    if Schema::is_schema_table_name(&ins.table) {
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            format!("table {} may not be modified", ins.table),
-        ));
-    }
-    let Some(tbl) = schema.find_table(&ins.table) else {
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            format!("no such table: {}", ins.table),
-        ));
-    };
+    let tbl = resolve_dml_target_table(schema, &ins.table)?;
     let dml_ctes = CteStore::default().with_scope(&ins.ctes);
     let mut visited = Vec::new();
 
@@ -11850,12 +12816,22 @@ fn validate_insert_static(
                     ));
                 }
                 for e in erow {
-                    validate_expr_static(e, &[], schema, &dml_ctes, false, false, &mut visited)?;
+                    validate_expr_static(
+                        e,
+                        &[],
+                        schema,
+                        &dml_ctes,
+                        functions,
+                        false,
+                        false,
+                        &mut visited,
+                    )?;
                 }
             }
         }
         InsertSource::Select(sel) => {
-            let sel_cols = validate_select_stmt_static(sel, &[], schema, &dml_ctes, &mut visited)?;
+            let sel_cols =
+                validate_select_stmt_static(sel, &[], schema, &dml_ctes, functions, &mut visited)?;
             if sel_cols.len() != expected_width {
                 if ins.columns.is_some() {
                     return Err(SqliteError::new(
@@ -11877,14 +12853,16 @@ fn validate_insert_static(
     }
 
     if !ins.returning.is_empty() {
-        let sample_scope = make_static_table_scope(&tbl, None);
-        let (ret_cols, ret_expanded) = expand_projection(&ins.returning, &sample_scope.cols)?;
+        let sample_scope = make_static_returning_scope(tbl);
+        let (ret_cols, ret_expanded) =
+            expand_returning_projection(&ins.returning, &sample_scope.cols)?;
         for (pe, _, _) in &ret_expanded {
             validate_expr_static(
                 pe,
                 std::slice::from_ref(&sample_scope),
                 schema,
                 &dml_ctes,
+                functions,
                 false,
                 false,
                 &mut visited,
@@ -11903,29 +12881,14 @@ fn validate_insert_static(
 fn validate_update_static(
     upd: &UpdateStmt,
     schema: &Schema,
+    functions: &FunctionRegistry,
     count_changes: bool,
 ) -> Result<Vec<String>> {
     validate_cte_scope_static(&upd.ctes)?;
-    if Schema::is_schema_table_name(&upd.table) {
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            format!("table {} may not be modified", upd.table),
-        ));
-    }
-    let Some(tbl) = schema.find_table(&upd.table) else {
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            format!("no such table: {}", upd.table),
-        ));
-    };
-    validate_index_hint_static(
-        schema,
-        &tbl,
-        upd.indexed_by.as_ref(),
-        upd.selection.as_ref(),
-    )?;
+    let tbl = resolve_dml_target_table(schema, &upd.table)?;
+    validate_index_hint_static(schema, tbl, upd.indexed_by.as_ref(), upd.selection.as_ref())?;
     let dml_ctes = CteStore::default().with_scope(&upd.ctes);
-    let scope = make_static_table_scope(&tbl, upd.alias.as_deref());
+    let scope = make_static_table_scope(tbl, upd.alias.as_deref());
     let mut visited = Vec::new();
 
     for (cname, expr) in &upd.assignments {
@@ -11947,6 +12910,7 @@ fn validate_update_static(
             std::slice::from_ref(&scope),
             schema,
             &dml_ctes,
+            functions,
             false,
             false,
             &mut visited,
@@ -11959,6 +12923,7 @@ fn validate_update_static(
             std::slice::from_ref(&scope),
             schema,
             &dml_ctes,
+            functions,
             false,
             false,
             &mut visited,
@@ -11966,14 +12931,16 @@ fn validate_update_static(
     }
 
     if !upd.returning.is_empty() {
-        let ret_scope = make_static_table_scope(&tbl, upd.alias.as_deref());
-        let (ret_cols, ret_expanded) = expand_projection(&upd.returning, &ret_scope.cols)?;
+        let ret_scope = make_static_returning_scope(tbl);
+        let (ret_cols, ret_expanded) =
+            expand_returning_projection(&upd.returning, &ret_scope.cols)?;
         for (pe, _, _) in &ret_expanded {
             validate_expr_static(
                 pe,
                 std::slice::from_ref(&ret_scope),
                 schema,
                 &dml_ctes,
+                functions,
                 false,
                 false,
                 &mut visited,
@@ -11992,29 +12959,14 @@ fn validate_update_static(
 fn validate_delete_static(
     del: &DeleteStmt,
     schema: &Schema,
+    functions: &FunctionRegistry,
     count_changes: bool,
 ) -> Result<Vec<String>> {
     validate_cte_scope_static(&del.ctes)?;
-    if Schema::is_schema_table_name(&del.table) {
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            format!("table {} may not be modified", del.table),
-        ));
-    }
-    let Some(tbl) = schema.find_table(&del.table) else {
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            format!("no such table: {}", del.table),
-        ));
-    };
-    validate_index_hint_static(
-        schema,
-        &tbl,
-        del.indexed_by.as_ref(),
-        del.selection.as_ref(),
-    )?;
+    let tbl = resolve_dml_target_table(schema, &del.table)?;
+    validate_index_hint_static(schema, tbl, del.indexed_by.as_ref(), del.selection.as_ref())?;
     let dml_ctes = CteStore::default().with_scope(&del.ctes);
-    let scope = make_static_table_scope(&tbl, del.alias.as_deref());
+    let scope = make_static_table_scope(tbl, del.alias.as_deref());
     let mut visited = Vec::new();
 
     if let Some(ref w) = del.selection {
@@ -12023,6 +12975,7 @@ fn validate_delete_static(
             std::slice::from_ref(&scope),
             schema,
             &dml_ctes,
+            functions,
             false,
             false,
             &mut visited,
@@ -12030,14 +12983,16 @@ fn validate_delete_static(
     }
 
     if !del.returning.is_empty() {
-        let ret_scope = make_static_table_scope(&tbl, del.alias.as_deref());
-        let (ret_cols, ret_expanded) = expand_projection(&del.returning, &ret_scope.cols)?;
+        let ret_scope = make_static_returning_scope(tbl);
+        let (ret_cols, ret_expanded) =
+            expand_returning_projection(&del.returning, &ret_scope.cols)?;
         for (pe, _, _) in &ret_expanded {
             validate_expr_static(
                 pe,
                 std::slice::from_ref(&ret_scope),
                 schema,
                 &dml_ctes,
+                functions,
                 false,
                 false,
                 &mut visited,
@@ -12058,6 +13013,7 @@ fn validate_select_stmt_static(
     outer_scopes: &[EvalRow],
     schema: &Schema,
     parent_ctes: &CteStore,
+    functions: &FunctionRegistry,
     visited_ctes: &mut Vec<(usize, usize)>,
 ) -> Result<Vec<String>> {
     validate_cte_scope_static(&stmt.ctes)?;
@@ -12069,12 +13025,22 @@ fn validate_select_stmt_static(
             outer_scopes,
             schema,
             &ctes,
+            functions,
             false,
             false,
             visited_ctes,
         )?;
         if let Some(ref off) = lim.offset {
-            validate_expr_static(off, outer_scopes, schema, &ctes, false, false, visited_ctes)?;
+            validate_expr_static(
+                off,
+                outer_scopes,
+                schema,
+                &ctes,
+                functions,
+                false,
+                false,
+                visited_ctes,
+            )?;
         }
     }
 
@@ -12085,6 +13051,7 @@ fn validate_select_stmt_static(
             outer_scopes,
             schema,
             &ctes,
+            functions,
             visited_ctes,
         )
     } else {
@@ -12094,6 +13061,7 @@ fn validate_select_stmt_static(
             outer_scopes,
             schema,
             &ctes,
+            functions,
             visited_ctes,
         )?;
         let mut all_arm_cols = vec![head_cols.clone()];
@@ -12104,6 +13072,7 @@ fn validate_select_stmt_static(
                 outer_scopes,
                 schema,
                 &ctes,
+                functions,
                 visited_ctes,
             )?;
             if rhs_cols.len() != head_cols.len() {
@@ -12138,10 +13107,11 @@ fn validate_select_stmt_static(
                 continue;
             }
             let target_label = match inner {
-                Expr::Column {
+                Expr::Column(ColumnRef {
+                    schema: None,
                     table: None,
                     column,
-                } => column.clone(),
+                }) => column.clone(),
                 other => expr_column_label(other),
             };
             let matched = all_arm_cols
@@ -12167,6 +13137,7 @@ fn validate_single_select_core_static(
     outer_scopes: &[EvalRow],
     schema: &Schema,
     ctes: &CteStore,
+    functions: &FunctionRegistry,
     visited_ctes: &mut Vec<(usize, usize)>,
 ) -> Result<Vec<String>> {
     match core {
@@ -12188,6 +13159,7 @@ fn validate_single_select_core_static(
                         outer_scopes,
                         schema,
                         ctes,
+                        functions,
                         false,
                         false,
                         visited_ctes,
@@ -12215,10 +13187,11 @@ fn validate_single_select_core_static(
                         continue;
                     }
                     let target_label = match inner {
-                        Expr::Column {
+                        Expr::Column(ColumnRef {
+                            schema: None,
                             table: None,
                             column,
-                        } => column.clone(),
+                        }) => column.clone(),
                         other => expr_column_label(other),
                     };
                     if !col_names
@@ -12253,6 +13226,7 @@ fn validate_single_select_core_static(
                     outer_scopes,
                     schema,
                     ctes,
+                    functions,
                     visited_ctes,
                 )?,
             };
@@ -12270,6 +13244,7 @@ fn validate_single_select_core_static(
                     &full_scopes,
                     schema,
                     ctes,
+                    functions,
                     false,
                     false,
                     visited_ctes,
@@ -12285,7 +13260,16 @@ fn validate_single_select_core_static(
                 || order_by.iter().any(|ob| expr_contains_aggregate(&ob.expr));
 
             for (pe, _, _) in &expanded_proj {
-                validate_expr_static(pe, &full_scopes, schema, ctes, is_agg, false, visited_ctes)?;
+                validate_expr_static(
+                    pe,
+                    &full_scopes,
+                    schema,
+                    ctes,
+                    functions,
+                    is_agg,
+                    false,
+                    visited_ctes,
+                )?;
             }
 
             for (gi, ge) in group_by.iter().enumerate() {
@@ -12312,6 +13296,7 @@ fn validate_single_select_core_static(
                         &full_scopes,
                         schema,
                         ctes,
+                        functions,
                         false,
                         false,
                         visited_ctes,
@@ -12327,6 +13312,7 @@ fn validate_single_select_core_static(
                     &full_scopes,
                     schema,
                     ctes,
+                    functions,
                     true,
                     false,
                     visited_ctes,
@@ -12357,6 +13343,7 @@ fn validate_single_select_core_static(
                         &full_scopes,
                         schema,
                         ctes,
+                        functions,
                         is_agg,
                         false,
                         visited_ctes,
@@ -12376,10 +13363,11 @@ fn subst_order_by_aliases_static(
     outer_scopes: &[EvalRow],
 ) -> Expr {
     match expr {
-        Expr::Column {
+        Expr::Column(ColumnRef {
+            schema: None,
             table: None,
             column,
-        } => {
+        }) => {
             let in_sample = sample_cols.iter().any(|sc| {
                 if sc.hidden_rowid {
                     column.eq_ignore_ascii_case("rowid")
@@ -12507,6 +13495,20 @@ fn subst_order_by_aliases_static(
                 .collect(),
             negated: *negated,
         },
+        Expr::InTable {
+            expr: val,
+            table,
+            negated,
+        } => Expr::InTable {
+            expr: Box::new(subst_order_by_aliases_static(
+                val,
+                expanded_proj,
+                sample_cols,
+                outer_scopes,
+            )),
+            table: table.clone(),
+            negated: *negated,
+        },
         Expr::Like {
             expr: val,
             pattern,
@@ -12616,6 +13618,7 @@ fn validate_from_clause_static(
     outer_scopes: &[EvalRow],
     schema: &Schema,
     ctes: &CteStore,
+    functions: &FunctionRegistry,
     visited_ctes: &mut Vec<(usize, usize)>,
 ) -> Result<Vec<ScopedColumn>> {
     let head_hint = if fc.joins.is_empty() {
@@ -12629,12 +13632,20 @@ fn validate_from_clause_static(
         outer_scopes,
         schema,
         ctes,
+        functions,
         visited_ctes,
     )?;
 
     for join in &fc.joins {
-        let right_cols =
-            validate_tos_static(&join.right, None, outer_scopes, schema, ctes, visited_ctes)?;
+        let right_cols = validate_tos_static(
+            &join.right,
+            None,
+            outer_scopes,
+            schema,
+            ctes,
+            functions,
+            visited_ctes,
+        )?;
 
         if join.natural && join.constraint.is_some() {
             return Err(SqliteError::new(
@@ -12672,6 +13683,7 @@ fn validate_from_clause_static(
                 &join_scopes,
                 schema,
                 ctes,
+                functions,
                 false,
                 false,
                 visited_ctes,
@@ -12689,6 +13701,7 @@ fn validate_tos_static(
     outer_scopes: &[EvalRow],
     schema: &Schema,
     ctes: &CteStore,
+    functions: &FunctionRegistry,
     visited_ctes: &mut Vec<(usize, usize)>,
 ) -> Result<Vec<ScopedColumn>> {
     match tos {
@@ -12697,14 +13710,16 @@ fn validate_tos_static(
             alias,
             indexed_by,
         } => {
-            let eff_alias = alias.clone().unwrap_or_else(|| name.clone());
-            if let Some((s_idx, c_idx)) = ctes.locate(name) {
+            let eff_alias = alias.clone().unwrap_or_else(|| name.name.clone());
+            if name.schema.is_none()
+                && let Some((s_idx, c_idx)) = ctes.locate(&name.name)
+            {
                 if indexed_by.is_some() {
                     return Err(SqliteError::new(
                         ErrorCode::Error,
                         match indexed_by {
                             Some(IndexHint::NotIndexed) => {
-                                format!("cannot use NOT INDEXED on CTE: {name}")
+                                format!("cannot use NOT INDEXED on CTE: {}", name.name)
                             }
                             Some(IndexHint::IndexedBy(idx)) => format!("no such index: {idx}"),
                             None => unreachable!(),
@@ -12717,15 +13732,17 @@ fn validate_tos_static(
                     outer_scopes,
                     schema,
                     ctes,
+                    functions,
                     visited_ctes,
                 )?;
-                let meta = infer_cte_meta_by_name(name, outer_scopes, schema, ctes);
+                let meta = infer_cte_meta_by_name(&name.name, outer_scopes, schema, ctes);
                 return Ok(cte_cols
                     .into_iter()
                     .enumerate()
                     .map(|(i, cn)| {
                         let (aff, coll) = meta.get(i).copied().unwrap_or((None, Collation::Binary));
                         ScopedColumn {
+                            schema_name: None,
                             table_alias: Some(eff_alias.clone()),
                             name: cn,
                             collation: coll,
@@ -12737,17 +13754,13 @@ fn validate_tos_static(
                     .collect());
             }
 
-            let Some(tbl) = schema.find_table(name) else {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    format!("no such table: {name}"),
-                ));
-            };
+            let (tbl, schema_lbl) = resolve_table_for_query(schema, name)?;
             validate_index_hint_static(schema, &tbl, indexed_by.as_ref(), where_hint)?;
             let mut cols: Vec<ScopedColumn> = tbl
                 .columns
                 .iter()
                 .map(|c| ScopedColumn {
+                    schema_name: Some(schema_lbl.to_owned()),
                     table_alias: Some(eff_alias.clone()),
                     name: c.name.clone(),
                     collation: c.collation,
@@ -12758,6 +13771,7 @@ fn validate_tos_static(
                 .collect();
             if !tbl.without_rowid {
                 cols.push(ScopedColumn {
+                    schema_name: Some(schema_lbl.to_owned()),
                     table_alias: Some(eff_alias),
                     name: "rowid".to_owned(),
                     collation: Collation::Binary,
@@ -12769,8 +13783,14 @@ fn validate_tos_static(
             Ok(cols)
         }
         TableOrSubquery::Subquery { query, alias } => {
-            let sub_cols =
-                validate_select_stmt_static(query, outer_scopes, schema, ctes, visited_ctes)?;
+            let sub_cols = validate_select_stmt_static(
+                query,
+                outer_scopes,
+                schema,
+                ctes,
+                functions,
+                visited_ctes,
+            )?;
             let sub_meta = infer_select_stmt_meta(query, outer_scopes, schema, ctes);
             Ok(sub_cols
                 .into_iter()
@@ -12781,6 +13801,7 @@ fn validate_tos_static(
                         .copied()
                         .unwrap_or((None, Collation::Binary));
                     ScopedColumn {
+                        schema_name: None,
                         table_alias: alias.clone(),
                         name: cn,
                         collation: coll,
@@ -12800,6 +13821,7 @@ fn resolve_cte_columns_static(
     outer_scopes: &[EvalRow],
     schema: &Schema,
     ctes: &CteStore,
+    functions: &FunctionRegistry,
     visited_ctes: &mut Vec<(usize, usize)>,
 ) -> Result<Vec<String>> {
     if let Some(w) = ctes.find_working(s_idx, c_idx) {
@@ -12836,6 +13858,7 @@ fn resolve_cte_columns_static(
                 outer_scopes,
                 schema,
                 &eval_ctes,
+                functions,
                 visited_ctes,
             )?;
             if let Some(ref explicit_cols) = cte.columns {
@@ -12873,6 +13896,7 @@ fn resolve_cte_columns_static(
                 outer_scopes,
                 schema,
                 &eval_ctes,
+                functions,
                 visited_ctes,
             )?;
             let working_cols = if let Some(ref explicit_cols) = cte.columns {
@@ -12936,6 +13960,7 @@ fn resolve_cte_columns_static(
                 outer_scopes,
                 schema,
                 &rec_ctes,
+                functions,
                 visited_ctes,
             )?;
             if rhs_cols.len() != working_cols.len() {
@@ -12954,6 +13979,7 @@ fn resolve_cte_columns_static(
                     outer_scopes,
                     schema,
                     &rec_ctes,
+                    functions,
                     false,
                     false,
                     visited_ctes,
@@ -12964,6 +13990,7 @@ fn resolve_cte_columns_static(
                         outer_scopes,
                         schema,
                         &rec_ctes,
+                        functions,
                         false,
                         false,
                         visited_ctes,
@@ -12978,11 +14005,13 @@ fn resolve_cte_columns_static(
     res
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_expr_static(
     expr: &Expr,
     scopes: &[EvalRow],
     schema: &Schema,
     ctes: &CteStore,
+    functions: &FunctionRegistry,
     allow_agg: bool,
     inside_agg: bool,
     visited_ctes: &mut Vec<(usize, usize)>,
@@ -12997,19 +14026,15 @@ fn validate_expr_static(
         | Expr::CurrentTimeKw(_)
         | Expr::Bind(_) => Ok(()),
 
-        Expr::Column { table, column } => {
+        Expr::Column(cref) => {
             for scope in scopes.iter().rev() {
-                if scope.lookup_full(table.as_deref(), column)?.is_some() {
+                if scope.lookup_cref_full(cref)?.is_some() {
                     return Ok(());
                 }
             }
-            let full = match table {
-                Some(t) => format!("{t}.{column}"),
-                None => column.clone(),
-            };
             Err(SqliteError::new(
                 ErrorCode::Error,
-                format!("no such column: {full}"),
+                format!("no such column: {}", cref.display_name()),
             ))
         }
 
@@ -13021,6 +14046,7 @@ fn validate_expr_static(
             scopes,
             schema,
             ctes,
+            functions,
             allow_agg,
             inside_agg,
             visited_ctes,
@@ -13033,6 +14059,7 @@ fn validate_expr_static(
                     scopes,
                     schema,
                     ctes,
+                    functions,
                     allow_agg,
                     inside_agg,
                     visited_ctes,
@@ -13060,6 +14087,7 @@ fn validate_expr_static(
                     scopes,
                     schema,
                     ctes,
+                    functions,
                     allow_agg,
                     inside_agg,
                     visited_ctes,
@@ -13069,6 +14097,7 @@ fn validate_expr_static(
                     scopes,
                     schema,
                     ctes,
+                    functions,
                     allow_agg,
                     inside_agg,
                     visited_ctes,
@@ -13097,6 +14126,7 @@ fn validate_expr_static(
                 scopes,
                 schema,
                 ctes,
+                functions,
                 allow_agg,
                 inside_agg,
                 visited_ctes,
@@ -13106,6 +14136,7 @@ fn validate_expr_static(
                 scopes,
                 schema,
                 ctes,
+                functions,
                 allow_agg,
                 inside_agg,
                 visited_ctes,
@@ -13124,6 +14155,7 @@ fn validate_expr_static(
                     scopes,
                     schema,
                     ctes,
+                    functions,
                     allow_agg,
                     inside_agg,
                     visited_ctes,
@@ -13133,6 +14165,7 @@ fn validate_expr_static(
                     scopes,
                     schema,
                     ctes,
+                    functions,
                     allow_agg,
                     inside_agg,
                     visited_ctes,
@@ -13142,6 +14175,7 @@ fn validate_expr_static(
                     scopes,
                     schema,
                     ctes,
+                    functions,
                     allow_agg,
                     inside_agg,
                     visited_ctes,
@@ -13156,6 +14190,7 @@ fn validate_expr_static(
                 scopes,
                 schema,
                 ctes,
+                functions,
                 allow_agg,
                 inside_agg,
                 visited_ctes,
@@ -13165,6 +14200,7 @@ fn validate_expr_static(
                 scopes,
                 schema,
                 ctes,
+                functions,
                 allow_agg,
                 inside_agg,
                 visited_ctes,
@@ -13174,6 +14210,7 @@ fn validate_expr_static(
                 scopes,
                 schema,
                 ctes,
+                functions,
                 allow_agg,
                 inside_agg,
                 visited_ctes,
@@ -13188,6 +14225,7 @@ fn validate_expr_static(
                 scopes,
                 schema,
                 ctes,
+                functions,
                 allow_agg,
                 inside_agg,
                 visited_ctes,
@@ -13198,6 +14236,7 @@ fn validate_expr_static(
                     scopes,
                     schema,
                     ctes,
+                    functions,
                     allow_agg,
                     inside_agg,
                     visited_ctes,
@@ -13228,12 +14267,19 @@ fn validate_expr_static(
                 scopes,
                 schema,
                 ctes,
+                functions,
                 allow_agg,
                 inside_agg,
                 visited_ctes,
             )?;
-            let sub_cols =
-                validate_select_stmt_static(subquery, scopes, schema, ctes, visited_ctes)?;
+            let sub_cols = validate_select_stmt_static(
+                subquery,
+                scopes,
+                schema,
+                ctes,
+                functions,
+                visited_ctes,
+            )?;
             if !sub_cols.is_empty() && sub_cols.len() != n {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
@@ -13241,6 +14287,45 @@ fn validate_expr_static(
                         "sub-select returns {} columns - expected {n}",
                         sub_cols.len()
                     ),
+                ));
+            }
+            Ok(())
+        }
+
+        Expr::InTable {
+            expr: lhs_e, table, ..
+        } => {
+            let n = validate_tuple_expr_static(
+                lhs_e,
+                scopes,
+                schema,
+                ctes,
+                functions,
+                allow_agg,
+                inside_agg,
+                visited_ctes,
+            )?;
+            let m = if table.schema.is_none()
+                && let Some((s_idx, c_idx)) = ctes.locate(&table.name)
+            {
+                resolve_cte_columns_static(
+                    s_idx,
+                    c_idx,
+                    scopes,
+                    schema,
+                    ctes,
+                    functions,
+                    visited_ctes,
+                )?
+                .len()
+            } else {
+                let (tbl, _) = resolve_table_for_query(schema, table)?;
+                tbl.columns.len()
+            };
+            if m != n {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("sub-select returns {m} columns - expected {n}"),
                 ));
             }
             Ok(())
@@ -13257,6 +14342,7 @@ fn validate_expr_static(
                 scopes,
                 schema,
                 ctes,
+                functions,
                 allow_agg,
                 inside_agg,
                 visited_ctes,
@@ -13266,6 +14352,7 @@ fn validate_expr_static(
                 scopes,
                 schema,
                 ctes,
+                functions,
                 allow_agg,
                 inside_agg,
                 visited_ctes,
@@ -13276,6 +14363,7 @@ fn validate_expr_static(
                     scopes,
                     schema,
                     ctes,
+                    functions,
                     allow_agg,
                     inside_agg,
                     visited_ctes,
@@ -13295,14 +14383,33 @@ fn validate_expr_static(
                     scopes,
                     schema,
                     ctes,
+                    functions,
                     allow_agg,
                     inside_agg,
                     visited_ctes,
                 )?;
             }
             for (w, t) in branches {
-                validate_expr_static(w, scopes, schema, ctes, allow_agg, inside_agg, visited_ctes)?;
-                validate_expr_static(t, scopes, schema, ctes, allow_agg, inside_agg, visited_ctes)?;
+                validate_expr_static(
+                    w,
+                    scopes,
+                    schema,
+                    ctes,
+                    functions,
+                    allow_agg,
+                    inside_agg,
+                    visited_ctes,
+                )?;
+                validate_expr_static(
+                    t,
+                    scopes,
+                    schema,
+                    ctes,
+                    functions,
+                    allow_agg,
+                    inside_agg,
+                    visited_ctes,
+                )?;
             }
             if let Some(el) = else_expr {
                 validate_expr_static(
@@ -13310,6 +14417,7 @@ fn validate_expr_static(
                     scopes,
                     schema,
                     ctes,
+                    functions,
                     allow_agg,
                     inside_agg,
                     visited_ctes,
@@ -13328,7 +14436,7 @@ fn validate_expr_static(
                 FunctionArgs::Star => (true, 0),
                 FunctionArgs::Exprs(es) => (false, es.len()),
             };
-            validate_function_call(
+            functions.validate_call(
                 name,
                 is_star,
                 arg_count,
@@ -13336,10 +14444,14 @@ fn validate_expr_static(
                 filter.is_some(),
                 allow_agg && !inside_agg,
             )?;
-            let is_agg_fn = match name.to_ascii_uppercase().as_str() {
-                "COUNT" | "SUM" | "TOTAL" | "AVG" | "GROUP_CONCAT" | "STRING_AGG" => true,
-                "MIN" | "MAX" => arg_count == 1,
-                _ => false,
+            let is_agg_fn = if !is_star && functions.find_scalar(name, arg_count).is_some() {
+                false
+            } else {
+                match name.to_ascii_uppercase().as_str() {
+                    "COUNT" | "SUM" | "TOTAL" | "AVG" | "GROUP_CONCAT" | "STRING_AGG" => true,
+                    "MIN" | "MAX" => arg_count == 1,
+                    _ => false,
+                }
             };
             if is_agg_fn {
                 if inside_agg || !allow_agg {
@@ -13350,32 +14462,50 @@ fn validate_expr_static(
                 }
                 if let FunctionArgs::Exprs(es) = args {
                     for ae in es {
-                        validate_expr_static(ae, scopes, schema, ctes, false, true, visited_ctes)?;
-                    }
-                }
-                if let Some(fe) = filter {
-                    validate_expr_static(fe, scopes, schema, ctes, false, true, visited_ctes)?;
-                }
-            } else {
-                if let FunctionArgs::Exprs(es) = args {
-                    for ae in es {
                         validate_expr_static(
                             ae,
                             scopes,
                             schema,
                             ctes,
-                            allow_agg,
-                            inside_agg,
+                            functions,
+                            false,
+                            true,
                             visited_ctes,
                         )?;
                     }
+                }
+                if let Some(fe) = filter {
+                    validate_expr_static(
+                        fe,
+                        scopes,
+                        schema,
+                        ctes,
+                        functions,
+                        false,
+                        true,
+                        visited_ctes,
+                    )?;
+                }
+            } else if let FunctionArgs::Exprs(es) = args {
+                for ae in es {
+                    validate_expr_static(
+                        ae,
+                        scopes,
+                        schema,
+                        ctes,
+                        functions,
+                        allow_agg,
+                        inside_agg,
+                        visited_ctes,
+                    )?;
                 }
             }
             Ok(())
         }
 
         Expr::Subquery(sub) => {
-            let sub_cols = validate_select_stmt_static(sub, scopes, schema, ctes, visited_ctes)?;
+            let sub_cols =
+                validate_select_stmt_static(sub, scopes, schema, ctes, functions, visited_ctes)?;
             if sub_cols.len() > 1 {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
@@ -13386,17 +14516,26 @@ fn validate_expr_static(
         }
 
         Expr::Exists { subquery, .. } => {
-            let _ = validate_select_stmt_static(subquery, scopes, schema, ctes, visited_ctes)?;
+            let _ = validate_select_stmt_static(
+                subquery,
+                scopes,
+                schema,
+                ctes,
+                functions,
+                visited_ctes,
+            )?;
             Ok(())
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_tuple_expr_static(
     mut expr: &Expr,
     scopes: &[EvalRow],
     schema: &Schema,
     ctes: &CteStore,
+    functions: &FunctionRegistry,
     allow_agg: bool,
     inside_agg: bool,
     visited_ctes: &mut Vec<(usize, usize)>,
@@ -13412,6 +14551,7 @@ fn validate_tuple_expr_static(
                     scopes,
                     schema,
                     ctes,
+                    functions,
                     allow_agg,
                     inside_agg,
                     visited_ctes,
@@ -13420,7 +14560,8 @@ fn validate_tuple_expr_static(
             Ok(elems.len())
         }
         Expr::Subquery(sub) => {
-            let sub_cols = validate_select_stmt_static(sub, scopes, schema, ctes, visited_ctes)?;
+            let sub_cols =
+                validate_select_stmt_static(sub, scopes, schema, ctes, functions, visited_ctes)?;
             Ok(sub_cols.len().max(1))
         }
         other => {
@@ -13429,6 +14570,7 @@ fn validate_tuple_expr_static(
                 scopes,
                 schema,
                 ctes,
+                functions,
                 allow_agg,
                 inside_agg,
                 visited_ctes,
