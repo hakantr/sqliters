@@ -22,8 +22,8 @@ pub use sqliters_pager::{
 };
 use sqliters_pager::{PagerOpenOptions, TransactionState};
 use sqliters_syntax::{
-    BindParam, Expr, FunctionArgs, InsertSource, ResultColumn, SelectCore, SelectStmt, Stmt,
-    TableOrSubquery, parse_one,
+    BindParam, Expr, FromClause, FunctionArgs, InsertSource, ResultColumn, SelectCore, SelectStmt,
+    Stmt, TableOrSubquery, UpsertAction, parse_one,
 };
 pub use sqliters_syntax::{ColumnRef, QualifiedName};
 pub use sqliters_types::{
@@ -54,8 +54,8 @@ pub use db_set::{
 pub use engine::{QueryOutput, SQLITE_DEFAULT_WAL_AUTOCHECKPOINT};
 pub use execution_context::{
     CollationCallback, CollationRegistry, CommitCoordinatorHooks, CommitHookCallback,
-    ExecutionContext, FunctionRegistry, ProgressCallback, ProgressTracker, ScalarFunctionCallback,
-    ScalarFunctionDef,
+    ExecutionContext, FunctionRegistry, MutationContext, MutationOrigin, MutationPipeline,
+    MutationRow, ProgressCallback, ProgressTracker, ScalarFunctionCallback, ScalarFunctionDef,
 };
 pub use schema::{ColumnSchema, ForeignKeySchema, IndexSchema, Schema, TableSchema, ViewSchema};
 
@@ -545,6 +545,7 @@ struct ConnectionInner {
     collations: CollationRegistry,
     progress: ProgressTracker,
     commit_hooks: CommitCoordinatorHooks,
+    mutation_pipeline: MutationPipeline,
     strict_subtype: bool,
     explicit_tx: bool,
     implicit_savepoint_tx: bool,
@@ -1227,6 +1228,7 @@ impl ConnectionInner {
                         collations: &self.collations,
                         progress: &mut self.progress,
                         commit_hooks: &mut self.commit_hooks,
+                        mutation_pipeline: &mut self.mutation_pipeline,
                         strict_subtype: self.strict_subtype,
                         explicit_tx: &mut self.explicit_tx,
                         implicit_savepoint_tx: &mut self.implicit_savepoint_tx,
@@ -1345,6 +1347,7 @@ impl ConnectionInner {
                         collations: &self.collations,
                         progress: &mut self.progress,
                         commit_hooks: &mut self.commit_hooks,
+                        mutation_pipeline: &mut self.mutation_pipeline,
                         strict_subtype: self.strict_subtype,
                         explicit_tx: &mut self.explicit_tx,
                         implicit_savepoint_tx: &mut self.implicit_savepoint_tx,
@@ -1446,6 +1449,7 @@ impl ConnectionInner {
                             collations: &self.collations,
                             progress: &mut self.progress,
                             commit_hooks: &mut self.commit_hooks,
+                            mutation_pipeline: &mut self.mutation_pipeline,
                             strict_subtype: self.strict_subtype,
                             explicit_tx: &mut self.explicit_tx,
                             implicit_savepoint_tx: &mut self.implicit_savepoint_tx,
@@ -2078,6 +2082,7 @@ impl Connection {
             collations: CollationRegistry::default(),
             progress: ProgressTracker::default(),
             commit_hooks: CommitCoordinatorHooks::default(),
+            mutation_pipeline: MutationPipeline::default(),
             strict_subtype: true,
             explicit_tx: false,
             implicit_savepoint_tx: false,
@@ -2306,6 +2311,25 @@ impl Connection {
         let out = res?;
         fin_res?;
         Ok(out)
+    }
+
+    /// Enables or disables recording of [`MutationContext`] events dispatched through the shared
+    /// row-mutation pipeline.
+    pub fn set_mutation_trace_enabled(&self, enabled: bool) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        inner.mutation_pipeline.set_trace_enabled(enabled);
+        Ok(())
+    }
+
+    /// Drains and returns all [`MutationContext`] events recorded since tracing was enabled or
+    /// last drained.
+    pub fn take_mutation_trace(&self) -> Result<Vec<MutationContext>> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        Ok(inner.mutation_pipeline.take_events())
     }
 
     /// Replaces the `main` database with an in-memory SQLite Format 3 image (`sqlite3_deserialize`).
@@ -3352,6 +3376,34 @@ fn expr_references_temp_catalog(expr: &Expr, db_set: &DatabaseSet) -> bool {
     }
 }
 
+fn from_clause_references_temp_catalog(fc: &FromClause, db_set: &DatabaseSet) -> bool {
+    let tos_refs = |tos: &TableOrSubquery| -> bool {
+        match tos {
+            TableOrSubquery::Table { name, .. } => matches!(
+                db_set.resolve_catalog_table(name),
+                Ok(Some(DatabaseId::TEMP))
+            ),
+            TableOrSubquery::Subquery { query, .. } => {
+                select_references_temp_catalog(query, db_set)
+            }
+        }
+    };
+    if tos_refs(&fc.head) {
+        return true;
+    }
+    for j in &fc.joins {
+        if tos_refs(&j.right) {
+            return true;
+        }
+        if let Some(sqliters_syntax::JoinConstraint::On(ref e)) = j.constraint
+            && expr_references_temp_catalog(e, db_set)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn stmt_references_temp_catalog(stmt: &Stmt, db_set: &DatabaseSet) -> bool {
     match stmt {
         Stmt::Explain { .. } => false,
@@ -3361,31 +3413,85 @@ fn stmt_references_temp_catalog(stmt: &Stmt, db_set: &DatabaseSet) -> bool {
             matches!(
                 db_set.resolve_catalog_table(&ins.table),
                 Ok(Some(DatabaseId::TEMP))
-            ) || match &ins.source {
-                InsertSource::Select(sel) => select_references_temp_catalog(sel, db_set),
-                InsertSource::Values(rows) => rows
-                    .iter()
-                    .any(|r| r.iter().any(|e| expr_references_temp_catalog(e, db_set))),
-                InsertSource::DefaultValues => false,
-            }
+            ) || ins
+                .ctes
+                .iter()
+                .any(|c| select_references_temp_catalog(&c.query, db_set))
+                || match &ins.source {
+                    InsertSource::Select(sel) => select_references_temp_catalog(sel, db_set),
+                    InsertSource::Values(rows) => rows
+                        .iter()
+                        .any(|r| r.iter().any(|e| expr_references_temp_catalog(e, db_set))),
+                    InsertSource::DefaultValues => false,
+                }
+                || ins.upsert_clauses.iter().any(|uc| {
+                    uc.target.as_ref().is_some_and(|t| {
+                        t.columns.iter().any(|ic| {
+                            ic.expr
+                                .as_ref()
+                                .is_some_and(|e| expr_references_temp_catalog(e, db_set))
+                        }) || t
+                            .where_clause
+                            .as_ref()
+                            .is_some_and(|w| expr_references_temp_catalog(w, db_set))
+                    }) || match &uc.action {
+                        UpsertAction::DoNothing => false,
+                        UpsertAction::DoUpdate {
+                            assignments,
+                            where_clause,
+                        } => {
+                            assignments
+                                .iter()
+                                .any(|a| expr_references_temp_catalog(&a.expr, db_set))
+                                || where_clause
+                                    .as_ref()
+                                    .is_some_and(|w| expr_references_temp_catalog(w, db_set))
+                        }
+                    }
+                })
+                || ins.returning.iter().any(|rc| {
+                    matches!(rc, ResultColumn::Expr { expr, .. } if expr_references_temp_catalog(expr, db_set))
+                })
         }
         Stmt::Update(upd) => {
             matches!(
                 db_set.resolve_catalog_table(&upd.table),
                 Ok(Some(DatabaseId::TEMP))
             ) || upd
-                .selection
-                .as_ref()
-                .is_some_and(|w| expr_references_temp_catalog(w, db_set))
+                .ctes
+                .iter()
+                .any(|c| select_references_temp_catalog(&c.query, db_set))
+                || upd
+                    .assignments
+                    .iter()
+                    .any(|a| expr_references_temp_catalog(&a.expr, db_set))
+                || upd
+                    .from
+                    .as_ref()
+                    .is_some_and(|fc| from_clause_references_temp_catalog(fc, db_set))
+                || upd
+                    .selection
+                    .as_ref()
+                    .is_some_and(|w| expr_references_temp_catalog(w, db_set))
+                || upd.returning.iter().any(|rc| {
+                    matches!(rc, ResultColumn::Expr { expr, .. } if expr_references_temp_catalog(expr, db_set))
+                })
         }
         Stmt::Delete(del) => {
             matches!(
                 db_set.resolve_catalog_table(&del.table),
                 Ok(Some(DatabaseId::TEMP))
             ) || del
-                .selection
-                .as_ref()
-                .is_some_and(|w| expr_references_temp_catalog(w, db_set))
+                .ctes
+                .iter()
+                .any(|c| select_references_temp_catalog(&c.query, db_set))
+                || del
+                    .selection
+                    .as_ref()
+                    .is_some_and(|w| expr_references_temp_catalog(w, db_set))
+                || del.returning.iter().any(|rc| {
+                    matches!(rc, ResultColumn::Expr { expr, .. } if expr_references_temp_catalog(expr, db_set))
+                })
         }
         _ => false,
     }
@@ -3618,6 +3724,7 @@ impl ConnectionInner {
             collations: &self.collations,
             progress: &mut self.progress,
             commit_hooks: &mut self.commit_hooks,
+            mutation_pipeline: &mut self.mutation_pipeline,
             strict_subtype: self.strict_subtype,
             explicit_tx: &mut self.explicit_tx,
             implicit_savepoint_tx: &mut self.implicit_savepoint_tx,
@@ -5802,6 +5909,30 @@ fn collect_stmt_params(stmt: &Stmt, max_idx: &mut usize, named: &mut HashMap<Str
                 InsertSource::Select(sel) => collect_select_params(sel, max_idx, named),
                 InsertSource::DefaultValues => {}
             }
+            for uc in &ins.upsert_clauses {
+                if let Some(target) = &uc.target {
+                    for ic in &target.columns {
+                        if let Some(e) = &ic.expr {
+                            collect_expr_params(e, max_idx, named);
+                        }
+                    }
+                    if let Some(w) = &target.where_clause {
+                        collect_expr_params(w, max_idx, named);
+                    }
+                }
+                if let UpsertAction::DoUpdate {
+                    assignments,
+                    where_clause,
+                } = &uc.action
+                {
+                    for assign in assignments {
+                        collect_expr_params(&assign.expr, max_idx, named);
+                    }
+                    if let Some(w) = where_clause {
+                        collect_expr_params(w, max_idx, named);
+                    }
+                }
+            }
             for rc in &ins.returning {
                 if let ResultColumn::Expr { expr, .. } = rc {
                     collect_expr_params(expr, max_idx, named);
@@ -5812,8 +5943,11 @@ fn collect_stmt_params(stmt: &Stmt, max_idx: &mut usize, named: &mut HashMap<Str
             for cte in &upd.ctes {
                 collect_select_params(&cte.query, max_idx, named);
             }
-            for (_, e) in &upd.assignments {
-                collect_expr_params(e, max_idx, named);
+            for assign in &upd.assignments {
+                collect_expr_params(&assign.expr, max_idx, named);
+            }
+            if let Some(fc) = &upd.from {
+                collect_from_params(fc, max_idx, named);
             }
             if let Some(w) = &upd.selection {
                 collect_expr_params(w, max_idx, named);
@@ -5838,6 +5972,20 @@ fn collect_stmt_params(stmt: &Stmt, max_idx: &mut usize, named: &mut HashMap<Str
             }
         }
         _ => {}
+    }
+}
+
+fn collect_from_params(fc: &FromClause, max_idx: &mut usize, named: &mut HashMap<String, usize>) {
+    if let TableOrSubquery::Subquery { query, .. } = &fc.head {
+        collect_select_params(query, max_idx, named);
+    }
+    for j in &fc.joins {
+        if let TableOrSubquery::Subquery { query, .. } = &j.right {
+            collect_select_params(query, max_idx, named);
+        }
+        if let Some(sqliters_syntax::JoinConstraint::On(e)) = &j.constraint {
+            collect_expr_params(e, max_idx, named);
+        }
     }
 }
 
@@ -5887,17 +6035,7 @@ fn collect_core_params(core: &SelectCore, max_idx: &mut usize, named: &mut HashM
                 }
             }
             if let Some(fc) = from {
-                if let TableOrSubquery::Subquery { query, .. } = &fc.head {
-                    collect_select_params(query, max_idx, named);
-                }
-                for j in &fc.joins {
-                    if let TableOrSubquery::Subquery { query, .. } = &j.right {
-                        collect_select_params(query, max_idx, named);
-                    }
-                    if let Some(sqliters_syntax::JoinConstraint::On(e)) = &j.constraint {
-                        collect_expr_params(e, max_idx, named);
-                    }
-                }
+                collect_from_params(fc, max_idx, named);
             }
             if let Some(w) = selection {
                 collect_expr_params(w, max_idx, named);

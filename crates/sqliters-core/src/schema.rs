@@ -1793,6 +1793,7 @@ fn fix_select_with_ctes(
         fixed_ctes.push(CommonTableExpr {
             name: cte.name.clone(),
             columns: cte.columns.clone(),
+            materialized: cte.materialized,
             query: fix_select_with_ctes(view_name, db_schema_name, &cte.query, &sc)?,
         });
     }

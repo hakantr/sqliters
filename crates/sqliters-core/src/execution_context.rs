@@ -1,11 +1,15 @@
+#![forbid(unsafe_code)]
+
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
+use sqliters_syntax::ConflictAction;
 use sqliters_types::{
-    Collation, ErrorCode, ExecutionServices, FunctionFlags, Result, RuntimeValue, SqliteError,
-    TextEncoding, Value, enforce_result_subtype_contract, extended, strip_unsubscribed_subtypes,
+    Collation, DatabaseId, ErrorCode, ExecutionServices, FunctionFlags, Result, RuntimeValue,
+    SqliteError, TextEncoding, Value, enforce_result_subtype_contract, extended,
+    strip_unsubscribed_subtypes,
 };
 use sqliters_vdbe::{
     VmRuntimeContext, eval_scalar_function_rt_with_strict, validate_function_call,
@@ -453,5 +457,108 @@ impl ExecutionServices for ExecutionContext<'_> {
     #[inline]
     fn strict_subtype(&self) -> bool {
         self.strict_subtype
+    }
+}
+
+/// Logical origin of a single physical row mutation passing through the shared mutation pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutationOrigin {
+    TopLevelInsert,
+    TopLevelUpdate,
+    TopLevelDelete,
+    UpsertDoUpdate,
+    ReplaceConflictDelete,
+    FkCascadeDelete,
+    FkActionUpdate,
+}
+
+/// Snapshot of a table row's `rowid` (`0` for `WITHOUT ROWID` tables) and logical column values.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MutationRow {
+    pub rowid: i64,
+    pub values: Vec<Value>,
+}
+
+/// Structured row-mutation descriptor routed through the shared DML / `UPSERT` / `OR REPLACE` /
+/// foreign-key mutation pipeline.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MutationContext {
+    pub db_id: DatabaseId,
+    pub table_name: String,
+    pub origin: MutationOrigin,
+    pub old_row: Option<MutationRow>,
+    pub new_row: Option<MutationRow>,
+    pub excluded_row: Option<MutationRow>,
+    pub effective_conflict: ConflictAction,
+    pub emit_update_hook: bool,
+    pub invalidate_blobs: bool,
+}
+
+/// Connection-level row-mutation event dispatcher (Phase 3 metadata core, Phase 4 trigger hookup,
+/// Phase 6 `update_hook` and incremental `Blob` invalidation).
+#[derive(Debug, Default)]
+pub struct MutationPipeline {
+    trace_enabled: bool,
+    events: Vec<MutationContext>,
+}
+
+impl MutationPipeline {
+    /// Creates an idle mutation pipeline with tracing disabled.
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enables or disables recording of [`MutationContext`] descriptors for inspection/testing.
+    #[inline]
+    pub fn set_trace_enabled(&mut self, enabled: bool) {
+        self.trace_enabled = enabled;
+        if !enabled {
+            self.events.clear();
+        }
+    }
+
+    /// Returns `true` if mutation trace recording is currently active.
+    #[inline]
+    pub fn is_trace_enabled(&self) -> bool {
+        self.trace_enabled
+    }
+
+    /// Drains and returns all recorded [`MutationContext`] events since the last call.
+    #[inline]
+    pub fn take_events(&mut self) -> Vec<MutationContext> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// Current number of buffered [`MutationContext`] trace events.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Returns `true` when no [`MutationContext`] trace events are buffered.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    /// Truncates uncommitted trace events on statement/savepoint/transaction rollback.
+    #[inline]
+    pub fn truncate(&mut self, len: usize) {
+        self.events.truncate(len);
+    }
+
+    /// Clears all buffered trace events (e.g., on full transaction rollback when opened inside tx).
+    #[inline]
+    pub fn clear(&mut self) {
+        self.events.clear();
+    }
+
+    /// Dispatches a completed physical row mutation through the shared event boundary.
+    #[inline]
+    pub fn dispatch(&mut self, ctx: MutationContext) {
+        if self.trace_enabled {
+            self.events.push(ctx);
+        }
     }
 }

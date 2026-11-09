@@ -1,4 +1,5 @@
 //! SQLite 3.54.1 lexical analyzer ported from `sqlite/src/tokenize.c` and `tool/mkkeywordhash.c`.
+#![forbid(unsafe_code)]
 
 use sqliters_types::{Result, SqliteError};
 
@@ -123,6 +124,7 @@ pub enum TokenKind {
     Like,
     Limit,
     Match,
+    Materialized,
     Natural,
     No,
     Not,
@@ -280,6 +282,7 @@ pub fn keyword_kind(word: &str) -> Option<TokenKind> {
         "LIKE" => TokenKind::Like,
         "LIMIT" => TokenKind::Limit,
         "MATCH" => TokenKind::Match,
+        "MATERIALIZED" => TokenKind::Materialized,
         "NATURAL" => TokenKind::Natural,
         "NO" => TokenKind::No,
         "NOT" => TokenKind::Not,

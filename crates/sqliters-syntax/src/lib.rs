@@ -218,4 +218,128 @@ mod tests {
             "CREATE TABLE t1(b, a, PRIMARY KEY(b, a)) WITHOUT ROWID"
         );
     }
+
+    #[test]
+    fn test_parse_materialized_cte_and_soft_keyword_ident() {
+        assert_eq!(keyword_kind("materialized"), Some(TokenKind::Materialized));
+
+        let Stmt::Select(sel) = parse_one(
+            "WITH c1 AS MATERIALIZED (VALUES(1)), c2 AS NOT MATERIALIZED (VALUES(2)), c3 AS (VALUES(3)) SELECT * FROM c1, c2, c3;",
+        )
+        .unwrap()
+        .0
+        .unwrap()
+        else {
+            panic!("expected Select");
+        };
+        assert_eq!(sel.ctes.len(), 3);
+        assert_eq!(sel.ctes[0].materialized, Some(true));
+        assert_eq!(sel.ctes[1].materialized, Some(false));
+        assert_eq!(sel.ctes[2].materialized, None);
+
+        // `materialized` remains valid as an unquoted table/column/alias identifier
+        let Stmt::CreateTable(ct) = parse_one("CREATE TABLE materialized(materialized INT);")
+            .unwrap()
+            .0
+            .unwrap()
+        else {
+            panic!("expected CreateTable");
+        };
+        assert_eq!(ct.name.name, "materialized");
+        assert_eq!(ct.columns[0].name, "materialized");
+
+        assert!(parse_one("WITH c AS NOT (VALUES(1)) SELECT * FROM c;").is_err());
+    }
+
+    #[test]
+    fn test_parse_chained_upsert_update_from_and_row_value_set() {
+        let Stmt::Insert(ins) = parse_one(
+            "INSERT INTO main.t AS al(a, b, c) VALUES(1, 2, 3) \
+             ON CONFLICT(a COLLATE nocase) WHERE b > 0 DO NOTHING \
+             ON CONFLICT(b, c) DO UPDATE SET (b, c) = (excluded.b, excluded.c + 1), a = 9 WHERE al.c < 10 \
+             ON CONFLICT DO NOTHING RETURNING *;",
+        )
+        .unwrap()
+        .0
+        .unwrap()
+        else {
+            panic!("expected Insert");
+        };
+        assert_eq!(ins.alias.as_deref(), Some("al"));
+        assert_eq!(ins.upsert_clauses.len(), 3);
+        assert!(matches!(
+            ins.upsert_clauses[0].action,
+            UpsertAction::DoNothing
+        ));
+        assert!(
+            ins.upsert_clauses[0]
+                .target
+                .as_ref()
+                .unwrap()
+                .where_clause
+                .is_some()
+        );
+        match &ins.upsert_clauses[1].action {
+            UpsertAction::DoUpdate {
+                assignments,
+                where_clause,
+            } => {
+                assert_eq!(assignments.len(), 2);
+                assert!(assignments[0].row_value);
+                assert_eq!(assignments[0].columns, vec!["b".to_owned(), "c".to_owned()]);
+                assert!(!assignments[1].row_value);
+                assert!(where_clause.is_some());
+            }
+            UpsertAction::DoNothing => panic!("expected DoUpdate"),
+        }
+        assert!(ins.upsert_clauses[2].target.is_none());
+        assert_eq!(ins.returning.len(), 1);
+
+        // Join-ON ambiguity vs WHERE / JOIN ON + UPSERT
+        let err_no_where = parse_one("INSERT INTO t SELECT * FROM src ON CONFLICT(a) DO NOTHING;")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err_no_where.contains("near \"DO\": syntax error"),
+            "{err_no_where}"
+        );
+
+        assert!(
+            parse_one("INSERT INTO t SELECT * FROM src WHERE 1 ON CONFLICT(a) DO NOTHING;").is_ok()
+        );
+        assert!(
+            parse_one(
+                "INSERT INTO t SELECT s1.a FROM s1 JOIN s2 ON s1.a = s2.a ON CONFLICT(a) DO NOTHING;"
+            )
+            .is_ok()
+        );
+        assert!(parse_one("INSERT INTO t DEFAULT VALUES ON CONFLICT DO NOTHING;").is_err());
+        assert!(
+            parse_one("INSERT INTO t VALUES(1) ON CONFLICT DO NOTHING ON CONFLICT(a) DO NOTHING;")
+                .is_err()
+        );
+
+        // UPDATE ... FROM ... with row-value SET (including 1-column parenthesized SET)
+        let Stmt::Update(upd) = parse_one(
+            "UPDATE t1 AS tgt SET (a, b) = (src.x, src.y), (c) = 42 FROM src JOIN s2 ON src.id = s2.id WHERE tgt.id = src.id RETURNING *;",
+        )
+        .unwrap()
+        .0
+        .unwrap()
+        else {
+            panic!("expected Update");
+        };
+        assert_eq!(upd.alias.as_deref(), Some("tgt"));
+        assert_eq!(upd.assignments.len(), 2);
+        assert!(upd.assignments[0].row_value);
+        assert_eq!(
+            upd.assignments[0].columns,
+            vec!["a".to_owned(), "b".to_owned()]
+        );
+        assert!(upd.assignments[1].row_value);
+        assert_eq!(upd.assignments[1].columns, vec!["c".to_owned()]);
+        assert!(upd.from.is_some());
+        assert!(upd.selection.is_some());
+        assert_eq!(upd.returning.len(), 1);
+    }
 }

@@ -58,6 +58,16 @@ fn parse_one_inner(sql: &str, track_spans: bool) -> Result<(Option<Stmt>, IdentS
         return Ok((None, IdentSpanMap::default(), ""));
     }
     let stmt = parser.parse_stmt()?;
+    if !parser.at(TokenKind::Semi) && !parser.at(TokenKind::Eof) {
+        let tok = parser.peek();
+        return Err(parser.syntax_err_at(tok, format!("near \"{}\": syntax error", tok.text)));
+    }
+    if let Some(kw) = parser.orphan_join_clause {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("a JOIN clause is required before {kw}"),
+        ));
+    }
     let tail_off = if parser.at(TokenKind::Semi) {
         let semi = parser.advance();
         semi.offset + semi.text.len()
@@ -92,6 +102,7 @@ struct Parser<'a> {
     named_params: HashMap<String, usize>,
     track_spans: bool,
     ident_spans: IdentSpanMap,
+    orphan_join_clause: Option<&'static str>,
 }
 
 impl<'a> Parser<'a> {
@@ -105,6 +116,7 @@ impl<'a> Parser<'a> {
             named_params: HashMap::new(),
             track_spans,
             ident_spans: IdentSpanMap::default(),
+            orphan_join_clause: None,
         }
     }
 
@@ -273,6 +285,7 @@ impl<'a> Parser<'a> {
                 | TokenKind::Last
                 | TokenKind::Like
                 | TokenKind::Match
+                | TokenKind::Materialized
                 | TokenKind::No
                 | TokenKind::Nothing
                 | TokenKind::Nulls
@@ -1246,6 +1259,11 @@ impl<'a> Parser<'a> {
             InsertSource::Select(Box::new(self.parse_select_stmt()?))
         };
 
+        let upsert_clauses = if matches!(source, InsertSource::DefaultValues) {
+            Vec::new()
+        } else {
+            self.parse_upsert_clauses()?
+        };
         let returning = self.parse_optional_returning()?;
         Ok(Stmt::Insert(InsertStmt {
             ctes,
@@ -1254,8 +1272,143 @@ impl<'a> Parser<'a> {
             alias,
             columns,
             source,
+            upsert_clauses,
             returning,
         }))
+    }
+
+    fn parse_upsert_target_column(&mut self) -> Result<IndexedColumn> {
+        let mut raw_expr = self.parse_expr()?;
+        let mut collation = None;
+        while let Expr::Collate { expr, collation: c } = raw_expr {
+            collation = Some(c);
+            raw_expr = *expr;
+        }
+        if self.eat(TokenKind::Collate) {
+            collation = Some(self.parse_ident()?);
+        }
+        let (name, expr) = match raw_expr {
+            Expr::Column(ColumnRef {
+                schema: None,
+                table: None,
+                column,
+            }) => (column, None),
+            other => (String::new(), Some(other)),
+        };
+        let mut desc = false;
+        if self.eat(TokenKind::Asc) {
+            desc = false;
+        } else if self.eat(TokenKind::Desc) {
+            desc = true;
+        }
+        let nulls_last = if self.eat(TokenKind::Nulls) {
+            if self.eat(TokenKind::First) {
+                Some(false)
+            } else {
+                self.expect(TokenKind::Last)?;
+                Some(true)
+            }
+        } else {
+            None
+        };
+        Ok(IndexedColumn {
+            name,
+            expr,
+            collation,
+            desc,
+            nulls_last,
+        })
+    }
+
+    fn parse_upsert_clauses(&mut self) -> Result<Vec<UpsertClause>> {
+        let mut clauses = Vec::new();
+        while self.eat(TokenKind::On) {
+            self.expect(TokenKind::Conflict)?;
+            let target = if self.eat(TokenKind::Lp) {
+                let mut cols = Vec::new();
+                loop {
+                    cols.push(self.parse_upsert_target_column()?);
+                    if !self.eat(TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(TokenKind::Rp)?;
+                let where_clause = if self.eat(TokenKind::Where) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                Some(UpsertTarget {
+                    columns: cols,
+                    where_clause,
+                })
+            } else {
+                None
+            };
+
+            self.expect(TokenKind::Do)?;
+            let action = if self.eat(TokenKind::Nothing) {
+                UpsertAction::DoNothing
+            } else if self.eat(TokenKind::Update) {
+                self.expect(TokenKind::Set)?;
+                let assignments = self.parse_set_assignments()?;
+                let where_clause = if self.eat(TokenKind::Where) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                UpsertAction::DoUpdate {
+                    assignments,
+                    where_clause,
+                }
+            } else {
+                let tok = self.peek();
+                return Err(self.syntax_err_at(tok, format!("near \"{}\": syntax error", tok.text)));
+            };
+
+            let is_targetless = target.is_none();
+            clauses.push(UpsertClause { target, action });
+            if is_targetless {
+                break;
+            }
+        }
+        Ok(clauses)
+    }
+
+    fn parse_set_assignments(&mut self) -> Result<Vec<SetAssignment>> {
+        let mut assignments = Vec::new();
+        loop {
+            if self.eat(TokenKind::Lp) {
+                let mut columns = Vec::new();
+                loop {
+                    columns.push(self.parse_ident()?);
+                    if !self.eat(TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(TokenKind::Rp)?;
+                self.expect(TokenKind::Eq)?;
+                let expr = self.parse_expr()?;
+                assignments.push(SetAssignment {
+                    columns,
+                    row_value: true,
+                    expr,
+                });
+            } else {
+                let col = self.parse_ident()?;
+                self.expect(TokenKind::Eq)?;
+                let expr = self.parse_expr()?;
+                assignments.push(SetAssignment {
+                    columns: vec![col],
+                    row_value: false,
+                    expr,
+                });
+            }
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        Ok(assignments)
     }
 
     fn parse_values_rows(&mut self) -> Result<Vec<Vec<Expr>>> {
@@ -1290,17 +1443,12 @@ impl<'a> Parser<'a> {
         let indexed_by = self.parse_optional_index_hint()?;
         self.expect(TokenKind::Set)?;
 
-        let mut assignments = Vec::new();
-        loop {
-            let col = self.parse_ident()?;
-            self.expect(TokenKind::Eq)?;
-            let val = self.parse_expr()?;
-            assignments.push((col, val));
-            if !self.eat(TokenKind::Comma) {
-                break;
-            }
-        }
-
+        let assignments = self.parse_set_assignments()?;
+        let from = if self.eat(TokenKind::From) {
+            Some(self.parse_from_clause()?)
+        } else {
+            None
+        };
         let selection = if self.eat(TokenKind::Where) {
             Some(self.parse_expr()?)
         } else {
@@ -1315,6 +1463,7 @@ impl<'a> Parser<'a> {
             alias,
             indexed_by,
             assignments,
+            from,
             selection,
             returning,
         })
@@ -1450,19 +1599,21 @@ impl<'a> Parser<'a> {
                 None
             };
             self.expect(TokenKind::As)?;
-            if self.at(TokenKind::Not) || Self::can_be_ident(self.peek().kind) {
-                // Optional MATERIALIZED / NOT MATERIALIZED
-                let _ = self.eat(TokenKind::Not);
-                if self.peek().text.eq_ignore_ascii_case("MATERIALIZED") {
-                    self.advance();
-                }
-            }
+            let materialized = if self.eat(TokenKind::Materialized) {
+                Some(true)
+            } else if self.eat(TokenKind::Not) {
+                self.expect(TokenKind::Materialized)?;
+                Some(false)
+            } else {
+                None
+            };
             self.expect(TokenKind::Lp)?;
             let query = self.parse_select_stmt()?;
             self.expect(TokenKind::Rp)?;
             ctes.push(CommonTableExpr {
                 name,
                 columns,
+                materialized,
                 query,
             });
             if !self.eat(TokenKind::Comma) {
@@ -1645,6 +1796,24 @@ impl<'a> Parser<'a> {
 
     fn parse_from_clause(&mut self) -> Result<FromClause> {
         let head = self.parse_table_or_subquery()?;
+        if self.eat(TokenKind::On) {
+            let _ = self.parse_expr()?;
+            if self.orphan_join_clause.is_none() {
+                self.orphan_join_clause = Some("ON");
+            }
+        } else if self.eat(TokenKind::Using) {
+            self.expect(TokenKind::Lp)?;
+            loop {
+                let _ = self.parse_ident()?;
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(TokenKind::Rp)?;
+            if self.orphan_join_clause.is_none() {
+                self.orphan_join_clause = Some("USING");
+            }
+        }
         let mut joins = Vec::new();
 
         loop {
@@ -1770,7 +1939,8 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
         if matches!(next, TokenKind::Id | TokenKind::QuotedId) {
-            return Ok(Some(dequote(self.advance().text)));
+            let tok = self.advance();
+            return Ok(Some(self.alloc_ident_from_token(tok)));
         }
         Ok(None)
     }

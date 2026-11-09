@@ -53,7 +53,8 @@ pub use sqliters_core::TestBlobHandle;
 pub use sqliters_core::{
     CloseError, CollationCallback, CollationRegistry, ColumnSchema, Connection,
     ConnectionOpenOptions, ExecutionContext, ForeignKeySchema, FunctionRegistry, IndexSchema,
-    InterruptHandle, PrepareMode, ProgressCallback, ProgressTracker, QueryOutput, QueryResult, Row,
+    InterruptHandle, MutationContext, MutationOrigin, MutationPipeline, MutationRow, PrepareMode,
+    ProgressCallback, ProgressTracker, QueryOutput, QueryResult, Row,
     SQLITE_DEFAULT_WAL_AUTOCHECKPOINT, ScalarFunctionCallback, ScalarFunctionDef, Schema,
     Statement, StepResult, TableSchema,
 };
@@ -62,7 +63,7 @@ pub use sqliters_pager::{
     WalCheckpointResult,
 };
 pub use sqliters_syntax::{
-    ColumnRef, FkAction, QualifiedName, is_complete, parse_one, parse_statements,
+    ColumnRef, ConflictAction, FkAction, QualifiedName, is_complete, parse_one, parse_statements,
 };
 pub use sqliters_types::{
     AggregateStepId, Collation, ConflictResolutionEffect, DatabaseId, DatabaseKind, ErrorCode,

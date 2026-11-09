@@ -5,7 +5,7 @@
 use sqliters_syntax::{
     BinaryOp, BindParam, ColumnRef, CurrentTimeKind, Expr, FromClause, FunctionArgs, IndexHint,
     InsertSource, InsertStmt, LikeOp, LimitClause, OrderByTerm, QualifiedName, ResultColumn,
-    SelectCore, SelectStmt, Stmt, TableOrSubquery, UnaryOp,
+    SelectBody, SelectCore, SelectStmt, Stmt, TableOrSubquery, UnaryOp,
 };
 use sqliters_types::{
     Collation, DatabaseId, ErrorCode, KeySortOrder, Result, SqliteError, TypeAffinity, Value,
@@ -623,6 +623,28 @@ pub fn try_compile_select_in_db_set(
     try_compile_select_core(stmt, functions, |name| {
         resolve_db_set_table_for_compiler(name, db_set)
     })
+}
+
+/// Returns `Ok(None)` whenever `ins` specifies `UPSERT` (`ON CONFLICT ...`) or any other construct
+/// requiring full interpreter execution in `engine.rs`.
+pub fn try_compile_insert(ins: &InsertStmt, _schema: &Schema) -> Result<Option<VdbeProgram>> {
+    if !ins.upsert_clauses.is_empty() {
+        return Ok(None);
+    }
+    Ok(None)
+}
+
+/// Multi-database variant of [`try_compile_insert`]; delegates `UPSERT` (`!ins.upsert_clauses.is_empty()`)
+/// to `engine.rs` with prepare-time static validation and `RETURNING` metadata.
+pub fn try_compile_insert_in_db_set(
+    ins: &InsertStmt,
+    _db_set: &DatabaseSet,
+    _functions: &FunctionRegistry,
+) -> Result<Option<VdbeProgram>> {
+    if !ins.upsert_clauses.is_empty() {
+        return Ok(None);
+    }
+    Ok(None)
 }
 
 fn try_compile_select_core<'a, F>(
@@ -2255,15 +2277,22 @@ fn compile_insert_explain_table(
     let col_base = prog.alloc_registers(tbl.columns.len());
     let rec_reg = prog.alloc_register();
 
-    if let InsertSource::Values(rows) = &ins.source {
+    if let InsertSource::Values(rows) = &ins.source
+        && ins.upsert_clauses.is_empty()
+    {
         for row in rows {
             prog.emit(Instruction::new(Opcode::NewRowid, tcur, rid_reg, 0));
             for (i, expr) in row.iter().take(tbl.columns.len()).enumerate() {
                 if tbl.rowid_alias_col == Some(i) {
-                    compile_expr(&mut prog, expr, None, functions, rid_reg)?;
+                    if compile_expr(&mut prog, expr, None, functions, rid_reg).is_err() {
+                        prog.emit(Instruction::new(Opcode::Null, 0, rid_reg, 0));
+                    }
                     prog.emit(Instruction::new(Opcode::Null, 0, col_base + i as i32, 0));
                 } else {
-                    compile_expr(&mut prog, expr, None, functions, col_base + i as i32)?;
+                    let dst = col_base + i as i32;
+                    if compile_expr(&mut prog, expr, None, functions, dst).is_err() {
+                        prog.emit(Instruction::new(Opcode::Null, 0, dst, 0));
+                    }
                 }
             }
             let affs: Vec<_> = tbl.columns.iter().map(|c| c.affinity).collect();
@@ -2546,15 +2575,45 @@ where
             if let Some((_, sname, slot_schema, ResolvedRelation::Table(tbl))) =
                 resolve_relation(&upd.table)
             {
+                let sel_pred = if upd.from.is_none() {
+                    upd.selection.as_ref()
+                } else {
+                    None
+                };
                 let plan = choose_access_plan_with_schema_name(
                     &tbl,
                     sname,
                     upd.alias.as_deref(),
-                    upd.selection.as_ref(),
+                    sel_pred,
                     slot_schema,
                 );
                 let disp = upd.alias.as_deref().unwrap_or(&tbl.name);
                 push_detail(plan.explain_detail(disp));
+                if let Some(ref fc) = upd.from {
+                    let from_sel = SelectStmt {
+                        ctes: upd.ctes.clone(),
+                        body: SelectBody {
+                            head: SelectCore::Select {
+                                distinct: false,
+                                projection: vec![ResultColumn::Star],
+                                from: Some(fc.clone()),
+                                selection: None,
+                                group_by: Vec::new(),
+                                having: None,
+                            },
+                            compounds: Vec::new(),
+                        },
+                        order_by: Vec::new(),
+                        limit: None,
+                    };
+                    let mut active_views = Vec::new();
+                    explain_select_plan(
+                        &from_sel,
+                        &resolve_relation,
+                        &mut active_views,
+                        &mut push_detail,
+                    )?;
+                }
             }
         }
         Stmt::Delete(del) => {

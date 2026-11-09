@@ -351,6 +351,7 @@ pub struct InsertStmt {
     pub alias: Option<String>,
     pub columns: Option<Vec<String>>,
     pub source: InsertSource,
+    pub upsert_clauses: Vec<UpsertClause>,
     pub returning: Vec<ResultColumn>,
 }
 
@@ -359,6 +360,35 @@ pub enum InsertSource {
     Values(Vec<Vec<Expr>>),
     Select(Box<SelectStmt>),
     DefaultValues,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetAssignment {
+    pub columns: Vec<String>,
+    /// True when written in parenthesized `SET (c1, ...) = expr` form (`LP idlist RP EQ expr` in `sqlite/src/parse.y`).
+    pub row_value: bool,
+    pub expr: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpsertClause {
+    pub target: Option<UpsertTarget>,
+    pub action: UpsertAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpsertTarget {
+    pub columns: Vec<IndexedColumn>,
+    pub where_clause: Option<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpsertAction {
+    DoNothing,
+    DoUpdate {
+        assignments: Vec<SetAssignment>,
+        where_clause: Option<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -374,7 +404,8 @@ pub struct UpdateStmt {
     pub table: QualifiedName,
     pub alias: Option<String>,
     pub indexed_by: Option<IndexHint>,
-    pub assignments: Vec<(String, Expr)>,
+    pub assignments: Vec<SetAssignment>,
+    pub from: Option<FromClause>,
     pub selection: Option<Expr>,
     pub returning: Vec<ResultColumn>,
 }
@@ -412,6 +443,7 @@ pub struct SelectStmt {
 pub struct CommonTableExpr {
     pub name: String,
     pub columns: Option<Vec<String>>,
+    pub materialized: Option<bool>,
     pub query: SelectStmt,
 }
 
