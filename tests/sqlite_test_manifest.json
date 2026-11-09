@@ -1,0 +1,961 @@
+{
+  "schema_version": 1,
+  "generator": "tools/generate_sqlite_test_wrappers.py",
+  "supported_roots": [
+    "sqlite/test",
+    "sqlite/ext/fts5/test",
+    "sqlite/ext/rtree"
+  ],
+  "summary": {
+    "total_registered": 43,
+    "active": 6,
+    "ignored": 37
+  },
+  "tests": [
+    {
+      "id": "sqlite/test/wal.test",
+      "source_root": "sqlite/test",
+      "relative_path": "wal.test",
+      "source_path": "sqlite/test/wal.test",
+      "sha256": "4236885cbfeb44b7e9378977a470dd1816098cb822bd209445f00765d6e7c070",
+      "wrapper_path": "tests/sqlite_test/wal.rs",
+      "module_name": "wal",
+      "test_fn": "test_wal",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal",
+        "attach",
+        "tempdb",
+        "autovacuum"
+      ],
+      "external_dependencies": [
+        "ATTACH",
+        "TEMP",
+        "db func",
+        "launch_testfixture"
+      ],
+      "status": "ignored",
+      "ignore_reason": "pending Phase 2 ATTACH/TEMP, Phase 1.3 autovacuum, and Phase 6 UDF/launch_testfixture",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 167
+    },
+    {
+      "id": "sqlite/test/wal2.test",
+      "source_root": "sqlite/test",
+      "relative_path": "wal2.test",
+      "source_path": "sqlite/test/wal2.test",
+      "sha256": "314bbc33c07bfc7352d033bf7c316b1318739415d6c6371b2a4dde884e3548ba",
+      "wrapper_path": "tests/sqlite_test/wal2.rs",
+      "module_name": "wal2",
+      "test_fn": "test_wal2",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "testvfs",
+        "tvfs"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testvfs/tvfs SHM/I/O interception harness",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 96
+    },
+    {
+      "id": "sqlite/test/wal3.test",
+      "source_root": "sqlite/test",
+      "relative_path": "wal3.test",
+      "source_path": "sqlite/test/wal3.test",
+      "sha256": "a886c47be7e7dd724f4585700ba35cb5d0ee1692210345b9a1bbc155150b8fe1",
+      "wrapper_path": "tests/sqlite_test/wal3.rs",
+      "module_name": "wal3",
+      "test_fn": "test_wal3",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "testvfs",
+        "tvfs",
+        "db func"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testvfs/tvfs harness and Phase 6 Tcl UDF (db func)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 45
+    },
+    {
+      "id": "sqlite/test/wal4.test",
+      "source_root": "sqlite/test",
+      "relative_path": "wal4.test",
+      "source_path": "sqlite/test/wal4.test",
+      "sha256": "8c4753b6f7c2cea79cd01977905e87464dcbc999bdbda26dc37519d733cc2120",
+      "wrapper_path": "tests/sqlite_test/wal4.rs",
+      "module_name": "wal4",
+      "test_fn": "test_wal4",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 3
+    },
+    {
+      "id": "sqlite/test/wal5.test",
+      "source_root": "sqlite/test",
+      "relative_path": "wal5.test",
+      "source_path": "sqlite/test/wal5.test",
+      "sha256": "f4cf51448442e0feaf613057db23f813f5b2b6c19b95b723d838fa8576ff1f80",
+      "wrapper_path": "tests/sqlite_test/wal5.rs",
+      "module_name": "wal5",
+      "test_fn": "test_wal5",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal",
+        "attach"
+      ],
+      "external_dependencies": [
+        "ATTACH",
+        "testvfs",
+        "db busy",
+        "wal_hook"
+      ],
+      "status": "ignored",
+      "ignore_reason": "pending Phase 2 ATTACH and Phase 6 Tcl busy/wal_hook callbacks + C testvfs",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 64
+    },
+    {
+      "id": "sqlite/test/wal6.test",
+      "source_root": "sqlite/test",
+      "relative_path": "wal6.test",
+      "source_path": "sqlite/test/wal6.test",
+      "sha256": "ede830bee9207c04b0c719c773a6158c55a62262126c28b376e9d7039b98c5e3",
+      "wrapper_path": "tests/sqlite_test/wal6.rs",
+      "module_name": "wal6",
+      "test_fn": "test_wal6",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal",
+        "autovacuum"
+      ],
+      "external_dependencies": [
+        "db func"
+      ],
+      "status": "ignored",
+      "ignore_reason": "pending Phase 1.3 autovacuum journal-mode matrix and Phase 6 Tcl UDF (db func)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 32
+    },
+    {
+      "id": "sqlite/test/wal64k.test",
+      "source_root": "sqlite/test",
+      "relative_path": "wal64k.test",
+      "source_path": "sqlite/test/wal64k.test",
+      "sha256": "0a21cf50ccfd843d44d48d928570925ceba824604991e5e165f28e7f9f1183c6",
+      "wrapper_path": "tests/sqlite_test/wal64k.rs",
+      "module_name": "wal64k",
+      "test_fn": "test_wal64k",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "test_syscall"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C test_syscall OS page-size override",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 4
+    },
+    {
+      "id": "sqlite/test/wal7.test",
+      "source_root": "sqlite/test",
+      "relative_path": "wal7.test",
+      "source_path": "sqlite/test/wal7.test",
+      "sha256": "507a11f809018fec283ae9f12d43ee45b261e9ab8c4f1f1f76e0921d32aef998",
+      "wrapper_path": "tests/sqlite_test/wal7.rs",
+      "module_name": "wal7",
+      "test_fn": "test_wal7",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 6,
+      "expected_subtest_count": 6
+    },
+    {
+      "id": "sqlite/test/wal8.test",
+      "source_root": "sqlite/test",
+      "relative_path": "wal8.test",
+      "source_path": "sqlite/test/wal8.test",
+      "sha256": "73c0d28f042199c61450c75e243ad9bac5d7192632ebbebc55f15ff326b88df5",
+      "wrapper_path": "tests/sqlite_test/wal8.rs",
+      "module_name": "wal8",
+      "test_fn": "test_wal8",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal",
+        "vacuum"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 6,
+      "expected_subtest_count": 6
+    },
+    {
+      "id": "sqlite/test/wal9.test",
+      "source_root": "sqlite/test",
+      "relative_path": "wal9.test",
+      "source_path": "sqlite/test/wal9.test",
+      "sha256": "fd2e0954508104666b0aeef9b9937b8b05f89b74b7ebf5e2bece244fb26ac47d",
+      "wrapper_path": "tests/sqlite_test/wal9.rs",
+      "module_name": "wal9",
+      "test_fn": "test_wal9",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 8,
+      "expected_subtest_count": 8
+    },
+    {
+      "id": "sqlite/test/walbak.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walbak.test",
+      "source_path": "sqlite/test/walbak.test",
+      "sha256": "5a8de85e2e9fa3360905a147819cd1473146f851933c1221cc9350436ffebdd2",
+      "wrapper_path": "tests/sqlite_test/walbak.rs",
+      "module_name": "walbak",
+      "test_fn": "test_walbak",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "sqlite3_backup"
+      ],
+      "status": "ignored",
+      "ignore_reason": "pending Phase 6 Online Backup API (sqlite3_backup)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 39
+    },
+    {
+      "id": "sqlite/test/walbig.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walbig.test",
+      "source_path": "sqlite/test/walbig.test",
+      "sha256": "b8ce42915808171d080db35910508f4959ba455ec5de8aaa317cf9f5fbe4ea11",
+      "wrapper_path": "tests/sqlite_test/walbig.rs",
+      "module_name": "walbig",
+      "test_fn": "test_walbig",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "db func"
+      ],
+      "status": "ignored",
+      "ignore_reason": "pending Phase 6 Tcl UDF (db func)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 4
+    },
+    {
+      "id": "sqlite/test/walblock.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walblock.test",
+      "source_path": "sqlite/test/walblock.test",
+      "sha256": "eba2071c92f4dcc24246f6a09ef96c3555e023c742617ec66b1bbd25ba83269a",
+      "wrapper_path": "tests/sqlite_test/walblock.rs",
+      "module_name": "walblock",
+      "test_fn": "test_walblock",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "testvfs",
+        "launch_testfixture"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testvfs SHM lock script hook and Phase 6 launch_testfixture",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 8
+    },
+    {
+      "id": "sqlite/test/walckptnoop.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walckptnoop.test",
+      "source_path": "sqlite/test/walckptnoop.test",
+      "sha256": "982c9c59ceb6a57484edb8fb478b21169e46c2ac2279b1a2bf0722f8e631fe47",
+      "wrapper_path": "tests/sqlite_test/walckptnoop.rs",
+      "module_name": "walckptnoop",
+      "test_fn": "test_walckptnoop",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "db func"
+      ],
+      "status": "ignored",
+      "ignore_reason": "pending Phase 6 Tcl UDF (db func myrandomblob); all 1.0..1.10 invariants covered in phase1_wal_concurrent_c_compat",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 11
+    },
+    {
+      "id": "sqlite/test/walcksum.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walcksum.test",
+      "source_path": "sqlite/test/walcksum.test",
+      "sha256": "f669d19d8e58ad50558ba3d930ac44a9856f3f792f6bc65ad03d18d0a793d5c1",
+      "wrapper_path": "tests/sqlite_test/walcksum.rs",
+      "module_name": "walcksum",
+      "test_fn": "test_walcksum",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal",
+        "savepoint"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 94,
+      "expected_subtest_count": 94
+    },
+    {
+      "id": "sqlite/test/walcrash.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walcrash.test",
+      "source_path": "sqlite/test/walcrash.test",
+      "sha256": "488170ee7c3cb7455d173b598c03fb2461dc371f52087d06e454e23893c0eac6",
+      "wrapper_path": "tests/sqlite_test/walcrash.rs",
+      "module_name": "walcrash",
+      "test_fn": "test_walcrash",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal",
+        "attach",
+        "autovacuum"
+      ],
+      "external_dependencies": [
+        "sqlite3_crash_enable",
+        "-vfs crash",
+        "ATTACH"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C crash fault-injection VFS (-vfs crash) and Phase 2 ATTACH",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 26
+    },
+    {
+      "id": "sqlite/test/walcrash2.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walcrash2.test",
+      "source_path": "sqlite/test/walcrash2.test",
+      "sha256": "d97daeb2f6e17324d18750f63118b6f429a8921446594eb27c1d2afca4e34b38",
+      "wrapper_path": "tests/sqlite_test/walcrash2.rs",
+      "module_name": "walcrash2",
+      "test_fn": "test_walcrash2",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "sqlite3_crash_enable",
+        "-vfs crash",
+        "launch_testfixture"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C crash fault-injection VFS (-vfs crash) and Phase 6 launch_testfixture",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 3
+    },
+    {
+      "id": "sqlite/test/walcrash3.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walcrash3.test",
+      "source_path": "sqlite/test/walcrash3.test",
+      "sha256": "a3ab85396c1f4c45e92de3aaf8e096f512b74a2ff4836069d6ca20b57f5a9c6e",
+      "wrapper_path": "tests/sqlite_test/walcrash3.rs",
+      "module_name": "walcrash3",
+      "test_fn": "test_walcrash3",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "testvfs",
+        "tvfs"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testvfs/tvfs sector-tear fault injection",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 7
+    },
+    {
+      "id": "sqlite/test/walcrash4.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walcrash4.test",
+      "source_path": "sqlite/test/walcrash4.test",
+      "sha256": "1113fa4c5cc3f0c1f87f053c65b340acda72d844f53efa08d26482c38dcf1f63",
+      "wrapper_path": "tests/sqlite_test/walcrash4.rs",
+      "module_name": "walcrash4",
+      "test_fn": "test_walcrash4",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "sqlite3_crash_enable",
+        "-vfs crash"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C crash fault-injection VFS (-vfs crash / sqlite3_crash_now)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 3
+    },
+    {
+      "id": "sqlite/test/walfault.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walfault.test",
+      "source_path": "sqlite/test/walfault.test",
+      "sha256": "bca460e7cacab4f67790d54a52adccd1cf81272c2fd4c3230cde2ba98760f931",
+      "wrapper_path": "tests/sqlite_test/walfault.rs",
+      "module_name": "walfault",
+      "test_fn": "test_walfault",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "testvfs",
+        "do_faultsim_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test + testvfs)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 16
+    },
+    {
+      "id": "sqlite/test/walfault2.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walfault2.test",
+      "source_path": "sqlite/test/walfault2.test",
+      "sha256": "bdbd8db1a3ebd2a1911bbaaa24a2add180d1968a7cebd9e1d6019c57787c9566",
+      "wrapper_path": "tests/sqlite_test/walfault2.rs",
+      "module_name": "walfault2",
+      "test_fn": "test_walfault2",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 2
+    },
+    {
+      "id": "sqlite/test/walhook.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walhook.test",
+      "source_path": "sqlite/test/walhook.test",
+      "sha256": "ce4b93e7d6ab39184e0dbb28c49be15f9255376a3b38b4b0f2186141d160effe",
+      "wrapper_path": "tests/sqlite_test/walhook.rs",
+      "module_name": "walhook",
+      "test_fn": "test_walhook",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal",
+        "attach",
+        "autovacuum"
+      ],
+      "external_dependencies": [
+        "wal_hook",
+        "ATTACH"
+      ],
+      "status": "ignored",
+      "ignore_reason": "pending Phase 6 user wal_hook Tcl callback and Phase 2 ATTACH",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 9
+    },
+    {
+      "id": "sqlite/test/waliter.test",
+      "source_root": "sqlite/test",
+      "relative_path": "waliter.test",
+      "source_path": "sqlite/test/waliter.test",
+      "sha256": "0c33f9daa1edd2861b87281654e52dee1ec17194a63470c6fbb527b8e5fd0a83",
+      "wrapper_path": "tests/sqlite_test/waliter.rs",
+      "module_name": "waliter",
+      "test_fn": "test_waliter",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "testvfs",
+        "sqlite3_wal_data"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C internal wal_iterator / testvfs test command",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 9
+    },
+    {
+      "id": "sqlite/test/walmode.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walmode.test",
+      "source_path": "sqlite/test/walmode.test",
+      "sha256": "aac371d1487da2f75b96417c1083641154db010b719b8204c4d2f0bd836d5e70",
+      "wrapper_path": "tests/sqlite_test/walmode.rs",
+      "module_name": "walmode",
+      "test_fn": "test_walmode",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal",
+        "attach",
+        "tempdb"
+      ],
+      "external_dependencies": [
+        "ATTACH",
+        "TEMP"
+      ],
+      "status": "ignored",
+      "ignore_reason": "pending Phase 2 ATTACH and TEMP schema journal_mode matrix",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 77
+    },
+    {
+      "id": "sqlite/test/walnoshm.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walnoshm.test",
+      "source_path": "sqlite/test/walnoshm.test",
+      "sha256": "9d6379ce086e8ba8cf839cefcb4c05ff740a114eca6ac7e3e51e9e4413b55e12",
+      "wrapper_path": "tests/sqlite_test/walnoshm.rs",
+      "module_name": "walnoshm",
+      "test_fn": "test_walnoshm",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "testvfs",
+        "unix-excl"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testvfs -noshm and unix-excl alternative VFS",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 24
+    },
+    {
+      "id": "sqlite/test/waloverwrite.test",
+      "source_root": "sqlite/test",
+      "relative_path": "waloverwrite.test",
+      "source_path": "sqlite/test/waloverwrite.test",
+      "sha256": "c7ac56d31a749b6dc0b4aca32fdefd05abcb31bf1e10c0c2d71de1b8f08fac46",
+      "wrapper_path": "tests/sqlite_test/waloverwrite.rs",
+      "module_name": "waloverwrite",
+      "test_fn": "test_waloverwrite",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal",
+        "cte",
+        "savepoint"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 22,
+      "expected_subtest_count": 22
+    },
+    {
+      "id": "sqlite/test/walpersist.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walpersist.test",
+      "source_path": "sqlite/test/walpersist.test",
+      "sha256": "c0731893aa697417b619b452ac11e814e38a505615363a9b5d13bfb1d8686636",
+      "wrapper_path": "tests/sqlite_test/walpersist.rs",
+      "module_name": "walpersist",
+      "test_fn": "test_walpersist",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 20,
+      "expected_subtest_count": 20
+    },
+    {
+      "id": "sqlite/test/walprotocol.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walprotocol.test",
+      "source_path": "sqlite/test/walprotocol.test",
+      "sha256": "341ae438ea2032a49de27140dea112bd0ee5702fc2385d18c9b20c745d15030c",
+      "wrapper_path": "tests/sqlite_test/walprotocol.rs",
+      "module_name": "walprotocol",
+      "test_fn": "test_walprotocol",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "testvfs",
+        "tvfs"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testvfs/tvfs SHM lock callback interception",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 14
+    },
+    {
+      "id": "sqlite/test/walprotocol2.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walprotocol2.test",
+      "source_path": "sqlite/test/walprotocol2.test",
+      "sha256": "3d78034889603b19420f475f660a2568820cdacd113856cb5a5bfa34d0bcae4d",
+      "wrapper_path": "tests/sqlite_test/walprotocol2.rs",
+      "module_name": "walprotocol2",
+      "test_fn": "test_walprotocol2",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "testvfs",
+        "tvfs"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testvfs/tvfs SHM lock callback interception",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 7
+    },
+    {
+      "id": "sqlite/test/walrestart.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walrestart.test",
+      "source_path": "sqlite/test/walrestart.test",
+      "sha256": "855f3e894894089f5d231190f3229c59d43386bb0051b3836a285aea7e35327a",
+      "wrapper_path": "tests/sqlite_test/walrestart.rs",
+      "module_name": "walrestart",
+      "test_fn": "test_walrestart",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "sqlite3_test_control_fault_install"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C internal sqlite3FaultSim(660) hook (sqlite3_test_control_fault_install)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 6
+    },
+    {
+      "id": "sqlite/test/walro.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walro.test",
+      "source_path": "sqlite/test/walro.test",
+      "sha256": "5dc4e9626d8e148afc36416dbfab39446be9606ded7b8f30bc230cce768b2a55",
+      "wrapper_path": "tests/sqlite_test/walro.rs",
+      "module_name": "walro",
+      "test_fn": "test_walro",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "testvfs",
+        "tvfs"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testvfs/tvfs read-only SHM simulation",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 37
+    },
+    {
+      "id": "sqlite/test/walro2.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walro2.test",
+      "source_path": "sqlite/test/walro2.test",
+      "sha256": "9d6fde9c65466d8d1e9dcdb38b19e94c0cbf808f4ac541069bb88a5dbe6eccf7",
+      "wrapper_path": "tests/sqlite_test/walro2.rs",
+      "module_name": "walro2",
+      "test_fn": "test_walro2",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "testvfs",
+        "tvfs"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testvfs/tvfs read-only SHM simulation",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 34
+    },
+    {
+      "id": "sqlite/test/walrofault.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walrofault.test",
+      "source_path": "sqlite/test/walrofault.test",
+      "sha256": "e3c770961cd0ac0f6a5386d7fc868743ea84822860f6320e26cc9bd1596d620e",
+      "wrapper_path": "tests/sqlite_test/walrofault.rs",
+      "module_name": "walrofault",
+      "test_fn": "test_walrofault",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 1
+    },
+    {
+      "id": "sqlite/test/walseh1.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walseh1.test",
+      "source_path": "sqlite/test/walseh1.test",
+      "sha256": "1d67293f2afb3b421fc845e62deca0b7796dcca4163d280184add81ea799819b",
+      "wrapper_path": "tests/sqlite_test/walseh1.rs",
+      "module_name": "walseh1",
+      "test_fn": "test_walseh1",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test",
+        "windows_seh"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires Windows SEH exception simulation and do_faultsim_test",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 1
+    },
+    {
+      "id": "sqlite/test/walsetlk.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walsetlk.test",
+      "source_path": "sqlite/test/walsetlk.test",
+      "sha256": "9a22b6c9db41ef832ee2c097549cac0be16ae05a85c1cd2c556e94c69e861d0d",
+      "wrapper_path": "tests/sqlite_test/walsetlk.rs",
+      "module_name": "walsetlk",
+      "test_fn": "test_walsetlk",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "testvfs",
+        "launch_testfixture",
+        "SQLITE_ENABLE_SETLK_TIMEOUT"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires SQLITE_ENABLE_SETLK_TIMEOUT, C testvfs, and launch_testfixture",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 35
+    },
+    {
+      "id": "sqlite/test/walsetlk2.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walsetlk2.test",
+      "source_path": "sqlite/test/walsetlk2.test",
+      "sha256": "9e7c61ae3721787d9efc862fe2c9ca61736723b4203250661c48d94385f8325f",
+      "wrapper_path": "tests/sqlite_test/walsetlk2.rs",
+      "module_name": "walsetlk2",
+      "test_fn": "test_walsetlk2",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "testvfs",
+        "launch_testfixture",
+        "SQLITE_ENABLE_SETLK_TIMEOUT"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires SQLITE_ENABLE_SETLK_TIMEOUT, C testvfs, and launch_testfixture",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 21
+    },
+    {
+      "id": "sqlite/test/walsetlk3.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walsetlk3.test",
+      "source_path": "sqlite/test/walsetlk3.test",
+      "sha256": "a55ca8bd1420cb3ad6dfa6bd7981e60bb5509f2dc0430ee36a30cc91c37cd061",
+      "wrapper_path": "tests/sqlite_test/walsetlk3.rs",
+      "module_name": "walsetlk3",
+      "test_fn": "test_walsetlk3",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "testvfs",
+        "launch_testfixture",
+        "SQLITE_ENABLE_SETLK_TIMEOUT"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires SQLITE_ENABLE_SETLK_TIMEOUT, C testvfs, and launch_testfixture",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 6
+    },
+    {
+      "id": "sqlite/test/walsetlk_recover.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walsetlk_recover.test",
+      "source_path": "sqlite/test/walsetlk_recover.test",
+      "sha256": "26651fb0e6f703e3f375a4eb0a7bed4a5024d68d2d51bbf3bdf47066cd190013",
+      "wrapper_path": "tests/sqlite_test/walsetlk_recover.rs",
+      "module_name": "walsetlk_recover",
+      "test_fn": "test_walsetlk_recover",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "testvfs",
+        "launch_testfixture",
+        "SQLITE_ENABLE_SETLK_TIMEOUT"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires SQLITE_ENABLE_SETLK_TIMEOUT, C testvfs, and launch_testfixture",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 6
+    },
+    {
+      "id": "sqlite/test/walsetlk_snapshot.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walsetlk_snapshot.test",
+      "source_path": "sqlite/test/walsetlk_snapshot.test",
+      "sha256": "70f25ba85fd4bbfde644b540e99a2b24c500c8f84f4ff4e4ce67d4ef6bf0708d",
+      "wrapper_path": "tests/sqlite_test/walsetlk_snapshot.rs",
+      "module_name": "walsetlk_snapshot",
+      "test_fn": "test_walsetlk_snapshot",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "testvfs",
+        "launch_testfixture",
+        "SQLITE_ENABLE_SETLK_TIMEOUT"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires SQLITE_ENABLE_SETLK_TIMEOUT, C testvfs, and launch_testfixture",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 7
+    },
+    {
+      "id": "sqlite/test/walshared.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walshared.test",
+      "source_path": "sqlite/test/walshared.test",
+      "sha256": "efa580c67b8940e830cf52ffc7f7f027028b2b1d27330ed064f60a859000614c",
+      "wrapper_path": "tests/sqlite_test/walshared.rs",
+      "module_name": "walshared",
+      "test_fn": "test_walshared",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal",
+        "shared_cache"
+      ],
+      "external_dependencies": [
+        "sqlite3_enable_shared_cache"
+      ],
+      "status": "ignored",
+      "ignore_reason": "out of scope: requires shared_cache=1 (sqlite3_enable_shared_cache)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 5
+    },
+    {
+      "id": "sqlite/test/walslow.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walslow.test",
+      "source_path": "sqlite/test/walslow.test",
+      "sha256": "690cf1171e0a792d6d2e22edf45e25a888c242a25ae7844bd40d45768d62a451",
+      "wrapper_path": "tests/sqlite_test/walslow.rs",
+      "module_name": "walslow",
+      "test_fn": "test_walslow",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "db func"
+      ],
+      "status": "ignored",
+      "ignore_reason": "pending Phase 6 Tcl UDF (db func)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 20
+    },
+    {
+      "id": "sqlite/test/walthread.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walthread.test",
+      "source_path": "sqlite/test/walthread.test",
+      "sha256": "26c5295c8626d32bcadd5377b118cc8a7773350c2a86fea9609cba809ad30ef0",
+      "wrapper_path": "tests/sqlite_test/walthread.rs",
+      "module_name": "walthread",
+      "test_fn": "test_walthread",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "sqlthread",
+        "wal_hook"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C sqlthread multi-interpreter harness and Phase 6 wal_hook",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 2
+    },
+    {
+      "id": "sqlite/test/walvfs.test",
+      "source_root": "sqlite/test",
+      "relative_path": "walvfs.test",
+      "source_path": "sqlite/test/walvfs.test",
+      "sha256": "43cb27a8e59039cbeeb4b766568538a2f91dfa63b1ab18b359b063d7fe40189f",
+      "wrapper_path": "tests/sqlite_test/walvfs.rs",
+      "module_name": "walvfs",
+      "test_fn": "test_walvfs",
+      "phase": "1.2",
+      "required_capabilities": [
+        "wal"
+      ],
+      "external_dependencies": [
+        "testvfs",
+        "tvfs"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testvfs/tvfs VFS callback instrumentation",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 34
+    }
+  ]
+}

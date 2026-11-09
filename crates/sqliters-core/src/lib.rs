@@ -14,7 +14,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use sqliters_btree::{Btree, BtreeCursorState, CursorId};
-use sqliters_pager::{DatabaseHeader, PagerOpenOptions, TransactionState};
+pub use sqliters_pager::{
+    DatabaseHeader, JournalMode, LockingMode, WalCheckpointMode, WalCheckpointResult,
+};
+use sqliters_pager::{PagerOpenOptions, TransactionState};
 use sqliters_syntax::{
     BindParam, Expr, FunctionArgs, InsertSource, ResultColumn, SelectCore, SelectStmt, Stmt,
     TableOrSubquery, parse_one,
@@ -27,12 +30,12 @@ use sqliters_vdbe::{VdbeProgram, VdbeVm, VmRuntimeContext, VmStep};
 use sqliters_vfs::{MemoryVfs, OpenFlags, OsVfs, Vfs};
 
 use crate::engine::{
-    ActivitySummary, ExecContext, LeaseCursorSpec, SqlSavepoint, StmtCategory, check_deferred_fks,
-    classify_stmt_category, collect_select_referenced_roots, commit_transaction,
-    execute_control_stmt, execute_nolock_stmt, execute_read_body, execute_write_body,
-    release_savepoint_op, stmt_requires_schema, validate_and_infer_columns,
+    ActivitySummary, BusyPolicy, ExecContext, LeaseCursorSpec, SqlSavepoint, StmtCategory,
+    check_deferred_fks, classify_stmt_category, collect_select_referenced_roots,
+    commit_transaction, execute_control_stmt, execute_nolock_stmt, execute_read_body,
+    execute_write_body, release_savepoint_op, stmt_requires_schema, validate_and_infer_columns,
 };
-pub use engine::QueryOutput;
+pub use engine::{QueryOutput, SQLITE_DEFAULT_WAL_AUTOCHECKPOINT};
 pub use schema::{ColumnSchema, ForeignKeySchema, IndexSchema, Schema, TableSchema};
 
 /// Maximum automatic `PrepareMode::V2` schema-change reprepare retries (`SQLITE_MAX_SCHEMA_RETRY`).
@@ -412,6 +415,9 @@ struct ConnectionInner {
     schema_changed_in_tx: bool,
     foreign_keys: bool,
     count_changes: bool,
+    wal_autocheckpoint_threshold: i32,
+    default_locking_mode: LockingMode,
+    busy_policy: BusyPolicy,
     rollback_count: u64,
     deferred_fk_suspects: Vec<(String, schema::TableRowKey, usize)>,
     schema_generation: u64,
@@ -688,7 +694,8 @@ impl ConnectionInner {
     /// immediately if no user/statement B-tree transaction was active (`sqlite3InitOne.openedTransaction`).
     fn ensure_schema_loaded_for_prepare(&mut self) -> Result<bool> {
         if self.btree.transaction_state() == TransactionState::Open {
-            self.btree.begin_read()?;
+            self.busy_policy
+                .retry_btree(&mut self.btree, |bt| bt.begin_read())?;
             let prev_cookie = self.schema.schema_cookie;
             let prev_had_pages = self.schema.had_pages;
             let prev_loaded = self.schema.loaded;
@@ -741,6 +748,64 @@ impl ConnectionInner {
         Ok(())
     }
 
+    fn maybe_run_wal_autocheckpoint(&mut self) {
+        if !self.is_autocommit() {
+            return;
+        }
+        let n_entry = self.btree.pager_mut().take_wal_callback_frame_count();
+        let threshold = self.wal_autocheckpoint_threshold;
+        if n_entry > 0
+            && threshold > 0
+            && i64::from(n_entry) >= i64::from(threshold)
+            && self.btree.transaction_state() == TransactionState::Open
+            && self.activity.has_no_active_tx()
+        {
+            let _ = self.btree.wal_checkpoint(WalCheckpointMode::Passive, None);
+        }
+    }
+
+    fn wal_checkpoint_internal(
+        &mut self,
+        db_name: Option<&str>,
+        mode: WalCheckpointMode,
+    ) -> Result<WalCheckpointResult> {
+        let target_is_temp = match db_name {
+            None | Some("") => false,
+            Some(s) if s.eq_ignore_ascii_case("main") => false,
+            Some(s) if s.eq_ignore_ascii_case("temp") => true,
+            Some(s) => {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("unknown database: {s}"),
+                ));
+            }
+        };
+        if target_is_temp {
+            return Ok(WalCheckpointResult::not_wal());
+        }
+        if self.btree.transaction_state() != TransactionState::Open
+            || !self.activity.has_no_active_tx()
+        {
+            return Err(SqliteError::new(
+                ErrorCode::Locked,
+                "database table is locked",
+            ));
+        }
+        if self.btree.pager().db_kind() == DatabaseKind::NamedDisk
+            && (!self.btree.pager().is_header_loaded()
+                || (self.btree.pager().journal_mode() == JournalMode::Wal
+                    && self.btree.pager().wal().is_none()))
+        {
+            self.busy_policy
+                .retry_btree(&mut self.btree, |bt| bt.begin_read())?;
+            self.btree.pager_mut().end_read_if_unused()?;
+        }
+        if self.btree.pager().wal().is_none() {
+            return Ok(WalCheckpointResult::not_wal());
+        }
+        self.busy_policy.checkpoint_btree(&mut self.btree, mode)
+    }
+
     fn finish_activity(
         &mut self,
         hid: HandleId,
@@ -790,6 +855,12 @@ impl ConnectionInner {
                     {
                         return Err(self.poison_with(e));
                     }
+                    if summary.other_writers == 0
+                        && summary.other_readers == 0
+                        && let Err(e) = self.btree.spill_if_over_cache_size()
+                    {
+                        return Err(self.poison_with(e));
+                    }
                     self.publish(shared);
                     return Ok(());
                 }
@@ -823,6 +894,9 @@ impl ConnectionInner {
                         activity: summary,
                         foreign_keys: &mut self.foreign_keys,
                         count_changes: &mut self.count_changes,
+                        wal_autocheckpoint_threshold: &mut self.wal_autocheckpoint_threshold,
+                        default_locking_mode: &mut self.default_locking_mode,
+                        busy_policy: &mut self.busy_policy,
                         rollback_count: &mut self.rollback_count,
                         deferred_fk_suspects: &mut self.deferred_fk_suspects,
                         publish_mirrors: &mut publish_fn,
@@ -887,6 +961,7 @@ impl ConnectionInner {
                 self.schema_changed_in_tx = false;
                 self.deferred_fk_suspects.clear();
                 self.publish(shared);
+                self.maybe_run_wal_autocheckpoint();
                 Ok(())
             }
         }
@@ -943,10 +1018,17 @@ impl ConnectionInner {
             }
 
             ConflictResolutionEffect::Fail => {
+                let mut committed_autocommit = false;
                 if !self.is_autocommit() || summary.other_writers > 0 {
                     if let Some(slot) = snap.stmt_sp_slot
                         && self.btree.transaction_state() == TransactionState::Write
                         && let Err(sp_err) = self.btree.pager_mut().release_subsavepoint(slot)
+                    {
+                        return self.poison_with(sp_err);
+                    }
+                    if summary.other_writers == 0
+                        && summary.other_readers == 0
+                        && let Err(sp_err) = self.btree.spill_if_over_cache_size()
                     {
                         return self.poison_with(sp_err);
                     }
@@ -983,8 +1065,12 @@ impl ConnectionInner {
                     }
                     self.schema_changed_in_tx = false;
                     self.deferred_fk_suspects.clear();
+                    committed_autocommit = true;
                 }
                 self.publish(shared);
+                if committed_autocommit {
+                    self.maybe_run_wal_autocheckpoint();
+                }
                 err.clone()
             }
 
@@ -1187,6 +1273,27 @@ impl Connection {
         Self::open_with_options(path, flags, ConnectionOpenOptions::default())
     }
 
+    /// Opens an existing disk database in read-only `immutable` mode (`file:...?immutable=1`):
+    /// skips OS file locking and `-shm` creation while still replaying any existing `-wal` frames
+    /// into a private heap-backed WAL index.
+    pub fn open_immutable(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_immutable_with_options(path, ConnectionOpenOptions::default())
+    }
+
+    /// Opens an existing disk database in read-only `immutable` mode with explicit
+    /// [`ConnectionOpenOptions`].
+    pub fn open_immutable_with_options(
+        path: impl AsRef<Path>,
+        options: ConnectionOpenOptions,
+    ) -> Result<Self> {
+        let p = path.as_ref();
+        let vfs: Arc<dyn Vfs> = Arc::new(OsVfs::with_lock_geometry(options.lock_geometry));
+        let mut pager_opts = options.to_pager_options(DatabaseKind::NamedDisk);
+        pager_opts.immutable = true;
+        let btree = Btree::open_with_options(vfs, Some(p), OpenFlags::READONLY, pager_opts)?;
+        Self::from_btree(btree, options)
+    }
+
     /// Opens a database with explicit [`OpenFlags`] and [`ConnectionOpenOptions`].
     pub fn open_with_options(
         path: impl AsRef<Path>,
@@ -1194,6 +1301,51 @@ impl Connection {
         options: ConnectionOpenOptions,
     ) -> Result<Self> {
         let p = path.as_ref();
+        if flags.contains(OpenFlags::URI)
+            && let Some(s) = p.to_str()
+            && let Some(rest) = s.strip_prefix("file:")
+        {
+            let (raw_path, query) = match rest.split_once('?') {
+                Some((rp, q)) => (rp, Some(q)),
+                None => (rest, None),
+            };
+            let mut is_immutable = false;
+            let mut mode_ro = false;
+            let mut mode_memory = false;
+            if let Some(q) = query {
+                for pair in q.split('&') {
+                    if let Some((k, v)) = pair.split_once('=') {
+                        if k == "immutable" && (v == "1" || v.eq_ignore_ascii_case("true")) {
+                            is_immutable = true;
+                        } else if k == "mode" {
+                            if v.eq_ignore_ascii_case("ro") {
+                                mode_ro = true;
+                            } else if v.eq_ignore_ascii_case("memory") {
+                                mode_memory = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if is_immutable {
+                return Self::open_immutable_with_options(Path::new(raw_path), options);
+            }
+            if mode_memory {
+                return Self::open_in_memory_with_options(options);
+            }
+            let effective_flags = if mode_ro {
+                OpenFlags::READONLY
+            } else {
+                OpenFlags(flags.0 & !OpenFlags::URI.0)
+            };
+            let vfs: Arc<dyn Vfs> = Arc::new(OsVfs::with_lock_geometry(options.lock_geometry));
+            return Self::open_with_vfs_and_options(
+                vfs,
+                Some(Path::new(raw_path)),
+                effective_flags,
+                options,
+            );
+        }
         let vfs: Arc<dyn Vfs> = if p == Path::new(":memory:") || flags.contains(OpenFlags::MEMORY) {
             Arc::new(MemoryVfs::with_lock_geometry(options.lock_geometry))
         } else {
@@ -1257,6 +1409,9 @@ impl Connection {
             schema_changed_in_tx: false,
             foreign_keys: false,
             count_changes: false,
+            wal_autocheckpoint_threshold: SQLITE_DEFAULT_WAL_AUTOCHECKPOINT,
+            default_locking_mode: LockingMode::Normal,
+            busy_policy: BusyPolicy::default(),
             rollback_count: 0,
             deferred_fk_suspects: Vec::new(),
             schema_generation: 0,
@@ -1494,7 +1649,9 @@ impl Connection {
         let inner = session.inner_mut();
         inner.ensure_usable()?;
         if inner.btree.transaction_state() == TransactionState::Open {
-            inner.btree.begin_read()?;
+            inner
+                .busy_policy
+                .retry_btree(&mut inner.btree, |bt| bt.begin_read())?;
             let hdr = inner.btree.pager().header().clone();
             if !inner.in_user_btree_tx && inner.activity.has_no_active_tx() {
                 inner.btree.pager_mut().end_read_if_unused()?;
@@ -1521,7 +1678,9 @@ impl Connection {
         let inner = session.inner_mut();
         inner.ensure_usable()?;
         if inner.btree.transaction_state() == TransactionState::Open {
-            inner.btree.begin_read()?;
+            inner
+                .busy_policy
+                .retry_btree(&mut inner.btree, |bt| bt.begin_read())?;
             let cnt = inner.btree.pager().page_count();
             if !inner.in_user_btree_tx && inner.activity.has_no_active_tx() {
                 inner.btree.pager_mut().end_read_if_unused()?;
@@ -1613,6 +1772,115 @@ impl Connection {
         let eff = flag.or_else(|| Some(Arc::clone(&self.shared.interrupt_flag)));
         inner.btree.set_interrupt_flag(eff);
         Ok(())
+    }
+
+    /// Runs a WAL checkpoint on `db_name` (`None` / `Some("")` for all schemas, `Some("main")`,
+    /// or `Some("temp")`) with explicit [`WalCheckpointMode`] (`sqlite3_wal_checkpoint_v2` in
+    /// `sqlite/src/main.c:2604-2703`).
+    ///
+    /// - Returns `Ok(WalCheckpointResult { busy: false, n_log: -1, n_ckpt: -1 })` when the target
+    ///   database is not in WAL mode (e.g., rollback journal mode or `temp`).
+    /// - Returns `Ok(WalCheckpointResult { busy: true, n_log, n_ckpt })` when checkpoint progress
+    ///   was blocked by another active reader, writer, or checkpointer (preserving `(n_log, n_ckpt)`
+    ///   even when busy, matching `sqlite3_wal_checkpoint_v2`).
+    /// - Returns `Err(SqliteError)` on hard errors (`ErrorCode::Error` for unknown schema,
+    ///   `ErrorCode::Locked` when this connection holds an active B-tree read/write transaction,
+    ///   `ErrorCode::ReadOnly`, `ErrorCode::Corrupt`, `ErrorCode::IoErr`, `ErrorCode::Interrupt`).
+    pub fn wal_checkpoint_v2(
+        &self,
+        db_name: Option<&str>,
+        mode: WalCheckpointMode,
+    ) -> Result<WalCheckpointResult> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        let res = inner.wal_checkpoint_internal(db_name, mode);
+        if inner.activity.leases.is_empty() {
+            self.shared.interrupt_flag.store(false, Ordering::SeqCst);
+        }
+        res
+    }
+
+    /// Runs a `PASSIVE` WAL checkpoint on `db_name` (`sqlite3_wal_checkpoint` in
+    /// `sqlite/src/main.c:2582-2589`), returning `Err(ErrorCode::Busy)` if blocked by an active
+    /// reader, writer, or checkpointer.
+    pub fn wal_checkpoint(&self, db_name: Option<&str>) -> Result<()> {
+        let res = self.wal_checkpoint_v2(db_name, WalCheckpointMode::Passive)?;
+        if res.busy {
+            return Err(SqliteError::new(ErrorCode::Busy, "database is locked"));
+        }
+        Ok(())
+    }
+
+    /// Configures the automatic post-commit `PASSIVE` WAL checkpoint frame threshold
+    /// (`sqlite3_wal_autocheckpoint` in `sqlite/src/main.c:2531-2546`).
+    ///
+    /// Passing `n_frames <= 0` disables automatic checkpointing (`0`); every new connection starts
+    /// with [`SQLITE_DEFAULT_WAL_AUTOCHECKPOINT`] (`1000`).
+    pub fn wal_autocheckpoint(&self, n_frames: i32) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        inner.wal_autocheckpoint_threshold = if n_frames <= 0 { 0 } else { n_frames };
+        Ok(())
+    }
+
+    /// Returns the currently configured `wal_autocheckpoint` threshold (`0` when disabled).
+    pub fn wal_autocheckpoint_threshold(&self) -> Result<i32> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        Ok(inner.wal_autocheckpoint_threshold)
+    }
+
+    /// Configures a millisecond retry timeout on lock contention (`sqlite3_busy_timeout`).
+    /// Passing `0` disables busy retries.
+    pub fn busy_timeout(&self, ms: u64) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        inner.busy_policy = if ms == 0 {
+            BusyPolicy::None
+        } else {
+            BusyPolicy::TimeoutMs(ms)
+        };
+        Ok(())
+    }
+
+    /// Installs or clears a custom busy-handler callback (`sqlite3_busy_handler`).
+    /// The callback receives the 0-based retry count and returns `true` to retry or `false` to
+    /// propagate `ErrorCode::Busy`.
+    pub fn busy_handler(&self, handler: Option<Box<dyn FnMut(u32) -> bool + Send>>) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        inner.busy_policy = match handler {
+            Some(cb) => BusyPolicy::Custom(cb),
+            None => BusyPolicy::None,
+        };
+        Ok(())
+    }
+
+    /// Queries or updates `SQLITE_FCNTL_PERSIST_WAL` on `db_name` (`None`, `Some("")`, or
+    /// `Some("main")`).
+    ///
+    /// Passing `mode < 0` queries the current flag without modifying it; `mode == 0` disables
+    /// persistent `-wal`/`-shm` across last-connection close; `mode > 0` enables it.
+    pub fn file_control_persist_wal(&self, db_name: Option<&str>, mode: i32) -> Result<bool> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        match db_name {
+            None | Some("") => {}
+            Some(s) if s.eq_ignore_ascii_case("main") => {}
+            Some(_) => {
+                return Err(SqliteError::new(ErrorCode::NotFound, "not found"));
+            }
+        }
+        if mode >= 0 {
+            inner.btree.pager_mut().set_persist_wal(mode != 0);
+        }
+        Ok(inner.btree.pager().persist_wal())
     }
 
     /// Test/internal hook invoking `f(self)` while holding the active execution gate and
@@ -2329,6 +2597,9 @@ impl Statement {
                         activity: summary,
                         foreign_keys: &mut inner.foreign_keys,
                         count_changes: &mut inner.count_changes,
+                        wal_autocheckpoint_threshold: &mut inner.wal_autocheckpoint_threshold,
+                        default_locking_mode: &mut inner.default_locking_mode,
+                        busy_policy: &mut inner.busy_policy,
                         rollback_count: &mut inner.rollback_count,
                         deferred_fk_suspects: &mut inner.deferred_fk_suspects,
                         publish_mirrors: &mut publish_fn,
@@ -2338,6 +2609,7 @@ impl Statement {
                 match res {
                     Ok(()) => {
                         inner.activity.remove(hid);
+                        inner.maybe_run_wal_autocheckpoint();
                         self.lifecycle = StatementLifecycle::Halted { last_error: None };
                         Ok(StepResult::Done)
                     }
@@ -2392,6 +2664,9 @@ impl Statement {
                         activity: summary,
                         foreign_keys: &mut inner.foreign_keys,
                         count_changes: &mut inner.count_changes,
+                        wal_autocheckpoint_threshold: &mut inner.wal_autocheckpoint_threshold,
+                        default_locking_mode: &mut inner.default_locking_mode,
+                        busy_policy: &mut inner.busy_policy,
                         rollback_count: &mut inner.rollback_count,
                         deferred_fk_suspects: &mut inner.deferred_fk_suspects,
                         publish_mirrors: &mut publish_fn,
@@ -2413,6 +2688,7 @@ impl Statement {
                             Ok(StepResult::Row(Row::new(first_row)))
                         } else {
                             let _ = inner.finish_activity(hid, ActivityFinish::NoLock, shared);
+                            inner.maybe_run_wal_autocheckpoint();
                             self.lifecycle = StatementLifecycle::Halted { last_error: None };
                             Ok(StepResult::Done)
                         }
@@ -2447,6 +2723,9 @@ impl Statement {
                         activity: summary,
                         foreign_keys: &mut inner.foreign_keys,
                         count_changes: &mut inner.count_changes,
+                        wal_autocheckpoint_threshold: &mut inner.wal_autocheckpoint_threshold,
+                        default_locking_mode: &mut inner.default_locking_mode,
+                        busy_policy: &mut inner.busy_policy,
                         rollback_count: &mut inner.rollback_count,
                         deferred_fk_suspects: &mut inner.deferred_fk_suspects,
                         publish_mirrors: &mut publish_fn,
@@ -2467,6 +2746,7 @@ impl Statement {
                         self.compiled_schema_generation = inner.schema_generation;
                         self.compiled_cookie = inner.schema.schema_cookie;
                         self.compiled_had_pages = inner.schema.had_pages;
+                        inner.maybe_run_wal_autocheckpoint();
                         self.lifecycle = StatementLifecycle::Halted { last_error: None };
                         Ok(StepResult::Done)
                     }
@@ -2488,7 +2768,11 @@ impl Statement {
 
             StmtCategory::Read => {
                 let opened_read_here = inner.btree.transaction_state() == TransactionState::Open;
-                if opened_read_here && let Err(e) = inner.btree.begin_read() {
+                if opened_read_here
+                    && let Err(e) = inner
+                        .busy_policy
+                        .retry_btree(&mut inner.btree, |bt| bt.begin_read())
+                {
                     self.lifecycle = StatementLifecycle::Halted {
                         last_error: Some(e.clone()),
                     };
@@ -2635,6 +2919,9 @@ impl Statement {
                         activity: summary,
                         foreign_keys: &mut inner.foreign_keys,
                         count_changes: &mut inner.count_changes,
+                        wal_autocheckpoint_threshold: &mut inner.wal_autocheckpoint_threshold,
+                        default_locking_mode: &mut inner.default_locking_mode,
+                        busy_policy: &mut inner.busy_policy,
                         rollback_count: &mut inner.rollback_count,
                         deferred_fk_suspects: &mut inner.deferred_fk_suspects,
                         publish_mirrors: &mut publish_fn,
@@ -2691,11 +2978,10 @@ impl Statement {
                 let opened_write_here = prev_tx_state != TransactionState::Write;
                 let base_sp_depth = inner.savepoints.len();
                 if opened_write_here {
-                    if let Err(e) = inner
-                        .btree
-                        .pager_mut()
-                        .begin_write_with_savepoint_depth(base_sp_depth)
-                    {
+                    if let Err(e) = inner.busy_policy.retry_btree(&mut inner.btree, |bt| {
+                        bt.pager_mut()
+                            .begin_write_with_savepoint_depth(base_sp_depth)
+                    }) {
                         self.lifecycle = StatementLifecycle::Halted {
                             last_error: Some(e.clone()),
                         };
@@ -2816,6 +3102,9 @@ impl Statement {
                         activity: summary,
                         foreign_keys: &mut inner.foreign_keys,
                         count_changes: &mut inner.count_changes,
+                        wal_autocheckpoint_threshold: &mut inner.wal_autocheckpoint_threshold,
+                        default_locking_mode: &mut inner.default_locking_mode,
+                        busy_policy: &mut inner.busy_policy,
                         rollback_count: &mut inner.rollback_count,
                         deferred_fk_suspects: &mut inner.deferred_fk_suspects,
                         publish_mirrors: &mut publish_fn,
@@ -3014,6 +3303,7 @@ impl Statement {
                     Ok(StepResult::Row(Row::new(vals)))
                 } else {
                     let _ = inner.finish_activity(hid, ActivityFinish::NoLock, shared);
+                    inner.maybe_run_wal_autocheckpoint();
                     self.lifecycle = StatementLifecycle::Halted { last_error: None };
                     Ok(StepResult::Done)
                 }
@@ -3080,6 +3370,9 @@ impl Statement {
                         activity: summary,
                         foreign_keys: &mut inner.foreign_keys,
                         count_changes: &mut inner.count_changes,
+                        wal_autocheckpoint_threshold: &mut inner.wal_autocheckpoint_threshold,
+                        default_locking_mode: &mut inner.default_locking_mode,
+                        busy_policy: &mut inner.busy_policy,
                         rollback_count: &mut inner.rollback_count,
                         deferred_fk_suspects: &mut inner.deferred_fk_suspects,
                         publish_mirrors: &mut publish_fn,
@@ -3093,6 +3386,7 @@ impl Statement {
                 match res {
                     Ok(()) => {
                         inner.activity.remove(hid);
+                        inner.maybe_run_wal_autocheckpoint();
                         self.lifecycle = StatementLifecycle::Halted { last_error: None };
                         Ok(StepResult::Done)
                     }

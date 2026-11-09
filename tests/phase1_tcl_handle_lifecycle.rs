@@ -928,15 +928,15 @@ finish_test
 
 #[test]
 fn explicit_capability_table_and_zero_subtest_guard() {
-    // 1. Direct Rust API audit of Phase 1.1 capabilities.
+    // 1. Direct Rust API audit of Phase 1.1 + Phase 1.2 capabilities.
     assert_eq!(phase1_capability("autoreset"), Some(true));
     assert_eq!(phase1_capability("foreignkey"), Some(true));
     assert_eq!(phase1_capability("savepoint"), Some(true));
     assert_eq!(phase1_capability("returning"), Some(true));
     assert_eq!(phase1_capability("cte"), Some(true));
     assert_eq!(phase1_capability("generated"), Some(true));
+    assert_eq!(phase1_capability("wal"), Some(true));
     for disabled in [
-        "wal",
         "tempdb",
         "attach",
         "autovacuum",
@@ -965,7 +965,7 @@ fn explicit_capability_table_and_zero_subtest_guard() {
         assert_eq!(
             phase1_capability(disabled),
             Some(false),
-            "capability `{disabled}` must be explicitly 0 in Phase 1.1"
+            "capability `{disabled}` must be explicitly 0 in Phase 1.2"
         );
     }
     assert_eq!(phase1_capability("nonexistent_xyz"), None);
@@ -1005,7 +1005,7 @@ do_test 1.1 {
     [capable prefer_proxy_locking] \
     [capable nonexistent_xyz] \
     [capable !nonexistent_xyz]
-} {1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1}
+} {1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1}
 
 finish_test
 "#;
@@ -1042,7 +1042,7 @@ fn run_test_script_panics_when_zero_subtests_execute() {
         r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
-ifcapable !wal {
+ifcapable !trigger {
   finish_test
   return
 }

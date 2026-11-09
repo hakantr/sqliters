@@ -52,8 +52,8 @@ pub use sqliters_vfs as vfs;
 pub use sqliters_core::TestBlobHandle;
 pub use sqliters_core::{
     CloseError, ColumnSchema, Connection, ConnectionOpenOptions, ForeignKeySchema, IndexSchema,
-    InterruptHandle, PrepareMode, QueryOutput, QueryResult, Row, Schema, Statement, StepResult,
-    TableSchema,
+    InterruptHandle, PrepareMode, QueryOutput, QueryResult, Row, SQLITE_DEFAULT_WAL_AUTOCHECKPOINT,
+    Schema, Statement, StepResult, TableSchema,
 };
 pub use sqliters_pager::{
     DatabaseHeader, JournalMode, LockingMode, WalCheckpointMode, WalCheckpointResult,

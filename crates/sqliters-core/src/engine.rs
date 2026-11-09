@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use sqliters_btree::Btree;
-use sqliters_pager::{JournalMode, TransactionState};
+use sqliters_pager::{
+    JournalMode, LockingMode, TransactionState, WalCheckpointMode, WalCheckpointResult,
+};
 use sqliters_syntax::{
     AlterTableAction, BinaryOp, BindParam, ColumnDef, CommonTableExpr, CompoundOp, ConflictAction,
     CreateIndexStmt, CreateTableStmt, CurrentTimeKind, DeleteStmt, Expr, FkAction, FromClause,
@@ -67,6 +69,91 @@ pub struct ActivitySummary {
     pub other_writers: usize,
 }
 
+/// Default WAL automatic checkpoint threshold (`SQLITE_DEFAULT_WAL_AUTOCHECKPOINT = 1000`).
+pub const SQLITE_DEFAULT_WAL_AUTOCHECKPOINT: i32 = 1000;
+
+/// Connection-level busy retry policy (`sqlite3_busy_timeout` / `sqlite3_busy_handler`, `main.c:1765-1955`).
+#[derive(Default)]
+pub enum BusyPolicy {
+    #[default]
+    None,
+    TimeoutMs(u64),
+    Custom(Box<dyn FnMut(u32) -> bool + Send>),
+}
+
+impl BusyPolicy {
+    #[inline]
+    pub(crate) fn has_handler(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub(crate) fn invoke_once(&mut self, count: u32, start: std::time::Instant) -> bool {
+        const DELAYS_MS: [u64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
+        match self {
+            Self::None => false,
+            Self::Custom(cb) => cb(count),
+            Self::TimeoutMs(tm) => {
+                let limit = *tm;
+                if limit == 0 {
+                    return false;
+                }
+                let elapsed = start.elapsed().as_millis() as u64;
+                if elapsed >= limit {
+                    return false;
+                }
+                let base_delay = DELAYS_MS.get(count as usize).copied().unwrap_or(100);
+                let sleep_ms = base_delay.min(limit - elapsed).max(1);
+                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+                true
+            }
+        }
+    }
+
+    /// Retries `op(btree)` on external lock contention (`ErrorCode::Busy` excluding `SQLITE_BUSY_SNAPSHOT`),
+    /// matching `btreeBeginTrans` (`btree.c:3040`).
+    pub(crate) fn retry_btree<T, F>(&mut self, btree: &mut Btree, mut op: F) -> Result<T>
+    where
+        F: FnMut(&mut Btree) -> Result<T>,
+    {
+        if !self.has_handler() {
+            return op(btree);
+        }
+        let start = std::time::Instant::now();
+        let mut count = 0u32;
+        loop {
+            match op(btree) {
+                Ok(v) => return Ok(v),
+                Err(e)
+                    if e.code == ErrorCode::Busy
+                        && e.extended_code != extended::SQLITE_BUSY_SNAPSHOT =>
+                {
+                    btree.check_interrupted()?;
+                    if !self.invoke_once(count, start) {
+                        return Err(e);
+                    }
+                    count = count.saturating_add(1);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Runs `btree.wal_checkpoint`, passing `busy_handler` only when `mode > Passive` (`pager.c:7608`, `wal.c:4408`).
+    pub(crate) fn checkpoint_btree(
+        &mut self,
+        btree: &mut Btree,
+        mode: WalCheckpointMode,
+    ) -> Result<WalCheckpointResult> {
+        if mode > WalCheckpointMode::Passive && self.has_handler() {
+            let start = std::time::Instant::now();
+            let mut cb = |count: u32| self.invoke_once(count, start);
+            btree.wal_checkpoint(mode, Some(&mut cb))
+        } else {
+            btree.wal_checkpoint(mode, None)
+        }
+    }
+}
+
 /// Mutable database state passed into statement execution.
 pub struct ExecContext<'a> {
     pub btree: &'a mut Btree,
@@ -81,6 +168,9 @@ pub struct ExecContext<'a> {
     pub activity: ActivitySummary,
     pub foreign_keys: &'a mut bool,
     pub count_changes: &'a mut bool,
+    pub wal_autocheckpoint_threshold: &'a mut i32,
+    pub default_locking_mode: &'a mut LockingMode,
+    pub busy_policy: &'a mut BusyPolicy,
     pub rollback_count: &'a mut u64,
     pub deferred_fk_suspects: &'a mut Vec<(String, TableRowKey, usize)>,
     pub publish_mirrors: &'a mut dyn FnMut(&VmRuntimeContext, bool, bool, u64),
@@ -282,6 +372,7 @@ pub(crate) fn stmt_requires_schema(stmt: &Stmt) -> bool {
                 | "FOREIGN_KEY_CHECK"
                 | "INTEGRITY_CHECK"
                 | "QUICK_CHECK"
+                | "WAL_CHECKPOINT"
         ),
         _ => true,
     }
@@ -441,14 +532,16 @@ pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
                     ctx.publish();
                 }
                 sqliters_syntax::TransactionMode::Immediate => {
-                    ctx.btree.begin_write()?;
+                    ctx.busy_policy
+                        .retry_btree(ctx.btree, |bt| bt.begin_write())?;
                     *ctx.explicit_tx = true;
                     *ctx.implicit_savepoint_tx = false;
                     *ctx.in_user_btree_tx = true;
                     ctx.publish();
                 }
                 sqliters_syntax::TransactionMode::Exclusive => {
-                    ctx.btree.begin_exclusive()?;
+                    ctx.busy_policy
+                        .retry_btree(ctx.btree, |bt| bt.begin_exclusive())?;
                     *ctx.explicit_tx = true;
                     *ctx.implicit_savepoint_tx = false;
                     *ctx.in_user_btree_tx = true;
@@ -574,7 +667,11 @@ pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
 pub(crate) fn execute_nolock_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Result<QueryOutput> {
     match stmt {
         Stmt::Analyze(_) => Ok(QueryOutput::default()),
-        Stmt::Pragma { name, value, .. } => exec_pragma(ctx, name, value.as_ref()),
+        Stmt::Pragma {
+            schema,
+            name,
+            value,
+        } => exec_pragma(ctx, schema.as_deref(), name, value.as_ref()),
         _ => unreachable!("execute_nolock_stmt called on non-nolock statement"),
     }
 }
@@ -617,7 +714,11 @@ pub(crate) fn execute_read_body(
             }
         }
         Stmt::Select(sel) => exec_select(ctx, sel, params, &[], &CteStore::default()),
-        Stmt::Pragma { name, value, .. } => exec_pragma(ctx, name, value.as_ref()),
+        Stmt::Pragma {
+            schema,
+            name,
+            value,
+        } => exec_pragma(ctx, schema.as_deref(), name, value.as_ref()),
         _ => unreachable!("execute_read_body called on non-read statement"),
     }
 }
@@ -665,7 +766,26 @@ pub(crate) fn execute_write_body(
             exec_reindex(ctx, target.as_deref())?;
             Ok(QueryOutput::default())
         }
-        Stmt::Pragma { name, value, .. } => {
+        Stmt::Pragma {
+            schema,
+            name,
+            value,
+        } => {
+            if let Some(s) = schema.as_deref()
+                && !s.eq_ignore_ascii_case("main")
+                && !s.eq_ignore_ascii_case("temp")
+            {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("unknown database {s}"),
+                ));
+            }
+            if schema
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case("temp"))
+            {
+                return Ok(QueryOutput::default());
+            }
             let Some(pv) = value.as_ref() else {
                 return Ok(QueryOutput::default());
             };
@@ -679,7 +799,7 @@ pub(crate) fn execute_write_body(
                     ctx.btree.pager_mut().header_mut()?.application_id = v;
                     Ok(QueryOutput::default())
                 }
-                _ => exec_pragma(ctx, name, value.as_ref()),
+                _ => exec_pragma(ctx, schema.as_deref(), name, value.as_ref()),
             }
         }
         _ => unreachable!("execute_write_body called on non-write statement"),
@@ -696,7 +816,7 @@ pub fn execute_statement(
         ctx.schema.ensure_fresh_in_tx(ctx.btree)?;
     }
 
-    match classify_stmt_category(stmt) {
+    let out = match classify_stmt_category(stmt) {
         StmtCategory::Control => {
             execute_control_stmt(ctx, stmt)?;
             Ok(QueryOutput::default())
@@ -713,6 +833,26 @@ pub fn execute_statement(
         StmtCategory::Write => {
             run_write_autocommit(ctx, |ctx| execute_write_body(ctx, stmt, params))
         }
+    }?;
+
+    maybe_run_wal_autocheckpoint_in_ctx(ctx);
+    Ok(out)
+}
+
+pub(crate) fn maybe_run_wal_autocheckpoint_in_ctx(ctx: &mut ExecContext<'_>) {
+    if !is_in_autocommit(ctx) {
+        return;
+    }
+    let n_entry = ctx.btree.pager_mut().take_wal_callback_frame_count();
+    let threshold = *ctx.wal_autocheckpoint_threshold;
+    if n_entry > 0
+        && threshold > 0
+        && i64::from(n_entry) >= i64::from(threshold)
+        && ctx.btree.transaction_state() == TransactionState::Open
+        && ctx.activity.other_readers == 0
+        && ctx.activity.other_writers == 0
+    {
+        let _ = ctx.btree.wal_checkpoint(WalCheckpointMode::Passive, None);
     }
 }
 
@@ -726,7 +866,8 @@ where
 {
     let started = ctx.btree.transaction_state() == TransactionState::Open;
     if started {
-        ctx.btree.begin_read()?;
+        ctx.busy_policy
+            .retry_btree(ctx.btree, |bt| bt.begin_read())?;
         if !is_in_autocommit(ctx) {
             *ctx.in_user_btree_tx = true;
         }
@@ -749,7 +890,8 @@ where
 {
     let started = ctx.btree.transaction_state() == TransactionState::Open;
     if started {
-        ctx.btree.begin_read()?;
+        ctx.busy_policy
+            .retry_btree(ctx.btree, |bt| bt.begin_read())?;
         if !is_in_autocommit(ctx) {
             *ctx.in_user_btree_tx = true;
         }
@@ -782,9 +924,10 @@ where
     if ctx.btree.transaction_state() == TransactionState::Write {
         ctx.btree.pager_mut().ensure_subsavepoints(required_depth)?;
     } else {
-        ctx.btree
-            .pager_mut()
-            .begin_write_with_savepoint_depth(required_depth)?;
+        ctx.busy_policy.retry_btree(ctx.btree, |bt| {
+            bt.pager_mut()
+                .begin_write_with_savepoint_depth(required_depth)
+        })?;
     }
     if !autocommit {
         *ctx.in_user_btree_tx = true;
@@ -857,6 +1000,8 @@ where
                 }
                 *ctx.schema_changed_in_tx = false;
                 ctx.deferred_fk_suspects.clear();
+            } else if ctx.activity.other_writers == 0 && ctx.activity.other_readers == 0 {
+                ctx.btree.spill_if_over_cache_size()?;
             }
             ctx.publish();
             Ok(out)
@@ -9374,7 +9519,9 @@ pub(crate) fn exec_vacuum_checked(
             "cannot VACUUM - SQL statements in progress",
         )));
     }
-    ctx.btree.begin_write().map_err(VacuumFail::Clean)?;
+    ctx.busy_policy
+        .retry_btree(ctx.btree, |bt| bt.begin_write())
+        .map_err(VacuumFail::Clean)?;
     if let Err(e) = ctx.schema.ensure_fresh_in_tx(ctx.btree) {
         if let Err(rb_err) = ctx.btree.rollback() {
             return Err(VacuumFail::Poison(rb_err));
@@ -9488,6 +9635,7 @@ pub(crate) fn exec_vacuum_checked(
             let dst = ctx.btree.pager_mut().write_page(pgno)?;
             dst.copy_from_slice(&src);
         }
+        let is_wal_db = ctx.btree.journal_mode() == JournalMode::Wal || ctx.btree.pager().use_wal();
         {
             let hdr = ctx.btree.pager_mut().header_mut()?;
             hdr.first_freelist_trunk_page = 0;
@@ -9496,10 +9644,20 @@ pub(crate) fn exec_vacuum_checked(
             hdr.application_id = compacted_hdr.application_id;
             hdr.text_encoding = compacted_hdr.text_encoding;
             hdr.schema_cookie = compacted_hdr.schema_cookie;
+            hdr.database_size_pages = compacted_count;
+            if is_wal_db {
+                hdr.write_version = 2;
+                hdr.read_version = 2;
+            }
         }
         let cur_total = ctx.btree.pager().page_count();
         if cur_total > compacted_count {
             ctx.btree.pager_mut().shrink_page_count(compacted_count)?;
+        }
+        let hdr_snapshot = ctx.btree.pager().header().clone();
+        {
+            let p1 = ctx.btree.pager_mut().write_page(1)?;
+            hdr_snapshot.write_into(&mut p1[0..sqliters_pager::DB_HEADER_SIZE]);
         }
         Schema::load(ctx.btree)
     })();
@@ -9531,9 +9689,20 @@ pub(crate) fn exec_vacuum_checked(
 
 fn exec_pragma(
     ctx: &mut ExecContext<'_>,
+    schema: Option<&str>,
     name: &str,
     value: Option<&PragmaValue>,
 ) -> Result<QueryOutput> {
+    if let Some(s) = schema
+        && !s.eq_ignore_ascii_case("main")
+        && !s.eq_ignore_ascii_case("temp")
+    {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("unknown database {s}"),
+        ));
+    }
+    let is_temp = schema.is_some_and(|s| s.eq_ignore_ascii_case("temp"));
     let upper = name.to_ascii_uppercase();
     let single_col = |cname: &str, v: Value| QueryOutput {
         column_names: vec![cname.to_owned()],
@@ -9637,11 +9806,29 @@ fn exec_pragma(
             }
         }
         "JOURNAL_MODE" => {
+            if is_temp {
+                let active = if let Some(pv) = value {
+                    let s = pragma_to_string(pv);
+                    match JournalMode::from_pragma_str(s.trim()) {
+                        Some(JournalMode::Off) => JournalMode::Off,
+                        Some(JournalMode::Memory) => JournalMode::Memory,
+                        _ => JournalMode::Delete,
+                    }
+                } else {
+                    JournalMode::Delete
+                };
+                return Ok(single_col(
+                    "journal_mode",
+                    Value::Text(active.as_str().to_owned()),
+                ));
+            }
             if ctx.btree.pager().transaction_state() == TransactionState::Open
                 && !ctx.btree.pager().is_header_loaded()
                 && ctx.btree.pager().db_kind() == DatabaseKind::NamedDisk
             {
-                let _ = ctx.btree.pager_mut().ensure_header_loaded()?;
+                ctx.busy_policy.retry_btree(ctx.btree, |bt| {
+                    bt.pager_mut().ensure_header_loaded().map(|_| ())
+                })?;
             }
 
             let active = if let Some(pv) = value {
@@ -9664,7 +9851,8 @@ fn exec_pragma(
                             ));
                         }
                     }
-                    ctx.btree.set_journal_mode(target)?
+                    ctx.busy_policy
+                        .retry_btree(ctx.btree, |bt| bt.set_journal_mode(target))?
                 } else {
                     ctx.btree.pager().journal_mode()
                 }
@@ -9675,6 +9863,100 @@ fn exec_pragma(
                 "journal_mode",
                 Value::Text(active.as_str().to_owned()),
             ))
+        }
+        "WAL_CHECKPOINT" => {
+            let mode = match value {
+                None => WalCheckpointMode::Passive,
+                Some(pv) => {
+                    let s = pragma_to_string(pv);
+                    WalCheckpointMode::from_pragma_str(s.trim())
+                        .unwrap_or(WalCheckpointMode::Passive)
+                }
+            };
+            let res = if is_temp {
+                WalCheckpointResult::not_wal()
+            } else {
+                if ctx.btree.transaction_state() != TransactionState::Open
+                    || ctx.activity.other_readers > 0
+                    || ctx.activity.other_writers > 0
+                {
+                    return Err(SqliteError::new(
+                        ErrorCode::Locked,
+                        "database table is locked",
+                    ));
+                }
+                if ctx.btree.pager().db_kind() == DatabaseKind::NamedDisk
+                    && (!ctx.btree.pager().is_header_loaded()
+                        || (ctx.btree.pager().journal_mode() == JournalMode::Wal
+                            && ctx.btree.pager().wal().is_none()))
+                {
+                    ctx.busy_policy
+                        .retry_btree(ctx.btree, |bt| bt.begin_read())?;
+                    ctx.btree.pager_mut().end_read_if_unused()?;
+                }
+                if ctx.btree.pager().wal().is_none() {
+                    WalCheckpointResult::not_wal()
+                } else {
+                    ctx.busy_policy.checkpoint_btree(ctx.btree, mode)?
+                }
+            };
+            Ok(QueryOutput {
+                column_names: vec![
+                    "busy".to_owned(),
+                    "log".to_owned(),
+                    "checkpointed".to_owned(),
+                ],
+                rows: vec![vec![
+                    Value::Integer(i64::from(res.busy)),
+                    Value::Integer(i64::from(res.n_log)),
+                    Value::Integer(i64::from(res.n_ckpt)),
+                ]],
+            })
+        }
+        "WAL_AUTOCHECKPOINT" => {
+            if let Some(pv) = value {
+                let raw = pragma_to_i64(pv).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+                *ctx.wal_autocheckpoint_threshold = if raw > 0 { raw } else { 0 };
+            }
+            let effective = (*ctx.wal_autocheckpoint_threshold).max(0);
+            Ok(single_col(
+                "wal_autocheckpoint",
+                Value::Integer(i64::from(effective)),
+            ))
+        }
+        "LOCKING_MODE" => {
+            if is_temp {
+                return Ok(single_col(
+                    "locking_mode",
+                    Value::Text("exclusive".to_owned()),
+                ));
+            }
+            if let Some(pv) = value {
+                let s = pragma_to_string(pv);
+                if let Some(req) = LockingMode::from_pragma_str(s.trim()) {
+                    let _ = ctx.btree.pager_mut().set_locking_mode(req);
+                    if schema.is_none() {
+                        *ctx.default_locking_mode = req;
+                    }
+                }
+            }
+            let cur = ctx.btree.pager().locking_mode();
+            Ok(single_col(
+                "locking_mode",
+                Value::Text(cur.as_str().to_owned()),
+            ))
+        }
+        "JOURNAL_SIZE_LIMIT" => {
+            if is_temp {
+                return Ok(single_col("journal_size_limit", Value::Integer(-1)));
+            }
+            let res = if let Some(pv) = value {
+                let limit = pragma_to_i64(pv).max(-1);
+                ctx.btree.pager_mut().set_journal_size_limit(limit)
+            } else {
+                ctx.btree.pager_mut().set_journal_size_limit(-2)
+            };
+            Ok(single_col("journal_size_limit", Value::Integer(res)))
         }
         #[cfg(feature = "test-diagnostics")]
         "LOCK_STATUS" => {
@@ -9836,10 +10118,22 @@ fn exec_pragma(
             }
         }
         "CACHE_SIZE" => {
-            if value.is_some() {
+            if let Some(pv) = value {
+                let sz = pragma_to_i64(pv).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+                if !is_temp {
+                    ctx.btree.set_cache_size(sz);
+                    if ctx.activity.other_readers == 0 && ctx.activity.other_writers == 0 {
+                        ctx.btree.spill_if_over_cache_size()?;
+                    }
+                }
                 Ok(QueryOutput::default())
             } else {
-                Ok(single_col("cache_size", Value::Integer(-2000)))
+                let cur = if is_temp {
+                    -2000
+                } else {
+                    ctx.btree.cache_size()
+                };
+                Ok(single_col("cache_size", Value::Integer(i64::from(cur))))
             }
         }
         "DATABASE_LIST" => {
@@ -10305,7 +10599,22 @@ pub(crate) fn validate_and_infer_columns(
             Ok(Vec::new())
         }
 
-        Stmt::Pragma { name, value, .. } => Ok(infer_pragma_columns(name, value.as_ref())),
+        Stmt::Pragma {
+            schema: pragma_schema,
+            name,
+            value,
+        } => {
+            if let Some(s) = pragma_schema.as_deref()
+                && !s.eq_ignore_ascii_case("main")
+                && !s.eq_ignore_ascii_case("temp")
+            {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("unknown database {s}"),
+                ));
+            }
+            Ok(infer_pragma_columns(name, value.as_ref()))
+        }
 
         Stmt::Explain { query_plan, stmt } => {
             let _ = validate_and_infer_columns(stmt, schema, foreign_keys, count_changes)?;
@@ -10649,6 +10958,14 @@ fn infer_pragma_columns(name: &str, value: Option<&PragmaValue>) -> Vec<String> 
             }
         }
         "JOURNAL_MODE" => vec!["journal_mode".to_owned()],
+        "WAL_CHECKPOINT" => vec![
+            "busy".to_owned(),
+            "log".to_owned(),
+            "checkpointed".to_owned(),
+        ],
+        "WAL_AUTOCHECKPOINT" => vec!["wal_autocheckpoint".to_owned()],
+        "LOCKING_MODE" => vec!["locking_mode".to_owned()],
+        "JOURNAL_SIZE_LIMIT" => vec!["journal_size_limit".to_owned()],
         #[cfg(feature = "test-diagnostics")]
         "LOCK_STATUS" => vec!["database".to_owned(), "status".to_owned()],
         "FOREIGN_KEYS" => {

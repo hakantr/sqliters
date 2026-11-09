@@ -58,6 +58,7 @@ pub struct TclProc {
 
 struct OpenChannel {
     file: fs::File,
+    binary: bool,
 }
 
 const DEFAULT_TCL_BUILTINS: &[(&str, &str)] = &[
@@ -862,7 +863,8 @@ impl TclInterp {
             "gets" => self.cmd_gets(args),
             "read" => self.cmd_read(args),
             "close" => self.cmd_close(args),
-            "flush" | "fconfigure" => Ok(String::new()),
+            "flush" => Ok(String::new()),
+            "fconfigure" => self.cmd_fconfigure(args),
             "eof" => Ok("0".to_string()),
             "seek" => self.cmd_seek(args),
             "tell" => self.cmd_tell(args),
@@ -2408,57 +2410,25 @@ impl TclInterp {
             "format" => {
                 let fmt = &args[1];
                 let vals = &args[2..];
-                if fmt == "H*" {
-                    let hex = vals.first().map_or("", String::as_str);
-                    let mut out = String::new();
-                    let bytes = hex.as_bytes();
-                    let mut j = 0;
-                    while j + 1 < bytes.len() {
-                        if let Ok(b) = u8::from_str_radix(&hex[j..j + 2], 16) {
-                            out.push(b as char);
-                        }
-                        j += 2;
-                    }
-                    Ok(out)
-                } else if fmt == "a*" || fmt == "A*" {
-                    Ok(vals.first().cloned().unwrap_or_default())
-                } else if fmt.starts_with('c') {
-                    let mut out = String::new();
-                    for v in vals {
-                        for item in parse_list(v).unwrap_or_else(|_| vec![v.clone()]) {
-                            let b = (parse_tcl_int(item.trim()).unwrap_or(0) & 0xff) as u8;
-                            out.push(b as char);
-                        }
-                    }
-                    Ok(out)
-                } else {
-                    Ok(vals.join(""))
-                }
+                let bytes = tcl_binary_format(fmt, vals)?;
+                Ok(bytes.into_iter().map(char::from).collect())
             }
             "scan" => {
-                if args.len() < 4 {
-                    return Ok("0".to_string());
+                if args.len() < 3 {
+                    return Err(TclControl::Error("wrong # args to binary scan".to_string()));
                 }
-                let data = &args[1];
+                let data_bytes: Vec<u8> =
+                    args[1].chars().map(|ch| (ch as u32 & 0xff) as u8).collect();
                 let fmt = &args[2];
-                let var = &args[3];
-                if fmt == "H*" {
-                    let mut hex = String::new();
-                    for ch in data.chars() {
-                        use std::fmt::Write;
-                        let _ = write!(&mut hex, "{:02x}", ch as u32 & 0xff);
+                let vars = &args[3..];
+                let assigned = tcl_binary_scan(&data_bytes, fmt, vars.len())?;
+                let count = assigned.len();
+                for (var_name, val_opt) in vars.iter().zip(assigned) {
+                    if let Some(v) = val_opt {
+                        self.set_var(var_name, v).map_err(TclControl::Error)?;
                     }
-                    self.set_var(var, hex).map_err(TclControl::Error)?;
-                    Ok("1".to_string())
-                } else if fmt == "c*" {
-                    let nums: Vec<String> = data.bytes().map(|b| (b as i8).to_string()).collect();
-                    self.set_var(var, format_list(&nums))
-                        .map_err(TclControl::Error)?;
-                    Ok("1".to_string())
-                } else {
-                    self.set_var(var, data.clone()).map_err(TclControl::Error)?;
-                    Ok("1".to_string())
                 }
+                Ok(count.to_string())
             }
             _ => Ok(String::new()),
         }
@@ -2661,13 +2631,49 @@ impl TclInterp {
                 opts.read(true).write(true).create(true);
             }
         }
+        let binary = mode.contains('b');
         let file = opts
             .open(path)
             .map_err(|e| TclControl::Error(e.to_string()))?;
         let id = format!("file{}", self.next_chan_id);
         self.next_chan_id += 1;
-        self.channels.insert(id.clone(), OpenChannel { file });
+        self.channels
+            .insert(id.clone(), OpenChannel { file, binary });
         Ok(id)
+    }
+
+    fn cmd_fconfigure(&mut self, args: &[String]) -> TclResult<String> {
+        if args.is_empty() {
+            return Ok(String::new());
+        }
+        let chan_id = &args[0];
+        if args.len() == 2 {
+            let opt = args[1].as_str();
+            if let Some(ch) = self.channels.get(chan_id)
+                && (opt == "-translation" || opt == "-encoding")
+            {
+                return Ok(if ch.binary {
+                    "binary".to_string()
+                } else if opt == "-translation" {
+                    "auto".to_string()
+                } else {
+                    "utf-8".to_string()
+                });
+            }
+            return Ok(String::new());
+        }
+        let mut i = 1;
+        while i + 1 < args.len() {
+            let opt = args[i].as_str();
+            let val = args[i + 1].as_str();
+            if (opt == "-translation" || opt == "-encoding")
+                && let Some(ch) = self.channels.get_mut(chan_id)
+            {
+                ch.binary = val.eq_ignore_ascii_case("binary");
+            }
+            i += 2;
+        }
+        Ok(String::new())
     }
 
     fn cmd_puts(&mut self, args: &[String]) -> TclResult<String> {
@@ -2687,7 +2693,12 @@ impl TclInterp {
             && chan != "stderr"
             && let Some(ch) = self.channels.get_mut(chan)
         {
-            let _ = ch.file.write_all(msg.as_bytes());
+            if ch.binary {
+                let raw: Vec<u8> = msg.chars().map(|c| (c as u32 & 0xff) as u8).collect();
+                let _ = ch.file.write_all(&raw);
+            } else {
+                let _ = ch.file.write_all(msg.as_bytes());
+            }
             if !nonewline {
                 let _ = ch.file.write_all(b"\n");
             }
@@ -2733,7 +2744,9 @@ impl TclInterp {
             return Err(TclControl::Error("wrong # args to read".to_string()));
         };
         let mut buf = Vec::new();
+        let mut is_binary = false;
         if let Some(ch) = self.channels.get_mut(chan_id) {
+            is_binary = ch.binary;
             if let Some(n_str) = args.get(i + 1) {
                 let n = parse_tcl_int(n_str).unwrap_or(0).max(0) as usize;
                 buf.resize(n, 0);
@@ -2743,7 +2756,11 @@ impl TclInterp {
                 let _ = ch.file.read_to_end(&mut buf);
             }
         }
-        let mut s = String::from_utf8_lossy(&buf).into_owned();
+        let mut s = if is_binary {
+            buf.into_iter().map(char::from).collect()
+        } else {
+            String::from_utf8_lossy(&buf).into_owned()
+        };
         if nonewline && s.ends_with('\n') {
             s.pop();
         }
@@ -3139,6 +3156,413 @@ fn tcl_format(fmt: &str, args: &[String]) -> Result<String, String> {
             }
         } else {
             out.push_str(&formatted);
+        }
+    }
+
+    Ok(out)
+}
+
+#[derive(Clone, Copy)]
+enum BinCount {
+    DefaultOne,
+    Exact(usize),
+    Star,
+}
+
+fn parse_bin_spec(chars: &[char], idx: &mut usize) -> Option<(char, bool, BinCount)> {
+    while *idx < chars.len() && chars[*idx].is_ascii_whitespace() {
+        *idx += 1;
+    }
+    if *idx >= chars.len() {
+        return None;
+    }
+    let cmd = chars[*idx];
+    *idx += 1;
+    let mut unsigned = false;
+    if *idx < chars.len() && chars[*idx] == 'u' {
+        unsigned = true;
+        *idx += 1;
+    }
+    let count = if *idx < chars.len() && chars[*idx] == '*' {
+        *idx += 1;
+        BinCount::Star
+    } else if *idx < chars.len() && chars[*idx].is_ascii_digit() {
+        let start = *idx;
+        while *idx < chars.len() && chars[*idx].is_ascii_digit() {
+            *idx += 1;
+        }
+        let s: String = chars[start..*idx].iter().collect();
+        BinCount::Exact(s.parse::<usize>().unwrap_or(0))
+    } else {
+        BinCount::DefaultOne
+    };
+    Some((cmd, unsigned, count))
+}
+
+fn tcl_binary_format(fmt: &str, vals: &[String]) -> TclResult<Vec<u8>> {
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut idx = 0usize;
+    let mut arg_idx = 0usize;
+    let mut out: Vec<u8> = Vec::new();
+    let mut cursor = 0usize;
+
+    let write_bytes = |out: &mut Vec<u8>, cursor: &mut usize, bytes: &[u8]| {
+        if *cursor + bytes.len() > out.len() {
+            out.resize(*cursor + bytes.len(), 0);
+        }
+        out[*cursor..*cursor + bytes.len()].copy_from_slice(bytes);
+        *cursor += bytes.len();
+    };
+
+    while let Some((cmd, _unsigned, count)) = parse_bin_spec(&chars, &mut idx) {
+        match cmd {
+            'x' => {
+                let n = match count {
+                    BinCount::DefaultOne => 1,
+                    BinCount::Exact(n) => n,
+                    BinCount::Star => 0,
+                };
+                let zeros = vec![0u8; n];
+                write_bytes(&mut out, &mut cursor, &zeros);
+            }
+            '@' => {
+                cursor = match count {
+                    BinCount::Star => out.len(),
+                    BinCount::Exact(n) => n,
+                    BinCount::DefaultOne => 0,
+                };
+                if cursor > out.len() {
+                    out.resize(cursor, 0);
+                }
+            }
+            'a' | 'A' => {
+                let Some(val) = vals.get(arg_idx) else {
+                    return Err(TclControl::Error(
+                        "not enough arguments for all format specifiers".to_string(),
+                    ));
+                };
+                arg_idx += 1;
+                let raw: Vec<u8> = val.chars().map(|c| (c as u32 & 0xff) as u8).collect();
+                let pad = if cmd == 'A' { b' ' } else { 0u8 };
+                match count {
+                    BinCount::Star => write_bytes(&mut out, &mut cursor, &raw),
+                    BinCount::DefaultOne => {
+                        let b = raw.first().copied().unwrap_or(pad);
+                        write_bytes(&mut out, &mut cursor, &[b]);
+                    }
+                    BinCount::Exact(n) => {
+                        let mut buf = vec![pad; n];
+                        let copy_len = n.min(raw.len());
+                        buf[..copy_len].copy_from_slice(&raw[..copy_len]);
+                        write_bytes(&mut out, &mut cursor, &buf);
+                    }
+                }
+            }
+            'H' | 'h' => {
+                let Some(val) = vals.get(arg_idx) else {
+                    return Err(TclControl::Error(
+                        "not enough arguments for all format specifiers".to_string(),
+                    ));
+                };
+                arg_idx += 1;
+                let hex_chars: Vec<char> = val.chars().filter(|c| !c.is_whitespace()).collect();
+                let n_nibbles = match count {
+                    BinCount::Star => hex_chars.len(),
+                    BinCount::DefaultOne => 1,
+                    BinCount::Exact(n) => n,
+                };
+                let mut bytes = Vec::with_capacity(n_nibbles.div_ceil(2));
+                let mut j = 0usize;
+                while j < n_nibbles {
+                    let d1 = hex_chars.get(j).and_then(|c| c.to_digit(16)).unwrap_or(0) as u8;
+                    let d2 = if j + 1 < n_nibbles {
+                        hex_chars
+                            .get(j + 1)
+                            .and_then(|c| c.to_digit(16))
+                            .unwrap_or(0) as u8
+                    } else {
+                        0u8
+                    };
+                    let b = if cmd == 'H' {
+                        (d1 << 4) | d2
+                    } else {
+                        d1 | (d2 << 4)
+                    };
+                    bytes.push(b);
+                    j += 2;
+                }
+                write_bytes(&mut out, &mut cursor, &bytes);
+            }
+            'c' | 'C' | 's' | 'S' | 'i' | 'I' | 'w' | 'W' => {
+                let Some(val) = vals.get(arg_idx) else {
+                    return Err(TclControl::Error(
+                        "not enough arguments for all format specifiers".to_string(),
+                    ));
+                };
+                arg_idx += 1;
+                let nums: Vec<i64> = match count {
+                    BinCount::DefaultOne => {
+                        let n = parse_tcl_int(val.trim()).or_else(|| {
+                            parse_list(val)
+                                .ok()
+                                .and_then(|l| l.first().and_then(|s| parse_tcl_int(s.trim())))
+                        });
+                        vec![n.ok_or_else(|| {
+                            TclControl::Error(format!("expected integer but got \"{val}\""))
+                        })?]
+                    }
+                    BinCount::Star => {
+                        let items = parse_list(val).map_err(TclControl::Error)?;
+                        let mut parsed = Vec::with_capacity(items.len());
+                        for item in items {
+                            let n = parse_tcl_int(item.trim()).ok_or_else(|| {
+                                TclControl::Error(format!("expected integer but got \"{item}\""))
+                            })?;
+                            parsed.push(n);
+                        }
+                        parsed
+                    }
+                    BinCount::Exact(n_req) => {
+                        let items = parse_list(val).map_err(TclControl::Error)?;
+                        if items.len() < n_req {
+                            return Err(TclControl::Error(
+                                "number of elements in list does not match count".to_string(),
+                            ));
+                        }
+                        let mut parsed = Vec::with_capacity(n_req);
+                        for item in items.into_iter().take(n_req) {
+                            let n = parse_tcl_int(item.trim()).ok_or_else(|| {
+                                TclControl::Error(format!("expected integer but got \"{item}\""))
+                            })?;
+                            parsed.push(n);
+                        }
+                        parsed
+                    }
+                };
+                for v in nums {
+                    match cmd {
+                        'c' | 'C' => write_bytes(&mut out, &mut cursor, &[(v & 0xff) as u8]),
+                        's' => write_bytes(&mut out, &mut cursor, &(v as i16).to_le_bytes()),
+                        'S' => write_bytes(&mut out, &mut cursor, &(v as i16).to_be_bytes()),
+                        'i' => write_bytes(&mut out, &mut cursor, &(v as i32).to_le_bytes()),
+                        'I' => write_bytes(&mut out, &mut cursor, &(v as i32).to_be_bytes()),
+                        'w' => write_bytes(&mut out, &mut cursor, &v.to_le_bytes()),
+                        'W' => write_bytes(&mut out, &mut cursor, &v.to_be_bytes()),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            other => {
+                return Err(TclControl::Error(format!(
+                    "bad field specifier \"{other}\" in binary format"
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn tcl_binary_scan(data: &[u8], fmt: &str, max_vars: usize) -> TclResult<Vec<Option<String>>> {
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut idx = 0usize;
+    let mut pos = 0usize;
+    let mut out: Vec<Option<String>> = Vec::new();
+
+    while let Some((cmd, unsigned, count)) = parse_bin_spec(&chars, &mut idx) {
+        match cmd {
+            'x' => {
+                let n = match count {
+                    BinCount::DefaultOne => 1,
+                    BinCount::Exact(n) => n,
+                    BinCount::Star => data.len().saturating_sub(pos),
+                };
+                if pos + n > data.len() {
+                    break;
+                }
+                pos += n;
+            }
+            '@' => {
+                let next_pos = match count {
+                    BinCount::Star => data.len(),
+                    BinCount::Exact(n) => n,
+                    BinCount::DefaultOne => 0,
+                };
+                if next_pos > data.len() {
+                    break;
+                }
+                pos = next_pos;
+            }
+            'a' | 'A' => {
+                if out.len() >= max_vars {
+                    return Err(TclControl::Error(
+                        "not enough arguments for all format specifiers".to_string(),
+                    ));
+                }
+                let n = match count {
+                    BinCount::DefaultOne => 1,
+                    BinCount::Exact(n) => n,
+                    BinCount::Star => data.len().saturating_sub(pos),
+                };
+                if pos + n > data.len() {
+                    break;
+                }
+                let mut slice = &data[pos..pos + n];
+                pos += n;
+                if cmd == 'A' {
+                    while let Some(&last) = slice.last() {
+                        if last == b' ' || last == 0 {
+                            slice = &slice[..slice.len() - 1];
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                let s: String = slice.iter().map(|&b| char::from(b)).collect();
+                out.push(Some(s));
+            }
+            'H' | 'h' => {
+                if out.len() >= max_vars {
+                    return Err(TclControl::Error(
+                        "not enough arguments for all format specifiers".to_string(),
+                    ));
+                }
+                let n_nibbles = match count {
+                    BinCount::DefaultOne => 1,
+                    BinCount::Exact(n) => n,
+                    BinCount::Star => data.len().saturating_sub(pos) * 2,
+                };
+                let bytes_needed = n_nibbles.div_ceil(2);
+                if pos + bytes_needed > data.len() {
+                    break;
+                }
+                let mut hex = String::with_capacity(n_nibbles);
+                for i in 0..n_nibbles {
+                    let b = data[pos + i / 2];
+                    let nib = if cmd == 'H' {
+                        if i % 2 == 0 { b >> 4 } else { b & 0x0f }
+                    } else if i % 2 == 0 {
+                        b & 0x0f
+                    } else {
+                        b >> 4
+                    };
+                    hex.push(char::from_digit(u32::from(nib), 16).unwrap_or('0'));
+                }
+                pos += bytes_needed;
+                out.push(Some(hex));
+            }
+            'c' | 'C' | 's' | 'S' | 'i' | 'I' | 'w' | 'W' => {
+                if out.len() >= max_vars {
+                    return Err(TclControl::Error(
+                        "not enough arguments for all format specifiers".to_string(),
+                    ));
+                }
+                let elem_size = match cmd {
+                    'c' | 'C' => 1usize,
+                    's' | 'S' => 2usize,
+                    'i' | 'I' => 4usize,
+                    _ => 8usize,
+                };
+                let is_unsigned = unsigned || cmd == 'C';
+                let decode_one = |chunk: &[u8]| -> String {
+                    match cmd {
+                        'c' | 'C' => {
+                            if is_unsigned {
+                                chunk[0].to_string()
+                            } else {
+                                (chunk[0] as i8).to_string()
+                            }
+                        }
+                        's' => {
+                            let u = u16::from_le_bytes([chunk[0], chunk[1]]);
+                            if is_unsigned {
+                                u.to_string()
+                            } else {
+                                (u as i16).to_string()
+                            }
+                        }
+                        'S' => {
+                            let u = u16::from_be_bytes([chunk[0], chunk[1]]);
+                            if is_unsigned {
+                                u.to_string()
+                            } else {
+                                (u as i16).to_string()
+                            }
+                        }
+                        'i' => {
+                            let u = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                            if is_unsigned {
+                                u.to_string()
+                            } else {
+                                (u as i32).to_string()
+                            }
+                        }
+                        'I' => {
+                            let u = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                            if is_unsigned {
+                                u.to_string()
+                            } else {
+                                (u as i32).to_string()
+                            }
+                        }
+                        'w' => {
+                            let mut b = [0u8; 8];
+                            b.copy_from_slice(chunk);
+                            let u = u64::from_le_bytes(b);
+                            if is_unsigned {
+                                u.to_string()
+                            } else {
+                                (u as i64).to_string()
+                            }
+                        }
+                        'W' => {
+                            let mut b = [0u8; 8];
+                            b.copy_from_slice(chunk);
+                            let u = u64::from_be_bytes(b);
+                            if is_unsigned {
+                                u.to_string()
+                            } else {
+                                (u as i64).to_string()
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                };
+                match count {
+                    BinCount::DefaultOne => {
+                        if pos + elem_size > data.len() {
+                            break;
+                        }
+                        let val_str = decode_one(&data[pos..pos + elem_size]);
+                        pos += elem_size;
+                        out.push(Some(val_str));
+                    }
+                    BinCount::Exact(n) => {
+                        if pos + n * elem_size > data.len() {
+                            break;
+                        }
+                        let mut vals = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            vals.push(decode_one(&data[pos..pos + elem_size]));
+                            pos += elem_size;
+                        }
+                        out.push(Some(format_list(&vals)));
+                    }
+                    BinCount::Star => {
+                        let n = data.len().saturating_sub(pos) / elem_size;
+                        let mut vals = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            vals.push(decode_one(&data[pos..pos + elem_size]));
+                            pos += elem_size;
+                        }
+                        out.push(Some(format_list(&vals)));
+                    }
+                }
+            }
+            other => {
+                return Err(TclControl::Error(format!(
+                    "bad field specifier \"{other}\" in binary scan"
+                )));
+            }
         }
     }
 

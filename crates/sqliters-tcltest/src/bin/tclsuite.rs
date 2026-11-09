@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use sqliters_tcltest::{TestFileReport, evaluate_test_script, strip_test_comments};
+use sqliters_tcltest::{TestFileReport, evaluate_test_script_in_root, strip_test_comments};
 
 pub const CORE_SQL_FAMILIES: &[&str] = &[
     "select",
@@ -52,6 +52,7 @@ pub const CORE_SQL_FAMILIES: &[&str] = &[
     "rowid",
     "enc",
     "lock",
+    "wal",
 ];
 
 pub const CORE_SQL_EXACT: &[&str] = &[
@@ -81,8 +82,96 @@ fn is_core_sql_test(stem: &str) -> bool {
     CORE_SQL_FAMILIES.contains(&alpha_prefix.as_str())
 }
 
-fn collect_test_files(args: &[String]) -> Vec<PathBuf> {
-    let test_dir = Path::new("sqlite/test");
+fn infer_source_root(path: &Path) -> &'static str {
+    let s = path.to_string_lossy();
+    if s.contains("sqlite/ext/fts5/test") {
+        "sqlite/ext/fts5/test"
+    } else if s.contains("sqlite/ext/rtree") {
+        "sqlite/ext/rtree"
+    } else {
+        "sqlite/test"
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ManifestEntryInfo {
+    source_path: PathBuf,
+    status: String,
+    ignore_reason: String,
+}
+
+fn load_manifest_entries() -> Vec<ManifestEntryInfo> {
+    let Ok(raw) = fs::read_to_string("tests/sqlite_test_manifest.json") else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    let mut cur_path: Option<PathBuf> = None;
+    let mut cur_status = String::new();
+    let mut cur_reason = String::new();
+
+    let extract_str = |rest: &str| -> String {
+        rest.trim()
+            .trim_end_matches(',')
+            .trim()
+            .trim_matches('"')
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
+    };
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("\"source_path\":") {
+            cur_path = Some(PathBuf::from(extract_str(rest)));
+        } else if let Some(rest) = trimmed.strip_prefix("\"status\":") {
+            cur_status = extract_str(rest);
+        } else if let Some(rest) = trimmed.strip_prefix("\"ignore_reason\":") {
+            cur_reason = extract_str(rest);
+        } else if trimmed.starts_with('}')
+            && let Some(p) = cur_path.take()
+        {
+            if p.exists() {
+                entries.push(ManifestEntryInfo {
+                    source_path: p,
+                    status: std::mem::take(&mut cur_status),
+                    ignore_reason: std::mem::take(&mut cur_reason),
+                });
+            } else {
+                cur_status.clear();
+                cur_reason.clear();
+            }
+        }
+    }
+    entries
+}
+
+fn collect_test_files(
+    args: &[String],
+    manifest_only: bool,
+    manifest: &[ManifestEntryInfo],
+) -> Vec<PathBuf> {
+    if manifest_only {
+        let mut out: Vec<PathBuf> = manifest
+            .iter()
+            .filter(|e| {
+                args.is_empty()
+                    || args.iter().any(|f| {
+                        e.source_path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(|st| st.starts_with(f.as_str()))
+                    })
+            })
+            .map(|e| e.source_path.clone())
+            .collect();
+        out.sort();
+        return out;
+    }
+
+    let roots = [
+        Path::new("sqlite/test"),
+        Path::new("sqlite/ext/fts5/test"),
+        Path::new("sqlite/ext/rtree"),
+    ];
     if !args.is_empty() {
         let mut out = Vec::new();
         for a in args {
@@ -90,9 +179,12 @@ fn collect_test_files(args: &[String]) -> Vec<PathBuf> {
             if p.exists() {
                 out.push(p);
             } else {
-                let candidate = test_dir.join(format!("{a}.test"));
-                if candidate.exists() {
-                    out.push(candidate);
+                for root in roots {
+                    let candidate = root.join(format!("{a}.test"));
+                    if candidate.exists() {
+                        out.push(candidate);
+                        break;
+                    }
                 }
             }
         }
@@ -100,6 +192,7 @@ fn collect_test_files(args: &[String]) -> Vec<PathBuf> {
     }
 
     let mut files = Vec::new();
+    let test_dir = Path::new("sqlite/test");
     if let Ok(entries) = fs::read_dir(test_dir) {
         for entry in entries.flatten() {
             let p = entry.path();
@@ -111,31 +204,61 @@ fn collect_test_files(args: &[String]) -> Vec<PathBuf> {
             }
         }
     }
+    for me in manifest {
+        if !files.contains(&me.source_path) {
+            files.push(me.source_path.clone());
+        }
+    }
     files.sort();
     files
+}
+
+enum SuiteItemOutcome {
+    Executed(TestFileReport),
+    ManifestSkipped { file_name: String, reason: String },
+}
+
+impl SuiteItemOutcome {
+    fn file_name(&self) -> &str {
+        match self {
+            Self::Executed(r) => &r.file_name,
+            Self::ManifestSkipped { file_name, .. } => file_name,
+        }
+    }
 }
 
 fn main() {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let mut verbose = false;
+    let mut manifest_only = false;
+    let mut run_ignored = false;
     let mut filter_args = Vec::new();
     for a in raw_args {
         if a == "-v" || a == "--verbose" {
             verbose = true;
+        } else if a == "--manifest" {
+            manifest_only = true;
+        } else if a == "--run-ignored" {
+            run_ignored = true;
         } else {
             filter_args.push(a);
         }
     }
 
-    let files = collect_test_files(&filter_args);
+    let manifest = load_manifest_entries();
+    let files = collect_test_files(&filter_args, manifest_only, &manifest);
     let total_files = files.len();
     if total_files == 0 {
         eprintln!("No matching .test files found.");
         std::process::exit(1);
     }
 
+    // Respect manifest `ignored` status unless explicitly running individual named stems without
+    // `--manifest`, or when `--run-ignored` is passed.
+    let honor_manifest_ignores = !run_ignored && (manifest_only || filter_args.is_empty());
+
     let next_idx = AtomicUsize::new(0);
-    let results: Mutex<Vec<TestFileReport>> = Mutex::new(Vec::with_capacity(total_files));
+    let results: Mutex<Vec<SuiteItemOutcome>> = Mutex::new(Vec::with_capacity(total_files));
     let num_threads = std::thread::available_parallelism()
         .map(|n| n.get().min(12))
         .unwrap_or(4)
@@ -156,18 +279,35 @@ fn main() {
                             .file_stem()
                             .and_then(|st| st.to_str())
                             .unwrap_or("unknown");
+                        if honor_manifest_ignores
+                            && let Some(me) = manifest.iter().find(|e| &e.source_path == path)
+                            && me.status == "ignored"
+                        {
+                            results
+                                .lock()
+                                .unwrap()
+                                .push(SuiteItemOutcome::ManifestSkipped {
+                                    file_name: stem.to_owned(),
+                                    reason: me.ignore_reason.clone(),
+                                });
+                            continue;
+                        }
                         let raw = fs::read_to_string(path).unwrap_or_default();
                         let stripped = strip_test_comments(&raw);
-                        let rep = evaluate_test_script(stem, &stripped);
-                        results.lock().unwrap().push(rep);
+                        let src_root = infer_source_root(path);
+                        let rep = evaluate_test_script_in_root(src_root, stem, &stripped);
+                        results
+                            .lock()
+                            .unwrap()
+                            .push(SuiteItemOutcome::Executed(rep));
                     }
                 })
                 .expect("failed to spawn tclsuite worker");
         }
     });
 
-    let mut reports = results.into_inner().unwrap();
-    reports.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+    let mut outcomes = results.into_inner().unwrap();
+    outcomes.sort_by(|a, b| a.file_name().cmp(b.file_name()));
 
     let mut files_ok = 0usize;
     let mut files_skipped = 0usize;
@@ -175,49 +315,55 @@ fn main() {
     let mut sub_failed = 0usize;
     let mut script_errs = 0usize;
 
-    for r in &reports {
-        sub_passed += r.passed;
-        sub_failed += r.failed.len();
-        if r.script_error.is_some() {
-            script_errs += 1;
-        }
-        if r.is_ok() {
-            files_ok += 1;
-            println!("PASS {:20} ({} subtests)", r.file_name, r.passed);
-        } else if r.skipped_zero_subtests && r.failed.is_empty() && r.script_error.is_none() {
-            files_skipped += 1;
-            println!("SKIP {:20} (0 subtests executed)", r.file_name);
-        } else {
-            println!(
-                "FAIL {:20} ({} passed, {} failed{})",
-                r.file_name,
-                r.passed,
-                r.failed.len(),
-                if let Some(ref se) = r.script_error {
-                    format!(", script_error: {se}")
-                } else {
-                    String::new()
+    for item in &outcomes {
+        match item {
+            SuiteItemOutcome::ManifestSkipped { file_name, reason } => {
+                files_skipped += 1;
+                println!("SKIP {:20} (manifest ignored: {})", file_name, reason);
+            }
+            SuiteItemOutcome::Executed(r) => {
+                sub_passed += r.passed;
+                sub_failed += r.failed.len();
+                if r.script_error.is_some() {
+                    script_errs += 1;
                 }
-            );
-            if verbose {
-                for f in r.failed.iter().take(15) {
+                if r.is_ok() {
+                    files_ok += 1;
+                    println!("PASS {:20} ({} subtests)", r.file_name, r.passed);
+                } else if r.skipped_zero_subtests && r.failed.is_empty() && r.script_error.is_none()
+                {
+                    files_skipped += 1;
+                    println!("SKIP {:20} (0 subtests executed)", r.file_name);
+                } else {
                     println!(
-                        "     ! {} => expected [{}] | got [{}]",
-                        f.name, f.expected, f.actual
+                        "FAIL {:20} ({} passed, {} failed{})",
+                        r.file_name,
+                        r.passed,
+                        r.failed.len(),
+                        if let Some(ref se) = r.script_error {
+                            format!(", script_error: {se}")
+                        } else {
+                            String::new()
+                        }
                     );
+                    if verbose {
+                        for f in r.failed.iter().take(15) {
+                            println!(
+                                "     ! {} => expected [{}] | got [{}]",
+                                f.name, f.expected, f.actual
+                            );
+                        }
+                    }
                 }
             }
         }
     }
 
+    let files_failed = total_files - files_ok - files_skipped;
     println!("================================================================");
     println!(
         "Files:    {}/{} passed ({} skipped/0-subtests, {} failed, {} with script errors)",
-        files_ok,
-        total_files,
-        files_skipped,
-        total_files - files_ok - files_skipped,
-        script_errs
+        files_ok, total_files, files_skipped, files_failed, script_errs
     );
     println!(
         "Subtests: {}/{} passed ({} failed)",
@@ -225,4 +371,7 @@ fn main() {
         sub_passed + sub_failed,
         sub_failed
     );
+    if files_failed > 0 {
+        std::process::exit(1);
+    }
 }

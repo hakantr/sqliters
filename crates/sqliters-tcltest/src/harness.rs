@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use sqliters_core::{
     CloseError, Connection, ConnectionOpenOptions, PrepareMode, Row, Statement, StepResult,
+    WalCheckpointMode,
 };
 use sqliters_types::{ErrorCode, LockGeometry, SqliteError, Value, extended, format_sqlite_real};
 use sqliters_vfs::OpenFlags;
@@ -196,6 +197,10 @@ const DEFAULT_HOST_BUILTINS: &[(&str, &str)] = &[
         "sqlite3_test_control_pending_byte",
     ),
     ("test_control_pending_byte", "test_control_pending_byte"),
+    ("sqlite3_wal_checkpoint", "sqlite3_wal_checkpoint"),
+    ("sqlite3_wal_checkpoint_v2", "sqlite3_wal_checkpoint_v2"),
+    ("sqlite3_wal_autocheckpoint", "sqlite3_wal_autocheckpoint"),
+    ("file_control_persist_wal", "file_control_persist_wal"),
     ("sqlite3_db_config", "noop_zero"),
     ("sqlite3_db_config_lookaside", "noop_zero"),
     ("sqlite3_test_control", "noop_zero"),
@@ -235,13 +240,13 @@ const DEFAULT_HOST_BUILTINS: &[(&str, &str)] = &[
     ("sqlite3_db_status", "noop_zero"),
 ];
 
-/// Explicit Phase 1.1 capability table (`sqlite_options` / `ifcapable`).
+/// Explicit Phase 1.2 capability table (`sqlite_options` / `ifcapable`).
 ///
-/// Only genuinely implemented and verified Phase 1.1 features are mapped to `true`.
+/// Only genuinely implemented and verified Phase 1.1 + Phase 1.2 features are mapped to `true`.
 /// Every unverified, future-phase, or out-of-scope capability is explicitly `false`,
 /// and any unknown capability name evaluates to `None` (`false` + recorded in diagnostics).
-const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
-    // Verified Phase 1.1 SQL, B-tree, pager, VFS, and lifecycle capabilities:
+pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
+    // Verified Phase 1.1 + Phase 1.2 SQL, B-tree, pager, WAL, VFS, and lifecycle capabilities:
     ("altertable", true),
     ("autoinc", true),
     ("autoreset", true),
@@ -285,6 +290,7 @@ const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("threadsafe", true),
     ("truncate_opt", true),
     ("vacuum", true),
+    ("wal", true),
     ("xfer_opt", true),
     // Explicitly disabled (future phases or out of scope):
     ("analyze", false),
@@ -331,11 +337,10 @@ const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("utf16", false),
     ("view", false),
     ("vtab", false),
-    ("wal", false),
     ("windowfunc", false),
 ];
 
-/// Looks up a capability name in the explicit Phase 1.1 capability table.
+/// Looks up a capability name in the explicit capability table.
 pub fn phase1_capability(name: &str) -> Option<bool> {
     PHASE1_CAPABILITY_TABLE
         .iter()
@@ -355,6 +360,7 @@ pub struct SqliteTestHost {
     lock_geometry: LockGeometry,
     pub report: TestFileReport,
     pub sqlite_test_dir: PathBuf,
+    pub source_roots: Vec<PathBuf>,
     prng_state: u64,
 }
 
@@ -362,6 +368,15 @@ pub type SharedHost = Rc<RefCell<SqliteTestHost>>;
 
 impl SqliteTestHost {
     pub fn new_shared(file_name: &str, sqlite_test_dir: PathBuf) -> SharedHost {
+        let roots = vec![sqlite_test_dir.clone()];
+        Self::new_shared_with_roots(file_name, sqlite_test_dir, roots)
+    }
+
+    pub fn new_shared_with_roots(
+        file_name: &str,
+        sqlite_test_dir: PathBuf,
+        source_roots: Vec<PathBuf>,
+    ) -> SharedHost {
         let mut cmd_table = HashMap::with_capacity(DEFAULT_HOST_BUILTINS.len() + 4);
         for &(name, target) in DEFAULT_HOST_BUILTINS {
             cmd_table.insert(name.to_string(), HostCmdTarget::Builtin(target));
@@ -387,6 +402,7 @@ impl SqliteTestHost {
                 unknown_capabilities: Vec::new(),
             },
             sqlite_test_dir,
+            source_roots,
             prng_state: 0x1234_5678_9abc_def0,
         }))
     }
@@ -648,16 +664,24 @@ pub fn bootstrap_tester(
     host: &SharedHost,
     temp_dir: &Path,
 ) -> TclResult<()> {
-    let (test_dir_str, file_name, open_opts) = {
+    let (test_dir_str, argv0_str, open_opts) = {
         let h = host.borrow();
+        let script_file = if h.report.file_name.ends_with(".test") {
+            h.report.file_name.clone()
+        } else {
+            format!("{}.test", h.report.file_name)
+        };
         (
             h.sqlite_test_dir.to_string_lossy().into_owned(),
-            h.report.file_name.clone(),
+            h.sqlite_test_dir
+                .join(script_file)
+                .to_string_lossy()
+                .into_owned(),
             h.open_options(),
         )
     };
     let _ = interp.set_var("testdir", test_dir_str);
-    let _ = interp.set_var("argv0", file_name);
+    let _ = interp.set_var("argv0", argv0_str);
     let _ = interp.set_var("argv", String::new());
     let _ = interp.set_var("AUTOVACUUM", "0".to_string());
     let _ = interp.set_var("sqlite_open_file_count", "0".to_string());
@@ -1041,6 +1065,10 @@ fn dispatch_host_builtin(
         "sqlite3_test_control_pending_byte" | "test_control_pending_byte" => {
             cmd_pending_byte(host, invoked_name, args)
         }
+        "sqlite3_wal_checkpoint" => cmd_wal_checkpoint(host, args),
+        "sqlite3_wal_checkpoint_v2" => cmd_wal_checkpoint_v2(host, args),
+        "sqlite3_wal_autocheckpoint" => cmd_wal_autocheckpoint(host, args),
+        "file_control_persist_wal" => cmd_file_control_persist_wal(host, invoked_name, args),
         "noop_zero" => Ok("0".to_string()),
         _ => Err(TclControl::Error(format!(
             "invalid command name \"{invoked_name}\""
@@ -1244,10 +1272,27 @@ fn dispatch_db_method(
             Ok(String::new())
         }
         "transaction" => db_transaction_cmd(host, interp, db_name, db_id, args),
+        "timeout" => {
+            if let Some(ms_str) = args.get(1) {
+                let ms = parse_tcl_int(ms_str.trim()).ok_or_else(|| {
+                    TclControl::Error(format!("expected integer but got \"{ms_str}\""))
+                })?;
+                let conn = {
+                    let h = host.borrow();
+                    let Some(DbSlot::Present(db)) = h.dbs.get(&db_id) else {
+                        return Err(TclControl::Error(format!("unknown db {db_name}")));
+                    };
+                    Rc::clone(&db.conn)
+                };
+                let timeout_ms = if ms <= 0 { 0u64 } else { ms as u64 };
+                conn.busy_timeout(timeout_ms)
+                    .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+            }
+            Ok(String::new())
+        }
         "status" => Ok("0".to_string()),
         "cache"
         | "config"
-        | "timeout"
         | "busy"
         | "authorizer"
         | "auth"
@@ -1974,29 +2019,238 @@ fn cmd_source(host: &SharedHost, interp: &mut TclInterp, args: &[String]) -> Tcl
     match file_tail.as_str() {
         "tester.tcl" | "malloc_common.tcl" | "thread_common.tcl" => Ok(String::new()),
         _ => {
-            let sqlite_test_dir = host.borrow().sqlite_test_dir.clone();
+            let source_roots = host.borrow().source_roots.clone();
             let candidate = {
                 let p = Path::new(target);
-                if p.exists() {
+                if p.is_absolute() && p.exists() {
                     p.to_path_buf()
                 } else {
-                    let in_test = sqlite_test_dir.join(&file_tail);
-                    if in_test.exists() {
-                        in_test
+                    let in_temp = interp.resolve_path(target);
+                    if in_temp.exists() {
+                        in_temp
+                    } else if p.exists() {
+                        p.to_path_buf()
                     } else {
-                        interp.resolve_path(target)
+                        let mut found = None;
+                        for root in &source_roots {
+                            let rel_in_root = root.join(target);
+                            if rel_in_root.exists() {
+                                found = Some(rel_in_root);
+                                break;
+                            }
+                            let tail_in_root = root.join(&file_tail);
+                            if tail_in_root.exists() {
+                                found = Some(tail_in_root);
+                                break;
+                            }
+                        }
+                        found.unwrap_or(in_temp)
                     }
                 }
             };
             let script = fs::read_to_string(&candidate).map_err(|e| {
                 TclControl::Error(format!("cannot source {}: {e}", candidate.display()))
             })?;
-            match interp.eval(&script) {
+            let prev_script_path = std::mem::replace(
+                &mut interp.script_path,
+                candidate.to_string_lossy().into_owned(),
+            );
+            let eval_res = interp.eval(&script);
+            interp.script_path = prev_script_path;
+            match eval_res {
                 Ok(v) => Ok(v),
                 Err(TclControl::Return { value, .. }) => Ok(value),
                 Err(other) => Err(other),
             }
         }
+    }
+}
+
+fn cmd_wal_checkpoint(host: &SharedHost, args: &[String]) -> TclResult<String> {
+    if args.len() != 1 && args.len() != 2 {
+        return Err(TclControl::Error(
+            "wrong # args: should be \"sqlite3_wal_checkpoint DB ?NAME?\"".to_string(),
+        ));
+    }
+    let (db_id, conn) = {
+        let h = host.borrow();
+        let db_id = h
+            .resolve_db_id(&args[0])
+            .ok_or_else(|| TclControl::Error(format!("not a database: {}", args[0])))?;
+        let Some(DbSlot::Present(db)) = h.dbs.get(&db_id) else {
+            return Err(TclControl::Error(format!("not a database: {}", args[0])));
+        };
+        (db_id, Rc::clone(&db.conn))
+    };
+    let db_name = args.get(1).map(String::as_str);
+    match conn.wal_checkpoint(db_name) {
+        Ok(()) => {
+            host.borrow_mut().clear_db_error(db_id);
+            Ok("SQLITE_OK".to_string())
+        }
+        Err(e) => {
+            let msg = sqlite_err_text(&e);
+            let eff = host
+                .borrow_mut()
+                .set_db_error(db_id, e.code as i32, e.extended_code, msg);
+            Ok(sqlite_err_name(eff).to_string())
+        }
+    }
+}
+
+fn cmd_wal_checkpoint_v2(host: &SharedHost, args: &[String]) -> TclResult<String> {
+    if args.len() != 2 && args.len() != 3 {
+        return Err(TclControl::Error(
+            "wrong # args: should be \"sqlite3_wal_checkpoint_v2 DB MODE ?NAME?\"".to_string(),
+        ));
+    }
+    let (db_id, conn) = {
+        let h = host.borrow();
+        let db_id = h
+            .resolve_db_id(&args[0])
+            .ok_or_else(|| TclControl::Error(format!("not a database: {}", args[0])))?;
+        let Some(DbSlot::Present(db)) = h.dbs.get(&db_id) else {
+            return Err(TclControl::Error(format!("not a database: {}", args[0])));
+        };
+        (db_id, Rc::clone(&db.conn))
+    };
+
+    let mode_arg = args[1].trim();
+    let mode_res: std::result::Result<WalCheckpointMode, SqliteError> =
+        if let Some(n) = parse_tcl_int(mode_arg) {
+            match n {
+                -1 => Ok(WalCheckpointMode::Noop),
+                0 => Ok(WalCheckpointMode::Passive),
+                1 => Ok(WalCheckpointMode::Full),
+                2 => Ok(WalCheckpointMode::Restart),
+                3 => Ok(WalCheckpointMode::Truncate),
+                _ => Err(SqliteError::misuse("invalid checkpoint mode")),
+            }
+        } else {
+            const MODES: &[(&str, WalCheckpointMode)] = &[
+                ("noop", WalCheckpointMode::Noop),
+                ("passive", WalCheckpointMode::Passive),
+                ("full", WalCheckpointMode::Full),
+                ("restart", WalCheckpointMode::Restart),
+                ("truncate", WalCheckpointMode::Truncate),
+            ];
+            let lower = mode_arg.to_ascii_lowercase();
+            let mut matched: Option<WalCheckpointMode> = None;
+            if !lower.is_empty() {
+                for &(name, m) in MODES {
+                    if name == lower {
+                        matched = Some(m);
+                        break;
+                    }
+                    if name.starts_with(&lower) {
+                        if matched.is_some() {
+                            matched = None;
+                            break;
+                        }
+                        matched = Some(m);
+                    }
+                }
+            }
+            match matched {
+                Some(m) => Ok(m),
+                None => {
+                    return Err(TclControl::Error(format!(
+                        "bad mode \"{mode_arg}\": must be noop, passive, full, restart, or truncate"
+                    )));
+                }
+            }
+        };
+
+    let db_name = args.get(2).map(String::as_str);
+    let cp_res = mode_res.and_then(|m| conn.wal_checkpoint_v2(db_name, m));
+    match cp_res {
+        Ok(res) => {
+            if res.busy {
+                let _ = host.borrow_mut().set_db_error(
+                    db_id,
+                    ErrorCode::Busy as i32,
+                    ErrorCode::Busy as i32,
+                    "database is locked".to_string(),
+                );
+            } else {
+                host.borrow_mut().clear_db_error(db_id);
+            }
+            Ok(format_list(&[
+                if res.busy { "1" } else { "0" }.to_string(),
+                res.n_log.to_string(),
+                res.n_ckpt.to_string(),
+            ]))
+        }
+        Err(e) => {
+            let msg = sqlite_err_text(&e);
+            let eff =
+                host.borrow_mut()
+                    .set_db_error(db_id, e.code as i32, e.extended_code, msg.clone());
+            let z_err_code = sqlite_err_name(eff);
+            Err(TclControl::Error(format!("{z_err_code} - {msg}")))
+        }
+    }
+}
+
+fn cmd_wal_autocheckpoint(host: &SharedHost, args: &[String]) -> TclResult<String> {
+    if args.len() != 2 {
+        return Err(TclControl::Error(
+            "wrong # args: should be \"sqlite3_wal_autocheckpoint DB VALUE\"".to_string(),
+        ));
+    }
+    let val = parse_tcl_int(args[1].trim())
+        .ok_or_else(|| TclControl::Error(format!("expected integer but got \"{}\"", args[1])))?;
+    let (db_id, conn) = {
+        let h = host.borrow();
+        let db_id = h
+            .resolve_db_id(&args[0])
+            .ok_or_else(|| TclControl::Error(format!("not a database: {}", args[0])))?;
+        let Some(DbSlot::Present(db)) = h.dbs.get(&db_id) else {
+            return Err(TclControl::Error(format!("not a database: {}", args[0])));
+        };
+        (db_id, Rc::clone(&db.conn))
+    };
+    match conn.wal_autocheckpoint(val as i32) {
+        Ok(()) => {
+            host.borrow_mut().clear_db_error(db_id);
+            Ok("SQLITE_OK".to_string())
+        }
+        Err(e) => {
+            let msg = sqlite_err_text(&e);
+            let eff = host
+                .borrow_mut()
+                .set_db_error(db_id, e.code as i32, e.extended_code, msg);
+            Ok(sqlite_err_name(eff).to_string())
+        }
+    }
+}
+
+fn cmd_file_control_persist_wal(
+    host: &SharedHost,
+    cmd_name: &str,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() != 2 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{cmd_name} DB FLAG\""
+        )));
+    }
+    let flag = parse_tcl_int(args[1].trim())
+        .ok_or_else(|| TclControl::Error(format!("expected integer but got \"{}\"", args[1])))?
+        as i32;
+    let conn = {
+        let h = host.borrow();
+        let db_id = h
+            .resolve_db_id(&args[0])
+            .ok_or_else(|| TclControl::Error(format!("not a database: {}", args[0])))?;
+        let Some(DbSlot::Present(db)) = h.dbs.get(&db_id) else {
+            return Err(TclControl::Error(format!("not a database: {}", args[0])));
+        };
+        Rc::clone(&db.conn)
+    };
+    match conn.file_control_persist_wal(None, flag) {
+        Ok(persisted) => Ok(format!("0 {}", i32::from(persisted))),
+        Err(e) => Ok(format!("{} {flag}", e.code as i32)),
     }
 }
 
@@ -3411,10 +3665,25 @@ proc verify_ex_errcode {name expected {db db}} {
 }
 
 proc do_not_use_codec {} {}
-proc wal_is_wal_mode {} { return 0 }
-proc wal_set_journal_mode {{db db}} {}
-proc wal_check_journal_mode {testname {db db}} {}
-proc wal_is_capable {} { return 0 }
+proc wal_is_wal_mode {} {
+  expr {[permutation] eq "wal"}
+}
+proc wal_set_journal_mode {{db db}} {
+  if { [wal_is_wal_mode] } {
+    $db eval "PRAGMA journal_mode = WAL"
+  }
+}
+proc wal_check_journal_mode {testname {db db}} {
+  if { [wal_is_wal_mode] } {
+    $db eval { SELECT * FROM sqlite_master }
+    do_test $testname [list $db eval "PRAGMA main.journal_mode"] {wal}
+  }
+}
+proc wal_is_capable {} {
+  ifcapable !wal { return 0 }
+  if {[permutation]=="journaltest"} { return 0 }
+  return 1
+}
 
 proc explain_no_trace {sql} {
   set tr [db eval "EXPLAIN $sql"]

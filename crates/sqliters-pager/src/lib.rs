@@ -212,6 +212,7 @@ pub struct Pager {
     locking_mode: LockingMode,
     journal_mode: JournalMode,
     journal_size_limit: i64,
+    cache_size: i32,
 
     header: DatabaseHeader,
     header_loaded: bool,
@@ -431,6 +432,7 @@ impl Pager {
             locking_mode: LockingMode::Normal,
             journal_mode,
             journal_size_limit: -1,
+            cache_size: -2000,
             header: candidate_header,
             header_loaded: false,
             page_size_fixed: false,
@@ -691,6 +693,52 @@ impl Pager {
     #[inline]
     pub fn set_persist_wal(&mut self, persist: bool) {
         self.persist_wal = persist;
+    }
+
+    /// Returns the configured page cache size (`PRAGMA cache_size`, default `-2000` KiB).
+    #[inline]
+    pub const fn cache_size(&self) -> i32 {
+        self.cache_size
+    }
+
+    /// Updates the configured page cache size (`PRAGMA cache_size = N`).
+    #[inline]
+    pub fn set_cache_size(&mut self, size: i32) {
+        self.cache_size = size;
+    }
+
+    /// Computes the effective dirty-page spill threshold in pages from [`Self::cache_size`] and
+    /// [`Self::page_size`] (`pragma.c:884-891`).
+    #[inline]
+    pub fn effective_max_cache_pages(&self) -> usize {
+        if self.cache_size >= 0 {
+            (self.cache_size as usize).max(1)
+        } else {
+            let kib = (-i64::from(self.cache_size)) as u64;
+            let bytes = kib.saturating_mul(1024);
+            let ps = u64::from(self.header.page_size.max(512));
+            (bytes / ps).max(1) as usize
+        }
+    }
+
+    /// Spills dirty pages to `<db>-wal` when in an active WAL write transaction and the number of
+    /// dirty cache pages exceeds [`Self::effective_max_cache_pages`].
+    pub fn spill_if_over_cache_size(&mut self) -> Result<usize> {
+        self.ensure_not_closed()?;
+        if self.state != TransactionState::Write || !self.use_wal() {
+            return Ok(0);
+        }
+        let lock_byte_pg = self.lock_byte_page();
+        let dirty_count = self
+            .cache
+            .iter()
+            .filter(|&(&pgno, p)| p.dirty && pgno <= self.page_count && pgno != lock_byte_pg)
+            .count();
+        if dirty_count > self.effective_max_cache_pages() {
+            self.spill_dirty_pages_to_wal()
+        } else {
+            Ok(0)
+        }
     }
 
     /// Returns `true` when it is safe to change `journal_mode` (`sqlite3PagerOkToChangeJournalMode`,
@@ -1074,7 +1122,7 @@ impl Pager {
         if self.state != TransactionState::Open {
             return Err(SqliteError::new(
                 ErrorCode::Locked,
-                "cannot checkpoint while a transaction is active on this connection",
+                "database table is locked",
             ));
         }
 
@@ -1359,8 +1407,12 @@ impl Pager {
         if self.journal_mode == JournalMode::Wal || self.use_wal() {
             return Ok(());
         }
-        if self.state == TransactionState::Open && !self.header_loaded {
-            let _ = self.ensure_header_loaded()?;
+        if self.state == TransactionState::Open
+            && !self.is_memdb_backing
+            && (!self.header_loaded || (!self.page_size_fixed && self.page_count == 0))
+        {
+            self.begin_read()?;
+            self.end_read_if_unused()?;
         }
         if self.journal_mode == JournalMode::Wal || self.use_wal() {
             return Ok(());
@@ -2236,27 +2288,37 @@ impl Pager {
                         || self.page_count != self.tx_orig_page_count;
 
                     if needs_db_flush && self.page_count > 0 {
-                        // Ticket `2d1a5c67dfc2` (`pager.c:6565-6571`): always ensure Page 1 is dirty
-                        // with updated `(2, 2)`, `database_size_pages`, and `change_counter` so even
-                        // transactions whose dirty pages were all spilled earlier emit a commit frame!
-                        self.mark_page_writable(1)?;
-                        self.header.write_version = 2;
-                        self.header.read_version = 2;
-                        self.header.database_size_pages = self.page_count;
-                        if !self.change_counter_bumped {
-                            self.header.change_counter = self.header.change_counter.wrapping_add(1);
-                            if self.header.change_counter == 0 {
-                                self.header.change_counter = 1;
+                        let p1_already_dirty = self.cache.get(&1).is_some_and(|p| p.dirty);
+                        // Match `pager.c:6565-6571` (Ticket `2d1a5c67dfc2`) & `pager.c:3272`:
+                        // Only dirty Page 1 on WAL commit when Page 1 was already modified, all
+                        // dirty pages were spilled earlier (`!has_dirty_pages`), the database page
+                        // count changed (`btree.c:6808`), or Page 1 header versions are not `(2, 2)`.
+                        let must_write_p1 = p1_already_dirty
+                            || !has_dirty_pages
+                            || self.page_count != self.tx_orig_page_count
+                            || self.header.write_version != 2
+                            || self.header.read_version != 2;
+                        if must_write_p1 {
+                            self.mark_page_writable(1)?;
+                            self.header.write_version = 2;
+                            self.header.read_version = 2;
+                            self.header.database_size_pages = self.page_count;
+                            if !self.change_counter_bumped {
+                                self.header.change_counter =
+                                    self.header.change_counter.wrapping_add(1);
+                                if self.header.change_counter == 0 {
+                                    self.header.change_counter = 1;
+                                }
+                                self.header.version_valid_for = self.header.change_counter;
+                                self.header.sqlite_version_number = SQLITE_VERSION_NUMBER;
+                                self.change_counter_bumped = true;
                             }
-                            self.header.version_valid_for = self.header.change_counter;
-                            self.header.sqlite_version_number = SQLITE_VERSION_NUMBER;
-                            self.change_counter_bumped = true;
-                        }
 
-                        let hdr_copy = self.header.clone();
-                        let p1 = self.cache.get_mut(&1).expect("page 1 in cache");
-                        hdr_copy.write_into(&mut p1.data[0..DB_HEADER_SIZE]);
-                        p1.dirty = true;
+                            let hdr_copy = self.header.clone();
+                            let p1 = self.cache.get_mut(&1).expect("page 1 in cache");
+                            hdr_copy.write_into(&mut p1.data[0..DB_HEADER_SIZE]);
+                            p1.dirty = true;
+                        }
 
                         let mut dirty_pgnos: Vec<Pgno> = self
                             .cache

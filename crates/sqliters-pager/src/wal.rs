@@ -103,6 +103,24 @@ pub struct WalCheckpointResult {
     pub n_ckpt: i32,
 }
 
+impl WalCheckpointResult {
+    /// Sentinel result returned when the target database is not in WAL mode (`(-1, -1)`).
+    #[inline]
+    pub const fn not_wal() -> Self {
+        Self {
+            busy: false,
+            n_log: -1,
+            n_ckpt: -1,
+        }
+    }
+
+    /// Converts into `(busy_flag, n_log, n_ckpt)` matching `PRAGMA wal_checkpoint` / Tcl `sqlite3_wal_checkpoint_v2`.
+    #[inline]
+    pub const fn into_c_tuple(self) -> (i32, i32, i32) {
+        (self.busy as i32, self.n_log, self.n_ckpt)
+    }
+}
+
 /// Exclusive WAL-index operating mode (`pWal->exclusiveMode` in `sqlite/src/wal.c:564-566`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalExclusiveMode {
@@ -2095,18 +2113,18 @@ impl Wal {
         if self.read_lock.is_some() && self.exclusive_mode != WalExclusiveMode::Exclusive {
             return Err(SqliteError::new(
                 ErrorCode::Locked,
-                "cannot checkpoint while connection holds an active WAL read snapshot",
+                "database table is locked",
             ));
         }
         if self.write_lock {
             return Err(SqliteError::new(
                 ErrorCode::Locked,
-                "cannot checkpoint while connection holds an active WAL write lock",
+                "database table is locked",
             ));
         }
         if self.read_only_flags != WAL_RDWR || self.immutable {
             return Err(SqliteError::readonly(
-                "cannot checkpoint a read-only WAL or shared-memory handle",
+                "attempt to write a readonly database",
             ));
         }
 
@@ -2632,13 +2650,22 @@ impl Wal {
 
         if self.read_only_flags == WAL_RDWR && !self.immutable {
             let prev_lock = db_file.lock_level();
-            let got_exclusive = if prev_lock >= sqliters_vfs::LockLevel::Exclusive
-                || db_file.lock(sqliters_vfs::LockLevel::Exclusive).is_ok()
-            {
+            let got_exclusive = if prev_lock >= sqliters_vfs::LockLevel::Exclusive {
                 true
             } else {
-                let _ = db_file.unlock(prev_lock);
-                false
+                let lock_res = if prev_lock == sqliters_vfs::LockLevel::NoLock {
+                    db_file
+                        .lock(sqliters_vfs::LockLevel::Shared)
+                        .and_then(|()| db_file.lock(sqliters_vfs::LockLevel::Exclusive))
+                } else {
+                    db_file.lock(sqliters_vfs::LockLevel::Exclusive)
+                };
+                if lock_res.is_ok() {
+                    true
+                } else {
+                    let _ = db_file.unlock(prev_lock);
+                    false
+                }
             };
 
             if got_exclusive {

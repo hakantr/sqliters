@@ -577,6 +577,135 @@ mod vacuum6;
 #[path = "sqlite_test/vacuum-into.rs"]
 mod vacuum_into;
 #[allow(non_snake_case)]
+#[path = "sqlite_test/wal.rs"]
+mod wal;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/wal2.rs"]
+mod wal2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/wal3.rs"]
+mod wal3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/wal4.rs"]
+mod wal4;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/wal5.rs"]
+mod wal5;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/wal6.rs"]
+mod wal6;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/wal64k.rs"]
+mod wal64k;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/wal7.rs"]
+mod wal7;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/wal8.rs"]
+mod wal8;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/wal9.rs"]
+mod wal9;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walbak.rs"]
+mod walbak;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walbig.rs"]
+mod walbig;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walblock.rs"]
+mod walblock;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walckptnoop.rs"]
+mod walckptnoop;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walcksum.rs"]
+mod walcksum;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walcrash.rs"]
+mod walcrash;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walcrash2.rs"]
+mod walcrash2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walcrash3.rs"]
+mod walcrash3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walcrash4.rs"]
+mod walcrash4;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walfault.rs"]
+mod walfault;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walfault2.rs"]
+mod walfault2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walhook.rs"]
+mod walhook;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/waliter.rs"]
+mod waliter;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walmode.rs"]
+mod walmode;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walnoshm.rs"]
+mod walnoshm;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/waloverwrite.rs"]
+mod waloverwrite;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walpersist.rs"]
+mod walpersist;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walprotocol.rs"]
+mod walprotocol;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walprotocol2.rs"]
+mod walprotocol2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walrestart.rs"]
+mod walrestart;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walro.rs"]
+mod walro;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walro2.rs"]
+mod walro2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walrofault.rs"]
+mod walrofault;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walseh1.rs"]
+mod walseh1;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walsetlk.rs"]
+mod walsetlk;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walsetlk2.rs"]
+mod walsetlk2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walsetlk3.rs"]
+mod walsetlk3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walsetlk_recover.rs"]
+mod walsetlk_recover;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walsetlk_snapshot.rs"]
+mod walsetlk_snapshot;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walshared.rs"]
+mod walshared;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walslow.rs"]
+mod walslow;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walthread.rs"]
+mod walthread;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/walvfs.rs"]
+mod walvfs;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/where.rs"]
 mod r#where;
 #[allow(non_snake_case)]

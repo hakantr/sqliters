@@ -234,6 +234,23 @@ impl Btree {
         self.pager.spill_dirty_pages_to_wal()
     }
 
+    /// Spills dirty pages to `<db>-wal` when in a WAL write transaction and dirty pages exceed `cache_size`.
+    pub fn spill_if_over_cache_size(&mut self) -> Result<usize> {
+        self.pager.spill_if_over_cache_size()
+    }
+
+    /// Returns the configured page cache size (`PRAGMA cache_size`).
+    #[inline]
+    pub fn cache_size(&self) -> i32 {
+        self.pager.cache_size()
+    }
+
+    /// Updates the configured page cache size (`PRAGMA cache_size = N`).
+    #[inline]
+    pub fn set_cache_size(&mut self, size: i32) {
+        self.pager.set_cache_size(size);
+    }
+
     // ========================================================================
     // Freelist & Page Allocation (`btreeInt.h:206-215`, `allocateBtreePage`)
     // ========================================================================

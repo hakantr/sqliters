@@ -196,7 +196,9 @@ impl WalIndexHeaderData {
         frame_cksum: [u32; 2],
         salt: [u32; 2],
     ) -> Result<Self> {
-        let _ = encode_shm_page_size(page_size)?;
+        if !(mx_frame == 0 && page_size == 0) {
+            let _ = encode_shm_page_size(page_size)?;
+        }
         let mut hdr = Self {
             version: WALINDEX_MAX_VERSION,
             unused: 0,
@@ -226,7 +228,11 @@ impl WalIndexHeaderData {
     /// Encodes a 48-byte `WalIndexHdr` following `walIndexWriteHdr` (`wal.c:979-982`), forcing
     /// `is_init = 1` and `version = WALINDEX_MAX_VERSION` and computing `aCksum` over `0..40`.
     pub fn encode_for_publish(&self) -> Result<([u8; WALINDEX_HDR_COPY_LEN], Self)> {
-        let encoded_sz_page = encode_shm_page_size(self.page_size)?;
+        let encoded_sz_page = if self.mx_frame == 0 && self.page_size == 0 {
+            0u16
+        } else {
+            encode_shm_page_size(self.page_size)?
+        };
         let mut out = [0u8; WALINDEX_HDR_COPY_LEN];
         let mut normalized = *self;
         normalized.version = WALINDEX_MAX_VERSION;
@@ -283,12 +289,18 @@ impl WalIndexHeaderData {
             ));
         }
 
+        let mx_frame = u32::from_ne_bytes([copy1[16], copy1[17], copy1[18], copy1[19]]);
         let raw_sz_page = u16::from_ne_bytes([copy1[14], copy1[15]]);
-        let page_size = decode_shm_page_size(raw_sz_page)?;
+        // In C SQLite (`wal.c:1446-1453, 1604`), `walIndexRecover` on an empty or uncommitted
+        // `-wal` (`mxFrame == 0`) leaves `pWal->hdr.szPage == 0` while setting `isInit = 1`.
+        let page_size = if mx_frame == 0 && raw_sz_page == 0 {
+            0
+        } else {
+            decode_shm_page_size(raw_sz_page)?
+        };
         let unused = u32::from_ne_bytes([copy1[4], copy1[5], copy1[6], copy1[7]]);
         let change_counter = u32::from_ne_bytes([copy1[8], copy1[9], copy1[10], copy1[11]]);
         let big_end_cksum = copy1[13];
-        let mx_frame = u32::from_ne_bytes([copy1[16], copy1[17], copy1[18], copy1[19]]);
         let n_page = u32::from_ne_bytes([copy1[20], copy1[21], copy1[22], copy1[23]]);
         let fc0 = u32::from_ne_bytes([copy1[24], copy1[25], copy1[26], copy1[27]]);
         let fc1 = u32::from_ne_bytes([copy1[28], copy1[29], copy1[30], copy1[31]]);

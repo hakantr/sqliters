@@ -1072,7 +1072,7 @@ fn test_suite2_read0_to_positive_slot_all_three_restart_paths_and_busy_snapshot(
         1,
         "Path A must wrap WAL and increment nCkpt to 1"
     );
-    assert_eq!(writer.wal().unwrap().header().mx_frame, 2); // Page 1 + Page 2
+    assert_eq!(writer.wal().unwrap().header().mx_frame, 1); // Page 2 only (`pager.c:6565-6571`)
     assert_eq!(&writer.read_page(2).unwrap()[0..8], b"PATH_A_2");
 
     // Verify retained positive `READ(1..=4)` slot blocks external C SQLite `RESTART` / `TRUNCATE`!
@@ -1104,20 +1104,20 @@ fn test_suite2_read0_to_positive_slot_all_three_restart_paths_and_busy_snapshot(
     writer.end_read_if_unused().unwrap();
 
     // ---- Path B (`nBackfill > 0`, reset hits `Busy` from `reader_r1` holding `READ(1..=4)`) ----
-    // Run `PASSIVE` checkpoint: because `aReadMark[r1_slot] == 2 == mxFrame`, `PASSIVE` backfills
-    // all 2 frames (`nBackfill == 2 == mxFrame`), while `reader_r1` STILL holds `READ(r1_slot)`!
+    // Run `PASSIVE` checkpoint: because `aReadMark[r1_slot] == 1 == mxFrame`, `PASSIVE` backfills
+    // the frame (`nBackfill == 1 == mxFrame`), while `reader_r1` STILL holds `READ(r1_slot)`!
     let ckpt_p = writer
         .wal_checkpoint(WalCheckpointMode::Passive, None, None)
         .unwrap();
-    assert!(!ckpt_p.busy && ckpt_p.n_ckpt == 2 && ckpt_p.n_log == 2);
+    assert!(!ckpt_p.busy && ckpt_p.n_ckpt == 1 && ckpt_p.n_log == 1);
 
-    // `writer` begins read: `nBackfill == mxFrame == 2`, so `writer` takes `READ(0)`!
+    // `writer` begins read: `nBackfill == mxFrame == 1`, so `writer` takes `READ(0)`!
     writer.begin_read().unwrap();
     assert_eq!(writer.wal().unwrap().read_lock_slot(), Some(0));
 
     // `writer` upgrades to write, dirties Page 2 (`PATH_B_3`), and commits with `retain_read = true`:
     // `walRestartLog` attempts `EXCLUSIVE WAL_READ_LOCK(1..=4)`, hits `Busy` on `r1_slot`, skips reset
-    // (`n_ckpt` stays `1`, frames append to `3..=4`), preserves dirty Page 2, and acquires a positive slot!
+    // (`n_ckpt` stays `1`, frame appends at `2`), preserves dirty Page 2, and acquires a positive slot!
     writer.begin_write().unwrap();
     writer.write_page(2).unwrap()[0..8].copy_from_slice(b"PATH_B_3");
     writer.commit_retaining_read(true).unwrap();
@@ -1129,7 +1129,7 @@ fn test_suite2_read0_to_positive_slot_all_three_restart_paths_and_busy_snapshot(
         1,
         "Path B must NOT reset nCkpt while reader_r1 holds READ(1..=4)"
     );
-    assert_eq!(writer.wal().unwrap().header().mx_frame, 4);
+    assert_eq!(writer.wal().unwrap().header().mx_frame, 2);
     assert_eq!(&writer.read_page(2).unwrap()[0..8], b"PATH_B_3");
 
     // Meanwhile `reader_r1` is isolated on its snapshot (`mx_frame == 2`) and still sees `PATH_A_2`,

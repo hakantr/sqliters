@@ -7,22 +7,35 @@ pub mod interp;
 pub mod list;
 pub mod regex;
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 pub use harness::{
-    SqliteTestHost, SubtestFailure, TESTFIXTURE_DEFAULT_PAGE_SIZE, TempTestDir, TestFileReport,
-    phase1_capability, sqlite_err_name,
+    PHASE1_CAPABILITY_TABLE, SqliteTestHost, SubtestFailure, TESTFIXTURE_DEFAULT_PAGE_SIZE,
+    TempTestDir, TestFileReport, phase1_capability, sqlite_err_name,
 };
 use interp::{TclControl, TclInterp};
 
-/// Evaluates an adapted SQLite `.test` script in an isolated temporary directory
-/// and returns its detailed [`TestFileReport`] without panicking on subtest failures.
+/// Evaluates an adapted SQLite `.test` script from `sqlite/test` in an isolated temporary
+/// directory and returns its detailed [`TestFileReport`] without panicking on subtest failures.
 pub fn evaluate_test_script(test_name: &str, script: &str) -> TestFileReport {
+    evaluate_test_script_in_root("sqlite/test", test_name, script)
+}
+
+/// Evaluates a SQLite `.test` script originating from `source_root_rel` (e.g. `"sqlite/test"`,
+/// `"sqlite/ext/fts5/test"`, or `"sqlite/ext/rtree"`) in an isolated temporary working directory.
+pub fn evaluate_test_script_in_root(
+    source_root_rel: &str,
+    test_name: &str,
+    script: &str,
+) -> TestFileReport {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    let sqlite_test_dir = resolve_sqlite_test_dir(Path::new(&manifest_dir));
+    let repo_root = resolve_repo_root(Path::new(&manifest_dir));
+    let script_source_dir = repo_root.join(source_root_rel);
+    let source_roots = collect_source_roots(&repo_root, &script_source_dir);
     let temp = TempTestDir::new(test_name);
 
-    let host = SqliteTestHost::new_shared(test_name, sqlite_test_dir);
+    let host = SqliteTestHost::new_shared_with_roots(test_name, script_source_dir, source_roots);
     let mut interp = TclInterp::new(temp.path.clone(), Some(host.clone()));
     interp.script_path = format!("{test_name}.test");
 
@@ -39,10 +52,16 @@ pub fn evaluate_test_script(test_name: &str, script: &str) -> TestFileReport {
     host.borrow().report.clone()
 }
 
-/// Runs an adapted SQLite `.test` script and asserts that **every** subtest passes
-/// with zero script errors. Panics with detailed diagnostics on any mismatch.
+/// Runs an adapted SQLite `.test` script from `sqlite/test` and asserts that **every** subtest
+/// passes with zero script errors. Panics with detailed diagnostics on any mismatch.
 pub fn run_test_script(test_name: &str, script: &str) {
-    let report = evaluate_test_script(test_name, script);
+    run_test_script_in_root("sqlite/test", test_name, script);
+}
+
+/// Runs a SQLite `.test` script originating from `source_root_rel` and asserts that **every**
+/// subtest passes with zero script errors.
+pub fn run_test_script_in_root(source_root_rel: &str, test_name: &str, script: &str) {
+    let report = evaluate_test_script_in_root(source_root_rel, test_name, script);
     if !report.is_ok() {
         let mut msg = format!(
             "\nSQLite test suite '{test_name}' failed ({} passed, {} failed):\n",
@@ -91,16 +110,26 @@ pub fn run_test_script(test_name: &str, script: &str) {
     }
 }
 
-fn resolve_sqlite_test_dir(base: &Path) -> PathBuf {
-    let p1 = base.join("sqlite/test");
-    if p1.is_dir() {
-        return p1;
+fn resolve_repo_root(base: &Path) -> PathBuf {
+    if base.join("sqlite/test").is_dir() {
+        return fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
     }
-    let p2 = base.join("../../sqlite/test");
-    if p2.is_dir() {
-        return p2;
+    let up2 = base.join("../..");
+    if up2.join("sqlite/test").is_dir() {
+        return fs::canonicalize(&up2).unwrap_or(up2);
     }
-    p1
+    fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf())
+}
+
+fn collect_source_roots(repo_root: &Path, primary: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![primary.to_path_buf()];
+    for rel in ["sqlite/test", "sqlite/ext/fts5/test", "sqlite/ext/rtree"] {
+        let candidate = repo_root.join(rel);
+        if candidate.is_dir() && !roots.iter().any(|r| r == &candidate) {
+            roots.push(candidate);
+        }
+    }
+    roots
 }
 
 /// Strips standalone TCL `#` comment lines and `/* ... */` header comment blocks
