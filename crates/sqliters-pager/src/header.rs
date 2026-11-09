@@ -8,6 +8,50 @@ use sqliters_types::{
 /// Size in bytes of the database file header on Page 1.
 pub const DB_HEADER_SIZE: usize = 100;
 
+/// Database auto-vacuum mode encoded in header bytes `[52..56]` and `[64..68]` (`btree.c:3232-3270`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AutoVacuumMode {
+    #[default]
+    None = 0,
+    Full = 1,
+    Incremental = 2,
+}
+
+impl AutoVacuumMode {
+    /// Derives the active auto-vacuum mode from `header` (`largest_root_btree_page` and
+    /// `incremental_vacuum_mode`).
+    #[inline]
+    pub const fn from_header(header: &DatabaseHeader) -> Self {
+        if header.largest_root_btree_page == 0 {
+            Self::None
+        } else if header.incremental_vacuum_mode != 0 {
+            Self::Incremental
+        } else {
+            Self::Full
+        }
+    }
+
+    /// Parses a `PRAGMA auto_vacuum` argument (`0`/`NONE`, `1`/`FULL`, `2`/`INCREMENTAL`).
+    pub fn from_pragma_value(s: &str) -> Option<Self> {
+        let trimmed = s.trim();
+        if trimmed == "0" || trimmed.eq_ignore_ascii_case("none") {
+            Some(Self::None)
+        } else if trimmed == "1" || trimmed.eq_ignore_ascii_case("full") {
+            Some(Self::Full)
+        } else if trimmed == "2" || trimmed.eq_ignore_ascii_case("incremental") {
+            Some(Self::Incremental)
+        } else {
+            None
+        }
+    }
+
+    /// Integer code (`0`, `1`, or `2`) reported by `PRAGMA auto_vacuum`.
+    #[inline]
+    pub const fn as_int(self) -> i64 {
+        self as i64
+    }
+}
+
 /// Parsed representation of the 100-byte header at offset 0 of Page 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseHeader {
@@ -82,6 +126,18 @@ impl DatabaseHeader {
         page_size >= SQLITE_MIN_PAGE_SIZE
             && page_size <= SQLITE_MAX_PAGE_SIZE
             && page_size.is_power_of_two()
+    }
+
+    /// Returns `Ok(())` when `page_size` is a legal page size, or `ErrorCode::Misuse` otherwise.
+    #[inline]
+    pub fn validate_page_size(page_size: u32) -> Result<()> {
+        if !Self::is_valid_page_size(page_size) {
+            return Err(SqliteError::new(
+                ErrorCode::Misuse,
+                format!("invalid page_size: {page_size}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Returns `true` when `write_version > 2`, which forces the connection into read-only mode
@@ -286,5 +342,61 @@ mod tests {
         assert_eq!(parsed64k.page_size, 65_536);
         assert!(parsed64k.is_wal());
         assert!(!parsed64k.forces_readonly());
+    }
+
+    #[test]
+    fn test_auto_vacuum_mode_helpers_and_page_size_validation() {
+        let mut hdr = DatabaseHeader::default();
+        assert_eq!(AutoVacuumMode::from_header(&hdr), AutoVacuumMode::None);
+        assert_eq!(AutoVacuumMode::None.as_int(), 0);
+
+        hdr.largest_root_btree_page = 1;
+        hdr.incremental_vacuum_mode = 0;
+        assert_eq!(AutoVacuumMode::from_header(&hdr), AutoVacuumMode::Full);
+        assert_eq!(AutoVacuumMode::Full.as_int(), 1);
+
+        hdr.incremental_vacuum_mode = 1;
+        assert_eq!(
+            AutoVacuumMode::from_header(&hdr),
+            AutoVacuumMode::Incremental
+        );
+        assert_eq!(AutoVacuumMode::Incremental.as_int(), 2);
+
+        assert_eq!(
+            AutoVacuumMode::from_pragma_value("0"),
+            Some(AutoVacuumMode::None)
+        );
+        assert_eq!(
+            AutoVacuumMode::from_pragma_value("NONE"),
+            Some(AutoVacuumMode::None)
+        );
+        assert_eq!(
+            AutoVacuumMode::from_pragma_value("1"),
+            Some(AutoVacuumMode::Full)
+        );
+        assert_eq!(
+            AutoVacuumMode::from_pragma_value("FuLl"),
+            Some(AutoVacuumMode::Full)
+        );
+        assert_eq!(
+            AutoVacuumMode::from_pragma_value("2"),
+            Some(AutoVacuumMode::Incremental)
+        );
+        assert_eq!(
+            AutoVacuumMode::from_pragma_value("incremental"),
+            Some(AutoVacuumMode::Incremental)
+        );
+        assert_eq!(AutoVacuumMode::from_pragma_value("3"), None);
+        assert_eq!(AutoVacuumMode::from_pragma_value("invalid"), None);
+
+        for ps in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536] {
+            DatabaseHeader::validate_page_size(ps).unwrap();
+        }
+        for bad in [0, 256, 513, 1000, 3072, 131_072] {
+            assert_eq!(
+                DatabaseHeader::validate_page_size(bad).unwrap_err().code,
+                ErrorCode::Misuse
+            );
+        }
     }
 }
