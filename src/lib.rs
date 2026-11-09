@@ -56,7 +56,8 @@ pub use sqliters_core::{
     Schema, Statement, StepResult, TableSchema,
 };
 pub use sqliters_pager::{
-    DatabaseHeader, JournalMode, LockingMode, WalCheckpointMode, WalCheckpointResult,
+    AutoVacuumMode, DatabaseHeader, JournalMode, LockingMode, WalCheckpointMode,
+    WalCheckpointResult,
 };
 pub use sqliters_syntax::{FkAction, is_complete, parse_one, parse_statements};
 pub use sqliters_types::{

@@ -227,7 +227,7 @@ pub struct Pager {
     page_size_fixed: bool,
     page_count: Pgno,
     configured_auto_vacuum: AutoVacuumMode,
-    autovacuum_ptrmap_ready: bool,
+    writable_schema: bool,
     next_page_size: Option<u32>,
     pending_byte_copy: Option<PendingByteCopy>,
     staged_raw_copy: bool,
@@ -238,6 +238,7 @@ pub struct Pager {
     /// Transaction-level undo state for atomic rollback
     tx_orig_page_count: Pgno,
     tx_orig_header: DatabaseHeader,
+    tx_orig_auto_vacuum: AutoVacuumMode,
     tx_journaled: Bitvec,
     tx_preimages: HashMap<Pgno, Vec<u8>>,
     journal_records_written: u32,
@@ -451,7 +452,7 @@ impl Pager {
             page_size_fixed: false,
             page_count: 0,
             configured_auto_vacuum: AutoVacuumMode::None,
-            autovacuum_ptrmap_ready: false,
+            writable_schema: false,
             next_page_size: None,
             pending_byte_copy: None,
             staged_raw_copy: false,
@@ -459,6 +460,7 @@ impl Pager {
             state: TransactionState::Open,
             tx_orig_page_count: 0,
             tx_orig_header: DatabaseHeader::default(),
+            tx_orig_auto_vacuum: AutoVacuumMode::None,
             tx_journaled: Bitvec::new(64),
             tx_preimages: HashMap::new(),
             journal_records_written: 0,
@@ -637,36 +639,117 @@ impl Pager {
         self.staged_raw_copy
     }
 
-    /// Returns the active [`AutoVacuumMode`] (from Page 1 header once initialized, otherwise from
-    /// [`Self::set_configured_auto_vacuum`]).
+    /// Returns `true` once Page 1 has been initialized or loaded from disk (`BTS_PAGESIZE_FIXED`).
     #[inline]
-    pub fn auto_vacuum_mode(&self) -> AutoVacuumMode {
-        if self.page_count > 0 || self.page_size_fixed {
-            AutoVacuumMode::from_header(&self.header)
-        } else {
-            self.configured_auto_vacuum
-        }
+    pub const fn is_page_size_fixed(&self) -> bool {
+        self.page_size_fixed
     }
 
-    /// Sets the configured [`AutoVacuumMode`] for an uninitialized database (`btree.c:3232-3250`).
-    pub fn set_configured_auto_vacuum(&mut self, mode: AutoVacuumMode) {
+    /// Returns the active [`AutoVacuumMode`] (`sqlite3BtreeGetAutoVacuum`, `btree.c:3258-3270`).
+    #[inline]
+    pub const fn auto_vacuum_mode(&self) -> AutoVacuumMode {
+        self.configured_auto_vacuum
+    }
+
+    /// Updates the configured [`AutoVacuumMode`] following `sqlite3BtreeSetAutoVacuum`
+    /// (`sqlite/src/btree.c:3232-3256`).
+    ///
+    /// Returns `false` (`SQLITE_READONLY`) without modifying the current mode if Page 1 is already
+    /// fixed and `mode != AutoVacuumMode::None` differs from `current != AutoVacuumMode::None`.
+    /// Toggling `Full <-> Incremental` on an existing auto-vacuum database is allowed and returns
+    /// `true`.
+    pub fn set_configured_auto_vacuum(&mut self, mode: AutoVacuumMode) -> bool {
+        let new_av = mode != AutoVacuumMode::None;
+        let cur_av = self.configured_auto_vacuum != AutoVacuumMode::None;
+        if self.page_size_fixed && new_av != cur_av {
+            return false;
+        }
         self.configured_auto_vacuum = mode;
         if self.page_count == 0 && !self.page_size_fixed {
             self.header.largest_root_btree_page = if mode == AutoVacuumMode::None { 0 } else { 1 };
             self.header.incremental_vacuum_mode = u32::from(mode == AutoVacuumMode::Incremental);
         }
+        true
     }
 
-    /// Enables or disables pointer-map auto-vacuum write readiness on this pager.
+    /// Enables or disables `PRAGMA writable_schema` truncated-image tolerance (`btree.c:3435-3442`).
     #[inline]
-    pub fn set_autovacuum_ptrmap_ready(&mut self, ready: bool) {
-        self.autovacuum_ptrmap_ready = ready;
+    pub fn set_writable_schema(&mut self, enabled: bool) {
+        self.writable_schema = enabled;
     }
 
-    /// Returns `true` when pointer-map auto-vacuum storage writes are enabled on this pager.
+    /// Returns `true` when `PRAGMA writable_schema` is enabled on this pager.
+    #[inline]
+    pub const fn writable_schema(&self) -> bool {
+        self.writable_schema
+    }
+
+    /// Compatibility no-op setter retained for pointer-map unit tests; auto-vacuum writes are
+    /// unconditionally enabled in Phase 1.3.
+    #[inline]
+    pub fn set_autovacuum_ptrmap_ready(&mut self, _ready: bool) {}
+
+    /// Returns `true` (auto-vacuum pointer-map writes are unconditionally enabled).
     #[inline]
     pub const fn is_autovacuum_ptrmap_ready(&self) -> bool {
-        self.autovacuum_ptrmap_ready
+        true
+    }
+
+    /// Replaces this pager's backing storage with an isolated in-memory database image initialized
+    /// from `data` (`sqlite3_deserialize`, `sqlite/src/memdb.c`).
+    ///
+    /// Requires `TransactionState::Open`. Page 1 header parsing is deferred until the next read or
+    /// write transaction so `PRAGMA writable_schema = ON` can be set before reading a fuzz image.
+    pub fn load_deserialized_image(&mut self, data: &[u8], readonly: bool) -> Result<()> {
+        self.ensure_not_closed()?;
+        if self.state != TransactionState::Open {
+            return Err(SqliteError::new(
+                ErrorCode::Locked,
+                "cannot deserialize while a transaction is active",
+            ));
+        }
+
+        if let Some(wal) = self.wal.take()
+            && let Some(ref df) = self.file
+        {
+            let _ = wal.close(&**df, None, self.persist_wal);
+        }
+        if let Some(mut jf) = self.journal_file.take() {
+            let _ = jf.close();
+        }
+        if let Some(mut df) = self.file.take() {
+            let _ = df.unlock(LockLevel::NoLock);
+            let _ = df.close();
+        }
+
+        let mem_vfs: Arc<dyn Vfs> = Arc::new(MemoryVfs::with_lock_geometry(self.lock_geometry));
+        let mem_file = mem_vfs.open(
+            Some(Path::new("deserialized.db")),
+            OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MEMORY,
+        )?;
+        if !data.is_empty() {
+            mem_file.write_at(data, 0)?;
+        }
+
+        self.vfs = mem_vfs;
+        self.db_path = None;
+        self.journal_path = None;
+        self.wal_path = None;
+        self.db_kind = DatabaseKind::Memory;
+        self.is_memdb_backing = true;
+        self.readonly = readonly;
+        self.journal_mode = JournalMode::Memory;
+        self.file = Some(mem_file);
+        self.cache.clear();
+        self.header = DatabaseHeader::new_with_page_size(self.header.page_size);
+        self.header_loaded = false;
+        self.page_size_fixed = false;
+        self.page_count = 0;
+        self.configured_auto_vacuum = AutoVacuumMode::None;
+        self.next_page_size = None;
+        self.pending_byte_copy = None;
+        self.staged_raw_copy = false;
+        Ok(())
     }
 
     /// Returns any deferred page size requested via [`Self::set_page_size`].
@@ -1504,6 +1587,21 @@ impl Pager {
         Ok(())
     }
 
+    /// Sets the reserved bytes per page before Page 1 is initialized (`sqlite3BtreeSetPageSize`,
+    /// `sqlite/src/btree.c:3103-3134`).
+    pub fn set_reserved_bytes(&mut self, reserved: u8) -> Result<()> {
+        self.ensure_not_closed()?;
+        if self.header.page_size.saturating_sub(u32::from(reserved)) < 480 {
+            return Err(SqliteError::misuse(
+                "usable page size must be at least 480 bytes",
+            ));
+        }
+        if !self.page_size_fixed && self.page_count == 0 {
+            self.header.reserved_bytes = reserved;
+        }
+        Ok(())
+    }
+
     /// Starts a read transaction (`SHARED` lock + two-phase WAL discovery + hot-journal recovery
     /// + authoritative 100-byte header validation).
     pub fn begin_read(&mut self) -> Result<()> {
@@ -1551,11 +1649,18 @@ impl Pager {
     }
 
     fn begin_read_under_shared_lock(&mut self) -> Result<()> {
-        if self.is_memdb_backing
+        if (self.is_memdb_backing && self.header_loaded)
             || (self.db_kind == DatabaseKind::PrivateTemporary && self.file.is_none())
         {
             self.header_loaded = true;
             return Ok(());
+        }
+        if self.is_memdb_backing {
+            let mem_len = self.file.as_ref().map_or(0, |f| f.file_size().unwrap_or(0));
+            if mem_len == 0 {
+                self.header_loaded = true;
+                return Ok(());
+            }
         }
 
         // Pass 1 (`pagerOpenWalIfPresent`, `pager.c:3393-3421`):
@@ -1576,7 +1681,7 @@ impl Pager {
         }
 
         if self.wal.is_none() {
-            let recovered = if self.immutable {
+            let recovered = if self.immutable || self.is_memdb_backing {
                 false
             } else {
                 self.recover_hot_journal_under_shared_lock()?
@@ -1631,16 +1736,22 @@ impl Pager {
                     let ps = u64::from(disk_hdr.page_size);
                     let file_pages = (file_len / ps) as Pgno;
 
-                    // Per btree.c:3330: if header page count is 0 or change_counter != version_valid_for
-                    // (e.g. modified by pre-3.7.0 SQLite), fall back to physical file size in pages.
+                    // Per btree.c:3330 & 3435-3442: if header page count is 0 or change_counter != version_valid_for
+                    // (e.g. modified by pre-3.7.0 SQLite), fall back to physical file size in pages;
+                    // if header page count exceeds physical file pages and `writable_schema` is enabled,
+                    // clamp to `file_pages`.
                     let effective_pages = if disk_hdr.database_size_pages == 0
                         || disk_hdr.change_counter != disk_hdr.version_valid_for
                     {
                         file_pages.max(1)
                     } else if disk_hdr.database_size_pages > file_pages && file_pages > 0 {
-                        return Err(SqliteError::corrupt(
-                            "database header page count exceeds file size",
-                        ));
+                        if self.writable_schema {
+                            file_pages
+                        } else {
+                            return Err(SqliteError::corrupt(
+                                "database header page count exceeds file size",
+                            ));
+                        }
                     } else {
                         disk_hdr.database_size_pages
                     };
@@ -1657,6 +1768,7 @@ impl Pager {
                         self.cache.clear();
                     }
 
+                    self.configured_auto_vacuum = AutoVacuumMode::from_header(&disk_hdr);
                     self.header = disk_hdr;
                     self.page_count = effective_pages;
                     self.page_size_fixed = true;
@@ -1734,9 +1846,13 @@ impl Pager {
             {
                 file_pages.max(1)
             } else if snap_hdr.database_size_pages > file_pages && file_pages > 0 {
-                return Err(SqliteError::corrupt(
-                    "database header page count exceeds file size",
-                ));
+                if self.writable_schema {
+                    file_pages
+                } else {
+                    return Err(SqliteError::corrupt(
+                        "database header page count exceeds file size",
+                    ));
+                }
             } else {
                 snap_hdr.database_size_pages
             }
@@ -1754,6 +1870,7 @@ impl Pager {
             self.cache.clear();
         }
 
+        self.configured_auto_vacuum = AutoVacuumMode::from_header(&snap_hdr);
         self.header = snap_hdr;
         self.page_count = effective_pages;
         self.page_size_fixed = true;
@@ -1871,18 +1988,6 @@ impl Pager {
             ));
         }
 
-        // Reject writing to auto-vacuum (`FULL` / `INCREMENTAL`) pointer-map databases unless enabled.
-        if !self.autovacuum_ptrmap_ready
-            && self.page_count > 0
-            && self.header.largest_root_btree_page != 0
-        {
-            self.abort_write_upgrade(acquired_read_here);
-            return Err(SqliteError::new(
-                ErrorCode::Error,
-                "writing to auto_vacuum (pointer-map) databases is not supported",
-            ));
-        }
-
         if self.use_wal() {
             // In `locking_mode = EXCLUSIVE`, acquire `.db` `EXCLUSIVE` lock and transition WAL to
             // `WalExclusiveMode::Exclusive` if currently in `Normal` (`pager.c:5998-6004`).
@@ -1920,6 +2025,7 @@ impl Pager {
 
         self.tx_orig_page_count = self.page_count;
         self.tx_orig_header = self.header.clone();
+        self.tx_orig_auto_vacuum = self.configured_auto_vacuum;
         self.tx_journaled = Bitvec::new(self.page_count.max(64));
         self.tx_preimages.clear();
         self.journal_records_written = 0;
@@ -1954,6 +2060,7 @@ impl Pager {
             self.cache.remove(&1);
             self.page_count = 0;
             self.header = self.tx_orig_header.clone();
+            self.configured_auto_vacuum = self.tx_orig_auto_vacuum;
             self.page_size_fixed = false;
             self.journal_started_in_tx = false;
             self.cache_modified = false;
@@ -2099,6 +2206,7 @@ impl Pager {
 
         self.page_count = 1;
         self.page_size_fixed = true;
+        self.configured_auto_vacuum = effective_av;
         self.header_loaded = true;
         self.cache_modified = true;
         self.cache.insert(
@@ -2445,6 +2553,7 @@ impl Pager {
                 self.tx_journaled
                     .grow_to(self.tx_orig_page_count.max(n_src_pages));
                 self.header = patched_hdr;
+                self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
                 self.change_counter_bumped = true;
                 self.cache_modified = true;
                 self.commit_phase_one_done = false;
@@ -2741,6 +2850,9 @@ impl Pager {
                     self.subsavepoints.clear();
                     self.header_loaded = true;
                     self.page_size_fixed = self.page_count > 0;
+                    if self.page_count > 0 {
+                        self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
+                    }
 
                     return self.finish_tx_to_read_or_open(retain_read);
                 }
@@ -2875,6 +2987,9 @@ impl Pager {
                 self.subsavepoints.clear();
                 self.header_loaded = true;
                 self.page_size_fixed = self.page_count > 0;
+                if self.page_count > 0 {
+                    self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
+                }
 
                 self.finish_tx_to_read_or_open(retain_read)
             }
@@ -2922,6 +3037,11 @@ impl Pager {
                     self.page_count = orig_count;
                     self.header = self.tx_orig_header.clone();
                     self.page_size_fixed = orig_count > 0;
+                    self.configured_auto_vacuum = if orig_count > 0 {
+                        AutoVacuumMode::from_header(&self.header)
+                    } else {
+                        self.tx_orig_auto_vacuum
+                    };
                     self.tx_journaled.clear_all();
                     self.commit_phase_one_done = false;
                     self.db_file_modified = false;
@@ -2998,6 +3118,11 @@ impl Pager {
                 self.page_count = orig_count;
                 self.header = self.tx_orig_header.clone();
                 self.page_size_fixed = orig_count > 0;
+                self.configured_auto_vacuum = if orig_count > 0 {
+                    AutoVacuumMode::from_header(&self.header)
+                } else {
+                    self.tx_orig_auto_vacuum
+                };
                 self.tx_journaled.clear_all();
                 self.commit_phase_one_done = false;
                 self.db_file_modified = false;
@@ -3046,12 +3171,16 @@ impl Pager {
                 let _ = db_file.truncate(target_size);
             }
             self.page_size_fixed = self.page_count > 0;
+            if self.page_count > 0 {
+                self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
+            }
             self.header_loaded = true;
         } else if was_modified {
             // Disk DB with `journal_mode=OFF` (`savepoint-13.4`): discard dirty in-memory cache
             // and mark `header_loaded = false` so subsequent reads reload untouched pages from disk!
             self.cache.clear();
             self.header = self.tx_orig_header.clone();
+            self.configured_auto_vacuum = self.tx_orig_auto_vacuum;
             self.page_count = 0;
             self.page_size_fixed = false;
             self.header_loaded = false;
@@ -3258,8 +3387,12 @@ impl Pager {
         self.header = sp.orig_header.clone();
         if self.page_count == 0 {
             self.page_size_fixed = self.tx_orig_page_count > 0;
-        } else if let Some(p1) = self.cache.get_mut(&1) {
-            self.header.write_into(&mut p1.data[0..DB_HEADER_SIZE]);
+            self.configured_auto_vacuum = self.tx_orig_auto_vacuum;
+        } else {
+            self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
+            if let Some(p1) = self.cache.get_mut(&1) {
+                self.header.write_into(&mut p1.data[0..DB_HEADER_SIZE]);
+            }
         }
     }
 

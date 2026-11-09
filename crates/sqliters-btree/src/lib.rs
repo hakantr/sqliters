@@ -159,13 +159,28 @@ impl Btree {
         self.pager.auto_vacuum_mode()
     }
 
-    /// Configures initial [`AutoVacuumMode`] prior to database initialization.
+    /// Updates configured [`AutoVacuumMode`] following `sqlite3BtreeSetAutoVacuum` (`btree.c:3232`).
+    ///
+    /// Returns `false` (`SQLITE_READONLY`) if Page 1 is already fixed and `mode != None` differs
+    /// from `current != None`; returns `true` otherwise.
     #[inline]
-    pub fn set_configured_auto_vacuum(&mut self, mode: AutoVacuumMode) {
-        self.pager.set_configured_auto_vacuum(mode);
+    pub fn set_configured_auto_vacuum(&mut self, mode: AutoVacuumMode) -> bool {
+        self.pager.set_configured_auto_vacuum(mode)
     }
 
-    /// Enables pointer-map auto-vacuum storage writes on the underlying [`Pager`].
+    /// Enables or disables `PRAGMA writable_schema` truncated-image tolerance on the underlying [`Pager`].
+    #[inline]
+    pub fn set_writable_schema(&mut self, enabled: bool) {
+        self.pager.set_writable_schema(enabled);
+    }
+
+    /// Returns `true` when `PRAGMA writable_schema` is enabled on the underlying [`Pager`].
+    #[inline]
+    pub fn writable_schema(&self) -> bool {
+        self.pager.writable_schema()
+    }
+
+    /// Compatibility no-op retained for pointer-map unit tests (auto-vacuum writes are always enabled).
     #[inline]
     pub fn enable_autovacuum_storage(&mut self) {
         self.pager.set_autovacuum_ptrmap_ready(true);
@@ -1090,38 +1105,157 @@ impl Btree {
                 (idx, target_child, n_cells)
             };
             let child_allow_quick = pgno != 1 && idx == n_cells;
-            let child_splits =
-                self.insert_table_rec(target_child, cell, false, child_allow_quick)?;
-            if child_splits.is_empty() {
-                return Ok(Vec::new());
-            }
-
-            let ParsedPage::TableInterior {
-                mut cells,
-                mut right_child,
-            } = self.read_parsed_page(pgno)?
-            else {
-                return Err(SqliteError::corrupt("expected table interior page"));
+            let target_ptype = {
+                let raw = self.pager.read_page(target_child)?;
+                peek_page_type(target_child, usable, raw)?
             };
 
-            let mut new_int_cells = Vec::with_capacity(child_splits.len());
-            let mut cur_left = target_child;
-            for &(div_key, next_sib) in &child_splits {
-                new_int_cells.push(TableInteriorCell {
-                    left_child: cur_left,
-                    key: div_key,
-                });
-                cur_left = next_sib;
-            }
-            let last_sib = cur_left;
+            let (cells, right_child) = if !child_allow_quick
+                && n_cells >= 1
+                && target_ptype == BtreePageType::TableLeaf
+            {
+                let inserted_fast = {
+                    let raw_mut = self.pager.write_page(target_child)?;
+                    try_insert_table_leaf_in_place(target_child, usable, raw_mut, &cell)?
+                };
+                if inserted_fast {
+                    if self.is_auto_vacuum()
+                        && let Some(ovfl) = cell.overflow_page
+                    {
+                        self.ptrmap_put(ovfl, PtrmapType::Overflow1, target_child)?;
+                    }
+                    return Ok(Vec::new());
+                }
 
-            if idx < cells.len() {
-                cells[idx].left_child = last_sib;
-                cells.splice(idx..idx, new_int_cells);
+                let ParsedPage::TableLeaf {
+                    cells: mut target_cells,
+                } = self.read_parsed_page(target_child)?
+                else {
+                    return Err(SqliteError::corrupt("expected table leaf page"));
+                };
+                match target_cells.binary_search_by_key(&cell.rowid, |c| c.rowid) {
+                    Ok(pos) => {
+                        let old = std::mem::replace(&mut target_cells[pos], cell);
+                        self.free_overflow_chain(old.overflow_page)?;
+                    }
+                    Err(pos) => {
+                        target_cells.insert(pos, cell);
+                    }
+                }
+                let single_candidate = ParsedPage::TableLeaf {
+                    cells: target_cells,
+                };
+                if single_candidate.fits_in_page(target_child, usable) {
+                    self.write_parsed_page(target_child, &single_candidate)?;
+                    return Ok(Vec::new());
+                }
+                let ParsedPage::TableLeaf {
+                    cells: target_cells,
+                } = single_candidate
+                else {
+                    unreachable!()
+                };
+
+                let ParsedPage::TableInterior {
+                    mut cells,
+                    mut right_child,
+                } = self.read_parsed_page(pgno)?
+                else {
+                    return Err(SqliteError::corrupt("expected table interior page"));
+                };
+                let m = cells.len();
+                let (nx_div, n_old) = if m < 2 {
+                    (0usize, 2usize)
+                } else if idx == 0 {
+                    (0usize, 3usize)
+                } else if idx == m {
+                    (m - 2, 3usize)
+                } else {
+                    (idx - 1, 3usize)
+                };
+
+                let mut avail_pgnos = Vec::with_capacity(n_old + 2);
+                let mut all_cells = Vec::new();
+                let mut target_opt = Some(target_cells);
+                for pos in nx_div..(nx_div + n_old) {
+                    let sib_pgno = cells.get(pos).map_or(right_child, |c| c.left_child);
+                    avail_pgnos.push(sib_pgno);
+                    if pos == idx {
+                        all_cells.extend(target_opt.take().expect("single idx slot"));
+                    } else {
+                        let ParsedPage::TableLeaf { cells: sib_cells } =
+                            self.read_parsed_page(sib_pgno)?
+                        else {
+                            return Err(SqliteError::corrupt("expected sibling table leaf page"));
+                        };
+                        all_cells.extend(sib_cells);
+                    }
+                }
+
+                let new_chunks = balance_table_leaf_siblings(all_cells, usable);
+                let k = new_chunks.len();
+                while avail_pgnos.len() < k {
+                    avail_pgnos.push(self.allocate_page()?);
+                }
+                while avail_pgnos.len() > k {
+                    let extra_pg = avail_pgnos.pop().expect("len > k");
+                    self.free_page(extra_pg)?;
+                }
+                avail_pgnos.sort_unstable();
+
+                let mut max_keys = Vec::with_capacity(k);
+                for (&out_pgno, chunk) in avail_pgnos.iter().zip(new_chunks) {
+                    max_keys.push(chunk.last().expect("non-empty leaf chunk").rowid);
+                    self.write_parsed_page(out_pgno, &ParsedPage::TableLeaf { cells: chunk })?;
+                }
+
+                let new_dividers = (0..(k - 1)).map(|j| TableInteriorCell {
+                    left_child: avail_pgnos[j],
+                    key: max_keys[j],
+                });
+                if nx_div + n_old - 1 < m {
+                    cells[nx_div + n_old - 1].left_child = avail_pgnos[k - 1];
+                    cells.splice(nx_div..(nx_div + n_old - 1), new_dividers);
+                } else {
+                    cells.splice(nx_div..m, new_dividers);
+                    right_child = avail_pgnos[k - 1];
+                }
+                (cells, right_child)
             } else {
-                cells.extend(new_int_cells);
-                right_child = last_sib;
-            }
+                let child_splits =
+                    self.insert_table_rec(target_child, cell, false, child_allow_quick)?;
+                if child_splits.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                let ParsedPage::TableInterior {
+                    mut cells,
+                    mut right_child,
+                } = self.read_parsed_page(pgno)?
+                else {
+                    return Err(SqliteError::corrupt("expected table interior page"));
+                };
+
+                let mut new_int_cells = Vec::with_capacity(child_splits.len());
+                let mut cur_left = target_child;
+                for &(div_key, next_sib) in &child_splits {
+                    new_int_cells.push(TableInteriorCell {
+                        left_child: cur_left,
+                        key: div_key,
+                    });
+                    cur_left = next_sib;
+                }
+                let last_sib = cur_left;
+
+                if idx < cells.len() {
+                    cells[idx].left_child = last_sib;
+                    cells.splice(idx..idx, new_int_cells);
+                } else {
+                    cells.extend(new_int_cells);
+                    right_child = last_sib;
+                }
+                (cells, right_child)
+            };
 
             let candidate = ParsedPage::TableInterior { cells, right_child };
             if candidate.fits_in_page(pgno, usable) {
@@ -1705,32 +1839,160 @@ impl Btree {
                 } else {
                     right_child
                 };
-
-                let Some((promoted, new_right_child)) =
-                    self.insert_index_rec(target_child, new_cell, key_vals, orders)?
-                else {
-                    return Ok(None);
+                let target_ptype = {
+                    let raw = self.pager.read_page(target_child)?;
+                    peek_page_type(target_child, usable, raw)?
                 };
 
-                if idx < cells.len() {
-                    cells[idx].left_child = new_right_child;
-                    cells.insert(
-                        idx,
-                        IndexInteriorCell {
+                if !cells.is_empty() && target_ptype == BtreePageType::IndexLeaf {
+                    let ParsedPage::IndexLeaf {
+                        cells: mut target_cells,
+                    } = self.read_parsed_page(target_child)?
+                    else {
+                        return Err(SqliteError::corrupt("expected index leaf page"));
+                    };
+                    let mut pos = target_cells.len();
+                    let mut replaced = false;
+                    for (i, existing) in target_cells.iter().enumerate() {
+                        let rec = self.read_full_payload(
+                            existing.total_payload_len,
+                            &existing.local_payload,
+                            existing.overflow_page,
+                        )?;
+                        match compare_records_with_encoding(&rec, key_vals, orders, enc)? {
+                            Ordering::Less => continue,
+                            Ordering::Equal => {
+                                pos = i;
+                                replaced = true;
+                                break;
+                            }
+                            Ordering::Greater => {
+                                pos = i;
+                                break;
+                            }
+                        }
+                    }
+                    if replaced {
+                        let old = std::mem::replace(&mut target_cells[pos], new_cell);
+                        self.free_overflow_chain(old.overflow_page)?;
+                    } else {
+                        target_cells.insert(pos, new_cell);
+                    }
+
+                    let single_candidate = ParsedPage::IndexLeaf {
+                        cells: target_cells,
+                    };
+                    if single_candidate.fits_in_page(target_child, usable) {
+                        self.write_parsed_page(target_child, &single_candidate)?;
+                        return Ok(None);
+                    }
+                    let ParsedPage::IndexLeaf {
+                        cells: target_cells,
+                    } = single_candidate
+                    else {
+                        unreachable!()
+                    };
+
+                    let m = cells.len();
+                    let (nx_div, n_old) = if m < 2 {
+                        (0usize, 2usize)
+                    } else if idx == 0 {
+                        (0usize, 3usize)
+                    } else if idx == m {
+                        (m - 2, 3usize)
+                    } else {
+                        (idx - 1, 3usize)
+                    };
+
+                    let mut avail_pgnos = Vec::with_capacity(n_old + 2);
+                    let mut all_cells = Vec::new();
+                    let mut target_opt = Some(target_cells);
+                    for sib_slot in nx_div..(nx_div + n_old) {
+                        let sib_pgno = cells.get(sib_slot).map_or(right_child, |c| c.left_child);
+                        avail_pgnos.push(sib_pgno);
+                        if sib_slot == idx {
+                            all_cells.extend(target_opt.take().expect("single idx slot"));
+                        } else {
+                            let ParsedPage::IndexLeaf { cells: sib_cells } =
+                                self.read_parsed_page(sib_pgno)?
+                            else {
+                                return Err(SqliteError::corrupt(
+                                    "expected sibling index leaf page",
+                                ));
+                            };
+                            all_cells.extend(sib_cells);
+                        }
+                        if sib_slot + 1 < nx_div + n_old
+                            && let Some(div) = cells.get(sib_slot)
+                        {
+                            all_cells.push(IndexLeafCell {
+                                total_payload_len: div.total_payload_len,
+                                local_payload: div.local_payload.clone(),
+                                overflow_page: div.overflow_page,
+                            });
+                        }
+                    }
+
+                    let (new_chunks, promoted_divs) =
+                        balance_index_leaf_siblings(all_cells, usable);
+                    let k = new_chunks.len();
+                    while avail_pgnos.len() < k {
+                        avail_pgnos.push(self.allocate_page()?);
+                    }
+                    while avail_pgnos.len() > k {
+                        let extra_pg = avail_pgnos.pop().expect("len > k");
+                        self.free_page(extra_pg)?;
+                    }
+                    avail_pgnos.sort_unstable();
+
+                    for (&out_pgno, chunk) in avail_pgnos.iter().zip(new_chunks) {
+                        self.write_parsed_page(out_pgno, &ParsedPage::IndexLeaf { cells: chunk })?;
+                    }
+
+                    let new_dividers =
+                        promoted_divs
+                            .into_iter()
+                            .enumerate()
+                            .map(|(j, div)| IndexInteriorCell {
+                                left_child: avail_pgnos[j],
+                                total_payload_len: div.total_payload_len,
+                                local_payload: div.local_payload,
+                                overflow_page: div.overflow_page,
+                            });
+                    if nx_div + n_old - 1 < m {
+                        cells[nx_div + n_old - 1].left_child = avail_pgnos[k - 1];
+                        cells.splice(nx_div..(nx_div + n_old - 1), new_dividers);
+                    } else {
+                        cells.splice(nx_div..m, new_dividers);
+                        right_child = avail_pgnos[k - 1];
+                    }
+                } else {
+                    let Some((promoted, new_right_child)) =
+                        self.insert_index_rec(target_child, new_cell, key_vals, orders)?
+                    else {
+                        return Ok(None);
+                    };
+
+                    if idx < cells.len() {
+                        cells[idx].left_child = new_right_child;
+                        cells.insert(
+                            idx,
+                            IndexInteriorCell {
+                                left_child: target_child,
+                                total_payload_len: promoted.total_payload_len,
+                                local_payload: promoted.local_payload,
+                                overflow_page: promoted.overflow_page,
+                            },
+                        );
+                    } else {
+                        cells.push(IndexInteriorCell {
                             left_child: target_child,
                             total_payload_len: promoted.total_payload_len,
                             local_payload: promoted.local_payload,
                             overflow_page: promoted.overflow_page,
-                        },
-                    );
-                } else {
-                    cells.push(IndexInteriorCell {
-                        left_child: target_child,
-                        total_payload_len: promoted.total_payload_len,
-                        local_payload: promoted.local_payload,
-                        overflow_page: promoted.overflow_page,
-                    });
-                    right_child = new_right_child;
+                        });
+                        right_child = new_right_child;
+                    }
                 }
 
                 let candidate = ParsedPage::IndexInterior { cells, right_child };
@@ -1875,7 +2137,7 @@ impl Btree {
                 }
                 ParsedPage::IndexInterior { cells, right_child } => {
                     let mut next_child = right_child;
-                    for c in &cells {
+                    for (ci, c) in cells.iter().enumerate() {
                         let rec = self.read_full_payload(
                             c.total_payload_len,
                             &c.local_payload,
@@ -1883,7 +2145,54 @@ impl Btree {
                         )?;
                         match compare_records_with_encoding(&rec, key_vals, orders, enc)? {
                             Ordering::Less => continue,
-                            Ordering::Equal => return Ok(None), // Interior cell hit -> structural path
+                            Ordering::Equal => {
+                                // Replace interior divider cell in-place with its in-order predecessor
+                                // from the rightmost leaf of `c.left_child` (`btree.c:sqlite3BtreeDelete`)
+                                // whenever that leaf has >= 2 cells and the replacement divider fits!
+                                let div_left_child = c.left_child;
+                                let mut pred_pgno = div_left_child;
+                                let pred_leaf = loop {
+                                    match self.read_parsed_page(pred_pgno)? {
+                                        ParsedPage::IndexInterior {
+                                            right_child: rc, ..
+                                        } => pred_pgno = rc,
+                                        ParsedPage::IndexLeaf { cells: pcells } => break pcells,
+                                        _ => {
+                                            return Err(SqliteError::corrupt(
+                                                "expected index page in predecessor walk",
+                                            ));
+                                        }
+                                    }
+                                };
+                                if pred_leaf.len() >= 2 {
+                                    let mut pred_cells = pred_leaf;
+                                    let pred = pred_cells.pop().expect("len >= 2");
+                                    let mut new_int_cells = cells;
+                                    let old_div = std::mem::replace(
+                                        &mut new_int_cells[ci],
+                                        IndexInteriorCell {
+                                            left_child: div_left_child,
+                                            total_payload_len: pred.total_payload_len,
+                                            local_payload: pred.local_payload,
+                                            overflow_page: pred.overflow_page,
+                                        },
+                                    );
+                                    let cand_int = ParsedPage::IndexInterior {
+                                        cells: new_int_cells,
+                                        right_child,
+                                    };
+                                    if cand_int.fits_in_page(cur_pgno, self.pager.usable_size()) {
+                                        self.free_overflow_chain(old_div.overflow_page)?;
+                                        self.write_parsed_page(
+                                            pred_pgno,
+                                            &ParsedPage::IndexLeaf { cells: pred_cells },
+                                        )?;
+                                        self.write_parsed_page(cur_pgno, &cand_int)?;
+                                        return Ok(Some(true));
+                                    }
+                                }
+                                return Ok(None);
+                            }
                             Ordering::Greater => {
                                 next_child = c.left_child;
                                 break;
@@ -2210,6 +2519,141 @@ impl Btree {
 
         Ok(errors)
     }
+}
+
+fn balance_index_leaf_siblings(
+    cells: Vec<IndexLeafCell>,
+    usable: u32,
+) -> (Vec<Vec<IndexLeafCell>>, Vec<IndexLeafCell>) {
+    let usable_space = (usable as usize).saturating_sub(8);
+    let mut cnt_new: Vec<usize> = Vec::with_capacity(5);
+    let mut sz_new: Vec<usize> = Vec::with_capacity(5);
+
+    let mut start = 0usize;
+    while start < cells.len() {
+        let mut cur_sz = 0usize;
+        let mut j = start;
+        while j < cells.len() {
+            let w = cells[j].encoded_size() + 2;
+            if j > start && cur_sz + w > usable_space {
+                break;
+            }
+            cur_sz += w;
+            j += 1;
+        }
+        cnt_new.push(j);
+        sz_new.push(cur_sz);
+        if j == cells.len() {
+            break;
+        }
+        start = j + 1;
+        if start == cells.len() {
+            cnt_new.push(cells.len());
+            sz_new.push(0);
+            break;
+        }
+    }
+
+    let k = cnt_new.len();
+    for i in (1..k).rev() {
+        let mut sz_right = sz_new[i];
+        let mut sz_left = sz_new[i - 1];
+        let min_left_start = if i > 1 { cnt_new[i - 2] + 1 } else { 0 };
+        let mut d = cnt_new[i - 1];
+        let pad = if i == k - 1 { 0 } else { 2 };
+        while d > min_left_start + 1 {
+            let r = d - 1;
+            let sz_r = cells[r].encoded_size();
+            let sz_d = cells[d].encoded_size();
+            if sz_right != 0
+                && (sz_right + sz_d + 2 > sz_left.saturating_sub(sz_r + pad)
+                    || sz_right + sz_d + 2 > usable_space)
+            {
+                break;
+            }
+            sz_right += sz_d + 2;
+            sz_left -= sz_r + 2;
+            d = r;
+            cnt_new[i - 1] = d;
+        }
+        sz_new[i] = sz_right;
+        sz_new[i - 1] = sz_left;
+    }
+
+    let mut chunks = Vec::with_capacity(k);
+    let mut dividers = Vec::with_capacity(k.saturating_sub(1));
+    let mut rest = cells;
+    let mut prev_start = 0usize;
+    for (idx, end) in cnt_new.into_iter().enumerate() {
+        let take_len = end - prev_start;
+        let mut tail = rest.split_off(take_len);
+        chunks.push(rest);
+        if idx + 1 < k {
+            let after_div = tail.split_off(1);
+            dividers.push(tail.into_iter().next().expect("divider cell exists"));
+            rest = after_div;
+            prev_start = end + 1;
+        } else {
+            rest = tail;
+            prev_start = end;
+        }
+    }
+    (chunks, dividers)
+}
+
+fn balance_table_leaf_siblings(cells: Vec<TableLeafCell>, usable: u32) -> Vec<Vec<TableLeafCell>> {
+    let usable_space = (usable as usize).saturating_sub(8);
+    let mut cnt_new: Vec<usize> = Vec::with_capacity(5);
+    let mut sz_new: Vec<usize> = Vec::with_capacity(5);
+
+    let mut cur_sz = 0usize;
+    for (idx, c) in cells.iter().enumerate() {
+        let w = c.encoded_size() + 2;
+        if idx > *cnt_new.last().unwrap_or(&0) && cur_sz + w > usable_space {
+            cnt_new.push(idx);
+            sz_new.push(cur_sz);
+            cur_sz = 0;
+        }
+        cur_sz += w;
+    }
+    cnt_new.push(cells.len());
+    sz_new.push(cur_sz);
+
+    let k = cnt_new.len();
+    for i in (1..k).rev() {
+        let mut sz_right = sz_new[i];
+        let mut sz_left = sz_new[i - 1];
+        let min_left = if i > 1 { cnt_new[i - 2] } else { 0 };
+        let mut r = cnt_new[i - 1];
+        let pad = if i == k - 1 { 0 } else { 2 };
+        while r > min_left + 1 {
+            let sz_r = cells[r - 1].encoded_size();
+            if sz_right != 0
+                && (sz_right + sz_r + 2 > sz_left.saturating_sub(sz_r + pad)
+                    || sz_right + sz_r + 2 > usable_space)
+            {
+                break;
+            }
+            sz_right += sz_r + 2;
+            sz_left -= sz_r + 2;
+            r -= 1;
+            cnt_new[i - 1] = r;
+        }
+        sz_new[i] = sz_right;
+        sz_new[i - 1] = sz_left;
+    }
+
+    let mut chunks = Vec::with_capacity(k);
+    let mut rest = cells;
+    let mut prev = 0usize;
+    for end in cnt_new {
+        let take_len = end - prev;
+        let tail = rest.split_off(take_len);
+        chunks.push(rest);
+        rest = tail;
+        prev = end;
+    }
+    chunks
 }
 
 fn partition_table_leaf_cells(

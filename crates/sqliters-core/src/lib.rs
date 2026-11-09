@@ -15,7 +15,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use sqliters_btree::{Btree, BtreeCursorState, CursorId};
 pub use sqliters_pager::{
-    DatabaseHeader, JournalMode, LockingMode, WalCheckpointMode, WalCheckpointResult,
+    AutoVacuumMode, DatabaseHeader, JournalMode, LockingMode, WalCheckpointMode,
+    WalCheckpointResult,
 };
 use sqliters_pager::{PagerOpenOptions, TransactionState};
 use sqliters_syntax::{
@@ -26,14 +27,16 @@ use sqliters_types::{
     ConflictResolutionEffect, DatabaseKind, ErrorCode, LockGeometry, Pgno, Result,
     SQLITE_DEFAULT_PAGE_SIZE, SqliteError, Value, extended,
 };
-use sqliters_vdbe::{VdbeProgram, VdbeVm, VmRuntimeContext, VmStep};
+use sqliters_vdbe::{TestFunctionsScope, VdbeProgram, VdbeVm, VmRuntimeContext, VmStep};
 use sqliters_vfs::{MemoryVfs, OpenFlags, OsVfs, Vfs};
 
 use crate::engine::{
     ActivitySummary, BusyPolicy, ExecContext, LeaseCursorSpec, SqlSavepoint, StmtCategory,
     check_deferred_fks, classify_stmt_category, collect_select_referenced_roots,
     commit_transaction, execute_control_stmt, execute_nolock_stmt, execute_read_body,
-    execute_write_body, release_savepoint_op, stmt_requires_schema, validate_and_infer_columns,
+    execute_write_body, parse_auto_vacuum_pragma, parse_incremental_vacuum_limit,
+    release_savepoint_op, stmt_loads_schema_on_prepare, stmt_requires_schema,
+    validate_and_infer_columns,
 };
 pub use engine::{QueryOutput, SQLITE_DEFAULT_WAL_AUTOCHECKPOINT};
 pub use schema::{ColumnSchema, ForeignKeySchema, IndexSchema, Schema, TableSchema};
@@ -367,6 +370,10 @@ enum RunningExec {
         rows: std::vec::IntoIter<Vec<Value>>,
         abort_snapshot: WriteAbortSnapshot,
     },
+    IncrementalVacuum {
+        remaining: u32,
+        abort_snapshot: WriteAbortSnapshot,
+    },
     PendingCommit {
         release_savepoint: Option<String>,
         last_busy: SqliteError,
@@ -417,6 +424,10 @@ struct ConnectionInner {
     count_changes: bool,
     wal_autocheckpoint_threshold: i32,
     default_locking_mode: LockingMode,
+    next_auto_vacuum: Option<AutoVacuumMode>,
+    next_page_size: Option<u32>,
+    writable_schema: bool,
+    working_dir: Option<PathBuf>,
     busy_policy: BusyPolicy,
     rollback_count: u64,
     deferred_fk_suspects: Vec<(String, schema::TableRowKey, usize)>,
@@ -896,6 +907,10 @@ impl ConnectionInner {
                         count_changes: &mut self.count_changes,
                         wal_autocheckpoint_threshold: &mut self.wal_autocheckpoint_threshold,
                         default_locking_mode: &mut self.default_locking_mode,
+                        next_auto_vacuum: &mut self.next_auto_vacuum,
+                        next_page_size: &mut self.next_page_size,
+                        writable_schema: &mut self.writable_schema,
+                        working_dir: &self.working_dir,
                         busy_policy: &mut self.busy_policy,
                         rollback_count: &mut self.rollback_count,
                         deferred_fk_suspects: &mut self.deferred_fk_suspects,
@@ -928,7 +943,7 @@ impl ConnectionInner {
 
                 let retain_read = summary.other_readers > 0;
                 if self.btree.transaction_state() == TransactionState::Write
-                    && let Err(cm_err) = self.btree.pager_mut().commit_retaining_read(retain_read)
+                    && let Err(cm_err) = self.btree.commit_retaining_read(retain_read)
                 {
                     let write_only = !self.schema_changed_in_tx;
                     if let Err(rb_err) = self.btree.rollback_with_trip(
@@ -1034,7 +1049,7 @@ impl ConnectionInner {
                     }
                 } else if self.btree.transaction_state() == TransactionState::Write {
                     let retain_read = summary.other_readers > 0;
-                    if let Err(cm_err) = self.btree.pager_mut().commit_retaining_read(retain_read) {
+                    if let Err(cm_err) = self.btree.commit_retaining_read(retain_read) {
                         let write_only = !self.schema_changed_in_tx;
                         if let Err(rb_err) = self.btree.rollback_with_trip(
                             extended::SQLITE_ABORT_ROLLBACK,
@@ -1145,7 +1160,8 @@ impl ConnectionInner {
             RunningExec::MaterializedNoLock { .. } => {
                 self.finish_activity(hid, ActivityFinish::NoLock, shared)
             }
-            RunningExec::ReturningWrite { abort_snapshot, .. } => self.finish_activity(
+            RunningExec::ReturningWrite { abort_snapshot, .. }
+            | RunningExec::IncrementalVacuum { abort_snapshot, .. } => self.finish_activity(
                 hid,
                 ActivityFinish::WriteCompleted { abort_snapshot },
                 shared,
@@ -1411,6 +1427,10 @@ impl Connection {
             count_changes: false,
             wal_autocheckpoint_threshold: SQLITE_DEFAULT_WAL_AUTOCHECKPOINT,
             default_locking_mode: LockingMode::Normal,
+            next_auto_vacuum: None,
+            next_page_size: None,
+            writable_schema: false,
+            working_dir: None,
             busy_policy: BusyPolicy::default(),
             rollback_count: 0,
             deferred_fk_suspects: Vec::new(),
@@ -1619,6 +1639,58 @@ impl Connection {
         let out = res?;
         fin_res?;
         Ok(out)
+    }
+
+    /// Replaces the `main` database with an in-memory SQLite Format 3 image (`sqlite3_deserialize`).
+    pub fn deserialize(&self, data: &[u8], readonly: bool) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        if !inner.activity.has_no_active_tx() {
+            return Err(SqliteError::new(ErrorCode::Busy, "database is locked"));
+        }
+        if inner.btree.transaction_state() != TransactionState::Open {
+            let _ = inner
+                .btree
+                .rollback_with_trip(extended::SQLITE_ABORT_ROLLBACK, false, false);
+        }
+        inner
+            .btree
+            .pager_mut()
+            .load_deserialized_image(data, readonly)?;
+        inner.btree.set_writable_schema(inner.writable_schema);
+        inner.schema = Schema::default();
+        inner.schema_loaded = false;
+        inner.schema_generation += 1;
+        inner.next_auto_vacuum = None;
+        inner.next_page_size = None;
+        inner.explicit_tx = false;
+        inner.implicit_savepoint_tx = false;
+        inner.in_user_btree_tx = false;
+        inner.savepoints.clear();
+        inner.deferred_fk_suspects.clear();
+        inner.publish(&self.shared);
+        Ok(())
+    }
+
+    /// Sets an optional base working directory used when resolving relative output paths in
+    /// statements such as `VACUUM INTO 'out.db'` inside sandboxed test harnesses.
+    pub fn set_working_dir(&self, dir: Option<PathBuf>) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        inner.working_dir = dir;
+        Ok(())
+    }
+
+    /// Enables or disables `testfixture` SQL scalar functions (`randstr`, `sqlite/src/test_func.c`)
+    /// on this connection.
+    pub fn set_enable_test_functions(&self, enabled: bool) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        inner.runtime.enable_test_functions = enabled;
+        Ok(())
     }
 
     /// Reloads the in-memory schema catalog from Page 1 (`sqlite_schema`).
@@ -2140,9 +2212,16 @@ fn compile_first_sql(
     schema: &Schema,
     foreign_keys: bool,
     count_changes: bool,
+    enable_test_functions: bool,
 ) -> Result<CompiledArtifacts> {
     let (stmt_opt, _) = parse_one(raw_sql)?;
-    compile_parsed_stmt(stmt_opt, schema, foreign_keys, count_changes)
+    compile_parsed_stmt(
+        stmt_opt,
+        schema,
+        foreign_keys,
+        count_changes,
+        enable_test_functions,
+    )
 }
 
 fn compile_parsed_stmt(
@@ -2150,7 +2229,9 @@ fn compile_parsed_stmt(
     schema: &Schema,
     foreign_keys: bool,
     count_changes: bool,
+    enable_test_functions: bool,
 ) -> Result<CompiledArtifacts> {
+    let _tf_guard = TestFunctionsScope::enter(enable_test_functions);
     let Some(stmt) = stmt_opt else {
         return Ok(CompiledArtifacts {
             stmt: None,
@@ -2188,6 +2269,39 @@ fn compile_parsed_stmt(
     })
 }
 
+fn apply_prepare_auto_vacuum_pragma(
+    inner: &mut ConnectionInner,
+    artifacts: &mut CompiledArtifacts,
+) {
+    // `sqlite3Pragma` (`pragma.c:802-845`) updates `nextAutovac` and `sqlite3BtreeSetAutoVacuum`
+    // at `prepare` time, emitting `setMeta6` (`StmtCategory::Write`) only when `ok && e_auto != None`!
+    if let Some(Stmt::Pragma {
+        ref schema,
+        ref name,
+        value: Some(ref pv),
+    }) = artifacts.stmt
+        && name.eq_ignore_ascii_case("auto_vacuum")
+    {
+        if schema
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("temp"))
+        {
+            artifacts.category = Some(StmtCategory::NoLockPragma);
+        } else {
+            let e_auto = parse_auto_vacuum_pragma(pv);
+            inner.next_auto_vacuum = Some(e_auto);
+            let ok = inner.btree.set_configured_auto_vacuum(e_auto);
+            artifacts.category = Some(
+                if ok && matches!(e_auto, AutoVacuumMode::Full | AutoVacuumMode::Incremental) {
+                    StmtCategory::Write
+                } else {
+                    StmtCategory::NoLockPragma
+                },
+            );
+        }
+    }
+}
+
 impl Statement {
     fn prepare_in_session(
         shared: &Arc<ConnectionShared>,
@@ -2200,7 +2314,7 @@ impl Statement {
         let raw_sql = sql[..consumed_len].to_owned();
         let unparsed_tail = tail.to_owned();
 
-        let needs_schema = stmt_opt.as_ref().is_some_and(stmt_requires_schema);
+        let needs_schema = stmt_opt.as_ref().is_some_and(stmt_loads_schema_on_prepare);
         if needs_schema {
             if !inner.schema_loaded {
                 let _ = inner.ensure_schema_loaded_for_prepare()?;
@@ -2209,11 +2323,12 @@ impl Statement {
             }
         }
 
-        let artifacts = match compile_parsed_stmt(
+        let mut artifacts = match compile_parsed_stmt(
             stmt_opt.clone(),
             &inner.schema,
             inner.foreign_keys,
             inner.count_changes,
+            inner.runtime.enable_test_functions,
         ) {
             Ok(a) => a,
             Err(err)
@@ -2228,6 +2343,7 @@ impl Statement {
                         &inner.schema,
                         inner.foreign_keys,
                         inner.count_changes,
+                        inner.runtime.enable_test_functions,
                     )?
                 } else {
                     return Err(err);
@@ -2235,6 +2351,8 @@ impl Statement {
             }
             Err(err) => return Err(err),
         };
+
+        apply_prepare_auto_vacuum_pragma(inner, &mut artifacts);
 
         let hid = inner.register_handle(HandleKind::Statement);
         Ok(Self {
@@ -2299,6 +2417,14 @@ impl Statement {
     #[inline]
     pub fn is_busy(&self) -> bool {
         matches!(self.lifecycle, StatementLifecycle::Running(_))
+    }
+
+    /// Marks this prepared statement as expired (`sqlite3ExpirePreparedStatements`), forcing V2
+    /// statements to reprepare on the next [`Statement::step`] (`PrepareMode::V1` returns
+    /// `ErrorCode::Schema`).
+    #[inline]
+    pub fn expire(&mut self) {
+        self.expired = true;
     }
 
     fn ensure_ready_for_bind(&self) -> Result<()> {
@@ -2495,13 +2621,21 @@ impl Statement {
 
     fn reprepare_in_open_tx(&mut self, inner: &mut ConnectionInner) -> Result<()> {
         for _ in 0..SQLITE_MAX_SCHEMA_RETRY {
-            inner.refresh_schema_in_open_tx()?;
-            let artifacts = compile_first_sql(
+            if inner.btree.transaction_state() != TransactionState::Open {
+                inner.refresh_schema_in_open_tx()?;
+            } else if !inner.schema_loaded
+                && self.stmt.as_ref().is_some_and(stmt_loads_schema_on_prepare)
+            {
+                let _ = inner.ensure_schema_loaded_for_prepare()?;
+            }
+            let mut artifacts = compile_first_sql(
                 &self.raw_sql,
                 &inner.schema,
                 inner.foreign_keys,
                 inner.count_changes,
+                inner.runtime.enable_test_functions,
             )?;
+            apply_prepare_auto_vacuum_pragma(inner, &mut artifacts);
             let mut transferred = vec![Value::Null; artifacts.max_param];
             let copy_len = self.params.len().min(artifacts.max_param);
             transferred[..copy_len].clone_from_slice(&self.params[..copy_len]);
@@ -2573,6 +2707,28 @@ impl Statement {
         shared: &Arc<ConnectionShared>,
         inner: &mut ConnectionInner,
     ) -> Result<StepResult> {
+        if matches!(
+            self.category,
+            Some(
+                StmtCategory::NoLockPragma | StmtCategory::Vacuum | StmtCategory::IncrementalVacuum
+            )
+        ) && self.needs_reprepare(inner)
+        {
+            if self.mode == PrepareMode::V1 {
+                let err = SqliteError::new(ErrorCode::Schema, "database schema has changed");
+                self.lifecycle = StatementLifecycle::Halted {
+                    last_error: Some(err.clone()),
+                };
+                return Err(err);
+            }
+            if let Err(e) = self.reprepare_in_open_tx(inner) {
+                self.lifecycle = StatementLifecycle::Halted {
+                    last_error: Some(e.clone()),
+                };
+                return Err(e);
+            }
+        }
+
         let category = self.category.expect("non-empty statement has category");
 
         match category {
@@ -2599,6 +2755,10 @@ impl Statement {
                         count_changes: &mut inner.count_changes,
                         wal_autocheckpoint_threshold: &mut inner.wal_autocheckpoint_threshold,
                         default_locking_mode: &mut inner.default_locking_mode,
+                        next_auto_vacuum: &mut inner.next_auto_vacuum,
+                        next_page_size: &mut inner.next_page_size,
+                        writable_schema: &mut inner.writable_schema,
+                        working_dir: &inner.working_dir,
                         busy_policy: &mut inner.busy_policy,
                         rollback_count: &mut inner.rollback_count,
                         deferred_fk_suspects: &mut inner.deferred_fk_suspects,
@@ -2666,12 +2826,28 @@ impl Statement {
                         count_changes: &mut inner.count_changes,
                         wal_autocheckpoint_threshold: &mut inner.wal_autocheckpoint_threshold,
                         default_locking_mode: &mut inner.default_locking_mode,
+                        next_auto_vacuum: &mut inner.next_auto_vacuum,
+                        next_page_size: &mut inner.next_page_size,
+                        writable_schema: &mut inner.writable_schema,
+                        working_dir: &inner.working_dir,
                         busy_policy: &mut inner.busy_policy,
                         rollback_count: &mut inner.rollback_count,
                         deferred_fk_suspects: &mut inner.deferred_fk_suspects,
                         publish_mirrors: &mut publish_fn,
                     };
-                    execute_nolock_stmt(&mut ctx, &stmt_clone)
+                    if let Stmt::Pragma {
+                        ref name,
+                        value: Some(_),
+                        ..
+                    } = stmt_clone
+                        && name.eq_ignore_ascii_case("auto_vacuum")
+                    {
+                        // Prepare-time already handled `next_auto_vacuum` and `set_configured_auto_vacuum`;
+                        // when classified as `NoLockPragma`, execution is a 0-op `SQLITE_DONE`!
+                        Ok(QueryOutput::default())
+                    } else {
+                        execute_nolock_stmt(&mut ctx, &stmt_clone)
+                    }
                 };
                 inner.runtime.stmt_timestamp_ms = prev_ts;
                 match res {
@@ -2704,6 +2880,13 @@ impl Statement {
             }
 
             StmtCategory::Vacuum => {
+                let Some(Stmt::Vacuum {
+                    schema: vac_schema,
+                    into: vac_into,
+                }) = self.stmt.clone()
+                else {
+                    unreachable!("StmtCategory::Vacuum requires Stmt::Vacuum");
+                };
                 inner.activity.start(hid, true, true);
                 let summary = inner.activity.summary_excluding(hid);
                 let res = {
@@ -2725,12 +2908,21 @@ impl Statement {
                         count_changes: &mut inner.count_changes,
                         wal_autocheckpoint_threshold: &mut inner.wal_autocheckpoint_threshold,
                         default_locking_mode: &mut inner.default_locking_mode,
+                        next_auto_vacuum: &mut inner.next_auto_vacuum,
+                        next_page_size: &mut inner.next_page_size,
+                        writable_schema: &mut inner.writable_schema,
+                        working_dir: &inner.working_dir,
                         busy_policy: &mut inner.busy_policy,
                         rollback_count: &mut inner.rollback_count,
                         deferred_fk_suspects: &mut inner.deferred_fk_suspects,
                         publish_mirrors: &mut publish_fn,
                     };
-                    engine::exec_vacuum_checked(&mut ctx)
+                    engine::exec_vacuum_checked(
+                        &mut ctx,
+                        vac_schema.as_deref(),
+                        vac_into.as_ref(),
+                        &self.params,
+                    )
                 };
                 inner.activity.remove(hid);
                 if let Some(sim_err) = inner.take_simulated_cleanup_error() {
@@ -2921,6 +3113,10 @@ impl Statement {
                         count_changes: &mut inner.count_changes,
                         wal_autocheckpoint_threshold: &mut inner.wal_autocheckpoint_threshold,
                         default_locking_mode: &mut inner.default_locking_mode,
+                        next_auto_vacuum: &mut inner.next_auto_vacuum,
+                        next_page_size: &mut inner.next_page_size,
+                        writable_schema: &mut inner.writable_schema,
+                        working_dir: &inner.working_dir,
                         busy_policy: &mut inner.busy_policy,
                         rollback_count: &mut inner.rollback_count,
                         deferred_fk_suspects: &mut inner.deferred_fk_suspects,
@@ -2969,6 +3165,153 @@ impl Statement {
                             last_error: Some(e.clone()),
                         };
                         Err(e)
+                    }
+                }
+            }
+
+            StmtCategory::IncrementalVacuum => {
+                let Some(Stmt::Pragma {
+                    ref schema,
+                    ref value,
+                    ..
+                }) = self.stmt
+                else {
+                    unreachable!("StmtCategory::IncrementalVacuum requires Stmt::Pragma");
+                };
+                if schema
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("temp"))
+                {
+                    self.lifecycle = StatementLifecycle::Halted { last_error: None };
+                    return Ok(StepResult::Done);
+                }
+                let mut remaining = parse_incremental_vacuum_limit(value.as_ref());
+
+                let prev_tx_state = inner.btree.transaction_state();
+                let opened_write_here = prev_tx_state != TransactionState::Write;
+                let base_sp_depth = inner.savepoints.len();
+                if opened_write_here {
+                    if let Err(e) = inner.busy_policy.retry_btree(&mut inner.btree, |bt| {
+                        bt.pager_mut()
+                            .begin_write_with_savepoint_depth(base_sp_depth)
+                    }) {
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        return Err(e);
+                    }
+                } else if base_sp_depth > 0
+                    && let Err(e) = inner.btree.pager_mut().ensure_subsavepoints(base_sp_depth)
+                {
+                    self.lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(e.clone()),
+                    };
+                    return Err(e);
+                }
+
+                let pre_summary = inner.activity.summary_excluding(hid);
+                let cleanup_unstarted_write = |inner: &mut ConnectionInner| {
+                    if opened_write_here && pre_summary.other_writers == 0 {
+                        let retain_read = prev_tx_state == TransactionState::Read
+                            || pre_summary.other_readers > 0;
+                        if let Err(rb_err) = inner.btree.rollback_with_trip(
+                            extended::SQLITE_ABORT_ROLLBACK,
+                            true,
+                            retain_read,
+                        ) {
+                            let _ = inner.poison_with(rb_err);
+                        }
+                    }
+                };
+
+                let stmt_sp_slot = if !inner.is_autocommit() || pre_summary.other_writers > 0 {
+                    let slot = inner.savepoints.len();
+                    if let Err(e) = inner.btree.pager_mut().ensure_subsavepoints(slot + 1) {
+                        cleanup_unstarted_write(inner);
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        return Err(e);
+                    }
+                    Some(slot)
+                } else {
+                    None
+                };
+
+                if !inner.is_autocommit() {
+                    inner.in_user_btree_tx = true;
+                }
+
+                let abort_snapshot = WriteAbortSnapshot {
+                    stmt_sp_slot,
+                    fk_before: inner.deferred_fk_suspects.clone(),
+                    rt_before: inner.runtime,
+                    schema_before: inner.schema.clone(),
+                    schema_gen_before: inner.schema_generation,
+                    schema_changed_before: inner.schema_changed_in_tx,
+                };
+
+                inner.activity.start(hid, true, true);
+                if let Err(e) = inner.btree.check_interrupted() {
+                    let final_err = inner.abort_write_statement(hid, &e, abort_snapshot, shared);
+                    self.lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(final_err.clone()),
+                    };
+                    return Err(final_err);
+                }
+
+                if remaining == 0 {
+                    return match inner.finish_activity(
+                        hid,
+                        ActivityFinish::WriteCompleted { abort_snapshot },
+                        shared,
+                    ) {
+                        Ok(()) => {
+                            self.lifecycle = StatementLifecycle::Halted { last_error: None };
+                            Ok(StepResult::Done)
+                        }
+                        Err(e) => {
+                            self.lifecycle = StatementLifecycle::Halted {
+                                last_error: Some(e.clone()),
+                            };
+                            Err(e)
+                        }
+                    };
+                }
+
+                remaining -= 1;
+                match inner.btree.incremental_vacuum_step() {
+                    Ok(true) => {
+                        self.lifecycle =
+                            StatementLifecycle::Running(RunningExec::IncrementalVacuum {
+                                remaining,
+                                abort_snapshot,
+                            });
+                        Ok(StepResult::Row(Row::new(Vec::new())))
+                    }
+                    Ok(false) => match inner.finish_activity(
+                        hid,
+                        ActivityFinish::WriteCompleted { abort_snapshot },
+                        shared,
+                    ) {
+                        Ok(()) => {
+                            self.lifecycle = StatementLifecycle::Halted { last_error: None };
+                            Ok(StepResult::Done)
+                        }
+                        Err(e) => {
+                            self.lifecycle = StatementLifecycle::Halted {
+                                last_error: Some(e.clone()),
+                            };
+                            Err(e)
+                        }
+                    },
+                    Err(err) => {
+                        let final_err =
+                            inner.abort_write_statement(hid, &err, abort_snapshot, shared);
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(final_err.clone()),
+                        };
+                        Err(final_err)
                     }
                 }
             }
@@ -3104,6 +3447,10 @@ impl Statement {
                         count_changes: &mut inner.count_changes,
                         wal_autocheckpoint_threshold: &mut inner.wal_autocheckpoint_threshold,
                         default_locking_mode: &mut inner.default_locking_mode,
+                        next_auto_vacuum: &mut inner.next_auto_vacuum,
+                        next_page_size: &mut inner.next_page_size,
+                        writable_schema: &mut inner.writable_schema,
+                        working_dir: &inner.working_dir,
                         busy_policy: &mut inner.busy_policy,
                         rollback_count: &mut inner.rollback_count,
                         deferred_fk_suspects: &mut inner.deferred_fk_suspects,
@@ -3347,6 +3694,76 @@ impl Statement {
                 }
             }
 
+            RunningExec::IncrementalVacuum {
+                remaining,
+                abort_snapshot,
+            } => {
+                if let Err(e) = inner.btree.check_interrupted() {
+                    let snap = abort_snapshot.clone();
+                    let final_err = inner.abort_write_statement(hid, &e, snap, shared);
+                    self.lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(final_err.clone()),
+                    };
+                    return Err(final_err);
+                }
+
+                if *remaining == 0 {
+                    let snap = abort_snapshot.clone();
+                    return match inner.finish_activity(
+                        hid,
+                        ActivityFinish::WriteCompleted {
+                            abort_snapshot: snap,
+                        },
+                        shared,
+                    ) {
+                        Ok(()) => {
+                            self.lifecycle = StatementLifecycle::Halted { last_error: None };
+                            Ok(StepResult::Done)
+                        }
+                        Err(e) => {
+                            self.lifecycle = StatementLifecycle::Halted {
+                                last_error: Some(e.clone()),
+                            };
+                            Err(e)
+                        }
+                    };
+                }
+
+                *remaining -= 1;
+                match inner.btree.incremental_vacuum_step() {
+                    Ok(true) => Ok(StepResult::Row(Row::new(Vec::new()))),
+                    Ok(false) => {
+                        let snap = abort_snapshot.clone();
+                        match inner.finish_activity(
+                            hid,
+                            ActivityFinish::WriteCompleted {
+                                abort_snapshot: snap,
+                            },
+                            shared,
+                        ) {
+                            Ok(()) => {
+                                self.lifecycle = StatementLifecycle::Halted { last_error: None };
+                                Ok(StepResult::Done)
+                            }
+                            Err(e) => {
+                                self.lifecycle = StatementLifecycle::Halted {
+                                    last_error: Some(e.clone()),
+                                };
+                                Err(e)
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let snap = abort_snapshot.clone();
+                        let final_err = inner.abort_write_statement(hid, &err, snap, shared);
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(final_err.clone()),
+                        };
+                        Err(final_err)
+                    }
+                }
+            }
+
             RunningExec::PendingCommit {
                 release_savepoint,
                 last_busy,
@@ -3372,6 +3789,10 @@ impl Statement {
                         count_changes: &mut inner.count_changes,
                         wal_autocheckpoint_threshold: &mut inner.wal_autocheckpoint_threshold,
                         default_locking_mode: &mut inner.default_locking_mode,
+                        next_auto_vacuum: &mut inner.next_auto_vacuum,
+                        next_page_size: &mut inner.next_page_size,
+                        writable_schema: &mut inner.writable_schema,
+                        working_dir: &inner.working_dir,
                         busy_policy: &mut inner.busy_policy,
                         rollback_count: &mut inner.rollback_count,
                         deferred_fk_suspects: &mut inner.deferred_fk_suspects,
@@ -3440,6 +3861,9 @@ impl Drop for Statement {
 fn collect_stmt_params(stmt: &Stmt, max_idx: &mut usize, named: &mut HashMap<String, usize>) {
     match stmt {
         Stmt::Explain { stmt: inner, .. } => collect_stmt_params(inner, max_idx, named),
+        Stmt::Vacuum {
+            into: Some(expr), ..
+        } => collect_expr_params(expr, max_idx, named),
         Stmt::Select(sel) => collect_select_params(sel, max_idx, named),
         Stmt::CreateTableAs { query, .. } => collect_select_params(query, max_idx, named),
         Stmt::Insert(ins) => {

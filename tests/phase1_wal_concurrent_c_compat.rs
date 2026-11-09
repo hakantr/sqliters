@@ -1601,11 +1601,23 @@ fn c_reference_3_54_1_verification_and_phase1_2_manifest() {
     let test_manifest_path = workspace_root.join("tests/sqlite_test_manifest.json");
     let test_manifest_raw =
         fs::read_to_string(&test_manifest_path).expect("read tests/sqlite_test_manifest.json");
-    let total_wal_wrappers = test_manifest_raw
-        .matches("\"id\": \"sqlite/test/wal")
-        .count();
-    let active_wal_wrappers = test_manifest_raw.matches("\"status\": \"active\"").count();
-    let ignored_wal_wrappers = test_manifest_raw.matches("\"status\": \"ignored\"").count();
+    let mut total_wal_wrappers = 0usize;
+    let mut active_wal_wrappers = 0usize;
+    let mut ignored_wal_wrappers = 0usize;
+    let mut in_wal_entry = false;
+    for line in test_manifest_raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("\"id\": \"sqlite/test/wal") {
+            in_wal_entry = true;
+            total_wal_wrappers += 1;
+        } else if trimmed.starts_with("\"id\": ") {
+            in_wal_entry = false;
+        } else if in_wal_entry && trimmed.starts_with("\"status\": \"active\"") {
+            active_wal_wrappers += 1;
+        } else if in_wal_entry && trimmed.starts_with("\"status\": \"ignored\"") {
+            ignored_wal_wrappers += 1;
+        }
+    }
     assert_eq!(total_wal_wrappers, 43);
     assert!(active_wal_wrappers >= 6);
     assert_eq!(active_wal_wrappers + ignored_wal_wrappers, 43);

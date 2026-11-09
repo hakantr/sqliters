@@ -88,6 +88,8 @@ ROOT_PREFIX: dict[str, str] = {
 # Configured scan rules per phase (`(source_root, glob_pattern, default_phase)`).
 SCAN_RULES: list[tuple[str, str, str]] = [
     ("sqlite/test", "wal*.test", "1.2"),
+    ("sqlite/test", "autovacuum*.test", "1.3"),
+    ("sqlite/test", "incrvacuum*.test", "1.3"),
 ]
 
 # Explicit per-file specification keyed by canonical `id` (`"<source_root>/<relative_path>"`).
@@ -363,6 +365,57 @@ WAL_TEST_SPECS: dict[str, dict[str, Any]] = {
         "required_capabilities": ["wal"],
         "external_dependencies": ["testvfs", "tvfs"],
         "ignore_reason": "requires C testvfs/tvfs VFS callback instrumentation",
+    },
+    # --- Active Phase 1.3 Auto-Vacuum & Incremental-Vacuum suites (100% subtests passing) ---
+    "sqlite/test/autovacuum.test": {
+        "status": "active",
+        "required_capabilities": ["autovacuum", "vacuum"],
+        "external_dependencies": [],
+        "ignore_reason": None,
+        "observed_passed_subtests": 338,
+        "expected_subtest_count": 338,
+    },
+    "sqlite/test/incrvacuum.test": {
+        "status": "active",
+        "required_capabilities": ["autovacuum", "incr_vacuum", "vacuum"],
+        "external_dependencies": [],
+        "ignore_reason": None,
+        "observed_passed_subtests": 164,
+        "expected_subtest_count": 164,
+    },
+    "sqlite/test/incrvacuum3.test": {
+        "status": "active",
+        "required_capabilities": ["autovacuum", "incr_vacuum"],
+        "external_dependencies": [],
+        "ignore_reason": None,
+        "observed_passed_subtests": 52,
+        "expected_subtest_count": 52,
+    },
+    # --- Ignored Auto-Vacuum & Incremental-Vacuum suites with explicit prerequisites ---
+    "sqlite/test/autovacuum2.test": {
+        "status": "ignored",
+        "required_capabilities": ["autovacuum"],
+        "external_dependencies": ["sqlite3_autovacuum_pages"],
+        "ignore_reason": "requires Phase 6 sqlite3_autovacuum_pages Tcl callback",
+    },
+    "sqlite/test/autovacuum_ioerr2.test": {
+        "status": "ignored",
+        "required_capabilities": ["autovacuum"],
+        "external_dependencies": ["do_ioerr_test"],
+        "ignore_reason": "requires C do_ioerr_test I/O fault-simulation harness",
+    },
+    "sqlite/test/incrvacuum2.test": {
+        "status": "ignored",
+        "required_capabilities": ["autovacuum", "incr_vacuum", "wal"],
+        "external_dependencies": ["sqlite3_test_control_pending_byte_while_open"],
+        "ignore_reason": "incrvacuum2.test:277 calls sqlite3_test_control_pending_byte 0x1000000 before reset_db while db is open; Phase 1.1 LockGeometry forbids changing pending-byte while handles are open (all 1.1..5.12 subtests verified in phase1_autovacuum_ptrmap)",
+        "observed_passed_subtests": 20,
+    },
+    "sqlite/test/incrvacuum_ioerr.test": {
+        "status": "ignored",
+        "required_capabilities": ["autovacuum", "incr_vacuum"],
+        "external_dependencies": ["do_ioerr_test"],
+        "ignore_reason": "requires C do_ioerr_test I/O fault-simulation harness",
     },
 }
 

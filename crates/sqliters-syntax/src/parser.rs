@@ -56,6 +56,7 @@ struct Parser<'a> {
     expr_depth: usize,
     max_param_idx: usize,
     named_params: HashMap<String, usize>,
+    in_vacuum_into: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -67,6 +68,7 @@ impl<'a> Parser<'a> {
             expr_depth: 0,
             max_param_idx: 0,
             named_params: HashMap::new(),
+            in_vacuum_into: false,
         }
     }
 
@@ -309,10 +311,43 @@ impl<'a> Parser<'a> {
             TokenKind::Pragma => self.parse_pragma(),
             TokenKind::Vacuum => {
                 self.advance();
-                if Self::can_be_ident(self.peek().kind) {
-                    let _ = self.parse_ident()?;
+                let mut schema = None;
+                let mut into = None;
+                if !self.at(TokenKind::Semi) && !self.at(TokenKind::Eof) {
+                    if self.at(TokenKind::Into) {
+                        if matches!(self.peek_n(1).kind, TokenKind::Semi | TokenKind::Eof) {
+                            let tok = self.advance();
+                            schema = Some(dequote(tok.text));
+                        } else {
+                            self.advance();
+                            self.in_vacuum_into = true;
+                            let res = self.parse_expr();
+                            self.in_vacuum_into = false;
+                            into = Some(res?);
+                        }
+                    } else {
+                        let schema_tok = self.peek();
+                        schema = if schema_tok.kind == TokenKind::StringLiteral {
+                            self.advance();
+                            Some(dequote(schema_tok.text))
+                        } else {
+                            Some(self.parse_ident()?)
+                        };
+                        if self.eat(TokenKind::Into) {
+                            self.in_vacuum_into = true;
+                            let res = self.parse_expr();
+                            self.in_vacuum_into = false;
+                            into = Some(res?);
+                        }
+                    }
                 }
-                Ok(Stmt::Vacuum)
+                if !self.at(TokenKind::Semi) && !self.at(TokenKind::Eof) {
+                    let tok = self.peek();
+                    return Err(
+                        self.syntax_err_at(tok, format!("near \"{}\": syntax error", tok.text))
+                    );
+                }
+                Ok(Stmt::Vacuum { schema, into })
             }
             TokenKind::Analyze => {
                 self.advance();
@@ -1247,12 +1282,17 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select_stmt(&mut self) -> Result<SelectStmt> {
-        let ctes = if self.at(TokenKind::With) {
-            self.parse_with_clause()?
-        } else {
-            Vec::new()
-        };
-        self.parse_select_after_with(ctes)
+        let prev_vac = std::mem::replace(&mut self.in_vacuum_into, false);
+        let res = (|| {
+            let ctes = if self.at(TokenKind::With) {
+                self.parse_with_clause()?
+            } else {
+                Vec::new()
+            };
+            self.parse_select_after_with(ctes)
+        })();
+        self.in_vacuum_into = prev_vac;
+        res
     }
 
     fn parse_select_after_with(&mut self, ctes: Vec<CommonTableExpr>) -> Result<SelectStmt> {
@@ -2092,7 +2132,8 @@ impl<'a> Parser<'a> {
                     let second = self.parse_ident()?;
                     if self.eat(TokenKind::Dot) {
                         let third = self.parse_ident()?;
-                        let tbl_qual = if first.eq_ignore_ascii_case("main") {
+                        let tbl_qual = if first.eq_ignore_ascii_case("main") && !self.in_vacuum_into
+                        {
                             second
                         } else {
                             format!("{first}.{second}")

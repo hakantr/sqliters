@@ -44,7 +44,10 @@ pub enum Stmt {
         name: String,
         value: Option<PragmaValue>,
     },
-    Vacuum,
+    Vacuum {
+        schema: Option<String>,
+        into: Option<Expr>,
+    },
     Analyze(Option<String>),
     Reindex(Option<String>),
 }

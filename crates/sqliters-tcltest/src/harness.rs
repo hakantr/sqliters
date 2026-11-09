@@ -201,6 +201,7 @@ const DEFAULT_HOST_BUILTINS: &[(&str, &str)] = &[
     ("sqlite3_wal_checkpoint_v2", "sqlite3_wal_checkpoint_v2"),
     ("sqlite3_wal_autocheckpoint", "sqlite3_wal_autocheckpoint"),
     ("file_control_persist_wal", "file_control_persist_wal"),
+    ("decode_hexdb", "decode_hexdb"),
     ("sqlite3_db_config", "noop_zero"),
     ("sqlite3_db_config_lookaside", "noop_zero"),
     ("sqlite3_test_control", "noop_zero"),
@@ -250,6 +251,7 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("altertable", true),
     ("autoinc", true),
     ("autoreset", true),
+    ("autovacuum", true),
     ("between_opt", true),
     ("bloblit", true),
     ("bounded_vars", true),
@@ -269,6 +271,7 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("floatingpoint", true),
     ("foreignkey", true),
     ("generated", true),
+    ("incr_vacuum", true),
     ("integrityck", true),
     ("like_match_blobs", true),
     ("like_opt", true),
@@ -297,7 +300,6 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("atomicwrite", false),
     ("attach", false),
     ("auth", false),
-    ("autovacuum", false),
     ("bitvec_test", false),
     ("case_sensitive_like", false),
     ("casesensitivelike", false),
@@ -310,7 +312,6 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("fts5", false),
     ("get_table", false),
     ("icu", false),
-    ("incr_vacuum", false),
     ("incrblob", false),
     ("json", false),
     ("json1", false),
@@ -703,6 +704,7 @@ pub fn bootstrap_tester(
     interp.set_array_entry("cmdlinearg", "maxerror", "1000".to_string());
     interp.set_array_entry("cmdlinearg", "verbose", "0".to_string());
     interp.set_array_entry("cmdlinearg", "testdir", String::new());
+    interp.set_array_entry("G", "savepoint6_iterations", "100".to_string());
 
     for &(cap, enabled) in PHASE1_CAPABILITY_TABLE {
         interp.set_array_entry(
@@ -720,6 +722,8 @@ pub fn bootstrap_tester(
         open_opts,
     )
     .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    let _ = conn.set_working_dir(Some(temp_dir.to_path_buf()));
+    let _ = conn.set_enable_test_functions(true);
 
     let (_, ptr_token) = host.borrow_mut().register_new_db("db".to_string(), conn);
     let _ = interp.set_var("DB", ptr_token);
@@ -1069,6 +1073,7 @@ fn dispatch_host_builtin(
         "sqlite3_wal_checkpoint_v2" => cmd_wal_checkpoint_v2(host, args),
         "sqlite3_wal_autocheckpoint" => cmd_wal_autocheckpoint(host, args),
         "file_control_persist_wal" => cmd_file_control_persist_wal(host, invoked_name, args),
+        "decode_hexdb" => cmd_decode_hexdb(args),
         "noop_zero" => Ok("0".to_string()),
         _ => Err(TclControl::Error(format!(
             "invalid command name \"{invoked_name}\""
@@ -1159,6 +1164,8 @@ fn open_db_cmd(host: &SharedHost, interp: &mut TclInterp, args: &[String]) -> Tc
         Connection::open_with_options(resolved, flags, opts)
             .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?
     };
+    let _ = conn.set_working_dir(Some(interp.cwd.clone()));
+    let _ = conn.set_enable_test_functions(true);
 
     // Per `tclsqlite.c:DbMain`, only after the new connection opens successfully do we
     // replace any existing Tcl command of the same name (running its delete hook once).
@@ -1291,6 +1298,7 @@ fn dispatch_db_method(
             Ok(String::new())
         }
         "status" => Ok("0".to_string()),
+        "deserialize" => db_deserialize_cmd(host, db_name, db_id, &args[1..]),
         "cache"
         | "config"
         | "busy"
@@ -2349,6 +2357,8 @@ fn cmd_reset_db(host: &SharedHost, interp: &mut TclInterp) -> TclResult<String> 
     let conn =
         Connection::open_with_options(db_path, OpenFlags::READWRITE | OpenFlags::CREATE, opts)
             .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    let _ = conn.set_working_dir(Some(interp.cwd.clone()));
+    let _ = conn.set_enable_test_functions(true);
 
     interp.remove_non_host_cmd("db");
     let (new_db_id, ptr_token) = host.borrow_mut().register_new_db("db".to_string(), conn);
@@ -3138,6 +3148,148 @@ fn cmd_hexio_write(interp: &TclInterp, args: &[String]) -> TclResult<String> {
     f.write_all(&bytes)
         .map_err(|e| TclControl::Error(e.to_string()))?;
     Ok(bytes.len().to_string())
+}
+
+/// Implements `decode_hexdb HEXDB` (`sqlite/src/test1.c:9085-9149`), returning a 1-char-per-byte
+/// Latin-1 string matching `cmd_binary`.
+fn cmd_decode_hexdb(args: &[String]) -> TclResult<String> {
+    if args.len() != 1 {
+        return Err(TclControl::Error(
+            "wrong # args: should be \"decode_hexdb HEXDB\"".to_string(),
+        ));
+    }
+    let mut buf: Option<Vec<u8>> = None;
+    let mut i_offset: i64 = 0;
+
+    for raw_line in args[0].lines() {
+        let line = raw_line.trim_start_matches([' ', '\t']);
+        let Some(rest) = line.strip_prefix('|') else {
+            continue;
+        };
+        if buf.is_none() {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 4
+                && parts[0] == "size"
+                && parts[2] == "pagesize"
+                && let (Ok(n_raw), Ok(pgsz)) = (parts[1].parse::<i64>(), parts[3].parse::<i64>())
+            {
+                if !(512..=65536).contains(&pgsz) || (pgsz & (pgsz - 1)) != 0 {
+                    return Err(TclControl::Error("bad 'pagesize' field".to_string()));
+                }
+                let n = (n_raw + pgsz - 1) & !(pgsz - 1);
+                if n < 512 {
+                    return Err(TclControl::Error("bad 'size' field".to_string()));
+                }
+                buf = Some(vec![0u8; n as usize]);
+            }
+            continue;
+        }
+
+        let a = buf.as_mut().expect("allocated above");
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        if parts.len() >= 4
+            && parts[0] == "page"
+            && parts[2] == "offset"
+            && parts[1].parse::<i64>().is_ok()
+            && let Ok(k) = parts[3].parse::<i64>()
+        {
+            i_offset = k;
+            continue;
+        }
+
+        if let Some((before_colon, after_colon)) = rest.split_once(':')
+            && let Ok(j) = before_colon.trim().parse::<i64>()
+        {
+            let mut hex_vals = [0u8; 16];
+            let mut parsed_count = 0usize;
+            for tok in after_colon.split_whitespace() {
+                if parsed_count == 16 {
+                    break;
+                }
+                let clean = tok.strip_prefix("0x").unwrap_or(tok);
+                if let Ok(v) = u32::from_str_radix(clean, 16) {
+                    hex_vals[parsed_count] = (v & 0xff) as u8;
+                    parsed_count += 1;
+                } else {
+                    break;
+                }
+            }
+            if parsed_count == 16 {
+                let k = i_offset + j;
+                if k >= 0 && (k as usize) + 16 <= a.len() {
+                    let start = k as usize;
+                    a[start..start + 16].copy_from_slice(&hex_vals);
+                }
+            }
+        }
+    }
+
+    let bytes = buf.unwrap_or_default();
+    Ok(bytes.into_iter().map(char::from).collect())
+}
+
+/// Implements `$db deserialize ?-maxsize N? ?-readonly BOOL? ?DATABASE? VALUE`
+/// (`sqlite/src/tclsqlite.c:3187-3260`).
+fn db_deserialize_cmd(
+    host: &SharedHost,
+    db_name: &str,
+    db_id: DbId,
+    args: &[String],
+) -> TclResult<String> {
+    if args.is_empty() {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{db_name} deserialize ?DATABASE? VALUE\""
+        )));
+    }
+    let mut schema: Option<&str> = None;
+    let mut readonly = false;
+    let mut i = 0usize;
+    while i + 1 < args.len() {
+        let z = args[i].as_str();
+        if z == "-maxsize" && i + 2 < args.len() {
+            let _mx = parse_tcl_int(args[i + 1].trim()).ok_or_else(|| {
+                TclControl::Error(format!("expected integer but got \"{}\"", args[i + 1]))
+            })?;
+            i += 2;
+            continue;
+        }
+        if z == "-readonly" && i + 2 < args.len() {
+            readonly = parse_tcl_bool(&args[i + 1]).map_err(TclControl::Error)?;
+            i += 2;
+            continue;
+        }
+        if schema.is_none() && i + 2 == args.len() && !z.starts_with('-') {
+            schema = Some(z);
+            i += 1;
+            continue;
+        }
+        return Err(TclControl::Error(format!("unknown option: {z}")));
+    }
+
+    if let Some(s) = schema
+        && !s.is_empty()
+        && !s.eq_ignore_ascii_case("main")
+    {
+        return Err(TclControl::Error("unable to set MEMDB content".to_string()));
+    }
+
+    let val_str = &args[args.len() - 1];
+    let data: Vec<u8> = val_str.chars().map(|ch| (ch as u32 & 0xff) as u8).collect();
+    let (conn, _) = checkout_db_conn(host, db_id)?;
+    let res = conn.deserialize(&data, readonly);
+    drop(conn);
+    match res {
+        Ok(()) => {
+            host.borrow_mut().clear_db_error(db_id);
+            Ok(String::new())
+        }
+        Err(e) => {
+            let msg = sqlite_err_text(&e);
+            host.borrow_mut()
+                .set_db_error(db_id, e.code as i32, e.extended_code, msg);
+            Err(TclControl::Error("unable to set MEMDB content".to_string()))
+        }
+    }
 }
 
 fn cmd_randstr(host: &SharedHost, args: &[String]) -> TclResult<String> {

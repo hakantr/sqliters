@@ -1,9 +1,33 @@
 //! Built-in SQLite scalar functions, `LIKE` / `GLOB` pattern matcher, and aggregate accumulators
 //! ported from `sqlite/src/func.c`.
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+thread_local! {
+    static TEST_FUNCTIONS_ENABLED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII guard enabling `testfixture` SQL functions (`randstr`) during `prepare` on connections
+/// configured with `enable_test_functions`.
+pub struct TestFunctionsScope {
+    prev: bool,
+}
+
+impl TestFunctionsScope {
+    pub fn enter(enabled: bool) -> Self {
+        let prev = TEST_FUNCTIONS_ENABLED.with(|c| c.replace(enabled));
+        Self { prev }
+    }
+}
+
+impl Drop for TestFunctionsScope {
+    fn drop(&mut self) {
+        TEST_FUNCTIONS_ENABLED.with(|c| c.set(self.prev));
+    }
+}
 
 static PRNG_STATE: AtomicU64 = AtomicU64::new(0);
 
@@ -38,6 +62,8 @@ pub struct VmRuntimeContext {
     pub total_changes: u64,
     /// UTC Unix epoch milliseconds captured at the start of statement execution (`sqlite3StmtCurrentTime`).
     pub stmt_timestamp_ms: Option<i64>,
+    /// Enables `testfixture` SQL functions (`randstr`, `sqlite/src/test_func.c`).
+    pub enable_test_functions: bool,
 }
 
 impl VmRuntimeContext {
@@ -379,6 +405,36 @@ pub fn eval_scalar_function(name: &str, args: &[Value], ctx: &VmRuntimeContext) 
             }
             Ok(Value::Blob(buf))
         }
+        "RANDSTR" if ctx.enable_test_functions => {
+            check_arity(name, args, 2, 2)?;
+            const Z_SRC: &[u8] =
+                b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-!,:*^+=_|?/<> ";
+            let mut i_min = args[0].to_integer_lossy().clamp(0, 999) as usize;
+            let mut i_max = args[1].to_integer_lossy();
+            if i_max < i_min as i64 {
+                i_max = i_min as i64;
+            }
+            let i_max = i_max.min(999) as usize;
+            if i_min > i_max {
+                i_min = i_max;
+            }
+            let mut n = i_min;
+            if i_max > i_min {
+                let r = (next_prng_u64() as u32) & 0x7fff_ffff;
+                n += (r as usize) % (i_max + 1 - i_min);
+            }
+            let mut out = String::with_capacity(n);
+            let mut rem = n;
+            while rem > 0 {
+                let bytes = next_prng_u64().to_le_bytes();
+                let take = rem.min(8);
+                for &b in &bytes[..take] {
+                    out.push(Z_SRC[(b as usize) % Z_SRC.len()] as char);
+                }
+                rem -= take;
+            }
+            Ok(Value::Text(out))
+        }
         "ROUND" => {
             check_arity(name, args, 1, 2)?;
             if args[0].is_null() || (args.len() == 2 && args[1].is_null()) {
@@ -536,6 +592,7 @@ fn scalar_function_arity(upper: &str) -> Option<(usize, usize)> {
         | "TOTAL_CHANGES" | "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" => Some((0, 0)),
         "COALESCE" => Some((2, usize::MAX)),
         "IFNULL" | "NULLIF" | "INSTR" | "GLOB" => Some((2, 2)),
+        "RANDSTR" if TEST_FUNCTIONS_ENABLED.with(Cell::get) => Some((2, 2)),
         "IIF" | "REPLACE" => Some((3, 3)),
         "TRIM" | "LTRIM" | "RTRIM" | "ROUND" => Some((1, 2)),
         "SUBSTR" | "SUBSTRING" | "LIKE" => Some((2, 3)),

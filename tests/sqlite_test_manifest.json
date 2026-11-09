@@ -7,11 +7,159 @@
     "sqlite/ext/rtree"
   ],
   "summary": {
-    "total_registered": 43,
-    "active": 6,
-    "ignored": 37
+    "total_registered": 50,
+    "active": 9,
+    "ignored": 41
   },
   "tests": [
+    {
+      "id": "sqlite/test/autovacuum.test",
+      "source_root": "sqlite/test",
+      "relative_path": "autovacuum.test",
+      "source_path": "sqlite/test/autovacuum.test",
+      "sha256": "634854ef65b56417376c1de9259bef48239e0ed341e0356c0ee781c9c9e56021",
+      "wrapper_path": "tests/sqlite_test/autovacuum.rs",
+      "module_name": "autovacuum",
+      "test_fn": "test_autovacuum",
+      "phase": "1.3",
+      "required_capabilities": [
+        "autovacuum",
+        "vacuum"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 338,
+      "expected_subtest_count": 338
+    },
+    {
+      "id": "sqlite/test/autovacuum2.test",
+      "source_root": "sqlite/test",
+      "relative_path": "autovacuum2.test",
+      "source_path": "sqlite/test/autovacuum2.test",
+      "sha256": "4deca53ee6b88fb67e60482a1f6df0dd9805605813dcbac3c81ce9d51e8b0691",
+      "wrapper_path": "tests/sqlite_test/autovacuum2.rs",
+      "module_name": "autovacuum2",
+      "test_fn": "test_autovacuum2",
+      "phase": "1.3",
+      "required_capabilities": [
+        "autovacuum"
+      ],
+      "external_dependencies": [
+        "sqlite3_autovacuum_pages"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires Phase 6 sqlite3_autovacuum_pages Tcl callback",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 8
+    },
+    {
+      "id": "sqlite/test/autovacuum_ioerr2.test",
+      "source_root": "sqlite/test",
+      "relative_path": "autovacuum_ioerr2.test",
+      "source_path": "sqlite/test/autovacuum_ioerr2.test",
+      "sha256": "32066a900dc43c503fceb73bceef92a5bf61e36e818c65f91b4ffe16b4036e4c",
+      "wrapper_path": "tests/sqlite_test/autovacuum_ioerr2.rs",
+      "module_name": "autovacuum_ioerr2",
+      "test_fn": "test_autovacuum_ioerr2",
+      "phase": "1.3",
+      "required_capabilities": [
+        "autovacuum"
+      ],
+      "external_dependencies": [
+        "do_ioerr_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C do_ioerr_test I/O fault-simulation harness",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/test/incrvacuum.test",
+      "source_root": "sqlite/test",
+      "relative_path": "incrvacuum.test",
+      "source_path": "sqlite/test/incrvacuum.test",
+      "sha256": "3bb20e699b1a7f5e4787d5a7f98cec6b7cdf306916fec654235020b70c2a1d82",
+      "wrapper_path": "tests/sqlite_test/incrvacuum.rs",
+      "module_name": "incrvacuum",
+      "test_fn": "test_incrvacuum",
+      "phase": "1.3",
+      "required_capabilities": [
+        "autovacuum",
+        "incr_vacuum",
+        "vacuum"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 164,
+      "expected_subtest_count": 164
+    },
+    {
+      "id": "sqlite/test/incrvacuum2.test",
+      "source_root": "sqlite/test",
+      "relative_path": "incrvacuum2.test",
+      "source_path": "sqlite/test/incrvacuum2.test",
+      "sha256": "3411133f3aeb4905c61d8e2c1c76599b17f4642394b116353cbd2f188d5b1532",
+      "wrapper_path": "tests/sqlite_test/incrvacuum2.rs",
+      "module_name": "incrvacuum2",
+      "test_fn": "test_incrvacuum2",
+      "phase": "1.3",
+      "required_capabilities": [
+        "autovacuum",
+        "incr_vacuum",
+        "wal"
+      ],
+      "external_dependencies": [
+        "sqlite3_test_control_pending_byte_while_open"
+      ],
+      "status": "ignored",
+      "ignore_reason": "incrvacuum2.test:277 calls sqlite3_test_control_pending_byte 0x1000000 before reset_db while db is open; Phase 1.1 LockGeometry forbids changing pending-byte while handles are open (all 1.1..5.12 subtests verified in phase1_autovacuum_ptrmap)",
+      "observed_passed_subtests": 20,
+      "expected_subtest_count": 29
+    },
+    {
+      "id": "sqlite/test/incrvacuum3.test",
+      "source_root": "sqlite/test",
+      "relative_path": "incrvacuum3.test",
+      "source_path": "sqlite/test/incrvacuum3.test",
+      "sha256": "b481339b0fb145364533a848f56fc19a8e27efca048ba9a71ddeab2093bae56a",
+      "wrapper_path": "tests/sqlite_test/incrvacuum3.rs",
+      "module_name": "incrvacuum3",
+      "test_fn": "test_incrvacuum3",
+      "phase": "1.3",
+      "required_capabilities": [
+        "autovacuum",
+        "incr_vacuum"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 52,
+      "expected_subtest_count": 52
+    },
+    {
+      "id": "sqlite/test/incrvacuum_ioerr.test",
+      "source_root": "sqlite/test",
+      "relative_path": "incrvacuum_ioerr.test",
+      "source_path": "sqlite/test/incrvacuum_ioerr.test",
+      "sha256": "4d5590fb9df257262f7081021df70ab9da8ad5adc9eea1949ffca66e7279dff0",
+      "wrapper_path": "tests/sqlite_test/incrvacuum_ioerr.rs",
+      "module_name": "incrvacuum_ioerr",
+      "test_fn": "test_incrvacuum_ioerr",
+      "phase": "1.3",
+      "required_capabilities": [
+        "autovacuum",
+        "incr_vacuum"
+      ],
+      "external_dependencies": [
+        "do_ioerr_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C do_ioerr_test I/O fault-simulation harness",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 4
+    },
     {
       "id": "sqlite/test/wal.test",
       "source_root": "sqlite/test",

@@ -396,11 +396,6 @@ impl Btree {
                     page_bytes[3],
                 ]);
                 if next_ovfl != 0 {
-                    if next_ovfl > self.pager.page_count() {
-                        return Err(SqliteError::corrupt(format!(
-                            "relocated overflow page {from_pgno} links to out-of-range page {next_ovfl}"
-                        )));
-                    }
                     self.ptrmap_put(next_ovfl, PtrmapType::Overflow2, to_pgno)?;
                 }
             }

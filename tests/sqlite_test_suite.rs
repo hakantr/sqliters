@@ -22,6 +22,15 @@ mod alter4;
 #[path = "sqlite_test/autoinc.rs"]
 mod autoinc;
 #[allow(non_snake_case)]
+#[path = "sqlite_test/autovacuum.rs"]
+mod autovacuum;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/autovacuum2.rs"]
+mod autovacuum2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/autovacuum_ioerr2.rs"]
+mod autovacuum_ioerr2;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/between.rs"]
 mod between;
 #[allow(non_snake_case)]
@@ -207,6 +216,18 @@ mod in6;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/in7.rs"]
 mod in7;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/incrvacuum.rs"]
+mod incrvacuum;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/incrvacuum2.rs"]
+mod incrvacuum2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/incrvacuum3.rs"]
+mod incrvacuum3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/incrvacuum_ioerr.rs"]
+mod incrvacuum_ioerr;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/index.rs"]
 mod index;

@@ -13,9 +13,10 @@ use sqliters_types::{
 };
 
 pub use functions::{
-    AggregateAccumulator, AggregateKind, VmRuntimeContext, eval_scalar_function, format_utc_date,
-    format_utc_time, format_utc_timestamp, parse_escape_char, sqlite_glob_match, sqlite_like_match,
-    system_utc_millis, utc_ymdhms_from_unix_ms, validate_function_call,
+    AggregateAccumulator, AggregateKind, TestFunctionsScope, VmRuntimeContext,
+    eval_scalar_function, format_utc_date, format_utc_time, format_utc_timestamp,
+    parse_escape_char, sqlite_glob_match, sqlite_like_match, system_utc_millis,
+    utc_ymdhms_from_unix_ms, validate_function_call,
 };
 
 /// Fourth operand (`P4`) payload for a VDBE instruction (`p4union` in `sqlite/src/vdbe.h`).

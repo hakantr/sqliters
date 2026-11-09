@@ -53,6 +53,8 @@ pub const CORE_SQL_FAMILIES: &[&str] = &[
     "enc",
     "lock",
     "wal",
+    "autovacuum",
+    "incrvacuum",
 ];
 
 pub const CORE_SQL_EXACT: &[&str] = &[
@@ -96,16 +98,18 @@ fn infer_source_root(path: &Path) -> &'static str {
 #[derive(Debug, Clone)]
 struct ManifestEntryInfo {
     source_path: PathBuf,
+    target_phase: String,
     status: String,
     ignore_reason: String,
 }
 
-fn load_manifest_entries() -> Vec<ManifestEntryInfo> {
-    let Ok(raw) = fs::read_to_string("tests/sqlite_test_manifest.json") else {
+fn load_manifest_entries(manifest_path: &Path) -> Vec<ManifestEntryInfo> {
+    let Ok(raw) = fs::read_to_string(manifest_path) else {
         return Vec::new();
     };
     let mut entries = Vec::new();
     let mut cur_path: Option<PathBuf> = None;
+    let mut cur_phase = String::new();
     let mut cur_status = String::new();
     let mut cur_reason = String::new();
 
@@ -122,6 +126,11 @@ fn load_manifest_entries() -> Vec<ManifestEntryInfo> {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("\"source_path\":") {
             cur_path = Some(PathBuf::from(extract_str(rest)));
+        } else if let Some(rest) = trimmed
+            .strip_prefix("\"phase\":")
+            .or_else(|| trimmed.strip_prefix("\"target_phase\":"))
+        {
+            cur_phase = extract_str(rest);
         } else if let Some(rest) = trimmed.strip_prefix("\"status\":") {
             cur_status = extract_str(rest);
         } else if let Some(rest) = trimmed.strip_prefix("\"ignore_reason\":") {
@@ -132,10 +141,12 @@ fn load_manifest_entries() -> Vec<ManifestEntryInfo> {
             if p.exists() {
                 entries.push(ManifestEntryInfo {
                     source_path: p,
+                    target_phase: std::mem::take(&mut cur_phase),
                     status: std::mem::take(&mut cur_status),
                     ignore_reason: std::mem::take(&mut cur_reason),
                 });
             } else {
+                cur_phase.clear();
                 cur_status.clear();
                 cur_reason.clear();
             }
@@ -147,12 +158,18 @@ fn load_manifest_entries() -> Vec<ManifestEntryInfo> {
 fn collect_test_files(
     args: &[String],
     manifest_only: bool,
+    phase_filter: Option<&str>,
     manifest: &[ManifestEntryInfo],
 ) -> Vec<PathBuf> {
-    if manifest_only {
+    if manifest_only || phase_filter.is_some() {
         let mut out: Vec<PathBuf> = manifest
             .iter()
             .filter(|e| {
+                if let Some(ph) = phase_filter
+                    && e.target_phase != ph
+                {
+                    return false;
+                }
                 args.is_empty()
                     || args.iter().any(|f| {
                         e.source_path
@@ -231,22 +248,59 @@ fn main() {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let mut verbose = false;
     let mut manifest_only = false;
+    let mut manifest_path = PathBuf::from("tests/sqlite_test_manifest.json");
+    let mut phase_filter: Option<String> = None;
     let mut run_ignored = false;
     let mut filter_args = Vec::new();
-    for a in raw_args {
+    let mut idx = 0usize;
+    while idx < raw_args.len() {
+        let a = &raw_args[idx];
         if a == "-v" || a == "--verbose" {
             verbose = true;
+            idx += 1;
         } else if a == "--manifest" {
             manifest_only = true;
+            if idx + 1 < raw_args.len()
+                && !raw_args[idx + 1].starts_with('-')
+                && raw_args[idx + 1].ends_with(".json")
+            {
+                manifest_path = PathBuf::from(&raw_args[idx + 1]);
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+        } else if let Some(p) = a.strip_prefix("--manifest=") {
+            manifest_only = true;
+            manifest_path = PathBuf::from(p);
+            idx += 1;
+        } else if a == "--phase" {
+            manifest_only = true;
+            if idx + 1 < raw_args.len() {
+                phase_filter = Some(raw_args[idx + 1].clone());
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+        } else if let Some(ph) = a.strip_prefix("--phase=") {
+            manifest_only = true;
+            phase_filter = Some(ph.to_owned());
+            idx += 1;
         } else if a == "--run-ignored" {
             run_ignored = true;
+            idx += 1;
         } else {
-            filter_args.push(a);
+            filter_args.push(a.clone());
+            idx += 1;
         }
     }
 
-    let manifest = load_manifest_entries();
-    let files = collect_test_files(&filter_args, manifest_only, &manifest);
+    let manifest = load_manifest_entries(&manifest_path);
+    let files = collect_test_files(
+        &filter_args,
+        manifest_only,
+        phase_filter.as_deref(),
+        &manifest,
+    );
     let total_files = files.len();
     if total_files == 0 {
         eprintln!("No matching .test files found.");

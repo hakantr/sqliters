@@ -4,9 +4,10 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
-use sqliters_btree::Btree;
+use sqliters_btree::{Btree, RootPageMove};
 use sqliters_pager::{
-    JournalMode, LockingMode, TransactionState, WalCheckpointMode, WalCheckpointResult,
+    AutoVacuumMode, JournalMode, LockingMode, TransactionState, WalCheckpointMode,
+    WalCheckpointResult,
 };
 use sqliters_syntax::{
     AlterTableAction, BinaryOp, BindParam, ColumnDef, CommonTableExpr, CompoundOp, ConflictAction,
@@ -170,6 +171,10 @@ pub struct ExecContext<'a> {
     pub count_changes: &'a mut bool,
     pub wal_autocheckpoint_threshold: &'a mut i32,
     pub default_locking_mode: &'a mut LockingMode,
+    pub next_auto_vacuum: &'a mut Option<AutoVacuumMode>,
+    pub next_page_size: &'a mut Option<u32>,
+    pub writable_schema: &'a mut bool,
+    pub working_dir: &'a Option<std::path::PathBuf>,
     pub busy_policy: &'a mut BusyPolicy,
     pub rollback_count: &'a mut u64,
     pub deferred_fk_suspects: &'a mut Vec<(String, TableRowKey, usize)>,
@@ -351,11 +356,28 @@ pub(crate) enum StmtCategory {
     Read,
     /// `INSERT`, `UPDATE`, `DELETE`, DDL, `REINDEX`, and header-writing `PRAGMA`s
     Write,
-    /// `VACUUM`
+    /// Streaming `PRAGMA [schema.]incremental_vacuum[(N)]`
+    IncrementalVacuum,
+    /// `VACUUM [schema] [INTO expr]`
     Vacuum,
 }
 
-/// Returns `true` when `stmt` requires `sqlite_schema` to be loaded (`PragFlg_NeedSchema` / `prepare.c`).
+/// Returns `true` when `stmt` must load `sqlite_schema` at `prepare` time (`PragFlg_NeedSchema` / `prepare.c`).
+pub(crate) fn stmt_loads_schema_on_prepare(stmt: &Stmt) -> bool {
+    if stmt_requires_schema(stmt) {
+        return true;
+    }
+    matches!(
+        stmt,
+        Stmt::Pragma { name, .. }
+            if matches!(
+                name.to_ascii_uppercase().as_str(),
+                "AUTO_VACUUM" | "INCREMENTAL_VACUUM" | "DEFAULT_CACHE_SIZE"
+            )
+    )
+}
+
+/// Returns `true` when `stmt` verifies `sqlite_schema` cookie on `step()` (`OP_Transaction` `P3 != 0`).
 pub(crate) fn stmt_requires_schema(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Begin { .. }
@@ -378,6 +400,48 @@ pub(crate) fn stmt_requires_schema(stmt: &Stmt) -> bool {
     }
 }
 
+/// Parses `PRAGMA auto_vacuum = <val>` matching `getAutoVacuum` (`sqlite/src/pragma.c:125-132`).
+pub(crate) fn parse_auto_vacuum_pragma(pv: &PragmaValue) -> AutoVacuumMode {
+    match pv {
+        PragmaValue::Integer(1) => AutoVacuumMode::Full,
+        PragmaValue::Integer(2) => AutoVacuumMode::Incremental,
+        PragmaValue::Integer(_) => AutoVacuumMode::None,
+        PragmaValue::Ident(s) | PragmaValue::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.eq_ignore_ascii_case("none") {
+                return AutoVacuumMode::None;
+            }
+            if trimmed.eq_ignore_ascii_case("full") {
+                return AutoVacuumMode::Full;
+            }
+            if trimmed.eq_ignore_ascii_case("incremental") {
+                return AutoVacuumMode::Incremental;
+            }
+            match trimmed.parse::<i32>() {
+                Ok(1) => AutoVacuumMode::Full,
+                Ok(2) => AutoVacuumMode::Incremental,
+                _ => AutoVacuumMode::None,
+            }
+        }
+    }
+}
+
+/// Parses `PRAGMA incremental_vacuum[(N) | = N]` matching `sqlite3GetInt32` in `pragma.c:856-859`:
+/// omitted, non-integer, out-of-`i32`-range, or `<= 0` all map to `i32::MAX as u32` (`0x7fff_ffff`).
+pub(crate) fn parse_incremental_vacuum_limit(value: Option<&PragmaValue>) -> u32 {
+    let Some(pv) = value else {
+        return i32::MAX as u32;
+    };
+    let parsed_i32: Option<i32> = match pv {
+        PragmaValue::Integer(i) => i32::try_from(*i).ok(),
+        PragmaValue::Ident(s) | PragmaValue::String(s) => s.trim().parse::<i32>().ok(),
+    };
+    match parsed_i32 {
+        Some(n) if n > 0 => n as u32,
+        _ => i32::MAX as u32,
+    }
+}
+
 /// Classifies `stmt` into its execution lease category.
 pub(crate) fn classify_stmt_category(stmt: &Stmt) -> StmtCategory {
     match stmt {
@@ -387,15 +451,27 @@ pub(crate) fn classify_stmt_category(stmt: &Stmt) -> StmtCategory {
         | Stmt::Savepoint(_)
         | Stmt::Release(_) => StmtCategory::Control,
         Stmt::Analyze(_) => StmtCategory::NoLockPragma,
-        Stmt::Vacuum => StmtCategory::Vacuum,
+        Stmt::Vacuum { .. } => StmtCategory::Vacuum,
         Stmt::Select(_) | Stmt::Explain { .. } => StmtCategory::Read,
-        Stmt::Pragma { name, value, .. } => match name.to_ascii_uppercase().as_str() {
+        Stmt::Pragma {
+            schema,
+            name,
+            value,
+        } => match name.to_ascii_uppercase().as_str() {
             "INTEGRITY_CHECK" | "QUICK_CHECK" | "PAGE_COUNT" | "FREELIST_COUNT"
             | "SCHEMA_VERSION" | "FOREIGN_KEY_LIST" | "FOREIGN_KEY_CHECK" | "TABLE_INFO"
             | "INDEX_LIST" | "INDEX_INFO" => StmtCategory::Read,
-            "USER_VERSION" | "APPLICATION_ID" => {
+            "INCREMENTAL_VACUUM" => StmtCategory::IncrementalVacuum,
+            "USER_VERSION" | "APPLICATION_ID" | "DEFAULT_CACHE_SIZE" => {
                 if value.is_some() {
-                    StmtCategory::Write
+                    if schema
+                        .as_deref()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("temp"))
+                    {
+                        StmtCategory::NoLockPragma
+                    } else {
+                        StmtCategory::Write
+                    }
                 } else {
                     StmtCategory::Read
                 }
@@ -450,7 +526,7 @@ pub(crate) fn commit_transaction(ctx: &mut ExecContext<'_>) -> Result<()> {
             }
         }
         TransactionState::Write => {
-            ctx.btree.pager_mut().commit_retaining_read(retain_read)?;
+            ctx.btree.commit_retaining_read(retain_read)?;
         }
     }
 
@@ -495,7 +571,7 @@ pub(crate) fn release_savepoint_op(ctx: &mut ExecContext<'_>, sp_name: &str) -> 
                 }
             }
             TransactionState::Write => {
-                ctx.btree.pager_mut().commit_retaining_read(retain_read)?;
+                ctx.btree.commit_retaining_read(retain_read)?;
             }
         }
         *ctx.implicit_savepoint_tx = false;
@@ -789,14 +865,31 @@ pub(crate) fn execute_write_body(
             let Some(pv) = value.as_ref() else {
                 return Ok(QueryOutput::default());
             };
-            let v = pragma_to_i64(pv) as i32;
             match name.to_ascii_uppercase().as_str() {
                 "USER_VERSION" => {
+                    let v = pragma_to_i64(pv) as i32;
                     ctx.btree.pager_mut().header_mut()?.user_version = v;
                     Ok(QueryOutput::default())
                 }
                 "APPLICATION_ID" => {
+                    let v = pragma_to_i64(pv) as i32;
                     ctx.btree.pager_mut().header_mut()?.application_id = v;
+                    Ok(QueryOutput::default())
+                }
+                "DEFAULT_CACHE_SIZE" => {
+                    let size = pragma_to_i64(pv).saturating_abs().min(i64::from(i32::MAX)) as i32;
+                    ctx.btree.pager_mut().header_mut()?.default_cache_size = size;
+                    ctx.btree.set_cache_size(size);
+                    Ok(QueryOutput::default())
+                }
+                "AUTO_VACUUM" => {
+                    let e_auto = parse_auto_vacuum_pragma(pv);
+                    *ctx.next_auto_vacuum = Some(e_auto);
+                    if ctx.btree.pager().header().largest_root_btree_page != 0 {
+                        let incr_flag = u32::from(e_auto == AutoVacuumMode::Incremental);
+                        ctx.btree.pager_mut().header_mut()?.incremental_vacuum_mode = incr_flag;
+                        let _ = ctx.btree.set_configured_auto_vacuum(e_auto);
+                    }
                     Ok(QueryOutput::default())
                 }
                 _ => exec_pragma(ctx, schema.as_deref(), name, value.as_ref()),
@@ -812,7 +905,8 @@ pub fn execute_statement(
     stmt: &Stmt,
     params: &[Value],
 ) -> Result<QueryOutput> {
-    if stmt_requires_schema(stmt) && ctx.btree.transaction_state() != TransactionState::Open {
+    if stmt_loads_schema_on_prepare(stmt) && ctx.btree.transaction_state() != TransactionState::Open
+    {
         ctx.schema.ensure_fresh_in_tx(ctx.btree)?;
     }
 
@@ -822,7 +916,49 @@ pub fn execute_statement(
             Ok(QueryOutput::default())
         }
         StmtCategory::NoLockPragma => execute_nolock_stmt(ctx, stmt),
-        StmtCategory::Vacuum => exec_vacuum(ctx),
+        StmtCategory::Vacuum => {
+            let Stmt::Vacuum { schema, into } = stmt else {
+                unreachable!();
+            };
+            exec_vacuum(ctx, schema.as_deref(), into.as_ref(), params)
+        }
+        StmtCategory::IncrementalVacuum => {
+            let Stmt::Pragma { schema, value, .. } = stmt else {
+                unreachable!();
+            };
+            if let Some(s) = schema.as_deref()
+                && !s.eq_ignore_ascii_case("main")
+                && !s.eq_ignore_ascii_case("temp")
+            {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("unknown database {s}"),
+                ));
+            }
+            if schema
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case("temp"))
+            {
+                Ok(QueryOutput::default())
+            } else {
+                let mut remaining = parse_incremental_vacuum_limit(value.as_ref());
+                run_write_autocommit(ctx, |ctx| {
+                    let mut rows = Vec::new();
+                    while remaining > 0 {
+                        remaining -= 1;
+                        if ctx.btree.incremental_vacuum_step()? {
+                            rows.push(Vec::new());
+                        } else {
+                            break;
+                        }
+                    }
+                    Ok(QueryOutput {
+                        column_names: Vec::new(),
+                        rows,
+                    })
+                })
+            }
+        }
         StmtCategory::Read => {
             if stmt_requires_schema(stmt) {
                 run_read_autocommit(ctx, |ctx| execute_read_body(ctx, stmt, params))
@@ -979,7 +1115,7 @@ where
                     ctx.publish();
                     return Err(fk_err);
                 }
-                if let Err(commit_err) = ctx.btree.pager_mut().commit_retaining_read(retain_read) {
+                if let Err(commit_err) = ctx.btree.commit_retaining_read(retain_read) {
                     let write_only = !*ctx.schema_changed_in_tx;
                     let _ = ctx.btree.rollback_with_trip(
                         extended::SQLITE_ABORT_ROLLBACK,
@@ -1037,7 +1173,7 @@ where
                         ctx.publish();
                         return Err(err);
                     }
-                    ctx.btree.pager_mut().commit_retaining_read(retain_read)?;
+                    ctx.btree.commit_retaining_read(retain_read)?;
                     *ctx.schema_changed_in_tx = false;
                     ctx.deferred_fk_suspects.clear();
                 }
@@ -8180,6 +8316,43 @@ fn exec_create_table_as(
     Ok(())
 }
 
+fn apply_root_page_move(btree: &mut Btree, schema: &mut Schema, mv: RootPageMove) -> Result<()> {
+    if let Some(t) = schema.tables.iter_mut().find(|t| t.root_pgno == mv.from) {
+        update_schema_entry(
+            btree,
+            t.schema_rowid,
+            "table",
+            &t.name,
+            &t.name,
+            mv.to,
+            Some(&t.raw_sql),
+        )?;
+        t.root_pgno = mv.to;
+        return Ok(());
+    }
+    if let Some(idx) = schema
+        .indexes
+        .iter_mut()
+        .find(|idx| idx.root_pgno == mv.from)
+    {
+        update_schema_entry(
+            btree,
+            idx.schema_rowid,
+            "index",
+            &idx.name,
+            &idx.table_name,
+            mv.to,
+            idx.raw_sql.as_deref(),
+        )?;
+        idx.root_pgno = mv.to;
+        return Ok(());
+    }
+    Err(SqliteError::corrupt(format!(
+        "relocated root page {} not found in schema catalog",
+        mv.from
+    )))
+}
+
 fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &str) -> Result<()> {
     if Schema::is_schema_table_name(name) {
         return Err(SqliteError::new(
@@ -8231,15 +8404,56 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &str) -> Re
         }
     }
 
-    let indexes = ctx.schema.indexes_for_table(&tbl.name);
-    for idx in indexes {
-        ctx.btree.drop_tree(idx.root_pgno)?;
-        delete_schema_entry(ctx.btree, idx.schema_rowid)?;
+    enum DropRootKind {
+        Table,
+        Index(String),
     }
-    ctx.btree.drop_tree(tbl.root_pgno)?;
-    delete_schema_entry(ctx.btree, tbl.schema_rowid)?;
 
-    // Also delete entry from `sqlite_sequence` if present
+    let indexes = ctx.schema.indexes_for_table(&tbl.name);
+    let mut roots: Vec<(Pgno, i64, DropRootKind)> = Vec::with_capacity(1 + indexes.len());
+    roots.push((tbl.root_pgno, tbl.schema_rowid, DropRootKind::Table));
+    for idx in indexes {
+        if idx.root_pgno != tbl.root_pgno {
+            roots.push((
+                idx.root_pgno,
+                idx.schema_rowid,
+                DropRootKind::Index(idx.name),
+            ));
+        } else {
+            if idx.schema_rowid != 0 {
+                delete_schema_entry(ctx.btree, idx.schema_rowid)?;
+            }
+            ctx.schema
+                .indexes
+                .retain(|i| !i.name.eq_ignore_ascii_case(&idx.name));
+        }
+    }
+    // Drop roots in strictly descending `root_pgno` order (`sqlite/src/build.c:destroyTable`)!
+    roots.sort_by_key(|a| std::cmp::Reverse(a.0));
+
+    for (root_pgno, schema_rowid, kind) in roots {
+        let mv = ctx.btree.drop_tree_relocating(root_pgno)?;
+        if schema_rowid != 0 {
+            delete_schema_entry(ctx.btree, schema_rowid)?;
+        }
+        match kind {
+            DropRootKind::Table => {
+                ctx.schema
+                    .tables
+                    .retain(|t| !t.name.eq_ignore_ascii_case(&tbl.name));
+            }
+            DropRootKind::Index(ref idx_name) => {
+                ctx.schema
+                    .indexes
+                    .retain(|i| !i.name.eq_ignore_ascii_case(idx_name));
+            }
+        }
+        if let Some(mv) = mv {
+            apply_root_page_move(ctx.btree, ctx.schema, mv)?;
+        }
+    }
+
+    // Also delete entry from `sqlite_sequence` if present (using its possibly-relocated `root_pgno`!)
     if let Some(seq_tbl) = ctx.schema.find_user_table("sqlite_sequence").cloned() {
         let enc = ctx.btree.encoding();
         let rows = scan_table_incremental(ctx.btree, seq_tbl.root_pgno)?;
@@ -8432,8 +8646,14 @@ fn exec_drop_index(ctx: &mut ExecContext<'_>, if_exists: bool, name: &str) -> Re
             "database table is locked",
         ));
     }
-    ctx.btree.drop_tree(idx.root_pgno)?;
+    let mv = ctx.btree.drop_tree_relocating(idx.root_pgno)?;
     delete_schema_entry(ctx.btree, idx.schema_rowid)?;
+    ctx.schema
+        .indexes
+        .retain(|i| !i.name.eq_ignore_ascii_case(&idx.name));
+    if let Some(mv) = mv {
+        apply_root_page_move(ctx.btree, ctx.schema, mv)?;
+    }
     *ctx.schema = Schema::load(ctx.btree)?;
     *ctx.schema_generation += 1;
     *ctx.schema_changed_in_tx = true;
@@ -9498,14 +9718,188 @@ pub(crate) enum VacuumFail {
     Poison(SqliteError),
 }
 
-pub(crate) fn exec_vacuum(ctx: &mut ExecContext<'_>) -> Result<QueryOutput> {
-    exec_vacuum_checked(ctx).map_err(|vf| match vf {
+pub(crate) fn exec_vacuum(
+    ctx: &mut ExecContext<'_>,
+    vac_schema: Option<&str>,
+    into: Option<&Expr>,
+    params: &[Value],
+) -> Result<QueryOutput> {
+    exec_vacuum_checked(ctx, vac_schema, into, params).map_err(|vf| match vf {
         VacuumFail::Clean(e) | VacuumFail::Poison(e) => e,
     })
 }
 
+fn compute_effective_vacuum_page_size(base_ps: u32, requested: Option<u32>, reserve: u8) -> u32 {
+    let Some(mut req) = requested else {
+        return base_ps;
+    };
+    if !sqliters_pager::DatabaseHeader::is_valid_page_size(req) {
+        return base_ps;
+    }
+    if req == 512 && reserve > 32 {
+        req = 1024;
+    }
+    if req.saturating_sub(u32::from(reserve)) >= 480 {
+        req
+    } else {
+        base_ps
+    }
+}
+
+fn build_vacuum_image(
+    ctx: &mut ExecContext<'_>,
+    orig_hdr: &sqliters_pager::DatabaseHeader,
+    target_btree: &mut Btree,
+) -> Result<()> {
+    target_btree.begin_write()?;
+    {
+        let fhdr = target_btree.pager_mut().header_mut()?;
+        fhdr.default_cache_size = orig_hdr.default_cache_size;
+        fhdr.user_version = orig_hdr.user_version;
+        fhdr.application_id = orig_hdr.application_id;
+        fhdr.text_encoding = orig_hdr.text_encoding;
+        fhdr.schema_cookie = orig_hdr.schema_cookie.wrapping_add(1);
+    }
+
+    let tables_snapshot = ctx.schema.tables.clone();
+    let indexes_snapshot = ctx.schema.indexes.clone();
+    let has_any_autoincrement = tables_snapshot
+        .iter()
+        .any(|t| !t.name.eq_ignore_ascii_case("sqlite_sequence") && t.autoincrement);
+
+    // Phase A: Allocate roots & insert `sqlite_schema` entries for all tables FIRST (`vacuum.c:298-307`)!
+    let mut mapped_tables: Vec<(TableSchema, Pgno)> = Vec::with_capacity(tables_snapshot.len());
+    for tbl in tables_snapshot {
+        if tbl.name.eq_ignore_ascii_case("sqlite_sequence") {
+            if !has_any_autoincrement {
+                // Omit orphaned `sqlite_sequence` when no `AUTOINCREMENT` table remains (`vacuum2-1.1, 3.1`)!
+                continue;
+            }
+            let seq_root = target_btree.create_table()?;
+            insert_schema_entry(
+                target_btree,
+                "table",
+                &tbl.name,
+                &tbl.name,
+                seq_root,
+                Some(&tbl.raw_sql),
+            )?;
+            mapped_tables.push((tbl, seq_root));
+        } else {
+            let new_tbl_root = if tbl.without_rowid {
+                target_btree.create_index()?
+            } else {
+                target_btree.create_table()?
+            };
+            insert_schema_entry(
+                target_btree,
+                "table",
+                &tbl.name,
+                &tbl.name,
+                new_tbl_root,
+                Some(&tbl.raw_sql),
+            )?;
+            mapped_tables.push((tbl, new_tbl_root));
+        }
+    }
+
+    // Phase B: Allocate roots & insert `sqlite_schema` entries for all indexes (`vacuum.c:309-315`)!
+    let mut mapped_indexes: Vec<(IndexSchema, Pgno)> = Vec::with_capacity(indexes_snapshot.len());
+    for idx in indexes_snapshot {
+        let new_idx_root = target_btree.create_index()?;
+        insert_schema_entry(
+            target_btree,
+            "index",
+            &idx.name,
+            &idx.table_name,
+            new_idx_root,
+            idx.raw_sql.as_deref(),
+        )?;
+        mapped_indexes.push((idx, new_idx_root));
+    }
+
+    // Phase C: Copy table rows & populate indexes (`vacuum.c:317-323`)!
+    for (tbl, new_tbl_root) in &mapped_tables {
+        let tbl_indexes: Vec<(IndexSchema, Pgno)> = mapped_indexes
+            .iter()
+            .filter(|(idx, _)| idx.table_name.eq_ignore_ascii_case(&tbl.name))
+            .cloned()
+            .collect();
+
+        if tbl.name.eq_ignore_ascii_case("sqlite_sequence") {
+            let rows = scan_table_incremental(ctx.btree, tbl.root_pgno)?;
+            let mut next_rid = 0i64;
+            for (_, payload) in rows {
+                next_rid += 1;
+                target_btree.insert_table(*new_tbl_root, next_rid, &payload)?;
+            }
+        } else if tbl.without_rowid {
+            let pk_orders = tbl.without_rowid_pk_orders();
+            let entries = scan_index_incremental(ctx.btree, tbl.root_pgno, pk_orders.clone())?;
+            for rec in entries {
+                target_btree.insert_index(*new_tbl_root, &rec, &pk_orders)?;
+            }
+            for (idx, new_idx_root) in &tbl_indexes {
+                let orders = idx.key_sort_orders();
+                let idx_entries = scan_index_incremental(ctx.btree, idx.root_pgno, orders.clone())?;
+                for rec in idx_entries {
+                    target_btree.insert_index(*new_idx_root, &rec, &orders)?;
+                }
+            }
+        } else if tbl.rowid_alias_col.is_some() {
+            // Explicit `INTEGER PRIMARY KEY`: preserve exact rowids!
+            let rows = scan_table_incremental(ctx.btree, tbl.root_pgno)?;
+            for (rid, payload) in rows {
+                target_btree.insert_table(*new_tbl_root, rid, &payload)?;
+            }
+            for (idx, new_idx_root) in &tbl_indexes {
+                let orders = idx.key_sort_orders();
+                let idx_entries = scan_index_incremental(ctx.btree, idx.root_pgno, orders.clone())?;
+                for rec in idx_entries {
+                    target_btree.insert_index(*new_idx_root, &rec, &orders)?;
+                }
+            }
+        } else {
+            // Implicit rowid table without `INTEGER PRIMARY KEY`: reassign sequential rowids `1..=N`
+            // and rebuild secondary/unique index entries against the compacted rowids!
+            let rows = scan_table_incremental(ctx.btree, tbl.root_pgno)?;
+            let mut next_rid = 0i64;
+            for (_, payload) in rows {
+                next_rid += 1;
+                target_btree.insert_table(*new_tbl_root, next_rid, &payload)?;
+                if !tbl_indexes.is_empty() {
+                    let new_rkey = TableRowKey::Rowid(next_rid);
+                    let vals = decode_table_logical_row(ctx, tbl, &new_rkey, &payload, &[])?;
+                    for (idx_schema, new_idx_root) in &tbl_indexes {
+                        if !index_row_passes_partial_where(
+                            ctx,
+                            tbl,
+                            idx_schema,
+                            next_rid,
+                            &vals,
+                            &[],
+                        )? {
+                            continue;
+                        }
+                        let keys =
+                            eval_index_key_values(ctx, tbl, idx_schema, &new_rkey, &vals, &[])?;
+                        let orders = idx_schema.key_sort_orders();
+                        let idx_rec = encode_record_with_encoding(&keys, target_btree.encoding());
+                        target_btree.insert_index(*new_idx_root, &idx_rec, &orders)?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub(crate) fn exec_vacuum_checked(
     ctx: &mut ExecContext<'_>,
+    vac_schema: Option<&str>,
+    into: Option<&Expr>,
+    params: &[Value],
 ) -> std::result::Result<QueryOutput, VacuumFail> {
     if !is_in_autocommit(ctx) {
         return Err(VacuumFail::Clean(SqliteError::new(
@@ -9519,37 +9913,244 @@ pub(crate) fn exec_vacuum_checked(
             "cannot VACUUM - SQL statements in progress",
         )));
     }
+    if let Some(s) = vac_schema {
+        if s.eq_ignore_ascii_case("temp") {
+            return Ok(QueryOutput::default());
+        }
+        if !s.eq_ignore_ascii_case("main") {
+            return Err(VacuumFail::Clean(SqliteError::new(
+                ErrorCode::Error,
+                format!("unknown database {s}"),
+            )));
+        }
+    }
+
+    if let Some(into_expr) = into {
+        let opened_read = if ctx.btree.transaction_state() == TransactionState::Open {
+            ctx.busy_policy
+                .retry_btree(ctx.btree, |bt| bt.begin_read())
+                .map_err(VacuumFail::Clean)?;
+            true
+        } else {
+            false
+        };
+
+        let into_res: Result<()> = (|| {
+            ctx.schema.ensure_fresh_in_tx(ctx.btree)?;
+            let out_val = eval_expr(ctx, into_expr, params, &[], &CteStore::default(), None)?;
+            let Value::Text(out_name) = out_val else {
+                return Err(SqliteError::new(ErrorCode::Error, "non-text filename"));
+            };
+
+            let orig_hdr = ctx.btree.pager().header().clone();
+            let lock_geometry = ctx.btree.pager().lock_geometry();
+            let src_ps = ctx.btree.pager().page_size();
+            let is_src_memdb = ctx.btree.pager().is_pager_memdb();
+
+            let mut target_is_memory = out_name.is_empty() || out_name == ":memory:";
+            let mut target_reserve = orig_hdr.reserved_bytes;
+            let mut raw_target_path: &str = out_name.as_str();
+
+            if let Some(rest) = out_name.strip_prefix("file:") {
+                let (rp, query_opt) = match rest.split_once('?') {
+                    Some((p, q)) => (p, Some(q)),
+                    None => (rest, None),
+                };
+                raw_target_path = rp;
+                if rp.is_empty() || rp == ":memory:" {
+                    target_is_memory = true;
+                }
+                if let Some(q) = query_opt {
+                    for pair in q.split('&') {
+                        if let Some((k, v)) = pair.split_once('=') {
+                            if k == "mode" && v.eq_ignore_ascii_case("memory") {
+                                target_is_memory = true;
+                            } else if k == "reserve"
+                                && let Ok(r) = v.parse::<i64>()
+                                && (0..=255).contains(&r)
+                            {
+                                target_reserve = r as u8;
+                            }
+                        }
+                    }
+                }
+            }
+
+            let target_ps = compute_effective_vacuum_page_size(
+                src_ps,
+                if is_src_memdb {
+                    None
+                } else {
+                    *ctx.next_page_size
+                },
+                target_reserve,
+            );
+            let target_autovac = ctx
+                .next_auto_vacuum
+                .unwrap_or_else(|| ctx.btree.auto_vacuum_mode());
+
+            if target_is_memory {
+                let mem_vfs: std::sync::Arc<dyn sqliters_vfs::Vfs> =
+                    std::sync::Arc::new(sqliters_vfs::MemoryVfs::with_lock_geometry(lock_geometry));
+                let opts = sqliters_pager::PagerOpenOptions {
+                    default_page_size: target_ps,
+                    lock_geometry: Some(lock_geometry),
+                    db_kind: Some(DatabaseKind::Memory),
+                    ..sqliters_pager::PagerOpenOptions::default()
+                };
+                let mut target_bt = Btree::open_with_options(
+                    mem_vfs,
+                    Some(std::path::Path::new(":memory:")),
+                    sqliters_vfs::OpenFlags::READWRITE
+                        | sqliters_vfs::OpenFlags::CREATE
+                        | sqliters_vfs::OpenFlags::MEMORY,
+                    opts,
+                )?;
+                target_bt.pager_mut().set_page_size(target_ps)?;
+                target_bt.pager_mut().set_reserved_bytes(target_reserve)?;
+                target_bt.pager_mut().set_encoding(orig_hdr.encoding())?;
+                let _ = target_bt.set_configured_auto_vacuum(target_autovac);
+                build_vacuum_image(ctx, &orig_hdr, &mut target_bt)?;
+                target_bt.commit_retaining_read(false)?;
+                return Ok(());
+            }
+
+            let resolved_path = {
+                let p = std::path::Path::new(raw_target_path);
+                if p.is_relative() {
+                    if let Some(ref wd) = *ctx.working_dir {
+                        wd.join(p)
+                    } else {
+                        p.to_path_buf()
+                    }
+                } else {
+                    p.to_path_buf()
+                }
+            };
+
+            let target_vfs: std::sync::Arc<dyn sqliters_vfs::Vfs> = if is_src_memdb {
+                std::sync::Arc::new(sqliters_vfs::OsVfs::with_lock_geometry(lock_geometry))
+            } else {
+                std::sync::Arc::clone(ctx.btree.pager().vfs())
+            };
+            let is_os_vfs = matches!(target_vfs.name(), "unix" | "win32");
+            if is_os_vfs && std::fs::metadata(&resolved_path).is_ok_and(|m| m.is_dir()) {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    "output file already exists",
+                ));
+            }
+            let full_target = target_vfs.full_pathname(&resolved_path)?;
+            if is_os_vfs
+                && let Ok(meta) = std::fs::metadata(&full_target)
+                && (meta.is_dir() || meta.len() > 0)
+            {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    "output file already exists",
+                ));
+            }
+            let existed_before = target_vfs.exists(&full_target)?;
+            if !is_os_vfs && existed_before {
+                let existing_f = target_vfs.open(
+                    Some(&full_target),
+                    sqliters_vfs::OpenFlags::READONLY | sqliters_vfs::OpenFlags::MAIN_DB,
+                )?;
+                let existing_len = existing_f.file_size()?;
+                drop(existing_f);
+                if existing_len > 0 {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "output file already exists",
+                    ));
+                }
+            }
+
+            let opts = sqliters_pager::PagerOpenOptions {
+                default_page_size: target_ps,
+                lock_geometry: Some(lock_geometry),
+                db_kind: Some(DatabaseKind::NamedDisk),
+                ..sqliters_pager::PagerOpenOptions::default()
+            };
+            let mut target_bt = Btree::open_with_options(
+                std::sync::Arc::clone(&target_vfs),
+                Some(&full_target),
+                sqliters_vfs::OpenFlags::READWRITE | sqliters_vfs::OpenFlags::CREATE,
+                opts,
+            )?;
+            let build_res = (|| -> Result<()> {
+                target_bt.pager_mut().set_page_size(target_ps)?;
+                target_bt.pager_mut().set_reserved_bytes(target_reserve)?;
+                target_bt.pager_mut().set_encoding(orig_hdr.encoding())?;
+                target_bt
+                    .pager_mut()
+                    .set_synchronous(ctx.btree.pager().synchronous());
+                let _ = target_bt.set_configured_auto_vacuum(target_autovac);
+                build_vacuum_image(ctx, &orig_hdr, &mut target_bt)?;
+                target_bt.commit_retaining_read(false)?;
+                Ok(())
+            })();
+            drop(target_bt);
+            if let Err(e) = build_res {
+                if !existed_before {
+                    let _ = target_vfs.delete(&full_target, false);
+                }
+                return Err(e);
+            }
+            Ok(())
+        })();
+
+        *ctx.next_page_size = None;
+        if opened_read {
+            let _ = ctx.btree.pager_mut().end_read_if_unused();
+        }
+        return into_res
+            .map(|()| QueryOutput::default())
+            .map_err(VacuumFail::Clean);
+    }
+
+    // In-place `VACUUM [main]` (`into.is_none()`):
     ctx.busy_policy
         .retry_btree(ctx.btree, |bt| bt.begin_write())
         .map_err(VacuumFail::Clean)?;
     if let Err(e) = ctx.schema.ensure_fresh_in_tx(ctx.btree) {
+        *ctx.next_page_size = None;
         if let Err(rb_err) = ctx.btree.rollback() {
             return Err(VacuumFail::Poison(rb_err));
         }
         return Err(VacuumFail::Clean(e));
     }
-    if ctx.btree.pager().page_count() == 0 {
-        if let Err(rb_err) = ctx.btree.rollback() {
-            return Err(VacuumFail::Poison(rb_err));
-        }
-        return Ok(QueryOutput::default());
+
+    let is_wal_db = ctx.btree.journal_mode() == JournalMode::Wal || ctx.btree.pager().is_wal_mode();
+    if is_wal_db {
+        *ctx.next_page_size = None;
     }
 
-    // Build a fresh compacted in-memory Btree with identical page_size, encoding & header metadata,
-    // copy all tables and rebuild all indexes cleanly, then write pages back and reload `Schema`
-    // while `TransactionState::Write` is still held!
     let res = (|| -> Result<Schema> {
-        let page_size = ctx.btree.pager().page_size();
+        let src_ps = ctx.btree.pager().page_size();
+        let is_src_memdb = ctx.btree.pager().is_pager_memdb();
         let lock_geometry = ctx.btree.pager().lock_geometry();
-        let lock_byte_pg = ctx.btree.pager().lock_byte_page();
         let orig_hdr = ctx.btree.pager().header().clone();
+
+        let target_ps = compute_effective_vacuum_page_size(
+            src_ps,
+            if is_wal_db || is_src_memdb {
+                None
+            } else {
+                *ctx.next_page_size
+            },
+            orig_hdr.reserved_bytes,
+        );
+        let target_autovac = ctx
+            .next_auto_vacuum
+            .unwrap_or_else(|| ctx.btree.auto_vacuum_mode());
 
         let mem_vfs: std::sync::Arc<dyn sqliters_vfs::Vfs> =
             std::sync::Arc::new(sqliters_vfs::MemoryVfs::with_lock_geometry(lock_geometry));
         let fresh_opts = sqliters_pager::PagerOpenOptions {
-            default_page_size: page_size,
+            default_page_size: target_ps,
             lock_geometry: Some(lock_geometry),
-            db_kind: Some(sqliters_types::DatabaseKind::Memory),
+            db_kind: Some(DatabaseKind::Memory),
             ..sqliters_pager::PagerOpenOptions::default()
         };
         let mut fresh = Btree::open_with_options(
@@ -9560,108 +10161,22 @@ pub(crate) fn exec_vacuum_checked(
                 | sqliters_vfs::OpenFlags::MEMORY,
             fresh_opts,
         )?;
-        fresh.pager_mut().set_page_size(page_size)?;
+        fresh.pager_mut().set_page_size(target_ps)?;
+        fresh
+            .pager_mut()
+            .set_reserved_bytes(orig_hdr.reserved_bytes)?;
         fresh.pager_mut().set_encoding(orig_hdr.encoding())?;
-        fresh.begin_write()?;
-        {
-            let fhdr = fresh.pager_mut().header_mut()?;
-            fhdr.user_version = orig_hdr.user_version;
-            fhdr.application_id = orig_hdr.application_id;
-            fhdr.text_encoding = orig_hdr.text_encoding;
-            fhdr.schema_cookie = orig_hdr.schema_cookie.wrapping_add(1);
-        }
+        let _ = fresh.set_configured_auto_vacuum(target_autovac);
 
-        for tbl in &ctx.schema.tables {
-            if tbl.without_rowid {
-                let new_tbl_root = fresh.create_index()?;
-                insert_schema_entry(
-                    &mut fresh,
-                    "table",
-                    &tbl.name,
-                    &tbl.name,
-                    new_tbl_root,
-                    Some(&tbl.raw_sql),
-                )?;
-                let pk_orders = tbl.without_rowid_pk_orders();
-                let entries = scan_index_incremental(ctx.btree, tbl.root_pgno, pk_orders.clone())?;
-                for rec in entries {
-                    fresh.insert_index(new_tbl_root, &rec, &pk_orders)?;
-                }
-            } else {
-                let new_tbl_root = fresh.create_table()?;
-                insert_schema_entry(
-                    &mut fresh,
-                    "table",
-                    &tbl.name,
-                    &tbl.name,
-                    new_tbl_root,
-                    Some(&tbl.raw_sql),
-                )?;
-                let rows = scan_table_incremental(ctx.btree, tbl.root_pgno)?;
-                for (rid, payload) in rows {
-                    fresh.insert_table(new_tbl_root, rid, &payload)?;
-                }
-            }
-        }
+        build_vacuum_image(ctx, &orig_hdr, &mut fresh)?;
+        fresh.commit_retaining_read(true)?;
+        let rebuilt_schema = Schema::load(&mut fresh)?;
 
-        for idx in &ctx.schema.indexes {
-            let new_idx_root = fresh.create_index()?;
-            insert_schema_entry(
-                &mut fresh,
-                "index",
-                &idx.name,
-                &idx.table_name,
-                new_idx_root,
-                idx.raw_sql.as_deref(),
-            )?;
-            let orders = idx.key_sort_orders();
-            let entries = scan_index_incremental(ctx.btree, idx.root_pgno, orders.clone())?;
-            for rec in entries {
-                fresh.insert_index(new_idx_root, &rec, &orders)?;
-            }
-        }
-
-        let compacted_count = fresh.pager().page_count();
-        let compacted_hdr = fresh.pager().header().clone();
-
-        while ctx.btree.pager().page_count() < compacted_count {
-            ctx.btree.pager_mut().allocate_raw_page()?;
-        }
-        for pgno in 1..=compacted_count {
-            if pgno == lock_byte_pg {
-                continue;
-            }
-            let src = fresh.pager_mut().read_page(pgno)?.to_vec();
-            let dst = ctx.btree.pager_mut().write_page(pgno)?;
-            dst.copy_from_slice(&src);
-        }
-        let is_wal_db = ctx.btree.journal_mode() == JournalMode::Wal || ctx.btree.pager().use_wal();
-        {
-            let hdr = ctx.btree.pager_mut().header_mut()?;
-            hdr.first_freelist_trunk_page = 0;
-            hdr.total_freelist_pages = 0;
-            hdr.user_version = compacted_hdr.user_version;
-            hdr.application_id = compacted_hdr.application_id;
-            hdr.text_encoding = compacted_hdr.text_encoding;
-            hdr.schema_cookie = compacted_hdr.schema_cookie;
-            hdr.database_size_pages = compacted_count;
-            if is_wal_db {
-                hdr.write_version = 2;
-                hdr.read_version = 2;
-            }
-        }
-        let cur_total = ctx.btree.pager().page_count();
-        if cur_total > compacted_count {
-            ctx.btree.pager_mut().shrink_page_count(compacted_count)?;
-        }
-        let hdr_snapshot = ctx.btree.pager().header().clone();
-        {
-            let p1 = ctx.btree.pager_mut().write_page(1)?;
-            hdr_snapshot.write_into(&mut p1[0..sqliters_pager::DB_HEADER_SIZE]);
-        }
-        Schema::load(ctx.btree)
+        ctx.btree.pager_mut().copy_pages_from(fresh.pager_mut())?;
+        Ok(rebuilt_schema)
     })();
 
+    *ctx.next_page_size = None;
     let new_schema = match res {
         Ok(s) => s,
         Err(e) => {
@@ -9671,7 +10186,7 @@ pub(crate) fn exec_vacuum_checked(
             return Err(VacuumFail::Clean(e));
         }
     };
-    if let Err(cm_err) = ctx.btree.pager_mut().commit_retaining_read(false) {
+    if let Err(cm_err) = ctx.btree.commit_retaining_read(false) {
         if let Err(rb_err) = ctx.btree.rollback() {
             let root = if cm_err.code == ErrorCode::Busy {
                 rb_err
@@ -9724,18 +10239,120 @@ fn exec_pragma(
             })
         }),
         "PAGE_SIZE" => {
+            if is_temp {
+                if value.is_some() {
+                    return Ok(QueryOutput::default());
+                }
+                return Ok(single_col(
+                    "page_size",
+                    Value::Integer(i64::from(sqliters_types::SQLITE_DEFAULT_PAGE_SIZE)),
+                ));
+            }
             if let Some(pv) = value {
-                let raw = pragma_to_i64(pv);
-                if let Ok(sz) = u32::try_from(raw)
-                    && sqliters_pager::DatabaseHeader::is_valid_page_size(sz)
-                    && is_in_autocommit(ctx)
+                if ctx.btree.transaction_state() == TransactionState::Open
+                    && !ctx.btree.pager().is_header_loaded()
+                    && ctx.btree.pager().db_kind() == DatabaseKind::NamedDisk
                 {
-                    let _ = ctx.btree.pager_mut().set_page_size(sz);
+                    let _ = ctx.busy_policy.retry_btree(ctx.btree, |bt| {
+                        bt.pager_mut().ensure_header_loaded().map(|_| ())
+                    });
+                }
+                let raw = pragma_to_i64(pv);
+                if let Ok(mut sz) = u32::try_from(raw)
+                    && sqliters_pager::DatabaseHeader::is_valid_page_size(sz)
+                {
+                    let reserve = ctx.btree.pager().header().reserved_bytes;
+                    if sz == 512 && reserve > 32 {
+                        sz = 1024;
+                    }
+                    if sz.saturating_sub(u32::from(reserve)) >= 480 {
+                        *ctx.next_page_size = Some(sz);
+                        if !ctx.btree.pager().is_page_size_fixed()
+                            && ctx.btree.pager().page_count() == 0
+                            && is_in_autocommit(ctx)
+                        {
+                            let _ = ctx.btree.pager_mut().set_page_size(sz);
+                        }
+                    }
                 }
                 Ok(QueryOutput::default())
             } else {
                 let ps = ctx.btree.pager_mut().effective_page_size()?;
                 Ok(single_col("page_size", Value::Integer(i64::from(ps))))
+            }
+        }
+        "AUTO_VACUUM" => {
+            if is_temp {
+                if value.is_some() {
+                    return Ok(QueryOutput::default());
+                }
+                return Ok(single_col("auto_vacuum", Value::Integer(0)));
+            }
+            if let Some(pv) = value {
+                let e_auto = parse_auto_vacuum_pragma(pv);
+                *ctx.next_auto_vacuum = Some(e_auto);
+                let ok = ctx.btree.set_configured_auto_vacuum(e_auto);
+                if ok && matches!(e_auto, AutoVacuumMode::Full | AutoVacuumMode::Incremental) {
+                    run_write_autocommit(ctx, |ctx| {
+                        if ctx.btree.pager().header().largest_root_btree_page != 0 {
+                            let incr_flag = u32::from(e_auto == AutoVacuumMode::Incremental);
+                            ctx.btree.pager_mut().header_mut()?.incremental_vacuum_mode = incr_flag;
+                            let _ = ctx.btree.set_configured_auto_vacuum(e_auto);
+                        }
+                        Ok(QueryOutput::default())
+                    })?;
+                }
+                Ok(QueryOutput::default())
+            } else {
+                let mode = ctx.btree.auto_vacuum_mode();
+                Ok(single_col("auto_vacuum", Value::Integer(mode.as_int())))
+            }
+        }
+        "DEFAULT_CACHE_SIZE" => {
+            if is_temp {
+                if value.is_some() {
+                    return Ok(QueryOutput::default());
+                }
+                return Ok(single_col("cache_size", Value::Integer(2000)));
+            }
+            if let Some(pv) = value {
+                let size = pragma_to_i64(pv).saturating_abs().min(i64::from(i32::MAX)) as i32;
+                run_write_autocommit(ctx, |ctx| {
+                    ctx.btree.pager_mut().header_mut()?.default_cache_size = size;
+                    ctx.btree.set_cache_size(size);
+                    Ok(QueryOutput::default())
+                })
+            } else {
+                run_header_read_autocommit(ctx, |ctx| {
+                    let raw = ctx.btree.pager().header().default_cache_size;
+                    let val = if raw == 0 {
+                        2000
+                    } else {
+                        i64::from(raw.unsigned_abs())
+                    };
+                    Ok(single_col("cache_size", Value::Integer(val)))
+                })
+            }
+        }
+        "WRITABLE_SCHEMA" => {
+            if let Some(pv) = value {
+                let on = pragma_to_bool(pv)
+                    || matches!(pv, PragmaValue::Ident(s) | PragmaValue::String(s) if s.trim().eq_ignore_ascii_case("reset"));
+                *ctx.writable_schema = on;
+                ctx.btree.set_writable_schema(on);
+                if matches!(pv, PragmaValue::Ident(s) | PragmaValue::String(s) if s.trim().eq_ignore_ascii_case("reset"))
+                {
+                    *ctx.writable_schema = false;
+                    ctx.btree.set_writable_schema(false);
+                    *ctx.schema = Schema::default();
+                    *ctx.schema_generation += 1;
+                }
+                Ok(QueryOutput::default())
+            } else {
+                Ok(single_col(
+                    "writable_schema",
+                    Value::Integer(i64::from(*ctx.writable_schema)),
+                ))
             }
         }
         "PAGE_COUNT" => run_header_read_autocommit(ctx, |ctx| {
@@ -10577,8 +11194,37 @@ pub(crate) fn validate_and_infer_columns(
         | Stmt::Rollback { .. }
         | Stmt::Savepoint(_)
         | Stmt::Release(_)
-        | Stmt::Vacuum
         | Stmt::Analyze(_) => Ok(Vec::new()),
+
+        Stmt::Vacuum {
+            schema: vac_schema,
+            into,
+        } => {
+            let mut is_temp = false;
+            if let Some(s) = vac_schema.as_deref() {
+                if s.eq_ignore_ascii_case("temp") {
+                    is_temp = true;
+                } else if !s.eq_ignore_ascii_case("main") {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("unknown database {s}"),
+                    ));
+                }
+            }
+            if !is_temp && let Some(expr) = into {
+                let mut visited = Vec::new();
+                validate_expr_static(
+                    expr,
+                    &[],
+                    schema,
+                    &CteStore::default(),
+                    false,
+                    false,
+                    &mut visited,
+                )?;
+            }
+            Ok(Vec::new())
+        }
 
         Stmt::Reindex(target) => {
             if let Some(raw_name) = target {
@@ -10931,6 +11577,28 @@ fn infer_pragma_columns(name: &str, value: Option<&PragmaValue>) -> Vec<String> 
                 Vec::new()
             } else {
                 vec!["page_size".to_owned()]
+            }
+        }
+        "AUTO_VACUUM" => {
+            if value.is_some() {
+                Vec::new()
+            } else {
+                vec!["auto_vacuum".to_owned()]
+            }
+        }
+        "INCREMENTAL_VACUUM" => Vec::new(),
+        "DEFAULT_CACHE_SIZE" => {
+            if value.is_some() {
+                Vec::new()
+            } else {
+                vec!["cache_size".to_owned()]
+            }
+        }
+        "WRITABLE_SCHEMA" => {
+            if value.is_some() {
+                Vec::new()
+            } else {
+                vec!["writable_schema".to_owned()]
             }
         }
         "PAGE_COUNT" => vec!["page_count".to_owned()],

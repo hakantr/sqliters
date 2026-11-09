@@ -1,4 +1,5 @@
 //! Regression test suite verifying fixes for all original findings (1..9) and re-review findings (Y1..Y12) in `bulgular.md`.
+#![forbid(unsafe_code)]
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -1331,11 +1332,11 @@ fn test_bulgu_y3_cross_connection_ddl_refreshes_schema_and_prevents_wrong_table_
 }
 
 // ============================================================================
-// Finding Y4: `auto_vacuum` (`FULL` & `INCREMENTAL`) databases protected against ptrmap corruption
+// Finding Y4: `auto_vacuum` (`FULL` & `INCREMENTAL`) bidirectional C parity & ptrmap maintenance
 // ============================================================================
 
 #[test]
-fn test_bulgu_y4_auto_vacuum_databases_read_cleanly_and_reject_writes_safely() {
+fn test_bulgu_y4_auto_vacuum_databases_write_shrink_and_pass_c_integrity_check() {
     for (mode_num, label) in [(1, "full"), (2, "incremental")] {
         let tmp = TempDb::new(&format!("y4_autovac_{label}"));
         run_c_sqlite3(
@@ -1343,33 +1344,79 @@ fn test_bulgu_y4_auto_vacuum_databases_read_cleanly_and_reject_writes_safely() {
             &format!(
                 "PRAGMA page_size = 512;
                  PRAGMA auto_vacuum = {mode_num};
-                 CREATE TABLE t(x TEXT);
-                 INSERT INTO t VALUES ('initial');"
+                 CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT);
+                 CREATE INDEX idx_t_x ON t(x);
+                 INSERT INTO t VALUES (1, 'initial');"
             ),
         );
 
+        let grown_size: u64;
+        let shrunk_size: u64;
         {
             let conn = Connection::open(tmp.path()).unwrap();
-            // Reading an auto-vacuum database works seamlessly
-            let r = conn.query("SELECT x FROM t;", &[]).unwrap();
+            let r = conn.query("SELECT x FROM t WHERE id = 1;", &[]).unwrap();
             assert_eq!(r.rows.len(), 1);
             assert_eq!(r.rows[0].get_str(0), Some("initial"));
 
-            // Writing to an auto-vacuum database is explicitly rejected before modifying any page
-            let long_str = "z".repeat(180);
-            let err = conn
-                .execute_params("INSERT INTO t VALUES (?1);", &[Value::Text(long_str)])
-                .unwrap_err();
+            // Mutate C-created auto-vacuum DB from Rust: trigger B-tree leaf/interior splits
+            // AND multi-page overflow chains (`1200` bytes on `512`-byte pages)!
+            conn.execute_batch("BEGIN;").unwrap();
+            for i in 2..=60i64 {
+                let payload = if i % 5 == 0 {
+                    format!("ovfl-{i:03}-{}", "z".repeat(1200))
+                } else {
+                    format!("row-{i:03}-{}", "y".repeat(180))
+                };
+                conn.execute_params(
+                    "INSERT INTO t VALUES (?1, ?2);",
+                    &[Value::Integer(i), Value::Text(payload)],
+                )
+                .unwrap();
+            }
+            conn.execute_batch("COMMIT;").unwrap();
+            assert_eq!(
+                conn.query("PRAGMA integrity_check;", &[]).unwrap().rows[0].get_str(0),
+                Some("ok")
+            );
+            grown_size = std::fs::metadata(tmp.path()).unwrap().len();
             assert!(
-                err.message.contains("auto_vacuum"),
-                "expected auto_vacuum error, got: {}",
-                err.message
+                grown_size > 16 * 512,
+                "expected multi-page growth, got {grown_size}"
+            );
+
+            // Delete most rows and verify FULL shrinks on commit while INCREMENTAL shrinks on
+            // `PRAGMA incremental_vacuum`!
+            conn.execute_batch("DELETE FROM t WHERE id > 3;").unwrap();
+            if mode_num == 2 {
+                let before_incrvac = std::fs::metadata(tmp.path()).unwrap().len();
+                assert_eq!(
+                    before_incrvac, grown_size,
+                    "INCREMENTAL mode must retain freelist pages until PRAGMA incremental_vacuum"
+                );
+                let freed = conn.query("PRAGMA incremental_vacuum;", &[]).unwrap();
+                assert!(
+                    !freed.rows.is_empty(),
+                    "expected PRAGMA incremental_vacuum to yield freed-page rows"
+                );
+            }
+            shrunk_size = std::fs::metadata(tmp.path()).unwrap().len();
+            assert!(
+                shrunk_size < grown_size / 2,
+                "expected {label} auto-vacuum file to shrink ({grown_size} -> {shrunk_size})"
+            );
+            assert_eq!(
+                conn.query("PRAGMA integrity_check;", &[]).unwrap().rows[0].get_str(0),
+                Some("ok")
             );
         }
 
-        // C `PRAGMA integrity_check` remains 100% `ok`!
+        // Verify C SQLite 3.54.1 `PRAGMA integrity_check` == `ok` and exact row/index contents!
         assert_eq!(run_c_sqlite3(tmp.path(), "PRAGMA integrity_check;"), "ok");
-        assert_eq!(run_c_sqlite3(tmp.path(), "SELECT count(*) FROM t;"), "1");
+        assert_eq!(run_c_sqlite3(tmp.path(), "SELECT count(*) FROM t;"), "3");
+        assert_eq!(
+            run_c_sqlite3(tmp.path(), "SELECT x FROM t WHERE id = 1;"),
+            "initial"
+        );
     }
 }
 
