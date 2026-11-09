@@ -4,11 +4,15 @@
 pub mod ast;
 pub mod complete;
 pub mod parser;
+pub mod rewrite;
 pub mod token;
 
 pub use ast::*;
 pub use complete::is_complete;
-pub use parser::{parse_one, parse_statements};
+pub use parser::{IdentSpanMap, TokenSpan, parse_one, parse_one_with_spans, parse_statements};
+pub use rewrite::{
+    apply_span_edits, format_replacement_ident, remove_column_def_from_create_table_sql,
+};
 pub use token::{Token, TokenKind, dequote, keyword_kind, tokenize};
 
 #[cfg(test)]
@@ -154,5 +158,64 @@ mod tests {
         };
         assert_eq!(schema.as_deref(), Some("main"));
         assert!(matches!(into, Some(Expr::Subquery(_))));
+    }
+
+    #[test]
+    fn test_parse_view_drop_view_and_alter_drop_column() {
+        let Stmt::CreateView(cv) = parse_one(
+            "CREATE TEMPORARY VIEW IF NOT EXISTS temp.\"v.1\" (c1, \"c.2\") AS SELECT a, b + 1 FROM t /* cmt */;",
+        )
+        .unwrap()
+        .0
+        .unwrap()
+        else {
+            panic!("expected CreateView");
+        };
+        assert!(cv.temp);
+        assert!(cv.if_not_exists);
+        assert_eq!(cv.name, QualifiedName::qualified("temp", "v.1"));
+        assert_eq!(cv.columns, Some(vec!["c1".to_owned(), "c.2".to_owned()]));
+        assert_eq!(
+            cv.catalog_sql,
+            "CREATE VIEW \"v.1\" (c1, \"c.2\") AS SELECT a, b + 1 FROM t"
+        );
+
+        assert_eq!(
+            parse_one("DROP VIEW IF EXISTS main.v1;").unwrap().0,
+            Some(Stmt::DropView {
+                if_exists: true,
+                name: QualifiedName::qualified("main", "v1"),
+            })
+        );
+
+        for sql in [
+            "ALTER TABLE main.t DROP c;",
+            "ALTER TABLE main.t DROP COLUMN c;",
+        ] {
+            assert_eq!(
+                parse_one(sql).unwrap().0,
+                Some(Stmt::AlterTable {
+                    table: QualifiedName::qualified("main", "t"),
+                    action: AlterTableAction::DropColumn("c".to_owned()),
+                })
+            );
+        }
+
+        assert_eq!(
+            remove_column_def_from_create_table_sql("CREATE TABLE t1(a, b, c)", 1).unwrap(),
+            "CREATE TABLE t1(a, c)"
+        );
+        assert_eq!(
+            remove_column_def_from_create_table_sql("CREATE TABLE t1(a, c)", 1).unwrap(),
+            "CREATE TABLE t1(a)"
+        );
+        assert_eq!(
+            remove_column_def_from_create_table_sql(
+                "CREATE TABLE t1(c, b, a, PRIMARY KEY(b, a)) WITHOUT ROWID",
+                0
+            )
+            .unwrap(),
+            "CREATE TABLE t1(b, a, PRIMARY KEY(b, a)) WITHOUT ROWID"
+        );
     }
 }

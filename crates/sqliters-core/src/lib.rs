@@ -48,7 +48,8 @@ use crate::engine::{
     stmt_requires_schema, validate_and_infer_columns,
 };
 pub use db_set::{
-    DatabaseSet, DbSlot, SQLITE_MAX_PAGE_COUNT, SchemaInstanceId, TempStoreMode, TempTriggerBinding,
+    DatabaseSet, DbSlot, ResolvedRelation, SQLITE_MAX_PAGE_COUNT, SchemaInstanceId, TempStoreMode,
+    TempTriggerBinding,
 };
 pub use engine::{QueryOutput, SQLITE_DEFAULT_WAL_AUTOCHECKPOINT};
 pub use execution_context::{
@@ -56,7 +57,7 @@ pub use execution_context::{
     ExecutionContext, FunctionRegistry, ProgressCallback, ProgressTracker, ScalarFunctionCallback,
     ScalarFunctionDef,
 };
-pub use schema::{ColumnSchema, ForeignKeySchema, IndexSchema, Schema, TableSchema};
+pub use schema::{ColumnSchema, ForeignKeySchema, IndexSchema, Schema, TableSchema, ViewSchema};
 
 /// Maximum automatic `PrepareMode::V2` schema-change reprepare retries (`SQLITE_MAX_SCHEMA_RETRY`).
 const SQLITE_MAX_SCHEMA_RETRY: usize = 50;
@@ -550,6 +551,7 @@ struct ConnectionInner {
     in_user_btree_tx: bool,
     schema_changed_in_tx: bool,
     foreign_keys: bool,
+    legacy_alter_table: bool,
     count_changes: bool,
     wal_autocheckpoint_threshold: i32,
     default_locking_mode: LockingMode,
@@ -892,7 +894,7 @@ impl ConnectionInner {
             {
                 slot.schema = saved.clone();
             } else if let Some(ref mut bt) = slot.btree
-                && let Ok(fresh) = Schema::load(bt)
+                && let Ok(fresh) = Schema::load_for_schema(bt, Some(&slot.name))
             {
                 slot.schema = fresh;
             }
@@ -928,11 +930,12 @@ impl ConnectionInner {
                     && self.activity.has_no_active_tx()
                     && !self.activity.has_active_tx_on_instance(inst_id);
                 let slot = &mut self.db_set.slots_mut()[idx];
+                let slot_name = slot.name.clone();
                 let bt = slot.btree.as_mut().unwrap();
                 let prev_cookie = slot.schema.schema_cookie;
                 let prev_had_pages = slot.schema.had_pages;
                 let prev_loaded = slot.schema.loaded;
-                let load_res = slot.schema.ensure_fresh_in_tx(bt);
+                let load_res = slot.schema.ensure_fresh_in_tx_for_schema(bt, &slot_name);
                 if idx == 0 && bt.pager().page_count() > 0 {
                     self.connection_encoding = bt.encoding();
                 }
@@ -951,11 +954,12 @@ impl ConnectionInner {
                 }
             } else {
                 let slot = &mut self.db_set.slots_mut()[idx];
+                let slot_name = slot.name.clone();
                 let bt = slot.btree.as_mut().unwrap();
                 let prev_cookie = slot.schema.schema_cookie;
                 let prev_had_pages = slot.schema.had_pages;
                 let prev_loaded = slot.schema.loaded;
-                slot.schema.ensure_fresh_in_tx(bt)?;
+                slot.schema.ensure_fresh_in_tx_for_schema(bt, &slot_name)?;
                 if idx == 0 && bt.pager().page_count() > 0 {
                     self.connection_encoding = bt.encoding();
                 }
@@ -977,19 +981,20 @@ impl ConnectionInner {
     fn refresh_open_tx_schemas(&mut self) -> Result<()> {
         let mut any_changed = false;
         for (idx, slot) in self.db_set.slots_mut().iter_mut().enumerate() {
+            let slot_name = slot.name.clone();
             let Some(ref mut bt) = slot.btree else {
                 continue;
             };
             if bt.transaction_state() == TransactionState::Open {
                 continue;
-            }
+            };
             let has_pages = bt.pager().page_count() > 0;
             let cur_cookie = bt.pager().header().schema_cookie;
             if !slot.schema.loaded
                 || slot.schema.had_pages != has_pages
                 || slot.schema.schema_cookie != cur_cookie
             {
-                slot.schema.ensure_fresh_in_tx(bt)?;
+                slot.schema.ensure_fresh_in_tx_for_schema(bt, &slot_name)?;
                 if idx == 0 && has_pages {
                     self.connection_encoding = bt.encoding();
                 }
@@ -1234,6 +1239,7 @@ impl ConnectionInner {
                         activity: summary,
                         stmt_tx: &mut stmt_tx_unused,
                         foreign_keys: &mut self.foreign_keys,
+                        legacy_alter_table: &mut self.legacy_alter_table,
                         count_changes: &mut self.count_changes,
                         wal_autocheckpoint_threshold: &mut self.wal_autocheckpoint_threshold,
                         default_locking_mode: &mut self.default_locking_mode,
@@ -1351,6 +1357,7 @@ impl ConnectionInner {
                         activity: summary,
                         stmt_tx: &mut stmt_tx_unused,
                         foreign_keys: &mut self.foreign_keys,
+                        legacy_alter_table: &mut self.legacy_alter_table,
                         count_changes: &mut self.count_changes,
                         wal_autocheckpoint_threshold: &mut self.wal_autocheckpoint_threshold,
                         default_locking_mode: &mut self.default_locking_mode,
@@ -1384,7 +1391,7 @@ impl ConnectionInner {
                     self.restore_schemas_snapshot(&snap.schemas_before);
                     for slot in self.db_set.slots_mut() {
                         if let Some(ref mut bt) = slot.btree
-                            && let Ok(s) = Schema::load(bt)
+                            && let Ok(s) = Schema::load_for_schema(bt, Some(&slot.name))
                         {
                             slot.schema = s;
                         }
@@ -1451,6 +1458,7 @@ impl ConnectionInner {
                             activity: summary,
                             stmt_tx: &mut stmt_tx_unused,
                             foreign_keys: &mut self.foreign_keys,
+                            legacy_alter_table: &mut self.legacy_alter_table,
                             count_changes: &mut self.count_changes,
                             wal_autocheckpoint_threshold: &mut self.wal_autocheckpoint_threshold,
                             default_locking_mode: &mut self.default_locking_mode,
@@ -2076,6 +2084,7 @@ impl Connection {
             in_user_btree_tx: false,
             schema_changed_in_tx: false,
             foreign_keys: false,
+            legacy_alter_table: false,
             count_changes: false,
             wal_autocheckpoint_threshold: SQLITE_DEFAULT_WAL_AUTOCHECKPOINT,
             default_locking_mode: LockingMode::Normal,
@@ -2369,7 +2378,7 @@ impl Connection {
         inner.ensure_usable()?;
         for slot in inner.db_set.slots_mut() {
             if let Some(ref mut bt) = slot.btree {
-                slot.schema = Schema::load(bt)?;
+                slot.schema = Schema::load_for_schema(bt, Some(&slot.name))?;
             }
         }
         if inner.db_set.main_btree().pager().page_count() > 0 {
@@ -3433,7 +3442,9 @@ fn target_write_db_for_stmt(stmt: &Stmt, db_set: &DatabaseSet) -> Option<Databas
             Some(cat_db)
         } else {
             db_set
-                .find_user_table_in_set(qn)
+                .find_relation_in_set(qn)
+                .ok()
+                .flatten()
                 .map(|(id, _)| id)
                 .or(Some(DatabaseId::MAIN))
         }
@@ -3460,15 +3471,26 @@ fn target_write_db_for_stmt(stmt: &Stmt, db_set: &DatabaseSet) -> Option<Databas
                 Some(DatabaseId::MAIN)
             }
         }
-        Stmt::DropTable { name, .. } | Stmt::AlterTable { table: name, .. } => {
-            resolve_qn_table(name)
+        Stmt::CreateView(cv) => {
+            if cv.temp {
+                Some(DatabaseId::TEMP)
+            } else if let Some(ref s) = cv.name.schema {
+                db_set.find_db_id(s)
+            } else {
+                Some(DatabaseId::MAIN)
+            }
         }
+        Stmt::DropTable { name, .. }
+        | Stmt::DropView { name, .. }
+        | Stmt::AlterTable { table: name, .. } => resolve_qn_table(name),
         Stmt::CreateIndex(ci) => {
             if let Some(ref s) = ci.name.schema {
                 db_set.find_db_id(s)
             } else {
                 db_set
-                    .find_user_table_in_set(&QualifiedName::unqualified(ci.table_name.clone()))
+                    .find_relation_in_set(&QualifiedName::unqualified(ci.table_name.clone()))
+                    .ok()
+                    .flatten()
                     .map(|(id, _)| id)
                     .or(Some(DatabaseId::MAIN))
             }
@@ -3488,7 +3510,9 @@ fn target_write_db_for_stmt(stmt: &Stmt, db_set: &DatabaseSet) -> Option<Databas
                 db_set.find_db_id(s)
             } else {
                 db_set
-                    .find_user_table_in_set(qn)
+                    .find_relation_in_set(qn)
+                    .ok()
+                    .flatten()
                     .map(|(id, _)| id)
                     .or_else(|| db_set.find_index_in_set(qn).map(|(id, _)| id))
             }
@@ -3507,7 +3531,9 @@ fn is_noop_if_exists_ddl(stmt: &Stmt, db_set: &DatabaseSet) -> bool {
         Stmt::CreateTable(ct) if ct.if_not_exists => target_write_db_for_stmt(stmt, db_set)
             .and_then(|id| db_set.slot(id))
             .is_some_and(|sl| {
-                sl.btree.is_some() && sl.schema.find_user_table(&ct.name.name).is_some()
+                sl.btree.is_some()
+                    && (sl.schema.find_user_table(&ct.name.name).is_some()
+                        || sl.schema.find_view(&ct.name.name).is_some())
             }),
         Stmt::CreateTableAs {
             if_not_exists: true,
@@ -3516,7 +3542,16 @@ fn is_noop_if_exists_ddl(stmt: &Stmt, db_set: &DatabaseSet) -> bool {
         } => target_write_db_for_stmt(stmt, db_set)
             .and_then(|id| db_set.slot(id))
             .is_some_and(|sl| {
-                sl.btree.is_some() && sl.schema.find_user_table(&name.name).is_some()
+                sl.btree.is_some()
+                    && (sl.schema.find_user_table(&name.name).is_some()
+                        || sl.schema.find_view(&name.name).is_some())
+            }),
+        Stmt::CreateView(cv) if cv.if_not_exists => target_write_db_for_stmt(stmt, db_set)
+            .and_then(|id| db_set.slot(id))
+            .is_some_and(|sl| {
+                sl.btree.is_some()
+                    && (sl.schema.find_user_table(&cv.name.name).is_some()
+                        || sl.schema.find_view(&cv.name.name).is_some())
             }),
         Stmt::CreateIndex(ci) if ci.if_not_exists => target_write_db_for_stmt(stmt, db_set)
             .and_then(|id| db_set.slot(id))
@@ -3530,7 +3565,18 @@ fn is_noop_if_exists_ddl(stmt: &Stmt, db_set: &DatabaseSet) -> bool {
             {
                 return true;
             }
-            db_set.find_user_table_in_set(name).is_none()
+            matches!(db_set.find_relation_in_set(name), Ok(None))
+        }
+        Stmt::DropView {
+            if_exists: true,
+            name,
+        } => {
+            if let Some(ref s) = name.schema
+                && db_set.find_db_id(s).is_none()
+            {
+                return true;
+            }
+            matches!(db_set.find_relation_in_set(name), Ok(None))
         }
         Stmt::DropIndex {
             if_exists: true,
@@ -3584,6 +3630,7 @@ impl ConnectionInner {
             activity: summary,
             stmt_tx,
             foreign_keys: &mut self.foreign_keys,
+            legacy_alter_table: &mut self.legacy_alter_table,
             count_changes: &mut self.count_changes,
             wal_autocheckpoint_threshold: &mut self.wal_autocheckpoint_threshold,
             default_locking_mode: &mut self.default_locking_mode,
@@ -3739,6 +3786,12 @@ impl Statement {
     #[inline]
     pub fn named_parameters(&self) -> &HashMap<String, usize> {
         &self.named_params
+    }
+
+    /// Number of result columns (`sqlite3_column_count`).
+    #[inline]
+    pub fn column_count(&self) -> usize {
+        self.column_names.len()
     }
 
     /// Result column names (`sqlite3_column_name`).

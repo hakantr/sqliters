@@ -1,4 +1,5 @@
 //! SQL Abstract Syntax Tree (AST) representing SQLite 3.54.1 statements and expressions.
+#![forbid(unsafe_code)]
 
 /// Structural `[schema.]object` SQL name (`nm dbnm` / `fullname` in `sqlite/src/parse.y`).
 ///
@@ -149,6 +150,11 @@ pub enum Stmt {
     },
     CreateIndex(CreateIndexStmt),
     DropIndex {
+        if_exists: bool,
+        name: QualifiedName,
+    },
+    CreateView(CreateViewStmt),
+    DropView {
         if_exists: bool,
         name: QualifiedName,
     },
@@ -317,10 +323,24 @@ pub struct CreateIndexStmt {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct CreateViewStmt {
+    pub temp: bool,
+    pub if_not_exists: bool,
+    pub name: QualifiedName,
+    pub columns: Option<Vec<String>>,
+    pub query: Box<SelectStmt>,
+    /// Normalized catalog SQL (`"CREATE VIEW <name>..."`) without `TEMP`, `IF NOT EXISTS`, or `schema.` (`sqlite/src/build.c`).
+    pub catalog_sql: String,
+    /// Original `CREATE VIEW ...` SQL text as written by the caller.
+    pub raw_sql: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum AlterTableAction {
     RenameTo(String),
     RenameColumn { old_name: String, new_name: String },
     AddColumn(ColumnDef),
+    DropColumn(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]

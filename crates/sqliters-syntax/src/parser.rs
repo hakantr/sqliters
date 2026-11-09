@@ -1,5 +1,6 @@
 //! Recursive-descent SQL statement parser and Pratt precedence-climbing expression parser
 //! modeled after `sqlite/src/parse.y`.
+#![forbid(unsafe_code)]
 
 use std::collections::HashMap;
 
@@ -12,16 +13,49 @@ use crate::token::{
     tokenize,
 };
 
+/// Byte span of a lexical token within the input SQL string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenSpan {
+    pub offset: usize,
+    pub len: usize,
+}
+
+/// Maps parsed identifier `String` allocations in an AST back to their exact lexical [`TokenSpan`]
+/// in the source SQL string (used for structural `ALTER TABLE` SQL rewriting).
+#[derive(Debug, Clone, Default)]
+pub struct IdentSpanMap {
+    by_ptr: HashMap<usize, TokenSpan>,
+}
+
+impl IdentSpanMap {
+    /// Returns the source [`TokenSpan`] of an AST identifier string parsed by [`parse_one_with_spans`].
+    #[inline]
+    pub fn span_of(&self, ident: &str) -> Option<TokenSpan> {
+        self.by_ptr.get(&(ident.as_ptr() as usize)).copied()
+    }
+}
+
 /// Parses a single SQL statement from the beginning of `sql`, returning `(Some(stmt), remaining_tail)`
 /// or `(None, "")` if `sql` contains only whitespace, comments, and/or empty semicolons.
 pub fn parse_one(sql: &str) -> Result<(Option<Stmt>, &str)> {
+    let (stmt, _spans, tail) = parse_one_inner(sql, false)?;
+    Ok((stmt, tail))
+}
+
+/// Parses a single SQL statement while recording the exact source [`TokenSpan`] of every parsed
+/// identifier in the returned [`IdentSpanMap`].
+pub fn parse_one_with_spans(sql: &str) -> Result<(Option<Stmt>, IdentSpanMap, &str)> {
+    parse_one_inner(sql, true)
+}
+
+fn parse_one_inner(sql: &str, track_spans: bool) -> Result<(Option<Stmt>, IdentSpanMap, &str)> {
     let prefix_end = first_statement_end_offset(sql);
     let prefix = &sql[..prefix_end];
     let tokens = tokenize(prefix)?;
-    let mut parser = Parser::new(prefix, &tokens);
+    let mut parser = Parser::new(prefix, &tokens, track_spans);
     while parser.eat(TokenKind::Semi) {}
     if parser.at(TokenKind::Eof) {
-        return Ok((None, ""));
+        return Ok((None, IdentSpanMap::default(), ""));
     }
     let stmt = parser.parse_stmt()?;
     let tail_off = if parser.at(TokenKind::Semi) {
@@ -30,7 +64,7 @@ pub fn parse_one(sql: &str) -> Result<(Option<Stmt>, &str)> {
     } else {
         parser.peek().offset
     };
-    Ok((Some(stmt), &sql[tail_off..]))
+    Ok((Some(stmt), parser.ident_spans, &sql[tail_off..]))
 }
 
 /// Parses all semicolon-separated SQL statements in `sql`.
@@ -56,10 +90,12 @@ struct Parser<'a> {
     expr_depth: usize,
     max_param_idx: usize,
     named_params: HashMap<String, usize>,
+    track_spans: bool,
+    ident_spans: IdentSpanMap,
 }
 
 impl<'a> Parser<'a> {
-    fn new(sql: &'a str, tokens: &'a [Token<'a>]) -> Self {
+    fn new(sql: &'a str, tokens: &'a [Token<'a>], track_spans: bool) -> Self {
         Self {
             sql,
             tokens,
@@ -67,6 +103,8 @@ impl<'a> Parser<'a> {
             expr_depth: 0,
             max_param_idx: 0,
             named_params: HashMap::new(),
+            track_spans,
+            ident_spans: IdentSpanMap::default(),
         }
     }
 
@@ -134,12 +172,41 @@ impl<'a> Parser<'a> {
         SqliteError::syntax(msg, tok.offset)
     }
 
+    fn alloc_ident_from_token(&mut self, tok: Token<'a>) -> String {
+        let raw = dequote(tok.text);
+        if self.track_spans {
+            let mut owned = String::with_capacity(raw.len().max(1));
+            owned.push_str(&raw);
+            self.ident_spans.by_ptr.insert(
+                owned.as_ptr() as usize,
+                TokenSpan {
+                    offset: tok.offset,
+                    len: tok.text.len(),
+                },
+            );
+            owned
+        } else {
+            raw
+        }
+    }
+
     /// Parses an identifier, allowing SQLite fallback keywords (`%fallback ID` in `parse.y`).
     fn parse_ident(&mut self) -> Result<String> {
         let tok = self.peek();
         if Self::can_be_ident(tok.kind) {
             self.advance();
-            Ok(dequote(tok.text))
+            Ok(self.alloc_ident_from_token(tok))
+        } else {
+            Err(self.syntax_err_at(tok, format!("near \"{}\": syntax error", tok.text)))
+        }
+    }
+
+    /// Parses a DDL object/column name (`nm ::= id | STRING | JOIN_KW` in `parse.y`).
+    fn parse_nm(&mut self) -> Result<String> {
+        let tok = self.peek();
+        if Self::can_be_ident(tok.kind) || tok.kind == TokenKind::StringLiteral {
+            self.advance();
+            Ok(self.alloc_ident_from_token(tok))
         } else {
             Err(self.syntax_err_at(tok, format!("near \"{}\": syntax error", tok.text)))
         }
@@ -153,10 +220,10 @@ impl<'a> Parser<'a> {
     /// Parses `[schema.]object_name`, returning `(QualifiedName, byte_offset_of_unqualified_name_token)`.
     fn parse_qualified_name_with_offset(&mut self) -> Result<(QualifiedName, usize)> {
         let first_tok = self.peek();
-        let first = self.parse_ident()?;
+        let first = self.parse_nm()?;
         if self.eat(TokenKind::Dot) {
             let second_tok = self.peek();
-            let second = self.parse_ident()?;
+            let second = self.parse_nm()?;
             Ok((QualifiedName::qualified(first, second), second_tok.offset))
         } else {
             Ok((QualifiedName::unqualified(first), first_tok.offset))
@@ -508,7 +575,7 @@ impl<'a> Parser<'a> {
             };
             let (name, name_offset) = self.parse_qualified_name_with_offset()?;
             self.expect(TokenKind::On)?;
-            let table_name = self.parse_ident()?;
+            let table_name = self.parse_nm()?;
             self.expect(TokenKind::Lp)?;
             let mut columns = Vec::new();
             loop {
@@ -544,6 +611,45 @@ impl<'a> Parser<'a> {
             }));
         }
 
+        if !unique && self.eat(TokenKind::View) {
+            let if_not_exists = if self.eat(TokenKind::If) {
+                self.expect(TokenKind::Not)?;
+                self.expect(TokenKind::Exists)?;
+                true
+            } else {
+                false
+            };
+            let (name, name_offset) = self.parse_qualified_name_with_offset()?;
+            let columns = if self.eat(TokenKind::Lp) {
+                let mut cols = Vec::new();
+                loop {
+                    cols.push(self.parse_nm()?);
+                    if !self.eat(TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(TokenKind::Rp)?;
+                Some(cols)
+            } else {
+                None
+            };
+            self.expect(TokenKind::As)?;
+            let query = self.parse_select_stmt()?;
+            let body_end = self.prev_token_end();
+            let end_off = self.peek().offset;
+            let catalog_sql = format!("CREATE VIEW {}", &self.sql[name_offset..body_end]);
+            let raw_sql = self.sql[stmt_start..end_off].trim().to_owned();
+            return Ok(Stmt::CreateView(CreateViewStmt {
+                temp,
+                if_not_exists,
+                name,
+                columns,
+                query: Box::new(query),
+                catalog_sql,
+                raw_sql,
+            }));
+        }
+
         let tok = self.peek();
         Err(self.syntax_err_at(
             tok,
@@ -552,8 +658,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_column_def(&mut self) -> Result<ColumnDef> {
-        let name = self.parse_ident()?;
-        let mut type_parts = Vec::new();
+        let name = self.parse_nm()?;
+        let mut type_start: Option<usize> = None;
+        let mut type_token_count = 0usize;
 
         // Read zero or more type words plus optional `(N)` or `(N, M)` precision
         while !self.at(TokenKind::Comma)
@@ -562,30 +669,43 @@ impl<'a> Parser<'a> {
             && !self.at(TokenKind::Eof)
             && !self.at(TokenKind::Semi)
         {
-            if self.eat(TokenKind::Lp) {
-                let mut inner = String::from("(");
+            if self.at(TokenKind::Lp) {
+                let lp_off = self.advance().offset;
+                if type_start.is_none() {
+                    type_start = Some(lp_off);
+                }
+                type_token_count += 1;
                 while !self.at(TokenKind::Rp) && !self.at(TokenKind::Eof) {
-                    let t = self.advance();
-                    if inner.len() > 1 && t.kind != TokenKind::Comma {
-                        inner.push(' ');
-                    }
-                    inner.push_str(t.text);
+                    self.advance();
                 }
                 self.expect(TokenKind::Rp)?;
-                inner.push(')');
-                type_parts.push(inner);
+                type_token_count += 1;
                 break;
             } else if Self::can_be_ident(self.peek().kind) || self.at(TokenKind::Null) {
                 if self.at(TokenKind::Null) {
                     break;
                 }
-                type_parts.push(self.advance().text.to_owned());
+                let tok = self.advance();
+                if type_start.is_none() {
+                    type_start = Some(tok.offset);
+                }
+                type_token_count += 1;
             } else {
                 break;
             }
         }
 
-        let type_name = type_parts.join(" ");
+        let type_name = match type_start {
+            Some(start) => {
+                let raw = self.sql[start..self.prev_token_end()].trim();
+                if type_token_count == 1 {
+                    dequote(raw)
+                } else {
+                    raw.to_owned()
+                }
+            }
+            None => String::new(),
+        };
         let mut constraints = Vec::new();
         while self.is_column_constraint_start() || self.at(TokenKind::Null) {
             let cname = if self.eat(TokenKind::Constraint) {
@@ -931,6 +1051,7 @@ impl<'a> Parser<'a> {
                 table: None,
                 column,
             }) => (column, None),
+            Expr::String(s) => (s, None),
             other => (String::new(), Some(other)),
         };
         let mut desc = false;
@@ -978,9 +1099,18 @@ impl<'a> Parser<'a> {
             };
             let name = self.parse_qualified_name()?;
             Ok(Stmt::DropIndex { if_exists, name })
+        } else if self.eat(TokenKind::View) {
+            let if_exists = if self.eat(TokenKind::If) {
+                self.expect(TokenKind::Exists)?;
+                true
+            } else {
+                false
+            };
+            let name = self.parse_qualified_name()?;
+            Ok(Stmt::DropView { if_exists, name })
         } else {
             let tok = self.peek();
-            Err(self.syntax_err_at(tok, "expected TABLE or INDEX after DROP"))
+            Err(self.syntax_err_at(tok, "expected TABLE, INDEX, or VIEW after DROP"))
         }
     }
 
@@ -990,16 +1120,16 @@ impl<'a> Parser<'a> {
         let table = self.parse_qualified_name()?;
         if self.eat(TokenKind::Rename) {
             if self.eat(TokenKind::To) {
-                let new_name = self.parse_ident()?;
+                let new_name = self.parse_nm()?;
                 Ok(Stmt::AlterTable {
                     table,
                     action: AlterTableAction::RenameTo(new_name),
                 })
             } else {
                 let _ = self.eat(TokenKind::ColumnKw);
-                let old_name = self.parse_ident()?;
+                let old_name = self.parse_nm()?;
                 self.expect(TokenKind::To)?;
-                let new_name = self.parse_ident()?;
+                let new_name = self.parse_nm()?;
                 Ok(Stmt::AlterTable {
                     table,
                     action: AlterTableAction::RenameColumn { old_name, new_name },
@@ -1012,9 +1142,16 @@ impl<'a> Parser<'a> {
                 table,
                 action: AlterTableAction::AddColumn(col),
             })
+        } else if self.eat(TokenKind::Drop) {
+            let _ = self.eat(TokenKind::ColumnKw);
+            let col_name = self.parse_nm()?;
+            Ok(Stmt::AlterTable {
+                table,
+                action: AlterTableAction::DropColumn(col_name),
+            })
         } else {
             let tok = self.peek();
-            Err(self.syntax_err_at(tok, "expected RENAME or ADD in ALTER TABLE"))
+            Err(self.syntax_err_at(tok, "expected RENAME, ADD, or DROP in ALTER TABLE"))
         }
     }
 

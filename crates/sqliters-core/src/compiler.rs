@@ -1,5 +1,6 @@
 //! SQL-to-VDBE bytecode compiler (`select.c`, `where.c`, `expr.c`, `insert.c`) and
 //! `EXPLAIN` / `EXPLAIN QUERY PLAN` planner.
+#![forbid(unsafe_code)]
 
 use sqliters_syntax::{
     BinaryOp, BindParam, ColumnRef, CurrentTimeKind, Expr, FromClause, FunctionArgs, IndexHint,
@@ -13,9 +14,9 @@ use sqliters_vdbe::{
     AggregateKind, Instruction, Opcode, P4, VdbeProgram, affinity_to_p5, sqlite_compare_affinity,
 };
 
-use crate::db_set::DatabaseSet;
+use crate::db_set::{DatabaseSet, ResolvedRelation};
 use crate::execution_context::FunctionRegistry;
-use crate::schema::{IndexSchema, Schema, TableSchema};
+use crate::schema::{IndexSchema, Schema, TableSchema, ViewSchema, fix_permanent_view_select};
 
 /// Chosen B-Tree access strategy for a single table (`where.c`).
 #[derive(Debug, Clone)]
@@ -552,6 +553,9 @@ fn resolve_main_table_for_compiler(
         return Ok(None);
     }
 
+    if schema.find_view(&name.name).is_some() && schema.find_user_table(&name.name).is_none() {
+        return Ok(None);
+    }
     let Some(tbl) = schema.find_table(&name.name) else {
         return Err(SqliteError::new(
             ErrorCode::Error,
@@ -565,11 +569,15 @@ fn resolve_db_set_table_for_compiler<'a>(
     name: &QualifiedName,
     db_set: &'a DatabaseSet,
 ) -> Result<Option<(DatabaseId, &'a str, &'a Schema, TableSchema)>> {
-    let Some((db_id, tbl)) = db_set.find_table_in_set(name)? else {
+    let Some((db_id, rel)) = db_set.find_relation_in_set(name)? else {
         return Err(SqliteError::new(
             ErrorCode::Error,
             format!("no such table: {}", name.display_name()),
         ));
+    };
+    let tbl = match rel {
+        ResolvedRelation::Table(t) => *t,
+        ResolvedRelation::View(_) => return Ok(None),
     };
     if tbl.root_pgno == 0 {
         return Ok(None);
@@ -2371,27 +2379,40 @@ pub fn explain_query_plan(stmt: &Stmt, schema: &Schema) -> Result<Vec<Vec<Value>
             .schema
             .as_deref()
             .is_none_or(|s| s.eq_ignore_ascii_case("main"))
-            && let Some(tbl) = schema.find_table(&name.name)
         {
-            Some(("main", schema, tbl))
-        } else {
-            None
+            if let Some(tbl) = schema.find_table(&name.name) {
+                return Some((
+                    DatabaseId::MAIN,
+                    "main",
+                    schema,
+                    ResolvedRelation::Table(Box::new(tbl)),
+                ));
+            }
+            if let Some(view) = schema.find_view(&name.name) {
+                return Some((
+                    DatabaseId::MAIN,
+                    "main",
+                    schema,
+                    ResolvedRelation::View(Box::new(view.clone())),
+                ));
+            }
         }
+        None
     })
 }
 
 /// Multi-database variant of [`explain_query_plan`].
 pub fn explain_query_plan_in_db_set(stmt: &Stmt, db_set: &DatabaseSet) -> Result<Vec<Vec<Value>>> {
     explain_query_plan_core(stmt, |name| {
-        let (db_id, tbl) = db_set.find_table_in_set(name).ok().flatten()?;
+        let (db_id, rel) = db_set.find_relation_in_set(name).ok().flatten()?;
         let slot = db_set.slot(db_id)?;
-        Some((slot.name.as_str(), &slot.schema, tbl))
+        Some((db_id, slot.name.as_str(), &slot.schema, rel))
     })
 }
 
-fn explain_query_plan_core<'a, F>(stmt: &Stmt, resolve_table: F) -> Result<Vec<Vec<Value>>>
+fn explain_query_plan_core<'a, F>(stmt: &Stmt, resolve_relation: F) -> Result<Vec<Vec<Value>>>
 where
-    F: Fn(&QualifiedName) -> Option<(&'a str, &'a Schema, TableSchema)>,
+    F: Fn(&QualifiedName) -> Option<(DatabaseId, &'a str, &'a Schema, ResolvedRelation)>,
 {
     let mut rows = Vec::new();
     let mut next_id = 2i64;
@@ -2405,63 +2426,126 @@ where
         next_id += 1;
     };
 
-    match stmt {
-        Stmt::Select(sel) => {
-            if let SelectCore::Select {
-                from: Some(fc),
-                selection,
-                ..
-            } = &sel.body.head
+    fn explain_select_plan<'a, F>(
+        sel: &SelectStmt,
+        resolve_relation: &F,
+        active_views: &mut Vec<(DatabaseId, String)>,
+        push_detail: &mut dyn FnMut(String),
+    ) -> Result<()>
+    where
+        F: Fn(&QualifiedName) -> Option<(DatabaseId, &'a str, &'a Schema, ResolvedRelation)>,
+    {
+        let explain_view = |db_id: DatabaseId,
+                            sname: &str,
+                            view: &ViewSchema,
+                            active_views: &mut Vec<(DatabaseId, String)>,
+                            push_detail: &mut dyn FnMut(String)|
+         -> Result<()> {
+            let key = (db_id, view.name.to_ascii_lowercase());
+            if active_views.contains(&key) {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("view {} is circularly defined", view.name),
+                ));
+            }
+            let fixed = if db_id != DatabaseId::TEMP {
+                fix_permanent_view_select(&view.name, sname, &view.select)?
+            } else {
+                view.select.clone()
+            };
+            active_views.push(key);
+            let res = explain_select_plan(&fixed, resolve_relation, active_views, push_detail);
+            active_views.pop();
+            res
+        };
+
+        let is_cte = |qn: &QualifiedName| {
+            qn.schema.is_none()
+                && sel
+                    .ctes
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(&qn.name))
+        };
+
+        if let SelectCore::Select {
+            from: Some(fc),
+            selection,
+            ..
+        } = &sel.body.head
+        {
+            if fc.joins.is_empty()
+                && let TableOrSubquery::Table {
+                    name,
+                    alias,
+                    indexed_by,
+                } = &fc.head
+                && !is_cte(name)
+                && let Some((db_id, sname, slot_schema, rel)) = resolve_relation(name)
             {
-                if fc.joins.is_empty()
-                    && let TableOrSubquery::Table {
-                        name,
-                        alias,
-                        indexed_by,
-                    } = &fc.head
-                    && let Some((sname, slot_schema, tbl)) = resolve_table(name)
-                {
-                    let plan = match indexed_by {
-                        Some(IndexHint::NotIndexed) => AccessPlan::FullScan,
-                        _ => choose_access_plan_with_schema_name(
-                            &tbl,
-                            sname,
-                            alias.as_deref(),
-                            selection.as_ref(),
-                            slot_schema,
-                        ),
-                    };
-                    let disp = alias.as_deref().unwrap_or(&tbl.name);
-                    push_detail(plan.explain_detail(disp));
-                } else {
-                    if let TableOrSubquery::Table { name, alias, .. } = &fc.head {
-                        push_detail(format!("SCAN {}", alias.as_deref().unwrap_or(&name.name)));
-                    } else {
-                        push_detail("SCAN SUBQUERY".to_owned());
+                match rel {
+                    ResolvedRelation::Table(tbl) => {
+                        let plan = match indexed_by {
+                            Some(IndexHint::NotIndexed) => AccessPlan::FullScan,
+                            _ => choose_access_plan_with_schema_name(
+                                &tbl,
+                                sname,
+                                alias.as_deref(),
+                                selection.as_ref(),
+                                slot_schema,
+                            ),
+                        };
+                        let disp = alias.as_deref().unwrap_or(&tbl.name);
+                        push_detail(plan.explain_detail(disp));
                     }
-                    for j in &fc.joins {
-                        match &j.right {
-                            TableOrSubquery::Table { name, alias, .. } => {
+                    ResolvedRelation::View(view) => {
+                        explain_view(db_id, sname, &view, active_views, push_detail)?;
+                    }
+                }
+            } else {
+                let mut explain_tos = |tos: &TableOrSubquery| -> Result<()> {
+                    match tos {
+                        TableOrSubquery::Table { name, alias, .. } => {
+                            if !is_cte(name)
+                                && let Some((db_id, sname, _, ResolvedRelation::View(view))) =
+                                    resolve_relation(name)
+                            {
+                                explain_view(db_id, sname, &view, active_views, push_detail)?;
+                            } else {
                                 push_detail(format!(
                                     "SCAN {}",
                                     alias.as_deref().unwrap_or(&name.name)
                                 ));
                             }
-                            TableOrSubquery::Subquery { .. } => {
-                                push_detail("SCAN SUBQUERY".to_owned());
-                            }
+                        }
+                        TableOrSubquery::Subquery { .. } => {
+                            push_detail("SCAN SUBQUERY".to_owned());
                         }
                     }
+                    Ok(())
+                };
+                explain_tos(&fc.head)?;
+                for j in &fc.joins {
+                    explain_tos(&j.right)?;
                 }
-                if !sel.order_by.is_empty() {
-                    push_detail("USE TEMP B-TREE FOR ORDER BY".to_owned());
-                }
-            } else {
-                push_detail("SCAN CONSTANT ROW".to_owned());
             }
+            if !sel.order_by.is_empty() {
+                push_detail("USE TEMP B-TREE FOR ORDER BY".to_owned());
+            }
+        } else {
+            push_detail("SCAN CONSTANT ROW".to_owned());
+        }
+        Ok(())
+    }
+
+    match stmt {
+        Stmt::Select(sel) => {
+            let mut active_views = Vec::new();
+            explain_select_plan(sel, &resolve_relation, &mut active_views, &mut push_detail)?;
         }
         Stmt::Update(upd) => {
-            if let Some((sname, slot_schema, tbl)) = resolve_table(&upd.table) {
+            if let Some((_, sname, slot_schema, ResolvedRelation::Table(tbl))) =
+                resolve_relation(&upd.table)
+            {
                 let plan = choose_access_plan_with_schema_name(
                     &tbl,
                     sname,
@@ -2474,7 +2558,9 @@ where
             }
         }
         Stmt::Delete(del) => {
-            if let Some((sname, slot_schema, tbl)) = resolve_table(&del.table) {
+            if let Some((_, sname, slot_schema, ResolvedRelation::Table(tbl))) =
+                resolve_relation(&del.table)
+            {
                 let plan = choose_access_plan_with_schema_name(
                     &tbl,
                     sname,
@@ -2482,7 +2568,7 @@ where
                     del.selection.as_ref(),
                     slot_schema,
                 );
-                let disp = del.alias.as_deref().unwrap_or(&tbl.name);
+                let disp = del.alias.as_deref().unwrap_or(&del.table.name);
                 push_detail(plan.explain_detail(disp));
             }
         }

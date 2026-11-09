@@ -1,10 +1,14 @@
 //! Schema catalog (`sqlite_schema` / `sqlite_master` on Page 1), ported from `sqlite/src/build.c`
 //! and `sqlite/src/prepare.c`.
+#![forbid(unsafe_code)]
 
 use sqliters_btree::Btree;
+use sqliters_syntax::FkAction;
 use sqliters_syntax::{
-    ColumnConstraint, ColumnDef, ConflictAction, CreateIndexStmt, CreateTableStmt, Expr, FkAction,
-    IndexedColumn, Stmt, TableConstraint, parse_one,
+    ColumnConstraint, ColumnDef, ColumnRef, CommonTableExpr, ConflictAction, CreateIndexStmt,
+    CreateTableStmt, Expr, FromClause, FunctionArgs, IndexedColumn, JoinClause, JoinConstraint,
+    LimitClause, OrderByTerm, QualifiedName, ResultColumn, SelectBody, SelectCore, SelectStmt,
+    Stmt, TableConstraint, TableOrSubquery, parse_one,
 };
 use sqliters_types::{
     Collation, ErrorCode, ExecutionServices, KeySortOrder, Pgno, Result, SqliteError, TypeAffinity,
@@ -28,6 +32,8 @@ pub struct ColumnSchema {
     pub default_expr: Option<Expr>,
     pub generated: Option<(Expr, bool)>,
     pub is_primary_key: bool,
+    /// `true` when the column has an inline `UNIQUE` column constraint (`COLFLAG_UNIQUE` in `sqliteInt.h`).
+    pub is_unique: bool,
     /// 1-based position within PRIMARY KEY (`0` if not part of PK), matching `PRAGMA table_info`.
     pub pk_order: usize,
 }
@@ -149,6 +155,7 @@ impl TableSchema {
             default_expr: None,
             generated: None,
             is_primary_key: false,
+            is_unique: false,
             pk_order: 0,
         };
         Self {
@@ -352,11 +359,22 @@ pub struct PendingAutoIndex {
     pub trailing_pk_cols: Vec<IndexedColSchema>,
 }
 
-/// Complete in-memory catalog of tables and indexes loaded from `sqlite_schema` (Page 1).
+/// Parsed view entry from `sqlite_schema` / `sqlite_temp_schema` (`type = 'view'`, `rootpage = 0`).
+#[derive(Debug, Clone)]
+pub struct ViewSchema {
+    pub schema_rowid: i64,
+    pub name: String,
+    pub columns: Option<Vec<String>>,
+    pub select: SelectStmt,
+    pub raw_sql: String,
+}
+
+/// Complete in-memory catalog of tables, indexes, and views loaded from `sqlite_schema` (Page 1).
 #[derive(Debug, Clone, Default)]
 pub struct Schema {
     pub tables: Vec<TableSchema>,
     pub indexes: Vec<IndexSchema>,
+    pub views: Vec<ViewSchema>,
     pub schema_cookie: u32,
     pub loaded: bool,
     pub had_pages: bool,
@@ -401,6 +419,18 @@ impl Schema {
         self.tables
             .iter_mut()
             .find(|t| t.name.eq_ignore_ascii_case(name))
+    }
+
+    pub fn find_view(&self, name: &str) -> Option<&ViewSchema> {
+        self.views
+            .iter()
+            .find(|v| v.name.eq_ignore_ascii_case(name))
+    }
+
+    pub fn find_view_mut(&mut self, name: &str) -> Option<&mut ViewSchema> {
+        self.views
+            .iter_mut()
+            .find(|v| v.name.eq_ignore_ascii_case(name))
     }
 
     pub fn find_index(&self, name: &str) -> Option<&IndexSchema> {
@@ -453,8 +483,29 @@ impl Schema {
         Ok(())
     }
 
+    /// Ensures `self` matches the on-disk `schema_cookie` and page presence inside an active
+    /// read/write transaction, validating permanent-view `SchemaFixer` constraints against `db_schema_name`.
+    pub fn ensure_fresh_in_tx_for_schema(
+        &mut self,
+        btree: &mut Btree,
+        db_schema_name: &str,
+    ) -> Result<()> {
+        let has_pages = btree.pager().page_count() > 0;
+        let cur_cookie = btree.pager().header().schema_cookie;
+        if !self.loaded || self.had_pages != has_pages || self.schema_cookie != cur_cookie {
+            *self = Self::load_for_schema(btree, Some(db_schema_name))?;
+        }
+        Ok(())
+    }
+
     /// Loads the schema catalog from Page 1 (`sqlite_schema`).
     pub fn load(btree: &mut Btree) -> Result<Self> {
+        Self::load_for_schema(btree, None)
+    }
+
+    /// Loads the schema catalog from Page 1 (`sqlite_schema`), validating views against
+    /// `db_schema_name` (`sqlite3InitOne` / `sqlite3FixInit` parity).
+    pub fn load_for_schema(btree: &mut Btree, db_schema_name: Option<&str>) -> Result<Self> {
         let need_read_tx = btree.transaction_state() == sqliters_pager::TransactionState::Open;
         if need_read_tx {
             btree.begin_read()?;
@@ -464,12 +515,13 @@ impl Schema {
             Ok(Self {
                 tables: Vec::new(),
                 indexes: Vec::new(),
+                views: Vec::new(),
                 schema_cookie: btree.pager().header().schema_cookie,
                 loaded: true,
                 had_pages: false,
             })
         } else {
-            Self::load_inner(btree)
+            Self::load_inner(btree, db_schema_name)
         };
 
         if need_read_tx {
@@ -478,10 +530,12 @@ impl Schema {
         res
     }
 
-    fn load_inner(btree: &mut Btree) -> Result<Self> {
+    fn load_inner(btree: &mut Btree, db_schema_name: Option<&str>) -> Result<Self> {
         let enc = btree.encoding();
+        let writable_schema = btree.writable_schema();
         let raw_rows = scan_table_incremental(btree, 1)?;
         let mut tables = Vec::new();
+        let mut views = Vec::new();
         let mut pending_auto_by_table: Vec<(String, Vec<PendingAutoIndex>)> = Vec::new();
         let mut raw_index_rows: Vec<(i64, String, String, Pgno, Option<String>)> = Vec::new();
 
@@ -499,10 +553,12 @@ impl Schema {
             match obj_type {
                 "table" => {
                     if let Some(sql_text) = sql_opt {
-                        let (Some(Stmt::CreateTable(ct)), _) = parse_one(&sql_text)? else {
-                            return Err(SqliteError::corrupt(format!(
-                                "malformed CREATE TABLE in sqlite_schema for '{name}'"
-                            )));
+                        let (Some(Stmt::CreateTable(ct)), _) =
+                            parse_one(&sql_text).map_err(|_| {
+                                SqliteError::corrupt("database disk image is malformed")
+                            })?
+                        else {
+                            return Err(SqliteError::corrupt("database disk image is malformed"));
                         };
                         let (mut tbl, autos) = build_table_schema_from_ast(&ct, rootpage)?;
                         tbl.schema_rowid = rowid;
@@ -515,8 +571,57 @@ impl Schema {
                 "index" => {
                     raw_index_rows.push((rowid, name, tbl_name, rootpage, sql_opt));
                 }
+                "view" => {
+                    if let Some(sql_text) = sql_opt {
+                        let parsed = parse_one(&sql_text);
+                        let cv = match parsed {
+                            Ok((Some(Stmt::CreateView(cv)), _)) => cv,
+                            _ => {
+                                if writable_schema {
+                                    continue;
+                                }
+                                return Err(SqliteError::corrupt(
+                                    "database disk image is malformed",
+                                ));
+                            }
+                        };
+                        if let Err(e) = validate_view_no_parameters(&cv.query) {
+                            if writable_schema {
+                                continue;
+                            }
+                            return Err(SqliteError::corrupt(format!(
+                                "malformed database schema ({name}) - {}",
+                                e.message
+                            )));
+                        }
+                        let mut fixed_select = *cv.query;
+                        if let Some(sname) = db_schema_name
+                            && !sname.eq_ignore_ascii_case("temp")
+                        {
+                            match fix_permanent_view_select(&name, sname, &fixed_select) {
+                                Ok(sel) => fixed_select = sel,
+                                Err(e) => {
+                                    if writable_schema {
+                                        continue;
+                                    }
+                                    return Err(SqliteError::corrupt(format!(
+                                        "malformed database schema ({name}) - {}",
+                                        e.message
+                                    )));
+                                }
+                            }
+                        }
+                        views.push(ViewSchema {
+                            schema_rowid: rowid,
+                            name,
+                            columns: cv.columns,
+                            select: fixed_select,
+                            raw_sql: sql_text,
+                        });
+                    }
+                }
                 _ => {
-                    // Views / triggers ignored if present
+                    // Triggers ignored until Phase 4
                 }
             }
         }
@@ -531,10 +636,10 @@ impl Schema {
             };
 
             if let Some(sql_text) = sql_opt {
-                let (Some(Stmt::CreateIndex(ci)), _) = parse_one(&sql_text)? else {
-                    return Err(SqliteError::corrupt(format!(
-                        "malformed CREATE INDEX in sqlite_schema for '{idx_name}'"
-                    )));
+                let (Some(Stmt::CreateIndex(ci)), _) = parse_one(&sql_text)
+                    .map_err(|_| SqliteError::corrupt("database disk image is malformed"))?
+                else {
+                    return Err(SqliteError::corrupt("database disk image is malformed"));
                 };
                 let mut idx = build_index_schema_from_ast(&ci, tbl, rootpage)?;
                 idx.schema_rowid = rowid;
@@ -572,6 +677,7 @@ impl Schema {
         Ok(Self {
             tables,
             indexes,
+            views,
             schema_cookie: btree.pager().header().schema_cookie,
             loaded: true,
             had_pages: true,
@@ -710,6 +816,7 @@ pub fn build_table_schema_from_ast(
             default_expr,
             generated,
             is_primary_key: is_pk,
+            is_unique: !unique_constraints.is_empty(),
             pk_order,
         });
 
@@ -873,6 +980,13 @@ pub fn build_table_schema_from_ast(
                 });
             }
         }
+    }
+
+    if columns.iter().all(|c| c.generated.is_some()) {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            "must have at least one non-generated column",
+        ));
     }
 
     if ct.strict || ct.without_rowid {
@@ -1144,6 +1258,12 @@ pub fn build_column_schema_from_def(
             "Cannot add a NOT NULL column with default value NULL",
         ));
     }
+    let mut is_unique = false;
+    for cons in &cdef.constraints {
+        if matches!(cons, ColumnConstraint::Unique { .. }) {
+            is_unique = true;
+        }
+    }
     Ok(ColumnSchema {
         name: cdef.name.clone(),
         type_name: cdef.type_name.clone(),
@@ -1153,6 +1273,7 @@ pub fn build_column_schema_from_def(
         default_expr,
         generated,
         is_primary_key: false,
+        is_unique,
         pk_order: 0,
     })
 }
@@ -1420,4 +1541,769 @@ pub(crate) fn scan_index_incremental_with_services(
     })();
     btree.close_cursor(cid);
     res
+}
+
+// ============================================================================
+// SchemaFixer (`sqlite3FixInit` / `sqlite3FixSelect` in `sqlite/src/attach.c`)
+// ============================================================================
+
+/// Rejects any bind parameter (`?`, `?NNN`, `:name`, `@name`, `$name`) inside a `VIEW`'s `SELECT`
+/// AST (`"parameters are not allowed in views"`, `sqlite/src/build.c:3089`).
+pub fn validate_view_no_parameters(select: &SelectStmt) -> Result<()> {
+    for cte in &select.ctes {
+        validate_view_no_parameters(&cte.query)?;
+    }
+    validate_core_no_params(&select.body.head)?;
+    for (_, core) in &select.body.compounds {
+        validate_core_no_params(core)?;
+    }
+    for ob in &select.order_by {
+        validate_expr_no_params(&ob.expr)?;
+    }
+    if let Some(ref lim) = select.limit {
+        validate_expr_no_params(&lim.limit)?;
+        if let Some(ref off) = lim.offset {
+            validate_expr_no_params(off)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_core_no_params(core: &SelectCore) -> Result<()> {
+    match core {
+        SelectCore::Select {
+            projection,
+            from,
+            selection,
+            group_by,
+            having,
+            ..
+        } => {
+            for rc in projection {
+                if let ResultColumn::Expr { expr, .. } = rc {
+                    validate_expr_no_params(expr)?;
+                }
+            }
+            if let Some(f) = from {
+                validate_tos_no_params(&f.head)?;
+                for j in &f.joins {
+                    validate_tos_no_params(&j.right)?;
+                    if let Some(JoinConstraint::On(ref on_expr)) = j.constraint {
+                        validate_expr_no_params(on_expr)?;
+                    }
+                }
+            }
+            if let Some(w) = selection {
+                validate_expr_no_params(w)?;
+            }
+            for g in group_by {
+                validate_expr_no_params(g)?;
+            }
+            if let Some(h) = having {
+                validate_expr_no_params(h)?;
+            }
+        }
+        SelectCore::Values(rows) => {
+            for r in rows {
+                for e in r {
+                    validate_expr_no_params(e)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_tos_no_params(tos: &TableOrSubquery) -> Result<()> {
+    if let TableOrSubquery::Subquery { query, .. } = tos {
+        validate_view_no_parameters(query)?;
+    }
+    Ok(())
+}
+
+fn validate_expr_no_params(expr: &Expr) -> Result<()> {
+    match expr {
+        Expr::Bind(_) => Err(SqliteError::new(
+            ErrorCode::Error,
+            "parameters are not allowed in views",
+        )),
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Integer(_)
+        | Expr::Float(_)
+        | Expr::String(_)
+        | Expr::Blob(_)
+        | Expr::CurrentTimeKw(_)
+        | Expr::Column(_) => Ok(()),
+        Expr::Unary { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => validate_expr_no_params(inner),
+        Expr::Binary { left, right, .. } => {
+            validate_expr_no_params(left)?;
+            validate_expr_no_params(right)
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            validate_expr_no_params(e)?;
+            validate_expr_no_params(low)?;
+            validate_expr_no_params(high)
+        }
+        Expr::InList { expr: e, list, .. } => {
+            validate_expr_no_params(e)?;
+            for item in list {
+                validate_expr_no_params(item)?;
+            }
+            Ok(())
+        }
+        Expr::InSubquery {
+            expr: e, subquery, ..
+        } => {
+            validate_expr_no_params(e)?;
+            validate_view_no_parameters(subquery)
+        }
+        Expr::InTable { expr: e, .. } => validate_expr_no_params(e),
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            validate_expr_no_params(e)?;
+            validate_expr_no_params(pattern)?;
+            if let Some(esc) = escape {
+                validate_expr_no_params(esc)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                validate_expr_no_params(op)?;
+            }
+            for (c, v) in branches {
+                validate_expr_no_params(c)?;
+                validate_expr_no_params(v)?;
+            }
+            if let Some(el) = else_expr {
+                validate_expr_no_params(el)?;
+            }
+            Ok(())
+        }
+        Expr::FunctionCall { args, filter, .. } => {
+            if let FunctionArgs::Exprs(es) = args {
+                for e in es {
+                    validate_expr_no_params(e)?;
+                }
+            }
+            if let Some(f) = filter {
+                validate_expr_no_params(f)?;
+            }
+            Ok(())
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
+            validate_view_no_parameters(subquery)
+        }
+        Expr::RowValue(es) => {
+            for e in es {
+                validate_expr_no_params(e)?;
+            }
+            Ok(())
+        }
+        Expr::Raise { message, .. } => {
+            if let Some(m) = message {
+                validate_expr_no_params(m)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Applies `SchemaFixer` (`sqlite3FixInit` / `sqlite3FixSelect`) to a permanent view's `SelectStmt`:
+/// - Rejects any explicit schema qualification (`schema.table`, `schema.table.col`, `schema.table.*`,
+///   `IN schema.table`) whose schema does not case-insensitively match `db_schema_name`
+///   (`"view <view_name> cannot reference objects in database <other_schema>"`).
+/// - Pins unqualified `FROM` / `JOIN` / `IN table` object references that do NOT match a locally
+///   in-scope CTE name strictly to `db_schema_name`, preventing `TEMP` tables or views from ever
+///   shadowing objects referenced inside a permanent view.
+pub fn fix_permanent_view_select(
+    view_name: &str,
+    db_schema_name: &str,
+    select: &SelectStmt,
+) -> Result<SelectStmt> {
+    fix_select_with_ctes(view_name, db_schema_name, select, &[])
+}
+
+fn check_allowed_schema(view_name: &str, db_schema_name: &str, explicit: &str) -> Result<()> {
+    if !explicit.eq_ignore_ascii_case(db_schema_name) {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("view {view_name} cannot reference objects in database {explicit}"),
+        ));
+    }
+    Ok(())
+}
+
+fn fix_qualified_relation(
+    view_name: &str,
+    db_schema_name: &str,
+    qn: &QualifiedName,
+    in_scope_ctes: &[String],
+) -> Result<QualifiedName> {
+    if let Some(ref s) = qn.schema {
+        check_allowed_schema(view_name, db_schema_name, s)?;
+        Ok(QualifiedName::qualified(
+            db_schema_name.to_owned(),
+            qn.name.clone(),
+        ))
+    } else if in_scope_ctes
+        .iter()
+        .any(|cte_name| cte_name.eq_ignore_ascii_case(&qn.name))
+    {
+        Ok(qn.clone())
+    } else {
+        Ok(QualifiedName::qualified(
+            db_schema_name.to_owned(),
+            qn.name.clone(),
+        ))
+    }
+}
+
+fn fix_select_with_ctes(
+    view_name: &str,
+    db_schema_name: &str,
+    select: &SelectStmt,
+    outer_ctes: &[String],
+) -> Result<SelectStmt> {
+    let mut full_scope: Vec<String> = outer_ctes.to_vec();
+    for cte in &select.ctes {
+        full_scope.push(cte.name.clone());
+    }
+
+    let mut fixed_ctes = Vec::with_capacity(select.ctes.len());
+    for cte in &select.ctes {
+        let mut sc: Vec<String> = outer_ctes.to_vec();
+        for sibling in &select.ctes {
+            sc.push(sibling.name.clone());
+        }
+        fixed_ctes.push(CommonTableExpr {
+            name: cte.name.clone(),
+            columns: cte.columns.clone(),
+            query: fix_select_with_ctes(view_name, db_schema_name, &cte.query, &sc)?,
+        });
+    }
+
+    let head = fix_core_with_ctes(view_name, db_schema_name, &select.body.head, &full_scope)?;
+    let mut compounds = Vec::with_capacity(select.body.compounds.len());
+    for (op, core) in &select.body.compounds {
+        compounds.push((
+            *op,
+            fix_core_with_ctes(view_name, db_schema_name, core, &full_scope)?,
+        ));
+    }
+    let mut order_by = Vec::with_capacity(select.order_by.len());
+    for ob in &select.order_by {
+        order_by.push(OrderByTerm {
+            expr: fix_expr_with_ctes(view_name, db_schema_name, &ob.expr, &full_scope)?,
+            desc: ob.desc,
+            nulls_last: ob.nulls_last,
+        });
+    }
+    let limit = match &select.limit {
+        Some(lim) => Some(LimitClause {
+            limit: fix_expr_with_ctes(view_name, db_schema_name, &lim.limit, &full_scope)?,
+            offset: match &lim.offset {
+                Some(off) => Some(fix_expr_with_ctes(
+                    view_name,
+                    db_schema_name,
+                    off,
+                    &full_scope,
+                )?),
+                None => None,
+            },
+        }),
+        None => None,
+    };
+
+    Ok(SelectStmt {
+        ctes: fixed_ctes,
+        body: SelectBody { head, compounds },
+        order_by,
+        limit,
+    })
+}
+
+fn fix_core_with_ctes(
+    view_name: &str,
+    db_schema_name: &str,
+    core: &SelectCore,
+    in_scope_ctes: &[String],
+) -> Result<SelectCore> {
+    match core {
+        SelectCore::Select {
+            distinct,
+            projection,
+            from,
+            selection,
+            group_by,
+            having,
+        } => {
+            let mut fixed_proj = Vec::with_capacity(projection.len());
+            for rc in projection {
+                match rc {
+                    ResultColumn::Star => fixed_proj.push(ResultColumn::Star),
+                    ResultColumn::TableStar { schema, table } => {
+                        if let Some(s) = schema {
+                            check_allowed_schema(view_name, db_schema_name, s)?;
+                        }
+                        fixed_proj.push(ResultColumn::TableStar {
+                            schema: schema.clone(),
+                            table: table.clone(),
+                        });
+                    }
+                    ResultColumn::Expr { expr, alias } => {
+                        fixed_proj.push(ResultColumn::Expr {
+                            expr: fix_expr_with_ctes(
+                                view_name,
+                                db_schema_name,
+                                expr,
+                                in_scope_ctes,
+                            )?,
+                            alias: alias.clone(),
+                        });
+                    }
+                }
+            }
+            let fixed_from = match from {
+                Some(f) => {
+                    let head =
+                        fix_tos_with_ctes(view_name, db_schema_name, &f.head, in_scope_ctes)?;
+                    let mut joins = Vec::with_capacity(f.joins.len());
+                    for j in &f.joins {
+                        let right =
+                            fix_tos_with_ctes(view_name, db_schema_name, &j.right, in_scope_ctes)?;
+                        let constraint = match &j.constraint {
+                            Some(JoinConstraint::On(e)) => Some(JoinConstraint::On(
+                                fix_expr_with_ctes(view_name, db_schema_name, e, in_scope_ctes)?,
+                            )),
+                            Some(JoinConstraint::Using(cols)) => {
+                                Some(JoinConstraint::Using(cols.clone()))
+                            }
+                            None => None,
+                        };
+                        joins.push(JoinClause {
+                            join_type: j.join_type,
+                            natural: j.natural,
+                            right,
+                            constraint,
+                        });
+                    }
+                    Some(FromClause { head, joins })
+                }
+                None => None,
+            };
+            let fixed_sel = match selection {
+                Some(w) => Some(fix_expr_with_ctes(
+                    view_name,
+                    db_schema_name,
+                    w,
+                    in_scope_ctes,
+                )?),
+                None => None,
+            };
+            let mut fixed_gb = Vec::with_capacity(group_by.len());
+            for g in group_by {
+                fixed_gb.push(fix_expr_with_ctes(
+                    view_name,
+                    db_schema_name,
+                    g,
+                    in_scope_ctes,
+                )?);
+            }
+            let fixed_hav = match having {
+                Some(h) => Some(fix_expr_with_ctes(
+                    view_name,
+                    db_schema_name,
+                    h,
+                    in_scope_ctes,
+                )?),
+                None => None,
+            };
+            Ok(SelectCore::Select {
+                distinct: *distinct,
+                projection: fixed_proj,
+                from: fixed_from,
+                selection: fixed_sel,
+                group_by: fixed_gb,
+                having: fixed_hav,
+            })
+        }
+        SelectCore::Values(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for r in rows {
+                let mut row_out = Vec::with_capacity(r.len());
+                for e in r {
+                    row_out.push(fix_expr_with_ctes(
+                        view_name,
+                        db_schema_name,
+                        e,
+                        in_scope_ctes,
+                    )?);
+                }
+                out.push(row_out);
+            }
+            Ok(SelectCore::Values(out))
+        }
+    }
+}
+
+fn fix_tos_with_ctes(
+    view_name: &str,
+    db_schema_name: &str,
+    tos: &TableOrSubquery,
+    in_scope_ctes: &[String],
+) -> Result<TableOrSubquery> {
+    match tos {
+        TableOrSubquery::Table {
+            name,
+            alias,
+            indexed_by,
+        } => Ok(TableOrSubquery::Table {
+            name: fix_qualified_relation(view_name, db_schema_name, name, in_scope_ctes)?,
+            alias: alias.clone(),
+            indexed_by: indexed_by.clone(),
+        }),
+        TableOrSubquery::Subquery { query, alias } => Ok(TableOrSubquery::Subquery {
+            query: Box::new(fix_select_with_ctes(
+                view_name,
+                db_schema_name,
+                query,
+                in_scope_ctes,
+            )?),
+            alias: alias.clone(),
+        }),
+    }
+}
+
+fn fix_expr_with_ctes(
+    view_name: &str,
+    db_schema_name: &str,
+    expr: &Expr,
+    in_scope_ctes: &[String],
+) -> Result<Expr> {
+    match expr {
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Integer(_)
+        | Expr::Float(_)
+        | Expr::String(_)
+        | Expr::Blob(_)
+        | Expr::CurrentTimeKw(_)
+        | Expr::Bind(_) => Ok(expr.clone()),
+        Expr::Column(ColumnRef {
+            schema,
+            table,
+            column,
+        }) => {
+            if let Some(s) = schema {
+                check_allowed_schema(view_name, db_schema_name, s)?;
+            }
+            Ok(Expr::Column(ColumnRef {
+                schema: schema.clone(),
+                table: table.clone(),
+                column: column.clone(),
+            }))
+        }
+        Expr::Unary { op, expr: inner } => Ok(Expr::Unary {
+            op: *op,
+            expr: Box::new(fix_expr_with_ctes(
+                view_name,
+                db_schema_name,
+                inner,
+                in_scope_ctes,
+            )?),
+        }),
+        Expr::Binary { left, op, right } => Ok(Expr::Binary {
+            left: Box::new(fix_expr_with_ctes(
+                view_name,
+                db_schema_name,
+                left,
+                in_scope_ctes,
+            )?),
+            op: *op,
+            right: Box::new(fix_expr_with_ctes(
+                view_name,
+                db_schema_name,
+                right,
+                in_scope_ctes,
+            )?),
+        }),
+        Expr::Between {
+            expr: e,
+            low,
+            high,
+            negated,
+        } => Ok(Expr::Between {
+            expr: Box::new(fix_expr_with_ctes(
+                view_name,
+                db_schema_name,
+                e,
+                in_scope_ctes,
+            )?),
+            low: Box::new(fix_expr_with_ctes(
+                view_name,
+                db_schema_name,
+                low,
+                in_scope_ctes,
+            )?),
+            high: Box::new(fix_expr_with_ctes(
+                view_name,
+                db_schema_name,
+                high,
+                in_scope_ctes,
+            )?),
+            negated: *negated,
+        }),
+        Expr::InList {
+            expr: e,
+            list,
+            negated,
+        } => {
+            let mut fixed_list = Vec::with_capacity(list.len());
+            for item in list {
+                fixed_list.push(fix_expr_with_ctes(
+                    view_name,
+                    db_schema_name,
+                    item,
+                    in_scope_ctes,
+                )?);
+            }
+            Ok(Expr::InList {
+                expr: Box::new(fix_expr_with_ctes(
+                    view_name,
+                    db_schema_name,
+                    e,
+                    in_scope_ctes,
+                )?),
+                list: fixed_list,
+                negated: *negated,
+            })
+        }
+        Expr::InSubquery {
+            expr: e,
+            subquery,
+            negated,
+        } => Ok(Expr::InSubquery {
+            expr: Box::new(fix_expr_with_ctes(
+                view_name,
+                db_schema_name,
+                e,
+                in_scope_ctes,
+            )?),
+            subquery: Box::new(fix_select_with_ctes(
+                view_name,
+                db_schema_name,
+                subquery,
+                in_scope_ctes,
+            )?),
+            negated: *negated,
+        }),
+        Expr::InTable {
+            expr: e,
+            table,
+            negated,
+        } => Ok(Expr::InTable {
+            expr: Box::new(fix_expr_with_ctes(
+                view_name,
+                db_schema_name,
+                e,
+                in_scope_ctes,
+            )?),
+            table: fix_qualified_relation(view_name, db_schema_name, table, in_scope_ctes)?,
+            negated: *negated,
+        }),
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            op,
+            negated,
+        } => Ok(Expr::Like {
+            expr: Box::new(fix_expr_with_ctes(
+                view_name,
+                db_schema_name,
+                e,
+                in_scope_ctes,
+            )?),
+            pattern: Box::new(fix_expr_with_ctes(
+                view_name,
+                db_schema_name,
+                pattern,
+                in_scope_ctes,
+            )?),
+            escape: match escape {
+                Some(esc) => Some(Box::new(fix_expr_with_ctes(
+                    view_name,
+                    db_schema_name,
+                    esc,
+                    in_scope_ctes,
+                )?)),
+                None => None,
+            },
+            op: *op,
+            negated: *negated,
+        }),
+        Expr::IsNull {
+            expr: inner,
+            negated,
+        } => Ok(Expr::IsNull {
+            expr: Box::new(fix_expr_with_ctes(
+                view_name,
+                db_schema_name,
+                inner,
+                in_scope_ctes,
+            )?),
+            negated: *negated,
+        }),
+        Expr::Collate {
+            expr: inner,
+            collation,
+        } => Ok(Expr::Collate {
+            expr: Box::new(fix_expr_with_ctes(
+                view_name,
+                db_schema_name,
+                inner,
+                in_scope_ctes,
+            )?),
+            collation: collation.clone(),
+        }),
+        Expr::Cast {
+            expr: inner,
+            type_name,
+        } => Ok(Expr::Cast {
+            expr: Box::new(fix_expr_with_ctes(
+                view_name,
+                db_schema_name,
+                inner,
+                in_scope_ctes,
+            )?),
+            type_name: type_name.clone(),
+        }),
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            let fixed_op = match operand {
+                Some(op) => Some(Box::new(fix_expr_with_ctes(
+                    view_name,
+                    db_schema_name,
+                    op,
+                    in_scope_ctes,
+                )?)),
+                None => None,
+            };
+            let mut fixed_branches = Vec::with_capacity(branches.len());
+            for (c, v) in branches {
+                fixed_branches.push((
+                    fix_expr_with_ctes(view_name, db_schema_name, c, in_scope_ctes)?,
+                    fix_expr_with_ctes(view_name, db_schema_name, v, in_scope_ctes)?,
+                ));
+            }
+            let fixed_else = match else_expr {
+                Some(el) => Some(Box::new(fix_expr_with_ctes(
+                    view_name,
+                    db_schema_name,
+                    el,
+                    in_scope_ctes,
+                )?)),
+                None => None,
+            };
+            Ok(Expr::Case {
+                operand: fixed_op,
+                branches: fixed_branches,
+                else_expr: fixed_else,
+            })
+        }
+        Expr::FunctionCall {
+            name,
+            distinct,
+            args,
+            filter,
+        } => {
+            let fixed_args = match args {
+                FunctionArgs::Star => FunctionArgs::Star,
+                FunctionArgs::Exprs(es) => {
+                    let mut out = Vec::with_capacity(es.len());
+                    for e in es {
+                        out.push(fix_expr_with_ctes(
+                            view_name,
+                            db_schema_name,
+                            e,
+                            in_scope_ctes,
+                        )?);
+                    }
+                    FunctionArgs::Exprs(out)
+                }
+            };
+            let fixed_filter = match filter {
+                Some(f) => Some(Box::new(fix_expr_with_ctes(
+                    view_name,
+                    db_schema_name,
+                    f,
+                    in_scope_ctes,
+                )?)),
+                None => None,
+            };
+            Ok(Expr::FunctionCall {
+                name: name.clone(),
+                distinct: *distinct,
+                args: fixed_args,
+                filter: fixed_filter,
+            })
+        }
+        Expr::Exists { subquery, negated } => Ok(Expr::Exists {
+            subquery: Box::new(fix_select_with_ctes(
+                view_name,
+                db_schema_name,
+                subquery,
+                in_scope_ctes,
+            )?),
+            negated: *negated,
+        }),
+        Expr::Subquery(subquery) => Ok(Expr::Subquery(Box::new(fix_select_with_ctes(
+            view_name,
+            db_schema_name,
+            subquery,
+            in_scope_ctes,
+        )?))),
+        Expr::RowValue(es) => {
+            let mut out = Vec::with_capacity(es.len());
+            for e in es {
+                out.push(fix_expr_with_ctes(
+                    view_name,
+                    db_schema_name,
+                    e,
+                    in_scope_ctes,
+                )?);
+            }
+            Ok(Expr::RowValue(out))
+        }
+        Expr::Raise { action, message } => Ok(Expr::Raise {
+            action: *action,
+            message: match message {
+                Some(m) => Some(Box::new(fix_expr_with_ctes(
+                    view_name,
+                    db_schema_name,
+                    m,
+                    in_scope_ctes,
+                )?)),
+                None => None,
+            },
+        }),
+    }
 }

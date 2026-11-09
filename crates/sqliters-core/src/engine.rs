@@ -14,11 +14,12 @@ use sqliters_pager::{
 };
 use sqliters_syntax::{
     AlterTableAction, BinaryOp, BindParam, ColumnDef, ColumnRef, CommonTableExpr, CompoundOp,
-    ConflictAction, CreateIndexStmt, CreateTableStmt, CurrentTimeKind, DeleteStmt, Expr, FkAction,
-    FromClause, FunctionArgs, IndexHint, InsertSource, InsertStmt, JoinClause, JoinConstraint,
-    JoinType, LikeOp, LimitClause, OrderByTerm, PragmaValue, QualifiedName, ResultColumn,
-    SelectBody, SelectCore, SelectStmt, Stmt, TableOrSubquery, Token, TokenKind, UnaryOp,
-    UpdateStmt, dequote, keyword_kind, parse_one, tokenize,
+    ConflictAction, CreateIndexStmt, CreateTableStmt, CreateViewStmt, CurrentTimeKind, DeleteStmt,
+    Expr, FkAction, FromClause, FunctionArgs, IdentSpanMap, IndexHint, InsertSource, InsertStmt,
+    JoinClause, JoinConstraint, JoinType, LikeOp, LimitClause, OrderByTerm, PragmaValue,
+    QualifiedName, ResultColumn, SelectBody, SelectCore, SelectStmt, Stmt, TableOrSubquery, Token,
+    TokenKind, TokenSpan, UnaryOp, UpdateStmt, apply_span_edits, dequote, keyword_kind, parse_one,
+    parse_one_with_spans, remove_column_def_from_create_table_sql, tokenize,
 };
 use sqliters_types::{
     Collation, ConflictResolutionEffect, DatabaseId, DatabaseKind, ErrorCode, ExecutionServices,
@@ -37,16 +38,16 @@ use crate::compiler::{
     AccessPlan, choose_access_plan_with_schema_name, compile_for_explain_in_db_set,
     explain_query_plan_in_db_set, expr_column_label, expr_contains_aggregate,
 };
-use crate::db_set::{DatabaseSet, SchemaInstanceId, TempStoreMode};
+use crate::db_set::{DatabaseSet, ResolvedRelation, SchemaInstanceId, TempStoreMode};
 use crate::execution_context::{
     CollationRegistry, CommitCoordinatorHooks, ExecutionContext, FunctionRegistry, ProgressTracker,
 };
 use crate::schema::{
-    ColumnSchema, ForeignKeySchema, IndexSchema, Schema, TableRowKey, TableSchema,
+    ColumnSchema, ForeignKeySchema, IndexSchema, Schema, TableRowKey, TableSchema, ViewSchema,
     build_column_schema_from_def, build_index_schema_from_ast, build_table_schema_from_ast,
-    delete_schema_entry, insert_schema_entry, scan_index_incremental,
+    delete_schema_entry, fix_permanent_view_select, insert_schema_entry, scan_index_incremental,
     scan_index_incremental_with_services, scan_table_incremental,
-    scan_table_incremental_with_services, update_schema_entry,
+    scan_table_incremental_with_services, update_schema_entry, validate_view_no_parameters,
 };
 
 /// Materialized result set (`column_names` + `rows`) produced by executing a statement.
@@ -207,6 +208,7 @@ pub struct ExecContext<'a> {
     pub activity: ActivitySummary,
     pub stmt_tx: &'a mut StmtTxTracker,
     pub foreign_keys: &'a mut bool,
+    pub legacy_alter_table: &'a mut bool,
     pub count_changes: &'a mut bool,
     pub wal_autocheckpoint_threshold: &'a mut i32,
     pub default_locking_mode: &'a mut LockingMode,
@@ -342,7 +344,8 @@ impl ExecContext<'_> {
             }
         }
         if check_schema {
-            slot.schema.ensure_fresh_in_tx(bt)?;
+            let slot_name = slot.name.clone();
+            slot.schema.ensure_fresh_in_tx_for_schema(bt, &slot_name)?;
         }
         Ok(())
     }
@@ -365,6 +368,7 @@ impl ExecContext<'_> {
             .db_set
             .slot_mut(db_id)
             .ok_or_else(|| SqliteError::new(ErrorCode::Error, "unknown database slot"))?;
+        let slot_name = slot.name.clone();
         let bt = slot
             .btree
             .as_mut()
@@ -383,7 +387,7 @@ impl ExecContext<'_> {
         if !autocommit {
             *self.in_user_btree_tx = true;
         }
-        if check_schema && let Err(e) = slot.schema.ensure_fresh_in_tx(bt) {
+        if check_schema && let Err(e) = slot.schema.ensure_fresh_in_tx_for_schema(bt, &slot_name) {
             if !was_write {
                 let retain = (self.activity.other_read_db_mask & bit) != 0;
                 let _ = bt.pager_mut().rollback_retaining_read(retain);
@@ -875,7 +879,10 @@ fn exec_attach_database(
     }
 
     // Eagerly read and validate schema (`sqlite3InitOne` in `attach.c:226-240`).
-    let loaded_schema = match ctx.busy_policy.retry_btree(&mut new_bt, Schema::load) {
+    let loaded_schema = match ctx
+        .busy_policy
+        .retry_btree(&mut new_bt, |b| Schema::load_for_schema(b, Some(&z_name)))
+    {
         Ok(s) => s,
         Err(e) => {
             let _ = new_bt.close();
@@ -990,7 +997,7 @@ pub(crate) fn rollback_all_databases(
     if reload_schemas_if_changed && *ctx.schema_changed_in_tx {
         for slot in ctx.db_set.slots_mut() {
             if let Some(ref mut bt) = slot.btree
-                && let Ok(fresh) = Schema::load(bt)
+                && let Ok(fresh) = Schema::load_for_schema(bt, Some(&slot.name))
             {
                 slot.schema = fresh;
             }
@@ -1270,7 +1277,9 @@ pub(crate) fn classify_stmt_category(stmt: &Stmt) -> StmtCategory {
         | Stmt::Delete(_)
         | Stmt::CreateTable(_)
         | Stmt::CreateTableAs { .. }
+        | Stmt::CreateView(_)
         | Stmt::DropTable { .. }
+        | Stmt::DropView { .. }
         | Stmt::CreateIndex(_)
         | Stmt::DropIndex { .. }
         | Stmt::AlterTable { .. }
@@ -1435,9 +1444,34 @@ struct CteStore {
     resolving: Vec<(usize, usize)>,
     /// Optional outer row limit hint `(scope_idx, cte_idx, max_rows)` for unbounded recursive CTEs.
     limit_hint: Option<(usize, usize, usize)>,
+    /// Active view expansion chain `(db_id, lowercase_view_name)` to detect circular views (`select.c`).
+    resolving_views: Vec<(DatabaseId, String)>,
 }
 
 impl CteStore {
+    fn enter_view(&self, db_id: DatabaseId, view_name: &str) -> Result<Self> {
+        let lower = view_name.to_ascii_lowercase();
+        if self
+            .resolving_views
+            .iter()
+            .any(|(id, n)| *id == db_id && *n == lower)
+        {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("view {view_name} is circularly defined"),
+            ));
+        }
+        let mut resolving_views = self.resolving_views.clone();
+        resolving_views.push((db_id, lower));
+        Ok(Self {
+            scopes: Vec::new(),
+            working: Vec::new(),
+            resolving: Vec::new(),
+            limit_hint: None,
+            resolving_views,
+        })
+    }
+
     fn with_scope(&self, ctes: &[CommonTableExpr]) -> Self {
         let mut next = self.clone();
         if !ctes.is_empty() {
@@ -1690,7 +1724,7 @@ pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
                         {
                             db_slot.schema = saved_schema.clone();
                         } else if let Some(ref mut bt) = db_slot.btree {
-                            db_slot.schema = Schema::load(bt)?;
+                            db_slot.schema = Schema::load_for_schema(bt, Some(&db_slot.name))?;
                         }
                     }
                 }
@@ -1911,8 +1945,16 @@ pub(crate) fn execute_write_body(
             exec_create_table_as(ctx, *temp, *if_not_exists, name, query, params)?;
             Ok(QueryOutput::default())
         }
+        Stmt::CreateView(cv) => {
+            exec_create_view(ctx, cv)?;
+            Ok(QueryOutput::default())
+        }
         Stmt::DropTable { if_exists, name } => {
             exec_drop_table(ctx, *if_exists, name)?;
+            Ok(QueryOutput::default())
+        }
+        Stmt::DropView { if_exists, name } => {
+            exec_drop_view(ctx, *if_exists, name)?;
             Ok(QueryOutput::default())
         }
         Stmt::CreateIndex(ci) => {
@@ -1965,9 +2007,10 @@ pub(crate) fn execute_write_body(
                     ctx.ensure_write_db(db_id, false)?;
                     let v = pragma_to_i64(pv) as u32;
                     let slot = ctx.db_set.slot_mut(db_id).unwrap();
+                    let slot_name = slot.name.clone();
                     if let Some(ref mut bt) = slot.btree {
                         bt.pager_mut().header_mut()?.schema_cookie = v;
-                        slot.schema = Schema::load(bt)?;
+                        slot.schema = Schema::load_for_schema(bt, Some(&slot_name))?;
                     }
                     *ctx.schema_generation += 1;
                     *ctx.v1_expire_generation += 1;
@@ -2019,10 +2062,11 @@ pub fn execute_statement(
 ) -> Result<QueryOutput> {
     if stmt_loads_schema_on_prepare(stmt) {
         for slot in ctx.db_set.slots_mut() {
+            let slot_name = slot.name.clone();
             if let Some(ref mut bt) = slot.btree
                 && bt.transaction_state() != TransactionState::Open
             {
-                slot.schema.ensure_fresh_in_tx(bt)?;
+                slot.schema.ensure_fresh_in_tx_for_schema(bt, &slot_name)?;
             }
         }
     }
@@ -2175,7 +2219,7 @@ where
             {
                 slot.schema = saved.clone();
             } else if let Some(ref mut bt) = slot.btree
-                && let Ok(fresh) = Schema::load(bt)
+                && let Ok(fresh) = Schema::load_for_schema(bt, Some(&slot.name))
             {
                 slot.schema = fresh;
             }
@@ -2660,6 +2704,7 @@ fn resolve_cte(
             r
         },
         limit_hint: None,
+        resolving_views: ctes.resolving_views.clone(),
     };
 
     let mut cte_out = match classify_cte_recursion(&cte) {
@@ -3985,6 +4030,84 @@ fn eval_from_clause(
     Ok(left_rows)
 }
 
+fn disambiguate_view_column_names(raw_names: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(raw_names.len());
+    for raw in raw_names {
+        if !out.iter().any(|ex| ex.eq_ignore_ascii_case(raw)) {
+            out.push(raw.clone());
+            continue;
+        }
+        let base = match raw.rfind(':') {
+            Some(pos)
+                if pos + 1 < raw.len()
+                    && raw.as_bytes()[pos + 1..].iter().all(u8::is_ascii_digit) =>
+            {
+                &raw[..pos]
+            }
+            _ => raw.as_str(),
+        };
+        let mut k = 1usize;
+        loop {
+            let candidate = format!("{base}:{k}");
+            if !out.iter().any(|ex| ex.eq_ignore_ascii_case(&candidate)) {
+                out.push(candidate);
+                break;
+            }
+            k += 1;
+        }
+    }
+    out
+}
+
+fn prepare_fixed_view_select(
+    db_id: DatabaseId,
+    schema_name: &str,
+    view: &ViewSchema,
+) -> Result<SelectStmt> {
+    validate_view_no_parameters(&view.select)?;
+    if db_id != DatabaseId::TEMP {
+        fix_permanent_view_select(&view.name, schema_name, &view.select)
+    } else {
+        Ok(view.select.clone())
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn eval_view_query_output(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    view: &ViewSchema,
+    ctes: &CteStore,
+) -> Result<(QueryOutput, Vec<(Option<TypeAffinity>, Collation)>, String)> {
+    ctx.ensure_read_db(db_id, true)?;
+    let schema_lbl = ctx
+        .db_set
+        .slot(db_id)
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| "main".to_owned());
+    let view_ctes = ctes.enter_view(db_id, &view.name)?;
+    let fixed_sel = prepare_fixed_view_select(db_id, &schema_lbl, view)?;
+    let meta = infer_select_stmt_meta(&fixed_sel, &[], ctx.db_set, &view_ctes);
+    let mut out = exec_select(ctx, &fixed_sel, &[], &[], &view_ctes)?;
+    if let Some(ref explicit_cols) = view.columns {
+        if explicit_cols.len() != out.column_names.len() {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!(
+                    "expected {} columns for '{}' but got {}",
+                    explicit_cols.len(),
+                    view.name,
+                    out.column_names.len()
+                ),
+            ));
+        }
+        out.column_names = disambiguate_view_column_names(explicit_cols);
+    } else {
+        out.column_names = disambiguate_view_column_names(&out.column_names);
+    }
+    Ok((out, meta, schema_lbl))
+}
+
 fn eval_table_or_subquery(
     ctx: &mut ExecContext<'_>,
     tos: &TableOrSubquery,
@@ -4032,6 +4155,47 @@ fn eval_table_or_subquery(
                     .collect::<Vec<_>>()
                     .into();
                 return Ok(cte_out
+                    .rows
+                    .into_iter()
+                    .map(|r| EvalRow {
+                        cols: Rc::clone(&cols),
+                        vals: r,
+                    })
+                    .collect());
+            }
+
+            if ctx.db_set.resolve_catalog_table(name)?.is_none()
+                && let Some((v_db_id, view_ref)) = ctx.db_set.find_view_in_set(name)
+            {
+                if let Some(IndexHint::IndexedBy(idx)) = indexed_by {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("no such index: {idx}"),
+                    ));
+                }
+                let view_cloned = view_ref.clone();
+                let (v_out, v_meta, schema_lbl) =
+                    eval_view_query_output(ctx, v_db_id, &view_cloned, ctes)?;
+                let cols: Rc<[ScopedColumn]> = v_out
+                    .column_names
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, cn)| {
+                        let (aff, coll) =
+                            v_meta.get(i).copied().unwrap_or((None, Collation::Binary));
+                        ScopedColumn {
+                            schema_name: Some(schema_lbl.clone()),
+                            table_alias: Some(eff_alias.clone()),
+                            name: cn,
+                            collation: coll,
+                            affinity: aff,
+                            hidden_rowid: false,
+                            merged_using: false,
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .into();
+                return Ok(v_out
                     .rows
                     .into_iter()
                     .map(|r| EvalRow {
@@ -4814,6 +4978,16 @@ fn schema_cols_for_tos(
                         })
                         .collect(),
                 );
+            }
+            if ctx
+                .db_set
+                .resolve_catalog_table(name)
+                .ok()
+                .flatten()
+                .is_none()
+                && let Some((v_db_id, view_ref)) = ctx.db_set.find_view_in_set(name)
+            {
+                return static_view_scoped_cols(v_db_id, view_ref, &eff, ctx.db_set, ctes, &[]);
             }
             let (_, tbl, schema_lbl) = resolve_table_for_query_in_set(ctx.db_set, name).ok()?;
             let mut cols: Vec<ScopedColumn> = tbl
@@ -5821,6 +5995,7 @@ fn infer_cte_meta_guarded(
         working: Vec::new(),
         resolving: Vec::new(),
         limit_hint: None,
+        resolving_views: ctes.resolving_views.clone(),
     };
     if !cte.query.ctes.is_empty() {
         sub_ctes.scopes.push(cte.query.ctes.clone());
@@ -5852,6 +6027,60 @@ fn infer_select_body_meta(
     infer_select_body_meta_guarded(body, outer_scopes, db_set, ctes, &mut visited)
 }
 
+fn expr_data_type_mask(
+    mut expr: &Expr,
+    scopes: &[EvalRow],
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    visited: &mut Vec<(usize, usize)>,
+) -> u8 {
+    loop {
+        match expr {
+            Expr::Collate { expr: inner, .. }
+            | Expr::Unary {
+                op: UnaryOp::Plus,
+                expr: inner,
+            } => {
+                expr = inner;
+            }
+            Expr::Null => return 0,
+            Expr::String(_) => return 0x02,
+            Expr::Blob(_) => return 0x04,
+            Expr::Binary {
+                op: BinaryOp::Concat,
+                ..
+            } => return 0x06,
+            Expr::Bind(_) | Expr::FunctionCall { .. } => return 0x07,
+            Expr::Column(_) | Expr::Subquery(_) | Expr::Cast { .. } | Expr::RowValue(_) => {
+                let aff =
+                    infer_expr_affinity_in_scopes_guarded(expr, scopes, db_set, ctes, visited);
+                return match aff {
+                    Some(TypeAffinity::Numeric | TypeAffinity::Integer | TypeAffinity::Real) => {
+                        0x05
+                    }
+                    Some(TypeAffinity::Text) => 0x06,
+                    _ => 0x07,
+                };
+            }
+            Expr::Case {
+                branches,
+                else_expr,
+                ..
+            } => {
+                let mut res = 0u8;
+                for (_, then_e) in branches {
+                    res |= expr_data_type_mask(then_e, scopes, db_set, ctes, visited);
+                }
+                if let Some(el) = else_expr {
+                    res |= expr_data_type_mask(el, scopes, db_set, ctes, visited);
+                }
+                return res;
+            }
+            _ => return 0x01,
+        }
+    }
+}
+
 fn infer_select_body_meta_guarded(
     body: &SelectBody,
     outer_scopes: &[EvalRow],
@@ -5860,29 +6089,60 @@ fn infer_select_body_meta_guarded(
     visited: &mut Vec<(usize, usize)>,
 ) -> Vec<(Option<TypeAffinity>, Collation)> {
     let head_meta = infer_select_core_meta(&body.head, outer_scopes, db_set, ctes, visited);
-    let mut combined: Vec<(Option<TypeAffinity>, Option<Collation>)> = head_meta;
+    if body.compounds.is_empty() {
+        return head_meta
+            .into_iter()
+            .map(|(a, c, _)| (a, c.unwrap_or(Collation::Binary)))
+            .collect();
+    }
+    let mut all_arms = Vec::with_capacity(1 + body.compounds.len());
+    all_arms.push(head_meta);
     for (_, rhs_core) in &body.compounds {
-        let rhs_meta = infer_select_core_meta(rhs_core, outer_scopes, db_set, ctes, visited);
-        for (i, (r_aff, r_coll)) in rhs_meta.into_iter().enumerate() {
-            if let Some((c_aff, c_coll)) = combined.get_mut(i) {
-                if c_coll.is_none() && r_coll.is_some() {
-                    *c_coll = r_coll;
-                }
-                if *c_aff != r_aff {
-                    // Per SQLite `select.c` (`multiSelect`): if compound arms disagree on affinity, check numeric compatibility or fall back to BLOB/None
-                    *c_aff = match (*c_aff, r_aff) {
-                        (Some(a), Some(b)) if a == b => Some(a),
-                        (Some(a), None) | (None, Some(a)) => Some(a),
-                        _ => Some(TypeAffinity::Blob),
-                    };
-                }
+        all_arms.push(infer_select_core_meta(
+            rhs_core,
+            outer_scopes,
+            db_set,
+            ctes,
+            visited,
+        ));
+    }
+    let width = all_arms[0].len();
+    let mut out = Vec::with_capacity(width);
+    for i in 0..width {
+        let mut coll: Option<Collation> = None;
+        for arm in &all_arms {
+            if let Some((_, Some(c), _)) = arm.get(i) {
+                coll = Some(*c);
+                break;
             }
         }
+        // Per `sqlite/src/select.c` (`sqlite3SubqueryColumnTypes`):
+        let mut k = 0usize;
+        let mut aff = all_arms[0].get(i).and_then(|(a, _, _)| *a);
+        let mut mask = 0u8;
+        while aff.is_none() && k + 1 < all_arms.len() {
+            if let Some((_, _, m)) = all_arms[k].get(i) {
+                mask |= *m;
+            }
+            k += 1;
+            aff = all_arms[k].get(i).and_then(|(a, _, _)| *a);
+        }
+        for arm in &all_arms[(k + 1)..] {
+            if let Some((_, _, m)) = arm.get(i) {
+                mask |= *m;
+            }
+        }
+        if (aff == Some(TypeAffinity::Text) && (mask & 0x01) != 0)
+            || (matches!(
+                aff,
+                Some(TypeAffinity::Numeric | TypeAffinity::Integer | TypeAffinity::Real)
+            ) && (mask & 0x02) != 0)
+        {
+            aff = Some(TypeAffinity::Blob);
+        }
+        out.push((aff, coll.unwrap_or(Collation::Binary)));
     }
-    combined
-        .into_iter()
-        .map(|(a, c)| (a, c.unwrap_or(Collation::Binary)))
-        .collect()
+    out
 }
 
 fn infer_select_core_meta(
@@ -5891,7 +6151,7 @@ fn infer_select_core_meta(
     db_set: &DatabaseSet,
     ctes: &CteStore,
     visited: &mut Vec<(usize, usize)>,
-) -> Vec<(Option<TypeAffinity>, Option<Collation>)> {
+) -> Vec<(Option<TypeAffinity>, Option<Collation>, u8)> {
     match core {
         SelectCore::Values(rows) => {
             let Some(first) = rows.first() else {
@@ -5908,7 +6168,8 @@ fn infer_select_core_meta(
                         visited,
                     );
                     let coll = infer_expr_explicit_or_col_collation(e, &[], outer_scopes);
-                    (aff, coll)
+                    let mask = expr_data_type_mask(e, outer_scopes, db_set, ctes, visited);
+                    (aff, coll, mask)
                 })
                 .collect()
         }
@@ -5939,7 +6200,8 @@ fn infer_select_core_meta(
                     );
                     let coll =
                         infer_expr_explicit_or_col_collation(&pe, &sample_cols, outer_scopes);
-                    (aff, coll)
+                    let mask = expr_data_type_mask(&pe, &full_scopes, db_set, ctes, visited);
+                    (aff, coll, mask)
                 })
                 .collect()
         }
@@ -5962,6 +6224,54 @@ fn static_schema_cols_for_from(
         }
     }
     Some(cols)
+}
+
+fn static_view_scoped_cols(
+    db_id: DatabaseId,
+    view: &ViewSchema,
+    eff_alias: &str,
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    visited: &[(usize, usize)],
+) -> Option<Vec<ScopedColumn>> {
+    let view_ctes = ctes.enter_view(db_id, &view.name).ok()?;
+    let schema_lbl = db_set
+        .slot(db_id)
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| "main".to_owned());
+    let fixed_sel = prepare_fixed_view_select(db_id, &schema_lbl, view).ok()?;
+    let sub_ctes = view_ctes.with_scope(&fixed_sel.ctes);
+    let mut inner_visited = visited.to_vec();
+    let meta =
+        infer_select_body_meta_guarded(&fixed_sel.body, &[], db_set, &sub_ctes, &mut inner_visited);
+    let select_names =
+        static_select_col_names(&fixed_sel.body, &[], db_set, &sub_ctes, &mut inner_visited);
+    let final_names = if let Some(ref explicit) = view.columns {
+        if explicit.len() != select_names.len() {
+            return None;
+        }
+        disambiguate_view_column_names(explicit)
+    } else {
+        disambiguate_view_column_names(&select_names)
+    };
+    Some(
+        final_names
+            .into_iter()
+            .enumerate()
+            .map(|(i, cn)| {
+                let (aff, coll) = meta.get(i).copied().unwrap_or((None, Collation::Binary));
+                ScopedColumn {
+                    schema_name: Some(schema_lbl.clone()),
+                    table_alias: Some(eff_alias.to_owned()),
+                    name: cn,
+                    collation: coll,
+                    affinity: aff,
+                    hidden_rowid: false,
+                    merged_using: false,
+                }
+            })
+            .collect(),
+    )
 }
 
 fn static_schema_cols_for_tos(
@@ -5991,6 +6301,7 @@ fn static_schema_cols_for_tos(
                         working: Vec::new(),
                         resolving: Vec::new(),
                         limit_hint: None,
+                        resolving_views: ctes.resolving_views.clone(),
                     };
                     if !cte.query.ctes.is_empty() {
                         sub_ctes.scopes.push(cte.query.ctes.clone());
@@ -6024,6 +6335,11 @@ fn static_schema_cols_for_tos(
                         })
                         .collect(),
                 );
+            }
+            if db_set.resolve_catalog_table(name).ok().flatten().is_none()
+                && let Some((v_db_id, view_ref)) = db_set.find_view_in_set(name)
+            {
+                return static_view_scoped_cols(v_db_id, view_ref, &eff, db_set, ctes, visited);
             }
             let (_db_id, tbl, schema_lbl) = resolve_table_for_query_in_set(db_set, name).ok()?;
             let mut cols: Vec<ScopedColumn> = tbl
@@ -6737,6 +7053,19 @@ fn eval_expr_rt(
                 }
                 let meta = infer_cte_meta_by_name(&table.name, scopes, ctx.db_set, ctes);
                 (cte_out.rows, meta)
+            } else if ctx.db_set.resolve_catalog_table(table)?.is_none()
+                && let Some((v_db_id, view_ref)) = ctx.db_set.find_view_in_set(table)
+            {
+                let view_cloned = view_ref.clone();
+                let (v_out, v_meta, _) = eval_view_query_output(ctx, v_db_id, &view_cloned, ctes)?;
+                let m = v_out.column_names.len();
+                if m != n {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("sub-select returns {m} columns - expected {n}"),
+                    ));
+                }
+                (v_out.rows, v_meta)
             } else {
                 let (db_id, tbl, _) = resolve_table_for_query_in_set(ctx.db_set, table)?;
                 let m = tbl.columns.len();
@@ -7741,6 +8070,9 @@ fn encode_table_physical_record(
         } else {
             slots.push(v.clone());
         }
+    }
+    if slots.is_empty() {
+        slots.push(Value::Null);
     }
     encode_record_with_encoding(&slots, enc)
 }
@@ -9348,12 +9680,22 @@ fn resolve_dml_target_table_in_set(
         return Ok((cat_db_id, tbl, sname, true));
     }
 
-    if let Some((db_id, tbl)) = db_set.find_user_table_in_set(qn) {
-        let sname = db_set
-            .slot(db_id)
-            .map(|s| s.name.clone())
-            .unwrap_or_else(|| "main".to_owned());
-        return Ok((db_id, tbl.clone(), sname, false));
+    if let Some((db_id, rel)) = db_set.find_relation_in_set(qn)? {
+        match rel {
+            ResolvedRelation::Table(tbl) => {
+                let sname = db_set
+                    .slot(db_id)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|| "main".to_owned());
+                return Ok((db_id, *tbl, sname, false));
+            }
+            ResolvedRelation::View(v) => {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("cannot modify {} because it is a view", v.name),
+                ));
+            }
+        }
     }
 
     Err(SqliteError::new(
@@ -9936,6 +10278,28 @@ fn is_reserved_sqlite_name(name: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"sqlite_"))
 }
 
+fn is_non_droppable_system_table_name(name: &str) -> bool {
+    let Some(rest) = name.as_bytes().get(7..) else {
+        return false;
+    };
+    if !name.as_bytes()[..7].eq_ignore_ascii_case(b"sqlite_") {
+        return false;
+    }
+    if rest
+        .get(..4)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"stat"))
+    {
+        return false;
+    }
+    if rest
+        .get(..10)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"parameters"))
+    {
+        return false;
+    }
+    true
+}
+
 fn validate_drop_or_alter_schema_table_in_set(
     db_set: &DatabaseSet,
     name: &QualifiedName,
@@ -9943,25 +10307,34 @@ fn validate_drop_or_alter_schema_table_in_set(
 ) -> Result<()> {
     match name.schema.as_deref() {
         None => {
-            if Schema::is_schema_table_name(&name.name)
-                || Schema::is_temp_schema_table_name(&name.name)
+            if Schema::is_temp_schema_table_name(&name.name) {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("table sqlite_temp_master may not be {verb}"),
+                ));
+            }
+            if name.name.eq_ignore_ascii_case("sqlite_schema")
+                || name.name.eq_ignore_ascii_case("sqlite_master")
             {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    format!("table {} may not be {verb}", name.name),
+                    format!("table sqlite_master may not be {verb}"),
                 ));
             }
         }
         Some(s) => {
-            if let Some(db_id) = db_set.find_db_id(s) {
-                let is_sys = Schema::is_schema_table_name(&name.name)
-                    || (db_id == DatabaseId::TEMP && Schema::is_temp_schema_table_name(&name.name));
-                if is_sys {
-                    return Err(SqliteError::new(
-                        ErrorCode::Error,
-                        format!("table {} may not be {verb}", name.name),
-                    ));
-                }
+            if let Some(db_id) = db_set.find_db_id(s)
+                && DatabaseSet::is_catalog_table_in_db(db_id, &name.name)
+            {
+                let canonical = if db_id == DatabaseId::TEMP {
+                    "sqlite_temp_master"
+                } else {
+                    "sqlite_master"
+                };
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("table {canonical} may not be {verb}"),
+                ));
             }
         }
     }
@@ -9996,6 +10369,15 @@ fn exec_create_table(ctx: &mut ExecContext<'_>, ct: &CreateTableStmt) -> Result<
             return Err(SqliteError::new(
                 ErrorCode::Error,
                 format!("table {} already exists", ct.name.name),
+            ));
+        }
+        if slot.schema.find_view(&ct.name.name).is_some() {
+            if ct.if_not_exists {
+                return Ok(());
+            }
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("view {} already exists", ct.name.name),
             ));
         }
         if slot.schema.find_index(&ct.name.name).is_some() {
@@ -10056,7 +10438,7 @@ fn exec_create_table(ctx: &mut ExecContext<'_>, ct: &CreateTableStmt) -> Result<
         ));
     }
 
-    slot.schema = Schema::load(bt)?;
+    slot.reload_schema()?;
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;
     *ctx.schema_changed_in_tx = true;
@@ -10094,6 +10476,15 @@ fn exec_create_table_as(
             return Err(SqliteError::new(
                 ErrorCode::Error,
                 format!("table {} already exists", name.name),
+            ));
+        }
+        if slot.schema.find_view(&name.name).is_some() {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("view {} already exists", name.name),
             ));
         }
         if slot.schema.find_index(&name.name).is_some() {
@@ -10237,6 +10628,166 @@ fn apply_root_page_move(btree: &mut Btree, schema: &mut Schema, mv: RootPageMove
     )))
 }
 
+fn exec_create_view(ctx: &mut ExecContext<'_>, cv: &CreateViewStmt) -> Result<()> {
+    let db_id = resolve_create_table_target(ctx.db_set, cv.temp, &cv.name)?;
+    if !*ctx.writable_schema && is_reserved_sqlite_name(&cv.name.name) {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("object name reserved for internal use: {}", cv.name.name),
+        ));
+    }
+    validate_view_no_parameters(&cv.query)?;
+    if db_id != DatabaseId::TEMP {
+        let slot_name = ctx
+            .db_set
+            .slot(db_id)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "main".to_owned());
+        let _ = fix_permanent_view_select(&cv.name.name, &slot_name, &cv.query)?;
+    }
+    if db_id == DatabaseId::TEMP {
+        let enc = ctx.encoding();
+        ctx.db_set.ensure_temp_open(enc, *ctx.writable_schema)?;
+    }
+
+    ctx.ensure_write_db(db_id, true)?;
+    {
+        let slot = ctx
+            .db_set
+            .slot(db_id)
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        if slot.schema.find_user_table(&cv.name.name).is_some() {
+            if cv.if_not_exists {
+                return Ok(());
+            }
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("table {} already exists", cv.name.name),
+            ));
+        }
+        if slot.schema.find_view(&cv.name.name).is_some() {
+            if cv.if_not_exists {
+                return Ok(());
+            }
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("view {} already exists", cv.name.name),
+            ));
+        }
+        if slot.schema.find_index(&cv.name.name).is_some() {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("there is already an index named {}", cv.name.name),
+            ));
+        }
+    }
+
+    let slot = ctx
+        .db_set
+        .slot_mut(db_id)
+        .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+    let bt = slot
+        .btree
+        .as_mut()
+        .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+    insert_schema_entry(
+        bt,
+        "view",
+        &cv.name.name,
+        &cv.name.name,
+        0,
+        Some(&cv.catalog_sql),
+    )?;
+    if bt.pager().page_count() > slot.max_page_count {
+        return Err(SqliteError::new(
+            ErrorCode::Full,
+            "database or disk is full",
+        ));
+    }
+    slot.reload_schema()?;
+    *ctx.schema_generation += 1;
+    *ctx.v1_expire_generation += 1;
+    *ctx.schema_changed_in_tx = true;
+    Ok(())
+}
+
+fn exec_drop_view(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedName) -> Result<()> {
+    if let Some(ref s) = name.schema
+        && ctx.db_set.find_db_id(s).is_none()
+    {
+        if if_exists {
+            return Ok(());
+        }
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("unknown database {s}"),
+        ));
+    }
+    validate_drop_or_alter_schema_table_in_set(ctx.db_set, name, "dropped")?;
+
+    let (db_id, view_name) = match ctx.db_set.find_relation_in_set(name).ok().flatten() {
+        Some((_, ResolvedRelation::Table(t))) => {
+            if is_non_droppable_system_table_name(&t.name) {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("table {} may not be dropped", t.name),
+                ));
+            }
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("use DROP TABLE to delete table {}", t.name),
+            ));
+        }
+        Some((id, ResolvedRelation::View(v))) => (id, v.name),
+        None => {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such view: {}", name.display_name()),
+            ));
+        }
+    };
+
+    let has_open_cur = ctx
+        .db_set
+        .slot(db_id)
+        .and_then(|s| s.btree.as_ref())
+        .is_some_and(|bt| bt.has_any_other_open_cursor(None));
+    if ctx.activity.other_readers > 0 || has_open_cur {
+        return Err(SqliteError::new(
+            ErrorCode::Locked,
+            "database table is locked",
+        ));
+    }
+
+    ctx.ensure_write_db(db_id, true)?;
+    let slot = ctx
+        .db_set
+        .slot_mut(db_id)
+        .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+    let Some(view) = slot.schema.find_view(&view_name).cloned() else {
+        if if_exists {
+            return Ok(());
+        }
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("no such view: {}", name.display_name()),
+        ));
+    };
+    let bt = slot
+        .btree
+        .as_mut()
+        .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+    delete_schema_entry(bt, view.schema_rowid)?;
+    slot.reload_schema()?;
+    *ctx.schema_generation += 1;
+    *ctx.v1_expire_generation += 1;
+    *ctx.schema_changed_in_tx = true;
+    Ok(())
+}
+
 fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedName) -> Result<()> {
     if let Some(ref s) = name.schema
         && ctx.db_set.find_db_id(s).is_none()
@@ -10251,6 +10802,15 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
     }
     validate_drop_or_alter_schema_table_in_set(ctx.db_set, name, "dropped")?;
 
+    if let Some((_, ResolvedRelation::View(v))) =
+        ctx.db_set.find_relation_in_set(name).ok().flatten()
+    {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("use DROP VIEW to delete view {}", v.name),
+        ));
+    }
+
     let Some((db_id, tbl_ref)) = ctx.db_set.find_user_table_in_set(name) else {
         if if_exists {
             return Ok(());
@@ -10260,6 +10820,12 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
             format!("no such table: {}", name.display_name()),
         ));
     };
+    if is_non_droppable_system_table_name(&tbl_ref.name) {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("table {} may not be dropped", tbl_ref.name),
+        ));
+    }
     let tbl_name = tbl_ref.name.clone();
 
     let has_open_cur = ctx
@@ -10403,11 +10969,7 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
         }
     }
 
-    let bt = slot
-        .btree
-        .as_mut()
-        .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-    slot.schema = Schema::load(bt)?;
+    slot.reload_schema()?;
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;
     *ctx.schema_changed_in_tx = true;
@@ -10425,24 +10987,40 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
     let db_id = if let Some(ref s) = ci.name.schema {
         let resolved = ctx.db_set.resolve_schema_or_err(Some(s))?;
         if resolved == DatabaseId::TEMP {
+            let in_temp_view = ctx.db_set.is_temp_open()
+                && ctx
+                    .db_set
+                    .slot(DatabaseId::TEMP)
+                    .is_some_and(|sl| sl.schema.find_view(&ci.table_name).is_some());
+            if in_temp_view {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    "views may not be indexed",
+                ));
+            }
             let in_temp = ctx.db_set.is_temp_open()
                 && ctx
                     .db_set
                     .slot(DatabaseId::TEMP)
                     .is_some_and(|sl| sl.schema.find_user_table(&ci.table_name).is_some());
             if !in_temp {
-                let in_other = ctx
+                if let Some((_, rel)) = ctx
                     .db_set
-                    .find_user_table_in_set(&QualifiedName::unqualified(ci.table_name.clone()))
-                    .is_some();
-                if in_other {
-                    return Err(SqliteError::new(
-                        ErrorCode::Error,
-                        format!(
-                            "cannot create a TEMP index on non-TEMP table \"{}\"",
-                            ci.table_name
-                        ),
-                    ));
+                    .find_relation_in_set(&QualifiedName::unqualified(ci.table_name.clone()))?
+                {
+                    return match rel {
+                        ResolvedRelation::View(_) => Err(SqliteError::new(
+                            ErrorCode::Error,
+                            "views may not be indexed",
+                        )),
+                        ResolvedRelation::Table(_) => Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!(
+                                "cannot create a TEMP index on non-TEMP table \"{}\"",
+                                ci.table_name
+                            ),
+                        )),
+                    };
                 }
                 return Err(SqliteError::new(
                     ErrorCode::Error,
@@ -10450,6 +11028,15 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
                 ));
             }
         } else {
+            let is_view = ctx.db_set.slot(resolved).is_some_and(|sl| {
+                sl.btree.is_some() && sl.schema.find_view(&ci.table_name).is_some()
+            });
+            if is_view {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    "views may not be indexed",
+                ));
+            }
             let has_tbl = ctx.db_set.slot(resolved).is_some_and(|sl| {
                 sl.btree.is_some() && sl.schema.find_user_table(&ci.table_name).is_some()
             });
@@ -10462,16 +11049,24 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
         }
         resolved
     } else {
-        let Some((found_db, _)) = ctx
+        match ctx
             .db_set
-            .find_user_table_in_set(&QualifiedName::unqualified(ci.table_name.clone()))
-        else {
-            return Err(SqliteError::new(
-                ErrorCode::Error,
-                format!("no such table: {}", ci.table_name),
-            ));
-        };
-        found_db
+            .find_relation_in_set(&QualifiedName::unqualified(ci.table_name.clone()))?
+        {
+            Some((_, ResolvedRelation::View(_))) => {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    "views may not be indexed",
+                ));
+            }
+            Some((found_db, ResolvedRelation::Table(_))) => found_db,
+            None => {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such table: {}", ci.table_name),
+                ));
+            }
+        }
     };
 
     ctx.ensure_write_db(db_id, true)?;
@@ -10480,6 +11075,12 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
             .db_set
             .slot(db_id)
             .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        if slot.schema.find_view(&ci.table_name).is_some() {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                "views may not be indexed",
+            ));
+        }
         let Some(tbl) = slot.schema.find_user_table(&ci.table_name).cloned() else {
             let disp = match &ci.name.schema {
                 Some(s) => format!("{s}.{}", ci.table_name),
@@ -10490,7 +11091,9 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
                 format!("no such table: {disp}"),
             ));
         };
-        if slot.schema.find_user_table(&ci.name.name).is_some() {
+        if slot.schema.find_user_table(&ci.name.name).is_some()
+            || slot.schema.find_view(&ci.name.name).is_some()
+        {
             return Err(SqliteError::new(
                 ErrorCode::Error,
                 format!("there is already a table named {}", ci.name.name),
@@ -10541,7 +11144,7 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
             "database or disk is full",
         ));
     }
-    slot.schema = Schema::load(bt)?;
+    slot.reload_schema()?;
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;
     *ctx.schema_changed_in_tx = true;
@@ -10639,6 +11242,8 @@ fn exec_reindex(ctx: &mut ExecContext<'_>, target: Option<&QualifiedName>) -> Re
                     for idx in slot.schema.indexes_for_table(&qn.name) {
                         targets.push((db_id, idx));
                     }
+                } else if slot.schema.find_view(&qn.name).is_some() {
+                    return Ok(());
                 } else if let Some(idx) = slot.schema.find_index(&qn.name).cloned() {
                     targets.push((db_id, idx));
                 } else {
@@ -10682,6 +11287,8 @@ fn exec_reindex(ctx: &mut ExecContext<'_>, target: Option<&QualifiedName>) -> Re
                 for idx in idxs {
                     targets.push((db_id, idx));
                 }
+            } else if ctx.db_set.find_view_in_set(qn).is_some() {
+                return Ok(());
             } else if let Some((db_id, idx_ref)) = ctx.db_set.find_index_in_set(qn) {
                 targets.push((db_id, idx_ref.clone()));
             } else {
@@ -10797,14 +11404,391 @@ fn exec_drop_index(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
             .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
         apply_root_page_move(bt, &mut slot.schema, mv)?;
     }
-    let bt = slot
-        .btree
-        .as_mut()
-        .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-    slot.schema = Schema::load(bt)?;
+    slot.reload_schema()?;
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;
     *ctx.schema_changed_in_tx = true;
+    Ok(())
+}
+
+fn is_rowid_alias_keyword(name: &str) -> bool {
+    name.eq_ignore_ascii_case("rowid")
+        || name.eq_ignore_ascii_case("_rowid_")
+        || name.eq_ignore_ascii_case("oid")
+}
+
+fn check_alter_rowid_alias(tbl: &TableSchema, col_name: &str, verb: &str) -> Result<()> {
+    if !tbl.without_rowid && is_rowid_alias_keyword(col_name) {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("cannot {verb} rowid alias: {col_name}"),
+        ));
+    }
+    Ok(())
+}
+
+fn alter_view_rejection_error(view_name: &str, action: &AlterTableAction) -> SqliteError {
+    let msg = match action {
+        AlterTableAction::RenameTo(_) => format!("view {view_name} may not be altered"),
+        AlterTableAction::RenameColumn { .. } => {
+            format!("cannot rename columns of view \"{view_name}\"")
+        }
+        AlterTableAction::DropColumn(_) => format!("cannot drop column from view \"{view_name}\""),
+        AlterTableAction::AddColumn(_) => "Cannot add a column to a view".to_owned(),
+    };
+    SqliteError::new(ErrorCode::Error, msg)
+}
+
+fn validate_single_view_definition(
+    db_id: DatabaseId,
+    view: &ViewSchema,
+    db_set: &DatabaseSet,
+    functions: &FunctionRegistry,
+) -> Result<()> {
+    let mut visited = Vec::new();
+    let _ = resolve_view_columns_static(
+        db_id,
+        view,
+        db_set,
+        &CteStore::default(),
+        functions,
+        &mut visited,
+    )?;
+    Ok(())
+}
+
+fn read_live_schema_sql_map(bt: &mut Btree) -> Result<HashMap<i64, Option<String>>> {
+    let mut out = HashMap::new();
+    if bt.pager().page_count() == 0 {
+        return Ok(out);
+    }
+    let enc = bt.encoding();
+    for (rid, payload) in scan_table_incremental(bt, 1)? {
+        let cols = decode_record_with_encoding(&payload, enc)?;
+        let sql_opt = match cols.get(4) {
+            Some(Value::Text(s)) => Some(s.clone()),
+            _ => None,
+        };
+        out.insert(rid, sql_opt);
+    }
+    Ok(out)
+}
+
+fn validate_views_before_alter(
+    db_set: &DatabaseSet,
+    functions: &FunctionRegistry,
+    target_db_id: DatabaseId,
+    legacy_mode: bool,
+    writable_schema: bool,
+) -> Result<()> {
+    if writable_schema {
+        return Ok(());
+    }
+    let mut dbs = vec![target_db_id];
+    if target_db_id != DatabaseId::TEMP && db_set.is_temp_open() {
+        dbs.push(DatabaseId::TEMP);
+    }
+    for check_db in dbs {
+        let Some(slot) = db_set.slot(check_db) else {
+            continue;
+        };
+        if slot.btree.is_none() {
+            continue;
+        }
+        let views = slot.schema.views.clone();
+        for v in &views {
+            if let Err(e) = validate_single_view_definition(check_db, v, db_set, functions) {
+                if legacy_mode {
+                    // `renameFixQuotes` (`renameQuotefixFunc`, `alter.c:2000-2009, 2041`)
+                    // resolves views even under `PRAGMA legacy_alter_table = ON` and sets
+                    // `sqlite3_result_error_code(context, SQLITE_ERROR)`.
+                    return Err(SqliteError::new(ErrorCode::Error, "SQL logic error"));
+                }
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("error in view {}: {}", v.name, e.message),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_views_after_alter(
+    db_set: &DatabaseSet,
+    functions: &FunctionRegistry,
+    target_db_id: DatabaseId,
+    op_label: &str,
+) -> Result<()> {
+    let mut dbs = vec![target_db_id];
+    if target_db_id != DatabaseId::TEMP && db_set.is_temp_open() {
+        dbs.push(DatabaseId::TEMP);
+    }
+    for check_db in dbs {
+        let Some(slot) = db_set.slot(check_db) else {
+            continue;
+        };
+        if slot.btree.is_none() {
+            continue;
+        }
+        let views = slot.schema.views.clone();
+        for v in &views {
+            if let Err(e) = validate_single_view_definition(check_db, v, db_set, functions) {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("error in view {} after {op_label}: {}", v.name, e.message),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_table_and_indexes_static_after_alter(
+    db_id: DatabaseId,
+    tbl_name: &str,
+    new_ct: &CreateTableStmt,
+    explicit_index_sqls: &[(String, Pgno, String)],
+    db_set: &DatabaseSet,
+    functions: &FunctionRegistry,
+    op_label: &str,
+) -> Result<TableSchema> {
+    let (mut new_tbl, _) = build_table_schema_from_ast(new_ct, 2).map_err(|e| {
+        SqliteError::new(
+            ErrorCode::Error,
+            format!("error in table {tbl_name} after {op_label}: {}", e.message),
+        )
+    })?;
+    new_tbl.name = tbl_name.to_owned();
+    let slot_name = db_set.slot(db_id).map_or("main", |s| s.name.as_str());
+    let tbl_scope = make_static_table_scope(&new_tbl, slot_name, None);
+    let mut visited = Vec::new();
+    for col in &new_tbl.columns {
+        if let Some(ref de) = col.default_expr {
+            validate_expr_static(
+                de,
+                &[],
+                db_set,
+                &CteStore::default(),
+                functions,
+                false,
+                false,
+                &mut visited,
+            )
+            .map_err(|e| {
+                SqliteError::new(
+                    ErrorCode::Error,
+                    format!("error in table {tbl_name} after {op_label}: {}", e.message),
+                )
+            })?;
+        }
+        if let Some((ref ge, _)) = col.generated {
+            validate_expr_static(
+                ge,
+                std::slice::from_ref(&tbl_scope),
+                db_set,
+                &CteStore::default(),
+                functions,
+                false,
+                false,
+                &mut visited,
+            )
+            .map_err(|e| {
+                SqliteError::new(
+                    ErrorCode::Error,
+                    format!("error in table {tbl_name} after {op_label}: {}", e.message),
+                )
+            })?;
+        }
+    }
+    for chk in &new_tbl.checks {
+        validate_expr_static(
+            &chk.expr,
+            std::slice::from_ref(&tbl_scope),
+            db_set,
+            &CteStore::default(),
+            functions,
+            false,
+            false,
+            &mut visited,
+        )
+        .map_err(|e| {
+            SqliteError::new(
+                ErrorCode::Error,
+                format!("error in table {tbl_name} after {op_label}: {}", e.message),
+            )
+        })?;
+    }
+
+    for (idx_name, idx_root, idx_sql) in explicit_index_sqls {
+        let (Some(Stmt::CreateIndex(ci)), _) = parse_one(idx_sql).map_err(|e| {
+            SqliteError::new(
+                ErrorCode::Error,
+                format!("error in index {idx_name} after {op_label}: {}", e.message),
+            )
+        })?
+        else {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("error in index {idx_name} after {op_label}"),
+            ));
+        };
+        let idx_preview = build_index_schema_from_ast(&ci, &new_tbl, *idx_root).map_err(|e| {
+            SqliteError::new(
+                ErrorCode::Error,
+                format!("error in index {idx_name} after {op_label}: {}", e.message),
+            )
+        })?;
+        for ic in &idx_preview.columns {
+            if let Some(ref ie) = ic.expr {
+                validate_expr_static(
+                    ie,
+                    std::slice::from_ref(&tbl_scope),
+                    db_set,
+                    &CteStore::default(),
+                    functions,
+                    false,
+                    false,
+                    &mut visited,
+                )
+                .map_err(|e| {
+                    SqliteError::new(
+                        ErrorCode::Error,
+                        format!("error in index {idx_name} after {op_label}: {}", e.message),
+                    )
+                })?;
+            }
+        }
+        if let Some(ref wc) = idx_preview.where_clause {
+            validate_expr_static(
+                wc,
+                std::slice::from_ref(&tbl_scope),
+                db_set,
+                &CteStore::default(),
+                functions,
+                false,
+                false,
+                &mut visited,
+            )
+            .map_err(|e| {
+                SqliteError::new(
+                    ErrorCode::Error,
+                    format!("error in index {idx_name} after {op_label}: {}", e.message),
+                )
+            })?;
+        }
+    }
+    Ok(new_tbl)
+}
+
+fn rewrite_physical_rows_for_drop_column(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    old_tbl: &TableSchema,
+    new_tbl: &TableSchema,
+    dropped_col_idx: usize,
+) -> Result<()> {
+    let (enc, _) = slot_encoding_and_name(ctx, db_id);
+    let existing_rows = scan_table_raw_entries(ctx, db_id, old_tbl)?;
+    if existing_rows.is_empty() {
+        return Ok(());
+    }
+
+    if old_tbl.without_rowid {
+        let mut new_records = Vec::with_capacity(existing_rows.len());
+        for (_, payload) in existing_rows {
+            let phys_vals = decode_record_with_encoding(&payload, enc)?;
+            let mut old_logical = vec![Value::Null; old_tbl.columns.len()];
+            let mut p_idx = 0usize;
+            for ic in &old_tbl.without_rowid_pk_cols {
+                let ci = ic.col_idx.expect("WITHOUT ROWID PK col has col_idx");
+                if p_idx < phys_vals.len() {
+                    old_logical[ci] = phys_vals[p_idx].clone();
+                    p_idx += 1;
+                }
+            }
+            for &ci in &old_tbl.without_rowid_extra_cols {
+                let v = if p_idx < phys_vals.len() {
+                    let pv = phys_vals[p_idx].clone();
+                    p_idx += 1;
+                    pv
+                } else {
+                    let col = &old_tbl.columns[ci];
+                    let def_val = match &col.default_expr {
+                        Some(de) => eval_expr(ctx, de, &[], &[], &CteStore::default(), None)?,
+                        None => Value::Null,
+                    };
+                    let mut coerced = col.affinity.apply(def_val);
+                    if old_tbl.strict
+                        && col.type_name.trim().eq_ignore_ascii_case("REAL")
+                        && let Value::Integer(iv) = coerced
+                    {
+                        coerced = Value::real(iv as f64);
+                    }
+                    coerced
+                };
+                old_logical[ci] = v;
+            }
+            old_logical.remove(dropped_col_idx);
+            new_records.push(encode_table_physical_record(new_tbl, &old_logical, enc));
+        }
+        let pk_orders = new_tbl.without_rowid_pk_orders();
+        let bt = ctx
+            .db_set
+            .slot_mut(db_id)
+            .and_then(|s| s.btree.as_mut())
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        bt.clear_tree(new_tbl.root_pgno)?;
+        for rec in new_records {
+            bt.insert_index(new_tbl.root_pgno, &rec, &pk_orders)?;
+        }
+        return Ok(());
+    }
+
+    let mut rewritten: Vec<(i64, Vec<u8>)> = Vec::with_capacity(existing_rows.len());
+    for (rkey, payload) in existing_rows {
+        let rid = rkey.rowid_or_zero();
+        let phys_vals = decode_record_with_encoding(&payload, enc)?;
+        let mut old_logical = Vec::with_capacity(old_tbl.columns.len());
+        let mut p_idx = 0usize;
+        for (ci, col) in old_tbl.columns.iter().enumerate() {
+            let is_virt = col.generated.as_ref().is_some_and(|(_, stored)| !*stored);
+            if is_virt {
+                old_logical.push(Value::Null);
+            } else if old_tbl.rowid_alias_col == Some(ci) {
+                p_idx += 1;
+                old_logical.push(Value::Null);
+            } else if p_idx < phys_vals.len() {
+                old_logical.push(phys_vals[p_idx].clone());
+                p_idx += 1;
+            } else {
+                let def_val = match &col.default_expr {
+                    Some(de) => eval_expr(ctx, de, &[], &[], &CteStore::default(), None)?,
+                    None => Value::Null,
+                };
+                let mut coerced = col.affinity.apply(def_val);
+                if old_tbl.strict
+                    && col.type_name.trim().eq_ignore_ascii_case("REAL")
+                    && let Value::Integer(iv) = coerced
+                {
+                    coerced = Value::real(iv as f64);
+                }
+                old_logical.push(coerced);
+            }
+        }
+        old_logical.remove(dropped_col_idx);
+        let new_rec = encode_table_physical_record(new_tbl, &old_logical, enc);
+        rewritten.push((rid, new_rec));
+    }
+
+    let bt = ctx
+        .db_set
+        .slot_mut(db_id)
+        .and_then(|s| s.btree.as_mut())
+        .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+    for (rid, new_rec) in rewritten {
+        bt.insert_table(new_tbl.root_pgno, rid, &new_rec)?;
+    }
     Ok(())
 }
 
@@ -10814,143 +11798,333 @@ fn exec_alter_table(
     action: &AlterTableAction,
 ) -> Result<()> {
     validate_drop_or_alter_schema_table_in_set(ctx.db_set, table, "altered")?;
-    let Some((db_id, tbl_ref)) = ctx.db_set.find_user_table_in_set(table) else {
+    let (db_id, orig_tbl_name) = match ctx.db_set.find_relation_in_set(table)? {
+        Some((_, ResolvedRelation::View(v))) => {
+            return Err(alter_view_rejection_error(&v.name, action));
+        }
+        Some((id, ResolvedRelation::Table(t))) => (id, t.name),
+        None => {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such table: {}", table.display_name()),
+            ));
+        }
+    };
+    if is_reserved_sqlite_name(&orig_tbl_name) {
         return Err(SqliteError::new(
             ErrorCode::Error,
-            format!("no such table: {}", table.display_name()),
+            format!("table {orig_tbl_name} may not be altered"),
         ));
-    };
-    let orig_tbl_name = tbl_ref.name.clone();
+    }
 
     ctx.ensure_write_db(db_id, true)?;
-    let (tbl, schema_name) = {
+    let (tbl, schema_name, live_sql_map) = {
         let slot = ctx
             .db_set
-            .slot(db_id)
+            .slot_mut(db_id)
             .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        if let Some(v) = slot.schema.find_view(&orig_tbl_name) {
+            return Err(alter_view_rejection_error(&v.name, action));
+        }
         let Some(tbl) = slot.schema.find_user_table(&orig_tbl_name).cloned() else {
             return Err(SqliteError::new(
                 ErrorCode::Error,
                 format!("no such table: {}", table.display_name()),
             ));
         };
-        (tbl, slot.name.clone())
+        let sname = slot.name.clone();
+        let bt = slot
+            .btree
+            .as_mut()
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        let live_map = read_live_schema_sql_map(bt)?;
+        (tbl, sname, live_map)
     };
+    let live_temp_sql_map = if db_id != DatabaseId::TEMP && ctx.db_set.is_temp_open() {
+        if let Some(tslot) = ctx.db_set.slot_mut(DatabaseId::TEMP)
+            && let Some(ref mut tbt) = tslot.btree
+        {
+            read_live_schema_sql_map(tbt)?
+        } else {
+            HashMap::new()
+        }
+    } else {
+        HashMap::new()
+    };
+    let live_tbl_sql: &str = live_sql_map
+        .get(&tbl.schema_rowid)
+        .map(|o| o.as_deref().unwrap_or(""))
+        .unwrap_or(&tbl.raw_sql);
+
+    let legacy_mode = *ctx.legacy_alter_table;
+    let writable_schema = *ctx.writable_schema;
+    let fk_enabled = *ctx.foreign_keys;
 
     match action {
         AlterTableAction::RenameTo(new_name) => {
-            if is_reserved_sqlite_name(new_name) {
+            if !writable_schema && is_reserved_sqlite_name(new_name) {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!("object name reserved for internal use: {new_name}"),
                 ));
             }
-            let slot = ctx
-                .db_set
-                .slot_mut(db_id)
-                .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-            if slot.schema.find_user_table(new_name).is_some()
-                || slot.schema.find_index(new_name).is_some()
             {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    format!("there is already another table or index with this name: {new_name}"),
-                ));
-            }
-            let indexes = slot.schema.indexes_for_table(&tbl.name);
-            let other_tables: Vec<TableSchema> = slot
-                .schema
-                .tables
-                .iter()
-                .filter(|t| !t.name.eq_ignore_ascii_case(&tbl.name))
-                .cloned()
-                .collect();
-            let seq_tbl_opt = slot.schema.find_user_table("sqlite_sequence").cloned();
-            let bt = slot
-                .btree
-                .as_mut()
-                .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-
-            let new_sql =
-                rewrite_table_name_in_create_table_sql(&tbl.raw_sql, &tbl.name, new_name)?;
-            update_schema_entry(
-                bt,
-                tbl.schema_rowid,
-                "table",
-                new_name,
-                new_name,
-                tbl.root_pgno,
-                Some(&new_sql),
-            )?;
-            let mut auto_n = 0usize;
-            for idx in indexes {
-                if idx.is_autoindex {
-                    auto_n += 1;
-                    let suffix_num = idx
-                        .name
-                        .rsplit('_')
-                        .next()
-                        .and_then(|s| s.parse::<usize>().ok())
-                        .unwrap_or(auto_n);
-                    let new_auto = format!("sqlite_autoindex_{new_name}_{suffix_num}");
-                    update_schema_entry(
-                        bt,
-                        idx.schema_rowid,
-                        "index",
-                        &new_auto,
-                        new_name,
-                        idx.root_pgno,
-                        None,
-                    )?;
-                } else {
-                    let updated_idx_sql = match idx.raw_sql.as_deref() {
-                        Some(s) => Some(rewrite_table_name_in_create_index_sql(
-                            s, &tbl.name, new_name,
-                        )?),
-                        None => None,
-                    };
-                    update_schema_entry(
-                        bt,
-                        idx.schema_rowid,
-                        "index",
-                        &idx.name,
-                        new_name,
-                        idx.root_pgno,
-                        updated_idx_sql.as_deref(),
-                    )?;
-                }
-            }
-            // Rewrite `REFERENCES <old_tbl>` in other user tables strictly within `db_id`
-            for otbl in other_tables {
-                if let Some(updated_other_sql) =
-                    rewrite_fk_ref_table_in_create_table_sql(&otbl.raw_sql, &tbl.name, new_name)?
+                let slot = ctx
+                    .db_set
+                    .slot(db_id)
+                    .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+                if slot.schema.find_user_table(new_name).is_some()
+                    || slot.schema.find_view(new_name).is_some()
+                    || slot.schema.find_index(new_name).is_some()
                 {
-                    update_schema_entry(
-                        bt,
-                        otbl.schema_rowid,
-                        "table",
-                        &otbl.name,
-                        &otbl.name,
-                        otbl.root_pgno,
-                        Some(&updated_other_sql),
-                    )?;
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!(
+                            "there is already another table or index with this name: {new_name}"
+                        ),
+                    ));
                 }
             }
-            // Update `sqlite_sequence` entry in `db_id` if present
-            if let Some(seq_tbl) = seq_tbl_opt {
-                let enc = bt.encoding();
-                let rows = scan_table_incremental(bt, seq_tbl.root_pgno)?;
-                for (rid, payload) in rows {
-                    let cols = decode_record_with_encoding(&payload, enc)?;
-                    if cols.len() >= 2 && cols[0].as_str() == Some(tbl.name.as_str()) {
-                        let rec = encode_record_with_encoding(
-                            &[Value::Text(new_name.clone()), cols[1].clone()],
-                            enc,
-                        );
-                        bt.insert_table(seq_tbl.root_pgno, rid, &rec)?;
+
+            if !legacy_mode {
+                validate_views_before_alter(
+                    ctx.db_set,
+                    ctx.functions,
+                    db_id,
+                    false,
+                    writable_schema,
+                )?;
+            }
+
+            let rewrite_fks = !legacy_mode || fk_enabled;
+            let rewrite_self_exprs = !legacy_mode;
+
+            // Compute view SQL edits BEFORE mutating `db_id`'s schema so unqualified resolution in `temp` views sees pre-rename bindings!
+            let mut same_db_view_edits: Vec<(i64, String, String)> = Vec::new();
+            let mut temp_view_edits: Vec<(i64, String, String)> = Vec::new();
+            if !legacy_mode {
+                if let Some(slot) = ctx.db_set.slot(db_id) {
+                    for v in &slot.schema.views {
+                        let v_sql = live_sql_map
+                            .get(&v.schema_rowid)
+                            .and_then(|o| o.as_deref())
+                            .unwrap_or(&v.raw_sql);
+                        match rewrite_view_for_table_rename(
+                            v_sql, db_id, db_id, &tbl.name, new_name, ctx.db_set,
+                        ) {
+                            Ok(Some(updated)) => {
+                                same_db_view_edits.push((v.schema_rowid, v.name.clone(), updated));
+                            }
+                            Ok(None) => {}
+                            Err(_) if writable_schema => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+                if db_id != DatabaseId::TEMP
+                    && ctx.db_set.is_temp_open()
+                    && let Some(tslot) = ctx.db_set.slot(DatabaseId::TEMP)
+                {
+                    for v in &tslot.schema.views {
+                        let v_sql = live_temp_sql_map
+                            .get(&v.schema_rowid)
+                            .and_then(|o| o.as_deref())
+                            .unwrap_or(&v.raw_sql);
+                        match rewrite_view_for_table_rename(
+                            v_sql,
+                            DatabaseId::TEMP,
+                            db_id,
+                            &tbl.name,
+                            new_name,
+                            ctx.db_set,
+                        ) {
+                            Ok(Some(updated)) => {
+                                temp_view_edits.push((v.schema_rowid, v.name.clone(), updated));
+                            }
+                            Ok(None) => {}
+                            Err(_) if writable_schema => {}
+                            Err(e) => return Err(e),
+                        }
                     }
                 }
             }
+
+            let new_sql = rewrite_table_name_in_create_table_sql(
+                live_tbl_sql,
+                &schema_name,
+                &tbl.name,
+                new_name,
+                rewrite_fks,
+                rewrite_self_exprs,
+            )?;
+
+            let mut updated_explicit_indexes: Vec<(String, Pgno, String)> = Vec::new();
+            {
+                let slot = ctx
+                    .db_set
+                    .slot_mut(db_id)
+                    .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+                let indexes = slot.schema.indexes_for_table(&tbl.name);
+                let other_tables: Vec<TableSchema> = slot
+                    .schema
+                    .tables
+                    .iter()
+                    .filter(|t| !t.name.eq_ignore_ascii_case(&tbl.name))
+                    .cloned()
+                    .collect();
+                let seq_tbl_opt = slot.schema.find_user_table("sqlite_sequence").cloned();
+                let bt = slot
+                    .btree
+                    .as_mut()
+                    .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+
+                update_schema_entry(
+                    bt,
+                    tbl.schema_rowid,
+                    "table",
+                    new_name,
+                    new_name,
+                    tbl.root_pgno,
+                    Some(&new_sql),
+                )?;
+                let mut auto_n = 0usize;
+                for idx in indexes {
+                    if idx.is_autoindex {
+                        auto_n += 1;
+                        let suffix_num = idx
+                            .name
+                            .rsplit('_')
+                            .next()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(auto_n);
+                        let new_auto = format!("sqlite_autoindex_{new_name}_{suffix_num}");
+                        update_schema_entry(
+                            bt,
+                            idx.schema_rowid,
+                            "index",
+                            &new_auto,
+                            new_name,
+                            idx.root_pgno,
+                            None,
+                        )?;
+                    } else {
+                        let live_idx_sql = live_sql_map
+                            .get(&idx.schema_rowid)
+                            .and_then(|o| o.as_deref())
+                            .or(idx.raw_sql.as_deref());
+                        let updated_idx_sql = match live_idx_sql {
+                            Some(s) => {
+                                let u = rewrite_table_name_in_create_index_sql(
+                                    s,
+                                    &schema_name,
+                                    &tbl.name,
+                                    new_name,
+                                    rewrite_self_exprs,
+                                )?;
+                                updated_explicit_indexes.push((
+                                    idx.name.clone(),
+                                    idx.root_pgno,
+                                    u.clone(),
+                                ));
+                                Some(u)
+                            }
+                            None => None,
+                        };
+                        update_schema_entry(
+                            bt,
+                            idx.schema_rowid,
+                            "index",
+                            &idx.name,
+                            new_name,
+                            idx.root_pgno,
+                            updated_idx_sql.as_deref(),
+                        )?;
+                    }
+                }
+                if rewrite_fks {
+                    for otbl in other_tables {
+                        let otbl_sql = live_sql_map
+                            .get(&otbl.schema_rowid)
+                            .and_then(|o| o.as_deref())
+                            .unwrap_or(&otbl.raw_sql);
+                        if let Some(updated_other_sql) =
+                            rewrite_fk_ref_table_in_create_table_sql(otbl_sql, &tbl.name, new_name)?
+                        {
+                            update_schema_entry(
+                                bt,
+                                otbl.schema_rowid,
+                                "table",
+                                &otbl.name,
+                                &otbl.name,
+                                otbl.root_pgno,
+                                Some(&updated_other_sql),
+                            )?;
+                        }
+                    }
+                }
+                for (v_rowid, v_name, v_sql) in &same_db_view_edits {
+                    update_schema_entry(bt, *v_rowid, "view", v_name, v_name, 0, Some(v_sql))?;
+                }
+                if let Some(seq_tbl) = seq_tbl_opt {
+                    let enc = bt.encoding();
+                    let rows = scan_table_incremental(bt, seq_tbl.root_pgno)?;
+                    for (rid, payload) in rows {
+                        let cols = decode_record_with_encoding(&payload, enc)?;
+                        if cols.len() >= 2 && cols[0].as_str() == Some(tbl.name.as_str()) {
+                            let rec = encode_record_with_encoding(
+                                &[Value::Text(new_name.clone()), cols[1].clone()],
+                                enc,
+                            );
+                            bt.insert_table(seq_tbl.root_pgno, rid, &rec)?;
+                        }
+                    }
+                }
+                slot.reload_schema()?;
+            }
+
+            if !temp_view_edits.is_empty() {
+                ctx.ensure_write_db(DatabaseId::TEMP, true)?;
+                let tslot = ctx
+                    .db_set
+                    .slot_mut(DatabaseId::TEMP)
+                    .ok_or_else(|| SqliteError::misuse("temp database slot closed"))?;
+                {
+                    let tbt = tslot
+                        .btree
+                        .as_mut()
+                        .ok_or_else(|| SqliteError::misuse("temp database slot closed"))?;
+                    for (v_rowid, v_name, v_sql) in &temp_view_edits {
+                        update_schema_entry(tbt, *v_rowid, "view", v_name, v_name, 0, Some(v_sql))?;
+                    }
+                }
+                tslot.reload_schema()?;
+            }
+
+            *ctx.schema_generation += 1;
+            *ctx.v1_expire_generation += 1;
+            *ctx.schema_changed_in_tx = true;
+
+            if !writable_schema {
+                let (Some(Stmt::CreateTable(new_ct)), _) = parse_one(&new_sql)? else {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("error in table {new_name} after rename"),
+                    ));
+                };
+                let _ = validate_table_and_indexes_static_after_alter(
+                    db_id,
+                    new_name,
+                    &new_ct,
+                    &updated_explicit_indexes,
+                    ctx.db_set,
+                    ctx.functions,
+                    "rename",
+                )?;
+                if !legacy_mode {
+                    validate_views_after_alter(ctx.db_set, ctx.functions, db_id, "rename")?;
+                }
+            }
+            return Ok(());
         }
         AlterTableAction::RenameColumn { old_name, new_name } => {
             if tbl.find_column(old_name).is_none() {
@@ -10959,6 +12133,8 @@ fn exec_alter_table(
                     format!("no such column: \"{old_name}\""),
                 ));
             }
+            check_alter_rowid_alias(&tbl, old_name, "rename from")?;
+            check_alter_rowid_alias(&tbl, new_name, "rename to")?;
             if !old_name.eq_ignore_ascii_case(new_name) && tbl.find_column(new_name).is_some() {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
@@ -10966,90 +12142,332 @@ fn exec_alter_table(
                 ));
             }
 
-            let new_sql =
-                rewrite_column_in_create_table_sql(&tbl.raw_sql, &tbl.name, old_name, new_name)?;
-            // Validate rewritten CREATE TABLE parses cleanly before committing schema updates
-            let (Some(Stmt::CreateTable(_)), _) = parse_one(&new_sql)? else {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    format!("error in table {} after rename column", tbl.name),
-                ));
-            };
-
-            let slot = ctx
-                .db_set
-                .slot_mut(db_id)
-                .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-            let indexes = slot.schema.indexes_for_table(&tbl.name);
-            let other_tables: Vec<TableSchema> = slot
-                .schema
-                .tables
-                .iter()
-                .filter(|t| !t.name.eq_ignore_ascii_case(&tbl.name))
-                .cloned()
-                .collect();
-            let bt = slot
-                .btree
-                .as_mut()
-                .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-
-            update_schema_entry(
-                bt,
-                tbl.schema_rowid,
-                "table",
-                &tbl.name,
-                &tbl.name,
-                tbl.root_pgno,
-                Some(&new_sql),
+            // Both `renameTestSchema` (`!legacy_mode`) and `renameFixQuotes` (`legacy_mode`) run before `RENAME COLUMN`.
+            validate_views_before_alter(
+                ctx.db_set,
+                ctx.functions,
+                db_id,
+                legacy_mode,
+                writable_schema,
             )?;
 
-            // Rewrite all explicit indexes (`CREATE [UNIQUE] INDEX ... ON tbl(...) [WHERE ...]`) on `tbl`
-            for idx in indexes {
-                if idx.is_autoindex {
-                    continue;
+            // `RENAME COLUMN` ALWAYS structurally rewrites dependent views in `db_id` and `temp` (`alter.c`)!
+            let mut same_db_view_edits: Vec<(i64, String, String)> = Vec::new();
+            let mut temp_view_edits: Vec<(i64, String, String)> = Vec::new();
+            if let Some(slot) = ctx.db_set.slot(db_id) {
+                for v in &slot.schema.views {
+                    let v_sql = live_sql_map
+                        .get(&v.schema_rowid)
+                        .and_then(|o| o.as_deref())
+                        .unwrap_or(&v.raw_sql);
+                    match rewrite_view_for_column_rename(
+                        v_sql, db_id, db_id, &tbl, old_name, new_name, ctx.db_set,
+                    ) {
+                        Ok(Some(updated)) => {
+                            same_db_view_edits.push((v.schema_rowid, v.name.clone(), updated));
+                        }
+                        Ok(None) => {}
+                        Err(_) if writable_schema => {}
+                        Err(e) => return Err(e),
+                    }
                 }
-                if let Some(ref idx_sql) = idx.raw_sql {
-                    let new_idx_sql =
-                        rewrite_column_in_create_index_sql(idx_sql, &tbl.name, old_name, new_name)?;
-                    if new_idx_sql != *idx_sql {
-                        let (Some(Stmt::CreateIndex(_)), _) = parse_one(&new_idx_sql)? else {
-                            return Err(SqliteError::new(
-                                ErrorCode::Error,
-                                format!("error in index {} after rename column", idx.name),
-                            ));
-                        };
-                        update_schema_entry(
-                            bt,
-                            idx.schema_rowid,
-                            "index",
-                            &idx.name,
-                            &tbl.name,
-                            idx.root_pgno,
-                            Some(&new_idx_sql),
-                        )?;
+            }
+            if db_id != DatabaseId::TEMP
+                && ctx.db_set.is_temp_open()
+                && let Some(tslot) = ctx.db_set.slot(DatabaseId::TEMP)
+            {
+                for v in &tslot.schema.views {
+                    let v_sql = live_temp_sql_map
+                        .get(&v.schema_rowid)
+                        .and_then(|o| o.as_deref())
+                        .unwrap_or(&v.raw_sql);
+                    match rewrite_view_for_column_rename(
+                        v_sql,
+                        DatabaseId::TEMP,
+                        db_id,
+                        &tbl,
+                        old_name,
+                        new_name,
+                        ctx.db_set,
+                    ) {
+                        Ok(Some(updated)) => {
+                            temp_view_edits.push((v.schema_rowid, v.name.clone(), updated));
+                        }
+                        Ok(None) => {}
+                        Err(_) if writable_schema => {}
+                        Err(e) => return Err(e),
                     }
                 }
             }
 
-            // Rewrite `REFERENCES tbl(old_name)` in child tables strictly within `db_id`
-            for otbl in other_tables {
-                if let Some(updated_child_sql) = rewrite_fk_ref_column_in_create_table_sql(
-                    &otbl.raw_sql,
+            let new_sql =
+                rewrite_column_in_create_table_sql(live_tbl_sql, &tbl.name, old_name, new_name)?;
+            let (Some(Stmt::CreateTable(new_ct)), _) = parse_one(&new_sql)? else {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("error in table {} after rename", tbl.name),
+                ));
+            };
+
+            let mut updated_explicit_indexes: Vec<(String, Pgno, String)> = Vec::new();
+            {
+                let slot = ctx
+                    .db_set
+                    .slot_mut(db_id)
+                    .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+                let indexes = slot.schema.indexes_for_table(&tbl.name);
+                let other_tables: Vec<TableSchema> = slot
+                    .schema
+                    .tables
+                    .iter()
+                    .filter(|t| !t.name.eq_ignore_ascii_case(&tbl.name))
+                    .cloned()
+                    .collect();
+                let bt = slot
+                    .btree
+                    .as_mut()
+                    .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+
+                update_schema_entry(
+                    bt,
+                    tbl.schema_rowid,
+                    "table",
                     &tbl.name,
-                    old_name,
-                    new_name,
-                )? {
-                    update_schema_entry(
-                        bt,
-                        otbl.schema_rowid,
-                        "table",
-                        &otbl.name,
-                        &otbl.name,
-                        otbl.root_pgno,
-                        Some(&updated_child_sql),
-                    )?;
+                    &tbl.name,
+                    tbl.root_pgno,
+                    Some(&new_sql),
+                )?;
+
+                for idx in indexes {
+                    if idx.is_autoindex {
+                        continue;
+                    }
+                    let live_idx_sql = live_sql_map
+                        .get(&idx.schema_rowid)
+                        .and_then(|o| o.as_deref())
+                        .or(idx.raw_sql.as_deref());
+                    if let Some(idx_sql) = live_idx_sql {
+                        let new_idx_sql = rewrite_column_in_create_index_sql(
+                            idx_sql, &tbl.name, old_name, new_name,
+                        )?;
+                        updated_explicit_indexes.push((
+                            idx.name.clone(),
+                            idx.root_pgno,
+                            new_idx_sql.clone(),
+                        ));
+                        if new_idx_sql != idx_sql {
+                            let (Some(Stmt::CreateIndex(_)), _) = parse_one(&new_idx_sql)? else {
+                                return Err(SqliteError::new(
+                                    ErrorCode::Error,
+                                    format!("error in index {} after rename", idx.name),
+                                ));
+                            };
+                            update_schema_entry(
+                                bt,
+                                idx.schema_rowid,
+                                "index",
+                                &idx.name,
+                                &tbl.name,
+                                idx.root_pgno,
+                                Some(&new_idx_sql),
+                            )?;
+                        }
+                    }
+                }
+
+                for otbl in other_tables {
+                    let otbl_sql = live_sql_map
+                        .get(&otbl.schema_rowid)
+                        .and_then(|o| o.as_deref())
+                        .unwrap_or(&otbl.raw_sql);
+                    if let Some(updated_child_sql) = rewrite_fk_ref_column_in_create_table_sql(
+                        otbl_sql, &tbl.name, old_name, new_name,
+                    )? {
+                        update_schema_entry(
+                            bt,
+                            otbl.schema_rowid,
+                            "table",
+                            &otbl.name,
+                            &otbl.name,
+                            otbl.root_pgno,
+                            Some(&updated_child_sql),
+                        )?;
+                    }
+                }
+
+                for (v_rowid, v_name, v_sql) in &same_db_view_edits {
+                    update_schema_entry(bt, *v_rowid, "view", v_name, v_name, 0, Some(v_sql))?;
+                }
+                slot.reload_schema()?;
+            }
+
+            if !temp_view_edits.is_empty() {
+                ctx.ensure_write_db(DatabaseId::TEMP, true)?;
+                let tslot = ctx
+                    .db_set
+                    .slot_mut(DatabaseId::TEMP)
+                    .ok_or_else(|| SqliteError::misuse("temp database slot closed"))?;
+                {
+                    let tbt = tslot
+                        .btree
+                        .as_mut()
+                        .ok_or_else(|| SqliteError::misuse("temp database slot closed"))?;
+                    for (v_rowid, v_name, v_sql) in &temp_view_edits {
+                        update_schema_entry(tbt, *v_rowid, "view", v_name, v_name, 0, Some(v_sql))?;
+                    }
+                }
+                tslot.reload_schema()?;
+            }
+
+            *ctx.schema_generation += 1;
+            *ctx.v1_expire_generation += 1;
+            *ctx.schema_changed_in_tx = true;
+
+            if !writable_schema {
+                let _ = validate_table_and_indexes_static_after_alter(
+                    db_id,
+                    &tbl.name,
+                    &new_ct,
+                    &updated_explicit_indexes,
+                    ctx.db_set,
+                    ctx.functions,
+                    "rename",
+                )?;
+                if !legacy_mode {
+                    validate_views_after_alter(ctx.db_set, ctx.functions, db_id, "rename")?;
                 }
             }
+            return Ok(());
+        }
+        AlterTableAction::DropColumn(col_name) => {
+            let Some((col_idx, col)) = tbl.find_column(col_name) else {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such column: \"{col_name}\""),
+                ));
+            };
+            check_alter_rowid_alias(&tbl, col_name, "drop")?;
+            if col.is_primary_key {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("cannot drop PRIMARY KEY column: \"{}\"", col.name),
+                ));
+            }
+            if col.is_unique {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("cannot drop UNIQUE column: \"{}\"", col.name),
+                ));
+            }
+            if tbl.columns.len() <= 1 {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!(
+                        "cannot drop column \"{}\": no other columns exist",
+                        col.name
+                    ),
+                ));
+            }
+            let dropped_is_virtual = col.generated.as_ref().is_some_and(|(_, stored)| !*stored);
+
+            // Both `renameTestSchema` (`!legacy_mode`) and `renameFixQuotes` (`legacy_mode`) run before `DROP COLUMN`.
+            validate_views_before_alter(
+                ctx.db_set,
+                ctx.functions,
+                db_id,
+                legacy_mode,
+                writable_schema,
+            )?;
+
+            let new_sql = remove_column_def_from_create_table_sql(live_tbl_sql, col_idx)?;
+            let (Some(Stmt::CreateTable(new_ct)), _) = parse_one(&new_sql).map_err(|e| {
+                SqliteError::new(
+                    ErrorCode::Error,
+                    format!(
+                        "error in table {} after drop column: {}",
+                        tbl.name, e.message
+                    ),
+                )
+            })?
+            else {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("error in table {} after drop column", tbl.name),
+                ));
+            };
+
+            if !writable_schema {
+                let explicit_index_sqls: Vec<(String, Pgno, String)> = ctx
+                    .db_set
+                    .slot(db_id)
+                    .map(|s| {
+                        s.schema
+                            .indexes_for_table(&tbl.name)
+                            .into_iter()
+                            .filter(|idx| !idx.is_autoindex)
+                            .filter_map(|idx| {
+                                let sql = live_sql_map
+                                    .get(&idx.schema_rowid)
+                                    .and_then(|o| o.clone())
+                                    .or(idx.raw_sql)?;
+                                Some((idx.name, idx.root_pgno, sql))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let _ = validate_table_and_indexes_static_after_alter(
+                    db_id,
+                    &tbl.name,
+                    &new_ct,
+                    &explicit_index_sqls,
+                    ctx.db_set,
+                    ctx.functions,
+                    "drop column",
+                )?;
+            }
+
+            {
+                let slot = ctx
+                    .db_set
+                    .slot_mut(db_id)
+                    .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+                {
+                    let bt = slot
+                        .btree
+                        .as_mut()
+                        .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+                    update_schema_entry(
+                        bt,
+                        tbl.schema_rowid,
+                        "table",
+                        &tbl.name,
+                        &tbl.name,
+                        tbl.root_pgno,
+                        Some(&new_sql),
+                    )?;
+                }
+                slot.reload_schema()?;
+            }
+            *ctx.schema_generation += 1;
+            *ctx.v1_expire_generation += 1;
+            *ctx.schema_changed_in_tx = true;
+
+            if !writable_schema && !legacy_mode {
+                validate_views_after_alter(ctx.db_set, ctx.functions, db_id, "drop column")?;
+            }
+
+            if !dropped_is_virtual {
+                let new_tbl = ctx
+                    .db_set
+                    .slot(db_id)
+                    .and_then(|s| s.schema.find_user_table(&tbl.name).cloned())
+                    .ok_or_else(|| {
+                        SqliteError::misuse("reloaded table missing after drop column")
+                    })?;
+                rewrite_physical_rows_for_drop_column(ctx, db_id, &tbl, &new_tbl, col_idx)?;
+            }
+            return Ok(());
         }
         AlterTableAction::AddColumn(cdef) => {
             if tbl.find_column(&cdef.name).is_some() {
@@ -11058,6 +12476,7 @@ fn exec_alter_table(
                     format!("duplicate column name: {}", cdef.name),
                 ));
             }
+            check_alter_rowid_alias(&tbl, &cdef.name, "add")?;
             let validated = build_column_schema_from_def(&tbl.name, tbl.strict, cdef)?;
             if validated
                 .generated
@@ -11086,7 +12505,7 @@ fn exec_alter_table(
                 ));
             }
             let rendered_col = render_column_def_sql(cdef);
-            let new_sql = append_column_to_create_table_sql(&tbl.raw_sql, &rendered_col)?;
+            let new_sql = append_column_to_create_table_sql(live_tbl_sql, &rendered_col)?;
             let (Some(Stmt::CreateTable(new_ct)), _) = parse_one(&new_sql)? else {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
@@ -11172,11 +12591,7 @@ fn exec_alter_table(
         .db_set
         .slot_mut(db_id)
         .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-    let bt = slot
-        .btree
-        .as_mut()
-        .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-    slot.schema = Schema::load(bt)?;
+    slot.reload_schema()?;
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;
     *ctx.schema_changed_in_tx = true;
@@ -11236,6 +12651,17 @@ fn token_matches_ident(tok: &Token<'_>, target: &str) -> bool {
     is_ident_like_token(tok.kind) && token_ident_name(tok).eq_ignore_ascii_case(target)
 }
 
+/// Formats a replacement table identifier for `ALTER TABLE ... RENAME TO ...` (`renameTableFunc`
+/// + `renameEditSql` with `bQuote = 1` in `sqlite/src/alter.c:1268-1308, 1798`).
+fn format_renamed_table_ident(sql: &str, token_end: usize, new_tbl: &str) -> String {
+    let trailing_space = if sql.as_bytes().get(token_end) == Some(&b'"') {
+        " "
+    } else {
+        ""
+    };
+    format!("\"{}\"{trailing_space}", new_tbl.replace('"', "\"\""))
+}
+
 fn format_replacement_ident(orig_tok_text: &str, new_name: &str) -> String {
     let was_quoted = orig_tok_text.starts_with('"')
         || orig_tok_text.starts_with('`')
@@ -11272,10 +12698,232 @@ fn apply_token_replacements(sql: &str, mut edits: Vec<(usize, usize, String)>) -
     out
 }
 
-fn rewrite_table_name_in_create_table_sql(
-    sql: &str,
+fn collect_self_table_qualifier_edits_in_expr(
+    expr: &Expr,
+    schema_name: &str,
     old_tbl: &str,
     new_tbl: &str,
+    spans: &IdentSpanMap,
+    edits: &mut Vec<(TokenSpan, String)>,
+) {
+    match expr {
+        Expr::Column(cref) => {
+            if let Some(ref tbl_tok) = cref.table {
+                let schema_ok = cref
+                    .schema
+                    .as_deref()
+                    .is_none_or(|s| s.eq_ignore_ascii_case(schema_name));
+                if schema_ok
+                    && tbl_tok.eq_ignore_ascii_case(old_tbl)
+                    && let Some(sp) = spans.span_of(tbl_tok)
+                {
+                    edits.push((sp, new_tbl.to_owned()));
+                }
+            }
+        }
+        Expr::Unary { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => {
+            collect_self_table_qualifier_edits_in_expr(
+                inner,
+                schema_name,
+                old_tbl,
+                new_tbl,
+                spans,
+                edits,
+            );
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_self_table_qualifier_edits_in_expr(
+                left,
+                schema_name,
+                old_tbl,
+                new_tbl,
+                spans,
+                edits,
+            );
+            collect_self_table_qualifier_edits_in_expr(
+                right,
+                schema_name,
+                old_tbl,
+                new_tbl,
+                spans,
+                edits,
+            );
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            collect_self_table_qualifier_edits_in_expr(
+                e,
+                schema_name,
+                old_tbl,
+                new_tbl,
+                spans,
+                edits,
+            );
+            collect_self_table_qualifier_edits_in_expr(
+                low,
+                schema_name,
+                old_tbl,
+                new_tbl,
+                spans,
+                edits,
+            );
+            collect_self_table_qualifier_edits_in_expr(
+                high,
+                schema_name,
+                old_tbl,
+                new_tbl,
+                spans,
+                edits,
+            );
+        }
+        Expr::InList { expr: e, list, .. } => {
+            collect_self_table_qualifier_edits_in_expr(
+                e,
+                schema_name,
+                old_tbl,
+                new_tbl,
+                spans,
+                edits,
+            );
+            for item in list {
+                collect_self_table_qualifier_edits_in_expr(
+                    item,
+                    schema_name,
+                    old_tbl,
+                    new_tbl,
+                    spans,
+                    edits,
+                );
+            }
+        }
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_self_table_qualifier_edits_in_expr(
+                e,
+                schema_name,
+                old_tbl,
+                new_tbl,
+                spans,
+                edits,
+            );
+            collect_self_table_qualifier_edits_in_expr(
+                pattern,
+                schema_name,
+                old_tbl,
+                new_tbl,
+                spans,
+                edits,
+            );
+            if let Some(esc) = escape {
+                collect_self_table_qualifier_edits_in_expr(
+                    esc,
+                    schema_name,
+                    old_tbl,
+                    new_tbl,
+                    spans,
+                    edits,
+                );
+            }
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                collect_self_table_qualifier_edits_in_expr(
+                    op,
+                    schema_name,
+                    old_tbl,
+                    new_tbl,
+                    spans,
+                    edits,
+                );
+            }
+            for (w, t) in branches {
+                collect_self_table_qualifier_edits_in_expr(
+                    w,
+                    schema_name,
+                    old_tbl,
+                    new_tbl,
+                    spans,
+                    edits,
+                );
+                collect_self_table_qualifier_edits_in_expr(
+                    t,
+                    schema_name,
+                    old_tbl,
+                    new_tbl,
+                    spans,
+                    edits,
+                );
+            }
+            if let Some(el) = else_expr {
+                collect_self_table_qualifier_edits_in_expr(
+                    el,
+                    schema_name,
+                    old_tbl,
+                    new_tbl,
+                    spans,
+                    edits,
+                );
+            }
+        }
+        Expr::FunctionCall { args, filter, .. } => {
+            if let FunctionArgs::Exprs(es) = args {
+                for e in es {
+                    collect_self_table_qualifier_edits_in_expr(
+                        e,
+                        schema_name,
+                        old_tbl,
+                        new_tbl,
+                        spans,
+                        edits,
+                    );
+                }
+            }
+            if let Some(f) = filter {
+                collect_self_table_qualifier_edits_in_expr(
+                    f,
+                    schema_name,
+                    old_tbl,
+                    new_tbl,
+                    spans,
+                    edits,
+                );
+            }
+        }
+        Expr::RowValue(es) => {
+            for e in es {
+                collect_self_table_qualifier_edits_in_expr(
+                    e,
+                    schema_name,
+                    old_tbl,
+                    new_tbl,
+                    spans,
+                    edits,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_table_name_in_create_table_sql(
+    sql: &str,
+    schema_name: &str,
+    old_tbl: &str,
+    new_tbl: &str,
+    rewrite_fks: bool,
+    rewrite_self_exprs: bool,
 ) -> Result<String> {
     let tokens = tokenize(sql)?;
     let mut edits = Vec::new();
@@ -11292,7 +12940,6 @@ fn rewrite_table_name_in_create_table_sql(
         {
             i += 3;
         }
-        // Optional `main.`
         if i + 2 < tokens.len() && tokens[i + 1].kind == TokenKind::Dot {
             i += 2;
         }
@@ -11300,31 +12947,77 @@ fn rewrite_table_name_in_create_table_sql(
             edits.push((
                 tokens[i].offset,
                 tokens[i].text.len(),
-                format_replacement_ident(tokens[i].text, new_tbl),
+                format_renamed_table_ident(sql, tokens[i].offset + tokens[i].text.len(), new_tbl),
             ));
         }
     }
-    // Also rewrite self-referencing `REFERENCES <old_tbl>` inside the same table
-    for idx in 0..tokens.len() {
-        if tokens[idx].kind == TokenKind::References
-            && idx + 1 < tokens.len()
-            && token_matches_ident(&tokens[idx + 1], old_tbl)
-        {
-            let t = &tokens[idx + 1];
-            edits.push((
-                t.offset,
-                t.text.len(),
-                format_replacement_ident(t.text, new_tbl),
-            ));
+    if rewrite_fks {
+        for idx in 0..tokens.len() {
+            if tokens[idx].kind == TokenKind::References
+                && idx + 1 < tokens.len()
+                && token_matches_ident(&tokens[idx + 1], old_tbl)
+            {
+                let t = &tokens[idx + 1];
+                edits.push((
+                    t.offset,
+                    t.text.len(),
+                    format_renamed_table_ident(sql, t.offset + t.text.len(), new_tbl),
+                ));
+            }
         }
     }
-    Ok(apply_token_replacements(sql, edits))
+    let mut out = apply_token_replacements(sql, edits);
+    if rewrite_self_exprs
+        && let Ok((Some(Stmt::CreateTable(ct)), spans, _)) = parse_one_with_spans(&out)
+    {
+        let mut span_edits = Vec::new();
+        for cdef in &ct.columns {
+            for cons in &cdef.constraints {
+                match cons {
+                    sqliters_syntax::ColumnConstraint::Check { expr, .. }
+                    | sqliters_syntax::ColumnConstraint::Generated { expr, .. }
+                    | sqliters_syntax::ColumnConstraint::Default(expr) => {
+                        collect_self_table_qualifier_edits_in_expr(
+                            expr,
+                            schema_name,
+                            old_tbl,
+                            new_tbl,
+                            &spans,
+                            &mut span_edits,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for tcons in &ct.constraints {
+            if let sqliters_syntax::TableConstraint::Check { expr, .. } = tcons {
+                collect_self_table_qualifier_edits_in_expr(
+                    expr,
+                    schema_name,
+                    old_tbl,
+                    new_tbl,
+                    &spans,
+                    &mut span_edits,
+                );
+            }
+        }
+        if !span_edits.is_empty() {
+            for (sp, rep) in &mut span_edits {
+                *rep = format_renamed_table_ident(&out, sp.offset + sp.len, new_tbl);
+            }
+            out = apply_span_edits(&out, span_edits);
+        }
+    }
+    Ok(out)
 }
 
 fn rewrite_table_name_in_create_index_sql(
     sql: &str,
+    schema_name: &str,
     old_tbl: &str,
     new_tbl: &str,
+    rewrite_self_exprs: bool,
 ) -> Result<String> {
     let tokens = tokenize(sql)?;
     let mut edits = Vec::new();
@@ -11335,13 +13028,1781 @@ fn rewrite_table_name_in_create_index_sql(
                 edits.push((
                     t.offset,
                     t.text.len(),
-                    format_replacement_ident(t.text, new_tbl),
+                    format_renamed_table_ident(sql, t.offset + t.text.len(), new_tbl),
                 ));
             }
             break;
         }
     }
-    Ok(apply_token_replacements(sql, edits))
+    let mut out = apply_token_replacements(sql, edits);
+    if rewrite_self_exprs
+        && let Ok((Some(Stmt::CreateIndex(ci)), spans, _)) = parse_one_with_spans(&out)
+    {
+        let mut span_edits = Vec::new();
+        for ic in &ci.columns {
+            if let Some(ref ie) = ic.expr {
+                collect_self_table_qualifier_edits_in_expr(
+                    ie,
+                    schema_name,
+                    old_tbl,
+                    new_tbl,
+                    &spans,
+                    &mut span_edits,
+                );
+            }
+        }
+        if let Some(ref wc) = ci.where_clause {
+            collect_self_table_qualifier_edits_in_expr(
+                wc,
+                schema_name,
+                old_tbl,
+                new_tbl,
+                &spans,
+                &mut span_edits,
+            );
+        }
+        if !span_edits.is_empty() {
+            for (sp, rep) in &mut span_edits {
+                *rep = format_renamed_table_ident(&out, sp.offset + sp.len, new_tbl);
+            }
+            out = apply_span_edits(&out, span_edits);
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Clone)]
+struct FromTableBinding {
+    schema_name: Option<String>,
+    effective_alias: String,
+    has_explicit_alias: bool,
+    is_target_table: bool,
+}
+
+impl FromTableBinding {
+    fn matches_qualifier(&self, schema_qual: Option<&str>, table_qual: &str) -> bool {
+        if let Some(sq) = schema_qual {
+            let Some(ref sn) = self.schema_name else {
+                return false;
+            };
+            if !sn.eq_ignore_ascii_case(sq) {
+                return false;
+            }
+        }
+        self.effective_alias.eq_ignore_ascii_case(table_qual)
+    }
+}
+
+fn view_qn_resolves_to_target_table(
+    qn: &QualifiedName,
+    view_db_id: DatabaseId,
+    target_db_id: DatabaseId,
+    old_tbl: &str,
+    local_cte_names: &[String],
+    db_set: &DatabaseSet,
+) -> (bool, Option<String>) {
+    if qn.schema.is_none()
+        && local_cte_names
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&qn.name))
+    {
+        return (false, None);
+    }
+    if view_db_id != DatabaseId::TEMP {
+        let Some(slot) = db_set.slot(view_db_id) else {
+            return (false, None);
+        };
+        let slot_name = slot.name.clone();
+        let schema_ok = qn
+            .schema
+            .as_deref()
+            .is_none_or(|s| s.eq_ignore_ascii_case(&slot_name));
+        if !schema_ok {
+            return (false, None);
+        }
+        let is_target = view_db_id == target_db_id
+            && qn.name.eq_ignore_ascii_case(old_tbl)
+            && slot.schema.find_user_table(old_tbl).is_some();
+        return (is_target, Some(slot_name));
+    }
+
+    // TEMP view: standard `DatabaseSet` search order (`temp -> main -> attached`)
+    if let Ok(Some((found_id, rel))) = db_set.find_relation_in_set(qn) {
+        let slot_name = db_set.slot(found_id).map(|s| s.name.clone());
+        let is_target = matches!(rel, ResolvedRelation::Table(_))
+            && found_id == target_db_id
+            && qn.name.eq_ignore_ascii_case(old_tbl);
+        return (is_target, slot_name);
+    }
+    (false, None)
+}
+
+fn rewrite_view_for_table_rename(
+    view_sql: &str,
+    view_db_id: DatabaseId,
+    target_db_id: DatabaseId,
+    old_tbl: &str,
+    new_tbl: &str,
+    db_set: &DatabaseSet,
+) -> Result<Option<String>> {
+    let (Some(Stmt::CreateView(cv)), spans, _) = parse_one_with_spans(view_sql)? else {
+        return Ok(None);
+    };
+    let mut edits: Vec<(TokenSpan, String)> = Vec::new();
+    let mut cte_names: Vec<String> = Vec::new();
+    let outer_bindings: Vec<Vec<FromTableBinding>> = Vec::new();
+    collect_table_rename_edits_in_select(
+        &cv.query,
+        view_db_id,
+        target_db_id,
+        old_tbl,
+        new_tbl,
+        &mut cte_names,
+        &outer_bindings,
+        db_set,
+        &spans,
+        &mut edits,
+    );
+    if edits.is_empty() {
+        Ok(None)
+    } else {
+        for (sp, rep) in &mut edits {
+            *rep = format_renamed_table_ident(view_sql, sp.offset + sp.len, new_tbl);
+        }
+        Ok(Some(apply_span_edits(view_sql, edits)))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_table_rename_edits_in_select(
+    sel: &SelectStmt,
+    view_db_id: DatabaseId,
+    target_db_id: DatabaseId,
+    old_tbl: &str,
+    new_tbl: &str,
+    cte_names: &mut Vec<String>,
+    outer_bindings: &[Vec<FromTableBinding>],
+    db_set: &DatabaseSet,
+    spans: &IdentSpanMap,
+    edits: &mut Vec<(TokenSpan, String)>,
+) {
+    let base_cte_len = cte_names.len();
+    for cte in &sel.ctes {
+        cte_names.push(cte.name.clone());
+        collect_table_rename_edits_in_select(
+            &cte.query,
+            view_db_id,
+            target_db_id,
+            old_tbl,
+            new_tbl,
+            cte_names,
+            outer_bindings,
+            db_set,
+            spans,
+            edits,
+        );
+    }
+    let head_bindings = collect_table_rename_edits_in_core(
+        &sel.body.head,
+        view_db_id,
+        target_db_id,
+        old_tbl,
+        new_tbl,
+        cte_names,
+        outer_bindings,
+        db_set,
+        spans,
+        edits,
+    );
+    for (_, rhs) in &sel.body.compounds {
+        let _ = collect_table_rename_edits_in_core(
+            rhs,
+            view_db_id,
+            target_db_id,
+            old_tbl,
+            new_tbl,
+            cte_names,
+            outer_bindings,
+            db_set,
+            spans,
+            edits,
+        );
+    }
+    let mut ob_scopes = outer_bindings.to_vec();
+    ob_scopes.push(head_bindings);
+    for ob in &sel.order_by {
+        collect_table_rename_edits_in_expr(
+            &ob.expr,
+            view_db_id,
+            target_db_id,
+            old_tbl,
+            new_tbl,
+            cte_names,
+            &ob_scopes,
+            db_set,
+            spans,
+            edits,
+        );
+    }
+    if let Some(ref lim) = sel.limit {
+        collect_table_rename_edits_in_expr(
+            &lim.limit,
+            view_db_id,
+            target_db_id,
+            old_tbl,
+            new_tbl,
+            cte_names,
+            outer_bindings,
+            db_set,
+            spans,
+            edits,
+        );
+        if let Some(ref off) = lim.offset {
+            collect_table_rename_edits_in_expr(
+                off,
+                view_db_id,
+                target_db_id,
+                old_tbl,
+                new_tbl,
+                cte_names,
+                outer_bindings,
+                db_set,
+                spans,
+                edits,
+            );
+        }
+    }
+    cte_names.truncate(base_cte_len);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_table_rename_edits_in_core(
+    core: &SelectCore,
+    view_db_id: DatabaseId,
+    target_db_id: DatabaseId,
+    old_tbl: &str,
+    new_tbl: &str,
+    cte_names: &mut Vec<String>,
+    outer_bindings: &[Vec<FromTableBinding>],
+    db_set: &DatabaseSet,
+    spans: &IdentSpanMap,
+    edits: &mut Vec<(TokenSpan, String)>,
+) -> Vec<FromTableBinding> {
+    match core {
+        SelectCore::Values(rows) => {
+            for r in rows {
+                for e in r {
+                    collect_table_rename_edits_in_expr(
+                        e,
+                        view_db_id,
+                        target_db_id,
+                        old_tbl,
+                        new_tbl,
+                        cte_names,
+                        outer_bindings,
+                        db_set,
+                        spans,
+                        edits,
+                    );
+                }
+            }
+            Vec::new()
+        }
+        SelectCore::Select {
+            projection,
+            from,
+            selection,
+            group_by,
+            having,
+            ..
+        } => {
+            let mut cur_bindings = Vec::new();
+            if let Some(fc) = from {
+                cur_bindings.push(collect_table_rename_edits_in_tos(
+                    &fc.head,
+                    view_db_id,
+                    target_db_id,
+                    old_tbl,
+                    new_tbl,
+                    cte_names,
+                    outer_bindings,
+                    db_set,
+                    spans,
+                    edits,
+                ));
+                for j in &fc.joins {
+                    cur_bindings.push(collect_table_rename_edits_in_tos(
+                        &j.right,
+                        view_db_id,
+                        target_db_id,
+                        old_tbl,
+                        new_tbl,
+                        cte_names,
+                        outer_bindings,
+                        db_set,
+                        spans,
+                        edits,
+                    ));
+                    if let Some(JoinConstraint::On(ref on_e)) = j.constraint {
+                        let mut join_scopes = outer_bindings.to_vec();
+                        join_scopes.push(cur_bindings.clone());
+                        collect_table_rename_edits_in_expr(
+                            on_e,
+                            view_db_id,
+                            target_db_id,
+                            old_tbl,
+                            new_tbl,
+                            cte_names,
+                            &join_scopes,
+                            db_set,
+                            spans,
+                            edits,
+                        );
+                    }
+                }
+            }
+
+            let mut full_scopes = outer_bindings.to_vec();
+            full_scopes.push(cur_bindings.clone());
+            for rc in projection {
+                match rc {
+                    ResultColumn::Star => {}
+                    ResultColumn::TableStar { schema, table } => {
+                        maybe_record_unaliased_table_qualifier_edit(
+                            schema.as_deref(),
+                            table,
+                            new_tbl,
+                            &full_scopes,
+                            spans,
+                            edits,
+                        );
+                    }
+                    ResultColumn::Expr { expr, .. } => {
+                        collect_table_rename_edits_in_expr(
+                            expr,
+                            view_db_id,
+                            target_db_id,
+                            old_tbl,
+                            new_tbl,
+                            cte_names,
+                            &full_scopes,
+                            db_set,
+                            spans,
+                            edits,
+                        );
+                    }
+                }
+            }
+            if let Some(w) = selection {
+                collect_table_rename_edits_in_expr(
+                    w,
+                    view_db_id,
+                    target_db_id,
+                    old_tbl,
+                    new_tbl,
+                    cte_names,
+                    &full_scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+            for g in group_by {
+                collect_table_rename_edits_in_expr(
+                    g,
+                    view_db_id,
+                    target_db_id,
+                    old_tbl,
+                    new_tbl,
+                    cte_names,
+                    &full_scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+            if let Some(h) = having {
+                collect_table_rename_edits_in_expr(
+                    h,
+                    view_db_id,
+                    target_db_id,
+                    old_tbl,
+                    new_tbl,
+                    cte_names,
+                    &full_scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+            cur_bindings
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_table_rename_edits_in_tos(
+    tos: &TableOrSubquery,
+    view_db_id: DatabaseId,
+    target_db_id: DatabaseId,
+    old_tbl: &str,
+    new_tbl: &str,
+    cte_names: &mut Vec<String>,
+    outer_bindings: &[Vec<FromTableBinding>],
+    db_set: &DatabaseSet,
+    spans: &IdentSpanMap,
+    edits: &mut Vec<(TokenSpan, String)>,
+) -> FromTableBinding {
+    match tos {
+        TableOrSubquery::Table { name, alias, .. } => {
+            let (is_target, schema_lbl) = view_qn_resolves_to_target_table(
+                name,
+                view_db_id,
+                target_db_id,
+                old_tbl,
+                cte_names,
+                db_set,
+            );
+            if is_target && let Some(sp) = spans.span_of(&name.name) {
+                edits.push((sp, new_tbl.to_owned()));
+            }
+            FromTableBinding {
+                schema_name: schema_lbl,
+                effective_alias: alias.clone().unwrap_or_else(|| name.name.clone()),
+                has_explicit_alias: alias.is_some(),
+                is_target_table: is_target,
+            }
+        }
+        TableOrSubquery::Subquery { query, alias } => {
+            collect_table_rename_edits_in_select(
+                query,
+                view_db_id,
+                target_db_id,
+                old_tbl,
+                new_tbl,
+                cte_names,
+                outer_bindings,
+                db_set,
+                spans,
+                edits,
+            );
+            FromTableBinding {
+                schema_name: None,
+                effective_alias: alias.clone().unwrap_or_default(),
+                has_explicit_alias: true,
+                is_target_table: false,
+            }
+        }
+    }
+}
+
+fn maybe_record_unaliased_table_qualifier_edit(
+    schema_qual: Option<&str>,
+    table_tok: &str,
+    new_tbl: &str,
+    scopes: &[Vec<FromTableBinding>],
+    spans: &IdentSpanMap,
+    edits: &mut Vec<(TokenSpan, String)>,
+) {
+    for scope in scopes.iter().rev() {
+        let mut matched: Option<&FromTableBinding> = None;
+        for b in scope {
+            if !b.effective_alias.is_empty() && b.matches_qualifier(schema_qual, table_tok) {
+                matched = Some(b);
+                break;
+            }
+        }
+        if let Some(hit) = matched {
+            if hit.is_target_table
+                && !hit.has_explicit_alias
+                && let Some(sp) = spans.span_of(table_tok)
+            {
+                edits.push((sp, new_tbl.to_owned()));
+            }
+            return;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_table_rename_edits_in_expr(
+    expr: &Expr,
+    view_db_id: DatabaseId,
+    target_db_id: DatabaseId,
+    old_tbl: &str,
+    new_tbl: &str,
+    cte_names: &mut Vec<String>,
+    scopes: &[Vec<FromTableBinding>],
+    db_set: &DatabaseSet,
+    spans: &IdentSpanMap,
+    edits: &mut Vec<(TokenSpan, String)>,
+) {
+    match expr {
+        Expr::Column(cref) => {
+            if let Some(ref tbl_tok) = cref.table {
+                maybe_record_unaliased_table_qualifier_edit(
+                    cref.schema.as_deref(),
+                    tbl_tok,
+                    new_tbl,
+                    scopes,
+                    spans,
+                    edits,
+                );
+            }
+        }
+        Expr::Unary { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => {
+            collect_table_rename_edits_in_expr(
+                inner,
+                view_db_id,
+                target_db_id,
+                old_tbl,
+                new_tbl,
+                cte_names,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_table_rename_edits_in_expr(
+                left,
+                view_db_id,
+                target_db_id,
+                old_tbl,
+                new_tbl,
+                cte_names,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+            collect_table_rename_edits_in_expr(
+                right,
+                view_db_id,
+                target_db_id,
+                old_tbl,
+                new_tbl,
+                cte_names,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            for sub in [e, low, high] {
+                collect_table_rename_edits_in_expr(
+                    sub,
+                    view_db_id,
+                    target_db_id,
+                    old_tbl,
+                    new_tbl,
+                    cte_names,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+        }
+        Expr::InList { expr: e, list, .. } => {
+            collect_table_rename_edits_in_expr(
+                e,
+                view_db_id,
+                target_db_id,
+                old_tbl,
+                new_tbl,
+                cte_names,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+            for item in list {
+                collect_table_rename_edits_in_expr(
+                    item,
+                    view_db_id,
+                    target_db_id,
+                    old_tbl,
+                    new_tbl,
+                    cte_names,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+        }
+        Expr::InSubquery {
+            expr: e, subquery, ..
+        } => {
+            collect_table_rename_edits_in_expr(
+                e,
+                view_db_id,
+                target_db_id,
+                old_tbl,
+                new_tbl,
+                cte_names,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+            collect_table_rename_edits_in_select(
+                subquery,
+                view_db_id,
+                target_db_id,
+                old_tbl,
+                new_tbl,
+                cte_names,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+        }
+        Expr::InTable { expr: e, table, .. } => {
+            collect_table_rename_edits_in_expr(
+                e,
+                view_db_id,
+                target_db_id,
+                old_tbl,
+                new_tbl,
+                cte_names,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+            let (is_target, _) = view_qn_resolves_to_target_table(
+                table,
+                view_db_id,
+                target_db_id,
+                old_tbl,
+                cte_names,
+                db_set,
+            );
+            if is_target && let Some(sp) = spans.span_of(&table.name) {
+                edits.push((sp, new_tbl.to_owned()));
+            }
+        }
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_table_rename_edits_in_expr(
+                e,
+                view_db_id,
+                target_db_id,
+                old_tbl,
+                new_tbl,
+                cte_names,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+            collect_table_rename_edits_in_expr(
+                pattern,
+                view_db_id,
+                target_db_id,
+                old_tbl,
+                new_tbl,
+                cte_names,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+            if let Some(esc) = escape {
+                collect_table_rename_edits_in_expr(
+                    esc,
+                    view_db_id,
+                    target_db_id,
+                    old_tbl,
+                    new_tbl,
+                    cte_names,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                collect_table_rename_edits_in_expr(
+                    op,
+                    view_db_id,
+                    target_db_id,
+                    old_tbl,
+                    new_tbl,
+                    cte_names,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+            for (w, t) in branches {
+                collect_table_rename_edits_in_expr(
+                    w,
+                    view_db_id,
+                    target_db_id,
+                    old_tbl,
+                    new_tbl,
+                    cte_names,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+                collect_table_rename_edits_in_expr(
+                    t,
+                    view_db_id,
+                    target_db_id,
+                    old_tbl,
+                    new_tbl,
+                    cte_names,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+            if let Some(el) = else_expr {
+                collect_table_rename_edits_in_expr(
+                    el,
+                    view_db_id,
+                    target_db_id,
+                    old_tbl,
+                    new_tbl,
+                    cte_names,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+        }
+        Expr::FunctionCall { args, filter, .. } => {
+            if let FunctionArgs::Exprs(es) = args {
+                for e in es {
+                    collect_table_rename_edits_in_expr(
+                        e,
+                        view_db_id,
+                        target_db_id,
+                        old_tbl,
+                        new_tbl,
+                        cte_names,
+                        scopes,
+                        db_set,
+                        spans,
+                        edits,
+                    );
+                }
+            }
+            if let Some(f) = filter {
+                collect_table_rename_edits_in_expr(
+                    f,
+                    view_db_id,
+                    target_db_id,
+                    old_tbl,
+                    new_tbl,
+                    cte_names,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+        }
+        Expr::RowValue(es) => {
+            for e in es {
+                collect_table_rename_edits_in_expr(
+                    e,
+                    view_db_id,
+                    target_db_id,
+                    old_tbl,
+                    new_tbl,
+                    cte_names,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+        }
+        Expr::Subquery(sub) | Expr::Exists { subquery: sub, .. } => {
+            collect_table_rename_edits_in_select(
+                sub,
+                view_db_id,
+                target_db_id,
+                old_tbl,
+                new_tbl,
+                cte_names,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+        }
+        _ => {}
+    }
+}
+
+#[derive(Clone)]
+struct RenameColBinding {
+    schema_name: Option<String>,
+    table_alias: Option<String>,
+    name: String,
+    is_target_col: bool,
+    merged_using: bool,
+}
+
+impl RenameColBinding {
+    fn matches_qualifier(&self, schema_qual: Option<&str>, table_qual: Option<&str>) -> bool {
+        if let Some(sq) = schema_qual {
+            let Some(ref sn) = self.schema_name else {
+                return false;
+            };
+            if !sn.eq_ignore_ascii_case(sq) {
+                return false;
+            }
+        }
+        if let Some(tq) = table_qual {
+            let Some(ref ta) = self.table_alias else {
+                return false;
+            };
+            if !ta.eq_ignore_ascii_case(tq) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn merge_join_rename_col_bindings(
+    left: &[RenameColBinding],
+    right: &[RenameColBinding],
+    join: &JoinClause,
+) -> Vec<RenameColBinding> {
+    let dedup_names: Vec<String> = if join.natural {
+        let mut common = Vec::new();
+        for lc in left {
+            if right
+                .iter()
+                .any(|rc| rc.name.eq_ignore_ascii_case(&lc.name))
+                && !common
+                    .iter()
+                    .any(|c: &String| c.eq_ignore_ascii_case(&lc.name))
+            {
+                common.push(lc.name.clone());
+            }
+        }
+        common
+    } else if let Some(JoinConstraint::Using(ref ucols)) = join.constraint {
+        ucols.clone()
+    } else {
+        Vec::new()
+    };
+
+    if dedup_names.is_empty() {
+        let mut out = left.to_vec();
+        out.extend_from_slice(right);
+        return out;
+    }
+
+    let mut out = Vec::with_capacity(left.len() + right.len());
+    for lc in left {
+        let mut copy = lc.clone();
+        if dedup_names.iter().any(|u| u.eq_ignore_ascii_case(&lc.name)) {
+            copy.merged_using = true;
+        }
+        out.push(copy);
+    }
+    out.extend_from_slice(right);
+    out
+}
+
+fn resolve_cref_is_target_col(cref: &ColumnRef, scopes: &[Vec<RenameColBinding>]) -> Option<bool> {
+    for scope in scopes.iter().rev() {
+        let mut hits = Vec::new();
+        for cb in scope {
+            if cb.matches_qualifier(cref.schema.as_deref(), cref.table.as_deref())
+                && cb.name.eq_ignore_ascii_case(&cref.column)
+            {
+                if cref.schema.is_none() && cref.table.is_none() && cb.merged_using {
+                    return Some(cb.is_target_col);
+                }
+                hits.push(cb.is_target_col);
+            }
+        }
+        if !hits.is_empty() {
+            return Some(hits.len() == 1 && hits[0]);
+        }
+    }
+    None
+}
+
+fn rewrite_view_for_column_rename(
+    view_sql: &str,
+    view_db_id: DatabaseId,
+    target_db_id: DatabaseId,
+    target_tbl: &TableSchema,
+    old_col: &str,
+    new_col: &str,
+    db_set: &DatabaseSet,
+) -> Result<Option<String>> {
+    let (Some(Stmt::CreateView(cv)), spans, _) = parse_one_with_spans(view_sql)? else {
+        return Ok(None);
+    };
+    let mut edits: Vec<(TokenSpan, String)> = Vec::new();
+    let ctes = CteStore::default();
+    let outer_scopes: Vec<Vec<RenameColBinding>> = Vec::new();
+    let _ = collect_col_rename_edits_in_select(
+        &cv.query,
+        view_db_id,
+        target_db_id,
+        target_tbl,
+        old_col,
+        new_col,
+        &ctes,
+        &outer_scopes,
+        db_set,
+        &spans,
+        &mut edits,
+    );
+    if edits.is_empty() {
+        Ok(None)
+    } else {
+        for (sp, rep) in &mut edits {
+            let orig_tok = &view_sql[sp.offset..sp.offset + sp.len];
+            let mut formatted = format_replacement_ident(orig_tok, new_col);
+            if formatted.starts_with('"')
+                && view_sql.as_bytes().get(sp.offset + sp.len) == Some(&b'"')
+            {
+                formatted.push(' ');
+            }
+            *rep = formatted;
+        }
+        Ok(Some(apply_span_edits(view_sql, edits)))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_col_rename_edits_in_select(
+    sel: &SelectStmt,
+    view_db_id: DatabaseId,
+    target_db_id: DatabaseId,
+    target_tbl: &TableSchema,
+    old_col: &str,
+    new_col: &str,
+    parent_ctes: &CteStore,
+    outer_scopes: &[Vec<RenameColBinding>],
+    db_set: &DatabaseSet,
+    spans: &IdentSpanMap,
+    edits: &mut Vec<(TokenSpan, String)>,
+) -> Vec<String> {
+    let mut ctes = parent_ctes.clone();
+    if !sel.ctes.is_empty() {
+        let mut cur_scope = Vec::new();
+        for cte in &sel.ctes {
+            cur_scope.push(cte.clone());
+            let mut cte_store = ctes.clone();
+            cte_store.scopes.push(cur_scope.clone());
+            let _ = collect_col_rename_edits_in_select(
+                &cte.query,
+                view_db_id,
+                target_db_id,
+                target_tbl,
+                old_col,
+                new_col,
+                &cte_store,
+                outer_scopes,
+                db_set,
+                spans,
+                edits,
+            );
+        }
+        ctes.scopes.push(cur_scope);
+    }
+
+    let (head_from_cols, head_proj_cols) = collect_col_rename_edits_in_core(
+        &sel.body.head,
+        view_db_id,
+        target_db_id,
+        target_tbl,
+        old_col,
+        new_col,
+        &ctes,
+        outer_scopes,
+        db_set,
+        spans,
+        edits,
+    );
+    for (_, rhs) in &sel.body.compounds {
+        let _ = collect_col_rename_edits_in_core(
+            rhs,
+            view_db_id,
+            target_db_id,
+            target_tbl,
+            old_col,
+            new_col,
+            &ctes,
+            outer_scopes,
+            db_set,
+            spans,
+            edits,
+        );
+    }
+
+    let mut ob_scopes = outer_scopes.to_vec();
+    ob_scopes.push(head_from_cols);
+    for ob in &sel.order_by {
+        if let Expr::Column(ref cref) = ob.expr
+            && cref.schema.is_none()
+            && cref.table.is_none()
+            && let Some((_, unaliased_target)) = head_proj_cols
+                .iter()
+                .find(|(pname, _)| pname.eq_ignore_ascii_case(&cref.column))
+        {
+            if *unaliased_target
+                && cref.column.eq_ignore_ascii_case(old_col)
+                && let Some(sp) = spans.span_of(&cref.column)
+            {
+                edits.push((sp, new_col.to_owned()));
+            }
+            continue;
+        }
+        collect_col_rename_edits_in_expr(
+            &ob.expr,
+            view_db_id,
+            target_db_id,
+            target_tbl,
+            old_col,
+            new_col,
+            &ctes,
+            &ob_scopes,
+            db_set,
+            spans,
+            edits,
+        );
+    }
+    if let Some(ref lim) = sel.limit {
+        collect_col_rename_edits_in_expr(
+            &lim.limit,
+            view_db_id,
+            target_db_id,
+            target_tbl,
+            old_col,
+            new_col,
+            &ctes,
+            outer_scopes,
+            db_set,
+            spans,
+            edits,
+        );
+        if let Some(ref off) = lim.offset {
+            collect_col_rename_edits_in_expr(
+                off,
+                view_db_id,
+                target_db_id,
+                target_tbl,
+                old_col,
+                new_col,
+                &ctes,
+                outer_scopes,
+                db_set,
+                spans,
+                edits,
+            );
+        }
+    }
+
+    head_proj_cols.into_iter().map(|(n, _)| n).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_col_rename_edits_in_core(
+    core: &SelectCore,
+    view_db_id: DatabaseId,
+    target_db_id: DatabaseId,
+    target_tbl: &TableSchema,
+    old_col: &str,
+    new_col: &str,
+    ctes: &CteStore,
+    outer_scopes: &[Vec<RenameColBinding>],
+    db_set: &DatabaseSet,
+    spans: &IdentSpanMap,
+    edits: &mut Vec<(TokenSpan, String)>,
+) -> (Vec<RenameColBinding>, Vec<(String, bool)>) {
+    match core {
+        SelectCore::Values(rows) => {
+            for r in rows {
+                for e in r {
+                    collect_col_rename_edits_in_expr(
+                        e,
+                        view_db_id,
+                        target_db_id,
+                        target_tbl,
+                        old_col,
+                        new_col,
+                        ctes,
+                        outer_scopes,
+                        db_set,
+                        spans,
+                        edits,
+                    );
+                }
+            }
+            let width = rows.first().map_or(0, Vec::len);
+            let cols = (1..=width).map(|i| (format!("column{i}"), false)).collect();
+            (Vec::new(), cols)
+        }
+        SelectCore::Select {
+            projection,
+            from,
+            selection,
+            group_by,
+            having,
+            ..
+        } => {
+            let mut from_cols = Vec::new();
+            if let Some(fc) = from {
+                from_cols = collect_col_rename_edits_in_tos(
+                    &fc.head,
+                    view_db_id,
+                    target_db_id,
+                    target_tbl,
+                    old_col,
+                    new_col,
+                    ctes,
+                    outer_scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+                for j in &fc.joins {
+                    let rcols = collect_col_rename_edits_in_tos(
+                        &j.right,
+                        view_db_id,
+                        target_db_id,
+                        target_tbl,
+                        old_col,
+                        new_col,
+                        ctes,
+                        outer_scopes,
+                        db_set,
+                        spans,
+                        edits,
+                    );
+                    from_cols = merge_join_rename_col_bindings(&from_cols, &rcols, j);
+                    // Note: `JoinConstraint::Using` is intentionally NOT rewritten (`alter.c:unmapColumnIdlistNames`)!
+                    if let Some(JoinConstraint::On(ref on_e)) = j.constraint {
+                        let mut j_scopes = outer_scopes.to_vec();
+                        j_scopes.push(from_cols.clone());
+                        collect_col_rename_edits_in_expr(
+                            on_e,
+                            view_db_id,
+                            target_db_id,
+                            target_tbl,
+                            old_col,
+                            new_col,
+                            ctes,
+                            &j_scopes,
+                            db_set,
+                            spans,
+                            edits,
+                        );
+                    }
+                }
+            }
+
+            let mut full_scopes = outer_scopes.to_vec();
+            full_scopes.push(from_cols.clone());
+            let mut proj_cols: Vec<(String, bool)> = Vec::new();
+            for rc in projection {
+                match rc {
+                    ResultColumn::Star => {
+                        let mut seen_using = Vec::new();
+                        for cb in &from_cols {
+                            if cb.merged_using {
+                                seen_using.push(cb.name.clone());
+                                proj_cols.push((cb.name.clone(), cb.is_target_col));
+                            } else if !seen_using.iter().any(|u| u.eq_ignore_ascii_case(&cb.name)) {
+                                proj_cols.push((cb.name.clone(), cb.is_target_col));
+                            }
+                        }
+                    }
+                    ResultColumn::TableStar { schema, table } => {
+                        for cb in &from_cols {
+                            if cb.matches_qualifier(schema.as_deref(), Some(table.as_str())) {
+                                proj_cols.push((cb.name.clone(), cb.is_target_col));
+                            }
+                        }
+                    }
+                    ResultColumn::Expr { expr, alias } => {
+                        collect_col_rename_edits_in_expr(
+                            expr,
+                            view_db_id,
+                            target_db_id,
+                            target_tbl,
+                            old_col,
+                            new_col,
+                            ctes,
+                            &full_scopes,
+                            db_set,
+                            spans,
+                            edits,
+                        );
+                        let is_unaliased_target = alias.is_none()
+                            && matches!(
+                                expr,
+                                Expr::Column(cref)
+                                    if resolve_cref_is_target_col(cref, &full_scopes) == Some(true)
+                            );
+                        let out_lbl = alias.clone().unwrap_or_else(|| expr_column_label(expr));
+                        proj_cols.push((out_lbl, is_unaliased_target));
+                    }
+                }
+            }
+
+            if let Some(w) = selection {
+                collect_col_rename_edits_in_expr(
+                    w,
+                    view_db_id,
+                    target_db_id,
+                    target_tbl,
+                    old_col,
+                    new_col,
+                    ctes,
+                    &full_scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+            for g in group_by {
+                collect_col_rename_edits_in_expr(
+                    g,
+                    view_db_id,
+                    target_db_id,
+                    target_tbl,
+                    old_col,
+                    new_col,
+                    ctes,
+                    &full_scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+            if let Some(h) = having {
+                collect_col_rename_edits_in_expr(
+                    h,
+                    view_db_id,
+                    target_db_id,
+                    target_tbl,
+                    old_col,
+                    new_col,
+                    ctes,
+                    &full_scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+            (from_cols, proj_cols)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_col_rename_edits_in_tos(
+    tos: &TableOrSubquery,
+    view_db_id: DatabaseId,
+    target_db_id: DatabaseId,
+    target_tbl: &TableSchema,
+    old_col: &str,
+    new_col: &str,
+    ctes: &CteStore,
+    outer_scopes: &[Vec<RenameColBinding>],
+    db_set: &DatabaseSet,
+    spans: &IdentSpanMap,
+    edits: &mut Vec<(TokenSpan, String)>,
+) -> Vec<RenameColBinding> {
+    match tos {
+        TableOrSubquery::Table { name, alias, .. } => {
+            let eff = alias.clone().unwrap_or_else(|| name.name.clone());
+            if name.schema.is_none()
+                && let Some((s_idx, c_idx)) = ctes.locate(&name.name)
+            {
+                let cte = &ctes.scopes[s_idx][c_idx];
+                let mut visited = Vec::new();
+                let cnames = if let Some(ref explicit) = cte.columns {
+                    explicit.clone()
+                } else {
+                    static_select_col_names(&cte.query.body, &[], db_set, ctes, &mut visited)
+                };
+                return cnames
+                    .into_iter()
+                    .map(|cn| RenameColBinding {
+                        schema_name: None,
+                        table_alias: Some(eff.clone()),
+                        name: cn,
+                        is_target_col: false,
+                        merged_using: false,
+                    })
+                    .collect();
+            }
+
+            let resolved: Option<(DatabaseId, ResolvedRelation)> = if view_db_id != DatabaseId::TEMP
+            {
+                let slot = db_set.slot(view_db_id);
+                let schema_ok = slot.is_some_and(|sl| {
+                    name.schema
+                        .as_deref()
+                        .is_none_or(|s| s.eq_ignore_ascii_case(&sl.name))
+                });
+                if !schema_ok {
+                    None
+                } else if let Some(sl) = slot {
+                    sl.schema
+                        .find_user_table(&name.name)
+                        .cloned()
+                        .map(|t| (view_db_id, ResolvedRelation::Table(Box::new(t))))
+                        .or_else(|| {
+                            sl.schema
+                                .find_view(&name.name)
+                                .cloned()
+                                .map(|v| (view_db_id, ResolvedRelation::View(Box::new(v))))
+                        })
+                } else {
+                    None
+                }
+            } else {
+                db_set.find_relation_in_set(name).ok().flatten()
+            };
+
+            match resolved {
+                Some((found_db_id, ResolvedRelation::Table(tbl))) => {
+                    let slot_lbl = db_set
+                        .slot(found_db_id)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_else(|| "main".to_owned());
+                    let is_target_tbl = found_db_id == target_db_id
+                        && tbl.name.eq_ignore_ascii_case(&target_tbl.name);
+                    tbl.columns
+                        .iter()
+                        .map(|c| RenameColBinding {
+                            schema_name: Some(slot_lbl.clone()),
+                            table_alias: Some(eff.clone()),
+                            name: c.name.clone(),
+                            is_target_col: is_target_tbl && c.name.eq_ignore_ascii_case(old_col),
+                            merged_using: false,
+                        })
+                        .collect()
+                }
+                Some((found_db_id, ResolvedRelation::View(v))) => {
+                    static_view_scoped_cols(found_db_id, &v, &eff, db_set, ctes, &[])
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|sc| RenameColBinding {
+                            schema_name: sc.schema_name,
+                            table_alias: sc.table_alias,
+                            name: sc.name,
+                            is_target_col: false,
+                            merged_using: false,
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
+            }
+        }
+        TableOrSubquery::Subquery { query, alias } => {
+            let sub_names = collect_col_rename_edits_in_select(
+                query,
+                view_db_id,
+                target_db_id,
+                target_tbl,
+                old_col,
+                new_col,
+                ctes,
+                outer_scopes,
+                db_set,
+                spans,
+                edits,
+            );
+            sub_names
+                .into_iter()
+                .map(|cn| RenameColBinding {
+                    schema_name: None,
+                    table_alias: alias.clone(),
+                    name: cn,
+                    is_target_col: false,
+                    merged_using: false,
+                })
+                .collect()
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_col_rename_edits_in_expr(
+    expr: &Expr,
+    view_db_id: DatabaseId,
+    target_db_id: DatabaseId,
+    target_tbl: &TableSchema,
+    old_col: &str,
+    new_col: &str,
+    ctes: &CteStore,
+    scopes: &[Vec<RenameColBinding>],
+    db_set: &DatabaseSet,
+    spans: &IdentSpanMap,
+    edits: &mut Vec<(TokenSpan, String)>,
+) {
+    match expr {
+        Expr::Column(cref) => {
+            if cref.column.eq_ignore_ascii_case(old_col)
+                && resolve_cref_is_target_col(cref, scopes) == Some(true)
+                && let Some(sp) = spans.span_of(&cref.column)
+            {
+                edits.push((sp, new_col.to_owned()));
+            }
+        }
+        Expr::Unary { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => {
+            collect_col_rename_edits_in_expr(
+                inner,
+                view_db_id,
+                target_db_id,
+                target_tbl,
+                old_col,
+                new_col,
+                ctes,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_col_rename_edits_in_expr(
+                left,
+                view_db_id,
+                target_db_id,
+                target_tbl,
+                old_col,
+                new_col,
+                ctes,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+            collect_col_rename_edits_in_expr(
+                right,
+                view_db_id,
+                target_db_id,
+                target_tbl,
+                old_col,
+                new_col,
+                ctes,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            for sub in [e, low, high] {
+                collect_col_rename_edits_in_expr(
+                    sub,
+                    view_db_id,
+                    target_db_id,
+                    target_tbl,
+                    old_col,
+                    new_col,
+                    ctes,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+        }
+        Expr::InList { expr: e, list, .. } => {
+            collect_col_rename_edits_in_expr(
+                e,
+                view_db_id,
+                target_db_id,
+                target_tbl,
+                old_col,
+                new_col,
+                ctes,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+            for item in list {
+                collect_col_rename_edits_in_expr(
+                    item,
+                    view_db_id,
+                    target_db_id,
+                    target_tbl,
+                    old_col,
+                    new_col,
+                    ctes,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+        }
+        Expr::InSubquery {
+            expr: e, subquery, ..
+        } => {
+            collect_col_rename_edits_in_expr(
+                e,
+                view_db_id,
+                target_db_id,
+                target_tbl,
+                old_col,
+                new_col,
+                ctes,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+            let _ = collect_col_rename_edits_in_select(
+                subquery,
+                view_db_id,
+                target_db_id,
+                target_tbl,
+                old_col,
+                new_col,
+                ctes,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+        }
+        Expr::InTable { expr: e, .. } => {
+            collect_col_rename_edits_in_expr(
+                e,
+                view_db_id,
+                target_db_id,
+                target_tbl,
+                old_col,
+                new_col,
+                ctes,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+        }
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_col_rename_edits_in_expr(
+                e,
+                view_db_id,
+                target_db_id,
+                target_tbl,
+                old_col,
+                new_col,
+                ctes,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+            collect_col_rename_edits_in_expr(
+                pattern,
+                view_db_id,
+                target_db_id,
+                target_tbl,
+                old_col,
+                new_col,
+                ctes,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+            if let Some(esc) = escape {
+                collect_col_rename_edits_in_expr(
+                    esc,
+                    view_db_id,
+                    target_db_id,
+                    target_tbl,
+                    old_col,
+                    new_col,
+                    ctes,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                collect_col_rename_edits_in_expr(
+                    op,
+                    view_db_id,
+                    target_db_id,
+                    target_tbl,
+                    old_col,
+                    new_col,
+                    ctes,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+            for (w, t) in branches {
+                collect_col_rename_edits_in_expr(
+                    w,
+                    view_db_id,
+                    target_db_id,
+                    target_tbl,
+                    old_col,
+                    new_col,
+                    ctes,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+                collect_col_rename_edits_in_expr(
+                    t,
+                    view_db_id,
+                    target_db_id,
+                    target_tbl,
+                    old_col,
+                    new_col,
+                    ctes,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+            if let Some(el) = else_expr {
+                collect_col_rename_edits_in_expr(
+                    el,
+                    view_db_id,
+                    target_db_id,
+                    target_tbl,
+                    old_col,
+                    new_col,
+                    ctes,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+        }
+        Expr::FunctionCall { args, filter, .. } => {
+            if let FunctionArgs::Exprs(es) = args {
+                for e in es {
+                    collect_col_rename_edits_in_expr(
+                        e,
+                        view_db_id,
+                        target_db_id,
+                        target_tbl,
+                        old_col,
+                        new_col,
+                        ctes,
+                        scopes,
+                        db_set,
+                        spans,
+                        edits,
+                    );
+                }
+            }
+            if let Some(f) = filter {
+                collect_col_rename_edits_in_expr(
+                    f,
+                    view_db_id,
+                    target_db_id,
+                    target_tbl,
+                    old_col,
+                    new_col,
+                    ctes,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+        }
+        Expr::RowValue(es) => {
+            for e in es {
+                collect_col_rename_edits_in_expr(
+                    e,
+                    view_db_id,
+                    target_db_id,
+                    target_tbl,
+                    old_col,
+                    new_col,
+                    ctes,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+        }
+        Expr::Subquery(sub) | Expr::Exists { subquery: sub, .. } => {
+            let _ = collect_col_rename_edits_in_select(
+                sub,
+                view_db_id,
+                target_db_id,
+                target_tbl,
+                old_col,
+                new_col,
+                ctes,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+        }
+        _ => {}
+    }
 }
 
 fn rewrite_fk_ref_table_in_create_table_sql(
@@ -11360,7 +14821,7 @@ fn rewrite_fk_ref_table_in_create_table_sql(
             edits.push((
                 t.offset,
                 t.text.len(),
-                format_replacement_ident(t.text, new_tbl),
+                format_renamed_table_ident(sql, t.offset + t.text.len(), new_tbl),
             ));
         }
     }
@@ -11968,12 +15429,16 @@ fn build_vacuum_image(
     }
 
     let (_, schema_name) = slot_encoding_and_name(ctx, src_db_id);
-    let (tables_snapshot, indexes_snapshot) = {
+    let (tables_snapshot, indexes_snapshot, views_snapshot) = {
         let slot = ctx
             .db_set
             .slot(src_db_id)
             .ok_or_else(|| SqliteError::misuse("vacuum source slot closed"))?;
-        (slot.schema.tables.clone(), slot.schema.indexes.clone())
+        (
+            slot.schema.tables.clone(),
+            slot.schema.indexes.clone(),
+            slot.schema.views.clone(),
+        )
     };
     let has_any_autoincrement = tables_snapshot
         .iter()
@@ -12028,6 +15493,18 @@ fn build_vacuum_image(
             idx.raw_sql.as_deref(),
         )?;
         mapped_indexes.push((idx, new_idx_root));
+    }
+
+    // Phase B2: Preserve all permanent views (`type = 'view'`, `rootpage = 0`) in `sqlite_schema`!
+    for view in views_snapshot {
+        insert_schema_entry(
+            target_btree,
+            "view",
+            &view.name,
+            &view.name,
+            0,
+            Some(&view.raw_sql),
+        )?;
     }
 
     // Phase C: Copy table rows & populate indexes (`vacuum.c:317-323`)!
@@ -12217,11 +15694,12 @@ pub(crate) fn exec_vacuum_checked(
                     .db_set
                     .slot_mut(db_id)
                     .ok_or_else(|| SqliteError::misuse("vacuum slot closed"))?;
+                let slot_name = slot.name.clone();
                 let bt = slot
                     .btree
                     .as_mut()
                     .ok_or_else(|| SqliteError::misuse("vacuum btree closed"))?;
-                slot.schema.ensure_fresh_in_tx(bt)?;
+                slot.schema.ensure_fresh_in_tx_for_schema(bt, &slot_name)?;
             }
             let out_val = eval_expr(ctx, into_expr, params, &[], &CteStore::default(), None)?;
             let Value::Text(out_name) = out_val else {
@@ -12430,6 +15908,7 @@ pub(crate) fn exec_vacuum_checked(
             .db_set
             .slot_mut(db_id)
             .ok_or_else(|| VacuumFail::Clean(SqliteError::misuse("vacuum slot closed")))?;
+        let slot_name = slot.name.clone();
         let bt = slot
             .btree
             .as_mut()
@@ -12437,7 +15916,7 @@ pub(crate) fn exec_vacuum_checked(
         ctx.busy_policy
             .retry_btree(bt, |b| b.begin_write())
             .map_err(VacuumFail::Clean)?;
-        if let Err(e) = slot.schema.ensure_fresh_in_tx(bt) {
+        if let Err(e) = slot.schema.ensure_fresh_in_tx_for_schema(bt, &slot_name) {
             slot.next_page_size = None;
             if let Err(rb_err) = bt.rollback() {
                 return Err(VacuumFail::Poison(rb_err));
@@ -12504,7 +15983,12 @@ pub(crate) fn exec_vacuum_checked(
 
         build_vacuum_image(ctx, db_id, &orig_hdr, &mut fresh)?;
         fresh.commit_retaining_read(true)?;
-        let rebuilt_schema = Schema::load(&mut fresh)?;
+        let vac_schema_name = ctx
+            .db_set
+            .slot(db_id)
+            .map_or("main", |s| s.name.as_str())
+            .to_owned();
+        let rebuilt_schema = Schema::load_for_schema(&mut fresh, Some(&vac_schema_name))?;
 
         let dst_bt = ctx
             .db_set
@@ -12756,6 +16240,16 @@ fn exec_pragma(
                 Value::Integer(i64::from(*ctx.foreign_keys)),
             ));
         }
+        "LEGACY_ALTER_TABLE" => {
+            if let Some(pv) = value {
+                *ctx.legacy_alter_table = pragma_to_bool(pv);
+                return Ok(QueryOutput::default());
+            }
+            return Ok(single_col(
+                "legacy_alter_table",
+                Value::Integer(i64::from(*ctx.legacy_alter_table)),
+            ));
+        }
         "COUNT_CHANGES" => {
             if let Some(pv) = value {
                 *ctx.count_changes = pragma_to_bool(pv);
@@ -12906,47 +16400,95 @@ fn exec_pragma(
                 cols.push("hidden".to_owned());
             }
 
-            let found_tbl = if schema.is_some() {
+            enum PragmaInfoTarget {
+                Table(Box<TableSchema>),
+                View(DatabaseId, Box<ViewSchema>),
+            }
+
+            let found_target = if schema.is_some() {
                 if db_id == DatabaseId::TEMP {
                     let enc = ctx.encoding();
                     ctx.db_set.ensure_temp_open(enc, *ctx.writable_schema)?;
                 }
                 ctx.ensure_read_db(db_id, true)?;
                 if DatabaseSet::is_catalog_table_in_db(db_id, &tname) {
-                    Some(TableSchema::sqlite_schema_table())
+                    Some(PragmaInfoTarget::Table(Box::new(
+                        TableSchema::sqlite_schema_table(),
+                    )))
+                } else if let Some(slot) = ctx.db_set.slot(db_id) {
+                    slot.schema
+                        .find_user_table(&tname)
+                        .cloned()
+                        .map(|t| PragmaInfoTarget::Table(Box::new(t)))
+                        .or_else(|| {
+                            slot.schema
+                                .find_view(&tname)
+                                .cloned()
+                                .map(|v| PragmaInfoTarget::View(db_id, Box::new(v)))
+                        })
                 } else {
-                    ctx.db_set
-                        .slot(db_id)
-                        .and_then(|s| s.schema.find_user_table(&tname).cloned())
+                    None
                 }
             } else {
                 let mut hit = None;
                 for cand_id in ctx.db_set.unqualified_search_order() {
                     ctx.ensure_read_db(cand_id, true)?;
                     if DatabaseSet::is_catalog_table_in_db(cand_id, &tname) {
-                        hit = Some(TableSchema::sqlite_schema_table());
+                        hit = Some(PragmaInfoTarget::Table(Box::new(
+                            TableSchema::sqlite_schema_table(),
+                        )));
                         break;
                     }
-                    if let Some(t) = ctx
-                        .db_set
-                        .slot(cand_id)
-                        .and_then(|s| s.schema.find_user_table(&tname).cloned())
-                    {
-                        hit = Some(t);
-                        break;
+                    if let Some(slot) = ctx.db_set.slot(cand_id) {
+                        if let Some(t) = slot.schema.find_user_table(&tname).cloned() {
+                            hit = Some(PragmaInfoTarget::Table(Box::new(t)));
+                            break;
+                        }
+                        if let Some(v) = slot.schema.find_view(&tname).cloned() {
+                            hit = Some(PragmaInfoTarget::View(cand_id, Box::new(v)));
+                            break;
+                        }
                     }
                 }
                 if hit.is_none() && Schema::is_temp_schema_table_name(&tname) {
-                    hit = Some(TableSchema::sqlite_schema_table());
+                    hit = Some(PragmaInfoTarget::Table(Box::new(
+                        TableSchema::sqlite_schema_table(),
+                    )));
                 }
                 hit
             };
 
-            let Some(tbl) = found_tbl else {
-                return Ok(QueryOutput {
-                    column_names: cols,
-                    rows: Vec::new(),
-                });
+            let tbl = match found_target {
+                None => {
+                    return Ok(QueryOutput {
+                        column_names: cols,
+                        rows: Vec::new(),
+                    });
+                }
+                Some(PragmaInfoTarget::View(v_db_id, view)) => {
+                    let vcols =
+                        infer_view_pragma_columns(v_db_id, &view, ctx.db_set, ctx.functions)?;
+                    let mut rows = Vec::with_capacity(vcols.len());
+                    for (cid, (cname, ctype)) in vcols.into_iter().enumerate() {
+                        let mut row = vec![
+                            Value::Integer(cid as i64),
+                            Value::Text(cname),
+                            Value::Text(ctype),
+                            Value::Integer(0),
+                            Value::Null,
+                            Value::Integer(0),
+                        ];
+                        if is_xinfo {
+                            row.push(Value::Integer(0));
+                        }
+                        rows.push(row);
+                    }
+                    return Ok(QueryOutput {
+                        column_names: cols,
+                        rows,
+                    });
+                }
+                Some(PragmaInfoTarget::Table(t)) => *t,
             };
 
             let mut rows = Vec::new();
@@ -13501,9 +17043,10 @@ fn exec_pragma(
                 let v = pragma_to_i64(pv) as u32;
                 ctx.ensure_write_db(db_id, false)?;
                 let slot = ctx.db_set.slot_mut(db_id).unwrap();
+                let sname = slot.name.clone();
                 if let Some(ref mut bt) = slot.btree {
                     bt.pager_mut().header_mut()?.schema_cookie = v;
-                    slot.schema = Schema::load(bt)?;
+                    slot.schema = Schema::load_for_schema(bt, Some(&sname))?;
                 }
                 *ctx.schema_generation += 1;
                 *ctx.v1_expire_generation += 1;
@@ -13747,7 +17290,15 @@ pub(crate) fn collect_select_referenced_roots(
     match stmt {
         Stmt::Select(sel) => {
             let mut cte_names = Vec::new();
-            collect_select_roots_rec(sel, db_set, &mut cte_names, &mut seen, &mut out);
+            let mut view_stack = Vec::new();
+            collect_select_roots_rec(
+                sel,
+                db_set,
+                &mut cte_names,
+                &mut view_stack,
+                &mut seen,
+                &mut out,
+            );
         }
         Stmt::Pragma {
             schema,
@@ -13792,6 +17343,7 @@ pub(crate) fn collect_select_referenced_roots(
                                 .ok()
                                 .flatten()
                                 .map(|(id, _)| id)
+                                .or_else(|| db_set.find_view_in_set(&qn).map(|(id, _)| id))
                         }
                         .or(Some(DatabaseId::MAIN))
                     } else {
@@ -13829,25 +17381,26 @@ fn collect_select_roots_rec(
     sel: &SelectStmt,
     db_set: &DatabaseSet,
     cte_stack: &mut Vec<String>,
+    view_stack: &mut Vec<(DatabaseId, String)>,
     seen: &mut HashSet<(DatabaseId, Pgno)>,
     out: &mut Vec<LeaseCursorSpec>,
 ) {
     let base_len = cte_stack.len();
     for cte in &sel.ctes {
         cte_stack.push(cte.name.clone());
-        collect_select_roots_rec(&cte.query, db_set, cte_stack, seen, out);
+        collect_select_roots_rec(&cte.query, db_set, cte_stack, view_stack, seen, out);
     }
-    collect_core_roots_rec(&sel.body.head, db_set, cte_stack, seen, out);
+    collect_core_roots_rec(&sel.body.head, db_set, cte_stack, view_stack, seen, out);
     for (_, rhs) in &sel.body.compounds {
-        collect_core_roots_rec(rhs, db_set, cte_stack, seen, out);
+        collect_core_roots_rec(rhs, db_set, cte_stack, view_stack, seen, out);
     }
     for ob in &sel.order_by {
-        collect_expr_roots_rec(&ob.expr, db_set, cte_stack, seen, out);
+        collect_expr_roots_rec(&ob.expr, db_set, cte_stack, view_stack, seen, out);
     }
     if let Some(ref lim) = sel.limit {
-        collect_expr_roots_rec(&lim.limit, db_set, cte_stack, seen, out);
+        collect_expr_roots_rec(&lim.limit, db_set, cte_stack, view_stack, seen, out);
         if let Some(ref off) = lim.offset {
-            collect_expr_roots_rec(off, db_set, cte_stack, seen, out);
+            collect_expr_roots_rec(off, db_set, cte_stack, view_stack, seen, out);
         }
     }
     cte_stack.truncate(base_len);
@@ -13857,6 +17410,7 @@ fn collect_core_roots_rec(
     core: &SelectCore,
     db_set: &DatabaseSet,
     cte_stack: &mut Vec<String>,
+    view_stack: &mut Vec<(DatabaseId, String)>,
     seen: &mut HashSet<(DatabaseId, Pgno)>,
     out: &mut Vec<LeaseCursorSpec>,
 ) {
@@ -13864,7 +17418,7 @@ fn collect_core_roots_rec(
         SelectCore::Values(rows) => {
             for r in rows {
                 for e in r {
-                    collect_expr_roots_rec(e, db_set, cte_stack, seen, out);
+                    collect_expr_roots_rec(e, db_set, cte_stack, view_stack, seen, out);
                 }
             }
         }
@@ -13877,27 +17431,27 @@ fn collect_core_roots_rec(
             ..
         } => {
             if let Some(fc) = from {
-                collect_tos_roots_rec(&fc.head, db_set, cte_stack, seen, out);
+                collect_tos_roots_rec(&fc.head, db_set, cte_stack, view_stack, seen, out);
                 for j in &fc.joins {
-                    collect_tos_roots_rec(&j.right, db_set, cte_stack, seen, out);
+                    collect_tos_roots_rec(&j.right, db_set, cte_stack, view_stack, seen, out);
                     if let Some(JoinConstraint::On(ref e)) = j.constraint {
-                        collect_expr_roots_rec(e, db_set, cte_stack, seen, out);
+                        collect_expr_roots_rec(e, db_set, cte_stack, view_stack, seen, out);
                     }
                 }
             }
             for rc in projection {
                 if let ResultColumn::Expr { expr, .. } = rc {
-                    collect_expr_roots_rec(expr, db_set, cte_stack, seen, out);
+                    collect_expr_roots_rec(expr, db_set, cte_stack, view_stack, seen, out);
                 }
             }
             if let Some(w) = selection {
-                collect_expr_roots_rec(w, db_set, cte_stack, seen, out);
+                collect_expr_roots_rec(w, db_set, cte_stack, view_stack, seen, out);
             }
             for g in group_by {
-                collect_expr_roots_rec(g, db_set, cte_stack, seen, out);
+                collect_expr_roots_rec(g, db_set, cte_stack, view_stack, seen, out);
             }
             if let Some(h) = having {
-                collect_expr_roots_rec(h, db_set, cte_stack, seen, out);
+                collect_expr_roots_rec(h, db_set, cte_stack, view_stack, seen, out);
             }
         }
     }
@@ -13907,6 +17461,7 @@ fn collect_table_root_spec(
     name: &QualifiedName,
     db_set: &DatabaseSet,
     cte_stack: &[String],
+    view_stack: &mut Vec<(DatabaseId, String)>,
     seen: &mut HashSet<(DatabaseId, Pgno)>,
     out: &mut Vec<LeaseCursorSpec>,
 ) {
@@ -13916,6 +17471,29 @@ fn collect_table_root_spec(
     if let Ok(Some(cat_db_id)) = db_set.resolve_catalog_table(name) {
         if (cat_db_id != DatabaseId::TEMP || db_set.is_temp_open()) && seen.insert((cat_db_id, 1)) {
             out.push(LeaseCursorSpec::Table(cat_db_id, 1));
+        }
+        return;
+    }
+    if let Some((v_db_id, view)) = db_set.find_view_in_set(name) {
+        let lower = view.name.to_ascii_lowercase();
+        if view_stack
+            .iter()
+            .any(|(id, n)| *id == v_db_id && *n == lower)
+        {
+            return;
+        }
+        let slot_name = db_set
+            .slot(v_db_id)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "main".to_owned());
+        if (v_db_id != DatabaseId::TEMP || db_set.is_temp_open()) && seen.insert((v_db_id, 1)) {
+            out.push(LeaseCursorSpec::Table(v_db_id, 1));
+        }
+        if let Ok(fixed_sel) = prepare_fixed_view_select(v_db_id, &slot_name, view) {
+            view_stack.push((v_db_id, lower));
+            let mut inner_ctes = Vec::new();
+            collect_select_roots_rec(&fixed_sel, db_set, &mut inner_ctes, view_stack, seen, out);
+            view_stack.pop();
         }
         return;
     }
@@ -13939,15 +17517,16 @@ fn collect_tos_roots_rec(
     tos: &TableOrSubquery,
     db_set: &DatabaseSet,
     cte_stack: &mut Vec<String>,
+    view_stack: &mut Vec<(DatabaseId, String)>,
     seen: &mut HashSet<(DatabaseId, Pgno)>,
     out: &mut Vec<LeaseCursorSpec>,
 ) {
     match tos {
         TableOrSubquery::Table { name, .. } => {
-            collect_table_root_spec(name, db_set, cte_stack, seen, out);
+            collect_table_root_spec(name, db_set, cte_stack, view_stack, seen, out);
         }
         TableOrSubquery::Subquery { query, .. } => {
-            collect_select_roots_rec(query, db_set, cte_stack, seen, out);
+            collect_select_roots_rec(query, db_set, cte_stack, view_stack, seen, out);
         }
     }
 }
@@ -13956,6 +17535,7 @@ fn collect_expr_roots_rec(
     expr: &Expr,
     db_set: &DatabaseSet,
     cte_stack: &mut Vec<String>,
+    view_stack: &mut Vec<(DatabaseId, String)>,
     seen: &mut HashSet<(DatabaseId, Pgno)>,
     out: &mut Vec<LeaseCursorSpec>,
 ) {
@@ -13963,38 +17543,40 @@ fn collect_expr_roots_rec(
         Expr::Unary { expr: e, .. }
         | Expr::Collate { expr: e, .. }
         | Expr::IsNull { expr: e, .. }
-        | Expr::Cast { expr: e, .. } => collect_expr_roots_rec(e, db_set, cte_stack, seen, out),
+        | Expr::Cast { expr: e, .. } => {
+            collect_expr_roots_rec(e, db_set, cte_stack, view_stack, seen, out)
+        }
         Expr::RowValue(es) => {
             for e in es {
-                collect_expr_roots_rec(e, db_set, cte_stack, seen, out);
+                collect_expr_roots_rec(e, db_set, cte_stack, view_stack, seen, out);
             }
         }
         Expr::Binary { left, right, .. } => {
-            collect_expr_roots_rec(left, db_set, cte_stack, seen, out);
-            collect_expr_roots_rec(right, db_set, cte_stack, seen, out);
+            collect_expr_roots_rec(left, db_set, cte_stack, view_stack, seen, out);
+            collect_expr_roots_rec(right, db_set, cte_stack, view_stack, seen, out);
         }
         Expr::Between {
             expr: e, low, high, ..
         } => {
-            collect_expr_roots_rec(e, db_set, cte_stack, seen, out);
-            collect_expr_roots_rec(low, db_set, cte_stack, seen, out);
-            collect_expr_roots_rec(high, db_set, cte_stack, seen, out);
+            collect_expr_roots_rec(e, db_set, cte_stack, view_stack, seen, out);
+            collect_expr_roots_rec(low, db_set, cte_stack, view_stack, seen, out);
+            collect_expr_roots_rec(high, db_set, cte_stack, view_stack, seen, out);
         }
         Expr::InList { expr: e, list, .. } => {
-            collect_expr_roots_rec(e, db_set, cte_stack, seen, out);
+            collect_expr_roots_rec(e, db_set, cte_stack, view_stack, seen, out);
             for x in list {
-                collect_expr_roots_rec(x, db_set, cte_stack, seen, out);
+                collect_expr_roots_rec(x, db_set, cte_stack, view_stack, seen, out);
             }
         }
         Expr::InSubquery {
             expr: e, subquery, ..
         } => {
-            collect_expr_roots_rec(e, db_set, cte_stack, seen, out);
-            collect_select_roots_rec(subquery, db_set, cte_stack, seen, out);
+            collect_expr_roots_rec(e, db_set, cte_stack, view_stack, seen, out);
+            collect_select_roots_rec(subquery, db_set, cte_stack, view_stack, seen, out);
         }
         Expr::InTable { expr: e, table, .. } => {
-            collect_expr_roots_rec(e, db_set, cte_stack, seen, out);
-            collect_table_root_spec(table, db_set, cte_stack, seen, out);
+            collect_expr_roots_rec(e, db_set, cte_stack, view_stack, seen, out);
+            collect_table_root_spec(table, db_set, cte_stack, view_stack, seen, out);
         }
         Expr::Like {
             expr: e,
@@ -14002,10 +17584,10 @@ fn collect_expr_roots_rec(
             escape,
             ..
         } => {
-            collect_expr_roots_rec(e, db_set, cte_stack, seen, out);
-            collect_expr_roots_rec(pattern, db_set, cte_stack, seen, out);
+            collect_expr_roots_rec(e, db_set, cte_stack, view_stack, seen, out);
+            collect_expr_roots_rec(pattern, db_set, cte_stack, view_stack, seen, out);
             if let Some(esc) = escape {
-                collect_expr_roots_rec(esc, db_set, cte_stack, seen, out);
+                collect_expr_roots_rec(esc, db_set, cte_stack, view_stack, seen, out);
             }
         }
         Expr::Case {
@@ -14014,28 +17596,28 @@ fn collect_expr_roots_rec(
             else_expr,
         } => {
             if let Some(op) = operand {
-                collect_expr_roots_rec(op, db_set, cte_stack, seen, out);
+                collect_expr_roots_rec(op, db_set, cte_stack, view_stack, seen, out);
             }
             for (w, t) in branches {
-                collect_expr_roots_rec(w, db_set, cte_stack, seen, out);
-                collect_expr_roots_rec(t, db_set, cte_stack, seen, out);
+                collect_expr_roots_rec(w, db_set, cte_stack, view_stack, seen, out);
+                collect_expr_roots_rec(t, db_set, cte_stack, view_stack, seen, out);
             }
             if let Some(el) = else_expr {
-                collect_expr_roots_rec(el, db_set, cte_stack, seen, out);
+                collect_expr_roots_rec(el, db_set, cte_stack, view_stack, seen, out);
             }
         }
         Expr::FunctionCall { args, filter, .. } => {
             if let FunctionArgs::Exprs(es) = args {
                 for e in es {
-                    collect_expr_roots_rec(e, db_set, cte_stack, seen, out);
+                    collect_expr_roots_rec(e, db_set, cte_stack, view_stack, seen, out);
                 }
             }
             if let Some(f) = filter {
-                collect_expr_roots_rec(f, db_set, cte_stack, seen, out);
+                collect_expr_roots_rec(f, db_set, cte_stack, view_stack, seen, out);
             }
         }
         Expr::Subquery(sub) | Expr::Exists { subquery: sub, .. } => {
-            collect_select_roots_rec(sub, db_set, cte_stack, seen, out);
+            collect_select_roots_rec(sub, db_set, cte_stack, view_stack, seen, out);
         }
         _ => {}
     }
@@ -14167,6 +17749,7 @@ pub(crate) fn validate_and_infer_columns(
                     let ok = db_set.slot(db_id).is_some_and(|sl| {
                         sl.btree.is_some()
                             && (sl.schema.find_user_table(&qn.name).is_some()
+                                || sl.schema.find_view(&qn.name).is_some()
                                 || sl.schema.find_index(&qn.name).is_some())
                     });
                     if !ok {
@@ -14179,6 +17762,7 @@ pub(crate) fn validate_and_infer_columns(
                     let ok = Collation::from_name(&qn.name).is_some()
                         || collations.has_collation(&qn.name)
                         || db_set.find_user_table_in_set(qn).is_some()
+                        || db_set.find_view_in_set(qn).is_some()
                         || db_set.find_index_in_set(qn).is_some();
                     if !ok {
                         return Err(SqliteError::new(
@@ -14196,7 +17780,43 @@ pub(crate) fn validate_and_infer_columns(
             name,
             value,
         } => {
-            let _ = db_set.resolve_schema_or_err(pragma_schema.as_deref())?;
+            let db_id = db_set.resolve_schema_or_err(pragma_schema.as_deref())?;
+            if let Some(pv) = value
+                && matches!(
+                    name.to_ascii_uppercase().as_str(),
+                    "TABLE_INFO" | "TABLE_XINFO"
+                )
+            {
+                let tname = pragma_to_string(pv);
+                if pragma_schema.is_some() {
+                    if !DatabaseSet::is_catalog_table_in_db(db_id, &tname)
+                        && let Some(slot) = db_set.slot(db_id)
+                        && slot.btree.is_some()
+                        && slot.schema.find_user_table(&tname).is_none()
+                        && let Some(view) = slot.schema.find_view(&tname)
+                    {
+                        let _ = infer_view_pragma_columns(db_id, view, db_set, functions)?;
+                    }
+                } else {
+                    for cand_id in db_set.unqualified_search_order() {
+                        if DatabaseSet::is_catalog_table_in_db(cand_id, &tname) {
+                            break;
+                        }
+                        if let Some(slot) = db_set.slot(cand_id)
+                            && slot.btree.is_some()
+                        {
+                            if slot.schema.find_user_table(&tname).is_some() {
+                                break;
+                            }
+                            if let Some(view) = slot.schema.find_view(&tname) {
+                                let _ =
+                                    infer_view_pragma_columns(cand_id, view, db_set, functions)?;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             Ok(infer_pragma_columns(name, value.as_ref()))
         }
 
@@ -14261,6 +17881,15 @@ pub(crate) fn validate_and_infer_columns(
                     return Err(SqliteError::new(
                         ErrorCode::Error,
                         format!("table {} already exists", ct.name.name),
+                    ));
+                }
+                if slot.schema.find_view(&ct.name.name).is_some() {
+                    if ct.if_not_exists {
+                        return Ok(Vec::new());
+                    }
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("view {} already exists", ct.name.name),
                     ));
                 }
                 if slot.schema.find_index(&ct.name.name).is_some() {
@@ -14349,6 +17978,24 @@ pub(crate) fn validate_and_infer_columns(
                         format!("table {} already exists", name.name),
                     ));
                 }
+                if slot.schema.find_view(&name.name).is_some() {
+                    if *if_not_exists {
+                        let mut visited = Vec::new();
+                        let _ = validate_select_stmt_static(
+                            query,
+                            &[],
+                            db_set,
+                            &CteStore::default(),
+                            functions,
+                            &mut visited,
+                        )?;
+                        return Ok(Vec::new());
+                    }
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("view {} already exists", name.name),
+                    ));
+                }
                 if slot.schema.find_index(&name.name).is_some() {
                     return Err(SqliteError::new(
                         ErrorCode::Error,
@@ -14368,6 +18015,53 @@ pub(crate) fn validate_and_infer_columns(
             Ok(Vec::new())
         }
 
+        Stmt::CreateView(cv) => {
+            let db_id = resolve_create_table_target(db_set, cv.temp, &cv.name)?;
+            if !writable_schema && is_reserved_sqlite_name(&cv.name.name) {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("object name reserved for internal use: {}", cv.name.name),
+                ));
+            }
+            validate_view_no_parameters(&cv.query)?;
+            if db_id != DatabaseId::TEMP {
+                let slot_name = db_set
+                    .slot(db_id)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|| "main".to_owned());
+                let _ = fix_permanent_view_select(&cv.name.name, &slot_name, &cv.query)?;
+            }
+            if let Some(slot) = db_set.slot(db_id)
+                && slot.btree.is_some()
+            {
+                if slot.schema.find_user_table(&cv.name.name).is_some() {
+                    if cv.if_not_exists {
+                        return Ok(Vec::new());
+                    }
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("table {} already exists", cv.name.name),
+                    ));
+                }
+                if slot.schema.find_view(&cv.name.name).is_some() {
+                    if cv.if_not_exists {
+                        return Ok(Vec::new());
+                    }
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("view {} already exists", cv.name.name),
+                    ));
+                }
+                if slot.schema.find_index(&cv.name.name).is_some() {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("there is already an index named {}", cv.name.name),
+                    ));
+                }
+            }
+            Ok(Vec::new())
+        }
+
         Stmt::DropTable { if_exists, name } => {
             if let Some(ref s) = name.schema
                 && db_set.find_db_id(s).is_none()
@@ -14381,11 +18075,70 @@ pub(crate) fn validate_and_infer_columns(
                 ));
             }
             validate_drop_or_alter_schema_table_in_set(db_set, name, "dropped")?;
-            if db_set.find_user_table_in_set(name).is_none() && !if_exists {
+            if let Some((_, ResolvedRelation::View(v))) =
+                db_set.find_relation_in_set(name).ok().flatten()
+            {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    format!("no such table: {}", name.display_name()),
+                    format!("use DROP VIEW to delete view {}", v.name),
                 ));
+            }
+            match db_set.find_user_table_in_set(name) {
+                Some((_, tbl)) => {
+                    if is_non_droppable_system_table_name(&tbl.name) {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("table {} may not be dropped", tbl.name),
+                        ));
+                    }
+                }
+                None => {
+                    if !if_exists {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("no such table: {}", name.display_name()),
+                        ));
+                    }
+                }
+            }
+            Ok(Vec::new())
+        }
+
+        Stmt::DropView { if_exists, name } => {
+            if let Some(ref s) = name.schema
+                && db_set.find_db_id(s).is_none()
+            {
+                if *if_exists {
+                    return Ok(Vec::new());
+                }
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("unknown database {s}"),
+                ));
+            }
+            validate_drop_or_alter_schema_table_in_set(db_set, name, "dropped")?;
+            match db_set.find_relation_in_set(name).ok().flatten() {
+                Some((_, ResolvedRelation::Table(t))) => {
+                    if is_non_droppable_system_table_name(&t.name) {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("table {} may not be dropped", t.name),
+                        ));
+                    }
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("use DROP TABLE to delete table {}", t.name),
+                    ));
+                }
+                Some((_, ResolvedRelation::View(_))) => {}
+                None => {
+                    if !if_exists {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("no such view: {}", name.display_name()),
+                        ));
+                    }
+                }
             }
             Ok(Vec::new())
         }
@@ -14400,24 +18153,37 @@ pub(crate) fn validate_and_infer_columns(
             let db_id = if let Some(ref s) = ci.name.schema {
                 let resolved = db_set.resolve_schema_or_err(Some(s))?;
                 if resolved == DatabaseId::TEMP {
+                    let in_temp_view = db_set.is_temp_open()
+                        && db_set
+                            .slot(DatabaseId::TEMP)
+                            .is_some_and(|sl| sl.schema.find_view(&ci.table_name).is_some());
+                    if in_temp_view {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            "views may not be indexed",
+                        ));
+                    }
                     let in_temp = db_set.is_temp_open()
                         && db_set
                             .slot(DatabaseId::TEMP)
                             .is_some_and(|sl| sl.schema.find_user_table(&ci.table_name).is_some());
                     if !in_temp {
-                        let in_other = db_set
-                            .find_user_table_in_set(&QualifiedName::unqualified(
-                                ci.table_name.clone(),
-                            ))
-                            .is_some();
-                        if in_other {
-                            return Err(SqliteError::new(
-                                ErrorCode::Error,
-                                format!(
-                                    "cannot create a TEMP index on non-TEMP table \"{}\"",
-                                    ci.table_name
-                                ),
-                            ));
+                        if let Some((_, rel)) = db_set.find_relation_in_set(
+                            &QualifiedName::unqualified(ci.table_name.clone()),
+                        )? {
+                            return match rel {
+                                ResolvedRelation::View(_) => Err(SqliteError::new(
+                                    ErrorCode::Error,
+                                    "views may not be indexed",
+                                )),
+                                ResolvedRelation::Table(_) => Err(SqliteError::new(
+                                    ErrorCode::Error,
+                                    format!(
+                                        "cannot create a TEMP index on non-TEMP table \"{}\"",
+                                        ci.table_name
+                                    ),
+                                )),
+                            };
                         }
                         return Err(SqliteError::new(
                             ErrorCode::Error,
@@ -14425,6 +18191,15 @@ pub(crate) fn validate_and_infer_columns(
                         ));
                     }
                 } else {
+                    let is_view = db_set.slot(resolved).is_some_and(|sl| {
+                        sl.btree.is_some() && sl.schema.find_view(&ci.table_name).is_some()
+                    });
+                    if is_view {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            "views may not be indexed",
+                        ));
+                    }
                     let has_tbl = db_set.slot(resolved).is_some_and(|sl| {
                         sl.btree.is_some() && sl.schema.find_user_table(&ci.table_name).is_some()
                     });
@@ -14437,15 +18212,23 @@ pub(crate) fn validate_and_infer_columns(
                 }
                 resolved
             } else {
-                let Some((found_db, _)) = db_set
-                    .find_user_table_in_set(&QualifiedName::unqualified(ci.table_name.clone()))
-                else {
-                    return Err(SqliteError::new(
-                        ErrorCode::Error,
-                        format!("no such table: {}", ci.table_name),
-                    ));
-                };
-                found_db
+                match db_set
+                    .find_relation_in_set(&QualifiedName::unqualified(ci.table_name.clone()))?
+                {
+                    Some((_, ResolvedRelation::View(_))) => {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            "views may not be indexed",
+                        ));
+                    }
+                    Some((found_db, ResolvedRelation::Table(_))) => found_db,
+                    None => {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("no such table: {}", ci.table_name),
+                        ));
+                    }
+                }
             };
 
             let slot = db_set
@@ -14457,7 +18240,9 @@ pub(crate) fn validate_and_infer_columns(
                     format!("no such table: {}", ci.table_name),
                 ));
             };
-            if slot.schema.find_user_table(&ci.name.name).is_some() {
+            if slot.schema.find_user_table(&ci.name.name).is_some()
+                || slot.schema.find_view(&ci.name.name).is_some()
+            {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!("there is already a table named {}", ci.name.name),
@@ -14539,12 +18324,24 @@ pub(crate) fn validate_and_infer_columns(
 
         Stmt::AlterTable { table, action } => {
             validate_drop_or_alter_schema_table_in_set(db_set, table, "altered")?;
-            let Some((db_id, tbl)) = db_set.find_user_table_in_set(table) else {
+            let (db_id, tbl) = match db_set.find_relation_in_set(table)? {
+                Some((_, ResolvedRelation::View(v))) => {
+                    return Err(alter_view_rejection_error(&v.name, action));
+                }
+                Some((id, ResolvedRelation::Table(t))) => (id, *t),
+                None => {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("no such table: {}", table.display_name()),
+                    ));
+                }
+            };
+            if is_reserved_sqlite_name(&tbl.name) {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    format!("no such table: {}", table.display_name()),
+                    format!("table {} may not be altered", tbl.name),
                 ));
-            };
+            }
             let slot = db_set
                 .slot(db_id)
                 .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
@@ -14557,6 +18354,7 @@ pub(crate) fn validate_and_infer_columns(
                         ));
                     }
                     if slot.schema.find_user_table(new_name).is_some()
+                        || slot.schema.find_view(new_name).is_some()
                         || slot.schema.find_index(new_name).is_some()
                     {
                         return Err(SqliteError::new(
@@ -14574,12 +18372,44 @@ pub(crate) fn validate_and_infer_columns(
                             format!("no such column: \"{old_name}\""),
                         ));
                     }
+                    check_alter_rowid_alias(&tbl, old_name, "rename from")?;
+                    check_alter_rowid_alias(&tbl, new_name, "rename to")?;
                     if !old_name.eq_ignore_ascii_case(new_name)
                         && tbl.find_column(new_name).is_some()
                     {
                         return Err(SqliteError::new(
                             ErrorCode::Error,
                             format!("duplicate column name: {new_name}"),
+                        ));
+                    }
+                }
+                AlterTableAction::DropColumn(col_name) => {
+                    let Some((_, col)) = tbl.find_column(col_name) else {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("no such column: \"{col_name}\""),
+                        ));
+                    };
+                    check_alter_rowid_alias(&tbl, col_name, "drop")?;
+                    if col.is_primary_key {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("cannot drop PRIMARY KEY column: \"{}\"", col.name),
+                        ));
+                    }
+                    if col.is_unique {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("cannot drop UNIQUE column: \"{}\"", col.name),
+                        ));
+                    }
+                    if tbl.columns.len() <= 1 {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!(
+                                "cannot drop column \"{}\": no other columns exist",
+                                col.name
+                            ),
                         ));
                     }
                 }
@@ -14590,6 +18420,7 @@ pub(crate) fn validate_and_infer_columns(
                             format!("duplicate column name: {}", cdef.name),
                         ));
                     }
+                    check_alter_rowid_alias(&tbl, &cdef.name, "add")?;
                     let validated = build_column_schema_from_def(&tbl.name, tbl.strict, cdef)?;
                     if validated
                         .generated
@@ -14671,6 +18502,13 @@ fn infer_pragma_columns(name: &str, value: Option<&PragmaValue>) -> Vec<String> 
                 Vec::new()
             } else {
                 vec!["writable_schema".to_owned()]
+            }
+        }
+        "LEGACY_ALTER_TABLE" => {
+            if value.is_some() {
+                Vec::new()
+            } else {
+                vec!["legacy_alter_table".to_owned()]
             }
         }
         "PAGE_COUNT" => vec!["page_count".to_owned()],
@@ -15916,6 +19754,42 @@ fn validate_tos_static(
                     .collect());
             }
 
+            if db_set.resolve_catalog_table(name)?.is_none()
+                && let Some((v_db_id, view_ref)) = db_set.find_view_in_set(name)
+            {
+                if let Some(IndexHint::IndexedBy(idx)) = indexed_by {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("no such index: {idx}"),
+                    ));
+                }
+                let (v_cols, v_meta, schema_lbl) = resolve_view_columns_static(
+                    v_db_id,
+                    view_ref,
+                    db_set,
+                    ctes,
+                    functions,
+                    visited_ctes,
+                )?;
+                return Ok(v_cols
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, cn)| {
+                        let (aff, coll) =
+                            v_meta.get(i).copied().unwrap_or((None, Collation::Binary));
+                        ScopedColumn {
+                            schema_name: Some(schema_lbl.clone()),
+                            table_alias: Some(eff_alias.clone()),
+                            name: cn,
+                            collation: coll,
+                            affinity: aff,
+                            hidden_rowid: false,
+                            merged_using: false,
+                        }
+                    })
+                    .collect());
+            }
+
             let (db_id, tbl, schema_lbl) = resolve_table_for_query_in_set(db_set, name)?;
             let empty_schema = Schema::default();
             let slot_schema = db_set
@@ -16008,6 +19882,7 @@ fn resolve_cte_columns_static(
         working: ctes.working.clone(),
         resolving: Vec::new(),
         limit_hint: None,
+        resolving_views: ctes.resolving_views.clone(),
     };
 
     let res = match classify_cte_recursion(cte) {
@@ -16485,6 +20360,19 @@ fn validate_expr_static(
                     visited_ctes,
                 )?
                 .len()
+            } else if db_set.resolve_catalog_table(table)?.is_none()
+                && let Some((v_db_id, view_ref)) = db_set.find_view_in_set(table)
+            {
+                resolve_view_columns_static(
+                    v_db_id,
+                    view_ref,
+                    db_set,
+                    ctes,
+                    functions,
+                    visited_ctes,
+                )?
+                .0
+                .len()
             } else {
                 let (_, tbl, _) = resolve_table_for_query_in_set(db_set, table)?;
                 tbl.columns.len()
@@ -16747,4 +20635,367 @@ fn validate_tuple_expr_static(
             Ok(1)
         }
     }
+}
+
+#[allow(clippy::type_complexity)]
+fn resolve_view_columns_static(
+    db_id: DatabaseId,
+    view: &ViewSchema,
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    functions: &FunctionRegistry,
+    visited_ctes: &mut Vec<(usize, usize)>,
+) -> Result<(Vec<String>, Vec<(Option<TypeAffinity>, Collation)>, String)> {
+    let schema_lbl = db_set
+        .slot(db_id)
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| "main".to_owned());
+    let view_ctes = ctes.enter_view(db_id, &view.name)?;
+    let fixed_sel = prepare_fixed_view_select(db_id, &schema_lbl, view)?;
+    let mut inner_visited = Vec::new();
+    let raw_cols = validate_select_stmt_static(
+        &fixed_sel,
+        &[],
+        db_set,
+        &view_ctes,
+        functions,
+        &mut inner_visited,
+    )?;
+    let _ = visited_ctes;
+    let meta = infer_select_stmt_meta(&fixed_sel, &[], db_set, &view_ctes);
+    let final_cols = if let Some(ref explicit_cols) = view.columns {
+        if explicit_cols.len() != raw_cols.len() {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!(
+                    "expected {} columns for '{}' but got {}",
+                    explicit_cols.len(),
+                    view.name,
+                    raw_cols.len()
+                ),
+            ));
+        }
+        disambiguate_view_column_names(explicit_cols)
+    } else {
+        disambiguate_view_column_names(&raw_cols)
+    };
+    Ok((final_cols, meta, schema_lbl))
+}
+
+fn infer_view_pragma_columns(
+    db_id: DatabaseId,
+    view: &ViewSchema,
+    db_set: &DatabaseSet,
+    functions: &FunctionRegistry,
+) -> Result<Vec<(String, String)>> {
+    let schema_lbl = db_set
+        .slot(db_id)
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| "main".to_owned());
+    let view_ctes = CteStore::default().enter_view(db_id, &view.name)?;
+    let fixed_sel = prepare_fixed_view_select(db_id, &schema_lbl, view)?;
+    let mut inner_visited = Vec::new();
+    let raw_cols = validate_select_stmt_static(
+        &fixed_sel,
+        &[],
+        db_set,
+        &view_ctes,
+        functions,
+        &mut inner_visited,
+    )?;
+    if let Some(ref explicit_cols) = view.columns
+        && explicit_cols.len() != raw_cols.len()
+    {
+        let names = disambiguate_view_column_names(explicit_cols);
+        return Ok(names.into_iter().map(|n| (n, String::new())).collect());
+    }
+    let names = match &view.columns {
+        Some(explicit_cols) => disambiguate_view_column_names(explicit_cols),
+        None => disambiguate_view_column_names(&raw_cols),
+    };
+    let meta = infer_select_stmt_meta(&fixed_sel, &[], db_set, &view_ctes);
+    let sub_ctes = view_ctes.with_scope(&fixed_sel.ctes);
+    let mut depth = 0usize;
+    let head_decl_types =
+        infer_core_origin_declared_types(&fixed_sel.body.head, db_set, &sub_ctes, &mut depth);
+    let mut out = Vec::with_capacity(names.len());
+    for (i, cname) in names.into_iter().enumerate() {
+        let aff = meta.get(i).and_then(|(a, _)| *a);
+        let decl_opt = head_decl_types.get(i).and_then(|d| d.as_deref());
+        let type_str = if let Some(dt) = decl_opt
+            && !dt.is_empty()
+            && Some(TypeAffinity::from_declared_type(dt)) == aff
+        {
+            dt.to_owned()
+        } else {
+            match aff {
+                Some(TypeAffinity::Integer) => "INT".to_owned(),
+                Some(TypeAffinity::Real) => "REAL".to_owned(),
+                Some(TypeAffinity::Text) => "TEXT".to_owned(),
+                Some(TypeAffinity::Blob) => "BLOB".to_owned(),
+                Some(TypeAffinity::Numeric) => "NUM".to_owned(),
+                None => String::new(),
+            }
+        };
+        out.push((cname, type_str));
+    }
+    Ok(out)
+}
+
+enum OriginSource {
+    Table {
+        schema_name: String,
+        alias: String,
+        tbl: TableSchema,
+    },
+    Derived {
+        schema_name: Option<String>,
+        alias: Option<String>,
+        col_names: Vec<String>,
+        decl_types: Vec<Option<String>>,
+    },
+}
+
+impl OriginSource {
+    fn matches_qualifier(&self, schema_qual: Option<&str>, table_qual: Option<&str>) -> bool {
+        match self {
+            Self::Table {
+                schema_name, alias, ..
+            } => {
+                if let Some(sq) = schema_qual
+                    && !schema_name.eq_ignore_ascii_case(sq)
+                {
+                    return false;
+                }
+                if let Some(tq) = table_qual
+                    && !alias.eq_ignore_ascii_case(tq)
+                {
+                    return false;
+                }
+                true
+            }
+            Self::Derived {
+                schema_name, alias, ..
+            } => {
+                if let Some(sq) = schema_qual {
+                    let Some(sn) = schema_name else {
+                        return false;
+                    };
+                    if !sn.eq_ignore_ascii_case(sq) {
+                        return false;
+                    }
+                }
+                if let Some(tq) = table_qual {
+                    let Some(al) = alias else {
+                        return false;
+                    };
+                    if !al.eq_ignore_ascii_case(tq) {
+                        return false;
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    fn lookup_declared_type(&self, col_name: &str) -> Option<(bool, Option<String>)> {
+        match self {
+            Self::Table { tbl, .. } => {
+                if let Some((_, c)) = tbl.find_column(col_name) {
+                    let dt = if c.type_name.is_empty() {
+                        None
+                    } else {
+                        Some(c.type_name.clone())
+                    };
+                    return Some((true, dt));
+                }
+                if tbl.is_implicit_rowid_name(col_name) {
+                    return Some((true, Some("INTEGER".to_owned())));
+                }
+                None
+            }
+            Self::Derived {
+                col_names,
+                decl_types,
+                ..
+            } => {
+                let idx = col_names
+                    .iter()
+                    .position(|cn| cn.eq_ignore_ascii_case(col_name))?;
+                Some((true, decl_types.get(idx).cloned().flatten()))
+            }
+        }
+    }
+}
+
+fn build_origin_source_for_tos(
+    tos: &TableOrSubquery,
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    depth: &mut usize,
+) -> Option<OriginSource> {
+    if *depth > 32 {
+        return None;
+    }
+    match tos {
+        TableOrSubquery::Table { name, alias, .. } => {
+            let eff = alias.clone().unwrap_or_else(|| name.name.clone());
+            if name.schema.is_none()
+                && let Some((s_idx, c_idx)) = ctes.locate(&name.name)
+            {
+                let cte = &ctes.scopes[s_idx][c_idx];
+                let mut sub_ctes = CteStore {
+                    scopes: ctes.scopes[..=s_idx].to_vec(),
+                    working: Vec::new(),
+                    resolving: Vec::new(),
+                    limit_hint: None,
+                    resolving_views: ctes.resolving_views.clone(),
+                };
+                if !cte.query.ctes.is_empty() {
+                    sub_ctes.scopes.push(cte.query.ctes.clone());
+                }
+                *depth += 1;
+                let decl_types = infer_core_origin_declared_types(
+                    &cte.query.body.head,
+                    db_set,
+                    &sub_ctes,
+                    depth,
+                );
+                let col_names = match &cte.columns {
+                    Some(ec) => ec.clone(),
+                    None => static_select_col_names(
+                        &cte.query.body,
+                        &[],
+                        db_set,
+                        &sub_ctes,
+                        &mut Vec::new(),
+                    ),
+                };
+                *depth -= 1;
+                return Some(OriginSource::Derived {
+                    schema_name: None,
+                    alias: Some(eff),
+                    col_names,
+                    decl_types,
+                });
+            }
+            if db_set.resolve_catalog_table(name).ok().flatten().is_none()
+                && let Some((v_db_id, view_ref)) = db_set.find_view_in_set(name)
+            {
+                let view_ctes = ctes.enter_view(v_db_id, &view_ref.name).ok()?;
+                let schema_lbl = db_set
+                    .slot(v_db_id)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|| "main".to_owned());
+                let fixed_sel = prepare_fixed_view_select(v_db_id, &schema_lbl, view_ref).ok()?;
+                let sub_ctes = view_ctes.with_scope(&fixed_sel.ctes);
+                *depth += 1;
+                let decl_types = infer_core_origin_declared_types(
+                    &fixed_sel.body.head,
+                    db_set,
+                    &sub_ctes,
+                    depth,
+                );
+                let raw_names = static_select_col_names(
+                    &fixed_sel.body,
+                    &[],
+                    db_set,
+                    &sub_ctes,
+                    &mut Vec::new(),
+                );
+                *depth -= 1;
+                let col_names = match &view_ref.columns {
+                    Some(ec) if ec.len() == raw_names.len() => disambiguate_view_column_names(ec),
+                    _ => disambiguate_view_column_names(&raw_names),
+                };
+                return Some(OriginSource::Derived {
+                    schema_name: Some(schema_lbl),
+                    alias: Some(eff),
+                    col_names,
+                    decl_types,
+                });
+            }
+            let (_, tbl, schema_lbl) = resolve_table_for_query_in_set(db_set, name).ok()?;
+            Some(OriginSource::Table {
+                schema_name: schema_lbl,
+                alias: eff,
+                tbl,
+            })
+        }
+        TableOrSubquery::Subquery { query, alias } => {
+            let sub_ctes = ctes.with_scope(&query.ctes);
+            *depth += 1;
+            let decl_types =
+                infer_core_origin_declared_types(&query.body.head, db_set, &sub_ctes, depth);
+            let col_names =
+                static_select_col_names(&query.body, &[], db_set, &sub_ctes, &mut Vec::new());
+            *depth -= 1;
+            Some(OriginSource::Derived {
+                schema_name: None,
+                alias: alias.clone(),
+                col_names,
+                decl_types,
+            })
+        }
+    }
+}
+
+fn infer_core_origin_declared_types(
+    core: &SelectCore,
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    depth: &mut usize,
+) -> Vec<Option<String>> {
+    if *depth > 32 {
+        return Vec::new();
+    }
+    let SelectCore::Select {
+        projection, from, ..
+    } = core
+    else {
+        return Vec::new();
+    };
+    let sample_cols = from
+        .as_ref()
+        .and_then(|fc| static_schema_cols_for_from(fc, &[], db_set, ctes, &mut Vec::new()))
+        .unwrap_or_default();
+    let Ok((_, expanded)) = expand_projection(projection, &sample_cols) else {
+        return Vec::new();
+    };
+    let mut sources: Vec<OriginSource> = Vec::new();
+    if let Some(fc) = from {
+        if let Some(src) = build_origin_source_for_tos(&fc.head, db_set, ctes, depth) {
+            sources.push(src);
+        }
+        for j in &fc.joins {
+            if let Some(src) = build_origin_source_for_tos(&j.right, db_set, ctes, depth) {
+                sources.push(src);
+            }
+        }
+    }
+    expanded
+        .into_iter()
+        .map(|(pe, _, _)| match pe {
+            Expr::Column(cref) => {
+                for src in &sources {
+                    if !src.matches_qualifier(cref.schema.as_deref(), cref.table.as_deref()) {
+                        continue;
+                    }
+                    if let Some((_, dt)) = src.lookup_declared_type(&cref.column) {
+                        return dt;
+                    }
+                }
+                None
+            }
+            Expr::Subquery(sub) => {
+                let sub_ctes = ctes.with_scope(&sub.ctes);
+                *depth += 1;
+                let sub_types =
+                    infer_core_origin_declared_types(&sub.body.head, db_set, &sub_ctes, depth);
+                *depth -= 1;
+                sub_types.into_iter().next().flatten()
+            }
+            _ => None,
+        })
+        .collect()
 }

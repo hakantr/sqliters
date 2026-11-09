@@ -6,6 +6,7 @@
 //!   its [`Btree`] is lazily opened on first access (`sqlite3OpenTempDatabase`).
 //! - Slots `2..nDb`: attached databases (up to `max_attached`, default [`SQLITE_MAX_ATTACHED`] = `10`).
 //!   Detaching slot `k >= 2` shifts slots `(k + 1)..nDb` left by 1 (`sqlite3CollapseDatabaseArray`).
+#![forbid(unsafe_code)]
 
 use std::path::Path;
 use std::sync::Arc;
@@ -21,7 +22,14 @@ use sqliters_types::{
 use sqliters_vdbe::BtreeAccess;
 use sqliters_vfs::Vfs;
 
-use crate::schema::{IndexSchema, Schema, TableSchema};
+use crate::schema::{IndexSchema, Schema, TableSchema, ViewSchema};
+
+/// Resolved relation (either a table or a view) located in [`DatabaseSet`].
+#[derive(Debug, Clone)]
+pub enum ResolvedRelation {
+    Table(Box<TableSchema>),
+    View(Box<ViewSchema>),
+}
 
 /// Connection-unique monotonic identity for a database schema instance.
 ///
@@ -105,6 +113,19 @@ pub struct DbSlot {
     pub max_page_count: u32,
     /// Whether URI `8_3_names=1` short super-journal/sidecar naming is enabled on this slot.
     pub enable_8_3_names: bool,
+}
+
+impl DbSlot {
+    /// Reloads `self.schema` from `self.btree` using `self.name` for `SchemaFixer` permanent-view
+    /// schema validation.
+    pub fn reload_schema(&mut self) -> Result<()> {
+        let bt = self
+            .btree
+            .as_mut()
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        self.schema = Schema::load_for_schema(bt, Some(&self.name))?;
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for DbSlot {
@@ -506,13 +527,27 @@ impl DatabaseSet {
         &self,
         qname: &QualifiedName,
     ) -> Result<Option<(DatabaseId, TableSchema)>> {
+        match self.find_relation_in_set(qname)? {
+            Some((db_id, ResolvedRelation::Table(tbl))) => Ok(Some((db_id, *tbl))),
+            Some((_, ResolvedRelation::View(_))) | None => Ok(None),
+        }
+    }
+
+    /// Locates a relation (catalog table, user table, or view) across [`DatabaseSet`] following
+    /// `sqlite3LocateTable` (`temp -> main -> attached` when unqualified; exact slot when qualified),
+    /// treating tables and views as a single per-database namespace so `temp` views shadow `main`
+    /// tables and `temp` tables shadow `main` views.
+    pub fn find_relation_in_set(
+        &self,
+        qname: &QualifiedName,
+    ) -> Result<Option<(DatabaseId, ResolvedRelation)>> {
         if let Some(cat_db_id) = self.resolve_catalog_table(qname)? {
             let mut tbl = TableSchema::sqlite_schema_table();
             tbl.name = qname.name.clone();
             if cat_db_id == DatabaseId::TEMP && !self.is_temp_open() {
                 tbl.root_pgno = 0;
             }
-            return Ok(Some((cat_db_id, tbl)));
+            return Ok(Some((cat_db_id, ResolvedRelation::Table(Box::new(tbl)))));
         }
         if let Some(ref s) = qname.schema {
             let Some(db_id) = self.find_db_id(s) else {
@@ -524,20 +559,59 @@ impl DatabaseSet {
             if slot.btree.is_none() {
                 return Ok(None);
             }
-            Ok(slot
-                .schema
-                .find_user_table(&qname.name)
-                .cloned()
-                .map(|t| (db_id, t)))
+            if let Some(tbl) = slot.schema.find_user_table(&qname.name) {
+                return Ok(Some((
+                    db_id,
+                    ResolvedRelation::Table(Box::new(tbl.clone())),
+                )));
+            }
+            if let Some(view) = slot.schema.find_view(&qname.name) {
+                return Ok(Some((
+                    db_id,
+                    ResolvedRelation::View(Box::new(view.clone())),
+                )));
+            }
+            Ok(None)
         } else {
             for db_id in self.unqualified_search_order() {
-                if let Some(slot) = self.slot(db_id)
-                    && let Some(tbl) = slot.schema.find_user_table(&qname.name)
-                {
-                    return Ok(Some((db_id, tbl.clone())));
+                if let Some(slot) = self.slot(db_id) {
+                    if let Some(tbl) = slot.schema.find_user_table(&qname.name) {
+                        return Ok(Some((
+                            db_id,
+                            ResolvedRelation::Table(Box::new(tbl.clone())),
+                        )));
+                    }
+                    if let Some(view) = slot.schema.find_view(&qname.name) {
+                        return Ok(Some((
+                            db_id,
+                            ResolvedRelation::View(Box::new(view.clone())),
+                        )));
+                    }
                 }
             }
             Ok(None)
+        }
+    }
+
+    /// Locates a view across [`DatabaseSet`] (`temp -> main -> attached` when unqualified).
+    pub fn find_view_in_set(&self, qname: &QualifiedName) -> Option<(DatabaseId, &ViewSchema)> {
+        if let Some(ref s) = qname.schema {
+            let db_id = self.find_db_id(s)?;
+            let slot = self.slot(db_id)?;
+            slot.btree.as_ref()?;
+            slot.schema.find_view(&qname.name).map(|v| (db_id, v))
+        } else {
+            for db_id in self.unqualified_search_order() {
+                if let Some(slot) = self.slot(db_id) {
+                    if slot.schema.find_user_table(&qname.name).is_some() {
+                        return None;
+                    }
+                    if let Some(view) = slot.schema.find_view(&qname.name) {
+                        return Some((db_id, view));
+                    }
+                }
+            }
+            None
         }
     }
 
@@ -553,10 +627,13 @@ impl DatabaseSet {
             slot.schema.find_user_table(&qname.name).map(|t| (db_id, t))
         } else {
             for db_id in self.unqualified_search_order() {
-                if let Some(slot) = self.slot(db_id)
-                    && let Some(tbl) = slot.schema.find_user_table(&qname.name)
-                {
-                    return Some((db_id, tbl));
+                if let Some(slot) = self.slot(db_id) {
+                    if let Some(tbl) = slot.schema.find_user_table(&qname.name) {
+                        return Some((db_id, tbl));
+                    }
+                    if slot.schema.find_view(&qname.name).is_some() {
+                        return None;
+                    }
                 }
             }
             None
