@@ -170,6 +170,7 @@ fn main() {
     reports.sort_by(|a, b| a.file_name.cmp(&b.file_name));
 
     let mut files_ok = 0usize;
+    let mut files_skipped = 0usize;
     let mut sub_passed = 0usize;
     let mut sub_failed = 0usize;
     let mut script_errs = 0usize;
@@ -183,6 +184,9 @@ fn main() {
         if r.is_ok() {
             files_ok += 1;
             println!("PASS {:20} ({} subtests)", r.file_name, r.passed);
+        } else if r.skipped_zero_subtests && r.failed.is_empty() && r.script_error.is_none() {
+            files_skipped += 1;
+            println!("SKIP {:20} (0 subtests executed)", r.file_name);
         } else {
             println!(
                 "FAIL {:20} ({} passed, {} failed{})",
@@ -208,10 +212,11 @@ fn main() {
 
     println!("================================================================");
     println!(
-        "Files:    {}/{} passed ({} failed, {} with script errors)",
+        "Files:    {}/{} passed ({} skipped/0-subtests, {} failed, {} with script errors)",
         files_ok,
         total_files,
-        total_files - files_ok,
+        files_skipped,
+        total_files - files_ok - files_skipped,
         script_errs
     );
     println!(

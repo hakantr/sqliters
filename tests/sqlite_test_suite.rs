@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 #[allow(non_snake_case)]
 #[path = "sqlite_test/affinity2.rs"]
 mod affinity2;

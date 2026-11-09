@@ -472,7 +472,8 @@ pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
                 };
                 let sp = ctx.savepoints[pos].clone();
                 let schema_changed_since_sp = *ctx.schema_generation != sp.schema_gen_at_open;
-                let write_only = !schema_changed_since_sp;
+                let is_schema_change = *ctx.schema_changed_in_tx || schema_changed_since_sp;
+                let write_only = !is_schema_change;
                 let trip_res = ctx
                     .btree
                     .trip_cursors(extended::SQLITE_ABORT_ROLLBACK, write_only);
@@ -485,7 +486,10 @@ pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
                 ctx.savepoints.truncate(pos + 1);
                 if schema_changed_since_sp {
                     *ctx.schema = sp.schema_at_open;
+                }
+                if is_schema_change {
                     *ctx.schema_generation += 1;
+                    *ctx.schema_changed_in_tx = true;
                 }
                 *ctx.rollback_count += 1;
                 ctx.publish();
@@ -9389,9 +9393,26 @@ pub(crate) fn exec_vacuum_checked(
     // while `TransactionState::Write` is still held!
     let res = (|| -> Result<Schema> {
         let page_size = ctx.btree.pager().page_size();
+        let lock_geometry = ctx.btree.pager().lock_geometry();
+        let lock_byte_pg = ctx.btree.pager().lock_byte_page();
         let orig_hdr = ctx.btree.pager().header().clone();
 
-        let mut fresh = Btree::open_in_memory()?;
+        let mem_vfs: std::sync::Arc<dyn sqliters_vfs::Vfs> =
+            std::sync::Arc::new(sqliters_vfs::MemoryVfs::with_lock_geometry(lock_geometry));
+        let fresh_opts = sqliters_pager::PagerOpenOptions {
+            default_page_size: page_size,
+            lock_geometry: Some(lock_geometry),
+            db_kind: Some(sqliters_types::DatabaseKind::Memory),
+            ..sqliters_pager::PagerOpenOptions::default()
+        };
+        let mut fresh = Btree::open_with_options(
+            mem_vfs,
+            None,
+            sqliters_vfs::OpenFlags::READWRITE
+                | sqliters_vfs::OpenFlags::CREATE
+                | sqliters_vfs::OpenFlags::MEMORY,
+            fresh_opts,
+        )?;
         fresh.pager_mut().set_page_size(page_size)?;
         fresh.pager_mut().set_encoding(orig_hdr.encoding())?;
         fresh.begin_write()?;
@@ -9460,6 +9481,9 @@ pub(crate) fn exec_vacuum_checked(
             ctx.btree.pager_mut().allocate_raw_page()?;
         }
         for pgno in 1..=compacted_count {
+            if pgno == lock_byte_pg {
+                continue;
+            }
             let src = fresh.pager_mut().read_page(pgno)?.to_vec();
             let dst = ctx.btree.pager_mut().write_page(pgno)?;
             dst.copy_from_slice(&src);

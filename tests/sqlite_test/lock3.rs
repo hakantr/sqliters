@@ -1,5 +1,4 @@
 #[test]
-#[ignore = "2/8 subtests passed; pending: lock3 edge cases"]
 fn test_lock3() {
     sqliters_tcltest::run_test_script(
         "lock3",

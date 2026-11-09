@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use sqliters_types::{ErrorCode, Result, SQLITE_MAX_EXPR_DEPTH, SqliteError};
 
 use crate::ast::*;
+use crate::complete::first_statement_end_offset;
 use crate::token::{
     Token, TokenKind, decode_blob_literal, dequote, parse_float_literal, parse_int_literal,
     tokenize,
@@ -14,15 +15,21 @@ use crate::token::{
 /// Parses a single SQL statement from the beginning of `sql`, returning `(Some(stmt), remaining_tail)`
 /// or `(None, "")` if `sql` contains only whitespace, comments, and/or empty semicolons.
 pub fn parse_one(sql: &str) -> Result<(Option<Stmt>, &str)> {
-    let tokens = tokenize(sql)?;
-    let mut parser = Parser::new(sql, &tokens);
+    let prefix_end = first_statement_end_offset(sql);
+    let prefix = &sql[..prefix_end];
+    let tokens = tokenize(prefix)?;
+    let mut parser = Parser::new(prefix, &tokens);
     while parser.eat(TokenKind::Semi) {}
     if parser.at(TokenKind::Eof) {
         return Ok((None, ""));
     }
     let stmt = parser.parse_stmt()?;
-    let _ = parser.eat(TokenKind::Semi);
-    let tail_off = parser.peek().offset;
+    let tail_off = if parser.at(TokenKind::Semi) {
+        let semi = parser.advance();
+        semi.offset + semi.text.len()
+    } else {
+        parser.peek().offset
+    };
     Ok((Some(stmt), &sql[tail_off..]))
 }
 

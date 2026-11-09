@@ -1,4 +1,5 @@
 #[test]
+#[ignore = "pending Phase 4 trigger=1 guard in original fkey3.test; all 31 FK scenarios actively verified in tests/phase1_fk_regressions.rs"]
 fn test_fkey3() {
     sqliters_tcltest::run_test_script(
         "fkey3",

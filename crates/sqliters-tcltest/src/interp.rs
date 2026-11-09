@@ -60,10 +60,80 @@ struct OpenChannel {
     file: fs::File,
 }
 
+const DEFAULT_TCL_BUILTINS: &[(&str, &str)] = &[
+    ("set", "set"),
+    ("unset", "unset"),
+    ("unset_nocomplain", "unset_nocomplain"),
+    ("incr", "incr"),
+    ("append", "append"),
+    ("lappend", "lappend"),
+    ("global", "global"),
+    ("variable", "variable"),
+    ("upvar", "upvar"),
+    ("proc", "proc"),
+    ("rename", "rename"),
+    ("if", "if"),
+    ("for", "for"),
+    ("foreach", "foreach"),
+    ("while", "while"),
+    ("switch", "switch"),
+    ("break", "break"),
+    ("continue", "continue"),
+    ("return", "return"),
+    ("error", "error"),
+    ("catch", "catch"),
+    ("eval", "eval"),
+    ("uplevel", "uplevel"),
+    ("subst", "subst"),
+    ("expr", "expr"),
+    ("list", "list"),
+    ("concat", "concat"),
+    ("split", "split"),
+    ("join", "join"),
+    ("llength", "llength"),
+    ("lindex", "lindex"),
+    ("lrange", "lrange"),
+    ("linsert", "linsert"),
+    ("lreplace", "lreplace"),
+    ("lset", "lset"),
+    ("lsearch", "lsearch"),
+    ("lsort", "lsort"),
+    ("string", "string"),
+    ("array", "array"),
+    ("info", "info"),
+    ("format", "format"),
+    ("scan", "scan"),
+    ("regexp", "regexp"),
+    ("regsub", "regsub"),
+    ("binary", "binary"),
+    ("file", "file"),
+    ("glob", "glob"),
+    ("cd", "cd"),
+    ("pwd", "pwd"),
+    ("open", "open"),
+    ("puts", "puts"),
+    ("puts_override", "puts_override"),
+    ("gets", "gets"),
+    ("read", "read"),
+    ("close", "close"),
+    ("flush", "flush"),
+    ("fconfigure", "fconfigure"),
+    ("eof", "eof"),
+    ("seek", "seek"),
+    ("tell", "tell"),
+    ("time", "time"),
+    ("clock", "clock"),
+    ("namespace", "namespace"),
+    ("encoding", "encoding"),
+    ("after", "after"),
+    ("pid", "pid"),
+];
+
 pub struct TclInterp {
     frames: Vec<CallFrame>,
     current_frame: usize,
     pub procs: HashMap<String, TclProc>,
+    pub builtins: HashMap<String, &'static str>,
     pub cwd: PathBuf,
     channels: HashMap<String, OpenChannel>,
     next_chan_id: usize,
@@ -93,16 +163,27 @@ impl TclInterp {
             .vars
             .insert("errorCode".to_string(), VarSlot::Scalar("NONE".to_string()));
 
+        let mut builtins = HashMap::with_capacity(DEFAULT_TCL_BUILTINS.len());
+        for &(name, target) in DEFAULT_TCL_BUILTINS {
+            builtins.insert(name.to_string(), target);
+        }
+
         Self {
             frames: vec![global],
             current_frame: 0,
             procs: HashMap::new(),
+            builtins,
             cwd,
             channels: HashMap::new(),
             next_chan_id: 1,
             host,
             script_path: String::new(),
         }
+    }
+
+    pub(crate) fn remove_non_host_cmd(&mut self, name: &str) {
+        self.procs.remove(name);
+        self.builtins.remove(name);
     }
 
     pub fn resolve_path(&self, p: &str) -> PathBuf {
@@ -172,6 +253,15 @@ impl TclInterp {
         let (is_global, base, idx) = self.parse_var_ref(raw_name);
         let start_frame = if is_global { 0 } else { self.current_frame };
         let (fidx, bname) = self.resolve_target(start_frame, base.to_string());
+        if fidx == 0
+            && bname == "sqlite_pending_byte"
+            && let Some(ref host_rc) = self.host
+        {
+            return match idx {
+                None => Ok(crate::harness::get_pending_byte_str(host_rc)),
+                Some(_) => Err(format!("can't read \"{raw_name}\": variable isn't array")),
+            };
+        }
         let slot = self.frames.get(fidx).and_then(|f| f.vars.get(&bname));
         match (slot, idx) {
             (Some(VarSlot::Scalar(v)), None) => Ok(v.clone()),
@@ -193,6 +283,18 @@ impl TclInterp {
         let (is_global, base, idx) = self.parse_var_ref(raw_name);
         let start_frame = if is_global { 0 } else { self.current_frame };
         let (fidx, bname) = self.resolve_target(start_frame, base.to_string());
+        if fidx == 0
+            && bname == "sqlite_pending_byte"
+            && let Some(host_rc) = self.host.clone()
+        {
+            return match idx {
+                None => {
+                    crate::harness::set_pending_byte_str(&host_rc, &val)?;
+                    Ok(val)
+                }
+                Some(_) => Err(format!("can't set \"{raw_name}\": variable isn't array")),
+            };
+        }
         match idx {
             None => {
                 if matches!(self.frames[fidx].vars.get(&bname), Some(VarSlot::Array(_))) {
@@ -223,6 +325,15 @@ impl TclInterp {
         let (is_global, base, idx) = self.parse_var_ref(raw_name);
         let start_frame = if is_global { 0 } else { self.current_frame };
         let (fidx, bname) = self.resolve_target(start_frame, base.to_string());
+        if fidx == 0 && bname == "sqlite_pending_byte" && self.host.is_some() {
+            return match idx {
+                None => Err(format!(
+                    "can't unset \"{raw_name}\": linked test-domain variable cannot be unset"
+                )),
+                Some(_) if nocomplain => Ok(()),
+                Some(_) => Err(format!("can't unset \"{raw_name}\": variable isn't array")),
+            };
+        }
         match idx {
             None => {
                 if self.frames[fidx].vars.remove(&bname).is_none() && !nocomplain {
@@ -251,6 +362,9 @@ impl TclInterp {
         let (is_global, base, idx) = self.parse_var_ref(raw_name);
         let start_frame = if is_global { 0 } else { self.current_frame };
         let (fidx, bname) = self.resolve_target(start_frame, base.to_string());
+        if fidx == 0 && bname == "sqlite_pending_byte" && self.host.is_some() {
+            return idx.is_none();
+        }
         match (self.frames.get(fidx).and_then(|f| f.vars.get(&bname)), idx) {
             (Some(VarSlot::Scalar(_)), None) => true,
             (Some(VarSlot::Array(_)), None) => true,
@@ -658,10 +772,17 @@ impl TclInterp {
             return res;
         }
 
-        // 3. Built-in TCL commands
-        match cmd {
+        // 3. Built-in TCL commands (resolved through command-identity table)
+        let Some(target) = self.builtins.get(cmd).copied() else {
+            return Err(TclControl::Error(format!(
+                "invalid command name \"{}\"",
+                words[0]
+            )));
+        };
+
+        match target {
             "set" => self.cmd_set(args),
-            "unset" | "unset_nocomplain" => self.cmd_unset(cmd == "unset_nocomplain", args),
+            "unset" | "unset_nocomplain" => self.cmd_unset(target == "unset_nocomplain", args),
             "incr" => self.cmd_incr(args),
             "append" => self.cmd_append(args),
             "lappend" => self.cmd_lappend(args),
@@ -1015,6 +1136,10 @@ impl TclInterp {
                 }
             }
         }
+        self.builtins.remove(&name);
+        if let Some(host_rc) = self.host.clone() {
+            crate::harness::delete_host_cmd_if_exists(&host_rc, &name);
+        }
         self.procs.insert(
             name,
             TclProc {
@@ -1032,11 +1157,52 @@ impl TclInterp {
         }
         let old = args[0].strip_prefix("::").unwrap_or(&args[0]);
         let new = args[1].strip_prefix("::").unwrap_or(&args[1]);
-        if let Some(p) = self.procs.remove(old)
+
+        let in_procs = self.procs.contains_key(old);
+        let in_host = self
+            .host
+            .as_ref()
+            .is_some_and(|h| crate::harness::has_host_cmd(h, old));
+        let in_builtins = self.builtins.contains_key(old);
+
+        if !in_procs && !in_host && !in_builtins {
+            return Err(TclControl::Error(format!(
+                "can't rename \"{}\": command doesn't exist",
+                args[0]
+            )));
+        }
+
+        if !new.is_empty() {
+            let new_exists = self.procs.contains_key(new)
+                || self.builtins.contains_key(new)
+                || self
+                    .host
+                    .as_ref()
+                    .is_some_and(|h| crate::harness::has_host_cmd(h, new));
+            if new_exists {
+                return Err(TclControl::Error(format!(
+                    "can't rename to \"{}\": command already exists",
+                    args[1]
+                )));
+            }
+        }
+
+        if in_procs {
+            if let Some(p) = self.procs.remove(old)
+                && !new.is_empty()
+            {
+                self.procs.insert(new.to_string(), p);
+            }
+        } else if in_host {
+            if let Some(host_rc) = self.host.clone() {
+                crate::harness::rename_or_delete_host_cmd(&host_rc, old, new)?;
+            }
+        } else if let Some(target) = self.builtins.remove(old)
             && !new.is_empty()
         {
-            self.procs.insert(new.to_string(), p);
+            self.builtins.insert(new.to_string(), target);
         }
+
         Ok(String::new())
     }
 
@@ -2026,7 +2192,7 @@ impl TclInterp {
                 let name = args.get(1).map_or("", String::as_str);
                 Ok(if self.var_exists(name) { "1" } else { "0" }.to_string())
             }
-            "commands" | "procs" => {
+            "procs" => {
                 let pat = args.get(1).map_or("*", String::as_str);
                 let mut hits: Vec<String> = self
                     .procs
@@ -2035,6 +2201,30 @@ impl TclInterp {
                     .cloned()
                     .collect();
                 hits.sort();
+                Ok(format_list(&hits))
+            }
+            "commands" => {
+                let pat = args.get(1).map_or("*", String::as_str);
+                let mut hits: Vec<String> = Vec::new();
+                for k in self.procs.keys() {
+                    if glob_match(pat, k, false) {
+                        hits.push(k.clone());
+                    }
+                }
+                for k in self.builtins.keys() {
+                    if glob_match(pat, k, false) {
+                        hits.push(k.clone());
+                    }
+                }
+                if let Some(ref host_rc) = self.host {
+                    for k in crate::harness::list_host_cmds(host_rc) {
+                        if glob_match(pat, &k, false) {
+                            hits.push(k);
+                        }
+                    }
+                }
+                hits.sort();
+                hits.dedup();
                 Ok(format_list(&hits))
             }
             "vars" | "globals" | "locals" => {
@@ -2050,7 +2240,12 @@ impl TclInterp {
                     .filter(|k| glob_match(pat, k, false))
                     .cloned()
                     .collect();
+                if fidx == 0 && self.host.is_some() && glob_match(pat, "sqlite_pending_byte", false)
+                {
+                    hits.push("sqlite_pending_byte".to_string());
+                }
                 hits.sort();
+                hits.dedup();
                 Ok(format_list(&hits))
             }
             "level" => {

@@ -9,7 +9,10 @@ pub mod regex;
 
 use std::path::{Path, PathBuf};
 
-pub use harness::{SqliteTestHost, SubtestFailure, TempTestDir, TestFileReport};
+pub use harness::{
+    SqliteTestHost, SubtestFailure, TESTFIXTURE_DEFAULT_PAGE_SIZE, TempTestDir, TestFileReport,
+    phase1_capability, sqlite_err_name,
+};
 use interp::{TclControl, TclInterp};
 
 /// Evaluates an adapted SQLite `.test` script in an isolated temporary directory
@@ -63,6 +66,21 @@ pub fn run_test_script(test_name: &str, script: &str) {
                 &mut msg,
                 "  ... and {} more failing subtests",
                 report.failed.len() - 20
+            );
+        }
+        if report.passed == 0 && report.failed.is_empty() && report.script_error.is_none() {
+            use std::fmt::Write;
+            let _ = writeln!(
+                &mut msg,
+                "  Zero subtests executed (early finish_test / capability skip cannot pass an active test)!"
+            );
+        }
+        if !report.unknown_capabilities.is_empty() {
+            use std::fmt::Write;
+            let _ = writeln!(
+                &mut msg,
+                "  Unknown capabilities queried: {:?}",
+                report.unknown_capabilities
             );
         }
         if let Some(ref serr) = report.script_error {

@@ -1,4 +1,5 @@
 #[test]
+#[ignore = "requires SQLITE_ENABLE_STAT4 (stat4=0; zero subtests without STAT4)"]
 fn test_whereJ() {
     sqliters_tcltest::run_test_script(
         "whereJ",
