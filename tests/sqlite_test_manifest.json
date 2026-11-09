@@ -7,11 +7,58 @@
     "sqlite/ext/rtree"
   ],
   "summary": {
-    "total_registered": 57,
-    "active": 14,
-    "ignored": 43
+    "total_registered": 74,
+    "active": 21,
+    "ignored": 53
   },
   "tests": [
+    {
+      "id": "sqlite/test/alterdropcol.test",
+      "source_root": "sqlite/test",
+      "relative_path": "alterdropcol.test",
+      "source_path": "sqlite/test/alterdropcol.test",
+      "sha256": "6a3f0c49fd0beba90c2cfdb27f8404e9684b20603f45496c3906718f1a666b0b",
+      "wrapper_path": "tests/sqlite_test/alterdropcol.rs",
+      "module_name": "alterdropcol",
+      "test_fn": "test_alterdropcol",
+      "phase": "3",
+      "required_capabilities": [
+        "altertable",
+        "view",
+        "trigger"
+      ],
+      "external_dependencies": [
+        "CREATE TRIGGER",
+        "DROP TRIGGER"
+      ],
+      "status": "ignored",
+      "ignore_reason": "alterdropcol-5.4.1..5.5.2 execute unguarded CREATE TRIGGER / DROP TRIGGER (pending Phase 4 trigger); all 96 non-trigger subtests pass and are verified in phase3_view_upsert_dropcol_cte",
+      "observed_passed_subtests": 96,
+      "expected_subtest_count": 100
+    },
+    {
+      "id": "sqlite/test/alterdropcol2.test",
+      "source_root": "sqlite/test",
+      "relative_path": "alterdropcol2.test",
+      "source_path": "sqlite/test/alterdropcol2.test",
+      "sha256": "35dd321abb00e29aa0055f8626c48f48051723af804b9a4dfa33484d82158624",
+      "wrapper_path": "tests/sqlite_test/alterdropcol2.rs",
+      "module_name": "alterdropcol2",
+      "test_fn": "test_alterdropcol2",
+      "phase": "3",
+      "required_capabilities": [
+        "altertable",
+        "view",
+        "trigger"
+      ],
+      "external_dependencies": [
+        "CREATE TRIGGER"
+      ],
+      "status": "ignored",
+      "ignore_reason": "alterdropcol2-3.0+ executes unguarded CREATE TRIGGER (pending Phase 4 trigger); 1.0..2.4 (15 subtests) pass and are verified in phase3_view_upsert_dropcol_cte",
+      "observed_passed_subtests": 15,
+      "expected_subtest_count": 21
+    },
     {
       "id": "sqlite/test/attach.test",
       "source_root": "sqlite/test",
@@ -305,6 +352,305 @@
       "ignore_reason": "pending Phase 6 Tcl user-defined SQL function callback (db func int2str)",
       "observed_passed_subtests": 0,
       "expected_subtest_count": 7
+    },
+    {
+      "id": "sqlite/test/upfrom1.test",
+      "source_root": "sqlite/test",
+      "relative_path": "upfrom1.test",
+      "source_path": "sqlite/test/upfrom1.test",
+      "sha256": "1224ad1e214780689a4c196394104ed5ed25e8101f00de5aa97c3b17e8c74739",
+      "wrapper_path": "tests/sqlite_test/upfrom1.rs",
+      "module_name": "upfrom1",
+      "test_fn": "test_upfrom1",
+      "phase": "3",
+      "required_capabilities": [
+        "cte",
+        "view"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 22,
+      "expected_subtest_count": 22
+    },
+    {
+      "id": "sqlite/test/upfrom2.test",
+      "source_root": "sqlite/test",
+      "relative_path": "upfrom2.test",
+      "source_path": "sqlite/test/upfrom2.test",
+      "sha256": "896a814086d1cf38b2efb5c672cabf641b85decd7b40d8e8e50fb1418a548a58",
+      "wrapper_path": "tests/sqlite_test/upfrom2.rs",
+      "module_name": "upfrom2",
+      "test_fn": "test_upfrom2",
+      "phase": "3",
+      "required_capabilities": [
+        "view",
+        "trigger"
+      ],
+      "external_dependencies": [
+        "CREATE TRIGGER"
+      ],
+      "status": "ignored",
+      "ignore_reason": "upfrom2 executes unguarded BEFORE/AFTER/INSTEAD OF CREATE TRIGGER across 1.1..6.2 (pending Phase 4 trigger); non-trigger sections pass and are verified in phase3_view_upsert_dropcol_cte",
+      "observed_passed_subtests": 18,
+      "expected_subtest_count": 46
+    },
+    {
+      "id": "sqlite/test/upfrom3.test",
+      "source_root": "sqlite/test",
+      "relative_path": "upfrom3.test",
+      "source_path": "sqlite/test/upfrom3.test",
+      "sha256": "de156cf6cfc76d8bfbaec056a4641fa45baf6ca8618ec40ac7e78bcddad6a6b7",
+      "wrapper_path": "tests/sqlite_test/upfrom3.rs",
+      "module_name": "upfrom3",
+      "test_fn": "test_upfrom3",
+      "phase": "3",
+      "required_capabilities": [
+        "cte",
+        "upsert"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 42,
+      "expected_subtest_count": 42
+    },
+    {
+      "id": "sqlite/test/upfrom4.test",
+      "source_root": "sqlite/test",
+      "relative_path": "upfrom4.test",
+      "source_path": "sqlite/test/upfrom4.test",
+      "sha256": "1b98d5800cc875a578a23e9552f9e2c1aadf4a94037eaef766b426eb9c1911a0",
+      "wrapper_path": "tests/sqlite_test/upfrom4.rs",
+      "module_name": "upfrom4",
+      "test_fn": "test_upfrom4",
+      "phase": "3",
+      "required_capabilities": [
+        "cte",
+        "view",
+        "trigger"
+      ],
+      "external_dependencies": [
+        "CREATE TRIGGER"
+      ],
+      "status": "ignored",
+      "ignore_reason": "upfrom4-300..400 execute unguarded CREATE TRIGGER (pending Phase 4 trigger); 1.0..2.2.3 (5 subtests) pass and are verified in phase3_view_upsert_dropcol_cte",
+      "observed_passed_subtests": 5,
+      "expected_subtest_count": 8
+    },
+    {
+      "id": "sqlite/test/upfromfault.test",
+      "source_root": "sqlite/test",
+      "relative_path": "upfromfault.test",
+      "source_path": "sqlite/test/upfromfault.test",
+      "sha256": "9b88ccb978b23f7ae5fd9612efd7aa41e2348071e2f53d56d88056a128e33e87",
+      "wrapper_path": "tests/sqlite_test/upfromfault.rs",
+      "module_name": "upfromfault",
+      "test_fn": "test_upfromfault",
+      "phase": "3",
+      "required_capabilities": [
+        "view",
+        "trigger"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test",
+        "CREATE TRIGGER"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test) and Phase 4 trigger",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/test/upsert1.test",
+      "source_root": "sqlite/test",
+      "relative_path": "upsert1.test",
+      "source_path": "sqlite/test/upsert1.test",
+      "sha256": "2da26435dbf7e950ce6a246bb85fdaa9c0083d860ead6b9ad7025cbf0ae80fc2",
+      "wrapper_path": "tests/sqlite_test/upsert1.rs",
+      "module_name": "upsert1",
+      "test_fn": "test_upsert1",
+      "phase": "3",
+      "required_capabilities": [
+        "upsert",
+        "view",
+        "trigger"
+      ],
+      "external_dependencies": [
+        "CREATE TRIGGER"
+      ],
+      "status": "ignored",
+      "ignore_reason": "upsert1-900 and upsert1-1300 execute unguarded CREATE TRIGGER (pending Phase 4 trigger); all 33 non-trigger subtests pass and are verified in phase3_view_upsert_dropcol_cte",
+      "observed_passed_subtests": 33,
+      "expected_subtest_count": 35
+    },
+    {
+      "id": "sqlite/test/upsert2.test",
+      "source_root": "sqlite/test",
+      "relative_path": "upsert2.test",
+      "source_path": "sqlite/test/upsert2.test",
+      "sha256": "220638f2e78658a57424ce614078318c153dc88e53dfa4a3831ae19e89ca4cad",
+      "wrapper_path": "tests/sqlite_test/upsert2.rs",
+      "module_name": "upsert2",
+      "test_fn": "test_upsert2",
+      "phase": "3",
+      "required_capabilities": [
+        "upsert",
+        "trigger"
+      ],
+      "external_dependencies": [
+        "CREATE TRIGGER"
+      ],
+      "status": "ignored",
+      "ignore_reason": "upsert2-300..421 execute unguarded CREATE TRIGGER (pending Phase 4 trigger); 100..220 (6 subtests) pass and are verified in phase3_view_upsert_dropcol_cte",
+      "observed_passed_subtests": 6,
+      "expected_subtest_count": 14
+    },
+    {
+      "id": "sqlite/test/upsert3.test",
+      "source_root": "sqlite/test",
+      "relative_path": "upsert3.test",
+      "source_path": "sqlite/test/upsert3.test",
+      "sha256": "7907fd68fb61b4db4ca46fc9c732736448a73c3d3d16cf9ae00450a526ea2d1f",
+      "wrapper_path": "tests/sqlite_test/upsert3.rs",
+      "module_name": "upsert3",
+      "test_fn": "test_upsert3",
+      "phase": "3",
+      "required_capabilities": [
+        "upsert"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 7,
+      "expected_subtest_count": 7
+    },
+    {
+      "id": "sqlite/test/upsert4.test",
+      "source_root": "sqlite/test",
+      "relative_path": "upsert4.test",
+      "source_path": "sqlite/test/upsert4.test",
+      "sha256": "bd9c3e00f0b57dc5a7e780c782ff44fa49707eb833fe37fd529553d248db3b65",
+      "wrapper_path": "tests/sqlite_test/upsert4.rs",
+      "module_name": "upsert4",
+      "test_fn": "test_upsert4",
+      "phase": "3",
+      "required_capabilities": [
+        "upsert",
+        "view",
+        "trigger"
+      ],
+      "external_dependencies": [
+        "CREATE TRIGGER"
+      ],
+      "status": "ignored",
+      "ignore_reason": "upsert4-9.0..9.1 execute unguarded CREATE TRIGGER (pending Phase 4 trigger); 1.0..8.16 (126 subtests) pass and are verified in phase3_view_upsert_dropcol_cte",
+      "observed_passed_subtests": 126,
+      "expected_subtest_count": 128
+    },
+    {
+      "id": "sqlite/test/upsert5.test",
+      "source_root": "sqlite/test",
+      "relative_path": "upsert5.test",
+      "source_path": "sqlite/test/upsert5.test",
+      "sha256": "9e8aff12ffce13f94bb7d4fc343761da3e608c477233e0819117106ee3112eac",
+      "wrapper_path": "tests/sqlite_test/upsert5.rs",
+      "module_name": "upsert5",
+      "test_fn": "test_upsert5",
+      "phase": "3",
+      "required_capabilities": [
+        "upsert"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 249,
+      "expected_subtest_count": 249
+    },
+    {
+      "id": "sqlite/test/upsertfault.test",
+      "source_root": "sqlite/test",
+      "relative_path": "upsertfault.test",
+      "source_path": "sqlite/test/upsertfault.test",
+      "sha256": "97257f0332105c07afc24e7250800d71e36e385d665d1c1d1ce0a83883dbc5e5",
+      "wrapper_path": "tests/sqlite_test/upsertfault.rs",
+      "module_name": "upsertfault",
+      "test_fn": "test_upsertfault",
+      "phase": "3",
+      "required_capabilities": [
+        "upsert"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/test/view.test",
+      "source_root": "sqlite/test",
+      "relative_path": "view.test",
+      "source_path": "sqlite/test/view.test",
+      "sha256": "61444e53a8789f08513b4e7ba6d1575e7a8c5ceaa38283b9a6fa354bfb123faf",
+      "wrapper_path": "tests/sqlite_test/view.rs",
+      "module_name": "view",
+      "test_fn": "test_view",
+      "phase": "3",
+      "required_capabilities": [
+        "view",
+        "analyze",
+        "auth"
+      ],
+      "external_dependencies": [
+        "ANALYZE",
+        "db authorizer"
+      ],
+      "status": "ignored",
+      "ignore_reason": "view-25.1..25.2 execute unguarded ANALYZE + db authorizer (pending Phase 5 analyze and Phase 6 auth); all 119 non-auth subtests pass and are verified in phase3_view_upsert_dropcol_cte",
+      "observed_passed_subtests": 120,
+      "expected_subtest_count": 121
+    },
+    {
+      "id": "sqlite/test/view2.test",
+      "source_root": "sqlite/test",
+      "relative_path": "view2.test",
+      "source_path": "sqlite/test/view2.test",
+      "sha256": "4cb155a4645793595b2ffd9723feb4eb26008c21597e35dd986a59846e47f566",
+      "wrapper_path": "tests/sqlite_test/view2.rs",
+      "module_name": "view2",
+      "test_fn": "test_view2",
+      "phase": "3",
+      "required_capabilities": [
+        "view",
+        "cte"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 4,
+      "expected_subtest_count": 4
+    },
+    {
+      "id": "sqlite/test/view3.test",
+      "source_root": "sqlite/test",
+      "relative_path": "view3.test",
+      "source_path": "sqlite/test/view3.test",
+      "sha256": "b39bc9f9c8d3c27c079c1b13a53d268d3022040bf2d5ddd8d523ebbbbc3047bb",
+      "wrapper_path": "tests/sqlite_test/view3.rs",
+      "module_name": "view3",
+      "test_fn": "test_view3",
+      "phase": "3",
+      "required_capabilities": [
+        "view",
+        "compound"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 1,
+      "expected_subtest_count": 1
     },
     {
       "id": "sqlite/test/wal.test",
@@ -1242,6 +1588,25 @@
       "ignore_reason": "requires C testvfs/tvfs VFS callback instrumentation",
       "observed_passed_subtests": 0,
       "expected_subtest_count": 34
+    },
+    {
+      "id": "sqlite/test/withM.test",
+      "source_root": "sqlite/test",
+      "relative_path": "withM.test",
+      "source_path": "sqlite/test/withM.test",
+      "sha256": "7aa5ef2c4ad54afdb1707717715e09a11338f3ac774f129ee2aa563f532dd31c",
+      "wrapper_path": "tests/sqlite_test/withM.rs",
+      "module_name": "withM",
+      "test_fn": "test_withM",
+      "phase": "3",
+      "required_capabilities": [
+        "cte"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 1,
+      "expected_subtest_count": 1
     }
   ]
 }

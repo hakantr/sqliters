@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "49/158 subtests passed; pending: VIEW, EQP/optimizer, C testfixture hooks"]
+#[ignore = "51/158 subtests passed; pending: like edge cases"]
 fn test_like() {
     sqliters_tcltest::run_test_script(
         "like",

@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "34824/36716 subtests passed; pending: VIEW, EQP/optimizer"]
+#[ignore = "34828/36716 subtests passed; pending: select9 edge cases"]
 fn test_select9() {
     sqliters_tcltest::run_test_script(
         "select9",

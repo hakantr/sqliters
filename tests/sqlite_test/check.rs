@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "76/109 subtests passed; pending: VIEW"]
+#[ignore = "75/109 subtests passed; pending: check edge cases"]
 fn test_check() {
     sqliters_tcltest::run_test_script(
         "check",

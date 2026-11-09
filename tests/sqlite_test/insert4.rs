@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "0/0 subtests passed; pending: VIEW, TEMP TABLE"]
+#[ignore = "88/95 subtests passed; pending: Tcl collation"]
 fn test_insert4() {
     sqliters_tcltest::run_test_script(
         "insert4",

@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "21/58 subtests passed; pending: VIEW, EQP/optimizer"]
+#[ignore = "17/58 subtests passed; pending: Tcl UDF"]
 fn test_whereG() {
     sqliters_tcltest::run_test_script(
         "whereG",

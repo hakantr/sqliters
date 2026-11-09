@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "0/2 subtests passed; pending: VIEW, TRIGGER, ATTACH"]
+#[ignore = "45/46 subtests passed; pending: Tcl UDF"]
 fn test_vacuum() {
     sqliters_tcltest::run_test_script(
         "vacuum",

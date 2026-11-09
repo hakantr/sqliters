@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "22/61 subtests passed; pending: VIEW, C testfixture hooks"]
+#[ignore = "23/61 subtests passed; pending: whereD edge cases"]
 fn test_whereD() {
     sqliters_tcltest::run_test_script(
         "whereD",

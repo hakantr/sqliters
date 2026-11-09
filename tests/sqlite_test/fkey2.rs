@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "1019/1216 subtests passed; pending: VIEW, TRIGGER, ATTACH"]
+#[ignore = "0/0 subtests passed; pending: TRIGGER"]
 fn test_fkey2() {
     sqliters_tcltest::run_test_script(
         "fkey2",

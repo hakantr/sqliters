@@ -496,6 +496,7 @@ pub enum ResultColumn {
     Expr {
         expr: Expr,
         alias: Option<String>,
+        span_text: Option<String>,
     },
 }
 
@@ -509,6 +510,7 @@ pub struct FromClause {
 pub enum TableOrSubquery {
     Table {
         name: QualifiedName,
+        table_args: Option<Vec<Expr>>,
         alias: Option<String>,
         indexed_by: Option<IndexHint>,
     },

@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "129/198 subtests passed; pending: VIEW, EQP/optimizer"]
+#[ignore = "169/191 subtests passed; pending: join edge cases"]
 fn test_join() {
     sqliters_tcltest::run_test_script(
         "join",

@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "88/107 subtests passed; pending: VIEW, TRIGGER, ATTACH"]
+#[ignore = "112/115 subtests passed; pending: TRIGGER, EQP/optimizer"]
 fn test_with1() {
     sqliters_tcltest::run_test_script(
         "with1",

@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "110/134 subtests passed; pending: VIEW, WINDOW"]
+#[ignore = "110/128 subtests passed; pending: cast edge cases"]
 fn test_cast() {
     sqliters_tcltest::run_test_script(
         "cast",

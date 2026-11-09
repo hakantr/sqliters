@@ -178,9 +178,15 @@ pub fn strip_test_comments(raw_tcl: &str) -> String {
             }
         } else if !in_quotes && !prev_backslash_cont && trimmed.starts_with('#') {
             // Inside a braced proc/do_test/if block (not inside quotes), check if
-            // we are inside a SQL single-quoted string or pure TCL block.
-            // Only strip if the line has no SQL single quotes and is a pure `#` comment.
-            if !trimmed.contains('\'') && !trimmed.contains('/') {
+            // we are inside a SQL single-quoted string or a multi-line literal result (`{{...}}`).
+            let is_nested_literal_data = brace_depth >= 2
+                && !trimmed.contains('{')
+                && !trimmed.contains('}')
+                && !trimmed.contains('"')
+                && !trimmed.starts_with("# ")
+                && trimmed != "#"
+                && !trimmed.bytes().all(|b| b == b'#');
+            if !is_nested_literal_data && !trimmed.contains('\'') && !trimmed.contains('/') {
                 prev_backslash_cont = trimmed.ends_with('\\');
                 continue;
             }

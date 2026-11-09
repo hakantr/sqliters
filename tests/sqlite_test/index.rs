@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "91/120 subtests passed; pending: VIEW, TRIGGER, TEMP TABLE"]
+#[ignore = "103/119 subtests passed; pending: index edge cases"]
 fn test_index() {
     sqliters_tcltest::run_test_script(
         "index",

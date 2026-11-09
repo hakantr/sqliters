@@ -576,6 +576,15 @@ impl Schema {
                         let parsed = parse_one(&sql_text);
                         let cv = match parsed {
                             Ok((Some(Stmt::CreateView(cv)), _)) => cv,
+                            Err(e) => {
+                                if writable_schema {
+                                    continue;
+                                }
+                                return Err(SqliteError::corrupt(format!(
+                                    "malformed database schema ({name}) - {}",
+                                    e.message
+                                )));
+                            }
                             _ => {
                                 if writable_schema {
                                     continue;
@@ -1866,7 +1875,11 @@ fn fix_core_with_ctes(
                             table: table.clone(),
                         });
                     }
-                    ResultColumn::Expr { expr, alias } => {
+                    ResultColumn::Expr {
+                        expr,
+                        alias,
+                        span_text,
+                    } => {
                         fixed_proj.push(ResultColumn::Expr {
                             expr: fix_expr_with_ctes(
                                 view_name,
@@ -1875,6 +1888,7 @@ fn fix_core_with_ctes(
                                 in_scope_ctes,
                             )?,
                             alias: alias.clone(),
+                            span_text: span_text.clone(),
                         });
                     }
                 }
@@ -1971,13 +1985,32 @@ fn fix_tos_with_ctes(
     match tos {
         TableOrSubquery::Table {
             name,
+            table_args,
             alias,
             indexed_by,
-        } => Ok(TableOrSubquery::Table {
-            name: fix_qualified_relation(view_name, db_schema_name, name, in_scope_ctes)?,
-            alias: alias.clone(),
-            indexed_by: indexed_by.clone(),
-        }),
+        } => {
+            let fixed_args = match table_args {
+                Some(args) => {
+                    let mut out = Vec::with_capacity(args.len());
+                    for e in args {
+                        out.push(fix_expr_with_ctes(
+                            view_name,
+                            db_schema_name,
+                            e,
+                            in_scope_ctes,
+                        )?);
+                    }
+                    Some(out)
+                }
+                None => None,
+            };
+            Ok(TableOrSubquery::Table {
+                name: fix_qualified_relation(view_name, db_schema_name, name, in_scope_ctes)?,
+                table_args: fixed_args,
+                alias: alias.clone(),
+                indexed_by: indexed_by.clone(),
+            })
+        }
         TableOrSubquery::Subquery { query, alias } => Ok(TableOrSubquery::Subquery {
             query: Box::new(fix_select_with_ctes(
                 view_name,

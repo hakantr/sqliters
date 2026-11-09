@@ -19,6 +19,12 @@ mod alter3;
 #[path = "sqlite_test/alter4.rs"]
 mod alter4;
 #[allow(non_snake_case)]
+#[path = "sqlite_test/alterdropcol.rs"]
+mod alterdropcol;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/alterdropcol2.rs"]
+mod alterdropcol2;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/attach.rs"]
 mod attach;
 #[allow(non_snake_case)]
@@ -595,6 +601,39 @@ mod update;
 #[path = "sqlite_test/update2.rs"]
 mod update2;
 #[allow(non_snake_case)]
+#[path = "sqlite_test/upfrom1.rs"]
+mod upfrom1;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/upfrom2.rs"]
+mod upfrom2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/upfrom3.rs"]
+mod upfrom3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/upfrom4.rs"]
+mod upfrom4;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/upfromfault.rs"]
+mod upfromfault;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/upsert1.rs"]
+mod upsert1;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/upsert2.rs"]
+mod upsert2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/upsert3.rs"]
+mod upsert3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/upsert4.rs"]
+mod upsert4;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/upsert5.rs"]
+mod upsert5;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/upsertfault.rs"]
+mod upsertfault;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/utf16align.rs"]
 mod utf16align;
 #[allow(non_snake_case)]
@@ -618,6 +657,15 @@ mod vacuum6;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/vacuum-into.rs"]
 mod vacuum_into;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/view.rs"]
+mod view;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/view2.rs"]
+mod view2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/view3.rs"]
+mod view3;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/wal.rs"]
 mod wal;
@@ -834,3 +882,6 @@ mod with5;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/with6.rs"]
 mod with6;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/withM.rs"]
+mod withM;

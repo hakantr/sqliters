@@ -206,7 +206,7 @@ const DEFAULT_HOST_BUILTINS: &[(&str, &str)] = &[
     ("sqlite3_db_filename", "sqlite3_db_filename"),
     ("sqlite3_limit", "sqlite3_limit"),
     ("decode_hexdb", "decode_hexdb"),
-    ("sqlite3_db_config", "noop_zero"),
+    ("sqlite3_db_config", "sqlite3_db_config"),
     ("sqlite3_db_config_lookaside", "noop_zero"),
     ("sqlite3_test_control", "noop_zero"),
     ("sqlite3_soft_heap_limit", "noop_zero"),
@@ -244,13 +244,13 @@ const DEFAULT_HOST_BUILTINS: &[(&str, &str)] = &[
     ("sqlite3_db_status", "noop_zero"),
 ];
 
-/// Explicit Phase 1.2 capability table (`sqlite_options` / `ifcapable`).
+/// Explicit harness capability table (`sqlite_options` / `ifcapable`).
 ///
-/// Only genuinely implemented and verified Phase 1.1 + Phase 1.2 features are mapped to `true`.
+/// Only genuinely implemented and verified Phase 1.1..Phase 3 features are mapped to `true`.
 /// Every unverified, future-phase, or out-of-scope capability is explicitly `false`,
 /// and any unknown capability name evaluates to `None` (`false` + recorded in diagnostics).
 pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
-    // Verified Phase 1.1 + Phase 1.2 SQL, B-tree, pager, WAL, VFS, and lifecycle capabilities:
+    // Verified Phase 1.1..Phase 3 SQL, B-tree, pager, WAL, VFS, and lifecycle capabilities:
     ("altertable", true),
     ("attach", true),
     ("autoinc", true),
@@ -298,7 +298,9 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("tempdb", true),
     ("threadsafe", true),
     ("truncate_opt", true),
+    ("upsert", true),
     ("vacuum", true),
+    ("view", true),
     ("wal", true),
     ("xfer_opt", true),
     // Explicitly disabled (future phases or out of scope):
@@ -338,9 +340,7 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("trigger", false),
     ("unlock_notify", false),
     ("update_delete_limit", false),
-    ("upsert", false),
     ("utf16", false),
-    ("view", false),
     ("vtab", false),
     ("windowfunc", false),
 ];
@@ -958,6 +958,7 @@ pub fn bootstrap_tester(
     let _ = interp.set_var("sqlite_like_count", "0".to_string());
     let _ = interp.set_var("sqlite_sort_count", "0".to_string());
     let _ = interp.set_var("sqlite_xferopt_count", "0".to_string());
+    let _ = interp.set_var("sqlite3_xferopt_count", "0".to_string());
     let _ = interp.set_var("sqlite_opentemp_count", "0".to_string());
     let _ = interp.set_var("sqlite_current_time", "0".to_string());
     let _ = interp.set_var("tcl_precision", "15".to_string());
@@ -1345,6 +1346,7 @@ fn dispatch_host_builtin(
         "file_control_persist_wal" => cmd_file_control_persist_wal(host, invoked_name, args),
         "sqlite3_db_filename" => cmd_db_filename(host, invoked_name, args),
         "sqlite3_limit" => cmd_sqlite3_limit(host, invoked_name, args),
+        "sqlite3_db_config" => cmd_sqlite3_db_config(host, invoked_name, args),
         "decode_hexdb" => cmd_decode_hexdb(args),
         "noop_zero" => Ok("0".to_string()),
         _ => Err(TclControl::Error(format!(
@@ -1588,8 +1590,8 @@ fn dispatch_db_method(
         }
         "status" => Ok("0".to_string()),
         "deserialize" => db_deserialize_cmd(host, db_name, db_id, &args[1..]),
+        "config" => db_config_subcmd(host, db_name, db_id, &args[1..]),
         "cache"
-        | "config"
         | "busy"
         | "authorizer"
         | "auth"
@@ -1821,6 +1823,26 @@ fn exec_db_internal_sql(
     }
 }
 
+fn flush_xferopt_delta(host: &SharedHost, interp: &mut TclInterp, db_id: DbId) {
+    let delta = {
+        let h = host.borrow();
+        match h.dbs.get(&db_id) {
+            Some(DbSlot::Present(db)) => db.conn.take_xferopt_delta(),
+            _ => 0,
+        }
+    };
+    if delta > 0 {
+        for var in ["sqlite3_xferopt_count", "sqlite_xferopt_count"] {
+            let prev = interp
+                .get_var(var)
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .unwrap_or(0);
+            let _ = interp.set_var(var, (prev + delta as i64).to_string());
+        }
+    }
+}
+
 fn checkout_db_conn(host: &SharedHost, db_id: DbId) -> TclResult<(Rc<Connection>, String)> {
     let h = host.borrow();
     match h.dbs.get(&db_id) {
@@ -2042,6 +2064,7 @@ fn db_eval(
                     }
                 }
                 Ok(StepResult::Done) => {
+                    flush_xferopt_delta(host, interp, db_id);
                     if let Some((Some(arr), _)) = body_spec
                         && !wrote_array_star
                     {
@@ -2051,6 +2074,7 @@ fn db_eval(
                 }
                 Err(step_err) => {
                     let _ = stmt.finalize();
+                    flush_xferopt_delta(host, interp, db_id);
                     let msg = sqlite_err_text(&step_err);
                     host.borrow_mut().set_db_error(
                         db_id,
@@ -2616,8 +2640,14 @@ fn cmd_sqlite3_limit(host: &SharedHost, cmd_name: &str, args: &[String]) -> TclR
         }
         "SQLITE_LIMIT_LENGTH" | "0" => Ok("1000000000".to_string()),
         "SQLITE_LIMIT_SQL_LENGTH" | "1" => Ok("1000000000".to_string()),
-        "SQLITE_LIMIT_COLUMN" | "2" => Ok("2000".to_string()),
-        "SQLITE_LIMIT_EXPR_DEPTH" | "3" => Ok("1000".to_string()),
+        "SQLITE_LIMIT_COLUMN" | "2" => {
+            let prev = conn.set_column_limit(val as isize);
+            Ok(prev.to_string())
+        }
+        "SQLITE_LIMIT_EXPR_DEPTH" | "3" => {
+            let prev = conn.set_expr_depth_limit(val as isize);
+            Ok(prev.to_string())
+        }
         "SQLITE_LIMIT_COMPOUND_SELECT" | "4" => Ok("500".to_string()),
         "SQLITE_LIMIT_VDBE_OP" | "5" => Ok("250000000".to_string()),
         "SQLITE_LIMIT_FUNCTION_ARG" | "6" => Ok("127".to_string()),
@@ -2629,6 +2659,70 @@ fn cmd_sqlite3_limit(host: &SharedHost, cmd_name: &str, args: &[String]) -> TclR
             "unknown limit type: {limit_name}"
         ))),
     }
+}
+
+fn db_config_subcmd(
+    host: &SharedHost,
+    db_name: &str,
+    db_id: DbId,
+    args: &[String],
+) -> TclResult<String> {
+    let conn = {
+        let h = host.borrow();
+        let Some(DbSlot::Present(db)) = h.dbs.get(&db_id) else {
+            return Err(TclControl::Error(format!("unknown db {db_name}")));
+        };
+        Rc::clone(&db.conn)
+    };
+    if args.is_empty() {
+        return Ok(format!(
+            "enable_view {}",
+            i32::from(conn.db_config_enable_view(None))
+        ));
+    }
+    let opt = args[0].trim();
+    if opt.eq_ignore_ascii_case("enable_view") {
+        let set_opt = match args.get(1) {
+            Some(v) => {
+                let s = v.trim();
+                if let Some(iv) = parse_tcl_int(s) {
+                    if iv < 0 { None } else { Some(iv != 0) }
+                } else {
+                    Some(parse_tcl_bool(s).map_err(TclControl::Error)?)
+                }
+            }
+            None => None,
+        };
+        let cur = conn.db_config_enable_view(set_opt);
+        return Ok(i32::from(cur).to_string());
+    }
+    Ok("0".to_string())
+}
+
+fn cmd_sqlite3_db_config(host: &SharedHost, cmd_name: &str, args: &[String]) -> TclResult<String> {
+    if args.len() < 2 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{cmd_name} DB OPTION ?BOOLEAN?\""
+        )));
+    }
+    let db_id = {
+        let h = host.borrow();
+        let Some(id) = h.resolve_db_id(&args[0]) else {
+            return Ok("0".to_string());
+        };
+        id
+    };
+    let opt = args[1].trim();
+    if opt.eq_ignore_ascii_case("ENABLE_VIEW")
+        || opt.eq_ignore_ascii_case("SQLITE_DBCONFIG_ENABLE_VIEW")
+    {
+        let mut sub_args = vec!["enable_view".to_string()];
+        if let Some(v) = args.get(2) {
+            sub_args.push(v.clone());
+        }
+        return db_config_subcmd(host, &args[0], db_id, &sub_args);
+    }
+    Ok("0".to_string())
 }
 
 fn cmd_ifcapable(host: &SharedHost, interp: &mut TclInterp, args: &[String]) -> TclResult<String> {
@@ -2952,6 +3046,7 @@ fn cmd_step(host: &SharedHost, args: &[String]) -> TclResult<String> {
     if h.stmts.contains_key(id) {
         h.stmts.insert(id.to_string(), StmtSlot::Present(rec));
     }
+    drop(h);
     Ok(ret_code_name)
 }
 

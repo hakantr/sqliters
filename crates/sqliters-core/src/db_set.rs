@@ -139,11 +139,17 @@ impl std::fmt::Debug for DbSlot {
     }
 }
 
+pub const SQLITE_MAX_EXPR_DEPTH: usize = 1000;
+pub const SQLITE_MAX_COLUMN: usize = 2000;
+
 /// Connection database array (`db->aDb[0..db->nDb]`) managing `"main"`, lazy `"temp"`, and
 /// attached databases (`2..nDb`).
 pub struct DatabaseSet {
     slots: Vec<DbSlot>,
     max_attached: usize,
+    enable_view: bool,
+    expr_depth_limit: usize,
+    column_limit: usize,
     next_schema_instance_id: u64,
     temp_store: TempStoreMode,
     disk_vfs: Arc<dyn Vfs>,
@@ -151,6 +157,7 @@ pub struct DatabaseSet {
     lock_geometry: LockGeometry,
     interrupt_flag: Arc<AtomicBool>,
     temp_trigger_bindings: Vec<TempTriggerBinding>,
+    xferopt_delta: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for DatabaseSet {
@@ -201,6 +208,9 @@ impl DatabaseSet {
         Self {
             slots,
             max_attached: SQLITE_MAX_ATTACHED,
+            enable_view: true,
+            expr_depth_limit: SQLITE_MAX_EXPR_DEPTH,
+            column_limit: SQLITE_MAX_COLUMN,
             next_schema_instance_id: 3,
             temp_store,
             disk_vfs,
@@ -208,6 +218,7 @@ impl DatabaseSet {
             lock_geometry,
             interrupt_flag,
             temp_trigger_bindings: Vec::new(),
+            xferopt_delta: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -234,6 +245,59 @@ impl DatabaseSet {
     pub fn set_max_attached(&mut self, limit: usize) -> usize {
         self.max_attached = limit.min(SQLITE_MAX_ATTACHED);
         self.max_attached
+    }
+
+    /// Whether permanent view expansion is enabled (`SQLITE_DBCONFIG_ENABLE_VIEW`).
+    #[inline]
+    pub const fn enable_view(&self) -> bool {
+        self.enable_view
+    }
+
+    /// Updates `SQLITE_DBCONFIG_ENABLE_VIEW`, returning the new setting.
+    #[inline]
+    pub fn set_enable_view(&mut self, enabled: bool) -> bool {
+        self.enable_view = enabled;
+        self.enable_view
+    }
+
+    /// Records one `INSERT` transfer-optimization activation (`sqlite3_xferopt_count`).
+    #[inline]
+    pub fn record_xferopt(&self) {
+        self.xferopt_delta
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Drains accumulated transfer-optimization activations since the last read.
+    #[inline]
+    pub fn take_xferopt_delta(&self) -> u64 {
+        self.xferopt_delta
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Current `SQLITE_LIMIT_EXPR_DEPTH` limit on this connection.
+    #[inline]
+    pub const fn expr_depth_limit(&self) -> usize {
+        self.expr_depth_limit
+    }
+
+    /// Sets `SQLITE_LIMIT_EXPR_DEPTH` (clamped to `0..=SQLITE_MAX_EXPR_DEPTH`), returning the new limit.
+    #[inline]
+    pub fn set_expr_depth_limit(&mut self, limit: usize) -> usize {
+        self.expr_depth_limit = limit.min(SQLITE_MAX_EXPR_DEPTH);
+        self.expr_depth_limit
+    }
+
+    /// Current `SQLITE_LIMIT_COLUMN` limit on this connection.
+    #[inline]
+    pub const fn column_limit(&self) -> usize {
+        self.column_limit
+    }
+
+    /// Sets `SQLITE_LIMIT_COLUMN` (clamped to `0..=SQLITE_MAX_COLUMN`), returning the new limit.
+    #[inline]
+    pub fn set_column_limit(&mut self, limit: usize) -> usize {
+        self.column_limit = limit.min(SQLITE_MAX_COLUMN);
+        self.column_limit
     }
 
     /// Current `PRAGMA temp_store` mode.

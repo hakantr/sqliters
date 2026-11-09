@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "34/87 subtests passed; pending: VIEW, TRIGGER, ATTACH"]
+#[ignore = "49/78 subtests passed; pending: autoinc edge cases"]
 fn test_autoinc() {
     sqliters_tcltest::run_test_script(
         "autoinc",

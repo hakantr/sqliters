@@ -57,6 +57,9 @@ pub const CORE_SQL_FAMILIES: &[&str] = &[
     "incrvacuum",
     "attach",
     "tempdb",
+    "view",
+    "upsert",
+    "upfrom",
 ];
 
 pub const CORE_SQL_EXACT: &[&str] = &[
@@ -66,6 +69,7 @@ pub const CORE_SQL_EXACT: &[&str] = &[
     "with4",
     "with5",
     "with6",
+    "withM",
     "expr",
     "expr2",
     "returning1",

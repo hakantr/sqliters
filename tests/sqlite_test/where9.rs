@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "46/89 subtests passed; pending: VIEW, TEMP TABLE, EQP/optimizer"]
+#[ignore = "48/89 subtests passed; pending: EQP/optimizer"]
 fn test_where9() {
     sqliters_tcltest::run_test_script(
         "where9",

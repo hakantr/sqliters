@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "22/54 subtests passed; pending: TRIGGER, ATTACH, VIRTUAL TABLE"]
+#[ignore = "45/50 subtests passed; pending: alter4 edge cases"]
 fn test_alter4() {
     sqliters_tcltest::run_test_script(
         "alter4",

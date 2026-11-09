@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "130/248 subtests passed; pending: VIEW, TRIGGER, C testfixture hooks"]
+#[ignore = "135/240 subtests passed; pending: rowid edge cases"]
 fn test_rowid() {
     sqliters_tcltest::run_test_script(
         "rowid",

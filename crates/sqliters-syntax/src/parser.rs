@@ -181,7 +181,11 @@ impl<'a> Parser<'a> {
     }
 
     fn syntax_err_at(&self, tok: Token<'a>, msg: impl Into<String>) -> SqliteError {
-        SqliteError::syntax(msg, tok.offset)
+        let mut s = msg.into();
+        if tok.kind == TokenKind::Eof && s == "near \"\": syntax error" {
+            s = "incomplete input".to_owned();
+        }
+        SqliteError::syntax(s, tok.offset)
     }
 
     fn alloc_ident_from_token(&mut self, tok: Token<'a>) -> String {
@@ -636,7 +640,18 @@ impl<'a> Parser<'a> {
             let columns = if self.eat(TokenKind::Lp) {
                 let mut cols = Vec::new();
                 loop {
-                    cols.push(self.parse_nm()?);
+                    let col_tok = self.peek();
+                    let col_name = self.parse_nm()?;
+                    if matches!(
+                        self.peek().kind,
+                        TokenKind::Collate | TokenKind::Asc | TokenKind::Desc
+                    ) {
+                        return Err(self.syntax_err_at(
+                            col_tok,
+                            format!("syntax error after column name \"{}\"", col_tok.text),
+                        ));
+                    }
+                    cols.push(col_name);
                     if !self.eat(TokenKind::Comma) {
                         break;
                     }
@@ -1772,20 +1787,30 @@ impl<'a> Parser<'a> {
                     table: tbl,
                 });
             } else {
+                let expr_start = self.peek().offset;
                 let expr = self.parse_expr()?;
+                let expr_end = self.prev_token_end();
                 let alias = if self.eat(TokenKind::As) {
-                    if self.at(TokenKind::StringLiteral) {
-                        Some(dequote(self.advance().text))
-                    } else {
-                        Some(self.parse_ident()?)
-                    }
-                } else if self.at(TokenKind::Id) || self.at(TokenKind::QuotedId) {
+                    Some(self.parse_nm()?)
+                } else if self.at(TokenKind::Id)
+                    || self.at(TokenKind::QuotedId)
+                    || self.at(TokenKind::StringLiteral)
+                {
                     // Implicit alias `SELECT expr alias` when not a clause keyword
                     Some(dequote(self.advance().text))
                 } else {
                     None
                 };
-                cols.push(ResultColumn::Expr { expr, alias });
+                let span_text = if alias.is_none() && expr_end >= expr_start {
+                    Some(self.sql[expr_start..expr_end].to_owned())
+                } else {
+                    None
+                };
+                cols.push(ResultColumn::Expr {
+                    expr,
+                    alias,
+                    span_text,
+                });
             }
             if !self.eat(TokenKind::Comma) {
                 break;
@@ -1908,10 +1933,26 @@ impl<'a> Parser<'a> {
         }
 
         let name = self.parse_qualified_name()?;
+        let table_args = if self.eat(TokenKind::Lp) {
+            let mut args = Vec::new();
+            if !self.at(TokenKind::Rp) {
+                loop {
+                    args.push(self.parse_expr()?);
+                    if !self.eat(TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(TokenKind::Rp)?;
+            Some(args)
+        } else {
+            None
+        };
         let alias = self.parse_optional_table_alias(&[])?;
         let indexed_by = self.parse_optional_index_hint()?;
         Ok(TableOrSubquery::Table {
             name,
+            table_args,
             alias,
             indexed_by,
         })
@@ -1932,13 +1973,15 @@ impl<'a> Parser<'a> {
 
     fn parse_optional_table_alias(&mut self, stop_tokens: &[TokenKind]) -> Result<Option<String>> {
         if self.eat(TokenKind::As) {
-            return Ok(Some(self.parse_ident()?));
+            return Ok(Some(self.parse_nm()?));
         }
         let next = self.peek().kind;
         if stop_tokens.contains(&next) {
             return Ok(None);
         }
-        if matches!(next, TokenKind::Id | TokenKind::QuotedId) {
+        if matches!(next, TokenKind::Id | TokenKind::QuotedId)
+            || (stop_tokens.is_empty() && next == TokenKind::StringLiteral)
+        {
             let tok = self.advance();
             return Ok(Some(self.alloc_ident_from_token(tok)));
         }

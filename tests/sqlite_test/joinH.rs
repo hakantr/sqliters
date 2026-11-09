@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "48/81 subtests passed; pending: VIEW"]
+#[ignore = "59/81 subtests passed; pending: joinH edge cases"]
 fn test_joinH() {
     sqliters_tcltest::run_test_script(
         "joinH",

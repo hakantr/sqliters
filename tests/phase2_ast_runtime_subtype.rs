@@ -836,6 +836,7 @@ fn group64_ast_structural_qualified_names_and_attach_detach() {
                 column: "c.d".into(),
             }),
             alias: None,
+            span_text: Some("main.\"a.b\".\"c.d\"".into()),
         }
     );
     assert_eq!(

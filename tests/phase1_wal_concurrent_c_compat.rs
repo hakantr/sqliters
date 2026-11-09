@@ -1595,7 +1595,8 @@ fn c_reference_3_54_1_verification_and_phase1_2_manifest() {
     assert_eq!(cap_map.get("wal"), Some(&true));
     assert_eq!(cap_map.get("tempdb"), Some(&true));
     assert_eq!(cap_map.get("attach"), Some(&true));
-    assert_eq!(cap_map.get("view"), Some(&false));
+    assert_eq!(cap_map.get("view"), Some(&true));
+    assert_eq!(cap_map.get("upsert"), Some(&true));
     assert_eq!(cap_map.get("trigger"), Some(&false));
 
     // 4. Read `tests/sqlite_test_manifest.json` summary & OS/filesystem metadata.

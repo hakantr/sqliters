@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "10/44 subtests passed; pending: VIEW, VIRTUAL TABLE, TEMP TABLE"]
+#[ignore = "0/0 subtests passed; pending: VIRTUAL TABLE"]
 fn test_index7() {
     sqliters_tcltest::run_test_script(
         "index7",

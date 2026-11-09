@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "44/49 subtests passed; pending: VIEW, TEMP TABLE"]
+#[ignore = "46/49 subtests passed; pending: Tcl UDF"]
 fn test_distinct2() {
     sqliters_tcltest::run_test_script(
         "distinct2",

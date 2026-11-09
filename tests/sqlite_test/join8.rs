@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "68/108 subtests passed; pending: VIEW, VIRTUAL TABLE, ANALYZE/sqlite_stat1"]
+#[ignore = "0/0 subtests passed; pending: VIRTUAL TABLE"]
 fn test_join8() {
     sqliters_tcltest::run_test_script(
         "join8",

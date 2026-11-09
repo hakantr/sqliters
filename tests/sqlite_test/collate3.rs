@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "6/39 subtests passed; pending: VIEW"]
+#[ignore = "6/39 subtests passed; pending: Tcl collation"]
 fn test_collate3() {
     sqliters_tcltest::run_test_script(
         "collate3",

@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "2186/2190 subtests passed; pending: VIEW, TRIGGER, TEMP TABLE"]
+#[ignore = "2188/2190 subtests passed; pending: Tcl UDF"]
 fn test_func() {
     sqliters_tcltest::run_test_script(
         "func",

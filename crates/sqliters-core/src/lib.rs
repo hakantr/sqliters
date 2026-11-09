@@ -2616,6 +2616,80 @@ impl Connection {
         }
     }
 
+    /// Queries (`enabled == None`) or updates (`enabled == Some(b)`) `SQLITE_DBCONFIG_ENABLE_VIEW`,
+    /// returning the current/updated state.
+    pub fn db_config_enable_view(&self, enabled: Option<bool>) -> bool {
+        if let Ok(mut session) = self.shared.enter() {
+            if session.inner().ensure_usable().is_err() {
+                return true;
+            }
+            if let Some(flag) = enabled {
+                let inner = session.inner_mut();
+                let prev = inner.db_set.enable_view();
+                let cur = inner.db_set.set_enable_view(flag);
+                if prev != cur {
+                    inner.schema_generation += 1;
+                }
+                cur
+            } else {
+                session.inner().db_set.enable_view()
+            }
+        } else {
+            true
+        }
+    }
+
+    /// Queries (`limit < 0`) or updates (`limit >= 0`, clamped to `0..=SQLITE_MAX_EXPR_DEPTH`)
+    /// `SQLITE_LIMIT_EXPR_DEPTH`, returning the **previous** limit.
+    pub fn set_expr_depth_limit(&self, limit: isize) -> usize {
+        if let Ok(mut session) = self.shared.enter() {
+            if session.inner().ensure_usable().is_err() {
+                return db_set::SQLITE_MAX_EXPR_DEPTH;
+            }
+            let prev = session.inner().db_set.expr_depth_limit();
+            if limit >= 0 {
+                let inner = session.inner_mut();
+                let actual = inner.db_set.set_expr_depth_limit(limit as usize);
+                if actual != prev {
+                    inner.schema_generation += 1;
+                }
+            }
+            prev
+        } else {
+            db_set::SQLITE_MAX_EXPR_DEPTH
+        }
+    }
+
+    /// Queries (`limit < 0`) or updates (`limit >= 0`, clamped to `0..=SQLITE_MAX_COLUMN`)
+    /// `SQLITE_LIMIT_COLUMN`, returning the **previous** limit.
+    pub fn set_column_limit(&self, limit: isize) -> usize {
+        if let Ok(mut session) = self.shared.enter() {
+            if session.inner().ensure_usable().is_err() {
+                return db_set::SQLITE_MAX_COLUMN;
+            }
+            let prev = session.inner().db_set.column_limit();
+            if limit >= 0 {
+                let inner = session.inner_mut();
+                let actual = inner.db_set.set_column_limit(limit as usize);
+                if actual != prev {
+                    inner.schema_generation += 1;
+                }
+            }
+            prev
+        } else {
+            db_set::SQLITE_MAX_COLUMN
+        }
+    }
+
+    /// Drains accumulated `INSERT` transfer-optimization activations (`sqlite3_xferopt_count`).
+    pub fn take_xferopt_delta(&self) -> u64 {
+        if let Ok(session) = self.shared.enter() {
+            session.inner().db_set.take_xferopt_delta()
+        } else {
+            0
+        }
+    }
+
     /// Installs or clears the connection commit hook (`sqlite3_commit_hook`).
     /// Returning `true` (non-zero) aborts the commit with `SQLITE_CONSTRAINT_COMMITHOOK` and rolls back.
     pub fn commit_hook(&self, hook: Option<CommitHookCallback>) -> Result<()> {

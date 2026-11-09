@@ -3,9 +3,10 @@
 #![forbid(unsafe_code)]
 
 use sqliters_syntax::{
-    BinaryOp, BindParam, ColumnRef, CurrentTimeKind, Expr, FromClause, FunctionArgs, IndexHint,
-    InsertSource, InsertStmt, LikeOp, LimitClause, OrderByTerm, QualifiedName, ResultColumn,
-    SelectBody, SelectCore, SelectStmt, Stmt, TableOrSubquery, UnaryOp,
+    BinaryOp, BindParam, ColumnRef, CommonTableExpr, CompoundOp, CurrentTimeKind, Expr, FromClause,
+    FunctionArgs, IndexHint, InsertSource, InsertStmt, JoinConstraint, LikeOp, LimitClause,
+    OrderByTerm, QualifiedName, ResultColumn, SelectBody, SelectCore, SelectStmt, Stmt,
+    TableOrSubquery, UnaryOp,
 };
 use sqliters_types::{
     Collation, DatabaseId, ErrorCode, KeySortOrder, Result, SqliteError, TypeAffinity, Value,
@@ -620,9 +621,18 @@ pub fn try_compile_select_in_db_set(
     db_set: &DatabaseSet,
     functions: &FunctionRegistry,
 ) -> Result<Option<VdbeProgram>> {
-    try_compile_select_core(stmt, functions, |name| {
+    let res = try_compile_select_core(stmt, functions, |name| {
         resolve_db_set_table_for_compiler(name, db_set)
-    })
+    })?;
+    if let Some(ref prog) = res
+        && prog.column_names.len() > db_set.column_limit()
+    {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            "too many columns in result set",
+        ));
+    }
+    Ok(res)
 }
 
 /// Returns `Ok(None)` whenever `ins` specifies `UPSERT` (`ON CONFLICT ...`) or any other construct
@@ -715,6 +725,7 @@ where
         Some(FromClause { head, joins }) if joins.is_empty() => {
             let TableOrSubquery::Table {
                 name,
+                table_args: None,
                 alias,
                 indexed_by,
             } = head
@@ -766,8 +777,15 @@ fn compile_tableless_select(
             ResultColumn::Star | ResultColumn::TableStar { .. } => {
                 return Err(SqliteError::new(ErrorCode::Error, "no tables specified"));
             }
-            ResultColumn::Expr { expr, alias } => {
-                let name = alias.clone().unwrap_or_else(|| expr_column_label(expr));
+            ResultColumn::Expr {
+                expr,
+                alias,
+                span_text,
+            } => {
+                let name = alias.clone().unwrap_or_else(|| match expr {
+                    Expr::Column(cref) => cref.column.clone(),
+                    _ => span_text.clone().unwrap_or_else(|| expr_column_label(expr)),
+                });
                 col_names.push(name);
                 proj_exprs.push(expr.clone());
             }
@@ -891,8 +909,25 @@ fn compile_single_table_select(
                     ));
                 }
             }
-            ResultColumn::Expr { expr, alias: al } => {
-                let label = al.clone().unwrap_or_else(|| expr_column_label(expr));
+            ResultColumn::Expr {
+                expr,
+                alias: al,
+                span_text,
+            } => {
+                let label = al.clone().unwrap_or_else(|| match expr {
+                    Expr::Column(cref) => {
+                        if let Some((_, col)) = tbl.find_column(&cref.column) {
+                            col.name.clone()
+                        } else if tbl.is_implicit_rowid_name(&cref.column) {
+                            tbl.rowid_alias_col
+                                .map(|idx| tbl.columns[idx].name.clone())
+                                .unwrap_or_else(|| "rowid".to_owned())
+                        } else {
+                            cref.column.clone()
+                        }
+                    }
+                    _ => span_text.clone().unwrap_or_else(|| expr_column_label(expr)),
+                });
                 expanded.push((expr.clone(), label, al.clone()));
             }
         }
@@ -1813,10 +1848,18 @@ fn compile_expr(
             } else {
                 let mut disj: Option<Expr> = None;
                 for item in list {
+                    // Per `sqlite/src/expr.c` (`exprINAffinity`), `lhs IN (list)` applies ONLY
+                    // `lhs`'s affinity and collation, never propagating an RHS column's affinity
+                    // or collation. Unary `+` preserves runtime value while stripping RHS column
+                    // affinity/collation metadata.
+                    let rhs_stripped = Expr::Unary {
+                        op: UnaryOp::Plus,
+                        expr: Box::new(item.clone()),
+                    };
                     let eq = Expr::Binary {
                         left: lhs_e.clone(),
                         op: BinaryOp::Eq,
-                        right: Box::new(item.clone()),
+                        right: Box::new(rhs_stripped),
                     };
                     disj = Some(match disj {
                         None => eq,
@@ -2139,7 +2182,7 @@ pub fn compile_for_explain_with_functions(
         }
         Stmt::Insert(ins) => {
             let tbl = find_table_qualified_main(&ins.table, schema)?;
-            compile_insert_explain_table(&tbl, DatabaseId::MAIN, schema, ins, functions)
+            compile_insert_explain_table(&tbl, DatabaseId::MAIN, schema, None, ins, functions)
         }
         Stmt::Update(upd) => {
             let tbl = find_table_qualified_main(&upd.table, schema)?;
@@ -2173,9 +2216,14 @@ pub fn compile_for_explain_in_db_set(
             let mut prog = VdbeProgram::new();
             prog.emit(Instruction::new(Opcode::Init, 0, 1, 0));
             prog.emit(Instruction::new(Opcode::Transaction, 0, 0, 0));
-            prog.emit(
-                Instruction::new(Opcode::OpenEphemeral, 0, 0, 0).with_comment("relational query"),
-            );
+            if select_needs_ephemeral_in_db_set(sel, &[], db_set, 0) {
+                prog.emit(
+                    Instruction::new(Opcode::OpenEphemeral, 0, 0, 0)
+                        .with_comment("relational query"),
+                );
+            } else {
+                prog.emit(Instruction::new(Opcode::OpenRead, 0, 2, 0).with_comment("flattened"));
+            }
             prog.emit(Instruction::new(Opcode::ResultRow, 1, 1, 0));
             prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
             Ok(prog)
@@ -2183,7 +2231,7 @@ pub fn compile_for_explain_in_db_set(
         Stmt::Insert(ins) => {
             let (db_id, tbl) = find_table_in_db_set_or_err(&ins.table, db_set)?;
             let slot_schema = &db_set.slot(db_id).expect("resolved slot exists").schema;
-            compile_insert_explain_table(&tbl, db_id, slot_schema, ins, functions)
+            compile_insert_explain_table(&tbl, db_id, slot_schema, Some(db_set), ins, functions)
         }
         Stmt::Update(upd) => {
             let (db_id, tbl) = find_table_in_db_set_or_err(&upd.table, db_set)?;
@@ -2242,6 +2290,7 @@ fn compile_insert_explain_table(
     tbl: &TableSchema,
     db_id: DatabaseId,
     schema: &Schema,
+    db_set: Option<&DatabaseSet>,
     ins: &InsertStmt,
     functions: &FunctionRegistry,
 ) -> Result<VdbeProgram> {
@@ -2322,6 +2371,21 @@ fn compile_insert_explain_table(
             prog.emit(Instruction::new(Opcode::Insert, tcur, rec_reg, rid_reg).with_p5(0x03));
         }
     } else {
+        let uses_ephemeral = match (&ins.source, db_set) {
+            (InsertSource::Select(sel), Some(ds)) => {
+                insert_select_reads_target(sel, &ins.ctes, db_id, &tbl.name, ds, 0)
+            }
+            _ => false,
+        };
+        if uses_ephemeral {
+            let ecur = prog.alloc_cursor();
+            prog.emit(Instruction::new(
+                Opcode::OpenEphemeral,
+                ecur,
+                tbl.columns.len() as i32,
+                0,
+            ));
+        }
         prog.emit(Instruction::new(Opcode::NewRowid, tcur, rid_reg, 0));
         prog.emit(Instruction::new(
             Opcode::MakeRecord,
@@ -2338,6 +2402,710 @@ fn compile_insert_explain_table(
     prog.emit(Instruction::new(Opcode::Close, tcur, 0, 0));
     prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
     Ok(prog)
+}
+
+fn cte_names_shadow(ctes: &[CommonTableExpr], qn: &QualifiedName) -> bool {
+    qn.schema.is_none() && ctes.iter().any(|c| c.name.eq_ignore_ascii_case(&qn.name))
+}
+
+fn select_core_blocks_flattening(core: &SelectCore) -> bool {
+    match core {
+        SelectCore::Values(_) => true,
+        SelectCore::Select {
+            distinct,
+            group_by,
+            having,
+            projection,
+            ..
+        } => {
+            *distinct
+                || !group_by.is_empty()
+                || having.is_some()
+                || projection.iter().any(|rc| {
+                    matches!(rc, ResultColumn::Expr { expr, .. } if expr_has_agg_for_explain(expr))
+                })
+        }
+    }
+}
+
+fn expr_has_agg_for_explain(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { name, args, .. } => {
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "count" | "sum" | "total" | "avg" | "min" | "max" | "group_concat" | "string_agg"
+            ) && (matches!(args, FunctionArgs::Star)
+                || matches!(args, FunctionArgs::Exprs(es) if es.len() <= 2 && !(name.eq_ignore_ascii_case("min") || name.eq_ignore_ascii_case("max")) || matches!(args, FunctionArgs::Exprs(es2) if es2.len() == 1)))
+            {
+                return true;
+            }
+            if let FunctionArgs::Exprs(es) = args {
+                return es.iter().any(expr_has_agg_for_explain);
+            }
+            false
+        }
+        Expr::Unary { expr: e, .. }
+        | Expr::Collate { expr: e, .. }
+        | Expr::Cast { expr: e, .. } => expr_has_agg_for_explain(e),
+        Expr::Binary { left, right, .. } => {
+            expr_has_agg_for_explain(left) || expr_has_agg_for_explain(right)
+        }
+        _ => false,
+    }
+}
+
+fn in_table_reuses_index(
+    qn: &QualifiedName,
+    ctes: &[CommonTableExpr],
+    db_set: &DatabaseSet,
+) -> bool {
+    if cte_names_shadow(ctes, qn) {
+        return false;
+    }
+    let Ok(Some((db_id, tbl))) = db_set.find_table_in_set(qn) else {
+        return false;
+    };
+    if tbl.columns.len() != 1 {
+        return false;
+    }
+    if tbl.rowid_alias_col == Some(0) || tbl.columns[0].is_primary_key || tbl.columns[0].is_unique {
+        return true;
+    }
+    db_set.slot(db_id).is_some_and(|sl| {
+        sl.schema.indexes_for_table(&tbl.name).iter().any(|idx| {
+            idx.where_clause.is_none()
+                && idx
+                    .columns
+                    .first()
+                    .is_some_and(|ic| ic.name.eq_ignore_ascii_case(&tbl.columns[0].name))
+        })
+    })
+}
+
+fn expr_needs_ephemeral_in_db_set(
+    expr: &Expr,
+    ctes: &[CommonTableExpr],
+    db_set: &DatabaseSet,
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    match expr {
+        Expr::InTable {
+            expr: lhs, table, ..
+        } => {
+            expr_needs_ephemeral_in_db_set(lhs, ctes, db_set, depth + 1)
+                || !in_table_reuses_index(table, ctes, db_set)
+        }
+        Expr::InSubquery {
+            expr: lhs,
+            subquery,
+            ..
+        } => {
+            expr_needs_ephemeral_in_db_set(lhs, ctes, db_set, depth + 1)
+                || !in_subquery_reuses_index(subquery, ctes, db_set)
+        }
+        Expr::InList {
+            expr: lhs, list, ..
+        } => {
+            expr_needs_ephemeral_in_db_set(lhs, ctes, db_set, depth + 1)
+                || list
+                    .iter()
+                    .any(|e| expr_needs_ephemeral_in_db_set(e, ctes, db_set, depth + 1))
+        }
+        Expr::Subquery(sub) | Expr::Exists { subquery: sub, .. } => {
+            select_needs_ephemeral_in_db_set(sub, ctes, db_set, depth + 1)
+        }
+        Expr::Unary { expr: e, .. }
+        | Expr::Collate { expr: e, .. }
+        | Expr::Cast { expr: e, .. }
+        | Expr::IsNull { expr: e, .. } => {
+            expr_needs_ephemeral_in_db_set(e, ctes, db_set, depth + 1)
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_needs_ephemeral_in_db_set(left, ctes, db_set, depth + 1)
+                || expr_needs_ephemeral_in_db_set(right, ctes, db_set, depth + 1)
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            expr_needs_ephemeral_in_db_set(e, ctes, db_set, depth + 1)
+                || expr_needs_ephemeral_in_db_set(low, ctes, db_set, depth + 1)
+                || expr_needs_ephemeral_in_db_set(high, ctes, db_set, depth + 1)
+        }
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_needs_ephemeral_in_db_set(e, ctes, db_set, depth + 1)
+                || expr_needs_ephemeral_in_db_set(pattern, ctes, db_set, depth + 1)
+                || escape
+                    .as_deref()
+                    .is_some_and(|esc| expr_needs_ephemeral_in_db_set(esc, ctes, db_set, depth + 1))
+        }
+        Expr::FunctionCall { args, filter, .. } => {
+            let args_ephem = match args {
+                FunctionArgs::Star => false,
+                FunctionArgs::Exprs(es) => es
+                    .iter()
+                    .any(|e| expr_needs_ephemeral_in_db_set(e, ctes, db_set, depth + 1)),
+            };
+            args_ephem
+                || filter
+                    .as_deref()
+                    .is_some_and(|f| expr_needs_ephemeral_in_db_set(f, ctes, db_set, depth + 1))
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|o| expr_needs_ephemeral_in_db_set(o, ctes, db_set, depth + 1))
+                || branches.iter().any(|(w, t)| {
+                    expr_needs_ephemeral_in_db_set(w, ctes, db_set, depth + 1)
+                        || expr_needs_ephemeral_in_db_set(t, ctes, db_set, depth + 1)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(|el| expr_needs_ephemeral_in_db_set(el, ctes, db_set, depth + 1))
+        }
+        Expr::RowValue(es) => es
+            .iter()
+            .any(|e| expr_needs_ephemeral_in_db_set(e, ctes, db_set, depth + 1)),
+        _ => false,
+    }
+}
+
+fn in_subquery_reuses_index(
+    sub: &SelectStmt,
+    ctes: &[CommonTableExpr],
+    db_set: &DatabaseSet,
+) -> bool {
+    if !sub.ctes.is_empty() || !sub.body.compounds.is_empty() || sub.limit.is_some() {
+        return false;
+    }
+    let SelectCore::Select {
+        distinct: false,
+        projection,
+        from: Some(fc),
+        selection: None,
+        group_by,
+        having: None,
+    } = &sub.body.head
+    else {
+        return false;
+    };
+    if !group_by.is_empty() || !fc.joins.is_empty() || projection.len() != 1 {
+        return false;
+    }
+    let TableOrSubquery::Table { name, .. } = &fc.head else {
+        return false;
+    };
+    if cte_names_shadow(ctes, name) {
+        return false;
+    }
+    let Ok(Some((db_id, tbl))) = db_set.find_table_in_set(name) else {
+        return false;
+    };
+    let ResultColumn::Expr {
+        expr: Expr::Column(cref),
+        ..
+    } = &projection[0]
+    else {
+        return false;
+    };
+    if tbl.is_implicit_rowid_name(&cref.column) {
+        return !tbl.without_rowid;
+    }
+    let Some((col_idx, col)) = tbl.find_column(&cref.column) else {
+        return false;
+    };
+    if tbl.rowid_alias_col == Some(col_idx) || col.is_primary_key || col.is_unique {
+        return true;
+    }
+    db_set.slot(db_id).is_some_and(|sl| {
+        sl.schema.indexes_for_table(&tbl.name).iter().any(|idx| {
+            idx.where_clause.is_none()
+                && idx
+                    .columns
+                    .first()
+                    .is_some_and(|ic| ic.name.eq_ignore_ascii_case(&col.name))
+        })
+    })
+}
+
+fn select_needs_ephemeral_in_db_set(
+    sel: &SelectStmt,
+    outer_ctes: &[CommonTableExpr],
+    db_set: &DatabaseSet,
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    let mut ctes = outer_ctes.to_vec();
+    ctes.extend(sel.ctes.iter().cloned());
+    for cte in &sel.ctes {
+        if cte.materialized == Some(true)
+            || !cte.query.body.compounds.is_empty()
+            || select_needs_ephemeral_in_db_set(&cte.query, &ctes, db_set, depth + 1)
+        {
+            return true;
+        }
+    }
+    if sel
+        .body
+        .compounds
+        .iter()
+        .any(|(op, _)| *op != CompoundOp::UnionAll)
+    {
+        return true;
+    }
+    if select_core_needs_ephemeral(&sel.body.head, &ctes, db_set, depth) {
+        return true;
+    }
+    for (_, core) in &sel.body.compounds {
+        if select_core_needs_ephemeral(core, &ctes, db_set, depth) {
+            return true;
+        }
+    }
+    sel.order_by
+        .iter()
+        .any(|ob| expr_needs_ephemeral_in_db_set(&ob.expr, &ctes, db_set, depth + 1))
+}
+
+fn select_core_needs_ephemeral(
+    core: &SelectCore,
+    ctes: &[CommonTableExpr],
+    db_set: &DatabaseSet,
+    depth: usize,
+) -> bool {
+    let SelectCore::Select {
+        distinct,
+        projection,
+        from,
+        selection,
+        group_by,
+        having,
+    } = core
+    else {
+        return false;
+    };
+    if *distinct {
+        return true;
+    }
+    if projection.iter().any(|rc| {
+        matches!(rc, ResultColumn::Expr { expr, .. } if expr_needs_ephemeral_in_db_set(expr, ctes, db_set, depth + 1))
+    }) {
+        return true;
+    }
+    if selection
+        .as_ref()
+        .is_some_and(|w| expr_needs_ephemeral_in_db_set(w, ctes, db_set, depth + 1))
+    {
+        return true;
+    }
+    if group_by
+        .iter()
+        .any(|g| expr_needs_ephemeral_in_db_set(g, ctes, db_set, depth + 1))
+    {
+        return true;
+    }
+    if having
+        .as_ref()
+        .is_some_and(|h| expr_needs_ephemeral_in_db_set(h, ctes, db_set, depth + 1))
+    {
+        return true;
+    }
+    let Some(fc) = from else {
+        return false;
+    };
+    let outer_has_joins = !fc.joins.is_empty();
+    let outer_blocks_limit_flatten = outer_has_joins || selection.is_some() || !group_by.is_empty();
+    if tos_needs_ephemeral_in_from(
+        &fc.head,
+        outer_has_joins,
+        outer_blocks_limit_flatten,
+        ctes,
+        db_set,
+        depth,
+    ) {
+        return true;
+    }
+    for j in &fc.joins {
+        if tos_needs_ephemeral_in_from(&j.right, true, true, ctes, db_set, depth) {
+            return true;
+        }
+        if let Some(JoinConstraint::On(ref on_e)) = j.constraint
+            && expr_needs_ephemeral_in_db_set(on_e, ctes, db_set, depth + 1)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn tos_needs_ephemeral_in_from(
+    tos: &TableOrSubquery,
+    outer_has_joins: bool,
+    outer_blocks_limit_flatten: bool,
+    ctes: &[CommonTableExpr],
+    db_set: &DatabaseSet,
+    depth: usize,
+) -> bool {
+    match tos {
+        TableOrSubquery::Subquery { query, .. } => {
+            (outer_has_joins && !query.body.compounds.is_empty())
+                || (outer_blocks_limit_flatten && query.limit.is_some())
+                || select_core_blocks_flattening(&query.body.head)
+                || query
+                    .body
+                    .compounds
+                    .iter()
+                    .any(|(_, arm)| select_core_blocks_flattening(arm))
+                || select_needs_ephemeral_in_db_set(query, ctes, db_set, depth + 1)
+        }
+        TableOrSubquery::Table { name, .. } => {
+            if cte_names_shadow(ctes, name) {
+                return false;
+            }
+            if db_set.resolve_catalog_table(name).ok().flatten().is_none()
+                && let Some((_, view)) = db_set.find_view_in_set(name)
+            {
+                return (outer_has_joins && !view.select.body.compounds.is_empty())
+                    || (outer_blocks_limit_flatten && view.select.limit.is_some())
+                    || select_core_blocks_flattening(&view.select.body.head)
+                    || view
+                        .select
+                        .body
+                        .compounds
+                        .iter()
+                        .any(|(_, arm)| select_core_blocks_flattening(arm))
+                    || select_needs_ephemeral_in_db_set(&view.select, &[], db_set, depth + 1);
+            }
+            false
+        }
+    }
+}
+
+fn insert_select_reads_target(
+    sel: &SelectStmt,
+    outer_ctes: &[CommonTableExpr],
+    target_db_id: DatabaseId,
+    target_tbl_name: &str,
+    db_set: &DatabaseSet,
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return true;
+    }
+    let mut ctes = outer_ctes.to_vec();
+    ctes.extend(sel.ctes.iter().cloned());
+    for cte in &sel.ctes {
+        if insert_select_reads_target(
+            &cte.query,
+            &ctes,
+            target_db_id,
+            target_tbl_name,
+            db_set,
+            depth + 1,
+        ) {
+            return true;
+        }
+    }
+    if select_core_reads_target(
+        &sel.body.head,
+        &ctes,
+        target_db_id,
+        target_tbl_name,
+        db_set,
+        depth,
+    ) {
+        return true;
+    }
+    for (_, core) in &sel.body.compounds {
+        if select_core_reads_target(core, &ctes, target_db_id, target_tbl_name, db_set, depth) {
+            return true;
+        }
+    }
+    if sel.order_by.iter().any(|ob| {
+        expr_reads_target(
+            &ob.expr,
+            &ctes,
+            target_db_id,
+            target_tbl_name,
+            db_set,
+            depth + 1,
+        )
+    }) {
+        return true;
+    }
+    if let Some(ref lim) = sel.limit {
+        if expr_reads_target(
+            &lim.limit,
+            &ctes,
+            target_db_id,
+            target_tbl_name,
+            db_set,
+            depth + 1,
+        ) {
+            return true;
+        }
+        if lim.offset.as_ref().is_some_and(|off| {
+            expr_reads_target(off, &ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn select_core_reads_target(
+    core: &SelectCore,
+    ctes: &[CommonTableExpr],
+    target_db_id: DatabaseId,
+    target_tbl_name: &str,
+    db_set: &DatabaseSet,
+    depth: usize,
+) -> bool {
+    match core {
+        SelectCore::Values(rows) => rows.iter().any(|r| {
+            r.iter().any(|e| {
+                expr_reads_target(e, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+            })
+        }),
+        SelectCore::Select {
+            projection,
+            from,
+            selection,
+            group_by,
+            having,
+            ..
+        } => {
+            if projection.iter().any(|rc| {
+                matches!(rc, ResultColumn::Expr { expr, .. } if expr_reads_target(expr, ctes, target_db_id, target_tbl_name, db_set, depth + 1))
+            }) {
+                return true;
+            }
+            if selection.as_ref().is_some_and(|w| {
+                expr_reads_target(w, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+            }) {
+                return true;
+            }
+            if group_by.iter().any(|g| {
+                expr_reads_target(g, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+            }) {
+                return true;
+            }
+            if having.as_ref().is_some_and(|h| {
+                expr_reads_target(h, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+            }) {
+                return true;
+            }
+            let Some(fc) = from else {
+                return false;
+            };
+            if tos_reads_target(&fc.head, ctes, target_db_id, target_tbl_name, db_set, depth) {
+                return true;
+            }
+            for j in &fc.joins {
+                if tos_reads_target(&j.right, ctes, target_db_id, target_tbl_name, db_set, depth) {
+                    return true;
+                }
+                if let Some(JoinConstraint::On(ref on_e)) = j.constraint
+                    && expr_reads_target(
+                        on_e,
+                        ctes,
+                        target_db_id,
+                        target_tbl_name,
+                        db_set,
+                        depth + 1,
+                    )
+                {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+fn tos_reads_target(
+    tos: &TableOrSubquery,
+    ctes: &[CommonTableExpr],
+    target_db_id: DatabaseId,
+    target_tbl_name: &str,
+    db_set: &DatabaseSet,
+    depth: usize,
+) -> bool {
+    match tos {
+        TableOrSubquery::Subquery { query, .. } => insert_select_reads_target(
+            query,
+            ctes,
+            target_db_id,
+            target_tbl_name,
+            db_set,
+            depth + 1,
+        ),
+        TableOrSubquery::Table { name, .. } => {
+            if cte_names_shadow(ctes, name) {
+                return false;
+            }
+            if let Ok(Some((db_id, tbl))) = db_set.find_table_in_set(name) {
+                return db_id == target_db_id && tbl.name.eq_ignore_ascii_case(target_tbl_name);
+            }
+            if let Some((_, view)) = db_set.find_view_in_set(name) {
+                return insert_select_reads_target(
+                    &view.select,
+                    &[],
+                    target_db_id,
+                    target_tbl_name,
+                    db_set,
+                    depth + 1,
+                );
+            }
+            false
+        }
+    }
+}
+
+fn expr_reads_target(
+    expr: &Expr,
+    ctes: &[CommonTableExpr],
+    target_db_id: DatabaseId,
+    target_tbl_name: &str,
+    db_set: &DatabaseSet,
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return true;
+    }
+    match expr {
+        Expr::InTable {
+            expr: lhs, table, ..
+        } => {
+            if expr_reads_target(lhs, ctes, target_db_id, target_tbl_name, db_set, depth + 1) {
+                return true;
+            }
+            tos_reads_target(
+                &TableOrSubquery::Table {
+                    name: table.clone(),
+                    table_args: None,
+                    alias: None,
+                    indexed_by: None,
+                },
+                ctes,
+                target_db_id,
+                target_tbl_name,
+                db_set,
+                depth + 1,
+            )
+        }
+        Expr::InSubquery {
+            expr: lhs,
+            subquery,
+            ..
+        } => {
+            expr_reads_target(lhs, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+                || insert_select_reads_target(
+                    subquery,
+                    ctes,
+                    target_db_id,
+                    target_tbl_name,
+                    db_set,
+                    depth + 1,
+                )
+        }
+        Expr::Subquery(sub) | Expr::Exists { subquery: sub, .. } => {
+            insert_select_reads_target(sub, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+        }
+        Expr::InList {
+            expr: lhs, list, ..
+        } => {
+            expr_reads_target(lhs, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+                || list.iter().any(|e| {
+                    expr_reads_target(e, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+                })
+        }
+        Expr::Unary { expr: e, .. }
+        | Expr::Collate { expr: e, .. }
+        | Expr::Cast { expr: e, .. }
+        | Expr::IsNull { expr: e, .. } => {
+            expr_reads_target(e, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_reads_target(left, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+                || expr_reads_target(
+                    right,
+                    ctes,
+                    target_db_id,
+                    target_tbl_name,
+                    db_set,
+                    depth + 1,
+                )
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            expr_reads_target(e, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+                || expr_reads_target(low, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+                || expr_reads_target(high, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+        }
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_reads_target(e, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+                || expr_reads_target(
+                    pattern,
+                    ctes,
+                    target_db_id,
+                    target_tbl_name,
+                    db_set,
+                    depth + 1,
+                )
+                || escape.as_deref().is_some_and(|esc| {
+                    expr_reads_target(esc, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+                })
+        }
+        Expr::FunctionCall { args, filter, .. } => {
+            let args_r = match args {
+                FunctionArgs::Star => false,
+                FunctionArgs::Exprs(es) => es.iter().any(|e| {
+                    expr_reads_target(e, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+                }),
+            };
+            args_r
+                || filter.as_deref().is_some_and(|f| {
+                    expr_reads_target(f, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+                })
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand.as_deref().is_some_and(|o| {
+                expr_reads_target(o, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+            }) || branches.iter().any(|(w, t)| {
+                expr_reads_target(w, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+                    || expr_reads_target(t, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+            }) || else_expr.as_deref().is_some_and(|el| {
+                expr_reads_target(el, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+            })
+        }
+        Expr::RowValue(es) => es
+            .iter()
+            .any(|e| expr_reads_target(e, ctes, target_db_id, target_tbl_name, db_set, depth + 1)),
+        _ => false,
+    }
 }
 
 fn compile_update_explain_table(tbl: &TableSchema, db_id: DatabaseId) -> Result<VdbeProgram> {
@@ -2505,6 +3273,7 @@ where
             if fc.joins.is_empty()
                 && let TableOrSubquery::Table {
                     name,
+                    table_args: None,
                     alias,
                     indexed_by,
                 } = &fc.head

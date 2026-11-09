@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "49/81 subtests passed; pending: VIEW, ANALYZE/sqlite_stat1, EQP/optimizer"]
+#[ignore = "53/81 subtests passed; pending: ANALYZE/sqlite_stat1, EQP/optimizer, Tcl UDF"]
 fn test_subquery() {
     sqliters_tcltest::run_test_script(
         "subquery",

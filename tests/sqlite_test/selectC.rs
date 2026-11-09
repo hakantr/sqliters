@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "14/29 subtests passed; pending: VIEW, TRIGGER"]
+#[ignore = "24/28 subtests passed; pending: Tcl UDF"]
 fn test_selectC() {
     sqliters_tcltest::run_test_script(
         "selectC",

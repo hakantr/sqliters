@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "38/60 subtests passed; pending: VIEW, TRIGGER, EQP/optimizer"]
+#[ignore = "51/60 subtests passed; pending: TRIGGER"]
 fn test_in7() {
     sqliters_tcltest::run_test_script(
         "in7",
