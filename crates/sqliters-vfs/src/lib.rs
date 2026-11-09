@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -111,6 +111,33 @@ impl OpenFlags {
     #[inline]
     pub const fn is_readonly(self) -> bool {
         self.contains(Self::READONLY) && !self.contains(Self::READWRITE)
+    }
+
+    #[inline]
+    pub const fn is_main_journal(self) -> bool {
+        self.contains(Self::MAIN_JOURNAL)
+    }
+
+    #[inline]
+    pub const fn is_super_journal(self) -> bool {
+        self.contains(Self::SUPER_JOURNAL)
+    }
+
+    #[inline]
+    pub const fn is_wal(self) -> bool {
+        self.contains(Self::WAL)
+    }
+
+    /// Returns whether opening with `self` requires a one-shot parent-directory sync on the first
+    /// [`VfsFile::sync`] call (`isNewJrnl` / `UNIXFILE_DIRSYNC` in `sqlite/src/os_unix.c:6557-6561`).
+    #[inline]
+    pub const fn requires_initial_dir_sync(self) -> bool {
+        !self.is_readonly()
+            && !self.contains(Self::DELETEONCLOSE)
+            && self.contains(Self::CREATE)
+            && (self.contains(Self::MAIN_JOURNAL)
+                || self.contains(Self::SUPER_JOURNAL)
+                || self.contains(Self::WAL))
     }
 }
 
@@ -2004,11 +2031,17 @@ impl shm::ShmBackend for WinShmSession {
 // Standard OS Filesystem VFS (`OsFile` & `OsVfs`)
 // ============================================================================
 
+#[cfg(test)]
+thread_local! {
+    static TEST_OS_DIR_SYNC_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 struct OsFile {
     file: Option<File>,
     path: Option<PathBuf>,
     delete_on_close: bool,
     readonly: bool,
+    pending_dir_sync: AtomicBool,
     lock_geometry: LockGeometry,
     min_shm_granularity: usize,
     lock_level: Mutex<LockLevel>,
@@ -2090,7 +2123,7 @@ impl VfsFile for OsFile {
         let file = self.file_ref()?;
         #[cfg(unix)]
         {
-            sys::unix::sync_fd(file, flags == SyncFlags::Full, flags == SyncFlags::DataOnly)
+            sys::unix::sync_fd(file, flags == SyncFlags::Full, flags == SyncFlags::DataOnly)?;
         }
         #[cfg(windows)]
         {
@@ -2098,8 +2131,33 @@ impl VfsFile for OsFile {
                 SyncFlags::DataOnly => file.sync_data(),
                 SyncFlags::Normal | SyncFlags::Full => file.sync_all(),
             };
-            res.map_err(|e| SqliteError::with_extended(extended::SQLITE_IOERR_FSYNC, e.to_string()))
+            res.map_err(|e| {
+                SqliteError::with_extended(extended::SQLITE_IOERR_FSYNC, e.to_string())
+            })?;
         }
+        if self.pending_dir_sync.swap(false, AtomicOrdering::SeqCst)
+            && let Some(ref p) = self.path
+            && let Some(parent) = p.parent()
+        {
+            let dir_target = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            #[cfg(unix)]
+            {
+                sys::unix::sync_directory(dir_target)?;
+            }
+            #[cfg(not(unix))]
+            {
+                if let Ok(dir) = File::open(dir_target) {
+                    let _ = dir.sync_all();
+                }
+            }
+            #[cfg(test)]
+            TEST_OS_DIR_SYNC_COUNT.with(|c| c.set(c.get() + 1));
+        }
+        Ok(())
     }
 
     fn file_size(&self) -> Result<u64> {
@@ -3335,11 +3393,14 @@ impl Vfs for OsVfs {
             (fid, info)
         };
 
+        let pending_dir_sync = !delete_on_close && !readonly && flags.requires_initial_dir_sync();
+
         Ok(Box::new(OsFile {
             file: Some(file),
             path: Some(target_path),
             delete_on_close,
             readonly,
+            pending_dir_sync: AtomicBool::new(pending_dir_sync),
             lock_geometry: self.lock_geometry,
             min_shm_granularity: self.min_shm_granularity,
             lock_level: Mutex::new(LockLevel::NoLock),
@@ -3904,5 +3965,153 @@ mod tests {
         h1.unlock(LockLevel::NoLock).unwrap();
         drop(h1);
         vfs.delete(&tmp, false).unwrap();
+    }
+
+    #[test]
+    fn test_super_journal_open_flags_and_one_shot_dir_sync() {
+        assert_eq!(OpenFlags::SUPER_JOURNAL, OpenFlags::MASTER_JOURNAL);
+        assert_eq!(OpenFlags::SUPER_JOURNAL.0, 0x0000_4000);
+        assert!(
+            (OpenFlags::READWRITE
+                | OpenFlags::CREATE
+                | OpenFlags::EXCLUSIVE
+                | OpenFlags::SUPER_JOURNAL)
+                .requires_initial_dir_sync()
+        );
+        assert!(
+            (OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_JOURNAL)
+                .requires_initial_dir_sync()
+        );
+        assert!(
+            (OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::WAL).requires_initial_dir_sync()
+        );
+        assert!(!(OpenFlags::READONLY | OpenFlags::SUPER_JOURNAL).requires_initial_dir_sync());
+        assert!(
+            !(OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB)
+                .requires_initial_dir_sync()
+        );
+        assert!(
+            !(OpenFlags::READWRITE
+                | OpenFlags::CREATE
+                | OpenFlags::DELETEONCLOSE
+                | OpenFlags::SUPER_JOURNAL)
+                .requires_initial_dir_sync()
+        );
+
+        // Verify MemoryVfs exclusive creation + readonly open for SUPER_JOURNAL
+        let mem_vfs = MemoryVfs::new();
+        let mem_sj = Path::new("main.db-mj1234569AB");
+        let mut w_mem = mem_vfs
+            .open(
+                Some(mem_sj),
+                OpenFlags::READWRITE
+                    | OpenFlags::CREATE
+                    | OpenFlags::EXCLUSIVE
+                    | OpenFlags::SUPER_JOURNAL,
+            )
+            .unwrap();
+        assert_eq!(
+            mem_vfs
+                .open(
+                    Some(mem_sj),
+                    OpenFlags::READWRITE
+                        | OpenFlags::CREATE
+                        | OpenFlags::EXCLUSIVE
+                        | OpenFlags::SUPER_JOURNAL,
+                )
+                .err()
+                .unwrap()
+                .code,
+            ErrorCode::CantOpen
+        );
+        w_mem
+            .write_at(b"main.db-journal\0aux.db-journal\0", 0)
+            .unwrap();
+        w_mem.sync(SyncFlags::Normal).unwrap();
+        w_mem.close().unwrap();
+
+        let mut r_mem = mem_vfs
+            .open(Some(mem_sj), OpenFlags::READONLY | OpenFlags::SUPER_JOURNAL)
+            .unwrap();
+        assert!(r_mem.is_readonly());
+        let mut rbuf = vec![0u8; r_mem.file_size().unwrap() as usize];
+        assert_eq!(r_mem.read_at(&mut rbuf, 0).unwrap(), rbuf.len());
+        assert_eq!(&rbuf, b"main.db-journal\0aux.db-journal\0");
+        assert_eq!(
+            r_mem.write_at(b"x", 0).unwrap_err().code,
+            ErrorCode::ReadOnly
+        );
+        r_mem.close().unwrap();
+        mem_vfs.delete(mem_sj, true).unwrap();
+        assert!(!mem_vfs.exists(mem_sj).unwrap());
+
+        // Verify OsVfs exclusive creation, readonly open, and one-shot parent-directory sync
+        let os_vfs = OsVfs::new();
+        for (suffix, kind_flag, expected_dir_sync) in [
+            ("-mjABCDEF901", OpenFlags::SUPER_JOURNAL, 1usize),
+            ("-journal", OpenFlags::MAIN_JOURNAL, 1usize),
+            ("-wal", OpenFlags::WAL, 1usize),
+            ("", OpenFlags::MAIN_DB, 0usize),
+        ] {
+            let base = make_temp_file_path();
+            let target = PathBuf::from(format!("{}{suffix}", base.display()));
+            let _ = os_vfs.delete(&target, false);
+            TEST_OS_DIR_SYNC_COUNT.with(|c| c.set(0));
+
+            let mut wf = os_vfs
+                .open(
+                    Some(&target),
+                    OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::EXCLUSIVE | kind_flag,
+                )
+                .unwrap();
+            if kind_flag == OpenFlags::SUPER_JOURNAL {
+                assert_eq!(
+                    os_vfs
+                        .open(
+                            Some(&target),
+                            OpenFlags::READWRITE
+                                | OpenFlags::CREATE
+                                | OpenFlags::EXCLUSIVE
+                                | OpenFlags::SUPER_JOURNAL,
+                        )
+                        .err()
+                        .unwrap()
+                        .code,
+                    ErrorCode::CantOpen
+                );
+            }
+            wf.write_at(b"payload\0", 0).unwrap();
+            // First sync fires parent-directory sync iff `requires_initial_dir_sync()`.
+            wf.sync(SyncFlags::Normal).unwrap();
+            assert_eq!(
+                TEST_OS_DIR_SYNC_COUNT.with(std::cell::Cell::get),
+                expected_dir_sync
+            );
+            // Second sync on the same handle must NOT re-sync the parent directory.
+            wf.write_at(b"more\0", 8).unwrap();
+            wf.sync(SyncFlags::Normal).unwrap();
+            assert_eq!(
+                TEST_OS_DIR_SYNC_COUNT.with(std::cell::Cell::get),
+                expected_dir_sync
+            );
+            wf.close().unwrap();
+
+            if kind_flag == OpenFlags::SUPER_JOURNAL {
+                let mut rf = os_vfs
+                    .open(
+                        Some(&target),
+                        OpenFlags::READONLY | OpenFlags::SUPER_JOURNAL,
+                    )
+                    .unwrap();
+                assert!(rf.is_readonly());
+                let mut out = [0u8; 8];
+                assert_eq!(rf.read_at(&mut out, 0).unwrap(), 8);
+                assert_eq!(&out, b"payload\0");
+                rf.close().unwrap();
+            }
+
+            os_vfs.delete(&target, true).unwrap();
+            assert!(!os_vfs.exists(&target).unwrap());
+        }
     }
 }

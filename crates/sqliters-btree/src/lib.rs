@@ -8,14 +8,14 @@ pub mod ptrmap;
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 pub use sqliters_pager::AutoVacuumMode;
 use sqliters_pager::{
     JournalMode, LockingMode, Pager, PagerOpenOptions, TransactionState, WalCheckpointMode,
-    WalCheckpointResult,
+    WalCheckpointResult, create_super_journal_file,
 };
 use sqliters_types::{
     Bitvec, ErrorCode, KeySortOrder, Pgno, Result, SqliteError, TextEncoding, Value,
@@ -186,24 +186,83 @@ impl Btree {
         self.pager.set_autovacuum_ptrmap_ready(true);
     }
 
-    /// Commits the active write transaction, running [`Self::auto_vacuum_commit`] first when in
-    /// [`AutoVacuumMode::Full`] before delegating to [`Pager::commit_retaining_read`].
-    pub fn commit_retaining_read(&mut self, retain_read: bool) -> Result<()> {
+    /// Acquires `LockLevel::Exclusive` on the underlying database file when in an active
+    /// rollback-mode write transaction (`sqlite3PagerExclusiveLock`).
+    #[inline]
+    pub fn acquire_exclusive_lock(&mut self) -> Result<()> {
+        self.pager.acquire_exclusive_lock()
+    }
+
+    /// Returns the database filename (`None` for `:memory:` and `PrivateTemporary`; `Some` for `NamedDisk`).
+    #[inline]
+    pub fn db_path(&self) -> Option<&Path> {
+        self.pager.db_path()
+    }
+
+    /// Returns the rollback journal filename (`None` for `:memory:` and `PrivateTemporary`; `Some` for `NamedDisk`).
+    #[inline]
+    pub fn journal_path(&self) -> Option<&Path> {
+        self.pager.journal_path()
+    }
+
+    /// Returns `true` when backed by heap memory, a temporary file, or immutable mode (`sqlite3PagerIsMemdb`).
+    #[inline]
+    pub const fn is_pager_memdb(&self) -> bool {
+        self.pager.is_pager_memdb()
+    }
+
+    /// Returns `true` when this B-tree is an active durable rollback-journal write participant
+    /// that requires a super-journal in multi-file commits (`vdbeCommit` in `vdbeaux.c:2969-2987`).
+    #[inline]
+    pub const fn needs_super_journal_in_write_tx(&self) -> bool {
+        self.pager.needs_super_journal_in_write_tx()
+    }
+
+    fn commit_phase_one_internal(
+        &mut self,
+        super_journal: Option<&str>,
+        retain_read_on_av_err: bool,
+    ) -> Result<()> {
         if self.pager.transaction_state() == TransactionState::Write
             && !self.pager.is_commit_phase_one_done()
             && !self.pager.has_staged_raw_copy()
             && self.is_auto_vacuum()
             && let Err(e) = self.auto_vacuum_commit()
         {
-            let _ = self.rollback_with_trip(extended::SQLITE_ABORT_ROLLBACK, false, retain_read);
+            let _ = self.rollback_with_trip(
+                extended::SQLITE_ABORT_ROLLBACK,
+                false,
+                retain_read_on_av_err,
+            );
             return Err(e);
         }
-        self.pager.commit_retaining_read(retain_read)
+        self.pager.commit_phase_one(super_journal)
+    }
+
+    /// Executes Phase 1 of a two-phase commit (`sqlite3BtreeCommitPhaseOne` in `btree.c:4343-4364`),
+    /// running [`Self::auto_vacuum_commit`] first when `auto_vacuum` is active and rolling back with
+    /// cursor trip if `auto_vacuum_commit` fails.
+    pub fn commit_phase_one(&mut self, super_journal: Option<&str>) -> Result<()> {
+        self.commit_phase_one_internal(super_journal, false)
+    }
+
+    /// Executes Phase 2 of a two-phase commit (`sqlite3BtreeCommitPhaseTwo` in `btree.c:4432-4459`).
+    #[inline]
+    pub fn commit_phase_two(&mut self, retain_read: bool, cleanup_benign: bool) -> Result<()> {
+        self.pager.commit_phase_two(retain_read, cleanup_benign)
+    }
+
+    /// Commits the active write transaction, running [`Self::commit_phase_one`] followed by
+    /// [`Self::commit_phase_two`].
+    pub fn commit_retaining_read(&mut self, retain_read: bool) -> Result<()> {
+        self.commit_phase_one_internal(None, retain_read)?;
+        self.commit_phase_two(retain_read, false)
     }
 
     #[inline]
     pub fn commit(&mut self) -> Result<()> {
-        self.commit_retaining_read(false)
+        self.commit_phase_one(None)?;
+        self.commit_phase_two(false, false)
     }
 
     /// Rolls back the write transaction after tripping open cursors (`sqlite3BtreeRollback`).
@@ -2720,6 +2779,86 @@ fn partition_table_leaf_cells(
         chunks.push(cur_chunk);
     }
     chunks
+}
+
+/// Coordinates a multi-database two-phase commit across `btrees` following `vdbeCommit`
+/// (`sqlite/src/vdbeaux.c:2963-3185`).
+///
+/// Reuses [`create_super_journal_file`] when `main_db_path` is non-empty and more than one
+/// durable rollback-journal participant is in [`TransactionState::Write`], running
+/// [`Btree::commit_phase_one`] (including `auto_vacuum_commit` when enabled), unlinking the
+/// super-journal with `sync_dir = true` as the atomic commit point, and executing benign
+/// [`Btree::commit_phase_two`] cleanup (`cleanup_benign = true`) across all participants.
+pub fn commit_btrees_two_phase(
+    vfs: &dyn Vfs,
+    main_db_path: Option<&Path>,
+    enable_8_3: bool,
+    btrees: &mut [&mut Btree],
+    retain_reads: &[bool],
+) -> Result<()> {
+    let mut n_trans = 0usize;
+    let mut need_xcommit = false;
+
+    for bt in btrees.iter_mut() {
+        if bt.transaction_state() == TransactionState::Write {
+            need_xcommit = true;
+            if bt.needs_super_journal_in_write_tx() {
+                n_trans += 1;
+            }
+            bt.acquire_exclusive_lock()?;
+        }
+    }
+
+    let main_db_str = main_db_path
+        .and_then(Path::to_str)
+        .filter(|s| !s.is_empty());
+
+    let Some(main_str) = main_db_str.filter(|_| n_trans > 1) else {
+        if need_xcommit {
+            for bt in btrees.iter_mut() {
+                if bt.transaction_state() == TransactionState::Write {
+                    bt.commit_phase_one(None)?;
+                }
+            }
+        }
+        for (i, bt) in btrees.iter_mut().enumerate() {
+            let retain = retain_reads.get(i).copied().unwrap_or(false);
+            bt.commit_phase_two(retain, false)?;
+        }
+        return Ok(());
+    };
+
+    let participant_journals: Vec<PathBuf> = btrees
+        .iter()
+        .filter(|bt| bt.transaction_state() == TransactionState::Write)
+        .filter_map(|bt| bt.journal_path().map(Path::to_path_buf))
+        .collect();
+    let participant_refs: Vec<&Path> = participant_journals.iter().map(PathBuf::as_path).collect();
+
+    let (z_super, mut p_super) =
+        create_super_journal_file(vfs, main_str, enable_8_3, &participant_refs)?;
+
+    let mut phase_one_err: Option<SqliteError> = None;
+    for bt in btrees.iter_mut() {
+        if let Err(e) = bt.commit_phase_one(Some(&z_super)) {
+            phase_one_err = Some(e);
+            break;
+        }
+    }
+    let close_res = p_super.close();
+    if let Some(err) = phase_one_err {
+        return Err(err);
+    }
+    close_res?;
+
+    vfs.delete(Path::new(&z_super), true)?;
+
+    for (i, bt) in btrees.iter_mut().enumerate() {
+        let retain = retain_reads.get(i).copied().unwrap_or(false);
+        let _ = bt.commit_phase_two(retain, true);
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

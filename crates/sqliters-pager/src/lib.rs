@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod header;
+pub mod super_journal;
 pub mod wal;
 
 use std::collections::HashMap;
@@ -19,6 +20,11 @@ use sqliters_vfs::{
 };
 
 pub use header::{AutoVacuumMode, DB_HEADER_SIZE, DatabaseHeader};
+pub use super_journal::{
+    SUPER_JOURNAL_COLLISION_RETRY_LIMIT, SUPER_JOURNAL_MAX_PATH_BYTES, apply_8_3_suffix,
+    commit_pagers_two_phase, create_super_journal_file, format_super_journal_name,
+    is_super_journal_name, journal_hdr_offset, read_super_journal, super_journal_checksum,
+};
 pub use wal::{
     WAL_FRAME_HDRSIZE, WAL_HDRSIZE, WAL_MAGIC_BE, WAL_MAGIC_LE, WAL_MAX_VERSION,
     WAL_RETRY_PROTOCOL_LIMIT, WAL_SAVEPOINT_NDATA, Wal, WalCheckpointMode, WalCheckpointResult,
@@ -250,6 +256,8 @@ pub struct Pager {
     change_counter_bumped: bool,
     /// True once `commit` has started writing/truncating the main database file (`PAGER_WRITER_DBMOD`).
     db_file_modified: bool,
+    /// True once `write_super_journal` has recorded a super-journal pointer in this tx (`pPager->setSuper`).
+    set_super: bool,
     /// True once Phase 1 of `commit` (`.db` page flush + truncate + sync) has finished (`PAGER_WRITER_FINISHED`).
     commit_phase_one_done: bool,
 
@@ -471,6 +479,7 @@ impl Pager {
             cache_modified: false,
             change_counter_bumped: false,
             db_file_modified: false,
+            set_super: false,
             commit_phase_one_done: false,
             subsavepoints: Vec::new(),
         })
@@ -633,6 +642,30 @@ impl Pager {
         self.commit_phase_one_done
     }
 
+    /// Acquires `LockLevel::Exclusive` on the database file when in an active rollback-mode write
+    /// transaction (`sqlite3PagerExclusiveLock` in `sqlite/src/pager.c:6485-6498`).
+    pub fn acquire_exclusive_lock(&mut self) -> Result<()> {
+        self.ensure_not_closed()?;
+        if self.state == TransactionState::Write && !self.use_wal() && !self.is_memdb_backing {
+            self.lock_db_file(LockLevel::Exclusive)?;
+        }
+        Ok(())
+    }
+
+    /// Returns `true` when this pager is an active durable rollback-journal write participant that
+    /// increments `nTrans` in `vdbeCommit` (`sqlite/src/vdbeaux.c:2969-2987`).
+    #[inline]
+    pub const fn needs_super_journal_in_write_tx(&self) -> bool {
+        matches!(self.state, TransactionState::Write)
+            && self.synchronous > 0
+            && !self.use_wal()
+            && matches!(
+                self.journal_mode,
+                JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate
+            )
+            && !self.is_pager_memdb()
+    }
+
     /// Returns `true` when a raw [`Self::copy_pages_from`] image is staged in the active write tx.
     #[inline]
     pub const fn has_staged_raw_copy(&self) -> bool {
@@ -749,6 +782,7 @@ impl Pager {
         self.next_page_size = None;
         self.pending_byte_copy = None;
         self.staged_raw_copy = false;
+        self.set_super = false;
         Ok(())
     }
 
@@ -2035,6 +2069,7 @@ impl Pager {
         self.cache_modified = false;
         self.change_counter_bumped = false;
         self.db_file_modified = false;
+        self.set_super = false;
         self.commit_phase_one_done = false;
         self.pending_byte_copy = None;
         self.staged_raw_copy = false;
@@ -2718,126 +2753,333 @@ impl Pager {
         Ok(())
     }
 
-    /// Commits the active transaction. When `retain_read` is `true`, downgrades to
-    /// `TransactionState::Read` (retaining `.db` `Shared` and positive `WAL_READ_LOCK(1..=4)` in WAL);
-    /// when `false`, transitions to `TransactionState::Open`.
-    pub fn commit_retaining_read(&mut self, retain_read: bool) -> Result<()> {
+    /// Appends a super-journal trailer to the open rollback journal (`writeSuperJournal` in
+    /// `sqlite/src/pager.c:1752-1816`).
+    ///
+    /// No-op when `super_name` is `None`/empty, `self.set_super` is already set, WAL mode is
+    /// active, `self.journal_mode` is `Memory` or `Off`, or no rollback journal file is open.
+    pub fn write_super_journal(&mut self, super_name: Option<&str>) -> Result<()> {
+        let Some(z_super) = super_name else {
+            return Ok(());
+        };
+        if z_super.is_empty()
+            || self.set_super
+            || self.use_wal()
+            || matches!(self.journal_mode, JournalMode::Memory | JournalMode::Off)
+            || self.journal_file.is_none()
+        {
+            return Ok(());
+        }
+        if !super_journal::is_super_journal_name(z_super) {
+            return Err(SqliteError::misuse(format!(
+                "invalid super-journal filename: {z_super}"
+            )));
+        }
+
+        self.set_super = true;
+        if self.synchronous >= 2 {
+            self.journal_off =
+                super_journal::journal_hdr_offset(self.journal_off, self.journal_sector_size);
+        }
+        let i_hdr_off = self.journal_off;
+        let name_bytes = z_super.as_bytes();
+        let n_super = u32::try_from(name_bytes.len())
+            .map_err(|_| SqliteError::misuse("super-journal filename length overflow"))?;
+        let cksum = super_journal::super_journal_checksum(name_bytes);
+        let sj_pgno = self.lock_geometry.sj_pgno(self.tx_orig_header.page_size);
+
+        let jfd = self.journal_file.as_deref().expect("checked Some");
+        jfd.write_at(&sj_pgno.to_be_bytes(), i_hdr_off)?;
+        jfd.write_at(name_bytes, i_hdr_off + 4)?;
+        jfd.write_at(&n_super.to_be_bytes(), i_hdr_off + 4 + u64::from(n_super))?;
+        jfd.write_at(&cksum.to_be_bytes(), i_hdr_off + 8 + u64::from(n_super))?;
+        jfd.write_at(&JOURNAL_MAGIC, i_hdr_off + 12 + u64::from(n_super))?;
+
+        self.journal_off = i_hdr_off + u64::from(n_super) + 20;
+        let jrnl_size = jfd.file_size()?;
+        if jrnl_size > self.journal_off {
+            jfd.truncate(self.journal_off)?;
+        }
+        Ok(())
+    }
+
+    /// Executes Phase 1 of a two-phase commit (`sqlite3PagerCommitPhaseOne` in
+    /// `sqlite/src/pager.c:6527-6746`):
+    ///
+    /// - No-op in `TransactionState::Open` or `TransactionState::Read`.
+    /// - In WAL mode: appends dirty cache pages as a commit frame batch to `-wal` and marks cache
+    ///   pages clean (deferring `end_write_transaction` and lock downgrade to [`Self::commit_phase_two`]).
+    /// - In rollback-journal mode: bumps Page 1's change counter, acquires `LockLevel::Exclusive`,
+    ///   writes the optional `super_journal` trailer **before** syncing `<db>-journal`, flushes
+    ///   dirty pages to `.db`, truncates `.db` if needed, syncs `.db`, and marks cache pages clean.
+    pub fn commit_phase_one(&mut self, super_journal: Option<&str>) -> Result<()> {
+        self.ensure_not_closed()?;
+        if self.state != TransactionState::Write || self.commit_phase_one_done {
+            return Ok(());
+        }
+
+        if self.use_wal() {
+            let lock_byte_pgno = self.lock_byte_page();
+            let has_dirty_pages = self
+                .cache
+                .iter()
+                .any(|(&pgno, p)| p.dirty && pgno <= self.page_count && pgno != lock_byte_pgno);
+            let needs_db_flush = self.cache_modified
+                || has_dirty_pages
+                || self.page_count != self.tx_orig_page_count;
+
+            if needs_db_flush && self.page_count > 0 {
+                let p1_already_dirty = self.cache.get(&1).is_some_and(|p| p.dirty);
+                // Match `pager.c:6565-6571` (Ticket `2d1a5c67dfc2`) & `pager.c:3272`:
+                // Only dirty Page 1 on WAL commit when Page 1 was already modified, all
+                // dirty pages were spilled earlier (`!has_dirty_pages`), the database page
+                // count changed (`btree.c:6808`), or Page 1 header versions are not `(2, 2)`.
+                let must_write_p1 = p1_already_dirty
+                    || !has_dirty_pages
+                    || self.page_count != self.tx_orig_page_count
+                    || self.header.write_version != 2
+                    || self.header.read_version != 2;
+                if must_write_p1 {
+                    self.mark_page_writable(1)?;
+                    self.header.write_version = 2;
+                    self.header.read_version = 2;
+                    self.header.database_size_pages = self.page_count;
+                    if !self.change_counter_bumped {
+                        self.header.change_counter = self.header.change_counter.wrapping_add(1);
+                        if self.header.change_counter == 0 {
+                            self.header.change_counter = 1;
+                        }
+                        self.header.version_valid_for = self.header.change_counter;
+                        self.header.sqlite_version_number = SQLITE_VERSION_NUMBER;
+                        self.change_counter_bumped = true;
+                    }
+
+                    let hdr_copy = self.header.clone();
+                    let p1 = self.cache.get_mut(&1).expect("page 1 in cache");
+                    hdr_copy.write_into(&mut p1.data[0..DB_HEADER_SIZE]);
+                    p1.dirty = true;
+                }
+
+                let mut dirty_pgnos: Vec<Pgno> = self
+                    .cache
+                    .iter()
+                    .filter_map(|(&pgno, p)| {
+                        if p.dirty && pgno <= self.page_count && pgno != lock_byte_pgno {
+                            Some(pgno)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                dirty_pgnos.sort_unstable();
+
+                let ps = self.header.page_size;
+                let w_sync = self.wal_sync_flags();
+                let c_sync = self.ckpt_sync_flags();
+                let effective_n_truncate = if self.page_count == lock_byte_pgno {
+                    self.page_count - 1
+                } else {
+                    self.page_count
+                };
+
+                {
+                    let db_f = self
+                        .file
+                        .as_deref()
+                        .ok_or_else(|| SqliteError::misuse("NamedDisk missing file"))?;
+                    let wal = self.wal.as_mut().expect("use_wal checked");
+                    let inputs: Vec<WalFrameInput<'_>> = dirty_pgnos
+                        .iter()
+                        .map(|&pgno| WalFrameInput {
+                            pgno,
+                            data: self
+                                .cache
+                                .get(&pgno)
+                                .expect("dirty page exists")
+                                .data
+                                .as_slice(),
+                        })
+                        .collect();
+                    wal.write_frames(
+                        db_f,
+                        ps,
+                        &inputs,
+                        effective_n_truncate,
+                        true,
+                        w_sync,
+                        c_sync,
+                    )?;
+                }
+
+                self.cache.retain(|&pgno, _| pgno <= self.page_count);
+                for pgno in dirty_pgnos {
+                    if let Some(page) = self.cache.get_mut(&pgno) {
+                        page.dirty = false;
+                    }
+                }
+            } else if self.page_count == 0 {
+                self.wal
+                    .as_mut()
+                    .expect("use_wal checked")
+                    .undo(|_| Ok(()))?;
+            }
+
+            self.commit_phase_one_done = true;
+            return Ok(());
+        }
+
+        let lock_byte_pgno = self.lock_byte_page();
+        let has_dirty_pages = self
+            .cache
+            .iter()
+            .any(|(&pgno, p)| p.dirty && pgno <= self.page_count && pgno != lock_byte_pgno);
+        let needs_db_flush = self.cache_modified
+            || has_dirty_pages
+            || self.page_count != self.tx_orig_page_count
+            || self.pending_byte_copy.is_some();
+
+        if needs_db_flush {
+            // Bump file change counter & version_valid_for on Page 1 (at most once per tx
+            // so retrying `commit` after `SQLITE_BUSY` does not double-increment).
+            // Skip overwriting Page 1 header when `pending_byte_copy` is active so Page 1
+            // retains its serialized `pgsz_src` header while `self.header` remains `pgsz_dest`.
+            if self.page_count > 0 && self.pending_byte_copy.is_none() {
+                self.mark_page_writable(1)?;
+                self.header.database_size_pages = self.page_count;
+                if !self.change_counter_bumped {
+                    self.header.change_counter = self.header.change_counter.wrapping_add(1);
+                    if self.header.change_counter == 0 {
+                        self.header.change_counter = 1;
+                    }
+                    self.header.version_valid_for = self.header.change_counter;
+                    self.header.sqlite_version_number = SQLITE_VERSION_NUMBER;
+                    self.change_counter_bumped = true;
+                }
+
+                let hdr_copy = self.header.clone();
+                let p1 = self.cache.get_mut(&1).expect("page 1 in cache");
+                hdr_copy.write_into(&mut p1.data[0..DB_HEADER_SIZE]);
+                p1.dirty = true;
+            }
+
+            // Step 1: Acquire EXCLUSIVE lock BEFORE modifying `.db` (`syncJournal` in `pager.c:4349`).
+            self.lock_db_file(LockLevel::Exclusive)?;
+
+            // Step 2: Append optional super-journal trailer BEFORE syncing the rollback journal
+            // (`pager.c:6660-6675`)!
+            self.write_super_journal(super_journal)?;
+
+            // Step 3: Update `nRec` in rollback journal header and sync BEFORE touching `.db`!
+            if self.journal_started_in_tx
+                && let Some(ref jfile) = self.journal_file
+            {
+                self.sync_journal_before_db_write(&**jfile)?;
+            }
+
+            // Step 4: Write all dirty pages in ascending `Pgno` order to `.db`, truncate, and sync.
+            self.db_file_modified = true;
+
+            let ps = u64::from(self.header.page_size);
+            let mut dirty_pgnos: Vec<Pgno> = self
+                .cache
+                .iter()
+                .filter_map(|(&pgno, p)| {
+                    if p.dirty && pgno <= self.page_count && pgno != lock_byte_pgno {
+                        Some(pgno)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            dirty_pgnos.sort_unstable();
+
+            for &pgno in &dirty_pgnos {
+                let page = self.cache.get(&pgno).expect("dirty page exists");
+                let offset = u64::from(pgno - 1) * ps;
+                self.db_file()?.write_at(&page.data, offset)?;
+            }
+
+            let target_size = if let Some(ref pending) = self.pending_byte_copy {
+                if let Some((tail_off, ref tail_bytes)) = pending.post_pending_tail {
+                    self.db_file()?.write_at(tail_bytes, tail_off)?;
+                }
+                pending.raw_byte_size
+            } else {
+                let effective_disk_pages = if self.page_count == lock_byte_pgno {
+                    self.page_count - 1
+                } else {
+                    self.page_count
+                };
+                u64::from(effective_disk_pages) * ps
+            };
+            if self.db_file()?.file_size()? != target_size {
+                self.db_file()?.truncate(target_size)?;
+            }
+
+            if !self.is_memdb_backing
+                && self.db_kind != DatabaseKind::PrivateTemporary
+                && self.synchronous > 0
+            {
+                self.db_file()?.sync(SyncFlags::Normal)?;
+            }
+
+            self.cache.retain(|&pgno, _| pgno <= self.page_count);
+            for pgno in dirty_pgnos {
+                if let Some(page) = self.cache.get_mut(&pgno) {
+                    page.dirty = false;
+                }
+            }
+            self.commit_phase_one_done = true;
+        }
+
+        Ok(())
+    }
+
+    /// Executes Phase 2 of a two-phase commit (`sqlite3PagerCommitPhaseTwo` in
+    /// `sqlite/src/pager.c:6764-6802` and `sqlite3BtreeCommitPhaseTwo` in `btree.c:4432-4459`):
+    ///
+    /// - Finalizes the rollback journal (or releases `WAL_WRITE_LOCK` in WAL mode) and downgrades
+    ///   database locks to `Read` (`retain_read == true`) or `Open` (`retain_read == false`).
+    /// - When `cleanup_benign` is `true` (post-super-journal-unlink cleanup in `vdbeCommit`), any
+    ///   I/O error while cleaning up cold journals or unlocking is absorbed without rolling back
+    ///   the already-committed database, and the pager still transitions cleanly out of `Write`.
+    pub fn commit_phase_two(&mut self, retain_read: bool, cleanup_benign: bool) -> Result<()> {
         self.ensure_not_closed()?;
         match self.state {
             TransactionState::Open => Ok(()),
-            TransactionState::Read => self.finish_tx_to_read_or_open(retain_read),
+            TransactionState::Read => {
+                if cleanup_benign {
+                    let _ = self.finish_tx_to_read_or_open(retain_read);
+                    self.state = if retain_read {
+                        TransactionState::Read
+                    } else {
+                        TransactionState::Open
+                    };
+                    Ok(())
+                } else {
+                    self.finish_tx_to_read_or_open(retain_read)
+                }
+            }
             TransactionState::Write => {
                 if self.use_wal() {
-                    let lock_byte_pgno = self.lock_byte_page();
-                    let has_dirty_pages = self.cache.iter().any(|(&pgno, p)| {
-                        p.dirty && pgno <= self.page_count && pgno != lock_byte_pgno
-                    });
-                    let needs_db_flush = self.cache_modified
-                        || has_dirty_pages
-                        || self.page_count != self.tx_orig_page_count;
-
-                    if needs_db_flush && self.page_count > 0 {
-                        let p1_already_dirty = self.cache.get(&1).is_some_and(|p| p.dirty);
-                        // Match `pager.c:6565-6571` (Ticket `2d1a5c67dfc2`) & `pager.c:3272`:
-                        // Only dirty Page 1 on WAL commit when Page 1 was already modified, all
-                        // dirty pages were spilled earlier (`!has_dirty_pages`), the database page
-                        // count changed (`btree.c:6808`), or Page 1 header versions are not `(2, 2)`.
-                        let must_write_p1 = p1_already_dirty
-                            || !has_dirty_pages
-                            || self.page_count != self.tx_orig_page_count
-                            || self.header.write_version != 2
-                            || self.header.read_version != 2;
-                        if must_write_p1 {
-                            self.mark_page_writable(1)?;
-                            self.header.write_version = 2;
-                            self.header.read_version = 2;
-                            self.header.database_size_pages = self.page_count;
-                            if !self.change_counter_bumped {
-                                self.header.change_counter =
-                                    self.header.change_counter.wrapping_add(1);
-                                if self.header.change_counter == 0 {
-                                    self.header.change_counter = 1;
-                                }
-                                self.header.version_valid_for = self.header.change_counter;
-                                self.header.sqlite_version_number = SQLITE_VERSION_NUMBER;
-                                self.change_counter_bumped = true;
-                            }
-
-                            let hdr_copy = self.header.clone();
-                            let p1 = self.cache.get_mut(&1).expect("page 1 in cache");
-                            hdr_copy.write_into(&mut p1.data[0..DB_HEADER_SIZE]);
-                            p1.dirty = true;
-                        }
-
-                        let mut dirty_pgnos: Vec<Pgno> = self
-                            .cache
-                            .iter()
-                            .filter_map(|(&pgno, p)| {
-                                if p.dirty && pgno <= self.page_count && pgno != lock_byte_pgno {
-                                    Some(pgno)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        dirty_pgnos.sort_unstable();
-
-                        let ps = self.header.page_size;
-                        let w_sync = self.wal_sync_flags();
-                        let c_sync = self.ckpt_sync_flags();
-                        let effective_n_truncate = if self.page_count == lock_byte_pgno {
-                            self.page_count - 1
-                        } else {
-                            self.page_count
-                        };
-
-                        {
-                            let db_f = self
-                                .file
-                                .as_deref()
-                                .ok_or_else(|| SqliteError::misuse("NamedDisk missing file"))?;
-                            let wal = self.wal.as_mut().expect("use_wal checked");
-                            let inputs: Vec<WalFrameInput<'_>> = dirty_pgnos
-                                .iter()
-                                .map(|&pgno| WalFrameInput {
-                                    pgno,
-                                    data: self
-                                        .cache
-                                        .get(&pgno)
-                                        .expect("dirty page exists")
-                                        .data
-                                        .as_slice(),
-                                })
-                                .collect();
-                            wal.write_frames(
-                                db_f,
-                                ps,
-                                &inputs,
-                                effective_n_truncate,
-                                true,
-                                w_sync,
-                                c_sync,
-                            )?;
-                        }
-
-                        self.cache.retain(|&pgno, _| pgno <= self.page_count);
-                        for pgno in dirty_pgnos {
-                            if let Some(page) = self.cache.get_mut(&pgno) {
-                                page.dirty = false;
-                            }
-                        }
-                    } else if self.page_count == 0 {
+                    if cleanup_benign {
+                        let _ = self
+                            .wal
+                            .as_mut()
+                            .expect("use_wal checked")
+                            .end_write_transaction();
+                    } else {
                         self.wal
                             .as_mut()
                             .expect("use_wal checked")
-                            .undo(|_| Ok(()))?;
+                            .end_write_transaction()?;
                     }
 
-                    self.wal
-                        .as_mut()
-                        .expect("use_wal checked")
-                        .end_write_transaction()?;
-
+                    self.cache.retain(|&pgno, _| pgno <= self.page_count);
+                    for page in self.cache.values_mut() {
+                        page.dirty = false;
+                    }
+                    self.set_super = false;
                     self.commit_phase_one_done = false;
                     self.db_file_modified = false;
                     self.cache_modified = false;
@@ -2854,121 +3096,33 @@ impl Pager {
                         self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
                     }
 
+                    if cleanup_benign {
+                        let _ = self.finish_tx_to_read_or_open(retain_read);
+                        self.state = if retain_read {
+                            TransactionState::Read
+                        } else {
+                            TransactionState::Open
+                        };
+                        return Ok(());
+                    }
                     return self.finish_tx_to_read_or_open(retain_read);
                 }
 
-                // Phase 1 (`sqlite3PagerCommitPhaseOne` / `PAGER_WRITER_FINISHED`, `pager.c:6740`):
-                // Skipped on retry if Phase 1 already completed and only Phase 2 (`finalize_journal_after_tx`)
-                // failed transiently, preventing re-writing `JOURNAL_MAGIC` over a truncated/zeroed journal!
-                if !self.commit_phase_one_done {
-                    let lock_byte_pgno = self.lock_byte_page();
-                    let has_dirty_pages = self.cache.iter().any(|(&pgno, p)| {
-                        p.dirty && pgno <= self.page_count && pgno != lock_byte_pgno
-                    });
-                    let needs_db_flush = self.cache_modified
-                        || has_dirty_pages
-                        || self.page_count != self.tx_orig_page_count
-                        || self.pending_byte_copy.is_some();
-
-                    if needs_db_flush {
-                        // Bump file change counter & version_valid_for on Page 1 (at most once per tx
-                        // so retrying `commit` after `SQLITE_BUSY` does not double-increment).
-                        // Skip overwriting Page 1 header when `pending_byte_copy` is active so Page 1
-                        // retains its serialized `pgsz_src` header while `self.header` remains `pgsz_dest`.
-                        if self.page_count > 0 && self.pending_byte_copy.is_none() {
-                            self.mark_page_writable(1)?;
-                            self.header.database_size_pages = self.page_count;
-                            if !self.change_counter_bumped {
-                                self.header.change_counter =
-                                    self.header.change_counter.wrapping_add(1);
-                                if self.header.change_counter == 0 {
-                                    self.header.change_counter = 1;
-                                }
-                                self.header.version_valid_for = self.header.change_counter;
-                                self.header.sqlite_version_number = SQLITE_VERSION_NUMBER;
-                                self.change_counter_bumped = true;
-                            }
-
-                            let hdr_copy = self.header.clone();
-                            let p1 = self.cache.get_mut(&1).expect("page 1 in cache");
-                            hdr_copy.write_into(&mut p1.data[0..DB_HEADER_SIZE]);
-                            p1.dirty = true;
+                let mut cold_journal_leftover = false;
+                if cleanup_benign {
+                    if self.finalize_journal_after_tx(true).is_err() {
+                        cold_journal_leftover = true;
+                        if let Some(mut jfd) = self.journal_file.take() {
+                            let _ = jfd.close();
                         }
-
-                        // Step 1: Acquire EXCLUSIVE lock BEFORE modifying `.db` (`syncJournal` in `pager.c:4349`).
-                        // If `lock(Exclusive)` returns `Busy`, `db_file_modified` remains `false` and the
-                        // write transaction + dirty cache stay intact in `TransactionState::Write`!
-                        self.lock_db_file(LockLevel::Exclusive)?;
-
-                        // Step 2: Update `nRec` in rollback journal header and sync BEFORE touching `.db`!
-                        if self.journal_started_in_tx
-                            && let Some(ref jfile) = self.journal_file
-                        {
-                            self.sync_journal_before_db_write(&**jfile)?;
-                        }
-
-                        // Step 3: Write all dirty pages in ascending `Pgno` order to `.db`, truncate, and sync.
-                        self.db_file_modified = true;
-
-                        let ps = u64::from(self.header.page_size);
-                        let mut dirty_pgnos: Vec<Pgno> = self
-                            .cache
-                            .iter()
-                            .filter_map(|(&pgno, p)| {
-                                if p.dirty && pgno <= self.page_count && pgno != lock_byte_pgno {
-                                    Some(pgno)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        dirty_pgnos.sort_unstable();
-
-                        for &pgno in &dirty_pgnos {
-                            let page = self.cache.get(&pgno).expect("dirty page exists");
-                            let offset = u64::from(pgno - 1) * ps;
-                            self.db_file()?.write_at(&page.data, offset)?;
-                        }
-
-                        let target_size = if let Some(ref pending) = self.pending_byte_copy {
-                            if let Some((tail_off, ref tail_bytes)) = pending.post_pending_tail {
-                                self.db_file()?.write_at(tail_bytes, tail_off)?;
-                            }
-                            pending.raw_byte_size
-                        } else {
-                            let effective_disk_pages = if self.page_count == lock_byte_pgno {
-                                self.page_count - 1
-                            } else {
-                                self.page_count
-                            };
-                            u64::from(effective_disk_pages) * ps
-                        };
-                        if self.db_file()?.file_size()? != target_size {
-                            self.db_file()?.truncate(target_size)?;
-                        }
-
-                        if !self.is_memdb_backing
-                            && self.db_kind != DatabaseKind::PrivateTemporary
-                            && self.synchronous > 0
-                        {
-                            self.db_file()?.sync(SyncFlags::Normal)?;
-                        }
-
-                        self.cache.retain(|&pgno, _| pgno <= self.page_count);
-                        for pgno in dirty_pgnos {
-                            if let Some(page) = self.cache.get_mut(&pgno) {
-                                page.dirty = false;
-                            }
-                        }
-                        self.commit_phase_one_done = true;
+                        self.journal_off = 0;
                     }
+                } else {
+                    // `journal_started_in_tx`, `set_super`, `db_file_modified`, and `tx_preimages`
+                    // are cleared ONLY AFTER `finalize_journal_after_tx(true)` succeeds so both
+                    // `commit()` retry and `rollback()` remain safe in single-DB commits!
+                    self.finalize_journal_after_tx(true)?;
                 }
-
-                // Phase 2 (`sqlite3PagerCommitPhaseTwo`): Finalize rollback journal according to `JournalMode`
-                // (including zero-write `Write` transactions per `lock-7.3`!).
-                // `journal_started_in_tx`, `db_file_modified`, and `tx_preimages` are cleared ONLY AFTER
-                // `finalize_journal_after_tx(true)` succeeds so both `commit()` retry and `rollback()` are safe!
-                self.finalize_journal_after_tx(true)?;
 
                 if let Some(pending) = self.pending_byte_copy.take() {
                     self.cache.clear();
@@ -2976,6 +3130,13 @@ impl Pager {
                     self.page_count = pending.new_page_count;
                     self.next_page_size = None;
                 }
+                if cleanup_benign {
+                    self.cache.retain(|&pgno, _| pgno <= self.page_count);
+                    for page in self.cache.values_mut() {
+                        page.dirty = false;
+                    }
+                }
+                self.set_super = false;
                 self.staged_raw_copy = false;
                 self.commit_phase_one_done = false;
                 self.db_file_modified = false;
@@ -2985,13 +3146,38 @@ impl Pager {
                 self.tx_preimages.clear();
                 self.tx_journaled.clear_all();
                 self.subsavepoints.clear();
-                self.header_loaded = true;
+                self.header_loaded = !cold_journal_leftover;
                 self.page_size_fixed = self.page_count > 0;
                 if self.page_count > 0 {
                     self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
                 }
 
-                self.finish_tx_to_read_or_open(retain_read)
+                if cleanup_benign {
+                    let _ = self.finish_tx_to_read_or_open(retain_read);
+                    self.state = if retain_read {
+                        TransactionState::Read
+                    } else {
+                        TransactionState::Open
+                    };
+                    Ok(())
+                } else {
+                    self.finish_tx_to_read_or_open(retain_read)
+                }
+            }
+        }
+    }
+
+    /// Commits the active transaction. When `retain_read` is `true`, downgrades to
+    /// `TransactionState::Read` (retaining `.db` `Shared` and positive `WAL_READ_LOCK(1..=4)` in WAL);
+    /// when `false`, transitions to `TransactionState::Open`.
+    pub fn commit_retaining_read(&mut self, retain_read: bool) -> Result<()> {
+        self.ensure_not_closed()?;
+        match self.state {
+            TransactionState::Open => Ok(()),
+            TransactionState::Read => self.finish_tx_to_read_or_open(retain_read),
+            TransactionState::Write => {
+                self.commit_phase_one(None)?;
+                self.commit_phase_two(retain_read, false)
             }
         }
     }
@@ -3043,6 +3229,7 @@ impl Pager {
                         self.tx_orig_auto_vacuum
                     };
                     self.tx_journaled.clear_all();
+                    self.set_super = false;
                     self.commit_phase_one_done = false;
                     self.db_file_modified = false;
                     self.cache_modified = false;
@@ -3136,6 +3323,7 @@ impl Pager {
                 // by a failed `commit()`, `Truncate` truncates to 0, `Persist` zeroes 28B) BEFORE
                 // clearing `self.journal_started_in_tx`!
                 self.finalize_journal_after_tx(false)?;
+                self.set_super = false;
                 self.journal_started_in_tx = false;
 
                 self.finish_tx_to_read_or_open(retain_read)
@@ -3196,6 +3384,7 @@ impl Pager {
         self.tx_journaled.clear_all();
         self.subsavepoints.clear();
         self.finalize_journal_after_tx(false)?;
+        self.set_super = false;
         self.journal_started_in_tx = false;
 
         if retain_read {
@@ -3276,7 +3465,7 @@ impl Pager {
             JournalMode::Persist => {
                 if self.journal_off > 0 {
                     let is_temp_file = self.db_kind == DatabaseKind::PrivateTemporary;
-                    let has_super = false;
+                    let has_super = self.set_super;
                     let limit = self.journal_size_limit;
                     let jfd = self.journal_file.as_deref().expect("checked Some");
 
@@ -3475,6 +3664,7 @@ impl Pager {
         self.tx_journaled.clear_all();
         self.pending_byte_copy = None;
         self.staged_raw_copy = false;
+        self.set_super = false;
         self.commit_phase_one_done = false;
         self.journal_started_in_tx = false;
         self.state = TransactionState::Open;
@@ -3698,8 +3888,55 @@ impl Pager {
         if !DatabaseHeader::is_valid_page_size(page_size) || !valid_sector || jsize < hdr_sz {
             let _ = jfile.close();
             self.vfs.delete(&jpath, true)?;
-            self.unlock_db_file(LockLevel::Shared)?;
+            if self.locking_mode == LockingMode::Normal {
+                self.unlock_db_file(LockLevel::Shared)?;
+            }
             return Ok(true);
+        }
+
+        // Inspect optional super-journal trailer BEFORE playing back `.db` (`pager.c:2894-2905`).
+        let z_super = match super_journal::read_super_journal(
+            &*jfile,
+            super_journal::SUPER_JOURNAL_MAX_PATH_BYTES,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = jfile.close();
+                if self.locking_mode == LockingMode::Normal {
+                    let _ = self.unlock_db_file(LockLevel::Shared);
+                }
+                return Err(e);
+            }
+        };
+
+        if let Some(ref super_name) = z_super {
+            // CRITICAL (`implementation_plan.md:589`): Any I/O error from `vfs.exists` MUST be
+            // propagated and NEVER treated as `false` ("super-journal deleted -> committed")!
+            let super_exists = match self.vfs.exists(Path::new(super_name)) {
+                Ok(exists) => exists,
+                Err(e) => {
+                    let _ = jfile.close();
+                    if self.locking_mode == LockingMode::Normal {
+                        let _ = self.unlock_db_file(LockLevel::Shared);
+                    }
+                    return Err(e);
+                }
+            };
+
+            if !super_exists {
+                // Super-journal was already unlinked: the multi-DB transaction COMMITTED!
+                // Do NOT play back `.db` (`pager.c:2895-2905`).
+                let close_res = jfile.close();
+                close_res?;
+                self.finalize_recovered_journal_file(&jpath, true)?;
+                self.cache.clear();
+                self.page_size_fixed = false;
+                self.header_loaded = false;
+                if self.locking_mode == LockingMode::Normal {
+                    self.unlock_db_file(LockLevel::Shared)?;
+                }
+                return Ok(true);
+            }
         }
 
         let playback_res: Result<()> = (|| {
@@ -3788,16 +4025,134 @@ impl Pager {
         playback_res?;
         close_res?;
 
-        // Finalize recovered hot journal: even if this connection was configured with `Memory`,
-        // delete the recovered on-disk hot journal (`pager.c:2145-2159`), or zero/truncate if
-        // this connection is in `Persist`/`Truncate` mode (`pager_end_transaction` -> delete on
-        // hot-journal recovery is always safe).
-        self.vfs.delete(&jpath, true)?;
+        // Finalize `&jpath` BEFORE calling `pager_delsuper` (`pager.c:3036-3046`) so sibling
+        // journal inspection sees this database's journal already deleted or truncated to 0 bytes!
+        self.finalize_recovered_journal_file(&jpath, z_super.is_some())?;
+        if let Some(ref super_name) = z_super {
+            self.pager_delsuper(super_name)?;
+        }
+
         self.cache.clear();
         self.page_size_fixed = false;
         self.header_loaded = false;
-        self.unlock_db_file(LockLevel::Shared)?;
+        if self.locking_mode == LockingMode::Normal {
+            self.unlock_db_file(LockLevel::Shared)?;
+        }
         Ok(true)
+    }
+
+    fn finalize_recovered_journal_file(&mut self, jpath: &Path, has_super: bool) -> Result<()> {
+        if !has_super {
+            return self.vfs.delete(jpath, true);
+        }
+        match self.journal_mode {
+            JournalMode::Truncate | JournalMode::Persist => {
+                let mut jf = self
+                    .vfs
+                    .open(Some(jpath), OpenFlags::READWRITE | OpenFlags::MAIN_JOURNAL)?;
+                let res: Result<()> = (|| {
+                    jf.truncate(0)?;
+                    if self.journal_mode == JournalMode::Persist && self.synchronous > 0 {
+                        jf.sync(SyncFlags::DataOnly)?;
+                    } else if self.journal_mode == JournalMode::Truncate && self.synchronous >= 2 {
+                        let sflags = if self.synchronous >= 3 {
+                            SyncFlags::Full
+                        } else {
+                            SyncFlags::Normal
+                        };
+                        jf.sync(sflags)?;
+                    }
+                    Ok(())
+                })();
+                let close_res = jf.close();
+                res?;
+                close_res
+            }
+            JournalMode::Delete | JournalMode::Memory | JournalMode::Off | JournalMode::Wal => {
+                self.vfs.delete(jpath, true)
+            }
+        }
+    }
+
+    /// Inspects super-journal `super_name` after rolling back this pager's hot journal and deletes
+    /// `super_name` (`sync_dir = false`) if and only if:
+    /// 1. [`super_journal::is_super_journal_name`] accepts `super_name`,
+    /// 2. `super_name` lists this pager's `journal_path` (`b_seen == true`), and
+    /// 3. no remaining existing sibling journal listed in `super_name` still ends with a valid
+    ///    super-journal trailer pointing to `super_name` (`pager_delsuper` in `pager.c:2583-2703`).
+    fn pager_delsuper(&self, super_name: &str) -> Result<()> {
+        if !super_journal::is_super_journal_name(super_name) {
+            return Ok(());
+        }
+        let super_path = Path::new(super_name);
+        let mut p_super = self.vfs.open(
+            Some(super_path),
+            OpenFlags::READONLY | OpenFlags::SUPER_JOURNAL,
+        )?;
+
+        let inspect_res: Result<(bool, bool)> = (|| {
+            let sz = p_super.file_size()?;
+            let sz_usize = usize::try_from(sz).map_err(|_| {
+                SqliteError::with_extended(
+                    extended::SQLITE_IOERR_READ,
+                    "super-journal size exceeds addressable memory",
+                )
+            })?;
+            let mut buf = vec![0u8; sz_usize];
+            if sz_usize > 0 {
+                super_journal::read_exact_from_vfs(&*p_super, &mut buf, 0)?;
+            }
+
+            let own_jpath_str = self.journal_path().and_then(Path::to_str);
+            let mut b_seen = false;
+            let mut pos = 0usize;
+            while pos < buf.len() {
+                let rel_nul = buf[pos..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(buf.len() - pos);
+                let entry_bytes = &buf[pos..pos + rel_nul];
+                pos = pos + rel_nul + 1;
+
+                if entry_bytes.is_empty() {
+                    continue;
+                }
+                let Ok(entry_str) = std::str::from_utf8(entry_bytes) else {
+                    continue;
+                };
+                if Some(entry_str) == own_jpath_str {
+                    b_seen = true;
+                } else {
+                    let child_path = Path::new(entry_str);
+                    if self.vfs.exists(child_path)? {
+                        let mut child_jf = self.vfs.open(
+                            Some(child_path),
+                            OpenFlags::READONLY | OpenFlags::SUPER_JOURNAL,
+                        )?;
+                        let ptr_res = super_journal::read_super_journal(
+                            &*child_jf,
+                            super_journal::SUPER_JOURNAL_MAX_PATH_BYTES,
+                        );
+                        let close_child = child_jf.close();
+                        let child_ptr = ptr_res?;
+                        close_child?;
+                        if child_ptr.as_deref() == Some(super_name) {
+                            return Ok((b_seen, true));
+                        }
+                    }
+                }
+            }
+            Ok((b_seen, false))
+        })();
+
+        let close_super = p_super.close();
+        let (b_seen, sibling_active) = inspect_res?;
+        close_super?;
+
+        if !sibling_active && b_seen {
+            self.vfs.delete(super_path, false)?;
+        }
+        Ok(())
     }
 }
 

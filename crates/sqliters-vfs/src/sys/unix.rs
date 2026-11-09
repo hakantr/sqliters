@@ -309,13 +309,18 @@ pub(crate) fn sync_fd(file: &File, full: bool, data_only: bool) -> Result<()> {
     }
 }
 
-/// Flushes a parent directory entry after file deletion (`unixDelete` in `sqlite/src/os_unix.c`).
+/// Flushes a parent directory entry after file creation or deletion (`unixSync` / `unixDelete`
+/// in `sqlite/src/os_unix.c`).
 pub(crate) fn sync_directory(dir_path: &Path) -> Result<()> {
     let dir = match File::open(dir_path) {
         Ok(d) => d,
-        // Mirrors `os_unix.c` where directory open failure in restricted sandboxes or missing
-        // parent after race is handled gracefully if `ENOENT`, otherwise `SQLITE_IOERR_DIR_FSYNC`.
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        // Mirrors `openDirectory` in `os_unix.c` (`lines 3945-3952, 6859-6868`) where an
+        // unopenable parent directory (`ENOENT` or `EACCES` in restricted sandboxes) maps to
+        // `SQLITE_CANTOPEN` and is treated as benign, while real `fsync` errors return
+        // `SQLITE_IOERR_DIR_FSYNC`.
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => {
+            return Ok(());
+        }
         Err(e) => {
             return Err(SqliteError::with_extended(
                 extended::SQLITE_IOERR_DIR_FSYNC,
