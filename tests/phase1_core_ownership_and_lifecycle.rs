@@ -862,6 +862,7 @@ fn test_group4_lazy_open_exclusive_lock_database_kind_and_open_options() {
         default_page_size: 1024,
         lock_geometry: LockGeometry::default(),
         temp_store_memory: false,
+        ..ConnectionOpenOptions::default()
     };
     let c1024 = Connection::open_with_options(
         &db_1024,

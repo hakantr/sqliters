@@ -304,7 +304,7 @@ impl<'a> Parser<'a> {
                 if self.at(TokenKind::Database)
                     && !matches!(
                         self.peek_n(1).kind,
-                        TokenKind::As | TokenKind::Dot | TokenKind::Lp
+                        TokenKind::As | TokenKind::Dot | TokenKind::Concat
                     )
                 {
                     self.advance();
@@ -328,7 +328,7 @@ impl<'a> Parser<'a> {
                 if self.at(TokenKind::Database)
                     && !matches!(
                         self.peek_n(1).kind,
-                        TokenKind::Semi | TokenKind::Eof | TokenKind::Dot | TokenKind::Lp
+                        TokenKind::Semi | TokenKind::Eof | TokenKind::Dot | TokenKind::Concat
                     )
                 {
                     self.advance();
@@ -2051,6 +2051,41 @@ impl<'a> Parser<'a> {
                     subquery: Box::new(subq),
                     negated: false,
                 })
+            }
+            TokenKind::Raise if self.peek_n(1).kind == TokenKind::Lp => {
+                self.advance();
+                self.expect(TokenKind::Lp)?;
+                let action_tok = self.peek();
+                match action_tok.kind {
+                    TokenKind::Ignore => {
+                        self.advance();
+                        self.expect(TokenKind::Rp)?;
+                        Ok(Expr::Raise {
+                            action: RaiseAction::Ignore,
+                            message: None,
+                        })
+                    }
+                    TokenKind::Rollback | TokenKind::Abort | TokenKind::Fail => {
+                        self.advance();
+                        let action = match action_tok.kind {
+                            TokenKind::Rollback => RaiseAction::Rollback,
+                            TokenKind::Abort => RaiseAction::Abort,
+                            TokenKind::Fail => RaiseAction::Fail,
+                            _ => unreachable!(),
+                        };
+                        self.expect(TokenKind::Comma)?;
+                        let msg = self.parse_expr()?;
+                        self.expect(TokenKind::Rp)?;
+                        Ok(Expr::Raise {
+                            action,
+                            message: Some(Box::new(msg)),
+                        })
+                    }
+                    _ => Err(self.syntax_err_at(
+                        action_tok,
+                        format!("near \"{}\": syntax error", action_tok.text),
+                    )),
+                }
             }
             TokenKind::Cast => {
                 self.advance();

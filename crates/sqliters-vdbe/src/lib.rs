@@ -399,6 +399,31 @@ impl VdbeProgram {
         self.ops.len()
     }
 
+    /// Returns the distinct [`DatabaseId`] slots accessed by B-Tree or transaction instructions in this program.
+    pub fn referenced_dbs(&self) -> Vec<DatabaseId> {
+        let mut dbs = Vec::new();
+        for ins in &self.ops {
+            let db = match ins.opcode {
+                Opcode::Transaction => {
+                    if ins.db != DatabaseId::MAIN {
+                        ins.db
+                    } else {
+                        DatabaseId(ins.p1.max(0) as usize)
+                    }
+                }
+                Opcode::OpenRead
+                | Opcode::OpenWrite
+                | Opcode::OpenReadIndex
+                | Opcode::OpenWriteIndex => ins.db,
+                _ => continue,
+            };
+            if !dbs.contains(&db) {
+                dbs.push(db);
+            }
+        }
+        dbs
+    }
+
     /// Formats `EXPLAIN <stmt>` rows identically to SQLite's 8-column `EXPLAIN` output:
     /// `(addr, opcode, p1, p2, p3, p4, p5, comment)`.
     pub fn explain_rows(&self) -> Vec<Vec<Value>> {
@@ -613,7 +638,9 @@ impl VdbeVm {
                         DatabaseId(ins.p1.max(0) as usize)
                     };
                     let btree = storage.btree_mut(db)?;
-                    if ins.p2 != 0 {
+                    if ins.p2 >= 2 {
+                        btree.begin_exclusive()?;
+                    } else if ins.p2 != 0 {
                         btree.begin_write()?;
                     } else {
                         btree.begin_read()?;

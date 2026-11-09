@@ -433,6 +433,7 @@ impl SqliteTestHost {
             default_page_size: self.default_page_size,
             lock_geometry: self.lock_geometry,
             temp_store_memory: false,
+            ..ConnectionOpenOptions::default()
         }
     }
 

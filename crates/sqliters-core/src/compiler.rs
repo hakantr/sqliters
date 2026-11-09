@@ -2,17 +2,18 @@
 //! `EXPLAIN` / `EXPLAIN QUERY PLAN` planner.
 
 use sqliters_syntax::{
-    BinaryOp, BindParam, ColumnRef, CurrentTimeKind, DeleteStmt, Expr, FromClause, FunctionArgs,
-    IndexHint, InsertSource, InsertStmt, LikeOp, LimitClause, OrderByTerm, QualifiedName,
-    ResultColumn, SelectCore, SelectStmt, Stmt, TableOrSubquery, UnaryOp, UpdateStmt,
+    BinaryOp, BindParam, ColumnRef, CurrentTimeKind, Expr, FromClause, FunctionArgs, IndexHint,
+    InsertSource, InsertStmt, LikeOp, LimitClause, OrderByTerm, QualifiedName, ResultColumn,
+    SelectCore, SelectStmt, Stmt, TableOrSubquery, UnaryOp,
 };
 use sqliters_types::{
-    Collation, ErrorCode, KeySortOrder, Result, SqliteError, TypeAffinity, Value,
+    Collation, DatabaseId, ErrorCode, KeySortOrder, Result, SqliteError, TypeAffinity, Value,
 };
 use sqliters_vdbe::{
     AggregateKind, Instruction, Opcode, P4, VdbeProgram, affinity_to_p5, sqlite_compare_affinity,
 };
 
+use crate::db_set::DatabaseSet;
 use crate::execution_context::FunctionRegistry;
 use crate::schema::{IndexSchema, Schema, TableSchema};
 
@@ -64,6 +65,17 @@ pub fn choose_access_plan(
     selection: Option<&Expr>,
     schema: &Schema,
 ) -> AccessPlan {
+    choose_access_plan_with_schema_name(tbl, "main", alias, selection, schema)
+}
+
+/// Multi-database variant of [`choose_access_plan`] honoring `schema_name` in 3-part `schema.table.col` predicates.
+pub fn choose_access_plan_with_schema_name(
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+    selection: Option<&Expr>,
+    schema: &Schema,
+) -> AccessPlan {
     let Some(where_expr) = selection else {
         return AccessPlan::FullScan;
     };
@@ -73,7 +85,7 @@ pub fn choose_access_plan(
 
     // 1. Check for `rowid = <const_or_param>` or `ipk_col = <const_or_param>` (O(log N) primary B+Tree seek!)
     for conj in &conjuncts {
-        if let Some((col_name, rhs)) = extract_table_col_eq(conj, tbl, alias) {
+        if let Some((col_name, rhs)) = extract_table_col_eq(conj, tbl, schema_name, alias) {
             let is_rowid = tbl.is_implicit_rowid_name(&col_name)
                 || tbl
                     .rowid_alias_col
@@ -108,10 +120,10 @@ pub fn choose_access_plan(
                 break;
             }
             let matched = conjuncts.iter().find_map(|conj| {
-                let (cname, rhs) = extract_table_col_eq(conj, tbl, alias)?;
+                let (cname, rhs) = extract_table_col_eq(conj, tbl, schema_name, alias)?;
                 if cname.eq_ignore_ascii_case(&ic.name) {
                     let idx_aff = tbl.columns[ci].affinity;
-                    let rhs_aff = compiler_expr_affinity(&rhs, Some(tbl), alias);
+                    let rhs_aff = compiler_expr_affinity(&rhs, Some((tbl, schema_name)), alias);
                     let comp_aff = sqlite_compare_affinity(Some(idx_aff), rhs_aff);
                     if index_affinity_ok(comp_aff, idx_aff) {
                         Some(rhs)
@@ -171,6 +183,7 @@ fn collect_and_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
 fn extract_table_col_eq(
     expr: &Expr,
     tbl: &TableSchema,
+    schema_name: &str,
     alias: Option<&str>,
 ) -> Option<(String, Expr)> {
     let Expr::Binary {
@@ -182,13 +195,13 @@ fn extract_table_col_eq(
         return None;
     };
 
-    if let Some(cname) = match_single_table_col(left, tbl, alias)
+    if let Some(cname) = match_single_table_col(left, tbl, schema_name, alias)
         && !matches!(right.as_ref(), Expr::Collate { .. })
         && expr_is_table_independent(right)
     {
         return Some((cname, (**right).clone()));
     }
-    if let Some(cname) = match_single_table_col(right, tbl, alias)
+    if let Some(cname) = match_single_table_col(right, tbl, schema_name, alias)
         && !matches!(left.as_ref(), Expr::Collate { .. })
         && expr_is_table_independent(left)
     {
@@ -197,26 +210,36 @@ fn extract_table_col_eq(
     None
 }
 
-fn cref_matches_single_table(cref: &ColumnRef, tbl: &TableSchema, alias: Option<&str>) -> bool {
+fn cref_matches_single_table(
+    cref: &ColumnRef,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+) -> bool {
     if let Some(s) = &cref.schema
-        && !s.eq_ignore_ascii_case("main")
+        && !s.eq_ignore_ascii_case(schema_name)
     {
         return false;
     }
-    if let Some(qual) = &cref.table {
-        let expect = alias.unwrap_or(&tbl.name);
-        if !qual.eq_ignore_ascii_case(expect) {
-            return false;
-        }
+    let effective_table = alias.unwrap_or(&tbl.name);
+    if let Some(qual) = &cref.table
+        && !qual.eq_ignore_ascii_case(effective_table)
+    {
+        return false;
     }
     true
 }
 
-fn match_single_table_col(expr: &Expr, tbl: &TableSchema, alias: Option<&str>) -> Option<String> {
+fn match_single_table_col(
+    expr: &Expr,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+) -> Option<String> {
     let Expr::Column(cref) = expr else {
         return None;
     };
-    if !cref_matches_single_table(cref, tbl, alias) {
+    if !cref_matches_single_table(cref, tbl, schema_name, alias) {
         return None;
     }
     if tbl.find_column(&cref.column).is_some() || tbl.is_implicit_rowid_name(&cref.column) {
@@ -240,7 +263,8 @@ pub fn expr_is_table_independent(expr: &Expr) -> bool {
         | Expr::Subquery(_)
         | Expr::Exists { .. }
         | Expr::InSubquery { .. }
-        | Expr::InTable { .. } => false,
+        | Expr::InTable { .. }
+        | Expr::Raise { .. } => false,
         Expr::Unary { expr, .. }
         | Expr::Collate { expr, .. }
         | Expr::IsNull { expr, .. }
@@ -368,7 +392,8 @@ pub fn expr_contains_subquery(expr: &Expr) -> bool {
         Expr::Subquery(_)
         | Expr::Exists { .. }
         | Expr::InSubquery { .. }
-        | Expr::InTable { .. } => true,
+        | Expr::InTable { .. }
+        | Expr::Raise { .. } => true,
         Expr::RowValue(_) => true, // Force relational engine evaluation for row-value tuples
         Expr::Unary { expr, .. }
         | Expr::Collate { expr, .. }
@@ -492,6 +517,7 @@ pub fn expr_column_label(expr: &Expr) -> String {
 
 struct TableBinding<'a> {
     tbl: &'a TableSchema,
+    schema_name: &'a str,
     alias: Option<&'a str>,
     cursor: i32,
 }
@@ -535,6 +561,28 @@ fn resolve_main_table_for_compiler(
     Ok(Some(tbl))
 }
 
+fn resolve_db_set_table_for_compiler<'a>(
+    name: &QualifiedName,
+    db_set: &'a DatabaseSet,
+) -> Result<Option<(DatabaseId, &'a str, &'a Schema, TableSchema)>> {
+    let Some((db_id, tbl)) = db_set.find_table_in_set(name)? else {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("no such table: {}", name.display_name()),
+        ));
+    };
+    if tbl.root_pgno == 0 {
+        return Ok(None);
+    }
+    let Some(slot) = db_set.slot(db_id) else {
+        return Ok(None);
+    };
+    if slot.btree.is_none() {
+        return Ok(None);
+    }
+    Ok(Some((db_id, slot.name.as_str(), &slot.schema, tbl)))
+}
+
 /// Attempts to compile `stmt` into a pure [`VdbeProgram`] for direct step-by-step execution
 /// on [`sqliters_vdbe::VdbeVm`]. Returns `Ok(None)` if the query uses multi-table joins, CTEs,
 /// compound set operations, aggregates/`GROUP BY`, `DISTINCT`, or subqueries (handled by `engine`).
@@ -548,6 +596,35 @@ pub fn try_compile_select_with_functions(
     schema: &Schema,
     functions: &FunctionRegistry,
 ) -> Result<Option<VdbeProgram>> {
+    try_compile_select_core(stmt, functions, |name| {
+        let Some(tbl) = resolve_main_table_for_compiler(name, schema)? else {
+            return Ok(None);
+        };
+        Ok(Some((DatabaseId::MAIN, "main", schema, tbl)))
+    })
+}
+
+/// Multi-database variant of [`try_compile_select_with_functions`] resolving unqualified tables via
+/// `temp -> main -> attached` and stamping resolved [`DatabaseId`] slots on all B-tree/transaction
+/// instructions.
+pub fn try_compile_select_in_db_set(
+    stmt: &SelectStmt,
+    db_set: &DatabaseSet,
+    functions: &FunctionRegistry,
+) -> Result<Option<VdbeProgram>> {
+    try_compile_select_core(stmt, functions, |name| {
+        resolve_db_set_table_for_compiler(name, db_set)
+    })
+}
+
+fn try_compile_select_core<'a, F>(
+    stmt: &SelectStmt,
+    functions: &FunctionRegistry,
+    resolve_table: F,
+) -> Result<Option<VdbeProgram>>
+where
+    F: FnOnce(&QualifiedName) -> Result<Option<(DatabaseId, &'a str, &'a Schema, TableSchema)>>,
+{
     if !stmt.ctes.is_empty() || !stmt.body.compounds.is_empty() {
         return Ok(None);
     }
@@ -617,7 +694,7 @@ pub fn try_compile_select_with_functions(
             if matches!(indexed_by, Some(IndexHint::IndexedBy(_))) {
                 return Ok(None);
             }
-            let Some(tbl) = resolve_main_table_for_compiler(name, schema)? else {
+            let Some((db_id, slot_name, slot_schema, tbl)) = resolve_table(name)? else {
                 return Ok(None);
             };
             if tbl.columns.iter().any(|c| c.generated.is_some()) {
@@ -625,6 +702,8 @@ pub fn try_compile_select_with_functions(
             }
             compile_single_table_select(
                 SingleTableSource {
+                    db_id,
+                    schema_name: slot_name,
                     tbl: &tbl,
                     alias: alias.as_deref(),
                     indexed_by: indexed_by.as_ref(),
@@ -633,7 +712,7 @@ pub fn try_compile_select_with_functions(
                 selection.as_ref(),
                 &stmt.order_by,
                 stmt.limit.as_ref(),
-                schema,
+                slot_schema,
                 functions,
             )
         }
@@ -712,6 +791,8 @@ fn compile_tableless_select(
 }
 
 struct SingleTableSource<'a> {
+    db_id: DatabaseId,
+    schema_name: &'a str,
     tbl: &'a TableSchema,
     alias: Option<&'a str>,
     indexed_by: Option<&'a IndexHint>,
@@ -727,6 +808,8 @@ fn compile_single_table_select(
     functions: &FunctionRegistry,
 ) -> Result<Option<VdbeProgram>> {
     let SingleTableSource {
+        db_id,
+        schema_name,
         tbl,
         alias,
         indexed_by,
@@ -752,9 +835,10 @@ fn compile_single_table_select(
                 schema: star_schema,
                 table: tname,
             } => {
-                let schema_ok = star_schema
-                    .as_deref()
-                    .is_none_or(|s| s.eq_ignore_ascii_case("main"));
+                let schema_ok = match star_schema.as_deref() {
+                    Some(s) => s.eq_ignore_ascii_case(schema_name),
+                    None => true,
+                };
                 if !schema_ok || !tname.eq_ignore_ascii_case(table_ref_name) {
                     let disp = match star_schema {
                         Some(s) => format!("{s}.{tname}"),
@@ -789,15 +873,17 @@ fn compile_single_table_select(
     let tbl_cursor = prog.alloc_cursor();
     let binding = TableBinding {
         tbl,
+        schema_name,
         alias,
         cursor: tbl_cursor,
     };
 
     let body_start = prog.current_addr();
-    prog.emit(Instruction::new(Opcode::Transaction, 0, 0, 0));
+    prog.emit(Instruction::new(Opcode::Transaction, db_id.index() as i32, 0, 0).with_db(db_id));
     if tbl.without_rowid {
         prog.emit(
             Instruction::new(Opcode::OpenReadIndex, tbl_cursor, tbl.root_pgno as i32, 0)
+                .with_db(db_id)
                 .with_p4(P4::KeyInfo(tbl.without_rowid_pk_orders()))
                 .with_comment(tbl.name.clone()),
         );
@@ -809,6 +895,7 @@ fn compile_single_table_select(
                 tbl.root_pgno as i32,
                 tbl.columns.len() as i32,
             )
+            .with_db(db_id)
             .with_comment(tbl.name.clone()),
         );
     }
@@ -835,7 +922,7 @@ fn compile_single_table_select(
 
     let plan = match indexed_by {
         Some(IndexHint::NotIndexed) => AccessPlan::FullScan,
-        None => choose_access_plan(tbl, alias, selection, schema),
+        None => choose_access_plan_with_schema_name(tbl, schema_name, alias, selection, schema),
         Some(IndexHint::IndexedBy(_)) => return Ok(None),
     };
 
@@ -874,7 +961,7 @@ fn compile_single_table_select(
             && matches!(plan, AccessPlan::FullScan | AccessPlan::RowidSeek { .. })
             && resolved_exprs
                 .first()
-                .is_some_and(|e| is_table_rowid_column_expr(e, tbl, alias));
+                .is_some_and(|e| is_table_rowid_column_expr(e, tbl, schema_name, alias));
 
         let natural_without_rowid_order = tbl.without_rowid
             && matches!(plan, AccessPlan::FullScan)
@@ -885,9 +972,9 @@ fn compile_single_table_select(
                 .zip(tbl.without_rowid_pk_cols.iter())
                 .all(|((re, so), pk_ic)| {
                     *so == pk_ic.sort_order
-                        && pk_ic
-                            .col_idx
-                            .is_some_and(|pk_ci| is_exact_table_column_expr(re, tbl, alias, pk_ci))
+                        && pk_ic.col_idx.is_some_and(|pk_ci| {
+                            is_exact_table_column_expr(re, tbl, schema_name, alias, pk_ci)
+                        })
                 });
 
         if natural_rowid_order || natural_without_rowid_order {
@@ -980,6 +1067,7 @@ fn compile_single_table_select(
                 seek_advance_cursor = Some(icur);
                 prog.emit(
                     Instruction::new(Opcode::OpenReadIndex, icur, index.root_pgno as i32, 0)
+                        .with_db(db_id)
                         .with_p4(P4::KeyInfo(index.key_sort_orders()))
                         .with_comment(index.name.clone()),
                 );
@@ -1257,14 +1345,19 @@ enum OrderBySource {
     Expr(Expr),
 }
 
-fn is_table_rowid_column_expr(expr: &Expr, tbl: &TableSchema, alias: Option<&str>) -> bool {
+fn is_table_rowid_column_expr(
+    expr: &Expr,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+) -> bool {
     if tbl.without_rowid {
         return false;
     }
     let Expr::Column(cref) = expr else {
         return false;
     };
-    if !cref_matches_single_table(cref, tbl, alias) {
+    if !cref_matches_single_table(cref, tbl, schema_name, alias) {
         return false;
     }
     tbl.is_implicit_rowid_name(&cref.column)
@@ -1276,13 +1369,14 @@ fn is_table_rowid_column_expr(expr: &Expr, tbl: &TableSchema, alias: Option<&str
 fn is_exact_table_column_expr(
     expr: &Expr,
     tbl: &TableSchema,
+    schema_name: &str,
     alias: Option<&str>,
     target_col_idx: usize,
 ) -> bool {
     let Expr::Column(cref) = expr else {
         return false;
     };
-    if !cref_matches_single_table(cref, tbl, alias) {
+    if !cref_matches_single_table(cref, tbl, schema_name, alias) {
         return false;
     }
     tbl.columns
@@ -1497,7 +1591,7 @@ fn compile_expr(
                     format!("no such column: {}", cref.display_name()),
                 ));
             };
-            if !cref_matches_single_table(cref, b.tbl, b.alias) {
+            if !cref_matches_single_table(cref, b.tbl, b.schema_name, b.alias) {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!("no such column: {}", cref.display_name()),
@@ -1592,12 +1686,12 @@ fn compile_expr(
             ) {
                 let l_aff = compiler_expr_affinity(
                     left,
-                    binding.map(|b| b.tbl),
+                    binding.map(|b| (b.tbl, b.schema_name)),
                     binding.and_then(|b| b.alias),
                 );
                 let r_aff = compiler_expr_affinity(
                     right,
-                    binding.map(|b| b.tbl),
+                    binding.map(|b| (b.tbl, b.schema_name)),
                     binding.and_then(|b| b.alias),
                 );
                 let comp_aff = sqlite_compare_affinity(l_aff, r_aff);
@@ -1770,12 +1864,12 @@ fn compile_expr(
                     let op_e = operand.as_ref().unwrap();
                     let l_aff = compiler_expr_affinity(
                         op_e,
-                        binding.map(|b| b.tbl),
+                        binding.map(|b| (b.tbl, b.schema_name)),
                         binding.and_then(|b| b.alias),
                     );
                     let r_aff = compiler_expr_affinity(
                         when_e,
-                        binding.map(|b| b.tbl),
+                        binding.map(|b| (b.tbl, b.schema_name)),
                         binding.and_then(|b| b.alias),
                     );
                     let comp_aff = sqlite_compare_affinity(l_aff, r_aff);
@@ -1884,6 +1978,12 @@ fn compile_expr(
                 }),
             );
         }
+        Expr::Raise { .. } => {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                "RAISE() may only be used within a trigger-program",
+            ));
+        }
         Expr::Subquery(_)
         | Expr::Exists { .. }
         | Expr::InSubquery { .. }
@@ -1954,15 +2054,15 @@ pub const fn index_affinity_ok(comp_aff: TypeAffinity, idx_aff: TypeAffinity) ->
 
 fn compiler_expr_affinity(
     expr: &Expr,
-    tbl: Option<&TableSchema>,
+    tbl_and_schema: Option<(&TableSchema, &str)>,
     alias: Option<&str>,
 ) -> Option<TypeAffinity> {
     match expr {
-        Expr::Collate { expr: inner, .. } => compiler_expr_affinity(inner, tbl, alias),
+        Expr::Collate { expr: inner, .. } => compiler_expr_affinity(inner, tbl_and_schema, alias),
         Expr::Cast { type_name, .. } => Some(TypeAffinity::from_declared_type(type_name)),
         Expr::Column(cref) => {
-            let t = tbl?;
-            if !cref_matches_single_table(cref, t, alias) {
+            let (t, schema_name) = tbl_and_schema?;
+            if !cref_matches_single_table(cref, t, schema_name, alias) {
                 return None;
             }
             if let Some((_, c)) = t.find_column(&cref.column) {
@@ -2007,9 +2107,18 @@ pub fn compile_for_explain_with_functions(
             prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
             Ok(prog)
         }
-        Stmt::Insert(ins) => compile_insert_explain(ins, schema, functions),
-        Stmt::Update(upd) => compile_update_explain(upd, schema),
-        Stmt::Delete(del) => compile_delete_explain(del, schema),
+        Stmt::Insert(ins) => {
+            let tbl = find_table_qualified_main(&ins.table, schema)?;
+            compile_insert_explain_table(&tbl, DatabaseId::MAIN, schema, ins, functions)
+        }
+        Stmt::Update(upd) => {
+            let tbl = find_table_qualified_main(&upd.table, schema)?;
+            compile_update_explain_table(&tbl, DatabaseId::MAIN)
+        }
+        Stmt::Delete(del) => {
+            let tbl = find_table_qualified_main(&del.table, schema)?;
+            compile_delete_explain_table(&tbl, DatabaseId::MAIN)
+        }
         _ => {
             let mut prog = VdbeProgram::new();
             prog.emit(Instruction::new(Opcode::Init, 0, 1, 0));
@@ -2018,6 +2127,62 @@ pub fn compile_for_explain_with_functions(
             Ok(prog)
         }
     }
+}
+
+/// Multi-database variant of [`compile_for_explain_with_functions`].
+pub fn compile_for_explain_in_db_set(
+    stmt: &Stmt,
+    db_set: &DatabaseSet,
+    functions: &FunctionRegistry,
+) -> Result<VdbeProgram> {
+    match stmt {
+        Stmt::Select(sel) => {
+            if let Some(prog) = try_compile_select_in_db_set(sel, db_set, functions)? {
+                return Ok(prog);
+            }
+            let mut prog = VdbeProgram::new();
+            prog.emit(Instruction::new(Opcode::Init, 0, 1, 0));
+            prog.emit(Instruction::new(Opcode::Transaction, 0, 0, 0));
+            prog.emit(
+                Instruction::new(Opcode::OpenEphemeral, 0, 0, 0).with_comment("relational query"),
+            );
+            prog.emit(Instruction::new(Opcode::ResultRow, 1, 1, 0));
+            prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
+            Ok(prog)
+        }
+        Stmt::Insert(ins) => {
+            let (db_id, tbl) = find_table_in_db_set_or_err(&ins.table, db_set)?;
+            let slot_schema = &db_set.slot(db_id).expect("resolved slot exists").schema;
+            compile_insert_explain_table(&tbl, db_id, slot_schema, ins, functions)
+        }
+        Stmt::Update(upd) => {
+            let (db_id, tbl) = find_table_in_db_set_or_err(&upd.table, db_set)?;
+            compile_update_explain_table(&tbl, db_id)
+        }
+        Stmt::Delete(del) => {
+            let (db_id, tbl) = find_table_in_db_set_or_err(&del.table, db_set)?;
+            compile_delete_explain_table(&tbl, db_id)
+        }
+        _ => {
+            let mut prog = VdbeProgram::new();
+            prog.emit(Instruction::new(Opcode::Init, 0, 1, 0));
+            prog.emit(Instruction::new(Opcode::Transaction, 0, 1, 0));
+            prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
+            Ok(prog)
+        }
+    }
+}
+
+fn find_table_in_db_set_or_err(
+    name: &QualifiedName,
+    db_set: &DatabaseSet,
+) -> Result<(DatabaseId, TableSchema)> {
+    db_set.find_table_in_set(name)?.ok_or_else(|| {
+        SqliteError::new(
+            ErrorCode::Error,
+            format!("no such table: {}", name.display_name()),
+        )
+    })
 }
 
 fn find_table_qualified_main(name: &QualifiedName, schema: &Schema) -> Result<TableSchema> {
@@ -2043,16 +2208,17 @@ fn find_table_qualified_main(name: &QualifiedName, schema: &Schema) -> Result<Ta
     })
 }
 
-fn compile_insert_explain(
-    ins: &InsertStmt,
+fn compile_insert_explain_table(
+    tbl: &TableSchema,
+    db_id: DatabaseId,
     schema: &Schema,
+    ins: &InsertStmt,
     functions: &FunctionRegistry,
 ) -> Result<VdbeProgram> {
-    let tbl = find_table_qualified_main(&ins.table, schema)?;
     let mut prog = VdbeProgram::new();
     prog.read_only = false;
     prog.emit(Instruction::new(Opcode::Init, 0, 1, 0));
-    prog.emit(Instruction::new(Opcode::Transaction, 0, 1, 0));
+    prog.emit(Instruction::new(Opcode::Transaction, db_id.index() as i32, 1, 0).with_db(db_id));
     let tcur = prog.alloc_cursor();
     prog.emit(
         Instruction::new(
@@ -2061,6 +2227,7 @@ fn compile_insert_explain(
             tbl.root_pgno as i32,
             tbl.columns.len() as i32,
         )
+        .with_db(db_id)
         .with_comment(tbl.name.clone()),
     );
     let indexes = schema.indexes_for_table(&tbl.name);
@@ -2069,6 +2236,7 @@ fn compile_insert_explain(
         let ic = prog.alloc_cursor();
         prog.emit(
             Instruction::new(Opcode::OpenWriteIndex, ic, idx.root_pgno as i32, 0)
+                .with_db(db_id)
                 .with_p4(P4::KeyInfo(idx.key_sort_orders()))
                 .with_comment(idx.name.clone()),
         );
@@ -2135,12 +2303,11 @@ fn compile_insert_explain(
     Ok(prog)
 }
 
-fn compile_update_explain(upd: &UpdateStmt, schema: &Schema) -> Result<VdbeProgram> {
-    let tbl = find_table_qualified_main(&upd.table, schema)?;
+fn compile_update_explain_table(tbl: &TableSchema, db_id: DatabaseId) -> Result<VdbeProgram> {
     let mut prog = VdbeProgram::new();
     prog.read_only = false;
     prog.emit(Instruction::new(Opcode::Init, 0, 1, 0));
-    prog.emit(Instruction::new(Opcode::Transaction, 0, 1, 0));
+    prog.emit(Instruction::new(Opcode::Transaction, db_id.index() as i32, 1, 0).with_db(db_id));
     let tcur = prog.alloc_cursor();
     prog.emit(
         Instruction::new(
@@ -2149,6 +2316,7 @@ fn compile_update_explain(upd: &UpdateStmt, schema: &Schema) -> Result<VdbeProgr
             tbl.root_pgno as i32,
             tbl.columns.len() as i32,
         )
+        .with_db(db_id)
         .with_comment(tbl.name.clone()),
     );
     let rew = prog.emit(Instruction::new(Opcode::Rewind, tcur, 0, 0));
@@ -2170,12 +2338,11 @@ fn compile_update_explain(upd: &UpdateStmt, schema: &Schema) -> Result<VdbeProgr
     Ok(prog)
 }
 
-fn compile_delete_explain(del: &DeleteStmt, schema: &Schema) -> Result<VdbeProgram> {
-    let tbl = find_table_qualified_main(&del.table, schema)?;
+fn compile_delete_explain_table(tbl: &TableSchema, db_id: DatabaseId) -> Result<VdbeProgram> {
     let mut prog = VdbeProgram::new();
     prog.read_only = false;
     prog.emit(Instruction::new(Opcode::Init, 0, 1, 0));
-    prog.emit(Instruction::new(Opcode::Transaction, 0, 1, 0));
+    prog.emit(Instruction::new(Opcode::Transaction, db_id.index() as i32, 1, 0).with_db(db_id));
     let tcur = prog.alloc_cursor();
     prog.emit(
         Instruction::new(
@@ -2184,6 +2351,7 @@ fn compile_delete_explain(del: &DeleteStmt, schema: &Schema) -> Result<VdbeProgr
             tbl.root_pgno as i32,
             tbl.columns.len() as i32,
         )
+        .with_db(db_id)
         .with_comment(tbl.name.clone()),
     );
     let rew = prog.emit(Instruction::new(Opcode::Rewind, tcur, 0, 0));
@@ -2198,6 +2366,33 @@ fn compile_delete_explain(del: &DeleteStmt, schema: &Schema) -> Result<VdbeProgr
 
 /// Generates 4-column `EXPLAIN QUERY PLAN <stmt>` rows: `(id, parent, notused, detail)`.
 pub fn explain_query_plan(stmt: &Stmt, schema: &Schema) -> Result<Vec<Vec<Value>>> {
+    explain_query_plan_core(stmt, |name| {
+        if name
+            .schema
+            .as_deref()
+            .is_none_or(|s| s.eq_ignore_ascii_case("main"))
+            && let Some(tbl) = schema.find_table(&name.name)
+        {
+            Some(("main", schema, tbl))
+        } else {
+            None
+        }
+    })
+}
+
+/// Multi-database variant of [`explain_query_plan`].
+pub fn explain_query_plan_in_db_set(stmt: &Stmt, db_set: &DatabaseSet) -> Result<Vec<Vec<Value>>> {
+    explain_query_plan_core(stmt, |name| {
+        let (db_id, tbl) = db_set.find_table_in_set(name).ok().flatten()?;
+        let slot = db_set.slot(db_id)?;
+        Some((slot.name.as_str(), &slot.schema, tbl))
+    })
+}
+
+fn explain_query_plan_core<'a, F>(stmt: &Stmt, resolve_table: F) -> Result<Vec<Vec<Value>>>
+where
+    F: Fn(&QualifiedName) -> Option<(&'a str, &'a Schema, TableSchema)>,
+{
     let mut rows = Vec::new();
     let mut next_id = 2i64;
     let mut push_detail = |detail: String| {
@@ -2224,15 +2419,17 @@ pub fn explain_query_plan(stmt: &Stmt, schema: &Schema) -> Result<Vec<Vec<Value>
                         alias,
                         indexed_by,
                     } = &fc.head
-                    && name
-                        .schema
-                        .as_deref()
-                        .is_none_or(|s| s.eq_ignore_ascii_case("main"))
-                    && let Some(tbl) = schema.find_table(&name.name)
+                    && let Some((sname, slot_schema, tbl)) = resolve_table(name)
                 {
                     let plan = match indexed_by {
                         Some(IndexHint::NotIndexed) => AccessPlan::FullScan,
-                        _ => choose_access_plan(&tbl, alias.as_deref(), selection.as_ref(), schema),
+                        _ => choose_access_plan_with_schema_name(
+                            &tbl,
+                            sname,
+                            alias.as_deref(),
+                            selection.as_ref(),
+                            slot_schema,
+                        ),
                     };
                     let disp = alias.as_deref().unwrap_or(&tbl.name);
                     push_detail(plan.explain_detail(disp));
@@ -2264,29 +2461,27 @@ pub fn explain_query_plan(stmt: &Stmt, schema: &Schema) -> Result<Vec<Vec<Value>
             }
         }
         Stmt::Update(upd) => {
-            if upd
-                .table
-                .schema
-                .as_deref()
-                .is_none_or(|s| s.eq_ignore_ascii_case("main"))
-                && let Some(tbl) = schema.find_table(&upd.table.name)
-            {
-                let plan =
-                    choose_access_plan(&tbl, upd.alias.as_deref(), upd.selection.as_ref(), schema);
+            if let Some((sname, slot_schema, tbl)) = resolve_table(&upd.table) {
+                let plan = choose_access_plan_with_schema_name(
+                    &tbl,
+                    sname,
+                    upd.alias.as_deref(),
+                    upd.selection.as_ref(),
+                    slot_schema,
+                );
                 let disp = upd.alias.as_deref().unwrap_or(&tbl.name);
                 push_detail(plan.explain_detail(disp));
             }
         }
         Stmt::Delete(del) => {
-            if del
-                .table
-                .schema
-                .as_deref()
-                .is_none_or(|s| s.eq_ignore_ascii_case("main"))
-                && let Some(tbl) = schema.find_table(&del.table.name)
-            {
-                let plan =
-                    choose_access_plan(&tbl, del.alias.as_deref(), del.selection.as_ref(), schema);
+            if let Some((sname, slot_schema, tbl)) = resolve_table(&del.table) {
+                let plan = choose_access_plan_with_schema_name(
+                    &tbl,
+                    sname,
+                    del.alias.as_deref(),
+                    del.selection.as_ref(),
+                    slot_schema,
+                );
                 let disp = del.alias.as_deref().unwrap_or(&tbl.name);
                 push_detail(plan.explain_detail(disp));
             }

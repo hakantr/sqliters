@@ -174,6 +174,7 @@ pub mod extended {
     pub const SQLITE_ABORT_ROLLBACK: i32 = (ErrorCode::Abort as i32) | (2 << 8);
 
     pub const SQLITE_CONSTRAINT_CHECK: i32 = (ErrorCode::Constraint as i32) | (1 << 8);
+    pub const SQLITE_CONSTRAINT_COMMITHOOK: i32 = (ErrorCode::Constraint as i32) | (2 << 8);
     pub const SQLITE_CONSTRAINT_FOREIGNKEY: i32 = (ErrorCode::Constraint as i32) | (3 << 8);
     pub const SQLITE_CONSTRAINT_NOTNULL: i32 = (ErrorCode::Constraint as i32) | (5 << 8);
     pub const SQLITE_CONSTRAINT_PRIMARYKEY: i32 = (ErrorCode::Constraint as i32) | (6 << 8);

@@ -560,6 +560,14 @@ pub enum FunctionArgs {
     Exprs(Vec<Expr>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaiseAction {
+    Ignore,
+    Rollback,
+    Abort,
+    Fail,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Null,
@@ -635,6 +643,10 @@ pub enum Expr {
     Exists {
         subquery: Box<SelectStmt>,
         negated: bool,
+    },
+    Raise {
+        action: RaiseAction,
+        message: Option<Box<Expr>>,
     },
     RowValue(Vec<Expr>),
 }

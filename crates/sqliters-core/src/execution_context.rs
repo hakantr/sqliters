@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use sqliters_types::{
     Collation, ErrorCode, ExecutionServices, FunctionFlags, Result, RuntimeValue, SqliteError,
-    TextEncoding, Value, enforce_result_subtype_contract, strip_unsubscribed_subtypes,
+    TextEncoding, Value, enforce_result_subtype_contract, extended, strip_unsubscribed_subtypes,
 };
 use sqliters_vdbe::{
     VmRuntimeContext, eval_scalar_function_rt_with_strict, validate_function_call,
@@ -335,6 +335,59 @@ impl ProgressTracker {
     }
 }
 
+/// Callback invoked by `vdbeCommit` (`sqlite3_commit_hook`) immediately before two-phase commit.
+/// Returning `true` vetoes the commit and triggers full multi-DB rollback (`SQLITE_CONSTRAINT_COMMITHOOK`).
+pub type CommitHookCallback = Box<dyn FnMut() -> bool + Send>;
+
+/// Connection-level `vdbeCommit` hook state (`sqlite3_commit_hook` + Phase 7 virtual table stubs).
+#[derive(Default)]
+pub struct CommitCoordinatorHooks {
+    commit_hook: Option<CommitHookCallback>,
+}
+
+impl std::fmt::Debug for CommitCoordinatorHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommitCoordinatorHooks")
+            .field("has_commit_hook", &self.commit_hook.is_some())
+            .finish()
+    }
+}
+
+impl CommitCoordinatorHooks {
+    /// Sets or clears the connection commit hook (`sqlite3_commit_hook`).
+    pub fn set_commit_hook(&mut self, hook: Option<CommitHookCallback>) {
+        self.commit_hook = hook;
+    }
+
+    /// Step 2 of `vdbeCommit`: runs `xSync` across active virtual tables before `nTrans` counting
+    /// and exclusive lock acquisition (Phase 2 no-op; Phase 7 virtual tables plug in here).
+    #[inline]
+    pub fn vtab_sync_all(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Step 4 of `vdbeCommit`: invokes any registered `sqlite3_commit_hook` when `need_xcommit` is
+    /// true; returning `true` aborts commit with `SQLITE_CONSTRAINT_COMMITHOOK`.
+    pub fn invoke_commit_hook(&mut self) -> Result<()> {
+        if let Some(ref mut cb) = self.commit_hook
+            && cb()
+        {
+            return Err(SqliteError::with_extended(
+                extended::SQLITE_CONSTRAINT_COMMITHOOK,
+                "commit hook vetoed commit",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Step 6 of `vdbeCommit`: runs `xCommit` across active virtual tables after B-tree commit
+    /// completes (Phase 2 no-op; Phase 7 virtual tables plug in here).
+    #[inline]
+    pub fn vtab_commit_all(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// Concrete [`ExecutionServices`] adapter in `sqliters-core` borrowing disjoint connection service
 /// fields so storage (`&mut Btree` / `BtreeAccess`) can be mutably borrowed simultaneously without
 /// aliasing `ConnectionInner`.
@@ -346,6 +399,26 @@ pub struct ExecutionContext<'a> {
     pub collations: &'a CollationRegistry,
     pub progress: &'a mut ProgressTracker,
     pub strict_subtype: bool,
+}
+
+impl ExecutionContext<'_> {
+    /// Phase 2 `vdbeCommit` Step 2 (`sqlite3VtabSync`).
+    #[inline]
+    pub fn vtab_sync_all(&mut self, hooks: &mut CommitCoordinatorHooks) -> Result<()> {
+        hooks.vtab_sync_all()
+    }
+
+    /// Phase 2 `vdbeCommit` Step 4 (`xCommitCallback`).
+    #[inline]
+    pub fn invoke_commit_hook(&mut self, hooks: &mut CommitCoordinatorHooks) -> Result<()> {
+        hooks.invoke_commit_hook()
+    }
+
+    /// Phase 2 `vdbeCommit` Step 6 (`sqlite3VtabCommit`).
+    #[inline]
+    pub fn vtab_commit_all(&mut self, hooks: &mut CommitCoordinatorHooks) {
+        let _ = hooks.vtab_commit_all();
+    }
 }
 
 impl ExecutionServices for ExecutionContext<'_> {

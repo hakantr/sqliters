@@ -716,20 +716,14 @@ fn group64_ast_structural_qualified_names_and_attach_detach() {
         }) if c == &ColumnRef::unqualified("my.aux")
     ));
 
-    // Controlled runtime errors for ATTACH / DETACH before Step 2-C multi-pager lands
+    // Step 2-C runtime behavior for ATTACH / DETACH
     let conn = Connection::open_in_memory().unwrap();
-    assert!(
-        conn.execute("DETACH DATABASE main;")
-            .unwrap_err()
-            .message
-            .contains("DETACH DATABASE")
+    assert_eq!(
+        conn.execute("DETACH DATABASE main;").unwrap_err().message,
+        "cannot detach database main"
     );
-    assert!(
-        conn.execute("ATTACH ':memory:' AS aux;")
-            .unwrap_err()
-            .message
-            .contains("ATTACH DATABASE")
-    );
+    conn.execute("ATTACH ':memory:' AS aux;").unwrap();
+    conn.execute("DETACH DATABASE aux;").unwrap();
 
     // 2. Structural DDL AST + normalized `catalog_sql`
     let (s_ct, _) = parse_one(
