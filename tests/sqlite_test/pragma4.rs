@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "44/80 subtests passed; pending: VIEW, ATTACH"]
+#[ignore = "66/83 subtests passed; pending: VIEW, pragma column_count parity"]
 fn test_pragma4() {
     sqliters_tcltest::run_test_script(
         "pragma4",

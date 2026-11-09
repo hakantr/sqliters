@@ -1593,7 +1593,8 @@ fn c_reference_3_54_1_verification_and_phase1_2_manifest() {
     let cap_map: BTreeMap<&str, bool> = PHASE1_CAPABILITY_TABLE.iter().copied().collect();
     assert_eq!(cap_map.get("autoreset"), Some(&true));
     assert_eq!(cap_map.get("wal"), Some(&true));
-    assert_eq!(cap_map.get("tempdb"), Some(&false));
+    assert_eq!(cap_map.get("tempdb"), Some(&true));
+    assert_eq!(cap_map.get("attach"), Some(&true));
     assert_eq!(cap_map.get("view"), Some(&false));
     assert_eq!(cap_map.get("trigger"), Some(&false));
 

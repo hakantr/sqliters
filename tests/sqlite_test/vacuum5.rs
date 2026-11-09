@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "0/1 subtests passed; pending: ATTACH, TEMP TABLE, C testfixture hooks"]
+#[ignore = "18/21 subtests passed; pending: C testvfs hook"]
 fn test_vacuum5() {
     sqliters_tcltest::run_test_script(
         "vacuum5",

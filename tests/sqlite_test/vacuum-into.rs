@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "1/16 subtests passed; pending: C testfixture hooks"]
+#[ignore = "19/32 subtests passed; pending: Phase 6 db func callback, C testvfs hook"]
 fn test_vacuum_into() {
     sqliters_tcltest::run_test_script(
         "vacuum-into",

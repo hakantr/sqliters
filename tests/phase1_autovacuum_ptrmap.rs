@@ -515,7 +515,7 @@ fn c_reference_3_54_1_and_phase1_3_manifest() {
     \"active_phase1_3_wrappers\": {},\n\
     \"ignored_phase1_3_wrappers\": {},\n\
     \"active_phase1_3_subtests\": 554,\n\
-    \"incrvacuum2_verified_subtests_in_rust_gate\": 24\n\
+    \"incrvacuum2_verified_subtests_in_rust_gate\": 30\n\
   }},\n\
   \"phase1_capability_table\": {{\n{}\n  }}\n\
 }}\n",
@@ -1338,7 +1338,7 @@ fn group36_pragma_auto_vacuum_streaming_incrvacuum_recovery_and_incrvacuum2() {
         conn.try_close().unwrap();
     }
 
-    // 2. Execute the complete `incrvacuum2.test` (`1.1..5.12`, 24 subtests including `0x1000000` + `65536` WAL)
+    // 2. Execute the complete `incrvacuum2.test` (`1.1..5.12`, 30 subtests including `ifcapable attach` 2.1..2.6 + `0x1000000` + `65536` WAL)
     //    closing `db` immediately before `sqlite3_test_control_pending_byte 0x1000000` per Phase 1.1 `LockGeometry`!
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let raw_incrvac2 = fs::read_to_string(workspace_root.join("sqlite/test/incrvacuum2.test"))
@@ -1354,7 +1354,7 @@ fn group36_pragma_auto_vacuum_streaming_incrvacuum_recovery_and_incrvacuum2() {
         report.failed,
         report.script_error
     );
-    assert_eq!(report.passed, 24);
+    assert_eq!(report.passed, 30);
 }
 
 // ============================================================================

@@ -1,5 +1,6 @@
 //! Built-in SQLite scalar functions, `LIKE` / `GLOB` pattern matcher, and aggregate accumulators
 //! ported from `sqlite/src/func.c`.
+#![forbid(unsafe_code)]
 
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -148,7 +149,7 @@ pub fn builtin_scalar_flags(name: &str, enable_test_functions: bool) -> Option<F
         "TEST_PLAIN_ARG_SUBTYPE" if enable_test_functions => {
             Some(FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS)
         }
-        "RANDSTR" if enable_test_functions => Some(FunctionFlags::INNOCUOUS),
+        "RANDSTR" | "TEST_ERROR" if enable_test_functions => Some(FunctionFlags::INNOCUOUS),
         "RANDOM" | "RANDOMBLOB" | "LAST_INSERT_ROWID" | "CHANGES" | "TOTAL_CHANGES" => {
             Some(FunctionFlags::INNOCUOUS)
         }
@@ -202,6 +203,21 @@ pub fn eval_scalar_function_rt_with_strict(
         "TEST_PLAIN_ARG_SUBTYPE" if ctx.enable_test_functions => {
             check_arity_rt(name, filtered, 1, 1)?;
             RuntimeValue::plain(Value::Integer(i64::from(filtered[0].subtype)))
+        }
+        "TEST_ERROR" if ctx.enable_test_functions => {
+            check_arity_rt(name, filtered, 1, 2)?;
+            let msg = if filtered[0].value.is_null() {
+                String::new()
+            } else {
+                filtered[0].value.to_text_lossy()
+            };
+            let err = if filtered.len() == 2 {
+                let raw_code = filtered[1].value.to_integer_lossy() as i32;
+                SqliteError::with_extended(raw_code, msg)
+            } else {
+                SqliteError::new(ErrorCode::Error, msg)
+            };
+            return Err(err);
         }
         "COALESCE" | "IFNULL" => {
             let min = 2;
@@ -797,6 +813,7 @@ fn scalar_function_arity_with_flag(
         "RANDSTR" | "TEST_SET_SUBTYPE" | "TEST_BAD_SUBTYPE" if enable_test_functions => {
             Some((2, 2))
         }
+        "TEST_ERROR" if enable_test_functions => Some((1, 2)),
         "TEST_PLAIN_ARG_SUBTYPE" if enable_test_functions => Some((1, 1)),
         "REPLACE" => Some((3, 3)),
         "TRIM" | "LTRIM" | "RTRIM" | "ROUND" => Some((1, 2)),

@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "6/24 subtests passed; pending: ATTACH"]
+#[ignore = "15/26 subtests passed; pending: cache_spill, C pagecache hooks"]
 fn test_pragma2() {
     sqliters_tcltest::run_test_script(
         "pragma2",

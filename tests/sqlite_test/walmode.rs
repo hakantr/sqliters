@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "pending Phase 2 ATTACH and TEMP schema journal_mode matrix"]
 fn test_walmode() {
     let raw = include_str!("../../sqlite/test/walmode.test");
     let script = sqliters_tcltest::strip_test_comments(raw);

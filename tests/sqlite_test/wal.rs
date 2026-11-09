@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "pending Phase 2 ATTACH/TEMP, Phase 1.3 autovacuum, and Phase 6 UDF/launch_testfixture"]
+#[ignore = "pending Phase 6 Tcl UDF (db func) and multi-process launch_testfixture"]
 fn test_wal() {
     let raw = include_str!("../../sqlite/test/wal.test");
     let script = sqliters_tcltest::strip_test_comments(raw);

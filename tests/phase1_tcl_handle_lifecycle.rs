@@ -938,10 +938,10 @@ fn explicit_capability_table_and_zero_subtest_guard() {
     assert_eq!(phase1_capability("wal"), Some(true));
     assert_eq!(phase1_capability("autovacuum"), Some(true));
     assert_eq!(phase1_capability("incr_vacuum"), Some(true));
+    assert_eq!(phase1_capability("tempdb"), Some(true));
+    assert_eq!(phase1_capability("attach"), Some(true));
     assert_eq!(phase1_capability("default_autovacuum"), Some(false));
     for disabled in [
-        "tempdb",
-        "attach",
         "view",
         "upsert",
         "trigger",
@@ -967,7 +967,7 @@ fn explicit_capability_table_and_zero_subtest_guard() {
         assert_eq!(
             phase1_capability(disabled),
             Some(false),
-            "capability `{disabled}` must be explicitly 0 in Phase 1.3"
+            "capability `{disabled}` must be explicitly 0 in Phase 2"
         );
     }
     assert_eq!(phase1_capability("nonexistent_xyz"), None);
@@ -1009,7 +1009,7 @@ do_test 1.1 {
     [capable prefer_proxy_locking] \
     [capable nonexistent_xyz] \
     [capable !nonexistent_xyz]
-} {1 1 1 0 0 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1}
+} {1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1}
 
 finish_test
 "#;

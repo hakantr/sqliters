@@ -90,6 +90,8 @@ SCAN_RULES: list[tuple[str, str, str]] = [
     ("sqlite/test", "wal*.test", "1.2"),
     ("sqlite/test", "autovacuum*.test", "1.3"),
     ("sqlite/test", "incrvacuum*.test", "1.3"),
+    ("sqlite/test", "attach*.test", "2"),
+    ("sqlite/test", "tempdb*.test", "2"),
 ]
 
 # Explicit per-file specification keyed by canonical `id` (`"<source_root>/<relative_path>"`).
@@ -147,8 +149,8 @@ WAL_TEST_SPECS: dict[str, dict[str, Any]] = {
     "sqlite/test/wal.test": {
         "status": "ignored",
         "required_capabilities": ["wal", "attach", "tempdb", "autovacuum"],
-        "external_dependencies": ["ATTACH", "TEMP", "db func", "launch_testfixture"],
-        "ignore_reason": "pending Phase 2 ATTACH/TEMP, Phase 1.3 autovacuum, and Phase 6 UDF/launch_testfixture",
+        "external_dependencies": ["db func", "launch_testfixture"],
+        "ignore_reason": "pending Phase 6 Tcl UDF (db func) and multi-process launch_testfixture",
     },
     "sqlite/test/wal2.test": {
         "status": "ignored",
@@ -171,14 +173,14 @@ WAL_TEST_SPECS: dict[str, dict[str, Any]] = {
     "sqlite/test/wal5.test": {
         "status": "ignored",
         "required_capabilities": ["wal", "attach"],
-        "external_dependencies": ["ATTACH", "testvfs", "db busy", "wal_hook"],
-        "ignore_reason": "pending Phase 2 ATTACH and Phase 6 Tcl busy/wal_hook callbacks + C testvfs",
+        "external_dependencies": ["testvfs", "db busy", "wal_hook"],
+        "ignore_reason": "pending Phase 6 Tcl busy/wal_hook callbacks and C testvfs",
     },
     "sqlite/test/wal6.test": {
         "status": "ignored",
         "required_capabilities": ["wal", "autovacuum"],
         "external_dependencies": ["db func"],
-        "ignore_reason": "pending Phase 1.3 autovacuum journal-mode matrix and Phase 6 Tcl UDF (db func)",
+        "ignore_reason": "pending Phase 6 Tcl UDF (db func)",
     },
     "sqlite/test/wal64k.test": {
         "status": "ignored",
@@ -213,8 +215,8 @@ WAL_TEST_SPECS: dict[str, dict[str, Any]] = {
     "sqlite/test/walcrash.test": {
         "status": "ignored",
         "required_capabilities": ["wal", "attach", "autovacuum"],
-        "external_dependencies": ["sqlite3_crash_enable", "-vfs crash", "ATTACH"],
-        "ignore_reason": "requires C crash fault-injection VFS (-vfs crash) and Phase 2 ATTACH",
+        "external_dependencies": ["sqlite3_crash_enable", "-vfs crash"],
+        "ignore_reason": "requires C crash fault-injection VFS (-vfs crash)",
     },
     "sqlite/test/walcrash2.test": {
         "status": "ignored",
@@ -249,8 +251,8 @@ WAL_TEST_SPECS: dict[str, dict[str, Any]] = {
     "sqlite/test/walhook.test": {
         "status": "ignored",
         "required_capabilities": ["wal", "attach", "autovacuum"],
-        "external_dependencies": ["wal_hook", "ATTACH"],
-        "ignore_reason": "pending Phase 6 user wal_hook Tcl callback and Phase 2 ATTACH",
+        "external_dependencies": ["wal_hook"],
+        "ignore_reason": "pending Phase 6 user wal_hook Tcl callback",
     },
     "sqlite/test/waliter.test": {
         "status": "ignored",
@@ -259,10 +261,12 @@ WAL_TEST_SPECS: dict[str, dict[str, Any]] = {
         "ignore_reason": "requires C internal wal_iterator / testvfs test command",
     },
     "sqlite/test/walmode.test": {
-        "status": "ignored",
+        "status": "active",
         "required_capabilities": ["wal", "attach", "tempdb"],
-        "external_dependencies": ["ATTACH", "TEMP"],
-        "ignore_reason": "pending Phase 2 ATTACH and TEMP schema journal_mode matrix",
+        "external_dependencies": [],
+        "ignore_reason": None,
+        "observed_passed_subtests": 93,
+        "expected_subtest_count": 93,
     },
     "sqlite/test/walnoshm.test": {
         "status": "ignored",
@@ -406,16 +410,74 @@ WAL_TEST_SPECS: dict[str, dict[str, Any]] = {
     },
     "sqlite/test/incrvacuum2.test": {
         "status": "ignored",
-        "required_capabilities": ["autovacuum", "incr_vacuum", "wal"],
+        "required_capabilities": ["autovacuum", "incr_vacuum", "wal", "attach"],
         "external_dependencies": ["sqlite3_test_control_pending_byte_while_open"],
-        "ignore_reason": "incrvacuum2.test:277 calls sqlite3_test_control_pending_byte 0x1000000 before reset_db while db is open; Phase 1.1 LockGeometry forbids changing pending-byte while handles are open (all 1.1..5.12 subtests verified in phase1_autovacuum_ptrmap)",
-        "observed_passed_subtests": 20,
+        "ignore_reason": "incrvacuum2.test:277 calls sqlite3_test_control_pending_byte 0x1000000 before reset_db while db is open; Phase 1.1 LockGeometry forbids changing pending-byte while handles are open (all 30 subtests in 1.1..5.12 verified in phase1_autovacuum_ptrmap)",
+        "observed_passed_subtests": 26,
     },
     "sqlite/test/incrvacuum_ioerr.test": {
         "status": "ignored",
         "required_capabilities": ["autovacuum", "incr_vacuum"],
         "external_dependencies": ["do_ioerr_test"],
         "ignore_reason": "requires C do_ioerr_test I/O fault-simulation harness",
+    },
+    # --- Active Phase 2 Multi-Database (`ATTACH` / `DETACH` / `TEMP`) suites (100% subtests passing) ---
+    "sqlite/test/attach.test": {
+        "status": "active",
+        "required_capabilities": ["attach", "tempdb"],
+        "external_dependencies": [],
+        "ignore_reason": None,
+        "observed_passed_subtests": 79,
+        "expected_subtest_count": 79,
+    },
+    "sqlite/test/attach2.test": {
+        "status": "active",
+        "required_capabilities": ["attach", "tempdb"],
+        "external_dependencies": [],
+        "ignore_reason": None,
+        "observed_passed_subtests": 63,
+        "expected_subtest_count": 63,
+    },
+    "sqlite/test/attach3.test": {
+        "status": "active",
+        "required_capabilities": ["attach", "tempdb"],
+        "external_dependencies": [],
+        "ignore_reason": None,
+        "observed_passed_subtests": 32,
+        "expected_subtest_count": 32,
+    },
+    "sqlite/test/tempdb.test": {
+        "status": "active",
+        "required_capabilities": ["tempdb"],
+        "external_dependencies": [],
+        "ignore_reason": None,
+        "observed_passed_subtests": 5,
+        "expected_subtest_count": 5,
+    },
+    # --- Ignored Phase 2 suites with explicit Phase 4/6 or C fault-sim prerequisites ---
+    "sqlite/test/attach4.test": {
+        "status": "ignored",
+        "required_capabilities": ["attach", "tempdb", "wal", "trigger"],
+        "external_dependencies": ["CREATE TEMPORARY TRIGGER"],
+        "ignore_reason": "attach4-2.0..2.2 execute unguarded CREATE TEMPORARY TRIGGER / DROP TRIGGER (pending Phase 4 trigger); 1.1..1.8 (10 subtests) pass and are verified in phase2_multidb_gate",
+        "observed_passed_subtests": 10,
+        "expected_subtest_count": 12,
+    },
+    "sqlite/test/attachmalloc.test": {
+        "status": "ignored",
+        "required_capabilities": ["attach"],
+        "external_dependencies": ["do_malloc_test"],
+        "ignore_reason": "requires C OOM fault-simulation harness (do_malloc_test)",
+        "observed_passed_subtests": 0,
+        "expected_subtest_count": 0,
+    },
+    "sqlite/test/tempdb2.test": {
+        "status": "ignored",
+        "required_capabilities": ["tempdb"],
+        "external_dependencies": ["db func"],
+        "ignore_reason": "pending Phase 6 Tcl user-defined SQL function callback (db func int2str)",
+        "observed_passed_subtests": 0,
+        "expected_subtest_count": 7,
     },
 }
 

@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "pending Phase 6 user wal_hook Tcl callback and Phase 2 ATTACH"]
+#[ignore = "pending Phase 6 user wal_hook Tcl callback"]
 fn test_walhook() {
     let raw = include_str!("../../sqlite/test/walhook.test");
     let script = sqliters_tcltest::strip_test_comments(raw);

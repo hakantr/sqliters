@@ -3433,7 +3433,7 @@ impl Pager {
                 && self.db_kind == DatabaseKind::NamedDisk
                 && let Some(ref jpath) = self.journal_path
             {
-                let sync_dir = is_commit && self.synchronous > 0;
+                let sync_dir = is_commit && self.synchronous >= 3;
                 self.vfs.delete(jpath, sync_dir)?;
             }
             return Ok(());

@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "incrvacuum2.test:277 calls sqlite3_test_control_pending_byte 0x1000000 before reset_db while db is open; Phase 1.1 LockGeometry forbids changing pending-byte while handles are open (all 1.1..5.12 subtests verified in phase1_autovacuum_ptrmap)"]
+#[ignore = "incrvacuum2.test:277 calls sqlite3_test_control_pending_byte 0x1000000 before reset_db while db is open; Phase 1.1 LockGeometry forbids changing pending-byte while handles are open (all 30 subtests in 1.1..5.12 verified in phase1_autovacuum_ptrmap)"]
 fn test_incrvacuum2() {
     let raw = include_str!("../../sqlite/test/incrvacuum2.test");
     let script = sqliters_tcltest::strip_test_comments(raw);

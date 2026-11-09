@@ -1,5 +1,6 @@
 //! Pure safe Rust TCL interpreter implementing the TCL 12-rule parser,
 //! variable/array/upvar frames, procedures, and standard built-in commands.
+#![forbid(unsafe_code)]
 
 use std::collections::HashMap;
 use std::fs;
@@ -255,13 +256,20 @@ impl TclInterp {
         let start_frame = if is_global { 0 } else { self.current_frame };
         let (fidx, bname) = self.resolve_target(start_frame, base.to_string());
         if fidx == 0
-            && bname == "sqlite_pending_byte"
             && let Some(ref host_rc) = self.host
         {
-            return match idx {
-                None => Ok(crate::harness::get_pending_byte_str(host_rc)),
-                Some(_) => Err(format!("can't read \"{raw_name}\": variable isn't array")),
-            };
+            if bname == "sqlite_pending_byte" {
+                return match idx {
+                    None => Ok(crate::harness::get_pending_byte_str(host_rc)),
+                    Some(_) => Err(format!("can't read \"{raw_name}\": variable isn't array")),
+                };
+            }
+            if let Some(counter_val) = crate::harness::get_vfs_counter_str(host_rc, &bname) {
+                return match idx {
+                    None => Ok(counter_val),
+                    Some(_) => Err(format!("can't read \"{raw_name}\": variable isn't array")),
+                };
+            }
         }
         let slot = self.frames.get(fidx).and_then(|f| f.vars.get(&bname));
         match (slot, idx) {
@@ -285,16 +293,26 @@ impl TclInterp {
         let start_frame = if is_global { 0 } else { self.current_frame };
         let (fidx, bname) = self.resolve_target(start_frame, base.to_string());
         if fidx == 0
-            && bname == "sqlite_pending_byte"
             && let Some(host_rc) = self.host.clone()
         {
-            return match idx {
-                None => {
-                    crate::harness::set_pending_byte_str(&host_rc, &val)?;
-                    Ok(val)
-                }
-                Some(_) => Err(format!("can't set \"{raw_name}\": variable isn't array")),
-            };
+            if bname == "sqlite_pending_byte" {
+                return match idx {
+                    None => {
+                        crate::harness::set_pending_byte_str(&host_rc, &val)?;
+                        Ok(val)
+                    }
+                    Some(_) => Err(format!("can't set \"{raw_name}\": variable isn't array")),
+                };
+            }
+            if crate::harness::is_vfs_counter_var(&bname) {
+                return match idx {
+                    None => {
+                        crate::harness::set_vfs_counter_str(&host_rc, &bname, &val)?;
+                        Ok(val)
+                    }
+                    Some(_) => Err(format!("can't set \"{raw_name}\": variable isn't array")),
+                };
+            }
         }
         match idx {
             None => {
@@ -2451,9 +2469,129 @@ impl TclInterp {
                 let p = self.resolve_path(args.get(1).map_or("", String::as_str));
                 Ok(if p.is_dir() { "1" } else { "0" }.to_string())
             }
-            "executable" | "readable" | "writable" => {
+            "executable" => {
                 let p = self.resolve_path(args.get(1).map_or("", String::as_str));
-                Ok(if p.exists() { "1" } else { "0" }.to_string())
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let ok = fs::metadata(&p)
+                        .map(|m| (m.permissions().mode() & 0o111) != 0)
+                        .unwrap_or(false);
+                    Ok(if ok { "1" } else { "0" }.to_string())
+                }
+                #[cfg(not(unix))]
+                {
+                    Ok(if p.exists() { "1" } else { "0" }.to_string())
+                }
+            }
+            "readable" => {
+                let p = self.resolve_path(args.get(1).map_or("", String::as_str));
+                let ok = if p.is_dir() {
+                    fs::read_dir(&p).is_ok()
+                } else {
+                    fs::File::open(&p).is_ok()
+                };
+                Ok(if ok { "1" } else { "0" }.to_string())
+            }
+            "writable" => {
+                let p = self.resolve_path(args.get(1).map_or("", String::as_str));
+                let ok = if !p.exists() {
+                    false
+                } else if p.is_dir() {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        fs::metadata(&p)
+                            .map(|m| (m.permissions().mode() & 0o222) != 0)
+                            .unwrap_or(false)
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        !fs::metadata(&p)
+                            .map(|m| m.permissions().readonly())
+                            .unwrap_or(true)
+                    }
+                } else {
+                    fs::OpenOptions::new().write(true).open(&p).is_ok()
+                };
+                Ok(if ok { "1" } else { "0" }.to_string())
+            }
+            "attributes" => {
+                let p = self.resolve_path(args.get(1).map_or("", String::as_str));
+                if args.len() == 3 {
+                    match args[2].as_str() {
+                        "-permissions" | "-permission" => {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                let m = fs::metadata(&p)
+                                    .map_err(|e| TclControl::Error(e.to_string()))?;
+                                return Ok(format!("0{:04o}", m.permissions().mode() & 0o7777));
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                return Ok("00644".to_string());
+                            }
+                        }
+                        "-readonly" => {
+                            let m =
+                                fs::metadata(&p).map_err(|e| TclControl::Error(e.to_string()))?;
+                            return Ok(
+                                if m.permissions().readonly() { "1" } else { "0" }.to_string()
+                            );
+                        }
+                        _ => return Ok(String::new()),
+                    }
+                }
+                let mut i = 2;
+                while i + 1 < args.len() {
+                    match args[i].as_str() {
+                        "-permissions" | "-permission" => {
+                            let raw_perm = args[i + 1].trim();
+                            let mode_opt = if let Some(rest) = raw_perm
+                                .strip_prefix("0o")
+                                .or_else(|| raw_perm.strip_prefix("0O"))
+                            {
+                                u32::from_str_radix(rest, 8).ok()
+                            } else if raw_perm.starts_with('0')
+                                && raw_perm.chars().all(|c| ('0'..='7').contains(&c))
+                            {
+                                u32::from_str_radix(raw_perm, 8).ok()
+                            } else {
+                                parse_tcl_int(raw_perm).map(|v| v as u32)
+                            };
+                            if let Some(mode) = mode_opt {
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    fs::set_permissions(&p, fs::Permissions::from_mode(mode))
+                                        .map_err(|e| TclControl::Error(e.to_string()))?;
+                                }
+                                #[cfg(not(unix))]
+                                {
+                                    let mut perms = fs::metadata(&p)
+                                        .map_err(|e| TclControl::Error(e.to_string()))?
+                                        .permissions();
+                                    perms.set_readonly((mode & 0o200) == 0);
+                                    fs::set_permissions(&p, perms)
+                                        .map_err(|e| TclControl::Error(e.to_string()))?;
+                                }
+                            }
+                        }
+                        "-readonly" => {
+                            let ro = parse_tcl_bool(&args[i + 1]).unwrap_or(false);
+                            let mut perms = fs::metadata(&p)
+                                .map_err(|e| TclControl::Error(e.to_string()))?
+                                .permissions();
+                            perms.set_readonly(ro);
+                            fs::set_permissions(&p, perms)
+                                .map_err(|e| TclControl::Error(e.to_string()))?;
+                        }
+                        _ => {}
+                    }
+                    i += 2;
+                }
+                Ok(String::new())
             }
             "size" => {
                 let p = self.resolve_path(args.get(1).map_or("", String::as_str));

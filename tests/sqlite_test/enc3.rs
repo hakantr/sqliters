@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "10/11 subtests passed; pending: ATTACH"]
+#[ignore = "4/11 subtests passed; pending: UTF-16, shared_cache"]
 fn test_enc3() {
     sqliters_tcltest::run_test_script(
         "enc3",

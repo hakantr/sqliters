@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "3/18 subtests passed; pending: TRIGGER"]
+#[ignore = "5/18 subtests passed; pending: TRIGGER"]
 fn test_insert3() {
     sqliters_tcltest::run_test_script(
         "insert3",

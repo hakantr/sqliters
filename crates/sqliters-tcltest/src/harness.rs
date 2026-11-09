@@ -1,5 +1,6 @@
 //! SQLite `testfixture` + `tester.tcl` host environment bound to `sqliters_core::Connection`
 //! and real owned `sqliters_core::Statement` handles.
+#![forbid(unsafe_code)]
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -7,14 +8,15 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use sqliters_core::{
     CloseError, Connection, ConnectionOpenOptions, PrepareMode, Row, Statement, StepResult,
     WalCheckpointMode,
 };
 use sqliters_types::{ErrorCode, LockGeometry, SqliteError, Value, extended, format_sqlite_real};
-use sqliters_vfs::OpenFlags;
+use sqliters_vfs::{LockLevel, OpenFlags, OsVfs, ShmOpenOptions, SyncFlags, Vfs, VfsFile, WalShm};
 
 use crate::expr::{eval_expr, parse_tcl_bool, parse_tcl_float, parse_tcl_int};
 use crate::interp::{TclControl, TclInterp, TclResult};
@@ -201,11 +203,12 @@ const DEFAULT_HOST_BUILTINS: &[(&str, &str)] = &[
     ("sqlite3_wal_checkpoint_v2", "sqlite3_wal_checkpoint_v2"),
     ("sqlite3_wal_autocheckpoint", "sqlite3_wal_autocheckpoint"),
     ("file_control_persist_wal", "file_control_persist_wal"),
+    ("sqlite3_db_filename", "sqlite3_db_filename"),
+    ("sqlite3_limit", "sqlite3_limit"),
     ("decode_hexdb", "decode_hexdb"),
     ("sqlite3_db_config", "noop_zero"),
     ("sqlite3_db_config_lookaside", "noop_zero"),
     ("sqlite3_test_control", "noop_zero"),
-    ("sqlite3_limit", "noop_zero"),
     ("sqlite3_soft_heap_limit", "noop_zero"),
     ("sqlite3_soft_heap_limit64", "noop_zero"),
     ("sqlite3_hard_heap_limit64", "noop_zero"),
@@ -249,6 +252,7 @@ const DEFAULT_HOST_BUILTINS: &[(&str, &str)] = &[
 pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     // Verified Phase 1.1 + Phase 1.2 SQL, B-tree, pager, WAL, VFS, and lifecycle capabilities:
     ("altertable", true),
+    ("attach", true),
     ("autoinc", true),
     ("autoreset", true),
     ("autovacuum", true),
@@ -265,6 +269,7 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("datetime", true),
     ("default_cksum", true),
     ("descidx", true),
+    ("dirsync", cfg!(unix)),
     ("diskio", true),
     ("explain", true),
     ("expr_depth", true),
@@ -290,6 +295,7 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("schema_version", true),
     ("subquery", true),
     ("tclvar", true),
+    ("tempdb", true),
     ("threadsafe", true),
     ("truncate_opt", true),
     ("vacuum", true),
@@ -298,7 +304,6 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     // Explicitly disabled (future phases or out of scope):
     ("analyze", false),
     ("atomicwrite", false),
-    ("attach", false),
     ("auth", false),
     ("bitvec_test", false),
     ("case_sensitive_like", false),
@@ -329,7 +334,6 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("rtree", false),
     ("shared_cache", false),
     ("stat4", false),
-    ("tempdb", false),
     ("trace", false),
     ("trigger", false),
     ("unlock_notify", false),
@@ -349,6 +353,191 @@ pub fn phase1_capability(name: &str) -> Option<bool> {
         .map(|&(_, v)| v)
 }
 
+#[derive(Default)]
+struct HarnessVfsCounters {
+    sync_count: AtomicI64,
+    fullsync_count: AtomicI64,
+    open_file_count: AtomicI64,
+    opentemp_count: AtomicI64,
+}
+
+struct HarnessVfs {
+    inner: OsVfs,
+    counters: Arc<HarnessVfsCounters>,
+}
+
+struct HarnessVfsFile {
+    inner: Box<dyn VfsFile>,
+    counters: Arc<HarnessVfsCounters>,
+    pending_dir_sync: AtomicBool,
+    closed: AtomicBool,
+}
+
+impl HarnessVfsFile {
+    fn mark_closed(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.counters
+                .open_file_count
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for HarnessVfsFile {
+    fn drop(&mut self) {
+        self.mark_closed();
+    }
+}
+
+impl VfsFile for HarnessVfsFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> sqliters_types::Result<usize> {
+        self.inner.read_at(buf, offset)
+    }
+
+    fn write_at(&self, buf: &[u8], offset: u64) -> sqliters_types::Result<()> {
+        self.inner.write_at(buf, offset)
+    }
+
+    fn truncate(&self, size: u64) -> sqliters_types::Result<()> {
+        self.inner.truncate(size)
+    }
+
+    fn sync(&self, flags: SyncFlags) -> sqliters_types::Result<()> {
+        self.inner.sync(flags)?;
+        self.counters.sync_count.fetch_add(1, Ordering::Relaxed);
+        if flags == SyncFlags::Full {
+            self.counters.fullsync_count.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.pending_dir_sync.swap(false, Ordering::AcqRel) {
+            self.counters.sync_count.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn file_size(&self) -> sqliters_types::Result<u64> {
+        self.inner.file_size()
+    }
+
+    fn lock(&self, level: LockLevel) -> sqliters_types::Result<()> {
+        self.inner.lock(level)
+    }
+
+    fn unlock(&self, level: LockLevel) -> sqliters_types::Result<()> {
+        self.inner.unlock(level)
+    }
+
+    fn check_reserved_lock(&self) -> sqliters_types::Result<bool> {
+        self.inner.check_reserved_lock()
+    }
+
+    fn lock_level(&self) -> LockLevel {
+        self.inner.lock_level()
+    }
+
+    fn lock_state_for_diagnostics(&self) -> sqliters_types::Result<Option<LockLevel>> {
+        self.inner.lock_state_for_diagnostics()
+    }
+
+    fn close(&mut self) -> sqliters_types::Result<()> {
+        let res = self.inner.close();
+        self.mark_closed();
+        res
+    }
+
+    fn open_wal_shm(&self) -> sqliters_types::Result<WalShm> {
+        self.inner.open_wal_shm()
+    }
+
+    fn open_wal_shm_with_options(&self, options: ShmOpenOptions) -> sqliters_types::Result<WalShm> {
+        self.inner.open_wal_shm_with_options(options)
+    }
+
+    fn supports_wal_shm(&self) -> bool {
+        self.inner.supports_wal_shm()
+    }
+
+    fn device_characteristics(&self) -> u32 {
+        self.inner.device_characteristics()
+    }
+
+    fn sector_size(&self) -> u32 {
+        self.inner.sector_size()
+    }
+
+    fn is_readonly(&self) -> bool {
+        self.inner.is_readonly()
+    }
+}
+
+impl Vfs for HarnessVfs {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn lock_geometry(&self) -> LockGeometry {
+        self.inner.lock_geometry()
+    }
+
+    fn open(
+        &self,
+        path: Option<&Path>,
+        flags: OpenFlags,
+    ) -> sqliters_types::Result<Box<dyn VfsFile>> {
+        let file = self.inner.open(path, flags)?;
+        self.counters
+            .open_file_count
+            .fetch_add(1, Ordering::Relaxed);
+        if path.is_none()
+            || flags.contains(OpenFlags::TEMP_DB)
+            || flags.contains(OpenFlags::SUBJOURNAL)
+            || flags.contains(OpenFlags::TRANSIENT_DB)
+        {
+            self.counters.opentemp_count.fetch_add(1, Ordering::Relaxed);
+        }
+        let needs_dir_sync = cfg!(unix)
+            && flags.contains(OpenFlags::CREATE)
+            && !flags.contains(OpenFlags::DELETEONCLOSE)
+            && (flags.contains(OpenFlags::MAIN_JOURNAL)
+                || flags.contains(OpenFlags::SUPER_JOURNAL)
+                || flags.contains(OpenFlags::WAL));
+        Ok(Box::new(HarnessVfsFile {
+            inner: file,
+            counters: Arc::clone(&self.counters),
+            pending_dir_sync: AtomicBool::new(needs_dir_sync),
+            closed: AtomicBool::new(false),
+        }))
+    }
+
+    fn delete(&self, path: &Path, sync_dir: bool) -> sqliters_types::Result<()> {
+        let existed = path.exists();
+        self.inner.delete(path, sync_dir)?;
+        if cfg!(unix) && sync_dir && existed {
+            self.counters.sync_count.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn exists(&self, path: &Path) -> sqliters_types::Result<bool> {
+        self.inner.exists(path)
+    }
+
+    fn full_pathname(&self, path: &Path) -> sqliters_types::Result<PathBuf> {
+        self.inner.full_pathname(path)
+    }
+
+    fn randomness(&self, buf: &mut [u8]) {
+        self.inner.randomness(buf);
+    }
+
+    fn sleep(&self, microseconds: u64) {
+        self.inner.sleep(microseconds);
+    }
+
+    fn current_time_int64(&self) -> i64 {
+        self.inner.current_time_int64()
+    }
+}
+
 pub struct SqliteTestHost {
     cmd_table: HashMap<String, HostCmdTarget>,
     dbs: HashMap<DbId, DbSlot>,
@@ -359,6 +548,8 @@ pub struct SqliteTestHost {
     active_evals: usize,
     default_page_size: u32,
     lock_geometry: LockGeometry,
+    vfs_counters: Arc<HarnessVfsCounters>,
+    disk_vfs: Arc<dyn Vfs>,
     pub report: TestFileReport,
     pub sqlite_test_dir: PathBuf,
     pub source_roots: Vec<PathBuf>,
@@ -383,6 +574,13 @@ impl SqliteTestHost {
             cmd_table.insert(name.to_string(), HostCmdTarget::Builtin(target));
         }
 
+        let lock_geometry = LockGeometry::test_64k();
+        let vfs_counters = Arc::new(HarnessVfsCounters::default());
+        let disk_vfs: Arc<dyn Vfs> = Arc::new(HarnessVfs {
+            inner: OsVfs::with_lock_geometry(lock_geometry),
+            counters: Arc::clone(&vfs_counters),
+        });
+
         Rc::new(RefCell::new(Self {
             cmd_table,
             dbs: HashMap::new(),
@@ -392,7 +590,9 @@ impl SqliteTestHost {
             next_stmt_id: 1,
             active_evals: 0,
             default_page_size: TESTFIXTURE_DEFAULT_PAGE_SIZE,
-            lock_geometry: LockGeometry::test_64k(),
+            lock_geometry,
+            vfs_counters,
+            disk_vfs,
             report: TestFileReport {
                 file_name: file_name.to_string(),
                 passed: 0,
@@ -435,6 +635,10 @@ impl SqliteTestHost {
             temp_store_memory: false,
             ..ConnectionOpenOptions::default()
         }
+    }
+
+    fn disk_vfs(&self) -> Arc<dyn Vfs> {
+        Arc::clone(&self.disk_vfs)
     }
 
     fn resolve_db_id(&self, raw_token: &str) -> Option<DbId> {
@@ -658,7 +862,66 @@ pub(crate) fn set_pending_byte_str(host: &SharedHost, raw: &str) -> Result<u64, 
         );
     }
     h.lock_geometry = new_geom;
+    h.disk_vfs = Arc::new(HarnessVfs {
+        inner: OsVfs::with_lock_geometry(new_geom),
+        counters: Arc::clone(&h.vfs_counters),
+    });
     Ok(old)
+}
+
+pub(crate) fn is_vfs_counter_var(name: &str) -> bool {
+    matches!(
+        name,
+        "sqlite_sync_count"
+            | "sqlite_fullsync_count"
+            | "sqlite_open_file_count"
+            | "sqlite_opentemp_count"
+    )
+}
+
+pub(crate) fn get_vfs_counter_str(host: &SharedHost, name: &str) -> Option<String> {
+    let h = host.borrow();
+    match name {
+        "sqlite_sync_count" => Some(
+            h.vfs_counters
+                .sync_count
+                .load(Ordering::Relaxed)
+                .to_string(),
+        ),
+        "sqlite_fullsync_count" => Some(
+            h.vfs_counters
+                .fullsync_count
+                .load(Ordering::Relaxed)
+                .to_string(),
+        ),
+        "sqlite_open_file_count" => Some(
+            h.vfs_counters
+                .open_file_count
+                .load(Ordering::Relaxed)
+                .to_string(),
+        ),
+        "sqlite_opentemp_count" => Some(
+            h.vfs_counters
+                .opentemp_count
+                .load(Ordering::Relaxed)
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+pub(crate) fn set_vfs_counter_str(host: &SharedHost, name: &str, raw: &str) -> Result<(), String> {
+    let val =
+        parse_tcl_int(raw.trim()).ok_or_else(|| format!("expected integer but got \"{raw}\""))?;
+    let h = host.borrow();
+    match name {
+        "sqlite_sync_count" => h.vfs_counters.sync_count.store(val, Ordering::Relaxed),
+        "sqlite_fullsync_count" => h.vfs_counters.fullsync_count.store(val, Ordering::Relaxed),
+        "sqlite_open_file_count" => h.vfs_counters.open_file_count.store(val, Ordering::Relaxed),
+        "sqlite_opentemp_count" => h.vfs_counters.opentemp_count.store(val, Ordering::Relaxed),
+        _ => {}
+    }
+    Ok(())
 }
 
 pub fn bootstrap_tester(
@@ -666,7 +929,7 @@ pub fn bootstrap_tester(
     host: &SharedHost,
     temp_dir: &Path,
 ) -> TclResult<()> {
-    let (test_dir_str, argv0_str, open_opts) = {
+    let (test_dir_str, argv0_str, open_opts, vfs) = {
         let h = host.borrow();
         let script_file = if h.report.file_name.ends_with(".test") {
             h.report.file_name.clone()
@@ -680,13 +943,17 @@ pub fn bootstrap_tester(
                 .to_string_lossy()
                 .into_owned(),
             h.open_options(),
+            h.disk_vfs(),
         )
     };
     let _ = interp.set_var("testdir", test_dir_str);
     let _ = interp.set_var("argv0", argv0_str);
     let _ = interp.set_var("argv", String::new());
     let _ = interp.set_var("AUTOVACUUM", "0".to_string());
+    let _ = interp.set_var("TEMP_STORE", "1".to_string());
     let _ = interp.set_var("sqlite_open_file_count", "0".to_string());
+    let _ = interp.set_var("sqlite_sync_count", "0".to_string());
+    let _ = interp.set_var("sqlite_fullsync_count", "0".to_string());
     let _ = interp.set_var("sqlite_search_count", "0".to_string());
     let _ = interp.set_var("sqlite_like_count", "0".to_string());
     let _ = interp.set_var("sqlite_sort_count", "0".to_string());
@@ -695,6 +962,7 @@ pub fn bootstrap_tester(
     let _ = interp.set_var("sqlite_current_time", "0".to_string());
     let _ = interp.set_var("tcl_precision", "15".to_string());
     let _ = interp.set_var("bitmask_size", "64".to_string());
+    let _ = interp.set_var("SQLITE_MAX_ATTACHED", "10".to_string());
     let _ = interp.set_var("SQLITE_MAX_EXPR_DEPTH", "1000".to_string());
     let _ = interp.set_var("SQLITE_MAX_VARIABLE_NUMBER", "999".to_string());
     let _ = interp.set_var("SQLITE_MAX_COLUMN", "2000".to_string());
@@ -717,8 +985,9 @@ pub fn bootstrap_tester(
 
     let db_path = temp_dir.join("test.db");
     let _ = fs::remove_file(&db_path);
-    let conn = Connection::open_with_options(
-        &db_path,
+    let conn = Connection::open_with_vfs_and_options(
+        vfs,
+        Some(&db_path),
         OpenFlags::READWRITE | OpenFlags::CREATE,
         open_opts,
     )
@@ -1074,6 +1343,8 @@ fn dispatch_host_builtin(
         "sqlite3_wal_checkpoint_v2" => cmd_wal_checkpoint_v2(host, args),
         "sqlite3_wal_autocheckpoint" => cmd_wal_autocheckpoint(host, args),
         "file_control_persist_wal" => cmd_file_control_persist_wal(host, invoked_name, args),
+        "sqlite3_db_filename" => cmd_db_filename(host, invoked_name, args),
+        "sqlite3_limit" => cmd_sqlite3_limit(host, invoked_name, args),
         "decode_hexdb" => cmd_decode_hexdb(args),
         "noop_zero" => Ok("0".to_string()),
         _ => Err(TclControl::Error(format!(
@@ -1125,12 +1396,14 @@ fn open_db_cmd(host: &SharedHost, interp: &mut TclInterp, args: &[String]) -> Tc
 
     let mut readonly = false;
     let mut create = true;
+    let mut uri = false;
     let mut requested_vfs: Option<&str> = None;
     let mut i = 2;
     while i + 1 < args.len() {
         match args[i].as_str() {
             "-readonly" => readonly = parse_tcl_bool(&args[i + 1]).unwrap_or(false),
             "-create" => create = parse_tcl_bool(&args[i + 1]).unwrap_or(true),
+            "-uri" => uri = parse_tcl_bool(&args[i + 1]).unwrap_or(false),
             "-vfs" => requested_vfs = Some(args[i + 1].as_str()),
             _ => {}
         }
@@ -1144,25 +1417,40 @@ fn open_db_cmd(host: &SharedHost, interp: &mut TclInterp, args: &[String]) -> Tc
         return Err(TclControl::Error(format!("no such vfs: {vfs_name}")));
     }
 
-    let opts = host.borrow().open_options();
+    let (mut opts, vfs) = {
+        let h = host.borrow();
+        (h.open_options(), h.disk_vfs())
+    };
+    opts.uri = uri;
+    let mut base_flags = if readonly {
+        OpenFlags::READONLY
+    } else if create {
+        OpenFlags::READWRITE | OpenFlags::CREATE
+    } else {
+        OpenFlags::READWRITE
+    };
+    if uri {
+        base_flags = OpenFlags(base_flags.0 | OpenFlags::URI.0);
+    }
+
     let conn = if raw_path.is_empty() {
-        Connection::open_private_temporary_with_options(opts)
+        Connection::open_with_vfs_and_options(vfs, None, base_flags, opts)
             .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?
     } else if raw_path == ":memory:" {
-        Connection::open_in_memory_with_options(opts)
+        Connection::open_with_vfs_and_options(
+            vfs,
+            Some(Path::new(":memory:")),
+            OpenFlags(base_flags.0 | OpenFlags::MEMORY.0),
+            opts,
+        )
+        .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?
+    } else if uri && raw_path.starts_with("file:") {
+        let resolved_uri = resolve_file_uri_in_cwd(raw_path, &interp.cwd);
+        Connection::open_with_vfs_and_options(vfs, Some(Path::new(&resolved_uri)), base_flags, opts)
             .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?
     } else {
-        let clean_path = raw_path.strip_prefix("file:").unwrap_or(raw_path);
-        let clean_path = clean_path.split('?').next().unwrap_or(clean_path);
-        let resolved = interp.resolve_path(clean_path);
-        let flags = if readonly {
-            OpenFlags::READONLY
-        } else if create {
-            OpenFlags::READWRITE | OpenFlags::CREATE
-        } else {
-            OpenFlags::READWRITE
-        };
-        Connection::open_with_options(resolved, flags, opts)
+        let resolved = interp.resolve_path(raw_path);
+        Connection::open_with_vfs_and_options(vfs, Some(&resolved), base_flags, opts)
             .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?
     };
     let _ = conn.set_working_dir(Some(interp.cwd.clone()));
@@ -2263,6 +2551,86 @@ fn cmd_file_control_persist_wal(
     }
 }
 
+fn resolve_file_uri_in_cwd(raw_uri: &str, cwd: &Path) -> String {
+    let rest = &raw_uri["file:".len()..];
+    let q_idx = rest.find(['?', '#']).unwrap_or(rest.len());
+    let path_part = &rest[..q_idx];
+    let tail_part = &rest[q_idx..];
+    let query_lower = tail_part.to_ascii_lowercase();
+    if path_part.is_empty()
+        || path_part.starts_with('/')
+        || query_lower.contains("mode=memory")
+        || path_part == ":memory:"
+    {
+        return raw_uri.to_string();
+    }
+    let abs = cwd.join(path_part);
+    format!("file:{}{tail_part}", abs.to_string_lossy())
+}
+
+fn cmd_db_filename(host: &SharedHost, cmd_name: &str, args: &[String]) -> TclResult<String> {
+    if args.len() != 2 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{cmd_name} DB SCHEMA\""
+        )));
+    }
+    let conn = {
+        let h = host.borrow();
+        let db_id = h
+            .resolve_db_id(&args[0])
+            .ok_or_else(|| TclControl::Error(format!("not a database: {}", args[0])))?;
+        let Some(DbSlot::Present(db)) = h.dbs.get(&db_id) else {
+            return Err(TclControl::Error(format!("not a database: {}", args[0])));
+        };
+        Rc::clone(&db.conn)
+    };
+    Ok(conn
+        .db_filename(&args[1])
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default())
+}
+
+fn cmd_sqlite3_limit(host: &SharedHost, cmd_name: &str, args: &[String]) -> TclResult<String> {
+    if args.len() != 3 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{cmd_name} DB LIMIT-TYPE VALUE\""
+        )));
+    }
+    let conn = {
+        let h = host.borrow();
+        let db_id = h
+            .resolve_db_id(&args[0])
+            .ok_or_else(|| TclControl::Error(format!("not a database: {}", args[0])))?;
+        let Some(DbSlot::Present(db)) = h.dbs.get(&db_id) else {
+            return Err(TclControl::Error(format!("not a database: {}", args[0])));
+        };
+        Rc::clone(&db.conn)
+    };
+    let val = parse_tcl_int(args[2].trim())
+        .ok_or_else(|| TclControl::Error(format!("expected integer but got \"{}\"", args[2])))?;
+    let limit_name = args[1].trim();
+    match limit_name {
+        "SQLITE_LIMIT_ATTACHED" | "7" => {
+            let prev = conn.set_attached_limit(val as isize);
+            Ok(prev.to_string())
+        }
+        "SQLITE_LIMIT_LENGTH" | "0" => Ok("1000000000".to_string()),
+        "SQLITE_LIMIT_SQL_LENGTH" | "1" => Ok("1000000000".to_string()),
+        "SQLITE_LIMIT_COLUMN" | "2" => Ok("2000".to_string()),
+        "SQLITE_LIMIT_EXPR_DEPTH" | "3" => Ok("1000".to_string()),
+        "SQLITE_LIMIT_COMPOUND_SELECT" | "4" => Ok("500".to_string()),
+        "SQLITE_LIMIT_VDBE_OP" | "5" => Ok("250000000".to_string()),
+        "SQLITE_LIMIT_FUNCTION_ARG" | "6" => Ok("127".to_string()),
+        "SQLITE_LIMIT_LIKE_PATTERN_LENGTH" | "8" => Ok("50000".to_string()),
+        "SQLITE_LIMIT_VARIABLE_NUMBER" | "9" => Ok("999".to_string()),
+        "SQLITE_LIMIT_TRIGGER_DEPTH" | "10" => Ok("1000".to_string()),
+        "SQLITE_LIMIT_WORKER_THREADS" | "11" => Ok("0".to_string()),
+        _ => Err(TclControl::Error(format!(
+            "unknown limit type: {limit_name}"
+        ))),
+    }
+}
+
 fn cmd_ifcapable(host: &SharedHost, interp: &mut TclInterp, args: &[String]) -> TclResult<String> {
     if args.len() < 2 {
         return Err(TclControl::Error("wrong # args to ifcapable".to_string()));
@@ -2353,11 +2721,18 @@ fn cmd_reset_db(host: &SharedHost, interp: &mut TclInterp) -> TclResult<String> 
     }
 
     // 3. Reopen `"db"` with the `testfixture` profile (`1024` page size + domain `LockGeometry`).
-    let opts = host.borrow().open_options();
+    let (opts, vfs) = {
+        let h = host.borrow();
+        (h.open_options(), h.disk_vfs())
+    };
     let db_path = interp.resolve_path("test.db");
-    let conn =
-        Connection::open_with_options(db_path, OpenFlags::READWRITE | OpenFlags::CREATE, opts)
-            .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    let conn = Connection::open_with_vfs_and_options(
+        vfs,
+        Some(&db_path),
+        OpenFlags::READWRITE | OpenFlags::CREATE,
+        opts,
+    )
+    .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
     let _ = conn.set_working_dir(Some(interp.cwd.clone()));
     let _ = conn.set_enable_test_functions(true);
 
@@ -3516,6 +3891,7 @@ pub fn sqlite_err_name(code: i32) -> &'static str {
         extended::SQLITE_READONLY_DIRECTORY => "SQLITE_READONLY_DIRECTORY",
         extended::SQLITE_ABORT_ROLLBACK => "SQLITE_ABORT_ROLLBACK",
         extended::SQLITE_CONSTRAINT_CHECK => "SQLITE_CONSTRAINT_CHECK",
+        extended::SQLITE_CONSTRAINT_COMMITHOOK => "SQLITE_CONSTRAINT_COMMITHOOK",
         extended::SQLITE_CONSTRAINT_FOREIGNKEY => "SQLITE_CONSTRAINT_FOREIGNKEY",
         extended::SQLITE_CONSTRAINT_NOTNULL => "SQLITE_CONSTRAINT_NOTNULL",
         extended::SQLITE_CONSTRAINT_PRIMARYKEY => "SQLITE_CONSTRAINT_PRIMARYKEY",
@@ -3880,4 +4256,22 @@ proc test_restore_config_pagecache {} {
 proc do_faultsim_test {args} {}
 proc do_malloc_test {args} {}
 proc do_ioerr_test {args} {}
+
+proc faultsim_save {args} { uplevel [linsert $args 0 db_save] }
+proc faultsim_save_and_close {args} { uplevel [linsert $args 0 db_save_and_close] }
+proc faultsim_restore {args} { uplevel [linsert $args 0 db_restore] }
+proc faultsim_restore_and_reopen {args} {
+  uplevel [linsert $args 0 db_restore_and_reopen]
+  sqlite3_extended_result_codes db 1
+  sqlite3_db_config_lookaside db 0 0 0
+}
+proc faultsim_delete_and_reopen {args} {
+  uplevel [linsert $args 0 db_delete_and_reopen]
+  sqlite3_extended_result_codes db 1
+  sqlite3_db_config_lookaside db 0 0 0
+}
+proc faultsim_integrity_check {{db db}} {
+  set ic [$db eval { PRAGMA integrity_check }]
+  if {$ic != "ok"} { error "Integrity check: $ic" }
+}
 "#;

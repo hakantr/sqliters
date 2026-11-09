@@ -1,5 +1,6 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "2/3 subtests passed; pending: TEMP TABLE, C testfixture hooks"]
 fn test_pragma6() {
     sqliters_tcltest::run_test_script(
         "pragma6",

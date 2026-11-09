@@ -1,5 +1,6 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "29/31 subtests passed; pending: VIRTUAL TABLE, TEMP TABLE"]
 fn test_insert2() {
     sqliters_tcltest::run_test_script(
         "insert2",

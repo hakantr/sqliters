@@ -55,6 +55,8 @@ pub const CORE_SQL_FAMILIES: &[&str] = &[
     "wal",
     "autovacuum",
     "incrvacuum",
+    "attach",
+    "tempdb",
 ];
 
 pub const CORE_SQL_EXACT: &[&str] = &[
@@ -247,6 +249,7 @@ impl SuiteItemOutcome {
 fn main() {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let mut verbose = false;
+    let mut list_only = false;
     let mut manifest_only = false;
     let mut manifest_path = PathBuf::from("tests/sqlite_test_manifest.json");
     let mut phase_filter: Option<String> = None;
@@ -257,6 +260,9 @@ fn main() {
         let a = &raw_args[idx];
         if a == "-v" || a == "--verbose" {
             verbose = true;
+            idx += 1;
+        } else if a == "--list" {
+            list_only = true;
             idx += 1;
         } else if a == "--manifest" {
             manifest_only = true;
@@ -305,6 +311,36 @@ fn main() {
     if total_files == 0 {
         eprintln!("No matching .test files found.");
         std::process::exit(1);
+    }
+
+    if list_only {
+        let mut active_cnt = 0usize;
+        let mut ignored_cnt = 0usize;
+        let mut unmanifested_cnt = 0usize;
+        for path in &files {
+            if let Some(me) = manifest.iter().find(|e| &e.source_path == path) {
+                if me.status == "active" {
+                    active_cnt += 1;
+                    println!("ACTIVE  [phase {:>4}] {}", me.target_phase, path.display());
+                } else {
+                    ignored_cnt += 1;
+                    println!(
+                        "IGNORED [phase {:>4}] {} ({})",
+                        me.target_phase,
+                        path.display(),
+                        me.ignore_reason
+                    );
+                }
+            } else {
+                unmanifested_cnt += 1;
+                println!("CORE    [static    ] {}", path.display());
+            }
+        }
+        println!(
+            "Total listed: {} ({} manifest-active, {} manifest-ignored, {} core-static)",
+            total_files, active_cnt, ignored_cnt, unmanifested_cnt
+        );
+        return;
     }
 
     // Respect manifest `ignored` status unless explicitly running individual named stems without

@@ -19,6 +19,21 @@ mod alter3;
 #[path = "sqlite_test/alter4.rs"]
 mod alter4;
 #[allow(non_snake_case)]
+#[path = "sqlite_test/attach.rs"]
+mod attach;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/attach2.rs"]
+mod attach2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/attach3.rs"]
+mod attach3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/attach4.rs"]
+mod attach4;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/attachmalloc.rs"]
+mod attachmalloc;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/autoinc.rs"]
 mod autoinc;
 #[allow(non_snake_case)]
@@ -543,6 +558,12 @@ mod subquery2;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/table.rs"]
 mod table;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/tempdb.rs"]
+mod tempdb;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/tempdb2.rs"]
+mod tempdb2;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/trans.rs"]
 mod trans;

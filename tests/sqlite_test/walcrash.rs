@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "requires C crash fault-injection VFS (-vfs crash) and Phase 2 ATTACH"]
+#[ignore = "requires C crash fault-injection VFS (-vfs crash)"]
 fn test_walcrash() {
     let raw = include_str!("../../sqlite/test/walcrash.test");
     let script = sqliters_tcltest::strip_test_comments(raw);

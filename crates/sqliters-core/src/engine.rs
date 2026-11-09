@@ -1,4 +1,5 @@
 //! Relational SQL query engine, DML/DDL executor, constraint & index manager, `VACUUM`, and `PRAGMA`s.
+#![forbid(unsafe_code)]
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -14084,8 +14085,9 @@ pub(crate) fn validate_and_infer_columns(
             key,
         } => {
             let mut visited = Vec::new();
+            let norm_file = normalize_attach_schema_expr(expr);
             validate_expr_static(
-                expr,
+                &norm_file,
                 &[],
                 db_set,
                 &CteStore::default(),
@@ -14106,8 +14108,9 @@ pub(crate) fn validate_and_infer_columns(
                 &mut visited,
             )?;
             if let Some(k) = key {
+                let norm_key = normalize_attach_schema_expr(k);
                 validate_expr_static(
-                    k,
+                    &norm_key,
                     &[],
                     db_set,
                     &CteStore::default(),
@@ -15176,32 +15179,7 @@ fn validate_select_stmt_static(
     validate_cte_scope_static(&stmt.ctes)?;
     let ctes = parent_ctes.with_scope(&stmt.ctes);
 
-    if let Some(ref lim) = stmt.limit {
-        validate_expr_static(
-            &lim.limit,
-            outer_scopes,
-            db_set,
-            &ctes,
-            functions,
-            false,
-            false,
-            visited_ctes,
-        )?;
-        if let Some(ref off) = lim.offset {
-            validate_expr_static(
-                off,
-                outer_scopes,
-                db_set,
-                &ctes,
-                functions,
-                false,
-                false,
-                visited_ctes,
-            )?;
-        }
-    }
-
-    if stmt.body.compounds.is_empty() {
+    let result_cols = if stmt.body.compounds.is_empty() {
         validate_single_select_core_static(
             &stmt.body.head,
             &stmt.order_by,
@@ -15210,7 +15188,7 @@ fn validate_select_stmt_static(
             &ctes,
             functions,
             visited_ctes,
-        )
+        )?
     } else {
         let head_cols = validate_single_select_core_static(
             &stmt.body.head,
@@ -15284,8 +15262,35 @@ fn validate_select_stmt_static(
                 ));
             }
         }
-        Ok(head_cols)
+        head_cols
+    };
+
+    if let Some(ref lim) = stmt.limit {
+        validate_expr_static(
+            &lim.limit,
+            outer_scopes,
+            db_set,
+            &ctes,
+            functions,
+            false,
+            false,
+            visited_ctes,
+        )?;
+        if let Some(ref off) = lim.offset {
+            validate_expr_static(
+                off,
+                outer_scopes,
+                db_set,
+                &ctes,
+                functions,
+                false,
+                false,
+                visited_ctes,
+            )?;
+        }
     }
+
+    Ok(result_cols)
 }
 
 fn validate_single_select_core_static(

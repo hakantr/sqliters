@@ -1994,17 +1994,36 @@ impl Connection {
             }
         };
         let pager_opts = effective_options.to_pager_options(inferred_kind);
-        let disk_vfs = if inferred_kind == DatabaseKind::Memory && vfs.name() == "memdb" {
-            Arc::new(OsVfs::with_lock_geometry(effective_options.lock_geometry))
+        let (main_vfs, disk_vfs): (Arc<dyn Vfs>, Arc<dyn Vfs>) =
+            if inferred_kind == DatabaseKind::Memory {
+                let mem_vfs: Arc<dyn Vfs> = if vfs.name() == "memdb" {
+                    Arc::clone(&vfs)
+                } else {
+                    Arc::new(MemoryVfs::with_lock_geometry(
+                        effective_options.lock_geometry,
+                    ))
+                };
+                let d_vfs: Arc<dyn Vfs> = if vfs.name() == "memdb" {
+                    Arc::new(OsVfs::with_lock_geometry(effective_options.lock_geometry))
+                } else {
+                    vfs
+                };
+                (mem_vfs, d_vfs)
+            } else {
+                (Arc::clone(&vfs), vfs)
+            };
+        let btree = if inferred_kind == DatabaseKind::PrivateTemporary
+            && !flags.contains(OpenFlags::TEMP_DB)
+        {
+            Btree::open_private_temporary(main_vfs, pager_opts)?
         } else {
-            Arc::clone(&vfs)
+            let effective_flags = if inferred_kind == DatabaseKind::Memory {
+                OpenFlags((flags.0 & !OpenFlags::URI.0) | OpenFlags::MEMORY.0)
+            } else {
+                OpenFlags(flags.0 & !OpenFlags::URI.0)
+            };
+            Btree::open_with_options(main_vfs, path, effective_flags, pager_opts)?
         };
-        let btree = Btree::open_with_options(
-            vfs,
-            path,
-            OpenFlags(flags.0 & !OpenFlags::URI.0),
-            pager_opts,
-        )?;
         Self::from_btree_with_disk_vfs(btree, disk_vfs, effective_options, false)
     }
 
@@ -3157,6 +3176,212 @@ fn compile_parsed_stmt(
     })
 }
 
+fn select_references_temp_catalog(sel: &SelectStmt, db_set: &DatabaseSet) -> bool {
+    if sel
+        .ctes
+        .iter()
+        .any(|cte| select_references_temp_catalog(&cte.query, db_set))
+    {
+        return true;
+    }
+    let core_refs = |core: &SelectCore| -> bool {
+        match core {
+            SelectCore::Values(rows) => rows
+                .iter()
+                .any(|r| r.iter().any(|e| expr_references_temp_catalog(e, db_set))),
+            SelectCore::Select {
+                projection,
+                from,
+                selection,
+                group_by,
+                having,
+                ..
+            } => {
+                for rc in projection {
+                    if let ResultColumn::Expr { expr, .. } = rc
+                        && expr_references_temp_catalog(expr, db_set)
+                    {
+                        return true;
+                    }
+                }
+                if let Some(fc) = from {
+                    let tos_refs = |tos: &TableOrSubquery| -> bool {
+                        match tos {
+                            TableOrSubquery::Table { name, .. } => matches!(
+                                db_set.resolve_catalog_table(name),
+                                Ok(Some(DatabaseId::TEMP))
+                            ),
+                            TableOrSubquery::Subquery { query, .. } => {
+                                select_references_temp_catalog(query, db_set)
+                            }
+                        }
+                    };
+                    if tos_refs(&fc.head) {
+                        return true;
+                    }
+                    for j in &fc.joins {
+                        if tos_refs(&j.right) {
+                            return true;
+                        }
+                        if let Some(sqliters_syntax::JoinConstraint::On(ref e)) = j.constraint
+                            && expr_references_temp_catalog(e, db_set)
+                        {
+                            return true;
+                        }
+                    }
+                }
+                if let Some(w) = selection
+                    && expr_references_temp_catalog(w, db_set)
+                {
+                    return true;
+                }
+                if group_by
+                    .iter()
+                    .any(|g| expr_references_temp_catalog(g, db_set))
+                {
+                    return true;
+                }
+                if let Some(h) = having
+                    && expr_references_temp_catalog(h, db_set)
+                {
+                    return true;
+                }
+                false
+            }
+        }
+    };
+    if core_refs(&sel.body.head)
+        || sel.body.compounds.iter().any(|(_, c)| core_refs(c))
+        || sel
+            .order_by
+            .iter()
+            .any(|ob| expr_references_temp_catalog(&ob.expr, db_set))
+    {
+        return true;
+    }
+    if let Some(ref lim) = sel.limit {
+        if expr_references_temp_catalog(&lim.limit, db_set) {
+            return true;
+        }
+        if let Some(ref off) = lim.offset
+            && expr_references_temp_catalog(off, db_set)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn expr_references_temp_catalog(expr: &Expr, db_set: &DatabaseSet) -> bool {
+    match expr {
+        Expr::Unary { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => expr_references_temp_catalog(inner, db_set),
+        Expr::Binary { left, right, .. } => {
+            expr_references_temp_catalog(left, db_set)
+                || expr_references_temp_catalog(right, db_set)
+        }
+        Expr::Between {
+            expr: v, low, high, ..
+        } => {
+            expr_references_temp_catalog(v, db_set)
+                || expr_references_temp_catalog(low, db_set)
+                || expr_references_temp_catalog(high, db_set)
+        }
+        Expr::InList { expr: v, list, .. } => {
+            expr_references_temp_catalog(v, db_set)
+                || list
+                    .iter()
+                    .any(|item| expr_references_temp_catalog(item, db_set))
+        }
+        Expr::InSubquery {
+            expr: v, subquery, ..
+        } => {
+            expr_references_temp_catalog(v, db_set)
+                || select_references_temp_catalog(subquery, db_set)
+        }
+        Expr::InTable { table, .. } => matches!(
+            db_set.resolve_catalog_table(table),
+            Ok(Some(DatabaseId::TEMP))
+        ),
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
+            select_references_temp_catalog(subquery, db_set)
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|e| expr_references_temp_catalog(e, db_set))
+                || branches.iter().any(|(w, t)| {
+                    expr_references_temp_catalog(w, db_set)
+                        || expr_references_temp_catalog(t, db_set)
+                })
+                || else_expr
+                    .as_ref()
+                    .is_some_and(|e| expr_references_temp_catalog(e, db_set))
+        }
+        Expr::FunctionCall { args, filter, .. } => {
+            let args_ref = match args {
+                FunctionArgs::Exprs(es) => {
+                    es.iter().any(|e| expr_references_temp_catalog(e, db_set))
+                }
+                _ => false,
+            };
+            args_ref
+                || filter
+                    .as_ref()
+                    .is_some_and(|f| expr_references_temp_catalog(f, db_set))
+        }
+        Expr::RowValue(items) => items
+            .iter()
+            .any(|e| expr_references_temp_catalog(e, db_set)),
+        _ => false,
+    }
+}
+
+fn stmt_references_temp_catalog(stmt: &Stmt, db_set: &DatabaseSet) -> bool {
+    match stmt {
+        Stmt::Explain { .. } => false,
+        Stmt::Select(sel) => select_references_temp_catalog(sel, db_set),
+        Stmt::CreateTableAs { query, .. } => select_references_temp_catalog(query, db_set),
+        Stmt::Insert(ins) => {
+            matches!(
+                db_set.resolve_catalog_table(&ins.table),
+                Ok(Some(DatabaseId::TEMP))
+            ) || match &ins.source {
+                InsertSource::Select(sel) => select_references_temp_catalog(sel, db_set),
+                InsertSource::Values(rows) => rows
+                    .iter()
+                    .any(|r| r.iter().any(|e| expr_references_temp_catalog(e, db_set))),
+                InsertSource::DefaultValues => false,
+            }
+        }
+        Stmt::Update(upd) => {
+            matches!(
+                db_set.resolve_catalog_table(&upd.table),
+                Ok(Some(DatabaseId::TEMP))
+            ) || upd
+                .selection
+                .as_ref()
+                .is_some_and(|w| expr_references_temp_catalog(w, db_set))
+        }
+        Stmt::Delete(del) => {
+            matches!(
+                db_set.resolve_catalog_table(&del.table),
+                Ok(Some(DatabaseId::TEMP))
+            ) || del
+                .selection
+                .as_ref()
+                .is_some_and(|w| expr_references_temp_catalog(w, db_set))
+        }
+        _ => false,
+    }
+}
+
 fn apply_prepare_auto_vacuum_pragma(
     inner: &mut ConnectionInner,
     artifacts: &mut CompiledArtifacts,
@@ -3404,6 +3629,13 @@ impl Statement {
         let unparsed_tail = tail.to_owned();
 
         let needs_schema = stmt_opt.as_ref().is_some_and(stmt_loads_schema_on_prepare);
+        if !inner.db_set.is_temp_open()
+            && let Some(ref st) = stmt_opt
+            && stmt_references_temp_catalog(st, &inner.db_set)
+        {
+            let enc = inner.effective_encoding();
+            inner.db_set.ensure_temp_open(enc, inner.writable_schema)?;
+        }
         if needs_schema {
             inner.refresh_open_tx_schemas()?;
             let any_unloaded = inner
@@ -3762,6 +3994,13 @@ impl Statement {
 
     fn reprepare_in_open_tx(&mut self, inner: &mut ConnectionInner) -> Result<()> {
         for _ in 0..SQLITE_MAX_SCHEMA_RETRY {
+            if !inner.db_set.is_temp_open()
+                && let Ok((Some(ref st), _)) = parse_one(&self.raw_sql)
+                && stmt_references_temp_catalog(st, &inner.db_set)
+            {
+                let enc = inner.effective_encoding();
+                inner.db_set.ensure_temp_open(enc, inner.writable_schema)?;
+            }
             inner.refresh_open_tx_schemas()?;
             if self.stmt.as_ref().is_some_and(stmt_loads_schema_on_prepare) {
                 let any_unloaded = inner
