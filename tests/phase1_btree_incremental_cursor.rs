@@ -1112,7 +1112,7 @@ fn test_index_cursor_mid_scan_delete_interior_and_leaf_cells_and_splits() {
 // ============================================================================
 
 fn compare_tuple_ref(a: &[Value], b: &[Value], orders: &[KeySortOrder]) -> CmpOrdering {
-    for (i, spec) in orders.iter().copied().enumerate() {
+    for (i, spec) in orders.iter().enumerate() {
         let va = &a[i];
         let vb = &b[i];
         let ord = match (va.is_null(), vb.is_null()) {
@@ -1155,11 +1155,13 @@ fn test_multilevel_index_btree_inorder_asc_desc_nulls_and_overflow_keys() {
             desc: false,
             nulls_last: true, // ASC NULLS LAST
             collation: Collation::NoCase,
+            custom_collation: None,
         },
         KeySortOrder {
             desc: true,
             nulls_last: false, // DESC NULLS FIRST
             collation: Collation::Binary,
+            custom_collation: None,
         },
         KeySortOrder::default(), // trailing rowid ASC
     ];

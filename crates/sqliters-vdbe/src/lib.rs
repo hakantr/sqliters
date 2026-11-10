@@ -13,7 +13,7 @@ use sqliters_btree::{Btree, CursorId};
 use sqliters_types::{
     AggregateStepId, Collation, DatabaseId, ErrorCode, ExecutionServices, KeySortOrder, Pgno,
     Result, RuntimeValue, SqliteError, TextEncoding, TypeAffinity, Value,
-    decode_record_with_encoding, encode_record_with_encoding,
+    decode_record_with_encoding, encode_record_with_encoding, fallible_sort_by,
 };
 
 pub use functions::{
@@ -1361,9 +1361,7 @@ impl VdbeVm {
                     // p1 = cursor, p4 = KeyInfo(orders), IntArray encoded via p2.. or KeyInfo
                     let cid = ins.p1 as usize;
                     let orders = match &ins.p4 {
-                        P4::KeyInfo(k) => {
-                            k.iter().enumerate().map(|(idx, &ord)| (idx, ord)).collect()
-                        }
+                        P4::KeyInfo(k) => k.iter().cloned().enumerate().collect(),
                         _ => Vec::new(),
                     };
                     self.ensure_cursor_slot(cid);
@@ -1400,7 +1398,7 @@ impl VdbeVm {
                             let enc = storage
                                 .btree_ref(DatabaseId::MAIN)
                                 .map_or(TextEncoding::Utf8, Btree::encoding);
-                            rows.sort_by(|a, b| compare_sorter_rows(a, b, &specs, enc));
+                            fallible_sort_by(rows, |a, b| compare_sorter_rows(a, b, &specs, enc))?;
                             *pos = 0;
                         }
                     } else {
@@ -1865,10 +1863,10 @@ fn compare_sorter_rows(
     b: &[Value],
     specs: &[(usize, KeySortOrder)],
     enc: TextEncoding,
-) -> Ordering {
-    for &(col_idx, spec) in specs {
-        let va = &a[col_idx];
-        let vb = &b[col_idx];
+) -> Result<Ordering> {
+    for (col_idx, spec) in specs {
+        let va = &a[*col_idx];
+        let vb = &b[*col_idx];
         let ord = match (va.is_null(), vb.is_null()) {
             (true, true) => Ordering::Equal,
             (true, false) => {
@@ -1886,15 +1884,15 @@ fn compare_sorter_rows(
                 }
             }
             (false, false) => {
-                let raw = va.cmp_sqlite_with_encoding(vb, spec.collation, enc);
+                let raw = va.cmp_sqlite_fallible(vb, spec, enc)?;
                 if spec.desc { raw.reverse() } else { raw }
             }
         };
         if ord != Ordering::Equal {
-            return ord;
+            return Ok(ord);
         }
     }
-    Ordering::Equal
+    Ok(Ordering::Equal)
 }
 
 #[cfg(test)]

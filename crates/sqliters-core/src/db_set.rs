@@ -1212,6 +1212,16 @@ impl DatabaseSet {
         Ok(())
     }
 
+    /// Re-binds custom collations across all loaded schemas in all slots (`main`, `temp`, attached).
+    pub fn rebind_all_collations(
+        &mut self,
+        collations: &crate::execution_context::CollationRegistry,
+    ) {
+        for slot in &mut self.slots {
+            slot.schema.rebind_collations(collations);
+        }
+    }
+
     /// Implements `sqlite3_db_filename(db, zDbName)`: returns the canonical OS path for a named disk
     /// database, or `None` for `"temp"`, `:memory:`, `PrivateTemporary` (`""`), or unknown schemas.
     pub fn db_filename(&self, schema_name: &str) -> Option<&Path> {

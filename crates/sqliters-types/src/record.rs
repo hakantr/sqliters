@@ -12,7 +12,7 @@
 use std::cmp::Ordering;
 
 use crate::error::{Result, SqliteError};
-use crate::value::{Collation, TextEncoding, Value};
+use crate::value::{Collation, CustomCollation, TextEncoding, Value};
 use crate::varint::{get_varint, push_varint, varint_len};
 
 const MAX_6BYTE_INT: u64 = (0x0000_8000_u64 << 32) - 1; // 140_737_488_355_327
@@ -292,11 +292,12 @@ pub fn decode_record_column_with_encoding(
 }
 
 /// Sort-order specification for a single key column in an Index B-Tree (`KeyInfo` in `sqliteInt.h`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeySortOrder {
     pub desc: bool,
     pub nulls_last: bool,
     pub collation: Collation,
+    pub custom_collation: Option<CustomCollation>,
 }
 
 impl Default for KeySortOrder {
@@ -305,6 +306,21 @@ impl Default for KeySortOrder {
             desc: false,
             nulls_last: false,
             collation: Collation::Binary,
+            custom_collation: None,
+        }
+    }
+}
+
+impl KeySortOrder {
+    pub fn collation_name(&self) -> &str {
+        if let Some(ref cc) = self.custom_collation {
+            &cc.name
+        } else {
+            match self.collation {
+                Collation::Binary => "BINARY",
+                Collation::NoCase => "NOCASE",
+                Collation::RTrim => "RTRIM",
+            }
         }
     }
 }
@@ -328,8 +344,9 @@ pub fn compare_records_with_encoding(
 ) -> Result<Ordering> {
     let lhs_values = decode_record_with_encoding(lhs_record, enc)?;
     let n = lhs_values.len().min(rhs_values.len());
+    let default_spec = KeySortOrder::default();
     for i in 0..n {
-        let spec = orders.get(i).copied().unwrap_or_default();
+        let spec = orders.get(i).unwrap_or(&default_spec);
         let a = &lhs_values[i];
         let b = &rhs_values[i];
         let ord = match (a.is_null(), b.is_null()) {
@@ -349,7 +366,7 @@ pub fn compare_records_with_encoding(
                 }
             }
             (false, false) => {
-                let raw = a.cmp_sqlite_with_encoding(b, spec.collation, enc);
+                let raw = a.cmp_sqlite_fallible(b, spec, enc)?;
                 if spec.desc { raw.reverse() } else { raw }
             }
         };
@@ -358,6 +375,62 @@ pub fn compare_records_with_encoding(
         }
     }
     Ok(Ordering::Equal)
+}
+
+/// Stable fallible merge sort for slices whose comparator may return `Err(SqliteError)`
+/// (e.g. custom collation errors or panics).
+pub fn fallible_sort_by<T: Clone, F>(slice: &mut [T], mut compare: F) -> Result<()>
+where
+    F: FnMut(&T, &T) -> Result<Ordering>,
+{
+    fn merge_sort_rec<T: Clone, F>(
+        slice: &mut [T],
+        scratch: &mut [T],
+        compare: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&T, &T) -> Result<Ordering>,
+    {
+        let len = slice.len();
+        if len <= 1 {
+            return Ok(());
+        }
+        let mid = len / 2;
+        merge_sort_rec(&mut slice[..mid], &mut scratch[..mid], compare)?;
+        merge_sort_rec(&mut slice[mid..], &mut scratch[mid..], compare)?;
+
+        let mut i = 0;
+        let mut j = mid;
+        let mut k = 0;
+        while i < mid && j < len {
+            if compare(&slice[i], &slice[j])? != Ordering::Greater {
+                scratch[k] = slice[i].clone();
+                i += 1;
+            } else {
+                scratch[k] = slice[j].clone();
+                j += 1;
+            }
+            k += 1;
+        }
+        while i < mid {
+            scratch[k] = slice[i].clone();
+            i += 1;
+            k += 1;
+        }
+        while j < len {
+            scratch[k] = slice[j].clone();
+            j += 1;
+            k += 1;
+        }
+        slice.clone_from_slice(&scratch[..len]);
+        Ok(())
+    }
+
+    if slice.len() <= 1 {
+        return Ok(());
+    }
+    let mut scratch = slice.to_vec();
+    merge_sort_rec(slice, &mut scratch, &mut compare)
 }
 
 #[cfg(test)]

@@ -7,14 +7,64 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use sqliters_syntax::ConflictAction;
 use sqliters_types::{
-    AggregateStepId, Collation, DatabaseId, ErrorCode, ExecutionServices, FunctionFlags, Result,
-    RuntimeValue, SqliteError, TextEncoding, Value, enforce_result_subtype_contract, extended,
-    strip_unsubscribed_subtypes,
+    AggregateStepId, Collation, CustomCollation, DatabaseId, ErrorCode, ExecutionServices,
+    FunctionFlags, KeySortOrder, Result, RowMutationOp, RuntimeValue, SqliteError, TextEncoding,
+    Value, enforce_result_subtype_contract, extended, strip_unsubscribed_subtypes,
 };
 use sqliters_vdbe::{
     AggregateAccumulator, AggregateKind, VmRuntimeContext, eval_scalar_function_rt_with_strict,
     validate_function_call,
 };
+
+/// Extracts a human-readable message from a panic payload caught via `std::panic::catch_unwind`.
+pub fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "callback panicked".to_owned()
+    }
+}
+
+/// Invokes a fallible user callback inside `std::panic::catch_unwind`, converting any panic into
+/// `Err(SqliteError::new(ErrorCode::Error, ...))` so panics never unwind across internal B-tree,
+/// sorter, VM, or connection state.
+#[inline]
+pub fn catch_callback_panic<T, F>(label: &str, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(res) => res,
+        Err(payload) => {
+            let msg = panic_payload_message(payload.as_ref());
+            Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("{label} callback panicked: {msg}"),
+            ))
+        }
+    }
+}
+
+/// Invokes an infallible user callback inside `std::panic::catch_unwind`, converting any panic
+/// into `Err(SqliteError::new(ErrorCode::Error, ...))`.
+#[inline]
+pub fn catch_infallible_callback_panic<T, F>(label: &str, f: F) -> Result<T>
+where
+    F: FnOnce() -> T,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(val) => Ok(val),
+        Err(payload) => {
+            let msg = panic_payload_message(payload.as_ref());
+            Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("{label} callback panicked: {msg}"),
+            ))
+        }
+    }
+}
 
 /// Thread-safe callback type for registered scalar SQL functions.
 pub type ScalarFunctionCallback =
@@ -297,7 +347,7 @@ impl FunctionRegistry {
             let reg_name = def.name.clone();
             let mut scratch = Vec::new();
             let filtered = strip_unsubscribed_subtypes(flags, args, &mut scratch);
-            let result = callback(filtered)?;
+            let result = catch_callback_panic(&reg_name, || callback(filtered))?;
             return enforce_result_subtype_contract(&reg_name, flags, strict_subtype, result);
         }
         match eval_scalar_function_rt_with_strict(name, args, runtime_ctx, strict_subtype) {
@@ -318,10 +368,13 @@ impl FunctionRegistry {
 /// Thread-safe callback type for registered custom collations.
 pub type CollationCallback = Arc<dyn Fn(&str, &str) -> Ordering + Send + Sync>;
 
+/// Thread-safe callback type for fallible registered custom collations.
+pub type FallibleCollationCallback = Arc<dyn Fn(&str, &str) -> Result<Ordering> + Send + Sync>;
+
 /// Connection-level registry for built-in and custom collation sequences.
 #[derive(Default, Clone)]
 pub struct CollationRegistry {
-    custom: BTreeMap<String, CollationCallback>,
+    custom: BTreeMap<String, CustomCollation>,
 }
 
 impl std::fmt::Debug for CollationRegistry {
@@ -339,13 +392,43 @@ impl CollationRegistry {
         Self::default()
     }
 
-    /// Registers or replaces a custom collation sequence (ASCII case-insensitive name).
+    /// Registers or replaces an infallible custom collation sequence (ASCII case-insensitive name),
+    /// isolating any panic inside `std::panic::catch_unwind`.
     pub fn register_collation<F>(&mut self, name: impl Into<String>, callback: F)
     where
         F: Fn(&str, &str) -> Ordering + Send + Sync + 'static,
     {
-        self.custom
-            .insert(name.into().to_ascii_uppercase(), Arc::new(callback));
+        let name_str = name.into();
+        let label = format!("collation {name_str}");
+        self.register_fallible_collation(name_str, move |a, b| {
+            catch_infallible_callback_panic(&label, || callback(a, b))
+        });
+    }
+
+    /// Registers or replaces a fallible custom collation sequence (ASCII case-insensitive name),
+    /// isolating any panic inside `std::panic::catch_unwind`.
+    pub fn register_fallible_collation<F>(&mut self, name: impl Into<String>, callback: F)
+    where
+        F: Fn(&str, &str) -> Result<Ordering> + Send + Sync + 'static,
+    {
+        let name_str = name.into();
+        let key = name_str.to_ascii_uppercase();
+        let label = format!("collation {name_str}");
+        let cc = CustomCollation::new(name_str, move |a, b| {
+            catch_callback_panic(&label, || callback(a, b))
+        });
+        self.custom.insert(key, cc);
+    }
+
+    /// Removes a custom collation by name, returning `true` if it was present.
+    pub fn unregister_collation(&mut self, name: &str) -> bool {
+        self.custom.remove(&name.to_ascii_uppercase()).is_some()
+    }
+
+    /// Looks up a registered custom collation descriptor by name (ASCII case-insensitive).
+    #[inline]
+    pub fn get_custom(&self, name: &str) -> Option<CustomCollation> {
+        self.custom.get(&name.to_ascii_uppercase()).cloned()
     }
 
     /// Returns `true` if `name` resolves to either a registered custom collation or a built-in
@@ -355,7 +438,71 @@ impl CollationRegistry {
         self.custom.contains_key(&name.to_ascii_uppercase()) || Collation::from_name(name).is_some()
     }
 
-    /// Compares two UTF-8 strings under `name`, returning an error if the collation does not exist.
+    /// Resolves `name` into a [`KeySortOrder`], returning an error if `name` is neither a
+    /// registered custom collation nor a built-in collation.
+    pub fn resolve_key_sort_order(
+        &self,
+        name: &str,
+        desc: bool,
+        nulls_last: bool,
+    ) -> Result<KeySortOrder> {
+        if let Some(cc) = self.get_custom(name) {
+            return Ok(KeySortOrder {
+                desc,
+                nulls_last,
+                collation: Collation::Binary,
+                custom_collation: Some(cc),
+            });
+        }
+        if let Some(coll) = Collation::from_name(name) {
+            return Ok(KeySortOrder {
+                desc,
+                nulls_last,
+                collation: coll,
+                custom_collation: None,
+            });
+        }
+        Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("no such collation sequence: {name}"),
+        ))
+    }
+
+    /// Resolves `name` into a [`KeySortOrder`], falling back to an unbound placeholder
+    /// [`CustomCollation`] if `name` has not been registered yet (used when loading persistent
+    /// schema definitions before application collations are registered).
+    pub fn resolve_key_sort_order_or_unbound(
+        &self,
+        name: &str,
+        desc: bool,
+        nulls_last: bool,
+    ) -> KeySortOrder {
+        if let Some(cc) = self.get_custom(name) {
+            KeySortOrder {
+                desc,
+                nulls_last,
+                collation: Collation::Binary,
+                custom_collation: Some(cc),
+            }
+        } else if let Some(coll) = Collation::from_name(name) {
+            KeySortOrder {
+                desc,
+                nulls_last,
+                collation: coll,
+                custom_collation: None,
+            }
+        } else {
+            KeySortOrder {
+                desc,
+                nulls_last,
+                collation: Collation::Binary,
+                custom_collation: Some(CustomCollation::unbound(name)),
+            }
+        }
+    }
+
+    /// Compares two UTF-8 strings under `name`, returning an error if the collation does not exist
+    /// or if a custom collation returns an error or panics.
     pub fn compare(
         &self,
         name: &str,
@@ -363,8 +510,8 @@ impl CollationRegistry {
         right: &str,
         encoding: TextEncoding,
     ) -> Result<Ordering> {
-        if let Some(cb) = self.custom.get(&name.to_ascii_uppercase()).cloned() {
-            return Ok(cb(left, right));
+        if let Some(cc) = self.custom.get(&name.to_ascii_uppercase()).cloned() {
+            return (cc.comparator)(left, right);
         }
         let Some(coll) = Collation::from_name(name) else {
             return Err(SqliteError::new(
@@ -472,7 +619,7 @@ impl ProgressTracker {
             h.since_last = h.since_last.saturating_add(1);
             if h.since_last >= h.interval {
                 h.since_last = 0;
-                if (h.callback)() {
+                if catch_infallible_callback_panic("progress_handler", || (h.callback)())? {
                     return Err(SqliteError::new(ErrorCode::Interrupt, "interrupted"));
                 }
             }
@@ -485,16 +632,36 @@ impl ProgressTracker {
 /// Returning `true` vetoes the commit and triggers full multi-DB rollback (`SQLITE_CONSTRAINT_COMMITHOOK`).
 pub type CommitHookCallback = Box<dyn FnMut() -> bool + Send>;
 
-/// Connection-level `vdbeCommit` hook state (`sqlite3_commit_hook` + Phase 7 virtual table stubs).
+/// Callback invoked whenever a transaction is rolled back (`sqlite3_rollback_hook`).
+pub type RollbackHookCallback = Box<dyn FnMut() + Send>;
+
+/// Recorded `(op, db_name, table_name, rowid)` event for [`UpdateHookCallback`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateHookEvent {
+    pub op: RowMutationOp,
+    pub db_name: String,
+    pub table_name: String,
+    pub rowid: i64,
+}
+
+/// Callback invoked after each physical row `INSERT`, `UPDATE`, or `DELETE` on a rowid table (`sqlite3_update_hook`).
+pub type UpdateHookCallback = Box<dyn FnMut(RowMutationOp, &str, &str, i64) + Send>;
+
+/// Callback invoked when a top-level SQL statement begins execution (`sqlite3_trace_v2` / `SQLITE_TRACE_STMT`).
+pub type TraceHookCallback = Box<dyn FnMut(&str) + Send>;
+
+/// Connection-level `vdbeCommit` and rollback hook state (`sqlite3_commit_hook` + `sqlite3_rollback_hook` + Phase 7 virtual table stubs).
 #[derive(Default)]
 pub struct CommitCoordinatorHooks {
     commit_hook: Option<CommitHookCallback>,
+    rollback_hook: Option<RollbackHookCallback>,
 }
 
 impl std::fmt::Debug for CommitCoordinatorHooks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CommitCoordinatorHooks")
             .field("has_commit_hook", &self.commit_hook.is_some())
+            .field("has_rollback_hook", &self.rollback_hook.is_some())
             .finish()
     }
 }
@@ -505,6 +672,25 @@ impl CommitCoordinatorHooks {
         self.commit_hook = hook;
     }
 
+    /// Sets or clears the connection rollback hook (`sqlite3_rollback_hook`).
+    pub fn set_rollback_hook(&mut self, hook: Option<RollbackHookCallback>) {
+        self.rollback_hook = hook;
+    }
+
+    /// Returns `true` if a rollback hook is currently registered.
+    #[inline]
+    pub fn has_rollback_hook(&self) -> bool {
+        self.rollback_hook.is_some()
+    }
+
+    /// Invokes any registered `sqlite3_rollback_hook` inside `std::panic::catch_unwind`.
+    pub fn invoke_rollback_hook(&mut self) -> Result<()> {
+        if let Some(ref mut cb) = self.rollback_hook {
+            catch_infallible_callback_panic("rollback_hook", cb)?;
+        }
+        Ok(())
+    }
+
     /// Step 2 of `vdbeCommit`: runs `xSync` across active virtual tables before `nTrans` counting
     /// and exclusive lock acquisition (Phase 2 no-op; Phase 7 virtual tables plug in here).
     #[inline]
@@ -513,15 +699,25 @@ impl CommitCoordinatorHooks {
     }
 
     /// Step 4 of `vdbeCommit`: invokes any registered `sqlite3_commit_hook` when `need_xcommit` is
-    /// true; returning `true` aborts commit with `SQLITE_CONSTRAINT_COMMITHOOK`.
+    /// true; returning `true` or panicking aborts commit with `SQLITE_CONSTRAINT_COMMITHOOK`.
     pub fn invoke_commit_hook(&mut self) -> Result<()> {
-        if let Some(ref mut cb) = self.commit_hook
-            && cb()
-        {
-            return Err(SqliteError::with_extended(
-                extended::SQLITE_CONSTRAINT_COMMITHOOK,
-                "commit hook vetoed commit",
-            ));
+        if let Some(ref mut cb) = self.commit_hook {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(cb)) {
+                Ok(true) => {
+                    return Err(SqliteError::with_extended(
+                        extended::SQLITE_CONSTRAINT_COMMITHOOK,
+                        "commit hook vetoed commit",
+                    ));
+                }
+                Err(payload) => {
+                    let msg = panic_payload_message(payload.as_ref());
+                    return Err(SqliteError::with_extended(
+                        extended::SQLITE_CONSTRAINT_COMMITHOOK,
+                        format!("commit_hook callback panicked: {msg}"),
+                    ));
+                }
+                Ok(false) => {}
+            }
         }
         Ok(())
     }
@@ -620,13 +816,14 @@ impl ExecutionServices for ExecutionContext<'_> {
         }
 
         let slot_val = if let Some(def) = self.functions.find_aggregate(name, arity) {
+            let instance = catch_infallible_callback_panic(&def.name, || (def.factory)())?;
             OpenAccumulatorSlot::Custom {
                 name: def.name.clone(),
                 flags: def.flags,
                 supports_window: def.supports_window,
                 supports_inverse: !distinct && def.supports_inverse,
                 distinct_seen: distinct.then(|| (collation_name.to_owned(), Vec::new())),
-                instance: (def.factory)(),
+                instance,
             }
         } else {
             let upper = name.to_ascii_uppercase();
@@ -725,6 +922,7 @@ impl ExecutionServices for ExecutionContext<'_> {
                 })
             }
             OpenAccumulatorSlot::Custom {
+                name,
                 flags,
                 distinct_seen,
                 instance,
@@ -738,20 +936,28 @@ impl ExecutionServices for ExecutionContext<'_> {
                     if first.value.is_null() {
                         return Ok(());
                     }
-                    let dup = seen.iter().any(|prev| match (&first.value, prev) {
-                        (Value::Text(la), Value::Text(lb)) => collations
-                            .compare(cname, la, lb, encoding)
-                            .is_ok_and(Ordering::is_eq),
-                        (a, b) => a
-                            .cmp_sqlite_with_encoding(b, Collation::Binary, encoding)
-                            .is_eq(),
-                    });
+                    let mut dup = false;
+                    for prev in seen.iter() {
+                        let eq = match (&first.value, prev) {
+                            (Value::Text(la), Value::Text(lb)) => {
+                                collations.compare(cname, la, lb, encoding)?.is_eq()
+                            }
+                            (a, b) => a
+                                .cmp_sqlite_with_encoding(b, Collation::Binary, encoding)
+                                .is_eq(),
+                        };
+                        if eq {
+                            dup = true;
+                            break;
+                        }
+                    }
                     if dup {
                         return Ok(());
                     }
                     seen.push(first.value.clone());
                 }
-                instance.step(filtered)
+                let fn_name = name.as_str();
+                catch_callback_panic(fn_name, || instance.step(filtered))
             }
         }
     }
@@ -783,7 +989,8 @@ impl ExecutionServices for ExecutionContext<'_> {
                         format!("{name}() may not be used as a window function"),
                     ));
                 }
-                let rv = instance.value()?;
+                let fn_name = name.as_str();
+                let rv = catch_callback_panic(fn_name, || instance.value())?;
                 enforce_result_subtype_contract(name, *flags, strict, rv)
             }
         }
@@ -803,6 +1010,7 @@ impl ExecutionServices for ExecutionContext<'_> {
                 acc.inverse(&plain)
             }
             OpenAccumulatorSlot::Custom {
+                name,
                 flags,
                 supports_inverse,
                 instance,
@@ -815,7 +1023,8 @@ impl ExecutionServices for ExecutionContext<'_> {
                 }
                 let mut scratch = Vec::new();
                 let filtered = strip_unsubscribed_subtypes(*flags, args, &mut scratch);
-                instance.inverse(filtered)
+                let fn_name = name.as_str();
+                catch_callback_panic(fn_name, || instance.inverse(filtered))
             }
         }
     }
@@ -845,7 +1054,7 @@ impl ExecutionServices for ExecutionContext<'_> {
                 mut instance,
                 ..
             } => {
-                let rv = instance.finalize()?;
+                let rv = catch_callback_panic(&name, || instance.finalize())?;
                 enforce_result_subtype_contract(&name, flags, strict, rv)
             }
         }
@@ -888,10 +1097,21 @@ pub struct MutationContext {
 
 /// Connection-level row-mutation event dispatcher (Phase 3 metadata core, Phase 4 trigger hookup,
 /// Phase 6 `update_hook` and incremental `Blob` invalidation).
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MutationPipeline {
     trace_enabled: bool,
     events: Vec<MutationContext>,
+    update_hook: Option<UpdateHookCallback>,
+}
+
+impl std::fmt::Debug for MutationPipeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MutationPipeline")
+            .field("trace_enabled", &self.trace_enabled)
+            .field("events_len", &self.events.len())
+            .field("has_update_hook", &self.update_hook.is_some())
+            .finish()
+    }
 }
 
 impl MutationPipeline {
@@ -899,6 +1119,17 @@ impl MutationPipeline {
     #[inline]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets or clears the connection `update_hook` (`sqlite3_update_hook`).
+    pub fn set_update_hook(&mut self, hook: Option<UpdateHookCallback>) {
+        self.update_hook = hook;
+    }
+
+    /// Returns `true` if a connection `update_hook` is currently registered.
+    #[inline]
+    pub fn has_update_hook(&self) -> bool {
+        self.update_hook.is_some()
     }
 
     /// Enables or disables recording of [`MutationContext`] descriptors for inspection/testing.
@@ -952,5 +1183,47 @@ impl MutationPipeline {
         if self.trace_enabled {
             self.events.push(ctx);
         }
+    }
+
+    /// Dispatches a completed physical row mutation, recording trace metadata and invoking any
+    /// registered `sqlite3_update_hook` when `ctx.emit_update_hook` is true.
+    pub fn dispatch_with_db_name(&mut self, ctx: MutationContext, db_name: &str) -> Result<()> {
+        let emit_hook = ctx.emit_update_hook;
+        let op_and_rowid = if emit_hook && self.update_hook.is_some() {
+            match ctx.origin {
+                MutationOrigin::TopLevelInsert => ctx
+                    .new_row
+                    .as_ref()
+                    .map(|r| (RowMutationOp::Insert, r.rowid)),
+                MutationOrigin::TopLevelUpdate
+                | MutationOrigin::UpsertDoUpdate
+                | MutationOrigin::FkActionUpdate => ctx
+                    .new_row
+                    .as_ref()
+                    .map(|r| (RowMutationOp::Update, r.rowid)),
+                MutationOrigin::TopLevelDelete
+                | MutationOrigin::FkCascadeDelete
+                | MutationOrigin::ReplaceConflictDelete => ctx
+                    .old_row
+                    .as_ref()
+                    .map(|r| (RowMutationOp::Delete, r.rowid)),
+            }
+        } else {
+            None
+        };
+        let table_name = if op_and_rowid.is_some() {
+            Some(ctx.table_name.clone())
+        } else {
+            None
+        };
+        if self.trace_enabled {
+            self.events.push(ctx);
+        }
+        if let (Some((op, rowid)), Some(tbl_name), Some(cb)) =
+            (op_and_rowid, table_name, self.update_hook.as_mut())
+        {
+            catch_infallible_callback_panic("update_hook", || cb(op, db_name, &tbl_name, rowid))?;
+        }
+        Ok(())
     }
 }

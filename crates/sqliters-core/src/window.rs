@@ -12,14 +12,15 @@ use sqliters_syntax::{
 };
 use sqliters_types::{
     Collation, ErrorCode, ExecutionServices, FunctionFlags, KeySortOrder, Result, RuntimeValue,
-    SqliteError, TextEncoding, Value,
+    SqliteError, TextEncoding, Value, fallible_sort_by,
 };
 use sqliters_vdbe::{AggregateKind, builtin_window_arity};
 
 use crate::compiler::expr_contains_aggregate;
 use crate::engine::{
     CteStore, EvalRow, ExecContext, ScopedColumn, col_in_scoped_cols_pub, eval_expr_pub,
-    eval_expr_rt_pub, infer_expr_collation_from_cols_pub, push_scope_pub,
+    eval_expr_rt_pub, infer_expr_collation_from_cols_pub,
+    infer_expr_custom_collation_from_cols_pub, push_scope_pub,
 };
 use crate::execution_context::{CollationRegistry, ExecutionContext, FunctionRegistry};
 
@@ -1947,26 +1948,30 @@ struct SortTermMeta {
 
 impl SortTermMeta {
     fn from_expr_asc(expr: &Expr, sample_cols: &[ScopedColumn]) -> Self {
-        let custom_collation = extract_custom_collation(expr);
+        let custom_collation = extract_custom_collation(expr)
+            .or_else(|| infer_expr_custom_collation_from_cols_pub(expr, sample_cols));
         let coll = infer_expr_collation_from_cols_pub(expr, sample_cols);
         Self {
             order: KeySortOrder {
                 desc: false,
                 nulls_last: false,
                 collation: coll,
+                custom_collation: None,
             },
             custom_collation,
         }
     }
 
     fn from_order_by_term(ob: &OrderByTerm, sample_cols: &[ScopedColumn]) -> Self {
-        let custom_collation = extract_custom_collation(&ob.expr);
+        let custom_collation = extract_custom_collation(&ob.expr)
+            .or_else(|| infer_expr_custom_collation_from_cols_pub(&ob.expr, sample_cols));
         let coll = infer_expr_collation_from_cols_pub(&ob.expr, sample_cols);
         Self {
             order: KeySortOrder {
                 desc: ob.desc,
                 nulls_last: ob.nulls_last.unwrap_or(ob.desc),
                 collation: coll,
+                custom_collation: None,
             },
             custom_collation,
         }
@@ -1990,34 +1995,28 @@ impl SortTermMeta {
         b: &Value,
         collations: &CollationRegistry,
         enc: TextEncoding,
-    ) -> Ordering {
+    ) -> Result<Ordering> {
         match (a.is_null(), b.is_null()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => {
-                if self.order.nulls_last {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            }
-            (false, true) => {
-                if self.order.nulls_last {
-                    Ordering::Less
-                } else {
-                    Ordering::Greater
-                }
-            }
+            (true, true) => Ok(Ordering::Equal),
+            (true, false) => Ok(if self.order.nulls_last {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }),
+            (false, true) => Ok(if self.order.nulls_last {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }),
             (false, false) => {
                 let raw = if let (Some(cname), Value::Text(ls), Value::Text(rs)) =
                     (self.custom_collation.as_deref(), a, b)
                 {
-                    collations
-                        .compare(cname, ls, rs, enc)
-                        .unwrap_or(Ordering::Equal)
+                    collations.compare(cname, ls, rs, enc)?
                 } else {
                     a.cmp_sqlite_with_encoding(b, self.order.collation, enc)
                 };
-                if self.order.desc { raw.reverse() } else { raw }
+                Ok(if self.order.desc { raw.reverse() } else { raw })
             }
         }
     }
@@ -2040,7 +2039,9 @@ fn extract_custom_collation(mut expr: &Expr) -> Option<String> {
 }
 
 fn extract_effective_collation_name(expr: &Expr, sample_cols: &[ScopedColumn]) -> String {
-    if let Some(custom) = extract_custom_collation(expr) {
+    if let Some(custom) = extract_custom_collation(expr)
+        .or_else(|| infer_expr_custom_collation_from_cols_pub(expr, sample_cols))
+    {
         return custom;
     }
     match infer_expr_collation_from_cols_pub(expr, sample_cols) {
@@ -2101,23 +2102,23 @@ fn execute_single_window_stage(
     if !stage.partition_by.is_empty() || !stage.order_by.is_empty() {
         let mut perm: Vec<usize> = (0..n_total).collect();
         let collations = ctx.collations;
-        perm.sort_by(|&ia, &ib| {
+        fallible_sort_by(&mut perm, |&ia, &ib| {
             let (pa, oa) = &keys[ia];
             let (pb, ob) = &keys[ib];
             for (k, pm) in part_metas.iter().enumerate() {
-                let ord = pm.compare_vals(&pa[k], &pb[k], collations, enc);
+                let ord = pm.compare_vals(&pa[k], &pb[k], collations, enc)?;
                 if ord != Ordering::Equal {
-                    return ord;
+                    return Ok(ord);
                 }
             }
             for (k, om) in order_metas.iter().enumerate() {
-                let ord = om.compare_vals(&oa[k], &ob[k], collations, enc);
+                let ord = om.compare_vals(&oa[k], &ob[k], collations, enc)?;
                 if ord != Ordering::Equal {
-                    return ord;
+                    return Ok(ord);
                 }
             }
-            Ordering::Equal
-        });
+            Ok(Ordering::Equal)
+        })?;
         apply_permutation_in_place(items, &perm);
         apply_permutation_in_place(&mut keys, &perm);
     }
@@ -2128,14 +2129,19 @@ fn execute_single_window_stage(
         let mut part_end = part_start + 1;
         if !stage.partition_by.is_empty() {
             while part_end < n_total {
-                let same_part = part_metas.iter().enumerate().all(|(k, pm)| {
-                    pm.compare_vals(
+                let mut same_part = true;
+                for (k, pm) in part_metas.iter().enumerate() {
+                    if pm.compare_vals(
                         &keys[part_start].0[k],
                         &keys[part_end].0[k],
                         ctx.collations,
                         enc,
-                    ) == Ordering::Equal
-                });
+                    )? != Ordering::Equal
+                    {
+                        same_part = false;
+                        break;
+                    }
+                }
                 if !same_part {
                     break;
                 }
@@ -2338,7 +2344,7 @@ fn vdbe_nulleq_cmp(
     meta: &SortTermMeta,
     collations: &CollationRegistry,
     enc: TextEncoding,
-) -> bool {
+) -> Result<bool> {
     let ord = match (lhs.is_null(), rhs.is_null()) {
         (true, true) => Ordering::Equal,
         (true, false) => Ordering::Less,
@@ -2347,20 +2353,18 @@ fn vdbe_nulleq_cmp(
             if let (Some(cname), Value::Text(ls), Value::Text(rs)) =
                 (meta.custom_collation.as_deref(), lhs, rhs)
             {
-                collations
-                    .compare(cname, ls, rs, enc)
-                    .unwrap_or(Ordering::Equal)
+                collations.compare(cname, ls, rs, enc)?
             } else {
                 lhs.cmp_sqlite_with_encoding(rhs, meta.order.collation, enc)
             }
         }
     };
-    match op {
+    Ok(match op {
         RangeTestOp::Ge => ord.is_ge(),
         RangeTestOp::Gt => ord.is_gt(),
         RangeTestOp::Le => ord.is_le(),
         RangeTestOp::Lt => ord.is_lt(),
-    }
+    })
 }
 
 fn vdbe_numeric_add_or_sub(val: &Value, offset: &Value, sub: bool) -> Value {
@@ -2396,7 +2400,7 @@ fn window_code_range_test(
     meta: &SortTermMeta,
     collations: &CollationRegistry,
     enc: TextEncoding,
-) -> bool {
+) -> Result<bool> {
     let desc = meta.order.desc;
     let bignull = meta.order.desc != meta.order.nulls_last;
     let mut arith_sub = false;
@@ -2412,14 +2416,14 @@ fn window_code_range_test(
 
     if bignull {
         if val1.is_null() {
-            return match op {
+            return Ok(match op {
                 RangeTestOp::Ge => true,
                 RangeTestOp::Gt => !val2.is_null(),
                 RangeTestOp::Le => val2.is_null(),
                 RangeTestOp::Lt => false,
-            };
+            });
         } else if val2.is_null() {
-            return matches!(op, RangeTestOp::Le | RangeTestOp::Lt);
+            return Ok(matches!(op, RangeTestOp::Le | RangeTestOp::Lt));
         }
     }
 
@@ -2427,9 +2431,9 @@ fn window_code_range_test(
         val1.clone()
     } else {
         if ((op == RangeTestOp::Ge && !arith_sub) || (op == RangeTestOp::Le && arith_sub))
-            && vdbe_nulleq_cmp(op, val1, val2, meta, collations, enc)
+            && vdbe_nulleq_cmp(op, val1, val2, meta, collations, enc)?
         {
-            return true;
+            return Ok(true);
         }
         vdbe_numeric_add_or_sub(val1, offset, arith_sub)
     };
@@ -2504,14 +2508,19 @@ fn execute_stage_on_partition(
             row_peer_group[g_start] = g_id;
             let mut g_end = g_start + 1;
             while g_end < n {
-                let same_peer = order_metas.iter().enumerate().all(|(k, om)| {
-                    om.compare_vals(
+                let mut same_peer = true;
+                for (k, om) in order_metas.iter().enumerate() {
+                    if om.compare_vals(
                         &part_keys[g_start].1[k],
                         &part_keys[g_end].1[k],
                         ctx.collations,
                         enc,
-                    ) == Ordering::Equal
-                });
+                    )? != Ordering::Equal
+                    {
+                        same_peer = false;
+                        break;
+                    }
+                }
                 if !same_peer {
                     break;
                 }
@@ -2611,7 +2620,7 @@ fn execute_stage_on_partition(
                                 om,
                                 ctx.collations,
                                 enc,
-                            ) {
+                            )? {
                                 break;
                             }
                             cur_sg += 1;
@@ -2631,7 +2640,7 @@ fn execute_stage_on_partition(
                                 om,
                                 ctx.collations,
                                 enc,
-                            ) {
+                            )? {
                                 break;
                             }
                             cur_sg += 1;
@@ -2656,7 +2665,7 @@ fn execute_stage_on_partition(
                                 om,
                                 ctx.collations,
                                 enc,
-                            ) {
+                            )? {
                                 break;
                             }
                             cur_eg += 1;
@@ -2676,7 +2685,7 @@ fn execute_stage_on_partition(
                                 om,
                                 ctx.collations,
                                 enc,
-                            ) {
+                            )? {
                                 break;
                             }
                             cur_eg += 1;
@@ -2994,6 +3003,7 @@ fn evaluate_call_on_partition(
                 }
             }
 
+            ctx.publish();
             let enc = ctx.encoding();
             let mut svc = ExecutionContext {
                 interrupt_flag: ctx.interrupt_flag,

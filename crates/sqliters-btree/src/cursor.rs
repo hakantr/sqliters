@@ -124,28 +124,24 @@ fn fault_error(code: i32) -> SqliteError {
 fn compare_two_values_with_order(
     a: &Value,
     b: &Value,
-    spec: KeySortOrder,
+    spec: &KeySortOrder,
     enc: TextEncoding,
-) -> Ordering {
+) -> Result<Ordering> {
     match (a.is_null(), b.is_null()) {
-        (true, true) => Ordering::Equal,
-        (true, false) => {
-            if spec.nulls_last {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
-        (false, true) => {
-            if spec.nulls_last {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
+        (true, true) => Ok(Ordering::Equal),
+        (true, false) => Ok(if spec.nulls_last {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        }),
+        (false, true) => Ok(if spec.nulls_last {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        }),
         (false, false) => {
-            let raw = a.cmp_sqlite_with_encoding(b, spec.collation, enc);
-            if spec.desc { raw.reverse() } else { raw }
+            let raw = a.cmp_sqlite_fallible(b, spec, enc)?;
+            Ok(if spec.desc { raw.reverse() } else { raw })
         }
     }
 }
@@ -1448,9 +1444,10 @@ impl Btree {
                                 &cell.local_payload[body_pos..end]
                             };
                             let a = decode_serial_value_with_encoding(st, slice, enc)?;
-                            let spec = orders.get(col_i).copied().unwrap_or_default();
+                            let default_spec = KeySortOrder::default();
+                            let spec = orders.get(col_i).unwrap_or(&default_spec);
                             let ord =
-                                compare_two_values_with_order(&a, &rhs_values[col_i], spec, enc);
+                                compare_two_values_with_order(&a, &rhs_values[col_i], spec, enc)?;
                             if ord != Ordering::Equal {
                                 return Ok(ord);
                             }
@@ -1515,8 +1512,9 @@ impl Btree {
                 return Err(SqliteError::corrupt("record payload truncated"));
             }
             let a = decode_serial_value_with_encoding(st, &buf[body_pos..end], enc)?;
-            let spec = orders.get(col_i).copied().unwrap_or_default();
-            let ord = compare_two_values_with_order(&a, &rhs_values[col_i], spec, enc);
+            let default_spec = KeySortOrder::default();
+            let spec = orders.get(col_i).unwrap_or(&default_spec);
+            let ord = compare_two_values_with_order(&a, &rhs_values[col_i], spec, enc)?;
             if ord != Ordering::Equal {
                 return Ok(ord);
             }

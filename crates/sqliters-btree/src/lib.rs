@@ -1965,7 +1965,8 @@ impl Btree {
         let Some(val) = decoded.get(k) else {
             return Ok(Ordering::Less);
         };
-        let range_so = orders.get(k).copied().unwrap_or_default();
+        let default_so = KeySortOrder::default();
+        let range_so = orders.get(k).unwrap_or(&default_so);
         if val.is_null() {
             // In SQL, NULL never satisfies `<`, `<=`, `>`, `>=`.
             // In B-tree key order, NULL is at the start when `!range_so.nulls_last` and at the end when `range_so.nulls_last`.
@@ -1980,7 +1981,7 @@ impl Btree {
             if lo_val.is_null() {
                 // `col > NULL` (from `IS NOT NULL` virtual range bound) is satisfied by all non-NULL values!
             } else {
-                let cmp = val.cmp_sqlite(lo_val, range_so.collation);
+                let cmp = val.cmp_sqlite_fallible(lo_val, range_so, enc)?;
                 if cmp == Ordering::Less || (!lo_inc && cmp == Ordering::Equal) {
                     // `val` is below the SQL lower bound.
                     // If the index column is ASC (`!range_so.desc`), `val` comes before the range (`Ordering::Less`);
@@ -1999,7 +2000,7 @@ impl Btree {
             if hi_val.is_null() {
                 return Ok(Ordering::Greater);
             }
-            let cmp = val.cmp_sqlite(hi_val, range_so.collation);
+            let cmp = val.cmp_sqlite_fallible(hi_val, range_so, enc)?;
             if cmp == Ordering::Greater || (!hi_inc && cmp == Ordering::Equal) {
                 // `val` is above the SQL upper bound.
                 return Ok(if range_so.desc {
@@ -2122,15 +2123,20 @@ impl Btree {
                 continue;
             }
             let prefix = fields[..prefix_len].to_vec();
-            let same_as_prev = distinct.last().is_some_and(|prev| {
-                prev.iter()
-                    .zip(prefix.iter())
-                    .enumerate()
-                    .all(|(i, (a, b))| {
-                        let so = orders.get(i).copied().unwrap_or_default();
-                        a.cmp_sqlite(b, so.collation) == Ordering::Equal
-                    })
-            });
+            let default_so = KeySortOrder::default();
+            let same_as_prev = if let Some(prev) = distinct.last() {
+                let mut eq = true;
+                for (i, (a, b)) in prev.iter().zip(prefix.iter()).enumerate() {
+                    let so = orders.get(i).unwrap_or(&default_so);
+                    if a.cmp_sqlite_fallible(b, so, enc)? != Ordering::Equal {
+                        eq = false;
+                        break;
+                    }
+                }
+                eq
+            } else {
+                false
+            };
             if !same_as_prev {
                 distinct.push(prefix);
             }

@@ -3,6 +3,10 @@
 
 use std::cmp::Ordering;
 use std::fmt;
+use std::sync::Arc;
+
+use crate::error::{ErrorCode, Result, SqliteError};
+use crate::record::KeySortOrder;
 
 /// The 5 fundamental SQLite datatypes (`SQLITE_INTEGER`, `SQLITE_FLOAT`, `SQLITE_TEXT`, `SQLITE_BLOB`, `SQLITE_NULL`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -296,6 +300,61 @@ impl Collation {
     }
 }
 
+/// Thread-safe fallible comparator callback for a custom collation sequence.
+pub type CustomCollationComparator = Arc<dyn Fn(&str, &str) -> Result<Ordering> + Send + Sync>;
+
+/// Cloneable custom collation descriptor carrying the registered name and fallible comparator.
+#[derive(Clone)]
+pub struct CustomCollation {
+    pub name: Arc<str>,
+    pub comparator: CustomCollationComparator,
+}
+
+impl CustomCollation {
+    pub fn new<F>(name: impl Into<Arc<str>>, comparator: F) -> Self
+    where
+        F: Fn(&str, &str) -> Result<Ordering> + Send + Sync + 'static,
+    {
+        Self {
+            name: name.into(),
+            comparator: Arc::new(comparator),
+        }
+    }
+
+    /// Creates a placeholder custom collation for a schema object loaded before the
+    /// custom collation callback is registered on the connection.
+    pub fn unbound(name: impl Into<Arc<str>>) -> Self {
+        let name_arc: Arc<str> = name.into();
+        let err_name = Arc::clone(&name_arc);
+        Self {
+            name: name_arc,
+            comparator: Arc::new(move |_, _| {
+                Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such collation sequence: {err_name}"),
+                ))
+            }),
+        }
+    }
+}
+
+impl fmt::Debug for CustomCollation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CustomCollation")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+impl PartialEq for CustomCollation {
+    fn eq(&self, other: &Self) -> bool {
+        self.name.eq_ignore_ascii_case(&other.name)
+            && Arc::ptr_eq(&self.comparator, &other.comparator)
+    }
+}
+
+impl Eq for CustomCollation {}
+
 /// Dynamic runtime value corresponding to SQLite's `sqlite3_value` / `Mem` cell.
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -481,6 +540,22 @@ impl Value {
 
             (Self::Blob(a), Self::Blob(b)) => a.cmp(b),
         }
+    }
+
+    /// Compares two values using `spec` (`KeySortOrder`), invoking `spec.custom_collation`
+    /// when both operands are `Value::Text` and propagating any custom collation error.
+    pub fn cmp_sqlite_fallible(
+        &self,
+        other: &Self,
+        spec: &KeySortOrder,
+        enc: TextEncoding,
+    ) -> Result<Ordering> {
+        if let (Self::Text(a), Self::Text(b)) = (self, other)
+            && let Some(ref cc) = spec.custom_collation
+        {
+            return (cc.comparator)(a, b);
+        }
+        Ok(self.cmp_sqlite_with_encoding(other, spec.collation, enc))
     }
 }
 

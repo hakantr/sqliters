@@ -1103,8 +1103,8 @@ fn match_index_col_target(
     schema_name: &str,
     alias: Option<&str>,
 ) -> Option<(TypeAffinity, Collation)> {
-    let (candidate_inner, explicit_coll) = match candidate {
-        Expr::Collate { expr, collation } => (expr.as_ref(), Collation::from_name(collation)),
+    let (candidate_inner, explicit_coll_name) = match candidate {
+        Expr::Collate { expr, collation } => (expr.as_ref(), Some(collation.as_str())),
         other => (other, None),
     };
     if let Some(ci) = ic.col_idx {
@@ -1112,16 +1112,25 @@ fn match_index_col_target(
         if !cname.eq_ignore_ascii_case(&ic.name) {
             return None;
         }
-        let col_coll = explicit_coll.unwrap_or(tbl.columns[ci].collation);
-        if ic.sort_order.collation != col_coll {
+        let col_coll_name = explicit_coll_name.unwrap_or_else(|| tbl.columns[ci].collation_name());
+        if !ic
+            .sort_order
+            .collation_name()
+            .eq_ignore_ascii_case(col_coll_name)
+        {
             return None;
         }
         Some((tbl.columns[ci].affinity, ic.sort_order.collation))
     } else if let Some(ref idx_expr) = ic.expr {
         // Expression index column or rowid index column!
         if expr_ast_equiv_for_table(candidate_inner, idx_expr, tbl, schema_name, alias) {
-            let expr_coll = explicit_coll.unwrap_or_else(|| infer_expr_collation(idx_expr, tbl));
-            if ic.sort_order.collation != expr_coll {
+            let expr_coll_name =
+                explicit_coll_name.unwrap_or_else(|| infer_expr_collation_name(idx_expr, tbl));
+            if !ic
+                .sort_order
+                .collation_name()
+                .eq_ignore_ascii_case(expr_coll_name)
+            {
                 return None;
             }
             let aff = compiler_expr_affinity(idx_expr, Some((tbl, schema_name)), None)
@@ -3035,13 +3044,13 @@ fn compile_single_table_select(
             else {
                 return Ok(None);
             };
-            let coll = if let Expr::Collate { collation, .. } = &ob.expr {
-                let Some(c) = Collation::from_name(collation) else {
-                    return Ok(None);
-                };
-                c
+            let coll_name = if let Expr::Collate { collation, .. } = &ob.expr {
+                collation.as_str()
             } else {
-                infer_expr_collation(&coll_ref_expr, tbl)
+                infer_expr_collation_name(&coll_ref_expr, tbl)
+            };
+            let Some(coll) = Collation::from_name(coll_name) else {
+                return Ok(None);
             };
             let desc = ob.desc;
             let nulls_last = ob.nulls_last.unwrap_or(desc);
@@ -3051,6 +3060,7 @@ fn compile_single_table_select(
                 desc,
                 nulls_last,
                 collation: coll,
+                custom_collation: None,
             });
         }
 
@@ -3709,13 +3719,13 @@ fn expr_uses_select_alias(
     }
 }
 
-fn infer_expr_collation(expr: &Expr, tbl: &TableSchema) -> Collation {
+fn infer_expr_collation_name<'a>(expr: &'a Expr, tbl: &'a TableSchema) -> &'a str {
     match expr {
-        Expr::Collate { collation, .. } => Collation::from_name(collation).unwrap_or_default(),
+        Expr::Collate { collation, .. } => collation.as_str(),
         Expr::Column(cref) => tbl
             .find_column(&cref.column)
-            .map_or(Collation::Binary, |(_, c)| c.collation),
-        _ => Collation::Binary,
+            .map_or("BINARY", |(_, c)| c.collation_name()),
+        _ => "BINARY",
     }
 }
 
@@ -3929,7 +3939,7 @@ fn compile_expr(
                     binding.and_then(|b| b.alias),
                 );
                 let comp_aff = sqlite_compare_affinity(l_aff, r_aff);
-                if let Some(custom_coll) = resolve_custom_binary_collation(left, right) {
+                if let Some(custom_coll) = resolve_custom_binary_collation(left, right, binding) {
                     ins = ins
                         .with_p4(P4::Str(custom_coll))
                         .with_p5(u16::from(affinity_to_p5(comp_aff)));
@@ -4062,18 +4072,23 @@ fn compile_expr(
             negated,
         } => {
             let fname = match op {
-                LikeOp::Like => "LIKE",
-                LikeOp::Glob => "GLOB",
+                LikeOp::Like => "like",
+                LikeOp::Glob => "glob",
+                LikeOp::Regexp => "regexp",
+                LikeOp::Match => "match",
             };
             let argc = if escape.is_some() { 3 } else { 2 };
+            functions.validate_call(fname, false, argc, false, false, false)?;
             let arg_base = prog.alloc_registers(argc);
-            // Note: SQLite's LIKE/GLOB function takes `(pattern, string [, escape])`!
+            // Note: SQLite's LIKE/GLOB/REGEXP/MATCH function takes `(pattern, string [, escape])`!
             compile_expr(prog, pattern, binding, functions, arg_base)?;
             compile_expr(prog, txt_e, binding, functions, arg_base + 1)?;
             if let Some(esc) = escape {
                 compile_expr(prog, esc, binding, functions, arg_base + 2)?;
             }
-            let res_reg = if *negated {
+            let needs_bool_norm = matches!(op, LikeOp::Regexp | LikeOp::Match)
+                || functions.find_scalar(fname, argc).is_some();
+            let res_reg = if *negated || needs_bool_norm {
                 prog.alloc_register()
             } else {
                 dest
@@ -4085,6 +4100,9 @@ fn compile_expr(
                 }),
             );
             if *negated {
+                prog.emit(Instruction::new(Opcode::Not, res_reg, dest, 0));
+            } else if needs_bool_norm {
+                prog.emit(Instruction::new(Opcode::Not, res_reg, res_reg, 0));
                 prog.emit(Instruction::new(Opcode::Not, res_reg, dest, 0));
             }
         }
@@ -4121,7 +4139,9 @@ fn compile_expr(
                     let comp_aff = sqlite_compare_affinity(l_aff, r_aff);
                     let mut ins = Instruction::new(Opcode::Eq, base_r, w_reg, cond_reg)
                         .with_p5(u16::from(affinity_to_p5(comp_aff)));
-                    if let Some(custom_coll) = resolve_custom_binary_collation(op_e, when_e) {
+                    if let Some(custom_coll) =
+                        resolve_custom_binary_collation(op_e, when_e, binding)
+                    {
                         ins = ins.with_p4(P4::Str(custom_coll));
                     } else {
                         let coll = resolve_binary_collation(op_e, when_e, binding);
@@ -4217,6 +4237,83 @@ fn compile_expr(
                         };
                         return compile_expr(prog, &case_expr, binding, functions, dest);
                     }
+                    "NULLIF" if expr_list.len() == 2 => {
+                        compile_expr(prog, &expr_list[0], binding, functions, dest)?;
+                        let r1 = prog.alloc_register();
+                        compile_expr(prog, &expr_list[1], binding, functions, r1)?;
+                        let eq_r = prog.alloc_register();
+                        let mut ins = Instruction::new(Opcode::Eq, dest, r1, eq_r);
+                        if let Some(custom_coll) =
+                            resolve_custom_binary_collation(&expr_list[0], &expr_list[1], binding)
+                        {
+                            ins = ins.with_p4(P4::Str(custom_coll));
+                        } else {
+                            let coll =
+                                resolve_binary_collation(&expr_list[0], &expr_list[1], binding);
+                            ins = ins.with_p4(P4::Collation(coll));
+                        }
+                        prog.emit(ins);
+                        let skip_null =
+                            prog.emit(Instruction::new(Opcode::JumpIfFalse, eq_r, 0, 1));
+                        prog.emit(Instruction::new(Opcode::Null, 0, dest, 0));
+                        let end_addr = prog.current_addr();
+                        prog.patch_p2(skip_null, end_addr);
+                        return Ok(());
+                    }
+                    "MIN" | "MAX" if expr_list.len() >= 2 => {
+                        let first_custom = expr_list
+                            .iter()
+                            .find_map(|a| resolve_custom_binary_collation(a, &Expr::Null, binding));
+                        let first_builtin = expr_list
+                            .iter()
+                            .map(|a| resolve_binary_collation(a, &Expr::Null, binding))
+                            .find(|c| *c != Collation::Binary)
+                            .unwrap_or(Collation::Binary);
+                        if first_custom.is_some() || first_builtin != Collation::Binary {
+                            let is_max = upper == "MAX";
+                            let cmp_op = if is_max { Opcode::Gt } else { Opcode::Lt };
+                            compile_expr(prog, &expr_list[0], binding, functions, dest)?;
+                            let mut null_jumps = Vec::with_capacity(expr_list.len());
+                            null_jumps.push(prog.emit(Instruction::new(
+                                Opcode::IsNull,
+                                dest,
+                                0,
+                                0,
+                            )));
+                            let cand_reg = prog.alloc_register();
+                            let cmp_reg = prog.alloc_register();
+                            for arg in &expr_list[1..] {
+                                compile_expr(prog, arg, binding, functions, cand_reg)?;
+                                null_jumps.push(prog.emit(Instruction::new(
+                                    Opcode::IsNull,
+                                    cand_reg,
+                                    0,
+                                    0,
+                                )));
+                                let mut ins = Instruction::new(cmp_op, cand_reg, dest, cmp_reg);
+                                if let Some(ref cname) = first_custom {
+                                    ins = ins.with_p4(P4::Str(cname.clone()));
+                                } else {
+                                    ins = ins.with_p4(P4::Collation(first_builtin));
+                                }
+                                prog.emit(ins);
+                                let skip_copy =
+                                    prog.emit(Instruction::new(Opcode::JumpIfFalse, cmp_reg, 0, 1));
+                                prog.emit(Instruction::new(Opcode::Move, cand_reg, dest, 0));
+                                let after_copy = prog.current_addr();
+                                prog.patch_p2(skip_copy, after_copy);
+                            }
+                            let done_jump = prog.emit(goto_placeholder());
+                            let null_addr = prog.current_addr();
+                            for j in null_jumps {
+                                prog.patch_p2(j, null_addr);
+                            }
+                            prog.emit(Instruction::new(Opcode::Null, 0, dest, 0));
+                            let end_addr = prog.current_addr();
+                            prog.patch_p2(done_jump, end_addr);
+                            return Ok(());
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -4250,7 +4347,11 @@ fn compile_expr(
     Ok(())
 }
 
-fn resolve_custom_binary_collation(left: &Expr, right: &Expr) -> Option<String> {
+fn resolve_custom_binary_collation(
+    left: &Expr,
+    right: &Expr,
+    binding: Option<&TableBinding<'_>>,
+) -> Option<String> {
     if let Expr::Collate { collation, .. } = left {
         return if Collation::from_name(collation).is_none() {
             Some(collation.clone())
@@ -4264,6 +4365,20 @@ fn resolve_custom_binary_collation(left: &Expr, right: &Expr) -> Option<String> 
         } else {
             None
         };
+    }
+    if let Some(b) = binding {
+        if let Expr::Column(cref) = left
+            && let Some((_, c)) = b.tbl.find_column(&cref.column)
+            && let Some(ref cname) = c.custom_collation
+        {
+            return Some(cname.clone());
+        }
+        if let Expr::Column(cref) = right
+            && let Some((_, c)) = b.tbl.find_column(&cref.column)
+            && let Some(ref cname) = c.custom_collation
+        {
+            return Some(cname.clone());
+        }
     }
     None
 }

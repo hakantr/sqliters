@@ -12,10 +12,12 @@ use sqliters_syntax::{
     WindowRef, WindowSpec, parse_one,
 };
 use sqliters_types::{
-    Collation, ErrorCode, ExecutionServices, KeySortOrder, Pgno, Result, SqliteError, TypeAffinity,
-    Value, decode_record_with_encoding, encode_record_with_encoding,
+    Collation, CustomCollation, ErrorCode, ExecutionServices, KeySortOrder, Pgno, Result,
+    SqliteError, TypeAffinity, Value, decode_record_with_encoding, encode_record_with_encoding,
 };
 use sqliters_vdbe::P4;
+
+use crate::execution_context::CollationRegistry;
 
 use crate::trigger::{
     TriggerSchema, fix_permanent_trigger, is_reserved_trigger_or_system_name,
@@ -36,6 +38,7 @@ pub struct ColumnSchema {
     pub type_name: String,
     pub affinity: TypeAffinity,
     pub collation: Collation,
+    pub custom_collation: Option<String>,
     pub not_null: Option<ConflictAction>,
     pub default_expr: Option<Expr>,
     pub generated: Option<(Expr, bool)>,
@@ -47,6 +50,29 @@ pub struct ColumnSchema {
 }
 
 impl ColumnSchema {
+    pub fn collation_name(&self) -> &str {
+        if let Some(ref cname) = self.custom_collation {
+            cname.as_str()
+        } else {
+            match self.collation {
+                Collation::Binary => "BINARY",
+                Collation::NoCase => "NOCASE",
+                Collation::RTrim => "RTRIM",
+            }
+        }
+    }
+
+    pub fn key_sort_order(&self, desc: bool, nulls_last: bool) -> KeySortOrder {
+        KeySortOrder {
+            desc,
+            nulls_last,
+            collation: self.collation,
+            custom_collation: self
+                .custom_collation
+                .as_deref()
+                .map(CustomCollation::unbound),
+        }
+    }
     /// Extracts a constant `P4` fallback (with column affinity + `STRICT` `REAL` coercion) for
     /// `OP_Column` when reading rows written prior to `ALTER TABLE ... ADD COLUMN`.
     pub fn default_p4_for_table(&self, table_strict: bool) -> P4 {
@@ -395,6 +421,7 @@ impl TableSchema {
             type_name: ty.to_owned(),
             affinity: aff,
             collation: Collation::Binary,
+            custom_collation: None,
             not_null: None,
             default_expr: None,
             generated: None,
@@ -470,7 +497,7 @@ impl TableSchema {
     pub fn without_rowid_pk_orders(&self) -> Vec<KeySortOrder> {
         self.without_rowid_pk_cols
             .iter()
-            .map(|ic| ic.sort_order)
+            .map(|ic| ic.sort_order.clone())
             .collect()
     }
 
@@ -610,9 +637,10 @@ impl IndexSchema {
     /// - Rowid table index: `[indexed_col_0, ..., indexed_col_{k-1}, trailing_rowid]`
     /// - `WITHOUT ROWID` index: `[indexed_col_0, ..., indexed_col_{k-1}, trailing_pk_cols...]`
     pub fn key_sort_orders(&self) -> Vec<KeySortOrder> {
-        let mut orders: Vec<KeySortOrder> = self.columns.iter().map(|c| c.sort_order).collect();
+        let mut orders: Vec<KeySortOrder> =
+            self.columns.iter().map(|c| c.sort_order.clone()).collect();
         if self.table_without_rowid {
-            orders.extend(self.trailing_pk_cols.iter().map(|c| c.sort_order));
+            orders.extend(self.trailing_pk_cols.iter().map(|c| c.sort_order.clone()));
         } else {
             // Trailing table rowid tie-breaker is always ASC BINARY
             orders.push(KeySortOrder::default());
@@ -646,7 +674,11 @@ impl IndexSchema {
     /// index that stores `pk_col` of its `WITHOUT ROWID` table.
     pub fn without_rowid_pk_slot_in_index(&self, pk_col: &IndexedColSchema) -> Option<usize> {
         if let Some(pos) = self.columns.iter().position(|ic| {
-            ic.col_idx == pk_col.col_idx && ic.sort_order.collation == pk_col.sort_order.collation
+            ic.col_idx == pk_col.col_idx
+                && ic
+                    .sort_order
+                    .collation_name()
+                    .eq_ignore_ascii_case(pk_col.sort_order.collation_name())
         }) {
             return Some(pos);
         }
@@ -654,7 +686,10 @@ impl IndexSchema {
             .iter()
             .position(|tc| {
                 tc.col_idx == pk_col.col_idx
-                    && tc.sort_order.collation == pk_col.sort_order.collation
+                    && tc
+                        .sort_order
+                        .collation_name()
+                        .eq_ignore_ascii_case(pk_col.sort_order.collation_name())
             })
             .map(|tpos| self.columns.len() + tpos)
     }
@@ -808,6 +843,16 @@ impl Schema {
             }
         }
         roots
+    }
+
+    /// Re-binds all custom collation comparators on tables and indexes in this schema against `collations`.
+    pub fn rebind_collations(&mut self, collations: &CollationRegistry) {
+        for tbl in &mut self.tables {
+            rebind_table_collations(tbl, collations);
+        }
+        for idx in &mut self.indexes {
+            rebind_index_collations(idx, collations);
+        }
     }
 
     /// Ensures `self` matches the on-disk `schema_cookie` and page presence inside an active read/write transaction.
@@ -1406,6 +1451,7 @@ pub fn build_table_schema_from_ast(
 
         let affinity = resolve_column_affinity(tbl_name, &cdef.name, &cdef.type_name, ct.strict)?;
         let mut collation = Collation::Binary;
+        let mut custom_collation: Option<String> = None;
         let mut not_null = None;
         let mut default_expr = None;
         let mut generated = None;
@@ -1462,12 +1508,13 @@ pub fn build_table_schema_from_ast(
                     generated = Some((e.clone(), *s));
                 }
                 ColumnConstraint::Collate(cname) => {
-                    collation = Collation::from_name(cname).ok_or_else(|| {
-                        SqliteError::new(
-                            ErrorCode::Error,
-                            format!("no such collation sequence: {cname}"),
-                        )
-                    })?;
+                    if let Some(c) = Collation::from_name(cname) {
+                        collation = c;
+                        custom_collation = None;
+                    } else {
+                        collation = Collation::Binary;
+                        custom_collation = Some(cname.clone());
+                    }
                 }
                 ColumnConstraint::ForeignKey {
                     ref_table,
@@ -1507,6 +1554,7 @@ pub fn build_table_schema_from_ast(
             type_name: cdef.type_name.clone(),
             affinity,
             collation,
+            custom_collation: custom_collation.clone(),
             not_null,
             default_expr,
             generated,
@@ -1547,6 +1595,9 @@ pub fn build_table_schema_from_ast(
                             desc: pk_desc,
                             nulls_last: pk_desc,
                             collation,
+                            custom_collation: custom_collation
+                                .as_deref()
+                                .map(CustomCollation::unbound),
                         },
                     }],
                 )?;
@@ -1567,6 +1618,7 @@ pub fn build_table_schema_from_ast(
                         desc: false,
                         nulls_last: false,
                         collation,
+                        custom_collation: custom_collation.as_deref().map(CustomCollation::unbound),
                     },
                 }],
             )?;
@@ -1730,7 +1782,11 @@ pub fn build_table_schema_from_ast(
                 ));
             }
             let is_dup = without_rowid_pk_cols.iter().any(|prev: &IndexedColSchema| {
-                prev.col_idx == ic.col_idx && prev.sort_order.collation == ic.sort_order.collation
+                prev.col_idx == ic.col_idx
+                    && prev
+                        .sort_order
+                        .collation_name()
+                        .eq_ignore_ascii_case(ic.sort_order.collation_name())
             });
             if !is_dup {
                 without_rowid_pk_cols.push(ic);
@@ -1742,7 +1798,10 @@ pub fn build_table_schema_from_ast(
             for pk_ic in &without_rowid_pk_cols {
                 let is_dup = u_auto.columns.iter().any(|ic| {
                     ic.col_idx == pk_ic.col_idx
-                        && ic.sort_order.collation == pk_ic.sort_order.collation
+                        && ic
+                            .sort_order
+                            .collation_name()
+                            .eq_ignore_ascii_case(pk_ic.sort_order.collation_name())
                 });
                 if !is_dup {
                     let mut trailing = pk_ic.clone();
@@ -1804,7 +1863,10 @@ fn push_inline_autoindex(
     for existing in inline_autos.iter_mut() {
         if existing.columns.len() == columns.len()
             && existing.columns.iter().zip(columns.iter()).all(|(a, b)| {
-                a.col_idx == b.col_idx && a.sort_order.collation == b.sort_order.collation
+                a.col_idx == b.col_idx
+                    && a.sort_order
+                        .collation_name()
+                        .eq_ignore_ascii_case(b.sort_order.collation_name())
             })
         {
             if origin == "pk" {
@@ -1858,7 +1920,11 @@ pub fn build_index_schema_from_ast(
         // preserving `pPk->aSortOrder[j]`!
         for pk_ic in &tbl.without_rowid_pk_cols {
             let is_dup = resolved.iter().any(|ic| {
-                ic.col_idx == pk_ic.col_idx && ic.sort_order.collation == pk_ic.sort_order.collation
+                ic.col_idx == pk_ic.col_idx
+                    && ic
+                        .sort_order
+                        .collation_name()
+                        .eq_ignore_ascii_case(pk_ic.sort_order.collation_name())
             });
             if !is_dup {
                 trailing_pk_cols.push(pk_ic.clone());
@@ -2038,6 +2104,7 @@ pub fn build_column_schema_from_def(
 ) -> Result<ColumnSchema> {
     let affinity = resolve_column_affinity(tbl_name, &cdef.name, &cdef.type_name, strict)?;
     let mut collation = Collation::Binary;
+    let mut custom_collation = None;
     let mut not_null = None;
     let mut default_expr = None;
     let mut generated = None;
@@ -2078,12 +2145,13 @@ pub fn build_column_schema_from_def(
                 generated = Some((expr.clone(), false));
             }
             ColumnConstraint::Collate(cname) => {
-                collation = Collation::from_name(cname).ok_or_else(|| {
-                    SqliteError::new(
-                        ErrorCode::Error,
-                        format!("no such collation sequence: {cname}"),
-                    )
-                })?;
+                if let Some(c) = Collation::from_name(cname) {
+                    collation = c;
+                    custom_collation = None;
+                } else {
+                    collation = Collation::Binary;
+                    custom_collation = Some(cname.clone());
+                }
             }
             _ => {}
         }
@@ -2105,6 +2173,7 @@ pub fn build_column_schema_from_def(
         type_name: cdef.type_name.clone(),
         affinity,
         collation,
+        custom_collation,
         not_null,
         default_expr,
         generated,
@@ -2128,14 +2197,15 @@ fn resolve_indexed_columns(
                     "expressions prohibited in PRIMARY KEY and UNIQUE constraints",
                 ));
             }
-            let collation = match &ic.collation {
-                Some(cname) => Collation::from_name(cname).ok_or_else(|| {
-                    SqliteError::new(
-                        ErrorCode::Error,
-                        format!("no such collation sequence: {cname}"),
-                    )
-                })?,
-                None => Collation::Binary,
+            let (collation, custom_collation) = match &ic.collation {
+                Some(cname) => match Collation::from_name(cname) {
+                    Some(c) => (c, None),
+                    None => (
+                        Collation::Binary,
+                        Some(CustomCollation::unbound(cname.as_str())),
+                    ),
+                },
+                None => (Collation::Binary, None),
             };
             let desc = ic.desc;
             let nulls_last = ic.nulls_last.unwrap_or(desc);
@@ -2147,6 +2217,7 @@ fn resolve_indexed_columns(
                     desc,
                     nulls_last,
                     collation,
+                    custom_collation,
                 },
             });
             continue;
@@ -2161,14 +2232,21 @@ fn resolve_indexed_columns(
                 format!("no such column: {}", ic.name),
             ));
         };
-        let collation = match &ic.collation {
-            Some(cname) => Collation::from_name(cname).ok_or_else(|| {
-                SqliteError::new(
-                    ErrorCode::Error,
-                    format!("no such collation sequence: {cname}"),
-                )
-            })?,
-            None => col_schema.collation,
+        let (collation, custom_collation) = match &ic.collation {
+            Some(cname) => match Collation::from_name(cname) {
+                Some(c) => (c, None),
+                None => (
+                    Collation::Binary,
+                    Some(CustomCollation::unbound(cname.as_str())),
+                ),
+            },
+            None => (
+                col_schema.collation,
+                col_schema
+                    .custom_collation
+                    .as_deref()
+                    .map(CustomCollation::unbound),
+            ),
         };
         let desc = ic.desc;
         let nulls_last = ic.nulls_last.unwrap_or(desc);
@@ -2180,10 +2258,103 @@ fn resolve_indexed_columns(
                 desc,
                 nulls_last,
                 collation,
+                custom_collation,
             },
         });
     }
     Ok(out)
+}
+
+fn rebind_indexed_col_collation(ic: &mut IndexedColSchema, collations: &CollationRegistry) {
+    if let Some(ref cc) = ic.sort_order.custom_collation {
+        let name = cc.name.to_string();
+        ic.sort_order = collations.resolve_key_sort_order_or_unbound(
+            &name,
+            ic.sort_order.desc,
+            ic.sort_order.nulls_last,
+        );
+    }
+}
+
+pub fn rebind_table_collations(tbl: &mut TableSchema, collations: &CollationRegistry) {
+    for ic in &mut tbl.without_rowid_pk_cols {
+        rebind_indexed_col_collation(ic, collations);
+    }
+}
+
+pub fn rebind_pending_autoindex_collations(
+    auto: &mut PendingAutoIndex,
+    collations: &CollationRegistry,
+) {
+    for ic in &mut auto.columns {
+        rebind_indexed_col_collation(ic, collations);
+    }
+    for ic in &mut auto.trailing_pk_cols {
+        rebind_indexed_col_collation(ic, collations);
+    }
+}
+
+pub fn rebind_index_collations(idx: &mut IndexSchema, collations: &CollationRegistry) {
+    for ic in &mut idx.columns {
+        rebind_indexed_col_collation(ic, collations);
+    }
+    for ic in &mut idx.trailing_pk_cols {
+        rebind_indexed_col_collation(ic, collations);
+    }
+}
+
+pub fn validate_table_collations(
+    tbl: &TableSchema,
+    autos: &[PendingAutoIndex],
+    collations: &CollationRegistry,
+) -> Result<()> {
+    for col in &tbl.columns {
+        if let Some(ref cname) = col.custom_collation
+            && !collations.has_collation(cname)
+        {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such collation sequence: {cname}"),
+            ));
+        }
+    }
+    for ic in &tbl.without_rowid_pk_cols {
+        if let Some(ref cc) = ic.sort_order.custom_collation
+            && !collations.has_collation(&cc.name)
+        {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such collation sequence: {}", cc.name),
+            ));
+        }
+    }
+    for auto in autos {
+        for ic in auto.columns.iter().chain(auto.trailing_pk_cols.iter()) {
+            if let Some(ref cc) = ic.sort_order.custom_collation
+                && !collations.has_collation(&cc.name)
+            {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such collation sequence: {}", cc.name),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_index_collations(idx: &IndexSchema, collations: &CollationRegistry) -> Result<()> {
+    for ic in idx.columns.iter().chain(idx.trailing_pk_cols.iter()) {
+        if let Some(ref cc) = ic.sort_order.custom_collation
+            && !collations.has_collation(&cc.name)
+        {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such collation sequence: {}", cc.name),
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ============================================================================

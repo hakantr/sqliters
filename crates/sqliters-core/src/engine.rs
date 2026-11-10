@@ -3,7 +3,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -28,6 +28,7 @@ use sqliters_types::{
     Collation, ConflictResolutionEffect, DatabaseId, DatabaseKind, ErrorCode, ExecutionServices,
     FunctionFlags, KeySortOrder, Pgno, Result, RuntimeValue, SqliteError, TextEncoding,
     TypeAffinity, Value, decode_record_with_encoding, encode_record_with_encoding, extended,
+    fallible_sort_by,
 };
 use sqliters_vdbe::{
     AggregateAccumulator, AggregateKind, Opcode, VmRuntimeContext, builtin_window_arity,
@@ -47,7 +48,8 @@ use crate::compiler::{
 use crate::db_set::{DatabaseSet, ResolvedRelation, SchemaInstanceId, TempStoreMode};
 use crate::execution_context::{
     CollationRegistry, CommitCoordinatorHooks, ExecutionContext, FunctionRegistry, MutationContext,
-    MutationOrigin, MutationPipeline, MutationRow, ProgressTracker,
+    MutationOrigin, MutationPipeline, MutationRow, ProgressTracker, catch_callback_panic,
+    catch_infallible_callback_panic,
 };
 use crate::schema::{
     ColumnSchema, ForeignKeySchema, IndexSchema, IndexedColSchema, Schema, TableRowKey,
@@ -55,7 +57,7 @@ use crate::schema::{
     build_table_schema_from_ast, delete_schema_entry, fix_permanent_view_select,
     insert_schema_entry, scan_index_incremental, scan_index_incremental_with_services,
     scan_table_incremental, scan_table_incremental_with_services, update_schema_entry,
-    validate_view_no_parameters,
+    validate_table_collations, validate_view_no_parameters,
 };
 use crate::trigger::{
     CreateTriggerPlan, TriggerEventKind, effective_trigger_step_conflict, expr_contains_raise,
@@ -148,24 +150,28 @@ impl BusyPolicy {
         !matches!(self, Self::None)
     }
 
-    pub(crate) fn invoke_once(&mut self, count: u32, start: std::time::Instant) -> bool {
+    pub(crate) fn invoke_once_fallible(
+        &mut self,
+        count: u32,
+        start: std::time::Instant,
+    ) -> Result<bool> {
         const DELAYS_MS: [u64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
         match self {
-            Self::None => false,
-            Self::Custom(cb) => cb(count),
+            Self::None => Ok(false),
+            Self::Custom(cb) => catch_infallible_callback_panic("busy_handler", || cb(count)),
             Self::TimeoutMs(tm) => {
                 let limit = *tm;
                 if limit == 0 {
-                    return false;
+                    return Ok(false);
                 }
                 let elapsed = start.elapsed().as_millis() as u64;
                 if elapsed >= limit {
-                    return false;
+                    return Ok(false);
                 }
                 let base_delay = DELAYS_MS.get(count as usize).copied().unwrap_or(100);
                 let sleep_ms = base_delay.min(limit - elapsed).max(1);
                 std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
-                true
+                Ok(true)
             }
         }
     }
@@ -189,7 +195,7 @@ impl BusyPolicy {
                         && e.extended_code != extended::SQLITE_BUSY_SNAPSHOT =>
                 {
                     btree.check_interrupted()?;
-                    if !self.invoke_once(count, start) {
+                    if !self.invoke_once_fallible(count, start)? {
                         return Err(e);
                     }
                     count = count.saturating_add(1);
@@ -207,8 +213,21 @@ impl BusyPolicy {
     ) -> Result<WalCheckpointResult> {
         if mode > WalCheckpointMode::Passive && self.has_handler() {
             let start = std::time::Instant::now();
-            let mut cb = |count: u32| self.invoke_once(count, start);
-            btree.wal_checkpoint(mode, Some(&mut cb))
+            let mut panic_err: Option<SqliteError> = None;
+            let res = {
+                let mut cb = |count: u32| match self.invoke_once_fallible(count, start) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        panic_err = Some(e);
+                        false
+                    }
+                };
+                btree.wal_checkpoint(mode, Some(&mut cb))
+            };
+            if let Some(pe) = panic_err {
+                return Err(pe);
+            }
+            res
         } else {
             btree.wal_checkpoint(mode, None)
         }
@@ -279,6 +298,18 @@ impl ExecContext<'_> {
     }
 
     #[inline]
+    pub(crate) fn dispatch_mutation(&mut self, event: MutationContext) -> Result<()> {
+        let db_name = self
+            .db_set
+            .slot(event.db_id)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "main".to_owned());
+        self.publish();
+        self.mutation_pipeline
+            .dispatch_with_db_name(event, &db_name)
+    }
+
+    #[inline]
     pub(crate) fn step_tick(&mut self) -> Result<()> {
         if self
             .interrupt_flag
@@ -294,6 +325,7 @@ impl ExecContext<'_> {
         name: &str,
         args: &[RuntimeValue],
     ) -> Result<RuntimeValue> {
+        self.publish();
         let enc = self.encoding();
         let mut svc = ExecutionContext {
             interrupt_flag: self.interrupt_flag,
@@ -391,6 +423,7 @@ impl ExecContext<'_> {
             false
         };
         if reloaded {
+            slot.schema.rebind_collations(self.collations);
             self.db_set.reconcile_temp_triggers()?;
         }
         Ok(())
@@ -449,6 +482,7 @@ impl ExecContext<'_> {
             false
         };
         if reloaded {
+            slot.schema.rebind_collations(self.collations);
             self.db_set.reconcile_temp_triggers()?;
         }
         Ok(())
@@ -935,7 +969,7 @@ fn exec_attach_database(
     }
 
     // Eagerly read and validate schema (`sqlite3InitOne` in `attach.c:226-240`).
-    let loaded_schema = match ctx
+    let mut loaded_schema = match ctx
         .busy_policy
         .retry_btree(&mut new_bt, |b| Schema::load_for_schema(b, Some(&z_name)))
     {
@@ -945,6 +979,7 @@ fn exec_attach_database(
             return Err(e);
         }
     };
+    loaded_schema.rebind_collations(ctx.collations);
 
     if new_bt.pager().page_count() > 0 {
         if new_bt.encoding() != expected_enc {
@@ -1053,8 +1088,9 @@ pub(crate) fn rollback_all_databases(
     if reload_schemas_if_changed && *ctx.schema_changed_in_tx {
         for slot in ctx.db_set.slots_mut() {
             if let Some(ref mut bt) = slot.btree
-                && let Ok(fresh) = Schema::load_for_schema(bt, Some(&slot.name))
+                && let Ok(mut fresh) = Schema::load_for_schema(bt, Some(&slot.name))
             {
+                fresh.rebind_collations(ctx.collations);
                 slot.schema = fresh;
             }
         }
@@ -1130,6 +1166,7 @@ pub(crate) fn commit_all_databases(
     // Step 4: Invoke connection commit hook (`xCommitCallback`, `vdbeaux.c:2997-3002`).
     // Non-zero (`true`) aborts with `SQLITE_CONSTRAINT_COMMITHOOK` and rolls back ALL write transactions!
     if need_xcommit {
+        ctx.publish();
         let enc = ctx.encoding();
         let hook_res = {
             let mut exec_svc = ExecutionContext {
@@ -1144,7 +1181,21 @@ pub(crate) fn commit_all_databases(
             exec_svc.invoke_commit_hook(ctx.commit_hooks)
         };
         if let Err(e) = hook_res {
+            *ctx.explicit_tx = false;
+            *ctx.implicit_savepoint_tx = false;
+            *ctx.in_user_btree_tx = false;
             let _ = rollback_all_databases(ctx, true);
+            *ctx.schema_changed_in_tx = false;
+            ctx.savepoints.clear();
+            ctx.deferred_fk_suspects.clear();
+            *ctx.rollback_count += 1;
+            ctx.publish();
+            let rb_hook_res = ctx.commit_hooks.invoke_rollback_hook();
+            if e.code == ErrorCode::Constraint
+                && let Err(rb_err) = rb_hook_res
+            {
+                return Err((rb_err, CommitFailureDisposition::RolledBack));
+            }
             return Err((e, CommitFailureDisposition::RolledBack));
         }
     }
@@ -1351,6 +1402,7 @@ pub(crate) struct ScopedColumn {
     table_alias: Option<String>,
     name: String,
     collation: Collation,
+    custom_collation: Option<String>,
     affinity: Option<TypeAffinity>,
     hidden_rowid: bool,
     omit_from_star: bool,
@@ -1444,6 +1496,41 @@ impl EvalRow {
         cref: &ColumnRef,
     ) -> Result<Option<(Value, Collation, Option<TypeAffinity>)>> {
         self.lookup_qual_full(cref.schema.as_deref(), cref.table.as_deref(), &cref.column)
+    }
+
+    fn lookup_cref_custom_collation(&self, cref: &ColumnRef) -> Option<&str> {
+        let schema_qual = cref.schema.as_deref();
+        let table_qual = cref.table.as_deref();
+        let col_name = cref.column.as_str();
+        if schema_qual == Some(STAR_SLOT_SCHEMA) {
+            if self.qualified_only {
+                return None;
+            }
+            if let Ok(idx) = col_name.parse::<usize>()
+                && let Some(sc) = self.cols.get(idx)
+            {
+                return sc.custom_collation.as_deref();
+            }
+            return None;
+        }
+        if self.qualified_only && (schema_qual.is_some() || table_qual.is_none()) {
+            return None;
+        }
+        let mut found = None;
+        let mut count = 0usize;
+        for sc in self.cols.iter() {
+            if sc.hidden_rowid || !sc.matches_qualifier(schema_qual, table_qual) {
+                continue;
+            }
+            if sc.name.eq_ignore_ascii_case(col_name) {
+                if schema_qual.is_none() && table_qual.is_none() && sc.merged_using {
+                    return sc.custom_collation.as_deref();
+                }
+                found = sc.custom_collation.as_deref();
+                count += 1;
+            }
+        }
+        if count == 1 { found } else { None }
     }
 
     fn lookup_qual_full(
@@ -1785,7 +1872,6 @@ pub(crate) fn commit_transaction(ctx: &mut ExecContext<'_>) -> Result<()> {
         }
         Err((err, CommitFailureDisposition::LeaveOpen)) => Err(err),
         Err((err, CommitFailureDisposition::RolledBack)) => {
-            *ctx.rollback_count += 1;
             *ctx.explicit_tx = false;
             *ctx.implicit_savepoint_tx = false;
             *ctx.in_user_btree_tx = false;
@@ -1832,7 +1918,6 @@ pub(crate) fn release_savepoint_op(ctx: &mut ExecContext<'_>, sp_name: &str) -> 
             }
             Err((err, CommitFailureDisposition::LeaveOpen)) => Err(err),
             Err((err, CommitFailureDisposition::RolledBack)) => {
-                *ctx.rollback_count += 1;
                 *ctx.explicit_tx = false;
                 *ctx.implicit_savepoint_tx = false;
                 *ctx.in_user_btree_tx = false;
@@ -1972,8 +2057,10 @@ pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
                             .find(|(inst, _)| *inst == db_slot.schema_instance_id)
                         {
                             db_slot.schema = saved_schema.clone();
+                            db_slot.schema.rebind_collations(ctx.collations);
                         } else if let Some(ref mut bt) = db_slot.btree {
                             db_slot.schema = Schema::load_for_schema(bt, Some(&db_slot.name))?;
+                            db_slot.schema.rebind_collations(ctx.collations);
                         }
                     }
                     ctx.db_set.sync_temp_trigger_bindings_from_schema();
@@ -2006,7 +2093,9 @@ pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
                 ctx.deferred_fk_suspects.clear();
                 ctx.mutation_pipeline.clear();
                 ctx.publish();
-                rollback_res
+                rollback_res?;
+                ctx.commit_hooks.invoke_rollback_hook()?;
+                Ok(())
             }
         }
         Stmt::Savepoint(name) => {
@@ -2109,6 +2198,7 @@ pub(crate) fn execute_nolock_stmt(
             key,
         } => {
             exec_attach_database(ctx, expr, schema_name, key.as_ref(), params)?;
+            ctx.db_set.rebind_all_collations(ctx.collations);
             Ok(QueryOutput::default())
         }
         Stmt::DetachDatabase { schema_name } => {
@@ -2209,6 +2299,7 @@ pub(crate) fn execute_write_body(
         }
         Stmt::CreateTable(ct) => {
             exec_create_table(ctx, ct)?;
+            ctx.db_set.rebind_all_collations(ctx.collations);
             Ok(QueryOutput::default())
         }
         Stmt::CreateTableAs {
@@ -2218,6 +2309,7 @@ pub(crate) fn execute_write_body(
             query,
         } => {
             exec_create_table_as(ctx, *temp, *if_not_exists, name, query, params)?;
+            ctx.db_set.rebind_all_collations(ctx.collations);
             Ok(QueryOutput::default())
         }
         Stmt::CreateView(cv) => {
@@ -2230,6 +2322,7 @@ pub(crate) fn execute_write_body(
         }
         Stmt::DropTable { if_exists, name } => {
             exec_drop_table(ctx, *if_exists, name)?;
+            ctx.db_set.rebind_all_collations(ctx.collations);
             Ok(QueryOutput::default())
         }
         Stmt::DropView { if_exists, name } => {
@@ -2242,14 +2335,17 @@ pub(crate) fn execute_write_body(
         }
         Stmt::CreateIndex(ci) => {
             exec_create_index(ctx, ci)?;
+            ctx.db_set.rebind_all_collations(ctx.collations);
             Ok(QueryOutput::default())
         }
         Stmt::DropIndex { if_exists, name } => {
             exec_drop_index(ctx, *if_exists, name)?;
+            ctx.db_set.rebind_all_collations(ctx.collations);
             Ok(QueryOutput::default())
         }
         Stmt::AlterTable { table, action } => {
             exec_alter_table(ctx, table, action)?;
+            ctx.db_set.rebind_all_collations(ctx.collations);
             Ok(QueryOutput::default())
         }
         Stmt::Reindex(target) => {
@@ -2298,6 +2394,7 @@ pub(crate) fn execute_write_body(
                     if let Some(ref mut bt) = slot.btree {
                         bt.pager_mut().header_mut()?.schema_cookie = v;
                         slot.schema = Schema::load_for_schema(bt, Some(&slot_name))?;
+                        slot.schema.rebind_collations(ctx.collations);
                     }
                     *ctx.schema_generation += 1;
                     *ctx.v1_expire_generation += 1;
@@ -2354,6 +2451,7 @@ pub fn execute_statement(
                 && bt.transaction_state() != TransactionState::Open
             {
                 slot.schema.ensure_fresh_in_tx_for_schema(bt, &slot_name)?;
+                slot.schema.rebind_collations(ctx.collations);
             }
         }
     }
@@ -2506,20 +2604,25 @@ where
 
     let step_res = f(ctx);
 
-    let restore_prev_schemas = |db_set: &mut DatabaseSet, prev: &[(SchemaInstanceId, Schema)]| {
-        for slot in db_set.slots_mut() {
-            if let Some((_, saved)) = prev
-                .iter()
-                .find(|(inst, _)| *inst == slot.schema_instance_id)
-            {
-                slot.schema = saved.clone();
-            } else if let Some(ref mut bt) = slot.btree
-                && let Ok(fresh) = Schema::load_for_schema(bt, Some(&slot.name))
-            {
-                slot.schema = fresh;
+    let restore_prev_schemas =
+        |db_set: &mut DatabaseSet,
+         collations: &CollationRegistry,
+         prev: &[(SchemaInstanceId, Schema)]| {
+            for slot in db_set.slots_mut() {
+                if let Some((_, saved)) = prev
+                    .iter()
+                    .find(|(inst, _)| *inst == slot.schema_instance_id)
+                {
+                    slot.schema = saved.clone();
+                    slot.schema.rebind_collations(collations);
+                } else if let Some(ref mut bt) = slot.btree
+                    && let Ok(mut fresh) = Schema::load_for_schema(bt, Some(&slot.name))
+                {
+                    fresh.rebind_collations(collations);
+                    slot.schema = fresh;
+                }
             }
-        }
-    };
+        };
 
     match step_res {
         Ok(out) => {
@@ -2537,6 +2640,8 @@ where
             }
             if autocommit && ctx.activity.other_writers == 0 {
                 if let Err((commit_err, disp)) = commit_all_databases(ctx) {
+                    let had_write_tx = disp == CommitFailureDisposition::LeaveOpen
+                        && ctx.db_set.any_in_write_transaction();
                     if disp == CommitFailureDisposition::LeaveOpen {
                         let _ = rollback_all_databases(ctx, false);
                     }
@@ -2547,11 +2652,14 @@ where
                     ctx.runtime.last_changes = abort_last_changes;
                     ctx.runtime.last_insert_rowid = prev_last_rowid;
                     if *ctx.schema_generation != prev_schema_gen {
-                        restore_prev_schemas(ctx.db_set, &prev_schemas);
+                        restore_prev_schemas(ctx.db_set, ctx.collations, &prev_schemas);
                         *ctx.schema_generation += 1;
                         *ctx.v1_expire_generation += 1;
                     }
                     ctx.publish();
+                    if had_write_tx {
+                        let _ = ctx.commit_hooks.invoke_rollback_hook();
+                    }
                     return Err(commit_err);
                 }
                 *ctx.schema_changed_in_tx = false;
@@ -2586,6 +2694,8 @@ where
                 }
                 if autocommit && ctx.activity.other_writers == 0 {
                     if let Err((cm_err, disp)) = commit_all_databases(ctx) {
+                        let had_write_tx = disp == CommitFailureDisposition::LeaveOpen
+                            && ctx.db_set.any_in_write_transaction();
                         if disp == CommitFailureDisposition::LeaveOpen {
                             let _ = rollback_all_databases(ctx, false);
                         }
@@ -2600,11 +2710,14 @@ where
                         ctx.runtime.last_changes = 0;
                         ctx.runtime.last_insert_rowid = prev_last_rowid;
                         if *ctx.schema_generation != prev_schema_gen {
-                            restore_prev_schemas(ctx.db_set, &prev_schemas);
+                            restore_prev_schemas(ctx.db_set, ctx.collations, &prev_schemas);
                             *ctx.schema_generation += 1;
                             *ctx.v1_expire_generation += 1;
                         }
                         ctx.publish();
+                        if had_write_tx {
+                            let _ = ctx.commit_hooks.invoke_rollback_hook();
+                        }
                         return Err(cm_err);
                     }
                     *ctx.schema_changed_in_tx = false;
@@ -2616,6 +2729,7 @@ where
                 || (autocommit && ctx.activity.other_writers == 0)
                 || err.code == ErrorCode::Full
             {
+                let had_tx = !autocommit || ctx.db_set.any_in_write_transaction();
                 let _ = rollback_all_databases(ctx, false);
                 if !autocommit {
                     *ctx.rollback_count += 1;
@@ -2635,11 +2749,14 @@ where
                 ctx.runtime.last_changes = abort_last_changes;
                 ctx.runtime.last_insert_rowid = prev_last_rowid;
                 if *ctx.schema_generation != prev_schema_gen {
-                    restore_prev_schemas(ctx.db_set, &prev_schemas);
+                    restore_prev_schemas(ctx.db_set, ctx.collations, &prev_schemas);
                     *ctx.schema_generation += 1;
                     *ctx.v1_expire_generation += 1;
                 }
                 ctx.publish();
+                if had_tx {
+                    let _ = ctx.commit_hooks.invoke_rollback_hook();
+                }
                 Err(err)
             } else {
                 let stmt_changed_schema = *ctx.schema_generation != prev_schema_gen;
@@ -2665,7 +2782,7 @@ where
                 ctx.runtime.last_changes = abort_last_changes;
                 ctx.runtime.last_insert_rowid = prev_last_rowid;
                 if stmt_changed_schema {
-                    restore_prev_schemas(ctx.db_set, &prev_schemas);
+                    restore_prev_schemas(ctx.db_set, ctx.collations, &prev_schemas);
                     *ctx.schema_generation += 1;
                     *ctx.v1_expire_generation = prev_v1_gen + 1;
                     *ctx.schema_changed_in_tx = prev_schema_changed;
@@ -3161,33 +3278,6 @@ fn check_recursive_arm_no_aggregates(rec_core: &SelectCore) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone)]
-struct DedupRow {
-    vals: Vec<Value>,
-    specs: Rc<[KeySortOrder]>,
-    enc: TextEncoding,
-}
-
-impl PartialEq for DedupRow {
-    fn eq(&self, other: &Self) -> bool {
-        compare_value_slices(&self.vals, &other.vals, &self.specs, self.enc) == Ordering::Equal
-    }
-}
-
-impl Eq for DedupRow {}
-
-impl PartialOrd for DedupRow {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for DedupRow {
-    fn cmp(&self, other: &Self) -> Ordering {
-        compare_value_slices(&self.vals, &other.vals, &self.specs, self.enc)
-    }
-}
-
 fn resolve_cte(
     ctx: &mut ExecContext<'_>,
     ctes: &CteStore,
@@ -3474,6 +3564,7 @@ fn exec_recursive_cte(
             desc: false,
             nulls_last: false,
             collation: coll,
+            custom_collation: None,
         })
         .collect::<Vec<_>>()
         .into();
@@ -3492,7 +3583,12 @@ fn exec_recursive_cte(
                 ));
             }
         }
-        resolve_compound_order_by_specs(&all_arm_col_names, &col_collations, &cte.query.order_by)?
+        resolve_compound_order_by_specs(
+            &all_arm_col_names,
+            &col_collations,
+            &cte.query.order_by,
+            Some(ctx.collations),
+        )?
     };
 
     // Evaluate optional CTE-level `LIMIT` / `OFFSET`
@@ -3539,6 +3635,7 @@ fn exec_recursive_cte(
                     table_alias: Some(sh.eff_alias.clone()),
                     name: cn.clone(),
                     collation: coll,
+                    custom_collation: None,
                     affinity: aff,
                     hidden_rowid: false,
                     omit_from_star: false,
@@ -3560,39 +3657,40 @@ fn exec_recursive_cte(
     };
 
     let enc = ctx.encoding();
-    let mut seen: BTreeSet<DedupRow> = BTreeSet::new();
+    let mut seen: Vec<Vec<Value>> = Vec::new();
     let mut queue: VecDeque<Vec<Value>> = VecDeque::new();
 
     let enqueue_row = |queue: &mut VecDeque<Vec<Value>>,
-                       seen: &mut BTreeSet<DedupRow>,
-                       row: Vec<Value>,
-                       collations: &CollationRegistry| {
-        if is_union_distinct
-            && !seen.insert(DedupRow {
-                vals: row.clone(),
-                specs: Rc::clone(&dedup_specs),
-                enc,
-            })
-        {
-            return;
+                       seen: &mut Vec<Vec<Value>>,
+                       row: Vec<Value>|
+     -> Result<()> {
+        if is_union_distinct {
+            for prev in seen.iter() {
+                if compare_value_slices(prev, &row, &dedup_specs, enc)? == Ordering::Equal {
+                    return Ok(());
+                }
+            }
+            seen.push(row.clone());
         }
         if order_specs.is_empty() {
             queue.push_back(row);
         } else {
-            let pos = queue
-                .iter()
-                .position(|existing| {
-                    compare_compound_order_rows(&row, existing, &order_specs, collations, enc)
-                        == Ordering::Less
-                })
-                .unwrap_or(queue.len());
+            let mut pos = queue.len();
+            for (idx, existing) in queue.iter().enumerate() {
+                if compare_compound_order_rows(&row, existing, &order_specs, enc)? == Ordering::Less
+                {
+                    pos = idx;
+                    break;
+                }
+            }
             queue.insert(pos, row);
         }
+        Ok(())
     };
 
     for r in seed_out.rows {
         ctx.step_tick()?;
-        enqueue_row(&mut queue, &mut seen, r, ctx.collations);
+        enqueue_row(&mut queue, &mut seen, r)?;
     }
 
     let mut out_rows = Vec::new();
@@ -3662,7 +3760,7 @@ fn exec_recursive_cte(
             }
             for nr in rhs_out.rows {
                 ctx.step_tick()?;
-                enqueue_row(&mut queue, &mut seen, nr, ctx.collations);
+                enqueue_row(&mut queue, &mut seen, nr)?;
             }
         }
     }
@@ -3696,6 +3794,7 @@ fn exec_compound_select(
             desc: false,
             nulls_last: false,
             collation: coll,
+            custom_collation: None,
         })
         .collect();
 
@@ -3719,45 +3818,84 @@ fn exec_compound_select(
             }
             CompoundOp::Union => {
                 acc_rows.extend(rhs_out.rows);
-                acc_rows.sort_by(|a, b| compare_value_slices(a, b, &default_specs, enc));
-                acc_rows.dedup_by(|a, b| {
-                    if compare_value_slices(a, b, &default_specs, enc) == Ordering::Equal {
-                        *b = std::mem::take(a);
-                        true
+                fallible_sort_by(&mut acc_rows, |a, b| {
+                    compare_value_slices(a, b, &default_specs, enc)
+                })?;
+                let mut deduped: Vec<Vec<Value>> = Vec::with_capacity(acc_rows.len());
+                for row in acc_rows {
+                    if let Some(last) = deduped.last_mut()
+                        && compare_value_slices(&row, last, &default_specs, enc)? == Ordering::Equal
+                    {
+                        *last = row;
                     } else {
-                        false
+                        deduped.push(row);
                     }
-                });
+                }
+                acc_rows = deduped;
             }
             CompoundOp::Intersect => {
                 let mut rhs_sorted = rhs_out.rows;
-                rhs_sorted.sort_by(|a, b| compare_value_slices(a, b, &default_specs, enc));
-                acc_rows.sort_by(|a, b| compare_value_slices(a, b, &default_specs, enc));
-                acc_rows.dedup_by(|a, b| {
-                    compare_value_slices(a, b, &default_specs, enc) == Ordering::Equal
-                });
-                acc_rows.retain(|r| {
-                    rhs_sorted
-                        .binary_search_by(|probe| {
-                            compare_value_slices(probe, r, &default_specs, enc)
-                        })
-                        .is_ok()
-                });
+                fallible_sort_by(&mut rhs_sorted, |a, b| {
+                    compare_value_slices(a, b, &default_specs, enc)
+                })?;
+                fallible_sort_by(&mut acc_rows, |a, b| {
+                    compare_value_slices(a, b, &default_specs, enc)
+                })?;
+                let mut kept: Vec<Vec<Value>> = Vec::with_capacity(acc_rows.len());
+                for row in acc_rows {
+                    if let Some(last) = kept.last()
+                        && compare_value_slices(last, &row, &default_specs, enc)? == Ordering::Equal
+                    {
+                        continue;
+                    }
+                    let mut in_rhs = false;
+                    for probe in &rhs_sorted {
+                        match compare_value_slices(probe, &row, &default_specs, enc)? {
+                            Ordering::Less => {}
+                            Ordering::Equal => {
+                                in_rhs = true;
+                                break;
+                            }
+                            Ordering::Greater => break,
+                        }
+                    }
+                    if in_rhs {
+                        kept.push(row);
+                    }
+                }
+                acc_rows = kept;
             }
             CompoundOp::Except => {
                 let mut rhs_sorted = rhs_out.rows;
-                rhs_sorted.sort_by(|a, b| compare_value_slices(a, b, &default_specs, enc));
-                acc_rows.sort_by(|a, b| compare_value_slices(a, b, &default_specs, enc));
-                acc_rows.dedup_by(|a, b| {
-                    compare_value_slices(a, b, &default_specs, enc) == Ordering::Equal
-                });
-                acc_rows.retain(|r| {
-                    rhs_sorted
-                        .binary_search_by(|probe| {
-                            compare_value_slices(probe, r, &default_specs, enc)
-                        })
-                        .is_err()
-                });
+                fallible_sort_by(&mut rhs_sorted, |a, b| {
+                    compare_value_slices(a, b, &default_specs, enc)
+                })?;
+                fallible_sort_by(&mut acc_rows, |a, b| {
+                    compare_value_slices(a, b, &default_specs, enc)
+                })?;
+                let mut kept: Vec<Vec<Value>> = Vec::with_capacity(acc_rows.len());
+                for row in acc_rows {
+                    if let Some(last) = kept.last()
+                        && compare_value_slices(last, &row, &default_specs, enc)? == Ordering::Equal
+                    {
+                        continue;
+                    }
+                    let mut in_rhs = false;
+                    for probe in &rhs_sorted {
+                        match compare_value_slices(probe, &row, &default_specs, enc)? {
+                            Ordering::Less => {}
+                            Ordering::Equal => {
+                                in_rhs = true;
+                                break;
+                            }
+                            Ordering::Greater => break,
+                        }
+                    }
+                    if !in_rhs {
+                        kept.push(row);
+                    }
+                }
+                acc_rows = kept;
             }
         }
     }
@@ -3769,6 +3907,7 @@ fn exec_compound_select(
             &all_arm_col_names,
             &col_collations,
             order_by,
+            ctx.collations,
             enc,
         )?;
     }
@@ -3900,7 +4039,14 @@ fn exec_single_select_core(
                 let enc = ctx.encoding();
                 let arm_cols = vec![col_names.clone()];
                 let default_colls = vec![Collation::Binary; col_names.len()];
-                sort_materialized_output(&mut rows, &arm_cols, &default_colls, order_by, enc)?;
+                sort_materialized_output(
+                    &mut rows,
+                    &arm_cols,
+                    &default_colls,
+                    order_by,
+                    ctx.collations,
+                    enc,
+                )?;
             }
             let rows = apply_limit_offset(ctx, rows, limit, params, outer_scopes, ctes)?;
             Ok(QueryOutput {
@@ -4424,17 +4570,26 @@ fn exec_single_select_core(
 
             if *distinct {
                 let enc = ctx.encoding();
-                let dist_specs: Vec<KeySortOrder> = expanded_proj
+                let mut dist_specs = Vec::with_capacity(expanded_proj.len());
+                for (pe, _, _) in &expanded_proj {
+                    if let Some(cname) = infer_expr_custom_collation_from_cols(pe, &sample_cols) {
+                        dist_specs.push(
+                            ctx.collations
+                                .resolve_key_sort_order(&cname, false, false)?,
+                        );
+                    } else {
+                        dist_specs.push(KeySortOrder {
+                            desc: false,
+                            nulls_last: false,
+                            collation: infer_expr_collation_from_cols(pe, &sample_cols),
+                            custom_collation: None,
+                        });
+                    }
+                }
+                let has_custom_coll = dist_specs
                     .iter()
-                    .map(|(pe, _, _)| KeySortOrder {
-                        desc: false,
-                        nulls_last: false,
-                        collation: infer_expr_collation_from_cols(pe, &sample_cols),
-                    })
-                    .collect();
-                let has_custom_coll = dist_specs.iter().any(|s| s.collation != Collation::Binary);
+                    .any(|s| s.collation != Collation::Binary || s.custom_collation.is_some());
                 if !has_custom_coll {
-                    let mut unique_rows: Vec<Vec<Value>> = Vec::new();
                     let mut seen_bytes = HashSet::new();
                     result_rows_with_sort.retain(|(proj, _)| {
                         let norm: Vec<Value> = proj
@@ -4450,21 +4605,27 @@ fn exec_single_select_core(
                                 other => other.clone(),
                             })
                             .collect();
-                        let _ = &mut unique_rows;
                         seen_bytes.insert(encode_record_with_encoding(&norm, enc))
                     });
                 } else {
                     let mut seen_rows: Vec<Vec<Value>> = Vec::new();
-                    result_rows_with_sort.retain(|(proj, _)| {
-                        if seen_rows.iter().any(|prev| {
-                            compare_value_slices(prev, proj, &dist_specs, enc) == Ordering::Equal
-                        }) {
-                            false
-                        } else {
-                            seen_rows.push(proj.clone());
-                            true
+                    let mut deduped = Vec::with_capacity(result_rows_with_sort.len());
+                    for item in result_rows_with_sort {
+                        let mut dup = false;
+                        for prev in &seen_rows {
+                            if compare_value_slices(prev, &item.0, &dist_specs, enc)?
+                                == Ordering::Equal
+                            {
+                                dup = true;
+                                break;
+                            }
                         }
-                    });
+                        if !dup {
+                            seen_rows.push(item.0.clone());
+                            deduped.push(item);
+                        }
+                    }
+                    result_rows_with_sort = deduped;
                 }
             }
 
@@ -4476,69 +4637,30 @@ fn exec_single_select_core(
             }
             if !order_by.is_empty() {
                 let enc = ctx.encoding();
-                let specs: Vec<(KeySortOrder, Option<String>)> = order_by
-                    .iter()
-                    .map(|ob| {
-                        let custom_coll = match &ob.expr {
-                            Expr::Collate { collation, .. }
-                                if Collation::from_name(collation).is_none() =>
-                            {
-                                Some(collation.clone())
-                            }
-                            _ => None,
-                        };
+                let mut specs: Vec<KeySortOrder> = Vec::with_capacity(order_by.len());
+                for ob in order_by {
+                    let nulls_last = ob.nulls_last.unwrap_or(ob.desc);
+                    if let Some(cname) =
+                        infer_order_by_custom_collation(&ob.expr, &expanded_proj, &sample_cols)
+                    {
+                        specs.push(
+                            ctx.collations
+                                .resolve_key_sort_order(&cname, ob.desc, nulls_last)?,
+                        );
+                    } else {
                         let coll = infer_order_by_collation(&ob.expr, &expanded_proj, &sample_cols);
-                        (
-                            KeySortOrder {
-                                desc: ob.desc,
-                                nulls_last: ob.nulls_last.unwrap_or(ob.desc),
-                                collation: coll,
-                            },
-                            custom_coll,
-                        )
-                    })
-                    .collect();
-
-                let collations = ctx.collations;
-                result_rows_with_sort.sort_by(|(_, sa), (_, sb)| {
-                    for (i, (spec, custom_opt)) in specs.iter().enumerate() {
-                        let a = &sa[i];
-                        let b = &sb[i];
-                        let ord = match (a.is_null(), b.is_null()) {
-                            (true, true) => Ordering::Equal,
-                            (true, false) => {
-                                if spec.nulls_last {
-                                    Ordering::Greater
-                                } else {
-                                    Ordering::Less
-                                }
-                            }
-                            (false, true) => {
-                                if spec.nulls_last {
-                                    Ordering::Less
-                                } else {
-                                    Ordering::Greater
-                                }
-                            }
-                            (false, false) => {
-                                let raw = if let (Some(cname), Value::Text(ls), Value::Text(rs)) =
-                                    (custom_opt.as_deref(), a, b)
-                                {
-                                    collations
-                                        .compare(cname, ls, rs, enc)
-                                        .unwrap_or(Ordering::Equal)
-                                } else {
-                                    a.cmp_sqlite_with_encoding(b, spec.collation, enc)
-                                };
-                                if spec.desc { raw.reverse() } else { raw }
-                            }
-                        };
-                        if ord != Ordering::Equal {
-                            return ord;
-                        }
+                        specs.push(KeySortOrder {
+                            desc: ob.desc,
+                            nulls_last,
+                            collation: coll,
+                            custom_collation: None,
+                        });
                     }
-                    Ordering::Equal
-                });
+                }
+
+                fallible_sort_by(&mut result_rows_with_sort, |(_, sa), (_, sb)| {
+                    compare_value_slices(sa, sb, &specs, enc)
+                })?;
             }
 
             let out_rows: Vec<Vec<Value>> =
@@ -4677,6 +4799,19 @@ fn choose_aggregate_representative_row(
         return Ok(first_row.clone());
     };
 
+    let spec = if let Some(cname) = infer_expr_custom_collation_from_cols(arg_expr, sample_cols) {
+        ctx.collations
+            .resolve_key_sort_order(&cname, false, false)?
+    } else {
+        KeySortOrder {
+            desc: false,
+            nulls_last: false,
+            collation: *coll,
+            custom_collation: None,
+        }
+    };
+    let enc = ctx.encoding();
+
     let mut best_val: Option<Value> = None;
     let mut best_idx: Option<usize> = None;
     for (idx, gr) in group_rows.iter().enumerate() {
@@ -4694,8 +4829,8 @@ fn choose_aggregate_representative_row(
         let is_better = match &best_val {
             None => true,
             Some(cur) => match kind {
-                AggregateKind::Min => val.cmp_sqlite(cur, *coll).is_lt(),
-                AggregateKind::Max => val.cmp_sqlite(cur, *coll).is_gt(),
+                AggregateKind::Min => val.cmp_sqlite_fallible(cur, &spec, enc)?.is_lt(),
+                AggregateKind::Max => val.cmp_sqlite_fallible(cur, &spec, enc)?.is_gt(),
                 _ => false,
             },
         };
@@ -5230,6 +5365,7 @@ fn eval_table_or_subquery(
                             table_alias: Some(eff_alias.clone()),
                             name: cn.clone(),
                             collation: coll,
+                            custom_collation: None,
                             affinity: aff,
                             hidden_rowid: false,
                             omit_from_star: false,
@@ -5269,6 +5405,7 @@ fn eval_table_or_subquery(
                             table_alias: Some(eff_alias.clone()),
                             name: cn,
                             collation: coll,
+                            custom_collation: None,
                             affinity: aff,
                             hidden_rowid: false,
                             omit_from_star: false,
@@ -5311,6 +5448,7 @@ fn eval_table_or_subquery(
                     table_alias: Some(eff_alias.clone()),
                     name: c.name.clone(),
                     collation: c.collation,
+                    custom_collation: c.custom_collation.clone(),
                     affinity: Some(c.affinity),
                     hidden_rowid: false,
                     omit_from_star: false,
@@ -5327,6 +5465,7 @@ fn eval_table_or_subquery(
                     table_alias: Some(eff_alias),
                     name: rid_col_name,
                     collation: Collation::Binary,
+                    custom_collation: None,
                     affinity: Some(TypeAffinity::Integer),
                     hidden_rowid: true,
                     omit_from_star: false,
@@ -5363,6 +5502,7 @@ fn eval_table_or_subquery(
                         table_alias: alias.clone(),
                         name: cn,
                         collation: coll,
+                        custom_collation: None,
                         affinity: aff,
                         hidden_rowid: false,
                         omit_from_star: false,
@@ -6385,6 +6525,7 @@ fn schema_cols_for_tos(
                                 table_alias: Some(eff.clone()),
                                 name: cn.clone(),
                                 collation: coll,
+                                custom_collation: None,
                                 affinity: aff,
                                 hidden_rowid: false,
                                 omit_from_star: false,
@@ -6413,6 +6554,7 @@ fn schema_cols_for_tos(
                     table_alias: Some(eff.clone()),
                     name: c.name.clone(),
                     collation: c.collation,
+                    custom_collation: c.custom_collation.clone(),
                     affinity: Some(c.affinity),
                     hidden_rowid: false,
                     omit_from_star: false,
@@ -6429,6 +6571,7 @@ fn schema_cols_for_tos(
                     table_alias: Some(eff),
                     name: rid_col_name,
                     collation: Collation::Binary,
+                    custom_collation: None,
                     affinity: Some(TypeAffinity::Integer),
                     hidden_rowid: true,
                     omit_from_star: false,
@@ -6455,6 +6598,7 @@ fn schema_cols_for_tos(
                             table_alias: alias.clone(),
                             name: cn,
                             collation: coll,
+                            custom_collation: None,
                             affinity: aff,
                             hidden_rowid: false,
                             omit_from_star: false,
@@ -6629,58 +6773,69 @@ fn build_groups(
         return Ok(Vec::new());
     }
 
-    let mut groups: Vec<(Vec<Value>, Vec<Collation>, Vec<EvalRow>)> = Vec::new();
+    let mut g_specs: Vec<KeySortOrder> = Vec::with_capacity(group_by.len());
+    for ge in group_by {
+        let spec = match ge {
+            Expr::Collate { collation, .. } => ctx
+                .collations
+                .resolve_key_sort_order(collation, false, false)?,
+            Expr::Column(cref) => {
+                if let Some(cname) = rows[0].lookup_cref_custom_collation(cref) {
+                    ctx.collations.resolve_key_sort_order(cname, false, false)?
+                } else {
+                    let coll = rows[0]
+                        .lookup_cref(cref)?
+                        .map_or(Collation::Binary, |(_, c)| c);
+                    KeySortOrder {
+                        desc: false,
+                        nulls_last: false,
+                        collation: coll,
+                        custom_collation: None,
+                    }
+                }
+            }
+            _ => KeySortOrder {
+                desc: false,
+                nulls_last: false,
+                collation: Collation::Binary,
+                custom_collation: None,
+            },
+        };
+        g_specs.push(spec);
+    }
+
+    let mut groups: Vec<(Vec<Value>, Vec<EvalRow>)> = Vec::new();
     for row in rows {
         ctx.step_tick()?;
         let scopes = push_scope(outer_scopes, &row);
         let mut g_vals = Vec::with_capacity(group_by.len());
-        let mut g_colls = Vec::with_capacity(group_by.len());
         for ge in group_by {
             let v = eval_expr(ctx, ge, params, &scopes, ctes, None)?;
-            let coll = match ge {
-                Expr::Collate { collation, .. } => {
-                    Collation::from_name(collation).unwrap_or_default()
-                }
-                Expr::Column(cref) => row.lookup_cref(cref)?.map_or(Collation::Binary, |(_, c)| c),
-                _ => Collation::Binary,
-            };
             g_vals.push(v);
-            g_colls.push(coll);
         }
 
         let enc = ctx.encoding();
-        let existing = groups.iter_mut().find(|(kv, colls, _)| {
-            kv.iter()
-                .zip(g_vals.iter())
-                .zip(colls.iter())
-                .all(|((a, b), &c)| match (a.is_null(), b.is_null()) {
-                    (true, true) => true,
-                    (true, false) | (false, true) => false,
-                    (false, false) => a.cmp_sqlite_with_encoding(b, c, enc) == Ordering::Equal,
-                })
-        });
-        if let Some((_, _, bucket)) = existing {
-            bucket.push(row);
+        let mut matched_idx = None;
+        for (idx, (kv, _)) in groups.iter().enumerate() {
+            if compare_value_slices(kv, &g_vals, &g_specs, enc)? == Ordering::Equal {
+                matched_idx = Some(idx);
+                break;
+            }
+        }
+        if let Some(idx) = matched_idx {
+            groups[idx].1.push(row);
         } else {
-            groups.push((g_vals, g_colls, vec![row]));
+            groups.push((g_vals, vec![row]));
         }
     }
 
     // Sort groups in SQLite's natural GROUP BY B-tree order!
     let enc = ctx.encoding();
-    groups.sort_by(|(ka, ca, _), (kb, _, _)| {
-        let specs: Vec<KeySortOrder> = ca
-            .iter()
-            .map(|&c| KeySortOrder {
-                desc: false,
-                nulls_last: false,
-                collation: c,
-            })
-            .collect();
-        compare_value_slices(ka, kb, &specs, enc)
-    });
+    fallible_sort_by(&mut groups, |(ka, _), (kb, _)| {
+        compare_value_slices(ka, kb, &g_specs, enc)
+    })?;
 
-    Ok(groups.into_iter().map(|(_, _, b)| b).collect())
+    Ok(groups.into_iter().map(|(_, b)| b).collect())
 }
 
 fn first_explicit_collate_in_expr(expr: &Expr) -> Option<&str> {
@@ -6741,6 +6896,61 @@ pub(crate) fn infer_expr_collation_from_cols_pub(
     infer_expr_collation_from_cols(expr, sample_cols)
 }
 
+pub(crate) fn infer_expr_custom_collation_from_cols_pub(
+    expr: &Expr,
+    sample_cols: &[ScopedColumn],
+) -> Option<String> {
+    infer_expr_custom_collation_from_cols(expr, sample_cols)
+}
+
+fn infer_expr_custom_collation_from_cols(
+    expr: &Expr,
+    sample_cols: &[ScopedColumn],
+) -> Option<String> {
+    if let Some(cname) = first_explicit_collate_in_expr(expr) {
+        return Collation::from_name(cname)
+            .is_none()
+            .then(|| cname.to_owned());
+    }
+    let mut cur = expr;
+    loop {
+        match cur {
+            Expr::Cast { expr: inner, .. }
+            | Expr::Unary {
+                op: UnaryOp::Plus,
+                expr: inner,
+            } => cur = inner,
+            Expr::RowValue(elems) if elems.len() == 1 => cur = &elems[0],
+            _ => break,
+        }
+    }
+    match cur {
+        Expr::Column(cref) => {
+            if cref.schema.as_deref() == Some(STAR_SLOT_SCHEMA) {
+                return cref
+                    .column
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|idx| sample_cols.get(idx))
+                    .and_then(|sc| sc.custom_collation.clone());
+            }
+            for sc in sample_cols {
+                if sc.hidden_rowid {
+                    continue;
+                }
+                if !sc.matches_qualifier(cref.schema.as_deref(), cref.table.as_deref()) {
+                    continue;
+                }
+                if sc.name.eq_ignore_ascii_case(&cref.column) {
+                    return sc.custom_collation.clone();
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 fn infer_expr_collation_from_cols(expr: &Expr, sample_cols: &[ScopedColumn]) -> Collation {
     if let Some(cname) = first_explicit_collate_in_expr(expr) {
         return Collation::from_name(cname).unwrap_or_default();
@@ -6782,6 +6992,48 @@ fn infer_expr_collation_from_cols(expr: &Expr, sample_cols: &[ScopedColumn]) -> 
         }
         _ => Collation::Binary,
     }
+}
+
+fn infer_order_by_custom_collation(
+    ob_expr: &Expr,
+    expanded_proj: &[(Expr, String, Option<String>)],
+    sample_cols: &[ScopedColumn],
+) -> Option<String> {
+    if let Expr::Collate { collation, .. } = ob_expr {
+        return Collation::from_name(collation)
+            .is_none()
+            .then(|| collation.clone());
+    }
+    if let Expr::Integer(ord) = ob_expr
+        && *ord >= 1
+        && (*ord as usize) <= expanded_proj.len()
+    {
+        return infer_expr_custom_collation_from_cols(
+            &expanded_proj[(*ord as usize) - 1].0,
+            sample_cols,
+        );
+    }
+    if let Expr::Column(ColumnRef {
+        schema: None,
+        table: None,
+        column,
+    }) = ob_expr
+        && let Some((idx, _)) = expanded_proj
+            .iter()
+            .enumerate()
+            .find(|(_, (_, label, al))| {
+                al.as_ref().is_some_and(|a| a.eq_ignore_ascii_case(column))
+                    || label.eq_ignore_ascii_case(column)
+            })
+    {
+        let in_row = sample_cols
+            .iter()
+            .any(|sc| !sc.hidden_rowid && sc.name.eq_ignore_ascii_case(column));
+        if expanded_proj[idx].2.is_some() || !in_row {
+            return infer_expr_custom_collation_from_cols(&expanded_proj[idx].0, sample_cols);
+        }
+    }
+    infer_expr_custom_collation_from_cols(ob_expr, sample_cols)
 }
 
 fn infer_order_by_collation(
@@ -7122,7 +7374,8 @@ fn resolve_compound_order_by_specs(
     all_arm_col_names: &[Vec<String>],
     col_collations: &[Collation],
     order_by: &[OrderByTerm],
-) -> Result<Vec<(usize, KeySortOrder, Option<String>)>> {
+    collations: Option<&CollationRegistry>,
+) -> Result<Vec<(usize, KeySortOrder)>> {
     let width = all_arm_col_names.first().map_or(0, Vec::len);
     let mut specs = Vec::with_capacity(order_by.len());
     for (ob_idx, ob) in order_by.iter().enumerate() {
@@ -7130,12 +7383,14 @@ fn resolve_compound_order_by_specs(
         while let Expr::Collate { expr, .. } = inner {
             inner = expr.as_ref();
         }
-        let (coll, custom_coll) = match &ob.expr {
-            Expr::Collate { collation, .. } => match Collation::from_name(collation) {
-                Some(builtin) => (builtin, None),
-                None => (Collation::Binary, Some(collation.clone())),
-            },
-            _ => (Collation::Binary, None),
+        let nulls_last = ob.nulls_last.unwrap_or(ob.desc);
+        let explicit_spec = match &ob.expr {
+            Expr::Collate { collation, .. } => Some(match collations {
+                Some(reg) => reg.resolve_key_sort_order(collation, ob.desc, nulls_last)?,
+                None => CollationRegistry::new()
+                    .resolve_key_sort_order_or_unbound(collation, ob.desc, nulls_last),
+            }),
+            _ => None,
         };
         if let Some(ord) = strip_collate_and_unary_plus(inner) {
             if ord < 1 || (ord as usize) > width {
@@ -7149,23 +7404,19 @@ fn resolve_compound_order_by_specs(
                 ));
             }
             let cidx = (ord as usize) - 1;
-            let eff_coll = if matches!(&ob.expr, Expr::Collate { .. }) {
-                coll
-            } else {
-                col_collations
-                    .get(cidx)
-                    .copied()
-                    .unwrap_or(Collation::Binary)
-            };
-            specs.push((
-                cidx,
-                KeySortOrder {
+            let spec = match explicit_spec {
+                Some(s) => s,
+                None => KeySortOrder {
                     desc: ob.desc,
-                    nulls_last: ob.nulls_last.unwrap_or(ob.desc),
-                    collation: eff_coll,
+                    nulls_last,
+                    collation: col_collations
+                        .get(cidx)
+                        .copied()
+                        .unwrap_or(Collation::Binary),
+                    custom_collation: None,
                 },
-                custom_coll,
-            ));
+            };
+            specs.push((cidx, spec));
             continue;
         }
         let target_label = match inner {
@@ -7191,23 +7442,19 @@ fn resolve_compound_order_by_specs(
                     ),
                 )
             })?;
-        let eff_coll = if matches!(&ob.expr, Expr::Collate { .. }) {
-            coll
-        } else {
-            col_collations
-                .get(col_idx)
-                .copied()
-                .unwrap_or(Collation::Binary)
-        };
-        specs.push((
-            col_idx,
-            KeySortOrder {
+        let spec = match explicit_spec {
+            Some(s) => s,
+            None => KeySortOrder {
                 desc: ob.desc,
-                nulls_last: ob.nulls_last.unwrap_or(ob.desc),
-                collation: eff_coll,
+                nulls_last,
+                collation: col_collations
+                    .get(col_idx)
+                    .copied()
+                    .unwrap_or(Collation::Binary),
+                custom_collation: None,
             },
-            custom_coll,
-        ));
+        };
+        specs.push((col_idx, spec));
     }
     Ok(specs)
 }
@@ -7215,26 +7462,16 @@ fn resolve_compound_order_by_specs(
 fn compare_compound_order_rows(
     a: &[Value],
     b: &[Value],
-    specs: &[(usize, KeySortOrder, Option<String>)],
-    collations: &CollationRegistry,
+    specs: &[(usize, KeySortOrder)],
     enc: TextEncoding,
-) -> Ordering {
-    for (idx, spec, custom_coll) in specs {
-        let va = &a[*idx];
-        let vb = &b[*idx];
-        let ord = if let (Some(cname), Value::Text(sa), Value::Text(sb)) = (custom_coll, va, vb) {
-            let raw = collations
-                .compare(cname, sa, sb, enc)
-                .unwrap_or(Ordering::Equal);
-            if spec.desc { raw.reverse() } else { raw }
-        } else {
-            compare_single_value(va, vb, *spec, enc)
-        };
+) -> Result<Ordering> {
+    for (idx, spec) in specs {
+        let ord = compare_single_value(&a[*idx], &b[*idx], spec, enc)?;
         if ord != Ordering::Equal {
-            return ord;
+            return Ok(ord);
         }
     }
-    Ordering::Equal
+    Ok(Ordering::Equal)
 }
 
 fn sort_materialized_output(
@@ -7242,19 +7479,16 @@ fn sort_materialized_output(
     all_arm_col_names: &[Vec<String>],
     col_collations: &[Collation],
     order_by: &[OrderByTerm],
+    collations: &CollationRegistry,
     enc: TextEncoding,
 ) -> Result<()> {
-    let specs = resolve_compound_order_by_specs(all_arm_col_names, col_collations, order_by)?;
-    rows.sort_by(|a, b| {
-        for (idx, spec, _) in &specs {
-            let ord = compare_single_value(&a[*idx], &b[*idx], *spec, enc);
-            if ord != Ordering::Equal {
-                return ord;
-            }
-        }
-        Ordering::Equal
-    });
-    Ok(())
+    let specs = resolve_compound_order_by_specs(
+        all_arm_col_names,
+        col_collations,
+        order_by,
+        Some(collations),
+    )?;
+    fallible_sort_by(rows, |a, b| compare_compound_order_rows(a, b, &specs, enc))
 }
 
 fn apply_limit_offset(
@@ -8132,6 +8366,7 @@ fn static_view_scoped_cols(
                         table_alias: Some(eff_alias.to_owned()),
                         name: cn,
                         collation: coll,
+                        custom_collation: None,
                         affinity: aff,
                         hidden_rowid: false,
                         omit_from_star: false,
@@ -8152,6 +8387,7 @@ fn static_view_scoped_cols(
                         table_alias: Some(eff_alias.to_owned()),
                         name: cn,
                         collation: coll,
+                        custom_collation: None,
                         affinity: aff,
                         hidden_rowid: false,
                         omit_from_star: false,
@@ -8193,6 +8429,7 @@ fn static_view_scoped_cols(
                     table_alias: Some(eff_alias.to_owned()),
                     name: cn,
                     collation: coll,
+                    custom_collation: None,
                     affinity: aff,
                     hidden_rowid: false,
                     omit_from_star: false,
@@ -8248,6 +8485,7 @@ fn static_schema_cols_for_tos(
                                 table_alias: Some(eff.clone()),
                                 name: cn,
                                 collation: coll,
+                                custom_collation: None,
                                 affinity: aff,
                                 hidden_rowid: false,
                                 omit_from_star: false,
@@ -8271,6 +8509,7 @@ fn static_schema_cols_for_tos(
                     table_alias: Some(eff.clone()),
                     name: c.name.clone(),
                     collation: c.collation,
+                    custom_collation: c.custom_collation.clone(),
                     affinity: Some(c.affinity),
                     hidden_rowid: false,
                     omit_from_star: false,
@@ -8287,6 +8526,7 @@ fn static_schema_cols_for_tos(
                     table_alias: Some(eff),
                     name: rid_col_name,
                     collation: Collation::Binary,
+                    custom_collation: None,
                     affinity: Some(TypeAffinity::Integer),
                     hidden_rowid: true,
                     omit_from_star: false,
@@ -8318,6 +8558,7 @@ fn static_schema_cols_for_tos(
                             table_alias: alias.clone(),
                             name: cn,
                             collation: coll,
+                            custom_collation: None,
                             affinity: aff,
                             hidden_rowid: false,
                             omit_from_star: false,
@@ -8464,36 +8705,37 @@ fn compare_value_slices(
     b: &[Value],
     specs: &[KeySortOrder],
     enc: TextEncoding,
-) -> Ordering {
+) -> Result<Ordering> {
     for (i, spec) in specs.iter().enumerate() {
-        let ord = compare_single_value(&a[i], &b[i], *spec, enc);
+        let ord = compare_single_value(&a[i], &b[i], spec, enc)?;
         if ord != Ordering::Equal {
-            return ord;
+            return Ok(ord);
         }
     }
-    Ordering::Equal
+    Ok(Ordering::Equal)
 }
 
-fn compare_single_value(va: &Value, vb: &Value, spec: KeySortOrder, enc: TextEncoding) -> Ordering {
+fn compare_single_value(
+    va: &Value,
+    vb: &Value,
+    spec: &KeySortOrder,
+    enc: TextEncoding,
+) -> Result<Ordering> {
     match (va.is_null(), vb.is_null()) {
-        (true, true) => Ordering::Equal,
-        (true, false) => {
-            if spec.nulls_last {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
-        (false, true) => {
-            if spec.nulls_last {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
+        (true, true) => Ok(Ordering::Equal),
+        (true, false) => Ok(if spec.nulls_last {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        }),
+        (false, true) => Ok(if spec.nulls_last {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        }),
         (false, false) => {
-            let raw = va.cmp_sqlite_with_encoding(vb, spec.collation, enc);
-            if spec.desc { raw.reverse() } else { raw }
+            let raw = va.cmp_sqlite_fallible(vb, spec, enc)?;
+            Ok(if spec.desc { raw.reverse() } else { raw })
         }
     }
 }
@@ -8911,18 +9153,6 @@ fn eval_expr_rt(
             }
             let l_meta = infer_row_value_elem_meta(lhs_e, n, scopes, ctx.db_set, ctes);
             let (affs, colls) = combine_row_value_meta(&l_meta, &[]);
-            let lhs_custom_coll = if n == 1 {
-                match lhs_e.as_ref() {
-                    Expr::Collate { collation, .. }
-                        if Collation::from_name(collation).is_none() =>
-                    {
-                        Some(collation.as_str())
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
             let enc = ctx.encoding();
             let mut saw_null = false;
             for item in list {
@@ -8944,24 +9174,16 @@ fn eval_expr_rt(
                     }
                     return Err(SqliteError::new(ErrorCode::Error, "row value misused"));
                 }
-                let eq_res = if let Some(cname) = lhs_custom_coll {
-                    let mut svc = ExecutionContext {
-                        interrupt_flag: ctx.interrupt_flag,
-                        runtime: ctx.runtime,
-                        encoding: enc,
-                        functions: ctx.functions,
-                        collations: ctx.collations,
-                        progress: ctx.progress,
-                        strict_subtype: ctx.strict_subtype,
-                    };
-                    eval_comparison_with_services(
+                let eq_res = if n == 1 {
+                    eval_scalar_comparison_in_scopes(
+                        ctx,
                         Opcode::Eq,
+                        lhs_e,
                         &lv_vec[0],
+                        item,
                         &iv_vec[0],
                         affs[0],
-                        cname,
-                        enc,
-                        &mut svc,
+                        scopes,
                     )?
                     .truthiness()
                 } else {
@@ -9153,6 +9375,37 @@ fn eval_expr_rt(
             op,
             negated,
         } => {
+            let fname = match op {
+                LikeOp::Like => "like",
+                LikeOp::Glob => "glob",
+                LikeOp::Regexp => "regexp",
+                LikeOp::Match => "match",
+            };
+            let argc = if escape.is_some() { 3 } else { 2 };
+            if matches!(op, LikeOp::Regexp | LikeOp::Match)
+                || ctx.functions.find_scalar(fname, argc).is_some()
+            {
+                // Lower `X [NOT] <OP> Y [ESCAPE E]` to `[NOT] <op>(Y, X [, E])` (`sqlite/src/parse.y`).
+                ctx.functions
+                    .validate_call(fname, false, argc, false, false, false)?;
+                let pv = eval_expr_rt(ctx, pattern, params, scopes, ctes, agg_group)?;
+                let tv = eval_expr_rt(ctx, txt_e, params, scopes, ctes, agg_group)?;
+                let mut arg_vals = Vec::with_capacity(argc);
+                arg_vals.push(pv);
+                arg_vals.push(tv);
+                if let Some(ee) = escape {
+                    arg_vals.push(eval_expr_rt(ctx, ee, params, scopes, ctes, agg_group)?);
+                }
+                let res = ctx.call_scalar_rt(fname, &arg_vals)?;
+                return Ok(match res.value.truthiness() {
+                    None => RuntimeValue::null(),
+                    Some(b) => RuntimeValue::plain(Value::Integer(i64::from(if *negated {
+                        !b
+                    } else {
+                        b
+                    }))),
+                });
+            }
             let tv = eval_expr(ctx, txt_e, params, scopes, ctes, agg_group)?;
             let pv = eval_expr(ctx, pattern, params, scopes, ctes, agg_group)?;
             if tv.is_null() || pv.is_null() {
@@ -9170,6 +9423,7 @@ fn eval_expr_rt(
             let matched = match op {
                 LikeOp::Like => sqlite_like_match(&pv.to_text_lossy(), &tv.to_text_lossy(), esc),
                 LikeOp::Glob => sqlite_glob_match(&pv.to_text_lossy(), &tv.to_text_lossy()),
+                LikeOp::Regexp | LikeOp::Match => unreachable!(),
             };
             Ok(RuntimeValue::plain(Value::Integer(i64::from(
                 if *negated { !matched } else { matched },
@@ -9326,16 +9580,61 @@ fn eval_expr_rt(
                         format!("misuse of aggregate function {name}()"),
                     ));
                 };
-                let arg_coll = match args {
+                let (arg_coll, custom_spec_opt) = match args {
                     FunctionArgs::Exprs(es) if es.len() == 1 => {
                         let ref_cols = group_rows.first().map_or(&[][..], |r| &r.cols[..]);
-                        infer_expr_collation_from_cols(&es[0], ref_cols)
+                        let custom = infer_expr_custom_collation_from_cols(&es[0], ref_cols)
+                            .map(|cname| {
+                                ctx.collations.resolve_key_sort_order(&cname, false, false)
+                            })
+                            .transpose()?;
+                        (infer_expr_collation_from_cols(&es[0], ref_cols), custom)
                     }
-                    _ => Collation::Binary,
+                    _ => (Collation::Binary, None),
                 };
-                let mut acc =
-                    AggregateAccumulator::new_with_collation(agg_kind, *distinct, arg_coll)
-                        .with_encoding(ctx.encoding());
+                let enc = ctx.encoding();
+                if let Some(ref spec) = custom_spec_opt
+                    && matches!(agg_kind, AggregateKind::Min | AggregateKind::Max)
+                {
+                    let mut best: Option<Value> = None;
+                    for gr in group_rows {
+                        let row_scopes = push_scope(base_outer, gr);
+                        if let Some(f_expr) = filter {
+                            let fv = eval_expr(ctx, f_expr, params, &row_scopes, ctes, None)?;
+                            if fv.truthiness() != Some(true) {
+                                continue;
+                            }
+                        }
+                        if let FunctionArgs::Exprs(es) = args {
+                            let val = eval_expr(ctx, &es[0], params, &row_scopes, ctes, None)?;
+                            if val.is_null() {
+                                continue;
+                            }
+                            let replace = match &best {
+                                None => true,
+                                Some(cur) => {
+                                    let ord = val.cmp_sqlite_fallible(cur, spec, enc)?;
+                                    if agg_kind == AggregateKind::Min {
+                                        ord.is_lt()
+                                    } else {
+                                        ord.is_gt()
+                                    }
+                                }
+                            };
+                            if replace {
+                                best = Some(val);
+                            }
+                        }
+                    }
+                    return Ok(RuntimeValue::plain(best.unwrap_or(Value::Null)));
+                }
+                let mut custom_distinct_seen: Vec<Value> = Vec::new();
+                let mut acc = AggregateAccumulator::new_with_collation(
+                    agg_kind,
+                    *distinct && custom_spec_opt.is_none(),
+                    arg_coll,
+                )
+                .with_encoding(enc);
                 for gr in group_rows {
                     let row_scopes = push_scope(base_outer, gr);
                     if let Some(f_expr) = filter {
@@ -9350,6 +9649,24 @@ fn eval_expr_rt(
                         let mut a_vals = Vec::with_capacity(es.len());
                         for ae in es {
                             a_vals.push(eval_expr(ctx, ae, params, &row_scopes, ctes, None)?);
+                        }
+                        if *distinct
+                            && let (Some(spec), Some(first)) = (&custom_spec_opt, a_vals.first())
+                        {
+                            if first.is_null() {
+                                continue;
+                            }
+                            let mut is_dup = false;
+                            for prev in &custom_distinct_seen {
+                                if prev.cmp_sqlite_fallible(first, spec, enc)?.is_eq() {
+                                    is_dup = true;
+                                    break;
+                                }
+                            }
+                            if is_dup {
+                                continue;
+                            }
+                            custom_distinct_seen.push(first.clone());
                         }
                         acc.step(&a_vals)?;
                     }
@@ -9410,14 +9727,32 @@ fn eval_expr_rt(
                     ));
                 };
                 let flags = def.flags;
-                let mut inst = (def.factory)();
+                let factory = Arc::clone(&def.factory);
+                ctx.publish();
+                let mut inst = catch_infallible_callback_panic(&def.name, move || factory())?;
                 let mut distinct_seen: Vec<Value> = Vec::new();
-                let arg_coll = if es.len() == 1 {
+                let arg_spec = if es.len() == 1 {
                     let ref_cols = group_rows.first().map_or(&[][..], |r| &r.cols[..]);
-                    infer_expr_collation_from_cols(&es[0], ref_cols)
+                    if let Some(cname) = infer_expr_custom_collation_from_cols(&es[0], ref_cols) {
+                        ctx.collations
+                            .resolve_key_sort_order(&cname, false, false)?
+                    } else {
+                        KeySortOrder {
+                            desc: false,
+                            nulls_last: false,
+                            collation: infer_expr_collation_from_cols(&es[0], ref_cols),
+                            custom_collation: None,
+                        }
+                    }
                 } else {
-                    Collation::Binary
+                    KeySortOrder {
+                        desc: false,
+                        nulls_last: false,
+                        collation: Collation::Binary,
+                        custom_collation: None,
+                    }
                 };
+                let enc = ctx.encoding();
                 for gr in group_rows {
                     let row_scopes = push_scope(base_outer, gr);
                     if let Some(f_expr) = filter {
@@ -9438,17 +9773,26 @@ fn eval_expr_rt(
                         if first.value.is_null() {
                             continue;
                         }
-                        if distinct_seen
-                            .iter()
-                            .any(|prev| prev.cmp_sqlite(&first.value, arg_coll).is_eq())
-                        {
+                        let mut is_dup = false;
+                        for prev in &distinct_seen {
+                            if prev
+                                .cmp_sqlite_fallible(&first.value, &arg_spec, enc)?
+                                .is_eq()
+                            {
+                                is_dup = true;
+                                break;
+                            }
+                        }
+                        if is_dup {
                             continue;
                         }
                         distinct_seen.push(first.value.clone());
                     }
-                    inst.step(&a_vals)?;
+                    ctx.publish();
+                    catch_callback_panic("aggregate step callback", || inst.step(&a_vals))?;
                 }
-                let out = inst.finalize()?;
+                ctx.publish();
+                let out = catch_callback_panic("aggregate finalize callback", || inst.finalize())?;
                 if out.subtype != 0
                     && !flags.contains(sqliters_types::FunctionFlags::RESULT_SUBTYPE)
                 {
@@ -9466,6 +9810,22 @@ fn eval_expr_rt(
                 FunctionArgs::Star => (true, &[][..]),
                 FunctionArgs::Exprs(es) => (false, es.as_slice()),
             };
+            if !ctes.resolving_views.is_empty() || !ctx.stmt_tx.subprogram_stack.is_empty() {
+                let is_direct_only = ctx
+                    .functions
+                    .find_scalar(name, expr_list.len())
+                    .is_some_and(|m| m.flags.contains(FunctionFlags::DIRECTONLY))
+                    || ctx
+                        .functions
+                        .find_aggregate(name, expr_list.len())
+                        .is_some_and(|m| m.flags.contains(FunctionFlags::DIRECTONLY));
+                if is_direct_only {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("unsafe use of {name}()"),
+                    ));
+                }
+            }
             {
                 let _tf_guard =
                     sqliters_vdbe::TestFunctionsScope::enter(ctx.runtime.enable_test_functions);
@@ -9517,6 +9877,83 @@ fn eval_expr_rt(
                         } else {
                             Ok(RuntimeValue::null())
                         };
+                    }
+                    "NULLIF" if expr_list.len() == 2 => {
+                        let lhs =
+                            eval_expr_rt(ctx, &expr_list[0], params, scopes, ctes, agg_group)?;
+                        let rhs =
+                            eval_expr_rt(ctx, &expr_list[1], params, scopes, ctes, agg_group)?;
+                        let eq = eval_scalar_comparison_in_scopes(
+                            ctx,
+                            Opcode::Eq,
+                            &expr_list[0],
+                            &lhs.value,
+                            &expr_list[1],
+                            &rhs.value,
+                            TypeAffinity::Blob,
+                            scopes,
+                        )?;
+                        return if eq.truthiness() == Some(true) {
+                            Ok(RuntimeValue::null())
+                        } else {
+                            Ok(lhs)
+                        };
+                    }
+                    "MIN" | "MAX" if expr_list.len() >= 2 => {
+                        let is_max = upper == "MAX";
+                        let mut spec = KeySortOrder {
+                            desc: false,
+                            nulls_last: false,
+                            collation: Collation::Binary,
+                            custom_collation: None,
+                        };
+                        for ae in expr_list {
+                            if let Some(cname) = first_explicit_collate_in_expr(ae) {
+                                spec =
+                                    ctx.collations.resolve_key_sort_order(cname, false, false)?;
+                                break;
+                            }
+                        }
+                        if spec.custom_collation.is_none() && spec.collation == Collation::Binary {
+                            'arg_loop: for ae in expr_list {
+                                if let Expr::Column(cref) = ae {
+                                    for s in scopes.iter().rev() {
+                                        if let Some(cname) = s.lookup_cref_custom_collation(cref) {
+                                            spec = ctx
+                                                .collations
+                                                .resolve_key_sort_order(cname, false, false)?;
+                                            break 'arg_loop;
+                                        }
+                                        if let Ok(Some((_, c))) = s.lookup_cref(cref)
+                                            && c != Collation::Binary
+                                        {
+                                            spec.collation = c;
+                                            break 'arg_loop;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let enc = ctx.encoding();
+                        let mut best_opt: Option<RuntimeValue> = None;
+                        for ae in expr_list {
+                            let rv = eval_expr_rt(ctx, ae, params, scopes, ctes, agg_group)?;
+                            if rv.value.is_null() {
+                                return Ok(RuntimeValue::null());
+                            }
+                            let replace = match &best_opt {
+                                None => true,
+                                Some(cur) => {
+                                    let ord =
+                                        rv.value.cmp_sqlite_fallible(&cur.value, &spec, enc)?;
+                                    if is_max { ord.is_gt() } else { ord.is_lt() }
+                                }
+                            };
+                            if replace {
+                                best_opt = Some(rv);
+                            }
+                        }
+                        return Ok(best_opt.unwrap_or_else(RuntimeValue::null));
                     }
                     _ => {}
                 }
@@ -9865,20 +10302,34 @@ fn eval_row_value_comparison(
     }
 }
 
-fn resolve_custom_binary_collation_name<'a>(left: &'a Expr, right: &'a Expr) -> Option<&'a str> {
+fn resolve_custom_binary_collation_name<'a>(
+    left: &'a Expr,
+    right: &'a Expr,
+    scopes: &'a [EvalRow],
+) -> Option<&'a str> {
     if let Expr::Collate { collation, .. } = left {
-        return if Collation::from_name(collation).is_none() {
-            Some(collation.as_str())
-        } else {
-            None
-        };
+        return Collation::from_name(collation)
+            .is_none()
+            .then_some(collation.as_str());
     }
     if let Expr::Collate { collation, .. } = right {
-        return if Collation::from_name(collation).is_none() {
-            Some(collation.as_str())
-        } else {
-            None
-        };
+        return Collation::from_name(collation)
+            .is_none()
+            .then_some(collation.as_str());
+    }
+    for e in [left, right] {
+        if let Expr::Column(cref) = e {
+            for s in scopes.iter().rev() {
+                if let Some(cname) = s.lookup_cref_custom_collation(cref) {
+                    return Some(cname);
+                }
+                if let Ok(Some((_, c))) = s.lookup_cref(cref)
+                    && c != Collation::Binary
+                {
+                    return None;
+                }
+            }
+        }
     }
     None
 }
@@ -9895,7 +10346,7 @@ fn eval_scalar_comparison_in_scopes(
     scopes: &[EvalRow],
 ) -> Result<Value> {
     let enc = ctx.encoding();
-    if let Some(cname) = resolve_custom_binary_collation_name(left_expr, right_expr) {
+    if let Some(cname) = resolve_custom_binary_collation_name(left_expr, right_expr, scopes) {
         let mut svc = ExecutionContext {
             interrupt_flag: ctx.interrupt_flag,
             runtime: ctx.runtime,
@@ -10336,6 +10787,7 @@ fn make_single_table_scope(
             table_alias: Some(eff.clone()),
             name: c.name.clone(),
             collation: c.collation,
+            custom_collation: c.custom_collation.clone(),
             affinity: Some(c.affinity),
             hidden_rowid: false,
             omit_from_star: false,
@@ -10349,6 +10801,7 @@ fn make_single_table_scope(
             table_alias: Some(eff),
             name: "rowid".to_owned(),
             collation: Collation::Binary,
+            custom_collation: None,
             affinity: Some(TypeAffinity::Integer),
             hidden_rowid: true,
             omit_from_star: false,
@@ -10371,6 +10824,7 @@ fn make_returning_table_scope(tbl: &TableSchema, rowid: i64, vals: &[Value]) -> 
             table_alias: Some(tbl.name.clone()),
             name: c.name.clone(),
             collation: c.collation,
+            custom_collation: c.custom_collation.clone(),
             affinity: Some(c.affinity),
             hidden_rowid: false,
             omit_from_star: false,
@@ -10384,6 +10838,7 @@ fn make_returning_table_scope(tbl: &TableSchema, rowid: i64, vals: &[Value]) -> 
             table_alias: Some(tbl.name.clone()),
             name: "rowid".to_owned(),
             collation: Collation::Binary,
+            custom_collation: None,
             affinity: Some(TypeAffinity::Integer),
             hidden_rowid: true,
             omit_from_star: false,
@@ -10405,6 +10860,7 @@ fn make_excluded_table_scope(tbl: &TableSchema, rowid: i64, vals: &[Value]) -> E
             table_alias: Some("excluded".to_owned()),
             name: c.name.clone(),
             collation: c.collation,
+            custom_collation: c.custom_collation.clone(),
             affinity: Some(c.affinity),
             hidden_rowid: false,
             omit_from_star: false,
@@ -10418,6 +10874,7 @@ fn make_excluded_table_scope(tbl: &TableSchema, rowid: i64, vals: &[Value]) -> E
             table_alias: Some("excluded".to_owned()),
             name: "rowid".to_owned(),
             collation: Collation::Binary,
+            custom_collation: None,
             affinity: Some(TypeAffinity::Integer),
             hidden_rowid: true,
             omit_from_star: false,
@@ -10735,20 +11192,20 @@ fn delete_row_via_pipeline(
             _ => !tbl.without_rowid && !is_catalog,
         };
         let invalidate_blobs = !tbl.without_rowid;
-        ctx.mutation_pipeline.dispatch(MutationContext {
+        ctx.dispatch_mutation(MutationContext {
             db_id,
             table_name: tbl.name.clone(),
             origin,
-            old_row: captured_old.map(|values| MutationRow {
+            old_row: Some(MutationRow {
                 rowid: rkey.rowid_or_zero(),
-                values,
+                values: captured_old.unwrap_or_default(),
             }),
             new_row: None,
             excluded_row: None,
             effective_conflict,
             emit_update_hook,
             invalidate_blobs,
-        });
+        })?;
     }
     Ok(deleted)
 }
@@ -10869,6 +11326,7 @@ fn make_runtime_table_pseudo_scope(
                 table_alias: Some(alias.to_owned()),
                 name: c.name.clone(),
                 collation: c.collation,
+                custom_collation: c.custom_collation.clone(),
                 affinity: Some(c.affinity),
                 hidden_rowid: false,
                 omit_from_star: false,
@@ -10882,6 +11340,7 @@ fn make_runtime_table_pseudo_scope(
                 table_alias: Some(alias.to_owned()),
                 name: "rowid".to_owned(),
                 collation: Collation::Binary,
+                custom_collation: None,
                 affinity: Some(TypeAffinity::Integer),
                 hidden_rowid: true,
                 omit_from_star: false,
@@ -10920,6 +11379,7 @@ fn make_runtime_view_pseudo_scope(
                 table_alias: Some(alias.to_owned()),
                 name: cname.clone(),
                 collation: *coll,
+                custom_collation: None,
                 affinity: *aff,
                 hidden_rowid: false,
                 omit_from_star: false,
@@ -10956,6 +11416,7 @@ fn make_returning_view_scope(
             table_alias: Some(view_name.to_owned()),
             name: cname.clone(),
             collation: *coll,
+            custom_collation: None,
             affinity: *aff,
             hidden_rowid: false,
             omit_from_star: false,
@@ -11707,6 +12168,11 @@ fn validate_and_write_row(
         register_child_fk_checks(ctx, db_id, tbl, &final_key, &raw_vals)?;
     }
 
+    if bump_last_rowid && !tbl.without_rowid {
+        ctx.runtime.last_insert_rowid = rowid;
+        ctx.publish();
+    }
+
     if let Some((origin, excluded_row)) = mutation_dispatch {
         let effective_conflict = stmt_conflict.unwrap_or(if tbl.without_rowid {
             tbl.without_rowid_pk_conflict
@@ -11722,7 +12188,7 @@ fn validate_and_write_row(
         let emit_update_hook = !tbl.without_rowid && !is_catalog;
         let invalidate_blobs =
             !matches!(origin, MutationOrigin::TopLevelInsert) && !tbl.without_rowid;
-        ctx.mutation_pipeline.dispatch(MutationContext {
+        ctx.dispatch_mutation(MutationContext {
             db_id,
             table_name: tbl.name.clone(),
             origin,
@@ -11735,18 +12201,13 @@ fn validate_and_write_row(
             effective_conflict,
             emit_update_hook,
             invalidate_blobs,
-        });
+        })?;
     }
 
     if *ctx.foreign_keys
         && let Some(ref old_vals) = old_logical_vals_opt
     {
         apply_parent_update_fk_actions(ctx, db_id, tbl, old_vals, &raw_vals, params)?;
-    }
-
-    if bump_last_rowid && !tbl.without_rowid {
-        ctx.runtime.last_insert_rowid = rowid;
-        ctx.publish();
     }
 
     Ok(Some((final_key, raw_vals)))
@@ -13511,39 +13972,6 @@ fn prepare_dml_write_slot(
     Ok((tbl, indexes, sname))
 }
 
-struct OrdTableKey {
-    key: TableRowKey,
-    pk_orders: Rc<[KeySortOrder]>,
-    enc: TextEncoding,
-}
-
-impl PartialEq for OrdTableKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl Eq for OrdTableKey {}
-
-impl PartialOrd for OrdTableKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for OrdTableKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        match (&self.key, &other.key) {
-            (TableRowKey::Rowid(a), TableRowKey::Rowid(b)) => a.cmp(b),
-            (TableRowKey::WithoutRowidPk(pa), TableRowKey::WithoutRowidPk(pb)) => {
-                compare_value_slices(pa, pb, &self.pk_orders, self.enc)
-            }
-            (TableRowKey::Rowid(_), TableRowKey::WithoutRowidPk(_)) => Ordering::Less,
-            (TableRowKey::WithoutRowidPk(_), TableRowKey::Rowid(_)) => Ordering::Greater,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TargetColRef {
     Col(usize),
@@ -15036,6 +15464,7 @@ fn make_single_view_scope(
             table_alias: Some(eff_alias.to_owned()),
             name: cname.clone(),
             collation: *coll,
+            custom_collation: None,
             affinity: *aff,
             hidden_rowid: false,
             omit_from_star: false,
@@ -16384,12 +16813,16 @@ fn execute_upsert_table_insert_row(
     if *ctx.foreign_keys {
         register_child_fk_checks(ctx, p.db_id, &p.tbl, &final_key, &raw_vals)?;
     }
+    if !p.tbl.without_rowid {
+        ctx.runtime.last_insert_rowid = rowid;
+        ctx.publish();
+    }
     let effective_conflict = effective_or_conflict.unwrap_or(if p.tbl.without_rowid {
         p.tbl.without_rowid_pk_conflict
     } else {
         p.tbl.rowid_pk_conflict
     });
-    ctx.mutation_pipeline.dispatch(MutationContext {
+    ctx.dispatch_mutation(MutationContext {
         db_id: p.db_id,
         table_name: p.tbl.name.clone(),
         origin: MutationOrigin::TopLevelInsert,
@@ -16402,11 +16835,7 @@ fn execute_upsert_table_insert_row(
         effective_conflict,
         emit_update_hook: !p.tbl.without_rowid && !p.is_catalog,
         invalidate_blobs: false,
-    });
-    if !p.tbl.without_rowid {
-        ctx.runtime.last_insert_rowid = rowid;
-        ctx.publish();
-    }
+    })?;
     *stmt_changes += 1;
     *count_changes_rows += 1;
 
@@ -17180,13 +17609,12 @@ fn prepare_update_exec<'a>(
                     };
                     PreparedTableUpdateRows::WithFrom(pending)
                 } else {
-                    let pk_orders: Rc<[KeySortOrder]> = if tbl.without_rowid {
-                        tbl.without_rowid_pk_orders().into()
+                    let pk_orders = if tbl.without_rowid {
+                        tbl.without_rowid_pk_orders()
                     } else {
-                        Rc::from(&[][..])
+                        Vec::new()
                     };
-                    let mut ephemeral: BTreeMap<OrdTableKey, (Option<i64>, Vec<Value>)> =
-                        BTreeMap::new();
+                    let mut ephemeral: Vec<(TableRowKey, Option<i64>, Vec<Value>)> = Vec::new();
                     for (old_key, payload) in candidates {
                         let old_vals =
                             decode_table_logical_row(ctx, db_id, &tbl, &old_key, &payload, params)?;
@@ -17229,22 +17657,43 @@ fn prepare_update_exec<'a>(
                                 &dml_ctes,
                                 params,
                             )?;
-                            ephemeral.insert(
-                                OrdTableKey {
-                                    key: old_key.clone(),
-                                    pk_orders: Rc::clone(&pk_orders),
-                                    enc,
-                                },
-                                (new_rowid_opt, new_vals),
-                            );
+                            let mut found_idx = None;
+                            let mut insert_idx = ephemeral.len();
+                            for (idx, (ekey, _, _)) in ephemeral.iter().enumerate() {
+                                let ord = match (ekey, &old_key) {
+                                    (TableRowKey::Rowid(a), TableRowKey::Rowid(b)) => a.cmp(b),
+                                    (
+                                        TableRowKey::WithoutRowidPk(pa),
+                                        TableRowKey::WithoutRowidPk(pb),
+                                    ) => compare_value_slices(pa, pb, &pk_orders, enc)?,
+                                    (TableRowKey::Rowid(_), TableRowKey::WithoutRowidPk(_)) => {
+                                        Ordering::Less
+                                    }
+                                    (TableRowKey::WithoutRowidPk(_), TableRowKey::Rowid(_)) => {
+                                        Ordering::Greater
+                                    }
+                                };
+                                match ord {
+                                    Ordering::Equal => {
+                                        found_idx = Some(idx);
+                                        break;
+                                    }
+                                    Ordering::Greater => {
+                                        insert_idx = idx;
+                                        break;
+                                    }
+                                    Ordering::Less => {}
+                                }
+                            }
+                            if let Some(idx) = found_idx {
+                                ephemeral[idx] = (old_key.clone(), new_rowid_opt, new_vals);
+                            } else {
+                                ephemeral
+                                    .insert(insert_idx, (old_key.clone(), new_rowid_opt, new_vals));
+                            }
                         }
                     }
-                    PreparedTableUpdateRows::WithFrom(
-                        ephemeral
-                            .into_iter()
-                            .map(|(ok, (nr, nv))| (ok.key, nr, nv))
-                            .collect(),
-                    )
+                    PreparedTableUpdateRows::WithFrom(ephemeral)
                 }
             } else {
                 // Plain `UPDATE` (`update.c:819-830`): pass 1 collects matching `old_key`s only!
@@ -18237,6 +18686,7 @@ fn exec_create_table(ctx: &mut ExecContext<'_>, ct: &CreateTableStmt) -> Result<
     }
     // Validate AST & inline autoindexes before opening write tx or allocating pages
     let (tbl_preview, pending_autos) = build_table_schema_from_ast(ct, 2)?;
+    validate_table_collations(&tbl_preview, &pending_autos, ctx.collations)?;
 
     ctx.ensure_write_db(db_id, true)?;
     {
@@ -18325,6 +18775,7 @@ fn exec_create_table(ctx: &mut ExecContext<'_>, ct: &CreateTableStmt) -> Result<
     } else {
         slot.reload_schema()?;
     }
+    ctx.db_set.rebind_all_collations(ctx.collations);
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;
     *ctx.schema_changed_in_tx = true;
@@ -18593,6 +19044,7 @@ fn exec_create_view(ctx: &mut ExecContext<'_>, cv: &CreateViewStmt) -> Result<()
     } else {
         slot.reload_schema()?;
     }
+    ctx.db_set.rebind_all_collations(ctx.collations);
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;
     *ctx.schema_changed_in_tx = true;
@@ -19282,6 +19734,7 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
 
     // Validate AST before allocating pages so invalid expressions don't leak pages
     let idx_preview = build_index_schema_from_ast(ci, &tbl, 2)?;
+    crate::schema::validate_index_collations(&idx_preview, ctx.collations)?;
     for ic in &idx_preview.columns {
         if let Some(ref ie) = ic.expr {
             validate_index_ddl_expr(ie, ctx.functions, "index expressions", true)?;
@@ -19296,7 +19749,8 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
         .and_then(|s| s.btree.as_mut())
         .ok_or_else(|| SqliteError::misuse("database slot closed"))?
         .create_index()?;
-    let idx_schema = build_index_schema_from_ast(ci, &tbl, idx_root)?;
+    let mut idx_schema = build_index_schema_from_ast(ci, &tbl, idx_root)?;
+    crate::schema::rebind_index_collations(&mut idx_schema, ctx.collations);
     populate_index_btree(ctx, db_id, &tbl, &idx_schema)?;
 
     let slot = ctx
@@ -19326,6 +19780,7 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
     } else {
         slot.reload_schema()?;
     }
+    ctx.db_set.rebind_all_collations(ctx.collations);
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;
     *ctx.schema_changed_in_tx = true;
@@ -19433,28 +19888,30 @@ fn exec_reindex(ctx: &mut ExecContext<'_>, target: Option<&QualifiedName>) -> Re
                         "unable to identify the object to be reindexed",
                     ));
                 }
-            } else if let Some(coll) = Collation::from_name(&qn.name) {
+            } else if Collation::from_name(&qn.name).is_some()
+                || ctx.collations.has_collation(&qn.name)
+            {
                 for db_id in ctx.db_set.unqualified_search_order() {
                     if let Some(slot) = ctx.db_set.slot(db_id)
                         && slot.btree.is_some()
                     {
                         for t in slot.schema.tables.iter().filter(|t| {
                             t.without_rowid
-                                && t.without_rowid_pk_cols
-                                    .iter()
-                                    .any(|c| c.sort_order.collation == coll)
+                                && t.without_rowid_pk_cols.iter().any(|c| {
+                                    c.sort_order.collation_name().eq_ignore_ascii_case(&qn.name)
+                                })
                         }) {
                             primary_without_rowid_tables.push((db_id, t.clone()));
                         }
                         for idx in slot.schema.indexes.iter().filter(|idx| {
-                            idx.columns.iter().any(|c| c.sort_order.collation == coll)
+                            idx.columns.iter().any(|c| {
+                                c.sort_order.collation_name().eq_ignore_ascii_case(&qn.name)
+                            })
                         }) {
                             targets.push((db_id, idx.clone()));
                         }
                     }
                 }
-            } else if ctx.collations.has_collation(&qn.name) {
-                // Custom collation — indexes using it (none with custom Collation enum yet)
             } else if let Some((db_id, tbl_ref)) = ctx.db_set.find_user_table_in_set(qn) {
                 let tbl = tbl_ref.clone();
                 let idxs = ctx
@@ -19481,8 +19938,9 @@ fn exec_reindex(ctx: &mut ExecContext<'_>, target: Option<&QualifiedName>) -> Re
         }
     }
 
-    for (db_id, tbl) in primary_without_rowid_tables {
+    for (db_id, mut tbl) in primary_without_rowid_tables {
         ctx.ensure_write_db(db_id, true)?;
+        crate::schema::rebind_table_collations(&mut tbl, ctx.collations);
         let pk_orders = tbl.without_rowid_pk_orders();
         let entries = ctx.scan_index_in_db(db_id, tbl.root_pgno, pk_orders.clone())?;
         if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
@@ -19493,15 +19951,17 @@ fn exec_reindex(ctx: &mut ExecContext<'_>, target: Option<&QualifiedName>) -> Re
         }
     }
 
-    for (db_id, idx) in targets {
+    for (db_id, mut idx) in targets {
         ctx.ensure_write_db(db_id, true)?;
-        let Some(tbl) = ctx
+        crate::schema::rebind_index_collations(&mut idx, ctx.collations);
+        let Some(mut tbl) = ctx
             .db_set
             .slot(db_id)
             .and_then(|s| s.schema.find_user_table(&idx.table_name).cloned())
         else {
             continue;
         };
+        crate::schema::rebind_table_collations(&mut tbl, ctx.collations);
         if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
             bt.clear_tree(idx.root_pgno)?;
         }
@@ -19591,6 +20051,18 @@ fn validate_index_ddl_expr(
                     | "current_date"
                     | "current_timestamp"
             );
+            if functions
+                .find_scalar(name, args.len())
+                .is_some_and(|meta| meta.flags.contains(FunctionFlags::DIRECTONLY))
+                || functions
+                    .find_aggregate(name, args.len())
+                    .is_some_and(|meta| meta.flags.contains(FunctionFlags::DIRECTONLY))
+            {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("unsafe use of {name}()"),
+                ));
+            }
             let is_non_det_custom = functions
                 .find_scalar(name, args.len())
                 .is_some_and(|meta| !meta.flags.contains(FunctionFlags::DETERMINISTIC))
@@ -20136,6 +20608,7 @@ fn exec_drop_index(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
     } else {
         slot.reload_schema()?;
     }
+    ctx.db_set.rebind_all_collations(ctx.collations);
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;
     *ctx.schema_changed_in_tx = true;
@@ -20218,6 +20691,7 @@ fn make_static_trigger_pseudo_scope(
                 table_alias: Some(alias.to_owned()),
                 name: cname.clone(),
                 collation: *coll,
+                custom_collation: None,
                 affinity: *aff,
                 hidden_rowid: false,
                 omit_from_star: false,
@@ -20230,6 +20704,7 @@ fn make_static_trigger_pseudo_scope(
                 table_alias: Some(alias.to_owned()),
                 name: "rowid".to_owned(),
                 collation: Collation::Binary,
+                custom_collation: None,
                 affinity: Some(TypeAffinity::Integer),
                 hidden_rowid: true,
                 omit_from_star: false,
@@ -20279,6 +20754,7 @@ fn resolve_trigger_step_target_scope_static(
                     table_alias: Some("excluded".to_owned()),
                     name: c.name.clone(),
                     collation: c.collation,
+                    custom_collation: c.custom_collation.clone(),
                     affinity: Some(c.affinity),
                     hidden_rowid: false,
                     omit_from_star: false,
@@ -20306,6 +20782,7 @@ fn resolve_trigger_step_target_scope_static(
                     table_alias: Some(eff_alias.to_owned()),
                     name: cn.clone(),
                     collation: coll,
+                    custom_collation: None,
                     affinity: aff,
                     hidden_rowid: false,
                     omit_from_star: false,
@@ -20316,6 +20793,7 @@ fn resolve_trigger_step_target_scope_static(
                     table_alias: Some("excluded".to_owned()),
                     name: cn,
                     collation: coll,
+                    custom_collation: None,
                     affinity: aff,
                     hidden_rowid: false,
                     omit_from_star: false,
@@ -21951,6 +22429,7 @@ fn exec_alter_table(
                 slot.reload_schema()?;
             }
             ctx.db_set.reconcile_temp_triggers()?;
+            ctx.db_set.rebind_all_collations(ctx.collations);
             *ctx.schema_generation += 1;
             *ctx.v1_expire_generation += 1;
             *ctx.schema_changed_in_tx = true;
@@ -21980,6 +22459,14 @@ fn exec_alter_table(
             }
             check_alter_rowid_alias(&tbl, &cdef.name, "add")?;
             let validated = build_column_schema_from_def(&tbl.name, tbl.strict, cdef)?;
+            if let Some(ref cname) = validated.custom_collation
+                && !ctx.collations.has_collation(cname)
+            {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such collation sequence: {cname}"),
+                ));
+            }
             if validated
                 .generated
                 .as_ref()
@@ -22098,6 +22585,7 @@ fn exec_alter_table(
             .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
         slot.reload_schema()?;
     }
+    ctx.db_set.rebind_all_collations(ctx.collations);
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;
     *ctx.schema_changed_in_tx = true;
@@ -26647,6 +27135,7 @@ pub(crate) fn exec_vacuum_checked(
     }
     if let Some(slot) = ctx.db_set.slot_mut(db_id) {
         slot.schema = new_schema;
+        slot.schema.rebind_collations(ctx.collations);
     }
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;
@@ -27675,6 +28164,7 @@ fn exec_pragma(
                 if let Some(ref mut bt) = slot.btree {
                     bt.pager_mut().header_mut()?.schema_cookie = v;
                     slot.schema = Schema::load_for_schema(bt, Some(&sname))?;
+                    slot.schema.rebind_collations(ctx.collations);
                 }
                 *ctx.schema_generation += 1;
                 *ctx.v1_expire_generation += 1;
@@ -28564,7 +29054,8 @@ pub(crate) fn validate_and_infer_columns(
                     ));
                 }
             }
-            let (tbl_preview, _) = build_table_schema_from_ast(ct, 2)?;
+            let (tbl_preview, auto_idxs) = build_table_schema_from_ast(ct, 2)?;
+            validate_table_collations(&tbl_preview, &auto_idxs, collations)?;
             let slot_name = db_set.slot(db_id).map_or("main", |s| s.name.as_str());
             let tbl_scope = make_static_table_scope(&tbl_preview, slot_name, None);
             let mut visited = Vec::new();
@@ -28957,6 +29448,7 @@ pub(crate) fn validate_and_infer_columns(
                 ));
             }
             let idx_preview = build_index_schema_from_ast(ci, tbl, 2)?;
+            crate::schema::validate_index_collations(&idx_preview, collations)?;
             for ic in &idx_preview.columns {
                 if let Some(ref ie) = ic.expr {
                     validate_index_ddl_expr(ie, functions, "index expressions", true)?;
@@ -29129,6 +29621,14 @@ pub(crate) fn validate_and_infer_columns(
                     }
                     check_alter_rowid_alias(&tbl, &cdef.name, "add")?;
                     let validated = build_column_schema_from_def(&tbl.name, tbl.strict, cdef)?;
+                    if Collation::from_name(validated.collation_name()).is_none()
+                        && !collations.has_collation(validated.collation_name())
+                    {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("no such collation sequence: {}", validated.collation_name()),
+                        ));
+                    }
                     if validated
                         .generated
                         .as_ref()
@@ -33120,6 +33620,7 @@ fn validate_tos_static(
                             table_alias: Some(eff_alias.clone()),
                             name: cn,
                             collation: coll,
+                            custom_collation: None,
                             affinity: aff,
                             hidden_rowid: false,
                             omit_from_star: false,
@@ -33157,6 +33658,7 @@ fn validate_tos_static(
                             table_alias: Some(eff_alias.clone()),
                             name: cn,
                             collation: coll,
+                            custom_collation: None,
                             affinity: aff,
                             hidden_rowid: false,
                             omit_from_star: false,
@@ -33182,6 +33684,7 @@ fn validate_tos_static(
                     table_alias: Some(eff_alias.clone()),
                     name: c.name.clone(),
                     collation: c.collation,
+                    custom_collation: c.custom_collation.clone(),
                     affinity: Some(c.affinity),
                     hidden_rowid: false,
                     omit_from_star: false,
@@ -33198,6 +33701,7 @@ fn validate_tos_static(
                     table_alias: Some(eff_alias),
                     name: rid_col_name,
                     collation: Collation::Binary,
+                    custom_collation: None,
                     affinity: Some(TypeAffinity::Integer),
                     hidden_rowid: true,
                     omit_from_star: false,
@@ -33231,6 +33735,7 @@ fn validate_tos_static(
                         table_alias: alias.clone(),
                         name: cn,
                         collation: coll,
+                        custom_collation: None,
                         affinity: aff,
                         hidden_rowid: false,
                         omit_from_star: false,
@@ -33426,6 +33931,7 @@ fn resolve_cte_columns_static(
                     &all_arm_col_names,
                     &default_colls,
                     &cte.query.order_by,
+                    None,
                 ) {
                     visited_ctes.pop();
                     return Err(err);
@@ -33995,8 +34501,22 @@ fn validate_expr_static_with_win_stage(
             expr: txt_e,
             pattern,
             escape,
+            op,
             ..
         } => {
+            let fname = match op {
+                LikeOp::Like => "like",
+                LikeOp::Glob => "glob",
+                LikeOp::Regexp => "regexp",
+                LikeOp::Match => "match",
+            };
+            let argc = if escape.is_some() { 3 } else { 2 };
+            if matches!(op, LikeOp::Regexp | LikeOp::Match)
+                || functions.find_scalar(fname, argc).is_some()
+                || (matches!(op, LikeOp::Like | LikeOp::Glob) && functions.has_scalar_name(fname))
+            {
+                functions.validate_call(fname, false, argc, false, false, false)?;
+            }
             validate_expr_static_with_win(
                 txt_e,
                 scopes,
@@ -34284,6 +34804,20 @@ fn validate_expr_static_with_win_stage(
                     _ => false,
                 }
             };
+            if !ctes.resolving_views.is_empty() {
+                let is_direct_only = functions
+                    .find_scalar(name, arg_count)
+                    .is_some_and(|m| m.flags.contains(FunctionFlags::DIRECTONLY))
+                    || functions
+                        .find_aggregate(name, arg_count)
+                        .is_some_and(|m| m.flags.contains(FunctionFlags::DIRECTONLY));
+                if is_direct_only {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("unsafe use of {name}()"),
+                    ));
+                }
+            }
             functions.validate_call(
                 name,
                 is_star,

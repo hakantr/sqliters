@@ -18,7 +18,8 @@ pub use record::{
     KeySortOrder, compare_records, compare_records_with_encoding, decode_record,
     decode_record_column, decode_record_column_with_encoding, decode_record_with_encoding,
     decode_serial_value, decode_serial_value_with_encoding, encode_record,
-    encode_record_with_encoding, serial_type_for, serial_type_for_with_encoding, serial_type_len,
+    encode_record_with_encoding, fallible_sort_by, serial_type_for, serial_type_for_with_encoding,
+    serial_type_len,
 };
 pub use runtime_api::{
     AggregateStepId, DatabaseId, ExecutionServices, FunctionFlags, MAX_DB_SLOTS, RowMutationEvent,
@@ -26,8 +27,8 @@ pub use runtime_api::{
     strip_unsubscribed_subtypes,
 };
 pub use value::{
-    Collation, StorageClass, TextEncoding, TypeAffinity, Value, cmp_int_float, format_sqlite_real,
-    parse_numeric_text,
+    Collation, CustomCollation, StorageClass, TextEncoding, TypeAffinity, Value, cmp_int_float,
+    format_sqlite_real, parse_numeric_text,
 };
 pub use varint::{get_varint, get_varint_i64, push_varint, put_varint, put_varint_i64, varint_len};
 

@@ -2761,15 +2761,25 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
-            // [NOT] BETWEEN / [NOT] IN / [NOT] LIKE / [NOT] GLOB
+            // [NOT] BETWEEN / [NOT] IN / [NOT] LIKE / [NOT] GLOB / [NOT] REGEXP / [NOT] MATCH
             if (tok.kind == TokenKind::Not
                 && matches!(
                     self.peek_n(1).kind,
-                    TokenKind::Between | TokenKind::In | TokenKind::Like | TokenKind::Glob
+                    TokenKind::Between
+                        | TokenKind::In
+                        | TokenKind::Like
+                        | TokenKind::Glob
+                        | TokenKind::Regexp
+                        | TokenKind::Match
                 )
                 || matches!(
                     tok.kind,
-                    TokenKind::Between | TokenKind::In | TokenKind::Like | TokenKind::Glob
+                    TokenKind::Between
+                        | TokenKind::In
+                        | TokenKind::Like
+                        | TokenKind::Glob
+                        | TokenKind::Regexp
+                        | TokenKind::Match
                 ))
                 && 7 >= min_bp
             {
@@ -2832,22 +2842,24 @@ impl<'a> Parser<'a> {
                             };
                         }
                     }
-                    TokenKind::Like | TokenKind::Glob => {
+                    TokenKind::Like | TokenKind::Glob | TokenKind::Regexp | TokenKind::Match => {
                         let pattern = self.parse_expr_bp(8)?;
                         let escape = if self.eat(TokenKind::Escape) {
                             Some(Box::new(self.parse_expr_bp(8)?))
                         } else {
                             None
                         };
+                        let op = match kw.kind {
+                            TokenKind::Glob => LikeOp::Glob,
+                            TokenKind::Regexp => LikeOp::Regexp,
+                            TokenKind::Match => LikeOp::Match,
+                            _ => LikeOp::Like,
+                        };
                         lhs = Expr::Like {
                             expr: Box::new(lhs),
                             pattern: Box::new(pattern),
                             escape,
-                            op: if kw.kind == TokenKind::Glob {
-                                LikeOp::Glob
-                            } else {
-                                LikeOp::Like
-                            },
+                            op,
                             negated,
                         };
                     }

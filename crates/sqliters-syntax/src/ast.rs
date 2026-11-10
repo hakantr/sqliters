@@ -709,6 +709,8 @@ pub enum BinaryOp {
 pub enum LikeOp {
     Like,
     Glob,
+    Regexp,
+    Match,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -51,13 +51,15 @@ pub use sqliters_vfs as vfs;
 #[doc(hidden)]
 pub use sqliters_core::TestBlobHandle;
 pub use sqliters_core::{
-    CloseError, CollationCallback, CollationRegistry, ColumnSchema, Connection,
-    ConnectionOpenOptions, ExecutionContext, ForeignKeySchema, FunctionRegistry, IndexSchema,
+    AuthorizerAction, AuthorizerCallback, AuthorizerResult, CloseError, CollationCallback,
+    CollationRegistry, ColumnSchema, CommitHookCallback, Connection, ConnectionOpenOptions,
+    ExecutionContext, FallibleCollationCallback, ForeignKeySchema, FunctionRegistry, IndexSchema,
     InterruptHandle, MutationContext, MutationOrigin, MutationPipeline, MutationRow, PrepareMode,
-    ProgressCallback, ProgressTracker, QueryOutput, QueryResult, Row,
+    ProgressCallback, ProgressTracker, QueryOutput, QueryResult, RollbackHookCallback, Row,
     SQLITE_DEFAULT_WAL_AUTOCHECKPOINT, SQLITE_MAX_TRIGGER_DEPTH, SQLITE_MAX_TRIGGER_STEPS,
     ScalarFunctionCallback, ScalarFunctionDef, Schema, Statement, StepResult, TableSchema,
-    TriggerEventKind, TriggerSchema,
+    TraceHookCallback, TriggerEventKind, TriggerSchema, UpdateHookCallback, UpdateHookEvent,
+    WindowAggregateInstance, WindowFunctionDef,
 };
 pub use sqliters_pager::{
     AutoVacuumMode, DatabaseHeader, JournalMode, LockingMode, WalCheckpointMode,
@@ -67,11 +69,12 @@ pub use sqliters_syntax::{
     ColumnRef, ConflictAction, FkAction, QualifiedName, is_complete, parse_one, parse_statements,
 };
 pub use sqliters_types::{
-    AggregateStepId, Collation, ConflictResolutionEffect, DatabaseId, DatabaseKind, ErrorCode,
-    ExecutionServices, FunctionFlags, LockGeometry, MAX_DB_SLOTS, Pgno, Result, RowMutationEvent,
-    RowMutationOp, RuntimeValue, SQLITE_DEFAULT_PAGE_SIZE, SQLITE_FILE_HEADER, SQLITE_MAX_ATTACHED,
-    SQLITE_SOURCE_ID, SQLITE_VERSION, SQLITE_VERSION_NUMBER, SqliteError, StorageClass,
-    TextEncoding, TypeAffinity, Value,
+    AggregateStepId, Collation, ConflictResolutionEffect, CustomCollation, DatabaseId,
+    DatabaseKind, ErrorCode, ExecutionServices, FunctionFlags, LockGeometry, MAX_DB_SLOTS, Pgno,
+    Result, RowMutationEvent, RowMutationOp, RuntimeValue, SQLITE_DEFAULT_PAGE_SIZE,
+    SQLITE_FILE_HEADER, SQLITE_MAX_ATTACHED, SQLITE_SOURCE_ID, SQLITE_VERSION,
+    SQLITE_VERSION_NUMBER, SqliteError, StorageClass, TextEncoding, TypeAffinity, Value,
+    fallible_sort_by,
 };
 pub use sqliters_vdbe::BtreeAccess;
 pub use sqliters_vfs::{LockLevel, MemoryVfs, OpenFlags, OsVfs, SyncFlags, Vfs, VfsFile};

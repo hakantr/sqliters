@@ -4,6 +4,7 @@
 
 pub mod compiler;
 pub mod db_set;
+pub mod driver;
 pub mod engine;
 pub mod execution_context;
 pub mod schema;
@@ -29,8 +30,8 @@ use sqliters_syntax::{
 };
 pub use sqliters_syntax::{ColumnRef, QualifiedName};
 pub use sqliters_types::{
-    AggregateStepId, DatabaseId, ExecutionServices, FunctionFlags, MAX_DB_SLOTS, RowMutationEvent,
-    RowMutationOp, RuntimeValue, SQLITE_MAX_ATTACHED,
+    AggregateStepId, CustomCollation, DatabaseId, ExecutionServices, FunctionFlags, MAX_DB_SLOTS,
+    RowMutationEvent, RowMutationOp, RuntimeValue, SQLITE_MAX_ATTACHED,
 };
 use sqliters_types::{
     ConflictResolutionEffect, DatabaseKind, ErrorCode, LockGeometry, Pgno, Result,
@@ -53,12 +54,14 @@ pub use db_set::{
     DatabaseSet, DbSlot, ResolvedRelation, SQLITE_MAX_PAGE_COUNT, SchemaInstanceId, TempStoreMode,
     TempTriggerBinding,
 };
+pub use driver::{AuthorizerAction, AuthorizerCallback, AuthorizerResult, AuthorizerSlot};
 pub use engine::{QueryOutput, SQLITE_DEFAULT_WAL_AUTOCHECKPOINT};
 pub use execution_context::{
     CollationCallback, CollationRegistry, CommitCoordinatorHooks, CommitHookCallback,
-    ExecutionContext, FunctionRegistry, MutationContext, MutationOrigin, MutationPipeline,
-    MutationRow, ProgressCallback, ProgressTracker, ScalarFunctionCallback, ScalarFunctionDef,
-    WindowAggregateInstance, WindowFunctionDef,
+    ExecutionContext, FallibleCollationCallback, FunctionRegistry, MutationContext, MutationOrigin,
+    MutationPipeline, MutationRow, ProgressCallback, ProgressTracker, RollbackHookCallback,
+    ScalarFunctionCallback, ScalarFunctionDef, TraceHookCallback, UpdateHookCallback,
+    UpdateHookEvent, WindowAggregateInstance, WindowFunctionDef,
 };
 pub use schema::{ColumnSchema, ForeignKeySchema, IndexSchema, Schema, TableSchema, ViewSchema};
 pub use trigger::{
@@ -554,6 +557,8 @@ struct ConnectionInner {
     progress: ProgressTracker,
     commit_hooks: CommitCoordinatorHooks,
     mutation_pipeline: MutationPipeline,
+    authorizer: AuthorizerSlot,
+    trace_hook: Option<TraceHookCallback>,
     strict_subtype: bool,
     explicit_tx: bool,
     implicit_savepoint_tx: bool,
@@ -572,6 +577,7 @@ struct ConnectionInner {
     deferred_fk_suspects: Vec<(SchemaInstanceId, String, schema::TableRowKey, usize)>,
     schema_generation: u64,
     v1_expire_generation: u64,
+    advisory_expire_generation: u64,
     simulated_cleanup_io_error: Option<SqliteError>,
     panic_on_next_pending_drop: bool,
 }
@@ -910,6 +916,7 @@ impl ConnectionInner {
             }
         }
         self.db_set.sync_temp_trigger_bindings_from_schema();
+        self.db_set.rebind_all_collations(&self.collations);
     }
 
     /// Ensures `sqlite_schema` catalogs across open database slots are loaded for `prepare`,
@@ -983,6 +990,7 @@ impl ConnectionInner {
             }
         }
         if any_changed {
+            self.db_set.rebind_all_collations(&self.collations);
             self.db_set.reconcile_temp_triggers()?;
             self.schema_generation += 1;
             self.v1_expire_generation += 1;
@@ -1014,6 +1022,7 @@ impl ConnectionInner {
             }
         }
         if any_changed {
+            self.db_set.rebind_all_collations(&self.collations);
             self.db_set.reconcile_temp_triggers()?;
             self.schema_generation += 1;
             self.v1_expire_generation += 1;
@@ -1112,6 +1121,9 @@ impl ConnectionInner {
         shared: &ConnectionShared,
     ) -> Result<()> {
         let _removed = self.activity.remove(hid);
+        if self.activity.leases.is_empty() {
+            shared.interrupt_flag.store(false, Ordering::SeqCst);
+        }
         let summary = self.activity.summary_excluding(hid, &self.db_set);
 
         if let Some(sim_err) = self.take_simulated_cleanup_error() {
@@ -1329,6 +1341,9 @@ impl ConnectionInner {
         shared: &ConnectionShared,
     ) -> SqliteError {
         self.activity.remove(hid);
+        if self.activity.leases.is_empty() {
+            shared.interrupt_flag.store(false, Ordering::SeqCst);
+        }
         let summary = self.activity.summary_excluding(hid, &self.db_set);
 
         if let Some(sim_err) = self.take_simulated_cleanup_error() {
@@ -1426,11 +1441,15 @@ impl ConnectionInner {
                             slot.schema = s;
                         }
                     }
+                    self.db_set.rebind_all_collations(&self.collations);
                     let _ = self.db_set.reconcile_temp_triggers();
                     self.schema_generation += 1;
                     self.v1_expire_generation += 1;
                 }
                 self.publish(shared);
+                if let Err(hk_err) = self.commit_hooks.invoke_rollback_hook() {
+                    return hk_err;
+                }
                 err.clone()
             }
 
@@ -2124,6 +2143,8 @@ impl Connection {
             progress: ProgressTracker::default(),
             commit_hooks: CommitCoordinatorHooks::default(),
             mutation_pipeline: MutationPipeline::default(),
+            authorizer: AuthorizerSlot::default(),
+            trace_hook: None,
             strict_subtype: true,
             explicit_tx: false,
             implicit_savepoint_tx: false,
@@ -2142,6 +2163,7 @@ impl Connection {
             deferred_fk_suspects: Vec::new(),
             schema_generation: 0,
             v1_expire_generation: 0,
+            advisory_expire_generation: 0,
             simulated_cleanup_io_error: None,
             panic_on_next_pending_drop: false,
         };
@@ -2447,6 +2469,7 @@ impl Connection {
                 slot.schema = Schema::load_for_schema(bt, Some(&slot.name))?;
             }
         }
+        inner.db_set.rebind_all_collations(&inner.collations);
         if inner.db_set.main_btree().pager().page_count() > 0 {
             inner.connection_encoding = inner.db_set.main_btree().encoding();
         }
@@ -2877,6 +2900,73 @@ impl Connection {
         Ok(())
     }
 
+    /// Alias for [`Connection::commit_hook`].
+    pub fn set_commit_hook(&self, hook: Option<CommitHookCallback>) -> Result<()> {
+        self.commit_hook(hook)
+    }
+
+    /// Installs or clears the connection rollback hook (`sqlite3_rollback_hook`).
+    pub fn rollback_hook(&self, hook: Option<RollbackHookCallback>) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        inner.commit_hooks.set_rollback_hook(hook);
+        Ok(())
+    }
+
+    /// Alias for [`Connection::rollback_hook`].
+    pub fn set_rollback_hook(&self, hook: Option<RollbackHookCallback>) -> Result<()> {
+        self.rollback_hook(hook)
+    }
+
+    /// Installs or clears the connection row-level update hook (`sqlite3_update_hook`).
+    pub fn update_hook(&self, hook: Option<UpdateHookCallback>) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        inner.mutation_pipeline.set_update_hook(hook);
+        Ok(())
+    }
+
+    /// Alias for [`Connection::update_hook`].
+    pub fn set_update_hook(&self, hook: Option<UpdateHookCallback>) -> Result<()> {
+        self.update_hook(hook)
+    }
+
+    /// Installs or clears the connection SQL statement trace hook (`sqlite3_trace_v2` / `SQLITE_TRACE_STMT`).
+    pub fn trace_hook(&self, hook: Option<TraceHookCallback>) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        inner.trace_hook = hook;
+        Ok(())
+    }
+
+    /// Alias for [`Connection::trace_hook`].
+    pub fn set_trace_hook(&self, hook: Option<TraceHookCallback>) -> Result<()> {
+        self.trace_hook(hook)
+    }
+
+    /// Installs or clears the prepare-time authorization callback (`sqlite3_set_authorizer`).
+    ///
+    /// Marks all existing prepared statements on this connection as advisory-expired
+    /// (`sqlite3ExpirePreparedStatements(db, 1)`): statements that have not yet started (or are
+    /// restarted after halting) will automatically reprepare under the new authorizer on the next
+    /// [`Statement::step`], while statements already in `Running` state continue to completion.
+    pub fn set_authorizer(&self, authorizer: Option<AuthorizerCallback>) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        inner.authorizer.set(authorizer);
+        inner.advisory_expire_generation += 1;
+        Ok(())
+    }
+
+    /// Clears the prepare-time authorization callback (`sqlite3_set_authorizer(db, NULL, NULL)`).
+    pub fn clear_authorizer(&self) -> Result<()> {
+        self.set_authorizer(None)
+    }
+
     /// Replaces or restores the `Btree` atomic interrupt flag under the connection gate.
     pub fn set_interrupt_flag(&self, flag: Option<Arc<AtomicBool>>) -> Result<()> {
         let mut session = self.shared.enter()?;
@@ -2914,6 +3004,17 @@ impl Connection {
         Ok(())
     }
 
+    /// Idiomatic alias for [`Connection::register_scalar_function`].
+    pub fn create_scalar_function(
+        &self,
+        name: &str,
+        num_args: i32,
+        flags: FunctionFlags,
+        func: impl Fn(&[RuntimeValue]) -> Result<RuntimeValue> + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.register_scalar_function(name, num_args, flags, func)
+    }
+
     /// Unregisters a connection-local scalar SQL function overload (`sqlite3_create_function_v2`
     /// with `xFunc == NULL`).
     pub fn unregister_scalar_function(&self, name: &str, num_args: i32) -> Result<bool> {
@@ -2933,6 +3034,25 @@ impl Connection {
             inner.v1_expire_generation += 1;
         }
         Ok(removed)
+    }
+
+    /// Idiomatic alias for [`Connection::unregister_scalar_function`].
+    pub fn remove_scalar_function(&self, name: &str, num_args: i32) -> Result<bool> {
+        self.unregister_scalar_function(name, num_args)
+    }
+
+    /// Registers or replaces a connection-local aggregate SQL function (`sqlite3_create_function_v2`).
+    pub fn create_aggregate_function(
+        &self,
+        name: &str,
+        num_args: i32,
+        flags: FunctionFlags,
+        factory: impl Fn() -> Box<dyn execution_context::WindowAggregateInstance>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<()> {
+        self.register_window_function(name, num_args, flags, false, false, factory)
     }
 
     /// Registers or replaces a connection-local aggregate or window SQL function
@@ -2972,6 +3092,20 @@ impl Connection {
         Ok(())
     }
 
+    /// Idiomatic alias for [`Connection::register_window_function`] with window `xValue`/`xInverse` enabled.
+    pub fn create_window_function(
+        &self,
+        name: &str,
+        num_args: i32,
+        flags: FunctionFlags,
+        factory: impl Fn() -> Box<dyn execution_context::WindowAggregateInstance>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<()> {
+        self.register_window_function(name, num_args, flags, true, true, factory)
+    }
+
     /// Registers or replaces a connection-local collation sequence (`sqlite3_create_collation_v2`).
     pub fn register_collation(
         &self,
@@ -2982,9 +3116,44 @@ impl Connection {
         let inner = session.inner_mut();
         inner.ensure_usable()?;
         inner.collations.register_collation(name, cmp);
+        inner.db_set.rebind_all_collations(&inner.collations);
         inner.schema_generation += 1;
         inner.v1_expire_generation += 1;
         Ok(())
+    }
+
+    /// Idiomatic alias for [`Connection::register_collation`].
+    pub fn create_collation(
+        &self,
+        name: &str,
+        cmp: impl Fn(&str, &str) -> std::cmp::Ordering + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.register_collation(name, cmp)
+    }
+
+    /// Registers or replaces a fallible connection-local collation sequence (`Result<Ordering>`).
+    pub fn register_fallible_collation(
+        &self,
+        name: &str,
+        cmp: impl Fn(&str, &str) -> Result<std::cmp::Ordering> + Send + Sync + 'static,
+    ) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        inner.collations.register_fallible_collation(name, cmp);
+        inner.db_set.rebind_all_collations(&inner.collations);
+        inner.schema_generation += 1;
+        inner.v1_expire_generation += 1;
+        Ok(())
+    }
+
+    /// Idiomatic alias for [`Connection::register_fallible_collation`].
+    pub fn create_fallible_collation(
+        &self,
+        name: &str,
+        cmp: impl Fn(&str, &str) -> Result<std::cmp::Ordering> + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.register_fallible_collation(name, cmp)
     }
 
     /// Installs or clears the periodic VM/engine progress callback (`sqlite3_progress_handler`).
@@ -3003,6 +3172,15 @@ impl Connection {
         let interval = u32::try_from(period_ops).unwrap_or(0);
         inner.progress.set_handler(interval, handler);
         Ok(())
+    }
+
+    /// Alias for [`Connection::progress_handler`].
+    pub fn set_progress_handler(
+        &self,
+        period_ops: i32,
+        handler: Option<Box<dyn FnMut() -> bool + Send>>,
+    ) -> Result<()> {
+        self.progress_handler(period_ops, handler)
     }
 
     /// Returns the cumulative VM/interpreter progress-tick count on this connection.
@@ -3107,6 +3285,14 @@ impl Connection {
             None => BusyPolicy::None,
         };
         Ok(())
+    }
+
+    /// Alias for [`Connection::busy_handler`].
+    pub fn set_busy_handler(
+        &self,
+        handler: Option<Box<dyn FnMut(u32) -> bool + Send>>,
+    ) -> Result<()> {
+        self.busy_handler(handler)
     }
 
     /// Queries or updates `SQLITE_FCNTL_PERSIST_WAL` on `db_name` (`None`, `Some("")`, or
@@ -3384,6 +3570,7 @@ pub struct Statement {
     compiled_vdbe: Option<VdbeProgram>,
     compiled_schema_generation: u64,
     compiled_v1_expire_generation: u64,
+    compiled_advisory_expire_generation: u64,
     compiled_slot_cookies: Vec<(SchemaInstanceId, u32, bool)>,
     expired: bool,
     column_names: Vec<String>,
@@ -3425,6 +3612,7 @@ fn compile_first_sql(
     enable_test_functions: bool,
     functions: &FunctionRegistry,
     collations: &CollationRegistry,
+    authorizer: &mut AuthorizerSlot,
 ) -> Result<CompiledArtifacts> {
     let (stmt_opt, _) = parse_one(raw_sql)?;
     compile_parsed_stmt(
@@ -3437,6 +3625,7 @@ fn compile_first_sql(
         enable_test_functions,
         functions,
         collations,
+        authorizer,
     )
 }
 
@@ -3451,6 +3640,7 @@ fn compile_parsed_stmt(
     enable_test_functions: bool,
     functions: &FunctionRegistry,
     collations: &CollationRegistry,
+    authorizer: &mut AuthorizerSlot,
 ) -> Result<CompiledArtifacts> {
     let _tf_guard = TestFunctionsScope::enter(enable_test_functions);
     let Some(stmt) = stmt_opt else {
@@ -3466,7 +3656,6 @@ fn compile_parsed_stmt(
     };
 
     let requires_schema = stmt_requires_schema(&stmt);
-    let category = Some(classify_stmt_category(&stmt));
     let mut max_param = 0usize;
     let mut named_params = HashMap::new();
     collect_stmt_params(&stmt, &mut max_param, &mut named_params);
@@ -3481,6 +3670,20 @@ fn compile_parsed_stmt(
         functions,
         collations,
     )?;
+
+    let Some(stmt) = driver::authorize_stmt_with_slot(&stmt, db_set, functions, authorizer)? else {
+        return Ok(CompiledArtifacts {
+            stmt: None,
+            requires_schema,
+            category: None,
+            compiled_vdbe: None,
+            column_names: Vec::new(),
+            max_param,
+            named_params,
+        });
+    };
+
+    let category = Some(classify_stmt_category(&stmt));
     let mut compiled_vdbe = None;
     // Only use fast-path `VdbeVm` when all `DatabaseId` slots are `0` (`main`) or `1` (`temp`),
     // which never shift on `DETACH`. Attached `slots[2..]` queries run via `MaterializedRead`
@@ -4190,6 +4393,7 @@ impl Statement {
             inner.runtime.enable_test_functions,
             &inner.functions,
             &inner.collations,
+            &mut inner.authorizer,
         ) {
             Ok(a) => a,
             Err(err)
@@ -4213,6 +4417,7 @@ impl Statement {
                         inner.runtime.enable_test_functions,
                         &inner.functions,
                         &inner.collations,
+                        &mut inner.authorizer,
                     )?
                 } else {
                     return Err(err);
@@ -4235,6 +4440,7 @@ impl Statement {
             compiled_vdbe: artifacts.compiled_vdbe,
             compiled_schema_generation: inner.schema_generation,
             compiled_v1_expire_generation: inner.v1_expire_generation,
+            compiled_advisory_expire_generation: inner.advisory_expire_generation,
             compiled_slot_cookies: inner.snapshot_slot_cookies(),
             expired: false,
             column_names: artifacts.column_names,
@@ -4510,7 +4716,9 @@ impl Statement {
     }
 
     fn needs_reprepare(&self, inner: &ConnectionInner) -> bool {
-        if self.expired {
+        if self.expired
+            || self.compiled_advisory_expire_generation != inner.advisory_expire_generation
+        {
             return true;
         }
         if self.category != Some(StmtCategory::Control) && self.has_detached_slot(inner) {
@@ -4534,15 +4742,19 @@ impl Statement {
 
     fn reprepare_in_open_tx(&mut self, inner: &mut ConnectionInner) -> Result<()> {
         for _ in 0..SQLITE_MAX_SCHEMA_RETRY {
+            let parsed_stmt = parse_one(&self.raw_sql).ok().and_then(|(st, _)| st);
             if !inner.db_set.is_temp_open()
-                && let Ok((Some(ref st), _)) = parse_one(&self.raw_sql)
+                && let Some(ref st) = parsed_stmt
                 && stmt_references_temp_catalog(st, &inner.db_set)
             {
                 let enc = inner.effective_encoding();
                 inner.db_set.ensure_temp_open(enc, inner.writable_schema)?;
             }
             inner.refresh_open_tx_schemas()?;
-            if self.stmt.as_ref().is_some_and(stmt_loads_schema_on_prepare) {
+            if parsed_stmt
+                .as_ref()
+                .is_some_and(stmt_loads_schema_on_prepare)
+            {
                 let any_unloaded = inner
                     .db_set
                     .slots()
@@ -4562,6 +4774,7 @@ impl Statement {
                 inner.runtime.enable_test_functions,
                 &inner.functions,
                 &inner.collations,
+                &mut inner.authorizer,
             ) {
                 Ok(a) => a,
                 Err(err)
@@ -4583,6 +4796,7 @@ impl Statement {
                             inner.runtime.enable_test_functions,
                             &inner.functions,
                             &inner.collations,
+                            &mut inner.authorizer,
                         )?
                     } else {
                         return Err(err);
@@ -4604,6 +4818,7 @@ impl Statement {
             self.named_params = artifacts.named_params;
             self.compiled_schema_generation = inner.schema_generation;
             self.compiled_v1_expire_generation = inner.v1_expire_generation;
+            self.compiled_advisory_expire_generation = inner.advisory_expire_generation;
             self.compiled_slot_cookies = inner.snapshot_slot_cookies();
             self.expired = false;
             if !self.needs_reprepare(inner) {
@@ -4642,13 +4857,31 @@ impl Statement {
             self.lifecycle = StatementLifecycle::Ready;
         }
 
-        // Empty / comment-only SQL (`stmt.is_none()`)
-        if self.stmt.is_none() {
+        // Empty / comment-only SQL (`stmt.is_none()` with no parsed statement)
+        if self.stmt.is_none() && matches!(parse_one(&self.raw_sql), Ok((None, _))) {
             self.lifecycle = StatementLifecycle::Halted { last_error: None };
             return Ok(StepResult::Done);
         }
 
         if matches!(self.lifecycle, StatementLifecycle::Ready) {
+            if let Some(ref mut cb) = inner.trace_hook
+                && let Err(e) =
+                    execution_context::catch_infallible_callback_panic("trace_hook", || {
+                        cb(&self.raw_sql)
+                    })
+            {
+                self.lifecycle = StatementLifecycle::Halted {
+                    last_error: Some(e.clone()),
+                };
+                return Err(e);
+            }
+            if self.stmt.is_none()
+                && !self.expired
+                && self.compiled_advisory_expire_generation == inner.advisory_expire_generation
+            {
+                self.lifecycle = StatementLifecycle::Halted { last_error: None };
+                return Ok(StepResult::Done);
+            }
             return self.start_execution_in_session(hid, shared, inner);
         }
 
@@ -4662,8 +4895,9 @@ impl Statement {
         shared: &Arc<ConnectionShared>,
         inner: &mut ConnectionInner,
     ) -> Result<StepResult> {
-        let initial_cat = self.category.expect("non-empty statement has category");
-        if initial_cat != StmtCategory::Control
+        let is_advisory_expired = self.expired
+            || self.compiled_advisory_expire_generation != inner.advisory_expire_generation;
+        if self.category != Some(StmtCategory::Control)
             && let Err(e) = inner.refresh_open_tx_schemas()
         {
             self.lifecycle = StatementLifecycle::Halted {
@@ -4672,8 +4906,8 @@ impl Statement {
             return Err(e);
         }
 
-        if (initial_cat == StmtCategory::Control && self.expired)
-            || (initial_cat != StmtCategory::Control && self.needs_reprepare(inner))
+        if is_advisory_expired
+            || (self.category != Some(StmtCategory::Control) && self.needs_reprepare(inner))
         {
             if self.mode == PrepareMode::V1 {
                 let err = SqliteError::new(ErrorCode::Schema, "database schema has changed");
@@ -4690,7 +4924,10 @@ impl Statement {
             }
         }
 
-        let category = self.category.expect("non-empty statement has category");
+        let Some(category) = self.category else {
+            self.lifecycle = StatementLifecycle::Halted { last_error: None };
+            return Ok(StepResult::Done);
+        };
 
         match category {
             StmtCategory::Control => {
