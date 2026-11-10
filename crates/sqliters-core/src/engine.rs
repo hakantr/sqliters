@@ -299,6 +299,13 @@ impl ExecContext<'_> {
 
     #[inline]
     pub(crate) fn dispatch_mutation(&mut self, event: MutationContext) -> Result<()> {
+        if event.invalidate_blobs
+            && let Some(ref old) = event.old_row
+            && let Some(inst_id) = self.db_set.slot(event.db_id).map(|s| s.schema_instance_id)
+        {
+            self.db_set
+                .expire_blobs_for_row(inst_id, &event.table_name, old.rowid);
+        }
         let db_name = self
             .db_set
             .slot(event.db_id)
@@ -1027,12 +1034,19 @@ fn exec_detach_database(
     let bit = 1u16.checked_shl(db_id.index() as u32).unwrap_or(0);
     let busy_by_lease =
         ((ctx.activity.other_read_db_mask | ctx.activity.other_write_db_mask) & bit) != 0;
+    let active_backups = ctx.db_set.slot(db_id).map_or(0, |s| s.active_backups);
     let in_tx = ctx
         .db_set
         .slot(db_id)
         .and_then(|s| s.btree.as_ref())
         .is_some_and(|bt| bt.transaction_state() != TransactionState::Open);
 
+    if active_backups > 0 {
+        return Err(SqliteError::new(
+            ErrorCode::Locked,
+            format!("database {z_name} is locked"),
+        ));
+    }
     if in_tx || busy_by_lease {
         return Err(SqliteError::new(
             ErrorCode::Error,
@@ -1041,6 +1055,7 @@ fn exec_detach_database(
     }
 
     let (detached_inst_id, _) = ctx.db_set.detach_slot(db_id)?;
+    ctx.db_set.invalidate_blobs_for_instance(detached_inst_id);
     ctx.deferred_fk_suspects
         .retain(|(inst, _, _, _)| *inst != detached_inst_id);
 
@@ -1055,6 +1070,7 @@ pub(crate) fn rollback_all_databases(
     ctx: &mut ExecContext<'_>,
     reload_schemas_if_changed: bool,
 ) -> Result<()> {
+    ctx.db_set.invalidate_all_blobs();
     let write_only = !*ctx.schema_changed_in_tx;
     let mut first_err: Option<SqliteError> = None;
 
@@ -2049,6 +2065,11 @@ pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
                 *ctx.deferred_fk_suspects = sp.deferred_fk_suspects;
                 ctx.mutation_pipeline.truncate(sp.mutation_len_at_open);
                 ctx.savepoints.truncate(pos + 1);
+                if is_schema_change {
+                    ctx.db_set.invalidate_all_blobs();
+                } else {
+                    ctx.db_set.expire_writable_blobs();
+                }
                 if schema_changed_since_sp {
                     for db_slot in ctx.db_set.slots_mut() {
                         if let Some((_, saved_schema)) = sp
@@ -11101,11 +11122,18 @@ fn remove_row_and_indexes(
             }
         }
     }
+    let inst_id_opt = ctx.db_set.slot(db_id).map(|s| s.schema_instance_id);
     let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) else {
         return Ok(false);
     };
     match rkey {
-        TableRowKey::Rowid(rid) => bt.delete_table(tbl.root_pgno, *rid),
+        TableRowKey::Rowid(rid) => {
+            let removed = bt.delete_table(tbl.root_pgno, *rid)?;
+            if removed && let Some(inst_id) = inst_id_opt {
+                ctx.db_set.expire_blobs_for_row(inst_id, &tbl.name, *rid);
+            }
+            Ok(removed)
+        }
         TableRowKey::WithoutRowidPk(pk) => {
             let pk_orders = tbl.without_rowid_pk_orders();
             bt.delete_index(tbl.root_pgno, pk, &pk_orders)
@@ -18299,6 +18327,9 @@ fn prepare_delete_exec(
                         bt.clear_tree(idx.root_pgno)?;
                     }
                 }
+                if let Some(inst_id) = ctx.db_set.slot(db_id).map(|s| s.schema_instance_id) {
+                    ctx.db_set.expire_blobs_for_table_clear(inst_id, &tbl.name);
+                }
                 return Ok(PreparedDelete::TruncateCleared(count));
             }
 
@@ -19507,6 +19538,7 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
     }
     // Drop roots in strictly descending `root_pgno` order (`sqlite/src/build.c:destroyTable`)!
     roots.sort_by_key(|a| std::cmp::Reverse(a.0));
+    let mut relocated_roots: Vec<RootPageMove> = Vec::new();
 
     for (root_pgno, schema_rowid, kind) in roots {
         let mv = {
@@ -19538,6 +19570,7 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
                 .as_mut()
                 .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
             apply_root_page_move(bt, &mut slot.schema, mv)?;
+            relocated_roots.push(mv);
         }
     }
 
@@ -19578,6 +19611,12 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
         if temp_triggers_deleted {
             ctx.db_set.reload_temp_schema_preserving_bindings()?;
         }
+    }
+    if let Some(inst_id) = ctx.db_set.slot(db_id).map(|s| s.schema_instance_id) {
+        for mv in relocated_roots {
+            ctx.db_set.update_blob_root_page(inst_id, mv.from, mv.to);
+        }
+        ctx.db_set.invalidate_blobs_for_table(inst_id, &tbl.name);
     }
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;
@@ -20607,6 +20646,11 @@ fn exec_drop_index(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
         ctx.db_set.reload_temp_schema_preserving_bindings()?;
     } else {
         slot.reload_schema()?;
+    }
+    if let Some(mv) = mv
+        && let Some(inst_id) = ctx.db_set.slot(db_id).map(|s| s.schema_instance_id)
+    {
+        ctx.db_set.update_blob_root_page(inst_id, mv.from, mv.to);
     }
     ctx.db_set.rebind_all_collations(ctx.collations);
     *ctx.schema_generation += 1;
@@ -22026,6 +22070,9 @@ fn exec_alter_table(
                     validate_views_after_alter(ctx.db_set, ctx.functions, db_id, "rename")?;
                 }
             }
+            if let Some(inst_id) = ctx.db_set.slot(db_id).map(|s| s.schema_instance_id) {
+                ctx.db_set.invalidate_blobs_for_table(inst_id, &tbl.name);
+            }
             return Ok(());
         }
         AlterTableAction::RenameColumn { old_name, new_name } => {
@@ -22314,6 +22361,9 @@ fn exec_alter_table(
                     validate_views_after_alter(ctx.db_set, ctx.functions, db_id, "rename")?;
                 }
             }
+            if let Some(inst_id) = ctx.db_set.slot(db_id).map(|s| s.schema_instance_id) {
+                ctx.db_set.invalidate_blobs_for_table(inst_id, &tbl.name);
+            }
             return Ok(());
         }
         AlterTableAction::DropColumn(col_name) => {
@@ -22447,6 +22497,9 @@ fn exec_alter_table(
                         SqliteError::misuse("reloaded table missing after drop column")
                     })?;
                 rewrite_physical_rows_for_drop_column(ctx, db_id, &tbl, &new_tbl, col_idx)?;
+            }
+            if let Some(inst_id) = ctx.db_set.slot(db_id).map(|s| s.schema_instance_id) {
+                ctx.db_set.invalidate_blobs_for_table(inst_id, &tbl.name);
             }
             return Ok(());
         }
@@ -22586,6 +22639,9 @@ fn exec_alter_table(
         slot.reload_schema()?;
     }
     ctx.db_set.rebind_all_collations(ctx.collations);
+    if let Some(inst_id) = ctx.db_set.slot(db_id).map(|s| s.schema_instance_id) {
+        ctx.db_set.invalidate_blobs_for_table(inst_id, &tbl.name);
+    }
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;
     *ctx.schema_changed_in_tx = true;
@@ -27136,6 +27192,9 @@ pub(crate) fn exec_vacuum_checked(
     if let Some(slot) = ctx.db_set.slot_mut(db_id) {
         slot.schema = new_schema;
         slot.schema.rebind_collations(ctx.collations);
+    }
+    if let Some(inst_id) = ctx.db_set.slot(db_id).map(|s| s.schema_instance_id) {
+        ctx.db_set.invalidate_blobs_for_instance(inst_id);
     }
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;

@@ -12,14 +12,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
-pub use sqliters_pager::AutoVacuumMode;
+pub use sqliters_pager::{AutoVacuumMode, BackupTracker};
 use sqliters_pager::{
     JournalMode, LockingMode, Pager, PagerOpenOptions, TransactionState, WalCheckpointMode,
     WalCheckpointResult, create_super_journal_file,
 };
 use sqliters_types::{
     Bitvec, ErrorCode, KeySortOrder, Pgno, Result, SqliteError, TextEncoding, Value,
-    compare_records_with_encoding, decode_record_with_encoding, extended,
+    compare_records_with_encoding, decode_record_with_encoding, extended, get_varint,
+    get_varint_i64, serial_type_len,
 };
 use sqliters_vfs::{OpenFlags, Vfs};
 
@@ -1145,6 +1146,305 @@ impl Btree {
                 Err(next_pgno) => cur_pgno = next_pgno,
             }
         }
+    }
+
+    /// Locates the leaf page and cell payload layout `(leaf_pgno, local_start, local_len, total_payload_len, overflow_page)`
+    /// for `rowid` in the Table B+Tree rooted at `root_pgno`.
+    #[allow(clippy::type_complexity)]
+    fn locate_table_leaf_cell_layout(
+        &mut self,
+        root_pgno: Pgno,
+        rowid: i64,
+    ) -> Result<Option<(Pgno, usize, usize, u32, Option<Pgno>)>> {
+        if self.pager.page_count() == 0 {
+            return Ok(None);
+        }
+        let usable = self.pager.usable_size();
+        let mut cur_pgno = root_pgno;
+        loop {
+            self.check_interrupted()?;
+            let raw = self.pager.read_page(cur_pgno)?;
+            match peek_page_type(cur_pgno, usable, raw)? {
+                BtreePageType::TableLeaf => {
+                    let (_, n_cell, _) = raw_page_header(cur_pgno, usable, raw)?;
+                    let Ok(cell_idx) =
+                        binary_search_table_leaf(cur_pgno, usable, raw, n_cell, rowid)?
+                    else {
+                        return Ok(None);
+                    };
+                    let cell_off = raw_cell_offset(cur_pgno, usable, raw, 8, n_cell, cell_idx)?;
+                    let slice = &raw[cell_off..usable as usize];
+                    let (payload_u64, n1) = get_varint(slice)?;
+                    let total_payload_len = u32::try_from(payload_u64)
+                        .map_err(|_| SqliteError::corrupt("table cell payload > 4GiB"))?;
+                    let (_, n2) = get_varint_i64(&slice[n1..])?;
+                    let bounds = PayloadBounds::for_table_leaf(usable);
+                    let local_start = cell_off + n1 + n2;
+                    let local_len = bounds.local_len(total_payload_len);
+                    let local_end = local_start + local_len;
+                    let has_ovfl = (local_len as u32) < total_payload_len;
+                    let needed = local_end + if has_ovfl { 4 } else { 0 };
+                    if needed > usable as usize {
+                        return Err(SqliteError::corrupt(format!(
+                            "table leaf cell extends past end of page {cur_pgno}"
+                        )));
+                    }
+                    let overflow_page = if has_ovfl {
+                        Some(u32::from_be_bytes([
+                            raw[local_end],
+                            raw[local_end + 1],
+                            raw[local_end + 2],
+                            raw[local_end + 3],
+                        ]))
+                    } else {
+                        None
+                    };
+                    return Ok(Some((
+                        cur_pgno,
+                        local_start,
+                        local_len,
+                        total_payload_len,
+                        overflow_page,
+                    )));
+                }
+                BtreePageType::TableInterior => {
+                    let (_, next_pgno) = find_table_interior_child(cur_pgno, usable, raw, rowid)?;
+                    cur_pgno = next_pgno;
+                }
+                _ => {
+                    return Err(SqliteError::corrupt(format!(
+                        "expected table page at {cur_pgno}"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Inspects column `col_idx` (0-based within the stored record) of `rowid` in the Table B+Tree
+    /// rooted at `root_pgno`, returning `Ok(Some((payload_offset, byte_len)))` if the row exists
+    /// and the column is `TEXT` or `BLOB`, `Ok(None)` if `rowid` is not found, or an error if the
+    /// column is `NULL`/`INTEGER`/`REAL`.
+    pub fn inspect_table_row_column(
+        &mut self,
+        root_pgno: Pgno,
+        rowid: i64,
+        col_idx: usize,
+    ) -> Result<Option<(usize, usize)>> {
+        let Some(payload) = self.seek_table_rowid(root_pgno, rowid)? else {
+            return Ok(None);
+        };
+        if payload.is_empty() {
+            return Err(SqliteError::corrupt("empty record payload"));
+        }
+        let (hdr_u64, mut hdr_pos) = get_varint(&payload)?;
+        let hdr_len = usize::try_from(hdr_u64)
+            .map_err(|_| SqliteError::corrupt("record header length overflow"))?;
+        if hdr_len > payload.len() || hdr_len < hdr_pos {
+            return Err(SqliteError::corrupt(format!(
+                "record header length ({hdr_len}) out of bounds (payload len {})",
+                payload.len()
+            )));
+        }
+        let mut body_offset = hdr_len;
+        let mut cur_col = 0usize;
+        while hdr_pos < hdr_len {
+            let (st, n) = get_varint(&payload[hdr_pos..hdr_len])?;
+            hdr_pos += n;
+            let byte_len = serial_type_len(st)?;
+            if body_offset
+                .checked_add(byte_len)
+                .is_none_or(|end| end > payload.len())
+            {
+                return Err(SqliteError::corrupt("record column extends past payload"));
+            }
+            if cur_col == col_idx {
+                if st < 12 {
+                    let ty_name = match st {
+                        0 => "null",
+                        7 => "real",
+                        _ => "integer",
+                    };
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("cannot open value of type {ty_name}"),
+                    ));
+                }
+                return Ok(Some((body_offset, byte_len)));
+            }
+            body_offset += byte_len;
+            cur_col += 1;
+        }
+        // Trailing omitted column (e.g. `ALTER TABLE ADD COLUMN` on an older row): serial type 0 (`NULL`).
+        Err(SqliteError::new(
+            ErrorCode::Error,
+            "cannot open value of type null",
+        ))
+    }
+
+    /// Reads `buf.len()` bytes starting at `payload_offset` from the record payload of `rowid` in
+    /// the Table B+Tree rooted at `root_pgno`.
+    pub fn read_table_payload_slice(
+        &mut self,
+        root_pgno: Pgno,
+        rowid: i64,
+        payload_offset: usize,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        let Some((leaf_pgno, local_start, local_len, total_payload_len, overflow_page)) =
+            self.locate_table_leaf_cell_layout(root_pgno, rowid)?
+        else {
+            return Err(SqliteError::new(
+                ErrorCode::Abort,
+                "blob handle has expired",
+            ));
+        };
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let total_len = total_payload_len as usize;
+        if payload_offset
+            .checked_add(buf.len())
+            .is_none_or(|end| end > total_len)
+        {
+            return Err(SqliteError::corrupt(
+                "blob read slice exceeds record payload bounds",
+            ));
+        }
+
+        let mut remaining_out = buf;
+        let mut cur_off = payload_offset;
+
+        if cur_off < local_len {
+            let take = (local_len - cur_off).min(remaining_out.len());
+            let raw = self.pager.read_page(leaf_pgno)?;
+            let src_start = local_start + cur_off;
+            remaining_out[..take].copy_from_slice(&raw[src_start..src_start + take]);
+            remaining_out = &mut remaining_out[take..];
+            cur_off += take;
+        }
+
+        if !remaining_out.is_empty() {
+            let usable = self.pager.usable_size() as usize;
+            let chunk_cap = usable - 4;
+            let mut ovfl_stream_off = local_len;
+            let mut cur_ovfl = overflow_page;
+            let mut hops = 0u32;
+            let max_pages = self.pager.page_count().max(1);
+
+            while !remaining_out.is_empty() {
+                let pgno = cur_ovfl.ok_or_else(|| {
+                    SqliteError::corrupt("truncated overflow chain in read_table_payload_slice")
+                })?;
+                hops += 1;
+                if hops > max_pages {
+                    return Err(SqliteError::corrupt("overflow chain cycle"));
+                }
+                let raw = self.pager.read_page(pgno)?;
+                let next_ovfl = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                let page_payload_len = total_len.saturating_sub(ovfl_stream_off).min(chunk_cap);
+                if cur_off < ovfl_stream_off + page_payload_len {
+                    let in_page_off = cur_off - ovfl_stream_off;
+                    let take = (page_payload_len - in_page_off).min(remaining_out.len());
+                    let src_start = 4 + in_page_off;
+                    remaining_out[..take].copy_from_slice(&raw[src_start..src_start + take]);
+                    remaining_out = &mut remaining_out[take..];
+                    cur_off += take;
+                }
+                ovfl_stream_off += page_payload_len;
+                cur_ovfl = if next_ovfl == 0 {
+                    None
+                } else {
+                    Some(next_ovfl)
+                };
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Overwrites `data.len()` bytes in-place starting at `payload_offset` within the record
+    /// payload of `rowid` in the Table B+Tree rooted at `root_pgno` (`sqlite3_blob_write`,
+    /// `sqlite/src/vdbeblob.c:340-396`), journaling touched leaf and overflow pages via [`Pager::write_page`].
+    pub fn write_table_payload_slice(
+        &mut self,
+        root_pgno: Pgno,
+        rowid: i64,
+        payload_offset: usize,
+        data: &[u8],
+    ) -> Result<()> {
+        let Some((leaf_pgno, local_start, local_len, total_payload_len, overflow_page)) =
+            self.locate_table_leaf_cell_layout(root_pgno, rowid)?
+        else {
+            return Err(SqliteError::new(
+                ErrorCode::Abort,
+                "blob handle has expired",
+            ));
+        };
+        let total_len = total_payload_len as usize;
+        if payload_offset
+            .checked_add(data.len())
+            .is_none_or(|end| end > total_len)
+        {
+            return Err(SqliteError::corrupt(
+                "blob write slice exceeds record payload bounds",
+            ));
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let mut remaining_in = data;
+        let mut cur_off = payload_offset;
+
+        if cur_off < local_len {
+            let take = (local_len - cur_off).min(remaining_in.len());
+            let page_slice = self.pager.write_page(leaf_pgno)?;
+            let dst_start = local_start + cur_off;
+            page_slice[dst_start..dst_start + take].copy_from_slice(&remaining_in[..take]);
+            remaining_in = &remaining_in[take..];
+            cur_off += take;
+        }
+
+        if !remaining_in.is_empty() {
+            let usable = self.pager.usable_size() as usize;
+            let chunk_cap = usable - 4;
+            let mut ovfl_stream_off = local_len;
+            let mut cur_ovfl = overflow_page;
+            let mut hops = 0u32;
+            let max_pages = self.pager.page_count().max(1);
+
+            while !remaining_in.is_empty() {
+                let pgno = cur_ovfl.ok_or_else(|| {
+                    SqliteError::corrupt("truncated overflow chain in write_table_payload_slice")
+                })?;
+                hops += 1;
+                if hops > max_pages {
+                    return Err(SqliteError::corrupt("overflow chain cycle"));
+                }
+                let next_ovfl = {
+                    let raw = self.pager.read_page(pgno)?;
+                    u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]])
+                };
+                let page_payload_len = total_len.saturating_sub(ovfl_stream_off).min(chunk_cap);
+                if cur_off < ovfl_stream_off + page_payload_len {
+                    let in_page_off = cur_off - ovfl_stream_off;
+                    let take = (page_payload_len - in_page_off).min(remaining_in.len());
+                    let page_slice = self.pager.write_page(pgno)?;
+                    let dst_start = 4 + in_page_off;
+                    page_slice[dst_start..dst_start + take].copy_from_slice(&remaining_in[..take]);
+                    remaining_in = &remaining_in[take..];
+                    cur_off += take;
+                }
+                ovfl_stream_off += page_payload_len;
+                cur_ovfl = if next_ovfl == 0 {
+                    None
+                } else {
+                    Some(next_ovfl)
+                };
+            }
+        }
+
+        Ok(())
     }
 
     /// Returns the maximum existing `rowid` in a Table B+Tree (`None` if empty) in O(log N) page reads.

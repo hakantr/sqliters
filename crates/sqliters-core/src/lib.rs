@@ -2,6 +2,8 @@
 //! and public `Connection` / `Statement` / `Row` API (`main.c`, `legacy.c`, `vdbeapi.c`).
 #![forbid(unsafe_code)]
 
+pub mod backup;
+pub mod blob;
 pub mod compiler;
 pub mod db_set;
 pub mod driver;
@@ -10,6 +12,9 @@ pub mod execution_context;
 pub mod schema;
 pub mod trigger;
 pub mod window;
+
+pub use backup::{Backup, BackupStepResult};
+pub use blob::Blob;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -118,6 +123,8 @@ const _: () = {
     assert_send::<Connection>();
     assert_sync::<Connection>();
     assert_send::<Statement>();
+    assert_send::<Backup>();
+    assert_send::<Blob>();
     assert_send::<InterruptHandle>();
     assert_sync::<InterruptHandle>();
     assert_send::<TestBlobHandle>();
@@ -304,20 +311,22 @@ impl InterruptHandle {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct HandleId(u64);
+pub(crate) struct HandleId(pub(crate) u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HandleKind {
+pub(crate) enum HandleKind {
     Statement,
+    Blob { writable: bool },
+    BackupDestination,
     TestBlob { writable: bool },
 }
 
 #[derive(Debug, Clone, Default)]
-struct ActiveLease {
-    is_reader: bool,
-    is_writer: bool,
-    read_instances: Vec<SchemaInstanceId>,
-    write_instances: Vec<SchemaInstanceId>,
+pub(crate) struct ActiveLease {
+    pub(crate) is_reader: bool,
+    pub(crate) is_writer: bool,
+    pub(crate) read_instances: Vec<SchemaInstanceId>,
+    pub(crate) write_instances: Vec<SchemaInstanceId>,
 }
 
 fn push_unique_instance(dst: &mut Vec<SchemaInstanceId>, id: SchemaInstanceId) {
@@ -347,12 +356,12 @@ fn mask_to_instances(db_set: &DatabaseSet, mask: u16) -> Vec<SchemaInstanceId> {
 }
 
 #[derive(Debug, Default)]
-struct ActivityTracker {
-    leases: BTreeMap<HandleId, ActiveLease>,
+pub(crate) struct ActivityTracker {
+    pub(crate) leases: BTreeMap<HandleId, ActiveLease>,
 }
 
 impl ActivityTracker {
-    fn start(&mut self, id: HandleId, is_reader: bool, is_writer: bool) {
+    pub(crate) fn start(&mut self, id: HandleId, is_reader: bool, is_writer: bool) {
         self.leases.insert(
             id,
             ActiveLease {
@@ -364,7 +373,7 @@ impl ActivityTracker {
         );
     }
 
-    fn start_with_instances(
+    pub(crate) fn start_with_instances(
         &mut self,
         id: HandleId,
         is_reader: bool,
@@ -385,7 +394,7 @@ impl ActivityTracker {
         );
     }
 
-    fn update_instances(
+    pub(crate) fn update_instances(
         &mut self,
         id: HandleId,
         read_instances: &[SchemaInstanceId],
@@ -403,11 +412,15 @@ impl ActivityTracker {
         }
     }
 
-    fn remove(&mut self, id: HandleId) -> Option<ActiveLease> {
+    pub(crate) fn remove(&mut self, id: HandleId) -> Option<ActiveLease> {
         self.leases.remove(&id)
     }
 
-    fn summary_excluding(&self, exclude: HandleId, db_set: &DatabaseSet) -> ActivitySummary {
+    pub(crate) fn summary_excluding(
+        &self,
+        exclude: HandleId,
+        db_set: &DatabaseSet,
+    ) -> ActivitySummary {
         let mut other_active = 0usize;
         let mut other_readers = 0usize;
         let mut other_writers = 0usize;
@@ -446,19 +459,25 @@ impl ActivityTracker {
         }
     }
 
-    fn has_no_active_tx(&self) -> bool {
+    pub(crate) fn has_no_active_tx(&self) -> bool {
         !self.leases.values().any(|l| l.is_reader || l.is_writer)
     }
 
-    fn has_active_tx_on_instance(&self, inst: SchemaInstanceId) -> bool {
+    pub(crate) fn has_active_tx_on_instance(&self, inst: SchemaInstanceId) -> bool {
         self.leases
             .values()
             .any(|l| l.read_instances.contains(&inst) || l.write_instances.contains(&inst))
     }
+
+    pub(crate) fn has_active_writer_on_instance(&self, inst: SchemaInstanceId) -> bool {
+        self.leases
+            .values()
+            .any(|l| l.write_instances.contains(&inst))
+    }
 }
 
 #[derive(Debug, Clone)]
-enum ConnectionState {
+pub(crate) enum ConnectionState {
     Open,
     Closing,
     Poisoned(SqliteError),
@@ -466,21 +485,21 @@ enum ConnectionState {
 }
 
 #[derive(Clone)]
-struct WriteAbortSnapshot {
-    stmt_sp_slot: Option<usize>,
-    touched_write_instances: Vec<SchemaInstanceId>,
-    started_read_instances: Vec<SchemaInstanceId>,
-    fk_before: Vec<(SchemaInstanceId, String, schema::TableRowKey, usize)>,
-    rt_before: VmRuntimeContext,
-    is_dml: bool,
-    mutation_len_before: usize,
-    schemas_before: Vec<(SchemaInstanceId, Schema)>,
-    schema_gen_before: u64,
-    v1_expire_gen_before: u64,
-    schema_changed_before: bool,
+pub(crate) struct WriteAbortSnapshot {
+    pub(crate) stmt_sp_slot: Option<usize>,
+    pub(crate) touched_write_instances: Vec<SchemaInstanceId>,
+    pub(crate) started_read_instances: Vec<SchemaInstanceId>,
+    pub(crate) fk_before: Vec<(SchemaInstanceId, String, schema::TableRowKey, usize)>,
+    pub(crate) rt_before: VmRuntimeContext,
+    pub(crate) is_dml: bool,
+    pub(crate) mutation_len_before: usize,
+    pub(crate) schemas_before: Vec<(SchemaInstanceId, Schema)>,
+    pub(crate) schema_gen_before: u64,
+    pub(crate) v1_expire_gen_before: u64,
+    pub(crate) schema_changed_before: bool,
 }
 
-enum RunningExec {
+pub(crate) enum RunningExec {
     Vdbe {
         vm: VdbeVm,
         read_instances: Vec<SchemaInstanceId>,
@@ -514,10 +533,25 @@ enum StatementLifecycle {
     Halted { last_error: Option<SqliteError> },
 }
 
-enum PendingDrop {
+pub(crate) enum PendingDrop {
     Statement {
         handle_id: HandleId,
         running: Option<Box<RunningExec>>,
+    },
+    Blob {
+        handle_id: HandleId,
+        schema_instance_id: SchemaInstanceId,
+        writable: bool,
+    },
+    BackupDestination {
+        handle_id: HandleId,
+        dst_instance_id: SchemaInstanceId,
+        in_write_tx: bool,
+        active_lease: bool,
+    },
+    BackupSource {
+        src_instance_id: SchemaInstanceId,
+        tracker: Arc<Mutex<sqliters_btree::BackupTracker>>,
     },
     TestBlob {
         handle_id: HandleId,
@@ -526,7 +560,7 @@ enum PendingDrop {
     },
 }
 
-enum ActivityFinish {
+pub(crate) enum ActivityFinish {
     NoLock,
     ReadDone {
         lease_cursors: Vec<(SchemaInstanceId, CursorId)>,
@@ -542,66 +576,66 @@ enum ActivityFinish {
     PendingCommitAborted,
 }
 
-struct ConnectionInner {
-    db_set: DatabaseSet,
-    connection_encoding: TextEncoding,
-    state: ConnectionState,
-    next_handle_id: u64,
-    open_handles: BTreeMap<HandleId, HandleKind>,
-    activity: ActivityTracker,
-    savepoints: Vec<SqlSavepoint>,
-    runtime: VmRuntimeContext,
-    active_interrupt_flag: Arc<AtomicBool>,
-    functions: FunctionRegistry,
-    collations: CollationRegistry,
-    progress: ProgressTracker,
-    commit_hooks: CommitCoordinatorHooks,
-    mutation_pipeline: MutationPipeline,
-    authorizer: AuthorizerSlot,
-    trace_hook: Option<TraceHookCallback>,
-    strict_subtype: bool,
-    explicit_tx: bool,
-    implicit_savepoint_tx: bool,
-    in_user_btree_tx: bool,
-    schema_changed_in_tx: bool,
-    foreign_keys: bool,
-    recursive_triggers: bool,
-    legacy_alter_table: bool,
-    count_changes: bool,
-    wal_autocheckpoint_threshold: i32,
-    default_locking_mode: LockingMode,
-    writable_schema: bool,
-    working_dir: Option<PathBuf>,
-    busy_policy: BusyPolicy,
-    rollback_count: u64,
-    deferred_fk_suspects: Vec<(SchemaInstanceId, String, schema::TableRowKey, usize)>,
-    schema_generation: u64,
-    v1_expire_generation: u64,
-    advisory_expire_generation: u64,
-    simulated_cleanup_io_error: Option<SqliteError>,
-    panic_on_next_pending_drop: bool,
+pub(crate) struct ConnectionInner {
+    pub(crate) db_set: DatabaseSet,
+    pub(crate) connection_encoding: TextEncoding,
+    pub(crate) state: ConnectionState,
+    pub(crate) next_handle_id: u64,
+    pub(crate) open_handles: BTreeMap<HandleId, HandleKind>,
+    pub(crate) activity: ActivityTracker,
+    pub(crate) savepoints: Vec<SqlSavepoint>,
+    pub(crate) runtime: VmRuntimeContext,
+    pub(crate) active_interrupt_flag: Arc<AtomicBool>,
+    pub(crate) functions: FunctionRegistry,
+    pub(crate) collations: CollationRegistry,
+    pub(crate) progress: ProgressTracker,
+    pub(crate) commit_hooks: CommitCoordinatorHooks,
+    pub(crate) mutation_pipeline: MutationPipeline,
+    pub(crate) authorizer: AuthorizerSlot,
+    pub(crate) trace_hook: Option<TraceHookCallback>,
+    pub(crate) strict_subtype: bool,
+    pub(crate) explicit_tx: bool,
+    pub(crate) implicit_savepoint_tx: bool,
+    pub(crate) in_user_btree_tx: bool,
+    pub(crate) schema_changed_in_tx: bool,
+    pub(crate) foreign_keys: bool,
+    pub(crate) recursive_triggers: bool,
+    pub(crate) legacy_alter_table: bool,
+    pub(crate) count_changes: bool,
+    pub(crate) wal_autocheckpoint_threshold: i32,
+    pub(crate) default_locking_mode: LockingMode,
+    pub(crate) writable_schema: bool,
+    pub(crate) working_dir: Option<PathBuf>,
+    pub(crate) busy_policy: BusyPolicy,
+    pub(crate) rollback_count: u64,
+    pub(crate) deferred_fk_suspects: Vec<(SchemaInstanceId, String, schema::TableRowKey, usize)>,
+    pub(crate) schema_generation: u64,
+    pub(crate) v1_expire_generation: u64,
+    pub(crate) advisory_expire_generation: u64,
+    pub(crate) simulated_cleanup_io_error: Option<SqliteError>,
+    pub(crate) panic_on_next_pending_drop: bool,
 }
 
-struct ConnectionShared {
-    conn_id: u64,
-    db_path: Option<PathBuf>,
-    database_kind: DatabaseKind,
-    is_readonly: bool,
-    open_options: ConnectionOpenOptions,
-    interrupt_flag: Arc<AtomicBool>,
-    gate_busy: AtomicBool,
-    mirror_last_insert_rowid: AtomicI64,
-    mirror_changes: AtomicU64,
-    mirror_total_changes: AtomicU64,
-    mirror_autocommit: AtomicBool,
-    mirror_rollback_count: AtomicU64,
-    mirror_attached_limit: AtomicUsize,
-    pending_drops: Mutex<Vec<PendingDrop>>,
-    inner: Mutex<ConnectionInner>,
+pub(crate) struct ConnectionShared {
+    pub(crate) conn_id: u64,
+    pub(crate) db_path: Option<PathBuf>,
+    pub(crate) database_kind: DatabaseKind,
+    pub(crate) is_readonly: bool,
+    pub(crate) open_options: ConnectionOpenOptions,
+    pub(crate) interrupt_flag: Arc<AtomicBool>,
+    pub(crate) gate_busy: AtomicBool,
+    pub(crate) mirror_last_insert_rowid: AtomicI64,
+    pub(crate) mirror_changes: AtomicU64,
+    pub(crate) mirror_total_changes: AtomicU64,
+    pub(crate) mirror_autocommit: AtomicBool,
+    pub(crate) mirror_rollback_count: AtomicU64,
+    pub(crate) mirror_attached_limit: AtomicUsize,
+    pub(crate) pending_drops: Mutex<Vec<PendingDrop>>,
+    pub(crate) inner: Mutex<ConnectionInner>,
 }
 
 impl ConnectionShared {
-    fn publish_mirrors(
+    pub(crate) fn publish_mirrors(
         &self,
         rt: &VmRuntimeContext,
         explicit_tx: bool,
@@ -620,17 +654,17 @@ impl ConnectionShared {
             .store(rollback_count, Ordering::Release);
     }
 
-    fn lock_pending_drops(&self) -> MutexGuard<'_, Vec<PendingDrop>> {
+    pub(crate) fn lock_pending_drops(&self) -> MutexGuard<'_, Vec<PendingDrop>> {
         self.pending_drops
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn lock_inner(&self) -> MutexGuard<'_, ConnectionInner> {
+    pub(crate) fn lock_inner(&self) -> MutexGuard<'_, ConnectionInner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn enter(&self) -> Result<ConnSession<'_>> {
+    pub(crate) fn enter(&self) -> Result<ConnSession<'_>> {
         if is_conn_active_on_current_thread(self.conn_id) {
             return Err(SqliteError::misuse(
                 "reentrant call into active Connection on the same thread",
@@ -672,7 +706,102 @@ impl ConnectionShared {
         Ok(session)
     }
 
-    fn enqueue_or_run_drop(&self, item: PendingDrop) {
+    pub(crate) fn enter_dual<'a>(src: &'a Self, dst: &'a Self) -> Result<DualConnSession<'a>> {
+        if src.conn_id == dst.conn_id {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                "source and destination must be distinct",
+            ));
+        }
+        if is_conn_active_on_current_thread(src.conn_id)
+            || is_conn_active_on_current_thread(dst.conn_id)
+        {
+            return Err(SqliteError::misuse(
+                "reentrant call into active Connection on the same thread",
+            ));
+        }
+
+        let (first, second, src_is_first) = if src.conn_id < dst.conn_id {
+            (src, dst, true)
+        } else {
+            (dst, src, false)
+        };
+
+        if first
+            .gate_busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(SqliteError::new(
+                ErrorCode::Busy,
+                "database connection is busy",
+            ));
+        }
+        let mut first_unwind = GateReleaseOnUnwind {
+            shared: first,
+            armed: true,
+        };
+
+        if second
+            .gate_busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(SqliteError::new(
+                ErrorCode::Busy,
+                "database connection is busy",
+            ));
+        }
+        let mut second_unwind = GateReleaseOnUnwind {
+            shared: second,
+            armed: true,
+        };
+
+        let first_stack = ActiveConnStackGuard::push(first.conn_id);
+        let second_stack = ActiveConnStackGuard::push(second.conn_id);
+        let first_guard = first.lock_inner();
+        let second_guard = second.lock_inner();
+        first_unwind.armed = false;
+        second_unwind.armed = false;
+
+        let mut session = DualConnSession {
+            first,
+            second,
+            first_guard: Some(first_guard),
+            second_guard: Some(second_guard),
+            src_is_first,
+            _second_stack: second_stack,
+            _first_stack: first_stack,
+        };
+
+        let first_drops = {
+            let mut pq = first.lock_pending_drops();
+            std::mem::take(&mut *pq)
+        };
+        if !first_drops.is_empty() {
+            session
+                .first_guard
+                .as_mut()
+                .unwrap()
+                .process_pending_drops(first_drops, first);
+        }
+
+        let second_drops = {
+            let mut pq = second.lock_pending_drops();
+            std::mem::take(&mut *pq)
+        };
+        if !second_drops.is_empty() {
+            session
+                .second_guard
+                .as_mut()
+                .unwrap()
+                .process_pending_drops(second_drops, second);
+        }
+
+        Ok(session)
+    }
+
+    pub(crate) fn enqueue_or_run_drop(&self, item: PendingDrop) {
         let claimed = {
             let mut pq = self.lock_pending_drops();
             pq.push(item);
@@ -758,6 +887,42 @@ impl Drop for ConnectionShared {
                     inner.activity.remove(handle_id);
                     inner.open_handles.remove(&handle_id);
                 }
+                PendingDrop::Blob { handle_id, .. } => {
+                    inner.db_set.open_blobs_mut().remove(&handle_id.0);
+                    inner.activity.remove(handle_id);
+                    inner.open_handles.remove(&handle_id);
+                }
+                PendingDrop::BackupDestination {
+                    handle_id,
+                    dst_instance_id,
+                    in_write_tx,
+                    ..
+                } => {
+                    if let Some(slot) = inner.db_set.slot_by_instance_mut(dst_instance_id) {
+                        slot.active_backups = slot.active_backups.saturating_sub(1);
+                        if in_write_tx && let Some(ref mut bt) = slot.btree {
+                            bt.pager_mut().backup_reset_raw_staging();
+                            if bt.transaction_state() == TransactionState::Write {
+                                let _ = bt.rollback_with_trip(
+                                    extended::SQLITE_ABORT_ROLLBACK,
+                                    false,
+                                    false,
+                                );
+                            }
+                        }
+                    }
+                    inner.activity.remove(handle_id);
+                    inner.open_handles.remove(&handle_id);
+                }
+                PendingDrop::BackupSource {
+                    src_instance_id,
+                    tracker,
+                } => {
+                    if let Some(slot) = inner.db_set.slot_by_instance_mut(src_instance_id) {
+                        slot.active_backups = slot.active_backups.saturating_sub(1);
+                        slot.detach_backup_tracker(&tracker);
+                    }
+                }
                 PendingDrop::TestBlob {
                     handle_id,
                     lease_cursor,
@@ -790,22 +955,22 @@ impl Drop for ConnectionShared {
     }
 }
 
-struct ConnSession<'a> {
-    shared: &'a ConnectionShared,
+pub(crate) struct ConnSession<'a> {
+    pub(crate) shared: &'a ConnectionShared,
     guard: Option<MutexGuard<'a, ConnectionInner>>,
     _stack_guard: ActiveConnStackGuard,
 }
 
 impl ConnSession<'_> {
     #[inline]
-    fn inner_mut(&mut self) -> &mut ConnectionInner {
+    pub(crate) fn inner_mut(&mut self) -> &mut ConnectionInner {
         self.guard
             .as_mut()
             .expect("ConnSession inner guard is live")
     }
 
     #[inline]
-    fn inner(&self) -> &ConnectionInner {
+    pub(crate) fn inner(&self) -> &ConnectionInner {
         self.guard
             .as_ref()
             .expect("ConnSession inner guard is live")
@@ -819,8 +984,42 @@ impl Drop for ConnSession<'_> {
     }
 }
 
+pub(crate) struct DualConnSession<'a> {
+    first: &'a ConnectionShared,
+    second: &'a ConnectionShared,
+    first_guard: Option<MutexGuard<'a, ConnectionInner>>,
+    second_guard: Option<MutexGuard<'a, ConnectionInner>>,
+    src_is_first: bool,
+    _second_stack: ActiveConnStackGuard,
+    _first_stack: ActiveConnStackGuard,
+}
+
+impl DualConnSession<'_> {
+    #[inline]
+    pub(crate) fn src_and_dst_mut(&mut self) -> (&mut ConnectionInner, &mut ConnectionInner) {
+        let f = self
+            .first_guard
+            .as_mut()
+            .expect("DualConnSession first guard is live");
+        let s = self
+            .second_guard
+            .as_mut()
+            .expect("DualConnSession second guard is live");
+        if self.src_is_first { (f, s) } else { (s, f) }
+    }
+}
+
+impl Drop for DualConnSession<'_> {
+    fn drop(&mut self) {
+        drop(self.second_guard.take());
+        drop(self.first_guard.take());
+        self.second.drain_and_release_gate();
+        self.first.drain_and_release_gate();
+    }
+}
+
 impl ConnectionInner {
-    fn ensure_usable(&self) -> Result<()> {
+    pub(crate) fn ensure_usable(&self) -> Result<()> {
         match &self.state {
             ConnectionState::Open => Ok(()),
             ConnectionState::Closing | ConnectionState::Closed => {
@@ -831,7 +1030,7 @@ impl ConnectionInner {
     }
 
     #[inline]
-    fn effective_encoding(&self) -> TextEncoding {
+    pub(crate) fn effective_encoding(&self) -> TextEncoding {
         if self.db_set.main_btree().pager().page_count() > 0 {
             self.db_set.main_btree().encoding()
         } else {
@@ -840,14 +1039,14 @@ impl ConnectionInner {
     }
 
     #[inline]
-    fn check_any_interrupted(&self) -> Result<()> {
+    pub(crate) fn check_any_interrupted(&self) -> Result<()> {
         if self.active_interrupt_flag.load(Ordering::SeqCst) {
             return Err(SqliteError::new(ErrorCode::Interrupt, "interrupted"));
         }
         self.db_set.main_btree().check_interrupted()
     }
 
-    fn publish(&self, shared: &ConnectionShared) {
+    pub(crate) fn publish(&self, shared: &ConnectionShared) {
         shared.publish_mirrors(
             &self.runtime,
             self.explicit_tx,
@@ -856,35 +1055,98 @@ impl ConnectionInner {
         );
     }
 
-    fn is_autocommit(&self) -> bool {
+    pub(crate) fn is_autocommit(&self) -> bool {
         !self.explicit_tx && !self.implicit_savepoint_tx
     }
 
-    fn register_handle(&mut self, kind: HandleKind) -> HandleId {
+    pub(crate) fn register_handle(&mut self, kind: HandleKind) -> HandleId {
         let id = HandleId(self.next_handle_id);
         self.next_handle_id += 1;
         self.open_handles.insert(id, kind);
         id
     }
 
-    fn take_simulated_cleanup_error(&mut self) -> Option<SqliteError> {
+    pub(crate) fn take_simulated_cleanup_error(&mut self) -> Option<SqliteError> {
         self.simulated_cleanup_io_error.take()
     }
 
-    fn poison_with(&mut self, err: SqliteError) -> SqliteError {
+    pub(crate) fn poison_with(&mut self, err: SqliteError) -> SqliteError {
         if !matches!(self.state, ConnectionState::Poisoned(_)) {
             self.state = ConnectionState::Poisoned(err.clone());
         }
         err
     }
 
-    fn snapshot_open_schemas(&self) -> Vec<(SchemaInstanceId, Schema)> {
+    pub(crate) fn snapshot_open_schemas(&self) -> Vec<(SchemaInstanceId, Schema)> {
         self.db_set
             .slots()
             .iter()
             .filter(|s| s.btree.is_some())
             .map(|s| (s.schema_instance_id, s.schema.clone()))
             .collect()
+    }
+
+    pub(crate) fn ensure_schemas_loaded_for_blob(
+        &mut self,
+        force_recheck_open: bool,
+    ) -> Result<bool> {
+        self.ensure_schemas_loaded_for_prepare(force_recheck_open)
+    }
+
+    pub(crate) fn finish_blob_activity(
+        &mut self,
+        hid: HandleId,
+        inst: SchemaInstanceId,
+        writable: bool,
+        shared: &ConnectionShared,
+    ) -> Result<()> {
+        self.db_set.open_blobs_mut().remove(&hid.0);
+        if !self.activity.leases.contains_key(&hid) {
+            return Ok(());
+        }
+        if writable {
+            let snap = WriteAbortSnapshot {
+                stmt_sp_slot: None,
+                touched_write_instances: vec![inst],
+                started_read_instances: Vec::new(),
+                fk_before: self.deferred_fk_suspects.clone(),
+                rt_before: self.runtime,
+                is_dml: false,
+                mutation_len_before: self.mutation_pipeline.len(),
+                schemas_before: self.snapshot_open_schemas(),
+                schema_gen_before: self.schema_generation,
+                v1_expire_gen_before: self.v1_expire_generation,
+                schema_changed_before: self.schema_changed_in_tx,
+            };
+            self.finish_activity(
+                hid,
+                ActivityFinish::WriteCompleted {
+                    abort_snapshot: snap,
+                },
+                shared,
+            )
+        } else {
+            self.finish_activity(
+                hid,
+                ActivityFinish::ReadDone {
+                    lease_cursors: Vec::new(),
+                    read_instances: vec![inst],
+                },
+                shared,
+            )
+        }
+    }
+
+    pub(crate) fn close_blob_handle(
+        &mut self,
+        hid: HandleId,
+        inst: SchemaInstanceId,
+        writable: bool,
+        shared: &ConnectionShared,
+    ) -> Result<()> {
+        let res = self.finish_blob_activity(hid, inst, writable, shared);
+        self.open_handles.remove(&hid);
+        res
     }
 
     fn snapshot_slot_cookies(&self) -> Vec<(SchemaInstanceId, u32, bool)> {
@@ -1722,6 +1984,46 @@ impl ConnectionInner {
                         let _ = self.finish_running_exec(handle_id, *run, shared);
                     }
                     self.open_handles.remove(&handle_id);
+                }
+                PendingDrop::Blob {
+                    handle_id,
+                    schema_instance_id,
+                    writable,
+                } => {
+                    let _ = self.close_blob_handle(handle_id, schema_instance_id, writable, shared);
+                }
+                PendingDrop::BackupDestination {
+                    handle_id,
+                    dst_instance_id,
+                    in_write_tx,
+                    active_lease,
+                } => {
+                    if let Some(slot) = self.db_set.slot_by_instance_mut(dst_instance_id) {
+                        slot.active_backups = slot.active_backups.saturating_sub(1);
+                        if in_write_tx && let Some(ref mut bt) = slot.btree {
+                            bt.pager_mut().backup_reset_raw_staging();
+                            if bt.transaction_state() == TransactionState::Write {
+                                let _ = bt.rollback_with_trip(
+                                    extended::SQLITE_ABORT_ROLLBACK,
+                                    false,
+                                    false,
+                                );
+                            }
+                        }
+                    }
+                    if active_lease {
+                        self.activity.remove(handle_id);
+                    }
+                    self.open_handles.remove(&handle_id);
+                }
+                PendingDrop::BackupSource {
+                    src_instance_id,
+                    tracker,
+                } => {
+                    if let Some(slot) = self.db_set.slot_by_instance_mut(src_instance_id) {
+                        slot.active_backups = slot.active_backups.saturating_sub(1);
+                        slot.detach_backup_tracker(&tracker);
+                    }
                 }
                 PendingDrop::TestBlob {
                     handle_id,
@@ -3293,6 +3595,30 @@ impl Connection {
         handler: Option<Box<dyn FnMut(u32) -> bool + Send>>,
     ) -> Result<()> {
         self.busy_handler(handler)
+    }
+
+    /// Initializes an online backup copying pages from `(self, src_db)` into `(dst, dst_db)`
+    /// (`sqlite3_backup_init(pDest, zDestName, pSource, zSourceName)` in `sqlite/src/backup.c`).
+    pub fn backup_init(&self, src_db: &str, dst: &Connection, dst_db: &str) -> Result<Backup> {
+        Backup::init(self, src_db, dst, dst_db)
+    }
+
+    /// Opens an incremental BLOB handle on `(db_name, table_name, column_name, rowid)`
+    /// (`sqlite3_blob_open` in `sqlite/src/vdbeblob.c`).
+    pub fn blob_open(
+        &self,
+        db_name: &str,
+        table_name: &str,
+        column_name: &str,
+        rowid: i64,
+        read_write: bool,
+    ) -> Result<Blob> {
+        Blob::open(self, db_name, table_name, column_name, rowid, read_write)
+    }
+
+    #[inline]
+    pub(crate) fn shared(&self) -> &Arc<ConnectionShared> {
+        &self.shared
     }
 
     /// Queries or updates `SQLITE_FCNTL_PERSIST_WAL` on `db_name` (`None`, `Some("")`, or

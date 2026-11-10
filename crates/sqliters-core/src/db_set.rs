@@ -117,6 +117,10 @@ pub struct DbSlot {
     pub max_page_count: u32,
     /// Whether URI `8_3_names=1` short super-journal/sidecar naming is enabled on this slot.
     pub enable_8_3_names: bool,
+    /// Number of active [`crate::backup::Backup`] handles using this slot as source or destination.
+    pub active_backups: usize,
+    /// Leaf dirty-page/restart trackers registered by active [`crate::backup::Backup`] handles reading this slot.
+    pub backup_trackers: Vec<Arc<std::sync::Mutex<sqliters_btree::BackupTracker>>>,
 }
 
 impl DbSlot {
@@ -130,6 +134,57 @@ impl DbSlot {
         self.schema = Schema::load_for_schema(bt, Some(&self.name))?;
         Ok(())
     }
+
+    /// Attaches a leaf backup tracker to this slot and its underlying pager (if open).
+    pub fn attach_backup_tracker(
+        &mut self,
+        tracker: Arc<std::sync::Mutex<sqliters_btree::BackupTracker>>,
+    ) {
+        if !self
+            .backup_trackers
+            .iter()
+            .any(|existing| Arc::ptr_eq(existing, &tracker))
+        {
+            self.backup_trackers.push(Arc::clone(&tracker));
+        }
+        if let Some(ref mut bt) = self.btree {
+            bt.pager_mut().attach_backup_tracker(tracker);
+        }
+    }
+
+    /// Detaches a leaf backup tracker from this slot and its underlying pager (if open).
+    pub fn detach_backup_tracker(
+        &mut self,
+        tracker: &Arc<std::sync::Mutex<sqliters_btree::BackupTracker>>,
+    ) {
+        self.backup_trackers
+            .retain(|existing| !Arc::ptr_eq(existing, tracker));
+        if let Some(ref mut bt) = self.btree {
+            bt.pager_mut().detach_backup_tracker(tracker);
+        }
+    }
+}
+
+/// Per-handle live metadata for an open [`crate::blob::Blob`] registered in [`DatabaseSet`].
+#[derive(Debug, Clone)]
+pub struct OpenBlobState {
+    pub handle_id: u64,
+    pub schema_instance_id: SchemaInstanceId,
+    pub db_name: String,
+    pub table_name: String,
+    pub column_name: String,
+    pub col_idx: usize,
+    pub root_pgno: sqliters_types::Pgno,
+    pub rowid: i64,
+    pub byte_len: usize,
+    pub read_write: bool,
+    /// Whether this handle started the B-tree read/write transaction on `db_slot` when opened.
+    pub started_slot_tx: bool,
+    /// Set to `true` when the target row is modified/deleted or when the table/schema is invalidated.
+    pub expired: bool,
+    /// Set to `true` when the table or schema itself was dropped/altered/rolled-back/detached,
+    /// preventing even [`crate::blob::Blob::reopen`] from succeeding.
+    pub table_invalidated: bool,
 }
 
 impl std::fmt::Debug for DbSlot {
@@ -165,6 +220,7 @@ pub struct DatabaseSet {
     interrupt_flag: Arc<AtomicBool>,
     temp_trigger_bindings: Vec<TempTriggerBinding>,
     xferopt_delta: std::sync::atomic::AtomicU64,
+    open_blobs: std::collections::HashMap<u64, OpenBlobState>,
 }
 
 impl std::fmt::Debug for DatabaseSet {
@@ -200,6 +256,8 @@ impl DatabaseSet {
                 next_auto_vacuum: None,
                 max_page_count: SQLITE_MAX_PAGE_COUNT,
                 enable_8_3_names: main_enable_8_3_names,
+                active_backups: 0,
+                backup_trackers: Vec::new(),
             },
             DbSlot {
                 name: "temp".to_owned(),
@@ -210,6 +268,8 @@ impl DatabaseSet {
                 next_auto_vacuum: None,
                 max_page_count: SQLITE_MAX_PAGE_COUNT,
                 enable_8_3_names: false,
+                active_backups: 0,
+                backup_trackers: Vec::new(),
             },
         ];
         Self {
@@ -229,6 +289,111 @@ impl DatabaseSet {
             interrupt_flag,
             temp_trigger_bindings: Vec::new(),
             xferopt_delta: std::sync::atomic::AtomicU64::new(0),
+            open_blobs: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Returns immutable map of active [`OpenBlobState`] entries keyed by handle ID.
+    #[inline]
+    pub fn open_blobs(&self) -> &std::collections::HashMap<u64, OpenBlobState> {
+        &self.open_blobs
+    }
+
+    /// Returns mutable map of active [`OpenBlobState`] entries keyed by handle ID.
+    #[inline]
+    pub fn open_blobs_mut(&mut self) -> &mut std::collections::HashMap<u64, OpenBlobState> {
+        &mut self.open_blobs
+    }
+
+    /// Marks open BLOB handles pointing at `(schema_instance_id, table_name, rowid)` as expired
+    /// (`SQLITE_ABORT` on read/write, though `reopen` to another rowid remains allowed).
+    pub fn expire_blobs_for_row(
+        &mut self,
+        schema_instance_id: SchemaInstanceId,
+        table_name: &str,
+        rowid: i64,
+    ) {
+        for state in self.open_blobs.values_mut() {
+            if state.schema_instance_id == schema_instance_id
+                && state.rowid == rowid
+                && state.table_name.eq_ignore_ascii_case(table_name)
+            {
+                state.expired = true;
+            }
+        }
+    }
+
+    /// Marks all open BLOB handles pointing at `(schema_instance_id, table_name)` as row-expired
+    /// (e.g. `DELETE FROM tbl` fast-path table clear), while still allowing `reopen` if a new row is inserted.
+    pub fn expire_blobs_for_table_clear(
+        &mut self,
+        schema_instance_id: SchemaInstanceId,
+        table_name: &str,
+    ) {
+        for state in self.open_blobs.values_mut() {
+            if state.schema_instance_id == schema_instance_id
+                && state.table_name.eq_ignore_ascii_case(table_name)
+            {
+                state.expired = true;
+            }
+        }
+    }
+
+    /// Invalidates all open BLOB handles pointing at `(schema_instance_id, table_name)` due to
+    /// `DROP TABLE` or `ALTER TABLE` (both read/write and `reopen` return `SQLITE_ABORT`).
+    pub fn invalidate_blobs_for_table(
+        &mut self,
+        schema_instance_id: SchemaInstanceId,
+        table_name: &str,
+    ) {
+        for state in self.open_blobs.values_mut() {
+            if state.schema_instance_id == schema_instance_id
+                && state.table_name.eq_ignore_ascii_case(table_name)
+            {
+                state.expired = true;
+                state.table_invalidated = true;
+            }
+        }
+    }
+
+    /// Invalidates all open BLOB handles pointing at `schema_instance_id` (e.g. `DETACH`, `VACUUM`).
+    pub fn invalidate_blobs_for_instance(&mut self, schema_instance_id: SchemaInstanceId) {
+        for state in self.open_blobs.values_mut() {
+            if state.schema_instance_id == schema_instance_id {
+                state.expired = true;
+                state.table_invalidated = true;
+            }
+        }
+    }
+
+    /// Invalidates all open BLOB handles on the connection (e.g. `ROLLBACK` or schema-changing `ROLLBACK TO`).
+    pub fn invalidate_all_blobs(&mut self) {
+        for state in self.open_blobs.values_mut() {
+            state.expired = true;
+            state.table_invalidated = true;
+        }
+    }
+
+    /// Marks all open writable BLOB handles as row-expired (e.g. non-schema-changing `ROLLBACK TO`).
+    pub fn expire_writable_blobs(&mut self) {
+        for state in self.open_blobs.values_mut() {
+            if state.read_write {
+                state.expired = true;
+            }
+        }
+    }
+
+    /// Updates `root_pgno` on open BLOB handles when auto-vacuum moves a table's root page.
+    pub fn update_blob_root_page(
+        &mut self,
+        schema_instance_id: SchemaInstanceId,
+        old_root: sqliters_types::Pgno,
+        new_root: sqliters_types::Pgno,
+    ) {
+        for state in self.open_blobs.values_mut() {
+            if state.schema_instance_id == schema_instance_id && state.root_pgno == old_root {
+                state.root_pgno = new_root;
+            }
         }
     }
 
@@ -511,6 +676,9 @@ impl DatabaseSet {
             bt.set_writable_schema(writable_schema);
             let _ = bt.pager_mut().set_locking_mode(LockingMode::Exclusive);
             bt.pager_mut().set_encoding(encoding)?;
+            for tracker in &self.slots[1].backup_trackers {
+                bt.pager_mut().attach_backup_tracker(Arc::clone(tracker));
+            }
             self.slots[1].btree = Some(bt);
         }
         Ok(&mut self.slots[1])
@@ -533,6 +701,8 @@ impl DatabaseSet {
             self.slots[1].btree = None;
             self.slots[1].schema = Schema::default();
             self.temp_trigger_bindings.clear();
+            let temp_inst = self.slots[1].schema_instance_id;
+            self.invalidate_blobs_for_instance(temp_inst);
             self.temp_store = mode;
             return Ok(true);
         }
@@ -857,6 +1027,8 @@ impl DatabaseSet {
             next_auto_vacuum: None,
             max_page_count: SQLITE_MAX_PAGE_COUNT,
             enable_8_3_names,
+            active_backups: 0,
+            backup_trackers: Vec::new(),
         });
         Ok(db_id)
     }

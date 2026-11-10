@@ -51,15 +51,15 @@ pub use sqliters_vfs as vfs;
 #[doc(hidden)]
 pub use sqliters_core::TestBlobHandle;
 pub use sqliters_core::{
-    AuthorizerAction, AuthorizerCallback, AuthorizerResult, CloseError, CollationCallback,
-    CollationRegistry, ColumnSchema, CommitHookCallback, Connection, ConnectionOpenOptions,
-    ExecutionContext, FallibleCollationCallback, ForeignKeySchema, FunctionRegistry, IndexSchema,
-    InterruptHandle, MutationContext, MutationOrigin, MutationPipeline, MutationRow, PrepareMode,
-    ProgressCallback, ProgressTracker, QueryOutput, QueryResult, RollbackHookCallback, Row,
-    SQLITE_DEFAULT_WAL_AUTOCHECKPOINT, SQLITE_MAX_TRIGGER_DEPTH, SQLITE_MAX_TRIGGER_STEPS,
-    ScalarFunctionCallback, ScalarFunctionDef, Schema, Statement, StepResult, TableSchema,
-    TraceHookCallback, TriggerEventKind, TriggerSchema, UpdateHookCallback, UpdateHookEvent,
-    WindowAggregateInstance, WindowFunctionDef,
+    AuthorizerAction, AuthorizerCallback, AuthorizerResult, Backup, BackupStepResult, Blob,
+    CloseError, CollationCallback, CollationRegistry, ColumnSchema, CommitHookCallback, Connection,
+    ConnectionOpenOptions, ExecutionContext, FallibleCollationCallback, ForeignKeySchema,
+    FunctionRegistry, IndexSchema, InterruptHandle, MutationContext, MutationOrigin,
+    MutationPipeline, MutationRow, PrepareMode, ProgressCallback, ProgressTracker, QueryOutput,
+    QueryResult, RollbackHookCallback, Row, SQLITE_DEFAULT_WAL_AUTOCHECKPOINT,
+    SQLITE_MAX_TRIGGER_DEPTH, SQLITE_MAX_TRIGGER_STEPS, ScalarFunctionCallback, ScalarFunctionDef,
+    Schema, Statement, StepResult, TableSchema, TraceHookCallback, TriggerEventKind, TriggerSchema,
+    UpdateHookCallback, UpdateHookEvent, WindowAggregateInstance, WindowFunctionDef,
 };
 pub use sqliters_pager::{
     AutoVacuumMode, DatabaseHeader, JournalMode, LockingMode, WalCheckpointMode,
