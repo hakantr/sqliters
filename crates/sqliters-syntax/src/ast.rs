@@ -356,6 +356,7 @@ pub enum TriggerEvent {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum TriggerStep {
     Select(SelectStmt),
     Insert(InsertStmt),
@@ -530,8 +531,62 @@ pub enum SelectCore {
         selection: Option<Expr>,
         group_by: Vec<Expr>,
         having: Option<Expr>,
+        windows: Vec<(String, WindowSpec)>,
     },
     Values(Vec<Vec<Expr>>),
+}
+
+/// Reference attached to `OVER` on a window function call (`OVER w` vs `OVER (...)` in `parse.y`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum WindowRef {
+    Name(String),
+    Spec(Box<WindowSpec>),
+}
+
+/// Window specification inside `WINDOW w AS (...)` or `OVER (...)` (`Window` in `sqliteInt.h`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct WindowSpec {
+    pub base_window: Option<String>,
+    pub partition_by: Vec<Expr>,
+    pub order_by: Vec<OrderByTerm>,
+    pub frame: Option<WindowFrame>,
+}
+
+/// Explicit window frame specification (`ROWS` / `RANGE` / `GROUPS` bounds + `EXCLUDE`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowFrame {
+    pub units: WindowFrameUnits,
+    pub start: WindowFrameBound,
+    pub end: WindowFrameBound,
+    pub exclude: WindowFrameExclude,
+}
+
+/// Window frame unit mode (`range_or_rows` in `sqlite/src/parse.y`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFrameUnits {
+    Rows,
+    Range,
+    Groups,
+}
+
+/// Starting or ending boundary of a window frame (`frame_bound` in `sqlite/src/parse.y`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum WindowFrameBound {
+    UnboundedPreceding,
+    Preceding(Box<Expr>),
+    CurrentRow,
+    Following(Box<Expr>),
+    UnboundedFollowing,
+}
+
+/// `EXCLUDE` clause of a window frame (`frame_exclude` in `sqlite/src/parse.y`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WindowFrameExclude {
+    #[default]
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -741,6 +796,7 @@ pub enum Expr {
         distinct: bool,
         args: FunctionArgs,
         filter: Option<Box<Expr>>,
+        over: Option<WindowRef>,
     },
     Subquery(Box<SelectStmt>),
     Exists {

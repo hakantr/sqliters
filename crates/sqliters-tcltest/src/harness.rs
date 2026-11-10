@@ -3819,11 +3819,26 @@ fn sqlite_err_text(e: &SqliteError) -> String {
     }
 }
 
+fn format_tcl_double(r: f64) -> String {
+    if r.is_finite() && r != 0.0 && !(1e-4..1e15).contains(&r.abs()) {
+        let s = format!("{r:.14e}");
+        if let Some((mant, exp_str)) = s.split_once('e') {
+            let mut m = mant.trim_end_matches('0').trim_end_matches('.').to_owned();
+            if m.is_empty() {
+                m.push('0');
+            }
+            let exp: i32 = exp_str.parse().unwrap_or(0);
+            return format!("{m}e{exp:+03}");
+        }
+    }
+    format_sqlite_real(r)
+}
+
 fn value_to_tcl_str(v: &Value, nullvalue: &str) -> String {
     match v {
         Value::Null => nullvalue.to_string(),
         Value::Integer(i) => i.to_string(),
-        Value::Real(r) => format_sqlite_real(*r),
+        Value::Real(r) => format_tcl_double(*r),
         Value::Text(s) => s.clone(),
         Value::Blob(b) => String::from_utf8_lossy(b).into_owned(),
     }

@@ -8,7 +8,8 @@ use sqliters_syntax::{
     ColumnConstraint, ColumnDef, ColumnRef, CommonTableExpr, ConflictAction, CreateIndexStmt,
     CreateTableStmt, Expr, FromClause, FunctionArgs, IndexedColumn, JoinClause, JoinConstraint,
     LimitClause, OrderByTerm, QualifiedName, ResultColumn, SelectBody, SelectCore, SelectStmt,
-    Stmt, TableConstraint, TableOrSubquery, TriggerTiming, parse_one,
+    Stmt, TableConstraint, TableOrSubquery, TriggerTiming, WindowFrame, WindowFrameBound,
+    WindowRef, WindowSpec, parse_one,
 };
 use sqliters_types::{
     Collation, ErrorCode, ExecutionServices, KeySortOrder, Pgno, Result, SqliteError, TypeAffinity,
@@ -21,6 +22,7 @@ use crate::trigger::{
     reject_raise_outside_trigger_expr, replace_bind_params_with_null_in_trigger,
     validate_trigger_body_dml_targets,
 };
+use crate::window::{is_window_bound_constant, reject_window_in_ddl_expr};
 
 #[derive(Debug, Clone)]
 pub struct CheckSchema {
@@ -1003,6 +1005,7 @@ pub fn build_table_schema_from_ast(
                     unique_constraints.push(*conflict);
                 }
                 ColumnConstraint::Default(expr) => {
+                    reject_window_in_ddl_expr(expr)?;
                     default_expr = Some(expr.clone());
                 }
                 ColumnConstraint::Check {
@@ -1010,6 +1013,7 @@ pub fn build_table_schema_from_ast(
                     expr_sql,
                     expr,
                 } => {
+                    reject_window_in_ddl_expr(expr)?;
                     checks.push(CheckSchema {
                         label: cname.clone().unwrap_or_else(|| expr_sql.clone()),
                         expr: expr.clone(),
@@ -1017,6 +1021,7 @@ pub fn build_table_schema_from_ast(
                 }
                 ColumnConstraint::Generated { expr: e, stored: s } => {
                     reject_raise_outside_trigger_expr(e)?;
+                    reject_window_in_ddl_expr(e)?;
                     generated = Some((e.clone(), *s));
                 }
                 ColumnConstraint::Collate(cname) => {
@@ -1181,6 +1186,7 @@ pub fn build_table_schema_from_ast(
                 expr_sql,
                 expr,
             } => {
+                reject_window_in_ddl_expr(expr)?;
                 checks.push(CheckSchema {
                     label: cname.clone().unwrap_or_else(|| expr_sql.clone()),
                     expr: expr.clone(),
@@ -1399,10 +1405,12 @@ pub fn build_index_schema_from_ast(
     for ic in &ci.columns {
         if let Some(ref ie) = ic.expr {
             reject_raise_outside_trigger_expr(ie)?;
+            reject_window_in_ddl_expr(ie)?;
         }
     }
     if let Some(ref wc) = ci.where_clause {
         reject_raise_outside_trigger_expr(wc)?;
+        reject_window_in_ddl_expr(wc)?;
     }
     let resolved = resolve_indexed_columns(&tbl.columns, &ci.columns, true)?;
     let mut trailing_pk_cols = Vec::new();
@@ -1491,10 +1499,12 @@ pub fn build_column_schema_from_def(
                 not_null = Some(*conflict);
             }
             ColumnConstraint::Default(e) => {
+                reject_window_in_ddl_expr(e)?;
                 default_expr = Some(e.clone());
             }
             ColumnConstraint::Check { expr, .. } => {
                 reject_raise_outside_trigger_expr(expr)?;
+                reject_window_in_ddl_expr(expr)?;
             }
             ColumnConstraint::Generated { expr, stored } => {
                 if *stored {
@@ -1504,6 +1514,7 @@ pub fn build_column_schema_from_def(
                     ));
                 }
                 reject_raise_outside_trigger_expr(expr)?;
+                reject_window_in_ddl_expr(expr)?;
                 generated = Some((expr.clone(), false));
             }
             ColumnConstraint::Collate(cname) => {
@@ -1842,6 +1853,7 @@ fn validate_core_no_params(core: &SelectCore) -> Result<()> {
             selection,
             group_by,
             having,
+            windows,
             ..
         } => {
             for rc in projection {
@@ -1867,6 +1879,9 @@ fn validate_core_no_params(core: &SelectCore) -> Result<()> {
             if let Some(h) = having {
                 validate_expr_no_params(h)?;
             }
+            for (_, ws) in windows {
+                validate_window_spec_no_params(ws)?;
+            }
         }
         SelectCore::Values(rows) => {
             for r in rows {
@@ -1882,6 +1897,25 @@ fn validate_core_no_params(core: &SelectCore) -> Result<()> {
 fn validate_tos_no_params(tos: &TableOrSubquery) -> Result<()> {
     if let TableOrSubquery::Subquery { query, .. } = tos {
         validate_view_no_parameters(query)?;
+    }
+    Ok(())
+}
+
+fn validate_window_spec_no_params(ws: &WindowSpec) -> Result<()> {
+    for pe in &ws.partition_by {
+        validate_expr_no_params(pe)?;
+    }
+    for ob in &ws.order_by {
+        validate_expr_no_params(&ob.expr)?;
+    }
+    if let Some(ref wf) = ws.frame {
+        for b in [&wf.start, &wf.end] {
+            if let WindowFrameBound::Preceding(e) | WindowFrameBound::Following(e) = b
+                && is_window_bound_constant(e)
+            {
+                validate_expr_no_params(e)?;
+            }
+        }
     }
     Ok(())
 }
@@ -1960,7 +1994,9 @@ fn validate_expr_no_params(expr: &Expr) -> Result<()> {
             }
             Ok(())
         }
-        Expr::FunctionCall { args, filter, .. } => {
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
             if let FunctionArgs::Exprs(es) = args {
                 for e in es {
                     validate_expr_no_params(e)?;
@@ -1968,6 +2004,9 @@ fn validate_expr_no_params(expr: &Expr) -> Result<()> {
             }
             if let Some(f) = filter {
                 validate_expr_no_params(f)?;
+            }
+            if let Some(WindowRef::Spec(ws)) = over {
+                validate_window_spec_no_params(ws)?;
             }
             Ok(())
         }
@@ -2118,6 +2157,7 @@ fn fix_core_with_ctes(
             selection,
             group_by,
             having,
+            windows,
         } => {
             let mut fixed_proj = Vec::with_capacity(projection.len());
             for rc in projection {
@@ -2205,6 +2245,13 @@ fn fix_core_with_ctes(
                 )?),
                 None => None,
             };
+            let mut fixed_windows = Vec::with_capacity(windows.len());
+            for (wname, wspec) in windows {
+                fixed_windows.push((
+                    wname.clone(),
+                    fix_window_spec_with_ctes(view_name, db_schema_name, wspec, in_scope_ctes)?,
+                ));
+            }
             Ok(SelectCore::Select {
                 distinct: *distinct,
                 projection: fixed_proj,
@@ -2212,6 +2259,7 @@ fn fix_core_with_ctes(
                 selection: fixed_sel,
                 group_by: fixed_gb,
                 having: fixed_hav,
+                windows: fixed_windows,
             })
         }
         SelectCore::Values(rows) => {
@@ -2526,6 +2574,7 @@ fn fix_expr_with_ctes(
             distinct,
             args,
             filter,
+            over,
         } => {
             let fixed_args = match args {
                 FunctionArgs::Star => FunctionArgs::Star,
@@ -2551,11 +2600,19 @@ fn fix_expr_with_ctes(
                 )?)),
                 None => None,
             };
+            let fixed_over = match over {
+                Some(WindowRef::Name(wn)) => Some(WindowRef::Name(wn.clone())),
+                Some(WindowRef::Spec(ws)) => Some(WindowRef::Spec(Box::new(
+                    fix_window_spec_with_ctes(view_name, db_schema_name, ws, in_scope_ctes)?,
+                ))),
+                None => None,
+            };
             Ok(Expr::FunctionCall {
                 name: name.clone(),
                 distinct: *distinct,
                 args: fixed_args,
                 filter: fixed_filter,
+                over: fixed_over,
             })
         }
         Expr::Exists { subquery, negated } => Ok(Expr::Exists {
@@ -2598,4 +2655,63 @@ fn fix_expr_with_ctes(
             },
         }),
     }
+}
+
+fn fix_window_bound_with_ctes(
+    view_name: &str,
+    db_schema_name: &str,
+    bound: &WindowFrameBound,
+    in_scope_ctes: &[String],
+) -> Result<WindowFrameBound> {
+    match bound {
+        WindowFrameBound::UnboundedPreceding => Ok(WindowFrameBound::UnboundedPreceding),
+        WindowFrameBound::CurrentRow => Ok(WindowFrameBound::CurrentRow),
+        WindowFrameBound::UnboundedFollowing => Ok(WindowFrameBound::UnboundedFollowing),
+        WindowFrameBound::Preceding(e) => Ok(WindowFrameBound::Preceding(Box::new(
+            fix_expr_with_ctes(view_name, db_schema_name, e, in_scope_ctes)?,
+        ))),
+        WindowFrameBound::Following(e) => Ok(WindowFrameBound::Following(Box::new(
+            fix_expr_with_ctes(view_name, db_schema_name, e, in_scope_ctes)?,
+        ))),
+    }
+}
+
+fn fix_window_spec_with_ctes(
+    view_name: &str,
+    db_schema_name: &str,
+    ws: &WindowSpec,
+    in_scope_ctes: &[String],
+) -> Result<WindowSpec> {
+    let mut part = Vec::with_capacity(ws.partition_by.len());
+    for pe in &ws.partition_by {
+        part.push(fix_expr_with_ctes(
+            view_name,
+            db_schema_name,
+            pe,
+            in_scope_ctes,
+        )?);
+    }
+    let mut ob_out = Vec::with_capacity(ws.order_by.len());
+    for ob in &ws.order_by {
+        ob_out.push(OrderByTerm {
+            expr: fix_expr_with_ctes(view_name, db_schema_name, &ob.expr, in_scope_ctes)?,
+            desc: ob.desc,
+            nulls_last: ob.nulls_last,
+        });
+    }
+    let frame = match &ws.frame {
+        Some(f) => Some(WindowFrame {
+            units: f.units,
+            start: fix_window_bound_with_ctes(view_name, db_schema_name, &f.start, in_scope_ctes)?,
+            end: fix_window_bound_with_ctes(view_name, db_schema_name, &f.end, in_scope_ctes)?,
+            exclude: f.exclude,
+        }),
+        None => None,
+    };
+    Ok(WindowSpec {
+        base_window: ws.base_window.clone(),
+        partition_by: part,
+        order_by: ob_out,
+        frame,
+    })
 }

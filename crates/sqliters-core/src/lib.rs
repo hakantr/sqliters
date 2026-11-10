@@ -8,6 +8,7 @@ pub mod engine;
 pub mod execution_context;
 pub mod schema;
 pub mod trigger;
+pub mod window;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -24,7 +25,7 @@ pub use sqliters_pager::{
 use sqliters_pager::{PagerOpenOptions, TransactionState};
 use sqliters_syntax::{
     BindParam, Expr, FromClause, FunctionArgs, InsertSource, ResultColumn, SelectCore, SelectStmt,
-    Stmt, TableOrSubquery, UpsertAction, parse_one,
+    Stmt, TableOrSubquery, UpsertAction, WindowFrameBound, WindowRef, WindowSpec, parse_one,
 };
 pub use sqliters_syntax::{ColumnRef, QualifiedName};
 pub use sqliters_types::{
@@ -57,6 +58,7 @@ pub use execution_context::{
     CollationCallback, CollationRegistry, CommitCoordinatorHooks, CommitHookCallback,
     ExecutionContext, FunctionRegistry, MutationContext, MutationOrigin, MutationPipeline,
     MutationRow, ProgressCallback, ProgressTracker, ScalarFunctionCallback, ScalarFunctionDef,
+    WindowAggregateInstance, WindowFunctionDef,
 };
 pub use schema::{ColumnSchema, ForeignKeySchema, IndexSchema, Schema, TableSchema, ViewSchema};
 pub use trigger::{
@@ -2906,6 +2908,43 @@ impl Connection {
         Ok(removed)
     }
 
+    /// Registers or replaces a connection-local aggregate or window SQL function
+    /// (`sqlite3_create_window_function` / `sqlite3_create_function_v2`).
+    pub fn register_window_function(
+        &self,
+        name: &str,
+        num_args: i32,
+        flags: FunctionFlags,
+        supports_window: bool,
+        supports_inverse: bool,
+        factory: impl Fn() -> Box<dyn execution_context::WindowAggregateInstance>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<()> {
+        let arity = if num_args == -1 {
+            None
+        } else if (0..=127).contains(&num_args) {
+            Some(num_args as usize)
+        } else {
+            return Err(SqliteError::misuse("invalid function argument count"));
+        };
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        inner.functions.register_window_aggregate(
+            name,
+            arity,
+            flags,
+            supports_window,
+            supports_inverse,
+            factory,
+        );
+        inner.schema_generation += 1;
+        inner.v1_expire_generation += 1;
+        Ok(())
+    }
+
     /// Registers or replaces a connection-local collation sequence (`sqlite3_create_collation_v2`).
     pub fn register_collation(
         &self,
@@ -3456,6 +3495,7 @@ fn select_references_temp_catalog(sel: &SelectStmt, db_set: &DatabaseSet) -> boo
                 selection,
                 group_by,
                 having,
+                windows,
                 ..
             } => {
                 for rc in projection {
@@ -3504,6 +3544,12 @@ fn select_references_temp_catalog(sel: &SelectStmt, db_set: &DatabaseSet) -> boo
                 }
                 if let Some(h) = having
                     && expr_references_temp_catalog(h, db_set)
+                {
+                    return true;
+                }
+                if windows
+                    .iter()
+                    .any(|(_, ws)| window_spec_references_temp_catalog(ws, db_set))
                 {
                     return true;
                 }
@@ -3585,7 +3631,9 @@ fn expr_references_temp_catalog(expr: &Expr, db_set: &DatabaseSet) -> bool {
                     .as_ref()
                     .is_some_and(|e| expr_references_temp_catalog(e, db_set))
         }
-        Expr::FunctionCall { args, filter, .. } => {
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
             let args_ref = match args {
                 FunctionArgs::Exprs(es) => {
                     es.iter().any(|e| expr_references_temp_catalog(e, db_set))
@@ -3596,12 +3644,23 @@ fn expr_references_temp_catalog(expr: &Expr, db_set: &DatabaseSet) -> bool {
                 || filter
                     .as_ref()
                     .is_some_and(|f| expr_references_temp_catalog(f, db_set))
+                || matches!(over, Some(WindowRef::Spec(ws)) if window_spec_references_temp_catalog(ws, db_set))
         }
         Expr::RowValue(items) => items
             .iter()
             .any(|e| expr_references_temp_catalog(e, db_set)),
         _ => false,
     }
+}
+
+fn window_spec_references_temp_catalog(ws: &WindowSpec, db_set: &DatabaseSet) -> bool {
+    ws.partition_by
+        .iter()
+        .any(|pe| expr_references_temp_catalog(pe, db_set))
+        || ws
+            .order_by
+            .iter()
+            .any(|ob| expr_references_temp_catalog(&ob.expr, db_set))
 }
 
 fn from_clause_references_temp_catalog(fc: &FromClause, db_set: &DatabaseSet) -> bool {
@@ -6348,6 +6407,7 @@ fn collect_core_params(core: &SelectCore, max_idx: &mut usize, named: &mut HashM
             selection,
             group_by,
             having,
+            windows,
             ..
         } => {
             for rc in projection {
@@ -6366,6 +6426,9 @@ fn collect_core_params(core: &SelectCore, max_idx: &mut usize, named: &mut HashM
             }
             if let Some(h) = having {
                 collect_expr_params(h, max_idx, named);
+            }
+            for (_, ws) in windows {
+                collect_window_spec_params(ws, max_idx, named);
             }
         }
     }
@@ -6440,7 +6503,9 @@ fn collect_expr_params(expr: &Expr, max_idx: &mut usize, named: &mut HashMap<Str
                 collect_expr_params(el, max_idx, named);
             }
         }
-        Expr::FunctionCall { args, filter, .. } => {
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
             if let FunctionArgs::Exprs(es) = args {
                 for a in es {
                     collect_expr_params(a, max_idx, named);
@@ -6448,6 +6513,9 @@ fn collect_expr_params(expr: &Expr, max_idx: &mut usize, named: &mut HashMap<Str
             }
             if let Some(f) = filter {
                 collect_expr_params(f, max_idx, named);
+            }
+            if let Some(WindowRef::Spec(ws)) = over {
+                collect_window_spec_params(ws, max_idx, named);
             }
         }
         Expr::Subquery(sub) | Expr::Exists { subquery: sub, .. } => {
@@ -6459,6 +6527,28 @@ fn collect_expr_params(expr: &Expr, max_idx: &mut usize, named: &mut HashMap<Str
             }
         }
         _ => {}
+    }
+}
+
+fn collect_window_spec_params(
+    ws: &WindowSpec,
+    max_idx: &mut usize,
+    named: &mut HashMap<String, usize>,
+) {
+    for pe in &ws.partition_by {
+        collect_expr_params(pe, max_idx, named);
+    }
+    for ob in &ws.order_by {
+        collect_expr_params(&ob.expr, max_idx, named);
+    }
+    if let Some(ref wf) = ws.frame {
+        for b in [&wf.start, &wf.end] {
+            if let WindowFrameBound::Preceding(e) | WindowFrameBound::Following(e) = b
+                && window::is_window_bound_constant(e)
+            {
+                collect_expr_params(e, max_idx, named);
+            }
+        }
     }
 }
 

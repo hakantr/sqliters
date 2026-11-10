@@ -74,11 +74,7 @@ impl TypeAffinity {
                 Value::Integer(i) => Value::Text(i.to_string()),
                 Value::Real(r) => Value::Text(format_sqlite_real(r)),
             },
-            Self::Numeric => match val {
-                Value::Text(ref s) => parse_numeric_text(s).unwrap_or(val),
-                _ => val,
-            },
-            Self::Integer => {
+            Self::Numeric | Self::Integer => {
                 let v = match val {
                     Value::Text(ref s) => parse_numeric_text(s).unwrap_or(val),
                     other => other,

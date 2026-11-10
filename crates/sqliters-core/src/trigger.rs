@@ -7,11 +7,12 @@ use sqliters_syntax::{
     FunctionArgs, IndexedColumn, InsertSource, InsertStmt, JoinClause, JoinConstraint, LimitClause,
     OrderByTerm, QualifiedName, ResultColumn, SelectBody, SelectCore, SelectStmt, SetAssignment,
     TableOrSubquery, TriggerEvent, TriggerStep, TriggerTiming, UpdateStmt, UpsertAction,
-    UpsertClause, UpsertTarget,
+    UpsertClause, UpsertTarget, WindowFrame, WindowFrameBound, WindowRef, WindowSpec,
 };
 use sqliters_types::{DatabaseId, ErrorCode, Result, SqliteError};
 
 use crate::db_set::{DatabaseSet, ResolvedRelation, SchemaInstanceId};
+use crate::window::is_window_bound_constant;
 
 /// Default `SQLITE_LIMIT_TRIGGER_STEPS` (`SQLITE_MAX_TRIGGER_STEPS` in `sqliteLimit.h`).
 pub const SQLITE_MAX_TRIGGER_STEPS: usize = 65_000;
@@ -427,6 +428,7 @@ fn validate_trig_core_no_params(core: &SelectCore) -> Result<()> {
             selection,
             group_by,
             having,
+            windows,
             ..
         } => {
             for rc in projection {
@@ -445,6 +447,9 @@ fn validate_trig_core_no_params(core: &SelectCore) -> Result<()> {
             }
             if let Some(h) = having {
                 validate_trig_expr_no_params(h)?;
+            }
+            for (_, ws) in windows {
+                validate_trig_window_spec_no_params(ws)?;
             }
         }
         SelectCore::Values(rows) => {
@@ -481,6 +486,25 @@ fn validate_trig_tos_no_params(tos: &TableOrSubquery) -> Result<()> {
         }
         TableOrSubquery::Subquery { query, .. } => validate_trig_select_no_params(query),
     }
+}
+
+fn validate_trig_window_spec_no_params(ws: &WindowSpec) -> Result<()> {
+    for pe in &ws.partition_by {
+        validate_trig_expr_no_params(pe)?;
+    }
+    for ob in &ws.order_by {
+        validate_trig_expr_no_params(&ob.expr)?;
+    }
+    if let Some(ref wf) = ws.frame {
+        for b in [&wf.start, &wf.end] {
+            if let WindowFrameBound::Preceding(e) | WindowFrameBound::Following(e) = b
+                && is_window_bound_constant(e)
+            {
+                validate_trig_expr_no_params(e)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_trig_expr_no_params(expr: &Expr) -> Result<()> {
@@ -557,7 +581,9 @@ fn validate_trig_expr_no_params(expr: &Expr) -> Result<()> {
             }
             Ok(())
         }
-        Expr::FunctionCall { args, filter, .. } => {
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
             if let FunctionArgs::Exprs(es) = args {
                 for e in es {
                     validate_trig_expr_no_params(e)?;
@@ -565,6 +591,9 @@ fn validate_trig_expr_no_params(expr: &Expr) -> Result<()> {
             }
             if let Some(f) = filter {
                 validate_trig_expr_no_params(f)?;
+            }
+            if let Some(WindowRef::Spec(ws)) = over {
+                validate_trig_window_spec_no_params(ws)?;
             }
             Ok(())
         }
@@ -691,6 +720,7 @@ fn replace_bind_in_core(core: &mut SelectCore) {
             selection,
             group_by,
             having,
+            windows,
             ..
         } => {
             for rc in projection {
@@ -709,6 +739,9 @@ fn replace_bind_in_core(core: &mut SelectCore) {
             }
             if let Some(h) = having {
                 replace_bind_in_expr(h);
+            }
+            for (_, ws) in windows {
+                replace_bind_in_window_spec(ws);
             }
         }
         SelectCore::Values(rows) => {
@@ -741,6 +774,22 @@ fn replace_bind_in_tos(tos: &mut TableOrSubquery) {
             }
         }
         TableOrSubquery::Subquery { query, .. } => replace_bind_in_select(query),
+    }
+}
+
+fn replace_bind_in_window_spec(ws: &mut WindowSpec) {
+    for pe in &mut ws.partition_by {
+        replace_bind_in_expr(pe);
+    }
+    for ob in &mut ws.order_by {
+        replace_bind_in_expr(&mut ob.expr);
+    }
+    if let Some(ref mut wf) = ws.frame {
+        for b in [&mut wf.start, &mut wf.end] {
+            if let WindowFrameBound::Preceding(e) | WindowFrameBound::Following(e) = b {
+                replace_bind_in_expr(e);
+            }
+        }
     }
 }
 
@@ -812,7 +861,9 @@ fn replace_bind_in_expr(expr: &mut Expr) {
                 replace_bind_in_expr(el);
             }
         }
-        Expr::FunctionCall { args, filter, .. } => {
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
             if let FunctionArgs::Exprs(es) = args {
                 for e in es {
                     replace_bind_in_expr(e);
@@ -820,6 +871,9 @@ fn replace_bind_in_expr(expr: &mut Expr) {
             }
             if let Some(f) = filter {
                 replace_bind_in_expr(f);
+            }
+            if let Some(WindowRef::Spec(ws)) = over {
+                replace_bind_in_window_spec(ws);
             }
         }
         Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
@@ -1127,6 +1181,7 @@ fn fix_trig_core(
             selection,
             group_by,
             having,
+            windows,
         } => {
             let fixed_from = match from {
                 Some(fc) => Some(fix_trig_from(
@@ -1190,6 +1245,13 @@ fn fix_trig_core(
                 )?),
                 None => None,
             };
+            let mut fixed_windows = Vec::with_capacity(windows.len());
+            for (wname, ws) in windows {
+                fixed_windows.push((
+                    wname.clone(),
+                    fix_trig_window_spec(trigger_name, db_schema_name, ws, in_scope_ctes)?,
+                ));
+            }
             Ok(SelectCore::Select {
                 distinct: *distinct,
                 projection: fixed_proj,
@@ -1197,6 +1259,7 @@ fn fix_trig_core(
                 selection: fixed_sel,
                 group_by: fixed_gb,
                 having: fixed_hav,
+                windows: fixed_windows,
             })
         }
         SelectCore::Values(rows) => {
@@ -1542,6 +1605,7 @@ fn fix_trig_expr(
             distinct,
             args,
             filter,
+            over,
         } => {
             let fixed_args = match args {
                 FunctionArgs::Star => FunctionArgs::Star,
@@ -1567,11 +1631,20 @@ fn fix_trig_expr(
                 )?)),
                 None => None,
             };
+            let fixed_over =
+                match over {
+                    Some(WindowRef::Name(wn)) => Some(WindowRef::Name(wn.clone())),
+                    Some(WindowRef::Spec(ws)) => Some(WindowRef::Spec(Box::new(
+                        fix_trig_window_spec(trigger_name, db_schema_name, ws, in_scope_ctes)?,
+                    ))),
+                    None => None,
+                };
             Ok(Expr::FunctionCall {
                 name: name.clone(),
                 distinct: *distinct,
                 args: fixed_args,
                 filter: fixed_filter,
+                over: fixed_over,
             })
         }
         Expr::Exists { subquery, negated } => Ok(Expr::Exists {
@@ -1671,6 +1744,7 @@ fn core_contains_raise(core: &SelectCore) -> bool {
             selection,
             group_by,
             having,
+            windows,
             ..
         } => {
             projection.iter().any(
@@ -1679,6 +1753,7 @@ fn core_contains_raise(core: &SelectCore) -> bool {
                 || selection.as_ref().is_some_and(expr_contains_raise)
                 || group_by.iter().any(expr_contains_raise)
                 || having.as_ref().is_some_and(expr_contains_raise)
+                || windows.iter().any(|(_, ws)| window_spec_contains_raise(ws))
         }
         SelectCore::Values(rows) => rows.iter().any(|r| r.iter().any(expr_contains_raise)),
     }
@@ -1754,9 +1829,12 @@ pub fn expr_contains_raise(expr: &Expr) -> bool {
                     .any(|(c, v)| expr_contains_raise(c) || expr_contains_raise(v))
                 || else_expr.as_deref().is_some_and(expr_contains_raise)
         }
-        Expr::FunctionCall { args, filter, .. } => {
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
             matches!(args, FunctionArgs::Exprs(es) if es.iter().any(expr_contains_raise))
                 || filter.as_deref().is_some_and(expr_contains_raise)
+                || matches!(over, Some(WindowRef::Spec(ws)) if window_spec_contains_raise(ws))
         }
         Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => select_contains_raise(subquery),
         Expr::RowValue(es) => es.iter().any(expr_contains_raise),
@@ -1884,6 +1962,7 @@ fn check_select_core_no_oversized_hex(core: &SelectCore) -> Result<()> {
             selection,
             group_by,
             having,
+            windows,
             ..
         } => {
             for rc in projection {
@@ -1902,6 +1981,9 @@ fn check_select_core_no_oversized_hex(core: &SelectCore) -> Result<()> {
             }
             if let Some(h) = having {
                 check_expr_no_oversized_hex(h)?;
+            }
+            for (_, ws) in windows {
+                check_window_spec_no_oversized_hex(ws)?;
             }
         }
     }
@@ -2007,7 +2089,9 @@ fn check_expr_no_oversized_hex(expr: &Expr) -> Result<()> {
             }
             Ok(())
         }
-        Expr::FunctionCall { args, filter, .. } => {
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
             if let FunctionArgs::Exprs(es) = args {
                 for e in es {
                     check_expr_no_oversized_hex(e)?;
@@ -2015,6 +2099,9 @@ fn check_expr_no_oversized_hex(expr: &Expr) -> Result<()> {
             }
             if let Some(f) = filter {
                 check_expr_no_oversized_hex(f)?;
+            }
+            if let Some(WindowRef::Spec(ws)) = over {
+                check_window_spec_no_oversized_hex(ws)?;
             }
             Ok(())
         }
@@ -2034,4 +2121,105 @@ fn check_expr_no_oversized_hex(expr: &Expr) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn fix_trig_window_bound(
+    trigger_name: &str,
+    db_schema_name: &str,
+    bound: &WindowFrameBound,
+    in_scope_ctes: &[String],
+) -> Result<WindowFrameBound> {
+    match bound {
+        WindowFrameBound::UnboundedPreceding => Ok(WindowFrameBound::UnboundedPreceding),
+        WindowFrameBound::CurrentRow => Ok(WindowFrameBound::CurrentRow),
+        WindowFrameBound::UnboundedFollowing => Ok(WindowFrameBound::UnboundedFollowing),
+        WindowFrameBound::Preceding(e) => {
+            let fixed = if is_window_bound_constant(e) {
+                fix_trig_expr(trigger_name, db_schema_name, e, in_scope_ctes)?
+            } else {
+                Expr::Null
+            };
+            Ok(WindowFrameBound::Preceding(Box::new(fixed)))
+        }
+        WindowFrameBound::Following(e) => {
+            let fixed = if is_window_bound_constant(e) {
+                fix_trig_expr(trigger_name, db_schema_name, e, in_scope_ctes)?
+            } else {
+                Expr::Null
+            };
+            Ok(WindowFrameBound::Following(Box::new(fixed)))
+        }
+    }
+}
+
+fn fix_trig_window_spec(
+    trigger_name: &str,
+    db_schema_name: &str,
+    ws: &WindowSpec,
+    in_scope_ctes: &[String],
+) -> Result<WindowSpec> {
+    let mut part = Vec::with_capacity(ws.partition_by.len());
+    for pe in &ws.partition_by {
+        part.push(fix_trig_expr(
+            trigger_name,
+            db_schema_name,
+            pe,
+            in_scope_ctes,
+        )?);
+    }
+    let mut ob_out = Vec::with_capacity(ws.order_by.len());
+    for ob in &ws.order_by {
+        ob_out.push(OrderByTerm {
+            expr: fix_trig_expr(trigger_name, db_schema_name, &ob.expr, in_scope_ctes)?,
+            desc: ob.desc,
+            nulls_last: ob.nulls_last,
+        });
+    }
+    let frame = match &ws.frame {
+        Some(f) => Some(WindowFrame {
+            units: f.units,
+            start: fix_trig_window_bound(trigger_name, db_schema_name, &f.start, in_scope_ctes)?,
+            end: fix_trig_window_bound(trigger_name, db_schema_name, &f.end, in_scope_ctes)?,
+            exclude: f.exclude,
+        }),
+        None => None,
+    };
+    Ok(WindowSpec {
+        base_window: ws.base_window.clone(),
+        partition_by: part,
+        order_by: ob_out,
+        frame,
+    })
+}
+
+fn window_spec_contains_raise(ws: &WindowSpec) -> bool {
+    ws.partition_by.iter().any(expr_contains_raise)
+        || ws.order_by.iter().any(|ob| expr_contains_raise(&ob.expr))
+        || ws.frame.as_ref().is_some_and(|wf| {
+            [&wf.start, &wf.end].into_iter().any(|b| match b {
+                WindowFrameBound::Preceding(e) | WindowFrameBound::Following(e) => {
+                    is_window_bound_constant(e) && expr_contains_raise(e)
+                }
+                _ => false,
+            })
+        })
+}
+
+fn check_window_spec_no_oversized_hex(ws: &WindowSpec) -> Result<()> {
+    for pe in &ws.partition_by {
+        check_expr_no_oversized_hex(pe)?;
+    }
+    for ob in &ws.order_by {
+        check_expr_no_oversized_hex(&ob.expr)?;
+    }
+    if let Some(ref wf) = ws.frame {
+        for b in [&wf.start, &wf.end] {
+            if let WindowFrameBound::Preceding(e) | WindowFrameBound::Following(e) = b
+                && is_window_bound_constant(e)
+            {
+                check_expr_no_oversized_hex(e)?;
+            }
+        }
+    }
+    Ok(())
 }

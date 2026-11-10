@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -50,9 +50,9 @@ fn next_prng_u64() -> u64 {
 }
 
 use sqliters_types::{
-    Collation, ErrorCode, FunctionFlags, Result, RuntimeValue, SQLITE_SOURCE_ID, SQLITE_VERSION,
-    SqliteError, Value, enforce_result_subtype_contract, format_sqlite_real,
-    strip_unsubscribed_subtypes,
+    AggregateStepId, Collation, ErrorCode, FunctionFlags, Result, RuntimeValue, SQLITE_SOURCE_ID,
+    SQLITE_VERSION, SqliteError, TextEncoding, Value, enforce_result_subtype_contract,
+    format_sqlite_real, strip_unsubscribed_subtypes,
 };
 
 /// Connection-level execution metadata exposed to SQL functions (`last_insert_rowid()`, `changes()`,
@@ -134,7 +134,8 @@ pub fn builtin_scalar_flags(name: &str, enable_test_functions: bool) -> Option<F
         "SUBTYPE" => {
             Some(FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS | FunctionFlags::SUBTYPE)
         }
-        "COALESCE" | "IFNULL" | "NULLIF" | "IIF" | "IF" | "MIN" | "MAX" => Some(
+        "COALESCE" | "IFNULL" | "NULLIF" | "IIF" | "IF" | "MIN" | "MAX" | "LIKELY" | "UNLIKELY"
+        | "LIKELIHOOD" => Some(
             FunctionFlags::DETERMINISTIC
                 | FunctionFlags::INNOCUOUS
                 | FunctionFlags::SUBTYPE
@@ -259,6 +260,23 @@ pub fn eval_scalar_function_rt_with_strict(
                     RuntimeValue::null()
                 }
             })
+        }
+        "LIKELY" | "UNLIKELY" => {
+            check_arity_rt(name, filtered, 1, 1)?;
+            filtered[0].clone()
+        }
+        "LIKELIHOOD" => {
+            check_arity_rt(name, filtered, 2, 2)?;
+            match filtered[1].value {
+                Value::Real(p) if (0.0..=1.0).contains(&p) => {}
+                _ => {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "second argument to likelihood() must be a constant between 0.0 and 1.0",
+                    ));
+                }
+            }
+            filtered[0].clone()
         }
         "MAX" => {
             check_arity_rt(name, filtered, 2, usize::MAX)?;
@@ -805,11 +823,12 @@ fn scalar_function_arity_with_flag(
 ) -> Option<(usize, usize)> {
     match upper {
         "TYPEOF" | "SUBTYPE" | "ABS" | "SIGN" | "LENGTH" | "OCTET_LENGTH" | "LOWER" | "UPPER"
-        | "HEX" | "UNHEX" | "UNICODE" | "QUOTE" | "ZEROBLOB" | "RANDOMBLOB" => Some((1, 1)),
+        | "HEX" | "UNHEX" | "UNICODE" | "QUOTE" | "ZEROBLOB" | "RANDOMBLOB" | "LIKELY"
+        | "UNLIKELY" => Some((1, 1)),
         "RANDOM" | "SQLITE_VERSION" | "SQLITE_SOURCE_ID" | "LAST_INSERT_ROWID" | "CHANGES"
         | "TOTAL_CHANGES" | "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" => Some((0, 0)),
         "COALESCE" | "IIF" | "IF" => Some((2, usize::MAX)),
-        "IFNULL" | "NULLIF" | "INSTR" | "GLOB" => Some((2, 2)),
+        "IFNULL" | "NULLIF" | "INSTR" | "GLOB" | "LIKELIHOOD" => Some((2, 2)),
         "RANDSTR" | "TEST_SET_SUBTYPE" | "TEST_BAD_SUBTYPE" if enable_test_functions => {
             Some((2, 2))
         }
@@ -826,6 +845,25 @@ fn scalar_function_arity_with_flag(
     }
 }
 
+/// Returns `(min_args, max_args)` if `upper` is one of SQLite's 11 built-in window-only functions
+/// (`SQLITE_FUNC_WINDOW` in `sqlite/src/window.c:614-630`).
+pub fn builtin_window_arity(name: &str) -> Option<(usize, usize)> {
+    match name.to_ascii_uppercase().as_str() {
+        "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "PERCENT_RANK" | "CUME_DIST" => Some((0, 0)),
+        "NTILE" | "FIRST_VALUE" | "LAST_VALUE" => Some((1, 1)),
+        "NTH_VALUE" => Some((2, 2)),
+        "LEAD" | "LAG" => Some((1, 3)),
+        _ => None,
+    }
+}
+
+/// Returns `true` if `name` (ASCII case-insensitive) is one of SQLite's 11 built-in window-only
+/// functions (`row_number`..`nth_value`).
+#[inline]
+pub fn is_builtin_window_only_function(name: &str) -> bool {
+    builtin_window_arity(&name.to_ascii_uppercase()).is_some()
+}
+
 /// Validates a SQL function call (`name`, `*` vs `arg_count`, `DISTINCT`, `FILTER`, and whether
 /// aggregate functions are permitted in the enclosing SQL clause) at `prepare` time.
 pub fn validate_function_call(
@@ -837,6 +875,23 @@ pub fn validate_function_call(
     allow_aggregates: bool,
 ) -> Result<()> {
     let upper = name.to_ascii_uppercase();
+    if let Some((min, max)) = builtin_window_arity(&upper) {
+        let bad_arity = if max == 0 {
+            !star_args && arg_count != 0
+        } else {
+            star_args || arg_count < min || arg_count > max
+        };
+        if bad_arity {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("wrong number of arguments to function {name}()"),
+            ));
+        }
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("misuse of window function {name}()"),
+        ));
+    }
     match upper.as_str() {
         "COUNT" => {
             if !star_args && arg_count > 1 {
@@ -920,7 +975,7 @@ pub fn validate_function_call(
                 if has_filter {
                     return Err(SqliteError::new(
                         ErrorCode::Error,
-                        format!("{name}() is not an aggregate function"),
+                        format!("FILTER may not be used with non-aggregate {name}()"),
                     ));
                 }
                 Ok(())
@@ -933,16 +988,22 @@ pub fn validate_function_call(
                     format!("no such function: {name}"),
                 ));
             };
-            if distinct || has_filter {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    format!("{name}() is not an aggregate function"),
-                ));
-            }
             if star_args || arg_count < min || arg_count > max {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!("wrong number of arguments to function {name}()"),
+                ));
+            }
+            if has_filter {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("FILTER may not be used with non-aggregate {name}()"),
+                ));
+            }
+            if distinct {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("{name}() is not an aggregate function"),
                 ));
             }
             Ok(())
@@ -1442,19 +1503,174 @@ impl AggregateKind {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct SumCtx {
+    r_sum: f64,
+    r_err: f64,
+    i_sum: i64,
+    approx: bool,
+    ovrfl: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SumNumeric {
+    Int(i64),
+    Float(f64),
+}
+
+impl SumCtx {
+    #[inline]
+    fn kbn_step(&mut self, r: f64) {
+        let s = self.r_sum;
+        let t = s + r;
+        if s.abs() > r.abs() {
+            self.r_err += (s - t) + r;
+        } else {
+            self.r_err += (r - t) + s;
+        }
+        self.r_sum = t;
+    }
+
+    #[inline]
+    fn kbn_step_i64(&mut self, i_val: i64) {
+        const SPLIT_LIMIT: i64 = 4_503_599_627_370_496; // 2^52
+        if i_val <= -SPLIT_LIMIT || i_val >= SPLIT_LIMIT {
+            let i_sm = i_val % 16_384;
+            let i_big = i_val - i_sm;
+            self.kbn_step(i_big as f64);
+            self.kbn_step(i_sm as f64);
+        } else {
+            self.kbn_step(i_val as f64);
+        }
+    }
+
+    #[inline]
+    fn kbn_init(&mut self, i_val: i64) {
+        const SPLIT_LIMIT: i64 = 4_503_599_627_370_496; // 2^52
+        if i_val <= -SPLIT_LIMIT || i_val >= SPLIT_LIMIT {
+            let i_sm = i_val % 16_384;
+            self.r_sum = (i_val - i_sm) as f64;
+            self.r_err = i_sm as f64;
+        } else {
+            self.r_sum = i_val as f64;
+            self.r_err = 0.0;
+        }
+    }
+
+    #[inline]
+    fn classify_numeric(v: &Value) -> Option<SumNumeric> {
+        match v {
+            Value::Null => None,
+            Value::Integer(i) => Some(SumNumeric::Int(*i)),
+            Value::Real(r) => Some(SumNumeric::Float(*r)),
+            Value::Text(s) => match sqliters_types::parse_numeric_text(s) {
+                Some(Value::Integer(i)) => Some(SumNumeric::Int(i)),
+                Some(Value::Real(r)) => Some(SumNumeric::Float(r)),
+                _ => Some(SumNumeric::Float(v.to_real_lossy())),
+            },
+            Value::Blob(_) => Some(SumNumeric::Float(0.0)),
+        }
+    }
+
+    fn step_val(&mut self, v: &Value) {
+        let Some(num) = Self::classify_numeric(v) else {
+            return;
+        };
+        if !self.approx {
+            match num {
+                SumNumeric::Float(f) => {
+                    self.kbn_init(self.i_sum);
+                    self.approx = true;
+                    self.kbn_step(f);
+                }
+                SumNumeric::Int(i) => {
+                    if let Some(next) = self.i_sum.checked_add(i) {
+                        self.i_sum = next;
+                    } else {
+                        self.ovrfl = true;
+                        self.kbn_init(self.i_sum);
+                        self.approx = true;
+                        self.kbn_step_i64(i);
+                    }
+                }
+            }
+        } else {
+            match num {
+                SumNumeric::Int(i) => self.kbn_step_i64(i),
+                SumNumeric::Float(f) => {
+                    self.ovrfl = false;
+                    self.kbn_step(f);
+                }
+            }
+        }
+    }
+
+    fn inverse_val(&mut self, v: &Value) {
+        let Some(num) = Self::classify_numeric(v) else {
+            return;
+        };
+        if !self.approx
+            && let SumNumeric::Int(i) = num
+        {
+            if let Some(next) = self.i_sum.checked_sub(i) {
+                self.i_sum = next;
+                return;
+            }
+            self.ovrfl = true;
+            self.approx = true;
+            self.kbn_init(self.i_sum);
+        }
+        match num {
+            SumNumeric::Int(i) => {
+                if i != i64::MIN {
+                    self.kbn_step_i64(-i);
+                } else {
+                    self.kbn_step_i64(i64::MAX);
+                    self.kbn_step_i64(1);
+                }
+            }
+            SumNumeric::Float(f) => {
+                self.kbn_step(-f);
+            }
+        }
+    }
+
+    #[inline]
+    fn combined_f64(&self) -> f64 {
+        if self.approx {
+            if self.r_err.is_finite() {
+                self.r_sum + self.r_err
+            } else {
+                self.r_sum
+            }
+        } else {
+            self.i_sum as f64
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AggregateAccumulator {
     kind: AggregateKind,
     distinct: bool,
     collation: Collation,
+    encoding: TextEncoding,
     seen: HashSet<Vec<u8>>,
     seen_collated: Vec<Value>,
     count: i64,
-    int_sum: i128,
-    float_sum: f64,
-    has_float: bool,
+    sum_ctx: SumCtx,
     best: Option<Value>,
-    concat_buf: Option<String>,
+    concat_buf: String,
+    concat_count: usize,
+    concat_sep_lens: VecDeque<usize>,
+}
+
+#[inline]
+fn value_to_text_in_encoding(v: &Value, encoding: TextEncoding) -> String {
+    match v {
+        Value::Blob(b) => encoding.decode_bytes(b),
+        other => other.to_text_lossy(),
+    }
 }
 
 impl AggregateAccumulator {
@@ -1467,18 +1683,51 @@ impl AggregateAccumulator {
             kind,
             distinct,
             collation,
+            encoding: TextEncoding::Utf8,
             seen: HashSet::new(),
             seen_collated: Vec::new(),
             count: 0,
-            int_sum: 0,
-            float_sum: 0.0,
-            has_float: false,
+            sum_ctx: SumCtx::default(),
             best: None,
-            concat_buf: None,
+            concat_buf: String::new(),
+            concat_count: 0,
+            concat_sep_lens: VecDeque::new(),
         }
     }
 
+    #[inline]
+    pub fn with_encoding(mut self, encoding: TextEncoding) -> Self {
+        self.encoding = encoding;
+        self
+    }
+
+    /// Returns `true` if this accumulator supports O(1) sliding-frame row removal via
+    /// [`Self::inverse`] (`xInverse` in `sqlite/src/func.c`).
+    #[inline]
+    pub fn supports_inverse(&self) -> bool {
+        !self.distinct
+            && matches!(
+                self.kind,
+                AggregateKind::CountStar
+                    | AggregateKind::Count
+                    | AggregateKind::Sum
+                    | AggregateKind::Total
+                    | AggregateKind::Avg
+                    | AggregateKind::GroupConcat
+            )
+    }
+
     pub fn step(&mut self, args: &[Value]) -> Result<()> {
+        let coll = self.collation;
+        self.step_with_cmp(args, |a, b| Ok(a.cmp_sqlite(b, coll)))
+    }
+
+    /// Feeds one row into this accumulator using a fallible value comparator `cmp_fn`
+    /// (supporting custom connection collations on `MIN` / `MAX`).
+    pub fn step_with_cmp<F>(&mut self, args: &[Value], cmp_fn: F) -> Result<()>
+    where
+        F: FnOnce(&Value, &Value) -> Result<std::cmp::Ordering>,
+    {
         if self.kind == AggregateKind::CountStar {
             self.count += 1;
             return Ok(());
@@ -1514,30 +1763,12 @@ impl AggregateAccumulator {
             }
             AggregateKind::Sum | AggregateKind::Total | AggregateKind::Avg => {
                 self.count += 1;
-                match first {
-                    Value::Integer(i) => {
-                        self.int_sum += i128::from(*i);
-                    }
-                    Value::Real(r) => {
-                        self.has_float = true;
-                        self.float_sum += *r;
-                    }
-                    other => {
-                        if let Some(Value::Integer(i)) =
-                            sqliters_types::parse_numeric_text(&other.to_text_lossy())
-                        {
-                            self.int_sum += i128::from(i);
-                        } else {
-                            self.has_float = true;
-                            self.float_sum += other.to_real_lossy();
-                        }
-                    }
-                }
+                self.sum_ctx.step_val(first);
             }
             AggregateKind::Min => {
                 let replace = match &self.best {
                     None => true,
-                    Some(cur) => first.cmp_sqlite(cur, self.collation).is_lt(),
+                    Some(cur) => cmp_fn(first, cur)?.is_lt(),
                 };
                 if replace {
                     self.best = Some(first.clone());
@@ -1546,64 +1777,248 @@ impl AggregateAccumulator {
             AggregateKind::Max => {
                 let replace = match &self.best {
                     None => true,
-                    Some(cur) => first.cmp_sqlite(cur, self.collation).is_gt(),
+                    Some(cur) => cmp_fn(first, cur)?.is_gt(),
                 };
                 if replace {
                     self.best = Some(first.clone());
                 }
             }
             AggregateKind::GroupConcat => {
-                let sep = args
-                    .get(1)
-                    .filter(|v| !v.is_null())
-                    .map_or_else(|| ",".to_owned(), Value::to_text_lossy);
-                if args.get(1).is_some_and(Value::is_null) {
-                    return Ok(());
-                }
-                let text = first.to_text_lossy();
-                match &mut self.concat_buf {
-                    None => self.concat_buf = Some(text),
-                    Some(buf) => {
-                        buf.push_str(&sep);
-                        buf.push_str(&text);
-                    }
+                // Match `groupConcatStep` (`sqlite/src/func.c:2206-2274`):
+                // 1-arg uses ","; 2-arg with NULL separator uses "" (`nSep = 0`).
+                let text = value_to_text_in_encoding(first, self.encoding);
+                if self.concat_count == 0 {
+                    self.concat_buf.push_str(&text);
+                    self.concat_count = 1;
+                } else {
+                    let sep = match args.get(1) {
+                        None => ",".to_owned(),
+                        Some(Value::Null) => String::new(),
+                        Some(v) => value_to_text_in_encoding(v, self.encoding),
+                    };
+                    self.concat_sep_lens.push_back(sep.len());
+                    self.concat_buf.push_str(&sep);
+                    self.concat_buf.push_str(&text);
+                    self.concat_count += 1;
                 }
             }
         }
         Ok(())
     }
 
-    pub fn finalize(&self) -> Result<Value> {
+    /// Removes a departing window-frame row from this accumulator (`xInverse` in `sqlite/src/func.c`).
+    pub fn inverse(&mut self, args: &[Value]) -> Result<()> {
+        if !self.supports_inverse() {
+            return Err(SqliteError::misuse(
+                "aggregate accumulator does not support inverse",
+            ));
+        }
+        match self.kind {
+            AggregateKind::CountStar => {
+                self.count -= 1;
+            }
+            AggregateKind::Count => {
+                if let Some(first) = args.first()
+                    && !first.is_null()
+                {
+                    self.count -= 1;
+                }
+            }
+            AggregateKind::Sum | AggregateKind::Total | AggregateKind::Avg => {
+                if let Some(first) = args.first()
+                    && !first.is_null()
+                {
+                    self.count -= 1;
+                    self.sum_ctx.inverse_val(first);
+                }
+            }
+            AggregateKind::GroupConcat => {
+                let Some(first) = args.first() else {
+                    return Ok(());
+                };
+                if first.is_null() {
+                    return Ok(());
+                }
+                let val_len = value_to_text_in_encoding(first, self.encoding).len();
+                self.concat_count = self.concat_count.saturating_sub(1);
+                let sep_len = self.concat_sep_lens.pop_front().unwrap_or(0);
+                let remove_bytes = (val_len + sep_len).min(self.concat_buf.len());
+                self.concat_buf.drain(..remove_bytes);
+            }
+            AggregateKind::Min | AggregateKind::Max => {
+                return Err(SqliteError::misuse(
+                    "min/max accumulator does not support inverse",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads the current window value without consuming or resetting accumulator state (`xValue`).
+    pub fn value(&self) -> Result<Value> {
         match self.kind {
             AggregateKind::CountStar | AggregateKind::Count => Ok(Value::Integer(self.count)),
             AggregateKind::Sum => {
                 if self.count == 0 {
                     return Ok(Value::Null);
                 }
-                if self.has_float {
-                    Ok(Value::real((self.int_sum as f64) + self.float_sum))
+                if self.sum_ctx.approx {
+                    if self.sum_ctx.ovrfl {
+                        Err(SqliteError::new(ErrorCode::Mismatch, "integer overflow"))
+                    } else {
+                        Ok(Value::real(self.sum_ctx.combined_f64()))
+                    }
                 } else {
-                    i64::try_from(self.int_sum)
-                        .map(Value::Integer)
-                        .map_err(|_| SqliteError::new(ErrorCode::Mismatch, "integer overflow"))
+                    Ok(Value::Integer(self.sum_ctx.i_sum))
                 }
             }
             AggregateKind::Total => {
-                // In SQLite, TOTAL() of empty set returns 0.0 (never NULL!)
-                Ok(Value::real((self.int_sum as f64) + self.float_sum))
+                if self.count == 0 && !self.sum_ctx.approx {
+                    Ok(Value::Real(0.0))
+                } else {
+                    Ok(Value::real(self.sum_ctx.combined_f64()))
+                }
             }
             AggregateKind::Avg => {
                 if self.count == 0 {
                     Ok(Value::Null)
                 } else {
-                    let sum = (self.int_sum as f64) + self.float_sum;
-                    Ok(Value::real(sum / (self.count as f64)))
+                    Ok(Value::real(
+                        self.sum_ctx.combined_f64() / (self.count as f64),
+                    ))
                 }
             }
             AggregateKind::Min | AggregateKind::Max => Ok(self.best.clone().unwrap_or(Value::Null)),
             AggregateKind::GroupConcat => {
-                Ok(self.concat_buf.clone().map_or(Value::Null, Value::Text))
+                if self.concat_count == 0 {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Text(self.concat_buf.clone()))
+                }
             }
         }
+    }
+
+    pub fn finalize(&self) -> Result<Value> {
+        self.value()
+    }
+}
+
+/// Reusable table of open built-in [`AggregateAccumulator`] instances backing
+/// [`sqliters_types::ExecutionServices`] (`agg_open`, `agg_step`, `agg_value`, `agg_inverse`, `agg_finalize`).
+#[derive(Debug, Default, Clone)]
+pub struct AccumulatorTable {
+    slots: Vec<Option<(String, FunctionFlags, AggregateAccumulator)>>,
+}
+
+impl AccumulatorTable {
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn open(
+        &mut self,
+        name: &str,
+        arity: usize,
+        distinct: bool,
+        collation: Collation,
+        encoding: TextEncoding,
+    ) -> Result<AggregateStepId> {
+        let upper = name.to_ascii_uppercase();
+        let kind = match (upper.as_str(), arity) {
+            ("COUNT", 0) => AggregateKind::CountStar,
+            ("COUNT", 1) => AggregateKind::Count,
+            ("SUM", 1) => AggregateKind::Sum,
+            ("TOTAL", 1) => AggregateKind::Total,
+            ("AVG", 1) => AggregateKind::Avg,
+            ("MIN", 1) => AggregateKind::Min,
+            ("MAX", 1) => AggregateKind::Max,
+            ("GROUP_CONCAT", 1 | 2) | ("STRING_AGG", 2) => AggregateKind::GroupConcat,
+            (
+                "COUNT" | "SUM" | "TOTAL" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "STRING_AGG",
+                _,
+            ) => {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("wrong number of arguments to function {name}()"),
+                ));
+            }
+            _ => {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such function: {name}"),
+                ));
+            }
+        };
+        let acc = AggregateAccumulator::new_with_collation(kind, distinct, collation)
+            .with_encoding(encoding);
+        let flags = FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS;
+        let entry = (name.to_ascii_lowercase(), flags, acc);
+        if let Some((idx, slot)) = self.slots.iter_mut().enumerate().find(|(_, s)| s.is_none()) {
+            *slot = Some(entry);
+            Ok(AggregateStepId(idx))
+        } else {
+            let idx = self.slots.len();
+            self.slots.push(Some(entry));
+            Ok(AggregateStepId(idx))
+        }
+    }
+
+    #[inline]
+    pub fn supports_inverse(&self, id: AggregateStepId) -> bool {
+        self.slots
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .is_some_and(|(_, _, acc)| acc.supports_inverse())
+    }
+
+    pub fn step(&mut self, id: AggregateStepId, args: &[RuntimeValue]) -> Result<()> {
+        let Some(Some((_, flags, acc))) = self.slots.get_mut(id.0) else {
+            return Err(SqliteError::misuse(
+                "aggregate step on unopened accumulator",
+            ));
+        };
+        let mut scratch = Vec::new();
+        let filtered = strip_unsubscribed_subtypes(*flags, args, &mut scratch);
+        let plain: Vec<Value> = filtered.iter().map(|rv| rv.value.clone()).collect();
+        acc.step(&plain)
+    }
+
+    pub fn value(&self, id: AggregateStepId, strict_subtype: bool) -> Result<RuntimeValue> {
+        let Some(Some((name, flags, acc))) = self.slots.get(id.0) else {
+            return Err(SqliteError::misuse(
+                "aggregate value on unopened accumulator",
+            ));
+        };
+        let rv = RuntimeValue::plain(acc.value()?);
+        enforce_result_subtype_contract(name, *flags, strict_subtype, rv)
+    }
+
+    pub fn inverse(&mut self, id: AggregateStepId, args: &[RuntimeValue]) -> Result<()> {
+        let Some(Some((_, flags, acc))) = self.slots.get_mut(id.0) else {
+            return Err(SqliteError::misuse(
+                "aggregate inverse on unopened accumulator",
+            ));
+        };
+        let mut scratch = Vec::new();
+        let filtered = strip_unsubscribed_subtypes(*flags, args, &mut scratch);
+        let plain: Vec<Value> = filtered.iter().map(|rv| rv.value.clone()).collect();
+        acc.inverse(&plain)
+    }
+
+    pub fn finalize(&mut self, id: AggregateStepId, strict_subtype: bool) -> Result<RuntimeValue> {
+        let Some(slot) = self.slots.get_mut(id.0) else {
+            return Err(SqliteError::misuse(
+                "aggregate finalize on unopened accumulator",
+            ));
+        };
+        let Some((name, flags, acc)) = slot.take() else {
+            return Err(SqliteError::misuse(
+                "aggregate finalize on unopened accumulator",
+            ));
+        };
+        let rv = RuntimeValue::plain(acc.finalize()?);
+        enforce_result_subtype_contract(&name, flags, strict_subtype, rv)
     }
 }

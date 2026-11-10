@@ -11,17 +11,17 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use sqliters_btree::{Btree, CursorId};
 use sqliters_types::{
-    Collation, DatabaseId, ErrorCode, ExecutionServices, KeySortOrder, Pgno, Result, RuntimeValue,
-    SqliteError, TextEncoding, TypeAffinity, Value, decode_record_with_encoding,
-    encode_record_with_encoding,
+    AggregateStepId, Collation, DatabaseId, ErrorCode, ExecutionServices, KeySortOrder, Pgno,
+    Result, RuntimeValue, SqliteError, TextEncoding, TypeAffinity, Value,
+    decode_record_with_encoding, encode_record_with_encoding,
 };
 
 pub use functions::{
-    AggregateAccumulator, AggregateKind, TestFunctionsScope, VmRuntimeContext,
-    builtin_scalar_flags, eval_scalar_function, eval_scalar_function_rt,
+    AccumulatorTable, AggregateAccumulator, AggregateKind, TestFunctionsScope, VmRuntimeContext,
+    builtin_scalar_flags, builtin_window_arity, eval_scalar_function, eval_scalar_function_rt,
     eval_scalar_function_rt_with_strict, format_utc_date, format_utc_time, format_utc_timestamp,
-    parse_escape_char, sqlite_glob_match, sqlite_like_match, system_utc_millis,
-    utc_ymdhms_from_unix_ms, validate_function_call,
+    is_builtin_window_only_function, parse_escape_char, sqlite_glob_match, sqlite_like_match,
+    system_utc_millis, utc_ymdhms_from_unix_ms, validate_function_call,
 };
 pub use storage_api::BtreeAccess;
 
@@ -34,6 +34,7 @@ pub struct DefaultVmServices {
     pub interrupt_flag: Option<Arc<AtomicBool>>,
     pub progress_ticks: u64,
     pub strict_subtype: bool,
+    pub accumulators: AccumulatorTable,
 }
 
 impl Default for DefaultVmServices {
@@ -50,6 +51,7 @@ impl DefaultVmServices {
             interrupt_flag: None,
             progress_ticks: 0,
             strict_subtype: true,
+            accumulators: AccumulatorTable::new(),
         }
     }
 
@@ -104,6 +106,48 @@ impl ExecutionServices for DefaultVmServices {
     #[inline]
     fn strict_subtype(&self) -> bool {
         self.strict_subtype
+    }
+
+    fn agg_open(&mut self, name: &str, arity: usize) -> Result<AggregateStepId> {
+        self.accumulators
+            .open(name, arity, false, Collation::Binary, self.encoding)
+    }
+
+    fn agg_open_collated(
+        &mut self,
+        name: &str,
+        arity: usize,
+        distinct: bool,
+        collation_name: &str,
+    ) -> Result<AggregateStepId> {
+        let coll = Collation::from_name(collation_name).ok_or_else(|| {
+            SqliteError::new(
+                ErrorCode::Error,
+                format!("no such collation sequence: {collation_name}"),
+            )
+        })?;
+        self.accumulators
+            .open(name, arity, distinct, coll, self.encoding)
+    }
+
+    fn agg_supports_inverse(&self, id: AggregateStepId) -> bool {
+        self.accumulators.supports_inverse(id)
+    }
+
+    fn agg_step(&mut self, id: AggregateStepId, args: &[RuntimeValue]) -> Result<()> {
+        self.accumulators.step(id, args)
+    }
+
+    fn agg_value(&mut self, id: AggregateStepId) -> Result<RuntimeValue> {
+        self.accumulators.value(id, self.strict_subtype)
+    }
+
+    fn agg_inverse(&mut self, id: AggregateStepId, args: &[RuntimeValue]) -> Result<()> {
+        self.accumulators.inverse(id, args)
+    }
+
+    fn agg_finalize(&mut self, id: AggregateStepId) -> Result<RuntimeValue> {
+        self.accumulators.finalize(id, self.strict_subtype)
     }
 }
 

@@ -20,9 +20,9 @@ use sqliters_syntax::{
     IndexedColumn, InsertSource, InsertStmt, JoinClause, JoinConstraint, JoinType, LikeOp,
     LimitClause, OrderByTerm, PragmaValue, QualifiedName, RaiseAction, ResultColumn, SelectBody,
     SelectCore, SelectStmt, SetAssignment, Stmt, TableOrSubquery, Token, TokenKind, TokenSpan,
-    TriggerEvent, TriggerStep, TriggerTiming, UnaryOp, UpdateStmt, UpsertAction, apply_span_edits,
-    dequote, keyword_kind, parse_one, parse_one_with_spans,
-    remove_column_def_from_create_table_sql, tokenize,
+    TriggerEvent, TriggerStep, TriggerTiming, UnaryOp, UpdateStmt, UpsertAction, WindowFrame,
+    WindowFrameBound, WindowRef, WindowSpec, apply_span_edits, dequote, keyword_kind, parse_one,
+    parse_one_with_spans, remove_column_def_from_create_table_sql, tokenize,
 };
 use sqliters_types::{
     Collation, ConflictResolutionEffect, DatabaseId, DatabaseKind, ErrorCode, ExecutionServices,
@@ -30,10 +30,11 @@ use sqliters_types::{
     decode_record_with_encoding, encode_record_with_encoding, extended,
 };
 use sqliters_vdbe::{
-    AggregateAccumulator, AggregateKind, Opcode, VmRuntimeContext, eval_cast_rt_with_encoding,
-    eval_comparison_with_affinity, eval_comparison_with_encoding, eval_comparison_with_services,
-    eval_unary_negate, format_utc_date, format_utc_time, format_utc_timestamp, parse_escape_char,
-    sqlite_compare_affinity, sqlite_glob_match, sqlite_like_match,
+    AggregateAccumulator, AggregateKind, Opcode, VmRuntimeContext, builtin_window_arity,
+    eval_cast_rt_with_encoding, eval_comparison_with_affinity, eval_comparison_with_encoding,
+    eval_comparison_with_services, eval_unary_negate, format_utc_date, format_utc_time,
+    format_utc_timestamp, parse_escape_char, sqlite_compare_affinity, sqlite_glob_match,
+    sqlite_like_match,
 };
 use sqliters_vfs::{MemoryVfs, OpenFlags, OsVfs, Vfs};
 
@@ -61,6 +62,13 @@ use crate::trigger::{
     reject_raise_outside_trigger_expr, reject_raise_outside_trigger_select,
     replace_bind_params_with_null_in_trigger, resolve_and_validate_create_trigger,
     validate_trigger_body_dml_targets,
+};
+use crate::window::{
+    ResolvedWindowSpec, WIN_SLOT_SCHEMA, WindowExecItem, chain_window_definitions,
+    check_aliased_window_misuse, classify_and_validate_window_fn, collect_and_rewrite_window_calls,
+    core_has_regular_aggregates, core_has_window, execute_window_pipeline, expr_contains_window,
+    finalize_window_spec_for_fn, first_window_function_name_in_expr, is_window_bound_constant,
+    resolve_over_clause,
 };
 
 /// Materialized result set (`column_names` + `rows`) produced by executing a statement.
@@ -1338,7 +1346,7 @@ pub(crate) fn classify_stmt_category(stmt: &Stmt) -> StmtCategory {
 }
 
 #[derive(Debug, Clone)]
-struct ScopedColumn {
+pub(crate) struct ScopedColumn {
     schema_name: Option<String>,
     table_alias: Option<String>,
     name: String,
@@ -1373,9 +1381,13 @@ impl ScopedColumn {
 }
 
 #[derive(Debug, Clone)]
-struct EvalRow {
+pub(crate) struct EvalRow {
     cols: Rc<[ScopedColumn]>,
     vals: Vec<Value>,
+    /// Precomputed window function outputs for `WIN_SLOT_SCHEMA` slots on this row.
+    pub(crate) win_vals: Rc<[RuntimeValue]>,
+    /// Active group rows when this scope represents an aggregated `SELECT` (`SF_Aggregate`).
+    pub(crate) agg_group_rows: Option<Rc<[EvalRow]>>,
     /// When `true` (e.g. `UPSERT` virtual `excluded` scope), only unqualified-schema `table.col`
     /// lookups match (`col` and `schema.table.col` do not match).
     qualified_only: bool,
@@ -1386,6 +1398,8 @@ impl Default for EvalRow {
         Self {
             cols: Rc::from([]),
             vals: Vec::new(),
+            win_vals: Rc::from([]),
+            agg_group_rows: None,
             qualified_only: false,
         }
     }
@@ -1399,6 +1413,8 @@ impl EvalRow {
         Self {
             cols,
             vals,
+            win_vals: Rc::from([]),
+            agg_group_rows: None,
             qualified_only: false,
         }
     }
@@ -1554,7 +1570,7 @@ type RuntimeViewCache = Rc<
 type CatalogRefMap = Rc<RefCell<HashMap<(DatabaseId, String), usize>>>;
 
 #[derive(Clone, Default)]
-struct CteStore {
+pub(crate) struct CteStore {
     /// Lexical stack of `WITH` scopes (`(scope_idx, cte_idx)`).
     scopes: Vec<Vec<CommonTableExpr>>,
     /// Per-scope materialization caches parallel to `scopes`.
@@ -2696,11 +2712,15 @@ fn exec_select(
             selection,
             group_by,
             having: None,
+            windows,
         } = &stmt.body.head
         && group_by.is_empty()
+        && windows.is_empty()
         && fc.joins.is_empty()
         && !projection.iter().any(|rc| match rc {
-            ResultColumn::Expr { expr, .. } => expr_contains_aggregate(expr),
+            ResultColumn::Expr { expr, .. } => {
+                expr_contains_aggregate(expr) || expr_contains_window(expr)
+            }
             _ => false,
         })
         && let TableOrSubquery::Table {
@@ -2745,8 +2765,10 @@ fn exec_select(
             selection: None,
             group_by,
             having: None,
+            windows,
         } = &stmt.body.head
         && group_by.is_empty()
+        && windows.is_empty()
         && fc.joins.is_empty()
         && projection.len() == 1
         && let ResultColumn::Expr {
@@ -2756,6 +2778,7 @@ fn exec_select(
                     distinct: false,
                     args: FunctionArgs::Star,
                     filter: None,
+                    over: None,
                 },
             alias: col_alias,
             span_text,
@@ -2864,6 +2887,7 @@ fn count_table_refs_in_core(core: &SelectCore, target: &str) -> usize {
             selection,
             group_by,
             having,
+            windows,
             ..
         } => {
             let mut n = 0;
@@ -2890,9 +2914,30 @@ fn count_table_refs_in_core(core: &SelectCore, target: &str) -> usize {
             if let Some(h) = having {
                 n += count_table_refs_in_expr(h, target);
             }
+            for (_, ws) in windows {
+                n += count_table_refs_in_window_spec(ws, target);
+            }
             n
         }
     }
+}
+
+fn count_table_refs_in_window_spec(ws: &WindowSpec, target: &str) -> usize {
+    let mut n = 0;
+    for pe in &ws.partition_by {
+        n += count_table_refs_in_expr(pe, target);
+    }
+    for ob in &ws.order_by {
+        n += count_table_refs_in_expr(&ob.expr, target);
+    }
+    if let Some(ref wf) = ws.frame {
+        for b in [&wf.start, &wf.end] {
+            if let WindowFrameBound::Preceding(be) | WindowFrameBound::Following(be) = b {
+                n += count_table_refs_in_expr(be, target);
+            }
+        }
+    }
+    n
 }
 
 fn count_table_refs_in_tos(tos: &TableOrSubquery, target: &str) -> usize {
@@ -2965,17 +3010,24 @@ fn count_table_refs_in_expr(expr: &Expr, target: &str) -> usize {
                     .as_ref()
                     .map_or(0, |el| count_table_refs_in_expr(el, target))
         }
-        Expr::FunctionCall { args, filter, .. } => {
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
             let a_cnt = match args {
                 FunctionArgs::Star => 0,
                 FunctionArgs::Exprs(es) => {
                     es.iter().map(|e| count_table_refs_in_expr(e, target)).sum()
                 }
             };
+            let o_cnt = match over {
+                Some(WindowRef::Spec(ws)) => count_table_refs_in_window_spec(ws, target),
+                _ => 0,
+            };
             a_cnt
                 + filter
                     .as_ref()
                     .map_or(0, |f| count_table_refs_in_expr(f, target))
+                + o_cnt
         }
         Expr::Subquery(sub) | Expr::Exists { subquery: sub, .. } => {
             count_table_refs_in_select(sub, target)
@@ -3076,16 +3128,27 @@ fn check_recursive_arm_no_aggregates(rec_core: &SelectCore) -> Result<()> {
         selection,
         group_by,
         having,
+        windows,
         ..
     } = rec_core
     {
-        let has_agg = !group_by.is_empty()
-            || having.is_some()
+        if !windows.is_empty()
             || projection.iter().any(|rc| match rc {
-                ResultColumn::Expr { expr, .. } => expr_contains_aggregate(expr),
+                ResultColumn::Expr { expr, .. } => expr_contains_window(expr),
                 _ => false,
             })
-            || selection.as_ref().is_some_and(expr_contains_aggregate);
+        {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                "cannot use window functions in recursive queries",
+            ));
+        }
+        let has_agg = !group_by.is_empty()
+            || having.is_some()
+            || core_has_regular_aggregates(rec_core, &[])
+            || selection
+                .as_ref()
+                .is_some_and(|w| expr_contains_aggregate(w) && !expr_contains_window(w));
         if has_agg {
             return Err(SqliteError::new(
                 ErrorCode::Error,
@@ -3656,7 +3719,12 @@ fn exec_compound_select(
                 acc_rows.extend(rhs_out.rows);
                 acc_rows.sort_by(|a, b| compare_value_slices(a, b, &default_specs, enc));
                 acc_rows.dedup_by(|a, b| {
-                    compare_value_slices(a, b, &default_specs, enc) == Ordering::Equal
+                    if compare_value_slices(a, b, &default_specs, enc) == Ordering::Equal {
+                        *b = std::mem::take(a);
+                        true
+                    } else {
+                        false
+                    }
                 });
             }
             CompoundOp::Intersect => {
@@ -3710,8 +3778,24 @@ fn exec_compound_select(
 }
 
 fn strip_collate_and_unary_plus(mut e: &Expr) -> Option<i64> {
-    while let Expr::Collate { expr, .. } = e {
-        e = expr;
+    loop {
+        match e {
+            Expr::Collate { expr, .. } => e = expr,
+            Expr::FunctionCall {
+                name,
+                distinct: false,
+                args: FunctionArgs::Exprs(es),
+                filter: None,
+                over: None,
+            } if !es.is_empty()
+                && (name.eq_ignore_ascii_case("LIKELY")
+                    || name.eq_ignore_ascii_case("UNLIKELY")
+                    || name.eq_ignore_ascii_case("LIKELIHOOD")) =>
+            {
+                e = &es[0];
+            }
+            _ => break,
+        }
     }
     match e {
         Expr::Integer(i) => Some(*i),
@@ -3766,8 +3850,41 @@ fn exec_single_select_core(
                     ));
                 }
                 let mut vals = Vec::with_capacity(width);
-                for e in erow {
-                    vals.push(eval_expr(ctx, e, params, outer_scopes, ctes, None)?);
+                if erow.iter().any(expr_contains_window) {
+                    let mut win_calls = Vec::new();
+                    let mut rewritten_row = Vec::with_capacity(width);
+                    for e in erow {
+                        rewritten_row.push(collect_and_rewrite_window_calls(
+                            e,
+                            &[],
+                            ctx.functions,
+                            None,
+                            &mut win_calls,
+                        )?);
+                    }
+                    let mut items = vec![WindowExecItem {
+                        row: EvalRow::default(),
+                        group_rows: None,
+                        win_vals: Vec::new(),
+                    }];
+                    execute_window_pipeline(
+                        ctx,
+                        &mut items,
+                        &win_calls,
+                        &[],
+                        params,
+                        outer_scopes,
+                        ctes,
+                    )?;
+                    let row_eval = items.pop().unwrap().row;
+                    let scopes = push_scope(outer_scopes, &row_eval);
+                    for re in &rewritten_row {
+                        vals.push(eval_expr(ctx, re, params, &scopes, ctes, None)?);
+                    }
+                } else {
+                    for e in erow {
+                        vals.push(eval_expr(ctx, e, params, outer_scopes, ctes, None)?);
+                    }
                 }
                 rows.push(vals);
             }
@@ -3796,12 +3913,26 @@ fn exec_single_select_core(
             selection,
             group_by,
             having,
+            windows,
         } => {
+            let resolved_defs = chain_window_definitions(windows)?;
             let has_proj_aliases = projection
                 .iter()
                 .any(|rc| matches!(rc, ResultColumn::Expr { alias: Some(_), .. }));
+            let has_win_proj_aliases = projection.iter().any(|rc| {
+                matches!(
+                    rc,
+                    ResultColumn::Expr {
+                        expr,
+                        alias: Some(_),
+                        ..
+                    } if expr_contains_window(expr)
+                )
+            });
             let pre_where_selection: Option<Expr> = if let Some(where_expr) = selection {
-                if has_proj_aliases {
+                if has_win_proj_aliases {
+                    None
+                } else if has_proj_aliases {
                     let preview_cols = from
                         .as_ref()
                         .and_then(|fc| {
@@ -3866,6 +3997,56 @@ fn exec_single_select_core(
                 ));
             }
 
+            let window_aliases: Vec<String> = projection
+                .iter()
+                .filter_map(|rc| match rc {
+                    ResultColumn::Expr {
+                        expr,
+                        alias: Some(a),
+                        ..
+                    } if expr_contains_window(expr) => Some(a.clone()),
+                    _ => None,
+                })
+                .collect();
+            if !window_aliases.is_empty() {
+                if let Some(where_expr) = selection {
+                    check_aliased_window_misuse(
+                        where_expr,
+                        &window_aliases,
+                        &sample_cols,
+                        false,
+                        ctx.functions,
+                    )?;
+                }
+                for ge in group_by {
+                    check_aliased_window_misuse(
+                        ge,
+                        &window_aliases,
+                        &sample_cols,
+                        false,
+                        ctx.functions,
+                    )?;
+                }
+                if let Some(hav) = having {
+                    check_aliased_window_misuse(
+                        hav,
+                        &window_aliases,
+                        &sample_cols,
+                        false,
+                        ctx.functions,
+                    )?;
+                }
+                for ob in order_by {
+                    check_aliased_window_misuse(
+                        &ob.expr,
+                        &window_aliases,
+                        &sample_cols,
+                        true,
+                        ctx.functions,
+                    )?;
+                }
+            }
+
             let resolved_where = selection.as_ref().map(|where_expr| {
                 subst_select_aliases_in_expr_with_ctes(
                     where_expr,
@@ -3891,14 +4072,17 @@ fn exec_single_select_core(
                 filtered = source_rows;
             }
 
-            // 3. Determine whether query is aggregated
-            let is_agg = !group_by.is_empty()
-                || having.is_some()
-                || projection.iter().any(|rc| match rc {
-                    ResultColumn::Expr { expr, .. } => expr_contains_aggregate(expr),
-                    _ => false,
-                })
-                || order_by.iter().any(|ob| expr_contains_aggregate(&ob.expr));
+            // 3. Determine whether query is aggregated / windowed
+            let has_win = core_has_window(core, order_by);
+            let is_agg = core_is_aggregate_in_scope(
+                core,
+                if has_win { &[] } else { order_by },
+                &sample_cols,
+                outer_scopes,
+                ctx.db_set,
+                ctes,
+                ctx.functions,
+            );
 
             // Validate & resolve GROUP BY / ORDER BY integer ordinals (1..=N) & SELECT aliases
             let mut resolved_group_by = Vec::with_capacity(group_by.len());
@@ -3959,7 +4143,156 @@ fn exec_single_select_core(
 
             let mut result_rows_with_sort: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
 
-            if is_agg {
+            if has_win {
+                let mut win_calls = Vec::new();
+                let mut rewritten_proj = Vec::with_capacity(expanded_proj.len());
+                for (pe, label, al) in &expanded_proj {
+                    let rpe = collect_and_rewrite_window_calls(
+                        pe,
+                        &resolved_defs,
+                        ctx.functions,
+                        None,
+                        &mut win_calls,
+                    )?;
+                    rewritten_proj.push((rpe, label.clone(), al.clone()));
+                }
+                let non_win_aliases: Vec<(String, Expr)> = expanded_proj
+                    .iter()
+                    .filter_map(|(pe, _, al)| {
+                        let alias = al.as_ref()?;
+                        if col_in_scoped_cols(alias, &sample_cols) || expr_contains_window(pe) {
+                            None
+                        } else {
+                            Some((alias.clone(), pe.clone()))
+                        }
+                    })
+                    .collect();
+                let subst_fn =
+                    |e: &Expr| subst_active_aliases_in_expr(e, &non_win_aliases, ctx.db_set, ctes);
+                let mut rewritten_ob = Vec::with_capacity(order_by.len());
+                for ob in order_by {
+                    let rob = collect_and_rewrite_window_calls(
+                        &ob.expr,
+                        &resolved_defs,
+                        ctx.functions,
+                        Some(&subst_fn),
+                        &mut win_calls,
+                    )?;
+                    rewritten_ob.push(rob);
+                }
+
+                let mut win_items: Vec<WindowExecItem> = Vec::new();
+                if is_agg {
+                    let mut minmax_specs: Vec<(AggregateKind, Expr, Option<Expr>, Collation)> =
+                        Vec::new();
+                    for (pe, _, _) in &expanded_proj {
+                        collect_minmax_aggregates(pe, &sample_cols, &mut minmax_specs);
+                    }
+                    if minmax_specs.is_empty() {
+                        if let Some(ref hav) = resolved_having {
+                            collect_minmax_aggregates(hav, &sample_cols, &mut minmax_specs);
+                        }
+                        for ob in order_by {
+                            collect_minmax_aggregates(&ob.expr, &sample_cols, &mut minmax_specs);
+                        }
+                        for wc in &win_calls {
+                            for pe in &wc.spec.partition_by {
+                                collect_minmax_aggregates(pe, &sample_cols, &mut minmax_specs);
+                            }
+                            for ob in &wc.spec.order_by {
+                                collect_minmax_aggregates(
+                                    &ob.expr,
+                                    &sample_cols,
+                                    &mut minmax_specs,
+                                );
+                            }
+                        }
+                    }
+
+                    let groups = build_groups(
+                        ctx,
+                        filtered,
+                        &resolved_group_by,
+                        params,
+                        outer_scopes,
+                        ctes,
+                    )?;
+                    for group_rows in groups {
+                        let mut rep_row = choose_aggregate_representative_row(
+                            ctx,
+                            &group_rows,
+                            &sample_cols,
+                            &minmax_specs,
+                            params,
+                            outer_scopes,
+                            ctes,
+                        )?;
+                        rep_row.agg_group_rows = Some(Rc::from(group_rows.as_slice()));
+                        let scopes = push_scope(outer_scopes, &rep_row);
+                        if let Some(ref hav) = resolved_having {
+                            let hv = eval_expr(
+                                ctx,
+                                hav,
+                                params,
+                                &scopes,
+                                ctes,
+                                Some((&group_rows, outer_scopes)),
+                            )?;
+                            if hv.truthiness() != Some(true) {
+                                continue;
+                            }
+                        }
+                        win_items.push(WindowExecItem {
+                            row: rep_row,
+                            group_rows: Some(group_rows),
+                            win_vals: Vec::new(),
+                        });
+                    }
+                } else {
+                    for row in filtered {
+                        win_items.push(WindowExecItem {
+                            row,
+                            group_rows: None,
+                            win_vals: Vec::new(),
+                        });
+                    }
+                }
+
+                execute_window_pipeline(
+                    ctx,
+                    &mut win_items,
+                    &win_calls,
+                    &sample_cols,
+                    params,
+                    outer_scopes,
+                    ctes,
+                )?;
+
+                for item in win_items {
+                    ctx.step_tick()?;
+                    let scopes = push_scope(outer_scopes, &item.row);
+                    let agg_ctx = item.group_rows.as_deref().map(|gr| (gr, outer_scopes));
+                    let mut out_vals = Vec::with_capacity(rewritten_proj.len());
+                    for (pe, _, _) in &rewritten_proj {
+                        out_vals.push(eval_expr(ctx, pe, params, &scopes, ctes, agg_ctx)?);
+                    }
+                    let mut sort_vals = Vec::with_capacity(order_by.len());
+                    for (ob_idx, _ob) in order_by.iter().enumerate() {
+                        let sv = eval_order_term_in_scope(
+                            ctx,
+                            &rewritten_ob[ob_idx],
+                            &out_vals,
+                            &rewritten_proj,
+                            &scopes,
+                            params,
+                            ctes,
+                            agg_ctx,
+                        )?;
+                        sort_vals.push(sv);
+                    }
+                    result_rows_with_sort.push((out_vals, sort_vals));
+                }
+            } else if is_agg {
                 let mut minmax_specs: Vec<(AggregateKind, Expr, Option<Expr>, Collation)> =
                     Vec::new();
                 for (pe, _, _) in &expanded_proj {
@@ -3983,7 +4316,7 @@ fn exec_single_select_core(
                     ctes,
                 )?;
                 for group_rows in groups {
-                    let rep_row = choose_aggregate_representative_row(
+                    let mut rep_row = choose_aggregate_representative_row(
                         ctx,
                         &group_rows,
                         &sample_cols,
@@ -3992,6 +4325,7 @@ fn exec_single_select_core(
                         outer_scopes,
                         ctes,
                     )?;
+                    rep_row.agg_group_rows = Some(Rc::from(group_rows.as_slice()));
                     let scopes = push_scope(outer_scopes, &rep_row);
                     if let Some(ref hav) = resolved_having {
                         let hv = eval_expr(
@@ -4228,6 +4562,7 @@ fn collect_minmax_aggregates(
             distinct: _,
             args: FunctionArgs::Exprs(es),
             filter,
+            over: None,
         } if es.len() == 1
             && (name.eq_ignore_ascii_case("MIN") || name.eq_ignore_ascii_case("MAX")) =>
         {
@@ -4240,16 +4575,24 @@ fn collect_minmax_aggregates(
             out.push((kind, es[0].clone(), filter.as_deref().cloned(), coll));
         }
         Expr::FunctionCall {
-            args: FunctionArgs::Exprs(es),
-            filter,
-            ..
+            args, filter, over, ..
         } => {
-            if !expr_contains_aggregate(expr) {
-                for a in es {
-                    collect_minmax_aggregates(a, sample_cols, out);
+            if over.is_some() || !expr_contains_aggregate(expr) {
+                if let FunctionArgs::Exprs(es) = args {
+                    for a in es {
+                        collect_minmax_aggregates(a, sample_cols, out);
+                    }
                 }
                 if let Some(f) = filter {
                     collect_minmax_aggregates(f, sample_cols, out);
+                }
+                if let Some(WindowRef::Spec(ws)) = over {
+                    for pe in &ws.partition_by {
+                        collect_minmax_aggregates(pe, sample_cols, out);
+                    }
+                    for ob in &ws.order_by {
+                        collect_minmax_aggregates(&ob.expr, sample_cols, out);
+                    }
                 }
             }
         }
@@ -4522,8 +4865,10 @@ fn expr_can_eval_with_cols(
                     expr_can_eval_with_cols(esc, avail_cols, full_scope_cols, outer_scopes)
                 })
         }
-        Expr::FunctionCall { args, filter, .. } => {
-            if expr_contains_aggregate(expr) || filter.is_some() {
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
+            if over.is_some() || expr_contains_aggregate(expr) || filter.is_some() {
                 return false;
             }
             match args {
@@ -4648,18 +4993,42 @@ fn eval_from_clause(
             }
         }
 
-        left_rows = apply_join(
-            ctx,
-            left_rows,
-            right_rows,
-            &left_cols_fallback,
-            &right_cols_fallback,
-            join,
-            &in_join_where_conjuncts,
-            params,
-            outer_scopes,
-            ctes,
-        )?;
+        let head_is_filtered_view = j_idx == 0
+            && fc.joins.len() == 1
+            && !join.natural
+            && matches!(join.join_type, JoinType::Inner | JoinType::Cross)
+            && join.constraint.is_none()
+            && in_join_where_conjuncts.is_empty()
+            && applied.iter().any(|&a| a)
+            && matches!(&fc.head, TableOrSubquery::Table { name, .. } if ctx.db_set.resolve_catalog_table(name).ok().flatten().is_none() && ctx.db_set.find_view_in_set(name).is_some())
+            && matches!(&join.right, TableOrSubquery::Table { name, .. } if ctx.db_set.resolve_catalog_table(name).ok().flatten().is_some() || ctx.db_set.find_view_in_set(name).is_none());
+
+        if head_is_filtered_view {
+            let shared_cols: Rc<[ScopedColumn]> = Rc::from(next_merged_cols.as_slice());
+            let mut out = Vec::with_capacity(left_rows.len() * right_rows.len());
+            for r in &right_rows {
+                for l in &left_rows {
+                    let mut vals = Vec::with_capacity(next_merged_cols.len());
+                    vals.extend_from_slice(&l.vals);
+                    vals.extend_from_slice(&r.vals);
+                    out.push(EvalRow::new(shared_cols.clone(), vals));
+                }
+            }
+            left_rows = out;
+        } else {
+            left_rows = apply_join(
+                ctx,
+                left_rows,
+                right_rows,
+                &left_cols_fallback,
+                &right_cols_fallback,
+                join,
+                &in_join_where_conjuncts,
+                params,
+                outer_scopes,
+                ctes,
+            )?;
+        }
         left_cols_fallback = next_merged_cols;
 
         // Post-join WHERE pushdown whenever all remaining joins in `fc.joins[(j_idx + 1)..]`
@@ -5968,9 +6337,81 @@ fn build_groups(
     Ok(groups.into_iter().map(|(_, _, b)| b).collect())
 }
 
-fn infer_expr_collation_from_cols(expr: &Expr, sample_cols: &[ScopedColumn]) -> Collation {
+fn first_explicit_collate_in_expr(expr: &Expr) -> Option<&str> {
     match expr {
-        Expr::Collate { collation, .. } => Collation::from_name(collation).unwrap_or_default(),
+        Expr::Collate { collation, .. } => Some(collation.as_str()),
+        Expr::Unary { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => first_explicit_collate_in_expr(inner),
+        Expr::Binary { left, right, .. } => {
+            first_explicit_collate_in_expr(left).or_else(|| first_explicit_collate_in_expr(right))
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => first_explicit_collate_in_expr(e)
+            .or_else(|| first_explicit_collate_in_expr(low))
+            .or_else(|| first_explicit_collate_in_expr(high)),
+        Expr::InList { expr: e, list, .. } => first_explicit_collate_in_expr(e)
+            .or_else(|| list.iter().find_map(first_explicit_collate_in_expr)),
+        Expr::InTable { expr: e, .. } | Expr::InSubquery { expr: e, .. } => {
+            first_explicit_collate_in_expr(e)
+        }
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => first_explicit_collate_in_expr(e)
+            .or_else(|| first_explicit_collate_in_expr(pattern))
+            .or_else(|| escape.as_deref().and_then(first_explicit_collate_in_expr)),
+        Expr::FunctionCall { args, .. } => match args {
+            FunctionArgs::Star => None,
+            FunctionArgs::Exprs(es) => es.iter().find_map(first_explicit_collate_in_expr),
+        },
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => branches
+            .iter()
+            .find_map(|(w, t)| {
+                first_explicit_collate_in_expr(w).or_else(|| first_explicit_collate_in_expr(t))
+            })
+            .or_else(|| {
+                else_expr
+                    .as_deref()
+                    .and_then(first_explicit_collate_in_expr)
+            })
+            .or_else(|| operand.as_deref().and_then(first_explicit_collate_in_expr)),
+        Expr::RowValue(elems) => elems.iter().find_map(first_explicit_collate_in_expr),
+        _ => None,
+    }
+}
+
+pub(crate) fn infer_expr_collation_from_cols_pub(
+    expr: &Expr,
+    sample_cols: &[ScopedColumn],
+) -> Collation {
+    infer_expr_collation_from_cols(expr, sample_cols)
+}
+
+fn infer_expr_collation_from_cols(expr: &Expr, sample_cols: &[ScopedColumn]) -> Collation {
+    if let Some(cname) = first_explicit_collate_in_expr(expr) {
+        return Collation::from_name(cname).unwrap_or_default();
+    }
+    let mut cur = expr;
+    loop {
+        match cur {
+            Expr::Cast { expr: inner, .. }
+            | Expr::Unary {
+                op: UnaryOp::Plus,
+                expr: inner,
+            } => cur = inner,
+            Expr::RowValue(elems) if elems.len() == 1 => cur = &elems[0],
+            _ => break,
+        }
+    }
+    match cur {
         Expr::Column(cref) => {
             if cref.schema.as_deref() == Some(STAR_SLOT_SCHEMA) {
                 return cref
@@ -6297,6 +6738,7 @@ fn subst_order_by_aliases_in_expr(
             distinct,
             args,
             filter,
+            over,
         } => Expr::FunctionCall {
             name: name.clone(),
             distinct: *distinct,
@@ -6318,6 +6760,7 @@ fn subst_order_by_aliases_in_expr(
                     scopes,
                 ))
             }),
+            over: over.clone(),
         },
         Expr::RowValue(elems) => Expr::RowValue(
             elems
@@ -6510,6 +6953,10 @@ fn expr_contains_conjunct(haystack: &Expr, needle: &Expr) -> bool {
     false
 }
 
+pub(crate) fn col_in_scoped_cols_pub(column: &str, sample_cols: &[ScopedColumn]) -> bool {
+    col_in_scoped_cols(column, sample_cols)
+}
+
 fn col_in_scoped_cols(column: &str, sample_cols: &[ScopedColumn]) -> bool {
     sample_cols.iter().any(|sc| {
         if sc.hidden_rowid {
@@ -6679,6 +7126,7 @@ fn subst_active_aliases_in_core(
             selection,
             group_by,
             having,
+            windows,
         } => {
             let filtered = filter_aliases_for_core(core, active_aliases, db_set, ctes);
             let new_from = from.as_ref().map(|fc| FromClause {
@@ -6714,6 +7162,15 @@ fn subst_active_aliases_in_core(
                     other => other.clone(),
                 })
                 .collect();
+            let new_windows = windows
+                .iter()
+                .map(|(wn, ws)| {
+                    (
+                        wn.clone(),
+                        subst_active_aliases_in_window_spec(ws, &filtered, db_set, ctes),
+                    )
+                })
+                .collect();
             SelectCore::Select {
                 distinct: *distinct,
                 projection: new_proj,
@@ -6728,8 +7185,60 @@ fn subst_active_aliases_in_core(
                 having: having
                     .as_ref()
                     .map(|h| subst_active_aliases_in_expr(h, &filtered, db_set, ctes)),
+                windows: new_windows,
             }
         }
+    }
+}
+
+fn subst_active_aliases_in_window_spec(
+    ws: &WindowSpec,
+    active_aliases: &[(String, Expr)],
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+) -> WindowSpec {
+    if active_aliases.is_empty() {
+        return ws.clone();
+    }
+    WindowSpec {
+        base_window: ws.base_window.clone(),
+        partition_by: ws
+            .partition_by
+            .iter()
+            .map(|e| subst_active_aliases_in_expr(e, active_aliases, db_set, ctes))
+            .collect(),
+        order_by: ws
+            .order_by
+            .iter()
+            .map(|ob| OrderByTerm {
+                expr: subst_active_aliases_in_expr(&ob.expr, active_aliases, db_set, ctes),
+                desc: ob.desc,
+                nulls_last: ob.nulls_last,
+            })
+            .collect(),
+        frame: ws.frame.as_ref().map(|wf| WindowFrame {
+            units: wf.units,
+            start: subst_active_aliases_in_frame_bound(&wf.start, active_aliases, db_set, ctes),
+            end: subst_active_aliases_in_frame_bound(&wf.end, active_aliases, db_set, ctes),
+            exclude: wf.exclude,
+        }),
+    }
+}
+
+fn subst_active_aliases_in_frame_bound(
+    b: &WindowFrameBound,
+    active_aliases: &[(String, Expr)],
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+) -> WindowFrameBound {
+    match b {
+        WindowFrameBound::Preceding(e) => WindowFrameBound::Preceding(Box::new(
+            subst_active_aliases_in_expr(e, active_aliases, db_set, ctes),
+        )),
+        WindowFrameBound::Following(e) => WindowFrameBound::Following(Box::new(
+            subst_active_aliases_in_expr(e, active_aliases, db_set, ctes),
+        )),
+        other => other.clone(),
     }
 }
 
@@ -6958,6 +7467,7 @@ fn subst_active_aliases_in_expr(
             distinct,
             args,
             filter,
+            over,
         } => Expr::FunctionCall {
             name: name.clone(),
             distinct: *distinct,
@@ -6976,6 +7486,12 @@ fn subst_active_aliases_in_expr(
                     db_set,
                     ctes,
                 ))
+            }),
+            over: over.as_ref().map(|wref| match wref {
+                WindowRef::Name(wn) => WindowRef::Name(wn.clone()),
+                WindowRef::Spec(ws) => WindowRef::Spec(Box::new(
+                    subst_active_aliases_in_window_spec(ws, active_aliases, db_set, ctes),
+                )),
             }),
         },
         Expr::RowValue(elems) => Expr::RowValue(
@@ -7514,13 +8030,22 @@ fn infer_expr_explicit_or_col_collation(
     sample_cols: &[ScopedColumn],
     outer_scopes: &[EvalRow],
 ) -> Option<Collation> {
-    match expr {
-        Expr::Collate { collation, .. } => {
-            Some(Collation::from_name(collation).unwrap_or_default())
+    if let Some(cname) = first_explicit_collate_in_expr(expr) {
+        return Some(Collation::from_name(cname).unwrap_or_default());
+    }
+    let mut cur = expr;
+    loop {
+        match cur {
+            Expr::Cast { expr: inner, .. }
+            | Expr::Unary {
+                op: UnaryOp::Plus,
+                expr: inner,
+            } => cur = inner,
+            Expr::RowValue(elems) if elems.len() == 1 => cur = &elems[0],
+            _ => break,
         }
-        Expr::RowValue(elems) if elems.len() == 1 => {
-            infer_expr_explicit_or_col_collation(&elems[0], sample_cols, outer_scopes)
-        }
+    }
+    match cur {
         Expr::Column(cref) => {
             if cref.schema.as_deref() == Some(STAR_SLOT_SCHEMA) {
                 return cref
@@ -7642,6 +8167,10 @@ fn compare_single_value(va: &Value, vb: &Value, spec: KeySortOrder, enc: TextEnc
     }
 }
 
+pub(crate) fn push_scope_pub(outer: &[EvalRow], inner: &EvalRow) -> Vec<EvalRow> {
+    push_scope(outer, inner)
+}
+
 fn push_scope(outer: &[EvalRow], inner: &EvalRow) -> Vec<EvalRow> {
     let mut v = Vec::with_capacity(outer.len() + 1);
     v.extend_from_slice(outer);
@@ -7652,6 +8181,28 @@ fn push_scope(outer: &[EvalRow], inner: &EvalRow) -> Vec<EvalRow> {
 // ============================================================================
 // Expression Evaluator (`eval_expr_rt` / `eval_expr`)
 // ============================================================================
+
+pub(crate) fn eval_expr_pub(
+    ctx: &mut ExecContext<'_>,
+    expr: &Expr,
+    params: &[Value],
+    scopes: &[EvalRow],
+    ctes: &CteStore,
+    agg_group: Option<(&[EvalRow], &[EvalRow])>,
+) -> Result<Value> {
+    eval_expr(ctx, expr, params, scopes, ctes, agg_group)
+}
+
+pub(crate) fn eval_expr_rt_pub(
+    ctx: &mut ExecContext<'_>,
+    expr: &Expr,
+    params: &[Value],
+    scopes: &[EvalRow],
+    ctes: &CteStore,
+    agg_group: Option<(&[EvalRow], &[EvalRow])>,
+) -> Result<RuntimeValue> {
+    eval_expr_rt(ctx, expr, params, scopes, ctes, agg_group)
+}
 
 fn eval_expr(
     ctx: &mut ExecContext<'_>,
@@ -7703,6 +8254,15 @@ fn eval_expr_rt(
             ))
         }
         Expr::Column(cref) => {
+            if cref.schema.as_deref() == Some(WIN_SLOT_SCHEMA) {
+                if let Ok(idx) = cref.column.parse::<usize>()
+                    && let Some(last_scope) = scopes.last()
+                    && let Some(rv) = last_scope.win_vals.get(idx)
+                {
+                    return Ok(rv.clone());
+                }
+                return Ok(RuntimeValue::null());
+            }
             if cref.schema.as_deref() == Some(STAR_SLOT_SCHEMA) {
                 if let Some(last_scope) = scopes.last()
                     && let Some((val, _)) = last_scope.lookup_cref(cref)?
@@ -8338,7 +8898,32 @@ fn eval_expr_rt(
             distinct,
             args,
             filter,
+            over,
         } => {
+            if over.is_some() {
+                let (star_args, expr_list) = match args {
+                    FunctionArgs::Star => (true, &[][..]),
+                    FunctionArgs::Exprs(es) => (false, es.as_slice()),
+                };
+                let _ = classify_and_validate_window_fn(
+                    name,
+                    star_args,
+                    expr_list.len(),
+                    *distinct,
+                    ctx.functions,
+                )?;
+                for ae in expr_list {
+                    let _ = eval_expr_rt(ctx, ae, params, scopes, ctes, None)?;
+                }
+                if let Some(fe) = filter {
+                    let _ = eval_expr_rt(ctx, fe, params, scopes, ctes, None)?;
+                }
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("misuse of window function {name}()"),
+                ));
+            }
+
             // Check if this is an aggregate call (`count(*)` and 0-arg `count()` are both `CountStar`)
             let is_count_zero = name.eq_ignore_ascii_case("COUNT")
                 && matches!(args, FunctionArgs::Exprs(es) if es.is_empty())
@@ -8366,7 +8951,45 @@ fn eval_expr_rt(
                         "DISTINCT aggregates must have exactly one argument",
                     ));
                 }
-                let Some((group_rows, base_outer)) = agg_group else {
+                if let FunctionArgs::Exprs(es) = args {
+                    for ae in es {
+                        if let Some(wname) = first_window_function_name_in_expr(ae) {
+                            return Err(SqliteError::new(
+                                ErrorCode::Error,
+                                format!("misuse of window function {wname}()"),
+                            ));
+                        }
+                    }
+                }
+                if let Some(fe) = filter
+                    && let Some(wname) = first_window_function_name_in_expr(fe)
+                {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("misuse of window function {wname}()"),
+                    ));
+                }
+                let owner_idx =
+                    resolve_agg_owner_scope_idx(args, filter.as_deref(), scopes, ctx.db_set, ctes);
+                let owned_agg_group: Option<(&[EvalRow], &[EvalRow])> =
+                    if owner_idx < scopes.len().saturating_sub(1) {
+                        let Some(ref grp_rc) = scopes[owner_idx].agg_group_rows else {
+                            return Err(SqliteError::new(
+                                ErrorCode::Error,
+                                format!("misuse of aggregate: {name}()"),
+                            ));
+                        };
+                        Some((grp_rc.as_ref(), &scopes[..owner_idx]))
+                    } else if let Some(ag) = agg_group {
+                        Some(ag)
+                    } else if let Some(last_s) = scopes.last()
+                        && let Some(ref grp_rc) = last_s.agg_group_rows
+                    {
+                        Some((grp_rc.as_ref(), &scopes[..scopes.len() - 1]))
+                    } else {
+                        None
+                    };
+                let Some((group_rows, base_outer)) = owned_agg_group else {
                     return Err(SqliteError::new(
                         ErrorCode::Error,
                         format!("misuse of aggregate function {name}()"),
@@ -8380,7 +9003,8 @@ fn eval_expr_rt(
                     _ => Collation::Binary,
                 };
                 let mut acc =
-                    AggregateAccumulator::new_with_collation(agg_kind, *distinct, arg_coll);
+                    AggregateAccumulator::new_with_collation(agg_kind, *distinct, arg_coll)
+                        .with_encoding(ctx.encoding());
                 for gr in group_rows {
                     let row_scopes = push_scope(base_outer, gr);
                     if let Some(f_expr) = filter {
@@ -8400,6 +9024,111 @@ fn eval_expr_rt(
                     }
                 }
                 return acc.finalize().map(RuntimeValue::plain);
+            }
+
+            if let FunctionArgs::Exprs(es) = args
+                && ctx.functions.find_scalar(name, es.len()).is_none()
+                && let Some(def) = ctx.functions.find_aggregate(name, es.len())
+            {
+                if *distinct && es.len() != 1 {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "DISTINCT aggregates must have exactly one argument",
+                    ));
+                }
+                for ae in es {
+                    if let Some(wname) = first_window_function_name_in_expr(ae) {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("misuse of window function {wname}()"),
+                        ));
+                    }
+                }
+                if let Some(fe) = filter
+                    && let Some(wname) = first_window_function_name_in_expr(fe)
+                {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("misuse of window function {wname}()"),
+                    ));
+                }
+                let owner_idx =
+                    resolve_agg_owner_scope_idx(args, filter.as_deref(), scopes, ctx.db_set, ctes);
+                let owned_agg_group: Option<(&[EvalRow], &[EvalRow])> =
+                    if owner_idx < scopes.len().saturating_sub(1) {
+                        let Some(ref grp_rc) = scopes[owner_idx].agg_group_rows else {
+                            return Err(SqliteError::new(
+                                ErrorCode::Error,
+                                format!("misuse of aggregate: {name}()"),
+                            ));
+                        };
+                        Some((grp_rc.as_ref(), &scopes[..owner_idx]))
+                    } else if let Some(ag) = agg_group {
+                        Some(ag)
+                    } else if let Some(last_s) = scopes.last()
+                        && let Some(ref grp_rc) = last_s.agg_group_rows
+                    {
+                        Some((grp_rc.as_ref(), &scopes[..scopes.len() - 1]))
+                    } else {
+                        None
+                    };
+                let Some((group_rows, base_outer)) = owned_agg_group else {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("misuse of aggregate function {name}()"),
+                    ));
+                };
+                let flags = def.flags;
+                let mut inst = (def.factory)();
+                let mut distinct_seen: Vec<Value> = Vec::new();
+                let arg_coll = if es.len() == 1 {
+                    let ref_cols = group_rows.first().map_or(&[][..], |r| &r.cols[..]);
+                    infer_expr_collation_from_cols(&es[0], ref_cols)
+                } else {
+                    Collation::Binary
+                };
+                for gr in group_rows {
+                    let row_scopes = push_scope(base_outer, gr);
+                    if let Some(f_expr) = filter {
+                        let fv = eval_expr(ctx, f_expr, params, &row_scopes, ctes, None)?;
+                        if fv.truthiness() != Some(true) {
+                            continue;
+                        }
+                    }
+                    let mut a_vals = Vec::with_capacity(es.len());
+                    for ae in es {
+                        let mut rv = eval_expr_rt(ctx, ae, params, &row_scopes, ctes, None)?;
+                        if !flags.contains(sqliters_types::FunctionFlags::SUBTYPE) {
+                            rv.subtype = 0;
+                        }
+                        a_vals.push(rv);
+                    }
+                    if *distinct && let Some(first) = a_vals.first() {
+                        if first.value.is_null() {
+                            continue;
+                        }
+                        if distinct_seen
+                            .iter()
+                            .any(|prev| prev.cmp_sqlite(&first.value, arg_coll).is_eq())
+                        {
+                            continue;
+                        }
+                        distinct_seen.push(first.value.clone());
+                    }
+                    inst.step(&a_vals)?;
+                }
+                let out = inst.finalize()?;
+                if out.subtype != 0
+                    && !flags.contains(sqliters_types::FunctionFlags::RESULT_SUBTYPE)
+                {
+                    return Err(SqliteError::new(
+                        ErrorCode::Misuse,
+                        format!(
+                            "aggregate function {name} returned subtype without RESULT_SUBTYPE"
+                        ),
+                    ));
+                }
+                return Ok(out);
             }
 
             let (star_args, expr_list) = match args {
@@ -8645,6 +9374,12 @@ fn infer_row_value_elem_meta(
             let aff = infer_expr_affinity_in_scopes(other, scopes, db_set, ctes);
             if let Some(tc) = top_collate {
                 vec![(aff, Some(tc), true)]
+            } else if let Some(cname) = first_explicit_collate_in_expr(other) {
+                vec![(
+                    aff,
+                    Some(Collation::from_name(cname).unwrap_or_default()),
+                    true,
+                )]
             } else {
                 let coll = infer_expr_explicit_or_col_collation(other, &[], scopes);
                 vec![(aff, coll, false)]
@@ -9362,6 +10097,8 @@ fn make_excluded_table_scope(tbl: &TableSchema, rowid: i64, vals: &[Value]) -> E
     EvalRow {
         cols: cols.into(),
         vals: row_vals,
+        win_vals: Rc::from([]),
+        agg_group_rows: None,
         qualified_only: true,
     }
 }
@@ -9831,6 +10568,8 @@ fn make_runtime_table_pseudo_scope(
     Box::new(EvalRow {
         cols: cols.into(),
         vals,
+        win_vals: Rc::from([]),
+        agg_group_rows: None,
         qualified_only: true,
     })
 }
@@ -9867,6 +10606,8 @@ fn make_runtime_view_pseudo_scope(
     Box::new(EvalRow {
         cols: cols.into(),
         vals,
+        win_vals: Rc::from([]),
+        agg_group_rows: None,
         qualified_only: true,
     })
 }
@@ -10764,7 +11505,9 @@ fn mark_expr_new_col_refs(expr: &Expr, tbl: &TableSchema, mask: &mut u32) {
                 mark_expr_new_col_refs(el, tbl, mask);
             }
         }
-        Expr::FunctionCall { args, filter, .. } => {
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
             if let FunctionArgs::Exprs(es) = args {
                 for a in es {
                     mark_expr_new_col_refs(a, tbl, mask);
@@ -10772,6 +11515,9 @@ fn mark_expr_new_col_refs(expr: &Expr, tbl: &TableSchema, mask: &mut u32) {
             }
             if let Some(f) = filter {
                 mark_expr_new_col_refs(f, tbl, mask);
+            }
+            if let Some(WindowRef::Spec(ws)) = over {
+                mark_window_spec_new_col_refs(ws, tbl, mask);
             }
         }
         Expr::RowValue(es) => {
@@ -10785,6 +11531,22 @@ fn mark_expr_new_col_refs(expr: &Expr, tbl: &TableSchema, mask: &mut u32) {
             mark_expr_new_col_refs(m, tbl, mask);
         }
         _ => {}
+    }
+}
+
+fn mark_window_spec_new_col_refs(ws: &WindowSpec, tbl: &TableSchema, mask: &mut u32) {
+    for pe in &ws.partition_by {
+        mark_expr_new_col_refs(pe, tbl, mask);
+    }
+    for ob in &ws.order_by {
+        mark_expr_new_col_refs(&ob.expr, tbl, mask);
+    }
+    if let Some(ref wf) = ws.frame {
+        for b in [&wf.start, &wf.end] {
+            if let WindowFrameBound::Preceding(be) | WindowFrameBound::Following(be) = b {
+                mark_expr_new_col_refs(be, tbl, mask);
+            }
+        }
     }
 }
 
@@ -10823,6 +11585,7 @@ fn mark_select_core_new_col_refs(core: &SelectCore, tbl: &TableSchema, mask: &mu
             selection,
             group_by,
             having,
+            windows,
             ..
         } => {
             for rc in projection {
@@ -10841,6 +11604,9 @@ fn mark_select_core_new_col_refs(core: &SelectCore, tbl: &TableSchema, mask: &mu
             }
             if let Some(h) = having {
                 mark_expr_new_col_refs(h, tbl, mask);
+            }
+            for (_, ws) in windows {
+                mark_window_spec_new_col_refs(ws, tbl, mask);
             }
         }
     }
@@ -12691,16 +13457,19 @@ fn upsert_expr_equiv(
                 distinct: da,
                 args: aa,
                 filter: fa,
+                over: oa,
             },
             Expr::FunctionCall {
                 name: nb,
                 distinct: db,
                 args: ab,
                 filter: fb,
+                over: ob,
             },
         ) => {
             na.eq_ignore_ascii_case(nb)
                 && da == db
+                && oa == ob
                 && match (aa, ab) {
                     (FunctionArgs::Star, FunctionArgs::Star) => true,
                     (FunctionArgs::Exprs(ea), FunctionArgs::Exprs(eb)) => {
@@ -12803,7 +13572,9 @@ fn validate_collations_in_expr(expr: &Expr, collations: &CollationRegistry) -> R
             }
             Ok(())
         }
-        Expr::FunctionCall { args, filter, .. } => {
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
             if let FunctionArgs::Exprs(es) = args {
                 for e in es {
                     validate_collations_in_expr(e, collations)?;
@@ -12811,6 +13582,22 @@ fn validate_collations_in_expr(expr: &Expr, collations: &CollationRegistry) -> R
             }
             if let Some(fe) = filter {
                 validate_collations_in_expr(fe, collations)?;
+            }
+            if let Some(WindowRef::Spec(ws)) = over {
+                for pe in &ws.partition_by {
+                    validate_collations_in_expr(pe, collations)?;
+                }
+                for ob in &ws.order_by {
+                    validate_collations_in_expr(&ob.expr, collations)?;
+                }
+                if let Some(ref wf) = ws.frame {
+                    for b in [&wf.start, &wf.end] {
+                        if let WindowFrameBound::Preceding(be) | WindowFrameBound::Following(be) = b
+                        {
+                            validate_collations_in_expr(be, collations)?;
+                        }
+                    }
+                }
             }
             Ok(())
         }
@@ -12870,8 +13657,17 @@ fn validate_set_assignments_static(
     for sa in assigns {
         validate_collations_in_expr(&sa.expr, collations)?;
         if !sa.row_value {
-            validate_expr_static(
-                &sa.expr, scopes, db_set, dml_ctes, functions, allow_agg, false, visited,
+            validate_expr_static_with_win(
+                &sa.expr,
+                scopes,
+                db_set,
+                dml_ctes,
+                functions,
+                allow_agg,
+                false,
+                allow_agg,
+                &[],
+                visited,
             )?;
         } else {
             let n = sa.columns.len();
@@ -12882,8 +13678,17 @@ fn validate_set_assignments_static(
             match inner {
                 Expr::RowValue(elems) => {
                     for el in elems {
-                        validate_expr_static(
-                            el, scopes, db_set, dml_ctes, functions, allow_agg, false, visited,
+                        validate_expr_static_with_win(
+                            el,
+                            scopes,
+                            db_set,
+                            dml_ctes,
+                            functions,
+                            allow_agg,
+                            false,
+                            allow_agg,
+                            &[],
+                            visited,
                         )?;
                     }
                     if elems.len() != n {
@@ -12905,8 +13710,17 @@ fn validate_set_assignments_static(
                     }
                 }
                 other => {
-                    validate_expr_static(
-                        other, scopes, db_set, dml_ctes, functions, allow_agg, false, visited,
+                    validate_expr_static_with_win(
+                        other,
+                        scopes,
+                        db_set,
+                        dml_ctes,
+                        functions,
+                        allow_agg,
+                        false,
+                        allow_agg,
+                        &[],
+                        visited,
                     )?;
                     if n != 1 {
                         return Err(SqliteError::new(
@@ -13548,15 +14362,39 @@ fn expr_mentions_implicit_rowid(expr: &Expr, tbl: &TableSchema) -> bool {
             expr_mentions_implicit_rowid(e, tbl)
                 || list.iter().any(|x| expr_mentions_implicit_rowid(x, tbl))
         }
-        Expr::FunctionCall { args, filter, .. } => {
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
             let args_r = match args {
                 FunctionArgs::Star => false,
                 FunctionArgs::Exprs(es) => es.iter().any(|e| expr_mentions_implicit_rowid(e, tbl)),
+            };
+            let over_r = match over {
+                Some(WindowRef::Spec(ws)) => {
+                    ws.partition_by
+                        .iter()
+                        .any(|pe| expr_mentions_implicit_rowid(pe, tbl))
+                        || ws
+                            .order_by
+                            .iter()
+                            .any(|ob| expr_mentions_implicit_rowid(&ob.expr, tbl))
+                        || ws.frame.as_ref().is_some_and(|wf| {
+                            [&wf.start, &wf.end].into_iter().any(|b| match b {
+                                WindowFrameBound::Preceding(be)
+                                | WindowFrameBound::Following(be) => {
+                                    expr_mentions_implicit_rowid(be, tbl)
+                                }
+                                _ => false,
+                            })
+                        })
+                }
+                _ => false,
             };
             args_r
                 || filter
                     .as_deref()
                     .is_some_and(|f| expr_mentions_implicit_rowid(f, tbl))
+                || over_r
         }
         Expr::Case {
             operand,
@@ -13644,11 +14482,13 @@ fn check_insert_xfer_eligible(
         selection: None,
         group_by,
         having: None,
+        windows,
     } = &sel.body.head
     else {
         return None;
     };
     if !group_by.is_empty()
+        || !windows.is_empty()
         || !fc.joins.is_empty()
         || projection.len() != 1
         || !matches!(projection[0], ResultColumn::Star)
@@ -14065,30 +14905,46 @@ fn prepare_insert_exec<'a>(
             let source = match &ins.source {
                 InsertSource::DefaultValues => PreparedInsertSource::Materialized(vec![Vec::new()]),
                 InsertSource::Values(expr_rows) => {
-                    let should_materialize = expr_rows.len() > 1
-                        && expr_rows
-                            .iter()
-                            .any(|r| r.iter().any(expr_contains_subquery))
-                        && !expr_rows.iter().any(|r| r.iter().any(expr_contains_raise));
-                    if should_materialize {
-                        let mut out = Vec::with_capacity(expr_rows.len());
-                        for erow in expr_rows {
-                            let mut vrow = Vec::with_capacity(erow.len());
-                            for e in erow {
-                                vrow.push(eval_expr(
-                                    ctx,
-                                    e,
-                                    params,
-                                    outer_scopes,
-                                    &dml_ctes,
-                                    None,
-                                )?);
-                            }
-                            out.push(vrow);
-                        }
-                        PreparedInsertSource::Materialized(out)
+                    if expr_rows.len() > 1
+                        && expr_rows.iter().any(|r| r.iter().any(expr_contains_window))
+                    {
+                        let rows = exec_single_select_core(
+                            ctx,
+                            &SelectCore::Values(expr_rows.clone()),
+                            &[],
+                            None,
+                            params,
+                            outer_scopes,
+                            &dml_ctes,
+                        )?
+                        .rows;
+                        PreparedInsertSource::Materialized(rows)
                     } else {
-                        PreparedInsertSource::StreamingValues(expr_rows)
+                        let should_materialize = expr_rows.len() > 1
+                            && expr_rows
+                                .iter()
+                                .any(|r| r.iter().any(expr_contains_subquery))
+                            && !expr_rows.iter().any(|r| r.iter().any(expr_contains_raise));
+                        if should_materialize {
+                            let mut out = Vec::with_capacity(expr_rows.len());
+                            for erow in expr_rows {
+                                let mut vrow = Vec::with_capacity(erow.len());
+                                for e in erow {
+                                    vrow.push(eval_expr(
+                                        ctx,
+                                        e,
+                                        params,
+                                        outer_scopes,
+                                        &dml_ctes,
+                                        None,
+                                    )?);
+                                }
+                                out.push(vrow);
+                            }
+                            PreparedInsertSource::Materialized(out)
+                        } else {
+                            PreparedInsertSource::StreamingValues(expr_rows)
+                        }
                     }
                 }
                 InsertSource::Select(sel) => {
@@ -14188,30 +15044,46 @@ fn prepare_insert_exec<'a>(
             let source = match &ins.source {
                 InsertSource::DefaultValues => PreparedInsertSource::Materialized(vec![Vec::new()]),
                 InsertSource::Values(expr_rows) => {
-                    let should_materialize = expr_rows.len() > 1
-                        && expr_rows
-                            .iter()
-                            .any(|r| r.iter().any(expr_contains_subquery))
-                        && !expr_rows.iter().any(|r| r.iter().any(expr_contains_raise));
-                    if should_materialize {
-                        let mut out = Vec::with_capacity(expr_rows.len());
-                        for erow in expr_rows {
-                            let mut vrow = Vec::with_capacity(erow.len());
-                            for e in erow {
-                                vrow.push(eval_expr(
-                                    ctx,
-                                    e,
-                                    params,
-                                    outer_scopes,
-                                    &dml_ctes,
-                                    None,
-                                )?);
-                            }
-                            out.push(vrow);
-                        }
-                        PreparedInsertSource::Materialized(out)
+                    if expr_rows.len() > 1
+                        && expr_rows.iter().any(|r| r.iter().any(expr_contains_window))
+                    {
+                        let rows = exec_single_select_core(
+                            ctx,
+                            &SelectCore::Values(expr_rows.clone()),
+                            &[],
+                            None,
+                            params,
+                            outer_scopes,
+                            &dml_ctes,
+                        )?
+                        .rows;
+                        PreparedInsertSource::Materialized(rows)
                     } else {
-                        PreparedInsertSource::StreamingValues(expr_rows)
+                        let should_materialize = expr_rows.len() > 1
+                            && expr_rows
+                                .iter()
+                                .any(|r| r.iter().any(expr_contains_subquery))
+                            && !expr_rows.iter().any(|r| r.iter().any(expr_contains_raise));
+                        if should_materialize {
+                            let mut out = Vec::with_capacity(expr_rows.len());
+                            for erow in expr_rows {
+                                let mut vrow = Vec::with_capacity(erow.len());
+                                for e in erow {
+                                    vrow.push(eval_expr(
+                                        ctx,
+                                        e,
+                                        params,
+                                        outer_scopes,
+                                        &dml_ctes,
+                                        None,
+                                    )?);
+                                }
+                                out.push(vrow);
+                            }
+                            PreparedInsertSource::Materialized(out)
+                        } else {
+                            PreparedInsertSource::StreamingValues(expr_rows)
+                        }
                     }
                 }
                 InsertSource::Select(sel) => {
@@ -15679,7 +16551,34 @@ fn prepare_update_exec<'a>(
                         PreparedViewUpdateRows::Precomputed(Vec::new())
                     }
                 } else {
-                    let mut pairs = Vec::new();
+                    let has_set_win = upd
+                        .assignments
+                        .iter()
+                        .any(|sa| expr_contains_window(&sa.expr));
+                    let mut win_calls = Vec::new();
+                    let mut rewritten_exprs: Vec<Expr> = Vec::new();
+                    if has_set_win {
+                        for (_, _, e) in &resolved_assigns {
+                            rewritten_exprs.push(collect_and_rewrite_window_calls(
+                                e,
+                                &[],
+                                ctx.functions,
+                                None,
+                                &mut win_calls,
+                            )?);
+                        }
+                    }
+                    let eff_assigns: Vec<(Vec<usize>, bool, &Expr)> = if has_set_win {
+                        resolved_assigns
+                            .iter()
+                            .zip(rewritten_exprs.iter())
+                            .map(|((c, rv, _), re)| (c.clone(), *rv, re))
+                            .collect()
+                    } else {
+                        resolved_assigns.clone()
+                    };
+
+                    let mut staged: Vec<(Vec<Value>, EvalRow)> = Vec::new();
                     for old_vals in view_out.rows {
                         let target_scope = make_single_view_scope(
                             &view.name,
@@ -15700,7 +16599,7 @@ fn prepare_update_exec<'a>(
                             combined_vals.extend_from_slice(&from_row.vals);
                             let combined_scope = EvalRow::new(combined_cols.into(), combined_vals);
                             let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
-                            scopes.push(combined_scope);
+                            scopes.push(combined_scope.clone());
                             scopes.extend_from_slice(outer_scopes);
 
                             if let Some(ref w) = upd.selection {
@@ -15709,17 +16608,49 @@ fn prepare_update_exec<'a>(
                                     continue;
                                 }
                             }
-                            let new_vals = apply_resolved_set_assignments_for_view(
-                                ctx,
-                                &old_vals,
-                                &resolved_assigns,
-                                &scopes,
-                                None,
-                                &dml_ctes,
-                                params,
-                            )?;
-                            pairs.push((old_vals.clone(), new_vals));
+                            staged.push((old_vals.clone(), combined_scope));
                         }
+                    }
+
+                    if has_set_win && !staged.is_empty() {
+                        let sample_cols = staged[0].1.cols.to_vec();
+                        let mut win_items: Vec<WindowExecItem> = staged
+                            .iter()
+                            .map(|(_, sc)| WindowExecItem {
+                                row: sc.clone(),
+                                group_rows: None,
+                                win_vals: Vec::new(),
+                            })
+                            .collect();
+                        execute_window_pipeline(
+                            ctx,
+                            &mut win_items,
+                            &win_calls,
+                            &sample_cols,
+                            params,
+                            outer_scopes,
+                            &dml_ctes,
+                        )?;
+                        for ((_, sc), wi) in staged.iter_mut().zip(win_items) {
+                            *sc = wi.row;
+                        }
+                    }
+
+                    let mut pairs = Vec::with_capacity(staged.len());
+                    for (old_vals, combined_scope) in staged {
+                        let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
+                        scopes.push(combined_scope);
+                        scopes.extend_from_slice(outer_scopes);
+                        let new_vals = apply_resolved_set_assignments_for_view(
+                            ctx,
+                            &old_vals,
+                            &eff_assigns,
+                            &scopes,
+                            None,
+                            &dml_ctes,
+                            params,
+                        )?;
+                        pairs.push((old_vals, new_vals));
                     }
                     PreparedViewUpdateRows::Precomputed(pairs)
                 }
@@ -18405,6 +19336,8 @@ fn make_static_trigger_pseudo_scope(
     EvalRow {
         cols: pseudo_cols.into(),
         vals: vec![Value::Null; n],
+        win_vals: Rc::from([]),
+        agg_group_rows: None,
         qualified_only: true,
     }
 }
@@ -18678,6 +19611,8 @@ fn validate_single_trigger_definition(
                     let excluded_scope = EvalRow {
                         cols: excl_cols.into(),
                         vals: vec![Value::Null; excl_n],
+                        win_vals: Rc::from([]),
+                        agg_group_rows: None,
                         qualified_only: true,
                     };
                     let target_scopes = [pseudo_scope.clone(), target_scope.clone()];
@@ -20507,7 +21442,9 @@ fn collect_self_table_qualifier_edits_in_expr(
                 );
             }
         }
-        Expr::FunctionCall { args, filter, .. } => {
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
             if let FunctionArgs::Exprs(es) = args {
                 for e in es {
                     collect_self_table_qualifier_edits_in_expr(
@@ -20529,6 +21466,43 @@ fn collect_self_table_qualifier_edits_in_expr(
                     spans,
                     edits,
                 );
+            }
+            if let Some(WindowRef::Spec(ws)) = over {
+                for pe in &ws.partition_by {
+                    collect_self_table_qualifier_edits_in_expr(
+                        pe,
+                        schema_name,
+                        old_tbl,
+                        new_tbl,
+                        spans,
+                        edits,
+                    );
+                }
+                for ob in &ws.order_by {
+                    collect_self_table_qualifier_edits_in_expr(
+                        &ob.expr,
+                        schema_name,
+                        old_tbl,
+                        new_tbl,
+                        spans,
+                        edits,
+                    );
+                }
+                if let Some(ref wf) = ws.frame {
+                    for b in [&wf.start, &wf.end] {
+                        if let WindowFrameBound::Preceding(be) | WindowFrameBound::Following(be) = b
+                        {
+                            collect_self_table_qualifier_edits_in_expr(
+                                be,
+                                schema_name,
+                                old_tbl,
+                                new_tbl,
+                                spans,
+                                edits,
+                            );
+                        }
+                    }
+                }
             }
         }
         Expr::RowValue(es) => {
@@ -20944,6 +21918,7 @@ fn collect_table_rename_edits_in_core(
             selection,
             group_by,
             having,
+            windows,
             ..
         } => {
             let mut cur_bindings = Vec::new();
@@ -21065,7 +22040,82 @@ fn collect_table_rename_edits_in_core(
                     edits,
                 );
             }
+            for (_, ws) in windows {
+                collect_table_rename_edits_in_window_spec(
+                    ws,
+                    view_db_id,
+                    target_db_id,
+                    old_tbl,
+                    new_tbl,
+                    cte_names,
+                    &full_scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
             cur_bindings
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_table_rename_edits_in_window_spec(
+    ws: &WindowSpec,
+    view_db_id: DatabaseId,
+    target_db_id: DatabaseId,
+    old_tbl: &str,
+    new_tbl: &str,
+    cte_names: &mut Vec<String>,
+    scopes: &[Vec<FromTableBinding>],
+    db_set: &DatabaseSet,
+    spans: &IdentSpanMap,
+    edits: &mut Vec<(TokenSpan, String)>,
+) {
+    for pe in &ws.partition_by {
+        collect_table_rename_edits_in_expr(
+            pe,
+            view_db_id,
+            target_db_id,
+            old_tbl,
+            new_tbl,
+            cte_names,
+            scopes,
+            db_set,
+            spans,
+            edits,
+        );
+    }
+    for ob in &ws.order_by {
+        collect_table_rename_edits_in_expr(
+            &ob.expr,
+            view_db_id,
+            target_db_id,
+            old_tbl,
+            new_tbl,
+            cte_names,
+            scopes,
+            db_set,
+            spans,
+            edits,
+        );
+    }
+    if let Some(ref wf) = ws.frame {
+        for b in [&wf.start, &wf.end] {
+            if let WindowFrameBound::Preceding(be) | WindowFrameBound::Following(be) = b {
+                collect_table_rename_edits_in_expr(
+                    be,
+                    view_db_id,
+                    target_db_id,
+                    old_tbl,
+                    new_tbl,
+                    cte_names,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
         }
     }
 }
@@ -21427,7 +22477,9 @@ fn collect_table_rename_edits_in_expr(
                 );
             }
         }
-        Expr::FunctionCall { args, filter, .. } => {
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
             if let FunctionArgs::Exprs(es) = args {
                 for e in es {
                     collect_table_rename_edits_in_expr(
@@ -21447,6 +22499,20 @@ fn collect_table_rename_edits_in_expr(
             if let Some(f) = filter {
                 collect_table_rename_edits_in_expr(
                     f,
+                    view_db_id,
+                    target_db_id,
+                    old_tbl,
+                    new_tbl,
+                    cte_names,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+            if let Some(WindowRef::Spec(ws)) = over {
+                collect_table_rename_edits_in_window_spec(
+                    ws,
                     view_db_id,
                     target_db_id,
                     old_tbl,
@@ -22193,6 +23259,7 @@ fn collect_col_rename_edits_in_core(
             selection,
             group_by,
             having,
+            windows,
             ..
         } => {
             let mut from_cols = Vec::new();
@@ -22340,7 +23407,87 @@ fn collect_col_rename_edits_in_core(
                     edits,
                 );
             }
+            for (_, ws) in windows {
+                collect_col_rename_edits_in_window_spec(
+                    ws,
+                    view_db_id,
+                    target_db_id,
+                    target_tbl,
+                    old_col,
+                    new_col,
+                    ctes,
+                    &full_scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
             (from_cols, proj_cols)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_col_rename_edits_in_window_spec(
+    ws: &WindowSpec,
+    view_db_id: DatabaseId,
+    target_db_id: DatabaseId,
+    target_tbl: &TableSchema,
+    old_col: &str,
+    new_col: &str,
+    ctes: &CteStore,
+    scopes: &[Vec<RenameColBinding>],
+    db_set: &DatabaseSet,
+    spans: &IdentSpanMap,
+    edits: &mut Vec<(TokenSpan, String)>,
+) {
+    for pe in &ws.partition_by {
+        collect_col_rename_edits_in_expr(
+            pe,
+            view_db_id,
+            target_db_id,
+            target_tbl,
+            old_col,
+            new_col,
+            ctes,
+            scopes,
+            db_set,
+            spans,
+            edits,
+        );
+    }
+    for ob in &ws.order_by {
+        collect_col_rename_edits_in_expr(
+            &ob.expr,
+            view_db_id,
+            target_db_id,
+            target_tbl,
+            old_col,
+            new_col,
+            ctes,
+            scopes,
+            db_set,
+            spans,
+            edits,
+        );
+    }
+    if let Some(ref wf) = ws.frame {
+        for b in [&wf.start, &wf.end] {
+            if let WindowFrameBound::Preceding(be) | WindowFrameBound::Following(be) = b {
+                collect_col_rename_edits_in_expr(
+                    be,
+                    view_db_id,
+                    target_db_id,
+                    target_tbl,
+                    old_col,
+                    new_col,
+                    ctes,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
         }
     }
 }
@@ -22754,7 +23901,9 @@ fn collect_col_rename_edits_in_expr(
                 );
             }
         }
-        Expr::FunctionCall { args, filter, .. } => {
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
             if let FunctionArgs::Exprs(es) = args {
                 for e in es {
                     collect_col_rename_edits_in_expr(
@@ -22775,6 +23924,21 @@ fn collect_col_rename_edits_in_expr(
             if let Some(f) = filter {
                 collect_col_rename_edits_in_expr(
                     f,
+                    view_db_id,
+                    target_db_id,
+                    target_tbl,
+                    old_col,
+                    new_col,
+                    ctes,
+                    scopes,
+                    db_set,
+                    spans,
+                    edits,
+                );
+            }
+            if let Some(WindowRef::Spec(ws)) = over {
+                collect_col_rename_edits_in_window_spec(
+                    ws,
                     view_db_id,
                     target_db_id,
                     target_tbl,
@@ -25951,6 +27115,7 @@ fn collect_core_roots_rec(
             selection,
             group_by,
             having,
+            windows,
             ..
         } => {
             if let Some(fc) = from {
@@ -25975,6 +27140,32 @@ fn collect_core_roots_rec(
             }
             if let Some(h) = having {
                 collect_expr_roots_rec(h, db_set, cte_stack, view_stack, seen, out);
+            }
+            for (_, ws) in windows {
+                collect_window_spec_roots_rec(ws, db_set, cte_stack, view_stack, seen, out);
+            }
+        }
+    }
+}
+
+fn collect_window_spec_roots_rec(
+    ws: &WindowSpec,
+    db_set: &DatabaseSet,
+    cte_stack: &mut Vec<String>,
+    view_stack: &mut Vec<(DatabaseId, String)>,
+    seen: &mut HashSet<(DatabaseId, Pgno)>,
+    out: &mut Vec<LeaseCursorSpec>,
+) {
+    for pe in &ws.partition_by {
+        collect_expr_roots_rec(pe, db_set, cte_stack, view_stack, seen, out);
+    }
+    for ob in &ws.order_by {
+        collect_expr_roots_rec(&ob.expr, db_set, cte_stack, view_stack, seen, out);
+    }
+    if let Some(ref wf) = ws.frame {
+        for b in [&wf.start, &wf.end] {
+            if let WindowFrameBound::Preceding(be) | WindowFrameBound::Following(be) = b {
+                collect_expr_roots_rec(be, db_set, cte_stack, view_stack, seen, out);
             }
         }
     }
@@ -26129,7 +27320,9 @@ fn collect_expr_roots_rec(
                 collect_expr_roots_rec(el, db_set, cte_stack, view_stack, seen, out);
             }
         }
-        Expr::FunctionCall { args, filter, .. } => {
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
             if let FunctionArgs::Exprs(es) = args {
                 for e in es {
                     collect_expr_roots_rec(e, db_set, cte_stack, view_stack, seen, out);
@@ -26137,6 +27330,9 @@ fn collect_expr_roots_rec(
             }
             if let Some(f) = filter {
                 collect_expr_roots_rec(f, db_set, cte_stack, view_stack, seen, out);
+            }
+            if let Some(WindowRef::Spec(ws)) = over {
+                collect_window_spec_roots_rec(ws, db_set, cte_stack, view_stack, seen, out);
             }
         }
         Expr::Subquery(sub) | Expr::Exists { subquery: sub, .. } => {
@@ -27354,8 +28550,17 @@ fn validate_set_assignments_for_view_static(
     for sa in assigns {
         validate_collations_in_expr(&sa.expr, collations)?;
         if !sa.row_value {
-            validate_expr_static(
-                &sa.expr, scopes, db_set, dml_ctes, functions, allow_agg, false, visited,
+            validate_expr_static_with_win(
+                &sa.expr,
+                scopes,
+                db_set,
+                dml_ctes,
+                functions,
+                allow_agg,
+                false,
+                allow_agg,
+                &[],
+                visited,
             )?;
         } else {
             let n = sa.columns.len();
@@ -27366,8 +28571,17 @@ fn validate_set_assignments_for_view_static(
             match inner {
                 Expr::RowValue(elems) => {
                     for el in elems {
-                        validate_expr_static(
-                            el, scopes, db_set, dml_ctes, functions, allow_agg, false, visited,
+                        validate_expr_static_with_win(
+                            el,
+                            scopes,
+                            db_set,
+                            dml_ctes,
+                            functions,
+                            allow_agg,
+                            false,
+                            allow_agg,
+                            &[],
+                            visited,
                         )?;
                     }
                     if elems.len() != n {
@@ -27389,8 +28603,17 @@ fn validate_set_assignments_for_view_static(
                     }
                 }
                 other => {
-                    validate_expr_static(
-                        other, scopes, db_set, dml_ctes, functions, allow_agg, false, visited,
+                    validate_expr_static_with_win(
+                        other,
+                        scopes,
+                        db_set,
+                        dml_ctes,
+                        functions,
+                        allow_agg,
+                        false,
+                        allow_agg,
+                        &[],
+                        visited,
                     )?;
                     if n != 1 {
                         return Err(SqliteError::new(
@@ -27725,7 +28948,7 @@ fn validate_insert_static_inner(
                             ));
                         }
                         for e in erow {
-                            validate_expr_static(
+                            validate_expr_static_with_win(
                                 e,
                                 outer_scopes,
                                 db_set,
@@ -27733,6 +28956,8 @@ fn validate_insert_static_inner(
                                 functions,
                                 false,
                                 false,
+                                expr_rows.len() > 1,
+                                &[],
                                 &mut visited,
                             )?;
                         }
@@ -27863,7 +29088,7 @@ fn validate_insert_static_inner(
                             ));
                         }
                         for e in erow {
-                            validate_expr_static(
+                            validate_expr_static_with_win(
                                 e,
                                 outer_scopes,
                                 db_set,
@@ -27871,6 +29096,8 @@ fn validate_insert_static_inner(
                                 functions,
                                 false,
                                 false,
+                                expr_rows.len() > 1,
+                                &[],
                                 &mut visited,
                             )?;
                         }
@@ -28740,6 +29967,14 @@ fn validate_select_stmt_static(
 
         let width = head_cols.len();
         for (ob_idx, ob) in stmt.order_by.iter().enumerate() {
+            validate_subquery_from_tables_in_expr_static(
+                &ob.expr,
+                outer_scopes,
+                db_set,
+                &ctes,
+                functions,
+                visited_ctes,
+            )?;
             let mut inner = &ob.expr;
             while let Expr::Collate { expr, .. } = inner {
                 inner = expr.as_ref();
@@ -28832,7 +30067,7 @@ fn validate_single_select_core_static(
                     ));
                 }
                 for e in erow {
-                    validate_expr_static(
+                    validate_expr_static_with_win(
                         e,
                         outer_scopes,
                         db_set,
@@ -28840,6 +30075,8 @@ fn validate_single_select_core_static(
                         functions,
                         false,
                         false,
+                        true,
+                        &[],
                         visited_ctes,
                     )?;
                 }
@@ -28900,8 +30137,10 @@ fn validate_single_select_core_static(
             selection,
             group_by,
             having,
+            windows,
             ..
         } => {
+            let resolved_defs = chain_window_definitions(windows)?;
             let sample_cols = match from {
                 None => Vec::new(),
                 Some(fc) => validate_from_clause_static(
@@ -28931,6 +30170,56 @@ fn validate_single_select_core_static(
             );
             let full_scopes = push_scope(outer_scopes, &row_eval);
 
+            let window_aliases: Vec<String> = projection
+                .iter()
+                .filter_map(|rc| match rc {
+                    ResultColumn::Expr {
+                        expr,
+                        alias: Some(a),
+                        ..
+                    } if expr_contains_window(expr) => Some(a.clone()),
+                    _ => None,
+                })
+                .collect();
+            if !window_aliases.is_empty() {
+                if let Some(where_expr) = selection {
+                    check_aliased_window_misuse(
+                        where_expr,
+                        &window_aliases,
+                        &sample_cols,
+                        false,
+                        functions,
+                    )?;
+                }
+                for ge in group_by {
+                    check_aliased_window_misuse(
+                        ge,
+                        &window_aliases,
+                        &sample_cols,
+                        false,
+                        functions,
+                    )?;
+                }
+                if let Some(hav) = having {
+                    check_aliased_window_misuse(
+                        hav,
+                        &window_aliases,
+                        &sample_cols,
+                        false,
+                        functions,
+                    )?;
+                }
+                for ob in order_by {
+                    check_aliased_window_misuse(
+                        &ob.expr,
+                        &window_aliases,
+                        &sample_cols,
+                        true,
+                        functions,
+                    )?;
+                }
+            }
+
             if let Some(where_expr) = selection {
                 let subst_where = subst_select_aliases_in_expr_with_ctes(
                     where_expr,
@@ -28939,7 +30228,7 @@ fn validate_single_select_core_static(
                     db_set,
                     ctes,
                 );
-                validate_expr_static(
+                validate_expr_static_with_win(
                     &subst_where,
                     &full_scopes,
                     db_set,
@@ -28947,27 +30236,78 @@ fn validate_single_select_core_static(
                     functions,
                     false,
                     false,
+                    false,
+                    &resolved_defs,
                     visited_ctes,
                 )?;
             }
 
-            let is_agg = !group_by.is_empty()
-                || having.is_some()
-                || projection.iter().any(|rc| match rc {
-                    ResultColumn::Expr { expr, .. } => expr_contains_aggregate(expr),
-                    _ => false,
-                })
-                || order_by.iter().any(|ob| expr_contains_aggregate(&ob.expr));
+            let has_win = core_has_window(core, order_by);
+            let is_agg = core_is_aggregate_in_scope(
+                core,
+                if has_win { &[] } else { order_by },
+                &sample_cols,
+                outer_scopes,
+                db_set,
+                ctes,
+                functions,
+            );
+
+            let mut proj_scopes = full_scopes.clone();
+            if is_agg && let Some(last_s) = proj_scopes.last_mut() {
+                last_s.agg_group_rows = Some(Rc::from([]));
+            }
+
+            let innermost_win_spec: Option<ResolvedWindowSpec> = if has_win {
+                let mut probe_calls = Vec::new();
+                for (pe, _, _) in &expanded_proj {
+                    let _ = collect_and_rewrite_window_calls(
+                        pe,
+                        &resolved_defs,
+                        functions,
+                        None,
+                        &mut probe_calls,
+                    );
+                }
+                for ob in order_by {
+                    let _ = collect_and_rewrite_window_calls(
+                        &ob.expr,
+                        &resolved_defs,
+                        functions,
+                        None,
+                        &mut probe_calls,
+                    );
+                }
+                let mut stage_specs: Vec<ResolvedWindowSpec> = Vec::new();
+                for wc in probe_calls {
+                    if !stage_specs.iter().any(|s| {
+                        s.partition_by == wc.spec.partition_by
+                            && s.order_by == wc.spec.order_by
+                            && s.units == wc.spec.units
+                            && s.start == wc.spec.start
+                            && s.end == wc.spec.end
+                            && s.exclude == wc.spec.exclude
+                    }) {
+                        stage_specs.push(wc.spec);
+                    }
+                }
+                stage_specs.pop()
+            } else {
+                None
+            };
 
             for (pe, _, _) in &expanded_proj {
-                validate_expr_static(
+                validate_expr_static_with_win_stage(
                     pe,
-                    &full_scopes,
+                    &proj_scopes,
                     db_set,
                     ctes,
                     functions,
-                    is_agg,
+                    true,
                     false,
+                    true,
+                    &resolved_defs,
+                    innermost_win_spec.as_ref(),
                     visited_ctes,
                 )?;
             }
@@ -28984,6 +30324,19 @@ fn validate_single_select_core_static(
                             ),
                         ));
                     }
+                    let target_expr = &expanded_proj[(ord as usize) - 1].0;
+                    validate_expr_static_with_win(
+                        target_expr,
+                        &full_scopes,
+                        db_set,
+                        ctes,
+                        functions,
+                        false,
+                        false,
+                        false,
+                        &resolved_defs,
+                        visited_ctes,
+                    )?;
                 } else {
                     let subst = subst_select_aliases_in_expr_with_ctes(
                         ge,
@@ -28992,7 +30345,7 @@ fn validate_single_select_core_static(
                         db_set,
                         ctes,
                     );
-                    validate_expr_static(
+                    validate_expr_static_with_win(
                         &subst,
                         &full_scopes,
                         db_set,
@@ -29000,6 +30353,8 @@ fn validate_single_select_core_static(
                         functions,
                         false,
                         false,
+                        false,
+                        &resolved_defs,
                         visited_ctes,
                     )?;
                 }
@@ -29013,18 +30368,25 @@ fn validate_single_select_core_static(
                     db_set,
                     ctes,
                 );
-                validate_expr_static(
+                let mut hav_scopes = full_scopes.clone();
+                if let Some(last_s) = hav_scopes.last_mut() {
+                    last_s.agg_group_rows = Some(Rc::from([]));
+                }
+                validate_expr_static_with_win(
                     &subst,
-                    &full_scopes,
+                    &hav_scopes,
                     db_set,
                     ctes,
                     functions,
                     true,
                     false,
+                    false,
+                    &resolved_defs,
                     visited_ctes,
                 )?;
             }
 
+            let ob_scopes = &proj_scopes;
             for (oi, ob) in order_by.iter().enumerate() {
                 if let Some(ord) = strip_collate_and_unary_plus(&ob.expr) {
                     if ord < 1 || (ord as usize) > expanded_proj.len() {
@@ -29044,21 +30406,1320 @@ fn validate_single_select_core_static(
                         &sample_cols,
                         outer_scopes,
                     );
-                    validate_expr_static(
+                    validate_expr_static_with_win_stage(
                         &subst,
-                        &full_scopes,
+                        ob_scopes,
                         db_set,
                         ctes,
                         functions,
-                        is_agg,
+                        is_agg || has_win,
                         false,
+                        true,
+                        &resolved_defs,
+                        innermost_win_spec.as_ref(),
                         visited_ctes,
                     )?;
+                    if has_win
+                        && !is_agg
+                        && let Some(agg_name) =
+                            first_regular_agg_in_order_by(&subst, &resolved_defs, functions)
+                    {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("misuse of aggregate: {agg_name}()"),
+                        ));
+                    }
                 }
             }
 
             Ok(col_names)
         }
+    }
+}
+
+fn cref_matches_cols(cref: &ColumnRef, cols: &[ScopedColumn]) -> bool {
+    if cref.schema.as_deref() == Some(WIN_SLOT_SCHEMA) {
+        return false;
+    }
+    if cref.schema.as_deref() == Some(STAR_SLOT_SCHEMA) {
+        return cref
+            .column
+            .parse::<usize>()
+            .ok()
+            .is_some_and(|idx| idx < cols.len());
+    }
+    for sc in cols {
+        if sc.hidden_rowid {
+            continue;
+        }
+        if sc.matches_qualifier(cref.schema.as_deref(), cref.table.as_deref())
+            && sc.name.eq_ignore_ascii_case(&cref.column)
+        {
+            return true;
+        }
+    }
+    if cref.column.eq_ignore_ascii_case("rowid")
+        || cref.column.eq_ignore_ascii_case("_rowid_")
+        || cref.column.eq_ignore_ascii_case("oid")
+    {
+        for sc in cols {
+            if sc.hidden_rowid
+                && sc.matches_qualifier(cref.schema.as_deref(), cref.table.as_deref())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn collect_agg_col_scope_refs(
+    expr: &Expr,
+    scopes: &[EvalRow],
+    excluded_cols: &mut Vec<Vec<ScopedColumn>>,
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    saw_any: &mut bool,
+    refs_scope: &mut [bool],
+) {
+    match expr {
+        Expr::Column(cref) => {
+            if excluded_cols
+                .iter()
+                .rev()
+                .any(|ec| cref_matches_cols(cref, ec))
+            {
+                return;
+            }
+            for idx in (0..scopes.len()).rev() {
+                if cref_matches_cols(cref, &scopes[idx].cols) {
+                    *saw_any = true;
+                    refs_scope[idx] = true;
+                    break;
+                }
+            }
+        }
+        Expr::Unary { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => collect_agg_col_scope_refs(
+            inner,
+            scopes,
+            excluded_cols,
+            db_set,
+            ctes,
+            saw_any,
+            refs_scope,
+        ),
+        Expr::Binary { left, right, .. } => {
+            collect_agg_col_scope_refs(
+                left,
+                scopes,
+                excluded_cols,
+                db_set,
+                ctes,
+                saw_any,
+                refs_scope,
+            );
+            collect_agg_col_scope_refs(
+                right,
+                scopes,
+                excluded_cols,
+                db_set,
+                ctes,
+                saw_any,
+                refs_scope,
+            );
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            for x in [e, low, high] {
+                collect_agg_col_scope_refs(
+                    x,
+                    scopes,
+                    excluded_cols,
+                    db_set,
+                    ctes,
+                    saw_any,
+                    refs_scope,
+                );
+            }
+        }
+        Expr::InList { expr: e, list, .. } => {
+            collect_agg_col_scope_refs(e, scopes, excluded_cols, db_set, ctes, saw_any, refs_scope);
+            for x in list {
+                collect_agg_col_scope_refs(
+                    x,
+                    scopes,
+                    excluded_cols,
+                    db_set,
+                    ctes,
+                    saw_any,
+                    refs_scope,
+                );
+            }
+        }
+        Expr::InTable { expr: e, .. } => {
+            collect_agg_col_scope_refs(e, scopes, excluded_cols, db_set, ctes, saw_any, refs_scope)
+        }
+        Expr::InSubquery {
+            expr: e, subquery, ..
+        } => {
+            collect_agg_col_scope_refs(e, scopes, excluded_cols, db_set, ctes, saw_any, refs_scope);
+            collect_agg_col_scope_refs_in_select(
+                subquery,
+                scopes,
+                excluded_cols,
+                db_set,
+                ctes,
+                saw_any,
+                refs_scope,
+            );
+        }
+        Expr::Subquery(sub) | Expr::Exists { subquery: sub, .. } => {
+            collect_agg_col_scope_refs_in_select(
+                sub,
+                scopes,
+                excluded_cols,
+                db_set,
+                ctes,
+                saw_any,
+                refs_scope,
+            );
+        }
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_agg_col_scope_refs(e, scopes, excluded_cols, db_set, ctes, saw_any, refs_scope);
+            collect_agg_col_scope_refs(
+                pattern,
+                scopes,
+                excluded_cols,
+                db_set,
+                ctes,
+                saw_any,
+                refs_scope,
+            );
+            if let Some(esc) = escape {
+                collect_agg_col_scope_refs(
+                    esc,
+                    scopes,
+                    excluded_cols,
+                    db_set,
+                    ctes,
+                    saw_any,
+                    refs_scope,
+                );
+            }
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                collect_agg_col_scope_refs(
+                    op,
+                    scopes,
+                    excluded_cols,
+                    db_set,
+                    ctes,
+                    saw_any,
+                    refs_scope,
+                );
+            }
+            for (w, t) in branches {
+                collect_agg_col_scope_refs(
+                    w,
+                    scopes,
+                    excluded_cols,
+                    db_set,
+                    ctes,
+                    saw_any,
+                    refs_scope,
+                );
+                collect_agg_col_scope_refs(
+                    t,
+                    scopes,
+                    excluded_cols,
+                    db_set,
+                    ctes,
+                    saw_any,
+                    refs_scope,
+                );
+            }
+            if let Some(el) = else_expr {
+                collect_agg_col_scope_refs(
+                    el,
+                    scopes,
+                    excluded_cols,
+                    db_set,
+                    ctes,
+                    saw_any,
+                    refs_scope,
+                );
+            }
+        }
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
+            if let FunctionArgs::Exprs(es) = args {
+                for a in es {
+                    collect_agg_col_scope_refs(
+                        a,
+                        scopes,
+                        excluded_cols,
+                        db_set,
+                        ctes,
+                        saw_any,
+                        refs_scope,
+                    );
+                }
+            }
+            if let Some(fe) = filter {
+                collect_agg_col_scope_refs(
+                    fe,
+                    scopes,
+                    excluded_cols,
+                    db_set,
+                    ctes,
+                    saw_any,
+                    refs_scope,
+                );
+            }
+            if let Some(WindowRef::Spec(ws)) = over {
+                for pe in &ws.partition_by {
+                    collect_agg_col_scope_refs(
+                        pe,
+                        scopes,
+                        excluded_cols,
+                        db_set,
+                        ctes,
+                        saw_any,
+                        refs_scope,
+                    );
+                }
+                for ob in &ws.order_by {
+                    collect_agg_col_scope_refs(
+                        &ob.expr,
+                        scopes,
+                        excluded_cols,
+                        db_set,
+                        ctes,
+                        saw_any,
+                        refs_scope,
+                    );
+                }
+            }
+        }
+        Expr::RowValue(elems) => {
+            for el in elems {
+                collect_agg_col_scope_refs(
+                    el,
+                    scopes,
+                    excluded_cols,
+                    db_set,
+                    ctes,
+                    saw_any,
+                    refs_scope,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_agg_col_scope_refs_in_select(
+    sub: &SelectStmt,
+    scopes: &[EvalRow],
+    excluded_cols: &mut Vec<Vec<ScopedColumn>>,
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    saw_any: &mut bool,
+    refs_scope: &mut [bool],
+) {
+    let sub_ctes = ctes.with_scope(&sub.ctes);
+    for cte in &sub.ctes {
+        collect_agg_col_scope_refs_in_select(
+            &cte.query,
+            scopes,
+            excluded_cols,
+            db_set,
+            &sub_ctes,
+            saw_any,
+            refs_scope,
+        );
+    }
+    let mut all_cores = vec![&sub.body.head];
+    for (_, rhs) in &sub.body.compounds {
+        all_cores.push(rhs);
+    }
+    let mut union_sub_cols = Vec::new();
+    for core in all_cores {
+        match core {
+            SelectCore::Values(rows) => {
+                for r in rows {
+                    for e in r {
+                        collect_agg_col_scope_refs(
+                            e,
+                            scopes,
+                            excluded_cols,
+                            db_set,
+                            &sub_ctes,
+                            saw_any,
+                            refs_scope,
+                        );
+                    }
+                }
+            }
+            SelectCore::Select {
+                projection,
+                from,
+                selection,
+                group_by,
+                having,
+                windows,
+                ..
+            } => {
+                let arm_cols = from
+                    .as_ref()
+                    .and_then(|fc| {
+                        static_schema_cols_for_from(fc, scopes, db_set, &sub_ctes, &mut Vec::new())
+                    })
+                    .unwrap_or_default();
+                union_sub_cols.extend(arm_cols.clone());
+                excluded_cols.push(arm_cols);
+                if let Some(fc) = from {
+                    for tos in std::iter::once(&fc.head).chain(fc.joins.iter().map(|j| &j.right)) {
+                        if let TableOrSubquery::Subquery { query, .. } = tos {
+                            collect_agg_col_scope_refs_in_select(
+                                query,
+                                scopes,
+                                excluded_cols,
+                                db_set,
+                                &sub_ctes,
+                                saw_any,
+                                refs_scope,
+                            );
+                        }
+                    }
+                    for j in &fc.joins {
+                        if let Some(JoinConstraint::On(on_e)) = &j.constraint {
+                            collect_agg_col_scope_refs(
+                                on_e,
+                                scopes,
+                                excluded_cols,
+                                db_set,
+                                &sub_ctes,
+                                saw_any,
+                                refs_scope,
+                            );
+                        }
+                    }
+                }
+                for rc in projection {
+                    if let ResultColumn::Expr { expr: pe, .. } = rc {
+                        collect_agg_col_scope_refs(
+                            pe,
+                            scopes,
+                            excluded_cols,
+                            db_set,
+                            &sub_ctes,
+                            saw_any,
+                            refs_scope,
+                        );
+                    }
+                }
+                if let Some(w) = selection {
+                    collect_agg_col_scope_refs(
+                        w,
+                        scopes,
+                        excluded_cols,
+                        db_set,
+                        &sub_ctes,
+                        saw_any,
+                        refs_scope,
+                    );
+                }
+                for ge in group_by {
+                    collect_agg_col_scope_refs(
+                        ge,
+                        scopes,
+                        excluded_cols,
+                        db_set,
+                        &sub_ctes,
+                        saw_any,
+                        refs_scope,
+                    );
+                }
+                if let Some(hav) = having {
+                    collect_agg_col_scope_refs(
+                        hav,
+                        scopes,
+                        excluded_cols,
+                        db_set,
+                        &sub_ctes,
+                        saw_any,
+                        refs_scope,
+                    );
+                }
+                for (_, wspec) in windows {
+                    for pe in &wspec.partition_by {
+                        collect_agg_col_scope_refs(
+                            pe,
+                            scopes,
+                            excluded_cols,
+                            db_set,
+                            &sub_ctes,
+                            saw_any,
+                            refs_scope,
+                        );
+                    }
+                    for ob in &wspec.order_by {
+                        collect_agg_col_scope_refs(
+                            &ob.expr,
+                            scopes,
+                            excluded_cols,
+                            db_set,
+                            &sub_ctes,
+                            saw_any,
+                            refs_scope,
+                        );
+                    }
+                }
+                excluded_cols.pop();
+            }
+        }
+    }
+    excluded_cols.push(union_sub_cols);
+    for ob in &sub.order_by {
+        collect_agg_col_scope_refs(
+            &ob.expr,
+            scopes,
+            excluded_cols,
+            db_set,
+            &sub_ctes,
+            saw_any,
+            refs_scope,
+        );
+    }
+    excluded_cols.pop();
+}
+
+/// Determines which active `Select` scope in `scopes` (`0..scopes.len()`) owns an aggregate
+/// function call (`sqlite3ReferencesSrcList` in `sqlite/src/expr.c:7319-7353`,
+/// `resolveExprStep` in `sqlite/src/resolve.c:1386-1402`).
+fn resolve_agg_owner_scope_idx(
+    args: &FunctionArgs,
+    filter: Option<&Expr>,
+    scopes: &[EvalRow],
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+) -> usize {
+    if scopes.is_empty() {
+        return 0;
+    }
+    let mut saw_any = false;
+    let mut refs_scope = vec![false; scopes.len()];
+    let mut excluded_cols = Vec::new();
+    if let FunctionArgs::Exprs(es) = args {
+        for ae in es {
+            collect_agg_col_scope_refs(
+                ae,
+                scopes,
+                &mut excluded_cols,
+                db_set,
+                ctes,
+                &mut saw_any,
+                &mut refs_scope,
+            );
+        }
+    }
+    if let Some(fe) = filter {
+        collect_agg_col_scope_refs(
+            fe,
+            scopes,
+            &mut excluded_cols,
+            db_set,
+            ctes,
+            &mut saw_any,
+            &mut refs_scope,
+        );
+    }
+    if !saw_any {
+        return scopes.len() - 1;
+    }
+    for idx in (0..scopes.len()).rev() {
+        if refs_scope[idx] {
+            return idx;
+        }
+    }
+    0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expr_has_agg_owned_by_target(
+    expr: &Expr,
+    target_idx: usize,
+    cur_scopes: &[EvalRow],
+    defs: &[(String, ResolvedWindowSpec)],
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    functions: &FunctionRegistry,
+) -> bool {
+    match expr {
+        Expr::FunctionCall {
+            name,
+            args,
+            filter,
+            over,
+            ..
+        } => {
+            if let Some(wref) = over {
+                if let FunctionArgs::Exprs(es) = args
+                    && es.iter().any(|ae| {
+                        expr_has_agg_owned_by_target(
+                            ae, target_idx, cur_scopes, defs, db_set, ctes, functions,
+                        )
+                    })
+                {
+                    return true;
+                }
+                if let Some(fe) = filter
+                    && expr_has_agg_owned_by_target(
+                        fe, target_idx, cur_scopes, defs, db_set, ctes, functions,
+                    )
+                {
+                    return true;
+                }
+                if let Ok(spec) = resolve_over_clause(wref, defs)
+                    && (spec.partition_by.iter().any(|pe| {
+                        expr_has_agg_owned_by_target(
+                            pe, target_idx, cur_scopes, defs, db_set, ctes, functions,
+                        )
+                    }) || spec.order_by.iter().any(|ob| {
+                        expr_has_agg_owned_by_target(
+                            &ob.expr, target_idx, cur_scopes, defs, db_set, ctes, functions,
+                        )
+                    }))
+                {
+                    return true;
+                }
+                return false;
+            }
+
+            let (is_star, arg_count) = match args {
+                FunctionArgs::Star => (true, 0),
+                FunctionArgs::Exprs(es) => (false, es.len()),
+            };
+            let is_agg_fn = if !is_star && functions.find_scalar(name, arg_count).is_some() {
+                false
+            } else if functions.has_aggregate_name(name) {
+                true
+            } else {
+                match name.to_ascii_uppercase().as_str() {
+                    "COUNT" | "SUM" | "TOTAL" | "AVG" | "GROUP_CONCAT" | "STRING_AGG" => true,
+                    "MIN" | "MAX" => arg_count == 1,
+                    _ => false,
+                }
+            };
+            if is_agg_fn
+                && resolve_agg_owner_scope_idx(args, filter.as_deref(), cur_scopes, db_set, ctes)
+                    == target_idx
+            {
+                return true;
+            }
+            if let FunctionArgs::Exprs(es) = args
+                && es.iter().any(|ae| {
+                    expr_has_agg_owned_by_target(
+                        ae, target_idx, cur_scopes, defs, db_set, ctes, functions,
+                    )
+                })
+            {
+                return true;
+            }
+            filter.as_deref().is_some_and(|fe| {
+                expr_has_agg_owned_by_target(
+                    fe, target_idx, cur_scopes, defs, db_set, ctes, functions,
+                )
+            })
+        }
+        Expr::Subquery(sub) | Expr::Exists { subquery: sub, .. } => {
+            select_has_agg_owned_by_target(sub, target_idx, cur_scopes, db_set, ctes, functions)
+        }
+        Expr::InSubquery {
+            expr: lhs,
+            subquery: sub,
+            ..
+        } => {
+            expr_has_agg_owned_by_target(lhs, target_idx, cur_scopes, defs, db_set, ctes, functions)
+                || select_has_agg_owned_by_target(
+                    sub, target_idx, cur_scopes, db_set, ctes, functions,
+                )
+        }
+        Expr::Unary { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => expr_has_agg_owned_by_target(
+            inner, target_idx, cur_scopes, defs, db_set, ctes, functions,
+        ),
+        Expr::Binary { left, right, .. } => {
+            expr_has_agg_owned_by_target(
+                left, target_idx, cur_scopes, defs, db_set, ctes, functions,
+            ) || expr_has_agg_owned_by_target(
+                right, target_idx, cur_scopes, defs, db_set, ctes, functions,
+            )
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => [e, low, high].into_iter().any(|x| {
+            expr_has_agg_owned_by_target(x, target_idx, cur_scopes, defs, db_set, ctes, functions)
+        }),
+        Expr::InList { expr: e, list, .. } => {
+            expr_has_agg_owned_by_target(e, target_idx, cur_scopes, defs, db_set, ctes, functions)
+                || list.iter().any(|x| {
+                    expr_has_agg_owned_by_target(
+                        x, target_idx, cur_scopes, defs, db_set, ctes, functions,
+                    )
+                })
+        }
+        Expr::InTable { expr: e, .. } => {
+            expr_has_agg_owned_by_target(e, target_idx, cur_scopes, defs, db_set, ctes, functions)
+        }
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_has_agg_owned_by_target(e, target_idx, cur_scopes, defs, db_set, ctes, functions)
+                || expr_has_agg_owned_by_target(
+                    pattern, target_idx, cur_scopes, defs, db_set, ctes, functions,
+                )
+                || escape.as_deref().is_some_and(|esc| {
+                    expr_has_agg_owned_by_target(
+                        esc, target_idx, cur_scopes, defs, db_set, ctes, functions,
+                    )
+                })
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand.as_deref().is_some_and(|op| {
+                expr_has_agg_owned_by_target(
+                    op, target_idx, cur_scopes, defs, db_set, ctes, functions,
+                )
+            }) || branches.iter().any(|(w, t)| {
+                expr_has_agg_owned_by_target(
+                    w, target_idx, cur_scopes, defs, db_set, ctes, functions,
+                ) || expr_has_agg_owned_by_target(
+                    t, target_idx, cur_scopes, defs, db_set, ctes, functions,
+                )
+            }) || else_expr.as_deref().is_some_and(|el| {
+                expr_has_agg_owned_by_target(
+                    el, target_idx, cur_scopes, defs, db_set, ctes, functions,
+                )
+            })
+        }
+        Expr::RowValue(elems) => elems.iter().any(|el| {
+            expr_has_agg_owned_by_target(el, target_idx, cur_scopes, defs, db_set, ctes, functions)
+        }),
+        _ => false,
+    }
+}
+
+fn select_has_agg_owned_by_target(
+    sub: &SelectStmt,
+    target_idx: usize,
+    outer_scopes: &[EvalRow],
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    functions: &FunctionRegistry,
+) -> bool {
+    let sub_ctes = ctes.with_scope(&sub.ctes);
+    for cte in &sub.ctes {
+        if select_has_agg_owned_by_target(
+            &cte.query,
+            target_idx,
+            outer_scopes,
+            db_set,
+            &sub_ctes,
+            functions,
+        ) {
+            return true;
+        }
+    }
+    let mut all_cores = vec![&sub.body.head];
+    for (_, rhs) in &sub.body.compounds {
+        all_cores.push(rhs);
+    }
+    for core in all_cores {
+        match core {
+            SelectCore::Values(rows) => {
+                let dummy = EvalRow::default();
+                let next_scopes = push_scope(outer_scopes, &dummy);
+                if rows.iter().any(|r| {
+                    r.iter().any(|e| {
+                        expr_has_agg_owned_by_target(
+                            e,
+                            target_idx,
+                            &next_scopes,
+                            &[],
+                            db_set,
+                            &sub_ctes,
+                            functions,
+                        )
+                    })
+                }) {
+                    return true;
+                }
+            }
+            SelectCore::Select {
+                projection,
+                from,
+                selection,
+                group_by,
+                having,
+                windows,
+                ..
+            } => {
+                if let Some(fc) = from {
+                    for tos in std::iter::once(&fc.head).chain(fc.joins.iter().map(|j| &j.right)) {
+                        if let TableOrSubquery::Subquery { query, .. } = tos
+                            && select_has_agg_owned_by_target(
+                                query,
+                                target_idx,
+                                outer_scopes,
+                                db_set,
+                                &sub_ctes,
+                                functions,
+                            )
+                        {
+                            return true;
+                        }
+                    }
+                }
+                let sub_cols = from
+                    .as_ref()
+                    .and_then(|fc| {
+                        static_schema_cols_for_from(
+                            fc,
+                            outer_scopes,
+                            db_set,
+                            &sub_ctes,
+                            &mut Vec::new(),
+                        )
+                    })
+                    .unwrap_or_default();
+                let dummy = EvalRow::new(
+                    Rc::from(sub_cols.as_slice()),
+                    vec![Value::Null; sub_cols.len()],
+                );
+                let next_scopes = push_scope(outer_scopes, &dummy);
+                let defs = chain_window_definitions(windows).unwrap_or_default();
+                if projection.iter().any(|rc| match rc {
+                    ResultColumn::Expr { expr: pe, .. } => expr_has_agg_owned_by_target(
+                        pe,
+                        target_idx,
+                        &next_scopes,
+                        &defs,
+                        db_set,
+                        &sub_ctes,
+                        functions,
+                    ),
+                    _ => false,
+                }) || selection.as_ref().is_some_and(|w| {
+                    expr_has_agg_owned_by_target(
+                        w,
+                        target_idx,
+                        &next_scopes,
+                        &defs,
+                        db_set,
+                        &sub_ctes,
+                        functions,
+                    )
+                }) || group_by.iter().any(|ge| {
+                    expr_has_agg_owned_by_target(
+                        ge,
+                        target_idx,
+                        &next_scopes,
+                        &defs,
+                        db_set,
+                        &sub_ctes,
+                        functions,
+                    )
+                }) || having.as_ref().is_some_and(|h| {
+                    expr_has_agg_owned_by_target(
+                        h,
+                        target_idx,
+                        &next_scopes,
+                        &defs,
+                        db_set,
+                        &sub_ctes,
+                        functions,
+                    )
+                }) {
+                    return true;
+                }
+            }
+        }
+    }
+    let dummy = EvalRow::default();
+    let next_scopes = push_scope(outer_scopes, &dummy);
+    sub.order_by.iter().any(|ob| {
+        expr_has_agg_owned_by_target(
+            &ob.expr,
+            target_idx,
+            &next_scopes,
+            &[],
+            db_set,
+            &sub_ctes,
+            functions,
+        )
+    })
+}
+
+fn core_is_aggregate_in_scope(
+    core: &SelectCore,
+    order_by: &[OrderByTerm],
+    sample_cols: &[ScopedColumn],
+    outer_scopes: &[EvalRow],
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    functions: &FunctionRegistry,
+) -> bool {
+    let SelectCore::Select {
+        projection,
+        group_by,
+        having,
+        windows,
+        ..
+    } = core
+    else {
+        return false;
+    };
+    if !group_by.is_empty() || having.is_some() {
+        return true;
+    }
+    let defs = chain_window_definitions(windows).unwrap_or_default();
+    let row_eval = EvalRow::new(Rc::from(sample_cols), vec![Value::Null; sample_cols.len()]);
+    let cur_scopes = push_scope(outer_scopes, &row_eval);
+    let target_idx = cur_scopes.len() - 1;
+    projection.iter().any(|rc| match rc {
+        ResultColumn::Expr { expr: pe, .. } => expr_has_agg_owned_by_target(
+            pe,
+            target_idx,
+            &cur_scopes,
+            &defs,
+            db_set,
+            ctes,
+            functions,
+        ),
+        _ => false,
+    }) || order_by.iter().any(|ob| {
+        expr_has_agg_owned_by_target(
+            &ob.expr,
+            target_idx,
+            &cur_scopes,
+            &defs,
+            db_set,
+            ctes,
+            functions,
+        )
+    })
+}
+
+fn validate_subquery_from_tables_in_expr_static(
+    expr: &Expr,
+    outer_scopes: &[EvalRow],
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    functions: &FunctionRegistry,
+    visited_ctes: &mut Vec<(usize, usize)>,
+) -> Result<()> {
+    match expr {
+        Expr::Subquery(sub) | Expr::Exists { subquery: sub, .. } => {
+            validate_subquery_from_tables_in_select_static(
+                sub,
+                outer_scopes,
+                db_set,
+                ctes,
+                functions,
+                visited_ctes,
+            )
+        }
+        Expr::InSubquery {
+            expr: lhs,
+            subquery: sub,
+            ..
+        } => {
+            validate_subquery_from_tables_in_expr_static(
+                lhs,
+                outer_scopes,
+                db_set,
+                ctes,
+                functions,
+                visited_ctes,
+            )?;
+            validate_subquery_from_tables_in_select_static(
+                sub,
+                outer_scopes,
+                db_set,
+                ctes,
+                functions,
+                visited_ctes,
+            )
+        }
+        Expr::Unary { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => validate_subquery_from_tables_in_expr_static(
+            inner,
+            outer_scopes,
+            db_set,
+            ctes,
+            functions,
+            visited_ctes,
+        ),
+        Expr::Binary { left, right, .. } => {
+            validate_subquery_from_tables_in_expr_static(
+                left,
+                outer_scopes,
+                db_set,
+                ctes,
+                functions,
+                visited_ctes,
+            )?;
+            validate_subquery_from_tables_in_expr_static(
+                right,
+                outer_scopes,
+                db_set,
+                ctes,
+                functions,
+                visited_ctes,
+            )
+        }
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
+            if let FunctionArgs::Exprs(es) = args {
+                for ae in es {
+                    validate_subquery_from_tables_in_expr_static(
+                        ae,
+                        outer_scopes,
+                        db_set,
+                        ctes,
+                        functions,
+                        visited_ctes,
+                    )?;
+                }
+            }
+            if let Some(fe) = filter {
+                validate_subquery_from_tables_in_expr_static(
+                    fe,
+                    outer_scopes,
+                    db_set,
+                    ctes,
+                    functions,
+                    visited_ctes,
+                )?;
+            }
+            if let Some(WindowRef::Spec(ws)) = over {
+                for pe in &ws.partition_by {
+                    validate_subquery_from_tables_in_expr_static(
+                        pe,
+                        outer_scopes,
+                        db_set,
+                        ctes,
+                        functions,
+                        visited_ctes,
+                    )?;
+                }
+                for ob in &ws.order_by {
+                    validate_subquery_from_tables_in_expr_static(
+                        &ob.expr,
+                        outer_scopes,
+                        db_set,
+                        ctes,
+                        functions,
+                        visited_ctes,
+                    )?;
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_subquery_from_tables_in_select_static(
+    sub: &SelectStmt,
+    outer_scopes: &[EvalRow],
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    functions: &FunctionRegistry,
+    visited_ctes: &mut Vec<(usize, usize)>,
+) -> Result<()> {
+    let sub_ctes = ctes.with_scope(&sub.ctes);
+    for (_, rhs) in sub.body.compounds.iter().rev() {
+        validate_subquery_from_tables_in_core_static(
+            rhs,
+            outer_scopes,
+            db_set,
+            &sub_ctes,
+            functions,
+            visited_ctes,
+        )?;
+    }
+    validate_subquery_from_tables_in_core_static(
+        &sub.body.head,
+        outer_scopes,
+        db_set,
+        &sub_ctes,
+        functions,
+        visited_ctes,
+    )?;
+    for ob in &sub.order_by {
+        validate_subquery_from_tables_in_expr_static(
+            &ob.expr,
+            outer_scopes,
+            db_set,
+            &sub_ctes,
+            functions,
+            visited_ctes,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_subquery_from_tables_in_core_static(
+    core: &SelectCore,
+    outer_scopes: &[EvalRow],
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    functions: &FunctionRegistry,
+    visited_ctes: &mut Vec<(usize, usize)>,
+) -> Result<()> {
+    if let SelectCore::Select {
+        projection,
+        from,
+        selection,
+        group_by,
+        having,
+        windows,
+        ..
+    } = core
+    {
+        if let Some(fc) = from {
+            let _ = validate_from_clause_static(
+                fc,
+                selection.as_ref(),
+                outer_scopes,
+                db_set,
+                ctes,
+                functions,
+                visited_ctes,
+            )?;
+        }
+        for rc in projection {
+            if let ResultColumn::Expr { expr: pe, .. } = rc {
+                validate_subquery_from_tables_in_expr_static(
+                    pe,
+                    outer_scopes,
+                    db_set,
+                    ctes,
+                    functions,
+                    visited_ctes,
+                )?;
+            }
+        }
+        if let Some(w) = selection {
+            validate_subquery_from_tables_in_expr_static(
+                w,
+                outer_scopes,
+                db_set,
+                ctes,
+                functions,
+                visited_ctes,
+            )?;
+        }
+        for ge in group_by {
+            validate_subquery_from_tables_in_expr_static(
+                ge,
+                outer_scopes,
+                db_set,
+                ctes,
+                functions,
+                visited_ctes,
+            )?;
+        }
+        if let Some(h) = having {
+            validate_subquery_from_tables_in_expr_static(
+                h,
+                outer_scopes,
+                db_set,
+                ctes,
+                functions,
+                visited_ctes,
+            )?;
+        }
+        for (_, ws) in windows {
+            for pe in &ws.partition_by {
+                validate_subquery_from_tables_in_expr_static(
+                    pe,
+                    outer_scopes,
+                    db_set,
+                    ctes,
+                    functions,
+                    visited_ctes,
+                )?;
+            }
+            for ob in &ws.order_by {
+                validate_subquery_from_tables_in_expr_static(
+                    &ob.expr,
+                    outer_scopes,
+                    db_set,
+                    ctes,
+                    functions,
+                    visited_ctes,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn first_regular_agg_in_order_by(
+    expr: &Expr,
+    defs: &[(String, ResolvedWindowSpec)],
+    functions: &FunctionRegistry,
+) -> Option<String> {
+    match expr {
+        Expr::FunctionCall {
+            name,
+            args,
+            filter,
+            over,
+            ..
+        } => {
+            if let Some(wref) = over {
+                if let FunctionArgs::Exprs(es) = args {
+                    for e in es {
+                        if let Some(found) = first_regular_agg_in_order_by(e, defs, functions) {
+                            return Some(found);
+                        }
+                    }
+                }
+                if let Some(fe) = filter
+                    && let Some(found) = first_regular_agg_in_order_by(fe, defs, functions)
+                {
+                    return Some(found);
+                }
+                if let Ok(spec) = resolve_over_clause(wref, defs) {
+                    for pe in &spec.partition_by {
+                        if let Some(found) = first_regular_agg_in_order_by(pe, defs, functions) {
+                            return Some(found);
+                        }
+                    }
+                    for ob in &spec.order_by {
+                        if let Some(found) =
+                            first_regular_agg_in_order_by(&ob.expr, defs, functions)
+                        {
+                            return Some(found);
+                        }
+                    }
+                }
+                return None;
+            }
+            let (is_star, arg_count) = match args {
+                FunctionArgs::Star => (true, 0),
+                FunctionArgs::Exprs(es) => (false, es.len()),
+            };
+            let is_agg = if !is_star && functions.find_scalar(name, arg_count).is_some() {
+                false
+            } else if functions.find_aggregate(name, arg_count).is_some() {
+                true
+            } else {
+                match name.to_ascii_uppercase().as_str() {
+                    "COUNT" | "SUM" | "TOTAL" | "AVG" | "GROUP_CONCAT" | "STRING_AGG" => true,
+                    "MIN" | "MAX" => arg_count == 1,
+                    _ => false,
+                }
+            };
+            if is_agg {
+                return Some(name.clone());
+            }
+            if let FunctionArgs::Exprs(es) = args {
+                for e in es {
+                    if let Some(found) = first_regular_agg_in_order_by(e, defs, functions) {
+                        return Some(found);
+                    }
+                }
+            }
+            if let Some(fe) = filter
+                && let Some(found) = first_regular_agg_in_order_by(fe, defs, functions)
+            {
+                return Some(found);
+            }
+            None
+        }
+        Expr::Unary { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => first_regular_agg_in_order_by(inner, defs, functions),
+        Expr::Binary { left, right, .. } => first_regular_agg_in_order_by(left, defs, functions)
+            .or_else(|| first_regular_agg_in_order_by(right, defs, functions)),
+        Expr::Between {
+            expr: e, low, high, ..
+        } => first_regular_agg_in_order_by(e, defs, functions)
+            .or_else(|| first_regular_agg_in_order_by(low, defs, functions))
+            .or_else(|| first_regular_agg_in_order_by(high, defs, functions)),
+        Expr::InList { expr: e, list, .. } => first_regular_agg_in_order_by(e, defs, functions)
+            .or_else(|| {
+                list.iter()
+                    .find_map(|x| first_regular_agg_in_order_by(x, defs, functions))
+            }),
+        Expr::InTable { expr: e, .. } => first_regular_agg_in_order_by(e, defs, functions),
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => first_regular_agg_in_order_by(e, defs, functions)
+            .or_else(|| first_regular_agg_in_order_by(pattern, defs, functions))
+            .or_else(|| {
+                escape
+                    .as_deref()
+                    .and_then(|esc| first_regular_agg_in_order_by(esc, defs, functions))
+            }),
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => operand
+            .as_deref()
+            .and_then(|op| first_regular_agg_in_order_by(op, defs, functions))
+            .or_else(|| {
+                branches.iter().find_map(|(w, t)| {
+                    first_regular_agg_in_order_by(w, defs, functions)
+                        .or_else(|| first_regular_agg_in_order_by(t, defs, functions))
+                })
+            })
+            .or_else(|| {
+                else_expr
+                    .as_deref()
+                    .and_then(|el| first_regular_agg_in_order_by(el, defs, functions))
+            }),
+        Expr::RowValue(elems) => elems
+            .iter()
+            .find_map(|x| first_regular_agg_in_order_by(x, defs, functions)),
+        _ => None,
     }
 }
 
@@ -29281,6 +31942,7 @@ fn subst_order_by_aliases_static(
             distinct,
             args,
             filter,
+            over,
         } => Expr::FunctionCall {
             name: name.clone(),
             distinct: *distinct,
@@ -29306,6 +31968,39 @@ fn subst_order_by_aliases_static(
                     sample_cols,
                     outer_scopes,
                 ))
+            }),
+            over: over.as_ref().map(|wref| match wref {
+                WindowRef::Name(wn) => WindowRef::Name(wn.clone()),
+                WindowRef::Spec(ws) => WindowRef::Spec(Box::new(WindowSpec {
+                    base_window: ws.base_window.clone(),
+                    partition_by: ws
+                        .partition_by
+                        .iter()
+                        .map(|pe| {
+                            subst_order_by_aliases_static(
+                                pe,
+                                expanded_proj,
+                                sample_cols,
+                                outer_scopes,
+                            )
+                        })
+                        .collect(),
+                    order_by: ws
+                        .order_by
+                        .iter()
+                        .map(|ob| OrderByTerm {
+                            expr: subst_order_by_aliases_static(
+                                &ob.expr,
+                                expanded_proj,
+                                sample_cols,
+                                outer_scopes,
+                            ),
+                            desc: ob.desc,
+                            nulls_last: ob.nulls_last,
+                        })
+                        .collect(),
+                    frame: ws.frame.clone(),
+                })),
             }),
         },
         Expr::RowValue(elems) => Expr::RowValue(
@@ -29902,6 +32597,62 @@ fn validate_expr_static(
     inside_agg: bool,
     visited_ctes: &mut Vec<(usize, usize)>,
 ) -> Result<()> {
+    validate_expr_static_with_win(
+        expr,
+        scopes,
+        db_set,
+        ctes,
+        functions,
+        allow_agg,
+        inside_agg,
+        false,
+        &[],
+        visited_ctes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_expr_static_with_win(
+    expr: &Expr,
+    scopes: &[EvalRow],
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    functions: &FunctionRegistry,
+    allow_agg: bool,
+    inside_agg: bool,
+    allow_win: bool,
+    resolved_defs: &[(String, ResolvedWindowSpec)],
+    visited_ctes: &mut Vec<(usize, usize)>,
+) -> Result<()> {
+    validate_expr_static_with_win_stage(
+        expr,
+        scopes,
+        db_set,
+        ctes,
+        functions,
+        allow_agg,
+        inside_agg,
+        allow_win,
+        resolved_defs,
+        None,
+        visited_ctes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_expr_static_with_win_stage(
+    expr: &Expr,
+    scopes: &[EvalRow],
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    functions: &FunctionRegistry,
+    allow_agg: bool,
+    inside_agg: bool,
+    allow_win: bool,
+    resolved_defs: &[(String, ResolvedWindowSpec)],
+    innermost_win_spec: Option<&ResolvedWindowSpec>,
+    visited_ctes: &mut Vec<(usize, usize)>,
+) -> Result<()> {
     match expr {
         Expr::OversizedHex(raw) => Err(SqliteError::new(
             ErrorCode::Error,
@@ -29917,6 +32668,9 @@ fn validate_expr_static(
         | Expr::Bind(_) => Ok(()),
 
         Expr::Column(cref) => {
+            if cref.schema.as_deref() == Some(WIN_SLOT_SCHEMA) {
+                return Ok(());
+            }
             if cref.schema.as_deref() == Some(STAR_SLOT_SCHEMA) {
                 if let Some(last_scope) = scopes.last()
                     && last_scope.lookup_cref_full(cref)?.is_some()
@@ -29942,7 +32696,7 @@ fn validate_expr_static(
         Expr::Collate { expr: inner, .. }
         | Expr::Unary { expr: inner, .. }
         | Expr::IsNull { expr: inner, .. }
-        | Expr::Cast { expr: inner, .. } => validate_expr_static(
+        | Expr::Cast { expr: inner, .. } => validate_expr_static_with_win_stage(
             inner,
             scopes,
             db_set,
@@ -29950,12 +32704,15 @@ fn validate_expr_static(
             functions,
             allow_agg,
             inside_agg,
+            allow_win,
+            resolved_defs,
+            innermost_win_spec,
             visited_ctes,
         ),
 
         Expr::RowValue(elems) => {
             if elems.len() == 1 {
-                validate_expr_static(
+                validate_expr_static_with_win_stage(
                     &elems[0],
                     scopes,
                     db_set,
@@ -29963,6 +32720,9 @@ fn validate_expr_static(
                     functions,
                     allow_agg,
                     inside_agg,
+                    allow_win,
+                    resolved_defs,
+                    innermost_win_spec,
                     visited_ctes,
                 )
             } else {
@@ -29983,7 +32743,7 @@ fn validate_expr_static(
                     | BinaryOp::IsNot
             ) && (is_row_value_expr(left) || is_row_value_expr(right))
             {
-                let lw = validate_tuple_expr_static(
+                let lw = validate_tuple_expr_static_with_win(
                     left,
                     scopes,
                     db_set,
@@ -29991,9 +32751,11 @@ fn validate_expr_static(
                     functions,
                     allow_agg,
                     inside_agg,
+                    allow_win,
+                    resolved_defs,
                     visited_ctes,
                 )?;
-                let rw = validate_tuple_expr_static(
+                let rw = validate_tuple_expr_static_with_win(
                     right,
                     scopes,
                     db_set,
@@ -30001,6 +32763,8 @@ fn validate_expr_static(
                     functions,
                     allow_agg,
                     inside_agg,
+                    allow_win,
+                    resolved_defs,
                     visited_ctes,
                 )?;
                 if lw != rw {
@@ -30022,7 +32786,7 @@ fn validate_expr_static(
                 }
                 return Ok(());
             }
-            validate_expr_static(
+            validate_expr_static_with_win_stage(
                 left,
                 scopes,
                 db_set,
@@ -30030,9 +32794,12 @@ fn validate_expr_static(
                 functions,
                 allow_agg,
                 inside_agg,
+                allow_win,
+                resolved_defs,
+                innermost_win_spec,
                 visited_ctes,
             )?;
-            validate_expr_static(
+            validate_expr_static_with_win_stage(
                 right,
                 scopes,
                 db_set,
@@ -30040,6 +32807,9 @@ fn validate_expr_static(
                 functions,
                 allow_agg,
                 inside_agg,
+                allow_win,
+                resolved_defs,
+                innermost_win_spec,
                 visited_ctes,
             )
         }
@@ -30051,7 +32821,7 @@ fn validate_expr_static(
             ..
         } => {
             if is_row_value_expr(val_e) || is_row_value_expr(low) || is_row_value_expr(high) {
-                let vw = validate_tuple_expr_static(
+                let vw = validate_tuple_expr_static_with_win(
                     val_e,
                     scopes,
                     db_set,
@@ -30059,9 +32829,11 @@ fn validate_expr_static(
                     functions,
                     allow_agg,
                     inside_agg,
+                    allow_win,
+                    resolved_defs,
                     visited_ctes,
                 )?;
-                let lw = validate_tuple_expr_static(
+                let lw = validate_tuple_expr_static_with_win(
                     low,
                     scopes,
                     db_set,
@@ -30069,9 +32841,11 @@ fn validate_expr_static(
                     functions,
                     allow_agg,
                     inside_agg,
+                    allow_win,
+                    resolved_defs,
                     visited_ctes,
                 )?;
-                let hw = validate_tuple_expr_static(
+                let hw = validate_tuple_expr_static_with_win(
                     high,
                     scopes,
                     db_set,
@@ -30079,6 +32853,8 @@ fn validate_expr_static(
                     functions,
                     allow_agg,
                     inside_agg,
+                    allow_win,
+                    resolved_defs,
                     visited_ctes,
                 )?;
                 if vw != lw || vw != hw {
@@ -30086,7 +32862,7 @@ fn validate_expr_static(
                 }
                 return Ok(());
             }
-            validate_expr_static(
+            validate_expr_static_with_win(
                 val_e,
                 scopes,
                 db_set,
@@ -30094,9 +32870,11 @@ fn validate_expr_static(
                 functions,
                 allow_agg,
                 inside_agg,
+                allow_win,
+                resolved_defs,
                 visited_ctes,
             )?;
-            validate_expr_static(
+            validate_expr_static_with_win(
                 low,
                 scopes,
                 db_set,
@@ -30104,9 +32882,11 @@ fn validate_expr_static(
                 functions,
                 allow_agg,
                 inside_agg,
+                allow_win,
+                resolved_defs,
                 visited_ctes,
             )?;
-            validate_expr_static(
+            validate_expr_static_with_win(
                 high,
                 scopes,
                 db_set,
@@ -30114,6 +32894,8 @@ fn validate_expr_static(
                 functions,
                 allow_agg,
                 inside_agg,
+                allow_win,
+                resolved_defs,
                 visited_ctes,
             )
         }
@@ -30121,7 +32903,7 @@ fn validate_expr_static(
         Expr::InList {
             expr: lhs_e, list, ..
         } => {
-            let n = validate_tuple_expr_static(
+            let n = validate_tuple_expr_static_with_win(
                 lhs_e,
                 scopes,
                 db_set,
@@ -30129,10 +32911,12 @@ fn validate_expr_static(
                 functions,
                 allow_agg,
                 inside_agg,
+                allow_win,
+                resolved_defs,
                 visited_ctes,
             )?;
             for item in list {
-                let m = validate_tuple_expr_static(
+                let m = validate_tuple_expr_static_with_win(
                     item,
                     scopes,
                     db_set,
@@ -30140,6 +32924,8 @@ fn validate_expr_static(
                     functions,
                     allow_agg,
                     inside_agg,
+                    allow_win,
+                    resolved_defs,
                     visited_ctes,
                 )?;
                 if m != n {
@@ -30163,7 +32949,7 @@ fn validate_expr_static(
             subquery,
             ..
         } => {
-            let n = validate_tuple_expr_static(
+            let n = validate_tuple_expr_static_with_win(
                 lhs_e,
                 scopes,
                 db_set,
@@ -30171,6 +32957,8 @@ fn validate_expr_static(
                 functions,
                 allow_agg,
                 inside_agg,
+                allow_win,
+                resolved_defs,
                 visited_ctes,
             )?;
             let sub_cols = validate_select_stmt_static(
@@ -30196,7 +32984,7 @@ fn validate_expr_static(
         Expr::InTable {
             expr: lhs_e, table, ..
         } => {
-            let n = validate_tuple_expr_static(
+            let n = validate_tuple_expr_static_with_win(
                 lhs_e,
                 scopes,
                 db_set,
@@ -30204,6 +32992,8 @@ fn validate_expr_static(
                 functions,
                 allow_agg,
                 inside_agg,
+                allow_win,
+                resolved_defs,
                 visited_ctes,
             )?;
             let m = if table.schema.is_none()
@@ -30251,7 +33041,7 @@ fn validate_expr_static(
             escape,
             ..
         } => {
-            validate_expr_static(
+            validate_expr_static_with_win(
                 txt_e,
                 scopes,
                 db_set,
@@ -30259,9 +33049,11 @@ fn validate_expr_static(
                 functions,
                 allow_agg,
                 inside_agg,
+                allow_win,
+                resolved_defs,
                 visited_ctes,
             )?;
-            validate_expr_static(
+            validate_expr_static_with_win(
                 pattern,
                 scopes,
                 db_set,
@@ -30269,10 +33061,12 @@ fn validate_expr_static(
                 functions,
                 allow_agg,
                 inside_agg,
+                allow_win,
+                resolved_defs,
                 visited_ctes,
             )?;
             if let Some(esc) = escape {
-                validate_expr_static(
+                validate_expr_static_with_win(
                     esc,
                     scopes,
                     db_set,
@@ -30280,6 +33074,8 @@ fn validate_expr_static(
                     functions,
                     allow_agg,
                     inside_agg,
+                    allow_win,
+                    resolved_defs,
                     visited_ctes,
                 )?;
             }
@@ -30292,7 +33088,7 @@ fn validate_expr_static(
             else_expr,
         } => {
             if let Some(op) = operand {
-                validate_expr_static(
+                validate_expr_static_with_win(
                     op,
                     scopes,
                     db_set,
@@ -30300,11 +33096,13 @@ fn validate_expr_static(
                     functions,
                     allow_agg,
                     inside_agg,
+                    allow_win,
+                    resolved_defs,
                     visited_ctes,
                 )?;
             }
             for (w, t) in branches {
-                validate_expr_static(
+                validate_expr_static_with_win(
                     w,
                     scopes,
                     db_set,
@@ -30312,9 +33110,11 @@ fn validate_expr_static(
                     functions,
                     allow_agg,
                     inside_agg,
+                    allow_win,
+                    resolved_defs,
                     visited_ctes,
                 )?;
-                validate_expr_static(
+                validate_expr_static_with_win(
                     t,
                     scopes,
                     db_set,
@@ -30322,11 +33122,13 @@ fn validate_expr_static(
                     functions,
                     allow_agg,
                     inside_agg,
+                    allow_win,
+                    resolved_defs,
                     visited_ctes,
                 )?;
             }
             if let Some(el) = else_expr {
-                validate_expr_static(
+                validate_expr_static_with_win(
                     el,
                     scopes,
                     db_set,
@@ -30334,6 +33136,8 @@ fn validate_expr_static(
                     functions,
                     allow_agg,
                     inside_agg,
+                    allow_win,
+                    resolved_defs,
                     visited_ctes,
                 )?;
             }
@@ -30345,38 +33149,141 @@ fn validate_expr_static(
             distinct,
             args,
             filter,
+            over,
         } => {
             let (is_star, arg_count) = match args {
                 FunctionArgs::Star => (true, 0),
                 FunctionArgs::Exprs(es) => (false, es.len()),
             };
-            functions.validate_call(
-                name,
-                is_star,
-                arg_count,
-                *distinct,
-                filter.is_some(),
-                allow_agg && !inside_agg,
-            )?;
-            let is_agg_fn = if !is_star && functions.find_scalar(name, arg_count).is_some() {
-                false
-            } else {
-                match name.to_ascii_uppercase().as_str() {
-                    "COUNT" | "SUM" | "TOTAL" | "AVG" | "GROUP_CONCAT" | "STRING_AGG" => true,
-                    "MIN" | "MAX" => arg_count == 1,
+            if let Some(over_ref) = over {
+                let fn_kind = classify_and_validate_window_fn(
+                    name, is_star, arg_count, *distinct, functions,
+                )?;
+                let spec_opt = resolve_over_clause(over_ref, resolved_defs)
+                    .and_then(|s| finalize_window_spec_for_fn(s, &fn_kind, filter.is_some()))
+                    .ok();
+                let is_non_innermost_stage = match (innermost_win_spec, spec_opt.as_ref()) {
+                    (Some(inner_s), Some(cur_s)) => {
+                        !(inner_s.partition_by == cur_s.partition_by
+                            && inner_s.order_by == cur_s.order_by
+                            && inner_s.units == cur_s.units
+                            && inner_s.start == cur_s.start
+                            && inner_s.end == cur_s.end
+                            && inner_s.exclude == cur_s.exclude)
+                    }
                     _ => false,
+                };
+                let mut stripped_scopes;
+                let win_sub_scopes: &[EvalRow] = if is_non_innermost_stage {
+                    stripped_scopes = scopes.to_vec();
+                    if let Some(last_s) = stripped_scopes.last_mut() {
+                        last_s.agg_group_rows = None;
+                    }
+                    &stripped_scopes
+                } else {
+                    scopes
+                };
+                if let FunctionArgs::Exprs(es) = args {
+                    for ae in es {
+                        validate_expr_static_with_win(
+                            ae,
+                            win_sub_scopes,
+                            db_set,
+                            ctes,
+                            functions,
+                            allow_agg && !inside_agg,
+                            false,
+                            false,
+                            resolved_defs,
+                            visited_ctes,
+                        )?;
+                    }
                 }
-            };
-            if is_agg_fn {
-                if inside_agg || !allow_agg {
+                if let Some(fe) = filter {
+                    validate_expr_static_with_win(
+                        fe,
+                        win_sub_scopes,
+                        db_set,
+                        ctes,
+                        functions,
+                        allow_agg && !inside_agg,
+                        false,
+                        false,
+                        resolved_defs,
+                        visited_ctes,
+                    )?;
+                }
+                if !allow_win || inside_agg {
                     return Err(SqliteError::new(
                         ErrorCode::Error,
-                        format!("misuse of aggregate function {name}()"),
+                        format!("misuse of window function {name}()"),
+                    ));
+                }
+                let spec = resolve_over_clause(over_ref, resolved_defs)?;
+                let spec = finalize_window_spec_for_fn(spec, &fn_kind, filter.is_some())?;
+                for pe in &spec.partition_by {
+                    validate_expr_static_with_win(
+                        pe,
+                        win_sub_scopes,
+                        db_set,
+                        ctes,
+                        functions,
+                        allow_agg && !inside_agg,
+                        false,
+                        false,
+                        resolved_defs,
+                        visited_ctes,
+                    )?;
+                }
+                for ob in &spec.order_by {
+                    validate_expr_static_with_win(
+                        &ob.expr,
+                        win_sub_scopes,
+                        db_set,
+                        ctes,
+                        functions,
+                        allow_agg && !inside_agg,
+                        false,
+                        false,
+                        resolved_defs,
+                        visited_ctes,
+                    )?;
+                }
+                for b in [&spec.start, &spec.end] {
+                    if let WindowFrameBound::Preceding(be) | WindowFrameBound::Following(be) = b
+                        && is_window_bound_constant(be)
+                    {
+                        validate_expr_static_with_win(
+                            be,
+                            &[],
+                            db_set,
+                            ctes,
+                            functions,
+                            false,
+                            false,
+                            false,
+                            resolved_defs,
+                            visited_ctes,
+                        )?;
+                    }
+                }
+                return Ok(());
+            }
+
+            let upper = name.to_ascii_uppercase();
+            if !functions.has_scalar_name(name)
+                && !functions.has_aggregate_name(name)
+                && let Some((min_a, max_a)) = builtin_window_arity(&upper)
+            {
+                if is_star || arg_count < min_a || arg_count > max_a {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("wrong number of arguments to function {name}()"),
                     ));
                 }
                 if let FunctionArgs::Exprs(es) = args {
                     for ae in es {
-                        validate_expr_static(
+                        validate_expr_static_with_win(
                             ae,
                             scopes,
                             db_set,
@@ -30384,12 +33291,14 @@ fn validate_expr_static(
                             functions,
                             false,
                             true,
+                            false,
+                            resolved_defs,
                             visited_ctes,
                         )?;
                     }
                 }
                 if let Some(fe) = filter {
-                    validate_expr_static(
+                    validate_expr_static_with_win(
                         fe,
                         scopes,
                         db_set,
@@ -30397,12 +33306,92 @@ fn validate_expr_static(
                         functions,
                         false,
                         true,
+                        false,
+                        resolved_defs,
                         visited_ctes,
                     )?;
                 }
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("misuse of window function {name}()"),
+                ));
+            }
+
+            let is_agg_fn = if !is_star && functions.find_scalar(name, arg_count).is_some() {
+                false
+            } else if functions.has_aggregate_name(name) {
+                true
+            } else {
+                match upper.as_str() {
+                    "COUNT" | "SUM" | "TOTAL" | "AVG" | "GROUP_CONCAT" | "STRING_AGG" => true,
+                    "MIN" | "MAX" => arg_count == 1,
+                    _ => false,
+                }
+            };
+            functions.validate_call(
+                name,
+                is_star,
+                arg_count,
+                *distinct,
+                filter.is_some(),
+                is_agg_fn || (allow_agg && !inside_agg),
+            )?;
+            if is_agg_fn {
+                let owner_idx =
+                    resolve_agg_owner_scope_idx(args, filter.as_deref(), scopes, db_set, ctes);
+                let mut child_scopes = scopes.to_vec();
+                if let Some(s) = child_scopes.get_mut(owner_idx) {
+                    s.agg_group_rows = None;
+                }
+                if let FunctionArgs::Exprs(es) = args {
+                    for ae in es {
+                        validate_expr_static_with_win(
+                            ae,
+                            &child_scopes,
+                            db_set,
+                            ctes,
+                            functions,
+                            false,
+                            true,
+                            false,
+                            resolved_defs,
+                            visited_ctes,
+                        )?;
+                    }
+                }
+                if let Some(fe) = filter {
+                    validate_expr_static_with_win(
+                        fe,
+                        &child_scopes,
+                        db_set,
+                        ctes,
+                        functions,
+                        false,
+                        true,
+                        false,
+                        resolved_defs,
+                        visited_ctes,
+                    )?;
+                }
+                if inside_agg || !allow_agg {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("misuse of aggregate function {name}()"),
+                    ));
+                }
+                if owner_idx < scopes.len().saturating_sub(1)
+                    && scopes
+                        .get(owner_idx)
+                        .is_none_or(|s| s.agg_group_rows.is_none())
+                {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("misuse of aggregate: {name}()"),
+                    ));
+                }
             } else if let FunctionArgs::Exprs(es) = args {
                 for ae in es {
-                    validate_expr_static(
+                    validate_expr_static_with_win_stage(
                         ae,
                         scopes,
                         db_set,
@@ -30410,6 +33399,9 @@ fn validate_expr_static(
                         functions,
                         allow_agg,
                         inside_agg,
+                        allow_win,
+                        resolved_defs,
+                        innermost_win_spec,
                         visited_ctes,
                     )?;
                 }
@@ -30443,7 +33435,7 @@ fn validate_expr_static(
 
         Expr::Raise { message, .. } => {
             if let Some(m) = message {
-                validate_expr_static(
+                validate_expr_static_with_win(
                     m,
                     scopes,
                     db_set,
@@ -30451,6 +33443,8 @@ fn validate_expr_static(
                     functions,
                     allow_agg,
                     inside_agg,
+                    allow_win,
+                    resolved_defs,
                     visited_ctes,
                 )?;
             }
@@ -30499,6 +33493,7 @@ fn reject_raise_in_top_level_core(
             selection,
             group_by,
             having,
+            windows,
             ..
         } => {
             if let Some(fc) = from {
@@ -30517,6 +33512,22 @@ fn reject_raise_in_top_level_core(
             }
             if let Some(h) = having {
                 reject_raise_in_top_level_expr(h, db_set, ctes, visited_views)?;
+            }
+            for (_, ws) in windows {
+                for pe in &ws.partition_by {
+                    reject_raise_in_top_level_expr(pe, db_set, ctes, visited_views)?;
+                }
+                for ob in &ws.order_by {
+                    reject_raise_in_top_level_expr(&ob.expr, db_set, ctes, visited_views)?;
+                }
+                if let Some(ref wf) = ws.frame {
+                    for b in [&wf.start, &wf.end] {
+                        if let WindowFrameBound::Preceding(be) | WindowFrameBound::Following(be) = b
+                        {
+                            reject_raise_in_top_level_expr(be, db_set, ctes, visited_views)?;
+                        }
+                    }
+                }
             }
             Ok(())
         }
@@ -30670,7 +33681,9 @@ fn reject_raise_in_top_level_expr(
             }
             Ok(())
         }
-        Expr::FunctionCall { args, filter, .. } => {
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
             if let FunctionArgs::Exprs(es) = args {
                 for e in es {
                     reject_raise_in_top_level_expr(e, db_set, ctes, visited_views)?;
@@ -30678,6 +33691,22 @@ fn reject_raise_in_top_level_expr(
             }
             if let Some(f) = filter {
                 reject_raise_in_top_level_expr(f, db_set, ctes, visited_views)?;
+            }
+            if let Some(WindowRef::Spec(ws)) = over {
+                for pe in &ws.partition_by {
+                    reject_raise_in_top_level_expr(pe, db_set, ctes, visited_views)?;
+                }
+                for ob in &ws.order_by {
+                    reject_raise_in_top_level_expr(&ob.expr, db_set, ctes, visited_views)?;
+                }
+                if let Some(ref wf) = ws.frame {
+                    for b in [&wf.start, &wf.end] {
+                        if let WindowFrameBound::Preceding(be) | WindowFrameBound::Following(be) = b
+                        {
+                            reject_raise_in_top_level_expr(be, db_set, ctes, visited_views)?;
+                        }
+                    }
+                }
             }
             Ok(())
         }
@@ -30838,7 +33867,7 @@ fn reject_raise_in_top_level_delete(del: &DeleteStmt, db_set: &DatabaseSet) -> R
 
 #[allow(clippy::too_many_arguments)]
 fn validate_tuple_expr_static(
-    mut expr: &Expr,
+    expr: &Expr,
     scopes: &[EvalRow],
     db_set: &DatabaseSet,
     ctes: &CteStore,
@@ -30847,13 +33876,40 @@ fn validate_tuple_expr_static(
     inside_agg: bool,
     visited_ctes: &mut Vec<(usize, usize)>,
 ) -> Result<usize> {
+    validate_tuple_expr_static_with_win(
+        expr,
+        scopes,
+        db_set,
+        ctes,
+        functions,
+        allow_agg,
+        inside_agg,
+        false,
+        &[],
+        visited_ctes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_tuple_expr_static_with_win(
+    mut expr: &Expr,
+    scopes: &[EvalRow],
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    functions: &FunctionRegistry,
+    allow_agg: bool,
+    inside_agg: bool,
+    allow_win: bool,
+    resolved_defs: &[(String, ResolvedWindowSpec)],
+    visited_ctes: &mut Vec<(usize, usize)>,
+) -> Result<usize> {
     while let Expr::Collate { expr: inner, .. } = expr {
         expr = inner;
     }
     match expr {
         Expr::RowValue(elems) => {
             for el in elems {
-                validate_expr_static(
+                validate_expr_static_with_win(
                     el,
                     scopes,
                     db_set,
@@ -30861,6 +33917,8 @@ fn validate_tuple_expr_static(
                     functions,
                     allow_agg,
                     inside_agg,
+                    allow_win,
+                    resolved_defs,
                     visited_ctes,
                 )?;
             }
@@ -30872,7 +33930,7 @@ fn validate_tuple_expr_static(
             Ok(sub_cols.len().max(1))
         }
         other => {
-            validate_expr_static(
+            validate_expr_static_with_win(
                 other,
                 scopes,
                 db_set,
@@ -30880,6 +33938,8 @@ fn validate_tuple_expr_static(
                 functions,
                 allow_agg,
                 inside_agg,
+                allow_win,
+                resolved_defs,
                 visited_ctes,
             )?;
             Ok(1)

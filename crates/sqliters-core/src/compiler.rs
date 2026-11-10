@@ -6,7 +6,8 @@ use sqliters_syntax::{
     BinaryOp, BindParam, ColumnRef, CommonTableExpr, CompoundOp, CurrentTimeKind, Expr, FromClause,
     FunctionArgs, IndexHint, InsertSource, InsertStmt, JoinConstraint, LikeOp, LimitClause,
     OrderByTerm, QualifiedName, ResultColumn, SelectBody, SelectCore, SelectStmt, SetAssignment,
-    Stmt, TableOrSubquery, TriggerStep, TriggerTiming, UnaryOp, UpsertAction,
+    Stmt, TableOrSubquery, TriggerStep, TriggerTiming, UnaryOp, UpsertAction, WindowFrameBound,
+    WindowRef, WindowSpec,
 };
 use sqliters_types::{
     Collation, DatabaseId, ErrorCode, KeySortOrder, Result, SqliteError, TypeAffinity, Value,
@@ -19,6 +20,7 @@ use crate::db_set::{DatabaseSet, ResolvedRelation};
 use crate::execution_context::FunctionRegistry;
 use crate::schema::{IndexSchema, Schema, TableSchema, ViewSchema, fix_permanent_view_select};
 use crate::trigger::TriggerEventKind;
+use crate::window::{core_has_window, expr_contains_window, is_window_bound_constant};
 
 /// Chosen B-Tree access strategy for a single table (`where.c`).
 #[derive(Debug, Clone)]
@@ -309,9 +311,13 @@ pub fn expr_is_table_independent(expr: &Expr) -> bool {
         }
         Expr::RowValue(elems) => elems.iter().all(expr_is_table_independent),
         Expr::FunctionCall {
-            name, args, filter, ..
+            name,
+            args,
+            filter,
+            over,
+            ..
         } => {
-            if expr_contains_aggregate(expr) || filter.is_some() {
+            if over.is_some() || expr_contains_aggregate(expr) || filter.is_some() {
                 return false;
             }
             let _ = name;
@@ -325,7 +331,32 @@ pub fn expr_is_table_independent(expr: &Expr) -> bool {
 
 pub fn expr_contains_aggregate(expr: &Expr) -> bool {
     match expr {
-        Expr::FunctionCall { name, args, .. } => {
+        Expr::FunctionCall {
+            name,
+            args,
+            filter,
+            over,
+            ..
+        } => {
+            if let Some(wref) = over {
+                let in_args = match args {
+                    FunctionArgs::Star => false,
+                    FunctionArgs::Exprs(es) => es.iter().any(expr_contains_aggregate),
+                };
+                let in_over = match wref {
+                    WindowRef::Name(_) => false,
+                    WindowRef::Spec(ws) => {
+                        ws.partition_by.iter().any(expr_contains_aggregate)
+                            || ws
+                                .order_by
+                                .iter()
+                                .any(|ob| expr_contains_aggregate(&ob.expr))
+                    }
+                };
+                return in_args
+                    || filter.as_deref().is_some_and(expr_contains_aggregate)
+                    || in_over;
+            }
             let is_agg = match args {
                 FunctionArgs::Star => AggregateKind::from_name(name, true).is_some(),
                 FunctionArgs::Exprs(es) => {
@@ -342,10 +373,11 @@ pub fn expr_contains_aggregate(expr: &Expr) -> bool {
             if is_agg {
                 return true;
             }
-            match args {
-                FunctionArgs::Star => false,
-                FunctionArgs::Exprs(es) => es.iter().any(expr_contains_aggregate),
-            }
+            filter.as_deref().is_some_and(expr_contains_aggregate)
+                || match args {
+                    FunctionArgs::Star => false,
+                    FunctionArgs::Exprs(es) => es.iter().any(expr_contains_aggregate),
+                }
         }
         Expr::Unary { expr, .. }
         | Expr::Collate { expr, .. }
@@ -364,7 +396,7 @@ pub fn expr_contains_aggregate(expr: &Expr) -> bool {
         Expr::InList { expr, list, .. } => {
             expr_contains_aggregate(expr) || list.iter().any(expr_contains_aggregate)
         }
-        Expr::InTable { expr, .. } => expr_contains_aggregate(expr),
+        Expr::InTable { expr, .. } | Expr::InSubquery { expr, .. } => expr_contains_aggregate(expr),
         Expr::Like {
             expr,
             pattern,
@@ -437,8 +469,11 @@ pub fn expr_contains_subquery(expr: &Expr) -> bool {
                     .any(|(w, t)| expr_contains_subquery(w) || expr_contains_subquery(t))
                 || else_expr.as_deref().is_some_and(expr_contains_subquery)
         }
-        Expr::FunctionCall { args, filter, .. } => {
-            filter.as_deref().is_some_and(expr_contains_subquery)
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
+            over.is_some()
+                || filter.as_deref().is_some_and(expr_contains_subquery)
                 || match args {
                     FunctionArgs::Star => false,
                     FunctionArgs::Exprs(es) => es.iter().any(expr_contains_subquery),
@@ -701,12 +736,18 @@ where
         selection,
         group_by,
         having,
+        windows,
     } = &stmt.body.head
     else {
         return Ok(None);
     };
 
-    if *distinct || !group_by.is_empty() || having.is_some() {
+    if *distinct
+        || !group_by.is_empty()
+        || having.is_some()
+        || !windows.is_empty()
+        || core_has_window(&stmt.body.head, &stmt.order_by)
+    {
         return Ok(None);
     }
 
@@ -2012,7 +2053,14 @@ fn compile_expr(
             distinct,
             args,
             filter,
+            over,
         } => {
+            if over.is_some() {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("misuse of window function {name}()"),
+                ));
+            }
             let (star_args, expr_list) = match args {
                 FunctionArgs::Star => (true, Vec::new()),
                 FunctionArgs::Exprs(es) => (false, es.clone()),
@@ -2537,13 +2585,15 @@ fn select_core_blocks_flattening(core: &SelectCore) -> bool {
             group_by,
             having,
             projection,
+            windows,
             ..
         } => {
             *distinct
                 || !group_by.is_empty()
                 || having.is_some()
+                || !windows.is_empty()
                 || projection.iter().any(|rc| {
-                    matches!(rc, ResultColumn::Expr { expr, .. } if expr_has_agg_for_explain(expr))
+                    matches!(rc, ResultColumn::Expr { expr, .. } if expr_has_agg_for_explain(expr) || expr_contains_window(expr))
                 })
         }
     }
@@ -2667,7 +2717,12 @@ fn expr_needs_ephemeral_in_db_set(
                     .as_deref()
                     .is_some_and(|esc| expr_needs_ephemeral_in_db_set(esc, ctes, db_set, depth + 1))
         }
-        Expr::FunctionCall { args, filter, .. } => {
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
+            if over.is_some() {
+                return true;
+            }
             let args_ephem = match args {
                 FunctionArgs::Star => false,
                 FunctionArgs::Exprs(es) => es
@@ -2717,11 +2772,13 @@ fn in_subquery_reuses_index(
         selection: None,
         group_by,
         having: None,
+        windows,
     } = &sub.body.head
     else {
         return false;
     };
-    if !group_by.is_empty() || !fc.joins.is_empty() || projection.len() != 1 {
+    if !group_by.is_empty() || !windows.is_empty() || !fc.joins.is_empty() || projection.len() != 1
+    {
         return false;
     }
     let TableOrSubquery::Table { name, .. } = &fc.head else {
@@ -2813,11 +2870,12 @@ fn select_core_needs_ephemeral(
         selection,
         group_by,
         having,
+        windows,
     } = core
     else {
         return false;
     };
-    if *distinct {
+    if *distinct || !windows.is_empty() {
         return true;
     }
     if projection.iter().any(|rc| {
@@ -3006,6 +3064,7 @@ fn select_core_reads_target(
             selection,
             group_by,
             having,
+            windows,
             ..
         } => {
             if projection.iter().any(|rc| {
@@ -3025,6 +3084,11 @@ fn select_core_reads_target(
             }
             if having.as_ref().is_some_and(|h| {
                 expr_reads_target(h, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
+            }) {
+                return true;
+            }
+            if windows.iter().any(|(_, ws)| {
+                window_spec_reads_target(ws, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
             }) {
                 return true;
             }
@@ -3196,7 +3260,9 @@ fn expr_reads_target(
                     expr_reads_target(esc, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
                 })
         }
-        Expr::FunctionCall { args, filter, .. } => {
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
             let args_r = match args {
                 FunctionArgs::Star => false,
                 FunctionArgs::Exprs(es) => es.iter().any(|e| {
@@ -3207,6 +3273,7 @@ fn expr_reads_target(
                 || filter.as_deref().is_some_and(|f| {
                     expr_reads_target(f, ctes, target_db_id, target_tbl_name, db_set, depth + 1)
                 })
+                || matches!(over, Some(WindowRef::Spec(ws)) if window_spec_reads_target(ws, ctes, target_db_id, target_tbl_name, db_set, depth + 1))
         }
         Expr::Case {
             operand,
@@ -3436,6 +3503,7 @@ fn emit_explain_select_core_literals(prog: &mut VdbeProgram, core: &SelectCore) 
             selection,
             group_by,
             having,
+            windows,
             ..
         } => {
             for rc in projection {
@@ -3451,6 +3519,9 @@ fn emit_explain_select_core_literals(prog: &mut VdbeProgram, core: &SelectCore) 
             }
             if let Some(h) = having {
                 emit_explain_expr_literals(prog, h);
+            }
+            for (_, ws) in windows {
+                emit_explain_window_spec_literals(prog, ws);
             }
         }
     }
@@ -3517,7 +3588,9 @@ fn emit_explain_expr_literals(prog: &mut VdbeProgram, expr: &Expr) {
                 emit_explain_expr_literals(prog, el);
             }
         }
-        Expr::FunctionCall { args, filter, .. } => {
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
             if let FunctionArgs::Exprs(es) = args {
                 for e in es {
                     emit_explain_expr_literals(prog, e);
@@ -3525,6 +3598,9 @@ fn emit_explain_expr_literals(prog: &mut VdbeProgram, expr: &Expr) {
             }
             if let Some(f) = filter {
                 emit_explain_expr_literals(prog, f);
+            }
+            if let Some(WindowRef::Spec(ws)) = over {
+                emit_explain_window_spec_literals(prog, ws);
             }
         }
         Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
@@ -3539,6 +3615,47 @@ fn emit_explain_expr_literals(prog: &mut VdbeProgram, expr: &Expr) {
             }
         }
         _ => {}
+    }
+}
+
+fn window_spec_reads_target(
+    ws: &WindowSpec,
+    ctes: &[CommonTableExpr],
+    target_db_id: DatabaseId,
+    target_tbl_name: &str,
+    db_set: &DatabaseSet,
+    depth: usize,
+) -> bool {
+    ws.partition_by
+        .iter()
+        .any(|pe| expr_reads_target(pe, ctes, target_db_id, target_tbl_name, db_set, depth + 1))
+        || ws.order_by.iter().any(|ob| {
+            expr_reads_target(
+                &ob.expr,
+                ctes,
+                target_db_id,
+                target_tbl_name,
+                db_set,
+                depth + 1,
+            )
+        })
+}
+
+fn emit_explain_window_spec_literals(prog: &mut VdbeProgram, ws: &WindowSpec) {
+    for pe in &ws.partition_by {
+        emit_explain_expr_literals(prog, pe);
+    }
+    for ob in &ws.order_by {
+        emit_explain_expr_literals(prog, &ob.expr);
+    }
+    if let Some(ref wf) = ws.frame {
+        for b in [&wf.start, &wf.end] {
+            if let WindowFrameBound::Preceding(e) | WindowFrameBound::Following(e) = b
+                && is_window_bound_constant(e)
+            {
+                emit_explain_expr_literals(prog, e);
+            }
+        }
     }
 }
 
@@ -3699,7 +3816,7 @@ where
                     explain_tos(&j.right)?;
                 }
             }
-            if !sel.order_by.is_empty() {
+            if !sel.order_by.is_empty() && !core_has_window(&sel.body.head, &sel.order_by) {
                 push_detail("USE TEMP B-TREE FOR ORDER BY".to_owned());
             }
         } else {
@@ -3742,6 +3859,7 @@ where
                                 selection: None,
                                 group_by: Vec::new(),
                                 having: None,
+                                windows: Vec::new(),
                             },
                             compounds: Vec::new(),
                         },

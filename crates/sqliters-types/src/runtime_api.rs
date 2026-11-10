@@ -288,6 +288,24 @@ pub trait ExecutionServices {
         ))
     }
 
+    /// Opens a stateful aggregate or window accumulator instance with explicit `DISTINCT` and
+    /// collation metadata.
+    fn agg_open_collated(
+        &mut self,
+        name: &str,
+        arity: usize,
+        _distinct: bool,
+        _collation_name: &str,
+    ) -> Result<AggregateStepId> {
+        self.agg_open(name, arity)
+    }
+
+    /// Returns `true` if the open accumulator `id` supports O(1) sliding-frame row removal via
+    /// [`Self::agg_inverse`] (`xInverse != NULL` in SQLite `FuncDef`).
+    fn agg_supports_inverse(&self, _id: AggregateStepId) -> bool {
+        false
+    }
+
     /// Feeds one row of arguments into an open aggregate/window accumulator (`xStep`).
     fn agg_step(&mut self, _id: AggregateStepId, _args: &[RuntimeValue]) -> Result<()> {
         Err(SqliteError::misuse(

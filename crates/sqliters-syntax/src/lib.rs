@@ -428,4 +428,130 @@ mod tests {
             "{err_ret}"
         );
     }
+
+    #[test]
+    fn test_parse_window_clauses_frames_and_soft_keywords() {
+        let sql = "SELECT
+            rank() OVER w1,
+            sum(x) FILTER (WHERE y > 0) OVER (
+                w1 ORDER BY z DESC NULLS FIRST
+                GROUPS BETWEEN 2 PRECEDING AND 1 FOLLOWING EXCLUDE TIES
+            ),
+            first_value(x) OVER (ROWS UNBOUNDED PRECEDING EXCLUDE CURRENT ROW),
+            last_value(x) OVER (RANGE CURRENT ROW EXCLUDE GROUP),
+            count(*) OVER (ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING EXCLUDE NO OTHERS)
+          FROM tbl
+          WINDOW w1 AS (PARTITION BY a, b), w2 AS (w1 ORDER BY c ASC);";
+        let Stmt::Select(sel) = parse_one(sql).unwrap().0.unwrap() else {
+            panic!("expected Select");
+        };
+        let SelectCore::Select {
+            projection,
+            windows,
+            ..
+        } = &sel.body.head
+        else {
+            panic!("expected SelectCore::Select");
+        };
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].0, "w1");
+        assert_eq!(windows[0].1.partition_by.len(), 2);
+        assert_eq!(windows[1].0, "w2");
+        assert_eq!(windows[1].1.base_window.as_deref(), Some("w1"));
+        assert_eq!(windows[1].1.order_by.len(), 1);
+        assert_eq!(projection.len(), 5);
+
+        // Soft-keyword disambiguation (`FROM tbl window`, `SELECT sum(x) over FROM tbl`, etc.)
+        let Stmt::Select(alias_win) =
+            parse_one("SELECT window.a FROM tbl window WHERE window.a = 1;")
+                .unwrap()
+                .0
+                .unwrap()
+        else {
+            panic!("expected Select");
+        };
+        let SelectCore::Select {
+            from: Some(fc),
+            windows: empty_wins,
+            ..
+        } = &alias_win.body.head
+        else {
+            panic!("expected SelectCore::Select");
+        };
+        assert!(empty_wins.is_empty());
+        assert!(matches!(
+            &fc.head,
+            TableOrSubquery::Table {
+                alias: Some(al),
+                ..
+            } if al == "window"
+        ));
+
+        let Stmt::Select(alias_over) =
+            parse_one("SELECT sum(x) over, count(*) filter, a rows FROM tbl groups;")
+                .unwrap()
+                .0
+                .unwrap()
+        else {
+            panic!("expected Select");
+        };
+        let SelectCore::Select {
+            projection: p2,
+            from: Some(fc2),
+            ..
+        } = &alias_over.body.head
+        else {
+            panic!("expected SelectCore::Select");
+        };
+        assert!(matches!(
+            &p2[0],
+            ResultColumn::Expr {
+                expr: Expr::FunctionCall { over: None, .. },
+                alias: Some(al),
+                ..
+            } if al == "over"
+        ));
+        assert!(matches!(
+            &p2[1],
+            ResultColumn::Expr {
+                expr: Expr::FunctionCall { filter: None, over: None, .. },
+                alias: Some(al),
+                ..
+            } if al == "filter"
+        ));
+        assert!(matches!(
+            &p2[2],
+            ResultColumn::Expr {
+                alias: Some(al),
+                ..
+            } if al == "rows"
+        ));
+        assert!(matches!(
+            &fc2.head,
+            TableOrSubquery::Table {
+                alias: Some(al),
+                ..
+            } if al == "groups"
+        ));
+
+        // Frame bound validation errors matching `sqlite/src/window.c` & `parse.y`
+        for bad_frame in [
+            "SELECT count(*) OVER (ROWS 2 FOLLOWING) FROM t;",
+            "SELECT count(*) OVER (ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM t;",
+            "SELECT count(*) OVER (ROWS BETWEEN 2 FOLLOWING AND CURRENT ROW) FROM t;",
+            "SELECT count(*) OVER (ROWS BETWEEN 2 FOLLOWING AND 1 PRECEDING) FROM t;",
+        ] {
+            let err = parse_one(bad_frame).unwrap_err();
+            assert_eq!(
+                err.message, "unsupported frame specification",
+                "{bad_frame}"
+            );
+        }
+
+        let err_dist = parse_one("SELECT count(DISTINCT x) OVER () FROM t;").unwrap_err();
+        assert_eq!(
+            err_dist.message,
+            "DISTINCT is not supported for window functions"
+        );
+    }
 }

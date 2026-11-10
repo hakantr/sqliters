@@ -51,7 +51,8 @@ pub fn parse_one_with_spans(sql: &str) -> Result<(Option<Stmt>, IdentSpanMap, &s
 fn parse_one_inner(sql: &str, track_spans: bool) -> Result<(Option<Stmt>, IdentSpanMap, &str)> {
     let prefix_end = first_statement_end_offset(sql);
     let prefix = &sql[..prefix_end];
-    let tokens = tokenize(prefix)?;
+    let mut tokens = tokenize(prefix)?;
+    disambiguate_window_keywords(&mut tokens);
     let mut parser = Parser::new(prefix, &tokens, track_spans);
     while parser.eat(TokenKind::Semi) {}
     if parser.at(TokenKind::Eof) {
@@ -75,6 +76,60 @@ fn parse_one_inner(sql: &str, track_spans: bool) -> Result<(Option<Stmt>, IdentS
         parser.peek().offset
     };
     Ok((Some(stmt), parser.ident_spans, &sql[tail_off..]))
+}
+
+/// Contextual lexer disambiguation for `WINDOW`, `OVER`, and `FILTER` (`analyzeWindowKeyword`,
+/// `analyzeOverKeyword`, and `analyzeFilterKeyword` in `sqlite/src/tokenize.c:197-266, 686-695`).
+fn disambiguate_window_keywords(tokens: &mut [Token<'_>]) {
+    let is_get_token_id = |k: TokenKind| -> bool {
+        k == TokenKind::StringLiteral
+            || Parser::is_join_kw(k)
+            || k == TokenKind::Window
+            || k == TokenKind::Over
+            || (Parser::can_be_ident(k) && k != TokenKind::Filter && k != TokenKind::Indexed)
+    };
+
+    let mut last_token: Option<TokenKind> = None;
+    for i in 0..tokens.len() {
+        let cur = tokens[i].kind;
+        if cur == TokenKind::Eof {
+            break;
+        }
+        if cur == TokenKind::Semi {
+            last_token = Some(TokenKind::Semi);
+            continue;
+        }
+        let next1 = tokens.get(i + 1).map_or(TokenKind::Eof, |t| t.kind);
+        let next2 = tokens.get(i + 2).map_or(TokenKind::Eof, |t| t.kind);
+        let resolved = match cur {
+            TokenKind::Window => {
+                if is_get_token_id(next1) && next2 == TokenKind::As {
+                    TokenKind::Window
+                } else {
+                    TokenKind::Id
+                }
+            }
+            TokenKind::Over => {
+                if last_token == Some(TokenKind::Rp)
+                    && (next1 == TokenKind::Lp || is_get_token_id(next1))
+                {
+                    TokenKind::Over
+                } else {
+                    TokenKind::Id
+                }
+            }
+            TokenKind::Filter => {
+                if last_token == Some(TokenKind::Rp) && next1 == TokenKind::Lp {
+                    TokenKind::Filter
+                } else {
+                    TokenKind::Id
+                }
+            }
+            other => other,
+        };
+        tokens[i].kind = resolved;
+        last_token = Some(resolved);
+    }
 }
 
 /// Parses all semicolon-separated SQL statements in `sql`.
@@ -297,6 +352,7 @@ impl<'a> Parser<'a> {
                 | TokenKind::Cast
                 | TokenKind::ColumnKw
                 | TokenKind::Conflict
+                | TokenKind::Current
                 | TokenKind::Database
                 | TokenKind::Deferred
                 | TokenKind::Desc
@@ -304,14 +360,17 @@ impl<'a> Parser<'a> {
                 | TokenKind::Do
                 | TokenKind::Each
                 | TokenKind::End
+                | TokenKind::Exclude
                 | TokenKind::Exclusive
                 | TokenKind::Explain
                 | TokenKind::Fail
                 | TokenKind::Filter
                 | TokenKind::First
+                | TokenKind::Following
                 | TokenKind::For
                 | TokenKind::Generated
                 | TokenKind::Glob
+                | TokenKind::Groups
                 | TokenKind::If
                 | TokenKind::Ignore
                 | TokenKind::Immediate
@@ -328,12 +387,15 @@ impl<'a> Parser<'a> {
                 | TokenKind::Nulls
                 | TokenKind::Of
                 | TokenKind::Offset
+                | TokenKind::Others
                 | TokenKind::Over
                 | TokenKind::Partition
                 | TokenKind::Plan
                 | TokenKind::Pragma
+                | TokenKind::Preceding
                 | TokenKind::Query
                 | TokenKind::Raise
+                | TokenKind::Range
                 | TokenKind::Recursive
                 | TokenKind::Regexp
                 | TokenKind::Reindex
@@ -348,12 +410,32 @@ impl<'a> Parser<'a> {
                 | TokenKind::Savepoint
                 | TokenKind::Strict
                 | TokenKind::Temp
+                | TokenKind::Ties
                 | TokenKind::Trigger
+                | TokenKind::Unbounded
                 | TokenKind::Vacuum
                 | TokenKind::View
                 | TokenKind::Virtual
                 | TokenKind::Window
                 | TokenKind::Without
+        )
+    }
+
+    const fn is_soft_alias_kw(kind: TokenKind) -> bool {
+        matches!(
+            kind,
+            TokenKind::Current
+                | TokenKind::Exclude
+                | TokenKind::Following
+                | TokenKind::Groups
+                | TokenKind::Others
+                | TokenKind::Partition
+                | TokenKind::Preceding
+                | TokenKind::Range
+                | TokenKind::Row
+                | TokenKind::Rows
+                | TokenKind::Ties
+                | TokenKind::Unbounded
         )
     }
 
@@ -2079,6 +2161,12 @@ impl<'a> Parser<'a> {
             having = Some(self.parse_expr()?);
         }
 
+        let windows = if self.eat(TokenKind::Window) {
+            self.parse_windowdefn_list()?
+        } else {
+            Vec::new()
+        };
+
         Ok(SelectCore::Select {
             distinct,
             projection,
@@ -2086,7 +2174,153 @@ impl<'a> Parser<'a> {
             selection,
             group_by,
             having,
+            windows,
         })
+    }
+
+    fn parse_windowdefn_list(&mut self) -> Result<Vec<(String, WindowSpec)>> {
+        let mut defs = Vec::new();
+        loop {
+            let name = self.parse_nm()?;
+            self.expect(TokenKind::As)?;
+            self.expect(TokenKind::Lp)?;
+            let spec = self.parse_window_spec()?;
+            self.expect(TokenKind::Rp)?;
+            defs.push((name, spec));
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        Ok(defs)
+    }
+
+    fn parse_window_spec(&mut self) -> Result<WindowSpec> {
+        if self.at(TokenKind::Rp) {
+            return Ok(WindowSpec::default());
+        }
+        let base_window = if matches!(
+            self.peek().kind,
+            TokenKind::Partition
+                | TokenKind::Order
+                | TokenKind::Range
+                | TokenKind::Rows
+                | TokenKind::Groups
+        ) {
+            None
+        } else {
+            Some(self.parse_nm()?)
+        };
+
+        let mut partition_by = Vec::new();
+        if self.eat(TokenKind::Partition) {
+            self.expect(TokenKind::By)?;
+            loop {
+                partition_by.push(self.parse_expr()?);
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+
+        let order_by = self.parse_optional_order_by()?;
+        let frame = self.parse_optional_window_frame()?;
+
+        Ok(WindowSpec {
+            base_window,
+            partition_by,
+            order_by,
+            frame,
+        })
+    }
+
+    fn parse_optional_window_frame(&mut self) -> Result<Option<WindowFrame>> {
+        let units = if self.eat(TokenKind::Rows) {
+            WindowFrameUnits::Rows
+        } else if self.eat(TokenKind::Range) {
+            WindowFrameUnits::Range
+        } else if self.eat(TokenKind::Groups) {
+            WindowFrameUnits::Groups
+        } else {
+            return Ok(None);
+        };
+
+        let (start, end) = if self.eat(TokenKind::Between) {
+            let s = self.parse_window_frame_bound(true)?;
+            self.expect(TokenKind::And)?;
+            let e = self.parse_window_frame_bound(false)?;
+            (s, e)
+        } else {
+            let s = self.parse_window_frame_bound(true)?;
+            (s, WindowFrameBound::CurrentRow)
+        };
+
+        let exclude = if self.eat(TokenKind::Exclude) {
+            if self.eat(TokenKind::No) {
+                self.expect(TokenKind::Others)?;
+                WindowFrameExclude::NoOthers
+            } else if self.eat(TokenKind::Current) {
+                self.expect(TokenKind::Row)?;
+                WindowFrameExclude::CurrentRow
+            } else if self.eat(TokenKind::Group) {
+                WindowFrameExclude::Group
+            } else if self.eat(TokenKind::Ties) {
+                WindowFrameExclude::Ties
+            } else {
+                let bad = self.peek();
+                return Err(self.syntax_err_at(bad, format!("near \"{}\": syntax error", bad.text)));
+            }
+        } else {
+            WindowFrameExclude::NoOthers
+        };
+
+        // Match `sqlite3WindowAlloc` (`sqlite/src/window.c:1221-1226`):
+        let invalid_order = matches!(
+            (&start, &end),
+            (WindowFrameBound::CurrentRow, WindowFrameBound::Preceding(_))
+                | (
+                    WindowFrameBound::Following(_),
+                    WindowFrameBound::Preceding(_) | WindowFrameBound::CurrentRow
+                )
+        );
+        if invalid_order {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                "unsupported frame specification",
+            ));
+        }
+
+        Ok(Some(WindowFrame {
+            units,
+            start,
+            end,
+            exclude,
+        }))
+    }
+
+    fn parse_window_frame_bound(&mut self, is_start: bool) -> Result<WindowFrameBound> {
+        if self.eat(TokenKind::Unbounded) {
+            if is_start {
+                self.expect(TokenKind::Preceding)?;
+                return Ok(WindowFrameBound::UnboundedPreceding);
+            } else {
+                self.expect(TokenKind::Following)?;
+                return Ok(WindowFrameBound::UnboundedFollowing);
+            }
+        }
+        if self.at(TokenKind::Current) && self.peek_n(1).kind == TokenKind::Row {
+            self.advance();
+            self.advance();
+            return Ok(WindowFrameBound::CurrentRow);
+        }
+        let expr = self.parse_expr()?;
+        if self.eat(TokenKind::Preceding) {
+            Ok(WindowFrameBound::Preceding(Box::new(expr)))
+        } else if self.eat(TokenKind::Following) {
+            Ok(WindowFrameBound::Following(Box::new(expr)))
+        } else {
+            let bad = self.peek();
+            Err(self.syntax_err_at(bad, format!("near \"{}\": syntax error", bad.text)))
+        }
     }
 
     fn parse_projection(&mut self) -> Result<Vec<ResultColumn>> {
@@ -2094,26 +2328,27 @@ impl<'a> Parser<'a> {
         loop {
             if self.eat(TokenKind::Star) {
                 cols.push(ResultColumn::Star);
-            } else if Self::can_be_ident(self.peek().kind)
+            } else if (Self::can_be_ident(self.peek().kind) || Self::is_join_kw(self.peek().kind))
                 && self.peek_n(1).kind == TokenKind::Dot
                 && self.peek_n(2).kind == TokenKind::Star
             {
-                let tbl = self.parse_ident()?;
+                let tbl = self.parse_nm()?;
                 self.expect(TokenKind::Dot)?;
                 self.expect(TokenKind::Star)?;
                 cols.push(ResultColumn::TableStar {
                     schema: None,
                     table: tbl,
                 });
-            } else if Self::can_be_ident(self.peek().kind)
+            } else if (Self::can_be_ident(self.peek().kind) || Self::is_join_kw(self.peek().kind))
                 && self.peek_n(1).kind == TokenKind::Dot
-                && Self::can_be_ident(self.peek_n(2).kind)
+                && (Self::can_be_ident(self.peek_n(2).kind)
+                    || Self::is_join_kw(self.peek_n(2).kind))
                 && self.peek_n(3).kind == TokenKind::Dot
                 && self.peek_n(4).kind == TokenKind::Star
             {
-                let schema = self.parse_ident()?;
+                let schema = self.parse_nm()?;
                 self.expect(TokenKind::Dot)?;
-                let tbl = self.parse_ident()?;
+                let tbl = self.parse_nm()?;
                 self.expect(TokenKind::Dot)?;
                 self.expect(TokenKind::Star)?;
                 cols.push(ResultColumn::TableStar {
@@ -2129,9 +2364,11 @@ impl<'a> Parser<'a> {
                 } else if self.at(TokenKind::Id)
                     || self.at(TokenKind::QuotedId)
                     || self.at(TokenKind::StringLiteral)
+                    || Self::is_soft_alias_kw(self.peek().kind)
                 {
                     // Implicit alias `SELECT expr alias` when not a clause keyword
-                    Some(dequote(self.advance().text))
+                    let tok = self.advance();
+                    Some(self.alloc_ident_from_token(tok))
                 } else {
                     None
                 };
@@ -2372,6 +2609,7 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
         if matches!(next, TokenKind::Id | TokenKind::QuotedId)
+            || Self::is_soft_alias_kw(next)
             || (stop_tokens.is_empty() && next == TokenKind::StringLiteral)
         {
             let tok = self.advance();
@@ -2946,8 +3184,8 @@ impl<'a> Parser<'a> {
                 self.expect(TokenKind::Rp)?;
                 Ok(first)
             }
-            k if Self::can_be_ident(k) => {
-                let first = self.parse_ident()?;
+            k if Self::can_be_ident(k) || Self::is_join_kw(k) => {
+                let first = self.parse_nm()?;
                 // Function call: `name(...)`
                 if self.eat(TokenKind::Lp) {
                     let mut distinct = false;
@@ -2981,19 +3219,37 @@ impl<'a> Parser<'a> {
                     } else {
                         None
                     };
+                    let over = if self.eat(TokenKind::Over) {
+                        if self.eat(TokenKind::Lp) {
+                            let spec = self.parse_window_spec()?;
+                            self.expect(TokenKind::Rp)?;
+                            Some(WindowRef::Spec(Box::new(spec)))
+                        } else {
+                            Some(WindowRef::Name(self.parse_nm()?))
+                        }
+                    } else {
+                        None
+                    };
+                    if distinct && over.is_some() {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            "DISTINCT is not supported for window functions",
+                        ));
+                    }
                     return Ok(Expr::FunctionCall {
                         name: first,
                         distinct,
                         args,
                         filter,
+                        over,
                     });
                 }
 
                 // Qualified column `table.col` or `schema.table.col`
                 if self.eat(TokenKind::Dot) {
-                    let second = self.parse_ident()?;
+                    let second = self.parse_nm()?;
                     if self.eat(TokenKind::Dot) {
-                        let third = self.parse_ident()?;
+                        let third = self.parse_nm()?;
                         return Ok(Expr::Column(ColumnRef::schema_table_qualified(
                             first, second, third,
                         )));

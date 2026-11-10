@@ -151,6 +151,8 @@ pub fn strip_test_comments(raw_tcl: &str) -> String {
                 if rest.is_empty() {
                     continue;
                 }
+            } else if brace_depth == 1 && trimmed.starts_with('}') {
+                in_block_comment = false;
             } else {
                 continue;
             }
