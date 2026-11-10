@@ -4,10 +4,10 @@
 
 use sqliters_syntax::{
     BinaryOp, BindParam, ColumnRef, CommonTableExpr, CompoundOp, CurrentTimeKind, Expr, FromClause,
-    FunctionArgs, IndexHint, InsertSource, InsertStmt, JoinConstraint, LikeOp, LimitClause,
-    OrderByTerm, QualifiedName, ResultColumn, SelectBody, SelectCore, SelectStmt, SetAssignment,
-    Stmt, TableOrSubquery, TriggerStep, TriggerTiming, UnaryOp, UpsertAction, WindowFrameBound,
-    WindowRef, WindowSpec,
+    FunctionArgs, IndexHint, InsertSource, InsertStmt, JoinConstraint, JoinType, LikeOp,
+    LimitClause, OrderByTerm, QualifiedName, ResultColumn, SelectBody, SelectCore, SelectStmt,
+    SetAssignment, Stmt, TableOrSubquery, TriggerStep, TriggerTiming, UnaryOp, UpsertAction,
+    WindowFrameBound, WindowRef, WindowSpec,
 };
 use sqliters_types::{
     Collation, DatabaseId, ErrorCode, KeySortOrder, Result, SqliteError, TypeAffinity, Value,
@@ -18,20 +18,82 @@ use sqliters_vdbe::{
 
 use crate::db_set::{DatabaseSet, ResolvedRelation};
 use crate::execution_context::FunctionRegistry;
-use crate::schema::{IndexSchema, Schema, TableSchema, ViewSchema, fix_permanent_view_select};
+use crate::schema::{
+    IndexSchema, IndexedColSchema, Schema, TableSchema, ViewSchema, fix_permanent_view_select,
+    sqlite_log_est, sqlite_log_est_add,
+};
 use crate::trigger::TriggerEventKind;
 use crate::window::{core_has_window, expr_contains_window, is_window_bound_constant};
 
+#[derive(Debug, Clone)]
+pub struct RangeBound {
+    pub expr: Expr,
+    pub inclusive: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QueryPlanContext<'a> {
+    pub projection: Option<&'a [ResultColumn]>,
+    pub group_by: &'a [Expr],
+    pub having: Option<&'a Expr>,
+    pub order_by: &'a [OrderByTerm],
+    pub indexed_by: Option<&'a IndexHint>,
+    pub is_count_star_only: bool,
+}
+
+fn explain_index_col_name(ic: &IndexedColSchema) -> &str {
+    if ic.col_idx.is_some() {
+        &ic.name
+    } else if matches!(
+        ic.expr.as_ref(),
+        Some(Expr::Column(cref))
+            if cref.table.is_none()
+                && (cref.column.eq_ignore_ascii_case("rowid")
+                    || cref.column.eq_ignore_ascii_case("_rowid_")
+                    || cref.column.eq_ignore_ascii_case("oid"))
+    ) {
+        "rowid"
+    } else {
+        "<expr>"
+    }
+}
+
 /// Chosen B-Tree access strategy for a single table (`where.c`).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum AccessPlan {
     FullScan,
+    IndexFullScan {
+        index: IndexSchema,
+        is_covering: bool,
+    },
     RowidSeek {
         key_expr: Expr,
+    },
+    RowidRange {
+        lower: Option<RangeBound>,
+        upper: Option<RangeBound>,
+    },
+    RowidIn {
+        list: Vec<Expr>,
     },
     IndexSeek {
         index: IndexSchema,
         prefix_exprs: Vec<Expr>,
+        is_covering: bool,
+    },
+    IndexRangeScan {
+        index: IndexSchema,
+        prefix_exprs: Vec<Expr>,
+        prefix_in_lists: Vec<(usize, Vec<Expr>)>,
+        range_col_idx: Option<usize>,
+        lower: Option<RangeBound>,
+        upper: Option<RangeBound>,
+        is_covering: bool,
+        skip_scan_cols: usize,
+    },
+    MultiIndexOr {
+        branches: Vec<AccessPlan>,
     },
 }
 
@@ -39,25 +101,98 @@ impl AccessPlan {
     pub fn explain_detail(&self, display_name: &str) -> String {
         match self {
             Self::FullScan => format!("SCAN {display_name}"),
-            Self::RowidSeek { .. } => {
+            Self::IndexFullScan { index, is_covering } => {
+                if index.table_without_rowid && index.origin == "pk" {
+                    format!("SCAN {display_name}")
+                } else {
+                    let cov = if *is_covering { "COVERING " } else { "" };
+                    format!("SCAN {display_name} USING {cov}INDEX {}", index.name)
+                }
+            }
+            Self::RowidSeek { .. } | Self::RowidIn { .. } => {
                 format!("SEARCH {display_name} USING INTEGER PRIMARY KEY (rowid=?)")
+            }
+            Self::RowidRange { lower, upper } => {
+                let cond = match (lower, upper) {
+                    (Some(_), Some(_)) => "rowid>? AND rowid<?",
+                    (Some(_), None) => "rowid>?",
+                    (None, Some(_)) => "rowid<?",
+                    (None, None) => "rowid=?",
+                };
+                format!("SEARCH {display_name} USING INTEGER PRIMARY KEY ({cond})")
             }
             Self::IndexSeek {
                 index,
                 prefix_exprs,
+                is_covering,
             } => {
                 let cols: Vec<String> = index
                     .columns
                     .iter()
                     .take(prefix_exprs.len())
-                    .map(|c| format!("{}=?", c.name))
+                    .map(|c| format!("{}=?", explain_index_col_name(c)))
                     .collect();
-                format!(
-                    "SEARCH {display_name} USING INDEX {} ({})",
-                    index.name,
-                    cols.join(" AND ")
-                )
+                if index.table_without_rowid && index.origin == "pk" {
+                    format!(
+                        "SEARCH {display_name} USING PRIMARY KEY ({})",
+                        cols.join(" AND ")
+                    )
+                } else {
+                    let cov = if *is_covering { "COVERING " } else { "" };
+                    format!(
+                        "SEARCH {display_name} USING {cov}INDEX {} ({})",
+                        index.name,
+                        cols.join(" AND ")
+                    )
+                }
             }
+            Self::IndexRangeScan {
+                index,
+                prefix_exprs,
+                prefix_in_lists,
+                range_col_idx,
+                lower,
+                upper,
+                is_covering,
+                skip_scan_cols,
+            } => {
+                let n_eq = prefix_exprs.len() + prefix_in_lists.len() + *skip_scan_cols;
+                let mut parts: Vec<String> = Vec::new();
+                for i in 0..n_eq.min(index.columns.len()) {
+                    let cname = explain_index_col_name(&index.columns[i]);
+                    if i < *skip_scan_cols {
+                        parts.push(format!("ANY({cname})"));
+                    } else {
+                        parts.push(format!("{cname}=?"));
+                    }
+                }
+                if let Some(rc_idx) = *range_col_idx
+                    && let Some(rc) = index.columns.get(rc_idx)
+                {
+                    let cname = explain_index_col_name(rc);
+                    if lower.is_some() {
+                        parts.push(format!("{cname}>?"));
+                    }
+                    if upper.is_some() {
+                        parts.push(format!("{cname}<?"));
+                    }
+                }
+                let cond_str = if parts.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", parts.join(" AND "))
+                };
+                if index.table_without_rowid && index.origin == "pk" {
+                    format!("SEARCH {display_name} USING PRIMARY KEY{cond_str}")
+                } else {
+                    let cov = if *is_covering { "COVERING " } else { "" };
+                    format!(
+                        "SEARCH {display_name} USING {cov}INDEX {}{cond_str}",
+                        index.name
+                    )
+                }
+            }
+            Self::MultiIndexOr { .. } => "MULTI-INDEX OR".to_owned(),
         }
     }
 }
@@ -81,94 +216,664 @@ pub fn choose_access_plan_with_schema_name(
     selection: Option<&Expr>,
     schema: &Schema,
 ) -> AccessPlan {
-    let Some(where_expr) = selection else {
+    choose_access_plan_with_context(
+        tbl,
+        schema_name,
+        alias,
+        selection,
+        schema,
+        QueryPlanContext::default(),
+    )
+}
+
+pub fn choose_access_plan_with_context(
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+    selection: Option<&Expr>,
+    schema: &Schema,
+    ctx: QueryPlanContext<'_>,
+) -> AccessPlan {
+    if matches!(ctx.indexed_by, Some(IndexHint::NotIndexed)) {
         return AccessPlan::FullScan;
+    }
+
+    let forced_idx_name = match ctx.indexed_by {
+        Some(IndexHint::IndexedBy(name)) => Some(name.as_str()),
+        _ => None,
     };
 
-    let mut conjuncts = Vec::new();
-    collect_and_conjuncts(where_expr, &mut conjuncts);
+    // Unfiltered `SELECT count(*) FROM tbl` (when no forced index and no WHERE clause)
+    // can pick the narrowest non-partial index as a covering index scan (`where.c`).
+    if selection.is_none()
+        && forced_idx_name.is_none()
+        && ctx.is_count_star_only
+        && ctx.group_by.is_empty()
+        && ctx.having.is_none()
+    {
+        let mut best_idx: Option<(i16, IndexSchema)> = None;
+        for idx in schema.indexes_for_table(&tbl.name) {
+            if idx.where_clause.is_some() || idx.is_unordered() {
+                continue;
+            }
+            let sz = idx.effective_sz_idx_row(tbl);
+            if sz < tbl.effective_sz_tab_row()
+                && best_idx.as_ref().is_none_or(|(b_sz, _)| sz < *b_sz)
+            {
+                best_idx = Some((sz, idx));
+            }
+        }
+        if let Some((_, index)) = best_idx {
+            return AccessPlan::IndexFullScan {
+                index,
+                is_covering: true,
+            };
+        }
+        return AccessPlan::FullScan;
+    }
 
-    // 1. Check for `rowid = <const_or_param>` or `ipk_col = <const_or_param>` (O(log N) primary B+Tree seek!)
-    for conj in &conjuncts {
-        if let Some((col_name, rhs)) = extract_table_col_eq(conj, tbl, schema_name, alias) {
-            let is_rowid = tbl.is_implicit_rowid_name(&col_name)
-                || tbl
-                    .rowid_alias_col
-                    .is_some_and(|ipk| tbl.columns[ipk].name.eq_ignore_ascii_case(&col_name));
-            if is_rowid {
-                return AccessPlan::RowidSeek { key_expr: rhs };
+    let single_plan = choose_single_term_plan(tbl, schema_name, alias, selection, schema, ctx);
+    if !matches!(
+        single_plan,
+        AccessPlan::FullScan | AccessPlan::IndexFullScan { .. }
+    ) {
+        return single_plan;
+    }
+
+    // Check for top-level `OR` (`MULTI-INDEX OR`) when not satisfied by a single index scan
+    // and every OR branch can use an index (`whereexpr.c` / `where.c`).
+    if let Some(where_expr) = selection {
+        let mut or_terms = Vec::new();
+        collect_or_disjuncts(where_expr, &mut or_terms);
+        if or_terms.len() >= 2 {
+            let mut branch_plans = Vec::with_capacity(or_terms.len());
+            let mut all_indexed = true;
+            for branch_expr in &or_terms {
+                let sub_ctx = QueryPlanContext {
+                    projection: None,
+                    group_by: &[],
+                    having: None,
+                    order_by: &[],
+                    indexed_by: ctx.indexed_by,
+                    is_count_star_only: false,
+                };
+                let bp = choose_single_term_plan(
+                    tbl,
+                    schema_name,
+                    alias,
+                    Some(branch_expr),
+                    schema,
+                    sub_ctx,
+                );
+                if matches!(bp, AccessPlan::FullScan | AccessPlan::IndexFullScan { .. }) {
+                    all_indexed = false;
+                    break;
+                }
+                branch_plans.push(bp);
+            }
+            if all_indexed {
+                return AccessPlan::MultiIndexOr {
+                    branches: branch_plans,
+                };
             }
         }
     }
 
-    // 2. Check secondary indexes (and primary Index B-Tree for `WITHOUT ROWID` tables),
-    //    preferring UNIQUE indexes and longer matched key prefixes!
+    single_plan
+}
+
+fn collect_or_disjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    if let Expr::Binary {
+        left,
+        op: BinaryOp::Or,
+        right,
+    } = expr
+    {
+        collect_or_disjuncts(left, out);
+        collect_or_disjuncts(right, out);
+    } else {
+        out.push(expr);
+    }
+}
+
+fn choose_single_term_plan(
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+    selection: Option<&Expr>,
+    schema: &Schema,
+    ctx: QueryPlanContext<'_>,
+) -> AccessPlan {
+    let forced_idx_name = match ctx.indexed_by {
+        Some(IndexHint::IndexedBy(name)) => Some(name.as_str()),
+        _ => None,
+    };
+
+    let mut conjuncts = Vec::new();
+    if let Some(where_expr) = selection {
+        collect_and_conjuncts_with_between(where_expr, &mut conjuncts);
+    }
+
+    let tbl_row_est = tbl.stat1.n_row_log_est;
+    let full_scan_cost: i16 = if forced_idx_name.is_some() {
+        i16::MAX
+    } else {
+        tbl_row_est.saturating_add(16)
+    };
+    let mut best_cost: i16 = full_scan_cost;
+    let mut best_sz: i16 = tbl.effective_sz_tab_row();
+    let mut best_is_uniq = false;
+    let mut best_eq_len: usize = 0;
+    let mut best_plan = AccessPlan::FullScan;
+
+    // 1. Check `rowid` / `INTEGER PRIMARY KEY` constraints (when table has rowid and no forced secondary index)
+    if !tbl.without_rowid && forced_idx_name.is_none() {
+        // 1a. `rowid = expr`
+        let mut rowid_eq: Option<Expr> = None;
+        let mut rowid_in: Option<Vec<Expr>> = None;
+        let mut rowid_lower: Option<RangeBound> = None;
+        let mut rowid_upper: Option<RangeBound> = None;
+
+        for conj in &conjuncts {
+            if let Some((col_name, rhs)) = extract_table_col_eq(conj, tbl, schema_name, alias)
+                && is_rowid_or_ipk_name(tbl, &col_name)
+            {
+                let comp_aff = sqlite_compare_affinity(
+                    Some(TypeAffinity::Integer),
+                    compiler_expr_affinity(&rhs, Some((tbl, schema_name)), alias),
+                );
+                if index_affinity_ok(comp_aff, TypeAffinity::Integer) {
+                    rowid_eq = Some(rhs);
+                    break;
+                }
+            }
+            if rowid_in.is_none()
+                && let Some((col_name, list)) =
+                    extract_table_col_in_list(conj, tbl, schema_name, alias)
+                && is_rowid_or_ipk_name(tbl, &col_name)
+            {
+                rowid_in = Some(list);
+            }
+            if let Some((col_name, op, rhs)) =
+                extract_table_col_range(conj, tbl, schema_name, alias)
+                && is_rowid_or_ipk_name(tbl, &col_name)
+            {
+                let comp_aff = sqlite_compare_affinity(
+                    Some(TypeAffinity::Integer),
+                    compiler_expr_affinity(&rhs, Some((tbl, schema_name)), alias),
+                );
+                if index_affinity_ok(comp_aff, TypeAffinity::Integer) {
+                    match op {
+                        BinaryOp::Gt => {
+                            if rowid_lower.is_none() {
+                                rowid_lower = Some(RangeBound {
+                                    expr: rhs,
+                                    inclusive: false,
+                                });
+                            }
+                        }
+                        BinaryOp::Ge => {
+                            if rowid_lower.is_none() {
+                                rowid_lower = Some(RangeBound {
+                                    expr: rhs,
+                                    inclusive: true,
+                                });
+                            }
+                        }
+                        BinaryOp::Lt if rowid_upper.is_none() => {
+                            rowid_upper = Some(RangeBound {
+                                expr: rhs,
+                                inclusive: false,
+                            });
+                        }
+                        BinaryOp::Le if rowid_upper.is_none() => {
+                            rowid_upper = Some(RangeBound {
+                                expr: rhs,
+                                inclusive: true,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some((col_name, low, high)) =
+                extract_table_col_between(conj, tbl, schema_name, alias)
+                && is_rowid_or_ipk_name(tbl, &col_name)
+            {
+                let low_aff = sqlite_compare_affinity(
+                    Some(TypeAffinity::Integer),
+                    compiler_expr_affinity(&low, Some((tbl, schema_name)), alias),
+                );
+                let high_aff = sqlite_compare_affinity(
+                    Some(TypeAffinity::Integer),
+                    compiler_expr_affinity(&high, Some((tbl, schema_name)), alias),
+                );
+                if index_affinity_ok(low_aff, TypeAffinity::Integer)
+                    && index_affinity_ok(high_aff, TypeAffinity::Integer)
+                {
+                    if rowid_lower.is_none() {
+                        rowid_lower = Some(RangeBound {
+                            expr: low,
+                            inclusive: true,
+                        });
+                    }
+                    if rowid_upper.is_none() {
+                        rowid_upper = Some(RangeBound {
+                            expr: high,
+                            inclusive: true,
+                        });
+                    }
+                }
+            }
+        }
+
+        if let Some(key_expr) = rowid_eq {
+            // `where.c`: IPK equality seek cost is ~10 (1 row output).
+            best_cost = 10;
+            best_is_uniq = true;
+            best_eq_len = 1;
+            best_plan = AccessPlan::RowidSeek { key_expr };
+        } else if let Some(list) = rowid_in {
+            let n_in = sqlite_log_est((list.len().max(1)) as u64);
+            let cost = n_in.saturating_add(10);
+            if cost < best_cost {
+                best_cost = cost;
+                best_eq_len = 1;
+                best_plan = AccessPlan::RowidIn { list };
+            }
+        } else if rowid_lower.is_some() || rowid_upper.is_some() {
+            let mut r_size = tbl_row_est;
+            if rowid_lower.is_some() {
+                r_size = (r_size - 10).max(0);
+            }
+            if rowid_upper.is_some() {
+                r_size = (r_size - 10).max(0);
+            }
+            let cost = sqlite_log_est_add(r_size + 16, 10);
+            if cost < best_cost {
+                best_cost = cost;
+                best_plan = AccessPlan::RowidRange {
+                    lower: rowid_lower,
+                    upper: rowid_upper,
+                };
+            }
+        }
+    }
+
+    // 2. Check secondary indexes (and primary Index B-Tree for `WITHOUT ROWID` tables)
     let mut indexes = schema.indexes_for_table(&tbl.name);
     if let Some(pk_idx) = tbl.without_rowid_pk_as_index() {
         indexes.insert(0, pk_idx);
     }
-    let mut best: Option<(usize, bool, IndexSchema, Vec<Expr>)> = None;
 
     for idx in indexes {
-        if idx.where_clause.is_some() {
-            // Partial indexes require proving the partial predicate; keep safe full scan or post-filter
+        if let Some(forced) = forced_idx_name
+            && !idx.name.eq_ignore_ascii_case(forced)
+        {
             continue;
         }
-        let mut prefix_exprs = Vec::new();
-        for ic in &idx.columns {
-            let Some(ci) = ic.col_idx else {
-                break;
-            };
-            // Only use equality seek if index column collation matches default/column collation
-            let tbl_col_coll = tbl.columns[ci].collation;
-            if ic.sort_order.collation != tbl_col_coll {
-                break;
-            }
-            let matched = conjuncts.iter().find_map(|conj| {
-                let (cname, rhs) = extract_table_col_eq(conj, tbl, schema_name, alias)?;
-                if cname.eq_ignore_ascii_case(&ic.name) {
-                    let idx_aff = tbl.columns[ci].affinity;
-                    let rhs_aff = compiler_expr_affinity(&rhs, Some((tbl, schema_name)), alias);
-                    let comp_aff = sqlite_compare_affinity(Some(idx_aff), rhs_aff);
-                    if index_affinity_ok(comp_aff, idx_aff) {
-                        Some(rhs)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+        // Partial index usability check (`whereUsablePartialIndex` in `whereexpr.c`):
+        if let Some(ref part_where) = idx.where_clause {
+            let implied = selection.is_some_and(|sel| {
+                expr_implies_partial_where(sel, part_where, tbl, schema_name, alias)
             });
-            if let Some(rhs_expr) = matched {
-                prefix_exprs.push(rhs_expr);
-            } else {
-                break;
+            if !implied {
+                continue;
             }
         }
 
-        if !prefix_exprs.is_empty() {
-            let len = prefix_exprs.len();
-            let is_uniq = idx.unique && len == idx.columns.len();
-            let better = match &best {
-                None => true,
-                Some((best_len, best_uniq, _, _)) => {
-                    (is_uniq && !*best_uniq) || (is_uniq == *best_uniq && len > *best_len)
+        let is_primary_without_rowid = idx.table_without_rowid && idx.origin == "pk";
+        let is_covering = is_primary_without_rowid
+            || index_is_covering_for_query(&idx, tbl, schema_name, alias, selection, &ctx);
+        let idx_est = idx.effective_row_log_est(tbl);
+        let idx_sz = idx.effective_sz_idx_row(tbl);
+        let tab_sz = tbl.effective_sz_tab_row().max(1);
+
+        // If `unordered` flag is set in `sqlite_stat1`, this index cannot be used for range scans,
+        // full index scans, or partial prefix scans; only full-key equality seeks are allowed?
+        // Actually in C SQLite (`where.c`: `IsUnordered(pProbe)`), an `unordered` stat1 tag means
+        // the index is completely ignored for ALL index scans/seeks EXCEPT when forced or not at all!
+        // Let's check: in `where.c:3668` (`whereLoopAddBtree`), if `pProbe->bUnordered`, it cannot be used
+        // for range or ORDER BY, and in `analyze9.test` / `analyzeC.test`, `unordered` disables index scan!
+        if idx.is_unordered() && forced_idx_name.is_none() {
+            continue;
+        }
+
+        let mut prefix_exprs: Vec<Expr> = Vec::new();
+        let mut prefix_in_lists: Vec<(usize, Vec<Expr>)> = Vec::new();
+        let mut range_col_idx: Option<usize> = None;
+        let mut lower: Option<RangeBound> = None;
+        let mut upper: Option<RangeBound> = None;
+
+        for (col_pos, ic) in idx.columns.iter().enumerate() {
+            // Try equality match (`col = expr` or `expr = val` for expression index, or `col IS NULL`)
+            let eq_match = conjuncts
+                .iter()
+                .find_map(|conj| match_index_col_eq(conj, ic, tbl, schema_name, alias));
+            if let Some(rhs_expr) = eq_match {
+                if prefix_in_lists.is_empty() {
+                    prefix_exprs.push(rhs_expr);
+                } else {
+                    prefix_in_lists.push((col_pos, vec![rhs_expr]));
                 }
+                continue;
+            }
+
+            // Try `col IN (e1, e2, ...)` or `col IN <table_name>`
+            let in_match = conjuncts
+                .iter()
+                .find_map(|conj| match_index_col_in_list(conj, ic, tbl, schema_name, alias))
+                .or_else(|| {
+                    conjuncts.iter().find_map(|conj| {
+                        match_index_col_in_table(conj, ic, tbl, schema_name, alias, schema)
+                    })
+                });
+            if let Some(list) = in_match {
+                let in_est = estimate_in_expr_list_log(&list, schema);
+                let col_gain = idx_est
+                    .get(col_pos)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(idx_est.get(col_pos + 1).copied().unwrap_or(0));
+                if col_pos == 0
+                    || !idx.stat1.as_ref().is_some_and(|s| s.has_stat1)
+                    || in_est <= col_gain
+                {
+                    prefix_in_lists.push((col_pos, list));
+                    continue;
+                }
+            }
+
+            // Try range bounds (`>`, `>=`, `<`, `<=`, `BETWEEN`) on this next column `col_pos`
+            if !idx.is_unordered() {
+                for conj in &conjuncts {
+                    if let Some((op, rhs)) =
+                        match_index_col_range(conj, ic, tbl, schema_name, alias)
+                    {
+                        match op {
+                            BinaryOp::Gt => {
+                                if lower.is_none() {
+                                    lower = Some(RangeBound {
+                                        expr: rhs,
+                                        inclusive: false,
+                                    });
+                                    range_col_idx = Some(col_pos);
+                                }
+                            }
+                            BinaryOp::Ge => {
+                                if lower.is_none() {
+                                    lower = Some(RangeBound {
+                                        expr: rhs,
+                                        inclusive: true,
+                                    });
+                                    range_col_idx = Some(col_pos);
+                                }
+                            }
+                            BinaryOp::Lt if upper.is_none() => {
+                                upper = Some(RangeBound {
+                                    expr: rhs,
+                                    inclusive: false,
+                                });
+                                range_col_idx = Some(col_pos);
+                            }
+                            BinaryOp::Le if upper.is_none() => {
+                                upper = Some(RangeBound {
+                                    expr: rhs,
+                                    inclusive: true,
+                                });
+                                range_col_idx = Some(col_pos);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some((low_e, high_e)) =
+                        match_index_col_between(conj, ic, tbl, schema_name, alias)
+                    {
+                        if lower.is_none() {
+                            lower = Some(RangeBound {
+                                expr: low_e,
+                                inclusive: true,
+                            });
+                            range_col_idx = Some(col_pos);
+                        }
+                        if upper.is_none() {
+                            upper = Some(RangeBound {
+                                expr: high_e,
+                                inclusive: true,
+                            });
+                            range_col_idx = Some(col_pos);
+                        }
+                    }
+                }
+            }
+            break;
+        }
+
+        // Skip-scan check (`whereLoopAddBtreeIndex` in `where.c`):
+        // When `prefix_exprs` and `prefix_in_lists` and `range_col_idx` are empty on column 0,
+        // check if skipping the first `k >= 1` columns (each having `aiRowLogEst[i] - aiRowLogEst[i+1] >= 42`,
+        // i.e. < ~18 distinct values per prefix, and `!idx.is_no_skip_scan()`) allows matching equality/range
+        // on column `k`!
+        let mut skip_scan_cols: usize = 0;
+        if prefix_exprs.is_empty()
+            && prefix_in_lists.is_empty()
+            && range_col_idx.is_none()
+            && !idx.is_no_skip_scan()
+            && !idx.is_unordered()
+            && idx.stat1.as_ref().is_some_and(|s| s.has_stat1)
+            && idx.columns.len() >= 2
+        {
+            let mut k = 0;
+            while k + 1 < idx.columns.len() {
+                // `where.c:3258`: skip-scan requires `pProbe->aiRowLogEst[nEq] >= 42`
+                // where `aiRowLogEst[i]` is log2(est rows per distinct prefix of length i+1).
+                let est_per_val = idx_est.get(k + 1).copied().unwrap_or(0);
+                if est_per_val < 42 {
+                    break;
+                }
+                k += 1;
+                let ic = &idx.columns[k];
+                if let Some(rhs_expr) = conjuncts
+                    .iter()
+                    .find_map(|conj| match_index_col_eq(conj, ic, tbl, schema_name, alias))
+                {
+                    skip_scan_cols = k;
+                    prefix_exprs.push(rhs_expr);
+                    // Also check subsequent columns after `k`!
+                    for next_ic in idx.columns.iter().skip(k + 1) {
+                        if let Some(next_rhs) = conjuncts.iter().find_map(|conj| {
+                            match_index_col_eq(conj, next_ic, tbl, schema_name, alias)
+                        }) {
+                            prefix_exprs.push(next_rhs);
+                        } else {
+                            break;
+                        }
+                    }
+                    break;
+                }
+                let mut skip_low = None;
+                let mut skip_high = None;
+                for conj in &conjuncts {
+                    if let Some((op, rhs)) =
+                        match_index_col_range(conj, ic, tbl, schema_name, alias)
+                        && !ic.sort_order.desc
+                    {
+                        match op {
+                            BinaryOp::Gt if skip_low.is_none() => {
+                                skip_low = Some(RangeBound {
+                                    expr: rhs,
+                                    inclusive: false,
+                                });
+                            }
+                            BinaryOp::Ge if skip_low.is_none() => {
+                                skip_low = Some(RangeBound {
+                                    expr: rhs,
+                                    inclusive: true,
+                                });
+                            }
+                            BinaryOp::Lt if skip_high.is_none() => {
+                                skip_high = Some(RangeBound {
+                                    expr: rhs,
+                                    inclusive: false,
+                                });
+                            }
+                            BinaryOp::Le if skip_high.is_none() => {
+                                skip_high = Some(RangeBound {
+                                    expr: rhs,
+                                    inclusive: true,
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if skip_low.is_some() || skip_high.is_some() {
+                    skip_scan_cols = k;
+                    range_col_idx = Some(k);
+                    lower = skip_low;
+                    upper = skip_high;
+                    break;
+                }
+            }
+        }
+
+        let n_eq = skip_scan_cols + prefix_exprs.len() + prefix_in_lists.len();
+        let has_search = n_eq > 0 || range_col_idx.is_some();
+
+        if has_search {
+            // Compute search cost (`where.c`: `aiRowLogEst[nEq]` + IN multiplier + skip-scan multiplier + range discount + table lookup cost)
+            let mut r_size = idx_est
+                .get(n_eq.min(idx_est.len().saturating_sub(1)))
+                .copied()
+                .unwrap_or(0);
+            if range_col_idx.is_some() {
+                if lower.is_some() {
+                    r_size = (r_size - 10).max(0);
+                }
+                if upper.is_some() {
+                    r_size = (r_size - 10).max(0);
+                }
+            }
+            let mut n_seeks_log: i16 = 0;
+            let mut has_in_table = false;
+            for (_, list) in &prefix_in_lists {
+                if list.len() == 1 && matches!(list[0], Expr::InTable { .. }) {
+                    has_in_table = true;
+                }
+                n_seeks_log = n_seeks_log.saturating_add(estimate_in_expr_list_log(list, schema));
+            }
+            if skip_scan_cols > 0 {
+                // Number of distinct prefixes of length `skip_scan_cols` is `idx_est[0] - idx_est[skip_scan_cols]`
+                let n_distinct_skip =
+                    (idx_est[0] - idx_est.get(skip_scan_cols).copied().unwrap_or(0)).max(10);
+                n_seeks_log = n_seeks_log.saturating_add(n_distinct_skip);
+            }
+            let total_rows_out = r_size.saturating_add(n_seeks_log);
+            // Seek overhead (~10 per seek) + scanning `total_rows_out` index entries
+            let mut cost = sqlite_log_est_add(n_seeks_log + 10, total_rows_out);
+            if !is_covering {
+                // Table lookup per index hit (`where.c`: `rRun = sqlite3LogEstAdd(rRun, rSize + 16)`)
+                cost = sqlite_log_est_add(cost, total_rows_out + 15);
+            }
+            if idx.where_clause.is_some() {
+                // Slight bonus for usable partial index when costs are close
+                cost = cost.saturating_sub(2);
+            }
+
+            let is_uniq = idx.unique
+                && n_eq == idx.columns.len()
+                && prefix_in_lists.is_empty()
+                && skip_scan_cols == 0;
+            let better = if cost != best_cost {
+                cost < best_cost
+            } else if is_covering && idx_sz != best_sz {
+                idx_sz < best_sz
+            } else if has_in_table {
+                true
+            } else {
+                (is_uniq && !best_is_uniq) || (is_uniq == best_is_uniq && n_eq > best_eq_len)
             };
+
             if better {
-                best = Some((len, is_uniq, idx, prefix_exprs));
+                best_cost = cost;
+                best_sz = idx_sz;
+                best_is_uniq = is_uniq;
+                best_eq_len = n_eq;
+                if prefix_in_lists.is_empty() && range_col_idx.is_none() && skip_scan_cols == 0 {
+                    best_plan = AccessPlan::IndexSeek {
+                        index: idx,
+                        prefix_exprs,
+                        is_covering,
+                    };
+                } else {
+                    best_plan = AccessPlan::IndexRangeScan {
+                        index: idx,
+                        prefix_exprs,
+                        prefix_in_lists,
+                        range_col_idx,
+                        lower,
+                        upper,
+                        is_covering,
+                        skip_scan_cols,
+                    };
+                }
+            }
+        } else {
+            // Full index scan candidate (`where.c:4235-4254, 5823-5832`):
+            // Eligible when:
+            //   1. Forced by `INDEXED BY`, OR
+            //   2. `is_covering && idx_sz < tab_sz`, OR
+            //   3. Usable partial index (`idx.where_clause.is_some()`), OR
+            //   4. Satisfies `ORDER BY`
+            if is_primary_without_rowid {
+                continue;
+            }
+            let satisfies_ob = !ctx.order_by.is_empty()
+                && index_satisfies_order_by(&idx, tbl, schema_name, alias, selection, ctx.order_by);
+            let eligible_full_scan = forced_idx_name.is_some()
+                || (is_covering && idx_sz < tab_sz)
+                || idx.where_clause.is_some()
+                || satisfies_ob;
+            if eligible_full_scan {
+                let r_size = idx_est.first().copied().unwrap_or(tbl_row_est);
+                let mut cost = r_size + 1 + (15 * idx_sz) / tab_sz;
+                if !is_covering {
+                    cost = sqlite_log_est_add(cost, r_size + 16);
+                }
+                if satisfies_ob {
+                    // Saves an external sorter pass (~ 3 * r_size)
+                    cost = cost.saturating_sub(16);
+                }
+                if idx.where_clause.is_some() && !idx.stat1.as_ref().is_some_and(|s| s.has_stat1) {
+                    cost = cost.saturating_sub(4);
+                }
+                let better = if cost != best_cost {
+                    cost < best_cost
+                } else {
+                    idx_sz < best_sz
+                };
+                if better {
+                    best_cost = cost;
+                    best_sz = idx_sz;
+                    best_is_uniq = false;
+                    best_eq_len = 0;
+                    best_plan = AccessPlan::IndexFullScan {
+                        index: idx,
+                        is_covering,
+                    };
+                }
             }
         }
     }
 
-    if let Some((_, _, index, prefix_exprs)) = best {
-        return AccessPlan::IndexSeek {
-            index,
-            prefix_exprs,
-        };
-    }
+    best_plan
+}
 
-    AccessPlan::FullScan
+fn is_rowid_or_ipk_name(tbl: &TableSchema, col_name: &str) -> bool {
+    tbl.is_implicit_rowid_name(col_name)
+        || tbl
+            .rowid_alias_col
+            .is_some_and(|ipk| tbl.columns[ipk].name.eq_ignore_ascii_case(col_name))
 }
 
 fn collect_and_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
@@ -182,6 +887,102 @@ fn collect_and_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
         collect_and_conjuncts(right, out);
     } else {
         out.push(expr);
+    }
+}
+
+fn collect_and_conjuncts_with_between(expr: &Expr, out: &mut Vec<Expr>) {
+    if let Expr::Binary {
+        left,
+        op: BinaryOp::And,
+        right,
+    } = expr
+    {
+        collect_and_conjuncts_with_between(left, out);
+        collect_and_conjuncts_with_between(right, out);
+    } else if let Expr::Between {
+        expr: target,
+        low,
+        high,
+        negated: false,
+    } = expr
+    {
+        out.push(Expr::Binary {
+            left: target.clone(),
+            op: BinaryOp::Ge,
+            right: low.clone(),
+        });
+        out.push(Expr::Binary {
+            left: target.clone(),
+            op: BinaryOp::Le,
+            right: high.clone(),
+        });
+        out.push(expr.clone());
+    } else if let Expr::Binary {
+        left: d1,
+        op: BinaryOp::Or,
+        right: d2,
+    } = expr
+    {
+        if !matches!(
+            d1.as_ref(),
+            Expr::Binary {
+                op: BinaryOp::Or,
+                ..
+            }
+        ) && !matches!(
+            d2.as_ref(),
+            Expr::Binary {
+                op: BinaryOp::Or,
+                ..
+            }
+        ) {
+            let mut sub1 = Vec::new();
+            let mut sub2 = Vec::new();
+            collect_and_conjuncts(d1, &mut sub1);
+            collect_and_conjuncts(d2, &mut sub2);
+            for &e1 in &sub1 {
+                for &e2 in &sub2 {
+                    if let (
+                        Expr::Binary {
+                            left: l1,
+                            op: op1,
+                            right: r1,
+                        },
+                        Expr::Binary {
+                            left: l2,
+                            op: op2,
+                            right: r2,
+                        },
+                    ) = (e1, e2)
+                        && l1 == l2
+                        && r1 == r2
+                    {
+                        if matches!(op1, BinaryOp::Eq | BinaryOp::Lt | BinaryOp::Le)
+                            && matches!(op2, BinaryOp::Eq | BinaryOp::Lt | BinaryOp::Le)
+                        {
+                            let combined = if op1 == op2 { *op1 } else { BinaryOp::Le };
+                            out.push(Expr::Binary {
+                                left: l1.clone(),
+                                op: combined,
+                                right: r1.clone(),
+                            });
+                        } else if matches!(op1, BinaryOp::Eq | BinaryOp::Gt | BinaryOp::Ge)
+                            && matches!(op2, BinaryOp::Eq | BinaryOp::Gt | BinaryOp::Ge)
+                        {
+                            let combined = if op1 == op2 { *op1 } else { BinaryOp::Ge };
+                            out.push(Expr::Binary {
+                                left: l1.clone(),
+                                op: combined,
+                                right: r1.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        out.push(expr.clone());
+    } else {
+        out.push(expr.clone());
     }
 }
 
@@ -213,6 +1014,1087 @@ fn extract_table_col_eq(
         return Some((cname, (**left).clone()));
     }
     None
+}
+
+fn extract_table_col_in_list(
+    expr: &Expr,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+) -> Option<(String, Vec<Expr>)> {
+    let Expr::InList {
+        expr: lhs,
+        list,
+        negated: false,
+    } = expr
+    else {
+        return None;
+    };
+    let cname = match_single_table_col(lhs, tbl, schema_name, alias)?;
+    if list.iter().all(expr_is_table_independent) {
+        Some((cname, list.clone()))
+    } else {
+        None
+    }
+}
+
+fn extract_table_col_range(
+    expr: &Expr,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+) -> Option<(String, BinaryOp, Expr)> {
+    let Expr::Binary { left, op, right } = expr else {
+        return None;
+    };
+    match op {
+        BinaryOp::Gt | BinaryOp::Ge | BinaryOp::Lt | BinaryOp::Le => {}
+        _ => return None,
+    }
+    if let Some(cname) = match_single_table_col(left, tbl, schema_name, alias)
+        && !matches!(right.as_ref(), Expr::Collate { .. })
+        && expr_is_table_independent(right)
+    {
+        return Some((cname, *op, (**right).clone()));
+    }
+    if let Some(cname) = match_single_table_col(right, tbl, schema_name, alias)
+        && !matches!(left.as_ref(), Expr::Collate { .. })
+        && expr_is_table_independent(left)
+    {
+        let flipped = match op {
+            BinaryOp::Gt => BinaryOp::Lt,
+            BinaryOp::Ge => BinaryOp::Le,
+            BinaryOp::Lt => BinaryOp::Gt,
+            BinaryOp::Le => BinaryOp::Ge,
+            _ => return None,
+        };
+        return Some((cname, flipped, (**left).clone()));
+    }
+    None
+}
+
+fn extract_table_col_between(
+    expr: &Expr,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+) -> Option<(String, Expr, Expr)> {
+    let Expr::Between {
+        expr: target,
+        low,
+        high,
+        negated: false,
+    } = expr
+    else {
+        return None;
+    };
+    let cname = match_single_table_col(target, tbl, schema_name, alias)?;
+    if expr_is_table_independent(low) && expr_is_table_independent(high) {
+        Some((cname, (**low).clone(), (**high).clone()))
+    } else {
+        None
+    }
+}
+
+fn match_index_col_target(
+    candidate: &Expr,
+    ic: &IndexedColSchema,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+) -> Option<(TypeAffinity, Collation)> {
+    let (candidate_inner, explicit_coll) = match candidate {
+        Expr::Collate { expr, collation } => (expr.as_ref(), Collation::from_name(collation)),
+        other => (other, None),
+    };
+    if let Some(ci) = ic.col_idx {
+        let cname = match_single_table_col(candidate_inner, tbl, schema_name, alias)?;
+        if !cname.eq_ignore_ascii_case(&ic.name) {
+            return None;
+        }
+        let col_coll = explicit_coll.unwrap_or(tbl.columns[ci].collation);
+        if ic.sort_order.collation != col_coll {
+            return None;
+        }
+        Some((tbl.columns[ci].affinity, ic.sort_order.collation))
+    } else if let Some(ref idx_expr) = ic.expr {
+        // Expression index column or rowid index column!
+        if expr_ast_equiv_for_table(candidate_inner, idx_expr, tbl, schema_name, alias) {
+            let expr_coll = explicit_coll.unwrap_or_else(|| infer_expr_collation(idx_expr, tbl));
+            if ic.sort_order.collation != expr_coll {
+                return None;
+            }
+            let aff = compiler_expr_affinity(idx_expr, Some((tbl, schema_name)), None)
+                .unwrap_or(TypeAffinity::Blob);
+            Some((aff, ic.sort_order.collation))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+fn match_index_col_eq(
+    conj: &Expr,
+    ic: &IndexedColSchema,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+) -> Option<Expr> {
+    let Expr::Binary { left, op, right } = conj else {
+        return None;
+    };
+    if *op != BinaryOp::Eq {
+        return None;
+    }
+    if let Some((idx_aff, _)) = match_index_col_target(left, ic, tbl, schema_name, alias)
+        && !matches!(right.as_ref(), Expr::Collate { .. })
+        && expr_is_table_independent(right)
+    {
+        let rhs_aff = compiler_expr_affinity(right, Some((tbl, schema_name)), alias);
+        let comp_aff = sqlite_compare_affinity(Some(idx_aff), rhs_aff);
+        if index_affinity_ok(comp_aff, idx_aff) {
+            return Some((**right).clone());
+        }
+    }
+    if let Some((idx_aff, _)) = match_index_col_target(right, ic, tbl, schema_name, alias)
+        && !matches!(left.as_ref(), Expr::Collate { .. })
+        && expr_is_table_independent(left)
+    {
+        let rhs_aff = compiler_expr_affinity(left, Some((tbl, schema_name)), alias);
+        let comp_aff = sqlite_compare_affinity(Some(idx_aff), rhs_aff);
+        if index_affinity_ok(comp_aff, idx_aff) {
+            return Some((**left).clone());
+        }
+    }
+    None
+}
+
+fn match_index_col_in_list(
+    conj: &Expr,
+    ic: &IndexedColSchema,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+) -> Option<Vec<Expr>> {
+    let Expr::InList {
+        expr: lhs,
+        list,
+        negated: false,
+    } = conj
+    else {
+        return None;
+    };
+    let _ = match_index_col_target(lhs, ic, tbl, schema_name, alias)?;
+    if list.iter().all(expr_is_table_independent) {
+        Some(list.clone())
+    } else {
+        None
+    }
+}
+
+fn match_index_col_in_table(
+    conj: &Expr,
+    ic: &IndexedColSchema,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+    schema: &Schema,
+) -> Option<Vec<Expr>> {
+    let Expr::InTable {
+        expr: lhs,
+        table,
+        negated: false,
+    } = conj
+    else {
+        return None;
+    };
+    let _ = match_index_col_target(lhs, ic, tbl, schema_name, alias)?;
+    let rhs_tbl = schema.find_table(&table.name)?;
+    if rhs_tbl.columns.len() == 1 {
+        Some(vec![Expr::InTable {
+            expr: Box::new(Expr::Null),
+            table: table.clone(),
+            negated: false,
+        }])
+    } else {
+        None
+    }
+}
+
+fn estimate_in_expr_list_log(list: &[Expr], schema: &Schema) -> i16 {
+    if list.len() == 1
+        && let Expr::InTable { table, .. } = &list[0]
+    {
+        return schema
+            .find_table(&table.name)
+            .map(|t| t.stat1.n_row_log_est)
+            .unwrap_or(100);
+    }
+    sqlite_log_est((list.len().max(1)) as u64)
+}
+
+fn match_index_col_range(
+    conj: &Expr,
+    ic: &IndexedColSchema,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+) -> Option<(BinaryOp, Expr)> {
+    let Expr::Binary { left, op, right } = conj else {
+        return None;
+    };
+    match op {
+        BinaryOp::Gt | BinaryOp::Ge | BinaryOp::Lt | BinaryOp::Le => {}
+        _ => return None,
+    }
+    if let Some((idx_aff, _)) = match_index_col_target(left, ic, tbl, schema_name, alias)
+        && !matches!(right.as_ref(), Expr::Collate { .. })
+        && expr_is_table_independent(right)
+    {
+        let rhs_aff = compiler_expr_affinity(right, Some((tbl, schema_name)), alias);
+        let comp_aff = sqlite_compare_affinity(Some(idx_aff), rhs_aff);
+        if index_affinity_ok(comp_aff, idx_aff) {
+            return Some((*op, (**right).clone()));
+        }
+    }
+    if let Some((idx_aff, _)) = match_index_col_target(right, ic, tbl, schema_name, alias)
+        && !matches!(left.as_ref(), Expr::Collate { .. })
+        && expr_is_table_independent(left)
+    {
+        let rhs_aff = compiler_expr_affinity(left, Some((tbl, schema_name)), alias);
+        let comp_aff = sqlite_compare_affinity(Some(idx_aff), rhs_aff);
+        if index_affinity_ok(comp_aff, idx_aff) {
+            let flipped = match op {
+                BinaryOp::Gt => BinaryOp::Lt,
+                BinaryOp::Ge => BinaryOp::Le,
+                BinaryOp::Lt => BinaryOp::Gt,
+                BinaryOp::Le => BinaryOp::Ge,
+                _ => return None,
+            };
+            return Some((flipped, (**left).clone()));
+        }
+    }
+    None
+}
+
+fn match_index_col_between(
+    conj: &Expr,
+    ic: &IndexedColSchema,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+) -> Option<(Expr, Expr)> {
+    let Expr::Between {
+        expr: target,
+        low,
+        high,
+        negated: false,
+    } = conj
+    else {
+        return None;
+    };
+    let (idx_aff, _) = match_index_col_target(target, ic, tbl, schema_name, alias)?;
+    if !expr_is_table_independent(low) || !expr_is_table_independent(high) {
+        return None;
+    }
+    let low_aff = sqlite_compare_affinity(
+        Some(idx_aff),
+        compiler_expr_affinity(low, Some((tbl, schema_name)), alias),
+    );
+    let high_aff = sqlite_compare_affinity(
+        Some(idx_aff),
+        compiler_expr_affinity(high, Some((tbl, schema_name)), alias),
+    );
+    if index_affinity_ok(low_aff, idx_aff) && index_affinity_ok(high_aff, idx_aff) {
+        Some(((**low).clone(), (**high).clone()))
+    } else {
+        None
+    }
+}
+
+/// Checks whether a query `WHERE` expression provably implies a partial index `WHERE` predicate
+/// (`whereUsablePartialIndex` / `sqlite3ExprImpliesExpr` / `sqlite3ExprImpliesNonNullRow` in `whereexpr.c` & `expr.c`).
+pub fn expr_implies_partial_where(
+    query_where: &Expr,
+    partial_where: &Expr,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+) -> bool {
+    let mut part_conjuncts = Vec::new();
+    collect_and_conjuncts(partial_where, &mut part_conjuncts);
+    let mut query_conjuncts = Vec::new();
+    collect_and_conjuncts(query_where, &mut query_conjuncts);
+
+    part_conjuncts.into_iter().all(|p_conj| {
+        // If `p_conj` is `col IS NOT NULL`, check if the entire `query_where` is null-rejecting for `col`
+        if let Expr::IsNull {
+            expr: inner,
+            negated: true,
+        } = p_conj
+            && let Some(cname) = match_single_table_col(inner, tbl, schema_name, alias)
+            && expr_implies_non_null_col(query_where, &cname, tbl, schema_name, alias)
+        {
+            return true;
+        }
+        query_conjuncts
+            .iter()
+            .any(|q_conj| single_conjunct_implies(q_conj, p_conj, tbl, schema_name, alias))
+    })
+}
+
+fn single_conjunct_implies(
+    q: &Expr,
+    p: &Expr,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+) -> bool {
+    if expr_ast_equiv_for_table(q, p, tbl, schema_name, alias) {
+        return true;
+    }
+    // `OR` in `q`: `(A OR B)` implies `P` if both `A` implies `P` and `B` implies `P`
+    if let Expr::Binary {
+        left,
+        op: BinaryOp::Or,
+        right,
+    } = q
+    {
+        return single_conjunct_implies(left, p, tbl, schema_name, alias)
+            && single_conjunct_implies(right, p, tbl, schema_name, alias);
+    }
+    // `OR` in `p`: `Q` implies `(P1 OR P2)` if `Q` is syntactically equivalent to `P1` or `P2`
+    // (`sqlite3ExprImpliesExpr` in `sqlite/src/expr.c`).
+    if let Expr::Binary {
+        left,
+        op: BinaryOp::Or,
+        right,
+    } = p
+    {
+        return expr_ast_equiv_for_table(q, left, tbl, schema_name, alias)
+            || expr_ast_equiv_for_table(q, right, tbl, schema_name, alias);
+    }
+
+    // If `p` is `X IS NOT NULL`, any null-rejecting comparison on `X` implies `p`
+    if let Expr::IsNull {
+        expr: p_inner,
+        negated: true,
+    } = p
+        && expr_rejects_null_of_target(q, p_inner, tbl, schema_name, alias)
+    {
+        return true;
+    }
+
+    // `sqlite3ExprImpliesExpr`: compare `(X op_q C_q)` against `(X op_p C_p)` for constant literals
+    if let Some((q_lhs, q_op, q_val)) = extract_expr_op_const(q)
+        && let Some((p_lhs, p_op, p_val)) = extract_expr_op_const(p)
+        && expr_ast_equiv_for_table(q_lhs, p_lhs, tbl, schema_name, alias)
+        && let Some(ord) = compare_const_literals(&q_val, &p_val)
+    {
+        use std::cmp::Ordering;
+        return match (q_op, p_op) {
+            (BinaryOp::Eq, BinaryOp::Eq) => ord == Ordering::Equal,
+            (BinaryOp::Eq, BinaryOp::Ne) => ord != Ordering::Equal,
+            (BinaryOp::Eq, BinaryOp::Gt) => ord == Ordering::Greater,
+            (BinaryOp::Eq, BinaryOp::Ge) => ord == Ordering::Greater || ord == Ordering::Equal,
+            (BinaryOp::Eq, BinaryOp::Lt) => ord == Ordering::Less,
+            (BinaryOp::Eq, BinaryOp::Le) => ord == Ordering::Less || ord == Ordering::Equal,
+            (BinaryOp::Gt, BinaryOp::Gt | BinaryOp::Ge | BinaryOp::Ne) => {
+                ord == Ordering::Greater || ord == Ordering::Equal
+            }
+            (BinaryOp::Ge, BinaryOp::Ge) => ord == Ordering::Greater || ord == Ordering::Equal,
+            (BinaryOp::Ge, BinaryOp::Gt | BinaryOp::Ne) => ord == Ordering::Greater,
+            (BinaryOp::Lt, BinaryOp::Lt | BinaryOp::Le | BinaryOp::Ne) => {
+                ord == Ordering::Less || ord == Ordering::Equal
+            }
+            (BinaryOp::Le, BinaryOp::Le) => ord == Ordering::Less || ord == Ordering::Equal,
+            (BinaryOp::Le, BinaryOp::Lt | BinaryOp::Ne) => ord == Ordering::Less,
+            _ => false,
+        };
+    }
+
+    // `X BETWEEN low AND high` implies `X >= low` and `X <= high`
+    if let Expr::Between {
+        expr: b_target,
+        low,
+        high,
+        negated: false,
+    } = q
+    {
+        let ge_e = Expr::Binary {
+            left: b_target.clone(),
+            op: BinaryOp::Ge,
+            right: low.clone(),
+        };
+        let le_e = Expr::Binary {
+            left: b_target.clone(),
+            op: BinaryOp::Le,
+            right: high.clone(),
+        };
+        if single_conjunct_implies(&ge_e, p, tbl, schema_name, alias)
+            || single_conjunct_implies(&le_e, p, tbl, schema_name, alias)
+        {
+            return true;
+        }
+    }
+
+    // `X IN (c1, c2, ...)` implies `p` if every `X = ci` implies `p`
+    if let Expr::InList {
+        expr: in_lhs,
+        list,
+        negated: false,
+    } = q
+        && !list.is_empty()
+    {
+        return list.iter().all(|item| {
+            let eq = Expr::Binary {
+                left: in_lhs.clone(),
+                op: BinaryOp::Eq,
+                right: Box::new(item.clone()),
+            };
+            single_conjunct_implies(&eq, p, tbl, schema_name, alias)
+        });
+    }
+
+    false
+}
+
+fn extract_expr_op_const(expr: &Expr) -> Option<(&Expr, BinaryOp, Value)> {
+    let Expr::Binary { left, op, right } = expr else {
+        return None;
+    };
+    match op {
+        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Gt | BinaryOp::Ge | BinaryOp::Lt | BinaryOp::Le => {
+        }
+        _ => return None,
+    }
+    if let Some(v) = eval_const_literal_for_implication(right) {
+        return Some((left.as_ref(), *op, v));
+    }
+    if let Some(v) = eval_const_literal_for_implication(left) {
+        let flipped = match op {
+            BinaryOp::Eq => BinaryOp::Eq,
+            BinaryOp::Ne => BinaryOp::Ne,
+            BinaryOp::Gt => BinaryOp::Lt,
+            BinaryOp::Ge => BinaryOp::Le,
+            BinaryOp::Lt => BinaryOp::Gt,
+            BinaryOp::Le => BinaryOp::Ge,
+            _ => return None,
+        };
+        return Some((right.as_ref(), flipped, v));
+    }
+    None
+}
+
+fn eval_const_literal_for_implication(expr: &Expr) -> Option<Value> {
+    match expr {
+        Expr::Integer(i) => Some(Value::Integer(*i)),
+        Expr::Float(f) => Some(Value::Real(*f)),
+        Expr::String(s) => Some(Value::Text(s.clone())),
+        Expr::Bool(b) => Some(Value::Integer(i64::from(*b))),
+        Expr::Unary {
+            op: UnaryOp::Negate,
+            expr: inner,
+        } => match inner.as_ref() {
+            Expr::Integer(i) => i.checked_neg().map(Value::Integer),
+            Expr::Float(f) => Some(Value::Real(-*f)),
+            _ => None,
+        },
+        Expr::Unary {
+            op: UnaryOp::Plus,
+            expr: inner,
+        } => eval_const_literal_for_implication(inner),
+        _ => None,
+    }
+}
+
+fn compare_const_literals(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => Some(x.cmp(y)),
+        (Value::Real(x), Value::Real(y)) => x.partial_cmp(y),
+        (Value::Integer(x), Value::Real(y)) => (*x as f64).partial_cmp(y),
+        (Value::Real(x), Value::Integer(y)) => x.partial_cmp(&(*y as f64)),
+        (Value::Text(x), Value::Text(y)) => Some(x.cmp(y)),
+        _ => None,
+    }
+}
+
+fn expr_rejects_null_of_target(
+    q: &Expr,
+    target: &Expr,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+) -> bool {
+    match q {
+        Expr::IsNull {
+            expr: inner,
+            negated: true,
+        } => expr_ast_equiv_for_table(inner, target, tbl, schema_name, alias),
+        Expr::Binary { left, op, right } => match op {
+            BinaryOp::And => {
+                expr_rejects_null_of_target(left, target, tbl, schema_name, alias)
+                    || expr_rejects_null_of_target(right, target, tbl, schema_name, alias)
+            }
+            BinaryOp::Or => {
+                expr_rejects_null_of_target(left, target, tbl, schema_name, alias)
+                    && expr_rejects_null_of_target(right, target, tbl, schema_name, alias)
+            }
+            BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Le
+            | BinaryOp::Gt
+            | BinaryOp::Ge => {
+                (expr_ast_equiv_for_table(left, target, tbl, schema_name, alias)
+                    && !matches!(right.as_ref(), Expr::Null))
+                    || (expr_ast_equiv_for_table(right, target, tbl, schema_name, alias)
+                        && !matches!(left.as_ref(), Expr::Null))
+            }
+            _ => false,
+        },
+        Expr::Between {
+            expr: b_e,
+            negated: false,
+            ..
+        } => expr_ast_equiv_for_table(b_e, target, tbl, schema_name, alias),
+        Expr::InList {
+            expr: in_e,
+            list,
+            negated: false,
+        } => !list.is_empty() && expr_ast_equiv_for_table(in_e, target, tbl, schema_name, alias),
+        Expr::Like {
+            expr: l_e,
+            negated: false,
+            ..
+        } => expr_ast_equiv_for_table(l_e, target, tbl, schema_name, alias),
+        _ => false,
+    }
+}
+
+fn expr_implies_non_null_col(
+    expr: &Expr,
+    col_name: &str,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+) -> bool {
+    let target = Expr::Column(ColumnRef::unqualified(col_name.to_owned()));
+    expr_rejects_null_of_target(expr, &target, tbl, schema_name, alias)
+}
+
+pub fn expr_ast_equiv_for_table(
+    a: &Expr,
+    b: &Expr,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+) -> bool {
+    match (a, b) {
+        (Expr::Null, Expr::Null) => true,
+        (Expr::Bool(x), Expr::Bool(y)) => x == y,
+        (Expr::Integer(x), Expr::Integer(y)) => x == y,
+        (Expr::Float(x), Expr::Float(y)) => x.to_bits() == y.to_bits(),
+        (Expr::String(x), Expr::String(y)) => x == y,
+        (Expr::Blob(x), Expr::Blob(y)) => x == y,
+        (Expr::Column(ca), Expr::Column(cb)) => {
+            if !cref_matches_single_table(ca, tbl, schema_name, alias)
+                || !cref_matches_single_table(cb, tbl, schema_name, alias)
+            {
+                return false;
+            }
+            if is_rowid_or_ipk_name(tbl, &ca.column) && is_rowid_or_ipk_name(tbl, &cb.column) {
+                return true;
+            }
+            ca.column.eq_ignore_ascii_case(&cb.column)
+        }
+        (Expr::Unary { op: op_a, expr: ea }, Expr::Unary { op: op_b, expr: eb }) => {
+            op_a == op_b && expr_ast_equiv_for_table(ea, eb, tbl, schema_name, alias)
+        }
+        (
+            Expr::Binary {
+                left: la,
+                op: op_a,
+                right: ra,
+            },
+            Expr::Binary {
+                left: lb,
+                op: op_b,
+                right: rb,
+            },
+        ) => {
+            if op_a == op_b
+                && expr_ast_equiv_for_table(la, lb, tbl, schema_name, alias)
+                && expr_ast_equiv_for_table(ra, rb, tbl, schema_name, alias)
+            {
+                return true;
+            }
+            // Commutative operators (`=`, `!=`, `+`, `*`, `AND`, `OR`)
+            if matches!(
+                op_a,
+                BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Add
+                    | BinaryOp::Multiply
+                    | BinaryOp::And
+                    | BinaryOp::Or
+            ) && op_a == op_b
+                && expr_ast_equiv_for_table(la, rb, tbl, schema_name, alias)
+                && expr_ast_equiv_for_table(ra, lb, tbl, schema_name, alias)
+            {
+                return true;
+            }
+            false
+        }
+        (
+            Expr::Collate {
+                expr: ea,
+                collation: ca,
+            },
+            Expr::Collate {
+                expr: eb,
+                collation: cb,
+            },
+        ) => {
+            ca.eq_ignore_ascii_case(cb) && expr_ast_equiv_for_table(ea, eb, tbl, schema_name, alias)
+        }
+        (
+            Expr::IsNull {
+                expr: ea,
+                negated: na,
+            },
+            Expr::IsNull {
+                expr: eb,
+                negated: nb,
+            },
+        ) => na == nb && expr_ast_equiv_for_table(ea, eb, tbl, schema_name, alias),
+        (
+            Expr::Cast {
+                expr: ea,
+                type_name: ta,
+            },
+            Expr::Cast {
+                expr: eb,
+                type_name: tb,
+            },
+        ) => {
+            ta.eq_ignore_ascii_case(tb) && expr_ast_equiv_for_table(ea, eb, tbl, schema_name, alias)
+        }
+        (
+            Expr::FunctionCall {
+                name: na,
+                distinct: da,
+                args: aa,
+                filter: fa,
+                over: None,
+            },
+            Expr::FunctionCall {
+                name: nb,
+                distinct: db,
+                args: ab,
+                filter: fb,
+                over: None,
+            },
+        ) => {
+            if !na.eq_ignore_ascii_case(nb) || da != db {
+                return false;
+            }
+            let args_eq = match (aa, ab) {
+                (FunctionArgs::Star, FunctionArgs::Star) => true,
+                (FunctionArgs::Exprs(esa), FunctionArgs::Exprs(esb)) => {
+                    esa.len() == esb.len()
+                        && esa
+                            .iter()
+                            .zip(esb.iter())
+                            .all(|(x, y)| expr_ast_equiv_for_table(x, y, tbl, schema_name, alias))
+                }
+                _ => false,
+            };
+            let filter_eq = match (fa, fb) {
+                (None, None) => true,
+                (Some(fx), Some(fy)) => expr_ast_equiv_for_table(fx, fy, tbl, schema_name, alias),
+                _ => false,
+            };
+            args_eq && filter_eq
+        }
+        (
+            Expr::Between {
+                expr: ea,
+                low: la,
+                high: ha,
+                negated: na,
+            },
+            Expr::Between {
+                expr: eb,
+                low: lb,
+                high: hb,
+                negated: nb,
+            },
+        ) => {
+            na == nb
+                && expr_ast_equiv_for_table(ea, eb, tbl, schema_name, alias)
+                && expr_ast_equiv_for_table(la, lb, tbl, schema_name, alias)
+                && expr_ast_equiv_for_table(ha, hb, tbl, schema_name, alias)
+        }
+        (
+            Expr::InList {
+                expr: ea,
+                list: la,
+                negated: na,
+            },
+            Expr::InList {
+                expr: eb,
+                list: lb,
+                negated: nb,
+            },
+        ) => {
+            na == nb
+                && la.len() == lb.len()
+                && expr_ast_equiv_for_table(ea, eb, tbl, schema_name, alias)
+                && la
+                    .iter()
+                    .zip(lb.iter())
+                    .all(|(x, y)| expr_ast_equiv_for_table(x, y, tbl, schema_name, alias))
+        }
+        (
+            Expr::Like {
+                expr: ea,
+                pattern: pa,
+                escape: esca,
+                op: opa,
+                negated: na,
+            },
+            Expr::Like {
+                expr: eb,
+                pattern: pb,
+                escape: escb,
+                op: opb,
+                negated: nb,
+            },
+        ) => {
+            opa == opb
+                && na == nb
+                && expr_ast_equiv_for_table(ea, eb, tbl, schema_name, alias)
+                && expr_ast_equiv_for_table(pa, pb, tbl, schema_name, alias)
+                && match (esca, escb) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => expr_ast_equiv_for_table(x, y, tbl, schema_name, alias),
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
+}
+
+/// Checks if `idx` covers all columns/expressions of `tbl` referenced anywhere in the query
+/// (`SELECT` projection, `WHERE` selection, `GROUP BY`, `HAVING`, `ORDER BY`).
+fn index_is_covering_for_query(
+    idx: &IndexSchema,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+    selection: Option<&Expr>,
+    ctx: &QueryPlanContext<'_>,
+) -> bool {
+    let Some(proj) = ctx.projection else {
+        // DML (`UPDATE` / `DELETE`) or unknown projection requires full table access
+        return false;
+    };
+
+    for rc in proj {
+        match rc {
+            ResultColumn::Star | ResultColumn::TableStar { .. } => {
+                for (ci, _) in tbl.columns.iter().enumerate() {
+                    if !index_provides_table_col(idx, tbl, ci) {
+                        return false;
+                    }
+                }
+            }
+            ResultColumn::Expr { expr, .. } => {
+                if !expr_covered_by_index(expr, idx, tbl, schema_name, alias) {
+                    return false;
+                }
+            }
+        }
+    }
+    if let Some(w) = selection
+        && !expr_covered_by_index(w, idx, tbl, schema_name, alias)
+    {
+        return false;
+    }
+    for g in ctx.group_by {
+        if !expr_covered_by_index(g, idx, tbl, schema_name, alias) {
+            return false;
+        }
+    }
+    if let Some(h) = ctx.having
+        && !expr_covered_by_index(h, idx, tbl, schema_name, alias)
+    {
+        return false;
+    }
+    for ob in ctx.order_by {
+        if !expr_covered_by_index(&ob.expr, idx, tbl, schema_name, alias) {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn index_provides_table_col(idx: &IndexSchema, tbl: &TableSchema, col_idx: usize) -> bool {
+    if !tbl.without_rowid && tbl.rowid_alias_col == Some(col_idx) {
+        return true;
+    }
+    if idx.columns.iter().any(|ic| ic.col_idx == Some(col_idx)) {
+        return true;
+    }
+    if idx
+        .trailing_pk_cols
+        .iter()
+        .any(|ic| ic.col_idx == Some(col_idx))
+    {
+        return true;
+    }
+    if let Some((ref gen_expr, _)) = tbl.columns[col_idx].generated {
+        // A generated column is covered if either its expression is directly indexed or all columns
+        // referenced by its generator expression are covered by the index!
+        return expr_covered_by_index(gen_expr, idx, tbl, "main", None);
+    }
+    false
+}
+
+pub fn index_slot_for_table_col(
+    idx: &IndexSchema,
+    tbl: &TableSchema,
+    col_idx: usize,
+) -> Option<usize> {
+    if let Some(pos) = idx
+        .columns
+        .iter()
+        .position(|ic| ic.col_idx == Some(col_idx))
+    {
+        return Some(pos);
+    }
+    if tbl.without_rowid
+        && let Some(pos) = idx
+            .trailing_pk_cols
+            .iter()
+            .position(|ic| ic.col_idx == Some(col_idx))
+    {
+        return Some(idx.columns.len() + pos);
+    }
+    None
+}
+
+pub fn index_slot_for_expr(
+    idx: &IndexSchema,
+    expr: &Expr,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+) -> Option<usize> {
+    idx.columns.iter().position(|ic| {
+        ic.expr
+            .as_ref()
+            .is_some_and(|ie| expr_ast_equiv_for_table(expr, ie, tbl, schema_name, alias))
+    })
+}
+
+fn expr_covered_by_index(
+    expr: &Expr,
+    idx: &IndexSchema,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+) -> bool {
+    if index_slot_for_expr(idx, expr, tbl, schema_name, alias).is_some() {
+        return true;
+    }
+    match expr {
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Integer(_)
+        | Expr::Float(_)
+        | Expr::String(_)
+        | Expr::Blob(_)
+        | Expr::OversizedHex(_)
+        | Expr::CurrentTimeKw(_)
+        | Expr::Bind(_)
+        | Expr::Raise { .. } => true,
+        Expr::Column(cref) => {
+            if !cref_matches_single_table(cref, tbl, schema_name, alias) {
+                return true;
+            }
+            if let Some((ci, _)) = tbl.find_column(&cref.column) {
+                index_provides_table_col(idx, tbl, ci)
+            } else if tbl.is_implicit_rowid_name(&cref.column) {
+                !tbl.without_rowid
+            } else {
+                false
+            }
+        }
+        Expr::Unary { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => {
+            expr_covered_by_index(inner, idx, tbl, schema_name, alias)
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_covered_by_index(left, idx, tbl, schema_name, alias)
+                && expr_covered_by_index(right, idx, tbl, schema_name, alias)
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            expr_covered_by_index(e, idx, tbl, schema_name, alias)
+                && expr_covered_by_index(low, idx, tbl, schema_name, alias)
+                && expr_covered_by_index(high, idx, tbl, schema_name, alias)
+        }
+        Expr::InList { expr: e, list, .. } => {
+            expr_covered_by_index(e, idx, tbl, schema_name, alias)
+                && list
+                    .iter()
+                    .all(|item| expr_covered_by_index(item, idx, tbl, schema_name, alias))
+        }
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_covered_by_index(e, idx, tbl, schema_name, alias)
+                && expr_covered_by_index(pattern, idx, tbl, schema_name, alias)
+                && escape
+                    .as_deref()
+                    .is_none_or(|esc| expr_covered_by_index(esc, idx, tbl, schema_name, alias))
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_deref()
+                .is_none_or(|op| expr_covered_by_index(op, idx, tbl, schema_name, alias))
+                && branches.iter().all(|(w, t)| {
+                    expr_covered_by_index(w, idx, tbl, schema_name, alias)
+                        && expr_covered_by_index(t, idx, tbl, schema_name, alias)
+                })
+                && else_expr
+                    .as_deref()
+                    .is_none_or(|el| expr_covered_by_index(el, idx, tbl, schema_name, alias))
+        }
+        Expr::RowValue(elems) => elems
+            .iter()
+            .all(|e| expr_covered_by_index(e, idx, tbl, schema_name, alias)),
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
+            if over.is_some() {
+                return false;
+            }
+            let args_ok = match args {
+                FunctionArgs::Star => true,
+                FunctionArgs::Exprs(es) => es
+                    .iter()
+                    .all(|e| expr_covered_by_index(e, idx, tbl, schema_name, alias)),
+            };
+            let filter_ok = filter
+                .as_deref()
+                .is_none_or(|f| expr_covered_by_index(f, idx, tbl, schema_name, alias));
+            args_ok && filter_ok
+        }
+        Expr::InTable { expr: e, .. } => expr_covered_by_index(e, idx, tbl, schema_name, alias),
+        Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => false,
+    }
+}
+
+pub fn index_satisfies_order_by(
+    idx: &IndexSchema,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+    selection: Option<&Expr>,
+    order_by: &[OrderByTerm],
+) -> bool {
+    if order_by.is_empty() {
+        return true;
+    }
+    let mut conjuncts = Vec::new();
+    if let Some(w) = selection {
+        collect_and_conjuncts(w, &mut conjuncts);
+    }
+
+    // Filter out ORDER BY terms that are already constrained to a constant by `WHERE col = const`
+    let remaining_ob: Vec<&OrderByTerm> = order_by
+        .iter()
+        .filter(|ob| {
+            !conjuncts.iter().any(|conj| {
+                if let Some((cname, _)) = extract_table_col_eq(conj, tbl, schema_name, alias)
+                    && let Some(ob_cname) =
+                        match_single_table_col(&ob.expr, tbl, schema_name, alias)
+                {
+                    cname.eq_ignore_ascii_case(&ob_cname)
+                } else {
+                    false
+                }
+            })
+        })
+        .collect();
+    if remaining_ob.is_empty() {
+        return true;
+    }
+
+    // Skip leading index columns that are constrained by equality (`col = const`) in `WHERE`
+    let mut first_non_eq = 0usize;
+    while first_non_eq < idx.columns.len() {
+        let ic = &idx.columns[first_non_eq];
+        let has_eq = conjuncts
+            .iter()
+            .any(|conj| match_index_col_eq(conj, ic, tbl, schema_name, alias).is_some());
+        if has_eq {
+            first_non_eq += 1;
+        } else {
+            break;
+        }
+    }
+
+    let rem_idx_cols = &idx.columns[first_non_eq..];
+    if remaining_ob.len() > rem_idx_cols.len() {
+        return false;
+    }
+
+    // Check forward or reverse scan direction
+    for &reverse in &[false, true] {
+        let mut ok = true;
+        for (ob, ic) in remaining_ob.iter().zip(rem_idx_cols.iter()) {
+            let ob_desc = ob.desc;
+            let ob_nulls_last = ob.nulls_last.unwrap_or(ob_desc);
+            let idx_desc = if reverse {
+                !ic.sort_order.desc
+            } else {
+                ic.sort_order.desc
+            };
+            let idx_nulls_last = if reverse {
+                !ic.sort_order.nulls_last
+            } else {
+                ic.sort_order.nulls_last
+            };
+            if ob_desc != idx_desc || ob_nulls_last != idx_nulls_last {
+                ok = false;
+                break;
+            }
+            if match_index_col_target(&ob.expr, ic, tbl, schema_name, alias).is_none() {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return true;
+        }
+    }
+    false
 }
 
 fn cref_matches_single_table(
@@ -559,6 +2441,7 @@ struct TableBinding<'a> {
     schema_name: &'a str,
     alias: Option<&'a str>,
     cursor: i32,
+    covering_index: Option<(&'a IndexSchema, i32)>,
 }
 
 fn resolve_main_table_for_compiler(
@@ -1001,36 +2884,98 @@ fn compile_single_table_select(
     }
     prog.column_names = expanded.iter().map(|(_, name, _)| name.clone()).collect();
 
-    // Begin read transaction & open table cursor
+    // Choose access plan first so covering index queries do NOT open or seek the table cursor!
+    if matches!(indexed_by, Some(IndexHint::IndexedBy(_))) {
+        return Ok(None);
+    }
+    let plan = choose_access_plan_with_context(
+        tbl,
+        schema_name,
+        alias,
+        selection,
+        schema,
+        QueryPlanContext {
+            projection: Some(projection),
+            group_by: &[],
+            having: None,
+            order_by,
+            indexed_by,
+            is_count_star_only: false,
+        },
+    );
+
+    // Delegate range scans, IN-list seeks, and MULTI-INDEX OR to the relational engine with B-Tree range seeks
+    if matches!(
+        plan,
+        AccessPlan::RowidRange { .. }
+            | AccessPlan::RowidIn { .. }
+            | AccessPlan::IndexRangeScan { .. }
+            | AccessPlan::MultiIndexOr { .. }
+    ) {
+        return Ok(None);
+    }
+
+    let covering_secondary_idx: Option<&IndexSchema> = match &plan {
+        AccessPlan::IndexFullScan {
+            index,
+            is_covering: true,
+        }
+        | AccessPlan::IndexSeek {
+            index,
+            is_covering: true,
+            ..
+        } if !(tbl.without_rowid && index.origin == "pk" && index.root_pgno == tbl.root_pgno) => {
+            Some(index)
+        }
+        _ => None,
+    };
+
+    // Begin read transaction & open table or covering index cursor
     let tbl_cursor = prog.alloc_cursor();
+    let mut idx_cursor_opt = None;
+    let body_start = prog.current_addr();
+    prog.emit(Instruction::new(Opcode::Transaction, db_id.index() as i32, 0, 0).with_db(db_id));
+
+    let covering_binding = if let Some(cov_idx) = covering_secondary_idx {
+        let icur = prog.alloc_cursor();
+        idx_cursor_opt = Some(icur);
+        prog.emit(
+            Instruction::new(Opcode::OpenReadIndex, icur, cov_idx.root_pgno as i32, 0)
+                .with_db(db_id)
+                .with_p4(P4::KeyInfo(cov_idx.key_sort_orders()))
+                .with_comment(cov_idx.name.clone()),
+        );
+        Some((cov_idx, icur))
+    } else {
+        if tbl.without_rowid {
+            prog.emit(
+                Instruction::new(Opcode::OpenReadIndex, tbl_cursor, tbl.root_pgno as i32, 0)
+                    .with_db(db_id)
+                    .with_p4(P4::KeyInfo(tbl.without_rowid_pk_orders()))
+                    .with_comment(tbl.name.clone()),
+            );
+        } else {
+            prog.emit(
+                Instruction::new(
+                    Opcode::OpenRead,
+                    tbl_cursor,
+                    tbl.root_pgno as i32,
+                    tbl.columns.len() as i32,
+                )
+                .with_db(db_id)
+                .with_comment(tbl.name.clone()),
+            );
+        }
+        None
+    };
+
     let binding = TableBinding {
         tbl,
         schema_name,
         alias,
         cursor: tbl_cursor,
+        covering_index: covering_binding,
     };
-
-    let body_start = prog.current_addr();
-    prog.emit(Instruction::new(Opcode::Transaction, db_id.index() as i32, 0, 0).with_db(db_id));
-    if tbl.without_rowid {
-        prog.emit(
-            Instruction::new(Opcode::OpenReadIndex, tbl_cursor, tbl.root_pgno as i32, 0)
-                .with_db(db_id)
-                .with_p4(P4::KeyInfo(tbl.without_rowid_pk_orders()))
-                .with_comment(tbl.name.clone()),
-        );
-    } else {
-        prog.emit(
-            Instruction::new(
-                Opcode::OpenRead,
-                tbl_cursor,
-                tbl.root_pgno as i32,
-                tbl.columns.len() as i32,
-            )
-            .with_db(db_id)
-            .with_comment(tbl.name.clone()),
-        );
-    }
 
     // Optional LIMIT / OFFSET registers initialized before loop
     let limit_regs = if let Some(lim) = limit {
@@ -1052,14 +2997,8 @@ fn compile_single_table_select(
         None
     };
 
-    let plan = match indexed_by {
-        Some(IndexHint::NotIndexed) => AccessPlan::FullScan,
-        None => choose_access_plan_with_schema_name(tbl, schema_name, alias, selection, schema),
-        Some(IndexHint::IndexedBy(_)) => return Ok(None),
-    };
-
-    // Optional Sorter setup for ORDER BY (elided when a natural ascending rowid scan or
-    // `WITHOUT ROWID` primary B-Tree scan already satisfies `ORDER BY`!)
+    // Optional Sorter setup for ORDER BY (elided when a natural ascending rowid scan,
+    // `WITHOUT ROWID` primary B-Tree scan, or forward index scan already satisfies `ORDER BY`!)
     let sorter_setup = if !order_by.is_empty() {
         let mut sort_sources = Vec::with_capacity(order_by.len());
         let mut sort_orders = Vec::with_capacity(order_by.len());
@@ -1109,7 +3048,22 @@ fn compile_single_table_select(
                         })
                 });
 
-        if natural_rowid_order || natural_without_rowid_order {
+        let natural_index_order = match &plan {
+            AccessPlan::IndexFullScan { index, .. } => {
+                order_by.len() <= index.columns.len()
+                    && resolved_exprs
+                        .iter()
+                        .zip(sort_orders.iter())
+                        .zip(index.columns.iter())
+                        .all(|((re, so), ic)| {
+                            *so == ic.sort_order
+                                && match_index_col_target(re, ic, tbl, schema_name, alias).is_some()
+                        })
+            }
+            _ => false,
+        };
+
+        if natural_rowid_order || natural_without_rowid_order || natural_index_order {
             None
         } else {
             let s_cursor = prog.alloc_cursor();
@@ -1130,7 +3084,6 @@ fn compile_single_table_select(
 
     let mut jumps_after_scan = Vec::new();
     let mut jumps_next_row = Vec::new();
-    let mut idx_cursor_opt = None;
     let mut seek_advance_cursor = None;
 
     // Early check: if LIMIT == 0 and no sorter needed, jump straight past scan
@@ -1148,6 +3101,57 @@ fn compile_single_table_select(
             jumps_after_scan.push(rewind);
             prog.current_addr()
         }
+        AccessPlan::IndexFullScan { index, is_covering } => {
+            let icur = if let Some((_, cov_cur)) = covering_binding {
+                cov_cur
+            } else {
+                let c = prog.alloc_cursor();
+                idx_cursor_opt = Some(c);
+                prog.emit(
+                    Instruction::new(Opcode::OpenReadIndex, c, index.root_pgno as i32, 0)
+                        .with_db(db_id)
+                        .with_p4(P4::KeyInfo(index.key_sort_orders()))
+                        .with_comment(index.name.clone()),
+                );
+                c
+            };
+            seek_advance_cursor = Some(icur);
+            let rewind = prog.emit(Instruction::new(Opcode::Rewind, icur, 0, 0));
+            jumps_after_scan.push(rewind);
+            let top = prog.current_addr();
+            if !*is_covering {
+                if tbl.without_rowid {
+                    let mut pk_slots_in_idx = Vec::new();
+                    for pk_col in &tbl.without_rowid_pk_cols {
+                        let Some(slot) = index.without_rowid_pk_slot_in_index(pk_col) else {
+                            return Ok(None);
+                        };
+                        pk_slots_in_idx.push(slot);
+                    }
+                    let pk_base = prog.alloc_registers(pk_slots_in_idx.len());
+                    for (k, &slot) in pk_slots_in_idx.iter().enumerate() {
+                        prog.emit(Instruction::new(
+                            Opcode::Column,
+                            icur,
+                            slot as i32,
+                            pk_base + k as i32,
+                        ));
+                    }
+                    let seek_tbl = prog.emit(
+                        Instruction::new(Opcode::SeekIndexEqual, tbl_cursor, 0, pk_base)
+                            .with_p5(pk_slots_in_idx.len() as u16),
+                    );
+                    jumps_next_row.push(seek_tbl);
+                } else {
+                    let rid_reg = prog.alloc_register();
+                    prog.emit(Instruction::new(Opcode::Rowid, icur, rid_reg, 0));
+                    let seek_tbl =
+                        prog.emit(Instruction::new(Opcode::SeekRowid, tbl_cursor, 0, rid_reg));
+                    jumps_next_row.push(seek_tbl);
+                }
+            }
+            top
+        }
         AccessPlan::RowidSeek { key_expr } => {
             let key_reg = prog.alloc_register();
             compile_expr(&mut prog, key_expr, None, functions, key_reg)?;
@@ -1158,6 +3162,7 @@ fn compile_single_table_select(
         AccessPlan::IndexSeek {
             index,
             prefix_exprs,
+            is_covering,
         } => {
             let is_primary_without_rowid =
                 tbl.without_rowid && index.origin == "pk" && index.root_pgno == tbl.root_pgno;
@@ -1185,7 +3190,7 @@ fn compile_single_table_select(
                 prog.current_addr()
             } else {
                 let mut pk_slots_in_idx = Vec::new();
-                if tbl.without_rowid {
+                if tbl.without_rowid && !*is_covering {
                     for pk_col in &tbl.without_rowid_pk_cols {
                         let Some(slot) = index.without_rowid_pk_slot_in_index(pk_col) else {
                             return Ok(None);
@@ -1194,15 +3199,20 @@ fn compile_single_table_select(
                     }
                 }
 
-                let icur = prog.alloc_cursor();
-                idx_cursor_opt = Some(icur);
+                let icur = if let Some((_, cov_cur)) = covering_binding {
+                    cov_cur
+                } else {
+                    let c = prog.alloc_cursor();
+                    idx_cursor_opt = Some(c);
+                    prog.emit(
+                        Instruction::new(Opcode::OpenReadIndex, c, index.root_pgno as i32, 0)
+                            .with_db(db_id)
+                            .with_p4(P4::KeyInfo(index.key_sort_orders()))
+                            .with_comment(index.name.clone()),
+                    );
+                    c
+                };
                 seek_advance_cursor = Some(icur);
-                prog.emit(
-                    Instruction::new(Opcode::OpenReadIndex, icur, index.root_pgno as i32, 0)
-                        .with_db(db_id)
-                        .with_p4(P4::KeyInfo(index.key_sort_orders()))
-                        .with_comment(index.name.clone()),
-                );
                 let key_base = prog.alloc_registers(prefix_exprs.len());
                 for (i, ke) in prefix_exprs.iter().enumerate() {
                     let r = key_base + i as i32;
@@ -1223,37 +3233,46 @@ fn compile_single_table_select(
                 jumps_after_scan.push(seek_ge);
 
                 let top = prog.current_addr();
-                if tbl.without_rowid {
-                    let pk_base = prog.alloc_registers(pk_slots_in_idx.len());
-                    for (k, &slot) in pk_slots_in_idx.iter().enumerate() {
-                        prog.emit(Instruction::new(
-                            Opcode::Column,
-                            icur,
-                            slot as i32,
-                            pk_base + k as i32,
-                        ));
+                if !*is_covering {
+                    if tbl.without_rowid {
+                        let pk_base = prog.alloc_registers(pk_slots_in_idx.len());
+                        for (k, &slot) in pk_slots_in_idx.iter().enumerate() {
+                            prog.emit(Instruction::new(
+                                Opcode::Column,
+                                icur,
+                                slot as i32,
+                                pk_base + k as i32,
+                            ));
+                        }
+                        let seek_tbl = prog.emit(
+                            Instruction::new(Opcode::SeekIndexEqual, tbl_cursor, 0, pk_base)
+                                .with_p5(pk_slots_in_idx.len() as u16),
+                        );
+                        jumps_next_row.push(seek_tbl);
+                    } else {
+                        let rid_reg = prog.alloc_register();
+                        prog.emit(Instruction::new(Opcode::Rowid, icur, rid_reg, 0));
+                        let seek_tbl =
+                            prog.emit(Instruction::new(Opcode::SeekRowid, tbl_cursor, 0, rid_reg));
+                        jumps_next_row.push(seek_tbl);
                     }
-                    let seek_tbl = prog.emit(
-                        Instruction::new(Opcode::SeekIndexEqual, tbl_cursor, 0, pk_base)
-                            .with_p5(pk_slots_in_idx.len() as u16),
-                    );
-                    jumps_next_row.push(seek_tbl);
-                } else {
-                    let rid_reg = prog.alloc_register();
-                    prog.emit(Instruction::new(Opcode::Rowid, icur, rid_reg, 0));
-                    let seek_tbl =
-                        prog.emit(Instruction::new(Opcode::SeekRowid, tbl_cursor, 0, rid_reg));
-                    jumps_next_row.push(seek_tbl);
                 }
                 top
             }
         }
+        AccessPlan::RowidRange { .. }
+        | AccessPlan::RowidIn { .. }
+        | AccessPlan::IndexRangeScan { .. }
+        | AccessPlan::MultiIndexOr { .. } => unreachable!(),
     };
 
     // Evaluate full WHERE filter (also handles residual conjuncts after index/rowid seek!)
     if let Some(w) = selection {
         let cond_reg = prog.alloc_register();
-        compile_expr(&mut prog, w, Some(&binding), functions, cond_reg)?;
+        if compile_expr(&mut prog, w, Some(&binding), functions, cond_reg).is_err() {
+            // If `WHERE` references a SELECT result-column alias, fall back to the relational engine
+            return Ok(None);
+        }
         jumps_next_row.push(prog.emit(Instruction::new(Opcode::JumpIfFalse, cond_reg, 0, 1)));
     }
 
@@ -1364,6 +3383,10 @@ fn compile_single_table_select(
                 0,
             ));
         }
+        AccessPlan::IndexFullScan { .. } => {
+            let adv_cur = seek_advance_cursor.expect("index full scan cursor allocated");
+            prog.emit(Instruction::new(Opcode::Next, adv_cur, loop_top as i32, 0));
+        }
         AccessPlan::RowidSeek { .. } => {
             // Single point lookup: falls straight through!
         }
@@ -1376,6 +3399,10 @@ fn compile_single_table_select(
                 0,
             ));
         }
+        AccessPlan::RowidRange { .. }
+        | AccessPlan::RowidIn { .. }
+        | AccessPlan::IndexRangeScan { .. }
+        | AccessPlan::MultiIndexOr { .. } => unreachable!(),
     }
 
     let after_scan = prog.current_addr();
@@ -1386,7 +3413,9 @@ fn compile_single_table_select(
     if let Some(icur) = idx_cursor_opt {
         prog.emit(Instruction::new(Opcode::Close, icur, 0, 0));
     }
-    prog.emit(Instruction::new(Opcode::Close, tbl_cursor, 0, 0));
+    if covering_binding.is_none() {
+        prog.emit(Instruction::new(Opcode::Close, tbl_cursor, 0, 0));
+    }
 
     // Drain Sorter if ORDER BY was present
     if let Some((s_cursor, sort_exprs)) = sorter_setup {
@@ -1674,6 +3703,15 @@ fn compile_expr(
     functions: &FunctionRegistry,
     dest: i32,
 ) -> Result<()> {
+    if !matches!(expr, Expr::Column(_))
+        && let Some(b) = binding
+        && let Some((cov_idx, cov_cur)) = b.covering_index
+        && let Some(slot) = index_slot_for_expr(cov_idx, expr, b.tbl, b.schema_name, b.alias)
+    {
+        prog.emit(Instruction::new(Opcode::Column, cov_cur, slot as i32, dest));
+        return Ok(());
+    }
+
     match expr {
         Expr::Null => {
             prog.emit(Instruction::new(Opcode::Null, 0, dest, 0));
@@ -1735,13 +3773,44 @@ fn compile_expr(
                     format!("no such column: {}", cref.display_name()),
                 ));
             }
-            if let Some((col_idx, col_schema)) = b.tbl.find_column(&cref.column) {
+            if let Some((cov_idx, cov_cur)) = b.covering_index {
+                if let Some((col_idx, col_schema)) = b.tbl.find_column(&cref.column) {
+                    if let Some(slot) = index_slot_for_table_col(cov_idx, b.tbl, col_idx) {
+                        prog.emit(
+                            Instruction::new(Opcode::Column, cov_cur, slot as i32, dest)
+                                .with_p4(col_schema.default_p4_for_table(b.tbl.strict))
+                                .with_comment(col_schema.name.clone()),
+                        );
+                    } else if !b.tbl.without_rowid && b.tbl.rowid_alias_col == Some(col_idx) {
+                        prog.emit(
+                            Instruction::new(Opcode::Rowid, cov_cur, dest, 0)
+                                .with_comment(col_schema.name.clone()),
+                        );
+                    } else if let Some((ref gen_expr, _)) = col_schema.generated {
+                        compile_expr(prog, gen_expr, Some(b), functions, dest)?;
+                    } else {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("no such column: {}", cref.display_name()),
+                        ));
+                    }
+                } else if b.tbl.is_implicit_rowid_name(&cref.column) {
+                    prog.emit(Instruction::new(Opcode::Rowid, cov_cur, dest, 0));
+                } else {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("no such column: {}", cref.display_name()),
+                    ));
+                }
+            } else if let Some((col_idx, col_schema)) = b.tbl.find_column(&cref.column) {
                 if b.tbl.rowid_alias_col == Some(col_idx) {
                     // C SQLite `insert.c:1361`: INTEGER PRIMARY KEY slot in record is NULL; read from B+Tree rowid!
                     prog.emit(
                         Instruction::new(Opcode::Rowid, b.cursor, dest, 0)
                             .with_comment(col_schema.name.clone()),
                     );
+                } else if let Some((ref gen_expr, false)) = col_schema.generated {
+                    compile_expr(prog, gen_expr, Some(b), functions, dest)?;
                 } else {
                     let phys_slot = b.tbl.physical_record_slot(col_idx);
                     prog.emit(
@@ -1919,6 +3988,10 @@ fn compile_expr(
                     0,
                 ));
             } else {
+                if list.len() >= 2 {
+                    let eph_cur = prog.alloc_cursor();
+                    prog.emit(Instruction::new(Opcode::OpenEphemeral, eph_cur, 1, 0));
+                }
                 let mut disj: Option<Expr> = None;
                 for item in list {
                     // Per `sqlite/src/expr.c` (`exprINAffinity`), `lhs IN (list)` applies ONLY
@@ -2239,6 +4312,151 @@ pub fn compile_for_explain(stmt: &Stmt, schema: &Schema) -> Result<VdbeProgram> 
     compile_for_explain_with_functions(stmt, schema, &FunctionRegistry::default())
 }
 
+fn is_pure_count_star_projection(projection: &[ResultColumn]) -> bool {
+    if projection.len() != 1 {
+        return false;
+    }
+    match &projection[0] {
+        ResultColumn::Expr {
+            expr:
+                Expr::FunctionCall {
+                    name,
+                    distinct: false,
+                    args,
+                    filter: None,
+                    over: None,
+                },
+            ..
+        } if name.eq_ignore_ascii_case("count") => match args {
+            FunctionArgs::Star => true,
+            FunctionArgs::Exprs(es) => es.is_empty(),
+        },
+        _ => false,
+    }
+}
+
+fn is_unfiltered_base_table_count_star<F>(sel: &SelectStmt, resolve_table: F) -> bool
+where
+    F: Fn(&QualifiedName) -> bool,
+{
+    if !sel.body.compounds.is_empty() {
+        return false;
+    }
+    let SelectCore::Select {
+        distinct: false,
+        projection,
+        from: Some(fc),
+        selection: None,
+        group_by,
+        having: None,
+        windows,
+    } = &sel.body.head
+    else {
+        return false;
+    };
+    if !group_by.is_empty() || !windows.is_empty() || !fc.joins.is_empty() {
+        return false;
+    }
+    if !is_pure_count_star_projection(projection) {
+        return false;
+    }
+    let TableOrSubquery::Table {
+        name,
+        table_args: None,
+        ..
+    } = &fc.head
+    else {
+        return false;
+    };
+    if name.schema.is_none()
+        && sel
+            .ctes
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(&name.name))
+    {
+        return false;
+    }
+    resolve_table(name)
+}
+
+fn expr_contains_multi_in_list(expr: &Expr) -> bool {
+    match expr {
+        Expr::InList { list, .. } => {
+            list.len() >= 2 || list.iter().any(expr_contains_multi_in_list)
+        }
+        Expr::Unary { expr: e, .. }
+        | Expr::Collate { expr: e, .. }
+        | Expr::IsNull { expr: e, .. }
+        | Expr::Cast { expr: e, .. } => expr_contains_multi_in_list(e),
+        Expr::Binary { left, right, .. } => {
+            expr_contains_multi_in_list(left) || expr_contains_multi_in_list(right)
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            expr_contains_multi_in_list(e)
+                || expr_contains_multi_in_list(low)
+                || expr_contains_multi_in_list(high)
+        }
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_multi_in_list(e)
+                || expr_contains_multi_in_list(pattern)
+                || escape.as_deref().is_some_and(expr_contains_multi_in_list)
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand.as_deref().is_some_and(expr_contains_multi_in_list)
+                || branches
+                    .iter()
+                    .any(|(w, t)| expr_contains_multi_in_list(w) || expr_contains_multi_in_list(t))
+                || else_expr
+                    .as_deref()
+                    .is_some_and(expr_contains_multi_in_list)
+        }
+        Expr::FunctionCall {
+            args: FunctionArgs::Exprs(es),
+            filter,
+            ..
+        } => {
+            es.iter().any(expr_contains_multi_in_list)
+                || filter.as_deref().is_some_and(expr_contains_multi_in_list)
+        }
+        Expr::RowValue(es) => es.iter().any(expr_contains_multi_in_list),
+        _ => false,
+    }
+}
+
+fn select_contains_multi_in_list(sel: &SelectStmt) -> bool {
+    if let SelectCore::Select {
+        projection,
+        selection,
+        having,
+        ..
+    } = &sel.body.head
+    {
+        if projection.iter().any(
+            |rc| matches!(rc, ResultColumn::Expr { expr, .. } if expr_contains_multi_in_list(expr)),
+        ) {
+            return true;
+        }
+        if selection.as_ref().is_some_and(expr_contains_multi_in_list) {
+            return true;
+        }
+        if having.as_ref().is_some_and(expr_contains_multi_in_list) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Generates a representative [`VdbeProgram`] for `EXPLAIN <stmt>` using connection `functions`.
 pub fn compile_for_explain_with_functions(
     stmt: &Stmt,
@@ -2250,12 +4468,20 @@ pub fn compile_for_explain_with_functions(
             if let Some(prog) = try_compile_select_with_functions(sel, schema, functions)? {
                 return Ok(prog);
             }
+            let is_cnt = is_unfiltered_base_table_count_star(sel, |qn| {
+                schema.find_table(&qn.name).is_some()
+            });
             let mut prog = VdbeProgram::new();
             prog.emit(Instruction::new(Opcode::Init, 0, 1, 0));
             prog.emit(Instruction::new(Opcode::Transaction, 0, 0, 0));
-            prog.emit(
-                Instruction::new(Opcode::OpenEphemeral, 0, 0, 0).with_comment("relational query"),
-            );
+            if is_cnt {
+                prog.emit(Instruction::new(Opcode::OpenRead, 0, 2, 0).with_comment("Count"));
+            } else {
+                prog.emit(
+                    Instruction::new(Opcode::OpenEphemeral, 0, 0, 0)
+                        .with_comment("relational query"),
+                );
+            }
             prog.emit(Instruction::new(Opcode::ResultRow, 1, 1, 0));
             prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
             Ok(prog)
@@ -2293,14 +4519,26 @@ pub fn compile_for_explain_in_db_set(
             if let Some(prog) = try_compile_select_in_db_set(sel, db_set, functions)? {
                 return Ok(prog);
             }
+            let is_cnt = is_unfiltered_base_table_count_star(sel, |qn| {
+                matches!(
+                    db_set.find_relation_in_set(qn),
+                    Ok(Some((_, ResolvedRelation::Table(_))))
+                )
+            });
             let mut prog = VdbeProgram::new();
             prog.emit(Instruction::new(Opcode::Init, 0, 1, 0));
             prog.emit(Instruction::new(Opcode::Transaction, 0, 0, 0));
-            if select_needs_ephemeral_in_db_set(sel, &[], db_set, 0) {
-                prog.emit(
-                    Instruction::new(Opcode::OpenEphemeral, 0, 0, 0)
-                        .with_comment("relational query"),
-                );
+            if is_cnt {
+                prog.emit(Instruction::new(Opcode::OpenRead, 0, 2, 0).with_comment("Count"));
+            } else if select_contains_multi_in_list(sel)
+                || select_needs_ephemeral_in_db_set(sel, &[], db_set, 0)
+            {
+                let comment = if select_uses_seek_scan_in_db_set(sel, db_set) {
+                    "SeekScan"
+                } else {
+                    "relational query"
+                };
+                prog.emit(Instruction::new(Opcode::OpenEphemeral, 0, 0, 0).with_comment(comment));
             } else {
                 prog.emit(Instruction::new(Opcode::OpenRead, 0, 2, 0).with_comment("flattened"));
             }
@@ -2757,6 +4995,46 @@ fn expr_needs_ephemeral_in_db_set(
     }
 }
 
+fn select_uses_seek_scan_in_db_set(sel: &SelectStmt, db_set: &DatabaseSet) -> bool {
+    let SelectCore::Select {
+        from: Some(fc),
+        selection: Some(w),
+        ..
+    } = &sel.body.head
+    else {
+        return false;
+    };
+    if !select_contains_multi_in_list(sel) || !expr_contains_between(w) {
+        return false;
+    }
+    let TableOrSubquery::Table { name, .. } = &fc.head else {
+        return false;
+    };
+    let Ok(Some((db_id, tbl))) = db_set.find_table_in_set(name) else {
+        return false;
+    };
+    db_set.slot(db_id).is_some_and(|sl| {
+        sl.schema
+            .indexes_for_table(&tbl.name)
+            .iter()
+            .any(|idx| idx.stat1.as_ref().is_some_and(|s| s.has_stat1))
+    })
+}
+
+fn expr_contains_between(expr: &Expr) -> bool {
+    match expr {
+        Expr::Between { .. } => true,
+        Expr::Binary { left, right, .. } => {
+            expr_contains_between(left) || expr_contains_between(right)
+        }
+        Expr::Unary { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. } => expr_contains_between(inner),
+        _ => false,
+    }
+}
+
 fn in_subquery_reuses_index(
     sub: &SelectStmt,
     ctes: &[CommonTableExpr],
@@ -2766,7 +5044,7 @@ fn in_subquery_reuses_index(
         return false;
     }
     let SelectCore::Select {
-        distinct: false,
+        distinct: _,
         projection,
         from: Some(fc),
         selection: None,
@@ -3697,27 +5975,528 @@ pub fn explain_query_plan_in_db_set(stmt: &Stmt, db_set: &DatabaseSet) -> Result
     })
 }
 
+fn plan_satisfies_order_by(
+    plan: &AccessPlan,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+    selection: Option<&Expr>,
+    order_by: &[OrderByTerm],
+) -> bool {
+    if order_by.is_empty() {
+        return true;
+    }
+    match plan {
+        AccessPlan::FullScan | AccessPlan::RowidSeek { .. } | AccessPlan::RowidRange { .. } => {
+            if !tbl.without_rowid {
+                order_by.len() == 1
+                    && is_table_rowid_column_expr(&order_by[0].expr, tbl, schema_name, alias)
+            } else if let Some(pk_idx) = tbl.without_rowid_pk_as_index() {
+                index_satisfies_order_by(&pk_idx, tbl, schema_name, alias, selection, order_by)
+            } else {
+                false
+            }
+        }
+        AccessPlan::IndexFullScan { index, .. }
+        | AccessPlan::IndexSeek { index, .. }
+        | AccessPlan::IndexRangeScan { index, .. } => {
+            index_satisfies_order_by(index, tbl, schema_name, alias, selection, order_by)
+        }
+        AccessPlan::RowidIn { .. } | AccessPlan::MultiIndexOr { .. } => false,
+    }
+}
+
+fn plan_cost_and_rows(plan: &AccessPlan, tbl: &TableSchema, schema: &Schema) -> (i16, i16) {
+    match plan {
+        AccessPlan::FullScan => {
+            let r_out = tbl.stat1.n_row_log_est;
+            (r_out, r_out)
+        }
+        AccessPlan::IndexFullScan { index, is_covering } => {
+            let r_out = index.effective_row_log_est(tbl)[0];
+            let cost = if *is_covering {
+                (r_out - 5).max(0)
+            } else {
+                r_out
+            };
+            (cost, r_out)
+        }
+        AccessPlan::RowidSeek { .. } => (10, 0),
+        AccessPlan::RowidIn { list } => {
+            let r_out = estimate_in_expr_list_log(list, schema);
+            (r_out.saturating_add(10), r_out)
+        }
+        AccessPlan::RowidRange { lower, upper } => {
+            let mut r_out = tbl.stat1.n_row_log_est;
+            if lower.is_some() {
+                r_out = (r_out - 10).max(0);
+            }
+            if upper.is_some() {
+                r_out = (r_out - 10).max(0);
+            }
+            (r_out.saturating_add(15), r_out)
+        }
+        AccessPlan::IndexSeek {
+            index,
+            prefix_exprs,
+            is_covering,
+        } => {
+            let idx_est = index.effective_row_log_est(tbl);
+            let n_eq = prefix_exprs.len();
+            let r_out = if index.unique && n_eq >= index.columns.len() {
+                0
+            } else {
+                idx_est
+                    .get(n_eq.min(idx_est.len().saturating_sub(1)))
+                    .copied()
+                    .unwrap_or(0)
+            };
+            let mut cost = sqlite_log_est_add(10, r_out);
+            if !*is_covering {
+                cost = sqlite_log_est_add(cost, r_out.saturating_add(15));
+            }
+            (cost, r_out)
+        }
+        AccessPlan::IndexRangeScan {
+            index,
+            prefix_exprs,
+            prefix_in_lists,
+            range_col_idx,
+            lower,
+            upper,
+            is_covering,
+            skip_scan_cols,
+        } => {
+            let idx_est = index.effective_row_log_est(tbl);
+            let n_eq = skip_scan_cols + prefix_exprs.len() + prefix_in_lists.len();
+            let mut r_size = idx_est
+                .get(n_eq.min(idx_est.len().saturating_sub(1)))
+                .copied()
+                .unwrap_or(0);
+            if range_col_idx.is_some() {
+                if lower.is_some() {
+                    r_size = (r_size - 10).max(0);
+                }
+                if upper.is_some() {
+                    r_size = (r_size - 10).max(0);
+                }
+            }
+            let mut n_seeks_log: i16 = 0;
+            for (_, list) in prefix_in_lists {
+                n_seeks_log = n_seeks_log.saturating_add(estimate_in_expr_list_log(list, schema));
+            }
+            if *skip_scan_cols > 0 {
+                let n_distinct_skip =
+                    (idx_est[0] - idx_est.get(*skip_scan_cols).copied().unwrap_or(0)).max(10);
+                n_seeks_log = n_seeks_log.saturating_add(n_distinct_skip);
+            }
+            let r_out = r_size.saturating_add(n_seeks_log);
+            let mut cost = sqlite_log_est_add(n_seeks_log.saturating_add(10), r_out);
+            if !*is_covering {
+                cost = sqlite_log_est_add(cost, r_out.saturating_add(15));
+            }
+            (cost, r_out)
+        }
+        AccessPlan::MultiIndexOr { branches } => {
+            let mut total_c = 0i16;
+            let mut total_r = 0i16;
+            for bp in branches {
+                let (bc, br) = plan_cost_and_rows(bp, tbl, schema);
+                total_c = sqlite_log_est_add(total_c, bc);
+                total_r = sqlite_log_est_add(total_r, br);
+            }
+            (total_c, total_r)
+        }
+    }
+}
+
+fn emit_in_table_eqp_nodes<'a, F>(
+    expr_opt: Option<&Expr>,
+    parent: i64,
+    resolve_relation: &F,
+    push_node: &mut dyn FnMut(i64, String) -> i64,
+) where
+    F: Fn(&QualifiedName) -> Option<(DatabaseId, &'a str, &'a Schema, ResolvedRelation)>,
+{
+    let Some(expr) = expr_opt else {
+        return;
+    };
+    match expr {
+        Expr::InTable {
+            expr: lhs,
+            table,
+            negated: false,
+        } => {
+            emit_in_table_eqp_nodes(Some(lhs), parent, resolve_relation, push_node);
+            if let Some((_, _, _, ResolvedRelation::Table(rhs_tbl))) = resolve_relation(table)
+                && rhs_tbl.columns.len() == 1
+                && rhs_tbl.rowid_alias_col == Some(0)
+            {
+                let _ = push_node(
+                    parent,
+                    format!(
+                        "USING ROWID SEARCH ON TABLE {} FOR IN-OPERATOR",
+                        rhs_tbl.name
+                    ),
+                );
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            emit_in_table_eqp_nodes(Some(left), parent, resolve_relation, push_node);
+            emit_in_table_eqp_nodes(Some(right), parent, resolve_relation, push_node);
+        }
+        Expr::Unary { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. } => {
+            emit_in_table_eqp_nodes(Some(inner), parent, resolve_relation, push_node);
+        }
+        _ => {}
+    }
+}
+
+fn validate_index_hint_in_eqp(
+    slot_schema: &Schema,
+    tbl: &TableSchema,
+    sname: &str,
+    alias: Option<&str>,
+    indexed_by: Option<&IndexHint>,
+    selection: Option<&Expr>,
+) -> Result<()> {
+    if let Some(IndexHint::IndexedBy(idx_name)) = indexed_by {
+        let Some(idx) = slot_schema
+            .indexes_for_table(&tbl.name)
+            .into_iter()
+            .find(|i| !i.is_autoindex && i.name.eq_ignore_ascii_case(idx_name))
+        else {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such index: {idx_name}"),
+            ));
+        };
+        if let Some(ref pw) = idx.where_clause {
+            let usable =
+                selection.is_some_and(|wh| expr_implies_partial_where(wh, pw, tbl, sname, alias));
+            if !usable {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    "no query solution".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn substitute_view_columns_in_expr(
+    expr: &Expr,
+    view_alias: &str,
+    view_col_map: &[(String, Expr)],
+) -> Expr {
+    match expr {
+        Expr::Column(cref) => {
+            if cref
+                .table
+                .as_deref()
+                .is_none_or(|t| t.eq_ignore_ascii_case(view_alias))
+                && let Some((_, mapped)) = view_col_map
+                    .iter()
+                    .find(|(vcol, _)| vcol.eq_ignore_ascii_case(&cref.column))
+            {
+                return mapped.clone();
+            }
+            expr.clone()
+        }
+        Expr::Unary { op, expr: inner } => Expr::Unary {
+            op: *op,
+            expr: Box::new(substitute_view_columns_in_expr(
+                inner,
+                view_alias,
+                view_col_map,
+            )),
+        },
+        Expr::Binary { left, op, right } => Expr::Binary {
+            left: Box::new(substitute_view_columns_in_expr(
+                left,
+                view_alias,
+                view_col_map,
+            )),
+            op: *op,
+            right: Box::new(substitute_view_columns_in_expr(
+                right,
+                view_alias,
+                view_col_map,
+            )),
+        },
+        Expr::Collate {
+            expr: inner,
+            collation,
+        } => Expr::Collate {
+            expr: Box::new(substitute_view_columns_in_expr(
+                inner,
+                view_alias,
+                view_col_map,
+            )),
+            collation: collation.clone(),
+        },
+        Expr::IsNull {
+            expr: inner,
+            negated,
+        } => Expr::IsNull {
+            expr: Box::new(substitute_view_columns_in_expr(
+                inner,
+                view_alias,
+                view_col_map,
+            )),
+            negated: *negated,
+        },
+        Expr::Cast {
+            expr: inner,
+            type_name,
+        } => Expr::Cast {
+            expr: Box::new(substitute_view_columns_in_expr(
+                inner,
+                view_alias,
+                view_col_map,
+            )),
+            type_name: type_name.clone(),
+        },
+        Expr::Between {
+            expr: e,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: Box::new(substitute_view_columns_in_expr(e, view_alias, view_col_map)),
+            low: Box::new(substitute_view_columns_in_expr(
+                low,
+                view_alias,
+                view_col_map,
+            )),
+            high: Box::new(substitute_view_columns_in_expr(
+                high,
+                view_alias,
+                view_col_map,
+            )),
+            negated: *negated,
+        },
+        Expr::InList {
+            expr: e,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(substitute_view_columns_in_expr(e, view_alias, view_col_map)),
+            list: list
+                .iter()
+                .map(|i| substitute_view_columns_in_expr(i, view_alias, view_col_map))
+                .collect(),
+            negated: *negated,
+        },
+        Expr::FunctionCall {
+            name,
+            distinct,
+            args: FunctionArgs::Exprs(es),
+            filter,
+            over,
+        } => Expr::FunctionCall {
+            name: name.clone(),
+            distinct: *distinct,
+            args: FunctionArgs::Exprs(
+                es.iter()
+                    .map(|e| substitute_view_columns_in_expr(e, view_alias, view_col_map))
+                    .collect(),
+            ),
+            filter: filter
+                .as_ref()
+                .map(|f| Box::new(substitute_view_columns_in_expr(f, view_alias, view_col_map))),
+            over: over.clone(),
+        },
+        _ => expr.clone(),
+    }
+}
+
+fn rewrite_join_expr_with_bound_tables(
+    expr: &Expr,
+    current_tbl: &TableSchema,
+    outer_table_names: &[String],
+) -> Expr {
+    match expr {
+        Expr::Column(cref) => {
+            if let Some(ref t) = cref.table {
+                if outer_table_names
+                    .iter()
+                    .any(|ot| ot.eq_ignore_ascii_case(t))
+                {
+                    // Outer join loop column acts as a bound parameter for the inner loop!
+                    return Expr::Bind(BindParam::Anonymous(1));
+                }
+            } else if !outer_table_names.is_empty()
+                && current_tbl.find_column(&cref.column).is_none()
+                && !current_tbl.is_implicit_rowid_name(&cref.column)
+            {
+                // Unqualified column that does not belong to `current_tbl` comes from an outer loop!
+                return Expr::Bind(BindParam::Anonymous(1));
+            }
+            expr.clone()
+        }
+        Expr::Unary { op, expr: inner } => Expr::Unary {
+            op: *op,
+            expr: Box::new(rewrite_join_expr_with_bound_tables(
+                inner,
+                current_tbl,
+                outer_table_names,
+            )),
+        },
+        Expr::Binary { left, op, right } => Expr::Binary {
+            left: Box::new(rewrite_join_expr_with_bound_tables(
+                left,
+                current_tbl,
+                outer_table_names,
+            )),
+            op: *op,
+            right: Box::new(rewrite_join_expr_with_bound_tables(
+                right,
+                current_tbl,
+                outer_table_names,
+            )),
+        },
+        Expr::Collate {
+            expr: inner,
+            collation,
+        } => Expr::Collate {
+            expr: Box::new(rewrite_join_expr_with_bound_tables(
+                inner,
+                current_tbl,
+                outer_table_names,
+            )),
+            collation: collation.clone(),
+        },
+        Expr::IsNull {
+            expr: inner,
+            negated,
+        } => Expr::IsNull {
+            expr: Box::new(rewrite_join_expr_with_bound_tables(
+                inner,
+                current_tbl,
+                outer_table_names,
+            )),
+            negated: *negated,
+        },
+        Expr::Between {
+            expr: e,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: Box::new(rewrite_join_expr_with_bound_tables(
+                e,
+                current_tbl,
+                outer_table_names,
+            )),
+            low: Box::new(rewrite_join_expr_with_bound_tables(
+                low,
+                current_tbl,
+                outer_table_names,
+            )),
+            high: Box::new(rewrite_join_expr_with_bound_tables(
+                high,
+                current_tbl,
+                outer_table_names,
+            )),
+            negated: *negated,
+        },
+        Expr::InList {
+            expr: e,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(rewrite_join_expr_with_bound_tables(
+                e,
+                current_tbl,
+                outer_table_names,
+            )),
+            list: list
+                .iter()
+                .map(|i| rewrite_join_expr_with_bound_tables(i, current_tbl, outer_table_names))
+                .collect(),
+            negated: *negated,
+        },
+        Expr::FunctionCall {
+            name,
+            distinct,
+            args: FunctionArgs::Exprs(es),
+            filter,
+            over,
+        } => Expr::FunctionCall {
+            name: name.clone(),
+            distinct: *distinct,
+            args: FunctionArgs::Exprs(
+                es.iter()
+                    .map(|e| rewrite_join_expr_with_bound_tables(e, current_tbl, outer_table_names))
+                    .collect(),
+            ),
+            filter: filter.as_ref().map(|f| {
+                Box::new(rewrite_join_expr_with_bound_tables(
+                    f,
+                    current_tbl,
+                    outer_table_names,
+                ))
+            }),
+            over: over.clone(),
+        },
+        _ => expr.clone(),
+    }
+}
+
 fn explain_query_plan_core<'a, F>(stmt: &Stmt, resolve_relation: F) -> Result<Vec<Vec<Value>>>
 where
     F: Fn(&QualifiedName) -> Option<(DatabaseId, &'a str, &'a Schema, ResolvedRelation)>,
 {
     let mut rows = Vec::new();
     let mut next_id = 2i64;
-    let mut push_detail = |detail: String| {
+    let mut push_node = |parent: i64, detail: String| -> i64 {
+        let id = next_id;
         rows.push(vec![
-            Value::Integer(next_id),
-            Value::Integer(0),
+            Value::Integer(id),
+            Value::Integer(parent),
             Value::Integer(0),
             Value::Text(detail),
         ]);
         next_id += 1;
+        id
     };
+
+    fn emit_plan_nodes(
+        parent: i64,
+        plan: &AccessPlan,
+        disp: &str,
+        suffix: &str,
+        push_node: &mut dyn FnMut(i64, String) -> i64,
+    ) {
+        match plan {
+            AccessPlan::MultiIndexOr { branches } => {
+                let or_id = push_node(parent, format!("MULTI-INDEX OR{suffix}"));
+                for (i, bp) in branches.iter().enumerate() {
+                    let idx_node = push_node(or_id, format!("INDEX {}", i + 1));
+                    let _ = push_node(idx_node, bp.explain_detail(disp));
+                }
+            }
+            _ => {
+                let mut det = plan.explain_detail(disp);
+                if !suffix.is_empty() {
+                    det.push_str(suffix);
+                }
+                let _ = push_node(parent, det);
+            }
+        }
+    }
 
     fn explain_select_plan<'a, F>(
         sel: &SelectStmt,
+        parent: i64,
         resolve_relation: &F,
         active_views: &mut Vec<(DatabaseId, String)>,
-        push_detail: &mut dyn FnMut(String),
+        push_node: &mut dyn FnMut(i64, String) -> i64,
     ) -> Result<()>
     where
         F: Fn(&QualifiedName) -> Option<(DatabaseId, &'a str, &'a Schema, ResolvedRelation)>,
@@ -3725,8 +6504,11 @@ where
         let explain_view = |db_id: DatabaseId,
                             sname: &str,
                             view: &ViewSchema,
+                            view_alias: Option<&str>,
+                            outer_selection: Option<&Expr>,
+                            parent_id: i64,
                             active_views: &mut Vec<(DatabaseId, String)>,
-                            push_detail: &mut dyn FnMut(String)|
+                            push_node: &mut dyn FnMut(i64, String) -> i64|
          -> Result<()> {
             let key = (db_id, view.name.to_ascii_lowercase());
             if active_views.contains(&key) {
@@ -3735,13 +6517,78 @@ where
                     format!("view {} is circularly defined", view.name),
                 ));
             }
-            let fixed = if db_id != DatabaseId::TEMP {
+            let mut fixed = if db_id != DatabaseId::TEMP {
                 fix_permanent_view_select(&view.name, sname, &view.select)?
             } else {
                 view.select.clone()
             };
+            // If the view is a simple single-table SELECT and `outer_selection` is present,
+            // push `outer_selection` into the view's `WHERE` clause (query flattening!).
+            if let Some(outer_w) = outer_selection
+                && fixed.body.compounds.is_empty()
+                && let SelectCore::Select {
+                    distinct: false,
+                    ref projection,
+                    from: Some(ref v_fc),
+                    ref mut selection,
+                    ref group_by,
+                    having: None,
+                    ref windows,
+                } = fixed.body.head
+                && group_by.is_empty()
+                && windows.is_empty()
+                && v_fc.joins.is_empty()
+                && let TableOrSubquery::Table {
+                    name: ref inner_tname,
+                    ..
+                } = v_fc.head
+                && let Some((_, _, _, ResolvedRelation::Table(inner_tbl))) =
+                    resolve_relation(inner_tname)
+            {
+                let mut col_map: Vec<(String, Expr)> = Vec::new();
+                for (idx, rc) in projection.iter().enumerate() {
+                    match rc {
+                        ResultColumn::Star | ResultColumn::TableStar { .. } => {
+                            for c in &inner_tbl.columns {
+                                col_map.push((
+                                    c.name.clone(),
+                                    Expr::Column(ColumnRef::unqualified(c.name.clone())),
+                                ));
+                            }
+                        }
+                        ResultColumn::Expr { expr, alias, .. } => {
+                            let cname = if let Some(ref cols) = view.columns
+                                && idx < cols.len()
+                            {
+                                cols[idx].clone()
+                            } else if let Some(al) = alias {
+                                al.clone()
+                            } else if let Expr::Column(cref) = expr {
+                                cref.column.clone()
+                            } else {
+                                expr_column_label(expr)
+                            };
+                            col_map.push((cname, expr.clone()));
+                        }
+                    }
+                }
+                let mapped_w = substitute_view_columns_in_expr(
+                    outer_w,
+                    view_alias.unwrap_or(&view.name),
+                    &col_map,
+                );
+                *selection = Some(match selection.take() {
+                    Some(prev) => Expr::Binary {
+                        left: Box::new(prev),
+                        op: BinaryOp::And,
+                        right: Box::new(mapped_w),
+                    },
+                    None => mapped_w,
+                });
+            }
             active_views.push(key);
-            let res = explain_select_plan(&fixed, resolve_relation, active_views, push_detail);
+            let res =
+                explain_select_plan(&fixed, parent_id, resolve_relation, active_views, push_node);
             active_views.pop();
             res
         };
@@ -3755,11 +6602,15 @@ where
         };
 
         if let SelectCore::Select {
+            projection,
             from: Some(fc),
             selection,
+            group_by,
+            having,
             ..
         } = &sel.body.head
         {
+            let mut order_by_satisfied = false;
             if fc.joins.is_empty()
                 && let TableOrSubquery::Table {
                     name,
@@ -3772,55 +6623,308 @@ where
             {
                 match rel {
                     ResolvedRelation::Table(tbl) => {
-                        let plan = match indexed_by {
-                            Some(IndexHint::NotIndexed) => AccessPlan::FullScan,
-                            _ => choose_access_plan_with_schema_name(
-                                &tbl,
-                                sname,
-                                alias.as_deref(),
-                                selection.as_ref(),
-                                slot_schema,
-                            ),
-                        };
+                        validate_index_hint_in_eqp(
+                            slot_schema,
+                            &tbl,
+                            sname,
+                            alias.as_deref(),
+                            indexed_by.as_ref(),
+                            selection.as_ref(),
+                        )?;
+                        let plan = choose_access_plan_with_context(
+                            &tbl,
+                            sname,
+                            alias.as_deref(),
+                            selection.as_ref(),
+                            slot_schema,
+                            QueryPlanContext {
+                                projection: Some(projection),
+                                group_by,
+                                having: having.as_ref(),
+                                order_by: &sel.order_by,
+                                indexed_by: indexed_by.as_ref(),
+                                is_count_star_only: is_pure_count_star_projection(projection),
+                            },
+                        );
+                        order_by_satisfied = plan_satisfies_order_by(
+                            &plan,
+                            &tbl,
+                            sname,
+                            alias.as_deref(),
+                            selection.as_ref(),
+                            &sel.order_by,
+                        );
                         let disp = alias.as_deref().unwrap_or(&tbl.name);
-                        push_detail(plan.explain_detail(disp));
+                        emit_plan_nodes(parent, &plan, disp, "", push_node);
+                        emit_in_table_eqp_nodes(
+                            selection.as_ref(),
+                            parent,
+                            resolve_relation,
+                            push_node,
+                        );
                     }
                     ResolvedRelation::View(view) => {
-                        explain_view(db_id, sname, &view, active_views, push_detail)?;
+                        explain_view(
+                            db_id,
+                            sname,
+                            &view,
+                            alias.as_deref(),
+                            selection.as_ref(),
+                            parent,
+                            active_views,
+                            push_node,
+                        )?;
                     }
                 }
             } else {
-                let mut explain_tos = |tos: &TableOrSubquery| -> Result<()> {
-                    match tos {
-                        TableOrSubquery::Table { name, alias, .. } => {
-                            if !is_cte(name)
-                                && let Some((db_id, sname, _, ResolvedRelation::View(view))) =
-                                    resolve_relation(name)
-                            {
-                                explain_view(db_id, sname, &view, active_views, push_detail)?;
-                            } else {
-                                push_detail(format!(
-                                    "SCAN {}",
-                                    alias.as_deref().unwrap_or(&name.name)
-                                ));
+                // Multi-table join or subquery/CTE scan
+                let mut join_items: Vec<(&TableOrSubquery, Option<JoinType>, Option<&Expr>)> =
+                    Vec::with_capacity(1 + fc.joins.len());
+                join_items.push((&fc.head, None, None));
+                for j in &fc.joins {
+                    let on_e = match &j.constraint {
+                        Some(JoinConstraint::On(e)) => Some(e),
+                        _ => None,
+                    };
+                    join_items.push((&j.right, Some(j.join_type), on_e));
+                }
+
+                // Check if all items are plain base tables with inner joins (eligible for cost-based join ordering)
+                let has_cross_or_outer = fc.joins.iter().any(|j| {
+                    matches!(
+                        j.join_type,
+                        JoinType::Cross | JoinType::Left | JoinType::Right | JoinType::Full
+                    )
+                });
+                let mut resolved_tables = Vec::with_capacity(join_items.len());
+                for (tos, _, _) in &join_items {
+                    if let TableOrSubquery::Table {
+                        name,
+                        table_args: None,
+                        alias,
+                        indexed_by,
+                    } = tos
+                        && !is_cte(name)
+                        && let Some((_, sname, slot_schema, ResolvedRelation::Table(tbl))) =
+                            resolve_relation(name)
+                    {
+                        validate_index_hint_in_eqp(
+                            slot_schema,
+                            &tbl,
+                            sname,
+                            alias.as_deref(),
+                            indexed_by.as_ref(),
+                            selection.as_ref(),
+                        )?;
+                        resolved_tables.push(Some((
+                            sname,
+                            slot_schema,
+                            *tbl,
+                            alias.as_deref(),
+                            indexed_by.as_ref(),
+                        )));
+                    } else {
+                        resolved_tables.push(None);
+                    }
+                }
+
+                // Combine WHERE selection with ON constraints of inner joins
+                let mut combined_where: Option<Expr> = selection.clone();
+                for (_, jtype, on_opt) in &join_items {
+                    if jtype.is_none_or(|jt| matches!(jt, JoinType::Inner | JoinType::Cross))
+                        && let Some(on_e) = on_opt
+                    {
+                        combined_where = Some(match combined_where {
+                            Some(prev) => Expr::Binary {
+                                left: Box::new(prev),
+                                op: BinaryOp::And,
+                                right: Box::new((*on_e).clone()),
+                            },
+                            None => (*on_e).clone(),
+                        });
+                    }
+                }
+
+                let mut order: Vec<usize> = (0..join_items.len()).collect();
+                if !has_cross_or_outer
+                    && order.len() == 2
+                    && resolved_tables[0].is_some()
+                    && resolved_tables[1].is_some()
+                {
+                    let (s0, sch0, ref t0, a0, ib0) = *resolved_tables[0].as_ref().unwrap();
+                    let (s1, sch1, ref t1, a1, ib1) = *resolved_tables[1].as_ref().unwrap();
+                    let disp0 = a0.unwrap_or(&t0.name).to_owned();
+                    let disp1 = a1.unwrap_or(&t1.name).to_owned();
+
+                    let p0_outer = choose_access_plan_with_context(
+                        t0,
+                        s0,
+                        a0,
+                        combined_where.as_ref(),
+                        sch0,
+                        QueryPlanContext {
+                            projection: Some(projection),
+                            group_by,
+                            having: having.as_ref(),
+                            order_by: &sel.order_by,
+                            indexed_by: ib0,
+                            is_count_star_only: false,
+                        },
+                    );
+                    let bound_w_for_1 = combined_where.as_ref().map(|w| {
+                        rewrite_join_expr_with_bound_tables(w, t1, &[disp0, t0.name.clone()])
+                    });
+                    let p1_inner = choose_access_plan_with_context(
+                        t1,
+                        s1,
+                        a1,
+                        bound_w_for_1.as_ref(),
+                        sch1,
+                        QueryPlanContext {
+                            projection: Some(projection),
+                            group_by,
+                            having: having.as_ref(),
+                            order_by: &sel.order_by,
+                            indexed_by: ib1,
+                            is_count_star_only: false,
+                        },
+                    );
+
+                    let p1_outer = choose_access_plan_with_context(
+                        t1,
+                        s1,
+                        a1,
+                        combined_where.as_ref(),
+                        sch1,
+                        QueryPlanContext {
+                            projection: Some(projection),
+                            group_by,
+                            having: having.as_ref(),
+                            order_by: &sel.order_by,
+                            indexed_by: ib1,
+                            is_count_star_only: false,
+                        },
+                    );
+                    let bound_w_for_0 = combined_where.as_ref().map(|w| {
+                        rewrite_join_expr_with_bound_tables(w, t0, &[disp1, t1.name.clone()])
+                    });
+                    let p0_inner = choose_access_plan_with_context(
+                        t0,
+                        s0,
+                        a0,
+                        bound_w_for_0.as_ref(),
+                        sch0,
+                        QueryPlanContext {
+                            projection: Some(projection),
+                            group_by,
+                            having: having.as_ref(),
+                            order_by: &sel.order_by,
+                            indexed_by: ib0,
+                            is_count_star_only: false,
+                        },
+                    );
+
+                    let (c0_out, r0_out) = plan_cost_and_rows(&p0_outer, t0, sch0);
+                    let (c1_in, _) = plan_cost_and_rows(&p1_inner, t1, sch1);
+                    let total_01 = sqlite_log_est_add(c0_out, r0_out.saturating_add(c1_in));
+
+                    let (c1_out, r1_out) = plan_cost_and_rows(&p1_outer, t1, sch1);
+                    let (c0_in, _) = plan_cost_and_rows(&p0_inner, t0, sch0);
+                    let total_10 = sqlite_log_est_add(c1_out, r1_out.saturating_add(c0_in));
+
+                    if total_10 < total_01 {
+                        order.swap(0, 1);
+                    }
+                }
+
+                let mut outer_bound_names: Vec<String> = Vec::new();
+                for &idx in &order {
+                    let (tos, jtype_opt, on_opt) = join_items[idx];
+                    if let Some((sname, slot_schema, ref tbl, alias, indexed_by)) =
+                        resolved_tables[idx]
+                    {
+                        let disp = alias.unwrap_or(&tbl.name);
+                        let is_left_join = jtype_opt == Some(JoinType::Left)
+                            && !selection.as_ref().is_some_and(|w| {
+                                tbl.columns.iter().any(|c| {
+                                    expr_implies_non_null_col(w, &c.name, tbl, sname, alias)
+                                })
+                            });
+                        let pred_for_tbl = if is_left_join {
+                            on_opt.cloned()
+                        } else {
+                            match (&combined_where, on_opt) {
+                                (Some(cw), Some(oe)) => Some(Expr::Binary {
+                                    left: Box::new(cw.clone()),
+                                    op: BinaryOp::And,
+                                    right: Box::new((*oe).clone()),
+                                }),
+                                (Some(cw), None) => Some(cw.clone()),
+                                (None, Some(oe)) => Some((*oe).clone()),
+                                (None, None) => None,
+                            }
+                        };
+                        let bound_pred = pred_for_tbl.as_ref().map(|p| {
+                            rewrite_join_expr_with_bound_tables(p, tbl, &outer_bound_names)
+                        });
+                        let plan = choose_access_plan_with_context(
+                            tbl,
+                            sname,
+                            alias,
+                            bound_pred.as_ref(),
+                            slot_schema,
+                            QueryPlanContext {
+                                projection: Some(projection),
+                                group_by,
+                                having: having.as_ref(),
+                                order_by: &sel.order_by,
+                                indexed_by,
+                                is_count_star_only: false,
+                            },
+                        );
+                        let suffix = if is_left_join { " LEFT-JOIN" } else { "" };
+                        emit_plan_nodes(parent, &plan, disp, suffix, push_node);
+                        outer_bound_names.push(disp.to_owned());
+                        outer_bound_names.push(tbl.name.clone());
+                    } else {
+                        match tos {
+                            TableOrSubquery::Table { name, alias, .. } => {
+                                if !is_cte(name)
+                                    && let Some((db_id, sname, _, ResolvedRelation::View(view))) =
+                                        resolve_relation(name)
+                                {
+                                    explain_view(
+                                        db_id,
+                                        sname,
+                                        &view,
+                                        alias.as_deref(),
+                                        None,
+                                        parent,
+                                        active_views,
+                                        push_node,
+                                    )?;
+                                } else {
+                                    let _ = push_node(
+                                        parent,
+                                        format!("SCAN {}", alias.as_deref().unwrap_or(&name.name)),
+                                    );
+                                }
+                            }
+                            TableOrSubquery::Subquery { .. } => {
+                                let _ = push_node(parent, "SCAN SUBQUERY".to_owned());
                             }
                         }
-                        TableOrSubquery::Subquery { .. } => {
-                            push_detail("SCAN SUBQUERY".to_owned());
-                        }
                     }
-                    Ok(())
-                };
-                explain_tos(&fc.head)?;
-                for j in &fc.joins {
-                    explain_tos(&j.right)?;
                 }
             }
-            if !sel.order_by.is_empty() && !core_has_window(&sel.body.head, &sel.order_by) {
-                push_detail("USE TEMP B-TREE FOR ORDER BY".to_owned());
+            if !sel.order_by.is_empty()
+                && !order_by_satisfied
+                && !core_has_window(&sel.body.head, &sel.order_by)
+            {
+                let _ = push_node(parent, "USE TEMP B-TREE FOR ORDER BY".to_owned());
             }
         } else {
-            push_detail("SCAN CONSTANT ROW".to_owned());
+            let _ = push_node(parent, "SCAN CONSTANT ROW".to_owned());
         }
         Ok(())
     }
@@ -3828,7 +6932,7 @@ where
     match stmt {
         Stmt::Select(sel) => {
             let mut active_views = Vec::new();
-            explain_select_plan(sel, &resolve_relation, &mut active_views, &mut push_detail)?;
+            explain_select_plan(sel, 0, &resolve_relation, &mut active_views, &mut push_node)?;
         }
         Stmt::Update(upd) => {
             if let Some((_, sname, slot_schema, ResolvedRelation::Table(tbl))) =
@@ -3847,7 +6951,7 @@ where
                     slot_schema,
                 );
                 let disp = upd.alias.as_deref().unwrap_or(&tbl.name);
-                push_detail(plan.explain_detail(disp));
+                emit_plan_nodes(0, &plan, disp, "", &mut push_node);
                 if let Some(ref fc) = upd.from {
                     let from_sel = SelectStmt {
                         ctes: upd.ctes.clone(),
@@ -3869,9 +6973,10 @@ where
                     let mut active_views = Vec::new();
                     explain_select_plan(
                         &from_sel,
+                        0,
                         &resolve_relation,
                         &mut active_views,
-                        &mut push_detail,
+                        &mut push_node,
                     )?;
                 }
             }
@@ -3888,11 +6993,11 @@ where
                     slot_schema,
                 );
                 let disp = del.alias.as_deref().unwrap_or(&del.table.name);
-                push_detail(plan.explain_detail(disp));
+                emit_plan_nodes(0, &plan, disp, "", &mut push_node);
             }
         }
         _ => {
-            push_detail("EXECUTE STATEMENT".to_owned());
+            let _ = push_node(0, "EXECUTE STATEMENT".to_owned());
         }
     }
 

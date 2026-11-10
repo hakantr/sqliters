@@ -2413,18 +2413,7 @@ impl<'a> Parser<'a> {
         let mut joins = Vec::new();
 
         loop {
-            if self.eat(TokenKind::Comma) {
-                let right = self.parse_table_or_subquery()?;
-                joins.push(JoinClause {
-                    join_type: JoinType::Cross,
-                    natural: false,
-                    right,
-                    constraint: None,
-                });
-                continue;
-            }
-
-            let (natural, join_type) = if self.eat(TokenKind::Join) {
+            let (natural, join_type) = if self.eat(TokenKind::Join) || self.eat(TokenKind::Comma) {
                 (false, Some(JoinType::Inner))
             } else if matches!(
                 self.peek().kind,
@@ -3197,6 +3186,12 @@ impl<'a> Parser<'a> {
                     } else {
                         if self.eat(TokenKind::Distinct) {
                             distinct = true;
+                            if self.eat(TokenKind::Rp) {
+                                return Err(SqliteError::new(
+                                    ErrorCode::Error,
+                                    "DISTINCT aggregates must have exactly one argument",
+                                ));
+                            }
                         } else {
                             let _ = self.eat(TokenKind::All);
                         }

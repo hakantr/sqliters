@@ -2840,6 +2840,33 @@ impl Connection {
         }
     }
 
+    /// Returns `true` if `sql` is a `SELECT` statement whose query plan uses a temporary B-tree
+    /// sorter for `ORDER BY` (`USE TEMP B-TREE FOR ORDER BY`).
+    pub fn select_uses_temp_sort(&self, sql: &str) -> bool {
+        if !sql.to_ascii_uppercase().contains("ORDER") {
+            return false;
+        }
+        let Ok((Some(stmt), _)) = sqliters_syntax::parse_one(sql) else {
+            return false;
+        };
+        if !matches!(stmt, Stmt::Select(_)) {
+            return false;
+        }
+        let Ok(session) = self.shared.enter() else {
+            return false;
+        };
+        let Ok(rows) = compiler::explain_query_plan_in_db_set(&stmt, &session.inner().db_set)
+        else {
+            return false;
+        };
+        rows.iter().any(|r| {
+            matches!(
+                r.get(3),
+                Some(Value::Text(s)) if s.contains("USE TEMP B-TREE FOR ORDER BY")
+            )
+        })
+    }
+
     /// Installs or clears the connection commit hook (`sqlite3_commit_hook`).
     /// Returning `true` (non-zero) aborts the commit with `SQLITE_CONSTRAINT_COMMITHOOK` and rolls back.
     pub fn commit_hook(&self, hook: Option<CommitHookCallback>) -> Result<()> {
@@ -3948,6 +3975,23 @@ fn target_write_db_for_stmt(stmt: &Stmt, db_set: &DatabaseSet) -> Option<Databas
             }
         }
         Stmt::Reindex(None) => None,
+        Stmt::Analyze(Some(qn)) => {
+            if let Some(ref s) = qn.schema {
+                db_set.find_db_id(s)
+            } else if let Some(id) = db_set.find_db_id(&qn.name) {
+                Some(id)
+            } else if let Some(id) = db_set.find_index_in_set(qn).map(|(id, _)| id) {
+                Some(id)
+            } else {
+                db_set
+                    .find_relation_in_set(qn)
+                    .ok()
+                    .flatten()
+                    .map(|(id, _)| id)
+                    .or_else(|| db_set.resolve_catalog_table(qn).ok().flatten())
+            }
+        }
+        Stmt::Analyze(None) => Some(DatabaseId::MAIN),
         Stmt::Pragma { schema, .. } => match schema.as_deref() {
             Some(s) => db_set.find_db_id(s),
             None => Some(DatabaseId::MAIN),

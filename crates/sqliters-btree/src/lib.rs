@@ -1829,6 +1829,315 @@ impl Btree {
         }
     }
 
+    /// Searches a Table B+Tree for all `(rowid, payload)` entries within optional lower and upper
+    /// `rowid` bounds in `O(log N + K)` page reads.
+    pub fn seek_table_range(
+        &mut self,
+        root_pgno: Pgno,
+        min_rowid: Option<(i64, bool)>,
+        max_rowid: Option<(i64, bool)>,
+    ) -> Result<Vec<(i64, Vec<u8>)>> {
+        let mut out = Vec::new();
+        self.seek_table_range_rec(root_pgno, min_rowid, max_rowid, &mut out)?;
+        Ok(out)
+    }
+
+    fn seek_table_range_rec(
+        &mut self,
+        pgno: Pgno,
+        min_rowid: Option<(i64, bool)>,
+        max_rowid: Option<(i64, bool)>,
+        out: &mut Vec<(i64, Vec<u8>)>,
+    ) -> Result<()> {
+        self.check_interrupted()?;
+        let parsed = self.read_parsed_page(pgno)?;
+        match parsed {
+            ParsedPage::TableLeaf { cells } => {
+                for c in cells {
+                    if let Some((lo, inc)) = min_rowid
+                        && (c.rowid < lo || (!inc && c.rowid == lo))
+                    {
+                        continue;
+                    }
+                    if let Some((hi, inc)) = max_rowid
+                        && (c.rowid > hi || (!inc && c.rowid == hi))
+                    {
+                        break;
+                    }
+                    let full = self.read_full_payload(
+                        c.total_payload_len,
+                        &c.local_payload,
+                        c.overflow_page,
+                    )?;
+                    out.push((c.rowid, full));
+                }
+                Ok(())
+            }
+            ParsedPage::TableInterior { cells, right_child } => {
+                let mut visit_right = true;
+                for c in cells {
+                    // `c.left_child` contains rowids `<= c.key`.
+                    if let Some((lo, inc)) = min_rowid
+                        && (c.key < lo || (!inc && c.key == lo))
+                    {
+                        continue;
+                    }
+                    self.seek_table_range_rec(c.left_child, min_rowid, max_rowid, out)?;
+                    if let Some((hi, inc)) = max_rowid
+                        && (c.key > hi || (!inc && c.key == hi))
+                    {
+                        visit_right = false;
+                        break;
+                    }
+                }
+                if visit_right {
+                    self.seek_table_range_rec(right_child, min_rowid, max_rowid, out)?;
+                }
+                Ok(())
+            }
+            _ => Err(SqliteError::corrupt("expected table page in range seek")),
+        }
+    }
+
+    /// Searches an Index B-Tree for all decoded records matching `prefix_values` on the first
+    /// `prefix_values.len()` columns and optional SQL lower/upper bounds on column `prefix_values.len()`.
+    pub fn seek_index_range(
+        &mut self,
+        root_pgno: Pgno,
+        prefix_values: &[Value],
+        lower_bound: Option<(&Value, bool)>,
+        upper_bound: Option<(&Value, bool)>,
+        orders: &[KeySortOrder],
+    ) -> Result<Vec<Vec<Value>>> {
+        let enc = self.encoding();
+        let raw_matches =
+            self.seek_index_range_raw(root_pgno, prefix_values, lower_bound, upper_bound, orders)?;
+        raw_matches
+            .into_iter()
+            .map(|rec| decode_record_with_encoding(&rec, enc))
+            .collect()
+    }
+
+    /// Searches an Index B-Tree for all raw serialized records matching `prefix_values` on the first
+    /// `prefix_values.len()` columns and optional SQL lower/upper bounds on column `prefix_values.len()`.
+    ///
+    /// Note: SQL bounds exclude `NULL` on the range column and automatically account for `DESC`
+    /// sort order on column `prefix_values.len()`.
+    pub fn seek_index_range_raw(
+        &mut self,
+        root_pgno: Pgno,
+        prefix_values: &[Value],
+        lower_bound: Option<(&Value, bool)>,
+        upper_bound: Option<(&Value, bool)>,
+        orders: &[KeySortOrder],
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        self.seek_index_range_raw_rec(
+            root_pgno,
+            prefix_values,
+            lower_bound,
+            upper_bound,
+            orders,
+            &mut out,
+        )?;
+        Ok(out)
+    }
+
+    fn compare_index_range_cell(
+        rec: &[u8],
+        prefix_values: &[Value],
+        lower_bound: Option<(&Value, bool)>,
+        upper_bound: Option<(&Value, bool)>,
+        orders: &[KeySortOrder],
+        enc: TextEncoding,
+    ) -> Result<Ordering> {
+        let k = prefix_values.len();
+        if k > 0 {
+            let p_ord = compare_records_with_encoding(rec, prefix_values, &orders[..k], enc)?;
+            if p_ord != Ordering::Equal {
+                return Ok(p_ord);
+            }
+        }
+        if lower_bound.is_none() && upper_bound.is_none() {
+            return Ok(Ordering::Equal);
+        }
+        let decoded = decode_record_with_encoding(rec, enc)?;
+        let Some(val) = decoded.get(k) else {
+            return Ok(Ordering::Less);
+        };
+        let range_so = orders.get(k).copied().unwrap_or_default();
+        if val.is_null() {
+            // In SQL, NULL never satisfies `<`, `<=`, `>`, `>=`.
+            // In B-tree key order, NULL is at the start when `!range_so.nulls_last` and at the end when `range_so.nulls_last`.
+            return Ok(if range_so.nulls_last {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            });
+        }
+        // Check SQL lower bound (`val > lo` or `val >= lo`)
+        if let Some((lo_val, lo_inc)) = lower_bound {
+            if lo_val.is_null() {
+                // `col > NULL` (from `IS NOT NULL` virtual range bound) is satisfied by all non-NULL values!
+            } else {
+                let cmp = val.cmp_sqlite(lo_val, range_so.collation);
+                if cmp == Ordering::Less || (!lo_inc && cmp == Ordering::Equal) {
+                    // `val` is below the SQL lower bound.
+                    // If the index column is ASC (`!range_so.desc`), `val` comes before the range (`Ordering::Less`);
+                    // if the index column is DESC (`range_so.desc`), `val` comes after the range (`Ordering::Greater`).
+                    return Ok(if range_so.desc {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    });
+                }
+            }
+        }
+
+        // Check SQL upper bound (`val < hi` or `val <= hi`)
+        if let Some((hi_val, hi_inc)) = upper_bound {
+            if hi_val.is_null() {
+                return Ok(Ordering::Greater);
+            }
+            let cmp = val.cmp_sqlite(hi_val, range_so.collation);
+            if cmp == Ordering::Greater || (!hi_inc && cmp == Ordering::Equal) {
+                // `val` is above the SQL upper bound.
+                return Ok(if range_so.desc {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                });
+            }
+        }
+
+        Ok(Ordering::Equal)
+    }
+
+    fn seek_index_range_raw_rec(
+        &mut self,
+        pgno: Pgno,
+        prefix_values: &[Value],
+        lower_bound: Option<(&Value, bool)>,
+        upper_bound: Option<(&Value, bool)>,
+        orders: &[KeySortOrder],
+        out: &mut Vec<Vec<u8>>,
+    ) -> Result<()> {
+        self.check_interrupted()?;
+        let enc = self.encoding();
+        let parsed = self.read_parsed_page(pgno)?;
+        match parsed {
+            ParsedPage::IndexLeaf { cells } => {
+                for c in cells {
+                    let rec = self.read_full_payload(
+                        c.total_payload_len,
+                        &c.local_payload,
+                        c.overflow_page,
+                    )?;
+                    match Self::compare_index_range_cell(
+                        &rec,
+                        prefix_values,
+                        lower_bound,
+                        upper_bound,
+                        orders,
+                        enc,
+                    )? {
+                        Ordering::Less => continue,
+                        Ordering::Equal => out.push(rec),
+                        Ordering::Greater => break,
+                    }
+                }
+                Ok(())
+            }
+            ParsedPage::IndexInterior { cells, right_child } => {
+                let mut visit_right = true;
+                for c in cells {
+                    let rec = self.read_full_payload(
+                        c.total_payload_len,
+                        &c.local_payload,
+                        c.overflow_page,
+                    )?;
+                    match Self::compare_index_range_cell(
+                        &rec,
+                        prefix_values,
+                        lower_bound,
+                        upper_bound,
+                        orders,
+                        enc,
+                    )? {
+                        Ordering::Less => continue,
+                        Ordering::Equal => {
+                            self.seek_index_range_raw_rec(
+                                c.left_child,
+                                prefix_values,
+                                lower_bound,
+                                upper_bound,
+                                orders,
+                                out,
+                            )?;
+                            out.push(rec);
+                        }
+                        Ordering::Greater => {
+                            self.seek_index_range_raw_rec(
+                                c.left_child,
+                                prefix_values,
+                                lower_bound,
+                                upper_bound,
+                                orders,
+                                out,
+                            )?;
+                            visit_right = false;
+                            break;
+                        }
+                    }
+                }
+                if visit_right {
+                    self.seek_index_range_raw_rec(
+                        right_child,
+                        prefix_values,
+                        lower_bound,
+                        upper_bound,
+                        orders,
+                        out,
+                    )?;
+                }
+                Ok(())
+            }
+            _ => Err(SqliteError::corrupt("expected index page in range seek")),
+        }
+    }
+
+    /// Collects distinct leading `prefix_len`-column tuples from an Index B-Tree for skip-scan execution.
+    pub fn scan_index_distinct_prefixes(
+        &mut self,
+        root_pgno: Pgno,
+        prefix_len: usize,
+        orders: &[KeySortOrder],
+    ) -> Result<Vec<Vec<Value>>> {
+        let enc = self.encoding();
+        let raw_entries = self.scan_index(root_pgno)?;
+        let mut distinct: Vec<Vec<Value>> = Vec::new();
+        for rec_bytes in raw_entries {
+            let fields = decode_record_with_encoding(&rec_bytes, enc)?;
+            if fields.len() < prefix_len {
+                continue;
+            }
+            let prefix = fields[..prefix_len].to_vec();
+            let same_as_prev = distinct.last().is_some_and(|prev| {
+                prev.iter()
+                    .zip(prefix.iter())
+                    .enumerate()
+                    .all(|(i, (a, b))| {
+                        let so = orders.get(i).copied().unwrap_or_default();
+                        a.cmp_sqlite(b, so.collation) == Ordering::Equal
+                    })
+            });
+            if !same_as_prev {
+                distinct.push(prefix);
+            }
+        }
+        Ok(distinct)
+    }
+
     /// Inserts a serialized index record (`[indexed_cols..., rowid]`) into an Index B-Tree.
     pub fn insert_index(
         &mut self,

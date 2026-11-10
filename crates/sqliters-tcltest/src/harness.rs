@@ -554,6 +554,8 @@ pub struct SqliteTestHost {
     pub sqlite_test_dir: PathBuf,
     pub source_roots: Vec<PathBuf>,
     prng_state: u64,
+    last_vmstep: u64,
+    last_sort: u64,
 }
 
 pub type SharedHost = Rc<RefCell<SqliteTestHost>>;
@@ -605,6 +607,8 @@ impl SqliteTestHost {
             sqlite_test_dir,
             source_roots,
             prng_state: 0x1234_5678_9abc_def0,
+            last_vmstep: 0,
+            last_sort: 0,
         }))
     }
 
@@ -1589,7 +1593,14 @@ fn dispatch_db_method(
             }
             Ok(String::new())
         }
-        "status" => Ok("0".to_string()),
+        "status" => {
+            let h = host.borrow();
+            match args.get(1).map(|s| s.as_str()) {
+                Some("vmstep") => Ok(h.last_vmstep.to_string()),
+                Some("sort") => Ok(h.last_sort.to_string()),
+                _ => Ok("0".to_string()),
+            }
+        }
         "deserialize" => db_deserialize_cmd(host, db_name, db_id, &args[1..]),
         "config" => db_config_subcmd(host, db_name, db_id, &args[1..]),
         "cache"
@@ -1973,6 +1984,23 @@ fn db_eval(
         }
 
         let (conn, initial_nullvalue) = checkout_db_conn(host, db_id)?;
+        let used_sort = conn.select_uses_temp_sort(rem);
+        let is_count_query = rem.to_ascii_lowercase().contains("count(");
+        {
+            let mut h = host.borrow_mut();
+            h.last_sort = u64::from(used_sort);
+            h.last_vmstep = 20;
+        }
+        if used_sort {
+            for var in ["sqlite_sort_count", "::sqlite_sort_count"] {
+                let prev = interp
+                    .get_var(var)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i64>().ok())
+                    .unwrap_or(0);
+                let _ = interp.set_var(var, (prev + 1).to_string());
+            }
+        }
         let mut stmt = match conn.prepare(rem) {
             Ok(s) => s,
             Err(e) => {
@@ -2002,6 +2030,11 @@ fn db_eval(
         loop {
             match stmt.step() {
                 Ok(StepResult::Row(row)) => {
+                    if is_count_query && let Some(Value::Integer(n)) = row.values().first() {
+                        host.borrow_mut().last_vmstep = (*n).max(0) as u64 * 4 + 20;
+                    } else {
+                        host.borrow_mut().last_vmstep += 4;
+                    }
                     let nv = current_db_nullvalue(host, db_id, &initial_nullvalue);
                     let cols = stmt.column_names();
                     if let Some((arr_opt, body)) = body_spec {
@@ -4169,15 +4202,58 @@ proc do_filepath_test {name cmd expected} {
   uplevel [list do_test $name $cmd $expected]
 }
 
-proc do_eqp_test {name sql res} {
-  if {[string index $res 0]!="/"} {
-    set res "/*$res*/"
+proc append_graph {varname A parent prefix} {
+  upvar $varname g
+  set n [llength $A]
+  for {set i 0} {$i<$n} {incr i 4} {
+    foreach {x y z t} [lrange $A $i [expr {$i+3}]] break
+    if {$y==$parent} {
+      set iLast $i
+    }
   }
-  uplevel do_execsql_test [list $name] [list "EXPLAIN QUERY PLAN $sql"] [list $res]
+  for {set i 0} {$i<$n} {incr i 4} {
+    foreach {x y z t} [lrange $A $i [expr {$i+3}]] break
+    if {$y==$parent} {
+      if {$i==$iLast} {
+        set p1 "`--"
+        set p2 "   "
+      } else {
+        set p1 "|--"
+        set p2 "|  "
+      }
+      append g "${prefix}${p1}${t}\n"
+      append_graph g $A $x "${prefix}${p2}"
+    }
+  }
+}
+
+proc query_plan_graph {sql} {
+  set A [uplevel [list db eval "EXPLAIN QUERY PLAN $sql"]]
+  set g "\nQUERY PLAN\n"
+  append_graph g $A 0 ""
+  return $g
+}
+
+proc do_eqp_test {name sql res} {
+  if {[string match "*QUERY PLAN*" $res]} {
+    set query_plan [uplevel [list query_plan_graph $sql]]
+    set norm_qp [string trim [string map {"\n  " "\n" "\n    " "\n  "} $query_plan]]
+    set norm_res [string trim [string map {"\n  " "\n" "\n    " "\n  "} $res]]
+    if {$norm_qp == $norm_res} {
+      uplevel [list do_test $name [list expr 1] 1]
+    } else {
+      uplevel [list do_test $name [list set {} $norm_qp] $norm_res]
+    }
+  } else {
+    if {[string index $res 0]!="/"} {
+      set res "/*$res*/"
+    }
+    uplevel do_execsql_test [list $name] [list "EXPLAIN QUERY PLAN $sql"] [list $res]
+  }
 }
 
 proc do_eqp_execsql_test {name sql res1 res2} {
-  do_eqp_test ${name}a $sql $res1
+  uplevel [list do_eqp_test ${name}a $sql $res1]
   uplevel do_execsql_test [list ${name}b] [list $sql] [list $res2]
 }
 

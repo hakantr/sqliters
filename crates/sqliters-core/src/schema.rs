@@ -96,6 +96,31 @@ impl ColumnSchema {
     pub fn default_p4(&self) -> P4 {
         self.default_p4_for_table(false)
     }
+
+    /// Estimates column width (`pCol->szEst` in `sqlite/src/build.c:1559-1775`), where 1 unit = 4 bytes.
+    pub fn estimated_width(&self) -> u32 {
+        let trimmed = self.type_name.trim();
+        if trimmed.is_empty() {
+            return 1;
+        }
+        if matches!(self.affinity, TypeAffinity::Text | TypeAffinity::Blob) {
+            let upper = trimmed.to_ascii_uppercase();
+            if let Some(pos) = upper.find("CHAR").or_else(|| upper.find("BLOB")) {
+                let tail = &upper[pos + 4..];
+                if let Some(dpos) = tail.find(|c: char| c.is_ascii_digit()) {
+                    let digits: String = tail[dpos..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    if let Ok(v) = digits.parse::<u32>() {
+                        return (v / 4 + 1).clamp(1, 255);
+                    }
+                }
+            }
+            return 5;
+        }
+        1
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +153,215 @@ impl TableRowKey {
     }
 }
 
+/// Table-level `sqlite_stat1` statistics (`pTable->nRowLogEst`, `pTable->szTabRow`, `TF_HasStat1`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableStat1 {
+    pub n_rows: u64,
+    pub n_row_log_est: i16,
+    pub sz_tab_row: Option<i16>,
+    pub has_stat1: bool,
+}
+
+impl Default for TableStat1 {
+    fn default() -> Self {
+        Self {
+            n_rows: 1_048_576,
+            n_row_log_est: 200,
+            sz_tab_row: None,
+            has_stat1: false,
+        }
+    }
+}
+
+/// Index-level `sqlite_stat1` statistics (`pIndex->aiRowLogEst`, `bUnordered`, `noSkipScan`, `szIdxRow`, `hasStat1`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexStat1 {
+    pub int_values: Vec<u64>,
+    pub row_log_est: Vec<i16>,
+    pub unordered: bool,
+    pub no_skip_scan: bool,
+    pub sz_idx_row: Option<i16>,
+    pub has_stat1: bool,
+}
+
+/// Computes `10 * log2(x)` matching `sqlite3LogEst` (`sqlite/src/util.c:2082-2099`).
+pub fn sqlite_log_est(mut x: u64) -> i16 {
+    const A: [i16; 8] = [0, 2, 3, 5, 6, 7, 8, 9];
+    let mut y: i16 = 40;
+    if x < 8 {
+        if x < 2 {
+            return 0;
+        }
+        while x < 8 {
+            y -= 10;
+            x <<= 1;
+        }
+    } else {
+        let i = 60i16 - (x.leading_zeros() as i16);
+        y += i * 10;
+        x >>= i as u32;
+    }
+    A[(x & 7) as usize] + y - 10
+}
+
+/// Log-space addition `10 * log2(2^(a/10) + 2^(b/10))` matching `sqlite3LogEstAdd` (`sqlite/src/util.c:2055-2076`).
+pub fn sqlite_log_est_add(a: i16, b: i16) -> i16 {
+    const X: [u8; 32] = [
+        10, 10, 9, 9, 8, 8, 7, 7, 7, 6, 6, 6, 5, 5, 5, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2,
+        2, 2,
+    ];
+    if a >= b {
+        if a > b + 49 {
+            return a;
+        }
+        if a > b + 31 {
+            return a + 1;
+        }
+        a + i16::from(X[(a - b) as usize])
+    } else {
+        if b > a + 49 {
+            return b;
+        }
+        if b > a + 31 {
+            return b + 1;
+        }
+        b + i16::from(X[(b - a) as usize])
+    }
+}
+
+/// Converts a `LogEst` back to an integer estimate (`sqlite3LogEstToInt` in `sqlite/src/util.c:2102-2115`).
+pub fn sqlite_log_est_to_int(mut x: i16) -> u64 {
+    let mut n = i64::from(x % 10);
+    x /= 10;
+    if n >= 5 {
+        n -= 2;
+    } else if n >= 1 {
+        n -= 1;
+    }
+    if x > 60 {
+        return i64::MAX as u64;
+    }
+    if x >= 3 {
+        ((n + 8) as u64) << ((x - 3) as u32)
+    } else {
+        ((n + 8) as u64) >> ((3 - x) as u32)
+    }
+}
+
+/// Builds default `aiRowLogEst` for an index without `sqlite_stat1` (`sqlite3DefaultRowEst` in `sqlite/src/build.c:4632-4670`).
+pub fn default_index_row_log_est(
+    table_row_log_est: i16,
+    n_key_col: usize,
+    unique: bool,
+    is_partial: bool,
+) -> Vec<i16> {
+    const A_VAL: [i16; 5] = [33, 32, 30, 28, 26];
+    let mut a = vec![0i16; n_key_col + 1];
+    let mut x = table_row_log_est;
+    if x < 99 {
+        x = 99;
+    }
+    if is_partial {
+        x -= 10;
+    }
+    a[0] = x;
+    for i in 1..=n_key_col {
+        if i <= 5 {
+            a[i] = A_VAL[i - 1];
+        } else {
+            a[i] = 23;
+        }
+    }
+    if unique && n_key_col > 0 {
+        a[n_key_col] = 0;
+    }
+    a
+}
+
+/// Decodes a `sqlite_stat1.stat` string matching `decodeIntArray` (`sqlite/src/analyze.c:1520-1580`).
+pub fn decode_stat1_string(stat_str: &str, n_out: usize) -> IndexStat1 {
+    let bytes = stat_str.as_bytes();
+    let mut pos = 0usize;
+    let mut int_values = vec![0u64; n_out];
+    let mut row_log_est = vec![0i16; n_out];
+    let mut i = 0usize;
+
+    while pos < bytes.len() {
+        let mut v: u64 = 0;
+        while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+            v = v
+                .wrapping_mul(10)
+                .wrapping_add(u64::from(bytes[pos] - b'0'));
+            pos += 1;
+        }
+        if i < n_out {
+            int_values[i] = v;
+            row_log_est[i] = sqlite_log_est(v);
+            i += 1;
+        }
+        if pos < bytes.len() && bytes[pos] == b' ' {
+            pos += 1;
+        } else {
+            break;
+        }
+    }
+
+    while i < n_out {
+        if i > 0 {
+            int_values[i] = int_values[i - 1];
+            row_log_est[i] = row_log_est[i - 1];
+        } else {
+            int_values[i] = 0;
+            row_log_est[i] = 0;
+        }
+        i += 1;
+    }
+
+    let mut unordered = false;
+    let mut no_skip_scan = false;
+    let mut sz_idx_row = None;
+
+    while pos < bytes.len() {
+        let rest = &stat_str[pos..];
+        if rest.starts_with("unordered") {
+            unordered = true;
+        } else if let Some(after_sz) = rest.strip_prefix("sz=") {
+            let after_bytes = after_sz.as_bytes();
+            if !after_bytes.is_empty() && after_bytes[0].is_ascii_digit() {
+                let mut sz: i64 = 0;
+                let mut k = 0usize;
+                while k < after_bytes.len() && after_bytes[k].is_ascii_digit() {
+                    sz = sz
+                        .saturating_mul(10)
+                        .saturating_add(i64::from(after_bytes[k] - b'0'));
+                    k += 1;
+                }
+                if sz < 2 {
+                    sz = 2;
+                }
+                sz_idx_row = Some(sqlite_log_est(sz as u64));
+            }
+        } else if rest.starts_with("noskipscan") {
+            no_skip_scan = true;
+        }
+        while pos < bytes.len() && bytes[pos] != b' ' {
+            pos += 1;
+        }
+        while pos < bytes.len() && bytes[pos] == b' ' {
+            pos += 1;
+        }
+    }
+
+    IndexStat1 {
+        int_values,
+        row_log_est,
+        unordered,
+        no_skip_scan,
+        sz_idx_row,
+        has_stat1: true,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TableSchema {
     pub schema_rowid: i64,
@@ -149,6 +383,8 @@ pub struct TableSchema {
     pub checks: Vec<CheckSchema>,
     pub foreign_keys: Vec<ForeignKeySchema>,
     pub raw_sql: String,
+    pub stat1: TableStat1,
+    pub without_rowid_pk_stat1: Option<IndexStat1>,
 }
 
 impl TableSchema {
@@ -189,7 +425,27 @@ impl TableSchema {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             raw_sql: "CREATE TABLE sqlite_schema(type text,name text,tbl_name text,rootpage int,sql text)".to_owned(),
+            stat1: TableStat1::default(),
+            without_rowid_pk_stat1: None,
         }
+    }
+
+    pub fn default_sz_tab_row(&self) -> i16 {
+        let mut w_table: u64 = self
+            .columns
+            .iter()
+            .map(|c| u64::from(c.estimated_width()))
+            .sum();
+        if self.rowid_alias_col.is_none() && !self.without_rowid {
+            w_table += 1;
+        }
+        sqlite_log_est(w_table.max(1) * 4)
+    }
+
+    pub fn effective_sz_tab_row(&self) -> i16 {
+        self.stat1
+            .sz_tab_row
+            .unwrap_or_else(|| self.default_sz_tab_row())
     }
 
     pub fn find_column(&self, name: &str) -> Option<(usize, &ColumnSchema)> {
@@ -270,6 +526,7 @@ impl TableSchema {
             raw_sql: None,
             table_without_rowid: true,
             trailing_pk_cols: Vec::new(),
+            stat1: self.without_rowid_pk_stat1.clone(),
         })
     }
 }
@@ -299,9 +556,56 @@ pub struct IndexSchema {
     pub table_without_rowid: bool,
     /// Non-redundant PK columns appended after `columns` on secondary indexes of `WITHOUT ROWID` tables.
     pub trailing_pk_cols: Vec<IndexedColSchema>,
+    pub stat1: Option<IndexStat1>,
 }
 
 impl IndexSchema {
+    pub fn effective_row_log_est(&self, tbl: &TableSchema) -> Vec<i16> {
+        if let Some(ref s) = self.stat1
+            && s.has_stat1
+            && s.row_log_est.len() > self.columns.len()
+        {
+            return s.row_log_est.clone();
+        }
+        default_index_row_log_est(
+            tbl.stat1.n_row_log_est,
+            self.columns.len(),
+            self.unique,
+            self.where_clause.is_some(),
+        )
+    }
+
+    pub fn is_unordered(&self) -> bool {
+        self.stat1.as_ref().is_some_and(|s| s.unordered)
+    }
+
+    pub fn is_no_skip_scan(&self) -> bool {
+        self.stat1.as_ref().is_some_and(|s| s.no_skip_scan)
+    }
+
+    pub fn default_sz_idx_row(&self, tbl: &TableSchema) -> i16 {
+        if self.origin == "pk" && self.table_without_rowid && self.root_pgno == tbl.root_pgno {
+            return tbl.default_sz_tab_row();
+        }
+        let mut w_index: u64 = 0;
+        for ic in self.columns.iter().chain(self.trailing_pk_cols.iter()) {
+            w_index += match ic.col_idx {
+                Some(ci) => tbl
+                    .columns
+                    .get(ci)
+                    .map_or(1, |c| u64::from(c.estimated_width())),
+                None => 1,
+            };
+        }
+        sqlite_log_est(w_index.max(1) * 4)
+    }
+
+    pub fn effective_sz_idx_row(&self, tbl: &TableSchema) -> i16 {
+        self.stat1
+            .as_ref()
+            .and_then(|s| s.sz_idx_row)
+            .unwrap_or_else(|| self.default_sz_idx_row(tbl))
+    }
     /// Returns the full `KeySortOrder` slice for the on-disk Index B-Tree record:
     /// - Rowid table index: `[indexed_col_0, ..., indexed_col_{k-1}, trailing_rowid]`
     /// - `WITHOUT ROWID` index: `[indexed_col_0, ..., indexed_col_{k-1}, trailing_pk_cols...]`
@@ -922,12 +1226,13 @@ impl Schema {
                         raw_sql: None,
                         table_without_rowid: tbl.without_rowid,
                         trailing_pk_cols: auto.trailing_pk_cols.clone(),
+                        stat1: None,
                     });
                 }
             }
         }
 
-        Ok(Self {
+        let mut schema = Self {
             tables,
             indexes,
             views,
@@ -935,7 +1240,139 @@ impl Schema {
             schema_cookie: btree.pager().header().schema_cookie,
             loaded: true,
             had_pages: true,
-        })
+        };
+        let _ = schema.reload_stat1(btree);
+        Ok(schema)
+    }
+
+    /// Reloads `sqlite_stat1` statistics from disk into `self.tables` and `self.indexes`
+    /// (`sqlite3AnalysisLoad` / `analysisLoader` in `sqlite/src/analyze.c:1593-1701`).
+    pub fn reload_stat1(&mut self, btree: &mut Btree) -> Result<()> {
+        for tbl in &mut self.tables {
+            tbl.stat1 = TableStat1::default();
+            tbl.without_rowid_pk_stat1 = None;
+        }
+        for idx in &mut self.indexes {
+            idx.stat1 = None;
+        }
+
+        let Some(stat_tbl) = self
+            .tables
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case("sqlite_stat1"))
+            .cloned()
+        else {
+            return Ok(());
+        };
+        if stat_tbl.root_pgno <= 1 {
+            return Ok(());
+        }
+        let (Some((tbl_ci, _)), Some((idx_ci, _)), Some((stat_ci, _))) = (
+            stat_tbl.find_column("tbl"),
+            stat_tbl.find_column("idx"),
+            stat_tbl.find_column("stat"),
+        ) else {
+            return Ok(());
+        };
+        let tbl_slot = stat_tbl.physical_record_slot(tbl_ci);
+        let idx_slot = stat_tbl.physical_record_slot(idx_ci);
+        let stat_slot = stat_tbl.physical_record_slot(stat_ci);
+
+        let enc = btree.encoding();
+        let payloads: Vec<Vec<u8>> = if stat_tbl.without_rowid {
+            match btree.scan_index(stat_tbl.root_pgno) {
+                Ok(keys) => keys,
+                Err(_) => return Ok(()),
+            }
+        } else {
+            match scan_table_incremental(btree, stat_tbl.root_pgno) {
+                Ok(rows) => rows.into_iter().map(|(_, p)| p).collect(),
+                Err(_) => return Ok(()),
+            }
+        };
+
+        let val_to_stat_text = |v: &Value| -> Option<String> {
+            match v {
+                Value::Null => None,
+                Value::Text(s) => Some(s.clone()),
+                Value::Integer(i) => Some(i.to_string()),
+                Value::Real(f) => Some(Value::Real(*f).to_text_lossy()),
+                Value::Blob(b) => Some(String::from_utf8_lossy(b).into_owned()),
+            }
+        };
+
+        for payload in payloads {
+            let Ok(cols) = decode_record_with_encoding(&payload, enc) else {
+                continue;
+            };
+            let tbl_val = cols.get(tbl_slot).unwrap_or(&Value::Null);
+            let idx_val = cols.get(idx_slot).unwrap_or(&Value::Null);
+            let stat_val = cols.get(stat_slot).unwrap_or(&Value::Null);
+
+            let (Some(tbl_str), Some(stat_str)) =
+                (val_to_stat_text(tbl_val), val_to_stat_text(stat_val))
+            else {
+                continue;
+            };
+            let Some(tbl_pos) = self
+                .tables
+                .iter()
+                .position(|t| t.name.eq_ignore_ascii_case(&tbl_str))
+            else {
+                continue;
+            };
+
+            let idx_opt = val_to_stat_text(idx_val);
+            match idx_opt {
+                None => {
+                    let decoded = decode_stat1_string(&stat_str, 1);
+                    self.tables[tbl_pos].stat1.n_rows = decoded.int_values[0];
+                    self.tables[tbl_pos].stat1.n_row_log_est = decoded.row_log_est[0];
+                    if let Some(sz) = decoded.sz_idx_row {
+                        self.tables[tbl_pos].stat1.sz_tab_row = Some(sz);
+                    }
+                    self.tables[tbl_pos].stat1.has_stat1 = true;
+                }
+                Some(idx_str) => {
+                    if tbl_str.eq_ignore_ascii_case(&idx_str) {
+                        if self.tables[tbl_pos].without_rowid {
+                            let n_out = self.tables[tbl_pos].without_rowid_pk_cols.len() + 1;
+                            let decoded = decode_stat1_string(&stat_str, n_out);
+                            self.tables[tbl_pos].stat1.n_rows = decoded.int_values[0];
+                            self.tables[tbl_pos].stat1.n_row_log_est = decoded.row_log_est[0];
+                            self.tables[tbl_pos].stat1.has_stat1 = true;
+                            self.tables[tbl_pos].without_rowid_pk_stat1 = Some(decoded);
+                        } else if let Some(pk_ix_pos) = self.indexes.iter().position(|ix| {
+                            ix.table_name.eq_ignore_ascii_case(&tbl_str) && ix.origin == "pk"
+                        }) {
+                            let n_out = self.indexes[pk_ix_pos].columns.len() + 1;
+                            let decoded = decode_stat1_string(&stat_str, n_out);
+                            if self.indexes[pk_ix_pos].where_clause.is_none() {
+                                self.tables[tbl_pos].stat1.n_rows = decoded.int_values[0];
+                                self.tables[tbl_pos].stat1.n_row_log_est = decoded.row_log_est[0];
+                                self.tables[tbl_pos].stat1.has_stat1 = true;
+                            }
+                            self.indexes[pk_ix_pos].stat1 = Some(decoded);
+                        }
+                    } else if let Some(ix_pos) = self
+                        .indexes
+                        .iter()
+                        .position(|ix| ix.name.eq_ignore_ascii_case(&idx_str))
+                    {
+                        let n_out = self.indexes[ix_pos].columns.len() + 1;
+                        let decoded = decode_stat1_string(&stat_str, n_out);
+                        if self.indexes[ix_pos].where_clause.is_none() {
+                            self.tables[tbl_pos].stat1.n_rows = decoded.int_values[0];
+                            self.tables[tbl_pos].stat1.n_row_log_est = decoded.row_log_est[0];
+                            self.tables[tbl_pos].stat1.has_stat1 = true;
+                        }
+                        self.indexes[ix_pos].stat1 = Some(decoded);
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1348,6 +1785,8 @@ pub fn build_table_schema_from_ast(
         checks,
         foreign_keys,
         raw_sql: ct.catalog_sql.clone(),
+        stat1: TableStat1::default(),
+        without_rowid_pk_stat1: None,
     };
 
     Ok((tbl, inline_autos))
@@ -1434,13 +1873,134 @@ pub fn build_index_schema_from_ast(
         unique: ci.unique,
         conflict: ConflictAction::Abort,
         columns: resolved,
-        where_clause: ci.where_clause.clone(),
+        where_clause: ci.where_clause.as_ref().map(strip_schema_from_expr),
         is_autoindex: false,
         origin: "c",
         raw_sql: Some(ci.catalog_sql.clone()),
         table_without_rowid: tbl.without_rowid,
         trailing_pk_cols,
+        stat1: None,
     })
+}
+
+fn strip_schema_from_expr(expr: &Expr) -> Expr {
+    match expr {
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Integer(_)
+        | Expr::OversizedHex(_)
+        | Expr::Float(_)
+        | Expr::String(_)
+        | Expr::Blob(_)
+        | Expr::CurrentTimeKw(_)
+        | Expr::Bind(_) => expr.clone(),
+        Expr::Column(ColumnRef { table, column, .. }) => Expr::Column(ColumnRef {
+            schema: None,
+            table: table.clone(),
+            column: column.clone(),
+        }),
+        Expr::Unary { op, expr: inner } => Expr::Unary {
+            op: *op,
+            expr: Box::new(strip_schema_from_expr(inner)),
+        },
+        Expr::Binary { left, op, right } => Expr::Binary {
+            left: Box::new(strip_schema_from_expr(left)),
+            op: *op,
+            right: Box::new(strip_schema_from_expr(right)),
+        },
+        Expr::Between {
+            expr: e,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: Box::new(strip_schema_from_expr(e)),
+            low: Box::new(strip_schema_from_expr(low)),
+            high: Box::new(strip_schema_from_expr(high)),
+            negated: *negated,
+        },
+        Expr::InList {
+            expr: e,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(strip_schema_from_expr(e)),
+            list: list.iter().map(strip_schema_from_expr).collect(),
+            negated: *negated,
+        },
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            op,
+            negated,
+        } => Expr::Like {
+            expr: Box::new(strip_schema_from_expr(e)),
+            pattern: Box::new(strip_schema_from_expr(pattern)),
+            escape: escape
+                .as_ref()
+                .map(|esc| Box::new(strip_schema_from_expr(esc))),
+            op: *op,
+            negated: *negated,
+        },
+        Expr::IsNull {
+            expr: inner,
+            negated,
+        } => Expr::IsNull {
+            expr: Box::new(strip_schema_from_expr(inner)),
+            negated: *negated,
+        },
+        Expr::Collate {
+            expr: inner,
+            collation,
+        } => Expr::Collate {
+            expr: Box::new(strip_schema_from_expr(inner)),
+            collation: collation.clone(),
+        },
+        Expr::Cast {
+            expr: inner,
+            type_name,
+        } => Expr::Cast {
+            expr: Box::new(strip_schema_from_expr(inner)),
+            type_name: type_name.clone(),
+        },
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => Expr::Case {
+            operand: operand
+                .as_ref()
+                .map(|op| Box::new(strip_schema_from_expr(op))),
+            branches: branches
+                .iter()
+                .map(|(w, t)| (strip_schema_from_expr(w), strip_schema_from_expr(t)))
+                .collect(),
+            else_expr: else_expr
+                .as_ref()
+                .map(|el| Box::new(strip_schema_from_expr(el))),
+        },
+        Expr::FunctionCall {
+            name,
+            distinct,
+            args,
+            filter,
+            over,
+        } => Expr::FunctionCall {
+            name: name.clone(),
+            distinct: *distinct,
+            args: match args {
+                FunctionArgs::Star => FunctionArgs::Star,
+                FunctionArgs::Exprs(es) => {
+                    FunctionArgs::Exprs(es.iter().map(strip_schema_from_expr).collect())
+                }
+            },
+            filter: filter.as_ref().map(|f| Box::new(strip_schema_from_expr(f))),
+            over: over.clone(),
+        },
+        Expr::RowValue(es) => Expr::RowValue(es.iter().map(strip_schema_from_expr).collect()),
+        _ => expr.clone(),
+    }
 }
 
 pub fn resolve_column_affinity(

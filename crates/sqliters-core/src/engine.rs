@@ -26,8 +26,8 @@ use sqliters_syntax::{
 };
 use sqliters_types::{
     Collation, ConflictResolutionEffect, DatabaseId, DatabaseKind, ErrorCode, ExecutionServices,
-    KeySortOrder, Pgno, Result, RuntimeValue, SqliteError, TextEncoding, TypeAffinity, Value,
-    decode_record_with_encoding, encode_record_with_encoding, extended,
+    FunctionFlags, KeySortOrder, Pgno, Result, RuntimeValue, SqliteError, TextEncoding,
+    TypeAffinity, Value, decode_record_with_encoding, encode_record_with_encoding, extended,
 };
 use sqliters_vdbe::{
     AggregateAccumulator, AggregateKind, Opcode, VmRuntimeContext, builtin_window_arity,
@@ -39,9 +39,10 @@ use sqliters_vdbe::{
 use sqliters_vfs::{MemoryVfs, OpenFlags, OsVfs, Vfs};
 
 use crate::compiler::{
-    AccessPlan, choose_access_plan_with_schema_name, compile_for_explain_in_db_set,
+    AccessPlan, QueryPlanContext, choose_access_plan_with_context,
+    choose_access_plan_with_schema_name, compile_for_explain_in_db_set,
     explain_query_plan_in_db_set, expr_column_label, expr_contains_aggregate,
-    expr_contains_subquery,
+    expr_contains_subquery, expr_implies_partial_where,
 };
 use crate::db_set::{DatabaseSet, ResolvedRelation, SchemaInstanceId, TempStoreMode};
 use crate::execution_context::{
@@ -1309,9 +1310,7 @@ pub(crate) fn classify_stmt_category(stmt: &Stmt) -> StmtCategory {
         | Stmt::Rollback { .. }
         | Stmt::Savepoint(_)
         | Stmt::Release(_) => StmtCategory::Control,
-        Stmt::Analyze(_) | Stmt::AttachDatabase { .. } | Stmt::DetachDatabase { .. } => {
-            StmtCategory::NoLockPragma
-        }
+        Stmt::AttachDatabase { .. } | Stmt::DetachDatabase { .. } => StmtCategory::NoLockPragma,
         Stmt::Vacuum { .. } => StmtCategory::Vacuum,
         Stmt::Select(_) | Stmt::Explain { .. } => StmtCategory::Read,
         Stmt::Pragma { name, value, .. } => match name.to_ascii_uppercase().as_str() {
@@ -1341,7 +1340,8 @@ pub(crate) fn classify_stmt_category(stmt: &Stmt) -> StmtCategory {
         | Stmt::CreateIndex(_)
         | Stmt::DropIndex { .. }
         | Stmt::AlterTable { .. }
-        | Stmt::Reindex(_) => StmtCategory::Write,
+        | Stmt::Reindex(_)
+        | Stmt::Analyze(_) => StmtCategory::Write,
     }
 }
 
@@ -2073,6 +2073,7 @@ fn validate_analyze_target_in_set(
         if let Some(slot) = db_set.slot(db_id)
             && slot.btree.is_some()
             && (slot.schema.find_user_table(&qn.name).is_some()
+                || slot.schema.find_view(&qn.name).is_some()
                 || slot.schema.find_index(&qn.name).is_some())
         {
             return Ok(());
@@ -2084,6 +2085,7 @@ fn validate_analyze_target_in_set(
     }
     if db_set.find_db_id(&qn.name).is_some()
         || db_set.find_table_in_set(qn)?.is_some()
+        || db_set.find_view_in_set(qn).is_some()
         || db_set.find_index_in_set(qn).is_some()
     {
         return Ok(());
@@ -2094,17 +2096,13 @@ fn validate_analyze_target_in_set(
     ))
 }
 
-/// Executes non-locking pragmas (`LOCK_STATUS`, `JOURNAL_MODE`, `SYNCHRONOUS`, etc.), `ANALYZE`, and `ATTACH`/`DETACH`.
+/// Executes non-locking pragmas (`LOCK_STATUS`, `JOURNAL_MODE`, `SYNCHRONOUS`, etc.) and `ATTACH`/`DETACH`.
 pub(crate) fn execute_nolock_stmt(
     ctx: &mut ExecContext<'_>,
     stmt: &Stmt,
     params: &[Value],
 ) -> Result<QueryOutput> {
     match stmt {
-        Stmt::Analyze(target) => {
-            validate_analyze_target_in_set(ctx.db_set, target.as_ref())?;
-            Ok(QueryOutput::default())
-        }
         Stmt::AttachDatabase {
             expr,
             schema_name,
@@ -2256,6 +2254,10 @@ pub(crate) fn execute_write_body(
         }
         Stmt::Reindex(target) => {
             exec_reindex(ctx, target.as_ref())?;
+            Ok(QueryOutput::default())
+        }
+        Stmt::Analyze(target) => {
+            exec_analyze(ctx, target.as_ref())?;
             Ok(QueryOutput::default())
         }
         Stmt::Pragma {
@@ -5399,6 +5401,7 @@ fn read_table_with_plan(
     };
     let db_page_count = bt_ref.pager().page_count();
     let db_enc = bt_ref.encoding();
+    let slot_name = slot_ref.name.clone();
 
     if let Some(hint) = indexed_by {
         match hint {
@@ -5421,35 +5424,40 @@ fn read_table_with_plan(
                     ));
                 };
                 if let Some(ref pw) = idx.where_clause {
-                    let usable = where_hint.is_some_and(|wh| expr_contains_conjunct(wh, pw));
+                    let usable = where_hint.is_some_and(|wh| {
+                        expr_implies_partial_where(wh, pw, tbl, &slot_name, alias)
+                    });
                     if !usable {
                         return Err(SqliteError::new(
                             ErrorCode::Error,
-                            format!("cannot use index: {idx_name}"),
+                            "no query solution".to_owned(),
                         ));
                     }
                 }
                 if db_page_count == 0 {
                     return Ok(Vec::new());
                 }
-                let entries = ctx.scan_index_in_db(db_id, idx.root_pgno, idx.key_sort_orders())?;
-                let mut rows = Vec::with_capacity(entries.len());
-                for rec_bytes in entries {
-                    let fields = decode_record_with_encoding(&rec_bytes, db_enc)?;
-                    if tbl.without_rowid {
-                        let pk = idx.extract_without_rowid_pk_from_hit(tbl, &fields);
-                        let rkey = TableRowKey::WithoutRowidPk(pk);
-                        if let Some(payload) = seek_table_raw_entry(ctx, db_id, tbl, &rkey)? {
-                            rows.push((rkey, payload));
-                        }
-                    } else if let Some(Value::Integer(rid)) = fields.last()
-                        && let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree
-                        && let Some(payload) = bt.seek_table_rowid(tbl.root_pgno, *rid)?
-                    {
-                        rows.push((TableRowKey::Rowid(*rid), payload));
-                    }
-                }
-                return Ok(rows);
+                let plan = choose_access_plan_with_context(
+                    tbl,
+                    &slot_name,
+                    alias,
+                    where_hint,
+                    &slot_ref.schema,
+                    QueryPlanContext {
+                        indexed_by,
+                        ..Default::default()
+                    },
+                );
+                return execute_access_plan(
+                    ctx,
+                    db_id,
+                    db_enc,
+                    tbl,
+                    &plan,
+                    params,
+                    outer_scopes,
+                    ctes,
+                );
             }
         }
     }
@@ -5457,28 +5465,119 @@ fn read_table_with_plan(
     if db_page_count == 0 {
         return Ok(Vec::new());
     }
-    let plan = choose_access_plan_with_schema_name(
-        tbl,
-        &slot_ref.name,
-        alias,
-        where_hint,
-        &slot_ref.schema,
-    );
+    let plan =
+        choose_access_plan_with_schema_name(tbl, &slot_name, alias, where_hint, &slot_ref.schema);
+    execute_access_plan(ctx, db_id, db_enc, tbl, &plan, params, outer_scopes, ctes)
+}
+
+fn eval_rowid_target_int(val: Value) -> Option<i64> {
+    match val {
+        Value::Integer(i) => Some(i),
+        Value::Real(r) if (r as i64 as f64) == r => Some(r as i64),
+        Value::Text(ref s) => sqliters_types::parse_numeric_text(s).and_then(|v| match v {
+            Value::Integer(i) => Some(i),
+            Value::Real(r) if (r as i64 as f64) == r => Some(r as i64),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn eval_rowid_range_bound(
+    val: Value,
+    inclusive: bool,
+    is_lower: bool,
+) -> Option<Option<(i64, bool)>> {
+    match val {
+        Value::Null => None,
+        Value::Integer(i) => Some(Some((i, inclusive))),
+        Value::Real(r) => {
+            if r.is_nan() {
+                None
+            } else if r >= (i64::MAX as f64) {
+                if is_lower { None } else { Some(None) }
+            } else if r < (i64::MIN as f64) {
+                if is_lower { Some(None) } else { None }
+            } else {
+                let fl = r.floor() as i64;
+                if (fl as f64) == r {
+                    Some(Some((fl, inclusive)))
+                } else if is_lower {
+                    // `rowid > 3.5` or `rowid >= 3.5` -> `rowid >= 4`
+                    Some(Some((fl.saturating_add(1), true)))
+                } else {
+                    // `rowid < 3.5` or `rowid <= 3.5` -> `rowid <= 3`
+                    Some(Some((fl, true)))
+                }
+            }
+        }
+        Value::Text(ref s) => {
+            if let Some(num) = sqliters_types::parse_numeric_text(s) {
+                eval_rowid_range_bound(num, inclusive, is_lower)
+            } else {
+                // In SQLite, INTEGER is always less than TEXT (`rowid < 'abc'` is true for all rowids; `rowid > 'abc'` is false for all rowids).
+                if is_lower { None } else { Some(None) }
+            }
+        }
+        Value::Blob(_) => {
+            // INTEGER is always less than BLOB
+            if is_lower { None } else { Some(None) }
+        }
+    }
+}
+
+fn materialize_index_hits(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    index: &IndexSchema,
+    idx_hits: Vec<Vec<Value>>,
+) -> Result<Vec<(TableRowKey, Vec<u8>)>> {
+    let mut rows = Vec::with_capacity(idx_hits.len());
+    for hit in idx_hits {
+        if tbl.without_rowid {
+            let pk = index.extract_without_rowid_pk_from_hit(tbl, &hit);
+            let rkey = TableRowKey::WithoutRowidPk(pk);
+            if let Some(payload) = seek_table_raw_entry(ctx, db_id, tbl, &rkey)? {
+                rows.push((rkey, payload));
+            }
+        } else if let Some(Value::Integer(rid)) = hit.last()
+            && let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree
+            && let Some(payload) = bt.seek_table_rowid(tbl.root_pgno, *rid)?
+        {
+            rows.push((TableRowKey::Rowid(*rid), payload));
+        }
+    }
+    Ok(rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_access_plan(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    db_enc: TextEncoding,
+    tbl: &TableSchema,
+    plan: &AccessPlan,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    ctes: &CteStore,
+) -> Result<Vec<(TableRowKey, Vec<u8>)>> {
     match plan {
         AccessPlan::FullScan => scan_table_raw_entries(ctx, db_id, tbl),
+        AccessPlan::IndexFullScan { index, .. } => {
+            if tbl.without_rowid && index.origin == "pk" && index.root_pgno == tbl.root_pgno {
+                return scan_table_raw_entries(ctx, db_id, tbl);
+            }
+            let entries = ctx.scan_index_in_db(db_id, index.root_pgno, index.key_sort_orders())?;
+            let mut decoded_hits = Vec::with_capacity(entries.len());
+            for rec_bytes in entries {
+                decoded_hits.push(decode_record_with_encoding(&rec_bytes, db_enc)?);
+            }
+            materialize_index_hits(ctx, db_id, tbl, index, decoded_hits)
+        }
         AccessPlan::RowidSeek { key_expr } => {
-            let kv = eval_expr(ctx, &key_expr, params, outer_scopes, ctes, None)?;
-            let target = match kv {
-                Value::Integer(i) => Some(i),
-                Value::Real(r) if (r as i64 as f64) == r => Some(r as i64),
-                Value::Text(ref s) => sqliters_types::parse_numeric_text(s).and_then(|v| match v {
-                    Value::Integer(i) => Some(i),
-                    Value::Real(r) if (r as i64 as f64) == r => Some(r as i64),
-                    _ => None,
-                }),
-                _ => None,
-            };
-            let Some(rid) = target else {
+            let kv = eval_expr(ctx, key_expr, params, outer_scopes, ctes, None)?;
+            let Some(rid) = eval_rowid_target_int(kv) else {
                 return Ok(Vec::new());
             };
             let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree else {
@@ -5490,9 +5589,59 @@ fn read_table_with_plan(
                 Ok(Vec::new())
             }
         }
+        AccessPlan::RowidRange { lower, upper } => {
+            let low_bound = if let Some(lb) = lower {
+                let v = eval_expr(ctx, &lb.expr, params, outer_scopes, ctes, None)?;
+                let Some(b) = eval_rowid_range_bound(v, lb.inclusive, true) else {
+                    return Ok(Vec::new());
+                };
+                b
+            } else {
+                None
+            };
+            let high_bound = if let Some(ub) = upper {
+                let v = eval_expr(ctx, &ub.expr, params, outer_scopes, ctes, None)?;
+                let Some(b) = eval_rowid_range_bound(v, ub.inclusive, false) else {
+                    return Ok(Vec::new());
+                };
+                b
+            } else {
+                None
+            };
+            let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree else {
+                return Ok(Vec::new());
+            };
+            let hits = bt.seek_table_range(tbl.root_pgno, low_bound, high_bound)?;
+            Ok(hits
+                .into_iter()
+                .map(|(rid, payload)| (TableRowKey::Rowid(rid), payload))
+                .collect())
+        }
+        AccessPlan::RowidIn { list } => {
+            let mut rids = Vec::with_capacity(list.len());
+            for item in list {
+                let kv = eval_expr(ctx, item, params, outer_scopes, ctes, None)?;
+                if let Some(rid) = eval_rowid_target_int(kv) {
+                    rids.push(rid);
+                }
+            }
+            rids.sort_unstable();
+            rids.dedup();
+            let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree else {
+                return Ok(Vec::new());
+            };
+            let mut rows = Vec::with_capacity(rids.len());
+            for rid in rids {
+                if let Some(payload) = bt.seek_table_rowid(tbl.root_pgno, rid)? {
+                    rows.push((TableRowKey::Rowid(rid), payload));
+                }
+            }
+            Ok(rows)
+        }
         AccessPlan::IndexSeek {
             index,
             prefix_exprs,
+            ..
         } => {
             let mut prefix_vals = Vec::with_capacity(prefix_exprs.len());
             for (i, ke) in prefix_exprs.iter().enumerate() {
@@ -5531,22 +5680,219 @@ fn read_table_with_plan(
                 let bt = ctx.db_set.slot_mut(db_id).unwrap().btree.as_mut().unwrap();
                 bt.seek_index_equal(index.root_pgno, &prefix_vals, &orders)?
             };
-            let mut rows = Vec::with_capacity(idx_hits.len());
-            for hit in idx_hits {
-                if tbl.without_rowid {
-                    let pk = index.extract_without_rowid_pk_from_hit(tbl, &hit);
-                    let rkey = TableRowKey::WithoutRowidPk(pk);
-                    if let Some(payload) = seek_table_raw_entry(ctx, db_id, tbl, &rkey)? {
-                        rows.push((rkey, payload));
+            materialize_index_hits(ctx, db_id, tbl, index, idx_hits)
+        }
+        AccessPlan::IndexRangeScan {
+            index,
+            prefix_exprs,
+            prefix_in_lists,
+            range_col_idx,
+            lower,
+            upper,
+            skip_scan_cols,
+            ..
+        } => {
+            let orders =
+                if tbl.without_rowid && index.origin == "pk" && index.root_pgno == tbl.root_pgno {
+                    tbl.without_rowid_pk_orders()
+                } else {
+                    index.key_sort_orders()
+                };
+
+            // Build list of equality prefix vectors (handling skip-scan distinct prefixes and IN-lists)
+            let mut eq_prefixes: Vec<Vec<Value>> = if *skip_scan_cols > 0 {
+                let bt = ctx.db_set.slot_mut(db_id).unwrap().btree.as_mut().unwrap();
+                bt.scan_index_distinct_prefixes(index.root_pgno, *skip_scan_cols, &orders)?
+            } else {
+                vec![Vec::new()]
+            };
+
+            let apply_seek_aff = |aff: TypeAffinity, raw: Value| -> Value {
+                match aff {
+                    TypeAffinity::Blob => raw,
+                    TypeAffinity::Text => TypeAffinity::Text.apply(raw),
+                    TypeAffinity::Numeric | TypeAffinity::Integer | TypeAffinity::Real => {
+                        if matches!(raw, Value::Text(_)) {
+                            TypeAffinity::Numeric.apply(raw)
+                        } else {
+                            raw
+                        }
                     }
-                } else if let Some(Value::Integer(rid)) = hit.last()
-                    && let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree
-                    && let Some(payload) = bt.seek_table_rowid(tbl.root_pgno, *rid)?
-                {
-                    rows.push((TableRowKey::Rowid(*rid), payload));
+                }
+            };
+
+            for (i, ke) in prefix_exprs.iter().enumerate() {
+                let col_pos = *skip_scan_cols + i;
+                let raw = eval_expr(ctx, ke, params, outer_scopes, ctes, None)?;
+                let aff = index
+                    .columns
+                    .get(col_pos)
+                    .and_then(|ic| ic.col_idx)
+                    .map_or(TypeAffinity::Blob, |ci| tbl.columns[ci].affinity);
+                let coerced = apply_seek_aff(aff, raw);
+                if coerced.is_null() {
+                    return Ok(Vec::new());
+                }
+                for p in &mut eq_prefixes {
+                    p.push(coerced.clone());
                 }
             }
-            Ok(rows)
+
+            for (col_pos, in_exprs) in prefix_in_lists {
+                let aff = index
+                    .columns
+                    .get(*col_pos)
+                    .and_then(|ic| ic.col_idx)
+                    .map_or(TypeAffinity::Blob, |ci| tbl.columns[ci].affinity);
+                let coll = index
+                    .columns
+                    .get(*col_pos)
+                    .map_or(Collation::Binary, |ic| ic.sort_order.collation);
+                let mut distinct_vals: Vec<Value> = Vec::with_capacity(in_exprs.len());
+                for item in in_exprs {
+                    if let Expr::InTable {
+                        table,
+                        negated: false,
+                        ..
+                    } = item
+                    {
+                        if let Ok((rhs_db_id, rhs_tbl, _)) =
+                            resolve_table_for_query_in_set(ctx.db_set, table)
+                        {
+                            let rhs_enc = ctx.encoding();
+                            if let Ok(entries) = scan_table_raw_entries(ctx, rhs_db_id, &rhs_tbl) {
+                                for (rkey, payload) in entries {
+                                    let raw = if rhs_tbl.rowid_alias_col == Some(0)
+                                        && let TableRowKey::Rowid(rid) = rkey
+                                    {
+                                        Value::Integer(rid)
+                                    } else if let Ok(mut dec) =
+                                        decode_record_with_encoding(&payload, rhs_enc)
+                                        && !dec.is_empty()
+                                    {
+                                        dec.swap_remove(0)
+                                    } else {
+                                        Value::Null
+                                    };
+                                    let coerced = apply_seek_aff(aff, raw);
+                                    if !coerced.is_null()
+                                        && !distinct_vals.iter().any(|v| {
+                                            v.cmp_sqlite(&coerced, coll) == Ordering::Equal
+                                        })
+                                    {
+                                        distinct_vals.push(coerced);
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    let raw = eval_expr(ctx, item, params, outer_scopes, ctes, None)?;
+                    let coerced = apply_seek_aff(aff, raw);
+                    if coerced.is_null() {
+                        continue;
+                    }
+                    if !distinct_vals
+                        .iter()
+                        .any(|v| v.cmp_sqlite(&coerced, coll) == Ordering::Equal)
+                    {
+                        distinct_vals.push(coerced);
+                    }
+                }
+                if distinct_vals.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let mut next_prefixes = Vec::with_capacity(eq_prefixes.len() * distinct_vals.len());
+                for p in &eq_prefixes {
+                    for dv in &distinct_vals {
+                        let mut cloned = p.clone();
+                        cloned.push(dv.clone());
+                        next_prefixes.push(cloned);
+                    }
+                }
+                eq_prefixes = next_prefixes;
+            }
+
+            let range_aff = range_col_idx
+                .and_then(|rc| index.columns.get(rc))
+                .and_then(|ic| ic.col_idx)
+                .map_or(TypeAffinity::Blob, |ci| tbl.columns[ci].affinity);
+
+            let low_bound: Option<(Value, bool)> = if let Some(lb) = lower {
+                let raw = eval_expr(ctx, &lb.expr, params, outer_scopes, ctes, None)?;
+                let coerced = apply_seek_aff(range_aff, raw);
+                if coerced.is_null() {
+                    return Ok(Vec::new());
+                }
+                Some((coerced, lb.inclusive))
+            } else {
+                None
+            };
+
+            let high_bound: Option<(Value, bool)> = if let Some(ub) = upper {
+                let raw = eval_expr(ctx, &ub.expr, params, outer_scopes, ctes, None)?;
+                let coerced = apply_seek_aff(range_aff, raw);
+                if coerced.is_null() {
+                    return Ok(Vec::new());
+                }
+                Some((coerced, ub.inclusive))
+            } else {
+                None
+            };
+
+            let is_primary_without_rowid =
+                tbl.without_rowid && index.origin == "pk" && index.root_pgno == tbl.root_pgno;
+            if is_primary_without_rowid {
+                let n_pk = tbl.without_rowid_pk_cols.len();
+                let mut rows = Vec::new();
+                for eq_p in &eq_prefixes {
+                    let raw_hits = {
+                        let bt = ctx.db_set.slot_mut(db_id).unwrap().btree.as_mut().unwrap();
+                        bt.seek_index_range_raw(
+                            tbl.root_pgno,
+                            eq_p,
+                            low_bound.as_ref().map(|(v, inc)| (v, *inc)),
+                            high_bound.as_ref().map(|(v, inc)| (v, *inc)),
+                            &orders,
+                        )?
+                    };
+                    for rec_bytes in raw_hits {
+                        let decoded = decode_record_with_encoding(&rec_bytes, db_enc)?;
+                        let pk = decoded[..n_pk.min(decoded.len())].to_vec();
+                        rows.push((TableRowKey::WithoutRowidPk(pk), rec_bytes));
+                    }
+                }
+                return Ok(rows);
+            }
+
+            let mut all_hits = Vec::new();
+            for eq_p in &eq_prefixes {
+                let hits = {
+                    let bt = ctx.db_set.slot_mut(db_id).unwrap().btree.as_mut().unwrap();
+                    bt.seek_index_range(
+                        index.root_pgno,
+                        eq_p,
+                        low_bound.as_ref().map(|(v, inc)| (v, *inc)),
+                        high_bound.as_ref().map(|(v, inc)| (v, *inc)),
+                        &orders,
+                    )?
+                };
+                all_hits.extend(hits);
+            }
+            materialize_index_hits(ctx, db_id, tbl, index, all_hits)
+        }
+        AccessPlan::MultiIndexOr { branches } => {
+            let mut combined = Vec::new();
+            for bp in branches {
+                let branch_rows =
+                    execute_access_plan(ctx, db_id, db_enc, tbl, bp, params, outer_scopes, ctes)?;
+                for (rkey, payload) in branch_rows {
+                    if !combined.iter().any(|(existing_k, _)| *existing_k == rkey) {
+                        combined.push((rkey, payload));
+                    }
+                }
+            }
+            Ok(combined)
         }
     }
 }
@@ -6936,21 +7282,6 @@ fn apply_limit_offset(
     } else {
         Ok(iter.take(lim_val as usize).collect())
     }
-}
-
-fn expr_contains_conjunct(haystack: &Expr, needle: &Expr) -> bool {
-    if haystack == needle {
-        return true;
-    }
-    if let Expr::Binary {
-        left,
-        op: BinaryOp::And,
-        right,
-    } = haystack
-    {
-        return expr_contains_conjunct(left, needle) || expr_contains_conjunct(right, needle);
-    }
-    false
 }
 
 pub(crate) fn col_in_scoped_cols_pub(column: &str, sample_cols: &[ScopedColumn]) -> bool {
@@ -18772,6 +19103,22 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
         }
     }
 
+    // Per `sqlite/src/build.c:3504-3508`: remove rows for `tbl.name` from `sqlite_stat1` in `db_id`.
+    if !tbl.name.eq_ignore_ascii_case("sqlite_stat1")
+        && let Some(stat_tbl) = slot.schema.find_user_table("sqlite_stat1").cloned()
+        && !stat_tbl.without_rowid
+        && let Some(ref mut bt) = slot.btree
+    {
+        let enc = bt.encoding();
+        let rows = scan_table_incremental(bt, stat_tbl.root_pgno)?;
+        for (rid, payload) in rows {
+            let cols = decode_record_with_encoding(&payload, enc)?;
+            if cols.first().and_then(Value::as_str) == Some(tbl.name.as_str()) {
+                bt.delete_table(stat_tbl.root_pgno, rid)?;
+            }
+        }
+    }
+
     if db_id == DatabaseId::TEMP {
         ctx.db_set.reload_temp_schema_preserving_bindings()?;
     } else {
@@ -18791,6 +19138,12 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
         return Err(SqliteError::new(
             ErrorCode::Error,
             format!("object name reserved for internal use: {}", ci.name.name),
+        ));
+    }
+    if Schema::is_schema_table_name(&ci.table_name) {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("table {} may not be indexed", ci.table_name),
         ));
     }
 
@@ -18901,6 +19254,12 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
                 format!("no such table: {disp}"),
             ));
         };
+        if is_reserved_sqlite_name(&tbl.name) {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("table {} may not be indexed", tbl.name),
+            ));
+        }
         if slot.schema.find_user_table(&ci.name.name).is_some()
             || slot.schema.find_view(&ci.name.name).is_some()
         {
@@ -18922,7 +19281,15 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
     };
 
     // Validate AST before allocating pages so invalid expressions don't leak pages
-    let _ = build_index_schema_from_ast(ci, &tbl, 2)?;
+    let idx_preview = build_index_schema_from_ast(ci, &tbl, 2)?;
+    for ic in &idx_preview.columns {
+        if let Some(ref ie) = ic.expr {
+            validate_index_ddl_expr(ie, ctx.functions, "index expressions", true)?;
+        }
+    }
+    if let Some(ref wc) = idx_preview.where_clause {
+        validate_index_ddl_expr(wc, ctx.functions, "partial index WHERE clauses", false)?;
+    }
     let idx_root = ctx
         .db_set
         .slot_mut(db_id)
@@ -19143,6 +19510,538 @@ fn exec_reindex(ctx: &mut ExecContext<'_>, target: Option<&QualifiedName>) -> Re
     Ok(())
 }
 
+fn validate_index_ddl_expr(
+    expr: &Expr,
+    functions: &FunctionRegistry,
+    context_label: &str,
+    in_index_expr: bool,
+) -> Result<()> {
+    match expr {
+        Expr::Bind(_) => Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("parameters prohibited in {context_label}"),
+        )),
+        Expr::Subquery(_)
+        | Expr::Exists { .. }
+        | Expr::InSubquery { .. }
+        | Expr::InTable { .. } => Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("subqueries prohibited in {context_label}"),
+        )),
+        Expr::Column(cref) => {
+            if in_index_expr && (cref.table.is_some() || cref.schema.is_some()) {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    "the \".\" operator prohibited in index expressions",
+                ));
+            }
+            Ok(())
+        }
+        Expr::CurrentTimeKw(_) => Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("non-deterministic functions prohibited in {context_label}"),
+        )),
+        Expr::FunctionCall {
+            name,
+            args: fn_args,
+            filter,
+            over,
+            ..
+        } => {
+            let fn_lower = name.to_ascii_lowercase();
+            let args = match fn_args {
+                FunctionArgs::Exprs(v) => v.as_slice(),
+                FunctionArgs::Star => &[][..],
+            };
+            if matches!(
+                fn_lower.as_str(),
+                "date" | "time" | "datetime" | "julianday" | "unixepoch" | "strftime" | "timediff"
+            ) {
+                let min_args = if fn_lower == "strftime" { 2 } else { 1 };
+                let mut uses_now_or_tz = args.len() < min_args;
+                for arg in args {
+                    if let Expr::String(s) = arg
+                        && matches!(
+                            s.to_ascii_lowercase().as_str(),
+                            "now" | "localtime" | "utc" | "subsec" | "subsecond"
+                        )
+                    {
+                        uses_now_or_tz = true;
+                    }
+                }
+                if uses_now_or_tz {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("non-deterministic use of {fn_lower}() in an index"),
+                    ));
+                }
+            }
+            let is_non_det_builtin = matches!(
+                fn_lower.as_str(),
+                "random"
+                    | "randomblob"
+                    | "changes"
+                    | "total_changes"
+                    | "last_insert_rowid"
+                    | "sqlite_version"
+                    | "sqlite_source_id"
+                    | "sqlite_compileoption_used"
+                    | "sqlite_compileoption_get"
+                    | "current_time"
+                    | "current_date"
+                    | "current_timestamp"
+            );
+            let is_non_det_custom = functions
+                .find_scalar(name, args.len())
+                .is_some_and(|meta| !meta.flags.contains(FunctionFlags::DETERMINISTIC))
+                || functions
+                    .find_aggregate(name, args.len())
+                    .is_some_and(|meta| !meta.flags.contains(FunctionFlags::DETERMINISTIC));
+            if is_non_det_builtin || is_non_det_custom {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("non-deterministic functions prohibited in {context_label}"),
+                ));
+            }
+            if over.is_some() {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("misuse of window function {name}()"),
+                ));
+            }
+            for arg in args {
+                validate_index_ddl_expr(arg, functions, context_label, in_index_expr)?;
+            }
+            if let Some(flt) = filter {
+                validate_index_ddl_expr(flt, functions, context_label, in_index_expr)?;
+            }
+            Ok(())
+        }
+        Expr::Unary { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. } => {
+            validate_index_ddl_expr(inner, functions, context_label, in_index_expr)
+        }
+        Expr::Binary { left, right, .. } => {
+            validate_index_ddl_expr(left, functions, context_label, in_index_expr)?;
+            validate_index_ddl_expr(right, functions, context_label, in_index_expr)
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            validate_index_ddl_expr(e, functions, context_label, in_index_expr)?;
+            validate_index_ddl_expr(low, functions, context_label, in_index_expr)?;
+            validate_index_ddl_expr(high, functions, context_label, in_index_expr)
+        }
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            validate_index_ddl_expr(e, functions, context_label, in_index_expr)?;
+            validate_index_ddl_expr(pattern, functions, context_label, in_index_expr)?;
+            if let Some(esc) = escape {
+                validate_index_ddl_expr(esc, functions, context_label, in_index_expr)?;
+            }
+            Ok(())
+        }
+        Expr::InList { expr: e, list, .. } => {
+            validate_index_ddl_expr(e, functions, context_label, in_index_expr)?;
+            for item in list {
+                validate_index_ddl_expr(item, functions, context_label, in_index_expr)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                validate_index_ddl_expr(op, functions, context_label, in_index_expr)?;
+            }
+            for (w, t) in branches {
+                validate_index_ddl_expr(w, functions, context_label, in_index_expr)?;
+                validate_index_ddl_expr(t, functions, context_label, in_index_expr)?;
+            }
+            if let Some(el) = else_expr {
+                validate_index_ddl_expr(el, functions, context_label, in_index_expr)?;
+            }
+            Ok(())
+        }
+        Expr::RowValue(items) => {
+            for item in items {
+                validate_index_ddl_expr(item, functions, context_label, in_index_expr)?;
+            }
+            Ok(())
+        }
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Integer(_)
+        | Expr::OversizedHex(_)
+        | Expr::Float(_)
+        | Expr::String(_)
+        | Expr::Blob(_)
+        | Expr::Raise { .. } => Ok(()),
+    }
+}
+
+fn exec_analyze(ctx: &mut ExecContext<'_>, target: Option<&QualifiedName>) -> Result<()> {
+    match target {
+        None => {
+            let db_ids: Vec<DatabaseId> = ctx
+                .db_set
+                .unqualified_search_order()
+                .into_iter()
+                .filter(|id| {
+                    *id != DatabaseId::TEMP
+                        && ctx.db_set.slot(*id).is_some_and(|s| s.btree.is_some())
+                })
+                .collect();
+            for db_id in db_ids {
+                analyze_one_db(ctx, db_id, None, None)?;
+            }
+            Ok(())
+        }
+        Some(qn) if qn.schema.is_none() => {
+            if let Some(db_id) = ctx.db_set.find_db_id(&qn.name) {
+                return analyze_one_db(ctx, db_id, None, None);
+            }
+            if Schema::is_temp_schema_table_name(&qn.name) {
+                return analyze_one_db(ctx, DatabaseId::TEMP, Some("sqlite_master"), None);
+            }
+            if DatabaseSet::is_catalog_table_in_db(DatabaseId::MAIN, &qn.name) {
+                return analyze_one_db(ctx, DatabaseId::MAIN, Some("sqlite_master"), None);
+            }
+            for db_id in ctx.db_set.unqualified_search_order() {
+                let Some(slot) = ctx.db_set.slot(db_id) else {
+                    continue;
+                };
+                if slot.btree.is_none() {
+                    continue;
+                }
+                if let Some(tbl) = slot.schema.find_user_table(&qn.name).cloned() {
+                    return analyze_one_db(ctx, db_id, Some(&tbl.name), None);
+                }
+                if slot.schema.find_view(&qn.name).is_some() {
+                    return Ok(());
+                }
+                if let Some(idx) = slot.schema.find_index(&qn.name).cloned() {
+                    return analyze_one_db(ctx, db_id, Some(&idx.table_name), Some(&idx.name));
+                }
+            }
+            Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such table: {}", qn.name),
+            ))
+        }
+        Some(qn) => {
+            let schema_name = qn.schema.as_deref().unwrap_or("main");
+            let Some(db_id) = ctx.db_set.find_db_id(schema_name) else {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("unknown database {schema_name}"),
+                ));
+            };
+            if DatabaseSet::is_catalog_table_in_db(db_id, &qn.name) {
+                return analyze_one_db(ctx, db_id, Some("sqlite_master"), None);
+            }
+            let Some(slot) = ctx.db_set.slot(db_id) else {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("unknown database {schema_name}"),
+                ));
+            };
+            if let Some(tbl) = slot.schema.find_user_table(&qn.name).cloned() {
+                return analyze_one_db(ctx, db_id, Some(&tbl.name), None);
+            }
+            if slot.schema.find_view(&qn.name).is_some() {
+                return Ok(());
+            }
+            if let Some(idx) = slot.schema.find_index(&qn.name).cloned() {
+                return analyze_one_db(ctx, db_id, Some(&idx.table_name), Some(&idx.name));
+            }
+            Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such table: {schema_name}.{}", qn.name),
+            ))
+        }
+    }
+}
+
+fn ensure_stat1_table_and_clear(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    clear_tbl: Option<&str>,
+    clear_idx: Option<&str>,
+) -> Result<Option<TableSchema>> {
+    ctx.ensure_write_db(db_id, true)?;
+    let existing = ctx
+        .db_set
+        .slot(db_id)
+        .and_then(|s| s.schema.find_user_table("sqlite_stat1").cloned());
+    let stat1_tbl = if let Some(tbl) = existing {
+        if tbl.without_rowid || tbl.columns.len() < 3 {
+            return Ok(None);
+        }
+        if let Some(bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
+            let enc = bt.encoding();
+            let rows = scan_table_incremental(bt, tbl.root_pgno)?;
+            for (rid, payload) in rows {
+                let Ok(vals) = decode_record_with_encoding(&payload, enc) else {
+                    continue;
+                };
+                let should_delete = if let Some(target_t) = clear_tbl {
+                    let row_t = vals.first().and_then(Value::as_str).unwrap_or("");
+                    if row_t != target_t {
+                        false
+                    } else if let Some(target_i) = clear_idx {
+                        let row_i = vals.get(1).and_then(Value::as_str).unwrap_or("");
+                        row_i == target_i
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                };
+                if should_delete {
+                    bt.delete_table(tbl.root_pgno, rid)?;
+                }
+            }
+        }
+        Some(tbl)
+    } else {
+        {
+            let slot = ctx
+                .db_set
+                .slot_mut(db_id)
+                .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+            let bt = slot
+                .btree
+                .as_mut()
+                .ok_or_else(|| SqliteError::misuse("btree not open"))?;
+            let root_pgno = bt.create_table()?;
+            insert_schema_entry(
+                bt,
+                "table",
+                "sqlite_stat1",
+                "sqlite_stat1",
+                root_pgno,
+                Some("CREATE TABLE sqlite_stat1(tbl,idx,stat)"),
+            )?;
+        }
+        if db_id == DatabaseId::TEMP {
+            ctx.db_set.reload_temp_schema_preserving_bindings()?;
+        } else if let Some(slot) = ctx.db_set.slot_mut(db_id) {
+            slot.reload_schema()?;
+        }
+        ctx.db_set
+            .slot(db_id)
+            .and_then(|s| s.schema.find_user_table("sqlite_stat1").cloned())
+    };
+    Ok(stat1_tbl)
+}
+
+fn analyze_one_db(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    only_tbl: Option<&str>,
+    only_idx: Option<&str>,
+) -> Result<()> {
+    let stat1_tbl = ensure_stat1_table_and_clear(ctx, db_id, only_tbl, only_idx)?;
+    if only_tbl != Some("sqlite_master") {
+        let tables_to_analyze: Vec<TableSchema> = ctx
+            .db_set
+            .slot(db_id)
+            .map(|s| {
+                s.schema
+                    .tables
+                    .iter()
+                    .filter(|t| {
+                        if let Some(target_t) = only_tbl {
+                            t.name.eq_ignore_ascii_case(target_t)
+                        } else {
+                            !is_reserved_sqlite_name(&t.name)
+                        }
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if let Some(ref st_tbl) = stat1_tbl {
+            let mut next_stat_rowid = ctx
+                .db_set
+                .slot_mut(db_id)
+                .and_then(|s| s.btree.as_mut())
+                .and_then(|bt| bt.max_table_rowid(st_tbl.root_pgno).ok().flatten())
+                .unwrap_or(0)
+                + 1;
+
+            for tbl in tables_to_analyze {
+                let rows_to_insert = analyze_one_table(ctx, db_id, &tbl, only_idx)?;
+                for (t_name, i_name_opt, stat_str) in rows_to_insert {
+                    let row_vals = [
+                        Value::Text(t_name),
+                        match i_name_opt {
+                            Some(s) => Value::Text(s),
+                            None => Value::Null,
+                        },
+                        Value::Text(stat_str),
+                    ];
+                    if let Some(bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
+                        let enc = bt.encoding();
+                        let rec = encode_record_with_encoding(&row_vals, enc);
+                        bt.insert_table(st_tbl.root_pgno, next_stat_rowid, &rec)?;
+                    }
+                    next_stat_rowid += 1;
+                }
+            }
+        }
+    }
+
+    if let Some(slot) = ctx.db_set.slot_mut(db_id)
+        && let Some(ref mut bt) = slot.btree
+    {
+        slot.schema.reload_stat1(bt)?;
+    }
+    *ctx.schema_generation = ctx.schema_generation.wrapping_add(1);
+    *ctx.v1_expire_generation = ctx.v1_expire_generation.wrapping_add(1);
+    Ok(())
+}
+
+fn analyze_one_table(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    only_idx: Option<&str>,
+) -> Result<Vec<(String, Option<String>, String)>> {
+    let mut results = Vec::new();
+    let enc = ctx
+        .db_set
+        .slot(db_id)
+        .and_then(|s| s.btree.as_ref().map(|bt| bt.encoding()))
+        .unwrap_or(TextEncoding::Utf8);
+    let indexes: Vec<IndexSchema> = ctx
+        .db_set
+        .slot(db_id)
+        .map(|s| {
+            s.schema
+                .indexes_for_table(&tbl.name)
+                .into_iter()
+                .filter(|idx| {
+                    only_idx.is_none_or(|target_i| idx.name.eq_ignore_ascii_case(target_i))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut has_non_partial_index = tbl.without_rowid;
+    if tbl.without_rowid && only_idx.is_none_or(|target_i| tbl.name.eq_ignore_ascii_case(target_i))
+    {
+        let pk_orders = tbl.without_rowid_pk_orders();
+        let raw_entries = ctx.scan_index_in_db(db_id, tbl.root_pgno, pk_orders.clone())?;
+        let mut entries = Vec::with_capacity(raw_entries.len());
+        for raw in &raw_entries {
+            entries.push(decode_record_with_encoding(raw, enc)?);
+        }
+        let n_key_col = tbl.without_rowid_pk_cols.len().max(1);
+        if let Some(stat_str) =
+            compute_index_stat1_string(&entries, n_key_col, &pk_orders, enc, false)
+        {
+            results.push((tbl.name.clone(), Some(tbl.name.clone()), stat_str));
+        }
+    }
+
+    for idx in &indexes {
+        if idx.where_clause.is_none() {
+            has_non_partial_index = true;
+        }
+        let orders = idx.key_sort_orders();
+        let raw_entries = ctx.scan_index_in_db(db_id, idx.root_pgno, orders.clone())?;
+        let mut entries = Vec::with_capacity(raw_entries.len());
+        for raw in &raw_entries {
+            entries.push(decode_record_with_encoding(raw, enc)?);
+        }
+        let n_key_col = idx.columns.len().max(1);
+        if let Some(stat_str) = compute_index_stat1_string(
+            &entries,
+            n_key_col,
+            &orders,
+            enc,
+            idx.where_clause.is_some(),
+        ) {
+            results.push((tbl.name.clone(), Some(idx.name.clone()), stat_str));
+        }
+    }
+
+    if only_idx.is_none() && !has_non_partial_index {
+        let row_count = ctx.scan_table_in_db(db_id, tbl.root_pgno)?.len();
+        if row_count > 0 {
+            results.push((tbl.name.clone(), None, row_count.to_string()));
+        }
+    }
+
+    Ok(results)
+}
+
+fn compute_index_stat1_string(
+    entries: &[Vec<Value>],
+    n_key_col: usize,
+    key_orders: &[KeySortOrder],
+    enc: TextEncoding,
+    is_partial: bool,
+) -> Option<String> {
+    let n_rows = entries.len();
+    if n_rows == 0 {
+        if is_partial {
+            let mut s = String::from("0");
+            for _ in 0..n_key_col {
+                s.push_str(" 0");
+            }
+            return Some(s);
+        }
+        return None;
+    }
+
+    let mut distinct_counts = vec![1usize; n_key_col];
+    for pair in entries.windows(2) {
+        let prev = &pair[0];
+        let curr = &pair[1];
+        let mut first_diff = None;
+        for i in 0..n_key_col {
+            let pv = prev.get(i).unwrap_or(&Value::Null);
+            let cv = curr.get(i).unwrap_or(&Value::Null);
+            let coll = key_orders
+                .get(i)
+                .map(|o| o.collation)
+                .unwrap_or(Collation::Binary);
+            if pv.cmp_sqlite_with_encoding(cv, coll, enc) != Ordering::Equal {
+                first_diff = Some(i);
+                break;
+            }
+        }
+        if let Some(diff_idx) = first_diff {
+            for cnt in &mut distinct_counts[diff_idx..n_key_col] {
+                *cnt += 1;
+            }
+        }
+    }
+
+    let mut stat = n_rows.to_string();
+    for u in distinct_counts {
+        let mut d = n_rows.div_ceil(u);
+        if d == 2 && n_rows * 10 <= u * 11 {
+            d = 1;
+        }
+        stat.push(' ');
+        stat.push_str(&d.max(1).to_string());
+    }
+    Some(stat)
+}
+
 fn exec_drop_index(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedName) -> Result<()> {
     if let Some(ref s) = name.schema
         && ctx.db_set.find_db_id(s).is_none()
@@ -19217,6 +20116,20 @@ fn exec_drop_index(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
             .as_mut()
             .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
         apply_root_page_move(bt, &mut slot.schema, mv)?;
+    }
+    // Per `sqlite/src/build.c:4564-4568`: remove rows for `idx.name` from `sqlite_stat1` in `db_id`.
+    if let Some(stat_tbl) = slot.schema.find_user_table("sqlite_stat1").cloned()
+        && !stat_tbl.without_rowid
+        && let Some(ref mut bt) = slot.btree
+    {
+        let enc = bt.encoding();
+        let rows = scan_table_incremental(bt, stat_tbl.root_pgno)?;
+        for (rid, payload) in rows {
+            let cols = decode_record_with_encoding(&payload, enc)?;
+            if cols.get(1).and_then(Value::as_str) == Some(idx.name.as_str()) {
+                bt.delete_table(stat_tbl.root_pgno, rid)?;
+            }
+        }
     }
     if db_id == DatabaseId::TEMP {
         ctx.db_set.reload_temp_schema_preserving_bindings()?;
@@ -20547,6 +21460,34 @@ fn exec_alter_table(
                                 enc,
                             );
                             bt.insert_table(seq_tbl.root_pgno, rid, &rec)?;
+                        }
+                    }
+                }
+                if let Some(stat_tbl) = slot.schema.find_user_table("sqlite_stat1").cloned()
+                    && !stat_tbl.without_rowid
+                {
+                    let enc = bt.encoding();
+                    let rows = scan_table_incremental(bt, stat_tbl.root_pgno)?;
+                    let old_auto_prefix = format!("sqlite_autoindex_{}_", tbl.name);
+                    for (rid, payload) in rows {
+                        let mut cols = decode_record_with_encoding(&payload, enc)?;
+                        if cols.first().and_then(Value::as_str) == Some(tbl.name.as_str()) {
+                            cols[0] = Value::Text(new_name.clone());
+                            if let Some(idx_str) = cols.get(1).and_then(Value::as_str) {
+                                if idx_str == tbl.name.as_str() {
+                                    cols[1] = Value::Text(new_name.clone());
+                                } else if idx_str.len() > old_auto_prefix.len()
+                                    && idx_str[..old_auto_prefix.len()]
+                                        .eq_ignore_ascii_case(&old_auto_prefix)
+                                {
+                                    let suffix = &idx_str[old_auto_prefix.len()..];
+                                    cols[1] = Value::Text(format!(
+                                        "sqlite_autoindex_{new_name}_{suffix}"
+                                    ));
+                                }
+                            }
+                            let rec = encode_record_with_encoding(&cols, enc);
+                            bt.insert_table(stat_tbl.root_pgno, rid, &rec)?;
                         }
                     }
                 }
@@ -27992,6 +28933,12 @@ pub(crate) fn validate_and_infer_columns(
                     format!("no such table: {}", ci.table_name),
                 ));
             };
+            if is_reserved_sqlite_name(&tbl.name) {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("table {} may not be indexed", tbl.name),
+                ));
+            }
             if slot.schema.find_user_table(&ci.name.name).is_some()
                 || slot.schema.find_view(&ci.name.name).is_some()
             {
@@ -28010,6 +28957,14 @@ pub(crate) fn validate_and_infer_columns(
                 ));
             }
             let idx_preview = build_index_schema_from_ast(ci, tbl, 2)?;
+            for ic in &idx_preview.columns {
+                if let Some(ref ie) = ic.expr {
+                    validate_index_ddl_expr(ie, functions, "index expressions", true)?;
+                }
+            }
+            if let Some(ref wc) = ci.where_clause {
+                validate_index_ddl_expr(wc, functions, "partial index WHERE clauses", false)?;
+            }
             let tbl_scope = make_static_table_scope(tbl, &slot.name, None);
             let mut visited = Vec::new();
             for ic in &idx_preview.columns {
@@ -28496,11 +29451,12 @@ fn validate_index_hint_static(
             ));
         };
         if let Some(ref pw) = idx.where_clause {
-            let usable = where_hint.is_some_and(|wh| expr_contains_conjunct(wh, pw));
+            let usable =
+                where_hint.is_some_and(|wh| expr_implies_partial_where(wh, pw, tbl, "main", None));
             if !usable {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    format!("cannot use index: {idx_name}"),
+                    "no query solution".to_owned(),
                 ));
             }
         }
@@ -34133,6 +35089,7 @@ fn infer_view_pragma_columns(
     Ok(out)
 }
 
+#[allow(clippy::large_enum_variant)]
 enum OriginSource {
     Table {
         schema_name: String,
