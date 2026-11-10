@@ -1,5 +1,6 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "48/64 subtests passed; pending: TEMP TABLE"]
 fn test_lock() {
     sqliters_tcltest::run_test_script(
         "lock",

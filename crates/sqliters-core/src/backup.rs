@@ -532,7 +532,8 @@ impl Backup {
                     dst_bt.commit()?;
                 }
 
-                // Reload schema on destination slot and invalidate any open blobs/prepared statements on `dst`.
+                // Reset destination schema (`sqlite3ResetAllSchemasOfConnection`, `backup.c:454`)
+                // and invalidate any open blobs/prepared statements on `dst`.
                 {
                     let dst_slot = dst_inner.db_set.slot_mut(dst_db_id).unwrap();
                     let slot_name = dst_slot.name.clone();
@@ -540,13 +541,20 @@ impl Backup {
                         if dst_db_id == DatabaseId::MAIN && dst_bt.pager().page_count() > 0 {
                             dst_inner.connection_encoding = dst_bt.encoding();
                         }
-                        match Schema::load_for_schema(dst_bt, Some(&slot_name)) {
-                            Ok(mut fresh) => {
-                                fresh.rebind_collations(&dst_inner.collations);
-                                dst_slot.schema = fresh;
-                            }
-                            Err(_) => {
-                                dst_slot.schema = Schema::default();
+                        if dst_bt.pager().db_kind() == DatabaseKind::NamedDisk
+                            && !dst_bt.pager().is_wal_mode()
+                        {
+                            dst_bt.pager_mut().invalidate_header_loaded();
+                            dst_slot.schema = Schema::default();
+                        } else {
+                            match Schema::load_for_schema(dst_bt, Some(&slot_name)) {
+                                Ok(mut fresh) => {
+                                    fresh.rebind_collations(&dst_inner.collations);
+                                    dst_slot.schema = fresh;
+                                }
+                                Err(_) => {
+                                    dst_slot.schema = Schema::default();
+                                }
                             }
                         }
                     }

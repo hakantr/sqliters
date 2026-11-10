@@ -1,5 +1,6 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "10/15 subtests passed; pending: fkey7 edge cases"]
 fn test_fkey7() {
     sqliters_tcltest::run_test_script(
         "fkey7",

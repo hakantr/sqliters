@@ -7,17 +7,17 @@
 use std::collections::HashMap;
 
 use sqliters_syntax::{
-    AlterTableAction, ColumnRef, CommonTableExpr, CreateIndexStmt, CreateTableStmt,
-    CreateTriggerStmt, CreateViewStmt, DeleteStmt, Expr, FromClause, FunctionArgs, InsertSource,
-    InsertStmt, JoinConstraint, LikeOp, PragmaValue, QualifiedName, ResultColumn, SelectCore,
-    SelectStmt, Stmt, TableOrSubquery, TriggerEvent, TriggerStep, UpdateStmt, UpsertAction,
-    WindowFrameBound, WindowRef, WindowSpec,
+    AlterTableAction, BinaryOp, ColumnRef, CommonTableExpr, CreateIndexStmt, CreateTableStmt,
+    CreateTriggerStmt, CreateViewStmt, DeleteStmt, Expr, FkAction, FromClause, FunctionArgs,
+    InsertSource, InsertStmt, JoinConstraint, LikeOp, PragmaValue, QualifiedName, ResultColumn,
+    SelectCore, SelectStmt, SetAssignment, Stmt, TableOrSubquery, TriggerEvent, TriggerStep,
+    UpdateStmt, UpsertAction, WindowFrameBound, WindowRef, WindowSpec,
 };
 use sqliters_types::{DatabaseId, ErrorCode, Result, SqliteError};
 
 use crate::db_set::{DatabaseSet, ResolvedRelation};
 use crate::execution_context::{FunctionRegistry, catch_infallible_callback_panic};
-use crate::schema::Schema;
+use crate::schema::{ForeignKeySchema, Schema, TableSchema};
 use crate::trigger::TriggerEventKind;
 
 /// Action code passed as the first parameter to an [`AuthorizerCallback`] (`sqlite3_set_authorizer`
@@ -322,9 +322,13 @@ struct AuthWalkCtx<'a> {
     db_set: &'a DatabaseSet,
     functions: &'a FunctionRegistry,
     slot: &'a mut AuthorizerSlot,
+    foreign_keys: bool,
+    in_subprogram: bool,
     context_stack: Vec<String>,
     visited_views: Vec<(DatabaseId, String)>,
     visited_triggers: Vec<(DatabaseId, String)>,
+    visited_fk_actions: Vec<(DatabaseId, String, usize, bool)>,
+    ignored_fk_parent_tables: Vec<(DatabaseId, String)>,
 }
 
 impl<'a> AuthWalkCtx<'a> {
@@ -575,8 +579,31 @@ impl<'a> AuthWalkCtx<'a> {
                 } else {
                     AuthorizerAction::DropTable
                 };
-                Ok(self.check(action, Some(&name.name), None, Some(&db_name))?
-                    != AuthorizerResult::Ignore)
+                if self.check(action, Some(&name.name), None, Some(&db_name))?
+                    == AuthorizerResult::Ignore
+                {
+                    return Ok(false);
+                }
+                if let Some(slot) = self.db_set.slot(db_id)
+                    && slot.schema.find_user_table("sqlite_stat1").is_some()
+                {
+                    for stat_tbl in [
+                        "sqlite_stat1",
+                        "sqlite_stat2",
+                        "sqlite_stat3",
+                        "sqlite_stat4",
+                    ] {
+                        if slot.schema.find_user_table(stat_tbl).is_some() {
+                            let _ = self.check(
+                                AuthorizerAction::Delete,
+                                Some(stat_tbl),
+                                None,
+                                Some(&db_name),
+                            )?;
+                        }
+                    }
+                }
+                Ok(true)
             }
             Stmt::CreateIndex(ci) => self.authorize_create_index(ci),
             Stmt::DropIndex { name, .. } => {
@@ -1423,6 +1450,19 @@ impl<'a> AuthWalkCtx<'a> {
         )?;
 
         self.authorize_firing_triggers(db_id, &target_src, TriggerEventKind::Insert, None)?;
+        if self.foreign_keys {
+            let is_single_row_toplevel_insert = !self.in_subprogram
+                && ins.upsert_clauses.is_empty()
+                && matches!(&ins.source, InsertSource::Values(rows) if rows.len() == 1);
+            self.authorize_fk_check(
+                db_id,
+                &target_src,
+                false,
+                true,
+                None,
+                !is_single_row_toplevel_insert,
+            )?;
+        }
         Ok(true)
     }
 
@@ -1481,6 +1521,11 @@ impl<'a> AuthWalkCtx<'a> {
 
         if upd.assignments.is_empty() && upd.returning.is_empty() {
             return Ok(false);
+        }
+        if self.foreign_keys {
+            self.authorize_fk_check(db_id, &target_src, true, false, Some(&mod_cols), true)?;
+            self.authorize_fk_check(db_id, &target_src, false, true, Some(&mod_cols), true)?;
+            self.authorize_fk_actions(db_id, &target_src, Some(&mod_cols))?;
         }
         Ok(true)
     }
@@ -1563,7 +1608,353 @@ impl<'a> AuthWalkCtx<'a> {
         self.authorize_projection(&mut del.returning, &current_scope, &local_ctes, &scopes)?;
 
         self.authorize_firing_triggers(db_id, &target_src, TriggerEventKind::Delete, None)?;
+        if self.foreign_keys {
+            self.authorize_fk_check(db_id, &target_src, true, false, None, true)?;
+            self.authorize_fk_actions(db_id, &target_src, None)?;
+        }
         Ok(true)
+    }
+
+    fn resolve_fk_parent_col_names(ptbl: &TableSchema, fk: &ForeignKeySchema) -> Vec<String> {
+        match &fk.ref_cols {
+            Some(names) => names
+                .iter()
+                .filter_map(|n| ptbl.find_column(n).map(|(_, c)| c.name.clone()))
+                .collect(),
+            None => {
+                if let Some(ipk_idx) = ptbl.rowid_alias_col
+                    && let Some(c) = ptbl.columns.get(ipk_idx)
+                {
+                    return vec![c.name.clone()];
+                }
+                let mut pk_cols: Vec<(usize, String)> = ptbl
+                    .columns
+                    .iter()
+                    .filter(|c| c.is_primary_key)
+                    .map(|c| (c.pk_order, c.name.clone()))
+                    .collect();
+                pk_cols.sort_by_key(|(ord, _)| *ord);
+                pk_cols.into_iter().map(|(_, n)| n).collect()
+            }
+        }
+    }
+
+    fn fk_child_is_modified(
+        tbl: &TableSchema,
+        fk: &ForeignKeySchema,
+        modified_cols: &[String],
+    ) -> bool {
+        let chng_rowid = !tbl.without_rowid
+            && (modified_cols.iter().any(|c| is_rowid_alias(c))
+                || tbl.rowid_alias_col.is_some_and(|idx| {
+                    modified_cols
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(&tbl.columns[idx].name))
+                }));
+        fk.from_cols.iter().any(|&ci| {
+            (tbl.rowid_alias_col == Some(ci) && chng_rowid)
+                || tbl.columns.get(ci).is_some_and(|col| {
+                    modified_cols
+                        .iter()
+                        .any(|m| m.eq_ignore_ascii_case(&col.name))
+                })
+        })
+    }
+
+    fn fk_parent_is_modified(
+        ptbl: &TableSchema,
+        parent_cols: &[String],
+        modified_cols: &[String],
+    ) -> bool {
+        let chng_rowid = !ptbl.without_rowid
+            && (modified_cols.iter().any(|c| is_rowid_alias(c))
+                || ptbl.rowid_alias_col.is_some_and(|idx| {
+                    modified_cols
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(&ptbl.columns[idx].name))
+                }));
+        parent_cols.iter().any(|pcol| {
+            modified_cols.iter().any(|m| m.eq_ignore_ascii_case(pcol))
+                || (chng_rowid
+                    && ptbl
+                        .rowid_alias_col
+                        .and_then(|idx| ptbl.columns.get(idx))
+                        .is_some_and(|c| c.name.eq_ignore_ascii_case(pcol)))
+        })
+    }
+
+    fn authorize_fk_check(
+        &mut self,
+        db_id: DatabaseId,
+        target_src: &AuthSourceTable,
+        has_old: bool,
+        has_new: bool,
+        modified_cols: Option<&[String]>,
+        is_multi_or_subprogram: bool,
+    ) -> Result<()> {
+        if Schema::is_schema_table_name(&target_src.table_name) {
+            return Ok(());
+        }
+        let Some((db_name, slot_schema, p_tab)) = self.db_set.slot(db_id).and_then(|s| {
+            let t = s.schema.find_user_table(&target_src.table_name)?.clone();
+            Some((s.name.clone(), s.schema.clone(), t))
+        }) else {
+            return Ok(());
+        };
+
+        // 1. Child-side FKs (`pTab->u.tab.pFKey` in `fkey.c:916-1015`)
+        for fk in p_tab.foreign_keys.iter().rev() {
+            if let Some(mods) = modified_cols
+                && !p_tab.name.eq_ignore_ascii_case(&fk.ref_table)
+                && !Self::fk_child_is_modified(&p_tab, fk, mods)
+            {
+                continue;
+            }
+            let Some(p_to) = slot_schema.find_user_table(&fk.ref_table) else {
+                continue;
+            };
+            let parent_cols = Self::resolve_fk_parent_col_names(p_to, fk);
+            if parent_cols.len() != fk.from_cols.len() {
+                continue;
+            }
+            for p_col_name in &parent_cols {
+                let res = self.check_read(db_id, &db_name, &p_to.name, p_col_name)?;
+                if res == AuthorizerResult::Ignore
+                    && !self
+                        .ignored_fk_parent_tables
+                        .iter()
+                        .any(|(d, t)| *d == db_id && t.eq_ignore_ascii_case(&p_to.name))
+                {
+                    self.ignored_fk_parent_tables
+                        .push((db_id, p_to.name.clone()));
+                }
+            }
+        }
+
+        // 2. Parent-side FKs (`sqlite3FkReferences(pTab)` in `fkey.c:1019-1086`)
+        for ctbl in slot_schema.tables.iter().rev() {
+            for fk in ctbl.foreign_keys.iter().rev() {
+                if !fk.ref_table.eq_ignore_ascii_case(&p_tab.name) {
+                    continue;
+                }
+                let parent_cols = Self::resolve_fk_parent_col_names(&p_tab, fk);
+                if parent_cols.len() != fk.from_cols.len() {
+                    continue;
+                }
+                if let Some(mods) = modified_cols
+                    && !Self::fk_parent_is_modified(&p_tab, &parent_cols, mods)
+                {
+                    continue;
+                }
+                if !has_old
+                    && has_new
+                    && modified_cols.is_none()
+                    && !fk.deferred
+                    && !is_multi_or_subprogram
+                {
+                    continue;
+                }
+                if has_new {
+                    for &from_ci in &fk.from_cols {
+                        if let Some(col) = ctbl.columns.get(from_ci) {
+                            let _ = self.check_read(db_id, &db_name, &ctbl.name, &col.name)?;
+                        }
+                    }
+                }
+                if has_old {
+                    for &from_ci in &fk.from_cols {
+                        if let Some(col) = ctbl.columns.get(from_ci) {
+                            let _ = self.check_read(db_id, &db_name, &ctbl.name, &col.name)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn authorize_fk_actions(
+        &mut self,
+        db_id: DatabaseId,
+        target_src: &AuthSourceTable,
+        modified_cols: Option<&[String]>,
+    ) -> Result<()> {
+        if !self.db_set.enable_trigger() || Schema::is_schema_table_name(&target_src.table_name) {
+            return Ok(());
+        }
+        let Some((db_name, slot_schema, p_tab)) = self.db_set.slot(db_id).and_then(|s| {
+            let t = s.schema.find_user_table(&target_src.table_name)?.clone();
+            Some((s.name.clone(), s.schema.clone(), t))
+        }) else {
+            return Ok(());
+        };
+        let is_update = modified_cols.is_some();
+
+        for ctbl in slot_schema.tables.iter().rev() {
+            for fk in ctbl.foreign_keys.iter().rev() {
+                if !fk.ref_table.eq_ignore_ascii_case(&p_tab.name) {
+                    continue;
+                }
+                let parent_cols = Self::resolve_fk_parent_col_names(&p_tab, fk);
+                if parent_cols.len() != fk.from_cols.len() {
+                    continue;
+                }
+                if let Some(mods) = modified_cols
+                    && !Self::fk_parent_is_modified(&p_tab, &parent_cols, mods)
+                {
+                    continue;
+                }
+                let action = if is_update {
+                    fk.on_update
+                } else {
+                    fk.on_delete
+                };
+                if action == FkAction::NoAction {
+                    continue;
+                }
+                let visit_key = (db_id, ctbl.name.to_ascii_uppercase(), fk.id, is_update);
+                if self.visited_fk_actions.contains(&visit_key) {
+                    continue;
+                }
+
+                let mut pseudo_scope = Vec::new();
+                let mut old_src = target_src.clone();
+                old_src.alias = Some("old".to_owned());
+                old_src.qualified_only = true;
+                pseudo_scope.push(old_src);
+                if is_update {
+                    let mut new_src = target_src.clone();
+                    new_src.alias = Some("new".to_owned());
+                    new_src.qualified_only = true;
+                    pseudo_scope.push(new_src);
+                }
+                let trig_scopes = vec![pseudo_scope];
+
+                // Build `WHERE old.to_col1 = from_col1 AND ...`
+                let mut where_expr: Option<Expr> = None;
+                for (&from_ci, to_col_name) in fk.from_cols.iter().zip(parent_cols.iter()) {
+                    let Some(from_col) = ctbl.columns.get(from_ci) else {
+                        continue;
+                    };
+                    let eq = Expr::Binary {
+                        left: Box::new(Expr::Column(ColumnRef {
+                            schema: None,
+                            table: Some("old".to_owned()),
+                            column: to_col_name.clone(),
+                        })),
+                        op: BinaryOp::Eq,
+                        right: Box::new(Expr::Column(ColumnRef {
+                            schema: None,
+                            table: None,
+                            column: from_col.name.clone(),
+                        })),
+                    };
+                    where_expr = Some(match where_expr {
+                        None => eq,
+                        Some(prev) => Expr::Binary {
+                            left: Box::new(prev),
+                            op: BinaryOp::And,
+                            right: Box::new(eq),
+                        },
+                    });
+                }
+
+                let prev_sub = self.in_subprogram;
+                self.in_subprogram = true;
+                self.visited_fk_actions.push(visit_key);
+                let res = (|| -> Result<()> {
+                    if is_update {
+                        // Synthetic `WHEN NOT(old.col1 IS new.col1 AND ...)` (`fkey.c:1284-1293`)
+                        for to_col_name in &parent_cols {
+                            let _ = self.check_read(db_id, &db_name, &p_tab.name, to_col_name)?;
+                            let _ = self.check_read(db_id, &db_name, &p_tab.name, to_col_name)?;
+                        }
+                    }
+                    match action {
+                        FkAction::NoAction => Ok(()),
+                        FkAction::Restrict => {
+                            let _ = self.check(AuthorizerAction::Select, None, None, None)?;
+                            for (&from_ci, to_col_name) in
+                                fk.from_cols.iter().zip(parent_cols.iter())
+                            {
+                                let _ =
+                                    self.check_read(db_id, &db_name, &p_tab.name, to_col_name)?;
+                                if let Some(from_col) = ctbl.columns.get(from_ci) {
+                                    let _ = self.check_read(
+                                        db_id,
+                                        &db_name,
+                                        &ctbl.name,
+                                        &from_col.name,
+                                    )?;
+                                }
+                            }
+                            Ok(())
+                        }
+                        FkAction::Cascade if !is_update => {
+                            let mut syn_del = DeleteStmt {
+                                ctes: Vec::new(),
+                                table: QualifiedName {
+                                    schema: Some(db_name.clone()),
+                                    name: ctbl.name.clone(),
+                                },
+                                alias: None,
+                                indexed_by: None,
+                                selection: where_expr,
+                                returning: Vec::new(),
+                            };
+                            let _ = self.authorize_delete_stmt(&mut syn_del, &trig_scopes)?;
+                            Ok(())
+                        }
+                        FkAction::Cascade | FkAction::SetNull | FkAction::SetDefault => {
+                            let mut assignments = Vec::with_capacity(fk.from_cols.len());
+                            for (&from_ci, to_col_name) in
+                                fk.from_cols.iter().zip(parent_cols.iter())
+                            {
+                                let Some(from_col) = ctbl.columns.get(from_ci) else {
+                                    continue;
+                                };
+                                let rhs = match action {
+                                    FkAction::Cascade => Expr::Column(ColumnRef {
+                                        schema: None,
+                                        table: Some("new".to_owned()),
+                                        column: to_col_name.clone(),
+                                    }),
+                                    FkAction::SetDefault => {
+                                        from_col.default_expr.clone().unwrap_or(Expr::Null)
+                                    }
+                                    _ => Expr::Null,
+                                };
+                                assignments.push(SetAssignment {
+                                    columns: vec![from_col.name.clone()],
+                                    row_value: false,
+                                    expr: rhs,
+                                });
+                            }
+                            let mut syn_upd = UpdateStmt {
+                                ctes: Vec::new(),
+                                or_conflict: None,
+                                table: QualifiedName {
+                                    schema: Some(db_name.clone()),
+                                    name: ctbl.name.clone(),
+                                },
+                                alias: None,
+                                indexed_by: None,
+                                assignments,
+                                from: None,
+                                selection: where_expr,
+                                returning: Vec::new(),
+                            };
+                            let _ = self.authorize_update_stmt(&mut syn_upd, &trig_scopes)?;
+                            Ok(())
+                        }
+                    }
+                })();
+                self.visited_fk_actions.pop();
+                self.in_subprogram = prev_sub;
+                res?;
+            }
+        }
+        Ok(())
     }
 
     fn authorize_firing_triggers(
@@ -1607,6 +1998,8 @@ impl<'a> AuthWalkCtx<'a> {
             let trig_scopes = vec![pseudo_scope];
             let empty_ctes = HashMap::new();
 
+            let prev_sub = self.in_subprogram;
+            self.in_subprogram = true;
             self.visited_triggers.push(visit_key);
             self.context_stack.push(trig.name.clone());
             let res = (|| -> Result<()> {
@@ -1633,6 +2026,7 @@ impl<'a> AuthWalkCtx<'a> {
             })();
             self.context_stack.pop();
             self.visited_triggers.pop();
+            self.in_subprogram = prev_sub;
             res?;
         }
         Ok(())
@@ -1949,22 +2343,39 @@ pub fn authorize_stmt_with_slot(
     functions: &FunctionRegistry,
     slot: &mut AuthorizerSlot,
 ) -> Result<Option<Stmt>> {
+    authorize_stmt_with_slot_and_fks(stmt, db_set, functions, false, slot).map(|(st, _)| st)
+}
+
+/// Runs compile-time authorization (`sqlite3_set_authorizer`) on `stmt` including foreign key
+/// read/action checks when `foreign_keys` is `true`, returning `(rewritten_stmt_opt, ignored_fk_parent_tables)`.
+#[allow(clippy::type_complexity)]
+pub fn authorize_stmt_with_slot_and_fks(
+    stmt: &Stmt,
+    db_set: &DatabaseSet,
+    functions: &FunctionRegistry,
+    foreign_keys: bool,
+    slot: &mut AuthorizerSlot,
+) -> Result<(Option<Stmt>, Vec<(DatabaseId, String)>)> {
     if !slot.is_some() {
-        return Ok(Some(stmt.clone()));
+        return Ok((Some(stmt.clone()), Vec::new()));
     }
     let mut cloned = stmt.clone();
     let mut ctx = AuthWalkCtx {
         db_set,
         functions,
         slot,
+        foreign_keys,
+        in_subprogram: false,
         context_stack: Vec::new(),
         visited_views: Vec::new(),
         visited_triggers: Vec::new(),
+        visited_fk_actions: Vec::new(),
+        ignored_fk_parent_tables: Vec::new(),
     };
     let _ = ctx.current_context();
     if ctx.authorize_stmt(&mut cloned, &[])? {
-        Ok(Some(cloned))
+        Ok((Some(cloned), ctx.ignored_fk_parent_tables))
     } else {
-        Ok(None)
+        Ok((None, ctx.ignored_fk_parent_tables))
     }
 }

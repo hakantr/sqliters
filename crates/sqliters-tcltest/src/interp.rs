@@ -4,9 +4,11 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::expr::{eval_expr, parse_tcl_bool, parse_tcl_float, parse_tcl_int};
 use crate::list::{
@@ -57,9 +59,83 @@ pub struct TclProc {
     pub body: String,
 }
 
-struct OpenChannel {
-    file: fs::File,
-    binary: bool,
+enum OpenChannel {
+    File {
+        file: fs::File,
+        binary: bool,
+        eof: bool,
+    },
+    Pipe {
+        child: Child,
+        stdin: Option<ChildStdin>,
+        stdout: Option<BufReader<ChildStdout>>,
+        binary: bool,
+        eof: bool,
+    },
+}
+
+impl OpenChannel {
+    fn is_binary(&self) -> bool {
+        match self {
+            Self::File { binary, .. } | Self::Pipe { binary, .. } => *binary,
+        }
+    }
+
+    fn set_binary(&mut self, val: bool) {
+        match self {
+            Self::File { binary, .. } | Self::Pipe { binary, .. } => *binary = val,
+        }
+    }
+
+    fn is_eof(&self) -> bool {
+        match self {
+            Self::File { eof, .. } | Self::Pipe { eof, .. } => *eof,
+        }
+    }
+
+    fn close_bounded(&mut self) {
+        if let Self::Pipe {
+            child,
+            stdin,
+            stdout,
+            ..
+        } = self
+        {
+            drop(stdin.take());
+            drop(stdout.take());
+            for _ in 0..500 {
+                if let Ok(Some(_)) = child.try_wait() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for OpenChannel {
+    fn drop(&mut self) {
+        if let Self::Pipe {
+            child,
+            stdin,
+            stdout,
+            ..
+        } = self
+        {
+            drop(stdin.take());
+            drop(stdout.take());
+            for _ in 0..50 {
+                if let Ok(Some(_)) = child.try_wait() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 const DEFAULT_TCL_BUILTINS: &[(&str, &str)] = &[
@@ -120,6 +196,7 @@ const DEFAULT_TCL_BUILTINS: &[(&str, &str)] = &[
     ("close", "close"),
     ("flush", "flush"),
     ("fconfigure", "fconfigure"),
+    ("fileevent", "fileevent"),
     ("eof", "eof"),
     ("seek", "seek"),
     ("tell", "tell"),
@@ -129,6 +206,8 @@ const DEFAULT_TCL_BUILTINS: &[(&str, &str)] = &[
     ("encoding", "encoding"),
     ("after", "after"),
     ("pid", "pid"),
+    ("exec", "exec"),
+    ("exit", "exit"),
 ];
 
 pub struct TclInterp {
@@ -141,9 +220,47 @@ pub struct TclInterp {
     next_chan_id: usize,
     pub host: Option<crate::harness::SharedHost>,
     pub script_path: String,
+    pub subprocess_mode: bool,
+    pub last_result_is_bytearray: bool,
+    stdin_eof: bool,
+    bg_children: Vec<Child>,
+}
+
+impl Drop for TclInterp {
+    fn drop(&mut self) {
+        self.channels.clear();
+        self.kill_bg_children();
+    }
 }
 
 impl TclInterp {
+    pub(crate) fn new_dummy() -> Self {
+        Self {
+            frames: Vec::new(),
+            current_frame: 0,
+            procs: HashMap::new(),
+            builtins: HashMap::new(),
+            cwd: PathBuf::new(),
+            channels: HashMap::new(),
+            next_chan_id: 1,
+            host: None,
+            script_path: String::new(),
+            subprocess_mode: false,
+            last_result_is_bytearray: false,
+            stdin_eof: false,
+            bg_children: Vec::new(),
+        }
+    }
+
+    pub(crate) fn kill_bg_children(&mut self) {
+        for mut child in self.bg_children.drain(..) {
+            if let Ok(None) = child.try_wait() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
     pub fn new(cwd: PathBuf, host: Option<crate::harness::SharedHost>) -> Self {
         let mut global = CallFrame::default();
         let mut platform = HashMap::new();
@@ -180,6 +297,10 @@ impl TclInterp {
             next_chan_id: 1,
             host,
             script_path: String::new(),
+            subprocess_mode: false,
+            last_result_is_bytearray: false,
+            stdin_eof: false,
+            bg_children: Vec::new(),
         }
     }
 
@@ -777,6 +898,9 @@ impl TclInterp {
         let raw_cmd = words[0].as_str();
         let cmd = raw_cmd.strip_prefix("::").unwrap_or(raw_cmd);
         let args = &words[1..];
+        if cmd != "return" {
+            self.last_result_is_bytearray = false;
+        }
 
         // 1. User/tester.tcl defined procs take precedence over built-ins when overridden
         //    (e.g., `proc puts` in tester.tcl!)
@@ -881,17 +1005,20 @@ impl TclInterp {
             "gets" => self.cmd_gets(args),
             "read" => self.cmd_read(args),
             "close" => self.cmd_close(args),
-            "flush" => Ok(String::new()),
+            "flush" => self.cmd_flush(args),
             "fconfigure" => self.cmd_fconfigure(args),
-            "eof" => Ok("0".to_string()),
+            "fileevent" => Ok(String::new()),
+            "eof" => self.cmd_eof(args),
             "seek" => self.cmd_seek(args),
             "tell" => self.cmd_tell(args),
             "time" => self.cmd_time(args),
             "clock" => self.cmd_clock(args),
             "namespace" => self.cmd_namespace(args),
             "encoding" => Ok("utf-8".to_string()),
-            "after" => Ok(String::new()),
+            "after" => self.cmd_after(args),
             "pid" => Ok(std::process::id().to_string()),
+            "exec" => self.cmd_exec(args),
+            "exit" => self.cmd_exit(args),
             _ => Err(TclControl::Error(format!(
                 "invalid command name \"{}\"",
                 words[0]
@@ -2278,9 +2405,7 @@ impl TclInterp {
                 Ok(depth.to_string())
             }
             "script" => Ok(self.script_path.clone()),
-            "nameofexec" => Ok(std::env::current_exe()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| "sqliters".to_string())),
+            "nameofexec" => Ok(resolve_testfixture_binary().to_string_lossy().into_owned()),
             "patchlevel" | "tclversion" => Ok("8.6".to_string()),
             _ => Ok(String::new()),
         }
@@ -2429,6 +2554,7 @@ impl TclInterp {
                 let fmt = &args[1];
                 let vals = &args[2..];
                 let bytes = tcl_binary_format(fmt, vals)?;
+                self.last_result_is_bytearray = true;
                 Ok(bytes.into_iter().map(char::from).collect())
             }
             "scan" => {
@@ -2746,8 +2872,46 @@ impl TclInterp {
         if args.is_empty() {
             return Err(TclControl::Error("wrong # args to open".to_string()));
         }
-        let path = self.resolve_path(&args[0]);
+        let target_arg = &args[0];
         let mode = args.get(1).map_or("r", String::as_str);
+        let binary = mode.contains('b');
+
+        if let Some(pipe_cmd) = target_arg.strip_prefix('|') {
+            let cmd_words = parse_list(pipe_cmd)
+                .ok()
+                .filter(|w| !w.is_empty())
+                .unwrap_or_else(|| pipe_cmd.split_whitespace().map(str::to_string).collect());
+            if cmd_words.is_empty() {
+                return Err(TclControl::Error(
+                    "illegal must specify command".to_string(),
+                ));
+            }
+            let mut child = Command::new(&cmd_words[0])
+                .args(&cmd_words[1..])
+                .current_dir(&self.cwd)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| TclControl::Error(e.to_string()))?;
+            let stdin = child.stdin.take();
+            let stdout = child.stdout.take().map(BufReader::new);
+            let id = format!("file{}", self.next_chan_id);
+            self.next_chan_id += 1;
+            self.channels.insert(
+                id.clone(),
+                OpenChannel::Pipe {
+                    child,
+                    stdin,
+                    stdout,
+                    binary,
+                    eof: false,
+                },
+            );
+            return Ok(id);
+        }
+
+        let path = self.resolve_path(target_arg);
         let mut opts = fs::OpenOptions::new();
         match mode {
             "r" | "rb" => {
@@ -2769,14 +2933,19 @@ impl TclInterp {
                 opts.read(true).write(true).create(true);
             }
         }
-        let binary = mode.contains('b');
         let file = opts
             .open(path)
             .map_err(|e| TclControl::Error(e.to_string()))?;
         let id = format!("file{}", self.next_chan_id);
         self.next_chan_id += 1;
-        self.channels
-            .insert(id.clone(), OpenChannel { file, binary });
+        self.channels.insert(
+            id.clone(),
+            OpenChannel::File {
+                file,
+                binary,
+                eof: false,
+            },
+        );
         Ok(id)
     }
 
@@ -2790,7 +2959,7 @@ impl TclInterp {
             if let Some(ch) = self.channels.get(chan_id)
                 && (opt == "-translation" || opt == "-encoding")
             {
-                return Ok(if ch.binary {
+                return Ok(if ch.is_binary() {
                     "binary".to_string()
                 } else if opt == "-translation" {
                     "auto".to_string()
@@ -2807,7 +2976,7 @@ impl TclInterp {
             if (opt == "-translation" || opt == "-encoding")
                 && let Some(ch) = self.channels.get_mut(chan_id)
             {
-                ch.binary = val.eq_ignore_ascii_case("binary");
+                ch.set_binary(val.eq_ignore_ascii_case("binary"));
             }
             i += 2;
         }
@@ -2827,18 +2996,92 @@ impl TclInterp {
             2 => (rem[0].as_str(), rem[1].as_str()),
             _ => return Ok(String::new()),
         };
-        if chan != "stdout"
-            && chan != "stderr"
-            && let Some(ch) = self.channels.get_mut(chan)
-        {
-            if ch.binary {
-                let raw: Vec<u8> = msg.chars().map(|c| (c as u32 & 0xff) as u8).collect();
-                let _ = ch.file.write_all(&raw);
-            } else {
-                let _ = ch.file.write_all(msg.as_bytes());
+        if chan == "stdout" {
+            if self.subprocess_mode {
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(msg.as_bytes());
+                if !nonewline {
+                    let _ = out.write_all(b"\n");
+                }
+                let _ = out.flush();
             }
-            if !nonewline {
-                let _ = ch.file.write_all(b"\n");
+            return Ok(String::new());
+        }
+        if chan == "stderr" {
+            if self.subprocess_mode {
+                let mut err = std::io::stderr().lock();
+                let _ = err.write_all(msg.as_bytes());
+                if !nonewline {
+                    let _ = err.write_all(b"\n");
+                }
+                let _ = err.flush();
+            }
+            return Ok(String::new());
+        }
+        if let Some(ref host_rc) = self.host
+            && crate::harness::has_incrblob_channel(host_rc, chan)
+        {
+            return crate::harness::incrblob_puts(host_rc, chan, msg, nonewline);
+        }
+        if let Some(ch) = self.channels.get_mut(chan) {
+            let is_bin = ch.is_binary();
+            match ch {
+                OpenChannel::File { file, .. } => {
+                    if is_bin {
+                        let raw: Vec<u8> = msg.chars().map(|c| (c as u32 & 0xff) as u8).collect();
+                        let _ = file.write_all(&raw);
+                    } else {
+                        let _ = file.write_all(msg.as_bytes());
+                    }
+                    if !nonewline {
+                        let _ = file.write_all(b"\n");
+                    }
+                }
+                OpenChannel::Pipe {
+                    stdin: Some(sin), ..
+                } => {
+                    if is_bin {
+                        let raw: Vec<u8> = msg.chars().map(|c| (c as u32 & 0xff) as u8).collect();
+                        let _ = sin.write_all(&raw);
+                    } else {
+                        let _ = sin.write_all(msg.as_bytes());
+                    }
+                    if !nonewline {
+                        let _ = sin.write_all(b"\n");
+                    }
+                    let _ = sin.flush();
+                }
+                OpenChannel::Pipe { stdin: None, .. } => {}
+            }
+        }
+        Ok(String::new())
+    }
+
+    fn cmd_flush(&mut self, args: &[String]) -> TclResult<String> {
+        let chan = args.first().map_or("stdout", String::as_str);
+        if chan == "stdout" {
+            if self.subprocess_mode {
+                let _ = std::io::stdout().flush();
+            }
+            return Ok(String::new());
+        }
+        if chan == "stderr" {
+            if self.subprocess_mode {
+                let _ = std::io::stderr().flush();
+            }
+            return Ok(String::new());
+        }
+        if let Some(ch) = self.channels.get_mut(chan) {
+            match ch {
+                OpenChannel::File { file, .. } => {
+                    let _ = file.flush();
+                }
+                OpenChannel::Pipe {
+                    stdin: Some(sin), ..
+                } => {
+                    let _ = sin.flush();
+                }
+                OpenChannel::Pipe { stdin: None, .. } => {}
             }
         }
         Ok(String::new())
@@ -2848,27 +3091,121 @@ impl TclInterp {
         if args.is_empty() {
             return Err(TclControl::Error("wrong # args to gets".to_string()));
         }
+        let chan = args[0].as_str();
         let mut content = String::new();
-        if let Some(ch) = self.channels.get_mut(&args[0]) {
-            let mut byte = [0u8; 1];
-            let mut buf = Vec::new();
-            while let Ok(1) = ch.file.read(&mut byte) {
-                if byte[0] == b'\n' {
-                    break;
+        let mut hit_eof = false;
+
+        if chan == "stdin" {
+            if self.subprocess_mode {
+                let stdin = std::io::stdin();
+                let mut lock = stdin.lock();
+                let mut line = String::new();
+                match lock.read_line(&mut line) {
+                    Ok(0) | Err(_) => {
+                        self.stdin_eof = true;
+                        hit_eof = true;
+                    }
+                    Ok(_) => {
+                        if line.ends_with("\r\n") {
+                            line.truncate(line.len() - 2);
+                        } else if line.ends_with('\n') {
+                            line.pop();
+                        }
+                        content = line;
+                    }
                 }
-                if byte[0] != b'\r' {
-                    buf.push(byte[0]);
+            } else {
+                self.stdin_eof = true;
+                hit_eof = true;
+            }
+        } else if let Some(ch) = self.channels.get_mut(chan) {
+            match ch {
+                OpenChannel::File { file, eof, .. } => {
+                    let mut byte = [0u8; 1];
+                    let mut buf = Vec::new();
+                    let mut read_any = false;
+                    while let Ok(1) = file.read(&mut byte) {
+                        read_any = true;
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                        if byte[0] != b'\r' {
+                            buf.push(byte[0]);
+                        }
+                    }
+                    if !read_any {
+                        *eof = true;
+                        hit_eof = true;
+                    } else {
+                        content = String::from_utf8_lossy(&buf).into_owned();
+                    }
+                }
+                OpenChannel::Pipe {
+                    stdout: Some(sout),
+                    eof,
+                    ..
+                } => {
+                    let mut line = String::new();
+                    match sout.read_line(&mut line) {
+                        Ok(0) | Err(_) => {
+                            *eof = true;
+                            hit_eof = true;
+                        }
+                        Ok(_) => {
+                            if line.ends_with("\r\n") {
+                                line.truncate(line.len() - 2);
+                            } else if line.ends_with('\n') {
+                                line.pop();
+                            }
+                            content = line;
+                        }
+                    }
+                }
+                OpenChannel::Pipe {
+                    stdout: None, eof, ..
+                } => {
+                    *eof = true;
+                    hit_eof = true;
                 }
             }
-            content = String::from_utf8_lossy(&buf).into_owned();
         }
+
         if let Some(var) = args.get(1) {
-            let len = content.chars().count();
-            self.set_var(var, content).map_err(TclControl::Error)?;
-            Ok(len.to_string())
+            if hit_eof {
+                self.set_var(var, String::new())
+                    .map_err(TclControl::Error)?;
+                Ok("-1".to_string())
+            } else {
+                let len = content.chars().count();
+                self.set_var(var, content).map_err(TclControl::Error)?;
+                Ok(len.to_string())
+            }
         } else {
             Ok(content)
         }
+    }
+
+    fn cmd_eof(&mut self, args: &[String]) -> TclResult<String> {
+        let Some(chan) = args.first().map(String::as_str) else {
+            return Err(TclControl::Error("wrong # args to eof".to_string()));
+        };
+        if chan == "stdin" {
+            return Ok(if self.stdin_eof { "1" } else { "0" }.to_string());
+        }
+        if let Some(ref host_rc) = self.host
+            && crate::harness::has_incrblob_channel(host_rc, chan)
+        {
+            return Ok(if crate::harness::incrblob_eof(host_rc, chan) {
+                "1"
+            } else {
+                "0"
+            }
+            .to_string());
+        }
+        if let Some(ch) = self.channels.get(chan) {
+            return Ok(if ch.is_eof() { "1" } else { "0" }.to_string());
+        }
+        Ok("0".to_string())
     }
 
     fn cmd_read(&mut self, args: &[String]) -> TclResult<String> {
@@ -2881,17 +3218,58 @@ impl TclInterp {
         let Some(chan_id) = args.get(i) else {
             return Err(TclControl::Error("wrong # args to read".to_string()));
         };
+        if let Some(ref host_rc) = self.host
+            && crate::harness::has_incrblob_channel(host_rc, chan_id)
+        {
+            return crate::harness::incrblob_read(
+                host_rc,
+                chan_id,
+                args.get(i + 1).map(String::as_str),
+                nonewline,
+            );
+        }
         let mut buf = Vec::new();
         let mut is_binary = false;
         if let Some(ch) = self.channels.get_mut(chan_id) {
-            is_binary = ch.binary;
-            if let Some(n_str) = args.get(i + 1) {
-                let n = parse_tcl_int(n_str).unwrap_or(0).max(0) as usize;
-                buf.resize(n, 0);
-                let k = ch.file.read(&mut buf).unwrap_or(0);
-                buf.truncate(k);
-            } else {
-                let _ = ch.file.read_to_end(&mut buf);
+            is_binary = ch.is_binary();
+            match ch {
+                OpenChannel::File { file, eof, .. } => {
+                    if let Some(n_str) = args.get(i + 1) {
+                        let n = parse_tcl_int(n_str).unwrap_or(0).max(0) as usize;
+                        buf.resize(n, 0);
+                        let k = file.read(&mut buf).unwrap_or(0);
+                        if k < n {
+                            *eof = true;
+                        }
+                        buf.truncate(k);
+                    } else {
+                        let _ = file.read_to_end(&mut buf);
+                        *eof = true;
+                    }
+                }
+                OpenChannel::Pipe {
+                    stdout: Some(sout),
+                    eof,
+                    ..
+                } => {
+                    if let Some(n_str) = args.get(i + 1) {
+                        let n = parse_tcl_int(n_str).unwrap_or(0).max(0) as usize;
+                        buf.resize(n, 0);
+                        let k = sout.read(&mut buf).unwrap_or(0);
+                        if k < n {
+                            *eof = true;
+                        }
+                        buf.truncate(k);
+                    } else {
+                        let _ = sout.read_to_end(&mut buf);
+                        *eof = true;
+                    }
+                }
+                OpenChannel::Pipe {
+                    stdout: None, eof, ..
+                } => {
+                    *eof = true;
+                }
             }
         }
         let mut s = if is_binary {
@@ -2907,34 +3285,126 @@ impl TclInterp {
 
     fn cmd_close(&mut self, args: &[String]) -> TclResult<String> {
         if let Some(id) = args.first() {
-            self.channels.remove(id);
+            if let Some(ref host_rc) = self.host
+                && crate::harness::has_incrblob_channel(host_rc, id)
+            {
+                return crate::harness::incrblob_close(host_rc, id);
+            }
+            if let Some(mut ch) = self.channels.remove(id) {
+                ch.close_bounded();
+            }
         }
         Ok(String::new())
     }
 
     fn cmd_seek(&mut self, args: &[String]) -> TclResult<String> {
-        if args.len() >= 2
-            && let Some(ch) = self.channels.get_mut(&args[0])
-        {
-            let off = parse_tcl_int(&args[1]).unwrap_or(0);
-            let pos = match args.get(2).map_or("start", String::as_str) {
-                "current" => SeekFrom::Current(off),
-                "end" => SeekFrom::End(off),
-                _ => SeekFrom::Start(off.max(0) as u64),
-            };
-            let _ = ch.file.seek(pos);
+        if args.len() >= 2 {
+            if let Some(ref host_rc) = self.host
+                && crate::harness::has_incrblob_channel(host_rc, &args[0])
+            {
+                return crate::harness::incrblob_seek(host_rc, &args[0], &args[1..]);
+            }
+            if let Some(OpenChannel::File { file, eof, .. }) = self.channels.get_mut(&args[0]) {
+                let off = parse_tcl_int(&args[1]).unwrap_or(0);
+                let pos = match args.get(2).map_or("start", String::as_str) {
+                    "current" => SeekFrom::Current(off),
+                    "end" => SeekFrom::End(off),
+                    _ => SeekFrom::Start(off.max(0) as u64),
+                };
+                let _ = file.seek(pos);
+                *eof = false;
+            }
         }
         Ok(String::new())
     }
 
     fn cmd_tell(&mut self, args: &[String]) -> TclResult<String> {
-        if let Some(id) = args.first()
-            && let Some(ch) = self.channels.get_mut(id)
-            && let Ok(pos) = ch.file.stream_position()
-        {
-            return Ok(pos.to_string());
+        if let Some(id) = args.first() {
+            if let Some(ref host_rc) = self.host
+                && crate::harness::has_incrblob_channel(host_rc, id)
+            {
+                return crate::harness::incrblob_tell(host_rc, id);
+            }
+            if let Some(OpenChannel::File { file, .. }) = self.channels.get_mut(id)
+                && let Ok(pos) = file.stream_position()
+            {
+                return Ok(pos.to_string());
+            }
         }
         Ok("0".to_string())
+    }
+
+    fn cmd_after(&mut self, args: &[String]) -> TclResult<String> {
+        if args.len() == 1
+            && let Some(ms) = parse_tcl_int(&args[0])
+            && ms > 0
+        {
+            std::thread::sleep(Duration::from_millis((ms as u64).min(100)));
+        }
+        Ok(String::new())
+    }
+
+    fn cmd_exec(&mut self, args: &[String]) -> TclResult<String> {
+        if args.is_empty() {
+            return Err(TclControl::Error("wrong # args to exec".to_string()));
+        }
+        if args.last().map(String::as_str) == Some("&") {
+            let cmd_args = &args[..args.len() - 1];
+            if cmd_args.is_empty() {
+                return Err(TclControl::Error("wrong # args to exec".to_string()));
+            }
+            let child = Command::new(&cmd_args[0])
+                .args(&cmd_args[1..])
+                .current_dir(&self.cwd)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| TclControl::Error(e.to_string()))?;
+            let pid = child.id().to_string();
+            self.bg_children.push(child);
+            return Ok(pid);
+        }
+        let output = Command::new(&args[0])
+            .args(&args[1..])
+            .current_dir(&self.cwd)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| TclControl::Error(e.to_string()))?;
+        if !output.status.success() {
+            let err_str = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let out_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let msg = if !err_str.is_empty() {
+                err_str
+            } else if !out_str.is_empty() {
+                out_str
+            } else {
+                "child process exited abnormally".to_string()
+            };
+            return Err(TclControl::Error(msg));
+        }
+        let mut out_str = String::from_utf8_lossy(&output.stdout).into_owned();
+        if out_str.ends_with("\r\n") {
+            out_str.truncate(out_str.len() - 2);
+        } else if out_str.ends_with('\n') {
+            out_str.pop();
+        }
+        Ok(out_str)
+    }
+
+    fn cmd_exit(&mut self, args: &[String]) -> TclResult<String> {
+        let code = args.first().and_then(|s| parse_tcl_int(s)).unwrap_or(0) as i32;
+        if self.subprocess_mode {
+            self.channels.clear();
+            self.kill_bg_children();
+            if let Some(ref host_rc) = self.host {
+                crate::harness::close_all_host_connections(host_rc);
+            }
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            std::process::exit(code);
+        }
+        Err(TclControl::FinishTest)
     }
 
     fn cmd_time(&mut self, args: &[String]) -> TclResult<String> {
@@ -3705,4 +4175,52 @@ fn tcl_binary_scan(data: &[u8], fmt: &str, max_vars: usize) -> TclResult<Vec<Opt
     }
 
     Ok(out)
+}
+
+static TESTFIXTURE_BIN_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn resolve_testfixture_binary() -> PathBuf {
+    TESTFIXTURE_BIN_PATH
+        .get_or_init(|| {
+            let bin_name = if cfg!(windows) {
+                "testfixture.exe"
+            } else {
+                "testfixture"
+            };
+            if let Ok(exe) = std::env::current_exe() {
+                if exe.file_name().is_some_and(|n| n == bin_name) && exe.exists() {
+                    return exe;
+                }
+                if let Some(parent) = exe.parent() {
+                    let profile_dir = if parent.file_name().is_some_and(|n| n == "deps") {
+                        parent.parent().unwrap_or(parent)
+                    } else {
+                        parent
+                    };
+                    let candidate = profile_dir.join(bin_name);
+                    if candidate.exists() {
+                        return candidate;
+                    }
+                    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+                    let manifest_dir =
+                        std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+                    let _ = Command::new(cargo)
+                        .current_dir(manifest_dir)
+                        .args([
+                            "build",
+                            "--quiet",
+                            "-p",
+                            "sqliters-tcltest",
+                            "--bin",
+                            "testfixture",
+                        ])
+                        .status();
+                    if candidate.exists() {
+                        return candidate;
+                    }
+                }
+            }
+            PathBuf::from(bin_name)
+        })
+        .clone()
 }

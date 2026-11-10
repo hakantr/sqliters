@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "pending Phase 6 Online Backup API (sqlite3_backup)"]
 fn test_walbak() {
     let raw = include_str!("../../sqlite/test/walbak.test");
     let script = sqliters_tcltest::strip_test_comments(raw);

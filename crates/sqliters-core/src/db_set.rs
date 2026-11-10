@@ -208,6 +208,7 @@ pub struct DatabaseSet {
     max_attached: usize,
     enable_view: bool,
     enable_trigger: bool,
+    dqs_dml: bool,
     expr_depth_limit: usize,
     column_limit: usize,
     trigger_steps_limit: usize,
@@ -277,6 +278,7 @@ impl DatabaseSet {
             max_attached: SQLITE_MAX_ATTACHED,
             enable_view: true,
             enable_trigger: true,
+            dqs_dml: false,
             expr_depth_limit: SQLITE_MAX_EXPR_DEPTH,
             column_limit: SQLITE_MAX_COLUMN,
             trigger_steps_limit: SQLITE_MAX_TRIGGER_STEPS,
@@ -446,6 +448,19 @@ impl DatabaseSet {
     pub fn set_enable_trigger(&mut self, enabled: bool) -> bool {
         self.enable_trigger = enabled;
         self.enable_trigger
+    }
+
+    /// Whether double-quoted string literals in DML are enabled (`SQLITE_DBCONFIG_DQS_DML`).
+    #[inline]
+    pub const fn dqs_dml(&self) -> bool {
+        self.dqs_dml
+    }
+
+    /// Updates `SQLITE_DBCONFIG_DQS_DML`, returning the new setting.
+    #[inline]
+    pub fn set_dqs_dml(&mut self, enabled: bool) -> bool {
+        self.dqs_dml = enabled;
+        self.dqs_dml
     }
 
     /// Current `SQLITE_LIMIT_TRIGGER_STEPS` limit on this connection.

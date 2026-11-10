@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "requires Phase 6 Tcl user-defined SQL function and collation callbacks (db func, db collate); pure-SQL subtests verified in phase5_window_analyze_planner_gate"]
 fn test_window6() {
     let raw = include_str!("../../sqlite/test/window6.test");
     let script = sqliters_tcltest::strip_test_comments(raw);

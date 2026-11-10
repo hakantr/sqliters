@@ -2248,6 +2248,10 @@ pub fn expr_is_table_independent(expr: &Expr) -> bool {
 }
 
 pub fn expr_contains_aggregate(expr: &Expr) -> bool {
+    expr_contains_aggregate_with_functions(expr, &FunctionRegistry::default())
+}
+
+pub fn expr_contains_aggregate_with_functions(expr: &Expr, functions: &FunctionRegistry) -> bool {
     match expr {
         Expr::FunctionCall {
             name,
@@ -2259,84 +2263,120 @@ pub fn expr_contains_aggregate(expr: &Expr) -> bool {
             if let Some(wref) = over {
                 let in_args = match args {
                     FunctionArgs::Star => false,
-                    FunctionArgs::Exprs(es) => es.iter().any(expr_contains_aggregate),
+                    FunctionArgs::Exprs(es) => es
+                        .iter()
+                        .any(|e| expr_contains_aggregate_with_functions(e, functions)),
                 };
                 let in_over = match wref {
                     WindowRef::Name(_) => false,
                     WindowRef::Spec(ws) => {
-                        ws.partition_by.iter().any(expr_contains_aggregate)
-                            || ws
-                                .order_by
-                                .iter()
-                                .any(|ob| expr_contains_aggregate(&ob.expr))
+                        ws.partition_by
+                            .iter()
+                            .any(|e| expr_contains_aggregate_with_functions(e, functions))
+                            || ws.order_by.iter().any(|ob| {
+                                expr_contains_aggregate_with_functions(&ob.expr, functions)
+                            })
                     }
                 };
                 return in_args
-                    || filter.as_deref().is_some_and(expr_contains_aggregate)
+                    || filter
+                        .as_deref()
+                        .is_some_and(|e| expr_contains_aggregate_with_functions(e, functions))
                     || in_over;
             }
             let is_agg = match args {
-                FunctionArgs::Star => AggregateKind::from_name(name, true).is_some(),
+                FunctionArgs::Star => {
+                    functions.find_aggregate(name, 0).is_some()
+                        || functions.has_aggregate_name(name)
+                        || AggregateKind::from_name(name, true).is_some()
+                }
                 FunctionArgs::Exprs(es) => {
-                    let upper = name.to_ascii_uppercase();
-                    if (upper == "MIN" || upper == "MAX") && es.len() != 1 {
+                    if functions.find_scalar(name, es.len()).is_some() {
                         false
-                    } else if upper == "COUNT" && es.is_empty() {
+                    } else if functions.find_aggregate(name, es.len()).is_some()
+                        || functions.has_aggregate_name(name)
+                    {
                         true
                     } else {
-                        AggregateKind::from_name(name, false).is_some()
+                        let upper = name.to_ascii_uppercase();
+                        if (upper == "MIN" || upper == "MAX") && es.len() != 1 {
+                            false
+                        } else if upper == "COUNT" && es.is_empty() {
+                            true
+                        } else {
+                            AggregateKind::from_name(name, false).is_some()
+                        }
                     }
                 }
             };
             if is_agg {
                 return true;
             }
-            filter.as_deref().is_some_and(expr_contains_aggregate)
+            filter
+                .as_deref()
+                .is_some_and(|e| expr_contains_aggregate_with_functions(e, functions))
                 || match args {
                     FunctionArgs::Star => false,
-                    FunctionArgs::Exprs(es) => es.iter().any(expr_contains_aggregate),
+                    FunctionArgs::Exprs(es) => es
+                        .iter()
+                        .any(|e| expr_contains_aggregate_with_functions(e, functions)),
                 }
         }
         Expr::Unary { expr, .. }
         | Expr::Collate { expr, .. }
         | Expr::IsNull { expr, .. }
-        | Expr::Cast { expr, .. } => expr_contains_aggregate(expr),
+        | Expr::Cast { expr, .. } => expr_contains_aggregate_with_functions(expr, functions),
         Expr::Binary { left, right, .. } => {
-            expr_contains_aggregate(left) || expr_contains_aggregate(right)
+            expr_contains_aggregate_with_functions(left, functions)
+                || expr_contains_aggregate_with_functions(right, functions)
         }
         Expr::Between {
             expr, low, high, ..
         } => {
-            expr_contains_aggregate(expr)
-                || expr_contains_aggregate(low)
-                || expr_contains_aggregate(high)
+            expr_contains_aggregate_with_functions(expr, functions)
+                || expr_contains_aggregate_with_functions(low, functions)
+                || expr_contains_aggregate_with_functions(high, functions)
         }
         Expr::InList { expr, list, .. } => {
-            expr_contains_aggregate(expr) || list.iter().any(expr_contains_aggregate)
+            expr_contains_aggregate_with_functions(expr, functions)
+                || list
+                    .iter()
+                    .any(|e| expr_contains_aggregate_with_functions(e, functions))
         }
-        Expr::InTable { expr, .. } | Expr::InSubquery { expr, .. } => expr_contains_aggregate(expr),
+        Expr::InTable { expr, .. } | Expr::InSubquery { expr, .. } => {
+            expr_contains_aggregate_with_functions(expr, functions)
+        }
         Expr::Like {
             expr,
             pattern,
             escape,
             ..
         } => {
-            expr_contains_aggregate(expr)
-                || expr_contains_aggregate(pattern)
-                || escape.as_deref().is_some_and(expr_contains_aggregate)
+            expr_contains_aggregate_with_functions(expr, functions)
+                || expr_contains_aggregate_with_functions(pattern, functions)
+                || escape
+                    .as_deref()
+                    .is_some_and(|e| expr_contains_aggregate_with_functions(e, functions))
         }
         Expr::Case {
             operand,
             branches,
             else_expr,
         } => {
-            operand.as_deref().is_some_and(expr_contains_aggregate)
-                || branches
-                    .iter()
-                    .any(|(w, t)| expr_contains_aggregate(w) || expr_contains_aggregate(t))
-                || else_expr.as_deref().is_some_and(expr_contains_aggregate)
+            operand
+                .as_deref()
+                .is_some_and(|e| expr_contains_aggregate_with_functions(e, functions))
+                || branches.iter().any(|(w, t)| {
+                    expr_contains_aggregate_with_functions(w, functions)
+                        || expr_contains_aggregate_with_functions(t, functions)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(|e| expr_contains_aggregate_with_functions(e, functions))
         }
-        Expr::RowValue(elems) => elems.iter().any(expr_contains_aggregate),
+        Expr::RowValue(elems) => elems
+            .iter()
+            .any(|e| expr_contains_aggregate_with_functions(e, functions)),
         _ => false,
     }
 }
@@ -2673,18 +2713,21 @@ where
     // Check for aggregates or subqueries in projection / selection / order_by / limit
     for rc in projection {
         if let ResultColumn::Expr { expr, .. } = rc
-            && (expr_contains_aggregate(expr) || expr_contains_subquery(expr))
+            && (expr_contains_aggregate_with_functions(expr, functions)
+                || expr_contains_subquery(expr))
         {
             return Ok(None);
         }
     }
     if let Some(w) = selection
-        && (expr_contains_aggregate(w) || expr_contains_subquery(w))
+        && (expr_contains_aggregate_with_functions(w, functions) || expr_contains_subquery(w))
     {
         return Ok(None);
     }
     for ob in &stmt.order_by {
-        if expr_contains_aggregate(&ob.expr) || expr_contains_subquery(&ob.expr) {
+        if expr_contains_aggregate_with_functions(&ob.expr, functions)
+            || expr_contains_subquery(&ob.expr)
+        {
             return Ok(None);
         }
     }
@@ -2700,13 +2743,12 @@ where
             if !stmt.order_by.is_empty() {
                 // Trivial 1-row tableless query; ORDER BY is a no-op if valid
             }
-            let prog = compile_tableless_select(
+            compile_tableless_select(
                 projection,
                 selection.as_ref(),
                 stmt.limit.as_ref(),
                 functions,
-            )?;
-            Ok(Some(prog))
+            )
         }
         Some(FromClause { head, joins }) if joins.is_empty() => {
             let TableOrSubquery::Table {
@@ -2752,7 +2794,7 @@ fn compile_tableless_select(
     selection: Option<&Expr>,
     limit: Option<&LimitClause>,
     functions: &FunctionRegistry,
-) -> Result<VdbeProgram> {
+) -> Result<Option<VdbeProgram>> {
     let mut prog = VdbeProgram::new();
     let init_addr = prog.emit(Instruction::new(Opcode::Init, 0, 0, 0));
 
@@ -2783,7 +2825,9 @@ fn compile_tableless_select(
 
     if let Some(lim) = limit {
         let lim_reg = prog.alloc_register();
-        compile_expr(&mut prog, &lim.limit, None, functions, lim_reg)?;
+        if compile_expr(&mut prog, &lim.limit, None, functions, lim_reg).is_err() {
+            return Ok(None);
+        }
         let zero_reg = prog.alloc_register();
         prog.emit(Instruction::new(Opcode::Integer, 0, zero_reg, 0));
         let le_reg = prog.alloc_register();
@@ -2792,7 +2836,9 @@ fn compile_tableless_select(
 
         if let Some(off_expr) = &lim.offset {
             let off_reg = prog.alloc_register();
-            compile_expr(&mut prog, off_expr, None, functions, off_reg)?;
+            if compile_expr(&mut prog, off_expr, None, functions, off_reg).is_err() {
+                return Ok(None);
+            }
             let gt_reg = prog.alloc_register();
             prog.emit(Instruction::new(Opcode::Gt, off_reg, zero_reg, gt_reg));
             jumps_to_halt.push(prog.emit(Instruction::new(Opcode::JumpIfTrue, gt_reg, 0, 0)));
@@ -2801,13 +2847,17 @@ fn compile_tableless_select(
 
     if let Some(w) = selection {
         let cond_reg = prog.alloc_register();
-        compile_expr(&mut prog, w, None, functions, cond_reg)?;
+        if compile_expr(&mut prog, w, None, functions, cond_reg).is_err() {
+            return Ok(None);
+        }
         jumps_to_halt.push(prog.emit(Instruction::new(Opcode::JumpIfFalse, cond_reg, 0, 1)));
     }
 
     let out_base = prog.alloc_registers(proj_exprs.len());
     for (i, e) in proj_exprs.iter().enumerate() {
-        compile_expr(&mut prog, e, None, functions, out_base + i as i32)?;
+        if compile_expr(&mut prog, e, None, functions, out_base + i as i32).is_err() {
+            return Ok(None);
+        }
     }
     prog.emit(Instruction::new(
         Opcode::ResultRow,
@@ -2821,7 +2871,7 @@ fn compile_tableless_select(
         prog.patch_p2(j, halt_addr);
     }
     prog.patch_p2(init_addr, 1);
-    Ok(prog)
+    Ok(Some(prog))
 }
 
 struct SingleTableSource<'a> {

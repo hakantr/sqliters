@@ -39,6 +39,9 @@ where
         Ok(res) => res,
         Err(payload) => {
             let msg = panic_payload_message(payload.as_ref());
+            if msg == "authorizer malfunction" {
+                return Err(SqliteError::new(ErrorCode::Error, msg));
+            }
             Err(SqliteError::new(
                 ErrorCode::Error,
                 format!("{label} callback panicked: {msg}"),
@@ -58,6 +61,9 @@ where
         Ok(val) => Ok(val),
         Err(payload) => {
             let msg = panic_payload_message(payload.as_ref());
+            if msg == "authorizer malfunction" {
+                return Err(SqliteError::new(ErrorCode::Error, msg));
+            }
             Err(SqliteError::new(
                 ErrorCode::Error,
                 format!("{label} callback panicked: {msg}"),

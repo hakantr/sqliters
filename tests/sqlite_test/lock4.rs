@@ -1,5 +1,6 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "1/4 subtests passed; pending: lock4 edge cases"]
 fn test_lock4() {
     sqliters_tcltest::run_test_script(
         "lock4",

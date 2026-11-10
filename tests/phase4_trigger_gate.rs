@@ -268,21 +268,24 @@ fn phase4_gate_c_reference_and_manifest_audit() {
         "wal",
         "windowfunc",
         "analyze",
+        "auth",
+        "progress",
+        "trace",
+        "incrblob",
+        "lfs",
         "xfer_opt",
     ] {
         assert_eq!(
             cap_map.get(enabled_cap),
             Some(&true),
-            "capability `{enabled_cap}` must be enabled in Phase 5"
+            "capability `{enabled_cap}` must be enabled in Phase 6"
         );
     }
-    for pending_cap in [
-        "stat4", "auth", "progress", "trace", "incrblob", "vtab", "fts5", "rtree", "json", "json1",
-    ] {
+    for pending_cap in ["stat4", "vtab", "fts5", "rtree", "json", "json1"] {
         assert_eq!(
             cap_map.get(pending_cap),
             Some(&false),
-            "Phase 6..7 capability `{pending_cap}` must remain false in Phase 5"
+            "Phase 7 capability `{pending_cap}` must remain false in Phase 6"
         );
     }
 
@@ -378,11 +381,8 @@ finish_test
         p4_total, 18,
         "expected 18 Phase 4 wrappers (altertrig + trigger1..9, triggerA..G, triggerupfrom)"
     );
-    assert_eq!(p4_active, 17, "expected 17 active Phase 4 manifest suites");
-    assert_eq!(
-        p4_ignored, 1,
-        "expected 1 ignored Phase 4 manifest suite (trigger6)"
-    );
+    assert_eq!(p4_active, 18, "expected 18 active Phase 4 manifest suites");
+    assert_eq!(p4_ignored, 0, "expected 0 ignored Phase 4 manifest suites");
     assert_eq!(
         p4_active_ids,
         vec![
@@ -392,6 +392,7 @@ finish_test
             "sqlite/test/trigger3.test",
             "sqlite/test/trigger4.test",
             "sqlite/test/trigger5.test",
+            "sqlite/test/trigger6.test",
             "sqlite/test/trigger7.test",
             "sqlite/test/trigger8.test",
             "sqlite/test/trigger9.test",

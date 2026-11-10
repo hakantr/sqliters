@@ -945,13 +945,14 @@ fn explicit_capability_table_and_zero_subtest_guard() {
     assert_eq!(phase1_capability("trigger"), Some(true));
     assert_eq!(phase1_capability("windowfunc"), Some(true));
     assert_eq!(phase1_capability("analyze"), Some(true));
+    assert_eq!(phase1_capability("progress"), Some(true));
+    assert_eq!(phase1_capability("trace"), Some(true));
+    assert_eq!(phase1_capability("auth"), Some(true));
+    assert_eq!(phase1_capability("incrblob"), Some(true));
+    assert_eq!(phase1_capability("lfs"), Some(true));
     assert_eq!(phase1_capability("default_autovacuum"), Some(false));
     for disabled in [
         "stat4",
-        "progress",
-        "trace",
-        "auth",
-        "incrblob",
         "vtab",
         "rtree",
         "fts5",
@@ -968,7 +969,7 @@ fn explicit_capability_table_and_zero_subtest_guard() {
         assert_eq!(
             phase1_capability(disabled),
             Some(false),
-            "capability `{disabled}` must be explicitly 0 in Phase 5"
+            "capability `{disabled}` must be explicitly 0 in Phase 6"
         );
     }
     assert_eq!(phase1_capability("nonexistent_xyz"), None);
@@ -1011,7 +1012,7 @@ do_test 1.1 {
     [capable prefer_proxy_locking] \
     [capable nonexistent_xyz] \
     [capable !nonexistent_xyz]
-} {1 1 1 1 1 1 1 0 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1}
+} {1 1 1 1 1 1 1 0 1 1 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 1}
 
 finish_test
 "#;

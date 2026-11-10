@@ -12,8 +12,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use sqliters_core::{
-    CloseError, Connection, ConnectionOpenOptions, PrepareMode, Row, Statement, StepResult,
-    WalCheckpointMode,
+    AuthorizerResult, Backup, BackupStepResult, Blob, CloseError, Connection,
+    ConnectionOpenOptions, FunctionFlags, PrepareMode, Row, RowMutationOp, RuntimeValue, Statement,
+    StepResult, WalCheckpointMode, WindowAggregateInstance,
 };
 use sqliters_types::{ErrorCode, LockGeometry, SqliteError, Value, extended, format_sqlite_real};
 use sqliters_vfs::{LockLevel, OpenFlags, OsVfs, ShmOpenOptions, SyncFlags, Vfs, VfsFile, WalShm};
@@ -85,6 +86,90 @@ pub struct DbId(u64);
 enum HostCmdTarget {
     Builtin(&'static str),
     Db(DbId),
+    Backup(u64),
+}
+
+#[derive(Default, Clone)]
+struct DbCallbackMeta {
+    busy: String,
+    auth: String,
+    disable_auth: usize,
+    progress: String,
+    update_hook: String,
+    commit_hook: String,
+    rollback_hook: String,
+    trace: String,
+    trace_v2: String,
+    wal_hook: String,
+}
+
+struct TclIncrblobChannel {
+    blob: Blob,
+    owner_db_id: DbId,
+    pos: usize,
+    eof: bool,
+}
+
+struct TclBackupHandle {
+    backup: Option<Backup>,
+    dest_conn: Rc<Connection>,
+    src_conn: Rc<Connection>,
+    dest_db_id: DbId,
+}
+
+thread_local! {
+    static INTERP_STACK: RefCell<Vec<TclInterp>> = const { RefCell::new(Vec::new()) };
+}
+
+struct EnterInterpScopeGuard<'a> {
+    slot: &'a mut TclInterp,
+}
+
+fn enter_interp_scope<'a>(interp: &'a mut TclInterp) -> EnterInterpScopeGuard<'a> {
+    let real = std::mem::replace(interp, TclInterp::new_dummy());
+    INTERP_STACK.with(|stack| stack.borrow_mut().push(real));
+    EnterInterpScopeGuard { slot: interp }
+}
+
+impl Drop for EnterInterpScopeGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(real) = INTERP_STACK.with(|stack| stack.borrow_mut().pop()) {
+            *self.slot = real;
+        }
+    }
+}
+
+struct CheckoutInterpGuard {
+    interp: Option<TclInterp>,
+}
+
+impl Drop for CheckoutInterpGuard {
+    fn drop(&mut self) {
+        if let Some(interp) = self.interp.take() {
+            INTERP_STACK.with(|stack| stack.borrow_mut().push(interp));
+        }
+    }
+}
+
+fn with_active_interp<R, F: FnOnce(&mut TclInterp) -> R>(f: F) -> Option<R> {
+    let popped = INTERP_STACK.with(|stack| stack.borrow_mut().pop())?;
+    let mut guard = CheckoutInterpGuard {
+        interp: Some(popped),
+    };
+    let res = f(guard.interp.as_mut().unwrap());
+    Some(res)
+}
+
+fn eval_global_in_active_interp(script: &str) -> Option<(TclResult<String>, bool)> {
+    with_active_interp(|interp| {
+        let saved_frame = interp.frame_idx_internal();
+        interp.set_frame_idx_internal(0);
+        interp.last_result_is_bytearray = false;
+        let res = interp.eval(script);
+        let is_bytearray = interp.last_result_is_bytearray;
+        interp.set_frame_idx_internal(saved_frame);
+        (res, is_bytearray)
+    })
 }
 
 struct DbHandle {
@@ -97,6 +182,7 @@ struct DbHandle {
     cmd_registered: bool,
     eval_refs: usize,
     tx_depth: usize,
+    cb_meta: Rc<RefCell<DbCallbackMeta>>,
 }
 
 enum DbSlot {
@@ -107,6 +193,7 @@ enum DbSlot {
         cmd_registered: bool,
         eval_refs: usize,
         tx_depth: usize,
+        cb_meta: Rc<RefCell<DbCallbackMeta>>,
     },
 }
 
@@ -229,9 +316,26 @@ const DEFAULT_HOST_BUILTINS: &[(&str, &str)] = &[
     ("register_echo_module", "noop_zero"),
     ("register_tcl_module", "noop_zero"),
     ("load_static_extension", "noop_zero"),
-    ("sqlite3_create_function", "noop_zero"),
-    ("sqlite3_create_function_v2", "noop_zero"),
-    ("sqlite3_create_collation_v2", "noop_zero"),
+    ("sqlite3_create_function", "sqlite3_create_function"),
+    ("sqlite3_create_function_v2", "sqlite3_create_function_v2"),
+    ("sqlite3_create_collation_v2", "sqlite3_create_collation_v2"),
+    ("add_test_collate", "add_test_collate"),
+    ("sqlite_delete_function", "sqlite_delete_function"),
+    ("sqlite_delete_collation", "sqlite_delete_collation"),
+    (
+        "sqlite3_create_window_function",
+        "sqlite3_create_window_function",
+    ),
+    ("create_window_function", "sqlite3_create_window_function"),
+    (
+        "test_create_window_function_misuse",
+        "test_create_window_function_misuse",
+    ),
+    ("test_create_sumint", "test_create_sumint"),
+    ("test_override_sum", "test_override_sum"),
+    ("sqlite3_create_aggregate", "sqlite3_create_aggregate"),
+    ("sqlite3_backup", "sqlite3_backup"),
+    ("sqlite3_busy_timeout", "sqlite3_busy_timeout"),
     ("sqlite3_rekey", "noop_zero"),
     ("sqlite3_key", "noop_zero"),
     ("optimization_control", "noop_zero"),
@@ -250,10 +354,11 @@ const DEFAULT_HOST_BUILTINS: &[(&str, &str)] = &[
 /// Every unverified, future-phase, or out-of-scope capability is explicitly `false`,
 /// and any unknown capability name evaluates to `None` (`false` + recorded in diagnostics).
 pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
-    // Verified Phase 1.1..Phase 5 SQL, B-tree, pager, WAL, VFS, and lifecycle capabilities:
+    // Verified Phase 1.1..Phase 6 SQL, B-tree, pager, WAL, VFS, and lifecycle capabilities:
     ("altertable", true),
     ("analyze", true),
     ("attach", true),
+    ("auth", true),
     ("autoinc", true),
     ("autoreset", true),
     ("autovacuum", true),
@@ -278,7 +383,9 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("foreignkey", true),
     ("generated", true),
     ("incr_vacuum", true),
+    ("incrblob", true),
     ("integrityck", true),
+    ("lfs", true),
     ("like_match_blobs", true),
     ("like_opt", true),
     ("localtime", true),
@@ -288,6 +395,7 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("pager_pragmas", true),
     ("pragma", true),
     ("printf", true),
+    ("progress", true),
     ("reindex", true),
     ("returning", true),
     ("rowvalue", true),
@@ -298,6 +406,7 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("tclvar", true),
     ("tempdb", true),
     ("threadsafe", true),
+    ("trace", true),
     ("trigger", true),
     ("truncate_opt", true),
     ("upsert", true),
@@ -308,7 +417,6 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("xfer_opt", true),
     // Explicitly disabled (future phases or out of scope):
     ("atomicwrite", false),
-    ("auth", false),
     ("bitvec_test", false),
     ("case_sensitive_like", false),
     ("casesensitivelike", false),
@@ -322,7 +430,6 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("fts5", false),
     ("get_table", false),
     ("icu", false),
-    ("incrblob", false),
     ("json", false),
     ("json1", false),
     ("load_ext", false),
@@ -334,12 +441,10 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("memorymanage", false),
     ("offset_sql_func", false),
     ("prefer_proxy_locking", false),
-    ("progress", false),
     ("proxy_locking", false),
     ("rtree", false),
     ("shared_cache", false),
     ("stat4", false),
-    ("trace", false),
     ("unlock_notify", false),
     ("update_delete_limit", false),
     ("utf16", false),
@@ -546,6 +651,10 @@ pub struct SqliteTestHost {
     next_db_id: u64,
     stmts: HashMap<String, StmtSlot>,
     next_stmt_id: u64,
+    incrblobs: HashMap<String, TclIncrblobChannel>,
+    next_incrblob_id: u64,
+    backups: HashMap<u64, TclBackupHandle>,
+    next_backup_id: u64,
     active_evals: usize,
     default_page_size: u32,
     lock_geometry: LockGeometry,
@@ -560,6 +669,45 @@ pub struct SqliteTestHost {
 }
 
 pub type SharedHost = Rc<RefCell<SqliteTestHost>>;
+
+struct Md5SumAcc(Vec<u8>);
+
+impl WindowAggregateInstance for Md5SumAcc {
+    fn step(&mut self, args: &[RuntimeValue]) -> Result<(), SqliteError> {
+        for rv in args {
+            let bytes: Option<std::borrow::Cow<'_, [u8]>> = match &rv.value {
+                Value::Null => None,
+                Value::Integer(i) => Some(std::borrow::Cow::Owned(i.to_string().into_bytes())),
+                Value::Real(r) => {
+                    Some(std::borrow::Cow::Owned(format_sqlite_real(*r).into_bytes()))
+                }
+                Value::Text(s) => Some(std::borrow::Cow::Borrowed(s.as_bytes())),
+                Value::Blob(b) => Some(std::borrow::Cow::Borrowed(b.as_slice())),
+            };
+            if let Some(b) = bytes {
+                let slice = match b.iter().position(|&c| c == 0) {
+                    Some(nul) => &b[..nul],
+                    None => &b[..],
+                };
+                self.0.extend_from_slice(slice);
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> Result<RuntimeValue, SqliteError> {
+        Ok(RuntimeValue::plain(Value::Text(md5_hex(&self.0))))
+    }
+}
+
+fn register_builtin_test_sql_functions(conn: &Connection) {
+    let _ = conn.create_aggregate_function(
+        "md5sum",
+        -1,
+        FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS,
+        || Box::new(Md5SumAcc(Vec::new())),
+    );
+}
 
 impl SqliteTestHost {
     pub fn new_shared(file_name: &str, sqlite_test_dir: PathBuf) -> SharedHost {
@@ -591,6 +739,10 @@ impl SqliteTestHost {
             next_db_id: 1,
             stmts: HashMap::new(),
             next_stmt_id: 1,
+            incrblobs: HashMap::new(),
+            next_incrblob_id: 1,
+            backups: HashMap::new(),
+            next_backup_id: 1,
             active_evals: 0,
             default_page_size: TESTFIXTURE_DEFAULT_PAGE_SIZE,
             lock_geometry,
@@ -655,6 +807,7 @@ impl SqliteTestHost {
     }
 
     fn register_new_db(&mut self, cmd_name: String, conn: Connection) -> (DbId, String) {
+        register_builtin_test_sql_functions(&conn);
         let db_id = DbId(self.next_db_id);
         self.next_db_id += 1;
         let ptr_token = format!("0x{:x}", db_id.0);
@@ -671,6 +824,7 @@ impl SqliteTestHost {
                 cmd_registered: true,
                 eval_refs: 0,
                 tx_depth: 0,
+                cb_meta: Rc::new(RefCell::new(DbCallbackMeta::default())),
             }),
         );
         self.cmd_table.insert(cmd_name, HostCmdTarget::Db(db_id));
@@ -737,8 +891,10 @@ pub(crate) fn list_host_cmds(host: &SharedHost) -> Vec<String> {
 
 pub(crate) fn delete_host_cmd_if_exists(host: &SharedHost, name: &str) {
     let target = host.borrow_mut().cmd_table.remove(name);
-    if let Some(HostCmdTarget::Db(db_id)) = target {
-        invoke_db_delete_hook(host, db_id);
+    match target {
+        Some(HostCmdTarget::Db(db_id)) => invoke_db_delete_hook(host, db_id),
+        Some(HostCmdTarget::Backup(backup_id)) => invoke_backup_delete_hook(host, backup_id),
+        _ => {}
     }
 }
 
@@ -749,13 +905,206 @@ pub(crate) fn rename_or_delete_host_cmd(host: &SharedHost, old: &str, new: &str)
         )));
     };
     if new.is_empty() {
-        if let HostCmdTarget::Db(db_id) = target {
-            invoke_db_delete_hook(host, db_id);
+        match target {
+            HostCmdTarget::Db(db_id) => invoke_db_delete_hook(host, db_id),
+            HostCmdTarget::Backup(backup_id) => invoke_backup_delete_hook(host, backup_id),
+            HostCmdTarget::Builtin(_) => {}
         }
     } else {
         host.borrow_mut().cmd_table.insert(new.to_string(), target);
     }
     Ok(())
+}
+
+fn invoke_backup_delete_hook(host: &SharedHost, backup_id: u64) {
+    let removed = host.borrow_mut().backups.remove(&backup_id);
+    if let Some(mut h) = removed
+        && let Some(b) = h.backup.take()
+    {
+        let _ = b.finish();
+    }
+}
+
+pub fn close_all_host_connections(host: &SharedHost) {
+    let backup_ids: Vec<u64> = host.borrow().backups.keys().copied().collect();
+    for bid in backup_ids {
+        invoke_backup_delete_hook(host, bid);
+    }
+    let stmts: Vec<Statement> = {
+        let mut h = host.borrow_mut();
+        h.incrblobs.clear();
+        let keys: Vec<String> = h.stmts.keys().cloned().collect();
+        let mut out = Vec::new();
+        for k in keys {
+            if let Some(StmtSlot::Present(rec)) = h.stmts.remove(&k) {
+                out.push(rec.stmt);
+            }
+        }
+        out
+    };
+    for s in stmts {
+        let _ = s.finalize();
+    }
+    let db_entries: Vec<(String, DbId)> = {
+        let h = host.borrow();
+        h.cmd_table
+            .iter()
+            .filter_map(|(k, v)| match v {
+                HostCmdTarget::Db(id) => Some((k.clone(), *id)),
+                _ => None,
+            })
+            .collect()
+    };
+    for (name, id) in db_entries {
+        let _ = db_close_cmd(host, &name, id);
+    }
+    host.borrow_mut().dbs.clear();
+}
+
+fn close_db_incrblobs(host: &SharedHost, db_id: DbId) {
+    let to_close: Vec<TclIncrblobChannel> = {
+        let mut h = host.borrow_mut();
+        let keys: Vec<String> = h
+            .incrblobs
+            .iter()
+            .filter(|(_, ch)| ch.owner_db_id == db_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        keys.into_iter()
+            .filter_map(|k| h.incrblobs.remove(&k))
+            .collect()
+    };
+    for ch in to_close {
+        let _ = ch.blob.close();
+    }
+}
+
+pub(crate) fn has_incrblob_channel(host: &SharedHost, chan_id: &str) -> bool {
+    host.borrow().incrblobs.contains_key(chan_id)
+}
+
+pub(crate) fn incrblob_eof(host: &SharedHost, chan_id: &str) -> bool {
+    host.borrow()
+        .incrblobs
+        .get(chan_id)
+        .is_some_and(|ch| ch.eof)
+}
+
+pub(crate) fn incrblob_read(
+    host: &SharedHost,
+    chan_id: &str,
+    n_arg: Option<&str>,
+    nonewline: bool,
+) -> TclResult<String> {
+    let mut h = host.borrow_mut();
+    let Some(ch) = h.incrblobs.get_mut(chan_id) else {
+        return Err(TclControl::Error(format!(
+            "can not find channel named \"{chan_id}\""
+        )));
+    };
+    let blob_len = ch.blob.len();
+    let avail = blob_len.saturating_sub(ch.pos);
+    let to_read = if let Some(n_str) = n_arg {
+        let req = parse_tcl_int(n_str).unwrap_or(0).max(0) as usize;
+        if req >= avail {
+            ch.eof = true;
+        }
+        req.min(avail)
+    } else {
+        ch.eof = true;
+        avail
+    };
+    let mut buf = vec![0u8; to_read];
+    if to_read > 0 {
+        ch.blob
+            .read_at(&mut buf, ch.pos)
+            .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+        ch.pos += to_read;
+    }
+    let mut s: String = buf.into_iter().map(char::from).collect();
+    if nonewline && s.ends_with('\n') {
+        s.pop();
+    }
+    Ok(s)
+}
+
+pub(crate) fn incrblob_puts(
+    host: &SharedHost,
+    chan_id: &str,
+    msg: &str,
+    nonewline: bool,
+) -> TclResult<String> {
+    let mut h = host.borrow_mut();
+    let Some(ch) = h.incrblobs.get_mut(chan_id) else {
+        return Err(TclControl::Error(format!(
+            "can not find channel named \"{chan_id}\""
+        )));
+    };
+    let mut raw: Vec<u8> = msg.chars().map(|c| (c as u32 & 0xff) as u8).collect();
+    if !nonewline {
+        raw.push(b'\n');
+    }
+    ch.blob
+        .write_at(&raw, ch.pos)
+        .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    ch.pos += raw.len();
+    Ok(String::new())
+}
+
+pub(crate) fn incrblob_seek(
+    host: &SharedHost,
+    chan_id: &str,
+    args: &[String],
+) -> TclResult<String> {
+    let mut h = host.borrow_mut();
+    let Some(ch) = h.incrblobs.get_mut(chan_id) else {
+        return Err(TclControl::Error(format!(
+            "can not find channel named \"{chan_id}\""
+        )));
+    };
+    let off = parse_tcl_int(&args[0])
+        .ok_or_else(|| TclControl::Error(format!("expected integer but got \"{}\"", args[0])))?;
+    let blob_len = ch.blob.len() as i64;
+    let base = match args.get(1).map_or("start", String::as_str) {
+        "start" => 0i64,
+        "current" => ch.pos as i64,
+        "end" => blob_len,
+        other => {
+            return Err(TclControl::Error(format!(
+                "bad origin \"{other}\": must be start, current, or end"
+            )));
+        }
+    };
+    let mut new_pos = base + off;
+    if new_pos < 0 {
+        return Err(TclControl::Error(
+            "error during seek: invalid argument".to_string(),
+        ));
+    }
+    if new_pos > blob_len {
+        new_pos = blob_len;
+    }
+    ch.pos = new_pos as usize;
+    ch.eof = false;
+    Ok(String::new())
+}
+
+pub(crate) fn incrblob_tell(host: &SharedHost, chan_id: &str) -> TclResult<String> {
+    let h = host.borrow();
+    let Some(ch) = h.incrblobs.get(chan_id) else {
+        return Ok("-1".to_string());
+    };
+    Ok(ch.pos.to_string())
+}
+
+pub(crate) fn incrblob_close(host: &SharedHost, chan_id: &str) -> TclResult<String> {
+    let ch_opt = host.borrow_mut().incrblobs.remove(chan_id);
+    if let Some(ch) = ch_opt {
+        ch.blob
+            .close()
+            .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    }
+    Ok(String::new())
 }
 
 /// Equivalent of `DbDeleteCmd` / `delDatabaseRef` in `tclsqlite.c`:
@@ -1020,6 +1369,9 @@ pub fn invoke_host_cmd(
     let target = host.borrow().cmd_table.get(cmd).copied()?;
     match target {
         HostCmdTarget::Db(db_id) => Some(dispatch_db_method(host, interp, cmd, db_id, args)),
+        HostCmdTarget::Backup(backup_id) => {
+            Some(dispatch_backup_method(host, interp, cmd, backup_id, args))
+        }
         HostCmdTarget::Builtin(builtin) => {
             Some(dispatch_host_builtin(host, interp, cmd, builtin, args))
         }
@@ -1317,7 +1669,7 @@ fn dispatch_host_builtin(
         }
         "sqlite3_prepare" => cmd_prepare(host, interp, invoked_name, PrepareMode::V1, args),
         "sqlite3_prepare_v2" => cmd_prepare(host, interp, invoked_name, PrepareMode::V2, args),
-        "sqlite3_step" => cmd_step(host, args),
+        "sqlite3_step" => cmd_step(host, interp, args),
         "sqlite3_column_count" => cmd_col_count(host, false, args),
         "sqlite3_data_count" => cmd_col_count(host, true, args),
         "sqlite3_column_name" => cmd_col_name(host, args),
@@ -1341,19 +1693,35 @@ fn dispatch_host_builtin(
         "sqlite3_bind_parameter_name" => cmd_bind_param_name(host, args),
         "sqlite3_bind_parameter_index" => cmd_bind_param_index(host, args),
         "sqlite3_clear_bindings" => cmd_clear_bindings(host, args),
-        "sqlite3_reset" => cmd_stmt_reset(host, args),
-        "sqlite3_finalize" => cmd_stmt_finalize(host, args),
+        "sqlite3_reset" => cmd_stmt_reset(host, interp, args),
+        "sqlite3_finalize" => cmd_stmt_finalize(host, interp, args),
         "sqlite3_test_control_pending_byte" | "test_control_pending_byte" => {
             cmd_pending_byte(host, invoked_name, args)
         }
-        "sqlite3_wal_checkpoint" => cmd_wal_checkpoint(host, args),
-        "sqlite3_wal_checkpoint_v2" => cmd_wal_checkpoint_v2(host, args),
+        "sqlite3_wal_checkpoint" => cmd_wal_checkpoint(host, interp, args),
+        "sqlite3_wal_checkpoint_v2" => cmd_wal_checkpoint_v2(host, interp, args),
         "sqlite3_wal_autocheckpoint" => cmd_wal_autocheckpoint(host, args),
         "file_control_persist_wal" => cmd_file_control_persist_wal(host, invoked_name, args),
         "sqlite3_db_filename" => cmd_db_filename(host, invoked_name, args),
         "sqlite3_limit" => cmd_sqlite3_limit(host, invoked_name, args),
         "sqlite3_db_config" => cmd_sqlite3_db_config(host, invoked_name, args),
         "decode_hexdb" => cmd_decode_hexdb(args),
+        "sqlite3_backup" => cmd_sqlite3_backup(host, interp, invoked_name, args),
+        "sqlite3_create_window_function" => cmd_create_window_function(host, invoked_name, args),
+        "test_create_window_function_misuse" => {
+            cmd_create_window_function_misuse(host, invoked_name, args)
+        }
+        "test_create_sumint" => cmd_create_sumint(host, invoked_name, args),
+        "test_override_sum" => cmd_override_sum(host, invoked_name, args),
+        "sqlite3_create_aggregate" => cmd_create_aggregate(host, invoked_name, args),
+        "add_test_collate" => cmd_add_test_collate(host, invoked_name, args),
+        "sqlite3_create_collation_v2" => cmd_create_collation_v2(host, invoked_name, args),
+        "sqlite3_create_function" | "sqlite3_create_function_v2" => {
+            cmd_create_function_v2(host, invoked_name, args)
+        }
+        "sqlite_delete_function" => cmd_delete_function(host, invoked_name, args),
+        "sqlite_delete_collation" => cmd_delete_collation(host, invoked_name, args),
+        "sqlite3_busy_timeout" => cmd_busy_timeout(host, invoked_name, args),
         "noop_zero" => Ok("0".to_string()),
         _ => Err(TclControl::Error(format!(
             "invalid command name \"{invoked_name}\""
@@ -1604,25 +1972,25 @@ fn dispatch_db_method(
         }
         "deserialize" => db_deserialize_cmd(host, db_name, db_id, &args[1..]),
         "config" => db_config_subcmd(host, db_name, db_id, &args[1..]),
+        "function" | "func" => db_function_cmd(host, db_name, db_id, &args[1..]),
+        "collate" => db_collate_cmd(host, db_name, db_id, &args[1..]),
+        "busy" => db_busy_cmd(host, db_name, db_id, &args[1..]),
+        "progress" => db_progress_cmd(host, db_name, db_id, &args[1..]),
+        "authorizer" | "auth" => db_authorizer_cmd(host, db_name, db_id, &args[1..]),
+        "update_hook" => db_update_hook_cmd(host, db_name, db_id, &args[1..]),
+        "commit_hook" => db_commit_hook_cmd(host, db_name, db_id, &args[1..]),
+        "rollback_hook" => db_rollback_hook_cmd(host, db_name, db_id, &args[1..]),
+        "trace" => db_trace_cmd(host, db_name, db_id, &args[1..]),
+        "trace_v2" => db_trace_v2_cmd(host, db_name, db_id, &args[1..]),
+        "wal_hook" => db_wal_hook_cmd(host, db_name, db_id, &args[1..]),
+        "incrblob" => db_incrblob_cmd(host, db_name, db_id, &args[1..]),
+        "backup" => db_backup_or_restore_cmd(host, interp, db_name, db_id, false, &args[1..]),
+        "restore" => db_backup_or_restore_cmd(host, interp, db_name, db_id, true, &args[1..]),
         "cache"
-        | "busy"
-        | "authorizer"
-        | "auth"
-        | "trace"
         | "profile"
-        | "progress"
-        | "collate"
         | "collation_needed"
-        | "function"
-        | "func"
         | "enable_load_extension"
-        | "incrblob"
-        | "restore"
-        | "backup"
-        | "wal_hook"
-        | "update_hook"
-        | "commit_hook"
-        | "rollback_hook"
+        | "bind_fallback"
         | "rekey"
         | "key" => Ok(String::new()),
         other => Err(TclControl::Error(format!(
@@ -1632,6 +2000,7 @@ fn dispatch_db_method(
 }
 
 fn db_close_cmd(host: &SharedHost, db_name: &str, db_id: DbId) -> TclResult<String> {
+    close_db_incrblobs(host, db_id);
     let conn = {
         let mut h = host.borrow_mut();
         let Some(slot) = h.dbs.get_mut(&db_id) else {
@@ -1663,6 +2032,7 @@ fn db_close_cmd(host: &SharedHost, db_name: &str, db_id: DbId) -> TclResult<Stri
                 cmd_registered: db.cmd_registered,
                 eval_refs: db.eval_refs,
                 tx_depth: db.tx_depth,
+                cb_meta: Rc::clone(&db.cb_meta),
             },
         );
         let DbSlot::Present(owned) = prev else {
@@ -1692,6 +2062,7 @@ fn db_close_cmd(host: &SharedHost, db_name: &str, db_id: DbId) -> TclResult<Stri
                         cmd_registered,
                         eval_refs,
                         tx_depth,
+                        cb_meta,
                     }) if cmd_registered || eval_refs > 0 => {
                         h.dbs.insert(
                             db_id,
@@ -1705,6 +2076,7 @@ fn db_close_cmd(host: &SharedHost, db_name: &str, db_id: DbId) -> TclResult<Stri
                                 cmd_registered,
                                 eval_refs,
                                 tx_depth,
+                                cb_meta,
                             }),
                         );
                         None
@@ -1760,7 +2132,7 @@ fn db_transaction_cmd(
     }
     let script = &args[args.len() - 1];
 
-    exec_db_internal_sql(host, db_id, z_begin, true).map_err(TclControl::Error)?;
+    exec_db_internal_sql(host, interp, db_id, z_begin, true).map_err(TclControl::Error)?;
 
     {
         let mut h = host.borrow_mut();
@@ -1799,8 +2171,8 @@ fn db_transaction_cmd(
         (true, true) => "ROLLBACK",
     };
 
-    if let Err(end_err_msg) = exec_db_internal_sql(host, db_id, z_end, !is_error) {
-        let _ = exec_db_internal_sql(host, db_id, "ROLLBACK", false);
+    if let Err(end_err_msg) = exec_db_internal_sql(host, interp, db_id, z_end, !is_error) {
+        let _ = exec_db_internal_sql(host, interp, db_id, "ROLLBACK", false);
         if !is_error {
             return Err(TclControl::Error(end_err_msg));
         }
@@ -1811,12 +2183,27 @@ fn db_transaction_cmd(
 
 fn exec_db_internal_sql(
     host: &SharedHost,
+    interp: &mut TclInterp,
     db_id: DbId,
     sql: &str,
     record_err_on_db: bool,
 ) -> Result<(), String> {
-    let (conn, _) = checkout_db_conn(host, db_id).map_err(|c| c.err_msg())?;
-    let res = conn.execute_batch(sql);
+    let (conn, cb_meta) = {
+        let h = host.borrow();
+        match h.dbs.get(&db_id) {
+            Some(DbSlot::Present(db)) => (Rc::clone(&db.conn), Rc::clone(&db.cb_meta)),
+            _ => return Err("database connection is closed".to_string()),
+        }
+    };
+    cb_meta.borrow_mut().disable_auth += 1;
+    let res = {
+        let _interp_guard = enter_interp_scope(interp);
+        conn.execute_batch(sql)
+    };
+    {
+        let mut m = cb_meta.borrow_mut();
+        m.disable_auth = m.disable_auth.saturating_sub(1);
+    }
     drop(conn);
     match res {
         Ok(()) => {
@@ -1961,7 +2348,11 @@ fn db_eval(
         if is_empty_stmt {
             // Check connection usability on empty/comment SQL, then finish.
             let (conn, _) = checkout_db_conn(host, db_id)?;
-            let stmt = match conn.prepare(rem) {
+            let prep_res = {
+                let _interp_guard = enter_interp_scope(interp);
+                conn.prepare(rem)
+            };
+            let stmt = match prep_res {
                 Ok(s) => s,
                 Err(e) => {
                     let msg = sqlite_err_text(&e);
@@ -1975,7 +2366,11 @@ fn db_eval(
                 }
             };
             drop(conn);
-            if let Err(e) = stmt.finalize() {
+            let fin_res = {
+                let _interp_guard = enter_interp_scope(interp);
+                stmt.finalize()
+            };
+            if let Err(e) = fin_res {
                 let msg = sqlite_err_text(&e);
                 host.borrow_mut()
                     .set_db_error(db_id, e.code as i32, e.extended_code, msg.clone());
@@ -2002,7 +2397,11 @@ fn db_eval(
                 let _ = interp.set_var(var, (prev + 1).to_string());
             }
         }
-        let mut stmt = match conn.prepare(rem) {
+        let prep_res = {
+            let _interp_guard = enter_interp_scope(interp);
+            conn.prepare(rem)
+        };
+        let mut stmt = match prep_res {
             Ok(s) => s,
             Err(e) => {
                 drop(conn);
@@ -2029,7 +2428,11 @@ fn db_eval(
         let mut wrote_array_star = false;
 
         loop {
-            match stmt.step() {
+            let step_res = {
+                let _interp_guard = enter_interp_scope(interp);
+                stmt.step()
+            };
+            match step_res {
                 Ok(StepResult::Row(row)) => {
                     if is_count_query && let Some(Value::Integer(n)) = row.values().first() {
                         host.borrow_mut().last_vmstep = (*n).max(0) as u64 * 4 + 20;
@@ -2062,7 +2465,11 @@ fn db_eval(
                         match interp.eval(body) {
                             Ok(_) | Err(TclControl::Continue) => {}
                             Err(TclControl::Break) => {
-                                if let Err(fin_err) = stmt.finalize() {
+                                let fin_res = {
+                                    let _interp_guard = enter_interp_scope(interp);
+                                    stmt.finalize()
+                                };
+                                if let Err(fin_err) = fin_res {
                                     let msg = sqlite_err_text(&fin_err);
                                     host.borrow_mut().set_db_error(
                                         db_id,
@@ -2078,7 +2485,11 @@ fn db_eval(
                             Err(ctrl) => {
                                 // Finalize `stmt` deterministically, recording any finalize error
                                 // on `db` while preserving Tcl body control/error priority.
-                                if let Err(fin_err) = stmt.finalize() {
+                                let fin_res = {
+                                    let _interp_guard = enter_interp_scope(interp);
+                                    stmt.finalize()
+                                };
+                                if let Err(fin_err) = fin_res {
                                     let msg = sqlite_err_text(&fin_err);
                                     host.borrow_mut().set_db_error(
                                         db_id,
@@ -2108,7 +2519,10 @@ fn db_eval(
                     break;
                 }
                 Err(step_err) => {
-                    let _ = stmt.finalize();
+                    {
+                        let _interp_guard = enter_interp_scope(interp);
+                        let _ = stmt.finalize();
+                    }
                     flush_xferopt_delta(host, interp, db_id);
                     let msg = sqlite_err_text(&step_err);
                     host.borrow_mut().set_db_error(
@@ -2122,7 +2536,11 @@ fn db_eval(
             }
         }
 
-        if let Err(fin_err) = stmt.finalize() {
+        let fin_res = {
+            let _interp_guard = enter_interp_scope(interp);
+            stmt.finalize()
+        };
+        if let Err(fin_err) = fin_res {
             let msg = sqlite_err_text(&fin_err);
             host.borrow_mut().set_db_error(
                 db_id,
@@ -2161,7 +2579,11 @@ fn db_onecolumn(
             break;
         }
         let (conn, nv) = checkout_db_conn(host, db_id)?;
-        let mut stmt = match conn.prepare(rem) {
+        let prep_res = {
+            let _interp_guard = enter_interp_scope(interp);
+            conn.prepare(rem)
+        };
+        let mut stmt = match prep_res {
             Ok(s) => s,
             Err(e) => {
                 drop(conn);
@@ -2181,18 +2603,29 @@ fn db_onecolumn(
         }
         let next_tail_len = stmt.tail().len();
         let cur_len = rem.len();
-        match stmt.step() {
+        let step_res = {
+            let _interp_guard = enter_interp_scope(interp);
+            stmt.step()
+        };
+        match step_res {
             Ok(StepResult::Row(row)) => {
                 let first = row
                     .get(0)
                     .map(|v| value_to_tcl_str(v, &nv))
                     .unwrap_or_default();
-                let _ = stmt.finalize();
+                {
+                    let _interp_guard = enter_interp_scope(interp);
+                    let _ = stmt.finalize();
+                }
                 host.borrow_mut().clear_db_error(db_id);
                 return Ok(first);
             }
             Ok(StepResult::Done) => {
-                if let Err(e) = stmt.finalize() {
+                let fin_res = {
+                    let _interp_guard = enter_interp_scope(interp);
+                    stmt.finalize()
+                };
+                if let Err(e) = fin_res {
                     let msg = sqlite_err_text(&e);
                     host.borrow_mut().set_db_error(
                         db_id,
@@ -2204,7 +2637,10 @@ fn db_onecolumn(
                 }
             }
             Err(e) => {
-                let _ = stmt.finalize();
+                {
+                    let _interp_guard = enter_interp_scope(interp);
+                    let _ = stmt.finalize();
+                }
                 let msg = sqlite_err_text(&e);
                 host.borrow_mut()
                     .set_db_error(db_id, e.code as i32, e.extended_code, msg.clone());
@@ -2233,7 +2669,11 @@ fn db_exists(
             break;
         }
         let (conn, _) = checkout_db_conn(host, db_id)?;
-        let mut stmt = match conn.prepare(rem) {
+        let prep_res = {
+            let _interp_guard = enter_interp_scope(interp);
+            conn.prepare(rem)
+        };
+        let mut stmt = match prep_res {
             Ok(s) => s,
             Err(e) => {
                 drop(conn);
@@ -2253,14 +2693,25 @@ fn db_exists(
         }
         let next_tail_len = stmt.tail().len();
         let cur_len = rem.len();
-        match stmt.step() {
+        let step_res = {
+            let _interp_guard = enter_interp_scope(interp);
+            stmt.step()
+        };
+        match step_res {
             Ok(StepResult::Row(_)) => {
-                let _ = stmt.finalize();
+                {
+                    let _interp_guard = enter_interp_scope(interp);
+                    let _ = stmt.finalize();
+                }
                 host.borrow_mut().clear_db_error(db_id);
                 return Ok("1".to_string());
             }
             Ok(StepResult::Done) => {
-                if let Err(e) = stmt.finalize() {
+                let fin_res = {
+                    let _interp_guard = enter_interp_scope(interp);
+                    stmt.finalize()
+                };
+                if let Err(e) = fin_res {
                     let msg = sqlite_err_text(&e);
                     host.borrow_mut().set_db_error(
                         db_id,
@@ -2272,7 +2723,10 @@ fn db_exists(
                 }
             }
             Err(e) => {
-                let _ = stmt.finalize();
+                {
+                    let _interp_guard = enter_interp_scope(interp);
+                    let _ = stmt.finalize();
+                }
                 let msg = sqlite_err_text(&e);
                 host.borrow_mut()
                     .set_db_error(db_id, e.code as i32, e.extended_code, msg.clone());
@@ -2422,7 +2876,11 @@ fn cmd_source(host: &SharedHost, interp: &mut TclInterp, args: &[String]) -> Tcl
     }
 }
 
-fn cmd_wal_checkpoint(host: &SharedHost, args: &[String]) -> TclResult<String> {
+fn cmd_wal_checkpoint(
+    host: &SharedHost,
+    interp: &mut TclInterp,
+    args: &[String],
+) -> TclResult<String> {
     if args.len() != 1 && args.len() != 2 {
         return Err(TclControl::Error(
             "wrong # args: should be \"sqlite3_wal_checkpoint DB ?NAME?\"".to_string(),
@@ -2439,7 +2897,11 @@ fn cmd_wal_checkpoint(host: &SharedHost, args: &[String]) -> TclResult<String> {
         (db_id, Rc::clone(&db.conn))
     };
     let db_name = args.get(1).map(String::as_str);
-    match conn.wal_checkpoint(db_name) {
+    let cp_res = {
+        let _interp_guard = enter_interp_scope(interp);
+        conn.wal_checkpoint(db_name)
+    };
+    match cp_res {
         Ok(()) => {
             host.borrow_mut().clear_db_error(db_id);
             Ok("SQLITE_OK".to_string())
@@ -2454,7 +2916,11 @@ fn cmd_wal_checkpoint(host: &SharedHost, args: &[String]) -> TclResult<String> {
     }
 }
 
-fn cmd_wal_checkpoint_v2(host: &SharedHost, args: &[String]) -> TclResult<String> {
+fn cmd_wal_checkpoint_v2(
+    host: &SharedHost,
+    interp: &mut TclInterp,
+    args: &[String],
+) -> TclResult<String> {
     if args.len() != 2 && args.len() != 3 {
         return Err(TclControl::Error(
             "wrong # args: should be \"sqlite3_wal_checkpoint_v2 DB MODE ?NAME?\"".to_string(),
@@ -2518,7 +2984,10 @@ fn cmd_wal_checkpoint_v2(host: &SharedHost, args: &[String]) -> TclResult<String
         };
 
     let db_name = args.get(2).map(String::as_str);
-    let cp_res = mode_res.and_then(|m| conn.wal_checkpoint_v2(db_name, m));
+    let cp_res = mode_res.and_then(|m| {
+        let _interp_guard = enter_interp_scope(interp);
+        conn.wal_checkpoint_v2(db_name, m)
+    });
     match cp_res {
         Ok(res) => {
             if res.busy {
@@ -2724,7 +3193,10 @@ fn db_config_subcmd(
         ));
     }
     let opt = args[0].trim().trim_start_matches('-');
-    if opt.eq_ignore_ascii_case("enable_view") || opt.eq_ignore_ascii_case("enable_trigger") {
+    if opt.eq_ignore_ascii_case("enable_view")
+        || opt.eq_ignore_ascii_case("enable_trigger")
+        || opt.eq_ignore_ascii_case("dqs_dml")
+    {
         let set_opt = match args.get(1) {
             Some(v) => {
                 let s = v.trim();
@@ -2738,8 +3210,10 @@ fn db_config_subcmd(
         };
         let cur = if opt.eq_ignore_ascii_case("enable_view") {
             conn.db_config_enable_view(set_opt)
-        } else {
+        } else if opt.eq_ignore_ascii_case("enable_trigger") {
             conn.db_config_enable_trigger(set_opt)
+        } else {
+            conn.db_config_dqs_dml(set_opt)
         };
         return Ok(i32::from(cur).to_string());
     }
@@ -2773,6 +3247,13 @@ fn cmd_sqlite3_db_config(host: &SharedHost, cmd_name: &str, args: &[String]) -> 
         || opt.eq_ignore_ascii_case("SQLITE_DBCONFIG_ENABLE_TRIGGER")
     {
         let mut sub_args = vec!["enable_trigger".to_string()];
+        if let Some(v) = args.get(2) {
+            sub_args.push(v.clone());
+        }
+        return db_config_subcmd(host, &args[0], db_id, &sub_args);
+    }
+    if opt.eq_ignore_ascii_case("DQS_DML") || opt.eq_ignore_ascii_case("SQLITE_DBCONFIG_DQS_DML") {
+        let mut sub_args = vec!["dqs_dml".to_string()];
         if let Some(v) = args.get(2) {
             sub_args.push(v.clone());
         }
@@ -2944,7 +3425,10 @@ fn cmd_prepare(
     };
 
     let parsed_preview = sqliters_syntax::parse_one(slice_sql);
-    let prep_res = conn.prepare_with_mode(slice_sql, mode);
+    let prep_res = {
+        let _interp_guard = enter_interp_scope(interp);
+        conn.prepare_with_mode(slice_sql, mode)
+    };
     drop(conn);
 
     match prep_res {
@@ -3022,7 +3506,7 @@ fn cmd_prepare(
     }
 }
 
-fn cmd_step(host: &SharedHost, args: &[String]) -> TclResult<String> {
+fn cmd_step(host: &SharedHost, interp: &mut TclInterp, args: &[String]) -> TclResult<String> {
     if args.len() != 1 {
         return Err(TclControl::Error(
             "wrong # args: should be \"sqlite3_step STMT\"".to_string(),
@@ -3055,7 +3539,10 @@ fn cmd_step(host: &SharedHost, args: &[String]) -> TclResult<String> {
 
     let owner_db_id = rec.owner_db_id;
     let mode = rec.stmt.prepare_mode();
-    let step_res = rec.stmt.step();
+    let step_res = {
+        let _interp_guard = enter_interp_scope(interp);
+        rec.stmt.step()
+    };
     rec.column_names = rec.stmt.column_names().to_vec();
 
     let ret_code_name = match step_res {
@@ -3106,7 +3593,7 @@ fn cmd_step(host: &SharedHost, args: &[String]) -> TclResult<String> {
     Ok(ret_code_name)
 }
 
-fn cmd_stmt_reset(host: &SharedHost, args: &[String]) -> TclResult<String> {
+fn cmd_stmt_reset(host: &SharedHost, interp: &mut TclInterp, args: &[String]) -> TclResult<String> {
     if args.len() != 1 {
         return Err(TclControl::Error(
             "wrong # args: should be \"sqlite3_reset <STMT>\"".to_string(),
@@ -3139,7 +3626,10 @@ fn cmd_stmt_reset(host: &SharedHost, args: &[String]) -> TclResult<String> {
 
     rec.current_row = None;
     let owner_db_id = rec.owner_db_id;
-    let reset_res = rec.stmt.reset();
+    let reset_res = {
+        let _interp_guard = enter_interp_scope(interp);
+        rec.stmt.reset()
+    };
 
     let ret_name = match reset_res {
         Ok(()) => {
@@ -3162,7 +3652,11 @@ fn cmd_stmt_reset(host: &SharedHost, args: &[String]) -> TclResult<String> {
     Ok(ret_name)
 }
 
-fn cmd_stmt_finalize(host: &SharedHost, args: &[String]) -> TclResult<String> {
+fn cmd_stmt_finalize(
+    host: &SharedHost,
+    interp: &mut TclInterp,
+    args: &[String],
+) -> TclResult<String> {
     if args.len() != 1 {
         return Err(TclControl::Error(
             "wrong # args: should be \"sqlite3_finalize <STMT>\"".to_string(),
@@ -3186,7 +3680,11 @@ fn cmd_stmt_finalize(host: &SharedHost, args: &[String]) -> TclResult<String> {
     };
 
     let owner_db_id = rec.owner_db_id;
-    match rec.stmt.finalize() {
+    let fin_res = {
+        let _interp_guard = enter_interp_scope(interp);
+        rec.stmt.finalize()
+    };
+    match fin_res {
         Ok(()) => {
             host.borrow_mut().clear_db_error(owner_db_id);
             Ok("SQLITE_OK".to_string())
@@ -3845,6 +4343,1388 @@ fn cmd_randstr(host: &SharedHost, args: &[String]) -> TclResult<String> {
     Ok(s)
 }
 
+fn value_to_tcl_arg_str(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::Integer(i) => i.to_string(),
+        Value::Real(r) => format_tcl_double(*r),
+        Value::Text(s) => s.clone(),
+        Value::Blob(b) => b.iter().map(|&byte| byte as char).collect(),
+    }
+}
+
+fn tcl_return_to_sqlite_value(res_str: &str, ret_type: &str, is_bytearray: bool) -> Value {
+    match ret_type {
+        "integer" => parse_tcl_int(res_str.trim())
+            .map(Value::Integer)
+            .unwrap_or_else(|| Value::Text(res_str.to_string())),
+        "real" => parse_tcl_float(res_str.trim())
+            .map(Value::real)
+            .unwrap_or_else(|| Value::Text(res_str.to_string())),
+        "text" => Value::Text(res_str.to_string()),
+        "blob" => Value::Blob(res_str.chars().map(|c| (c as u32 & 0xff) as u8).collect()),
+        _ => {
+            if is_bytearray {
+                Value::Blob(res_str.chars().map(|c| (c as u32 & 0xff) as u8).collect())
+            } else {
+                tcl_string_to_sqlite_value(res_str)
+            }
+        }
+    }
+}
+
+fn db_function_cmd(
+    host: &SharedHost,
+    db_name: &str,
+    db_id: DbId,
+    args: &[String],
+) -> TclResult<String> {
+    let mut n_arg: i32 = -1;
+    let mut flags = FunctionFlags::default();
+    let mut ret_type = "any".to_string();
+    let mut positional = Vec::new();
+    let mut i = 0usize;
+    while i < args.len() {
+        if i + 1 < args.len() && args[i].starts_with('-') && positional.len() < 2 {
+            match args[i].as_str() {
+                "-argcount" => {
+                    if i + 2 >= args.len() {
+                        return Err(TclControl::Error(format!(
+                            "option requires an argument: \"{}\"",
+                            args[i]
+                        )));
+                    }
+                    let v = parse_tcl_int(args[i + 1].trim()).ok_or_else(|| {
+                        TclControl::Error(format!("expected integer but got \"{}\"", args[i + 1]))
+                    })?;
+                    if v < 0 {
+                        return Err(TclControl::Error(
+                            "number of arguments must be non-negative".to_string(),
+                        ));
+                    }
+                    n_arg = v as i32;
+                    i += 2;
+                }
+                "-deterministic" => {
+                    flags |= FunctionFlags::DETERMINISTIC;
+                    i += 1;
+                }
+                "-directonly" => {
+                    flags |= FunctionFlags::DIRECTONLY;
+                    i += 1;
+                }
+                "-innocuous" => {
+                    flags |= FunctionFlags::INNOCUOUS;
+                    i += 1;
+                }
+                "-returntype" => {
+                    if i + 2 >= args.len() {
+                        return Err(TclControl::Error(format!(
+                            "option requires an argument: \"{}\"",
+                            args[i]
+                        )));
+                    }
+                    let rt = args[i + 1].to_ascii_lowercase();
+                    match rt.as_str() {
+                        "integer" | "real" | "text" | "blob" | "numeric" | "any" => {
+                            ret_type = rt;
+                        }
+                        _ => {
+                            return Err(TclControl::Error(format!(
+                                "bad returntype \"{}\": must be integer, real, text, blob, numeric, or any",
+                                args[i + 1]
+                            )));
+                        }
+                    }
+                    i += 2;
+                }
+                other => {
+                    return Err(TclControl::Error(format!(
+                        "bad option \"{other}\": must be -argcount, -deterministic, -directonly, -innocuous, or -returntype"
+                    )));
+                }
+            }
+        } else {
+            positional.push(args[i].clone());
+            i += 1;
+        }
+    }
+    if positional.len() != 2 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{db_name} function ?OPTIONS? NAME SCRIPT\""
+        )));
+    }
+    let func_name = positional[0].clone();
+    let script_cmd = positional[1].clone();
+    let (conn, _) = checkout_db_conn(host, db_id)?;
+    let cmd_words = parse_list(&script_cmd).unwrap_or_else(|_| vec![script_cmd.clone()]);
+    conn.create_scalar_function(&func_name, n_arg, flags, move |vals| {
+        let mut call_words = cmd_words.clone();
+        for v in vals {
+            call_words.push(value_to_tcl_arg_str(&v.value));
+        }
+        let call_line = format_list(&call_words);
+        let Some((eval_res, is_bytearray)) = eval_global_in_active_interp(&call_line) else {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                "no active Tcl interpreter for SQL function",
+            ));
+        };
+        match eval_res {
+            Ok(s) => Ok(RuntimeValue::plain(tcl_return_to_sqlite_value(
+                &s,
+                &ret_type,
+                is_bytearray,
+            ))),
+            Err(TclControl::Return { code, value }) if code == 0 || code == 2 => Ok(
+                RuntimeValue::plain(tcl_return_to_sqlite_value(&value, &ret_type, is_bytearray)),
+            ),
+            Err(ctrl) => Err(SqliteError::new(ErrorCode::Error, ctrl.err_msg())),
+        }
+    })
+    .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    Ok(String::new())
+}
+
+fn db_collate_cmd(
+    host: &SharedHost,
+    db_name: &str,
+    db_id: DbId,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() != 2 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{db_name} collate NAME SCRIPT\""
+        )));
+    }
+    let col_name = &args[0];
+    let proc_name = args[1].clone();
+    let (conn, _) = checkout_db_conn(host, db_id)?;
+    if proc_name.is_empty() {
+        conn.remove_collation(col_name)
+            .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+        return Ok(String::new());
+    }
+    let cmd_words = parse_list(&proc_name).unwrap_or_else(|_| vec![proc_name.clone()]);
+    conn.create_fallible_collation(col_name, move |lhs, rhs| {
+        let mut call_words = cmd_words.clone();
+        call_words.push(lhs.to_string());
+        call_words.push(rhs.to_string());
+        let call_line = format_list(&call_words);
+        let Some((eval_res, _)) = eval_global_in_active_interp(&call_line) else {
+            return Ok(lhs.cmp(rhs));
+        };
+        match eval_res {
+            Ok(s) => {
+                let n = parse_tcl_int(s.trim()).ok_or_else(|| {
+                    SqliteError::new(
+                        ErrorCode::Error,
+                        format!("expected integer but got \"{s}\""),
+                    )
+                })?;
+                Ok(if n < 0 {
+                    std::cmp::Ordering::Less
+                } else if n > 0 {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                })
+            }
+            Err(ctrl) => Err(SqliteError::new(ErrorCode::Error, ctrl.err_msg())),
+        }
+    })
+    .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    Ok(String::new())
+}
+
+fn db_busy_cmd(
+    host: &SharedHost,
+    db_name: &str,
+    db_id: DbId,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() > 1 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{db_name} busy ?CALLBACK?\""
+        )));
+    }
+    let (conn, cb_meta) = {
+        let h = host.borrow();
+        let Some(DbSlot::Present(db)) = h.dbs.get(&db_id) else {
+            return Err(TclControl::Error(format!("unknown db {db_name}")));
+        };
+        (Rc::clone(&db.conn), Rc::clone(&db.cb_meta))
+    };
+    let Some(proc_arg) = args.first() else {
+        return Ok(cb_meta.borrow().busy.clone());
+    };
+    if proc_arg.is_empty() {
+        cb_meta.borrow_mut().busy.clear();
+        conn.busy_handler(None)
+            .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    } else {
+        cb_meta.borrow_mut().busy = proc_arg.clone();
+        let proc_str = proc_arg.clone();
+        conn.busy_handler(Some(Box::new(move |n_tries| {
+            let script = format!("{proc_str} {n_tries}");
+            let Some((eval_res, _)) = eval_global_in_active_interp(&script) else {
+                return false;
+            };
+            match eval_res {
+                Ok(s) => {
+                    let val = parse_tcl_int(s.trim()).unwrap_or(0);
+                    val == 0
+                }
+                Err(_) => false,
+            }
+        })))
+        .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    }
+    Ok(String::new())
+}
+
+fn db_progress_cmd(
+    host: &SharedHost,
+    db_name: &str,
+    db_id: DbId,
+    args: &[String],
+) -> TclResult<String> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{db_name} progress N ?CALLBACK?\""
+        )));
+    }
+    let (conn, cb_meta) = {
+        let h = host.borrow();
+        let Some(DbSlot::Present(db)) = h.dbs.get(&db_id) else {
+            return Err(TclControl::Error(format!("unknown db {db_name}")));
+        };
+        (Rc::clone(&db.conn), Rc::clone(&db.cb_meta))
+    };
+    if args.len() == 1 {
+        return Ok(cb_meta.borrow().progress.clone());
+    }
+    let n_ops = parse_tcl_int(args[0].trim())
+        .ok_or_else(|| TclControl::Error(format!("expected integer but got \"{}\"", args[0])))?
+        as i32;
+    let proc_str = args[1].clone();
+    if proc_str.is_empty() || n_ops <= 0 {
+        cb_meta.borrow_mut().progress.clear();
+        conn.progress_handler(0, None)
+            .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    } else {
+        cb_meta.borrow_mut().progress = proc_str.clone();
+        conn.progress_handler(
+            n_ops,
+            Some(Box::new(move || {
+                let Some((eval_res, _)) = eval_global_in_active_interp(&proc_str) else {
+                    return false;
+                };
+                match eval_res {
+                    Ok(s) => parse_tcl_int(s.trim()).unwrap_or(0) != 0,
+                    Err(_) => true,
+                }
+            })),
+        )
+        .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    }
+    Ok(String::new())
+}
+
+fn db_authorizer_cmd(
+    host: &SharedHost,
+    db_name: &str,
+    db_id: DbId,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() > 1 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{db_name} authorizer ?CALLBACK?\""
+        )));
+    }
+    let (conn, cb_meta) = {
+        let h = host.borrow();
+        let Some(DbSlot::Present(db)) = h.dbs.get(&db_id) else {
+            return Err(TclControl::Error(format!("unknown db {db_name}")));
+        };
+        (Rc::clone(&db.conn), Rc::clone(&db.cb_meta))
+    };
+    let Some(proc_arg) = args.first() else {
+        return Ok(cb_meta.borrow().auth.clone());
+    };
+    if proc_arg.is_empty() {
+        cb_meta.borrow_mut().auth.clear();
+        conn.clear_authorizer()
+            .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    } else {
+        cb_meta.borrow_mut().auth = proc_arg.clone();
+        let proc_str = proc_arg.clone();
+        conn.set_authorizer(Some(Box::new(move |action, a1, a2, a3, a4| {
+            let code_str = action.as_tcl_str();
+            let mut words = parse_list(&proc_str).unwrap_or_else(|_| vec![proc_str.clone()]);
+            words.push(code_str.to_string());
+            words.push(a1.unwrap_or("").to_string());
+            words.push(a2.unwrap_or("").to_string());
+            words.push(a3.unwrap_or("").to_string());
+            if let Some(trig_or_view) = a4 {
+                words.push(trig_or_view.to_string());
+            } else {
+                words.push(String::new());
+            }
+            let call_line = format_list(&words);
+            let Some((eval_res, _)) = eval_global_in_active_interp(&call_line) else {
+                return AuthorizerResult::Ok;
+            };
+            let ret = match eval_res {
+                Ok(s) => s,
+                Err(TclControl::Return { code, value }) if code == 0 || code == 2 => value,
+                Err(_) => return AuthorizerResult::Deny,
+            };
+            match ret.trim() {
+                "SQLITE_OK" | "0" | "" => AuthorizerResult::Ok,
+                "SQLITE_DENY" | "1" => AuthorizerResult::Deny,
+                "SQLITE_IGNORE" | "2" => AuthorizerResult::Ignore,
+                _ => panic!("authorizer malfunction"),
+            }
+        })))
+        .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    }
+    Ok(String::new())
+}
+
+fn db_update_hook_cmd(
+    host: &SharedHost,
+    db_name: &str,
+    db_id: DbId,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() > 1 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{db_name} update_hook ?CALLBACK?\""
+        )));
+    }
+    let (conn, cb_meta) = {
+        let h = host.borrow();
+        let Some(DbSlot::Present(db)) = h.dbs.get(&db_id) else {
+            return Err(TclControl::Error(format!("unknown db {db_name}")));
+        };
+        (Rc::clone(&db.conn), Rc::clone(&db.cb_meta))
+    };
+    let prev = cb_meta.borrow().update_hook.clone();
+    let Some(proc_arg) = args.first() else {
+        return Ok(prev);
+    };
+    if proc_arg.is_empty() {
+        cb_meta.borrow_mut().update_hook.clear();
+        conn.update_hook(None)
+            .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    } else {
+        cb_meta.borrow_mut().update_hook = proc_arg.clone();
+        let proc_str = proc_arg.clone();
+        conn.update_hook(Some(Box::new(move |op, db_schema, tbl, rowid| {
+            let op_str = match op {
+                RowMutationOp::Insert => "INSERT",
+                RowMutationOp::Delete => "DELETE",
+                RowMutationOp::Update => "UPDATE",
+            };
+            let mut words = parse_list(&proc_str).unwrap_or_else(|_| vec![proc_str.clone()]);
+            words.push(op_str.to_string());
+            words.push(db_schema.to_string());
+            words.push(tbl.to_string());
+            words.push(rowid.to_string());
+            let call_line = format_list(&words);
+            let _ = eval_global_in_active_interp(&call_line);
+        })))
+        .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    }
+    Ok(prev)
+}
+
+fn db_commit_hook_cmd(
+    host: &SharedHost,
+    db_name: &str,
+    db_id: DbId,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() > 1 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{db_name} commit_hook ?CALLBACK?\""
+        )));
+    }
+    let (conn, cb_meta) = {
+        let h = host.borrow();
+        let Some(DbSlot::Present(db)) = h.dbs.get(&db_id) else {
+            return Err(TclControl::Error(format!("unknown db {db_name}")));
+        };
+        (Rc::clone(&db.conn), Rc::clone(&db.cb_meta))
+    };
+    let prev = cb_meta.borrow().commit_hook.clone();
+    let Some(proc_arg) = args.first() else {
+        return Ok(prev);
+    };
+    if proc_arg.is_empty() {
+        cb_meta.borrow_mut().commit_hook.clear();
+        conn.commit_hook(None)
+            .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    } else {
+        cb_meta.borrow_mut().commit_hook = proc_arg.clone();
+        let proc_str = proc_arg.clone();
+        conn.commit_hook(Some(Box::new(move || {
+            let Some((eval_res, _)) = eval_global_in_active_interp(&proc_str) else {
+                return false;
+            };
+            match eval_res {
+                Ok(s) => parse_tcl_int(s.trim()).unwrap_or(0) != 0,
+                Err(_) => true,
+            }
+        })))
+        .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    }
+    Ok(prev)
+}
+
+fn db_rollback_hook_cmd(
+    host: &SharedHost,
+    db_name: &str,
+    db_id: DbId,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() > 1 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{db_name} rollback_hook ?CALLBACK?\""
+        )));
+    }
+    let (conn, cb_meta) = {
+        let h = host.borrow();
+        let Some(DbSlot::Present(db)) = h.dbs.get(&db_id) else {
+            return Err(TclControl::Error(format!("unknown db {db_name}")));
+        };
+        (Rc::clone(&db.conn), Rc::clone(&db.cb_meta))
+    };
+    let prev = cb_meta.borrow().rollback_hook.clone();
+    let Some(proc_arg) = args.first() else {
+        return Ok(prev);
+    };
+    if proc_arg.is_empty() {
+        cb_meta.borrow_mut().rollback_hook.clear();
+        conn.rollback_hook(None)
+            .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    } else {
+        cb_meta.borrow_mut().rollback_hook = proc_arg.clone();
+        let proc_str = proc_arg.clone();
+        conn.rollback_hook(Some(Box::new(move || {
+            let _ = eval_global_in_active_interp(&proc_str);
+        })))
+        .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    }
+    Ok(prev)
+}
+
+fn db_trace_cmd(
+    host: &SharedHost,
+    db_name: &str,
+    db_id: DbId,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() > 1 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{db_name} trace ?CALLBACK?\""
+        )));
+    }
+    let (conn, cb_meta) = {
+        let h = host.borrow();
+        let Some(DbSlot::Present(db)) = h.dbs.get(&db_id) else {
+            return Err(TclControl::Error(format!("unknown db {db_name}")));
+        };
+        (Rc::clone(&db.conn), Rc::clone(&db.cb_meta))
+    };
+    let prev = cb_meta.borrow().trace.clone();
+    let Some(proc_arg) = args.first() else {
+        return Ok(prev);
+    };
+    if proc_arg.is_empty() {
+        cb_meta.borrow_mut().trace.clear();
+        conn.trace_hook(None)
+            .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    } else {
+        cb_meta.borrow_mut().trace = proc_arg.clone();
+        let proc_str = proc_arg.clone();
+        conn.trace_hook(Some(Box::new(move |sql| {
+            let mut words = parse_list(&proc_str).unwrap_or_else(|_| vec![proc_str.clone()]);
+            words.push(sql.to_string());
+            let call_line = format_list(&words);
+            let _ = eval_global_in_active_interp(&call_line);
+        })))
+        .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    }
+    Ok(String::new())
+}
+
+fn db_trace_v2_cmd(
+    host: &SharedHost,
+    db_name: &str,
+    db_id: DbId,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() > 2 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{db_name} trace_v2 ?CALLBACK? ?MASK?\""
+        )));
+    }
+    let (conn, cb_meta) = {
+        let h = host.borrow();
+        let Some(DbSlot::Present(db)) = h.dbs.get(&db_id) else {
+            return Err(TclControl::Error(format!("unknown db {db_name}")));
+        };
+        (Rc::clone(&db.conn), Rc::clone(&db.cb_meta))
+    };
+    let prev = cb_meta.borrow().trace_v2.clone();
+    let Some(proc_arg) = args.first() else {
+        return Ok(prev);
+    };
+    if proc_arg.is_empty() {
+        cb_meta.borrow_mut().trace_v2.clear();
+        conn.trace_hook(None)
+            .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    } else {
+        cb_meta.borrow_mut().trace_v2 = proc_arg.clone();
+        let proc_str = proc_arg.clone();
+        conn.trace_hook(Some(Box::new(move |sql| {
+            let mut words = parse_list(&proc_str).unwrap_or_else(|_| vec![proc_str.clone()]);
+            words.push("0".to_string());
+            words.push(sql.to_string());
+            let call_line = format_list(&words);
+            let _ = eval_global_in_active_interp(&call_line);
+        })))
+        .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    }
+    Ok(String::new())
+}
+
+fn db_wal_hook_cmd(
+    host: &SharedHost,
+    db_name: &str,
+    db_id: DbId,
+    args: &[String],
+) -> TclResult<String> {
+    let cb_meta = {
+        let h = host.borrow();
+        let Some(DbSlot::Present(db)) = h.dbs.get(&db_id) else {
+            return Err(TclControl::Error(format!("unknown db {db_name}")));
+        };
+        Rc::clone(&db.cb_meta)
+    };
+    let prev = cb_meta.borrow().wal_hook.clone();
+    if let Some(proc_arg) = args.first() {
+        cb_meta.borrow_mut().wal_hook = proc_arg.clone();
+    }
+    Ok(prev)
+}
+
+fn db_incrblob_cmd(
+    host: &SharedHost,
+    db_name: &str,
+    db_id: DbId,
+    args: &[String],
+) -> TclResult<String> {
+    let mut readonly = false;
+    let mut idx = 0usize;
+    if args.first().map(String::as_str) == Some("-readonly") {
+        readonly = true;
+        idx += 1;
+    }
+    let rem = &args[idx..];
+    if rem.len() != 3 && rem.len() != 4 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{db_name} incrblob ?-readonly? ?DB? TABLE COLUMN ROWID\""
+        )));
+    }
+    let (schema, table, col, rowid_str) = if rem.len() == 4 {
+        (
+            rem[0].as_str(),
+            rem[1].as_str(),
+            rem[2].as_str(),
+            rem[3].as_str(),
+        )
+    } else {
+        ("main", rem[0].as_str(), rem[1].as_str(), rem[2].as_str())
+    };
+    let rowid = parse_tcl_int(rowid_str.trim())
+        .ok_or_else(|| TclControl::Error(format!("expected integer but got \"{rowid_str}\"")))?;
+    let (conn, _) = checkout_db_conn(host, db_id)?;
+    let blob = match conn.blob_open(schema, table, col, rowid, !readonly) {
+        Ok(b) => b,
+        Err(e) => {
+            let msg = sqlite_err_text(&e);
+            host.borrow_mut()
+                .set_db_error(db_id, e.code as i32, e.extended_code, msg.clone());
+            return Err(TclControl::Error(msg));
+        }
+    };
+    drop(conn);
+    let mut h = host.borrow_mut();
+    h.clear_db_error(db_id);
+    let chan_id = format!("incrblob_{}", h.next_incrblob_id);
+    h.next_incrblob_id += 1;
+    h.incrblobs.insert(
+        chan_id.clone(),
+        TclIncrblobChannel {
+            blob,
+            owner_db_id: db_id,
+            pos: 0,
+            eof: false,
+        },
+    );
+    Ok(chan_id)
+}
+
+fn db_backup_or_restore_cmd(
+    host: &SharedHost,
+    interp: &mut TclInterp,
+    db_name: &str,
+    db_id: DbId,
+    is_restore: bool,
+    args: &[String],
+) -> TclResult<String> {
+    if args.is_empty() || args.len() > 2 {
+        let sub = if is_restore { "restore" } else { "backup" };
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{db_name} {sub} ?DATABASE? FILENAME\""
+        )));
+    }
+    let (schema, filename) = if args.len() == 2 {
+        (args[0].as_str(), args[1].as_str())
+    } else {
+        ("main", args[0].as_str())
+    };
+    let resolved_path = interp.resolve_path(filename);
+    let (opts, vfs) = {
+        let h = host.borrow();
+        (h.open_options(), h.disk_vfs())
+    };
+    let flags = if is_restore {
+        OpenFlags::READONLY
+    } else {
+        OpenFlags::READWRITE | OpenFlags::CREATE
+    };
+    let file_conn =
+        match Connection::open_with_vfs_and_options(vfs, Some(&resolved_path), flags, opts) {
+            Ok(c) => c,
+            Err(e) => {
+                let sub = if is_restore { "restore" } else { "backup" };
+                return Err(TclControl::Error(format!(
+                    "{sub} failed: {}",
+                    sqlite_err_text(&e)
+                )));
+            }
+        };
+    let _ = file_conn.busy_timeout(100);
+    let (db_conn, _) = checkout_db_conn(host, db_id)?;
+    let res = if is_restore {
+        Backup::init(&file_conn, "main", &db_conn, schema).and_then(|mut b| {
+            let step_res = b.step(-1);
+            let fin_res = b.finish();
+            step_res?;
+            fin_res
+        })
+    } else {
+        Backup::init(&db_conn, schema, &file_conn, "main").and_then(|mut b| {
+            let step_res = b.step(-1);
+            let fin_res = b.finish();
+            step_res?;
+            fin_res
+        })
+    };
+    drop(db_conn);
+    let _ = file_conn.try_close();
+    match res {
+        Ok(()) => {
+            host.borrow_mut().clear_db_error(db_id);
+            Ok(String::new())
+        }
+        Err(e) => {
+            let sub = if is_restore { "restore" } else { "backup" };
+            let msg = sqlite_err_text(&e);
+            host.borrow_mut()
+                .set_db_error(db_id, e.code as i32, e.extended_code, msg.clone());
+            Err(TclControl::Error(format!("{sub} failed: {msg}")))
+        }
+    }
+}
+
+fn cmd_sqlite3_backup(
+    host: &SharedHost,
+    interp: &mut TclInterp,
+    invoked_name: &str,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() != 5 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{invoked_name} CMDNAME DESTHANDLE DESTNAME SRCHANDLE SRCNAME\""
+        )));
+    }
+    let cmd_name = args[0].strip_prefix("::").unwrap_or(&args[0]).to_string();
+    let dest_handle = &args[1];
+    let dest_name = &args[2];
+    let src_handle = &args[3];
+    let src_name = &args[4];
+
+    let (dest_db_id, dest_conn, src_conn) = {
+        let h = host.borrow();
+        let Some(d_id) = h.resolve_db_id(dest_handle) else {
+            return Err(TclControl::Error(format!("not a database: {dest_handle}")));
+        };
+        let Some(s_id) = h.resolve_db_id(src_handle) else {
+            return Err(TclControl::Error(format!("not a database: {src_handle}")));
+        };
+        let Some(DbSlot::Present(d_db)) = h.dbs.get(&d_id) else {
+            return Err(TclControl::Error(format!("not a database: {dest_handle}")));
+        };
+        let Some(DbSlot::Present(s_db)) = h.dbs.get(&s_id) else {
+            return Err(TclControl::Error(format!("not a database: {src_handle}")));
+        };
+        (d_id, Rc::clone(&d_db.conn), Rc::clone(&s_db.conn))
+    };
+
+    let init_res = {
+        let _interp_guard = enter_interp_scope(interp);
+        Backup::init(&src_conn, src_name, &dest_conn, dest_name)
+    };
+    let backup = match init_res {
+        Ok(b) => {
+            host.borrow_mut().clear_db_error(dest_db_id);
+            b
+        }
+        Err(e) => {
+            let msg = sqlite_err_text(&e);
+            host.borrow_mut()
+                .set_db_error(dest_db_id, e.code as i32, e.extended_code, msg);
+            return Err(TclControl::Error(
+                "sqlite3_backup_init() failed".to_string(),
+            ));
+        }
+    };
+
+    interp.remove_non_host_cmd(&cmd_name);
+    delete_host_cmd_if_exists(host, &cmd_name);
+
+    let mut h = host.borrow_mut();
+    let backup_id = h.next_backup_id;
+    h.next_backup_id += 1;
+    h.backups.insert(
+        backup_id,
+        TclBackupHandle {
+            backup: Some(backup),
+            dest_conn,
+            src_conn,
+            dest_db_id,
+        },
+    );
+    h.cmd_table
+        .insert(cmd_name.clone(), HostCmdTarget::Backup(backup_id));
+    Ok(cmd_name)
+}
+
+fn dispatch_backup_method(
+    host: &SharedHost,
+    interp: &mut TclInterp,
+    cmd_name: &str,
+    backup_id: u64,
+    args: &[String],
+) -> TclResult<String> {
+    if args.is_empty() {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{cmd_name} SUBCOMMAND ...\""
+        )));
+    }
+    let sub = args[0].as_str();
+    match sub {
+        "step" => {
+            if args.len() != 2 {
+                return Err(TclControl::Error(format!(
+                    "wrong # args: should be \"{cmd_name} step NPAGE\""
+                )));
+            }
+            let n_page = parse_tcl_int(args[1].trim()).ok_or_else(|| {
+                TclControl::Error(format!("expected integer but got \"{}\"", args[1]))
+            })? as i32;
+            let mut bh = {
+                let mut h = host.borrow_mut();
+                let Some(bh) = h.backups.remove(&backup_id) else {
+                    return Ok("SQLITE_MISUSE".to_string());
+                };
+                bh
+            };
+            let dest_db_id = bh.dest_db_id;
+            let res = if let Some(ref mut b) = bh.backup {
+                let _interp_guard = enter_interp_scope(interp);
+                b.step(n_page)
+            } else {
+                Err(SqliteError::misuse("backup already finished"))
+            };
+            let ret_str = match res {
+                Ok(BackupStepResult::Done) => {
+                    host.borrow_mut()
+                        .set_db_step_status(dest_db_id, ErrorCode::Done as i32);
+                    "SQLITE_DONE".to_string()
+                }
+                Ok(BackupStepResult::More) => {
+                    host.borrow_mut().clear_db_error(dest_db_id);
+                    "SQLITE_OK".to_string()
+                }
+                Err(e) => {
+                    let msg = sqlite_err_text(&e);
+                    let eff = host.borrow_mut().set_db_error(
+                        dest_db_id,
+                        e.code as i32,
+                        e.extended_code,
+                        msg,
+                    );
+                    sqlite_err_name(eff).to_string()
+                }
+            };
+            let _ = (&bh.dest_conn, &bh.src_conn);
+            host.borrow_mut().backups.insert(backup_id, bh);
+            Ok(ret_str)
+        }
+        "finish" => {
+            if args.len() != 1 {
+                return Err(TclControl::Error(format!(
+                    "wrong # args: should be \"{cmd_name} finish\""
+                )));
+            }
+            let removed = {
+                let mut h = host.borrow_mut();
+                if matches!(h.cmd_table.get(cmd_name), Some(&HostCmdTarget::Backup(id)) if id == backup_id)
+                {
+                    h.cmd_table.remove(cmd_name);
+                }
+                h.backups.remove(&backup_id)
+            };
+            let Some(mut bh) = removed else {
+                return Ok("SQLITE_OK".to_string());
+            };
+            let dest_db_id = bh.dest_db_id;
+            let res = if let Some(b) = bh.backup.take() {
+                let _interp_guard = enter_interp_scope(interp);
+                b.finish()
+            } else {
+                Ok(())
+            };
+            drop(bh);
+            match res {
+                Ok(()) => {
+                    host.borrow_mut().clear_db_error(dest_db_id);
+                    Ok("SQLITE_OK".to_string())
+                }
+                Err(e) => {
+                    let msg = sqlite_err_text(&e);
+                    let eff = host.borrow_mut().set_db_error(
+                        dest_db_id,
+                        e.code as i32,
+                        e.extended_code,
+                        msg,
+                    );
+                    Ok(sqlite_err_name(eff).to_string())
+                }
+            }
+        }
+        "remaining" => {
+            if args.len() != 1 {
+                return Err(TclControl::Error(format!(
+                    "wrong # args: should be \"{cmd_name} remaining\""
+                )));
+            }
+            let h = host.borrow();
+            let rem = h
+                .backups
+                .get(&backup_id)
+                .and_then(|bh| bh.backup.as_ref())
+                .map_or(0, Backup::remaining);
+            Ok(rem.to_string())
+        }
+        "pagecount" => {
+            if args.len() != 1 {
+                return Err(TclControl::Error(format!(
+                    "wrong # args: should be \"{cmd_name} pagecount\""
+                )));
+            }
+            let h = host.borrow();
+            let pc = h
+                .backups
+                .get(&backup_id)
+                .and_then(|bh| bh.backup.as_ref())
+                .map_or(0, Backup::pagecount);
+            Ok(pc.to_string())
+        }
+        other => Err(TclControl::Error(format!(
+            "bad option \"{other}\": must be finish, pagecount, remaining, or step"
+        ))),
+    }
+}
+
+struct TclWindowAcc {
+    state: String,
+    step_words: Vec<String>,
+    final_words: Vec<String>,
+    value_words: Vec<String>,
+    inv_words: Vec<String>,
+    has_window_hooks: bool,
+}
+
+impl WindowAggregateInstance for TclWindowAcc {
+    fn step(&mut self, args: &[RuntimeValue]) -> Result<(), SqliteError> {
+        if self.step_words.is_empty() || self.step_words[0].is_empty() {
+            return Ok(());
+        }
+        let mut call = self.step_words.clone();
+        call.push(self.state.clone());
+        for v in args {
+            call.push(value_to_tcl_arg_str(&v.value));
+        }
+        let line = format_list(&call);
+        let Some((res, _)) = eval_global_in_active_interp(&line) else {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                "no active Tcl interpreter",
+            ));
+        };
+        match res {
+            Ok(s) => {
+                self.state = s;
+                Ok(())
+            }
+            Err(ctrl) => Err(SqliteError::new(ErrorCode::Error, ctrl.err_msg())),
+        }
+    }
+
+    fn value(&self) -> Result<RuntimeValue, SqliteError> {
+        if !self.has_window_hooks || self.value_words.is_empty() || self.value_words[0].is_empty() {
+            return Ok(RuntimeValue::plain(Value::Null));
+        }
+        let mut call = self.value_words.clone();
+        call.push(self.state.clone());
+        let line = format_list(&call);
+        let Some((res, is_bytearray)) = eval_global_in_active_interp(&line) else {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                "no active Tcl interpreter",
+            ));
+        };
+        match res {
+            Ok(s) => Ok(RuntimeValue::plain(tcl_return_to_sqlite_value(
+                &s,
+                "any",
+                is_bytearray,
+            ))),
+            Err(ctrl) => Err(SqliteError::new(ErrorCode::Error, ctrl.err_msg())),
+        }
+    }
+
+    fn inverse(&mut self, args: &[RuntimeValue]) -> Result<(), SqliteError> {
+        if !self.has_window_hooks || self.inv_words.is_empty() || self.inv_words[0].is_empty() {
+            return Ok(());
+        }
+        let mut call = self.inv_words.clone();
+        call.push(self.state.clone());
+        for v in args {
+            call.push(value_to_tcl_arg_str(&v.value));
+        }
+        let line = format_list(&call);
+        let Some((res, _)) = eval_global_in_active_interp(&line) else {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                "no active Tcl interpreter",
+            ));
+        };
+        match res {
+            Ok(s) => {
+                self.state = s;
+                Ok(())
+            }
+            Err(ctrl) => Err(SqliteError::new(ErrorCode::Error, ctrl.err_msg())),
+        }
+    }
+
+    fn finalize(&mut self) -> Result<RuntimeValue, SqliteError> {
+        if self.final_words.is_empty() || self.final_words[0].is_empty() {
+            return Ok(RuntimeValue::plain(Value::Null));
+        }
+        let mut call = self.final_words.clone();
+        call.push(self.state.clone());
+        let line = format_list(&call);
+        let Some((res, is_bytearray)) = eval_global_in_active_interp(&line) else {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                "no active Tcl interpreter",
+            ));
+        };
+        self.state.clear();
+        match res {
+            Ok(s) => Ok(RuntimeValue::plain(tcl_return_to_sqlite_value(
+                &s,
+                "any",
+                is_bytearray,
+            ))),
+            Err(ctrl) => Err(SqliteError::new(ErrorCode::Error, ctrl.err_msg())),
+        }
+    }
+}
+
+fn cmd_create_window_function(
+    host: &SharedHost,
+    invoked_name: &str,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() != 4 && args.len() != 6 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{invoked_name} db name xStep xFinal ?xValue xInverse?\""
+        )));
+    }
+    let db_tok = &args[0];
+    let func_name = &args[1];
+    let x_step = args[2].clone();
+    let x_final = args[3].clone();
+    let x_value = args.get(4).cloned().unwrap_or_default();
+    let x_inverse = args.get(5).cloned().unwrap_or_default();
+
+    let (db_id, conn) = {
+        let h = host.borrow();
+        let Some(id) = h.resolve_db_id(db_tok) else {
+            return Err(TclControl::Error(format!("not a database: {db_tok}")));
+        };
+        let Some(DbSlot::Present(db)) = h.dbs.get(&id) else {
+            return Err(TclControl::Error(format!("not a database: {db_tok}")));
+        };
+        (id, Rc::clone(&db.conn))
+    };
+
+    let step_words = parse_list(&x_step).unwrap_or_else(|_| vec![x_step.clone()]);
+    let final_words = parse_list(&x_final).unwrap_or_else(|_| vec![x_final.clone()]);
+    let value_words = parse_list(&x_value).unwrap_or_else(|_| vec![x_value.clone()]);
+    let inv_words = parse_list(&x_inverse).unwrap_or_else(|_| vec![x_inverse.clone()]);
+    let has_window_hooks = args.len() == 6;
+
+    conn.register_window_function(
+        func_name,
+        -1,
+        FunctionFlags::default(),
+        has_window_hooks,
+        has_window_hooks,
+        move || {
+            Box::new(TclWindowAcc {
+                state: String::new(),
+                step_words: step_words.clone(),
+                final_words: final_words.clone(),
+                value_words: value_words.clone(),
+                inv_words: inv_words.clone(),
+                has_window_hooks,
+            })
+        },
+    )
+    .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    host.borrow_mut().clear_db_error(db_id);
+    Ok(String::new())
+}
+
+fn cmd_create_window_function_misuse(
+    host: &SharedHost,
+    invoked_name: &str,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() != 1 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{invoked_name} db\""
+        )));
+    }
+    let db_tok = &args[0];
+    if host.borrow().resolve_db_id(db_tok).is_none() {
+        return Err(TclControl::Error(format!("not a database: {db_tok}")));
+    }
+    Ok(String::new())
+}
+
+struct SumIntAcc {
+    count: i64,
+    sum: i64,
+}
+
+impl WindowAggregateInstance for SumIntAcc {
+    fn step(&mut self, args: &[RuntimeValue]) -> Result<(), SqliteError> {
+        match args.first().map(|rv| &rv.value) {
+            Some(Value::Null) | None => {}
+            Some(Value::Integer(i)) => {
+                self.count += 1;
+                self.sum = self.sum.wrapping_add(*i);
+            }
+            _ => {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    "invalid argument to sumint()",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn value(&self) -> Result<RuntimeValue, SqliteError> {
+        if self.count > 0 {
+            Ok(RuntimeValue::plain(Value::Integer(self.sum)))
+        } else {
+            Ok(RuntimeValue::plain(Value::Null))
+        }
+    }
+
+    fn inverse(&mut self, args: &[RuntimeValue]) -> Result<(), SqliteError> {
+        if let Some(Value::Integer(i)) = args.first().map(|rv| &rv.value) {
+            self.count -= 1;
+            self.sum = self.sum.wrapping_sub(*i);
+        }
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> Result<RuntimeValue, SqliteError> {
+        self.value()
+    }
+}
+
+fn register_sumint_on_conn(conn: &Connection, name: &str) -> Result<(), SqliteError> {
+    conn.create_window_function(name, 1, FunctionFlags::default(), || {
+        Box::new(SumIntAcc { count: 0, sum: 0 })
+    })
+}
+
+fn cmd_create_sumint(host: &SharedHost, invoked_name: &str, args: &[String]) -> TclResult<String> {
+    if args.len() != 1 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{invoked_name} db\""
+        )));
+    }
+    let conn = {
+        let h = host.borrow();
+        let Some(id) = h.resolve_db_id(&args[0]) else {
+            return Err(TclControl::Error(format!("not a database: {}", args[0])));
+        };
+        let Some(DbSlot::Present(db)) = h.dbs.get(&id) else {
+            return Err(TclControl::Error(format!("not a database: {}", args[0])));
+        };
+        Rc::clone(&db.conn)
+    };
+    register_sumint_on_conn(&conn, "sumint").map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    Ok(String::new())
+}
+
+fn cmd_override_sum(host: &SharedHost, invoked_name: &str, args: &[String]) -> TclResult<String> {
+    if args.len() != 1 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{invoked_name} db\""
+        )));
+    }
+    let conn = {
+        let h = host.borrow();
+        let Some(id) = h.resolve_db_id(&args[0]) else {
+            return Err(TclControl::Error(format!("not a database: {}", args[0])));
+        };
+        let Some(DbSlot::Present(db)) = h.dbs.get(&id) else {
+            return Err(TclControl::Error(format!("not a database: {}", args[0])));
+        };
+        Rc::clone(&db.conn)
+    };
+    conn.create_aggregate_function("sum", 1, FunctionFlags::default(), || {
+        Box::new(SumIntAcc { count: 0, sum: 0 })
+    })
+    .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    Ok(String::new())
+}
+
+struct LegacyCountAcc(i64);
+
+impl WindowAggregateInstance for LegacyCountAcc {
+    fn step(&mut self, _args: &[RuntimeValue]) -> Result<(), SqliteError> {
+        self.0 += 1;
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> Result<RuntimeValue, SqliteError> {
+        Ok(RuntimeValue::plain(Value::Integer(self.0)))
+    }
+}
+
+fn cmd_create_aggregate(
+    host: &SharedHost,
+    invoked_name: &str,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() != 1 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{invoked_name} db\""
+        )));
+    }
+    let conn = {
+        let h = host.borrow();
+        let Some(id) = h.resolve_db_id(&args[0]) else {
+            return Err(TclControl::Error(format!("not a database: {}", args[0])));
+        };
+        let Some(DbSlot::Present(db)) = h.dbs.get(&id) else {
+            return Err(TclControl::Error(format!("not a database: {}", args[0])));
+        };
+        Rc::clone(&db.conn)
+    };
+    conn.create_aggregate_function("x_count", 0, FunctionFlags::default(), || {
+        Box::new(LegacyCountAcc(0))
+    })
+    .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    conn.create_aggregate_function("x_count", 1, FunctionFlags::default(), || {
+        Box::new(LegacyCountAcc(0))
+    })
+    .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    conn.create_aggregate_function("legacy_count", 0, FunctionFlags::default(), || {
+        Box::new(LegacyCountAcc(0))
+    })
+    .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    Ok("SQLITE_OK".to_string())
+}
+
+fn cmd_add_test_collate(
+    host: &SharedHost,
+    _invoked_name: &str,
+    args: &[String],
+) -> TclResult<String> {
+    let Some(db_tok) = args.first() else {
+        return Ok(String::new());
+    };
+    let conn = {
+        let h = host.borrow();
+        let Some(id) = h.resolve_db_id(db_tok) else {
+            return Ok(String::new());
+        };
+        let Some(DbSlot::Present(db)) = h.dbs.get(&id) else {
+            return Ok(String::new());
+        };
+        Rc::clone(&db.conn)
+    };
+    let _ = conn.create_collation("test_collate", |lhs, rhs| lhs.cmp(rhs));
+    Ok(String::new())
+}
+
+fn cmd_create_collation_v2(
+    host: &SharedHost,
+    _invoked_name: &str,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() < 4 {
+        return Ok("SQLITE_OK".to_string());
+    }
+    let db_tok = &args[0];
+    let col_name = &args[1];
+    let cmp_proc = args.get(3).cloned().unwrap_or_default();
+    let Some(db_id) = host.borrow().resolve_db_id(db_tok) else {
+        return Ok("SQLITE_OK".to_string());
+    };
+    let sub_args = vec![col_name.clone(), cmp_proc];
+    let _ = db_collate_cmd(host, db_tok, db_id, &sub_args);
+    Ok("SQLITE_OK".to_string())
+}
+
+fn cmd_create_function_v2(
+    host: &SharedHost,
+    _invoked_name: &str,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() < 5 {
+        return Ok("SQLITE_OK".to_string());
+    }
+    let db_tok = &args[0];
+    let fn_name = &args[1];
+    let n_arg = parse_tcl_int(args[2].trim()).unwrap_or(-1);
+    let func_proc = args.get(4).cloned().unwrap_or_default();
+    let Some(db_id) = host.borrow().resolve_db_id(db_tok) else {
+        return Ok("SQLITE_OK".to_string());
+    };
+    if !func_proc.is_empty() {
+        let mut sub_args = Vec::new();
+        if n_arg >= 0 {
+            sub_args.push("-argcount".to_string());
+            sub_args.push(n_arg.to_string());
+        }
+        sub_args.push(fn_name.clone());
+        sub_args.push(func_proc);
+        let _ = db_function_cmd(host, db_tok, db_id, &sub_args);
+    }
+    Ok("SQLITE_OK".to_string())
+}
+
+fn cmd_delete_function(
+    host: &SharedHost,
+    _invoked_name: &str,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() < 2 {
+        return Ok("SQLITE_OK".to_string());
+    }
+    let db_tok = &args[0];
+    let fn_name = &args[1];
+    let conn = {
+        let h = host.borrow();
+        let Some(id) = h.resolve_db_id(db_tok) else {
+            return Ok("SQLITE_OK".to_string());
+        };
+        let Some(DbSlot::Present(db)) = h.dbs.get(&id) else {
+            return Ok("SQLITE_OK".to_string());
+        };
+        Rc::clone(&db.conn)
+    };
+    let _ = conn.remove_scalar_function(fn_name, -1);
+    Ok("SQLITE_OK".to_string())
+}
+
+fn cmd_delete_collation(
+    host: &SharedHost,
+    _invoked_name: &str,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() < 2 {
+        return Ok("SQLITE_OK".to_string());
+    }
+    let db_tok = &args[0];
+    let col_name = &args[1];
+    let conn = {
+        let h = host.borrow();
+        let Some(id) = h.resolve_db_id(db_tok) else {
+            return Ok("SQLITE_OK".to_string());
+        };
+        let Some(DbSlot::Present(db)) = h.dbs.get(&id) else {
+            return Ok("SQLITE_OK".to_string());
+        };
+        Rc::clone(&db.conn)
+    };
+    let _ = conn.remove_collation(col_name);
+    Ok("SQLITE_OK".to_string())
+}
+
+fn cmd_busy_timeout(host: &SharedHost, invoked_name: &str, args: &[String]) -> TclResult<String> {
+    if args.len() != 2 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{invoked_name} DB MS\""
+        )));
+    }
+    let ms = parse_tcl_int(args[1].trim())
+        .ok_or_else(|| TclControl::Error(format!("expected integer but got \"{}\"", args[1])))?;
+    let conn = {
+        let h = host.borrow();
+        let Some(id) = h.resolve_db_id(&args[0]) else {
+            return Err(TclControl::Error(format!("not a database: {}", args[0])));
+        };
+        let Some(DbSlot::Present(db)) = h.dbs.get(&id) else {
+            return Err(TclControl::Error(format!("not a database: {}", args[0])));
+        };
+        Rc::clone(&db.conn)
+    };
+    let timeout_ms = if ms <= 0 { 0u64 } else { ms as u64 };
+    let _ = conn.busy_timeout(timeout_ms);
+    Ok("0".to_string())
+}
+
 fn sqlite_err_text(e: &SqliteError) -> String {
     if e.message.is_empty() {
         e.code.as_str().to_string()
@@ -4397,6 +6277,10 @@ proc stepsql {dbptr sql} {
 
 proc permutation {} { return "" }
 proc presql {} { return "" }
+proc get_pwd {} { pwd }
+proc save_prng_state {} {}
+proc restore_prng_state {} {}
+proc flush_async_queue {} {}
 proc isquick {} { return 0 }
 proc omit_test {args} {}
 proc warning {args} {}

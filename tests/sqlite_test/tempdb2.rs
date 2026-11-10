@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "pending Phase 6 Tcl user-defined SQL function callback (db func int2str)"]
 fn test_tempdb2() {
     let raw = include_str!("../../sqlite/test/tempdb2.test");
     let script = sqliters_tcltest::strip_test_comments(raw);

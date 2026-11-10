@@ -8,6 +8,10 @@ license.workspace = true
 [lints]
 workspace = true
 
+[[bin]]
+name = "testfixture"
+path = "src/bin/testfixture.rs"
+
 [dependencies]
 sqliters-types = { path = "../sqliters-types" }
 sqliters-vfs = { path = "../sqliters-vfs" }

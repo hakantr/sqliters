@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "pending Phase 6 Tcl user-defined SQL function callback (db function counter)"]
 fn test_trigger6() {
     let raw = include_str!("../../sqlite/test/trigger6.test");
     let script = sqliters_tcltest::strip_test_comments(raw);

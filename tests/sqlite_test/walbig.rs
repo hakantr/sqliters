@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "pending Phase 6 Tcl UDF (db func)"]
 fn test_walbig() {
     let raw = include_str!("../../sqlite/test/walbig.test");
     let script = sqliters_tcltest::strip_test_comments(raw);

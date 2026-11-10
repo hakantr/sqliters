@@ -1383,9 +1383,6 @@ impl ConnectionInner {
         shared: &ConnectionShared,
     ) -> Result<()> {
         let _removed = self.activity.remove(hid);
-        if self.activity.leases.is_empty() {
-            shared.interrupt_flag.store(false, Ordering::SeqCst);
-        }
         let summary = self.activity.summary_excluding(hid, &self.db_set);
 
         if let Some(sim_err) = self.take_simulated_cleanup_error() {
@@ -1537,6 +1534,7 @@ impl ConnectionInner {
                         busy_policy: &mut self.busy_policy,
                         rollback_count: &mut self.rollback_count,
                         deferred_fk_suspects: &mut self.deferred_fk_suspects,
+                        trace_hook: &mut self.trace_hook,
                         publish_mirrors: &mut publish_fn,
                     };
                     match commit_all_databases(&mut ctx) {
@@ -1666,6 +1664,7 @@ impl ConnectionInner {
                         busy_policy: &mut self.busy_policy,
                         rollback_count: &mut self.rollback_count,
                         deferred_fk_suspects: &mut self.deferred_fk_suspects,
+                        trace_hook: &mut self.trace_hook,
                         publish_mirrors: &mut publish_fn,
                     };
                     rollback_all_databases(&mut ctx, false)
@@ -1781,6 +1780,7 @@ impl ConnectionInner {
                             busy_policy: &mut self.busy_policy,
                             rollback_count: &mut self.rollback_count,
                             deferred_fk_suspects: &mut self.deferred_fk_suspects,
+                            trace_hook: &mut self.trace_hook,
                             publish_mirrors: &mut publish_fn,
                         };
                         match commit_all_databases(&mut ctx) {
@@ -3029,6 +3029,29 @@ impl Connection {
         }
     }
 
+    /// Queries (`enabled = None`) or updates (`enabled = Some(...)`) `SQLITE_DBCONFIG_DQS_DML`,
+    /// returning the current/updated state.
+    pub fn db_config_dqs_dml(&self, enabled: Option<bool>) -> bool {
+        if let Ok(mut session) = self.shared.enter() {
+            if session.inner().ensure_usable().is_err() {
+                return false;
+            }
+            if let Some(flag) = enabled {
+                let inner = session.inner_mut();
+                let prev = inner.db_set.dqs_dml();
+                let cur = inner.db_set.set_dqs_dml(flag);
+                if prev != cur {
+                    inner.schema_generation += 1;
+                }
+                cur
+            } else {
+                session.inner().db_set.dqs_dml()
+            }
+        } else {
+            false
+        }
+    }
+
     /// Queries (`enabled = None`) or updates (`enabled = Some(...)`) `PRAGMA recursive_triggers`,
     /// returning the current/updated state.
     pub fn recursive_triggers(&self, enabled: Option<bool>) -> bool {
@@ -3456,6 +3479,20 @@ impl Connection {
         cmp: impl Fn(&str, &str) -> Result<std::cmp::Ordering> + Send + Sync + 'static,
     ) -> Result<()> {
         self.register_fallible_collation(name, cmp)
+    }
+
+    /// Removes a connection-local collation sequence (`sqlite3_create_collation_v2` with `xCompare == NULL`).
+    pub fn remove_collation(&self, name: &str) -> Result<bool> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        let removed = inner.collations.unregister_collation(name);
+        if removed {
+            inner.db_set.rebind_all_collations(&inner.collations);
+            inner.schema_generation += 1;
+            inner.v1_expire_generation += 1;
+        }
+        Ok(removed)
     }
 
     /// Installs or clears the periodic VM/engine progress callback (`sqlite3_progress_handler`).
@@ -3902,6 +3939,7 @@ pub struct Statement {
     column_names: Vec<String>,
     params: Vec<Value>,
     named_params: HashMap<String, usize>,
+    ignored_fk_parent_tables: Vec<(DatabaseId, String)>,
     unparsed_tail: String,
     lifecycle: StatementLifecycle,
 }
@@ -3925,6 +3963,7 @@ struct CompiledArtifacts {
     column_names: Vec<String>,
     max_param: usize,
     named_params: HashMap<String, usize>,
+    ignored_fk_parent_tables: Vec<(DatabaseId, String)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3978,6 +4017,7 @@ fn compile_parsed_stmt(
             column_names: Vec::new(),
             max_param: 0,
             named_params: HashMap::new(),
+            ignored_fk_parent_tables: Vec::new(),
         });
     };
 
@@ -3997,7 +4037,14 @@ fn compile_parsed_stmt(
         collations,
     )?;
 
-    let Some(stmt) = driver::authorize_stmt_with_slot(&stmt, db_set, functions, authorizer)? else {
+    let (stmt_opt_auth, ignored_fk_parent_tables) = driver::authorize_stmt_with_slot_and_fks(
+        &stmt,
+        db_set,
+        functions,
+        foreign_keys,
+        authorizer,
+    )?;
+    let Some(stmt) = stmt_opt_auth else {
         return Ok(CompiledArtifacts {
             stmt: None,
             requires_schema,
@@ -4006,6 +4053,7 @@ fn compile_parsed_stmt(
             column_names: Vec::new(),
             max_param,
             named_params,
+            ignored_fk_parent_tables,
         });
     };
 
@@ -4029,6 +4077,7 @@ fn compile_parsed_stmt(
         column_names,
         max_param,
         named_params,
+        ignored_fk_parent_tables,
     })
 }
 
@@ -4653,6 +4702,7 @@ impl ConnectionInner {
             busy_policy: &mut self.busy_policy,
             rollback_count: &mut self.rollback_count,
             deferred_fk_suspects: &mut self.deferred_fk_suspects,
+            trace_hook: &mut self.trace_hook,
             publish_mirrors: &mut publish_fn,
         };
         f(&mut ctx)
@@ -4772,6 +4822,7 @@ impl Statement {
             column_names: artifacts.column_names,
             params: vec![Value::Null; artifacts.max_param],
             named_params: artifacts.named_params,
+            ignored_fk_parent_tables: artifacts.ignored_fk_parent_tables,
             unparsed_tail,
             lifecycle: StatementLifecycle::Ready,
         })
@@ -5142,6 +5193,7 @@ impl Statement {
             self.column_names = artifacts.column_names;
             self.params = transferred;
             self.named_params = artifacts.named_params;
+            self.ignored_fk_parent_tables = artifacts.ignored_fk_parent_tables;
             self.compiled_schema_generation = inner.schema_generation;
             self.compiled_v1_expire_generation = inner.v1_expire_generation;
             self.compiled_advisory_expire_generation = inner.advisory_expire_generation;
@@ -6327,6 +6379,8 @@ impl Statement {
                     .then_some(inner.savepoints.len());
                 let mut stmt_tx = StmtTxTracker {
                     stmt_sp_slot,
+                    top_level_sql: Some(self.raw_sql.clone()),
+                    ignored_fk_parent_tables: self.ignored_fk_parent_tables.clone(),
                     ..StmtTxTracker::default()
                 };
                 let initial_insts: Vec<SchemaInstanceId> = match prelocked_write {

@@ -1633,6 +1633,13 @@ impl Pager {
         self.header_loaded
     }
 
+    /// Marks the cached database header as unloaded so the next read/write or pragma
+    /// re-reads Page 1 from disk (and attaches WAL if Page 1 now has `write_version = 2`).
+    #[inline]
+    pub fn invalidate_header_loaded(&mut self) {
+        self.header_loaded = false;
+    }
+
     #[inline]
     pub const fn header(&self) -> &DatabaseHeader {
         &self.header
@@ -2154,9 +2161,7 @@ impl Pager {
                 return Err(e);
             }
         } else {
-            let lock_res = if target_lock >= LockLevel::Exclusive
-                || self.locking_mode == LockingMode::Exclusive
-            {
+            let lock_res = if target_lock >= LockLevel::Exclusive {
                 self.lock_db_file(LockLevel::Reserved)
                     .and_then(|()| self.lock_db_file(LockLevel::Exclusive))
             } else {
@@ -2931,7 +2936,16 @@ impl Pager {
             }
         }
         patched_hdr.page_size = pgsz_src;
-        let ver = if self.is_wal_mode() { 2 } else { 1 };
+        let ver = if self.is_wal_mode()
+            || (raw_src_pages > 0
+                && self.db_kind == DatabaseKind::NamedDisk
+                && !self.is_memdb_backing
+                && src_hdr.is_wal())
+        {
+            2
+        } else {
+            1
+        };
         patched_hdr.write_version = ver;
         patched_hdr.read_version = ver;
         patched_hdr.database_size_pages = n_src_pages;
@@ -3454,6 +3468,8 @@ impl Pager {
             }
             self.commit_phase_one_done = true;
             self.notify_backup_self_commit();
+        } else if self.locking_mode == LockingMode::Exclusive {
+            self.lock_db_file(LockLevel::Exclusive)?;
         }
 
         Ok(())

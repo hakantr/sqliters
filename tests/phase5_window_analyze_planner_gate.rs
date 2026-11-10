@@ -226,22 +226,26 @@ fn phase5_gate_c_reference_and_manifest_audit() {
         "view",
         "wal",
         "windowfunc",
+        "auth",
+        "progress",
+        "trace",
+        "incrblob",
+        "lfs",
         "xfer_opt",
     ] {
         assert_eq!(
             cap_map.get(enabled_cap),
             Some(&true),
-            "capability `{enabled_cap}` must be enabled in Phase 5"
+            "capability `{enabled_cap}` must be enabled in Phase 6"
         );
     }
     for pending_cap in [
-        "stat4", "auth", "progress", "trace", "incrblob", "vtab", "fts3", "fts4", "fts5", "rtree",
-        "json", "json1",
+        "stat4", "vtab", "fts3", "fts4", "fts5", "rtree", "json", "json1",
     ] {
         assert_eq!(
             cap_map.get(pending_cap),
             Some(&false),
-            "Phase 6..7 capability `{pending_cap}` must remain false in Phase 5"
+            "Phase 7 capability `{pending_cap}` must remain false in Phase 6"
         );
     }
 
@@ -311,26 +315,23 @@ fn phase5_gate_c_reference_and_manifest_audit() {
 
     p5_active_ids.sort();
     assert_eq!(
-        p3_active, 14,
-        "expected 14 active Phase 3 manifest suites (including promoted upfrom2)"
+        p3_active, 15,
+        "expected 15 active Phase 3 manifest suites (including promoted upfrom2 & view)"
     );
-    assert_eq!(p3_ignored, 3, "expected 3 ignored Phase 3 manifest suites");
+    assert_eq!(p3_ignored, 2, "expected 2 ignored Phase 3 manifest suites");
     assert_eq!(
-        p4_active, 17,
-        "expected 17 active Phase 4 manifest suites (including promoted trigger1 & triggerE)"
+        p4_active, 18,
+        "expected 18 active Phase 4 manifest suites (including promoted trigger1, trigger6 & triggerE)"
     );
-    assert_eq!(
-        p4_ignored, 1,
-        "expected 1 ignored Phase 4 manifest suite (trigger6)"
-    );
+    assert_eq!(p4_ignored, 0, "expected 0 ignored Phase 4 manifest suites");
     assert_eq!(
         p5_total, 31,
         "expected 31 Phase 5 wrappers (17 window*.test + 14 analyze*.test/analyzer1.test)"
     );
-    assert_eq!(p5_active, 16, "expected 16 active Phase 5 manifest suites");
+    assert_eq!(p5_active, 18, "expected 18 active Phase 5 manifest suites");
     assert_eq!(
-        p5_ignored, 15,
-        "expected 15 ignored Phase 5 manifest suites"
+        p5_ignored, 13,
+        "expected 13 ignored Phase 5 manifest suites"
     );
     assert_eq!(
         p5_active_ids,
@@ -343,6 +344,8 @@ fn phase5_gate_c_reference_and_manifest_audit() {
             "sqlite/test/window2.test",
             "sqlite/test/window3.test",
             "sqlite/test/window4.test",
+            "sqlite/test/window5.test",
+            "sqlite/test/window6.test",
             "sqlite/test/window7.test",
             "sqlite/test/window8.test",
             "sqlite/test/window9.test",
@@ -353,8 +356,8 @@ fn phase5_gate_c_reference_and_manifest_audit() {
             "sqlite/test/windowpushd.test",
         ]
     );
-    assert_eq!(manifest_active_total, 62);
-    assert_eq!(manifest_ignored_total, 61);
+    assert_eq!(manifest_active_total, 70);
+    assert_eq!(manifest_ignored_total, 53);
 
     let uname_out = Command::new("uname")
         .arg("-srmo")

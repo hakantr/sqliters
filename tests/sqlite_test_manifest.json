@@ -8,8 +8,8 @@
   ],
   "summary": {
     "total_registered": 123,
-    "active": 62,
-    "ignored": 61
+    "active": 70,
+    "ignored": 53
   },
   "tests": [
     {
@@ -655,12 +655,10 @@
       "required_capabilities": [
         "tempdb"
       ],
-      "external_dependencies": [
-        "db func"
-      ],
-      "status": "ignored",
-      "ignore_reason": "pending Phase 6 Tcl user-defined SQL function callback (db func int2str)",
-      "observed_passed_subtests": 0,
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 7,
       "expected_subtest_count": 7
     },
     {
@@ -777,12 +775,10 @@
       "required_capabilities": [
         "trigger"
       ],
-      "external_dependencies": [
-        "db function"
-      ],
-      "status": "ignored",
-      "ignore_reason": "pending Phase 6 Tcl user-defined SQL function callback (db function counter)",
-      "observed_passed_subtests": 0,
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 6,
       "expected_subtest_count": 6
     },
     {
@@ -1246,13 +1242,10 @@
         "analyze",
         "auth"
       ],
-      "external_dependencies": [
-        "ANALYZE",
-        "db authorizer"
-      ],
-      "status": "ignored",
-      "ignore_reason": "view-25.1..25.2 execute unguarded ANALYZE + db authorizer (pending Phase 5 analyze and Phase 6 auth); all 119 non-auth subtests pass and are verified in phase3_view_upsert_dropcol_cte",
-      "observed_passed_subtests": 120,
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 121,
       "expected_subtest_count": 121
     },
     {
@@ -1287,13 +1280,14 @@
       "phase": "3",
       "required_capabilities": [
         "view",
-        "compound"
+        "compound",
+        "progress"
       ],
       "external_dependencies": [],
       "status": "active",
       "ignore_reason": null,
-      "observed_passed_subtests": 1,
-      "expected_subtest_count": 1
+      "observed_passed_subtests": 2,
+      "expected_subtest_count": 2
     },
     {
       "id": "sqlite/test/wal.test",
@@ -1524,12 +1518,10 @@
       "required_capabilities": [
         "wal"
       ],
-      "external_dependencies": [
-        "sqlite3_backup"
-      ],
-      "status": "ignored",
-      "ignore_reason": "pending Phase 6 Online Backup API (sqlite3_backup)",
-      "observed_passed_subtests": 0,
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 83,
       "expected_subtest_count": 39
     },
     {
@@ -1545,12 +1537,10 @@
       "required_capabilities": [
         "wal"
       ],
-      "external_dependencies": [
-        "db func"
-      ],
-      "status": "ignored",
-      "ignore_reason": "pending Phase 6 Tcl UDF (db func)",
-      "observed_passed_subtests": 0,
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 1,
       "expected_subtest_count": 4
     },
     {
@@ -2180,12 +2170,10 @@
       "required_capabilities": [
         "wal"
       ],
-      "external_dependencies": [
-        "db func"
-      ],
-      "status": "ignored",
-      "ignore_reason": "pending Phase 6 Tcl UDF (db func)",
-      "observed_passed_subtests": 0,
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 3722,
       "expected_subtest_count": 20
     },
     {
@@ -2324,13 +2312,11 @@
       "required_capabilities": [
         "windowfunc"
       ],
-      "external_dependencies": [
-        "create_window_function"
-      ],
-      "status": "ignored",
-      "ignore_reason": "requires Phase 6 Tcl user-defined window function registration (create_window_function)",
-      "observed_passed_subtests": 0,
-      "expected_subtest_count": 28
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 7,
+      "expected_subtest_count": 7
     },
     {
       "id": "sqlite/test/window6.test",
@@ -2345,14 +2331,11 @@
       "required_capabilities": [
         "windowfunc"
       ],
-      "external_dependencies": [
-        "db func",
-        "db collate"
-      ],
-      "status": "ignored",
-      "ignore_reason": "requires Phase 6 Tcl user-defined SQL function and collation callbacks (db func, db collate); pure-SQL subtests verified in phase5_window_analyze_planner_gate",
-      "observed_passed_subtests": 25,
-      "expected_subtest_count": 29
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 74,
+      "expected_subtest_count": 74
     },
     {
       "id": "sqlite/test/window7.test",

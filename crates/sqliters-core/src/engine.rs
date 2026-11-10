@@ -130,6 +130,10 @@ pub struct StmtTxTracker {
     /// Table roots pinned by `OP_CursorLock` during `UPDATE` `OE_Replace` conflict delete triggers
     /// (`(schema_inst, root_pgno, pin_frame_depth)` per `insert.c:2626-2634` and `btree.c:773-775`).
     pub pinned_table_roots: Vec<(SchemaInstanceId, Pgno, usize)>,
+    /// Top-level statement SQL text for subprogram trace hooks (`vdbe.c:9247`).
+    pub top_level_sql: Option<String>,
+    /// Parent tables whose `SQLITE_READ` returned `SQLITE_IGNORE` during compile-time FK check (`fkey.c:984-985`).
+    pub ignored_fk_parent_tables: Vec<(DatabaseId, String)>,
 }
 
 /// Default WAL automatic checkpoint threshold (`SQLITE_DEFAULT_WAL_AUTOCHECKPOINT = 1000`).
@@ -177,12 +181,14 @@ impl BusyPolicy {
     }
 
     /// Retries `op(btree)` on external lock contention (`ErrorCode::Busy` excluding `SQLITE_BUSY_SNAPSHOT`),
-    /// matching `btreeBeginTrans` (`btree.c:3040`).
+    /// matching `btreeBeginTrans` (`btree.c:3040, 3622, 3770`). When upgrading from `TransactionState::Read`
+    /// to `TransactionState::Write`, `SQLITE_BUSY` is returned immediately without invoking `busy_handler`
+    /// to avoid deadlock (`lock-2.3.2`, `lock-2.4.2`).
     pub(crate) fn retry_btree<T, F>(&mut self, btree: &mut Btree, mut op: F) -> Result<T>
     where
         F: FnMut(&mut Btree) -> Result<T>,
     {
-        if !self.has_handler() {
+        if !self.has_handler() || btree.transaction_state() == TransactionState::Read {
             return op(btree);
         }
         let start = std::time::Instant::now();
@@ -269,6 +275,7 @@ pub struct ExecContext<'a> {
     pub busy_policy: &'a mut BusyPolicy,
     pub rollback_count: &'a mut u64,
     pub deferred_fk_suspects: &'a mut Vec<(SchemaInstanceId, String, TableRowKey, usize)>,
+    pub trace_hook: &'a mut Option<crate::TraceHookCallback>,
     pub publish_mirrors: &'a mut dyn FnMut(&VmRuntimeContext, bool, bool, u64),
 }
 
@@ -5273,7 +5280,6 @@ fn eval_view_query_output(
     view: &ViewSchema,
     ctes: &CteStore,
 ) -> Result<(QueryOutput, Vec<(Option<TypeAffinity>, Collation)>, String)> {
-    ctes.record_catalog_ref(db_id, &view.name)?;
     if !ctx.db_set.enable_view() && db_id != DatabaseId::TEMP {
         return Err(SqliteError::new(
             ErrorCode::Error,
@@ -5288,18 +5294,30 @@ fn eval_view_query_output(
         .unwrap_or_else(|| "main".to_owned());
     let view_ctes = ctes.enter_view(db_id, &view.name, ctx.db_set.expr_depth_limit())?;
     let cache_key = (db_id, view.name.to_ascii_lowercase());
-    // Ensure sub-reference counts are still accounted even when output is cached
-    let _ = resolve_view_columns_static(
-        db_id,
-        view,
-        ctx.db_set,
-        ctes,
-        ctx.functions,
-        &mut Vec::new(),
-    )?;
     if let Some(cached) = ctes.runtime_view_cache.borrow().get(&cache_key).cloned() {
+        // Ensure sub-reference counts are still accounted when output is served from cache
+        let _ = resolve_view_columns_static(
+            db_id,
+            view,
+            ctx.db_set,
+            ctes,
+            ctx.functions,
+            &mut Vec::new(),
+        )?;
+        let sub_ticks = ctes
+            .static_view_cache
+            .borrow()
+            .get(&cache_key)
+            .map(|sc| sc.sub_refs.iter().map(|(_, _, _, d)| *d).sum::<usize>())
+            .unwrap_or(1)
+            .max(1);
+        for _ in 0..sub_ticks {
+            ctx.progress.tick()?;
+        }
         return Ok(cached);
     }
+    ctes.record_catalog_ref(db_id, &view.name)?;
+    ctx.progress.tick()?;
     let fixed_sel = prepare_fixed_view_select(db_id, &schema_lbl, view)?;
     let meta = infer_select_stmt_meta(&fixed_sel, &[], ctx.db_set, &view_ctes);
     let mut out = exec_select(ctx, &fixed_sel, &[], &[], &view_ctes)?;
@@ -8872,6 +8890,9 @@ fn eval_expr_rt(
                 if let Some((val, _)) = scope.lookup_cref(cref)? {
                     return Ok(RuntimeValue::plain(val));
                 }
+            }
+            if ctx.db_set.dqs_dml() && cref.schema.is_none() && cref.table.is_none() {
+                return Ok(RuntimeValue::plain(Value::Text(cref.column.clone())));
             }
             // In SQLite, double-quoted string fallback is deprecated; return clear error
             Err(SqliteError::new(
@@ -13002,6 +13023,14 @@ fn parent_row_exists_for_fk(
     if from_cols.iter().any(|&ci| child_vals[ci].is_null()) {
         return Ok(true);
     }
+    if ctx
+        .stmt_tx
+        .ignored_fk_parent_tables
+        .iter()
+        .any(|(d, t)| *d == db_id && t.eq_ignore_ascii_case(&ptbl.name))
+    {
+        return Ok(false);
+    }
 
     // Fast path: single-column `INTEGER PRIMARY KEY` (`rowid_alias_col`)
     if parent_col_idxs.len() == 1 && ptbl.rowid_alias_col == Some(parent_col_idxs[0]) {
@@ -13301,6 +13330,12 @@ where
             "triggers nested too deep",
         ));
     }
+    if let (Some(cb), Some(sql)) = (
+        ctx.trace_hook.as_mut(),
+        ctx.stmt_tx.top_level_sql.as_deref(),
+    ) {
+        catch_infallible_callback_panic("trace_hook", || cb(sql))?;
+    }
     ctx.stmt_tx.subprogram_stack.push(None);
     let saved_last_rowid = ctx.runtime.last_insert_rowid;
     let saved_last_changes = ctx.runtime.last_changes;
@@ -13372,6 +13407,9 @@ fn apply_parent_delete_fk_actions(
             }
         }
         if matching_children.is_empty() {
+            if fk.on_delete != FkAction::NoAction && fk.on_delete != FkAction::Restrict {
+                run_in_fk_subprogram(ctx, |_| Ok(()))?;
+            }
             continue;
         }
 
@@ -13643,6 +13681,9 @@ fn apply_parent_update_fk_actions(
             }
         }
         if matching_children.is_empty() {
+            if fk.on_update != FkAction::NoAction && fk.on_update != FkAction::Restrict {
+                run_in_fk_subprogram(ctx, |_| Ok(()))?;
+            }
             continue;
         }
 
@@ -27318,13 +27359,22 @@ fn exec_pragma(
         }
         "LOCK_STATUS" => {
             let mut rows = Vec::with_capacity(ctx.db_set.slot_count());
-            for slot in ctx.db_set.slots() {
+            for (slot_idx, slot) in ctx.db_set.slots().iter().enumerate() {
                 let status = match slot.btree {
                     None => "closed",
-                    Some(ref bt) => match bt.pager().lock_state_for_diagnostics()? {
-                        Some(lvl) => lvl.as_diagnostic_str(),
-                        None => "unknown",
-                    },
+                    Some(ref bt) => {
+                        if slot_idx == DatabaseId::TEMP.index()
+                            && ctx.db_set.temp_store() == TempStoreMode::Default
+                            && bt.pager().page_count() <= bt.pager().cache_size().unsigned_abs()
+                        {
+                            "unknown"
+                        } else {
+                            match bt.pager().lock_state_for_diagnostics()? {
+                                Some(lvl) => lvl.as_diagnostic_str(),
+                                None => "unknown",
+                            }
+                        }
+                    }
                 };
                 rows.push(vec![
                     Value::Text(slot.name.clone()),
@@ -27446,6 +27496,21 @@ fn exec_pragma(
                 "wal_autocheckpoint",
                 Value::Integer(i64::from(effective)),
             ));
+        }
+        "BUSY_TIMEOUT" => {
+            if let Some(pv) = value {
+                let raw = pragma_to_i64(pv);
+                if raw <= 0 {
+                    *ctx.busy_policy = BusyPolicy::None;
+                } else {
+                    *ctx.busy_policy = BusyPolicy::TimeoutMs(raw as u64);
+                }
+            }
+            let cur = match *ctx.busy_policy {
+                BusyPolicy::TimeoutMs(ms) => ms as i64,
+                _ => 0,
+            };
+            return Ok(single_col("timeout", Value::Integer(cur)));
         }
         "COMPILE_OPTIONS" => {
             return Ok(QueryOutput {
@@ -29863,6 +29928,7 @@ fn infer_pragma_columns(name: &str, value: Option<&PragmaValue>) -> Vec<String> 
             "checkpointed".to_owned(),
         ],
         "WAL_AUTOCHECKPOINT" => vec!["wal_autocheckpoint".to_owned()],
+        "BUSY_TIMEOUT" => vec!["timeout".to_owned()],
         "LOCKING_MODE" => vec!["locking_mode".to_owned()],
         "JOURNAL_SIZE_LIMIT" => vec!["journal_size_limit".to_owned()],
         "LOCK_STATUS" => vec!["database".to_owned(), "status".to_owned()],
@@ -32514,11 +32580,23 @@ fn expr_has_agg_owned_by_target(
                 if let Ok(spec) = resolve_over_clause(wref, defs)
                     && (spec.partition_by.iter().any(|pe| {
                         expr_has_agg_owned_by_target(
-                            pe, target_idx, cur_scopes, defs, db_set, ctes, functions,
+                            pe,
+                            target_idx,
+                            cur_scopes,
+                            &[],
+                            db_set,
+                            ctes,
+                            functions,
                         )
                     }) || spec.order_by.iter().any(|ob| {
                         expr_has_agg_owned_by_target(
-                            &ob.expr, target_idx, cur_scopes, defs, db_set, ctes, functions,
+                            &ob.expr,
+                            target_idx,
+                            cur_scopes,
+                            &[],
+                            db_set,
+                            ctes,
+                            functions,
                         )
                     }))
                 {
@@ -33138,13 +33216,12 @@ fn first_regular_agg_in_order_by(
                 }
                 if let Ok(spec) = resolve_over_clause(wref, defs) {
                     for pe in &spec.partition_by {
-                        if let Some(found) = first_regular_agg_in_order_by(pe, defs, functions) {
+                        if let Some(found) = first_regular_agg_in_order_by(pe, &[], functions) {
                             return Some(found);
                         }
                     }
                     for ob in &spec.order_by {
-                        if let Some(found) =
-                            first_regular_agg_in_order_by(&ob.expr, defs, functions)
+                        if let Some(found) = first_regular_agg_in_order_by(&ob.expr, &[], functions)
                         {
                             return Some(found);
                         }
@@ -34207,6 +34284,9 @@ fn validate_expr_static_with_win_stage(
                 if scope.lookup_cref_full(cref)?.is_some() {
                     return Ok(());
                 }
+            }
+            if db_set.dqs_dml() && cref.schema.is_none() && cref.table.is_none() {
+                return Ok(());
             }
             Err(SqliteError::new(
                 ErrorCode::Error,

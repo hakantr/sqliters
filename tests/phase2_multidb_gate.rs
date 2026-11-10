@@ -607,12 +607,12 @@ fn test_gate2_1_c_sqlite_3541_reference_and_phase2_manifest() {
 
     assert_eq!(p2_total, 7, "expected 7 Phase 2 attach*/tempdb* wrappers");
     assert_eq!(
-        p2_active, 5,
-        "expected 5 active Phase 2 wrappers (attach, attach2, attach3, attach4, tempdb)"
+        p2_active, 6,
+        "expected 6 active Phase 2 wrappers (attach, attach2, attach3, attach4, tempdb, tempdb2)"
     );
     assert_eq!(
-        p2_ignored, 2,
-        "expected 2 ignored Phase 2 wrappers (attachmalloc, tempdb2)"
+        p2_ignored, 1,
+        "expected 1 ignored Phase 2 wrapper (attachmalloc)"
     );
     assert!(walmode_active, "walmode.test must be active in Phase 2");
     assert!(manifest_active_total >= 14);

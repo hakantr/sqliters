@@ -1,5 +1,6 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "67/111 subtests passed; pending: ATTACH"]
 fn test_savepoint() {
     sqliters_tcltest::run_test_script(
         "savepoint",

@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "requires Phase 6 Tcl user-defined window function registration (create_window_function)"]
 fn test_window5() {
     let raw = include_str!("../../sqlite/test/window5.test");
     let script = sqliters_tcltest::strip_test_comments(raw);

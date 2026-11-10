@@ -265,21 +265,24 @@ fn phase3_gate_c_reference_and_manifest_audit() {
         "wal",
         "windowfunc",
         "analyze",
+        "auth",
+        "progress",
+        "trace",
+        "incrblob",
+        "lfs",
         "xfer_opt",
     ] {
         assert_eq!(
             cap_map.get(enabled_cap),
             Some(&true),
-            "capability `{enabled_cap}` must be enabled in Phase 5"
+            "capability `{enabled_cap}` must be enabled in Phase 6"
         );
     }
-    for pending_cap in [
-        "stat4", "auth", "progress", "trace", "incrblob", "vtab", "fts5", "rtree", "json", "json1",
-    ] {
+    for pending_cap in ["stat4", "vtab", "fts5", "rtree", "json", "json1"] {
         assert_eq!(
             cap_map.get(pending_cap),
             Some(&false),
-            "Phase 6..7 capability `{pending_cap}` must remain false in Phase 5"
+            "Phase 7 capability `{pending_cap}` must remain false in Phase 6"
         );
     }
 
@@ -331,10 +334,10 @@ fn phase3_gate_c_reference_and_manifest_audit() {
         p3_total, 17,
         "expected 17 Phase 3 wrappers (view*, upsert*, upfrom*, alterdropcol*, withM)"
     );
-    assert_eq!(p3_active, 14, "expected 14 active Phase 3 manifest suites");
+    assert_eq!(p3_active, 15, "expected 15 active Phase 3 manifest suites");
     assert_eq!(
-        p3_ignored, 3,
-        "expected 3 ignored Phase 3 manifest suites (view, upsertfault, upfromfault)"
+        p3_ignored, 2,
+        "expected 2 ignored Phase 3 manifest suites (upsertfault, upfromfault)"
     );
     assert_eq!(
         p3_active_ids,
@@ -350,6 +353,7 @@ fn phase3_gate_c_reference_and_manifest_audit() {
             "sqlite/test/upsert3.test",
             "sqlite/test/upsert4.test",
             "sqlite/test/upsert5.test",
+            "sqlite/test/view.test",
             "sqlite/test/view2.test",
             "sqlite/test/view3.test",
             "sqlite/test/withM.test",

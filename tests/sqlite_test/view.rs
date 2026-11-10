@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "view-25.1..25.2 execute unguarded ANALYZE + db authorizer (pending Phase 5 analyze and Phase 6 auth); all 119 non-auth subtests pass and are verified in phase3_view_upsert_dropcol_cte"]
 fn test_view() {
     let raw = include_str!("../../sqlite/test/view.test");
     let script = sqliters_tcltest::strip_test_comments(raw);

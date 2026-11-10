@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 #[test]
 fn test_lock3() {
     sqliters_tcltest::run_test_script(
