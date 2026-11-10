@@ -1,0 +1,10 @@
+BEGIN;
+INSERT INTO customers VALUES(1,'Ada','İstanbul'),(2,'O''Brien','東京'),(3,'Zoë',NULL),(4,'Unmatched','');
+INSERT INTO orders VALUES(10,1,12.5,'paid'),(11,1,0.0,NULL),(12,2,19.75,'pending'),(13,NULL,7.0,'orphan'),(14,99,4.0,'unknown');
+INSERT INTO items VALUES(101,10,'A',2,3.0),(102,10,'B',1,6.5),(103,12,'A',3,6.5),(104,NULL,'Z',1,1.0);
+INSERT INTO employees VALUES(1,NULL,'Lead','R&D'),(2,1,'Dev A','R&D'),(3,1,'Dev B','R&D'),(4,2,'Intern',NULL);
+INSERT INTO join_keys VALUES(1,'dup-a'),(1,'dup-b'),(NULL,'null-key'),(77,'unmatched-key');
+INSERT INTO inventory VALUES('A',10,3.0),('B',5,6.5);
+INSERT INTO fk_parent VALUES(1),(2);
+INSERT INTO fk_child VALUES(1,1),(2,1),(3,2);
+COMMIT;

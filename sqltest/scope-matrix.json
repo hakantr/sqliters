@@ -1,0 +1,146 @@
+{
+  "schema": 1,
+  "kind": "STATIC_SCOPE_MATRIX",
+  "execution_status": "NOT_RUN",
+  "families": [
+    {
+      "family": "aggregate",
+      "static_scenarios": 2,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "family": "alter",
+      "static_scenarios": 1,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "family": "conflict",
+      "static_scenarios": 6,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "family": "cte",
+      "static_scenarios": 2,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "family": "ddl",
+      "static_scenarios": 5,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "family": "dml",
+      "static_scenarios": 4,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "family": "foreign_key",
+      "static_scenarios": 3,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "family": "function",
+      "static_scenarios": 3,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "family": "index",
+      "static_scenarios": 3,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "family": "join",
+      "static_scenarios": 14,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "family": "management",
+      "static_scenarios": 5,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "family": "select",
+      "static_scenarios": 3,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "family": "set",
+      "static_scenarios": 4,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "family": "storage",
+      "static_scenarios": 1,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "family": "syntax",
+      "static_scenarios": 4,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "family": "transaction",
+      "static_scenarios": 4,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "family": "trigger",
+      "static_scenarios": 3,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "family": "value",
+      "static_scenarios": 5,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "family": "window",
+      "static_scenarios": 3,
+      "execution_status": "NOT_RUN"
+    }
+  ],
+  "physical_data": {
+    "normal_records": 10000,
+    "relational_records": {
+      "customers": 3000,
+      "orders": 12000,
+      "items": 24000,
+      "employees": 1000,
+      "measurements": 10000
+    }
+  },
+  "wide_sql_plans": [
+    {
+      "columns": 2000,
+      "planned_rows": 3000,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "columns": 4096,
+      "planned_rows": 3000,
+      "execution_status": "NOT_RUN"
+    }
+  ],
+  "large_relational_queries": {
+    "path": "examples/large-join-queries.sql",
+    "planned_top_level_selects": 13,
+    "execution_status": "NOT_RUN"
+  },
+  "boundary_families": [
+    "table",
+    "view",
+    "select",
+    "index",
+    "update-set",
+    "group-by",
+    "order-by",
+    "insert-values"
+  ],
+  "planned_step_2_only": [
+    "extension fixtures",
+    "WAL multi-connection/process instructions",
+    "crash/recovery instructions",
+    "API action instructions"
+  ],
+  "coverage_limit": "Family examples only; not exhaustive grammar/combinations; no SQL validity or result proof."
+}
