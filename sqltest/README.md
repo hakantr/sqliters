@@ -3,9 +3,12 @@
 Kontrol harici Python ile yapılır; Rust `#[test]` yazılmaz. Bu görevde yalnız
 pinned C SQLite çalıştırılır; sqliters derlenmez veya çalıştırılmaz.
 
-Güncel durum: **2A kod incelemesi tamamlandı.** Ebeveyn 24 Python kontrolünü ve
-45 küçük C preflight kontrolünü yeniden çalıştırdı. Tam 168 doğruluk işi ve
-222 süre örneği henüz **NOT_RUN**; bunlar ayrı 2B koşusunda alınacaktır.
+Güncel durum: **C-only 2B baseline PASS_SCOPED.** İncelenmiş `5ef303d`
+koduyla 168 doğruluk işi, 74 warmup ve 222 süre örneği tamamlandı;
+bağımsız audit ve 222 salt okunur DB integrity kontrolü geçti.
+[Ölçülmüş sonuç ve sınırlar](results/external-baseline.md).
+Sonuç dosyaları ebeveyn incelemesi bekliyor. Rust çalıştırılmadı;
+WAL çoklu süreç/crash/ileri API tarifleri NOT_RUN kalır.
 
 ## Veri ve oracle ayrımı
 
@@ -38,12 +41,15 @@ python3 sqltest/harness_controls.py
 python3 sqltest/external.py preflight
 ```
 
-Gözden geçirilmiş temiz kod commit'iyle C-only baseline:
+Tamamlanan tarihsel C-only baseline ve mevcut kanıtın denetimi:
 
 ```sh
-python3 sqltest/external.py measure --reviewed-commit REVIEWED_COMMIT --output sqltest/artifacts/external/runs/c-baseline-001
+python3 sqltest/external.py measure --reviewed-commit 5ef303d --output sqltest/artifacts/external/runs/c-baseline-001
 python3 sqltest/audit.py sqltest/artifacts/external/runs/c-baseline-001
 ```
+
+İlk komutun mevcut çıktı dizini doludur; tekrar ölçüm için ayrı, gözden
+geçirilmiş bir koşu gerekir. Kanıtı incelemek için ikinci komut yeterlidir.
 
 Koşu önce 168 tam correctness işini geçirir; sonra 162 ingestion +36 UUID
 CLI-query +24 LIVE örneğini alır. İki oturum × üç tekrar ve oturum başına
@@ -70,6 +76,9 @@ yerini tutmaz. Eksik bundle'da karşılaştırma başlamaz.
   [input manifesti](external-input-manifest.json).
 - [Hazırlık](results/external-preparation.md), [2A uygulama kaydı](results/external-implementation.md),
   [kontroller](results/external-controls.json), [preflight](results/external-preflight.json).
+- [C baseline raporu](results/external-baseline.md),
+  [kanıt indeksi](results/external-baseline-index.json),
+  [aggregate süreler](results/external-timing-summary.csv).
 - `examples/schema.sql`, `seed.sql`, `scenarios/*.sql`, `large-join-queries.sql`:
   küçük kaynak örnekleri ve SQL aileleri; [eski scope](scope-matrix.json).
 - `examples/optional/`, `additional/`, `stress/`: JSON/JSONB/FTS5/R-Tree,
