@@ -1805,10 +1805,22 @@ fn index_is_covering_for_query(
 
     for rc in proj {
         match rc {
-            ResultColumn::Star | ResultColumn::TableStar { .. } => {
+            ResultColumn::Star => {
                 for (ci, _) in tbl.columns.iter().enumerate() {
                     if !index_provides_table_col(idx, tbl, ci) {
                         return false;
+                    }
+                }
+            }
+            ResultColumn::TableStar { table, .. } => {
+                let effective_table = alias.unwrap_or(&tbl.name);
+                if table.eq_ignore_ascii_case(effective_table)
+                    || table.eq_ignore_ascii_case(&tbl.name)
+                {
+                    for (ci, _) in tbl.columns.iter().enumerate() {
+                        if !index_provides_table_col(idx, tbl, ci) {
+                            return false;
+                        }
                     }
                 }
             }
@@ -1991,7 +2003,22 @@ fn expr_covered_by_index(
         Expr::FunctionCall {
             args, filter, over, ..
         } => {
-            if over.is_some() {
+            let over_ok = match over {
+                None => true,
+                Some(WindowRef::Name(_)) => false,
+                Some(WindowRef::Spec(ws)) => {
+                    ws.base_window.is_none()
+                        && ws
+                            .partition_by
+                            .iter()
+                            .all(|e| expr_covered_by_index(e, idx, tbl, schema_name, alias))
+                        && ws
+                            .order_by
+                            .iter()
+                            .all(|ob| expr_covered_by_index(&ob.expr, idx, tbl, schema_name, alias))
+                }
+            };
+            if !over_ok {
                 return false;
             }
             let args_ok = match args {
@@ -4539,6 +4566,13 @@ pub fn compile_for_explain_in_db_set(
                     "relational query"
                 };
                 prog.emit(Instruction::new(Opcode::OpenEphemeral, 0, 0, 0).with_comment(comment));
+                if select_has_repeated_from_table_in_db_set(sel) {
+                    prog.emit(
+                        Instruction::new(Opcode::OpenEphemeral, 1, 0, 0)
+                            .with_p4(P4::Str("OpenDup".to_owned()))
+                            .with_comment("OpenDup"),
+                    );
+                }
             } else {
                 prog.emit(Instruction::new(Opcode::OpenRead, 0, 2, 0).with_comment("flattened"));
             }
@@ -5019,6 +5053,29 @@ fn select_uses_seek_scan_in_db_set(sel: &SelectStmt, db_set: &DatabaseSet) -> bo
             .iter()
             .any(|idx| idx.stat1.as_ref().is_some_and(|s| s.has_stat1))
     })
+}
+
+fn select_has_repeated_from_table_in_db_set(sel: &SelectStmt) -> bool {
+    let SelectCore::Select { from: Some(fc), .. } = &sel.body.head else {
+        return false;
+    };
+    if fc.joins.is_empty() {
+        return false;
+    }
+    let mut names: Vec<String> = Vec::with_capacity(1 + fc.joins.len());
+    if let TableOrSubquery::Table { name, .. } = &fc.head {
+        names.push(name.name.to_ascii_lowercase());
+    }
+    for j in &fc.joins {
+        if let TableOrSubquery::Table { name, .. } = &j.right {
+            let lower = name.name.to_ascii_lowercase();
+            if names.contains(&lower) {
+                return true;
+            }
+            names.push(lower);
+        }
+    }
+    false
 }
 
 fn expr_contains_between(expr: &Expr) -> bool {
@@ -6601,6 +6658,45 @@ where
                     .any(|c| c.name.eq_ignore_ascii_case(&qn.name))
         };
 
+        let resolve_cte_target_name = |qn: &QualifiedName| -> Option<String> {
+            if qn.schema.is_some() {
+                return None;
+            }
+            let c = sel
+                .ctes
+                .iter()
+                .rev()
+                .find(|c| c.name.eq_ignore_ascii_case(&qn.name))?;
+            if c.query.body.compounds.is_empty()
+                && c.query.order_by.is_empty()
+                && c.query.limit.is_none()
+                && let SelectCore::Select {
+                    distinct: false,
+                    ref projection,
+                    from: Some(ref c_fc),
+                    selection: None,
+                    ref group_by,
+                    having: None,
+                    ref windows,
+                } = c.query.body.head
+                && group_by.is_empty()
+                && windows.is_empty()
+                && c_fc.joins.is_empty()
+                && matches!(projection.as_slice(), [ResultColumn::Star])
+                && let TableOrSubquery::Table {
+                    name: ref inner_qn, ..
+                } = c_fc.head
+                && inner_qn.schema.is_none()
+                && sel
+                    .ctes
+                    .iter()
+                    .any(|base| base.name.eq_ignore_ascii_case(&inner_qn.name))
+            {
+                return Some(inner_qn.name.clone());
+            }
+            Some(c.name.clone())
+        };
+
         if let SelectCore::Select {
             projection,
             from: Some(fc),
@@ -6610,6 +6706,81 @@ where
             ..
         } = &sel.body.head
         {
+            if fc.joins.is_empty()
+                && let TableOrSubquery::Subquery { query, alias } = &fc.head
+            {
+                if query.body.compounds.is_empty()
+                    && query.order_by.is_empty()
+                    && query.limit.is_none()
+                    && !crate::window::core_has_regular_aggregates(
+                        &query.body.head,
+                        &query.order_by,
+                    )
+                    && !core_has_window(&query.body.head, &query.order_by)
+                {
+                    let mut merged_q = (**query).clone();
+                    let mut combined_ctes = sel.ctes.clone();
+                    combined_ctes.extend(merged_q.ctes);
+                    merged_q.ctes = combined_ctes;
+                    return explain_select_plan(
+                        &merged_q,
+                        parent,
+                        resolve_relation,
+                        active_views,
+                        push_node,
+                    );
+                } else if !query.order_by.is_empty() {
+                    let sub_label = alias.as_deref().unwrap_or("(subquery-xxxxxx)");
+                    let co_id = push_node(parent, format!("CO-ROUTINE {sub_label}"));
+                    explain_select_plan(query, co_id, resolve_relation, active_views, push_node)?;
+                    let _ = push_node(parent, format!("SCAN {sub_label}"));
+                    return Ok(());
+                }
+            }
+
+            if !sel.ctes.is_empty() {
+                let mut ref_counts: Vec<(String, usize)> = Vec::new();
+                let mut count_tos = |tos: &TableOrSubquery| {
+                    if let TableOrSubquery::Table { name, .. } = tos
+                        && let Some(canon) = resolve_cte_target_name(name)
+                    {
+                        if let Some((_, cnt)) = ref_counts
+                            .iter_mut()
+                            .find(|(n, _)| n.eq_ignore_ascii_case(&canon))
+                        {
+                            *cnt += 1;
+                        } else {
+                            ref_counts.push((canon, 1));
+                        }
+                    }
+                };
+                count_tos(&fc.head);
+                for j in &fc.joins {
+                    count_tos(&j.right);
+                }
+                for (canon, cnt) in &ref_counts {
+                    if *cnt >= 2
+                        && let Some(cte_def) =
+                            sel.ctes.iter().find(|c| c.name.eq_ignore_ascii_case(canon))
+                    {
+                        let mat_id = push_node(parent, format!("MATERIALIZE {}", cte_def.name));
+                        explain_select_plan(
+                            &cte_def.query,
+                            mat_id,
+                            resolve_relation,
+                            active_views,
+                            push_node,
+                        )?;
+                    }
+                }
+            }
+            let window_sort_groups = crate::window::collect_window_sort_groups(sel);
+            let effective_order_by: &[OrderByTerm] =
+                if let Some(first_wg) = window_sort_groups.first() {
+                    first_wg.as_slice()
+                } else {
+                    &sel.order_by
+                };
             let mut order_by_satisfied = false;
             if fc.joins.is_empty()
                 && let TableOrSubquery::Table {
@@ -6641,7 +6812,7 @@ where
                                 projection: Some(projection),
                                 group_by,
                                 having: having.as_ref(),
-                                order_by: &sel.order_by,
+                                order_by: effective_order_by,
                                 indexed_by: indexed_by.as_ref(),
                                 is_count_star_only: is_pure_count_star_projection(projection),
                             },
@@ -6652,7 +6823,7 @@ where
                             sname,
                             alias.as_deref(),
                             selection.as_ref(),
-                            &sel.order_by,
+                            effective_order_by,
                         );
                         let disp = alias.as_deref().unwrap_or(&tbl.name);
                         emit_plan_nodes(parent, &plan, disp, "", push_node);
@@ -6904,10 +7075,12 @@ where
                                         push_node,
                                     )?;
                                 } else {
-                                    let _ = push_node(
-                                        parent,
-                                        format!("SCAN {}", alias.as_deref().unwrap_or(&name.name)),
-                                    );
+                                    let disp_name = alias
+                                        .as_deref()
+                                        .map(str::to_owned)
+                                        .or_else(|| resolve_cte_target_name(name))
+                                        .unwrap_or_else(|| name.name.clone());
+                                    let _ = push_node(parent, format!("SCAN {disp_name}"));
                                 }
                             }
                             TableOrSubquery::Subquery { .. } => {
@@ -6917,10 +7090,14 @@ where
                     }
                 }
             }
-            if !sel.order_by.is_empty()
-                && !order_by_satisfied
-                && !core_has_window(&sel.body.head, &sel.order_by)
-            {
+            if !window_sort_groups.is_empty() {
+                let first_needs_sort = !order_by_satisfied;
+                let total_window_sorts =
+                    usize::from(first_needs_sort) + window_sort_groups.len().saturating_sub(1);
+                for _ in 0..total_window_sorts {
+                    let _ = push_node(parent, "USE TEMP B-TREE FOR ORDER BY".to_owned());
+                }
+            } else if !sel.order_by.is_empty() && !order_by_satisfied {
                 let _ = push_node(parent, "USE TEMP B-TREE FOR ORDER BY".to_owned());
             }
         } else {
@@ -6933,6 +7110,24 @@ where
         Stmt::Select(sel) => {
             let mut active_views = Vec::new();
             explain_select_plan(sel, 0, &resolve_relation, &mut active_views, &mut push_node)?;
+        }
+        Stmt::Insert(ins) => {
+            if let InsertSource::Select(ref src_sel) = ins.source {
+                let mut merged_sel = (**src_sel).clone();
+                let mut combined_ctes = ins.ctes.clone();
+                combined_ctes.extend(merged_sel.ctes);
+                merged_sel.ctes = combined_ctes;
+                let mut active_views = Vec::new();
+                explain_select_plan(
+                    &merged_sel,
+                    0,
+                    &resolve_relation,
+                    &mut active_views,
+                    &mut push_node,
+                )?;
+            } else {
+                let _ = push_node(0, "EXECUTE STATEMENT".to_owned());
+            }
         }
         Stmt::Update(upd) => {
             if let Some((_, sname, slot_schema, ResolvedRelation::Table(tbl))) =

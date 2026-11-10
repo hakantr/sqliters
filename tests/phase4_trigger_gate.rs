@@ -266,32 +266,23 @@ fn phase4_gate_c_reference_and_manifest_audit() {
         "vacuum",
         "view",
         "wal",
+        "windowfunc",
+        "analyze",
         "xfer_opt",
     ] {
         assert_eq!(
             cap_map.get(enabled_cap),
             Some(&true),
-            "capability `{enabled_cap}` must be enabled in Phase 4"
+            "capability `{enabled_cap}` must be enabled in Phase 5"
         );
     }
     for pending_cap in [
-        "windowfunc",
-        "analyze",
-        "stat4",
-        "auth",
-        "progress",
-        "trace",
-        "incrblob",
-        "vtab",
-        "fts5",
-        "rtree",
-        "json",
-        "json1",
+        "stat4", "auth", "progress", "trace", "incrblob", "vtab", "fts5", "rtree", "json", "json1",
     ] {
         assert_eq!(
             cap_map.get(pending_cap),
             Some(&false),
-            "Phase 5..7 capability `{pending_cap}` must remain false in Phase 4"
+            "Phase 6..7 capability `{pending_cap}` must remain false in Phase 5"
         );
     }
 
@@ -387,15 +378,16 @@ finish_test
         p4_total, 18,
         "expected 18 Phase 4 wrappers (altertrig + trigger1..9, triggerA..G, triggerupfrom)"
     );
-    assert_eq!(p4_active, 15, "expected 15 active Phase 4 manifest suites");
+    assert_eq!(p4_active, 17, "expected 17 active Phase 4 manifest suites");
     assert_eq!(
-        p4_ignored, 3,
-        "expected 3 ignored Phase 4 manifest suites (trigger1, trigger6, triggerE)"
+        p4_ignored, 1,
+        "expected 1 ignored Phase 4 manifest suite (trigger6)"
     );
     assert_eq!(
         p4_active_ids,
         vec![
             "sqlite/test/altertrig.test",
+            "sqlite/test/trigger1.test",
             "sqlite/test/trigger2.test",
             "sqlite/test/trigger3.test",
             "sqlite/test/trigger4.test",
@@ -407,6 +399,7 @@ finish_test
             "sqlite/test/triggerB.test",
             "sqlite/test/triggerC.test",
             "sqlite/test/triggerD.test",
+            "sqlite/test/triggerE.test",
             "sqlite/test/triggerF.test",
             "sqlite/test/triggerG.test",
             "sqlite/test/triggerupfrom.test",

@@ -263,32 +263,23 @@ fn phase3_gate_c_reference_and_manifest_audit() {
         "vacuum",
         "view",
         "wal",
+        "windowfunc",
+        "analyze",
         "xfer_opt",
     ] {
         assert_eq!(
             cap_map.get(enabled_cap),
             Some(&true),
-            "capability `{enabled_cap}` must be enabled in Phase 4"
+            "capability `{enabled_cap}` must be enabled in Phase 5"
         );
     }
     for pending_cap in [
-        "windowfunc",
-        "analyze",
-        "stat4",
-        "auth",
-        "progress",
-        "trace",
-        "incrblob",
-        "vtab",
-        "fts5",
-        "rtree",
-        "json",
-        "json1",
+        "stat4", "auth", "progress", "trace", "incrblob", "vtab", "fts5", "rtree", "json", "json1",
     ] {
         assert_eq!(
             cap_map.get(pending_cap),
             Some(&false),
-            "Phase 5..7 capability `{pending_cap}` must remain false in Phase 4"
+            "Phase 6..7 capability `{pending_cap}` must remain false in Phase 5"
         );
     }
 
@@ -340,10 +331,10 @@ fn phase3_gate_c_reference_and_manifest_audit() {
         p3_total, 17,
         "expected 17 Phase 3 wrappers (view*, upsert*, upfrom*, alterdropcol*, withM)"
     );
-    assert_eq!(p3_active, 13, "expected 13 active Phase 3 manifest suites");
+    assert_eq!(p3_active, 14, "expected 14 active Phase 3 manifest suites");
     assert_eq!(
-        p3_ignored, 4,
-        "expected 4 ignored Phase 3 manifest suites (view, upfrom2, upsertfault, upfromfault)"
+        p3_ignored, 3,
+        "expected 3 ignored Phase 3 manifest suites (view, upsertfault, upfromfault)"
     );
     assert_eq!(
         p3_active_ids,
@@ -351,6 +342,7 @@ fn phase3_gate_c_reference_and_manifest_audit() {
             "sqlite/test/alterdropcol.test",
             "sqlite/test/alterdropcol2.test",
             "sqlite/test/upfrom1.test",
+            "sqlite/test/upfrom2.test",
             "sqlite/test/upfrom3.test",
             "sqlite/test/upfrom4.test",
             "sqlite/test/upsert1.test",

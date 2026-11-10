@@ -406,6 +406,85 @@ pub fn can_push_where_into_window_select(subquery: &SelectStmt, outer_where: &Ex
     expr_only_references_partition_terms(outer_where, &first.partition_by)
 }
 
+fn order_by_terms_match(a: &OrderByTerm, b: &OrderByTerm) -> bool {
+    a.expr == b.expr
+        && a.desc == b.desc
+        && a.nulls_last.unwrap_or(a.desc) == b.nulls_last.unwrap_or(b.desc)
+}
+
+fn order_by_slice_is_prefix(short: &[OrderByTerm], long: &[OrderByTerm]) -> bool {
+    short.len() <= long.len()
+        && short
+            .iter()
+            .zip(long.iter())
+            .all(|(a, b)| order_by_terms_match(a, b))
+}
+
+/// Collects the distinct merged `(PARTITION BY ++ ORDER BY)` sort-order groups required by
+/// window functions in `sel` (`selectWindowRewriteEList` in `sqlite/src/window.c`).
+pub fn collect_window_sort_groups(sel: &SelectStmt) -> Vec<Vec<OrderByTerm>> {
+    if !core_has_window(&sel.body.head, &sel.order_by) {
+        return Vec::new();
+    }
+    let SelectCore::Select {
+        projection,
+        windows,
+        ..
+    } = &sel.body.head
+    else {
+        return Vec::new();
+    };
+    let defs = chain_window_definitions(windows).unwrap_or_default();
+    let mut specs = Vec::new();
+    for rc in projection {
+        if let ResultColumn::Expr { expr, .. } = rc {
+            let _ = collect_resolved_specs_in_expr(expr, &defs, &mut specs);
+        }
+    }
+    for ob in &sel.order_by {
+        let _ = collect_resolved_specs_in_expr(&ob.expr, &defs, &mut specs);
+    }
+    let mut groups: Vec<Vec<OrderByTerm>> = Vec::new();
+    for spec in specs {
+        let mut combined: Vec<OrderByTerm> =
+            Vec::with_capacity(spec.partition_by.len() + spec.order_by.len());
+        for p_expr in spec.partition_by {
+            let term = OrderByTerm {
+                expr: p_expr,
+                desc: false,
+                nulls_last: None,
+            };
+            if !combined
+                .iter()
+                .any(|existing| order_by_terms_match(existing, &term))
+            {
+                combined.push(term);
+            }
+        }
+        for ob in spec.order_by {
+            if !combined
+                .iter()
+                .any(|existing| order_by_terms_match(existing, &ob))
+            {
+                combined.push(ob);
+            }
+        }
+        if combined.is_empty() {
+            continue;
+        }
+        if let Some(existing_group) = groups.iter_mut().find(|g| {
+            order_by_slice_is_prefix(g, &combined) || order_by_slice_is_prefix(&combined, g)
+        }) {
+            if combined.len() > existing_group.len() {
+                *existing_group = combined;
+            }
+        } else {
+            groups.push(combined);
+        }
+    }
+    groups
+}
+
 fn collect_resolved_specs_in_expr(
     expr: &Expr,
     defs: &[(String, ResolvedWindowSpec)],

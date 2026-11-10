@@ -28,6 +28,48 @@ mod alterdropcol2;
 #[path = "sqlite_test/altertrig.rs"]
 mod altertrig;
 #[allow(non_snake_case)]
+#[path = "sqlite_test/analyze.rs"]
+mod analyze;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/analyze3.rs"]
+mod analyze3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/analyze4.rs"]
+mod analyze4;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/analyze5.rs"]
+mod analyze5;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/analyze6.rs"]
+mod analyze6;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/analyze7.rs"]
+mod analyze7;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/analyze8.rs"]
+mod analyze8;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/analyze9.rs"]
+mod analyze9;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/analyzeC.rs"]
+mod analyzeC;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/analyzeD.rs"]
+mod analyzeD;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/analyzeE.rs"]
+mod analyzeE;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/analyzeF.rs"]
+mod analyzeF;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/analyzeG.rs"]
+mod analyzeG;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/analyzer1.rs"]
+mod analyzer1;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/attach.rs"]
 mod attach;
 #[allow(non_snake_case)]
@@ -918,6 +960,57 @@ mod whereM;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/whereN.rs"]
 mod whereN;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/window1.rs"]
+mod window1;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/window2.rs"]
+mod window2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/window3.rs"]
+mod window3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/window4.rs"]
+mod window4;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/window5.rs"]
+mod window5;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/window6.rs"]
+mod window6;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/window7.rs"]
+mod window7;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/window8.rs"]
+mod window8;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/window9.rs"]
+mod window9;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/windowA.rs"]
+mod windowA;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/windowB.rs"]
+mod windowB;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/windowC.rs"]
+mod windowC;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/windowD.rs"]
+mod windowD;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/windowE.rs"]
+mod windowE;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/windowerr.rs"]
+mod windowerr;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/windowfault.rs"]
+mod windowfault;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/windowpushd.rs"]
+mod windowpushd;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/with1.rs"]
 mod with1;

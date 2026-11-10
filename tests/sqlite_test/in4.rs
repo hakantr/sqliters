@@ -1,5 +1,6 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "64/83 subtests passed; pending: VIRTUAL TABLE, ANALYZE/sqlite_stat1, EQP/optimizer"]
 fn test_in4() {
     sqliters_tcltest::run_test_script(
         "in4",

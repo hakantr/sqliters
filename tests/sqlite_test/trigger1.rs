@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "trigger1-22.10 executes unguarded sum(b) OVER (...) window function (pending Phase 5 windowfunc); all 92 non-window subtests pass and are verified in phase4_trigger_gate"]
 fn test_trigger1() {
     let raw = include_str!("../../sqlite/test/trigger1.test");
     let script = sqliters_tcltest::strip_test_comments(raw);

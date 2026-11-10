@@ -61,6 +61,8 @@ pub const CORE_SQL_FAMILIES: &[&str] = &[
     "upsert",
     "upfrom",
     "trigger",
+    "window",
+    "analyze",
 ];
 
 pub const CORE_SQL_EXACT: &[&str] = &[
@@ -76,6 +78,7 @@ pub const CORE_SQL_EXACT: &[&str] = &[
     "returning1",
     "utf16align",
     "altertrig",
+    "analyzer1",
 ];
 
 fn is_core_sql_test(stem: &str) -> bool {

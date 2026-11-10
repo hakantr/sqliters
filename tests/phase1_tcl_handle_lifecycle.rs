@@ -943,10 +943,10 @@ fn explicit_capability_table_and_zero_subtest_guard() {
     assert_eq!(phase1_capability("view"), Some(true));
     assert_eq!(phase1_capability("upsert"), Some(true));
     assert_eq!(phase1_capability("trigger"), Some(true));
+    assert_eq!(phase1_capability("windowfunc"), Some(true));
+    assert_eq!(phase1_capability("analyze"), Some(true));
     assert_eq!(phase1_capability("default_autovacuum"), Some(false));
     for disabled in [
-        "windowfunc",
-        "analyze",
         "stat4",
         "progress",
         "trace",
@@ -957,6 +957,7 @@ fn explicit_capability_table_and_zero_subtest_guard() {
         "fts5",
         "json",
         "fts3",
+        "fts4",
         "load_ext",
         "shared_cache",
         "utf16",
@@ -967,7 +968,7 @@ fn explicit_capability_table_and_zero_subtest_guard() {
         assert_eq!(
             phase1_capability(disabled),
             Some(false),
-            "capability `{disabled}` must be explicitly 0 in Phase 4"
+            "capability `{disabled}` must be explicitly 0 in Phase 5"
         );
     }
     assert_eq!(phase1_capability("nonexistent_xyz"), None);
@@ -992,6 +993,7 @@ do_test 1.1 {
     [capable upsert] \
     [capable trigger] \
     [capable windowfunc] \
+    [capable analyze] \
     [capable progress] \
     [capable trace] \
     [capable auth] \
@@ -1009,7 +1011,7 @@ do_test 1.1 {
     [capable prefer_proxy_locking] \
     [capable nonexistent_xyz] \
     [capable !nonexistent_xyz]
-} {1 1 1 1 1 1 1 0 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1}
+} {1 1 1 1 1 1 1 0 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1}
 
 finish_test
 "#;

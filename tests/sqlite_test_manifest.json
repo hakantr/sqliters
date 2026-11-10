@@ -7,9 +7,9 @@
     "sqlite/ext/rtree"
   ],
   "summary": {
-    "total_registered": 92,
-    "active": 43,
-    "ignored": 49
+    "total_registered": 123,
+    "active": 62,
+    "ignored": 61
   },
   "tests": [
     {
@@ -73,6 +73,303 @@
       "ignore_reason": null,
       "observed_passed_subtests": 36,
       "expected_subtest_count": 36
+    },
+    {
+      "id": "sqlite/test/analyze.test",
+      "source_root": "sqlite/test",
+      "relative_path": "analyze.test",
+      "source_path": "sqlite/test/analyze.test",
+      "sha256": "2f291e5db46757f9959f08c19c91f1cbe4664199ef40e8a379ea865ab313f656",
+      "wrapper_path": "tests/sqlite_test/analyze.rs",
+      "module_name": "analyze",
+      "test_fn": "test_analyze",
+      "phase": "5",
+      "required_capabilities": [
+        "analyze"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 40,
+      "expected_subtest_count": 40
+    },
+    {
+      "id": "sqlite/test/analyze3.test",
+      "source_root": "sqlite/test",
+      "relative_path": "analyze3.test",
+      "source_path": "sqlite/test/analyze3.test",
+      "sha256": "d63370fdacbe88bf3c8ae3d604e2083de4b4aef25770c9d862990d5edb4c67f9",
+      "wrapper_path": "tests/sqlite_test/analyze3.rs",
+      "module_name": "analyze3",
+      "test_fn": "test_analyze3",
+      "phase": "5",
+      "required_capabilities": [
+        "analyze",
+        "stat4"
+      ],
+      "external_dependencies": [
+        "SQLITE_ENABLE_STAT4"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires SQLITE_ENABLE_STAT4 (stat4=0; zero subtests without STAT4)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/test/analyze4.test",
+      "source_root": "sqlite/test",
+      "relative_path": "analyze4.test",
+      "source_path": "sqlite/test/analyze4.test",
+      "sha256": "4004b1d847bd5e5a3fad56988aca1c5daa61ba0d5bdac39ebc2088a73359231b",
+      "wrapper_path": "tests/sqlite_test/analyze4.rs",
+      "module_name": "analyze4",
+      "test_fn": "test_analyze4",
+      "phase": "5",
+      "required_capabilities": [
+        "analyze"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 5,
+      "expected_subtest_count": 5
+    },
+    {
+      "id": "sqlite/test/analyze5.test",
+      "source_root": "sqlite/test",
+      "relative_path": "analyze5.test",
+      "source_path": "sqlite/test/analyze5.test",
+      "sha256": "8dedba0315406139ae056290f94ccaa9f14c9e26cfb4c6af8adbdd29c64b6cad",
+      "wrapper_path": "tests/sqlite_test/analyze5.rs",
+      "module_name": "analyze5",
+      "test_fn": "test_analyze5",
+      "phase": "5",
+      "required_capabilities": [
+        "analyze",
+        "stat4"
+      ],
+      "external_dependencies": [
+        "SQLITE_ENABLE_STAT4"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires SQLITE_ENABLE_STAT4 (stat4=0; zero subtests without STAT4)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/test/analyze6.test",
+      "source_root": "sqlite/test",
+      "relative_path": "analyze6.test",
+      "source_path": "sqlite/test/analyze6.test",
+      "sha256": "548ccd8f132d54594469a09fa1297fe276c4362cfb4812aa7e7b2696779d3ca4",
+      "wrapper_path": "tests/sqlite_test/analyze6.rs",
+      "module_name": "analyze6",
+      "test_fn": "test_analyze6",
+      "phase": "5",
+      "required_capabilities": [
+        "analyze",
+        "stat4"
+      ],
+      "external_dependencies": [
+        "SQLITE_ENABLE_STAT4"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires SQLITE_ENABLE_STAT4 (stat4=0; zero subtests without STAT4)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/test/analyze7.test",
+      "source_root": "sqlite/test",
+      "relative_path": "analyze7.test",
+      "source_path": "sqlite/test/analyze7.test",
+      "sha256": "27c023a81043e7c7746324cb51adb30c4527b6cad931793162ec316a976457c3",
+      "wrapper_path": "tests/sqlite_test/analyze7.rs",
+      "module_name": "analyze7",
+      "test_fn": "test_analyze7",
+      "phase": "5",
+      "required_capabilities": [
+        "analyze"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 15,
+      "expected_subtest_count": 15
+    },
+    {
+      "id": "sqlite/test/analyze8.test",
+      "source_root": "sqlite/test",
+      "relative_path": "analyze8.test",
+      "source_path": "sqlite/test/analyze8.test",
+      "sha256": "3e960b51f224c2bb74508d2a009a276e5628d593bae7e0c97aeec18969bcf2a1",
+      "wrapper_path": "tests/sqlite_test/analyze8.rs",
+      "module_name": "analyze8",
+      "test_fn": "test_analyze8",
+      "phase": "5",
+      "required_capabilities": [
+        "analyze",
+        "stat4"
+      ],
+      "external_dependencies": [
+        "SQLITE_ENABLE_STAT4"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires SQLITE_ENABLE_STAT4 (stat4=0; zero subtests without STAT4)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/test/analyze9.test",
+      "source_root": "sqlite/test",
+      "relative_path": "analyze9.test",
+      "source_path": "sqlite/test/analyze9.test",
+      "sha256": "04ec547f8fde4a76a45bab1510a3a03e82319bb4bb3831d233757251524e88fc",
+      "wrapper_path": "tests/sqlite_test/analyze9.rs",
+      "module_name": "analyze9",
+      "test_fn": "test_analyze9",
+      "phase": "5",
+      "required_capabilities": [
+        "analyze",
+        "stat4"
+      ],
+      "external_dependencies": [
+        "SQLITE_ENABLE_STAT4"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires SQLITE_ENABLE_STAT4 (stat4=0; zero subtests without STAT4)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/test/analyzeC.test",
+      "source_root": "sqlite/test",
+      "relative_path": "analyzeC.test",
+      "source_path": "sqlite/test/analyzeC.test",
+      "sha256": "1642c6f9047ae89c7222960d1cb15e5aedd0e9348e84b0f8473e75b767837d4a",
+      "wrapper_path": "tests/sqlite_test/analyzeC.rs",
+      "module_name": "analyzeC",
+      "test_fn": "test_analyzeC",
+      "phase": "5",
+      "required_capabilities": [
+        "analyze"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 24,
+      "expected_subtest_count": 24
+    },
+    {
+      "id": "sqlite/test/analyzeD.test",
+      "source_root": "sqlite/test",
+      "relative_path": "analyzeD.test",
+      "source_path": "sqlite/test/analyzeD.test",
+      "sha256": "1a541b02522607ae2737222753fbaff3c33bd856273e2e8668f7afffa5680762",
+      "wrapper_path": "tests/sqlite_test/analyzeD.rs",
+      "module_name": "analyzeD",
+      "test_fn": "test_analyzeD",
+      "phase": "5",
+      "required_capabilities": [
+        "analyze",
+        "stat4"
+      ],
+      "external_dependencies": [
+        "SQLITE_ENABLE_STAT4"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires SQLITE_ENABLE_STAT4 (stat4=0; zero subtests without STAT4)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/test/analyzeE.test",
+      "source_root": "sqlite/test",
+      "relative_path": "analyzeE.test",
+      "source_path": "sqlite/test/analyzeE.test",
+      "sha256": "fb65c0a522eff09a557bb94ad3ba6cd6436f7f233f7a40edf294b369257f57bd",
+      "wrapper_path": "tests/sqlite_test/analyzeE.rs",
+      "module_name": "analyzeE",
+      "test_fn": "test_analyzeE",
+      "phase": "5",
+      "required_capabilities": [
+        "analyze",
+        "stat4"
+      ],
+      "external_dependencies": [
+        "SQLITE_ENABLE_STAT4"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires SQLITE_ENABLE_STAT4 (stat4=0; zero subtests without STAT4)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/test/analyzeF.test",
+      "source_root": "sqlite/test",
+      "relative_path": "analyzeF.test",
+      "source_path": "sqlite/test/analyzeF.test",
+      "sha256": "74aadd6ae6580f4e660b0090135cce276b3955a034de1ecec728cc79c9d8a026",
+      "wrapper_path": "tests/sqlite_test/analyzeF.rs",
+      "module_name": "analyzeF",
+      "test_fn": "test_analyzeF",
+      "phase": "5",
+      "required_capabilities": [
+        "analyze",
+        "stat4"
+      ],
+      "external_dependencies": [
+        "SQLITE_ENABLE_STAT4"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires SQLITE_ENABLE_STAT4 (stat4=0; zero subtests without STAT4)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/test/analyzeG.test",
+      "source_root": "sqlite/test",
+      "relative_path": "analyzeG.test",
+      "source_path": "sqlite/test/analyzeG.test",
+      "sha256": "d12aaf6793b2ee54789e2e802df4b2647f77d2c7e603b3c96f961d40e5989143",
+      "wrapper_path": "tests/sqlite_test/analyzeG.rs",
+      "module_name": "analyzeG",
+      "test_fn": "test_analyzeG",
+      "phase": "5",
+      "required_capabilities": [
+        "analyze",
+        "stat4"
+      ],
+      "external_dependencies": [
+        "SQLITE_ENABLE_STAT4"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires SQLITE_ENABLE_STAT4 (stat4=0; zero subtests without STAT4)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/test/analyzer1.test",
+      "source_root": "sqlite/test",
+      "relative_path": "analyzer1.test",
+      "source_path": "sqlite/test/analyzer1.test",
+      "sha256": "937a2676e84958f8071d2a148c6b6235585c3e6f5ef96dd64b4472115dfc132a",
+      "wrapper_path": "tests/sqlite_test/analyzer1.rs",
+      "module_name": "analyzer1",
+      "test_fn": "test_analyzer1",
+      "phase": "5",
+      "required_capabilities": [
+        "analyze",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "dbstat",
+        "sqlite3_analyzer"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires Phase 7 dbstat virtual table and sqlite3_analyzer utility",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 4
     },
     {
       "id": "sqlite/test/attach.test",
@@ -382,12 +679,10 @@
         "view",
         "windowfunc"
       ],
-      "external_dependencies": [
-        "OVER"
-      ],
-      "status": "ignored",
-      "ignore_reason": "trigger1-22.10 executes unguarded sum(b) OVER (...) window function (pending Phase 5 windowfunc); all 92 non-window subtests pass and are verified in phase4_trigger_gate",
-      "observed_passed_subtests": 92,
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 93,
       "expected_subtest_count": 93
     },
     {
@@ -646,12 +941,10 @@
         "tempdb",
         "windowfunc"
       ],
-      "external_dependencies": [
-        "OVER"
-      ],
-      "status": "ignored",
-      "ignore_reason": "triggerE-1.1.11 and 1.2.11 execute unguarded max(b) OVER (...) window function (pending Phase 5 windowfunc); all 24 non-window subtests pass and are verified in phase4_trigger_gate",
-      "observed_passed_subtests": 24,
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 26,
       "expected_subtest_count": 26
     },
     {
@@ -748,12 +1041,10 @@
         "trigger",
         "windowfunc"
       ],
-      "external_dependencies": [
-        "OVER"
-      ],
-      "status": "ignored",
-      "ignore_reason": "upfrom2-7.0..7.1 execute unguarded window function COUNT(*) OVER () (pending Phase 5 windowfunc); 1.1..6.2 (44 subtests) pass and are verified in phase4_trigger_gate",
-      "observed_passed_subtests": 44,
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 46,
       "expected_subtest_count": 46
     },
     {
@@ -1940,6 +2231,347 @@
       "ignore_reason": "requires C testvfs/tvfs VFS callback instrumentation",
       "observed_passed_subtests": 0,
       "expected_subtest_count": 34
+    },
+    {
+      "id": "sqlite/test/window1.test",
+      "source_root": "sqlite/test",
+      "relative_path": "window1.test",
+      "source_path": "sqlite/test/window1.test",
+      "sha256": "dc9a5374e8dc9a786ccece5a345aebc6895ef13ced00e0b86063e2e5b9afb88e",
+      "wrapper_path": "tests/sqlite_test/window1.rs",
+      "module_name": "window1",
+      "test_fn": "test_window1",
+      "phase": "5",
+      "required_capabilities": [
+        "windowfunc",
+        "view",
+        "trigger",
+        "cte"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 347,
+      "expected_subtest_count": 347
+    },
+    {
+      "id": "sqlite/test/window2.test",
+      "source_root": "sqlite/test",
+      "relative_path": "window2.test",
+      "source_path": "sqlite/test/window2.test",
+      "sha256": "5872e41f5c6b008308d44a8ab0d37d9e4584af1e03b1a5f40d6fd4ba46c8ebdc",
+      "wrapper_path": "tests/sqlite_test/window2.rs",
+      "module_name": "window2",
+      "test_fn": "test_window2",
+      "phase": "5",
+      "required_capabilities": [
+        "windowfunc"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 67,
+      "expected_subtest_count": 67
+    },
+    {
+      "id": "sqlite/test/window3.test",
+      "source_root": "sqlite/test",
+      "relative_path": "window3.test",
+      "source_path": "sqlite/test/window3.test",
+      "sha256": "acbc32508a01d5611887662ddab89b657edb6d06878832c1547edffe1dfae6f7",
+      "wrapper_path": "tests/sqlite_test/window3.rs",
+      "module_name": "window3",
+      "test_fn": "test_window3",
+      "phase": "5",
+      "required_capabilities": [
+        "windowfunc"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 1602,
+      "expected_subtest_count": 1602
+    },
+    {
+      "id": "sqlite/test/window4.test",
+      "source_root": "sqlite/test",
+      "relative_path": "window4.test",
+      "source_path": "sqlite/test/window4.test",
+      "sha256": "518d6a178feb357dc28f3765ae854a1c635df1a73854003647d2948acc001aac",
+      "wrapper_path": "tests/sqlite_test/window4.rs",
+      "module_name": "window4",
+      "test_fn": "test_window4",
+      "phase": "5",
+      "required_capabilities": [
+        "windowfunc"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 225,
+      "expected_subtest_count": 225
+    },
+    {
+      "id": "sqlite/test/window5.test",
+      "source_root": "sqlite/test",
+      "relative_path": "window5.test",
+      "source_path": "sqlite/test/window5.test",
+      "sha256": "9e074194c19edcd42a7afd304b0c0603bbbe9a75ac94d7dda4094f88419ed1ec",
+      "wrapper_path": "tests/sqlite_test/window5.rs",
+      "module_name": "window5",
+      "test_fn": "test_window5",
+      "phase": "5",
+      "required_capabilities": [
+        "windowfunc"
+      ],
+      "external_dependencies": [
+        "create_window_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires Phase 6 Tcl user-defined window function registration (create_window_function)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 28
+    },
+    {
+      "id": "sqlite/test/window6.test",
+      "source_root": "sqlite/test",
+      "relative_path": "window6.test",
+      "source_path": "sqlite/test/window6.test",
+      "sha256": "4175eebbad9030219e808ebb0a3f347d1f5ed714987b48e2d33246fdc976df27",
+      "wrapper_path": "tests/sqlite_test/window6.rs",
+      "module_name": "window6",
+      "test_fn": "test_window6",
+      "phase": "5",
+      "required_capabilities": [
+        "windowfunc"
+      ],
+      "external_dependencies": [
+        "db func",
+        "db collate"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires Phase 6 Tcl user-defined SQL function and collation callbacks (db func, db collate); pure-SQL subtests verified in phase5_window_analyze_planner_gate",
+      "observed_passed_subtests": 25,
+      "expected_subtest_count": 29
+    },
+    {
+      "id": "sqlite/test/window7.test",
+      "source_root": "sqlite/test",
+      "relative_path": "window7.test",
+      "source_path": "sqlite/test/window7.test",
+      "sha256": "a3c4ed8f46b53d0d49d9e45705b2476c46e42fed595ad03934ce028dab24d6c8",
+      "wrapper_path": "tests/sqlite_test/window7.rs",
+      "module_name": "window7",
+      "test_fn": "test_window7",
+      "phase": "5",
+      "required_capabilities": [
+        "windowfunc"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 10,
+      "expected_subtest_count": 10
+    },
+    {
+      "id": "sqlite/test/window8.test",
+      "source_root": "sqlite/test",
+      "relative_path": "window8.test",
+      "source_path": "sqlite/test/window8.test",
+      "sha256": "2e0c3afa73288ee3db21c079796b201dec32f052324589a3719cf5d64b92a070",
+      "wrapper_path": "tests/sqlite_test/window8.rs",
+      "module_name": "window8",
+      "test_fn": "test_window8",
+      "phase": "5",
+      "required_capabilities": [
+        "windowfunc"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 361,
+      "expected_subtest_count": 361
+    },
+    {
+      "id": "sqlite/test/window9.test",
+      "source_root": "sqlite/test",
+      "relative_path": "window9.test",
+      "source_path": "sqlite/test/window9.test",
+      "sha256": "b6ee5840152fbd4a70dbd8edb4c6a08bb1cf6b7665562fbf76a940e416d52246",
+      "wrapper_path": "tests/sqlite_test/window9.rs",
+      "module_name": "window9",
+      "test_fn": "test_window9",
+      "phase": "5",
+      "required_capabilities": [
+        "windowfunc"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 42,
+      "expected_subtest_count": 42
+    },
+    {
+      "id": "sqlite/test/windowA.test",
+      "source_root": "sqlite/test",
+      "relative_path": "windowA.test",
+      "source_path": "sqlite/test/windowA.test",
+      "sha256": "f4307dde60c0075f5e2d7c5c0e588d912d43eb53b5ac07e18bd69b64e545dfcc",
+      "wrapper_path": "tests/sqlite_test/windowA.rs",
+      "module_name": "windowA",
+      "test_fn": "test_windowA",
+      "phase": "5",
+      "required_capabilities": [
+        "windowfunc"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 18,
+      "expected_subtest_count": 18
+    },
+    {
+      "id": "sqlite/test/windowB.test",
+      "source_root": "sqlite/test",
+      "relative_path": "windowB.test",
+      "source_path": "sqlite/test/windowB.test",
+      "sha256": "0ac1bedaa70084e672410e30a937207dea309769986243d0924af0c5b6649969",
+      "wrapper_path": "tests/sqlite_test/windowB.rs",
+      "module_name": "windowB",
+      "test_fn": "test_windowB",
+      "phase": "5",
+      "required_capabilities": [
+        "windowfunc",
+        "json1"
+      ],
+      "external_dependencies": [
+        "json_group_array",
+        "json_group_object"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires Phase 7 JSON extension aggregate functions (json_group_array, json_group_object); pure-SQL subtests verified in phase5_window_analyze_planner_gate",
+      "observed_passed_subtests": 8,
+      "expected_subtest_count": 30
+    },
+    {
+      "id": "sqlite/test/windowC.test",
+      "source_root": "sqlite/test",
+      "relative_path": "windowC.test",
+      "source_path": "sqlite/test/windowC.test",
+      "sha256": "eed489308c853efc203513d071e52b0d1c95facd085107a995dc79bd604de860",
+      "wrapper_path": "tests/sqlite_test/windowC.rs",
+      "module_name": "windowC",
+      "test_fn": "test_windowC",
+      "phase": "5",
+      "required_capabilities": [
+        "windowfunc"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 43,
+      "expected_subtest_count": 43
+    },
+    {
+      "id": "sqlite/test/windowD.test",
+      "source_root": "sqlite/test",
+      "relative_path": "windowD.test",
+      "source_path": "sqlite/test/windowD.test",
+      "sha256": "2b72d4ca46007d9ee3b4bec9741ce5c4cf46dd7e2d26a77e87823e1c87e2cea5",
+      "wrapper_path": "tests/sqlite_test/windowD.rs",
+      "module_name": "windowD",
+      "test_fn": "test_windowD",
+      "phase": "5",
+      "required_capabilities": [
+        "windowfunc"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 21,
+      "expected_subtest_count": 21
+    },
+    {
+      "id": "sqlite/test/windowE.test",
+      "source_root": "sqlite/test",
+      "relative_path": "windowE.test",
+      "source_path": "sqlite/test/windowE.test",
+      "sha256": "ee8bfcb1e521c3a2b62078afda3d003326fe152b66eb83237b1d8e0e747420e1",
+      "wrapper_path": "tests/sqlite_test/windowE.rs",
+      "module_name": "windowE",
+      "test_fn": "test_windowE",
+      "phase": "5",
+      "required_capabilities": [
+        "windowfunc"
+      ],
+      "external_dependencies": [
+        "db collate",
+        "sqlite3_db_config"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires Phase 6 Tcl custom collation and defensive db_config callbacks; pure-SQL subtests verified in phase5_window_analyze_planner_gate",
+      "observed_passed_subtests": 6,
+      "expected_subtest_count": 8
+    },
+    {
+      "id": "sqlite/test/windowerr.test",
+      "source_root": "sqlite/test",
+      "relative_path": "windowerr.test",
+      "source_path": "sqlite/test/windowerr.test",
+      "sha256": "0561f0a11d87d9615208f4454f9c27712ee12bba7d42a0061ea4d4f3b20cdd1b",
+      "wrapper_path": "tests/sqlite_test/windowerr.rs",
+      "module_name": "windowerr",
+      "test_fn": "test_windowerr",
+      "phase": "5",
+      "required_capabilities": [
+        "windowfunc"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 14,
+      "expected_subtest_count": 14
+    },
+    {
+      "id": "sqlite/test/windowfault.test",
+      "source_root": "sqlite/test",
+      "relative_path": "windowfault.test",
+      "source_path": "sqlite/test/windowfault.test",
+      "sha256": "f63a08789af7262480713dd53f18d5afc09d1eb8dbc6b5f9c0915b3db047304d",
+      "wrapper_path": "tests/sqlite_test/windowfault.rs",
+      "module_name": "windowfault",
+      "test_fn": "test_windowfault",
+      "phase": "5",
+      "required_capabilities": [
+        "windowfunc"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/test/windowpushd.test",
+      "source_root": "sqlite/test",
+      "relative_path": "windowpushd.test",
+      "source_path": "sqlite/test/windowpushd.test",
+      "sha256": "05ec942c8d08f05854852842aa0f80cb0d909bbead50c5d4116e8f65d76e7bf7",
+      "wrapper_path": "tests/sqlite_test/windowpushd.rs",
+      "module_name": "windowpushd",
+      "test_fn": "test_windowpushd",
+      "phase": "5",
+      "required_capabilities": [
+        "windowfunc",
+        "view"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 35,
+      "expected_subtest_count": 35
     },
     {
       "id": "sqlite/test/withM.test",

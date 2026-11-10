@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "upfrom2-7.0..7.1 execute unguarded window function COUNT(*) OVER () (pending Phase 5 windowfunc); 1.1..6.2 (44 subtests) pass and are verified in phase4_trigger_gate"]
 fn test_upfrom2() {
     let raw = include_str!("../../sqlite/test/upfrom2.test");
     let script = sqliters_tcltest::strip_test_comments(raw);

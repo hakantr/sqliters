@@ -1,5 +1,6 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "12/22 subtests passed; pending: EQP/optimizer"]
 fn test_between() {
     sqliters_tcltest::run_test_script(
         "between",

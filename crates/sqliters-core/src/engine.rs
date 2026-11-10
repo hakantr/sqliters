@@ -25692,7 +25692,7 @@ fn rewrite_column_in_create_table_sql(
                     TokenKind::Constraint => {
                         p += 2;
                     }
-                    TokenKind::Check => {
+                    TokenKind::Check | TokenKind::As => {
                         if p + 1 < iend
                             && tokens[p + 1].kind == TokenKind::Lp
                             && let Some(rp) = find_matching_rparen(&tokens, p + 1)
@@ -25780,7 +25780,7 @@ fn rewrite_column_in_create_index_sql(
     };
 
     let mut edits = Vec::new();
-    collect_paren_col_list_edits(&tokens, lp, rp, old_col, new_col, &mut edits);
+    collect_expr_column_edits(&tokens, lp + 1, rp, tbl_name, old_col, new_col, &mut edits);
 
     // Also rewrite `WHERE <expr>` on partial indexes if present
     if let Some(rel_where) = tokens[rp + 1..]

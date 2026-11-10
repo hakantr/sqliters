@@ -1,5 +1,6 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "0/2 subtests passed; pending: ANALYZE/sqlite_stat1, EQP/optimizer"]
 fn test_whereN() {
     sqliters_tcltest::run_test_script(
         "whereN",

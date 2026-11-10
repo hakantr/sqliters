@@ -549,12 +549,14 @@ fn test_gate2_1_c_sqlite_3541_reference_and_phase2_manifest() {
     assert_eq!(cap_map.get("view"), Some(&true));
     assert_eq!(cap_map.get("upsert"), Some(&true));
     assert_eq!(cap_map.get("trigger"), Some(&true));
-    // Phase 5+ capabilities must remain honestly `false`.
-    for pending_cap in ["windowfunc", "vtab", "fts5", "rtree", "json1"] {
+    assert_eq!(cap_map.get("windowfunc"), Some(&true));
+    assert_eq!(cap_map.get("analyze"), Some(&true));
+    // Phase 6+ capabilities must remain honestly `false`.
+    for pending_cap in ["vtab", "fts5", "rtree", "json1"] {
         assert_eq!(
             cap_map.get(pending_cap),
             Some(&false),
-            "Phase 5+ capability {pending_cap} must remain false in Phase 4"
+            "Phase 6+ capability {pending_cap} must remain false in Phase 5"
         );
     }
 

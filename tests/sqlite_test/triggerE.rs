@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "triggerE-1.1.11 and 1.2.11 execute unguarded max(b) OVER (...) window function (pending Phase 5 windowfunc); all 24 non-window subtests pass and are verified in phase4_trigger_gate"]
 fn test_triggerE() {
     let raw = include_str!("../../sqlite/test/triggerE.test");
     let script = sqliters_tcltest::strip_test_comments(raw);

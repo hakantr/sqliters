@@ -442,13 +442,18 @@ fn differential_against_c_sqlite_reference() {
 
 #[test]
 fn targeted_tcl_suite_audit_phase5b() {
+    assert_eq!(
+        sqliters_tcltest::phase1_capability("windowfunc"),
+        Some(true)
+    );
+    assert_eq!(sqliters_tcltest::phase1_capability("analyze"), Some(true));
     let test_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("sqlite/test");
     if !test_dir.exists() {
         return;
     }
     let strict_phase5b_suites = [
         "analyze", "analyze4", "analyze7", "analyzeC", "index6", "index7", "in4", "count",
-        "between", "whereE", "whereF", "whereH", "whereI", "whereK", "whereM",
+        "between", "whereE", "whereF", "whereH", "whereI", "whereK", "whereM", "whereN", "with1",
     ];
     let files = [
         "analyze", "analyze4", "analyze7", "analyzeC", "index6", "index7", "in4", "count", "fkey1",
@@ -463,12 +468,8 @@ fn targeted_tcl_suite_audit_phase5b() {
             continue;
         }
         let raw_script = fs::read_to_string(&path).unwrap();
-        // Enable `ifcapable analyze` in-memory for the Step 5-B targeted audit while keeping
-        // `("analyze", false)` in `PHASE1_CAPABILITY_TABLE` until Step 5-C GATE-5.
         let script = raw_script
-            .replace("ifcapable {!analyze}", "if {0}")
-            .replace("ifcapable !analyze", "if {0}")
-            .replace("ifcapable {!analyze||!vtab}", "if {0}")
+            .replace("ifcapable {!analyze||!vtab}", "ifcapable {!analyze}")
             .replace("ifcapable !vtab", "if {0}")
             .replace("load_static_extension db wholenumber;", "")
             .replace("load_static_extension db wholenumber", "")

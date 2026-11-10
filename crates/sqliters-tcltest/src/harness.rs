@@ -246,12 +246,13 @@ const DEFAULT_HOST_BUILTINS: &[(&str, &str)] = &[
 
 /// Explicit harness capability table (`sqlite_options` / `ifcapable`).
 ///
-/// Only genuinely implemented and verified Phase 1.1..Phase 4 features are mapped to `true`.
+/// Only genuinely implemented and verified Phase 1.1..Phase 5 features are mapped to `true`.
 /// Every unverified, future-phase, or out-of-scope capability is explicitly `false`,
 /// and any unknown capability name evaluates to `None` (`false` + recorded in diagnostics).
 pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
-    // Verified Phase 1.1..Phase 4 SQL, B-tree, pager, WAL, VFS, and lifecycle capabilities:
+    // Verified Phase 1.1..Phase 5 SQL, B-tree, pager, WAL, VFS, and lifecycle capabilities:
     ("altertable", true),
+    ("analyze", true),
     ("attach", true),
     ("autoinc", true),
     ("autoreset", true),
@@ -303,9 +304,9 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("vacuum", true),
     ("view", true),
     ("wal", true),
+    ("windowfunc", true),
     ("xfer_opt", true),
     // Explicitly disabled (future phases or out of scope):
-    ("analyze", false),
     ("atomicwrite", false),
     ("auth", false),
     ("bitvec_test", false),
@@ -317,6 +318,7 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("deprecated", false),
     ("empty_result_callbacks", false),
     ("fts3", false),
+    ("fts4", false),
     ("fts5", false),
     ("get_table", false),
     ("icu", false),
@@ -342,7 +344,6 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("update_delete_limit", false),
     ("utf16", false),
     ("vtab", false),
-    ("windowfunc", false),
 ];
 
 /// Looks up a capability name in the explicit capability table.
