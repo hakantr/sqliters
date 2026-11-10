@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "upfrom4-300..400 execute unguarded CREATE TRIGGER (pending Phase 4 trigger); 1.0..2.2.3 (5 subtests) pass and are verified in phase3_view_upsert_dropcol_cte"]
 fn test_upfrom4() {
     let raw = include_str!("../../sqlite/test/upfrom4.test");
     let script = sqliters_tcltest::strip_test_comments(raw);

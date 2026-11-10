@@ -1,5 +1,6 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "2/6 subtests passed; pending: FOREIGN KEY constraint failed"]
 fn test_fkey4() {
     sqliters_tcltest::run_test_script(
         "fkey4",

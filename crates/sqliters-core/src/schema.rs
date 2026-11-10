@@ -572,6 +572,20 @@ impl Schema {
         let mut raw_index_rows: Vec<(i64, String, String, Pgno, Option<String>)> = Vec::new();
         let mut raw_trigger_rows: Vec<(i64, String, String, Option<String>)> = Vec::new();
 
+        let corrupt_schema_ddl_err =
+            |obj_name: &str, sql_text: &str, parse_err: Option<&str>| -> SqliteError {
+                let disp = if obj_name.is_empty() { "?" } else { obj_name };
+                let trimmed = sql_text.trim_start();
+                if trimmed.len() >= 2
+                    && trimmed.as_bytes()[..2].eq_ignore_ascii_case(b"cr")
+                    && let Some(extra) = parse_err.filter(|s| !s.is_empty())
+                {
+                    SqliteError::corrupt(format!("malformed database schema ({disp}) - {extra}"))
+                } else {
+                    SqliteError::corrupt(format!("malformed database schema ({disp})"))
+                }
+            };
+
         for (rowid, payload) in raw_rows {
             let cols = decode_record_with_encoding(&payload, enc)?;
             if cols.len() < 5 {
@@ -586,12 +600,23 @@ impl Schema {
             match obj_type {
                 "table" => {
                     if let Some(sql_text) = sql_opt {
-                        let (Some(Stmt::CreateTable(ct)), _) =
-                            parse_one(&sql_text).map_err(|_| {
-                                SqliteError::corrupt("database disk image is malformed")
-                            })?
-                        else {
-                            return Err(SqliteError::corrupt("database disk image is malformed"));
+                        let ct = match parse_one(&sql_text) {
+                            Ok((Some(Stmt::CreateTable(ct)), tail)) if tail.trim().is_empty() => ct,
+                            Ok((Some(_), _)) => {
+                                return Err(SqliteError::corrupt(
+                                    "database disk image is malformed",
+                                ));
+                            }
+                            Ok((None, _)) => {
+                                return Err(corrupt_schema_ddl_err(&name, &sql_text, None));
+                            }
+                            Err(e) => {
+                                return Err(corrupt_schema_ddl_err(
+                                    &name,
+                                    &sql_text,
+                                    Some(&e.message),
+                                ));
+                            }
                         };
                         let (mut tbl, autos) = build_table_schema_from_ast(&ct, rootpage)?;
                         tbl.schema_rowid = rowid;
@@ -608,23 +633,22 @@ impl Schema {
                     if let Some(sql_text) = sql_opt {
                         let parsed = parse_one(&sql_text);
                         let cv = match parsed {
-                            Ok((Some(Stmt::CreateView(cv)), _)) => cv,
+                            Ok((Some(Stmt::CreateView(cv)), tail)) if tail.trim().is_empty() => cv,
                             Err(e) => {
                                 if writable_schema {
                                     continue;
                                 }
-                                return Err(SqliteError::corrupt(format!(
-                                    "malformed database schema ({name}) - {}",
-                                    e.message
-                                )));
+                                return Err(corrupt_schema_ddl_err(
+                                    &name,
+                                    &sql_text,
+                                    Some(&e.message),
+                                ));
                             }
                             _ => {
                                 if writable_schema {
                                     continue;
                                 }
-                                return Err(SqliteError::corrupt(
-                                    "database disk image is malformed",
-                                ));
+                                return Err(corrupt_schema_ddl_err(&name, &sql_text, None));
                             }
                         };
                         if let Err(e) = validate_view_no_parameters(&cv.query) {
@@ -676,21 +700,22 @@ impl Schema {
                 continue;
             };
             let mut ct = match parse_one(&sql_text) {
-                Ok((Some(Stmt::CreateTrigger(ct)), _)) => ct,
+                Ok((Some(Stmt::CreateTrigger(ct)), tail)) if tail.trim().is_empty() => ct,
                 Err(e) => {
                     if writable_schema {
                         continue;
                     }
-                    return Err(SqliteError::corrupt(format!(
-                        "malformed database schema ({trig_name}) - {}",
-                        e.message
-                    )));
+                    return Err(corrupt_schema_ddl_err(
+                        &trig_name,
+                        &sql_text,
+                        Some(&e.message),
+                    ));
                 }
                 _ => {
                     if writable_schema {
                         continue;
                     }
-                    return Err(SqliteError::corrupt("database disk image is malformed"));
+                    return Err(corrupt_schema_ddl_err(&trig_name, &sql_text, None));
                 }
             };
 
@@ -854,10 +879,18 @@ impl Schema {
             };
 
             if let Some(sql_text) = sql_opt {
-                let (Some(Stmt::CreateIndex(ci)), _) = parse_one(&sql_text)
-                    .map_err(|_| SqliteError::corrupt("database disk image is malformed"))?
-                else {
-                    return Err(SqliteError::corrupt("database disk image is malformed"));
+                let ci = match parse_one(&sql_text) {
+                    Ok((Some(Stmt::CreateIndex(ci)), tail)) if tail.trim().is_empty() => ci,
+                    Err(e) => {
+                        return Err(corrupt_schema_ddl_err(
+                            &idx_name,
+                            &sql_text,
+                            Some(&e.message),
+                        ));
+                    }
+                    _ => {
+                        return Err(corrupt_schema_ddl_err(&idx_name, &sql_text, None));
+                    }
                 };
                 let mut idx = build_index_schema_from_ast(&ci, tbl, rootpage)?;
                 idx.schema_rowid = rowid;
@@ -1862,6 +1895,7 @@ fn validate_expr_no_params(expr: &Expr) -> Result<()> {
         Expr::Null
         | Expr::Bool(_)
         | Expr::Integer(_)
+        | Expr::OversizedHex(_)
         | Expr::Float(_)
         | Expr::String(_)
         | Expr::Blob(_)
@@ -2256,6 +2290,7 @@ fn fix_expr_with_ctes(
         Expr::Null
         | Expr::Bool(_)
         | Expr::Integer(_)
+        | Expr::OversizedHex(_)
         | Expr::Float(_)
         | Expr::String(_)
         | Expr::Blob(_)

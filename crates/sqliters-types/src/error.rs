@@ -182,6 +182,7 @@ pub mod extended {
     pub const SQLITE_CONSTRAINT_TRIGGER: i32 = (ErrorCode::Constraint as i32) | (7 << 8);
     pub const SQLITE_CONSTRAINT_UNIQUE: i32 = (ErrorCode::Constraint as i32) | (8 << 8);
     pub const SQLITE_CONSTRAINT_ROWID: i32 = (ErrorCode::Constraint as i32) | (10 << 8);
+    pub const SQLITE_CONSTRAINT_PINNED: i32 = (ErrorCode::Constraint as i32) | (11 << 8);
     pub const SQLITE_CONSTRAINT_DATATYPE: i32 = (ErrorCode::Constraint as i32) | (12 << 8);
 
     pub const SQLITE_NOTICE_RECOVER_WAL: i32 = (ErrorCode::Notice as i32) | (1 << 8);

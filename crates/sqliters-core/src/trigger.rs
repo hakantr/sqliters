@@ -492,6 +492,7 @@ fn validate_trig_expr_no_params(expr: &Expr) -> Result<()> {
         Expr::Null
         | Expr::Bool(_)
         | Expr::Integer(_)
+        | Expr::OversizedHex(_)
         | Expr::Float(_)
         | Expr::String(_)
         | Expr::Blob(_)
@@ -749,6 +750,7 @@ fn replace_bind_in_expr(expr: &mut Expr) {
         Expr::Null
         | Expr::Bool(_)
         | Expr::Integer(_)
+        | Expr::OversizedHex(_)
         | Expr::Float(_)
         | Expr::String(_)
         | Expr::Blob(_)
@@ -1309,6 +1311,7 @@ fn fix_trig_expr(
         Expr::Null
         | Expr::Bool(_)
         | Expr::Integer(_)
+        | Expr::OversizedHex(_)
         | Expr::Float(_)
         | Expr::String(_)
         | Expr::Blob(_)
@@ -1708,6 +1711,7 @@ pub fn expr_contains_raise(expr: &Expr) -> bool {
         Expr::Null
         | Expr::Bool(_)
         | Expr::Integer(_)
+        | Expr::OversizedHex(_)
         | Expr::Float(_)
         | Expr::String(_)
         | Expr::Blob(_)
@@ -1756,5 +1760,278 @@ pub fn expr_contains_raise(expr: &Expr) -> bool {
         }
         Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => select_contains_raise(subquery),
         Expr::RowValue(es) => es.iter().any(expr_contains_raise),
+    }
+}
+
+/// Checks whether a parsed [`TriggerSchema`] contains any deferred oversized hex integer literal
+/// (`codeInteger` in `sqlite/src/expr.c:4448-4450`), failing at DML prepare/compile time.
+pub fn validate_trigger_no_oversized_hex(trig: &TriggerSchema) -> Result<()> {
+    if let Some(ref w) = trig.when_clause {
+        check_expr_no_oversized_hex(w)?;
+    }
+    for step in &trig.body {
+        match step {
+            TriggerStep::Select(sel) => check_select_no_oversized_hex(sel)?,
+            TriggerStep::Insert(ins) => {
+                for cte in &ins.ctes {
+                    check_select_no_oversized_hex(&cte.query)?;
+                }
+                match &ins.source {
+                    InsertSource::DefaultValues => {}
+                    InsertSource::Values(rows) => {
+                        for row in rows {
+                            for e in row {
+                                check_expr_no_oversized_hex(e)?;
+                            }
+                        }
+                    }
+                    InsertSource::Select(sel) => check_select_no_oversized_hex(sel)?,
+                }
+                for uc in &ins.upsert_clauses {
+                    if let Some(ref ut) = uc.target
+                        && let Some(ref tw) = ut.where_clause
+                    {
+                        check_expr_no_oversized_hex(tw)?;
+                    }
+                    if let UpsertAction::DoUpdate {
+                        ref assignments,
+                        ref where_clause,
+                    } = uc.action
+                    {
+                        for sa in assignments {
+                            check_expr_no_oversized_hex(&sa.expr)?;
+                        }
+                        if let Some(dw) = where_clause {
+                            check_expr_no_oversized_hex(dw)?;
+                        }
+                    }
+                }
+                for rc in &ins.returning {
+                    if let ResultColumn::Expr { expr, .. } = rc {
+                        check_expr_no_oversized_hex(expr)?;
+                    }
+                }
+            }
+            TriggerStep::Update(upd) => {
+                for cte in &upd.ctes {
+                    check_select_no_oversized_hex(&cte.query)?;
+                }
+                for sa in &upd.assignments {
+                    check_expr_no_oversized_hex(&sa.expr)?;
+                }
+                if let Some(ref fc) = upd.from {
+                    check_from_no_oversized_hex(fc)?;
+                }
+                if let Some(ref w) = upd.selection {
+                    check_expr_no_oversized_hex(w)?;
+                }
+                for rc in &upd.returning {
+                    if let ResultColumn::Expr { expr, .. } = rc {
+                        check_expr_no_oversized_hex(expr)?;
+                    }
+                }
+            }
+            TriggerStep::Delete(del) => {
+                for cte in &del.ctes {
+                    check_select_no_oversized_hex(&cte.query)?;
+                }
+                if let Some(ref w) = del.selection {
+                    check_expr_no_oversized_hex(w)?;
+                }
+                for rc in &del.returning {
+                    if let ResultColumn::Expr { expr, .. } = rc {
+                        check_expr_no_oversized_hex(expr)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_select_no_oversized_hex(sel: &SelectStmt) -> Result<()> {
+    for cte in &sel.ctes {
+        check_select_no_oversized_hex(&cte.query)?;
+    }
+    check_select_core_no_oversized_hex(&sel.body.head)?;
+    for (_, rhs) in &sel.body.compounds {
+        check_select_core_no_oversized_hex(rhs)?;
+    }
+    for ob in &sel.order_by {
+        check_expr_no_oversized_hex(&ob.expr)?;
+    }
+    if let Some(ref lim) = sel.limit {
+        check_expr_no_oversized_hex(&lim.limit)?;
+        if let Some(ref off) = lim.offset {
+            check_expr_no_oversized_hex(off)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_select_core_no_oversized_hex(core: &SelectCore) -> Result<()> {
+    match core {
+        SelectCore::Values(rows) => {
+            for row in rows {
+                for e in row {
+                    check_expr_no_oversized_hex(e)?;
+                }
+            }
+        }
+        SelectCore::Select {
+            projection,
+            from,
+            selection,
+            group_by,
+            having,
+            ..
+        } => {
+            for rc in projection {
+                if let ResultColumn::Expr { expr, .. } = rc {
+                    check_expr_no_oversized_hex(expr)?;
+                }
+            }
+            if let Some(fc) = from {
+                check_from_no_oversized_hex(fc)?;
+            }
+            if let Some(w) = selection {
+                check_expr_no_oversized_hex(w)?;
+            }
+            for g in group_by {
+                check_expr_no_oversized_hex(g)?;
+            }
+            if let Some(h) = having {
+                check_expr_no_oversized_hex(h)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_from_no_oversized_hex(fc: &FromClause) -> Result<()> {
+    check_tos_no_oversized_hex(&fc.head)?;
+    for jc in &fc.joins {
+        check_tos_no_oversized_hex(&jc.right)?;
+        if let Some(JoinConstraint::On(ref e)) = jc.constraint {
+            check_expr_no_oversized_hex(e)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_tos_no_oversized_hex(tos: &TableOrSubquery) -> Result<()> {
+    match tos {
+        TableOrSubquery::Table { table_args, .. } => {
+            if let Some(args) = table_args {
+                for a in args {
+                    check_expr_no_oversized_hex(a)?;
+                }
+            }
+        }
+        TableOrSubquery::Subquery { query, .. } => check_select_no_oversized_hex(query)?,
+    }
+    Ok(())
+}
+
+fn check_expr_no_oversized_hex(expr: &Expr) -> Result<()> {
+    match expr {
+        Expr::OversizedHex(raw) => Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("hex literal too big: {raw}"),
+        )),
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Integer(_)
+        | Expr::Float(_)
+        | Expr::String(_)
+        | Expr::Blob(_)
+        | Expr::CurrentTimeKw(_)
+        | Expr::Bind(_)
+        | Expr::Column(_) => Ok(()),
+        Expr::Unary { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => check_expr_no_oversized_hex(inner),
+        Expr::Binary { left, right, .. } => {
+            check_expr_no_oversized_hex(left)?;
+            check_expr_no_oversized_hex(right)
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            check_expr_no_oversized_hex(e)?;
+            check_expr_no_oversized_hex(low)?;
+            check_expr_no_oversized_hex(high)
+        }
+        Expr::InList { expr: e, list, .. } => {
+            check_expr_no_oversized_hex(e)?;
+            for item in list {
+                check_expr_no_oversized_hex(item)?;
+            }
+            Ok(())
+        }
+        Expr::InSubquery {
+            expr: e, subquery, ..
+        } => {
+            check_expr_no_oversized_hex(e)?;
+            check_select_no_oversized_hex(subquery)
+        }
+        Expr::InTable { expr: e, .. } => check_expr_no_oversized_hex(e),
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            check_expr_no_oversized_hex(e)?;
+            check_expr_no_oversized_hex(pattern)?;
+            if let Some(esc) = escape {
+                check_expr_no_oversized_hex(esc)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                check_expr_no_oversized_hex(op)?;
+            }
+            for (c, v) in branches {
+                check_expr_no_oversized_hex(c)?;
+                check_expr_no_oversized_hex(v)?;
+            }
+            if let Some(el) = else_expr {
+                check_expr_no_oversized_hex(el)?;
+            }
+            Ok(())
+        }
+        Expr::FunctionCall { args, filter, .. } => {
+            if let FunctionArgs::Exprs(es) = args {
+                for e in es {
+                    check_expr_no_oversized_hex(e)?;
+                }
+            }
+            if let Some(f) = filter {
+                check_expr_no_oversized_hex(f)?;
+            }
+            Ok(())
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
+            check_select_no_oversized_hex(subquery)
+        }
+        Expr::Raise { message, .. } => {
+            if let Some(m) = message {
+                check_expr_no_oversized_hex(m)?;
+            }
+            Ok(())
+        }
+        Expr::RowValue(es) => {
+            for e in es {
+                check_expr_no_oversized_hex(e)?;
+            }
+            Ok(())
+        }
     }
 }

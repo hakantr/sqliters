@@ -25,6 +25,9 @@ mod alterdropcol;
 #[path = "sqlite_test/alterdropcol2.rs"]
 mod alterdropcol2;
 #[allow(non_snake_case)]
+#[path = "sqlite_test/altertrig.rs"]
+mod altertrig;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/attach.rs"]
 mod attach;
 #[allow(non_snake_case)]
@@ -579,6 +582,57 @@ mod trans2;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/trans3.rs"]
 mod trans3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/trigger1.rs"]
+mod trigger1;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/trigger2.rs"]
+mod trigger2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/trigger3.rs"]
+mod trigger3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/trigger4.rs"]
+mod trigger4;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/trigger5.rs"]
+mod trigger5;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/trigger6.rs"]
+mod trigger6;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/trigger7.rs"]
+mod trigger7;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/trigger8.rs"]
+mod trigger8;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/trigger9.rs"]
+mod trigger9;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/triggerA.rs"]
+mod triggerA;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/triggerB.rs"]
+mod triggerB;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/triggerC.rs"]
+mod triggerC;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/triggerD.rs"]
+mod triggerD;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/triggerE.rs"]
+mod triggerE;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/triggerF.rs"]
+mod triggerF;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/triggerG.rs"]
+mod triggerG;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/triggerupfrom.rs"]
+mod triggerupfrom;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/types.rs"]
 mod types;

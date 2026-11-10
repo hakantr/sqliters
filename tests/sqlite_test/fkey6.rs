@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "16/42 subtests passed; pending: TRIGGER, VIRTUAL TABLE"]
+#[ignore = "15/38 subtests passed; pending: PRAGMA defer_foreign_keys, sqlite3_db_status, VIRTUAL TABLE"]
 fn test_fkey6() {
     sqliters_tcltest::run_test_script(
         "fkey6",

@@ -246,11 +246,11 @@ const DEFAULT_HOST_BUILTINS: &[(&str, &str)] = &[
 
 /// Explicit harness capability table (`sqlite_options` / `ifcapable`).
 ///
-/// Only genuinely implemented and verified Phase 1.1..Phase 3 features are mapped to `true`.
+/// Only genuinely implemented and verified Phase 1.1..Phase 4 features are mapped to `true`.
 /// Every unverified, future-phase, or out-of-scope capability is explicitly `false`,
 /// and any unknown capability name evaluates to `None` (`false` + recorded in diagnostics).
 pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
-    // Verified Phase 1.1..Phase 3 SQL, B-tree, pager, WAL, VFS, and lifecycle capabilities:
+    // Verified Phase 1.1..Phase 4 SQL, B-tree, pager, WAL, VFS, and lifecycle capabilities:
     ("altertable", true),
     ("attach", true),
     ("autoinc", true),
@@ -297,6 +297,7 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("tclvar", true),
     ("tempdb", true),
     ("threadsafe", true),
+    ("trigger", true),
     ("truncate_opt", true),
     ("upsert", true),
     ("vacuum", true),
@@ -337,7 +338,6 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("shared_cache", false),
     ("stat4", false),
     ("trace", false),
-    ("trigger", false),
     ("unlock_notify", false),
     ("update_delete_limit", false),
     ("utf16", false),
@@ -2684,12 +2684,13 @@ fn db_config_subcmd(
     };
     if args.is_empty() {
         return Ok(format!(
-            "enable_view {}",
+            "enable_trigger {} enable_view {}",
+            i32::from(conn.db_config_enable_trigger(None)),
             i32::from(conn.db_config_enable_view(None))
         ));
     }
-    let opt = args[0].trim();
-    if opt.eq_ignore_ascii_case("enable_view") {
+    let opt = args[0].trim().trim_start_matches('-');
+    if opt.eq_ignore_ascii_case("enable_view") || opt.eq_ignore_ascii_case("enable_trigger") {
         let set_opt = match args.get(1) {
             Some(v) => {
                 let s = v.trim();
@@ -2701,7 +2702,11 @@ fn db_config_subcmd(
             }
             None => None,
         };
-        let cur = conn.db_config_enable_view(set_opt);
+        let cur = if opt.eq_ignore_ascii_case("enable_view") {
+            conn.db_config_enable_view(set_opt)
+        } else {
+            conn.db_config_enable_trigger(set_opt)
+        };
         return Ok(i32::from(cur).to_string());
     }
     Ok("0".to_string())
@@ -2725,6 +2730,15 @@ fn cmd_sqlite3_db_config(host: &SharedHost, cmd_name: &str, args: &[String]) -> 
         || opt.eq_ignore_ascii_case("SQLITE_DBCONFIG_ENABLE_VIEW")
     {
         let mut sub_args = vec!["enable_view".to_string()];
+        if let Some(v) = args.get(2) {
+            sub_args.push(v.clone());
+        }
+        return db_config_subcmd(host, &args[0], db_id, &sub_args);
+    }
+    if opt.eq_ignore_ascii_case("ENABLE_TRIGGER")
+        || opt.eq_ignore_ascii_case("SQLITE_DBCONFIG_ENABLE_TRIGGER")
+    {
+        let mut sub_args = vec!["enable_trigger".to_string()];
         if let Some(v) = args.get(2) {
             sub_args.push(v.clone());
         }
@@ -4000,6 +4014,7 @@ pub fn sqlite_err_name(code: i32) -> &'static str {
         extended::SQLITE_CONSTRAINT_PRIMARYKEY => "SQLITE_CONSTRAINT_PRIMARYKEY",
         extended::SQLITE_CONSTRAINT_UNIQUE => "SQLITE_CONSTRAINT_UNIQUE",
         extended::SQLITE_CONSTRAINT_ROWID => "SQLITE_CONSTRAINT_ROWID",
+        extended::SQLITE_CONSTRAINT_PINNED => "SQLITE_CONSTRAINT_PINNED",
         extended::SQLITE_CONSTRAINT_DATATYPE => "SQLITE_CONSTRAINT_DATATYPE",
         extended::SQLITE_CONSTRAINT_TRIGGER => "SQLITE_CONSTRAINT_TRIGGER",
         extended::SQLITE_NOTICE_RECOVER_WAL => "SQLITE_NOTICE_RECOVER_WAL",

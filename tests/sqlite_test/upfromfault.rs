@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "requires C OOM/I/O fault-simulation harness (do_faultsim_test) and Phase 4 trigger"]
+#[ignore = "requires C OOM/I/O fault-simulation harness (do_faultsim_test)"]
 fn test_upfromfault() {
     let raw = include_str!("../../sqlite/test/upfromfault.test");
     let script = sqliters_tcltest::strip_test_comments(raw);

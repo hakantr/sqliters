@@ -60,6 +60,7 @@ pub const CORE_SQL_FAMILIES: &[&str] = &[
     "view",
     "upsert",
     "upfrom",
+    "trigger",
 ];
 
 pub const CORE_SQL_EXACT: &[&str] = &[
@@ -74,6 +75,7 @@ pub const CORE_SQL_EXACT: &[&str] = &[
     "expr2",
     "returning1",
     "utf16align",
+    "altertrig",
 ];
 
 fn is_core_sql_test(stem: &str) -> bool {

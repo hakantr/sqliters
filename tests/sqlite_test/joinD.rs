@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "1168/1170 subtests passed; pending: TRIGGER"]
 fn test_joinD() {
     sqliters_tcltest::run_test_script(
         "joinD",

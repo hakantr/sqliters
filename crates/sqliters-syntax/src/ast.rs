@@ -675,6 +675,7 @@ pub enum Expr {
     Null,
     Bool(bool),
     Integer(i64),
+    OversizedHex(String),
     Float(f64),
     String(String),
     Blob(Vec<u8>),

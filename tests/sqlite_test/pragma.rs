@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "7/26 subtests passed; pending: TRIGGER, ATTACH, TEMP TABLE"]
+#[ignore = "145/199 subtests passed; pending: C testvfs (tvfs) and PRAGMA integrity_check index row diff"]
 fn test_pragma() {
     sqliters_tcltest::run_test_script(
         "pragma",

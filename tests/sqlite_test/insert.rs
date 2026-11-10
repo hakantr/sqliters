@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "60/83 subtests passed; pending: TRIGGER, TEMP TABLE"]
+#[ignore = "74/83 subtests passed; pending: DQS_DML disabled check and multi-row VALUES arity message"]
 fn test_insert() {
     sqliters_tcltest::run_test_script(
         "insert",

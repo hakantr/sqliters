@@ -7,9 +7,9 @@
     "sqlite/ext/rtree"
   ],
   "summary": {
-    "total_registered": 74,
-    "active": 21,
-    "ignored": 53
+    "total_registered": 92,
+    "active": 43,
+    "ignored": 49
   },
   "tests": [
     {
@@ -27,13 +27,10 @@
         "view",
         "trigger"
       ],
-      "external_dependencies": [
-        "CREATE TRIGGER",
-        "DROP TRIGGER"
-      ],
-      "status": "ignored",
-      "ignore_reason": "alterdropcol-5.4.1..5.5.2 execute unguarded CREATE TRIGGER / DROP TRIGGER (pending Phase 4 trigger); all 96 non-trigger subtests pass and are verified in phase3_view_upsert_dropcol_cte",
-      "observed_passed_subtests": 96,
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 100,
       "expected_subtest_count": 100
     },
     {
@@ -51,13 +48,31 @@
         "view",
         "trigger"
       ],
-      "external_dependencies": [
-        "CREATE TRIGGER"
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 23,
+      "expected_subtest_count": 23
+    },
+    {
+      "id": "sqlite/test/altertrig.test",
+      "source_root": "sqlite/test",
+      "relative_path": "altertrig.test",
+      "source_path": "sqlite/test/altertrig.test",
+      "sha256": "91d967509f8684d17aaab7bae363caac4cb63f15a8d6559d15207f1eea16937b",
+      "wrapper_path": "tests/sqlite_test/altertrig.rs",
+      "module_name": "altertrig",
+      "test_fn": "test_altertrig",
+      "phase": "4",
+      "required_capabilities": [
+        "altertable",
+        "trigger"
       ],
-      "status": "ignored",
-      "ignore_reason": "alterdropcol2-3.0+ executes unguarded CREATE TRIGGER (pending Phase 4 trigger); 1.0..2.4 (15 subtests) pass and are verified in phase3_view_upsert_dropcol_cte",
-      "observed_passed_subtests": 15,
-      "expected_subtest_count": 21
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 36,
+      "expected_subtest_count": 36
     },
     {
       "id": "sqlite/test/attach.test",
@@ -135,12 +150,10 @@
         "wal",
         "trigger"
       ],
-      "external_dependencies": [
-        "CREATE TEMPORARY TRIGGER"
-      ],
-      "status": "ignored",
-      "ignore_reason": "attach4-2.0..2.2 execute unguarded CREATE TEMPORARY TRIGGER / DROP TRIGGER (pending Phase 4 trigger); 1.1..1.8 (10 subtests) pass and are verified in phase2_multidb_gate",
-      "observed_passed_subtests": 10,
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 12,
       "expected_subtest_count": 12
     },
     {
@@ -354,6 +367,353 @@
       "expected_subtest_count": 7
     },
     {
+      "id": "sqlite/test/trigger1.test",
+      "source_root": "sqlite/test",
+      "relative_path": "trigger1.test",
+      "source_path": "sqlite/test/trigger1.test",
+      "sha256": "c7fa1a1baf48999050706b0b2de875135fb6f79ba34c0daa4b6491d9541d163e",
+      "wrapper_path": "tests/sqlite_test/trigger1.rs",
+      "module_name": "trigger1",
+      "test_fn": "test_trigger1",
+      "phase": "4",
+      "required_capabilities": [
+        "trigger",
+        "tempdb",
+        "view",
+        "windowfunc"
+      ],
+      "external_dependencies": [
+        "OVER"
+      ],
+      "status": "ignored",
+      "ignore_reason": "trigger1-22.10 executes unguarded sum(b) OVER (...) window function (pending Phase 5 windowfunc); all 92 non-window subtests pass and are verified in phase4_trigger_gate",
+      "observed_passed_subtests": 92,
+      "expected_subtest_count": 93
+    },
+    {
+      "id": "sqlite/test/trigger2.test",
+      "source_root": "sqlite/test",
+      "relative_path": "trigger2.test",
+      "source_path": "sqlite/test/trigger2.test",
+      "sha256": "c2d7d47b48594496aa586a2a4d290405bac82ad3ed7cca62da8fd8290c3545a4",
+      "wrapper_path": "tests/sqlite_test/trigger2.rs",
+      "module_name": "trigger2",
+      "test_fn": "test_trigger2",
+      "phase": "4",
+      "required_capabilities": [
+        "trigger",
+        "tempdb",
+        "view"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 111,
+      "expected_subtest_count": 111
+    },
+    {
+      "id": "sqlite/test/trigger3.test",
+      "source_root": "sqlite/test",
+      "relative_path": "trigger3.test",
+      "source_path": "sqlite/test/trigger3.test",
+      "sha256": "d1356cf88e9fe999bffa26d0d357f0e6362dc10df61351528bb4981d71ab5236",
+      "wrapper_path": "tests/sqlite_test/trigger3.rs",
+      "module_name": "trigger3",
+      "test_fn": "test_trigger3",
+      "phase": "4",
+      "required_capabilities": [
+        "trigger"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 24,
+      "expected_subtest_count": 24
+    },
+    {
+      "id": "sqlite/test/trigger4.test",
+      "source_root": "sqlite/test",
+      "relative_path": "trigger4.test",
+      "source_path": "sqlite/test/trigger4.test",
+      "sha256": "4e89c58439b14fc5a3855249f93199d7a8dc2c8b72ddf5d34557b3095c80cd4a",
+      "wrapper_path": "tests/sqlite_test/trigger4.rs",
+      "module_name": "trigger4",
+      "test_fn": "test_trigger4",
+      "phase": "4",
+      "required_capabilities": [
+        "trigger",
+        "view"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 24,
+      "expected_subtest_count": 24
+    },
+    {
+      "id": "sqlite/test/trigger5.test",
+      "source_root": "sqlite/test",
+      "relative_path": "trigger5.test",
+      "source_path": "sqlite/test/trigger5.test",
+      "sha256": "7d1e71f8433e1c3c5b87f390bd11cfc90c4cb601b0dfbfaa1c3aed357c6859cd",
+      "wrapper_path": "tests/sqlite_test/trigger5.rs",
+      "module_name": "trigger5",
+      "test_fn": "test_trigger5",
+      "phase": "4",
+      "required_capabilities": [
+        "trigger"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 2,
+      "expected_subtest_count": 2
+    },
+    {
+      "id": "sqlite/test/trigger6.test",
+      "source_root": "sqlite/test",
+      "relative_path": "trigger6.test",
+      "source_path": "sqlite/test/trigger6.test",
+      "sha256": "e1c6ef7ca5016120c0068dd64ad0ec067a7938fd6f55c2f3aafd199daad4e371",
+      "wrapper_path": "tests/sqlite_test/trigger6.rs",
+      "module_name": "trigger6",
+      "test_fn": "test_trigger6",
+      "phase": "4",
+      "required_capabilities": [
+        "trigger"
+      ],
+      "external_dependencies": [
+        "db function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "pending Phase 6 Tcl user-defined SQL function callback (db function counter)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 6
+    },
+    {
+      "id": "sqlite/test/trigger7.test",
+      "source_root": "sqlite/test",
+      "relative_path": "trigger7.test",
+      "source_path": "sqlite/test/trigger7.test",
+      "sha256": "6f2cbb20c4398674bd41e62a4d2c4852fbfcaf93c1fdd520e26395d75a135076",
+      "wrapper_path": "tests/sqlite_test/trigger7.rs",
+      "module_name": "trigger7",
+      "test_fn": "test_trigger7",
+      "phase": "4",
+      "required_capabilities": [
+        "trigger",
+        "tempdb",
+        "explain"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 10,
+      "expected_subtest_count": 10
+    },
+    {
+      "id": "sqlite/test/trigger8.test",
+      "source_root": "sqlite/test",
+      "relative_path": "trigger8.test",
+      "source_path": "sqlite/test/trigger8.test",
+      "sha256": "7f62472a51df2c43e9af4a08701d7d926aff5a1ec8e50deb262396df272c0226",
+      "wrapper_path": "tests/sqlite_test/trigger8.rs",
+      "module_name": "trigger8",
+      "test_fn": "test_trigger8",
+      "phase": "4",
+      "required_capabilities": [
+        "trigger"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 1,
+      "expected_subtest_count": 1
+    },
+    {
+      "id": "sqlite/test/trigger9.test",
+      "source_root": "sqlite/test",
+      "relative_path": "trigger9.test",
+      "source_path": "sqlite/test/trigger9.test",
+      "sha256": "cc8ff702dca648f06bdd087190f0fe80abc413512f90b8178b0ae46cb4c1d72b",
+      "wrapper_path": "tests/sqlite_test/trigger9.rs",
+      "module_name": "trigger9",
+      "test_fn": "test_trigger9",
+      "phase": "4",
+      "required_capabilities": [
+        "trigger",
+        "view"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 28,
+      "expected_subtest_count": 28
+    },
+    {
+      "id": "sqlite/test/triggerA.test",
+      "source_root": "sqlite/test",
+      "relative_path": "triggerA.test",
+      "source_path": "sqlite/test/triggerA.test",
+      "sha256": "d3f76c8e29501b95f53171c23f544ec2977b78eced2664f452ab74321a6fd070",
+      "wrapper_path": "tests/sqlite_test/triggerA.rs",
+      "module_name": "triggerA",
+      "test_fn": "test_triggerA",
+      "phase": "4",
+      "required_capabilities": [
+        "trigger",
+        "view"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 17,
+      "expected_subtest_count": 17
+    },
+    {
+      "id": "sqlite/test/triggerB.test",
+      "source_root": "sqlite/test",
+      "relative_path": "triggerB.test",
+      "source_path": "sqlite/test/triggerB.test",
+      "sha256": "fa0ecbe1572bdfda11ceb4d1316e500d86cc5fbd2a9b85e9d58478dc810611ee",
+      "wrapper_path": "tests/sqlite_test/triggerB.rs",
+      "module_name": "triggerB",
+      "test_fn": "test_triggerB",
+      "phase": "4",
+      "required_capabilities": [
+        "trigger"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 202,
+      "expected_subtest_count": 202
+    },
+    {
+      "id": "sqlite/test/triggerC.test",
+      "source_root": "sqlite/test",
+      "relative_path": "triggerC.test",
+      "source_path": "sqlite/test/triggerC.test",
+      "sha256": "ff20b7d01a2627bfd16cda6d144c82524c935a01dab7a82ac0fef832bc016516",
+      "wrapper_path": "tests/sqlite_test/triggerC.rs",
+      "module_name": "triggerC",
+      "test_fn": "test_triggerC",
+      "phase": "4",
+      "required_capabilities": [
+        "trigger",
+        "view",
+        "foreignkey"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 121,
+      "expected_subtest_count": 121
+    },
+    {
+      "id": "sqlite/test/triggerD.test",
+      "source_root": "sqlite/test",
+      "relative_path": "triggerD.test",
+      "source_path": "sqlite/test/triggerD.test",
+      "sha256": "fa217463e77d8c21c35bf880904b68c165b66c789caba643102ebff5685445a5",
+      "wrapper_path": "tests/sqlite_test/triggerD.rs",
+      "module_name": "triggerD",
+      "test_fn": "test_triggerD",
+      "phase": "4",
+      "required_capabilities": [
+        "trigger",
+        "attach",
+        "tempdb"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 12,
+      "expected_subtest_count": 12
+    },
+    {
+      "id": "sqlite/test/triggerE.test",
+      "source_root": "sqlite/test",
+      "relative_path": "triggerE.test",
+      "source_path": "sqlite/test/triggerE.test",
+      "sha256": "e06b4402b796068981ada8dcc153a1562d9d5672665fe151bd55bad9aa256f14",
+      "wrapper_path": "tests/sqlite_test/triggerE.rs",
+      "module_name": "triggerE",
+      "test_fn": "test_triggerE",
+      "phase": "4",
+      "required_capabilities": [
+        "trigger",
+        "tempdb",
+        "windowfunc"
+      ],
+      "external_dependencies": [
+        "OVER"
+      ],
+      "status": "ignored",
+      "ignore_reason": "triggerE-1.1.11 and 1.2.11 execute unguarded max(b) OVER (...) window function (pending Phase 5 windowfunc); all 24 non-window subtests pass and are verified in phase4_trigger_gate",
+      "observed_passed_subtests": 24,
+      "expected_subtest_count": 26
+    },
+    {
+      "id": "sqlite/test/triggerF.test",
+      "source_root": "sqlite/test",
+      "relative_path": "triggerF.test",
+      "source_path": "sqlite/test/triggerF.test",
+      "sha256": "f1bec6ce2e6b162393448cccbabc0befbcb4ee5623475e25c004d4b6a001a98f",
+      "wrapper_path": "tests/sqlite_test/triggerF.rs",
+      "module_name": "triggerF",
+      "test_fn": "test_triggerF",
+      "phase": "4",
+      "required_capabilities": [
+        "trigger"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 12,
+      "expected_subtest_count": 12
+    },
+    {
+      "id": "sqlite/test/triggerG.test",
+      "source_root": "sqlite/test",
+      "relative_path": "triggerG.test",
+      "source_path": "sqlite/test/triggerG.test",
+      "sha256": "d0f0cbd8e8c9e2451745c76777d8f83e0db56e31c8f9163e071d5d99d90cffb0",
+      "wrapper_path": "tests/sqlite_test/triggerG.rs",
+      "module_name": "triggerG",
+      "test_fn": "test_triggerG",
+      "phase": "4",
+      "required_capabilities": [
+        "trigger",
+        "view"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 8,
+      "expected_subtest_count": 8
+    },
+    {
+      "id": "sqlite/test/triggerupfrom.test",
+      "source_root": "sqlite/test",
+      "relative_path": "triggerupfrom.test",
+      "source_path": "sqlite/test/triggerupfrom.test",
+      "sha256": "c44976eb96b15b47227c24debc6da98bb5bbba5858461f107912c0f9c0f9da00",
+      "wrapper_path": "tests/sqlite_test/triggerupfrom.rs",
+      "module_name": "triggerupfrom",
+      "test_fn": "test_triggerupfrom",
+      "phase": "4",
+      "required_capabilities": [
+        "trigger",
+        "view"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 14,
+      "expected_subtest_count": 14
+    },
+    {
       "id": "sqlite/test/upfrom1.test",
       "source_root": "sqlite/test",
       "relative_path": "upfrom1.test",
@@ -385,14 +745,15 @@
       "phase": "3",
       "required_capabilities": [
         "view",
-        "trigger"
+        "trigger",
+        "windowfunc"
       ],
       "external_dependencies": [
-        "CREATE TRIGGER"
+        "OVER"
       ],
       "status": "ignored",
-      "ignore_reason": "upfrom2 executes unguarded BEFORE/AFTER/INSTEAD OF CREATE TRIGGER across 1.1..6.2 (pending Phase 4 trigger); non-trigger sections pass and are verified in phase3_view_upsert_dropcol_cte",
-      "observed_passed_subtests": 18,
+      "ignore_reason": "upfrom2-7.0..7.1 execute unguarded window function COUNT(*) OVER () (pending Phase 5 windowfunc); 1.1..6.2 (44 subtests) pass and are verified in phase4_trigger_gate",
+      "observed_passed_subtests": 44,
       "expected_subtest_count": 46
     },
     {
@@ -430,12 +791,10 @@
         "view",
         "trigger"
       ],
-      "external_dependencies": [
-        "CREATE TRIGGER"
-      ],
-      "status": "ignored",
-      "ignore_reason": "upfrom4-300..400 execute unguarded CREATE TRIGGER (pending Phase 4 trigger); 1.0..2.2.3 (5 subtests) pass and are verified in phase3_view_upsert_dropcol_cte",
-      "observed_passed_subtests": 5,
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 8,
       "expected_subtest_count": 8
     },
     {
@@ -453,11 +812,10 @@
         "trigger"
       ],
       "external_dependencies": [
-        "do_faultsim_test",
-        "CREATE TRIGGER"
+        "do_faultsim_test"
       ],
       "status": "ignored",
-      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test) and Phase 4 trigger",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
       "observed_passed_subtests": 0,
       "expected_subtest_count": 0
     },
@@ -476,12 +834,10 @@
         "view",
         "trigger"
       ],
-      "external_dependencies": [
-        "CREATE TRIGGER"
-      ],
-      "status": "ignored",
-      "ignore_reason": "upsert1-900 and upsert1-1300 execute unguarded CREATE TRIGGER (pending Phase 4 trigger); all 33 non-trigger subtests pass and are verified in phase3_view_upsert_dropcol_cte",
-      "observed_passed_subtests": 33,
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 35,
       "expected_subtest_count": 35
     },
     {
@@ -498,12 +854,10 @@
         "upsert",
         "trigger"
       ],
-      "external_dependencies": [
-        "CREATE TRIGGER"
-      ],
-      "status": "ignored",
-      "ignore_reason": "upsert2-300..421 execute unguarded CREATE TRIGGER (pending Phase 4 trigger); 100..220 (6 subtests) pass and are verified in phase3_view_upsert_dropcol_cte",
-      "observed_passed_subtests": 6,
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 14,
       "expected_subtest_count": 14
     },
     {
@@ -540,12 +894,10 @@
         "view",
         "trigger"
       ],
-      "external_dependencies": [
-        "CREATE TRIGGER"
-      ],
-      "status": "ignored",
-      "ignore_reason": "upsert4-9.0..9.1 execute unguarded CREATE TRIGGER (pending Phase 4 trigger); 1.0..8.16 (126 subtests) pass and are verified in phase3_view_upsert_dropcol_cte",
-      "observed_passed_subtests": 126,
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 128,
       "expected_subtest_count": 128
     },
     {

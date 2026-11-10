@@ -116,6 +116,9 @@ pub struct StmtTxTracker {
     pub subprogram_stack: Vec<Option<(SchemaInstanceId, i64)>>,
     /// Top-level statement immediate FK suspects (`Vdbe::nFkConstraint` in `vdbeaux.c:3306-3309`).
     pub stmt_fk_suspects: Vec<(SchemaInstanceId, String, TableRowKey, usize)>,
+    /// Table roots pinned by `OP_CursorLock` during `UPDATE` `OE_Replace` conflict delete triggers
+    /// (`(schema_inst, root_pgno, pin_frame_depth)` per `insert.c:2626-2634` and `btree.c:773-775`).
+    pub pinned_table_roots: Vec<(SchemaInstanceId, Pgno, usize)>,
 }
 
 /// Default WAL automatic checkpoint threshold (`SQLITE_DEFAULT_WAL_AUTOCHECKPOINT = 1000`).
@@ -2162,9 +2165,34 @@ pub(crate) fn execute_write_body(
     params: &[Value],
 ) -> Result<QueryOutput> {
     match stmt {
-        Stmt::Insert(ins) => exec_insert(ctx, ins, params),
-        Stmt::Update(upd) => exec_update(ctx, upd, params),
-        Stmt::Delete(del) => exec_delete(ctx, del, params),
+        Stmt::Insert(ins) => {
+            validate_dml_matching_triggers_hex(
+                ctx.db_set,
+                &ins.table,
+                TriggerEventKind::Insert,
+                None,
+            )?;
+            exec_insert(ctx, ins, params)
+        }
+        Stmt::Update(upd) => {
+            let mod_names = collect_set_assignment_col_names(&upd.assignments);
+            validate_dml_matching_triggers_hex(
+                ctx.db_set,
+                &upd.table,
+                TriggerEventKind::Update,
+                Some(&mod_names),
+            )?;
+            exec_update(ctx, upd, params)
+        }
+        Stmt::Delete(del) => {
+            validate_dml_matching_triggers_hex(
+                ctx.db_set,
+                &del.table,
+                TriggerEventKind::Delete,
+                None,
+            )?;
+            exec_delete(ctx, del, params)
+        }
         Stmt::CreateTable(ct) => {
             exec_create_table(ctx, ct)?;
             Ok(QueryOutput::default())
@@ -2703,6 +2731,64 @@ fn exec_select(
                 max_kept: off_val.saturating_add(lim_val as usize),
             });
         }
+    }
+
+    // Fast `OP_Count` path for `SELECT COUNT(*) FROM <table>` with no `WHERE`, `GROUP BY`, `HAVING`,
+    // `ORDER BY`, or `LIMIT` (`sqlite/src/select.c` `isSimpleCount`).
+    if stmt.body.compounds.is_empty()
+        && stmt.order_by.is_empty()
+        && stmt.limit.is_none()
+        && let SelectCore::Select {
+            distinct: false,
+            projection,
+            from: Some(fc),
+            selection: None,
+            group_by,
+            having: None,
+        } = &stmt.body.head
+        && group_by.is_empty()
+        && fc.joins.is_empty()
+        && projection.len() == 1
+        && let ResultColumn::Expr {
+            expr:
+                Expr::FunctionCall {
+                    name: fn_name,
+                    distinct: false,
+                    args: FunctionArgs::Star,
+                    filter: None,
+                },
+            alias: col_alias,
+            span_text,
+        } = &projection[0]
+        && fn_name.eq_ignore_ascii_case("count")
+        && !ctx.functions.has_scalar_name("count")
+        && let TableOrSubquery::Table {
+            name: tbl_qn,
+            table_args: None,
+            indexed_by: None,
+            ..
+        } = &fc.head
+        && (tbl_qn.schema.is_some() || ctes.locate(&tbl_qn.name).is_none())
+        && let Some((db_id, ResolvedRelation::Table(tbl))) =
+            ctx.db_set.find_relation_in_set(tbl_qn)?
+        && !Schema::is_schema_table_name(&tbl.name)
+    {
+        ctx.ensure_read_db(db_id, false)?;
+        let cnt = ctx
+            .db_set
+            .slot_mut(db_id)
+            .and_then(|s| s.btree.as_mut())
+            .map(|bt| bt.count_entries(tbl.root_pgno))
+            .transpose()?
+            .unwrap_or(0);
+        let col_name = col_alias
+            .clone()
+            .or_else(|| span_text.clone())
+            .unwrap_or_else(|| "count(*)".to_owned());
+        return Ok(QueryOutput {
+            column_names: vec![col_name],
+            rows: vec![vec![Value::Integer(cnt)]],
+        });
     }
 
     if stmt.body.compounds.is_empty() {
@@ -4357,7 +4443,9 @@ fn expr_can_eval_with_cols(
         | Expr::Blob(_)
         | Expr::CurrentTimeKw(_)
         | Expr::Bind(_) => true,
-        Expr::Subquery(_) | Expr::Exists { .. } | Expr::Raise { .. } => false,
+        Expr::Subquery(_) | Expr::Exists { .. } | Expr::Raise { .. } | Expr::OversizedHex(_) => {
+            false
+        }
         Expr::Column(cref) => match resolve_unique_col_idx_cref(full_scope_cols, cref) {
             Err(_) => false, // Ambiguous in full join scope: do NOT push down!
             Ok(Some(full_idx)) => {
@@ -7588,6 +7676,10 @@ fn eval_expr_rt(
         Expr::Null => Ok(RuntimeValue::null()),
         Expr::Bool(b) => Ok(RuntimeValue::plain(Value::Integer(i64::from(*b)))),
         Expr::Integer(i) => Ok(RuntimeValue::plain(Value::Integer(*i))),
+        Expr::OversizedHex(raw) => Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("hex literal too big: {raw}"),
+        )),
         Expr::Float(f) => Ok(RuntimeValue::plain(Value::real(*f))),
         Expr::String(s) => Ok(RuntimeValue::plain(Value::Text(s.clone()))),
         Expr::Blob(b) => Ok(RuntimeValue::plain(Value::Blob(b.clone()))),
@@ -9397,6 +9489,53 @@ fn format_unique_index_failure(tbl: &TableSchema, idx: &IndexSchema) -> String {
     }
 }
 
+#[inline]
+fn check_table_not_pinned(ctx: &ExecContext<'_>, db_id: DatabaseId, root_pgno: Pgno) -> Result<()> {
+    if !ctx.stmt_tx.pinned_table_roots.is_empty()
+        && let Some(slot) = ctx.db_set.slot(db_id)
+    {
+        let inst_id = slot.schema_instance_id;
+        let cur_depth = ctx.stmt_tx.subprogram_stack.len();
+        if ctx
+            .stmt_tx
+            .pinned_table_roots
+            .iter()
+            .any(|&(pi, pr, depth)| pi == inst_id && pr == root_pgno && cur_depth > depth)
+        {
+            return Err(SqliteError::constraint(
+                extended::SQLITE_CONSTRAINT_PINNED,
+                "constraint failed",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_dml_matching_triggers_hex(
+    db_set: &DatabaseSet,
+    target_qn: &QualifiedName,
+    event_kind: TriggerEventKind,
+    mod_cols: Option<&[&str]>,
+) -> Result<()> {
+    let Some((db_id, rel)) = db_set.find_relation_in_set(target_qn)? else {
+        return Ok(());
+    };
+    let (target_name, timings): (&str, &[TriggerTiming]) = match &rel {
+        ResolvedRelation::Table(t) => (
+            t.name.as_str(),
+            &[TriggerTiming::Before, TriggerTiming::After],
+        ),
+        ResolvedRelation::View(v) => (v.name.as_str(), &[TriggerTiming::InsteadOf]),
+    };
+    for &timing in timings {
+        let matched = db_set.matching_triggers(db_id, target_name, timing, event_kind, mod_cols);
+        for (_, _, trig) in &matched {
+            crate::trigger::validate_trigger_no_oversized_hex(trig)?;
+        }
+    }
+    Ok(())
+}
+
 /// Deletes `rkey` AND all its secondary index entries from `tbl` in `db_id`.
 fn remove_row_and_indexes(
     ctx: &mut ExecContext<'_>,
@@ -9406,6 +9545,7 @@ fn remove_row_and_indexes(
     rkey: &TableRowKey,
     params: &[Value],
 ) -> Result<bool> {
+    check_table_not_pinned(ctx, db_id, tbl.root_pgno)?;
     if indexes.is_empty() {
         let Some(slot) = ctx.db_set.slot_mut(db_id) else {
             return Ok(false);
@@ -9893,6 +10033,7 @@ fn run_single_trigger_body(
     outer_scopes: &[EvalRow],
     outer_or_conflict: Option<ConflictAction>,
 ) -> Result<TriggerOutcome> {
+    crate::trigger::validate_trigger_no_oversized_hex(trig)?;
     if let Some(ref w) = trig.when_clause
         && !eval_trigger_when_cond(ctx, w, outer_scopes)?
     {
@@ -9984,6 +10125,7 @@ fn replace_conflict_delete_row(
     indexes: &[IndexSchema],
     ckey: &TableRowKey,
     is_catalog: bool,
+    pin_data_cursor: bool,
     params: &[Value],
     did_replace_delete: &mut bool,
     did_replace_trigger: &mut bool,
@@ -10001,71 +10143,93 @@ fn replace_conflict_delete_row(
             None,
         );
 
-    if run_del_triggers {
-        *did_replace_trigger = true;
-        let pscope =
-            make_runtime_table_pseudo_scope(tbl, Some((ckey.rowid_or_zero(), &cvals)), None);
-        if fire_row_triggers(
-            ctx,
-            db_id,
-            &tbl.name,
-            TriggerTiming::Before,
-            TriggerEventKind::Delete,
-            None,
-            pscope,
-            Some(ConflictAction::Replace),
-        )? == TriggerOutcome::Ignored
-        {
+    let pinned_entry = if pin_data_cursor
+        && run_del_triggers
+        && let Some(slot) = ctx.db_set.slot(db_id)
+    {
+        let entry = (
+            slot.schema_instance_id,
+            tbl.root_pgno,
+            ctx.stmt_tx.subprogram_stack.len(),
+        );
+        ctx.stmt_tx.pinned_table_roots.push(entry);
+        Some(entry)
+    } else {
+        None
+    };
+
+    let res = (|| -> Result<()> {
+        if run_del_triggers {
+            *did_replace_trigger = true;
+            let pscope =
+                make_runtime_table_pseudo_scope(tbl, Some((ckey.rowid_or_zero(), &cvals)), None);
+            if fire_row_triggers(
+                ctx,
+                db_id,
+                &tbl.name,
+                TriggerTiming::Before,
+                TriggerEventKind::Delete,
+                None,
+                pscope,
+                Some(ConflictAction::Replace),
+            )? == TriggerOutcome::Ignored
+            {
+                *did_replace_delete = true;
+                return Ok(());
+            }
+        }
+
+        let Some(cpayload2) = seek_table_raw_entry(ctx, db_id, tbl, ckey)? else {
             *did_replace_delete = true;
             return Ok(());
+        };
+        let cvals2 = if run_del_triggers {
+            decode_table_logical_row(ctx, db_id, tbl, ckey, &cpayload2, params)?
+        } else {
+            cvals
+        };
+
+        if *ctx.foreign_keys {
+            check_parent_delete_restrict(ctx, db_id, tbl, &cvals2, params)?;
         }
-    }
-
-    let Some(cpayload2) = seek_table_raw_entry(ctx, db_id, tbl, ckey)? else {
-        *did_replace_delete = true;
-        return Ok(());
-    };
-    let cvals2 = if run_del_triggers {
-        decode_table_logical_row(ctx, db_id, tbl, ckey, &cpayload2, params)?
-    } else {
-        cvals
-    };
-
-    if *ctx.foreign_keys {
-        check_parent_delete_restrict(ctx, db_id, tbl, &cvals2, params)?;
-    }
-    delete_row_via_pipeline(
-        ctx,
-        db_id,
-        tbl,
-        indexes,
-        ckey,
-        Some(&cvals2),
-        MutationOrigin::ReplaceConflictDelete,
-        ConflictAction::Replace,
-        is_catalog,
-        params,
-    )?;
-    *did_replace_delete = true;
-    if *ctx.foreign_keys {
-        apply_parent_delete_fk_actions(ctx, db_id, tbl, &cvals2, params)?;
-    }
-
-    if run_del_triggers {
-        let pscope =
-            make_runtime_table_pseudo_scope(tbl, Some((ckey.rowid_or_zero(), &cvals2)), None);
-        let _ = fire_row_triggers(
+        delete_row_via_pipeline(
             ctx,
             db_id,
-            &tbl.name,
-            TriggerTiming::After,
-            TriggerEventKind::Delete,
-            None,
-            pscope,
-            Some(ConflictAction::Replace),
+            tbl,
+            indexes,
+            ckey,
+            Some(&cvals2),
+            MutationOrigin::ReplaceConflictDelete,
+            ConflictAction::Replace,
+            is_catalog,
+            params,
         )?;
+        *did_replace_delete = true;
+        if *ctx.foreign_keys {
+            apply_parent_delete_fk_actions(ctx, db_id, tbl, &cvals2, params)?;
+        }
+
+        if run_del_triggers {
+            let pscope =
+                make_runtime_table_pseudo_scope(tbl, Some((ckey.rowid_or_zero(), &cvals2)), None);
+            let _ = fire_row_triggers(
+                ctx,
+                db_id,
+                &tbl.name,
+                TriggerTiming::After,
+                TriggerEventKind::Delete,
+                None,
+                pscope,
+                Some(ConflictAction::Replace),
+            )?;
+        }
+        Ok(())
+    })();
+
+    if pinned_entry.is_some() {
+        let _ = ctx.stmt_tx.pinned_table_roots.pop();
     }
-    Ok(())
+    res
 }
 
 /// Validates constraints (NOT NULL, STRICT, CHECK, Rowid/WITHOUT ROWID PK, UNIQUE indexes), applies conflict resolution
@@ -10238,6 +10402,7 @@ fn validate_and_write_row(
                         indexes,
                         &conflict_key,
                         is_catalog,
+                        false,
                         params,
                         did_replace_delete,
                         did_replace_trigger,
@@ -10292,6 +10457,7 @@ fn validate_and_write_row(
                             indexes,
                             &conflict_key,
                             is_catalog,
+                            existing_self_key.is_some(),
                             params,
                             &mut did_replace_delete,
                             &mut did_replace_trigger,
@@ -10357,6 +10523,7 @@ fn validate_and_write_row(
                             indexes,
                             &ckey,
                             is_catalog,
+                            existing_self_key.is_some(),
                             params,
                             &mut did_replace_delete,
                             &mut did_replace_trigger,
@@ -10426,6 +10593,7 @@ fn validate_and_write_row(
     };
 
     // 8. Write table primary B-Tree record & secondary index records
+    check_table_not_pinned(ctx, db_id, tbl.root_pgno)?;
     let phys_rec = encode_table_physical_record(tbl, &raw_vals, enc);
     if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
         if tbl.without_rowid {
@@ -11154,6 +11322,15 @@ fn resolve_fk_parent_cols(
     fk: &ForeignKeySchema,
 ) -> Result<(TableSchema, Vec<usize>)> {
     let Some(ptbl) = schema.find_user_table(&fk.ref_table).cloned() else {
+        if let Some(v) = schema.find_view(&fk.ref_table) {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!(
+                    "foreign key mismatch - \"{child_tbl_name}\" referencing \"{}\"",
+                    v.name
+                ),
+            ));
+        }
         return Err(SqliteError::new(
             ErrorCode::Error,
             format!("no such table: {schema_name}.{}", fk.ref_table),
@@ -14674,6 +14851,7 @@ fn execute_upsert_table_insert_row(
                                 &p.indexes,
                                 &ckey,
                                 p.is_catalog,
+                                false,
                                 params,
                                 &mut did_replace_delete,
                                 &mut did_replace_trigger,
@@ -14724,6 +14902,7 @@ fn execute_upsert_table_insert_row(
                                     &p.indexes,
                                     &ckey,
                                     p.is_catalog,
+                                    false,
                                     params,
                                     &mut did_replace_delete,
                                     &mut did_replace_trigger,
@@ -14814,6 +14993,7 @@ fn execute_upsert_table_insert_row(
                                         &p.indexes,
                                         &ckey,
                                         p.is_catalog,
+                                        false,
                                         params,
                                         &mut did_replace_delete,
                                         &mut did_replace_trigger,
@@ -14950,6 +15130,7 @@ fn execute_upsert_table_insert_row(
         )?;
     }
 
+    check_table_not_pinned(ctx, p.db_id, p.tbl.root_pgno)?;
     let phys_rec = encode_table_physical_record(&p.tbl, &raw_vals, p.enc);
     if let Some(ref mut bt) = ctx.db_set.slot_mut(p.db_id).and_then(|s| s.btree.as_mut()) {
         if p.tbl.without_rowid {
@@ -16393,6 +16574,7 @@ fn prepare_delete_exec(
                 && !has_del_triggers
                 && del.indexed_by.is_none()
             {
+                check_table_not_pinned(ctx, db_id, tbl.root_pgno)?;
                 let count = if tbl.without_rowid {
                     ctx.scan_index_in_db(db_id, tbl.root_pgno, tbl.without_rowid_pk_orders())?
                         .len() as u64
@@ -29721,6 +29903,10 @@ fn validate_expr_static(
     visited_ctes: &mut Vec<(usize, usize)>,
 ) -> Result<()> {
     match expr {
+        Expr::OversizedHex(raw) => Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("hex literal too big: {raw}"),
+        )),
         Expr::Null
         | Expr::Bool(_)
         | Expr::Integer(_)

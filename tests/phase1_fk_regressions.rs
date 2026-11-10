@@ -1,11 +1,12 @@
-//! Phase 1.1 Foreign Key Regressions preserved from `sqlite/test/fkey3.test`
-//! (`implementation_plan.md` lines 135-137, 301).
+//! Phase 1.1..Phase 4 Foreign Key Regressions & `sqlite/test/fkey3.test` 1-to-1 Equivalence
+//! (`implementation_plan.md` Group 31, lines 893, 947).
 //!
-//! Upstream `sqlite/test/fkey3.test` starts with `ifcapable {!foreignkey||!trigger}` even though
-//! none of its 31 subtests create or invoke SQL triggers. With the Phase 1.1 capability table
-//! setting `trigger = 0` (Phase 4) and enforcing the zero-subtest guard, `tests/sqlite_test/fkey3.rs`
-//! is explicitly ignored until Phase 4 while all 31 FK subtests are actively verified here with
-//! their exact source IDs, SQL statements, and expected results/errors.
+//! Upstream `sqlite/test/fkey3.test` starts with `ifcapable {!foreignkey||!trigger}`. In Phases
+//! 1.1..3 (`trigger = 0`), all 31 FK subtests were preserved here while `fkey3.rs` stayed ignored.
+//! Now in Phase 4 (`trigger = 1`), `fkey3.rs` is active AND this suite verifies 1-to-1 subtest
+//! equivalence (`31 == 31`) between the preserved scenarios and the unmodified upstream
+//! `sqlite/test/fkey3.test`, while still verifying the zero-subtest guard when `trigger` is
+//! overridden to `0`.
 #![forbid(unsafe_code)]
 
 const FKEY3_31_SCENARIOS_TCL: &str = r#"
@@ -183,39 +184,61 @@ finish_test
 "#;
 
 #[test]
-fn fkey3_all_31_foreign_key_scenarios_pass_without_trigger_capability() {
+fn fkey3_all_31_foreign_key_scenarios_match_upstream_fkey3_one_to_one() {
     assert_eq!(
         sqliters_tcltest::phase1_capability("foreignkey"),
         Some(true)
     );
-    assert_eq!(sqliters_tcltest::phase1_capability("trigger"), Some(false));
+    assert_eq!(sqliters_tcltest::phase1_capability("trigger"), Some(true));
 
-    let report = sqliters_tcltest::evaluate_test_script("fkey3_phase1", FKEY3_31_SCENARIOS_TCL);
+    let preserved_report =
+        sqliters_tcltest::evaluate_test_script("fkey3_phase1", FKEY3_31_SCENARIOS_TCL);
     assert!(
-        report.is_ok(),
-        "expected all 31 fkey3 subtests to pass: passed={}, failed={:?}, script_error={:?}",
-        report.passed,
-        report.failed,
-        report.script_error,
+        preserved_report.is_ok(),
+        "expected all 31 preserved fkey3 subtests to pass: passed={}, failed={:?}, script_error={:?}",
+        preserved_report.passed,
+        preserved_report.failed,
+        preserved_report.script_error,
     );
     assert_eq!(
-        report.passed, 31,
-        "all 31 fkey3 subtests must execute and pass"
+        preserved_report.passed, 31,
+        "all 31 preserved fkey3 subtests must execute and pass"
     );
-    assert!(report.failed.is_empty());
-    assert!(report.script_error.is_none());
-    assert!(!report.skipped_zero_subtests);
-    assert!(report.unknown_capabilities.is_empty());
+    assert!(preserved_report.failed.is_empty());
+    assert!(preserved_report.script_error.is_none());
+    assert!(!preserved_report.skipped_zero_subtests);
+    assert!(preserved_report.unknown_capabilities.is_empty());
+
+    let original_fkey3_raw = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sqlite/test/fkey3.test"),
+    )
+    .expect("read sqlite/test/fkey3.test");
+    let original_fkey3 = sqliters_tcltest::strip_test_comments(&original_fkey3_raw);
+    let upstream_report =
+        sqliters_tcltest::evaluate_test_script_in_root("sqlite/test", "fkey3", &original_fkey3);
+    assert!(
+        upstream_report.is_ok(),
+        "expected upstream sqlite/test/fkey3.test to pass 100%: passed={}, failed={:?}, script_error={:?}",
+        upstream_report.passed,
+        upstream_report.failed,
+        upstream_report.script_error,
+    );
+    assert_eq!(upstream_report.passed, 31);
+    assert_eq!(upstream_report.passed, preserved_report.passed);
+    assert!(!upstream_report.skipped_zero_subtests);
+    assert!(upstream_report.unknown_capabilities.is_empty());
 }
 
 #[test]
-fn original_fkey3_trigger_guard_triggers_zero_subtest_detection_in_phase1() {
+fn original_fkey3_trigger_guard_triggers_zero_subtest_detection_when_trigger_disabled() {
     let original_fkey3 = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sqlite/test/fkey3.test"),
     )
     .expect("read sqlite/test/fkey3.test");
+    let disabled_trigger_script = format!("set ::sqlite_options(trigger) 0\n{original_fkey3}");
 
-    let report = sqliters_tcltest::evaluate_test_script("fkey3_orig_guard", &original_fkey3);
+    let report =
+        sqliters_tcltest::evaluate_test_script("fkey3_orig_guard", &disabled_trigger_script);
     assert_eq!(report.passed, 0);
     assert!(report.failed.is_empty());
     assert!(report.script_error.is_none());

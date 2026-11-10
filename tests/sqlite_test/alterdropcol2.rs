@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "alterdropcol2-3.0+ executes unguarded CREATE TRIGGER (pending Phase 4 trigger); 1.0..2.4 (15 subtests) pass and are verified in phase3_view_upsert_dropcol_cte"]
 fn test_alterdropcol2() {
     let raw = include_str!("../../sqlite/test/alterdropcol2.test");
     let script = sqliters_tcltest::strip_test_comments(raw);

@@ -5,8 +5,8 @@
 use sqliters_syntax::{
     BinaryOp, BindParam, ColumnRef, CommonTableExpr, CompoundOp, CurrentTimeKind, Expr, FromClause,
     FunctionArgs, IndexHint, InsertSource, InsertStmt, JoinConstraint, LikeOp, LimitClause,
-    OrderByTerm, QualifiedName, ResultColumn, SelectBody, SelectCore, SelectStmt, Stmt,
-    TableOrSubquery, UnaryOp,
+    OrderByTerm, QualifiedName, ResultColumn, SelectBody, SelectCore, SelectStmt, SetAssignment,
+    Stmt, TableOrSubquery, TriggerStep, TriggerTiming, UnaryOp, UpsertAction,
 };
 use sqliters_types::{
     Collation, DatabaseId, ErrorCode, KeySortOrder, Result, SqliteError, TypeAffinity, Value,
@@ -263,6 +263,7 @@ pub fn expr_is_table_independent(expr: &Expr) -> bool {
         | Expr::CurrentTimeKw(_)
         | Expr::Bind(_) => true,
         Expr::Column(_)
+        | Expr::OversizedHex(_)
         | Expr::Subquery(_)
         | Expr::Exists { .. }
         | Expr::InSubquery { .. }
@@ -1646,6 +1647,12 @@ fn compile_expr(
                 prog.emit(Instruction::new(Opcode::Int64, 0, dest, 0).with_p4(P4::Int64(*i)));
             }
         }
+        Expr::OversizedHex(raw) => {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("hex literal too big: {raw}"),
+            ));
+        }
         Expr::Float(f) => {
             prog.emit(Instruction::new(Opcode::Real, 0, dest, 0).with_p4(P4::Real(*f)));
         }
@@ -2253,19 +2260,120 @@ pub fn compile_for_explain_in_db_set(
             prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
             Ok(prog)
         }
-        Stmt::Insert(ins) => {
-            let (db_id, tbl) = find_table_in_db_set_or_err(&ins.table, db_set)?;
-            let slot_schema = &db_set.slot(db_id).expect("resolved slot exists").schema;
-            compile_insert_explain_table(&tbl, db_id, slot_schema, Some(db_set), ins, functions)
-        }
-        Stmt::Update(upd) => {
-            let (db_id, tbl) = find_table_in_db_set_or_err(&upd.table, db_set)?;
-            compile_update_explain_table(&tbl, db_id)
-        }
-        Stmt::Delete(del) => {
-            let (db_id, tbl) = find_table_in_db_set_or_err(&del.table, db_set)?;
-            compile_delete_explain_table(&tbl, db_id)
-        }
+        Stmt::Insert(ins) => match db_set.find_relation_in_set(&ins.table)? {
+            Some((db_id, ResolvedRelation::Table(tbl))) => {
+                let slot_schema = &db_set.slot(db_id).expect("resolved slot exists").schema;
+                let mut prog = compile_insert_explain_table(
+                    &tbl,
+                    db_id,
+                    slot_schema,
+                    Some(db_set),
+                    ins,
+                    functions,
+                )?;
+                append_matching_triggers_for_explain(
+                    &mut prog,
+                    db_set,
+                    db_id,
+                    &tbl.name,
+                    false,
+                    TriggerEventKind::Insert,
+                    None,
+                );
+                Ok(prog)
+            }
+            Some((db_id, ResolvedRelation::View(v))) => {
+                let mut prog = VdbeProgram::new();
+                prog.emit(Instruction::new(Opcode::Init, 0, 1, 0));
+                prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
+                append_matching_triggers_for_explain(
+                    &mut prog,
+                    db_set,
+                    db_id,
+                    &v.name,
+                    true,
+                    TriggerEventKind::Insert,
+                    None,
+                );
+                Ok(prog)
+            }
+            None => Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such table: {}", ins.table.display_name()),
+            )),
+        },
+        Stmt::Update(upd) => match db_set.find_relation_in_set(&upd.table)? {
+            Some((db_id, ResolvedRelation::Table(tbl))) => {
+                let mut prog = compile_update_explain_table(&tbl, db_id)?;
+                let mod_cols = resolve_update_explain_modified_cols(Some(&tbl), &upd.assignments);
+                let mod_refs: Vec<&str> = mod_cols.iter().map(String::as_str).collect();
+                append_matching_triggers_for_explain(
+                    &mut prog,
+                    db_set,
+                    db_id,
+                    &tbl.name,
+                    false,
+                    TriggerEventKind::Update,
+                    Some(&mod_refs),
+                );
+                Ok(prog)
+            }
+            Some((db_id, ResolvedRelation::View(v))) => {
+                let mut prog = VdbeProgram::new();
+                prog.emit(Instruction::new(Opcode::Init, 0, 1, 0));
+                prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
+                let mod_cols = resolve_update_explain_modified_cols(None, &upd.assignments);
+                let mod_refs: Vec<&str> = mod_cols.iter().map(String::as_str).collect();
+                append_matching_triggers_for_explain(
+                    &mut prog,
+                    db_set,
+                    db_id,
+                    &v.name,
+                    true,
+                    TriggerEventKind::Update,
+                    Some(&mod_refs),
+                );
+                Ok(prog)
+            }
+            None => Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such table: {}", upd.table.display_name()),
+            )),
+        },
+        Stmt::Delete(del) => match db_set.find_relation_in_set(&del.table)? {
+            Some((db_id, ResolvedRelation::Table(tbl))) => {
+                let mut prog = compile_delete_explain_table(&tbl, db_id)?;
+                append_matching_triggers_for_explain(
+                    &mut prog,
+                    db_set,
+                    db_id,
+                    &tbl.name,
+                    false,
+                    TriggerEventKind::Delete,
+                    None,
+                );
+                Ok(prog)
+            }
+            Some((db_id, ResolvedRelation::View(v))) => {
+                let mut prog = VdbeProgram::new();
+                prog.emit(Instruction::new(Opcode::Init, 0, 1, 0));
+                prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
+                append_matching_triggers_for_explain(
+                    &mut prog,
+                    db_set,
+                    db_id,
+                    &v.name,
+                    true,
+                    TriggerEventKind::Delete,
+                    None,
+                );
+                Ok(prog)
+            }
+            None => Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such table: {}", del.table.display_name()),
+            )),
+        },
         _ => {
             let mut prog = VdbeProgram::new();
             prog.emit(Instruction::new(Opcode::Init, 0, 1, 0));
@@ -2274,18 +2382,6 @@ pub fn compile_for_explain_in_db_set(
             Ok(prog)
         }
     }
-}
-
-fn find_table_in_db_set_or_err(
-    name: &QualifiedName,
-    db_set: &DatabaseSet,
-) -> Result<(DatabaseId, TableSchema)> {
-    db_set.find_table_in_set(name)?.ok_or_else(|| {
-        SqliteError::new(
-            ErrorCode::Error,
-            format!("no such table: {}", name.display_name()),
-        )
-    })
 }
 
 fn find_table_qualified_main(name: &QualifiedName, schema: &Schema) -> Result<TableSchema> {
@@ -3192,6 +3288,258 @@ fn compile_delete_explain_table(tbl: &TableSchema, db_id: DatabaseId) -> Result<
     prog.emit(Instruction::new(Opcode::Close, tcur, 0, 0));
     prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
     Ok(prog)
+}
+
+fn resolve_update_explain_modified_cols(
+    tbl_opt: Option<&TableSchema>,
+    assigns: &[SetAssignment],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let push_col = |raw: &str, out: &mut Vec<String>| {
+        if let Some(tbl) = tbl_opt {
+            if let Some(col) = tbl
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(raw))
+            {
+                out.push(col.name.clone());
+            } else if !tbl.without_rowid
+                && matches!(
+                    raw.to_ascii_lowercase().as_str(),
+                    "rowid" | "_rowid_" | "oid"
+                )
+                && let Some(ipk) = tbl.rowid_alias_col
+            {
+                out.push(tbl.columns[ipk].name.clone());
+            }
+        } else {
+            out.push(raw.to_owned());
+        }
+    };
+    for sa in assigns {
+        for c in &sa.columns {
+            push_col(c, &mut out);
+        }
+    }
+    out
+}
+
+fn append_matching_triggers_for_explain(
+    prog: &mut VdbeProgram,
+    db_set: &DatabaseSet,
+    db_id: DatabaseId,
+    target_name: &str,
+    is_view: bool,
+    event_kind: TriggerEventKind,
+    mod_cols: Option<&[&str]>,
+) {
+    let timings: &[TriggerTiming] = if is_view {
+        &[TriggerTiming::InsteadOf]
+    } else {
+        &[TriggerTiming::Before, TriggerTiming::After]
+    };
+    for &timing in timings {
+        let matched = db_set.matching_triggers(db_id, target_name, timing, event_kind, mod_cols);
+        for (_, _, trig) in matched {
+            prog.emit(
+                Instruction::new(Opcode::Init, 0, 1, 0)
+                    .with_p4(P4::Str(format!("-- TRIGGER {}", trig.name))),
+            );
+            if let Some(ref w) = trig.when_clause {
+                emit_explain_expr_literals(prog, w);
+            }
+            for step in &trig.body {
+                match step {
+                    TriggerStep::Select(sel) => emit_explain_select_literals(prog, sel),
+                    TriggerStep::Insert(ins) => {
+                        for cte in &ins.ctes {
+                            emit_explain_select_literals(prog, &cte.query);
+                        }
+                        match &ins.source {
+                            InsertSource::DefaultValues => {}
+                            InsertSource::Values(rows) => {
+                                for r in rows {
+                                    for e in r {
+                                        emit_explain_expr_literals(prog, e);
+                                    }
+                                }
+                            }
+                            InsertSource::Select(sel) => emit_explain_select_literals(prog, sel),
+                        }
+                        for uc in &ins.upsert_clauses {
+                            if let Some(ref ut) = uc.target
+                                && let Some(ref tw) = ut.where_clause
+                            {
+                                emit_explain_expr_literals(prog, tw);
+                            }
+                            if let UpsertAction::DoUpdate {
+                                ref assignments,
+                                ref where_clause,
+                            } = uc.action
+                            {
+                                for sa in assignments {
+                                    emit_explain_expr_literals(prog, &sa.expr);
+                                }
+                                if let Some(dw) = where_clause {
+                                    emit_explain_expr_literals(prog, dw);
+                                }
+                            }
+                        }
+                    }
+                    TriggerStep::Update(upd) => {
+                        for cte in &upd.ctes {
+                            emit_explain_select_literals(prog, &cte.query);
+                        }
+                        for sa in &upd.assignments {
+                            emit_explain_expr_literals(prog, &sa.expr);
+                        }
+                        if let Some(ref w) = upd.selection {
+                            emit_explain_expr_literals(prog, w);
+                        }
+                    }
+                    TriggerStep::Delete(del) => {
+                        for cte in &del.ctes {
+                            emit_explain_select_literals(prog, &cte.query);
+                        }
+                        if let Some(ref w) = del.selection {
+                            emit_explain_expr_literals(prog, w);
+                        }
+                    }
+                }
+            }
+            prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
+        }
+    }
+}
+
+fn emit_explain_select_literals(prog: &mut VdbeProgram, sel: &SelectStmt) {
+    for cte in &sel.ctes {
+        emit_explain_select_literals(prog, &cte.query);
+    }
+    emit_explain_select_core_literals(prog, &sel.body.head);
+    for (_, rhs) in &sel.body.compounds {
+        emit_explain_select_core_literals(prog, rhs);
+    }
+}
+
+fn emit_explain_select_core_literals(prog: &mut VdbeProgram, core: &SelectCore) {
+    match core {
+        SelectCore::Values(rows) => {
+            for r in rows {
+                for e in r {
+                    emit_explain_expr_literals(prog, e);
+                }
+            }
+        }
+        SelectCore::Select {
+            projection,
+            selection,
+            group_by,
+            having,
+            ..
+        } => {
+            for rc in projection {
+                if let ResultColumn::Expr { expr, .. } = rc {
+                    emit_explain_expr_literals(prog, expr);
+                }
+            }
+            if let Some(w) = selection {
+                emit_explain_expr_literals(prog, w);
+            }
+            for g in group_by {
+                emit_explain_expr_literals(prog, g);
+            }
+            if let Some(h) = having {
+                emit_explain_expr_literals(prog, h);
+            }
+        }
+    }
+}
+
+fn emit_explain_expr_literals(prog: &mut VdbeProgram, expr: &Expr) {
+    match expr {
+        Expr::String(s) => {
+            prog.emit(Instruction::new(Opcode::String8, 0, 1, 0).with_p4(P4::Str(s.clone())));
+        }
+        Expr::Unary { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => emit_explain_expr_literals(prog, inner),
+        Expr::Binary { left, right, .. } => {
+            emit_explain_expr_literals(prog, left);
+            emit_explain_expr_literals(prog, right);
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            emit_explain_expr_literals(prog, e);
+            emit_explain_expr_literals(prog, low);
+            emit_explain_expr_literals(prog, high);
+        }
+        Expr::InList { expr: e, list, .. } => {
+            emit_explain_expr_literals(prog, e);
+            for item in list {
+                emit_explain_expr_literals(prog, item);
+            }
+        }
+        Expr::InSubquery {
+            expr: e, subquery, ..
+        } => {
+            emit_explain_expr_literals(prog, e);
+            emit_explain_select_literals(prog, subquery);
+        }
+        Expr::InTable { expr: e, .. } => emit_explain_expr_literals(prog, e),
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            emit_explain_expr_literals(prog, e);
+            emit_explain_expr_literals(prog, pattern);
+            if let Some(esc) = escape {
+                emit_explain_expr_literals(prog, esc);
+            }
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                emit_explain_expr_literals(prog, op);
+            }
+            for (c, v) in branches {
+                emit_explain_expr_literals(prog, c);
+                emit_explain_expr_literals(prog, v);
+            }
+            if let Some(el) = else_expr {
+                emit_explain_expr_literals(prog, el);
+            }
+        }
+        Expr::FunctionCall { args, filter, .. } => {
+            if let FunctionArgs::Exprs(es) = args {
+                for e in es {
+                    emit_explain_expr_literals(prog, e);
+                }
+            }
+            if let Some(f) = filter {
+                emit_explain_expr_literals(prog, f);
+            }
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
+            emit_explain_select_literals(prog, subquery);
+        }
+        Expr::Raise {
+            message: Some(m), ..
+        } => emit_explain_expr_literals(prog, m),
+        Expr::RowValue(es) => {
+            for e in es {
+                emit_explain_expr_literals(prog, e);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Generates 4-column `EXPLAIN QUERY PLAN <stmt>` rows: `(id, parent, notused, detail)`.

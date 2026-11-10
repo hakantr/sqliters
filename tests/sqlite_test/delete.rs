@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "52/67 subtests passed; pending: TRIGGER"]
+#[ignore = "64/67 subtests passed; pending: incremental join cursor mid-scan delete (delete-9.2..9.5)"]
 fn test_delete() {
     sqliters_tcltest::run_test_script(
         "delete",

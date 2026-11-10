@@ -942,9 +942,9 @@ fn explicit_capability_table_and_zero_subtest_guard() {
     assert_eq!(phase1_capability("attach"), Some(true));
     assert_eq!(phase1_capability("view"), Some(true));
     assert_eq!(phase1_capability("upsert"), Some(true));
+    assert_eq!(phase1_capability("trigger"), Some(true));
     assert_eq!(phase1_capability("default_autovacuum"), Some(false));
     for disabled in [
-        "trigger",
         "windowfunc",
         "analyze",
         "stat4",
@@ -967,7 +967,7 @@ fn explicit_capability_table_and_zero_subtest_guard() {
         assert_eq!(
             phase1_capability(disabled),
             Some(false),
-            "capability `{disabled}` must be explicitly 0 in Phase 3"
+            "capability `{disabled}` must be explicitly 0 in Phase 4"
         );
     }
     assert_eq!(phase1_capability("nonexistent_xyz"), None);
@@ -1009,7 +1009,7 @@ do_test 1.1 {
     [capable prefer_proxy_locking] \
     [capable nonexistent_xyz] \
     [capable !nonexistent_xyz]
-} {1 1 1 1 1 1 1 0 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1}
+} {1 1 1 1 1 1 1 0 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1}
 
 finish_test
 "#;
@@ -1025,7 +1025,7 @@ finish_test
     let zero_script = r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
-ifcapable !trigger {
+ifcapable !shared_cache {
   finish_test
   return
 }
@@ -1046,7 +1046,7 @@ fn run_test_script_panics_when_zero_subtests_execute() {
         r#"
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
-ifcapable !trigger {
+ifcapable !shared_cache {
   finish_test
   return
 }

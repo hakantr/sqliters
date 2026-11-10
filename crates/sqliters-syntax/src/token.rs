@@ -887,14 +887,19 @@ pub fn parse_int_literal(raw: &str) -> Result<Option<i64>> {
         .strip_prefix("0x")
         .or_else(|| cleaned.strip_prefix("0X"))
     {
-        if hex.len() > 16 {
-            return Err(SqliteError::syntax(
-                format!("hex literal out of range: {raw}"),
-                0,
+        let sig = hex.trim_start_matches('0');
+        if sig.len() > 16 {
+            return Err(SqliteError::new(
+                sqliters_types::ErrorCode::Error,
+                format!("hex literal too big: {raw}"),
             ));
         }
-        let u = u64::from_str_radix(hex, 16)
-            .map_err(|_| SqliteError::syntax(format!("invalid hex literal: {raw}"), 0))?;
+        let u = if sig.is_empty() {
+            0
+        } else {
+            u64::from_str_radix(sig, 16)
+                .map_err(|_| SqliteError::syntax(format!("invalid hex literal: {raw}"), 0))?
+        };
         return Ok(Some(u as i64));
     }
     Ok(cleaned.parse::<i64>().ok())

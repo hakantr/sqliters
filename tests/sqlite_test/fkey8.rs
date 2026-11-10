@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "18/37 subtests passed; pending: TRIGGER, ATTACH"]
+#[ignore = "24/37 subtests passed; pending: C testfixture uses_stmt_journal"]
 fn test_fkey8() {
     sqliters_tcltest::run_test_script(
         "fkey8",

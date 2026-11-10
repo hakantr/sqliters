@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "69/91 subtests passed; pending: TRIGGER, Tcl UDF"]
+#[ignore = "78/119 subtests passed; pending: Phase 6 Tcl UDF (trigfunc)"]
 fn test_alter() {
     sqliters_tcltest::run_test_script(
         "alter",

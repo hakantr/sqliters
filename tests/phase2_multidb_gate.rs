@@ -548,12 +548,13 @@ fn test_gate2_1_c_sqlite_3541_reference_and_phase2_manifest() {
     assert_eq!(cap_map.get("foreignkey"), Some(&true));
     assert_eq!(cap_map.get("view"), Some(&true));
     assert_eq!(cap_map.get("upsert"), Some(&true));
-    // Phase 4+ capabilities must remain honestly `false`.
-    for pending_cap in ["trigger", "windowfunc", "vtab", "fts5", "rtree", "json1"] {
+    assert_eq!(cap_map.get("trigger"), Some(&true));
+    // Phase 5+ capabilities must remain honestly `false`.
+    for pending_cap in ["windowfunc", "vtab", "fts5", "rtree", "json1"] {
         assert_eq!(
             cap_map.get(pending_cap),
             Some(&false),
-            "Phase 4+ capability {pending_cap} must remain false in Phase 3"
+            "Phase 5+ capability {pending_cap} must remain false in Phase 4"
         );
     }
 
@@ -604,12 +605,12 @@ fn test_gate2_1_c_sqlite_3541_reference_and_phase2_manifest() {
 
     assert_eq!(p2_total, 7, "expected 7 Phase 2 attach*/tempdb* wrappers");
     assert_eq!(
-        p2_active, 4,
-        "expected 4 active Phase 2 wrappers (attach, attach2, attach3, tempdb)"
+        p2_active, 5,
+        "expected 5 active Phase 2 wrappers (attach, attach2, attach3, attach4, tempdb)"
     );
     assert_eq!(
-        p2_ignored, 3,
-        "expected 3 ignored Phase 2 wrappers (attach4, attachmalloc, tempdb2)"
+        p2_ignored, 2,
+        "expected 2 ignored Phase 2 wrappers (attachmalloc, tempdb2)"
     );
     assert!(walmode_active, "walmode.test must be active in Phase 2");
     assert!(manifest_active_total >= 14);
@@ -665,10 +666,10 @@ fn test_gate2_1_c_sqlite_3541_reference_and_phase2_manifest() {
     \"registered_phase2_wrappers\": {},\n\
     \"active_phase2_wrappers\": {},\n\
     \"ignored_phase2_wrappers\": {},\n\
-    \"active_phase2_subtests\": 179,\n\
+    \"active_phase2_subtests\": 191,\n\
     \"newly_unlocked_walmode_subtests\": 93,\n\
     \"newly_unlocked_static_wrappers\": [\"insert2\", \"pragma6\"],\n\
-    \"attach4_verified_subtests_in_gate2\": 10,\n\
+    \"attach4_verified_subtests_in_gate2\": 12,\n\
     \"manifest_total_active\": {},\n\
     \"manifest_total_ignored\": {}\n\
   }},\n\
@@ -707,7 +708,7 @@ fn test_gate2_1_c_sqlite_3541_reference_and_phase2_manifest() {
     assert!(read_back.contains("\"gate\": \"GATE-2\""));
     assert!(read_back.contains("\"attach\": true"));
     assert!(read_back.contains("\"tempdb\": true"));
-    assert!(read_back.contains("\"trigger\": false"));
+    assert!(read_back.contains("\"trigger\": true"));
 }
 
 // ============================================================================
@@ -776,7 +777,7 @@ fn test_gate2_2_attach_detach_lifecycle_slot_collapse_limits_and_errors() {
         assert_eq!(conn.attached_limit(), 10);
         conn.try_close().unwrap();
 
-        // Verify `sqlite/test/attach4.test` 1.1..1.8 (lines 1..117) pass 100%, and full script has 10 passed.
+        // Verify `sqlite/test/attach4.test` passes all 12/12 subtests now that `trigger = true`.
         let attach4_raw = include_str!("../sqlite/test/attach4.test");
         let attach4_part1: String =
             attach4_raw.lines().take(117).collect::<Vec<_>>().join("\n") + "\nfinish_test\n";
@@ -788,8 +789,9 @@ fn test_gate2_2_attach_detach_lifecycle_slot_collapse_limits_and_errors() {
             "attach4",
             &strip_test_comments(attach4_raw),
         );
-        assert_eq!(full_report.passed, 10);
-        assert_eq!(full_report.failed.len(), 2);
+        assert!(full_report.is_ok(), "attach4 failed: {full_report:?}");
+        assert_eq!(full_report.passed, 12);
+        assert!(full_report.failed.is_empty());
     }
 
     // --- 2B. `sqlite3CollapseDatabaseArray` Slot Shifting (`4 -> 3`) & `V2` vs `V1` Statements ---

@@ -1,5 +1,6 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "5/15 subtests passed; pending: TRIGGER"]
 fn test_collate6() {
     sqliters_tcltest::run_test_script(
         "collate6",

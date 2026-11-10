@@ -103,6 +103,7 @@ struct Parser<'a> {
     track_spans: bool,
     ident_spans: IdentSpanMap,
     orphan_join_clause: Option<&'static str>,
+    in_trigger_body: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -117,6 +118,7 @@ impl<'a> Parser<'a> {
             track_spans,
             ident_spans: IdentSpanMap::default(),
             orphan_join_clause: None,
+            in_trigger_body: false,
         }
     }
 
@@ -217,10 +219,26 @@ impl<'a> Parser<'a> {
         }
     }
 
+    const fn is_join_kw(kind: TokenKind) -> bool {
+        matches!(
+            kind,
+            TokenKind::Cross
+                | TokenKind::Full
+                | TokenKind::Inner
+                | TokenKind::Left
+                | TokenKind::Natural
+                | TokenKind::Outer
+                | TokenKind::Right
+        )
+    }
+
     /// Parses a DDL object/column name (`nm ::= id | STRING | JOIN_KW` in `parse.y`).
     fn parse_nm(&mut self) -> Result<String> {
         let tok = self.peek();
-        if Self::can_be_ident(tok.kind) || tok.kind == TokenKind::StringLiteral {
+        if Self::can_be_ident(tok.kind)
+            || Self::is_join_kw(tok.kind)
+            || tok.kind == TokenKind::StringLiteral
+        {
             self.advance();
             Ok(self.alloc_ident_from_token(tok))
         } else {
@@ -383,7 +401,7 @@ impl<'a> Parser<'a> {
                 let _ = self.eat(TokenKind::Transaction);
                 let savepoint = if self.eat(TokenKind::To) {
                     let _ = self.eat(TokenKind::Savepoint);
-                    Some(self.parse_ident()?)
+                    Some(self.parse_nm()?)
                 } else {
                     None
                 };
@@ -391,12 +409,12 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Savepoint => {
                 self.advance();
-                Ok(Stmt::Savepoint(self.parse_ident()?))
+                Ok(Stmt::Savepoint(self.parse_nm()?))
             }
             TokenKind::Release => {
                 self.advance();
                 let _ = self.eat(TokenKind::Savepoint);
-                Ok(Stmt::Release(self.parse_ident()?))
+                Ok(Stmt::Release(self.parse_nm()?))
             }
             TokenKind::Attach => {
                 self.advance();
@@ -746,6 +764,7 @@ impl<'a> Parser<'a> {
             } else {
                 false
             };
+            self.in_trigger_body = true;
             let when_clause = if self.eat(TokenKind::When) {
                 Some(self.parse_expr()?)
             } else {
@@ -762,6 +781,7 @@ impl<'a> Parser<'a> {
                 }
             }
             let end_tok = self.expect(TokenKind::End)?;
+            self.in_trigger_body = false;
             let body_end = end_tok.offset + end_tok.text.len();
             let end_off = self.peek().offset;
             let catalog_sql = format!("CREATE TRIGGER {}", &self.sql[name_offset..body_end]);
@@ -2167,31 +2187,89 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
-            let natural = self.eat(TokenKind::Natural);
-            let join_type = if self.eat(TokenKind::Left) {
-                let _ = self.eat(TokenKind::Outer);
+            let (natural, join_type) = if self.eat(TokenKind::Join) {
+                (false, Some(JoinType::Inner))
+            } else if matches!(
+                self.peek().kind,
+                TokenKind::Natural
+                    | TokenKind::Left
+                    | TokenKind::Right
+                    | TokenKind::Full
+                    | TokenKind::Outer
+                    | TokenKind::Inner
+                    | TokenKind::Cross
+            ) {
+                let n_kw = if self.peek_n(1).kind == TokenKind::Join {
+                    1
+                } else if self.peek_n(2).kind == TokenKind::Join {
+                    2
+                } else if self.peek_n(3).kind == TokenKind::Join {
+                    3
+                } else {
+                    0
+                };
+                if n_kw == 0 {
+                    self.advance();
+                    let bad = self.peek();
+                    return Err(
+                        self.syntax_err_at(bad, format!("near \"{}\": syntax error", bad.text))
+                    );
+                }
+                const JT_INNER: u8 = 0x01;
+                const JT_CROSS: u8 = 0x02;
+                const JT_NATURAL: u8 = 0x04;
+                const JT_LEFT: u8 = 0x08;
+                const JT_RIGHT: u8 = 0x10;
+                const JT_OUTER: u8 = 0x20;
+                const JT_ERROR: u8 = 0x80;
+                let mut mask: u8 = 0;
+                let mut words = Vec::with_capacity(n_kw);
+                for _ in 0..n_kw {
+                    let wt = self.advance();
+                    words.push(wt.text);
+                    if wt.text.eq_ignore_ascii_case("natural") {
+                        mask |= JT_NATURAL;
+                    } else if wt.text.eq_ignore_ascii_case("left") {
+                        mask |= JT_LEFT | JT_OUTER;
+                    } else if wt.text.eq_ignore_ascii_case("outer") {
+                        mask |= JT_OUTER;
+                    } else if wt.text.eq_ignore_ascii_case("right") {
+                        mask |= JT_RIGHT | JT_OUTER;
+                    } else if wt.text.eq_ignore_ascii_case("full") {
+                        mask |= JT_LEFT | JT_RIGHT | JT_OUTER;
+                    } else if wt.text.eq_ignore_ascii_case("inner") {
+                        mask |= JT_INNER;
+                    } else if wt.text.eq_ignore_ascii_case("cross") {
+                        mask |= JT_INNER | JT_CROSS;
+                    } else {
+                        mask |= JT_ERROR;
+                    }
+                }
                 self.expect(TokenKind::Join)?;
-                Some(JoinType::Left)
-            } else if self.eat(TokenKind::Right) {
-                let _ = self.eat(TokenKind::Outer);
-                self.expect(TokenKind::Join)?;
-                Some(JoinType::Right)
-            } else if self.eat(TokenKind::Full) {
-                let _ = self.eat(TokenKind::Outer);
-                self.expect(TokenKind::Join)?;
-                Some(JoinType::Full)
-            } else if self.eat(TokenKind::Inner) {
-                self.expect(TokenKind::Join)?;
-                Some(JoinType::Inner)
-            } else if self.eat(TokenKind::Cross) {
-                self.expect(TokenKind::Join)?;
-                Some(JoinType::Cross)
-            } else if self.eat(TokenKind::Join) {
-                Some(JoinType::Inner)
-            } else if natural {
-                return Err(self.syntax_err_at(self.peek(), "expected JOIN after NATURAL"));
+                if (mask & (JT_INNER | JT_OUTER)) == (JT_INNER | JT_OUTER)
+                    || (mask & JT_ERROR) != 0
+                    || (mask & (JT_OUTER | JT_LEFT | JT_RIGHT)) == JT_OUTER
+                {
+                    return Err(SqliteError::new(
+                        sqliters_types::ErrorCode::Error,
+                        format!("unknown join type: {}", words.join(" ")),
+                    ));
+                }
+                let is_nat = (mask & JT_NATURAL) != 0;
+                let jt = if (mask & (JT_LEFT | JT_RIGHT)) == (JT_LEFT | JT_RIGHT) {
+                    JoinType::Full
+                } else if (mask & JT_LEFT) != 0 {
+                    JoinType::Left
+                } else if (mask & JT_RIGHT) != 0 {
+                    JoinType::Right
+                } else if (mask & JT_CROSS) != 0 && !is_nat {
+                    JoinType::Cross
+                } else {
+                    JoinType::Inner
+                };
+                (is_nat, Some(jt))
             } else {
-                None
+                (false, None)
             };
 
             let Some(jt) = join_type else {
@@ -2616,15 +2694,42 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Minus => {
                 self.advance();
+                let next_tok = self.peek();
+                let next_is_hex = next_tok.kind == TokenKind::Integer
+                    && (next_tok.text.starts_with("0x") || next_tok.text.starts_with("0X"));
                 let rhs = self.parse_expr_bp(17)?;
                 // Fold `-9223372036854775808` and negative integer literals cleanly!
                 if let Expr::Float(f) = rhs {
                     return Ok(Expr::Float(-f));
                 }
-                if let Expr::Integer(i) = rhs
-                    && let Some(neg) = i.checked_neg()
-                {
-                    return Ok(Expr::Integer(neg));
+                if let Expr::OversizedHex(h) = rhs {
+                    let neg_h = if let Some(stripped) = h.strip_prefix('-') {
+                        stripped.to_owned()
+                    } else {
+                        format!("-{h}")
+                    };
+                    if self.in_trigger_body {
+                        return Ok(Expr::OversizedHex(neg_h));
+                    }
+                    return Err(SqliteError::new(
+                        sqliters_types::ErrorCode::Error,
+                        format!("hex literal too big: {neg_h}"),
+                    ));
+                }
+                if let Expr::Integer(i) = rhs {
+                    if i == i64::MIN && next_is_hex {
+                        let neg_h = format!("-{}", next_tok.text);
+                        if self.in_trigger_body {
+                            return Ok(Expr::OversizedHex(neg_h));
+                        }
+                        return Err(SqliteError::new(
+                            sqliters_types::ErrorCode::Error,
+                            format!("hex literal too big: {neg_h}"),
+                        ));
+                    }
+                    if let Some(neg) = i.checked_neg() {
+                        return Ok(Expr::Integer(neg));
+                    }
                 }
                 Ok(Expr::Unary {
                     op: UnaryOp::Negate,
@@ -2683,10 +2788,17 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Integer => {
                 self.advance();
-                if let Some(i) = parse_int_literal(tok.text)? {
-                    Ok(Expr::Integer(i))
-                } else {
-                    Ok(Expr::Float(parse_float_literal(tok.text)?))
+                match parse_int_literal(tok.text) {
+                    Ok(Some(i)) => Ok(Expr::Integer(i)),
+                    Ok(None) => Ok(Expr::Float(parse_float_literal(tok.text)?)),
+                    Err(e)
+                        if self.in_trigger_body
+                            && (tok.text.starts_with("0x") || tok.text.starts_with("0X")) =>
+                    {
+                        let _ = e;
+                        Ok(Expr::OversizedHex(tok.text.to_owned()))
+                    }
+                    Err(e) => Err(e),
                 }
             }
             TokenKind::Float => {
@@ -2702,6 +2814,13 @@ impl<'a> Parser<'a> {
                 Ok(Expr::Blob(decode_blob_literal(tok.text)?))
             }
             TokenKind::Variable => {
+                if tok.text.starts_with('#')
+                    && tok.text.as_bytes().get(1).is_some_and(u8::is_ascii_digit)
+                {
+                    return Err(
+                        self.syntax_err_at(tok, format!("near \"{}\": syntax error", tok.text))
+                    );
+                }
                 self.advance();
                 let param = self.resolve_bind_param(tok)?;
                 Ok(Expr::Bind(param))

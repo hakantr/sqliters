@@ -1597,7 +1597,7 @@ fn c_reference_3_54_1_verification_and_phase1_2_manifest() {
     assert_eq!(cap_map.get("attach"), Some(&true));
     assert_eq!(cap_map.get("view"), Some(&true));
     assert_eq!(cap_map.get("upsert"), Some(&true));
-    assert_eq!(cap_map.get("trigger"), Some(&false));
+    assert_eq!(cap_map.get("trigger"), Some(&true));
 
     // 4. Read `tests/sqlite_test_manifest.json` summary & OS/filesystem metadata.
     let test_manifest_path = workspace_root.join("tests/sqlite_test_manifest.json");

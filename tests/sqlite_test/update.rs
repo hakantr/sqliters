@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "133/141 subtests passed; pending: TRIGGER, EQP/optimizer"]
+#[ignore = "140/141 subtests passed; pending: Phase 5 WINDOW and EQP/optimizer (update-21.12)"]
 fn test_update() {
     sqliters_tcltest::run_test_script(
         "update",

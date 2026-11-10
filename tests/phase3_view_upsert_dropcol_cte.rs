@@ -258,6 +258,7 @@ fn phase3_gate_c_reference_and_manifest_audit() {
         "savepoint",
         "subquery",
         "tempdb",
+        "trigger",
         "upsert",
         "vacuum",
         "view",
@@ -267,11 +268,10 @@ fn phase3_gate_c_reference_and_manifest_audit() {
         assert_eq!(
             cap_map.get(enabled_cap),
             Some(&true),
-            "capability `{enabled_cap}` must be enabled in Phase 3"
+            "capability `{enabled_cap}` must be enabled in Phase 4"
         );
     }
     for pending_cap in [
-        "trigger",
         "windowfunc",
         "analyze",
         "stat4",
@@ -288,7 +288,7 @@ fn phase3_gate_c_reference_and_manifest_audit() {
         assert_eq!(
             cap_map.get(pending_cap),
             Some(&false),
-            "Phase 4..7 capability `{pending_cap}` must remain false in Phase 3"
+            "Phase 5..7 capability `{pending_cap}` must remain false in Phase 4"
         );
     }
 
@@ -340,25 +340,31 @@ fn phase3_gate_c_reference_and_manifest_audit() {
         p3_total, 17,
         "expected 17 Phase 3 wrappers (view*, upsert*, upfrom*, alterdropcol*, withM)"
     );
-    assert_eq!(p3_active, 7, "expected 7 active Phase 3 manifest suites");
+    assert_eq!(p3_active, 13, "expected 13 active Phase 3 manifest suites");
     assert_eq!(
-        p3_ignored, 10,
-        "expected 10 ignored Phase 3 manifest suites"
+        p3_ignored, 4,
+        "expected 4 ignored Phase 3 manifest suites (view, upfrom2, upsertfault, upfromfault)"
     );
     assert_eq!(
         p3_active_ids,
         vec![
+            "sqlite/test/alterdropcol.test",
+            "sqlite/test/alterdropcol2.test",
             "sqlite/test/upfrom1.test",
             "sqlite/test/upfrom3.test",
+            "sqlite/test/upfrom4.test",
+            "sqlite/test/upsert1.test",
+            "sqlite/test/upsert2.test",
             "sqlite/test/upsert3.test",
+            "sqlite/test/upsert4.test",
             "sqlite/test/upsert5.test",
             "sqlite/test/view2.test",
             "sqlite/test/view3.test",
             "sqlite/test/withM.test",
         ]
     );
-    assert!(manifest_active_total >= 21);
-    assert!(manifest_ignored_total >= 53);
+    assert!(manifest_active_total >= 43);
+    assert!(manifest_ignored_total >= 49);
 
     let uname_out = Command::new("uname")
         .arg("-srmo")

@@ -3273,9 +3273,12 @@ impl Vfs for OsVfs {
                 Err(err)
                     if (err.kind() == ErrorKind::PermissionDenied
                         || err.kind() == ErrorKind::ReadOnlyFilesystem)
-                        && !flags.contains(OpenFlags::CREATE) =>
+                        && path.is_some()
+                        && !flags.contains(OpenFlags::EXCLUSIVE)
+                        && !flags.contains(OpenFlags::DELETEONCLOSE)
+                        && !flags.requires_initial_dir_sync() =>
                 {
-                    // Fallback to read-only just like unixOpen in os_unix.c!
+                    // Fallback to read-only for existing non-exclusive database opens (`unixOpen` in `os_unix.c:6692`).
                     readonly = true;
                     OpenOptions::new()
                         .read(true)

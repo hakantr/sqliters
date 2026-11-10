@@ -1,5 +1,6 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "25/28 subtests passed; pending: TRIGGER"]
 fn test_delete4() {
     sqliters_tcltest::run_test_script(
         "delete4",

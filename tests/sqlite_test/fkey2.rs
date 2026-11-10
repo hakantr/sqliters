@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "0/0 subtests passed; pending: TRIGGER"]
+#[ignore = "1037/1198 subtests passed; pending: C testfixture sqlite_rename_table and ADD COLUMN raw default formatting"]
 fn test_fkey2() {
     sqliters_tcltest::run_test_script(
         "fkey2",

@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "63/83 subtests passed; pending: TRIGGER, Tcl UDF"]
+#[ignore = "77/83 subtests passed; pending: Phase 6 Tcl UDF (affinity) and RETURNING edge cases"]
 fn test_returning1() {
     sqliters_tcltest::run_test_script(
         "returning1",

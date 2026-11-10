@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "272/308 subtests passed; pending: TRIGGER, WINDOW, EQP/optimizer"]
+#[ignore = "291/308 subtests passed; pending: Phase 5 WINDOW and EQP/optimizer"]
 fn test_rowvalue() {
     sqliters_tcltest::run_test_script(
         "rowvalue",

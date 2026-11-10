@@ -1,5 +1,6 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "15/25 subtests passed; pending: TRIGGER"]
 fn test_conflict4() {
     sqliters_tcltest::run_test_script(
         "conflict4",

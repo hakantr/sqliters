@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "attach4-2.0..2.2 execute unguarded CREATE TEMPORARY TRIGGER / DROP TRIGGER (pending Phase 4 trigger); 1.1..1.8 (10 subtests) pass and are verified in phase2_multidb_gate"]
 fn test_attach4() {
     let raw = include_str!("../../sqlite/test/attach4.test");
     let script = sqliters_tcltest::strip_test_comments(raw);

@@ -988,6 +988,84 @@ impl Btree {
     // Table B+Tree Queries, Seeks, Inserts (with Splitting), and Deletes
     // ========================================================================
 
+    /// Counts all entries in a Table B+Tree (`0x0d`/`0x05`) or Index/`WITHOUT ROWID` B-Tree
+    /// (`0x0a`/`0x02`) without decoding cell payloads (`OP_Count` in `sqlite/src/vdbe.c`).
+    pub fn count_entries(&mut self, root_pgno: Pgno) -> Result<i64> {
+        if self.pager.page_count() == 0 || root_pgno == 0 {
+            return Ok(0);
+        }
+        let max_pages = self.pager.page_count() as usize + 1;
+        let mut visited = 0usize;
+        self.count_entries_page(root_pgno, max_pages, &mut visited)
+    }
+
+    fn count_entries_page(
+        &mut self,
+        pgno: Pgno,
+        max_pages: usize,
+        visited: &mut usize,
+    ) -> Result<i64> {
+        self.check_interrupted()?;
+        *visited += 1;
+        if *visited > max_pages {
+            return Err(SqliteError::corrupt(format!(
+                "cycle detected while counting B-tree entries at page {pgno}"
+            )));
+        }
+        let hdr_off = if pgno == 1 { 100usize } else { 0usize };
+        let (ptype, n_cells, children) = {
+            let raw = self.pager.read_page(pgno)?;
+            if raw.len() < hdr_off + 8 {
+                return Err(SqliteError::corrupt("truncated B-tree page header"));
+            }
+            let ptype = raw[hdr_off];
+            let n_cells = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
+            match ptype {
+                0x0d | 0x0a => return Ok(n_cells as i64),
+                0x05 | 0x02 => {
+                    if raw.len() < hdr_off + 12 + n_cells * 2 {
+                        return Err(SqliteError::corrupt("truncated interior B-tree page"));
+                    }
+                    let mut kids = Vec::with_capacity(n_cells + 1);
+                    let ptr_base = hdr_off + 12;
+                    for i in 0..n_cells {
+                        let cell_off =
+                            u16::from_be_bytes([raw[ptr_base + i * 2], raw[ptr_base + i * 2 + 1]])
+                                as usize;
+                        if cell_off + 4 > raw.len() {
+                            return Err(SqliteError::corrupt(
+                                "interior cell pointer out of bounds",
+                            ));
+                        }
+                        kids.push(u32::from_be_bytes([
+                            raw[cell_off],
+                            raw[cell_off + 1],
+                            raw[cell_off + 2],
+                            raw[cell_off + 3],
+                        ]));
+                    }
+                    kids.push(u32::from_be_bytes([
+                        raw[hdr_off + 8],
+                        raw[hdr_off + 9],
+                        raw[hdr_off + 10],
+                        raw[hdr_off + 11],
+                    ]));
+                    (ptype, n_cells, kids)
+                }
+                other => {
+                    return Err(SqliteError::corrupt(format!(
+                        "invalid btree page flags byte: {other:#04x}"
+                    )));
+                }
+            }
+        };
+        let mut total = if ptype == 0x02 { n_cells as i64 } else { 0 };
+        for child in children {
+            total += self.count_entries_page(child, max_pages, visited)?;
+        }
+        Ok(total)
+    }
+
     /// Scans all `(rowid, payload_bytes)` entries of a Table B+Tree in ascending `rowid` order.
     pub fn scan_table(&mut self, root_pgno: Pgno) -> Result<Vec<(i64, Vec<u8>)>> {
         if self.pager.page_count() == 0 {
