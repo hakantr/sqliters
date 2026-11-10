@@ -27,7 +27,7 @@ def integer(value):
 
 
 def guarded_write(path, data):
-    if not path.is_relative_to(ROOT) or path.is_symlink() or any(parent.is_symlink() for parent in path.parents):
+    if not path.resolve().is_relative_to(ROOT) or path.is_symlink() or any(parent.is_symlink() for parent in path.parents):
         raise ValueError(f'outside/symlink output forbidden: {path}')
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
@@ -316,6 +316,23 @@ SELECT device_id,(at_sec/60)*60 AS minute,count(*),min(value),max(value),avg(val
         put(f'artifacts/generated/full/wide-{width}.sql', sql, kind='wide_sql', planned_columns=width,
             explicit_ddl_columns=width, explicit_insert_expressions=width, planned_insert_rows=rows,
             planned_materialized_fields=width * rows, future_max_column=wide['future_max_column'])
+        first, middle, last = columns[0], columns[width//2], columns[-1]
+        workload = f'''-- Future own DB loaded with wide-{width}.sql; NOT_RUN.
+BEGIN IMMEDIATE;
+UPDATE wide_{width} SET {first}=rowid,{middle}=printf('updated-%08d',rowid),{last}=CAST(printf('%08x',rowid) AS BLOB) WHERE rowid%3=0;
+SAVEPOINT discard_delete;
+DELETE FROM wide_{width} WHERE rowid%13=0;
+ROLLBACK TO discard_delete;
+RELEASE discard_delete;
+COMMIT;
+-- Cast before aggregate: avoid an accidental integer SUM overflow on original int64 edge values.
+SELECT count(*),sum(CAST({first} AS REAL)),avg(CAST({first} AS REAL)),sum(length({middle})),sum(length({last})) FROM wide_{width};
+SELECT {','.join(columns)} FROM wide_{width} ORDER BY rowid;
+PRAGMA integrity_check;
+'''
+        put(f'artifacts/generated/full/stress/wide-{width}-workload.sql', workload, kind='wide_workload_sql',
+            planned_columns=width, explicit_projection_columns=width, planned_records_after=rows,
+            future_max_column=width, prerequisite=f'artifacts/generated/full/wide-{width}.sql')
 
     boundary = []
     for maximum in profiles['future_max_column_builds']:
@@ -358,6 +375,13 @@ SELECT device_id,(at_sec/60)*60 AS minute,count(*),min(value),max(value),avg(val
                                  'expectation': expectation, 'execution_status': 'NOT_RUN',
                                  'caveat': 'INSERT above-limit also has value/table arity mismatch' if family == 'insert-values' and delta > 0 else None})
 
+    extra_path = ROOT/'extra-scope.json'
+    extra_bytes = extra_path.read_bytes()
+    extra = json.loads(extra_bytes)
+    for relative in extra['static_source_paths']:
+        put(relative,(ROOT/relative).read_text(),kind='additional_static_source',
+            case_ids=[case['id'] for case in extra['cases'] if relative in case['paths']])
+    put('extra-scope.json',extra_bytes.decode('utf-8'),kind='additional_scope')
     family_counts = {}
     for case in scenarios:
         family_counts[case['family']] = family_counts.get(case['family'], 0) + 1
@@ -367,12 +391,14 @@ SELECT device_id,(at_sec/60)*60 AS minute,count(*),min(value),max(value),avg(val
               'wide_sql_plans': [{'columns':x['columns'],'planned_rows':x['planned_rows'],'execution_status':'NOT_RUN'} for x in profiles['wide_tables']],
               'large_relational_queries': {'path':'examples/large-join-queries.sql','planned_top_level_selects':13,'execution_status':'NOT_RUN'},
               'boundary_families': ['table','view','select','index','update-set','group-by','order-by','insert-values'],
-              'planned_step_2_only': ['extension fixtures','WAL multi-connection/process instructions','crash/recovery instructions','API action instructions'],
+              'additional_cases':extra['cases'],
+              'execution_not_implemented': ['native C runner','Rust adapter','ACK/process orchestrator','API/fault runner'],
               'coverage_limit': 'Family examples only; not exhaustive grammar/combinations; no SQL validity or result proof.'}
     put('scope-matrix.json', json.dumps(matrix, ensure_ascii=False, indent=2) + '\n', kind='scope_matrix')
     manifest = {'schema': 1, 'kind': 'STATIC_GENERATION_MANIFEST', 'generator_version': profiles['generator_version'],
                 'seed': profiles['seed'], 'profiles_sha256': sha((ROOT/'profiles.json').read_bytes()),
                 'generator_sha256': sha(Path(__file__).read_bytes()), 'execution_status': 'NOT_RUN',
+                'extra_scope_sha256': sha(extra_bytes), 'additional_cases':extra['cases'],
                 'generation_scope': 'Physical text/data files only. No SQL engine, test, build or benchmark executed.',
                 'normal_physical_records': profiles['normal_records'], 'readable_scenarios': len(scenarios),
                 'relational_physical_records': relational_stats,

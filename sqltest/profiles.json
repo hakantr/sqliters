@@ -1,17 +1,64 @@
 {
   "schema": 1,
-  "generator_version": "sqltest-static-1",
+  "generator_version": "sqltest-static-2",
   "seed": 20261120,
   "prng": "SplitMix64, unsigned 64-bit arithmetic, independent dataset seed",
   "normal_records": 10000,
-  "relational_records": {"customers": 3000, "orders": 12000, "items": 24000, "employees": 1000, "measurements": 10000},
+  "relational_records": {
+    "customers": 3000,
+    "orders": 12000,
+    "items": 24000,
+    "employees": 1000,
+    "measurements": 10000
+  },
   "wide_tables": [
-    {"columns": 2000, "planned_rows": 3000, "future_max_column": 2000},
-    {"columns": 4096, "planned_rows": 3000, "future_max_column": 4096}
+    {
+      "columns": 128,
+      "planned_rows": 3000,
+      "future_max_column": 128
+    },
+    {
+      "columns": 2000,
+      "planned_rows": 3000,
+      "future_max_column": 2000
+    },
+    {
+      "columns": 4096,
+      "planned_rows": 3000,
+      "future_max_column": 4096
+    }
   ],
-  "future_max_column_builds": [128, 2000, 4096],
-  "boundary_offsets": [-1, 0, 1],
+  "future_max_column_builds": [
+    128,
+    2000,
+    4096
+  ],
+  "boundary_offsets": [
+    -1,
+    0,
+    1
+  ],
   "execution_status": "NOT_RUN",
+  "future_resource_limits": {
+    "execution_status": "NOT_RUN",
+    "kind": "proposal_only_not_enforced",
+    "case_timeout_seconds": {
+      "smoke": 30,
+      "full": 180,
+      "stress": 600,
+      "wal_step": 30
+    },
+    "total_timeout_seconds": 1800,
+    "max_rss_bytes": 2147483648,
+    "max_sandbox_bytes": 8589934592,
+    "on_exceed": "TIMEOUT or SKIP_RESOURCE; never silent PASS or reduced data"
+  },
   "allowed_action": "static file generation only",
-  "forbidden_actions": ["SQL execute", "DB engine", "build", "test", "benchmark"]
+  "forbidden_actions": [
+    "SQL execute",
+    "DB engine",
+    "build",
+    "test",
+    "benchmark"
+  ]
 }

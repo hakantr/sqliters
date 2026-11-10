@@ -42,10 +42,10 @@ koruyun. Üretim hiçbir SQL'i çalıştırmaz.
   Bu fixture küçük schema/seed yerine kendi temiz gelecekteki DB'sini hedefler;
   customers/orders/items/employees adları aynı olduğu için ikisi üst üste
   çalıştırılmaz. Üretilmiş dosyalar DB'ye yüklenmedi.
-- `artifacts/generated/full/wide-2000.sql`, `wide-4096.sql`: 2000/4096 explicit
-  sütun DDL'i, aynı sayıda INSERT SELECT ifadesi ve bütün sütun SELECT'i.
-  Deterministic SQL aritmetiğiyle her tabloda **3000 hedef kayıt** üretir;
-  DB oluşturma ve 6.000.000/12.288.000 hücre materyalizasyonu **NOT_RUN**.
+- `artifacts/generated/full/wide-128.sql`, `wide-2000.sql`, `wide-4096.sql`:
+  128/2000/4096 explicit sütun DDL'i, aynı sayıda INSERT SELECT ifadesi ve bütün
+  sütun SELECT'i. Her tabloda **3000 hedef kayıt**; 384.000/6.000.000/12.288.000
+  hücre materyalizasyonu ve DB oluşturma **NOT_RUN**.
 - `artifacts/generated/full/boundary/max-{128,2000,4096}/`: sekiz aile × üç
   M−1/M/M+1 genişlik × üç yapılandırma = **72 ayrı SQL dosyası**.
 
@@ -92,16 +92,34 @@ Her beklenti manifestte **unverified/NOT_RUN** olarak işaretlidir.
 Gelecekte C O2 `SQLITE_MAX_COLUMN=128/2000/4096` konfigürasyonları gerekir;
 bu görevde compiler çalıştırılmaz. Yerel C 3.54.1 UUID
 `555e07ef33f69a0957d24d8e555b702464a131d6f1607f4c3c1e4551e8e6ca76` yalnız
-referans kimliğidir. Runtime limit PRAGMA değildir; API tarifleri sonraki
-adımdadır. Portun mevcut 2000 tavanı bu dosyalarla değiştirilmez; 4096 senaryosu
+referans kimliğidir. Runtime limit PRAGMA değildir; API tarifleri
+[uygulama planında](docs/uygulama-plani.md) ve [API recipe](recipes/api.md) içindedir. Portun mevcut 2000 tavanı bu dosyalarla değiştirilmez; 4096 senaryosu
 C özel konfigürasyonunu hedefler. 32767 ağır profil otomatik üretilmez.
 
 Math fonksiyonları ve bazı core özellikler gelecekte capability/compile
 option farkı gösterebilir; math-function-probe manifest kaydı gelecekte C
 `-DSQLITE_ENABLE_MATH_FUNCTIONS` ve math capability gerektirir. Bu görevde
-probe bile çalıştırılmaz. Extension,
-WAL çok bağlantı/süreç, crash/recovery ve API uygulama tarifleri adım 2'ye
-bırakılmıştır; bu adımda uygulanmış/koşulmuş değillerdir.
+probe bile çalıştırılmaz. Adım 2 statik dosyaları da hazırlanmıştır:
+
+- [Uygulama planı](docs/uygulama-plani.md): gelecek sıra, C compile/runtime limit
+  tablosu, strict typed diff ve önerilen resource/timeout bütçeleri.
+- `examples/optional/*.sql`: küçük JSON/JSONB, FTS5 ve R-Tree fixture'ları;
+  gereken capabilities/future flags [extra-scope.json](extra-scope.json) içindedir.
+- `examples/additional/*.sql`: FAIL/ABORT/ROLLBACK ayrı setup/action/inspect,
+  composite FK/WITHOUT ROWID, generated columns ve 4 page-size create/reopen
+  phase'leri. Reopen iki gerçek API fazı gerektirir; tek SQL script'i yetmez.
+- `examples/stress/relational-workload.sql` ve
+  `artifacts/generated/full/stress/wide-{128,2000,4096}-workload.sql`: gerçek
+  büyük fixture'lara uygulanacak index/mutation/rollback/vacuum/tam scan
+  komutları. Bunlar statik dosyadır; hiçbiri yürütülmedi.
+- [WAL JSON](schedules/wal.json) / [açıklama](schedules/wal.md): ayrı session SQL
+  dosyaları, iki bağlantı veya üç süreç için dokuz ACK/barrier adımı.
+- [Crash/recovery](recipes/crash-recovery.md) ve [API](recipes/api.md): yalnız
+  uygulama tarifleri, runnable adapter/orchestrator yoktur.
+
+Yeni 22 scope kaydı ve bütün yeni SQL/recipe yolları prerequisites/NOT_RUN ile
+manifest/matrise bağlıdır. Eski 170 dosya silinmedi; eski veri/SQL baytları
+korundu. Profiles/scope/corpus metadata yeni kapsamı yansıtır.
 
 ## Durum
 
@@ -109,4 +127,6 @@ Yalnız statik üretim ve dosya/içerik/hash/sayım/determinism incelemesi vard�
 SQL doğruluğu, beklenen error, C/Rust eşdeğerliği, runtime limitler, wide DB
 kayıt sayısı ve performans **NOT_RUN**. Eksik/unsupported/skip gelecek çalışmada
 ayrı raporlanacaktır; burada hiçbir case PASS sertifikası üretilmez.
-Adım 1 ebeveyn statik içerik/hash/sayım incelemesi tamamlandı; SQL/test yürütülmedi.
+Her iki üretim adımı ebeveyn statik içerik/hash/sayım incelemesinden geçti.
+216 manifest dosyasının kimliği ve yerel bağlantıları incelendi. SQL/test yürütülmedi;
+son teslim yalnız `sqltest/` kapsamında `main` dalına kaydedilir.

@@ -1,11 +1,359 @@
 {
   "schema": 1,
   "kind": "STATIC_GENERATION_MANIFEST",
-  "generator_version": "sqltest-static-1",
+  "generator_version": "sqltest-static-2",
   "seed": 20261120,
-  "profiles_sha256": "7405c2d71b236eeb30b801317fd9d3524272abf94050a595005a9f4f73f4e747",
-  "generator_sha256": "b73f7ffba03652ed53a448de97e24b4bd261aea0a5ae9e386cc14aa2dbd2770c",
+  "profiles_sha256": "4cb690cd1cb03a32a5b31935bac43f66acf9d890879cc566e57f3aeb9931e1eb",
+  "generator_sha256": "f2a765a12d8e2b75800dd8c4e3e00f2ff48f3b8b48aed942c4d64dfdb872b395",
   "execution_status": "NOT_RUN",
+  "extra_scope_sha256": "6aaae42c541cde004baceba72628c88115a6802b16c01f0a9ef23b4f847a7ee0",
+  "additional_cases": [
+    {
+      "id": "optional-json",
+      "family": "optional",
+      "paths": [
+        "examples/optional/json.sql"
+      ],
+      "prerequisites": [],
+      "execution_status": "NOT_RUN",
+      "required_capabilities": [
+        "json"
+      ],
+      "future_c_conditions": [
+        "SQLITE_OMIT_JSON not enabled"
+      ],
+      "phase_scope": "Faz6/7 optional: no support proof"
+    },
+    {
+      "id": "optional-jsonb",
+      "family": "optional",
+      "paths": [
+        "examples/optional/jsonb.sql"
+      ],
+      "prerequisites": [
+        "examples/optional/json.sql"
+      ],
+      "execution_status": "NOT_RUN",
+      "required_capabilities": [
+        "json",
+        "jsonb"
+      ],
+      "future_c_conditions": [
+        "SQLite JSONB implementation present; pinned C3.54.1",
+        "SQLITE_OMIT_JSON not enabled"
+      ],
+      "phase_scope": "Faz6/7 optional: no support proof"
+    },
+    {
+      "id": "optional-fts5",
+      "family": "optional",
+      "paths": [
+        "examples/optional/fts5.sql"
+      ],
+      "prerequisites": [],
+      "execution_status": "NOT_RUN",
+      "required_capabilities": [
+        "fts5"
+      ],
+      "future_c_flags": [
+        "-DSQLITE_ENABLE_FTS5"
+      ],
+      "phase_scope": "Faz6/7 optional: no support proof"
+    },
+    {
+      "id": "optional-rtree",
+      "family": "optional",
+      "paths": [
+        "examples/optional/rtree.sql"
+      ],
+      "prerequisites": [],
+      "execution_status": "NOT_RUN",
+      "required_capabilities": [
+        "rtree"
+      ],
+      "future_c_flags": [
+        "-DSQLITE_ENABLE_RTREE"
+      ],
+      "phase_scope": "Faz6/7 optional: no support proof"
+    },
+    {
+      "id": "conflict-fail",
+      "family": "conflict",
+      "paths": [
+        "examples/additional/conflict-setup.sql",
+        "examples/additional/conflict-fail-action.sql",
+        "examples/additional/conflict-inspect.sql"
+      ],
+      "prerequisites": [],
+      "execution_status": "NOT_RUN",
+      "intentionally_negative": true,
+      "phase_order": "same connection; continue after expected error",
+      "expected_error": "UNIQUE constraint; exact code/stage unverified",
+      "expected_ids": [
+        1,
+        2,
+        3,
+        9
+      ],
+      "expected_autocommit_after_error": false
+    },
+    {
+      "id": "conflict-abort",
+      "family": "conflict",
+      "paths": [
+        "examples/additional/conflict-setup.sql",
+        "examples/additional/conflict-abort-action.sql",
+        "examples/additional/conflict-inspect.sql"
+      ],
+      "prerequisites": [],
+      "execution_status": "NOT_RUN",
+      "intentionally_negative": true,
+      "phase_order": "same connection; continue after expected error",
+      "expected_error": "UNIQUE constraint; exact code/stage unverified",
+      "expected_ids": [
+        1,
+        2,
+        9
+      ],
+      "expected_autocommit_after_error": false
+    },
+    {
+      "id": "conflict-rollback",
+      "family": "conflict",
+      "paths": [
+        "examples/additional/conflict-setup.sql",
+        "examples/additional/conflict-rollback-action.sql",
+        "examples/additional/conflict-inspect.sql"
+      ],
+      "prerequisites": [],
+      "execution_status": "NOT_RUN",
+      "intentionally_negative": true,
+      "phase_order": "same connection; continue after expected error",
+      "expected_error": "UNIQUE constraint; exact code/stage unverified",
+      "expected_ids": [
+        1,
+        2
+      ],
+      "expected_autocommit_after_error": true
+    },
+    {
+      "id": "composite-without-rowid-fk",
+      "family": "ddl_fk",
+      "paths": [
+        "examples/additional/without-rowid-fk.sql"
+      ],
+      "prerequisites": [],
+      "execution_status": "NOT_RUN",
+      "required_capabilities": [
+        "without_rowid",
+        "foreign_keys"
+      ]
+    },
+    {
+      "id": "generated-columns",
+      "family": "generated",
+      "paths": [
+        "examples/additional/generated-columns.sql"
+      ],
+      "prerequisites": [],
+      "execution_status": "NOT_RUN",
+      "required_capabilities": [
+        "generated_columns"
+      ]
+    },
+    {
+      "id": "reopen-page-512",
+      "family": "storage",
+      "paths": [
+        "examples/additional/page-512-create.sql",
+        "examples/additional/page-512-reopen.sql"
+      ],
+      "prerequisites": [],
+      "execution_status": "NOT_RUN",
+      "between_files": "future close/reopen API required; no automatic runner",
+      "expected_page_size": 512,
+      "planned_records": 256
+    },
+    {
+      "id": "reopen-page-1024",
+      "family": "storage",
+      "paths": [
+        "examples/additional/page-1024-create.sql",
+        "examples/additional/page-1024-reopen.sql"
+      ],
+      "prerequisites": [],
+      "execution_status": "NOT_RUN",
+      "between_files": "future close/reopen API required; no automatic runner",
+      "expected_page_size": 1024,
+      "planned_records": 256
+    },
+    {
+      "id": "reopen-page-4096",
+      "family": "storage",
+      "paths": [
+        "examples/additional/page-4096-create.sql",
+        "examples/additional/page-4096-reopen.sql"
+      ],
+      "prerequisites": [],
+      "execution_status": "NOT_RUN",
+      "between_files": "future close/reopen API required; no automatic runner",
+      "expected_page_size": 4096,
+      "planned_records": 256
+    },
+    {
+      "id": "reopen-page-65536",
+      "family": "storage",
+      "paths": [
+        "examples/additional/page-65536-create.sql",
+        "examples/additional/page-65536-reopen.sql"
+      ],
+      "prerequisites": [],
+      "execution_status": "NOT_RUN",
+      "between_files": "future close/reopen API required; no automatic runner",
+      "expected_page_size": 65536,
+      "planned_records": 256
+    },
+    {
+      "id": "relational-mutation-stress",
+      "family": "stress",
+      "paths": [
+        "examples/stress/relational-workload.sql"
+      ],
+      "prerequisites": [
+        "artifacts/generated/full/relational.sql"
+      ],
+      "execution_status": "NOT_RUN",
+      "planned_records_after": 50000
+    },
+    {
+      "id": "wide-128-mutation-stress",
+      "family": "stress",
+      "paths": [
+        "artifacts/generated/full/stress/wide-128-workload.sql"
+      ],
+      "prerequisites": [
+        "artifacts/generated/full/wide-128.sql"
+      ],
+      "execution_status": "NOT_RUN",
+      "future_max_column": 128,
+      "planned_records_after": 3000,
+      "full_materialized_fields": 384000
+    },
+    {
+      "id": "wide-2000-mutation-stress",
+      "family": "stress",
+      "paths": [
+        "artifacts/generated/full/stress/wide-2000-workload.sql"
+      ],
+      "prerequisites": [
+        "artifacts/generated/full/wide-2000.sql"
+      ],
+      "execution_status": "NOT_RUN",
+      "future_max_column": 2000,
+      "planned_records_after": 3000,
+      "full_materialized_fields": 6000000
+    },
+    {
+      "id": "wide-4096-mutation-stress",
+      "family": "stress",
+      "paths": [
+        "artifacts/generated/full/stress/wide-4096-workload.sql"
+      ],
+      "prerequisites": [
+        "artifacts/generated/full/wide-4096.sql"
+      ],
+      "execution_status": "NOT_RUN",
+      "future_max_column": 4096,
+      "planned_records_after": 3000,
+      "full_materialized_fields": 12288000
+    },
+    {
+      "id": "wal-sessions",
+      "family": "wal",
+      "paths": [
+        "sessions/wal/setup.sql",
+        "sessions/wal/reader-01-hold.sql",
+        "sessions/wal/writer-01-commit.sql",
+        "sessions/wal/reader-02-snapshot.sql",
+        "sessions/wal/checkpointer-01-passive.sql",
+        "sessions/wal/checkpointer-02-restart.sql",
+        "sessions/wal/reader-03-release.sql",
+        "sessions/wal/checkpointer-03-truncate.sql",
+        "sessions/wal/verify.sql",
+        "schedules/wal.json",
+        "schedules/wal.md",
+        "sessions/wal/connection-config.sql"
+      ],
+      "prerequisites": [],
+      "execution_status": "NOT_RUN",
+      "requirements": [
+        "real persistent connections/PIDs and ACK orchestrator not included"
+      ],
+      "expected_role_modes": [
+        "two-connections",
+        "three-processes"
+      ],
+      "per_connection_preflight": "WAL/synchronous/autocheckpoint/busy_timeout readback before transactions"
+    },
+    {
+      "id": "future-api-actions",
+      "family": "api_recipe",
+      "paths": [
+        "recipes/api.md"
+      ],
+      "prerequisites": [],
+      "execution_status": "NOT_RUN",
+      "required_execution": "separate authorized future native adapters; none in this delivery"
+    },
+    {
+      "id": "future-crash-recovery",
+      "family": "crash_recipe",
+      "paths": [
+        "recipes/crash-recovery.md"
+      ],
+      "prerequisites": [
+        "schedules/wal.json"
+      ],
+      "execution_status": "NOT_RUN",
+      "required_execution": "separate authorized future process/fault orchestration; none in this delivery"
+    },
+    {
+      "id": "future-application-order",
+      "family": "application_recipe",
+      "paths": [
+        "docs/uygulama-plani.md"
+      ],
+      "prerequisites": [
+        "profiles.json"
+      ],
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "id": "wal-additional-contention",
+      "family": "wal",
+      "paths": [
+        "sessions/wal/reader-upgrade.sql",
+        "sessions/wal/reader-upgrade-inspect.sql",
+        "sessions/wal/writer-hold.sql",
+        "sessions/wal/competing-writer.sql",
+        "sessions/wal/writer-release.sql",
+        "recipes/wal-contention.md"
+      ],
+      "prerequisites": [
+        "schedules/wal.json",
+        "sessions/wal/connection-config.sql"
+      ],
+      "execution_status": "NOT_RUN",
+      "intentionally_negative": true,
+      "expected_primary_errors": [
+        "BUSY"
+      ],
+      "expected_extended_errors": [
+        "BUSY_SNAPSHOT"
+      ],
+      "scope": "two separate alternate branches; actual error/stage/ACK not observed"
+    }
+  ],
   "generation_scope": "Physical text/data files only. No SQL engine, test, build or benchmark executed.",
   "normal_physical_records": 10000,
   "readable_scenarios": 75,
@@ -952,6 +1300,33 @@
       "planned_select_statements": 13
     },
     {
+      "path": "artifacts/generated/full/wide-128.sql",
+      "bytes": 55232,
+      "sha256": "be54193656fc255fc56c4ec94cec43145fed62d553de532a23599d5de34dc8ca",
+      "physical_lines": 267,
+      "execution_status": "NOT_RUN",
+      "kind": "wide_sql",
+      "planned_columns": 128,
+      "explicit_ddl_columns": 128,
+      "explicit_insert_expressions": 128,
+      "planned_insert_rows": 3000,
+      "planned_materialized_fields": 384000,
+      "future_max_column": 128
+    },
+    {
+      "path": "artifacts/generated/full/stress/wide-128-workload.sql",
+      "bytes": 1365,
+      "sha256": "7b4ccfe68e04f41a9f1d34e2bc6a50e8c35233cbbeec0cd2f407526167710faa",
+      "physical_lines": 12,
+      "execution_status": "NOT_RUN",
+      "kind": "wide_workload_sql",
+      "planned_columns": 128,
+      "explicit_projection_columns": 128,
+      "planned_records_after": 3000,
+      "future_max_column": 128,
+      "prerequisite": "artifacts/generated/full/wide-128.sql"
+    },
+    {
       "path": "artifacts/generated/full/wide-2000.sql",
       "bytes": 864515,
       "sha256": "75a3cad0082a5979162a3b7bb361dfba51ea0ec233433794d767631d3443c049",
@@ -966,6 +1341,19 @@
       "future_max_column": 2000
     },
     {
+      "path": "artifacts/generated/full/stress/wide-2000-workload.sql",
+      "bytes": 12602,
+      "sha256": "977b9e2a7fe584e61d108e4916d18354914e469a33ef8157c67e2328c15b84df",
+      "physical_lines": 12,
+      "execution_status": "NOT_RUN",
+      "kind": "wide_workload_sql",
+      "planned_columns": 2000,
+      "explicit_projection_columns": 2000,
+      "planned_records_after": 3000,
+      "future_max_column": 2000,
+      "prerequisite": "artifacts/generated/full/wide-2000.sql"
+    },
+    {
       "path": "artifacts/generated/full/wide-4096.sql",
       "bytes": 1774179,
       "sha256": "9de1346820de051046ee32b04702c49af13a5add6a7465aed1126f754436560a",
@@ -978,6 +1366,19 @@
       "planned_insert_rows": 3000,
       "planned_materialized_fields": 12288000,
       "future_max_column": 4096
+    },
+    {
+      "path": "artifacts/generated/full/stress/wide-4096-workload.sql",
+      "bytes": 25178,
+      "sha256": "da8b9c29fabbfdb7d5d881fdf674f14c2c29042fb57eb9912ed69899635cfe8c",
+      "physical_lines": 12,
+      "execution_status": "NOT_RUN",
+      "kind": "wide_workload_sql",
+      "planned_columns": 4096,
+      "explicit_projection_columns": 4096,
+      "planned_records_after": 3000,
+      "future_max_column": 4096,
+      "prerequisite": "artifacts/generated/full/wide-4096.sql"
     },
     {
       "path": "artifacts/generated/full/boundary/max-128/table-127.sql",
@@ -1916,10 +2317,473 @@
       "expectation": "error expected; unverified code/stage"
     },
     {
+      "path": "docs/uygulama-plani.md",
+      "bytes": 8241,
+      "sha256": "55ed78f795940835520d4648c4bf32c1ad3441ce495ecd7f1c43dd18faae696d",
+      "physical_lines": 129,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "future-application-order"
+      ]
+    },
+    {
+      "path": "examples/additional/conflict-abort-action.sql",
+      "bytes": 154,
+      "sha256": "3d9a22a10fbad7da4843c70fa9a4cc0bfb9b48f558d3e446df4631fda107bec3",
+      "physical_lines": 2,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "conflict-abort"
+      ]
+    },
+    {
+      "path": "examples/additional/conflict-fail-action.sql",
+      "bytes": 153,
+      "sha256": "41cde5e31efdcb540361813e01c1902ec194a9e61cd91ee2cf86cfcf67954925",
+      "physical_lines": 2,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "conflict-fail"
+      ]
+    },
+    {
+      "path": "examples/additional/conflict-inspect.sql",
+      "bytes": 127,
+      "sha256": "d206147c08ab5cc94b171e4a3e1a0cfcba6d2bf5b72544c73b49150192b86ab7",
+      "physical_lines": 2,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "conflict-fail",
+        "conflict-abort",
+        "conflict-rollback"
+      ]
+    },
+    {
+      "path": "examples/additional/conflict-rollback-action.sql",
+      "bytes": 157,
+      "sha256": "6de835c7191b2c32f8a09a70383719420da92b710d5838b847eeb540f71faa69",
+      "physical_lines": 2,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "conflict-rollback"
+      ]
+    },
+    {
+      "path": "examples/additional/conflict-setup.sql",
+      "bytes": 218,
+      "sha256": "0d5a0c4557a636c0f28af79b3fa4ec1b097424325b0d49a69c0757790ceae22b",
+      "physical_lines": 5,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "conflict-fail",
+        "conflict-abort",
+        "conflict-rollback"
+      ]
+    },
+    {
+      "path": "examples/additional/generated-columns.sql",
+      "bytes": 436,
+      "sha256": "3e70e6a57c28b88b7fa31f82c57c8890420d0ee3aab929410e2944bbd5ca41bc",
+      "physical_lines": 6,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "generated-columns"
+      ]
+    },
+    {
+      "path": "examples/additional/page-1024-create.sql",
+      "bytes": 418,
+      "sha256": "89293c35c11fb815098d95f3ba5a81c06764b4bdc49e3b25f7abf09d5d1e5b1f",
+      "physical_lines": 6,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "reopen-page-1024"
+      ]
+    },
+    {
+      "path": "examples/additional/page-1024-reopen.sql",
+      "bytes": 169,
+      "sha256": "808d49cd1be9aef48eebcf928484bc517913d6646f534262c63df95d7905217b",
+      "physical_lines": 5,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "reopen-page-1024"
+      ]
+    },
+    {
+      "path": "examples/additional/page-4096-create.sql",
+      "bytes": 418,
+      "sha256": "3ad4590fdfb686c2ba9a86d4b948e958b0469c120289414b544117a8159c28b4",
+      "physical_lines": 6,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "reopen-page-4096"
+      ]
+    },
+    {
+      "path": "examples/additional/page-4096-reopen.sql",
+      "bytes": 169,
+      "sha256": "f1ecf34ebe55d6d53b4f8688a9c76d2bed832df7f7f9371da3c4468a54548ded",
+      "physical_lines": 5,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "reopen-page-4096"
+      ]
+    },
+    {
+      "path": "examples/additional/page-512-create.sql",
+      "bytes": 417,
+      "sha256": "264d9f28b3125beba5d0e996b80a7976d3a34e2e64657643a7cf268d24557252",
+      "physical_lines": 6,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "reopen-page-512"
+      ]
+    },
+    {
+      "path": "examples/additional/page-512-reopen.sql",
+      "bytes": 168,
+      "sha256": "d52b4679b465e5c1a322908bf40cb96b1949ad9fbc0f1552235c89427209228a",
+      "physical_lines": 5,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "reopen-page-512"
+      ]
+    },
+    {
+      "path": "examples/additional/page-65536-create.sql",
+      "bytes": 419,
+      "sha256": "17591c4624629aa782dbf69ac555c55ec3cb7da4d9cc30afc5407b64d97215c3",
+      "physical_lines": 6,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "reopen-page-65536"
+      ]
+    },
+    {
+      "path": "examples/additional/page-65536-reopen.sql",
+      "bytes": 170,
+      "sha256": "f1f96c9006a58dcc51145e6e9fded6f2c1ffd347d4369169309ed8e6a3b19942",
+      "physical_lines": 5,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "reopen-page-65536"
+      ]
+    },
+    {
+      "path": "examples/additional/without-rowid-fk.sql",
+      "bytes": 647,
+      "sha256": "74717d035b264b6f33a8ba40a7eff4b057ff46e3a03db7b0677805199d9d44ad",
+      "physical_lines": 11,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "composite-without-rowid-fk"
+      ]
+    },
+    {
+      "path": "examples/optional/fts5.sql",
+      "bytes": 497,
+      "sha256": "bc5fde7fe70026ebe6727cfa6fc49177456afbec4bd785d29aaf7f6d4d153bdf",
+      "physical_lines": 5,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "optional-fts5"
+      ]
+    },
+    {
+      "path": "examples/optional/json.sql",
+      "bytes": 514,
+      "sha256": "b24d015d36598f4e165a7008be6a48add7960d5b139058c31c47a100e3f44bad",
+      "physical_lines": 6,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "optional-json"
+      ]
+    },
+    {
+      "path": "examples/optional/jsonb.sql",
+      "bytes": 300,
+      "sha256": "1ff142a7340e66830a809f438b84f082a564c289c610642ae6d36f352a89fd7b",
+      "physical_lines": 4,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "optional-jsonb"
+      ]
+    },
+    {
+      "path": "examples/optional/rtree.sql",
+      "bytes": 311,
+      "sha256": "f6a3b950445881e5d16c988a48f4c6594b73525438401f8d28ba67f450925b9c",
+      "physical_lines": 4,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "optional-rtree"
+      ]
+    },
+    {
+      "path": "examples/stress/relational-workload.sql",
+      "bytes": 1253,
+      "sha256": "b2bff8ddd7b8167508fb2e4b63c79990988dca7219bc9ec9284524e15f9686e0",
+      "physical_lines": 27,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "relational-mutation-stress"
+      ]
+    },
+    {
+      "path": "recipes/api.md",
+      "bytes": 2552,
+      "sha256": "f0a4d30c3739d4e660694ac633636aeccf1c9c587c409fbdf7aa7a9f8488864f",
+      "physical_lines": 20,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "future-api-actions"
+      ]
+    },
+    {
+      "path": "recipes/crash-recovery.md",
+      "bytes": 2190,
+      "sha256": "faf93b17f73de966f04f06d9aa21b1281e6b5c26d791cade76d21e32ef73761f",
+      "physical_lines": 29,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "future-crash-recovery"
+      ]
+    },
+    {
+      "path": "recipes/wal-contention.md",
+      "bytes": 1680,
+      "sha256": "9612afa2403fa750f280b3acf17cb895dd0d12e0641235bf0ef3ee17e9ac6a67",
+      "physical_lines": 25,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "wal-additional-contention"
+      ]
+    },
+    {
+      "path": "schedules/wal.json",
+      "bytes": 3612,
+      "sha256": "91bcb928c5ddb2545d0b63beca1b057cd42b376621b7e26ac7c24ca760f4738b",
+      "physical_lines": 149,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "wal-sessions"
+      ]
+    },
+    {
+      "path": "schedules/wal.md",
+      "bytes": 2188,
+      "sha256": "cc01579d9bfbd168dccda2f1a23a9d120e0f990cff25ef119a97037f091f8d8d",
+      "physical_lines": 35,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "wal-sessions"
+      ]
+    },
+    {
+      "path": "sessions/wal/checkpointer-01-passive.sql",
+      "bytes": 130,
+      "sha256": "9ed56ffd341b275db0b6460b9116535abd57c3616da66cca44de4028ff0d9c5b",
+      "physical_lines": 3,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "wal-sessions"
+      ]
+    },
+    {
+      "path": "sessions/wal/checkpointer-02-restart.sql",
+      "bytes": 116,
+      "sha256": "635eac56553ae22082662035d4d54dd597a0ef83d353d1b6d1dc828916175d33",
+      "physical_lines": 3,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "wal-sessions"
+      ]
+    },
+    {
+      "path": "sessions/wal/checkpointer-03-truncate.sql",
+      "bytes": 76,
+      "sha256": "aff1af343af0bf127391f73b5e21b04fa1654220b099f9f73e7d22e8c1b43ba5",
+      "physical_lines": 2,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "wal-sessions"
+      ]
+    },
+    {
+      "path": "sessions/wal/competing-writer.sql",
+      "bytes": 181,
+      "sha256": "e96f67d0773ccacf91e67d4fa4b757c4268b58ff9900d347bbf26a6a732d7c41",
+      "physical_lines": 4,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "wal-additional-contention"
+      ]
+    },
+    {
+      "path": "sessions/wal/connection-config.sql",
+      "bytes": 249,
+      "sha256": "c25290fdedd9832553e7c83c0c959a03ecd3a9d93fe7cf9e20060734982adba0",
+      "physical_lines": 8,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "wal-sessions"
+      ]
+    },
+    {
+      "path": "sessions/wal/reader-01-hold.sql",
+      "bytes": 254,
+      "sha256": "00feff0530071f5aa4dd99cc5121dac7f73e16644e983cb96d1075d2a6c1e99c",
+      "physical_lines": 6,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "wal-sessions"
+      ]
+    },
+    {
+      "path": "sessions/wal/reader-02-snapshot.sql",
+      "bytes": 148,
+      "sha256": "4eaa4f11cc270fe16d7f258bf3aecc5872f81e4cf9b3f1bb8561d2d4b357b7f7",
+      "physical_lines": 3,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "wal-sessions"
+      ]
+    },
+    {
+      "path": "sessions/wal/reader-03-release.sql",
+      "bytes": 155,
+      "sha256": "940beac503c717f0d35b1ab677b18164fc6eb8b38886434a16b83158af8eabb5",
+      "physical_lines": 4,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "wal-sessions"
+      ]
+    },
+    {
+      "path": "sessions/wal/reader-upgrade-inspect.sql",
+      "bytes": 146,
+      "sha256": "1d42499d365614a2710f38bae83860d44f056ed8eb4f4791a61cc9b6c64604b1",
+      "physical_lines": 4,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "wal-additional-contention"
+      ]
+    },
+    {
+      "path": "sessions/wal/reader-upgrade.sql",
+      "bytes": 231,
+      "sha256": "63659b6d117791634e5338d0354772c371b7c73d5574c24a5f3a1b373ed6778a",
+      "physical_lines": 3,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "wal-additional-contention"
+      ]
+    },
+    {
+      "path": "sessions/wal/setup.sql",
+      "bytes": 319,
+      "sha256": "7d63c6249d74b34fb0c2c5589c80a2692d70f792d95f7e5d5e164c07b9359eae",
+      "physical_lines": 8,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "wal-sessions"
+      ]
+    },
+    {
+      "path": "sessions/wal/verify.sql",
+      "bytes": 123,
+      "sha256": "1c0529dd280bd423967937103ec23f964074c1b38426fd5b52efc876bd332f49",
+      "physical_lines": 3,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "wal-sessions"
+      ]
+    },
+    {
+      "path": "sessions/wal/writer-01-commit.sql",
+      "bytes": 243,
+      "sha256": "6cdfe372c74c5b8f608c2bdc1ebe888ccc0dcb444181b88ff56963215bf856a9",
+      "physical_lines": 6,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "wal-sessions"
+      ]
+    },
+    {
+      "path": "sessions/wal/writer-hold.sql",
+      "bytes": 226,
+      "sha256": "213936fea3059a2ae7d3af00592f0b4895dcbb8b03907e06b6b7b5cc0632485f",
+      "physical_lines": 4,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "wal-additional-contention"
+      ]
+    },
+    {
+      "path": "sessions/wal/writer-release.sql",
+      "bytes": 86,
+      "sha256": "e7ed48375cb962f8980858de653d6df9b86d4bcf3906838418b1d21f94df3e08",
+      "physical_lines": 2,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_static_source",
+      "case_ids": [
+        "wal-additional-contention"
+      ]
+    },
+    {
+      "path": "extra-scope.json",
+      "bytes": 11819,
+      "sha256": "6aaae42c541cde004baceba72628c88115a6802b16c01f0a9ef23b4f847a7ee0",
+      "physical_lines": 396,
+      "execution_status": "NOT_RUN",
+      "kind": "additional_scope"
+    },
+    {
       "path": "scope-matrix.json",
-      "bytes": 3119,
-      "sha256": "f76ae23aae1d2d6634c0e814e22900978b8b5327d33f5c96912d361de7ff4df2",
-      "physical_lines": 146,
+      "bytes": 13087,
+      "sha256": "115f076e6415f6e579a870b6e6a3687f5c0bff1c3fd8cf4c8f189e7a93f518a3",
+      "physical_lines": 498,
       "execution_status": "NOT_RUN",
       "kind": "scope_matrix"
     }

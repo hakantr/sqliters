@@ -28,3 +28,13 @@ generator ile yeniden üretilebilir. Kaynak, profiles, küçük örnekler, corpu
 manifesti ve scope matrisi review içindir. Bütün yazmalar yalnız yeni sqltest
 kapsamında; kullanıcı kaynaklarını veya R-0006 işlerini değiştirmedik.
 Ebeveyn statik içerik/hash/sayım incelemesi tamamlandı; adım 2 bu kayıt sırasında henüz başlamadı.
+
+## Adım 2 son statik teslim
+
+128/2000/4096 geniş tablo ve workload SQL setleri; 22 ek scope kaydı, optional
+JSON/JSONB/FTS5/R-Tree, ayrı WAL oturumları ve contention, API ve crash/recovery
+tarifleri hazırlandı. Toplam 216 manifest dosyası / 15.485.945 byte.
+Ebeveyn dosya kimliklerini, kaynak generator hash bağını, scope yollarını ve
+yerel Markdown bağlantılarını statik olarak inceledi. Motor/SQL/test/derleme
+yürütülmedi; bütün sonuçlar NOT_RUN. Büyük generated dosyalar ignored halde
+diskte bulunur; kaynak ve komut setleri yalnız sqltest kapsamıyla commit edilir.

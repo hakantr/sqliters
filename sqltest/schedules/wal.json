@@ -1,0 +1,149 @@
+{
+  "schema": 1,
+  "kind": "FUTURE_SCHEDULE_ONLY",
+  "execution_status": "NOT_RUN",
+  "prerequisites": [
+    "fresh DB in sqltest sandbox",
+    "local filesystem supports WAL",
+    "real orchestrator not included"
+  ],
+  "modes": [
+    {
+      "id": "two-connections",
+      "processes": 1,
+      "connections": 2,
+      "roles": {
+        "reader": "connection-R",
+        "writer": "connection-W",
+        "checkpointer": "alias connection-W"
+      }
+    },
+    {
+      "id": "three-processes",
+      "processes": 3,
+      "connections": 3,
+      "roles": {
+        "reader": "PID-R/connection-R",
+        "writer": "PID-W/connection-W",
+        "checkpointer": "PID-K/connection-K"
+      }
+    }
+  ],
+  "steps": [
+    {
+      "step": 1,
+      "role": "writer",
+      "sql_path": "sessions/wal/setup.sql",
+      "requires": [],
+      "ack": "SETUP_READY",
+      "expected_sum": 300,
+      "keep_connection_open": true,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "step": 2,
+      "role": "reader",
+      "sql_path": "sessions/wal/reader-01-hold.sql",
+      "requires": [
+        "SETUP_READY"
+      ],
+      "ack": "READER_SNAPSHOT_OPEN",
+      "expected_sum": 300,
+      "keep_transaction_open": true,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "step": 3,
+      "role": "writer",
+      "sql_path": "sessions/wal/writer-01-commit.sql",
+      "requires": [
+        "READER_SNAPSHOT_OPEN"
+      ],
+      "ack": "WRITER_COMMITTED",
+      "expected_sum": 325,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "step": 4,
+      "role": "reader",
+      "sql_path": "sessions/wal/reader-02-snapshot.sql",
+      "requires": [
+        "WRITER_COMMITTED"
+      ],
+      "ack": "READER_OLD_SNAPSHOT_CONFIRMED",
+      "expected_sum": 300,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "step": 5,
+      "role": "checkpointer",
+      "sql_path": "sessions/wal/checkpointer-01-passive.sql",
+      "requires": [
+        "READER_OLD_SNAPSHOT_CONFIRMED"
+      ],
+      "ack": "PASSIVE_REPORTED",
+      "expectation": "partial/bounded backfill only; inspect actual log/ckpt; no exact page count assumed",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "step": 6,
+      "role": "checkpointer",
+      "sql_path": "sessions/wal/checkpointer-02-restart.sql",
+      "requires": [
+        "PASSIVE_REPORTED"
+      ],
+      "ack": "RESTART_BUSY_CONFIRMED",
+      "expected_busy": 1,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "step": 7,
+      "role": "reader",
+      "sql_path": "sessions/wal/reader-03-release.sql",
+      "requires": [
+        "RESTART_BUSY_CONFIRMED"
+      ],
+      "ack": "READER_RELEASED",
+      "expected_sum": 325,
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "step": 8,
+      "role": "checkpointer",
+      "sql_path": "sessions/wal/checkpointer-03-truncate.sql",
+      "requires": [
+        "READER_RELEASED"
+      ],
+      "ack": "TRUNCATED",
+      "expected_checkpoint_row": [
+        0,
+        0,
+        0
+      ],
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "step": 9,
+      "role": "reader",
+      "sql_path": "sessions/wal/verify.sql",
+      "requires": [
+        "TRUNCATED"
+      ],
+      "ack": "VERIFIED",
+      "expected_integrity": "ok",
+      "expected_rows": [
+        [
+          1,
+          125
+        ],
+        [
+          2,
+          200
+        ]
+      ],
+      "execution_status": "NOT_RUN"
+    }
+  ],
+  "ack_rule": "ACK only after real result/error/transaction state; comments are not events",
+  "cleanup": "future close all connections after last ACK, preserve bundle/artifacts; no cleanup executed now"
+}
