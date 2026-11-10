@@ -2478,6 +2478,8 @@ pub fn expr_column_label(expr: &Expr) -> String {
         Expr::Binary { left, op, right } => {
             let sym = match op {
                 BinaryOp::Concat => "||",
+                BinaryOp::JsonExtract => "->",
+                BinaryOp::JsonExtractText => "->>",
                 BinaryOp::Multiply => "*",
                 BinaryOp::Divide => "/",
                 BinaryOp::Remainder => "%",
@@ -2553,6 +2555,13 @@ fn resolve_main_table_for_compiler(
     if schema.find_view(&name.name).is_some() && schema.find_user_table(&name.name).is_none() {
         return Ok(None);
     }
+    if schema.find_virtual_table(&name.name).is_some()
+        || name.name.eq_ignore_ascii_case("generate_series")
+        || name.name.eq_ignore_ascii_case("dbstat")
+        || crate::vtab::PragmaVTabModule::try_for_module_name(&name.name).is_some()
+    {
+        return Ok(None);
+    }
     let Some(tbl) = schema.find_table(&name.name) else {
         return Err(SqliteError::new(
             ErrorCode::Error,
@@ -2567,6 +2576,15 @@ fn resolve_db_set_table_for_compiler<'a>(
     db_set: &'a DatabaseSet,
 ) -> Result<Option<(DatabaseId, &'a str, &'a Schema, TableSchema)>> {
     let Some((db_id, rel)) = db_set.find_relation_in_set(name)? else {
+        if db_set.find_virtual_table_in_set(name).is_some()
+            || db_set
+                .vtab_registry()
+                .get_module(&name.name)
+                .is_some_and(|m| m.is_eponymous())
+            || crate::vtab::PragmaVTabModule::try_for_module_name(&name.name).is_some()
+        {
+            return Ok(None);
+        }
         return Err(SqliteError::new(
             ErrorCode::Error,
             format!("no such table: {}", name.display_name()),
@@ -3940,12 +3958,31 @@ fn compile_expr(
             }
         },
         Expr::Binary { left, op, right } => {
+            if matches!(op, BinaryOp::JsonExtract | BinaryOp::JsonExtractText) {
+                let fname = match op {
+                    BinaryOp::JsonExtract => "->",
+                    BinaryOp::JsonExtractText => "->>",
+                    _ => unreachable!(),
+                };
+                functions.validate_call(fname, false, 2, false, false, false)?;
+                let arg_base = prog.alloc_registers(2);
+                compile_expr(prog, left, binding, functions, arg_base)?;
+                compile_expr(prog, right, binding, functions, arg_base + 1)?;
+                prog.emit(
+                    Instruction::new(Opcode::Function, arg_base, 0, dest).with_p4(P4::Func {
+                        name: fname.to_owned(),
+                        argc: 2,
+                    }),
+                );
+                return Ok(());
+            }
             let lhs = prog.alloc_register();
             let rhs = prog.alloc_register();
             compile_expr(prog, left, binding, functions, lhs)?;
             compile_expr(prog, right, binding, functions, rhs)?;
             let vdbe_op = match op {
                 BinaryOp::Concat => Opcode::Concat,
+                BinaryOp::JsonExtract | BinaryOp::JsonExtractText => unreachable!(),
                 BinaryOp::Multiply => Opcode::Multiply,
                 BinaryOp::Divide => Opcode::Divide,
                 BinaryOp::Remainder => Opcode::Remainder,
@@ -5469,6 +5506,9 @@ fn tos_needs_ephemeral_in_from(
             }
             false
         }
+        TableOrSubquery::TableFunction { args, .. } => args
+            .iter()
+            .any(|a| expr_needs_ephemeral_in_db_set(a, ctes, db_set, depth + 1)),
     }
 }
 
@@ -5656,6 +5696,9 @@ fn tos_reads_target(
             }
             false
         }
+        TableOrSubquery::TableFunction { args, .. } => args
+            .iter()
+            .any(|a| expr_reads_target(a, ctes, target_db_id, target_tbl_name, db_set, depth + 1)),
     }
 }
 
@@ -7250,6 +7293,13 @@ where
                             }
                             TableOrSubquery::Subquery { .. } => {
                                 let _ = push_node(parent, "SCAN SUBQUERY".to_owned());
+                            }
+                            TableOrSubquery::TableFunction { name, alias, .. } => {
+                                let disp_name = alias.as_deref().unwrap_or(name.as_str());
+                                let _ = push_node(
+                                    parent,
+                                    format!("SCAN {disp_name} VIRTUAL TABLE INDEX 0:"),
+                                );
                             }
                         }
                     }

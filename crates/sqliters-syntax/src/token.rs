@@ -30,8 +30,8 @@ pub enum TokenKind {
     LShift,
     RShift,
     Concat,
-    Ptr,     // ->
-    PtrText, // ->>
+    Arrow,       // ->
+    DoubleArrow, // ->>
 
     // Literals, identifiers, bind variables
     Id,
@@ -195,6 +195,12 @@ pub enum TokenKind {
     Without,
 
     Eof,
+}
+
+#[allow(non_upper_case_globals)]
+impl TokenKind {
+    pub const Ptr: Self = Self::Arrow;
+    pub const PtrText: Self = Self::DoubleArrow;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,14 +405,14 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token<'_>>> {
                     if i + 2 < bytes.len() && bytes[i + 2] == b'>' {
                         i += 3;
                         tokens.push(Token {
-                            kind: TokenKind::PtrText,
+                            kind: TokenKind::DoubleArrow,
                             text: &sql[start..i],
                             offset: start,
                         });
                     } else {
                         i += 2;
                         tokens.push(Token {
-                            kind: TokenKind::Ptr,
+                            kind: TokenKind::Arrow,
                             text: &sql[start..i],
                             offset: start,
                         });

@@ -1,0 +1,12 @@
+[package]
+name = "sqliters-ext"
+description = "Built-in virtual table modules and extensions for sqliters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sqliters-types = { path = "../sqliters-types" }

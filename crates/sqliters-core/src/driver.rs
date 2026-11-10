@@ -562,6 +562,26 @@ impl<'a> AuthWalkCtx<'a> {
                 }
                 self.authorize_select_stmt(query, outer_scopes)
             }
+            Stmt::CreateVirtualTable {
+                name, module_name, ..
+            } => {
+                let db_id = name
+                    .schema
+                    .as_deref()
+                    .and_then(|s| self.db_set.find_db_id(s))
+                    .unwrap_or(DatabaseId::MAIN);
+                let db_name = self.slot_name(db_id);
+                if self.check(
+                    AuthorizerAction::CreateVtable,
+                    Some(&name.name),
+                    Some(module_name),
+                    Some(&db_name),
+                )? == AuthorizerResult::Ignore
+                {
+                    return Ok(false);
+                }
+                Ok(true)
+            }
             Stmt::DropTable { name, .. } => {
                 let db_id = if let Some(ref s) = name.schema {
                     self.db_set.find_db_id(s).unwrap_or(DatabaseId::MAIN)
@@ -1207,6 +1227,23 @@ impl<'a> AuthWalkCtx<'a> {
                         alias: Some(eff_alias),
                     };
                 }
+                Ok(src)
+            }
+            TableOrSubquery::TableFunction {
+                schema,
+                name,
+                args,
+                alias,
+            } => {
+                for a in args {
+                    self.authorize_expr(a, ctes, outer_scopes)?;
+                }
+                let qn = match schema {
+                    Some(s) => QualifiedName::qualified(s.clone(), name.clone()),
+                    None => QualifiedName::unqualified(name.clone()),
+                };
+                let (src, _) =
+                    self.resolve_source_relation(&qn, alias.as_deref(), ctes, outer_scopes)?;
                 Ok(src)
             }
             TableOrSubquery::Subquery { query, alias } => {

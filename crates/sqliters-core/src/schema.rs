@@ -716,10 +716,21 @@ pub struct ViewSchema {
     pub raw_sql: String,
 }
 
+/// Virtual table catalog definition loaded lazily from `sqlite_schema` (`type = 'table'`, `rootpage = 0`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualTableDef {
+    pub schema_rowid: i64,
+    pub name: String,
+    pub module_name: String,
+    pub args: Vec<String>,
+    pub sql: String,
+}
+
 /// Complete in-memory catalog of tables, indexes, views, and triggers loaded from `sqlite_schema` (Page 1).
 #[derive(Debug, Clone, Default)]
 pub struct Schema {
     pub tables: Vec<TableSchema>,
+    pub virtual_tables: Vec<VirtualTableDef>,
     pub indexes: Vec<IndexSchema>,
     pub views: Vec<ViewSchema>,
     pub triggers: Vec<TriggerSchema>,
@@ -767,6 +778,18 @@ impl Schema {
         self.tables
             .iter_mut()
             .find(|t| t.name.eq_ignore_ascii_case(name))
+    }
+
+    pub fn find_virtual_table(&self, name: &str) -> Option<&VirtualTableDef> {
+        self.virtual_tables
+            .iter()
+            .find(|vt| vt.name.eq_ignore_ascii_case(name))
+    }
+
+    pub fn find_virtual_table_mut(&mut self, name: &str) -> Option<&mut VirtualTableDef> {
+        self.virtual_tables
+            .iter_mut()
+            .find(|vt| vt.name.eq_ignore_ascii_case(name))
     }
 
     pub fn find_view(&self, name: &str) -> Option<&ViewSchema> {
@@ -896,6 +919,7 @@ impl Schema {
         let res = if btree.pager().page_count() == 0 {
             Ok(Self {
                 tables: Vec::new(),
+                virtual_tables: Vec::new(),
                 indexes: Vec::new(),
                 views: Vec::new(),
                 triggers: Vec::new(),
@@ -918,6 +942,7 @@ impl Schema {
         let writable_schema = btree.writable_schema();
         let raw_rows = scan_table_incremental(btree, 1)?;
         let mut tables = Vec::new();
+        let mut virtual_tables = Vec::new();
         let mut views = Vec::new();
         let mut pending_auto_by_table: Vec<(String, Vec<PendingAutoIndex>)> = Vec::new();
         let mut raw_index_rows: Vec<(i64, String, String, Pgno, Option<String>)> = Vec::new();
@@ -951,8 +976,29 @@ impl Schema {
             match obj_type {
                 "table" => {
                     if let Some(sql_text) = sql_opt {
-                        let ct = match parse_one(&sql_text) {
-                            Ok((Some(Stmt::CreateTable(ct)), tail)) if tail.trim().is_empty() => ct,
+                        match parse_one(&sql_text) {
+                            Ok((Some(Stmt::CreateTable(ct)), tail)) if tail.trim().is_empty() => {
+                                let (mut tbl, autos) = build_table_schema_from_ast(&ct, rootpage)?;
+                                tbl.schema_rowid = rowid;
+                                tbl.name = name.clone();
+                                tbl.raw_sql = sql_text;
+                                pending_auto_by_table.push((name, autos));
+                                tables.push(tbl);
+                            }
+                            Ok((
+                                Some(Stmt::CreateVirtualTable {
+                                    module_name, args, ..
+                                }),
+                                tail,
+                            )) if tail.trim().is_empty() => {
+                                virtual_tables.push(VirtualTableDef {
+                                    schema_rowid: rowid,
+                                    name,
+                                    module_name,
+                                    args,
+                                    sql: sql_text,
+                                });
+                            }
                             Ok((Some(_), _)) => {
                                 return Err(SqliteError::corrupt(
                                     "database disk image is malformed",
@@ -968,13 +1014,7 @@ impl Schema {
                                     Some(&e.message),
                                 ));
                             }
-                        };
-                        let (mut tbl, autos) = build_table_schema_from_ast(&ct, rootpage)?;
-                        tbl.schema_rowid = rowid;
-                        tbl.name = name.clone();
-                        tbl.raw_sql = sql_text;
-                        pending_auto_by_table.push((name, autos));
-                        tables.push(tbl);
+                        }
                     }
                 }
                 "index" => {
@@ -1279,6 +1319,7 @@ impl Schema {
 
         let mut schema = Self {
             tables,
+            virtual_tables,
             indexes,
             views,
             triggers,
@@ -2626,8 +2667,22 @@ fn validate_core_no_params(core: &SelectCore) -> Result<()> {
 }
 
 fn validate_tos_no_params(tos: &TableOrSubquery) -> Result<()> {
-    if let TableOrSubquery::Subquery { query, .. } = tos {
-        validate_view_no_parameters(query)?;
+    match tos {
+        TableOrSubquery::Table {
+            table_args: Some(args),
+            ..
+        }
+        | TableOrSubquery::TableFunction { args, .. } => {
+            for arg in args {
+                validate_expr_no_params(arg)?;
+            }
+        }
+        TableOrSubquery::Table {
+            table_args: None, ..
+        } => {}
+        TableOrSubquery::Subquery { query, .. } => {
+            validate_view_no_parameters(query)?;
+        }
     }
     Ok(())
 }
@@ -3045,6 +3100,31 @@ fn fix_tos_with_ctes(
                 table_args: fixed_args,
                 alias: alias.clone(),
                 indexed_by: indexed_by.clone(),
+            })
+        }
+        TableOrSubquery::TableFunction {
+            schema,
+            name,
+            args,
+            alias,
+        } => {
+            if let Some(s) = schema {
+                check_allowed_schema(view_name, db_schema_name, s)?;
+            }
+            let mut fixed_args = Vec::with_capacity(args.len());
+            for e in args {
+                fixed_args.push(fix_expr_with_ctes(
+                    view_name,
+                    db_schema_name,
+                    e,
+                    in_scope_ctes,
+                )?);
+            }
+            Ok(TableOrSubquery::TableFunction {
+                schema: Some(db_schema_name.to_owned()),
+                name: name.clone(),
+                args: fixed_args,
+                alias: alias.clone(),
             })
         }
         TableOrSubquery::Subquery { query, alias } => Ok(TableOrSubquery::Subquery {

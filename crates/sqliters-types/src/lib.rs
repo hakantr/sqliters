@@ -10,6 +10,7 @@ pub mod record;
 pub mod runtime_api;
 pub mod value;
 pub mod varint;
+pub mod vtab_api;
 
 pub use bitvec::Bitvec;
 pub use error::{ConflictResolutionEffect, ErrorCode, Result, SqliteError, extended};
@@ -31,6 +32,11 @@ pub use value::{
     format_sqlite_real, parse_numeric_text,
 };
 pub use varint::{get_varint, get_varint_i64, push_varint, put_varint, put_varint_i64, varint_len};
+pub use vtab_api::{
+    VTabConfigOption, VTabConstraint, VTabConstraintOp, VTabConstraintUsage, VTabHostContext,
+    VTabIndexInfo, VTabOrderBy, VTabRiskFlags, VTabUpdateOperation, VirtualCursor, VirtualTable,
+    VirtualTableModule,
+};
 
 #[cfg(test)]
 mod tests {

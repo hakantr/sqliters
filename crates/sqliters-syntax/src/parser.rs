@@ -624,6 +624,62 @@ impl<'a> Parser<'a> {
         let temp = self.eat(TokenKind::Temp);
         let unique = self.eat(TokenKind::Unique);
 
+        if !temp && !unique && self.eat(TokenKind::Virtual) {
+            self.expect(TokenKind::Table)?;
+            let if_not_exists = if self.eat(TokenKind::If) {
+                self.expect(TokenKind::Not)?;
+                self.expect(TokenKind::Exists)?;
+                true
+            } else {
+                false
+            };
+            let (name, name_offset) = self.parse_qualified_name_with_offset()?;
+            self.expect(TokenKind::Using)?;
+            let module_name = self.parse_nm()?;
+            let args = if self.at(TokenKind::Lp) {
+                let lp_tok = self.expect(TokenKind::Lp)?;
+                let mut depth = 1usize;
+                let rp_tok = loop {
+                    let tok = self.peek();
+                    match tok.kind {
+                        TokenKind::Lp => {
+                            self.advance();
+                            depth += 1;
+                        }
+                        TokenKind::Rp => {
+                            let rp = self.advance();
+                            depth -= 1;
+                            if depth == 0 {
+                                break rp;
+                            }
+                        }
+                        TokenKind::Eof => {
+                            return Err(self.syntax_err_at(tok, "near \"\": syntax error"));
+                        }
+                        _ => {
+                            self.advance();
+                        }
+                    }
+                };
+                let inner_sql = &self.sql[lp_tok.offset + lp_tok.text.len()..rp_tok.offset];
+                split_vtab_raw_args(inner_sql)
+            } else {
+                Vec::new()
+            };
+            let body_end = self.prev_token_end();
+            let end_off = self.peek().offset;
+            let catalog_sql = format!("CREATE VIRTUAL TABLE {}", &self.sql[name_offset..body_end]);
+            let raw_sql = self.sql[stmt_start..end_off].trim().to_owned();
+            return Ok(Stmt::CreateVirtualTable {
+                if_not_exists,
+                name,
+                module_name,
+                args,
+                catalog_sql,
+                raw_sql,
+            });
+        }
+
         if !unique && self.eat(TokenKind::Table) {
             let if_not_exists = if self.eat(TokenKind::If) {
                 self.expect(TokenKind::Not)?;
@@ -2551,7 +2607,7 @@ impl<'a> Parser<'a> {
         }
 
         let name = self.parse_qualified_name()?;
-        let table_args = if self.eat(TokenKind::Lp) {
+        if self.eat(TokenKind::Lp) {
             let mut args = Vec::new();
             if !self.at(TokenKind::Rp) {
                 loop {
@@ -2562,15 +2618,19 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect(TokenKind::Rp)?;
-            Some(args)
-        } else {
-            None
-        };
+            let alias = self.parse_optional_table_alias(&[])?;
+            return Ok(TableOrSubquery::TableFunction {
+                schema: name.schema,
+                name: name.name,
+                args,
+                alias,
+            });
+        }
         let alias = self.parse_optional_table_alias(&[])?;
         let indexed_by = self.parse_optional_index_hint()?;
         Ok(TableOrSubquery::Table {
             name,
-            table_args,
+            table_args: None,
             alias,
             indexed_by,
         })
@@ -2907,6 +2967,8 @@ impl<'a> Parser<'a> {
             TokenKind::Slash => Some((BinaryOp::Divide, 15, 16)),
             TokenKind::Rem => Some((BinaryOp::Remainder, 15, 16)),
             TokenKind::Concat => Some((BinaryOp::Concat, 17, 18)),
+            TokenKind::Arrow => Some((BinaryOp::JsonExtract, 17, 18)),
+            TokenKind::DoubleArrow => Some((BinaryOp::JsonExtractText, 17, 18)),
             _ => None,
         }
     }
@@ -2936,7 +2998,7 @@ impl<'a> Parser<'a> {
                 let next_tok = self.peek();
                 let next_is_hex = next_tok.kind == TokenKind::Integer
                     && (next_tok.text.starts_with("0x") || next_tok.text.starts_with("0X"));
-                let rhs = self.parse_expr_bp(17)?;
+                let rhs = self.parse_expr_bp(20)?;
                 // Fold `-9223372036854775808` and negative integer literals cleanly!
                 if let Expr::Float(f) = rhs {
                     return Ok(Expr::Float(-f));
@@ -2977,7 +3039,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Plus => {
                 self.advance();
-                let rhs = self.parse_expr_bp(17)?;
+                let rhs = self.parse_expr_bp(20)?;
                 Ok(Expr::Unary {
                     op: UnaryOp::Plus,
                     expr: Box::new(rhs),
@@ -2985,7 +3047,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::BitNot => {
                 self.advance();
-                let rhs = self.parse_expr_bp(17)?;
+                let rhs = self.parse_expr_bp(20)?;
                 Ok(Expr::Unary {
                     op: UnaryOp::BitNot,
                     expr: Box::new(rhs),
@@ -3296,4 +3358,92 @@ impl<'a> Parser<'a> {
         self.named_params.insert(txt.to_owned(), idx);
         Ok(BindParam::Named(txt.to_owned(), idx))
     }
+}
+
+/// Splits raw module arguments inside `CREATE VIRTUAL TABLE ... USING module(...)`
+/// at top-level commas while preserving balanced parentheses, brackets, braces,
+/// quoted strings/identifiers, and comments.
+pub fn split_vtab_raw_args(inner_sql: &str) -> Vec<String> {
+    if inner_sql.trim().is_empty() {
+        return Vec::new();
+    }
+    let bytes = inner_sql.as_bytes();
+    let mut args = Vec::new();
+    let mut seg_start = 0usize;
+    let mut i = 0usize;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'\'' | b'"' | b'`' => {
+                let quote = b;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                if i + 1 < bytes.len() {
+                    i += 2;
+                }
+            }
+            b'(' => {
+                paren_depth += 1;
+                i += 1;
+            }
+            b')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                i += 1;
+            }
+            b'[' => {
+                bracket_depth += 1;
+                i += 1;
+            }
+            b']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                i += 1;
+            }
+            b'{' => {
+                brace_depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                brace_depth = brace_depth.saturating_sub(1);
+                i += 1;
+            }
+            b',' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                args.push(inner_sql[seg_start..i].trim().to_owned());
+                i += 1;
+                seg_start = i;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    args.push(inner_sql[seg_start..].trim().to_owned());
+    args
 }

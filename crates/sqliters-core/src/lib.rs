@@ -11,6 +11,7 @@ pub mod engine;
 pub mod execution_context;
 pub mod schema;
 pub mod trigger;
+pub mod vtab;
 pub mod window;
 
 pub use backup::{Backup, BackupStepResult};
@@ -24,6 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use sqliters_btree::{Btree, BtreeCursorState, CursorId};
+pub use sqliters_ext::GenerateSeriesModule;
 pub use sqliters_pager::{
     AutoVacuumMode, DatabaseHeader, JournalMode, LockingMode, WalCheckpointMode,
     WalCheckpointResult,
@@ -36,7 +38,10 @@ use sqliters_syntax::{
 pub use sqliters_syntax::{ColumnRef, QualifiedName};
 pub use sqliters_types::{
     AggregateStepId, CustomCollation, DatabaseId, ExecutionServices, FunctionFlags, MAX_DB_SLOTS,
-    RowMutationEvent, RowMutationOp, RuntimeValue, SQLITE_MAX_ATTACHED,
+    RowMutationEvent, RowMutationOp, RuntimeValue, SQLITE_MAX_ATTACHED, VTabConfigOption,
+    VTabConstraint, VTabConstraintOp, VTabConstraintUsage, VTabHostContext, VTabIndexInfo,
+    VTabOrderBy, VTabRiskFlags, VTabUpdateOperation, VirtualCursor, VirtualTable,
+    VirtualTableModule,
 };
 use sqliters_types::{
     ConflictResolutionEffect, DatabaseKind, ErrorCode, LockGeometry, Pgno, Result,
@@ -68,10 +73,13 @@ pub use execution_context::{
     ScalarFunctionCallback, ScalarFunctionDef, TraceHookCallback, UpdateHookCallback,
     UpdateHookEvent, WindowAggregateInstance, WindowFunctionDef,
 };
-pub use schema::{ColumnSchema, ForeignKeySchema, IndexSchema, Schema, TableSchema, ViewSchema};
+pub use schema::{
+    ColumnSchema, ForeignKeySchema, IndexSchema, Schema, TableSchema, ViewSchema, VirtualTableDef,
+};
 pub use trigger::{
     SQLITE_MAX_TRIGGER_DEPTH, SQLITE_MAX_TRIGGER_STEPS, TriggerEventKind, TriggerSchema,
 };
+pub use vtab::{DbStatModule, DeclaredVTabSchema, PragmaVTabModule, VTabInstanceKey, VTabRegistry};
 
 /// Maximum automatic `PrepareMode::V2` schema-change reprepare retries (`SQLITE_MAX_SCHEMA_RETRY`).
 const SQLITE_MAX_SCHEMA_RETRY: usize = 50;
@@ -1593,6 +1601,23 @@ impl ConnectionInner {
         }
     }
 
+    fn with_default_exec_ctx<T>(
+        &mut self,
+        shared: &ConnectionShared,
+        activity: ActivitySummary,
+        f: impl FnOnce(&mut ExecContext<'_>) -> T,
+    ) -> T {
+        let mut expire_self_unused = false;
+        let mut stmt_tx_unused = StmtTxTracker::default();
+        self.with_exec_ctx(
+            shared,
+            activity,
+            &mut stmt_tx_unused,
+            &mut expire_self_unused,
+            f,
+        )
+    }
+
     fn abort_write_statement(
         &mut self,
         hid: HandleId,
@@ -1881,6 +1906,9 @@ impl ConnectionInner {
                     self.schema_changed_in_tx = snap.schema_changed_before;
                 } else {
                     // Autocommit statement abort: roll back write DBs and end reads started here!
+                    self.with_default_exec_ctx(shared, summary, |ctx| {
+                        crate::vtab::vtab_rollback_all(ctx)
+                    });
                     let write_only = !stmt_changed_schema && !self.schema_changed_in_tx;
                     for &inst in &snap.touched_write_instances {
                         if let Some(db_id) = self.db_set.find_db_id_by_instance(inst) {
@@ -2537,7 +2565,10 @@ impl Connection {
                 }
             }
         }
-        if any_in_tx {
+        if any_in_tx || !inner.db_set.vtab_registry().active_tx_vtabs().is_empty() {
+            inner.with_default_exec_ctx(&self.shared, ActivitySummary::default(), |ctx| {
+                crate::vtab::vtab_rollback_all(ctx)
+            });
             inner.rollback_count += 1;
         }
         inner.explicit_tx = false;
@@ -2706,6 +2737,9 @@ impl Connection {
         if !inner.activity.has_no_active_tx() {
             return Err(SqliteError::new(ErrorCode::Busy, "database is locked"));
         }
+        inner.with_default_exec_ctx(&self.shared, ActivitySummary::default(), |ctx| {
+            crate::vtab::vtab_rollback_all(ctx)
+        });
         for slot in inner.db_set.slots_mut() {
             if let Some(ref mut bt) = slot.btree
                 && bt.transaction_state() != TransactionState::Open
@@ -3495,6 +3529,114 @@ impl Connection {
         Ok(removed)
     }
 
+    /// Registers or replaces a virtual table module on this connection (`sqlite3_create_module_v2`).
+    pub fn create_module(&self, module: Arc<dyn VirtualTableModule>) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        inner.db_set.vtab_registry_mut().register_module(module);
+        inner.schema_generation += 1;
+        inner.v1_expire_generation += 1;
+        Ok(())
+    }
+
+    /// Idiomatic alias for [`Connection::create_module`].
+    pub fn register_module(&self, module: Arc<dyn VirtualTableModule>) -> Result<()> {
+        self.create_module(module)
+    }
+
+    /// Idiomatic alias for [`Connection::create_module`].
+    pub fn register_virtual_table_module(&self, module: Arc<dyn VirtualTableModule>) -> Result<()> {
+        self.create_module(module)
+    }
+
+    /// Unregisters a virtual table module by name (`sqlite3_create_module_v2` with `pModule == NULL`).
+    pub fn unregister_module(&self, name: &str) -> Result<bool> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        let removed = inner.db_set.vtab_registry_mut().unregister_module(name);
+        if removed {
+            inner.schema_generation += 1;
+            inner.v1_expire_generation += 1;
+        }
+        Ok(removed)
+    }
+
+    /// Idiomatic alias for [`Connection::unregister_module`].
+    pub fn remove_module(&self, name: &str) -> Result<bool> {
+        self.unregister_module(name)
+    }
+
+    /// Enables or disables `SQLITE_DBCONFIG_DEFENSIVE` mode on this connection
+    /// (protecting virtual table shadow tables against direct user DML/DDL).
+    pub fn set_defensive(&self, enabled: bool) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        let prev = inner.db_set.defensive();
+        inner.db_set.set_defensive(enabled);
+        if prev != enabled {
+            inner.schema_generation += 1;
+            inner.v1_expire_generation += 1;
+        }
+        Ok(())
+    }
+
+    /// Returns whether `SQLITE_DBCONFIG_DEFENSIVE` mode is currently enabled on this connection.
+    pub fn defensive(&self) -> Result<bool> {
+        let session = self.shared.enter()?;
+        let inner = session.inner();
+        inner.ensure_usable()?;
+        Ok(inner.db_set.defensive())
+    }
+
+    /// Queries (`enabled == None`) or updates (`enabled == Some(b)`) `SQLITE_DBCONFIG_DEFENSIVE`,
+    /// returning the current/updated state.
+    pub fn db_config_defensive(&self, enabled: Option<bool>) -> bool {
+        if let Ok(mut session) = self.shared.enter() {
+            if session.inner().ensure_usable().is_err() {
+                return false;
+            }
+            if let Some(flag) = enabled {
+                let inner = session.inner_mut();
+                let prev = inner.db_set.defensive();
+                let cur = inner.db_set.set_defensive(flag);
+                if prev != cur {
+                    inner.schema_generation += 1;
+                    inner.v1_expire_generation += 1;
+                }
+                cur
+            } else {
+                session.inner().db_set.defensive()
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Enables or disables `PRAGMA trusted_schema` (`SQLITE_DBCONFIG_TRUSTED_SCHEMA`) on this connection.
+    pub fn set_trusted_schema(&self, enabled: bool) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        let prev = inner.db_set.trusted_schema();
+        inner.db_set.set_trusted_schema(enabled);
+        if prev != enabled {
+            inner.schema_generation += 1;
+            inner.v1_expire_generation += 1;
+        }
+        Ok(())
+    }
+
+    /// Returns whether `PRAGMA trusted_schema` (`SQLITE_DBCONFIG_TRUSTED_SCHEMA`) is currently enabled.
+    pub fn trusted_schema(&self) -> Result<bool> {
+        let session = self.shared.enter()?;
+        let inner = session.inner();
+        inner.ensure_usable()?;
+        Ok(inner.db_set.trusted_schema())
+    }
+
     /// Installs or clears the periodic VM/engine progress callback (`sqlite3_progress_handler`).
     ///
     /// When `period_ops >= 1` and `handler` is `Some(cb)`, `cb` is invoked once every `period_ops`
@@ -4117,6 +4259,9 @@ fn select_references_temp_catalog(sel: &SelectStmt, db_set: &DatabaseSet) -> boo
                                 db_set.resolve_catalog_table(name),
                                 Ok(Some(DatabaseId::TEMP))
                             ),
+                            TableOrSubquery::TableFunction { args, .. } => {
+                                args.iter().any(|a| expr_references_temp_catalog(a, db_set))
+                            }
                             TableOrSubquery::Subquery { query, .. } => {
                                 select_references_temp_catalog(query, db_set)
                             }
@@ -4275,6 +4420,9 @@ fn from_clause_references_temp_catalog(fc: &FromClause, db_set: &DatabaseSet) ->
                 db_set.resolve_catalog_table(name),
                 Ok(Some(DatabaseId::TEMP))
             ),
+            TableOrSubquery::TableFunction { args, .. } => {
+                args.iter().any(|a| expr_references_temp_catalog(a, db_set))
+            }
             TableOrSubquery::Subquery { query, .. } => {
                 select_references_temp_catalog(query, db_set)
             }
@@ -4451,6 +4599,9 @@ fn target_write_db_for_stmt(stmt: &Stmt, db_set: &DatabaseSet) -> Option<Databas
         if let Ok(Some(cat_db)) = db_set.resolve_catalog_table(qn) {
             return Some(cat_db);
         }
+        if let Some((id, _)) = db_set.find_virtual_table_in_set(qn) {
+            return Some(id);
+        }
         match db_set.find_relation_in_set(qn) {
             // `if (!isView) sqlite3BeginWriteOperation(...)` (`insert.c:1058`): DML on a `VIEW`
             // does NOT pre-acquire a `Write` transaction on the view's database!
@@ -4469,6 +4620,13 @@ fn target_write_db_for_stmt(stmt: &Stmt, db_set: &DatabaseSet) -> Option<Databas
         Stmt::Insert(ins) => resolve_dml_target(&ins.table),
         Stmt::Update(upd) => resolve_dml_target(&upd.table),
         Stmt::Delete(del) => resolve_dml_target(&del.table),
+        Stmt::CreateVirtualTable { name, .. } => {
+            if let Some(ref s) = name.schema {
+                db_set.find_db_id(s)
+            } else {
+                Some(DatabaseId::MAIN)
+            }
+        }
         Stmt::CreateTable(ct) => {
             if ct.temp {
                 Some(DatabaseId::TEMP)
@@ -4585,7 +4743,20 @@ fn is_noop_if_exists_ddl(stmt: &Stmt, db_set: &DatabaseSet) -> bool {
             .is_some_and(|sl| {
                 sl.btree.is_some()
                     && (sl.schema.find_user_table(&ct.name.name).is_some()
-                        || sl.schema.find_view(&ct.name.name).is_some())
+                        || sl.schema.find_view(&ct.name.name).is_some()
+                        || sl.schema.find_virtual_table(&ct.name.name).is_some())
+            }),
+        Stmt::CreateVirtualTable {
+            if_not_exists: true,
+            name,
+            ..
+        } => target_write_db_for_stmt(stmt, db_set)
+            .and_then(|id| db_set.slot(id))
+            .is_some_and(|sl| {
+                sl.btree.is_some()
+                    && (sl.schema.find_user_table(&name.name).is_some()
+                        || sl.schema.find_view(&name.name).is_some()
+                        || sl.schema.find_virtual_table(&name.name).is_some())
             }),
         Stmt::CreateTableAs {
             if_not_exists: true,
@@ -4596,14 +4767,16 @@ fn is_noop_if_exists_ddl(stmt: &Stmt, db_set: &DatabaseSet) -> bool {
             .is_some_and(|sl| {
                 sl.btree.is_some()
                     && (sl.schema.find_user_table(&name.name).is_some()
-                        || sl.schema.find_view(&name.name).is_some())
+                        || sl.schema.find_view(&name.name).is_some()
+                        || sl.schema.find_virtual_table(&name.name).is_some())
             }),
         Stmt::CreateView(cv) if cv.if_not_exists => target_write_db_for_stmt(stmt, db_set)
             .and_then(|id| db_set.slot(id))
             .is_some_and(|sl| {
                 sl.btree.is_some()
                     && (sl.schema.find_user_table(&cv.name.name).is_some()
-                        || sl.schema.find_view(&cv.name.name).is_some())
+                        || sl.schema.find_view(&cv.name.name).is_some()
+                        || sl.schema.find_virtual_table(&cv.name.name).is_some())
             }),
         Stmt::CreateTrigger(ct) if ct.if_not_exists => target_write_db_for_stmt(stmt, db_set)
             .and_then(|id| db_set.slot(id))
@@ -4759,18 +4932,28 @@ impl Statement {
             }
         }
 
-        let mut artifacts = match compile_parsed_stmt(
-            stmt_opt.clone(),
-            &inner.db_set,
-            inner.writable_schema,
-            inner.foreign_keys,
-            inner.recursive_triggers,
-            inner.count_changes,
-            inner.runtime.enable_test_functions,
-            &inner.functions,
-            &inner.collations,
-            &mut inner.authorizer,
-        ) {
+        let try_compile =
+            |inner: &mut ConnectionInner, stmt_opt: Option<Stmt>| -> Result<CompiledArtifacts> {
+                if let Some(ref st) = stmt_opt {
+                    inner.with_default_exec_ctx(shared, ActivitySummary::default(), |ctx| {
+                        crate::vtab::ensure_stmt_vtabs_connected(ctx, st)
+                    })?;
+                }
+                compile_parsed_stmt(
+                    stmt_opt,
+                    &inner.db_set,
+                    inner.writable_schema,
+                    inner.foreign_keys,
+                    inner.recursive_triggers,
+                    inner.count_changes,
+                    inner.runtime.enable_test_functions,
+                    &inner.functions,
+                    &inner.collations,
+                    &mut inner.authorizer,
+                )
+            };
+
+        let mut artifacts = match try_compile(inner, stmt_opt.clone()) {
             Ok(a) => a,
             Err(err)
                 if needs_schema
@@ -4783,18 +4966,7 @@ impl Statement {
             {
                 // Cached schema might be stale due to an external writer: check on-disk cookies once!
                 if inner.ensure_schemas_loaded_for_prepare(true)? {
-                    compile_parsed_stmt(
-                        stmt_opt,
-                        &inner.db_set,
-                        inner.writable_schema,
-                        inner.foreign_keys,
-                        inner.recursive_triggers,
-                        inner.count_changes,
-                        inner.runtime.enable_test_functions,
-                        &inner.functions,
-                        &inner.collations,
-                        &mut inner.authorizer,
-                    )?
+                    try_compile(inner, stmt_opt)?
                 } else {
                     return Err(err);
                 }
@@ -5141,18 +5313,29 @@ impl Statement {
                     let _ = inner.ensure_schemas_loaded_for_prepare(false)?;
                 }
             }
-            let mut artifacts = match compile_first_sql(
-                &self.raw_sql,
-                &inner.db_set,
-                inner.writable_schema,
-                inner.foreign_keys,
-                inner.recursive_triggers,
-                inner.count_changes,
-                inner.runtime.enable_test_functions,
-                &inner.functions,
-                &inner.collations,
-                &mut inner.authorizer,
-            ) {
+            let shared = Arc::clone(&self.shared);
+            let try_compile = |inner: &mut ConnectionInner,
+                               parsed_stmt: &Option<Stmt>|
+             -> Result<CompiledArtifacts> {
+                if let Some(st) = parsed_stmt {
+                    inner.with_default_exec_ctx(&shared, ActivitySummary::default(), |ctx| {
+                        crate::vtab::ensure_stmt_vtabs_connected(ctx, st)
+                    })?;
+                }
+                compile_first_sql(
+                    &self.raw_sql,
+                    &inner.db_set,
+                    inner.writable_schema,
+                    inner.foreign_keys,
+                    inner.recursive_triggers,
+                    inner.count_changes,
+                    inner.runtime.enable_test_functions,
+                    &inner.functions,
+                    &inner.collations,
+                    &mut inner.authorizer,
+                )
+            };
+            let mut artifacts = match try_compile(inner, &parsed_stmt) {
                 Ok(a) => a,
                 Err(err)
                     if err.code == ErrorCode::Error
@@ -5163,18 +5346,7 @@ impl Statement {
                         }) =>
                 {
                     if inner.ensure_schemas_loaded_for_prepare(true)? {
-                        compile_first_sql(
-                            &self.raw_sql,
-                            &inner.db_set,
-                            inner.writable_schema,
-                            inner.foreign_keys,
-                            inner.recursive_triggers,
-                            inner.count_changes,
-                            inner.runtime.enable_test_functions,
-                            &inner.functions,
-                            &inner.collations,
-                            &mut inner.authorizer,
-                        )?
+                        try_compile(inner, &parsed_stmt)?
                     } else {
                         return Err(err);
                     }
@@ -7017,12 +7189,26 @@ fn collect_stmt_params(stmt: &Stmt, max_idx: &mut usize, named: &mut HashMap<Str
 }
 
 fn collect_from_params(fc: &FromClause, max_idx: &mut usize, named: &mut HashMap<String, usize>) {
-    if let TableOrSubquery::Subquery { query, .. } = &fc.head {
-        collect_select_params(query, max_idx, named);
+    match &fc.head {
+        TableOrSubquery::Subquery { query, .. } => collect_select_params(query, max_idx, named),
+        TableOrSubquery::TableFunction { args, .. } => {
+            for a in args {
+                collect_expr_params(a, max_idx, named);
+            }
+        }
+        TableOrSubquery::Table { .. } => {}
     }
     for j in &fc.joins {
-        if let TableOrSubquery::Subquery { query, .. } = &j.right {
-            collect_select_params(query, max_idx, named);
+        match &j.right {
+            TableOrSubquery::Subquery { query, .. } => {
+                collect_select_params(query, max_idx, named);
+            }
+            TableOrSubquery::TableFunction { args, .. } => {
+                for a in args {
+                    collect_expr_params(a, max_idx, named);
+                }
+            }
+            TableOrSubquery::Table { .. } => {}
         }
         if let Some(sqliters_syntax::JoinConstraint::On(e)) = &j.constraint {
             collect_expr_params(e, max_idx, named);

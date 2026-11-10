@@ -135,7 +135,7 @@ pub fn builtin_scalar_flags(name: &str, enable_test_functions: bool) -> Option<F
             Some(FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS | FunctionFlags::SUBTYPE)
         }
         "COALESCE" | "IFNULL" | "NULLIF" | "IIF" | "IF" | "MIN" | "MAX" | "LIKELY" | "UNLIKELY"
-        | "LIKELIHOOD" => Some(
+        | "LIKELIHOOD" | "->" | "->>" => Some(
             FunctionFlags::DETERMINISTIC
                 | FunctionFlags::INNOCUOUS
                 | FunctionFlags::SUBTYPE
@@ -315,6 +315,10 @@ pub fn eval_scalar_function_rt_with_strict(
             } else {
                 best.clone()
             }
+        }
+        "->" | "->>" => {
+            check_arity_rt(name, filtered, 2, 2)?;
+            eval_json_arrow_operator(&filtered[0].value, &filtered[1].value, upper == "->>")?
         }
         _ => {
             let plain_vals: Vec<Value> = filtered.iter().map(|rv| rv.value.clone()).collect();
@@ -828,7 +832,7 @@ fn scalar_function_arity_with_flag(
         "RANDOM" | "SQLITE_VERSION" | "SQLITE_SOURCE_ID" | "LAST_INSERT_ROWID" | "CHANGES"
         | "TOTAL_CHANGES" | "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" => Some((0, 0)),
         "COALESCE" | "IIF" | "IF" => Some((2, usize::MAX)),
-        "IFNULL" | "NULLIF" | "INSTR" | "GLOB" | "LIKELIHOOD" => Some((2, 2)),
+        "IFNULL" | "NULLIF" | "INSTR" | "GLOB" | "LIKELIHOOD" | "->" | "->>" => Some((2, 2)),
         "RANDSTR" | "TEST_SET_SUBTYPE" | "TEST_BAD_SUBTYPE" if enable_test_functions => {
             Some((2, 2))
         }
@@ -2020,5 +2024,474 @@ impl AccumulatorTable {
         };
         let rv = RuntimeValue::plain(acc.finalize()?);
         enforce_result_subtype_contract(&name, flags, strict_subtype, rv)
+    }
+}
+
+#[derive(Debug, Clone)]
+enum MiniJsonValue {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64, String),
+    Str(String),
+    Array(Vec<MiniJsonValue>),
+    Object(Vec<(String, MiniJsonValue)>),
+}
+
+impl MiniJsonValue {
+    fn to_json_text(&self) -> String {
+        match self {
+            Self::Null => "null".to_owned(),
+            Self::Bool(b) => if *b { "true" } else { "false" }.to_owned(),
+            Self::Int(i) => i.to_string(),
+            Self::Float(_, raw) => raw.clone(),
+            Self::Str(s) => {
+                let mut out = String::with_capacity(s.len() + 2);
+                out.push('"');
+                for ch in s.chars() {
+                    match ch {
+                        '"' => out.push_str("\\\""),
+                        '\\' => out.push_str("\\\\"),
+                        '\x08' => out.push_str("\\b"),
+                        '\x0C' => out.push_str("\\f"),
+                        '\n' => out.push_str("\\n"),
+                        '\r' => out.push_str("\\r"),
+                        '\t' => out.push_str("\\t"),
+                        c if (c as u32) < 0x20 => {
+                            out.push_str(&format!("\\u{:04x}", c as u32));
+                        }
+                        c => out.push(c),
+                    }
+                }
+                out.push('"');
+                out
+            }
+            Self::Array(items) => {
+                let mut out = String::from("[");
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&item.to_json_text());
+                }
+                out.push(']');
+                out
+            }
+            Self::Object(entries) => {
+                let mut out = String::from("{");
+                for (i, (k, v)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&Self::Str(k.clone()).to_json_text());
+                    out.push(':');
+                    out.push_str(&v.to_json_text());
+                }
+                out.push('}');
+                out
+            }
+        }
+    }
+}
+
+fn parse_mini_json(src: &str) -> Result<MiniJsonValue> {
+    let bytes = src.as_bytes();
+    let mut pos = 0usize;
+    let val = parse_mini_json_val(src, bytes, &mut pos)?;
+    skip_json_ws(bytes, &mut pos);
+    if pos != bytes.len() {
+        return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
+    }
+    Ok(val)
+}
+
+fn skip_json_ws(bytes: &[u8], pos: &mut usize) {
+    while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\n' | b'\r') {
+        *pos += 1;
+    }
+}
+
+fn parse_mini_json_val(src: &str, bytes: &[u8], pos: &mut usize) -> Result<MiniJsonValue> {
+    skip_json_ws(bytes, pos);
+    if *pos >= bytes.len() {
+        return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
+    }
+    match bytes[*pos] {
+        b'n' => {
+            if src[*pos..].starts_with("null") {
+                *pos += 4;
+                Ok(MiniJsonValue::Null)
+            } else {
+                Err(SqliteError::new(ErrorCode::Error, "malformed JSON"))
+            }
+        }
+        b't' => {
+            if src[*pos..].starts_with("true") {
+                *pos += 4;
+                Ok(MiniJsonValue::Bool(true))
+            } else {
+                Err(SqliteError::new(ErrorCode::Error, "malformed JSON"))
+            }
+        }
+        b'f' => {
+            if src[*pos..].starts_with("false") {
+                *pos += 5;
+                Ok(MiniJsonValue::Bool(false))
+            } else {
+                Err(SqliteError::new(ErrorCode::Error, "malformed JSON"))
+            }
+        }
+        b'"' => {
+            let s = parse_mini_json_string(src, bytes, pos)?;
+            Ok(MiniJsonValue::Str(s))
+        }
+        b'[' => {
+            *pos += 1;
+            skip_json_ws(bytes, pos);
+            let mut items = Vec::new();
+            if *pos < bytes.len() && bytes[*pos] == b']' {
+                *pos += 1;
+                return Ok(MiniJsonValue::Array(items));
+            }
+            loop {
+                items.push(parse_mini_json_val(src, bytes, pos)?);
+                skip_json_ws(bytes, pos);
+                if *pos >= bytes.len() {
+                    return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
+                }
+                if bytes[*pos] == b']' {
+                    *pos += 1;
+                    break;
+                }
+                if bytes[*pos] != b',' {
+                    return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
+                }
+                *pos += 1;
+            }
+            Ok(MiniJsonValue::Array(items))
+        }
+        b'{' => {
+            *pos += 1;
+            skip_json_ws(bytes, pos);
+            let mut entries = Vec::new();
+            if *pos < bytes.len() && bytes[*pos] == b'}' {
+                *pos += 1;
+                return Ok(MiniJsonValue::Object(entries));
+            }
+            loop {
+                skip_json_ws(bytes, pos);
+                if *pos >= bytes.len() || bytes[*pos] != b'"' {
+                    return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
+                }
+                let key = parse_mini_json_string(src, bytes, pos)?;
+                skip_json_ws(bytes, pos);
+                if *pos >= bytes.len() || bytes[*pos] != b':' {
+                    return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
+                }
+                *pos += 1;
+                let val = parse_mini_json_val(src, bytes, pos)?;
+                entries.push((key, val));
+                skip_json_ws(bytes, pos);
+                if *pos >= bytes.len() {
+                    return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
+                }
+                if bytes[*pos] == b'}' {
+                    *pos += 1;
+                    break;
+                }
+                if bytes[*pos] != b',' {
+                    return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
+                }
+                *pos += 1;
+            }
+            Ok(MiniJsonValue::Object(entries))
+        }
+        b'-' | b'0'..=b'9' => {
+            let start = *pos;
+            if bytes[*pos] == b'-' {
+                *pos += 1;
+            }
+            if *pos >= bytes.len() || !bytes[*pos].is_ascii_digit() {
+                return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
+            }
+            while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
+                *pos += 1;
+            }
+            let mut is_float = false;
+            if *pos < bytes.len() && bytes[*pos] == b'.' {
+                is_float = true;
+                *pos += 1;
+                if *pos >= bytes.len() || !bytes[*pos].is_ascii_digit() {
+                    return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
+                }
+                while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
+                    *pos += 1;
+                }
+            }
+            if *pos < bytes.len() && matches!(bytes[*pos], b'e' | b'E') {
+                is_float = true;
+                *pos += 1;
+                if *pos < bytes.len() && matches!(bytes[*pos], b'+' | b'-') {
+                    *pos += 1;
+                }
+                if *pos >= bytes.len() || !bytes[*pos].is_ascii_digit() {
+                    return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
+                }
+                while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
+                    *pos += 1;
+                }
+            }
+            let num_str = &src[start..*pos];
+            if !is_float && let Ok(i) = num_str.parse::<i64>() {
+                return Ok(MiniJsonValue::Int(i));
+            }
+            let f = num_str
+                .parse::<f64>()
+                .map_err(|_| SqliteError::new(ErrorCode::Error, "malformed JSON"))?;
+            Ok(MiniJsonValue::Float(f, num_str.to_owned()))
+        }
+        _ => Err(SqliteError::new(ErrorCode::Error, "malformed JSON")),
+    }
+}
+
+fn parse_mini_json_string(src: &str, bytes: &[u8], pos: &mut usize) -> Result<String> {
+    *pos += 1; // skip opening '"'
+    let mut out = String::new();
+    while *pos < bytes.len() {
+        let b = bytes[*pos];
+        if b == b'"' {
+            *pos += 1;
+            return Ok(out);
+        }
+        if b == b'\\' {
+            *pos += 1;
+            if *pos >= bytes.len() {
+                return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
+            }
+            match bytes[*pos] {
+                b'"' => {
+                    out.push('"');
+                    *pos += 1;
+                }
+                b'\\' => {
+                    out.push('\\');
+                    *pos += 1;
+                }
+                b'/' => {
+                    out.push('/');
+                    *pos += 1;
+                }
+                b'b' => {
+                    out.push('\x08');
+                    *pos += 1;
+                }
+                b'f' => {
+                    out.push('\x0C');
+                    *pos += 1;
+                }
+                b'n' => {
+                    out.push('\n');
+                    *pos += 1;
+                }
+                b'r' => {
+                    out.push('\r');
+                    *pos += 1;
+                }
+                b't' => {
+                    out.push('\t');
+                    *pos += 1;
+                }
+                b'u' => {
+                    *pos += 1;
+                    if *pos + 4 > bytes.len() {
+                        return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
+                    }
+                    let hex = &src[*pos..*pos + 4];
+                    let code = u32::from_str_radix(hex, 16)
+                        .map_err(|_| SqliteError::new(ErrorCode::Error, "malformed JSON"))?;
+                    *pos += 4;
+                    if let Some(ch) = char::from_u32(code) {
+                        out.push(ch);
+                    }
+                }
+                _ => return Err(SqliteError::new(ErrorCode::Error, "malformed JSON")),
+            }
+        } else {
+            let ch = src[*pos..].chars().next().unwrap();
+            out.push(ch);
+            *pos += ch.len_utf8();
+        }
+    }
+    Err(SqliteError::new(ErrorCode::Error, "malformed JSON"))
+}
+
+#[derive(Debug, Clone)]
+enum JsonPathStep {
+    Key(String),
+    Index { from_end: bool, offset: i64 },
+}
+
+fn parse_json_arrow_path(path_val: &Value) -> Result<Vec<JsonPathStep>> {
+    match path_val {
+        Value::Integer(i) => {
+            if *i >= 0 {
+                Ok(vec![JsonPathStep::Index {
+                    from_end: false,
+                    offset: *i,
+                }])
+            } else {
+                Ok(vec![JsonPathStep::Key(i.to_string())])
+            }
+        }
+        Value::Real(f) => Ok(vec![JsonPathStep::Key(format_sqlite_real(*f))]),
+        Value::Text(s) => {
+            if !s.starts_with('$') {
+                return Ok(vec![JsonPathStep::Key(s.clone())]);
+            }
+            let bytes = s.as_bytes();
+            let mut pos = 1usize;
+            let mut steps = Vec::new();
+            while pos < bytes.len() {
+                match bytes[pos] {
+                    b'.' => {
+                        pos += 1;
+                        if pos >= bytes.len() {
+                            return Err(SqliteError::new(ErrorCode::Error, "JSON path error"));
+                        }
+                        if bytes[pos] == b'"' {
+                            let key = parse_mini_json_string(s, bytes, &mut pos)?;
+                            steps.push(JsonPathStep::Key(key));
+                        } else {
+                            let start = pos;
+                            while pos < bytes.len() && bytes[pos] != b'.' && bytes[pos] != b'[' {
+                                pos += 1;
+                            }
+                            if start == pos {
+                                return Err(SqliteError::new(ErrorCode::Error, "JSON path error"));
+                            }
+                            steps.push(JsonPathStep::Key(s[start..pos].to_owned()));
+                        }
+                    }
+                    b'[' => {
+                        pos += 1;
+                        if pos >= bytes.len() {
+                            return Err(SqliteError::new(ErrorCode::Error, "JSON path error"));
+                        }
+                        let mut from_end = false;
+                        if bytes[pos] == b'#' {
+                            from_end = true;
+                            pos += 1;
+                        }
+                        let start = pos;
+                        while pos < bytes.len() && bytes[pos] != b']' {
+                            pos += 1;
+                        }
+                        if pos >= bytes.len() || bytes[pos] != b']' {
+                            return Err(SqliteError::new(ErrorCode::Error, "JSON path error"));
+                        }
+                        let idx_str = &s[start..pos];
+                        pos += 1; // skip ']'
+                        let offset = if from_end && idx_str.is_empty() {
+                            0
+                        } else {
+                            idx_str.parse::<i64>().map_err(|_| {
+                                SqliteError::new(ErrorCode::Error, "JSON path error")
+                            })?
+                        };
+                        if !from_end && offset < 0 {
+                            return Err(SqliteError::new(ErrorCode::Error, "JSON path error"));
+                        }
+                        steps.push(JsonPathStep::Index { from_end, offset });
+                    }
+                    _ => {
+                        return Err(SqliteError::new(ErrorCode::Error, "JSON path error"));
+                    }
+                }
+            }
+            Ok(steps)
+        }
+        Value::Null | Value::Blob(_) => Ok(Vec::new()),
+    }
+}
+
+fn eval_json_arrow_operator(
+    json_arg: &Value,
+    path_arg: &Value,
+    unquote_text: bool,
+) -> Result<RuntimeValue> {
+    if json_arg.is_null() || path_arg.is_null() {
+        return Ok(RuntimeValue::null());
+    }
+    if matches!(path_arg, Value::Blob(_)) {
+        return Err(SqliteError::new(ErrorCode::Error, "JSON path error"));
+    }
+    let json_str = match json_arg {
+        Value::Text(s) => s.clone(),
+        Value::Integer(i) => i.to_string(),
+        Value::Real(f) => format_sqlite_real(*f),
+        Value::Blob(_) => {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                "JSON cannot hold BLOB values",
+            ));
+        }
+        Value::Null => return Ok(RuntimeValue::null()),
+    };
+    let root = parse_mini_json(&json_str)?;
+    let steps = parse_json_arrow_path(path_arg)?;
+    let mut cur = &root;
+    for step in &steps {
+        match (cur, step) {
+            (MiniJsonValue::Object(entries), JsonPathStep::Key(k)) => {
+                if let Some((_, v)) = entries.iter().find(|(ek, _)| ek == k) {
+                    cur = v;
+                } else {
+                    return Ok(RuntimeValue::null());
+                }
+            }
+            (MiniJsonValue::Array(items), JsonPathStep::Index { from_end, offset }) => {
+                let resolved_idx = if *from_end {
+                    (items.len() as i64) + *offset
+                } else {
+                    *offset
+                };
+                if resolved_idx < 0 || (resolved_idx as usize) >= items.len() {
+                    return Ok(RuntimeValue::null());
+                }
+                cur = &items[resolved_idx as usize];
+            }
+            (
+                MiniJsonValue::Object(entries),
+                JsonPathStep::Index {
+                    from_end: false,
+                    offset,
+                },
+            ) if matches!(path_arg, Value::Integer(_)) => {
+                let k = offset.to_string();
+                if let Some((_, v)) = entries.iter().find(|(ek, _)| *ek == k) {
+                    cur = v;
+                } else {
+                    return Ok(RuntimeValue::null());
+                }
+            }
+            _ => return Ok(RuntimeValue::null()),
+        }
+    }
+    if unquote_text {
+        match cur {
+            MiniJsonValue::Null => Ok(RuntimeValue::null()),
+            MiniJsonValue::Bool(b) => Ok(RuntimeValue::plain(Value::Integer(i64::from(*b)))),
+            MiniJsonValue::Int(i) => Ok(RuntimeValue::plain(Value::Integer(*i))),
+            MiniJsonValue::Float(f, _) => Ok(RuntimeValue::plain(Value::real(*f))),
+            MiniJsonValue::Str(s) => Ok(RuntimeValue::plain(Value::Text(s.clone()))),
+            MiniJsonValue::Array(_) | MiniJsonValue::Object(_) => {
+                Ok(RuntimeValue::plain(Value::Text(cur.to_json_text())))
+            }
+        }
+    } else {
+        Ok(RuntimeValue::with_subtype(
+            Value::Text(cur.to_json_text()),
+            u32::from(b'J'),
+        ))
     }
 }

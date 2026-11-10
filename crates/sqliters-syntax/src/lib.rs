@@ -9,7 +9,9 @@ pub mod token;
 
 pub use ast::*;
 pub use complete::is_complete;
-pub use parser::{IdentSpanMap, TokenSpan, parse_one, parse_one_with_spans, parse_statements};
+pub use parser::{
+    IdentSpanMap, TokenSpan, parse_one, parse_one_with_spans, parse_statements, split_vtab_raw_args,
+};
 pub use rewrite::{
     apply_span_edits, format_replacement_ident, remove_column_def_from_create_table_sql,
 };

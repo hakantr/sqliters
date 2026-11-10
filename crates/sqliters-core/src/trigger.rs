@@ -173,6 +173,12 @@ pub fn resolve_and_validate_create_trigger(
         match db_set.find_relation_in_set(&pinned_qn)? {
             Some(found) => found,
             None => {
+                if db_set.find_virtual_table_in_set(&pinned_qn).is_some() {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "cannot create triggers on virtual tables",
+                    ));
+                }
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!("no such table: {slot_name}.{}", ct.on_table.name),
@@ -183,6 +189,12 @@ pub fn resolve_and_validate_create_trigger(
         match db_set.find_relation_in_set(&ct.on_table)? {
             Some(found) => found,
             None => {
+                if db_set.find_virtual_table_in_set(&ct.on_table).is_some() {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "cannot create triggers on virtual tables",
+                    ));
+                }
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!("no such table: {}", ct.on_table.display_name()),
@@ -484,6 +496,12 @@ fn validate_trig_tos_no_params(tos: &TableOrSubquery) -> Result<()> {
             }
             Ok(())
         }
+        TableOrSubquery::TableFunction { args, .. } => {
+            for a in args {
+                validate_trig_expr_no_params(a)?;
+            }
+            Ok(())
+        }
         TableOrSubquery::Subquery { query, .. } => validate_trig_select_no_params(query),
     }
 }
@@ -771,6 +789,11 @@ fn replace_bind_in_tos(tos: &mut TableOrSubquery) {
                 for a in args {
                     replace_bind_in_expr(a);
                 }
+            }
+        }
+        TableOrSubquery::TableFunction { args, .. } => {
+            for a in args {
+                replace_bind_in_expr(a);
             }
         }
         TableOrSubquery::Subquery { query, .. } => replace_bind_in_select(query),
@@ -1348,6 +1371,34 @@ fn fix_trig_tos(
                 indexed_by: indexed_by.clone(),
             })
         }
+        TableOrSubquery::TableFunction {
+            schema,
+            name,
+            args,
+            alias,
+        } => {
+            let qn = match schema {
+                Some(s) => QualifiedName::qualified(s.clone(), name.clone()),
+                None => QualifiedName::unqualified(name.clone()),
+            };
+            let fixed_qn =
+                fix_trig_qualified_relation(trigger_name, db_schema_name, &qn, in_scope_ctes)?;
+            let mut fixed_args = Vec::with_capacity(args.len());
+            for e in args {
+                fixed_args.push(fix_trig_expr(
+                    trigger_name,
+                    db_schema_name,
+                    e,
+                    in_scope_ctes,
+                )?);
+            }
+            Ok(TableOrSubquery::TableFunction {
+                schema: fixed_qn.schema,
+                name: fixed_qn.name,
+                args: fixed_args,
+                alias: alias.clone(),
+            })
+        }
         TableOrSubquery::Subquery { query, alias } => Ok(TableOrSubquery::Subquery {
             query: Box::new(fix_trig_select(
                 trigger_name,
@@ -1775,6 +1826,7 @@ fn tos_contains_raise(tos: &TableOrSubquery) -> bool {
         TableOrSubquery::Table { table_args, .. } => table_args
             .as_ref()
             .is_some_and(|args| args.iter().any(expr_contains_raise)),
+        TableOrSubquery::TableFunction { args, .. } => args.iter().any(expr_contains_raise),
         TableOrSubquery::Subquery { query, .. } => select_contains_raise(query),
     }
 }
@@ -2008,6 +2060,11 @@ fn check_tos_no_oversized_hex(tos: &TableOrSubquery) -> Result<()> {
                 for a in args {
                     check_expr_no_oversized_hex(a)?;
                 }
+            }
+        }
+        TableOrSubquery::TableFunction { args, .. } => {
+            for a in args {
+                check_expr_no_oversized_hex(a)?;
             }
         }
         TableOrSubquery::Subquery { query, .. } => check_select_no_oversized_hex(query)?,

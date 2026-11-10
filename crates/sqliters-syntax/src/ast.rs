@@ -144,6 +144,14 @@ pub enum Stmt {
         name: QualifiedName,
         query: Box<SelectStmt>,
     },
+    CreateVirtualTable {
+        if_not_exists: bool,
+        name: QualifiedName,
+        module_name: String,
+        args: Vec<String>,
+        catalog_sql: String,
+        raw_sql: String,
+    },
     DropTable {
         if_exists: bool,
         name: QualifiedName,
@@ -617,6 +625,12 @@ pub enum TableOrSubquery {
         alias: Option<String>,
         indexed_by: Option<IndexHint>,
     },
+    TableFunction {
+        schema: Option<String>,
+        name: String,
+        args: Vec<Expr>,
+        alias: Option<String>,
+    },
     Subquery {
         query: Box<SelectStmt>,
         alias: Option<String>,
@@ -684,6 +698,8 @@ pub enum UnaryOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
     Concat,
+    JsonExtract,
+    JsonExtractText,
     Multiply,
     Divide,
     Remainder,

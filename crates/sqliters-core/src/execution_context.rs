@@ -369,6 +369,33 @@ impl FunctionRegistry {
             Err(err) => Err(err),
         }
     }
+
+    /// Returns metadata `(name, type_str, narg, flags)` for all registered custom functions.
+    pub fn custom_function_entries(&self) -> Vec<(String, &'static str, i64, i64)> {
+        let mut out = Vec::new();
+        for overloads in self.scalars.values() {
+            for def in overloads {
+                out.push((
+                    def.name.clone(),
+                    "s",
+                    def.arity.map_or(-1, |a| a as i64),
+                    i64::from(def.flags.0),
+                ));
+            }
+        }
+        for overloads in self.aggregates.values() {
+            for def in overloads {
+                let kind = if def.supports_window { "w" } else { "a" };
+                out.push((
+                    def.name.clone(),
+                    kind,
+                    def.arity.map_or(-1, |a| a as i64),
+                    i64::from(def.flags.0),
+                ));
+            }
+        }
+        out
+    }
 }
 
 /// Thread-safe callback type for registered custom collations.
@@ -530,6 +557,17 @@ impl CollationRegistry {
             coll,
             encoding,
         ))
+    }
+
+    /// Returns all active collation names (built-in `BINARY`, `NOCASE`, `RTRIM`, plus custom collations).
+    pub fn all_collation_names(&self) -> Vec<String> {
+        let mut names = vec!["BINARY".to_owned(), "NOCASE".to_owned(), "RTRIM".to_owned()];
+        for cc in self.custom.values() {
+            if !names.iter().any(|n| n.eq_ignore_ascii_case(&cc.name)) {
+                names.push(cc.name.to_string());
+            }
+        }
+        names
     }
 }
 

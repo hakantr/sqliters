@@ -222,6 +222,7 @@ pub struct DatabaseSet {
     temp_trigger_bindings: Vec<TempTriggerBinding>,
     xferopt_delta: std::sync::atomic::AtomicU64,
     open_blobs: std::collections::HashMap<u64, OpenBlobState>,
+    vtab_registry: crate::vtab::VTabRegistry,
 }
 
 impl std::fmt::Debug for DatabaseSet {
@@ -292,7 +293,20 @@ impl DatabaseSet {
             temp_trigger_bindings: Vec::new(),
             xferopt_delta: std::sync::atomic::AtomicU64::new(0),
             open_blobs: std::collections::HashMap::new(),
+            vtab_registry: crate::vtab::VTabRegistry::new(),
         }
+    }
+
+    /// Returns immutable reference to the connection's virtual table registry.
+    #[inline]
+    pub fn vtab_registry(&self) -> &crate::vtab::VTabRegistry {
+        &self.vtab_registry
+    }
+
+    /// Returns mutable reference to the connection's virtual table registry.
+    #[inline]
+    pub fn vtab_registry_mut(&mut self) -> &mut crate::vtab::VTabRegistry {
+        &mut self.vtab_registry
     }
 
     /// Returns immutable map of active [`OpenBlobState`] entries keyed by handle ID.
@@ -553,6 +567,62 @@ impl DatabaseSet {
         self.default_page_size = page_size;
     }
 
+    /// Whether defensive mode (`SQLITE_DBCONFIG_DEFENSIVE`) is enabled on this connection.
+    #[inline]
+    pub const fn defensive(&self) -> bool {
+        self.vtab_registry.defensive_mode
+    }
+
+    /// Updates `SQLITE_DBCONFIG_DEFENSIVE`, returning the new setting.
+    #[inline]
+    pub fn set_defensive(&mut self, enabled: bool) -> bool {
+        self.vtab_registry.defensive_mode = enabled;
+        self.vtab_registry.defensive_mode
+    }
+
+    /// Whether `PRAGMA trusted_schema` (`SQLITE_DBCONFIG_TRUSTED_SCHEMA`) is enabled on this connection.
+    #[inline]
+    pub const fn trusted_schema(&self) -> bool {
+        self.vtab_registry.trusted_schema
+    }
+
+    /// Updates `PRAGMA trusted_schema` (`SQLITE_DBCONFIG_TRUSTED_SCHEMA`), returning the new setting.
+    #[inline]
+    pub fn set_trusted_schema(&mut self, enabled: bool) -> bool {
+        self.vtab_registry.trusted_schema = enabled;
+        self.vtab_registry.trusted_schema
+    }
+
+    /// Returns `true` if `table_name` in `db_id` is a shadow table of any virtual table in that schema
+    /// (unless currently executing inside a virtual table module's own internal sub-SQL).
+    pub fn is_shadow_table_in_db(&self, db_id: DatabaseId, table_name: &str) -> bool {
+        if self.vtab_registry.internal_sql_depth > 0 {
+            return false;
+        }
+        let Some(slot) = self.slot(db_id) else {
+            return false;
+        };
+        for vt in &slot.schema.virtual_tables {
+            let Some(module) = self.vtab_registry.get_module(&vt.module_name) else {
+                continue;
+            };
+            let suffixes = module.shadow_table_suffixes();
+            if suffixes.is_empty() {
+                continue;
+            }
+            let prefix = format!("{}_", vt.name);
+            if table_name.len() > prefix.len()
+                && table_name[..prefix.len()].eq_ignore_ascii_case(&prefix)
+            {
+                let suffix = &table_name[prefix.len()..];
+                if suffixes.iter().any(|s| s.eq_ignore_ascii_case(suffix)) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Returns `true` if any open database slot currently holds a `Read` or `Write` B-tree transaction.
     pub fn any_in_transaction(&self) -> bool {
         self.slots.iter().any(|slot| {
@@ -718,6 +788,7 @@ impl DatabaseSet {
             self.temp_trigger_bindings.clear();
             let temp_inst = self.slots[1].schema_instance_id;
             self.invalidate_blobs_for_instance(temp_inst);
+            self.vtab_registry.disconnect_schema("temp");
             self.temp_store = mode;
             return Ok(true);
         }
@@ -902,7 +973,9 @@ impl DatabaseSet {
         } else {
             for db_id in self.unqualified_search_order() {
                 if let Some(slot) = self.slot(db_id) {
-                    if slot.schema.find_user_table(&qname.name).is_some() {
+                    if slot.schema.find_user_table(&qname.name).is_some()
+                        || slot.schema.find_virtual_table(&qname.name).is_some()
+                    {
                         return None;
                     }
                     if let Some(view) = slot.schema.find_view(&qname.name) {
@@ -930,13 +1003,108 @@ impl DatabaseSet {
                     if let Some(tbl) = slot.schema.find_user_table(&qname.name) {
                         return Some((db_id, tbl));
                     }
-                    if slot.schema.find_view(&qname.name).is_some() {
+                    if slot.schema.find_view(&qname.name).is_some()
+                        || slot.schema.find_virtual_table(&qname.name).is_some()
+                    {
                         return None;
                     }
                 }
             }
             None
         }
+    }
+
+    /// Locates a persistent virtual table definition across [`DatabaseSet`].
+    pub fn find_virtual_table_in_set(
+        &self,
+        qname: &QualifiedName,
+    ) -> Option<(DatabaseId, &crate::schema::VirtualTableDef)> {
+        if let Some(ref s) = qname.schema {
+            let db_id = self.find_db_id(s)?;
+            let slot = self.slot(db_id)?;
+            slot.btree.as_ref()?;
+            slot.schema
+                .find_virtual_table(&qname.name)
+                .map(|vt| (db_id, vt))
+        } else {
+            for db_id in self.unqualified_search_order() {
+                if let Some(slot) = self.slot(db_id) {
+                    if let Some(vt) = slot.schema.find_virtual_table(&qname.name) {
+                        return Some((db_id, vt));
+                    }
+                    if slot.schema.find_user_table(&qname.name).is_some()
+                        || slot.schema.find_view(&qname.name).is_some()
+                    {
+                        return None;
+                    }
+                }
+            }
+            None
+        }
+    }
+
+    /// Looks up an already-connected virtual table (persistent or eponymous) across [`DatabaseSet`].
+    pub fn find_connected_vtab_in_set(
+        &self,
+        qname: &QualifiedName,
+        allow_eponymous: bool,
+    ) -> Option<(DatabaseId, String, String, &crate::vtab::VTabDeclaredSchema)> {
+        if let Some(ref s) = qname.schema {
+            let db_id = self.find_db_id(s)?;
+            let slot = self.slot(db_id)?;
+            if db_id != DatabaseId::TEMP && slot.btree.is_none() {
+                return None;
+            }
+            if let Some(vt) = slot.schema.find_virtual_table(&qname.name)
+                && let Some(entry) = self.vtab_registry.get_connected(&slot.name, &vt.name)
+            {
+                return Some((
+                    db_id,
+                    slot.name.clone(),
+                    entry.table_name.clone(),
+                    &entry.declared,
+                ));
+            }
+            if allow_eponymous
+                && slot.schema.find_user_table(&qname.name).is_none()
+                && slot.schema.find_view(&qname.name).is_none()
+                && let Some(entry) = self.vtab_registry.get_connected(&slot.name, &qname.name)
+            {
+                return Some((
+                    db_id,
+                    slot.name.clone(),
+                    entry.table_name.clone(),
+                    &entry.declared,
+                ));
+            }
+            return None;
+        }
+
+        if let Some((db_id, vt)) = self.find_virtual_table_in_set(qname)
+            && let Some(slot) = self.slot(db_id)
+            && let Some(entry) = self.vtab_registry.get_connected(&slot.name, &vt.name)
+        {
+            return Some((
+                db_id,
+                slot.name.clone(),
+                entry.table_name.clone(),
+                &entry.declared,
+            ));
+        }
+
+        if allow_eponymous
+            && self.find_user_table_in_set(qname).is_none()
+            && self.find_view_in_set(qname).is_none()
+            && let Some(entry) = self.vtab_registry.get_connected("main", &qname.name)
+        {
+            return Some((
+                DatabaseId::MAIN,
+                "main".to_owned(),
+                entry.table_name.clone(),
+                &entry.declared,
+            ));
+        }
+        None
     }
 
     /// Finds a database slot by its stable [`SchemaInstanceId`].
@@ -1060,6 +1228,7 @@ impl DatabaseSet {
             )));
         }
         let mut removed = self.slots.remove(idx);
+        self.vtab_registry.disconnect_schema(&removed.name);
         let redirected = self.detach_temp_triggers(removed.schema_instance_id);
         if let Some(ref mut bt) = removed.btree {
             bt.close()?;
@@ -1421,6 +1590,7 @@ impl DatabaseSet {
 
     /// Closes all open [`Btree`] handles in reverse order (`attached`, `temp`, `main`).
     pub fn close_all(&mut self) -> Result<()> {
+        self.vtab_registry.disconnect_all();
         let mut first_err: Option<SqliteError> = None;
         for slot in self.slots.iter_mut().rev() {
             if let Some(ref mut bt) = slot.btree
