@@ -57,7 +57,7 @@ pub use sqliters_core::{
     ProgressCallback, ProgressTracker, QueryOutput, QueryResult, Row,
     SQLITE_DEFAULT_WAL_AUTOCHECKPOINT, SQLITE_MAX_TRIGGER_DEPTH, SQLITE_MAX_TRIGGER_STEPS,
     ScalarFunctionCallback, ScalarFunctionDef, Schema, Statement, StepResult, TableSchema,
-    TriggerSchema,
+    TriggerEventKind, TriggerSchema,
 };
 pub use sqliters_pager::{
     AutoVacuumMode, DatabaseHeader, JournalMode, LockingMode, WalCheckpointMode,

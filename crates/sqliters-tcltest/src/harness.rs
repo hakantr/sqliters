@@ -968,6 +968,7 @@ pub fn bootstrap_tester(
     let _ = interp.set_var("SQLITE_MAX_VARIABLE_NUMBER", "999".to_string());
     let _ = interp.set_var("SQLITE_MAX_COLUMN", "2000".to_string());
     let _ = interp.set_var("SQLITE_MAX_COMPOUND_SELECT", "500".to_string());
+    let _ = interp.set_var("SQLITE_MAX_TRIGGER_DEPTH", "1000".to_string());
     let _ = interp.set_var("SQLITE_DEFAULT_FILE_FORMAT", "4".to_string());
     interp.set_array_entry("cmdlinearg", "soft-heap-limit", "0".to_string());
     interp.set_array_entry("cmdlinearg", "hard-heap-limit", "0".to_string());
@@ -2653,8 +2654,15 @@ fn cmd_sqlite3_limit(host: &SharedHost, cmd_name: &str, args: &[String]) -> TclR
         "SQLITE_LIMIT_FUNCTION_ARG" | "6" => Ok("127".to_string()),
         "SQLITE_LIMIT_LIKE_PATTERN_LENGTH" | "8" => Ok("50000".to_string()),
         "SQLITE_LIMIT_VARIABLE_NUMBER" | "9" => Ok("999".to_string()),
-        "SQLITE_LIMIT_TRIGGER_DEPTH" | "10" => Ok("1000".to_string()),
+        "SQLITE_LIMIT_TRIGGER_DEPTH" | "10" => {
+            let prev = conn.set_trigger_depth_limit(val as isize);
+            Ok(prev.to_string())
+        }
         "SQLITE_LIMIT_WORKER_THREADS" | "11" => Ok("0".to_string()),
+        "SQLITE_LIMIT_TRIGGER_STEPS" | "13" => {
+            let prev = conn.set_trigger_steps_limit(val as isize);
+            Ok(prev.to_string())
+        }
         _ => Err(TclControl::Error(format!(
             "unknown limit type: {limit_name}"
         ))),
@@ -3993,6 +4001,7 @@ pub fn sqlite_err_name(code: i32) -> &'static str {
         extended::SQLITE_CONSTRAINT_UNIQUE => "SQLITE_CONSTRAINT_UNIQUE",
         extended::SQLITE_CONSTRAINT_ROWID => "SQLITE_CONSTRAINT_ROWID",
         extended::SQLITE_CONSTRAINT_DATATYPE => "SQLITE_CONSTRAINT_DATATYPE",
+        extended::SQLITE_CONSTRAINT_TRIGGER => "SQLITE_CONSTRAINT_TRIGGER",
         extended::SQLITE_NOTICE_RECOVER_WAL => "SQLITE_NOTICE_RECOVER_WAL",
         extended::SQLITE_NOTICE_RECOVER_ROLLBACK => "SQLITE_NOTICE_RECOVER_ROLLBACK",
         other => match other & 0xff {

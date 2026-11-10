@@ -24,7 +24,7 @@ use sqliters_vfs::Vfs;
 
 use crate::schema::{IndexSchema, Schema, TableSchema, ViewSchema};
 use crate::trigger::{
-    SQLITE_MAX_TRIGGER_DEPTH, SQLITE_MAX_TRIGGER_STEPS, TriggerSchema,
+    SQLITE_MAX_TRIGGER_DEPTH, SQLITE_MAX_TRIGGER_STEPS, TriggerEventKind, TriggerSchema,
     is_reserved_trigger_or_system_name,
 };
 
@@ -302,10 +302,10 @@ impl DatabaseSet {
         self.trigger_depth_limit
     }
 
-    /// Sets `SQLITE_LIMIT_TRIGGER_DEPTH` (clamped to `1..=SQLITE_MAX_TRIGGER_DEPTH`), returning the new limit.
+    /// Sets `SQLITE_LIMIT_TRIGGER_DEPTH` (clamped to `0..=SQLITE_MAX_TRIGGER_DEPTH`), returning the new limit.
     #[inline]
     pub fn set_trigger_depth_limit(&mut self, limit: usize) -> usize {
-        self.trigger_depth_limit = limit.clamp(1, SQLITE_MAX_TRIGGER_DEPTH);
+        self.trigger_depth_limit = limit.min(SQLITE_MAX_TRIGGER_DEPTH);
         self.trigger_depth_limit
     }
 
@@ -934,9 +934,13 @@ impl DatabaseSet {
         }
     }
 
-    /// Returns all active triggers attached to `(target_db_id, relation_name)` (`sqlite3TriggerList`
-    /// in `sqlite/src/trigger.c:50-82`), prepending `TEMP` triggers followed by permanent triggers
-    /// in `target_db_id`.
+    /// Returns all active triggers attached to `(target_db_id, relation_name)` in exact execution
+    /// order (`sqlite3TriggerList` + `pTab->pTrigger` in `sqlite/src/trigger.c:50-82, 416-421, 827-840`):
+    /// - For a non-`TEMP` target relation: `TEMP` triggers targeting `(target_db_id, relation_name)` in
+    ///   creation order (`trigHash` LIFO reversed by `sqlite3TriggerList` prepend), followed (when
+    ///   `self.enable_trigger` is `true`) by permanent triggers in `target_db_id` in LIFO reverse-creation order.
+    /// - For a `TEMP` target relation: `TEMP` triggers in LIFO reverse-creation order (`pTab->pTrigger`),
+    ///   unaffected by `self.enable_trigger` (`SQLITE_DBCONFIG_ENABLE_TRIGGER` only disables non-`TEMP` triggers).
     pub fn triggers_for_relation(
         &self,
         target_db_id: DatabaseId,
@@ -947,6 +951,21 @@ impl DatabaseSet {
         };
         let target_inst = target_slot.schema_instance_id;
         let mut out = Vec::new();
+
+        if target_db_id == DatabaseId::TEMP {
+            if self.is_temp_open() {
+                for tr in self.slots[1].schema.triggers.iter().rev() {
+                    if tr.is_active()
+                        && !tr.detached_to_temp
+                        && tr.target_schema_instance_id == Some(target_inst)
+                        && tr.tbl_name.eq_ignore_ascii_case(relation_name)
+                    {
+                        out.push((DatabaseId::TEMP, tr.clone()));
+                    }
+                }
+            }
+            return out;
+        }
 
         if self.is_temp_open() {
             for tr in &self.slots[1].schema.triggers {
@@ -960,8 +979,8 @@ impl DatabaseSet {
             }
         }
 
-        if target_db_id != DatabaseId::TEMP && self.enable_trigger {
-            for tr in &target_slot.schema.triggers {
+        if self.enable_trigger {
+            for tr in target_slot.schema.triggers.iter().rev() {
                 if tr.is_active() && tr.tbl_name.eq_ignore_ascii_case(relation_name) {
                     out.push((target_db_id, tr.clone()));
                 }
@@ -969,6 +988,42 @@ impl DatabaseSet {
         }
 
         out
+    }
+
+    /// Returns active triggers on `(target_db_id, relation_name)` matching `(timing, event_kind)`
+    /// and (for `UPDATE`) `modified_cols` in exact execution order (`sqlite3CodeRowTrigger`).
+    pub fn matching_triggers(
+        &self,
+        target_db_id: DatabaseId,
+        relation_name: &str,
+        timing: TriggerTiming,
+        event_kind: TriggerEventKind,
+        modified_cols: Option<&[&str]>,
+    ) -> Vec<(DatabaseId, SchemaInstanceId, TriggerSchema)> {
+        self.triggers_for_relation(target_db_id, relation_name)
+            .into_iter()
+            .filter(|(_, tr)| {
+                tr.timing == timing && tr.matches_event_and_columns(event_kind, modified_cols)
+            })
+            .filter_map(|(trig_db_id, tr)| {
+                let trig_inst = self.slot(trig_db_id)?.schema_instance_id;
+                Some((trig_db_id, trig_inst, tr))
+            })
+            .collect()
+    }
+
+    /// Returns `true` when at least one active trigger exists on `(target_db_id, relation_name)`
+    /// for `(event_kind, modified_cols)` across any timing (`sqlite3TriggersExist`).
+    pub fn has_active_triggers_for_event(
+        &self,
+        target_db_id: DatabaseId,
+        relation_name: &str,
+        event_kind: TriggerEventKind,
+        modified_cols: Option<&[&str]>,
+    ) -> bool {
+        self.triggers_for_relation(target_db_id, relation_name)
+            .iter()
+            .any(|(_, tr)| tr.matches_event_and_columns(event_kind, modified_cols))
     }
 
     /// Re-synchronizes [`Self::temp_trigger_bindings`] from `slots[1].schema.triggers`.

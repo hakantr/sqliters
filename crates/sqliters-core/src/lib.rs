@@ -59,7 +59,9 @@ pub use execution_context::{
     MutationRow, ProgressCallback, ProgressTracker, ScalarFunctionCallback, ScalarFunctionDef,
 };
 pub use schema::{ColumnSchema, ForeignKeySchema, IndexSchema, Schema, TableSchema, ViewSchema};
-pub use trigger::{SQLITE_MAX_TRIGGER_DEPTH, SQLITE_MAX_TRIGGER_STEPS, TriggerSchema};
+pub use trigger::{
+    SQLITE_MAX_TRIGGER_DEPTH, SQLITE_MAX_TRIGGER_STEPS, TriggerEventKind, TriggerSchema,
+};
 
 /// Maximum automatic `PrepareMode::V2` schema-change reprepare retries (`SQLITE_MAX_SCHEMA_RETRY`).
 const SQLITE_MAX_SCHEMA_RETRY: usize = 50;
@@ -465,6 +467,8 @@ struct WriteAbortSnapshot {
     started_read_instances: Vec<SchemaInstanceId>,
     fk_before: Vec<(SchemaInstanceId, String, schema::TableRowKey, usize)>,
     rt_before: VmRuntimeContext,
+    is_dml: bool,
+    mutation_len_before: usize,
     schemas_before: Vec<(SchemaInstanceId, Schema)>,
     schema_gen_before: u64,
     v1_expire_gen_before: u64,
@@ -554,6 +558,7 @@ struct ConnectionInner {
     in_user_btree_tx: bool,
     schema_changed_in_tx: bool,
     foreign_keys: bool,
+    recursive_triggers: bool,
     legacy_alter_table: bool,
     count_changes: bool,
     wal_autocheckpoint_threshold: i32,
@@ -1246,6 +1251,7 @@ impl ConnectionInner {
                         activity: summary,
                         stmt_tx: &mut stmt_tx_unused,
                         foreign_keys: &mut self.foreign_keys,
+                        recursive_triggers: &mut self.recursive_triggers,
                         legacy_alter_table: &mut self.legacy_alter_table,
                         count_changes: &mut self.count_changes,
                         wal_autocheckpoint_threshold: &mut self.wal_autocheckpoint_threshold,
@@ -1282,9 +1288,15 @@ impl ConnectionInner {
                         self.publish(shared);
                         return Err(self.poison_with(root_err));
                     }
-                    self.runtime.last_changes = abort_snapshot.rt_before.last_changes;
+                    self.runtime.last_changes = if abort_snapshot.is_dml {
+                        0
+                    } else {
+                        abort_snapshot.rt_before.last_changes
+                    };
                     self.runtime.total_changes = abort_snapshot.rt_before.total_changes;
                     self.runtime.last_insert_rowid = abort_snapshot.rt_before.last_insert_rowid;
+                    self.mutation_pipeline
+                        .truncate(abort_snapshot.mutation_len_before);
                     self.deferred_fk_suspects.clear();
                     if self.schema_changed_in_tx
                         || self.schema_generation != abort_snapshot.schema_gen_before
@@ -1365,6 +1377,7 @@ impl ConnectionInner {
                         activity: summary,
                         stmt_tx: &mut stmt_tx_unused,
                         foreign_keys: &mut self.foreign_keys,
+                        recursive_triggers: &mut self.recursive_triggers,
                         legacy_alter_table: &mut self.legacy_alter_table,
                         count_changes: &mut self.count_changes,
                         wal_autocheckpoint_threshold: &mut self.wal_autocheckpoint_threshold,
@@ -1389,10 +1402,17 @@ impl ConnectionInner {
                 if !was_autocommit || err.conflict_effect == ConflictResolutionEffect::Rollback {
                     self.rollback_count += 1;
                 }
-                self.runtime.last_changes = snap.rt_before.last_changes;
+                self.runtime.last_changes = if snap.is_dml {
+                    0
+                } else {
+                    snap.rt_before.last_changes
+                };
                 self.runtime.last_insert_rowid = snap.rt_before.last_insert_rowid;
                 if was_autocommit {
                     self.runtime.total_changes = snap.rt_before.total_changes;
+                    self.mutation_pipeline.truncate(snap.mutation_len_before);
+                } else {
+                    self.mutation_pipeline.clear();
                 }
                 if schema_changed {
                     self.schema_changed_in_tx = false;
@@ -1468,6 +1488,7 @@ impl ConnectionInner {
                             activity: summary,
                             stmt_tx: &mut stmt_tx_unused,
                             foreign_keys: &mut self.foreign_keys,
+                            recursive_triggers: &mut self.recursive_triggers,
                             legacy_alter_table: &mut self.legacy_alter_table,
                             count_changes: &mut self.count_changes,
                             wal_autocheckpoint_threshold: &mut self.wal_autocheckpoint_threshold,
@@ -1503,9 +1524,14 @@ impl ConnectionInner {
                             self.publish(shared);
                             return self.poison_with(root_err);
                         }
-                        self.runtime.last_changes = snap.rt_before.last_changes;
+                        self.runtime.last_changes = if snap.is_dml {
+                            0
+                        } else {
+                            snap.rt_before.last_changes
+                        };
                         self.runtime.total_changes = snap.rt_before.total_changes;
                         self.runtime.last_insert_rowid = snap.rt_before.last_insert_rowid;
+                        self.mutation_pipeline.truncate(snap.mutation_len_before);
                         self.deferred_fk_suspects.clear();
                         if self.schema_changed_in_tx
                             || self.schema_generation != snap.schema_gen_before
@@ -1531,9 +1557,14 @@ impl ConnectionInner {
 
             ConflictResolutionEffect::Abort => {
                 let stmt_changed_schema = self.schema_generation != snap.schema_gen_before;
-                self.runtime.last_changes = snap.rt_before.last_changes;
+                self.runtime.last_changes = if snap.is_dml {
+                    0
+                } else {
+                    snap.rt_before.last_changes
+                };
                 self.runtime.total_changes = snap.rt_before.total_changes;
                 self.runtime.last_insert_rowid = snap.rt_before.last_insert_rowid;
+                self.mutation_pipeline.truncate(snap.mutation_len_before);
                 self.deferred_fk_suspects = snap.fk_before;
 
                 if let Some(sp_slot) = snap.stmt_sp_slot {
@@ -1684,6 +1715,8 @@ impl ConnectionInner {
                             started_read_instances: Vec::new(),
                             fk_before: self.deferred_fk_suspects.clone(),
                             rt_before: self.runtime,
+                            is_dml: false,
+                            mutation_len_before: self.mutation_pipeline.len(),
                             schemas_before: self.snapshot_open_schemas(),
                             schema_gen_before: self.schema_generation,
                             v1_expire_gen_before: self.v1_expire_generation,
@@ -2095,6 +2128,7 @@ impl Connection {
             in_user_btree_tx: false,
             schema_changed_in_tx: false,
             foreign_keys: false,
+            recursive_triggers: false,
             legacy_alter_table: false,
             count_changes: false,
             wal_autocheckpoint_threshold: SQLITE_DEFAULT_WAL_AUTOCHECKPOINT,
@@ -2668,6 +2702,28 @@ impl Connection {
         }
     }
 
+    /// Queries (`enabled = None`) or updates (`enabled = Some(...)`) `PRAGMA recursive_triggers`,
+    /// returning the current/updated state.
+    pub fn recursive_triggers(&self, enabled: Option<bool>) -> bool {
+        if let Ok(mut session) = self.shared.enter() {
+            if session.inner().ensure_usable().is_err() {
+                return false;
+            }
+            if let Some(flag) = enabled {
+                let inner = session.inner_mut();
+                if inner.recursive_triggers != flag {
+                    inner.recursive_triggers = flag;
+                    inner.schema_generation += 1;
+                }
+                inner.recursive_triggers
+            } else {
+                session.inner().recursive_triggers
+            }
+        } else {
+            false
+        }
+    }
+
     /// Queries (`limit < 0`) or updates (`limit >= 0`, clamped to `0..=SQLITE_MAX_TRIGGER_STEPS`)
     /// `SQLITE_LIMIT_TRIGGER_STEPS`, returning the **previous** limit.
     pub fn set_trigger_steps_limit(&self, limit: isize) -> usize {
@@ -3203,6 +3259,8 @@ impl TestBlobHandle {
                 started_read_instances: Vec::new(),
                 fk_before: inner.deferred_fk_suspects.clone(),
                 rt_before: inner.runtime,
+                is_dml: false,
+                mutation_len_before: inner.mutation_pipeline.len(),
                 schemas_before: inner.snapshot_open_schemas(),
                 schema_gen_before: inner.schema_generation,
                 v1_expire_gen_before: inner.v1_expire_generation,
@@ -3296,6 +3354,7 @@ fn compile_first_sql(
     db_set: &DatabaseSet,
     writable_schema: bool,
     foreign_keys: bool,
+    recursive_triggers: bool,
     count_changes: bool,
     enable_test_functions: bool,
     functions: &FunctionRegistry,
@@ -3307,6 +3366,7 @@ fn compile_first_sql(
         db_set,
         writable_schema,
         foreign_keys,
+        recursive_triggers,
         count_changes,
         enable_test_functions,
         functions,
@@ -3320,6 +3380,7 @@ fn compile_parsed_stmt(
     db_set: &DatabaseSet,
     writable_schema: bool,
     foreign_keys: bool,
+    recursive_triggers: bool,
     count_changes: bool,
     enable_test_functions: bool,
     functions: &FunctionRegistry,
@@ -3349,6 +3410,7 @@ fn compile_parsed_stmt(
         db_set,
         writable_schema,
         foreign_keys,
+        recursive_triggers,
         count_changes,
         functions,
         collations,
@@ -3721,10 +3783,28 @@ fn target_write_db_for_stmt(stmt: &Stmt, db_set: &DatabaseSet) -> Option<Databas
                 .or(Some(DatabaseId::MAIN))
         }
     };
+    let resolve_dml_target = |qn: &QualifiedName| -> Option<DatabaseId> {
+        if let Ok(Some(cat_db)) = db_set.resolve_catalog_table(qn) {
+            return Some(cat_db);
+        }
+        match db_set.find_relation_in_set(qn) {
+            // `if (!isView) sqlite3BeginWriteOperation(...)` (`insert.c:1058`): DML on a `VIEW`
+            // does NOT pre-acquire a `Write` transaction on the view's database!
+            Ok(Some((_, ResolvedRelation::View(_)))) => None,
+            Ok(Some((id, ResolvedRelation::Table(_)))) => Some(id),
+            _ => {
+                if let Some(ref s) = qn.schema {
+                    db_set.find_db_id(s)
+                } else {
+                    Some(DatabaseId::MAIN)
+                }
+            }
+        }
+    };
     match stmt {
-        Stmt::Insert(ins) => resolve_qn_table(&ins.table),
-        Stmt::Update(upd) => resolve_qn_table(&upd.table),
-        Stmt::Delete(del) => resolve_qn_table(&del.table),
+        Stmt::Insert(ins) => resolve_dml_target(&ins.table),
+        Stmt::Update(upd) => resolve_dml_target(&upd.table),
+        Stmt::Delete(del) => resolve_dml_target(&del.table),
         Stmt::CreateTable(ct) => {
             if ct.temp {
                 Some(DatabaseId::TEMP)
@@ -3931,6 +4011,7 @@ impl ConnectionInner {
             activity: summary,
             stmt_tx,
             foreign_keys: &mut self.foreign_keys,
+            recursive_triggers: &mut self.recursive_triggers,
             legacy_alter_table: &mut self.legacy_alter_table,
             count_changes: &mut self.count_changes,
             wal_autocheckpoint_threshold: &mut self.wal_autocheckpoint_threshold,
@@ -4001,6 +4082,7 @@ impl Statement {
             &inner.db_set,
             inner.writable_schema,
             inner.foreign_keys,
+            inner.recursive_triggers,
             inner.count_changes,
             inner.runtime.enable_test_functions,
             &inner.functions,
@@ -4023,6 +4105,7 @@ impl Statement {
                         &inner.db_set,
                         inner.writable_schema,
                         inner.foreign_keys,
+                        inner.recursive_triggers,
                         inner.count_changes,
                         inner.runtime.enable_test_functions,
                         &inner.functions,
@@ -4371,6 +4454,7 @@ impl Statement {
                 &inner.db_set,
                 inner.writable_schema,
                 inner.foreign_keys,
+                inner.recursive_triggers,
                 inner.count_changes,
                 inner.runtime.enable_test_functions,
                 &inner.functions,
@@ -4391,6 +4475,7 @@ impl Statement {
                             &inner.db_set,
                             inner.writable_schema,
                             inner.foreign_keys,
+                            inner.recursive_triggers,
                             inner.count_changes,
                             inner.runtime.enable_test_functions,
                             &inner.functions,
@@ -5312,6 +5397,8 @@ impl Statement {
                     started_read_instances: Vec::new(),
                     fk_before: inner.deferred_fk_suspects.clone(),
                     rt_before: inner.runtime,
+                    is_dml: false,
+                    mutation_len_before: inner.mutation_pipeline.len(),
                     schemas_before: inner.snapshot_open_schemas(),
                     schema_gen_before: inner.schema_generation,
                     v1_expire_gen_before: inner.v1_expire_generation,
@@ -5535,6 +5622,38 @@ impl Statement {
                     }
 
                     prelocked_write = Some((db_id, inst));
+                } else if !skip_prelock && self.requires_schema {
+                    if let Err(e) = inner.refresh_open_tx_schemas() {
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        return Err(e);
+                    }
+                    if self.needs_reprepare(inner) {
+                        if self.mode == PrepareMode::V1 {
+                            let err =
+                                SqliteError::new(ErrorCode::Schema, "database schema has changed");
+                            self.lifecycle = StatementLifecycle::Halted {
+                                last_error: Some(err.clone()),
+                            };
+                            return Err(err);
+                        }
+                        if let Err(e) = self.reprepare_in_open_tx(inner) {
+                            self.lifecycle = StatementLifecycle::Halted {
+                                last_error: Some(e.clone()),
+                            };
+                            return Err(e);
+                        }
+                        if self.category != Some(StmtCategory::Write)
+                            || target_write_db_for_stmt(
+                                self.stmt.as_ref().expect("non-empty statement"),
+                                &inner.db_set,
+                            )
+                            .is_some()
+                        {
+                            return self.start_execution_in_session(hid, shared, inner);
+                        }
+                    }
                 }
 
                 // Open an anonymous statement subsavepoint whenever an outer tx or another writer exists!
@@ -5561,6 +5680,7 @@ impl Statement {
                 let schemas_before = inner.snapshot_open_schemas();
                 let fk_before = inner.deferred_fk_suspects.clone();
                 let rt_before = inner.runtime;
+                let mutation_len_before = inner.mutation_pipeline.len();
                 let schema_gen_before = inner.schema_generation;
                 let v1_expire_gen_before = inner.v1_expire_generation;
                 let schema_changed_before = inner.schema_changed_in_tx;
@@ -5574,6 +5694,9 @@ impl Statement {
                 );
                 let summary = inner.activity.summary_excluding(hid, &inner.db_set);
 
+                let is_dml = self.stmt.as_ref().is_some_and(|st| {
+                    matches!(st, Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_))
+                });
                 if let Err(e) = inner.check_any_interrupted() {
                     let early_snap = WriteAbortSnapshot {
                         stmt_sp_slot,
@@ -5581,6 +5704,8 @@ impl Statement {
                         started_read_instances: Vec::new(),
                         fk_before,
                         rt_before,
+                        is_dml,
+                        mutation_len_before,
                         schemas_before,
                         schema_gen_before,
                         v1_expire_gen_before,
@@ -5639,6 +5764,8 @@ impl Statement {
                     started_read_instances,
                     fk_before,
                     rt_before,
+                    is_dml,
+                    mutation_len_before,
                     schemas_before,
                     schema_gen_before,
                     v1_expire_gen_before,

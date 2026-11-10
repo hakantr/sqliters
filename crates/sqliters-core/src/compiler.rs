@@ -18,6 +18,7 @@ use sqliters_vdbe::{
 use crate::db_set::{DatabaseSet, ResolvedRelation};
 use crate::execution_context::FunctionRegistry;
 use crate::schema::{IndexSchema, Schema, TableSchema, ViewSchema, fix_permanent_view_select};
+use crate::trigger::TriggerEventKind;
 
 /// Chosen B-Tree access strategy for a single table (`where.c`).
 #[derive(Debug, Clone)]
@@ -635,24 +636,48 @@ pub fn try_compile_select_in_db_set(
     Ok(res)
 }
 
-/// Returns `Ok(None)` whenever `ins` specifies `UPSERT` (`ON CONFLICT ...`) or any other construct
-/// requiring full interpreter execution in `engine.rs`.
-pub fn try_compile_insert(ins: &InsertStmt, _schema: &Schema) -> Result<Option<VdbeProgram>> {
+/// Returns `Ok(None)` whenever `ins` specifies `UPSERT` (`ON CONFLICT ...`), targets a relation
+/// with active triggers, or uses any construct requiring full interpreter execution in `engine.rs`.
+pub fn try_compile_insert(ins: &InsertStmt, schema: &Schema) -> Result<Option<VdbeProgram>> {
     if !ins.upsert_clauses.is_empty() {
+        return Ok(None);
+    }
+    if schema.triggers.iter().any(|tr| {
+        tr.is_active()
+            && tr.tbl_name.eq_ignore_ascii_case(&ins.table.name)
+            && tr.matches_event_and_columns(TriggerEventKind::Insert, None)
+    }) {
         return Ok(None);
     }
     Ok(None)
 }
 
-/// Multi-database variant of [`try_compile_insert`]; delegates `UPSERT` (`!ins.upsert_clauses.is_empty()`)
-/// to `engine.rs` with prepare-time static validation and `RETURNING` metadata.
+/// Multi-database variant of [`try_compile_insert`]; delegates to `engine.rs` (`Ok(None)`) whenever
+/// `UPSERT` is present, active triggers exist on the target relation (in `target_db_id` or `TEMP`),
+/// or foreign keys / interpreter features apply.
 pub fn try_compile_insert_in_db_set(
     ins: &InsertStmt,
-    _db_set: &DatabaseSet,
+    db_set: &DatabaseSet,
     _functions: &FunctionRegistry,
 ) -> Result<Option<VdbeProgram>> {
     if !ins.upsert_clauses.is_empty() {
         return Ok(None);
+    }
+    if let Ok(Some((target_db_id, rel))) = db_set.find_relation_in_set(&ins.table) {
+        let rel_name = match &rel {
+            ResolvedRelation::Table(t) => t.name.as_str(),
+            ResolvedRelation::View(v) => v.name.as_str(),
+        };
+        if matches!(rel, ResolvedRelation::View(_))
+            || db_set.has_active_triggers_for_event(
+                target_db_id,
+                rel_name,
+                TriggerEventKind::Insert,
+                None,
+            )
+        {
+            return Ok(None);
+        }
     }
     Ok(None)
 }

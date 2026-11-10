@@ -3,9 +3,9 @@
 #![forbid(unsafe_code)]
 
 use sqliters_syntax::{
-    ColumnRef, CommonTableExpr, CreateTriggerStmt, DeleteStmt, Expr, FromClause, FunctionArgs,
-    IndexedColumn, InsertSource, InsertStmt, JoinClause, JoinConstraint, LimitClause, OrderByTerm,
-    QualifiedName, ResultColumn, SelectBody, SelectCore, SelectStmt, SetAssignment,
+    ColumnRef, CommonTableExpr, ConflictAction, CreateTriggerStmt, DeleteStmt, Expr, FromClause,
+    FunctionArgs, IndexedColumn, InsertSource, InsertStmt, JoinClause, JoinConstraint, LimitClause,
+    OrderByTerm, QualifiedName, ResultColumn, SelectBody, SelectCore, SelectStmt, SetAssignment,
     TableOrSubquery, TriggerEvent, TriggerStep, TriggerTiming, UpdateStmt, UpsertAction,
     UpsertClause, UpsertTarget,
 };
@@ -40,11 +40,63 @@ pub struct TriggerSchema {
     pub raw_sql: String,
 }
 
+/// Coarse DML event category used when matching candidate triggers (`TK_INSERT`, `TK_UPDATE`, `TK_DELETE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TriggerEventKind {
+    Insert,
+    Update,
+    Delete,
+}
+
 impl TriggerSchema {
     /// Returns `true` when this trigger is installed in the active trigger namespace (`!self.is_orphan`).
     #[inline]
     pub const fn is_active(&self) -> bool {
         !self.is_orphan
+    }
+
+    /// Returns `true` if `self.event` matches `event_kind` and (for `UPDATE OF ...`) at least one
+    /// column in `columns` overlaps syntactically with `modified_cols` (`checkColumnOverlap` in
+    /// `sqlite/src/trigger.c:787-794`).
+    pub fn matches_event_and_columns(
+        &self,
+        event_kind: TriggerEventKind,
+        modified_cols: Option<&[&str]>,
+    ) -> bool {
+        match (&self.event, event_kind) {
+            (TriggerEvent::Insert, TriggerEventKind::Insert) => true,
+            (TriggerEvent::Delete, TriggerEventKind::Delete) => true,
+            (TriggerEvent::Update { columns }, TriggerEventKind::Update) => {
+                let Some(of_cols) = columns.as_deref() else {
+                    return true;
+                };
+                if of_cols.is_empty() {
+                    return true;
+                }
+                let Some(changed) = modified_cols else {
+                    return true;
+                };
+                of_cols.iter().any(|of_col| {
+                    changed
+                        .iter()
+                        .any(|ch_col| of_col.eq_ignore_ascii_case(ch_col))
+                })
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Computes the effective `ON CONFLICT` policy for a DML step inside a trigger program
+/// (`pParse->eOrconf = (orconf == OE_Default) ? pStep->orconf : orconf` in `sqlite/src/trigger.c:1143`).
+#[inline]
+pub const fn effective_trigger_step_conflict(
+    outer_or_conflict: Option<ConflictAction>,
+    step_or_conflict: Option<ConflictAction>,
+) -> Option<ConflictAction> {
+    match outer_or_conflict {
+        Some(outer) => Some(outer),
+        None => step_or_conflict,
     }
 }
 

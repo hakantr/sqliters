@@ -18,11 +18,11 @@ use sqliters_syntax::{
     ConflictAction, CreateIndexStmt, CreateTableStmt, CreateTriggerStmt, CreateViewStmt,
     CurrentTimeKind, DeleteStmt, Expr, FkAction, FromClause, FunctionArgs, IdentSpanMap, IndexHint,
     IndexedColumn, InsertSource, InsertStmt, JoinClause, JoinConstraint, JoinType, LikeOp,
-    LimitClause, OrderByTerm, PragmaValue, QualifiedName, ResultColumn, SelectBody, SelectCore,
-    SelectStmt, SetAssignment, Stmt, TableOrSubquery, Token, TokenKind, TokenSpan, TriggerEvent,
-    TriggerStep, TriggerTiming, UnaryOp, UpdateStmt, UpsertAction, apply_span_edits, dequote,
-    keyword_kind, parse_one, parse_one_with_spans, remove_column_def_from_create_table_sql,
-    tokenize,
+    LimitClause, OrderByTerm, PragmaValue, QualifiedName, RaiseAction, ResultColumn, SelectBody,
+    SelectCore, SelectStmt, SetAssignment, Stmt, TableOrSubquery, Token, TokenKind, TokenSpan,
+    TriggerEvent, TriggerStep, TriggerTiming, UnaryOp, UpdateStmt, UpsertAction, apply_span_edits,
+    dequote, keyword_kind, parse_one, parse_one_with_spans,
+    remove_column_def_from_create_table_sql, tokenize,
 };
 use sqliters_types::{
     Collation, ConflictResolutionEffect, DatabaseId, DatabaseKind, ErrorCode, ExecutionServices,
@@ -40,6 +40,7 @@ use sqliters_vfs::{MemoryVfs, OpenFlags, OsVfs, Vfs};
 use crate::compiler::{
     AccessPlan, choose_access_plan_with_schema_name, compile_for_explain_in_db_set,
     explain_query_plan_in_db_set, expr_column_label, expr_contains_aggregate,
+    expr_contains_subquery,
 };
 use crate::db_set::{DatabaseSet, ResolvedRelation, SchemaInstanceId, TempStoreMode};
 use crate::execution_context::{
@@ -55,10 +56,11 @@ use crate::schema::{
     validate_view_no_parameters,
 };
 use crate::trigger::{
-    CreateTriggerPlan, fix_permanent_trigger, from_contains_raise,
-    is_reserved_trigger_or_system_name, reject_raise_outside_trigger_expr,
-    reject_raise_outside_trigger_select, replace_bind_params_with_null_in_trigger,
-    resolve_and_validate_create_trigger, validate_trigger_body_dml_targets,
+    CreateTriggerPlan, TriggerEventKind, effective_trigger_step_conflict, expr_contains_raise,
+    fix_permanent_trigger, from_contains_raise, is_reserved_trigger_or_system_name,
+    reject_raise_outside_trigger_expr, reject_raise_outside_trigger_select,
+    replace_bind_params_with_null_in_trigger, resolve_and_validate_create_trigger,
+    validate_trigger_body_dml_targets,
 };
 
 /// Materialized result set (`column_names` + `rows`) produced by executing a statement.
@@ -81,6 +83,7 @@ pub struct SqlSavepoint {
     pub schema_gen_at_open: u64,
     pub v1_expire_gen_at_open: u64,
     pub deferred_fk_suspects: Vec<(SchemaInstanceId, String, TableRowKey, usize)>,
+    pub mutation_len_at_open: usize,
 }
 
 /// Snapshot of other active statements on the connection (excluding the currently executing handle).
@@ -108,6 +111,11 @@ pub struct StmtTxTracker {
     pub write_db_mask: u16,
     /// Statement-level subsavepoint slot index when `!autocommit || other_writers > 0`.
     pub stmt_sp_slot: Option<usize>,
+    /// Active `OP_Program` frame stack (`Some((schema_inst, schema_rowid))` for user triggers,
+    /// `None` for FK action subprograms; `len()` mirrors `Vdbe::nFrame` in `vdbe.c:7683`).
+    pub subprogram_stack: Vec<Option<(SchemaInstanceId, i64)>>,
+    /// Top-level statement immediate FK suspects (`Vdbe::nFkConstraint` in `vdbeaux.c:3306-3309`).
+    pub stmt_fk_suspects: Vec<(SchemaInstanceId, String, TableRowKey, usize)>,
 }
 
 /// Default WAL automatic checkpoint threshold (`SQLITE_DEFAULT_WAL_AUTOCHECKPOINT = 1000`).
@@ -220,6 +228,7 @@ pub struct ExecContext<'a> {
     pub activity: ActivitySummary,
     pub stmt_tx: &'a mut StmtTxTracker,
     pub foreign_keys: &'a mut bool,
+    pub recursive_triggers: &'a mut bool,
     pub legacy_alter_table: &'a mut bool,
     pub count_changes: &'a mut bool,
     pub wal_autocheckpoint_threshold: &'a mut i32,
@@ -233,6 +242,11 @@ pub struct ExecContext<'a> {
 }
 
 impl ExecContext<'_> {
+    #[inline]
+    pub(crate) fn in_trigger_program(&self) -> bool {
+        self.stmt_tx.subprogram_stack.iter().any(Option::is_some)
+    }
+
     #[inline]
     pub(crate) fn encoding(&self) -> TextEncoding {
         if self.db_set.main_btree().pager().page_count() > 0 {
@@ -1793,6 +1807,7 @@ pub(crate) fn release_savepoint_op(ctx: &mut ExecContext<'_>, sp_name: &str) -> 
                 ctx.savepoints.clear();
                 *ctx.schema_changed_in_tx = false;
                 ctx.deferred_fk_suspects.clear();
+                ctx.mutation_pipeline.clear();
                 ctx.publish();
                 Ok(())
             }
@@ -1805,6 +1820,7 @@ pub(crate) fn release_savepoint_op(ctx: &mut ExecContext<'_>, sp_name: &str) -> 
                 ctx.savepoints.clear();
                 *ctx.schema_changed_in_tx = false;
                 ctx.deferred_fk_suspects.clear();
+                ctx.mutation_pipeline.clear();
                 ctx.publish();
                 Err(err)
             }
@@ -1927,6 +1943,7 @@ pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
                     }
                 }
                 *ctx.deferred_fk_suspects = sp.deferred_fk_suspects;
+                ctx.mutation_pipeline.truncate(sp.mutation_len_at_open);
                 ctx.savepoints.truncate(pos + 1);
                 if schema_changed_since_sp {
                     for db_slot in ctx.db_set.slots_mut() {
@@ -1968,6 +1985,7 @@ pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
                 ctx.savepoints.clear();
                 *ctx.schema_changed_in_tx = false;
                 ctx.deferred_fk_suspects.clear();
+                ctx.mutation_pipeline.clear();
                 ctx.publish();
                 rollback_res
             }
@@ -2003,6 +2021,7 @@ pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
                 schema_gen_at_open: *ctx.schema_generation,
                 v1_expire_gen_at_open: *ctx.v1_expire_generation,
                 deferred_fk_suspects: ctx.deferred_fk_suspects.clone(),
+                mutation_len_at_open: ctx.mutation_pipeline.len(),
             });
             if was_autocommit {
                 *ctx.implicit_savepoint_tx = true;
@@ -2315,7 +2334,7 @@ pub fn execute_statement(
                 ctx.db_set.ensure_temp_open(enc, *ctx.writable_schema)?;
             }
             let mut remaining = parse_incremental_vacuum_limit(value.as_ref());
-            run_write_autocommit(ctx, |ctx| {
+            run_write_autocommit(ctx, false, |ctx| {
                 ctx.ensure_write_db(db_id, true)?;
                 let mut rows = Vec::new();
                 while remaining > 0 {
@@ -2340,7 +2359,8 @@ pub fn execute_statement(
         }
         StmtCategory::Read => run_read_autocommit(ctx, |ctx| execute_read_body(ctx, stmt, params)),
         StmtCategory::Write => {
-            run_write_autocommit(ctx, |ctx| execute_write_body(ctx, stmt, params))
+            let is_dml = matches!(stmt, Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_));
+            run_write_autocommit(ctx, is_dml, |ctx| execute_write_body(ctx, stmt, params))
         }
     }?;
 
@@ -2404,7 +2424,11 @@ where
     res
 }
 
-pub(crate) fn run_write_autocommit<F>(ctx: &mut ExecContext<'_>, f: F) -> Result<QueryOutput>
+pub(crate) fn run_write_autocommit<F>(
+    ctx: &mut ExecContext<'_>,
+    is_dml: bool,
+    f: F,
+) -> Result<QueryOutput>
 where
     F: FnOnce(&mut ExecContext<'_>) -> Result<QueryOutput>,
 {
@@ -2418,7 +2442,10 @@ where
     };
 
     let prev_total_changes = ctx.runtime.total_changes;
+    let prev_last_changes = ctx.runtime.last_changes;
     let prev_last_rowid = ctx.runtime.last_insert_rowid;
+    let abort_last_changes = if is_dml { 0 } else { prev_last_changes };
+    let prev_mutation_len = ctx.mutation_pipeline.len();
     let prev_deferred = ctx.deferred_fk_suspects.clone();
     let prev_schemas: Vec<(SchemaInstanceId, Schema)> = ctx
         .db_set
@@ -2469,8 +2496,9 @@ where
                     }
                     *ctx.schema_changed_in_tx = false;
                     ctx.deferred_fk_suspects.clear();
+                    ctx.mutation_pipeline.truncate(prev_mutation_len);
                     ctx.runtime.total_changes = prev_total_changes;
-                    ctx.runtime.last_changes = 0;
+                    ctx.runtime.last_changes = abort_last_changes;
                     ctx.runtime.last_insert_rowid = prev_last_rowid;
                     if *ctx.schema_generation != prev_schema_gen {
                         restore_prev_schemas(ctx.db_set, &prev_schemas);
@@ -2511,7 +2539,7 @@ where
                     }
                 }
                 if autocommit && ctx.activity.other_writers == 0 {
-                    if let Err((_, disp)) = commit_all_databases(ctx) {
+                    if let Err((cm_err, disp)) = commit_all_databases(ctx) {
                         if disp == CommitFailureDisposition::LeaveOpen {
                             let _ = rollback_all_databases(ctx, false);
                         }
@@ -2521,6 +2549,7 @@ where
                         ctx.savepoints.clear();
                         *ctx.schema_changed_in_tx = false;
                         ctx.deferred_fk_suspects.clear();
+                        ctx.mutation_pipeline.truncate(prev_mutation_len);
                         ctx.runtime.total_changes = prev_total_changes;
                         ctx.runtime.last_changes = 0;
                         ctx.runtime.last_insert_rowid = prev_last_rowid;
@@ -2530,7 +2559,7 @@ where
                             *ctx.v1_expire_generation += 1;
                         }
                         ctx.publish();
-                        return Err(err);
+                        return Err(cm_err);
                     }
                     *ctx.schema_changed_in_tx = false;
                     ctx.deferred_fk_suspects.clear();
@@ -2551,8 +2580,13 @@ where
                 ctx.savepoints.clear();
                 *ctx.schema_changed_in_tx = false;
                 ctx.deferred_fk_suspects.clear();
+                if autocommit {
+                    ctx.mutation_pipeline.truncate(prev_mutation_len);
+                } else {
+                    ctx.mutation_pipeline.clear();
+                }
                 ctx.runtime.total_changes = prev_total_changes;
-                ctx.runtime.last_changes = 0;
+                ctx.runtime.last_changes = abort_last_changes;
                 ctx.runtime.last_insert_rowid = prev_last_rowid;
                 if *ctx.schema_generation != prev_schema_gen {
                     restore_prev_schemas(ctx.db_set, &prev_schemas);
@@ -2580,8 +2614,9 @@ where
                     }
                 }
                 *ctx.deferred_fk_suspects = prev_deferred;
+                ctx.mutation_pipeline.truncate(prev_mutation_len);
                 ctx.runtime.total_changes = prev_total_changes;
-                ctx.runtime.last_changes = 0;
+                ctx.runtime.last_changes = abort_last_changes;
                 ctx.runtime.last_insert_rowid = prev_last_rowid;
                 if stmt_changed_schema {
                     restore_prev_schemas(ctx.db_set, &prev_schemas);
@@ -8368,11 +8403,48 @@ fn eval_expr_rt(
                 if *negated { !exists } else { exists },
             ))))
         }
-        Expr::Raise { .. } => Err(SqliteError::new(
-            ErrorCode::Error,
-            "RAISE() may only be used within a trigger-program",
-        )),
+        Expr::Raise { action, message } => {
+            if !ctx.in_trigger_program() {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    "RAISE() may only be used within a trigger-program",
+                ));
+            }
+            match action {
+                RaiseAction::Ignore => Err(make_raise_ignore_signal()),
+                RaiseAction::Abort | RaiseAction::Fail | RaiseAction::Rollback => {
+                    let msg = match message {
+                        Some(m) => {
+                            eval_expr(ctx, m, params, scopes, ctes, agg_group)?.to_text_lossy()
+                        }
+                        None => String::new(),
+                    };
+                    let effect = match action {
+                        RaiseAction::Abort => ConflictResolutionEffect::Abort,
+                        RaiseAction::Fail => ConflictResolutionEffect::Fail,
+                        RaiseAction::Rollback => ConflictResolutionEffect::Rollback,
+                        RaiseAction::Ignore => unreachable!(),
+                    };
+                    Err(
+                        SqliteError::constraint(extended::SQLITE_CONSTRAINT_TRIGGER, msg)
+                            .with_conflict_effect(effect),
+                    )
+                }
+            }
+        }
     }
+}
+
+const RAISE_IGNORE_SENTINEL: &str = "\0__SQLITERS_RAISE_IGNORE__";
+
+#[inline]
+fn make_raise_ignore_signal() -> SqliteError {
+    SqliteError::new(ErrorCode::Ok, RAISE_IGNORE_SENTINEL)
+}
+
+#[inline]
+fn is_raise_ignore_signal(err: &SqliteError) -> bool {
+    err.code == ErrorCode::Ok && err.message == RAISE_IGNORE_SENTINEL
 }
 
 fn is_row_value_expr(mut e: &Expr) -> bool {
@@ -8907,7 +8979,14 @@ fn decode_table_logical_row(
             let phys_pos = n_pk + extra_slot;
             let col = &tbl.columns[ci];
             let v = if phys_pos < phys_vals.len() {
-                phys_vals[phys_pos].clone()
+                let pv = phys_vals[phys_pos].clone();
+                if col.affinity == TypeAffinity::Real
+                    && let Value::Integer(iv) = pv
+                {
+                    Value::real(iv as f64)
+                } else {
+                    pv
+                }
             } else {
                 let def_val = match &col.default_expr {
                     Some(de) => eval_expr(ctx, de, params, &[], &CteStore::default(), None)?,
@@ -8970,10 +9049,14 @@ fn decode_table_logical_row(
             vals.push(coerced);
         }
         vals.truncate(tbl.columns.len());
-        if let Some(ipk) = tbl.rowid_alias_col
-            && ipk < vals.len()
-        {
-            vals[ipk] = Value::Integer(rowid);
+        for (ci, v) in vals.iter_mut().enumerate() {
+            if tbl.rowid_alias_col == Some(ci) {
+                *v = Value::Integer(rowid);
+            } else if tbl.columns[ci].affinity == TypeAffinity::Real
+                && let Value::Integer(iv) = *v
+            {
+                *v = Value::real(iv as f64);
+            }
         }
         return Ok(vals);
     }
@@ -8991,7 +9074,13 @@ fn decode_table_logical_row(
             } else if phys_idx < phys_vals.len() {
                 let pv = phys_vals[phys_idx].clone();
                 phys_idx += 1;
-                pv
+                if col.affinity == TypeAffinity::Real
+                    && let Value::Integer(iv) = pv
+                {
+                    Value::real(iv as f64)
+                } else {
+                    pv
+                }
             } else {
                 let def_val = match &col.default_expr {
                     Some(de) => eval_expr(ctx, de, params, &[], &CteStore::default(), None)?,
@@ -9551,6 +9640,438 @@ fn recheck_uniqueness_abort(
 /// Validates constraints (NOT NULL, STRICT, CHECK, Rowid/WITHOUT ROWID PK, UNIQUE indexes), applies conflict resolution
 /// (`IGNORE` / `REPLACE` / error with `ConflictResolutionEffect`), and writes the row + secondary index entries!
 /// Returns `Ok(Some((final_key, final_logical_vals)))` if written, or `Ok(None)` if skipped via `IGNORE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerOutcome {
+    Continue,
+    Ignored,
+}
+
+#[inline(never)]
+fn make_runtime_table_pseudo_scope(
+    tbl: &TableSchema,
+    old_row: Option<(i64, &[Value])>,
+    new_row: Option<(i64, &[Value])>,
+) -> Box<EvalRow> {
+    let mut cols = Vec::new();
+    let mut vals = Vec::new();
+    let mut push_side = |alias: &str, rowid: i64, rvals: &[Value]| {
+        for (i, c) in tbl.columns.iter().enumerate() {
+            cols.push(ScopedColumn {
+                schema_name: None,
+                table_alias: Some(alias.to_owned()),
+                name: c.name.clone(),
+                collation: c.collation,
+                affinity: Some(c.affinity),
+                hidden_rowid: false,
+                omit_from_star: false,
+                merged_using: false,
+            });
+            vals.push(rvals.get(i).cloned().unwrap_or(Value::Null));
+        }
+        if !tbl.without_rowid {
+            cols.push(ScopedColumn {
+                schema_name: None,
+                table_alias: Some(alias.to_owned()),
+                name: "rowid".to_owned(),
+                collation: Collation::Binary,
+                affinity: Some(TypeAffinity::Integer),
+                hidden_rowid: true,
+                omit_from_star: false,
+                merged_using: false,
+            });
+            vals.push(Value::Integer(rowid));
+        }
+    };
+    if let Some((orid, ovals)) = old_row {
+        push_side("old", orid, ovals);
+    }
+    if let Some((nrid, nvals)) = new_row {
+        push_side("new", nrid, nvals);
+    }
+    Box::new(EvalRow {
+        cols: cols.into(),
+        vals,
+        qualified_only: true,
+    })
+}
+
+#[inline(never)]
+fn make_runtime_view_pseudo_scope(
+    col_specs: &[(String, Collation, Option<TypeAffinity>)],
+    old_vals: Option<&[Value]>,
+    new_vals: Option<&[Value]>,
+) -> Box<EvalRow> {
+    let mut cols = Vec::new();
+    let mut vals = Vec::new();
+    let mut push_side = |alias: &str, rvals: &[Value]| {
+        for (i, (cname, coll, aff)) in col_specs.iter().enumerate() {
+            cols.push(ScopedColumn {
+                schema_name: None,
+                table_alias: Some(alias.to_owned()),
+                name: cname.clone(),
+                collation: *coll,
+                affinity: *aff,
+                hidden_rowid: false,
+                omit_from_star: false,
+                merged_using: false,
+            });
+            vals.push(rvals.get(i).cloned().unwrap_or(Value::Null));
+        }
+    };
+    if let Some(ovals) = old_vals {
+        push_side("old", ovals);
+    }
+    if let Some(nvals) = new_vals {
+        push_side("new", nvals);
+    }
+    Box::new(EvalRow {
+        cols: cols.into(),
+        vals,
+        qualified_only: true,
+    })
+}
+
+fn make_returning_view_scope(
+    view_name: &str,
+    col_specs: &[(String, Collation, Option<TypeAffinity>)],
+    vals: &[Value],
+) -> EvalRow {
+    let mut cols = Vec::with_capacity(col_specs.len());
+    let mut rvals = Vec::with_capacity(col_specs.len());
+    for (i, (cname, coll, aff)) in col_specs.iter().enumerate() {
+        cols.push(ScopedColumn {
+            schema_name: None,
+            table_alias: Some(view_name.to_owned()),
+            name: cname.clone(),
+            collation: *coll,
+            affinity: *aff,
+            hidden_rowid: false,
+            omit_from_star: false,
+            merged_using: false,
+        });
+        rvals.push(vals.get(i).cloned().unwrap_or(Value::Null));
+    }
+    EvalRow::new(cols.into(), rvals)
+}
+
+fn apply_table_affinities_and_generated(
+    ctx: &mut ExecContext<'_>,
+    tbl: &TableSchema,
+    schema_name: &str,
+    rowid: i64,
+    raw_vals: &mut [Value],
+    params: &[Value],
+) -> Result<()> {
+    for (i, col) in tbl.columns.iter().enumerate() {
+        if col.generated.is_some() {
+            continue;
+        }
+        if tbl.rowid_alias_col == Some(i) {
+            raw_vals[i] = Value::Integer(rowid);
+        } else {
+            raw_vals[i] = col.affinity.apply(raw_vals[i].clone());
+            if tbl.strict
+                && col.type_name.trim().eq_ignore_ascii_case("REAL")
+                && let Value::Integer(iv) = raw_vals[i]
+            {
+                raw_vals[i] = Value::real(iv as f64);
+            }
+        }
+    }
+    for i in 0..tbl.columns.len() {
+        if let Some((ref gexpr, _)) = tbl.columns[i].generated {
+            let scope = make_single_table_scope(tbl, schema_name, None, rowid, raw_vals);
+            let gv = eval_expr(ctx, gexpr, params, &[scope], &CteStore::default(), None)?;
+            let mut coerced = tbl.columns[i].affinity.apply(gv);
+            if tbl.strict
+                && tbl.columns[i].type_name.trim().eq_ignore_ascii_case("REAL")
+                && let Value::Integer(iv) = coerced
+            {
+                coerced = Value::real(iv as f64);
+            }
+            raw_vals[i] = coerced;
+        }
+    }
+    Ok(())
+}
+
+struct TriggerBatchState {
+    triggers: Vec<(DatabaseId, SchemaInstanceId, crate::trigger::TriggerSchema)>,
+    pseudo_scopes: [EvalRow; 1],
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments, clippy::boxed_local)]
+fn collect_matching_trigger_batch(
+    db_set: &DatabaseSet,
+    target_db_id: DatabaseId,
+    target_name: &str,
+    timing: TriggerTiming,
+    event_kind: TriggerEventKind,
+    modified_cols: Option<&[&str]>,
+    pseudo_scope: Box<EvalRow>,
+) -> Option<Box<TriggerBatchState>> {
+    let triggers =
+        db_set.matching_triggers(target_db_id, target_name, timing, event_kind, modified_cols);
+    if triggers.is_empty() {
+        return None;
+    }
+    Some(Box::new(TriggerBatchState {
+        triggers,
+        pseudo_scopes: [*pseudo_scope],
+    }))
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn fire_row_triggers(
+    ctx: &mut ExecContext<'_>,
+    target_db_id: DatabaseId,
+    target_name: &str,
+    timing: TriggerTiming,
+    event_kind: TriggerEventKind,
+    modified_cols: Option<&[&str]>,
+    pseudo_scope: Box<EvalRow>,
+    outer_or_conflict: Option<ConflictAction>,
+) -> Result<TriggerOutcome> {
+    let Some(batch) = collect_matching_trigger_batch(
+        ctx.db_set,
+        target_db_id,
+        target_name,
+        timing,
+        event_kind,
+        modified_cols,
+        pseudo_scope,
+    ) else {
+        return Ok(TriggerOutcome::Continue);
+    };
+    for idx in 0..batch.triggers.len() {
+        let (_trig_db_id, trig_inst, ref trig) = batch.triggers[idx];
+        if !*ctx.recursive_triggers
+            && ctx
+                .stmt_tx
+                .subprogram_stack
+                .contains(&Some((trig_inst, trig.schema_rowid)))
+        {
+            continue;
+        }
+        if run_single_trigger(
+            ctx,
+            trig_inst,
+            trig,
+            &batch.pseudo_scopes,
+            outer_or_conflict,
+        )? == TriggerOutcome::Ignored
+        {
+            return Ok(TriggerOutcome::Ignored);
+        }
+    }
+    Ok(TriggerOutcome::Continue)
+}
+
+#[inline(never)]
+fn eval_trigger_when_cond(
+    ctx: &mut ExecContext<'_>,
+    when_expr: &Expr,
+    outer_scopes: &[EvalRow],
+) -> Result<bool> {
+    let v = eval_expr(
+        ctx,
+        when_expr,
+        &[],
+        outer_scopes,
+        &CteStore::default(),
+        None,
+    )?;
+    Ok(v.truthiness() == Some(true))
+}
+
+#[inline(never)]
+fn run_single_trigger_body(
+    ctx: &mut ExecContext<'_>,
+    trig: &crate::trigger::TriggerSchema,
+    outer_scopes: &[EvalRow],
+    outer_or_conflict: Option<ConflictAction>,
+) -> Result<TriggerOutcome> {
+    if let Some(ref w) = trig.when_clause
+        && !eval_trigger_when_cond(ctx, w, outer_scopes)?
+    {
+        return Ok(TriggerOutcome::Continue);
+    }
+    for idx in 0..trig.body.len() {
+        ctx.step_tick()?;
+        run_trigger_step(ctx, &trig.body[idx], outer_scopes, outer_or_conflict)?;
+    }
+    Ok(TriggerOutcome::Continue)
+}
+
+#[inline(never)]
+fn run_single_trigger(
+    ctx: &mut ExecContext<'_>,
+    trig_inst: SchemaInstanceId,
+    trig: &crate::trigger::TriggerSchema,
+    outer_scopes: &[EvalRow],
+    outer_or_conflict: Option<ConflictAction>,
+) -> Result<TriggerOutcome> {
+    if ctx.stmt_tx.subprogram_stack.len() >= ctx.db_set.trigger_depth_limit() {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            "triggers nested too deep",
+        ));
+    }
+    ctx.stmt_tx
+        .subprogram_stack
+        .push(Some((trig_inst, trig.schema_rowid)));
+    let saved_last_rowid = ctx.runtime.last_insert_rowid;
+    let saved_last_changes = ctx.runtime.last_changes;
+
+    let exec_res = run_single_trigger_body(ctx, trig, outer_scopes, outer_or_conflict);
+
+    let _ = ctx.stmt_tx.subprogram_stack.pop();
+    ctx.runtime.last_insert_rowid = saved_last_rowid;
+    ctx.runtime.last_changes = saved_last_changes;
+    ctx.publish();
+
+    match exec_res {
+        Ok(outcome) => Ok(outcome),
+        Err(err) if is_raise_ignore_signal(&err) => Ok(TriggerOutcome::Ignored),
+        Err(err) => Err(err),
+    }
+}
+
+#[inline(never)]
+fn run_trigger_select_step(
+    ctx: &mut ExecContext<'_>,
+    sel: &SelectStmt,
+    outer_scopes: &[EvalRow],
+) -> Result<()> {
+    let _ = exec_select(ctx, sel, &[], outer_scopes, &CteStore::default())?;
+    Ok(())
+}
+
+#[inline(never)]
+fn run_trigger_step(
+    ctx: &mut ExecContext<'_>,
+    step: &TriggerStep,
+    outer_scopes: &[EvalRow],
+    outer_or_conflict: Option<ConflictAction>,
+) -> Result<()> {
+    match step {
+        TriggerStep::Select(sel) => run_trigger_select_step(ctx, sel, outer_scopes),
+        TriggerStep::Insert(ins) => {
+            let eff = effective_trigger_step_conflict(outer_or_conflict, ins.or_conflict);
+            let _ = exec_insert_internal(ctx, ins, eff, &[], outer_scopes, false)?;
+            Ok(())
+        }
+        TriggerStep::Update(upd) => {
+            let eff = effective_trigger_step_conflict(outer_or_conflict, upd.or_conflict);
+            let _ = exec_update_internal(ctx, upd, eff, &[], outer_scopes, false)?;
+            Ok(())
+        }
+        TriggerStep::Delete(del) => {
+            let _ = exec_delete_internal(ctx, del, None, &[], outer_scopes, false)?;
+            Ok(())
+        }
+    }
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn replace_conflict_delete_row(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    indexes: &[IndexSchema],
+    ckey: &TableRowKey,
+    is_catalog: bool,
+    params: &[Value],
+    did_replace_delete: &mut bool,
+    did_replace_trigger: &mut bool,
+) -> Result<()> {
+    let Some(cpayload) = seek_table_raw_entry(ctx, db_id, tbl, ckey)? else {
+        return Ok(());
+    };
+    let cvals = decode_table_logical_row(ctx, db_id, tbl, ckey, &cpayload, params)?;
+    let run_del_triggers = !is_catalog
+        && *ctx.recursive_triggers
+        && ctx.db_set.has_active_triggers_for_event(
+            db_id,
+            &tbl.name,
+            TriggerEventKind::Delete,
+            None,
+        );
+
+    if run_del_triggers {
+        *did_replace_trigger = true;
+        let pscope =
+            make_runtime_table_pseudo_scope(tbl, Some((ckey.rowid_or_zero(), &cvals)), None);
+        if fire_row_triggers(
+            ctx,
+            db_id,
+            &tbl.name,
+            TriggerTiming::Before,
+            TriggerEventKind::Delete,
+            None,
+            pscope,
+            Some(ConflictAction::Replace),
+        )? == TriggerOutcome::Ignored
+        {
+            *did_replace_delete = true;
+            return Ok(());
+        }
+    }
+
+    let Some(cpayload2) = seek_table_raw_entry(ctx, db_id, tbl, ckey)? else {
+        *did_replace_delete = true;
+        return Ok(());
+    };
+    let cvals2 = if run_del_triggers {
+        decode_table_logical_row(ctx, db_id, tbl, ckey, &cpayload2, params)?
+    } else {
+        cvals
+    };
+
+    if *ctx.foreign_keys {
+        check_parent_delete_restrict(ctx, db_id, tbl, &cvals2, params)?;
+    }
+    delete_row_via_pipeline(
+        ctx,
+        db_id,
+        tbl,
+        indexes,
+        ckey,
+        Some(&cvals2),
+        MutationOrigin::ReplaceConflictDelete,
+        ConflictAction::Replace,
+        is_catalog,
+        params,
+    )?;
+    *did_replace_delete = true;
+    if *ctx.foreign_keys {
+        apply_parent_delete_fk_actions(ctx, db_id, tbl, &cvals2, params)?;
+    }
+
+    if run_del_triggers {
+        let pscope =
+            make_runtime_table_pseudo_scope(tbl, Some((ckey.rowid_or_zero(), &cvals2)), None);
+        let _ = fire_row_triggers(
+            ctx,
+            db_id,
+            &tbl.name,
+            TriggerTiming::After,
+            TriggerEventKind::Delete,
+            None,
+            pscope,
+            Some(ConflictAction::Replace),
+        )?;
+    }
+    Ok(())
+}
+
+/// Validates constraints (NOT NULL, STRICT, CHECK, Rowid/WITHOUT ROWID PK, UNIQUE indexes), applies conflict resolution
+/// (`IGNORE` / `REPLACE` / error with `ConflictResolutionEffect`), and writes the row + secondary index entries!
+/// Returns `Ok(Some((final_key, final_logical_vals)))` if written, or `Ok(None)` if skipped via `IGNORE`.
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn validate_and_write_row(
     ctx: &mut ExecContext<'_>,
@@ -9563,16 +10084,13 @@ fn validate_and_write_row(
     existing_self_key: Option<&TableRowKey>,
     params: &[Value],
     bump_last_rowid: bool,
-    count_as_top_level_change: bool,
-    stmt_fk_suspects: &mut Vec<(SchemaInstanceId, String, TableRowKey, usize)>,
-    fk_depth: usize,
     mutation_dispatch: Option<(MutationOrigin, Option<MutationRow>)>,
     is_catalog: bool,
 ) -> Result<Option<(TableRowKey, Vec<Value>)>> {
     ctx.ensure_write_db(db_id, false)?;
     let (enc, schema_name) = slot_encoding_and_name(ctx, db_id);
 
-    // 1. Determine final rowid (for rowid tables) & apply column affinities
+    // 1. Determine final rowid (for rowid tables) & apply column affinities + generated columns
     let rowid = if tbl.without_rowid {
         0
     } else {
@@ -9599,38 +10117,7 @@ fn validate_and_write_row(
         final_rowid.unwrap()
     };
 
-    for (i, col) in tbl.columns.iter().enumerate() {
-        if col.generated.is_some() {
-            continue;
-        }
-        if tbl.rowid_alias_col == Some(i) {
-            raw_vals[i] = Value::Integer(rowid);
-        } else {
-            raw_vals[i] = col.affinity.apply(raw_vals[i].clone());
-            if tbl.strict
-                && col.type_name.trim().eq_ignore_ascii_case("REAL")
-                && let Value::Integer(iv) = raw_vals[i]
-            {
-                raw_vals[i] = Value::real(iv as f64);
-            }
-        }
-    }
-
-    // Evaluate VIRTUAL and STORED generated columns in declaration order
-    for i in 0..tbl.columns.len() {
-        if let Some((ref gexpr, _)) = tbl.columns[i].generated {
-            let scope = make_single_table_scope(tbl, &schema_name, None, rowid, &raw_vals);
-            let gv = eval_expr(ctx, gexpr, params, &[scope], &CteStore::default(), None)?;
-            let mut coerced = tbl.columns[i].affinity.apply(gv);
-            if tbl.strict
-                && tbl.columns[i].type_name.trim().eq_ignore_ascii_case("REAL")
-                && let Value::Integer(iv) = coerced
-            {
-                coerced = Value::real(iv as f64);
-            }
-            raw_vals[i] = coerced;
-        }
-    }
+    apply_table_affinities_and_generated(ctx, tbl, &schema_name, rowid, &mut raw_vals, params)?;
 
     // 2. STRICT type check
     if tbl.strict {
@@ -9720,85 +10207,64 @@ fn validate_and_write_row(
         TableRowKey::Rowid(rowid)
     };
 
-    // 5 & 6. Uniqueness checks in `insert.c` (`sqlite3GenerateConstraintChecks`) order:
-    // - Non-`Replace` IPK check (when rowid table and IPK conflict != Replace)
-    // - `ordered_unique_indexes` (`WITHOUT ROWID` PK + secondary `UNIQUE` indexes: non-Replace in reverse creation order, then Replace in creation order)
-    // - `Replace` IPK check (`Do IPK REPLACE` last so non-Replace secondary UNIQUE constraints run before deleting!)
+    // 5 & 6. Uniqueness checks in `insert.c:2287-2290` (`sqlite3GenerateConstraintChecks`) order:
+    // Defer IPK `REPLACE` behind secondary `UNIQUE` indexes ONLY when `ipk_eff == Replace &&
+    // stmt_conflict != Some(Replace) && !indexes.is_empty()`.
     let ordered_uniques = ordered_unique_indexes(tbl, indexes);
     let mut did_replace_delete = false;
+    let mut did_replace_trigger = false;
     let ipk_eff = stmt_conflict.unwrap_or(tbl.rowid_pk_conflict);
+    let defer_ipk_replace = !tbl.without_rowid
+        && ipk_eff == ConflictAction::Replace
+        && stmt_conflict != Some(ConflictAction::Replace)
+        && !indexes.is_empty();
 
-    let check_rowid_pk =
-        |ctx: &mut ExecContext<'_>,
-         stmt_fk_suspects: &mut Vec<(SchemaInstanceId, String, TableRowKey, usize)>,
-         did_replace_delete: &mut bool|
-         -> Result<bool> {
-            if !tbl.without_rowid
-                && existing_self_key != Some(&final_key)
-                && let Some(conflict_payload) = seek_table_raw_entry(ctx, db_id, tbl, &final_key)?
-            {
-                let conflict_key = TableRowKey::Rowid(rowid);
-                match ipk_eff {
-                    ConflictAction::Ignore => return Ok(true),
-                    ConflictAction::Replace => {
-                        let conflict_vals = decode_table_logical_row(
-                            ctx,
-                            db_id,
-                            tbl,
-                            &conflict_key,
-                            &conflict_payload,
-                            params,
-                        )?;
-                        if *ctx.foreign_keys {
-                            check_parent_delete_restrict(ctx, db_id, tbl, &conflict_vals, params)?;
-                        }
-                        delete_row_via_pipeline(
-                            ctx,
-                            db_id,
-                            tbl,
-                            indexes,
-                            &conflict_key,
-                            Some(&conflict_vals),
-                            MutationOrigin::ReplaceConflictDelete,
-                            ConflictAction::Replace,
-                            is_catalog,
-                            params,
-                        )?;
-                        *did_replace_delete = true;
-                        if *ctx.foreign_keys {
-                            apply_parent_delete_fk_actions(
-                                ctx,
-                                db_id,
-                                tbl,
-                                &conflict_vals,
-                                params,
-                                stmt_fk_suspects,
-                                fk_depth + 1,
-                            )?;
-                        }
-                    }
-                    _ => {
-                        let (ext_code, col_label) = match tbl.rowid_alias_col {
-                            Some(ipk) => (
-                                extended::SQLITE_CONSTRAINT_PRIMARYKEY,
-                                tbl.columns[ipk].name.as_str(),
-                            ),
-                            None => (extended::SQLITE_CONSTRAINT_ROWID, "rowid"),
-                        };
-                        return Err(SqliteError::constraint(
-                            ext_code,
-                            format!("UNIQUE constraint failed: {}.{}", tbl.name, col_label),
-                        )
-                        .with_conflict_effect(conflict_action_to_effect(ipk_eff)));
-                    }
+    let check_rowid_pk = |ctx: &mut ExecContext<'_>,
+                          did_replace_delete: &mut bool,
+                          did_replace_trigger: &mut bool|
+     -> Result<bool> {
+        if !tbl.without_rowid
+            && existing_self_key != Some(&final_key)
+            && seek_table_raw_entry(ctx, db_id, tbl, &final_key)?.is_some()
+        {
+            let conflict_key = TableRowKey::Rowid(rowid);
+            match ipk_eff {
+                ConflictAction::Ignore => return Ok(true),
+                ConflictAction::Replace => {
+                    replace_conflict_delete_row(
+                        ctx,
+                        db_id,
+                        tbl,
+                        indexes,
+                        &conflict_key,
+                        is_catalog,
+                        params,
+                        did_replace_delete,
+                        did_replace_trigger,
+                    )?;
+                }
+                _ => {
+                    let (ext_code, col_label) = match tbl.rowid_alias_col {
+                        Some(ipk) => (
+                            extended::SQLITE_CONSTRAINT_PRIMARYKEY,
+                            tbl.columns[ipk].name.as_str(),
+                        ),
+                        None => (extended::SQLITE_CONSTRAINT_ROWID, "rowid"),
+                    };
+                    return Err(SqliteError::constraint(
+                        ext_code,
+                        format!("UNIQUE constraint failed: {}.{}", tbl.name, col_label),
+                    )
+                    .with_conflict_effect(conflict_action_to_effect(ipk_eff)));
                 }
             }
-            Ok(false)
-        };
+        }
+        Ok(false)
+    };
 
     if !tbl.without_rowid
-        && ipk_eff != ConflictAction::Replace
-        && check_rowid_pk(ctx, stmt_fk_suspects, &mut did_replace_delete)?
+        && !defer_ipk_replace
+        && check_rowid_pk(ctx, &mut did_replace_delete, &mut did_replace_trigger)?
     {
         return Ok(None);
     }
@@ -9819,41 +10285,17 @@ fn validate_and_write_row(
                 match eff {
                     ConflictAction::Ignore => return Ok(None),
                     ConflictAction::Replace => {
-                        let conflict_vals = decode_table_logical_row(
-                            ctx,
-                            db_id,
-                            tbl,
-                            &conflict_key,
-                            &conflict_payload,
-                            params,
-                        )?;
-                        if *ctx.foreign_keys {
-                            check_parent_delete_restrict(ctx, db_id, tbl, &conflict_vals, params)?;
-                        }
-                        delete_row_via_pipeline(
+                        replace_conflict_delete_row(
                             ctx,
                             db_id,
                             tbl,
                             indexes,
                             &conflict_key,
-                            Some(&conflict_vals),
-                            MutationOrigin::ReplaceConflictDelete,
-                            ConflictAction::Replace,
                             is_catalog,
                             params,
+                            &mut did_replace_delete,
+                            &mut did_replace_trigger,
                         )?;
-                        did_replace_delete = true;
-                        if *ctx.foreign_keys {
-                            apply_parent_delete_fk_actions(
-                                ctx,
-                                db_id,
-                                tbl,
-                                &conflict_vals,
-                                params,
-                                stmt_fk_suspects,
-                                fk_depth + 1,
-                            )?;
-                        }
                     }
                     _ => {
                         return Err(SqliteError::constraint(
@@ -9908,38 +10350,17 @@ fn validate_and_write_row(
                 ConflictAction::Ignore => return Ok(None),
                 ConflictAction::Replace => {
                     for ckey in conflicting_keys {
-                        if let Some(cpayload) = seek_table_raw_entry(ctx, db_id, tbl, &ckey)? {
-                            let cvals = decode_table_logical_row(
-                                ctx, db_id, tbl, &ckey, &cpayload, params,
-                            )?;
-                            if *ctx.foreign_keys {
-                                check_parent_delete_restrict(ctx, db_id, tbl, &cvals, params)?;
-                            }
-                            delete_row_via_pipeline(
-                                ctx,
-                                db_id,
-                                tbl,
-                                indexes,
-                                &ckey,
-                                Some(&cvals),
-                                MutationOrigin::ReplaceConflictDelete,
-                                ConflictAction::Replace,
-                                is_catalog,
-                                params,
-                            )?;
-                            did_replace_delete = true;
-                            if *ctx.foreign_keys {
-                                apply_parent_delete_fk_actions(
-                                    ctx,
-                                    db_id,
-                                    tbl,
-                                    &cvals,
-                                    params,
-                                    stmt_fk_suspects,
-                                    fk_depth + 1,
-                                )?;
-                            }
-                        }
+                        replace_conflict_delete_row(
+                            ctx,
+                            db_id,
+                            tbl,
+                            indexes,
+                            &ckey,
+                            is_catalog,
+                            params,
+                            &mut did_replace_delete,
+                            &mut did_replace_trigger,
+                        )?;
                     }
                 }
                 _ => {
@@ -9958,21 +10379,20 @@ fn validate_and_write_row(
         }
     }
 
-    if !tbl.without_rowid
-        && ipk_eff == ConflictAction::Replace
-        && check_rowid_pk(ctx, stmt_fk_suspects, &mut did_replace_delete)?
+    if defer_ipk_replace && check_rowid_pk(ctx, &mut did_replace_delete, &mut did_replace_trigger)?
     {
         return Ok(None);
     }
 
-    // `addrRecheck` (`insert.c:2707-2725`): when `OR REPLACE` ran and FK actions may have mutated `tbl`,
-    // re-verify all uniqueness constraints under `ConflictAction::Abort`!
+    // `addrRecheck` (`insert.c:2707-2725`): when `OR REPLACE` ran and `DELETE` triggers or FK actions
+    // may have mutated `tbl`, re-verify all uniqueness constraints under `ConflictAction::Abort`!
     if did_replace_delete
-        && *ctx.foreign_keys
-        && ctx
-            .db_set
-            .slot(db_id)
-            .is_some_and(|s| !find_referencing_fks(&s.schema, &tbl.name).is_empty())
+        && (did_replace_trigger
+            || (*ctx.foreign_keys
+                && ctx
+                    .db_set
+                    .slot(db_id)
+                    .is_some_and(|s| !find_referencing_fks(&s.schema, &tbl.name).is_empty())))
     {
         recheck_uniqueness_abort(
             ctx,
@@ -9989,22 +10409,18 @@ fn validate_and_write_row(
         )?;
     }
 
-    // 7. If updating an existing row in-place or moving keys, check parent UPDATE RESTRICT before mutating
+    // 7. If updating an existing row, re-verify `old_key` still exists (`update.c:1050-1057`),
+    // check parent UPDATE RESTRICT before mutating, and remove the old row + index entries!
     let old_logical_vals_opt = if let Some(old_key) = existing_self_key {
-        let old_vals = if let Some(op) = seek_table_raw_entry(ctx, db_id, tbl, old_key)? {
-            Some(decode_table_logical_row(
-                ctx, db_id, tbl, old_key, &op, params,
-            )?)
-        } else {
-            None
+        let Some(op) = seek_table_raw_entry(ctx, db_id, tbl, old_key)? else {
+            return Ok(None);
         };
-        if *ctx.foreign_keys
-            && let Some(ref ov) = old_vals
-        {
-            check_parent_update_restrict(ctx, db_id, tbl, ov, &raw_vals, params)?;
+        let old_vals = decode_table_logical_row(ctx, db_id, tbl, old_key, &op, params)?;
+        if *ctx.foreign_keys {
+            check_parent_update_restrict(ctx, db_id, tbl, &old_vals, &raw_vals, params)?;
         }
         remove_row_and_indexes(ctx, db_id, tbl, indexes, old_key, params)?;
-        old_vals
+        Some(old_vals)
     } else {
         None
     };
@@ -10048,7 +10464,7 @@ fn validate_and_write_row(
 
     // 9. Foreign key checks on child row, dispatch parent mutation, & cascading parent UPDATE actions
     if *ctx.foreign_keys {
-        register_child_fk_checks(ctx, db_id, tbl, &final_key, &raw_vals, stmt_fk_suspects)?;
+        register_child_fk_checks(ctx, db_id, tbl, &final_key, &raw_vals)?;
     }
 
     if let Some((origin, excluded_row)) = mutation_dispatch {
@@ -10085,28 +10501,544 @@ fn validate_and_write_row(
     if *ctx.foreign_keys
         && let Some(ref old_vals) = old_logical_vals_opt
     {
-        apply_parent_update_fk_actions(
-            ctx,
-            db_id,
-            tbl,
-            old_vals,
-            &raw_vals,
-            params,
-            stmt_fk_suspects,
-            fk_depth + 1,
-        )?;
+        apply_parent_update_fk_actions(ctx, db_id, tbl, old_vals, &raw_vals, params)?;
     }
 
     if bump_last_rowid && !tbl.without_rowid {
         ctx.runtime.last_insert_rowid = rowid;
+        ctx.publish();
     }
-    if count_as_top_level_change {
-        ctx.runtime.last_changes += 1;
-    }
-    ctx.runtime.total_changes += 1;
-    ctx.publish();
 
     Ok(Some((final_key, raw_vals)))
+}
+
+/// Shared row-UPDATE pipeline (`update.c:991-1065`) used by `UPDATE`, `UPSERT DO UPDATE`, and
+/// `FOREIGN KEY` `ON DELETE`/`ON UPDATE` (`SET NULL`, `SET DEFAULT`, `CASCADE`):
+/// 1. Fires `BEFORE UPDATE` triggers (with pre-constraint `NEW.*` after affinities & generated cols).
+/// 2. Re-seeks `old_key`; if deleted by a `BEFORE` trigger, skips write, `RETURNING`, and `AFTER`.
+/// 3. Reloads unmodified non-generated, non-IPK columns from the re-seeked row (`update.c:1014-1035`).
+/// 4. Validates & writes the updated row via `validate_and_write_row` (returning `Ok(false)` on `OR IGNORE`).
+/// 5. Invokes `on_written` (`stmt_changes` / `total_changes` / `RETURNING`) BEFORE firing `AFTER UPDATE`.
+/// 6. Fires `AFTER UPDATE` triggers.
+fn mark_expr_new_col_refs(expr: &Expr, tbl: &TableSchema, mask: &mut u32) {
+    match expr {
+        Expr::Column(cref) => {
+            if cref.schema.is_none()
+                && cref
+                    .table
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case("new"))
+                && let Some((ci, _)) = tbl.find_column(&cref.column)
+            {
+                if ci >= 32 {
+                    *mask = u32::MAX;
+                } else {
+                    *mask |= 1u32 << ci;
+                }
+            }
+        }
+        Expr::Unary { expr: e, .. }
+        | Expr::Collate { expr: e, .. }
+        | Expr::Cast { expr: e, .. }
+        | Expr::IsNull { expr: e, .. } => mark_expr_new_col_refs(e, tbl, mask),
+        Expr::Binary { left, right, .. } => {
+            mark_expr_new_col_refs(left, tbl, mask);
+            mark_expr_new_col_refs(right, tbl, mask);
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            mark_expr_new_col_refs(e, tbl, mask);
+            mark_expr_new_col_refs(low, tbl, mask);
+            mark_expr_new_col_refs(high, tbl, mask);
+        }
+        Expr::InList { expr: e, list, .. } => {
+            mark_expr_new_col_refs(e, tbl, mask);
+            for item in list {
+                mark_expr_new_col_refs(item, tbl, mask);
+            }
+        }
+        Expr::InSubquery {
+            expr: e, subquery, ..
+        } => {
+            mark_expr_new_col_refs(e, tbl, mask);
+            mark_select_new_col_refs(subquery, tbl, mask);
+        }
+        Expr::InTable { expr: e, .. } => mark_expr_new_col_refs(e, tbl, mask),
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
+            mark_select_new_col_refs(subquery, tbl, mask);
+        }
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            mark_expr_new_col_refs(e, tbl, mask);
+            mark_expr_new_col_refs(pattern, tbl, mask);
+            if let Some(esc) = escape {
+                mark_expr_new_col_refs(esc, tbl, mask);
+            }
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                mark_expr_new_col_refs(op, tbl, mask);
+            }
+            for (w, t) in branches {
+                mark_expr_new_col_refs(w, tbl, mask);
+                mark_expr_new_col_refs(t, tbl, mask);
+            }
+            if let Some(el) = else_expr {
+                mark_expr_new_col_refs(el, tbl, mask);
+            }
+        }
+        Expr::FunctionCall { args, filter, .. } => {
+            if let FunctionArgs::Exprs(es) = args {
+                for a in es {
+                    mark_expr_new_col_refs(a, tbl, mask);
+                }
+            }
+            if let Some(f) = filter {
+                mark_expr_new_col_refs(f, tbl, mask);
+            }
+        }
+        Expr::RowValue(es) => {
+            for e in es {
+                mark_expr_new_col_refs(e, tbl, mask);
+            }
+        }
+        Expr::Raise {
+            message: Some(m), ..
+        } => {
+            mark_expr_new_col_refs(m, tbl, mask);
+        }
+        _ => {}
+    }
+}
+
+fn mark_from_new_col_refs(fc: &FromClause, tbl: &TableSchema, mask: &mut u32) {
+    let visit_tos = |tos: &TableOrSubquery, mask: &mut u32| match tos {
+        TableOrSubquery::Table { table_args, .. } => {
+            if let Some(es) = table_args {
+                for e in es {
+                    mark_expr_new_col_refs(e, tbl, mask);
+                }
+            }
+        }
+        TableOrSubquery::Subquery { query, .. } => mark_select_new_col_refs(query, tbl, mask),
+    };
+    visit_tos(&fc.head, mask);
+    for j in &fc.joins {
+        visit_tos(&j.right, mask);
+        if let Some(JoinConstraint::On(ref on_e)) = j.constraint {
+            mark_expr_new_col_refs(on_e, tbl, mask);
+        }
+    }
+}
+
+fn mark_select_core_new_col_refs(core: &SelectCore, tbl: &TableSchema, mask: &mut u32) {
+    match core {
+        SelectCore::Values(rows) => {
+            for r in rows {
+                for e in r {
+                    mark_expr_new_col_refs(e, tbl, mask);
+                }
+            }
+        }
+        SelectCore::Select {
+            projection,
+            from,
+            selection,
+            group_by,
+            having,
+            ..
+        } => {
+            for rc in projection {
+                if let ResultColumn::Expr { expr, .. } = rc {
+                    mark_expr_new_col_refs(expr, tbl, mask);
+                }
+            }
+            if let Some(fc) = from {
+                mark_from_new_col_refs(fc, tbl, mask);
+            }
+            if let Some(w) = selection {
+                mark_expr_new_col_refs(w, tbl, mask);
+            }
+            for g in group_by {
+                mark_expr_new_col_refs(g, tbl, mask);
+            }
+            if let Some(h) = having {
+                mark_expr_new_col_refs(h, tbl, mask);
+            }
+        }
+    }
+}
+
+fn mark_select_new_col_refs(sel: &SelectStmt, tbl: &TableSchema, mask: &mut u32) {
+    for cte in &sel.ctes {
+        mark_select_new_col_refs(&cte.query, tbl, mask);
+    }
+    mark_select_core_new_col_refs(&sel.body.head, tbl, mask);
+    for (_, rhs) in &sel.body.compounds {
+        mark_select_core_new_col_refs(rhs, tbl, mask);
+    }
+    for term in &sel.order_by {
+        mark_expr_new_col_refs(&term.expr, tbl, mask);
+    }
+    if let Some(ref lim) = sel.limit {
+        mark_expr_new_col_refs(&lim.limit, tbl, mask);
+        if let Some(ref off) = lim.offset {
+            mark_expr_new_col_refs(off, tbl, mask);
+        }
+    }
+}
+
+fn compute_before_update_newmask(
+    db_set: &DatabaseSet,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    modified_col_names: &[&str],
+) -> u32 {
+    let mut mask = 0u32;
+    let trigs = db_set.matching_triggers(
+        db_id,
+        &tbl.name,
+        TriggerTiming::Before,
+        TriggerEventKind::Update,
+        Some(modified_col_names),
+    );
+    for (_, _, trig) in &trigs {
+        if let Some(ref w) = trig.when_clause {
+            mark_expr_new_col_refs(w, tbl, &mut mask);
+        }
+        for step in &trig.body {
+            match step {
+                TriggerStep::Select(sel) => mark_select_new_col_refs(sel, tbl, &mut mask),
+                TriggerStep::Insert(ins) => {
+                    for cte in &ins.ctes {
+                        mark_select_new_col_refs(&cte.query, tbl, &mut mask);
+                    }
+                    match &ins.source {
+                        InsertSource::DefaultValues => {}
+                        InsertSource::Values(rows) => {
+                            for r in rows {
+                                for e in r {
+                                    mark_expr_new_col_refs(e, tbl, &mut mask);
+                                }
+                            }
+                        }
+                        InsertSource::Select(sel) => mark_select_new_col_refs(sel, tbl, &mut mask),
+                    }
+                    for uc in &ins.upsert_clauses {
+                        if let Some(ref ut) = uc.target
+                            && let Some(ref tw) = ut.where_clause
+                        {
+                            mark_expr_new_col_refs(tw, tbl, &mut mask);
+                        }
+                        if let UpsertAction::DoUpdate {
+                            ref assignments,
+                            ref where_clause,
+                        } = uc.action
+                        {
+                            for sa in assignments {
+                                mark_expr_new_col_refs(&sa.expr, tbl, &mut mask);
+                            }
+                            if let Some(dw) = where_clause {
+                                mark_expr_new_col_refs(dw, tbl, &mut mask);
+                            }
+                        }
+                    }
+                }
+                TriggerStep::Update(upd) => {
+                    for cte in &upd.ctes {
+                        mark_select_new_col_refs(&cte.query, tbl, &mut mask);
+                    }
+                    for sa in &upd.assignments {
+                        mark_expr_new_col_refs(&sa.expr, tbl, &mut mask);
+                    }
+                    if let Some(ref fc) = upd.from {
+                        mark_from_new_col_refs(fc, tbl, &mut mask);
+                    }
+                    if let Some(ref w) = upd.selection {
+                        mark_expr_new_col_refs(w, tbl, &mut mask);
+                    }
+                }
+                TriggerStep::Delete(del) => {
+                    for cte in &del.ctes {
+                        mark_select_new_col_refs(&cte.query, tbl, &mut mask);
+                    }
+                    if let Some(ref w) = del.selection {
+                        mark_expr_new_col_refs(w, tbl, &mut mask);
+                    }
+                }
+            }
+        }
+    }
+    mask
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn prepare_update_before_scope(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    schema_name: &str,
+    old_key: &TableRowKey,
+    old_vals: &[Value],
+    new_rowid_opt: &mut Option<i64>,
+    new_vals: &[Value],
+    modified_col_mask: &[bool],
+    modified_col_names: &[&str],
+    is_catalog: bool,
+    params: &[Value],
+) -> Result<Option<Box<EvalRow>>> {
+    let pre_before_rowid = if tbl.without_rowid {
+        0
+    } else if let Some(r) = *new_rowid_opt {
+        r
+    } else if let Some(ipk) = tbl.rowid_alias_col {
+        if new_vals[ipk].is_null() {
+            return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
+        }
+        let coerced = TypeAffinity::Integer.apply(new_vals[ipk].clone());
+        let Some(i) = coerced.as_i64() else {
+            return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
+        };
+        *new_rowid_opt = Some(i);
+        i
+    } else {
+        return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
+    };
+
+    if is_catalog
+        || !ctx.db_set.has_active_triggers_for_event(
+            db_id,
+            &tbl.name,
+            TriggerEventKind::Update,
+            Some(modified_col_names),
+        )
+    {
+        return Ok(None);
+    }
+
+    let mut before_new_vals = new_vals.to_vec();
+    if tbl.columns.iter().any(|c| c.generated.is_some())
+        && !ctx
+            .db_set
+            .matching_triggers(
+                db_id,
+                &tbl.name,
+                TriggerTiming::Before,
+                TriggerEventKind::Update,
+                Some(modified_col_names),
+            )
+            .is_empty()
+    {
+        let newmask = compute_before_update_newmask(ctx.db_set, db_id, tbl, modified_col_names);
+        for (ci, col) in tbl.columns.iter().enumerate() {
+            if ci < 32
+                && col.generated.is_none()
+                && tbl.rowid_alias_col != Some(ci)
+                && !modified_col_mask.get(ci).copied().unwrap_or(false)
+                && (newmask & (1u32 << ci)) == 0
+            {
+                before_new_vals[ci] = Value::Null;
+            }
+        }
+    }
+    apply_table_affinities_and_generated(
+        ctx,
+        tbl,
+        schema_name,
+        pre_before_rowid,
+        &mut before_new_vals,
+        params,
+    )?;
+    Ok(Some(make_runtime_table_pseudo_scope(
+        tbl,
+        Some((old_key.rowid_or_zero(), old_vals)),
+        Some((pre_before_rowid, &before_new_vals)),
+    )))
+}
+
+#[inline(never)]
+fn reload_update_row_after_before(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    old_key: &TableRowKey,
+    modified_col_mask: &[bool],
+    new_vals: &mut [Value],
+    params: &[Value],
+) -> Result<bool> {
+    let Some(reloaded_payload) = seek_table_raw_entry(ctx, db_id, tbl, old_key)? else {
+        return Ok(false);
+    };
+    let reloaded_vals =
+        decode_table_logical_row(ctx, db_id, tbl, old_key, &reloaded_payload, params)?;
+    for (ci, col) in tbl.columns.iter().enumerate() {
+        if col.generated.is_none()
+            && tbl.rowid_alias_col != Some(ci)
+            && !modified_col_mask.get(ci).copied().unwrap_or(false)
+        {
+            new_vals[ci] = reloaded_vals[ci].clone();
+        }
+    }
+    Ok(true)
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn write_update_row_and_build_after_scope<F>(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    indexes: &[IndexSchema],
+    old_key: &TableRowKey,
+    old_vals: &[Value],
+    new_rowid_opt: Option<i64>,
+    new_vals: Vec<Value>,
+    or_conflict: Option<ConflictAction>,
+    mutation_dispatch: Option<(MutationOrigin, Option<MutationRow>)>,
+    is_catalog: bool,
+    params: &[Value],
+    on_written: F,
+) -> Result<Option<Option<Box<EvalRow>>>>
+where
+    F: FnOnce(&mut ExecContext<'_>, &TableRowKey, &[Value]) -> Result<()>,
+{
+    let Some((written_key, written_vals)) = validate_and_write_row(
+        ctx,
+        db_id,
+        tbl,
+        indexes,
+        new_rowid_opt,
+        new_vals,
+        or_conflict,
+        Some(old_key),
+        params,
+        false,
+        mutation_dispatch,
+        is_catalog,
+    )?
+    else {
+        return Ok(None);
+    };
+    on_written(ctx, &written_key, &written_vals)?;
+    let after_scope = if !is_catalog {
+        Some(make_runtime_table_pseudo_scope(
+            tbl,
+            Some((old_key.rowid_or_zero(), old_vals)),
+            Some((written_key.rowid_or_zero(), &written_vals)),
+        ))
+    } else {
+        None
+    };
+    Ok(Some(after_scope))
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn update_existing_table_row_with_triggers<F>(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    indexes: &[IndexSchema],
+    schema_name: &str,
+    old_key: &TableRowKey,
+    old_vals: Vec<Value>,
+    mut new_rowid_opt: Option<i64>,
+    mut new_vals: Vec<Value>,
+    modified_col_mask: &[bool],
+    modified_col_names: &[&str],
+    or_conflict: Option<ConflictAction>,
+    mutation_dispatch: Option<(MutationOrigin, Option<MutationRow>)>,
+    is_catalog: bool,
+    params: &[Value],
+    on_written: F,
+) -> Result<bool>
+where
+    F: FnOnce(&mut ExecContext<'_>, &TableRowKey, &[Value]) -> Result<()>,
+{
+    if let Some(before_scope) = prepare_update_before_scope(
+        ctx,
+        db_id,
+        tbl,
+        schema_name,
+        old_key,
+        &old_vals,
+        &mut new_rowid_opt,
+        &new_vals,
+        modified_col_mask,
+        modified_col_names,
+        is_catalog,
+        params,
+    )? {
+        if fire_row_triggers(
+            ctx,
+            db_id,
+            &tbl.name,
+            TriggerTiming::Before,
+            TriggerEventKind::Update,
+            Some(modified_col_names),
+            before_scope,
+            or_conflict,
+        )? == TriggerOutcome::Ignored
+        {
+            return Ok(false);
+        }
+        if !reload_update_row_after_before(
+            ctx,
+            db_id,
+            tbl,
+            old_key,
+            modified_col_mask,
+            &mut new_vals,
+            params,
+        )? {
+            return Ok(false);
+        }
+    }
+
+    let Some(after_scope_opt) = write_update_row_and_build_after_scope(
+        ctx,
+        db_id,
+        tbl,
+        indexes,
+        old_key,
+        &old_vals,
+        new_rowid_opt,
+        new_vals,
+        or_conflict,
+        mutation_dispatch,
+        is_catalog,
+        params,
+        on_written,
+    )?
+    else {
+        return Ok(false);
+    };
+    drop(old_vals);
+
+    if let Some(after_scope) = after_scope_opt {
+        let _ = fire_row_triggers(
+            ctx,
+            db_id,
+            &tbl.name,
+            TriggerTiming::After,
+            TriggerEventKind::Update,
+            Some(modified_col_names),
+            after_scope,
+            or_conflict,
+        )?;
+    }
+
+    Ok(true)
 }
 
 fn allocate_table_rowid(
@@ -10205,8 +11137,6 @@ fn update_sqlite_sequence(
 // Foreign Key Enforcement & Referential Actions (`sqlite/src/fkey.c`)
 // ============================================================================
 
-const MAX_FK_CASCADE_DEPTH: usize = 1000;
-
 fn fk_constraint_err() -> SqliteError {
     SqliteError::constraint(
         extended::SQLITE_CONSTRAINT_FOREIGNKEY,
@@ -10215,7 +11145,7 @@ fn fk_constraint_err() -> SqliteError {
 }
 
 /// Resolves the target parent table and parent column indices for `fk` on `child_tbl_name`
-/// strictly within the same database slot (`schema` / `schema_name`), verifying SQLite's parent key
+/// strictly within the same database slot (`schema` / `schema_name`), verifying parent key
 /// existence and `PRIMARY KEY` / `UNIQUE` index requirement (`sqlite3FkLocateIndex`).
 fn resolve_fk_parent_cols(
     schema: &Schema,
@@ -10391,7 +11321,6 @@ fn register_child_fk_checks(
     tbl: &TableSchema,
     rkey: &TableRowKey,
     written_vals: &[Value],
-    stmt_fk_suspects: &mut Vec<(SchemaInstanceId, String, TableRowKey, usize)>,
 ) -> Result<()> {
     let Some((inst_id, schema_name, slot_schema)) = ctx
         .db_set
@@ -10418,9 +11347,11 @@ fn register_child_fk_checks(
                 ctx.deferred_fk_suspects
                     .push((inst_id, tbl.name.clone(), rkey.clone(), fk.id));
             } else {
-                // Per SQLite `OP_FkCounter` / `sqlite3VdbeCheckFkImmediate`, non-RESTRICT immediate FKs
-                // are verified at statement completion so multi-row / multi-cascade updates settle cleanly.
-                stmt_fk_suspects.push((inst_id, tbl.name.clone(), rkey.clone(), fk.id));
+                // Immediate non-RESTRICT FK violations are verified at top-level statement halt
+                // (`sqlite3VdbeCheckFkImmediate`) so multi-row / multi-step trigger mutations settle cleanly.
+                ctx.stmt_tx
+                    .stmt_fk_suspects
+                    .push((inst_id, tbl.name.clone(), rkey.clone(), fk.id));
             }
         }
     }
@@ -10463,8 +11394,8 @@ fn find_referencing_fks(
     parent_tbl_name: &str,
 ) -> Vec<(TableSchema, ForeignKeySchema)> {
     let mut out = Vec::new();
-    for ctbl in &schema.tables {
-        for fk in &ctbl.foreign_keys {
+    for ctbl in schema.tables.iter().rev() {
+        for fk in ctbl.foreign_keys.iter().rev() {
             if fk.ref_table.eq_ignore_ascii_case(parent_tbl_name) {
                 out.push((ctbl.clone(), fk.clone()));
             }
@@ -10597,22 +11528,50 @@ fn check_parent_update_restrict(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+fn run_in_fk_subprogram<F>(ctx: &mut ExecContext<'_>, f: F) -> Result<()>
+where
+    F: FnOnce(&mut ExecContext<'_>) -> Result<()>,
+{
+    if ctx.stmt_tx.subprogram_stack.len() >= ctx.db_set.trigger_depth_limit() {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            "triggers nested too deep",
+        ));
+    }
+    ctx.stmt_tx.subprogram_stack.push(None);
+    let saved_last_rowid = ctx.runtime.last_insert_rowid;
+    let saved_last_changes = ctx.runtime.last_changes;
+    let res = f(ctx);
+    let _ = ctx.stmt_tx.subprogram_stack.pop();
+    ctx.runtime.last_insert_rowid = saved_last_rowid;
+    ctx.runtime.last_changes = saved_last_changes;
+    ctx.publish();
+    res
+}
+
+fn build_fk_modified_col_info<'a>(
+    ctbl: &'a TableSchema,
+    from_cols: &[usize],
+) -> (Vec<bool>, Vec<&'a str>) {
+    let mut mask = vec![false; ctbl.columns.len()];
+    let mut names = Vec::with_capacity(from_cols.len());
+    for &ci in from_cols {
+        if ci < mask.len() {
+            mask[ci] = true;
+            names.push(ctbl.columns[ci].name.as_str());
+        }
+    }
+    (mask, names)
+}
+
+#[inline(never)]
 fn apply_parent_delete_fk_actions(
     ctx: &mut ExecContext<'_>,
     db_id: DatabaseId,
     ptbl: &TableSchema,
     old_parent_vals: &[Value],
     params: &[Value],
-    stmt_fk_suspects: &mut Vec<(SchemaInstanceId, String, TableRowKey, usize)>,
-    fk_depth: usize,
 ) -> Result<()> {
-    if fk_depth > MAX_FK_CASCADE_DEPTH {
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            "too many levels of trigger recursion",
-        ));
-    }
     let Some((inst_id, schema_name, slot_schema, refs)) = ctx.db_set.slot(db_id).map(|s| {
         (
             s.schema_instance_id,
@@ -10646,153 +11605,227 @@ fn apply_parent_delete_fk_actions(
                 &fk.from_cols,
                 enc,
             ) {
-                matching_children.push((ckey, cvals));
+                matching_children.push(ckey);
             }
         }
         if matching_children.is_empty() {
             continue;
         }
 
-        match fk.on_delete {
-            FkAction::Restrict => return Err(fk_constraint_err()),
-            FkAction::NoAction => {
-                for (ckey, _) in matching_children {
-                    if fk.deferred {
-                        ctx.deferred_fk_suspects
-                            .push((inst_id, ctbl.name.clone(), ckey, fk.id));
-                    } else {
-                        stmt_fk_suspects.push((inst_id, ctbl.name.clone(), ckey, fk.id));
-                    }
-                }
+        if fk.on_delete == FkAction::Restrict {
+            return Err(fk_constraint_err());
+        }
+
+        // Register all matching child rows as FK suspects BEFORE running the action (`fkey.c`
+        // `OP_FkCounter`), so if a child `BEFORE` trigger suppresses the delete/update via
+        // `RAISE(IGNORE)`, statement-end / commit-time FK verification catches the remaining child!
+        for ckey in &matching_children {
+            if fk.deferred {
+                ctx.deferred_fk_suspects
+                    .push((inst_id, ctbl.name.clone(), ckey.clone(), fk.id));
+            } else {
+                ctx.stmt_tx.stmt_fk_suspects.push((
+                    inst_id,
+                    ctbl.name.clone(),
+                    ckey.clone(),
+                    fk.id,
+                ));
             }
+        }
+
+        match fk.on_delete {
+            FkAction::Restrict => unreachable!(),
+            FkAction::NoAction => {}
             FkAction::Cascade => {
                 let cindexes = slot_schema.indexes_for_table(&ctbl.name);
-                for (ckey, _) in matching_children {
-                    // Re-check child existence in case an earlier cascade already deleted it
-                    let Some(cpayload) = seek_table_raw_entry(ctx, db_id, &ctbl, &ckey)? else {
-                        continue;
-                    };
-                    let cur_cvals =
-                        decode_table_logical_row(ctx, db_id, &ctbl, &ckey, &cpayload, params)?;
-                    check_parent_delete_restrict(ctx, db_id, &ctbl, &cur_cvals, params)?;
-                    if delete_row_via_pipeline(
-                        ctx,
-                        db_id,
-                        &ctbl,
-                        &cindexes,
-                        &ckey,
-                        Some(&cur_cvals),
-                        MutationOrigin::FkCascadeDelete,
-                        ConflictAction::Abort,
-                        false,
-                        params,
-                    )? {
-                        ctx.runtime.total_changes += 1;
-                        apply_parent_delete_fk_actions(
+                run_in_fk_subprogram(ctx, |ctx| {
+                    let mut sub_changes: u64 = 0;
+                    for ckey in matching_children {
+                        let Some(cpayload) = seek_table_raw_entry(ctx, db_id, &ctbl, &ckey)? else {
+                            continue;
+                        };
+                        let cur_cvals =
+                            decode_table_logical_row(ctx, db_id, &ctbl, &ckey, &cpayload, params)?;
+                        let pscope = make_runtime_table_pseudo_scope(
+                            &ctbl,
+                            Some((ckey.rowid_or_zero(), &cur_cvals)),
+                            None,
+                        );
+                        if fire_row_triggers(
+                            ctx,
+                            db_id,
+                            &ctbl.name,
+                            TriggerTiming::Before,
+                            TriggerEventKind::Delete,
+                            None,
+                            pscope,
+                            None,
+                        )? == TriggerOutcome::Ignored
+                        {
+                            continue;
+                        }
+                        let Some(cpayload2) = seek_table_raw_entry(ctx, db_id, &ctbl, &ckey)?
+                        else {
+                            continue;
+                        };
+                        let cur_cvals2 =
+                            decode_table_logical_row(ctx, db_id, &ctbl, &ckey, &cpayload2, params)?;
+                        check_parent_delete_restrict(ctx, db_id, &ctbl, &cur_cvals2, params)?;
+                        if delete_row_via_pipeline(
                             ctx,
                             db_id,
                             &ctbl,
-                            &cur_cvals,
+                            &cindexes,
+                            &ckey,
+                            Some(&cur_cvals2),
+                            MutationOrigin::FkCascadeDelete,
+                            ConflictAction::Abort,
+                            false,
                             params,
-                            stmt_fk_suspects,
-                            fk_depth + 1,
-                        )?;
+                        )? {
+                            sub_changes += 1;
+                            apply_parent_delete_fk_actions(ctx, db_id, &ctbl, &cur_cvals2, params)?;
+                            let after_scope = make_runtime_table_pseudo_scope(
+                                &ctbl,
+                                Some((ckey.rowid_or_zero(), &cur_cvals2)),
+                                None,
+                            );
+                            let _ = fire_row_triggers(
+                                ctx,
+                                db_id,
+                                &ctbl.name,
+                                TriggerTiming::After,
+                                TriggerEventKind::Delete,
+                                None,
+                                after_scope,
+                                None,
+                            )?;
+                        }
                     }
-                }
+                    ctx.runtime.last_changes = sub_changes;
+                    ctx.runtime.total_changes += sub_changes;
+                    Ok(())
+                })?;
             }
             FkAction::SetNull => {
                 let cindexes = slot_schema.indexes_for_table(&ctbl.name);
-                for (ckey, _) in matching_children {
-                    let Some(cpayload) = seek_table_raw_entry(ctx, db_id, &ctbl, &ckey)? else {
-                        continue;
-                    };
-                    let mut new_cvals =
-                        decode_table_logical_row(ctx, db_id, &ctbl, &ckey, &cpayload, params)?;
-                    let new_crid_opt = match &ckey {
-                        TableRowKey::Rowid(r) => Some(*r),
-                        TableRowKey::WithoutRowidPk(_) => None,
-                    };
-                    for &fcol in &fk.from_cols {
-                        new_cvals[fcol] = Value::Null;
-                        if ctbl.rowid_alias_col == Some(fcol) {
-                            // INTEGER PRIMARY KEY column cannot hold NULL
-                            return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
-                        }
-                    }
-                    validate_and_write_row(
-                        ctx,
-                        db_id,
-                        &ctbl,
-                        &cindexes,
-                        new_crid_opt,
-                        new_cvals,
-                        Some(ConflictAction::Abort),
-                        Some(&ckey),
-                        params,
-                        false,
-                        false,
-                        stmt_fk_suspects,
-                        fk_depth + 1,
-                        Some((MutationOrigin::FkActionUpdate, None)),
-                        false,
-                    )?;
-                }
-            }
-            FkAction::SetDefault => {
-                let cindexes = slot_schema.indexes_for_table(&ctbl.name);
-                for (ckey, _) in matching_children {
-                    let Some(cpayload) = seek_table_raw_entry(ctx, db_id, &ctbl, &ckey)? else {
-                        continue;
-                    };
-                    let mut new_cvals =
-                        decode_table_logical_row(ctx, db_id, &ctbl, &ckey, &cpayload, params)?;
-                    let mut new_crid_opt = match &ckey {
-                        TableRowKey::Rowid(r) => Some(*r),
-                        TableRowKey::WithoutRowidPk(_) => None,
-                    };
-                    for &fcol in &fk.from_cols {
-                        let dval = match &ctbl.columns[fcol].default_expr {
-                            Some(de) => {
-                                eval_expr(ctx, de, params, &[], &CteStore::default(), None)?
-                            }
-                            None => Value::Null,
+                let (mod_mask, mod_names) = build_fk_modified_col_info(&ctbl, &fk.from_cols);
+                run_in_fk_subprogram(ctx, |ctx| {
+                    let mut sub_changes: u64 = 0;
+                    for ckey in matching_children {
+                        let Some(cpayload) = seek_table_raw_entry(ctx, db_id, &ctbl, &ckey)? else {
+                            continue;
                         };
-                        if ctbl.rowid_alias_col == Some(fcol) {
-                            if dval.is_null() {
+                        let old_cvals =
+                            decode_table_logical_row(ctx, db_id, &ctbl, &ckey, &cpayload, params)?;
+                        let mut new_cvals = old_cvals.clone();
+                        let new_crid_opt = match &ckey {
+                            TableRowKey::Rowid(r) => Some(*r),
+                            TableRowKey::WithoutRowidPk(_) => None,
+                        };
+                        for &fcol in &fk.from_cols {
+                            new_cvals[fcol] = Value::Null;
+                            if ctbl.rowid_alias_col == Some(fcol) {
                                 return Err(SqliteError::new(
                                     ErrorCode::Mismatch,
                                     "datatype mismatch",
                                 ));
                             }
-                            new_crid_opt = None;
                         }
-                        new_cvals[fcol] = dval;
+                        update_existing_table_row_with_triggers(
+                            ctx,
+                            db_id,
+                            &ctbl,
+                            &cindexes,
+                            &schema_name,
+                            &ckey,
+                            old_cvals,
+                            new_crid_opt,
+                            new_cvals,
+                            &mod_mask,
+                            &mod_names,
+                            Some(ConflictAction::Abort),
+                            Some((MutationOrigin::FkActionUpdate, None)),
+                            false,
+                            params,
+                            |_, _, _| {
+                                sub_changes += 1;
+                                Ok(())
+                            },
+                        )?;
                     }
-                    validate_and_write_row(
-                        ctx,
-                        db_id,
-                        &ctbl,
-                        &cindexes,
-                        new_crid_opt,
-                        new_cvals,
-                        Some(ConflictAction::Abort),
-                        Some(&ckey),
-                        params,
-                        false,
-                        false,
-                        stmt_fk_suspects,
-                        fk_depth + 1,
-                        Some((MutationOrigin::FkActionUpdate, None)),
-                        false,
-                    )?;
-                }
+                    ctx.runtime.last_changes = sub_changes;
+                    ctx.runtime.total_changes += sub_changes;
+                    Ok(())
+                })?;
+            }
+            FkAction::SetDefault => {
+                let cindexes = slot_schema.indexes_for_table(&ctbl.name);
+                let (mod_mask, mod_names) = build_fk_modified_col_info(&ctbl, &fk.from_cols);
+                run_in_fk_subprogram(ctx, |ctx| {
+                    let mut sub_changes: u64 = 0;
+                    for ckey in matching_children {
+                        let Some(cpayload) = seek_table_raw_entry(ctx, db_id, &ctbl, &ckey)? else {
+                            continue;
+                        };
+                        let old_cvals =
+                            decode_table_logical_row(ctx, db_id, &ctbl, &ckey, &cpayload, params)?;
+                        let mut new_cvals = old_cvals.clone();
+                        let mut new_crid_opt = match &ckey {
+                            TableRowKey::Rowid(r) => Some(*r),
+                            TableRowKey::WithoutRowidPk(_) => None,
+                        };
+                        for &fcol in &fk.from_cols {
+                            let dval = match &ctbl.columns[fcol].default_expr {
+                                Some(de) => {
+                                    eval_expr(ctx, de, params, &[], &CteStore::default(), None)?
+                                }
+                                None => Value::Null,
+                            };
+                            if ctbl.rowid_alias_col == Some(fcol) {
+                                if dval.is_null() {
+                                    return Err(SqliteError::new(
+                                        ErrorCode::Mismatch,
+                                        "datatype mismatch",
+                                    ));
+                                }
+                                new_crid_opt = None;
+                            }
+                            new_cvals[fcol] = dval;
+                        }
+                        update_existing_table_row_with_triggers(
+                            ctx,
+                            db_id,
+                            &ctbl,
+                            &cindexes,
+                            &schema_name,
+                            &ckey,
+                            old_cvals,
+                            new_crid_opt,
+                            new_cvals,
+                            &mod_mask,
+                            &mod_names,
+                            Some(ConflictAction::Abort),
+                            Some((MutationOrigin::FkActionUpdate, None)),
+                            false,
+                            params,
+                            |_, _, _| {
+                                sub_changes += 1;
+                                Ok(())
+                            },
+                        )?;
+                    }
+                    ctx.runtime.last_changes = sub_changes;
+                    ctx.runtime.total_changes += sub_changes;
+                    Ok(())
+                })?;
             }
         }
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[inline(never)]
 fn apply_parent_update_fk_actions(
     ctx: &mut ExecContext<'_>,
     db_id: DatabaseId,
@@ -10800,15 +11833,7 @@ fn apply_parent_update_fk_actions(
     old_parent_vals: &[Value],
     new_parent_vals: &[Value],
     params: &[Value],
-    stmt_fk_suspects: &mut Vec<(SchemaInstanceId, String, TableRowKey, usize)>,
-    fk_depth: usize,
 ) -> Result<()> {
-    if fk_depth > MAX_FK_CASCADE_DEPTH {
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            "too many levels of trigger recursion",
-        ));
-    }
     let Some((inst_id, schema_name, slot_schema, refs)) = ctx.db_set.slot(db_id).map(|s| {
         (
             s.schema_instance_id,
@@ -10858,147 +11883,195 @@ fn apply_parent_update_fk_actions(
             continue;
         }
 
-        match fk.on_update {
-            FkAction::Restrict => return Err(fk_constraint_err()),
-            FkAction::NoAction => {
-                for ckey in matching_children {
-                    if fk.deferred {
-                        ctx.deferred_fk_suspects
-                            .push((inst_id, ctbl.name.clone(), ckey, fk.id));
-                    } else {
-                        stmt_fk_suspects.push((inst_id, ctbl.name.clone(), ckey, fk.id));
-                    }
-                }
+        if fk.on_update == FkAction::Restrict {
+            return Err(fk_constraint_err());
+        }
+
+        for ckey in &matching_children {
+            if fk.deferred {
+                ctx.deferred_fk_suspects
+                    .push((inst_id, ctbl.name.clone(), ckey.clone(), fk.id));
+            } else {
+                ctx.stmt_tx.stmt_fk_suspects.push((
+                    inst_id,
+                    ctbl.name.clone(),
+                    ckey.clone(),
+                    fk.id,
+                ));
             }
+        }
+
+        match fk.on_update {
+            FkAction::Restrict => unreachable!(),
+            FkAction::NoAction => {}
             FkAction::Cascade => {
                 let cindexes = slot_schema.indexes_for_table(&ctbl.name);
-                for ckey in matching_children {
-                    let Some(cpayload) = seek_table_raw_entry(ctx, db_id, &ctbl, &ckey)? else {
-                        continue;
-                    };
-                    let mut new_cvals =
-                        decode_table_logical_row(ctx, db_id, &ctbl, &ckey, &cpayload, params)?;
-                    let mut new_crid_opt = match &ckey {
-                        TableRowKey::Rowid(r) => Some(*r),
-                        TableRowKey::WithoutRowidPk(_) => None,
-                    };
-                    for (&fcol, &pcol) in fk.from_cols.iter().zip(parent_col_idxs.iter()) {
-                        let nv = new_parent_vals[pcol].clone();
-                        if ctbl.rowid_alias_col == Some(fcol) {
-                            if nv.is_null() {
-                                return Err(SqliteError::new(
-                                    ErrorCode::Mismatch,
-                                    "datatype mismatch",
-                                ));
+                let (mod_mask, mod_names) = build_fk_modified_col_info(&ctbl, &fk.from_cols);
+                run_in_fk_subprogram(ctx, |ctx| {
+                    let mut sub_changes: u64 = 0;
+                    for ckey in matching_children {
+                        let Some(cpayload) = seek_table_raw_entry(ctx, db_id, &ctbl, &ckey)? else {
+                            continue;
+                        };
+                        let old_cvals =
+                            decode_table_logical_row(ctx, db_id, &ctbl, &ckey, &cpayload, params)?;
+                        let mut new_cvals = old_cvals.clone();
+                        let mut new_crid_opt = match &ckey {
+                            TableRowKey::Rowid(r) => Some(*r),
+                            TableRowKey::WithoutRowidPk(_) => None,
+                        };
+                        for (&fcol, &pcol) in fk.from_cols.iter().zip(parent_col_idxs.iter()) {
+                            let nv = new_parent_vals[pcol].clone();
+                            if ctbl.rowid_alias_col == Some(fcol) {
+                                if nv.is_null() {
+                                    return Err(SqliteError::new(
+                                        ErrorCode::Mismatch,
+                                        "datatype mismatch",
+                                    ));
+                                }
+                                new_crid_opt = None;
                             }
-                            new_crid_opt = None;
+                            new_cvals[fcol] = nv;
                         }
-                        new_cvals[fcol] = nv;
+                        update_existing_table_row_with_triggers(
+                            ctx,
+                            db_id,
+                            &ctbl,
+                            &cindexes,
+                            &schema_name,
+                            &ckey,
+                            old_cvals,
+                            new_crid_opt,
+                            new_cvals,
+                            &mod_mask,
+                            &mod_names,
+                            Some(ConflictAction::Abort),
+                            Some((MutationOrigin::FkActionUpdate, None)),
+                            false,
+                            params,
+                            |_, _, _| {
+                                sub_changes += 1;
+                                Ok(())
+                            },
+                        )?;
                     }
-                    validate_and_write_row(
-                        ctx,
-                        db_id,
-                        &ctbl,
-                        &cindexes,
-                        new_crid_opt,
-                        new_cvals,
-                        Some(ConflictAction::Abort),
-                        Some(&ckey),
-                        params,
-                        false,
-                        false,
-                        stmt_fk_suspects,
-                        fk_depth + 1,
-                        Some((MutationOrigin::FkActionUpdate, None)),
-                        false,
-                    )?;
-                }
+                    ctx.runtime.last_changes = sub_changes;
+                    ctx.runtime.total_changes += sub_changes;
+                    Ok(())
+                })?;
             }
             FkAction::SetNull => {
                 let cindexes = slot_schema.indexes_for_table(&ctbl.name);
-                for ckey in matching_children {
-                    let Some(cpayload) = seek_table_raw_entry(ctx, db_id, &ctbl, &ckey)? else {
-                        continue;
-                    };
-                    let mut new_cvals =
-                        decode_table_logical_row(ctx, db_id, &ctbl, &ckey, &cpayload, params)?;
-                    let new_crid_opt = match &ckey {
-                        TableRowKey::Rowid(r) => Some(*r),
-                        TableRowKey::WithoutRowidPk(_) => None,
-                    };
-                    for &fcol in &fk.from_cols {
-                        if ctbl.rowid_alias_col == Some(fcol) {
-                            return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
-                        }
-                        new_cvals[fcol] = Value::Null;
-                    }
-                    validate_and_write_row(
-                        ctx,
-                        db_id,
-                        &ctbl,
-                        &cindexes,
-                        new_crid_opt,
-                        new_cvals,
-                        Some(ConflictAction::Abort),
-                        Some(&ckey),
-                        params,
-                        false,
-                        false,
-                        stmt_fk_suspects,
-                        fk_depth + 1,
-                        Some((MutationOrigin::FkActionUpdate, None)),
-                        false,
-                    )?;
-                }
-            }
-            FkAction::SetDefault => {
-                let cindexes = slot_schema.indexes_for_table(&ctbl.name);
-                for ckey in matching_children {
-                    let Some(cpayload) = seek_table_raw_entry(ctx, db_id, &ctbl, &ckey)? else {
-                        continue;
-                    };
-                    let mut new_cvals =
-                        decode_table_logical_row(ctx, db_id, &ctbl, &ckey, &cpayload, params)?;
-                    let mut new_crid_opt = match &ckey {
-                        TableRowKey::Rowid(r) => Some(*r),
-                        TableRowKey::WithoutRowidPk(_) => None,
-                    };
-                    for &fcol in &fk.from_cols {
-                        let dval = match &ctbl.columns[fcol].default_expr {
-                            Some(de) => {
-                                eval_expr(ctx, de, params, &[], &CteStore::default(), None)?
-                            }
-                            None => Value::Null,
+                let (mod_mask, mod_names) = build_fk_modified_col_info(&ctbl, &fk.from_cols);
+                run_in_fk_subprogram(ctx, |ctx| {
+                    let mut sub_changes: u64 = 0;
+                    for ckey in matching_children {
+                        let Some(cpayload) = seek_table_raw_entry(ctx, db_id, &ctbl, &ckey)? else {
+                            continue;
                         };
-                        if ctbl.rowid_alias_col == Some(fcol) {
-                            if dval.is_null() {
+                        let old_cvals =
+                            decode_table_logical_row(ctx, db_id, &ctbl, &ckey, &cpayload, params)?;
+                        let mut new_cvals = old_cvals.clone();
+                        let new_crid_opt = match &ckey {
+                            TableRowKey::Rowid(r) => Some(*r),
+                            TableRowKey::WithoutRowidPk(_) => None,
+                        };
+                        for &fcol in &fk.from_cols {
+                            if ctbl.rowid_alias_col == Some(fcol) {
                                 return Err(SqliteError::new(
                                     ErrorCode::Mismatch,
                                     "datatype mismatch",
                                 ));
                             }
-                            new_crid_opt = None;
+                            new_cvals[fcol] = Value::Null;
                         }
-                        new_cvals[fcol] = dval;
+                        update_existing_table_row_with_triggers(
+                            ctx,
+                            db_id,
+                            &ctbl,
+                            &cindexes,
+                            &schema_name,
+                            &ckey,
+                            old_cvals,
+                            new_crid_opt,
+                            new_cvals,
+                            &mod_mask,
+                            &mod_names,
+                            Some(ConflictAction::Abort),
+                            Some((MutationOrigin::FkActionUpdate, None)),
+                            false,
+                            params,
+                            |_, _, _| {
+                                sub_changes += 1;
+                                Ok(())
+                            },
+                        )?;
                     }
-                    validate_and_write_row(
-                        ctx,
-                        db_id,
-                        &ctbl,
-                        &cindexes,
-                        new_crid_opt,
-                        new_cvals,
-                        Some(ConflictAction::Abort),
-                        Some(&ckey),
-                        params,
-                        false,
-                        false,
-                        stmt_fk_suspects,
-                        fk_depth + 1,
-                        Some((MutationOrigin::FkActionUpdate, None)),
-                        false,
-                    )?;
-                }
+                    ctx.runtime.last_changes = sub_changes;
+                    ctx.runtime.total_changes += sub_changes;
+                    Ok(())
+                })?;
+            }
+            FkAction::SetDefault => {
+                let cindexes = slot_schema.indexes_for_table(&ctbl.name);
+                let (mod_mask, mod_names) = build_fk_modified_col_info(&ctbl, &fk.from_cols);
+                run_in_fk_subprogram(ctx, |ctx| {
+                    let mut sub_changes: u64 = 0;
+                    for ckey in matching_children {
+                        let Some(cpayload) = seek_table_raw_entry(ctx, db_id, &ctbl, &ckey)? else {
+                            continue;
+                        };
+                        let old_cvals =
+                            decode_table_logical_row(ctx, db_id, &ctbl, &ckey, &cpayload, params)?;
+                        let mut new_cvals = old_cvals.clone();
+                        let mut new_crid_opt = match &ckey {
+                            TableRowKey::Rowid(r) => Some(*r),
+                            TableRowKey::WithoutRowidPk(_) => None,
+                        };
+                        for &fcol in &fk.from_cols {
+                            let dval = match &ctbl.columns[fcol].default_expr {
+                                Some(de) => {
+                                    eval_expr(ctx, de, params, &[], &CteStore::default(), None)?
+                                }
+                                None => Value::Null,
+                            };
+                            if ctbl.rowid_alias_col == Some(fcol) {
+                                if dval.is_null() {
+                                    return Err(SqliteError::new(
+                                        ErrorCode::Mismatch,
+                                        "datatype mismatch",
+                                    ));
+                                }
+                                new_crid_opt = None;
+                            }
+                            new_cvals[fcol] = dval;
+                        }
+                        update_existing_table_row_with_triggers(
+                            ctx,
+                            db_id,
+                            &ctbl,
+                            &cindexes,
+                            &schema_name,
+                            &ckey,
+                            old_cvals,
+                            new_crid_opt,
+                            new_cvals,
+                            &mod_mask,
+                            &mod_names,
+                            Some(ConflictAction::Abort),
+                            Some((MutationOrigin::FkActionUpdate, None)),
+                            false,
+                            params,
+                            |_, _, _| {
+                                sub_changes += 1;
+                                Ok(())
+                            },
+                        )?;
+                    }
+                    ctx.runtime.last_changes = sub_changes;
+                    ctx.runtime.total_changes += sub_changes;
+                    Ok(())
+                })?;
             }
         }
     }
@@ -11009,31 +12082,29 @@ fn apply_parent_update_fk_actions(
 // DML Executors: `INSERT`, `UPDATE`, `DELETE`
 // ============================================================================
 
-fn maybe_count_changes_output(ctx: &ExecContext<'_>, out: QueryOutput) -> QueryOutput {
-    if *ctx.count_changes && out.column_names.is_empty() {
-        QueryOutput {
-            column_names: vec!["count".to_owned()],
-            rows: vec![vec![Value::Integer(ctx.runtime.last_changes as i64)]],
-        }
-    } else {
-        out
-    }
+#[derive(Clone)]
+enum DmlTarget {
+    Table {
+        db_id: DatabaseId,
+        tbl: Box<TableSchema>,
+        schema_name: String,
+        is_catalog: bool,
+    },
+    View {
+        db_id: DatabaseId,
+        view: Box<ViewSchema>,
+        schema_name: String,
+    },
 }
 
-fn resolve_dml_target_table_in_set(
-    db_set: &DatabaseSet,
-    qn: &QualifiedName,
-    writable_schema: bool,
-) -> Result<(DatabaseId, TableSchema, String, bool)> {
-    resolve_dml_target_table_in_set_opts(db_set, qn, writable_schema, false)
-}
-
-fn resolve_dml_target_table_in_set_opts(
+fn resolve_dml_target_in_set(
     db_set: &DatabaseSet,
     qn: &QualifiedName,
     writable_schema: bool,
     is_upsert: bool,
-) -> Result<(DatabaseId, TableSchema, String, bool)> {
+    event_kind: TriggerEventKind,
+    modified_cols: Option<&[&str]>,
+) -> Result<DmlTarget> {
     if let Some(cat_db_id) = db_set.resolve_catalog_table(qn)? {
         if !writable_schema {
             return Err(SqliteError::new(
@@ -11047,21 +12118,47 @@ fn resolve_dml_target_table_in_set_opts(
             .slot(cat_db_id)
             .map(|s| s.name.clone())
             .unwrap_or_else(|| "main".to_owned());
-        return Ok((cat_db_id, tbl, sname, true));
+        return Ok(DmlTarget::Table {
+            db_id: cat_db_id,
+            tbl: Box::new(tbl),
+            schema_name: sname,
+            is_catalog: true,
+        });
     }
 
     if let Some((db_id, rel)) = db_set.find_relation_in_set(qn)? {
+        let sname = db_set
+            .slot(db_id)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "main".to_owned());
         match rel {
             ResolvedRelation::Table(tbl) => {
-                let sname = db_set
-                    .slot(db_id)
-                    .map(|s| s.name.clone())
-                    .unwrap_or_else(|| "main".to_owned());
-                return Ok((db_id, *tbl, sname, false));
+                return Ok(DmlTarget::Table {
+                    db_id,
+                    tbl,
+                    schema_name: sname,
+                    is_catalog: false,
+                });
             }
             ResolvedRelation::View(v) => {
                 if is_upsert {
                     return Err(SqliteError::new(ErrorCode::Error, "cannot UPSERT a view"));
+                }
+                if !db_set
+                    .matching_triggers(
+                        db_id,
+                        &v.name,
+                        TriggerTiming::InsteadOf,
+                        event_kind,
+                        modified_cols,
+                    )
+                    .is_empty()
+                {
+                    return Ok(DmlTarget::View {
+                        db_id,
+                        view: v,
+                        schema_name: sname,
+                    });
                 }
                 return Err(SqliteError::new(
                     ErrorCode::Error,
@@ -11688,32 +12785,24 @@ fn apply_resolved_set_assignments_with_agg(
         TableRowKey::Rowid(r) => Some(*r),
         TableRowKey::WithoutRowidPk(_) => None,
     };
+    let mut explicit_rowid_val: Option<Value> = None;
 
-    let mut apply_one = |target_idx: usize, v: Value| -> Result<()> {
+    let mut apply_one = |target_idx: usize, v: Value| {
         if target_idx == usize::MAX {
-            if v.is_null() {
-                new_rowid_opt = None;
-            } else {
-                let c = TypeAffinity::Integer.apply(v);
-                let rid = c
-                    .as_i64()
-                    .ok_or_else(|| SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"))?;
-                new_rowid_opt = Some(rid);
-            }
+            explicit_rowid_val = Some(v);
         } else {
-            new_vals[target_idx] = v;
             if tbl.rowid_alias_col == Some(target_idx) {
-                new_rowid_opt = None;
+                explicit_rowid_val = Some(v.clone());
             }
+            new_vals[target_idx] = v;
         }
-        Ok(())
     };
 
     let eval_agg: Option<(&[EvalRow], &[EvalRow])> = agg_group.map(|g| (g, &[][..]));
     for (col_idxs, is_row_value, val_expr) in resolved_assigns {
         if !*is_row_value {
             let v = eval_expr(ctx, val_expr, params, eval_scopes, dml_ctes, eval_agg)?;
-            apply_one(col_idxs[0], v)?;
+            apply_one(col_idxs[0], v);
         } else {
             let n = col_idxs.len();
             let mut inner = *val_expr;
@@ -11766,8 +12855,22 @@ fn apply_resolved_set_assignments_with_agg(
                 }
             };
             for (&target_idx, v) in col_idxs.iter().zip(rhs_vals) {
-                apply_one(target_idx, v)?;
+                apply_one(target_idx, v);
             }
+        }
+    }
+
+    if let Some(rv) = explicit_rowid_val {
+        if rv.is_null() {
+            return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
+        }
+        let coerced = TypeAffinity::Integer.apply(rv);
+        let rid = coerced
+            .as_i64()
+            .ok_or_else(|| SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"))?;
+        new_rowid_opt = Some(rid);
+        if let Some(ipk) = tbl.rowid_alias_col {
+            new_vals[ipk] = Value::Integer(rid);
         }
     }
 
@@ -12008,6 +13111,7 @@ fn analyze_upsert_clauses(
 fn build_upsert_check_steps(
     tbl: &TableSchema,
     ins_or_conflict: Option<ConflictAction>,
+    has_other_indexes: bool,
     ordered_uniques: &[IndexSchema],
     analyzed: &[ResolvedUpsertTarget],
 ) -> Vec<UpsertCheckStep> {
@@ -12057,7 +13161,11 @@ fn build_upsert_check_steps(
     }
 
     let ipk_eff = ins_or_conflict.unwrap_or(tbl.rowid_pk_conflict);
-    if !rowid_handled && (catch_all_idx.is_some() || ipk_eff != ConflictAction::Replace) {
+    let defer_ipk_replace = !tbl.without_rowid
+        && ipk_eff == ConflictAction::Replace
+        && ins_or_conflict != Some(ConflictAction::Replace)
+        && has_other_indexes;
+    if !rowid_handled && (catch_all_idx.is_some() || !defer_ipk_replace) {
         rowid_handled = true;
         steps.push(UpsertCheckStep::RowidPk {
             clause_idx: catch_all_idx,
@@ -12120,37 +13228,7 @@ fn prepare_proposed_insert_row(
         final_rowid.unwrap()
     };
 
-    for (i, col) in tbl.columns.iter().enumerate() {
-        if col.generated.is_some() {
-            continue;
-        }
-        if tbl.rowid_alias_col == Some(i) {
-            raw_vals[i] = Value::Integer(rowid);
-        } else {
-            raw_vals[i] = col.affinity.apply(raw_vals[i].clone());
-            if tbl.strict
-                && col.type_name.trim().eq_ignore_ascii_case("REAL")
-                && let Value::Integer(iv) = raw_vals[i]
-            {
-                raw_vals[i] = Value::real(iv as f64);
-            }
-        }
-    }
-
-    for i in 0..tbl.columns.len() {
-        if let Some((ref gexpr, _)) = tbl.columns[i].generated {
-            let scope = make_single_table_scope(tbl, schema_name, None, rowid, &raw_vals);
-            let gv = eval_expr(ctx, gexpr, params, &[scope], &CteStore::default(), None)?;
-            let mut coerced = tbl.columns[i].affinity.apply(gv);
-            if tbl.strict
-                && tbl.columns[i].type_name.trim().eq_ignore_ascii_case("REAL")
-                && let Value::Integer(iv) = coerced
-            {
-                coerced = Value::real(iv as f64);
-            }
-            raw_vals[i] = coerced;
-        }
-    }
+    apply_table_affinities_and_generated(ctx, tbl, schema_name, rowid, &mut raw_vals, params)?;
 
     if tbl.strict {
         let eff = stmt_conflict.unwrap_or(ConflictAction::Abort);
@@ -12357,6 +13435,18 @@ fn check_insert_xfer_eligible(
         || !ins.returning.is_empty()
         || count_changes
         || (foreign_keys && !dest_tbl.foreign_keys.is_empty())
+        || db_set.has_active_triggers_for_event(
+            dest_db_id,
+            &dest_tbl.name,
+            TriggerEventKind::Insert,
+            None,
+        )
+        || db_set.has_active_triggers_for_event(
+            dest_db_id,
+            &dest_tbl.name,
+            TriggerEventKind::Delete,
+            None,
+        )
     {
         return None;
     }
@@ -12479,192 +13569,1581 @@ fn check_insert_xfer_eligible(
     Some((src_db_id, src_tbl.clone()))
 }
 
+fn finalize_dml_step_result(
+    ctx: &mut ExecContext<'_>,
+    step_res: Result<QueryOutput>,
+    stmt_changes: u64,
+    count_changes_rows: u64,
+    is_top_level: bool,
+) -> Result<QueryOutput> {
+    if !is_top_level {
+        match step_res {
+            Ok(out) => {
+                ctx.runtime.last_changes = stmt_changes;
+                ctx.runtime.total_changes += stmt_changes;
+                ctx.publish();
+                Ok(out)
+            }
+            Err(err) if is_raise_ignore_signal(&err) => {
+                ctx.runtime.last_changes = stmt_changes;
+                ctx.runtime.total_changes += stmt_changes;
+                ctx.publish();
+                Err(err)
+            }
+            Err(err) => Err(err),
+        }
+    } else {
+        let suspects = std::mem::take(&mut ctx.stmt_tx.stmt_fk_suspects);
+        match step_res {
+            Ok(mut out) => {
+                if *ctx.foreign_keys && !suspects.is_empty() {
+                    verify_fk_suspects(ctx, &suspects)?;
+                }
+                ctx.runtime.last_changes = stmt_changes;
+                ctx.runtime.total_changes += stmt_changes;
+                ctx.publish();
+                if *ctx.count_changes && out.column_names.is_empty() {
+                    out = QueryOutput {
+                        column_names: vec!["count".to_owned()],
+                        rows: vec![vec![Value::Integer(count_changes_rows as i64)]],
+                    };
+                }
+                Ok(out)
+            }
+            Err(err) => {
+                if err.conflict_effect == ConflictResolutionEffect::Fail
+                    && err.code == ErrorCode::Constraint
+                {
+                    if *ctx.foreign_keys && !suspects.is_empty() {
+                        verify_fk_suspects(ctx, &suspects)?;
+                    }
+                    ctx.runtime.last_changes = stmt_changes;
+                    ctx.runtime.total_changes += stmt_changes;
+                    ctx.publish();
+                }
+                Err(err)
+            }
+        }
+    }
+}
+
+fn collect_set_assignment_col_names(assigns: &[SetAssignment]) -> Vec<&str> {
+    let mut out = Vec::new();
+    for sa in assigns {
+        for cn in &sa.columns {
+            out.push(cn.as_str());
+        }
+    }
+    out
+}
+
+fn build_table_modified_col_mask(
+    tbl: &TableSchema,
+    resolved_assigns: &[(Vec<usize>, bool, &Expr)],
+) -> Vec<bool> {
+    let mut mask = vec![false; tbl.columns.len()];
+    for (col_idxs, _, _) in resolved_assigns {
+        for &ci in col_idxs {
+            if ci < mask.len() {
+                mask[ci] = true;
+            }
+        }
+    }
+    mask
+}
+
+fn resolve_view_col_specs_static(
+    db_id: DatabaseId,
+    view: &ViewSchema,
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    functions: &FunctionRegistry,
+    visited: &mut Vec<(usize, usize)>,
+) -> Result<Vec<(String, Collation, Option<TypeAffinity>)>> {
+    let (v_names, v_meta, _) =
+        resolve_view_columns_static(db_id, view, db_set, ctes, functions, visited)?;
+    Ok(v_names
+        .into_iter()
+        .enumerate()
+        .map(|(i, cn)| {
+            let (aff, coll) = v_meta.get(i).copied().unwrap_or((None, Collation::Binary));
+            (cn, coll, aff)
+        })
+        .collect())
+}
+
+fn make_single_view_scope(
+    view_name: &str,
+    schema_name: &str,
+    alias: Option<&str>,
+    col_specs: &[(String, Collation, Option<TypeAffinity>)],
+    vals: &[Value],
+) -> EvalRow {
+    let eff_alias = alias.unwrap_or(view_name);
+    let mut cols = Vec::with_capacity(col_specs.len());
+    let mut rvals = Vec::with_capacity(col_specs.len());
+    for (i, (cname, coll, aff)) in col_specs.iter().enumerate() {
+        cols.push(ScopedColumn {
+            schema_name: Some(schema_name.to_owned()),
+            table_alias: Some(eff_alias.to_owned()),
+            name: cname.clone(),
+            collation: *coll,
+            affinity: *aff,
+            hidden_rowid: false,
+            omit_from_star: false,
+            merged_using: false,
+        });
+        rvals.push(vals.get(i).cloned().unwrap_or(Value::Null));
+    }
+    EvalRow::new(cols.into(), rvals)
+}
+
+fn resolve_set_assignments_for_view<'a>(
+    col_specs: &[(String, Collation, Option<TypeAffinity>)],
+    assigns: &'a [SetAssignment],
+) -> Result<Vec<(Vec<usize>, bool, &'a Expr)>> {
+    let mut resolved = Vec::with_capacity(assigns.len());
+    for sa in assigns {
+        let mut col_idxs = Vec::with_capacity(sa.columns.len());
+        for cname in &sa.columns {
+            if let Some(ci) = col_specs
+                .iter()
+                .position(|(n, _, _)| n.eq_ignore_ascii_case(cname))
+            {
+                col_idxs.push(ci);
+            } else {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such column: {cname}"),
+                ));
+            }
+        }
+        resolved.push((col_idxs, sa.row_value, &sa.expr));
+    }
+    Ok(resolved)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_resolved_set_assignments_for_view(
+    ctx: &mut ExecContext<'_>,
+    old_vals: &[Value],
+    resolved_assigns: &[(Vec<usize>, bool, &Expr)],
+    eval_scopes: &[EvalRow],
+    agg_group: Option<&[EvalRow]>,
+    dml_ctes: &CteStore,
+    params: &[Value],
+) -> Result<Vec<Value>> {
+    let mut new_vals = old_vals.to_vec();
+    let eval_agg: Option<(&[EvalRow], &[EvalRow])> = agg_group.map(|g| (g, &[][..]));
+    for (col_idxs, is_row_value, val_expr) in resolved_assigns {
+        if !*is_row_value {
+            let v = eval_expr(ctx, val_expr, params, eval_scopes, dml_ctes, eval_agg)?;
+            new_vals[col_idxs[0]] = v;
+        } else {
+            let n = col_idxs.len();
+            let mut inner = *val_expr;
+            while let Expr::Collate { expr: sub, .. } = inner {
+                inner = sub;
+            }
+            let rhs_vals = match inner {
+                Expr::RowValue(elems) => {
+                    if elems.len() != n {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("{n} columns assigned {} values", elems.len()),
+                        ));
+                    }
+                    let mut out = Vec::with_capacity(n);
+                    for el in elems {
+                        out.push(eval_expr(ctx, el, params, eval_scopes, dml_ctes, eval_agg)?);
+                    }
+                    out
+                }
+                Expr::Subquery(sub) => {
+                    let sub_out = exec_select(ctx, sub, params, eval_scopes, dml_ctes)?;
+                    if sub_out.column_names.len() != n {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("{n} columns assigned {} values", sub_out.column_names.len()),
+                        ));
+                    }
+                    sub_out
+                        .rows
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| vec![Value::Null; n])
+                }
+                other => {
+                    if n != 1 {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("{n} columns assigned 1 values"),
+                        ));
+                    }
+                    vec![eval_expr(
+                        ctx,
+                        other,
+                        params,
+                        eval_scopes,
+                        dml_ctes,
+                        eval_agg,
+                    )?]
+                }
+            };
+            for (&target_idx, v) in col_idxs.iter().zip(rhs_vals) {
+                new_vals[target_idx] = v;
+            }
+        }
+    }
+    Ok(new_vals)
+}
+
+enum PreparedInsertSource<'a> {
+    Materialized(Vec<Vec<Value>>),
+    StreamingValues(&'a [Vec<Expr>]),
+}
+
+struct PreparedTableInsert<'a> {
+    db_id: DatabaseId,
+    tbl: TableSchema,
+    indexes: Vec<IndexSchema>,
+    schema_name: String,
+    enc: TextEncoding,
+    is_catalog: bool,
+    dml_ctes: CteStore,
+    col_targets: Option<Vec<usize>>,
+    implicit_non_gen_cols: Vec<usize>,
+    source: PreparedInsertSource<'a>,
+    xfer_preserve_rowids: Option<Vec<i64>>,
+    ordered_uniques: Vec<IndexSchema>,
+    upsert_steps: Vec<UpsertCheckStep>,
+    resolved_do_updates: Vec<Vec<(Vec<usize>, bool, &'a Expr)>>,
+    ret_col_names: Vec<String>,
+    ret_expanded: Vec<(Expr, String, Option<String>)>,
+}
+
+struct PreparedViewInsert<'a> {
+    db_id: DatabaseId,
+    view: ViewSchema,
+    dml_ctes: CteStore,
+    col_specs: Vec<(String, Collation, Option<TypeAffinity>)>,
+    col_targets: Option<Vec<usize>>,
+    source: PreparedInsertSource<'a>,
+    ret_col_names: Vec<String>,
+    ret_expanded: Vec<(Expr, String, Option<String>)>,
+}
+
+enum PreparedInsert<'a> {
+    Table(Box<PreparedTableInsert<'a>>),
+    View(Box<PreparedViewInsert<'a>>),
+}
+
+#[inline(never)]
+fn prepare_insert_exec<'a>(
+    ctx: &mut ExecContext<'_>,
+    ins: &'a InsertStmt,
+    effective_or_conflict: Option<ConflictAction>,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+) -> Result<PreparedInsert<'a>> {
+    let target = resolve_dml_target_in_set(
+        ctx.db_set,
+        &ins.table,
+        *ctx.writable_schema,
+        !ins.upsert_clauses.is_empty(),
+        TriggerEventKind::Insert,
+        None,
+    )?;
+    let dml_ctes = CteStore::default().with_scope_at(&ins.ctes, outer_scopes.len());
+
+    match target {
+        DmlTarget::View { db_id, view, .. } => {
+            let col_specs = resolve_view_col_specs_static(
+                db_id,
+                &view,
+                ctx.db_set,
+                &dml_ctes,
+                ctx.functions,
+                &mut Vec::new(),
+            )?;
+            let col_targets = if let Some(ref cnames) = ins.columns {
+                let mut idxs = Vec::with_capacity(cnames.len());
+                for cn in cnames {
+                    if let Some(ci) = col_specs
+                        .iter()
+                        .position(|(n, _, _)| n.eq_ignore_ascii_case(cn))
+                    {
+                        idxs.push(ci);
+                    } else {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("table {} has no column named {cn}", view.name),
+                        ));
+                    }
+                }
+                Some(idxs)
+            } else {
+                None
+            };
+            let source = match &ins.source {
+                InsertSource::DefaultValues => PreparedInsertSource::Materialized(vec![Vec::new()]),
+                InsertSource::Values(expr_rows) => {
+                    let should_materialize = expr_rows.len() > 1
+                        && expr_rows
+                            .iter()
+                            .any(|r| r.iter().any(expr_contains_subquery))
+                        && !expr_rows.iter().any(|r| r.iter().any(expr_contains_raise));
+                    if should_materialize {
+                        let mut out = Vec::with_capacity(expr_rows.len());
+                        for erow in expr_rows {
+                            let mut vrow = Vec::with_capacity(erow.len());
+                            for e in erow {
+                                vrow.push(eval_expr(
+                                    ctx,
+                                    e,
+                                    params,
+                                    outer_scopes,
+                                    &dml_ctes,
+                                    None,
+                                )?);
+                            }
+                            out.push(vrow);
+                        }
+                        PreparedInsertSource::Materialized(out)
+                    } else {
+                        PreparedInsertSource::StreamingValues(expr_rows)
+                    }
+                }
+                InsertSource::Select(sel) => {
+                    let rows = exec_select(ctx, sel, params, outer_scopes, &dml_ctes)?.rows;
+                    PreparedInsertSource::Materialized(rows)
+                }
+            };
+            let sample_scope = make_returning_view_scope(
+                &view.name,
+                &col_specs,
+                &vec![Value::Null; col_specs.len()],
+            );
+            let (ret_col_names, ret_expanded) = if ins.returning.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                expand_returning_projection(&ins.returning, &sample_scope.cols)?
+            };
+            Ok(PreparedInsert::View(Box::new(PreparedViewInsert {
+                db_id,
+                view: *view,
+                dml_ctes,
+                col_specs,
+                col_targets,
+                source,
+                ret_col_names,
+                ret_expanded,
+            })))
+        }
+        DmlTarget::Table {
+            db_id,
+            tbl: initial_tbl,
+            schema_name: initial_sname,
+            is_catalog,
+        } => {
+            let col_targets: Option<Vec<usize>> = if let Some(ref cnames) = ins.columns {
+                let mut idxs = Vec::with_capacity(cnames.len());
+                for cn in cnames {
+                    if let Some((ci, col)) = initial_tbl.find_column(cn) {
+                        if col.generated.is_some() {
+                            return Err(SqliteError::new(
+                                ErrorCode::Error,
+                                format!("cannot INSERT into generated column \"{}\"", col.name),
+                            ));
+                        }
+                        idxs.push(ci);
+                    } else if initial_tbl.is_implicit_rowid_name(cn) {
+                        idxs.push(usize::MAX);
+                    } else {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("table {} has no column named {cn}", initial_tbl.name),
+                        ));
+                    }
+                }
+                Some(idxs)
+            } else {
+                None
+            };
+
+            if !ins.upsert_clauses.is_empty() && outer_scopes.is_empty() {
+                let init_indexes = if is_catalog {
+                    Vec::new()
+                } else {
+                    ctx.db_set
+                        .slot(db_id)
+                        .map(|s| s.schema.indexes_for_table(&initial_tbl.name))
+                        .unwrap_or_default()
+                };
+                let init_ordered = ordered_unique_indexes(&initial_tbl, &init_indexes);
+                let _ = analyze_upsert_clauses(
+                    ins,
+                    &initial_tbl,
+                    &initial_sname,
+                    &init_ordered,
+                    ctx.db_set,
+                    &dml_ctes,
+                    ctx.functions,
+                    ctx.collations,
+                    &mut Vec::new(),
+                )?;
+            }
+
+            let xfer_src = if outer_scopes.is_empty() {
+                check_insert_xfer_eligible(
+                    ins,
+                    db_id,
+                    &initial_tbl,
+                    is_catalog,
+                    ctx.db_set,
+                    *ctx.foreign_keys,
+                    *ctx.count_changes,
+                )
+            } else {
+                None
+            };
+            let mut xfer_preserve_rowids: Option<Vec<i64>> = None;
+            let source = match &ins.source {
+                InsertSource::DefaultValues => PreparedInsertSource::Materialized(vec![Vec::new()]),
+                InsertSource::Values(expr_rows) => {
+                    let should_materialize = expr_rows.len() > 1
+                        && expr_rows
+                            .iter()
+                            .any(|r| r.iter().any(expr_contains_subquery))
+                        && !expr_rows.iter().any(|r| r.iter().any(expr_contains_raise));
+                    if should_materialize {
+                        let mut out = Vec::with_capacity(expr_rows.len());
+                        for erow in expr_rows {
+                            let mut vrow = Vec::with_capacity(erow.len());
+                            for e in erow {
+                                vrow.push(eval_expr(
+                                    ctx,
+                                    e,
+                                    params,
+                                    outer_scopes,
+                                    &dml_ctes,
+                                    None,
+                                )?);
+                            }
+                            out.push(vrow);
+                        }
+                        PreparedInsertSource::Materialized(out)
+                    } else {
+                        PreparedInsertSource::StreamingValues(expr_rows)
+                    }
+                }
+                InsertSource::Select(sel) => {
+                    let mut rows = exec_select(ctx, sel, params, outer_scopes, &dml_ctes)?.rows;
+                    if let Some((src_db_id, ref src_tbl)) = xfer_src {
+                        ctx.db_set.record_xferopt();
+                        if initial_tbl.columns.iter().any(|c| c.generated.is_some()) {
+                            for row in &mut rows {
+                                if row.len() == initial_tbl.columns.len() {
+                                    let mut filtered =
+                                        Vec::with_capacity(initial_tbl.columns.len());
+                                    for (i, val) in row.drain(..).enumerate() {
+                                        if initial_tbl.columns[i].generated.is_none() {
+                                            filtered.push(val);
+                                        }
+                                    }
+                                    *row = filtered;
+                                }
+                            }
+                        }
+                        if !initial_tbl.without_rowid
+                            && initial_tbl.rowid_alias_col.is_none()
+                            && let Ok(dest_empty) =
+                                is_table_btree_empty(ctx, db_id, initial_tbl.root_pgno)
+                            && dest_empty
+                            && let Ok(src_rids) =
+                                scan_table_rowids_only(ctx, src_db_id, src_tbl.root_pgno)
+                            && src_rids.len() == rows.len()
+                        {
+                            xfer_preserve_rowids = Some(src_rids);
+                        }
+                    }
+                    PreparedInsertSource::Materialized(rows)
+                }
+            };
+
+            let (tbl, indexes, schema_name) =
+                prepare_dml_write_slot(ctx, db_id, &ins.table, is_catalog, *initial_tbl)?;
+            let (enc, _) = slot_encoding_and_name(ctx, db_id);
+            let ordered_uniques = ordered_unique_indexes(&tbl, &indexes);
+            let (upsert_steps, resolved_do_updates) = if ins.upsert_clauses.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                let analyzed = analyze_upsert_clauses_with_outer(
+                    ins,
+                    &tbl,
+                    &schema_name,
+                    &ordered_uniques,
+                    outer_scopes,
+                    ctx.db_set,
+                    &dml_ctes,
+                    ctx.functions,
+                    ctx.collations,
+                    &mut Vec::new(),
+                )?;
+                let steps = build_upsert_check_steps(
+                    &tbl,
+                    effective_or_conflict,
+                    !indexes.is_empty(),
+                    &ordered_uniques,
+                    &analyzed,
+                );
+                let mut r_assigns = Vec::with_capacity(ins.upsert_clauses.len());
+                for uc in &ins.upsert_clauses {
+                    match &uc.action {
+                        UpsertAction::DoNothing => r_assigns.push(Vec::new()),
+                        UpsertAction::DoUpdate { assignments, .. } => {
+                            r_assigns.push(resolve_set_assignments_for_table(&tbl, assignments)?);
+                        }
+                    }
+                }
+                (steps, r_assigns)
+            };
+
+            let implicit_non_gen_cols: Vec<usize> = tbl
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.generated.is_none())
+                .map(|(i, _)| i)
+                .collect();
+
+            let sample_scope =
+                make_returning_table_scope(&tbl, 0, &vec![Value::Null; tbl.columns.len()]);
+            let (ret_col_names, ret_expanded) = if ins.returning.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                expand_returning_projection(&ins.returning, &sample_scope.cols)?
+            };
+
+            Ok(PreparedInsert::Table(Box::new(PreparedTableInsert {
+                db_id,
+                tbl,
+                indexes,
+                schema_name,
+                enc,
+                is_catalog,
+                dml_ctes,
+                col_targets,
+                implicit_non_gen_cols,
+                source,
+                xfer_preserve_rowids,
+                ordered_uniques,
+                upsert_steps,
+                resolved_do_updates,
+                ret_col_names,
+                ret_expanded,
+            })))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_upsert_clauses_with_outer(
+    ins: &InsertStmt,
+    tbl: &TableSchema,
+    schema_name: &str,
+    ordered_uniques: &[IndexSchema],
+    outer_scopes: &[EvalRow],
+    db_set: &DatabaseSet,
+    dml_ctes: &CteStore,
+    functions: &FunctionRegistry,
+    collations: &CollationRegistry,
+    visited: &mut Vec<(usize, usize)>,
+) -> Result<Vec<ResolvedUpsertTarget>> {
+    if outer_scopes.is_empty() {
+        return analyze_upsert_clauses(
+            ins,
+            tbl,
+            schema_name,
+            ordered_uniques,
+            db_set,
+            dml_ctes,
+            functions,
+            collations,
+            visited,
+        );
+    }
+    let target_scope = make_static_table_scope(tbl, schema_name, ins.alias.as_deref());
+    let excluded_scope = make_excluded_table_scope(tbl, 0, &vec![Value::Null; tbl.columns.len()]);
+    let mut target_scopes = Vec::with_capacity(1 + outer_scopes.len());
+    target_scopes.push(target_scope.clone());
+    target_scopes.extend_from_slice(outer_scopes);
+
+    let mut do_update_scopes = Vec::with_capacity(2 + outer_scopes.len());
+    do_update_scopes.push(excluded_scope);
+    do_update_scopes.push(target_scope);
+    do_update_scopes.extend_from_slice(outer_scopes);
+
+    let multi_clauses = ins.upsert_clauses.len() > 1;
+    let mut resolved = Vec::with_capacity(ins.upsert_clauses.len());
+    for (clause_idx, clause) in ins.upsert_clauses.iter().enumerate() {
+        let rtarget = if let Some(ref target) = clause.target {
+            for ic in &target.columns {
+                if ic.nulls_last == Some(false) {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "unsupported use of NULLS FIRST",
+                    ));
+                }
+                if ic.nulls_last == Some(true) {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "unsupported use of NULLS LAST",
+                    ));
+                }
+                if let Some(ref cname) = ic.collation
+                    && !collations.has_collation(cname)
+                {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!("no such collation sequence: {cname}"),
+                    ));
+                }
+                let ic_expr = indexed_col_to_expr(ic);
+                validate_collations_in_expr(&ic_expr, collations)?;
+                validate_expr_static(
+                    &ic_expr,
+                    &target_scopes,
+                    db_set,
+                    dml_ctes,
+                    functions,
+                    false,
+                    false,
+                    visited,
+                )?;
+            }
+            if let Some(ref tw) = target.where_clause {
+                validate_collations_in_expr(tw, collations)?;
+                validate_expr_static(
+                    tw,
+                    &target_scopes,
+                    db_set,
+                    dml_ctes,
+                    functions,
+                    false,
+                    false,
+                    visited,
+                )?;
+            }
+
+            let is_rowid_match = !tbl.without_rowid
+                && target.columns.len() == 1
+                && target.columns[0].collation.is_none()
+                && {
+                    let e0 = indexed_col_to_expr(&target.columns[0]);
+                    !matches!(e0, Expr::Collate { .. })
+                        && matches!(unwrap_trivial_row_value(&e0), Expr::Column(cref)
+                            if resolve_target_col_ref(tbl, schema_name, ins.alias.as_deref(), cref)
+                                == Some(TargetColRef::Rowid))
+                };
+
+            if is_rowid_match {
+                ResolvedUpsertTarget::RowidPk
+            } else {
+                let mut matched_idx = None;
+                for (u_idx, idx) in ordered_uniques.iter().enumerate() {
+                    if idx.columns.len() != target.columns.len() {
+                        continue;
+                    }
+                    if let Some(ref iw) = idx.where_clause {
+                        let Some(ref tw) = target.where_clause else {
+                            continue;
+                        };
+                        if !upsert_expr_equiv(tbl, schema_name, ins.alias.as_deref(), tw, iw) {
+                            continue;
+                        }
+                    }
+                    let mut used_target = vec![false; target.columns.len()];
+                    let mut all_cols_ok = true;
+                    for idx_col in &idx.columns {
+                        if let Some(tpos) = (0..target.columns.len()).find(|&ti| {
+                            !used_target[ti]
+                                && match_target_col_to_index_col(
+                                    tbl,
+                                    schema_name,
+                                    ins.alias.as_deref(),
+                                    &target.columns[ti],
+                                    idx_col,
+                                )
+                        }) {
+                            used_target[tpos] = true;
+                        } else {
+                            all_cols_ok = false;
+                            break;
+                        }
+                    }
+                    if all_cols_ok {
+                        matched_idx = Some(u_idx);
+                        break;
+                    }
+                }
+                match matched_idx {
+                    Some(u_idx) => ResolvedUpsertTarget::UniqueIndex(u_idx),
+                    None => {
+                        let msg = if multi_clauses {
+                            format!(
+                                "{} ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
+                                ordinal_suffix(clause_idx + 1)
+                            )
+                        } else {
+                            "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"
+                                .to_owned()
+                        };
+                        return Err(SqliteError::new(ErrorCode::Error, msg));
+                    }
+                }
+            }
+        } else {
+            ResolvedUpsertTarget::CatchAll
+        };
+
+        if let UpsertAction::DoUpdate {
+            ref assignments,
+            ref where_clause,
+        } = clause.action
+        {
+            validate_set_assignments_static(
+                tbl,
+                assignments,
+                &do_update_scopes,
+                db_set,
+                dml_ctes,
+                functions,
+                collations,
+                false,
+                visited,
+            )?;
+            if let Some(dw) = where_clause {
+                validate_collations_in_expr(dw, collations)?;
+                validate_expr_static(
+                    dw,
+                    &do_update_scopes,
+                    db_set,
+                    dml_ctes,
+                    functions,
+                    false,
+                    false,
+                    visited,
+                )?;
+            }
+        }
+
+        resolved.push(rtarget);
+    }
+    Ok(resolved)
+}
+
+#[inline(never)]
+fn eval_insert_source_row(
+    ctx: &mut ExecContext<'_>,
+    source: &mut PreparedInsertSource<'_>,
+    row_idx: usize,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    dml_ctes: &CteStore,
+) -> Result<Option<Vec<Value>>> {
+    match source {
+        PreparedInsertSource::Materialized(rows) => {
+            if row_idx >= rows.len() {
+                return Ok(None);
+            }
+            Ok(Some(std::mem::take(&mut rows[row_idx])))
+        }
+        PreparedInsertSource::StreamingValues(expr_rows) => {
+            let Some(erow) = expr_rows.get(row_idx) else {
+                return Ok(None);
+            };
+            let mut vrow = Vec::with_capacity(erow.len());
+            for e in erow {
+                vrow.push(eval_expr(ctx, e, params, outer_scopes, dml_ctes, None)?);
+            }
+            Ok(Some(vrow))
+        }
+    }
+}
+
+#[inline(never)]
+#[allow(clippy::type_complexity)]
+fn prepare_table_insert_row_before(
+    ctx: &mut ExecContext<'_>,
+    p: &PreparedTableInsert<'_>,
+    ins: &InsertStmt,
+    row_idx: usize,
+    src_row: Vec<Value>,
+    params: &[Value],
+) -> Result<(Option<i64>, Vec<Value>, Option<Box<EvalRow>>)> {
+    let mut explicit_rowid: Option<i64> = p
+        .xfer_preserve_rowids
+        .as_ref()
+        .and_then(|rids| rids.get(row_idx).copied());
+    let mut col_vals = Vec::with_capacity(p.tbl.columns.len());
+    for col in &p.tbl.columns {
+        let def = match &col.default_expr {
+            Some(de) => eval_expr(ctx, de, params, &[], &CteStore::default(), None)?,
+            None => Value::Null,
+        };
+        col_vals.push(def);
+    }
+
+    if matches!(ins.source, InsertSource::DefaultValues) {
+        // Keep defaults
+    } else if let Some(ref targets) = p.col_targets {
+        if src_row.len() != targets.len() {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("{} values for {} columns", src_row.len(), targets.len()),
+            ));
+        }
+        for (&t_idx, val) in targets.iter().zip(src_row) {
+            if t_idx == usize::MAX {
+                if !val.is_null() {
+                    let c = TypeAffinity::Integer.apply(val);
+                    let rid = c.as_i64().ok_or_else(|| {
+                        SqliteError::new(ErrorCode::Mismatch, "datatype mismatch")
+                    })?;
+                    explicit_rowid = Some(rid);
+                }
+            } else {
+                col_vals[t_idx] = val;
+            }
+        }
+    } else {
+        if src_row.len() != p.implicit_non_gen_cols.len() {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!(
+                    "table {} has {} columns but {} values were supplied",
+                    p.tbl.name,
+                    p.implicit_non_gen_cols.len(),
+                    src_row.len()
+                ),
+            ));
+        }
+        for (&ci, val) in p.implicit_non_gen_cols.iter().zip(src_row) {
+            col_vals[ci] = val;
+        }
+    }
+
+    // Validate explicit `INTEGER PRIMARY KEY` `datatype mismatch` (`OP_MustBeInt`) BEFORE `BEFORE INSERT`!
+    if !p.tbl.without_rowid
+        && explicit_rowid.is_none()
+        && let Some(ipk) = p.tbl.rowid_alias_col
+        && !col_vals[ipk].is_null()
+    {
+        let coerced = TypeAffinity::Integer.apply(col_vals[ipk].clone());
+        let Some(rid) = coerced.as_i64() else {
+            return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
+        };
+        explicit_rowid = Some(rid);
+    }
+
+    let before_scope = if !p.is_catalog
+        && ctx.db_set.has_active_triggers_for_event(
+            p.db_id,
+            &p.tbl.name,
+            TriggerEventKind::Insert,
+            None,
+        ) {
+        let before_rowid = if p.tbl.without_rowid {
+            0
+        } else {
+            explicit_rowid.unwrap_or(-1)
+        };
+        let mut before_vals = col_vals.clone();
+        apply_table_affinities_and_generated(
+            ctx,
+            &p.tbl,
+            &p.schema_name,
+            before_rowid,
+            &mut before_vals,
+            params,
+        )?;
+        Some(make_runtime_table_pseudo_scope(
+            &p.tbl,
+            None,
+            Some((before_rowid, &before_vals)),
+        ))
+    } else {
+        None
+    };
+
+    Ok((explicit_rowid, col_vals, before_scope))
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn write_plain_table_insert_and_build_after_scope(
+    ctx: &mut ExecContext<'_>,
+    p: &PreparedTableInsert<'_>,
+    explicit_rowid: Option<i64>,
+    col_vals: Vec<Value>,
+    effective_or_conflict: Option<ConflictAction>,
+    params: &[Value],
+    stmt_changes: &mut u64,
+    count_changes_rows: &mut u64,
+    ret_rows: &mut Vec<Vec<Value>>,
+) -> Result<Option<Option<Box<EvalRow>>>> {
+    let Some((written_key, written_vals)) = validate_and_write_row(
+        ctx,
+        p.db_id,
+        &p.tbl,
+        &p.indexes,
+        explicit_rowid,
+        col_vals,
+        effective_or_conflict,
+        None,
+        params,
+        true,
+        Some((MutationOrigin::TopLevelInsert, None)),
+        p.is_catalog,
+    )?
+    else {
+        return Ok(None);
+    };
+    *stmt_changes += 1;
+    *count_changes_rows += 1;
+    if !p.ret_expanded.is_empty() {
+        let rscope = make_returning_table_scope(&p.tbl, written_key.rowid_or_zero(), &written_vals);
+        let mut rrow = Vec::with_capacity(p.ret_expanded.len());
+        for (pe, _, _) in &p.ret_expanded {
+            rrow.push(eval_expr(
+                ctx,
+                pe,
+                params,
+                std::slice::from_ref(&rscope),
+                &p.dml_ctes,
+                None,
+            )?);
+        }
+        ret_rows.push(rrow);
+    }
+    let after_scope = if !p.is_catalog {
+        Some(make_runtime_table_pseudo_scope(
+            &p.tbl,
+            None,
+            Some((written_key.rowid_or_zero(), &written_vals)),
+        ))
+    } else {
+        None
+    };
+    Ok(Some(after_scope))
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn execute_single_table_insert_row(
+    ctx: &mut ExecContext<'_>,
+    p: &PreparedTableInsert<'_>,
+    ins: &InsertStmt,
+    effective_or_conflict: Option<ConflictAction>,
+    row_idx: usize,
+    src_row: Vec<Value>,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    stmt_changes: &mut u64,
+    count_changes_rows: &mut u64,
+    ret_rows: &mut Vec<Vec<Value>>,
+) -> Result<()> {
+    let (explicit_rowid, col_vals, before_scope_opt) =
+        prepare_table_insert_row_before(ctx, p, ins, row_idx, src_row, params)?;
+
+    if let Some(before_scope) = before_scope_opt
+        && fire_row_triggers(
+            ctx,
+            p.db_id,
+            &p.tbl.name,
+            TriggerTiming::Before,
+            TriggerEventKind::Insert,
+            None,
+            before_scope,
+            effective_or_conflict,
+        )? == TriggerOutcome::Ignored
+    {
+        return Ok(());
+    }
+
+    if ins.upsert_clauses.is_empty() {
+        let Some(after_scope_opt) = write_plain_table_insert_and_build_after_scope(
+            ctx,
+            p,
+            explicit_rowid,
+            col_vals,
+            effective_or_conflict,
+            params,
+            stmt_changes,
+            count_changes_rows,
+            ret_rows,
+        )?
+        else {
+            return Ok(());
+        };
+        if let Some(after_scope) = after_scope_opt {
+            let _ = fire_row_triggers(
+                ctx,
+                p.db_id,
+                &p.tbl.name,
+                TriggerTiming::After,
+                TriggerEventKind::Insert,
+                None,
+                after_scope,
+                effective_or_conflict,
+            )?;
+        }
+        return Ok(());
+    }
+
+    execute_upsert_table_insert_row(
+        ctx,
+        p,
+        ins,
+        effective_or_conflict,
+        explicit_rowid,
+        col_vals,
+        params,
+        outer_scopes,
+        stmt_changes,
+        count_changes_rows,
+        ret_rows,
+    )
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn execute_upsert_table_insert_row(
+    ctx: &mut ExecContext<'_>,
+    p: &PreparedTableInsert<'_>,
+    ins: &InsertStmt,
+    effective_or_conflict: Option<ConflictAction>,
+    explicit_rowid: Option<i64>,
+    col_vals: Vec<Value>,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    stmt_changes: &mut u64,
+    count_changes_rows: &mut u64,
+    ret_rows: &mut Vec<Vec<Value>>,
+) -> Result<()> {
+    // UPSERT path (`upsert.c`)
+    let Some((rowid, final_key, raw_vals)) = prepare_proposed_insert_row(
+        ctx,
+        p.db_id,
+        &p.tbl,
+        &p.schema_name,
+        explicit_rowid,
+        col_vals,
+        effective_or_conflict,
+        params,
+    )?
+    else {
+        return Ok(());
+    };
+
+    let mut matched_upsert: Option<(usize, TableRowKey, Vec<Value>)> = None;
+    let mut did_replace_delete = false;
+    let mut did_replace_trigger = false;
+
+    for step in &p.upsert_steps {
+        match *step {
+            UpsertCheckStep::RowidPk { clause_idx } => {
+                if let Some(cpayload) = seek_table_raw_entry(ctx, p.db_id, &p.tbl, &final_key)? {
+                    let ckey = TableRowKey::Rowid(rowid);
+                    if let Some(ci) = clause_idx {
+                        let cvals = decode_table_logical_row(
+                            ctx, p.db_id, &p.tbl, &ckey, &cpayload, params,
+                        )?;
+                        matched_upsert = Some((ci, ckey, cvals));
+                        break;
+                    }
+                    let eff = effective_or_conflict.unwrap_or(p.tbl.rowid_pk_conflict);
+                    match eff {
+                        ConflictAction::Ignore => return Ok(()),
+                        ConflictAction::Replace => {
+                            replace_conflict_delete_row(
+                                ctx,
+                                p.db_id,
+                                &p.tbl,
+                                &p.indexes,
+                                &ckey,
+                                p.is_catalog,
+                                params,
+                                &mut did_replace_delete,
+                                &mut did_replace_trigger,
+                            )?;
+                        }
+                        _ => {
+                            let (ext_code, col_label) = match p.tbl.rowid_alias_col {
+                                Some(ipk) => (
+                                    extended::SQLITE_CONSTRAINT_PRIMARYKEY,
+                                    p.tbl.columns[ipk].name.as_str(),
+                                ),
+                                None => (extended::SQLITE_CONSTRAINT_ROWID, "rowid"),
+                            };
+                            return Err(SqliteError::constraint(
+                                ext_code,
+                                format!("UNIQUE constraint failed: {}.{}", p.tbl.name, col_label),
+                            )
+                            .with_conflict_effect(conflict_action_to_effect(eff)));
+                        }
+                    }
+                }
+            }
+            UpsertCheckStep::UniqueIdx { u_idx, clause_idx } => {
+                let idx = &p.ordered_uniques[u_idx];
+                if idx.table_without_rowid && idx.origin == "pk" {
+                    if let Some(cpayload) = seek_table_raw_entry(ctx, p.db_id, &p.tbl, &final_key)?
+                    {
+                        let decoded = decode_record_with_encoding(&cpayload, p.enc)?;
+                        let n_pk = p.tbl.without_rowid_pk_cols.len();
+                        let ckey = TableRowKey::WithoutRowidPk(
+                            decoded[..n_pk.min(decoded.len())].to_vec(),
+                        );
+                        if let Some(ci) = clause_idx {
+                            let cvals = decode_table_logical_row(
+                                ctx, p.db_id, &p.tbl, &ckey, &cpayload, params,
+                            )?;
+                            matched_upsert = Some((ci, ckey, cvals));
+                            break;
+                        }
+                        let eff = effective_or_conflict.unwrap_or(p.tbl.without_rowid_pk_conflict);
+                        match eff {
+                            ConflictAction::Ignore => return Ok(()),
+                            ConflictAction::Replace => {
+                                replace_conflict_delete_row(
+                                    ctx,
+                                    p.db_id,
+                                    &p.tbl,
+                                    &p.indexes,
+                                    &ckey,
+                                    p.is_catalog,
+                                    params,
+                                    &mut did_replace_delete,
+                                    &mut did_replace_trigger,
+                                )?;
+                            }
+                            _ => {
+                                return Err(SqliteError::constraint(
+                                    extended::SQLITE_CONSTRAINT_PRIMARYKEY,
+                                    format_unique_index_failure(&p.tbl, idx),
+                                )
+                                .with_conflict_effect(conflict_action_to_effect(eff)));
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if !index_row_passes_partial_where(
+                    ctx,
+                    &p.schema_name,
+                    &p.tbl,
+                    idx,
+                    rowid,
+                    &raw_vals,
+                    params,
+                )? {
+                    continue;
+                }
+                let indexed_vals = eval_index_column_values(
+                    ctx,
+                    &p.schema_name,
+                    &p.tbl,
+                    idx,
+                    rowid,
+                    &raw_vals,
+                    params,
+                )?;
+                if indexed_vals.iter().any(Value::is_null) {
+                    continue;
+                }
+                let orders = idx.key_sort_orders();
+                let hits = if let Some(ref mut bt) =
+                    ctx.db_set.slot_mut(p.db_id).and_then(|s| s.btree.as_mut())
+                    && bt.pager().page_count() > 0
+                {
+                    bt.seek_index_equal(
+                        idx.root_pgno,
+                        &indexed_vals,
+                        &orders[..indexed_vals.len()],
+                    )?
+                } else {
+                    Vec::new()
+                };
+                let mut conflicting_keys = Vec::new();
+                for hit in hits {
+                    let hit_key_opt = if p.tbl.without_rowid {
+                        Some(TableRowKey::WithoutRowidPk(
+                            idx.extract_without_rowid_pk_from_hit(&p.tbl, &hit),
+                        ))
+                    } else {
+                        hit.last().and_then(Value::as_i64).map(TableRowKey::Rowid)
+                    };
+                    if let Some(hk) = hit_key_opt {
+                        conflicting_keys.push(hk);
+                    }
+                }
+                if let Some(first_ckey) = conflicting_keys.first() {
+                    if let Some(ci) = clause_idx {
+                        if let Some(cpayload) =
+                            seek_table_raw_entry(ctx, p.db_id, &p.tbl, first_ckey)?
+                        {
+                            let cvals = decode_table_logical_row(
+                                ctx, p.db_id, &p.tbl, first_ckey, &cpayload, params,
+                            )?;
+                            matched_upsert = Some((ci, first_ckey.clone(), cvals));
+                            break;
+                        }
+                    } else {
+                        let eff = effective_or_conflict.unwrap_or(idx.conflict);
+                        match eff {
+                            ConflictAction::Ignore => return Ok(()),
+                            ConflictAction::Replace => {
+                                for ckey in conflicting_keys {
+                                    replace_conflict_delete_row(
+                                        ctx,
+                                        p.db_id,
+                                        &p.tbl,
+                                        &p.indexes,
+                                        &ckey,
+                                        p.is_catalog,
+                                        params,
+                                        &mut did_replace_delete,
+                                        &mut did_replace_trigger,
+                                    )?;
+                                }
+                            }
+                            _ => {
+                                let ext_code = if idx.origin == "pk" {
+                                    extended::SQLITE_CONSTRAINT_PRIMARYKEY
+                                } else {
+                                    extended::SQLITE_CONSTRAINT_UNIQUE
+                                };
+                                return Err(SqliteError::constraint(
+                                    ext_code,
+                                    format_unique_index_failure(&p.tbl, idx),
+                                )
+                                .with_conflict_effect(conflict_action_to_effect(eff)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some((c_idx, conflict_key, old_vals)) = matched_upsert {
+        match &ins.upsert_clauses[c_idx].action {
+            UpsertAction::DoNothing => return Ok(()),
+            UpsertAction::DoUpdate {
+                assignments,
+                where_clause,
+            } => {
+                let excluded_scope = make_excluded_table_scope(&p.tbl, rowid, &raw_vals);
+                let old_scope = make_single_table_scope(
+                    &p.tbl,
+                    &p.schema_name,
+                    ins.alias.as_deref(),
+                    conflict_key.rowid_or_zero(),
+                    &old_vals,
+                );
+                let mut scopes = Vec::with_capacity(2 + outer_scopes.len());
+                scopes.push(excluded_scope);
+                scopes.push(old_scope);
+                scopes.extend_from_slice(outer_scopes);
+
+                if let Some(dw) = where_clause {
+                    let cond = eval_expr(ctx, dw, params, &scopes, &p.dml_ctes, None)?;
+                    if cond.truthiness() != Some(true) {
+                        return Ok(());
+                    }
+                }
+                let (new_rowid_opt, new_vals) = apply_resolved_set_assignments(
+                    ctx,
+                    &p.tbl,
+                    &conflict_key,
+                    &old_vals,
+                    &p.resolved_do_updates[c_idx],
+                    &scopes,
+                    &p.dml_ctes,
+                    params,
+                )?;
+                let mod_mask = build_table_modified_col_mask(&p.tbl, &p.resolved_do_updates[c_idx]);
+                let mod_names = collect_set_assignment_col_names(assignments);
+                let excluded_mutation_row = MutationRow {
+                    rowid,
+                    values: raw_vals,
+                };
+                update_existing_table_row_with_triggers(
+                    ctx,
+                    p.db_id,
+                    &p.tbl,
+                    &p.indexes,
+                    &p.schema_name,
+                    &conflict_key,
+                    old_vals,
+                    new_rowid_opt,
+                    new_vals,
+                    &mod_mask,
+                    &mod_names,
+                    Some(ConflictAction::Abort),
+                    Some((MutationOrigin::UpsertDoUpdate, Some(excluded_mutation_row))),
+                    p.is_catalog,
+                    params,
+                    |ctx, written_key, written_vals| {
+                        *stmt_changes += 1;
+                        if !p.ret_expanded.is_empty() {
+                            let rscope = make_returning_table_scope(
+                                &p.tbl,
+                                written_key.rowid_or_zero(),
+                                written_vals,
+                            );
+                            let mut rrow = Vec::with_capacity(p.ret_expanded.len());
+                            for (pe, _, _) in &p.ret_expanded {
+                                rrow.push(eval_expr(
+                                    ctx,
+                                    pe,
+                                    params,
+                                    std::slice::from_ref(&rscope),
+                                    &p.dml_ctes,
+                                    None,
+                                )?);
+                            }
+                            ret_rows.push(rrow);
+                        }
+                        Ok(())
+                    },
+                )?;
+                return Ok(());
+            }
+        }
+    }
+
+    // No UPSERT clause triggered — finish normal INSERT write (`addrRecheck` if `OR REPLACE` ran)
+    if did_replace_delete
+        && (did_replace_trigger
+            || (*ctx.foreign_keys
+                && ctx
+                    .db_set
+                    .slot(p.db_id)
+                    .is_some_and(|s| !find_referencing_fks(&s.schema, &p.tbl.name).is_empty())))
+    {
+        recheck_uniqueness_abort(
+            ctx,
+            p.db_id,
+            &p.tbl,
+            &p.ordered_uniques,
+            &p.schema_name,
+            rowid,
+            &final_key,
+            &raw_vals,
+            None,
+            p.enc,
+            params,
+        )?;
+    }
+
+    let phys_rec = encode_table_physical_record(&p.tbl, &raw_vals, p.enc);
+    if let Some(ref mut bt) = ctx.db_set.slot_mut(p.db_id).and_then(|s| s.btree.as_mut()) {
+        if p.tbl.without_rowid {
+            let pk_orders = p.tbl.without_rowid_pk_orders();
+            bt.insert_index(p.tbl.root_pgno, &phys_rec, &pk_orders)?;
+        } else {
+            bt.insert_table(p.tbl.root_pgno, rowid, &phys_rec)?;
+        }
+    }
+    for idx in &p.indexes {
+        if index_row_passes_partial_where(
+            ctx,
+            &p.schema_name,
+            &p.tbl,
+            idx,
+            rowid,
+            &raw_vals,
+            params,
+        )? {
+            let keys = eval_index_key_values(
+                ctx,
+                &p.schema_name,
+                &p.tbl,
+                idx,
+                &final_key,
+                &raw_vals,
+                params,
+            )?;
+            let idx_rec = encode_record_with_encoding(&keys, p.enc);
+            let orders = idx.key_sort_orders();
+            if let Some(ref mut bt) = ctx.db_set.slot_mut(p.db_id).and_then(|s| s.btree.as_mut()) {
+                bt.insert_index(idx.root_pgno, &idx_rec, &orders)?;
+            }
+        }
+    }
+    if p.tbl.autoincrement {
+        update_sqlite_sequence(ctx, p.db_id, &p.tbl.name, rowid)?;
+    }
+    if let Some(slot) = ctx.db_set.slot(p.db_id)
+        && let Some(ref bt) = slot.btree
+        && bt.pager().page_count() > slot.max_page_count
+    {
+        return Err(SqliteError::new(
+            ErrorCode::Full,
+            "database or disk is full",
+        ));
+    }
+    if *ctx.foreign_keys {
+        register_child_fk_checks(ctx, p.db_id, &p.tbl, &final_key, &raw_vals)?;
+    }
+    let effective_conflict = effective_or_conflict.unwrap_or(if p.tbl.without_rowid {
+        p.tbl.without_rowid_pk_conflict
+    } else {
+        p.tbl.rowid_pk_conflict
+    });
+    ctx.mutation_pipeline.dispatch(MutationContext {
+        db_id: p.db_id,
+        table_name: p.tbl.name.clone(),
+        origin: MutationOrigin::TopLevelInsert,
+        old_row: None,
+        new_row: Some(MutationRow {
+            rowid: final_key.rowid_or_zero(),
+            values: raw_vals.clone(),
+        }),
+        excluded_row: None,
+        effective_conflict,
+        emit_update_hook: !p.tbl.without_rowid && !p.is_catalog,
+        invalidate_blobs: false,
+    });
+    if !p.tbl.without_rowid {
+        ctx.runtime.last_insert_rowid = rowid;
+        ctx.publish();
+    }
+    *stmt_changes += 1;
+    *count_changes_rows += 1;
+
+    if !p.ret_expanded.is_empty() {
+        let rscope = make_returning_table_scope(&p.tbl, final_key.rowid_or_zero(), &raw_vals);
+        let mut rrow = Vec::with_capacity(p.ret_expanded.len());
+        for (pe, _, _) in &p.ret_expanded {
+            rrow.push(eval_expr(
+                ctx,
+                pe,
+                params,
+                std::slice::from_ref(&rscope),
+                &p.dml_ctes,
+                None,
+            )?);
+        }
+        ret_rows.push(rrow);
+    }
+
+    if !p.is_catalog {
+        let after_scope = make_runtime_table_pseudo_scope(
+            &p.tbl,
+            None,
+            Some((final_key.rowid_or_zero(), &raw_vals)),
+        );
+        let _ = fire_row_triggers(
+            ctx,
+            p.db_id,
+            &p.tbl.name,
+            TriggerTiming::After,
+            TriggerEventKind::Insert,
+            None,
+            after_scope,
+            effective_or_conflict,
+        )?;
+    }
+    Ok(())
+}
+
 fn exec_insert(
     ctx: &mut ExecContext<'_>,
     ins: &InsertStmt,
     params: &[Value],
 ) -> Result<QueryOutput> {
-    let (db_id, initial_tbl, initial_sname, is_catalog) = resolve_dml_target_table_in_set_opts(
-        ctx.db_set,
-        &ins.table,
-        *ctx.writable_schema,
-        !ins.upsert_clauses.is_empty(),
-    )?;
-    let dml_ctes = CteStore::default().with_scope(&ins.ctes);
+    exec_insert_internal(ctx, ins, ins.or_conflict, params, &[], true)
+}
 
-    // Resolve target column mapping (`None` = all non-generated columns in order; `Some(names)` = mapped columns, `usize::MAX` for implicit `rowid`)
-    let col_targets: Option<Vec<usize>> = if let Some(ref cnames) = ins.columns {
-        let mut idxs = Vec::with_capacity(cnames.len());
-        for cn in cnames {
-            if let Some((ci, col)) = initial_tbl.find_column(cn) {
-                if col.generated.is_some() {
-                    return Err(SqliteError::new(
-                        ErrorCode::Error,
-                        format!("cannot INSERT into generated column \"{}\"", col.name),
-                    ));
-                }
-                idxs.push(ci);
-            } else if initial_tbl.is_implicit_rowid_name(cn) {
-                idxs.push(usize::MAX);
-            } else {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    format!("table {} has no column named {cn}", initial_tbl.name),
-                ));
-            }
-        }
-        Some(idxs)
-    } else {
-        None
-    };
-
-    // Pre-analyze UPSERT clauses before evaluating input query so invalid conflict targets fail immediately
-    if !ins.upsert_clauses.is_empty() {
-        let init_indexes = if is_catalog {
-            Vec::new()
-        } else {
-            ctx.db_set
-                .slot(db_id)
-                .map(|s| s.schema.indexes_for_table(&initial_tbl.name))
-                .unwrap_or_default()
-        };
-        let init_ordered = ordered_unique_indexes(&initial_tbl, &init_indexes);
-        let _ = analyze_upsert_clauses(
-            ins,
-            &initial_tbl,
-            &initial_sname,
-            &init_ordered,
-            ctx.db_set,
-            &dml_ctes,
-            ctx.functions,
-            ctx.collations,
-            &mut Vec::new(),
-        )?;
-    }
-
-    // Materialize input value rows BEFORE mutating target table (handles `INSERT INTO t SELECT * FROM t` safely!)
-    let xfer_src = check_insert_xfer_eligible(
-        ins,
-        db_id,
-        &initial_tbl,
-        is_catalog,
-        ctx.db_set,
-        *ctx.foreign_keys,
-        *ctx.count_changes,
-    );
-    let mut xfer_preserve_rowids: Option<Vec<i64>> = None;
-    let source_value_rows: Vec<Vec<Value>> = match &ins.source {
-        InsertSource::DefaultValues => vec![Vec::new()],
-        InsertSource::Values(expr_rows) => {
-            let mut out = Vec::with_capacity(expr_rows.len());
-            for erow in expr_rows {
-                let mut vrow = Vec::with_capacity(erow.len());
-                for e in erow {
-                    vrow.push(eval_expr(ctx, e, params, &[], &dml_ctes, None)?);
-                }
-                out.push(vrow);
-            }
-            out
-        }
-        InsertSource::Select(sel) => {
-            let mut rows = exec_select(ctx, sel, params, &[], &dml_ctes)?.rows;
-            if let Some((src_db_id, ref src_tbl)) = xfer_src {
-                ctx.db_set.record_xferopt();
-                if initial_tbl.columns.iter().any(|c| c.generated.is_some()) {
-                    for row in &mut rows {
-                        if row.len() == initial_tbl.columns.len() {
-                            let mut filtered = Vec::with_capacity(initial_tbl.columns.len());
-                            for (i, val) in row.drain(..).enumerate() {
-                                if initial_tbl.columns[i].generated.is_none() {
-                                    filtered.push(val);
-                                }
-                            }
-                            *row = filtered;
-                        }
-                    }
-                }
-                if !initial_tbl.without_rowid
-                    && initial_tbl.rowid_alias_col.is_none()
-                    && let Ok(dest_empty) = is_table_btree_empty(ctx, db_id, initial_tbl.root_pgno)
-                    && dest_empty
-                    && let Ok(src_rids) = scan_table_rowids_only(ctx, src_db_id, src_tbl.root_pgno)
-                    && src_rids.len() == rows.len()
-                {
-                    xfer_preserve_rowids = Some(src_rids);
-                }
-            }
-            rows
-        }
-    };
-
-    let (tbl, indexes, schema_name) =
-        prepare_dml_write_slot(ctx, db_id, &ins.table, is_catalog, initial_tbl)?;
-    let (enc, _) = slot_encoding_and_name(ctx, db_id);
-    let ordered_uniques = ordered_unique_indexes(&tbl, &indexes);
-    let (upsert_steps, resolved_do_updates) = if ins.upsert_clauses.is_empty() {
-        (Vec::new(), Vec::new())
-    } else {
-        let analyzed = analyze_upsert_clauses(
-            ins,
-            &tbl,
-            &schema_name,
-            &ordered_uniques,
-            ctx.db_set,
-            &dml_ctes,
-            ctx.functions,
-            ctx.collations,
-            &mut Vec::new(),
-        )?;
-        let steps = build_upsert_check_steps(&tbl, ins.or_conflict, &ordered_uniques, &analyzed);
-        let mut r_assigns = Vec::with_capacity(ins.upsert_clauses.len());
-        for uc in &ins.upsert_clauses {
-            match &uc.action {
-                UpsertAction::DoNothing => r_assigns.push(Vec::new()),
-                UpsertAction::DoUpdate { assignments, .. } => {
-                    r_assigns.push(resolve_set_assignments_for_table(&tbl, assignments)?);
-                }
-            }
-        }
-        (steps, r_assigns)
-    };
-
-    let implicit_non_gen_cols: Vec<usize> = tbl
-        .columns
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.generated.is_none())
-        .map(|(i, _)| i)
-        .collect();
-
-    ctx.runtime.last_changes = 0;
-    ctx.publish();
-
-    let sample_scope = make_returning_table_scope(&tbl, 0, &vec![Value::Null; tbl.columns.len()]);
-    let (ret_col_names, ret_expanded) = if ins.returning.is_empty() {
-        (Vec::new(), Vec::new())
-    } else {
-        expand_returning_projection(&ins.returning, &sample_scope.cols)?
-    };
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn run_table_insert_loop(
+    ctx: &mut ExecContext<'_>,
+    mut p: Box<PreparedTableInsert<'_>>,
+    ins: &InsertStmt,
+    effective_or_conflict: Option<ConflictAction>,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    stmt_changes: &mut u64,
+    count_changes_rows: &mut u64,
+) -> Result<QueryOutput> {
+    let mut source = Box::new(std::mem::replace(
+        &mut p.source,
+        PreparedInsertSource::Materialized(Vec::new()),
+    ));
     let mut ret_rows = Vec::new();
-    let mut stmt_fk_suspects = Vec::new();
-    let mut inserted_count: usize = 0;
+    let mut row_idx = 0usize;
+    loop {
+        ctx.step_tick()?;
+        let Some(src_row) =
+            eval_insert_source_row(ctx, &mut source, row_idx, params, outer_scopes, &p.dml_ctes)?
+        else {
+            break;
+        };
+        execute_single_table_insert_row(
+            ctx,
+            &p,
+            ins,
+            effective_or_conflict,
+            row_idx,
+            src_row,
+            params,
+            outer_scopes,
+            stmt_changes,
+            count_changes_rows,
+            &mut ret_rows,
+        )?;
+        row_idx += 1;
+    }
+    Ok(QueryOutput {
+        column_names: p.ret_col_names,
+        rows: ret_rows,
+    })
+}
 
-    for (row_idx, src_row) in source_value_rows.into_iter().enumerate() {
-        let mut explicit_rowid: Option<i64> = xfer_preserve_rowids
-            .as_ref()
-            .and_then(|rids| rids.get(row_idx).copied());
-        let mut col_vals = Vec::with_capacity(tbl.columns.len());
-        for col in &tbl.columns {
-            let def = match &col.default_expr {
-                Some(de) => eval_expr(ctx, de, params, &[], &CteStore::default(), None)?,
-                None => Value::Null,
-            };
-            col_vals.push(def);
-        }
-
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn run_view_insert_loop(
+    ctx: &mut ExecContext<'_>,
+    mut p: Box<PreparedViewInsert<'_>>,
+    ins: &InsertStmt,
+    effective_or_conflict: Option<ConflictAction>,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    count_changes_rows: &mut u64,
+) -> Result<QueryOutput> {
+    let mut source = Box::new(std::mem::replace(
+        &mut p.source,
+        PreparedInsertSource::Materialized(Vec::new()),
+    ));
+    let mut ret_rows = Vec::new();
+    let mut row_idx = 0usize;
+    loop {
+        ctx.step_tick()?;
+        let Some(src_row) =
+            eval_insert_source_row(ctx, &mut source, row_idx, params, outer_scopes, &p.dml_ctes)?
+        else {
+            break;
+        };
+        let mut new_vals = vec![Value::Null; p.col_specs.len()];
         if matches!(ins.source, InsertSource::DefaultValues) {
-            // Keep defaults
-        } else if let Some(ref targets) = col_targets {
+            // All view columns default to NULL
+        } else if let Some(ref targets) = p.col_targets {
             if src_row.len() != targets.len() {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
@@ -12672,547 +15151,102 @@ fn exec_insert(
                 ));
             }
             for (&t_idx, val) in targets.iter().zip(src_row) {
-                if t_idx == usize::MAX {
-                    if !val.is_null() {
-                        let c = TypeAffinity::Integer.apply(val);
-                        let rid = c.as_i64().ok_or_else(|| {
-                            SqliteError::new(ErrorCode::Mismatch, "datatype mismatch")
-                        })?;
-                        explicit_rowid = Some(rid);
-                    }
-                } else {
-                    col_vals[t_idx] = val;
-                }
+                new_vals[t_idx] = val;
             }
         } else {
-            if src_row.len() != implicit_non_gen_cols.len() {
+            if src_row.len() != p.col_specs.len() {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!(
                         "table {} has {} columns but {} values were supplied",
-                        tbl.name,
-                        implicit_non_gen_cols.len(),
+                        p.view.name,
+                        p.col_specs.len(),
                         src_row.len()
                     ),
                 ));
             }
-            for (&ci, val) in implicit_non_gen_cols.iter().zip(src_row) {
-                col_vals[ci] = val;
-            }
+            new_vals = src_row;
         }
-
-        let write_res: Result<Option<(TableRowKey, Vec<Value>)>> = if ins.upsert_clauses.is_empty()
+        let pscope = make_runtime_view_pseudo_scope(&p.col_specs, None, Some(&new_vals));
+        if fire_row_triggers(
+            ctx,
+            p.db_id,
+            &p.view.name,
+            TriggerTiming::InsteadOf,
+            TriggerEventKind::Insert,
+            None,
+            pscope,
+            effective_or_conflict,
+        )? == TriggerOutcome::Continue
         {
-            let r = validate_and_write_row(
-                ctx,
-                db_id,
-                &tbl,
-                &indexes,
-                explicit_rowid,
-                col_vals,
-                ins.or_conflict,
-                None,
-                params,
-                true,
-                true,
-                &mut stmt_fk_suspects,
-                0,
-                Some((MutationOrigin::TopLevelInsert, None)),
-                is_catalog,
-            );
-            if matches!(r, Ok(Some(_))) {
-                inserted_count += 1;
-            }
-            r
-        } else {
-            (|| -> Result<Option<(TableRowKey, Vec<Value>)>> {
-                let Some((rowid, final_key, raw_vals)) = prepare_proposed_insert_row(
-                    ctx,
-                    db_id,
-                    &tbl,
-                    &schema_name,
-                    explicit_rowid,
-                    col_vals,
-                    ins.or_conflict,
-                    params,
-                )?
-                else {
-                    return Ok(None);
-                };
-
-                let mut matched_upsert: Option<(usize, TableRowKey, Vec<Value>)> = None;
-                let mut did_replace_delete = false;
-
-                for step in &upsert_steps {
-                    match *step {
-                        UpsertCheckStep::RowidPk { clause_idx } => {
-                            if let Some(cpayload) =
-                                seek_table_raw_entry(ctx, db_id, &tbl, &final_key)?
-                            {
-                                let ckey = TableRowKey::Rowid(rowid);
-                                let cvals = decode_table_logical_row(
-                                    ctx, db_id, &tbl, &ckey, &cpayload, params,
-                                )?;
-                                if let Some(ci) = clause_idx {
-                                    matched_upsert = Some((ci, ckey, cvals));
-                                    break;
-                                }
-                                let eff = ins.or_conflict.unwrap_or(tbl.rowid_pk_conflict);
-                                match eff {
-                                    ConflictAction::Ignore => return Ok(None),
-                                    ConflictAction::Replace => {
-                                        if *ctx.foreign_keys {
-                                            check_parent_delete_restrict(
-                                                ctx, db_id, &tbl, &cvals, params,
-                                            )?;
-                                        }
-                                        delete_row_via_pipeline(
-                                            ctx,
-                                            db_id,
-                                            &tbl,
-                                            &indexes,
-                                            &ckey,
-                                            Some(&cvals),
-                                            MutationOrigin::ReplaceConflictDelete,
-                                            ConflictAction::Replace,
-                                            is_catalog,
-                                            params,
-                                        )?;
-                                        did_replace_delete = true;
-                                        if *ctx.foreign_keys {
-                                            apply_parent_delete_fk_actions(
-                                                ctx,
-                                                db_id,
-                                                &tbl,
-                                                &cvals,
-                                                params,
-                                                &mut stmt_fk_suspects,
-                                                1,
-                                            )?;
-                                        }
-                                    }
-                                    _ => {
-                                        let (ext_code, col_label) = match tbl.rowid_alias_col {
-                                            Some(ipk) => (
-                                                extended::SQLITE_CONSTRAINT_PRIMARYKEY,
-                                                tbl.columns[ipk].name.as_str(),
-                                            ),
-                                            None => (extended::SQLITE_CONSTRAINT_ROWID, "rowid"),
-                                        };
-                                        return Err(SqliteError::constraint(
-                                            ext_code,
-                                            format!(
-                                                "UNIQUE constraint failed: {}.{}",
-                                                tbl.name, col_label
-                                            ),
-                                        )
-                                        .with_conflict_effect(conflict_action_to_effect(eff)));
-                                    }
-                                }
-                            }
-                        }
-                        UpsertCheckStep::UniqueIdx { u_idx, clause_idx } => {
-                            let idx = &ordered_uniques[u_idx];
-                            if idx.table_without_rowid && idx.origin == "pk" {
-                                if let Some(cpayload) =
-                                    seek_table_raw_entry(ctx, db_id, &tbl, &final_key)?
-                                {
-                                    let decoded = decode_record_with_encoding(&cpayload, enc)?;
-                                    let n_pk = tbl.without_rowid_pk_cols.len();
-                                    let ckey = TableRowKey::WithoutRowidPk(
-                                        decoded[..n_pk.min(decoded.len())].to_vec(),
-                                    );
-                                    let cvals = decode_table_logical_row(
-                                        ctx, db_id, &tbl, &ckey, &cpayload, params,
-                                    )?;
-                                    if let Some(ci) = clause_idx {
-                                        matched_upsert = Some((ci, ckey, cvals));
-                                        break;
-                                    }
-                                    let eff =
-                                        ins.or_conflict.unwrap_or(tbl.without_rowid_pk_conflict);
-                                    match eff {
-                                        ConflictAction::Ignore => return Ok(None),
-                                        ConflictAction::Replace => {
-                                            if *ctx.foreign_keys {
-                                                check_parent_delete_restrict(
-                                                    ctx, db_id, &tbl, &cvals, params,
-                                                )?;
-                                            }
-                                            delete_row_via_pipeline(
-                                                ctx,
-                                                db_id,
-                                                &tbl,
-                                                &indexes,
-                                                &ckey,
-                                                Some(&cvals),
-                                                MutationOrigin::ReplaceConflictDelete,
-                                                ConflictAction::Replace,
-                                                is_catalog,
-                                                params,
-                                            )?;
-                                            did_replace_delete = true;
-                                            if *ctx.foreign_keys {
-                                                apply_parent_delete_fk_actions(
-                                                    ctx,
-                                                    db_id,
-                                                    &tbl,
-                                                    &cvals,
-                                                    params,
-                                                    &mut stmt_fk_suspects,
-                                                    1,
-                                                )?;
-                                            }
-                                        }
-                                        _ => {
-                                            return Err(SqliteError::constraint(
-                                                extended::SQLITE_CONSTRAINT_PRIMARYKEY,
-                                                format_unique_index_failure(&tbl, idx),
-                                            )
-                                            .with_conflict_effect(conflict_action_to_effect(eff)));
-                                        }
-                                    }
-                                }
-                                continue;
-                            }
-
-                            if !index_row_passes_partial_where(
-                                ctx,
-                                &schema_name,
-                                &tbl,
-                                idx,
-                                rowid,
-                                &raw_vals,
-                                params,
-                            )? {
-                                continue;
-                            }
-                            let indexed_vals = eval_index_column_values(
-                                ctx,
-                                &schema_name,
-                                &tbl,
-                                idx,
-                                rowid,
-                                &raw_vals,
-                                params,
-                            )?;
-                            if indexed_vals.iter().any(Value::is_null) {
-                                continue;
-                            }
-                            let orders = idx.key_sort_orders();
-                            let hits = if let Some(ref mut bt) =
-                                ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut())
-                                && bt.pager().page_count() > 0
-                            {
-                                bt.seek_index_equal(
-                                    idx.root_pgno,
-                                    &indexed_vals,
-                                    &orders[..indexed_vals.len()],
-                                )?
-                            } else {
-                                Vec::new()
-                            };
-                            let mut conflicting_keys = Vec::new();
-                            for hit in hits {
-                                let hit_key_opt = if tbl.without_rowid {
-                                    Some(TableRowKey::WithoutRowidPk(
-                                        idx.extract_without_rowid_pk_from_hit(&tbl, &hit),
-                                    ))
-                                } else {
-                                    hit.last().and_then(Value::as_i64).map(TableRowKey::Rowid)
-                                };
-                                if let Some(hk) = hit_key_opt {
-                                    conflicting_keys.push(hk);
-                                }
-                            }
-                            if let Some(first_ckey) = conflicting_keys.first() {
-                                if let Some(ci) = clause_idx {
-                                    if let Some(cpayload) =
-                                        seek_table_raw_entry(ctx, db_id, &tbl, first_ckey)?
-                                    {
-                                        let cvals = decode_table_logical_row(
-                                            ctx, db_id, &tbl, first_ckey, &cpayload, params,
-                                        )?;
-                                        matched_upsert = Some((ci, first_ckey.clone(), cvals));
-                                        break;
-                                    }
-                                } else {
-                                    let eff = ins.or_conflict.unwrap_or(idx.conflict);
-                                    match eff {
-                                        ConflictAction::Ignore => return Ok(None),
-                                        ConflictAction::Replace => {
-                                            for ckey in conflicting_keys {
-                                                if let Some(cpayload) =
-                                                    seek_table_raw_entry(ctx, db_id, &tbl, &ckey)?
-                                                {
-                                                    let cvals = decode_table_logical_row(
-                                                        ctx, db_id, &tbl, &ckey, &cpayload, params,
-                                                    )?;
-                                                    if *ctx.foreign_keys {
-                                                        check_parent_delete_restrict(
-                                                            ctx, db_id, &tbl, &cvals, params,
-                                                        )?;
-                                                    }
-                                                    delete_row_via_pipeline(
-                                                        ctx,
-                                                        db_id,
-                                                        &tbl,
-                                                        &indexes,
-                                                        &ckey,
-                                                        Some(&cvals),
-                                                        MutationOrigin::ReplaceConflictDelete,
-                                                        ConflictAction::Replace,
-                                                        is_catalog,
-                                                        params,
-                                                    )?;
-                                                    did_replace_delete = true;
-                                                    if *ctx.foreign_keys {
-                                                        apply_parent_delete_fk_actions(
-                                                            ctx,
-                                                            db_id,
-                                                            &tbl,
-                                                            &cvals,
-                                                            params,
-                                                            &mut stmt_fk_suspects,
-                                                            1,
-                                                        )?;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        _ => {
-                                            let ext_code = if idx.origin == "pk" {
-                                                extended::SQLITE_CONSTRAINT_PRIMARYKEY
-                                            } else {
-                                                extended::SQLITE_CONSTRAINT_UNIQUE
-                                            };
-                                            return Err(SqliteError::constraint(
-                                                ext_code,
-                                                format_unique_index_failure(&tbl, idx),
-                                            )
-                                            .with_conflict_effect(conflict_action_to_effect(eff)));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if let Some((c_idx, conflict_key, old_vals)) = matched_upsert {
-                    match &ins.upsert_clauses[c_idx].action {
-                        UpsertAction::DoNothing => return Ok(None),
-                        UpsertAction::DoUpdate { where_clause, .. } => {
-                            let excluded_scope = make_excluded_table_scope(&tbl, rowid, &raw_vals);
-                            let old_scope = make_single_table_scope(
-                                &tbl,
-                                &schema_name,
-                                ins.alias.as_deref(),
-                                conflict_key.rowid_or_zero(),
-                                &old_vals,
-                            );
-                            let scopes = [excluded_scope, old_scope];
-                            if let Some(dw) = where_clause {
-                                let cond = eval_expr(ctx, dw, params, &scopes, &dml_ctes, None)?;
-                                if cond.truthiness() != Some(true) {
-                                    return Ok(None);
-                                }
-                            }
-                            let (new_rowid_opt, new_vals) = apply_resolved_set_assignments(
-                                ctx,
-                                &tbl,
-                                &conflict_key,
-                                &old_vals,
-                                &resolved_do_updates[c_idx],
-                                &scopes,
-                                &dml_ctes,
-                                params,
-                            )?;
-                            let excluded_mutation_row = MutationRow {
-                                rowid,
-                                values: raw_vals,
-                            };
-                            return validate_and_write_row(
-                                ctx,
-                                db_id,
-                                &tbl,
-                                &indexes,
-                                new_rowid_opt,
-                                new_vals,
-                                Some(ConflictAction::Abort),
-                                Some(&conflict_key),
-                                params,
-                                false,
-                                true,
-                                &mut stmt_fk_suspects,
-                                0,
-                                Some((MutationOrigin::UpsertDoUpdate, Some(excluded_mutation_row))),
-                                is_catalog,
-                            );
-                        }
-                    }
-                }
-
-                // No UPSERT clause triggered — finish normal INSERT write (`addrRecheck` if `OR REPLACE` ran)
-                if did_replace_delete
-                    && *ctx.foreign_keys
-                    && ctx
-                        .db_set
-                        .slot(db_id)
-                        .is_some_and(|s| !find_referencing_fks(&s.schema, &tbl.name).is_empty())
-                {
-                    recheck_uniqueness_abort(
+            *count_changes_rows += 1;
+            if !p.ret_expanded.is_empty() {
+                let rscope = make_returning_view_scope(&p.view.name, &p.col_specs, &new_vals);
+                let mut rrow = Vec::with_capacity(p.ret_expanded.len());
+                for (pe, _, _) in &p.ret_expanded {
+                    rrow.push(eval_expr(
                         ctx,
-                        db_id,
-                        &tbl,
-                        &ordered_uniques,
-                        &schema_name,
-                        rowid,
-                        &final_key,
-                        &raw_vals,
+                        pe,
+                        params,
+                        std::slice::from_ref(&rscope),
+                        &p.dml_ctes,
                         None,
-                        enc,
-                        params,
-                    )?;
+                    )?);
                 }
-
-                let phys_rec = encode_table_physical_record(&tbl, &raw_vals, enc);
-                if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut())
-                {
-                    if tbl.without_rowid {
-                        let pk_orders = tbl.without_rowid_pk_orders();
-                        bt.insert_index(tbl.root_pgno, &phys_rec, &pk_orders)?;
-                    } else {
-                        bt.insert_table(tbl.root_pgno, rowid, &phys_rec)?;
-                    }
-                }
-                for idx in &indexes {
-                    if index_row_passes_partial_where(
-                        ctx,
-                        &schema_name,
-                        &tbl,
-                        idx,
-                        rowid,
-                        &raw_vals,
-                        params,
-                    )? {
-                        let keys = eval_index_key_values(
-                            ctx,
-                            &schema_name,
-                            &tbl,
-                            idx,
-                            &final_key,
-                            &raw_vals,
-                            params,
-                        )?;
-                        let idx_rec = encode_record_with_encoding(&keys, enc);
-                        let orders = idx.key_sort_orders();
-                        if let Some(ref mut bt) =
-                            ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut())
-                        {
-                            bt.insert_index(idx.root_pgno, &idx_rec, &orders)?;
-                        }
-                    }
-                }
-                if tbl.autoincrement {
-                    update_sqlite_sequence(ctx, db_id, &tbl.name, rowid)?;
-                }
-                if let Some(slot) = ctx.db_set.slot(db_id)
-                    && let Some(ref bt) = slot.btree
-                    && bt.pager().page_count() > slot.max_page_count
-                {
-                    return Err(SqliteError::new(
-                        ErrorCode::Full,
-                        "database or disk is full",
-                    ));
-                }
-                if *ctx.foreign_keys {
-                    register_child_fk_checks(
-                        ctx,
-                        db_id,
-                        &tbl,
-                        &final_key,
-                        &raw_vals,
-                        &mut stmt_fk_suspects,
-                    )?;
-                }
-                let effective_conflict = ins.or_conflict.unwrap_or(if tbl.without_rowid {
-                    tbl.without_rowid_pk_conflict
-                } else {
-                    tbl.rowid_pk_conflict
-                });
-                ctx.mutation_pipeline.dispatch(MutationContext {
-                    db_id,
-                    table_name: tbl.name.clone(),
-                    origin: MutationOrigin::TopLevelInsert,
-                    old_row: None,
-                    new_row: Some(MutationRow {
-                        rowid: final_key.rowid_or_zero(),
-                        values: raw_vals.clone(),
-                    }),
-                    excluded_row: None,
-                    effective_conflict,
-                    emit_update_hook: !tbl.without_rowid && !is_catalog,
-                    invalidate_blobs: false,
-                });
-                if !tbl.without_rowid {
-                    ctx.runtime.last_insert_rowid = rowid;
-                }
-                inserted_count += 1;
-                ctx.runtime.last_changes += 1;
-                ctx.runtime.total_changes += 1;
-                ctx.publish();
-                Ok(Some((final_key, raw_vals)))
-            })()
-        };
-
-        let written_opt = match write_res {
-            Ok(w) => w,
-            Err(e) => {
-                if e.conflict_effect == ConflictResolutionEffect::Fail
-                    && *ctx.foreign_keys
-                    && !stmt_fk_suspects.is_empty()
-                {
-                    verify_fk_suspects(ctx, &stmt_fk_suspects)?;
-                }
-                return Err(e);
+                ret_rows.push(rrow);
             }
-        };
-        if let Some((written_key, written_vals)) = written_opt
-            && !ret_expanded.is_empty()
-        {
-            let rscope =
-                make_returning_table_scope(&tbl, written_key.rowid_or_zero(), &written_vals);
-            let mut rrow = Vec::with_capacity(ret_expanded.len());
-            for (pe, _, _) in &ret_expanded {
-                rrow.push(eval_expr(
-                    ctx,
-                    pe,
-                    params,
-                    std::slice::from_ref(&rscope),
-                    &dml_ctes,
-                    None,
-                )?);
-            }
-            ret_rows.push(rrow);
         }
+        row_idx += 1;
     }
+    Ok(QueryOutput {
+        column_names: p.ret_col_names,
+        rows: ret_rows,
+    })
+}
 
-    if *ctx.foreign_keys && !stmt_fk_suspects.is_empty() {
-        verify_fk_suspects(ctx, &stmt_fk_suspects)?;
-    }
+#[inline(never)]
+fn exec_insert_internal(
+    ctx: &mut ExecContext<'_>,
+    ins: &InsertStmt,
+    effective_or_conflict: Option<ConflictAction>,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    is_top_level: bool,
+) -> Result<QueryOutput> {
+    let mut stmt_changes: u64 = 0;
+    let mut count_changes_rows: u64 = 0;
 
-    if *ctx.count_changes && ret_col_names.is_empty() {
-        Ok(QueryOutput {
-            column_names: vec!["count".to_owned()],
-            rows: vec![vec![Value::Integer(inserted_count as i64)]],
-        })
-    } else {
-        Ok(QueryOutput {
-            column_names: ret_col_names,
-            rows: ret_rows,
-        })
-    }
+    let step_res = match prepare_insert_exec(ctx, ins, effective_or_conflict, params, outer_scopes)
+    {
+        Ok(PreparedInsert::Table(p)) => run_table_insert_loop(
+            ctx,
+            p,
+            ins,
+            effective_or_conflict,
+            params,
+            outer_scopes,
+            &mut stmt_changes,
+            &mut count_changes_rows,
+        ),
+        Ok(PreparedInsert::View(p)) => run_view_insert_loop(
+            ctx,
+            p,
+            ins,
+            effective_or_conflict,
+            params,
+            outer_scopes,
+            &mut count_changes_rows,
+        ),
+        Err(e) => Err(e),
+    };
+
+    finalize_dml_step_result(
+        ctx,
+        step_res,
+        stmt_changes,
+        count_changes_rows,
+        is_top_level,
+    )
 }
 
 fn check_update_from_same_src_alias(
@@ -13261,319 +15295,1174 @@ fn check_update_from_same_src_alias(
     Ok(())
 }
 
-fn exec_update(
+enum PreparedTableUpdateRows {
+    WithFrom(Vec<(TableRowKey, Option<i64>, Vec<Value>)>),
+    PlainKeys(Vec<TableRowKey>),
+}
+
+struct PreparedTableUpdate<'a> {
+    db_id: DatabaseId,
+    tbl: TableSchema,
+    indexes: Vec<IndexSchema>,
+    schema_name: String,
+    is_catalog: bool,
+    dml_ctes: CteStore,
+    resolved_assigns: Vec<(Vec<usize>, bool, &'a Expr)>,
+    modified_col_mask: Vec<bool>,
+    rows: PreparedTableUpdateRows,
+    ret_col_names: Vec<String>,
+    ret_expanded: Vec<(Expr, String, Option<String>)>,
+}
+
+enum PreparedViewUpdateRows {
+    Precomputed(Vec<(Vec<Value>, Vec<Value>)>),
+    PlainOldRows(Vec<Vec<Value>>),
+}
+
+struct PreparedViewUpdate<'a> {
+    db_id: DatabaseId,
+    view: ViewSchema,
+    schema_name: String,
+    dml_ctes: CteStore,
+    col_specs: Vec<(String, Collation, Option<TypeAffinity>)>,
+    resolved_assigns: Vec<(Vec<usize>, bool, &'a Expr)>,
+    rows: PreparedViewUpdateRows,
+    ret_col_names: Vec<String>,
+    ret_expanded: Vec<(Expr, String, Option<String>)>,
+}
+
+enum PreparedUpdate<'a> {
+    Table(Box<PreparedTableUpdate<'a>>),
+    View(Box<PreparedViewUpdate<'a>>),
+}
+
+#[inline(never)]
+fn prepare_update_exec<'a>(
     ctx: &mut ExecContext<'_>,
-    upd: &UpdateStmt,
+    upd: &'a UpdateStmt,
     params: &[Value],
-) -> Result<QueryOutput> {
-    let (db_id, initial_tbl, _, is_catalog) =
-        resolve_dml_target_table_in_set(ctx.db_set, &upd.table, *ctx.writable_schema)?;
-    let dml_ctes = CteStore::default().with_scope(&upd.ctes);
-
-    let _ = resolve_set_assignments_for_table(&initial_tbl, &upd.assignments)?;
-
-    // Evaluate optional `FROM` clause BEFORE acquiring write slot (`SF_NestedFrom` — target table not in scope!)
-    let from_rows_opt = if let Some(ref fc) = upd.from {
-        if 2 + fc.joins.len() > 64 {
-            return Err(SqliteError::new(
-                ErrorCode::Error,
-                "at most 64 tables in a join",
-            ));
-        }
-        check_update_from_same_src_alias(
-            db_id,
-            &initial_tbl.name,
-            upd.alias.as_deref(),
-            fc,
-            ctx.db_set,
-            &dml_ctes,
-        )?;
-        Some(eval_from_clause(ctx, fc, None, params, &[], &dml_ctes)?)
-    } else {
-        None
-    };
-
-    let (tbl, indexes, schema_name) =
-        prepare_dml_write_slot(ctx, db_id, &upd.table, is_catalog, initial_tbl)?;
-    let (enc, _) = slot_encoding_and_name(ctx, db_id);
-    let resolved_assigns = resolve_set_assignments_for_table(&tbl, &upd.assignments)?;
-
-    let plan_where_hint = if upd.from.is_none() || upd.indexed_by.is_some() {
-        upd.selection.as_ref()
-    } else {
-        None
-    };
-    let candidates = read_table_with_plan(
-        ctx,
-        db_id,
-        &tbl,
-        upd.alias.as_deref(),
-        upd.indexed_by.as_ref(),
-        plan_where_hint,
-        params,
-        &[],
-        &dml_ctes,
+    outer_scopes: &[EvalRow],
+) -> Result<PreparedUpdate<'a>> {
+    let mod_col_names = collect_set_assignment_col_names(&upd.assignments);
+    let target = resolve_dml_target_in_set(
+        ctx.db_set,
+        &upd.table,
+        *ctx.writable_schema,
+        false,
+        TriggerEventKind::Update,
+        Some(&mod_col_names),
     )?;
-
+    let dml_ctes = CteStore::default().with_scope_at(&upd.ctes, outer_scopes.len());
     let has_set_agg = upd.from.is_some()
         && upd
             .assignments
             .iter()
             .any(|sa| expr_contains_aggregate(&sa.expr));
 
-    // Two-phase update: collect all matching `(old_key, new_rowid_opt, new_col_vals)` before mutating B-Trees!
-    let pending_updates: Vec<(TableRowKey, Option<i64>, Vec<Value>)> = if let Some(ref from_rows) =
-        from_rows_opt
-    {
-        if has_set_agg {
-            let mut matched_keys: Vec<(TableRowKey, Vec<Value>)> = Vec::new();
-            let mut agg_rows: Vec<EvalRow> = Vec::new();
-            for (old_key, payload) in candidates {
-                let old_vals =
-                    decode_table_logical_row(ctx, db_id, &tbl, &old_key, &payload, params)?;
-                let target_scope = make_single_table_scope(
-                    &tbl,
-                    &schema_name,
-                    upd.alias.as_deref(),
-                    old_key.rowid_or_zero(),
-                    &old_vals,
-                );
-                for from_row in from_rows {
-                    ctx.step_tick()?;
-                    let mut combined_cols =
-                        Vec::with_capacity(target_scope.cols.len() + from_row.cols.len());
-                    combined_cols.extend_from_slice(&target_scope.cols);
-                    combined_cols.extend_from_slice(&from_row.cols);
-                    let mut combined_vals =
-                        Vec::with_capacity(target_scope.vals.len() + from_row.vals.len());
-                    combined_vals.extend_from_slice(&target_scope.vals);
-                    combined_vals.extend_from_slice(&from_row.vals);
-                    let combined_scope = EvalRow::new(combined_cols.into(), combined_vals);
-                    let scopes = std::slice::from_ref(&combined_scope);
-
-                    if let Some(ref w) = upd.selection {
-                        let cond = eval_expr(ctx, w, params, scopes, &dml_ctes, None)?;
-                        if cond.truthiness() != Some(true) {
-                            continue;
-                        }
-                    }
-                    matched_keys.push((old_key.clone(), old_vals.clone()));
-                    agg_rows.push(combined_scope);
-                }
-            }
-            if let Some((first_key, first_vals)) = matched_keys.first() {
-                let scopes = std::slice::from_ref(&agg_rows[0]);
-                let (new_rowid_opt, new_vals) = apply_resolved_set_assignments_with_agg(
-                    ctx,
-                    &tbl,
-                    first_key,
-                    first_vals,
-                    &resolved_assigns,
-                    scopes,
-                    Some(&agg_rows),
-                    &dml_ctes,
-                    params,
-                )?;
-                vec![(first_key.clone(), new_rowid_opt, new_vals)]
-            } else {
-                // Ungrouped aggregate on 0 matching rows evaluates once against an empty group (`rowid = NULL` -> 0 updates)
-                let dummy_target =
-                    make_static_table_scope(&tbl, &schema_name, upd.alias.as_deref());
-                let from_preview = upd
-                    .from
-                    .as_ref()
-                    .and_then(|fc| schema_cols_preview(ctx, fc, params, &[], &dml_ctes))
-                    .unwrap_or_default();
-                let mut combined_cols =
-                    Vec::with_capacity(dummy_target.cols.len() + from_preview.len());
-                combined_cols.extend_from_slice(&dummy_target.cols);
-                combined_cols.extend(from_preview);
-                let n_cols = combined_cols.len();
-                let dummy_scope = EvalRow::new(combined_cols.into(), vec![Value::Null; n_cols]);
-                let dummy_vals = vec![Value::Null; tbl.columns.len()];
-                let _ = apply_resolved_set_assignments_with_agg(
-                    ctx,
-                    &tbl,
-                    &TableRowKey::Rowid(0),
-                    &dummy_vals,
-                    &resolved_assigns,
-                    std::slice::from_ref(&dummy_scope),
-                    Some(&[]),
-                    &dml_ctes,
-                    params,
-                )?;
-                Vec::new()
-            }
-        } else {
-            let pk_orders: Rc<[KeySortOrder]> = if tbl.without_rowid {
-                tbl.without_rowid_pk_orders().into()
-            } else {
-                Rc::from(&[][..])
-            };
-            let mut ephemeral: BTreeMap<OrdTableKey, (Option<i64>, Vec<Value>)> = BTreeMap::new();
-            for (old_key, payload) in candidates {
-                let old_vals =
-                    decode_table_logical_row(ctx, db_id, &tbl, &old_key, &payload, params)?;
-                let target_scope = make_single_table_scope(
-                    &tbl,
-                    &schema_name,
-                    upd.alias.as_deref(),
-                    old_key.rowid_or_zero(),
-                    &old_vals,
-                );
-                for from_row in from_rows {
-                    ctx.step_tick()?;
-                    let mut combined_cols =
-                        Vec::with_capacity(target_scope.cols.len() + from_row.cols.len());
-                    combined_cols.extend_from_slice(&target_scope.cols);
-                    combined_cols.extend_from_slice(&from_row.cols);
-                    let mut combined_vals =
-                        Vec::with_capacity(target_scope.vals.len() + from_row.vals.len());
-                    combined_vals.extend_from_slice(&target_scope.vals);
-                    combined_vals.extend_from_slice(&from_row.vals);
-                    let combined_scope = EvalRow::new(combined_cols.into(), combined_vals);
-                    let scopes = std::slice::from_ref(&combined_scope);
-
-                    if let Some(ref w) = upd.selection {
-                        let cond = eval_expr(ctx, w, params, scopes, &dml_ctes, None)?;
-                        if cond.truthiness() != Some(true) {
-                            continue;
-                        }
-                    }
-
-                    let (new_rowid_opt, new_vals) = apply_resolved_set_assignments(
-                        ctx,
-                        &tbl,
-                        &old_key,
-                        &old_vals,
-                        &resolved_assigns,
-                        scopes,
-                        &dml_ctes,
-                        params,
-                    )?;
-                    ephemeral.insert(
-                        OrdTableKey {
-                            key: old_key.clone(),
-                            pk_orders: Rc::clone(&pk_orders),
-                            enc,
-                        },
-                        (new_rowid_opt, new_vals),
-                    );
-                }
-            }
-            ephemeral
-                .into_iter()
-                .map(|(ok, (nr, nv))| (ok.key, nr, nv))
-                .collect()
-        }
-    } else {
-        let _ = resolved_assigns;
-        let resolved_assigns = resolve_set_assignments_for_table(&tbl, &upd.assignments)?;
-        let mut out = Vec::new();
-        for (old_key, payload) in candidates {
-            let old_vals = decode_table_logical_row(ctx, db_id, &tbl, &old_key, &payload, params)?;
-            let scope = make_single_table_scope(
-                &tbl,
-                &schema_name,
-                upd.alias.as_deref(),
-                old_key.rowid_or_zero(),
-                &old_vals,
-            );
-            let scopes = std::slice::from_ref(&scope);
-            if let Some(ref w) = upd.selection {
-                let cond = eval_expr(ctx, w, params, scopes, &dml_ctes, None)?;
-                if cond.truthiness() != Some(true) {
-                    continue;
-                }
-            }
-            let (new_rowid_opt, new_vals) = apply_resolved_set_assignments(
-                ctx,
-                &tbl,
-                &old_key,
-                &old_vals,
-                &resolved_assigns,
-                scopes,
-                &dml_ctes,
-                params,
-            )?;
-            out.push((old_key, new_rowid_opt, new_vals));
-        }
-        out
-    };
-
-    ctx.runtime.last_changes = 0;
-    ctx.publish();
-
-    let sample_scope = make_returning_table_scope(&tbl, 0, &vec![Value::Null; tbl.columns.len()]);
-    let (ret_col_names, ret_expanded) = if upd.returning.is_empty() {
-        (Vec::new(), Vec::new())
-    } else {
-        expand_returning_projection(&upd.returning, &sample_scope.cols)?
-    };
-    let mut ret_rows = Vec::new();
-    let mut stmt_fk_suspects = Vec::new();
-
-    for (old_key, new_rowid_opt, new_vals) in pending_updates {
-        let write_res = validate_and_write_row(
-            ctx,
+    match target {
+        DmlTarget::View {
             db_id,
-            &tbl,
-            &indexes,
+            view,
+            schema_name,
+        } => {
+            if let Some(IndexHint::IndexedBy(ref idx_name)) = upd.indexed_by {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such index: {idx_name}"),
+                ));
+            }
+            let col_specs = resolve_view_col_specs_static(
+                db_id,
+                &view,
+                ctx.db_set,
+                &dml_ctes,
+                ctx.functions,
+                &mut Vec::new(),
+            )?;
+            let resolved_assigns = resolve_set_assignments_for_view(&col_specs, &upd.assignments)?;
+
+            let from_rows_opt = if let Some(ref fc) = upd.from {
+                if 2 + fc.joins.len() > 64 {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "at most 64 tables in a join",
+                    ));
+                }
+                check_update_from_same_src_alias(
+                    db_id,
+                    &view.name,
+                    upd.alias.as_deref(),
+                    fc,
+                    ctx.db_set,
+                    &dml_ctes,
+                )?;
+                Some(eval_from_clause(
+                    ctx,
+                    fc,
+                    None,
+                    params,
+                    outer_scopes,
+                    &dml_ctes,
+                )?)
+            } else {
+                None
+            };
+
+            let (view_out, _, _) = eval_view_query_output(ctx, db_id, &view, &CteStore::default())?;
+            let rows = if let Some(ref from_rows) = from_rows_opt {
+                if has_set_agg {
+                    let mut matched_old: Vec<Vec<Value>> = Vec::new();
+                    let mut agg_rows: Vec<EvalRow> = Vec::new();
+                    for old_vals in view_out.rows {
+                        let target_scope = make_single_view_scope(
+                            &view.name,
+                            &schema_name,
+                            upd.alias.as_deref(),
+                            &col_specs,
+                            &old_vals,
+                        );
+                        for from_row in from_rows {
+                            ctx.step_tick()?;
+                            let mut combined_cols =
+                                Vec::with_capacity(target_scope.cols.len() + from_row.cols.len());
+                            combined_cols.extend_from_slice(&target_scope.cols);
+                            combined_cols.extend_from_slice(&from_row.cols);
+                            let mut combined_vals =
+                                Vec::with_capacity(target_scope.vals.len() + from_row.vals.len());
+                            combined_vals.extend_from_slice(&target_scope.vals);
+                            combined_vals.extend_from_slice(&from_row.vals);
+                            let combined_scope = EvalRow::new(combined_cols.into(), combined_vals);
+                            let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
+                            scopes.push(combined_scope.clone());
+                            scopes.extend_from_slice(outer_scopes);
+
+                            if let Some(ref w) = upd.selection {
+                                let cond = eval_expr(ctx, w, params, &scopes, &dml_ctes, None)?;
+                                if cond.truthiness() != Some(true) {
+                                    continue;
+                                }
+                            }
+                            matched_old.push(old_vals.clone());
+                            agg_rows.push(combined_scope);
+                        }
+                    }
+                    if let Some(first_old) = matched_old.first() {
+                        let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
+                        scopes.push(agg_rows[0].clone());
+                        scopes.extend_from_slice(outer_scopes);
+                        let new_vals = apply_resolved_set_assignments_for_view(
+                            ctx,
+                            first_old,
+                            &resolved_assigns,
+                            &scopes,
+                            Some(&agg_rows),
+                            &dml_ctes,
+                            params,
+                        )?;
+                        PreparedViewUpdateRows::Precomputed(vec![(first_old.clone(), new_vals)])
+                    } else {
+                        let dummy_vals = vec![Value::Null; col_specs.len()];
+                        let dummy_target = make_single_view_scope(
+                            &view.name,
+                            &schema_name,
+                            upd.alias.as_deref(),
+                            &col_specs,
+                            &dummy_vals,
+                        );
+                        let from_preview = upd
+                            .from
+                            .as_ref()
+                            .and_then(|fc| {
+                                schema_cols_preview(ctx, fc, params, outer_scopes, &dml_ctes)
+                            })
+                            .unwrap_or_default();
+                        let mut combined_cols =
+                            Vec::with_capacity(dummy_target.cols.len() + from_preview.len());
+                        combined_cols.extend_from_slice(&dummy_target.cols);
+                        combined_cols.extend(from_preview);
+                        let n_cols = combined_cols.len();
+                        let dummy_scope =
+                            EvalRow::new(combined_cols.into(), vec![Value::Null; n_cols]);
+                        let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
+                        scopes.push(dummy_scope);
+                        scopes.extend_from_slice(outer_scopes);
+                        let _ = apply_resolved_set_assignments_for_view(
+                            ctx,
+                            &dummy_vals,
+                            &resolved_assigns,
+                            &scopes,
+                            Some(&[]),
+                            &dml_ctes,
+                            params,
+                        )?;
+                        PreparedViewUpdateRows::Precomputed(Vec::new())
+                    }
+                } else {
+                    let mut pairs = Vec::new();
+                    for old_vals in view_out.rows {
+                        let target_scope = make_single_view_scope(
+                            &view.name,
+                            &schema_name,
+                            upd.alias.as_deref(),
+                            &col_specs,
+                            &old_vals,
+                        );
+                        for from_row in from_rows {
+                            ctx.step_tick()?;
+                            let mut combined_cols =
+                                Vec::with_capacity(target_scope.cols.len() + from_row.cols.len());
+                            combined_cols.extend_from_slice(&target_scope.cols);
+                            combined_cols.extend_from_slice(&from_row.cols);
+                            let mut combined_vals =
+                                Vec::with_capacity(target_scope.vals.len() + from_row.vals.len());
+                            combined_vals.extend_from_slice(&target_scope.vals);
+                            combined_vals.extend_from_slice(&from_row.vals);
+                            let combined_scope = EvalRow::new(combined_cols.into(), combined_vals);
+                            let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
+                            scopes.push(combined_scope);
+                            scopes.extend_from_slice(outer_scopes);
+
+                            if let Some(ref w) = upd.selection {
+                                let cond = eval_expr(ctx, w, params, &scopes, &dml_ctes, None)?;
+                                if cond.truthiness() != Some(true) {
+                                    continue;
+                                }
+                            }
+                            let new_vals = apply_resolved_set_assignments_for_view(
+                                ctx,
+                                &old_vals,
+                                &resolved_assigns,
+                                &scopes,
+                                None,
+                                &dml_ctes,
+                                params,
+                            )?;
+                            pairs.push((old_vals.clone(), new_vals));
+                        }
+                    }
+                    PreparedViewUpdateRows::Precomputed(pairs)
+                }
+            } else {
+                let mut matched = Vec::new();
+                for old_vals in view_out.rows {
+                    let scope = make_single_view_scope(
+                        &view.name,
+                        &schema_name,
+                        upd.alias.as_deref(),
+                        &col_specs,
+                        &old_vals,
+                    );
+                    let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
+                    scopes.push(scope);
+                    scopes.extend_from_slice(outer_scopes);
+                    if let Some(ref w) = upd.selection {
+                        let cond = eval_expr(ctx, w, params, &scopes, &dml_ctes, None)?;
+                        if cond.truthiness() != Some(true) {
+                            continue;
+                        }
+                    }
+                    matched.push(old_vals);
+                }
+                PreparedViewUpdateRows::PlainOldRows(matched)
+            };
+
+            let sample_scope = make_returning_view_scope(
+                &view.name,
+                &col_specs,
+                &vec![Value::Null; col_specs.len()],
+            );
+            let (ret_col_names, ret_expanded) = if upd.returning.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                expand_returning_projection(&upd.returning, &sample_scope.cols)?
+            };
+
+            Ok(PreparedUpdate::View(Box::new(PreparedViewUpdate {
+                db_id,
+                view: *view,
+                schema_name,
+                dml_ctes,
+                col_specs,
+                resolved_assigns,
+                rows,
+                ret_col_names,
+                ret_expanded,
+            })))
+        }
+        DmlTarget::Table {
+            db_id,
+            tbl: initial_tbl,
+            is_catalog,
+            ..
+        } => {
+            let _ = resolve_set_assignments_for_table(&initial_tbl, &upd.assignments)?;
+            let from_rows_opt = if let Some(ref fc) = upd.from {
+                if 2 + fc.joins.len() > 64 {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "at most 64 tables in a join",
+                    ));
+                }
+                check_update_from_same_src_alias(
+                    db_id,
+                    &initial_tbl.name,
+                    upd.alias.as_deref(),
+                    fc,
+                    ctx.db_set,
+                    &dml_ctes,
+                )?;
+                Some(eval_from_clause(
+                    ctx,
+                    fc,
+                    None,
+                    params,
+                    outer_scopes,
+                    &dml_ctes,
+                )?)
+            } else {
+                None
+            };
+
+            let (tbl, indexes, schema_name) =
+                prepare_dml_write_slot(ctx, db_id, &upd.table, is_catalog, *initial_tbl)?;
+            let (enc, _) = slot_encoding_and_name(ctx, db_id);
+            let resolved_assigns = resolve_set_assignments_for_table(&tbl, &upd.assignments)?;
+            let modified_col_mask = build_table_modified_col_mask(&tbl, &resolved_assigns);
+
+            let plan_where_hint = if upd.from.is_none() || upd.indexed_by.is_some() {
+                upd.selection.as_ref()
+            } else {
+                None
+            };
+            let candidates = read_table_with_plan(
+                ctx,
+                db_id,
+                &tbl,
+                upd.alias.as_deref(),
+                upd.indexed_by.as_ref(),
+                plan_where_hint,
+                params,
+                outer_scopes,
+                &dml_ctes,
+            )?;
+
+            let rows = if let Some(ref from_rows) = from_rows_opt {
+                if has_set_agg {
+                    let mut matched_keys: Vec<(TableRowKey, Vec<Value>)> = Vec::new();
+                    let mut agg_rows: Vec<EvalRow> = Vec::new();
+                    for (old_key, payload) in candidates {
+                        let old_vals =
+                            decode_table_logical_row(ctx, db_id, &tbl, &old_key, &payload, params)?;
+                        let target_scope = make_single_table_scope(
+                            &tbl,
+                            &schema_name,
+                            upd.alias.as_deref(),
+                            old_key.rowid_or_zero(),
+                            &old_vals,
+                        );
+                        for from_row in from_rows {
+                            ctx.step_tick()?;
+                            let mut combined_cols =
+                                Vec::with_capacity(target_scope.cols.len() + from_row.cols.len());
+                            combined_cols.extend_from_slice(&target_scope.cols);
+                            combined_cols.extend_from_slice(&from_row.cols);
+                            let mut combined_vals =
+                                Vec::with_capacity(target_scope.vals.len() + from_row.vals.len());
+                            combined_vals.extend_from_slice(&target_scope.vals);
+                            combined_vals.extend_from_slice(&from_row.vals);
+                            let combined_scope = EvalRow::new(combined_cols.into(), combined_vals);
+                            let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
+                            scopes.push(combined_scope.clone());
+                            scopes.extend_from_slice(outer_scopes);
+
+                            if let Some(ref w) = upd.selection {
+                                let cond = eval_expr(ctx, w, params, &scopes, &dml_ctes, None)?;
+                                if cond.truthiness() != Some(true) {
+                                    continue;
+                                }
+                            }
+                            matched_keys.push((old_key.clone(), old_vals.clone()));
+                            agg_rows.push(combined_scope);
+                        }
+                    }
+                    let pending = if let Some((first_key, first_vals)) = matched_keys.first() {
+                        let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
+                        scopes.push(agg_rows[0].clone());
+                        scopes.extend_from_slice(outer_scopes);
+                        let (new_rowid_opt, new_vals) = apply_resolved_set_assignments_with_agg(
+                            ctx,
+                            &tbl,
+                            first_key,
+                            first_vals,
+                            &resolved_assigns,
+                            &scopes,
+                            Some(&agg_rows),
+                            &dml_ctes,
+                            params,
+                        )?;
+                        vec![(first_key.clone(), new_rowid_opt, new_vals)]
+                    } else {
+                        let dummy_target =
+                            make_static_table_scope(&tbl, &schema_name, upd.alias.as_deref());
+                        let from_preview = upd
+                            .from
+                            .as_ref()
+                            .and_then(|fc| {
+                                schema_cols_preview(ctx, fc, params, outer_scopes, &dml_ctes)
+                            })
+                            .unwrap_or_default();
+                        let mut combined_cols =
+                            Vec::with_capacity(dummy_target.cols.len() + from_preview.len());
+                        combined_cols.extend_from_slice(&dummy_target.cols);
+                        combined_cols.extend(from_preview);
+                        let n_cols = combined_cols.len();
+                        let dummy_scope =
+                            EvalRow::new(combined_cols.into(), vec![Value::Null; n_cols]);
+                        let dummy_vals = vec![Value::Null; tbl.columns.len()];
+                        let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
+                        scopes.push(dummy_scope);
+                        scopes.extend_from_slice(outer_scopes);
+                        let _ = apply_resolved_set_assignments_with_agg(
+                            ctx,
+                            &tbl,
+                            &TableRowKey::Rowid(0),
+                            &dummy_vals,
+                            &resolved_assigns,
+                            &scopes,
+                            Some(&[]),
+                            &dml_ctes,
+                            params,
+                        )?;
+                        Vec::new()
+                    };
+                    PreparedTableUpdateRows::WithFrom(pending)
+                } else {
+                    let pk_orders: Rc<[KeySortOrder]> = if tbl.without_rowid {
+                        tbl.without_rowid_pk_orders().into()
+                    } else {
+                        Rc::from(&[][..])
+                    };
+                    let mut ephemeral: BTreeMap<OrdTableKey, (Option<i64>, Vec<Value>)> =
+                        BTreeMap::new();
+                    for (old_key, payload) in candidates {
+                        let old_vals =
+                            decode_table_logical_row(ctx, db_id, &tbl, &old_key, &payload, params)?;
+                        let target_scope = make_single_table_scope(
+                            &tbl,
+                            &schema_name,
+                            upd.alias.as_deref(),
+                            old_key.rowid_or_zero(),
+                            &old_vals,
+                        );
+                        for from_row in from_rows {
+                            ctx.step_tick()?;
+                            let mut combined_cols =
+                                Vec::with_capacity(target_scope.cols.len() + from_row.cols.len());
+                            combined_cols.extend_from_slice(&target_scope.cols);
+                            combined_cols.extend_from_slice(&from_row.cols);
+                            let mut combined_vals =
+                                Vec::with_capacity(target_scope.vals.len() + from_row.vals.len());
+                            combined_vals.extend_from_slice(&target_scope.vals);
+                            combined_vals.extend_from_slice(&from_row.vals);
+                            let combined_scope = EvalRow::new(combined_cols.into(), combined_vals);
+                            let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
+                            scopes.push(combined_scope);
+                            scopes.extend_from_slice(outer_scopes);
+
+                            if let Some(ref w) = upd.selection {
+                                let cond = eval_expr(ctx, w, params, &scopes, &dml_ctes, None)?;
+                                if cond.truthiness() != Some(true) {
+                                    continue;
+                                }
+                            }
+
+                            let (new_rowid_opt, new_vals) = apply_resolved_set_assignments(
+                                ctx,
+                                &tbl,
+                                &old_key,
+                                &old_vals,
+                                &resolved_assigns,
+                                &scopes,
+                                &dml_ctes,
+                                params,
+                            )?;
+                            ephemeral.insert(
+                                OrdTableKey {
+                                    key: old_key.clone(),
+                                    pk_orders: Rc::clone(&pk_orders),
+                                    enc,
+                                },
+                                (new_rowid_opt, new_vals),
+                            );
+                        }
+                    }
+                    PreparedTableUpdateRows::WithFrom(
+                        ephemeral
+                            .into_iter()
+                            .map(|(ok, (nr, nv))| (ok.key, nr, nv))
+                            .collect(),
+                    )
+                }
+            } else {
+                // Plain `UPDATE` (`update.c:819-830`): pass 1 collects matching `old_key`s only!
+                let mut keys = Vec::new();
+                for (old_key, payload) in candidates {
+                    let old_vals =
+                        decode_table_logical_row(ctx, db_id, &tbl, &old_key, &payload, params)?;
+                    let scope = make_single_table_scope(
+                        &tbl,
+                        &schema_name,
+                        upd.alias.as_deref(),
+                        old_key.rowid_or_zero(),
+                        &old_vals,
+                    );
+                    let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
+                    scopes.push(scope);
+                    scopes.extend_from_slice(outer_scopes);
+                    if let Some(ref w) = upd.selection {
+                        let cond = eval_expr(ctx, w, params, &scopes, &dml_ctes, None)?;
+                        if cond.truthiness() != Some(true) {
+                            continue;
+                        }
+                    }
+                    keys.push(old_key);
+                }
+                PreparedTableUpdateRows::PlainKeys(keys)
+            };
+
+            let sample_scope =
+                make_returning_table_scope(&tbl, 0, &vec![Value::Null; tbl.columns.len()]);
+            let (ret_col_names, ret_expanded) = if upd.returning.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                expand_returning_projection(&upd.returning, &sample_scope.cols)?
+            };
+
+            Ok(PreparedUpdate::Table(Box::new(PreparedTableUpdate {
+                db_id,
+                tbl,
+                indexes,
+                schema_name,
+                is_catalog,
+                dml_ctes,
+                resolved_assigns,
+                modified_col_mask,
+                rows,
+                ret_col_names,
+                ret_expanded,
+            })))
+        }
+    }
+}
+
+fn exec_update(
+    ctx: &mut ExecContext<'_>,
+    upd: &UpdateStmt,
+    params: &[Value],
+) -> Result<QueryOutput> {
+    exec_update_internal(ctx, upd, upd.or_conflict, params, &[], true)
+}
+
+#[inline(never)]
+#[allow(clippy::type_complexity)]
+fn prepare_plain_table_update_row(
+    ctx: &mut ExecContext<'_>,
+    p: &PreparedTableUpdate<'_>,
+    upd: &UpdateStmt,
+    old_key: &TableRowKey,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+) -> Result<Option<(Vec<Value>, Option<i64>, Vec<Value>)>> {
+    let Some(cur_payload) = seek_table_raw_entry(ctx, p.db_id, &p.tbl, old_key)? else {
+        return Ok(None);
+    };
+    let old_vals = decode_table_logical_row(ctx, p.db_id, &p.tbl, old_key, &cur_payload, params)?;
+    let scope = make_single_table_scope(
+        &p.tbl,
+        &p.schema_name,
+        upd.alias.as_deref(),
+        old_key.rowid_or_zero(),
+        &old_vals,
+    );
+    let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
+    scopes.push(scope);
+    scopes.extend_from_slice(outer_scopes);
+    let (new_rowid_opt, new_vals) = apply_resolved_set_assignments(
+        ctx,
+        &p.tbl,
+        old_key,
+        &old_vals,
+        &p.resolved_assigns,
+        &scopes,
+        &p.dml_ctes,
+        params,
+    )?;
+    Ok(Some((old_vals, new_rowid_opt, new_vals)))
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn run_table_update_with_from(
+    ctx: &mut ExecContext<'_>,
+    p: &PreparedTableUpdate<'_>,
+    pending: Vec<(TableRowKey, Option<i64>, Vec<Value>)>,
+    mod_col_names: &[&str],
+    effective_or_conflict: Option<ConflictAction>,
+    params: &[Value],
+    stmt_changes: &mut u64,
+    count_changes_rows: &mut u64,
+    ret_rows: &mut Vec<Vec<Value>>,
+) -> Result<()> {
+    for (old_key, new_rowid_opt, mut new_vals) in pending {
+        ctx.step_tick()?;
+        let Some(old_vals) = ({
+            let opt = seek_table_raw_entry(ctx, p.db_id, &p.tbl, &old_key)?;
+            match opt {
+                Some(cur_payload) => Some(decode_table_logical_row(
+                    ctx,
+                    p.db_id,
+                    &p.tbl,
+                    &old_key,
+                    &cur_payload,
+                    params,
+                )?),
+                None => None,
+            }
+        }) else {
+            continue;
+        };
+        for (ci, col) in p.tbl.columns.iter().enumerate() {
+            if col.generated.is_none()
+                && p.tbl.rowid_alias_col != Some(ci)
+                && !p.modified_col_mask.get(ci).copied().unwrap_or(false)
+            {
+                new_vals[ci] = old_vals[ci].clone();
+            }
+        }
+        update_existing_table_row_with_triggers(
+            ctx,
+            p.db_id,
+            &p.tbl,
+            &p.indexes,
+            &p.schema_name,
+            &old_key,
+            old_vals,
             new_rowid_opt,
             new_vals,
-            upd.or_conflict,
-            Some(&old_key),
-            params,
-            false,
-            true,
-            &mut stmt_fk_suspects,
-            0,
+            &p.modified_col_mask,
+            mod_col_names,
+            effective_or_conflict,
             Some((MutationOrigin::TopLevelUpdate, None)),
-            is_catalog,
-        );
-        let written_opt = match write_res {
-            Ok(w) => w,
-            Err(e) => {
-                if e.conflict_effect == ConflictResolutionEffect::Fail
-                    && *ctx.foreign_keys
-                    && !stmt_fk_suspects.is_empty()
-                {
-                    verify_fk_suspects(ctx, &stmt_fk_suspects)?;
+            p.is_catalog,
+            params,
+            |ctx, written_key, written_vals| {
+                *stmt_changes += 1;
+                *count_changes_rows += 1;
+                if !p.ret_expanded.is_empty() {
+                    let rscope = make_returning_table_scope(
+                        &p.tbl,
+                        written_key.rowid_or_zero(),
+                        written_vals,
+                    );
+                    let mut rrow = Vec::with_capacity(p.ret_expanded.len());
+                    for (pe, _, _) in &p.ret_expanded {
+                        rrow.push(eval_expr(
+                            ctx,
+                            pe,
+                            params,
+                            std::slice::from_ref(&rscope),
+                            &p.dml_ctes,
+                            None,
+                        )?);
+                    }
+                    ret_rows.push(rrow);
                 }
-                return Err(e);
-            }
-        };
-        if let Some((written_key, written_vals)) = written_opt
-            && !ret_expanded.is_empty()
-        {
-            let rscope =
-                make_returning_table_scope(&tbl, written_key.rowid_or_zero(), &written_vals);
-            let mut rrow = Vec::with_capacity(ret_expanded.len());
-            for (pe, _, _) in &ret_expanded {
-                rrow.push(eval_expr(
+                Ok(())
+            },
+        )?;
+    }
+    Ok(())
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn record_plain_table_update_written(
+    ctx: &mut ExecContext<'_>,
+    p: &PreparedTableUpdate<'_>,
+    written_key: &TableRowKey,
+    written_vals: &[Value],
+    params: &[Value],
+    stmt_changes: &mut u64,
+    count_changes_rows: &mut u64,
+    ret_rows: &mut Vec<Vec<Value>>,
+) -> Result<()> {
+    *stmt_changes += 1;
+    *count_changes_rows += 1;
+    if !p.ret_expanded.is_empty() {
+        let rscope = make_returning_table_scope(&p.tbl, written_key.rowid_or_zero(), written_vals);
+        let mut rrow = Vec::with_capacity(p.ret_expanded.len());
+        for (pe, _, _) in &p.ret_expanded {
+            rrow.push(eval_expr(
+                ctx,
+                pe,
+                params,
+                std::slice::from_ref(&rscope),
+                &p.dml_ctes,
+                None,
+            )?);
+        }
+        ret_rows.push(rrow);
+    }
+    Ok(())
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn run_table_update_loop(
+    ctx: &mut ExecContext<'_>,
+    mut p: Box<PreparedTableUpdate<'_>>,
+    upd: &UpdateStmt,
+    mod_col_names: &[&str],
+    effective_or_conflict: Option<ConflictAction>,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    stmt_changes: &mut u64,
+    count_changes_rows: &mut u64,
+) -> Result<QueryOutput> {
+    let rows = Box::new(std::mem::replace(
+        &mut p.rows,
+        PreparedTableUpdateRows::PlainKeys(Vec::new()),
+    ));
+    let mut ret_rows = Vec::new();
+    match *rows {
+        PreparedTableUpdateRows::WithFrom(pending) => {
+            run_table_update_with_from(
+                ctx,
+                &p,
+                pending,
+                mod_col_names,
+                effective_or_conflict,
+                params,
+                stmt_changes,
+                count_changes_rows,
+                &mut ret_rows,
+            )?;
+        }
+        PreparedTableUpdateRows::PlainKeys(keys) => {
+            let keys = keys.into_boxed_slice();
+            for old_key in keys.iter() {
+                ctx.step_tick()?;
+                let Some((old_vals, new_rowid_opt, new_vals)) =
+                    prepare_plain_table_update_row(ctx, &p, upd, old_key, params, outer_scopes)?
+                else {
+                    continue;
+                };
+                let p_ref = &*p;
+                update_existing_table_row_with_triggers(
                     ctx,
-                    pe,
+                    p_ref.db_id,
+                    &p_ref.tbl,
+                    &p_ref.indexes,
+                    &p_ref.schema_name,
+                    old_key,
+                    old_vals,
+                    new_rowid_opt,
+                    new_vals,
+                    &p_ref.modified_col_mask,
+                    mod_col_names,
+                    effective_or_conflict,
+                    Some((MutationOrigin::TopLevelUpdate, None)),
+                    p_ref.is_catalog,
                     params,
-                    std::slice::from_ref(&rscope),
-                    &dml_ctes,
-                    None,
-                )?);
+                    |ctx, written_key, written_vals| {
+                        record_plain_table_update_written(
+                            ctx,
+                            p_ref,
+                            written_key,
+                            written_vals,
+                            params,
+                            stmt_changes,
+                            count_changes_rows,
+                            &mut ret_rows,
+                        )
+                    },
+                )?;
             }
-            ret_rows.push(rrow);
         }
     }
+    Ok(QueryOutput {
+        column_names: p.ret_col_names,
+        rows: ret_rows,
+    })
+}
 
-    if *ctx.foreign_keys && !stmt_fk_suspects.is_empty() {
-        verify_fk_suspects(ctx, &stmt_fk_suspects)?;
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn run_view_update_loop(
+    ctx: &mut ExecContext<'_>,
+    mut p: Box<PreparedViewUpdate<'_>>,
+    upd: &UpdateStmt,
+    mod_col_names: &[&str],
+    effective_or_conflict: Option<ConflictAction>,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    count_changes_rows: &mut u64,
+) -> Result<QueryOutput> {
+    let rows = std::mem::replace(
+        &mut p.rows,
+        PreparedViewUpdateRows::PlainOldRows(Vec::new()),
+    );
+    let mut ret_rows = Vec::new();
+    match rows {
+        PreparedViewUpdateRows::Precomputed(pairs) => {
+            for (old_vals, new_vals) in pairs {
+                ctx.step_tick()?;
+                let pscope =
+                    make_runtime_view_pseudo_scope(&p.col_specs, Some(&old_vals), Some(&new_vals));
+                drop(old_vals);
+                if fire_row_triggers(
+                    ctx,
+                    p.db_id,
+                    &p.view.name,
+                    TriggerTiming::InsteadOf,
+                    TriggerEventKind::Update,
+                    Some(mod_col_names),
+                    pscope,
+                    effective_or_conflict,
+                )? == TriggerOutcome::Continue
+                {
+                    *count_changes_rows += 1;
+                    if !p.ret_expanded.is_empty() {
+                        let rscope =
+                            make_returning_view_scope(&p.view.name, &p.col_specs, &new_vals);
+                        let mut rrow = Vec::with_capacity(p.ret_expanded.len());
+                        for (pe, _, _) in &p.ret_expanded {
+                            rrow.push(eval_expr(
+                                ctx,
+                                pe,
+                                params,
+                                std::slice::from_ref(&rscope),
+                                &p.dml_ctes,
+                                None,
+                            )?);
+                        }
+                        ret_rows.push(rrow);
+                    }
+                }
+            }
+        }
+        PreparedViewUpdateRows::PlainOldRows(old_rows) => {
+            for old_vals in old_rows {
+                ctx.step_tick()?;
+                let new_vals = {
+                    let scope = make_single_view_scope(
+                        &p.view.name,
+                        &p.schema_name,
+                        upd.alias.as_deref(),
+                        &p.col_specs,
+                        &old_vals,
+                    );
+                    let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
+                    scopes.push(scope);
+                    scopes.extend_from_slice(outer_scopes);
+                    apply_resolved_set_assignments_for_view(
+                        ctx,
+                        &old_vals,
+                        &p.resolved_assigns,
+                        &scopes,
+                        None,
+                        &p.dml_ctes,
+                        params,
+                    )?
+                };
+                let pscope =
+                    make_runtime_view_pseudo_scope(&p.col_specs, Some(&old_vals), Some(&new_vals));
+                drop(old_vals);
+                if fire_row_triggers(
+                    ctx,
+                    p.db_id,
+                    &p.view.name,
+                    TriggerTiming::InsteadOf,
+                    TriggerEventKind::Update,
+                    Some(mod_col_names),
+                    pscope,
+                    effective_or_conflict,
+                )? == TriggerOutcome::Continue
+                {
+                    *count_changes_rows += 1;
+                    if !p.ret_expanded.is_empty() {
+                        let rscope =
+                            make_returning_view_scope(&p.view.name, &p.col_specs, &new_vals);
+                        let mut rrow = Vec::with_capacity(p.ret_expanded.len());
+                        for (pe, _, _) in &p.ret_expanded {
+                            rrow.push(eval_expr(
+                                ctx,
+                                pe,
+                                params,
+                                std::slice::from_ref(&rscope),
+                                &p.dml_ctes,
+                                None,
+                            )?);
+                        }
+                        ret_rows.push(rrow);
+                    }
+                }
+            }
+        }
     }
+    Ok(QueryOutput {
+        column_names: p.ret_col_names,
+        rows: ret_rows,
+    })
+}
 
-    Ok(maybe_count_changes_output(
+#[inline(never)]
+fn exec_update_internal(
+    ctx: &mut ExecContext<'_>,
+    upd: &UpdateStmt,
+    effective_or_conflict: Option<ConflictAction>,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    is_top_level: bool,
+) -> Result<QueryOutput> {
+    let mut stmt_changes: u64 = 0;
+    let mut count_changes_rows: u64 = 0;
+    let mod_col_names = collect_set_assignment_col_names(&upd.assignments).into_boxed_slice();
+
+    let step_res = match prepare_update_exec(ctx, upd, params, outer_scopes) {
+        Ok(PreparedUpdate::Table(p)) => run_table_update_loop(
+            ctx,
+            p,
+            upd,
+            &mod_col_names,
+            effective_or_conflict,
+            params,
+            outer_scopes,
+            &mut stmt_changes,
+            &mut count_changes_rows,
+        ),
+        Ok(PreparedUpdate::View(p)) => run_view_update_loop(
+            ctx,
+            p,
+            upd,
+            &mod_col_names,
+            effective_or_conflict,
+            params,
+            outer_scopes,
+            &mut count_changes_rows,
+        ),
+        Err(e) => Err(e),
+    };
+
+    finalize_dml_step_result(
         ctx,
-        QueryOutput {
-            column_names: ret_col_names,
-            rows: ret_rows,
-        },
-    ))
+        step_res,
+        stmt_changes,
+        count_changes_rows,
+        is_top_level,
+    )
+}
+
+enum PreparedDelete {
+    TruncateCleared(u64),
+    Table(Box<PreparedTableDelete>),
+    View(Box<PreparedViewDelete>),
+}
+
+struct PreparedTableDelete {
+    db_id: DatabaseId,
+    tbl: TableSchema,
+    indexes: Vec<IndexSchema>,
+    is_catalog: bool,
+    dml_ctes: CteStore,
+    target_keys: Vec<TableRowKey>,
+    ret_col_names: Vec<String>,
+    ret_expanded: Vec<(Expr, String, Option<String>)>,
+}
+
+struct PreparedViewDelete {
+    db_id: DatabaseId,
+    view: ViewSchema,
+    dml_ctes: CteStore,
+    col_specs: Vec<(String, Collation, Option<TypeAffinity>)>,
+    target_rows: Vec<Vec<Value>>,
+    ret_col_names: Vec<String>,
+    ret_expanded: Vec<(Expr, String, Option<String>)>,
+}
+
+#[inline(never)]
+fn prepare_delete_exec(
+    ctx: &mut ExecContext<'_>,
+    del: &DeleteStmt,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+) -> Result<PreparedDelete> {
+    let target = resolve_dml_target_in_set(
+        ctx.db_set,
+        &del.table,
+        *ctx.writable_schema,
+        false,
+        TriggerEventKind::Delete,
+        None,
+    )?;
+    let dml_ctes = CteStore::default().with_scope_at(&del.ctes, outer_scopes.len());
+
+    match target {
+        DmlTarget::View {
+            db_id,
+            view,
+            schema_name,
+        } => {
+            if let Some(IndexHint::IndexedBy(ref idx_name)) = del.indexed_by {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such index: {idx_name}"),
+                ));
+            }
+            let col_specs = resolve_view_col_specs_static(
+                db_id,
+                &view,
+                ctx.db_set,
+                &dml_ctes,
+                ctx.functions,
+                &mut Vec::new(),
+            )?;
+            let (view_out, _, _) = eval_view_query_output(ctx, db_id, &view, &CteStore::default())?;
+            let mut target_rows = Vec::new();
+            for old_vals in view_out.rows {
+                let scope = make_single_view_scope(
+                    &view.name,
+                    &schema_name,
+                    del.alias.as_deref(),
+                    &col_specs,
+                    &old_vals,
+                );
+                let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
+                scopes.push(scope);
+                scopes.extend_from_slice(outer_scopes);
+                if let Some(ref w) = del.selection {
+                    let cond = eval_expr(ctx, w, params, &scopes, &dml_ctes, None)?;
+                    if cond.truthiness() != Some(true) {
+                        continue;
+                    }
+                }
+                target_rows.push(old_vals);
+            }
+            let sample_scope = make_returning_view_scope(
+                &view.name,
+                &col_specs,
+                &vec![Value::Null; col_specs.len()],
+            );
+            let (ret_col_names, ret_expanded) = if del.returning.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                expand_returning_projection(&del.returning, &sample_scope.cols)?
+            };
+            Ok(PreparedDelete::View(Box::new(PreparedViewDelete {
+                db_id,
+                view: *view,
+                dml_ctes,
+                col_specs,
+                target_rows,
+                ret_col_names,
+                ret_expanded,
+            })))
+        }
+        DmlTarget::Table {
+            db_id,
+            tbl: initial_tbl,
+            is_catalog,
+            ..
+        } => {
+            let (tbl, indexes, schema_name) =
+                prepare_dml_write_slot(ctx, db_id, &del.table, is_catalog, *initial_tbl)?;
+            let has_del_triggers = !is_catalog
+                && ctx.db_set.has_active_triggers_for_event(
+                    db_id,
+                    &tbl.name,
+                    TriggerEventKind::Delete,
+                    None,
+                );
+
+            // Truncate optimization (`OP_Clear`, `delete.c:455-510`) is ONLY allowed when there is
+            // NO `WHERE`, NO `RETURNING`, NO `INDEXED BY`, NO active `DELETE` triggers, and NO FKs!
+            if !is_catalog
+                && del.selection.is_none()
+                && del.returning.is_empty()
+                && !*ctx.foreign_keys
+                && !has_del_triggers
+                && del.indexed_by.is_none()
+            {
+                let count = if tbl.without_rowid {
+                    ctx.scan_index_in_db(db_id, tbl.root_pgno, tbl.without_rowid_pk_orders())?
+                        .len() as u64
+                } else {
+                    ctx.scan_table_in_db(db_id, tbl.root_pgno)?.len() as u64
+                };
+                if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut())
+                {
+                    bt.clear_tree(tbl.root_pgno)?;
+                    for idx in &indexes {
+                        bt.clear_tree(idx.root_pgno)?;
+                    }
+                }
+                return Ok(PreparedDelete::TruncateCleared(count));
+            }
+
+            let candidates = read_table_with_plan(
+                ctx,
+                db_id,
+                &tbl,
+                del.alias.as_deref(),
+                del.indexed_by.as_ref(),
+                del.selection.as_ref(),
+                params,
+                outer_scopes,
+                &dml_ctes,
+            )?;
+
+            let mut target_keys = Vec::new();
+            for (rkey, payload) in candidates {
+                let vals = decode_table_logical_row(ctx, db_id, &tbl, &rkey, &payload, params)?;
+                let scope = make_single_table_scope(
+                    &tbl,
+                    &schema_name,
+                    del.alias.as_deref(),
+                    rkey.rowid_or_zero(),
+                    &vals,
+                );
+                let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
+                scopes.push(scope);
+                scopes.extend_from_slice(outer_scopes);
+                if let Some(ref w) = del.selection {
+                    let cond = eval_expr(ctx, w, params, &scopes, &dml_ctes, None)?;
+                    if cond.truthiness() != Some(true) {
+                        continue;
+                    }
+                }
+                target_keys.push(rkey);
+            }
+
+            let sample_scope =
+                make_returning_table_scope(&tbl, 0, &vec![Value::Null; tbl.columns.len()]);
+            let (ret_col_names, ret_expanded) = if del.returning.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                expand_returning_projection(&del.returning, &sample_scope.cols)?
+            };
+
+            Ok(PreparedDelete::Table(Box::new(PreparedTableDelete {
+                db_id,
+                tbl,
+                indexes,
+                is_catalog,
+                dml_ctes,
+                target_keys,
+                ret_col_names,
+                ret_expanded,
+            })))
+        }
+    }
 }
 
 fn exec_delete(
@@ -13581,131 +16470,184 @@ fn exec_delete(
     del: &DeleteStmt,
     params: &[Value],
 ) -> Result<QueryOutput> {
-    let (db_id, initial_tbl, _, is_catalog) =
-        resolve_dml_target_table_in_set(ctx.db_set, &del.table, *ctx.writable_schema)?;
-    let (tbl, indexes, schema_name) =
-        prepare_dml_write_slot(ctx, db_id, &del.table, is_catalog, initial_tbl)?;
-    let dml_ctes = CteStore::default().with_scope(&del.ctes);
+    exec_delete_internal(ctx, del, None, params, &[], true)
+}
 
-    // Fast path (`OP_Clear`) for unconditional `DELETE FROM tbl` without `RETURNING` when no FKs reference `tbl`!
-    if !is_catalog
-        && del.selection.is_none()
-        && del.returning.is_empty()
-        && !*ctx.foreign_keys
-        && del.indexed_by.is_none()
-    {
-        let count = if tbl.without_rowid {
-            ctx.scan_index_in_db(db_id, tbl.root_pgno, tbl.without_rowid_pk_orders())?
-                .len() as u64
-        } else {
-            ctx.scan_table_in_db(db_id, tbl.root_pgno)?.len() as u64
-        };
-        if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
-            bt.clear_tree(tbl.root_pgno)?;
-            for idx in &indexes {
-                bt.clear_tree(idx.root_pgno)?;
-            }
-        }
-        ctx.runtime.last_changes = count;
-        ctx.runtime.total_changes += count;
-        ctx.publish();
-        return Ok(maybe_count_changes_output(ctx, QueryOutput::default()));
-    }
-
-    let candidates = read_table_with_plan(
-        ctx,
-        db_id,
-        &tbl,
-        del.alias.as_deref(),
-        del.indexed_by.as_ref(),
-        del.selection.as_ref(),
-        params,
-        &[],
-        &dml_ctes,
-    )?;
-
-    let mut targets = Vec::new();
-    for (rkey, payload) in candidates {
-        let vals = decode_table_logical_row(ctx, db_id, &tbl, &rkey, &payload, params)?;
-        let scope = make_single_table_scope(
-            &tbl,
-            &schema_name,
-            del.alias.as_deref(),
-            rkey.rowid_or_zero(),
-            &vals,
-        );
-        if let Some(ref w) = del.selection {
-            let cond = eval_expr(
-                ctx,
-                w,
-                params,
-                std::slice::from_ref(&scope),
-                &dml_ctes,
-                None,
-            )?;
-            if cond.truthiness() != Some(true) {
-                continue;
-            }
-        }
-        targets.push((rkey, vals, scope));
-    }
-
-    ctx.runtime.last_changes = 0;
-    ctx.publish();
-
-    let sample_scope = make_returning_table_scope(&tbl, 0, &vec![Value::Null; tbl.columns.len()]);
-    let (ret_col_names, ret_expanded) = if del.returning.is_empty() {
-        (Vec::new(), Vec::new())
-    } else {
-        expand_returning_projection(&del.returning, &sample_scope.cols)?
+#[inline(never)]
+fn prepare_delete_before_scope(
+    ctx: &mut ExecContext<'_>,
+    p: &PreparedTableDelete,
+    rkey: &TableRowKey,
+    params: &[Value],
+) -> Result<Option<Option<Box<EvalRow>>>> {
+    let Some(payload) = seek_table_raw_entry(ctx, p.db_id, &p.tbl, rkey)? else {
+        return Ok(None);
     };
-    let mut ret_rows = Vec::new();
-    let mut stmt_fk_suspects = Vec::new();
+    if p.is_catalog {
+        return Ok(Some(None));
+    }
+    let old_vals = decode_table_logical_row(ctx, p.db_id, &p.tbl, rkey, &payload, params)?;
+    Ok(Some(Some(make_runtime_table_pseudo_scope(
+        &p.tbl,
+        Some((rkey.rowid_or_zero(), &old_vals)),
+        None,
+    ))))
+}
 
-    for (rkey, old_vals, _where_scope) in targets {
-        if *ctx.foreign_keys {
-            // Re-check row existence in case a self-referential ON DELETE CASCADE already removed it
-            if seek_table_raw_entry(ctx, db_id, &tbl, &rkey)?.is_none() {
-                continue;
-            }
-            check_parent_delete_restrict(ctx, db_id, &tbl, &old_vals, params)?;
+#[inline(never)]
+fn delete_table_row_and_build_after_scope(
+    ctx: &mut ExecContext<'_>,
+    p: &PreparedTableDelete,
+    rkey: &TableRowKey,
+    params: &[Value],
+    stmt_changes: &mut u64,
+    count_changes_rows: &mut u64,
+    ret_rows: &mut Vec<Vec<Value>>,
+) -> Result<Option<Box<EvalRow>>> {
+    let Some(payload2) = seek_table_raw_entry(ctx, p.db_id, &p.tbl, rkey)? else {
+        return Ok(None);
+    };
+    let cur_old_vals = decode_table_logical_row(ctx, p.db_id, &p.tbl, rkey, &payload2, params)?;
+    if *ctx.foreign_keys {
+        check_parent_delete_restrict(ctx, p.db_id, &p.tbl, &cur_old_vals, params)?;
+    }
+    if !delete_row_via_pipeline(
+        ctx,
+        p.db_id,
+        &p.tbl,
+        &p.indexes,
+        rkey,
+        Some(&cur_old_vals),
+        MutationOrigin::TopLevelDelete,
+        ConflictAction::Abort,
+        p.is_catalog,
+        params,
+    )? {
+        return Ok(None);
+    }
+    *stmt_changes += 1;
+    *count_changes_rows += 1;
+    if *ctx.foreign_keys {
+        apply_parent_delete_fk_actions(ctx, p.db_id, &p.tbl, &cur_old_vals, params)?;
+    }
+    if !p.ret_expanded.is_empty() {
+        let rscope = make_returning_table_scope(&p.tbl, rkey.rowid_or_zero(), &cur_old_vals);
+        let mut rrow = Vec::with_capacity(p.ret_expanded.len());
+        for (pe, _, _) in &p.ret_expanded {
+            rrow.push(eval_expr(
+                ctx,
+                pe,
+                params,
+                std::slice::from_ref(&rscope),
+                &p.dml_ctes,
+                None,
+            )?);
         }
-        if delete_row_via_pipeline(
+        ret_rows.push(rrow);
+    }
+    if !p.is_catalog {
+        Ok(Some(make_runtime_table_pseudo_scope(
+            &p.tbl,
+            Some((rkey.rowid_or_zero(), &cur_old_vals)),
+            None,
+        )))
+    } else {
+        Ok(None)
+    }
+}
+
+#[inline(never)]
+fn run_table_delete_loop(
+    ctx: &mut ExecContext<'_>,
+    mut p: Box<PreparedTableDelete>,
+    effective_or_conflict: Option<ConflictAction>,
+    params: &[Value],
+    stmt_changes: &mut u64,
+    count_changes_rows: &mut u64,
+) -> Result<QueryOutput> {
+    let target_keys = std::mem::take(&mut p.target_keys).into_boxed_slice();
+    let mut ret_rows = Vec::new();
+    for rkey in target_keys.iter() {
+        ctx.step_tick()?;
+        let Some(before_scope_opt) = prepare_delete_before_scope(ctx, &p, rkey, params)? else {
+            continue;
+        };
+        if let Some(before_scope) = before_scope_opt
+            && fire_row_triggers(
+                ctx,
+                p.db_id,
+                &p.tbl.name,
+                TriggerTiming::Before,
+                TriggerEventKind::Delete,
+                None,
+                before_scope,
+                effective_or_conflict,
+            )? == TriggerOutcome::Ignored
+        {
+            continue;
+        }
+        if let Some(after_scope) = delete_table_row_and_build_after_scope(
             ctx,
-            db_id,
-            &tbl,
-            &indexes,
-            &rkey,
-            Some(&old_vals),
-            MutationOrigin::TopLevelDelete,
-            ConflictAction::Abort,
-            is_catalog,
+            &p,
+            rkey,
             params,
+            stmt_changes,
+            count_changes_rows,
+            &mut ret_rows,
         )? {
-            ctx.runtime.last_changes += 1;
-            ctx.runtime.total_changes += 1;
-            ctx.publish();
-            if *ctx.foreign_keys {
-                apply_parent_delete_fk_actions(
-                    ctx,
-                    db_id,
-                    &tbl,
-                    &old_vals,
-                    params,
-                    &mut stmt_fk_suspects,
-                    0,
-                )?;
-            }
-            if !ret_expanded.is_empty() {
-                let rscope = make_returning_table_scope(&tbl, rkey.rowid_or_zero(), &old_vals);
-                let mut rrow = Vec::with_capacity(ret_expanded.len());
-                for (pe, _, _) in &ret_expanded {
+            let _ = fire_row_triggers(
+                ctx,
+                p.db_id,
+                &p.tbl.name,
+                TriggerTiming::After,
+                TriggerEventKind::Delete,
+                None,
+                after_scope,
+                effective_or_conflict,
+            )?;
+        }
+    }
+    Ok(QueryOutput {
+        column_names: p.ret_col_names,
+        rows: ret_rows,
+    })
+}
+
+#[inline(never)]
+fn run_view_delete_loop(
+    ctx: &mut ExecContext<'_>,
+    mut p: Box<PreparedViewDelete>,
+    effective_or_conflict: Option<ConflictAction>,
+    params: &[Value],
+    count_changes_rows: &mut u64,
+) -> Result<QueryOutput> {
+    let target_rows = std::mem::take(&mut p.target_rows).into_boxed_slice();
+    let mut ret_rows = Vec::new();
+    for old_vals in target_rows.iter() {
+        ctx.step_tick()?;
+        let pscope = make_runtime_view_pseudo_scope(&p.col_specs, Some(old_vals), None);
+        if fire_row_triggers(
+            ctx,
+            p.db_id,
+            &p.view.name,
+            TriggerTiming::InsteadOf,
+            TriggerEventKind::Delete,
+            None,
+            pscope,
+            effective_or_conflict,
+        )? == TriggerOutcome::Continue
+        {
+            *count_changes_rows += 1;
+            if !p.ret_expanded.is_empty() {
+                let rscope = make_returning_view_scope(&p.view.name, &p.col_specs, old_vals);
+                let mut rrow = Vec::with_capacity(p.ret_expanded.len());
+                for (pe, _, _) in &p.ret_expanded {
                     rrow.push(eval_expr(
                         ctx,
                         pe,
                         params,
                         std::slice::from_ref(&rscope),
-                        &dml_ctes,
+                        &p.dml_ctes,
                         None,
                     )?);
                 }
@@ -13713,18 +16655,55 @@ fn exec_delete(
             }
         }
     }
+    Ok(QueryOutput {
+        column_names: p.ret_col_names,
+        rows: ret_rows,
+    })
+}
 
-    if *ctx.foreign_keys && !stmt_fk_suspects.is_empty() {
-        verify_fk_suspects(ctx, &stmt_fk_suspects)?;
-    }
+#[inline(never)]
+fn exec_delete_internal(
+    ctx: &mut ExecContext<'_>,
+    del: &DeleteStmt,
+    effective_or_conflict: Option<ConflictAction>,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    is_top_level: bool,
+) -> Result<QueryOutput> {
+    let mut stmt_changes: u64 = 0;
+    let mut count_changes_rows: u64 = 0;
 
-    Ok(maybe_count_changes_output(
+    let step_res = match prepare_delete_exec(ctx, del, params, outer_scopes) {
+        Ok(PreparedDelete::TruncateCleared(count)) => {
+            stmt_changes = count;
+            count_changes_rows = count;
+            Ok(QueryOutput::default())
+        }
+        Ok(PreparedDelete::Table(p)) => run_table_delete_loop(
+            ctx,
+            p,
+            effective_or_conflict,
+            params,
+            &mut stmt_changes,
+            &mut count_changes_rows,
+        ),
+        Ok(PreparedDelete::View(p)) => run_view_delete_loop(
+            ctx,
+            p,
+            effective_or_conflict,
+            params,
+            &mut count_changes_rows,
+        ),
+        Err(e) => Err(e),
+    };
+
+    finalize_dml_step_result(
         ctx,
-        QueryOutput {
-            column_names: ret_col_names,
-            rows: ret_rows,
-        },
-    ))
+        step_res,
+        stmt_changes,
+        count_changes_rows,
+        is_top_level,
+    )
 }
 
 // ============================================================================
@@ -14033,7 +17012,6 @@ fn exec_create_table_as(
     else {
         return Ok(());
     };
-    let mut stmt_fk_suspects = Vec::new();
     for row in q_out.rows {
         validate_and_write_row(
             ctx,
@@ -14046,9 +17024,6 @@ fn exec_create_table_as(
             None,
             params,
             false,
-            false,
-            &mut stmt_fk_suspects,
-            0,
             None,
             false,
         )?;
@@ -14281,18 +17256,6 @@ fn exec_drop_trigger(
             format!("no such trigger: {}", name.display_name()),
         ));
     };
-
-    let has_open_cur = ctx
-        .db_set
-        .slot(db_id)
-        .and_then(|s| s.btree.as_ref())
-        .is_some_and(|bt| bt.has_any_other_open_cursor(None));
-    if ctx.activity.other_readers > 0 || has_open_cur {
-        return Err(SqliteError::new(
-            ErrorCode::Locked,
-            "database table is locked",
-        ));
-    }
 
     ctx.ensure_write_db(db_id, true)?;
     let trig_rowid = {
@@ -14585,7 +17548,6 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
                 .slot(db_id)
                 .map(|s| s.schema.indexes_for_table(&tbl.name))
                 .unwrap_or_default();
-            let mut stmt_fk_suspects = Vec::new();
             for (rkey, payload) in existing_rows {
                 if seek_table_raw_entry(ctx, db_id, &tbl, &rkey)?.is_none() {
                     continue;
@@ -14604,19 +17566,12 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
                     false,
                     &[],
                 )? {
-                    apply_parent_delete_fk_actions(
-                        ctx,
-                        db_id,
-                        &tbl,
-                        &old_vals,
-                        &[],
-                        &mut stmt_fk_suspects,
-                        0,
-                    )?;
+                    apply_parent_delete_fk_actions(ctx, db_id, &tbl, &old_vals, &[])?;
                 }
             }
-            if !stmt_fk_suspects.is_empty() {
-                verify_fk_suspects(ctx, &stmt_fk_suspects)?;
+            let suspects = std::mem::take(&mut ctx.stmt_tx.stmt_fk_suspects);
+            if !suspects.is_empty() {
+                verify_fk_suspects(ctx, &suspects)?;
             }
         }
     }
@@ -21632,6 +24587,20 @@ fn exec_pragma(
                 Value::Integer(i64::from(*ctx.count_changes)),
             ));
         }
+        "RECURSIVE_TRIGGERS" => {
+            if let Some(pv) = value {
+                let flag = pragma_to_bool(pv);
+                if *ctx.recursive_triggers != flag {
+                    *ctx.recursive_triggers = flag;
+                    *ctx.schema_generation += 1;
+                }
+                return Ok(QueryOutput::default());
+            }
+            return Ok(single_col(
+                "recursive_triggers",
+                Value::Integer(i64::from(*ctx.recursive_triggers)),
+            ));
+        }
         "WAL_AUTOCHECKPOINT" => {
             if let Some(pv) = value {
                 let raw = pragma_to_i64(pv).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
@@ -22276,7 +25245,7 @@ fn exec_pragma(
                         .is_some_and(|bt| bt.set_configured_auto_vacuum(e_auto))
                 };
                 if ok && matches!(e_auto, AutoVacuumMode::Full | AutoVacuumMode::Incremental) {
-                    run_write_autocommit(ctx, |ctx| {
+                    run_write_autocommit(ctx, false, |ctx| {
                         ctx.ensure_write_db(db_id, false)?;
                         if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree
                             && bt.pager().header().largest_root_btree_page != 0
@@ -23012,11 +25981,13 @@ fn normalize_attach_schema_expr(expr: &Expr) -> std::borrow::Cow<'_, Expr> {
 
 /// Validates semantic bindings (tables, columns, functions, subqueries, DML/DDL widths) with
 /// ZERO side effects and returns the exact result column names for `Connection::prepare`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_and_infer_columns(
     stmt: &Stmt,
     db_set: &DatabaseSet,
     writable_schema: bool,
     foreign_keys: bool,
+    recursive_triggers: bool,
     count_changes: bool,
     functions: &FunctionRegistry,
     collations: &CollationRegistry,
@@ -23198,6 +26169,7 @@ pub(crate) fn validate_and_infer_columns(
                 db_set,
                 writable_schema,
                 foreign_keys,
+                recursive_triggers,
                 count_changes,
                 functions,
                 collations,
@@ -23856,32 +26828,59 @@ pub(crate) fn validate_and_infer_columns(
         }
 
         Stmt::Insert(ins) => {
-            let cols = validate_insert_static(
+            let mut coded_triggers = Vec::new();
+            let cols = validate_insert_static_inner(
                 ins,
+                ins.or_conflict,
+                &[],
                 db_set,
                 writable_schema,
+                foreign_keys,
+                recursive_triggers,
                 functions,
                 collations,
                 count_changes,
+                &mut coded_triggers,
+                0,
             )?;
             reject_raise_in_top_level_insert(ins, db_set)?;
             Ok(cols)
         }
         Stmt::Update(upd) => {
-            let cols = validate_update_static(
+            let mut coded_triggers = Vec::new();
+            let cols = validate_update_static_inner(
                 upd,
+                upd.or_conflict,
+                &[],
                 db_set,
                 writable_schema,
+                foreign_keys,
+                recursive_triggers,
                 functions,
                 collations,
                 count_changes,
+                &mut coded_triggers,
+                0,
             )?;
             reject_raise_in_top_level_update(upd, db_set)?;
             Ok(cols)
         }
         Stmt::Delete(del) => {
-            let cols =
-                validate_delete_static(del, db_set, writable_schema, functions, count_changes)?;
+            let mut coded_triggers = Vec::new();
+            let cols = validate_delete_static_inner(
+                del,
+                None,
+                &[],
+                db_set,
+                writable_schema,
+                foreign_keys,
+                recursive_triggers,
+                functions,
+                collations,
+                count_changes,
+                &mut coded_triggers,
+                0,
+            )?;
             reject_raise_in_top_level_delete(del, db_set)?;
             Ok(cols)
         }
@@ -23980,6 +26979,13 @@ fn infer_pragma_columns(name: &str, value: Option<&PragmaValue>) -> Vec<String> 
                 Vec::new()
             } else {
                 vec!["foreign_keys".to_owned()]
+            }
+        }
+        "RECURSIVE_TRIGGERS" => {
+            if value.is_some() {
+                Vec::new()
+            } else {
+                vec!["recursive_triggers".to_owned()]
             }
         }
         "FOREIGN_KEY_LIST" => {
@@ -24150,70 +27156,466 @@ fn validate_cte_scope_static(ctes_list: &[CommonTableExpr]) -> Result<()> {
     Ok(())
 }
 
-fn validate_insert_static(
-    ins: &InsertStmt,
+#[allow(clippy::too_many_arguments)]
+fn validate_set_assignments_for_view_static(
+    col_specs: &[(String, Collation, Option<TypeAffinity>)],
+    assigns: &[SetAssignment],
+    scopes: &[EvalRow],
+    db_set: &DatabaseSet,
+    dml_ctes: &CteStore,
+    functions: &FunctionRegistry,
+    collations: &CollationRegistry,
+    allow_agg: bool,
+    visited: &mut Vec<(usize, usize)>,
+) -> Result<()> {
+    let _ = resolve_set_assignments_for_view(col_specs, assigns)?;
+    for sa in assigns {
+        validate_collations_in_expr(&sa.expr, collations)?;
+        if !sa.row_value {
+            validate_expr_static(
+                &sa.expr, scopes, db_set, dml_ctes, functions, allow_agg, false, visited,
+            )?;
+        } else {
+            let n = sa.columns.len();
+            let mut inner = &sa.expr;
+            while let Expr::Collate { expr: sub, .. } = inner {
+                inner = sub;
+            }
+            match inner {
+                Expr::RowValue(elems) => {
+                    for el in elems {
+                        validate_expr_static(
+                            el, scopes, db_set, dml_ctes, functions, allow_agg, false, visited,
+                        )?;
+                    }
+                    if elems.len() != n {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("{n} columns assigned {} values", elems.len()),
+                        ));
+                    }
+                }
+                Expr::Subquery(sub) => {
+                    let sub_cols = validate_select_stmt_static(
+                        sub, scopes, db_set, dml_ctes, functions, visited,
+                    )?;
+                    if !sub_cols.is_empty() && sub_cols.len() != n {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("{n} columns assigned {} values", sub_cols.len()),
+                        ));
+                    }
+                }
+                other => {
+                    validate_expr_static(
+                        other, scopes, db_set, dml_ctes, functions, allow_agg, false, visited,
+                    )?;
+                    if n != 1 {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("{n} columns assigned 1 values"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn validate_matching_triggers_static(
+    target_db_id: DatabaseId,
+    target_name: &str,
+    col_specs: &[(String, Collation, Option<TypeAffinity>)],
+    has_hidden_rowid: bool,
+    timing: TriggerTiming,
+    event_kind: TriggerEventKind,
+    modified_cols: Option<&[&str]>,
+    orconf: Option<ConflictAction>,
     db_set: &DatabaseSet,
     writable_schema: bool,
+    foreign_keys: bool,
+    recursive_triggers: bool,
+    functions: &FunctionRegistry,
+    collations: &CollationRegistry,
+    coded_triggers: &mut Vec<(SchemaInstanceId, i64, Option<ConflictAction>)>,
+    trig_depth: usize,
+) -> Result<()> {
+    let matching =
+        db_set.matching_triggers(target_db_id, target_name, timing, event_kind, modified_cols);
+    for (_trig_db_id, trig_inst, trig) in matching {
+        let key = (trig_inst, trig.schema_rowid, orconf);
+        if coded_triggers.contains(&key) {
+            continue;
+        }
+        if trig_depth >= db_set.trigger_depth_limit() {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                "triggers nested too deep",
+            ));
+        }
+        coded_triggers.push(key);
+        let pseudo_scope =
+            make_static_trigger_pseudo_scope(&trig.event, col_specs, has_hidden_rowid);
+        let outer = std::slice::from_ref(&pseudo_scope);
+        let mut visited = Vec::new();
+        if let Some(ref w) = trig.when_clause {
+            validate_expr_static(
+                w,
+                outer,
+                db_set,
+                &CteStore::default(),
+                functions,
+                false,
+                false,
+                &mut visited,
+            )?;
+        }
+        for step in &trig.body {
+            match step {
+                TriggerStep::Select(sel) => {
+                    let _ = validate_select_stmt_static(
+                        sel,
+                        outer,
+                        db_set,
+                        &CteStore::default(),
+                        functions,
+                        &mut visited,
+                    )?;
+                }
+                TriggerStep::Insert(ins) => {
+                    let eff = effective_trigger_step_conflict(orconf, ins.or_conflict);
+                    let _ = validate_insert_static_inner(
+                        ins,
+                        eff,
+                        outer,
+                        db_set,
+                        writable_schema,
+                        foreign_keys,
+                        recursive_triggers,
+                        functions,
+                        collations,
+                        false,
+                        coded_triggers,
+                        trig_depth + 1,
+                    )?;
+                }
+                TriggerStep::Update(upd) => {
+                    let eff = effective_trigger_step_conflict(orconf, upd.or_conflict);
+                    let _ = validate_update_static_inner(
+                        upd,
+                        eff,
+                        outer,
+                        db_set,
+                        writable_schema,
+                        foreign_keys,
+                        recursive_triggers,
+                        functions,
+                        collations,
+                        false,
+                        coded_triggers,
+                        trig_depth + 1,
+                    )?;
+                }
+                TriggerStep::Delete(del) => {
+                    let _ = validate_delete_static_inner(
+                        del,
+                        None,
+                        outer,
+                        db_set,
+                        writable_schema,
+                        foreign_keys,
+                        recursive_triggers,
+                        functions,
+                        collations,
+                        false,
+                        coded_triggers,
+                        trig_depth + 1,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn validate_fk_actions_triggers_static(
+    db_id: DatabaseId,
+    ptbl_name: &str,
+    is_delete: bool,
+    db_set: &DatabaseSet,
+    writable_schema: bool,
+    foreign_keys: bool,
+    recursive_triggers: bool,
+    functions: &FunctionRegistry,
+    collations: &CollationRegistry,
+    coded_triggers: &mut Vec<(SchemaInstanceId, i64, Option<ConflictAction>)>,
+    trig_depth: usize,
+) -> Result<()> {
+    if !foreign_keys {
+        return Ok(());
+    }
+    let Some(slot) = db_set.slot(db_id).filter(|s| s.btree.is_some()) else {
+        return Ok(());
+    };
+    let refs = find_referencing_fks(&slot.schema, ptbl_name);
+    if refs.is_empty() {
+        return Ok(());
+    }
+    let schema_name = slot.name.clone();
+    let slot_schema = slot.schema.clone();
+    for (ctbl, fk) in refs {
+        if resolve_fk_parent_cols(&slot_schema, &schema_name, &ctbl.name, &fk).is_err() {
+            continue;
+        }
+        let action = if is_delete {
+            fk.on_delete
+        } else {
+            fk.on_update
+        };
+        let cspecs: Vec<(String, Collation, Option<TypeAffinity>)> = ctbl
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.collation, Some(c.affinity)))
+            .collect();
+        let chas_rowid = !ctbl.without_rowid;
+        match action {
+            FkAction::NoAction | FkAction::Restrict => {}
+            FkAction::Cascade if is_delete => {
+                if trig_depth >= db_set.trigger_depth_limit() {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "triggers nested too deep",
+                    ));
+                }
+                for tm in [TriggerTiming::Before, TriggerTiming::After] {
+                    validate_matching_triggers_static(
+                        db_id,
+                        &ctbl.name,
+                        &cspecs,
+                        chas_rowid,
+                        tm,
+                        TriggerEventKind::Delete,
+                        None,
+                        None,
+                        db_set,
+                        writable_schema,
+                        foreign_keys,
+                        recursive_triggers,
+                        functions,
+                        collations,
+                        coded_triggers,
+                        trig_depth + 1,
+                    )?;
+                }
+            }
+            FkAction::Cascade | FkAction::SetNull | FkAction::SetDefault => {
+                if trig_depth >= db_set.trigger_depth_limit() {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "triggers nested too deep",
+                    ));
+                }
+                let (_, mod_names) = build_fk_modified_col_info(&ctbl, &fk.from_cols);
+                for tm in [TriggerTiming::Before, TriggerTiming::After] {
+                    validate_matching_triggers_static(
+                        db_id,
+                        &ctbl.name,
+                        &cspecs,
+                        chas_rowid,
+                        tm,
+                        TriggerEventKind::Update,
+                        Some(&mod_names),
+                        Some(ConflictAction::Abort),
+                        db_set,
+                        writable_schema,
+                        foreign_keys,
+                        recursive_triggers,
+                        functions,
+                        collations,
+                        coded_triggers,
+                        trig_depth + 1,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn table_may_use_replace(
+    tbl: &TableSchema,
+    indexes: &[IndexSchema],
+    orconf: Option<ConflictAction>,
+) -> bool {
+    if orconf == Some(ConflictAction::Replace) {
+        return true;
+    }
+    if orconf.is_some() {
+        return false;
+    }
+    let pk_replace = if tbl.without_rowid {
+        tbl.without_rowid_pk_conflict == ConflictAction::Replace
+    } else {
+        tbl.rowid_pk_conflict == ConflictAction::Replace
+    };
+    pk_replace
+        || indexes
+            .iter()
+            .any(|i| i.unique && i.conflict == ConflictAction::Replace)
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn validate_insert_static_inner(
+    ins: &InsertStmt,
+    effective_or_conflict: Option<ConflictAction>,
+    outer_scopes: &[EvalRow],
+    db_set: &DatabaseSet,
+    writable_schema: bool,
+    foreign_keys: bool,
+    recursive_triggers: bool,
     functions: &FunctionRegistry,
     collations: &CollationRegistry,
     count_changes: bool,
+    coded_triggers: &mut Vec<(SchemaInstanceId, i64, Option<ConflictAction>)>,
+    trig_depth: usize,
 ) -> Result<Vec<String>> {
     validate_cte_scope_static(&ins.ctes)?;
-    let (db_id, tbl, slot_name, is_catalog) = resolve_dml_target_table_in_set_opts(
+    let target = resolve_dml_target_in_set(
         db_set,
         &ins.table,
         writable_schema,
         !ins.upsert_clauses.is_empty(),
+        TriggerEventKind::Insert,
+        None,
     )?;
-    let dml_ctes = CteStore::default().with_scope(&ins.ctes);
+    let dml_ctes = CteStore::default().with_scope_at(&ins.ctes, outer_scopes.len());
     let mut visited = Vec::new();
 
-    let expected_width = if let Some(ref cnames) = ins.columns {
-        for cn in cnames {
-            if let Some((_, col)) = tbl.find_column(cn) {
-                if col.generated.is_some() {
-                    return Err(SqliteError::new(
-                        ErrorCode::Error,
-                        format!("cannot INSERT into generated column \"{}\"", col.name),
-                    ));
-                }
-            } else if !tbl.is_implicit_rowid_name(cn) {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    format!("table {} has no column named {cn}", tbl.name),
-                ));
-            }
-        }
-        cnames.len()
-    } else {
-        tbl.columns.iter().filter(|c| c.generated.is_none()).count()
-    };
-
-    match &ins.source {
-        InsertSource::DefaultValues => {}
-        InsertSource::Values(expr_rows) => {
-            for erow in expr_rows {
-                if erow.len() != expected_width {
-                    if ins.columns.is_some() {
+    match target {
+        DmlTarget::View { db_id, view, .. } => {
+            let col_specs = resolve_view_col_specs_static(
+                db_id,
+                &view,
+                db_set,
+                &dml_ctes,
+                functions,
+                &mut visited,
+            )?;
+            let expected_width = if let Some(ref cnames) = ins.columns {
+                for cn in cnames {
+                    if !col_specs.iter().any(|(n, _, _)| n.eq_ignore_ascii_case(cn)) {
                         return Err(SqliteError::new(
                             ErrorCode::Error,
-                            format!("{} values for {} columns", erow.len(), expected_width),
+                            format!("table {} has no column named {cn}", view.name),
                         ));
                     }
-                    return Err(SqliteError::new(
-                        ErrorCode::Error,
-                        format!(
-                            "table {} has {} columns but {} values were supplied",
-                            tbl.name,
-                            expected_width,
-                            erow.len()
-                        ),
-                    ));
                 }
-                for e in erow {
+                cnames.len()
+            } else {
+                col_specs.len()
+            };
+
+            match &ins.source {
+                InsertSource::DefaultValues => {}
+                InsertSource::Values(expr_rows) => {
+                    for erow in expr_rows {
+                        if erow.len() != expected_width {
+                            if ins.columns.is_some() {
+                                return Err(SqliteError::new(
+                                    ErrorCode::Error,
+                                    format!("{} values for {} columns", erow.len(), expected_width),
+                                ));
+                            }
+                            return Err(SqliteError::new(
+                                ErrorCode::Error,
+                                format!(
+                                    "table {} has {} columns but {} values were supplied",
+                                    view.name,
+                                    expected_width,
+                                    erow.len()
+                                ),
+                            ));
+                        }
+                        for e in erow {
+                            validate_expr_static(
+                                e,
+                                outer_scopes,
+                                db_set,
+                                &dml_ctes,
+                                functions,
+                                false,
+                                false,
+                                &mut visited,
+                            )?;
+                        }
+                    }
+                }
+                InsertSource::Select(sel) => {
+                    let sel_cols = validate_select_stmt_static(
+                        sel,
+                        outer_scopes,
+                        db_set,
+                        &dml_ctes,
+                        functions,
+                        &mut visited,
+                    )?;
+                    if sel_cols.len() != expected_width {
+                        if ins.columns.is_some() {
+                            return Err(SqliteError::new(
+                                ErrorCode::Error,
+                                format!("{} values for {} columns", sel_cols.len(), expected_width),
+                            ));
+                        }
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!(
+                                "table {} has {} columns but {} values were supplied",
+                                view.name,
+                                expected_width,
+                                sel_cols.len()
+                            ),
+                        ));
+                    }
+                }
+            }
+
+            validate_matching_triggers_static(
+                db_id,
+                &view.name,
+                &col_specs,
+                false,
+                TriggerTiming::InsteadOf,
+                TriggerEventKind::Insert,
+                None,
+                effective_or_conflict,
+                db_set,
+                writable_schema,
+                foreign_keys,
+                recursive_triggers,
+                functions,
+                collations,
+                coded_triggers,
+                trig_depth,
+            )?;
+
+            if !ins.returning.is_empty() {
+                let sample_scope = make_returning_view_scope(
+                    &view.name,
+                    &col_specs,
+                    &vec![Value::Null; col_specs.len()],
+                );
+                let (ret_cols, ret_expanded) =
+                    expand_returning_projection(&ins.returning, &sample_scope.cols)?;
+                for (pe, _, _) in &ret_expanded {
                     validate_expr_static(
-                        e,
-                        &[],
+                        pe,
+                        std::slice::from_ref(&sample_scope),
                         db_set,
                         &dml_ctes,
                         functions,
@@ -24222,268 +27624,875 @@ fn validate_insert_static(
                         &mut visited,
                     )?;
                 }
+                return Ok(ret_cols);
+            }
+            if count_changes {
+                Ok(vec!["count".to_owned()])
+            } else {
+                Ok(Vec::new())
             }
         }
-        InsertSource::Select(sel) => {
-            let sel_cols =
-                validate_select_stmt_static(sel, &[], db_set, &dml_ctes, functions, &mut visited)?;
-            let xfer_gen_match = ins.columns.is_none()
-                && tbl.columns.iter().any(|c| c.generated.is_some())
-                && sel_cols.len() == tbl.columns.len()
-                && check_insert_xfer_eligible(
-                    ins,
-                    db_id,
-                    &tbl,
-                    is_catalog,
-                    db_set,
-                    false,
-                    count_changes,
-                )
-                .is_some();
-            if sel_cols.len() != expected_width && !xfer_gen_match {
-                if ins.columns.is_some() {
-                    return Err(SqliteError::new(
-                        ErrorCode::Error,
-                        format!("{} values for {} columns", sel_cols.len(), expected_width),
-                    ));
+        DmlTarget::Table {
+            db_id,
+            tbl,
+            schema_name: slot_name,
+            is_catalog,
+        } => {
+            let expected_width = if let Some(ref cnames) = ins.columns {
+                for cn in cnames {
+                    if let Some((_, col)) = tbl.find_column(cn) {
+                        if col.generated.is_some() {
+                            return Err(SqliteError::new(
+                                ErrorCode::Error,
+                                format!("cannot INSERT into generated column \"{}\"", col.name),
+                            ));
+                        }
+                    } else if !tbl.is_implicit_rowid_name(cn) {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("table {} has no column named {cn}", tbl.name),
+                        ));
+                    }
                 }
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    format!(
-                        "table {} has {} columns but {} values were supplied",
-                        tbl.name,
-                        expected_width,
-                        sel_cols.len()
-                    ),
-                ));
+                cnames.len()
+            } else {
+                tbl.columns.iter().filter(|c| c.generated.is_none()).count()
+            };
+
+            match &ins.source {
+                InsertSource::DefaultValues => {}
+                InsertSource::Values(expr_rows) => {
+                    for erow in expr_rows {
+                        if erow.len() != expected_width {
+                            if ins.columns.is_some() {
+                                return Err(SqliteError::new(
+                                    ErrorCode::Error,
+                                    format!("{} values for {} columns", erow.len(), expected_width),
+                                ));
+                            }
+                            return Err(SqliteError::new(
+                                ErrorCode::Error,
+                                format!(
+                                    "table {} has {} columns but {} values were supplied",
+                                    tbl.name,
+                                    expected_width,
+                                    erow.len()
+                                ),
+                            ));
+                        }
+                        for e in erow {
+                            validate_expr_static(
+                                e,
+                                outer_scopes,
+                                db_set,
+                                &dml_ctes,
+                                functions,
+                                false,
+                                false,
+                                &mut visited,
+                            )?;
+                        }
+                    }
+                }
+                InsertSource::Select(sel) => {
+                    let sel_cols = validate_select_stmt_static(
+                        sel,
+                        outer_scopes,
+                        db_set,
+                        &dml_ctes,
+                        functions,
+                        &mut visited,
+                    )?;
+                    let xfer_gen_match = outer_scopes.is_empty()
+                        && ins.columns.is_none()
+                        && tbl.columns.iter().any(|c| c.generated.is_some())
+                        && sel_cols.len() == tbl.columns.len()
+                        && check_insert_xfer_eligible(
+                            ins,
+                            db_id,
+                            &tbl,
+                            is_catalog,
+                            db_set,
+                            false,
+                            count_changes,
+                        )
+                        .is_some();
+                    if sel_cols.len() != expected_width && !xfer_gen_match {
+                        if ins.columns.is_some() {
+                            return Err(SqliteError::new(
+                                ErrorCode::Error,
+                                format!("{} values for {} columns", sel_cols.len(), expected_width),
+                            ));
+                        }
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!(
+                                "table {} has {} columns but {} values were supplied",
+                                tbl.name,
+                                expected_width,
+                                sel_cols.len()
+                            ),
+                        ));
+                    }
+                }
+            }
+
+            let indexes = if is_catalog {
+                Vec::new()
+            } else {
+                db_set
+                    .slot(db_id)
+                    .filter(|s| s.btree.is_some())
+                    .map(|s| s.schema.indexes_for_table(&tbl.name))
+                    .unwrap_or_default()
+            };
+
+            if !ins.upsert_clauses.is_empty() {
+                let ordered_uniques = ordered_unique_indexes(&tbl, &indexes);
+                let _ = analyze_upsert_clauses_with_outer(
+                    ins,
+                    &tbl,
+                    &slot_name,
+                    &ordered_uniques,
+                    outer_scopes,
+                    db_set,
+                    &dml_ctes,
+                    functions,
+                    collations,
+                    &mut visited,
+                )?;
+            }
+
+            if !is_catalog {
+                let cspecs: Vec<(String, Collation, Option<TypeAffinity>)> = tbl
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.collation, Some(c.affinity)))
+                    .collect();
+                let has_rowid = !tbl.without_rowid;
+
+                for tm in [TriggerTiming::Before, TriggerTiming::After] {
+                    validate_matching_triggers_static(
+                        db_id,
+                        &tbl.name,
+                        &cspecs,
+                        has_rowid,
+                        tm,
+                        TriggerEventKind::Insert,
+                        None,
+                        effective_or_conflict,
+                        db_set,
+                        writable_schema,
+                        foreign_keys,
+                        recursive_triggers,
+                        functions,
+                        collations,
+                        coded_triggers,
+                        trig_depth,
+                    )?;
+                }
+
+                for uc in &ins.upsert_clauses {
+                    if let UpsertAction::DoUpdate {
+                        ref assignments, ..
+                    } = uc.action
+                    {
+                        let mod_names = collect_set_assignment_col_names(assignments);
+                        for tm in [TriggerTiming::Before, TriggerTiming::After] {
+                            validate_matching_triggers_static(
+                                db_id,
+                                &tbl.name,
+                                &cspecs,
+                                has_rowid,
+                                tm,
+                                TriggerEventKind::Update,
+                                Some(&mod_names),
+                                Some(ConflictAction::Abort),
+                                db_set,
+                                writable_schema,
+                                foreign_keys,
+                                recursive_triggers,
+                                functions,
+                                collations,
+                                coded_triggers,
+                                trig_depth,
+                            )?;
+                        }
+                        validate_fk_actions_triggers_static(
+                            db_id,
+                            &tbl.name,
+                            false,
+                            db_set,
+                            writable_schema,
+                            foreign_keys,
+                            recursive_triggers,
+                            functions,
+                            collations,
+                            coded_triggers,
+                            trig_depth,
+                        )?;
+                    }
+                }
+
+                if table_may_use_replace(&tbl, &indexes, effective_or_conflict) {
+                    if recursive_triggers {
+                        for tm in [TriggerTiming::Before, TriggerTiming::After] {
+                            validate_matching_triggers_static(
+                                db_id,
+                                &tbl.name,
+                                &cspecs,
+                                has_rowid,
+                                tm,
+                                TriggerEventKind::Delete,
+                                None,
+                                Some(ConflictAction::Replace),
+                                db_set,
+                                writable_schema,
+                                foreign_keys,
+                                recursive_triggers,
+                                functions,
+                                collations,
+                                coded_triggers,
+                                trig_depth,
+                            )?;
+                        }
+                    }
+                    validate_fk_actions_triggers_static(
+                        db_id,
+                        &tbl.name,
+                        true,
+                        db_set,
+                        writable_schema,
+                        foreign_keys,
+                        recursive_triggers,
+                        functions,
+                        collations,
+                        coded_triggers,
+                        trig_depth,
+                    )?;
+                }
+            }
+
+            if !ins.returning.is_empty() {
+                let sample_scope = make_static_returning_scope(&tbl);
+                let (ret_cols, ret_expanded) =
+                    expand_returning_projection(&ins.returning, &sample_scope.cols)?;
+                for (pe, _, _) in &ret_expanded {
+                    validate_expr_static(
+                        pe,
+                        std::slice::from_ref(&sample_scope),
+                        db_set,
+                        &dml_ctes,
+                        functions,
+                        false,
+                        false,
+                        &mut visited,
+                    )?;
+                }
+                return Ok(ret_cols);
+            }
+
+            if count_changes {
+                Ok(vec!["count".to_owned()])
+            } else {
+                Ok(Vec::new())
             }
         }
-    }
-
-    if !ins.upsert_clauses.is_empty() {
-        let indexes = if is_catalog {
-            Vec::new()
-        } else {
-            db_set
-                .slot(db_id)
-                .filter(|s| s.btree.is_some())
-                .map(|s| s.schema.indexes_for_table(&tbl.name))
-                .unwrap_or_default()
-        };
-        let ordered_uniques = ordered_unique_indexes(&tbl, &indexes);
-        let _ = analyze_upsert_clauses(
-            ins,
-            &tbl,
-            &slot_name,
-            &ordered_uniques,
-            db_set,
-            &dml_ctes,
-            functions,
-            collations,
-            &mut visited,
-        )?;
-    }
-
-    if !ins.returning.is_empty() {
-        let sample_scope = make_static_returning_scope(&tbl);
-        let (ret_cols, ret_expanded) =
-            expand_returning_projection(&ins.returning, &sample_scope.cols)?;
-        for (pe, _, _) in &ret_expanded {
-            validate_expr_static(
-                pe,
-                std::slice::from_ref(&sample_scope),
-                db_set,
-                &dml_ctes,
-                functions,
-                false,
-                false,
-                &mut visited,
-            )?;
-        }
-        return Ok(ret_cols);
-    }
-
-    if count_changes {
-        Ok(vec!["count".to_owned()])
-    } else {
-        Ok(Vec::new())
     }
 }
 
-fn validate_update_static(
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn validate_update_static_inner(
     upd: &UpdateStmt,
+    effective_or_conflict: Option<ConflictAction>,
+    outer_scopes: &[EvalRow],
     db_set: &DatabaseSet,
     writable_schema: bool,
+    foreign_keys: bool,
+    recursive_triggers: bool,
     functions: &FunctionRegistry,
     collations: &CollationRegistry,
     count_changes: bool,
+    coded_triggers: &mut Vec<(SchemaInstanceId, i64, Option<ConflictAction>)>,
+    trig_depth: usize,
 ) -> Result<Vec<String>> {
     validate_cte_scope_static(&upd.ctes)?;
-    let (db_id, tbl, slot_name, is_catalog) =
-        resolve_dml_target_table_in_set(db_set, &upd.table, writable_schema)?;
-    let empty_schema = Schema::default();
-    let slot_schema = if is_catalog {
-        &empty_schema
-    } else {
-        db_set
-            .slot(db_id)
-            .filter(|s| s.btree.is_some())
-            .map_or(&empty_schema, |s| &s.schema)
-    };
-    validate_index_hint_static(
-        slot_schema,
-        &tbl,
-        upd.indexed_by.as_ref(),
-        upd.selection.as_ref(),
+    let mod_col_names = collect_set_assignment_col_names(&upd.assignments);
+    let target = resolve_dml_target_in_set(
+        db_set,
+        &upd.table,
+        writable_schema,
+        false,
+        TriggerEventKind::Update,
+        Some(&mod_col_names),
     )?;
-    let dml_ctes = CteStore::default().with_scope(&upd.ctes);
-    let target_scope = make_static_table_scope(&tbl, &slot_name, upd.alias.as_deref());
+    let dml_ctes = CteStore::default().with_scope_at(&upd.ctes, outer_scopes.len());
     let mut visited = Vec::new();
 
-    let eval_scope = if let Some(ref fc) = upd.from {
-        if 2 + fc.joins.len() > 64 {
-            return Err(SqliteError::new(
-                ErrorCode::Error,
-                "at most 64 tables in a join",
-            ));
-        }
-        // `SF_NestedFrom` (`update.c:927`): validate `FROM` independently without `target_scope`!
-        let from_cols =
-            validate_from_clause_static(fc, None, &[], db_set, &dml_ctes, functions, &mut visited)?;
-        check_update_from_same_src_alias(
+    match target {
+        DmlTarget::View {
             db_id,
-            &tbl.name,
-            upd.alias.as_deref(),
-            fc,
-            db_set,
-            &dml_ctes,
-        )?;
-        let mut combined_cols = Vec::with_capacity(target_scope.cols.len() + from_cols.len());
-        combined_cols.extend_from_slice(&target_scope.cols);
-        combined_cols.extend(from_cols);
-        let n_cols = combined_cols.len();
-        EvalRow::new(combined_cols.into(), vec![Value::Null; n_cols])
-    } else {
-        target_scope
-    };
-
-    validate_set_assignments_static(
-        &tbl,
-        &upd.assignments,
-        std::slice::from_ref(&eval_scope),
-        db_set,
-        &dml_ctes,
-        functions,
-        collations,
-        upd.from.is_some(),
-        &mut visited,
-    )?;
-
-    if let Some(ref w) = upd.selection {
-        validate_collations_in_expr(w, collations)?;
-        validate_expr_static(
-            w,
-            std::slice::from_ref(&eval_scope),
-            db_set,
-            &dml_ctes,
-            functions,
-            false,
-            false,
-            &mut visited,
-        )?;
-    }
-
-    if !upd.returning.is_empty() {
-        let ret_scope = make_static_returning_scope(&tbl);
-        let (ret_cols, ret_expanded) =
-            expand_returning_projection(&upd.returning, &ret_scope.cols)?;
-        for (pe, _, _) in &ret_expanded {
-            validate_expr_static(
-                pe,
-                std::slice::from_ref(&ret_scope),
+            view,
+            schema_name: slot_name,
+        } => {
+            if let Some(IndexHint::IndexedBy(ref idx_name)) = upd.indexed_by {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such index: {idx_name}"),
+                ));
+            }
+            let col_specs = resolve_view_col_specs_static(
+                db_id,
+                &view,
                 db_set,
                 &dml_ctes,
                 functions,
-                false,
-                false,
                 &mut visited,
             )?;
-        }
-        return Ok(ret_cols);
-    }
+            let target_scope = make_single_view_scope(
+                &view.name,
+                &slot_name,
+                upd.alias.as_deref(),
+                &col_specs,
+                &vec![Value::Null; col_specs.len()],
+            );
+            let eval_scope = if let Some(ref fc) = upd.from {
+                if 2 + fc.joins.len() > 64 {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "at most 64 tables in a join",
+                    ));
+                }
+                let from_cols = validate_from_clause_static(
+                    fc,
+                    None,
+                    outer_scopes,
+                    db_set,
+                    &dml_ctes,
+                    functions,
+                    &mut visited,
+                )?;
+                check_update_from_same_src_alias(
+                    db_id,
+                    &view.name,
+                    upd.alias.as_deref(),
+                    fc,
+                    db_set,
+                    &dml_ctes,
+                )?;
+                let mut combined_cols =
+                    Vec::with_capacity(target_scope.cols.len() + from_cols.len());
+                combined_cols.extend_from_slice(&target_scope.cols);
+                combined_cols.extend(from_cols);
+                let n_cols = combined_cols.len();
+                EvalRow::new(combined_cols.into(), vec![Value::Null; n_cols])
+            } else {
+                target_scope
+            };
 
-    if count_changes {
-        Ok(vec!["count".to_owned()])
-    } else {
-        Ok(Vec::new())
+            let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
+            scopes.push(eval_scope);
+            scopes.extend_from_slice(outer_scopes);
+
+            validate_set_assignments_for_view_static(
+                &col_specs,
+                &upd.assignments,
+                &scopes,
+                db_set,
+                &dml_ctes,
+                functions,
+                collations,
+                upd.from.is_some(),
+                &mut visited,
+            )?;
+
+            if let Some(ref w) = upd.selection {
+                validate_collations_in_expr(w, collations)?;
+                validate_expr_static(
+                    w,
+                    &scopes,
+                    db_set,
+                    &dml_ctes,
+                    functions,
+                    false,
+                    false,
+                    &mut visited,
+                )?;
+            }
+
+            validate_matching_triggers_static(
+                db_id,
+                &view.name,
+                &col_specs,
+                false,
+                TriggerTiming::InsteadOf,
+                TriggerEventKind::Update,
+                Some(&mod_col_names),
+                effective_or_conflict,
+                db_set,
+                writable_schema,
+                foreign_keys,
+                recursive_triggers,
+                functions,
+                collations,
+                coded_triggers,
+                trig_depth,
+            )?;
+
+            if !upd.returning.is_empty() {
+                let ret_scope = make_returning_view_scope(
+                    &view.name,
+                    &col_specs,
+                    &vec![Value::Null; col_specs.len()],
+                );
+                let (ret_cols, ret_expanded) =
+                    expand_returning_projection(&upd.returning, &ret_scope.cols)?;
+                for (pe, _, _) in &ret_expanded {
+                    validate_expr_static(
+                        pe,
+                        std::slice::from_ref(&ret_scope),
+                        db_set,
+                        &dml_ctes,
+                        functions,
+                        false,
+                        false,
+                        &mut visited,
+                    )?;
+                }
+                return Ok(ret_cols);
+            }
+            if count_changes {
+                Ok(vec!["count".to_owned()])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        DmlTarget::Table {
+            db_id,
+            tbl,
+            schema_name: slot_name,
+            is_catalog,
+        } => {
+            let empty_schema = Schema::default();
+            let slot_schema = if is_catalog {
+                &empty_schema
+            } else {
+                db_set
+                    .slot(db_id)
+                    .filter(|s| s.btree.is_some())
+                    .map_or(&empty_schema, |s| &s.schema)
+            };
+            validate_index_hint_static(
+                slot_schema,
+                &tbl,
+                upd.indexed_by.as_ref(),
+                upd.selection.as_ref(),
+            )?;
+            let target_scope = make_static_table_scope(&tbl, &slot_name, upd.alias.as_deref());
+
+            let eval_scope = if let Some(ref fc) = upd.from {
+                if 2 + fc.joins.len() > 64 {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "at most 64 tables in a join",
+                    ));
+                }
+                let from_cols = validate_from_clause_static(
+                    fc,
+                    None,
+                    outer_scopes,
+                    db_set,
+                    &dml_ctes,
+                    functions,
+                    &mut visited,
+                )?;
+                check_update_from_same_src_alias(
+                    db_id,
+                    &tbl.name,
+                    upd.alias.as_deref(),
+                    fc,
+                    db_set,
+                    &dml_ctes,
+                )?;
+                let mut combined_cols =
+                    Vec::with_capacity(target_scope.cols.len() + from_cols.len());
+                combined_cols.extend_from_slice(&target_scope.cols);
+                combined_cols.extend(from_cols);
+                let n_cols = combined_cols.len();
+                EvalRow::new(combined_cols.into(), vec![Value::Null; n_cols])
+            } else {
+                target_scope
+            };
+
+            let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
+            scopes.push(eval_scope);
+            scopes.extend_from_slice(outer_scopes);
+
+            validate_set_assignments_static(
+                &tbl,
+                &upd.assignments,
+                &scopes,
+                db_set,
+                &dml_ctes,
+                functions,
+                collations,
+                upd.from.is_some(),
+                &mut visited,
+            )?;
+
+            if let Some(ref w) = upd.selection {
+                validate_collations_in_expr(w, collations)?;
+                validate_expr_static(
+                    w,
+                    &scopes,
+                    db_set,
+                    &dml_ctes,
+                    functions,
+                    false,
+                    false,
+                    &mut visited,
+                )?;
+            }
+
+            if !is_catalog {
+                let cspecs: Vec<(String, Collation, Option<TypeAffinity>)> = tbl
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.collation, Some(c.affinity)))
+                    .collect();
+                let has_rowid = !tbl.without_rowid;
+                let indexes = slot_schema.indexes_for_table(&tbl.name);
+
+                for tm in [TriggerTiming::Before, TriggerTiming::After] {
+                    validate_matching_triggers_static(
+                        db_id,
+                        &tbl.name,
+                        &cspecs,
+                        has_rowid,
+                        tm,
+                        TriggerEventKind::Update,
+                        Some(&mod_col_names),
+                        effective_or_conflict,
+                        db_set,
+                        writable_schema,
+                        foreign_keys,
+                        recursive_triggers,
+                        functions,
+                        collations,
+                        coded_triggers,
+                        trig_depth,
+                    )?;
+                }
+
+                if table_may_use_replace(&tbl, &indexes, effective_or_conflict) {
+                    if recursive_triggers {
+                        for tm in [TriggerTiming::Before, TriggerTiming::After] {
+                            validate_matching_triggers_static(
+                                db_id,
+                                &tbl.name,
+                                &cspecs,
+                                has_rowid,
+                                tm,
+                                TriggerEventKind::Delete,
+                                None,
+                                Some(ConflictAction::Replace),
+                                db_set,
+                                writable_schema,
+                                foreign_keys,
+                                recursive_triggers,
+                                functions,
+                                collations,
+                                coded_triggers,
+                                trig_depth,
+                            )?;
+                        }
+                    }
+                    validate_fk_actions_triggers_static(
+                        db_id,
+                        &tbl.name,
+                        true,
+                        db_set,
+                        writable_schema,
+                        foreign_keys,
+                        recursive_triggers,
+                        functions,
+                        collations,
+                        coded_triggers,
+                        trig_depth,
+                    )?;
+                }
+
+                validate_fk_actions_triggers_static(
+                    db_id,
+                    &tbl.name,
+                    false,
+                    db_set,
+                    writable_schema,
+                    foreign_keys,
+                    recursive_triggers,
+                    functions,
+                    collations,
+                    coded_triggers,
+                    trig_depth,
+                )?;
+            }
+
+            if !upd.returning.is_empty() {
+                let ret_scope = make_static_returning_scope(&tbl);
+                let (ret_cols, ret_expanded) =
+                    expand_returning_projection(&upd.returning, &ret_scope.cols)?;
+                for (pe, _, _) in &ret_expanded {
+                    validate_expr_static(
+                        pe,
+                        std::slice::from_ref(&ret_scope),
+                        db_set,
+                        &dml_ctes,
+                        functions,
+                        false,
+                        false,
+                        &mut visited,
+                    )?;
+                }
+                return Ok(ret_cols);
+            }
+
+            if count_changes {
+                Ok(vec!["count".to_owned()])
+            } else {
+                Ok(Vec::new())
+            }
+        }
     }
 }
 
-fn validate_delete_static(
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn validate_delete_static_inner(
     del: &DeleteStmt,
+    effective_or_conflict: Option<ConflictAction>,
+    outer_scopes: &[EvalRow],
     db_set: &DatabaseSet,
     writable_schema: bool,
+    foreign_keys: bool,
+    recursive_triggers: bool,
     functions: &FunctionRegistry,
+    collations: &CollationRegistry,
     count_changes: bool,
+    coded_triggers: &mut Vec<(SchemaInstanceId, i64, Option<ConflictAction>)>,
+    trig_depth: usize,
 ) -> Result<Vec<String>> {
     validate_cte_scope_static(&del.ctes)?;
-    let (db_id, tbl, slot_name, is_catalog) =
-        resolve_dml_target_table_in_set(db_set, &del.table, writable_schema)?;
-    let empty_schema = Schema::default();
-    let slot_schema = if is_catalog {
-        &empty_schema
-    } else {
-        db_set
-            .slot(db_id)
-            .filter(|s| s.btree.is_some())
-            .map_or(&empty_schema, |s| &s.schema)
-    };
-    validate_index_hint_static(
-        slot_schema,
-        &tbl,
-        del.indexed_by.as_ref(),
-        del.selection.as_ref(),
+    let target = resolve_dml_target_in_set(
+        db_set,
+        &del.table,
+        writable_schema,
+        false,
+        TriggerEventKind::Delete,
+        None,
     )?;
-    let dml_ctes = CteStore::default().with_scope(&del.ctes);
-    let scope = make_static_table_scope(&tbl, &slot_name, del.alias.as_deref());
+    let dml_ctes = CteStore::default().with_scope_at(&del.ctes, outer_scopes.len());
     let mut visited = Vec::new();
 
-    if let Some(ref w) = del.selection {
-        validate_expr_static(
-            w,
-            std::slice::from_ref(&scope),
-            db_set,
-            &dml_ctes,
-            functions,
-            false,
-            false,
-            &mut visited,
-        )?;
-    }
-
-    if !del.returning.is_empty() {
-        let ret_scope = make_static_returning_scope(&tbl);
-        let (ret_cols, ret_expanded) =
-            expand_returning_projection(&del.returning, &ret_scope.cols)?;
-        for (pe, _, _) in &ret_expanded {
-            validate_expr_static(
-                pe,
-                std::slice::from_ref(&ret_scope),
+    match target {
+        DmlTarget::View {
+            db_id,
+            view,
+            schema_name: slot_name,
+        } => {
+            if let Some(IndexHint::IndexedBy(ref idx_name)) = del.indexed_by {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such index: {idx_name}"),
+                ));
+            }
+            let col_specs = resolve_view_col_specs_static(
+                db_id,
+                &view,
                 db_set,
                 &dml_ctes,
                 functions,
-                false,
-                false,
                 &mut visited,
             )?;
-        }
-        return Ok(ret_cols);
-    }
+            let scope = make_single_view_scope(
+                &view.name,
+                &slot_name,
+                del.alias.as_deref(),
+                &col_specs,
+                &vec![Value::Null; col_specs.len()],
+            );
+            let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
+            scopes.push(scope);
+            scopes.extend_from_slice(outer_scopes);
 
-    if count_changes {
-        Ok(vec!["count".to_owned()])
-    } else {
-        Ok(Vec::new())
+            if let Some(ref w) = del.selection {
+                validate_expr_static(
+                    w,
+                    &scopes,
+                    db_set,
+                    &dml_ctes,
+                    functions,
+                    false,
+                    false,
+                    &mut visited,
+                )?;
+            }
+
+            validate_matching_triggers_static(
+                db_id,
+                &view.name,
+                &col_specs,
+                false,
+                TriggerTiming::InsteadOf,
+                TriggerEventKind::Delete,
+                None,
+                effective_or_conflict,
+                db_set,
+                writable_schema,
+                foreign_keys,
+                recursive_triggers,
+                functions,
+                collations,
+                coded_triggers,
+                trig_depth,
+            )?;
+
+            if !del.returning.is_empty() {
+                let ret_scope = make_returning_view_scope(
+                    &view.name,
+                    &col_specs,
+                    &vec![Value::Null; col_specs.len()],
+                );
+                let (ret_cols, ret_expanded) =
+                    expand_returning_projection(&del.returning, &ret_scope.cols)?;
+                for (pe, _, _) in &ret_expanded {
+                    validate_expr_static(
+                        pe,
+                        std::slice::from_ref(&ret_scope),
+                        db_set,
+                        &dml_ctes,
+                        functions,
+                        false,
+                        false,
+                        &mut visited,
+                    )?;
+                }
+                return Ok(ret_cols);
+            }
+            if count_changes {
+                Ok(vec!["count".to_owned()])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        DmlTarget::Table {
+            db_id,
+            tbl,
+            schema_name: slot_name,
+            is_catalog,
+        } => {
+            let empty_schema = Schema::default();
+            let slot_schema = if is_catalog {
+                &empty_schema
+            } else {
+                db_set
+                    .slot(db_id)
+                    .filter(|s| s.btree.is_some())
+                    .map_or(&empty_schema, |s| &s.schema)
+            };
+            validate_index_hint_static(
+                slot_schema,
+                &tbl,
+                del.indexed_by.as_ref(),
+                del.selection.as_ref(),
+            )?;
+            let scope = make_static_table_scope(&tbl, &slot_name, del.alias.as_deref());
+            let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
+            scopes.push(scope);
+            scopes.extend_from_slice(outer_scopes);
+
+            if let Some(ref w) = del.selection {
+                validate_expr_static(
+                    w,
+                    &scopes,
+                    db_set,
+                    &dml_ctes,
+                    functions,
+                    false,
+                    false,
+                    &mut visited,
+                )?;
+            }
+
+            if !is_catalog {
+                let cspecs: Vec<(String, Collation, Option<TypeAffinity>)> = tbl
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.collation, Some(c.affinity)))
+                    .collect();
+                let has_rowid = !tbl.without_rowid;
+
+                for tm in [TriggerTiming::Before, TriggerTiming::After] {
+                    validate_matching_triggers_static(
+                        db_id,
+                        &tbl.name,
+                        &cspecs,
+                        has_rowid,
+                        tm,
+                        TriggerEventKind::Delete,
+                        None,
+                        effective_or_conflict,
+                        db_set,
+                        writable_schema,
+                        foreign_keys,
+                        recursive_triggers,
+                        functions,
+                        collations,
+                        coded_triggers,
+                        trig_depth,
+                    )?;
+                }
+
+                validate_fk_actions_triggers_static(
+                    db_id,
+                    &tbl.name,
+                    true,
+                    db_set,
+                    writable_schema,
+                    foreign_keys,
+                    recursive_triggers,
+                    functions,
+                    collations,
+                    coded_triggers,
+                    trig_depth,
+                )?;
+            }
+
+            if !del.returning.is_empty() {
+                let ret_scope = make_static_returning_scope(&tbl);
+                let (ret_cols, ret_expanded) =
+                    expand_returning_projection(&del.returning, &ret_scope.cols)?;
+                for (pe, _, _) in &ret_expanded {
+                    validate_expr_static(
+                        pe,
+                        std::slice::from_ref(&ret_scope),
+                        db_set,
+                        &dml_ctes,
+                        functions,
+                        false,
+                        false,
+                        &mut visited,
+                    )?;
+                }
+                return Ok(ret_cols);
+            }
+
+            if count_changes {
+                Ok(vec!["count".to_owned()])
+            } else {
+                Ok(Vec::new())
+            }
+        }
     }
 }
 
@@ -26573,6 +30582,19 @@ fn reject_raise_in_top_level_update(upd: &UpdateStmt, db_set: &DatabaseSet) -> R
     }
     if let Some((_, tbl)) = db_set.find_user_table_in_set(&upd.table) {
         reject_raise_in_table_constraints_outside_trigger(tbl)?;
+    } else if let Some((v_db, view)) = db_set.find_view_in_set(&upd.table) {
+        let sname = db_set
+            .slot(v_db)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "main".to_owned());
+        if let Ok(fixed) = prepare_fixed_view_select(v_db, &sname, view) {
+            reject_raise_in_top_level_select(
+                &fixed,
+                db_set,
+                &CteStore::default(),
+                &mut visited_views,
+            )?;
+        }
     }
     if let Some(ref fc) = upd.from {
         if from_contains_raise(fc) {
@@ -26602,6 +30624,20 @@ fn reject_raise_in_top_level_delete(del: &DeleteStmt, db_set: &DatabaseSet) -> R
     let dml_ctes = CteStore::default().with_scope(&del.ctes);
     for cte in &del.ctes {
         reject_raise_in_top_level_select(&cte.query, db_set, &dml_ctes, &mut visited_views)?;
+    }
+    if let Some((v_db, view)) = db_set.find_view_in_set(&del.table) {
+        let sname = db_set
+            .slot(v_db)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "main".to_owned());
+        if let Ok(fixed) = prepare_fixed_view_select(v_db, &sname, view) {
+            reject_raise_in_top_level_select(
+                &fixed,
+                db_set,
+                &CteStore::default(),
+                &mut visited_views,
+            )?;
+        }
     }
     if let Some(ref w) = del.selection {
         reject_raise_in_top_level_expr(w, db_set, &dml_ctes, &mut visited_views)?;

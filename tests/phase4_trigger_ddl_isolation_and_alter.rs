@@ -1126,7 +1126,7 @@ SELECT 'AUX', type, name, tbl_name, sql FROM aux.sqlite_schema WHERE type='trigg
     );
     assert_eq!(
         c_verify_out,
-        "ok\n1|Ada Lovelace\n2|Grace\nGrace|created\nAda Lovelace|renamed_from:Ada\n"
+        "ok\n1|Ada Lovelace\n2|Grace\nAda|created\nGrace|created\nAda Lovelace|renamed_from:Ada\n"
     );
 
     // Direction B: C SQLite 3.54.1 creates tables, views, and triggers; Rust opens the `.db`,

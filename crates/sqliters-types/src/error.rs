@@ -1,4 +1,5 @@
 //! Result codes and error types ported from `sqlite/src/sqlite.h.in`.
+#![forbid(unsafe_code)]
 
 use std::fmt;
 
@@ -178,6 +179,7 @@ pub mod extended {
     pub const SQLITE_CONSTRAINT_FOREIGNKEY: i32 = (ErrorCode::Constraint as i32) | (3 << 8);
     pub const SQLITE_CONSTRAINT_NOTNULL: i32 = (ErrorCode::Constraint as i32) | (5 << 8);
     pub const SQLITE_CONSTRAINT_PRIMARYKEY: i32 = (ErrorCode::Constraint as i32) | (6 << 8);
+    pub const SQLITE_CONSTRAINT_TRIGGER: i32 = (ErrorCode::Constraint as i32) | (7 << 8);
     pub const SQLITE_CONSTRAINT_UNIQUE: i32 = (ErrorCode::Constraint as i32) | (8 << 8);
     pub const SQLITE_CONSTRAINT_ROWID: i32 = (ErrorCode::Constraint as i32) | (10 << 8);
     pub const SQLITE_CONSTRAINT_DATATYPE: i32 = (ErrorCode::Constraint as i32) | (12 << 8);
