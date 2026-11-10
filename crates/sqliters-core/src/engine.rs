@@ -15,13 +15,14 @@ use sqliters_pager::{
 };
 use sqliters_syntax::{
     AlterTableAction, BinaryOp, BindParam, ColumnDef, ColumnRef, CommonTableExpr, CompoundOp,
-    ConflictAction, CreateIndexStmt, CreateTableStmt, CreateViewStmt, CurrentTimeKind, DeleteStmt,
-    Expr, FkAction, FromClause, FunctionArgs, IdentSpanMap, IndexHint, IndexedColumn, InsertSource,
-    InsertStmt, JoinClause, JoinConstraint, JoinType, LikeOp, LimitClause, OrderByTerm,
-    PragmaValue, QualifiedName, ResultColumn, SelectBody, SelectCore, SelectStmt, SetAssignment,
-    Stmt, TableOrSubquery, Token, TokenKind, TokenSpan, UnaryOp, UpdateStmt, UpsertAction,
-    apply_span_edits, dequote, keyword_kind, parse_one, parse_one_with_spans,
-    remove_column_def_from_create_table_sql, tokenize,
+    ConflictAction, CreateIndexStmt, CreateTableStmt, CreateTriggerStmt, CreateViewStmt,
+    CurrentTimeKind, DeleteStmt, Expr, FkAction, FromClause, FunctionArgs, IdentSpanMap, IndexHint,
+    IndexedColumn, InsertSource, InsertStmt, JoinClause, JoinConstraint, JoinType, LikeOp,
+    LimitClause, OrderByTerm, PragmaValue, QualifiedName, ResultColumn, SelectBody, SelectCore,
+    SelectStmt, SetAssignment, Stmt, TableOrSubquery, Token, TokenKind, TokenSpan, TriggerEvent,
+    TriggerStep, TriggerTiming, UnaryOp, UpdateStmt, UpsertAction, apply_span_edits, dequote,
+    keyword_kind, parse_one, parse_one_with_spans, remove_column_def_from_create_table_sql,
+    tokenize,
 };
 use sqliters_types::{
     Collation, ConflictResolutionEffect, DatabaseId, DatabaseKind, ErrorCode, ExecutionServices,
@@ -52,6 +53,12 @@ use crate::schema::{
     insert_schema_entry, scan_index_incremental, scan_index_incremental_with_services,
     scan_table_incremental, scan_table_incremental_with_services, update_schema_entry,
     validate_view_no_parameters,
+};
+use crate::trigger::{
+    CreateTriggerPlan, fix_permanent_trigger, from_contains_raise,
+    is_reserved_trigger_or_system_name, reject_raise_outside_trigger_expr,
+    reject_raise_outside_trigger_select, replace_bind_params_with_null_in_trigger,
+    resolve_and_validate_create_trigger, validate_trigger_body_dml_targets,
 };
 
 /// Materialized result set (`column_names` + `rows`) produced by executing a statement.
@@ -348,9 +355,17 @@ impl ExecContext<'_> {
                 *self.in_user_btree_tx = true;
             }
         }
-        if check_schema {
+        let reloaded = if check_schema {
+            let was_loaded = slot.schema.loaded;
+            let prev_cookie = slot.schema.schema_cookie;
             let slot_name = slot.name.clone();
             slot.schema.ensure_fresh_in_tx_for_schema(bt, &slot_name)?;
+            !was_loaded || slot.schema.schema_cookie != prev_cookie
+        } else {
+            false
+        };
+        if reloaded {
+            self.db_set.reconcile_temp_triggers()?;
         }
         Ok(())
     }
@@ -392,13 +407,23 @@ impl ExecContext<'_> {
         if !autocommit {
             *self.in_user_btree_tx = true;
         }
-        if check_schema && let Err(e) = slot.schema.ensure_fresh_in_tx_for_schema(bt, &slot_name) {
-            if !was_write {
-                let retain = (self.activity.other_read_db_mask & bit) != 0;
-                let _ = bt.pager_mut().rollback_retaining_read(retain);
-                self.stmt_tx.touched_write_mask &= !bit;
+        let reloaded = if check_schema {
+            let was_loaded = slot.schema.loaded;
+            let prev_cookie = slot.schema.schema_cookie;
+            if let Err(e) = slot.schema.ensure_fresh_in_tx_for_schema(bt, &slot_name) {
+                if !was_write {
+                    let retain = (self.activity.other_read_db_mask & bit) != 0;
+                    let _ = bt.pager_mut().rollback_retaining_read(retain);
+                    self.stmt_tx.touched_write_mask &= !bit;
+                }
+                return Err(e);
             }
-            return Err(e);
+            !was_loaded || slot.schema.schema_cookie != prev_cookie
+        } else {
+            false
+        };
+        if reloaded {
+            self.db_set.reconcile_temp_triggers()?;
         }
         Ok(())
     }
@@ -1007,6 +1032,7 @@ pub(crate) fn rollback_all_databases(
                 slot.schema = fresh;
             }
         }
+        let _ = ctx.db_set.reconcile_temp_triggers();
         *ctx.schema_generation += 1;
         *ctx.v1_expire_generation += 1;
     }
@@ -1283,8 +1309,10 @@ pub(crate) fn classify_stmt_category(stmt: &Stmt) -> StmtCategory {
         | Stmt::CreateTable(_)
         | Stmt::CreateTableAs { .. }
         | Stmt::CreateView(_)
+        | Stmt::CreateTrigger(_)
         | Stmt::DropTable { .. }
         | Stmt::DropView { .. }
+        | Stmt::DropTrigger { .. }
         | Stmt::CreateIndex(_)
         | Stmt::DropIndex { .. }
         | Stmt::AlterTable { .. }
@@ -1300,6 +1328,7 @@ struct ScopedColumn {
     collation: Collation,
     affinity: Option<TypeAffinity>,
     hidden_rowid: bool,
+    omit_from_star: bool,
     merged_using: bool,
 }
 
@@ -1911,6 +1940,7 @@ pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
                             db_slot.schema = Schema::load_for_schema(bt, Some(&db_slot.name))?;
                         }
                     }
+                    ctx.db_set.sync_temp_trigger_bindings_from_schema();
                 }
                 if is_schema_change {
                     *ctx.schema_generation += 1;
@@ -2133,12 +2163,20 @@ pub(crate) fn execute_write_body(
             exec_create_view(ctx, cv)?;
             Ok(QueryOutput::default())
         }
+        Stmt::CreateTrigger(ct) => {
+            exec_create_trigger(ctx, ct)?;
+            Ok(QueryOutput::default())
+        }
         Stmt::DropTable { if_exists, name } => {
             exec_drop_table(ctx, *if_exists, name)?;
             Ok(QueryOutput::default())
         }
         Stmt::DropView { if_exists, name } => {
             exec_drop_view(ctx, *if_exists, name)?;
+            Ok(QueryOutput::default())
+        }
+        Stmt::DropTrigger { if_exists, name } => {
+            exec_drop_trigger(ctx, *if_exists, name)?;
             Ok(QueryOutput::default())
         }
         Stmt::CreateIndex(ci) => {
@@ -3317,6 +3355,7 @@ fn exec_recursive_cte(
                     collation: coll,
                     affinity: aff,
                     hidden_rowid: false,
+                    omit_from_star: false,
                     merged_using: false,
                 }
             })
@@ -4699,6 +4738,7 @@ fn eval_table_or_subquery(
                             collation: coll,
                             affinity: aff,
                             hidden_rowid: false,
+                            omit_from_star: false,
                             merged_using: false,
                         }
                     })
@@ -4737,6 +4777,7 @@ fn eval_table_or_subquery(
                             collation: coll,
                             affinity: aff,
                             hidden_rowid: false,
+                            omit_from_star: false,
                             merged_using: false,
                         }
                     })
@@ -4778,6 +4819,7 @@ fn eval_table_or_subquery(
                     collation: c.collation,
                     affinity: Some(c.affinity),
                     hidden_rowid: false,
+                    omit_from_star: false,
                     merged_using: false,
                 })
                 .collect();
@@ -4793,6 +4835,7 @@ fn eval_table_or_subquery(
                     collation: Collation::Binary,
                     affinity: Some(TypeAffinity::Integer),
                     hidden_rowid: true,
+                    omit_from_star: false,
                     merged_using: false,
                 });
             }
@@ -4828,6 +4871,7 @@ fn eval_table_or_subquery(
                         collation: coll,
                         affinity: aff,
                         hidden_rowid: false,
+                        omit_from_star: false,
                         merged_using: false,
                     }
                 })
@@ -5059,10 +5103,12 @@ fn merge_join_scoped_columns(
         cols.push(sc);
     }
     for rc in right_cols {
-        if !rc.hidden_rowid && using_cols.iter().any(|u| u.eq_ignore_ascii_case(&rc.name)) {
-            continue;
+        let mut sc = rc.clone();
+        if !sc.hidden_rowid && using_cols.iter().any(|u| u.eq_ignore_ascii_case(&sc.name)) {
+            sc.omit_from_star = true;
+            sc.merged_using = false;
         }
-        cols.push(rc.clone());
+        cols.push(sc);
     }
     cols
 }
@@ -5235,17 +5281,6 @@ fn apply_join(
     let using_cols = compute_join_using_cols(&left_sample_cols, &right_sample_cols, join);
     let merged_cols = merge_join_scoped_columns(&left_sample_cols, &right_sample_cols, join);
     let shared_merged_cols: Rc<[ScopedColumn]> = Rc::from(merged_cols.as_slice());
-    let right_keep_indices: Vec<usize> = right_sample_cols
-        .iter()
-        .enumerate()
-        .filter_map(|(j, rc)| {
-            if !rc.hidden_rowid && using_cols.iter().any(|u| u.eq_ignore_ascii_case(&rc.name)) {
-                None
-            } else {
-                Some(j)
-            }
-        })
-        .collect();
     let left_is_using: Vec<bool> = left_sample_cols
         .iter()
         .map(|lc| !lc.hidden_rowid && using_cols.iter().any(|u| u.eq_ignore_ascii_case(&lc.name)))
@@ -5264,7 +5299,7 @@ fn apply_join(
             }
             vals.push(val);
         }
-        for &j in &right_keep_indices {
+        for j in 0..right_sample_cols.len() {
             vals.push(r.map_or(Value::Null, |row| row.vals[j].clone()));
         }
         EvalRow::new(Rc::clone(&shared_merged_cols), vals)
@@ -5514,6 +5549,7 @@ fn schema_cols_for_tos(
                                 collation: coll,
                                 affinity: aff,
                                 hidden_rowid: false,
+                                omit_from_star: false,
                                 merged_using: false,
                             }
                         })
@@ -5541,6 +5577,7 @@ fn schema_cols_for_tos(
                     collation: c.collation,
                     affinity: Some(c.affinity),
                     hidden_rowid: false,
+                    omit_from_star: false,
                     merged_using: false,
                 })
                 .collect();
@@ -5556,6 +5593,7 @@ fn schema_cols_for_tos(
                     collation: Collation::Binary,
                     affinity: Some(TypeAffinity::Integer),
                     hidden_rowid: true,
+                    omit_from_star: false,
                     merged_using: false,
                 });
             }
@@ -5581,6 +5619,7 @@ fn schema_cols_for_tos(
                             collation: coll,
                             affinity: aff,
                             hidden_rowid: false,
+                            omit_from_star: false,
                             merged_using: false,
                         }
                     })
@@ -5618,7 +5657,7 @@ fn expand_projection(
         match rc {
             ResultColumn::Star => {
                 for (slot_idx, sc) in sample_cols.iter().enumerate() {
-                    if sc.hidden_rowid {
+                    if sc.hidden_rowid || sc.omit_from_star {
                         continue;
                     }
                     let e = Expr::Column(ColumnRef {
@@ -7125,6 +7164,7 @@ fn static_view_scoped_cols(
                         collation: coll,
                         affinity: aff,
                         hidden_rowid: false,
+                        omit_from_star: false,
                         merged_using: false,
                     }
                 })
@@ -7144,6 +7184,7 @@ fn static_view_scoped_cols(
                         collation: coll,
                         affinity: aff,
                         hidden_rowid: false,
+                        omit_from_star: false,
                         merged_using: false,
                     }
                 })
@@ -7184,6 +7225,7 @@ fn static_view_scoped_cols(
                     collation: coll,
                     affinity: aff,
                     hidden_rowid: false,
+                    omit_from_star: false,
                     merged_using: false,
                 }
             })
@@ -7238,6 +7280,7 @@ fn static_schema_cols_for_tos(
                                 collation: coll,
                                 affinity: aff,
                                 hidden_rowid: false,
+                                omit_from_star: false,
                                 merged_using: false,
                             }
                         })
@@ -7260,6 +7303,7 @@ fn static_schema_cols_for_tos(
                     collation: c.collation,
                     affinity: Some(c.affinity),
                     hidden_rowid: false,
+                    omit_from_star: false,
                     merged_using: false,
                 })
                 .collect();
@@ -7275,6 +7319,7 @@ fn static_schema_cols_for_tos(
                     collation: Collation::Binary,
                     affinity: Some(TypeAffinity::Integer),
                     hidden_rowid: true,
+                    omit_from_star: false,
                     merged_using: false,
                 });
             }
@@ -7305,6 +7350,7 @@ fn static_schema_cols_for_tos(
                             collation: coll,
                             affinity: aff,
                             hidden_rowid: false,
+                            omit_from_star: false,
                             merged_using: false,
                         }
                     })
@@ -9045,6 +9091,7 @@ fn make_single_table_scope(
             collation: c.collation,
             affinity: Some(c.affinity),
             hidden_rowid: false,
+            omit_from_star: false,
             merged_using: false,
         })
         .collect();
@@ -9057,6 +9104,7 @@ fn make_single_table_scope(
             collation: Collation::Binary,
             affinity: Some(TypeAffinity::Integer),
             hidden_rowid: true,
+            omit_from_star: false,
             merged_using: false,
         });
         row_vals.push(Value::Integer(rowid));
@@ -9078,6 +9126,7 @@ fn make_returning_table_scope(tbl: &TableSchema, rowid: i64, vals: &[Value]) -> 
             collation: c.collation,
             affinity: Some(c.affinity),
             hidden_rowid: false,
+            omit_from_star: false,
             merged_using: false,
         })
         .collect();
@@ -9090,6 +9139,7 @@ fn make_returning_table_scope(tbl: &TableSchema, rowid: i64, vals: &[Value]) -> 
             collation: Collation::Binary,
             affinity: Some(TypeAffinity::Integer),
             hidden_rowid: true,
+            omit_from_star: false,
             merged_using: false,
         });
         row_vals.push(Value::Integer(rowid));
@@ -9110,6 +9160,7 @@ fn make_excluded_table_scope(tbl: &TableSchema, rowid: i64, vals: &[Value]) -> E
             collation: c.collation,
             affinity: Some(c.affinity),
             hidden_rowid: false,
+            omit_from_star: false,
             merged_using: false,
         })
         .collect();
@@ -9122,6 +9173,7 @@ fn make_excluded_table_scope(tbl: &TableSchema, rowid: i64, vals: &[Value]) -> E
             collation: Collation::Binary,
             affinity: Some(TypeAffinity::Integer),
             hidden_rowid: true,
+            omit_from_star: false,
             merged_using: false,
         });
         row_vals.push(Value::Integer(rowid));
@@ -13845,7 +13897,11 @@ fn exec_create_table(ctx: &mut ExecContext<'_>, ct: &CreateTableStmt) -> Result<
         ));
     }
 
-    slot.reload_schema()?;
+    if db_id == DatabaseId::TEMP {
+        ctx.db_set.reload_temp_schema_preserving_bindings()?;
+    } else {
+        slot.reload_schema()?;
+    }
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;
     *ctx.schema_changed_in_tx = true;
@@ -14113,11 +14169,248 @@ fn exec_create_view(ctx: &mut ExecContext<'_>, cv: &CreateViewStmt) -> Result<()
             "database or disk is full",
         ));
     }
-    slot.reload_schema()?;
+    if db_id == DatabaseId::TEMP {
+        ctx.db_set.reload_temp_schema_preserving_bindings()?;
+    } else {
+        slot.reload_schema()?;
+    }
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;
     *ctx.schema_changed_in_tx = true;
     Ok(())
+}
+
+fn exec_create_trigger(ctx: &mut ExecContext<'_>, ct: &CreateTriggerStmt) -> Result<()> {
+    let plan = resolve_and_validate_create_trigger(ctx.db_set, ct, *ctx.writable_schema)?;
+    let CreateTriggerPlan::Create {
+        trigger_db_id,
+        target_schema_instance_id,
+        target_table_name,
+        ..
+    } = plan
+    else {
+        return Ok(());
+    };
+
+    if trigger_db_id == DatabaseId::TEMP {
+        let enc = ctx.encoding();
+        ctx.db_set.ensure_temp_open(enc, *ctx.writable_schema)?;
+    }
+    ctx.ensure_write_db(trigger_db_id, true)?;
+    {
+        let slot = ctx
+            .db_set
+            .slot(trigger_db_id)
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        if slot.schema.find_trigger(&ct.name.name).is_some() {
+            if ct.if_not_exists {
+                return Ok(());
+            }
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("trigger {} already exists", ct.name_token_text),
+            ));
+        }
+    }
+
+    {
+        let slot = ctx
+            .db_set
+            .slot_mut(trigger_db_id)
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        let bt = slot
+            .btree
+            .as_mut()
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        insert_schema_entry(
+            bt,
+            "trigger",
+            &ct.name.name,
+            &target_table_name,
+            0,
+            Some(&ct.catalog_sql),
+        )?;
+        if bt.pager().page_count() > slot.max_page_count {
+            return Err(SqliteError::new(
+                ErrorCode::Full,
+                "database or disk is full",
+            ));
+        }
+    }
+
+    if trigger_db_id == DatabaseId::TEMP {
+        ctx.db_set.reload_temp_schema_preserving_bindings()?;
+        if let Some(tslot) = ctx.db_set.slot_mut(DatabaseId::TEMP)
+            && let Some(tr) = tslot
+                .schema
+                .triggers
+                .iter_mut()
+                .rev()
+                .find(|t| t.name.eq_ignore_ascii_case(&ct.name.name))
+        {
+            tr.is_orphan = false;
+            tr.target_schema_instance_id = Some(target_schema_instance_id);
+            tr.detached_to_temp = false;
+        }
+        ctx.db_set.sync_temp_trigger_bindings_from_schema();
+    } else if let Some(slot) = ctx.db_set.slot_mut(trigger_db_id) {
+        slot.reload_schema()?;
+    }
+
+    *ctx.schema_generation += 1;
+    *ctx.v1_expire_generation += 1;
+    *ctx.schema_changed_in_tx = true;
+    Ok(())
+}
+
+fn exec_drop_trigger(
+    ctx: &mut ExecContext<'_>,
+    if_exists: bool,
+    name: &QualifiedName,
+) -> Result<()> {
+    let Some((db_id, trig_name)) = ctx
+        .db_set
+        .find_trigger_in_set(name)
+        .map(|(id, tr)| (id, tr.name.clone()))
+    else {
+        if if_exists {
+            return Ok(());
+        }
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("no such trigger: {}", name.display_name()),
+        ));
+    };
+
+    let has_open_cur = ctx
+        .db_set
+        .slot(db_id)
+        .and_then(|s| s.btree.as_ref())
+        .is_some_and(|bt| bt.has_any_other_open_cursor(None));
+    if ctx.activity.other_readers > 0 || has_open_cur {
+        return Err(SqliteError::new(
+            ErrorCode::Locked,
+            "database table is locked",
+        ));
+    }
+
+    ctx.ensure_write_db(db_id, true)?;
+    let trig_rowid = {
+        let slot = ctx
+            .db_set
+            .slot(db_id)
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        let Some(tr) = slot.schema.find_trigger(&trig_name) else {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such trigger: {}", name.display_name()),
+            ));
+        };
+        tr.schema_rowid
+    };
+
+    {
+        let slot = ctx
+            .db_set
+            .slot_mut(db_id)
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        let bt = slot
+            .btree
+            .as_mut()
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        delete_schema_entry(bt, trig_rowid)?;
+    }
+
+    if db_id == DatabaseId::TEMP {
+        ctx.db_set.reload_temp_schema_preserving_bindings()?;
+    } else if let Some(slot) = ctx.db_set.slot_mut(db_id) {
+        slot.reload_schema()?;
+    }
+
+    *ctx.schema_generation += 1;
+    *ctx.v1_expire_generation += 1;
+    *ctx.schema_changed_in_tx = true;
+    Ok(())
+}
+
+/// Deletes all triggers attached to `(db_id, rel_name)` in `db_id` AND any active `TEMP` triggers
+/// targeting `(db_id, rel_name)` (`sqlite3CodeDropTable` + `sqlite3TriggerList`, `build.c:3487-3493`).
+fn cascade_delete_triggers_for_relation(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    rel_name: &str,
+) -> Result<bool> {
+    let Some(target_inst) = ctx.db_set.slot(db_id).map(|s| s.schema_instance_id) else {
+        return Ok(false);
+    };
+
+    let same_db_trig_rowids: Vec<i64> = ctx
+        .db_set
+        .slot(db_id)
+        .map(|s| {
+            s.schema
+                .triggers
+                .iter()
+                .filter(|tr| {
+                    if db_id == DatabaseId::TEMP {
+                        tr.is_active()
+                            && !tr.detached_to_temp
+                            && tr.target_schema_instance_id == Some(target_inst)
+                            && tr.tbl_name.eq_ignore_ascii_case(rel_name)
+                    } else {
+                        tr.tbl_name.eq_ignore_ascii_case(rel_name)
+                    }
+                })
+                .map(|tr| tr.schema_rowid)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !same_db_trig_rowids.is_empty()
+        && let Some(slot) = ctx.db_set.slot_mut(db_id)
+        && let Some(ref mut bt) = slot.btree
+    {
+        for rid in same_db_trig_rowids {
+            delete_schema_entry(bt, rid)?;
+        }
+    }
+
+    let mut temp_deleted = false;
+    if db_id != DatabaseId::TEMP && ctx.db_set.is_temp_open() {
+        let temp_trig_rowids: Vec<i64> = ctx
+            .db_set
+            .slot(DatabaseId::TEMP)
+            .map(|ts| {
+                ts.schema
+                    .triggers
+                    .iter()
+                    .filter(|tr| {
+                        tr.is_active()
+                            && !tr.detached_to_temp
+                            && tr.target_schema_instance_id == Some(target_inst)
+                            && tr.tbl_name.eq_ignore_ascii_case(rel_name)
+                    })
+                    .map(|tr| tr.schema_rowid)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !temp_trig_rowids.is_empty() {
+            ctx.ensure_write_db(DatabaseId::TEMP, true)?;
+            if let Some(tslot) = ctx.db_set.slot_mut(DatabaseId::TEMP)
+                && let Some(ref mut tbt) = tslot.btree
+            {
+                for rid in temp_trig_rowids {
+                    delete_schema_entry(tbt, rid)?;
+                }
+            }
+            temp_deleted = true;
+        }
+    }
+
+    Ok(temp_deleted)
 }
 
 fn exec_drop_view(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedName) -> Result<()> {
@@ -14172,25 +14465,44 @@ fn exec_drop_view(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedNa
     }
 
     ctx.ensure_write_db(db_id, true)?;
-    let slot = ctx
-        .db_set
-        .slot_mut(db_id)
-        .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-    let Some(view) = slot.schema.find_view(&view_name).cloned() else {
-        if if_exists {
-            return Ok(());
-        }
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            format!("no such view: {}", name.display_name()),
-        ));
+    let view_rowid = {
+        let slot = ctx
+            .db_set
+            .slot(db_id)
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        let Some(view) = slot.schema.find_view(&view_name) else {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such view: {}", name.display_name()),
+            ));
+        };
+        view.schema_rowid
     };
-    let bt = slot
-        .btree
-        .as_mut()
-        .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-    delete_schema_entry(bt, view.schema_rowid)?;
-    slot.reload_schema()?;
+    let temp_deleted = cascade_delete_triggers_for_relation(ctx, db_id, &view_name)?;
+    {
+        let slot = ctx
+            .db_set
+            .slot_mut(db_id)
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        let bt = slot
+            .btree
+            .as_mut()
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        delete_schema_entry(bt, view_rowid)?;
+    }
+    if db_id == DatabaseId::TEMP {
+        ctx.db_set.reload_temp_schema_preserving_bindings()?;
+    } else {
+        if let Some(slot) = ctx.db_set.slot_mut(db_id) {
+            slot.reload_schema()?;
+        }
+        if temp_deleted {
+            ctx.db_set.reload_temp_schema_preserving_bindings()?;
+        }
+    }
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;
     *ctx.schema_changed_in_tx = true;
@@ -14309,6 +14621,9 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
         }
     }
 
+    // Delete all triggers attached to `tbl.name` in `db_id` and `TEMP` (`sqlite3CodeDropTable`)
+    let temp_triggers_deleted = cascade_delete_triggers_for_relation(ctx, db_id, &tbl.name)?;
+
     enum DropRootKind {
         Table,
         Index(String),
@@ -14389,7 +14704,14 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
         }
     }
 
-    slot.reload_schema()?;
+    if db_id == DatabaseId::TEMP {
+        ctx.db_set.reload_temp_schema_preserving_bindings()?;
+    } else {
+        slot.reload_schema()?;
+        if temp_triggers_deleted {
+            ctx.db_set.reload_temp_schema_preserving_bindings()?;
+        }
+    }
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;
     *ctx.schema_changed_in_tx = true;
@@ -14564,7 +14886,11 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
             "database or disk is full",
         ));
     }
-    slot.reload_schema()?;
+    if db_id == DatabaseId::TEMP {
+        ctx.db_set.reload_temp_schema_preserving_bindings()?;
+    } else {
+        slot.reload_schema()?;
+    }
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;
     *ctx.schema_changed_in_tx = true;
@@ -14824,7 +15150,11 @@ fn exec_drop_index(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
             .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
         apply_root_page_move(bt, &mut slot.schema, mv)?;
     }
-    slot.reload_schema()?;
+    if db_id == DatabaseId::TEMP {
+        ctx.db_set.reload_temp_schema_preserving_bindings()?;
+    } else {
+        slot.reload_schema()?;
+    }
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;
     *ctx.schema_changed_in_tx = true;
@@ -14894,15 +15224,500 @@ fn read_live_schema_sql_map(bt: &mut Btree) -> Result<HashMap<i64, Option<String
     Ok(out)
 }
 
+fn make_static_trigger_pseudo_scope(
+    event: &TriggerEvent,
+    col_specs: &[(String, Collation, Option<TypeAffinity>)],
+    has_hidden_rowid: bool,
+) -> EvalRow {
+    let mut pseudo_cols = Vec::new();
+    let push_pseudo = |out: &mut Vec<ScopedColumn>, alias: &str| {
+        for (cname, coll, aff) in col_specs {
+            out.push(ScopedColumn {
+                schema_name: None,
+                table_alias: Some(alias.to_owned()),
+                name: cname.clone(),
+                collation: *coll,
+                affinity: *aff,
+                hidden_rowid: false,
+                omit_from_star: false,
+                merged_using: false,
+            });
+        }
+        if has_hidden_rowid {
+            out.push(ScopedColumn {
+                schema_name: None,
+                table_alias: Some(alias.to_owned()),
+                name: "rowid".to_owned(),
+                collation: Collation::Binary,
+                affinity: Some(TypeAffinity::Integer),
+                hidden_rowid: true,
+                omit_from_star: false,
+                merged_using: false,
+            });
+        }
+    };
+    match event {
+        TriggerEvent::Insert => push_pseudo(&mut pseudo_cols, "new"),
+        TriggerEvent::Delete => push_pseudo(&mut pseudo_cols, "old"),
+        TriggerEvent::Update { .. } => {
+            push_pseudo(&mut pseudo_cols, "old");
+            push_pseudo(&mut pseudo_cols, "new");
+        }
+    }
+    let n = pseudo_cols.len();
+    EvalRow {
+        cols: pseudo_cols.into(),
+        vals: vec![Value::Null; n],
+        qualified_only: true,
+    }
+}
+
+fn resolve_trigger_step_target_scope_static(
+    qn: &QualifiedName,
+    alias: Option<&str>,
+    db_set: &DatabaseSet,
+    functions: &FunctionRegistry,
+    visited_ctes: &mut Vec<(usize, usize)>,
+) -> Result<(EvalRow, Vec<ScopedColumn>)> {
+    let Some((found_db_id, rel)) = db_set.find_relation_in_set(qn)? else {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("no such table: {}", qn.display_name()),
+        ));
+    };
+    let slot_name = db_set.slot(found_db_id).map_or("main", |s| s.name.as_str());
+    match rel {
+        ResolvedRelation::Table(tbl) => {
+            let scope = make_static_table_scope(&tbl, slot_name, alias);
+            let mut excl_cols = Vec::with_capacity(tbl.columns.len());
+            for c in &tbl.columns {
+                excl_cols.push(ScopedColumn {
+                    schema_name: None,
+                    table_alias: Some("excluded".to_owned()),
+                    name: c.name.clone(),
+                    collation: c.collation,
+                    affinity: Some(c.affinity),
+                    hidden_rowid: false,
+                    omit_from_star: false,
+                    merged_using: false,
+                });
+            }
+            Ok((scope, excl_cols))
+        }
+        ResolvedRelation::View(v) => {
+            let eff_alias = alias.unwrap_or(&v.name);
+            let (v_names, v_affs, _) = resolve_view_columns_static(
+                found_db_id,
+                &v,
+                db_set,
+                &CteStore::default(),
+                functions,
+                visited_ctes,
+            )?;
+            let mut scols = Vec::with_capacity(v_names.len());
+            let mut excl_cols = Vec::with_capacity(v_names.len());
+            for (i, cn) in v_names.into_iter().enumerate() {
+                let (aff, coll) = v_affs.get(i).copied().unwrap_or((None, Collation::Binary));
+                scols.push(ScopedColumn {
+                    schema_name: Some(slot_name.to_owned()),
+                    table_alias: Some(eff_alias.to_owned()),
+                    name: cn.clone(),
+                    collation: coll,
+                    affinity: aff,
+                    hidden_rowid: false,
+                    omit_from_star: false,
+                    merged_using: false,
+                });
+                excl_cols.push(ScopedColumn {
+                    schema_name: None,
+                    table_alias: Some("excluded".to_owned()),
+                    name: cn,
+                    collation: coll,
+                    affinity: aff,
+                    hidden_rowid: false,
+                    omit_from_star: false,
+                    merged_using: false,
+                });
+            }
+            let n = scols.len();
+            Ok((EvalRow::new(scols.into(), vec![Value::Null; n]), excl_cols))
+        }
+    }
+}
+
+/// Validates a trigger definition from `sqlite_schema` / `sqlite_temp_schema` against `db_set`,
+/// matching `renameParseSql` + `renameResolveTrigger` (`sqlite/src/alter.c:1369-1476`).
+fn validate_single_trigger_definition(
+    trig_db_id: DatabaseId,
+    raw_sql: &str,
+    db_set: &DatabaseSet,
+    functions: &FunctionRegistry,
+) -> Result<()> {
+    let (Some(Stmt::CreateTrigger(ct)), _) = parse_one(raw_sql)? else {
+        return Err(SqliteError::new(ErrorCode::Error, "SQL logic error"));
+    };
+
+    let (target_db_id, target_rel) = if trig_db_id != DatabaseId::TEMP {
+        let slot_name = db_set.slot(trig_db_id).map_or("main", |s| s.name.as_str());
+        if let Some(ref explicit_s) = ct.on_table.schema
+            && !explicit_s.eq_ignore_ascii_case(slot_name)
+        {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!(
+                    "trigger {} cannot reference objects in database {explicit_s}",
+                    ct.name_token_text
+                ),
+            ));
+        }
+        let pinned_qn = QualifiedName::qualified(slot_name.to_owned(), ct.on_table.name.clone());
+        match db_set.find_relation_in_set(&pinned_qn)? {
+            Some(found) => found,
+            None => {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such table: {slot_name}.{}", ct.on_table.name),
+                ));
+            }
+        }
+    } else {
+        match db_set.find_relation_in_set(&ct.on_table)? {
+            Some(found) => found,
+            None => {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such table: {}", ct.on_table.display_name()),
+                ));
+            }
+        }
+    };
+
+    let resolved_rel_name = match &target_rel {
+        ResolvedRelation::Table(t) => t.name.as_str(),
+        ResolvedRelation::View(v) => v.name.as_str(),
+    };
+    if is_reserved_trigger_or_system_name(resolved_rel_name)
+        || is_reserved_trigger_or_system_name(&ct.on_table.name)
+    {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            "cannot create trigger on system table",
+        ));
+    }
+
+    let target_disp = if trig_db_id == DatabaseId::TEMP {
+        ct.on_table.display_name()
+    } else {
+        ct.on_table.name.clone()
+    };
+    match (&target_rel, ct.timing) {
+        (ResolvedRelation::View(_), TriggerTiming::Before) => {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("cannot create BEFORE trigger on view: {target_disp}"),
+            ));
+        }
+        (ResolvedRelation::View(_), TriggerTiming::After) => {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("cannot create AFTER trigger on view: {target_disp}"),
+            ));
+        }
+        (ResolvedRelation::Table(_), TriggerTiming::InsteadOf) => {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("cannot create INSTEAD OF trigger on table: {target_disp}"),
+            ));
+        }
+        _ => {}
+    }
+
+    validate_trigger_body_dml_targets(&ct.body)?;
+    let mut when_clause = ct.when_clause;
+    let mut body = ct.body;
+    replace_bind_params_with_null_in_trigger(&mut when_clause, &mut body);
+    if trig_db_id != DatabaseId::TEMP {
+        let slot_name = db_set.slot(trig_db_id).map_or("main", |s| s.name.as_str());
+        (when_clause, body) =
+            fix_permanent_trigger(&ct.name.name, slot_name, when_clause.as_ref(), &body)?;
+    }
+
+    let mut visited = Vec::new();
+    let (col_specs, has_hidden_rowid) = match &target_rel {
+        ResolvedRelation::Table(tbl) => (
+            tbl.columns
+                .iter()
+                .map(|c| (c.name.clone(), c.collation, Some(c.affinity)))
+                .collect::<Vec<_>>(),
+            !tbl.without_rowid,
+        ),
+        ResolvedRelation::View(v) => {
+            let (v_names, v_affs, _) = resolve_view_columns_static(
+                target_db_id,
+                v,
+                db_set,
+                &CteStore::default(),
+                functions,
+                &mut visited,
+            )?;
+            let specs = v_names
+                .into_iter()
+                .enumerate()
+                .map(|(i, cn)| {
+                    let (aff, coll) = v_affs.get(i).copied().unwrap_or((None, Collation::Binary));
+                    (cn, coll, aff)
+                })
+                .collect::<Vec<_>>();
+            (specs, false)
+        }
+    };
+    let pseudo_scope = make_static_trigger_pseudo_scope(&ct.event, &col_specs, has_hidden_rowid);
+    let outer_scopes = std::slice::from_ref(&pseudo_scope);
+
+    if let Some(ref w) = when_clause {
+        validate_expr_static(
+            w,
+            outer_scopes,
+            db_set,
+            &CteStore::default(),
+            functions,
+            false,
+            false,
+            &mut visited,
+        )?;
+    }
+
+    for step in &body {
+        match step {
+            TriggerStep::Select(sel) => {
+                let _ = validate_select_stmt_static(
+                    sel,
+                    outer_scopes,
+                    db_set,
+                    &CteStore::default(),
+                    functions,
+                    &mut visited,
+                )?;
+            }
+            TriggerStep::Insert(ins) => {
+                match &ins.source {
+                    InsertSource::Values(rows) => {
+                        for row in rows {
+                            for e in row {
+                                validate_expr_static(
+                                    e,
+                                    outer_scopes,
+                                    db_set,
+                                    &CteStore::default(),
+                                    functions,
+                                    false,
+                                    false,
+                                    &mut visited,
+                                )?;
+                            }
+                        }
+                    }
+                    InsertSource::Select(sel) => {
+                        let _ = validate_select_stmt_static(
+                            sel,
+                            outer_scopes,
+                            db_set,
+                            &CteStore::default(),
+                            functions,
+                            &mut visited,
+                        )?;
+                    }
+                    InsertSource::DefaultValues => {}
+                }
+                let (target_scope, excl_cols) = resolve_trigger_step_target_scope_static(
+                    &ins.table,
+                    ins.alias.as_deref(),
+                    db_set,
+                    functions,
+                    &mut visited,
+                )?;
+                if !ins.upsert_clauses.is_empty() {
+                    let excl_n = excl_cols.len();
+                    let excluded_scope = EvalRow {
+                        cols: excl_cols.into(),
+                        vals: vec![Value::Null; excl_n],
+                        qualified_only: true,
+                    };
+                    let target_scopes = [pseudo_scope.clone(), target_scope.clone()];
+                    let upsert_set_scopes = [pseudo_scope.clone(), target_scope, excluded_scope];
+                    for uc in &ins.upsert_clauses {
+                        if let Some(ref tgt) = uc.target {
+                            for ic in &tgt.columns {
+                                if let Some(ref ie) = ic.expr {
+                                    validate_expr_static(
+                                        ie,
+                                        &target_scopes,
+                                        db_set,
+                                        &CteStore::default(),
+                                        functions,
+                                        false,
+                                        false,
+                                        &mut visited,
+                                    )?;
+                                } else {
+                                    let cref = ColumnRef {
+                                        schema: None,
+                                        table: None,
+                                        column: ic.name.clone(),
+                                    };
+                                    validate_expr_static(
+                                        &Expr::Column(cref),
+                                        &target_scopes,
+                                        db_set,
+                                        &CteStore::default(),
+                                        functions,
+                                        false,
+                                        false,
+                                        &mut visited,
+                                    )?;
+                                }
+                            }
+                            if let Some(ref tw) = tgt.where_clause {
+                                validate_expr_static(
+                                    tw,
+                                    &target_scopes,
+                                    db_set,
+                                    &CteStore::default(),
+                                    functions,
+                                    false,
+                                    false,
+                                    &mut visited,
+                                )?;
+                            }
+                        }
+                        if let UpsertAction::DoUpdate {
+                            ref assignments,
+                            ref where_clause,
+                        } = uc.action
+                        {
+                            for asgn in assignments {
+                                let _ = validate_tuple_expr_static(
+                                    &asgn.expr,
+                                    &upsert_set_scopes,
+                                    db_set,
+                                    &CteStore::default(),
+                                    functions,
+                                    false,
+                                    false,
+                                    &mut visited,
+                                )?;
+                            }
+                            if let Some(uw) = where_clause {
+                                validate_expr_static(
+                                    uw,
+                                    &upsert_set_scopes,
+                                    db_set,
+                                    &CteStore::default(),
+                                    functions,
+                                    false,
+                                    false,
+                                    &mut visited,
+                                )?;
+                            }
+                        }
+                    }
+                }
+            }
+            TriggerStep::Update(upd) => {
+                let (target_scope, _) = resolve_trigger_step_target_scope_static(
+                    &upd.table,
+                    upd.alias.as_deref(),
+                    db_set,
+                    functions,
+                    &mut visited,
+                )?;
+                let step_scope = if let Some(ref fc) = upd.from {
+                    let from_cols = validate_from_clause_static(
+                        fc,
+                        None,
+                        outer_scopes,
+                        db_set,
+                        &CteStore::default(),
+                        functions,
+                        &mut visited,
+                    )?;
+                    let mut combined =
+                        Vec::with_capacity(target_scope.cols.len() + from_cols.len());
+                    combined.extend_from_slice(&target_scope.cols);
+                    combined.extend(from_cols);
+                    let n = combined.len();
+                    EvalRow::new(combined.into(), vec![Value::Null; n])
+                } else {
+                    target_scope
+                };
+                let step_scopes = [pseudo_scope.clone(), step_scope];
+                if let Some(ref w) = upd.selection {
+                    validate_expr_static(
+                        w,
+                        &step_scopes,
+                        db_set,
+                        &CteStore::default(),
+                        functions,
+                        false,
+                        false,
+                        &mut visited,
+                    )?;
+                }
+                for asgn in &upd.assignments {
+                    let _ = validate_tuple_expr_static(
+                        &asgn.expr,
+                        &step_scopes,
+                        db_set,
+                        &CteStore::default(),
+                        functions,
+                        false,
+                        false,
+                        &mut visited,
+                    )?;
+                }
+            }
+            TriggerStep::Delete(del) => {
+                let (target_scope, _) = resolve_trigger_step_target_scope_static(
+                    &del.table,
+                    del.alias.as_deref(),
+                    db_set,
+                    functions,
+                    &mut visited,
+                )?;
+                let step_scopes = [pseudo_scope.clone(), target_scope];
+                if let Some(ref w) = del.selection {
+                    validate_expr_static(
+                        w,
+                        &step_scopes,
+                        db_set,
+                        &CteStore::default(),
+                        functions,
+                        false,
+                        false,
+                        &mut visited,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_views_before_alter(
     db_set: &DatabaseSet,
     functions: &FunctionRegistry,
     target_db_id: DatabaseId,
     legacy_mode: bool,
     writable_schema: bool,
+    live_sql_map: &HashMap<i64, Option<String>>,
+    live_temp_sql_map: &HashMap<i64, Option<String>>,
 ) -> Result<()> {
     if writable_schema {
         return Ok(());
+    }
+    enum AlterCheckObj {
+        View(Box<ViewSchema>),
+        Trigger(String, String),
     }
     let mut dbs = vec![target_db_id];
     if target_db_id != DatabaseId::TEMP && db_set.is_temp_open() {
@@ -14915,19 +15730,55 @@ fn validate_views_before_alter(
         if slot.btree.is_none() {
             continue;
         }
-        let views = slot.schema.views.clone();
-        for v in &views {
-            if let Err(e) = validate_single_view_definition(check_db, v, db_set, functions) {
-                if legacy_mode {
-                    // `renameFixQuotes` (`renameQuotefixFunc`, `alter.c:2000-2009, 2041`)
-                    // resolves views even under `PRAGMA legacy_alter_table = ON` and sets
-                    // `sqlite3_result_error_code(context, SQLITE_ERROR)`.
-                    return Err(SqliteError::new(ErrorCode::Error, "SQL logic error"));
+        let sql_map = if check_db == target_db_id {
+            live_sql_map
+        } else {
+            live_temp_sql_map
+        };
+        let mut objs: Vec<(i64, AlterCheckObj)> =
+            Vec::with_capacity(slot.schema.views.len() + slot.schema.triggers.len());
+        for v in &slot.schema.views {
+            objs.push((v.schema_rowid, AlterCheckObj::View(Box::new(v.clone()))));
+        }
+        for tr in &slot.schema.triggers {
+            let sql = sql_map
+                .get(&tr.schema_rowid)
+                .and_then(|o| o.clone())
+                .unwrap_or_else(|| tr.raw_sql.clone());
+            objs.push((
+                tr.schema_rowid,
+                AlterCheckObj::Trigger(tr.name.clone(), sql),
+            ));
+        }
+        objs.sort_by_key(|(rowid, _)| *rowid);
+
+        for (_, obj) in objs {
+            match obj {
+                AlterCheckObj::View(v) => {
+                    if let Err(e) = validate_single_view_definition(check_db, &v, db_set, functions)
+                    {
+                        if legacy_mode {
+                            return Err(SqliteError::new(ErrorCode::Error, "SQL logic error"));
+                        }
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("error in view {}: {}", v.name, e.message),
+                        ));
+                    }
                 }
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    format!("error in view {}: {}", v.name, e.message),
-                ));
+                AlterCheckObj::Trigger(tr_name, tr_sql) => {
+                    if let Err(e) =
+                        validate_single_trigger_definition(check_db, &tr_sql, db_set, functions)
+                    {
+                        if legacy_mode {
+                            return Err(SqliteError::new(ErrorCode::Error, "SQL logic error"));
+                        }
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("error in trigger {tr_name}: {}", e.message),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -14940,6 +15791,10 @@ fn validate_views_after_alter(
     target_db_id: DatabaseId,
     op_label: &str,
 ) -> Result<()> {
+    enum AlterCheckObj {
+        View(Box<ViewSchema>),
+        Trigger(String, String),
+    }
     let mut dbs = vec![target_db_id];
     if target_db_id != DatabaseId::TEMP && db_set.is_temp_open() {
         dbs.push(DatabaseId::TEMP);
@@ -14951,13 +15806,40 @@ fn validate_views_after_alter(
         if slot.btree.is_none() {
             continue;
         }
-        let views = slot.schema.views.clone();
-        for v in &views {
-            if let Err(e) = validate_single_view_definition(check_db, v, db_set, functions) {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    format!("error in view {} after {op_label}: {}", v.name, e.message),
-                ));
+        let mut objs: Vec<(i64, AlterCheckObj)> =
+            Vec::with_capacity(slot.schema.views.len() + slot.schema.triggers.len());
+        for v in &slot.schema.views {
+            objs.push((v.schema_rowid, AlterCheckObj::View(Box::new(v.clone()))));
+        }
+        for tr in &slot.schema.triggers {
+            objs.push((
+                tr.schema_rowid,
+                AlterCheckObj::Trigger(tr.name.clone(), tr.raw_sql.clone()),
+            ));
+        }
+        objs.sort_by_key(|(rowid, _)| *rowid);
+
+        for (_, obj) in objs {
+            match obj {
+                AlterCheckObj::View(v) => {
+                    if let Err(e) = validate_single_view_definition(check_db, &v, db_set, functions)
+                    {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("error in view {} after {op_label}: {}", v.name, e.message),
+                        ));
+                    }
+                }
+                AlterCheckObj::Trigger(tr_name, tr_sql) => {
+                    if let Err(e) =
+                        validate_single_trigger_definition(check_db, &tr_sql, db_set, functions)
+                    {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("error in trigger {tr_name} after {op_label}: {}", e.message),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -15313,15 +16195,19 @@ fn exec_alter_table(
                     db_id,
                     false,
                     writable_schema,
+                    &live_sql_map,
+                    &live_temp_sql_map,
                 )?;
             }
 
             let rewrite_fks = !legacy_mode || fk_enabled;
             let rewrite_self_exprs = !legacy_mode;
 
-            // Compute view SQL edits BEFORE mutating `db_id`'s schema so unqualified resolution in `temp` views sees pre-rename bindings!
+            // Compute view and trigger SQL edits BEFORE mutating `db_id`'s schema so unqualified resolution in `temp` sees pre-rename bindings!
             let mut same_db_view_edits: Vec<(i64, String, String)> = Vec::new();
             let mut temp_view_edits: Vec<(i64, String, String)> = Vec::new();
+            let mut same_db_trigger_edits: Vec<(i64, String, String, String)> = Vec::new();
+            let mut temp_trigger_edits: Vec<(i64, String, String, String)> = Vec::new();
             if !legacy_mode {
                 if let Some(slot) = ctx.db_set.slot(db_id) {
                     for v in &slot.schema.views {
@@ -15365,6 +16251,88 @@ fn exec_alter_table(
                             Err(_) if writable_schema => {}
                             Err(e) => return Err(e),
                         }
+                    }
+                }
+            }
+
+            // Triggers: `ON <old_tbl>` and `tbl_name` are updated EVEN when `legacy_alter_table = ON`,
+            // while trigger body references (`WHEN`, `SELECT`, DML targets, `FROM`) are rewritten ONLY when `!legacy_mode` (`alter.c:1880-1903`)!
+            if let Some(slot) = ctx.db_set.slot(db_id) {
+                for tr in &slot.schema.triggers {
+                    let tr_sql = live_sql_map
+                        .get(&tr.schema_rowid)
+                        .and_then(|o| o.as_deref())
+                        .unwrap_or(&tr.raw_sql);
+                    match rewrite_trigger_for_table_rename(
+                        tr_sql,
+                        db_id,
+                        db_id,
+                        &tbl.name,
+                        new_name,
+                        legacy_mode,
+                        ctx.db_set,
+                    ) {
+                        Ok((updated_opt, is_on_target)) => {
+                            let new_tbl_col =
+                                if is_on_target || tr.tbl_name.eq_ignore_ascii_case(&tbl.name) {
+                                    new_name.clone()
+                                } else {
+                                    tr.tbl_name.clone()
+                                };
+                            if updated_opt.is_some()
+                                || !new_tbl_col.eq_ignore_ascii_case(&tr.tbl_name)
+                                || new_tbl_col != tr.tbl_name
+                            {
+                                let final_sql = updated_opt.unwrap_or_else(|| tr_sql.to_owned());
+                                same_db_trigger_edits.push((
+                                    tr.schema_rowid,
+                                    tr.name.clone(),
+                                    new_tbl_col,
+                                    final_sql,
+                                ));
+                            }
+                        }
+                        Err(_) if writable_schema => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            if db_id != DatabaseId::TEMP
+                && ctx.db_set.is_temp_open()
+                && let Some(tslot) = ctx.db_set.slot(DatabaseId::TEMP)
+            {
+                for tr in &tslot.schema.triggers {
+                    let tr_sql = live_temp_sql_map
+                        .get(&tr.schema_rowid)
+                        .and_then(|o| o.as_deref())
+                        .unwrap_or(&tr.raw_sql);
+                    match rewrite_trigger_for_table_rename(
+                        tr_sql,
+                        DatabaseId::TEMP,
+                        db_id,
+                        &tbl.name,
+                        new_name,
+                        legacy_mode,
+                        ctx.db_set,
+                    ) {
+                        Ok((updated_opt, is_on_target)) => {
+                            let new_tbl_col = if is_on_target {
+                                new_name.clone()
+                            } else {
+                                tr.tbl_name.clone()
+                            };
+                            if updated_opt.is_some() || new_tbl_col != tr.tbl_name {
+                                let final_sql = updated_opt.unwrap_or_else(|| tr_sql.to_owned());
+                                temp_trigger_edits.push((
+                                    tr.schema_rowid,
+                                    tr.name.clone(),
+                                    new_tbl_col,
+                                    final_sql,
+                                ));
+                            }
+                        }
+                        Err(_) if writable_schema => {}
+                        Err(e) => return Err(e),
                     }
                 }
             }
@@ -15485,6 +16453,17 @@ fn exec_alter_table(
                 for (v_rowid, v_name, v_sql) in &same_db_view_edits {
                     update_schema_entry(bt, *v_rowid, "view", v_name, v_name, 0, Some(v_sql))?;
                 }
+                for (tr_rowid, tr_name, tr_tbl, tr_sql) in &same_db_trigger_edits {
+                    update_schema_entry(
+                        bt,
+                        *tr_rowid,
+                        "trigger",
+                        tr_name,
+                        tr_tbl,
+                        0,
+                        Some(tr_sql),
+                    )?;
+                }
                 if let Some(seq_tbl) = seq_tbl_opt {
                     let enc = bt.encoding();
                     let rows = scan_table_incremental(bt, seq_tbl.root_pgno)?;
@@ -15502,7 +16481,7 @@ fn exec_alter_table(
                 slot.reload_schema()?;
             }
 
-            if !temp_view_edits.is_empty() {
+            if !temp_view_edits.is_empty() || !temp_trigger_edits.is_empty() {
                 ctx.ensure_write_db(DatabaseId::TEMP, true)?;
                 let tslot = ctx
                     .db_set
@@ -15516,9 +16495,21 @@ fn exec_alter_table(
                     for (v_rowid, v_name, v_sql) in &temp_view_edits {
                         update_schema_entry(tbt, *v_rowid, "view", v_name, v_name, 0, Some(v_sql))?;
                     }
+                    for (tr_rowid, tr_name, tr_tbl, tr_sql) in &temp_trigger_edits {
+                        update_schema_entry(
+                            tbt,
+                            *tr_rowid,
+                            "trigger",
+                            tr_name,
+                            tr_tbl,
+                            0,
+                            Some(tr_sql),
+                        )?;
+                    }
                 }
                 tslot.reload_schema()?;
             }
+            ctx.db_set.reconcile_temp_triggers()?;
 
             *ctx.schema_generation += 1;
             *ctx.v1_expire_generation += 1;
@@ -15569,11 +16560,15 @@ fn exec_alter_table(
                 db_id,
                 legacy_mode,
                 writable_schema,
+                &live_sql_map,
+                &live_temp_sql_map,
             )?;
 
-            // `RENAME COLUMN` ALWAYS structurally rewrites dependent views in `db_id` and `temp` (`alter.c`)!
+            // `RENAME COLUMN` ALWAYS structurally rewrites dependent views and triggers in `db_id` and `temp` (`alter.c`)!
             let mut same_db_view_edits: Vec<(i64, String, String)> = Vec::new();
             let mut temp_view_edits: Vec<(i64, String, String)> = Vec::new();
+            let mut same_db_trigger_edits: Vec<(i64, String, String, String)> = Vec::new();
+            let mut temp_trigger_edits: Vec<(i64, String, String, String)> = Vec::new();
             if let Some(slot) = ctx.db_set.slot(db_id) {
                 for v in &slot.schema.views {
                     let v_sql = live_sql_map
@@ -15585,6 +16580,27 @@ fn exec_alter_table(
                     ) {
                         Ok(Some(updated)) => {
                             same_db_view_edits.push((v.schema_rowid, v.name.clone(), updated));
+                        }
+                        Ok(None) => {}
+                        Err(_) if writable_schema => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                for tr in &slot.schema.triggers {
+                    let tr_sql = live_sql_map
+                        .get(&tr.schema_rowid)
+                        .and_then(|o| o.as_deref())
+                        .unwrap_or(&tr.raw_sql);
+                    match rewrite_trigger_for_column_rename(
+                        tr_sql, db_id, db_id, &tbl, old_name, new_name, ctx.db_set,
+                    ) {
+                        Ok(Some(updated)) => {
+                            same_db_trigger_edits.push((
+                                tr.schema_rowid,
+                                tr.name.clone(),
+                                tr.tbl_name.clone(),
+                                updated,
+                            ));
                         }
                         Ok(None) => {}
                         Err(_) if writable_schema => {}
@@ -15612,6 +16628,33 @@ fn exec_alter_table(
                     ) {
                         Ok(Some(updated)) => {
                             temp_view_edits.push((v.schema_rowid, v.name.clone(), updated));
+                        }
+                        Ok(None) => {}
+                        Err(_) if writable_schema => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                for tr in &tslot.schema.triggers {
+                    let tr_sql = live_temp_sql_map
+                        .get(&tr.schema_rowid)
+                        .and_then(|o| o.as_deref())
+                        .unwrap_or(&tr.raw_sql);
+                    match rewrite_trigger_for_column_rename(
+                        tr_sql,
+                        DatabaseId::TEMP,
+                        db_id,
+                        &tbl,
+                        old_name,
+                        new_name,
+                        ctx.db_set,
+                    ) {
+                        Ok(Some(updated)) => {
+                            temp_trigger_edits.push((
+                                tr.schema_rowid,
+                                tr.name.clone(),
+                                tr.tbl_name.clone(),
+                                updated,
+                            ));
                         }
                         Ok(None) => {}
                         Err(_) if writable_schema => {}
@@ -15718,10 +16761,21 @@ fn exec_alter_table(
                 for (v_rowid, v_name, v_sql) in &same_db_view_edits {
                     update_schema_entry(bt, *v_rowid, "view", v_name, v_name, 0, Some(v_sql))?;
                 }
+                for (tr_rowid, tr_name, tr_tbl, tr_sql) in &same_db_trigger_edits {
+                    update_schema_entry(
+                        bt,
+                        *tr_rowid,
+                        "trigger",
+                        tr_name,
+                        tr_tbl,
+                        0,
+                        Some(tr_sql),
+                    )?;
+                }
                 slot.reload_schema()?;
             }
 
-            if !temp_view_edits.is_empty() {
+            if !temp_view_edits.is_empty() || !temp_trigger_edits.is_empty() {
                 ctx.ensure_write_db(DatabaseId::TEMP, true)?;
                 let tslot = ctx
                     .db_set
@@ -15735,9 +16789,21 @@ fn exec_alter_table(
                     for (v_rowid, v_name, v_sql) in &temp_view_edits {
                         update_schema_entry(tbt, *v_rowid, "view", v_name, v_name, 0, Some(v_sql))?;
                     }
+                    for (tr_rowid, tr_name, tr_tbl, tr_sql) in &temp_trigger_edits {
+                        update_schema_entry(
+                            tbt,
+                            *tr_rowid,
+                            "trigger",
+                            tr_name,
+                            tr_tbl,
+                            0,
+                            Some(tr_sql),
+                        )?;
+                    }
                 }
                 tslot.reload_schema()?;
             }
+            ctx.db_set.reconcile_temp_triggers()?;
 
             *ctx.schema_generation += 1;
             *ctx.v1_expire_generation += 1;
@@ -15797,6 +16863,8 @@ fn exec_alter_table(
                 db_id,
                 legacy_mode,
                 writable_schema,
+                &live_sql_map,
+                &live_temp_sql_map,
             )?;
 
             let new_sql = remove_column_def_from_create_table_sql(live_tbl_sql, col_idx)?;
@@ -15869,6 +16937,7 @@ fn exec_alter_table(
                 }
                 slot.reload_schema()?;
             }
+            ctx.db_set.reconcile_temp_triggers()?;
             *ctx.schema_generation += 1;
             *ctx.v1_expire_generation += 1;
             *ctx.schema_changed_in_tx = true;
@@ -16007,11 +17076,15 @@ fn exec_alter_table(
         }
     }
 
-    let slot = ctx
-        .db_set
-        .slot_mut(db_id)
-        .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-    slot.reload_schema()?;
+    if db_id == DatabaseId::TEMP {
+        ctx.db_set.reload_temp_schema_preserving_bindings()?;
+    } else {
+        let slot = ctx
+            .db_set
+            .slot_mut(db_id)
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        slot.reload_schema()?;
+    }
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;
     *ctx.schema_changed_in_tx = true;
@@ -17279,7 +18352,389 @@ fn collect_table_rename_edits_in_expr(
                 edits,
             );
         }
+        Expr::Raise {
+            message: Some(m), ..
+        } => {
+            collect_table_rename_edits_in_expr(
+                m,
+                view_db_id,
+                target_db_id,
+                old_tbl,
+                new_tbl,
+                cte_names,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+        }
         _ => {}
+    }
+}
+
+/// Structurally rewrites a trigger definition (`sqlite_schema` / `sqlite_temp_schema`) for
+/// `ALTER TABLE old_tbl RENAME TO new_tbl`, matching `renameTableFunc` (`sqlite/src/alter.c:1878-1903`).
+///
+/// Returns `(updated_sql_if_changed, trigger_on_clause_targeted_renamed_table)`.
+fn rewrite_trigger_for_table_rename(
+    trig_sql: &str,
+    trig_db_id: DatabaseId,
+    target_db_id: DatabaseId,
+    old_tbl: &str,
+    new_tbl: &str,
+    legacy_mode: bool,
+    db_set: &DatabaseSet,
+) -> Result<(Option<String>, bool)> {
+    let (Some(Stmt::CreateTrigger(ct)), spans, _) = parse_one_with_spans(trig_sql)? else {
+        return Ok((None, false));
+    };
+    let mut edits: Vec<(TokenSpan, String)> = Vec::new();
+    let (is_on_target, _) = view_qn_resolves_to_target_table(
+        &ct.on_table,
+        trig_db_id,
+        target_db_id,
+        old_tbl,
+        &[],
+        db_set,
+    );
+    if is_on_target && let Some(sp) = spans.span_of(&ct.on_table.name) {
+        edits.push((sp, new_tbl.to_owned()));
+    }
+
+    if !legacy_mode {
+        let mut pseudo_bindings = Vec::new();
+        let mk_pseudo = |alias: &str| FromTableBinding {
+            schema_name: None,
+            effective_alias: alias.to_owned(),
+            has_explicit_alias: true,
+            is_target_table: false,
+        };
+        match ct.event {
+            TriggerEvent::Insert => pseudo_bindings.push(mk_pseudo("new")),
+            TriggerEvent::Delete => pseudo_bindings.push(mk_pseudo("old")),
+            TriggerEvent::Update { .. } => {
+                pseudo_bindings.push(mk_pseudo("old"));
+                pseudo_bindings.push(mk_pseudo("new"));
+            }
+        }
+        let outer_bindings = vec![pseudo_bindings];
+        let mut cte_names: Vec<String> = Vec::new();
+
+        if let Some(ref w) = ct.when_clause {
+            collect_table_rename_edits_in_expr(
+                w,
+                trig_db_id,
+                target_db_id,
+                old_tbl,
+                new_tbl,
+                &mut cte_names,
+                &outer_bindings,
+                db_set,
+                &spans,
+                &mut edits,
+            );
+        }
+
+        for step in &ct.body {
+            match step {
+                TriggerStep::Select(sel) => {
+                    collect_table_rename_edits_in_select(
+                        sel,
+                        trig_db_id,
+                        target_db_id,
+                        old_tbl,
+                        new_tbl,
+                        &mut cte_names,
+                        &outer_bindings,
+                        db_set,
+                        &spans,
+                        &mut edits,
+                    );
+                }
+                TriggerStep::Insert(ins) => {
+                    match &ins.source {
+                        InsertSource::Values(rows) => {
+                            for row in rows {
+                                for e in row {
+                                    collect_table_rename_edits_in_expr(
+                                        e,
+                                        trig_db_id,
+                                        target_db_id,
+                                        old_tbl,
+                                        new_tbl,
+                                        &mut cte_names,
+                                        &outer_bindings,
+                                        db_set,
+                                        &spans,
+                                        &mut edits,
+                                    );
+                                }
+                            }
+                        }
+                        InsertSource::Select(sel) => {
+                            collect_table_rename_edits_in_select(
+                                sel,
+                                trig_db_id,
+                                target_db_id,
+                                old_tbl,
+                                new_tbl,
+                                &mut cte_names,
+                                &outer_bindings,
+                                db_set,
+                                &spans,
+                                &mut edits,
+                            );
+                        }
+                        InsertSource::DefaultValues => {}
+                    }
+
+                    let (is_step_tgt, schema_lbl) = view_qn_resolves_to_target_table(
+                        &ins.table,
+                        trig_db_id,
+                        target_db_id,
+                        old_tbl,
+                        &[],
+                        db_set,
+                    );
+                    if is_step_tgt && let Some(sp) = spans.span_of(&ins.table.name) {
+                        edits.push((sp, new_tbl.to_owned()));
+                    }
+                    if !ins.upsert_clauses.is_empty() {
+                        let tgt_binding = FromTableBinding {
+                            schema_name: schema_lbl,
+                            effective_alias: ins
+                                .alias
+                                .clone()
+                                .unwrap_or_else(|| ins.table.name.clone()),
+                            has_explicit_alias: ins.alias.is_some(),
+                            is_target_table: is_step_tgt,
+                        };
+                        let excl_binding = FromTableBinding {
+                            schema_name: None,
+                            effective_alias: "excluded".to_owned(),
+                            has_explicit_alias: true,
+                            is_target_table: false,
+                        };
+                        let mut target_scopes = outer_bindings.clone();
+                        target_scopes.push(vec![tgt_binding.clone()]);
+                        let mut upsert_set_scopes = outer_bindings.clone();
+                        upsert_set_scopes.push(vec![tgt_binding, excl_binding]);
+
+                        for uc in &ins.upsert_clauses {
+                            if let Some(ref tgt) = uc.target {
+                                for ic in &tgt.columns {
+                                    if let Some(ref ie) = ic.expr {
+                                        collect_table_rename_edits_in_expr(
+                                            ie,
+                                            trig_db_id,
+                                            target_db_id,
+                                            old_tbl,
+                                            new_tbl,
+                                            &mut cte_names,
+                                            &target_scopes,
+                                            db_set,
+                                            &spans,
+                                            &mut edits,
+                                        );
+                                    }
+                                }
+                                if let Some(ref tw) = tgt.where_clause {
+                                    collect_table_rename_edits_in_expr(
+                                        tw,
+                                        trig_db_id,
+                                        target_db_id,
+                                        old_tbl,
+                                        new_tbl,
+                                        &mut cte_names,
+                                        &target_scopes,
+                                        db_set,
+                                        &spans,
+                                        &mut edits,
+                                    );
+                                }
+                            }
+                            if let UpsertAction::DoUpdate {
+                                ref assignments,
+                                ref where_clause,
+                            } = uc.action
+                            {
+                                for asgn in assignments {
+                                    collect_table_rename_edits_in_expr(
+                                        &asgn.expr,
+                                        trig_db_id,
+                                        target_db_id,
+                                        old_tbl,
+                                        new_tbl,
+                                        &mut cte_names,
+                                        &upsert_set_scopes,
+                                        db_set,
+                                        &spans,
+                                        &mut edits,
+                                    );
+                                }
+                                if let Some(uw) = where_clause {
+                                    collect_table_rename_edits_in_expr(
+                                        uw,
+                                        trig_db_id,
+                                        target_db_id,
+                                        old_tbl,
+                                        new_tbl,
+                                        &mut cte_names,
+                                        &upsert_set_scopes,
+                                        db_set,
+                                        &spans,
+                                        &mut edits,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                TriggerStep::Update(upd) => {
+                    let (is_step_tgt, schema_lbl) = view_qn_resolves_to_target_table(
+                        &upd.table,
+                        trig_db_id,
+                        target_db_id,
+                        old_tbl,
+                        &[],
+                        db_set,
+                    );
+                    if is_step_tgt && let Some(sp) = spans.span_of(&upd.table.name) {
+                        edits.push((sp, new_tbl.to_owned()));
+                    }
+                    let mut step_bindings = vec![FromTableBinding {
+                        schema_name: schema_lbl,
+                        effective_alias: upd
+                            .alias
+                            .clone()
+                            .unwrap_or_else(|| upd.table.name.clone()),
+                        has_explicit_alias: upd.alias.is_some(),
+                        is_target_table: is_step_tgt,
+                    }];
+                    if let Some(ref fc) = upd.from {
+                        let mut from_bindings = vec![collect_table_rename_edits_in_tos(
+                            &fc.head,
+                            trig_db_id,
+                            target_db_id,
+                            old_tbl,
+                            new_tbl,
+                            &mut cte_names,
+                            &outer_bindings,
+                            db_set,
+                            &spans,
+                            &mut edits,
+                        )];
+                        for j in &fc.joins {
+                            from_bindings.push(collect_table_rename_edits_in_tos(
+                                &j.right,
+                                trig_db_id,
+                                target_db_id,
+                                old_tbl,
+                                new_tbl,
+                                &mut cte_names,
+                                &outer_bindings,
+                                db_set,
+                                &spans,
+                                &mut edits,
+                            ));
+                            if let Some(JoinConstraint::On(ref on_e)) = j.constraint {
+                                let mut join_scopes = outer_bindings.clone();
+                                join_scopes.push(from_bindings.clone());
+                                collect_table_rename_edits_in_expr(
+                                    on_e,
+                                    trig_db_id,
+                                    target_db_id,
+                                    old_tbl,
+                                    new_tbl,
+                                    &mut cte_names,
+                                    &join_scopes,
+                                    db_set,
+                                    &spans,
+                                    &mut edits,
+                                );
+                            }
+                        }
+                        step_bindings.extend(from_bindings);
+                    }
+                    let mut step_scopes = outer_bindings.clone();
+                    step_scopes.push(step_bindings);
+                    for asgn in &upd.assignments {
+                        collect_table_rename_edits_in_expr(
+                            &asgn.expr,
+                            trig_db_id,
+                            target_db_id,
+                            old_tbl,
+                            new_tbl,
+                            &mut cte_names,
+                            &step_scopes,
+                            db_set,
+                            &spans,
+                            &mut edits,
+                        );
+                    }
+                    if let Some(ref w) = upd.selection {
+                        collect_table_rename_edits_in_expr(
+                            w,
+                            trig_db_id,
+                            target_db_id,
+                            old_tbl,
+                            new_tbl,
+                            &mut cte_names,
+                            &step_scopes,
+                            db_set,
+                            &spans,
+                            &mut edits,
+                        );
+                    }
+                }
+                TriggerStep::Delete(del) => {
+                    let (is_step_tgt, schema_lbl) = view_qn_resolves_to_target_table(
+                        &del.table,
+                        trig_db_id,
+                        target_db_id,
+                        old_tbl,
+                        &[],
+                        db_set,
+                    );
+                    if is_step_tgt && let Some(sp) = spans.span_of(&del.table.name) {
+                        edits.push((sp, new_tbl.to_owned()));
+                    }
+                    let mut step_scopes = outer_bindings.clone();
+                    step_scopes.push(vec![FromTableBinding {
+                        schema_name: schema_lbl,
+                        effective_alias: del
+                            .alias
+                            .clone()
+                            .unwrap_or_else(|| del.table.name.clone()),
+                        has_explicit_alias: del.alias.is_some(),
+                        is_target_table: is_step_tgt,
+                    }]);
+                    if let Some(ref w) = del.selection {
+                        collect_table_rename_edits_in_expr(
+                            w,
+                            trig_db_id,
+                            target_db_id,
+                            old_tbl,
+                            new_tbl,
+                            &mut cte_names,
+                            &step_scopes,
+                            db_set,
+                            &spans,
+                            &mut edits,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if edits.is_empty() {
+        Ok((None, is_on_target))
+    } else {
+        for (sp, rep) in &mut edits {
+            *rep = format_renamed_table_ident(trig_sql, sp.offset + sp.len, new_tbl);
+        }
+        Ok((Some(apply_span_edits(trig_sql, edits)), is_on_target))
     }
 }
 
@@ -17290,10 +18745,14 @@ struct RenameColBinding {
     name: String,
     is_target_col: bool,
     merged_using: bool,
+    qualified_only: bool,
 }
 
 impl RenameColBinding {
     fn matches_qualifier(&self, schema_qual: Option<&str>, table_qual: Option<&str>) -> bool {
+        if self.qualified_only && (schema_qual.is_some() || table_qual.is_none()) {
+            return false;
+        }
         if let Some(sq) = schema_qual {
             let Some(ref sn) = self.schema_name else {
                 return false;
@@ -17784,6 +19243,7 @@ fn collect_col_rename_edits_in_tos(
                         name: cn,
                         is_target_col: false,
                         merged_using: false,
+                        qualified_only: false,
                     })
                     .collect();
             }
@@ -17832,6 +19292,7 @@ fn collect_col_rename_edits_in_tos(
                             name: c.name.clone(),
                             is_target_col: is_target_tbl && c.name.eq_ignore_ascii_case(old_col),
                             merged_using: false,
+                            qualified_only: false,
                         })
                         .collect()
                 }
@@ -17845,6 +19306,7 @@ fn collect_col_rename_edits_in_tos(
                             name: sc.name,
                             is_target_col: false,
                             merged_using: false,
+                            qualified_only: false,
                         })
                         .collect()
                 }
@@ -17873,6 +19335,7 @@ fn collect_col_rename_edits_in_tos(
                     name: cn,
                     is_target_col: false,
                     merged_using: false,
+                    qualified_only: false,
                 })
                 .collect()
         }
@@ -18220,7 +19683,482 @@ fn collect_col_rename_edits_in_expr(
                 edits,
             );
         }
+        Expr::Raise {
+            message: Some(m), ..
+        } => {
+            collect_col_rename_edits_in_expr(
+                m,
+                view_db_id,
+                target_db_id,
+                target_tbl,
+                old_col,
+                new_col,
+                ctes,
+                scopes,
+                db_set,
+                spans,
+                edits,
+            );
+        }
         _ => {}
+    }
+}
+
+/// Structurally rewrites a trigger definition (`sqlite_schema` / `sqlite_temp_schema`) for
+/// `ALTER TABLE tbl RENAME COLUMN old_col TO new_col`, matching `renameColumnFunc` (`sqlite/src/alter.c:1600-1735`).
+fn rewrite_trigger_for_column_rename(
+    trig_sql: &str,
+    trig_db_id: DatabaseId,
+    target_db_id: DatabaseId,
+    target_tbl: &TableSchema,
+    old_col: &str,
+    new_col: &str,
+    db_set: &DatabaseSet,
+) -> Result<Option<String>> {
+    let (Some(Stmt::CreateTrigger(ct)), spans, _) = parse_one_with_spans(trig_sql)? else {
+        return Ok(None);
+    };
+    let mut edits: Vec<(TokenSpan, String)> = Vec::new();
+    let ctes = CteStore::default();
+
+    let resolved_on: Option<(DatabaseId, ResolvedRelation)> = if trig_db_id != DatabaseId::TEMP {
+        let slot = db_set.slot(trig_db_id);
+        let schema_ok = slot.is_some_and(|sl| {
+            ct.on_table
+                .schema
+                .as_deref()
+                .is_none_or(|s| s.eq_ignore_ascii_case(&sl.name))
+        });
+        if !schema_ok {
+            None
+        } else if let Some(sl) = slot {
+            sl.schema
+                .find_user_table(&ct.on_table.name)
+                .cloned()
+                .map(|t| (trig_db_id, ResolvedRelation::Table(Box::new(t))))
+                .or_else(|| {
+                    sl.schema
+                        .find_view(&ct.on_table.name)
+                        .cloned()
+                        .map(|v| (trig_db_id, ResolvedRelation::View(Box::new(v))))
+                })
+        } else {
+            None
+        }
+    } else {
+        db_set.find_relation_in_set(&ct.on_table).ok().flatten()
+    };
+
+    let (on_is_target_tbl, on_col_names): (bool, Vec<String>) = match resolved_on {
+        Some((found_db_id, ResolvedRelation::Table(tbl))) => {
+            let is_tgt =
+                found_db_id == target_db_id && tbl.name.eq_ignore_ascii_case(&target_tbl.name);
+            let cols = tbl.columns.iter().map(|c| c.name.clone()).collect();
+            (is_tgt, cols)
+        }
+        Some((found_db_id, ResolvedRelation::View(v))) => {
+            let cols = static_view_scoped_cols(found_db_id, &v, &v.name, db_set, &ctes, &[])
+                .unwrap_or_default()
+                .into_iter()
+                .map(|sc| sc.name)
+                .collect();
+            (false, cols)
+        }
+        None => (false, Vec::new()),
+    };
+
+    if on_is_target_tbl
+        && let TriggerEvent::Update {
+            columns: Some(ref ucols),
+        } = ct.event
+    {
+        for uc in ucols {
+            if uc.eq_ignore_ascii_case(old_col)
+                && let Some(sp) = spans.span_of(uc)
+            {
+                edits.push((sp, new_col.to_owned()));
+            }
+        }
+    }
+
+    let mut pseudo_cols: Vec<RenameColBinding> = Vec::new();
+    let push_pseudo = |out: &mut Vec<RenameColBinding>, alias: &str| {
+        for cn in &on_col_names {
+            out.push(RenameColBinding {
+                schema_name: None,
+                table_alias: Some(alias.to_owned()),
+                name: cn.clone(),
+                is_target_col: on_is_target_tbl && cn.eq_ignore_ascii_case(old_col),
+                merged_using: false,
+                qualified_only: true,
+            });
+        }
+    };
+    match ct.event {
+        TriggerEvent::Insert => push_pseudo(&mut pseudo_cols, "new"),
+        TriggerEvent::Delete => push_pseudo(&mut pseudo_cols, "old"),
+        TriggerEvent::Update { .. } => {
+            push_pseudo(&mut pseudo_cols, "old");
+            push_pseudo(&mut pseudo_cols, "new");
+        }
+    }
+    let outer_scopes = vec![pseudo_cols];
+
+    if let Some(ref w) = ct.when_clause {
+        collect_col_rename_edits_in_expr(
+            w,
+            trig_db_id,
+            target_db_id,
+            target_tbl,
+            old_col,
+            new_col,
+            &ctes,
+            &outer_scopes,
+            db_set,
+            &spans,
+            &mut edits,
+        );
+    }
+
+    let resolve_step_dml_target =
+        |qn: &QualifiedName, alias: &Option<String>, edits_out: &mut Vec<(TokenSpan, String)>| {
+            let (is_tgt, _) = view_qn_resolves_to_target_table(
+                qn,
+                trig_db_id,
+                target_db_id,
+                &target_tbl.name,
+                &[],
+                db_set,
+            );
+            let synthetic_tos = TableOrSubquery::Table {
+                name: qn.clone(),
+                table_args: None,
+                alias: alias.clone(),
+                indexed_by: None,
+            };
+            let cols = collect_col_rename_edits_in_tos(
+                &synthetic_tos,
+                trig_db_id,
+                target_db_id,
+                target_tbl,
+                old_col,
+                new_col,
+                &ctes,
+                &outer_scopes,
+                db_set,
+                &spans,
+                edits_out,
+            );
+            (is_tgt, cols)
+        };
+
+    for step in &ct.body {
+        match step {
+            TriggerStep::Select(sel) => {
+                let _ = collect_col_rename_edits_in_select(
+                    sel,
+                    trig_db_id,
+                    target_db_id,
+                    target_tbl,
+                    old_col,
+                    new_col,
+                    &ctes,
+                    &outer_scopes,
+                    db_set,
+                    &spans,
+                    &mut edits,
+                );
+            }
+            TriggerStep::Insert(ins) => {
+                match &ins.source {
+                    InsertSource::Values(rows) => {
+                        for row in rows {
+                            for e in row {
+                                collect_col_rename_edits_in_expr(
+                                    e,
+                                    trig_db_id,
+                                    target_db_id,
+                                    target_tbl,
+                                    old_col,
+                                    new_col,
+                                    &ctes,
+                                    &outer_scopes,
+                                    db_set,
+                                    &spans,
+                                    &mut edits,
+                                );
+                            }
+                        }
+                    }
+                    InsertSource::Select(sel) => {
+                        let _ = collect_col_rename_edits_in_select(
+                            sel,
+                            trig_db_id,
+                            target_db_id,
+                            target_tbl,
+                            old_col,
+                            new_col,
+                            &ctes,
+                            &outer_scopes,
+                            db_set,
+                            &spans,
+                            &mut edits,
+                        );
+                    }
+                    InsertSource::DefaultValues => {}
+                }
+
+                let (step_is_target, dml_cols) =
+                    resolve_step_dml_target(&ins.table, &ins.alias, &mut edits);
+                if step_is_target && let Some(ref cols) = ins.columns {
+                    for cn in cols {
+                        if cn.eq_ignore_ascii_case(old_col)
+                            && let Some(sp) = spans.span_of(cn)
+                        {
+                            edits.push((sp, new_col.to_owned()));
+                        }
+                    }
+                }
+                if !ins.upsert_clauses.is_empty() {
+                    let excl_cols: Vec<RenameColBinding> = dml_cols
+                        .iter()
+                        .map(|cb| RenameColBinding {
+                            schema_name: None,
+                            table_alias: Some("excluded".to_owned()),
+                            name: cb.name.clone(),
+                            is_target_col: cb.is_target_col,
+                            merged_using: false,
+                            qualified_only: true,
+                        })
+                        .collect();
+                    let mut target_scopes = outer_scopes.clone();
+                    target_scopes.push(dml_cols.clone());
+                    let mut upsert_set_scopes = outer_scopes.clone();
+                    let mut combined = dml_cols;
+                    combined.extend(excl_cols);
+                    upsert_set_scopes.push(combined);
+
+                    for uc in &ins.upsert_clauses {
+                        if let Some(ref tgt) = uc.target {
+                            for ic in &tgt.columns {
+                                if let Some(ref ie) = ic.expr {
+                                    collect_col_rename_edits_in_expr(
+                                        ie,
+                                        trig_db_id,
+                                        target_db_id,
+                                        target_tbl,
+                                        old_col,
+                                        new_col,
+                                        &ctes,
+                                        &target_scopes,
+                                        db_set,
+                                        &spans,
+                                        &mut edits,
+                                    );
+                                } else if step_is_target
+                                    && ic.name.eq_ignore_ascii_case(old_col)
+                                    && let Some(sp) = spans.span_of(&ic.name)
+                                {
+                                    edits.push((sp, new_col.to_owned()));
+                                }
+                            }
+                            if let Some(ref tw) = tgt.where_clause {
+                                collect_col_rename_edits_in_expr(
+                                    tw,
+                                    trig_db_id,
+                                    target_db_id,
+                                    target_tbl,
+                                    old_col,
+                                    new_col,
+                                    &ctes,
+                                    &target_scopes,
+                                    db_set,
+                                    &spans,
+                                    &mut edits,
+                                );
+                            }
+                        }
+                        if let UpsertAction::DoUpdate {
+                            ref assignments,
+                            ref where_clause,
+                        } = uc.action
+                        {
+                            for asgn in assignments {
+                                if step_is_target {
+                                    for lhs in &asgn.columns {
+                                        if lhs.eq_ignore_ascii_case(old_col)
+                                            && let Some(sp) = spans.span_of(lhs)
+                                        {
+                                            edits.push((sp, new_col.to_owned()));
+                                        }
+                                    }
+                                }
+                                collect_col_rename_edits_in_expr(
+                                    &asgn.expr,
+                                    trig_db_id,
+                                    target_db_id,
+                                    target_tbl,
+                                    old_col,
+                                    new_col,
+                                    &ctes,
+                                    &upsert_set_scopes,
+                                    db_set,
+                                    &spans,
+                                    &mut edits,
+                                );
+                            }
+                            if let Some(uw) = where_clause {
+                                collect_col_rename_edits_in_expr(
+                                    uw,
+                                    trig_db_id,
+                                    target_db_id,
+                                    target_tbl,
+                                    old_col,
+                                    new_col,
+                                    &ctes,
+                                    &upsert_set_scopes,
+                                    db_set,
+                                    &spans,
+                                    &mut edits,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            TriggerStep::Update(upd) => {
+                let (step_is_target, mut step_cols) =
+                    resolve_step_dml_target(&upd.table, &upd.alias, &mut edits);
+                if step_is_target {
+                    for asgn in &upd.assignments {
+                        for lhs in &asgn.columns {
+                            if lhs.eq_ignore_ascii_case(old_col)
+                                && let Some(sp) = spans.span_of(lhs)
+                            {
+                                edits.push((sp, new_col.to_owned()));
+                            }
+                        }
+                    }
+                }
+                if let Some(ref fc) = upd.from {
+                    let mut from_cols = collect_col_rename_edits_in_tos(
+                        &fc.head,
+                        trig_db_id,
+                        target_db_id,
+                        target_tbl,
+                        old_col,
+                        new_col,
+                        &ctes,
+                        &outer_scopes,
+                        db_set,
+                        &spans,
+                        &mut edits,
+                    );
+                    for j in &fc.joins {
+                        let rcols = collect_col_rename_edits_in_tos(
+                            &j.right,
+                            trig_db_id,
+                            target_db_id,
+                            target_tbl,
+                            old_col,
+                            new_col,
+                            &ctes,
+                            &outer_scopes,
+                            db_set,
+                            &spans,
+                            &mut edits,
+                        );
+                        from_cols = merge_join_rename_col_bindings(&from_cols, &rcols, j);
+                        if let Some(JoinConstraint::On(ref on_e)) = j.constraint {
+                            let mut j_scopes = outer_scopes.clone();
+                            j_scopes.push(from_cols.clone());
+                            collect_col_rename_edits_in_expr(
+                                on_e,
+                                trig_db_id,
+                                target_db_id,
+                                target_tbl,
+                                old_col,
+                                new_col,
+                                &ctes,
+                                &j_scopes,
+                                db_set,
+                                &spans,
+                                &mut edits,
+                            );
+                        }
+                    }
+                    step_cols.extend(from_cols);
+                }
+                let mut step_scopes = outer_scopes.clone();
+                step_scopes.push(step_cols);
+                for asgn in &upd.assignments {
+                    collect_col_rename_edits_in_expr(
+                        &asgn.expr,
+                        trig_db_id,
+                        target_db_id,
+                        target_tbl,
+                        old_col,
+                        new_col,
+                        &ctes,
+                        &step_scopes,
+                        db_set,
+                        &spans,
+                        &mut edits,
+                    );
+                }
+                if let Some(ref w) = upd.selection {
+                    collect_col_rename_edits_in_expr(
+                        w,
+                        trig_db_id,
+                        target_db_id,
+                        target_tbl,
+                        old_col,
+                        new_col,
+                        &ctes,
+                        &step_scopes,
+                        db_set,
+                        &spans,
+                        &mut edits,
+                    );
+                }
+            }
+            TriggerStep::Delete(del) => {
+                let (_, step_cols) = resolve_step_dml_target(&del.table, &del.alias, &mut edits);
+                let mut step_scopes = outer_scopes.clone();
+                step_scopes.push(step_cols);
+                if let Some(ref w) = del.selection {
+                    collect_col_rename_edits_in_expr(
+                        w,
+                        trig_db_id,
+                        target_db_id,
+                        target_tbl,
+                        old_col,
+                        new_col,
+                        &ctes,
+                        &step_scopes,
+                        db_set,
+                        &spans,
+                        &mut edits,
+                    );
+                }
+            }
+        }
+    }
+
+    if edits.is_empty() {
+        Ok(None)
+    } else {
+        for (sp, rep) in &mut edits {
+            let orig_tok = &trig_sql[sp.offset..sp.offset + sp.len];
+            let mut formatted = format_replacement_ident(orig_tok, new_col);
+            if formatted.starts_with('"')
+                && trig_sql.as_bytes().get(sp.offset + sp.len) == Some(&b'"')
+            {
+                formatted.push(' ');
+            }
+            *rep = formatted;
+        }
+        Ok(Some(apply_span_edits(trig_sql, edits)))
     }
 }
 
@@ -18848,7 +20786,7 @@ fn build_vacuum_image(
     }
 
     let (_, schema_name) = slot_encoding_and_name(ctx, src_db_id);
-    let (tables_snapshot, indexes_snapshot, views_snapshot) = {
+    let (tables_snapshot, indexes_snapshot, views_snapshot, triggers_snapshot) = {
         let slot = ctx
             .db_set
             .slot(src_db_id)
@@ -18857,6 +20795,7 @@ fn build_vacuum_image(
             slot.schema.tables.clone(),
             slot.schema.indexes.clone(),
             slot.schema.views.clone(),
+            slot.schema.triggers.clone(),
         )
     };
     let has_any_autoincrement = tables_snapshot
@@ -18914,16 +20853,30 @@ fn build_vacuum_image(
         mapped_indexes.push((idx, new_idx_root));
     }
 
-    // Phase B2: Preserve all permanent views (`type = 'view'`, `rootpage = 0`) in `sqlite_schema`!
+    // Phase B2: Preserve all permanent views and triggers (`rootpage = 0`) in `schema_rowid` order (`vacuum.c:333-339`)!
+    let mut non_storage_entries: Vec<(i64, &'static str, String, String, String)> =
+        Vec::with_capacity(views_snapshot.len() + triggers_snapshot.len());
     for view in views_snapshot {
-        insert_schema_entry(
-            target_btree,
+        non_storage_entries.push((
+            view.schema_rowid,
             "view",
-            &view.name,
-            &view.name,
-            0,
-            Some(&view.raw_sql),
-        )?;
+            view.name.clone(),
+            view.name,
+            view.raw_sql,
+        ));
+    }
+    for trig in triggers_snapshot {
+        non_storage_entries.push((
+            trig.schema_rowid,
+            "trigger",
+            trig.name,
+            trig.tbl_name,
+            trig.raw_sql,
+        ));
+    }
+    non_storage_entries.sort_by_key(|e| e.0);
+    for (_, ty, obj_name, tbl_name, sql) in non_storage_entries {
+        insert_schema_entry(target_btree, ty, &obj_name, &tbl_name, 0, Some(&sql))?;
     }
 
     // Phase C: Copy table rows & populate indexes (`vacuum.c:317-323`)!
@@ -21272,14 +23225,16 @@ pub(crate) fn validate_and_infer_columns(
 
         Stmt::Select(sel) => {
             let mut visited = Vec::new();
-            validate_select_stmt_static(
+            let cols = validate_select_stmt_static(
                 sel,
                 &[],
                 db_set,
                 &CteStore::default(),
                 functions,
                 &mut visited,
-            )
+            )?;
+            reject_raise_in_top_level_select(sel, db_set, &CteStore::default(), &mut Vec::new())?;
+            Ok(cols)
         }
 
         Stmt::CreateTable(ct) => {
@@ -21390,6 +23345,12 @@ pub(crate) fn validate_and_infer_columns(
                             functions,
                             &mut visited,
                         )?;
+                        reject_raise_in_top_level_select(
+                            query,
+                            db_set,
+                            &CteStore::default(),
+                            &mut Vec::new(),
+                        )?;
                         return Ok(Vec::new());
                     }
                     return Err(SqliteError::new(
@@ -21407,6 +23368,12 @@ pub(crate) fn validate_and_infer_columns(
                             &CteStore::default(),
                             functions,
                             &mut visited,
+                        )?;
+                        reject_raise_in_top_level_select(
+                            query,
+                            db_set,
+                            &CteStore::default(),
+                            &mut Vec::new(),
                         )?;
                         return Ok(Vec::new());
                     }
@@ -21431,6 +23398,7 @@ pub(crate) fn validate_and_infer_columns(
                 functions,
                 &mut visited,
             )?;
+            reject_raise_in_top_level_select(query, db_set, &CteStore::default(), &mut Vec::new())?;
             Ok(Vec::new())
         }
 
@@ -21558,6 +23526,21 @@ pub(crate) fn validate_and_infer_columns(
                         ));
                     }
                 }
+            }
+            Ok(Vec::new())
+        }
+
+        Stmt::CreateTrigger(ct) => {
+            let _ = resolve_and_validate_create_trigger(db_set, ct, writable_schema)?;
+            Ok(Vec::new())
+        }
+
+        Stmt::DropTrigger { if_exists, name } => {
+            if db_set.find_trigger_in_set(name).is_none() && !*if_exists {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such trigger: {}", name.display_name()),
+                ));
             }
             Ok(Vec::new())
         }
@@ -21872,24 +23855,35 @@ pub(crate) fn validate_and_infer_columns(
             Ok(Vec::new())
         }
 
-        Stmt::Insert(ins) => validate_insert_static(
-            ins,
-            db_set,
-            writable_schema,
-            functions,
-            collations,
-            count_changes,
-        ),
-        Stmt::Update(upd) => validate_update_static(
-            upd,
-            db_set,
-            writable_schema,
-            functions,
-            collations,
-            count_changes,
-        ),
+        Stmt::Insert(ins) => {
+            let cols = validate_insert_static(
+                ins,
+                db_set,
+                writable_schema,
+                functions,
+                collations,
+                count_changes,
+            )?;
+            reject_raise_in_top_level_insert(ins, db_set)?;
+            Ok(cols)
+        }
+        Stmt::Update(upd) => {
+            let cols = validate_update_static(
+                upd,
+                db_set,
+                writable_schema,
+                functions,
+                collations,
+                count_changes,
+            )?;
+            reject_raise_in_top_level_update(upd, db_set)?;
+            Ok(cols)
+        }
         Stmt::Delete(del) => {
-            validate_delete_static(del, db_set, writable_schema, functions, count_changes)
+            let cols =
+                validate_delete_static(del, db_set, writable_schema, functions, count_changes)?;
+            reject_raise_in_top_level_delete(del, db_set)?;
+            Ok(cols)
         }
     }
 }
@@ -23286,6 +25280,7 @@ fn validate_tos_static(
                             collation: coll,
                             affinity: aff,
                             hidden_rowid: false,
+                            omit_from_star: false,
                             merged_using: false,
                         }
                     })
@@ -23322,6 +25317,7 @@ fn validate_tos_static(
                             collation: coll,
                             affinity: aff,
                             hidden_rowid: false,
+                            omit_from_star: false,
                             merged_using: false,
                         }
                     })
@@ -23346,6 +25342,7 @@ fn validate_tos_static(
                     collation: c.collation,
                     affinity: Some(c.affinity),
                     hidden_rowid: false,
+                    omit_from_star: false,
                     merged_using: false,
                 })
                 .collect();
@@ -23361,6 +25358,7 @@ fn validate_tos_static(
                     collation: Collation::Binary,
                     affinity: Some(TypeAffinity::Integer),
                     hidden_rowid: true,
+                    omit_from_star: false,
                     merged_using: false,
                 });
             }
@@ -23393,6 +25391,7 @@ fn validate_tos_static(
                         collation: coll,
                         affinity: aff,
                         hidden_rowid: false,
+                        omit_from_star: false,
                         merged_using: false,
                     }
                 })
@@ -24247,8 +26246,372 @@ fn validate_expr_static(
             Ok(())
         }
 
-        Expr::Raise { .. } => Ok(()),
+        Expr::Raise { message, .. } => {
+            if let Some(m) = message {
+                validate_expr_static(
+                    m,
+                    scopes,
+                    db_set,
+                    ctes,
+                    functions,
+                    allow_agg,
+                    inside_agg,
+                    visited_ctes,
+                )?;
+            }
+            Ok(())
+        }
     }
+}
+
+fn reject_raise_in_top_level_select(
+    sel: &SelectStmt,
+    db_set: &DatabaseSet,
+    parent_ctes: &CteStore,
+    visited_views: &mut Vec<(DatabaseId, String)>,
+) -> Result<()> {
+    reject_raise_outside_trigger_select(sel)?;
+    let ctes = parent_ctes.with_scope(&sel.ctes);
+    for cte in &sel.ctes {
+        reject_raise_in_top_level_select(&cte.query, db_set, &ctes, visited_views)?;
+    }
+    reject_raise_in_top_level_core(&sel.body.head, db_set, &ctes, visited_views)?;
+    for (_, core) in &sel.body.compounds {
+        reject_raise_in_top_level_core(core, db_set, &ctes, visited_views)?;
+    }
+    for ob in &sel.order_by {
+        reject_raise_in_top_level_expr(&ob.expr, db_set, &ctes, visited_views)?;
+    }
+    if let Some(ref lim) = sel.limit {
+        reject_raise_in_top_level_expr(&lim.limit, db_set, &ctes, visited_views)?;
+        if let Some(ref off) = lim.offset {
+            reject_raise_in_top_level_expr(off, db_set, &ctes, visited_views)?;
+        }
+    }
+    Ok(())
+}
+
+fn reject_raise_in_top_level_core(
+    core: &SelectCore,
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    visited_views: &mut Vec<(DatabaseId, String)>,
+) -> Result<()> {
+    match core {
+        SelectCore::Select {
+            projection,
+            from,
+            selection,
+            group_by,
+            having,
+            ..
+        } => {
+            if let Some(fc) = from {
+                reject_raise_in_top_level_from(fc, db_set, ctes, visited_views)?;
+            }
+            for rc in projection {
+                if let ResultColumn::Expr { expr, .. } = rc {
+                    reject_raise_in_top_level_expr(expr, db_set, ctes, visited_views)?;
+                }
+            }
+            if let Some(w) = selection {
+                reject_raise_in_top_level_expr(w, db_set, ctes, visited_views)?;
+            }
+            for g in group_by {
+                reject_raise_in_top_level_expr(g, db_set, ctes, visited_views)?;
+            }
+            if let Some(h) = having {
+                reject_raise_in_top_level_expr(h, db_set, ctes, visited_views)?;
+            }
+            Ok(())
+        }
+        SelectCore::Values(rows) => {
+            for row in rows {
+                for e in row {
+                    reject_raise_in_top_level_expr(e, db_set, ctes, visited_views)?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn reject_raise_in_top_level_from(
+    fc: &FromClause,
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    visited_views: &mut Vec<(DatabaseId, String)>,
+) -> Result<()> {
+    reject_raise_in_top_level_tos(&fc.head, db_set, ctes, visited_views)?;
+    for j in &fc.joins {
+        reject_raise_in_top_level_tos(&j.right, db_set, ctes, visited_views)?;
+        if let Some(JoinConstraint::On(ref on_e)) = j.constraint {
+            reject_raise_in_top_level_expr(on_e, db_set, ctes, visited_views)?;
+        }
+    }
+    Ok(())
+}
+
+fn reject_raise_in_top_level_tos(
+    tos: &TableOrSubquery,
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    visited_views: &mut Vec<(DatabaseId, String)>,
+) -> Result<()> {
+    match tos {
+        TableOrSubquery::Table {
+            name, table_args, ..
+        } => {
+            if let Some(args) = table_args {
+                for a in args {
+                    reject_raise_in_top_level_expr(a, db_set, ctes, visited_views)?;
+                }
+            }
+            reject_raise_in_referenced_view(name, db_set, ctes, visited_views)
+        }
+        TableOrSubquery::Subquery { query, .. } => {
+            reject_raise_in_top_level_select(query, db_set, ctes, visited_views)
+        }
+    }
+}
+
+fn reject_raise_in_referenced_view(
+    qn: &QualifiedName,
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    visited_views: &mut Vec<(DatabaseId, String)>,
+) -> Result<()> {
+    if qn.schema.is_none() && ctes.locate(&qn.name).is_some() {
+        return Ok(());
+    }
+    if db_set.resolve_catalog_table(qn)?.is_none()
+        && let Some((v_db_id, v)) = db_set.find_view_in_set(qn)
+    {
+        let key = (v_db_id, v.name.to_ascii_lowercase());
+        if !visited_views.contains(&key) {
+            visited_views.push(key);
+            let res = reject_raise_in_top_level_select(
+                &v.select,
+                db_set,
+                &CteStore::default(),
+                visited_views,
+            );
+            visited_views.pop();
+            return res;
+        }
+    }
+    Ok(())
+}
+
+fn reject_raise_in_top_level_expr(
+    expr: &Expr,
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+    visited_views: &mut Vec<(DatabaseId, String)>,
+) -> Result<()> {
+    reject_raise_outside_trigger_expr(expr)?;
+    match expr {
+        Expr::Unary { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => {
+            reject_raise_in_top_level_expr(inner, db_set, ctes, visited_views)
+        }
+        Expr::Binary { left, right, .. } => {
+            reject_raise_in_top_level_expr(left, db_set, ctes, visited_views)?;
+            reject_raise_in_top_level_expr(right, db_set, ctes, visited_views)
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            reject_raise_in_top_level_expr(e, db_set, ctes, visited_views)?;
+            reject_raise_in_top_level_expr(low, db_set, ctes, visited_views)?;
+            reject_raise_in_top_level_expr(high, db_set, ctes, visited_views)
+        }
+        Expr::InList { expr: e, list, .. } => {
+            reject_raise_in_top_level_expr(e, db_set, ctes, visited_views)?;
+            for item in list {
+                reject_raise_in_top_level_expr(item, db_set, ctes, visited_views)?;
+            }
+            Ok(())
+        }
+        Expr::InSubquery {
+            expr: e, subquery, ..
+        } => {
+            reject_raise_in_top_level_expr(e, db_set, ctes, visited_views)?;
+            reject_raise_in_top_level_select(subquery, db_set, ctes, visited_views)
+        }
+        Expr::InTable { expr: e, table, .. } => {
+            reject_raise_in_top_level_expr(e, db_set, ctes, visited_views)?;
+            reject_raise_in_referenced_view(table, db_set, ctes, visited_views)
+        }
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            reject_raise_in_top_level_expr(e, db_set, ctes, visited_views)?;
+            reject_raise_in_top_level_expr(pattern, db_set, ctes, visited_views)?;
+            if let Some(esc) = escape {
+                reject_raise_in_top_level_expr(esc, db_set, ctes, visited_views)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                reject_raise_in_top_level_expr(op, db_set, ctes, visited_views)?;
+            }
+            for (c, v) in branches {
+                reject_raise_in_top_level_expr(c, db_set, ctes, visited_views)?;
+                reject_raise_in_top_level_expr(v, db_set, ctes, visited_views)?;
+            }
+            if let Some(el) = else_expr {
+                reject_raise_in_top_level_expr(el, db_set, ctes, visited_views)?;
+            }
+            Ok(())
+        }
+        Expr::FunctionCall { args, filter, .. } => {
+            if let FunctionArgs::Exprs(es) = args {
+                for e in es {
+                    reject_raise_in_top_level_expr(e, db_set, ctes, visited_views)?;
+                }
+            }
+            if let Some(f) = filter {
+                reject_raise_in_top_level_expr(f, db_set, ctes, visited_views)?;
+            }
+            Ok(())
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
+            reject_raise_in_top_level_select(subquery, db_set, ctes, visited_views)
+        }
+        Expr::RowValue(es) => {
+            for e in es {
+                reject_raise_in_top_level_expr(e, db_set, ctes, visited_views)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn reject_raise_in_table_constraints_outside_trigger(tbl: &TableSchema) -> Result<()> {
+    for chk in &tbl.checks {
+        reject_raise_outside_trigger_expr(&chk.expr)?;
+    }
+    for col in &tbl.columns {
+        if let Some((ref ge, _)) = col.generated {
+            reject_raise_outside_trigger_expr(ge)?;
+        }
+    }
+    Ok(())
+}
+
+fn reject_raise_in_top_level_insert(ins: &InsertStmt, db_set: &DatabaseSet) -> Result<()> {
+    let mut visited_views = Vec::new();
+    let dml_ctes = CteStore::default().with_scope(&ins.ctes);
+    for cte in &ins.ctes {
+        reject_raise_in_top_level_select(&cte.query, db_set, &dml_ctes, &mut visited_views)?;
+    }
+    if let Some((_, tbl)) = db_set.find_user_table_in_set(&ins.table) {
+        reject_raise_in_table_constraints_outside_trigger(tbl)?;
+    }
+    match &ins.source {
+        InsertSource::DefaultValues => {}
+        InsertSource::Values(rows) => {
+            for row in rows {
+                for e in row {
+                    reject_raise_in_top_level_expr(e, db_set, &dml_ctes, &mut visited_views)?;
+                }
+            }
+        }
+        InsertSource::Select(sel) => {
+            reject_raise_in_top_level_select(sel, db_set, &dml_ctes, &mut visited_views)?;
+        }
+    }
+    for uc in &ins.upsert_clauses {
+        if let Some(ref tgt) = uc.target {
+            for ic in &tgt.columns {
+                if let Some(ref ie) = ic.expr {
+                    reject_raise_in_top_level_expr(ie, db_set, &dml_ctes, &mut visited_views)?;
+                }
+            }
+            if let Some(ref tw) = tgt.where_clause {
+                reject_raise_in_top_level_expr(tw, db_set, &dml_ctes, &mut visited_views)?;
+            }
+        }
+        if let UpsertAction::DoUpdate {
+            ref assignments,
+            ref where_clause,
+        } = uc.action
+        {
+            for asgn in assignments {
+                reject_raise_in_top_level_expr(&asgn.expr, db_set, &dml_ctes, &mut visited_views)?;
+            }
+            if let Some(uw) = where_clause {
+                reject_raise_in_top_level_expr(uw, db_set, &dml_ctes, &mut visited_views)?;
+            }
+        }
+    }
+    for rc in &ins.returning {
+        if let ResultColumn::Expr { expr, .. } = rc {
+            reject_raise_in_top_level_expr(expr, db_set, &dml_ctes, &mut visited_views)?;
+        }
+    }
+    Ok(())
+}
+
+fn reject_raise_in_top_level_update(upd: &UpdateStmt, db_set: &DatabaseSet) -> Result<()> {
+    let mut visited_views = Vec::new();
+    let dml_ctes = CteStore::default().with_scope(&upd.ctes);
+    for cte in &upd.ctes {
+        reject_raise_in_top_level_select(&cte.query, db_set, &dml_ctes, &mut visited_views)?;
+    }
+    if let Some((_, tbl)) = db_set.find_user_table_in_set(&upd.table) {
+        reject_raise_in_table_constraints_outside_trigger(tbl)?;
+    }
+    if let Some(ref fc) = upd.from {
+        if from_contains_raise(fc) {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                "RAISE() may only be used within a trigger-program",
+            ));
+        }
+        reject_raise_in_top_level_from(fc, db_set, &dml_ctes, &mut visited_views)?;
+    }
+    for asgn in &upd.assignments {
+        reject_raise_in_top_level_expr(&asgn.expr, db_set, &dml_ctes, &mut visited_views)?;
+    }
+    if let Some(ref w) = upd.selection {
+        reject_raise_in_top_level_expr(w, db_set, &dml_ctes, &mut visited_views)?;
+    }
+    for rc in &upd.returning {
+        if let ResultColumn::Expr { expr, .. } = rc {
+            reject_raise_in_top_level_expr(expr, db_set, &dml_ctes, &mut visited_views)?;
+        }
+    }
+    Ok(())
+}
+
+fn reject_raise_in_top_level_delete(del: &DeleteStmt, db_set: &DatabaseSet) -> Result<()> {
+    let mut visited_views = Vec::new();
+    let dml_ctes = CteStore::default().with_scope(&del.ctes);
+    for cte in &del.ctes {
+        reject_raise_in_top_level_select(&cte.query, db_set, &dml_ctes, &mut visited_views)?;
+    }
+    if let Some(ref w) = del.selection {
+        reject_raise_in_top_level_expr(w, db_set, &dml_ctes, &mut visited_views)?;
+    }
+    for rc in &del.returning {
+        if let ResultColumn::Expr { expr, .. } = rc {
+            reject_raise_in_top_level_expr(expr, db_set, &dml_ctes, &mut visited_views)?;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

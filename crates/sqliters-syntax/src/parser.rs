@@ -235,14 +235,28 @@ impl<'a> Parser<'a> {
 
     /// Parses `[schema.]object_name`, returning `(QualifiedName, byte_offset_of_unqualified_name_token)`.
     fn parse_qualified_name_with_offset(&mut self) -> Result<(QualifiedName, usize)> {
+        let (qn, off, _) = self.parse_qualified_name_with_token()?;
+        Ok((qn, off))
+    }
+
+    /// Parses `[schema.]object_name`, returning `(QualifiedName, byte_offset_of_unqualified_name_token, raw_unqualified_token_text)`.
+    fn parse_qualified_name_with_token(&mut self) -> Result<(QualifiedName, usize, &'a str)> {
         let first_tok = self.peek();
         let first = self.parse_nm()?;
         if self.eat(TokenKind::Dot) {
             let second_tok = self.peek();
             let second = self.parse_nm()?;
-            Ok((QualifiedName::qualified(first, second), second_tok.offset))
+            Ok((
+                QualifiedName::qualified(first, second),
+                second_tok.offset,
+                second_tok.text,
+            ))
         } else {
-            Ok((QualifiedName::unqualified(first), first_tok.offset))
+            Ok((
+                QualifiedName::unqualified(first),
+                first_tok.offset,
+                first_tok.text,
+            ))
         }
     }
 
@@ -277,6 +291,7 @@ impl<'a> Parser<'a> {
                 | TokenKind::Fail
                 | TokenKind::Filter
                 | TokenKind::First
+                | TokenKind::For
                 | TokenKind::Generated
                 | TokenKind::Glob
                 | TokenKind::If
@@ -673,6 +688,95 @@ impl<'a> Parser<'a> {
                 name,
                 columns,
                 query: Box::new(query),
+                catalog_sql,
+                raw_sql,
+            }));
+        }
+
+        if !unique && self.eat(TokenKind::Trigger) {
+            let if_not_exists = if self.eat(TokenKind::If) {
+                self.expect(TokenKind::Not)?;
+                self.expect(TokenKind::Exists)?;
+                true
+            } else {
+                false
+            };
+            let (name, name_offset, name_tok_str) = self.parse_qualified_name_with_token()?;
+            let timing = if self.eat(TokenKind::Before) {
+                TriggerTiming::Before
+            } else if self.eat(TokenKind::After) {
+                TriggerTiming::After
+            } else if self.eat(TokenKind::Instead) {
+                self.expect(TokenKind::Of)?;
+                TriggerTiming::InsteadOf
+            } else {
+                TriggerTiming::Before
+            };
+
+            let event = if self.eat(TokenKind::Insert) {
+                TriggerEvent::Insert
+            } else if self.eat(TokenKind::Delete) {
+                TriggerEvent::Delete
+            } else if self.eat(TokenKind::Update) {
+                if self.eat(TokenKind::Of) {
+                    let mut cols = Vec::new();
+                    loop {
+                        cols.push(self.parse_nm()?);
+                        if !self.eat(TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    TriggerEvent::Update {
+                        columns: Some(cols),
+                    }
+                } else {
+                    TriggerEvent::Update { columns: None }
+                }
+            } else {
+                let tok = self.peek();
+                return Err(self.syntax_err_at(tok, format!("near \"{}\": syntax error", tok.text)));
+            };
+
+            self.expect(TokenKind::On)?;
+            let on_table = self.parse_qualified_name()?;
+            let for_each_row = if self.eat(TokenKind::For) {
+                self.expect(TokenKind::Each)?;
+                self.expect(TokenKind::Row)?;
+                true
+            } else {
+                false
+            };
+            let when_clause = if self.eat(TokenKind::When) {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+
+            self.expect(TokenKind::Begin)?;
+            let mut body = Vec::new();
+            loop {
+                body.push(self.parse_trigger_step()?);
+                self.expect(TokenKind::Semi)?;
+                if self.at(TokenKind::End) {
+                    break;
+                }
+            }
+            let end_tok = self.expect(TokenKind::End)?;
+            let body_end = end_tok.offset + end_tok.text.len();
+            let end_off = self.peek().offset;
+            let catalog_sql = format!("CREATE TRIGGER {}", &self.sql[name_offset..body_end]);
+            let raw_sql = self.sql[stmt_start..end_off].trim().to_owned();
+            return Ok(Stmt::CreateTrigger(CreateTriggerStmt {
+                temp,
+                if_not_exists,
+                name,
+                name_token_text: name_tok_str.to_owned(),
+                timing,
+                event,
+                on_table,
+                for_each_row,
+                when_clause,
+                body,
                 catalog_sql,
                 raw_sql,
             }));
@@ -1136,9 +1240,18 @@ impl<'a> Parser<'a> {
             };
             let name = self.parse_qualified_name()?;
             Ok(Stmt::DropView { if_exists, name })
+        } else if self.eat(TokenKind::Trigger) {
+            let if_exists = if self.eat(TokenKind::If) {
+                self.expect(TokenKind::Exists)?;
+                true
+            } else {
+                false
+            };
+            let name = self.parse_qualified_name()?;
+            Ok(Stmt::DropTrigger { if_exists, name })
         } else {
             let tok = self.peek();
-            Err(self.syntax_err_at(tok, "expected TABLE, INDEX, or VIEW after DROP"))
+            Err(self.syntax_err_at(tok, "expected TABLE, INDEX, VIEW, or TRIGGER after DROP"))
         }
     }
 
@@ -1197,7 +1310,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Into)?;
         let table = self.parse_qualified_name()?;
         let alias = if self.eat(TokenKind::As) {
-            Some(self.parse_ident()?)
+            Some(self.parse_nm()?)
         } else {
             None
         };
@@ -1206,7 +1319,7 @@ impl<'a> Parser<'a> {
             self.expect(TokenKind::Lp)?;
             let mut cols = Vec::new();
             loop {
-                cols.push(self.parse_ident()?);
+                cols.push(self.parse_nm()?);
                 if !self.eat(TokenKind::Comma) {
                     break;
                 }
@@ -1396,7 +1509,7 @@ impl<'a> Parser<'a> {
             if self.eat(TokenKind::Lp) {
                 let mut columns = Vec::new();
                 loop {
-                    columns.push(self.parse_ident()?);
+                    columns.push(self.parse_nm()?);
                     if !self.eat(TokenKind::Comma) {
                         break;
                     }
@@ -1410,7 +1523,7 @@ impl<'a> Parser<'a> {
                     expr,
                 });
             } else {
-                let col = self.parse_ident()?;
+                let col = self.parse_nm()?;
                 self.expect(TokenKind::Eq)?;
                 let expr = self.parse_expr()?;
                 assignments.push(SetAssignment {
@@ -1424,6 +1537,207 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(assignments)
+    }
+
+    fn check_trigger_indexed_by(&mut self) -> Result<()> {
+        if self.eat(TokenKind::Indexed) {
+            self.expect(TokenKind::By)?;
+            let _ = self.parse_nm()?;
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                "the INDEXED BY clause is not allowed on UPDATE or DELETE statements within triggers",
+            ));
+        }
+        if self.at(TokenKind::Not) && self.peek_n(1).kind == TokenKind::Indexed {
+            self.advance();
+            self.advance();
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                "the NOT INDEXED clause is not allowed on UPDATE or DELETE statements within triggers",
+            ));
+        }
+        Ok(())
+    }
+
+    fn parse_trigger_step(&mut self) -> Result<TriggerStep> {
+        let tok = self.peek();
+        match tok.kind {
+            TokenKind::Select | TokenKind::Values | TokenKind::With => {
+                Ok(TriggerStep::Select(self.parse_select_stmt()?))
+            }
+            TokenKind::Insert | TokenKind::Replace => {
+                let or_conflict = if self.eat(TokenKind::Replace) {
+                    Some(ConflictAction::Replace)
+                } else {
+                    self.expect(TokenKind::Insert)?;
+                    if self.eat(TokenKind::Or) {
+                        Some(self.parse_conflict_action()?)
+                    } else {
+                        None
+                    }
+                };
+                self.expect(TokenKind::Into)?;
+                let table = self.parse_qualified_name()?;
+                let alias = if self.eat(TokenKind::As) {
+                    Some(self.parse_nm()?)
+                } else {
+                    None
+                };
+                let columns = if self.at(TokenKind::Lp) && self.peek_n(1).kind != TokenKind::Select
+                {
+                    self.expect(TokenKind::Lp)?;
+                    let mut cols = Vec::new();
+                    loop {
+                        cols.push(self.parse_nm()?);
+                        if !self.eat(TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(TokenKind::Rp)?;
+                    Some(cols)
+                } else {
+                    None
+                };
+                let source = if self.at(TokenKind::Values) && self.peek_n(1).kind == TokenKind::Lp {
+                    self.advance();
+                    let rows = self.parse_values_rows()?;
+                    if matches!(
+                        self.peek().kind,
+                        TokenKind::Union
+                            | TokenKind::Intersect
+                            | TokenKind::Except
+                            | TokenKind::Order
+                            | TokenKind::Limit
+                    ) {
+                        let mut order_by = self.parse_optional_order_by()?;
+                        let mut limit = self.parse_optional_limit()?;
+                        let mut compounds = Vec::new();
+                        while let Some(op) = self.eat_compound_op() {
+                            if !order_by.is_empty() {
+                                return Err(SqliteError::new(
+                                    ErrorCode::Error,
+                                    format!(
+                                        "ORDER BY clause should come after {} not before",
+                                        op.as_sql_str()
+                                    ),
+                                ));
+                            }
+                            if limit.is_some() {
+                                return Err(SqliteError::new(
+                                    ErrorCode::Error,
+                                    format!(
+                                        "LIMIT clause should come after {} not before",
+                                        op.as_sql_str()
+                                    ),
+                                ));
+                            }
+                            compounds.push((op, self.parse_select_core()?));
+                            order_by = self.parse_optional_order_by()?;
+                            limit = self.parse_optional_limit()?;
+                        }
+                        InsertSource::Select(Box::new(SelectStmt {
+                            ctes: Vec::new(),
+                            body: SelectBody {
+                                head: SelectCore::Values(rows),
+                                compounds,
+                            },
+                            order_by,
+                            limit,
+                        }))
+                    } else {
+                        InsertSource::Values(rows)
+                    }
+                } else if matches!(self.peek().kind, TokenKind::Select | TokenKind::With) {
+                    InsertSource::Select(Box::new(self.parse_select_stmt()?))
+                } else {
+                    let bad = self.peek();
+                    return Err(
+                        self.syntax_err_at(bad, format!("near \"{}\": syntax error", bad.text))
+                    );
+                };
+                let upsert_clauses = self.parse_upsert_clauses()?;
+                if self.eat(TokenKind::Returning) {
+                    let _ = self.parse_projection()?;
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "cannot use RETURNING in a trigger",
+                    ));
+                }
+                Ok(TriggerStep::Insert(InsertStmt {
+                    ctes: Vec::new(),
+                    or_conflict,
+                    table,
+                    alias,
+                    columns,
+                    source,
+                    upsert_clauses,
+                    returning: Vec::new(),
+                }))
+            }
+            TokenKind::Update => {
+                self.expect(TokenKind::Update)?;
+                let or_conflict = if self.eat(TokenKind::Or) {
+                    Some(self.parse_conflict_action()?)
+                } else {
+                    None
+                };
+                let table = self.parse_qualified_name()?;
+                let alias = if self.eat(TokenKind::As) {
+                    Some(self.parse_nm()?)
+                } else {
+                    None
+                };
+                self.check_trigger_indexed_by()?;
+                self.expect(TokenKind::Set)?;
+                let assignments = self.parse_set_assignments()?;
+                let from = if self.eat(TokenKind::From) {
+                    Some(self.parse_from_clause()?)
+                } else {
+                    None
+                };
+                let selection = if self.eat(TokenKind::Where) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                Ok(TriggerStep::Update(UpdateStmt {
+                    ctes: Vec::new(),
+                    or_conflict,
+                    table,
+                    alias,
+                    indexed_by: None,
+                    assignments,
+                    from,
+                    selection,
+                    returning: Vec::new(),
+                }))
+            }
+            TokenKind::Delete => {
+                self.expect(TokenKind::Delete)?;
+                self.expect(TokenKind::From)?;
+                let table = self.parse_qualified_name()?;
+                let alias = if self.eat(TokenKind::As) {
+                    Some(self.parse_nm()?)
+                } else {
+                    None
+                };
+                self.check_trigger_indexed_by()?;
+                let selection = if self.eat(TokenKind::Where) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                Ok(TriggerStep::Delete(DeleteStmt {
+                    ctes: Vec::new(),
+                    table,
+                    alias,
+                    indexed_by: None,
+                    selection,
+                    returning: Vec::new(),
+                }))
+            }
+            _ => Err(self.syntax_err_at(tok, format!("near \"{}\": syntax error", tok.text))),
+        }
     }
 
     fn parse_values_rows(&mut self) -> Result<Vec<Vec<Expr>>> {

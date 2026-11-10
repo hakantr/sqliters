@@ -14,7 +14,7 @@ use std::sync::atomic::AtomicBool;
 
 use sqliters_btree::Btree;
 use sqliters_pager::{AutoVacuumMode, LockingMode, PagerOpenOptions, TransactionState};
-use sqliters_syntax::QualifiedName;
+use sqliters_syntax::{QualifiedName, TriggerTiming};
 use sqliters_types::{
     DatabaseId, DatabaseKind, ErrorCode, LockGeometry, Result, SQLITE_MAX_ATTACHED, SqliteError,
     TextEncoding,
@@ -23,6 +23,10 @@ use sqliters_vdbe::BtreeAccess;
 use sqliters_vfs::Vfs;
 
 use crate::schema::{IndexSchema, Schema, TableSchema, ViewSchema};
+use crate::trigger::{
+    SQLITE_MAX_TRIGGER_DEPTH, SQLITE_MAX_TRIGGER_STEPS, TriggerSchema,
+    is_reserved_trigger_or_system_name,
+};
 
 /// Resolved relation (either a table or a view) located in [`DatabaseSet`].
 #[derive(Debug, Clone)]
@@ -148,8 +152,11 @@ pub struct DatabaseSet {
     slots: Vec<DbSlot>,
     max_attached: usize,
     enable_view: bool,
+    enable_trigger: bool,
     expr_depth_limit: usize,
     column_limit: usize,
+    trigger_steps_limit: usize,
+    trigger_depth_limit: usize,
     next_schema_instance_id: u64,
     temp_store: TempStoreMode,
     disk_vfs: Arc<dyn Vfs>,
@@ -209,8 +216,11 @@ impl DatabaseSet {
             slots,
             max_attached: SQLITE_MAX_ATTACHED,
             enable_view: true,
+            enable_trigger: true,
             expr_depth_limit: SQLITE_MAX_EXPR_DEPTH,
             column_limit: SQLITE_MAX_COLUMN,
+            trigger_steps_limit: SQLITE_MAX_TRIGGER_STEPS,
+            trigger_depth_limit: SQLITE_MAX_TRIGGER_DEPTH,
             next_schema_instance_id: 3,
             temp_store,
             disk_vfs,
@@ -258,6 +268,45 @@ impl DatabaseSet {
     pub fn set_enable_view(&mut self, enabled: bool) -> bool {
         self.enable_view = enabled;
         self.enable_view
+    }
+
+    /// Whether permanent trigger firing is enabled (`SQLITE_DBCONFIG_ENABLE_TRIGGER`).
+    #[inline]
+    pub const fn enable_trigger(&self) -> bool {
+        self.enable_trigger
+    }
+
+    /// Updates `SQLITE_DBCONFIG_ENABLE_TRIGGER`, returning the new setting.
+    #[inline]
+    pub fn set_enable_trigger(&mut self, enabled: bool) -> bool {
+        self.enable_trigger = enabled;
+        self.enable_trigger
+    }
+
+    /// Current `SQLITE_LIMIT_TRIGGER_STEPS` limit on this connection.
+    #[inline]
+    pub const fn trigger_steps_limit(&self) -> usize {
+        self.trigger_steps_limit
+    }
+
+    /// Sets `SQLITE_LIMIT_TRIGGER_STEPS` (clamped to `0..=SQLITE_MAX_TRIGGER_STEPS`), returning the new limit.
+    #[inline]
+    pub fn set_trigger_steps_limit(&mut self, limit: usize) -> usize {
+        self.trigger_steps_limit = limit.min(SQLITE_MAX_TRIGGER_STEPS);
+        self.trigger_steps_limit
+    }
+
+    /// Current `SQLITE_LIMIT_TRIGGER_DEPTH` limit on this connection.
+    #[inline]
+    pub const fn trigger_depth_limit(&self) -> usize {
+        self.trigger_depth_limit
+    }
+
+    /// Sets `SQLITE_LIMIT_TRIGGER_DEPTH` (clamped to `1..=SQLITE_MAX_TRIGGER_DEPTH`), returning the new limit.
+    #[inline]
+    pub fn set_trigger_depth_limit(&mut self, limit: usize) -> usize {
+        self.trigger_depth_limit = limit.clamp(1, SQLITE_MAX_TRIGGER_DEPTH);
+        self.trigger_depth_limit
     }
 
     /// Records one `INSERT` transfer-optimization activation (`sqlite3_xferopt_count`).
@@ -483,6 +532,7 @@ impl DatabaseSet {
             bt.close()?;
             self.slots[1].btree = None;
             self.slots[1].schema = Schema::default();
+            self.temp_trigger_bindings.clear();
             self.temp_store = mode;
             return Ok(true);
         }
@@ -846,6 +896,12 @@ impl DatabaseSet {
     pub fn detach_temp_triggers(&mut self, detached_schema_instance_id: SchemaInstanceId) -> usize {
         let temp_id = self.slots[1].schema_instance_id;
         let mut redirected = 0;
+        for tr in &mut self.slots[1].schema.triggers {
+            if tr.target_schema_instance_id == Some(detached_schema_instance_id) {
+                tr.target_schema_instance_id = Some(temp_id);
+                tr.detached_to_temp = true;
+            }
+        }
         for binding in &mut self.temp_trigger_bindings {
             if binding.target_schema_instance_id == detached_schema_instance_id {
                 binding.target_schema_instance_id = temp_id;
@@ -853,6 +909,252 @@ impl DatabaseSet {
             }
         }
         redirected
+    }
+
+    /// Locates an active trigger across [`DatabaseSet`] (`temp -> main -> attached` when unqualified;
+    /// exact slot when qualified, matching `sqlite3DropTrigger` in `sqlite/src/trigger.c:681-687`).
+    pub fn find_trigger_in_set(
+        &self,
+        qname: &QualifiedName,
+    ) -> Option<(DatabaseId, &TriggerSchema)> {
+        if let Some(ref s) = qname.schema {
+            let db_id = self.find_db_id(s)?;
+            let slot = self.slot(db_id)?;
+            slot.btree.as_ref()?;
+            slot.schema.find_trigger(&qname.name).map(|tr| (db_id, tr))
+        } else {
+            for db_id in self.unqualified_search_order() {
+                if let Some(slot) = self.slot(db_id)
+                    && let Some(tr) = slot.schema.find_trigger(&qname.name)
+                {
+                    return Some((db_id, tr));
+                }
+            }
+            None
+        }
+    }
+
+    /// Returns all active triggers attached to `(target_db_id, relation_name)` (`sqlite3TriggerList`
+    /// in `sqlite/src/trigger.c:50-82`), prepending `TEMP` triggers followed by permanent triggers
+    /// in `target_db_id`.
+    pub fn triggers_for_relation(
+        &self,
+        target_db_id: DatabaseId,
+        relation_name: &str,
+    ) -> Vec<(DatabaseId, TriggerSchema)> {
+        let Some(target_slot) = self.slot(target_db_id) else {
+            return Vec::new();
+        };
+        let target_inst = target_slot.schema_instance_id;
+        let mut out = Vec::new();
+
+        if self.is_temp_open() {
+            for tr in &self.slots[1].schema.triggers {
+                if tr.is_active()
+                    && !tr.detached_to_temp
+                    && tr.target_schema_instance_id == Some(target_inst)
+                    && tr.tbl_name.eq_ignore_ascii_case(relation_name)
+                {
+                    out.push((DatabaseId::TEMP, tr.clone()));
+                }
+            }
+        }
+
+        if target_db_id != DatabaseId::TEMP && self.enable_trigger {
+            for tr in &target_slot.schema.triggers {
+                if tr.is_active() && tr.tbl_name.eq_ignore_ascii_case(relation_name) {
+                    out.push((target_db_id, tr.clone()));
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Re-synchronizes [`Self::temp_trigger_bindings`] from `slots[1].schema.triggers`.
+    pub fn sync_temp_trigger_bindings_from_schema(&mut self) {
+        self.temp_trigger_bindings.clear();
+        if !self.is_temp_open() {
+            return;
+        }
+        for tr in &self.slots[1].schema.triggers {
+            if tr.is_active()
+                && let Some(inst) = tr.target_schema_instance_id
+            {
+                self.temp_trigger_bindings.push(TempTriggerBinding {
+                    trigger_name: tr.name.clone(),
+                    target_schema_instance_id: inst,
+                    target_table_name: tr.tbl_name.clone(),
+                });
+            }
+        }
+    }
+
+    /// Resolves a `TEMP` trigger target relation as seen during `sqlite3InitOne(db, 1)` at
+    /// `trigger_rowid`: all permanent schemas (`main`, `attached`) are already loaded, while in
+    /// `TEMP` only tables/views with `schema_rowid < trigger_rowid` existed when the trigger was parsed.
+    fn find_relation_for_temp_trigger_init(
+        &self,
+        qname: &QualifiedName,
+        trigger_rowid: i64,
+    ) -> Result<Option<(DatabaseId, ResolvedRelation)>> {
+        if Schema::is_schema_table_name(&qname.name) {
+            return self.find_relation_in_set(qname);
+        }
+        let visible_in_slot = |db_id: DatabaseId, slot: &DbSlot| -> Option<ResolvedRelation> {
+            if let Some(tbl) = slot.schema.find_user_table(&qname.name)
+                && (db_id != DatabaseId::TEMP || tbl.schema_rowid < trigger_rowid)
+            {
+                return Some(ResolvedRelation::Table(Box::new(tbl.clone())));
+            }
+            if let Some(view) = slot.schema.find_view(&qname.name)
+                && (db_id != DatabaseId::TEMP || view.schema_rowid < trigger_rowid)
+            {
+                return Some(ResolvedRelation::View(Box::new(view.clone())));
+            }
+            None
+        };
+        if let Some(ref s) = qname.schema {
+            let Some(db_id) = self.find_db_id(s) else {
+                return Ok(None);
+            };
+            let Some(slot) = self.slot(db_id) else {
+                return Ok(None);
+            };
+            if slot.btree.is_none() {
+                return Ok(None);
+            }
+            Ok(visible_in_slot(db_id, slot).map(|rel| (db_id, rel)))
+        } else {
+            for db_id in self.unqualified_search_order() {
+                if let Some(slot) = self.slot(db_id)
+                    && let Some(rel) = visible_in_slot(db_id, slot)
+                {
+                    return Ok(Some((db_id, rel)));
+                }
+            }
+            Ok(None)
+        }
+    }
+
+    /// Reconciles `TEMP` triggers in `slots[1].schema.triggers` against the live [`DatabaseSet`].
+    ///
+    /// Any `TEMP` trigger whose target table/view is missing across `temp`, `main`, and attached
+    /// databases (or became incompatible, e.g. table replaced by view) is marked `is_orphan = true`
+    /// (`db->init.orphanTrigger = 1` in `sqlite/src/trigger.c:304-317`) without failing schema load!
+    pub fn reconcile_temp_triggers(&mut self) -> Result<()> {
+        if !self.is_temp_open() {
+            self.temp_trigger_bindings.clear();
+            return Ok(());
+        }
+        let writable_schema = self.slots[1]
+            .btree
+            .as_ref()
+            .is_some_and(Btree::writable_schema);
+        let candidates: Vec<(usize, i64, QualifiedName, TriggerTiming)> = self.slots[1]
+            .schema
+            .triggers
+            .iter()
+            .enumerate()
+            .map(|(idx, tr)| {
+                (
+                    idx,
+                    tr.schema_rowid,
+                    QualifiedName {
+                        schema: tr.on_table_schema.clone(),
+                        name: tr.tbl_name.clone(),
+                    },
+                    tr.timing,
+                )
+            })
+            .collect();
+
+        let mut resolved_states: Vec<(usize, bool, Option<SchemaInstanceId>)> =
+            Vec::with_capacity(candidates.len());
+        for (idx, trig_rowid, qn, timing) in candidates {
+            match self.find_relation_for_temp_trigger_init(&qn, trig_rowid) {
+                Ok(Some((found_db_id, rel))) => {
+                    let rel_name = match &rel {
+                        ResolvedRelation::Table(t) => t.name.as_str(),
+                        ResolvedRelation::View(v) => v.name.as_str(),
+                    };
+                    if is_reserved_trigger_or_system_name(rel_name)
+                        || is_reserved_trigger_or_system_name(&qn.name)
+                    {
+                        if !writable_schema {
+                            let trig_name = &self.slots[1].schema.triggers[idx].name;
+                            return Err(SqliteError::corrupt(format!(
+                                "malformed database schema ({trig_name}) - cannot create trigger on system table"
+                            )));
+                        }
+                        resolved_states.push((idx, true, None));
+                        continue;
+                    }
+                    let kind_mismatch = matches!(
+                        (&rel, timing),
+                        (
+                            ResolvedRelation::View(_),
+                            TriggerTiming::Before | TriggerTiming::After
+                        ) | (ResolvedRelation::Table(_), TriggerTiming::InsteadOf)
+                    );
+                    if kind_mismatch {
+                        resolved_states.push((idx, true, None));
+                    } else {
+                        let inst = self.slots[found_db_id.index()].schema_instance_id;
+                        resolved_states.push((idx, false, Some(inst)));
+                    }
+                }
+                _ => {
+                    // Orphan `TEMP` trigger (`db->init.orphanTrigger = 1`): retain safely without `Corrupt`!
+                    resolved_states.push((idx, true, None));
+                }
+            }
+        }
+
+        for (idx, is_orphan, target_inst) in resolved_states {
+            let tr = &mut self.slots[1].schema.triggers[idx];
+            tr.is_orphan = is_orphan;
+            tr.target_schema_instance_id = target_inst;
+            tr.detached_to_temp = false;
+        }
+        self.sync_temp_trigger_bindings_from_schema();
+        Ok(())
+    }
+
+    /// Reloads `slots[1]` (`TEMP`) after an in-connection DDL statement while preserving existing
+    /// in-memory `TEMP` trigger bindings (including `detached_to_temp` state from `DETACH DATABASE`).
+    pub fn reload_temp_schema_preserving_bindings(&mut self) -> Result<()> {
+        if !self.is_temp_open() {
+            self.temp_trigger_bindings.clear();
+            return Ok(());
+        }
+        let prior_states: Vec<(i64, bool, Option<SchemaInstanceId>, bool)> = self.slots[1]
+            .schema
+            .triggers
+            .iter()
+            .map(|tr| {
+                (
+                    tr.schema_rowid,
+                    tr.is_orphan,
+                    tr.target_schema_instance_id,
+                    tr.detached_to_temp,
+                )
+            })
+            .collect();
+        self.slots[1].reload_schema()?;
+        self.reconcile_temp_triggers()?;
+        for tr in &mut self.slots[1].schema.triggers {
+            if let Some(&(_, was_orphan, prior_inst, was_detached)) = prior_states
+                .iter()
+                .find(|(rowid, _, _, _)| *rowid == tr.schema_rowid)
+            {
+                tr.is_orphan = was_orphan;
+                tr.target_schema_instance_id = prior_inst;
+                tr.detached_to_temp = was_detached;
+            }
+        }
+        self.sync_temp_trigger_bindings_from_schema();
+        Ok(())
     }
 
     /// Implements `sqlite3_db_filename(db, zDbName)`: returns the canonical OS path for a named disk

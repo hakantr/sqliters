@@ -33,6 +33,12 @@ mod tests {
         assert!(is_complete(
             "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES(1); END;"
         ));
+        assert!(!is_complete(
+            "CREATE TEMP TRIGGER tr AFTER INSERT ON t WHEN CASE WHEN 1 THEN 1 END BEGIN SELECT CASE WHEN 1 THEN 2 END;"
+        ));
+        assert!(is_complete(
+            "CREATE TEMP TRIGGER tr AFTER INSERT ON t WHEN CASE WHEN 1 THEN 1 END BEGIN SELECT CASE WHEN 1 THEN 2 END; END;"
+        ));
     }
 
     #[test]
@@ -341,5 +347,85 @@ mod tests {
         assert!(upd.from.is_some());
         assert!(upd.selection.is_some());
         assert_eq!(upd.returning.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_create_and_drop_trigger_and_raise() {
+        let Stmt::CreateTrigger(ct) = parse_one(
+            "CREATE TEMPORARY TRIGGER IF NOT EXISTS \"tr.1\" /* c1 */ UPDATE OF a, \"b.c\" ON aux.t1 \
+             FOR EACH ROW WHEN new.a > 0 BEGIN \
+               SELECT RAISE(ABORT, 'bad: ' || new.a); -- c2\n\
+               INSERT INTO log AS l(x) VALUES(CASE WHEN new.a = 1 THEN 10 ELSE 20 END) ON CONFLICT(x) DO NOTHING; \
+               UPDATE log SET x = x + 1 FROM t2 WHERE x = old.a; \
+               DELETE FROM log WHERE x < 0; \
+             END ;",
+        )
+        .unwrap()
+        .0
+        .unwrap()
+        else {
+            panic!("expected CreateTrigger");
+        };
+        assert!(ct.temp);
+        assert!(ct.if_not_exists);
+        assert_eq!(ct.name, QualifiedName::unqualified("tr.1"));
+        assert_eq!(ct.name_token_text, "\"tr.1\"");
+        assert_eq!(ct.timing, TriggerTiming::Before);
+        assert_eq!(
+            ct.event,
+            TriggerEvent::Update {
+                columns: Some(vec!["a".to_owned(), "b.c".to_owned()])
+            }
+        );
+        assert_eq!(ct.on_table, QualifiedName::qualified("aux", "t1"));
+        assert!(ct.for_each_row);
+        assert!(ct.when_clause.is_some());
+        assert_eq!(ct.body.len(), 4);
+        assert!(
+            ct.catalog_sql
+                .starts_with("CREATE TRIGGER \"tr.1\" /* c1 */ UPDATE OF a")
+        );
+        assert!(ct.catalog_sql.ends_with("END"));
+
+        assert_eq!(
+            parse_one("DROP TRIGGER IF EXISTS main.tr1;").unwrap().0,
+            Some(Stmt::DropTrigger {
+                if_exists: true,
+                name: QualifiedName::qualified("main", "tr1"),
+            })
+        );
+
+        let err_idx = parse_one(
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t INDEXED BY i1 SET a = 1; END;",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err_idx.contains(
+                "the INDEXED BY clause is not allowed on UPDATE or DELETE statements within triggers"
+            ),
+            "{err_idx}"
+        );
+
+        let err_not_idx =
+            parse_one("CREATE TRIGGER tr AFTER INSERT ON t BEGIN DELETE FROM t NOT INDEXED; END;")
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err_not_idx.contains(
+                "the NOT INDEXED clause is not allowed on UPDATE or DELETE statements within triggers"
+            ),
+            "{err_not_idx}"
+        );
+
+        let err_ret = parse_one(
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO t VALUES(1) RETURNING *; END;",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err_ret.contains("cannot use RETURNING in a trigger"),
+            "{err_ret}"
+        );
     }
 }

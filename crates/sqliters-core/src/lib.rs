@@ -7,6 +7,7 @@ pub mod db_set;
 pub mod engine;
 pub mod execution_context;
 pub mod schema;
+pub mod trigger;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -58,6 +59,7 @@ pub use execution_context::{
     MutationRow, ProgressCallback, ProgressTracker, ScalarFunctionCallback, ScalarFunctionDef,
 };
 pub use schema::{ColumnSchema, ForeignKeySchema, IndexSchema, Schema, TableSchema, ViewSchema};
+pub use trigger::{SQLITE_MAX_TRIGGER_DEPTH, SQLITE_MAX_TRIGGER_STEPS, TriggerSchema};
 
 /// Maximum automatic `PrepareMode::V2` schema-change reprepare retries (`SQLITE_MAX_SCHEMA_RETRY`).
 const SQLITE_MAX_SCHEMA_RETRY: usize = 50;
@@ -900,6 +902,7 @@ impl ConnectionInner {
                 slot.schema = fresh;
             }
         }
+        self.db_set.sync_temp_trigger_bindings_from_schema();
     }
 
     /// Ensures `sqlite_schema` catalogs across open database slots are loaded for `prepare`,
@@ -973,6 +976,7 @@ impl ConnectionInner {
             }
         }
         if any_changed {
+            self.db_set.reconcile_temp_triggers()?;
             self.schema_generation += 1;
             self.v1_expire_generation += 1;
         }
@@ -1003,6 +1007,7 @@ impl ConnectionInner {
             }
         }
         if any_changed {
+            self.db_set.reconcile_temp_triggers()?;
             self.schema_generation += 1;
             self.v1_expire_generation += 1;
         }
@@ -1399,6 +1404,7 @@ impl ConnectionInner {
                             slot.schema = s;
                         }
                     }
+                    let _ = self.db_set.reconcile_temp_triggers();
                     self.schema_generation += 1;
                     self.v1_expire_generation += 1;
                 }
@@ -2639,6 +2645,92 @@ impl Connection {
         }
     }
 
+    /// Queries (`enabled = None`) or updates (`enabled = Some(...)`) `SQLITE_DBCONFIG_ENABLE_TRIGGER`,
+    /// returning the current/updated state.
+    pub fn db_config_enable_trigger(&self, enabled: Option<bool>) -> bool {
+        if let Ok(mut session) = self.shared.enter() {
+            if session.inner().ensure_usable().is_err() {
+                return true;
+            }
+            if let Some(flag) = enabled {
+                let inner = session.inner_mut();
+                let prev = inner.db_set.enable_trigger();
+                let cur = inner.db_set.set_enable_trigger(flag);
+                if prev != cur {
+                    inner.schema_generation += 1;
+                }
+                cur
+            } else {
+                session.inner().db_set.enable_trigger()
+            }
+        } else {
+            true
+        }
+    }
+
+    /// Queries (`limit < 0`) or updates (`limit >= 0`, clamped to `0..=SQLITE_MAX_TRIGGER_STEPS`)
+    /// `SQLITE_LIMIT_TRIGGER_STEPS`, returning the **previous** limit.
+    pub fn set_trigger_steps_limit(&self, limit: isize) -> usize {
+        if let Ok(mut session) = self.shared.enter() {
+            if session.inner().ensure_usable().is_err() {
+                return SQLITE_MAX_TRIGGER_STEPS;
+            }
+            let prev = session.inner().db_set.trigger_steps_limit();
+            if limit >= 0 {
+                let inner = session.inner_mut();
+                let actual = inner.db_set.set_trigger_steps_limit(limit as usize);
+                if actual != prev {
+                    inner.schema_generation += 1;
+                }
+            }
+            prev
+        } else {
+            SQLITE_MAX_TRIGGER_STEPS
+        }
+    }
+
+    /// Queries (`limit < 0`) or updates (`limit >= 0`, clamped to `1..=SQLITE_MAX_TRIGGER_DEPTH`)
+    /// `SQLITE_LIMIT_TRIGGER_DEPTH`, returning the **previous** limit.
+    pub fn set_trigger_depth_limit(&self, limit: isize) -> usize {
+        if let Ok(mut session) = self.shared.enter() {
+            if session.inner().ensure_usable().is_err() {
+                return SQLITE_MAX_TRIGGER_DEPTH;
+            }
+            let prev = session.inner().db_set.trigger_depth_limit();
+            if limit >= 0 {
+                let inner = session.inner_mut();
+                let actual = inner.db_set.set_trigger_depth_limit(limit as usize);
+                if actual != prev {
+                    inner.schema_generation += 1;
+                }
+            }
+            prev
+        } else {
+            SQLITE_MAX_TRIGGER_DEPTH
+        }
+    }
+
+    /// Returns all active triggers attached to `(target_db_id, relation_name)` (`TEMP` triggers
+    /// followed by permanent triggers in `target_db_id`).
+    pub fn triggers_for_relation(
+        &self,
+        target_db_id: DatabaseId,
+        relation_name: &str,
+    ) -> Vec<(DatabaseId, TriggerSchema)> {
+        if let Ok(mut session) = self.shared.enter() {
+            let inner = session.inner_mut();
+            if inner.ensure_usable().is_err() {
+                return Vec::new();
+            }
+            let _ = inner.ensure_schemas_loaded_for_prepare(true);
+            inner
+                .db_set
+                .triggers_for_relation(target_db_id, relation_name)
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Queries (`limit < 0`) or updates (`limit >= 0`, clamped to `0..=SQLITE_MAX_EXPR_DEPTH`)
     /// `SQLITE_LIMIT_EXPR_DEPTH`, returning the **previous** limit.
     pub fn set_expr_depth_limit(&self, limit: isize) -> usize {
@@ -3660,6 +3752,25 @@ fn target_write_db_for_stmt(stmt: &Stmt, db_set: &DatabaseSet) -> Option<Databas
                 Some(DatabaseId::MAIN)
             }
         }
+        Stmt::CreateTrigger(ct) => {
+            if ct.temp {
+                Some(DatabaseId::TEMP)
+            } else if let Some(ref s) = ct.name.schema {
+                db_set.find_db_id(s)
+            } else if matches!(
+                db_set.find_relation_in_set(&ct.on_table),
+                Ok(Some((DatabaseId::TEMP, _)))
+            ) {
+                Some(DatabaseId::TEMP)
+            } else {
+                Some(DatabaseId::MAIN)
+            }
+        }
+        Stmt::DropTrigger { name, .. } => db_set
+            .find_trigger_in_set(name)
+            .map(|(id, _)| id)
+            .or_else(|| name.schema.as_deref().and_then(|s| db_set.find_db_id(s)))
+            .or(Some(DatabaseId::MAIN)),
         Stmt::DropTable { name, .. }
         | Stmt::DropView { name, .. }
         | Stmt::AlterTable { table: name, .. } => resolve_qn_table(name),
@@ -3733,6 +3844,11 @@ fn is_noop_if_exists_ddl(stmt: &Stmt, db_set: &DatabaseSet) -> bool {
                     && (sl.schema.find_user_table(&cv.name.name).is_some()
                         || sl.schema.find_view(&cv.name.name).is_some())
             }),
+        Stmt::CreateTrigger(ct) if ct.if_not_exists => target_write_db_for_stmt(stmt, db_set)
+            .and_then(|id| db_set.slot(id))
+            .is_some_and(|sl| {
+                sl.btree.is_some() && sl.schema.find_trigger(&ct.name.name).is_some()
+            }),
         Stmt::CreateIndex(ci) if ci.if_not_exists => target_write_db_for_stmt(stmt, db_set)
             .and_then(|id| db_set.slot(id))
             .is_some_and(|sl| sl.btree.is_some() && sl.schema.find_index(&ci.name.name).is_some()),
@@ -3758,6 +3874,10 @@ fn is_noop_if_exists_ddl(stmt: &Stmt, db_set: &DatabaseSet) -> bool {
             }
             matches!(db_set.find_relation_in_set(name), Ok(None))
         }
+        Stmt::DropTrigger {
+            if_exists: true,
+            name,
+        } => db_set.find_trigger_in_set(name).is_none(),
         Stmt::DropIndex {
             if_exists: true,
             name,

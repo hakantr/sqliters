@@ -158,6 +158,11 @@ pub enum Stmt {
         if_exists: bool,
         name: QualifiedName,
     },
+    CreateTrigger(CreateTriggerStmt),
+    DropTrigger {
+        if_exists: bool,
+        name: QualifiedName,
+    },
     AlterTable {
         table: QualifiedName,
         action: AlterTableAction,
@@ -332,6 +337,49 @@ pub struct CreateViewStmt {
     /// Normalized catalog SQL (`"CREATE VIEW <name>..."`) without `TEMP`, `IF NOT EXISTS`, or `schema.` (`sqlite/src/build.c`).
     pub catalog_sql: String,
     /// Original `CREATE VIEW ...` SQL text as written by the caller.
+    pub raw_sql: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TriggerTiming {
+    #[default]
+    Before,
+    After,
+    InsteadOf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TriggerEvent {
+    Insert,
+    Delete,
+    Update { columns: Option<Vec<String>> },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TriggerStep {
+    Select(SelectStmt),
+    Insert(InsertStmt),
+    Update(UpdateStmt),
+    Delete(DeleteStmt),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTriggerStmt {
+    pub temp: bool,
+    pub if_not_exists: bool,
+    pub name: QualifiedName,
+    /// Raw lexical token text of the unqualified trigger name (`%T` in `sqlite/src/trigger.c` diagnostics).
+    pub name_token_text: String,
+    pub timing: TriggerTiming,
+    pub event: TriggerEvent,
+    pub on_table: QualifiedName,
+    pub for_each_row: bool,
+    pub when_clause: Option<Expr>,
+    pub body: Vec<TriggerStep>,
+    /// Normalized catalog SQL (`"CREATE TRIGGER <name>...END"`) without `TEMP`, `IF NOT EXISTS`,
+    /// or trigger `schema.` (`sqlite3FinishTrigger` in `sqlite/src/trigger.c`).
+    pub catalog_sql: String,
+    /// Original `CREATE TRIGGER ...` SQL text as written by the caller.
     pub raw_sql: String,
 }
 

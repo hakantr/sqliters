@@ -8,13 +8,19 @@ use sqliters_syntax::{
     ColumnConstraint, ColumnDef, ColumnRef, CommonTableExpr, ConflictAction, CreateIndexStmt,
     CreateTableStmt, Expr, FromClause, FunctionArgs, IndexedColumn, JoinClause, JoinConstraint,
     LimitClause, OrderByTerm, QualifiedName, ResultColumn, SelectBody, SelectCore, SelectStmt,
-    Stmt, TableConstraint, TableOrSubquery, parse_one,
+    Stmt, TableConstraint, TableOrSubquery, TriggerTiming, parse_one,
 };
 use sqliters_types::{
     Collation, ErrorCode, ExecutionServices, KeySortOrder, Pgno, Result, SqliteError, TypeAffinity,
     Value, decode_record_with_encoding, encode_record_with_encoding,
 };
 use sqliters_vdbe::P4;
+
+use crate::trigger::{
+    TriggerSchema, fix_permanent_trigger, is_reserved_trigger_or_system_name,
+    reject_raise_outside_trigger_expr, replace_bind_params_with_null_in_trigger,
+    validate_trigger_body_dml_targets,
+};
 
 #[derive(Debug, Clone)]
 pub struct CheckSchema {
@@ -369,12 +375,13 @@ pub struct ViewSchema {
     pub raw_sql: String,
 }
 
-/// Complete in-memory catalog of tables, indexes, and views loaded from `sqlite_schema` (Page 1).
+/// Complete in-memory catalog of tables, indexes, views, and triggers loaded from `sqlite_schema` (Page 1).
 #[derive(Debug, Clone, Default)]
 pub struct Schema {
     pub tables: Vec<TableSchema>,
     pub indexes: Vec<IndexSchema>,
     pub views: Vec<ViewSchema>,
+    pub triggers: Vec<TriggerSchema>,
     pub schema_cookie: u32,
     pub loaded: bool,
     pub had_pages: bool,
@@ -457,6 +464,30 @@ impl Schema {
             .collect()
     }
 
+    pub fn find_trigger(&self, name: &str) -> Option<&TriggerSchema> {
+        self.triggers
+            .iter()
+            .find(|tr| tr.is_active() && tr.name.eq_ignore_ascii_case(name))
+    }
+
+    pub fn find_trigger_mut(&mut self, name: &str) -> Option<&mut TriggerSchema> {
+        self.triggers
+            .iter_mut()
+            .find(|tr| tr.is_active() && tr.name.eq_ignore_ascii_case(name))
+    }
+
+    pub fn triggers_for_table(&self, table_name: &str) -> Vec<TriggerSchema> {
+        self.triggers
+            .iter()
+            .filter(|tr| {
+                tr.is_active()
+                    && !tr.detached_to_temp
+                    && tr.tbl_name.eq_ignore_ascii_case(table_name)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Returns all active B-Tree root page numbers (`[1, tables..., indexes...]`) for `PRAGMA integrity_check`.
     pub fn all_btree_roots(&self) -> Vec<Pgno> {
         let mut roots = vec![1];
@@ -516,6 +547,7 @@ impl Schema {
                 tables: Vec::new(),
                 indexes: Vec::new(),
                 views: Vec::new(),
+                triggers: Vec::new(),
                 schema_cookie: btree.pager().header().schema_cookie,
                 loaded: true,
                 had_pages: false,
@@ -538,6 +570,7 @@ impl Schema {
         let mut views = Vec::new();
         let mut pending_auto_by_table: Vec<(String, Vec<PendingAutoIndex>)> = Vec::new();
         let mut raw_index_rows: Vec<(i64, String, String, Pgno, Option<String>)> = Vec::new();
+        let mut raw_trigger_rows: Vec<(i64, String, String, Option<String>)> = Vec::new();
 
         for (rowid, payload) in raw_rows {
             let cols = decode_record_with_encoding(&payload, enc)?;
@@ -629,9 +662,185 @@ impl Schema {
                         });
                     }
                 }
-                _ => {
-                    // Triggers ignored until Phase 4
+                "trigger" => {
+                    raw_trigger_rows.push((rowid, name, tbl_name, sql_opt));
                 }
+                _ => {}
+            }
+        }
+
+        let is_temp_schema = db_schema_name.is_some_and(|s| s.eq_ignore_ascii_case("temp"));
+        let mut triggers: Vec<TriggerSchema> = Vec::new();
+        for (rowid, trig_name, tbl_name_col, sql_opt) in raw_trigger_rows {
+            let Some(sql_text) = sql_opt else {
+                continue;
+            };
+            let mut ct = match parse_one(&sql_text) {
+                Ok((Some(Stmt::CreateTrigger(ct)), _)) => ct,
+                Err(e) => {
+                    if writable_schema {
+                        continue;
+                    }
+                    return Err(SqliteError::corrupt(format!(
+                        "malformed database schema ({trig_name}) - {}",
+                        e.message
+                    )));
+                }
+                _ => {
+                    if writable_schema {
+                        continue;
+                    }
+                    return Err(SqliteError::corrupt("database disk image is malformed"));
+                }
+            };
+
+            // `fixExprCb` (`attach.c:484-485`): bound variables in stored catalog triggers become `NULL`.
+            replace_bind_params_with_null_in_trigger(&mut ct.when_clause, &mut ct.body);
+
+            if let Err(e) = validate_trigger_body_dml_targets(&ct.body) {
+                if writable_schema {
+                    continue;
+                }
+                return Err(SqliteError::corrupt(format!(
+                    "malformed database schema ({trig_name}) - {}",
+                    e.message
+                )));
+            }
+
+            if !writable_schema && is_reserved_trigger_or_system_name(&trig_name) {
+                return Err(SqliteError::corrupt(format!(
+                    "malformed database schema ({trig_name}) - object name reserved for internal use: {trig_name}"
+                )));
+            }
+
+            if triggers
+                .iter()
+                .any(|t| t.is_active() && t.name.eq_ignore_ascii_case(&trig_name))
+            {
+                if writable_schema {
+                    continue;
+                }
+                return Err(SqliteError::corrupt(format!(
+                    "malformed database schema ({trig_name}) - trigger {} already exists",
+                    ct.name_token_text
+                )));
+            }
+
+            if !is_temp_schema {
+                // `trigger.c:155-160`: ignore any schema prefix on `ON <schema>.<table>` when loading a permanent trigger.
+                ct.on_table.schema = None;
+                let sname_disp = db_schema_name.unwrap_or("main");
+                let target_is_table = tables
+                    .iter()
+                    .any(|t| t.name.eq_ignore_ascii_case(&ct.on_table.name));
+                let target_is_view = !target_is_table
+                    && views
+                        .iter()
+                        .any(|v| v.name.eq_ignore_ascii_case(&ct.on_table.name));
+                if !target_is_table && !target_is_view {
+                    if writable_schema {
+                        continue;
+                    }
+                    return Err(SqliteError::corrupt(format!(
+                        "malformed database schema ({trig_name}) - no such table: {sname_disp}.{}",
+                        ct.on_table.name
+                    )));
+                }
+                if is_reserved_trigger_or_system_name(&ct.on_table.name) {
+                    if writable_schema {
+                        continue;
+                    }
+                    return Err(SqliteError::corrupt(format!(
+                        "malformed database schema ({trig_name}) - cannot create trigger on system table"
+                    )));
+                }
+                if target_is_view && ct.timing != TriggerTiming::InsteadOf {
+                    if writable_schema {
+                        continue;
+                    }
+                    let tm_str = if ct.timing == TriggerTiming::Before {
+                        "BEFORE"
+                    } else {
+                        "AFTER"
+                    };
+                    return Err(SqliteError::corrupt(format!(
+                        "malformed database schema ({trig_name}) - cannot create {tm_str} trigger on view: {}",
+                        ct.on_table.name
+                    )));
+                }
+                if target_is_table && ct.timing == TriggerTiming::InsteadOf {
+                    if writable_schema {
+                        continue;
+                    }
+                    return Err(SqliteError::corrupt(format!(
+                        "malformed database schema ({trig_name}) - cannot create INSTEAD OF trigger on table: {}",
+                        ct.on_table.name
+                    )));
+                }
+
+                let (fixed_when, fixed_body) = if let Some(sname) = db_schema_name {
+                    match fix_permanent_trigger(
+                        &trig_name,
+                        sname,
+                        ct.when_clause.as_ref(),
+                        &ct.body,
+                    ) {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            if writable_schema {
+                                continue;
+                            }
+                            return Err(SqliteError::corrupt(format!(
+                                "malformed database schema ({trig_name}) - {}",
+                                e.message
+                            )));
+                        }
+                    }
+                } else {
+                    (ct.when_clause, ct.body)
+                };
+
+                let effective_tbl = if tbl_name_col.is_empty() {
+                    ct.on_table.name
+                } else {
+                    tbl_name_col
+                };
+                triggers.push(TriggerSchema {
+                    schema_rowid: rowid,
+                    name: trig_name,
+                    tbl_name: effective_tbl,
+                    on_table_schema: None,
+                    target_schema_instance_id: None,
+                    detached_to_temp: false,
+                    is_orphan: false,
+                    timing: ct.timing,
+                    event: ct.event,
+                    when_clause: fixed_when,
+                    body: fixed_body,
+                    raw_sql: sql_text,
+                });
+            } else {
+                // `TEMP` trigger: target table/view may reside in `temp`, `main`, or an `attached` DB
+                // (or may have been dropped by another connection -> `orphanTrigger`).
+                let effective_tbl = if tbl_name_col.is_empty() {
+                    ct.on_table.name
+                } else {
+                    tbl_name_col
+                };
+                triggers.push(TriggerSchema {
+                    schema_rowid: rowid,
+                    name: trig_name,
+                    tbl_name: effective_tbl,
+                    on_table_schema: ct.on_table.schema,
+                    target_schema_instance_id: None,
+                    detached_to_temp: false,
+                    is_orphan: false,
+                    timing: ct.timing,
+                    event: ct.event,
+                    when_clause: ct.when_clause,
+                    body: ct.body,
+                    raw_sql: sql_text,
+                });
             }
         }
 
@@ -687,6 +896,7 @@ impl Schema {
             tables,
             indexes,
             views,
+            triggers,
             schema_cookie: btree.pager().header().schema_cookie,
             loaded: true,
             had_pages: true,
@@ -772,8 +982,9 @@ pub fn build_table_schema_from_ast(
                         expr: expr.clone(),
                     });
                 }
-                ColumnConstraint::Generated { expr, stored } => {
-                    generated = Some((expr.clone(), *stored));
+                ColumnConstraint::Generated { expr: e, stored: s } => {
+                    reject_raise_outside_trigger_expr(e)?;
+                    generated = Some((e.clone(), *s));
                 }
                 ColumnConstraint::Collate(cname) => {
                     collation = Collation::from_name(cname).ok_or_else(|| {
@@ -1152,6 +1363,14 @@ pub fn build_index_schema_from_ast(
     tbl: &TableSchema,
     root_pgno: Pgno,
 ) -> Result<IndexSchema> {
+    for ic in &ci.columns {
+        if let Some(ref ie) = ic.expr {
+            reject_raise_outside_trigger_expr(ie)?;
+        }
+    }
+    if let Some(ref wc) = ci.where_clause {
+        reject_raise_outside_trigger_expr(wc)?;
+    }
     let resolved = resolve_indexed_columns(&tbl.columns, &ci.columns, true)?;
     let mut trailing_pk_cols = Vec::new();
     if tbl.without_rowid {
@@ -1241,6 +1460,9 @@ pub fn build_column_schema_from_def(
             ColumnConstraint::Default(e) => {
                 default_expr = Some(e.clone());
             }
+            ColumnConstraint::Check { expr, .. } => {
+                reject_raise_outside_trigger_expr(expr)?;
+            }
             ColumnConstraint::Generated { expr, stored } => {
                 if *stored {
                     return Err(SqliteError::new(
@@ -1248,6 +1470,7 @@ pub fn build_column_schema_from_def(
                         "cannot add a STORED column",
                     ));
                 }
+                reject_raise_outside_trigger_expr(expr)?;
                 generated = Some((expr.clone(), false));
             }
             ColumnConstraint::Collate(cname) => {
