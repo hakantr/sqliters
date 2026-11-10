@@ -53,7 +53,7 @@
     "Rust native API backend"
   ],
   "performance_status": "NOT_RUN",
-  "measurement_implementation_ready": false,
+  "measurement_implementation_ready": true,
   "frozen_uuid7": {
     "base_ms": 1735689600000,
     "parents": 3000,
@@ -72,7 +72,7 @@
       "family": "CLI process+query+all output",
       "load_input_db": "outside timer",
       "golden": "frozen join expected; indexed/noindex metamorphic equality",
-      "implementation_status": "2A required; timing NOT_RUN"
+      "implementation_status": "implemented; timing NOT_RUN pending reviewed 2A commit"
     }
   },
   "live": {
@@ -89,6 +89,28 @@
     "sessions": 2,
     "repeats": 3,
     "oracle": "same-run event log plus structural invariants; never cross-run data/output hashes",
-    "timing_status": "NOT_RUN"
+    "timing_status": "NOT_RUN",
+    "commit_modes": [
+      "autocommit",
+      "batch"
+    ]
+  },
+  "cpu": 2,
+  "resource_scope": {
+    "RSS": "hard RLIMIT_AS per worker",
+    "disk": "8GiB per-run output sandbox; immutable input/build bundle excluded",
+    "time": "hard owned process-group case timeout and global run deadline"
+  },
+  "historical_compare": {
+    "max_load1_delta": 1.0,
+    "runtime_fields": [
+      "platform",
+      "cpu_model",
+      "cpu",
+      "governor",
+      "SMT_siblings",
+      "cache"
+    ],
+    "ratio_scope": "historical descriptive/diagnostic; never contemporaneous A/B"
   }
 }

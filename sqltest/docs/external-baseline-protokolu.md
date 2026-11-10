@@ -192,3 +192,65 @@ uymalı. Native API query latency Rust CLI process süresine oranlanmaz.
 Actual runner 2A review/commit sonrasıdır; bu hazırlıkta zaman yoktur. Index'in
 her zaman hızlandırdığı varsayılmaz. RFC9562 A.6 v7 vector'ü ayrı Python
 kontrolüdür; fixed epoch milisaniyesi integer+timedelta ile üretilir.
+
+
+## 2A runner / audit sözleşmesi (ilk duration öncesi)
+
+Bu kod adımında benchmark/latency/calibration çalıştırılmaz. 2A kaynak/config/
+freeze/preflight ebeveynce commit edildikten sonra ayrı 2B yetkisiyle C-only
+baseline başlatılır. Admission, reviewed commit'teki bütün kullanılan Python
+kaynakları/config/protokol/manifest baytlarını karşılaştırır; input/source/
+binary drift, başarısız freeze/preflight ve eksik golden kapıyı kapatır.
+
+Önce tam **168 untimed correctness işi** geçmelidir: core75, boundary72,
+wide3, append1, frozenUUID3, optional4, conflict3, compositeFK1, generated1,
+reopen4, relational-stress1. Legacy üç wide workload aynı full-wide +
+precomputed typed mutation case'ine açıkça eşlenir; eski CTE veri yükleyicisi
+benchmark'a sokulmaz. WAL/crash/UDF/hooks/backup/blob tarifleri gerçek backend
+olmadığından NOT_RUN; 168 sayısına sahte PASS olarak eklenmez.
+
+Sonra her session/case/seed için bir untimed fresh-DB warmup ve **222 timed
+sample**: ingestion9×3seed×2session×3repeat=162; frozenUUID forced-index/noindex
+CLI query2×3×2×3=36; LIVE ikiUUIDmode×autocommit/batch×2×3=24. LIVE batch1000,
+parent1000/detail3000; batch row-step commit latency değildir. Client generation,
+DB bind/step/reset+commit ve e2e ayrı; DB DEFAULT UUID/time üretimi SQLite step
+maliyetinin içindedir, izole generation zamanı diye uydurulmaz. API CSV read/
+decode ve reused prepared-prepare loop dışında; exec-auto'da her row prepare/
+finalize gerçek row süresindedir. Bulk ns/row sample ortalamasının dağılımı,
+gerçek row P50/P95 olarak etiketlenmez.
+
+Worker kendi process group'unda; 2 GiB hard RLIMIT_AS, 8 GiB file upper bound;
+parent ayrıca **yalnız yeni run output sandbox'ı** toplamını 8 GiB sınırlar
+(immutable input/build bundle ayrı). Case600s/global3600s bütçesi setup,
+correctness ve warmup dahil gerçek deadline'dır; aşımda owned group kill/reap,
+TIMEOUT/RESOURCE ve RUNNING→FAIL kaydı. PID/argv/exit/CPU affinity/load/RSS,
+source/build/config/protocol/commit ve ham event/row/batch dosyaları saklanır.
+Yeni run global summary'yi RUNNING/FAIL ile günceller; eski bundle korunur.
+
+Bağımsız read-only audit ham result dosyalarından benzersiz222 anahtarı,
+168 correctness matrix'i, tam type/field/hash/golden, error stage/extended/
+offset/transaction durumunu ve percentile/istatistiği yeniden hesaplar. LIVE
+aynı-run requested events + readback/UTC/FK/JOIN/cents ile denetlenir; live
+value/file SHA hiçbir cross-run oracle değildir.
+
+Gelecek candidate-only CLI performance **126 sample**: aynı frozen order'ın
+CLI5×3×2×3=90 alt kümesi + UUID36; aynı dış Python pipeline, own SELECT ve
+actual C baseline golden'ı gerekir. API/LIVE native backend yoksa NOT_RUN.
+C library candidate validation yolunda açılmaz, baseline yeniden üretilmez.
+C baseline ile sonraki candidate tarihi farklıdır: oran historical/descriptive;
+contemporaneous A/B veya kanıtlanmış genel kazanç değildir. CPU/OS/governor/
+affinity/cache ve load1 farkı (ön sınır1.0) kaydedilir; koşullar uyuşmazsa
+comparable_environment=false, oran diagnostic kalır. Candidate compiler/flags
+kullanıcı sağlamadıysa bilinmiyor olarak işaretlenir. Audit candidate JSON/CSV
+sürelerini de raw126 dosyadan yeniden hesaplar.
+
+
+2A resource sınırları yalnız owned run output için uygulanır; immutable input/
+build cache 8GiB output kotasına dahil değildir. Full correctness kaynak/input
+SHA'ları timingden hemen önce yeniden denetlenir. Candidate eskiCbaseline'ın
+library'sini açmadan pure file audit yapar; cachedC/API/LIVE oranı uydurulmaz.
+
+UUID CLI-query e2e her yeni query bağlantısında frozen settings/readback ve
+marker'ı da içerir: WAL/NORMAL/autockpt0 doğrulanmadan typed sonuç kabul edilmez.
+Bu sabit startup+configuration+query+bütün çıktı pipeline'ı C ve candidate'da
+aynıdır; DB fixture yüklemesi timer dışındadır.

@@ -59,6 +59,9 @@ def prepare():
         producer_sources=sources()
         write(DATA/'settings.txt',SETTINGS);write(DATA/'readback.txt',READBACK)
         write(DATA/'schema.txt',SCHEMA);write(DATA/'stage-schema.txt',STAGE);write(DATA/'transform.txt',TRANSFORM)
+        rawfields=["'T:'||lower(hex("+name+"))" for name in HEADER]
+        write(DATA/'cli-raw-verify.txt','.bail on\n.mode list\n.headers off\nSELECT '+"||char(9)||".join(rawfields)+' FROM stage ORDER BY CAST(id AS INTEGER);\n','CLI_raw_CSV_own_select')
+        write(DATA/'cli-transform-only.txt',dotread(DATA/'schema.txt')+dotread(DATA/'transform.txt'),'CLI_typed_transform')
         write(DATA/'insert-template.txt','INSERT INTO bench VALUES('+','.join('?' for _ in range(7))+');\n')
         write(DATA/'select.txt',QUERY);write(DATA/'quit.txt','.quit\n')
         cli_fields=["'I:'||CAST(id AS TEXT)","CASE WHEN g IS NULL THEN 'N' ELSE 'I:'||CAST(g AS TEXT) END","CASE WHEN n IS NULL THEN 'N' ELSE 'I:'||CAST(n AS TEXT) END","'RDEC:'||printf('%!.26g',r)","CASE WHEN name IS NULL THEN 'N' ELSE 'T:'||lower(hex(name)) END","CASE WHEN note IS NULL THEN 'N' ELSE 'T:'||lower(hex(note)) END","'B:'||lower(hex(b))"]
@@ -94,11 +97,11 @@ def prepare():
                         for start in range(0,count,size):chunks+=['BEGIN;\n',*sql[start:start+size],'COMMIT;\n']
                     write(folder/f'insert-{mode}.txt',''.join(chunks),'frozen_insert_script',rows=count)
                 imported='.bail on\n'+dotread(DATA/'settings.txt')+dotread(DATA/'stage-schema.txt')+'.import --csv --skip 1 '+rel(csvpath)+' stage\n'
-                write(folder/'import.txt',imported,'native_cli_import_driver',rows=count)
-                write(folder/'import-typed.txt',imported+dotread(DATA/'schema.txt')+dotread(DATA/'transform.txt'),'native_cli_import_typed_driver',rows=count)
+                write(folder/'import.txt',imported+dotread(DATA/'readback.txt'),'native_cli_import_driver',rows=count)
+                write(folder/'import-typed.txt',imported+dotread(DATA/'schema.txt')+dotread(DATA/'transform.txt')+dotread(DATA/'readback.txt'),'native_cli_import_typed_driver',rows=count)
                 for mode in ['auto','batch','one-txn']:
-                    write(folder/f'read-{mode}.txt','.bail on\n'+dotread(DATA/'settings.txt')+dotread(DATA/'schema.txt')+dotread(folder/f'insert-{mode}.txt'),'native_cli_read_driver',rows=count)
-                write(folder/'persistent-start.txt','.bail on\n'+dotread(DATA/'settings.txt')+dotread(DATA/'schema.txt')+'.print SQLTEST_READY\n','frozen_persistent_start')
+                    write(folder/f'read-{mode}.txt','.bail on\n'+dotread(DATA/'settings.txt')+dotread(DATA/'schema.txt')+dotread(folder/f'insert-{mode}.txt')+dotread(DATA/'readback.txt'),'native_cli_read_driver',rows=count)
+                write(folder/'persistent-start.txt','.bail on\n'+dotread(DATA/'settings.txt')+dotread(DATA/'schema.txt')+dotread(DATA/'readback.txt')+'.print SQLTEST_READY\n','frozen_persistent_start')
                 for mode in ['auto','batch']:
                     write(folder/f'persistent-{mode}.txt',dotread(folder/f'insert-{mode}.txt')+'SELECT count(*) FROM bench;\n.print SQLTEST_DONE\n','frozen_persistent_commands',rows=count)
                 datasets[f'{seed}-{label}']={'folder':str(folder.relative_to(ROOT)),'rows':count,'seed':seed,'id_range':[offset+1,offset+count]}
@@ -109,32 +112,43 @@ def prepare():
             write(folder/'schema.txt','CREATE TABLE wide('+','.join(columns)+');\n')
             write(folder/'insert-template.txt','INSERT INTO wide VALUES('+','.join('?' for _ in columns)+');\n')
             write(folder/'select.txt','SELECT '+','.join(columns)+' FROM wide ORDER BY rowid;\n')
-            paths={name:folder/name for name in ['rows.csv','expected.txt','row-statements.txt','insert-one-txn.txt']}
+            paths={name:folder/name for name in ['rows.csv','expected.txt','row-statements.txt','insert-one-txn.txt','mutated-expected.txt']}
             rng=Random64(cfg['seeds'][0]^width)
-            with out(paths['rows.csv']).open('w',newline='') as cs, out(paths['expected.txt']).open('wb') as es, out(paths['row-statements.txt']).open('w') as ss, out(paths['insert-one-txn.txt']).open('w') as ts:
+            with out(paths['rows.csv']).open('w',newline='') as cs, out(paths['expected.txt']).open('wb') as es, out(paths['row-statements.txt']).open('w') as ss, out(paths['insert-one-txn.txt']).open('w') as ts, out(paths['mutated-expected.txt']).open('wb') as ms:
                 writer=csv.writer(cs,lineterminator='\r\n');writer.writerow(columns);ts.write('BEGIN;\n')
                 for row_id in range(cfg['wide_rows']):
                     v=[]
                     for i in range(width):
                         x=rng.next();tag=x%7
                         v.append(None if tag==0 else -(1<<63) if tag==1 else (1<<63)-1 if tag==2 else (x%1000000)/8.0 if tag==3 else 'col-'+str(i)+'-東京' if tag==4 else x.to_bytes(8,'big') if tag==5 else int(x%1000000))
+                    mutated=v.copy()
+                    if (row_id+1)%3==0:mutated[0]=row_id+1;mutated[width//2]='updated-'+format(row_id+1,'08d');mutated[-1]=format(row_id+1,'08x').encode()
+                    ms.write(wire(mutated))
                     encoded=wire(v);writer.writerow(encoded.decode().rstrip('\n').split('\t'));es.write(encoded)
                     statement='INSERT INTO wide VALUES('+','.join(literal(x) for x in v)+');\n';ss.write(statement);ts.write(statement)
                 ts.write('COMMIT;\n')
             for name,path in paths.items():add(path,'precomputed_wide_'+name,rows=cfg['wide_rows'],fields=width)
+            source_workload=ROOT/f'artifacts/generated/full/stress/wide-{width}-workload.sql'
+            write(folder/'workload.txt',source_workload.read_text().replace('wide_'+str(width),'wide'),'mapped_wide_mutation_workload')
             datasets[f'wide-{width}']={'folder':str(folder.relative_to(ROOT)),'rows':cfg['wide_rows'],'columns':width}
         from uuid_family import create
         for seed in cfg['seeds']:
             for label,smoke in [('full',False),('smoke',True)]:
                 uuid_files,meta=create(seed,cfg['frozen_uuid7'],smoke=smoke)
                 uuid_folder=DATA/f'uuid7-{seed}-{label}'
+                for query_leaf in ['join-cli-index.txt','join-cli-noindex.txt']:
+                    uuid_files[query_leaf]=uuid_files[query_leaf].replace('.headers off\n','.headers off\n'+dotread(DATA/'settings.txt')+dotread(DATA/'readback.txt')+'.print SQLTEST_QUERY_BEGIN\n')
+                uuid_files['load-cli.txt']='.bail on\n'+dotread(DATA/'settings.txt')+dotread(uuid_folder/'schema.txt')+dotread(uuid_folder/'parents-insert.txt')+dotread(uuid_folder/'details-insert.txt')+dotread(DATA/'readback.txt')
                 for leaf,text in uuid_files.items():write(uuid_folder/leaf,text,'frozen_uuid7_'+leaf,**meta)
                 datasets[f'uuid7-{seed}-{label}']={'folder':str(uuid_folder.relative_to(ROOT)),**meta}
+        from live import SCHEMA as LIVE_SCHEMA,SQL as LIVE_SQL
+        write(DATA/'live/schema.txt',LIVE_SCHEMA,'live_operator_SQL')
+        for name,sql in LIVE_SQL.items():write(DATA/f'live/{name}.txt',sql+'\n','live_operator_SQL')
         # Copy existing SQL catalog into the ignored immutable freeze bundle.
         catalog=[];old=json.loads((ROOT/'corpus-manifest.json').read_text())
         for item in old['files']:
             if item['path'].endswith('.sql'):
-                src=ROOT/item['path'];dst=DATA/'catalog'/item['path'];out(dst).write_bytes(src.read_bytes());add(dst,'catalog_sql',source_path=item['path']);catalog.append({'path':str(dst.relative_to(ROOT)),**{k:item[k] for k in item if k not in ['path','sha256','bytes']}})
+                src=ROOT/item['path'];dst=DATA/'catalog'/item['path'];out(dst).write_bytes(src.read_bytes());add(dst,'catalog_sql',source_path=item['path']);catalog.append({'path':str(dst.relative_to(ROOT)),'source_path':item['path'],**{k:item[k] for k in item if k not in ['path','sha256','bytes']}})
         order=[];rng=random.Random(cfg['order_seed'])
         for session in range(cfg['sessions']):
             for repeat in range(cfg['repeats']):
@@ -142,6 +156,9 @@ def prepare():
                 order.extend({'session':session,'repeat':repeat,**x} for x in block)
         uuid_order=[{'session':s,'repeat':rep,'seed':seed,'case':case} for s in range(cfg['sessions']) for rep in range(cfg['repeats']) for seed in cfg['seeds'] for case in cfg['frozen_uuid7']['cli_query_timing']['cases']]
         rng.shuffle(uuid_order)
+        live_order=[{'session':s,'repeat':rep,'case':mode+'-'+policy,'uuid_mode':mode,'commit_mode':policy} for s in range(cfg['sessions']) for rep in range(cfg['repeats']) for mode in cfg['live']['cases'] for policy in cfg['live']['commit_modes']]
+        rng.shuffle(live_order)
+        write(DATA/'live-order.txt',''.join(json.dumps(x,sort_keys=True)+'\n' for x in live_order),'frozen_live_family_order',records=len(live_order))
         write(DATA/'uuid-query-order.txt',''.join(json.dumps(x,sort_keys=True)+'\n' for x in uuid_order),'frozen_uuid_query_order',records=len(uuid_order))
         write(DATA/'order.txt',''.join(json.dumps(x,sort_keys=True)+'\n' for x in order),'frozen_order',records=len(order))
         manifest={'schema':1,'status':'FROZEN','performance_status':'NOT_RUN','config':cfg,'sources':producer_sources,'producer_python':sys.version,
@@ -164,16 +181,21 @@ def verify(manifest=None):
     if len(m['catalog_scenarios'])!=75 or len({x['id'] for x in m['catalog_scenarios']})!=75 or sum(e.get('kind')=='boundary_sql' for e in m['catalog'])!=72:raise ValueError('incomplete core/boundary catalog')
     paths=[e['path'] for e in m['files']]
     if not paths or len(paths)!=len(set(paths)) or len(paths)!=len({str((ROOT/p).resolve()) for p in paths}):raise ValueError('empty/duplicate frozen files')
+    for leaf in ['settings.txt','schema.txt','stage-schema.txt','transform.txt','readback.txt','insert-template.txt','select.txt','begin.txt','commit.txt','quit.txt','cli-verify.txt','cli-raw-verify.txt','cli-transform-only.txt','order.txt','uuid-query-order.txt','live-order.txt','live/schema.txt','live/client-parent.txt','live/client-detail.txt','live/server-parent.txt','live/server-detail.txt']:
+        if str((DATA/leaf).relative_to(ROOT)) not in paths:raise ValueError('missing mandatory operator/order file')
     for name,d in m['datasets'].items():
         folder=Path(d['folder'])
         if name.startswith('uuid7-'):
-            for leaf in ['parents.csv','details.csv','parents-expected.txt','details-expected.txt','schema.txt','join-query.txt','join-noindex.txt','join-expected.txt','aggregate-query.txt','aggregate-expected.txt','foreign-keys-readback.txt','negative-orphan.txt','negative-duplicate.txt']:
+            for leaf in ['parents.csv','details.csv','parents-expected.txt','details-expected.txt','schema.txt','join-query.txt','join-noindex.txt','join-expected.txt','aggregate-query.txt','aggregate-expected.txt','foreign-keys-readback.txt','negative-orphan.txt','negative-duplicate.txt','load-cli.txt','join-cli-index.txt','join-cli-noindex.txt']:
                 if str(folder/leaf) not in paths:raise ValueError('missing frozen UUID file')
             key='smoke_parents' if name.endswith('-smoke') else 'parents'
             if d['parents']!=cfg['frozen_uuid7'][key] or d['details']!=cfg['frozen_uuid7']['smoke_details' if name.endswith('-smoke') else 'details']:raise ValueError('UUID row contract mismatch')
             continue
         for leaf in ['rows.csv','expected.txt','row-statements.txt','insert-one-txn.txt']:
             if str(folder/leaf) not in paths:raise ValueError('missing required dataset input')
+        if name.startswith('wide-'):
+            for leaf in ['workload.txt','mutated-expected.txt']:
+                if str(folder/leaf) not in paths:raise ValueError('missing wide mutation input/golden')
         count=cfg['wide_rows'] if name.startswith('wide-') else cfg['normal_rows'] if name.endswith('-full') else cfg['single_rows'] if name.endswith('-single') else cfg['append_rows'] if name.endswith('-append') else 32
         if d['rows']!=count:raise ValueError('dataset row contract mismatch')
     for e in m['files']:
@@ -183,6 +205,11 @@ def verify(manifest=None):
     keys=[(x['session'],x['repeat'],x['seed'],x['case']) for x in order]
     required={(s,r,seed,c) for s in range(cfg['sessions']) for r in range(cfg['repeats']) for seed in cfg['seeds'] for c in cfg['timed_cases']}
     if len(keys)!=len(required) or set(keys)!=required:raise ValueError('frozen order incomplete/duplicate')
+    for leaf,family in [('uuid-query-order.txt','uuid'),('live-order.txt','live')]:
+        entries=[json.loads(line) for line in (DATA/leaf).read_text().splitlines()]
+        keys=[(x['session'],x['repeat'],x.get('seed'),x['case']) for x in entries]
+        required={(s,r,seed,c) for s in range(cfg['sessions']) for r in range(cfg['repeats']) for seed in cfg['seeds'] for c in cfg['frozen_uuid7']['cli_query_timing']['cases']} if family=='uuid' else {(s,r,None,mode+'-'+policy) for s in range(cfg['sessions']) for r in range(cfg['repeats']) for mode in cfg['live']['cases'] for policy in cfg['live']['commit_modes']}
+        if len(keys)!=len(required) or set(keys)!=required:raise ValueError('UUID/LIVE order matrix')
     return m
 
 if __name__=='__main__':prepare()

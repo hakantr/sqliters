@@ -21,6 +21,7 @@ def out(path):
     path = Path(path)
     if not path.resolve().is_relative_to(ROOT) or any(p.is_symlink() for p in [path, *path.parents]):
         raise ValueError(f'outside/symlink output: {path}')
+    path=path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -38,12 +39,31 @@ def environment():
 
 
 def command(args, *, cwd=None, timeout=600, input=None):
-    return subprocess.run([str(x) for x in args], cwd=cwd or ROOT, env=environment(),
-                          input=input, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          timeout=timeout, check=True)
+    argv=[str(x) for x in args]
+    proc=subprocess.Popen(argv,cwd=cwd or ROOT,env=environment(),stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    record_process(argv,proc.pid)
+    try:
+        stdout,stderr=proc.communicate(input=input,timeout=timeout)
+    except BaseException:
+        proc.kill();proc.communicate();record_process(argv,proc.pid,proc.returncode);raise
+    record_process(argv,proc.pid,proc.returncode)
+    result=subprocess.CompletedProcess(argv,proc.returncode,stdout,stderr)
+    if proc.returncode:raise subprocess.CalledProcessError(proc.returncode,argv,stdout,stderr)
+    return result
 
 
 def sources():
-    names = ['support.py','sqlitebuild.py','native.py','freeze_inputs.py','external.py','harness_controls.py',
-             'external-config.json','uuid_family.py','live.py','docs/external-baseline-protokolu.md']
+    names=[p.name for p in sorted(ROOT.glob('*.py'))]+['external-config.json','docs/external-baseline-protokolu.md']
     return {name:digest(ROOT/name) for name in names}
+
+EXECUTION_LOG=None
+
+def set_execution_log(path):
+    global EXECUTION_LOG
+    EXECUTION_LOG=out(path) if path is not None else None
+
+def record_process(args,pid,returncode=None):
+    if EXECUTION_LOG is not None:
+        from datetime import datetime,timezone
+        with out(EXECUTION_LOG).open('a') as f:
+            f.write(json.dumps({'argv':[str(x) for x in args],'pid':pid,'returncode':returncode,'utc':datetime.now(timezone.utc).isoformat()})+'\n')

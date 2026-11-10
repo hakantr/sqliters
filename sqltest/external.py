@@ -42,8 +42,12 @@ def configured(db):
 def verified_db(build,path):return Database(build['library'],path)
 
 def ingest_api(db,data,path,case,*,timed=False,batch_rows=1000):
+    decode_start=time.perf_counter_ns() if timed else None
     rows=decoded(data/'rows.csv');sql=read(data/'row-statements.txt').splitlines()
+    decode_ns=time.perf_counter_ns()-decode_start if timed else None
+    prepare_start=time.perf_counter_ns() if timed else None
     stmt=db.prepare(read(DATA/'insert-template.txt')) if case!='api-exec-auto' else None
+    prepare_ns=time.perf_counter_ns()-prepare_start if timed and stmt else None
     row_times=[];batch_times=[]
     begin,commit=read(DATA/'begin.txt'),read(DATA/'commit.txt')
     started=time.perf_counter_ns() if timed else None
@@ -63,7 +67,7 @@ def ingest_api(db,data,path,case,*,timed=False,batch_rows=1000):
         total=time.perf_counter_ns()-started if timed else None
     finally:
         if stmt:stmt.close(ignore_error=sys.exc_info()[0] is not None)
-    return {'rows':len(rows),'ns':total,'row_latency_ns':row_times,'batch_latency_ns':batch_times}
+    return {'rows':len(rows),'ns':total,'row_latency_ns':row_times,'batch_latency_ns':batch_times,'input_read_decode_ns':decode_ns,'prepare_ns':prepare_ns,'finalize_scope':'exec-auto per-row includes prepare/finalize; reused prepared finalize outside loop'}
 
 def cli(build,db_path,driver,raw):
     result=command([build['cli'],str(db_path)],input=('.read '+json.dumps(str(driver.relative_to(ROOT)))+'\n').encode())
@@ -160,8 +164,40 @@ def preflight():
         for mode in m['config']['live']['cases']:
             import shutil
             live_folder=ART/'preflight/live'/mode
-            if live_folder.exists():shutil.rmtree(live_folder)
+            if live_folder.exists():shutil.rmtree(out(live_folder))
             checks.append(smoke(b['library'],m['config']['live'],mode,live_folder))
+        # Exercise every ingestion backend on the immutable 32-row smoke fixture.
+        import copy
+        from unittest.mock import patch
+        from compare_cli import exercise
+        from benchmark import dispatch
+        tiny=copy.deepcopy(m);seed=m['config']['seeds'][0]
+        for label in ['full','single']:tiny['datasets'][f'{seed}-{label}']=copy.deepcopy(m['datasets'][f'{seed}-preflight'])
+        backends=ART/'preflight/backends'
+        if backends.exists():__import__('shutil').rmtree(out(backends))
+        backends.mkdir()
+        with patch('time.perf_counter_ns',side_effect=AssertionError('untimed preflight sampled duration')):
+            for case in m['config']['timed_cases']:
+                result=one_case(tiny,case,seed,backends/case,timed=False)
+                if result['ns'] is not None or result['row_latency_ns'] or result['batch_latency_ns']:raise ValueError('preflight timing leaked')
+                checks.append({'case':'backend-smoke-'+case,'status':'PASS','rows':32,'timing':'NOT_RUN'})
+            comparison=ART/'preflight/cli-selfcheck'
+            if comparison.exists():__import__('shutil').rmtree(out(comparison))
+            # Even accidental C Database use in candidate path must fail.
+            with patch('native.Database.__init__',side_effect=AssertionError('candidate path loaded C API')):
+                result=exercise(b['cli'],m,comparison,smoke=True)
+            if result['status']!='PASS_SCOPED':raise ValueError('CLI comparator smoke failed: '+str(result))
+            checks.append({'case':'candidate-own-CLI-selfcheck-with-C-binary','status':'PASS','cases':len(result['cases']),'timing':'NOT_RUN','native_C_API_forbidden':True})
+            from live import run as live_run
+            for mode in m['config']['live']['cases']:
+                path=ART/'preflight/live-batch'/mode
+                if path.exists():__import__('shutil').rmtree(out(path))
+                checks.append(live_run(b['library'],m['config']['live'],mode,path,commit_mode='batch',smoke_only=True,timed=False,batch_rows=m['config']['batch_rows']))
+        path=ART/'preflight/uuid-worker'
+        if path.exists():__import__('shutil').rmtree(out(path))
+        worker_result=dispatch({'mode':'untimed','family':'uuid-query','case':'join-index','seed':seed,'session':0,'repeat':0,'smoke':True,'build':b,'output':str(path),'cpu':m['config']['cpu']},timeout=60)
+        if worker_result['ns'] is not None or worker_result['rows']!=m['config']['frozen_uuid7']['smoke_details']:raise ValueError('untimed worker mismatch')
+        checks.append({'case':'bounded-UUID-CLI-worker-smoke','status':'PASS','rows':worker_result['rows'],'timing':'NOT_RUN'})
         report={'status':'PASS','scope':'small pinned C preflight only' ,'performance_status':'NOT_RUN',
                 'input_manifest_sha256':digest(ROOT/'external-input-manifest.json'),'build_sha256':digest(ART/'build.json'),
                 'sources':sources(),'checks':checks,'full_wide_3000':'NOT_RUN','catalog_full':'NOT_RUN','Rust':'NOT_RUN'}
@@ -169,38 +205,23 @@ def preflight():
     except BaseException as e:save(output,{'status':'FAIL','performance_status':'NOT_RUN','error':str(e)});raise
 
 
-def review_gate(commit):
-    m=verify();p=json.loads((ROOT/'results/external-preflight.json').read_text())
-    if p.get('status')!='PASS' or p.get('performance_status')!='NOT_RUN' or p['input_manifest_sha256']!=digest(ROOT/'external-input-manifest.json') or p['build_sha256']!=digest(ART/'build.json') or p['sources']!=sources():raise ValueError('preflight stale/missing')
-    for name in [*sources(),'external-input-manifest.json']:
-        before=command(['git','show',commit+':sqltest/'+name],cwd=ROOT.parent).stdout
-        if before!=(ROOT/name).read_bytes():raise ValueError('not reviewed clean code/config/input: '+name)
-    for maximum in [128,2000,4096]:verified(maximum)
-    return m
-
-
 def compatible_family(reference,candidate):return reference==candidate
 
-def cli_own_result(binary,dbpath,destination):
-    result=command([binary,str(dbpath)],input=(DATA/'cli-verify.txt').read_bytes())
+def cli_own_result(binary,dbpath,destination,*,script=None,fields=7):
+    from wireio import normalize_file
+    script=script or DATA/'cli-verify.txt'
+    result=command([binary,str(dbpath)],input=Path(script).read_bytes())
     if result.stderr:raise ValueError('CLI verification feature/error: '+result.stderr.decode(errors='replace'))
-    lines=[]
-    for raw in result.stdout.splitlines():
-        tokens=raw.decode('ascii').split('\t')
-        if len(tokens)!=7:raise ValueError('candidate typed wire field count')
-        converted=[]
-        for token in tokens:
-            if token.startswith('RDEC:'):
-                import struct
-                token='R:'+struct.pack('>d',float(token[5:])).hex()
-            if not (token=='N' or token.startswith(('I:','R:','T:','B:'))):raise ValueError('candidate typed wire tag')
-            converted.append(token)
-        lines.append(('\t'.join(converted)+'\n').encode())
-    out(destination).write_bytes(b''.join(lines));return len(lines)
+    raw=out(Path(str(destination)+'.stdout'));raw.write_bytes(result.stdout)
+    normalized=normalize_file(raw,destination,fields)
+    return normalized['rows']
+
 
 def persistent_cli(binary,dbpath,data,mode,*,timed):
     import queue,threading
     proc=subprocess.Popen([str(binary),str(dbpath)],cwd=ROOT,env=environment(),stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    from support import record_process
+    record_process([binary,dbpath],proc.pid)
     q=queue.Queue();errors=[]
     def pump():
         for line in proc.stdout:q.put(line)
@@ -215,38 +236,22 @@ def persistent_cli(binary,dbpath,data,mode,*,timed):
             if row.strip()==marker:return got
             got.append(row)
     try:
-        proc.stdin.write((data/'persistent-start.txt').read_bytes());proc.stdin.flush();until(b'SQLTEST_READY')
+        proc.stdin.write((data/'persistent-start.txt').read_bytes());proc.stdin.flush();preflight=until(b'SQLTEST_READY')
+        if [x.strip() for x in preflight][-3:]!=[b'wal',b'1',b'0']:raise ValueError('persistent per-connection readback')
         payload=(data/f'persistent-{mode}.txt').read_bytes()
         start=time.perf_counter_ns() if timed else None
         proc.stdin.write(payload);proc.stdin.flush();rows=until(b'SQLTEST_DONE')
         duration=time.perf_counter_ns()-start if timed else None
         proc.stdin.write((DATA/'quit.txt').read_bytes());proc.stdin.flush();proc.stdin.close()
         proc.wait(timeout=600);reader.join(timeout=5);er.join(timeout=5)
+        record_process([binary,dbpath],proc.pid,proc.returncode)
         if proc.returncode or any(errors):raise ValueError('persistent CLI error: '+repr(errors))
         return duration,rows
     finally:
         if proc.poll() is None:proc.kill();proc.wait()
 
-def candidate_compare(binary,output):
-    m=verify();path=Path(binary).resolve();output=out(Path(output));output.mkdir(exist_ok=False)
-    if not path.is_file():raise ValueError('candidate binary required')
-    results=[]
-    # No native C library is opened anywhere in this candidate path.
-    for seed in m['config']['seeds']:
-        for mode in ['import-typed','read-auto','read-batch','persistent-auto','persistent-batch']:
-            label='single' if mode.endswith('auto') else 'full';data=folder(m,seed,label)
-            sandbox=output/f'{seed}-{mode}';sandbox.mkdir();dbpath=sandbox/'candidate.db'
-            try:
-                if mode.startswith('persistent'):persistent_cli(path,dbpath,data,mode.split('-')[1],timed=False)
-                else:cli({'cli':str(path)},dbpath,data/(mode+'.txt'),sandbox/'stdout')
-                count=cli_own_result(path,dbpath,sandbox/'canonical.txt');equal_file(sandbox/'canonical.txt',data/'expected.txt')
-                results.append({'seed':seed,'case':mode,'status':'PASS','rows':count})
-            except subprocess.CalledProcessError as e:results.append({'seed':seed,'case':mode,'status':'NOT_SUPPORTED_OR_ERROR','stderr':e.stderr.decode(errors='replace')})
-            except Exception as e:results.append({'seed':seed,'case':mode,'status':'DIFF','error':str(e)})
-    save(output/'comparison.json',{'engine':'sqliters','binary_sha256':digest(path),'input_manifest_sha256':digest(ROOT/'external-input-manifest.json'),'cases':results,'timing':'NOT_RUN','API':'NOT_RUN: native API adapter required','C_loaded':False})
-
 def one_case(m,case,seed,sandbox,*,timed):
-    b=verified(2000);data=folder(m,seed,'single' if case.endswith('auto') else 'full')
+    b=verified(2000);label='single' if case.endswith('auto') else 'full';data=folder(m,seed,label)
     out(sandbox/'placeholder');sandbox.mkdir(exist_ok=True);dbpath=sandbox/'case.db'
     if dbpath.exists():raise ValueError('fresh DB required')
     if case.startswith('api'):
@@ -263,93 +268,26 @@ def one_case(m,case,seed,sandbox,*,timed):
             if not acks or acks[-1].strip()!=str(m['datasets'][f'{seed}-'+('single' if case.endswith('auto') else 'full')]['rows']).encode():raise ValueError('persistent row count ACK mismatch')
         else:
             start=time.perf_counter_ns() if timed else None
-            cli(b,dbpath,data/(mode+'.txt'),sandbox/'stdout')
+            response=cli(b,dbpath,data/(mode+'.txt'),sandbox/'stdout')
             duration=time.perf_counter_ns()-start if timed else None
+            if response.stdout.splitlines()[-3:]!=[b'wal',b'1',b'0']:raise ValueError('CLI per-connection readback')
         db=verified_db(b,dbpath)
         try:
             if case=='cli-import':
-                raw=canonical(db,'SELECT * FROM stage ORDER BY CAST(id AS INTEGER);',sandbox/'raw.txt');equal_file(ROOT/raw['path'],data/'raw-expected.txt')
+                raw=canonical(db,'SELECT * FROM stage ORDER BY CAST(id AS INTEGER);',sandbox/'raw.txt');equal_file(ROOT/raw['path'],data/'raw-expected.txt');raw.update({'columns':11,'expected':str((data/'raw-expected.txt').relative_to(ROOT))})
                 db.exec(read(DATA/'schema.txt'));db.exec(read(DATA/'transform.txt'))
             result=canonical(db,read(DATA/'select.txt'),sandbox/'canonical.txt')
         finally:db.close()
         info={'ns':duration,'rows':result['rows'],'row_latency_ns':[],'batch_latency_ns':[]}
     equal_file(ROOT/result['path'],data/'expected.txt')
+    result.update({'columns':7,'expected':str((data/'expected.txt').relative_to(ROOT))})
+    if case=='cli-import':info['raw_csv']=raw;info['typed_transform_scope']='outside CLI timer; staging import only is timed'
+    if result['rows']!=m['datasets'][f'{seed}-{label}']['rows'] or result['fields']!=result['rows']*7:raise ValueError('ingestion shape incomplete')
     return {**info,'case':case,'seed':seed,'canonical':result,'metric':'Python+native loop/commit' if case.startswith('api') else 'CLI process/I/O/import' if not case.startswith('cli-persistent') else 'persistent CLI pipe/SQL/ACK','status':'PASS'}
-
-def full_wide_and_append(m,output):
-    checks=[]
-    for width in m['config']['wide_columns']:
-        b=verified(width);data=ROOT/m['datasets'][f'wide-{width}']['folder'];db=verified_db(b,output/f'wide-{width}.db')
-        try:
-            db.exec(read(data/'schema.txt'));db.exec(read(DATA/'begin.txt'));stmt=db.prepare(read(data/'insert-template.txt'))
-            try:
-                with (data/'rows.csv').open(newline='') as f:
-                    reader=csv.reader(f);next(reader)
-                    for row in reader:stmt.bind([token_value(x) for x in row]);stmt.run();stmt.reset()
-            finally:stmt.close()
-            db.exec(read(DATA/'commit.txt'));result=canonical(db,read(data/'select.txt'),output/f'wide-{width}-canonical.txt');equal_file(ROOT/result['path'],data/'expected.txt')
-            if result['rows']!=3000 or result['fields']!=3000*width:raise ValueError('wide content incomplete')
-            checks.append({'case':f'wide-{width}','status':'PASS','rows':result['rows'],'fields':result['fields']})
-        finally:db.close()
-    b=verified(2000);db=verified_db(b,output/'append.db')
-    try:
-        db.exec(read(DATA/'schema.txt'));first=folder(m,m['config']['seeds'][0],'full');db.exec(read(first/'insert-one-txn.txt'))
-        expected=(first/'expected.txt').read_bytes()
-        for seed in m['config']['seeds']:
-            data=folder(m,seed,'append');db.exec(read(data/'insert-one-txn.txt'));expected+=(data/'expected.txt').read_bytes()
-        actual=canonical(db,read(DATA/'select.txt'),output/'append-canonical.txt')
-        if (ROOT/actual['path']).read_bytes()!=expected:raise ValueError('append unique-id content mismatch')
-        checks.append({'case':'append-all-seeds','status':'PASS','rows':actual['rows']})
-    finally:db.close()
-    return checks
-
-def catalog_correctness(m,output):
-    results=[];catalog_root=DATA/'catalog'
-    cases=[]
-    for row in m['catalog_scenarios']:cases.append((row['id'],2000,[*row['prerequisites'],row['sql_path']],row.get('intentionally_negative',False)))
-    for row in m['catalog']:
-        if row.get('kind')=='boundary_sql':cases.append((f"max{row['future_max_column']}-{Path(row['source_path']).stem}",row['future_max_column'],[row['source_path']],row['limit_delta']>0))
-    # Optional source SQL and additional mutation/page/conflict cases stay
-    # explicitly catalogued; phased/API/crash schedules are never concatenated.
-    for row in m['catalog_additional_cases']:
-        if row['family']=='optional':cases.append((row['id'],2000,row['prerequisites']+row['paths'],False))
-    for name,maximum,paths,negative in cases:
-        b=verified(maximum);db=verified_db(b,output/(name+'.db'));last=None
-        try:
-            for path in paths:
-                for _ in db.execute(read(catalog_root/path)):pass
-            if negative:raise ValueError('expected negative accepted')
-            results.append({'case':name,'status':'PASS'})
-        except SqlError as e:
-            results.append({'case':name,'status':'EXPECTED_ERROR' if negative else 'FAIL','primary':e.code,'extended':e.extended,'stage':e.stage,'message':e.message,'offset':e.offset})
-        except Exception as e:results.append({'case':name,'status':'FAIL','error':str(e)})
-        finally:db.close()
-    for row in m['catalog_additional_cases']:
-        if row['family']!='optional':results.append({'case':row['id'],'status':'NOT_RUN','reason':'phased/reopen/mutation/WAL/API schedule requires dedicated backend; not concatenated'})
-    return results
-
-def measure(commit,output):
-    if not json.loads((ROOT/'external-config.json').read_text()).get('measurement_implementation_ready'):raise RuntimeError('Stage 2A implementation/review/commit required; no timing taken')
-    m=review_gate(commit);output=out(Path(output));output.mkdir(exist_ok=False)
-    save(output/'status.json',{'status':'RUNNING'})
-    try:
-        raw=[];deadline=time.monotonic()+m['config']['full_timeout_seconds']
-        for seed in m['config']['seeds']:
-            for case in m['config']['timed_cases']:one_case(m,case,seed,output/f'warm-{seed}-{case}',timed=False)
-        order=[json.loads(line) for line in (DATA/'order.txt').read_text().splitlines()]
-        for i,row in enumerate(order):
-            if time.monotonic()>deadline:raise TimeoutError('full run deadline')
-            sample=one_case(m,row['case'],row['seed'],output/f'sample-{i:04}',timed=True);sample.update(row);raw.append(sample)
-            save(output/'raw.json',raw)
-        correctness=full_wide_and_append(m,output);catalog=catalog_correctness(m,output/'catalog')
-        summary={'status':'PASS' if all(x['status']!='FAIL' for x in catalog) else 'FAIL','samples':len(raw),'correctness':correctness,'catalog':catalog,'Rust':'NOT_RUN','input_manifest_sha256':digest(ROOT/'external-input-manifest.json'),'raw_sha256':digest(output/'raw.json'),'sources':sources()}
-        save(output/'status.json',summary);save(ROOT/'results/external-summary.json',summary)
-    except BaseException as e:save(output/'status.json',{'status':'FAIL','error':str(e)});raise
-
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('action',choices=['preflight','measure','compare'])
-    p.add_argument('--reviewed-commit');p.add_argument('--output',type=Path);p.add_argument('--engine',choices=['sqlite','sqliters'],default='sqlite');p.add_argument('--binary',type=Path)
+    p.add_argument('--reviewed-commit');p.add_argument('--output',type=Path);p.add_argument('--engine',choices=['sqlite','sqliters'],default='sqlite');p.add_argument('--binary',type=Path);p.add_argument('--baseline',type=Path)
     a=p.parse_args()
     if a.action=='preflight':
         if a.engine!='sqlite':p.error('preflight is pinned C only; Rust execution forbidden')
@@ -357,10 +295,13 @@ def main():
     elif a.action=='measure':
         if a.engine!='sqlite':p.error('API/CLI families cannot be substituted; C-only stage 2')
         if not a.reviewed_commit or not a.output:p.error('reviewed commit and fresh output required')
-        measure(a.reviewed_commit,a.output)
+        from benchmark import run
+        run(a.reviewed_commit,a.output)
     else:
         if not a.binary or not a.output:p.error('binary and output required')
         if a.engine!='sqliters':p.error('future candidate comparison uses --engine sqliters; no C rerun')
-        candidate_compare(a.binary,a.output)
+        if not a.baseline:p.error('immutable actual C baseline/golden bundle required; no regeneration')
+        from candidate_benchmark import compare
+        compare(a.binary,a.output,a.baseline)
 
 if __name__=='__main__':main()
