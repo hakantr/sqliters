@@ -4,7 +4,7 @@
   "generator_version": "sqltest-static-2",
   "seed": 20261120,
   "profiles_sha256": "4cb690cd1cb03a32a5b31935bac43f66acf9d890879cc566e57f3aeb9931e1eb",
-  "generator_sha256": "f2a765a12d8e2b75800dd8c4e3e00f2ff48f3b8b48aed942c4d64dfdb872b395",
+  "generator_sha256": "774e660ff46a936d5874e31b3437720166797010f2ab0afecf85f8ab198425c0",
   "execution_status": "NOT_RUN",
   "extra_scope_sha256": "6aaae42c541cde004baceba72628c88115a6802b16c01f0a9ef23b4f847a7ee0",
   "additional_cases": [
@@ -1109,7 +1109,7 @@
       "planned_result_columns": 7
     },
     {
-      "path": "examples/normal-sample.csv",
+      "path": "artifacts/generated/full/normal-sample.csv",
       "bytes": 859,
       "sha256": "786021cc093d13f21ccd18602a6c712051a28a479c6eda232a69505a8d401f64",
       "physical_lines": 13,
@@ -1119,7 +1119,7 @@
       "columns": 7
     },
     {
-      "path": "examples/normal-sample.jsonl",
+      "path": "artifacts/generated/full/normal-sample.jsonl",
       "bytes": 1761,
       "sha256": "e544cdf5bfa85984973a80691858a5fba56f5e0d2ff00c40d6a60f1e9bd3dc42",
       "physical_lines": 12,
@@ -1128,7 +1128,7 @@
       "generated_records": 12
     },
     {
-      "path": "examples/normal-sample.sql",
+      "path": "artifacts/generated/full/normal-sample.sql",
       "bytes": 1497,
       "sha256": "7c0c2828748be9ff6cdfc3c9a7c42e50267cc770841920d9c5c478813f207058",
       "physical_lines": 19,

@@ -224,9 +224,9 @@ COMMIT;
     put('artifacts/generated/full/normal.csv', csv_buffer.getvalue(), kind='physical_csv', generated_records=profiles['normal_records'], columns=7)
     put('artifacts/generated/full/normal.jsonl', '\n'.join(json_lines) + '\n', kind='physical_jsonl', generated_records=profiles['normal_records'])
     put('artifacts/generated/full/normal.sql', ''.join(normal_sql), kind='literal_insert_sql', planned_insert_rows=profiles['normal_records'], planned_result_columns=7)
-    put('examples/normal-sample.csv', small_csv.getvalue(), kind='physical_csv', generated_records=12, columns=7)
-    put('examples/normal-sample.jsonl', '\n'.join(json_lines[:12]) + '\n', kind='physical_jsonl', generated_records=12)
-    put('examples/normal-sample.sql', normal_sql[0] + ''.join(normal_sql[1:13]) + normal_sql[-1], kind='literal_insert_sql', planned_insert_rows=12, planned_result_columns=7)
+    put('artifacts/generated/full/normal-sample.csv', small_csv.getvalue(), kind='physical_csv', generated_records=12, columns=7)
+    put('artifacts/generated/full/normal-sample.jsonl', '\n'.join(json_lines[:12]) + '\n', kind='physical_jsonl', generated_records=12)
+    put('artifacts/generated/full/normal-sample.sql', normal_sql[0] + ''.join(normal_sql[1:13]) + normal_sql[-1], kind='literal_insert_sql', planned_insert_rows=12, planned_result_columns=7)
 
     # A separate large, related fixture. Names match the small readable fixture
     # but this SQL must be prepared in its own future database.

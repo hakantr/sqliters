@@ -159,3 +159,36 @@ girdilerin Git'e alınmaması geçmiş purge işlemi değildir ve işi durdurmaz
 Mevcut 13 dirty port dosyası ve root R-0007 dahil başka kullanıcı işleri kapsam
 dışıdır. Ebeveyn her adımı inceleyip yalnız sqltest'i port main'e commit eder;
 root yönerge değişikliği ayrıca kendi scoped commit'ine aittir.
+
+
+## Ölçüm öncesi UUID / LIVE eki
+
+Frozen UUIDv7: RFC9562 timestamp48/version7/rand12/variant10/rand62 alanları;
+ana seed'ler 20261120/21/22, sabit base_ms=1735689600000. Her seed'de üst3000,
+detay12000 fiziksel CSV/TXT; TEXT canonical36 PK/FK ve
+(detail.parent_id,created_at) indeksi; literal INSERT, JOIN/aggregate ve
+index/no-index query dosyaları ölçümden önce üretilir. Küçük smoke8/24 ayrı
+frozen fixture'dır. Python file generator iki tabloyu da üretir.
+
+Ayrı LIVE iki case: Python uuid.uuid4()+UTCnow client ve SQLite DEFAULT
+RFC9562 UUIDv4+strftime UTC timestamp, prepared INSERT RETURNING id/timestamp.
+Her koşuda üst1000/detay3000, cents integer payload ve ilişkiler; aynı
+2oturum×3 tekrar planı. Live API-row/batch ayrı family, üretim latency'si,
+DB write ve uçtan uca süre ayrı olacak. Ön hazırlık smoke8/24'tür; süre alınmaz.
+
+Bu LIVE ailesi frozen-input genel kuralının açık istisnasıdır. Nondeterministic
+veri/olay çıktıları ignored; **dosya/sonuç hash'i cross-run veya cross-engine
+oracle yapılmaz**. Count, UUID unique/canonical/version4/variant10, UTC zaman
+aralığı(start/end+tolerance2s), FK/no-orphan, JOIN count, index/no-index aynı
+koşuda aynı seçili sonuç ve cents toplamı kayıtlı eventlog ile denetlenir.
+Kod/source/binary SHA yalnız provenance içindir. Hiçbir Rust çalıştırması yok.
+
+
+Frozen UUIDv7 JOIN performance planı: join-index ve join-noindex, her seed'de
+2oturum×3 tekrar; aynı dış Python/CLI process+query+bütün çıktı family'si.
+Input DB yükleme timer dışındadır. Dondurulmuş CLI-own typed SELECT dosyaları
+ve order dosyası kullanılır; index/no-index bütün sonuçları aynı golden'a
+uymalı. Native API query latency Rust CLI process süresine oranlanmaz.
+Actual runner 2A review/commit sonrasıdır; bu hazırlıkta zaman yoktur. Index'in
+her zaman hızlandırdığı varsayılmaz. RFC9562 A.6 v7 vector'ü ayrı Python
+kontrolüdür; fixed epoch milisaniyesi integer+timedelta ile üretilir.

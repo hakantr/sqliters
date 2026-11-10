@@ -35,7 +35,7 @@ koruyun. Üretim hiçbir SQL'i çalıştırmaz.
   gelecekte temiz schema+seed ile ayrı yürütülecek şekilde tasarlanmıştır;
   önceki senaryonun mutation/rollback sonucuna dayanmaz. `negative-*` dosyaları
   kasıtlı hata beklentisidir; sıradan senaryolarla birleştirilmez.
-- `examples/normal-sample.csv/jsonl/sql`: ilk 12 normal kaydın okunabilir örneği.
+- `artifacts/generated/full/normal-sample.csv/jsonl/sql`: ilk 12 normal kaydın okunabilir örneği.
 - [large-join-queries.sql](examples/large-join-queries.sql): büyük ilişkili veri
   için 13 açık SELECT; full materyalizasyon, FULL/LEFT JOIN, aggregation,
   semi/anti, recursive çalışan ağacı ve zaman pencereleri.
@@ -136,3 +136,38 @@ ayrı raporlanacaktır; burada hiçbir case PASS sertifikası üretilmez.
 Her iki üretim adımı ebeveyn statik içerik/hash/sayım incelemesinden geçti.
 216 manifest dosyasının kimliği ve yerel bağlantıları incelendi. SQL/test yürütülmedi;
 son teslim yalnız `sqltest/` kapsamında `main` dalına kaydedilir.
+
+
+## Harici Python hazırlığı (yeni C-only görev)
+
+Önce `python3 sqltest/generate.py`, ardından `python3 sqltest/sqlitebuild.py`
+ve `python3 sqltest/freeze_inputs.py`. Yeni girdiler yalnız ignored
+`artifacts/external/inputs/` altındadır; üç seed, standard CSV/TXT ve literal
+wide128/2000/4096×3000 değer dosyaları vardır. UUIDv7 üst3000/detay12000 her
+seed'de offline sabit zamanla üretilir. Ayrı LIVE uuid4/UTC olayları frozen
+value hash oracle'ı değildir.
+
+`python3 sqltest/harness_controls.py` harici Python kontrolleri;
+`python3 sqltest/external.py preflight` yalnız küçük C correctness'tir:
+32 satır/tek wide row/frozen UUID smoke8-24/iki LIVE smoke8-24. Performance
+alınmaz. `measurement_implementation_ready=false` kapısı benchmark'ı engeller;
+sonraki 2A kod inceleme/commit'i ve ayrı 2B talimatı gereklidir.
+Future `external.py compare --engine sqliters --binary PATH --output ...`
+runner'ı candidate'ın kendi CLI SELECT çıktısını kullanır, C library açmaz;
+bu görevde sqliters komutu çalıştırılmaz. CLI features eksikse açık rapor,
+API backend gerekiyorsa NOT_RUN; API/CLI latency oranı kurulmaz.
+
+Üç eski sample dosyası çalışma ağacından ignored alana taşındı; yalnız bu
+scoped yolların index'ten çıkarılmasını ebeveyn yapar. Geçmiş/remote'daki
+örnekler history rewrite/push yapılmadan kalır. Yeni benchmark veri, canonical
+expected ve raw çıktılar Git'e alınmaz. Kod/protokol + küçük SHA/count ve
+preflight summary review içindir; eski illustrative SQL kaynakları korunur.
+
+
+Adım 1 güncel küçük sonuç: [hazırlık kaydı](results/external-preparation.md)
+ve [preflight JSON](results/external-preflight.json). 522 frozen input ve
+13 Python kontrolü/32 küçük C preflight kaydı vardır; tam catalog/stress ve
+bütün benchmarklar NOT_RUN. Measurement kodu 2A'da tamamlanıp yeniden review
+edilmeden kapı açılamaz. Frozen/LIVE UUID family'leri ayrı oracle kullanır;
+üst/detay inputlarının dosya generator'ında hazırlanması ve LIVE otomatik
+UUID4/UTC üretimi protokol ekinde açıklanır. Sonraki aşamaya ebeveyn karar verir.

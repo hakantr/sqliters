@@ -27,3 +27,14 @@ kök Cargo ve mevcut kullanıcı işleri düzenlenmez/stage/restore edilmez.
 
 Ayrıntı: [External baseline protokolü](docs/external-baseline-protokolu.md).
 Önceki statik dosyalar yürütülmüş test sonucu değildir; NOT_RUN geçmişi korunur.
+
+
+Güncel UUID eki: seed + sabit UTC millisecond ile UUIDv7 üst/detay CSV/TXT
+frozen veri ailesine dahildir. Ayrı LIVE ailede Python uuid4/UTCnow ve C DB
+DEFAULT UUIDv4/UTC timestamp otomatik üretimi yetkilidir; live üretim latenciesi,
+DB write ve end-to-end süreleri ayrı family olarak ancak review/commit sonrası
+ölçülebilir. Live file/result hash'i cross-run/cross-engine oracle değildir;
+count/uniqueness/version/variant/UTC aralığı/FK/JOIN ve aynı koşunun kayıtlı
+olayları doğruluk ölçütüdür. Kod/binary/source SHA provenance için korunur.
+Rust yürütme/derleme yoktur. Şu hazırlıkta yalnız küçük correctness smoke,
+benchmark/latency/calibration yoktur.

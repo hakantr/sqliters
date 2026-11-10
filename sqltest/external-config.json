@@ -1,0 +1,94 @@
+{
+  "schema": 1,
+  "input_version": "external-frozen-1",
+  "seeds": [
+    20261120,
+    20261121,
+    20261122
+  ],
+  "normal_rows": 10000,
+  "single_rows": 1000,
+  "append_rows": 1000,
+  "wide_columns": [
+    128,
+    2000,
+    4096
+  ],
+  "wide_rows": 3000,
+  "batch_rows": 1000,
+  "sessions": 2,
+  "repeats": 3,
+  "warmups": 1,
+  "order_seed": 20261121,
+  "main_max_column": 2000,
+  "journal_mode": "WAL",
+  "synchronous": 1,
+  "wal_autocheckpoint": 0,
+  "case_timeout_seconds": 600,
+  "full_timeout_seconds": 3600,
+  "rss_budget_bytes": 2147483648,
+  "sandbox_budget_bytes": 8589934592,
+  "timed_cases": [
+    "cli-import",
+    "cli-read-auto",
+    "cli-read-batch",
+    "cli-persistent-auto",
+    "cli-persistent-batch",
+    "api-exec-auto",
+    "api-prepared-auto",
+    "api-prepared-batch",
+    "api-prepared-one-txn"
+  ],
+  "correctness_only": [
+    "wide-all-fields",
+    "append-live",
+    "core-75",
+    "boundary-72",
+    "optional",
+    "mutation-workloads"
+  ],
+  "not_implemented": [
+    "crash orchestrator",
+    "UDF/hooks/backup/blob API recipes",
+    "Rust native API backend"
+  ],
+  "performance_status": "NOT_RUN",
+  "measurement_implementation_ready": false,
+  "frozen_uuid7": {
+    "base_ms": 1735689600000,
+    "parents": 3000,
+    "details": 12000,
+    "smoke_parents": 8,
+    "smoke_details": 24,
+    "representation": "canonical lowercase TEXT36",
+    "rfc": "RFC9562 version7 variant10",
+    "cli_query_timing": {
+      "cases": [
+        "join-index",
+        "join-noindex"
+      ],
+      "sessions": 2,
+      "repeats": 3,
+      "family": "CLI process+query+all output",
+      "load_input_db": "outside timer",
+      "golden": "frozen join expected; indexed/noindex metamorphic equality",
+      "implementation_status": "2A required; timing NOT_RUN"
+    }
+  },
+  "live": {
+    "separate_family": true,
+    "cases": [
+      "client-uuid4-utc",
+      "db-default-uuid4-utc"
+    ],
+    "parents": 1000,
+    "details": 3000,
+    "smoke_parents": 8,
+    "smoke_details": 24,
+    "timestamp_tolerance_seconds": 2,
+    "sessions": 2,
+    "repeats": 3,
+    "oracle": "same-run event log plus structural invariants; never cross-run data/output hashes",
+    "timing_status": "NOT_RUN"
+  }
+}

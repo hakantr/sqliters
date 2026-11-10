@@ -1,0 +1,253 @@
+{
+  "Rust": "NOT_RUN",
+  "build_sha256": "f626f8a837c217795a73d875d21b35196b00515d166c094074a84bdfa7a61a51",
+  "catalog_full": "NOT_RUN",
+  "checks": [
+    {
+      "case": "import",
+      "maximum": 128,
+      "rows": 32,
+      "status": "PASS"
+    },
+    {
+      "case": "import-typed",
+      "maximum": 128,
+      "rows": 32,
+      "status": "PASS"
+    },
+    {
+      "case": "read-one-txn",
+      "maximum": 128,
+      "rows": 32,
+      "status": "PASS"
+    },
+    {
+      "case": "negative-constraint",
+      "cleanup_finalize_rc": 19,
+      "extended": 1555,
+      "maximum": 128,
+      "primary": 19,
+      "stage": "step",
+      "status": "PASS"
+    },
+    {
+      "case": "negative-constraint",
+      "cleanup_finalize_rc": 19,
+      "extended": 275,
+      "maximum": 128,
+      "primary": 19,
+      "stage": "step",
+      "status": "PASS"
+    },
+    {
+      "case": "API-small/limit/arity",
+      "maximum": 128,
+      "rows": 32,
+      "status": "PASS"
+    },
+    {
+      "case": "wide-one-row",
+      "fields": 128,
+      "maximum": 128,
+      "status": "PASS"
+    },
+    {
+      "case": "import",
+      "maximum": 2000,
+      "rows": 32,
+      "status": "PASS"
+    },
+    {
+      "case": "import-typed",
+      "maximum": 2000,
+      "rows": 32,
+      "status": "PASS"
+    },
+    {
+      "case": "read-one-txn",
+      "maximum": 2000,
+      "rows": 32,
+      "status": "PASS"
+    },
+    {
+      "case": "negative-constraint",
+      "cleanup_finalize_rc": 19,
+      "extended": 1555,
+      "maximum": 2000,
+      "primary": 19,
+      "stage": "step",
+      "status": "PASS"
+    },
+    {
+      "case": "negative-constraint",
+      "cleanup_finalize_rc": 19,
+      "extended": 275,
+      "maximum": 2000,
+      "primary": 19,
+      "stage": "step",
+      "status": "PASS"
+    },
+    {
+      "case": "API-small/limit/arity",
+      "maximum": 2000,
+      "rows": 32,
+      "status": "PASS"
+    },
+    {
+      "case": "wide-one-row",
+      "fields": 2000,
+      "maximum": 2000,
+      "status": "PASS"
+    },
+    {
+      "case": "import",
+      "maximum": 4096,
+      "rows": 32,
+      "status": "PASS"
+    },
+    {
+      "case": "import-typed",
+      "maximum": 4096,
+      "rows": 32,
+      "status": "PASS"
+    },
+    {
+      "case": "read-one-txn",
+      "maximum": 4096,
+      "rows": 32,
+      "status": "PASS"
+    },
+    {
+      "case": "negative-constraint",
+      "cleanup_finalize_rc": 19,
+      "extended": 1555,
+      "maximum": 4096,
+      "primary": 19,
+      "stage": "step",
+      "status": "PASS"
+    },
+    {
+      "case": "negative-constraint",
+      "cleanup_finalize_rc": 19,
+      "extended": 275,
+      "maximum": 4096,
+      "primary": 19,
+      "stage": "step",
+      "status": "PASS"
+    },
+    {
+      "case": "API-small/limit/arity",
+      "maximum": 4096,
+      "rows": 32,
+      "status": "PASS"
+    },
+    {
+      "case": "wide-one-row",
+      "fields": 4096,
+      "maximum": 4096,
+      "status": "PASS"
+    },
+    {
+      "case": "frozen-uuid7-negative-orphan.txt",
+      "extended": 787,
+      "primary": 19,
+      "stage": "step",
+      "status": "PASS"
+    },
+    {
+      "case": "frozen-uuid7-negative-duplicate.txt",
+      "extended": 1555,
+      "primary": 19,
+      "stage": "step",
+      "status": "PASS"
+    },
+    {
+      "case": "frozen-uuid7",
+      "details": 24,
+      "parents": 8,
+      "seed": 20261120,
+      "status": "PASS"
+    },
+    {
+      "case": "frozen-uuid7-negative-orphan.txt",
+      "extended": 787,
+      "primary": 19,
+      "stage": "step",
+      "status": "PASS"
+    },
+    {
+      "case": "frozen-uuid7-negative-duplicate.txt",
+      "extended": 1555,
+      "primary": 19,
+      "stage": "step",
+      "status": "PASS"
+    },
+    {
+      "case": "frozen-uuid7",
+      "details": 24,
+      "parents": 8,
+      "seed": 20261121,
+      "status": "PASS"
+    },
+    {
+      "case": "frozen-uuid7-negative-orphan.txt",
+      "extended": 787,
+      "primary": 19,
+      "stage": "step",
+      "status": "PASS"
+    },
+    {
+      "case": "frozen-uuid7-negative-duplicate.txt",
+      "extended": 1555,
+      "primary": 19,
+      "stage": "step",
+      "status": "PASS"
+    },
+    {
+      "case": "frozen-uuid7",
+      "details": 24,
+      "parents": 8,
+      "seed": 20261122,
+      "status": "PASS"
+    },
+    {
+      "UUID_version": 4,
+      "details": 24,
+      "end_utc": "2026-11-10T14:38:01.783205+00:00",
+      "mode": "client-uuid4-utc",
+      "oracle": "same-run events+invariants; no data/result SHA oracle",
+      "parents": 8,
+      "scope": "small correctness smoke; no timing",
+      "start_utc": "2026-11-10T14:38:01.537847+00:00",
+      "status": "PASS"
+    },
+    {
+      "UUID_version": 4,
+      "details": 24,
+      "end_utc": "2026-11-10T14:38:02.029047+00:00",
+      "mode": "db-default-uuid4-utc",
+      "oracle": "same-run events+invariants; no data/result SHA oracle",
+      "parents": 8,
+      "scope": "small correctness smoke; no timing",
+      "start_utc": "2026-11-10T14:38:01.788347+00:00",
+      "status": "PASS"
+    }
+  ],
+  "full_wide_3000": "NOT_RUN",
+  "input_manifest_sha256": "d5b9012b7ee65e8902957f27e1948642f593bc71174e15f79b9bd40c5005a9b1",
+  "performance_status": "NOT_RUN",
+  "scope": "small pinned C preflight only",
+  "sources": {
+    "docs/external-baseline-protokolu.md": "ec8fb10b32f231115500a674f4d72262b344fa92b8c82714d9bbcd1a5786e11b",
+    "external-config.json": "f93ad52846483817a302618c6b9dbcddeb409cdff9ae4e9af57b1112829ffece",
+    "external.py": "2478cf22abe93a56b1614c0466519a668f0731aece3d3d15279de3317784d42f",
+    "freeze_inputs.py": "d3177c801f1fc746d8e6d58fb42bc7e87c87b3467fa007d749dd9ac8f5002066",
+    "harness_controls.py": "2d09768eab41947452e9687a55a4770e1d0c250bf9bedb51d124343706890504",
+    "live.py": "a76101baa7a8cbeec176380171b42984685cd7bf72b9d91a68477247ce2f821b",
+    "native.py": "938f9cca399e6c9e8a8d40f748ea063a2dd8864cfc207ad0935ff76dd835ae0e",
+    "sqlitebuild.py": "6d76cf755a5b7aa57510ef8451ccb6875ea6edc004f266dd8ad1b72c820a56eb",
+    "support.py": "16c93a7f6a6c4e2c97d6d91c650f8f928d6525c811308b9b08cb088e69df12bb",
+    "uuid_family.py": "9edff4db95881cf3153f13d524a6dcac44396d070dd493330ff81978a06b9d13"
+  },
+  "status": "PASS"
+}
