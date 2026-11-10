@@ -1,3 +1,9 @@
+> Güncel görev: önceki statik teslimden sonra yalnız pinned C SQLite ve harici
+> Python baseline akışı yetkilendirildi. [Yeni protokol](docs/external-baseline-protokolu.md)
+> önce freeze/runner inceleme+commit, sonra ayrı C-only koşu gerektirir.
+> Bu adım 0'da veri, build veya motor yürütülmedi; sqliters hâlâ derlenmez/çalıştırılmaz.
+> Aşağıdaki NOT_RUN açıklamaları önceki statik teslimin tarihsel durumudur.
+
 # SQLtest — Statik örnek veri ve SQL komut setleri
 
 **Test çalıştırılmaz.** Bu paket yalnız plan, veri ve SQL metni üretir.
