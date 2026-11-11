@@ -5122,6 +5122,132 @@ impl Statement {
         &self.column_names
     }
 
+    /// Declared column type string (`sqlite3_column_decltype`) for result column `col_idx`, if
+    /// the column directly references a table or virtual table column.
+    pub fn column_decltype(&self, col_idx: usize) -> Option<String> {
+        let Some(Stmt::Select(ref sel)) = self.stmt else {
+            return None;
+        };
+        if !sel.body.compounds.is_empty() {
+            return None;
+        }
+        let SelectCore::Select {
+            projection: ref columns,
+            from: Some(ref fc),
+            ..
+        } = sel.body.head
+        else {
+            return None;
+        };
+        let guard = self.shared.inner.try_lock().ok()?;
+        let db_set = &guard.db_set;
+
+        struct SrcTable {
+            alias: String,
+            all_cols: Vec<(String, String, bool)>,
+        }
+        let load_tos = |tos: &sqliters_syntax::TableOrSubquery| -> Option<SrcTable> {
+            let sqliters_syntax::TableOrSubquery::Table {
+                ref name,
+                ref alias,
+                ..
+            } = *tos
+            else {
+                return None;
+            };
+            let eff = alias.clone().unwrap_or_else(|| name.name.clone());
+            if let Ok(Some((_, crate::db_set::ResolvedRelation::Table(tbl)))) =
+                db_set.find_relation_in_set(name)
+            {
+                let cols = tbl
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.type_name.clone(), false))
+                    .collect();
+                return Some(SrcTable {
+                    alias: eff,
+                    all_cols: cols,
+                });
+            }
+            if let Some((_, _, _, decl)) = db_set.find_connected_vtab_in_set(name, true) {
+                let cols = decl
+                    .table_schema
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (c.name.clone(), c.type_name.clone(), decl.is_hidden(i)))
+                    .collect();
+                return Some(SrcTable {
+                    alias: eff,
+                    all_cols: cols,
+                });
+            }
+            None
+        };
+
+        let mut srcs = Vec::new();
+        if let Some(h) = load_tos(&fc.head) {
+            srcs.push(h);
+        }
+        for j in &fc.joins {
+            if let Some(r) = load_tos(&j.right) {
+                srcs.push(r);
+            }
+        }
+
+        let mut decls: Vec<Option<String>> = Vec::new();
+        for rc in columns {
+            match rc {
+                sqliters_syntax::ResultColumn::Star => {
+                    for s in &srcs {
+                        for (_, dt, hidden) in &s.all_cols {
+                            if !*hidden {
+                                decls.push(Some(dt.clone()));
+                            }
+                        }
+                    }
+                }
+                sqliters_syntax::ResultColumn::TableStar { table: tname, .. } => {
+                    for s in &srcs {
+                        if s.alias.eq_ignore_ascii_case(tname) {
+                            for (_, dt, hidden) in &s.all_cols {
+                                if !*hidden {
+                                    decls.push(Some(dt.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+                sqliters_syntax::ResultColumn::Expr { expr, .. } => {
+                    if let sqliters_syntax::Expr::Column(cref) = expr {
+                        let mut found = None;
+                        for s in &srcs {
+                            if cref
+                                .table
+                                .as_ref()
+                                .is_some_and(|t| !s.alias.eq_ignore_ascii_case(t))
+                            {
+                                continue;
+                            }
+                            if let Some((_, dt, _)) = s
+                                .all_cols
+                                .iter()
+                                .find(|(cn, _, _)| cn.eq_ignore_ascii_case(&cref.column))
+                            {
+                                found = Some(dt.clone());
+                                break;
+                            }
+                        }
+                        decls.push(found);
+                    } else {
+                        decls.push(None);
+                    }
+                }
+            }
+        }
+        decls.into_iter().nth(col_idx).flatten()
+    }
+
     /// Returns `true` if this statement is currently paused in `Running` (`SQLITE_ROW` / retryable `Busy`)
     /// (`sqlite3_stmt_busy`).
     #[inline]

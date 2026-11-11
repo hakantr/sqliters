@@ -232,20 +232,24 @@ fn phase5_gate_c_reference_and_manifest_audit() {
         "incrblob",
         "lfs",
         "xfer_opt",
+        "vtab",
+        "fts5",
+        "rtree",
+        "json",
+        "json1",
+        "dbstat",
     ] {
         assert_eq!(
             cap_map.get(enabled_cap),
             Some(&true),
-            "capability `{enabled_cap}` must be enabled in Phase 6"
+            "capability `{enabled_cap}` must be enabled in Phase 7"
         );
     }
-    for pending_cap in [
-        "stat4", "vtab", "fts3", "fts4", "fts5", "rtree", "json", "json1",
-    ] {
+    for pending_cap in ["stat4", "fts3", "fts4", "shared_cache"] {
         assert_eq!(
             cap_map.get(pending_cap),
             Some(&false),
-            "Phase 7 capability `{pending_cap}` must remain false in Phase 6"
+            "out-of-scope capability `{pending_cap}` must remain false in Phase 7"
         );
     }
 
@@ -328,10 +332,10 @@ fn phase5_gate_c_reference_and_manifest_audit() {
         p5_total, 31,
         "expected 31 Phase 5 wrappers (17 window*.test + 14 analyze*.test/analyzer1.test)"
     );
-    assert_eq!(p5_active, 18, "expected 18 active Phase 5 manifest suites");
+    assert_eq!(p5_active, 19, "expected 19 active Phase 5 manifest suites");
     assert_eq!(
-        p5_ignored, 13,
-        "expected 13 ignored Phase 5 manifest suites"
+        p5_ignored, 12,
+        "expected 12 ignored Phase 5 manifest suites"
     );
     assert_eq!(
         p5_active_ids,
@@ -350,14 +354,15 @@ fn phase5_gate_c_reference_and_manifest_audit() {
             "sqlite/test/window8.test",
             "sqlite/test/window9.test",
             "sqlite/test/windowA.test",
+            "sqlite/test/windowB.test",
             "sqlite/test/windowC.test",
             "sqlite/test/windowD.test",
             "sqlite/test/windowerr.test",
             "sqlite/test/windowpushd.test",
         ]
     );
-    assert_eq!(manifest_active_total, 70);
-    assert_eq!(manifest_ignored_total, 53);
+    assert_eq!(manifest_active_total, 131);
+    assert_eq!(manifest_ignored_total, 204);
 
     let uname_out = Command::new("uname")
         .arg("-srmo")

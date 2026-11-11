@@ -48,11 +48,28 @@ impl QualifiedName {
 }
 
 /// Structural 1-, 2-, or 3-part column reference (`[schema.][table.]column`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct ColumnRef {
     pub schema: Option<String>,
     pub table: Option<String>,
     pub column: String,
+    pub double_quoted: bool,
+}
+
+impl PartialEq for ColumnRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema == other.schema && self.table == other.table && self.column == other.column
+    }
+}
+
+impl Eq for ColumnRef {}
+
+impl std::hash::Hash for ColumnRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.schema.hash(state);
+        self.table.hash(state);
+        self.column.hash(state);
+    }
 }
 
 impl ColumnRef {
@@ -63,6 +80,18 @@ impl ColumnRef {
             schema: None,
             table: None,
             column: column.into(),
+            double_quoted: false,
+        }
+    }
+
+    /// Creates a 1-part double-quoted identifier (`"column"`).
+    #[inline]
+    pub fn unqualified_double_quoted(column: impl Into<String>) -> Self {
+        Self {
+            schema: None,
+            table: None,
+            column: column.into(),
+            double_quoted: true,
         }
     }
 
@@ -73,6 +102,7 @@ impl ColumnRef {
             schema: None,
             table: Some(table.into()),
             column: column.into(),
+            double_quoted: false,
         }
     }
 
@@ -87,6 +117,7 @@ impl ColumnRef {
             schema: Some(schema.into()),
             table: Some(table.into()),
             column: column.into(),
+            double_quoted: false,
         }
     }
 

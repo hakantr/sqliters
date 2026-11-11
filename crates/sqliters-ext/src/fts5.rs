@@ -1449,17 +1449,27 @@ impl Fts5Config {
                         };
                     }
                     "detail" => {
-                        detail = match v.to_ascii_lowercase().as_str() {
-                            "full" => DetailMode::Full,
-                            "col" => DetailMode::Col,
-                            "none" => DetailMode::None,
-                            _ => {
-                                return Err(SqliteError::new(
-                                    ErrorCode::Error,
-                                    "malformed detail=... directive",
-                                ));
-                            }
+                        let v_lc = v.to_ascii_lowercase();
+                        detail = if !v_lc.is_empty() && "full".starts_with(v_lc.as_str()) {
+                            DetailMode::Full
+                        } else if !v_lc.is_empty() && "columns".starts_with(v_lc.as_str()) {
+                            DetailMode::Col
+                        } else if !v_lc.is_empty() && "none".starts_with(v_lc.as_str()) {
+                            DetailMode::None
+                        } else {
+                            return Err(SqliteError::new(
+                                ErrorCode::Error,
+                                "malformed detail=... directive",
+                            ));
                         };
+                    }
+                    "locale" => {
+                        if !matches!(v.as_str(), "0" | "1") {
+                            return Err(SqliteError::new(
+                                ErrorCode::Error,
+                                "malformed locale=... directive",
+                            ));
+                        }
                     }
                     "tokendata" => {
                         if !matches!(v.as_str(), "0" | "1") {
@@ -2621,7 +2631,39 @@ impl<'a> QueryParser<'a> {
         if self.pos < self.toks.len() {
             return Err(self.syntax_err_here());
         }
+        if Self::expr_height(&expr) > FTS5_MAX_EXPR_DEPTH {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("fts5 expression tree is too large (maximum depth {FTS5_MAX_EXPR_DEPTH})"),
+            ));
+        }
         Ok(expr)
+    }
+
+    fn expr_height(expr: &FtsQueryExpr) -> usize {
+        match expr {
+            FtsQueryExpr::Phrase(_) | FtsQueryExpr::Near { .. } => 0,
+            FtsQueryExpr::ColFilter { inner, .. } => Self::expr_height(inner),
+            FtsQueryExpr::Not(lhs, rhs) => 1 + Self::expr_height(lhs).max(Self::expr_height(rhs)),
+            FtsQueryExpr::And(lhs, rhs) => {
+                fn max_and_child(e: &FtsQueryExpr) -> usize {
+                    match e {
+                        FtsQueryExpr::And(l, r) => max_and_child(l).max(max_and_child(r)),
+                        other => QueryParser::expr_height(other),
+                    }
+                }
+                1 + max_and_child(lhs).max(max_and_child(rhs))
+            }
+            FtsQueryExpr::Or(lhs, rhs) => {
+                fn max_or_child(e: &FtsQueryExpr) -> usize {
+                    match e {
+                        FtsQueryExpr::Or(l, r) => max_or_child(l).max(max_or_child(r)),
+                        other => QueryParser::expr_height(other),
+                    }
+                }
+                1 + max_or_child(lhs).max(max_or_child(rhs))
+            }
+        }
     }
 
     fn syntax_err_here(&self) -> SqliteError {
@@ -2646,10 +2688,10 @@ impl<'a> QueryParser<'a> {
     }
 
     fn check_depth(depth: usize) -> Result<()> {
-        if depth > FTS5_MAX_EXPR_DEPTH {
+        if depth > FTS5_MAX_EXPR_DEPTH * 2 {
             return Err(SqliteError::new(
                 ErrorCode::Error,
-                "fts5: query expression tree is too large",
+                format!("fts5 expression tree is too large (maximum depth {FTS5_MAX_EXPR_DEPTH})"),
             ));
         }
         Ok(())

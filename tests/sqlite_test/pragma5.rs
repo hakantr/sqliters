@@ -1,5 +1,6 @@
+#![forbid(unsafe_code)]
+
 #[test]
-#[ignore = "pending Phase 7: pragma_function_list/pragma_module_list/pragma_pragma_list virtual tables, UDFs, and fts5=1"]
 fn test_pragma5() {
     sqliters_tcltest::run_test_script(
         "pragma5",

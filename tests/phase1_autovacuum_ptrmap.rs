@@ -437,6 +437,12 @@ fn c_reference_3_54_1_and_phase1_3_manifest() {
     assert_eq!(cap_map.get("default_autovacuum"), Some(&false));
     assert_eq!(cap_map.get("vacuum"), Some(&true));
     assert_eq!(cap_map.get("wal"), Some(&true));
+    assert_eq!(cap_map.get("vtab"), Some(&true));
+    assert_eq!(cap_map.get("json"), Some(&true));
+    assert_eq!(cap_map.get("json1"), Some(&true));
+    assert_eq!(cap_map.get("fts5"), Some(&true));
+    assert_eq!(cap_map.get("rtree"), Some(&true));
+    assert_eq!(cap_map.get("dbstat"), Some(&true));
 
     let test_manifest_raw =
         fs::read_to_string(workspace_root.join("tests/sqlite_test_manifest.json"))

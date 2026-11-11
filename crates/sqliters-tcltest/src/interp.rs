@@ -269,6 +269,7 @@ impl TclInterp {
         platform.insert("byteOrder".to_string(), "littleEndian".to_string());
         platform.insert("wordSize".to_string(), "8".to_string());
         platform.insert("pointerSize".to_string(), "8".to_string());
+        platform.insert("machine".to_string(), "x86_64".to_string());
         global
             .vars
             .insert("tcl_platform".to_string(), VarSlot::Array(platform));
@@ -3960,6 +3961,60 @@ fn tcl_binary_format(fmt: &str, vals: &[String]) -> TclResult<Vec<u8>> {
                     }
                 }
             }
+            'f' | 'r' | 'R' | 'd' | 'q' | 'Q' => {
+                let Some(val) = vals.get(arg_idx) else {
+                    return Err(TclControl::Error(
+                        "not enough arguments for all format specifiers".to_string(),
+                    ));
+                };
+                arg_idx += 1;
+                let parse_f = |s: &str| -> TclResult<f64> {
+                    s.trim().parse::<f64>().map_err(|_| {
+                        TclControl::Error(format!("expected floating-point number but got \"{s}\""))
+                    })
+                };
+                let nums: Vec<f64> = match count {
+                    BinCount::DefaultOne => {
+                        let f = parse_f(val).or_else(|e| {
+                            parse_list(val)
+                                .ok()
+                                .and_then(|l| l.first().cloned())
+                                .map_or(Err(e), |s| parse_f(&s))
+                        })?;
+                        vec![f]
+                    }
+                    BinCount::Star => {
+                        let items = parse_list(val).map_err(TclControl::Error)?;
+                        let mut parsed = Vec::with_capacity(items.len());
+                        for item in items {
+                            parsed.push(parse_f(&item)?);
+                        }
+                        parsed
+                    }
+                    BinCount::Exact(n_req) => {
+                        let items = parse_list(val).map_err(TclControl::Error)?;
+                        if items.len() < n_req {
+                            return Err(TclControl::Error(
+                                "number of elements in list does not match count".to_string(),
+                            ));
+                        }
+                        let mut parsed = Vec::with_capacity(n_req);
+                        for item in items.into_iter().take(n_req) {
+                            parsed.push(parse_f(&item)?);
+                        }
+                        parsed
+                    }
+                };
+                for v in nums {
+                    match cmd {
+                        'f' | 'r' => write_bytes(&mut out, &mut cursor, &(v as f32).to_le_bytes()),
+                        'R' => write_bytes(&mut out, &mut cursor, &(v as f32).to_be_bytes()),
+                        'd' | 'q' => write_bytes(&mut out, &mut cursor, &v.to_le_bytes()),
+                        'Q' => write_bytes(&mut out, &mut cursor, &v.to_be_bytes()),
+                        _ => unreachable!(),
+                    }
+                }
+            }
             other => {
                 return Err(TclControl::Error(format!(
                     "bad field specifier \"{other}\" in binary format"
@@ -4058,7 +4113,7 @@ fn tcl_binary_scan(data: &[u8], fmt: &str, max_vars: usize) -> TclResult<Vec<Opt
                 pos += bytes_needed;
                 out.push(Some(hex));
             }
-            'c' | 'C' | 's' | 'S' | 'i' | 'I' | 'w' | 'W' => {
+            'c' | 'C' | 's' | 'S' | 'i' | 'I' | 'w' | 'W' | 'f' | 'r' | 'R' | 'd' | 'q' | 'Q' => {
                 if out.len() >= max_vars {
                     return Err(TclControl::Error(
                         "not enough arguments for all format specifiers".to_string(),
@@ -4067,7 +4122,7 @@ fn tcl_binary_scan(data: &[u8], fmt: &str, max_vars: usize) -> TclResult<Vec<Opt
                 let elem_size = match cmd {
                     'c' | 'C' => 1usize,
                     's' | 'S' => 2usize,
-                    'i' | 'I' => 4usize,
+                    'i' | 'I' | 'f' | 'r' | 'R' => 4usize,
                     _ => 8usize,
                 };
                 let is_unsigned = unsigned || cmd == 'C';
@@ -4131,6 +4186,28 @@ fn tcl_binary_scan(data: &[u8], fmt: &str, max_vars: usize) -> TclResult<Vec<Opt
                             } else {
                                 (u as i64).to_string()
                             }
+                        }
+                        'f' | 'r' => {
+                            let v = f64::from(f32::from_le_bytes([
+                                chunk[0], chunk[1], chunk[2], chunk[3],
+                            ]));
+                            crate::expr::ExprVal::Float(v).to_tcl_string()
+                        }
+                        'R' => {
+                            let v = f64::from(f32::from_be_bytes([
+                                chunk[0], chunk[1], chunk[2], chunk[3],
+                            ]));
+                            crate::expr::ExprVal::Float(v).to_tcl_string()
+                        }
+                        'd' | 'q' => {
+                            let mut b = [0u8; 8];
+                            b.copy_from_slice(chunk);
+                            crate::expr::ExprVal::Float(f64::from_le_bytes(b)).to_tcl_string()
+                        }
+                        'Q' => {
+                            let mut b = [0u8; 8];
+                            b.copy_from_slice(chunk);
+                            crate::expr::ExprVal::Float(f64::from_be_bytes(b)).to_tcl_string()
                         }
                         _ => unreachable!(),
                     }

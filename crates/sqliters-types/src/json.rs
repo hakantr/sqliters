@@ -41,8 +41,106 @@ fn err_too_deep() -> SqliteError {
 }
 
 #[inline]
-fn err_bad_path(near: &str) -> SqliteError {
-    SqliteError::new(ErrorCode::Error, format!("JSON path error near '{near}'"))
+fn err_bad_path(z_path: &str) -> SqliteError {
+    SqliteError::new(
+        ErrorCode::Error,
+        format!("bad JSON path: '{}'", z_path.replace('\'', "''")),
+    )
+}
+
+#[inline]
+fn err_not_array_element(z_path: &str) -> SqliteError {
+    SqliteError::new(
+        ErrorCode::Error,
+        format!("not an array element: '{}'", z_path.replace('\'', "''")),
+    )
+}
+
+/// Formats a finite or infinite `f64` using SQLite `%!0.17g` semantics (`json.c:814`).
+fn format_json_real(f: f64) -> &'static str {
+    if f.is_sign_positive() {
+        "9.0e+999"
+    } else {
+        "-9.0e+999"
+    }
+}
+
+fn format_finite_json_real(f: f64) -> String {
+    debug_assert!(f.is_finite());
+    if f == 0.0 {
+        return "0.0".to_owned();
+    }
+    let sign = if f.is_sign_negative() { "-" } else { "" };
+    let abs_f = f.abs();
+    // Shortest round-trip scientific form (matching Dragonbox / `%!0.17g` precision).
+    let sci = format!("{abs_f:e}");
+    let (mantissa, exp_str) = sci.split_once('e').expect("scientific format has 'e'");
+    let exp: i32 = exp_str.parse().expect("valid exponent");
+    let digits: Vec<u8> = mantissa.bytes().filter(|&b| b != b'.').collect();
+    // Trim trailing zeros down to at least 1 significant digit.
+    let mut sig_len = digits.len();
+    while sig_len > 1 && digits[sig_len - 1] == b'0' {
+        sig_len -= 1;
+    }
+    let sig = &digits[..sig_len];
+
+    if (-4..17).contains(&exp) {
+        let mut out = String::with_capacity(24);
+        out.push_str(sign);
+        if exp < 0 {
+            out.push_str("0.");
+            for _ in 0..(-exp - 1) {
+                out.push('0');
+            }
+            for &d in sig {
+                out.push(d as char);
+            }
+        } else {
+            let int_digits = (exp as usize) + 1;
+            if int_digits >= sig.len() {
+                for &d in sig {
+                    out.push(d as char);
+                }
+                for _ in 0..(int_digits - sig.len()) {
+                    out.push('0');
+                }
+                out.push_str(".0");
+            } else {
+                for &d in &sig[..int_digits] {
+                    out.push(d as char);
+                }
+                out.push('.');
+                for &d in &sig[int_digits..] {
+                    out.push(d as char);
+                }
+            }
+        }
+        out
+    } else {
+        let mut out = String::with_capacity(28);
+        out.push_str(sign);
+        out.push(sig[0] as char);
+        out.push('.');
+        if sig.len() == 1 {
+            out.push('0');
+        } else {
+            for &d in &sig[1..] {
+                out.push(d as char);
+            }
+        }
+        out.push('e');
+        if exp >= 0 {
+            out.push('+');
+        } else {
+            out.push('-');
+        }
+        let abs_exp = exp.unsigned_abs();
+        if abs_exp < 10 {
+            out.push('0');
+        }
+        out.push_str(&abs_exp.to_string());
+        out
+    }
 }
 
 #[inline]
@@ -1115,8 +1213,17 @@ pub fn parse_func_arg_to_jsonb(val: &Value) -> Result<Option<Vec<u8>>> {
             Ok(Some(out))
         }
         Value::Real(f) => {
-            if !f.is_finite() {
+            if f.is_nan() {
                 Ok(Some(vec![JSONB_NULL]))
+            } else if f.is_infinite() {
+                let s = if f.is_sign_positive() {
+                    "9e999"
+                } else {
+                    "-9e999"
+                };
+                let mut out = Vec::with_capacity(s.len() + 2);
+                jsonb_append_node(&mut out, JSONB_FLOAT, s.as_bytes());
+                Ok(Some(out))
             } else {
                 let s = format_sqlite_real(*f);
                 let mut out = Vec::with_capacity(s.len() + 2);
@@ -1490,10 +1597,13 @@ pub fn append_sql_arg_as_jsonb(out: &mut Vec<u8>, arg: &RuntimeValue) -> Result<
             jsonb_append_node(out, JSONB_INT, s.as_bytes());
         }
         Value::Real(f) => {
-            if !f.is_finite() {
+            if f.is_nan() {
                 jsonb_append_node(out, JSONB_NULL, &[]);
+            } else if f.is_infinite() {
+                let s = format_json_real(*f);
+                jsonb_append_node(out, JSONB_FLOAT, s.as_bytes());
             } else {
-                let s = format_sqlite_real(*f);
+                let s = format_finite_json_real(*f);
                 jsonb_append_node(out, JSONB_FLOAT, s.as_bytes());
             }
         }
@@ -1674,14 +1784,22 @@ pub enum PathStep {
 }
 
 pub fn parse_json_path(path: &str) -> Result<Vec<PathStep>> {
+    Ok(parse_json_path_with_spans(path)?
+        .into_iter()
+        .map(|(_, _, step)| step)
+        .collect())
+}
+
+fn parse_json_path_with_spans(path: &str) -> Result<Vec<(usize, usize, PathStep)>> {
     let Some(mut rest) = path.strip_prefix('$') else {
         return Err(err_bad_path(path));
     };
     let mut steps = Vec::new();
     while !rest.is_empty() {
+        let step_start = path.len() - rest.len();
         if let Some(after_dot) = rest.strip_prefix('.') {
             if after_dot.is_empty() {
-                return Err(err_bad_path(rest));
+                return Err(err_bad_path(path));
             }
             if let Some(after_quote) = after_dot.strip_prefix('"') {
                 let bytes = after_quote.as_bytes();
@@ -1696,7 +1814,7 @@ pub fn parse_json_path(path: &str) -> Result<Vec<PathStep>> {
                     } else if bytes[i] == b'\\' {
                         let (consumed, cp) = json_unescape_one_char(&bytes[i..]);
                         if cp == JSON_INVALID_CHAR || consumed == 0 {
-                            return Err(err_bad_path(rest));
+                            return Err(err_bad_path(path));
                         }
                         if cp != u32::MAX
                             && let Some(ch) = char::from_u32(cp)
@@ -1708,50 +1826,51 @@ pub fn parse_json_path(path: &str) -> Result<Vec<PathStep>> {
                         let ch = after_quote[i..]
                             .chars()
                             .next()
-                            .ok_or_else(|| err_bad_path(rest))?;
+                            .ok_or_else(|| err_bad_path(path))?;
                         key.push(ch);
                         i += ch.len_utf8();
                     }
                 }
                 if !closed {
-                    return Err(err_bad_path(rest));
+                    return Err(err_bad_path(path));
                 }
-                steps.push(PathStep::Key(key));
+                let step_end = path.len() - rest.len();
+                steps.push((step_start, step_end, PathStep::Key(key)));
             } else {
                 let end = after_dot.find(['.', '[']).unwrap_or(after_dot.len());
                 if end == 0 {
-                    return Err(err_bad_path(rest));
+                    return Err(err_bad_path(path));
                 }
                 let key = &after_dot[..end];
-                if key.contains('"') {
-                    return Err(err_bad_path(rest));
-                }
-                steps.push(PathStep::Key(key.to_owned()));
                 rest = &after_dot[end..];
+                let step_end = path.len() - rest.len();
+                steps.push((step_start, step_end, PathStep::Key(key.to_owned())));
             }
         } else if let Some(after_bracket) = rest.strip_prefix('[') {
             let Some(close_idx) = after_bracket.find(']') else {
-                return Err(err_bad_path(rest));
+                return Err(err_bad_path(path));
             };
             let inside = &after_bracket[..close_idx];
-            if inside == "#" {
-                steps.push(PathStep::ArrayFromEnd(0));
+            let step = if inside == "#" {
+                PathStep::ArrayFromEnd(0)
             } else if let Some(neg_str) = inside.strip_prefix("#-") {
                 if neg_str.is_empty() || !neg_str.bytes().all(|b| b.is_ascii_digit()) {
-                    return Err(err_bad_path(rest));
+                    return Err(err_bad_path(path));
                 }
-                let n = neg_str.parse::<usize>().map_err(|_| err_bad_path(rest))?;
-                steps.push(PathStep::ArrayFromEnd(n));
+                let n = neg_str.parse::<usize>().map_err(|_| err_bad_path(path))?;
+                PathStep::ArrayFromEnd(n)
             } else {
                 if inside.is_empty() || !inside.bytes().all(|b| b.is_ascii_digit()) {
-                    return Err(err_bad_path(rest));
+                    return Err(err_bad_path(path));
                 }
-                let idx = inside.parse::<usize>().map_err(|_| err_bad_path(rest))?;
-                steps.push(PathStep::ArrayIndex(idx));
-            }
+                let idx = inside.parse::<usize>().map_err(|_| err_bad_path(path))?;
+                PathStep::ArrayIndex(idx)
+            };
             rest = &after_bracket[close_idx + 1..];
+            let step_end = path.len() - rest.len();
+            steps.push((step_start, step_end, step));
         } else {
-            return Err(err_bad_path(rest));
+            return Err(err_bad_path(path));
         }
     }
     Ok(steps)
@@ -1784,9 +1903,10 @@ fn parse_abbreviated_path(arg: &Value) -> Result<Vec<PathStep>> {
                 Ok(vec![PathStep::Key(s)])
             } else if s.starts_with('[') && s.len() >= 3 && s.ends_with(']') {
                 let candidate = format!("${s}");
-                parse_json_path(&candidate)
+                parse_json_path(&candidate).map_err(|_| err_bad_path(&s))
             } else {
-                Ok(vec![PathStep::Key(s)])
+                let candidate = format!("$.\"{s}\"");
+                parse_json_path(&candidate).map_err(|_| err_bad_path(&s))
             }
         }
     }
@@ -2102,8 +2222,10 @@ fn apply_edit(node: &mut EditNode, steps: &[PathStep], mode: EditMode, new_val: 
                 }
             } else if let Some(pos) = existing_pos {
                 apply_edit(&mut entries[pos].2, rest, mode, new_val);
-            } else if matches!(mode, EditMode::Insert | EditMode::Set)
-                && let Some(v) = new_val
+            } else if matches!(
+                mode,
+                EditMode::Insert | EditMode::Set | EditMode::ArrayInsert
+            ) && let Some(v) = new_val
                 && let Some(sub) = build_intermediate_for_steps(rest, EditNode::Raw(v.to_vec()))
             {
                 entries.push((k.clone(), encode_key_jsonb(k), sub));
@@ -2128,9 +2250,7 @@ fn apply_edit(node: &mut EditNode, steps: &[PathStep], mode: EditMode, new_val: 
                             && mode == EditMode::Set
                             && let Some(v) = new_val
                         {
-                            // Note: in `json.c` `$[N]` where N == len does NOT append unless `[#]`!
-                            // Verify: in SQLite `json_set('[1,2]', '$[2]', 3)` leaves `[1,2]` unchanged!
-                            let _ = v;
+                            items.push(EditNode::Raw(v.to_vec()));
                         }
                     }
                     EditMode::Remove => {
@@ -2138,10 +2258,25 @@ fn apply_edit(node: &mut EditNode, steps: &[PathStep], mode: EditMode, new_val: 
                             items.remove(*idx);
                         }
                     }
-                    EditMode::Insert => {}
+                    EditMode::Insert => {
+                        if *idx == items.len()
+                            && let Some(v) = new_val
+                        {
+                            items.push(EditNode::Raw(v.to_vec()));
+                        }
+                    }
                 }
             } else if *idx < items.len() {
                 apply_edit(&mut items[*idx], rest, mode, new_val);
+            } else if *idx == items.len()
+                && matches!(
+                    mode,
+                    EditMode::Insert | EditMode::Set | EditMode::ArrayInsert
+                )
+                && let Some(v) = new_val
+                && let Some(sub) = build_intermediate_for_steps(rest, EditNode::Raw(v.to_vec()))
+            {
+                items.push(sub);
             }
         }
         (EditNode::Array(items), PathStep::ArrayFromEnd(back)) => {
@@ -2155,8 +2290,10 @@ fn apply_edit(node: &mut EditNode, steps: &[PathStep], mode: EditMode, new_val: 
                     {
                         items.push(EditNode::Raw(v.to_vec()));
                     }
-                } else if matches!(mode, EditMode::Insert | EditMode::Set)
-                    && let Some(v) = new_val
+                } else if matches!(
+                    mode,
+                    EditMode::Insert | EditMode::Set | EditMode::ArrayInsert
+                ) && let Some(v) = new_val
                     && let Some(sub) = build_intermediate_for_steps(rest, EditNode::Raw(v.to_vec()))
                 {
                     items.push(sub);
@@ -2550,12 +2687,12 @@ pub fn eval_json_edit(
     }
     for pair in args[1..].as_chunks::<2>().0 {
         if matches!(pair[0].value, Value::Null) {
-            return Err(SqliteError::new(
-                ErrorCode::Error,
-                "JSON path error near 'NULL'",
-            ));
+            continue;
         }
         let path_str = pair[0].value.to_text_lossy();
+        if mode == EditMode::ArrayInsert && !path_str.ends_with(']') {
+            return Err(err_not_array_element(&path_str));
+        }
         let steps = parse_json_path(&path_str)?;
         if mode == EditMode::ArrayInsert
             && !matches!(
@@ -2563,7 +2700,7 @@ pub fn eval_json_edit(
                 Some(PathStep::ArrayIndex(_) | PathStep::ArrayFromEnd(_))
             )
         {
-            return Err(err_bad_path(&path_str));
+            return Err(err_not_array_element(&path_str));
         }
         let mut val_jsonb = Vec::new();
         append_sql_arg_as_jsonb(&mut val_jsonb, &pair[1])?;
@@ -2825,15 +2962,16 @@ pub fn build_json_walk_rows(
     let Some(jsonb) = parse_func_arg_to_jsonb(json_arg)? else {
         return Ok(Vec::new());
     };
-    // Full validation up front (`malformed JSON` / `JSON nested too deep`)
-    let _ = jsonb_to_text(&jsonb)?;
-
     let root_path_str = match root_arg {
         None => "$".to_owned(),
         Some(Value::Null) => return Ok(Vec::new()),
         Some(v) => v.to_text_lossy(),
     };
-    let steps = parse_json_path(&root_path_str)?;
+    let spanned_steps = parse_json_path_with_spans(&root_path_str)?;
+    let steps: Vec<PathStep> = spanned_steps
+        .iter()
+        .map(|(_, _, step)| step.clone())
+        .collect();
     let Some((start_id_offset, start_offset)) = jsonb_lookup_steps_with_id(&jsonb, 0, &steps)?
     else {
         return Ok(Vec::new());
@@ -2877,9 +3015,16 @@ pub fn build_json_walk_rows(
                         return Err(err_malformed());
                     };
                     let kstr = jsonb_decode_string(&jsonb, j)?;
-                    let vpos = j + kn + ksz;
-                    let Some((vn, vsz)) = jsonb_payload_size(&jsonb[..end], vpos) else {
-                        return Err(err_malformed());
+                    let raw_vpos = j + kn + ksz;
+                    let (vpos, next_j) = if raw_vpos >= jsonb.len() {
+                        // `jsonSkipLabel` (`json.c:5393`): when last member has a label
+                        // with no value at end of blob, clamp value index to label `j`.
+                        (j, end)
+                    } else {
+                        let Some((vn, vsz)) = jsonb_payload_size(&jsonb[..end], raw_vpos) else {
+                            return Err(err_malformed());
+                        };
+                        (raw_vpos, raw_vpos + vn + vsz)
                     };
                     let fk = format_fullkey_object_step(&root_path_str, &kstr);
                     rows.push(make_walk_row(
@@ -2892,7 +3037,7 @@ pub fn build_json_walk_rows(
                         root_path_str.clone(),
                         as_blob_containers,
                     )?);
-                    j = vpos + vn + vsz;
+                    j = next_j;
                 }
             }
             _ => {
@@ -2911,18 +3056,25 @@ pub fn build_json_walk_rows(
         return Ok(rows);
     }
 
-    let (root_key, root_parent_path) = match steps.last() {
+    let (root_key, root_parent_path) = match spanned_steps.last() {
         None => (Value::Null, root_path_str.clone()),
-        Some(PathStep::Key(k)) => {
-            let parent_path = render_canonical_steps(&steps[..steps.len() - 1]);
-            (Value::Text(k.clone()), parent_path)
+        Some((s_start, s_end, PathStep::Key(k))) => {
+            let parent_path = root_path_str[..*s_start].to_owned();
+            let raw_seg = &root_path_str[*s_start..*s_end];
+            let key_text =
+                if raw_seg.starts_with(".\"") && raw_seg.ends_with('"') && raw_seg.len() >= 3 {
+                    raw_seg[2..raw_seg.len() - 1].to_owned()
+                } else {
+                    k.clone()
+                };
+            (Value::Text(key_text), parent_path)
         }
-        Some(PathStep::ArrayIndex(idx)) => {
-            let parent_path = render_canonical_steps(&steps[..steps.len() - 1]);
+        Some((s_start, _, PathStep::ArrayIndex(idx))) => {
+            let parent_path = root_path_str[..*s_start].to_owned();
             (Value::Integer(*idx as i64), parent_path)
         }
-        Some(PathStep::ArrayFromEnd(_)) => {
-            let parent_path = render_canonical_steps(&steps[..steps.len() - 1]);
+        Some((s_start, _, PathStep::ArrayFromEnd(_))) => {
+            let parent_path = root_path_str[..*s_start].to_owned();
             (Value::Null, parent_path)
         }
     };
@@ -2936,9 +3088,13 @@ pub fn build_json_walk_rows(
         parent_id: Value,
         fullkey: String,
         path: String,
+        depth: usize,
         as_blob_containers: bool,
         rows: &mut Vec<JsonWalkRow>,
     ) -> Result<()> {
+        if depth > JSON_MAX_DEPTH {
+            return Err(err_too_deep());
+        }
         let row = make_walk_row(
             jsonb,
             id_offset,
@@ -2958,6 +3114,9 @@ pub fn build_json_walk_rows(
         let end = val_offset + n + sz;
         match jsonb[val_offset] & 0x0f {
             JSONB_ARRAY => {
+                if depth + 1 > JSON_MAX_DEPTH {
+                    return Err(err_too_deep());
+                }
                 let mut j = val_offset + n;
                 let mut idx = 0i64;
                 while j < end {
@@ -2973,6 +3132,7 @@ pub fn build_json_walk_rows(
                         Value::Integer(my_id),
                         child_fk,
                         fullkey.clone(),
+                        depth + 1,
                         as_blob_containers,
                         rows,
                     )?;
@@ -2981,15 +3141,23 @@ pub fn build_json_walk_rows(
                 }
             }
             JSONB_OBJECT => {
+                if depth + 1 > JSON_MAX_DEPTH {
+                    return Err(err_too_deep());
+                }
                 let mut j = val_offset + n;
                 while j < end {
                     let Some((kn, ksz)) = jsonb_payload_size(&jsonb[..end], j) else {
                         return Err(err_malformed());
                     };
                     let kstr = jsonb_decode_string(jsonb, j)?;
-                    let vpos = j + kn + ksz;
-                    let Some((vn, vsz)) = jsonb_payload_size(&jsonb[..end], vpos) else {
-                        return Err(err_malformed());
+                    let raw_vpos = j + kn + ksz;
+                    let (vpos, next_j) = if raw_vpos >= jsonb.len() {
+                        (j, end)
+                    } else {
+                        let Some((vn, vsz)) = jsonb_payload_size(&jsonb[..end], raw_vpos) else {
+                            return Err(err_malformed());
+                        };
+                        (raw_vpos, raw_vpos + vn + vsz)
                     };
                     let child_fk = format_fullkey_object_step(&fullkey, &kstr);
                     walk_tree_dfs(
@@ -3000,10 +3168,11 @@ pub fn build_json_walk_rows(
                         Value::Integer(my_id),
                         child_fk,
                         fullkey.clone(),
+                        depth + 1,
                         as_blob_containers,
                         rows,
                     )?;
-                    j = vpos + vn + vsz;
+                    j = next_j;
                 }
             }
             _ => {}
@@ -3024,29 +3193,9 @@ pub fn build_json_walk_rows(
         Value::Null,
         canon_fullkey,
         root_parent_path,
+        1,
         as_blob_containers,
         &mut rows,
     )?;
     Ok(rows)
-}
-
-fn render_canonical_steps(steps: &[PathStep]) -> String {
-    let mut out = String::from("$");
-    for s in steps {
-        match s {
-            PathStep::Key(k) => {
-                out = format_fullkey_object_step(&out, k);
-            }
-            PathStep::ArrayIndex(i) => {
-                out.push_str(&format!("[{i}]"));
-            }
-            PathStep::ArrayFromEnd(0) => {
-                out.push_str("[#]");
-            }
-            PathStep::ArrayFromEnd(n) => {
-                out.push_str(&format!("[#-{n}]"));
-            }
-        }
-    }
-    out
 }

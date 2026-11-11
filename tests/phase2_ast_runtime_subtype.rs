@@ -834,6 +834,7 @@ fn group64_ast_structural_qualified_names_and_attach_detach() {
                 schema: Some("main".into()),
                 table: Some("a.b".into()),
                 column: "c.d".into(),
+                double_quoted: false,
             }),
             alias: None,
             span_text: Some("main.\"a.b\".\"c.d\"".into()),

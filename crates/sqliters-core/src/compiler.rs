@@ -2962,6 +2962,7 @@ fn compile_single_table_select(
                             schema: star_schema.clone(),
                             table: Some(tname.clone()),
                             column: c.name.clone(),
+                            double_quoted: false,
                         }),
                         c.name.clone(),
                         None,
@@ -2973,6 +2974,9 @@ fn compile_single_table_select(
                 alias: al,
                 span_text,
             } => {
+                if expr_has_unresolved_double_quoted_col(expr, tbl) {
+                    return Ok(None);
+                }
                 let label = al.clone().unwrap_or_else(|| match expr {
                     Expr::Column(cref) => {
                         if let Some((_, col)) = tbl.find_column(&cref.column) {
@@ -2995,6 +2999,20 @@ fn compile_single_table_select(
 
     // Choose access plan first so covering index queries do NOT open or seek the table cursor!
     if matches!(indexed_by, Some(IndexHint::IndexedBy(_))) {
+        return Ok(None);
+    }
+    if selection.is_some_and(|w| expr_has_unresolved_double_quoted_col(w, tbl))
+        || order_by
+            .iter()
+            .any(|ob| expr_has_unresolved_double_quoted_col(&ob.expr, tbl))
+        || limit.as_ref().is_some_and(|lim| {
+            expr_has_unresolved_double_quoted_col(&lim.limit, tbl)
+                || lim
+                    .offset
+                    .as_ref()
+                    .is_some_and(|o| expr_has_unresolved_double_quoted_col(o, tbl))
+        })
+    {
         return Ok(None);
     }
     let plan = choose_access_plan_with_context(
@@ -3675,6 +3693,7 @@ fn resolve_order_by_source(
         schema: None,
         table: None,
         column,
+        ..
     }) = inner
     {
         let in_tbl = tbl.find_column(column).is_some() || tbl.is_implicit_rowid_name(column);
@@ -3703,6 +3722,82 @@ fn resolve_order_by_source(
     Some((OrderBySource::Expr(ob_expr.clone()), ob_expr.clone()))
 }
 
+fn expr_has_unresolved_double_quoted_col(expr: &Expr, tbl: &TableSchema) -> bool {
+    match expr {
+        Expr::Column(cref) => {
+            cref.double_quoted
+                && cref.schema.is_none()
+                && cref.table.is_none()
+                && tbl.find_column(&cref.column).is_none()
+                && !tbl.is_implicit_rowid_name(&cref.column)
+        }
+        Expr::Unary { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => expr_has_unresolved_double_quoted_col(inner, tbl),
+        Expr::Binary { left, right, .. } => {
+            expr_has_unresolved_double_quoted_col(left, tbl)
+                || expr_has_unresolved_double_quoted_col(right, tbl)
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            expr_has_unresolved_double_quoted_col(e, tbl)
+                || expr_has_unresolved_double_quoted_col(low, tbl)
+                || expr_has_unresolved_double_quoted_col(high, tbl)
+        }
+        Expr::InList { expr: e, list, .. } => {
+            expr_has_unresolved_double_quoted_col(e, tbl)
+                || list
+                    .iter()
+                    .any(|it| expr_has_unresolved_double_quoted_col(it, tbl))
+        }
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_has_unresolved_double_quoted_col(e, tbl)
+                || expr_has_unresolved_double_quoted_col(pattern, tbl)
+                || escape
+                    .as_deref()
+                    .is_some_and(|esc| expr_has_unresolved_double_quoted_col(esc, tbl))
+        }
+        Expr::FunctionCall {
+            args: FunctionArgs::Exprs(es),
+            filter,
+            ..
+        } => {
+            es.iter()
+                .any(|a| expr_has_unresolved_double_quoted_col(a, tbl))
+                || filter
+                    .as_deref()
+                    .is_some_and(|f| expr_has_unresolved_double_quoted_col(f, tbl))
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|op| expr_has_unresolved_double_quoted_col(op, tbl))
+                || branches.iter().any(|(w, t)| {
+                    expr_has_unresolved_double_quoted_col(w, tbl)
+                        || expr_has_unresolved_double_quoted_col(t, tbl)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(|el| expr_has_unresolved_double_quoted_col(el, tbl))
+        }
+        Expr::RowValue(elems) => elems
+            .iter()
+            .any(|el| expr_has_unresolved_double_quoted_col(el, tbl)),
+        _ => false,
+    }
+}
+
 fn expr_uses_select_alias(
     expr: &Expr,
     expanded: &[(Expr, String, Option<String>)],
@@ -3713,6 +3808,7 @@ fn expr_uses_select_alias(
             schema: None,
             table: None,
             column,
+            ..
         }) => {
             let in_tbl = tbl.find_column(column).is_some() || tbl.is_implicit_rowid_name(column);
             !in_tbl
@@ -3872,6 +3968,13 @@ fn compile_expr(
         }
         Expr::Column(cref) => {
             let Some(b) = binding else {
+                if cref.double_quoted && cref.schema.is_none() && cref.table.is_none() {
+                    prog.emit(
+                        Instruction::new(Opcode::String8, 0, dest, 0)
+                            .with_p4(P4::Str(cref.column.clone())),
+                    );
+                    return Ok(());
+                }
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!("no such column: {}", cref.display_name()),
@@ -6987,6 +7090,12 @@ where
                     }
                 }
             }
+            let has_window = core_has_window(&sel.body.head, &sel.order_by);
+            let scan_parent = if has_window {
+                push_node(parent, "CO-ROUTINE (subquery-2)".to_owned())
+            } else {
+                parent
+            };
             let window_sort_groups = crate::window::collect_window_sort_groups(sel);
             let effective_order_by: &[OrderByTerm] =
                 if let Some(first_wg) = window_sort_groups.first() {
@@ -7039,10 +7148,10 @@ where
                             effective_order_by,
                         );
                         let disp = alias.as_deref().unwrap_or(&tbl.name);
-                        emit_plan_nodes(parent, &plan, disp, "", push_node);
+                        emit_plan_nodes(scan_parent, &plan, disp, "", push_node);
                         emit_in_table_eqp_nodes(
                             selection.as_ref(),
-                            parent,
+                            scan_parent,
                             resolve_relation,
                             push_node,
                         );
@@ -7054,7 +7163,7 @@ where
                             &view,
                             alias.as_deref(),
                             selection.as_ref(),
-                            parent,
+                            scan_parent,
                             active_views,
                             push_node,
                         )?;
@@ -7267,7 +7376,7 @@ where
                             },
                         );
                         let suffix = if is_left_join { " LEFT-JOIN" } else { "" };
-                        emit_plan_nodes(parent, &plan, disp, suffix, push_node);
+                        emit_plan_nodes(scan_parent, &plan, disp, suffix, push_node);
                         outer_bound_names.push(disp.to_owned());
                         outer_bound_names.push(tbl.name.clone());
                     } else {
@@ -7283,7 +7392,7 @@ where
                                         &view,
                                         alias.as_deref(),
                                         None,
-                                        parent,
+                                        scan_parent,
                                         active_views,
                                         push_node,
                                     )?;
@@ -7293,17 +7402,58 @@ where
                                         .map(str::to_owned)
                                         .or_else(|| resolve_cte_target_name(name))
                                         .unwrap_or_else(|| name.name.clone());
-                                    let _ = push_node(parent, format!("SCAN {disp_name}"));
+                                    let _ = push_node(scan_parent, format!("SCAN {disp_name}"));
                                 }
                             }
                             TableOrSubquery::Subquery { .. } => {
-                                let _ = push_node(parent, "SCAN SUBQUERY".to_owned());
+                                let _ = push_node(scan_parent, "SCAN SUBQUERY".to_owned());
                             }
-                            TableOrSubquery::TableFunction { name, alias, .. } => {
+                            TableOrSubquery::TableFunction {
+                                name, args, alias, ..
+                            } => {
                                 let disp_name = alias.as_deref().unwrap_or(name.as_str());
+                                let idx_num = match name.to_ascii_lowercase().as_str() {
+                                    "json_each" | "json_tree" | "jsonb_each" | "jsonb_tree" => {
+                                        let mut m = 0i32;
+                                        if !args.is_empty() {
+                                            m |= 1;
+                                        }
+                                        if args.len() >= 2 {
+                                            m |= 2;
+                                        }
+                                        if m != 0
+                                            && join_items.len() == 1
+                                            && effective_order_by.len() == 1
+                                            && !effective_order_by[0].desc
+                                            && let Expr::Column(ref cref) =
+                                                effective_order_by[0].expr
+                                            && matches!(
+                                                cref.column.to_ascii_lowercase().as_str(),
+                                                "rowid" | "_rowid_" | "oid"
+                                            )
+                                        {
+                                            order_by_satisfied = true;
+                                        }
+                                        m
+                                    }
+                                    "generate_series" => {
+                                        let mut m = 0i32;
+                                        if !args.is_empty() {
+                                            m |= 1;
+                                        }
+                                        if args.len() >= 2 {
+                                            m |= 2;
+                                        }
+                                        if args.len() >= 3 {
+                                            m |= 4;
+                                        }
+                                        m
+                                    }
+                                    _ => 0,
+                                };
                                 let _ = push_node(
-                                    parent,
-                                    format!("SCAN {disp_name} VIRTUAL TABLE INDEX 0:"),
+                                    scan_parent,
+                                    format!("SCAN {disp_name} VIRTUAL TABLE INDEX {idx_num}:"),
                                 );
                             }
                         }
@@ -7315,10 +7465,17 @@ where
                 let total_window_sorts =
                     usize::from(first_needs_sort) + window_sort_groups.len().saturating_sub(1);
                 for _ in 0..total_window_sorts {
+                    let _ = push_node(scan_parent, "USE TEMP B-TREE FOR ORDER BY".to_owned());
+                }
+            } else if !has_window && !sel.order_by.is_empty() && !order_by_satisfied {
+                let _ = push_node(scan_parent, "USE TEMP B-TREE FOR ORDER BY".to_owned());
+            }
+            if has_window {
+                let _ = push_node(parent, "SCAN (subquery-2)".to_owned());
+                if window_sort_groups.is_empty() && !sel.order_by.is_empty() && !order_by_satisfied
+                {
                     let _ = push_node(parent, "USE TEMP B-TREE FOR ORDER BY".to_owned());
                 }
-            } else if !sel.order_by.is_empty() && !order_by_satisfied {
-                let _ = push_node(parent, "USE TEMP B-TREE FOR ORDER BY".to_owned());
             }
         } else {
             let _ = push_node(parent, "SCAN CONSTANT ROW".to_owned());

@@ -1805,13 +1805,7 @@ pub fn eval_cast_with_encoding(val: Value, type_name: &str, enc: TextEncoding) -
         TypeAffinity::Text => match val {
             Value::Blob(b) => {
                 let s = match enc {
-                    TextEncoding::Utf8 => {
-                        let slice = b
-                            .iter()
-                            .position(|&x| x == 0)
-                            .map_or(b.as_slice(), |p| &b[..p]);
-                        String::from_utf8_lossy(slice).into_owned()
-                    }
+                    TextEncoding::Utf8 => String::from_utf8_lossy(&b).into_owned(),
                     TextEncoding::Utf16Le => {
                         let units: Vec<u16> = b
                             .as_chunks::<2>()

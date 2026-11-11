@@ -1299,11 +1299,7 @@ impl<'a> AuthWalkCtx<'a> {
                             let expr = if is_ignored {
                                 Expr::Null
                             } else {
-                                Expr::Column(ColumnRef {
-                                    schema: None,
-                                    table: Some(qual.clone()),
-                                    column: col.clone(),
-                                })
+                                Expr::Column(ColumnRef::table_qualified(qual.clone(), col.clone()))
                             };
                             star_items.push(ResultColumn::Expr {
                                 expr,
@@ -1341,11 +1337,10 @@ impl<'a> AuthWalkCtx<'a> {
                                 let expr = if is_ignored {
                                     Expr::Null
                                 } else {
-                                    Expr::Column(ColumnRef {
-                                        schema: None,
-                                        table: Some(qual.clone()),
-                                        column: col.clone(),
-                                    })
+                                    Expr::Column(ColumnRef::table_qualified(
+                                        qual.clone(),
+                                        col.clone(),
+                                    ))
                                 };
                                 star_items.push(ResultColumn::Expr {
                                     expr,
@@ -1874,17 +1869,14 @@ impl<'a> AuthWalkCtx<'a> {
                         continue;
                     };
                     let eq = Expr::Binary {
-                        left: Box::new(Expr::Column(ColumnRef {
-                            schema: None,
-                            table: Some("old".to_owned()),
-                            column: to_col_name.clone(),
-                        })),
+                        left: Box::new(Expr::Column(ColumnRef::table_qualified(
+                            "old",
+                            to_col_name.clone(),
+                        ))),
                         op: BinaryOp::Eq,
-                        right: Box::new(Expr::Column(ColumnRef {
-                            schema: None,
-                            table: None,
-                            column: from_col.name.clone(),
-                        })),
+                        right: Box::new(Expr::Column(ColumnRef::unqualified(
+                            from_col.name.clone(),
+                        ))),
                     };
                     where_expr = Some(match where_expr {
                         None => eq,
@@ -1951,11 +1943,10 @@ impl<'a> AuthWalkCtx<'a> {
                                     continue;
                                 };
                                 let rhs = match action {
-                                    FkAction::Cascade => Expr::Column(ColumnRef {
-                                        schema: None,
-                                        table: Some("new".to_owned()),
-                                        column: to_col_name.clone(),
-                                    }),
+                                    FkAction::Cascade => Expr::Column(ColumnRef::table_qualified(
+                                        "new",
+                                        to_col_name.clone(),
+                                    )),
                                     FkAction::SetDefault => {
                                         from_col.default_expr.clone().unwrap_or(Expr::Null)
                                     }

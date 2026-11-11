@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 #[test]
-#[ignore = "requires Phase 7 JSON extension aggregate functions (json_group_array, json_group_object); pure-SQL subtests verified in phase5_window_analyze_planner_gate"]
 fn test_windowB() {
     let raw = include_str!("../../sqlite/test/windowB.test");
     let script = sqliters_tcltest::strip_test_comments(raw);

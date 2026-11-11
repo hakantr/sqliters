@@ -1,4 +1,5 @@
 //! End-to-end SQL suite and bidirectional binary compatibility tests against `/usr/bin/sqlite3` (v3.54.1).
+#![forbid(unsafe_code)]
 
 use std::fs;
 use std::path::{Path, PathBuf};

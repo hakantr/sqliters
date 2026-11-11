@@ -235,6 +235,450 @@ mod fkey7;
 #[path = "sqlite_test/fkey8.rs"]
 mod fkey8;
 #[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5aa.rs"]
+mod fts5_ext_fts5aa;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5ab.rs"]
+mod fts5_ext_fts5ab;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5ac.rs"]
+mod fts5_ext_fts5ac;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5ad.rs"]
+mod fts5_ext_fts5ad;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5ae.rs"]
+mod fts5_ext_fts5ae;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5af.rs"]
+mod fts5_ext_fts5af;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5ag.rs"]
+mod fts5_ext_fts5ag;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5ah.rs"]
+mod fts5_ext_fts5ah;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5ai.rs"]
+mod fts5_ext_fts5ai;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5aj.rs"]
+mod fts5_ext_fts5aj;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5ak.rs"]
+mod fts5_ext_fts5ak;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5al.rs"]
+mod fts5_ext_fts5al;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5alter.rs"]
+mod fts5_ext_fts5alter;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5auto.rs"]
+mod fts5_ext_fts5auto;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5aux.rs"]
+mod fts5_ext_fts5aux;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5aux2.rs"]
+mod fts5_ext_fts5aux2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5auxdata.rs"]
+mod fts5_ext_fts5auxdata;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5bigid.rs"]
+mod fts5_ext_fts5bigid;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5bigpl.rs"]
+mod fts5_ext_fts5bigpl;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5bigtok.rs"]
+mod fts5_ext_fts5bigtok;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5bigtok2.rs"]
+mod fts5_ext_fts5bigtok2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5blob.rs"]
+mod fts5_ext_fts5blob;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5cat.rs"]
+mod fts5_ext_fts5cat;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5circref.rs"]
+mod fts5_ext_fts5circref;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5colset.rs"]
+mod fts5_ext_fts5colset;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5columnsize.rs"]
+mod fts5_ext_fts5columnsize;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5config.rs"]
+mod fts5_ext_fts5config;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5conflict.rs"]
+mod fts5_ext_fts5conflict;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5connect.rs"]
+mod fts5_ext_fts5connect;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5content.rs"]
+mod fts5_ext_fts5content;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5contentless.rs"]
+mod fts5_ext_fts5contentless;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5contentless2.rs"]
+mod fts5_ext_fts5contentless2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5contentless3.rs"]
+mod fts5_ext_fts5contentless3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5contentless4.rs"]
+mod fts5_ext_fts5contentless4;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5contentless5.rs"]
+mod fts5_ext_fts5contentless5;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5corrupt.rs"]
+mod fts5_ext_fts5corrupt;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5corrupt2.rs"]
+mod fts5_ext_fts5corrupt2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5corrupt3.rs"]
+mod fts5_ext_fts5corrupt3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5corrupt4.rs"]
+mod fts5_ext_fts5corrupt4;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5corrupt5.rs"]
+mod fts5_ext_fts5corrupt5;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5corrupt6.rs"]
+mod fts5_ext_fts5corrupt6;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5corrupt7.rs"]
+mod fts5_ext_fts5corrupt7;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5corrupt8.rs"]
+mod fts5_ext_fts5corrupt8;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5corrupt9.rs"]
+mod fts5_ext_fts5corrupt9;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5corruptA.rs"]
+mod fts5_ext_fts5corruptA;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5corruptB.rs"]
+mod fts5_ext_fts5corruptB;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5corruptbig.rs"]
+mod fts5_ext_fts5corruptbig;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5delete.rs"]
+mod fts5_ext_fts5delete;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5detail.rs"]
+mod fts5_ext_fts5detail;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5determin.rs"]
+mod fts5_ext_fts5determin;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5dlidx.rs"]
+mod fts5_ext_fts5dlidx;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5doclist.rs"]
+mod fts5_ext_fts5doclist;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5ea.rs"]
+mod fts5_ext_fts5ea;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5eb.rs"]
+mod fts5_ext_fts5eb;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5expr.rs"]
+mod fts5_ext_fts5expr;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5fault1.rs"]
+mod fts5_ext_fts5fault1;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5fault2.rs"]
+mod fts5_ext_fts5fault2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5fault3.rs"]
+mod fts5_ext_fts5fault3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5fault4.rs"]
+mod fts5_ext_fts5fault4;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5fault5.rs"]
+mod fts5_ext_fts5fault5;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5fault6.rs"]
+mod fts5_ext_fts5fault6;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5fault7.rs"]
+mod fts5_ext_fts5fault7;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5fault8.rs"]
+mod fts5_ext_fts5fault8;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5fault9.rs"]
+mod fts5_ext_fts5fault9;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5faultA.rs"]
+mod fts5_ext_fts5faultA;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5faultB.rs"]
+mod fts5_ext_fts5faultB;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5faultD.rs"]
+mod fts5_ext_fts5faultD;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5faultE.rs"]
+mod fts5_ext_fts5faultE;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5faultF.rs"]
+mod fts5_ext_fts5faultF;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5faultG.rs"]
+mod fts5_ext_fts5faultG;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5faultH.rs"]
+mod fts5_ext_fts5faultH;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5faultI.rs"]
+mod fts5_ext_fts5faultI;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5first.rs"]
+mod fts5_ext_fts5first;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5full.rs"]
+mod fts5_ext_fts5full;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5fuzz1.rs"]
+mod fts5_ext_fts5fuzz1;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5hash.rs"]
+mod fts5_ext_fts5hash;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5integrity.rs"]
+mod fts5_ext_fts5integrity;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5integrity2.rs"]
+mod fts5_ext_fts5integrity2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5interrupt.rs"]
+mod fts5_ext_fts5interrupt;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5join.rs"]
+mod fts5_ext_fts5join;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5lastrowid.rs"]
+mod fts5_ext_fts5lastrowid;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5leftjoin.rs"]
+mod fts5_ext_fts5leftjoin;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5limits.rs"]
+mod fts5_ext_fts5limits;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5locale.rs"]
+mod fts5_ext_fts5locale;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5matchinfo.rs"]
+mod fts5_ext_fts5matchinfo;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5merge.rs"]
+mod fts5_ext_fts5merge;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5merge2.rs"]
+mod fts5_ext_fts5merge2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5misc.rs"]
+mod fts5_ext_fts5misc;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5multi.rs"]
+mod fts5_ext_fts5multi;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5multiclient.rs"]
+mod fts5_ext_fts5multiclient;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5near.rs"]
+mod fts5_ext_fts5near;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5onepass.rs"]
+mod fts5_ext_fts5onepass;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5optimize.rs"]
+mod fts5_ext_fts5optimize;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5optimize2.rs"]
+mod fts5_ext_fts5optimize2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5optimize3.rs"]
+mod fts5_ext_fts5optimize3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5origintext.rs"]
+mod fts5_ext_fts5origintext;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5origintext2.rs"]
+mod fts5_ext_fts5origintext2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5origintext3.rs"]
+mod fts5_ext_fts5origintext3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5origintext4.rs"]
+mod fts5_ext_fts5origintext4;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5origintext5.rs"]
+mod fts5_ext_fts5origintext5;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5origintext6.rs"]
+mod fts5_ext_fts5origintext6;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5phrase.rs"]
+mod fts5_ext_fts5phrase;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5plan.rs"]
+mod fts5_ext_fts5plan;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5porter.rs"]
+mod fts5_ext_fts5porter;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5porter2.rs"]
+mod fts5_ext_fts5porter2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5prefix.rs"]
+mod fts5_ext_fts5prefix;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5prefix2.rs"]
+mod fts5_ext_fts5prefix2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5query.rs"]
+mod fts5_ext_fts5query;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5rank.rs"]
+mod fts5_ext_fts5rank;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5rebuild.rs"]
+mod fts5_ext_fts5rebuild;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5restart.rs"]
+mod fts5_ext_fts5restart;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5rowid.rs"]
+mod fts5_ext_fts5rowid;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5savepoint.rs"]
+mod fts5_ext_fts5savepoint;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5secure.rs"]
+mod fts5_ext_fts5secure;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5secure2.rs"]
+mod fts5_ext_fts5secure2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5secure3.rs"]
+mod fts5_ext_fts5secure3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5secure4.rs"]
+mod fts5_ext_fts5secure4;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5secure5.rs"]
+mod fts5_ext_fts5secure5;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5secure6.rs"]
+mod fts5_ext_fts5secure6;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5secure7.rs"]
+mod fts5_ext_fts5secure7;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5secure8.rs"]
+mod fts5_ext_fts5secure8;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5securefault.rs"]
+mod fts5_ext_fts5securefault;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5simple.rs"]
+mod fts5_ext_fts5simple;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5simple2.rs"]
+mod fts5_ext_fts5simple2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5simple3.rs"]
+mod fts5_ext_fts5simple3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5synonym.rs"]
+mod fts5_ext_fts5synonym;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5synonym2.rs"]
+mod fts5_ext_fts5synonym2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5tok1.rs"]
+mod fts5_ext_fts5tok1;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5tok2.rs"]
+mod fts5_ext_fts5tok2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5tokendata.rs"]
+mod fts5_ext_fts5tokendata;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5tokenizer.rs"]
+mod fts5_ext_fts5tokenizer;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5tokenizer2.rs"]
+mod fts5_ext_fts5tokenizer2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5tokenizer3.rs"]
+mod fts5_ext_fts5tokenizer3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5trigram.rs"]
+mod fts5_ext_fts5trigram;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5trigram2.rs"]
+mod fts5_ext_fts5trigram2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5ubsan.rs"]
+mod fts5_ext_fts5ubsan;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5umlaut.rs"]
+mod fts5_ext_fts5umlaut;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5unicode.rs"]
+mod fts5_ext_fts5unicode;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5unicode2.rs"]
+mod fts5_ext_fts5unicode2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5unicode3.rs"]
+mod fts5_ext_fts5unicode3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5unicode4.rs"]
+mod fts5_ext_fts5unicode4;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5unindexed.rs"]
+mod fts5_ext_fts5unindexed;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5unindexed2.rs"]
+mod fts5_ext_fts5unindexed2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5update.rs"]
+mod fts5_ext_fts5update;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5update2.rs"]
+mod fts5_ext_fts5update2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5version.rs"]
+mod fts5_ext_fts5version;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5vocab.rs"]
+mod fts5_ext_fts5vocab;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/fts5_ext_fts5vocab2.rs"]
+mod fts5_ext_fts5vocab2;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/func.rs"]
 mod func;
 #[allow(non_snake_case)]
@@ -394,6 +838,42 @@ mod joinH;
 #[path = "sqlite_test/joinI.rs"]
 mod joinI;
 #[allow(non_snake_case)]
+#[path = "sqlite_test/json101.rs"]
+mod json101;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/json102.rs"]
+mod json102;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/json103.rs"]
+mod json103;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/json104.rs"]
+mod json104;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/json105.rs"]
+mod json105;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/json106.rs"]
+mod json106;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/json107.rs"]
+mod json107;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/json108.rs"]
+mod json108;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/json109.rs"]
+mod json109;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/json501.rs"]
+mod json501;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/json502.rs"]
+mod json502;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/jsonb01.rs"]
+mod jsonb01;
+#[allow(non_snake_case)]
 #[path = "sqlite_test/like.rs"]
 mod like;
 #[allow(non_snake_case)]
@@ -531,6 +1011,84 @@ mod rowvalue9;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/rowvalueA.rs"]
 mod rowvalueA;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtree1.rs"]
+mod rtree_ext_rtree1;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtree2.rs"]
+mod rtree_ext_rtree2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtree3.rs"]
+mod rtree_ext_rtree3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtree4.rs"]
+mod rtree_ext_rtree4;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtree5.rs"]
+mod rtree_ext_rtree5;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtree6.rs"]
+mod rtree_ext_rtree6;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtree7.rs"]
+mod rtree_ext_rtree7;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtree8.rs"]
+mod rtree_ext_rtree8;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtree9.rs"]
+mod rtree_ext_rtree9;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtreeA.rs"]
+mod rtree_ext_rtreeA;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtreeB.rs"]
+mod rtree_ext_rtreeB;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtreeC.rs"]
+mod rtree_ext_rtreeC;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtreeD.rs"]
+mod rtree_ext_rtreeD;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtreeE.rs"]
+mod rtree_ext_rtreeE;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtreeF.rs"]
+mod rtree_ext_rtreeF;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtreeG.rs"]
+mod rtree_ext_rtreeG;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtreeH.rs"]
+mod rtree_ext_rtreeH;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtreeI.rs"]
+mod rtree_ext_rtreeI;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtreeJ.rs"]
+mod rtree_ext_rtreeJ;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtreecheck.rs"]
+mod rtree_ext_rtreecheck;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtreecirc.rs"]
+mod rtree_ext_rtreecirc;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtreeconnect.rs"]
+mod rtree_ext_rtreeconnect;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtreedoc.rs"]
+mod rtree_ext_rtreedoc;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtreedoc2.rs"]
+mod rtree_ext_rtreedoc2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtreedoc3.rs"]
+mod rtree_ext_rtreedoc3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/rtree_ext_rtreefuzz001.rs"]
+mod rtree_ext_rtreefuzz001;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/savepoint.rs"]
 mod savepoint;
@@ -762,6 +1320,84 @@ mod view2;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/view3.rs"]
 mod view3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtab1.rs"]
+mod vtab1;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtab2.rs"]
+mod vtab2;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtab3.rs"]
+mod vtab3;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtab4.rs"]
+mod vtab4;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtab5.rs"]
+mod vtab5;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtab6.rs"]
+mod vtab6;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtab7.rs"]
+mod vtab7;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtab8.rs"]
+mod vtab8;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtab9.rs"]
+mod vtab9;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtabA.rs"]
+mod vtabA;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtabB.rs"]
+mod vtabB;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtabC.rs"]
+mod vtabC;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtabD.rs"]
+mod vtabD;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtabE.rs"]
+mod vtabE;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtabF.rs"]
+mod vtabF;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtabH.rs"]
+mod vtabH;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtabI.rs"]
+mod vtabI;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtabJ.rs"]
+mod vtabJ;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtabK.rs"]
+mod vtabK;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtabL.rs"]
+mod vtabL;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtab_alter.rs"]
+mod vtab_alter;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtab_err.rs"]
+mod vtab_err;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtab_shared.rs"]
+mod vtab_shared;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtabdistinct.rs"]
+mod vtabdistinct;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtabdrop.rs"]
+mod vtabdrop;
+#[allow(non_snake_case)]
+#[path = "sqlite_test/vtabrhs1.rs"]
+mod vtabrhs1;
 #[allow(non_snake_case)]
 #[path = "sqlite_test/wal.rs"]
 mod wal;

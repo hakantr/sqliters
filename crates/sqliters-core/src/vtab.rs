@@ -61,12 +61,12 @@ impl VTabDeclaredSchema {
     }
 }
 
-/// Strips any `HIDDEN` keyword token from a column's `type_name`, returning `(cleaned_type_name, is_hidden)`.
+/// Strips the first `HIDDEN` keyword token from a column's `type_name`, returning `(cleaned_type_name, is_hidden)`.
 pub fn strip_hidden_from_type_name(type_name: &str) -> (String, bool) {
     let mut is_hidden = false;
     let mut kept = Vec::new();
     for word in type_name.split_whitespace() {
-        if word.eq_ignore_ascii_case("hidden") {
+        if !is_hidden && word.eq_ignore_ascii_case("hidden") {
             is_hidden = true;
         } else {
             kept.push(word);
@@ -80,21 +80,36 @@ pub fn parse_declare_vtab_sql(
     table_name: &str,
     create_table_sql: &str,
 ) -> Result<(TableSchema, Vec<bool>)> {
-    let (Some(Stmt::CreateTable(mut ct)), tail) = parse_one(create_table_sql)? else {
+    if create_table_sql.trim().is_empty() {
         return Err(SqliteError::new(
             ErrorCode::Error,
             "vtable constructor did not declare schema",
         ));
-    };
-    if !tail.trim().is_empty() {
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            "extra input in declare_vtab SQL",
-        ));
     }
+    let parsed = parse_one(create_table_sql)
+        .map_err(|_| SqliteError::new(ErrorCode::Error, "syntax error"))?;
+    let mut ct = match parsed {
+        (Some(Stmt::CreateTable(ct)), tail) => {
+            if !tail.trim().is_empty() {
+                return Err(SqliteError::new(ErrorCode::Error, "syntax error"));
+            }
+            ct
+        }
+        (Some(Stmt::CreateTableAs { .. }), _) => {
+            return Err(SqliteError::new(ErrorCode::Error, "SQL logic error"));
+        }
+        _ => return Err(SqliteError::new(ErrorCode::Error, "syntax error")),
+    };
     let mut hidden_cols = Vec::with_capacity(ct.columns.len());
     for cdef in &mut ct.columns {
-        let (cleaned, is_hidden) = strip_hidden_from_type_name(&cdef.type_name);
+        let raw_trimmed = cdef.type_name.trim();
+        let pre_std = match raw_trimmed.to_ascii_uppercase().as_str() {
+            "TEXT" | "INT" | "INTEGER" | "REAL" | "BLOB" | "NUM" => {
+                raw_trimmed.to_ascii_uppercase()
+            }
+            _ => cdef.type_name.clone(),
+        };
+        let (cleaned, is_hidden) = strip_hidden_from_type_name(&pre_std);
         cdef.type_name = cleaned;
         hidden_cols.push(is_hidden);
     }
@@ -259,6 +274,16 @@ impl VTabRegistry {
     /// Returns a reference to a connected virtual table entry if present.
     pub fn get_connected(&self, db_name: &str, table_name: &str) -> Option<&ConnectedVTabEntry> {
         self.connected.get(&Self::slot_key(db_name, table_name))
+    }
+
+    /// Returns `true` if a connected virtual table belongs to an eponymous-only read-only module.
+    pub fn is_connected_read_only(&self, db_name: &str, table_name: &str) -> bool {
+        match self.get_connected(db_name, table_name) {
+            Some(entry) => self
+                .get_module(&entry.module_name)
+                .is_some_and(|m| m.is_eponymous_only()),
+            None => false,
+        }
     }
 
     /// Returns a mutable reference to a connected virtual table entry if present.

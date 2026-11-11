@@ -7,11 +7,3821 @@
     "sqlite/ext/rtree"
   ],
   "summary": {
-    "total_registered": 123,
-    "active": 70,
-    "ignored": 53
+    "total_registered": 335,
+    "active": 131,
+    "ignored": 204
   },
   "tests": [
+    {
+      "id": "sqlite/ext/fts5/test/fts5aa.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5aa.test",
+      "source_path": "sqlite/ext/fts5/test/fts5aa.test",
+      "sha256": "8afafde34748b90f9a244e838ac44cf72f541fbae971c95c9603d65a8c140f7e",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5aa.rs",
+      "module_name": "fts5_ext_fts5aa",
+      "test_fn": "test_fts5_ext_fts5aa",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_register_origintext",
+        "fts5_decode"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 custom origintext tokenizer FFI hook (sqlite3_fts5_register_origintext)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5ab.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5ab.test",
+      "source_path": "sqlite/ext/fts5/test/fts5ab.test",
+      "sha256": "1df9494be684b3745971e6600e3927ac7bacb8d29ba1205ac5245edbc0ea15d7",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5ab.rs",
+      "module_name": "fts5_ext_fts5ab",
+      "test_fn": "test_fts5_ext_fts5ab",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5ab_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "266/286 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 266,
+      "expected_subtest_count": 286
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5ac.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5ac.test",
+      "source_path": "sqlite/ext/fts5/test/fts5ac.test",
+      "sha256": "b54206d401c4b699b59c6d223300b14e974746c4788f5dd75a76460696cd6822",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5ac.rs",
+      "module_name": "fts5_ext_fts5ac",
+      "test_fn": "test_fts5_ext_fts5ac",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5_expr"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5_expr() internal parser diagnostic SQL function",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5ad.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5ad.test",
+      "source_path": "sqlite/ext/fts5/test/fts5ad.test",
+      "sha256": "f3a3813e4d93558b57237b440177c4ab7a54ca577da2c5b0957f762faf6b3738",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5ad.rs",
+      "module_name": "fts5_ext_fts5ad",
+      "test_fn": "test_fts5_ext_fts5ad",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 783,
+      "expected_subtest_count": 783
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5ae.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5ae.test",
+      "source_path": "sqlite/ext/fts5/test/fts5ae.test",
+      "sha256": "77983d2b0cac08616fc81398177538fc6616a29d735b1452f727d1ce717d5398",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5ae.rs",
+      "module_name": "fts5_ext_fts5ae",
+      "test_fn": "test_fts5_ext_fts5ae",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testfixture Tcl command `sqlite3_fts5_create_function`",
+      "observed_passed_subtests": 6,
+      "expected_subtest_count": 6
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5af.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5af.test",
+      "source_path": "sqlite/ext/fts5/test/fts5af.test",
+      "sha256": "68e44a6c1db3490584f858438261e60802dca3ff6809bb56f3acc3fe0c611681",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5af.rs",
+      "module_name": "fts5_ext_fts5af",
+      "test_fn": "test_fts5_ext_fts5af",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5af_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "265/559 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 265,
+      "expected_subtest_count": 559
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5ag.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5ag.test",
+      "source_path": "sqlite/ext/fts5/test/fts5ag.test",
+      "sha256": "0ac51d0734a4c7b0b3c9cde0c8457f07e997cb81e0f76f7bb4ef780f58f2e14b",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5ag.rs",
+      "module_name": "fts5_ext_fts5ag",
+      "test_fn": "test_fts5_ext_fts5ag",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testfixture Tcl command `sqlite3_fts5_create_function`",
+      "observed_passed_subtests": 2,
+      "expected_subtest_count": 2
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5ah.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5ah.test",
+      "source_path": "sqlite/ext/fts5/test/fts5ah.test",
+      "sha256": "da9c33fe2af3867b0472b2894091e37e0ab175566a71e1e9eaf6941aca05b437",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5ah.rs",
+      "module_name": "fts5_ext_fts5ah",
+      "test_fn": "test_fts5_ext_fts5ah",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5_decode"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5_decode() internal segment blob decoder SQL function",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5ai.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5ai.test",
+      "source_path": "sqlite/ext/fts5/test/fts5ai.test",
+      "sha256": "e7bbb83a2f7b3a3ee6cef6acebd210abb0e97f859523ceeb89884a8fdb8c99a9",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5ai.rs",
+      "module_name": "fts5_ext_fts5ai",
+      "test_fn": "test_fts5_ext_fts5ai",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 12,
+      "expected_subtest_count": 12
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5aj.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5aj.test",
+      "source_path": "sqlite/ext/fts5/test/fts5aj.test",
+      "sha256": "f02f59516840fd9ec73f42f5cbfc566b67e9fb8bf1e315f1b5a41e5004f32a70",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5aj.rs",
+      "module_name": "fts5_ext_fts5aj",
+      "test_fn": "test_fts5_ext_fts5aj",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5_decode"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5_decode() internal segment blob decoder SQL function",
+      "observed_passed_subtests": 1,
+      "expected_subtest_count": 1
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5ak.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5ak.test",
+      "source_path": "sqlite/ext/fts5/test/fts5ak.test",
+      "sha256": "62adaae68ff1df2f52912b87a8a4f84246a724637afaffbe5ace0308a95cc027",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5ak.rs",
+      "module_name": "fts5_ext_fts5ak",
+      "test_fn": "test_fts5_ext_fts5ak",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5ak_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "15/25 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 15,
+      "expected_subtest_count": 25
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5al.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5al.test",
+      "source_path": "sqlite/ext/fts5/test/fts5al.test",
+      "sha256": "3ce56673b3151dab84f84f9aca6437167ee3c0deea870f658249c84abb6f4fbf",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5al.rs",
+      "module_name": "fts5_ext_fts5al",
+      "test_fn": "test_fts5_ext_fts5al",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 custom auxiliary function FFI callback (sqlite3_fts5_create_function)",
+      "observed_passed_subtests": 4,
+      "expected_subtest_count": 24
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5alter.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5alter.test",
+      "source_path": "sqlite/ext/fts5/test/fts5alter.test",
+      "sha256": "b90a8d7c3e7d1d0b41992368c4bd4870f51b1d7dfeaa60b3416e982b2a8e43b4",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5alter.rs",
+      "module_name": "fts5_ext_fts5alter",
+      "test_fn": "test_fts5_ext_fts5alter",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "match"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C diagnostic/test SQL function `match()`",
+      "observed_passed_subtests": 6,
+      "expected_subtest_count": 12
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5auto.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5auto.test",
+      "source_path": "sqlite/ext/fts5/test/fts5auto.test",
+      "sha256": "e06f4e9e6f53ec89f714773a36bebfdc8de28b27f0032b88fedad1dae21527f4",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5auto.rs",
+      "module_name": "fts5_ext_fts5auto",
+      "test_fn": "test_fts5_ext_fts5auto",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testfixture Tcl command `sqlite3_fts5_create_function`",
+      "observed_passed_subtests": 1,
+      "expected_subtest_count": 1
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5aux.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5aux.test",
+      "source_path": "sqlite/ext/fts5/test/fts5aux.test",
+      "sha256": "cd77b4965f465543d5e23cd239a2c808ed987599679f1829e67a6ed438a49aed",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5aux.rs",
+      "module_name": "fts5_ext_fts5aux",
+      "test_fn": "test_fts5_ext_fts5aux",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 custom auxiliary function FFI callback (sqlite3_fts5_create_function)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5aux2.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5aux2.test",
+      "source_path": "sqlite/ext/fts5/test/fts5aux2.test",
+      "sha256": "78bff48bf6a46b8732b7829703c261420369adacbbdc4fe1a50107a8f9be9f0b",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5aux2.rs",
+      "module_name": "fts5_ext_fts5aux2",
+      "test_fn": "test_fts5_ext_fts5aux2",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testfixture Tcl command `sqlite3_fts5_create_function`",
+      "observed_passed_subtests": 1,
+      "expected_subtest_count": 1
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5auxdata.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5auxdata.test",
+      "source_path": "sqlite/ext/fts5/test/fts5auxdata.test",
+      "sha256": "0dcd832338974aadcbf4d33d240915716ba26ce1dc445beb4f50a91ed492e3c0",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5auxdata.rs",
+      "module_name": "fts5_ext_fts5auxdata",
+      "test_fn": "test_fts5_ext_fts5auxdata",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 custom auxiliary function FFI callback (sqlite3_fts5_create_function)",
+      "observed_passed_subtests": 1,
+      "expected_subtest_count": 1
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5bigid.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5bigid.test",
+      "source_path": "sqlite/ext/fts5/test/fts5bigid.test",
+      "sha256": "407ee00aee7721b33d316a485112b2994f726b1c93b9fedfee07ebbce69a2f7b",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5bigid.rs",
+      "module_name": "fts5_ext_fts5bigid",
+      "test_fn": "test_fts5_ext_fts5bigid",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "stress_runtime"
+      ],
+      "status": "ignored",
+      "ignore_reason": "long-running randomized/stress Tcl permutation exceeding unit-test timeout budget",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5bigpl.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5bigpl.test",
+      "source_path": "sqlite/ext/fts5/test/fts5bigpl.test",
+      "sha256": "890051596aa2adaf80d9bee25e47a4b7ca4a075c40f8c49d7aa10a3a8da04162",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5bigpl.rs",
+      "module_name": "fts5_ext_fts5bigpl",
+      "test_fn": "test_fts5_ext_fts5bigpl",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5bigpl_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "1/4 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 1,
+      "expected_subtest_count": 4
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5bigtok.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5bigtok.test",
+      "source_path": "sqlite/ext/fts5/test/fts5bigtok.test",
+      "sha256": "e9797781413f82f5e6182201a1d928b2a21a99106fd9be409164016883a6adf6",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5bigtok.rs",
+      "module_name": "fts5_ext_fts5bigtok",
+      "test_fn": "test_fts5_ext_fts5bigtok",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5vocab"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5vocab vocabulary virtual table module",
+      "observed_passed_subtests": 240,
+      "expected_subtest_count": 296
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5bigtok2.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5bigtok2.test",
+      "source_path": "sqlite/ext/fts5/test/fts5bigtok2.test",
+      "sha256": "2c3d64a9a7ac81453a4fc5e497590f75772e05f73640740df05f0ae8005e4f3f",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5bigtok2.rs",
+      "module_name": "fts5_ext_fts5bigtok2",
+      "test_fn": "test_fts5_ext_fts5bigtok2",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 2,
+      "expected_subtest_count": 2
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5blob.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5blob.test",
+      "source_path": "sqlite/ext/fts5/test/fts5blob.test",
+      "sha256": "31cb83d29c7441d5d66eab50c6836e49fc441295d4b129e6d3d12b632205efc6",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5blob.rs",
+      "module_name": "fts5_ext_fts5blob",
+      "test_fn": "test_fts5_ext_fts5blob",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5vocab"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5vocab vocabulary virtual table module",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5cat.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5cat.test",
+      "source_path": "sqlite/ext/fts5/test/fts5cat.test",
+      "sha256": "4401e04e16de4381efe4aebd28bcf0623aefae9cdfd6e5f731ed9ac28ba53312",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5cat.rs",
+      "module_name": "fts5_ext_fts5cat",
+      "test_fn": "test_fts5_ext_fts5cat",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5vocab"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5vocab vocabulary virtual table module",
+      "observed_passed_subtests": 5,
+      "expected_subtest_count": 9
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5circref.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5circref.test",
+      "source_path": "sqlite/ext/fts5/test/fts5circref.test",
+      "sha256": "d5c50d855c24a18ccea353119dd4f86c82ee694b55ce83e53511448b86ae21a5",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5circref.rs",
+      "module_name": "fts5_ext_fts5circref",
+      "test_fn": "test_fts5_ext_fts5circref",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5circref_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "6/11 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 6,
+      "expected_subtest_count": 11
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5colset.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5colset.test",
+      "source_path": "sqlite/ext/fts5/test/fts5colset.test",
+      "sha256": "fb373e5678a673654c4ce6aacd1ddfa9baa14a5b34b84b5e9c50babb0c4a4448",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5colset.rs",
+      "module_name": "fts5_ext_fts5colset",
+      "test_fn": "test_fts5_ext_fts5colset",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5_expr"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5_expr() internal parser diagnostic SQL function",
+      "observed_passed_subtests": 58,
+      "expected_subtest_count": 63
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5columnsize.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5columnsize.test",
+      "source_path": "sqlite/ext/fts5/test/fts5columnsize.test",
+      "sha256": "fbfb25151b8cf8c6f48d96c36dbf305cd7ec85feb23e59fbb79ab5e2440ef079",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5columnsize.rs",
+      "module_name": "fts5_ext_fts5columnsize",
+      "test_fn": "test_fts5_ext_fts5columnsize",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testfixture Tcl command `sqlite3_fts5_create_function`",
+      "observed_passed_subtests": 20,
+      "expected_subtest_count": 26
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5config.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5config.test",
+      "source_path": "sqlite/ext/fts5/test/fts5config.test",
+      "sha256": "6f639ac1536e60f37a88bb2c1cdcf4ad01d2c289d69b0b14b0ce2759773ecf38",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5config.rs",
+      "module_name": "fts5_ext_fts5config",
+      "test_fn": "test_fts5_ext_fts5config",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 custom auxiliary function FFI callback (sqlite3_fts5_create_function)",
+      "observed_passed_subtests": 5,
+      "expected_subtest_count": 17
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5conflict.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5conflict.test",
+      "source_path": "sqlite/ext/fts5/test/fts5conflict.test",
+      "sha256": "af6fd5d96569e53076cc59d218e64f48b58149ab657d4144e22315c57a025bba",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5conflict.rs",
+      "module_name": "fts5_ext_fts5conflict",
+      "test_fn": "test_fts5_ext_fts5conflict",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5conflict_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "17/26 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 17,
+      "expected_subtest_count": 26
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5connect.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5connect.test",
+      "source_path": "sqlite/ext/fts5/test/fts5connect.test",
+      "sha256": "cf65bcb5bb8bd2c581b8f860c68021648207efe05c7d7e78d883641b796bad2d",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5connect.rs",
+      "module_name": "fts5_ext_fts5connect",
+      "test_fn": "test_fts5_ext_fts5connect",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5connect_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "84/100 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 84,
+      "expected_subtest_count": 100
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5content.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5content.test",
+      "source_path": "sqlite/ext/fts5/test/fts5content.test",
+      "sha256": "d748292f425e6fbbc69a4291b3d7e5ecfcc067ac1e4600a4cefe0b6f36f626df",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5content.rs",
+      "module_name": "fts5_ext_fts5content",
+      "test_fn": "test_fts5_ext_fts5content",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5content_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "36 subtests passed before C-internal harness divergence (no such table: t5_data)",
+      "observed_passed_subtests": 36,
+      "expected_subtest_count": 42
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5contentless.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5contentless.test",
+      "source_path": "sqlite/ext/fts5/test/fts5contentless.test",
+      "sha256": "75301e5ca6f3f6266d707215a66fbae303acb66fd609fa9c23f51f632ccb25c6",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5contentless.rs",
+      "module_name": "fts5_ext_fts5contentless",
+      "test_fn": "test_fts5_ext_fts5contentless",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5_decode"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5_decode() internal segment blob decoder SQL function",
+      "observed_passed_subtests": 111,
+      "expected_subtest_count": 120
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5contentless2.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5contentless2.test",
+      "source_path": "sqlite/ext/fts5/test/fts5contentless2.test",
+      "sha256": "26d71d46ab30adef9dd13dfa8fe541a5f1673e96cf9153b825e10a91592b87dc",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5contentless2.rs",
+      "module_name": "fts5_ext_fts5contentless2",
+      "test_fn": "test_fts5_ext_fts5contentless2",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5contentless2_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "0 subtests passed before C-internal harness divergence (no such table: t1)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 18
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5contentless3.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5contentless3.test",
+      "source_path": "sqlite/ext/fts5/test/fts5contentless3.test",
+      "sha256": "f675be1369dd65c9c503da975aae20e1386cd3ff30647baa34f59141464e5835",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5contentless3.rs",
+      "module_name": "fts5_ext_fts5contentless3",
+      "test_fn": "test_fts5_ext_fts5contentless3",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5contentless3_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "0 subtests passed before C-internal harness divergence (no such table: ft_data)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 18
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5contentless4.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5contentless4.test",
+      "source_path": "sqlite/ext/fts5/test/fts5contentless4.test",
+      "sha256": "95ad8e57c4e8ac611fdb02e827cb85f442b9d1889e630c02bb6abd13672042b4",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5contentless4.rs",
+      "module_name": "fts5_ext_fts5contentless4",
+      "test_fn": "test_fts5_ext_fts5contentless4",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "stress_runtime"
+      ],
+      "status": "ignored",
+      "ignore_reason": "long-running randomized/stress Tcl permutation exceeding unit-test timeout budget",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5contentless5.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5contentless5.test",
+      "source_path": "sqlite/ext/fts5/test/fts5contentless5.test",
+      "sha256": "b73b5ac08b7afcaa39dda726e0cca99280199bc37a187bb5bb6a9b90e6e6832d",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5contentless5.rs",
+      "module_name": "fts5_ext_fts5contentless5",
+      "test_fn": "test_fts5_ext_fts5contentless5",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testfixture Tcl command `sqlite3_fts5_create_function`",
+      "observed_passed_subtests": 8,
+      "expected_subtest_count": 13
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5corrupt.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5corrupt.test",
+      "source_path": "sqlite/ext/fts5/test/fts5corrupt.test",
+      "sha256": "25415f1e3579a5250504eb127d336b28c118321ee327c26d6cf0a6dd8f2543aa",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5corrupt.rs",
+      "module_name": "fts5_ext_fts5corrupt",
+      "test_fn": "test_fts5_ext_fts5corrupt",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5_decode",
+        "fts5_rowid"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5_decode() internal segment blob decoder SQL function",
+      "observed_passed_subtests": 2,
+      "expected_subtest_count": 3
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5corrupt2.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5corrupt2.test",
+      "source_path": "sqlite/ext/fts5/test/fts5corrupt2.test",
+      "sha256": "7af411c042a8c85631bba874ee8da528a40b30a17dba35a2e513bb8a8d5e9205",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5corrupt2.rs",
+      "module_name": "fts5_ext_fts5corrupt2",
+      "test_fn": "test_fts5_ext_fts5corrupt2",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 custom auxiliary function FFI callback (sqlite3_fts5_create_function)",
+      "observed_passed_subtests": 3340,
+      "expected_subtest_count": 6641
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5corrupt3.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5corrupt3.test",
+      "source_path": "sqlite/ext/fts5/test/fts5corrupt3.test",
+      "sha256": "02b570106c16012c542609d160019cf2fcf4683e8464c927918439ac048ab2c7",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5corrupt3.rs",
+      "module_name": "fts5_ext_fts5corrupt3",
+      "test_fn": "test_fts5_ext_fts5corrupt3",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5vocab",
+        "fts5_decode"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5vocab vocabulary virtual table module",
+      "observed_passed_subtests": 111,
+      "expected_subtest_count": 233
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5corrupt4.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5corrupt4.test",
+      "source_path": "sqlite/ext/fts5/test/fts5corrupt4.test",
+      "sha256": "fe0ffd3c2f8568f10310e3d6436e285261f07fb1195dad9aef204605e233087f",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5corrupt4.rs",
+      "module_name": "fts5_ext_fts5corrupt4",
+      "test_fn": "test_fts5_ext_fts5corrupt4",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 6,
+      "expected_subtest_count": 6
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5corrupt5.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5corrupt5.test",
+      "source_path": "sqlite/ext/fts5/test/fts5corrupt5.test",
+      "sha256": "2fe58965abd1b881553a4b0c17f41ef033572ddf1114257858e2cee37cfcda5c",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5corrupt5.rs",
+      "module_name": "fts5_ext_fts5corrupt5",
+      "test_fn": "test_fts5_ext_fts5corrupt5",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5vocab"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5vocab vocabulary virtual table module",
+      "observed_passed_subtests": 14,
+      "expected_subtest_count": 40
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5corrupt6.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5corrupt6.test",
+      "source_path": "sqlite/ext/fts5/test/fts5corrupt6.test",
+      "sha256": "142f50595138569b631dd52b60f8996c2bc34daa39a013c44311bb32dd768bf8",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5corrupt6.rs",
+      "module_name": "fts5_ext_fts5corrupt6",
+      "test_fn": "test_fts5_ext_fts5corrupt6",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5corrupt6_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "1/2 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 1,
+      "expected_subtest_count": 2
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5corrupt7.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5corrupt7.test",
+      "source_path": "sqlite/ext/fts5/test/fts5corrupt7.test",
+      "sha256": "bb33c48306c1e9ab883d331d7148d4fe66799d6c595fc1e1756107acb9c8952c",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5corrupt7.rs",
+      "module_name": "fts5_ext_fts5corrupt7",
+      "test_fn": "test_fts5_ext_fts5corrupt7",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5_decode"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5_decode() internal segment blob decoder SQL function",
+      "observed_passed_subtests": 2,
+      "expected_subtest_count": 2
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5corrupt8.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5corrupt8.test",
+      "source_path": "sqlite/ext/fts5/test/fts5corrupt8.test",
+      "sha256": "171a6716f5efca8c30d4d86821dda0ab6a3fdc0e787ab0faf2b43da9311eed41",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5corrupt8.rs",
+      "module_name": "fts5_ext_fts5corrupt8",
+      "test_fn": "test_fts5_ext_fts5corrupt8",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5corrupt8_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "16/27 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 16,
+      "expected_subtest_count": 27
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5corrupt9.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5corrupt9.test",
+      "source_path": "sqlite/ext/fts5/test/fts5corrupt9.test",
+      "sha256": "b10b770970edb87897b51e58e49ec90017b94d24a4a4391ae2753529248ddc0a",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5corrupt9.rs",
+      "module_name": "fts5_ext_fts5corrupt9",
+      "test_fn": "test_fts5_ext_fts5corrupt9",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5corrupt9_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "10/14 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 10,
+      "expected_subtest_count": 14
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5corruptA.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5corruptA.test",
+      "source_path": "sqlite/ext/fts5/test/fts5corruptA.test",
+      "sha256": "b865611075f972d8d8b40b47024b0a0c3f9eef7785110b603422108a52da2ab5",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5corruptA.rs",
+      "module_name": "fts5_ext_fts5corruptA",
+      "test_fn": "test_fts5_ext_fts5corruptA",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5corruptA_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "24/31 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 24,
+      "expected_subtest_count": 31
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5corruptB.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5corruptB.test",
+      "source_path": "sqlite/ext/fts5/test/fts5corruptB.test",
+      "sha256": "4b2a6b7131a74be5796b582206ca646752b47ace5369d0632fc1ba1fc17061b8",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5corruptB.rs",
+      "module_name": "fts5_ext_fts5corruptB",
+      "test_fn": "test_fts5_ext_fts5corruptB",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5corruptB_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "1 subtests passed before C-internal harness divergence (cannot change pending byte while database or statement handles are open)",
+      "observed_passed_subtests": 1,
+      "expected_subtest_count": 2
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5corruptbig.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5corruptbig.test",
+      "source_path": "sqlite/ext/fts5/test/fts5corruptbig.test",
+      "sha256": "307d2e71e2cab8a481d8a9a82b0cd1cc40cda8741ac47ee2061cdc9ab03019be",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5corruptbig.rs",
+      "module_name": "fts5_ext_fts5corruptbig",
+      "test_fn": "test_fts5_ext_fts5corruptbig",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5corruptbig_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "0 subtests passed before C-internal harness divergence (can't read \"SQLITE_MAX_LENGTH\": no such variable)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5delete.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5delete.test",
+      "source_path": "sqlite/ext/fts5/test/fts5delete.test",
+      "sha256": "6c478b40e9a87df15ed164383978ceaa721bf25d6822214b0195b35bca3be17d",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5delete.rs",
+      "module_name": "fts5_ext_fts5delete",
+      "test_fn": "test_fts5_ext_fts5delete",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testfixture Tcl command `sqlite3_fts5_create_function`",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5detail.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5detail.test",
+      "source_path": "sqlite/ext/fts5/test/fts5detail.test",
+      "sha256": "18f8848d3310c850bd467fca8976afe509f13fd85082cc34cbc7588c79975ebc",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5detail.rs",
+      "module_name": "fts5_ext_fts5detail",
+      "test_fn": "test_fts5_ext_fts5detail",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5_expr",
+        "fts5_decode"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5_expr() internal parser diagnostic SQL function",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5determin.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5determin.test",
+      "source_path": "sqlite/ext/fts5/test/fts5determin.test",
+      "sha256": "cd2affc78afead37ad06aa84faafdd07f89265deeb3e96e436210bef20952263",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5determin.rs",
+      "module_name": "fts5_ext_fts5determin",
+      "test_fn": "test_fts5_ext_fts5determin",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 15,
+      "expected_subtest_count": 15
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5dlidx.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5dlidx.test",
+      "source_path": "sqlite/ext/fts5/test/fts5dlidx.test",
+      "sha256": "8e0272eee27880507a3f7411dc723ef7ae2b5c9956a97d0d21a4092ef5adac44",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5dlidx.rs",
+      "module_name": "fts5_ext_fts5dlidx",
+      "test_fn": "test_fts5_ext_fts5dlidx",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "stress_runtime"
+      ],
+      "status": "ignored",
+      "ignore_reason": "long-running randomized/stress Tcl permutation exceeding unit-test timeout budget",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5doclist.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5doclist.test",
+      "source_path": "sqlite/ext/fts5/test/fts5doclist.test",
+      "sha256": "d9f8d740fb38688f3c4b268a4d2b1ae7be64f74ecbb8b5ff4e3bc1e65052ba64",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5doclist.rs",
+      "module_name": "fts5_ext_fts5doclist",
+      "test_fn": "test_fts5_ext_fts5doclist",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 6,
+      "expected_subtest_count": 6
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5ea.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5ea.test",
+      "source_path": "sqlite/ext/fts5/test/fts5ea.test",
+      "sha256": "7e3de94640a394b807c83d67955c005df8879d008c2443d2c81ceea359c91de1",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5ea.rs",
+      "module_name": "fts5_ext_fts5ea",
+      "test_fn": "test_fts5_ext_fts5ea",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5_expr"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5_expr() internal parser diagnostic SQL function",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 32
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5eb.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5eb.test",
+      "source_path": "sqlite/ext/fts5/test/fts5eb.test",
+      "sha256": "2228d3c3bcb5602a455c4e966a9c970e580d340032b690296460ffafff56ff42",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5eb.rs",
+      "module_name": "fts5_ext_fts5eb",
+      "test_fn": "test_fts5_ext_fts5eb",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5_expr"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5_expr() internal parser diagnostic SQL function",
+      "observed_passed_subtests": 259,
+      "expected_subtest_count": 283
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5expr.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5expr.test",
+      "source_path": "sqlite/ext/fts5/test/fts5expr.test",
+      "sha256": "d9c278d228c2c7cfb169f24a231313bb758f24d00c096402094ceb972faec803",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5expr.rs",
+      "module_name": "fts5_ext_fts5expr",
+      "test_fn": "test_fts5_ext_fts5expr",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 303,
+      "expected_subtest_count": 303
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5fault1.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5fault1.test",
+      "source_path": "sqlite/ext/fts5/test/fts5fault1.test",
+      "sha256": "a2072f142b66220340c8bc48a41fe337821f32c45b17d20c9dcda3f5da321820",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5fault1.rs",
+      "module_name": "fts5_ext_fts5fault1",
+      "test_fn": "test_fts5_ext_fts5fault1",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test",
+        "fts5_decode"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5fault2.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5fault2.test",
+      "source_path": "sqlite/ext/fts5/test/fts5fault2.test",
+      "sha256": "d4a551c06a36d8f690d7066c2cb8c27907c492840ff1d6529beceb8b3605bd73",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5fault2.rs",
+      "module_name": "fts5_ext_fts5fault2",
+      "test_fn": "test_fts5_ext_fts5fault2",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 4,
+      "expected_subtest_count": 4
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5fault3.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5fault3.test",
+      "source_path": "sqlite/ext/fts5/test/fts5fault3.test",
+      "sha256": "6efcbaf8830c8e9d6139cb4d692469ef736d745a7dc86edda4a591ed29aedbb3",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5fault3.rs",
+      "module_name": "fts5_ext_fts5fault3",
+      "test_fn": "test_fts5_ext_fts5fault3",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 3,
+      "expected_subtest_count": 3
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5fault4.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5fault4.test",
+      "source_path": "sqlite/ext/fts5/test/fts5fault4.test",
+      "sha256": "fd74f97c9be20ebaa65b063b9e50c10c43ff47eb31353486bf9bc4291c9f36db",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5fault4.rs",
+      "module_name": "fts5_ext_fts5fault4",
+      "test_fn": "test_fts5_ext_fts5fault4",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test",
+        "sqlite3_fts5_create_function",
+        "fts5vocab",
+        "fts5_expr"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 2,
+      "expected_subtest_count": 3
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5fault5.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5fault5.test",
+      "source_path": "sqlite/ext/fts5/test/fts5fault5.test",
+      "sha256": "b227d88b43281998b4f1a6361213a631f4467d112a73161061468d545cb610c3",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5fault5.rs",
+      "module_name": "fts5_ext_fts5fault5",
+      "test_fn": "test_fts5_ext_fts5fault5",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test",
+        "fts5vocab"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 2,
+      "expected_subtest_count": 3
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5fault6.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5fault6.test",
+      "source_path": "sqlite/ext/fts5/test/fts5fault6.test",
+      "sha256": "ad23d345cee91640998b8626552a6e9ab24759e733a9b4e6cb495095dd0d8ca2",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5fault6.rs",
+      "module_name": "fts5_ext_fts5fault6",
+      "test_fn": "test_fts5_ext_fts5fault6",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test",
+        "sqlite3_fts5_create_tokenizer"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 2,
+      "expected_subtest_count": 3
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5fault7.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5fault7.test",
+      "source_path": "sqlite/ext/fts5/test/fts5fault7.test",
+      "sha256": "8742e9979439d06c1aa093aa254c5ce5c4eb2a5df81046b6f4b1b7502a150958",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5fault7.rs",
+      "module_name": "fts5_ext_fts5fault7",
+      "test_fn": "test_fts5_ext_fts5fault7",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 1,
+      "expected_subtest_count": 1
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5fault8.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5fault8.test",
+      "source_path": "sqlite/ext/fts5/test/fts5fault8.test",
+      "sha256": "4e49175810c1dc4496297e3b28147dbc0f56e1ef4d8af63e27eef2da26c6e744",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5fault8.rs",
+      "module_name": "fts5_ext_fts5fault8",
+      "test_fn": "test_fts5_ext_fts5fault8",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5fault9.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5fault9.test",
+      "source_path": "sqlite/ext/fts5/test/fts5fault9.test",
+      "sha256": "bd86ef4e52204d53474356d63988ae289e710e033f651bb1def868d3a2e293ae",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5fault9.rs",
+      "module_name": "fts5_ext_fts5fault9",
+      "test_fn": "test_fts5_ext_fts5fault9",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5faultA.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5faultA.test",
+      "source_path": "sqlite/ext/fts5/test/fts5faultA.test",
+      "sha256": "3c237c2f46bbfd0042f44b60564c29c50b39b87b2b7e91f771a28d757fb749b0",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5faultA.rs",
+      "module_name": "fts5_ext_fts5faultA",
+      "test_fn": "test_fts5_ext_fts5faultA",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 4,
+      "expected_subtest_count": 4
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5faultB.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5faultB.test",
+      "source_path": "sqlite/ext/fts5/test/fts5faultB.test",
+      "sha256": "c1e6055d89a0af5352a170a667571571a640e50dea20b5d618c61dce8ba3c99c",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5faultB.rs",
+      "module_name": "fts5_ext_fts5faultB",
+      "test_fn": "test_fts5_ext_fts5faultB",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5faultD.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5faultD.test",
+      "source_path": "sqlite/ext/fts5/test/fts5faultD.test",
+      "sha256": "45c81c0f1b28c16887605583d0c249e94d7b25bb532b064ab574a80684a21a84",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5faultD.rs",
+      "module_name": "fts5_ext_fts5faultD",
+      "test_fn": "test_fts5_ext_fts5faultD",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 2,
+      "expected_subtest_count": 2
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5faultE.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5faultE.test",
+      "source_path": "sqlite/ext/fts5/test/fts5faultE.test",
+      "sha256": "e8ea6ce3e4a1cfff91ff3fb2fbf9bae2f33709dcc2f7f126c270ad54da9552ba",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5faultE.rs",
+      "module_name": "fts5_ext_fts5faultE",
+      "test_fn": "test_fts5_ext_fts5faultE",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 2,
+      "expected_subtest_count": 2
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5faultF.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5faultF.test",
+      "source_path": "sqlite/ext/fts5/test/fts5faultF.test",
+      "sha256": "c3aa1369d34803b7e96a58b36747dbf90620225ed7a955ff50470b5398bce1bf",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5faultF.rs",
+      "module_name": "fts5_ext_fts5faultF",
+      "test_fn": "test_fts5_ext_fts5faultF",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 4
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5faultG.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5faultG.test",
+      "source_path": "sqlite/ext/fts5/test/fts5faultG.test",
+      "sha256": "e5c88438a32a2edda8dc527e6ac86ae384c6c3c75c92993d487c0d119c646e68",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5faultG.rs",
+      "module_name": "fts5_ext_fts5faultG",
+      "test_fn": "test_fts5_ext_fts5faultG",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 1,
+      "expected_subtest_count": 2
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5faultH.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5faultH.test",
+      "source_path": "sqlite/ext/fts5/test/fts5faultH.test",
+      "sha256": "3aa83cb2fcb20952bcfa07a4d950967aa7551be58ae85c91c7ecc649595ea966",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5faultH.rs",
+      "module_name": "fts5_ext_fts5faultH",
+      "test_fn": "test_fts5_ext_fts5faultH",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test",
+        "sqlite3_fts5_register_origintext"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5faultI.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5faultI.test",
+      "source_path": "sqlite/ext/fts5/test/fts5faultI.test",
+      "sha256": "b1b2226ccc416bd32dc8a2035abc9ad9e844d7525f2651d2ca84bc1090b09959",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5faultI.rs",
+      "module_name": "fts5_ext_fts5faultI",
+      "test_fn": "test_fts5_ext_fts5faultI",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab",
+        "foreignkey"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 1,
+      "expected_subtest_count": 1
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5first.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5first.test",
+      "source_path": "sqlite/ext/fts5/test/fts5first.test",
+      "sha256": "4179968d188599f4f0d9d77cf472590ae40308b5284cefb0fb7af242e9794aab",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5first.rs",
+      "module_name": "fts5_ext_fts5first",
+      "test_fn": "test_fts5_ext_fts5first",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testfixture Tcl command `sqlite3_fts5_create_function`",
+      "observed_passed_subtests": 21,
+      "expected_subtest_count": 22
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5full.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5full.test",
+      "source_path": "sqlite/ext/fts5/test/fts5full.test",
+      "sha256": "848fb6a0ed18b170f3efd471ab7f31cc2ffd6cba04f40e9b3e5f855c575bdc65",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5full.rs",
+      "module_name": "fts5_ext_fts5full",
+      "test_fn": "test_fts5_ext_fts5full",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 2,
+      "expected_subtest_count": 2
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5fuzz1.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5fuzz1.test",
+      "source_path": "sqlite/ext/fts5/test/fts5fuzz1.test",
+      "sha256": "b09519c8601fd00a88542a0c51547c38306f7ef8cd3814a7b294cad404eb8874",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5fuzz1.rs",
+      "module_name": "fts5_ext_fts5fuzz1",
+      "test_fn": "test_fts5_ext_fts5fuzz1",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5fuzz1_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "10/14 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 10,
+      "expected_subtest_count": 14
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5hash.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5hash.test",
+      "source_path": "sqlite/ext/fts5/test/fts5hash.test",
+      "sha256": "9f96b67f664a30c768716012db981cf58ea7a6c371c0ffe6b68d7ee7f79af899",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5hash.rs",
+      "module_name": "fts5_ext_fts5hash",
+      "test_fn": "test_fts5_ext_fts5hash",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5vocab"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5vocab vocabulary virtual table module",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5integrity.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5integrity.test",
+      "source_path": "sqlite/ext/fts5/test/fts5integrity.test",
+      "sha256": "9a8aed045a94bd7cbfb40cb1e6b770723728e9ba3a1717f953d10d676d8e8c94",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5integrity.rs",
+      "module_name": "fts5_ext_fts5integrity",
+      "test_fn": "test_fts5_ext_fts5integrity",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5_decode"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5_decode() internal segment blob decoder SQL function",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5integrity2.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5integrity2.test",
+      "source_path": "sqlite/ext/fts5/test/fts5integrity2.test",
+      "sha256": "b367183c3ddc6331a79a63b558fed6d56f2e6198709424f33e7ba4f27c82b6b5",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5integrity2.rs",
+      "module_name": "fts5_ext_fts5integrity2",
+      "test_fn": "test_fts5_ext_fts5integrity2",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 5,
+      "expected_subtest_count": 5
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5interrupt.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5interrupt.test",
+      "source_path": "sqlite/ext/fts5/test/fts5interrupt.test",
+      "sha256": "8c3dd3dfa851c684c89e43e24869646bffaa2b9e2a8e1039b98a3f75a3848708",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5interrupt.rs",
+      "module_name": "fts5_ext_fts5interrupt",
+      "test_fn": "test_fts5_ext_fts5interrupt",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 29,
+      "expected_subtest_count": 29
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5join.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5join.test",
+      "source_path": "sqlite/ext/fts5/test/fts5join.test",
+      "sha256": "c1c27f5eca43b030114e42a0d29a67e980e3408bf0d5075e62fea54b0b72f2a5",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5join.rs",
+      "module_name": "fts5_ext_fts5join",
+      "test_fn": "test_fts5_ext_fts5join",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5join_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "1/6 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 1,
+      "expected_subtest_count": 6
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5lastrowid.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5lastrowid.test",
+      "source_path": "sqlite/ext/fts5/test/fts5lastrowid.test",
+      "sha256": "403ded82b2a03657f4933d785eef01a27d037b5ab28e382cc65aa408c12225e8",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5lastrowid.rs",
+      "module_name": "fts5_ext_fts5lastrowid",
+      "test_fn": "test_fts5_ext_fts5lastrowid",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 7,
+      "expected_subtest_count": 7
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5leftjoin.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5leftjoin.test",
+      "source_path": "sqlite/ext/fts5/test/fts5leftjoin.test",
+      "sha256": "14e5917e40b647f2256dee0d1259c7880709883c67841c4ac7f913e9b88847ee",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5leftjoin.rs",
+      "module_name": "fts5_ext_fts5leftjoin",
+      "test_fn": "test_fts5_ext_fts5leftjoin",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 11,
+      "expected_subtest_count": 11
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5limits.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5limits.test",
+      "source_path": "sqlite/ext/fts5/test/fts5limits.test",
+      "sha256": "57521687cf78183b502c2eea93074a63a36a26a22a5e075cab98f44a14e833b9",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5limits.rs",
+      "module_name": "fts5_ext_fts5limits",
+      "test_fn": "test_fts5_ext_fts5limits",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 7,
+      "expected_subtest_count": 7
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5locale.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5locale.test",
+      "source_path": "sqlite/ext/fts5/test/fts5locale.test",
+      "sha256": "98ac0a41fadcbab7f7ed13188b60460698aece91fd76417ca7eb6df850385c62",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5locale.rs",
+      "module_name": "fts5_ext_fts5locale",
+      "test_fn": "test_fts5_ext_fts5locale",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_tokenizer",
+        "sqlite3_fts5_locale",
+        "fts5vocab"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 custom Tcl tokenizer FFI callback (sqlite3_fts5_create_tokenizer)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5matchinfo.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5matchinfo.test",
+      "source_path": "sqlite/ext/fts5/test/fts5matchinfo.test",
+      "sha256": "98674b0c013ed149d322ccc6378d3acc68265575bfec568af5284bbc09dee5a5",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5matchinfo.rs",
+      "module_name": "fts5_ext_fts5matchinfo",
+      "test_fn": "test_fts5_ext_fts5matchinfo",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5matchinfo_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "0 subtests passed before C-internal harness divergence (missing close-brace)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5merge.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5merge.test",
+      "source_path": "sqlite/ext/fts5/test/fts5merge.test",
+      "sha256": "9ef7ae3ebf31470d080bdbf4c395666aa9a1f291c952d2c2caecab016b84900b",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5merge.rs",
+      "module_name": "fts5_ext_fts5merge",
+      "test_fn": "test_fts5_ext_fts5merge",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5_decode"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5_decode() internal segment blob decoder SQL function",
+      "observed_passed_subtests": 1,
+      "expected_subtest_count": 1
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5merge2.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5merge2.test",
+      "source_path": "sqlite/ext/fts5/test/fts5merge2.test",
+      "sha256": "b9636b45983bbbd9667a4d6c7970cfb28701a0508b48f9db9755fcffa70c78fd",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5merge2.rs",
+      "module_name": "fts5_ext_fts5merge2",
+      "test_fn": "test_fts5_ext_fts5merge2",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 9,
+      "expected_subtest_count": 9
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5misc.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5misc.test",
+      "source_path": "sqlite/ext/fts5/test/fts5misc.test",
+      "sha256": "93fcf97ef69c90d7f5210555982f33ed8e7a0cb4632aed3d269b848b7d69ea7b",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5misc.rs",
+      "module_name": "fts5_ext_fts5misc",
+      "test_fn": "test_fts5_ext_fts5misc",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testfixture Tcl command `sqlite3_fts5_create_function`",
+      "observed_passed_subtests": 1,
+      "expected_subtest_count": 8
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5multi.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5multi.test",
+      "source_path": "sqlite/ext/fts5/test/fts5multi.test",
+      "sha256": "4606449c3a65d647b42b01d37ca44d35f37ded93dc57761c8ef84b038b82e881",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5multi.rs",
+      "module_name": "fts5_ext_fts5multi",
+      "test_fn": "test_fts5_ext_fts5multi",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testfixture Tcl command `sqlite3_fts5_create_function`",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5multiclient.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5multiclient.test",
+      "source_path": "sqlite/ext/fts5/test/fts5multiclient.test",
+      "sha256": "be8401b3ad3e465025b78674745397a56f7030b0c3acaeef25784356dca1362b",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5multiclient.rs",
+      "module_name": "fts5_ext_fts5multiclient",
+      "test_fn": "test_fts5_ext_fts5multiclient",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 24,
+      "expected_subtest_count": 24
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5near.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5near.test",
+      "source_path": "sqlite/ext/fts5/test/fts5near.test",
+      "sha256": "bec4ac7368724634976869057e8037cf0b88f4e8b8c52bafde438c7ed56e0f46",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5near.rs",
+      "module_name": "fts5_ext_fts5near",
+      "test_fn": "test_fts5_ext_fts5near",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5near_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "24/27 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 24,
+      "expected_subtest_count": 27
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5onepass.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5onepass.test",
+      "source_path": "sqlite/ext/fts5/test/fts5onepass.test",
+      "sha256": "76468ab41f7cd867e5ac11e567a07a97476651b554a37aa06e54d92bb649fb79",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5onepass.rs",
+      "module_name": "fts5_ext_fts5onepass",
+      "test_fn": "test_fts5_ext_fts5onepass",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sql_uses_stmt"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testfixture Tcl command `sql_uses_stmt`",
+      "observed_passed_subtests": 37,
+      "expected_subtest_count": 55
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5optimize.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5optimize.test",
+      "source_path": "sqlite/ext/fts5/test/fts5optimize.test",
+      "sha256": "e61911031d164615d0f4bb01fcc56be57ec924104d7f47f9d9a98f5879d5a812",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5optimize.rs",
+      "module_name": "fts5_ext_fts5optimize",
+      "test_fn": "test_fts5_ext_fts5optimize",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5_decode"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C diagnostic/test SQL function `fts5_decode()`",
+      "observed_passed_subtests": 40,
+      "expected_subtest_count": 48
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5optimize2.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5optimize2.test",
+      "source_path": "sqlite/ext/fts5/test/fts5optimize2.test",
+      "sha256": "1ae3cc8b4490ccae31c998b252bc9c1ea35b3723ce74a03aecca3c8cf7b5b585",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5optimize2.rs",
+      "module_name": "fts5_ext_fts5optimize2",
+      "test_fn": "test_fts5_ext_fts5optimize2",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 3,
+      "expected_subtest_count": 3
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5optimize3.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5optimize3.test",
+      "source_path": "sqlite/ext/fts5/test/fts5optimize3.test",
+      "sha256": "b34f0f3a81ac841dda8875c23b8e945d4bd26c3d44014c98d59e07c662995472",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5optimize3.rs",
+      "module_name": "fts5_ext_fts5optimize3",
+      "test_fn": "test_fts5_ext_fts5optimize3",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 3,
+      "expected_subtest_count": 3
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5origintext.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5origintext.test",
+      "source_path": "sqlite/ext/fts5/test/fts5origintext.test",
+      "sha256": "07efc5ccbce9e7bf6df216090c530e52c8ce8eb1465a12563e117efab09655f9",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5origintext.rs",
+      "module_name": "fts5_ext_fts5origintext",
+      "test_fn": "test_fts5_ext_fts5origintext",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_register_origintext",
+        "sqlite3_fts5_create_function",
+        "fts5vocab"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 custom origintext tokenizer FFI hook (sqlite3_fts5_register_origintext)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5origintext2.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5origintext2.test",
+      "source_path": "sqlite/ext/fts5/test/fts5origintext2.test",
+      "sha256": "18c2e6d8c990f720f3dd8c05c36eb164b024effd08889c677d2913308031ef5b",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5origintext2.rs",
+      "module_name": "fts5_ext_fts5origintext2",
+      "test_fn": "test_fts5_ext_fts5origintext2",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_register_origintext",
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 custom origintext tokenizer FFI hook (sqlite3_fts5_register_origintext)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5origintext3.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5origintext3.test",
+      "source_path": "sqlite/ext/fts5/test/fts5origintext3.test",
+      "sha256": "ee37f4afea38715dbb903d38e4c8d04bd9a900b123eb95e02ffd156e7567d385",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5origintext3.rs",
+      "module_name": "fts5_ext_fts5origintext3",
+      "test_fn": "test_fts5_ext_fts5origintext3",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_register_origintext",
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 custom origintext tokenizer FFI hook (sqlite3_fts5_register_origintext)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5origintext4.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5origintext4.test",
+      "source_path": "sqlite/ext/fts5/test/fts5origintext4.test",
+      "sha256": "bf59c897f5efd508f2f0be4a251bb79c480617adc0e17a406545a223c90aa3e3",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5origintext4.rs",
+      "module_name": "fts5_ext_fts5origintext4",
+      "test_fn": "test_fts5_ext_fts5origintext4",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_register_origintext"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 custom origintext tokenizer FFI hook (sqlite3_fts5_register_origintext)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5origintext5.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5origintext5.test",
+      "source_path": "sqlite/ext/fts5/test/fts5origintext5.test",
+      "sha256": "4af1c560fc5d8c127f1f10133f99577e603cf2c654d905de3971fab5d4ae56d8",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5origintext5.rs",
+      "module_name": "fts5_ext_fts5origintext5",
+      "test_fn": "test_fts5_ext_fts5origintext5",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_register_origintext",
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 custom origintext tokenizer FFI hook (sqlite3_fts5_register_origintext)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5origintext6.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5origintext6.test",
+      "source_path": "sqlite/ext/fts5/test/fts5origintext6.test",
+      "sha256": "0c247f8d28134b0e55ddad99365bc1b583062927ed17e879961df50ca35f5d5e",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5origintext6.rs",
+      "module_name": "fts5_ext_fts5origintext6",
+      "test_fn": "test_fts5_ext_fts5origintext6",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_register_origintext",
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 custom origintext tokenizer FFI hook (sqlite3_fts5_register_origintext)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5phrase.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5phrase.test",
+      "source_path": "sqlite/ext/fts5/test/fts5phrase.test",
+      "sha256": "0ffb6298e97c6e3dd956db0eb3c3b5778c362e0f21ed378261675cf5047a5271",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5phrase.rs",
+      "module_name": "fts5_ext_fts5phrase",
+      "test_fn": "test_fts5_ext_fts5phrase",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 46,
+      "expected_subtest_count": 46
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5plan.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5plan.test",
+      "source_path": "sqlite/ext/fts5/test/fts5plan.test",
+      "sha256": "4ec1551cd0fe4ab55ca5c99fc552155d88d55d5302ad15356f0ea38c028c81fb",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5plan.rs",
+      "module_name": "fts5_ext_fts5plan",
+      "test_fn": "test_fts5_ext_fts5plan",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5plan_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "1/6 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 1,
+      "expected_subtest_count": 6
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5porter.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5porter.test",
+      "source_path": "sqlite/ext/fts5/test/fts5porter.test",
+      "sha256": "8a882ee605503fa2363612cbf0e92a3e565bd9fb8fbccd9936bf84dc280d24e8",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5porter.rs",
+      "module_name": "fts5_ext_fts5porter",
+      "test_fn": "test_fts5_ext_fts5porter",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_tokenize"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 direct tokenizer test command (sqlite3_fts5_tokenize)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 23531
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5porter2.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5porter2.test",
+      "source_path": "sqlite/ext/fts5/test/fts5porter2.test",
+      "sha256": "1b7a1c35088057521b10153b9df929bd36e0f14b59cfb5c3bb170927ef6a616d",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5porter2.rs",
+      "module_name": "fts5_ext_fts5porter2",
+      "test_fn": "test_fts5_ext_fts5porter2",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_tokenize"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 direct tokenizer test command (sqlite3_fts5_tokenize)",
+      "observed_passed_subtests": 1,
+      "expected_subtest_count": 31
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5prefix.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5prefix.test",
+      "source_path": "sqlite/ext/fts5/test/fts5prefix.test",
+      "sha256": "af238c21be4cb31a3cec3a01ff7dfaa7b06993c047c51e4cefff8dcd50d67709",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5prefix.rs",
+      "module_name": "fts5_ext_fts5prefix",
+      "test_fn": "test_fts5_ext_fts5prefix",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5_decode"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5_decode() internal segment blob decoder SQL function",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5prefix2.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5prefix2.test",
+      "source_path": "sqlite/ext/fts5/test/fts5prefix2.test",
+      "sha256": "17f44604f2305103f5d587c4b5adf580ad0c288598f8be77ca628597816e750d",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5prefix2.rs",
+      "module_name": "fts5_ext_fts5prefix2",
+      "test_fn": "test_fts5_ext_fts5prefix2",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5prefix2_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "26/29 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 26,
+      "expected_subtest_count": 29
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5query.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5query.test",
+      "source_path": "sqlite/ext/fts5/test/fts5query.test",
+      "sha256": "eb7cf6b39fa2261c51445e1b7246a1b39c999d47863b4b3cb52bfcae8d5217ac",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5query.rs",
+      "module_name": "fts5_ext_fts5query",
+      "test_fn": "test_fts5_ext_fts5query",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 777,
+      "expected_subtest_count": 777
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5rank.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5rank.test",
+      "source_path": "sqlite/ext/fts5/test/fts5rank.test",
+      "sha256": "08d26d42ffa35fd8bfbe49db944789cf6f655f3fb98bdb72512f36541d6d757e",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5rank.rs",
+      "module_name": "fts5_ext_fts5rank",
+      "test_fn": "test_fts5_ext_fts5rank",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 custom auxiliary function FFI callback (sqlite3_fts5_create_function)",
+      "observed_passed_subtests": 4,
+      "expected_subtest_count": 5
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5rebuild.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5rebuild.test",
+      "source_path": "sqlite/ext/fts5/test/fts5rebuild.test",
+      "sha256": "2db37cd1f1697218f79258224416b08f9ba96e5b3df44dbc7c4f3b1bf780683c",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5rebuild.rs",
+      "module_name": "fts5_ext_fts5rebuild",
+      "test_fn": "test_fts5_ext_fts5rebuild",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5rebuild_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "6/9 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 6,
+      "expected_subtest_count": 9
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5restart.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5restart.test",
+      "source_path": "sqlite/ext/fts5/test/fts5restart.test",
+      "sha256": "c5749e6c9c91953c3b9d0089097820642d58ceab25a77a62e730fcb689321ab5",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5restart.rs",
+      "module_name": "fts5_ext_fts5restart",
+      "test_fn": "test_fts5_ext_fts5restart",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5restart_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "14/15 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 14,
+      "expected_subtest_count": 15
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5rowid.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5rowid.test",
+      "source_path": "sqlite/ext/fts5/test/fts5rowid.test",
+      "sha256": "ebcc37333dc5a1510b6998c1383d1ef2aebc37ca5ba58b7b534fac572ace89e6",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5rowid.rs",
+      "module_name": "fts5_ext_fts5rowid",
+      "test_fn": "test_fts5_ext_fts5rowid",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5_decode",
+        "fts5_rowid"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5_decode() internal segment blob decoder SQL function",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5savepoint.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5savepoint.test",
+      "source_path": "sqlite/ext/fts5/test/fts5savepoint.test",
+      "sha256": "992fca54dc7b35eaa68ecb05891984c3f7607e2b86d73866dae2f10ac1703d44",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5savepoint.rs",
+      "module_name": "fts5_ext_fts5savepoint",
+      "test_fn": "test_fts5_ext_fts5savepoint",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab",
+        "fts3"
+      ],
+      "external_dependencies": [
+        "fts5savepoint_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "1/2 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 1,
+      "expected_subtest_count": 2
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5secure.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5secure.test",
+      "source_path": "sqlite/ext/fts5/test/fts5secure.test",
+      "sha256": "3edc4051ab9af6b0ae3dba9fed728974193f3afde593be873ae50b844b370d8f",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5secure.rs",
+      "module_name": "fts5_ext_fts5secure",
+      "test_fn": "test_fts5_ext_fts5secure",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 3508,
+      "expected_subtest_count": 3508
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5secure2.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5secure2.test",
+      "source_path": "sqlite/ext/fts5/test/fts5secure2.test",
+      "sha256": "ff8daf6b238ce84af987575c504e807dd646fe74547d0a1802809f2bf8fa948a",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5secure2.rs",
+      "module_name": "fts5_ext_fts5secure2",
+      "test_fn": "test_fts5_ext_fts5secure2",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5secure2_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "10/13 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 10,
+      "expected_subtest_count": 13
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5secure3.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5secure3.test",
+      "source_path": "sqlite/ext/fts5/test/fts5secure3.test",
+      "sha256": "ef79f97bcb41af239e826fbadf1b4b8a6474342039942ee6f8f2a8dcdb15b943",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5secure3.rs",
+      "module_name": "fts5_ext_fts5secure3",
+      "test_fn": "test_fts5_ext_fts5secure3",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5_decode"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5_decode() internal segment blob decoder SQL function",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5secure4.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5secure4.test",
+      "source_path": "sqlite/ext/fts5/test/fts5secure4.test",
+      "sha256": "d9ac92669d90a93f87aff04197090da84137e7082be2567a567483cf23a6494f",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5secure4.rs",
+      "module_name": "fts5_ext_fts5secure4",
+      "test_fn": "test_fts5_ext_fts5secure4",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5secure4_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "38/40 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 38,
+      "expected_subtest_count": 40
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5secure5.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5secure5.test",
+      "source_path": "sqlite/ext/fts5/test/fts5secure5.test",
+      "sha256": "22def306a866357ee8bc04d40899dd1b1559342e4bc7310799f16127d7ba6747",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5secure5.rs",
+      "module_name": "fts5_ext_fts5secure5",
+      "test_fn": "test_fts5_ext_fts5secure5",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 21,
+      "expected_subtest_count": 21
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5secure6.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5secure6.test",
+      "source_path": "sqlite/ext/fts5/test/fts5secure6.test",
+      "sha256": "e9ddfe8250c2a6fef96994ae4b406fb80b5c1330c7fddafe26c98105e8a8d06c",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5secure6.rs",
+      "module_name": "fts5_ext_fts5secure6",
+      "test_fn": "test_fts5_ext_fts5secure6",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5secure6_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "18/19 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 18,
+      "expected_subtest_count": 19
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5secure7.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5secure7.test",
+      "source_path": "sqlite/ext/fts5/test/fts5secure7.test",
+      "sha256": "27ff6f8fcdc8c08fcdebcce0890feee4a093d34d2232111ecdc1de8f3e897c79",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5secure7.rs",
+      "module_name": "fts5_ext_fts5secure7",
+      "test_fn": "test_fts5_ext_fts5secure7",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 1104,
+      "expected_subtest_count": 1104
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5secure8.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5secure8.test",
+      "source_path": "sqlite/ext/fts5/test/fts5secure8.test",
+      "sha256": "78b11afbb2a1746242a9cd80c6d862329c2ed3c0a922f607b86e7945393103c9",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5secure8.rs",
+      "module_name": "fts5_ext_fts5secure8",
+      "test_fn": "test_fts5_ext_fts5secure8",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5secure8_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "11/14 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 11,
+      "expected_subtest_count": 14
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5securefault.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5securefault.test",
+      "source_path": "sqlite/ext/fts5/test/fts5securefault.test",
+      "sha256": "7c4dbc1e4a437e592303efa58ae4a74a14853152ac97e70e9426bba9fe984432",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5securefault.rs",
+      "module_name": "fts5_ext_fts5securefault",
+      "test_fn": "test_fts5_ext_fts5securefault",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 7,
+      "expected_subtest_count": 7
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5simple.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5simple.test",
+      "source_path": "sqlite/ext/fts5/test/fts5simple.test",
+      "sha256": "528bf8cdcebd12380751e366ef51ed6ec5add5b829e78e3999f061cc4476b3e1",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5simple.rs",
+      "module_name": "fts5_ext_fts5simple",
+      "test_fn": "test_fts5_ext_fts5simple",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5_decode"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5_decode() internal segment blob decoder SQL function",
+      "observed_passed_subtests": 49,
+      "expected_subtest_count": 53
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5simple2.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5simple2.test",
+      "source_path": "sqlite/ext/fts5/test/fts5simple2.test",
+      "sha256": "89fcb2c9794f8c0c3b9c9c3845474d3afd076e9397640f72d69a496df0e09258",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5simple2.rs",
+      "module_name": "fts5_ext_fts5simple2",
+      "test_fn": "test_fts5_ext_fts5simple2",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5_decode"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5_decode() internal segment blob decoder SQL function",
+      "observed_passed_subtests": 62,
+      "expected_subtest_count": 62
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5simple3.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5simple3.test",
+      "source_path": "sqlite/ext/fts5/test/fts5simple3.test",
+      "sha256": "bc48d2067e3d656faa67676cf69670a63e523d982b9eae0357966783e4299a8a",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5simple3.rs",
+      "module_name": "fts5_ext_fts5simple3",
+      "test_fn": "test_fts5_ext_fts5simple3",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testfixture Tcl command `sqlite3_fts5_create_function`",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5synonym.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5synonym.test",
+      "source_path": "sqlite/ext/fts5/test/fts5synonym.test",
+      "sha256": "78cc4e7fce196ec905fd8b5b5cdad581f0a042111defb0582a444c2d51926894",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5synonym.rs",
+      "module_name": "fts5_ext_fts5synonym",
+      "test_fn": "test_fts5_ext_fts5synonym",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_tokenizer",
+        "fts5vocab",
+        "fts5_expr"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 custom Tcl tokenizer FFI callback (sqlite3_fts5_create_tokenizer)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5synonym2.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5synonym2.test",
+      "source_path": "sqlite/ext/fts5/test/fts5synonym2.test",
+      "sha256": "70cb24a217518d48fbc0f3a728efc5297e6dec32d5fc498be5d8c0f0c37c0878",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5synonym2.rs",
+      "module_name": "fts5_ext_fts5synonym2",
+      "test_fn": "test_fts5_ext_fts5synonym2",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_function",
+        "fts5_rowid"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 custom auxiliary function FFI callback (sqlite3_fts5_create_function)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5tok1.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5tok1.test",
+      "source_path": "sqlite/ext/fts5/test/fts5tok1.test",
+      "sha256": "604e70517935e16e763bb29d35bc6c39b828ae78100c5176187f4090d3ea21c9",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5tok1.rs",
+      "module_name": "fts5_ext_fts5tok1",
+      "test_fn": "test_fts5_ext_fts5tok1",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5tokenize",
+        "fts5vocab"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5tokenize diagnostic virtual table module",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5tok2.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5tok2.test",
+      "source_path": "sqlite/ext/fts5/test/fts5tok2.test",
+      "sha256": "2b0633e44e1fb4965444ae524b677d6b9a79ed55d86442bddc2b728397eaf098",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5tok2.rs",
+      "module_name": "fts5_ext_fts5tok2",
+      "test_fn": "test_fts5_ext_fts5tok2",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab",
+        "fts3"
+      ],
+      "external_dependencies": [
+        "fts5tokenize"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5tokenize diagnostic virtual table module",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5tokendata.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5tokendata.test",
+      "source_path": "sqlite/ext/fts5/test/fts5tokendata.test",
+      "sha256": "442c25f6f9126876c659121cfcec09c218517c634155fdd2438d0bc8fb6a24e9",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5tokendata.rs",
+      "module_name": "fts5_ext_fts5tokendata",
+      "test_fn": "test_fts5_ext_fts5tokendata",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_register_origintext",
+        "fts5vocab"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 custom origintext tokenizer FFI hook (sqlite3_fts5_register_origintext)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5tokenizer.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5tokenizer.test",
+      "source_path": "sqlite/ext/fts5/test/fts5tokenizer.test",
+      "sha256": "28ee4aaddfd3a8e0dcad02b937beb5184482ca27b05477e93e423943bd76fc6b",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5tokenizer.rs",
+      "module_name": "fts5_ext_fts5tokenizer",
+      "test_fn": "test_fts5_ext_fts5tokenizer",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_tokenizer",
+        "sqlite3_fts5_create_function",
+        "fts5vocab"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 custom Tcl tokenizer FFI callback (sqlite3_fts5_create_tokenizer)",
+      "observed_passed_subtests": 10,
+      "expected_subtest_count": 11
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5tokenizer2.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5tokenizer2.test",
+      "source_path": "sqlite/ext/fts5/test/fts5tokenizer2.test",
+      "sha256": "029d9d80a042efec0f651b9932b2bb9597e56125abb4d18532fbef2012967f40",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5tokenizer2.rs",
+      "module_name": "fts5_ext_fts5tokenizer2",
+      "test_fn": "test_fts5_ext_fts5tokenizer2",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_tokenizer"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 custom Tcl tokenizer FFI callback (sqlite3_fts5_create_tokenizer)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5tokenizer3.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5tokenizer3.test",
+      "source_path": "sqlite/ext/fts5/test/fts5tokenizer3.test",
+      "sha256": "ccf0cdaa489e568d76732b52deb35e669a1731badae985909ad471dca2d79fe2",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5tokenizer3.rs",
+      "module_name": "fts5_ext_fts5tokenizer3",
+      "test_fn": "test_fts5_ext_fts5tokenizer3",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_tokenizer",
+        "fts5vocab"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 custom Tcl tokenizer FFI callback (sqlite3_fts5_create_tokenizer)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5trigram.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5trigram.test",
+      "source_path": "sqlite/ext/fts5/test/fts5trigram.test",
+      "sha256": "24024a7a5f6c77fa8c3ee536f22988bfa85ae3fc321b1da67254a06c0a97ec64",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5trigram.rs",
+      "module_name": "fts5_ext_fts5trigram",
+      "test_fn": "test_fts5_ext_fts5trigram",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_tokenize",
+        "fts5_expr"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 direct tokenizer test command (sqlite3_fts5_tokenize)",
+      "observed_passed_subtests": 134,
+      "expected_subtest_count": 149
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5trigram2.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5trigram2.test",
+      "source_path": "sqlite/ext/fts5/test/fts5trigram2.test",
+      "sha256": "868d97ee383267fc41ef57c2f7ac9bf063af3cf22f2e58dd541acd64994b5809",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5trigram2.rs",
+      "module_name": "fts5_ext_fts5trigram2",
+      "test_fn": "test_fts5_ext_fts5trigram2",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5trigram2_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "17/22 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 17,
+      "expected_subtest_count": 22
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5ubsan.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5ubsan.test",
+      "source_path": "sqlite/ext/fts5/test/fts5ubsan.test",
+      "sha256": "58dea883bc382918a13513c277aa87fdea8c42e02adc9e001f3f21b134105200",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5ubsan.rs",
+      "module_name": "fts5_ext_fts5ubsan",
+      "test_fn": "test_fts5_ext_fts5ubsan",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 7,
+      "expected_subtest_count": 7
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5umlaut.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5umlaut.test",
+      "source_path": "sqlite/ext/fts5/test/fts5umlaut.test",
+      "sha256": "05f6a8ff6cc21b2d1a9efe8e5ce958e18ff7b19166ed47e89e83395f3d4daf10",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5umlaut.rs",
+      "module_name": "fts5_ext_fts5umlaut",
+      "test_fn": "test_fts5_ext_fts5umlaut",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5umlaut_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "25/29 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 25,
+      "expected_subtest_count": 29
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5unicode.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5unicode.test",
+      "source_path": "sqlite/ext/fts5/test/fts5unicode.test",
+      "sha256": "abf9494fb523d2d66d746eedb07f560ecf1b762193f0697f7a2f29a48eaa6a7d",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5unicode.rs",
+      "module_name": "fts5_ext_fts5unicode",
+      "test_fn": "test_fts5_ext_fts5unicode",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_tokenize",
+        "fts5vocab"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 direct tokenizer test command (sqlite3_fts5_tokenize)",
+      "observed_passed_subtests": 4,
+      "expected_subtest_count": 12
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5unicode2.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5unicode2.test",
+      "source_path": "sqlite/ext/fts5/test/fts5unicode2.test",
+      "sha256": "edcc7baa30e16ba2112c1ddfcee7880c552abc0bcb83ec62bec53a1c1ef081e5",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5unicode2.rs",
+      "module_name": "fts5_ext_fts5unicode2",
+      "test_fn": "test_fts5_ext_fts5unicode2",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab",
+        "icu"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_tokenize"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C FTS5 direct tokenizer test command (sqlite3_fts5_tokenize)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5unicode3.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5unicode3.test",
+      "source_path": "sqlite/ext/fts5/test/fts5unicode3.test",
+      "sha256": "be0e8563a278b25d1d7937483f7125a20ebbe577ad6ff4dc6d394284c0f5b363",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5unicode3.rs",
+      "module_name": "fts5_ext_fts5unicode3",
+      "test_fn": "test_fts5_ext_fts5unicode3",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5_isalnum"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C diagnostic/test SQL function `fts5_isalnum()`",
+      "observed_passed_subtests": 2,
+      "expected_subtest_count": 9
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5unicode4.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5unicode4.test",
+      "source_path": "sqlite/ext/fts5/test/fts5unicode4.test",
+      "sha256": "634ed44b380e04a1b603e69ad5408981aa493b7bfb45bf36691761e999d488a6",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5unicode4.rs",
+      "module_name": "fts5_ext_fts5unicode4",
+      "test_fn": "test_fts5_ext_fts5unicode4",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 22,
+      "expected_subtest_count": 22
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5unindexed.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5unindexed.test",
+      "source_path": "sqlite/ext/fts5/test/fts5unindexed.test",
+      "sha256": "c06513c3f368c06c718551d8a79ddac7c606878f50f7b28ef5bb2edb2eadf913",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5unindexed.rs",
+      "module_name": "fts5_ext_fts5unindexed",
+      "test_fn": "test_fts5_ext_fts5unindexed",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 18,
+      "expected_subtest_count": 18
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5unindexed2.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5unindexed2.test",
+      "source_path": "sqlite/ext/fts5/test/fts5unindexed2.test",
+      "sha256": "1b97ff6d90174bf383c50afa0eb0ca214f273c1b66374c569fc54489b1ed2a39",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5unindexed2.rs",
+      "module_name": "fts5_ext_fts5unindexed2",
+      "test_fn": "test_fts5_ext_fts5unindexed2",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sqlite3_fts5_create_function"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testfixture Tcl command `sqlite3_fts5_create_function`",
+      "observed_passed_subtests": 1,
+      "expected_subtest_count": 12
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5update.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5update.test",
+      "source_path": "sqlite/ext/fts5/test/fts5update.test",
+      "sha256": "2ccf684158c03bfcc2d6d205f0b367de72a72eb7e799111f1114f73d55a16537",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5update.rs",
+      "module_name": "fts5_ext_fts5update",
+      "test_fn": "test_fts5_ext_fts5update",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 59,
+      "expected_subtest_count": 59
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5update2.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5update2.test",
+      "source_path": "sqlite/ext/fts5/test/fts5update2.test",
+      "sha256": "1e5a329159c2a8dfee9821a84fb580e08eca0d5495930f80465e4d813bc405a9",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5update2.rs",
+      "module_name": "fts5_ext_fts5update2",
+      "test_fn": "test_fts5_ext_fts5update2",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5update2_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "66/132 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 66,
+      "expected_subtest_count": 132
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5version.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5version.test",
+      "source_path": "sqlite/ext/fts5/test/fts5version.test",
+      "sha256": "b26fcb7651b0d7912cf3440ce9ab42706ceda597b6180850f638b46e96a3e81d",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5version.rs",
+      "module_name": "fts5_ext_fts5version",
+      "test_fn": "test_fts5_ext_fts5version",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5version_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "12/17 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 12,
+      "expected_subtest_count": 17
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5vocab.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5vocab.test",
+      "source_path": "sqlite/ext/fts5/test/fts5vocab.test",
+      "sha256": "e1ae3bfe37f6b830976047ebbc5f3525c0587327ac17546806c49c05936a6b47",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5vocab.rs",
+      "module_name": "fts5_ext_fts5vocab",
+      "test_fn": "test_fts5_ext_fts5vocab",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "fts5vocab"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5vocab vocabulary virtual table module",
+      "observed_passed_subtests": 372,
+      "expected_subtest_count": 566
+    },
+    {
+      "id": "sqlite/ext/fts5/test/fts5vocab2.test",
+      "source_root": "sqlite/ext/fts5/test",
+      "relative_path": "fts5vocab2.test",
+      "source_path": "sqlite/ext/fts5/test/fts5vocab2.test",
+      "sha256": "ff92667d54ef41b869f09a512e485970f6e8fc7fdf86aabb2a9c320babd14f5b",
+      "wrapper_path": "tests/sqlite_test/fts5_ext_fts5vocab2.rs",
+      "module_name": "fts5_ext_fts5vocab2",
+      "test_fn": "test_fts5_ext_fts5vocab2",
+      "phase": "7",
+      "required_capabilities": [
+        "fts5",
+        "vtab",
+        "fts3"
+      ],
+      "external_dependencies": [
+        "fts5vocab"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C fts5vocab vocabulary virtual table module",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/rtree/rtree1.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtree1.test",
+      "source_path": "sqlite/ext/rtree/rtree1.test",
+      "sha256": "0d58c07b68cc4db024251ae608fcf14b38a8ea30cf887fc717a674a9f93a7e69",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtree1.rs",
+      "module_name": "rtree_ext_rtree1",
+      "test_fn": "test_rtree_ext_rtree1",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "sql_uses_stmt"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testfixture Tcl command `sql_uses_stmt`",
+      "observed_passed_subtests": 259,
+      "expected_subtest_count": 298
+    },
+    {
+      "id": "sqlite/ext/rtree/rtree2.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtree2.test",
+      "source_path": "sqlite/ext/rtree/rtree2.test",
+      "sha256": "5e89c70ce675521e4ebd76435f6375c8bc711fa67a9280a0c5a2cfbf1408b57f",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtree2.rs",
+      "module_name": "rtree_ext_rtree2",
+      "test_fn": "test_rtree_ext_rtree2",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 4050,
+      "expected_subtest_count": 4050
+    },
+    {
+      "id": "sqlite/ext/rtree/rtree3.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtree3.test",
+      "source_path": "sqlite/ext/rtree/rtree3.test",
+      "sha256": "69ed9e4f955526a4b357fd694f573831197cd3be8771db47ae0a57c05224bd71",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtree3.rs",
+      "module_name": "rtree_ext_rtree3",
+      "test_fn": "test_rtree_ext_rtree3",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test",
+        "register_cube_geom"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 7,
+      "expected_subtest_count": 7
+    },
+    {
+      "id": "sqlite/ext/rtree/rtree4.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtree4.test",
+      "source_path": "sqlite/ext/rtree/rtree4.test",
+      "sha256": "b530c36e37f6460dc8faa73253a1fac2144771b75fe393ff9b95df2655bdb048",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtree4.rs",
+      "module_name": "rtree_ext_rtree4",
+      "test_fn": "test_rtree_ext_rtree4",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab",
+        "rtree_int_only"
+      ],
+      "external_dependencies": [
+        "stress_runtime"
+      ],
+      "status": "ignored",
+      "ignore_reason": "long-running randomized/stress Tcl permutation exceeding unit-test timeout budget",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/rtree/rtree5.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtree5.test",
+      "source_path": "sqlite/ext/rtree/rtree5.test",
+      "sha256": "b553b3af36e8d9c9da146cfdcab8bf43d2964792ef4399cc8aaaefba4b7c792d",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtree5.rs",
+      "module_name": "rtree_ext_rtree5",
+      "test_fn": "test_rtree_ext_rtree5",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab",
+        "rtree_int_only"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 16,
+      "expected_subtest_count": 16
+    },
+    {
+      "id": "sqlite/ext/rtree/rtree6.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtree6.test",
+      "source_path": "sqlite/ext/rtree/rtree6.test",
+      "sha256": "5bf9837a9acfddb9dc89ba8a20e6cc360ae670f2d5a5f4f0bbf21ab93882ec32",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtree6.rs",
+      "module_name": "rtree_ext_rtree6",
+      "test_fn": "test_rtree_ext_rtree6",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab",
+        "rtree_int_only"
+      ],
+      "external_dependencies": [
+        "rtree6_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "6/19 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 6,
+      "expected_subtest_count": 19
+    },
+    {
+      "id": "sqlite/ext/rtree/rtree7.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtree7.test",
+      "source_path": "sqlite/ext/rtree/rtree7.test",
+      "sha256": "01619de116f2ed0b7ca5969805c4d466f3effc0c05113da1a3f087ca3c6f4aa7",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtree7.rs",
+      "module_name": "rtree_ext_rtree7",
+      "test_fn": "test_rtree_ext_rtree7",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab",
+        "vacuum"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 7,
+      "expected_subtest_count": 7
+    },
+    {
+      "id": "sqlite/ext/rtree/rtree8.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtree8.test",
+      "source_path": "sqlite/ext/rtree/rtree8.test",
+      "sha256": "e9a5c35e4b59a3ab2b95ea826c49c6349a2cabf4a20bcc38f0d5449ef18af401",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtree8.rs",
+      "module_name": "rtree_ext_rtree8",
+      "test_fn": "test_rtree_ext_rtree8",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "rtreedepth"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C rtreedepth()/rtreenode() internal node diagnostic SQL functions",
+      "observed_passed_subtests": 12,
+      "expected_subtest_count": 13
+    },
+    {
+      "id": "sqlite/ext/rtree/rtree9.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtree9.test",
+      "source_path": "sqlite/ext/rtree/rtree9.test",
+      "sha256": "cdd7ca8c2b3e72feef1e75240e05fe56723a39ea99917df80e9df47d8c70ec4a",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtree9.rs",
+      "module_name": "rtree_ext_rtree9",
+      "test_fn": "test_rtree_ext_rtree9",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab",
+        "rtree_int_only"
+      ],
+      "external_dependencies": [
+        "register_cube_geom",
+        "register_circle_geom"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C sqlite3_rtree_geometry_callback custom cube geometry FFI callback (register_cube_geom)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/rtree/rtreeA.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtreeA.test",
+      "source_path": "sqlite/ext/rtree/rtreeA.test",
+      "sha256": "7887a2726e627499c6ff2277544608eb693ec2ecfc2eb95ac7b17d23b6a0c6ca",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtreeA.rs",
+      "module_name": "rtree_ext_rtreeA",
+      "test_fn": "test_rtree_ext_rtreeA",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "rtreeA_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "16/54 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 16,
+      "expected_subtest_count": 54
+    },
+    {
+      "id": "sqlite/ext/rtree/rtreeB.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtreeB.test",
+      "source_path": "sqlite/ext/rtree/rtreeB.test",
+      "sha256": "7ccd92996be26ac735c3fd580bfda9db1559a4d6dc50568749d6c5e973ce84ed",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtreeB.rs",
+      "module_name": "rtree_ext_rtreeB",
+      "test_fn": "test_rtree_ext_rtreeB",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab",
+        "rtree_int_only"
+      ],
+      "external_dependencies": [
+        "rtreenode"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C rtreenode() internal node diagnostic SQL function",
+      "observed_passed_subtests": 4,
+      "expected_subtest_count": 5
+    },
+    {
+      "id": "sqlite/ext/rtree/rtreeC.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtreeC.test",
+      "source_path": "sqlite/ext/rtree/rtreeC.test",
+      "sha256": "c9c61ebfa1dfd2ed0a89960b652924bdf3f5b4c9172668478ecd01e7e8420646",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtreeC.rs",
+      "module_name": "rtree_ext_rtreeC",
+      "test_fn": "test_rtree_ext_rtreeC",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "rtreenode"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C rtreenode() internal node diagnostic SQL function",
+      "observed_passed_subtests": 22,
+      "expected_subtest_count": 40
+    },
+    {
+      "id": "sqlite/ext/rtree/rtreeD.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtreeD.test",
+      "source_path": "sqlite/ext/rtree/rtreeD.test",
+      "sha256": "5f589d31487f69937e6852a5b2fe9a9cffba4cdb913c7cecec224fbabd1f318b",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtreeD.rs",
+      "module_name": "rtree_ext_rtreeD",
+      "test_fn": "test_rtree_ext_rtreeD",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab",
+        "builtin_test"
+      ],
+      "external_dependencies": [
+        "disabled_capability"
+      ],
+      "status": "ignored",
+      "ignore_reason": "0 subtests executed under current out-of-scope capability configuration (utf16/icu/fts3/fts4/shared_cache=0)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/rtree/rtreeE.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtreeE.test",
+      "source_path": "sqlite/ext/rtree/rtreeE.test",
+      "sha256": "168b49e7d8cf43e53d711c4899734fbde5534173bac3a4f1f788c950b00554a4",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtreeE.rs",
+      "module_name": "rtree_ext_rtreeE",
+      "test_fn": "test_rtree_ext_rtreeE",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab",
+        "rtree_int_only"
+      ],
+      "external_dependencies": [
+        "register_circle_geom"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C sqlite3_rtree_geometry_callback custom circle geometry FFI callback (register_circle_geom)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/rtree/rtreeF.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtreeF.test",
+      "source_path": "sqlite/ext/rtree/rtreeF.test",
+      "sha256": "01627cc6396c1c399b02716a40781c2850d5a355da0b927e76c9667a9fbb74b0",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtreeF.rs",
+      "module_name": "rtree_ext_rtreeF",
+      "test_fn": "test_rtree_ext_rtreeF",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 7,
+      "expected_subtest_count": 7
+    },
+    {
+      "id": "sqlite/ext/rtree/rtreeG.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtreeG.test",
+      "source_path": "sqlite/ext/rtree/rtreeG.test",
+      "sha256": "3ff69d6e4a779ccc0b35c17f8b3718035c8f736ce6e261cf224df3846f7c3a53",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtreeG.rs",
+      "module_name": "rtree_ext_rtreeG",
+      "test_fn": "test_rtree_ext_rtreeG",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "test_sqlite3_log"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testfixture Tcl command `test_sqlite3_log`",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/rtree/rtreeH.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtreeH.test",
+      "source_path": "sqlite/ext/rtree/rtreeH.test",
+      "sha256": "c807f5754dacadb6b24d04615168fce8170b77dd16aeb93aa5fd45bfd428555c",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtreeH.rs",
+      "module_name": "rtree_ext_rtreeH",
+      "test_fn": "test_rtree_ext_rtreeH",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 21,
+      "expected_subtest_count": 21
+    },
+    {
+      "id": "sqlite/ext/rtree/rtreeI.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtreeI.test",
+      "source_path": "sqlite/ext/rtree/rtreeI.test",
+      "sha256": "8c5f0f4e9a7f4f67287923410034962802479c22666a76256cc5d7c268e81419",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtreeI.rs",
+      "module_name": "rtree_ext_rtreeI",
+      "test_fn": "test_rtree_ext_rtreeI",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "rtreeI_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "16/18 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 16,
+      "expected_subtest_count": 18
+    },
+    {
+      "id": "sqlite/ext/rtree/rtreeJ.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtreeJ.test",
+      "source_path": "sqlite/ext/rtree/rtreeJ.test",
+      "sha256": "b791be8836bd155885fc2287f0c75e11d2b04e6d3a09dc6fb3a60a66c5ede412",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtreeJ.rs",
+      "module_name": "rtree_ext_rtreeJ",
+      "test_fn": "test_rtree_ext_rtreeJ",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "rtreeJ_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "17/22 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 17,
+      "expected_subtest_count": 22
+    },
+    {
+      "id": "sqlite/ext/rtree/rtreecheck.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtreecheck.test",
+      "source_path": "sqlite/ext/rtree/rtreecheck.test",
+      "sha256": "80b317332a133c40a4240de4db710d978c89dd6237e0a8a8cba7c4e9714185d7",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtreecheck.rs",
+      "module_name": "rtree_ext_rtreecheck",
+      "test_fn": "test_rtree_ext_rtreecheck",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 21,
+      "expected_subtest_count": 21
+    },
+    {
+      "id": "sqlite/ext/rtree/rtreecirc.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtreecirc.test",
+      "source_path": "sqlite/ext/rtree/rtreecirc.test",
+      "sha256": "5b5894dce4cde549e832302c55d30ca2efaac7516e30df8e4c3e85c017b81013",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtreecirc.rs",
+      "module_name": "rtree_ext_rtreecirc",
+      "test_fn": "test_rtree_ext_rtreecirc",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "rtreecirc_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "4/7 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 4,
+      "expected_subtest_count": 7
+    },
+    {
+      "id": "sqlite/ext/rtree/rtreeconnect.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtreeconnect.test",
+      "source_path": "sqlite/ext/rtree/rtreeconnect.test",
+      "sha256": "788b741d9f29549a738806f8907f6ae2fc3acfaf76af2aa294b5d27197c8bbff",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtreeconnect.rs",
+      "module_name": "rtree_ext_rtreeconnect",
+      "test_fn": "test_rtree_ext_rtreeconnect",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 3,
+      "expected_subtest_count": 3
+    },
+    {
+      "id": "sqlite/ext/rtree/rtreedoc.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtreedoc.test",
+      "source_path": "sqlite/ext/rtree/rtreedoc.test",
+      "sha256": "f0da68951533d5b2f3a6c3ebb1722c8f437e31ccfc72dc3b4140f835564bad2f",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtreedoc.rs",
+      "module_name": "rtree_ext_rtreedoc",
+      "test_fn": "test_rtree_ext_rtreedoc",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "rtreedoc_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "124 subtests passed before C-internal harness divergence (no such table: demo_tbl)",
+      "observed_passed_subtests": 124,
+      "expected_subtest_count": 133
+    },
+    {
+      "id": "sqlite/ext/rtree/rtreedoc2.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtreedoc2.test",
+      "source_path": "sqlite/ext/rtree/rtreedoc2.test",
+      "sha256": "7bd2fd93377a6f38054c9ba5229f769468bb3b40adc90c6e527c22efdc6d4d58",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtreedoc2.rs",
+      "module_name": "rtree_ext_rtreedoc2",
+      "test_fn": "test_rtree_ext_rtreedoc2",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "register_circle_geom",
+        "register_box_geom"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C sqlite3_rtree_geometry_callback custom circle geometry FFI callback (register_circle_geom)",
+      "observed_passed_subtests": 2,
+      "expected_subtest_count": 9
+    },
+    {
+      "id": "sqlite/ext/rtree/rtreedoc3.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtreedoc3.test",
+      "source_path": "sqlite/ext/rtree/rtreedoc3.test",
+      "sha256": "9ca83677ce48065da767f741136c42af427be7593b2f8308591e8d6454c081bd",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtreedoc3.rs",
+      "module_name": "rtree_ext_rtreedoc3",
+      "test_fn": "test_rtree_ext_rtreedoc3",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab"
+      ],
+      "external_dependencies": [
+        "register_box_query"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C sqlite3_rtree_query_callback custom 2D box query FFI callback (register_box_query)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/ext/rtree/rtreefuzz001.test",
+      "source_root": "sqlite/ext/rtree",
+      "relative_path": "rtreefuzz001.test",
+      "source_path": "sqlite/ext/rtree/rtreefuzz001.test",
+      "sha256": "180097ca2ac3e8f87c61eef03837c380edef05849cc4599e1c80f6ccd7b48150",
+      "wrapper_path": "tests/sqlite_test/rtree_ext_rtreefuzz001.rs",
+      "module_name": "rtree_ext_rtreefuzz001",
+      "test_fn": "test_rtree_ext_rtreefuzz001",
+      "phase": "7",
+      "required_capabilities": [
+        "rtree",
+        "vtab",
+        "deserialize",
+        "geopoly"
+      ],
+      "external_dependencies": [
+        "disabled_capability"
+      ],
+      "status": "ignored",
+      "ignore_reason": "0 subtests executed under current out-of-scope capability configuration (utf16/icu/fts3/fts4/shared_cache=0)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
     {
       "id": "sqlite/test/alterdropcol.test",
       "source_root": "sqlite/test",
@@ -622,6 +4432,247 @@
       "ignore_reason": "requires C do_ioerr_test I/O fault-simulation harness",
       "observed_passed_subtests": 0,
       "expected_subtest_count": 4
+    },
+    {
+      "id": "sqlite/test/json101.test",
+      "source_root": "sqlite/test",
+      "relative_path": "json101.test",
+      "source_path": "sqlite/test/json101.test",
+      "sha256": "43d8f67052e469f33c479b92fed51f53fd011228098d238ee21483238711f6e1",
+      "wrapper_path": "tests/sqlite_test/json101.rs",
+      "module_name": "json101",
+      "test_fn": "test_json101",
+      "phase": "7",
+      "required_capabilities": [
+        "json1",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 281,
+      "expected_subtest_count": 281
+    },
+    {
+      "id": "sqlite/test/json102.test",
+      "source_root": "sqlite/test",
+      "relative_path": "json102.test",
+      "source_path": "sqlite/test/json102.test",
+      "sha256": "51d4951ab1439459a569c7b6589094aa250c0349ae672911e7eb3a568a02d60d",
+      "wrapper_path": "tests/sqlite_test/json102.rs",
+      "module_name": "json102",
+      "test_fn": "test_json102",
+      "phase": "7",
+      "required_capabilities": [
+        "json1",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 324,
+      "expected_subtest_count": 324
+    },
+    {
+      "id": "sqlite/test/json103.test",
+      "source_root": "sqlite/test",
+      "relative_path": "json103.test",
+      "source_path": "sqlite/test/json103.test",
+      "sha256": "4ad46e6487e9217cca1971366c3d13c538a76468e1f9ec5b9cf1ce616b5731a8",
+      "wrapper_path": "tests/sqlite_test/json103.rs",
+      "module_name": "json103",
+      "test_fn": "test_json103",
+      "phase": "7",
+      "required_capabilities": [
+        "json1",
+        "vtab",
+        "windowfunc"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 14,
+      "expected_subtest_count": 14
+    },
+    {
+      "id": "sqlite/test/json104.test",
+      "source_root": "sqlite/test",
+      "relative_path": "json104.test",
+      "source_path": "sqlite/test/json104.test",
+      "sha256": "f6134f02cbf4a1118350d389fe11af45d6c93f7fdad5c6517ea8f84416698aa6",
+      "wrapper_path": "tests/sqlite_test/json104.rs",
+      "module_name": "json104",
+      "test_fn": "test_json104",
+      "phase": "7",
+      "required_capabilities": [
+        "json1",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 33,
+      "expected_subtest_count": 33
+    },
+    {
+      "id": "sqlite/test/json105.test",
+      "source_root": "sqlite/test",
+      "relative_path": "json105.test",
+      "source_path": "sqlite/test/json105.test",
+      "sha256": "c18c25419252ee62febf1e0e1393f946a095f81f8af5d078ba8a40cceb043679",
+      "wrapper_path": "tests/sqlite_test/json105.rs",
+      "module_name": "json105",
+      "test_fn": "test_json105",
+      "phase": "7",
+      "required_capabilities": [
+        "json1",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 52,
+      "expected_subtest_count": 52
+    },
+    {
+      "id": "sqlite/test/json106.test",
+      "source_root": "sqlite/test",
+      "relative_path": "json106.test",
+      "source_path": "sqlite/test/json106.test",
+      "sha256": "278d46c2fb66ad8aabce7e5eaaa758a30d2675162a657e545a790acfb16f8315",
+      "wrapper_path": "tests/sqlite_test/json106.rs",
+      "module_name": "json106",
+      "test_fn": "test_json106",
+      "phase": "7",
+      "required_capabilities": [
+        "json1",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 45000,
+      "expected_subtest_count": 45000
+    },
+    {
+      "id": "sqlite/test/json107.test",
+      "source_root": "sqlite/test",
+      "relative_path": "json107.test",
+      "source_path": "sqlite/test/json107.test",
+      "sha256": "8fbbf4754f0d0ee7f82669eb4a2a7357ee4f66a45cb306ee1021eac54bdd9839",
+      "wrapper_path": "tests/sqlite_test/json107.rs",
+      "module_name": "json107",
+      "test_fn": "test_json107",
+      "phase": "7",
+      "required_capabilities": [
+        "json1",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 15,
+      "expected_subtest_count": 15
+    },
+    {
+      "id": "sqlite/test/json108.test",
+      "source_root": "sqlite/test",
+      "relative_path": "json108.test",
+      "source_path": "sqlite/test/json108.test",
+      "sha256": "f516fbba29e30a33af2e0750b962629381499dd76acc859889b76cb587b1acf6",
+      "wrapper_path": "tests/sqlite_test/json108.rs",
+      "module_name": "json108",
+      "test_fn": "test_json108",
+      "phase": "7",
+      "required_capabilities": [
+        "json1",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 17,
+      "expected_subtest_count": 17
+    },
+    {
+      "id": "sqlite/test/json109.test",
+      "source_root": "sqlite/test",
+      "relative_path": "json109.test",
+      "source_path": "sqlite/test/json109.test",
+      "sha256": "0b24ef1184b5a56f1e2a01daaf4bcf9db1214bdd709442e59fe22321bf9e3f30",
+      "wrapper_path": "tests/sqlite_test/json109.rs",
+      "module_name": "json109",
+      "test_fn": "test_json109",
+      "phase": "7",
+      "required_capabilities": [
+        "json1",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 17,
+      "expected_subtest_count": 17
+    },
+    {
+      "id": "sqlite/test/json501.test",
+      "source_root": "sqlite/test",
+      "relative_path": "json501.test",
+      "source_path": "sqlite/test/json501.test",
+      "sha256": "18a227887d76a0454b01ac221dd194d050b32d627b7c059978acb336404a24f8",
+      "wrapper_path": "tests/sqlite_test/json501.rs",
+      "module_name": "json501",
+      "test_fn": "test_json501",
+      "phase": "7",
+      "required_capabilities": [
+        "json1",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 184,
+      "expected_subtest_count": 184
+    },
+    {
+      "id": "sqlite/test/json502.test",
+      "source_root": "sqlite/test",
+      "relative_path": "json502.test",
+      "source_path": "sqlite/test/json502.test",
+      "sha256": "7ddf819b1212619742cf8316b56efa879719622e05d26582ba6fed8754d0be5c",
+      "wrapper_path": "tests/sqlite_test/json502.rs",
+      "module_name": "json502",
+      "test_fn": "test_json502",
+      "phase": "7",
+      "required_capabilities": [
+        "json1",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 12,
+      "expected_subtest_count": 12
+    },
+    {
+      "id": "sqlite/test/jsonb01.test",
+      "source_root": "sqlite/test",
+      "relative_path": "jsonb01.test",
+      "source_path": "sqlite/test/jsonb01.test",
+      "sha256": "0c2cb44a953cca9c301df314670d565c276eaf0e48b96919417def2ab7274bc8",
+      "wrapper_path": "tests/sqlite_test/jsonb01.rs",
+      "module_name": "jsonb01",
+      "test_fn": "test_jsonb01",
+      "phase": "7",
+      "required_capabilities": [
+        "json1",
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 40,
+      "expected_subtest_count": 40
     },
     {
       "id": "sqlite/test/tempdb.test",
@@ -1240,13 +5291,14 @@
       "required_capabilities": [
         "view",
         "analyze",
-        "auth"
+        "auth",
+        "vtab"
       ],
       "external_dependencies": [],
       "status": "active",
       "ignore_reason": null,
-      "observed_passed_subtests": 121,
-      "expected_subtest_count": 121
+      "observed_passed_subtests": 122,
+      "expected_subtest_count": 122
     },
     {
       "id": "sqlite/test/view2.test",
@@ -1288,6 +5340,553 @@
       "ignore_reason": null,
       "observed_passed_subtests": 2,
       "expected_subtest_count": 2
+    },
+    {
+      "id": "sqlite/test/vtab1.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtab1.test",
+      "source_path": "sqlite/test/vtab1.test",
+      "sha256": "217d690e1cccfd9c9df47c20c571759af9c8551a97c0b9d51f85e7cf1dee6096",
+      "wrapper_path": "tests/sqlite_test/vtab1.rs",
+      "module_name": "vtab1",
+      "test_fn": "test_vtab1",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab",
+        "schema_pragmas",
+        "subquery",
+        "attach",
+        "altertable",
+        "icu",
+        "fts3"
+      ],
+      "external_dependencies": [
+        "vtab1_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "173/212 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 173,
+      "expected_subtest_count": 212
+    },
+    {
+      "id": "sqlite/test/vtab2.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtab2.test",
+      "source_path": "sqlite/test/vtab2.test",
+      "sha256": "750eb837610feaca6fe71b13cfdc2dd7be9e37b8756a465ab8391e4081713fb2",
+      "wrapper_path": "tests/sqlite_test/vtab2.rs",
+      "module_name": "vtab2",
+      "test_fn": "test_vtab2",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab",
+        "schema_pragmas",
+        "fts3"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 15,
+      "expected_subtest_count": 15
+    },
+    {
+      "id": "sqlite/test/vtab3.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtab3.test",
+      "source_path": "sqlite/test/vtab3.test",
+      "sha256": "122ef261df074715c164db9ad31dc9f4944f0f530f91af608f85c6df8da4983f",
+      "wrapper_path": "tests/sqlite_test/vtab3.rs",
+      "module_name": "vtab3",
+      "test_fn": "test_vtab3",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab",
+        "auth"
+      ],
+      "external_dependencies": [
+        "vtab3_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "7/19 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 7,
+      "expected_subtest_count": 19
+    },
+    {
+      "id": "sqlite/test/vtab4.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtab4.test",
+      "source_path": "sqlite/test/vtab4.test",
+      "sha256": "11fa92f9da0de5ae0b02620b80d90cc71bf073f21e9cb5ae332f252715e903c5",
+      "wrapper_path": "tests/sqlite_test/vtab4.rs",
+      "module_name": "vtab4",
+      "test_fn": "test_vtab4",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab"
+      ],
+      "external_dependencies": [
+        "vtab4_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "8/14 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 8,
+      "expected_subtest_count": 14
+    },
+    {
+      "id": "sqlite/test/vtab5.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtab5.test",
+      "source_path": "sqlite/test/vtab5.test",
+      "sha256": "8658ad7586d8ae631a963bc6bf3b67097bb654de43de0e0378d616c3e4b12fd5",
+      "wrapper_path": "tests/sqlite_test/vtab5.rs",
+      "module_name": "vtab5",
+      "test_fn": "test_vtab5",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab",
+        "trigger",
+        "altertable"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 14,
+      "expected_subtest_count": 14
+    },
+    {
+      "id": "sqlite/test/vtab6.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtab6.test",
+      "source_path": "sqlite/test/vtab6.test",
+      "sha256": "90d23df77ac752c7b113de1ccbb4abeb16de7ad756ee41cd63b832e1e2f91ec6",
+      "wrapper_path": "tests/sqlite_test/vtab6.rs",
+      "module_name": "vtab6",
+      "test_fn": "test_vtab6",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab",
+        "subquery",
+        "view",
+        "compound"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 76,
+      "expected_subtest_count": 76
+    },
+    {
+      "id": "sqlite/test/vtab7.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtab7.test",
+      "source_path": "sqlite/test/vtab7.test",
+      "sha256": "fd2bf0b3426d25f748d52aeab3a47012a9489d01f6f03ee91df87d1963559793",
+      "wrapper_path": "tests/sqlite_test/vtab7.rs",
+      "module_name": "vtab7",
+      "test_fn": "test_vtab7",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab",
+        "attach"
+      ],
+      "external_dependencies": [
+        "trace"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C testfixture Tcl command `trace`",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/test/vtab8.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtab8.test",
+      "source_path": "sqlite/test/vtab8.test",
+      "sha256": "322df20d105ec613ba2c044b46162fa774b3e46ae09225cf609195540af891b3",
+      "wrapper_path": "tests/sqlite_test/vtab8.rs",
+      "module_name": "vtab8",
+      "test_fn": "test_vtab8",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 5,
+      "expected_subtest_count": 5
+    },
+    {
+      "id": "sqlite/test/vtab9.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtab9.test",
+      "source_path": "sqlite/test/vtab9.test",
+      "sha256": "1df84f50aba6e771aa98108f546fab2d527f21f3fa82472cb5b3dfdf41ab03bc",
+      "wrapper_path": "tests/sqlite_test/vtab9.rs",
+      "module_name": "vtab9",
+      "test_fn": "test_vtab9",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 2,
+      "expected_subtest_count": 2
+    },
+    {
+      "id": "sqlite/test/vtabA.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtabA.test",
+      "source_path": "sqlite/test/vtabA.test",
+      "sha256": "0d8c7c54b54baf759dfd8caa6b13939e7a6cf8ee4d767e44e26913a93a16422c",
+      "wrapper_path": "tests/sqlite_test/vtabA.rs",
+      "module_name": "vtabA",
+      "test_fn": "test_vtabA",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 18,
+      "expected_subtest_count": 18
+    },
+    {
+      "id": "sqlite/test/vtabB.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtabB.test",
+      "source_path": "sqlite/test/vtabB.test",
+      "sha256": "291d5082b12316be61acae79b0af5de10c69ba6e35ff5d1dd0fcf495d4bfc341",
+      "wrapper_path": "tests/sqlite_test/vtabB.rs",
+      "module_name": "vtabB",
+      "test_fn": "test_vtabB",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 7,
+      "expected_subtest_count": 7
+    },
+    {
+      "id": "sqlite/test/vtabC.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtabC.test",
+      "source_path": "sqlite/test/vtabC.test",
+      "sha256": "be9a014acb4c557969e59bb41877b6acb4ac7bce5b06a2b5dfe81070f807c8f6",
+      "wrapper_path": "tests/sqlite_test/vtabC.rs",
+      "module_name": "vtabC",
+      "test_fn": "test_vtabC",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab",
+        "trigger"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 960,
+      "expected_subtest_count": 960
+    },
+    {
+      "id": "sqlite/test/vtabD.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtabD.test",
+      "source_path": "sqlite/test/vtabD.test",
+      "sha256": "5a4648d010f6672cb5aaf9d97eab970257e9c31d1ba7b503b09a2bcb95dacd1b",
+      "wrapper_path": "tests/sqlite_test/vtabD.rs",
+      "module_name": "vtabD",
+      "test_fn": "test_vtabD",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab",
+        "schema_pragmas"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 8,
+      "expected_subtest_count": 8
+    },
+    {
+      "id": "sqlite/test/vtabE.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtabE.test",
+      "source_path": "sqlite/test/vtabE.test",
+      "sha256": "9a96bf4252e699677759e0742f2950f00ea3bbaf07c69f72476a670cccbdfe0f",
+      "wrapper_path": "tests/sqlite_test/vtabE.rs",
+      "module_name": "vtabE",
+      "test_fn": "test_vtabE",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 1,
+      "expected_subtest_count": 1
+    },
+    {
+      "id": "sqlite/test/vtabF.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtabF.test",
+      "source_path": "sqlite/test/vtabF.test",
+      "sha256": "93c460635235be44a45d399b99f76d4cac36cf6edaddf738adbfc1c428eaeea8",
+      "wrapper_path": "tests/sqlite_test/vtabF.rs",
+      "module_name": "vtabF",
+      "test_fn": "test_vtabF",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab",
+        "schema_pragmas"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 2,
+      "expected_subtest_count": 2
+    },
+    {
+      "id": "sqlite/test/vtabH.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtabH.test",
+      "source_path": "sqlite/test/vtabH.test",
+      "sha256": "6fb9738465c8176905e959588245b0fb54242240c138559e32f45758197f9e73",
+      "wrapper_path": "tests/sqlite_test/vtabH.rs",
+      "module_name": "vtabH",
+      "test_fn": "test_vtabH",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab",
+        "icu"
+      ],
+      "external_dependencies": [
+        "register_fs_module",
+        "tclvar_module"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C test_fs.c filesystem virtual table test module",
+      "observed_passed_subtests": 16,
+      "expected_subtest_count": 18
+    },
+    {
+      "id": "sqlite/test/vtabI.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtabI.test",
+      "source_path": "sqlite/test/vtabI.test",
+      "sha256": "8be8bb6127f2bcb4b5df1b3d3dc642e953fbdb6039d7458e960fd9bd2b8563ad",
+      "wrapper_path": "tests/sqlite_test/vtabI.rs",
+      "module_name": "vtabI",
+      "test_fn": "test_vtabI",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab"
+      ],
+      "external_dependencies": [
+        "vtabI_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "3/15 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 3,
+      "expected_subtest_count": 15
+    },
+    {
+      "id": "sqlite/test/vtabJ.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtabJ.test",
+      "source_path": "sqlite/test/vtabJ.test",
+      "sha256": "0fa657d59bc2de78afe8220fb31ab73e2a539a7ae0508a20f735accfd4c2c395",
+      "wrapper_path": "tests/sqlite_test/vtabJ.rs",
+      "module_name": "vtabJ",
+      "test_fn": "test_vtabJ",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 19,
+      "expected_subtest_count": 19
+    },
+    {
+      "id": "sqlite/test/vtabK.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtabK.test",
+      "source_path": "sqlite/test/vtabK.test",
+      "sha256": "2e28a0e730e615d352adb65904b4914a8ec3655e7a2d5479dba7c78295f06bea",
+      "wrapper_path": "tests/sqlite_test/vtabK.rs",
+      "module_name": "vtabK",
+      "test_fn": "test_vtabK",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab",
+        "rtree",
+        "fts5"
+      ],
+      "external_dependencies": [
+        "vtabK_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "8/12 subtests passed; remaining subtests depend on C-internal storage layout or planner details",
+      "observed_passed_subtests": 8,
+      "expected_subtest_count": 12
+    },
+    {
+      "id": "sqlite/test/vtabL.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtabL.test",
+      "source_path": "sqlite/test/vtabL.test",
+      "sha256": "1fff9e5d39fccefb9cd91188f657c6f836bacdc7ce9dd1dbc864d1165df5c99f",
+      "wrapper_path": "tests/sqlite_test/vtabL.rs",
+      "module_name": "vtabL",
+      "test_fn": "test_vtabL",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 14,
+      "expected_subtest_count": 14
+    },
+    {
+      "id": "sqlite/test/vtab_alter.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtab_alter.test",
+      "source_path": "sqlite/test/vtab_alter.test",
+      "sha256": "37f954bacf685ff303ddaac1d61a02360ab0935f79272518a0a5049c547e3f87",
+      "wrapper_path": "tests/sqlite_test/vtab_alter.rs",
+      "module_name": "vtab_alter",
+      "test_fn": "test_vtab_alter",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab",
+        "altertable"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 13,
+      "expected_subtest_count": 13
+    },
+    {
+      "id": "sqlite/test/vtab_err.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtab_err.test",
+      "source_path": "sqlite/test/vtab_err.test",
+      "sha256": "5cb6ebd85a563c532619d1b9531b80e454d993eb577a2342a993e8dcfe970182",
+      "wrapper_path": "tests/sqlite_test/vtab_err.rs",
+      "module_name": "vtab_err",
+      "test_fn": "test_vtab_err",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab"
+      ],
+      "external_dependencies": [
+        "do_faultsim_test"
+      ],
+      "status": "ignored",
+      "ignore_reason": "requires C OOM/I/O fault-simulation harness (do_faultsim_test)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/test/vtab_shared.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtab_shared.test",
+      "source_path": "sqlite/test/vtab_shared.test",
+      "sha256": "52bfbae045de847cb7b8bb6bfdda7b7d07c82d560b3fb5f9245bdea13c408894",
+      "wrapper_path": "tests/sqlite_test/vtab_shared.rs",
+      "module_name": "vtab_shared",
+      "test_fn": "test_vtab_shared",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab",
+        "shared_cache",
+        "compound",
+        "altertable",
+        "rtree",
+        "fts3"
+      ],
+      "external_dependencies": [
+        "sqlite3_enable_shared_cache"
+      ],
+      "status": "ignored",
+      "ignore_reason": "out of scope: requires shared_cache=1 (sqlite3_enable_shared_cache)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/test/vtabdistinct.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtabdistinct.test",
+      "source_path": "sqlite/test/vtabdistinct.test",
+      "sha256": "0597697816ff273fb621b84e3f54d064f1ee03c3180e4d66f0623efb0717e65a",
+      "wrapper_path": "tests/sqlite_test/vtabdistinct.rs",
+      "module_name": "vtabdistinct",
+      "test_fn": "test_vtabdistinct",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab"
+      ],
+      "external_dependencies": [
+        "vtabdistinct_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "0 subtests passed before C-internal harness divergence (unsupported static extension: qpvtab)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
+    },
+    {
+      "id": "sqlite/test/vtabdrop.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtabdrop.test",
+      "source_path": "sqlite/test/vtabdrop.test",
+      "sha256": "1c380b9465dec94bfd07f79be8e34565cc46bdb35d2334fa3cb2a5f1636a3607",
+      "wrapper_path": "tests/sqlite_test/vtabdrop.rs",
+      "module_name": "vtabdrop",
+      "test_fn": "test_vtabdrop",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab",
+        "rtree",
+        "fts5",
+        "fts3"
+      ],
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 8,
+      "expected_subtest_count": 8
+    },
+    {
+      "id": "sqlite/test/vtabrhs1.test",
+      "source_root": "sqlite/test",
+      "relative_path": "vtabrhs1.test",
+      "source_path": "sqlite/test/vtabrhs1.test",
+      "sha256": "a359b2b4be0a35048658145bcb7a5cf5a52d83ed41a5733c5a11d5b53a63f055",
+      "wrapper_path": "tests/sqlite_test/vtabrhs1.rs",
+      "module_name": "vtabrhs1",
+      "test_fn": "test_vtabrhs1",
+      "phase": "7",
+      "required_capabilities": [
+        "vtab"
+      ],
+      "external_dependencies": [
+        "vtabrhs1_c_internals"
+      ],
+      "status": "ignored",
+      "ignore_reason": "0 subtests passed before C-internal harness divergence (unsupported static extension: qpvtab)",
+      "observed_passed_subtests": 0,
+      "expected_subtest_count": 0
     },
     {
       "id": "sqlite/test/wal.test",
@@ -2425,16 +7024,14 @@
       "phase": "5",
       "required_capabilities": [
         "windowfunc",
-        "json1"
+        "json1",
+        "vtab"
       ],
-      "external_dependencies": [
-        "json_group_array",
-        "json_group_object"
-      ],
-      "status": "ignored",
-      "ignore_reason": "requires Phase 7 JSON extension aggregate functions (json_group_array, json_group_object); pure-SQL subtests verified in phase5_window_analyze_planner_gate",
-      "observed_passed_subtests": 8,
-      "expected_subtest_count": 30
+      "external_dependencies": [],
+      "status": "active",
+      "ignore_reason": null,
+      "observed_passed_subtests": 72,
+      "expected_subtest_count": 72
     },
     {
       "id": "sqlite/test/windowC.test",

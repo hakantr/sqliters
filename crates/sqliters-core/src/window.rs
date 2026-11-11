@@ -1161,6 +1161,7 @@ fn check_aliased_win_inner(
             schema: None,
             table: None,
             column,
+            ..
         }) => {
             if !allow_here
                 && !col_in_scoped_cols_pub(column, sample_cols)
@@ -1541,6 +1542,7 @@ pub(crate) fn collect_and_rewrite_window_calls(
                 schema: Some(WIN_SLOT_SCHEMA.to_owned()),
                 table: None,
                 column: slot_idx.to_string(),
+                double_quoted: false,
             }))
         }
         Expr::FunctionCall {

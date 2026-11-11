@@ -274,18 +274,24 @@ fn phase4_gate_c_reference_and_manifest_audit() {
         "incrblob",
         "lfs",
         "xfer_opt",
+        "vtab",
+        "fts5",
+        "rtree",
+        "json",
+        "json1",
+        "dbstat",
     ] {
         assert_eq!(
             cap_map.get(enabled_cap),
             Some(&true),
-            "capability `{enabled_cap}` must be enabled in Phase 6"
+            "capability `{enabled_cap}` must be enabled in Phase 7"
         );
     }
-    for pending_cap in ["stat4", "vtab", "fts5", "rtree", "json", "json1"] {
+    for pending_cap in ["stat4", "fts3", "fts4", "shared_cache"] {
         assert_eq!(
             cap_map.get(pending_cap),
             Some(&false),
-            "Phase 7 capability `{pending_cap}` must remain false in Phase 6"
+            "out-of-scope capability `{pending_cap}` must remain false in Phase 7"
         );
     }
 
@@ -466,7 +472,7 @@ finish_test
     \"active_phase4_subtests\": 622,\n\
     \"promoted_phase2_phase3_wrappers\": [\"attach4\", \"upsert1\", \"upsert2\", \"upsert4\", \"upfrom4\", \"alterdropcol\", \"alterdropcol2\"],\n\
     \"newly_unlocked_static_wrappers\": [\"collate6\", \"conflict4\", \"delete4\", \"fkey3\", \"fkey4\", \"insert3\", \"joinD\", \"with4\"],\n\
-    \"verified_non_phase5_subtests_in_gate4\": 160,\n\
+    \"verified_non_phase5_subtests_in_gate4\": 161,\n\
     \"manifest_total_active\": {},\n\
     \"manifest_total_ignored\": {}\n\
   }},\n\
@@ -914,7 +920,7 @@ fn phase4_non_phase5_sections_of_ignored_trigger_tcl_suites() {
         );
     }
 
-    // 2. `triggerE.test`: all 24 non-window subtests (omitting only loop item `11` `max(b) OVER(ORDER BY $1)`)
+    // 2. `triggerE.test`: all 25 non-window subtests (omitting only loop item `11` `max(b) OVER(ORDER BY $1)`)
     {
         let lines = read_lines("sqlite/test/triggerE.test");
         let mut sliced = Vec::with_capacity(lines.len());
@@ -922,9 +928,9 @@ fn phase4_non_phase5_sections_of_ignored_trigger_tcl_suites() {
         sliced.extend_from_slice(&lines[62..]);
         assert_tcl_section_ok(
             "triggerE",
-            "triggerE.test (all 24 non-window subtests)",
+            "triggerE.test (all 25 non-window subtests)",
             &sliced.join("\n"),
-            24,
+            25,
         );
     }
 

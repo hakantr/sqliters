@@ -2001,10 +2001,16 @@ fn strip_schema_from_expr(expr: &Expr) -> Expr {
         | Expr::Blob(_)
         | Expr::CurrentTimeKw(_)
         | Expr::Bind(_) => expr.clone(),
-        Expr::Column(ColumnRef { table, column, .. }) => Expr::Column(ColumnRef {
+        Expr::Column(ColumnRef {
+            table,
+            column,
+            double_quoted,
+            ..
+        }) => Expr::Column(ColumnRef {
             schema: None,
             table: table.clone(),
             column: column.clone(),
+            double_quoted: *double_quoted,
         }),
         Expr::Unary { op, expr: inner } => Expr::Unary {
             op: *op,
@@ -3159,6 +3165,7 @@ fn fix_expr_with_ctes(
             schema,
             table,
             column,
+            double_quoted,
         }) => {
             if let Some(s) = schema {
                 check_allowed_schema(view_name, db_schema_name, s)?;
@@ -3167,6 +3174,7 @@ fn fix_expr_with_ctes(
                 schema: schema.clone(),
                 table: table.clone(),
                 column: column.clone(),
+                double_quoted: *double_quoted,
             }))
         }
         Expr::Unary { op, expr: inner } => Ok(Expr::Unary {

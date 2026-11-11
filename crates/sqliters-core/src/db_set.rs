@@ -279,7 +279,7 @@ impl DatabaseSet {
             max_attached: SQLITE_MAX_ATTACHED,
             enable_view: true,
             enable_trigger: true,
-            dqs_dml: false,
+            dqs_dml: true,
             expr_depth_limit: SQLITE_MAX_EXPR_DEPTH,
             column_limit: SQLITE_MAX_COLUMN,
             trigger_steps_limit: SQLITE_MAX_TRIGGER_STEPS,

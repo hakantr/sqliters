@@ -1600,6 +1600,12 @@ fn c_reference_3_54_1_verification_and_phase1_2_manifest() {
     assert_eq!(cap_map.get("trigger"), Some(&true));
     assert_eq!(cap_map.get("windowfunc"), Some(&true));
     assert_eq!(cap_map.get("analyze"), Some(&true));
+    assert_eq!(cap_map.get("vtab"), Some(&true));
+    assert_eq!(cap_map.get("json"), Some(&true));
+    assert_eq!(cap_map.get("json1"), Some(&true));
+    assert_eq!(cap_map.get("fts5"), Some(&true));
+    assert_eq!(cap_map.get("rtree"), Some(&true));
+    assert_eq!(cap_map.get("dbstat"), Some(&true));
 
     // 4. Read `tests/sqlite_test_manifest.json` summary & OS/filesystem metadata.
     let test_manifest_path = workspace_root.join("tests/sqlite_test_manifest.json");

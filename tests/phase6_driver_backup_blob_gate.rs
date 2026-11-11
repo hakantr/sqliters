@@ -249,15 +249,17 @@ fn phase6_gate_1_capability_and_manifest_audit() {
             "Phase 6 capability `{phase6_cap}` must be enabled in GATE-6"
         );
     }
+    for phase7_cap in ["vtab", "fts5", "rtree", "json", "json1", "dbstat"] {
+        assert_eq!(
+            cap_map.get(phase7_cap),
+            Some(&true),
+            "Phase 7 capability `{phase7_cap}` must be enabled in Phase 7"
+        );
+    }
     for pending_cap in [
         "stat4",
-        "vtab",
         "fts3",
         "fts4",
-        "fts5",
-        "rtree",
-        "json",
-        "json1",
         "load_ext",
         "shared_cache",
         "utf16",
@@ -268,7 +270,7 @@ fn phase6_gate_1_capability_and_manifest_audit() {
         assert_eq!(
             cap_map.get(pending_cap),
             Some(&false),
-            "Phase 7 / out-of-scope capability `{pending_cap}` must remain false in Phase 6"
+            "out-of-scope capability `{pending_cap}` must remain false in Phase 7"
         );
     }
 
@@ -342,13 +344,13 @@ finish_test
 
     assert_eq!(
         active_suites.len(),
-        70,
-        "expected 70 active manifest suites"
+        131,
+        "expected 131 active manifest suites"
     );
     assert_eq!(
         ignored_suites.len(),
-        53,
-        "expected 53 ignored manifest suites"
+        204,
+        "expected 204 ignored manifest suites"
     );
 
     let phase6_promoted_suites = [
@@ -409,7 +411,7 @@ finish_test
     \"lock4\": 4,\n\
     \"savepoint\": 139,\n\
     \"fkey7\": 15,\n\
-    \"view\": 121,\n\
+    \"view\": 122,\n\
     \"tempdb2\": 7,\n\
     \"trigger6\": 6,\n\
     \"window5\": 7,\n\
@@ -513,7 +515,7 @@ fn phase6_gate_2_multiprocess_testfixture_and_promoted_tcl_suites() {
             include_str!("../sqlite/test/window6.test"),
             74usize,
         ),
-        ("view", include_str!("../sqlite/test/view.test"), 121usize),
+        ("view", include_str!("../sqlite/test/view.test"), 122usize),
         ("walbig", include_str!("../sqlite/test/walbig.test"), 1usize),
         (
             "walslow",

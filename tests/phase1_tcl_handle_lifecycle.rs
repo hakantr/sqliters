@@ -950,13 +950,15 @@ fn explicit_capability_table_and_zero_subtest_guard() {
     assert_eq!(phase1_capability("auth"), Some(true));
     assert_eq!(phase1_capability("incrblob"), Some(true));
     assert_eq!(phase1_capability("lfs"), Some(true));
+    assert_eq!(phase1_capability("vtab"), Some(true));
+    assert_eq!(phase1_capability("rtree"), Some(true));
+    assert_eq!(phase1_capability("fts5"), Some(true));
+    assert_eq!(phase1_capability("json"), Some(true));
+    assert_eq!(phase1_capability("json1"), Some(true));
+    assert_eq!(phase1_capability("dbstat"), Some(true));
     assert_eq!(phase1_capability("default_autovacuum"), Some(false));
     for disabled in [
         "stat4",
-        "vtab",
-        "rtree",
-        "fts5",
-        "json",
         "fts3",
         "fts4",
         "load_ext",
@@ -969,7 +971,7 @@ fn explicit_capability_table_and_zero_subtest_guard() {
         assert_eq!(
             phase1_capability(disabled),
             Some(false),
-            "capability `{disabled}` must be explicitly 0 in Phase 6"
+            "capability `{disabled}` must be explicitly 0 in Phase 7"
         );
     }
     assert_eq!(phase1_capability("nonexistent_xyz"), None);
@@ -1012,7 +1014,7 @@ do_test 1.1 {
     [capable prefer_proxy_locking] \
     [capable nonexistent_xyz] \
     [capable !nonexistent_xyz]
-} {1 1 1 1 1 1 1 0 1 1 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 1}
+} {1 1 1 1 1 1 1 0 1 1 1 1 1 1 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 1}
 
 finish_test
 "#;

@@ -63,6 +63,10 @@ pub const CORE_SQL_FAMILIES: &[&str] = &[
     "trigger",
     "window",
     "analyze",
+    "vtab",
+    "json",
+    "fts5",
+    "rtree",
 ];
 
 pub const CORE_SQL_EXACT: &[&str] = &[
@@ -93,6 +97,10 @@ fn is_core_sql_test(stem: &str) -> bool {
         .take_while(|c| c.is_ascii_lowercase() || *c == '_')
         .collect();
     CORE_SQL_FAMILIES.contains(&alpha_prefix.as_str())
+        || stem.starts_with("fts5")
+        || stem.starts_with("json")
+        || stem.starts_with("vtab")
+        || stem.starts_with("rtree")
 }
 
 fn infer_source_root(path: &Path) -> &'static str {
@@ -220,15 +228,16 @@ fn collect_test_files(
     }
 
     let mut files = Vec::new();
-    let test_dir = Path::new("sqlite/test");
-    if let Ok(entries) = fs::read_dir(test_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("test")
-                && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
-                && is_core_sql_test(stem)
-            {
-                files.push(p);
+    for test_dir in roots {
+        if let Ok(entries) = fs::read_dir(test_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("test")
+                    && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
+                    && is_core_sql_test(stem)
+                {
+                    files.push(p);
+                }
             }
         }
     }

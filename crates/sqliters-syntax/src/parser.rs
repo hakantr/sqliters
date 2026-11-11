@@ -1340,6 +1340,7 @@ impl<'a> Parser<'a> {
                 schema: None,
                 table: None,
                 column,
+                ..
             }) => (column, None),
             Expr::String(s) => (s, None),
             other => (String::new(), Some(other)),
@@ -1578,6 +1579,7 @@ impl<'a> Parser<'a> {
                 schema: None,
                 table: None,
                 column,
+                ..
             }) => (column, None),
             other => (String::new(), Some(other)),
         };
@@ -2601,8 +2603,44 @@ impl<'a> Parser<'a> {
                     alias,
                 });
             }
-            let inner = self.parse_table_or_subquery()?;
+            let mut inner = self.parse_table_or_subquery()?;
             self.expect(TokenKind::Rp)?;
+            if let Some(outer_alias) = self.parse_optional_table_alias(&[])? {
+                match &mut inner {
+                    TableOrSubquery::Table { alias, .. }
+                    | TableOrSubquery::TableFunction { alias, .. }
+                    | TableOrSubquery::Subquery { alias, .. }
+                        if alias.is_none() =>
+                    {
+                        *alias = Some(outer_alias);
+                    }
+                    _ => {
+                        inner = TableOrSubquery::Subquery {
+                            query: Box::new(SelectStmt {
+                                ctes: Vec::new(),
+                                body: SelectBody {
+                                    head: SelectCore::Select {
+                                        distinct: false,
+                                        projection: vec![ResultColumn::Star],
+                                        from: Some(FromClause {
+                                            head: inner,
+                                            joins: Vec::new(),
+                                        }),
+                                        selection: None,
+                                        group_by: Vec::new(),
+                                        having: None,
+                                        windows: Vec::new(),
+                                    },
+                                    compounds: Vec::new(),
+                                },
+                                order_by: Vec::new(),
+                                limit: None,
+                            }),
+                            alias: Some(outer_alias),
+                        };
+                    }
+                }
+            }
             return Ok(inner);
         }
 
@@ -2995,11 +3033,38 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Minus => {
                 self.advance();
+                let start_pos = self.pos;
                 let next_tok = self.peek();
                 let next_is_hex = next_tok.kind == TokenKind::Integer
                     && (next_tok.text.starts_with("0x") || next_tok.text.starts_with("0X"));
                 let rhs = self.parse_expr_bp(20)?;
-                // Fold `-9223372036854775808` and negative integer literals cleanly!
+                // Fold `-9223372036854775808` (including `-(9223372036854775808)` / `-(+9223372036854775808)`)
+                // to `Expr::Integer(i64::MIN)` while keeping `-9223372036854775808.0` as `Expr::Float`.
+                let is_i64_min_int_tokens = {
+                    let slice = &self.tokens[start_pos..self.pos];
+                    let mut int_count = 0usize;
+                    let mut all_valid = !slice.is_empty();
+                    for t in slice {
+                        match t.kind {
+                            TokenKind::Lp | TokenKind::Rp | TokenKind::Plus => {}
+                            TokenKind::Integer
+                                if !t.text.starts_with("0x")
+                                    && !t.text.starts_with("0X")
+                                    && t.text.trim_start_matches('0') == "9223372036854775808" =>
+                            {
+                                int_count += 1;
+                            }
+                            _ => {
+                                all_valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    all_valid && int_count == 1
+                };
+                if is_i64_min_int_tokens {
+                    return Ok(Expr::Integer(i64::MIN));
+                }
                 if let Expr::Float(f) = rhs {
                     return Ok(Expr::Float(-f));
                 }
@@ -3248,6 +3313,7 @@ impl<'a> Parser<'a> {
                 Ok(first)
             }
             k if Self::can_be_ident(k) || Self::is_join_kw(k) => {
+                let first_dbl_quoted = tok.text.starts_with('"');
                 let first = self.parse_nm()?;
                 // Function call: `name(...)`
                 if self.eat(TokenKind::Lp) {
@@ -3326,7 +3392,11 @@ impl<'a> Parser<'a> {
                     return Ok(Expr::Column(ColumnRef::table_qualified(first, second)));
                 }
 
-                Ok(Expr::Column(ColumnRef::unqualified(first)))
+                if first_dbl_quoted {
+                    Ok(Expr::Column(ColumnRef::unqualified_double_quoted(first)))
+                } else {
+                    Ok(Expr::Column(ColumnRef::unqualified(first)))
+                }
             }
             _ => Err(self.syntax_err_at(tok, format!("near \"{}\": syntax error", tok.text))),
         }

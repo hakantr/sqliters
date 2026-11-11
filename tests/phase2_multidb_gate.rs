@@ -551,12 +551,18 @@ fn test_gate2_1_c_sqlite_3541_reference_and_phase2_manifest() {
     assert_eq!(cap_map.get("trigger"), Some(&true));
     assert_eq!(cap_map.get("windowfunc"), Some(&true));
     assert_eq!(cap_map.get("analyze"), Some(&true));
-    // Phase 6+ capabilities must remain honestly `false`.
-    for pending_cap in ["vtab", "fts5", "rtree", "json1"] {
+    for phase7_cap in ["vtab", "fts5", "rtree", "json", "json1", "dbstat"] {
         assert_eq!(
-            cap_map.get(pending_cap),
+            cap_map.get(phase7_cap),
+            Some(&true),
+            "Phase 7 capability {phase7_cap} must be enabled in Phase 7"
+        );
+    }
+    for out_of_scope_cap in ["stat4", "fts3", "fts4", "shared_cache"] {
+        assert_eq!(
+            cap_map.get(out_of_scope_cap),
             Some(&false),
-            "Phase 6+ capability {pending_cap} must remain false in Phase 5"
+            "out-of-scope capability {out_of_scope_cap} must remain false"
         );
     }
 

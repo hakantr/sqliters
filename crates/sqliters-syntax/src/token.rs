@@ -435,7 +435,9 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token<'_>>> {
                     if i + 1 < bytes.len() {
                         i += 2;
                     } else {
-                        return Err(SqliteError::syntax("unterminated /* comment", start));
+                        // In SQLite (`sqlite/src/tokenize.c`), an unclosed `/*` block comment
+                        // consumes until end-of-input as whitespace (`TK_SPACE`).
+                        i = bytes.len();
                     }
                 } else {
                     i += 1;

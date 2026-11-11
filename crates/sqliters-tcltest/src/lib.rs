@@ -6,6 +6,7 @@ pub mod harness;
 pub mod interp;
 pub mod list;
 pub mod regex;
+pub mod vtab_helpers;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,27 +36,18 @@ pub fn evaluate_test_script_in_root(
     let source_roots = collect_source_roots(&repo_root, &script_source_dir);
     let temp = TempTestDir::new(test_name);
 
-    let host = SqliteTestHost::new_shared_with_roots(test_name, script_source_dir, source_roots);
+    let host =
+        SqliteTestHost::new_shared_with_roots(test_name, script_source_dir.clone(), source_roots);
     let mut interp = TclInterp::new(temp.path.clone(), Some(host.clone()));
-    interp.script_path = format!("{test_name}.test");
+    interp.script_path = script_source_dir
+        .join(format!("{test_name}.test"))
+        .to_string_lossy()
+        .into_owned();
 
     if let Err(ctrl) = harness::bootstrap_tester(&mut interp, &host, &temp.path) {
         interp.record_script_error(ctrl.err_msg());
     } else {
-        let adapted_script;
-        let script_to_eval = if matches!(test_name, "analyze7" | "index6" | "index7") {
-            adapted_script = script
-                .replace("ifcapable {!analyze||!vtab}", "ifcapable {!analyze}")
-                .replace("ifcapable !vtab", "if {0}")
-                .replace(
-                    "CREATE VIRTUAL TABLE nums USING wholenumber;",
-                    "CREATE TEMP VIEW nums(value) AS WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM c WHERE x<2000) SELECT x FROM c;",
-                );
-            adapted_script.as_str()
-        } else {
-            script
-        };
-        match interp.eval(script_to_eval) {
+        match interp.eval(script) {
             Ok(_) | Err(TclControl::FinishTest) | Err(TclControl::Return { .. }) => {}
             Err(err) => interp.record_script_error(err.err_msg()),
         }
@@ -171,7 +163,8 @@ pub fn strip_test_comments(raw_tcl: &str) -> String {
             }
         }
 
-        if !in_quotes
+        if brace_depth == 0
+            && !in_quotes
             && !prev_backslash_cont
             && trimmed.starts_with("/*")
             && !trimmed.starts_with("/* QUERY PLAN")

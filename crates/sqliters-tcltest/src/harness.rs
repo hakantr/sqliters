@@ -151,7 +151,7 @@ impl Drop for CheckoutInterpGuard {
     }
 }
 
-fn with_active_interp<R, F: FnOnce(&mut TclInterp) -> R>(f: F) -> Option<R> {
+pub(crate) fn with_active_interp<R, F: FnOnce(&mut TclInterp) -> R>(f: F) -> Option<R> {
     let popped = INTERP_STACK.with(|stack| stack.borrow_mut().pop())?;
     let mut guard = CheckoutInterpGuard {
         interp: Some(popped),
@@ -160,7 +160,7 @@ fn with_active_interp<R, F: FnOnce(&mut TclInterp) -> R>(f: F) -> Option<R> {
     Some(res)
 }
 
-fn eval_global_in_active_interp(script: &str) -> Option<(TclResult<String>, bool)> {
+pub(crate) fn eval_global_in_active_interp(script: &str) -> Option<(TclResult<String>, bool)> {
     with_active_interp(|interp| {
         let saved_frame = interp.frame_idx_internal();
         interp.set_frame_idx_internal(0);
@@ -253,6 +253,7 @@ const DEFAULT_HOST_BUILTINS: &[(&str, &str)] = &[
     ("sqlite3_data_count", "sqlite3_data_count"),
     ("sqlite3_column_count", "sqlite3_column_count"),
     ("sqlite3_column_name", "sqlite3_column_name"),
+    ("sqlite3_column_decltype", "sqlite3_column_decltype"),
     ("sqlite3_column_type", "sqlite3_column_type"),
     ("sqlite3_column_text", "sqlite3_column_text"),
     ("sqlite3_column_int", "sqlite3_column_int"),
@@ -295,6 +296,7 @@ const DEFAULT_HOST_BUILTINS: &[(&str, &str)] = &[
     ("decode_hexdb", "decode_hexdb"),
     ("sqlite3_db_config", "sqlite3_db_config"),
     ("sqlite3_db_config_lookaside", "noop_zero"),
+    ("sqlite3_config_lookaside", "noop_zero"),
     ("sqlite3_test_control", "noop_zero"),
     ("sqlite3_soft_heap_limit", "noop_zero"),
     ("sqlite3_soft_heap_limit64", "noop_zero"),
@@ -312,10 +314,19 @@ const DEFAULT_HOST_BUILTINS: &[(&str, &str)] = &[
     ("extra_schema_checks", "noop_zero"),
     ("reset_prng_state", "noop_zero"),
     ("add_alignment_test_functions", "noop_zero"),
-    ("register_dbstat_vtab", "noop_zero"),
-    ("register_echo_module", "noop_zero"),
-    ("register_tcl_module", "noop_zero"),
-    ("load_static_extension", "noop_zero"),
+    ("register_dbstat_vtab", "register_dbstat_vtab"),
+    ("register_wholenumber_module", "register_wholenumber_module"),
+    ("register_schema_module", "register_schema_module"),
+    ("register_tclvar_module", "register_tclvar_module"),
+    ("register_echo_module", "register_echo_module"),
+    ("register_tcl_module", "register_tcl_module"),
+    ("load_static_extension", "load_static_extension"),
+    ("sqlite3_declare_vtab", "sqlite3_declare_vtab"),
+    ("sqlite3_fts5_may_be_corrupt", "sqlite3_fts5_may_be_corrupt"),
+    (
+        "sqlite3_fts5_drop_corrupt_table",
+        "sqlite3_fts5_drop_corrupt_table",
+    ),
     ("sqlite3_create_function", "sqlite3_create_function"),
     ("sqlite3_create_function_v2", "sqlite3_create_function_v2"),
     ("sqlite3_create_collation_v2", "sqlite3_create_collation_v2"),
@@ -344,17 +355,17 @@ const DEFAULT_HOST_BUILTINS: &[(&str, &str)] = &[
     ("atomic_batch_write", "noop_zero"),
     ("tcl_variable_type", "noop_zero"),
     ("translate_selftest", "noop_zero"),
-    ("testvfs", "noop_zero"),
+    ("testvfs", "testvfs"),
     ("sqlite3_db_status", "noop_zero"),
 ];
 
 /// Explicit harness capability table (`sqlite_options` / `ifcapable`).
 ///
-/// Only genuinely implemented and verified Phase 1.1..Phase 5 features are mapped to `true`.
+/// Only genuinely implemented and verified Phase 1.1..Phase 7 features are mapped to `true`.
 /// Every unverified, future-phase, or out-of-scope capability is explicitly `false`,
 /// and any unknown capability name evaluates to `None` (`false` + recorded in diagnostics).
 pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
-    // Verified Phase 1.1..Phase 6 SQL, B-tree, pager, WAL, VFS, and lifecycle capabilities:
+    // Verified Phase 1.1..Phase 7 SQL, B-tree, pager, WAL, VFS, lifecycle, VTab, and extension capabilities:
     ("altertable", true),
     ("analyze", true),
     ("attach", true),
@@ -373,6 +384,7 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("cte", true),
     ("curdir", true),
     ("datetime", true),
+    ("dbstat", true),
     ("default_cksum", true),
     ("descidx", true),
     ("dirsync", cfg!(unix)),
@@ -381,10 +393,13 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("expr_depth", true),
     ("floatingpoint", true),
     ("foreignkey", true),
+    ("fts5", true),
     ("generated", true),
     ("incr_vacuum", true),
     ("incrblob", true),
     ("integrityck", true),
+    ("json", true),
+    ("json1", true),
     ("lfs", true),
     ("like_match_blobs", true),
     ("like_opt", true),
@@ -399,6 +414,7 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("reindex", true),
     ("returning", true),
     ("rowvalue", true),
+    ("rtree", true),
     ("savepoint", true),
     ("schema_pragmas", true),
     ("schema_version", true),
@@ -412,26 +428,27 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("upsert", true),
     ("vacuum", true),
     ("view", true),
+    ("vtab", true),
     ("wal", true),
     ("windowfunc", true),
     ("xfer_opt", true),
-    // Explicitly disabled (future phases or out of scope):
+    // Explicitly disabled (out of scope):
     ("atomicwrite", false),
     ("bitvec_test", false),
+    ("builtin_test", false),
     ("case_sensitive_like", false),
     ("casesensitivelike", false),
     ("codec", false),
     ("columnmetadata", false),
     ("default_autovacuum", false),
     ("deprecated", false),
+    ("deserialize", false),
     ("empty_result_callbacks", false),
     ("fts3", false),
     ("fts4", false),
-    ("fts5", false),
+    ("geopoly", false),
     ("get_table", false),
     ("icu", false),
-    ("json", false),
-    ("json1", false),
     ("load_ext", false),
     ("lock_proxy_pragmas", false),
     ("lookaside", false),
@@ -442,13 +459,12 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("offset_sql_func", false),
     ("prefer_proxy_locking", false),
     ("proxy_locking", false),
-    ("rtree", false),
+    ("rtree_int_only", false),
     ("shared_cache", false),
     ("stat4", false),
     ("unlock_notify", false),
     ("update_delete_limit", false),
     ("utf16", false),
-    ("vtab", false),
 ];
 
 /// Looks up a capability name in the explicit capability table.
@@ -666,6 +682,7 @@ pub struct SqliteTestHost {
     prng_state: u64,
     last_vmstep: u64,
     last_sort: u64,
+    fts5_may_be_corrupt: bool,
 }
 
 pub type SharedHost = Rc<RefCell<SqliteTestHost>>;
@@ -762,6 +779,7 @@ impl SqliteTestHost {
             prng_state: 0x1234_5678_9abc_def0,
             last_vmstep: 0,
             last_sort: 0,
+            fts5_may_be_corrupt: false,
         }))
     }
 
@@ -1283,14 +1301,20 @@ pub fn bootstrap_tester(
     host: &SharedHost,
     temp_dir: &Path,
 ) -> TclResult<()> {
-    let (test_dir_str, argv0_str, open_opts, vfs) = {
+    let (preset_testdir, test_dir_str, argv0_str, open_opts, vfs) = {
         let h = host.borrow();
         let script_file = if h.report.file_name.ends_with(".test") {
             h.report.file_name.clone()
         } else {
             format!("{}.test", h.report.file_name)
         };
+        let is_core_test_root = h.sqlite_test_dir.file_name().is_some_and(|n| n == "test")
+            && h.sqlite_test_dir
+                .parent()
+                .and_then(|p| p.file_name())
+                .is_some_and(|n| n == "sqlite");
         (
+            is_core_test_root,
             h.sqlite_test_dir.to_string_lossy().into_owned(),
             h.sqlite_test_dir
                 .join(script_file)
@@ -1300,7 +1324,9 @@ pub fn bootstrap_tester(
             h.disk_vfs(),
         )
     };
-    let _ = interp.set_var("testdir", test_dir_str);
+    if preset_testdir {
+        let _ = interp.set_var("testdir", test_dir_str);
+    }
     let _ = interp.set_var("argv0", argv0_str);
     let _ = interp.set_var("argv", String::new());
     let _ = interp.set_var("AUTOVACUUM", "0".to_string());
@@ -1673,6 +1699,7 @@ fn dispatch_host_builtin(
         "sqlite3_column_count" => cmd_col_count(host, false, args),
         "sqlite3_data_count" => cmd_col_count(host, true, args),
         "sqlite3_column_name" => cmd_col_name(host, args),
+        "sqlite3_column_decltype" => cmd_col_decltype(host, args),
         "sqlite3_column_type" => cmd_col_type(host, args),
         "sqlite3_column_text" => cmd_col_text(host, args),
         "sqlite3_column_int" => cmd_col_int(host, false, args),
@@ -1722,6 +1749,21 @@ fn dispatch_host_builtin(
         "sqlite_delete_function" => cmd_delete_function(host, invoked_name, args),
         "sqlite_delete_collation" => cmd_delete_collation(host, invoked_name, args),
         "sqlite3_busy_timeout" => cmd_busy_timeout(host, invoked_name, args),
+        "load_static_extension" => cmd_load_static_extension(host, invoked_name, args),
+        "register_dbstat_vtab" => cmd_register_dbstat_vtab(host, invoked_name, args),
+        "register_wholenumber_module" => cmd_register_wholenumber_module(host, invoked_name, args),
+        "register_schema_module" => cmd_register_schema_module(host, invoked_name, args),
+        "register_tclvar_module" => cmd_register_tclvar_module(host, interp, invoked_name, args),
+        "register_tcl_module" => cmd_register_tcl_module(host, invoked_name, args),
+        "register_echo_module" => cmd_register_echo_module(host, invoked_name, args),
+        "sqlite3_declare_vtab" => cmd_sqlite3_declare_vtab(host, invoked_name, args),
+        "sqlite3_fts5_may_be_corrupt" => cmd_fts5_may_be_corrupt(host, invoked_name, args),
+        "sqlite3_fts5_drop_corrupt_table" => {
+            cmd_fts5_drop_corrupt_table(host, interp, invoked_name, args)
+        }
+        "testvfs" => Err(TclControl::Error(
+            "C testvfs is not supported in safe Rust harness".to_string(),
+        )),
         "noop_zero" => Ok("0".to_string()),
         _ => Err(TclControl::Error(format!(
             "invalid command name \"{invoked_name}\""
@@ -2836,8 +2878,15 @@ fn cmd_source(host: &SharedHost, interp: &mut TclInterp, args: &[String]) -> Tcl
                     p.to_path_buf()
                 } else {
                     let in_temp = interp.resolve_path(target);
+                    let in_script_dir = Path::new(&interp.script_path)
+                        .parent()
+                        .map(|d| d.join(target));
                     if in_temp.exists() {
                         in_temp
+                    } else if let Some(ref sd_candidate) = in_script_dir
+                        && sd_candidate.exists()
+                    {
+                        sd_candidate.clone()
                     } else if p.exists() {
                         p.to_path_buf()
                     } else {
@@ -3196,6 +3245,8 @@ fn db_config_subcmd(
     if opt.eq_ignore_ascii_case("enable_view")
         || opt.eq_ignore_ascii_case("enable_trigger")
         || opt.eq_ignore_ascii_case("dqs_dml")
+        || opt.eq_ignore_ascii_case("defensive")
+        || opt.eq_ignore_ascii_case("trusted_schema")
     {
         let set_opt = match args.get(1) {
             Some(v) => {
@@ -3212,8 +3263,15 @@ fn db_config_subcmd(
             conn.db_config_enable_view(set_opt)
         } else if opt.eq_ignore_ascii_case("enable_trigger") {
             conn.db_config_enable_trigger(set_opt)
-        } else {
+        } else if opt.eq_ignore_ascii_case("dqs_dml") {
             conn.db_config_dqs_dml(set_opt)
+        } else if opt.eq_ignore_ascii_case("defensive") {
+            conn.db_config_defensive(set_opt)
+        } else {
+            if let Some(b) = set_opt {
+                let _ = conn.set_trusted_schema(b);
+            }
+            conn.trusted_schema().unwrap_or(true)
         };
         return Ok(i32::from(cur).to_string());
     }
@@ -3233,27 +3291,28 @@ fn cmd_sqlite3_db_config(host: &SharedHost, cmd_name: &str, args: &[String]) -> 
         };
         id
     };
-    let opt = args[1].trim();
-    if opt.eq_ignore_ascii_case("ENABLE_VIEW")
-        || opt.eq_ignore_ascii_case("SQLITE_DBCONFIG_ENABLE_VIEW")
-    {
-        let mut sub_args = vec!["enable_view".to_string()];
-        if let Some(v) = args.get(2) {
-            sub_args.push(v.clone());
-        }
-        return db_config_subcmd(host, &args[0], db_id, &sub_args);
+    let mut opt = args[1].trim();
+    if let Some(rest) = opt.strip_prefix("SQLITE_") {
+        opt = rest;
     }
-    if opt.eq_ignore_ascii_case("ENABLE_TRIGGER")
-        || opt.eq_ignore_ascii_case("SQLITE_DBCONFIG_ENABLE_TRIGGER")
-    {
-        let mut sub_args = vec!["enable_trigger".to_string()];
-        if let Some(v) = args.get(2) {
-            sub_args.push(v.clone());
-        }
-        return db_config_subcmd(host, &args[0], db_id, &sub_args);
+    if let Some(rest) = opt.strip_prefix("DBCONFIG_") {
+        opt = rest;
     }
-    if opt.eq_ignore_ascii_case("DQS_DML") || opt.eq_ignore_ascii_case("SQLITE_DBCONFIG_DQS_DML") {
-        let mut sub_args = vec!["dqs_dml".to_string()];
+    let mapped = if opt.eq_ignore_ascii_case("ENABLE_VIEW") || opt.eq_ignore_ascii_case("VIEW") {
+        Some("enable_view")
+    } else if opt.eq_ignore_ascii_case("ENABLE_TRIGGER") || opt.eq_ignore_ascii_case("TRIGGER") {
+        Some("enable_trigger")
+    } else if opt.eq_ignore_ascii_case("DQS_DML") {
+        Some("dqs_dml")
+    } else if opt.eq_ignore_ascii_case("DEFENSIVE") {
+        Some("defensive")
+    } else if opt.eq_ignore_ascii_case("TRUSTED_SCHEMA") {
+        Some("trusted_schema")
+    } else {
+        None
+    };
+    if let Some(canonical) = mapped {
+        let mut sub_args = vec![canonical.to_string()];
         if let Some(v) = args.get(2) {
             sub_args.push(v.clone());
         }
@@ -3746,6 +3805,28 @@ fn cmd_col_name(host: &SharedHost, args: &[String]) -> TclResult<String> {
     }
     .unwrap_or_default();
     Ok(name)
+}
+
+fn cmd_col_decltype(host: &SharedHost, args: &[String]) -> TclResult<String> {
+    if args.len() != 2 {
+        return Err(TclControl::Error(
+            "wrong # args: should be \"sqlite3_column_decltype STMT column\"".to_string(),
+        ));
+    }
+    let id = args[0].as_str();
+    let col = parse_tcl_int(args[1].trim())
+        .ok_or_else(|| TclControl::Error(format!("expected integer but got \"{}\"", args[1])))?;
+    if id.is_empty() || col < 0 {
+        return Ok(String::new());
+    }
+    let col_idx = col as usize;
+    let h = host.borrow();
+    let decl = match h.stmts.get(id) {
+        Some(StmtSlot::Present(rec)) => rec.stmt.column_decltype(col_idx),
+        _ => None,
+    }
+    .unwrap_or_default();
+    Ok(decl)
 }
 
 fn with_current_col_value<F, R>(host: &SharedHost, args: &[String], cmd: &str, f: F) -> TclResult<R>
@@ -5725,7 +5806,242 @@ fn cmd_busy_timeout(host: &SharedHost, invoked_name: &str, args: &[String]) -> T
     Ok("0".to_string())
 }
 
-fn sqlite_err_text(e: &SqliteError) -> String {
+fn resolve_db_conn_and_cmd_name(
+    host: &SharedHost,
+    raw_token: &str,
+) -> Result<(DbId, Rc<Connection>, String), TclControl> {
+    let h = host.borrow();
+    let Some(id) = h.resolve_db_id(raw_token) else {
+        return Err(TclControl::Error(format!("not a database: {raw_token}")));
+    };
+    let Some(DbSlot::Present(db)) = h.dbs.get(&id) else {
+        return Err(TclControl::Error(format!("not a database: {raw_token}")));
+    };
+    let cmd_name = h
+        .cmd_table
+        .iter()
+        .find_map(|(name, target)| match target {
+            HostCmdTarget::Db(tid) if *tid == id => Some(name.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| raw_token.to_string());
+    Ok((id, Rc::clone(&db.conn), cmd_name))
+}
+
+fn cmd_load_static_extension(
+    host: &SharedHost,
+    invoked_name: &str,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() < 2 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{invoked_name} db NAME ...\""
+        )));
+    }
+    let (_db_id, conn, db_cmd_name) = resolve_db_conn_and_cmd_name(host, &args[0])?;
+    for raw_ext in &args[1..] {
+        let base = Path::new(raw_ext.trim())
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(raw_ext.trim())
+            .to_ascii_lowercase();
+        let res: sqliters_types::Result<()> = match base.as_str() {
+            "wholenumber" => conn.register_module(Arc::new(crate::vtab_helpers::WholenumberModule)),
+            "series" | "generate_series" => Ok(()),
+            "strdup" => crate::vtab_helpers::register_strdup_extension(&conn),
+            "randomjson" => crate::vtab_helpers::register_randomjson_extension(&conn),
+            "eval" => crate::vtab_helpers::register_eval_extension(&conn, db_cmd_name.clone()),
+            other => {
+                return Err(TclControl::Error(format!(
+                    "unsupported static extension: {other}"
+                )));
+            }
+        };
+        res.map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    }
+    Ok(String::new())
+}
+
+fn cmd_register_dbstat_vtab(
+    host: &SharedHost,
+    invoked_name: &str,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() != 1 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{invoked_name} DB\""
+        )));
+    }
+    let _ = resolve_db_conn_and_cmd_name(host, &args[0])?;
+    Ok("SQLITE_OK".to_string())
+}
+
+fn cmd_register_wholenumber_module(
+    host: &SharedHost,
+    invoked_name: &str,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() != 1 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{invoked_name} DB\""
+        )));
+    }
+    let (_id, conn, _) = resolve_db_conn_and_cmd_name(host, &args[0])?;
+    conn.register_module(Arc::new(crate::vtab_helpers::WholenumberModule))
+        .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    Ok(String::new())
+}
+
+fn cmd_register_schema_module(
+    host: &SharedHost,
+    invoked_name: &str,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() != 1 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{invoked_name} DB\""
+        )));
+    }
+    let (_id, conn, _) = resolve_db_conn_and_cmd_name(host, &args[0])?;
+    conn.register_module(Arc::new(crate::vtab_helpers::SchemaTestModule))
+        .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    Ok(String::new())
+}
+
+fn cmd_register_tclvar_module(
+    host: &SharedHost,
+    interp: &mut TclInterp,
+    invoked_name: &str,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() != 1 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{invoked_name} DB\""
+        )));
+    }
+    let (_id, conn, _) = resolve_db_conn_and_cmd_name(host, &args[0])?;
+    conn.register_module(Arc::new(crate::vtab_helpers::TclvarTestModule))
+        .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    interp.eval(crate::vtab_helpers::TCLVAR_HELPER_PROCS)?;
+    Ok(String::new())
+}
+
+fn cmd_register_tcl_module(
+    host: &SharedHost,
+    invoked_name: &str,
+    args: &[String],
+) -> TclResult<String> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{invoked_name} DB ?DEFAULT-CMD?\""
+        )));
+    }
+    let (_id, conn, _) = resolve_db_conn_and_cmd_name(host, &args[0])?;
+    let module = crate::vtab_helpers::TclVtabTestModule {
+        default_cmd: args.get(1).cloned(),
+        allow_update: args.len() == 2,
+    };
+    conn.register_module(Arc::new(module))
+        .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    Ok(String::new())
+}
+
+fn cmd_register_echo_module(
+    host: &SharedHost,
+    invoked_name: &str,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() != 1 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{invoked_name} DB\""
+        )));
+    }
+    let (_id, conn, _) = resolve_db_conn_and_cmd_name(host, &args[0])?;
+    conn.register_module(Arc::new(crate::vtab_helpers::EchoTestModule::new("echo")))
+        .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    conn.register_module(Arc::new(crate::vtab_helpers::EchoTestModule::new(
+        "echo_v2",
+    )))
+    .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    Ok("SQLITE_OK".to_string())
+}
+
+fn cmd_sqlite3_declare_vtab(
+    host: &SharedHost,
+    invoked_name: &str,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() != 2 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{invoked_name} DB SQL\""
+        )));
+    }
+    let (db_id, _, _) = resolve_db_conn_and_cmd_name(host, &args[0])?;
+    let misuse_code = ErrorCode::Misuse as i32;
+    let msg = "bad parameter or other API misuse".to_string();
+    host.borrow_mut()
+        .set_db_error(db_id, misuse_code, misuse_code, msg.clone());
+    Err(TclControl::Error(msg))
+}
+
+fn cmd_fts5_may_be_corrupt(
+    host: &SharedHost,
+    invoked_name: &str,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() > 1 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{invoked_name} ?BOOLEAN?\""
+        )));
+    }
+    let mut h = host.borrow_mut();
+    let old = if h.fts5_may_be_corrupt { "1" } else { "0" }.to_string();
+    if let Some(arg) = args.first() {
+        let new_val = parse_tcl_bool(arg).map_err(TclControl::Error)?;
+        h.fts5_may_be_corrupt = new_val;
+    }
+    Ok(old)
+}
+
+fn cmd_fts5_drop_corrupt_table(
+    host: &SharedHost,
+    interp: &mut TclInterp,
+    invoked_name: &str,
+    args: &[String],
+) -> TclResult<String> {
+    if args.len() != 3 {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{invoked_name} DB DATABASE TABLE\""
+        )));
+    }
+    let (_db_id, conn, _) = resolve_db_conn_and_cmd_name(host, &args[0])?;
+    let db_schema = args[1].replace('"', "\"\"");
+    let tab = args[2].replace('"', "\"\"");
+    let old_defensive = conn.db_config_defensive(None);
+    if old_defensive {
+        conn.db_config_defensive(Some(false));
+    }
+    let sql = format!(
+        "DELETE FROM \"{db_schema}\".\"{tab}_data\"; \
+         DELETE FROM \"{db_schema}\".\"{tab}_config\"; \
+         INSERT INTO \"{db_schema}\".\"{tab}_data\" VALUES(10, X'0000000000'); \
+         INSERT INTO \"{db_schema}\".\"{tab}_config\" VALUES('version', 4); \
+         DROP TABLE \"{db_schema}\".\"{tab}\";"
+    );
+    let res = {
+        let _interp_guard = enter_interp_scope(interp);
+        conn.execute_batch(&sql)
+    };
+    if old_defensive {
+        conn.db_config_defensive(Some(true));
+    }
+    match res {
+        Ok(()) => Ok(String::new()),
+        Err(e) => Err(TclControl::Error(format!("error: {}", sqlite_err_text(&e)))),
+    }
+}
+
+pub(crate) fn sqlite_err_text(e: &SqliteError) -> String {
     if e.message.is_empty() {
         e.code.as_str().to_string()
     } else {
@@ -5753,7 +6069,7 @@ fn value_to_tcl_str(v: &Value, nullvalue: &str) -> String {
         Value::Null => nullvalue.to_string(),
         Value::Integer(i) => i.to_string(),
         Value::Real(r) => format_tcl_double(*r),
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.split('\0').next().unwrap_or("").to_string(),
         Value::Blob(b) => String::from_utf8_lossy(b).into_owned(),
     }
 }
@@ -5991,6 +6307,15 @@ proc execsql_timed {sql {db db}} {
   uplevel [list $db eval $sql]
 }
 
+proc execsql_pp {sql {db db}} {
+  uplevel [list $db eval $sql]
+  return ""
+}
+
+proc expand_all_sql {db} {
+  return ""
+}
+
 proc catchsql {sql {db db}} {
   set r [catch [list uplevel [list $db eval $sql]] msg]
   lappend r $msg
@@ -6112,14 +6437,43 @@ proc query_plan_graph {sql} {
   set A [uplevel [list db eval "EXPLAIN QUERY PLAN $sql"]]
   set g "\nQUERY PLAN\n"
   append_graph g $A 0 ""
+  regsub -all {SUBQUERY 0x[A-Fa-f0-9]+} $g {SUBQUERY xxxxxx} g
+  regsub -all {(MATERIALIZE|CO-ROUTINE|SUBQUERY) [0-9]+} $g {\1 xxxxxx} g
+  regsub -all {\((join|subquery)-[0-9]+\)} $g {(\1-xxxxxx)} g
   return $g
 }
 
 proc do_eqp_test {name sql res} {
   if {[string match "*QUERY PLAN*" $res]} {
     set query_plan [uplevel [list query_plan_graph $sql]]
-    set norm_qp [string trim [string map {"\n  " "\n" "\n    " "\n  "} $query_plan]]
-    set norm_res [string trim [string map {"\n  " "\n" "\n    " "\n  "} $res]]
+    set qp_lines [list]
+    foreach ln [split [string trim $query_plan] "\n"] {
+      lappend qp_lines [string trimright $ln]
+    }
+    set base_indent 0
+    foreach ln [split $res "\n"] {
+      if {[string trim $ln] eq "QUERY PLAN"} {
+        set base_indent [expr {[string length $ln] - [string length [string trimleft $ln]]}]
+        break
+      }
+    }
+    set res_lines [list]
+    foreach ln [split [string trim $res] "\n"] {
+      set trimmed_r [string trimright $ln]
+      if {$trimmed_r eq "QUERY PLAN"} {
+        lappend res_lines "QUERY PLAN"
+      } elseif {$base_indent > 0 && [string length $trimmed_r] >= $base_indent && [string trim [string range $trimmed_r 0 [expr {$base_indent - 1}]]] eq ""} {
+        set rest [string range $trimmed_r $base_indent end]
+        if {[string range $rest 0 1] eq "  "} {
+          set rest [string range $rest 2 end]
+        }
+        lappend res_lines $rest
+      } else {
+        lappend res_lines $trimmed_r
+      }
+    }
+    set norm_qp [join $qp_lines "\n"]
+    set norm_res [join $res_lines "\n"]
     if {$norm_qp == $norm_res} {
       uplevel [list do_test $name [list expr 1] 1]
     } else {

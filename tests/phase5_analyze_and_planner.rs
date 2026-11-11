@@ -467,16 +467,7 @@ fn targeted_tcl_suite_audit_phase5b() {
         if !path.exists() {
             continue;
         }
-        let raw_script = fs::read_to_string(&path).unwrap();
-        let script = raw_script
-            .replace("ifcapable {!analyze||!vtab}", "ifcapable {!analyze}")
-            .replace("ifcapable !vtab", "if {0}")
-            .replace("load_static_extension db wholenumber;", "")
-            .replace("load_static_extension db wholenumber", "")
-            .replace(
-                "CREATE VIRTUAL TABLE nums USING wholenumber;",
-                "CREATE TEMP VIEW nums(value) AS WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM c WHERE x<2000) SELECT x FROM c;",
-            );
+        let script = fs::read_to_string(&path).unwrap();
         let name_owned = name.to_owned();
         let report = std::thread::Builder::new()
             .name(format!("tcl-{name}"))

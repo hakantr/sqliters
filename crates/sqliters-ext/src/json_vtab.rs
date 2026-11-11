@@ -146,6 +146,10 @@ impl VirtualTable for JsonWalkTable {
         } else {
             info.estimated_cost = 1.0;
             info.estimated_rows = 25;
+            if info.order_by.len() == 1 && info.order_by[0].i_column == -1 && !info.order_by[0].desc
+            {
+                info.order_by_consumed = true;
+            }
         }
         info.idx_num = idx_num;
         Ok(())

@@ -1434,6 +1434,7 @@ fn fix_trig_expr(
             schema,
             table,
             column,
+            double_quoted,
         }) => {
             if let Some(s) = schema {
                 check_allowed_trig_schema(trigger_name, db_schema_name, s)?;
@@ -1442,6 +1443,7 @@ fn fix_trig_expr(
                 schema: schema.clone(),
                 table: table.clone(),
                 column: column.clone(),
+                double_quoted: *double_quoted,
             }))
         }
         Expr::Unary { op, expr: inner } => Ok(Expr::Unary {

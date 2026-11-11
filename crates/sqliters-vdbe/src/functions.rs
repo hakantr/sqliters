@@ -358,7 +358,7 @@ pub fn eval_scalar_function_rt_with_strict(
             eval_json_error_position(&filtered[0])?
         }
         "JSON_EXTRACT" | "JSONB_EXTRACT" => {
-            check_arity_rt(name, filtered, 2, usize::MAX)?;
+            check_arity_rt(name, filtered, 0, usize::MAX)?;
             eval_json_extract(filtered, upper == "JSONB_EXTRACT")?
         }
         "JSON_INSERT" | "JSONB_INSERT" => {
@@ -496,7 +496,11 @@ fn eval_scalar_function_plain(
             match &args[0] {
                 Value::Null => Ok(Value::Null),
                 Value::Blob(b) => Ok(Value::Integer(b.len() as i64)),
-                other => Ok(Value::Integer(other.to_text_lossy().chars().count() as i64)),
+                other => {
+                    let s = other.to_text_lossy();
+                    let before_nul = s.split('\0').next().unwrap_or("");
+                    Ok(Value::Integer(before_nul.chars().count() as i64))
+                }
             }
         }
         "OCTET_LENGTH" => {
@@ -657,7 +661,10 @@ fn eval_scalar_function_plain(
                 Value::Null => "NULL".to_owned(),
                 Value::Integer(i) => i.to_string(),
                 Value::Real(r) => format_sqlite_real(*r),
-                Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+                Value::Text(s) => {
+                    let before_nul = s.split('\0').next().unwrap_or("");
+                    format!("'{}'", before_nul.replace('\'', "''"))
+                }
                 Value::Blob(b) => {
                     let mut hex = String::with_capacity(b.len() * 2 + 3);
                     hex.push_str("X'");
@@ -922,7 +929,7 @@ fn scalar_function_arity_with_flag(
         | "JSON_ERROR_POSITION" => Some((1, 1)),
         "RANDOM" | "SQLITE_VERSION" | "SQLITE_SOURCE_ID" | "LAST_INSERT_ROWID" | "CHANGES"
         | "TOTAL_CHANGES" | "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" => Some((0, 0)),
-        "COALESCE" | "IIF" | "IF" | "JSON_EXTRACT" | "JSONB_EXTRACT" => Some((2, usize::MAX)),
+        "COALESCE" | "IIF" | "IF" => Some((2, usize::MAX)),
         "IFNULL" | "NULLIF" | "INSTR" | "GLOB" | "LIKELIHOOD" | "->" | "->>" | "JSON_PATCH"
         | "JSONB_PATCH" => Some((2, 2)),
         "RANDSTR" | "TEST_SET_SUBTYPE" | "TEST_BAD_SUBTYPE" if enable_test_functions => {
@@ -935,7 +942,8 @@ fn scalar_function_arity_with_flag(
         | "JSON_PRETTY" => Some((1, 2)),
         "SUBSTR" | "SUBSTRING" | "LIKE" => Some((2, 3)),
         "CHAR" | "DATE" | "TIME" | "DATETIME" | "UNIXEPOCH" | "JULIANDAY" | "STRFTIME"
-        | "JSON_ARRAY" | "JSONB_ARRAY" | "JSON_OBJECT" | "JSONB_OBJECT" => Some((0, usize::MAX)),
+        | "JSON_ARRAY" | "JSONB_ARRAY" | "JSON_OBJECT" | "JSONB_OBJECT" | "JSON_EXTRACT"
+        | "JSONB_EXTRACT" => Some((0, usize::MAX)),
         "PRINTF" | "FORMAT" | "JSON_INSERT" | "JSONB_INSERT" | "JSON_REPLACE" | "JSONB_REPLACE"
         | "JSON_SET" | "JSONB_SET" | "JSON_REMOVE" | "JSONB_REMOVE" | "JSON_ARRAY_INSERT"
         | "JSONB_ARRAY_INSERT" => Some((1, usize::MAX)),
@@ -1540,24 +1548,62 @@ fn simple_sqlite_printf(fmt: &str, args: &[Value]) -> String {
             continue;
         }
         let mut zero_pad = false;
-        if i < bytes.len() && bytes[i] == b'0' {
-            zero_pad = true;
-            i += 1;
+        let mut left_align = false;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'0' => {
+                    zero_pad = true;
+                    i += 1;
+                }
+                b'-' => {
+                    left_align = true;
+                    i += 1;
+                }
+                b'+' | b' ' | b'#' | b'!' | b',' => {
+                    i += 1;
+                }
+                _ => break,
+            }
         }
         let mut width = 0usize;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            width = width * 10 + (bytes[i] - b'0') as usize;
+        if i < bytes.len() && bytes[i] == b'*' {
             i += 1;
+            let w = args.get(arg_idx).map_or(0, Value::to_integer_lossy);
+            arg_idx += 1;
+            if w < 0 {
+                left_align = true;
+                width = w.unsigned_abs() as usize;
+            } else {
+                width = w as usize;
+            }
+        } else {
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                width = width * 10 + (bytes[i] - b'0') as usize;
+                i += 1;
+            }
         }
         let mut prec: Option<usize> = None;
         if i < bytes.len() && bytes[i] == b'.' {
             i += 1;
-            let mut p = 0usize;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                p = p * 10 + (bytes[i] - b'0') as usize;
+            if i < bytes.len() && bytes[i] == b'*' {
                 i += 1;
+                let p = args.get(arg_idx).map_or(0, Value::to_integer_lossy);
+                arg_idx += 1;
+                if p >= 0 {
+                    prec = Some(p as usize);
+                }
+            } else {
+                let mut p = 0usize;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    p = p * 10 + (bytes[i] - b'0') as usize;
+                    i += 1;
+                }
+                prec = Some(p);
             }
-            prec = Some(p);
+        }
+        // Optional length modifiers (`l`, `ll`, `z`)
+        while i < bytes.len() && matches!(bytes[i], b'l' | b'h') {
+            i += 1;
         }
         if i >= bytes.len() {
             break;
@@ -1568,19 +1614,99 @@ fn simple_sqlite_printf(fmt: &str, args: &[Value]) -> String {
         arg_idx += 1;
 
         let formatted = match spec {
-            'd' | 'i' => format!("{}", val.to_integer_lossy()),
-            'x' => format!("{:x}", val.to_integer_lossy()),
-            'X' => format!("{:X}", val.to_integer_lossy()),
+            'd' | 'i' => {
+                let raw = format!("{}", val.to_integer_lossy());
+                if let Some(p) = prec {
+                    if p == 0 && raw == "0" {
+                        String::new()
+                    } else if let Some(digits) = raw.strip_prefix('-') {
+                        if digits.len() < p {
+                            format!("-{}{digits}", "0".repeat(p - digits.len()))
+                        } else {
+                            raw
+                        }
+                    } else if raw.len() < p {
+                        format!("{}{raw}", "0".repeat(p - raw.len()))
+                    } else {
+                        raw
+                    }
+                } else {
+                    raw
+                }
+            }
+            'u' => format!("{}", val.to_integer_lossy() as u64),
+            'o' => format!("{:o}", val.to_integer_lossy() as u64),
+            'x' => format!("{:x}", val.to_integer_lossy() as u64),
+            'X' => format!("{:X}", val.to_integer_lossy() as u64),
             'f' => {
                 let p = prec.unwrap_or(6);
                 format!("{:.*}", p, val.to_real_lossy())
             }
-            's' => val.to_text_lossy(),
+            'e' => {
+                let p = prec.unwrap_or(6);
+                format!("{:.*e}", p, val.to_real_lossy())
+            }
+            'E' => {
+                let p = prec.unwrap_or(6);
+                format!("{:.*E}", p, val.to_real_lossy())
+            }
+            'c' => {
+                let repeat = prec.unwrap_or(1).max(1);
+                let s = val.to_text_lossy();
+                if let Some(ch) = s.chars().next() {
+                    let mut buf = String::with_capacity(ch.len_utf8() * repeat);
+                    for _ in 0..repeat {
+                        buf.push(ch);
+                    }
+                    buf
+                } else {
+                    String::new()
+                }
+            }
+            'q' => {
+                if val.is_null() {
+                    "(NULL)".to_owned()
+                } else {
+                    let s = val.to_text_lossy();
+                    let before_nul = s.split('\0').next().unwrap_or("");
+                    before_nul.replace('\'', "''")
+                }
+            }
+            'Q' => {
+                if val.is_null() {
+                    "NULL".to_owned()
+                } else {
+                    let s = val.to_text_lossy();
+                    let before_nul = s.split('\0').next().unwrap_or("");
+                    format!("'{}'", before_nul.replace('\'', "''"))
+                }
+            }
+            's' | 'z' => {
+                let s = val.to_text_lossy();
+                let before_nul = s.split('\0').next().unwrap_or("");
+                if let Some(p) = prec {
+                    before_nul.chars().take(p).collect()
+                } else {
+                    before_nul.to_owned()
+                }
+            }
             _ => val.to_text_lossy(),
         };
-        if formatted.len() < width {
-            let pad = width - formatted.len();
-            let pad_ch = if zero_pad { '0' } else { ' ' };
+        let char_len = formatted.chars().count();
+        if char_len < width {
+            let pad = width - char_len;
+            if left_align {
+                out.push_str(&formatted);
+                for _ in 0..pad {
+                    out.push(' ');
+                }
+                continue;
+            }
+            let pad_ch = if zero_pad && !matches!(spec, 's' | 'z' | 'c' | 'q' | 'Q') {
+                '0'
+            } else {
+                ' '
+            };
             for _ in 0..pad {
                 out.push(pad_ch);
             }
