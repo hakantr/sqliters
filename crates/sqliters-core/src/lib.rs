@@ -9,6 +9,7 @@ pub mod db_set;
 pub mod driver;
 pub mod engine;
 pub mod execution_context;
+pub mod fast_read;
 pub mod schema;
 pub mod trigger;
 pub mod vtab;
@@ -840,6 +841,13 @@ pub(crate) enum RunningExec {
         lease_cursors: Vec<(SchemaInstanceId, CursorId)>,
         read_instances: SmallInstVec,
     },
+    FastSingleTextArena {
+        arena: String,
+        spans: Vec<(u32, u32)>,
+        pos: usize,
+        lease_cursors: Vec<(SchemaInstanceId, CursorId)>,
+        read_instances: SmallInstVec,
+    },
     MaterializedNoLock {
         rows: std::vec::IntoIter<Vec<Value>>,
     },
@@ -979,6 +987,7 @@ pub(crate) struct ConnectionShared {
     pub(crate) is_readonly: bool,
     pub(crate) open_options: ConnectionOpenOptions,
     pub(crate) interrupt_flag: Arc<AtomicBool>,
+    pub(crate) has_external_interrupt: AtomicBool,
     pub(crate) gate_busy: AtomicBool,
     pub(crate) conn_state: AtomicU8,
     pub(crate) has_pending_drops: AtomicBool,
@@ -1265,7 +1274,8 @@ impl Drop for ConnectionShared {
                             RunningExec::Vdbe { mut vm, .. } => {
                                 vm.close_cursors(&mut inner.db_set);
                             }
-                            RunningExec::MaterializedRead { lease_cursors, .. } => {
+                            RunningExec::MaterializedRead { lease_cursors, .. }
+                            | RunningExec::FastSingleTextArena { lease_cursors, .. } => {
                                 for (inst, cid) in lease_cursors {
                                     if let Some(slot) = inner.db_set.slot_by_instance_mut(inst)
                                         && let Some(ref mut bt) = slot.btree
@@ -2428,6 +2438,11 @@ impl ConnectionInner {
                 lease_cursors,
                 read_instances,
                 ..
+            }
+            | RunningExec::FastSingleTextArena {
+                lease_cursors,
+                read_instances,
+                ..
             } => self.finish_activity(
                 hid,
                 ActivityFinish::ReadDone {
@@ -2963,6 +2978,7 @@ impl Connection {
             is_readonly,
             open_options,
             interrupt_flag,
+            has_external_interrupt: AtomicBool::new(false),
             gate_busy: AtomicBool::new(false),
             conn_state: AtomicU8::new(CONN_STATE_OPEN),
             has_pending_drops: AtomicBool::new(false),
@@ -3433,6 +3449,9 @@ impl Connection {
     /// Returns a lock-free [`InterruptHandle`] (`Send + Sync + Clone`) for `sqlite3_interrupt`.
     #[inline]
     pub fn interrupt_handle(&self) -> InterruptHandle {
+        self.shared
+            .has_external_interrupt
+            .store(true, Ordering::Release);
         InterruptHandle {
             flag: Arc::clone(&self.shared.interrupt_flag),
         }
@@ -3441,6 +3460,9 @@ impl Connection {
     /// Returns the default atomic interrupt flag attached to this connection.
     #[inline]
     pub fn interrupt_flag(&self) -> &Arc<AtomicBool> {
+        self.shared
+            .has_external_interrupt
+            .store(true, Ordering::Release);
         &self.shared.interrupt_flag
     }
 
@@ -3824,6 +3846,11 @@ impl Connection {
         let mut session = self.shared.enter()?;
         let inner = session.inner_mut();
         inner.ensure_usable()?;
+        if flag.is_some() {
+            self.shared
+                .has_external_interrupt
+                .store(true, Ordering::Release);
+        }
         let eff = flag.unwrap_or_else(|| Arc::clone(&self.shared.interrupt_flag));
         inner.active_interrupt_flag = Arc::clone(&eff);
         inner.db_set.set_interrupt_flag(eff);
@@ -4567,6 +4594,7 @@ pub struct Statement {
     requires_schema: bool,
     category: Option<StmtCategory>,
     compiled_vdbe: Option<Arc<VdbeProgram>>,
+    compiled_fast_read: Option<Arc<fast_read::FastReadPlan>>,
     cached_read_vm: Option<VdbeVm>,
     write_vm_scratch: sqliters_vdbe::VdbeWriteScratch,
     compiled_schema_generation: u64,
@@ -4598,6 +4626,7 @@ struct CompiledArtifacts {
     requires_schema: bool,
     category: Option<StmtCategory>,
     compiled_vdbe: Option<Arc<VdbeProgram>>,
+    compiled_fast_read: Option<Arc<fast_read::FastReadPlan>>,
     column_names: Vec<String>,
     max_param: usize,
     named_params: HashMap<String, usize>,
@@ -4652,6 +4681,7 @@ fn compile_parsed_stmt(
             requires_schema: false,
             category: None,
             compiled_vdbe: None,
+            compiled_fast_read: None,
             column_names: Vec::new(),
             max_param: 0,
             named_params: HashMap::new(),
@@ -4688,6 +4718,7 @@ fn compile_parsed_stmt(
             requires_schema,
             category: None,
             compiled_vdbe: None,
+            compiled_fast_read: None,
             column_names: Vec::new(),
             max_param,
             named_params,
@@ -4697,12 +4728,19 @@ fn compile_parsed_stmt(
 
     let category = Some(classify_stmt_category(&stmt));
     let mut compiled_vdbe = None;
+    let mut compiled_fast_read = None;
     // Only use fast-path `VdbeVm` when all `DatabaseId` slots are `0` (`main`) or `1` (`temp`),
     // which never shift on `DETACH`. Attached `slots[2..]` queries run via `MaterializedRead`
     // keyed by `SchemaInstanceId` so `DETACH` slot-collapse never shifts active cursor indices!
     match &stmt {
         Stmt::Select(sel) => {
-            if let Some(prog) = compiler::try_compile_select_in_db_set(sel, db_set, functions)?
+            if let Some(fp) =
+                fast_read::try_compile_fast_read_plan(sel, db_set, functions, collations)
+                && fp.db_id == DatabaseId::MAIN
+            {
+                compiled_fast_read = Some(Arc::new(fp));
+            } else if let Some(prog) =
+                compiler::try_compile_select_in_db_set(sel, db_set, functions)?
                 && (prog.referenced_db_mask() & !0b11) == 0
             {
                 compiled_vdbe = Some(Arc::new(prog));
@@ -4737,6 +4775,7 @@ fn compile_parsed_stmt(
         requires_schema,
         category,
         compiled_vdbe,
+        compiled_fast_read,
         column_names,
         max_param,
         named_params,
@@ -5607,9 +5646,10 @@ impl ConnectionInner {
 
         let is_autocommit = self.is_autocommit();
         let can_elide_sp = !prog.needs_stmt_subsavepoint()
-            && !prog.has_function_call()
+            && (!prog.has_function_call() || !self.functions.has_user_functions())
             && !self.progress.is_enabled()
-            && Arc::strong_count(&self.active_interrupt_flag) == 1
+            && !shared.has_external_interrupt.load(Ordering::Acquire)
+            && !self.active_interrupt_flag.load(Ordering::Relaxed)
             && self.db_set.main_slot().max_page_count >= SQLITE_MAX_PAGE_COUNT;
         let stmt_sp_slot = if !is_autocommit {
             if can_elide_sp {
@@ -5671,44 +5711,68 @@ impl ConnectionInner {
             ));
         }
 
-        let prev_ts = self.runtime.stmt_timestamp_ms;
-        let stmt_ts = if prev_ts.is_some() {
-            prev_ts
-        } else if prog.has_function_call() {
-            Some(self.db_set.main_btree().pager().vfs().current_unix_millis())
-        } else {
-            None
-        };
-        let enc = self.effective_encoding();
-        let mut vm_rt = VmRuntimeContext {
-            last_insert_rowid: self.runtime.last_insert_rowid,
-            last_changes: 0,
-            total_changes: 0,
-            stmt_timestamp_ms: stmt_ts,
-            enable_test_functions: self.runtime.enable_test_functions,
-        };
-        let svc_rt = vm_rt;
-        let mut run_res = {
-            let mut exec_svc = ExecutionContext {
-                interrupt_flag: &self.active_interrupt_flag,
-                runtime: &svc_rt,
-                encoding: enc,
-                functions: &self.functions,
-                collations: &self.collations,
-                progress: &mut self.progress,
-                strict_subtype: self.strict_subtype,
-            };
-            sqliters_vdbe::VdbeVm::run_write_program(
-                &prog,
+        let (mut run_res, new_last_rowid, new_changes) = if let Some(ins_plan) =
+            prog.single_row_insert()
+            && (!ins_plan.has_builtin_jsonb || !self.functions.has_user_functions())
+            && !self.progress.is_enabled()
+        {
+            let bt = self.db_set.slots_mut()[0].btree.as_mut().unwrap();
+            let (scratch_rec, scratch_jb) = self.lit_insert_scratch.scratch_buffers_mut();
+            match execute_single_row_insert_plan(
+                ins_plan,
                 &self.lit_insert_params[..n_args],
-                &mut vm_rt,
-                &mut self.lit_insert_scratch,
-                &mut self.db_set,
-                &mut exec_svc,
-            )
+                scratch_rec,
+                scratch_jb,
+                bt,
+            ) {
+                Ok(rid) => {
+                    self.progress
+                        .add_ticks_without_handler(prog.ops.len() as u64);
+                    (Ok(()), rid, 1u64)
+                }
+                Err(e) => (Err(e), self.runtime.last_insert_rowid, 0u64),
+            }
+        } else {
+            let prev_ts = self.runtime.stmt_timestamp_ms;
+            let stmt_ts = if prev_ts.is_some() {
+                prev_ts
+            } else if prog.needs_stmt_timestamp() {
+                Some(self.db_set.main_btree().pager().vfs().current_unix_millis())
+            } else {
+                None
+            };
+            let enc = self.effective_encoding();
+            let mut vm_rt = VmRuntimeContext {
+                last_insert_rowid: self.runtime.last_insert_rowid,
+                last_changes: 0,
+                total_changes: 0,
+                stmt_timestamp_ms: stmt_ts,
+                enable_test_functions: self.runtime.enable_test_functions,
+            };
+            let svc_rt = vm_rt;
+            let r = {
+                let mut exec_svc = ExecutionContext {
+                    interrupt_flag: &self.active_interrupt_flag,
+                    runtime: &svc_rt,
+                    encoding: enc,
+                    functions: &self.functions,
+                    collations: &self.collations,
+                    progress: &mut self.progress,
+                    strict_subtype: self.strict_subtype,
+                };
+                sqliters_vdbe::VdbeVm::run_write_program(
+                    &prog,
+                    &self.lit_insert_params[..n_args],
+                    &mut vm_rt,
+                    &mut self.lit_insert_scratch,
+                    &mut self.db_set,
+                    &mut exec_svc,
+                )
+            };
+            (r, vm_rt.last_insert_rowid, vm_rt.last_changes)
         };
-        if vm_rt.last_insert_rowid != self.runtime.last_insert_rowid {
-            self.runtime.last_insert_rowid = vm_rt.last_insert_rowid;
+        if new_last_rowid != self.runtime.last_insert_rowid {
+            self.runtime.last_insert_rowid = new_last_rowid;
         }
         if run_res.is_ok() {
             let slot = self.db_set.main_slot();
@@ -5741,8 +5805,8 @@ impl ConnectionInner {
             ));
         }
 
-        self.runtime.last_changes = vm_rt.last_changes;
-        self.runtime.total_changes += vm_rt.last_changes;
+        self.runtime.last_changes = new_changes;
+        self.runtime.total_changes += new_changes;
 
         if !is_autocommit && self.simulated_cleanup_io_error.is_none() {
             if let Some(sp_slot) = stmt_sp_slot
@@ -6238,6 +6302,7 @@ impl Statement {
             requires_schema: artifacts.requires_schema,
             category: artifacts.category,
             compiled_vdbe: artifacts.compiled_vdbe,
+            compiled_fast_read: artifacts.compiled_fast_read,
             cached_read_vm: None,
             write_vm_scratch: sqliters_vdbe::VdbeWriteScratch::default(),
             compiled_schema_generation: inner.schema_generation,
@@ -6838,6 +6903,7 @@ impl Statement {
             self.requires_schema = artifacts.requires_schema;
             self.category = artifacts.category;
             self.compiled_vdbe = artifacts.compiled_vdbe;
+            self.compiled_fast_read = artifacts.compiled_fast_read;
             self.column_names = artifacts.column_names;
             self.params = transferred;
             self.named_params = artifacts.named_params;
@@ -7150,6 +7216,58 @@ impl Statement {
             }
         }
 
+        // Zero-`Arc::clone` fast path for pre-compiled `FastReadPlan` on `main`.
+        if let Some(hid) = self.handle_id
+            && matches!(
+                self.lifecycle,
+                StatementLifecycle::Ready | StatementLifecycle::Halted { .. }
+            )
+            && self.category == Some(StmtCategory::Read)
+            && !self.expired
+            && self.compiled_fast_read.is_some()
+        {
+            let fast_read_res = {
+                let Self {
+                    ref shared,
+                    category,
+                    expired,
+                    compiled_advisory_expire_generation,
+                    compiled_schema_generation,
+                    compiled_v1_expire_generation,
+                    ref compiled_slot_cookies,
+                    ref compiled_fast_read,
+                    ref params,
+                    ref mut lifecycle,
+                    ..
+                } = *self;
+                let mut session = shared.enter()?;
+                let inner = session.inner_mut();
+                if let Err(e) = inner.ensure_usable() {
+                    Some(Err(e))
+                } else if inner.trace_hook.is_some() || inner.authorizer.is_some() {
+                    None
+                } else {
+                    try_fast_read_plan_fields(
+                        hid,
+                        shared,
+                        inner,
+                        category,
+                        expired,
+                        compiled_advisory_expire_generation,
+                        compiled_schema_generation,
+                        compiled_v1_expire_generation,
+                        compiled_slot_cookies,
+                        compiled_fast_read.as_deref(),
+                        params,
+                        lifecycle,
+                    )
+                }
+            };
+            if let Some(res) = fast_read_res {
+                return res;
+            }
+        }
+
         let shared = Arc::clone(&self.shared);
         let mut session = shared.enter()?;
         self.step_in_session(&shared, session.inner_mut())
@@ -7222,6 +7340,28 @@ impl Statement {
             &self.params,
             &mut self.lifecycle,
             &mut self.write_vm_scratch,
+        )
+    }
+
+    fn try_fast_read_plan(
+        &mut self,
+        hid: HandleId,
+        shared: &Arc<ConnectionShared>,
+        inner: &mut ConnectionInner,
+    ) -> Option<Result<StepResult>> {
+        try_fast_read_plan_fields(
+            hid,
+            shared,
+            inner,
+            self.category,
+            self.expired,
+            self.compiled_advisory_expire_generation,
+            self.compiled_schema_generation,
+            self.compiled_v1_expire_generation,
+            &self.compiled_slot_cookies,
+            self.compiled_fast_read.as_deref(),
+            &self.params,
+            &mut self.lifecycle,
         )
     }
 
@@ -7306,7 +7446,7 @@ impl Statement {
             SmallInstVec::new(),
         );
         let mut vm_rt = inner.runtime;
-        if vm_rt.stmt_timestamp_ms.is_none() && prog.has_function_call() {
+        if vm_rt.stmt_timestamp_ms.is_none() && prog.needs_stmt_timestamp() {
             vm_rt.stmt_timestamp_ms = Some(
                 inner
                     .db_set
@@ -7333,6 +7473,9 @@ impl Statement {
         inner: &mut ConnectionInner,
     ) -> Result<StepResult> {
         if let Some(fast_res) = self.try_fast_compiled_main_write(hid, shared, inner) {
+            return fast_res;
+        }
+        if let Some(fast_res) = self.try_fast_read_plan(hid, shared, inner) {
             return fast_res;
         }
         if let Some(fast_res) = self.try_fast_compiled_main_read(hid, shared, inner) {
@@ -7364,6 +7507,9 @@ impl Statement {
                     last_error: Some(e.clone()),
                 };
                 return Err(e);
+            }
+            if let Some(fast_res) = self.try_fast_read_plan(hid, shared, inner) {
+                return fast_res;
             }
         }
 
@@ -7733,7 +7879,7 @@ impl Statement {
                             SmallInstVec::new(),
                         );
                         let mut vm_rt = inner.runtime;
-                        if vm_rt.stmt_timestamp_ms.is_none() && prog_final.has_function_call() {
+                        if vm_rt.stmt_timestamp_ms.is_none() && prog_final.needs_stmt_timestamp() {
                             vm_rt.stmt_timestamp_ms = Some(
                                 inner
                                     .db_set
@@ -8550,7 +8696,8 @@ impl Statement {
                 let write_scratch = &mut self.write_vm_scratch;
                 let params_ref = &self.params;
                 let prev_ts = inner.runtime.stmt_timestamp_ms;
-                let needs_ts_for_compiled = compiled_prog_ref.is_none_or(|p| p.has_function_call());
+                let needs_ts_for_compiled =
+                    compiled_prog_ref.is_none_or(|p| p.needs_stmt_timestamp());
                 if prev_ts.is_none() && needs_ts_for_compiled {
                     inner.runtime.stmt_timestamp_ms = Some(
                         inner
@@ -8888,6 +9035,116 @@ impl Statement {
                 }
             }
 
+            RunningExec::FastSingleTextArena {
+                arena,
+                spans,
+                pos,
+                lease_cursors,
+                read_instances,
+            } => {
+                if let Err(e) = inner.check_any_interrupted() {
+                    std::mem::take(arena);
+                    std::mem::take(spans);
+                    let cursors = std::mem::take(lease_cursors);
+                    let r_insts = std::mem::take(read_instances);
+                    let _ = inner.finish_activity(
+                        hid,
+                        ActivityFinish::ReadAborted {
+                            lease_cursors: cursors,
+                            read_instances: r_insts,
+                        },
+                        shared,
+                    );
+                    self.lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(e.clone()),
+                    };
+                    return Err(e);
+                }
+
+                for &(inst, cid) in lease_cursors.iter() {
+                    let Some(slot) = inner.db_set.slot_by_instance_mut(inst) else {
+                        continue;
+                    };
+                    let Some(ref mut bt) = slot.btree else {
+                        continue;
+                    };
+                    if let Some(&BtreeCursorState::Fault(code)) = bt.cursor_state(cid) {
+                        let msg = if code == extended::SQLITE_ABORT_ROLLBACK {
+                            "abort due to ROLLBACK"
+                        } else {
+                            ErrorCode::from_raw_primary(code).as_str()
+                        };
+                        let err = SqliteError::with_extended(code, msg);
+                        std::mem::take(arena);
+                        std::mem::take(spans);
+                        let cursors = std::mem::take(lease_cursors);
+                        let r_insts = std::mem::take(read_instances);
+                        let _ = inner.finish_activity(
+                            hid,
+                            ActivityFinish::ReadAborted {
+                                lease_cursors: cursors,
+                                read_instances: r_insts,
+                            },
+                            shared,
+                        );
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(err.clone()),
+                        };
+                        return Err(err);
+                    }
+                    if let Err(e) = bt.restore_cursor_position(cid) {
+                        std::mem::take(arena);
+                        std::mem::take(spans);
+                        let cursors = std::mem::take(lease_cursors);
+                        let r_insts = std::mem::take(read_instances);
+                        let _ = inner.finish_activity(
+                            hid,
+                            ActivityFinish::ReadAborted {
+                                lease_cursors: cursors,
+                                read_instances: r_insts,
+                            },
+                            shared,
+                        );
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        return Err(e);
+                    }
+                }
+
+                if *pos < spans.len() {
+                    let (off, len) = spans[*pos];
+                    *pos += 1;
+                    let val = if len == u32::MAX {
+                        Value::Null
+                    } else {
+                        Value::Text(arena[off as usize..(off + len) as usize].to_owned())
+                    };
+                    Ok(StepResult::Row(Row::new(vec![val])))
+                } else {
+                    std::mem::take(arena);
+                    std::mem::take(spans);
+                    let cursors = std::mem::take(lease_cursors);
+                    let r_insts = std::mem::take(read_instances);
+                    let fin_res = inner.finish_activity(
+                        hid,
+                        ActivityFinish::ReadDone {
+                            lease_cursors: cursors,
+                            read_instances: r_insts,
+                        },
+                        shared,
+                    );
+                    if let Err(e) = fin_res {
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        return Err(e);
+                    }
+                    self.lifecycle = StatementLifecycle::Halted { last_error: None };
+                    Ok(StepResult::Done)
+                }
+            }
+
             RunningExec::MaterializedNoLock { rows } => {
                 if let Some(vals) = rows.next() {
                     Ok(StepResult::Row(Row::new(vals)))
@@ -9116,7 +9373,20 @@ fn resolve_insert_val_source<'a>(src: &'a InsertValSource, params: &'a [Value]) 
     match src {
         InsertValSource::Null => &Value::Null,
         InsertValSource::Const(v) => v,
-        InsertValSource::Param1Based(p) => params.get((*p as usize) - 1).unwrap_or(&Value::Null),
+        InsertValSource::Param1Based(p) | InsertValSource::JsonbParam1Based(p) => {
+            params.get((*p as usize) - 1).unwrap_or(&Value::Null)
+        }
+    }
+}
+
+#[inline]
+fn reclaim_jsonb_scratch(coerced: &mut [Value], scratch_jsonb: &mut Vec<u8>) {
+    for v in coerced {
+        if let Value::Blob(b) = v
+            && b.capacity() > scratch_jsonb.capacity()
+        {
+            *scratch_jsonb = std::mem::take(b);
+        }
     }
 }
 
@@ -9124,83 +9394,382 @@ fn execute_single_row_insert_plan(
     plan: &SingleRowInsertPlan,
     params: &[Value],
     scratch_rec: &mut Vec<u8>,
+    scratch_jsonb: &mut Vec<u8>,
     bt: &mut Btree,
 ) -> Result<i64> {
     if bt.transaction_state() != TransactionState::Write {
         bt.begin_write()?;
     }
-    let explicit_rowid = match plan.rowid_src {
-        None => None,
-        Some(ref src) => {
-            let raw_rid = resolve_insert_val_source(src, params);
-            if raw_rid.is_null() {
-                None
-            } else if let Value::Integer(rid) = *raw_rid {
-                Some(rid)
-            } else {
-                match TypeAffinity::Integer.apply(raw_rid.clone()) {
-                    Value::Integer(rid) => Some(rid),
-                    _ => return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch")),
-                }
-            }
-        }
-    };
 
     let n_cols = plan.cols.len();
     let mut coerced: [Value; 16] = std::array::from_fn(|_| Value::Null);
     let mut is_coerced = [false; 16];
-    for (i, col) in plan.cols.iter().enumerate() {
-        let raw_val = resolve_insert_val_source(&col.src, params);
-        if affinity_is_noop_for_insert(col.affinity, raw_val) {
-            if raw_val.is_null()
-                && let Some(ref msg) = col.notnull_msg
-            {
-                return Err(SqliteError::constraint(
-                    extended::SQLITE_CONSTRAINT_NOTNULL,
-                    msg.clone(),
-                ));
+
+    // 1. Evaluate any built-in `jsonb(?p)` expressions first (matching VDBE step-2 expression order).
+    if plan.has_builtin_jsonb {
+        for (i, col) in plan.cols.iter().enumerate() {
+            if let InsertValSource::JsonbParam1Based(p) = col.src {
+                let raw_arg = params.get((p as usize) - 1).unwrap_or(&Value::Null);
+                let mut jb_buf = std::mem::take(scratch_jsonb);
+                match sqliters_types::eval_jsonb_value_into(raw_arg, &mut jb_buf) {
+                    Ok(true) => {
+                        coerced[i] = Value::Blob(jb_buf);
+                        is_coerced[i] = true;
+                    }
+                    Ok(false) => {
+                        *scratch_jsonb = jb_buf;
+                        coerced[i] = Value::Null;
+                        is_coerced[i] = true;
+                    }
+                    Err(e) => {
+                        *scratch_jsonb = jb_buf;
+                        reclaim_jsonb_scratch(&mut coerced[..n_cols], scratch_jsonb);
+                        return Err(e);
+                    }
+                }
             }
-        } else {
-            let v = col.affinity.apply(raw_val.clone());
-            if v.is_null()
-                && let Some(ref msg) = col.notnull_msg
-            {
-                return Err(SqliteError::constraint(
-                    extended::SQLITE_CONSTRAINT_NOTNULL,
-                    msg.clone(),
-                ));
-            }
-            coerced[i] = v;
-            is_coerced[i] = true;
         }
     }
 
-    let mut val_refs: [&Value; 16] = [&Value::Null; 16];
-    for (i, col) in plan.cols.iter().enumerate() {
-        val_refs[i] = if is_coerced[i] {
-            &coerced[i]
-        } else {
-            resolve_insert_val_source(&col.src, params)
+    let run_res = (|| -> Result<i64> {
+        let explicit_rowid = match plan.rowid_src {
+            None => None,
+            Some(ref src) => {
+                let raw_rid = resolve_insert_val_source(src, params);
+                if raw_rid.is_null() {
+                    None
+                } else if let Value::Integer(rid) = *raw_rid {
+                    Some(rid)
+                } else {
+                    match TypeAffinity::Integer.apply(raw_rid.clone()) {
+                        Value::Integer(rid) => Some(rid),
+                        _ => {
+                            return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
+                        }
+                    }
+                }
+            }
         };
+
+        for (i, col) in plan.cols.iter().enumerate() {
+            if is_coerced[i] {
+                if coerced[i].is_null()
+                    && let Some(ref msg) = col.notnull_msg
+                {
+                    return Err(SqliteError::constraint(
+                        extended::SQLITE_CONSTRAINT_NOTNULL,
+                        msg.clone(),
+                    ));
+                }
+                continue;
+            }
+            let raw_val = resolve_insert_val_source(&col.src, params);
+            if affinity_is_noop_for_insert(col.affinity, raw_val) {
+                if raw_val.is_null()
+                    && let Some(ref msg) = col.notnull_msg
+                {
+                    return Err(SqliteError::constraint(
+                        extended::SQLITE_CONSTRAINT_NOTNULL,
+                        msg.clone(),
+                    ));
+                }
+            } else {
+                let v = col.affinity.apply(raw_val.clone());
+                if v.is_null()
+                    && let Some(ref msg) = col.notnull_msg
+                {
+                    return Err(SqliteError::constraint(
+                        extended::SQLITE_CONSTRAINT_NOTNULL,
+                        msg.clone(),
+                    ));
+                }
+                coerced[i] = v;
+                is_coerced[i] = true;
+            }
+        }
+
+        let mut val_refs: [&Value; 16] = [&Value::Null; 16];
+        for (i, col) in plan.cols.iter().enumerate() {
+            val_refs[i] = if is_coerced[i] {
+                &coerced[i]
+            } else {
+                resolve_insert_val_source(&col.src, params)
+            };
+        }
+
+        let (rowid, need_dup_check) = match explicit_rowid {
+            Some(rid) => (rid, true),
+            None => (bt.next_rowid(plan.root_pgno)?, false),
+        };
+
+        let enc = bt.encoding();
+        encode_value_refs_record_into(&val_refs[..n_cols], enc, scratch_rec);
+        if need_dup_check {
+            if !bt.insert_table_unique(plan.root_pgno, rowid, scratch_rec)? {
+                return Err(SqliteError::constraint(
+                    plan.dup_ext_code,
+                    plan.dup_msg.clone(),
+                ));
+            }
+        } else {
+            bt.insert_table(plan.root_pgno, rowid, scratch_rec)?;
+        }
+
+        if !plan.indexes.is_empty() {
+            let rid_val = Value::Integer(rowid);
+            let mut idx_refs: [&Value; 17] = [&Value::Null; 17];
+            for idx in &plan.indexes {
+                let k_len = idx.col_slots.len();
+                for (k, &slot) in idx.col_slots.iter().enumerate() {
+                    idx_refs[k] = match slot {
+                        None => &rid_val,
+                        Some(ci) => val_refs[ci],
+                    };
+                }
+                idx_refs[k_len] = &rid_val;
+                encode_value_refs_record_into(&idx_refs[..=k_len], enc, scratch_rec);
+                bt.insert_index(idx.root_pgno, scratch_rec, &idx.orders)?;
+            }
+        }
+
+        Ok(rowid)
+    })();
+
+    if plan.has_builtin_jsonb {
+        reclaim_jsonb_scratch(&mut coerced[..n_cols], scratch_jsonb);
+    }
+    run_res
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_fast_read_plan_fields(
+    hid: HandleId,
+    shared: &Arc<ConnectionShared>,
+    inner: &mut ConnectionInner,
+    category: Option<StmtCategory>,
+    expired: bool,
+    compiled_advisory_expire_generation: u64,
+    compiled_schema_generation: u64,
+    compiled_v1_expire_generation: u64,
+    compiled_slot_cookies: &[(SchemaInstanceId, u32, bool)],
+    fast_plan: Option<&fast_read::FastReadPlan>,
+    params: &[Value],
+    lifecycle: &mut StatementLifecycle,
+) -> Option<Result<StepResult>> {
+    if category != Some(StmtCategory::Read)
+        || expired
+        || compiled_advisory_expire_generation != inner.advisory_expire_generation
+        || compiled_schema_generation != inner.schema_generation
+        || compiled_v1_expire_generation != inner.v1_expire_generation
+        || inner.progress.is_enabled()
+        || inner.simulated_cleanup_io_error.is_some()
+        || inner.db_set.vtab_registry().has_any_in_tx()
+    {
+        return None;
+    }
+    let fast_plan = fast_plan?;
+    if fast_plan.db_id != DatabaseId::MAIN {
+        return None;
+    }
+    let main_slot = inner.db_set.main_slot();
+    if !main_slot.schema.loaded || main_slot.btree.is_none() {
+        return None;
+    }
+    let main_inst = main_slot.schema_instance_id;
+    let main_cookie = main_slot.schema.schema_cookie;
+    let main_had_pages = main_slot.schema.had_pages;
+    if inner.db_set.main_btree().transaction_state() != TransactionState::Open {
+        let bt = inner.db_set.main_btree();
+        let has_pages = bt.pager().page_count() > 0;
+        let cur_cookie = bt.pager().header().schema_cookie;
+        if main_had_pages != has_pages || main_cookie != cur_cookie {
+            return None;
+        }
+    }
+    if slot_cookies_changed_slice(compiled_slot_cookies, inner) {
+        return None;
     }
 
-    let (rowid, need_dup_check) = match explicit_rowid {
-        Some(rid) => (rid, true),
-        None => (bt.next_rowid(plan.root_pgno)?, false),
+    let started_here = inner.db_set.main_btree().transaction_state() == TransactionState::Open;
+    if started_here {
+        let res = {
+            let bt = inner.db_set.slots_mut()[0].btree.as_mut().unwrap();
+            inner.busy_policy.retry_btree(bt, |b| b.begin_read())
+        };
+        if let Err(e) = res {
+            *lifecycle = StatementLifecycle::Halted {
+                last_error: Some(e.clone()),
+            };
+            return Some(Err(e));
+        }
+        let bt = inner.db_set.main_btree();
+        let has_pages = bt.pager().page_count() > 0;
+        let cur_cookie = bt.pager().header().schema_cookie;
+        if has_pages != main_had_pages || cur_cookie != main_cookie {
+            if !inner.in_user_btree_tx && inner.is_autocommit() {
+                let sum = inner.activity.summary_excluding(hid, &inner.db_set);
+                if (sum.other_read_db_mask & 1) == 0
+                    && (sum.other_write_db_mask & 1) == 0
+                    && sum.other_writers == 0
+                    && let Some(ref mut bt_mut) = inner.db_set.slots_mut()[0].btree
+                    && bt_mut.transaction_state() == TransactionState::Read
+                {
+                    let _ = bt_mut.pager_mut().end_read_if_unused();
+                }
+            }
+            return None;
+        }
+    }
+
+    if let Err(e) = inner.check_any_interrupted() {
+        if !inner.in_user_btree_tx && inner.is_autocommit() {
+            let sum = inner.activity.summary_excluding(hid, &inner.db_set);
+            if (sum.other_read_db_mask & 1) == 0
+                && (sum.other_write_db_mask & 1) == 0
+                && sum.other_writers == 0
+                && let Some(ref mut bt) = inner.db_set.slots_mut()[0].btree
+                && bt.transaction_state() == TransactionState::Read
+            {
+                let _ = bt.pager_mut().end_read_if_unused();
+            }
+        }
+        *lifecycle = StatementLifecycle::Halted {
+            last_error: Some(e.clone()),
+        };
+        return Some(Err(e));
+    }
+
+    let enc = inner.effective_encoding();
+    let exec_res = {
+        let bt = inner.db_set.slots_mut()[0].btree.as_mut().unwrap();
+        fast_plan.execute(bt, params, enc)
     };
 
-    encode_value_refs_record_into(&val_refs[..n_cols], bt.encoding(), scratch_rec);
-    if need_dup_check {
-        if !bt.insert_table_unique(plan.root_pgno, rowid, scratch_rec)? {
-            return Err(SqliteError::constraint(
-                plan.dup_ext_code,
-                plan.dup_msg.clone(),
-            ));
+    match exec_res {
+        Ok(fast_read::FastReadExecOut::Empty) => {
+            if !inner.is_autocommit() {
+                inner.in_user_btree_tx = true;
+            } else if !inner.in_user_btree_tx {
+                let sum = inner.activity.summary_excluding(hid, &inner.db_set);
+                if (sum.other_read_db_mask & 1) == 0
+                    && (sum.other_write_db_mask & 1) == 0
+                    && sum.other_writers == 0
+                    && let Some(ref mut bt) = inner.db_set.slots_mut()[0].btree
+                    && bt.transaction_state() == TransactionState::Read
+                    && let Err(e) = bt.pager_mut().end_read_if_unused()
+                {
+                    let p_err = inner.poison_with(e);
+                    *lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(p_err.clone()),
+                    };
+                    return Some(Err(p_err));
+                }
+            }
+            *lifecycle = StatementLifecycle::Halted { last_error: None };
+            Some(Ok(StepResult::Done))
         }
-    } else {
-        bt.insert_table(plan.root_pgno, rowid, scratch_rec)?;
+        Ok(fast_read::FastReadExecOut::SingleRow(vals)) => {
+            if !inner.is_autocommit() {
+                inner.in_user_btree_tx = true;
+            }
+            let read_instances = SmallInstVec::single(main_inst);
+            inner.activity.start_with_instances(
+                hid,
+                true,
+                false,
+                read_instances.clone(),
+                SmallInstVec::new(),
+            );
+            *lifecycle =
+                StatementLifecycle::Running(RunningExec::PointSelectRowYielded { read_instances });
+            Some(Ok(StepResult::Row(Row::new(vals))))
+        }
+        Ok(out_multi) => {
+            if !inner.is_autocommit() {
+                inner.in_user_btree_tx = true;
+            }
+            let read_instances = SmallInstVec::single(main_inst);
+            inner.activity.start_with_instances(
+                hid,
+                true,
+                false,
+                read_instances.clone(),
+                SmallInstVec::new(),
+            );
+            let mut lease_cursors: Vec<(SchemaInstanceId, CursorId)> =
+                Vec::with_capacity(fast_plan.lease_roots.len());
+            for &root in fast_plan.lease_roots.iter() {
+                let bt = inner.db_set.slots_mut()[0].btree.as_mut().unwrap();
+                let page_cnt = bt.pager().page_count();
+                let cid = bt.open_table_cursor(root, false);
+                if page_cnt >= root
+                    && let Err(e) = bt.cursor_first(cid)
+                {
+                    lease_cursors.push((main_inst, cid));
+                    let _ = inner.finish_activity(
+                        hid,
+                        ActivityFinish::ReadAborted {
+                            lease_cursors,
+                            read_instances,
+                        },
+                        shared,
+                    );
+                    *lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(e.clone()),
+                    };
+                    return Some(Err(e));
+                }
+                lease_cursors.push((main_inst, cid));
+            }
+
+            match out_multi {
+                fast_read::FastReadExecOut::Rows(rows) => {
+                    let mut iter = rows.into_iter();
+                    let first = iter.next().expect("Rows has >= 2 elements");
+                    *lifecycle = StatementLifecycle::Running(RunningExec::MaterializedRead {
+                        rows: iter,
+                        lease_cursors,
+                        read_instances,
+                    });
+                    Some(Ok(StepResult::Row(Row::new(first))))
+                }
+                fast_read::FastReadExecOut::SingleTextArena { arena, spans } => {
+                    let (off0, len0) = spans[0];
+                    let first_val = if len0 == u32::MAX {
+                        Value::Null
+                    } else {
+                        Value::Text(arena[off0 as usize..(off0 + len0) as usize].to_owned())
+                    };
+                    *lifecycle = StatementLifecycle::Running(RunningExec::FastSingleTextArena {
+                        arena,
+                        spans,
+                        pos: 1,
+                        lease_cursors,
+                        read_instances,
+                    });
+                    Some(Ok(StepResult::Row(Row::new(vec![first_val]))))
+                }
+                _ => unreachable!(),
+            }
+        }
+        Err(e) => {
+            if !inner.in_user_btree_tx && inner.is_autocommit() {
+                let sum = inner.activity.summary_excluding(hid, &inner.db_set);
+                if (sum.other_read_db_mask & 1) == 0
+                    && (sum.other_write_db_mask & 1) == 0
+                    && sum.other_writers == 0
+                    && let Some(ref mut bt) = inner.db_set.slots_mut()[0].btree
+                    && bt.transaction_state() == TransactionState::Read
+                {
+                    let _ = bt.pager_mut().end_read_if_unused();
+                }
+            }
+            *lifecycle = StatementLifecycle::Halted {
+                last_error: Some(e.clone()),
+            };
+            Some(Err(e))
+        }
     }
-    Ok(rowid)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9318,9 +9887,10 @@ fn try_fast_compiled_main_write_fields(
 
     let is_autocommit = inner.is_autocommit();
     let can_elide_sp = !prog.needs_stmt_subsavepoint()
-        && !prog.has_function_call()
+        && (!prog.has_function_call() || !inner.functions.has_user_functions())
         && !inner.progress.is_enabled()
-        && Arc::strong_count(&inner.active_interrupt_flag) == 1
+        && !shared.has_external_interrupt.load(Ordering::Acquire)
+        && !inner.active_interrupt_flag.load(Ordering::Relaxed)
         && inner.db_set.main_slot().max_page_count >= SQLITE_MAX_PAGE_COUNT;
     let stmt_sp_slot = if !is_autocommit {
         if can_elide_sp {
@@ -9392,15 +9962,12 @@ fn try_fast_compiled_main_write_fields(
 
     let (mut run_res, new_last_rowid, new_changes) = if let Some(ins_plan) =
         prog.single_row_insert()
+        && (!ins_plan.has_builtin_jsonb || !inner.functions.has_user_functions())
         && !inner.progress.is_enabled()
     {
         let bt = inner.db_set.slots_mut()[0].btree.as_mut().unwrap();
-        match execute_single_row_insert_plan(
-            ins_plan,
-            params,
-            write_vm_scratch.scratch_rec_mut(),
-            bt,
-        ) {
+        let (scratch_rec, scratch_jb) = write_vm_scratch.scratch_buffers_mut();
+        match execute_single_row_insert_plan(ins_plan, params, scratch_rec, scratch_jb, bt) {
             Ok(rid) => {
                 inner
                     .progress
@@ -9413,7 +9980,7 @@ fn try_fast_compiled_main_write_fields(
         let prev_ts = inner.runtime.stmt_timestamp_ms;
         let stmt_ts = if prev_ts.is_some() {
             prev_ts
-        } else if prog.has_function_call() {
+        } else if prog.needs_stmt_timestamp() {
             Some(
                 inner
                     .db_set

@@ -14,8 +14,8 @@ use sqliters_types::{
 };
 use sqliters_vdbe::{
     AggregateKind, InsertValSource, Instruction, Opcode, P4, PointProjCol, RowidKeySource,
-    RowidPointSelectPlan, SingleRowInsertCol, SingleRowInsertPlan, VdbeProgram, affinity_to_p5,
-    sqlite_compare_affinity,
+    RowidPointSelectPlan, SingleRowInsertCol, SingleRowInsertIndex, SingleRowInsertPlan,
+    VdbeProgram, affinity_to_p5, sqlite_compare_affinity,
 };
 
 use crate::db_set::{DatabaseSet, ResolvedRelation};
@@ -2722,6 +2722,7 @@ fn is_vtab_shadow_table(tbl_name: &str, schema: &Schema) -> bool {
     }
     for vt in &schema.virtual_tables {
         if tbl_name.len() > vt.name.len()
+            && tbl_name.is_char_boundary(vt.name.len())
             && tbl_name[..vt.name.len()].eq_ignore_ascii_case(&vt.name)
         {
             let tail = &tbl_name[vt.name.len()..];
@@ -2838,7 +2839,11 @@ fn try_compile_insert_core(
     }
     if db_id.index() >= 2
         || Schema::is_schema_table_name(&tbl.name)
-        || (tbl.name.len() >= 7 && tbl.name[..7].eq_ignore_ascii_case("sqlite_"))
+        || tbl
+            .name
+            .as_bytes()
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case(b"sqlite_"))
         || slot_schema.find_virtual_table(&tbl.name).is_some()
         || is_vtab_shadow_table(&tbl.name, slot_schema)
         || tbl.without_rowid
@@ -3177,10 +3182,35 @@ fn try_compile_insert_core(
         }
     }
 
-    let can_elide_stmt_sp =
-        rows.len() == 1 && icurs.iter().all(|(_, idx, _)| !idx.unique) && !prog.has_function_call();
-    let can_build_single_row_plan =
-        rows.len() == 1 && icurs.is_empty() && !prog.has_function_call() && n_cols <= 16;
+    let can_elide_stmt_sp = rows.len() == 1 && icurs.iter().all(|(_, idx, _)| !idx.unique);
+    let can_build_single_row_plan = rows.len() == 1
+        && n_cols <= 16
+        && icurs
+            .iter()
+            .all(|(_, idx, _)| !idx.unique && idx.columns.len() <= 16);
+    let plan_indexes: Vec<SingleRowInsertIndex> = if can_build_single_row_plan {
+        icurs
+            .iter()
+            .map(|(_, idx, _)| SingleRowInsertIndex {
+                root_pgno: idx.root_pgno,
+                orders: idx.key_sort_orders(),
+                col_slots: idx
+                    .columns
+                    .iter()
+                    .map(|ic| {
+                        let ci = ic.col_idx.expect("validated col_idx");
+                        if tbl.rowid_alias_col == Some(ci) {
+                            None
+                        } else {
+                            Some(ci)
+                        }
+                    })
+                    .collect(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     for (ic, _, _) in icurs {
         prog.emit(Instruction::new(Opcode::Close, ic, 0, 0));
     }
@@ -3210,6 +3240,8 @@ fn try_compile_insert_core(
         prog.set_needs_stmt_subsavepoint(false);
     }
     if can_build_single_row_plan {
+        let allow_builtin_jsonb = !functions.has_user_functions();
+        let mut has_builtin_jsonb = false;
         let row = &rows[0];
         let mut ok = true;
         let mut rowid_src: Option<InsertValSource> = None;
@@ -3218,7 +3250,9 @@ fn try_compile_insert_core(
             if !seen_col[ci] {
                 if tbl.rowid_alias_col == Some(ci) {
                     if let Some(ref de) = col.default_expr {
-                        if let Some(s) = expr_to_insert_val_source(de) {
+                        if let Some(s) =
+                            expr_to_insert_val_source(de, false, &mut has_builtin_jsonb)
+                        {
                             rowid_src = Some(s);
                         } else {
                             ok = false;
@@ -3226,7 +3260,9 @@ fn try_compile_insert_core(
                         }
                     }
                 } else if let Some(ref de) = col.default_expr {
-                    if let Some(s) = expr_to_insert_val_source(de) {
+                    if let Some(s) =
+                        expr_to_insert_val_source(de, allow_builtin_jsonb, &mut has_builtin_jsonb)
+                    {
                         col_srcs[ci] = s;
                     } else {
                         ok = false;
@@ -3237,7 +3273,9 @@ fn try_compile_insert_core(
         }
         if ok {
             for (slot, expr) in targets.iter().zip(row.iter()) {
-                let Some(s) = expr_to_insert_val_source(expr) else {
+                let allow_jb = allow_builtin_jsonb && matches!(*slot, InsertTargetSlot::Col(_));
+                let Some(s) = expr_to_insert_val_source(expr, allow_jb, &mut has_builtin_jsonb)
+                else {
                     ok = false;
                     break;
                 };
@@ -3265,6 +3303,8 @@ fn try_compile_insert_core(
                 root_pgno: tbl.root_pgno,
                 rowid_src,
                 cols,
+                indexes: plan_indexes,
+                has_builtin_jsonb,
                 dup_ext_code,
                 dup_msg,
             }));
@@ -3273,7 +3313,11 @@ fn try_compile_insert_core(
     Ok(Some(prog))
 }
 
-fn expr_to_insert_val_source(expr: &Expr) -> Option<InsertValSource> {
+fn expr_to_insert_val_source(
+    expr: &Expr,
+    allow_builtin_jsonb: bool,
+    has_builtin_jsonb: &mut bool,
+) -> Option<InsertValSource> {
     match expr {
         Expr::Null => Some(InsertValSource::Null),
         Expr::Bool(b) => Some(InsertValSource::Const(Value::Integer(i64::from(*b)))),
@@ -3289,6 +3333,26 @@ fn expr_to_insert_val_source(expr: &Expr) -> Option<InsertValSource> {
                 .ok()
                 .filter(|&p| p >= 1)
                 .map(InsertValSource::Param1Based)
+        }
+        Expr::FunctionCall {
+            name,
+            distinct: false,
+            args: FunctionArgs::Exprs(es),
+            filter: None,
+            over: None,
+        } if allow_builtin_jsonb && es.len() == 1 && name.eq_ignore_ascii_case("jsonb") => {
+            if let Expr::Bind(bp) = &es[0] {
+                let idx = match bp {
+                    BindParam::Anonymous(i) | BindParam::Numbered(i) | BindParam::Named(_, i) => *i,
+                };
+                if let Ok(p) = u32::try_from(idx)
+                    && p >= 1
+                {
+                    *has_builtin_jsonb = true;
+                    return Some(InsertValSource::JsonbParam1Based(p));
+                }
+            }
+            None
         }
         Expr::Unary {
             op: UnaryOp::Negate,
@@ -3327,7 +3391,11 @@ fn table_and_indexes_can_compile_dml(
 ) -> Option<Vec<IndexSchema>> {
     if db_id.index() >= 2
         || Schema::is_schema_table_name(&tbl.name)
-        || (tbl.name.len() >= 7 && tbl.name[..7].eq_ignore_ascii_case("sqlite_"))
+        || tbl
+            .name
+            .as_bytes()
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case(b"sqlite_"))
         || slot_schema.find_virtual_table(&tbl.name).is_some()
         || is_vtab_shadow_table(&tbl.name, slot_schema)
         || tbl.without_rowid

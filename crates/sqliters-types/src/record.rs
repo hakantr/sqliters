@@ -670,8 +670,10 @@ pub fn compare_records_with_encoding(
     Ok(decided)
 }
 
-#[derive(Clone, Copy)]
-enum RawField<'a> {
+/// Borrowed field view decoded directly from a raw SQLite Format-3 record slice without
+/// heap allocation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RawField<'a> {
     Null,
     Int(i64),
     Float(f64),
@@ -681,7 +683,7 @@ enum RawField<'a> {
 
 impl<'a> RawField<'a> {
     #[inline(always)]
-    fn from_serial(serial_type: u64, buf: &'a [u8]) -> Result<Self> {
+    pub fn from_serial(serial_type: u64, buf: &'a [u8]) -> Result<Self> {
         match serial_type {
             0 => Ok(Self::Null),
             1 => Ok(Self::Int(i64::from(buf[0] as i8))),
@@ -725,6 +727,11 @@ impl<'a> RawField<'a> {
     }
 
     #[inline(always)]
+    pub const fn is_null(self) -> bool {
+        matches!(self, Self::Null)
+    }
+
+    #[inline(always)]
     const fn class_rank(self) -> u8 {
         match self {
             Self::Null => 0,
@@ -733,6 +740,289 @@ impl<'a> RawField<'a> {
             Self::Blob(_) => 3,
         }
     }
+
+    /// Materializes an owned [`Value`] from this borrowed field when needed.
+    #[inline]
+    pub fn to_owned_value(self, enc: TextEncoding) -> Value {
+        match self {
+            Self::Null => Value::Null,
+            Self::Int(i) => Value::Integer(i),
+            Self::Float(r) => Value::Real(r),
+            Self::Blob(b) => Value::Blob(b.to_vec()),
+            Self::Text(b) => Value::Text(enc.decode_bytes(b)),
+        }
+    }
+
+    /// Compares `self` (encoded under `enc`) against a non-NULL `rhs` in raw SQL value order
+    /// (without applying `spec.desc` or `spec.nulls_last`), matching `Value::cmp_sqlite_fallible`.
+    #[inline]
+    pub fn compare_sql_to_nonnull_value(
+        self,
+        rhs: &Value,
+        spec: &KeySortOrder,
+        enc: TextEncoding,
+    ) -> Result<Ordering> {
+        match (self, rhs) {
+            (Self::Null, Value::Null) => Ok(Ordering::Equal),
+            (Self::Null, _) => Ok(Ordering::Less),
+            (_, Value::Null) => Ok(Ordering::Greater),
+            (Self::Int(a), Value::Integer(b)) => Ok(a.cmp(b)),
+            (Self::Float(a), Value::Real(b)) => {
+                if b.is_nan() {
+                    return Ok(Ordering::Greater);
+                }
+                if a == 0.0 && *b == 0.0 {
+                    Ok(Ordering::Equal)
+                } else {
+                    Ok(a.total_cmp(b))
+                }
+            }
+            (Self::Int(i), Value::Real(r)) => {
+                if r.is_nan() {
+                    Ok(Ordering::Greater)
+                } else {
+                    Ok(cmp_int_float(i, *r))
+                }
+            }
+            (Self::Float(r), Value::Integer(i)) => Ok(cmp_int_float(*i, r).reverse()),
+            (Self::Int(_) | Self::Float(_), Value::Text(_) | Value::Blob(_)) => Ok(Ordering::Less),
+            (Self::Text(_), Value::Integer(_) | Value::Real(_)) => Ok(Ordering::Greater),
+            (Self::Text(_), Value::Blob(_)) => Ok(Ordering::Less),
+            (Self::Text(buf), Value::Text(rs)) => {
+                if enc == TextEncoding::Utf8
+                    && let Ok(lhs_s) = std::str::from_utf8(buf)
+                {
+                    if let Some(ref cc) = spec.custom_collation {
+                        (cc.comparator)(lhs_s, rs.as_str())
+                    } else {
+                        Ok(spec
+                            .collation
+                            .compare_str_with_encoding(lhs_s, rs.as_str(), enc))
+                    }
+                } else {
+                    let lhs_s = enc.decode_bytes(buf);
+                    if let Some(ref cc) = spec.custom_collation {
+                        (cc.comparator)(&lhs_s, rs.as_str())
+                    } else {
+                        Ok(spec
+                            .collation
+                            .compare_str_with_encoding(&lhs_s, rs.as_str(), enc))
+                    }
+                }
+            }
+            (Self::Blob(buf), Value::Blob(rb)) => Ok(buf.cmp(rb.as_slice())),
+            (Self::Blob(_), _) => Ok(Ordering::Greater),
+        }
+    }
+
+    /// Compares `self` against `rhs` in B-tree index key order (honoring `spec.nulls_last` and `spec.desc`).
+    #[inline]
+    pub fn compare_key_to_value(
+        self,
+        rhs: &Value,
+        spec: &KeySortOrder,
+        enc: TextEncoding,
+    ) -> Result<Ordering> {
+        let rhs_is_null = rhs.is_null();
+        match (self.is_null(), rhs_is_null) {
+            (true, true) => Ok(Ordering::Equal),
+            (true, false) => Ok(if spec.nulls_last {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }),
+            (false, true) => Ok(if spec.nulls_last {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }),
+            (false, false) => {
+                let raw = self.compare_sql_to_nonnull_value(rhs, spec, enc)?;
+                Ok(if spec.desc { raw.reverse() } else { raw })
+            }
+        }
+    }
+}
+
+/// Decodes up to `out_fields.len()` leading columns from `raw` in place with zero heap allocation,
+/// returning the number of columns decoded (`0..=out_fields.len()`).
+#[inline]
+pub fn parse_raw_record_prefix<'a>(
+    raw: &'a [u8],
+    out_fields: &mut [RawField<'a>],
+) -> Result<usize> {
+    if raw.is_empty() || out_fields.is_empty() {
+        return Ok(0);
+    }
+    let (hdr_u64, mut hdr_pos) = get_varint(raw)?;
+    let hdr_size = usize::try_from(hdr_u64)
+        .map_err(|_| SqliteError::corrupt("record header size overflow"))?;
+    if hdr_size > raw.len() || hdr_pos > hdr_size {
+        return Err(SqliteError::corrupt("record header exceeds record length"));
+    }
+    let mut body_pos = hdr_size;
+    let mut idx = 0usize;
+    let max_cols = out_fields.len();
+    while idx < max_cols && hdr_pos < hdr_size {
+        let (st, used) = get_varint(&raw[hdr_pos..hdr_size])?;
+        hdr_pos += used;
+        let len = serial_type_len(st)?;
+        let end = body_pos
+            .checked_add(len)
+            .ok_or_else(|| SqliteError::corrupt("record body offset overflow"))?;
+        if end > raw.len() {
+            return Err(SqliteError::corrupt("record payload truncated"));
+        }
+        out_fields[idx] = RawField::from_serial(st, &raw[body_pos..end])?;
+        body_pos = end;
+        idx += 1;
+    }
+    Ok(idx)
+}
+
+/// Reads a single column `col_idx` directly as a borrowed [`RawField`] without heap allocation.
+#[inline]
+pub fn read_raw_record_field(raw: &[u8], col_idx: usize) -> Result<Option<RawField<'_>>> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let (hdr_u64, mut hdr_pos) = get_varint(raw)?;
+    let hdr_size = usize::try_from(hdr_u64)
+        .map_err(|_| SqliteError::corrupt("record header size overflow"))?;
+    if hdr_size > raw.len() || hdr_pos > hdr_size {
+        return Err(SqliteError::corrupt("record header exceeds record length"));
+    }
+    let mut body_pos = hdr_size;
+    let mut cur = 0usize;
+    while hdr_pos < hdr_size {
+        let (st, used) = get_varint(&raw[hdr_pos..hdr_size])?;
+        hdr_pos += used;
+        let len = serial_type_len(st)?;
+        let end = body_pos
+            .checked_add(len)
+            .ok_or_else(|| SqliteError::corrupt("record body offset overflow"))?;
+        if end > raw.len() {
+            return Err(SqliteError::corrupt("record payload truncated"));
+        }
+        if cur == col_idx {
+            return Ok(Some(RawField::from_serial(st, &raw[body_pos..end])?));
+        }
+        if matches!(st, 10 | 11) {
+            return Err(SqliteError::corrupt(format!("reserved serial type {st}")));
+        }
+        body_pos = end;
+        cur += 1;
+    }
+    Ok(None)
+}
+
+/// Compares a raw serialized index record `rec` against `prefix_values` plus optional
+/// `lower_bound` / `upper_bound` on column `k = prefix_values.len()` with zero heap allocations.
+///
+/// Returns:
+/// - `Ordering::Less` if `rec` precedes the target index range in B-tree key order,
+/// - `Ordering::Equal` if `rec` lies within the target index range,
+/// - `Ordering::Greater` if `rec` follows the target index range in B-tree key order.
+pub fn compare_raw_record_range(
+    rec: &[u8],
+    prefix_values: &[Value],
+    lower_bound: Option<(&Value, bool)>,
+    upper_bound: Option<(&Value, bool)>,
+    orders: &[KeySortOrder],
+    enc: TextEncoding,
+) -> Result<Ordering> {
+    let k = prefix_values.len();
+    let has_bounds = lower_bound.is_some() || upper_bound.is_some();
+    if rec.is_empty() {
+        return Ok(if has_bounds {
+            Ordering::Less
+        } else {
+            Ordering::Equal
+        });
+    }
+    let (hdr_u64, mut hdr_pos) = get_varint(rec)?;
+    let hdr_size = usize::try_from(hdr_u64)
+        .map_err(|_| SqliteError::corrupt("record header size overflow"))?;
+    if hdr_size > rec.len() || hdr_pos > hdr_size {
+        return Err(SqliteError::corrupt("record header exceeds record length"));
+    }
+
+    let mut body_pos = hdr_size;
+    let mut col_idx = 0usize;
+    let mut decided = Ordering::Equal;
+    let mut saw_range_col = false;
+    let default_so = KeySortOrder::default();
+
+    while hdr_pos < hdr_size {
+        let (st, used) = get_varint(&rec[hdr_pos..hdr_size])?;
+        hdr_pos += used;
+        if matches!(st, 10 | 11) {
+            return Err(SqliteError::corrupt(format!("reserved serial type {st}")));
+        }
+        let len = serial_type_len(st)?;
+        let end = body_pos
+            .checked_add(len)
+            .ok_or_else(|| SqliteError::corrupt("record body offset overflow"))?;
+        if end > rec.len() {
+            return Err(SqliteError::corrupt("record payload truncated"));
+        }
+
+        if decided == Ordering::Equal {
+            if col_idx < k {
+                let f = RawField::from_serial(st, &rec[body_pos..end])?;
+                let spec = orders.get(col_idx).unwrap_or(&default_so);
+                decided = f.compare_key_to_value(&prefix_values[col_idx], spec, enc)?;
+            } else if col_idx == k && has_bounds {
+                saw_range_col = true;
+                let f = RawField::from_serial(st, &rec[body_pos..end])?;
+                let range_so = orders.get(k).unwrap_or(&default_so);
+                if f.is_null() {
+                    decided = if range_so.nulls_last {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    };
+                } else {
+                    if let Some((lo_val, lo_inc)) = lower_bound
+                        && !lo_val.is_null()
+                    {
+                        let cmp = f.compare_sql_to_nonnull_value(lo_val, range_so, enc)?;
+                        if cmp == Ordering::Less || (!lo_inc && cmp == Ordering::Equal) {
+                            decided = if range_so.desc {
+                                Ordering::Greater
+                            } else {
+                                Ordering::Less
+                            };
+                        }
+                    }
+                    if decided == Ordering::Equal
+                        && let Some((hi_val, hi_inc)) = upper_bound
+                    {
+                        if hi_val.is_null() {
+                            decided = Ordering::Greater;
+                        } else {
+                            let cmp = f.compare_sql_to_nonnull_value(hi_val, range_so, enc)?;
+                            if cmp == Ordering::Greater || (!hi_inc && cmp == Ordering::Equal) {
+                                decided = if range_so.desc {
+                                    Ordering::Less
+                                } else {
+                                    Ordering::Greater
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        body_pos = end;
+        col_idx += 1;
+    }
+
+    if decided == Ordering::Equal && has_bounds && !saw_range_col {
+        return Ok(Ordering::Less);
+    }
+    Ok(decided)
 }
 
 #[inline]

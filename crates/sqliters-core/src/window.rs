@@ -14,7 +14,7 @@ use sqliters_types::{
     Collation, ErrorCode, ExecutionServices, FunctionFlags, KeySortOrder, Result, RuntimeValue,
     SqliteError, TextEncoding, Value, fallible_sort_by,
 };
-use sqliters_vdbe::{AggregateKind, builtin_window_arity};
+use sqliters_vdbe::{AggregateKind, FastSumAccum, builtin_window_arity};
 
 use crate::compiler::expr_contains_aggregate;
 use crate::engine::{
@@ -2023,6 +2023,43 @@ impl SortTermMeta {
         Ok(())
     }
 
+    #[inline]
+    fn compare_vals_infallible(&self, a: &Value, b: &Value, enc: TextEncoding) -> Ordering {
+        debug_assert!(self.custom_collation.is_none());
+        match (a, b) {
+            (Value::Integer(ia), Value::Integer(ib)) => {
+                let raw = ia.cmp(ib);
+                return if self.order.desc { raw.reverse() } else { raw };
+            }
+            (Value::Real(ra), Value::Real(rb)) => {
+                let raw = ra.total_cmp(rb);
+                return if self.order.desc { raw.reverse() } else { raw };
+            }
+            _ => {}
+        }
+        match (a.is_null(), b.is_null()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => {
+                if self.order.nulls_last {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (false, true) => {
+                if self.order.nulls_last {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (false, false) => {
+                let raw = a.cmp_sqlite_with_encoding(b, self.order.collation, enc);
+                if self.order.desc { raw.reverse() } else { raw }
+            }
+        }
+    }
+
     fn compare_vals(
         &self,
         a: &Value,
@@ -2030,6 +2067,9 @@ impl SortTermMeta {
         collations: &CollationRegistry,
         enc: TextEncoding,
     ) -> Result<Ordering> {
+        if self.custom_collation.is_none() {
+            return Ok(self.compare_vals_infallible(a, b, enc));
+        }
         match (a.is_null(), b.is_null()) {
             (true, true) => Ok(Ordering::Equal),
             (true, false) => Ok(if self.order.nulls_last {
@@ -2085,6 +2125,145 @@ fn extract_effective_collation_name(expr: &Expr, sample_cols: &[ScopedColumn]) -
     }
 }
 
+#[derive(Clone, Copy)]
+enum FastWinExprSlot {
+    RowVal(usize),
+    WinVal(usize),
+}
+
+fn expr_uses_win_slot(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(cref) => cref.schema.as_deref() == Some(WIN_SLOT_SCHEMA),
+        Expr::Unary { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::InTable { expr: inner, .. } => expr_uses_win_slot(inner),
+        Expr::Binary { left, right, .. } => expr_uses_win_slot(left) || expr_uses_win_slot(right),
+        Expr::Between {
+            expr: e, low, high, ..
+        } => expr_uses_win_slot(e) || expr_uses_win_slot(low) || expr_uses_win_slot(high),
+        Expr::InList { expr: e, list, .. } => {
+            expr_uses_win_slot(e) || list.iter().any(expr_uses_win_slot)
+        }
+        Expr::InSubquery { expr: e, .. } => expr_uses_win_slot(e),
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_uses_win_slot(e)
+                || expr_uses_win_slot(pattern)
+                || escape.as_deref().is_some_and(expr_uses_win_slot)
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand.as_deref().is_some_and(expr_uses_win_slot)
+                || branches
+                    .iter()
+                    .any(|(w, t)| expr_uses_win_slot(w) || expr_uses_win_slot(t))
+                || else_expr.as_deref().is_some_and(expr_uses_win_slot)
+        }
+        Expr::FunctionCall { args, filter, .. } => {
+            let in_args = match args {
+                FunctionArgs::Star => false,
+                FunctionArgs::Exprs(es) => es.iter().any(expr_uses_win_slot),
+            };
+            in_args || filter.as_deref().is_some_and(expr_uses_win_slot)
+        }
+        Expr::RowValue(elems) => elems.iter().any(expr_uses_win_slot),
+        _ => false,
+    }
+}
+
+fn try_resolve_fast_win_slot(
+    mut expr: &Expr,
+    sample_cols: &[ScopedColumn],
+    outer_scopes: &[EvalRow],
+) -> Option<FastWinExprSlot> {
+    while let Expr::Collate { expr: inner, .. } = expr {
+        expr = inner;
+    }
+    let Expr::Column(cref) = expr else {
+        return None;
+    };
+    if cref.schema.as_deref() == Some(WIN_SLOT_SCHEMA) {
+        return cref
+            .column
+            .parse::<usize>()
+            .ok()
+            .map(FastWinExprSlot::WinVal);
+    }
+    if !outer_scopes.is_empty() || sample_cols.is_empty() {
+        return None;
+    }
+    let dummy = EvalRow::new(Rc::from(sample_cols), vec![Value::Null; sample_cols.len()]);
+    match dummy.lookup_qual_idx(cref.schema.as_deref(), cref.table.as_deref(), &cref.column) {
+        Ok(Some(idx)) => Some(FastWinExprSlot::RowVal(idx)),
+        _ => None,
+    }
+}
+
+#[inline]
+fn eval_item_expr(
+    ctx: &mut ExecContext<'_>,
+    expr: &Expr,
+    fast_slot: Option<FastWinExprSlot>,
+    item: &WindowExecItem,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    ctes: &CteStore,
+) -> Result<Value> {
+    if item.group_rows.is_none()
+        && let Some(slot) = fast_slot
+    {
+        match slot {
+            FastWinExprSlot::RowVal(idx) => {
+                if let Some(v) = item.row.vals.get(idx) {
+                    return Ok(v.clone());
+                }
+            }
+            FastWinExprSlot::WinVal(idx) => {
+                return Ok(item
+                    .win_vals
+                    .get(idx)
+                    .map_or(Value::Null, |rv| rv.value.clone()));
+            }
+        }
+    }
+    let scope_buf;
+    let scopes: &[EvalRow] = if outer_scopes.is_empty() {
+        std::slice::from_ref(&item.row)
+    } else {
+        scope_buf = push_scope_pub(outer_scopes, &item.row);
+        &scope_buf
+    };
+    let agg_grp = item.group_rows.as_deref().map(|gr| (gr, outer_scopes));
+    eval_expr_pub(ctx, expr, params, scopes, ctes, agg_grp)
+}
+
+enum StageKeysSlice<'a> {
+    Compact(&'a [(Value, Value)]),
+    General(&'a [(Vec<Value>, Vec<Value>)]),
+}
+
+impl<'a> StageKeysSlice<'a> {
+    #[inline(always)]
+    fn order_val(&self, row_idx: usize, k: usize) -> &Value {
+        match self {
+            Self::Compact(v) => {
+                debug_assert_eq!(k, 0);
+                &v[row_idx].1
+            }
+            Self::General(v) => &v[row_idx].1[k],
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_single_window_stage(
     ctx: &mut ExecContext<'_>,
@@ -2108,51 +2287,223 @@ fn execute_single_window_stage(
     for m in part_metas.iter().chain(order_metas.iter()) {
         m.validate_collation(ctx.collations)?;
     }
+    let all_infallible = part_metas
+        .iter()
+        .chain(order_metas.iter())
+        .all(|m| m.custom_collation.is_none());
 
-    // Evaluate `PARTITION BY` and `ORDER BY` keys per item
+    let bound_uses_win = |b: &WindowFrameBound| match b {
+        WindowFrameBound::Preceding(e) | WindowFrameBound::Following(e) => expr_uses_win_slot(e),
+        _ => false,
+    };
+    let stage_uses_win_slot = stage.partition_by.iter().any(expr_uses_win_slot)
+        || stage.order_by.iter().any(|ob| expr_uses_win_slot(&ob.expr))
+        || bound_uses_win(&stage.start)
+        || bound_uses_win(&stage.end)
+        || stage.calls.iter().any(|c| {
+            c.args.iter().any(expr_uses_win_slot)
+                || c.filter.as_ref().is_some_and(expr_uses_win_slot)
+        });
+
+    let part_slots: Vec<Option<FastWinExprSlot>> = stage
+        .partition_by
+        .iter()
+        .map(|pe| try_resolve_fast_win_slot(pe, sample_cols, outer_scopes))
+        .collect();
+    let order_slots: Vec<Option<FastWinExprSlot>> = stage
+        .order_by
+        .iter()
+        .map(|ob| try_resolve_fast_win_slot(&ob.expr, sample_cols, outer_scopes))
+        .collect();
+
     let n_total = items.len();
+    let enc = ctx.encoding();
+
+    if stage.partition_by.len() <= 1 && stage.order_by.len() <= 1 {
+        let mut keys: Vec<(Value, Value)> = Vec::with_capacity(n_total);
+        for item in items.iter_mut() {
+            ctx.step_tick()?;
+            if stage_uses_win_slot {
+                item.row.win_vals = Rc::from(item.win_vals.as_slice());
+            }
+            let pv = if let Some(pe) = stage.partition_by.first() {
+                eval_item_expr(ctx, pe, part_slots[0], item, params, outer_scopes, ctes)?
+            } else {
+                Value::Null
+            };
+            let ov = if let Some(ob) = stage.order_by.first() {
+                eval_item_expr(
+                    ctx,
+                    &ob.expr,
+                    order_slots[0],
+                    item,
+                    params,
+                    outer_scopes,
+                    ctes,
+                )?
+            } else {
+                Value::Null
+            };
+            keys.push((pv, ov));
+        }
+
+        if !stage.partition_by.is_empty() || !stage.order_by.is_empty() {
+            let mut perm: Vec<usize> = (0..n_total).collect();
+            let has_p = !part_metas.is_empty();
+            let has_o = !order_metas.is_empty();
+            if all_infallible {
+                perm.sort_by(|&ia, &ib| {
+                    let (pa, oa) = &keys[ia];
+                    let (pb, ob) = &keys[ib];
+                    if has_p {
+                        let ord = part_metas[0].compare_vals_infallible(pa, pb, enc);
+                        if ord != Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    if has_o {
+                        let ord = order_metas[0].compare_vals_infallible(oa, ob, enc);
+                        if ord != Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    Ordering::Equal
+                });
+            } else {
+                let collations = ctx.collations;
+                fallible_sort_by(&mut perm, |&ia, &ib| {
+                    let (pa, oa) = &keys[ia];
+                    let (pb, ob) = &keys[ib];
+                    if has_p {
+                        let ord = part_metas[0].compare_vals(pa, pb, collations, enc)?;
+                        if ord != Ordering::Equal {
+                            return Ok(ord);
+                        }
+                    }
+                    if has_o {
+                        let ord = order_metas[0].compare_vals(oa, ob, collations, enc)?;
+                        if ord != Ordering::Equal {
+                            return Ok(ord);
+                        }
+                    }
+                    Ok(Ordering::Equal)
+                })?;
+            }
+            apply_permutation_in_place(items, &perm);
+            apply_permutation_in_place(&mut keys, &perm);
+        }
+
+        let mut part_start = 0usize;
+        while part_start < n_total {
+            let mut part_end = part_start + 1;
+            if let Some(pm) = part_metas.first() {
+                while part_end < n_total {
+                    let ord = pm.compare_vals(
+                        &keys[part_start].0,
+                        &keys[part_end].0,
+                        ctx.collations,
+                        enc,
+                    )?;
+                    if ord != Ordering::Equal {
+                        break;
+                    }
+                    part_end += 1;
+                }
+            } else {
+                part_end = n_total;
+            }
+
+            execute_stage_on_partition(
+                ctx,
+                &mut items[part_start..part_end],
+                StageKeysSlice::Compact(&keys[part_start..part_end]),
+                stage,
+                &order_metas,
+                sample_cols,
+                params,
+                outer_scopes,
+                ctes,
+            )?;
+            part_start = part_end;
+        }
+        return Ok(());
+    }
+
+    // General multi-column `PARTITION BY` / `ORDER BY` path
     let mut keys: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(n_total);
     for item in items.iter_mut() {
         ctx.step_tick()?;
-        item.row.win_vals = Rc::from(item.win_vals.as_slice());
-        let scopes = push_scope_pub(outer_scopes, &item.row);
-        let agg_grp = item.group_rows.as_deref().map(|gr| (gr, outer_scopes));
-
+        if stage_uses_win_slot {
+            item.row.win_vals = Rc::from(item.win_vals.as_slice());
+        }
         let mut p_vals = Vec::with_capacity(stage.partition_by.len());
-        for pe in &stage.partition_by {
-            p_vals.push(eval_expr_pub(ctx, pe, params, &scopes, ctes, agg_grp)?);
+        for (pi, pe) in stage.partition_by.iter().enumerate() {
+            p_vals.push(eval_item_expr(
+                ctx,
+                pe,
+                part_slots[pi],
+                item,
+                params,
+                outer_scopes,
+                ctes,
+            )?);
         }
         let mut o_vals = Vec::with_capacity(stage.order_by.len());
-        for ob in &stage.order_by {
-            o_vals.push(eval_expr_pub(
-                ctx, &ob.expr, params, &scopes, ctes, agg_grp,
+        for (oi, ob) in stage.order_by.iter().enumerate() {
+            o_vals.push(eval_item_expr(
+                ctx,
+                &ob.expr,
+                order_slots[oi],
+                item,
+                params,
+                outer_scopes,
+                ctes,
             )?);
         }
         keys.push((p_vals, o_vals));
     }
 
     // Stably sort `(items, keys)` ONLY when `PARTITION BY` or `ORDER BY` is non-empty!
-    let enc = ctx.encoding();
     if !stage.partition_by.is_empty() || !stage.order_by.is_empty() {
         let mut perm: Vec<usize> = (0..n_total).collect();
-        let collations = ctx.collations;
-        fallible_sort_by(&mut perm, |&ia, &ib| {
-            let (pa, oa) = &keys[ia];
-            let (pb, ob) = &keys[ib];
-            for (k, pm) in part_metas.iter().enumerate() {
-                let ord = pm.compare_vals(&pa[k], &pb[k], collations, enc)?;
-                if ord != Ordering::Equal {
-                    return Ok(ord);
+        if all_infallible {
+            perm.sort_by(|&ia, &ib| {
+                let (pa, oa) = &keys[ia];
+                let (pb, ob) = &keys[ib];
+                for (k, pm) in part_metas.iter().enumerate() {
+                    let ord = pm.compare_vals_infallible(&pa[k], &pb[k], enc);
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
                 }
-            }
-            for (k, om) in order_metas.iter().enumerate() {
-                let ord = om.compare_vals(&oa[k], &ob[k], collations, enc)?;
-                if ord != Ordering::Equal {
-                    return Ok(ord);
+                for (k, om) in order_metas.iter().enumerate() {
+                    let ord = om.compare_vals_infallible(&oa[k], &ob[k], enc);
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
                 }
-            }
-            Ok(Ordering::Equal)
-        })?;
+                Ordering::Equal
+            });
+        } else {
+            let collations = ctx.collations;
+            fallible_sort_by(&mut perm, |&ia, &ib| {
+                let (pa, oa) = &keys[ia];
+                let (pb, ob) = &keys[ib];
+                for (k, pm) in part_metas.iter().enumerate() {
+                    let ord = pm.compare_vals(&pa[k], &pb[k], collations, enc)?;
+                    if ord != Ordering::Equal {
+                        return Ok(ord);
+                    }
+                }
+                for (k, om) in order_metas.iter().enumerate() {
+                    let ord = om.compare_vals(&oa[k], &ob[k], collations, enc)?;
+                    if ord != Ordering::Equal {
+                        return Ok(ord);
+                    }
+                }
+                Ok(Ordering::Equal)
+            })?;
+        }
         apply_permutation_in_place(items, &perm);
         apply_permutation_in_place(&mut keys, &perm);
     }
@@ -2188,7 +2539,7 @@ fn execute_single_window_stage(
         execute_stage_on_partition(
             ctx,
             &mut items[part_start..part_end],
-            &keys[part_start..part_end],
+            StageKeysSlice::General(&keys[part_start..part_end]),
             stage,
             &order_metas,
             sample_cols,
@@ -2292,12 +2643,18 @@ fn eval_bound_on_first_row(
         if !is_window_bound_constant(expr) {
             return Ok(Value::Null);
         }
-        let scopes = push_scope_pub(outer_scopes, &first_item.row);
+        let scope_buf;
+        let scopes: &[EvalRow] = if outer_scopes.is_empty() {
+            std::slice::from_ref(&first_item.row)
+        } else {
+            scope_buf = push_scope_pub(outer_scopes, &first_item.row);
+            &scope_buf
+        };
         let agg_grp = first_item
             .group_rows
             .as_deref()
             .map(|gr| (gr, outer_scopes));
-        eval_expr_pub(ctx, expr, params, &scopes, ctes, agg_grp)
+        eval_expr_pub(ctx, expr, params, scopes, ctes, agg_grp)
     };
 
     match bound {
@@ -2494,7 +2851,7 @@ fn vdbe_rowid_offset_target(base_rowid_1based: i64, off_val: &Value, is_lead: bo
 fn execute_stage_on_partition(
     ctx: &mut ExecContext<'_>,
     part_items: &mut [WindowExecItem],
-    part_keys: &[(Vec<Value>, Vec<Value>)],
+    part_keys: StageKeysSlice<'_>,
     stage: &WindowStage,
     order_metas: &[SortTermMeta],
     sample_cols: &[ScopedColumn],
@@ -2545,8 +2902,8 @@ fn execute_stage_on_partition(
                 let mut same_peer = true;
                 for (k, om) in order_metas.iter().enumerate() {
                     if om.compare_vals(
-                        &part_keys[g_start].1[k],
-                        &part_keys[g_end].1[k],
+                        part_keys.order_val(g_start, k),
+                        part_keys.order_val(g_end, k),
                         ctx.collations,
                         enc,
                     )? != Ordering::Equal
@@ -2643,9 +3000,9 @@ fn execute_stage_on_partition(
                     EvalFrameBound::CurrentRow => g,
                     EvalFrameBound::PrecedingNum(off) => {
                         let om = &order_metas[0];
-                        let curr_v = &part_keys[curr_row_idx].1[0];
+                        let curr_v = part_keys.order_val(curr_row_idx, 0);
                         while cur_sg < num_groups {
-                            let cand_v = &part_keys[peer_groups[cur_sg].0].1[0];
+                            let cand_v = part_keys.order_val(peer_groups[cur_sg].0, 0);
                             if window_code_range_test(
                                 RangeTestOp::Ge,
                                 cand_v,
@@ -2663,9 +3020,9 @@ fn execute_stage_on_partition(
                     }
                     EvalFrameBound::FollowingNum(off) => {
                         let om = &order_metas[0];
-                        let curr_v = &part_keys[curr_row_idx].1[0];
+                        let curr_v = part_keys.order_val(curr_row_idx, 0);
                         while cur_sg < num_groups {
-                            let cand_v = &part_keys[peer_groups[cur_sg].0].1[0];
+                            let cand_v = part_keys.order_val(peer_groups[cur_sg].0, 0);
                             if window_code_range_test(
                                 RangeTestOp::Le,
                                 curr_v,
@@ -2688,9 +3045,9 @@ fn execute_stage_on_partition(
                     EvalFrameBound::UnboundedFollowing => num_groups,
                     EvalFrameBound::PrecedingNum(off) => {
                         let om = &order_metas[0];
-                        let curr_v = &part_keys[curr_row_idx].1[0];
+                        let curr_v = part_keys.order_val(curr_row_idx, 0);
                         while cur_eg < num_groups {
-                            let cand_v = &part_keys[peer_groups[cur_eg].0].1[0];
+                            let cand_v = part_keys.order_val(peer_groups[cur_eg].0, 0);
                             if window_code_range_test(
                                 RangeTestOp::Gt,
                                 cand_v,
@@ -2708,9 +3065,9 @@ fn execute_stage_on_partition(
                     }
                     EvalFrameBound::FollowingNum(off) => {
                         let om = &order_metas[0];
-                        let curr_v = &part_keys[curr_row_idx].1[0];
+                        let curr_v = part_keys.order_val(curr_row_idx, 0);
                         while cur_eg < num_groups {
-                            let cand_v = &part_keys[peer_groups[cur_eg].0].1[0];
+                            let cand_v = part_keys.order_val(peer_groups[cur_eg].0, 0);
                             if !window_code_range_test(
                                 RangeTestOp::Ge,
                                 curr_v,
@@ -2841,13 +3198,19 @@ fn evaluate_call_on_partition(
                 }
             }
             BuiltinWinFn::Ntile => {
-                let first_scopes = push_scope_pub(outer_scopes, &part_items[0].row);
+                let scope_buf;
+                let first_scopes: &[EvalRow] = if outer_scopes.is_empty() {
+                    std::slice::from_ref(&part_items[0].row)
+                } else {
+                    scope_buf = push_scope_pub(outer_scopes, &part_items[0].row);
+                    &scope_buf
+                };
                 let first_agg = part_items[0]
                     .group_rows
                     .as_deref()
                     .map(|gr| (gr, outer_scopes));
                 let n_val =
-                    eval_expr_pub(ctx, &call.args[0], params, &first_scopes, ctes, first_agg)?;
+                    eval_expr_pub(ctx, &call.args[0], params, first_scopes, ctes, first_agg)?;
                 let n_param = n_val.to_integer_lossy();
                 if n_param <= 0 {
                     return Err(SqliteError::new(
@@ -2872,34 +3235,40 @@ fn evaluate_call_on_partition(
             }
             BuiltinWinFn::Lag | BuiltinWinFn::Lead => {
                 let is_lead = *bfn == BuiltinWinFn::Lead;
+                let arg0_slot = try_resolve_fast_win_slot(&call.args[0], sample_cols, outer_scopes);
                 let mut arg0_vals: Vec<Value> = Vec::with_capacity(n);
                 for item in part_items.iter() {
                     ctx.step_tick()?;
-                    let scopes = push_scope_pub(outer_scopes, &item.row);
-                    let agg_grp = item.group_rows.as_deref().map(|gr| (gr, outer_scopes));
-                    arg0_vals.push(eval_expr_pub(
+                    arg0_vals.push(eval_item_expr(
                         ctx,
                         &call.args[0],
+                        arg0_slot,
+                        item,
                         params,
-                        &scopes,
+                        outer_scopes,
                         ctes,
-                        agg_grp,
                     )?);
                 }
                 let mut results: Vec<Value> = Vec::with_capacity(n);
                 for (i, item) in part_items.iter().enumerate() {
                     ctx.step_tick()?;
-                    let scopes = push_scope_pub(outer_scopes, &item.row);
+                    let scope_buf;
+                    let scopes: &[EvalRow] = if outer_scopes.is_empty() {
+                        std::slice::from_ref(&item.row)
+                    } else {
+                        scope_buf = push_scope_pub(outer_scopes, &item.row);
+                        &scope_buf
+                    };
                     let agg_grp = item.group_rows.as_deref().map(|gr| (gr, outer_scopes));
                     let def_val = if call.args.len() >= 3 {
-                        eval_expr_pub(ctx, &call.args[2], params, &scopes, ctes, agg_grp)?
+                        eval_expr_pub(ctx, &call.args[2], params, scopes, ctes, agg_grp)?
                     } else {
                         Value::Null
                     };
                     let base_rowid = (i + 1) as i64;
                     let target_opt = if call.args.len() >= 2 {
                         let off_v =
-                            eval_expr_pub(ctx, &call.args[1], params, &scopes, ctes, agg_grp)?;
+                            eval_expr_pub(ctx, &call.args[1], params, scopes, ctes, agg_grp)?;
                         vdbe_rowid_offset_target(base_rowid, &off_v, is_lead)
                     } else {
                         Some(base_rowid + if is_lead { 1 } else { -1 })
@@ -2918,18 +3287,18 @@ fn evaluate_call_on_partition(
             }
             BuiltinWinFn::FirstValue | BuiltinWinFn::LastValue => {
                 let is_first = *bfn == BuiltinWinFn::FirstValue;
+                let arg0_slot = try_resolve_fast_win_slot(&call.args[0], sample_cols, outer_scopes);
                 let mut arg0_vals: Vec<Value> = Vec::with_capacity(n);
                 for item in part_items.iter() {
                     ctx.step_tick()?;
-                    let scopes = push_scope_pub(outer_scopes, &item.row);
-                    let agg_grp = item.group_rows.as_deref().map(|gr| (gr, outer_scopes));
-                    arg0_vals.push(eval_expr_pub(
+                    arg0_vals.push(eval_item_expr(
                         ctx,
                         &call.args[0],
+                        arg0_slot,
+                        item,
                         params,
-                        &scopes,
+                        outer_scopes,
                         ctes,
-                        agg_grp,
                     )?);
                 }
                 for (i, item) in part_items.iter_mut().enumerate() {
@@ -2947,25 +3316,33 @@ fn evaluate_call_on_partition(
                 }
             }
             BuiltinWinFn::NthValue => {
+                let arg0_slot = try_resolve_fast_win_slot(&call.args[0], sample_cols, outer_scopes);
                 let mut arg0_vals: Vec<Value> = Vec::with_capacity(n);
                 let mut arg1_vals: Vec<Value> = Vec::with_capacity(n);
                 for item in part_items.iter() {
                     ctx.step_tick()?;
-                    let scopes = push_scope_pub(outer_scopes, &item.row);
-                    let agg_grp = item.group_rows.as_deref().map(|gr| (gr, outer_scopes));
-                    arg0_vals.push(eval_expr_pub(
+                    arg0_vals.push(eval_item_expr(
                         ctx,
                         &call.args[0],
+                        arg0_slot,
+                        item,
                         params,
-                        &scopes,
+                        outer_scopes,
                         ctes,
-                        agg_grp,
                     )?);
+                    let scope_buf;
+                    let scopes: &[EvalRow] = if outer_scopes.is_empty() {
+                        std::slice::from_ref(&item.row)
+                    } else {
+                        scope_buf = push_scope_pub(outer_scopes, &item.row);
+                        &scope_buf
+                    };
+                    let agg_grp = item.group_rows.as_deref().map(|gr| (gr, outer_scopes));
                     arg1_vals.push(eval_expr_pub(
                         ctx,
                         &call.args[1],
                         params,
-                        &scopes,
+                        scopes,
                         ctes,
                         agg_grp,
                     )?);
@@ -3003,6 +3380,121 @@ fn evaluate_call_on_partition(
             distinct,
             flags,
         } => {
+            // Fast zero-allocation sliding window path for non-overridden built-in
+            // `COUNT(*)`, `COUNT(x)`, `SUM(x)`, `TOTAL(x)`, and `AVG(x)`.
+            if exclude == WindowFrameExclude::NoOthers && !*distinct && call.filter.is_none() {
+                if *is_star
+                    && *arity == 0
+                    && name.eq_ignore_ascii_case("COUNT")
+                    && ctx.functions.find_aggregate(name, 0).is_none()
+                {
+                    for (i, item) in part_items.iter_mut().enumerate() {
+                        ctx.step_tick()?;
+                        let (s, e) = frames[i];
+                        item.win_vals[slot] = RuntimeValue::plain(Value::Integer((e - s) as i64));
+                    }
+                    return Ok(());
+                }
+
+                if !*is_star && *arity == 1 && ctx.functions.find_aggregate(name, 1).is_none() {
+                    let fast_kind = if name.eq_ignore_ascii_case("COUNT") {
+                        Some(AggregateKind::Count)
+                    } else if name.eq_ignore_ascii_case("SUM") {
+                        Some(AggregateKind::Sum)
+                    } else if name.eq_ignore_ascii_case("TOTAL") {
+                        Some(AggregateKind::Total)
+                    } else if name.eq_ignore_ascii_case("AVG") {
+                        Some(AggregateKind::Avg)
+                    } else {
+                        None
+                    };
+                    if let Some(ak) = fast_kind {
+                        let arg0_slot =
+                            try_resolve_fast_win_slot(&call.args[0], sample_cols, outer_scopes);
+                        let mut arg_vals: Vec<Value> = Vec::with_capacity(n);
+                        for item in part_items.iter() {
+                            ctx.step_tick()?;
+                            arg_vals.push(eval_item_expr(
+                                ctx,
+                                &call.args[0],
+                                arg0_slot,
+                                item,
+                                params,
+                                outer_scopes,
+                                ctes,
+                            )?);
+                        }
+                        if ak == AggregateKind::Count {
+                            let mut cur_s = 0usize;
+                            let mut cur_e = 0usize;
+                            let mut cnt = 0i64;
+                            for (i, item) in part_items.iter_mut().enumerate() {
+                                ctx.step_tick()?;
+                                let (s, e) = frames[i];
+                                if cur_e < s {
+                                    cnt = 0;
+                                    cur_s = s;
+                                    cur_e = s;
+                                } else if cur_s < s {
+                                    for v in &arg_vals[cur_s..s] {
+                                        if !v.is_null() {
+                                            cnt -= 1;
+                                        }
+                                    }
+                                    cur_s = s;
+                                }
+                                if cur_e < e {
+                                    for v in &arg_vals[cur_e..e] {
+                                        if !v.is_null() {
+                                            cnt += 1;
+                                        }
+                                    }
+                                    cur_e = e;
+                                }
+                                item.win_vals[slot] = RuntimeValue::plain(Value::Integer(cnt));
+                            }
+                        } else {
+                            let mut acc = FastSumAccum::new();
+                            let mut cur_s = 0usize;
+                            let mut cur_e = 0usize;
+                            for (i, item) in part_items.iter_mut().enumerate() {
+                                ctx.step_tick()?;
+                                let (s, e) = frames[i];
+                                if cur_e < s {
+                                    for v in &arg_vals[cur_e..s] {
+                                        acc.step_value(v);
+                                    }
+                                    for v in &arg_vals[cur_s..s] {
+                                        acc.inverse_value(v);
+                                    }
+                                    cur_s = s;
+                                    cur_e = s;
+                                } else if cur_s < s {
+                                    for v in &arg_vals[cur_s..s] {
+                                        acc.inverse_value(v);
+                                    }
+                                    cur_s = s;
+                                }
+                                if cur_e < e {
+                                    for v in &arg_vals[cur_e..e] {
+                                        acc.step_value(v);
+                                    }
+                                    cur_e = e;
+                                }
+                                let out_v = match ak {
+                                    AggregateKind::Sum => acc.finalize_sum()?,
+                                    AggregateKind::Total => acc.finalize_total(),
+                                    AggregateKind::Avg => acc.finalize_avg(),
+                                    _ => unreachable!(),
+                                };
+                                item.win_vals[slot] = RuntimeValue::plain(out_v);
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+
             let preserve_arg_subtype = flags.contains(FunctionFlags::SUBTYPE);
             let coll_name = match call.args.first() {
                 Some(first_arg) => extract_effective_collation_name(first_arg, sample_cols),
@@ -3013,10 +3505,16 @@ fn evaluate_call_on_partition(
             let mut filter_ok: Vec<bool> = Vec::with_capacity(n);
             for item in part_items.iter() {
                 ctx.step_tick()?;
-                let scopes = push_scope_pub(outer_scopes, &item.row);
+                let scope_buf;
+                let scopes: &[EvalRow] = if outer_scopes.is_empty() {
+                    std::slice::from_ref(&item.row)
+                } else {
+                    scope_buf = push_scope_pub(outer_scopes, &item.row);
+                    &scope_buf
+                };
                 let agg_grp = item.group_rows.as_deref().map(|gr| (gr, outer_scopes));
                 let pass = if let Some(ref fe) = call.filter {
-                    eval_expr_pub(ctx, fe, params, &scopes, ctes, agg_grp)?.truthiness()
+                    eval_expr_pub(ctx, fe, params, scopes, ctes, agg_grp)?.truthiness()
                         == Some(true)
                 } else {
                     true
@@ -3027,7 +3525,7 @@ fn evaluate_call_on_partition(
                 } else {
                     let mut av = Vec::with_capacity(call.args.len());
                     for ae in &call.args {
-                        let mut rv = eval_expr_rt_pub(ctx, ae, params, &scopes, ctes, agg_grp)?;
+                        let mut rv = eval_expr_rt_pub(ctx, ae, params, scopes, ctes, agg_grp)?;
                         if !preserve_arg_subtype {
                             rv.subtype = 0;
                         }

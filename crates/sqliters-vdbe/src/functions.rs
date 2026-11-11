@@ -646,14 +646,24 @@ fn eval_scalar_function_plain(
             if args[0].is_null() {
                 return Ok(Value::Null);
             }
-            let bytes: Vec<u8> = match &args[0] {
-                Value::Blob(b) => b.clone(),
-                other => other.to_text_lossy().into_bytes(),
+            const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+            let write_hex = |src: &[u8]| -> String {
+                let mut out = String::with_capacity(src.len() * 2);
+                for &b in src {
+                    out.push(HEX_UPPER[(b >> 4) as usize] as char);
+                    out.push(HEX_UPPER[(b & 0x0f) as usize] as char);
+                }
+                out
             };
-            let mut out = String::with_capacity(bytes.len() * 2);
-            for b in bytes {
-                out.push_str(&format!("{b:02X}"));
-            }
+            let out = match &args[0] {
+                Value::Blob(b) => write_hex(b),
+                Value::Text(s) => write_hex(s.as_bytes()),
+                Value::Integer(i) => {
+                    let mut buf = [0u8; 24];
+                    write_hex(format_i64_into_stack(*i, &mut buf))
+                }
+                other => write_hex(other.to_text_lossy().as_bytes()),
+            };
             Ok(Value::Text(out))
         }
         "UNHEX" => {
@@ -1621,53 +1631,503 @@ pub fn parse_escape_char(s: &str) -> Result<char> {
     Ok(c)
 }
 
-/// SQLite `LIKE` matcher (`%` = 0+ chars, `_` = 1 char, ASCII case-insensitive).
-pub fn sqlite_like_match(pattern: &str, text: &str, escape: Option<char>) -> bool {
-    let pchars: Vec<char> = pattern.chars().collect();
-    let tchars: Vec<char> = text.chars().collect();
-    like_rec(&pchars, &tchars, escape)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LikeToken {
+    Star,
+    AnyOne,
+    Literal(char),
 }
 
-fn like_rec(pat: &[char], txt: &[char], escape: Option<char>) -> bool {
-    let mut pi = 0usize;
-    let mut ti = 0usize;
-    while pi < pat.len() {
-        let pc = pat[pi];
-        if Some(pc) == escape {
-            pi += 1;
-            if pi >= pat.len() || ti >= txt.len() || !ascii_eq_nocase(pat[pi], txt[ti]) {
-                return false;
+#[derive(Debug, Clone)]
+enum CompiledLikeKind {
+    NeverMatch,
+    MatchAll,
+    ExactAscii(Box<[u8]>),
+    PrefixAscii(Box<[u8]>),
+    SuffixAscii(Box<[u8]>),
+    PrefixSuffixAscii {
+        prefix: Box<[u8]>,
+        suffix: Box<[u8]>,
+    },
+    ContainsAsciiOne(u8),
+    ContainsAsciiBmh {
+        needle: Box<[u8]>,
+        skip: Box<[usize; 256]>,
+    },
+    General(Box<[LikeToken]>),
+}
+
+/// Pre-compiled SQLite `LIKE` pattern with zero-allocation byte-slice matching and a pure
+/// safe-Rust Boyer-Moore-Horspool `[usize; 256]` skip table for `%<ascii_literal>%`.
+#[derive(Debug, Clone)]
+pub struct CompiledLikePattern {
+    kind: CompiledLikeKind,
+    case_sensitive: bool,
+}
+
+impl CompiledLikePattern {
+    pub fn compile(pattern: &str, escape: Option<char>, case_sensitive: bool) -> Self {
+        let mut tokens: Vec<LikeToken> = Vec::with_capacity(pattern.len());
+        let mut chars = pattern.chars();
+        while let Some(ch) = chars.next() {
+            if Some(ch) == escape {
+                if let Some(escaped) = chars.next() {
+                    tokens.push(LikeToken::Literal(escaped));
+                } else {
+                    // Trailing dangling escape char in SQLite LIKE (`func.c:patternCompare`) never matches.
+                    return Self {
+                        kind: CompiledLikeKind::NeverMatch,
+                        case_sensitive,
+                    };
+                }
+            } else if ch == '%' {
+                if tokens.last() != Some(&LikeToken::Star) {
+                    tokens.push(LikeToken::Star);
+                }
+            } else if ch == '_' {
+                tokens.push(LikeToken::AnyOne);
+            } else {
+                tokens.push(LikeToken::Literal(ch));
             }
-            pi += 1;
-            ti += 1;
-        } else if pc == '%' {
-            while pi < pat.len() && pat[pi] == '%' {
-                pi += 1;
+        }
+
+        if tokens.as_slice() == [LikeToken::Star] {
+            return Self {
+                kind: CompiledLikeKind::MatchAll,
+                case_sensitive,
+            };
+        }
+
+        let fold_ascii = |b: u8| -> u8 {
+            if case_sensitive {
+                b
+            } else {
+                b.to_ascii_lowercase()
             }
-            if pi == pat.len() {
-                return true;
-            }
-            for k in ti..=txt.len() {
-                if like_rec(&pat[pi..], &txt[k..], escape) {
-                    return true;
+        };
+
+        let extract_ascii_lit = |slice: &[LikeToken]| -> Option<Box<[u8]>> {
+            let mut out = Vec::with_capacity(slice.len());
+            for tok in slice {
+                match tok {
+                    LikeToken::Literal(c) if c.is_ascii() => out.push(fold_ascii(*c as u8)),
+                    _ => return None,
                 }
             }
-            return false;
-        } else if pc == '_' {
-            if ti >= txt.len() {
-                return false;
+            Some(out.into_boxed_slice())
+        };
+
+        // `ExactAscii`: `lit` (including empty pattern `""`)
+        if let Some(exact) = extract_ascii_lit(&tokens) {
+            return Self {
+                kind: CompiledLikeKind::ExactAscii(exact),
+                case_sensitive,
+            };
+        }
+
+        // `ContainsAscii`: `%lit%`
+        if tokens.len() >= 3
+            && tokens.first() == Some(&LikeToken::Star)
+            && tokens.last() == Some(&LikeToken::Star)
+            && let Some(needle) = extract_ascii_lit(&tokens[1..tokens.len() - 1])
+        {
+            if needle.len() == 1 {
+                return Self {
+                    kind: CompiledLikeKind::ContainsAsciiOne(needle[0]),
+                    case_sensitive,
+                };
             }
-            pi += 1;
-            ti += 1;
-        } else {
-            if ti >= txt.len() || !ascii_eq_nocase(pc, txt[ti]) {
-                return false;
+            let m = needle.len();
+            let mut skip = Box::new([m; 256]);
+            for i in 0..(m - 1) {
+                let b = needle[i];
+                let shift = m - 1 - i;
+                skip[b as usize] = shift;
+                if !case_sensitive && b.is_ascii_lowercase() {
+                    skip[b.to_ascii_uppercase() as usize] = shift;
+                }
             }
-            pi += 1;
-            ti += 1;
+            return Self {
+                kind: CompiledLikeKind::ContainsAsciiBmh { needle, skip },
+                case_sensitive,
+            };
+        }
+
+        // `PrefixAscii`: `lit%`
+        if tokens.len() >= 2
+            && tokens.last() == Some(&LikeToken::Star)
+            && let Some(prefix) = extract_ascii_lit(&tokens[..tokens.len() - 1])
+        {
+            return Self {
+                kind: CompiledLikeKind::PrefixAscii(prefix),
+                case_sensitive,
+            };
+        }
+
+        // `SuffixAscii`: `%lit`
+        if tokens.len() >= 2
+            && tokens.first() == Some(&LikeToken::Star)
+            && let Some(suffix) = extract_ascii_lit(&tokens[1..])
+        {
+            return Self {
+                kind: CompiledLikeKind::SuffixAscii(suffix),
+                case_sensitive,
+            };
+        }
+
+        // `PrefixSuffixAscii`: `pre%suf`
+        if let Some(star_pos) = tokens.iter().position(|t| *t == LikeToken::Star)
+            && star_pos > 0
+            && star_pos + 1 < tokens.len()
+            && let (Some(prefix), Some(suffix)) = (
+                extract_ascii_lit(&tokens[..star_pos]),
+                extract_ascii_lit(&tokens[star_pos + 1..]),
+            )
+        {
+            return Self {
+                kind: CompiledLikeKind::PrefixSuffixAscii { prefix, suffix },
+                case_sensitive,
+            };
+        }
+
+        Self {
+            kind: CompiledLikeKind::General(tokens.into_boxed_slice()),
+            case_sensitive,
         }
     }
-    ti == txt.len()
+
+    #[inline]
+    fn eq_slice_folded(hay: &[u8], lower_needle: &[u8], case_sensitive: bool) -> bool {
+        if hay.len() != lower_needle.len() {
+            return false;
+        }
+        if case_sensitive {
+            hay == lower_needle
+        } else {
+            for i in 0..lower_needle.len() {
+                if hay[i].to_ascii_lowercase() != lower_needle[i] {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+
+    /// Evaluates this pre-compiled `LIKE` pattern directly on UTF-8 bytes with zero heap allocation
+    /// for all ASCII fast-path shapes and valid UTF-8 general patterns.
+    #[inline]
+    pub fn matches_utf8_bytes(&self, haystack: &[u8]) -> bool {
+        let cs = self.case_sensitive;
+        match &self.kind {
+            CompiledLikeKind::NeverMatch => false,
+            CompiledLikeKind::MatchAll => true,
+            CompiledLikeKind::ExactAscii(lit) => Self::eq_slice_folded(haystack, lit, cs),
+            CompiledLikeKind::PrefixAscii(pre) => {
+                haystack.len() >= pre.len()
+                    && Self::eq_slice_folded(&haystack[..pre.len()], pre, cs)
+            }
+            CompiledLikeKind::SuffixAscii(suf) => {
+                haystack.len() >= suf.len()
+                    && Self::eq_slice_folded(&haystack[haystack.len() - suf.len()..], suf, cs)
+            }
+            CompiledLikeKind::PrefixSuffixAscii { prefix, suffix } => {
+                haystack.len() >= prefix.len() + suffix.len()
+                    && Self::eq_slice_folded(&haystack[..prefix.len()], prefix, cs)
+                    && Self::eq_slice_folded(&haystack[haystack.len() - suffix.len()..], suffix, cs)
+            }
+            CompiledLikeKind::ContainsAsciiOne(target) => {
+                let t = *target;
+                if cs || !t.is_ascii_lowercase() {
+                    haystack.contains(&t)
+                } else {
+                    let upper = t.to_ascii_uppercase();
+                    for &b in haystack {
+                        if b == t || b == upper {
+                            return true;
+                        }
+                    }
+                    false
+                }
+            }
+            CompiledLikeKind::ContainsAsciiBmh { needle, skip } => {
+                let m = needle.len();
+                let n = haystack.len();
+                if n < m {
+                    return false;
+                }
+                let last_idx = m - 1;
+                let last_b = needle[last_idx];
+                let limit = n - m;
+                let mut pos = 0usize;
+                if !cs {
+                    while pos <= limit {
+                        let win = &haystack[pos..pos + m];
+                        let hb = win[last_idx];
+                        if hb.to_ascii_lowercase() == last_b {
+                            let mut ok = true;
+                            for k in 0..last_idx {
+                                if win[k].to_ascii_lowercase() != needle[k] {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if ok {
+                                return true;
+                            }
+                        }
+                        pos += skip[hb as usize];
+                    }
+                } else {
+                    while pos <= limit {
+                        let win = &haystack[pos..pos + m];
+                        let hb = win[last_idx];
+                        if hb == last_b && win[..last_idx] == needle[..last_idx] {
+                            return true;
+                        }
+                        pos += skip[hb as usize];
+                    }
+                }
+                false
+            }
+            CompiledLikeKind::General(tokens) => {
+                if let Ok(s) = std::str::from_utf8(haystack) {
+                    like_tokens_str(tokens, s, cs)
+                } else {
+                    let lossy = String::from_utf8_lossy(haystack);
+                    like_tokens_str(tokens, &lossy, cs)
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn matches_str(&self, text: &str) -> bool {
+        match &self.kind {
+            CompiledLikeKind::General(tokens) => like_tokens_str(tokens, text, self.case_sensitive),
+            _ => self.matches_utf8_bytes(text.as_bytes()),
+        }
+    }
+
+    /// Evaluates this pre-compiled `LIKE` pattern directly on a borrowed [`sqliters_types::RawField`]
+    /// inside a 4 KiB B-tree page buffer with zero heap allocation on UTF-8 text, blobs, and integers.
+    #[inline]
+    pub fn matches_raw_field(
+        &self,
+        field: sqliters_types::RawField<'_>,
+        enc: TextEncoding,
+    ) -> Option<bool> {
+        match field {
+            sqliters_types::RawField::Null => None,
+            sqliters_types::RawField::Text(bytes) => {
+                if enc == TextEncoding::Utf8 {
+                    Some(self.matches_utf8_bytes(bytes))
+                } else {
+                    let decoded = enc.decode_bytes(bytes);
+                    Some(self.matches_str(&decoded))
+                }
+            }
+            sqliters_types::RawField::Blob(bytes) => Some(self.matches_utf8_bytes(bytes)),
+            sqliters_types::RawField::Int(i) => {
+                let mut buf = [0u8; 24];
+                let slice = format_i64_into_stack(i, &mut buf);
+                Some(self.matches_utf8_bytes(slice))
+            }
+            sqliters_types::RawField::Float(f) => {
+                let s = sqliters_types::format_sqlite_real(f);
+                Some(self.matches_str(&s))
+            }
+        }
+    }
+}
+
+#[inline]
+pub fn format_i64_into_stack(val: i64, buf: &mut [u8; 24]) -> &[u8] {
+    if val == 0 {
+        buf[23] = b'0';
+        return &buf[23..24];
+    }
+    let neg = val < 0;
+    let mut mag = val.unsigned_abs();
+    let mut pos = 24usize;
+    while mag > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (mag % 10) as u8;
+        mag /= 10;
+    }
+    if neg {
+        pos -= 1;
+        buf[pos] = b'-';
+    }
+    &buf[pos..24]
+}
+
+fn like_tokens_str(pat: &[LikeToken], mut txt: &str, case_sensitive: bool) -> bool {
+    let mut pi = 0usize;
+    let mut star_pi: Option<usize> = None;
+    let mut star_txt: &str = "";
+
+    loop {
+        if pi < pat.len() {
+            match pat[pi] {
+                LikeToken::Star => {
+                    star_pi = Some(pi + 1);
+                    star_txt = txt;
+                    pi += 1;
+                    continue;
+                }
+                LikeToken::AnyOne => {
+                    let mut chars = txt.chars();
+                    if chars.next().is_some() {
+                        txt = chars.as_str();
+                        pi += 1;
+                        continue;
+                    }
+                }
+                LikeToken::Literal(pc) => {
+                    let mut chars = txt.chars();
+                    if let Some(tc) = chars.next() {
+                        let eq = if case_sensitive {
+                            pc == tc
+                        } else {
+                            ascii_eq_nocase(pc, tc)
+                        };
+                        if eq {
+                            txt = chars.as_str();
+                            pi += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        } else if txt.is_empty() {
+            return true;
+        }
+
+        if let Some(spi) = star_pi {
+            let mut chars = star_txt.chars();
+            if chars.next().is_some() {
+                star_txt = chars.as_str();
+                txt = star_txt;
+                pi = spi;
+                continue;
+            }
+        }
+        return false;
+    }
+}
+
+/// SQLite `LIKE` matcher (`%` = 0+ chars, `_` = 1 char, ASCII case-insensitive).
+pub fn sqlite_like_match(pattern: &str, text: &str, escape: Option<char>) -> bool {
+    if escape.is_none() && pattern.is_ascii() && text.is_ascii() {
+        return like_ascii_bytes_nocase(pattern.as_bytes(), text.as_bytes());
+    }
+    like_str_iter(pattern, text, escape)
+}
+
+#[inline]
+fn like_ascii_bytes_nocase(pat: &[u8], txt: &[u8]) -> bool {
+    let mut pi = 0usize;
+    let mut ti = 0usize;
+    let mut star_pi = usize::MAX;
+    let mut star_ti = 0usize;
+
+    while ti < txt.len() {
+        if pi < pat.len() {
+            let pb = pat[pi];
+            if pb == b'%' {
+                while pi < pat.len() && pat[pi] == b'%' {
+                    pi += 1;
+                }
+                if pi == pat.len() {
+                    return true;
+                }
+                star_pi = pi;
+                star_ti = ti;
+                continue;
+            }
+            if pb == b'_' || pb.eq_ignore_ascii_case(&txt[ti]) {
+                pi += 1;
+                ti += 1;
+                continue;
+            }
+        }
+        if star_pi != usize::MAX {
+            star_ti += 1;
+            ti = star_ti;
+            pi = star_pi;
+            continue;
+        }
+        return false;
+    }
+    while pi < pat.len() && pat[pi] == b'%' {
+        pi += 1;
+    }
+    pi == pat.len()
+}
+
+fn like_str_iter(mut pat: &str, mut txt: &str, escape: Option<char>) -> bool {
+    let mut star_pat: Option<&str> = None;
+    let mut star_txt: &str = "";
+
+    loop {
+        let mut pchars = pat.chars();
+        if let Some(pc) = pchars.next() {
+            if Some(pc) == escape {
+                let Some(esc_lit) = pchars.next() else {
+                    return false;
+                };
+                let mut tchars = txt.chars();
+                if let Some(tc) = tchars.next()
+                    && ascii_eq_nocase(esc_lit, tc)
+                {
+                    pat = pchars.as_str();
+                    txt = tchars.as_str();
+                    continue;
+                }
+            } else if pc == '%' {
+                let mut rest = pchars.as_str();
+                while let Some(after) = rest.strip_prefix('%') {
+                    rest = after;
+                }
+                if rest.is_empty() {
+                    return true;
+                }
+                star_pat = Some(rest);
+                star_txt = txt;
+                pat = rest;
+                continue;
+            } else if pc == '_' {
+                let mut tchars = txt.chars();
+                if tchars.next().is_some() {
+                    pat = pchars.as_str();
+                    txt = tchars.as_str();
+                    continue;
+                }
+            } else {
+                let mut tchars = txt.chars();
+                if let Some(tc) = tchars.next()
+                    && ascii_eq_nocase(pc, tc)
+                {
+                    pat = pchars.as_str();
+                    txt = tchars.as_str();
+                    continue;
+                }
+            }
+        } else if txt.is_empty() {
+            return true;
+        }
+
+        if let Some(sp) = star_pat {
+            let mut tchars = star_txt.chars();
+            if tchars.next().is_some() {
+                star_txt = tchars.as_str();
+                txt = star_txt;
+                pat = sp;
+                continue;
+            }
+        }
+        return false;
+    }
 }
 
 #[inline]
@@ -2441,6 +2901,141 @@ impl SumCtx {
             }
         } else {
             self.i_sum as f64
+        }
+    }
+}
+
+/// Zero-allocation streaming `SUM` / `TOTAL` / `AVG` accumulator sharing exact SQLite `SumCtx`
+/// overflow and Kahan-Babuška-Neumaier floating-point semantics.
+#[derive(Debug, Clone, Default)]
+pub struct FastSumAccum {
+    count: i64,
+    ctx: SumCtx,
+}
+
+impl FastSumAccum {
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            count: 0,
+            ctx: SumCtx {
+                r_sum: 0.0,
+                r_err: 0.0,
+                i_sum: 0,
+                approx: false,
+                ovrfl: false,
+            },
+        }
+    }
+
+    #[inline(always)]
+    pub const fn count(&self) -> i64 {
+        self.count
+    }
+
+    #[inline(always)]
+    pub fn step_i64(&mut self, i: i64) {
+        self.count += 1;
+        if !self.ctx.approx {
+            if let Some(next) = self.ctx.i_sum.checked_add(i) {
+                self.ctx.i_sum = next;
+                return;
+            }
+            self.ctx.ovrfl = true;
+            self.ctx.kbn_init(self.ctx.i_sum);
+            self.ctx.approx = true;
+        }
+        self.ctx.kbn_step_i64(i);
+    }
+
+    #[inline]
+    pub fn step_f64(&mut self, f: f64) {
+        if f.is_nan() {
+            return;
+        }
+        self.count += 1;
+        if !self.ctx.approx {
+            self.ctx.kbn_init(self.ctx.i_sum);
+            self.ctx.approx = true;
+        } else {
+            self.ctx.ovrfl = false;
+        }
+        self.ctx.kbn_step(f);
+    }
+
+    #[inline]
+    pub fn step_value(&mut self, v: &Value) {
+        if v.is_null() {
+            return;
+        }
+        self.count += 1;
+        self.ctx.step_val(v);
+    }
+
+    #[inline]
+    pub fn inverse_value(&mut self, v: &Value) {
+        if v.is_null() {
+            return;
+        }
+        self.count -= 1;
+        self.ctx.inverse_val(v);
+    }
+
+    #[inline]
+    pub fn step_raw_field(&mut self, field: sqliters_types::RawField<'_>, enc: TextEncoding) {
+        match field {
+            sqliters_types::RawField::Null => {}
+            sqliters_types::RawField::Int(i) => self.step_i64(i),
+            sqliters_types::RawField::Float(f) => self.step_f64(f),
+            sqliters_types::RawField::Blob(_) => self.step_f64(0.0),
+            sqliters_types::RawField::Text(b) => {
+                if enc == TextEncoding::Utf8
+                    && let Ok(s) = std::str::from_utf8(b)
+                {
+                    match sqliters_types::parse_numeric_text(s) {
+                        Some(Value::Integer(i)) => self.step_i64(i),
+                        Some(Value::Real(r)) => self.step_f64(r),
+                        _ => self.step_f64(sqliters_types::parse_leading_f64(s)),
+                    }
+                } else {
+                    let owned = field.to_owned_value(enc);
+                    self.step_value(&owned);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn finalize_sum(&self) -> Result<Value> {
+        if self.count == 0 {
+            return Ok(Value::Null);
+        }
+        if self.ctx.approx {
+            if self.ctx.ovrfl {
+                Err(SqliteError::new(ErrorCode::Mismatch, "integer overflow"))
+            } else {
+                Ok(Value::real(self.ctx.combined_f64()))
+            }
+        } else {
+            Ok(Value::Integer(self.ctx.i_sum))
+        }
+    }
+
+    #[inline]
+    pub fn finalize_total(&self) -> Value {
+        if self.count == 0 && !self.ctx.approx {
+            Value::Real(0.0)
+        } else {
+            Value::real(self.ctx.combined_f64())
+        }
+    }
+
+    #[inline]
+    pub fn finalize_avg(&self) -> Value {
+        if self.count == 0 {
+            Value::Null
+        } else {
+            Value::real(self.ctx.combined_f64() / (self.count as f64))
         }
     }
 }

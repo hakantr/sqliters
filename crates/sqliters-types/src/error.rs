@@ -212,54 +212,84 @@ pub struct SqliteError {
 }
 
 impl SqliteError {
-    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+    #[cold]
+    #[inline(never)]
+    fn new_owned(code: ErrorCode, message: String) -> Self {
         Self {
             code,
             extended_code: code as i32,
-            message: message.into(),
+            message,
             offset: None,
             conflict_effect: ConflictResolutionEffect::Abort,
         }
     }
 
-    pub fn with_extended(extended_code: i32, message: impl Into<String>) -> Self {
+    #[cold]
+    #[inline(never)]
+    fn with_extended_owned(extended_code: i32, message: String) -> Self {
         Self {
             code: ErrorCode::from_raw_primary(extended_code),
             extended_code,
-            message: message.into(),
+            message,
             offset: None,
             conflict_effect: ConflictResolutionEffect::Abort,
         }
     }
 
+    #[cold]
+    #[inline(never)]
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self::new_owned(code, message.into())
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub fn with_extended(extended_code: i32, message: impl Into<String>) -> Self {
+        Self::with_extended_owned(extended_code, message.into())
+    }
+
+    #[cold]
+    #[inline(never)]
     pub fn with_offset(mut self, offset: usize) -> Self {
         self.offset = Some(offset);
         self
     }
 
+    #[cold]
+    #[inline(never)]
     pub fn with_conflict_effect(mut self, effect: ConflictResolutionEffect) -> Self {
         self.conflict_effect = effect;
         self
     }
 
+    #[cold]
+    #[inline(never)]
     pub fn syntax(message: impl Into<String>, offset: usize) -> Self {
-        Self::new(ErrorCode::Error, message).with_offset(offset)
+        Self::new_owned(ErrorCode::Error, message.into()).with_offset(offset)
     }
 
+    #[cold]
+    #[inline(never)]
     pub fn corrupt(message: impl Into<String>) -> Self {
-        Self::new(ErrorCode::Corrupt, message)
+        Self::new_owned(ErrorCode::Corrupt, message.into())
     }
 
+    #[cold]
+    #[inline(never)]
     pub fn constraint(extended_code: i32, message: impl Into<String>) -> Self {
-        Self::with_extended(extended_code, message)
+        Self::with_extended_owned(extended_code, message.into())
     }
 
+    #[cold]
+    #[inline(never)]
     pub fn misuse(message: impl Into<String>) -> Self {
-        Self::new(ErrorCode::Misuse, message)
+        Self::new_owned(ErrorCode::Misuse, message.into())
     }
 
+    #[cold]
+    #[inline(never)]
     pub fn readonly(message: impl Into<String>) -> Self {
-        Self::new(ErrorCode::ReadOnly, message)
+        Self::new_owned(ErrorCode::ReadOnly, message.into())
     }
 }
 
@@ -276,8 +306,10 @@ impl fmt::Display for SqliteError {
 impl std::error::Error for SqliteError {}
 
 impl From<std::io::Error> for SqliteError {
+    #[cold]
+    #[inline(never)]
     fn from(err: std::io::Error) -> Self {
-        Self::new(ErrorCode::IoErr, err.to_string())
+        Self::new_owned(ErrorCode::IoErr, err.to_string())
     }
 }
 

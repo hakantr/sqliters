@@ -177,8 +177,13 @@ fn main() -> ExitCode {
     }
 
     let stdin = io::stdin();
-    let mut reader = stdin.lock();
-    let outcome = process_input_stream(&mut conn, &mut cfg, &mut reader, &mut stdout, interactive);
+    let outcome = if interactive {
+        let mut reader = stdin.lock();
+        process_input_stream(&mut conn, &mut cfg, &mut reader, &mut stdout, true)
+    } else {
+        let mut reader = BufReader::with_capacity(64 * 1024, stdin.lock());
+        process_input_stream(&mut conn, &mut cfg, &mut reader, &mut stdout, false)
+    };
     let _ = stdout.flush();
 
     if outcome.bailed || (!interactive && outcome.err_count > 0) {
@@ -391,6 +396,14 @@ fn execute_shell_input<W: Write>(
         }
         return Ok(());
     }
+    if !input.contains('\n') && !input.contains('\r') && is_complete(input) {
+        if let Err(e) = execute_sql_buffer(conn, cfg, input, out) {
+            let _ = out.flush();
+            eprintln!("Error: {e}");
+            return Err(ExitCode::from(1));
+        }
+        return Ok(());
+    }
     let mut cursor = io::Cursor::new(input.as_bytes());
     let outcome = process_input_stream(conn, cfg, &mut cursor, out, false);
     if outcome.bailed || outcome.err_count > 0 {
@@ -399,13 +412,14 @@ fn execute_shell_input<W: Write>(
     Ok(())
 }
 
-/// Returns `true` when every statement in `sql` is a non-returning DML or transaction-control
-/// statement (`INSERT`, `REPLACE`, `UPDATE`, `DELETE`, `BEGIN`, `COMMIT`, `END`, `ROLLBACK`)
-/// containing no unquoted `RETURNING` keyword, so it never emits result rows or column headers
-/// and can be executed directly via [`Connection::execute_batch`].
+/// Returns `true` when every statement in `sql` is a semicolon-terminated non-returning DML or
+/// transaction-control statement (`INSERT`, `REPLACE`, `UPDATE`, `DELETE`, `BEGIN`, `COMMIT`,
+/// `END`, `ROLLBACK`) containing no unquoted `RETURNING` keyword, so it never emits result rows or
+/// column headers and can be executed directly via [`Connection::execute_batch`].
 fn is_pure_non_returning_batch_sql(sql: &str) -> bool {
     let bytes = sql.as_bytes();
     let mut i = 0usize;
+    let mut saw_stmt = false;
 
     loop {
         while i < bytes.len() {
@@ -436,7 +450,7 @@ fn is_pure_non_returning_batch_sql(sql: &str) -> bool {
             }
         }
         if i >= bytes.len() {
-            return true;
+            return saw_stmt;
         }
 
         if !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
@@ -459,11 +473,14 @@ fn is_pure_non_returning_batch_sql(sql: &str) -> bool {
         if !is_dml && !is_tcl {
             return false;
         }
+        saw_stmt = true;
+        let mut terminated = false;
 
         while i < bytes.len() {
             match bytes[i] {
                 b';' => {
                     i += 1;
+                    terminated = true;
                     break;
                 }
                 b'\'' | b'"' | b'`' => {
@@ -537,6 +554,9 @@ fn is_pure_non_returning_batch_sql(sql: &str) -> bool {
                 _ => i += 1,
             }
         }
+        if !terminated {
+            return false;
+        }
     }
 }
 
@@ -553,24 +573,102 @@ fn execute_sql_buffer<W: Write>(
         let mut stmt = conn.prepare(sql)?;
         let tail_len = stmt.tail().len();
         let cur_len = sql.len();
-        let step_res = (|| -> sqliters::Result<QueryResult> {
-            let mut rows = Vec::new();
-            while let StepResult::Row(r) = stmt.step()? {
-                rows.push(r);
+        if matches!(
+            cfg.mode,
+            OutputMode::List | OutputMode::Csv | OutputMode::Line
+        ) {
+            let col_names: Vec<String> = stmt.column_names().to_vec();
+            let has_cols = !col_names.is_empty();
+            let max_w = if cfg.mode == OutputMode::Line && has_cols {
+                col_names
+                    .iter()
+                    .map(|s| s.chars().count())
+                    .max()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let mut row_idx = 0usize;
+            let step_res = (|| -> sqliters::Result<()> {
+                while let StepResult::Row(r) = stmt.step()? {
+                    if !has_cols {
+                        continue;
+                    }
+                    match cfg.mode {
+                        OutputMode::List => {
+                            if row_idx == 0 && cfg.headers {
+                                let _ = writeln!(out, "{}", col_names.join(&cfg.separator));
+                            }
+                            let sep_bytes = cfg.separator.as_bytes();
+                            for (ci, v) in r.values().iter().enumerate() {
+                                if ci > 0 {
+                                    let _ = out.write_all(sep_bytes);
+                                }
+                                write_cell_value(out, v, &cfg.null_value);
+                            }
+                            let _ = out.write_all(b"\n");
+                        }
+                        OutputMode::Csv => {
+                            if row_idx == 0 && cfg.headers {
+                                let hdr: Vec<String> =
+                                    col_names.iter().map(|s| csv_escape(s)).collect();
+                                let _ = writeln!(out, "{}", hdr.join(","));
+                            }
+                            for (ci, v) in r.values().iter().enumerate() {
+                                if ci > 0 {
+                                    let _ = out.write_all(b",");
+                                }
+                                let esc = csv_escape(&format_cell_value(v, &cfg.null_value));
+                                let _ = out.write_all(esc.as_bytes());
+                            }
+                            let _ = out.write_all(b"\n");
+                        }
+                        OutputMode::Line => {
+                            if row_idx > 0 {
+                                let _ = out.write_all(b"\n");
+                            }
+                            for (ci, v) in r.values().iter().enumerate() {
+                                let val = format_cell_value(v, &cfg.null_value);
+                                let _ = writeln!(
+                                    out,
+                                    "{:>width$} = {val}",
+                                    col_names[ci],
+                                    width = max_w
+                                );
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                    row_idx += 1;
+                }
+                Ok(())
+            })();
+            let fin_res = stmt.finalize();
+            step_res?;
+            fin_res?;
+            if row_idx > 0 {
+                let _ = out.flush();
             }
-            Ok(QueryResult {
-                column_names: stmt.column_names().to_vec(),
-                rows,
-            })
-        })();
-        let fin_res = stmt.finalize();
-        let qres = step_res?;
-        fin_res?;
-        if !qres.rows.is_empty()
-            || (cfg.headers && !qres.column_names.is_empty() && cfg.mode == OutputMode::Json)
-        {
-            render_query_result(&qres, cfg, out);
-            let _ = out.flush();
+        } else {
+            let step_res = (|| -> sqliters::Result<QueryResult> {
+                let mut rows = Vec::new();
+                while let StepResult::Row(r) = stmt.step()? {
+                    rows.push(r);
+                }
+                Ok(QueryResult {
+                    column_names: stmt.column_names().to_vec(),
+                    rows,
+                })
+            })();
+            let fin_res = stmt.finalize();
+            let qres = step_res?;
+            fin_res?;
+            if !qres.rows.is_empty()
+                || (cfg.headers && !qres.column_names.is_empty() && cfg.mode == OutputMode::Json)
+            {
+                render_query_result(&qres, cfg, out);
+                let _ = out.flush();
+            }
         }
         if tail_len == cur_len {
             break;
@@ -896,16 +994,25 @@ fn handle_dot_command<W: Write>(
                 record_dot_error(&mut outcome, cfg, out, "Usage: .read FILE");
                 return outcome;
             };
-            match File::open(Path::new(fpath)) {
-                Ok(file) => {
-                    let mut reader = BufReader::with_capacity(64 * 1024, file);
-                    let sub = process_input_stream(conn, cfg, &mut reader, out, false);
-                    outcome.err_count += sub.err_count;
-                    if sub.bailed {
-                        outcome.bailed = true;
-                    }
-                    if sub.quit {
-                        outcome.quit = true;
+            match std::fs::read(Path::new(fpath)) {
+                Ok(bytes) => {
+                    if cfg.bail
+                        && let Ok(sql_text) = std::str::from_utf8(&bytes)
+                        && is_pure_non_returning_batch_sql(sql_text)
+                    {
+                        if let Err(e) = conn.execute_batch(sql_text) {
+                            record_dot_error(&mut outcome, cfg, out, &format!("Error: {e}"));
+                        }
+                    } else {
+                        let mut cursor = io::Cursor::new(bytes.as_slice());
+                        let sub = process_input_stream(conn, cfg, &mut cursor, out, false);
+                        outcome.err_count += sub.err_count;
+                        if sub.bailed {
+                            outcome.bailed = true;
+                        }
+                        if sub.quit {
+                            outcome.quit = true;
+                        }
                     }
                 }
                 Err(e) => record_dot_error(
@@ -1571,16 +1678,37 @@ fn print_box_row<W: Write>(out: &mut W, cells: &[String], widths: &[usize], sep:
 fn write_cell_value<W: Write>(out: &mut W, v: &Value, null_str: &str) {
     match v {
         Value::Null => {
-            let _ = write!(out, "{null_str}");
+            let _ = out.write_all(null_str.as_bytes());
         }
         Value::Integer(i) => {
-            let _ = write!(out, "{i}");
+            let mut buf = [0u8; 24];
+            let mut pos = buf.len();
+            let neg = *i < 0;
+            let mut mag: u64 = if neg {
+                i.wrapping_neg() as u64
+            } else {
+                *i as u64
+            };
+            loop {
+                pos -= 1;
+                buf[pos] = b'0' + (mag % 10) as u8;
+                mag /= 10;
+                if mag == 0 {
+                    break;
+                }
+            }
+            if neg {
+                pos -= 1;
+                buf[pos] = b'-';
+            }
+            let _ = out.write_all(&buf[pos..]);
         }
         Value::Real(r) => {
-            let _ = write!(out, "{}", format_sqlite_real(*r));
+            let s = format_sqlite_real(*r);
+            let _ = out.write_all(s.as_bytes());
         }
         Value::Text(s) => {
-            let _ = write!(out, "{s}");
+            let _ = out.write_all(s.as_bytes());
         }
         Value::Blob(b) => {
             let _ = out.write_all(String::from_utf8_lossy(b).as_bytes());

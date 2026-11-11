@@ -18,9 +18,10 @@ use sqliters_types::{
 };
 
 pub use functions::{
-    AccumulatorTable, AggregateAccumulator, AggregateKind, TestFunctionsScope, VmRuntimeContext,
-    builtin_scalar_flags, builtin_window_arity, eval_scalar_function, eval_scalar_function_rt,
-    eval_scalar_function_rt_with_strict, format_utc_date, format_utc_time, format_utc_timestamp,
+    AccumulatorTable, AggregateAccumulator, AggregateKind, CompiledLikePattern, FastSumAccum,
+    TestFunctionsScope, VmRuntimeContext, builtin_scalar_flags, builtin_window_arity,
+    eval_scalar_function, eval_scalar_function_rt, eval_scalar_function_rt_with_strict,
+    format_i64_into_stack, format_utc_date, format_utc_time, format_utc_timestamp,
     is_builtin_window_only_function, parse_escape_char, sqlite_glob_match, sqlite_like_match,
     system_utc_millis, utc_ymdhms_from_unix_ms, validate_function_call,
 };
@@ -424,6 +425,8 @@ pub enum InsertValSource {
     Const(Value),
     /// 1-based bind parameter (`?1`, `:x`, etc.).
     Param1Based(u32),
+    /// Built-in `jsonb(?p)` call on a 1-based bind parameter.
+    JsonbParam1Based(u32),
 }
 
 /// Column specification in a [`SingleRowInsertPlan`].
@@ -434,14 +437,25 @@ pub struct SingleRowInsertCol {
     pub notnull_msg: Option<String>,
 }
 
-/// Precompiled direct single-row table `INSERT` plan (when no secondary indexes, triggers, FKs,
-/// or SQL functions apply), bypassing VDBE register copying and per-opcode dispatch.
+/// Non-unique secondary index specification in a [`SingleRowInsertPlan`].
+#[derive(Debug, Clone)]
+pub struct SingleRowInsertIndex {
+    pub root_pgno: Pgno,
+    pub orders: Vec<KeySortOrder>,
+    /// Logical column index (`Some(ci)`) or `None` for the `INTEGER PRIMARY KEY` / `rowid`.
+    pub col_slots: Vec<Option<usize>>,
+}
+
+/// Precompiled direct single-row table `INSERT` plan (when no triggers, FKs, or unique secondary
+/// indexes apply), bypassing VDBE register copying and per-opcode dispatch.
 #[derive(Debug, Clone)]
 pub struct SingleRowInsertPlan {
     pub db: DatabaseId,
     pub root_pgno: Pgno,
     pub rowid_src: Option<InsertValSource>,
     pub cols: Vec<SingleRowInsertCol>,
+    pub indexes: Vec<SingleRowInsertIndex>,
+    pub has_builtin_jsonb: bool,
     pub dup_ext_code: i32,
     pub dup_msg: String,
 }
@@ -457,6 +471,7 @@ pub struct VdbeProgram {
     referenced_db_mask: u16,
     primary_write_db: Option<DatabaseId>,
     has_function_call: bool,
+    needs_stmt_timestamp: bool,
     needs_stmt_subsavepoint: bool,
     rowid_point_select: Option<RowidPointSelectPlan>,
     single_row_insert: Option<SingleRowInsertPlan>,
@@ -473,6 +488,7 @@ impl VdbeProgram {
             referenced_db_mask: 0,
             primary_write_db: None,
             has_function_call: false,
+            needs_stmt_timestamp: false,
             needs_stmt_subsavepoint: true,
             rowid_point_select: None,
             single_row_insert: None,
@@ -551,6 +567,24 @@ impl VdbeProgram {
             }
             Opcode::Function => {
                 self.has_function_call = true;
+                let may_need_ts = match &op.p4 {
+                    P4::Func { name, .. } => {
+                        name.eq_ignore_ascii_case("current_date")
+                            || name.eq_ignore_ascii_case("current_time")
+                            || name.eq_ignore_ascii_case("current_timestamp")
+                            || name.eq_ignore_ascii_case("date")
+                            || name.eq_ignore_ascii_case("time")
+                            || name.eq_ignore_ascii_case("datetime")
+                            || name.eq_ignore_ascii_case("julianday")
+                            || name.eq_ignore_ascii_case("unixepoch")
+                            || name.eq_ignore_ascii_case("strftime")
+                            || name.eq_ignore_ascii_case("timediff")
+                    }
+                    _ => true,
+                };
+                if may_need_ts {
+                    self.needs_stmt_timestamp = true;
+                }
             }
             _ => {}
         }
@@ -572,6 +606,11 @@ impl VdbeProgram {
     #[inline(always)]
     pub fn has_function_call(&self) -> bool {
         self.has_function_call
+    }
+
+    #[inline(always)]
+    pub fn needs_stmt_timestamp(&self) -> bool {
+        self.needs_stmt_timestamp
     }
 
     pub fn patch_p2(&mut self, addr: usize, target: usize) {
@@ -852,6 +891,7 @@ pub struct VdbeWriteScratch {
     regs: Vec<RuntimeValue>,
     cursors: Vec<CursorState>,
     pool: VdbePool,
+    scratch_jsonb: Vec<u8>,
 }
 
 impl VdbeWriteScratch {
@@ -859,6 +899,12 @@ impl VdbeWriteScratch {
     #[inline(always)]
     pub fn scratch_rec_mut(&mut self) -> &mut Vec<u8> {
         &mut self.pool.scratch_rec
+    }
+
+    /// Reusable record and JSONB byte buffers for zero-allocation direct `INSERT` execution.
+    #[inline(always)]
+    pub fn scratch_buffers_mut(&mut self) -> (&mut Vec<u8>, &mut Vec<u8>) {
+        (&mut self.pool.scratch_rec, &mut self.scratch_jsonb)
     }
 }
 
@@ -2086,7 +2132,7 @@ fn step_ops_loop(
     Ok(VmStep::Done)
 }
 
-fn eval_arith(op: Opcode, lhs: &Value, rhs: &Value) -> Value {
+pub fn eval_arith(op: Opcode, lhs: &Value, rhs: &Value) -> Value {
     if lhs.is_null() || rhs.is_null() {
         return Value::Null;
     }
