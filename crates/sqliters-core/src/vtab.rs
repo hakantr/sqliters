@@ -2,7 +2,7 @@
 //! and eponymous `pragma_*` virtual table modules (`sqlite/src/vtab.c`, `pragma.c`, `dbstat.c`).
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use sqliters_ext::{
@@ -20,7 +20,7 @@ use sqliters_types::{
     VirtualCursor, VirtualTable, VirtualTableModule, get_varint,
 };
 
-use crate::db_set::{DatabaseSet, ResolvedRelation};
+use crate::db_set::{DatabaseSet, RelationRef};
 use crate::engine::ExecContext;
 pub use crate::execution_context::catch_callback_panic;
 use crate::schema::{ColumnSchema, TableSchema, build_table_schema_from_ast};
@@ -140,8 +140,10 @@ pub struct ConnectedVTabEntry {
     pub table_name: String,
     pub module_name: String,
     pub module_risk_flags: VTabRiskFlags,
+    pub is_eponymous: bool,
+    pub is_eponymous_only: bool,
     pub shadow_suffixes: Vec<String>,
-    pub declared: VTabDeclaredSchema,
+    pub declared: Arc<VTabDeclaredSchema>,
     pub state: VTabInstanceState,
     pub in_tx: bool,
 }
@@ -155,10 +157,20 @@ impl ConnectedVTabEntry {
     }
 }
 
+const MAX_SUB_SQL_CACHE_ENTRIES: usize = 128;
+
+/// Cached parse outcome for internal `VTabHostContext` sub-SQL.
+pub enum CachedSubSql {
+    Empty,
+    Single(Arc<Stmt>),
+    Multi,
+}
+
 /// Per-connection registry of virtual table modules and connected virtual table instances.
 pub struct VTabRegistry {
     modules: BTreeMap<String, (String, Arc<dyn VirtualTableModule>)>,
-    connected: BTreeMap<(String, String), ConnectedVTabEntry>,
+    connected: HashMap<String, Vec<ConnectedVTabEntry>>,
+    sub_sql_cache: HashMap<String, Arc<Stmt>>,
     fts5_aux: Arc<Fts5AuxRegistry>,
     pub trusted_schema: bool,
     pub defensive_mode: bool,
@@ -170,6 +182,7 @@ impl std::fmt::Debug for VTabRegistry {
         f.debug_struct("VTabRegistry")
             .field("module_count", &self.modules.len())
             .field("connected", &self.connected)
+            .field("sub_sql_cache_len", &self.sub_sql_cache.len())
             .field("trusted_schema", &self.trusted_schema)
             .field("defensive_mode", &self.defensive_mode)
             .field("internal_sql_depth", &self.internal_sql_depth)
@@ -190,7 +203,8 @@ impl VTabRegistry {
         let fts5_aux = Arc::new(Fts5AuxRegistry::new());
         let mut reg = Self {
             modules: BTreeMap::new(),
-            connected: BTreeMap::new(),
+            connected: HashMap::new(),
+            sub_sql_cache: HashMap::new(),
             fts5_aux: Arc::clone(&fts5_aux),
             trusted_schema: true,
             defensive_mode: false,
@@ -246,6 +260,9 @@ impl VTabRegistry {
 
     /// Looks up an already-registered module without lazy `pragma_*` registration.
     pub fn get_module(&self, name: &str) -> Option<Arc<dyn VirtualTableModule>> {
+        if !name.bytes().any(|b| b.is_ascii_uppercase()) {
+            return self.modules.get(name).map(|(_, m)| Arc::clone(m));
+        }
         let key = name.to_ascii_lowercase();
         self.modules.get(&key).map(|(_, m)| Arc::clone(m))
     }
@@ -264,41 +281,70 @@ impl VTabRegistry {
     }
 
     #[inline]
-    fn slot_key(db_name: &str, table_name: &str) -> (String, String) {
-        (
-            db_name.to_ascii_lowercase(),
-            table_name.to_ascii_lowercase(),
-        )
-    }
-
-    /// Returns a reference to a connected virtual table entry if present.
-    pub fn get_connected(&self, db_name: &str, table_name: &str) -> Option<&ConnectedVTabEntry> {
-        self.connected.get(&Self::slot_key(db_name, table_name))
-    }
-
-    /// Returns `true` if a connected virtual table belongs to an eponymous-only read-only module.
-    pub fn is_connected_read_only(&self, db_name: &str, table_name: &str) -> bool {
-        match self.get_connected(db_name, table_name) {
-            Some(entry) => self
-                .get_module(&entry.module_name)
-                .is_some_and(|m| m.is_eponymous_only()),
-            None => false,
+    fn get_bucket(&self, table_name: &str) -> Option<&Vec<ConnectedVTabEntry>> {
+        if self.connected.is_empty() {
+            return None;
+        }
+        if !table_name.bytes().any(|b| b.is_ascii_uppercase()) {
+            self.connected.get(table_name)
+        } else {
+            let key = table_name.to_ascii_lowercase();
+            self.connected.get(key.as_str())
         }
     }
 
+    #[inline]
+    fn get_bucket_mut(&mut self, table_name: &str) -> Option<&mut Vec<ConnectedVTabEntry>> {
+        if self.connected.is_empty() {
+            return None;
+        }
+        if !table_name.bytes().any(|b| b.is_ascii_uppercase()) {
+            self.connected.get_mut(table_name)
+        } else {
+            let key = table_name.to_ascii_lowercase();
+            self.connected.get_mut(key.as_str())
+        }
+    }
+
+    /// Returns a reference to a connected virtual table entry if present.
+    #[inline]
+    pub fn get_connected(&self, db_name: &str, table_name: &str) -> Option<&ConnectedVTabEntry> {
+        self.get_bucket(table_name)?
+            .iter()
+            .find(|e| e.db_name.eq_ignore_ascii_case(db_name))
+    }
+
+    /// Returns `true` if a connected virtual table belongs to an eponymous-only read-only module.
+    #[inline]
+    pub fn is_connected_read_only(&self, db_name: &str, table_name: &str) -> bool {
+        self.get_connected(db_name, table_name)
+            .is_some_and(|entry| entry.is_eponymous_only)
+    }
+
     /// Returns a mutable reference to a connected virtual table entry if present.
+    #[inline]
     pub fn get_connected_mut(
         &mut self,
         db_name: &str,
         table_name: &str,
     ) -> Option<&mut ConnectedVTabEntry> {
-        self.connected.get_mut(&Self::slot_key(db_name, table_name))
+        self.get_bucket_mut(table_name)?
+            .iter_mut()
+            .find(|e| e.db_name.eq_ignore_ascii_case(db_name))
     }
 
     /// Inserts a newly created or connected virtual table entry.
     pub fn insert_connected(&mut self, entry: ConnectedVTabEntry) {
-        let key = Self::slot_key(&entry.db_name, &entry.table_name);
-        self.connected.insert(key, entry);
+        let key = entry.table_name.to_ascii_lowercase();
+        let bucket = self.connected.entry(key).or_default();
+        if let Some(slot) = bucket
+            .iter_mut()
+            .find(|e| e.db_name.eq_ignore_ascii_case(&entry.db_name))
+        {
+            *slot = entry;
+        } else {
+            bucket.push(entry);
+        }
     }
 
     /// Removes and returns a connected virtual table entry.
@@ -307,31 +353,54 @@ impl VTabRegistry {
         db_name: &str,
         table_name: &str,
     ) -> Option<ConnectedVTabEntry> {
-        self.connected.remove(&Self::slot_key(db_name, table_name))
+        let key = table_name.to_ascii_lowercase();
+        let bucket = self.connected.get_mut(&key)?;
+        let pos = bucket
+            .iter()
+            .position(|e| e.db_name.eq_ignore_ascii_case(db_name))?;
+        let removed = bucket.swap_remove(pos);
+        if bucket.is_empty() {
+            self.connected.remove(&key);
+        }
+        Some(removed)
     }
 
     /// Renames a connected virtual table entry from `old_name` to `new_name` in `db_name`.
     pub fn rename_connected(&mut self, db_name: &str, old_name: &str, new_name: &str) {
         if let Some(mut entry) = self.remove_connected(db_name, old_name) {
             entry.table_name = new_name.to_owned();
-            entry.declared.table_schema.name = new_name.to_owned();
+            Arc::make_mut(&mut entry.declared).table_schema.name = new_name.to_owned();
             self.insert_connected(entry);
+        }
+    }
+
+    /// Invalidates shadow-table caches across all currently available virtual table instances.
+    pub fn invalidate_all_shadow_caches(&mut self) {
+        for bucket in self.connected.values_mut() {
+            for entry in bucket.iter_mut() {
+                if let VTabInstanceState::Available(ref mut vt) = entry.state {
+                    vt.invalidate_shadow_cache();
+                }
+            }
         }
     }
 
     /// Disconnects all connected virtual tables belonging to `db_name` (e.g. on `DETACH` or schema reload).
     pub fn disconnect_schema(&mut self, db_name: &str) {
-        let db_lower = db_name.to_ascii_lowercase();
-        let keys: Vec<(String, String)> = self
-            .connected
-            .keys()
-            .filter(|(d, _)| d == &db_lower)
-            .cloned()
-            .collect();
-        for k in keys {
-            if let Some(mut entry) = self.connected.remove(&k)
-                && let VTabInstanceState::Available(ref mut vt) = entry.state
-            {
+        let mut removed_entries = Vec::new();
+        self.connected.retain(|_, bucket| {
+            let mut i = 0;
+            while i < bucket.len() {
+                if bucket[i].db_name.eq_ignore_ascii_case(db_name) {
+                    removed_entries.push(bucket.swap_remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            !bucket.is_empty()
+        });
+        for mut entry in removed_entries {
+            if let VTabInstanceState::Available(ref mut vt) = entry.state {
                 let _ = vt.disconnect();
             }
         }
@@ -339,13 +408,35 @@ impl VTabRegistry {
 
     /// Disconnects all connected virtual tables across all schemas (`sqlite3_close`).
     pub fn disconnect_all(&mut self) {
-        let keys: Vec<(String, String)> = self.connected.keys().cloned().collect();
-        for k in keys {
-            if let Some(mut entry) = self.connected.remove(&k)
-                && let VTabInstanceState::Available(ref mut vt) = entry.state
-            {
-                let _ = vt.disconnect();
+        let drained: Vec<Vec<ConnectedVTabEntry>> =
+            self.connected.drain().map(|(_, b)| b).collect();
+        for bucket in drained {
+            for mut entry in bucket {
+                if let VTabInstanceState::Available(ref mut vt) = entry.state {
+                    let _ = vt.disconnect();
+                }
             }
+        }
+    }
+
+    /// Checks out only the `Box<dyn VirtualTable>` from `(db_name, table_name)` with zero allocations,
+    /// marking the slot `Busy`.
+    #[inline]
+    pub fn checkout_vtab_instance(
+        &mut self,
+        db_name: &str,
+        table_name: &str,
+    ) -> Result<Box<dyn VirtualTable>> {
+        let entry = self.get_connected_mut(db_name, table_name).ok_or_else(|| {
+            SqliteError::new(ErrorCode::Error, format!("no such table: {table_name}"))
+        })?;
+        let prev = std::mem::replace(&mut entry.state, VTabInstanceState::Busy);
+        match prev {
+            VTabInstanceState::Available(vt) => Ok(vt),
+            VTabInstanceState::Busy => Err(SqliteError::new(
+                ErrorCode::Locked,
+                format!("virtual table \"{table_name}\" is locked"),
+            )),
         }
     }
 
@@ -355,15 +446,18 @@ impl VTabRegistry {
         &mut self,
         db_name: &str,
         table_name: &str,
-    ) -> Result<(Box<dyn VirtualTable>, VTabDeclaredSchema, VTabRiskFlags)> {
-        let key = Self::slot_key(db_name, table_name);
-        let entry = self.connected.get_mut(&key).ok_or_else(|| {
+    ) -> Result<(
+        Box<dyn VirtualTable>,
+        Arc<VTabDeclaredSchema>,
+        VTabRiskFlags,
+    )> {
+        let entry = self.get_connected_mut(db_name, table_name).ok_or_else(|| {
             SqliteError::new(ErrorCode::Error, format!("no such table: {table_name}"))
         })?;
         let prev = std::mem::replace(&mut entry.state, VTabInstanceState::Busy);
         match prev {
             VTabInstanceState::Available(vt) => {
-                let decl = entry.declared.clone();
+                let decl = Arc::clone(&entry.declared);
                 let risk = entry.effective_risk_flags();
                 Ok((vt, decl, risk))
             }
@@ -375,20 +469,48 @@ impl VTabRegistry {
     }
 
     /// Restores a previously checked-out `Box<dyn VirtualTable>` back into its slot.
+    #[inline]
     pub fn restore_vtab(&mut self, db_name: &str, table_name: &str, vt: Box<dyn VirtualTable>) {
-        let key = Self::slot_key(db_name, table_name);
-        if let Some(entry) = self.connected.get_mut(&key) {
+        if let Some(entry) = self.get_connected_mut(db_name, table_name) {
             entry.state = VTabInstanceState::Available(vt);
         }
+    }
+
+    /// Returns `true` if any connected virtual table is currently participating in a transaction (`in_tx`).
+    #[inline]
+    pub fn has_any_in_tx(&self) -> bool {
+        !self.connected.is_empty() && self.connected.values().flatten().any(|e| e.in_tx)
     }
 
     /// Returns all `(db_name, table_name)` keys currently marked `in_tx`.
     pub fn active_tx_vtabs(&self) -> Vec<(String, String)> {
         self.connected
             .values()
+            .flatten()
             .filter(|e| e.in_tx)
             .map(|e| (e.db_name.clone(), e.table_name.clone()))
             .collect()
+    }
+
+    /// Looks up a cached single-statement AST for internal `VTabHostContext` sub-SQL, or parses and
+    /// caches it when `sql` consists of a single statement with no trailing statements.
+    pub fn get_or_parse_single_sub_sql(&mut self, sql: &str) -> Result<CachedSubSql> {
+        if let Some(cached) = self.sub_sql_cache.get(sql) {
+            return Ok(CachedSubSql::Single(Arc::clone(cached)));
+        }
+        let (opt_stmt, tail) = parse_one(sql)?;
+        if !tail.trim().is_empty() {
+            return Ok(CachedSubSql::Multi);
+        }
+        let Some(stmt) = opt_stmt else {
+            return Ok(CachedSubSql::Empty);
+        };
+        let arc = Arc::new(stmt);
+        if self.sub_sql_cache.len() >= MAX_SUB_SQL_CACHE_ENTRIES {
+            self.sub_sql_cache.clear();
+        }
+        self.sub_sql_cache.insert(sql.to_owned(), Arc::clone(&arc));
+        Ok(CachedSubSql::Single(arc))
     }
 }
 
@@ -454,26 +576,23 @@ pub fn check_defensive_shadow_table_write(
 }
 
 /// Concrete [`VTabHostContext`] passed to virtual table callbacks with controlled internal sub-SQL access.
-pub struct CoreVTabHostContext<'a, 'b> {
+pub struct CoreVTabHostContext<'a, 'b, 'c> {
     pub ctx: &'a mut ExecContext<'b>,
-    pub db_name: String,
-    pub table_name: String,
+    pub db_name: &'c str,
+    pub table_name: &'c str,
     pub declared: Option<VTabDeclaredSchema>,
     pub config_risk_flags: Option<VTabRiskFlags>,
     pub constraint_support: bool,
     pub conflict_mode: VTabConflictMode,
 }
 
-impl<'a, 'b> CoreVTabHostContext<'a, 'b> {
-    pub fn new(
-        ctx: &'a mut ExecContext<'b>,
-        db_name: impl Into<String>,
-        table_name: impl Into<String>,
-    ) -> Self {
+impl<'a, 'b, 'c> CoreVTabHostContext<'a, 'b, 'c> {
+    #[inline]
+    pub fn new(ctx: &'a mut ExecContext<'b>, db_name: &'c str, table_name: &'c str) -> Self {
         Self {
             ctx,
-            db_name: db_name.into(),
-            table_name: table_name.into(),
+            db_name,
+            table_name,
             declared: None,
             config_risk_flags: None,
             constraint_support: false,
@@ -494,18 +613,18 @@ impl<'a, 'b> CoreVTabHostContext<'a, 'b> {
     }
 }
 
-impl VTabHostContext for CoreVTabHostContext<'_, '_> {
+impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
     fn db_name(&self) -> &str {
-        &self.db_name
+        self.db_name
     }
 
     fn table_name(&self) -> &str {
-        &self.table_name
+        self.table_name
     }
 
     fn declare_vtab(&mut self, create_table_sql: &str) -> Result<()> {
         let (table_schema, hidden_cols) =
-            parse_declare_vtab_sql(&self.table_name, create_table_sql)?;
+            parse_declare_vtab_sql(self.table_name, create_table_sql)?;
         self.declared = Some(VTabDeclaredSchema {
             table_schema,
             hidden_cols,
@@ -545,46 +664,95 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_> {
     fn query_sql(&mut self, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>> {
         crate::engine::query_internal_vtab_sql(self.ctx, sql, params)
     }
+
+    fn shadow_get_rowid(&mut self, shadow_table: &str, rowid: i64) -> Result<Option<Vec<Value>>> {
+        crate::engine::shadow_get_rowid_direct(self.ctx, self.db_name, shadow_table, rowid)
+    }
+
+    fn shadow_put_rowid(
+        &mut self,
+        shadow_table: &str,
+        rowid: i64,
+        cols: &[Value],
+        or_replace: bool,
+    ) -> Result<()> {
+        crate::engine::shadow_put_rowid_direct(
+            self.ctx,
+            self.db_name,
+            shadow_table,
+            rowid,
+            cols,
+            or_replace,
+        )
+    }
+
+    fn shadow_delete_rowid(&mut self, shadow_table: &str, rowid: i64) -> Result<bool> {
+        crate::engine::shadow_delete_rowid_direct(self.ctx, self.db_name, shadow_table, rowid)
+    }
+
+    fn shadow_rowid_blob_eq(
+        &mut self,
+        shadow_table: &str,
+        rowid: i64,
+        col_idx: usize,
+        expected: &[u8],
+    ) -> Result<Option<bool>> {
+        crate::engine::shadow_rowid_blob_eq_direct(
+            self.ctx,
+            self.db_name,
+            shadow_table,
+            rowid,
+            col_idx,
+            expected,
+        )
+    }
+
+    fn shadow_max_rowid(&mut self, shadow_table: &str) -> Result<Option<i64>> {
+        crate::engine::shadow_max_rowid_direct(self.ctx, self.db_name, shadow_table)
+    }
 }
 
 /// Ensures that a persistent virtual table `(db_id, vt_def)` or an eponymous module is connected
 /// in `ctx.db_set.vtab_registry`, returning its [`VTabDeclaredSchema`] and effective [`VTabRiskFlags`].
+#[allow(clippy::type_complexity)]
 pub fn ensure_vtab_connected(
     ctx: &mut ExecContext<'_>,
     db_id: DatabaseId,
     table_name: &str,
     allow_eponymous: bool,
-) -> Result<Option<(String, String, VTabDeclaredSchema, VTabRiskFlags)>> {
+) -> Result<Option<(String, String, Arc<VTabDeclaredSchema>, VTabRiskFlags)>> {
+    // 1. Zero-alloc check if already connected in `(db_name, table_name)`
+    {
+        let db_name_ref = ctx
+            .db_set
+            .slot(db_id)
+            .map(|s| s.name.as_str())
+            .unwrap_or("main");
+        if let Some(entry) = ctx
+            .db_set
+            .vtab_registry()
+            .get_connected(db_name_ref, table_name)
+        {
+            let still_in_schema = ctx
+                .db_set
+                .slot(db_id)
+                .is_some_and(|s| s.schema.find_virtual_table(table_name).is_some());
+            if still_in_schema || (allow_eponymous && entry.is_eponymous) {
+                return Ok(Some((
+                    entry.db_name.clone(),
+                    entry.table_name.clone(),
+                    Arc::clone(&entry.declared),
+                    entry.effective_risk_flags(),
+                )));
+            }
+        }
+    }
+
     let db_name = ctx
         .db_set
         .slot(db_id)
         .map(|s| s.name.clone())
         .unwrap_or_else(|| "main".to_owned());
-
-    // 1. Check if already connected in `(db_name, table_name)`
-    if let Some(entry) = ctx
-        .db_set
-        .vtab_registry()
-        .get_connected(&db_name, table_name)
-    {
-        let still_in_schema = ctx
-            .db_set
-            .slot(db_id)
-            .is_some_and(|s| s.schema.find_virtual_table(table_name).is_some());
-        let is_eponymous = ctx
-            .db_set
-            .vtab_registry()
-            .get_module(&entry.module_name)
-            .is_some_and(|m| m.is_eponymous());
-        if still_in_schema || (allow_eponymous && is_eponymous) {
-            return Ok(Some((
-                entry.db_name.clone(),
-                entry.table_name.clone(),
-                entry.declared.clone(),
-                entry.effective_risk_flags(),
-            )));
-        }
-    }
 
     // 2. Check if `(db_id, table_name)` is a persistent `VirtualTableDef` in `slot.schema`
     let vt_def_opt = ctx
@@ -603,11 +771,14 @@ pub fn ensure_vtab_connected(
                     format!("no such module: {}", vt_def.module_name),
                 )
             })?;
-        let mut host_ctx = CoreVTabHostContext::new(ctx, db_name.clone(), vt_def.name.clone());
-        let vt_box = catch_callback_panic("vtab xConnect", || {
-            module.connect(&mut host_ctx, &vt_def.args)
-        })?;
-        let declared = host_ctx.take_declared_schema()?;
+        let (vt_box, declared) = {
+            let mut host_ctx = CoreVTabHostContext::new(ctx, &db_name, &vt_def.name);
+            let vt_box = catch_callback_panic("vtab xConnect", || {
+                module.connect(&mut host_ctx, &vt_def.args)
+            })?;
+            let declared = Arc::new(host_ctx.take_declared_schema()?);
+            (vt_box, declared)
+        };
         let effective_risk = declared
             .config_risk_flags
             .unwrap_or_else(|| module.risk_flags());
@@ -621,8 +792,10 @@ pub fn ensure_vtab_connected(
             table_name: vt_def.name.clone(),
             module_name: vt_def.module_name.clone(),
             module_risk_flags: module.risk_flags(),
+            is_eponymous: module.is_eponymous(),
+            is_eponymous_only: module.is_eponymous_only(),
             shadow_suffixes,
-            declared: declared.clone(),
+            declared: Arc::clone(&declared),
             state: VTabInstanceState::Available(vt_box),
             in_tx: false,
         };
@@ -639,10 +812,13 @@ pub fn ensure_vtab_connected(
             .filter(|m| m.is_eponymous());
         if let Some(module) = module_opt {
             let mod_name = module.name().to_owned();
-            let mut host_ctx = CoreVTabHostContext::new(ctx, db_name.clone(), mod_name.clone());
-            let vt_box =
-                catch_callback_panic("vtab xConnect", || module.connect(&mut host_ctx, &[]))?;
-            let declared = host_ctx.take_declared_schema()?;
+            let (vt_box, declared) = {
+                let mut host_ctx = CoreVTabHostContext::new(ctx, &db_name, &mod_name);
+                let vt_box =
+                    catch_callback_panic("vtab xConnect", || module.connect(&mut host_ctx, &[]))?;
+                let declared = Arc::new(host_ctx.take_declared_schema()?);
+                (vt_box, declared)
+            };
             let effective_risk = declared
                 .config_risk_flags
                 .unwrap_or_else(|| module.risk_flags());
@@ -656,8 +832,10 @@ pub fn ensure_vtab_connected(
                 table_name: mod_name.clone(),
                 module_name: mod_name.clone(),
                 module_risk_flags: module.risk_flags(),
+                is_eponymous: module.is_eponymous(),
+                is_eponymous_only: module.is_eponymous_only(),
                 shadow_suffixes,
-                declared: declared.clone(),
+                declared: Arc::clone(&declared),
                 state: VTabInstanceState::Available(vt_box),
                 in_tx: false,
             };
@@ -669,20 +847,250 @@ pub fn ensure_vtab_connected(
     Ok(None)
 }
 
+/// Returns `true` if `expr` could contain a subquery or `IN <table>` that might reference a virtual table.
+fn expr_may_reference_relation(expr: &Expr) -> bool {
+    match expr {
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Integer(_)
+        | Expr::Float(_)
+        | Expr::String(_)
+        | Expr::Blob(_)
+        | Expr::OversizedHex(_)
+        | Expr::CurrentTimeKw(_)
+        | Expr::Bind(_)
+        | Expr::Column(_)
+        | Expr::Raise { .. } => false,
+        Expr::InSubquery { .. }
+        | Expr::InTable { .. }
+        | Expr::Subquery(_)
+        | Expr::Exists { .. } => true,
+        Expr::Unary { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => expr_may_reference_relation(inner),
+        Expr::Binary { left, right, .. } => {
+            expr_may_reference_relation(left) || expr_may_reference_relation(right)
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            expr_may_reference_relation(e)
+                || expr_may_reference_relation(low)
+                || expr_may_reference_relation(high)
+        }
+        Expr::InList { expr: e, list, .. } => {
+            expr_may_reference_relation(e) || list.iter().any(expr_may_reference_relation)
+        }
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_may_reference_relation(e)
+                || expr_may_reference_relation(pattern)
+                || escape.as_deref().is_some_and(expr_may_reference_relation)
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand.as_deref().is_some_and(expr_may_reference_relation)
+                || branches
+                    .iter()
+                    .any(|(w, t)| expr_may_reference_relation(w) || expr_may_reference_relation(t))
+                || else_expr
+                    .as_deref()
+                    .is_some_and(expr_may_reference_relation)
+        }
+        Expr::RowValue(elems) => elems.iter().any(expr_may_reference_relation),
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
+            let args_ref = match args {
+                FunctionArgs::Exprs(es) => es.iter().any(expr_may_reference_relation),
+                _ => false,
+            };
+            args_ref
+                || filter.as_deref().is_some_and(expr_may_reference_relation)
+                || match over {
+                    Some(WindowRef::Spec(ws)) => {
+                        ws.partition_by.iter().any(expr_may_reference_relation)
+                            || ws
+                                .order_by
+                                .iter()
+                                .any(|ob| expr_may_reference_relation(&ob.expr))
+                    }
+                    _ => false,
+                }
+        }
+    }
+}
+
 /// Lazily connects any persistent virtual tables or eponymous modules referenced by `stmt`
 /// (including through views and triggers) and enforces [`VTabRiskFlags`] (`trusted_schema`,
 /// `DirectOnly`, `Innocuous`).
 pub fn ensure_stmt_vtabs_connected(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Result<()> {
-    let mut visited_views = HashSet::new();
-    ensure_stmt_vtabs_connected_inner(ctx, stmt, &HashSet::new(), false, &mut visited_views)
+    // Ultra-fast zero-alloc path for ordinary-table and already-connected virtual-table DML / single-table SELECT
+    // with no triggers and no subqueries in expressions.
+    match stmt {
+        Stmt::Insert(ins)
+            if ins.ctes.is_empty()
+                && ins.upsert_clauses.is_empty()
+                && ins.returning.is_empty()
+                && !ctx.db_set.has_any_triggers() =>
+        {
+            let simple_source = match &ins.source {
+                InsertSource::DefaultValues => true,
+                InsertSource::Values(rows) => rows
+                    .iter()
+                    .all(|r| !r.iter().any(expr_may_reference_relation)),
+                InsertSource::Select(_) => false,
+            };
+            if simple_source {
+                match ctx.db_set.find_relation_ref_in_set(&ins.table) {
+                    Ok(Some((db_id, RelationRef::Table(tbl)))) => {
+                        if ctx.db_set.vtab_registry().internal_sql_depth == 0
+                            && ctx.db_set.is_shadow_table_metadata(db_id, &tbl.name)
+                        {
+                            vtab_on_user_shadow_access(ctx)?;
+                        }
+                        return Ok(());
+                    }
+                    Ok(None) => {
+                        if let Some((_db_id, _db_name, entry)) =
+                            ctx.db_set.find_connected_vtab_entry_in_set(&ins.table, true)
+                            && !entry.module_name.eq_ignore_ascii_case("fts5vocab")
+                            && !entry.module_name.eq_ignore_ascii_case("dbstat")
+                        {
+                            return Ok(());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Stmt::Select(sel)
+            if sel.ctes.is_empty()
+                && sel.body.compounds.is_empty()
+                && !sel
+                    .order_by
+                    .iter()
+                    .any(|ob| expr_may_reference_relation(&ob.expr))
+                && sel.limit.as_ref().is_none_or(|l| {
+                    !expr_may_reference_relation(&l.limit)
+                        && !l
+                            .offset
+                            .as_ref()
+                            .is_some_and(expr_may_reference_relation)
+                }) =>
+        {
+            if let SelectCore::Select {
+                projection,
+                from: Some(fc),
+                selection,
+                group_by,
+                having,
+                windows,
+                ..
+            } = &sel.body.head
+                && fc.joins.is_empty()
+                && windows.is_empty()
+                && let TableOrSubquery::Table {
+                    name, table_args, ..
+                } = &fc.head
+                && table_args
+                    .as_ref()
+                    .is_none_or(|a| !a.iter().any(expr_may_reference_relation))
+                && !projection.iter().any(|rc| {
+                    matches!(rc, ResultColumn::Expr { expr, .. } if expr_may_reference_relation(expr))
+                })
+                && !selection.as_ref().is_some_and(expr_may_reference_relation)
+                && !group_by.iter().any(expr_may_reference_relation)
+                && !having.as_ref().is_some_and(expr_may_reference_relation)
+            {
+                match ctx.db_set.find_relation_ref_in_set(name) {
+                    Ok(Some((db_id, RelationRef::Table(tbl)))) if table_args.is_none() => {
+                        if ctx.db_set.vtab_registry().internal_sql_depth == 0
+                            && ctx.db_set.is_shadow_table_metadata(db_id, &tbl.name)
+                        {
+                            vtab_on_user_shadow_access(ctx)?;
+                        }
+                        return Ok(());
+                    }
+                    Ok(None) => {
+                        if let Some((_db_id, _db_name, entry)) =
+                            ctx.db_set.find_connected_vtab_entry_in_set(name, true)
+                            && !entry.module_name.eq_ignore_ascii_case("fts5vocab")
+                            && !entry.module_name.eq_ignore_ascii_case("dbstat")
+                        {
+                            return Ok(());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Stmt::Update(upd)
+            if upd.ctes.is_empty()
+                && upd.from.is_none()
+                && upd.returning.is_empty()
+                && !ctx.db_set.has_any_triggers()
+                && !upd
+                    .assignments
+                    .iter()
+                    .any(|a| expr_may_reference_relation(&a.expr))
+                && !upd
+                    .selection
+                    .as_ref()
+                    .is_some_and(expr_may_reference_relation) =>
+        {
+            if let Ok(Some((db_id, RelationRef::Table(tbl)))) =
+                ctx.db_set.find_relation_ref_in_set(&upd.table)
+            {
+                if ctx.db_set.vtab_registry().internal_sql_depth == 0
+                    && ctx.db_set.is_shadow_table_metadata(db_id, &tbl.name)
+                {
+                    vtab_on_user_shadow_access(ctx)?;
+                }
+                return Ok(());
+            }
+        }
+        Stmt::Delete(del)
+            if del.ctes.is_empty()
+                && del.returning.is_empty()
+                && !ctx.db_set.has_any_triggers()
+                && !del
+                    .selection
+                    .as_ref()
+                    .is_some_and(expr_may_reference_relation) =>
+        {
+            if let Ok(Some((db_id, RelationRef::Table(tbl)))) =
+                ctx.db_set.find_relation_ref_in_set(&del.table)
+            {
+                if ctx.db_set.vtab_registry().internal_sql_depth == 0
+                    && ctx.db_set.is_shadow_table_metadata(db_id, &tbl.name)
+                {
+                    vtab_on_user_shadow_access(ctx)?;
+                }
+                return Ok(());
+            }
+        }
+        _ => {}
+    }
+
+    let mut visited_views = Vec::new();
+    ensure_stmt_vtabs_connected_inner(ctx, stmt, &[], false, &mut visited_views)
 }
 
 fn ensure_stmt_vtabs_connected_inner(
     ctx: &mut ExecContext<'_>,
     stmt: &Stmt,
-    cte_names: &HashSet<String>,
+    cte_names: &[String],
     in_view_or_trigger: bool,
-    visited_views: &mut HashSet<(DatabaseId, String)>,
+    visited_views: &mut Vec<(DatabaseId, String)>,
 ) -> Result<()> {
     match stmt {
         Stmt::Explain { stmt: inner, .. } => ensure_stmt_vtabs_connected_inner(
@@ -699,21 +1107,28 @@ fn ensure_stmt_vtabs_connected_inner(
             ensure_select_vtabs_connected(ctx, query, cte_names, in_view_or_trigger, visited_views)
         }
         Stmt::Insert(ins) => {
-            let mut local_ctes = cte_names.clone();
-            for cte in &ins.ctes {
-                local_ctes.insert(cte.name.to_ascii_lowercase());
-                ensure_select_vtabs_connected(
-                    ctx,
-                    &cte.query,
-                    &local_ctes,
-                    in_view_or_trigger,
-                    visited_views,
-                )?;
-            }
+            let mut local_ctes_buf: Vec<String>;
+            let active_ctes: &[String] = if ins.ctes.is_empty() {
+                cte_names
+            } else {
+                local_ctes_buf = Vec::with_capacity(cte_names.len() + ins.ctes.len());
+                local_ctes_buf.extend_from_slice(cte_names);
+                for cte in &ins.ctes {
+                    local_ctes_buf.push(cte.name.to_ascii_lowercase());
+                    ensure_select_vtabs_connected(
+                        ctx,
+                        &cte.query,
+                        &local_ctes_buf,
+                        in_view_or_trigger,
+                        visited_views,
+                    )?;
+                }
+                &local_ctes_buf
+            };
             ensure_qname_vtab_connected(
                 ctx,
                 &ins.table,
-                &local_ctes,
+                active_ctes,
                 true,
                 in_view_or_trigger,
                 visited_views,
@@ -722,7 +1137,7 @@ fn ensure_stmt_vtabs_connected_inner(
                 InsertSource::Select(sel) => ensure_select_vtabs_connected(
                     ctx,
                     sel,
-                    &local_ctes,
+                    active_ctes,
                     in_view_or_trigger,
                     visited_views,
                 )?,
@@ -732,7 +1147,7 @@ fn ensure_stmt_vtabs_connected_inner(
                             ensure_expr_vtabs_connected(
                                 ctx,
                                 e,
-                                &local_ctes,
+                                active_ctes,
                                 in_view_or_trigger,
                                 visited_views,
                             )?;
@@ -748,7 +1163,7 @@ fn ensure_stmt_vtabs_connected_inner(
                     ensure_expr_vtabs_connected(
                         ctx,
                         w,
-                        &local_ctes,
+                        active_ctes,
                         in_view_or_trigger,
                         visited_views,
                     )?;
@@ -762,7 +1177,7 @@ fn ensure_stmt_vtabs_connected_inner(
                         ensure_expr_vtabs_connected(
                             ctx,
                             &a.expr,
-                            &local_ctes,
+                            active_ctes,
                             in_view_or_trigger,
                             visited_views,
                         )?;
@@ -771,7 +1186,7 @@ fn ensure_stmt_vtabs_connected_inner(
                         ensure_expr_vtabs_connected(
                             ctx,
                             w,
-                            &local_ctes,
+                            active_ctes,
                             in_view_or_trigger,
                             visited_views,
                         )?;
@@ -783,7 +1198,7 @@ fn ensure_stmt_vtabs_connected_inner(
                     ensure_expr_vtabs_connected(
                         ctx,
                         expr,
-                        &local_ctes,
+                        active_ctes,
                         in_view_or_trigger,
                         visited_views,
                     )?;
@@ -798,21 +1213,28 @@ fn ensure_stmt_vtabs_connected_inner(
             Ok(())
         }
         Stmt::Update(upd) => {
-            let mut local_ctes = cte_names.clone();
-            for cte in &upd.ctes {
-                local_ctes.insert(cte.name.to_ascii_lowercase());
-                ensure_select_vtabs_connected(
-                    ctx,
-                    &cte.query,
-                    &local_ctes,
-                    in_view_or_trigger,
-                    visited_views,
-                )?;
-            }
+            let mut local_ctes_buf: Vec<String>;
+            let active_ctes: &[String] = if upd.ctes.is_empty() {
+                cte_names
+            } else {
+                local_ctes_buf = Vec::with_capacity(cte_names.len() + upd.ctes.len());
+                local_ctes_buf.extend_from_slice(cte_names);
+                for cte in &upd.ctes {
+                    local_ctes_buf.push(cte.name.to_ascii_lowercase());
+                    ensure_select_vtabs_connected(
+                        ctx,
+                        &cte.query,
+                        &local_ctes_buf,
+                        in_view_or_trigger,
+                        visited_views,
+                    )?;
+                }
+                &local_ctes_buf
+            };
             ensure_qname_vtab_connected(
                 ctx,
                 &upd.table,
-                &local_ctes,
+                active_ctes,
                 true,
                 in_view_or_trigger,
                 visited_views,
@@ -821,7 +1243,7 @@ fn ensure_stmt_vtabs_connected_inner(
                 ensure_expr_vtabs_connected(
                     ctx,
                     &a.expr,
-                    &local_ctes,
+                    active_ctes,
                     in_view_or_trigger,
                     visited_views,
                 )?;
@@ -830,7 +1252,7 @@ fn ensure_stmt_vtabs_connected_inner(
                 ensure_from_vtabs_connected(
                     ctx,
                     from,
-                    &local_ctes,
+                    active_ctes,
                     in_view_or_trigger,
                     visited_views,
                 )?;
@@ -839,7 +1261,7 @@ fn ensure_stmt_vtabs_connected_inner(
                 ensure_expr_vtabs_connected(
                     ctx,
                     w,
-                    &local_ctes,
+                    active_ctes,
                     in_view_or_trigger,
                     visited_views,
                 )?;
@@ -849,7 +1271,7 @@ fn ensure_stmt_vtabs_connected_inner(
                     ensure_expr_vtabs_connected(
                         ctx,
                         expr,
-                        &local_ctes,
+                        active_ctes,
                         in_view_or_trigger,
                         visited_views,
                     )?;
@@ -864,21 +1286,28 @@ fn ensure_stmt_vtabs_connected_inner(
             Ok(())
         }
         Stmt::Delete(del) => {
-            let mut local_ctes = cte_names.clone();
-            for cte in &del.ctes {
-                local_ctes.insert(cte.name.to_ascii_lowercase());
-                ensure_select_vtabs_connected(
-                    ctx,
-                    &cte.query,
-                    &local_ctes,
-                    in_view_or_trigger,
-                    visited_views,
-                )?;
-            }
+            let mut local_ctes_buf: Vec<String>;
+            let active_ctes: &[String] = if del.ctes.is_empty() {
+                cte_names
+            } else {
+                local_ctes_buf = Vec::with_capacity(cte_names.len() + del.ctes.len());
+                local_ctes_buf.extend_from_slice(cte_names);
+                for cte in &del.ctes {
+                    local_ctes_buf.push(cte.name.to_ascii_lowercase());
+                    ensure_select_vtabs_connected(
+                        ctx,
+                        &cte.query,
+                        &local_ctes_buf,
+                        in_view_or_trigger,
+                        visited_views,
+                    )?;
+                }
+                &local_ctes_buf
+            };
             ensure_qname_vtab_connected(
                 ctx,
                 &del.table,
-                &local_ctes,
+                active_ctes,
                 true,
                 in_view_or_trigger,
                 visited_views,
@@ -887,7 +1316,7 @@ fn ensure_stmt_vtabs_connected_inner(
                 ensure_expr_vtabs_connected(
                     ctx,
                     w,
-                    &local_ctes,
+                    active_ctes,
                     in_view_or_trigger,
                     visited_views,
                 )?;
@@ -897,7 +1326,7 @@ fn ensure_stmt_vtabs_connected_inner(
                     ensure_expr_vtabs_connected(
                         ctx,
                         expr,
-                        &local_ctes,
+                        active_ctes,
                         in_view_or_trigger,
                         visited_views,
                     )?;
@@ -912,22 +1341,22 @@ fn ensure_stmt_vtabs_connected_inner(
             Ok(())
         }
         Stmt::DropTable { name, .. } => {
-            if let Some((db_id, vt)) = ctx
+            if let Some((db_id, vt_name)) = ctx
                 .db_set
                 .find_virtual_table_in_set(name)
-                .map(|(id, v)| (id, v.clone()))
+                .map(|(id, v)| (id, v.name.clone()))
             {
-                let _ = ensure_vtab_connected(ctx, db_id, &vt.name, false)?;
+                let _ = ensure_vtab_connected(ctx, db_id, &vt_name, false)?;
             }
             Ok(())
         }
         Stmt::AlterTable { table, .. } => {
-            if let Some((db_id, vt)) = ctx
+            if let Some((db_id, vt_name)) = ctx
                 .db_set
                 .find_virtual_table_in_set(table)
-                .map(|(id, v)| (id, v.clone()))
+                .map(|(id, v)| (id, v.name.clone()))
             {
-                let _ = ensure_vtab_connected(ctx, db_id, &vt.name, false)?;
+                let _ = ensure_vtab_connected(ctx, db_id, &vt_name, false)?;
             }
             Ok(())
         }
@@ -936,10 +1365,7 @@ fn ensure_stmt_vtabs_connected_inner(
             name,
             value: Some(pv),
         } => {
-            if matches!(
-                name.to_ascii_uppercase().as_str(),
-                "TABLE_INFO" | "TABLE_XINFO"
-            ) {
+            if name.eq_ignore_ascii_case("table_info") || name.eq_ignore_ascii_case("table_xinfo") {
                 let tname = match pv {
                     PragmaValue::Ident(s) | PragmaValue::String(s) => s.clone(),
                     PragmaValue::Integer(n) => n.to_string(),
@@ -967,14 +1393,18 @@ fn ensure_dml_triggers_vtabs_connected(
     ctx: &mut ExecContext<'_>,
     target: &QualifiedName,
     event: TriggerEventKind,
-    visited_views: &mut HashSet<(DatabaseId, String)>,
+    visited_views: &mut Vec<(DatabaseId, String)>,
 ) -> Result<()> {
-    let Ok(Some((db_id, rel))) = ctx.db_set.find_relation_in_set(target) else {
+    if !ctx.db_set.has_any_triggers() {
+        return Ok(());
+    }
+    let Ok(Some((db_id, rel))) = ctx.db_set.find_relation_ref_in_set(target) else {
         return Ok(());
     };
-    let rel_name = match &rel {
-        ResolvedRelation::Table(t) => t.name.clone(),
-        ResolvedRelation::View(v) => v.name.clone(),
+    let rel_name = match rel {
+        RelationRef::CatalogTable => return Ok(()),
+        RelationRef::Table(t) => t.name.clone(),
+        RelationRef::View(v) => v.name.clone(),
     };
     let triggers = ctx.db_set.triggers_for_relation(db_id, &rel_name);
     for (trig_db_id, tr) in triggers {
@@ -985,11 +1415,12 @@ fn ensure_dml_triggers_vtabs_connected(
             trig_db_id,
             format!("__trigger__:{}", tr.name.to_ascii_lowercase()),
         );
-        if !visited_views.insert(trig_visit_key) {
+        if visited_views.contains(&trig_visit_key) {
             continue;
         }
+        visited_views.push(trig_visit_key);
         if let Some(ref w) = tr.when_clause {
-            ensure_expr_vtabs_connected(ctx, w, &HashSet::new(), true, visited_views)?;
+            ensure_expr_vtabs_connected(ctx, w, &[], true, visited_views)?;
         }
         for step in &tr.body {
             let step_stmt = match step {
@@ -998,13 +1429,7 @@ fn ensure_dml_triggers_vtabs_connected(
                 TriggerStep::Update(u) => Stmt::Update(u.clone()),
                 TriggerStep::Delete(d) => Stmt::Delete(d.clone()),
             };
-            ensure_stmt_vtabs_connected_inner(
-                ctx,
-                &step_stmt,
-                &HashSet::new(),
-                true,
-                visited_views,
-            )?;
+            ensure_stmt_vtabs_connected_inner(ctx, &step_stmt, &[], true, visited_views)?;
         }
     }
     Ok(())
@@ -1013,40 +1438,62 @@ fn ensure_dml_triggers_vtabs_connected(
 fn ensure_qname_vtab_connected(
     ctx: &mut ExecContext<'_>,
     qname: &QualifiedName,
-    cte_names: &HashSet<String>,
+    cte_names: &[String],
     allow_eponymous: bool,
     in_view_or_trigger: bool,
-    visited_views: &mut HashSet<(DatabaseId, String)>,
+    visited_views: &mut Vec<(DatabaseId, String)>,
 ) -> Result<()> {
-    if qname.schema.is_none() && cte_names.contains(&qname.name.to_ascii_lowercase()) {
+    if qname.schema.is_none()
+        && !cte_names.is_empty()
+        && cte_names
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&qname.name))
+    {
         return Ok(());
     }
-    if let Ok(Some((db_id, rel))) = ctx.db_set.find_relation_in_set(qname) {
-        if let ResolvedRelation::View(v) = rel {
-            let v_select = v.select.clone();
-            let v_key = (db_id, v.name.to_ascii_lowercase());
-            if visited_views.insert(v_key.clone()) {
-                let res = ensure_select_vtabs_connected(
-                    ctx,
-                    &v_select,
-                    &HashSet::new(),
-                    true,
-                    visited_views,
-                );
-                visited_views.remove(&v_key);
-                res?;
+    if let Ok(Some((db_id, rel))) = ctx.db_set.find_relation_ref_in_set(qname) {
+        match rel {
+            RelationRef::CatalogTable => return Ok(()),
+            RelationRef::Table(tbl) => {
+                if ctx.db_set.vtab_registry().internal_sql_depth == 0
+                    && ctx.db_set.is_shadow_table_metadata(db_id, &tbl.name)
+                {
+                    vtab_on_user_shadow_access(ctx)?;
+                }
+                return Ok(());
+            }
+            RelationRef::View(v) => {
+                let v_key = (db_id, v.name.to_ascii_lowercase());
+                if !visited_views.contains(&v_key) {
+                    let v_select = v.select.clone();
+                    visited_views.push(v_key.clone());
+                    let res =
+                        ensure_select_vtabs_connected(ctx, &v_select, &[], true, visited_views);
+                    if let Some(pos) = visited_views.iter().rposition(|k| k == &v_key) {
+                        visited_views.remove(pos);
+                    }
+                    res?;
+                }
+                return Ok(());
             }
         }
-        return Ok(());
     }
-    if let Some((db_id, vt)) = ctx
+    if let Some((db_id, vt_name, vt_mod)) = ctx
         .db_set
         .find_virtual_table_in_set(qname)
-        .map(|(id, v)| (id, v.clone()))
+        .map(|(id, v)| (id, v.name.clone(), v.module_name.clone()))
     {
-        if let Some((_, vt_name, _, risk)) = ensure_vtab_connected(ctx, db_id, &vt.name, false)? {
+        if ctx.db_set.vtab_registry().internal_sql_depth == 0
+            && ctx.db_set.vtab_registry().has_any_in_tx()
+            && (vt_mod.eq_ignore_ascii_case("fts5vocab") || vt_mod.eq_ignore_ascii_case("dbstat"))
+        {
+            vtab_flush_shadow_all(ctx)?;
+        }
+        if let Some((_, connected_name, _, risk)) =
+            ensure_vtab_connected(ctx, db_id, &vt_name, false)?
+        {
             check_vtab_risk(
-                &vt_name,
+                &connected_name,
                 risk,
                 ctx.db_set.vtab_registry().trusted_schema,
                 in_view_or_trigger,
@@ -1055,6 +1502,12 @@ fn ensure_qname_vtab_connected(
         return Ok(());
     }
     if allow_eponymous {
+        if ctx.db_set.vtab_registry().internal_sql_depth == 0
+            && ctx.db_set.vtab_registry().has_any_in_tx()
+            && qname.name.eq_ignore_ascii_case("dbstat")
+        {
+            vtab_flush_shadow_all(ctx)?;
+        }
         let db_id = match &qname.schema {
             Some(s) => match ctx.db_set.resolve_schema_or_err(Some(s)) {
                 Ok(id) => id,
@@ -1078,25 +1531,32 @@ fn ensure_qname_vtab_connected(
 fn ensure_select_vtabs_connected(
     ctx: &mut ExecContext<'_>,
     sel: &SelectStmt,
-    cte_names: &HashSet<String>,
+    cte_names: &[String],
     in_view_or_trigger: bool,
-    visited_views: &mut HashSet<(DatabaseId, String)>,
+    visited_views: &mut Vec<(DatabaseId, String)>,
 ) -> Result<()> {
-    let mut local_ctes = cte_names.clone();
-    for cte in &sel.ctes {
-        local_ctes.insert(cte.name.to_ascii_lowercase());
-        ensure_select_vtabs_connected(
-            ctx,
-            &cte.query,
-            &local_ctes,
-            in_view_or_trigger,
-            visited_views,
-        )?;
-    }
+    let mut local_ctes_buf: Vec<String>;
+    let active_ctes: &[String] = if sel.ctes.is_empty() {
+        cte_names
+    } else {
+        local_ctes_buf = Vec::with_capacity(cte_names.len() + sel.ctes.len());
+        local_ctes_buf.extend_from_slice(cte_names);
+        for cte in &sel.ctes {
+            local_ctes_buf.push(cte.name.to_ascii_lowercase());
+            ensure_select_vtabs_connected(
+                ctx,
+                &cte.query,
+                &local_ctes_buf,
+                in_view_or_trigger,
+                visited_views,
+            )?;
+        }
+        &local_ctes_buf
+    };
     ensure_select_core_vtabs_connected(
         ctx,
         &sel.body.head,
-        &local_ctes,
+        active_ctes,
         in_view_or_trigger,
         visited_views,
     )?;
@@ -1104,7 +1564,7 @@ fn ensure_select_vtabs_connected(
         ensure_select_core_vtabs_connected(
             ctx,
             right,
-            &local_ctes,
+            active_ctes,
             in_view_or_trigger,
             visited_views,
         )?;
@@ -1113,7 +1573,7 @@ fn ensure_select_vtabs_connected(
         ensure_expr_vtabs_connected(
             ctx,
             &ob.expr,
-            &local_ctes,
+            active_ctes,
             in_view_or_trigger,
             visited_views,
         )?;
@@ -1122,12 +1582,12 @@ fn ensure_select_vtabs_connected(
         ensure_expr_vtabs_connected(
             ctx,
             &lim.limit,
-            &local_ctes,
+            active_ctes,
             in_view_or_trigger,
             visited_views,
         )?;
         if let Some(ref off) = lim.offset {
-            ensure_expr_vtabs_connected(ctx, off, &local_ctes, in_view_or_trigger, visited_views)?;
+            ensure_expr_vtabs_connected(ctx, off, active_ctes, in_view_or_trigger, visited_views)?;
         }
     }
     Ok(())
@@ -1136,9 +1596,9 @@ fn ensure_select_vtabs_connected(
 fn ensure_select_core_vtabs_connected(
     ctx: &mut ExecContext<'_>,
     core: &SelectCore,
-    cte_names: &HashSet<String>,
+    cte_names: &[String],
     in_view_or_trigger: bool,
-    visited_views: &mut HashSet<(DatabaseId, String)>,
+    visited_views: &mut Vec<(DatabaseId, String)>,
 ) -> Result<()> {
     match core {
         SelectCore::Select {
@@ -1215,9 +1675,9 @@ fn ensure_select_core_vtabs_connected(
 fn ensure_from_vtabs_connected(
     ctx: &mut ExecContext<'_>,
     from: &FromClause,
-    cte_names: &HashSet<String>,
+    cte_names: &[String],
     in_view_or_trigger: bool,
-    visited_views: &mut HashSet<(DatabaseId, String)>,
+    visited_views: &mut Vec<(DatabaseId, String)>,
 ) -> Result<()> {
     ensure_tos_vtabs_connected(
         ctx,
@@ -1250,9 +1710,9 @@ fn ensure_from_vtabs_connected(
 fn ensure_tos_vtabs_connected(
     ctx: &mut ExecContext<'_>,
     tos: &TableOrSubquery,
-    cte_names: &HashSet<String>,
+    cte_names: &[String],
     in_view_or_trigger: bool,
-    visited_views: &mut HashSet<(DatabaseId, String)>,
+    visited_views: &mut Vec<(DatabaseId, String)>,
 ) -> Result<()> {
     match tos {
         TableOrSubquery::Table {
@@ -1308,10 +1768,13 @@ fn ensure_tos_vtabs_connected(
 fn ensure_expr_vtabs_connected(
     ctx: &mut ExecContext<'_>,
     expr: &Expr,
-    cte_names: &HashSet<String>,
+    cte_names: &[String],
     in_view_or_trigger: bool,
-    visited_views: &mut HashSet<(DatabaseId, String)>,
+    visited_views: &mut Vec<(DatabaseId, String)>,
 ) -> Result<()> {
+    if !expr_may_reference_relation(expr) {
+        return Ok(());
+    }
     match expr {
         Expr::Null
         | Expr::Bool(_)
@@ -1477,6 +1940,7 @@ fn ensure_expr_vtabs_connected(
 }
 
 /// Ensures `VirtualTable::begin` has been called on `(db_name, table_name)` prior to `update`.
+#[inline]
 pub fn vtab_begin_if_needed(
     ctx: &mut ExecContext<'_>,
     db_name: &str,
@@ -1491,20 +1955,24 @@ pub fn vtab_begin_if_needed(
         return Ok(());
     }
     let active_sp_depth = ctx.savepoints.len() + usize::from(ctx.stmt_tx.stmt_sp_slot.is_some());
-    let (mut vt, _, _) = ctx
+    let mut vt = ctx
         .db_set
         .vtab_registry_mut()
-        .checkout_vtab(db_name, table_name)?;
-    let mut host_ctx = CoreVTabHostContext::new(ctx, db_name, table_name);
-    let mut res = catch_callback_panic("vtab xBegin", || vt.begin(&mut host_ctx));
-    if res.is_ok() {
-        for sp_idx in 0..active_sp_depth {
-            res = catch_callback_panic("vtab xSavepoint", || vt.savepoint(&mut host_ctx, sp_idx));
-            if res.is_err() {
-                break;
+        .checkout_vtab_instance(db_name, table_name)?;
+    let res = {
+        let mut host_ctx = CoreVTabHostContext::new(ctx, db_name, table_name);
+        let mut res = catch_callback_panic("vtab xBegin", || vt.begin(&mut host_ctx));
+        if res.is_ok() {
+            for sp_idx in 0..active_sp_depth {
+                res =
+                    catch_callback_panic("vtab xSavepoint", || vt.savepoint(&mut host_ctx, sp_idx));
+                if res.is_err() {
+                    break;
+                }
             }
         }
-    }
+        res
+    };
     ctx.db_set
         .vtab_registry_mut()
         .restore_vtab(db_name, table_name, vt);
@@ -1538,13 +2006,15 @@ pub fn vtab_perform_update_with_conflict(
     conflict_mode: VTabConflictMode,
 ) -> Result<Option<i64>> {
     vtab_begin_if_needed(ctx, db_name, table_name)?;
-    let (mut vt, _, _) = ctx
+    let mut vt = ctx
         .db_set
         .vtab_registry_mut()
-        .checkout_vtab(db_name, table_name)?;
-    let mut host_ctx = CoreVTabHostContext::new(ctx, db_name, table_name);
-    host_ctx.conflict_mode = conflict_mode;
-    let res = catch_callback_panic("vtab xUpdate", || vt.update(&mut host_ctx, op));
+        .checkout_vtab_instance(db_name, table_name)?;
+    let res = {
+        let mut host_ctx = CoreVTabHostContext::new(ctx, db_name, table_name);
+        host_ctx.conflict_mode = conflict_mode;
+        catch_callback_panic("vtab xUpdate", || vt.update(&mut host_ctx, op))
+    };
     ctx.db_set
         .vtab_registry_mut()
         .restore_vtab(db_name, table_name, vt);
@@ -1555,12 +2025,14 @@ pub fn vtab_perform_update_with_conflict(
 pub fn vtab_sync_all(ctx: &mut ExecContext<'_>) -> Result<()> {
     let active = ctx.db_set.vtab_registry().active_tx_vtabs();
     for (db_name, table_name) in active {
-        let (mut vt, _, _) = ctx
+        let mut vt = ctx
             .db_set
             .vtab_registry_mut()
-            .checkout_vtab(&db_name, &table_name)?;
-        let mut host_ctx = CoreVTabHostContext::new(ctx, &db_name, &table_name);
-        let res = catch_callback_panic("vtab xSync", || vt.sync(&mut host_ctx));
+            .checkout_vtab_instance(&db_name, &table_name)?;
+        let res = {
+            let mut host_ctx = CoreVTabHostContext::new(ctx, &db_name, &table_name);
+            catch_callback_panic("vtab xSync", || vt.sync(&mut host_ctx))
+        };
         ctx.db_set
             .vtab_registry_mut()
             .restore_vtab(&db_name, &table_name, vt);
@@ -1574,15 +2046,17 @@ pub fn vtab_commit_all(ctx: &mut ExecContext<'_>) -> Result<()> {
     let active = ctx.db_set.vtab_registry().active_tx_vtabs();
     let mut first_err: Option<SqliteError> = None;
     for (db_name, table_name) in active {
-        let Ok((mut vt, _, _)) = ctx
+        let Ok(mut vt) = ctx
             .db_set
             .vtab_registry_mut()
-            .checkout_vtab(&db_name, &table_name)
+            .checkout_vtab_instance(&db_name, &table_name)
         else {
             continue;
         };
-        let mut host_ctx = CoreVTabHostContext::new(ctx, &db_name, &table_name);
-        let res = catch_callback_panic("vtab xCommit", || vt.commit(&mut host_ctx));
+        let res = {
+            let mut host_ctx = CoreVTabHostContext::new(ctx, &db_name, &table_name);
+            catch_callback_panic("vtab xCommit", || vt.commit(&mut host_ctx))
+        };
         ctx.db_set
             .vtab_registry_mut()
             .restore_vtab(&db_name, &table_name, vt);
@@ -1609,15 +2083,17 @@ pub fn vtab_commit_all(ctx: &mut ExecContext<'_>) -> Result<()> {
 pub fn vtab_rollback_all(ctx: &mut ExecContext<'_>) {
     let active = ctx.db_set.vtab_registry().active_tx_vtabs();
     for (db_name, table_name) in active {
-        let Ok((mut vt, _, _)) = ctx
+        let Ok(mut vt) = ctx
             .db_set
             .vtab_registry_mut()
-            .checkout_vtab(&db_name, &table_name)
+            .checkout_vtab_instance(&db_name, &table_name)
         else {
             continue;
         };
-        let mut host_ctx = CoreVTabHostContext::new(ctx, &db_name, &table_name);
-        let _ = catch_callback_panic("vtab xRollback", || vt.rollback(&mut host_ctx));
+        {
+            let mut host_ctx = CoreVTabHostContext::new(ctx, &db_name, &table_name);
+            let _ = catch_callback_panic("vtab xRollback", || vt.rollback(&mut host_ctx));
+        }
         ctx.db_set
             .vtab_registry_mut()
             .restore_vtab(&db_name, &table_name, vt);
@@ -1635,12 +2111,14 @@ pub fn vtab_rollback_all(ctx: &mut ExecContext<'_>) {
 pub fn vtab_savepoint_all(ctx: &mut ExecContext<'_>, idx: usize) -> Result<()> {
     let active = ctx.db_set.vtab_registry().active_tx_vtabs();
     for (db_name, table_name) in active {
-        let (mut vt, _, _) = ctx
+        let mut vt = ctx
             .db_set
             .vtab_registry_mut()
-            .checkout_vtab(&db_name, &table_name)?;
-        let mut host_ctx = CoreVTabHostContext::new(ctx, &db_name, &table_name);
-        let res = catch_callback_panic("vtab xSavepoint", || vt.savepoint(&mut host_ctx, idx));
+            .checkout_vtab_instance(&db_name, &table_name)?;
+        let res = {
+            let mut host_ctx = CoreVTabHostContext::new(ctx, &db_name, &table_name);
+            catch_callback_panic("vtab xSavepoint", || vt.savepoint(&mut host_ctx, idx))
+        };
         ctx.db_set
             .vtab_registry_mut()
             .restore_vtab(&db_name, &table_name, vt);
@@ -1653,12 +2131,14 @@ pub fn vtab_savepoint_all(ctx: &mut ExecContext<'_>, idx: usize) -> Result<()> {
 pub fn vtab_release_all(ctx: &mut ExecContext<'_>, idx: usize) -> Result<()> {
     let active = ctx.db_set.vtab_registry().active_tx_vtabs();
     for (db_name, table_name) in active {
-        let (mut vt, _, _) = ctx
+        let mut vt = ctx
             .db_set
             .vtab_registry_mut()
-            .checkout_vtab(&db_name, &table_name)?;
-        let mut host_ctx = CoreVTabHostContext::new(ctx, &db_name, &table_name);
-        let res = catch_callback_panic("vtab xRelease", || vt.release(&mut host_ctx, idx));
+            .checkout_vtab_instance(&db_name, &table_name)?;
+        let res = {
+            let mut host_ctx = CoreVTabHostContext::new(ctx, &db_name, &table_name);
+            catch_callback_panic("vtab xRelease", || vt.release(&mut host_ctx, idx))
+        };
         ctx.db_set
             .vtab_registry_mut()
             .restore_vtab(&db_name, &table_name, vt);
@@ -1671,17 +2151,60 @@ pub fn vtab_release_all(ctx: &mut ExecContext<'_>, idx: usize) -> Result<()> {
 pub fn vtab_rollback_to_all(ctx: &mut ExecContext<'_>, idx: usize) -> Result<()> {
     let active = ctx.db_set.vtab_registry().active_tx_vtabs();
     for (db_name, table_name) in active {
-        let (mut vt, _, _) = ctx
+        let mut vt = ctx
             .db_set
             .vtab_registry_mut()
-            .checkout_vtab(&db_name, &table_name)?;
-        let mut host_ctx = CoreVTabHostContext::new(ctx, &db_name, &table_name);
-        let res = catch_callback_panic("vtab xRollbackTo", || vt.rollback_to(&mut host_ctx, idx));
+            .checkout_vtab_instance(&db_name, &table_name)?;
+        let res = {
+            let mut host_ctx = CoreVTabHostContext::new(ctx, &db_name, &table_name);
+            catch_callback_panic("vtab xRollbackTo", || vt.rollback_to(&mut host_ctx, idx))
+        };
         ctx.db_set
             .vtab_registry_mut()
             .restore_vtab(&db_name, &table_name, vt);
         res?;
     }
+    Ok(())
+}
+
+/// Flushes any buffered in-memory shadow mutations on active `in_tx` virtual tables before
+/// user-level SQL accesses shadow tables directly.
+pub fn vtab_flush_shadow_all(ctx: &mut ExecContext<'_>) -> Result<()> {
+    if ctx.db_set.vtab_registry().internal_sql_depth > 0
+        || !ctx.db_set.vtab_registry().has_any_in_tx()
+    {
+        return Ok(());
+    }
+    let active = ctx.db_set.vtab_registry().active_tx_vtabs();
+    for (db_name, table_name) in active {
+        let Ok(mut vt) = ctx
+            .db_set
+            .vtab_registry_mut()
+            .checkout_vtab_instance(&db_name, &table_name)
+        else {
+            continue;
+        };
+        let res = {
+            let mut host_ctx = CoreVTabHostContext::new(ctx, &db_name, &table_name);
+            catch_callback_panic("vtab flush_before_shadow_access", || {
+                vt.flush_before_shadow_access(&mut host_ctx)
+            })
+        };
+        ctx.db_set
+            .vtab_registry_mut()
+            .restore_vtab(&db_name, &table_name, vt);
+        res?;
+    }
+    Ok(())
+}
+
+/// Flushes buffered `in_tx` virtual tables and invalidates clean shadow caches when user SQL
+/// directly touches a shadow table.
+pub fn vtab_on_user_shadow_access(ctx: &mut ExecContext<'_>) -> Result<()> {
+    vtab_flush_shadow_all(ctx)?;
+    ctx.db_set
+        .vtab_registry_mut()
+        .invalidate_all_shadow_caches();
     Ok(())
 }
 

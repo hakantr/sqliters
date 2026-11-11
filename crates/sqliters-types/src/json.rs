@@ -1716,7 +1716,21 @@ pub fn jsonb_node_to_sql_value(
                 Ok(RuntimeValue::plain(Value::Real(if neg { -f } else { f })))
             }
         }
-        JSONB_FLOAT | JSONB_FLOAT5 => {
+        JSONB_FLOAT => {
+            if jsonb_validity_check(blob, offset, end, 1) != 0 {
+                return Err(err_malformed());
+            }
+            let s = std::str::from_utf8(payload).map_err(|_| err_malformed())?;
+            let fv = s.parse::<f64>().unwrap_or_else(|_| {
+                if s.starts_with('-') {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                }
+            });
+            Ok(RuntimeValue::plain(Value::Real(fv)))
+        }
+        JSONB_FLOAT5 => {
             let mut canon = String::new();
             jsonb_node_to_text(blob, offset, 0, &mut canon)?;
             let fv = canon.parse::<f64>().unwrap_or_else(|_| {
@@ -1733,15 +1747,20 @@ pub fn jsonb_node_to_sql_value(
             Ok(RuntimeValue::plain(Value::Text(decoded)))
         }
         JSONB_ARRAY | JSONB_OBJECT => {
-            // Validate subtree first
-            let mut canon = String::new();
-            jsonb_node_to_text(blob, offset, 0, &mut canon)?;
             if return_blob_containers {
+                if jsonb_validity_check(blob, offset, end, 1) != 0 {
+                    let mut canon = String::new();
+                    jsonb_node_to_text(blob, offset, 0, &mut canon)?;
+                }
                 Ok(RuntimeValue::plain(Value::Blob(blob[offset..end].to_vec())))
-            } else if set_json_subtype_on_containers {
-                Ok(RuntimeValue::with_subtype(Value::Text(canon), JSON_SUBTYPE))
             } else {
-                Ok(RuntimeValue::plain(Value::Text(canon)))
+                let mut canon = String::new();
+                jsonb_node_to_text(blob, offset, 0, &mut canon)?;
+                if set_json_subtype_on_containers {
+                    Ok(RuntimeValue::with_subtype(Value::Text(canon), JSON_SUBTYPE))
+                } else {
+                    Ok(RuntimeValue::plain(Value::Text(canon)))
+                }
             }
         }
         _ => Err(err_malformed()),
@@ -1876,42 +1895,6 @@ fn parse_json_path_with_spans(path: &str) -> Result<Vec<(usize, usize, PathStep)
     Ok(steps)
 }
 
-fn parse_abbreviated_path(arg: &Value) -> Result<Vec<PathStep>> {
-    match arg {
-        Value::Integer(i) => {
-            if *i >= 0 {
-                let idx = usize::try_from(*i).unwrap_or(usize::MAX);
-                Ok(vec![PathStep::ArrayIndex(idx)])
-            } else {
-                let back = i.unsigned_abs() as usize;
-                Ok(vec![PathStep::ArrayFromEnd(back)])
-            }
-        }
-        _ => {
-            let s = match arg {
-                Value::Text(t) => t.clone(),
-                Value::Real(f) => format_sqlite_real(*f),
-                Value::Blob(b) => std::str::from_utf8(b)
-                    .map_err(|_| err_bad_path("<blob>"))?
-                    .to_owned(),
-                Value::Null => return Ok(Vec::new()),
-                Value::Integer(_) => unreachable!(),
-            };
-            if s.starts_with('$') {
-                parse_json_path(&s)
-            } else if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-                Ok(vec![PathStep::Key(s)])
-            } else if s.starts_with('[') && s.len() >= 3 && s.ends_with(']') {
-                let candidate = format!("${s}");
-                parse_json_path(&candidate).map_err(|_| err_bad_path(&s))
-            } else {
-                let candidate = format!("$.\"{s}\"");
-                parse_json_path(&candidate).map_err(|_| err_bad_path(&s))
-            }
-        }
-    }
-}
-
 /// Looks up `steps` inside `blob` starting at `offset`, returning `Ok(Some((id_offset, val_offset)))`
 /// where `id_offset` is the 0-based JSONB byte offset of the key (for object entries) or element
 /// (for array elements / root), matching `json_each` / `json_tree` `id` in `json.c`.
@@ -2011,6 +1994,370 @@ pub fn jsonb_lookup_steps_with_id(
 /// or `Ok(None)` if not found.
 pub fn jsonb_lookup_steps(blob: &[u8], offset: usize, steps: &[PathStep]) -> Result<Option<usize>> {
     Ok(jsonb_lookup_steps_with_id(blob, offset, steps)?.map(|(_, v)| v))
+}
+
+enum JsonbCow<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+}
+
+impl JsonbCow<'_> {
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(b) => b,
+            Self::Owned(v) => v.as_slice(),
+        }
+    }
+}
+
+#[inline]
+fn parse_func_arg_to_jsonb_cow(val: &Value) -> Result<Option<JsonbCow<'_>>> {
+    match val {
+        Value::Null => Ok(None),
+        Value::Blob(b) if blob_is_jsonb(b) => Ok(Some(JsonbCow::Borrowed(b.as_slice()))),
+        _ => Ok(parse_func_arg_to_jsonb(val)?.map(JsonbCow::Owned)),
+    }
+}
+
+#[inline]
+fn validate_jsonb_root(blob: &[u8]) -> Result<()> {
+    if blob.is_empty() {
+        return Err(err_malformed());
+    }
+    if jsonb_validity_check(blob, 0, blob.len(), 1) == 0 {
+        return Ok(());
+    }
+    let _ = jsonb_to_text(blob)?;
+    Ok(())
+}
+
+#[inline]
+fn next_label_codepoint(s: &mut &[u8], is_raw: bool) -> u32 {
+    loop {
+        if s.is_empty() {
+            return 0;
+        }
+        if is_raw || s[0] != b'\\' {
+            if s[0] < 0x80 {
+                let cp = u32::from(s[0]);
+                *s = &s[1..];
+                return cp;
+            }
+            if let Ok(st) = std::str::from_utf8(s)
+                && let Some(ch) = st.chars().next()
+            {
+                *s = &s[ch.len_utf8()..];
+                return ch as u32;
+            }
+            *s = &s[1..];
+            return JSON_INVALID_CHAR;
+        }
+        let (consumed, cp) = json_unescape_one_char(s);
+        let step = consumed.clamp(1, s.len());
+        *s = &s[step..];
+        if cp == u32::MAX {
+            continue;
+        }
+        return cp;
+    }
+}
+
+#[inline(never)]
+fn jsonb_label_compare_escaped(
+    mut left: &[u8],
+    raw_left: bool,
+    mut right: &[u8],
+    raw_right: bool,
+) -> bool {
+    loop {
+        let cl = next_label_codepoint(&mut left, raw_left);
+        let cr = next_label_codepoint(&mut right, raw_right);
+        if cl == JSON_INVALID_CHAR || cr == JSON_INVALID_CHAR || cl != cr {
+            return false;
+        }
+        if cl == 0 {
+            return true;
+        }
+    }
+}
+
+#[inline]
+fn jsonb_label_compare(left: &[u8], raw_left: bool, right: &[u8], raw_right: bool) -> bool {
+    if raw_left && raw_right {
+        left == right
+    } else {
+        jsonb_label_compare_escaped(left, raw_left, right, raw_right)
+    }
+}
+
+#[inline]
+fn jsonb_array_count_in_slice(blob: &[u8], elem_start: usize, i_end: usize) -> Result<u64> {
+    let mut j = elem_start;
+    let mut cnt = 0u64;
+    while j < i_end {
+        if (blob[j] & 0x0f) > JSONB_OBJECT {
+            return Err(err_malformed());
+        }
+        let Some((cn, csz)) = jsonb_payload_size(&blob[..i_end], j) else {
+            return Err(err_malformed());
+        };
+        cnt += 1;
+        j += cn + csz;
+    }
+    Ok(cnt)
+}
+
+#[cold]
+fn validate_mismatched_node(blob: &[u8], i_root: usize) -> Result<()> {
+    let Some((n, sz)) = jsonb_payload_size(blob, i_root) else {
+        return Err(err_malformed());
+    };
+    if jsonb_validity_check(blob, i_root, i_root + n + sz, 1) != 0 {
+        return Err(err_malformed());
+    }
+    Ok(())
+}
+
+#[inline]
+fn jsonb_lookup_single_key(
+    blob: &[u8],
+    i_root: usize,
+    key_bytes: &[u8],
+    raw_key: bool,
+) -> Result<Option<usize>> {
+    if i_root >= blob.len() || (blob[i_root] & 0x0f) > JSONB_OBJECT {
+        return Err(err_malformed());
+    }
+    if (blob[i_root] & 0x0f) != JSONB_OBJECT {
+        validate_mismatched_node(blob, i_root)?;
+        return Ok(None);
+    }
+    let Some((n, sz)) = jsonb_payload_size(blob, i_root) else {
+        return Err(err_malformed());
+    };
+    let mut j = i_root + n;
+    let i_end = j + sz;
+    while j < i_end {
+        let kx = blob[j] & 0x0f;
+        if !(JSONB_TEXT..=JSONB_TEXTRAW).contains(&kx) {
+            return Err(err_malformed());
+        }
+        let Some((kn, ksz)) = jsonb_payload_size(&blob[..i_end], j) else {
+            return Err(err_malformed());
+        };
+        let k = j + kn;
+        if k + ksz >= i_end {
+            return Err(err_malformed());
+        }
+        let raw_label = kx == JSONB_TEXT || kx == JSONB_TEXTRAW;
+        if jsonb_label_compare(key_bytes, raw_key, &blob[k..k + ksz], raw_label) {
+            let v = k + ksz;
+            if (blob[v] & 0x0f) > JSONB_OBJECT || jsonb_payload_size(&blob[..i_end], v).is_none() {
+                return Err(err_malformed());
+            }
+            return Ok(Some(v));
+        }
+        j = k + ksz;
+        if (blob[j] & 0x0f) > JSONB_OBJECT {
+            return Err(err_malformed());
+        }
+        let Some((vn, vsz)) = jsonb_payload_size(&blob[..i_end], j) else {
+            return Err(err_malformed());
+        };
+        j += vn + vsz;
+    }
+    Ok(None)
+}
+
+#[inline]
+fn jsonb_lookup_single_array_index(blob: &[u8], i_root: usize, idx: i64) -> Result<Option<usize>> {
+    if i_root >= blob.len() || (blob[i_root] & 0x0f) > JSONB_OBJECT {
+        return Err(err_malformed());
+    }
+    if (blob[i_root] & 0x0f) != JSONB_ARRAY {
+        validate_mismatched_node(blob, i_root)?;
+        return Ok(None);
+    }
+    let Some((n, sz)) = jsonb_payload_size(blob, i_root) else {
+        return Err(err_malformed());
+    };
+    let elem_start = i_root + n;
+    let i_end = elem_start + sz;
+    let target_kk: u64 = if idx >= 0 {
+        idx as u64
+    } else {
+        let back = idx.unsigned_abs();
+        let cnt = jsonb_array_count_in_slice(blob, elem_start, i_end)?;
+        if back > cnt {
+            return Ok(None);
+        }
+        cnt - back
+    };
+    let mut j = elem_start;
+    let mut kk = target_kk;
+    while j < i_end {
+        if (blob[j] & 0x0f) > JSONB_OBJECT {
+            return Err(err_malformed());
+        }
+        let Some((cn, csz)) = jsonb_payload_size(&blob[..i_end], j) else {
+            return Err(err_malformed());
+        };
+        if kk == 0 {
+            return Ok(Some(j));
+        }
+        kk -= 1;
+        j += cn + csz;
+    }
+    Ok(None)
+}
+
+/// Zero-allocation in-place JSONB path walker (`jsonLookupStep` in `sqlite/src/json.c`).
+fn jsonb_lookup_raw_path(
+    blob: &[u8],
+    mut i_root: usize,
+    mut z_path: &str,
+    full_path: &str,
+) -> Result<Option<usize>> {
+    let mut depth = 0usize;
+    if i_root >= blob.len()
+        || (blob[i_root] & 0x0f) > JSONB_OBJECT
+        || jsonb_payload_size(blob, i_root).is_none()
+    {
+        return Err(err_malformed());
+    }
+
+    while !z_path.is_empty() {
+        let pbytes = z_path.as_bytes();
+        if pbytes[0] == b'.' {
+            let after_dot = &z_path[1..];
+            let abytes = after_dot.as_bytes();
+            if abytes.is_empty() {
+                return Err(err_bad_path(full_path));
+            }
+            let (key_bytes, raw_key, rest) = if abytes[0] == b'"' {
+                let mut i = 1usize;
+                let mut has_backslash = false;
+                while i < abytes.len() && abytes[i] != b'"' {
+                    if abytes[i] == b'\\' {
+                        has_backslash = true;
+                        if i + 1 < abytes.len() {
+                            i += 1;
+                        }
+                    }
+                    i += 1;
+                }
+                if i >= abytes.len() {
+                    return Err(err_bad_path(full_path));
+                }
+                (&abytes[1..i], !has_backslash, &after_dot[i + 1..])
+            } else {
+                let mut i = 0usize;
+                while i < abytes.len() && abytes[i] != b'.' && abytes[i] != b'[' {
+                    i += 1;
+                }
+                if i == 0 {
+                    return Err(err_bad_path(full_path));
+                }
+                (&abytes[..i], true, &after_dot[i..])
+            };
+
+            if (blob[i_root] & 0x0f) != JSONB_OBJECT {
+                validate_mismatched_node(blob, i_root)?;
+                return Ok(None);
+            }
+            let Some(v) = jsonb_lookup_single_key(blob, i_root, key_bytes, raw_key)? else {
+                return Ok(None);
+            };
+            depth += 1;
+            if depth >= JSON_MAX_DEPTH {
+                return Err(err_too_deep());
+            }
+            i_root = v;
+            z_path = rest;
+        } else if pbytes[0] == b'[' {
+            if (blob[i_root] & 0x0f) != JSONB_ARRAY {
+                validate_mismatched_node(blob, i_root)?;
+                return Ok(None);
+            }
+            let Some((n, sz)) = jsonb_payload_size(blob, i_root) else {
+                return Err(err_malformed());
+            };
+            let elem_start = i_root + n;
+            let i_end = elem_start + sz;
+
+            let mut kk = 0u64;
+            let mut i = 1usize;
+            while i < pbytes.len() && pbytes[i].is_ascii_digit() {
+                if kk < 0xffff_ffff {
+                    kk = kk * 10 + u64::from(pbytes[i] - b'0');
+                }
+                i += 1;
+            }
+            let rest = if i >= 2 && pbytes.get(i) == Some(&b']') {
+                &z_path[i + 1..]
+            } else if pbytes.get(1) == Some(&b'#') {
+                let cnt = jsonb_array_count_in_slice(blob, elem_start, i_end)?;
+                i = 2;
+                if pbytes.get(2) == Some(&b'-') && pbytes.get(3).is_some_and(u8::is_ascii_digit) {
+                    let mut nn = 0u64;
+                    i = 3;
+                    while i < pbytes.len() && pbytes[i].is_ascii_digit() {
+                        if nn < 0xffff_ffff {
+                            nn = nn * 10 + u64::from(pbytes[i] - b'0');
+                        }
+                        i += 1;
+                    }
+                    if pbytes.get(i) != Some(&b']') {
+                        return Err(err_bad_path(full_path));
+                    }
+                    if nn > cnt {
+                        return Ok(None);
+                    }
+                    kk = cnt - nn;
+                    &z_path[i + 1..]
+                } else {
+                    if pbytes.get(i) != Some(&b']') {
+                        return Err(err_bad_path(full_path));
+                    }
+                    // `$[#]` is past-end; never matches an existing element on read!
+                    return Ok(None);
+                }
+            } else {
+                return Err(err_bad_path(full_path));
+            };
+
+            let mut j = elem_start;
+            let mut found = None;
+            while j < i_end {
+                if (blob[j] & 0x0f) > JSONB_OBJECT {
+                    return Err(err_malformed());
+                }
+                let Some((cn, csz)) = jsonb_payload_size(&blob[..i_end], j) else {
+                    return Err(err_malformed());
+                };
+                if kk == 0 {
+                    found = Some(j);
+                    break;
+                }
+                kk -= 1;
+                j += cn + csz;
+            }
+            let Some(cpos) = found else {
+                return Ok(None);
+            };
+            depth += 1;
+            if depth >= JSON_MAX_DEPTH {
+                return Err(err_too_deep());
+            }
+            i_root = cpos;
+            z_path = rest;
+        } else {
+            return Err(err_bad_path(full_path));
+        }
+    }
+
+    Ok(Some(i_root))
 }
 
 // ============================================================================
@@ -2359,8 +2706,7 @@ fn merge_patch(target: EditNode, patch: EditNode) -> EditNode {
 
 fn finish_json_or_jsonb(jsonb: Vec<u8>, as_blob: bool) -> Result<RuntimeValue> {
     if as_blob {
-        // Validate subtree & depth
-        let _ = jsonb_to_text(&jsonb)?;
+        validate_jsonb_root(&jsonb)?;
         Ok(RuntimeValue::plain(Value::Blob(jsonb)))
     } else {
         let text = jsonb_to_text(&jsonb)?;
@@ -2370,6 +2716,17 @@ fn finish_json_or_jsonb(jsonb: Vec<u8>, as_blob: bool) -> Result<RuntimeValue> {
 
 /// `json(X)` / `jsonb(X)`
 pub fn eval_json(arg: &RuntimeValue, as_blob: bool) -> Result<RuntimeValue> {
+    if as_blob
+        && matches!(
+            arg.value,
+            Value::Text(_) | Value::Integer(_) | Value::Real(_)
+        )
+    {
+        let Some(jsonb) = parse_func_arg_to_jsonb(&arg.value)? else {
+            return Ok(RuntimeValue::plain(Value::Null));
+        };
+        return Ok(RuntimeValue::plain(Value::Blob(jsonb)));
+    }
     let Some(jsonb) = parse_func_arg_to_jsonb(&arg.value)? else {
         return Ok(RuntimeValue::plain(Value::Null));
     };
@@ -2437,63 +2794,65 @@ pub fn eval_json_quote(arg: &RuntimeValue) -> Result<RuntimeValue> {
 
 /// `json_array_length(X[, P])`
 pub fn eval_json_array_length(args: &[RuntimeValue]) -> Result<RuntimeValue> {
-    let Some(jsonb) = parse_func_arg_to_jsonb(&args[0].value)? else {
+    let Some(jb_cow) = parse_func_arg_to_jsonb_cow(&args[0].value)? else {
         return Ok(RuntimeValue::plain(Value::Null));
     };
-    // Ensure root JSONB is valid
-    let _ = jsonb_to_text(&jsonb)?;
+    let jsonb = jb_cow.as_slice();
+    if matches!(jb_cow, JsonbCow::Borrowed(_)) {
+        validate_jsonb_root(jsonb)?;
+    }
     let target_offset = if args.len() == 2 {
-        if matches!(args[1].value, Value::Null) {
-            return Ok(RuntimeValue::plain(Value::Null));
-        }
-        let path_str = args[1].value.to_text_lossy();
-        let steps = parse_json_path(&path_str)?;
-        let Some(pos) = jsonb_lookup_steps(&jsonb, 0, &steps)? else {
+        let path_cow: std::borrow::Cow<'_, str> = match &args[1].value {
+            Value::Null => return Ok(RuntimeValue::plain(Value::Null)),
+            Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+            other => std::borrow::Cow::Owned(other.to_text_lossy()),
+        };
+        let Some(after_dollar) = path_cow.strip_prefix('$') else {
+            return Err(err_bad_path(&path_cow));
+        };
+        let Some(pos) = jsonb_lookup_raw_path(jsonb, 0, after_dollar, &path_cow)? else {
             return Ok(RuntimeValue::plain(Value::Null));
         };
         pos
     } else {
         0usize
     };
-    let Some((n, sz)) = jsonb_payload_size(&jsonb, target_offset) else {
+    let Some((n, sz)) = jsonb_payload_size(jsonb, target_offset) else {
         return Err(err_malformed());
     };
     if (jsonb[target_offset] & 0x0f) != JSONB_ARRAY {
         return Ok(RuntimeValue::plain(Value::Integer(0)));
     }
-    let end = target_offset + n + sz;
-    let mut cnt = 0i64;
-    let mut j = target_offset + n;
-    while j < end {
-        let Some((cn, csz)) = jsonb_payload_size(&jsonb[..end], j) else {
-            return Err(err_malformed());
-        };
-        cnt += 1;
-        j += cn + csz;
-    }
+    let cnt = jsonb_array_count_in_slice(jsonb, target_offset + n, target_offset + n + sz)? as i64;
     Ok(RuntimeValue::plain(Value::Integer(cnt)))
 }
 
 /// `json_type(X[, P])`
 pub fn eval_json_type(args: &[RuntimeValue]) -> Result<RuntimeValue> {
-    let Some(jsonb) = parse_func_arg_to_jsonb(&args[0].value)? else {
+    let Some(jb_cow) = parse_func_arg_to_jsonb_cow(&args[0].value)? else {
         return Ok(RuntimeValue::plain(Value::Null));
     };
-    let _ = jsonb_to_text(&jsonb)?;
+    let jsonb = jb_cow.as_slice();
+    if matches!(jb_cow, JsonbCow::Borrowed(_)) {
+        validate_jsonb_root(jsonb)?;
+    }
     let target_offset = if args.len() == 2 {
-        if matches!(args[1].value, Value::Null) {
-            return Ok(RuntimeValue::plain(Value::Null));
-        }
-        let path_str = args[1].value.to_text_lossy();
-        let steps = parse_json_path(&path_str)?;
-        let Some(pos) = jsonb_lookup_steps(&jsonb, 0, &steps)? else {
+        let path_cow: std::borrow::Cow<'_, str> = match &args[1].value {
+            Value::Null => return Ok(RuntimeValue::plain(Value::Null)),
+            Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+            other => std::borrow::Cow::Owned(other.to_text_lossy()),
+        };
+        let Some(after_dollar) = path_cow.strip_prefix('$') else {
+            return Err(err_bad_path(&path_cow));
+        };
+        let Some(pos) = jsonb_lookup_raw_path(jsonb, 0, after_dollar, &path_cow)? else {
             return Ok(RuntimeValue::plain(Value::Null));
         };
         pos
     } else {
         0usize
     };
-    let tname = jsonb_node_type_name(&jsonb, target_offset)?;
+    let tname = jsonb_node_type_name(jsonb, target_offset)?;
     Ok(RuntimeValue::plain(Value::Text(tname.to_owned())))
 }
 
@@ -2604,32 +2963,38 @@ pub fn eval_json_extract(args: &[RuntimeValue], as_blob: bool) -> Result<Runtime
     if args.len() < 2 {
         return Ok(RuntimeValue::plain(Value::Null));
     }
-    let Some(jsonb) = parse_func_arg_to_jsonb(&args[0].value)? else {
+    let Some(jb_cow) = parse_func_arg_to_jsonb_cow(&args[0].value)? else {
         return Ok(RuntimeValue::plain(Value::Null));
     };
-    let _ = jsonb_to_text(&jsonb)?;
+    let jsonb = jb_cow.as_slice();
 
     if args.len() == 2 {
-        if matches!(args[1].value, Value::Null) {
-            return Ok(RuntimeValue::plain(Value::Null));
-        }
-        let path_str = args[1].value.to_text_lossy();
-        let steps = parse_json_path(&path_str)?;
-        let Some(pos) = jsonb_lookup_steps(&jsonb, 0, &steps)? else {
+        let path_cow: std::borrow::Cow<'_, str> = match &args[1].value {
+            Value::Null => return Ok(RuntimeValue::plain(Value::Null)),
+            Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+            other => std::borrow::Cow::Owned(other.to_text_lossy()),
+        };
+        let Some(after_dollar) = path_cow.strip_prefix('$') else {
+            return Err(err_bad_path(&path_cow));
+        };
+        let Some(pos) = jsonb_lookup_raw_path(jsonb, 0, after_dollar, &path_cow)? else {
             return Ok(RuntimeValue::plain(Value::Null));
         };
-        return jsonb_node_to_sql_value(&jsonb, pos, as_blob, !as_blob);
+        return jsonb_node_to_sql_value(jsonb, pos, as_blob, !as_blob);
     }
 
     let mut children = Vec::new();
     for path_arg in &args[1..] {
-        if matches!(path_arg.value, Value::Null) {
-            return Ok(RuntimeValue::plain(Value::Null));
-        }
-        let path_str = path_arg.value.to_text_lossy();
-        let steps = parse_json_path(&path_str)?;
-        if let Some(pos) = jsonb_lookup_steps(&jsonb, 0, &steps)? {
-            let Some((n, sz)) = jsonb_payload_size(&jsonb, pos) else {
+        let path_cow: std::borrow::Cow<'_, str> = match &path_arg.value {
+            Value::Null => return Ok(RuntimeValue::plain(Value::Null)),
+            Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+            other => std::borrow::Cow::Owned(other.to_text_lossy()),
+        };
+        let Some(after_dollar) = path_cow.strip_prefix('$') else {
+            return Err(err_bad_path(&path_cow));
+        };
+        if let Some(pos) = jsonb_lookup_raw_path(jsonb, 0, after_dollar, &path_cow)? {
+            let Some((n, sz)) = jsonb_payload_size(jsonb, pos) else {
                 return Err(err_malformed());
             };
             children.extend_from_slice(&jsonb[pos..pos + n + sz]);
@@ -2642,25 +3007,66 @@ pub fn eval_json_extract(args: &[RuntimeValue], as_blob: bool) -> Result<Runtime
     finish_json_or_jsonb(out, as_blob)
 }
 
-/// `->` (`as_sql == false`) and `->>` (`as_sql == true`) operators on JSON/JSON5 text or JSONB blobs.
-pub fn eval_json_arrow(lhs: &Value, rhs: &Value, as_sql: bool) -> Result<RuntimeValue> {
-    if matches!(lhs, Value::Null) || matches!(rhs, Value::Null) {
-        return Ok(RuntimeValue::plain(Value::Null));
-    }
-    let Some(jsonb) = parse_func_arg_to_jsonb(lhs)? else {
-        return Ok(RuntimeValue::plain(Value::Null));
-    };
-    let _ = jsonb_to_text(&jsonb)?;
-    let steps = parse_abbreviated_path(rhs)?;
-    let Some(pos) = jsonb_lookup_steps(&jsonb, 0, &steps)? else {
-        return Ok(RuntimeValue::plain(Value::Null));
-    };
+#[inline]
+fn finish_arrow_node(blob: &[u8], pos: usize, as_sql: bool) -> Result<RuntimeValue> {
     if as_sql {
-        jsonb_node_to_sql_value(&jsonb, pos, false, false)
+        jsonb_node_to_sql_value(blob, pos, false, false)
     } else {
         let mut text = String::new();
-        jsonb_node_to_text(&jsonb, pos, 0, &mut text)?;
+        jsonb_node_to_text(blob, pos, 0, &mut text)?;
         Ok(RuntimeValue::with_subtype(Value::Text(text), JSON_SUBTYPE))
+    }
+}
+
+/// Zero-allocation `->` / `->>` evaluator when the RHS path is already borrowed as `&str`.
+pub fn eval_json_arrow_path_str(lhs: &Value, rhs_path: &str, as_sql: bool) -> Result<RuntimeValue> {
+    let Some(jb_cow) = parse_func_arg_to_jsonb_cow(lhs)? else {
+        return Ok(RuntimeValue::plain(Value::Null));
+    };
+    let blob = jb_cow.as_slice();
+    let pos_opt = if let Some(after_dollar) = rhs_path.strip_prefix('$') {
+        jsonb_lookup_raw_path(blob, 0, after_dollar, rhs_path)?
+    } else if !rhs_path.is_empty()
+        && rhs_path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        jsonb_lookup_single_key(blob, 0, rhs_path.as_bytes(), true)?
+    } else if rhs_path.len() >= 3 && rhs_path.starts_with('[') && rhs_path.ends_with(']') {
+        jsonb_lookup_raw_path(blob, 0, rhs_path, rhs_path)?
+    } else {
+        let quoted = format!(".\"{rhs_path}\"");
+        jsonb_lookup_raw_path(blob, 0, &quoted, rhs_path)?
+    };
+    let Some(pos) = pos_opt else {
+        return Ok(RuntimeValue::plain(Value::Null));
+    };
+    finish_arrow_node(blob, pos, as_sql)
+}
+
+/// `->` (`as_sql == false`) and `->>` (`as_sql == true`) operators on JSON/JSON5 text or JSONB blobs.
+pub fn eval_json_arrow(lhs: &Value, rhs: &Value, as_sql: bool) -> Result<RuntimeValue> {
+    match (lhs, rhs) {
+        (Value::Null, _) | (_, Value::Null) => Ok(RuntimeValue::plain(Value::Null)),
+        (_, Value::Text(s)) => eval_json_arrow_path_str(lhs, s, as_sql),
+        (_, Value::Integer(idx)) => {
+            let Some(jb_cow) = parse_func_arg_to_jsonb_cow(lhs)? else {
+                return Ok(RuntimeValue::plain(Value::Null));
+            };
+            let blob = jb_cow.as_slice();
+            let Some(pos) = jsonb_lookup_single_array_index(blob, 0, *idx)? else {
+                return Ok(RuntimeValue::plain(Value::Null));
+            };
+            finish_arrow_node(blob, pos, as_sql)
+        }
+        (_, Value::Real(f)) => {
+            let s = format_sqlite_real(*f);
+            eval_json_arrow_path_str(lhs, &s, as_sql)
+        }
+        (_, Value::Blob(b)) => {
+            let s = std::str::from_utf8(b).map_err(|_| err_bad_path("<blob>"))?;
+            eval_json_arrow_path_str(lhs, s, as_sql)
+        }
     }
 }
 

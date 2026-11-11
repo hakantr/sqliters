@@ -476,6 +476,24 @@ impl Value {
         }
     }
 
+    /// Converts `self` to an exact `i64` rowid key per C SQLite `OP_MustBeInt` / `OP_SeekRowid`:
+    /// - `Integer(i)` -> `Some(i)`
+    /// - `Real(r)` -> `real_to_exact_int(r)`
+    /// - `Text(s)` -> `parse_numeric_text(s)` converted via `Integer(i)` or `real_to_exact_int(r)`
+    /// - `Null` / `Blob` / non-numeric or fractional values -> `None`
+    pub fn to_exact_rowid_i64(&self) -> Option<i64> {
+        match self {
+            Self::Integer(i) => Some(*i),
+            Self::Real(r) => real_to_exact_int(*r),
+            Self::Text(s) => match parse_numeric_text(s)? {
+                Self::Integer(i) => Some(i),
+                Self::Real(r) => real_to_exact_int(r),
+                _ => None,
+            },
+            Self::Null | Self::Blob(_) => None,
+        }
+    }
+
     /// Converts value to text following `sqlite3_value_text` / string concatenation rules.
     pub fn to_text_lossy(&self) -> String {
         match self {
@@ -690,21 +708,94 @@ pub fn format_sqlite_real(r: f64) -> String {
     }
 }
 
-/// Parses a string into `Value::Integer` or `Value::Real` if the entire trimmed string is numeric.
+/// Returns `true` iff `b` is ASCII whitespace recognized by C SQLite's `sqlite3Isspace`.
+#[inline]
+pub const fn is_sqlite_ascii_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+}
+
+/// Trims leading ASCII whitespace (`sqlite3Isspace`: `' '`, `'\t'`, `'\n'`, `'\r'`, `0x0b`, `0x0c`).
+#[inline]
+pub fn sqlite_trim_ascii_start(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    while start < bytes.len() && is_sqlite_ascii_space(bytes[start]) {
+        start += 1;
+    }
+    &s[start..]
+}
+
+/// Trims leading and trailing ASCII whitespace (`sqlite3Isspace`: `' '`, `'\t'`, `'\n'`, `'\r'`, `0x0b`, `0x0c`).
+#[inline]
+pub fn sqlite_trim_ascii(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    while start < bytes.len() && is_sqlite_ascii_space(bytes[start]) {
+        start += 1;
+    }
+    let mut end = bytes.len();
+    while end > start && is_sqlite_ascii_space(bytes[end - 1]) {
+        end -= 1;
+    }
+    &s[start..end]
+}
+
+fn is_well_formed_sqlite_number(trimmed: &str) -> (bool, bool) {
+    let bytes = trimmed.as_bytes();
+    if bytes.is_empty() {
+        return (false, false);
+    }
+    let mut i = usize::from(bytes[0] == b'+' || bytes[0] == b'-');
+    let mut saw_digit = false;
+    let mut is_float_syntax = false;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        saw_digit = true;
+        i += 1;
+    }
+    if i < bytes.len() && bytes[i] == b'.' {
+        is_float_syntax = true;
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            saw_digit = true;
+            i += 1;
+        }
+    }
+    if !saw_digit {
+        return (false, false);
+    }
+    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        is_float_syntax = true;
+        i += 1;
+        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        let exp_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == exp_start {
+            return (false, false);
+        }
+    }
+    (i == bytes.len(), is_float_syntax)
+}
+
+/// Parses a string into `Value::Integer` or `Value::Real` if the entire ASCII-trimmed string is
+/// well-formed SQLite numeric text (`sqlite3AtoF` / `sqlite3Atoi64`).
+///
+/// Overflowing decimal exponents such as `'1e309'` evaluate to `Some(Value::Real(±f64::INFINITY))`,
+/// whereas non-numeric words such as `'inf'` or `'nan'` return `None`.
 pub fn parse_numeric_text(s: &str) -> Option<Value> {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
+    let trimmed = sqlite_trim_ascii(s);
+    let (valid, is_float_syntax) = is_well_formed_sqlite_number(trimmed);
+    if !valid {
         return None;
     }
-    if !trimmed.contains('.')
-        && !trimmed.contains('e')
-        && !trimmed.contains('E')
-        && let Ok(i) = trimmed.parse::<i64>()
-    {
+    if !is_float_syntax && let Ok(i) = trimmed.parse::<i64>() {
         return Some(Value::Integer(i));
     }
     if let Ok(r) = trimmed.parse::<f64>()
-        && r.is_finite()
+        && !r.is_nan()
     {
         return Some(Value::real(r));
     }
@@ -722,7 +813,7 @@ fn real_to_exact_int(r: f64) -> Option<i64> {
 }
 
 pub fn parse_leading_i64(s: &str) -> i64 {
-    let trimmed = s.trim_start();
+    let trimmed = sqlite_trim_ascii_start(s);
     let bytes = trimmed.as_bytes();
     let mut idx = 0;
     let mut neg = false;
@@ -758,7 +849,7 @@ pub fn parse_leading_i64(s: &str) -> i64 {
 }
 
 pub fn parse_leading_f64(s: &str) -> f64 {
-    let trimmed = s.trim_start();
+    let trimmed = sqlite_trim_ascii_start(s);
     let bytes = trimmed.as_bytes();
     let mut end = 0;
     if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {

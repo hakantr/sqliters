@@ -107,6 +107,30 @@ impl Digest {
     }
 }
 
+fn read_proc_mem_kib() -> (u64, u64) {
+    let Ok(status) = fs::read_to_string("/proc/self/status") else {
+        return (0, 0);
+    };
+    let mut rss_kib = 0_u64;
+    let mut hwm_kib = 0_u64;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            rss_kib = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("VmHWM:") {
+            hwm_kib = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+        }
+    }
+    (rss_kib, hwm_kib)
+}
+
 #[derive(Debug, Clone)]
 struct WorkloadMetric {
     name: &'static str,
@@ -115,6 +139,8 @@ struct WorkloadMetric {
     op_unit: &'static str,
     elapsed_ms: f64,
     ops_per_sec: f64,
+    rss_kib: u64,
+    hwm_kib: u64,
     digest_hex: String,
 }
 
@@ -127,6 +153,7 @@ impl WorkloadMetric {
         elapsed_secs: f64,
         digest: Digest,
     ) -> Self {
+        let (rss_kib, hwm_kib) = read_proc_mem_kib();
         let elapsed_ms = elapsed_secs * 1_000.0;
         let ops_per_sec = if elapsed_secs > 0.0 {
             (ops as f64) / elapsed_secs
@@ -140,6 +167,8 @@ impl WorkloadMetric {
             op_unit,
             elapsed_ms,
             ops_per_sec,
+            rss_kib,
+            hwm_kib,
             digest_hex: digest.hex(),
         }
     }
@@ -796,15 +825,10 @@ fn run_suite(
             .map_err(|e| format!("W10 fin grp: {e}"))?;
 
         let elapsed = t0.elapsed().as_secs_f64();
+        let metric =
+            WorkloadMetric::finish("W10_jsonb_extract_agg", "memory", 5_026, "ops", elapsed, dg);
         conn.try_close().map_err(|e| format!("W10 close: {e}"))?;
-        results.push(WorkloadMetric::finish(
-            "W10_jsonb_extract_agg",
-            "memory",
-            5_026,
-            "ops",
-            elapsed,
-            dg,
-        ));
+        results.push(metric);
     }
 
     // W11: FTS5 3,000 docs + 200 MATCH queries ordered by bm25() (:memory:)
@@ -876,15 +900,16 @@ fn run_suite(
         qstmt.finalize().map_err(|e| format!("W11 qfin: {e}"))?;
 
         let elapsed = t0.elapsed().as_secs_f64();
-        conn.try_close().map_err(|e| format!("W11 close: {e}"))?;
-        results.push(WorkloadMetric::finish(
+        let metric = WorkloadMetric::finish(
             "W11_fts5_index_and_bm25",
             "memory",
             3_200,
             "ops",
             elapsed,
             dg,
-        ));
+        );
+        conn.try_close().map_err(|e| format!("W11 close: {e}"))?;
+        results.push(metric);
     }
 
     // W12: R-Tree 5,000 2D boxes + 500 bounding-box intersection queries (:memory:)
@@ -958,15 +983,16 @@ fn run_suite(
         qstmt.finalize().map_err(|e| format!("W12 qfin: {e}"))?;
 
         let elapsed = t0.elapsed().as_secs_f64();
-        conn.try_close().map_err(|e| format!("W12 close: {e}"))?;
-        results.push(WorkloadMetric::finish(
+        let metric = WorkloadMetric::finish(
             "W12_rtree_insert_and_bbox",
             "memory",
             5_500,
             "ops",
             elapsed,
             dg,
-        ));
+        );
+        conn.try_close().map_err(|e| format!("W12 close: {e}"))?;
+        results.push(metric);
     }
 
     // W13: 300 individual autocommit WAL INSERT transactions (synchronous = NORMAL)
@@ -1016,16 +1042,17 @@ fn run_suite(
         dg.i64(agg.get_i64(0).unwrap_or(0));
         dg.i64(agg.get_i64(1).unwrap_or(0));
 
-        conn.try_close().map_err(|e| format!("W13 close: {e}"))?;
-        remove_db_family(&w13_db);
-        results.push(WorkloadMetric::finish(
+        let metric = WorkloadMetric::finish(
             "W13_autocommit_wal_txns",
             "disk_wal",
             300,
             "txns",
             elapsed,
             dg,
-        ));
+        );
+        conn.try_close().map_err(|e| format!("W13 close: {e}"))?;
+        remove_db_family(&w13_db);
+        results.push(metric);
     }
 
     // W14: End-to-end CLI SQL batch script execution
@@ -1100,20 +1127,25 @@ fn json_escape(s: &str) -> String {
 }
 
 fn emit_json(engine: &str, results: &[WorkloadMetric]) {
+    let (suite_rss_kib, suite_hwm_kib) = read_proc_mem_kib();
     println!("{{");
     println!("  \"engine\": \"{}\",", json_escape(engine));
     println!("  \"sqlite_version\": \"{}\",", sqliters::libversion());
+    println!("  \"suite_rss_kib\": {suite_rss_kib},");
+    println!("  \"suite_hwm_kib\": {suite_hwm_kib},");
     println!("  \"workloads\": [");
     for (idx, m) in results.iter().enumerate() {
         let comma = if idx + 1 < results.len() { "," } else { "" };
         println!(
-            "    {{\"name\": \"{}\", \"storage\": \"{}\", \"ops\": {}, \"op_unit\": \"{}\", \"elapsed_ms\": {:.6}, \"ops_per_sec\": {:.3}, \"digest\": \"{}\"}}{}",
+            "    {{\"name\": \"{}\", \"storage\": \"{}\", \"ops\": {}, \"op_unit\": \"{}\", \"elapsed_ms\": {:.6}, \"ops_per_sec\": {:.3}, \"rss_kib\": {}, \"hwm_kib\": {}, \"digest\": \"{}\"}}{}",
             json_escape(m.name),
             json_escape(m.storage),
             m.ops,
             json_escape(m.op_unit),
             m.elapsed_ms,
             m.ops_per_sec,
+            m.rss_kib,
+            m.hwm_kib,
             m.digest_hex,
             comma
         );
@@ -1124,19 +1156,33 @@ fn emit_json(engine: &str, results: &[WorkloadMetric]) {
 
 fn emit_table(results: &[WorkloadMetric]) {
     println!(
-        "{:<28} {:<13} {:>10} {:>12} {:>14}  {:<16}",
-        "Workload", "Storage", "Ops", "Time (ms)", "Ops/sec", "Digest (FNV-1a)"
+        "{:<28} {:<13} {:>10} {:>12} {:>14} {:>10} {:>10}  {:<16}",
+        "Workload",
+        "Storage",
+        "Ops",
+        "Time (ms)",
+        "Ops/sec",
+        "RSS(KiB)",
+        "HWM(KiB)",
+        "Digest (FNV-1a)"
     );
-    println!("{}", "-".repeat(99));
+    println!("{}", "-".repeat(121));
     let mut total_ms = 0.0;
     for m in results {
         total_ms += m.elapsed_ms;
         println!(
-            "{:<28} {:<13} {:>10} {:>12.3} {:>14.1}  {}",
-            m.name, m.storage, m.ops, m.elapsed_ms, m.ops_per_sec, m.digest_hex
+            "{:<28} {:<13} {:>10} {:>12.3} {:>14.1} {:>10} {:>10}  {}",
+            m.name,
+            m.storage,
+            m.ops,
+            m.elapsed_ms,
+            m.ops_per_sec,
+            m.rss_kib,
+            m.hwm_kib,
+            m.digest_hex
         );
     }
-    println!("{}", "-".repeat(99));
+    println!("{}", "-".repeat(121));
     println!("Total elapsed across workloads: {total_ms:.3} ms");
 }
 

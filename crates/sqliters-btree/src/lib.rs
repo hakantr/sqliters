@@ -31,10 +31,12 @@ pub use cursor::{
 pub use page::{
     BtreePageType, IndexInteriorCell, IndexLeafCell, ParsedPage, PayloadBounds, RawIndexCell,
     RawLeafDeleteOutcome, RawTableLeafCell, TableInteriorCell, TableLeafCell,
-    binary_search_table_leaf, find_table_interior_child, last_table_leaf_rowid, peek_page_type,
-    raw_cell_offset, raw_page_header, read_index_interior_cell, read_index_leaf_cell,
-    read_table_interior_cell, read_table_leaf_cell, read_table_leaf_rowid, seek_table_leaf_cell,
-    table_interior_right_child, try_delete_table_leaf_in_place, try_insert_table_leaf_in_place,
+    apply_insert_index_leaf_in_place, binary_search_table_leaf, find_index_interior_child_in_place,
+    find_table_interior_child, last_table_leaf_rowid, peek_page_type,
+    probe_insert_index_leaf_in_place, raw_cell_offset, raw_page_header, read_index_interior_cell,
+    read_index_leaf_cell, read_table_interior_cell, read_table_leaf_cell, read_table_leaf_rowid,
+    seek_table_leaf_cell, table_interior_right_child, try_delete_table_leaf_in_place,
+    try_insert_table_leaf_in_place,
 };
 pub use ptrmap::{PtrmapType, RootPageMove, is_ptrmap_page, ptrmap_offset, ptrmap_pageno};
 
@@ -1220,6 +1222,59 @@ impl Btree {
         }
     }
 
+    /// Zero-allocation fast path: checks whether `rowid` exists on a non-overflow leaf cell and
+    /// its `col_idx`-th column is a `BLOB` byte-for-byte equal to `expected`.
+    /// Returns `Ok(None)` when the cell spills onto overflow pages (caller can fall back).
+    pub fn table_rowid_col_blob_eq(
+        &mut self,
+        root_pgno: Pgno,
+        rowid: i64,
+        col_idx: usize,
+        expected: &[u8],
+    ) -> Result<Option<bool>> {
+        let Some((leaf_pgno, local_start, local_len, total_payload_len, overflow_page)) =
+            self.locate_table_leaf_cell_layout(root_pgno, rowid)?
+        else {
+            return Ok(Some(false));
+        };
+        if overflow_page.is_some() || (local_len as u32) != total_payload_len {
+            return Ok(None);
+        }
+        let raw = self.pager.read_page(leaf_pgno)?;
+        let payload = &raw[local_start..local_start + local_len];
+        if payload.is_empty() {
+            return Err(SqliteError::corrupt("empty record payload"));
+        }
+        let (hdr_u64, mut hdr_pos) = get_varint(payload)?;
+        let hdr_len = usize::try_from(hdr_u64)
+            .map_err(|_| SqliteError::corrupt("record header length overflow"))?;
+        if hdr_len > payload.len() || hdr_len < hdr_pos {
+            return Err(SqliteError::corrupt("record header length out of bounds"));
+        }
+        let mut body_offset = hdr_len;
+        let mut cur_col = 0usize;
+        while hdr_pos < hdr_len {
+            let (st, n) = get_varint(&payload[hdr_pos..hdr_len])?;
+            hdr_pos += n;
+            let byte_len = serial_type_len(st)?;
+            let Some(end) = body_offset.checked_add(byte_len) else {
+                return Err(SqliteError::corrupt("record column extends past payload"));
+            };
+            if end > payload.len() {
+                return Err(SqliteError::corrupt("record column extends past payload"));
+            }
+            if cur_col == col_idx {
+                if st >= 12 && (st & 1) == 0 {
+                    return Ok(Some(&payload[body_offset..end] == expected));
+                }
+                return Ok(Some(false));
+            }
+            body_offset = end;
+            cur_col += 1;
+        }
+        Ok(Some(false))
+    }
+
     /// Inspects column `col_idx` (0-based within the stored record) of `rowid` in the Table B+Tree
     /// rooted at `root_pgno`, returning `Ok(Some((payload_offset, byte_len)))` if the row exists
     /// and the column is `TEXT` or `BLOB`, `Ok(None)` if `rowid` is not found, or an error if the
@@ -2075,7 +2130,25 @@ impl Btree {
         let parsed = self.read_parsed_page(pgno)?;
         match parsed {
             ParsedPage::IndexLeaf { cells } => {
-                for c in cells {
+                let mut lo = 0usize;
+                let mut hi = cells.len();
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let c = &cells[mid];
+                    let rec = self.read_full_payload(
+                        c.total_payload_len,
+                        &c.local_payload,
+                        c.overflow_page,
+                    )?;
+                    if compare_records_with_encoding(&rec, prefix_values, orders, enc)?
+                        == Ordering::Less
+                    {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                for c in &cells[lo..] {
                     let rec = self.read_full_payload(
                         c.total_payload_len,
                         &c.local_payload,
@@ -2090,8 +2163,26 @@ impl Btree {
                 Ok(())
             }
             ParsedPage::IndexInterior { cells, right_child } => {
+                let mut lo = 0usize;
+                let mut hi = cells.len();
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let c = &cells[mid];
+                    let rec = self.read_full_payload(
+                        c.total_payload_len,
+                        &c.local_payload,
+                        c.overflow_page,
+                    )?;
+                    if compare_records_with_encoding(&rec, prefix_values, orders, enc)?
+                        == Ordering::Less
+                    {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
                 let mut visit_right = true;
-                for c in cells {
+                for c in &cells[lo..] {
                     let rec = self.read_full_payload(
                         c.total_payload_len,
                         &c.local_payload,
@@ -2328,7 +2419,31 @@ impl Btree {
         let parsed = self.read_parsed_page(pgno)?;
         match parsed {
             ParsedPage::IndexLeaf { cells } => {
-                for c in cells {
+                let mut lo = 0usize;
+                let mut hi = cells.len();
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let c = &cells[mid];
+                    let rec = self.read_full_payload(
+                        c.total_payload_len,
+                        &c.local_payload,
+                        c.overflow_page,
+                    )?;
+                    if Self::compare_index_range_cell(
+                        &rec,
+                        prefix_values,
+                        lower_bound,
+                        upper_bound,
+                        orders,
+                        enc,
+                    )? == Ordering::Less
+                    {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                for c in &cells[lo..] {
                     let rec = self.read_full_payload(
                         c.total_payload_len,
                         &c.local_payload,
@@ -2350,8 +2465,32 @@ impl Btree {
                 Ok(())
             }
             ParsedPage::IndexInterior { cells, right_child } => {
+                let mut lo = 0usize;
+                let mut hi = cells.len();
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let c = &cells[mid];
+                    let rec = self.read_full_payload(
+                        c.total_payload_len,
+                        &c.local_payload,
+                        c.overflow_page,
+                    )?;
+                    if Self::compare_index_range_cell(
+                        &rec,
+                        prefix_values,
+                        lower_bound,
+                        upper_bound,
+                        orders,
+                        enc,
+                    )? == Ordering::Less
+                    {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
                 let mut visit_right = true;
-                for c in cells {
+                for c in &cells[lo..] {
                     let rec = self.read_full_payload(
                         c.total_payload_len,
                         &c.local_payload,
@@ -2470,6 +2609,27 @@ impl Btree {
             overflow_page,
         };
 
+        if let Some((leaf_pgno, insert_idx, content_top)) =
+            self.probe_fast_index_insert_target(root_pgno, &leaf_cell, key_vals, orders, enc)?
+        {
+            {
+                let raw_mut = self.pager.write_page(leaf_pgno)?;
+                apply_insert_index_leaf_in_place(
+                    leaf_pgno,
+                    raw_mut,
+                    &leaf_cell,
+                    insert_idx,
+                    content_top,
+                );
+            }
+            if self.is_auto_vacuum()
+                && let Some(ovfl) = leaf_cell.overflow_page
+            {
+                self.ptrmap_put(ovfl, PtrmapType::Overflow1, leaf_pgno)?;
+            }
+            return Ok(());
+        }
+
         if let Some((promoted_cell, right_pgno)) =
             self.insert_index_rec(root_pgno, leaf_cell, key_vals, orders)?
         {
@@ -2491,6 +2651,110 @@ impl Btree {
         Ok(())
     }
 
+    fn probe_fast_index_insert_target(
+        &mut self,
+        root_pgno: Pgno,
+        cell: &IndexLeafCell,
+        key_vals: &[Value],
+        orders: &[KeySortOrder],
+        enc: TextEncoding,
+    ) -> Result<Option<(Pgno, usize, usize)>> {
+        let usable = self.pager.usable_size();
+        let mut cur_pgno = root_pgno;
+        for _ in 0..BTCURSOR_MAX_DEPTH {
+            let raw = self.pager.read_page(cur_pgno)?;
+            let hdr_off = if cur_pgno == 1 { 100 } else { 0 };
+            if hdr_off >= raw.len() {
+                return Ok(None);
+            }
+            match raw[hdr_off] {
+                x if x == BtreePageType::IndexLeaf as u8 => {
+                    return Ok(probe_insert_index_leaf_in_place(
+                        cur_pgno, usable, raw, cell, key_vals, orders, enc,
+                    )?
+                    .map(|(ins_idx, top)| (cur_pgno, ins_idx, top)));
+                }
+                x if x == BtreePageType::IndexInterior as u8 => {
+                    let Some(child) = find_index_interior_child_in_place(
+                        cur_pgno, usable, raw, key_vals, orders, enc,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    cur_pgno = child;
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
+    fn lower_bound_index_leaf_cells(
+        &mut self,
+        cells: &[IndexLeafCell],
+        key_vals: &[Value],
+        orders: &[KeySortOrder],
+        enc: TextEncoding,
+    ) -> Result<(usize, bool)> {
+        let mut lo = 0usize;
+        let mut hi = cells.len();
+        let mut hi_is_equal = false;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let existing = &cells[mid];
+            let rec = self.read_full_payload(
+                existing.total_payload_len,
+                &existing.local_payload,
+                existing.overflow_page,
+            )?;
+            match compare_records_with_encoding(&rec, key_vals, orders, enc)? {
+                Ordering::Less => lo = mid + 1,
+                Ordering::Equal => {
+                    hi = mid;
+                    hi_is_equal = true;
+                }
+                Ordering::Greater => {
+                    hi = mid;
+                    hi_is_equal = false;
+                }
+            }
+        }
+        Ok((lo, hi_is_equal))
+    }
+
+    fn lower_bound_index_interior_cells(
+        &mut self,
+        cells: &[IndexInteriorCell],
+        key_vals: &[Value],
+        orders: &[KeySortOrder],
+        enc: TextEncoding,
+    ) -> Result<(usize, bool)> {
+        let mut lo = 0usize;
+        let mut hi = cells.len();
+        let mut hi_is_equal = false;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let existing = &cells[mid];
+            let rec = self.read_full_payload(
+                existing.total_payload_len,
+                &existing.local_payload,
+                existing.overflow_page,
+            )?;
+            match compare_records_with_encoding(&rec, key_vals, orders, enc)? {
+                Ordering::Less => lo = mid + 1,
+                Ordering::Equal => {
+                    hi = mid;
+                    hi_is_equal = true;
+                }
+                Ordering::Greater => {
+                    hi = mid;
+                    hi_is_equal = false;
+                }
+            }
+        }
+        Ok((lo, hi_is_equal))
+    }
+
     fn insert_index_rec(
         &mut self,
         pgno: Pgno,
@@ -2504,33 +2768,20 @@ impl Btree {
 
         match parsed {
             ParsedPage::IndexLeaf { mut cells } => {
-                let mut pos = cells.len();
-                for (i, existing) in cells.iter().enumerate() {
-                    let rec = self.read_full_payload(
-                        existing.total_payload_len,
-                        &existing.local_payload,
-                        existing.overflow_page,
-                    )?;
-                    match compare_records_with_encoding(&rec, key_vals, orders, enc)? {
-                        Ordering::Less => continue,
-                        Ordering::Equal => {
-                            let old = std::mem::replace(&mut cells[i], new_cell);
-                            self.free_overflow_chain(old.overflow_page)?;
-                            let updated = ParsedPage::IndexLeaf { cells };
-                            if updated.fits_in_page(pgno, usable) {
-                                self.write_parsed_page(pgno, &updated)?;
-                                return Ok(None);
-                            }
-                            let ParsedPage::IndexLeaf { cells: c2 } = updated else {
-                                unreachable!()
-                            };
-                            return self.split_index_leaf(pgno, c2);
-                        }
-                        Ordering::Greater => {
-                            pos = i;
-                            break;
-                        }
+                let (pos, is_equal) =
+                    self.lower_bound_index_leaf_cells(&cells, key_vals, orders, enc)?;
+                if is_equal {
+                    let old = std::mem::replace(&mut cells[pos], new_cell);
+                    self.free_overflow_chain(old.overflow_page)?;
+                    let updated = ParsedPage::IndexLeaf { cells };
+                    if updated.fits_in_page(pgno, usable) {
+                        self.write_parsed_page(pgno, &updated)?;
+                        return Ok(None);
                     }
+                    let ParsedPage::IndexLeaf { cells: c2 } = updated else {
+                        unreachable!()
+                    };
+                    return self.split_index_leaf(pgno, c2);
                 }
                 cells.insert(pos, new_cell);
                 let candidate = ParsedPage::IndexLeaf { cells };
@@ -2547,43 +2798,31 @@ impl Btree {
                 mut cells,
                 mut right_child,
             } => {
-                let mut idx = cells.len();
-                for (i, existing) in cells.iter().enumerate() {
-                    let rec = self.read_full_payload(
-                        existing.total_payload_len,
-                        &existing.local_payload,
-                        existing.overflow_page,
-                    )?;
-                    match compare_records_with_encoding(&rec, key_vals, orders, enc)? {
-                        Ordering::Less => continue,
-                        Ordering::Equal => {
-                            let old_ovfl = existing.overflow_page;
-                            cells[i] = IndexInteriorCell {
-                                left_child: existing.left_child,
-                                total_payload_len: new_cell.total_payload_len,
-                                local_payload: new_cell.local_payload,
-                                overflow_page: new_cell.overflow_page,
-                            };
-                            self.free_overflow_chain(old_ovfl)?;
-                            let updated = ParsedPage::IndexInterior { cells, right_child };
-                            if updated.fits_in_page(pgno, usable) {
-                                self.write_parsed_page(pgno, &updated)?;
-                                return Ok(None);
-                            }
-                            let ParsedPage::IndexInterior {
-                                cells: c2,
-                                right_child: rc2,
-                            } = updated
-                            else {
-                                unreachable!()
-                            };
-                            return self.split_index_interior(pgno, c2, rc2);
-                        }
-                        Ordering::Greater => {
-                            idx = i;
-                            break;
-                        }
+                let (idx, is_equal) =
+                    self.lower_bound_index_interior_cells(&cells, key_vals, orders, enc)?;
+                if is_equal {
+                    let old_ovfl = cells[idx].overflow_page;
+                    let left_child = cells[idx].left_child;
+                    cells[idx] = IndexInteriorCell {
+                        left_child,
+                        total_payload_len: new_cell.total_payload_len,
+                        local_payload: new_cell.local_payload,
+                        overflow_page: new_cell.overflow_page,
+                    };
+                    self.free_overflow_chain(old_ovfl)?;
+                    let updated = ParsedPage::IndexInterior { cells, right_child };
+                    if updated.fits_in_page(pgno, usable) {
+                        self.write_parsed_page(pgno, &updated)?;
+                        return Ok(None);
                     }
+                    let ParsedPage::IndexInterior {
+                        cells: c2,
+                        right_child: rc2,
+                    } = updated
+                    else {
+                        unreachable!()
+                    };
+                    return self.split_index_interior(pgno, c2, rc2);
                 }
 
                 let target_child = if idx < cells.len() {
@@ -2603,27 +2842,8 @@ impl Btree {
                     else {
                         return Err(SqliteError::corrupt("expected index leaf page"));
                     };
-                    let mut pos = target_cells.len();
-                    let mut replaced = false;
-                    for (i, existing) in target_cells.iter().enumerate() {
-                        let rec = self.read_full_payload(
-                            existing.total_payload_len,
-                            &existing.local_payload,
-                            existing.overflow_page,
-                        )?;
-                        match compare_records_with_encoding(&rec, key_vals, orders, enc)? {
-                            Ordering::Less => continue,
-                            Ordering::Equal => {
-                                pos = i;
-                                replaced = true;
-                                break;
-                            }
-                            Ordering::Greater => {
-                                pos = i;
-                                break;
-                            }
-                        }
-                    }
+                    let (pos, replaced) =
+                        self.lower_bound_index_leaf_cells(&target_cells, key_vals, orders, enc)?;
                     if replaced {
                         let old = std::mem::replace(&mut target_cells[pos], new_cell);
                         self.free_overflow_chain(old.overflow_page)?;

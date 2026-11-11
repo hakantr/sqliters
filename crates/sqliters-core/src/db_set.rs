@@ -35,6 +35,14 @@ pub enum ResolvedRelation {
     View(Box<ViewSchema>),
 }
 
+/// Borrowed relation reference located in [`DatabaseSet`] without cloning [`TableSchema`] or [`ViewSchema`].
+#[derive(Debug, Clone, Copy)]
+pub enum RelationRef<'a> {
+    CatalogTable,
+    Table(&'a TableSchema),
+    View(&'a ViewSchema),
+}
+
 /// Connection-unique monotonic identity for a database schema instance.
 ///
 /// Unlike numeric [`DatabaseId`] slot indices — which shift left when an earlier attached
@@ -860,6 +868,14 @@ impl DatabaseSet {
         order
     }
 
+    #[inline]
+    fn unqualified_search_ids(&self) -> impl Iterator<Item = DatabaseId> + '_ {
+        let temp = self.slots[1].btree.is_some().then_some(DatabaseId::TEMP);
+        temp.into_iter()
+            .chain(std::iter::once(DatabaseId::MAIN))
+            .chain((2..self.slots.len()).map(DatabaseId))
+    }
+
     /// Returns `true` if `table_name` is a built-in catalog table name in `db_id`.
     #[inline]
     pub fn is_catalog_table_in_db(db_id: DatabaseId, table_name: &str) -> bool {
@@ -985,6 +1001,78 @@ impl DatabaseSet {
         }
     }
 
+    /// Locates a relation by reference without cloning [`TableSchema`] or [`ViewSchema`].
+    pub fn find_relation_ref_in_set(
+        &self,
+        qname: &QualifiedName,
+    ) -> Result<Option<(DatabaseId, RelationRef<'_>)>> {
+        if let Some(cat_db_id) = self.resolve_catalog_table(qname)? {
+            return Ok(Some((cat_db_id, RelationRef::CatalogTable)));
+        }
+        if let Some(ref s) = qname.schema {
+            let Some(db_id) = self.find_db_id(s) else {
+                return Ok(None);
+            };
+            let Some(slot) = self.slot(db_id) else {
+                return Ok(None);
+            };
+            if slot.btree.is_none() {
+                return Ok(None);
+            }
+            if let Some(tbl) = slot.schema.find_user_table(&qname.name) {
+                return Ok(Some((db_id, RelationRef::Table(tbl))));
+            }
+            if let Some(view) = slot.schema.find_view(&qname.name) {
+                return Ok(Some((db_id, RelationRef::View(view))));
+            }
+            Ok(None)
+        } else {
+            // Unqualified search order: `temp` (if open) -> `main` -> `attached[2..]` without Vec alloc!
+            if self.slots[1].btree.is_some() {
+                let slot = &self.slots[1];
+                if let Some(tbl) = slot.schema.find_user_table(&qname.name) {
+                    return Ok(Some((DatabaseId::TEMP, RelationRef::Table(tbl))));
+                }
+                if let Some(view) = slot.schema.find_view(&qname.name) {
+                    return Ok(Some((DatabaseId::TEMP, RelationRef::View(view))));
+                }
+            }
+            {
+                let slot = &self.slots[0];
+                if let Some(tbl) = slot.schema.find_user_table(&qname.name) {
+                    return Ok(Some((DatabaseId::MAIN, RelationRef::Table(tbl))));
+                }
+                if let Some(view) = slot.schema.find_view(&qname.name) {
+                    return Ok(Some((DatabaseId::MAIN, RelationRef::View(view))));
+                }
+            }
+            for idx in 2..self.slots.len() {
+                let slot = &self.slots[idx];
+                if let Some(tbl) = slot.schema.find_user_table(&qname.name) {
+                    return Ok(Some((DatabaseId(idx), RelationRef::Table(tbl))));
+                }
+                if let Some(view) = slot.schema.find_view(&qname.name) {
+                    return Ok(Some((DatabaseId(idx), RelationRef::View(view))));
+                }
+            }
+            Ok(None)
+        }
+    }
+
+    /// Returns `true` if any slot has at least one persistent virtual table in its schema.
+    #[inline]
+    pub fn has_any_virtual_tables(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|s| !s.schema.virtual_tables.is_empty())
+    }
+
+    /// Returns `true` if any slot has at least one trigger in its schema.
+    #[inline]
+    pub fn has_any_triggers(&self) -> bool {
+        self.slots.iter().any(|s| !s.schema.triggers.is_empty())
+    }
+
     /// Locates a view across [`DatabaseSet`] (`temp -> main -> attached` when unqualified).
     pub fn find_view_in_set(&self, qname: &QualifiedName) -> Option<(DatabaseId, &ViewSchema)> {
         if let Some(ref s) = qname.schema {
@@ -993,7 +1081,7 @@ impl DatabaseSet {
             slot.btree.as_ref()?;
             slot.schema.find_view(&qname.name).map(|v| (db_id, v))
         } else {
-            for db_id in self.unqualified_search_order() {
+            for db_id in self.unqualified_search_ids() {
                 if let Some(slot) = self.slot(db_id) {
                     if slot.schema.find_user_table(&qname.name).is_some()
                         || slot.schema.find_virtual_table(&qname.name).is_some()
@@ -1020,7 +1108,7 @@ impl DatabaseSet {
             slot.btree.as_ref()?;
             slot.schema.find_user_table(&qname.name).map(|t| (db_id, t))
         } else {
-            for db_id in self.unqualified_search_order() {
+            for db_id in self.unqualified_search_ids() {
                 if let Some(slot) = self.slot(db_id) {
                     if let Some(tbl) = slot.schema.find_user_table(&qname.name) {
                         return Some((db_id, tbl));
@@ -1049,7 +1137,7 @@ impl DatabaseSet {
                 .find_virtual_table(&qname.name)
                 .map(|vt| (db_id, vt))
         } else {
-            for db_id in self.unqualified_search_order() {
+            for db_id in self.unqualified_search_ids() {
                 if let Some(slot) = self.slot(db_id) {
                     if let Some(vt) = slot.schema.find_virtual_table(&qname.name) {
                         return Some((db_id, vt));
@@ -1065,12 +1153,22 @@ impl DatabaseSet {
         }
     }
 
-    /// Looks up an already-connected virtual table (persistent or eponymous) across [`DatabaseSet`].
-    pub fn find_connected_vtab_in_set(
+    /// Looks up an already-connected virtual table entry by reference with zero heap allocations.
+    pub fn find_connected_vtab_entry_in_set(
         &self,
         qname: &QualifiedName,
         allow_eponymous: bool,
-    ) -> Option<(DatabaseId, String, String, &crate::vtab::VTabDeclaredSchema)> {
+    ) -> Option<(DatabaseId, &str, &crate::vtab::ConnectedVTabEntry)> {
+        if self
+            .vtab_registry
+            .get_connected("main", &qname.name)
+            .is_none()
+            && qname.schema.is_none()
+            && self.slots.len() <= 2
+            && self.slots[1].btree.is_none()
+        {
+            return None;
+        }
         if let Some(ref s) = qname.schema {
             let db_id = self.find_db_id(s)?;
             let slot = self.slot(db_id)?;
@@ -1080,24 +1178,14 @@ impl DatabaseSet {
             if let Some(vt) = slot.schema.find_virtual_table(&qname.name)
                 && let Some(entry) = self.vtab_registry.get_connected(&slot.name, &vt.name)
             {
-                return Some((
-                    db_id,
-                    slot.name.clone(),
-                    entry.table_name.clone(),
-                    &entry.declared,
-                ));
+                return Some((db_id, slot.name.as_str(), entry));
             }
             if allow_eponymous
                 && slot.schema.find_user_table(&qname.name).is_none()
                 && slot.schema.find_view(&qname.name).is_none()
                 && let Some(entry) = self.vtab_registry.get_connected(&slot.name, &qname.name)
             {
-                return Some((
-                    db_id,
-                    slot.name.clone(),
-                    entry.table_name.clone(),
-                    &entry.declared,
-                ));
+                return Some((db_id, slot.name.as_str(), entry));
             }
             return None;
         }
@@ -1106,12 +1194,7 @@ impl DatabaseSet {
             && let Some(slot) = self.slot(db_id)
             && let Some(entry) = self.vtab_registry.get_connected(&slot.name, &vt.name)
         {
-            return Some((
-                db_id,
-                slot.name.clone(),
-                entry.table_name.clone(),
-                &entry.declared,
-            ));
+            return Some((db_id, slot.name.as_str(), entry));
         }
 
         if allow_eponymous
@@ -1119,14 +1202,31 @@ impl DatabaseSet {
             && self.find_view_in_set(qname).is_none()
             && let Some(entry) = self.vtab_registry.get_connected("main", &qname.name)
         {
-            return Some((
-                DatabaseId::MAIN,
-                "main".to_owned(),
-                entry.table_name.clone(),
-                &entry.declared,
-            ));
+            return Some((DatabaseId::MAIN, "main", entry));
         }
         None
+    }
+
+    /// Looks up an already-connected virtual table (persistent or eponymous) across [`DatabaseSet`].
+    pub fn find_connected_vtab_in_set(
+        &self,
+        qname: &QualifiedName,
+        allow_eponymous: bool,
+    ) -> Option<(
+        DatabaseId,
+        String,
+        String,
+        &std::sync::Arc<crate::vtab::VTabDeclaredSchema>,
+    )> {
+        self.find_connected_vtab_entry_in_set(qname, allow_eponymous)
+            .map(|(db_id, db_name, entry)| {
+                (
+                    db_id,
+                    db_name.to_owned(),
+                    entry.table_name.clone(),
+                    &entry.declared,
+                )
+            })
     }
 
     /// Finds a database slot by its stable [`SchemaInstanceId`].

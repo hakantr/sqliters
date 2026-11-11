@@ -151,11 +151,30 @@ impl std::fmt::Debug for ScalarFunctionDef {
     }
 }
 
+#[inline]
+fn with_ascii_upper_key<R>(name: &str, f: impl for<'k> FnOnce(&'k str) -> R) -> R {
+    let bytes = name.as_bytes();
+    if bytes.iter().all(|b| !b.is_ascii_lowercase()) {
+        return f(name);
+    }
+    if bytes.len() <= 64 {
+        let mut buf = [0u8; 64];
+        for (dst, &src) in buf[..bytes.len()].iter_mut().zip(bytes) {
+            *dst = src.to_ascii_uppercase();
+        }
+        let s = std::str::from_utf8(&buf[..bytes.len()]).unwrap_or(name);
+        return f(s);
+    }
+    let owned = name.to_ascii_uppercase();
+    f(&owned)
+}
+
 /// Connection-level registry for custom and extension scalar, aggregate, and window SQL functions.
 #[derive(Debug, Default, Clone)]
 pub struct FunctionRegistry {
     scalars: BTreeMap<String, Vec<ScalarFunctionDef>>,
     aggregates: BTreeMap<String, Vec<WindowFunctionDef>>,
+    user_modified: bool,
 }
 
 impl FunctionRegistry {
@@ -163,6 +182,20 @@ impl FunctionRegistry {
     #[inline]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Marks built-in extension function registration complete so fast paths can check
+    /// [`Self::has_user_functions`] in O(1).
+    #[inline]
+    pub fn mark_builtin_init_complete(&mut self) {
+        self.user_modified = false;
+    }
+
+    /// Returns `true` if any user-defined scalar, aggregate, or window function has been
+    /// registered or unregistered after built-in extension initialization.
+    #[inline]
+    pub fn has_user_functions(&self) -> bool {
+        self.user_modified
     }
 
     /// Registers or replaces a scalar function (`arity: Some(n)` for fixed arity, `None` for variadic).
@@ -175,6 +208,7 @@ impl FunctionRegistry {
     ) where
         F: Fn(&[RuntimeValue]) -> Result<RuntimeValue> + Send + Sync + 'static,
     {
+        self.user_modified = true;
         let name = name.into();
         let key = name.to_ascii_uppercase();
         let def = ScalarFunctionDef {
@@ -193,6 +227,7 @@ impl FunctionRegistry {
 
     /// Removes a registered scalar function overload, returning `true` if one was removed.
     pub fn unregister_scalar(&mut self, name: &str, arity: Option<usize>) -> bool {
+        self.user_modified = true;
         let key = name.to_ascii_uppercase();
         let Some(overloads) = self.scalars.get_mut(&key) else {
             return false;
@@ -209,13 +244,20 @@ impl FunctionRegistry {
     /// Returns `true` if any scalar overload with `name` (ASCII case-insensitive) is registered.
     #[inline]
     pub fn has_scalar_name(&self, name: &str) -> bool {
-        self.scalars.contains_key(&name.to_ascii_uppercase())
+        if self.scalars.is_empty() {
+            return false;
+        }
+        with_ascii_upper_key(name, |k| self.scalars.contains_key(k))
     }
 
     /// Finds the best matching registered scalar overload for `(name, argc)` (exact arity preferred
     /// over variadic `None`, matching `sqlite3FindFunction`).
+    #[inline]
     pub fn find_scalar(&self, name: &str, argc: usize) -> Option<&ScalarFunctionDef> {
-        let overloads = self.scalars.get(&name.to_ascii_uppercase())?;
+        if self.scalars.is_empty() {
+            return None;
+        }
+        let overloads = with_ascii_upper_key(name, |k| self.scalars.get(k))?;
         overloads
             .iter()
             .find(|d| d.arity == Some(argc))
@@ -234,6 +276,7 @@ impl FunctionRegistry {
     ) where
         F: Fn() -> Box<dyn WindowAggregateInstance> + Send + Sync + 'static,
     {
+        self.user_modified = true;
         let name = name.into();
         let key = name.to_ascii_uppercase();
         let def = WindowFunctionDef {
@@ -255,12 +298,19 @@ impl FunctionRegistry {
     /// Returns `true` if any custom aggregate/window overload with `name` (ASCII case-insensitive) is registered.
     #[inline]
     pub fn has_aggregate_name(&self, name: &str) -> bool {
-        self.aggregates.contains_key(&name.to_ascii_uppercase())
+        if self.aggregates.is_empty() {
+            return false;
+        }
+        with_ascii_upper_key(name, |k| self.aggregates.contains_key(k))
     }
 
     /// Finds the best matching registered aggregate/window overload for `(name, argc)`.
+    #[inline]
     pub fn find_aggregate(&self, name: &str, argc: usize) -> Option<&WindowFunctionDef> {
-        let overloads = self.aggregates.get(&name.to_ascii_uppercase())?;
+        if self.aggregates.is_empty() {
+            return None;
+        }
+        let overloads = with_ascii_upper_key(name, |k| self.aggregates.get(k))?;
         overloads
             .iter()
             .find(|d| d.arity == Some(argc))

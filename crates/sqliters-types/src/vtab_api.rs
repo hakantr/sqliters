@@ -176,6 +176,87 @@ pub trait VTabHostContext {
     fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<usize>;
     /// Executes an internal SQL query within the active connection/transaction context and returns all rows.
     fn query_sql(&mut self, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>>;
+
+    /// Point-reads a single row by `rowid` from a standard rowid shadow table in `self.db_name()`.
+    /// Defaults to `query_sql` so custom/mock [`VTabHostContext`] implementations work unchanged.
+    fn shadow_get_rowid(&mut self, shadow_table: &str, rowid: i64) -> Result<Option<Vec<Value>>> {
+        let db_q = quote_vtab_sql_ident(self.db_name());
+        let tbl_q = quote_vtab_sql_ident(shadow_table);
+        let sql = format!("SELECT * FROM {db_q}.{tbl_q} WHERE rowid = ?1");
+        let mut rows = self.query_sql(&sql, &[Value::Integer(rowid)])?;
+        Ok(rows.pop())
+    }
+
+    /// Inserts (or replaces when `or_replace` is `true`) a single row at `rowid` in `shadow_table`.
+    /// `cols` matches the declared columns of `shadow_table` (with `rowid` at the `INTEGER PRIMARY KEY` slot).
+    fn shadow_put_rowid(
+        &mut self,
+        shadow_table: &str,
+        rowid: i64,
+        cols: &[Value],
+        or_replace: bool,
+    ) -> Result<()> {
+        let db_q = quote_vtab_sql_ident(self.db_name());
+        let tbl_q = quote_vtab_sql_ident(shadow_table);
+        let verb = if or_replace {
+            "INSERT OR REPLACE"
+        } else {
+            "INSERT"
+        };
+        if cols.is_empty() {
+            let sql = format!("{verb} INTO {db_q}.{tbl_q}(rowid) VALUES (?1)");
+            self.execute_sql(&sql, &[Value::Integer(rowid)])?;
+            return Ok(());
+        }
+        let mut ph = String::with_capacity(cols.len() * 4);
+        for i in 0..cols.len() {
+            if i > 0 {
+                ph.push_str(", ");
+            }
+            ph.push('?');
+            ph.push_str(&(i + 1).to_string());
+        }
+        let sql = format!("{verb} INTO {db_q}.{tbl_q} VALUES ({ph})");
+        self.execute_sql(&sql, cols)?;
+        Ok(())
+    }
+
+    /// Deletes a single row by `rowid` from `shadow_table`, returning `true` if a row was removed.
+    fn shadow_delete_rowid(&mut self, shadow_table: &str, rowid: i64) -> Result<bool> {
+        let db_q = quote_vtab_sql_ident(self.db_name());
+        let tbl_q = quote_vtab_sql_ident(shadow_table);
+        let sql = format!("DELETE FROM {db_q}.{tbl_q} WHERE rowid = ?1");
+        Ok(self.execute_sql(&sql, &[Value::Integer(rowid)])? > 0)
+    }
+
+    /// Zero-allocation fast check: returns `Ok(Some(true))` if `rowid` in `shadow_table` has a
+    /// `BLOB` at `col_idx` equal to `expected`, `Ok(Some(false))` if missing or different, or
+    /// `Ok(None)` if unsupported so the caller falls back to `shadow_get_rowid`.
+    fn shadow_rowid_blob_eq(
+        &mut self,
+        _shadow_table: &str,
+        _rowid: i64,
+        _col_idx: usize,
+        _expected: &[u8],
+    ) -> Result<Option<bool>> {
+        Ok(None)
+    }
+
+    /// Returns `MAX(rowid)` from `shadow_table`, or `None` if the table is empty.
+    fn shadow_max_rowid(&mut self, shadow_table: &str) -> Result<Option<i64>> {
+        let db_q = quote_vtab_sql_ident(self.db_name());
+        let tbl_q = quote_vtab_sql_ident(shadow_table);
+        let sql = format!("SELECT max(rowid) FROM {db_q}.{tbl_q}");
+        let rows = self.query_sql(&sql, &[])?;
+        match rows.first().and_then(|r| r.first()) {
+            Some(Value::Integer(v)) => Ok(Some(*v)),
+            _ => Ok(None),
+        }
+    }
+}
+
+fn quote_vtab_sql_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
 /// Factory and metadata trait for a virtual table module (`sqlite3_module`).
@@ -288,6 +369,14 @@ pub trait VirtualTable: Send + Sync {
     fn disconnect(&mut self) -> Result<()> {
         Ok(())
     }
+
+    /// Flushes any pending in-memory shadow mutations before external SQL reads or modifies a shadow table.
+    fn flush_before_shadow_access(&mut self, _ctx: &mut dyn VTabHostContext) -> Result<()> {
+        Ok(())
+    }
+
+    /// Invalidates any in-memory shadow-table cache when external SQL touches shadow tables directly.
+    fn invalidate_shadow_cache(&mut self) {}
 }
 
 /// Cursor over a virtual table (`sqlite3_vtab_cursor`).

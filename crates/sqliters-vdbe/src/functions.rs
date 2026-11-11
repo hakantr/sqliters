@@ -131,11 +131,27 @@ pub fn format_utc_timestamp(unix_ms: i64) -> String {
     format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}")
 }
 
-/// Returns the [`FunctionFlags`] metadata for a built-in scalar SQL function (`func.c`), or
-/// `None` if `name` is not a recognized built-in scalar function.
-pub fn builtin_scalar_flags(name: &str, enable_test_functions: bool) -> Option<FunctionFlags> {
-    let upper = name.to_ascii_uppercase();
-    match upper.as_str() {
+#[inline]
+fn with_ascii_upper<R>(name: &str, f: impl FnOnce(&str) -> R) -> R {
+    let bytes = name.as_bytes();
+    if bytes.iter().all(|b| !b.is_ascii_lowercase()) {
+        return f(name);
+    }
+    if bytes.len() <= 64 {
+        let mut buf = [0u8; 64];
+        for (dst, &src) in buf[..bytes.len()].iter_mut().zip(bytes) {
+            *dst = src.to_ascii_uppercase();
+        }
+        let s = std::str::from_utf8(&buf[..bytes.len()]).unwrap_or(name);
+        return f(s);
+    }
+    let owned = name.to_ascii_uppercase();
+    f(&owned)
+}
+
+#[inline]
+fn builtin_scalar_flags_upper(upper: &str, enable_test_functions: bool) -> Option<FunctionFlags> {
+    match upper {
         "SUBTYPE" => {
             Some(FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS | FunctionFlags::SUBTYPE)
         }
@@ -167,9 +183,17 @@ pub fn builtin_scalar_flags(name: &str, enable_test_functions: bool) -> Option<F
         }
         "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" | "DATE" | "TIME" | "DATETIME"
         | "UNIXEPOCH" | "JULIANDAY" | "STRFTIME" => Some(FunctionFlags::INNOCUOUS),
-        _ => scalar_function_arity_with_flag(&upper, enable_test_functions)
+        _ => scalar_function_arity_with_flag(upper, enable_test_functions)
             .map(|_| FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS),
     }
+}
+
+/// Returns the [`FunctionFlags`] metadata for a built-in scalar SQL function (`func.c`), or
+/// `None` if `name` is not a recognized built-in scalar function.
+pub fn builtin_scalar_flags(name: &str, enable_test_functions: bool) -> Option<FunctionFlags> {
+    with_ascii_upper(name, |upper| {
+        builtin_scalar_flags_upper(upper, enable_test_functions)
+    })
 }
 
 /// Evaluates a built-in SQLite scalar function with [`RuntimeValue`] subtype semantics and strict
@@ -190,14 +214,24 @@ pub fn eval_scalar_function_rt_with_strict(
     ctx: &VmRuntimeContext,
     strict_subtype: bool,
 ) -> Result<RuntimeValue> {
-    let flags = builtin_scalar_flags(name, ctx.enable_test_functions)
+    with_ascii_upper(name, |upper| {
+        eval_scalar_function_rt_upper(name, upper, args, ctx, strict_subtype)
+    })
+}
+
+fn eval_scalar_function_rt_upper(
+    name: &str,
+    upper: &str,
+    args: &[RuntimeValue],
+    ctx: &VmRuntimeContext,
+    strict_subtype: bool,
+) -> Result<RuntimeValue> {
+    let flags = builtin_scalar_flags_upper(upper, ctx.enable_test_functions)
         .ok_or_else(|| SqliteError::new(ErrorCode::Error, format!("no such function: {name}")))?;
     let mut scratch = Vec::new();
     let filtered = strip_unsubscribed_subtypes(flags, args, &mut scratch);
-    let upper = name.to_ascii_uppercase();
-    let canonical = name.to_ascii_lowercase();
 
-    let raw_out = match upper.as_str() {
+    let raw_out = match upper {
         "SUBTYPE" => {
             check_arity_rt(name, filtered, 1, 1)?;
             RuntimeValue::plain(Value::Integer(i64::from(filtered[0].subtype)))
@@ -396,12 +430,16 @@ pub fn eval_scalar_function_rt_with_strict(
         }
         _ => {
             let plain_vals: Vec<Value> = filtered.iter().map(|rv| rv.value.clone()).collect();
-            let v = eval_scalar_function_plain(name, &upper, &plain_vals, ctx)?;
+            let v = eval_scalar_function_plain(name, upper, &plain_vals, ctx)?;
             RuntimeValue::plain(v)
         }
     };
 
-    enforce_result_subtype_contract(&canonical, flags, strict_subtype, raw_out)
+    if raw_out.subtype != 0 && !flags.contains(FunctionFlags::RESULT_SUBTYPE) && strict_subtype {
+        let canonical = name.to_ascii_lowercase();
+        return enforce_result_subtype_contract(&canonical, flags, strict_subtype, raw_out);
+    }
+    Ok(raw_out)
 }
 
 /// Evaluates a built-in SQLite scalar function (`func.c`), discarding any ephemeral result subtype.
@@ -1680,7 +1718,7 @@ fn glob_rec(pat: &[char], txt: &[char]) -> bool {
                 }
                 let ch = txt[ti];
                 pi += 1;
-                let invert = pi < pat.len() && (pat[pi] == '^' || pat[pi] == '!');
+                let invert = pi < pat.len() && pat[pi] == '^';
                 if invert {
                     pi += 1;
                 }

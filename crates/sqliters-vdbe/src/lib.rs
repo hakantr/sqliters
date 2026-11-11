@@ -13,7 +13,7 @@ use sqliters_btree::{Btree, CursorId};
 use sqliters_types::{
     AggregateStepId, Collation, DatabaseId, ErrorCode, ExecutionServices, KeySortOrder, Pgno,
     Result, RuntimeValue, SqliteError, TextEncoding, TypeAffinity, Value,
-    decode_record_with_encoding, encode_record_with_encoding, fallible_sort_by,
+    decode_record_with_encoding, encode_runtime_record_with_encoding, fallible_sort_by,
 };
 
 pub use functions::{
@@ -254,6 +254,7 @@ pub enum Opcode {
     JumpIfTrue,
     JumpIfFalse,
     JumpIfNull,
+    MustBeInt,
     Affinity,
     Cast,
     Function,
@@ -329,6 +330,7 @@ impl Opcode {
             Self::JumpIfTrue => "If",
             Self::JumpIfFalse => "IfNot",
             Self::JumpIfNull => "IfNull",
+            Self::MustBeInt => "MustBeInt",
             Self::Affinity => "Affinity",
             Self::Cast => "Cast",
             Self::Function => "Function",
@@ -505,6 +507,7 @@ pub enum VmStep {
     Done,
 }
 
+#[derive(Debug)]
 enum CursorState {
     Closed,
     Table {
@@ -530,6 +533,42 @@ enum CursorState {
         rows: Vec<Vec<Value>>,
         pos: usize,
     },
+}
+
+/// Reusable register and cursor scratch buffers for zero-allocation execution of compiled
+/// write [`VdbeProgram`]s across repeated prepared statement executions.
+#[derive(Debug, Default)]
+pub struct VdbeWriteScratch {
+    regs: Vec<RuntimeValue>,
+    cursors: Vec<CursorState>,
+}
+
+#[inline]
+fn ensure_cursor_slot_vec(cursors: &mut Vec<CursorState>, cid: usize) {
+    if cid >= cursors.len() {
+        cursors.resize_with(cid + 1, || CursorState::Closed);
+    }
+}
+
+#[inline]
+fn close_cursor_slot_vec(cursors: &mut [CursorState], cid: usize, storage: &mut dyn BtreeAccess) {
+    if cid < cursors.len() {
+        match std::mem::replace(&mut cursors[cid], CursorState::Closed) {
+            CursorState::Table { db, cursor_id, .. } | CursorState::Index { db, cursor_id, .. } => {
+                if let Ok(btree) = storage.btree_mut(db) {
+                    btree.close_cursor(cursor_id);
+                }
+            }
+            CursorState::Closed | CursorState::Ephemeral { .. } | CursorState::Sorter { .. } => {}
+        }
+    }
+}
+
+#[inline]
+fn close_cursors_vec(cursors: &mut [CursorState], storage: &mut dyn BtreeAccess) {
+    for cid in 0..cursors.len() {
+        close_cursor_slot_vec(cursors, cid, storage);
+    }
 }
 
 /// Stateful VDBE virtual machine executing a [`VdbeProgram`] step-by-step (`sqlite3_step`).
@@ -562,35 +601,51 @@ impl VdbeVm {
         }
     }
 
-    #[inline]
-    fn ensure_cursor_slot(&mut self, cid: usize) {
-        if cid >= self.cursors.len() {
-            self.cursors.resize_with(cid + 1, || CursorState::Closed);
+    /// Executes a non-returning write [`VdbeProgram`] to completion using reusable `scratch`
+    /// register and cursor buffers without cloning `program` or `params`.
+    pub fn run_write_program(
+        program: &VdbeProgram,
+        params: &[Value],
+        runtime_ctx: &mut VmRuntimeContext,
+        scratch: &mut VdbeWriteScratch,
+        storage: &mut dyn BtreeAccess,
+        services: &mut dyn ExecutionServices,
+    ) -> Result<()> {
+        let n_regs = program.num_registers.max(1) + 4;
+        if scratch.regs.len() < n_regs {
+            scratch.regs.resize(n_regs, RuntimeValue::null());
         }
-    }
-
-    #[inline]
-    fn close_cursor_slot(&mut self, cid: usize, storage: &mut dyn BtreeAccess) {
-        if cid < self.cursors.len() {
-            match std::mem::replace(&mut self.cursors[cid], CursorState::Closed) {
-                CursorState::Table { db, cursor_id, .. }
-                | CursorState::Index { db, cursor_id, .. } => {
-                    if let Ok(btree) = storage.btree_mut(db) {
-                        btree.close_cursor(cursor_id);
-                    }
-                }
-                CursorState::Closed
-                | CursorState::Ephemeral { .. }
-                | CursorState::Sorter { .. } => {}
-            }
+        let n_curs = program.num_cursors + 2;
+        if scratch.cursors.len() < n_curs {
+            scratch.cursors.resize_with(n_curs, || CursorState::Closed);
+        }
+        let mut pc = 0usize;
+        let mut halted = false;
+        let res = step_ops(
+            &program.ops,
+            &mut pc,
+            &mut halted,
+            &mut scratch.regs,
+            &mut scratch.cursors,
+            params,
+            runtime_ctx,
+            storage,
+            services,
+        );
+        close_cursors_vec(&mut scratch.cursors, storage);
+        scratch.regs[..n_regs].fill(RuntimeValue::null());
+        match res {
+            Ok(VmStep::Done) => Ok(()),
+            Ok(VmStep::Row(_)) => Err(SqliteError::misuse(
+                "unexpected ResultRow in write VDBE program",
+            )),
+            Err(err) => Err(err),
         }
     }
 
     /// Closes all open [`Btree`] cursors owned by this VM without resetting program state.
     pub fn close_cursors(&mut self, storage: &mut dyn BtreeAccess) {
-        for cid in 0..self.cursors.len() {
-            self.close_cursor_slot(cid, storage);
-        }
+        close_cursors_vec(&mut self.cursors, storage);
     }
 
     /// Closes all open [`Btree`] cursors and resets the VM back to PC 0.
@@ -626,7 +681,17 @@ impl VdbeVm {
         if self.halted {
             return Ok(VmStep::Done);
         }
-        match self.step_inner(storage, services) {
+        match step_ops(
+            &self.program.ops,
+            &mut self.pc,
+            &mut self.halted,
+            &mut self.regs,
+            &mut self.cursors,
+            &self.params,
+            &mut self.runtime_ctx,
+            storage,
+            services,
+        ) {
             Ok(VmStep::Row(row)) => Ok(VmStep::Row(row)),
             Ok(VmStep::Done) => {
                 self.halted = true;
@@ -640,803 +705,803 @@ impl VdbeVm {
             }
         }
     }
+}
 
-    fn step_inner(
-        &mut self,
-        storage: &mut dyn BtreeAccess,
-        services: &mut dyn ExecutionServices,
-    ) -> Result<VmStep> {
-        while self.pc < self.program.ops.len() {
-            services.check_interrupted()?;
-            services.tick_progress()?;
-            let ins = self.program.ops[self.pc].clone();
-            let mut next_pc = self.pc + 1;
+#[allow(clippy::too_many_arguments)]
+fn step_ops(
+    ops: &[Instruction],
+    pc: &mut usize,
+    halted: &mut bool,
+    regs: &mut [RuntimeValue],
+    cursors: &mut Vec<CursorState>,
+    params: &[Value],
+    runtime_ctx: &mut VmRuntimeContext,
+    storage: &mut dyn BtreeAccess,
+    services: &mut dyn ExecutionServices,
+) -> Result<VmStep> {
+    while *pc < ops.len() {
+        services.check_interrupted()?;
+        services.tick_progress()?;
+        let ins = &ops[*pc];
+        let mut next_pc = *pc + 1;
 
-            match ins.opcode {
-                Opcode::Init => {
-                    if ins.p2 > 0 {
-                        next_pc = ins.p2 as usize;
-                    }
-                }
-                Opcode::Noop => {}
-                Opcode::Goto => {
+        match ins.opcode {
+            Opcode::Init => {
+                if ins.p2 > 0 {
                     next_pc = ins.p2 as usize;
                 }
-                Opcode::Halt => {
-                    self.halted = true;
-                    self.close_cursors(storage);
-                    if ins.p1 != 0 {
-                        let code = ErrorCode::from_raw_primary(ins.p1);
-                        let msg = match &ins.p4 {
-                            P4::Str(s) => s.clone(),
-                            _ => code.as_str().to_owned(),
-                        };
-                        return Err(SqliteError::with_extended(ins.p1, msg));
-                    }
-                    return Ok(VmStep::Done);
-                }
-                Opcode::Transaction => {
-                    let db = if ins.db != DatabaseId::MAIN {
-                        ins.db
-                    } else {
-                        DatabaseId(ins.p1.max(0) as usize)
+            }
+            Opcode::Noop => {}
+            Opcode::Goto => {
+                next_pc = ins.p2 as usize;
+            }
+            Opcode::Halt => {
+                *halted = true;
+                close_cursors_vec(cursors, storage);
+                if ins.p1 != 0 {
+                    let code = ErrorCode::from_raw_primary(ins.p1);
+                    let msg = match &ins.p4 {
+                        P4::Str(s) => s.clone(),
+                        _ => code.as_str().to_owned(),
                     };
-                    let btree = storage.btree_mut(db)?;
-                    if ins.p2 >= 2 {
-                        btree.begin_exclusive()?;
-                    } else if ins.p2 != 0 {
-                        btree.begin_write()?;
-                    } else {
-                        btree.begin_read()?;
-                    }
+                    return Err(SqliteError::with_extended(ins.p1, msg));
                 }
-                Opcode::OpenRead | Opcode::OpenWrite => {
-                    let cid = ins.p1 as usize;
-                    let root_pgno = ins.p2 as Pgno;
-                    let writable = ins.opcode == Opcode::OpenWrite;
-                    let db = ins.db;
-                    self.ensure_cursor_slot(cid);
-                    self.close_cursor_slot(cid, storage);
-                    let btree = storage.btree_mut(db)?;
-                    let cursor_id = btree.open_table_cursor(root_pgno, writable);
-                    self.cursors[cid] = CursorState::Table {
+                return Ok(VmStep::Done);
+            }
+            Opcode::Transaction => {
+                let db = if ins.db != DatabaseId::MAIN {
+                    ins.db
+                } else {
+                    DatabaseId(ins.p1.max(0) as usize)
+                };
+                let btree = storage.btree_mut(db)?;
+                if ins.p2 >= 2 {
+                    btree.begin_exclusive()?;
+                } else if ins.p2 != 0 {
+                    btree.begin_write()?;
+                } else {
+                    btree.begin_read()?;
+                }
+            }
+            Opcode::OpenRead | Opcode::OpenWrite => {
+                let cid = ins.p1 as usize;
+                let root_pgno = ins.p2 as Pgno;
+                let writable = ins.opcode == Opcode::OpenWrite;
+                let db = ins.db;
+                ensure_cursor_slot_vec(cursors, cid);
+                close_cursor_slot_vec(cursors, cid, storage);
+                let btree = storage.btree_mut(db)?;
+                let cursor_id = btree.open_table_cursor(root_pgno, writable);
+                cursors[cid] = CursorState::Table {
+                    db,
+                    cursor_id,
+                    root_pgno,
+                    writable,
+                };
+            }
+            Opcode::OpenReadIndex | Opcode::OpenWriteIndex => {
+                let cid = ins.p1 as usize;
+                let root_pgno = ins.p2 as Pgno;
+                let writable = ins.opcode == Opcode::OpenWriteIndex;
+                let db = ins.db;
+                let orders = match &ins.p4 {
+                    P4::KeyInfo(k) => k.clone(),
+                    _ => Vec::new(),
+                };
+                ensure_cursor_slot_vec(cursors, cid);
+                close_cursor_slot_vec(cursors, cid, storage);
+                let btree = storage.btree_mut(db)?;
+                let cursor_id = btree.open_index_cursor(root_pgno, orders.clone(), writable);
+                cursors[cid] = CursorState::Index {
+                    db,
+                    cursor_id,
+                    root_pgno,
+                    orders,
+                    writable,
+                    eq_prefix: None,
+                };
+            }
+            Opcode::OpenEphemeral => {
+                let cid = ins.p1 as usize;
+                ensure_cursor_slot_vec(cursors, cid);
+                close_cursor_slot_vec(cursors, cid, storage);
+                cursors[cid] = CursorState::Ephemeral {
+                    rows: Vec::new(),
+                    pos: 0,
+                };
+            }
+            Opcode::Close => {
+                let cid = ins.p1 as usize;
+                close_cursor_slot_vec(cursors, cid, storage);
+            }
+            Opcode::Rewind => {
+                let cid = ins.p1 as usize;
+                let jump_empty = ins.p2 as usize;
+                match &mut cursors[cid] {
+                    CursorState::Table { db, cursor_id, .. } => {
+                        let (db, id) = (*db, *cursor_id);
+                        let btree = storage.btree_mut(db)?;
+                        if !btree.cursor_first(id)? {
+                            next_pc = jump_empty;
+                        }
+                    }
+                    CursorState::Index {
                         db,
                         cursor_id,
-                        root_pgno,
-                        writable,
-                    };
-                }
-                Opcode::OpenReadIndex | Opcode::OpenWriteIndex => {
-                    let cid = ins.p1 as usize;
-                    let root_pgno = ins.p2 as Pgno;
-                    let writable = ins.opcode == Opcode::OpenWriteIndex;
-                    let db = ins.db;
-                    let orders = match &ins.p4 {
-                        P4::KeyInfo(k) => k.clone(),
-                        _ => Vec::new(),
-                    };
-                    self.ensure_cursor_slot(cid);
-                    self.close_cursor_slot(cid, storage);
-                    let btree = storage.btree_mut(db)?;
-                    let cursor_id = btree.open_index_cursor(root_pgno, orders.clone(), writable);
-                    self.cursors[cid] = CursorState::Index {
-                        db,
-                        cursor_id,
-                        root_pgno,
-                        orders,
-                        writable,
-                        eq_prefix: None,
-                    };
-                }
-                Opcode::OpenEphemeral => {
-                    let cid = ins.p1 as usize;
-                    self.ensure_cursor_slot(cid);
-                    self.close_cursor_slot(cid, storage);
-                    self.cursors[cid] = CursorState::Ephemeral {
-                        rows: Vec::new(),
-                        pos: 0,
-                    };
-                }
-                Opcode::Close => {
-                    let cid = ins.p1 as usize;
-                    self.close_cursor_slot(cid, storage);
-                }
-                Opcode::Rewind => {
-                    let cid = ins.p1 as usize;
-                    let jump_empty = ins.p2 as usize;
-                    match &mut self.cursors[cid] {
-                        CursorState::Table { db, cursor_id, .. } => {
-                            let (db, id) = (*db, *cursor_id);
-                            let btree = storage.btree_mut(db)?;
-                            if !btree.cursor_first(id)? {
-                                next_pc = jump_empty;
-                            }
-                        }
-                        CursorState::Index {
-                            db,
-                            cursor_id,
-                            eq_prefix,
-                            ..
-                        } => {
-                            let (db, id) = (*db, *cursor_id);
-                            *eq_prefix = None;
-                            let btree = storage.btree_mut(db)?;
-                            if !btree.cursor_first(id)? {
-                                next_pc = jump_empty;
-                            }
-                        }
-                        CursorState::Ephemeral { rows, pos } => {
-                            *pos = 0;
-                            if rows.is_empty() {
-                                next_pc = jump_empty;
-                            }
-                        }
-                        _ => return Err(SqliteError::misuse("Rewind on invalid cursor")),
-                    }
-                }
-                Opcode::Next => {
-                    let cid = ins.p1 as usize;
-                    let loop_target = ins.p2 as usize;
-                    match &mut self.cursors[cid] {
-                        CursorState::Table { db, cursor_id, .. }
-                        | CursorState::Index { db, cursor_id, .. } => {
-                            let (db, id) = (*db, *cursor_id);
-                            let btree = storage.btree_mut(db)?;
-                            if btree.cursor_next(id)? {
-                                next_pc = loop_target;
-                            }
-                        }
-                        CursorState::Ephemeral { rows, pos } => {
-                            *pos += 1;
-                            if *pos < rows.len() {
-                                next_pc = loop_target;
-                            }
-                        }
-                        _ => return Err(SqliteError::misuse("Next on invalid cursor")),
-                    }
-                }
-                Opcode::SeekRowid => {
-                    // p1 = cursor, p2 = jump_if_not_found, p3 = reg containing target rowid
-                    let cid = ins.p1 as usize;
-                    let jump_miss = ins.p2 as usize;
-                    let target = match &self.regs[ins.p3 as usize].value {
-                        Value::Integer(i) => Some(*i),
-                        Value::Real(r) if (*r as i64 as f64) == *r => Some(*r as i64),
-                        _ => None,
-                    };
-                    let Some(rowid) = target else {
-                        next_pc = jump_miss;
-                        self.pc = next_pc;
-                        continue;
-                    };
-                    let (db, cursor_id) = match &self.cursors[cid] {
-                        CursorState::Table { db, cursor_id, .. } => (*db, *cursor_id),
-                        _ => return Err(SqliteError::misuse("SeekRowid on non-table cursor")),
-                    };
-                    let btree = storage.btree_mut(db)?;
-                    if !btree.cursor_seek_rowid(cursor_id, rowid)? {
-                        next_pc = jump_miss;
-                    }
-                }
-                Opcode::SeekIndexEqual => {
-                    // p1 = index cursor, p2 = jump_if_empty, p3 = start_reg; p5 = key_count
-                    let cid = ins.p1 as usize;
-                    let jump_miss = ins.p2 as usize;
-                    let start_reg = ins.p3 as usize;
-                    let n_keys = ins.p5 as usize;
-                    let prefix: Vec<Value> = self.regs[start_reg..start_reg + n_keys]
-                        .iter()
-                        .map(|rv| rv.value.clone())
-                        .collect();
-                    let (db, cursor_id) = match &mut self.cursors[cid] {
-                        CursorState::Index {
-                            db,
-                            cursor_id,
-                            eq_prefix,
-                            ..
-                        } => {
-                            *eq_prefix = Some(prefix.clone());
-                            (*db, *cursor_id)
-                        }
-                        _ => return Err(SqliteError::misuse("SeekGE on non-index cursor")),
-                    };
-                    let btree = storage.btree_mut(db)?;
-                    if !btree.cursor_seek_index_equal_first(cursor_id, &prefix)? {
-                        next_pc = jump_miss;
-                    }
-                }
-                Opcode::IndexMatchNext => {
-                    let cid = ins.p1 as usize;
-                    let loop_target = ins.p2 as usize;
-                    let (db, cursor_id, prefix) = match &self.cursors[cid] {
-                        CursorState::Index {
-                            db,
-                            cursor_id,
-                            eq_prefix,
-                            ..
-                        } => (*db, *cursor_id, eq_prefix.clone().unwrap_or_default()),
-                        _ => return Err(SqliteError::misuse("IdxNext on non-index cursor")),
-                    };
-                    let btree = storage.btree_mut(db)?;
-                    if btree.cursor_next_index_matching(cursor_id, &prefix)? {
-                        next_pc = loop_target;
-                    }
-                }
-                Opcode::Rowid => {
-                    // p1 = cursor, p2 = dest_reg
-                    let cid = ins.p1 as usize;
-                    let dest = ins.p2 as usize;
-                    match &self.cursors[cid] {
-                        CursorState::Table { db, cursor_id, .. } => {
-                            let (db, id) = (*db, *cursor_id);
-                            let rid = storage.btree_mut(db)?.cursor_rowid(id)?;
-                            self.regs[dest] = RuntimeValue::plain(Value::Integer(rid));
-                        }
-                        CursorState::Index { db, cursor_id, .. } => {
-                            // In SQLite secondary indexes, the table rowid is the LAST column of the index record!
-                            let (db, id) = (*db, *cursor_id);
-                            let val = storage
-                                .btree_mut(db)?
-                                .cursor_last_column(id)?
-                                .unwrap_or(Value::Null);
-                            self.regs[dest] = RuntimeValue::plain(val);
-                        }
-                        _ => return Err(SqliteError::misuse("Rowid on unsupported cursor")),
-                    }
-                }
-                Opcode::Column => {
-                    // p1 = cursor, p2 = 0-based col_idx, p3 = dest_reg
-                    let cid = ins.p1 as usize;
-                    let col_idx = ins.p2 as usize;
-                    let dest = ins.p3 as usize;
-                    match &self.cursors[cid] {
-                        CursorState::Table { db, cursor_id, .. }
-                        | CursorState::Index { db, cursor_id, .. } => {
-                            let (db, id) = (*db, *cursor_id);
-                            let val = storage
-                                .btree_mut(db)?
-                                .cursor_column(id, col_idx)?
-                                .unwrap_or_else(|| {
-                                    // Default fallback from P4 if column was added via ALTER TABLE ADD COLUMN
-                                    match &ins.p4 {
-                                        P4::Int64(i) => Value::Integer(*i),
-                                        P4::Real(r) => Value::real(*r),
-                                        P4::Str(s) => Value::Text(s.clone()),
-                                        P4::Blob(b) => Value::Blob(b.clone()),
-                                        _ => Value::Null,
-                                    }
-                                });
-                            self.regs[dest] = RuntimeValue::plain(val);
-                        }
-                        CursorState::Ephemeral { rows, pos } => {
-                            self.regs[dest] = RuntimeValue::plain(
-                                rows[*pos].get(col_idx).cloned().unwrap_or(Value::Null),
-                            );
-                        }
-                        _ => return Err(SqliteError::misuse("Column on closed cursor")),
-                    }
-                }
-                Opcode::MakeRecord => {
-                    // p1 = first_reg, p2 = n_regs, p3 = dest_reg
-                    let start = ins.p1 as usize;
-                    let count = ins.p2 as usize;
-                    let dest = ins.p3 as usize;
-                    let enc = storage
-                        .btree_ref(DatabaseId::MAIN)
-                        .map_or(TextEncoding::Utf8, Btree::encoding);
-                    let vals: Vec<Value> = self.regs[start..start + count]
-                        .iter()
-                        .map(|rv| rv.value.clone())
-                        .collect();
-                    let bytes = encode_record_with_encoding(&vals, enc);
-                    self.regs[dest] = RuntimeValue::plain(Value::Blob(bytes));
-                }
-                Opcode::NewRowid => {
-                    // p1 = table cursor, p2 = dest_reg
-                    let cid = ins.p1 as usize;
-                    let dest = ins.p2 as usize;
-                    let (db, root_pgno) = match &self.cursors[cid] {
-                        CursorState::Table { db, root_pgno, .. } => (*db, *root_pgno),
-                        _ => return Err(SqliteError::misuse("NewRowid on non-table cursor")),
-                    };
-                    let rid = storage.btree_mut(db)?.next_rowid(root_pgno)?;
-                    self.regs[dest] = RuntimeValue::plain(Value::Integer(rid));
-                }
-                Opcode::Insert => {
-                    // p1 = table cursor, p2 = record_blob_reg, p3 = rowid_reg, p5 = update_meta_flags (1 = bump changes & last_rowid)
-                    let cid = ins.p1 as usize;
-                    let rec_reg = ins.p2 as usize;
-                    let rid_reg = ins.p3 as usize;
-                    let rowid = self.regs[rid_reg].value.as_i64().ok_or_else(|| {
-                        SqliteError::new(ErrorCode::Mismatch, "datatype mismatch on rowid")
-                    })?;
-                    let payload = match &self.regs[rec_reg].value {
-                        Value::Blob(b) => b.clone(),
-                        _ => return Err(SqliteError::misuse("OP_Insert expects record blob")),
-                    };
-                    let (db, root_pgno, writable) = match &self.cursors[cid] {
-                        CursorState::Table {
-                            db,
-                            root_pgno,
-                            writable,
-                            ..
-                        } => (*db, *root_pgno, *writable),
-                        _ => return Err(SqliteError::misuse("Insert on non-table cursor")),
-                    };
-                    if !writable {
-                        return Err(SqliteError::misuse("Insert on read-only table cursor"));
-                    }
-                    storage
-                        .btree_mut(db)?
-                        .insert_table(root_pgno, rowid, &payload)?;
-                    if (ins.p5 & 0x01) != 0 {
-                        self.runtime_ctx.last_insert_rowid = rowid;
-                    }
-                    if (ins.p5 & 0x02) != 0 {
-                        self.runtime_ctx.last_changes += 1;
-                        self.runtime_ctx.total_changes += 1;
-                    }
-                }
-                Opcode::Delete => {
-                    // p1 = table cursor, p2 = rowid_reg (if >0, else current cursor rowid)
-                    let cid = ins.p1 as usize;
-                    let (db, cursor_id, root_pgno, writable) = match &self.cursors[cid] {
-                        CursorState::Table {
-                            db,
-                            cursor_id,
-                            root_pgno,
-                            writable,
-                        } => (*db, *cursor_id, *root_pgno, *writable),
-                        _ => return Err(SqliteError::misuse("Delete on non-table cursor")),
-                    };
-                    if !writable {
-                        return Err(SqliteError::misuse("Delete on read-only table cursor"));
-                    }
-                    let btree = storage.btree_mut(db)?;
-                    let rowid = if ins.p2 > 0 {
-                        self.regs[ins.p2 as usize].value.to_integer_lossy()
-                    } else {
-                        btree.cursor_rowid(cursor_id)?
-                    };
-                    if btree.delete_table(root_pgno, rowid)? && (ins.p5 & 0x02) != 0 {
-                        self.runtime_ctx.last_changes += 1;
-                        self.runtime_ctx.total_changes += 1;
-                    }
-                }
-                Opcode::IdxInsert => {
-                    // p1 = index cursor, p2 = record_blob_reg, p5 = 1 if UNIQUE check enabled
-                    let cid = ins.p1 as usize;
-                    let payload = match &self.regs[ins.p2 as usize].value {
-                        Value::Blob(b) => b.clone(),
-                        _ => return Err(SqliteError::misuse("IdxInsert expects record blob")),
-                    };
-                    let (db, root_pgno, orders, writable) = match &self.cursors[cid] {
-                        CursorState::Index {
-                            db,
-                            root_pgno,
-                            orders,
-                            writable,
-                            ..
-                        } => (*db, *root_pgno, orders.clone(), *writable),
-                        _ => return Err(SqliteError::misuse("IdxInsert on non-index cursor")),
-                    };
-                    if !writable {
-                        return Err(SqliteError::misuse("IdxInsert on read-only index cursor"));
-                    }
-                    let btree = storage.btree_mut(db)?;
-                    if ins.p5 != 0 {
-                        // UNIQUE constraint check via incremental BtreeCursor (zero Vec materialization!)
-                        let enc = btree.encoding();
-                        let vals = decode_record_with_encoding(&payload, enc)?;
-                        if vals.len() > 1 {
-                            let indexed_cols = &vals[..vals.len() - 1];
-                            if indexed_cols.iter().all(|v| !v.is_null()) {
-                                let new_rowid = vals.last();
-                                let probe_id =
-                                    btree.open_index_cursor(root_pgno, orders.clone(), false);
-                                let probe_res = (|| -> Result<bool> {
-                                    if !btree
-                                        .cursor_seek_index_equal_first(probe_id, indexed_cols)?
-                                    {
-                                        return Ok(false);
-                                    }
-                                    loop {
-                                        let existing_rowid = btree.cursor_last_column(probe_id)?;
-                                        if existing_rowid.as_ref() != new_rowid {
-                                            return Ok(true);
-                                        }
-                                        if !btree
-                                            .cursor_next_index_matching(probe_id, indexed_cols)?
-                                        {
-                                            return Ok(false);
-                                        }
-                                    }
-                                })();
-                                btree.close_cursor(probe_id);
-                                if probe_res? {
-                                    let msg = match &ins.p4 {
-                                        P4::Str(s) => s.clone(),
-                                        _ => "UNIQUE constraint failed".to_owned(),
-                                    };
-                                    return Err(SqliteError::constraint(
-                                        sqliters_types::extended::SQLITE_CONSTRAINT_UNIQUE,
-                                        msg,
-                                    ));
-                                }
-                            }
+                        eq_prefix,
+                        ..
+                    } => {
+                        let (db, id) = (*db, *cursor_id);
+                        *eq_prefix = None;
+                        let btree = storage.btree_mut(db)?;
+                        if !btree.cursor_first(id)? {
+                            next_pc = jump_empty;
                         }
                     }
-                    btree.insert_index(root_pgno, &payload, &orders)?;
-                }
-                Opcode::IdxDelete => {
-                    // p1 = index cursor, p2 = start_reg, p3 = n_fields
-                    let cid = ins.p1 as usize;
-                    let start = ins.p2 as usize;
-                    let count = ins.p3 as usize;
-                    let keys: Vec<Value> = self.regs[start..start + count]
-                        .iter()
-                        .map(|rv| rv.value.clone())
-                        .collect();
-                    let (db, root_pgno, orders, writable) = match &self.cursors[cid] {
-                        CursorState::Index {
-                            db,
-                            root_pgno,
-                            orders,
-                            writable,
-                            ..
-                        } => (*db, *root_pgno, orders.clone(), *writable),
-                        _ => return Err(SqliteError::misuse("IdxDelete on non-index cursor")),
-                    };
-                    if !writable {
-                        return Err(SqliteError::misuse("IdxDelete on read-only index cursor"));
-                    }
-                    storage
-                        .btree_mut(db)?
-                        .delete_index(root_pgno, &keys, &orders)?;
-                }
-                Opcode::ResultRow => {
-                    let start = ins.p1 as usize;
-                    let count = ins.p2 as usize;
-                    let row: Vec<Value> = self.regs[start..start + count]
-                        .iter()
-                        .map(|rv| rv.value.clone())
-                        .collect();
-                    self.pc = next_pc;
-                    return Ok(VmStep::Row(row));
-                }
-                Opcode::Integer => {
-                    self.regs[ins.p2 as usize] =
-                        RuntimeValue::plain(Value::Integer(i64::from(ins.p1)));
-                }
-                Opcode::Int64 => {
-                    let P4::Int64(v) = ins.p4 else {
-                        return Err(SqliteError::misuse("Int64 missing P4::Int64"));
-                    };
-                    self.regs[ins.p2 as usize] = RuntimeValue::plain(Value::Integer(v));
-                }
-                Opcode::Real => {
-                    let P4::Real(v) = ins.p4 else {
-                        return Err(SqliteError::misuse("Real missing P4::Real"));
-                    };
-                    self.regs[ins.p2 as usize] = RuntimeValue::plain(Value::real(v));
-                }
-                Opcode::String8 => {
-                    let P4::Str(ref s) = ins.p4 else {
-                        return Err(SqliteError::misuse("String8 missing P4::Str"));
-                    };
-                    self.regs[ins.p2 as usize] = RuntimeValue::plain(Value::Text(s.clone()));
-                }
-                Opcode::Blob => {
-                    let P4::Blob(ref b) = ins.p4 else {
-                        return Err(SqliteError::misuse("Blob missing P4::Blob"));
-                    };
-                    self.regs[ins.p2 as usize] = RuntimeValue::plain(Value::Blob(b.clone()));
-                }
-                Opcode::Null => {
-                    let start = ins.p2 as usize;
-                    let end = if ins.p3 > ins.p2 {
-                        ins.p3 as usize
-                    } else {
-                        start
-                    };
-                    for r in start..=end {
-                        self.regs[r] = RuntimeValue::null();
-                    }
-                }
-                Opcode::Variable => {
-                    // p1 = 1-based parameter index, p2 = dest_reg
-                    let idx = (ins.p1 as usize).saturating_sub(1);
-                    self.regs[ins.p2 as usize] =
-                        RuntimeValue::plain(self.params.get(idx).cloned().unwrap_or(Value::Null));
-                }
-                Opcode::Copy => {
-                    let src = ins.p1 as usize;
-                    let dst = ins.p2 as usize;
-                    let extra = ins.p3.max(0) as usize;
-                    let clear_subtype = (ins.p5 & 0x0002) != 0;
-                    for i in 0..=extra {
-                        let mut rv = self.regs[src + i].clone();
-                        if clear_subtype {
-                            rv.clear_subtype();
-                        }
-                        self.regs[dst + i] = rv;
-                    }
-                }
-                Opcode::Move => {
-                    let src = ins.p1 as usize;
-                    let dst = ins.p2 as usize;
-                    let count = ins.p3.max(1) as usize;
-                    for i in 0..count {
-                        let v = std::mem::replace(&mut self.regs[src + i], RuntimeValue::null());
-                        self.regs[dst + i] = v;
-                    }
-                }
-                Opcode::Add
-                | Opcode::Subtract
-                | Opcode::Multiply
-                | Opcode::Divide
-                | Opcode::Remainder => {
-                    // SQLite convention: P3 = P2 <op> P1 (or we use standard P1 = lhs, P2 = rhs, P3 = dest)
-                    // Here: p1 = lhs_reg, p2 = rhs_reg, p3 = dest_reg.
-                    let lhs = &self.regs[ins.p1 as usize].value;
-                    let rhs = &self.regs[ins.p2 as usize].value;
-                    self.regs[ins.p3 as usize] =
-                        RuntimeValue::plain(eval_arith(ins.opcode, lhs, rhs));
-                }
-                Opcode::BitAnd | Opcode::BitOr | Opcode::ShiftLeft | Opcode::ShiftRight => {
-                    let lhs = &self.regs[ins.p1 as usize].value;
-                    let rhs = &self.regs[ins.p2 as usize].value;
-                    if lhs.is_null() || rhs.is_null() {
-                        self.regs[ins.p3 as usize] = RuntimeValue::null();
-                    } else {
-                        let a = lhs.to_integer_lossy();
-                        let b = rhs.to_integer_lossy();
-                        let res = match ins.opcode {
-                            Opcode::BitAnd => a & b,
-                            Opcode::BitOr => a | b,
-                            Opcode::ShiftLeft => shift_left_sqlite(a, b),
-                            Opcode::ShiftRight => shift_right_sqlite(a, b),
-                            _ => unreachable!(),
-                        };
-                        self.regs[ins.p3 as usize] = RuntimeValue::plain(Value::Integer(res));
-                    }
-                }
-                Opcode::BitNot => {
-                    let v = &self.regs[ins.p1 as usize].value;
-                    self.regs[ins.p2 as usize] = if v.is_null() {
-                        RuntimeValue::null()
-                    } else {
-                        RuntimeValue::plain(Value::Integer(!v.to_integer_lossy()))
-                    };
-                }
-                Opcode::Negate => {
-                    let v = &self.regs[ins.p1 as usize].value;
-                    self.regs[ins.p2 as usize] = RuntimeValue::plain(eval_unary_negate(v));
-                }
-                Opcode::Concat => {
-                    let lhs = &self.regs[ins.p1 as usize].value;
-                    let rhs = &self.regs[ins.p2 as usize].value;
-                    self.regs[ins.p3 as usize] = if lhs.is_null() || rhs.is_null() {
-                        RuntimeValue::null()
-                    } else {
-                        let mut s = lhs.to_text_lossy();
-                        s.push_str(&rhs.to_text_lossy());
-                        RuntimeValue::plain(Value::Text(s))
-                    };
-                }
-                Opcode::Eq
-                | Opcode::Ne
-                | Opcode::Lt
-                | Opcode::Le
-                | Opcode::Gt
-                | Opcode::Ge
-                | Opcode::Is
-                | Opcode::IsNot => {
-                    // Boolean evaluation into register: p1 = lhs, p2 = rhs, p3 = dest_reg
-                    let aff = p5_to_affinity(ins.p5);
-                    let lhs = self.regs[ins.p1 as usize].value.clone();
-                    let rhs = self.regs[ins.p2 as usize].value.clone();
-                    let enc = storage
-                        .btree_ref(DatabaseId::MAIN)
-                        .map_or(TextEncoding::Utf8, Btree::encoding);
-                    let out = match &ins.p4 {
-                        P4::Str(custom_coll) => eval_comparison_with_services(
-                            ins.opcode,
-                            &lhs,
-                            &rhs,
-                            aff,
-                            custom_coll,
-                            enc,
-                            services,
-                        )?,
-                        P4::Collation(c) => {
-                            eval_comparison_with_affinity(ins.opcode, &lhs, &rhs, aff, *c, enc)
-                        }
-                        _ => eval_comparison_with_affinity(
-                            ins.opcode,
-                            &lhs,
-                            &rhs,
-                            aff,
-                            Collation::Binary,
-                            enc,
-                        ),
-                    };
-                    self.regs[ins.p3 as usize] = RuntimeValue::plain(out);
-                }
-                Opcode::And => {
-                    let a = self.regs[ins.p1 as usize].value.truthiness();
-                    let b = self.regs[ins.p2 as usize].value.truthiness();
-                    self.regs[ins.p3 as usize] = RuntimeValue::plain(match (a, b) {
-                        (Some(false), _) | (_, Some(false)) => Value::Integer(0),
-                        (Some(true), Some(true)) => Value::Integer(1),
-                        _ => Value::Null,
-                    });
-                }
-                Opcode::Or => {
-                    let a = self.regs[ins.p1 as usize].value.truthiness();
-                    let b = self.regs[ins.p2 as usize].value.truthiness();
-                    self.regs[ins.p3 as usize] = RuntimeValue::plain(match (a, b) {
-                        (Some(true), _) | (_, Some(true)) => Value::Integer(1),
-                        (Some(false), Some(false)) => Value::Integer(0),
-                        _ => Value::Null,
-                    });
-                }
-                Opcode::Not => {
-                    let a = self.regs[ins.p1 as usize].value.truthiness();
-                    self.regs[ins.p2 as usize] = RuntimeValue::plain(match a {
-                        None => Value::Null,
-                        Some(b) => Value::Integer(i64::from(!b)),
-                    });
-                }
-                Opcode::IsNull => {
-                    // p1 = reg; if p2 >= 0 and p3 == 0: jump mode; if p3 > 0: store 0/1 in reg p3
-                    let is_n = self.regs[ins.p1 as usize].value.is_null();
-                    if ins.p3 > 0 {
-                        self.regs[ins.p3 as usize] =
-                            RuntimeValue::plain(Value::Integer(i64::from(is_n)));
-                    } else if is_n {
-                        next_pc = ins.p2 as usize;
-                    }
-                }
-                Opcode::NotNull => {
-                    let not_n = !self.regs[ins.p1 as usize].value.is_null();
-                    if ins.p3 > 0 {
-                        self.regs[ins.p3 as usize] =
-                            RuntimeValue::plain(Value::Integer(i64::from(not_n)));
-                    } else if not_n {
-                        next_pc = ins.p2 as usize;
-                    }
-                }
-                Opcode::JumpIfTrue => {
-                    if self.regs[ins.p1 as usize].value.truthiness() == Some(true) {
-                        next_pc = ins.p2 as usize;
-                    }
-                }
-                Opcode::JumpIfFalse => {
-                    // Jump when false, or when NULL if p3 != 0 (`jumpIfNull` flag in SQLite `OP_IfNot`!)
-                    match self.regs[ins.p1 as usize].value.truthiness() {
-                        Some(false) => next_pc = ins.p2 as usize,
-                        None if ins.p3 != 0 => next_pc = ins.p2 as usize,
-                        _ => {}
-                    }
-                }
-                Opcode::JumpIfNull => {
-                    if self.regs[ins.p1 as usize].value.is_null() {
-                        next_pc = ins.p2 as usize;
-                    }
-                }
-                Opcode::Affinity => {
-                    // p1 = start_reg, p2 = count, p4 = Affinity(vec)
-                    let start = ins.p1 as usize;
-                    if let P4::Affinity(ref affs) = ins.p4 {
-                        for (i, &aff) in affs.iter().enumerate() {
-                            let v = self.regs[start + i].value.clone();
-                            self.regs[start + i] = RuntimeValue::plain(aff.apply(v));
-                        }
-                    }
-                }
-                Opcode::Cast => {
-                    // p1 = src_reg, p2 = dest_reg, p4 = Str(type_name)
-                    let src = self.regs[ins.p1 as usize].clone();
-                    let type_name = match &ins.p4 {
-                        P4::Str(s) => s.as_str(),
-                        _ => "",
-                    };
-                    let enc = storage
-                        .btree_ref(DatabaseId::MAIN)
-                        .map_or(TextEncoding::Utf8, Btree::encoding);
-                    self.regs[ins.p2 as usize] = eval_cast_rt_with_encoding(src, type_name, enc);
-                }
-                Opcode::Function => {
-                    // p1 = first_arg_reg, p3 = dest_reg, p4 = Func { name, argc }
-                    let start = ins.p1 as usize;
-                    let dest = ins.p3 as usize;
-                    let P4::Func { ref name, argc } = ins.p4 else {
-                        return Err(SqliteError::misuse("Function missing P4::Func"));
-                    };
-                    let args = &self.regs[start..start + argc];
-                    self.regs[dest] = services.call_scalar(name, args)?;
-                }
-                Opcode::SorterOpen => {
-                    // p1 = cursor, p4 = KeyInfo(orders), IntArray encoded via p2.. or KeyInfo
-                    let cid = ins.p1 as usize;
-                    let orders = match &ins.p4 {
-                        P4::KeyInfo(k) => k.iter().cloned().enumerate().collect(),
-                        _ => Vec::new(),
-                    };
-                    self.ensure_cursor_slot(cid);
-                    self.close_cursor_slot(cid, storage);
-                    self.cursors[cid] = CursorState::Sorter {
-                        orders,
-                        rows: Vec::new(),
-                        pos: 0,
-                    };
-                }
-                Opcode::SorterInsert => {
-                    // p1 = sorter cursor, p2 = start_reg, p3 = n_cols
-                    let cid = ins.p1 as usize;
-                    let start = ins.p2 as usize;
-                    let count = ins.p3 as usize;
-                    let row: Vec<Value> = self.regs[start..start + count]
-                        .iter()
-                        .map(|rv| rv.value.clone())
-                        .collect();
-                    if let CursorState::Sorter { rows, .. } = &mut self.cursors[cid] {
-                        rows.push(row);
-                    } else {
-                        return Err(SqliteError::misuse("SorterInsert on non-sorter cursor"));
-                    }
-                }
-                Opcode::SorterSort => {
-                    let cid = ins.p1 as usize;
-                    let jump_empty = ins.p2 as usize;
-                    if let CursorState::Sorter { orders, rows, pos } = &mut self.cursors[cid] {
+                    CursorState::Ephemeral { rows, pos } => {
+                        *pos = 0;
                         if rows.is_empty() {
                             next_pc = jump_empty;
-                        } else {
-                            let specs = orders.clone();
-                            let enc = storage
-                                .btree_ref(DatabaseId::MAIN)
-                                .map_or(TextEncoding::Utf8, Btree::encoding);
-                            fallible_sort_by(rows, |a, b| compare_sorter_rows(a, b, &specs, enc))?;
-                            *pos = 0;
                         }
-                    } else {
-                        return Err(SqliteError::misuse("SorterSort on non-sorter cursor"));
                     }
+                    _ => return Err(SqliteError::misuse("Rewind on invalid cursor")),
                 }
-                Opcode::SorterColumn => {
-                    let cid = ins.p1 as usize;
-                    let col_idx = ins.p2 as usize;
-                    let dest = ins.p3 as usize;
-                    if let CursorState::Sorter { rows, pos, .. } = &self.cursors[cid] {
-                        self.regs[dest] = RuntimeValue::plain(
-                            rows[*pos].get(col_idx).cloned().unwrap_or(Value::Null),
-                        );
-                    } else {
-                        return Err(SqliteError::misuse("SorterColumn on non-sorter cursor"));
+            }
+            Opcode::Next => {
+                let cid = ins.p1 as usize;
+                let loop_target = ins.p2 as usize;
+                match &mut cursors[cid] {
+                    CursorState::Table { db, cursor_id, .. }
+                    | CursorState::Index { db, cursor_id, .. } => {
+                        let (db, id) = (*db, *cursor_id);
+                        let btree = storage.btree_mut(db)?;
+                        if btree.cursor_next(id)? {
+                            next_pc = loop_target;
+                        }
                     }
-                }
-                Opcode::SorterNext => {
-                    let cid = ins.p1 as usize;
-                    let loop_target = ins.p2 as usize;
-                    if let CursorState::Sorter { rows, pos, .. } = &mut self.cursors[cid] {
+                    CursorState::Ephemeral { rows, pos } => {
                         *pos += 1;
                         if *pos < rows.len() {
                             next_pc = loop_target;
                         }
-                    } else {
-                        return Err(SqliteError::misuse("SorterNext on non-sorter cursor"));
+                    }
+                    _ => return Err(SqliteError::misuse("Next on invalid cursor")),
+                }
+            }
+            Opcode::SeekRowid => {
+                // p1 = cursor, p2 = jump_if_not_found, p3 = reg containing target rowid
+                let cid = ins.p1 as usize;
+                let jump_miss = ins.p2 as usize;
+                let target = regs[ins.p3 as usize].value.to_exact_rowid_i64();
+                let Some(rowid) = target else {
+                    *pc = jump_miss;
+                    continue;
+                };
+                let (db, cursor_id) = match &cursors[cid] {
+                    CursorState::Table { db, cursor_id, .. } => (*db, *cursor_id),
+                    _ => return Err(SqliteError::misuse("SeekRowid on non-table cursor")),
+                };
+                let btree = storage.btree_mut(db)?;
+                if !btree.cursor_seek_rowid(cursor_id, rowid)? {
+                    next_pc = jump_miss;
+                }
+            }
+            Opcode::SeekIndexEqual => {
+                // p1 = index cursor, p2 = jump_if_empty, p3 = start_reg; p5 = key_count
+                let cid = ins.p1 as usize;
+                let jump_miss = ins.p2 as usize;
+                let start_reg = ins.p3 as usize;
+                let n_keys = ins.p5 as usize;
+                let prefix: Vec<Value> = regs[start_reg..start_reg + n_keys]
+                    .iter()
+                    .map(|rv| rv.value.clone())
+                    .collect();
+                let (db, cursor_id) = match &mut cursors[cid] {
+                    CursorState::Index {
+                        db,
+                        cursor_id,
+                        eq_prefix,
+                        ..
+                    } => {
+                        *eq_prefix = Some(prefix.clone());
+                        (*db, *cursor_id)
+                    }
+                    _ => return Err(SqliteError::misuse("SeekGE on non-index cursor")),
+                };
+                let btree = storage.btree_mut(db)?;
+                if !btree.cursor_seek_index_equal_first(cursor_id, &prefix)? {
+                    next_pc = jump_miss;
+                }
+            }
+            Opcode::IndexMatchNext => {
+                let cid = ins.p1 as usize;
+                let loop_target = ins.p2 as usize;
+                let (db, cursor_id, prefix) = match &cursors[cid] {
+                    CursorState::Index {
+                        db,
+                        cursor_id,
+                        eq_prefix,
+                        ..
+                    } => (*db, *cursor_id, eq_prefix.clone().unwrap_or_default()),
+                    _ => return Err(SqliteError::misuse("IdxNext on non-index cursor")),
+                };
+                let btree = storage.btree_mut(db)?;
+                if btree.cursor_next_index_matching(cursor_id, &prefix)? {
+                    next_pc = loop_target;
+                }
+            }
+            Opcode::Rowid => {
+                // p1 = cursor, p2 = dest_reg
+                let cid = ins.p1 as usize;
+                let dest = ins.p2 as usize;
+                match &cursors[cid] {
+                    CursorState::Table { db, cursor_id, .. } => {
+                        let (db, id) = (*db, *cursor_id);
+                        let rid = storage.btree_mut(db)?.cursor_rowid(id)?;
+                        regs[dest] = RuntimeValue::plain(Value::Integer(rid));
+                    }
+                    CursorState::Index { db, cursor_id, .. } => {
+                        // In SQLite secondary indexes, the table rowid is the LAST column of the index record!
+                        let (db, id) = (*db, *cursor_id);
+                        let val = storage
+                            .btree_mut(db)?
+                            .cursor_last_column(id)?
+                            .unwrap_or(Value::Null);
+                        regs[dest] = RuntimeValue::plain(val);
+                    }
+                    _ => return Err(SqliteError::misuse("Rowid on unsupported cursor")),
+                }
+            }
+            Opcode::Column => {
+                // p1 = cursor, p2 = 0-based col_idx, p3 = dest_reg
+                let cid = ins.p1 as usize;
+                let col_idx = ins.p2 as usize;
+                let dest = ins.p3 as usize;
+                match &cursors[cid] {
+                    CursorState::Table { db, cursor_id, .. }
+                    | CursorState::Index { db, cursor_id, .. } => {
+                        let (db, id) = (*db, *cursor_id);
+                        let val = storage
+                            .btree_mut(db)?
+                            .cursor_column(id, col_idx)?
+                            .unwrap_or_else(|| match &ins.p4 {
+                                P4::Int64(i) => Value::Integer(*i),
+                                P4::Real(r) => Value::real(*r),
+                                P4::Str(s) => Value::Text(s.clone()),
+                                P4::Blob(b) => Value::Blob(b.clone()),
+                                _ => Value::Null,
+                            });
+                        regs[dest] = RuntimeValue::plain(val);
+                    }
+                    CursorState::Ephemeral { rows, pos } => {
+                        regs[dest] = RuntimeValue::plain(
+                            rows[*pos].get(col_idx).cloned().unwrap_or(Value::Null),
+                        );
+                    }
+                    _ => return Err(SqliteError::misuse("Column on closed cursor")),
+                }
+            }
+            Opcode::MakeRecord => {
+                // p1 = first_reg, p2 = n_regs, p3 = dest_reg
+                let start = ins.p1 as usize;
+                let count = ins.p2 as usize;
+                let dest = ins.p3 as usize;
+                let enc = storage
+                    .btree_ref(DatabaseId::MAIN)
+                    .map_or(TextEncoding::Utf8, Btree::encoding);
+                let bytes = encode_runtime_record_with_encoding(&regs[start..start + count], enc);
+                regs[dest] = RuntimeValue::plain(Value::Blob(bytes));
+            }
+            Opcode::NewRowid => {
+                // p1 = table cursor, p2 = dest_reg
+                let cid = ins.p1 as usize;
+                let dest = ins.p2 as usize;
+                let (db, root_pgno) = match &cursors[cid] {
+                    CursorState::Table { db, root_pgno, .. } => (*db, *root_pgno),
+                    _ => return Err(SqliteError::misuse("NewRowid on non-table cursor")),
+                };
+                let rid = storage.btree_mut(db)?.next_rowid(root_pgno)?;
+                regs[dest] = RuntimeValue::plain(Value::Integer(rid));
+            }
+            Opcode::Insert => {
+                // p1 = table cursor, p2 = record_blob_reg, p3 = rowid_reg, p5 = update_meta_flags (1 = last_rowid, 2 = changes)
+                let cid = ins.p1 as usize;
+                let rec_reg = ins.p2 as usize;
+                let rid_reg = ins.p3 as usize;
+                let rowid = regs[rid_reg]
+                    .value
+                    .as_i64()
+                    .ok_or_else(|| SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"))?;
+                let Value::Blob(ref payload) = regs[rec_reg].value else {
+                    return Err(SqliteError::misuse("OP_Insert expects record blob"));
+                };
+                let (db, root_pgno, writable) = match &cursors[cid] {
+                    CursorState::Table {
+                        db,
+                        root_pgno,
+                        writable,
+                        ..
+                    } => (*db, *root_pgno, *writable),
+                    _ => return Err(SqliteError::misuse("Insert on non-table cursor")),
+                };
+                if !writable {
+                    return Err(SqliteError::misuse("Insert on read-only table cursor"));
+                }
+                storage
+                    .btree_mut(db)?
+                    .insert_table(root_pgno, rowid, payload)?;
+                if (ins.p5 & 0x01) != 0 {
+                    runtime_ctx.last_insert_rowid = rowid;
+                }
+                if (ins.p5 & 0x02) != 0 {
+                    runtime_ctx.last_changes += 1;
+                    runtime_ctx.total_changes += 1;
+                }
+            }
+            Opcode::Delete => {
+                // p1 = table cursor, p2 = rowid_reg (if >0, else current cursor rowid)
+                let cid = ins.p1 as usize;
+                let (db, cursor_id, root_pgno, writable) = match &cursors[cid] {
+                    CursorState::Table {
+                        db,
+                        cursor_id,
+                        root_pgno,
+                        writable,
+                    } => (*db, *cursor_id, *root_pgno, *writable),
+                    _ => return Err(SqliteError::misuse("Delete on non-table cursor")),
+                };
+                if !writable {
+                    return Err(SqliteError::misuse("Delete on read-only table cursor"));
+                }
+                let btree = storage.btree_mut(db)?;
+                let rowid = if ins.p2 > 0 {
+                    regs[ins.p2 as usize].value.to_integer_lossy()
+                } else {
+                    btree.cursor_rowid(cursor_id)?
+                };
+                if btree.delete_table(root_pgno, rowid)? && (ins.p5 & 0x02) != 0 {
+                    runtime_ctx.last_changes += 1;
+                    runtime_ctx.total_changes += 1;
+                }
+            }
+            Opcode::IdxInsert => {
+                // p1 = index cursor, p2 = record_blob_reg, p5 = 0 (non-unique), 1 (UNIQUE), 2 (PRIMARYKEY)
+                let cid = ins.p1 as usize;
+                let Value::Blob(ref payload) = regs[ins.p2 as usize].value else {
+                    return Err(SqliteError::misuse("IdxInsert expects record blob"));
+                };
+                let CursorState::Index {
+                    db,
+                    root_pgno,
+                    ref orders,
+                    writable,
+                    ..
+                } = cursors[cid]
+                else {
+                    return Err(SqliteError::misuse("IdxInsert on non-index cursor"));
+                };
+                if !writable {
+                    return Err(SqliteError::misuse("IdxInsert on read-only index cursor"));
+                }
+                let btree = storage.btree_mut(db)?;
+                if ins.p5 != 0 {
+                    let enc = btree.encoding();
+                    let vals = decode_record_with_encoding(payload, enc)?;
+                    if vals.len() > 1 {
+                        let indexed_cols = &vals[..vals.len() - 1];
+                        if indexed_cols.iter().all(|v| !v.is_null()) {
+                            let new_rowid = vals.last();
+                            let probe_id =
+                                btree.open_index_cursor(root_pgno, orders.clone(), false);
+                            let probe_res = (|| -> Result<bool> {
+                                if !btree.cursor_seek_index_equal_first(probe_id, indexed_cols)? {
+                                    return Ok(false);
+                                }
+                                loop {
+                                    let existing_rowid = btree.cursor_last_column(probe_id)?;
+                                    if existing_rowid.as_ref() != new_rowid {
+                                        return Ok(true);
+                                    }
+                                    if !btree.cursor_next_index_matching(probe_id, indexed_cols)? {
+                                        return Ok(false);
+                                    }
+                                }
+                            })();
+                            btree.close_cursor(probe_id);
+                            if probe_res? {
+                                let msg = match &ins.p4 {
+                                    P4::Str(s) => s.clone(),
+                                    _ => "UNIQUE constraint failed".to_owned(),
+                                };
+                                let ext = if ins.p5 == 2 {
+                                    sqliters_types::extended::SQLITE_CONSTRAINT_PRIMARYKEY
+                                } else {
+                                    sqliters_types::extended::SQLITE_CONSTRAINT_UNIQUE
+                                };
+                                return Err(SqliteError::constraint(ext, msg));
+                            }
+                        }
+                    }
+                }
+                btree.insert_index(root_pgno, payload, orders)?;
+            }
+            Opcode::IdxDelete => {
+                // p1 = index cursor, p2 = start_reg, p3 = n_fields
+                let cid = ins.p1 as usize;
+                let start = ins.p2 as usize;
+                let count = ins.p3 as usize;
+                let keys: Vec<Value> = regs[start..start + count]
+                    .iter()
+                    .map(|rv| rv.value.clone())
+                    .collect();
+                let CursorState::Index {
+                    db,
+                    root_pgno,
+                    ref orders,
+                    writable,
+                    ..
+                } = cursors[cid]
+                else {
+                    return Err(SqliteError::misuse("IdxDelete on non-index cursor"));
+                };
+                if !writable {
+                    return Err(SqliteError::misuse("IdxDelete on read-only index cursor"));
+                }
+                storage
+                    .btree_mut(db)?
+                    .delete_index(root_pgno, &keys, orders)?;
+            }
+            Opcode::ResultRow => {
+                let start = ins.p1 as usize;
+                let count = ins.p2 as usize;
+                let row: Vec<Value> = regs[start..start + count]
+                    .iter()
+                    .map(|rv| rv.value.clone())
+                    .collect();
+                *pc = next_pc;
+                return Ok(VmStep::Row(row));
+            }
+            Opcode::Integer => {
+                regs[ins.p2 as usize] = RuntimeValue::plain(Value::Integer(i64::from(ins.p1)));
+            }
+            Opcode::Int64 => {
+                let P4::Int64(v) = ins.p4 else {
+                    return Err(SqliteError::misuse("Int64 missing P4::Int64"));
+                };
+                regs[ins.p2 as usize] = RuntimeValue::plain(Value::Integer(v));
+            }
+            Opcode::Real => {
+                let P4::Real(v) = ins.p4 else {
+                    return Err(SqliteError::misuse("Real missing P4::Real"));
+                };
+                regs[ins.p2 as usize] = RuntimeValue::plain(Value::real(v));
+            }
+            Opcode::String8 => {
+                let P4::Str(ref s) = ins.p4 else {
+                    return Err(SqliteError::misuse("String8 missing P4::Str"));
+                };
+                regs[ins.p2 as usize] = RuntimeValue::plain(Value::Text(s.clone()));
+            }
+            Opcode::Blob => {
+                let P4::Blob(ref b) = ins.p4 else {
+                    return Err(SqliteError::misuse("Blob missing P4::Blob"));
+                };
+                regs[ins.p2 as usize] = RuntimeValue::plain(Value::Blob(b.clone()));
+            }
+            Opcode::Null => {
+                let start = ins.p2 as usize;
+                let end = if ins.p3 > ins.p2 {
+                    ins.p3 as usize
+                } else {
+                    start
+                };
+                for r in &mut regs[start..=end] {
+                    *r = RuntimeValue::null();
+                }
+            }
+            Opcode::Variable => {
+                // p1 = 1-based parameter index, p2 = dest_reg
+                let idx = (ins.p1 as usize).saturating_sub(1);
+                regs[ins.p2 as usize] =
+                    RuntimeValue::plain(params.get(idx).cloned().unwrap_or(Value::Null));
+            }
+            Opcode::Copy => {
+                let src = ins.p1 as usize;
+                let dst = ins.p2 as usize;
+                let extra = ins.p3.max(0) as usize;
+                let clear_subtype = (ins.p5 & 0x0002) != 0;
+                for i in 0..=extra {
+                    let mut rv = regs[src + i].clone();
+                    if clear_subtype {
+                        rv.clear_subtype();
+                    }
+                    regs[dst + i] = rv;
+                }
+            }
+            Opcode::Move => {
+                let src = ins.p1 as usize;
+                let dst = ins.p2 as usize;
+                let count = ins.p3.max(1) as usize;
+                for i in 0..count {
+                    let v = std::mem::replace(&mut regs[src + i], RuntimeValue::null());
+                    regs[dst + i] = v;
+                }
+            }
+            Opcode::Add
+            | Opcode::Subtract
+            | Opcode::Multiply
+            | Opcode::Divide
+            | Opcode::Remainder => {
+                let lhs = &regs[ins.p1 as usize].value;
+                let rhs = &regs[ins.p2 as usize].value;
+                regs[ins.p3 as usize] = RuntimeValue::plain(eval_arith(ins.opcode, lhs, rhs));
+            }
+            Opcode::BitAnd | Opcode::BitOr | Opcode::ShiftLeft | Opcode::ShiftRight => {
+                let lhs = &regs[ins.p1 as usize].value;
+                let rhs = &regs[ins.p2 as usize].value;
+                if lhs.is_null() || rhs.is_null() {
+                    regs[ins.p3 as usize] = RuntimeValue::null();
+                } else {
+                    let a = lhs.to_integer_lossy();
+                    let b = rhs.to_integer_lossy();
+                    let res = match ins.opcode {
+                        Opcode::BitAnd => a & b,
+                        Opcode::BitOr => a | b,
+                        Opcode::ShiftLeft => shift_left_sqlite(a, b),
+                        Opcode::ShiftRight => shift_right_sqlite(a, b),
+                        _ => unreachable!(),
+                    };
+                    regs[ins.p3 as usize] = RuntimeValue::plain(Value::Integer(res));
+                }
+            }
+            Opcode::BitNot => {
+                let v = &regs[ins.p1 as usize].value;
+                regs[ins.p2 as usize] = if v.is_null() {
+                    RuntimeValue::null()
+                } else {
+                    RuntimeValue::plain(Value::Integer(!v.to_integer_lossy()))
+                };
+            }
+            Opcode::Negate => {
+                let v = &regs[ins.p1 as usize].value;
+                regs[ins.p2 as usize] = RuntimeValue::plain(eval_unary_negate(v));
+            }
+            Opcode::Concat => {
+                let lhs = &regs[ins.p1 as usize].value;
+                let rhs = &regs[ins.p2 as usize].value;
+                regs[ins.p3 as usize] = if lhs.is_null() || rhs.is_null() {
+                    RuntimeValue::null()
+                } else {
+                    let mut s = lhs.to_text_lossy();
+                    s.push_str(&rhs.to_text_lossy());
+                    RuntimeValue::plain(Value::Text(s))
+                };
+            }
+            Opcode::Eq
+            | Opcode::Ne
+            | Opcode::Lt
+            | Opcode::Le
+            | Opcode::Gt
+            | Opcode::Ge
+            | Opcode::Is
+            | Opcode::IsNot => {
+                // Boolean evaluation into register: p1 = lhs, p2 = rhs, p3 = dest_reg
+                let aff = p5_to_affinity(ins.p5);
+                let lhs = regs[ins.p1 as usize].value.clone();
+                let rhs = regs[ins.p2 as usize].value.clone();
+                let enc = storage
+                    .btree_ref(DatabaseId::MAIN)
+                    .map_or(TextEncoding::Utf8, Btree::encoding);
+                let out = match &ins.p4 {
+                    P4::Str(custom_coll) => eval_comparison_with_services(
+                        ins.opcode,
+                        &lhs,
+                        &rhs,
+                        aff,
+                        custom_coll,
+                        enc,
+                        services,
+                    )?,
+                    P4::Collation(c) => {
+                        eval_comparison_with_affinity(ins.opcode, &lhs, &rhs, aff, *c, enc)
+                    }
+                    _ => eval_comparison_with_affinity(
+                        ins.opcode,
+                        &lhs,
+                        &rhs,
+                        aff,
+                        Collation::Binary,
+                        enc,
+                    ),
+                };
+                regs[ins.p3 as usize] = RuntimeValue::plain(out);
+            }
+            Opcode::And => {
+                let a = regs[ins.p1 as usize].value.truthiness();
+                let b = regs[ins.p2 as usize].value.truthiness();
+                regs[ins.p3 as usize] = RuntimeValue::plain(match (a, b) {
+                    (Some(false), _) | (_, Some(false)) => Value::Integer(0),
+                    (Some(true), Some(true)) => Value::Integer(1),
+                    _ => Value::Null,
+                });
+            }
+            Opcode::Or => {
+                let a = regs[ins.p1 as usize].value.truthiness();
+                let b = regs[ins.p2 as usize].value.truthiness();
+                regs[ins.p3 as usize] = RuntimeValue::plain(match (a, b) {
+                    (Some(true), _) | (_, Some(true)) => Value::Integer(1),
+                    (Some(false), Some(false)) => Value::Integer(0),
+                    _ => Value::Null,
+                });
+            }
+            Opcode::Not => {
+                let a = regs[ins.p1 as usize].value.truthiness();
+                regs[ins.p2 as usize] = RuntimeValue::plain(match a {
+                    None => Value::Null,
+                    Some(b) => Value::Integer(i64::from(!b)),
+                });
+            }
+            Opcode::IsNull => {
+                // p1 = reg; if p2 >= 0 and p3 == 0: jump mode; if p3 > 0: store 0/1 in reg p3
+                let is_n = regs[ins.p1 as usize].value.is_null();
+                if ins.p3 > 0 {
+                    regs[ins.p3 as usize] = RuntimeValue::plain(Value::Integer(i64::from(is_n)));
+                } else if is_n {
+                    next_pc = ins.p2 as usize;
+                }
+            }
+            Opcode::NotNull => {
+                let not_n = !regs[ins.p1 as usize].value.is_null();
+                if ins.p3 > 0 {
+                    regs[ins.p3 as usize] = RuntimeValue::plain(Value::Integer(i64::from(not_n)));
+                } else if not_n {
+                    next_pc = ins.p2 as usize;
+                }
+            }
+            Opcode::JumpIfTrue => {
+                if regs[ins.p1 as usize].value.truthiness() == Some(true) {
+                    next_pc = ins.p2 as usize;
+                }
+            }
+            Opcode::JumpIfFalse => {
+                // Jump when false, or when NULL if p3 != 0 (`jumpIfNull` flag in SQLite `OP_IfNot`!)
+                match regs[ins.p1 as usize].value.truthiness() {
+                    Some(false) => next_pc = ins.p2 as usize,
+                    None if ins.p3 != 0 => next_pc = ins.p2 as usize,
+                    _ => {}
+                }
+            }
+            Opcode::JumpIfNull => {
+                if regs[ins.p1 as usize].value.is_null() {
+                    next_pc = ins.p2 as usize;
+                }
+            }
+            Opcode::MustBeInt => {
+                // p1 = reg, p2 = jump_if_not_int (0 = raise SQLITE_MISMATCH)
+                let reg = ins.p1 as usize;
+                let cur = std::mem::replace(&mut regs[reg].value, Value::Null);
+                let coerced = TypeAffinity::Integer.apply(cur);
+                if let Value::Integer(i) = coerced {
+                    regs[reg] = RuntimeValue::plain(Value::Integer(i));
+                } else if ins.p2 > 0 {
+                    regs[reg] = RuntimeValue::plain(coerced);
+                    next_pc = ins.p2 as usize;
+                } else {
+                    regs[reg] = RuntimeValue::plain(coerced);
+                    return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
+                }
+            }
+            Opcode::Affinity => {
+                // p1 = start_reg, p2 = count, p4 = Affinity(vec)
+                let start = ins.p1 as usize;
+                if let P4::Affinity(ref affs) = ins.p4 {
+                    for (i, &aff) in affs.iter().enumerate() {
+                        let v = std::mem::replace(&mut regs[start + i].value, Value::Null);
+                        regs[start + i] = RuntimeValue::plain(aff.apply(v));
                     }
                 }
             }
-
-            self.pc = next_pc;
+            Opcode::Cast => {
+                // p1 = src_reg, p2 = dest_reg, p4 = Str(type_name)
+                let src = regs[ins.p1 as usize].clone();
+                let type_name = match &ins.p4 {
+                    P4::Str(s) => s.as_str(),
+                    _ => "",
+                };
+                let enc = storage
+                    .btree_ref(DatabaseId::MAIN)
+                    .map_or(TextEncoding::Utf8, Btree::encoding);
+                regs[ins.p2 as usize] = eval_cast_rt_with_encoding(src, type_name, enc);
+            }
+            Opcode::Function => {
+                // p1 = first_arg_reg, p3 = dest_reg, p4 = Func { name, argc }
+                let start = ins.p1 as usize;
+                let dest = ins.p3 as usize;
+                let P4::Func { ref name, argc } = ins.p4 else {
+                    return Err(SqliteError::misuse("Function missing P4::Func"));
+                };
+                let res = services.call_scalar(name, &regs[start..start + argc])?;
+                regs[dest] = res;
+            }
+            Opcode::SorterOpen => {
+                // p1 = cursor, p4 = KeyInfo(orders), IntArray encoded via p2.. or KeyInfo
+                let cid = ins.p1 as usize;
+                let orders = match &ins.p4 {
+                    P4::KeyInfo(k) => k.iter().cloned().enumerate().collect(),
+                    _ => Vec::new(),
+                };
+                ensure_cursor_slot_vec(cursors, cid);
+                close_cursor_slot_vec(cursors, cid, storage);
+                cursors[cid] = CursorState::Sorter {
+                    orders,
+                    rows: Vec::new(),
+                    pos: 0,
+                };
+            }
+            Opcode::SorterInsert => {
+                // p1 = sorter cursor, p2 = start_reg, p3 = n_cols
+                let cid = ins.p1 as usize;
+                let start = ins.p2 as usize;
+                let count = ins.p3 as usize;
+                let row: Vec<Value> = regs[start..start + count]
+                    .iter()
+                    .map(|rv| rv.value.clone())
+                    .collect();
+                if let CursorState::Sorter { rows, .. } = &mut cursors[cid] {
+                    rows.push(row);
+                } else {
+                    return Err(SqliteError::misuse("SorterInsert on non-sorter cursor"));
+                }
+            }
+            Opcode::SorterSort => {
+                let cid = ins.p1 as usize;
+                let jump_empty = ins.p2 as usize;
+                if let CursorState::Sorter { orders, rows, pos } = &mut cursors[cid] {
+                    if rows.is_empty() {
+                        next_pc = jump_empty;
+                    } else {
+                        let specs = orders.clone();
+                        let enc = storage
+                            .btree_ref(DatabaseId::MAIN)
+                            .map_or(TextEncoding::Utf8, Btree::encoding);
+                        fallible_sort_by(rows, |a, b| compare_sorter_rows(a, b, &specs, enc))?;
+                        *pos = 0;
+                    }
+                } else {
+                    return Err(SqliteError::misuse("SorterSort on non-sorter cursor"));
+                }
+            }
+            Opcode::SorterColumn => {
+                let cid = ins.p1 as usize;
+                let col_idx = ins.p2 as usize;
+                let dest = ins.p3 as usize;
+                if let CursorState::Sorter { rows, pos, .. } = &cursors[cid] {
+                    regs[dest] = RuntimeValue::plain(
+                        rows[*pos].get(col_idx).cloned().unwrap_or(Value::Null),
+                    );
+                } else {
+                    return Err(SqliteError::misuse("SorterColumn on non-sorter cursor"));
+                }
+            }
+            Opcode::SorterNext => {
+                let cid = ins.p1 as usize;
+                let loop_target = ins.p2 as usize;
+                if let CursorState::Sorter { rows, pos, .. } = &mut cursors[cid] {
+                    *pos += 1;
+                    if *pos < rows.len() {
+                        next_pc = loop_target;
+                    }
+                } else {
+                    return Err(SqliteError::misuse("SorterNext on non-sorter cursor"));
+                }
+            }
         }
 
-        self.halted = true;
-        Ok(VmStep::Done)
+        *pc = next_pc;
     }
+
+    *halted = true;
+    Ok(VmStep::Done)
 }
 
 fn eval_arith(op: Opcode, lhs: &Value, rhs: &Value) -> Value {
@@ -1847,7 +1912,7 @@ fn decode_blob_for_cast(b: &[u8], enc: TextEncoding) -> String {
 }
 
 fn cast_text_to_numeric(s: &str) -> Value {
-    let trimmed = s.trim();
+    let trimmed = sqliters_types::sqlite_trim_ascii(s);
     if !trimmed.is_empty()
         && !trimmed.contains('.')
         && !trimmed.contains('e')

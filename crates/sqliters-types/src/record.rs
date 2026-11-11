@@ -12,6 +12,7 @@
 use std::cmp::Ordering;
 
 use crate::error::{Result, SqliteError};
+use crate::runtime_api::RuntimeValue;
 use crate::value::{Collation, CustomCollation, TextEncoding, Value};
 use crate::varint::{get_varint, push_varint, varint_len};
 
@@ -94,6 +95,32 @@ pub fn encode_record(values: &[Value]) -> Vec<u8> {
 
 /// Serializes a slice of [`Value`]s into an SQLite Format-3 record using `enc` (`OP_MakeRecord`).
 pub fn encode_record_with_encoding(values: &[Value], enc: TextEncoding) -> Vec<u8> {
+    if values.len() <= 16 {
+        let mut serials = [0u64; 16];
+        let mut serial_bytes_len = 0usize;
+        let mut body_len = 0usize;
+        for (i, v) in values.iter().enumerate() {
+            let (st, len) = serial_type_for_with_encoding(v, enc);
+            serial_bytes_len += varint_len(st);
+            body_len += len;
+            serials[i] = st;
+        }
+        let mut hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 1) as u64);
+        if varint_len(hdr_len as u64) + serial_bytes_len != hdr_len {
+            hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 2) as u64);
+        }
+        let mut out = Vec::with_capacity(hdr_len + body_len);
+        push_varint(&mut out, hdr_len as u64);
+        for &st in &serials[..values.len()] {
+            push_varint(&mut out, st);
+        }
+        debug_assert_eq!(out.len(), hdr_len);
+        for (v, &st) in values.iter().zip(serials[..values.len()].iter()) {
+            write_serial_value(&mut out, v, st, enc);
+        }
+        return out;
+    }
+
     let mut serials = Vec::with_capacity(values.len());
     let mut serial_bytes_len = 0usize;
     let mut body_len = 0usize;
@@ -123,6 +150,60 @@ pub fn encode_record_with_encoding(values: &[Value], enc: TextEncoding) -> Vec<u
         write_serial_value(&mut out, v, st, enc);
     }
 
+    out
+}
+
+/// Serializes a slice of [`RuntimeValue`] registers directly into an SQLite Format-3 record
+/// without cloning intermediate [`Value`] elements (`OP_MakeRecord`).
+pub fn encode_runtime_record_with_encoding(values: &[RuntimeValue], enc: TextEncoding) -> Vec<u8> {
+    if values.len() <= 16 {
+        let mut serials = [0u64; 16];
+        let mut serial_bytes_len = 0usize;
+        let mut body_len = 0usize;
+        for (i, rv) in values.iter().enumerate() {
+            let (st, len) = serial_type_for_with_encoding(&rv.value, enc);
+            serial_bytes_len += varint_len(st);
+            body_len += len;
+            serials[i] = st;
+        }
+        let mut hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 1) as u64);
+        if varint_len(hdr_len as u64) + serial_bytes_len != hdr_len {
+            hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 2) as u64);
+        }
+        let mut out = Vec::with_capacity(hdr_len + body_len);
+        push_varint(&mut out, hdr_len as u64);
+        for &st in &serials[..values.len()] {
+            push_varint(&mut out, st);
+        }
+        debug_assert_eq!(out.len(), hdr_len);
+        for (rv, &st) in values.iter().zip(serials[..values.len()].iter()) {
+            write_serial_value(&mut out, &rv.value, st, enc);
+        }
+        return out;
+    }
+
+    let mut serials = Vec::with_capacity(values.len());
+    let mut serial_bytes_len = 0usize;
+    let mut body_len = 0usize;
+    for rv in values {
+        let (st, len) = serial_type_for_with_encoding(&rv.value, enc);
+        serial_bytes_len += varint_len(st);
+        body_len += len;
+        serials.push(st);
+    }
+    let mut hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 1) as u64);
+    if varint_len(hdr_len as u64) + serial_bytes_len != hdr_len {
+        hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 2) as u64);
+    }
+    let mut out = Vec::with_capacity(hdr_len + body_len);
+    push_varint(&mut out, hdr_len as u64);
+    for st in &serials {
+        push_varint(&mut out, *st);
+    }
+    debug_assert_eq!(out.len(), hdr_len);
+    for (rv, &st) in values.iter().zip(serials.iter()) {
+        write_serial_value(&mut out, &rv.value, st, enc);
+    }
     out
 }
 
@@ -342,39 +423,109 @@ pub fn compare_records_with_encoding(
     orders: &[KeySortOrder],
     enc: TextEncoding,
 ) -> Result<Ordering> {
-    let lhs_values = decode_record_with_encoding(lhs_record, enc)?;
-    let n = lhs_values.len().min(rhs_values.len());
-    let default_spec = KeySortOrder::default();
-    for i in 0..n {
-        let spec = orders.get(i).unwrap_or(&default_spec);
-        let a = &lhs_values[i];
-        let b = &rhs_values[i];
-        let ord = match (a.is_null(), b.is_null()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => {
-                if spec.nulls_last {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            }
-            (false, true) => {
-                if spec.nulls_last {
-                    Ordering::Less
-                } else {
-                    Ordering::Greater
-                }
-            }
-            (false, false) => {
-                let raw = a.cmp_sqlite_fallible(b, spec, enc)?;
-                if spec.desc { raw.reverse() } else { raw }
-            }
-        };
-        if ord != Ordering::Equal {
-            return Ok(ord);
-        }
+    if lhs_record.is_empty() {
+        return Ok(Ordering::Equal);
     }
-    Ok(Ordering::Equal)
+    let (hdr_size_u64, mut hdr_pos) = get_varint(lhs_record)?;
+    let hdr_size = usize::try_from(hdr_size_u64)
+        .map_err(|_| SqliteError::corrupt("record header size overflow"))?;
+    if hdr_size > lhs_record.len() || hdr_pos > hdr_size {
+        return Err(SqliteError::corrupt("record header exceeds record length"));
+    }
+
+    let mut body_pos = hdr_size;
+    let mut col_idx = 0usize;
+    let mut decided = Ordering::Equal;
+    let default_spec = KeySortOrder::default();
+
+    while hdr_pos < hdr_size {
+        let (st, used) = get_varint(&lhs_record[hdr_pos..hdr_size])?;
+        hdr_pos += used;
+        if matches!(st, 10 | 11) {
+            return Err(SqliteError::corrupt(format!("reserved serial type {st}")));
+        }
+        let len = serial_type_len(st)?;
+        let end = body_pos
+            .checked_add(len)
+            .ok_or_else(|| SqliteError::corrupt("record body offset overflow"))?;
+        if end > lhs_record.len() {
+            return Err(SqliteError::corrupt("record payload truncated"));
+        }
+
+        if decided == Ordering::Equal && col_idx < rhs_values.len() {
+            let spec = orders.get(col_idx).unwrap_or(&default_spec);
+            let b = &rhs_values[col_idx];
+            let buf = &lhs_record[body_pos..end];
+            decided = if st < 12 {
+                let a = decode_serial_value_with_encoding(st, buf, enc)?;
+                match (a.is_null(), b.is_null()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => {
+                        if spec.nulls_last {
+                            Ordering::Greater
+                        } else {
+                            Ordering::Less
+                        }
+                    }
+                    (false, true) => {
+                        if spec.nulls_last {
+                            Ordering::Less
+                        } else {
+                            Ordering::Greater
+                        }
+                    }
+                    (false, false) => {
+                        let raw = a.cmp_sqlite_fallible(b, spec, enc)?;
+                        if spec.desc { raw.reverse() } else { raw }
+                    }
+                }
+            } else if b.is_null() {
+                if spec.nulls_last {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            } else if (st & 1) == 0 {
+                let raw = match b {
+                    Value::Blob(rb) => buf.cmp(rb.as_slice()),
+                    _ => Ordering::Greater,
+                };
+                if spec.desc { raw.reverse() } else { raw }
+            } else {
+                let raw = match b {
+                    Value::Integer(_) | Value::Real(_) => Ordering::Greater,
+                    Value::Blob(_) => Ordering::Less,
+                    Value::Text(rs) => {
+                        if enc == TextEncoding::Utf8
+                            && let Ok(lhs_s) = std::str::from_utf8(buf)
+                        {
+                            if let Some(ref cc) = spec.custom_collation {
+                                (cc.comparator)(lhs_s, rs.as_str())?
+                            } else {
+                                spec.collation
+                                    .compare_str_with_encoding(lhs_s, rs.as_str(), enc)
+                            }
+                        } else {
+                            let lhs_s = enc.decode_bytes(buf);
+                            if let Some(ref cc) = spec.custom_collation {
+                                (cc.comparator)(&lhs_s, rs.as_str())?
+                            } else {
+                                spec.collation
+                                    .compare_str_with_encoding(&lhs_s, rs.as_str(), enc)
+                            }
+                        }
+                    }
+                    Value::Null => unreachable!(),
+                };
+                if spec.desc { raw.reverse() } else { raw }
+            };
+        }
+
+        body_pos = end;
+        col_idx += 1;
+    }
+
+    Ok(decided)
 }
 
 /// Stable fallible merge sort for slices whose comparator may return `Err(SqliteError)`

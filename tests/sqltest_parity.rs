@@ -1389,3 +1389,205 @@ fn test_sqltest_correctness_catalog() {
 fn test_sqltest_wide_2000_and_4096_catalog() {
     run_sqltest_correctness_subset(|idx| idx == 1 || idx == 2);
 }
+
+#[test]
+fn test_p1a_c_sqlite_3541_equivalence_edge_cases() {
+    let conn = Connection::open_in_memory().unwrap();
+
+    // F-08: Only ASCII whitespace (`' '`, `'\t'`, `'\n'`, `'\r'`, `'\x0b'`, `'\x0c'`) is trimmed
+    // in numeric conversions; Unicode NBSP (`U+00A0`) is NOT trimmed.
+    let rows = conn
+        .query(
+            "SELECT \
+                CAST(char(160) || '12' AS INTEGER), \
+                CAST(char(160) || '12.5' AS REAL), \
+                CAST(char(160) || '12' AS NUMERIC), \
+                CAST(char(11) || char(12) || '42' AS INTEGER), \
+                (char(160) || '12') + 0, \
+                (' \t\n\r\x0b\x0c99 ' ) + 0",
+            &[],
+        )
+        .unwrap()
+        .rows;
+    assert_eq!(
+        rows[0].values(),
+        &[
+            Value::Integer(0),
+            Value::Real(0.0),
+            Value::Integer(0),
+            Value::Integer(42),
+            Value::Integer(0),
+            Value::Integer(99),
+        ]
+    );
+    conn.execute_batch("CREATE TABLE f08_num(v NUMERIC); INSERT INTO f08_num VALUES (char(160) || '12'), ('12'|| char(160)), (' 12 ');")
+        .unwrap();
+    let f08_rows = conn
+        .query("SELECT typeof(v), v FROM f08_num ORDER BY rowid", &[])
+        .unwrap()
+        .rows;
+    assert_eq!(
+        f08_rows[0].values(),
+        &[Value::text("text"), Value::text("\u{00a0}12")]
+    );
+    assert_eq!(
+        f08_rows[1].values(),
+        &[Value::text("text"), Value::text("12\u{00a0}")]
+    );
+    assert_eq!(
+        f08_rows[2].values(),
+        &[Value::text("integer"), Value::Integer(12)]
+    );
+
+    // F-06: Overflowing float exponent in `parse_numeric_text` yields `±Inf`, whereas literal
+    // words `'inf'`, `'-inf'`, `'infinity'`, `'nan'` stay non-numeric (`TEXT` / `0` in `+ 0`).
+    let f06_arith = conn
+        .query(
+            "SELECT '1e309' + 0, '-1e309' + 0, 'inf' + 0, '-inf' + 0, 'infinity' + 0, 'nan' + 0",
+            &[],
+        )
+        .unwrap()
+        .rows;
+    assert_eq!(
+        f06_arith[0].values(),
+        &[
+            Value::Real(f64::INFINITY),
+            Value::Real(f64::NEG_INFINITY),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+        ]
+    );
+    conn.execute_batch(
+        "CREATE TABLE f06_num(n NUMERIC, r REAL); \
+         INSERT INTO f06_num VALUES ('1e400', '1e400'), ('-1e400', '-1e400'), ('inf', 'inf'), ('nan', 'nan');",
+    )
+    .unwrap();
+    let f06_tbl = conn
+        .query(
+            "SELECT typeof(n), n, typeof(r), r FROM f06_num ORDER BY rowid",
+            &[],
+        )
+        .unwrap()
+        .rows;
+    assert_eq!(
+        f06_tbl[0].values(),
+        &[
+            Value::text("real"),
+            Value::Real(f64::INFINITY),
+            Value::text("real"),
+            Value::Real(f64::INFINITY),
+        ]
+    );
+    assert_eq!(
+        f06_tbl[1].values(),
+        &[
+            Value::text("real"),
+            Value::Real(f64::NEG_INFINITY),
+            Value::text("real"),
+            Value::Real(f64::NEG_INFINITY),
+        ]
+    );
+    assert_eq!(
+        f06_tbl[2].values(),
+        &[
+            Value::text("text"),
+            Value::text("inf"),
+            Value::text("text"),
+            Value::text("inf"),
+        ]
+    );
+    assert_eq!(
+        f06_tbl[3].values(),
+        &[
+            Value::text("text"),
+            Value::text("nan"),
+            Value::text("text"),
+            Value::text("nan"),
+        ]
+    );
+
+    // F-12: `GLOB` bracket negation uses ONLY `[^...]`; `[!a]` matches `'!'` or `'a'` literally.
+    let f12 = conn
+        .query(
+            "SELECT 'a' GLOB '[!a]', '!' GLOB '[!a]', 'b' GLOB '[!a]', \
+                    'a' GLOB '[^a]', 'b' GLOB '[^a]'",
+            &[],
+        )
+        .unwrap()
+        .rows;
+    assert_eq!(
+        f12[0].values(),
+        &[
+            Value::Integer(1),
+            Value::Integer(1),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(1),
+        ]
+    );
+
+    // F-13: VDBE `SeekRowid` (`OP_SeekRowid` / `OP_MustBeInt`) with `TEXT` and `REAL` keys.
+    conn.execute_batch(
+        "CREATE TABLE f13_t(id INTEGER PRIMARY KEY, a TEXT); \
+         INSERT INTO f13_t VALUES (2, 'two'), (10, 'ten');",
+    )
+    .unwrap();
+    let mut stmt = conn.prepare("SELECT a FROM f13_t WHERE id = ?1").unwrap();
+    for (param, expected) in [
+        (Value::text("2"), Some("two")),
+        (Value::text(" 2.0 "), Some("two")),
+        (Value::text("1e1"), Some("ten")),
+        (Value::Real(2.0), Some("two")),
+        (Value::text("2.5"), None),
+        (Value::text("abc"), None),
+        (Value::text("\u{00a0}2"), None),
+        (Value::Real(9_223_372_036_854_775_808.0), None),
+    ] {
+        stmt.reset().unwrap();
+        stmt.bind(1, param.clone()).unwrap();
+        let got = stmt.collect_rows().unwrap();
+        match expected {
+            Some(exp) => {
+                assert_eq!(got.len(), 1, "expected match for {param:?}");
+                assert_eq!(got[0].values(), &[Value::text(exp)]);
+            }
+            None => assert!(got.is_empty(), "expected miss for {param:?}, got {got:?}"),
+        }
+    }
+    drop(stmt);
+
+    // F-14: `NATURAL JOIN` and `JOIN ... USING` use the left table column's collation.
+    conn.execute_batch(
+        "CREATE TABLE f14_t1(b TEXT); \
+         CREATE TABLE f14_t2(B TEXT COLLATE NOCASE); \
+         INSERT INTO f14_t1 VALUES ('abc'); \
+         INSERT INTO f14_t2 VALUES ('ABC');",
+    )
+    .unwrap();
+    assert!(
+        conn.query("SELECT * FROM f14_t1 NATURAL JOIN f14_t2", &[])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    assert!(
+        conn.query("SELECT * FROM f14_t1 JOIN f14_t2 USING(b)", &[])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    let rev_nat = conn
+        .query("SELECT * FROM f14_t2 NATURAL JOIN f14_t1", &[])
+        .unwrap()
+        .rows;
+    assert_eq!(rev_nat.len(), 1);
+    assert_eq!(rev_nat[0].values(), &[Value::text("ABC")]);
+    let rev_using = conn
+        .query("SELECT * FROM f14_t2 JOIN f14_t1 USING(B)", &[])
+        .unwrap()
+        .rows;
+    assert_eq!(rev_using.len(), 1);
+    assert_eq!(rev_using[0].values(), &[Value::text("ABC")]);
+}

@@ -472,7 +472,6 @@ impl ExecContext<'_> {
             .db_set
             .slot_mut(db_id)
             .ok_or_else(|| SqliteError::new(ErrorCode::Error, "unknown database slot"))?;
-        let slot_name = slot.name.clone();
         let bt = slot
             .btree
             .as_mut()
@@ -492,6 +491,7 @@ impl ExecContext<'_> {
             *self.in_user_btree_tx = true;
         }
         let reloaded = if check_schema {
+            let slot_name = slot.name.clone();
             let was_loaded = slot.schema.loaded;
             let prev_cookie = slot.schema.schema_cookie;
             if let Err(e) = slot.schema.ensure_fresh_in_tx_for_schema(bt, &slot_name) {
@@ -1549,14 +1549,6 @@ impl EvalRow {
             .map(|(v, c, _)| (v, c)))
     }
 
-    fn lookup_full(
-        &self,
-        qual: Option<&str>,
-        col_name: &str,
-    ) -> Result<Option<(Value, Collation, Option<TypeAffinity>)>> {
-        self.lookup_qual_full(None, qual, col_name)
-    }
-
     fn lookup_cref(&self, cref: &ColumnRef) -> Result<Option<(Value, Collation)>> {
         Ok(self
             .lookup_qual_full(cref.schema.as_deref(), cref.table.as_deref(), &cref.column)?
@@ -1570,6 +1562,13 @@ impl EvalRow {
                 value: self.vals[idx].clone(),
                 subtype: self.subtypes.get(idx).copied().unwrap_or(0),
             }))
+    }
+
+    #[inline]
+    fn lookup_cref_val_ref(&self, cref: &ColumnRef) -> Result<Option<&Value>> {
+        Ok(self
+            .lookup_qual_idx(cref.schema.as_deref(), cref.table.as_deref(), &cref.column)?
+            .map(|idx| &self.vals[idx]))
     }
 
     fn lookup_cref_is_vtab(&self, cref: &ColumnRef) -> bool {
@@ -2208,6 +2207,7 @@ pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
                 ));
             }
             let was_autocommit = is_in_autocommit(ctx);
+            crate::vtab::vtab_flush_shadow_all(ctx)?;
             let slot_idx = ctx.savepoints.len();
             for db_slot in ctx.db_set.slots_mut() {
                 if let Some(ref mut bt) = db_slot.btree
@@ -2362,6 +2362,78 @@ pub(crate) fn execute_read_body(
         } => exec_pragma(ctx, schema.as_deref(), name, value.as_ref()),
         _ => unreachable!("execute_read_body called on non-read statement"),
     }
+}
+
+/// Fast-path VDBE execution for compiled `INSERT INTO <table> VALUES (...)` programs.
+pub(crate) fn try_execute_compiled_insert(
+    ctx: &mut ExecContext<'_>,
+    prog: &sqliters_vdbe::VdbeProgram,
+    scratch: &mut sqliters_vdbe::VdbeWriteScratch,
+    params: &[Value],
+) -> Result<Option<QueryOutput>> {
+    if *ctx.count_changes
+        || ctx.mutation_pipeline.has_update_hook()
+        || ctx.mutation_pipeline.is_trace_enabled()
+        || !ctx.stmt_tx.pinned_table_roots.is_empty()
+    {
+        return Ok(None);
+    }
+    let mut target_db = DatabaseId::MAIN;
+    for ins in &prog.ops {
+        if matches!(ins.opcode, Opcode::OpenWrite | Opcode::Transaction) {
+            target_db = ins.db;
+            break;
+        }
+    }
+    ctx.ensure_write_db(target_db, false)?;
+    let enc = ctx.encoding();
+    let mut vm_rt = VmRuntimeContext {
+        last_insert_rowid: ctx.runtime.last_insert_rowid,
+        last_changes: 0,
+        total_changes: 0,
+        stmt_timestamp_ms: ctx.runtime.stmt_timestamp_ms,
+        enable_test_functions: ctx.runtime.enable_test_functions,
+    };
+    let svc_rt = vm_rt;
+    let run_res = {
+        let mut exec_svc = ExecutionContext {
+            interrupt_flag: ctx.interrupt_flag,
+            runtime: &svc_rt,
+            encoding: enc,
+            functions: ctx.functions,
+            collations: ctx.collations,
+            progress: ctx.progress,
+            strict_subtype: ctx.strict_subtype,
+        };
+        sqliters_vdbe::VdbeVm::run_write_program(
+            prog,
+            params,
+            &mut vm_rt,
+            scratch,
+            ctx.db_set,
+            &mut exec_svc,
+        )
+    };
+    if vm_rt.last_insert_rowid != ctx.runtime.last_insert_rowid {
+        ctx.runtime.last_insert_rowid = vm_rt.last_insert_rowid;
+        ctx.publish();
+    }
+    run_res?;
+
+    if let Some(slot) = ctx.db_set.slot(target_db)
+        && let Some(ref bt) = slot.btree
+        && bt.pager().page_count() > slot.max_page_count
+    {
+        return Err(SqliteError::new(
+            ErrorCode::Full,
+            "database or disk is full",
+        ));
+    }
+
+    ctx.runtime.last_changes = vm_rt.last_changes;
+    ctx.runtime.total_changes += vm_rt.last_changes;
+    ctx.publish();
+    Ok(Some(QueryOutput::default()))
 }
 
 /// Executes a `Write` statement body (`INSERT`, `UPDATE`, `DELETE`, DDL, `REINDEX`, or header-writing `PRAGMA`)
@@ -2708,18 +2780,23 @@ where
     let abort_last_changes = if is_dml { 0 } else { prev_last_changes };
     let prev_mutation_len = ctx.mutation_pipeline.len();
     let prev_deferred = ctx.deferred_fk_suspects.clone();
-    let prev_schemas: Vec<(SchemaInstanceId, Schema)> = ctx
-        .db_set
-        .slots()
-        .iter()
-        .filter(|s| s.btree.is_some())
-        .map(|s| (s.schema_instance_id, s.schema.clone()))
-        .collect();
+    let prev_schemas: Vec<(SchemaInstanceId, Schema)> = if is_dml && !*ctx.writable_schema {
+        Vec::new()
+    } else {
+        ctx.db_set
+            .slots()
+            .iter()
+            .filter(|s| s.btree.is_some())
+            .map(|s| (s.schema_instance_id, s.schema.clone()))
+            .collect()
+    };
     let prev_schema_gen = *ctx.schema_generation;
     let prev_v1_gen = *ctx.v1_expire_generation;
     let prev_schema_changed = *ctx.schema_changed_in_tx;
 
-    if let Some(sp_slot) = stmt_sp_slot {
+    if let Some(sp_slot) = stmt_sp_slot
+        && ctx.db_set.vtab_registry().has_any_in_tx()
+    {
         crate::vtab::vtab_savepoint_all(ctx, sp_slot)?;
     }
 
@@ -2758,7 +2835,9 @@ where
                         bt.pager_mut().release_subsavepoint(sp_slot)?;
                     }
                 }
-                crate::vtab::vtab_release_all(ctx, sp_slot)?;
+                if ctx.db_set.vtab_registry().has_any_in_tx() {
+                    crate::vtab::vtab_release_all(ctx, sp_slot)?;
+                }
             }
             if autocommit && ctx.activity.other_writers == 0 {
                 if let Err((commit_err, disp)) = commit_all_databases(ctx) {
@@ -2929,24 +3008,22 @@ pub fn execute_internal_vtab_sql(
     params: &[Value],
 ) -> Result<usize> {
     ctx.db_set.vtab_registry_mut().internal_sql_depth += 1;
-    let res = (|| {
-        let mut total_changes = 0usize;
-        let mut rest = sql;
-        while !rest.trim().is_empty() {
-            let (opt_stmt, tail) = parse_one(rest)?;
-            rest = tail;
-            let Some(stmt) = opt_stmt else {
-                continue;
-            };
-            crate::vtab::ensure_stmt_vtabs_connected(ctx, &stmt)?;
+    let res = (|| match ctx
+        .db_set
+        .vtab_registry_mut()
+        .get_or_parse_single_sub_sql(sql)?
+    {
+        crate::vtab::CachedSubSql::Empty => Ok(0),
+        crate::vtab::CachedSubSql::Single(stmt_arc) => {
+            crate::vtab::ensure_stmt_vtabs_connected(ctx, &stmt_arc)?;
             let prev_last_changes = ctx.runtime.last_changes;
             let prev_total_changes = ctx.runtime.total_changes;
             let prev_last_rowid = ctx.runtime.last_insert_rowid;
             ctx.runtime.last_changes = 0;
-            let run_res = match classify_stmt_category(&stmt) {
-                StmtCategory::Read => execute_read_body(ctx, &stmt, params),
-                StmtCategory::Write => execute_write_body(ctx, &stmt, params),
-                StmtCategory::NoLockPragma => execute_nolock_stmt(ctx, &stmt, params),
+            let run_res = match classify_stmt_category(&stmt_arc) {
+                StmtCategory::Read => execute_read_body(ctx, &stmt_arc, params),
+                StmtCategory::Write => execute_write_body(ctx, &stmt_arc, params),
+                StmtCategory::NoLockPragma => execute_nolock_stmt(ctx, &stmt_arc, params),
                 _ => Err(SqliteError::new(
                     ErrorCode::Error,
                     "unsupported statement in virtual table sub-SQL",
@@ -2957,9 +3034,40 @@ pub fn execute_internal_vtab_sql(
             ctx.runtime.total_changes = prev_total_changes;
             ctx.runtime.last_insert_rowid = prev_last_rowid;
             run_res?;
-            total_changes += sub_changes;
+            Ok(sub_changes)
         }
-        Ok(total_changes)
+        crate::vtab::CachedSubSql::Multi => {
+            let mut total_changes = 0usize;
+            let mut rest = sql;
+            while !rest.trim().is_empty() {
+                let (opt_stmt, tail) = parse_one(rest)?;
+                rest = tail;
+                let Some(stmt) = opt_stmt else {
+                    continue;
+                };
+                crate::vtab::ensure_stmt_vtabs_connected(ctx, &stmt)?;
+                let prev_last_changes = ctx.runtime.last_changes;
+                let prev_total_changes = ctx.runtime.total_changes;
+                let prev_last_rowid = ctx.runtime.last_insert_rowid;
+                ctx.runtime.last_changes = 0;
+                let run_res = match classify_stmt_category(&stmt) {
+                    StmtCategory::Read => execute_read_body(ctx, &stmt, params),
+                    StmtCategory::Write => execute_write_body(ctx, &stmt, params),
+                    StmtCategory::NoLockPragma => execute_nolock_stmt(ctx, &stmt, params),
+                    _ => Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "unsupported statement in virtual table sub-SQL",
+                    )),
+                };
+                let sub_changes = ctx.runtime.last_changes as usize;
+                ctx.runtime.last_changes = prev_last_changes;
+                ctx.runtime.total_changes = prev_total_changes;
+                ctx.runtime.last_insert_rowid = prev_last_rowid;
+                run_res?;
+                total_changes += sub_changes;
+            }
+            Ok(total_changes)
+        }
     })();
     ctx.db_set.vtab_registry_mut().internal_sql_depth = ctx
         .db_set
@@ -2977,18 +3085,29 @@ pub fn query_internal_vtab_sql(
 ) -> Result<Vec<Vec<Value>>> {
     ctx.db_set.vtab_registry_mut().internal_sql_depth += 1;
     let res = (|| {
-        let (opt_stmt, _) = parse_one(sql)?;
-        let Some(stmt) = opt_stmt else {
-            return Ok(Vec::new());
+        let stmt_arc = match ctx
+            .db_set
+            .vtab_registry_mut()
+            .get_or_parse_single_sub_sql(sql)?
+        {
+            crate::vtab::CachedSubSql::Single(s) => s,
+            crate::vtab::CachedSubSql::Empty => return Ok(Vec::new()),
+            crate::vtab::CachedSubSql::Multi => {
+                let (opt_stmt, _) = parse_one(sql)?;
+                let Some(stmt) = opt_stmt else {
+                    return Ok(Vec::new());
+                };
+                Arc::new(stmt)
+            }
         };
-        crate::vtab::ensure_stmt_vtabs_connected(ctx, &stmt)?;
+        crate::vtab::ensure_stmt_vtabs_connected(ctx, &stmt_arc)?;
         let prev_last_changes = ctx.runtime.last_changes;
         let prev_total_changes = ctx.runtime.total_changes;
         let prev_last_rowid = ctx.runtime.last_insert_rowid;
-        let run_res = match classify_stmt_category(&stmt) {
-            StmtCategory::Read => execute_read_body(ctx, &stmt, params),
-            StmtCategory::NoLockPragma => execute_nolock_stmt(ctx, &stmt, params),
-            StmtCategory::Write => execute_write_body(ctx, &stmt, params),
+        let run_res = match classify_stmt_category(&stmt_arc) {
+            StmtCategory::Read => execute_read_body(ctx, &stmt_arc, params),
+            StmtCategory::NoLockPragma => execute_nolock_stmt(ctx, &stmt_arc, params),
+            StmtCategory::Write => execute_write_body(ctx, &stmt_arc, params),
             _ => Err(SqliteError::new(
                 ErrorCode::Error,
                 "unsupported statement in virtual table sub-query",
@@ -3005,6 +3124,347 @@ pub fn query_internal_vtab_sql(
         .internal_sql_depth
         .saturating_sub(1);
     res
+}
+
+fn quote_shadow_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+/// Fast-path direct B-tree point read by `rowid` on an ordinary rowid shadow table, falling back
+/// to `query_internal_vtab_sql` for `WITHOUT ROWID`, generated columns, or missing tables.
+pub fn shadow_get_rowid_direct(
+    ctx: &mut ExecContext<'_>,
+    db_name: &str,
+    shadow_table: &str,
+    rowid: i64,
+) -> Result<Option<Vec<Value>>> {
+    if let Some(db_id) = ctx.db_set.find_db_id(db_name) {
+        let check_schema = ctx.db_set.slot(db_id).is_some_and(|s| !s.schema.loaded);
+        ctx.ensure_read_db(db_id, check_schema)?;
+        if let Some(slot) = ctx.db_set.slot_mut(db_id)
+            && let Some(tbl_info) = slot
+                .schema
+                .tables
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(shadow_table))
+                .filter(|t| {
+                    !t.without_rowid
+                        && t.root_pgno > 0
+                        && t.columns
+                            .iter()
+                            .all(|c| c.generated.is_none() && c.default_expr.is_none())
+                })
+                .map(|t| (t.root_pgno, t.columns.len(), t.rowid_alias_col))
+            && let Some(ref mut bt) = slot.btree
+        {
+            let (root_pgno, n_cols, alias_col) = tbl_info;
+            let Some(raw) = bt.seek_table_rowid(root_pgno, rowid)? else {
+                return Ok(None);
+            };
+            let enc = bt.encoding();
+            let mut vals = decode_record_with_encoding(&raw, enc)?;
+            if vals.len() < n_cols {
+                vals.resize(n_cols, Value::Null);
+            } else if vals.len() > n_cols {
+                vals.truncate(n_cols);
+            }
+            if let Some(a_idx) = alias_col
+                && a_idx < vals.len()
+            {
+                vals[a_idx] = Value::Integer(rowid);
+            }
+            return Ok(Some(vals));
+        }
+    }
+    let db_q = quote_shadow_ident(db_name);
+    let tbl_q = quote_shadow_ident(shadow_table);
+    let sql = format!("SELECT * FROM {db_q}.{tbl_q} WHERE rowid = ?1");
+    let mut rows = query_internal_vtab_sql(ctx, &sql, &[Value::Integer(rowid)])?;
+    Ok(rows.pop())
+}
+
+/// Zero-allocation fast check comparing a `BLOB` column on an ordinary rowid shadow table row.
+pub fn shadow_rowid_blob_eq_direct(
+    ctx: &mut ExecContext<'_>,
+    db_name: &str,
+    shadow_table: &str,
+    rowid: i64,
+    col_idx: usize,
+    expected: &[u8],
+) -> Result<Option<bool>> {
+    if let Some(db_id) = ctx.db_set.find_db_id(db_name) {
+        let check_schema = ctx.db_set.slot(db_id).is_some_and(|s| !s.schema.loaded);
+        ctx.ensure_read_db(db_id, check_schema)?;
+        if let Some(slot) = ctx.db_set.slot_mut(db_id)
+            && let Some(tbl_info) = slot
+                .schema
+                .tables
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(shadow_table))
+                .filter(|t| {
+                    !t.without_rowid
+                        && t.root_pgno > 0
+                        && col_idx < t.columns.len()
+                        && t.rowid_alias_col != Some(col_idx)
+                        && t.columns
+                            .iter()
+                            .all(|c| c.generated.is_none() && c.default_expr.is_none())
+                })
+                .map(|t| t.root_pgno)
+            && let Some(ref mut bt) = slot.btree
+        {
+            return bt.table_rowid_col_blob_eq(tbl_info, rowid, col_idx, expected);
+        }
+    }
+    Ok(None)
+}
+
+/// Fast-path direct B-tree `MAX(rowid)` read on an ordinary rowid shadow table.
+pub fn shadow_max_rowid_direct(
+    ctx: &mut ExecContext<'_>,
+    db_name: &str,
+    shadow_table: &str,
+) -> Result<Option<i64>> {
+    if let Some(db_id) = ctx.db_set.find_db_id(db_name) {
+        let check_schema = ctx.db_set.slot(db_id).is_some_and(|s| !s.schema.loaded);
+        ctx.ensure_read_db(db_id, check_schema)?;
+        if let Some(slot) = ctx.db_set.slot_mut(db_id)
+            && let Some(root_pgno) = slot
+                .schema
+                .tables
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(shadow_table))
+                .filter(|t| !t.without_rowid && t.root_pgno > 0)
+                .map(|t| t.root_pgno)
+            && let Some(ref mut bt) = slot.btree
+        {
+            return bt.max_table_rowid(root_pgno);
+        }
+    }
+    let db_q = quote_shadow_ident(db_name);
+    let tbl_q = quote_shadow_ident(shadow_table);
+    let sql = format!("SELECT max(rowid) FROM {db_q}.{tbl_q}");
+    let rows = query_internal_vtab_sql(ctx, &sql, &[])?;
+    match rows.first().and_then(|r| r.first()) {
+        Some(Value::Integer(v)) => Ok(Some(*v)),
+        _ => Ok(None),
+    }
+}
+
+/// Fast-path direct B-tree point `INSERT [OR REPLACE]` by `rowid` on an ordinary rowid shadow table
+/// with no secondary indexes, triggers, foreign keys, or active mutation hooks.
+pub fn shadow_put_rowid_direct(
+    ctx: &mut ExecContext<'_>,
+    db_name: &str,
+    shadow_table: &str,
+    rowid: i64,
+    cols: &[Value],
+    or_replace: bool,
+) -> Result<()> {
+    let mut has_ipk_opt: Option<bool> = None;
+    if (!ctx.is_connection_readonly || db_name.eq_ignore_ascii_case("temp"))
+        && !ctx.mutation_pipeline.is_trace_enabled()
+        && !ctx.mutation_pipeline.has_update_hook()
+        && let Some(db_id) = ctx.db_set.find_db_id(db_name)
+    {
+        let check_schema = ctx.db_set.slot(db_id).is_some_and(|s| !s.schema.loaded);
+        ctx.ensure_write_db(db_id, check_schema)?;
+        let no_triggers = !ctx.db_set.has_any_triggers()
+            || ctx
+                .db_set
+                .triggers_for_relation(db_id, shadow_table)
+                .is_empty();
+        if no_triggers && let Some(slot) = ctx.db_set.slot_mut(db_id) {
+            let fk_enabled = *ctx.foreign_keys;
+            let inst_id = slot.schema_instance_id;
+            let max_pages = slot.max_page_count;
+            let mut fast_payload: Option<(Pgno, Vec<u8>)> = None;
+            if let Some(tbl) = slot
+                .schema
+                .tables
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(shadow_table))
+            {
+                has_ipk_opt = Some(tbl.rowid_alias_col.is_some());
+                let no_indexes = !slot
+                    .schema
+                    .indexes
+                    .iter()
+                    .any(|idx| idx.table_name.eq_ignore_ascii_case(&tbl.name));
+                let no_fks = !fk_enabled
+                    || (tbl.foreign_keys.is_empty()
+                        && !slot.schema.tables.iter().any(|ot| {
+                            ot.foreign_keys
+                                .iter()
+                                .any(|fk| fk.ref_table.eq_ignore_ascii_case(&tbl.name))
+                        }));
+                if !tbl.without_rowid
+                    && !tbl.strict
+                    && !tbl.autoincrement
+                    && tbl.root_pgno > 0
+                    && tbl.columns.len() == cols.len()
+                    && tbl.checks.is_empty()
+                    && no_indexes
+                    && no_fks
+                    && tbl
+                        .columns
+                        .iter()
+                        .all(|c| c.generated.is_none() && c.not_null.is_none() && !c.is_unique)
+                    && let Some(ref bt) = slot.btree
+                {
+                    let enc = bt.encoding();
+                    let mut rec_vals = Vec::with_capacity(cols.len());
+                    for (i, v) in cols.iter().enumerate() {
+                        if Some(i) == tbl.rowid_alias_col {
+                            rec_vals.push(Value::Null);
+                        } else {
+                            rec_vals.push(tbl.columns[i].affinity.apply(v.clone()));
+                        }
+                    }
+                    fast_payload =
+                        Some((tbl.root_pgno, encode_record_with_encoding(&rec_vals, enc)));
+                }
+            }
+            if let Some((root_pgno, payload)) = fast_payload
+                && let Some(ref mut bt) = slot.btree
+            {
+                let duplicate = !or_replace && bt.seek_table_rowid(root_pgno, rowid)?.is_some();
+                if !duplicate {
+                    bt.insert_table(root_pgno, rowid, &payload)?;
+                    if bt.pager().page_count() > max_pages {
+                        return Err(SqliteError::new(
+                            ErrorCode::Full,
+                            "database or disk is full",
+                        ));
+                    }
+                    if !ctx.db_set.open_blobs().is_empty() {
+                        ctx.db_set
+                            .expire_blobs_for_row(inst_id, shadow_table, rowid);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    let db_q = quote_shadow_ident(db_name);
+    let tbl_q = quote_shadow_ident(shadow_table);
+    let verb = if or_replace {
+        "INSERT OR REPLACE"
+    } else {
+        "INSERT"
+    };
+    if has_ipk_opt.is_none()
+        && let Some(db_id) = ctx.db_set.find_db_id(db_name)
+        && let Some(slot) = ctx.db_set.slot(db_id)
+        && let Some(tbl) = slot.schema.find_user_table(shadow_table)
+    {
+        has_ipk_opt = Some(tbl.rowid_alias_col.is_some());
+    }
+    if cols.is_empty() {
+        let sql = format!("{verb} INTO {db_q}.{tbl_q}(rowid) VALUES (?1)");
+        execute_internal_vtab_sql(ctx, &sql, &[Value::Integer(rowid)])?;
+        return Ok(());
+    }
+    if has_ipk_opt == Some(false)
+        && let Some(db_id) = ctx.db_set.find_db_id(db_name)
+        && let Some(col_names) = ctx
+            .db_set
+            .slot(db_id)
+            .and_then(|s| s.schema.find_user_table(shadow_table))
+            .filter(|t| t.columns.len() == cols.len())
+            .map(|t| {
+                t.columns
+                    .iter()
+                    .map(|c| quote_shadow_ident(&c.name))
+                    .collect::<Vec<_>>()
+            })
+    {
+        let mut params = Vec::with_capacity(cols.len() + 1);
+        params.push(Value::Integer(rowid));
+        params.extend_from_slice(cols);
+        let ph: Vec<String> = (1..=params.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "{verb} INTO {db_q}.{tbl_q}(rowid, {}) VALUES ({})",
+            col_names.join(", "),
+            ph.join(", ")
+        );
+        execute_internal_vtab_sql(ctx, &sql, &params)?;
+        return Ok(());
+    }
+    let mut ph = String::with_capacity(cols.len() * 4);
+    for i in 0..cols.len() {
+        if i > 0 {
+            ph.push_str(", ");
+        }
+        ph.push('?');
+        ph.push_str(&(i + 1).to_string());
+    }
+    let sql = format!("{verb} INTO {db_q}.{tbl_q} VALUES ({ph})");
+    execute_internal_vtab_sql(ctx, &sql, cols)?;
+    Ok(())
+}
+
+/// Fast-path direct B-tree point `DELETE` by `rowid` on an ordinary rowid shadow table.
+pub fn shadow_delete_rowid_direct(
+    ctx: &mut ExecContext<'_>,
+    db_name: &str,
+    shadow_table: &str,
+    rowid: i64,
+) -> Result<bool> {
+    if (!ctx.is_connection_readonly || db_name.eq_ignore_ascii_case("temp"))
+        && !ctx.mutation_pipeline.is_trace_enabled()
+        && !ctx.mutation_pipeline.has_update_hook()
+        && let Some(db_id) = ctx.db_set.find_db_id(db_name)
+    {
+        let check_schema = ctx.db_set.slot(db_id).is_some_and(|s| !s.schema.loaded);
+        ctx.ensure_write_db(db_id, check_schema)?;
+        let no_triggers = !ctx.db_set.has_any_triggers()
+            || ctx
+                .db_set
+                .triggers_for_relation(db_id, shadow_table)
+                .is_empty();
+        if no_triggers && let Some(slot) = ctx.db_set.slot_mut(db_id) {
+            let fk_enabled = *ctx.foreign_keys;
+            let inst_id = slot.schema_instance_id;
+            let root_opt = slot
+                .schema
+                .tables
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(shadow_table))
+                .filter(|tbl| {
+                    let no_indexes = !slot
+                        .schema
+                        .indexes
+                        .iter()
+                        .any(|idx| idx.table_name.eq_ignore_ascii_case(&tbl.name));
+                    let no_fks = !fk_enabled
+                        || (tbl.foreign_keys.is_empty()
+                            && !slot.schema.tables.iter().any(|ot| {
+                                ot.foreign_keys
+                                    .iter()
+                                    .any(|fk| fk.ref_table.eq_ignore_ascii_case(&tbl.name))
+                            }));
+                    !tbl.without_rowid && tbl.root_pgno > 0 && no_indexes && no_fks
+                })
+                .map(|t| t.root_pgno);
+            if let Some(root_pgno) = root_opt
+                && let Some(ref mut bt) = slot.btree
+            {
+                let deleted = bt.delete_table(root_pgno, rowid)?;
+                if deleted && !ctx.db_set.open_blobs().is_empty() {
+                    ctx.db_set
+                        .expire_blobs_for_row(inst_id, shadow_table, rowid);
+                }
+                return Ok(deleted);
+            }
+        }
+    }
+
+    let db_q = quote_shadow_ident(db_name);
+    let tbl_q = quote_shadow_ident(shadow_table);
+    let sql = format!("DELETE FROM {db_q}.{tbl_q} WHERE rowid = ?1");
+    Ok(execute_internal_vtab_sql(ctx, &sql, &[Value::Integer(rowid)])? > 0)
 }
 
 #[inline]
@@ -4358,15 +4818,61 @@ fn exec_single_select_core(
             let mut omitted_vtab_conjuncts: Vec<Expr> = Vec::new();
             let source_rows = match from {
                 None => vec![EvalRow::default()],
+                Some(fc) if fc.joins.is_empty() => {
+                    match try_exec_fast_single_vtab_select(
+                        ctx,
+                        core,
+                        fc,
+                        pre_where_selection.as_ref(),
+                        order_by,
+                        limit,
+                        params,
+                        outer_scopes,
+                        ctes,
+                        &mut omitted_vtab_conjuncts,
+                    )? {
+                        FastSingleVtabOutcome::Completed(out) => return Ok(out),
+                        FastSingleVtabOutcome::FallbackRows(rows) => rows,
+                        FastSingleVtabOutcome::NotApplicable => {
+                            let single_vtab_qinfo =
+                                if tos_is_vtab_or_tvf(ctx.db_set, &fc.head, ctes) {
+                                    Some(SingleVtabQueryInfo::from_single_select(
+                                        projection,
+                                        selection.as_ref(),
+                                        pre_where_selection.as_ref(),
+                                        group_by,
+                                        having.as_ref(),
+                                        windows,
+                                        order_by,
+                                        limit,
+                                    ))
+                                } else {
+                                    None
+                                };
+                            eval_table_or_subquery(
+                                ctx,
+                                &fc.head,
+                                pre_where_selection.as_ref(),
+                                None,
+                                if group_by.is_empty() && windows.is_empty() {
+                                    order_by
+                                } else {
+                                    &[]
+                                },
+                                params,
+                                outer_scopes,
+                                ctes,
+                                &mut omitted_vtab_conjuncts,
+                                single_vtab_qinfo.as_ref(),
+                            )?
+                        }
+                    }
+                }
                 Some(fc) => eval_from_clause(
                     ctx,
                     fc,
                     pre_where_selection.as_ref(),
-                    if fc.joins.is_empty() && group_by.is_empty() && windows.is_empty() {
-                        order_by
-                    } else {
-                        &[]
-                    },
+                    &[],
                     params,
                     outer_scopes,
                     ctes,
@@ -5347,7 +5853,12 @@ fn tos_is_vtab_or_tvf(db_set: &DatabaseSet, tos: &TableOrSubquery, ctes: &CteSto
             if db_set.resolve_catalog_table(name).ok().flatten().is_some() {
                 return false;
             }
-            if db_set.find_relation_in_set(name).ok().flatten().is_some() {
+            if db_set
+                .find_relation_ref_in_set(name)
+                .ok()
+                .flatten()
+                .is_some()
+            {
                 return false;
             }
             db_set.find_connected_vtab_in_set(name, true).is_some()
@@ -5664,6 +6175,7 @@ fn eval_from_clause_inner(
         outer_scopes,
         ctes,
         omitted_conjuncts,
+        None,
     ) {
         Ok(rows) => rows,
         Err(head_err) if head_is_vtab && vtab_rotations_left > 0 => {
@@ -5885,6 +6397,7 @@ fn eval_from_clause_inner(
                     &sc,
                     ctes,
                     omitted_conjuncts,
+                    None,
                 )?;
             } else {
                 let mut combined_out = Vec::new();
@@ -5900,6 +6413,7 @@ fn eval_from_clause_inner(
                         &sc,
                         ctes,
                         omitted_conjuncts,
+                        None,
                     )?;
                     let r_cols_actual = if !right_cols_fallback.is_empty() {
                         right_cols_fallback.clone()
@@ -5952,6 +6466,7 @@ fn eval_from_clause_inner(
                 outer_scopes,
                 ctes,
                 omitted_conjuncts,
+                None,
             )?;
             let right_cols_actual: Vec<ScopedColumn> = right_rows
                 .first()
@@ -6237,17 +6752,31 @@ fn vtab_scoped_cols_with_alias(
     vtab_scoped_cols(schema_lbl, alias.unwrap_or(table_name), declared)
 }
 
+#[allow(clippy::type_complexity)]
 fn resolve_vtab_for_query(
     ctx: &mut ExecContext<'_>,
     qname: &QualifiedName,
     allow_eponymous: bool,
-) -> Result<Option<(DatabaseId, String, String, crate::vtab::VTabDeclaredSchema)>> {
-    if let Some((db_id, vt)) = ctx
+) -> Result<
+    Option<(
+        DatabaseId,
+        String,
+        String,
+        Arc<crate::vtab::VTabDeclaredSchema>,
+    )>,
+> {
+    if let Some((id, db_name, vt_name, decl)) = ctx
+        .db_set
+        .find_connected_vtab_in_set(qname, allow_eponymous)
+    {
+        return Ok(Some((id, db_name, vt_name, Arc::clone(decl))));
+    }
+    if let Some((db_id, vt_name)) = ctx
         .db_set
         .find_virtual_table_in_set(qname)
-        .map(|(id, v)| (id, v.clone()))
+        .map(|(id, v)| (id, v.name.clone()))
     {
-        let _ = crate::vtab::ensure_vtab_connected(ctx, db_id, &vt.name, false)?;
+        let _ = crate::vtab::ensure_vtab_connected(ctx, db_id, &vt_name, false)?;
     } else if allow_eponymous {
         let db_id = match &qname.schema {
             Some(s) => match ctx.db_set.resolve_schema_or_err(Some(s)) {
@@ -6261,7 +6790,322 @@ fn resolve_vtab_for_query(
     Ok(ctx
         .db_set
         .find_connected_vtab_in_set(qname, allow_eponymous)
-        .map(|(id, db_name, vt_name, decl)| (id, db_name, vt_name, decl.clone())))
+        .map(|(id, db_name, vt_name, decl)| (id, db_name, vt_name, Arc::clone(decl))))
+}
+
+#[derive(Debug, Default)]
+struct SingleVtabQueryInfo {
+    has_star: bool,
+    has_fts5_text_aux: bool,
+    col_names: Vec<String>,
+}
+
+impl SingleVtabQueryInfo {
+    #[allow(clippy::too_many_arguments)]
+    fn from_single_select(
+        projection: &[ResultColumn],
+        selection: Option<&Expr>,
+        pre_where_selection: Option<&Expr>,
+        group_by: &[Expr],
+        having: Option<&Expr>,
+        windows: &[(String, WindowSpec)],
+        order_by: &[OrderByTerm],
+        limit: Option<&LimitClause>,
+    ) -> Self {
+        let mut info = Self::default();
+        for rc in projection {
+            match rc {
+                ResultColumn::Star | ResultColumn::TableStar { .. } => info.has_star = true,
+                ResultColumn::Expr { expr, .. } => info.collect_expr(expr),
+            }
+        }
+        if let Some(e) = selection {
+            info.collect_expr(e);
+        }
+        if let Some(e) = pre_where_selection {
+            info.collect_expr(e);
+        }
+        for e in group_by {
+            info.collect_expr(e);
+        }
+        if let Some(e) = having {
+            info.collect_expr(e);
+        }
+        for (_, wspec) in windows {
+            info.collect_window_spec(wspec);
+        }
+        for ob in order_by {
+            info.collect_expr(&ob.expr);
+        }
+        if let Some(lc) = limit {
+            info.collect_expr(&lc.limit);
+            if let Some(ref off) = lc.offset {
+                info.collect_expr(off);
+            }
+        }
+        info
+    }
+
+    fn record_col_name(&mut self, name: &str) {
+        if !self.col_names.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+            self.col_names.push(name.to_owned());
+        }
+    }
+
+    fn collect_window_spec(&mut self, wspec: &WindowSpec) {
+        for e in &wspec.partition_by {
+            self.collect_expr(e);
+        }
+        for ob in &wspec.order_by {
+            self.collect_expr(&ob.expr);
+        }
+        if let Some(ref wf) = wspec.frame {
+            if let WindowFrameBound::Preceding(ref e) | WindowFrameBound::Following(ref e) =
+                wf.start
+            {
+                self.collect_expr(e);
+            }
+            if let WindowFrameBound::Preceding(ref e) | WindowFrameBound::Following(ref e) = wf.end
+            {
+                self.collect_expr(e);
+            }
+        }
+    }
+
+    fn collect_select_stmt(&mut self, stmt: &SelectStmt) {
+        for cte in &stmt.ctes {
+            self.collect_select_stmt(&cte.query);
+        }
+        self.collect_select_core(&stmt.body.head);
+        for (_, core) in &stmt.body.compounds {
+            self.collect_select_core(core);
+        }
+        for ob in &stmt.order_by {
+            self.collect_expr(&ob.expr);
+        }
+        if let Some(ref lc) = stmt.limit {
+            self.collect_expr(&lc.limit);
+            if let Some(ref off) = lc.offset {
+                self.collect_expr(off);
+            }
+        }
+    }
+
+    fn collect_select_core(&mut self, core: &SelectCore) {
+        match core {
+            SelectCore::Values(rows) => {
+                for r in rows {
+                    for e in r {
+                        self.collect_expr(e);
+                    }
+                }
+            }
+            SelectCore::Select {
+                projection,
+                from,
+                selection,
+                group_by,
+                having,
+                windows,
+                ..
+            } => {
+                for rc in projection {
+                    if let ResultColumn::Expr { expr, .. } = rc {
+                        self.collect_expr(expr);
+                    }
+                }
+                if let Some(fc) = from {
+                    self.collect_tos(&fc.head);
+                    for j in &fc.joins {
+                        self.collect_tos(&j.right);
+                        if let Some(JoinConstraint::On(ref on_e)) = j.constraint {
+                            self.collect_expr(on_e);
+                        }
+                    }
+                }
+                if let Some(e) = selection {
+                    self.collect_expr(e);
+                }
+                for e in group_by {
+                    self.collect_expr(e);
+                }
+                if let Some(e) = having {
+                    self.collect_expr(e);
+                }
+                for (_, wspec) in windows {
+                    self.collect_window_spec(wspec);
+                }
+            }
+        }
+    }
+
+    fn collect_tos(&mut self, tos: &TableOrSubquery) {
+        match tos {
+            TableOrSubquery::Table {
+                table_args: Some(args),
+                ..
+            }
+            | TableOrSubquery::TableFunction { args, .. } => {
+                for a in args {
+                    self.collect_expr(a);
+                }
+            }
+            TableOrSubquery::Table {
+                table_args: None, ..
+            } => {}
+            TableOrSubquery::Subquery { query, .. } => {
+                self.collect_select_stmt(query);
+            }
+        }
+    }
+
+    fn collect_expr(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Null
+            | Expr::Bool(_)
+            | Expr::Integer(_)
+            | Expr::OversizedHex(_)
+            | Expr::Float(_)
+            | Expr::String(_)
+            | Expr::Blob(_)
+            | Expr::CurrentTimeKw(_)
+            | Expr::Bind(_) => {}
+            Expr::Column(cref) => {
+                self.record_col_name(&cref.column);
+            }
+            Expr::Unary { expr: inner, .. }
+            | Expr::Collate { expr: inner, .. }
+            | Expr::IsNull { expr: inner, .. }
+            | Expr::Cast { expr: inner, .. }
+            | Expr::InTable { expr: inner, .. } => {
+                self.collect_expr(inner);
+            }
+            Expr::Binary { left, right, .. } => {
+                self.collect_expr(left);
+                self.collect_expr(right);
+            }
+            Expr::Between {
+                expr: e, low, high, ..
+            } => {
+                self.collect_expr(e);
+                self.collect_expr(low);
+                self.collect_expr(high);
+            }
+            Expr::InList { expr: e, list, .. } => {
+                self.collect_expr(e);
+                for it in list {
+                    self.collect_expr(it);
+                }
+            }
+            Expr::InSubquery {
+                expr: e, subquery, ..
+            } => {
+                self.collect_expr(e);
+                self.collect_select_stmt(subquery);
+            }
+            Expr::Like {
+                expr: e,
+                pattern,
+                escape,
+                ..
+            } => {
+                self.collect_expr(e);
+                self.collect_expr(pattern);
+                if let Some(esc) = escape {
+                    self.collect_expr(esc);
+                }
+            }
+            Expr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                if let Some(op) = operand {
+                    self.collect_expr(op);
+                }
+                for (w, t) in branches {
+                    self.collect_expr(w);
+                    self.collect_expr(t);
+                }
+                if let Some(el) = else_expr {
+                    self.collect_expr(el);
+                }
+            }
+            Expr::FunctionCall {
+                name,
+                args,
+                filter,
+                over,
+                ..
+            } => {
+                if name.eq_ignore_ascii_case("highlight") || name.eq_ignore_ascii_case("snippet") {
+                    self.has_fts5_text_aux = true;
+                }
+                if let FunctionArgs::Exprs(es) = args {
+                    for a in es {
+                        self.collect_expr(a);
+                    }
+                }
+                if let Some(fe) = filter {
+                    self.collect_expr(fe);
+                }
+                if let Some(WindowRef::Spec(wspec)) = over {
+                    self.collect_window_spec(wspec);
+                }
+            }
+            Expr::Subquery(sub) | Expr::Exists { subquery: sub, .. } => {
+                self.collect_select_stmt(sub);
+            }
+            Expr::Raise { message, .. } => {
+                if let Some(m) = message {
+                    self.collect_expr(m);
+                }
+            }
+            Expr::RowValue(elems) => {
+                for el in elems {
+                    self.collect_expr(el);
+                }
+            }
+        }
+    }
+}
+
+fn compute_vtab_col_used(
+    declared: &crate::vtab::VTabDeclaredSchema,
+    tvf_args: Option<&[Expr]>,
+    hidden_col_indices: &[usize],
+    vtab_query_info: Option<&SingleVtabQueryInfo>,
+) -> u64 {
+    let Some(qinfo) = vtab_query_info else {
+        let mut mask = 0u64;
+        for idx in 0..declared.table_schema.columns.len() {
+            mask |= 1u64 << idx.min(63);
+        }
+        return mask;
+    };
+    let mut mask = 0u64;
+    if qinfo.has_star {
+        for idx in 0..declared.table_schema.columns.len() {
+            if !declared.is_hidden(idx) {
+                mask |= 1u64 << idx.min(63);
+            }
+        }
+    }
+    if tvf_args.is_some() {
+        for &idx in hidden_col_indices {
+            mask |= 1u64 << idx.min(63);
+        }
+    }
+    for (idx, col) in declared.table_schema.columns.iter().enumerate() {
+        if qinfo
+            .col_names
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(&col.name))
+        {
+            mask |= 1u64 << idx.min(63);
+        }
+    }
+    mask
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6281,6 +7125,7 @@ fn eval_vtab_scan(
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
     omitted_conjuncts: &mut Vec<Expr>,
+    vtab_query_info: Option<&SingleVtabQueryInfo>,
 ) -> Result<Vec<EvalRow>> {
     if let Some(IndexHint::IndexedBy(idx)) = indexed_by {
         return Err(SqliteError::new(
@@ -6472,15 +7317,13 @@ fn eval_vtab_scan(
                 .map(|&b| build_branch_constraints(b))
                 .collect();
             if branch_cs.iter().all(|cs| cs.iter().any(|c| c.usable)) {
-                let mut col_used = 0u64;
-                for idx in 0..declared.table_schema.columns.len() {
-                    col_used |= 1u64 << idx.min(63);
-                }
+                let col_used =
+                    compute_vtab_col_used(declared, tvf_args, &hidden_col_indices, vtab_query_info);
                 let all_indexed = {
-                    let (vt, _, _) = ctx
+                    let vt = ctx
                         .db_set
                         .vtab_registry_mut()
-                        .checkout_vtab(db_name, vt_name)?;
+                        .checkout_vtab_instance(db_name, vt_name)?;
                     let mut ok = true;
                     for cs in &branch_cs {
                         let mut b_info = sqliters_types::VTabIndexInfo::new(cs.clone(), Vec::new());
@@ -6524,6 +7367,7 @@ fn eval_vtab_scan(
                             outer_scopes,
                             ctes,
                             &mut branch_omitted,
+                            vtab_query_info,
                         )?;
                         let residual = strip_omitted_conjuncts(br, &branch_omitted);
                         for r in b_rows {
@@ -6571,6 +7415,81 @@ fn eval_vtab_scan(
         }
     }
 
+    let (mut cursor, col_used) = open_filtered_vtab_cursor_inner(
+        ctx,
+        db_name,
+        vt_name,
+        declared,
+        eff_alias,
+        &cols,
+        &hidden_col_indices,
+        tvf_args,
+        indexed_by,
+        where_hint,
+        unusable_where_hint,
+        order_by_hint,
+        params,
+        outer_scopes,
+        ctes,
+        omitted_conjuncts,
+        vtab_query_info,
+    )?;
+
+    materialize_open_vtab_cursor(ctx, &mut *cursor, declared, cols, col_used)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_filtered_vtab_cursor_inner(
+    ctx: &mut ExecContext<'_>,
+    db_name: &str,
+    vt_name: &str,
+    declared: &crate::vtab::VTabDeclaredSchema,
+    eff_alias: &str,
+    cols: &[ScopedColumn],
+    hidden_col_indices: &[usize],
+    tvf_args: Option<&[Expr]>,
+    indexed_by: Option<&IndexHint>,
+    where_hint: Option<&Expr>,
+    unusable_where_hint: Option<&Expr>,
+    order_by_hint: &[OrderByTerm],
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    ctes: &CteStore,
+    omitted_conjuncts: &mut Vec<Expr>,
+    vtab_query_info: Option<&SingleVtabQueryInfo>,
+) -> Result<(Box<dyn sqliters_types::VirtualCursor>, u64)> {
+    let resolve_vtab_col = |e: &Expr| -> Option<i32> {
+        let Expr::Column(cref) = e else {
+            return None;
+        };
+        if let Some(ref s) = cref.schema
+            && !s.eq_ignore_ascii_case(db_name)
+        {
+            return None;
+        }
+        if let Some(ref t) = cref.table
+            && !t.eq_ignore_ascii_case(eff_alias)
+        {
+            return None;
+        }
+        if let Some(pos) = declared
+            .table_schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&cref.column))
+        {
+            return Some(pos as i32);
+        }
+        if !declared.table_schema.without_rowid
+            && (cref.column.eq_ignore_ascii_case("rowid")
+                || cref.column.eq_ignore_ascii_case("_rowid_")
+                || cref.column.eq_ignore_ascii_case("oid"))
+        {
+            return Some(-1);
+        }
+        None
+    };
+
     let mut constraints: Vec<sqliters_types::VTabConstraint> = Vec::new();
     let mut rhs_exprs: Vec<Option<Expr>> = Vec::new();
     let mut source_conjuncts: Vec<Option<Expr>> = Vec::new();
@@ -6596,7 +7515,9 @@ fn eval_vtab_scan(
                 match conj {
                     Expr::Binary { left, op, right } => {
                         let map_bin_op =
-                            |bop: BinaryOp, flipped: bool| -> Option<sqliters_types::VTabConstraintOp> {
+                            |bop: BinaryOp,
+                             flipped: bool|
+                             -> Option<sqliters_types::VTabConstraintOp> {
                                 use sqliters_types::VTabConstraintOp as VOp;
                                 match bop {
                                     BinaryOp::Eq => Some(VOp::Eq),
@@ -6613,7 +7534,7 @@ fn eval_vtab_scan(
                         if let Some(col_i) = resolve_vtab_col(left)
                             && let Some(vop) = map_bin_op(*op, false)
                         {
-                            let usable = expr_can_eval_with_cols(right, &[], &cols, outer_scopes);
+                            let usable = expr_can_eval_with_cols(right, &[], cols, outer_scopes);
                             constraints.push(sqliters_types::VTabConstraint {
                                 i_column: col_i,
                                 op: vop,
@@ -6625,7 +7546,7 @@ fn eval_vtab_scan(
                         } else if let Some(col_i) = resolve_vtab_col(right)
                             && let Some(vop) = map_bin_op(*op, true)
                         {
-                            let usable = expr_can_eval_with_cols(left, &[], &cols, outer_scopes);
+                            let usable = expr_can_eval_with_cols(left, &[], cols, outer_scopes);
                             constraints.push(sqliters_types::VTabConstraint {
                                 i_column: col_i,
                                 op: vop,
@@ -6650,7 +7571,7 @@ fn eval_vtab_scan(
                                 LikeOp::Regexp => sqliters_types::VTabConstraintOp::Regexp,
                                 LikeOp::Match => sqliters_types::VTabConstraintOp::Match,
                             };
-                            let usable = expr_can_eval_with_cols(pattern, &[], &cols, outer_scopes);
+                            let usable = expr_can_eval_with_cols(pattern, &[], cols, outer_scopes);
                             constraints.push(sqliters_types::VTabConstraint {
                                 i_column: col_i,
                                 op: vop,
@@ -6684,7 +7605,7 @@ fn eval_vtab_scan(
                         high,
                     } => {
                         if let Some(col_i) = resolve_vtab_col(be) {
-                            let usable_low = expr_can_eval_with_cols(low, &[], &cols, outer_scopes);
+                            let usable_low = expr_can_eval_with_cols(low, &[], cols, outer_scopes);
                             constraints.push(sqliters_types::VTabConstraint {
                                 i_column: col_i,
                                 op: sqliters_types::VTabConstraintOp::Ge,
@@ -6695,7 +7616,7 @@ fn eval_vtab_scan(
                             source_conjuncts.push(None);
 
                             let usable_high =
-                                expr_can_eval_with_cols(high, &[], &cols, outer_scopes);
+                                expr_can_eval_with_cols(high, &[], cols, outer_scopes);
                             constraints.push(sqliters_types::VTabConstraint {
                                 i_column: col_i,
                                 op: sqliters_types::VTabConstraintOp::Le,
@@ -6718,22 +7639,22 @@ fn eval_vtab_scan(
                 match conj {
                     Expr::Binary { left, op, right } => {
                         let map_bin_op =
-                                |bop: BinaryOp,
-                                 flipped: bool|
-                                 -> Option<sqliters_types::VTabConstraintOp> {
-                                    use sqliters_types::VTabConstraintOp as VOp;
-                                    match bop {
-                                        BinaryOp::Eq => Some(VOp::Eq),
-                                        BinaryOp::Ne => Some(VOp::Ne),
-                                        BinaryOp::Is => Some(VOp::Is),
-                                        BinaryOp::IsNot => Some(VOp::IsNot),
-                                        BinaryOp::Lt => Some(if flipped { VOp::Gt } else { VOp::Lt }),
-                                        BinaryOp::Le => Some(if flipped { VOp::Ge } else { VOp::Le }),
-                                        BinaryOp::Gt => Some(if flipped { VOp::Lt } else { VOp::Gt }),
-                                        BinaryOp::Ge => Some(if flipped { VOp::Le } else { VOp::Ge }),
-                                        _ => None,
-                                    }
-                                };
+                            |bop: BinaryOp,
+                             flipped: bool|
+                             -> Option<sqliters_types::VTabConstraintOp> {
+                                use sqliters_types::VTabConstraintOp as VOp;
+                                match bop {
+                                    BinaryOp::Eq => Some(VOp::Eq),
+                                    BinaryOp::Ne => Some(VOp::Ne),
+                                    BinaryOp::Is => Some(VOp::Is),
+                                    BinaryOp::IsNot => Some(VOp::IsNot),
+                                    BinaryOp::Lt => Some(if flipped { VOp::Gt } else { VOp::Lt }),
+                                    BinaryOp::Le => Some(if flipped { VOp::Ge } else { VOp::Le }),
+                                    BinaryOp::Gt => Some(if flipped { VOp::Lt } else { VOp::Gt }),
+                                    BinaryOp::Ge => Some(if flipped { VOp::Le } else { VOp::Ge }),
+                                    _ => None,
+                                }
+                            };
                         if let Some(col_i) = resolve_vtab_col(left)
                             && let Some(vop) = map_bin_op(*op, false)
                         {
@@ -6805,18 +7726,15 @@ fn eval_vtab_scan(
         }
     }
 
-    let mut col_used = 0u64;
-    for idx in 0..declared.table_schema.columns.len() {
-        col_used |= 1u64 << idx.min(63);
-    }
+    let col_used = compute_vtab_col_used(declared, tvf_args, hidden_col_indices, vtab_query_info);
 
     let mut info = sqliters_types::VTabIndexInfo::new(constraints, vtab_order_by);
     info.col_used = col_used;
 
-    let (vt, _, _) = ctx
+    let vt = ctx
         .db_set
         .vtab_registry_mut()
-        .checkout_vtab(db_name, vt_name)?;
+        .checkout_vtab_instance(db_name, vt_name)?;
     let best_res =
         crate::vtab::catch_callback_panic("vtab xBestIndex", || vt.best_index(&mut info));
     let open_res = if best_res.is_ok() {
@@ -6850,20 +7768,29 @@ fn eval_vtab_scan(
             format!("{vt_name}.xBestIndex malfunction"),
         ));
     }
-    let mut seen_argv = vec![false; max_argv];
-    let mut argv = vec![Value::Null; max_argv];
+    let mut seen_argv = [false; 16];
+    let mut seen_argv_vec: Option<Vec<bool>> = (max_argv > 16).then(|| vec![false; max_argv]);
+    let mut argv = Vec::with_capacity(max_argv);
+    argv.resize(max_argv, Value::Null);
     for (ci, usage) in info.constraint_usage.iter().enumerate() {
         if usage.argv_index >= 1 {
             let slot_idx = usage.argv_index - 1;
-            if ci >= info.constraints.len() || !info.constraints[ci].usable || seen_argv[slot_idx] {
+            let seen_slot = match seen_argv_vec.as_mut() {
+                Some(v) => &mut v[slot_idx],
+                None => &mut seen_argv[slot_idx],
+            };
+            if ci >= info.constraints.len() || !info.constraints[ci].usable || *seen_slot {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!("{vt_name}.xBestIndex malfunction"),
                 ));
             }
-            seen_argv[slot_idx] = true;
+            *seen_slot = true;
             let val = match rhs_exprs.get(ci).and_then(|o| o.as_ref()) {
-                Some(re) => eval_expr(ctx, re, params, outer_scopes, ctes, None)?,
+                Some(re) => match re {
+                    Expr::Bind(bp) => eval_bind_param(bp, params),
+                    _ => eval_expr(ctx, re, params, outer_scopes, ctes, None)?,
+                },
                 None => Value::Null,
             };
             argv[slot_idx] = val;
@@ -6875,7 +7802,11 @@ fn eval_vtab_scan(
             omitted_conjuncts.push(conj_expr.clone());
         }
     }
-    if seen_argv.iter().any(|&present| !present) {
+    let missing_argv = match seen_argv_vec.as_ref() {
+        Some(v) => v.iter().any(|&p| !p),
+        None => seen_argv[..max_argv].iter().any(|&p| !p),
+    };
+    if missing_argv {
         return Err(SqliteError::new(
             ErrorCode::Error,
             format!("{vt_name}.xBestIndex malfunction"),
@@ -6883,46 +7814,1181 @@ fn eval_vtab_scan(
     }
 
     {
+        struct Fts5TextAuxGuard(Option<Arc<sqliters_ext::Fts5AuxRegistry>>);
+        impl Drop for Fts5TextAuxGuard {
+            fn drop(&mut self) {
+                if let Some(ref aux) = self.0 {
+                    aux.exit_text_aux_scope();
+                }
+            }
+        }
+        let need_fts5_text_aux = vtab_query_info.is_none_or(|q| q.has_fts5_text_aux);
+        let _aux_guard = if need_fts5_text_aux {
+            let aux = ctx.db_set.vtab_registry().fts5_aux_registry();
+            aux.enter_text_aux_scope();
+            Fts5TextAuxGuard(Some(aux))
+        } else {
+            Fts5TextAuxGuard(None)
+        };
         let mut host_ctx = crate::vtab::CoreVTabHostContext::new(ctx, db_name, vt_name);
         crate::vtab::catch_callback_panic("vtab xFilter", || {
             cursor.filter(&mut host_ctx, info.idx_num, info.idx_str.as_deref(), &argv)
         })?;
     }
 
-    let shared_cols: Rc<[ScopedColumn]> = cols.into();
-    let num_cols = declared.table_schema.columns.len();
-    let mut out = Vec::new();
-    while !crate::vtab::catch_callback_panic("vtab xEof", || Ok(cursor.eof()))? {
-        ctx.step_tick()?;
-        let mut vals = Vec::with_capacity(shared_cols.len());
-        let mut subtypes: Option<Vec<u8>> = None;
-        for col_idx in 0..num_cols {
-            let v = crate::vtab::catch_callback_panic("vtab xColumn", || cursor.column(col_idx))?;
-            let st = cursor.column_subtype(col_idx);
-            if st != 0 {
-                let sv = subtypes.get_or_insert_with(|| vec![0u8; shared_cols.len()]);
-                sv[col_idx] = st;
+    Ok((cursor, col_used))
+}
+
+fn materialize_open_vtab_cursor(
+    ctx: &mut ExecContext<'_>,
+    cursor: &mut dyn sqliters_types::VirtualCursor,
+    declared: &crate::vtab::VTabDeclaredSchema,
+    cols: Vec<ScopedColumn>,
+    col_used: u64,
+) -> Result<Vec<EvalRow>> {
+    let mut col_used_fetch = col_used;
+    if let Some(pk_idx) = declared.table_schema.rowid_alias_col {
+        col_used_fetch |= 1u64 << pk_idx.min(63);
+    }
+    if declared.table_schema.without_rowid {
+        for ic in &declared.table_schema.without_rowid_pk_cols {
+            if let Some(pk_idx) = ic.col_idx {
+                col_used_fetch |= 1u64 << pk_idx.min(63);
             }
-            vals.push(v);
         }
-        if !declared.table_schema.without_rowid {
-            let rowid = crate::vtab::catch_callback_panic("vtab xRowid", || cursor.rowid())?;
-            if let Some(pk_idx) = declared.table_schema.rowid_alias_col
-                && vals.get(pk_idx).is_some_and(Value::is_null)
-            {
-                vals[pk_idx] = Value::Integer(rowid);
-            }
-            vals.push(Value::Integer(rowid));
-        }
-        let erow = match subtypes {
-            Some(sv) => EvalRow::with_subtypes(Rc::clone(&shared_cols), vals, sv.into()),
-            None => EvalRow::new(Rc::clone(&shared_cols), vals),
-        };
-        out.push(erow);
-        crate::vtab::catch_callback_panic("vtab xNext", || cursor.next())?;
     }
 
-    Ok(out)
+    let shared_cols: Rc<[ScopedColumn]> = cols.into();
+    let num_cols = declared.table_schema.columns.len();
+    crate::vtab::catch_callback_panic("vtab scan", || {
+        let mut out = Vec::new();
+        while !cursor.eof() {
+            ctx.step_tick()?;
+            let mut vals = Vec::with_capacity(shared_cols.len());
+            let mut subtypes: Option<Vec<u8>> = None;
+            for col_idx in 0..num_cols {
+                if (col_used_fetch & (1u64 << col_idx.min(63))) != 0 {
+                    let v = cursor.column(col_idx)?;
+                    let st = cursor.column_subtype(col_idx);
+                    if st != 0 {
+                        let sv = subtypes.get_or_insert_with(|| vec![0u8; shared_cols.len()]);
+                        sv[col_idx] = st;
+                    }
+                    vals.push(v);
+                } else {
+                    vals.push(Value::Null);
+                }
+            }
+            if !declared.table_schema.without_rowid {
+                let rowid = cursor.rowid()?;
+                if let Some(pk_idx) = declared.table_schema.rowid_alias_col
+                    && vals.get(pk_idx).is_some_and(Value::is_null)
+                {
+                    vals[pk_idx] = Value::Integer(rowid);
+                }
+                vals.push(Value::Integer(rowid));
+            }
+            let erow = match subtypes {
+                Some(sv) => EvalRow::with_subtypes(Rc::clone(&shared_cols), vals, sv.into()),
+                None => EvalRow::new(Rc::clone(&shared_cols), vals),
+            };
+            out.push(erow);
+            cursor.next()?;
+        }
+        Ok(out)
+    })
+}
+
+enum FastSingleVtabOutcome {
+    NotApplicable,
+    Completed(QueryOutput),
+    FallbackRows(Vec<EvalRow>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FastVtabColRef {
+    Rowid,
+    Col(usize),
+}
+
+#[derive(Clone)]
+enum FastVtabAggExpr {
+    Const(Value),
+    Agg(usize),
+    Coalesce(Vec<FastVtabAggExpr>),
+}
+
+impl FastVtabAggExpr {
+    fn eval(&self, agg_vals: &[Value]) -> Value {
+        match self {
+            Self::Const(v) => v.clone(),
+            Self::Agg(idx) => agg_vals[*idx].clone(),
+            Self::Coalesce(items) => {
+                for item in items {
+                    let v = item.eval(agg_vals);
+                    if !v.is_null() {
+                        return v;
+                    }
+                }
+                Value::Null
+            }
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+enum FastVtabRowExpr {
+    Const(Value),
+    Rowid,
+    Col(usize),
+    Bm25(usize),
+}
+
+impl FastVtabRowExpr {
+    #[inline]
+    fn eval(
+        &self,
+        cursor: &dyn sqliters_types::VirtualCursor,
+        rowid_alias_col: Option<usize>,
+        cached_rowid: &mut Option<i64>,
+        bm25_vals: &[Value],
+    ) -> Result<Value> {
+        match self {
+            Self::Const(v) => Ok(v.clone()),
+            Self::Rowid => {
+                let rid = match *cached_rowid {
+                    Some(r) => r,
+                    None => {
+                        let r = cursor.rowid()?;
+                        *cached_rowid = Some(r);
+                        r
+                    }
+                };
+                Ok(Value::Integer(rid))
+            }
+            Self::Col(idx) => {
+                let v = cursor.column(*idx)?;
+                if Some(*idx) == rowid_alias_col && v.is_null() {
+                    let rid = match *cached_rowid {
+                        Some(r) => r,
+                        None => {
+                            let r = cursor.rowid()?;
+                            *cached_rowid = Some(r);
+                            r
+                        }
+                    };
+                    Ok(Value::Integer(rid))
+                } else {
+                    Ok(v)
+                }
+            }
+            Self::Bm25(bidx) => Ok(bm25_vals[*bidx].clone()),
+        }
+    }
+}
+
+enum FastVtabWherePred {
+    ColCmpConst {
+        col: FastVtabColRef,
+        vdbe_op: Opcode,
+        rhs: Value,
+        comp_aff: TypeAffinity,
+        coll: Collation,
+        col_on_left: bool,
+    },
+    IsNull {
+        col: FastVtabColRef,
+        negated: bool,
+    },
+}
+
+impl FastVtabWherePred {
+    #[inline]
+    fn read_col(
+        col: FastVtabColRef,
+        cursor: &dyn sqliters_types::VirtualCursor,
+        rowid_alias_col: Option<usize>,
+        cached_rowid: &mut Option<i64>,
+    ) -> Result<Value> {
+        match col {
+            FastVtabColRef::Rowid => {
+                let rid = match *cached_rowid {
+                    Some(r) => r,
+                    None => {
+                        let r = cursor.rowid()?;
+                        *cached_rowid = Some(r);
+                        r
+                    }
+                };
+                Ok(Value::Integer(rid))
+            }
+            FastVtabColRef::Col(cidx) => {
+                let v = cursor.column(cidx)?;
+                if Some(cidx) == rowid_alias_col && v.is_null() {
+                    let rid = match *cached_rowid {
+                        Some(r) => r,
+                        None => {
+                            let r = cursor.rowid()?;
+                            *cached_rowid = Some(r);
+                            r
+                        }
+                    };
+                    Ok(Value::Integer(rid))
+                } else {
+                    Ok(v)
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn matches(
+        &self,
+        cursor: &dyn sqliters_types::VirtualCursor,
+        rowid_alias_col: Option<usize>,
+        cached_rowid: &mut Option<i64>,
+        enc: TextEncoding,
+    ) -> Result<bool> {
+        match self {
+            Self::ColCmpConst {
+                col,
+                vdbe_op,
+                rhs,
+                comp_aff,
+                coll,
+                col_on_left,
+            } => {
+                let cv = Self::read_col(*col, cursor, rowid_alias_col, cached_rowid)?;
+                let res = if *col_on_left {
+                    eval_comparison_with_affinity(*vdbe_op, &cv, rhs, *comp_aff, *coll, enc)
+                } else {
+                    eval_comparison_with_affinity(*vdbe_op, rhs, &cv, *comp_aff, *coll, enc)
+                };
+                Ok(res.truthiness() == Some(true))
+            }
+            Self::IsNull { col, negated } => {
+                let cv = Self::read_col(*col, cursor, rowid_alias_col, cached_rowid)?;
+                let is_n = cv.is_null();
+                Ok(if *negated { !is_n } else { is_n })
+            }
+        }
+    }
+}
+
+fn try_compile_fast_vtab_where_preds<F>(
+    residual_where: &Expr,
+    params: &[Value],
+    declared: &crate::vtab::VTabDeclaredSchema,
+    resolve_col: &F,
+) -> Option<Vec<FastVtabWherePred>>
+where
+    F: Fn(&ColumnRef) -> Option<FastVtabColRef>,
+{
+    let col_meta = |fcol: FastVtabColRef| -> (Option<TypeAffinity>, Collation) {
+        match fcol {
+            FastVtabColRef::Rowid => (Some(TypeAffinity::Integer), Collation::Binary),
+            FastVtabColRef::Col(cidx) => {
+                let c = &declared.table_schema.columns[cidx];
+                let aff = if c.type_name.is_empty() {
+                    None
+                } else {
+                    Some(c.affinity)
+                };
+                (aff, c.collation)
+            }
+        }
+    };
+    let mut conjs = Vec::new();
+    split_where_conjuncts(residual_where, &mut conjs);
+    let mut preds = Vec::with_capacity(conjs.len());
+    for conj in conjs {
+        match conj {
+            Expr::Binary { left, op, right } => {
+                let vdbe_op = match op {
+                    BinaryOp::Lt => Opcode::Lt,
+                    BinaryOp::Le => Opcode::Le,
+                    BinaryOp::Gt => Opcode::Gt,
+                    BinaryOp::Ge => Opcode::Ge,
+                    BinaryOp::Eq => Opcode::Eq,
+                    BinaryOp::Ne => Opcode::Ne,
+                    BinaryOp::Is => Opcode::Is,
+                    BinaryOp::IsNot => Opcode::IsNot,
+                    _ => return None,
+                };
+                if let Expr::Column(cref) = left.as_ref()
+                    && let Some(fcol) = resolve_col(cref)
+                    && let Some(rhs_val) = eval_fast_vtab_const(right, params)
+                {
+                    let (c_aff, c_coll) = col_meta(fcol);
+                    preds.push(FastVtabWherePred::ColCmpConst {
+                        col: fcol,
+                        vdbe_op,
+                        rhs: rhs_val,
+                        comp_aff: sqlite_compare_affinity(c_aff, None),
+                        coll: c_coll,
+                        col_on_left: true,
+                    });
+                } else if let Expr::Column(cref) = right.as_ref()
+                    && let Some(fcol) = resolve_col(cref)
+                    && let Some(lhs_val) = eval_fast_vtab_const(left, params)
+                {
+                    let (c_aff, c_coll) = col_meta(fcol);
+                    preds.push(FastVtabWherePred::ColCmpConst {
+                        col: fcol,
+                        vdbe_op,
+                        rhs: lhs_val,
+                        comp_aff: sqlite_compare_affinity(None, c_aff),
+                        coll: c_coll,
+                        col_on_left: false,
+                    });
+                } else {
+                    return None;
+                }
+            }
+            Expr::IsNull { expr: ie, negated } => {
+                let Expr::Column(cref) = ie.as_ref() else {
+                    return None;
+                };
+                let fcol = resolve_col(cref)?;
+                preds.push(FastVtabWherePred::IsNull {
+                    col: fcol,
+                    negated: *negated,
+                });
+            }
+            Expr::Between {
+                expr: be,
+                negated: false,
+                low,
+                high,
+            } => {
+                let Expr::Column(cref) = be.as_ref() else {
+                    return None;
+                };
+                let fcol = resolve_col(cref)?;
+                let lo_val = eval_fast_vtab_const(low, params)?;
+                let hi_val = eval_fast_vtab_const(high, params)?;
+                let (c_aff, c_coll) = col_meta(fcol);
+                let comp_aff = sqlite_compare_affinity(c_aff, None);
+                preds.push(FastVtabWherePred::ColCmpConst {
+                    col: fcol,
+                    vdbe_op: Opcode::Ge,
+                    rhs: lo_val,
+                    comp_aff,
+                    coll: c_coll,
+                    col_on_left: true,
+                });
+                preds.push(FastVtabWherePred::ColCmpConst {
+                    col: fcol,
+                    vdbe_op: Opcode::Le,
+                    rhs: hi_val,
+                    comp_aff,
+                    coll: c_coll,
+                    col_on_left: true,
+                });
+            }
+            _ => return None,
+        }
+    }
+    Some(preds)
+}
+
+fn eval_fast_vtab_const(expr: &Expr, params: &[Value]) -> Option<Value> {
+    match expr {
+        Expr::Null => Some(Value::Null),
+        Expr::Integer(i) => Some(Value::Integer(*i)),
+        Expr::Float(f) => Some(Value::real(*f)),
+        Expr::String(s) => Some(Value::Text(s.clone())),
+        Expr::Blob(b) => Some(Value::Blob(b.clone())),
+        Expr::Bind(bp) => Some(eval_bind_param(bp, params)),
+        Expr::Unary {
+            op: UnaryOp::Negate,
+            expr: inner,
+        } => match eval_fast_vtab_const(inner, params)? {
+            Value::Integer(i) => Some(match i.checked_neg() {
+                Some(neg) => Value::Integer(neg),
+                None => Value::Real(-(i as f64)),
+            }),
+            Value::Real(r) => Some(Value::real(-r)),
+            _ => None,
+        },
+        Expr::Unary {
+            op: UnaryOp::Plus,
+            expr: inner,
+        } => eval_fast_vtab_const(inner, params),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_exec_fast_single_vtab_select(
+    ctx: &mut ExecContext<'_>,
+    core: &SelectCore,
+    fc: &FromClause,
+    pre_where_selection: Option<&Expr>,
+    order_by: &[OrderByTerm],
+    limit: Option<&LimitClause>,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    ctes: &CteStore,
+    omitted_vtab_conjuncts: &mut Vec<Expr>,
+) -> Result<FastSingleVtabOutcome> {
+    let SelectCore::Select {
+        distinct,
+        projection,
+        selection,
+        group_by,
+        having,
+        windows,
+        ..
+    } = core
+    else {
+        return Ok(FastSingleVtabOutcome::NotApplicable);
+    };
+    if ctx.functions.has_user_functions()
+        || *distinct
+        || !windows.is_empty()
+        || !group_by.is_empty()
+        || having.is_some()
+        || !outer_scopes.is_empty()
+        || matches!(
+            pre_where_selection,
+            Some(Expr::Binary {
+                op: BinaryOp::Or,
+                ..
+            })
+        )
+    {
+        return Ok(FastSingleVtabOutcome::NotApplicable);
+    }
+    let TableOrSubquery::Table {
+        name,
+        table_args: None,
+        alias,
+        indexed_by,
+    } = &fc.head
+    else {
+        return Ok(FastSingleVtabOutcome::NotApplicable);
+    };
+    if matches!(indexed_by, Some(IndexHint::IndexedBy(_))) {
+        return Ok(FastSingleVtabOutcome::NotApplicable);
+    }
+    if name.schema.is_none() && ctes.locate(&name.name).is_some() {
+        return Ok(FastSingleVtabOutcome::NotApplicable);
+    }
+    if ctx.db_set.resolve_catalog_table(name)?.is_some()
+        || ctx.db_set.find_relation_ref_in_set(name)?.is_some()
+        || ctx.db_set.find_view_in_set(name).is_some()
+    {
+        return Ok(FastSingleVtabOutcome::NotApplicable);
+    }
+    if core_has_window(core, order_by) {
+        return Ok(FastSingleVtabOutcome::NotApplicable);
+    }
+    let Some((_db_id, db_name, vt_name, declared)) = resolve_vtab_for_query(ctx, name, true)?
+    else {
+        return Ok(FastSingleVtabOutcome::NotApplicable);
+    };
+    if declared.table_schema.without_rowid
+        || declared
+            .table_schema
+            .columns
+            .iter()
+            .any(|c| c.custom_collation.is_some())
+    {
+        return Ok(FastSingleVtabOutcome::NotApplicable);
+    }
+
+    let eff_alias = alias.as_deref().unwrap_or(&name.name);
+    let cols = vtab_scoped_cols(&db_name, eff_alias, &declared);
+    let (col_names, expanded_proj) = expand_projection(projection, &cols)?;
+    if col_names.len() > ctx.db_set.column_limit() {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            "too many columns in result set",
+        ));
+    }
+
+    let effective_where = selection.as_ref().map(|where_expr| {
+        if expanded_proj.iter().any(|(_, _, al)| al.is_some()) {
+            subst_select_aliases_in_expr_with_ctes(
+                where_expr,
+                &expanded_proj,
+                &cols,
+                ctx.db_set,
+                ctes,
+            )
+        } else {
+            where_expr.clone()
+        }
+    });
+    if effective_where.as_ref() != pre_where_selection {
+        return Ok(FastSingleVtabOutcome::NotApplicable);
+    }
+
+    let resolve_fast_col = |cref: &ColumnRef| -> Option<FastVtabColRef> {
+        if cref.schema.as_deref() == Some(STAR_SLOT_SCHEMA) {
+            let idx = cref.column.parse::<usize>().ok()?;
+            return (idx < declared.table_schema.columns.len()).then_some(FastVtabColRef::Col(idx));
+        }
+        if let Some(ref s) = cref.schema
+            && !s.eq_ignore_ascii_case(&db_name)
+        {
+            return None;
+        }
+        if let Some(ref t) = cref.table
+            && !t.eq_ignore_ascii_case(eff_alias)
+        {
+            return None;
+        }
+        if let Some(pos) = declared
+            .table_schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&cref.column))
+        {
+            return Some(FastVtabColRef::Col(pos));
+        }
+        if cref.column.eq_ignore_ascii_case("rowid")
+            || cref.column.eq_ignore_ascii_case("_rowid_")
+            || cref.column.eq_ignore_ascii_case("oid")
+        {
+            return Some(FastVtabColRef::Rowid);
+        }
+        None
+    };
+
+    let is_agg = core_is_aggregate_in_scope(
+        core,
+        order_by,
+        &cols,
+        outer_scopes,
+        ctx.db_set,
+        ctes,
+        ctx.functions,
+    );
+
+    let enc = ctx.encoding();
+    let rowid_alias_col = declared.table_schema.rowid_alias_col;
+    let hidden_col_indices: Vec<usize> = (0..declared.table_schema.columns.len())
+        .filter(|&i| declared.is_hidden(i))
+        .collect();
+
+    if is_agg {
+        if !order_by.is_empty() || limit.is_some() {
+            return Ok(FastSingleVtabOutcome::NotApplicable);
+        }
+        let mut accumulators: Vec<(AggregateAccumulator, Option<FastVtabColRef>)> = Vec::new();
+        fn compile_agg_expr<F>(
+            expr: &Expr,
+            params: &[Value],
+            declared: &crate::vtab::VTabDeclaredSchema,
+            enc: TextEncoding,
+            resolve_col: &F,
+            accumulators: &mut Vec<(AggregateAccumulator, Option<FastVtabColRef>)>,
+        ) -> Option<FastVtabAggExpr>
+        where
+            F: Fn(&ColumnRef) -> Option<FastVtabColRef>,
+        {
+            if let Some(v) = eval_fast_vtab_const(expr, params) {
+                return Some(FastVtabAggExpr::Const(v));
+            }
+            match expr {
+                Expr::FunctionCall {
+                    name,
+                    distinct: false,
+                    args,
+                    filter: None,
+                    over: None,
+                } => {
+                    if name.eq_ignore_ascii_case("COALESCE") || name.eq_ignore_ascii_case("IFNULL")
+                    {
+                        let FunctionArgs::Exprs(es) = args else {
+                            return None;
+                        };
+                        if (name.eq_ignore_ascii_case("IFNULL") && es.len() != 2) || es.len() < 2 {
+                            return None;
+                        }
+                        let mut compiled = Vec::with_capacity(es.len());
+                        for a in es {
+                            compiled.push(compile_agg_expr(
+                                a,
+                                params,
+                                declared,
+                                enc,
+                                resolve_col,
+                                accumulators,
+                            )?);
+                        }
+                        return Some(FastVtabAggExpr::Coalesce(compiled));
+                    }
+                    match args {
+                        FunctionArgs::Star if name.eq_ignore_ascii_case("COUNT") => {
+                            let idx = accumulators.len();
+                            accumulators.push((
+                                AggregateAccumulator::new(AggregateKind::CountStar, false)
+                                    .with_encoding(enc),
+                                None,
+                            ));
+                            Some(FastVtabAggExpr::Agg(idx))
+                        }
+                        FunctionArgs::Exprs(es)
+                            if es.is_empty() && name.eq_ignore_ascii_case("COUNT") =>
+                        {
+                            let idx = accumulators.len();
+                            accumulators.push((
+                                AggregateAccumulator::new(AggregateKind::CountStar, false)
+                                    .with_encoding(enc),
+                                None,
+                            ));
+                            Some(FastVtabAggExpr::Agg(idx))
+                        }
+                        FunctionArgs::Exprs(es) if es.len() == 1 => {
+                            let kind = if name.eq_ignore_ascii_case("COUNT") {
+                                AggregateKind::Count
+                            } else if name.eq_ignore_ascii_case("SUM") {
+                                AggregateKind::Sum
+                            } else if name.eq_ignore_ascii_case("TOTAL") {
+                                AggregateKind::Total
+                            } else if name.eq_ignore_ascii_case("AVG") {
+                                AggregateKind::Avg
+                            } else if name.eq_ignore_ascii_case("MIN") {
+                                AggregateKind::Min
+                            } else if name.eq_ignore_ascii_case("MAX") {
+                                AggregateKind::Max
+                            } else {
+                                return None;
+                            };
+                            let Expr::Column(cref) = &es[0] else {
+                                return None;
+                            };
+                            let fcol = resolve_col(cref)?;
+                            let coll = match fcol {
+                                FastVtabColRef::Rowid => Collation::Binary,
+                                FastVtabColRef::Col(cidx) => {
+                                    declared.table_schema.columns[cidx].collation
+                                }
+                            };
+                            let idx = accumulators.len();
+                            accumulators.push((
+                                AggregateAccumulator::new_with_collation(kind, false, coll)
+                                    .with_encoding(enc),
+                                Some(fcol),
+                            ));
+                            Some(FastVtabAggExpr::Agg(idx))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+
+        let mut proj_exprs = Vec::with_capacity(expanded_proj.len());
+        for (pe, _, _) in &expanded_proj {
+            let Some(compiled) = compile_agg_expr(
+                pe,
+                params,
+                &declared,
+                enc,
+                &resolve_fast_col,
+                &mut accumulators,
+            ) else {
+                return Ok(FastSingleVtabOutcome::NotApplicable);
+            };
+            proj_exprs.push(compiled);
+        }
+
+        let qinfo = SingleVtabQueryInfo::from_single_select(
+            projection,
+            selection.as_ref(),
+            pre_where_selection,
+            group_by,
+            having.as_ref(),
+            windows,
+            order_by,
+            limit,
+        );
+        let (mut cursor, col_used) = open_filtered_vtab_cursor_inner(
+            ctx,
+            &db_name,
+            &vt_name,
+            &declared,
+            eff_alias,
+            &cols,
+            &hidden_col_indices,
+            None,
+            indexed_by.as_ref(),
+            pre_where_selection,
+            None,
+            &[],
+            params,
+            outer_scopes,
+            ctes,
+            omitted_vtab_conjuncts,
+            Some(&qinfo),
+        )?;
+
+        let residual_preds = match pre_where_selection
+            .and_then(|we| strip_omitted_conjuncts(we, omitted_vtab_conjuncts))
+        {
+            None => Vec::new(),
+            Some(ref res_we) => {
+                let Some(preds) =
+                    try_compile_fast_vtab_where_preds(res_we, params, &declared, &resolve_fast_col)
+                else {
+                    let rows =
+                        materialize_open_vtab_cursor(ctx, &mut *cursor, &declared, cols, col_used)?;
+                    return Ok(FastSingleVtabOutcome::FallbackRows(rows));
+                };
+                preds
+            }
+        };
+
+        crate::vtab::catch_callback_panic("vtab scan", || {
+            while !cursor.eof() {
+                ctx.step_tick()?;
+                let mut cached_rowid: Option<i64> = None;
+                let mut row_ok = true;
+                for pred in &residual_preds {
+                    if !pred.matches(&*cursor, rowid_alias_col, &mut cached_rowid, enc)? {
+                        row_ok = false;
+                        break;
+                    }
+                }
+                if !row_ok {
+                    cursor.next()?;
+                    continue;
+                }
+                for (acc, arg_ref) in &mut accumulators {
+                    match *arg_ref {
+                        None => acc.step(&[])?,
+                        Some(FastVtabColRef::Rowid) => {
+                            let rid = match cached_rowid {
+                                Some(r) => r,
+                                None => {
+                                    let r = cursor.rowid()?;
+                                    cached_rowid = Some(r);
+                                    r
+                                }
+                            };
+                            acc.step(std::slice::from_ref(&Value::Integer(rid)))?;
+                        }
+                        Some(FastVtabColRef::Col(cidx)) => {
+                            let mut v = cursor.column(cidx)?;
+                            if Some(cidx) == rowid_alias_col && v.is_null() {
+                                let rid = match cached_rowid {
+                                    Some(r) => r,
+                                    None => {
+                                        let r = cursor.rowid()?;
+                                        cached_rowid = Some(r);
+                                        r
+                                    }
+                                };
+                                v = Value::Integer(rid);
+                            }
+                            acc.step(std::slice::from_ref(&v))?;
+                        }
+                    }
+                }
+                cursor.next()?;
+            }
+            Ok(())
+        })?;
+
+        let mut agg_vals = Vec::with_capacity(accumulators.len());
+        for (acc, _) in &accumulators {
+            agg_vals.push(acc.value()?);
+        }
+        let mut out_row = Vec::with_capacity(proj_exprs.len());
+        for pe in &proj_exprs {
+            out_row.push(pe.eval(&agg_vals));
+        }
+        return Ok(FastSingleVtabOutcome::Completed(QueryOutput {
+            column_names: col_names,
+            rows: vec![out_row],
+        }));
+    }
+
+    // Non-aggregate single-vtab fast path (`FastVtabRowPlan`)
+    let mut bm25_calls: Vec<(usize, Vec<f64>)> = Vec::new();
+    let compile_row_expr =
+        |expr: &Expr, bm25_calls: &mut Vec<(usize, Vec<f64>)>| -> Option<FastVtabRowExpr> {
+            let mut inner = expr;
+            while let Expr::Collate { expr: sub, .. } = inner {
+                inner = sub;
+            }
+            if let Some(v) = eval_fast_vtab_const(inner, params) {
+                return Some(FastVtabRowExpr::Const(v));
+            }
+            match inner {
+                Expr::Column(cref) => match resolve_fast_col(cref)? {
+                    FastVtabColRef::Rowid => Some(FastVtabRowExpr::Rowid),
+                    FastVtabColRef::Col(idx) => Some(FastVtabRowExpr::Col(idx)),
+                },
+                Expr::FunctionCall {
+                    name,
+                    distinct: false,
+                    args: FunctionArgs::Exprs(es),
+                    filter: None,
+                    over: None,
+                } if name.eq_ignore_ascii_case("bm25") && !es.is_empty() => {
+                    let Expr::Column(cref) = &es[0] else {
+                        return None;
+                    };
+                    let FastVtabColRef::Col(hidx) = resolve_fast_col(cref)? else {
+                        return None;
+                    };
+                    if !declared.is_hidden(hidx) {
+                        return None;
+                    }
+                    let mut weights = Vec::with_capacity(es.len().saturating_sub(1));
+                    for we in &es[1..] {
+                        let wv = eval_fast_vtab_const(we, params)?;
+                        weights.push(wv.to_real_lossy());
+                    }
+                    if let Some(pos) = bm25_calls
+                        .iter()
+                        .position(|(c, w)| *c == hidx && *w == weights)
+                    {
+                        Some(FastVtabRowExpr::Bm25(pos))
+                    } else {
+                        let pos = bm25_calls.len();
+                        bm25_calls.push((hidx, weights));
+                        Some(FastVtabRowExpr::Bm25(pos))
+                    }
+                }
+                _ => None,
+            }
+        };
+
+    let mut proj_exprs = Vec::with_capacity(expanded_proj.len());
+    for (pe, _, _) in &expanded_proj {
+        let Some(compiled) = compile_row_expr(pe, &mut bm25_calls) else {
+            return Ok(FastSingleVtabOutcome::NotApplicable);
+        };
+        proj_exprs.push(compiled);
+    }
+
+    let mut sort_exprs = Vec::with_capacity(order_by.len());
+    let mut sort_specs = Vec::with_capacity(order_by.len());
+    for ob in order_by {
+        if strip_collate_and_unary_plus(&ob.expr).is_some() {
+            let mut bare = &ob.expr;
+            while let Expr::Collate { expr: sub, .. } = bare {
+                bare = sub;
+            }
+            let Expr::Integer(ord) = bare else {
+                return Ok(FastSingleVtabOutcome::NotApplicable);
+            };
+            if *ord < 1 || (*ord as usize) > proj_exprs.len() {
+                return Ok(FastSingleVtabOutcome::NotApplicable);
+            }
+        }
+        if infer_order_by_custom_collation(&ob.expr, &expanded_proj, &cols).is_some() {
+            return Ok(FastSingleVtabOutcome::NotApplicable);
+        }
+        let coll = infer_order_by_collation(&ob.expr, &expanded_proj, &cols);
+        sort_specs.push(KeySortOrder {
+            desc: ob.desc,
+            nulls_last: ob.nulls_last.unwrap_or(ob.desc),
+            collation: coll,
+            custom_collation: None,
+        });
+
+        let mut inner = &ob.expr;
+        while let Expr::Collate { expr: sub, .. } = inner {
+            inner = sub;
+        }
+        let compiled_ob = if let Expr::Integer(ord) = inner
+            && *ord >= 1
+            && (*ord as usize) <= proj_exprs.len()
+        {
+            Some(proj_exprs[(*ord as usize) - 1].clone())
+        } else if let Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column,
+            ..
+        }) = inner
+            && let Some((idx, _)) = expanded_proj
+                .iter()
+                .enumerate()
+                .find(|(_, (_, label, al))| {
+                    al.as_ref().is_some_and(|a| a.eq_ignore_ascii_case(column))
+                        || label.eq_ignore_ascii_case(column)
+                })
+            && (expanded_proj[idx].2.is_some() || !col_in_scoped_cols(column, &cols))
+        {
+            Some(proj_exprs[idx].clone())
+        } else if let Some(idx) = expanded_proj.iter().position(|(pe, _, _)| pe == inner) {
+            Some(proj_exprs[idx].clone())
+        } else if expanded_proj.iter().any(|(_, _, al)| al.is_some())
+            && !matches!(inner, Expr::Column(_))
+        {
+            None
+        } else {
+            compile_row_expr(inner, &mut bm25_calls)
+        };
+        let Some(se) = compiled_ob else {
+            return Ok(FastSingleVtabOutcome::NotApplicable);
+        };
+        sort_exprs.push(se);
+    }
+
+    let (lim_val, off_val) = match limit {
+        None => (-1i64, 0usize),
+        Some(lc) => {
+            let Some(lv) = eval_fast_vtab_const(&lc.limit, params) else {
+                return Ok(FastSingleVtabOutcome::NotApplicable);
+            };
+            let ov = match &lc.offset {
+                None => 0usize,
+                Some(oe) => {
+                    let Some(ov_val) = eval_fast_vtab_const(oe, params) else {
+                        return Ok(FastSingleVtabOutcome::NotApplicable);
+                    };
+                    ov_val.to_integer_lossy().max(0) as usize
+                }
+            };
+            (lv.to_integer_lossy(), ov)
+        }
+    };
+
+    let qinfo = SingleVtabQueryInfo::from_single_select(
+        projection,
+        selection.as_ref(),
+        pre_where_selection,
+        group_by,
+        having.as_ref(),
+        windows,
+        order_by,
+        limit,
+    );
+    let (mut cursor, col_used) = open_filtered_vtab_cursor_inner(
+        ctx,
+        &db_name,
+        &vt_name,
+        &declared,
+        eff_alias,
+        &cols,
+        &hidden_col_indices,
+        None,
+        indexed_by.as_ref(),
+        pre_where_selection,
+        None,
+        order_by,
+        params,
+        outer_scopes,
+        ctes,
+        omitted_vtab_conjuncts,
+        Some(&qinfo),
+    )?;
+
+    let residual_preds = match pre_where_selection
+        .and_then(|we| strip_omitted_conjuncts(we, omitted_vtab_conjuncts))
+    {
+        None => Vec::new(),
+        Some(ref res_we) => {
+            let Some(preds) =
+                try_compile_fast_vtab_where_preds(res_we, params, &declared, &resolve_fast_col)
+            else {
+                let rows =
+                    materialize_open_vtab_cursor(ctx, &mut *cursor, &declared, cols, col_used)?;
+                return Ok(FastSingleVtabOutcome::FallbackRows(rows));
+            };
+            preds
+        }
+    };
+
+    if cursor.eof() && !bm25_calls.is_empty() {
+        return Ok(FastSingleVtabOutcome::FallbackRows(Vec::new()));
+    }
+
+    let fts5_aux = if bm25_calls.is_empty() {
+        None
+    } else {
+        Some(ctx.db_set.vtab_registry().fts5_aux_registry())
+    };
+
+    let rows: Vec<Vec<Value>> = crate::vtab::catch_callback_panic("vtab scan", || {
+        let mut bm25_vals: Vec<Value> = vec![Value::Null; bm25_calls.len()];
+
+        if sort_specs.is_empty() {
+            let mut out = Vec::new();
+            let mut skipped = 0usize;
+            while !cursor.eof() {
+                if lim_val == 0 && bm25_calls.is_empty() {
+                    break;
+                }
+                ctx.step_tick()?;
+                let mut cached_rowid: Option<i64> = None;
+                let mut row_ok = true;
+                for pred in &residual_preds {
+                    if !pred.matches(&*cursor, rowid_alias_col, &mut cached_rowid, enc)? {
+                        row_ok = false;
+                        break;
+                    }
+                }
+                if !row_ok {
+                    cursor.next()?;
+                    continue;
+                }
+                if let Some(ref aux) = fts5_aux {
+                    for (bi, (hidx, weights)) in bm25_calls.iter().enumerate() {
+                        let hval = cursor.column(*hidx)?;
+                        bm25_vals[bi] = aux.eval_bm25_fast(&hval, weights)?;
+                    }
+                }
+                if skipped < off_val {
+                    skipped += 1;
+                    cursor.next()?;
+                    continue;
+                }
+                if lim_val == 0 {
+                    break;
+                }
+                let mut proj_vals = Vec::with_capacity(proj_exprs.len());
+                for pe in &proj_exprs {
+                    proj_vals.push(pe.eval(
+                        &*cursor,
+                        rowid_alias_col,
+                        &mut cached_rowid,
+                        &bm25_vals,
+                    )?);
+                }
+                out.push(proj_vals);
+                if lim_val > 0 && out.len() >= (lim_val as usize) {
+                    break;
+                }
+                cursor.next()?;
+            }
+            return Ok(out);
+        }
+
+        // Bounded stable Top-K selection (`ORDER BY ... LIMIT K` with `OFFSET 0`, `1 <= K <= 128`)
+        if off_val == 0 && lim_val > 0 && (lim_val as usize) <= 128 {
+            let k = lim_val as usize;
+            let mut top_k: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(k);
+            while !cursor.eof() {
+                ctx.step_tick()?;
+                let mut cached_rowid: Option<i64> = None;
+                let mut row_ok = true;
+                for pred in &residual_preds {
+                    if !pred.matches(&*cursor, rowid_alias_col, &mut cached_rowid, enc)? {
+                        row_ok = false;
+                        break;
+                    }
+                }
+                if !row_ok {
+                    cursor.next()?;
+                    continue;
+                }
+                if let Some(ref aux) = fts5_aux {
+                    for (bi, (hidx, weights)) in bm25_calls.iter().enumerate() {
+                        let hval = cursor.column(*hidx)?;
+                        bm25_vals[bi] = aux.eval_bm25_fast(&hval, weights)?;
+                    }
+                }
+                let mut sort_vals = Vec::with_capacity(sort_exprs.len());
+                for se in &sort_exprs {
+                    sort_vals.push(se.eval(
+                        &*cursor,
+                        rowid_alias_col,
+                        &mut cached_rowid,
+                        &bm25_vals,
+                    )?);
+                }
+                if top_k.len() == k
+                    && compare_value_slices(&sort_vals, &top_k[k - 1].1, &sort_specs, enc)?
+                        != Ordering::Less
+                {
+                    cursor.next()?;
+                    continue;
+                }
+                let mut proj_vals = Vec::with_capacity(proj_exprs.len());
+                for pe in &proj_exprs {
+                    proj_vals.push(pe.eval(
+                        &*cursor,
+                        rowid_alias_col,
+                        &mut cached_rowid,
+                        &bm25_vals,
+                    )?);
+                }
+                let mut insert_pos = top_k.len();
+                for (idx, (_, existing_sort)) in top_k.iter().enumerate() {
+                    if compare_value_slices(&sort_vals, existing_sort, &sort_specs, enc)?
+                        == Ordering::Less
+                    {
+                        insert_pos = idx;
+                        break;
+                    }
+                }
+                if top_k.len() == k {
+                    top_k.pop();
+                }
+                top_k.insert(insert_pos, (proj_vals, sort_vals));
+                cursor.next()?;
+            }
+            return Ok(top_k.into_iter().map(|(p, _)| p).collect());
+        }
+
+        let mut all_rows: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
+        while !cursor.eof() {
+            ctx.step_tick()?;
+            let mut cached_rowid: Option<i64> = None;
+            let mut row_ok = true;
+            for pred in &residual_preds {
+                if !pred.matches(&*cursor, rowid_alias_col, &mut cached_rowid, enc)? {
+                    row_ok = false;
+                    break;
+                }
+            }
+            if !row_ok {
+                cursor.next()?;
+                continue;
+            }
+            if let Some(ref aux) = fts5_aux {
+                for (bi, (hidx, weights)) in bm25_calls.iter().enumerate() {
+                    let hval = cursor.column(*hidx)?;
+                    bm25_vals[bi] = aux.eval_bm25_fast(&hval, weights)?;
+                }
+            }
+            let mut proj_vals = Vec::with_capacity(proj_exprs.len());
+            for pe in &proj_exprs {
+                proj_vals.push(pe.eval(
+                    &*cursor,
+                    rowid_alias_col,
+                    &mut cached_rowid,
+                    &bm25_vals,
+                )?);
+            }
+            let mut sort_vals = Vec::with_capacity(sort_exprs.len());
+            for se in &sort_exprs {
+                sort_vals.push(se.eval(
+                    &*cursor,
+                    rowid_alias_col,
+                    &mut cached_rowid,
+                    &bm25_vals,
+                )?);
+            }
+            all_rows.push((proj_vals, sort_vals));
+            cursor.next()?;
+        }
+        fallible_sort_by(&mut all_rows, |(_, sa), (_, sb)| {
+            compare_value_slices(sa, sb, &sort_specs, enc)
+        })?;
+        let iter = all_rows.into_iter().map(|(p, _)| p).skip(off_val);
+        if lim_val < 0 {
+            Ok(iter.collect())
+        } else {
+            Ok(iter.take(lim_val as usize).collect())
+        }
+    })?;
+
+    Ok(FastSingleVtabOutcome::Completed(QueryOutput {
+        column_names: col_names,
+        rows,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6936,6 +9002,7 @@ fn eval_table_or_subquery(
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
     omitted_conjuncts: &mut Vec<Expr>,
+    vtab_query_info: Option<&SingleVtabQueryInfo>,
 ) -> Result<Vec<EvalRow>> {
     match tos {
         TableOrSubquery::TableFunction {
@@ -6949,7 +9016,7 @@ fn eval_table_or_subquery(
                 name: name.clone(),
             };
             let exists_non_tvf = (qname.schema.is_none() && ctes.locate(&qname.name).is_some())
-                || ctx.db_set.find_relation_in_set(&qname)?.is_some()
+                || ctx.db_set.find_relation_ref_in_set(&qname)?.is_some()
                 || ctx.db_set.resolve_catalog_table(&qname)?.is_some();
             if exists_non_tvf {
                 return Err(SqliteError::new(
@@ -6982,6 +9049,7 @@ fn eval_table_or_subquery(
                 outer_scopes,
                 ctes,
                 omitted_conjuncts,
+                vtab_query_info,
             )
         }
         TableOrSubquery::Table {
@@ -6992,7 +9060,7 @@ fn eval_table_or_subquery(
         } => {
             if let Some(args) = table_args {
                 let exists_non_tvf = (name.schema.is_none() && ctes.locate(&name.name).is_some())
-                    || ctx.db_set.find_relation_in_set(name)?.is_some()
+                    || ctx.db_set.find_relation_ref_in_set(name)?.is_some()
                     || ctx.db_set.resolve_catalog_table(name)?.is_some();
                 if exists_non_tvf {
                     return Err(SqliteError::new(
@@ -7025,6 +9093,7 @@ fn eval_table_or_subquery(
                     outer_scopes,
                     ctes,
                     omitted_conjuncts,
+                    vtab_query_info,
                 );
             }
             let eff_alias = alias.clone().unwrap_or_else(|| name.name.clone());
@@ -7118,7 +9187,7 @@ fn eval_table_or_subquery(
             }
 
             if ctx.db_set.resolve_catalog_table(name)?.is_none()
-                && ctx.db_set.find_relation_in_set(name)?.is_none()
+                && ctx.db_set.find_relation_ref_in_set(name)?.is_none()
                 && let Some((db_id, db_name, vt_name, declared)) =
                     resolve_vtab_for_query(ctx, name, true)?
             {
@@ -7138,6 +9207,7 @@ fn eval_table_or_subquery(
                     outer_scopes,
                     ctes,
                     omitted_conjuncts,
+                    vtab_query_info,
                 );
             }
 
@@ -7337,16 +9407,7 @@ fn read_table_with_plan(
 }
 
 fn eval_rowid_target_int(val: Value) -> Option<i64> {
-    match val {
-        Value::Integer(i) => Some(i),
-        Value::Real(r) if (r as i64 as f64) == r => Some(r as i64),
-        Value::Text(ref s) => sqliters_types::parse_numeric_text(s).and_then(|v| match v {
-            Value::Integer(i) => Some(i),
-            Value::Real(r) if (r as i64 as f64) == r => Some(r as i64),
-            _ => None,
-        }),
-        _ => None,
-    }
+    val.to_exact_rowid_i64()
 }
 
 fn eval_rowid_range_bound(
@@ -8119,33 +10180,72 @@ fn apply_join(
                 let matches = if !using_cols.is_empty() {
                     let mut ok = true;
                     for u in &using_cols {
-                        let (lv, lcoll, laff) = l.lookup_full(None, u)?.unwrap_or((
-                            Value::Null,
-                            Collation::Binary,
-                            None,
-                        ));
-                        let (rv, rcoll, raff) = r.lookup_full(None, u)?.unwrap_or((
-                            Value::Null,
-                            Collation::Binary,
-                            None,
-                        ));
-                        let coll = if lcoll != Collation::Binary {
-                            lcoll
+                        let l_idx = l.lookup_qual_idx(None, None, u)?;
+                        let r_idx = r.lookup_qual_idx(None, None, u)?;
+                        let (lv, lcoll, laff, lcustom) = match l_idx {
+                            Some(idx) => {
+                                let sc = &l.cols[idx];
+                                (
+                                    l.vals[idx].clone(),
+                                    sc.collation,
+                                    sc.affinity,
+                                    sc.custom_collation.as_deref(),
+                                )
+                            }
+                            None => (Value::Null, Collation::Binary, None, None),
+                        };
+                        let (rv, rcoll, raff, rcustom) = match r_idx {
+                            Some(idx) => {
+                                let sc = &r.cols[idx];
+                                (
+                                    r.vals[idx].clone(),
+                                    sc.collation,
+                                    sc.affinity,
+                                    sc.custom_collation.as_deref(),
+                                )
+                            }
+                            None => (Value::Null, Collation::Binary, None, None),
+                        };
+                        // Per C SQLite `sqlite3BinaryCompareCollSeq` on `t1.u = t2.u` (`select.c`),
+                        // the left table column's collating sequence always takes precedence when
+                        // present, even when it is `BINARY`.
+                        let (coll, custom_coll) = if l_idx.is_some() {
+                            (lcoll, lcustom)
                         } else {
-                            rcoll
+                            (rcoll, rcustom)
                         };
                         let comp_aff = sqlite_compare_affinity(laff, raff);
-                        if eval_comparison_with_affinity(
-                            Opcode::Eq,
-                            &lv,
-                            &rv,
-                            comp_aff,
-                            coll,
-                            ctx.encoding(),
-                        )
-                        .truthiness()
-                            != Some(true)
-                        {
+                        let cmp_val = if let Some(cname) = custom_coll {
+                            let enc = ctx.encoding();
+                            let mut svc = ExecutionContext {
+                                interrupt_flag: ctx.interrupt_flag,
+                                runtime: ctx.runtime,
+                                encoding: enc,
+                                functions: ctx.functions,
+                                collations: ctx.collations,
+                                progress: ctx.progress,
+                                strict_subtype: ctx.strict_subtype,
+                            };
+                            eval_comparison_with_services(
+                                Opcode::Eq,
+                                &lv,
+                                &rv,
+                                comp_aff,
+                                cname,
+                                enc,
+                                &mut svc,
+                            )?
+                        } else {
+                            eval_comparison_with_affinity(
+                                Opcode::Eq,
+                                &lv,
+                                &rv,
+                                comp_aff,
+                                coll,
+                                ctx.encoding(),
+                            )
+                        };
+                        if cmp_val.truthiness() != Some(true) {
                             ok = false;
                             break;
                         }
@@ -10653,6 +12753,38 @@ pub(crate) fn eval_expr_rt_pub(
     eval_expr_rt(ctx, expr, params, scopes, ctes, agg_group)
 }
 
+#[inline]
+fn try_borrow_simple_expr_val<'a>(
+    expr: &'a Expr,
+    params: &'a [Value],
+    scopes: &'a [EvalRow],
+) -> Result<Option<&'a Value>> {
+    match expr {
+        Expr::Column(cref) => {
+            if cref.schema.as_deref() == Some(WIN_SLOT_SCHEMA)
+                || cref.schema.as_deref() == Some(STAR_SLOT_SCHEMA)
+            {
+                return Ok(None);
+            }
+            for scope in scopes.iter().rev() {
+                if let Some(v_ref) = scope.lookup_cref_val_ref(cref)? {
+                    return Ok(Some(v_ref));
+                }
+            }
+            Ok(None)
+        }
+        Expr::Bind(bp) => {
+            let idx = match bp {
+                BindParam::Anonymous(i) | BindParam::Numbered(i) | BindParam::Named(_, i) => *i,
+            };
+            Ok(Some(
+                params.get(idx.saturating_sub(1)).unwrap_or(&Value::Null),
+            ))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn eval_expr(
     ctx: &mut ExecContext<'_>,
     expr: &Expr,
@@ -10826,13 +12958,26 @@ fn eval_expr_rt(
             }
 
             if matches!(op, BinaryOp::JsonExtract | BinaryOp::JsonExtractText) {
-                let lv_rt = eval_expr_rt(ctx, left, params, scopes, ctes, agg_group)?;
-                let rv_rt = eval_expr_rt(ctx, right, params, scopes, ctes, agg_group)?;
                 let fname = match op {
                     BinaryOp::JsonExtract => "->",
                     BinaryOp::JsonExtractText => "->>",
                     _ => unreachable!(),
                 };
+                if ctx.functions.find_scalar(fname, 2).is_none() {
+                    let as_sql = *op == BinaryOp::JsonExtractText;
+                    if let Expr::String(path_str) = right.as_ref()
+                        && let Some(lhs_ref) = try_borrow_simple_expr_val(left, params, scopes)?
+                    {
+                        return sqliters_types::json::eval_json_arrow_path_str(
+                            lhs_ref, path_str, as_sql,
+                        );
+                    }
+                    let lv = eval_expr(ctx, left, params, scopes, ctes, agg_group)?;
+                    let rv = eval_expr(ctx, right, params, scopes, ctes, agg_group)?;
+                    return sqliters_types::json::eval_json_arrow(&lv, &rv, as_sql);
+                }
+                let lv_rt = eval_expr_rt(ctx, left, params, scopes, ctes, agg_group)?;
+                let rv_rt = eval_expr_rt(ctx, right, params, scopes, ctes, agg_group)?;
                 return ctx.call_scalar_rt(fname, &[lv_rt, rv_rt]);
             }
 
@@ -11248,6 +13393,7 @@ fn eval_expr_rt(
                     scopes,
                     ctes,
                     &mut omitted,
+                    None,
                 )?;
                 let out_rows: Vec<Vec<Value>> = vrows
                     .into_iter()
@@ -15857,7 +18003,7 @@ enum DmlTarget {
         db_id: DatabaseId,
         db_name: String,
         table_name: String,
-        declared: Box<crate::vtab::VTabDeclaredSchema>,
+        declared: Arc<crate::vtab::VTabDeclaredSchema>,
     },
 }
 
@@ -15963,7 +18109,7 @@ fn resolve_dml_target_in_set(
             db_id,
             db_name,
             table_name,
-            declared: Box::new(declared.clone()),
+            declared: Arc::clone(declared),
         });
     }
 
@@ -17711,7 +19857,7 @@ struct PreparedVTabInsert<'a> {
     db_id: DatabaseId,
     db_name: String,
     table_name: String,
-    declared: crate::vtab::VTabDeclaredSchema,
+    declared: Arc<crate::vtab::VTabDeclaredSchema>,
     dml_ctes: CteStore,
     col_targets: Option<Vec<usize>>,
     implicit_visible_cols: Vec<usize>,
@@ -18141,17 +20287,17 @@ fn prepare_insert_exec<'a>(
                     PreparedInsertSource::Materialized(rows)
                 }
             };
-            let sample_cols = vtab_scoped_cols(&db_name, &table_name, &declared);
             let (ret_col_names, ret_expanded) = if ins.returning.is_empty() {
                 (Vec::new(), Vec::new())
             } else {
+                let sample_cols = vtab_scoped_cols(&db_name, &table_name, &declared);
                 expand_returning_projection(&ins.returning, &sample_cols)?
             };
             Ok(PreparedInsert::VirtualTable(Box::new(PreparedVTabInsert {
                 db_id,
                 db_name,
                 table_name,
-                declared: *declared,
+                declared,
                 dml_ctes,
                 col_targets,
                 implicit_visible_cols,
@@ -19280,6 +21426,7 @@ fn eval_rtreecheck_in_engine(
     } else {
         (0usize, false)
     };
+    crate::vtab::vtab_flush_shadow_all(ctx)?;
     let report = sqliters_ext::run_rtreecheck(
         |sql, p| query_internal_vtab_sql(ctx, sql, p),
         &db_name,
@@ -19307,8 +21454,11 @@ fn run_vtab_insert_loop(
         &mut p.source,
         PreparedInsertSource::Materialized(Vec::new()),
     ));
-    let sample_cols: Rc<[ScopedColumn]> =
-        vtab_scoped_cols(&p.db_name, &p.table_name, &p.declared).into();
+    let sample_cols: Option<Rc<[ScopedColumn]>> = if p.ret_expanded.is_empty() {
+        None
+    } else {
+        Some(vtab_scoped_cols(&p.db_name, &p.table_name, &p.declared).into())
+    };
     let mut ret_rows = Vec::new();
     let mut row_idx = 0usize;
     loop {
@@ -19364,7 +21514,9 @@ fn run_vtab_insert_loop(
         }
 
         for (i, c) in p.declared.table_schema.columns.iter().enumerate() {
-            col_vals[i] = c.affinity.apply(col_vals[i].clone());
+            col_vals[i] = c
+                .affinity
+                .apply(std::mem::replace(&mut col_vals[i], Value::Null));
         }
         if !p.declared.table_schema.without_rowid
             && explicit_rowid.is_none()
@@ -19395,13 +21547,18 @@ fn run_vtab_insert_loop(
         }
 
         let vtab_conflict = conflict_action_to_vtab_mode(effective_or_conflict);
+        let ret_col_vals = if sample_cols.is_some() {
+            Some(col_vals.clone())
+        } else {
+            None
+        };
         let upd_res = crate::vtab::vtab_perform_update_with_conflict(
             ctx,
             &p.db_name,
             &p.table_name,
             sqliters_types::VTabUpdateOperation::Insert {
                 new_rowid: explicit_rowid.clone(),
-                values: col_vals.clone(),
+                values: col_vals,
             },
             vtab_conflict,
         )
@@ -19434,21 +21591,20 @@ fn run_vtab_insert_loop(
         if !p.declared.table_schema.without_rowid {
             ctx.runtime.last_insert_rowid = final_rowid;
             ctx.publish();
-            if let Some(ipk) = p.declared.table_schema.rowid_alias_col
-                && col_vals[ipk].is_null()
-            {
-                col_vals[ipk] = Value::Integer(final_rowid);
-            }
         }
         *stmt_changes += 1;
         *count_changes_rows += 1;
 
-        if !p.ret_expanded.is_empty() {
-            let mut rvals = col_vals;
+        if let (Some(scols), Some(mut rvals)) = (sample_cols.as_ref(), ret_col_vals) {
             if !p.declared.table_schema.without_rowid {
+                if let Some(ipk) = p.declared.table_schema.rowid_alias_col
+                    && rvals[ipk].is_null()
+                {
+                    rvals[ipk] = Value::Integer(final_rowid);
+                }
                 rvals.push(Value::Integer(final_rowid));
             }
-            let rscope = EvalRow::new(sample_cols.clone(), rvals);
+            let rscope = EvalRow::new(Rc::clone(scols), rvals);
             let mut rrow = Vec::with_capacity(p.ret_expanded.len());
             for (pe, _, _) in &p.ret_expanded {
                 rrow.push(eval_expr(
@@ -19470,6 +21626,265 @@ fn run_vtab_insert_loop(
     })
 }
 
+#[inline]
+fn eval_bind_param(bp: &BindParam, params: &[Value]) -> Value {
+    let idx = match bp {
+        BindParam::Anonymous(i) | BindParam::Numbered(i) | BindParam::Named(_, i) => *i,
+    };
+    params
+        .get(idx.saturating_sub(1))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+struct StackIdent {
+    inline: [u8; 64],
+    len: usize,
+    heap: Option<String>,
+}
+
+impl StackIdent {
+    #[inline]
+    fn from_str(s: &str) -> Self {
+        let bytes = s.as_bytes();
+        if bytes.len() <= 64 {
+            let mut inline = [0u8; 64];
+            inline[..bytes.len()].copy_from_slice(bytes);
+            Self {
+                inline,
+                len: bytes.len(),
+                heap: None,
+            }
+        } else {
+            Self {
+                inline: [0u8; 64],
+                len: 0,
+                heap: Some(s.to_owned()),
+            }
+        }
+    }
+
+    #[inline]
+    fn as_str(&self) -> &str {
+        if let Some(ref h) = self.heap {
+            h.as_str()
+        } else {
+            std::str::from_utf8(&self.inline[..self.len]).unwrap_or("")
+        }
+    }
+}
+
+fn try_exec_fast_vtab_insert(
+    ctx: &mut ExecContext<'_>,
+    ins: &InsertStmt,
+    effective_or_conflict: Option<ConflictAction>,
+    params: &[Value],
+    stmt_changes: &mut u64,
+    count_changes_rows: &mut u64,
+) -> Result<Option<QueryOutput>> {
+    let InsertSource::Values(expr_rows) = &ins.source else {
+        return Ok(None);
+    };
+    if expr_rows.is_empty() {
+        return Ok(None);
+    }
+    if expr_rows.len() > 1
+        && expr_rows.iter().any(|r| {
+            r.iter()
+                .any(|e| expr_contains_window(e) || expr_contains_subquery(e))
+        })
+    {
+        return Ok(None);
+    }
+    if ctx.db_set.resolve_catalog_table(&ins.table)?.is_some()
+        || ctx.db_set.find_relation_ref_in_set(&ins.table)?.is_some()
+    {
+        return Ok(None);
+    }
+    let (db_id, db_ident, tbl_ident, declared) = {
+        let Some((db_id, db_name_ref, entry)) = ctx
+            .db_set
+            .find_connected_vtab_entry_in_set(&ins.table, true)
+        else {
+            return Ok(None);
+        };
+        if entry.is_eponymous_only
+            || (entry.declared.table_schema.without_rowid
+                && entry.declared.table_schema.without_rowid_pk_cols.len() != 1)
+        {
+            return Err(SqliteError::new(
+                ErrorCode::ReadOnly,
+                format!("table {} may not be modified", entry.table_name),
+            ));
+        }
+        (
+            db_id,
+            StackIdent::from_str(db_name_ref),
+            StackIdent::from_str(&entry.table_name),
+            Arc::clone(&entry.declared),
+        )
+    };
+
+    let num_cols = declared.table_schema.columns.len();
+    if num_cols > 16
+        || declared
+            .table_schema
+            .columns
+            .iter()
+            .any(|c| c.default_expr.is_some())
+    {
+        return Ok(None);
+    }
+
+    let mut target_map = [0usize; 16];
+    let target_len: usize;
+    if let Some(ref cnames) = ins.columns {
+        if cnames.len() > 16 {
+            return Ok(None);
+        }
+        for (i, cn) in cnames.iter().enumerate() {
+            if let Some((ci, _)) = declared.table_schema.find_column(cn) {
+                target_map[i] = ci;
+            } else if declared.table_schema.is_implicit_rowid_name(cn) {
+                target_map[i] = usize::MAX;
+            } else {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("table {} has no column named {cn}", tbl_ident.as_str()),
+                ));
+            }
+        }
+        target_len = cnames.len();
+    } else {
+        let mut vis_count = 0usize;
+        for ci in 0..num_cols {
+            if !declared.is_hidden(ci) {
+                target_map[vis_count] = ci;
+                vis_count += 1;
+            }
+        }
+        target_len = vis_count;
+    }
+
+    if expr_rows.iter().any(|r| r.len() != target_len) {
+        return Ok(None);
+    }
+
+    ctx.ensure_write_db(db_id, false)?;
+    let empty_ctes = CteStore::default();
+    let vtab_conflict = conflict_action_to_vtab_mode(effective_or_conflict);
+    let db_name = db_ident.as_str();
+    let table_name = tbl_ident.as_str();
+
+    for erow in expr_rows {
+        ctx.step_tick()?;
+        let mut explicit_rowid: Option<Value> = None;
+        let mut col_vals = vec![Value::Null; num_cols];
+        for (i, e) in erow.iter().enumerate() {
+            let val = match e {
+                Expr::Bind(spec) => eval_bind_param(spec, params),
+                Expr::Null => Value::Null,
+                Expr::Integer(n) => Value::Integer(*n),
+                Expr::Float(f) => Value::real(*f),
+                Expr::String(s) => Value::Text(s.clone()),
+                Expr::Blob(b) => Value::Blob(b.clone()),
+                Expr::Bool(b) => Value::Integer(i64::from(*b)),
+                _ => eval_expr(ctx, e, params, &[], &empty_ctes, None)?,
+            };
+            let t_idx = target_map[i];
+            if t_idx == usize::MAX {
+                if !val.is_null() {
+                    explicit_rowid = Some(val);
+                }
+            } else {
+                col_vals[t_idx] = val;
+            }
+        }
+
+        for (i, c) in declared.table_schema.columns.iter().enumerate() {
+            if c.affinity != TypeAffinity::Blob {
+                col_vals[i] = c
+                    .affinity
+                    .apply(std::mem::replace(&mut col_vals[i], Value::Null));
+            }
+        }
+        if !declared.table_schema.without_rowid
+            && explicit_rowid.is_none()
+            && let Some(ipk) = declared.table_schema.rowid_alias_col
+            && !col_vals[ipk].is_null()
+        {
+            explicit_rowid = Some(col_vals[ipk].clone());
+        }
+        if !declared.table_schema.without_rowid
+            && let Some(rv) = explicit_rowid.take()
+            && !rv.is_null()
+        {
+            match TypeAffinity::Integer.apply(rv) {
+                Value::Integer(i) => {
+                    explicit_rowid = Some(Value::Integer(i));
+                }
+                _ => {
+                    return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
+                }
+            }
+        }
+        if declared.table_schema.without_rowid
+            && explicit_rowid.is_none()
+            && declared.table_schema.without_rowid_pk_cols.len() == 1
+            && let Some(pk_ci) = declared.table_schema.without_rowid_pk_cols[0].col_idx
+        {
+            explicit_rowid = Some(col_vals[pk_ci].clone());
+        }
+
+        let upd_res = crate::vtab::vtab_perform_update_with_conflict(
+            ctx,
+            db_name,
+            table_name,
+            sqliters_types::VTabUpdateOperation::Insert {
+                new_rowid: explicit_rowid.clone(),
+                values: col_vals,
+            },
+            vtab_conflict,
+        )
+        .map_err(|e| {
+            if e.code == ErrorCode::ReadOnly && e.message == "virtual table is read-only" {
+                SqliteError::new(
+                    ErrorCode::ReadOnly,
+                    format!("table {table_name} may not be modified"),
+                )
+            } else {
+                e
+            }
+        });
+        let maybe_rowid = match upd_res {
+            Ok(mr) => mr,
+            Err(e)
+                if declared.constraint_support
+                    && vtab_conflict == sqliters_types::VTabConflictMode::Ignore
+                    && e.code == ErrorCode::Constraint =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+
+        let final_rowid = maybe_rowid
+            .or_else(|| explicit_rowid.as_ref().and_then(Value::as_i64))
+            .unwrap_or(0);
+        if !declared.table_schema.without_rowid {
+            ctx.runtime.last_insert_rowid = final_rowid;
+            ctx.publish();
+        }
+        *stmt_changes += 1;
+        *count_changes_rows += 1;
+    }
+
+    Ok(Some(QueryOutput {
+        column_names: Vec::new(),
+        rows: Vec::new(),
+    }))
+}
+
 #[inline(never)]
 fn exec_insert_internal(
     ctx: &mut ExecContext<'_>,
@@ -19481,6 +21896,41 @@ fn exec_insert_internal(
 ) -> Result<QueryOutput> {
     let mut stmt_changes: u64 = 0;
     let mut count_changes_rows: u64 = 0;
+
+    if ins.ctes.is_empty()
+        && ins.upsert_clauses.is_empty()
+        && ins.returning.is_empty()
+        && outer_scopes.is_empty()
+    {
+        match try_exec_fast_vtab_insert(
+            ctx,
+            ins,
+            effective_or_conflict,
+            params,
+            &mut stmt_changes,
+            &mut count_changes_rows,
+        ) {
+            Ok(Some(out)) => {
+                return finalize_dml_step_result(
+                    ctx,
+                    Ok(out),
+                    stmt_changes,
+                    count_changes_rows,
+                    is_top_level,
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return finalize_dml_step_result(
+                    ctx,
+                    Err(e),
+                    stmt_changes,
+                    count_changes_rows,
+                    is_top_level,
+                );
+            }
+        }
+    }
 
     let step_res = match prepare_insert_exec(ctx, ins, effective_or_conflict, params, outer_scopes)
     {
@@ -19611,7 +22061,7 @@ struct PreparedVTabUpdate<'a> {
     db_id: DatabaseId,
     db_name: String,
     table_name: String,
-    declared: crate::vtab::VTabDeclaredSchema,
+    declared: Arc<crate::vtab::VTabDeclaredSchema>,
     dml_ctes: CteStore,
     resolved_assigns: Vec<(Vec<usize>, bool, &'a Expr)>,
     matched_rows: Vec<EvalRow>,
@@ -20272,6 +22722,7 @@ fn prepare_update_exec<'a>(
                 outer_scopes,
                 &dml_ctes,
                 &mut omitted,
+                None,
             )?;
             let eff_selection = upd
                 .selection
@@ -20328,17 +22779,17 @@ fn prepare_update_exec<'a>(
                 }
             }
 
-            let sample_cols = vtab_scoped_cols(&db_name, &table_name, &declared);
             let (ret_col_names, ret_expanded) = if upd.returning.is_empty() {
                 (Vec::new(), Vec::new())
             } else {
+                let sample_cols = vtab_scoped_cols(&db_name, &table_name, &declared);
                 expand_returning_projection(&upd.returning, &sample_cols)?
             };
             Ok(PreparedUpdate::VirtualTable(Box::new(PreparedVTabUpdate {
                 db_id,
                 db_name,
                 table_name,
-                declared: *declared,
+                declared,
                 dml_ctes,
                 resolved_assigns,
                 matched_rows,
@@ -21007,7 +23458,7 @@ struct PreparedVTabDelete {
     db_id: DatabaseId,
     db_name: String,
     table_name: String,
-    declared: crate::vtab::VTabDeclaredSchema,
+    declared: Arc<crate::vtab::VTabDeclaredSchema>,
     dml_ctes: CteStore,
     target_rows: Vec<EvalRow>,
     ret_col_names: Vec<String>,
@@ -21220,6 +23671,7 @@ fn prepare_delete_exec(
                 outer_scopes,
                 &dml_ctes,
                 &mut omitted,
+                None,
             )?;
             let eff_selection = del
                 .selection
@@ -21238,17 +23690,17 @@ fn prepare_delete_exec(
                 }
                 target_rows.push(row);
             }
-            let sample_cols = vtab_scoped_cols(&db_name, &table_name, &declared);
             let (ret_col_names, ret_expanded) = if del.returning.is_empty() {
                 (Vec::new(), Vec::new())
             } else {
+                let sample_cols = vtab_scoped_cols(&db_name, &table_name, &declared);
                 expand_returning_projection(&del.returning, &sample_cols)?
             };
             Ok(PreparedDelete::VirtualTable(Box::new(PreparedVTabDelete {
                 db_id,
                 db_name,
                 table_name,
-                declared: *declared,
+                declared,
                 dml_ctes,
                 target_rows,
                 ret_col_names,
@@ -21837,12 +24289,11 @@ fn exec_create_virtual_table(
     }
 
     let (vt, declared) = {
-        let mut host_ctx =
-            crate::vtab::CoreVTabHostContext::new(ctx, db_name.clone(), name.name.clone());
+        let mut host_ctx = crate::vtab::CoreVTabHostContext::new(ctx, &db_name, &name.name);
         let vt = crate::vtab::catch_callback_panic("virtual table create", || {
             module.create(&mut host_ctx, args)
         })?;
-        let declared = host_ctx.take_declared_schema()?;
+        let declared = Arc::new(host_ctx.take_declared_schema()?);
         (vt, declared)
     };
 
@@ -21881,6 +24332,8 @@ fn exec_create_virtual_table(
             table_name: name.name.clone(),
             module_name: module_name.to_owned(),
             module_risk_flags: module.risk_flags(),
+            is_eponymous: module.is_eponymous(),
+            is_eponymous_only: module.is_eponymous_only(),
             shadow_suffixes,
             declared,
             state: crate::vtab::VTabInstanceState::Available(vt),
@@ -22538,13 +24991,12 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
             .slot(db_id)
             .map(|s| s.name.clone())
             .unwrap_or_else(|| "main".to_owned());
-        let (mut vt, _, _) = ctx
+        let mut vt = ctx
             .db_set
             .vtab_registry_mut()
-            .checkout_vtab(&db_name, &vt_def.name)?;
+            .checkout_vtab_instance(&db_name, &vt_def.name)?;
         let destroy_res = {
-            let mut host_ctx =
-                crate::vtab::CoreVTabHostContext::new(ctx, db_name.clone(), vt_def.name.clone());
+            let mut host_ctx = crate::vtab::CoreVTabHostContext::new(ctx, &db_name, &vt_def.name);
             crate::vtab::catch_callback_panic("virtual table destroy", || vt.destroy(&mut host_ctx))
         };
         if let Err(e) = destroy_res {
@@ -24876,16 +27328,13 @@ fn exec_alter_table(
                     .slot(vt_db_id)
                     .map(|s| s.name.clone())
                     .unwrap_or_else(|| "main".to_owned());
-                let (mut vt, _, _) = ctx
+                let mut vt = ctx
                     .db_set
                     .vtab_registry_mut()
-                    .checkout_vtab(&db_name, &vt_def.name)?;
+                    .checkout_vtab_instance(&db_name, &vt_def.name)?;
                 let rename_res = {
-                    let mut host_ctx = crate::vtab::CoreVTabHostContext::new(
-                        ctx,
-                        db_name.clone(),
-                        vt_def.name.clone(),
-                    );
+                    let mut host_ctx =
+                        crate::vtab::CoreVTabHostContext::new(ctx, &db_name, &vt_def.name);
                     crate::vtab::catch_callback_panic("virtual table rename", || {
                         vt.rename(&mut host_ctx, new_name)
                     })
@@ -31148,6 +33597,7 @@ fn exec_pragma(
                         out.push((slot_name.to_owned(), vt.name.clone(), n_dim, is_rtree_i32));
                     }
                 };
+            crate::vtab::vtab_flush_shadow_all(ctx)?;
             if schema.is_none() {
                 for idx in 0..ctx.db_set.slot_count() {
                     let cur_id = DatabaseId(idx);

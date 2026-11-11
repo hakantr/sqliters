@@ -127,6 +127,11 @@ fn register_builtin_extension_functions(
 ) {
     let aux_bm25 = Arc::clone(&fts5_aux);
     functions.register_scalar("bm25", None, FunctionFlags::INNOCUOUS, move |args| {
+        if args.len() == 1 {
+            return Ok(RuntimeValue::plain(
+                aux_bm25.eval_bm25(std::slice::from_ref(&args[0].value))?,
+            ));
+        }
         let vals: Vec<Value> = args.iter().map(|rv| rv.value.clone()).collect();
         Ok(RuntimeValue::plain(aux_bm25.eval_bm25(&vals)?))
     });
@@ -1546,6 +1551,13 @@ impl ConnectionInner {
                                 return Err(self.poison_with(e));
                             }
                         }
+                        if self.db_set.vtab_registry().has_any_in_tx()
+                            && let Err(e) = self.with_default_exec_ctx(shared, summary, |ctx| {
+                                crate::vtab::vtab_release_all(ctx, sp_slot)
+                            })
+                        {
+                            return Err(self.poison_with(e));
+                        }
                     }
                     if summary.other_writers == 0 && summary.other_readers == 0 {
                         for slot in self.db_set.slots_mut() {
@@ -1571,6 +1583,13 @@ impl ConnectionInner {
                             {
                                 return Err(self.poison_with(e));
                             }
+                        }
+                        if self.db_set.vtab_registry().has_any_in_tx()
+                            && let Err(e) = self.with_default_exec_ctx(shared, summary, |ctx| {
+                                crate::vtab::vtab_release_all(ctx, sp_slot)
+                            })
+                        {
+                            return Err(self.poison_with(e));
                         }
                     }
                     self.publish(shared);
@@ -1828,6 +1847,14 @@ impl ConnectionInner {
                                 return self.poison_with(sp_err);
                             }
                         }
+                        if self.db_set.vtab_registry().has_any_in_tx()
+                            && let Err(sp_err) =
+                                self.with_default_exec_ctx(shared, summary, |ctx| {
+                                    crate::vtab::vtab_release_all(ctx, sp_slot)
+                                })
+                        {
+                            return self.poison_with(sp_err);
+                        }
                     }
                     if summary.other_writers == 0 && summary.other_readers == 0 {
                         for slot in self.db_set.slots_mut() {
@@ -1973,6 +2000,12 @@ impl ConnectionInner {
                                 }
                             }
                         }
+                    }
+                    if self.db_set.vtab_registry().has_any_in_tx() {
+                        self.with_default_exec_ctx(shared, summary, |ctx| {
+                            let _ = crate::vtab::vtab_rollback_to_all(ctx, sp_slot);
+                            let _ = crate::vtab::vtab_release_all(ctx, sp_slot);
+                        });
                     }
                     if stmt_changed_schema {
                         self.restore_schemas_snapshot(&snap.schemas_before);
@@ -2537,6 +2570,7 @@ impl Connection {
         let fts5_aux = db_set.vtab_registry().fts5_aux_registry();
         let mut functions = FunctionRegistry::default();
         register_builtin_extension_functions(&mut functions, fts5_aux);
+        functions.mark_builtin_init_complete();
 
         let inner = ConnectionInner {
             db_set,
@@ -4172,6 +4206,7 @@ pub struct Statement {
     requires_schema: bool,
     category: Option<StmtCategory>,
     compiled_vdbe: Option<VdbeProgram>,
+    write_vm_scratch: sqliters_vdbe::VdbeWriteScratch,
     compiled_schema_generation: u64,
     compiled_v1_expire_generation: u64,
     compiled_advisory_expire_generation: u64,
@@ -4306,6 +4341,12 @@ fn compile_parsed_stmt(
     if let Stmt::Select(ref sel) = stmt
         && let Some(prog) = compiler::try_compile_select_in_db_set(sel, db_set, functions)?
         && prog.ops.iter().all(|ins| ins.db.index() < 2)
+    {
+        compiled_vdbe = Some(prog);
+    } else if let Stmt::Insert(ref ins) = stmt
+        && !count_changes
+        && let Some(prog) = compiler::try_compile_insert_in_db_set(ins, db_set, functions)?
+        && prog.ops.iter().all(|op| op.db.index() < 2)
     {
         compiled_vdbe = Some(prog);
     }
@@ -5085,6 +5126,7 @@ impl Statement {
             requires_schema: artifacts.requires_schema,
             category: artifacts.category,
             compiled_vdbe: artifacts.compiled_vdbe,
+            write_vm_scratch: sqliters_vdbe::VdbeWriteScratch::default(),
             compiled_schema_generation: inner.schema_generation,
             compiled_v1_expire_generation: inner.v1_expire_generation,
             compiled_advisory_expire_generation: inner.advisory_expire_generation,
@@ -5858,9 +5900,13 @@ impl Statement {
                 }
                 match res {
                     Ok(_) => {
-                        self.compiled_schema_generation = inner.schema_generation;
-                        self.compiled_v1_expire_generation = inner.v1_expire_generation;
-                        self.compiled_slot_cookies = inner.snapshot_slot_cookies();
+                        if self.compiled_schema_generation != inner.schema_generation
+                            || self.compiled_v1_expire_generation != inner.v1_expire_generation
+                        {
+                            self.compiled_schema_generation = inner.schema_generation;
+                            self.compiled_v1_expire_generation = inner.v1_expire_generation;
+                            self.compiled_slot_cookies = inner.snapshot_slot_cookies();
+                        }
                         inner.maybe_run_wal_autocheckpoint();
                         self.lifecycle = StatementLifecycle::Halted { last_error: None };
                         Ok(StepResult::Done)
@@ -5905,6 +5951,20 @@ impl Statement {
                             }
                         }
                     };
+
+                // If any virtual table has buffered in-tx writes, flush them before a `Read`
+                // statement executes so direct shadow-table queries or VDBE reads see fresh rows.
+                if inner.db_set.vtab_registry().has_any_in_tx() {
+                    let pre_sum = inner.activity.summary_excluding(hid, &inner.db_set);
+                    if let Err(e) = inner.with_default_exec_ctx(shared, pre_sum, |ctx| {
+                        crate::vtab::vtab_flush_shadow_all(ctx)
+                    }) {
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        return Err(e);
+                    }
+                }
 
                 if let Some(ref prog) = self.compiled_vdbe {
                     let mut tx_dbs: Vec<DatabaseId> = Vec::new();
@@ -6295,7 +6355,7 @@ impl Statement {
                     }
                 }
 
-                let stmt_clone = self.stmt.clone().expect("non-empty statement");
+                let stmt_ref = self.stmt.as_ref().expect("non-empty statement");
                 let summary = inner.activity.summary_excluding(hid, &inner.db_set);
                 let prev_ts = inner.runtime.stmt_timestamp_ms;
                 if prev_ts.is_none() {
@@ -6315,7 +6375,10 @@ impl Statement {
                     summary,
                     &mut stmt_tx,
                     &mut expire_self_only,
-                    |ctx| execute_read_body(ctx, &stmt_clone, &self.params),
+                    |ctx| {
+                        crate::vtab::ensure_stmt_vtabs_connected(ctx, stmt_ref)?;
+                        execute_read_body(ctx, stmt_ref, &self.params)
+                    },
                 );
                 inner.runtime.stmt_timestamp_ms = prev_ts;
 
@@ -6774,9 +6837,10 @@ impl Statement {
                 // Open an anonymous statement subsavepoint whenever an outer tx or another writer exists!
                 let stmt_sp_slot = (!inner.is_autocommit() || pre_summary.other_writers > 0)
                     .then_some(inner.savepoints.len());
+                let top_level_sql = inner.trace_hook.is_some().then(|| self.raw_sql.clone());
                 let mut stmt_tx = StmtTxTracker {
                     stmt_sp_slot,
-                    top_level_sql: Some(self.raw_sql.clone()),
+                    top_level_sql,
                     ignored_fk_parent_tables: self.ignored_fk_parent_tables.clone(),
                     ..StmtTxTracker::default()
                 };
@@ -6794,7 +6858,14 @@ impl Statement {
                     None => Vec::new(),
                 };
 
-                let schemas_before = inner.snapshot_open_schemas();
+                let is_dml = self.stmt.as_ref().is_some_and(|st| {
+                    matches!(st, Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_))
+                });
+                let schemas_before = if is_dml && !inner.writable_schema {
+                    Vec::new()
+                } else {
+                    inner.snapshot_open_schemas()
+                };
                 let fk_before = inner.deferred_fk_suspects.clone();
                 let rt_before = inner.runtime;
                 let mutation_len_before = inner.mutation_pipeline.len();
@@ -6811,9 +6882,6 @@ impl Statement {
                 );
                 let summary = inner.activity.summary_excluding(hid, &inner.db_set);
 
-                let is_dml = self.stmt.as_ref().is_some_and(|st| {
-                    matches!(st, Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_))
-                });
                 if let Err(e) = inner.check_any_interrupted() {
                     let early_snap = WriteAbortSnapshot {
                         stmt_sp_slot,
@@ -6835,7 +6903,10 @@ impl Statement {
                     return Err(final_err);
                 }
 
-                let stmt_clone = self.stmt.clone().expect("non-empty statement");
+                let stmt_ref = self.stmt.as_ref().expect("non-empty statement");
+                let compiled_prog_ref = self.compiled_vdbe.as_ref();
+                let write_scratch = &mut self.write_vm_scratch;
+                let params_ref = &self.params;
                 let prev_ts = inner.runtime.stmt_timestamp_ms;
                 if prev_ts.is_none() {
                     inner.runtime.stmt_timestamp_ms = Some(
@@ -6853,7 +6924,25 @@ impl Statement {
                     summary,
                     &mut stmt_tx,
                     &mut expire_self_only,
-                    |ctx| execute_write_body(ctx, &stmt_clone, &self.params),
+                    |ctx| {
+                        if let Some(sp_slot) = ctx.stmt_tx.stmt_sp_slot
+                            && ctx.db_set.vtab_registry().has_any_in_tx()
+                        {
+                            crate::vtab::vtab_savepoint_all(ctx, sp_slot)?;
+                        }
+                        crate::vtab::ensure_stmt_vtabs_connected(ctx, stmt_ref)?;
+                        if let (Some(prog), Stmt::Insert(_)) = (compiled_prog_ref, stmt_ref)
+                            && let Some(out) = engine::try_execute_compiled_insert(
+                                ctx,
+                                prog,
+                                write_scratch,
+                                params_ref,
+                            )?
+                        {
+                            return Ok(out);
+                        }
+                        execute_write_body(ctx, stmt_ref, params_ref)
+                    },
                 );
                 inner.runtime.stmt_timestamp_ms = prev_ts;
 
@@ -6894,9 +6983,13 @@ impl Statement {
                         if !out.column_names.is_empty() {
                             self.column_names = out.column_names;
                         }
-                        self.compiled_schema_generation = inner.schema_generation;
-                        self.compiled_v1_expire_generation = inner.v1_expire_generation;
-                        self.compiled_slot_cookies = inner.snapshot_slot_cookies();
+                        if self.compiled_schema_generation != inner.schema_generation
+                            || self.compiled_v1_expire_generation != inner.v1_expire_generation
+                        {
+                            self.compiled_schema_generation = inner.schema_generation;
+                            self.compiled_v1_expire_generation = inner.v1_expire_generation;
+                            self.compiled_slot_cookies = inner.snapshot_slot_cookies();
+                        }
 
                         let mut iter = out.rows.into_iter();
                         if let Some(first_row) = iter.next() {

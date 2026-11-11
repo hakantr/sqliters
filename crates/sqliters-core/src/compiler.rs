@@ -3,11 +3,11 @@
 #![forbid(unsafe_code)]
 
 use sqliters_syntax::{
-    BinaryOp, BindParam, ColumnRef, CommonTableExpr, CompoundOp, CurrentTimeKind, Expr, FromClause,
-    FunctionArgs, IndexHint, InsertSource, InsertStmt, JoinConstraint, JoinType, LikeOp,
-    LimitClause, OrderByTerm, QualifiedName, ResultColumn, SelectBody, SelectCore, SelectStmt,
-    SetAssignment, Stmt, TableOrSubquery, TriggerStep, TriggerTiming, UnaryOp, UpsertAction,
-    WindowFrameBound, WindowRef, WindowSpec,
+    BinaryOp, BindParam, ColumnRef, CommonTableExpr, CompoundOp, ConflictAction, CurrentTimeKind,
+    Expr, FromClause, FunctionArgs, IndexHint, InsertSource, InsertStmt, JoinConstraint, JoinType,
+    LikeOp, LimitClause, OrderByTerm, QualifiedName, ResultColumn, SelectBody, SelectCore,
+    SelectStmt, SetAssignment, Stmt, TableOrSubquery, TriggerStep, TriggerTiming, UnaryOp,
+    UpsertAction, WindowFrameBound, WindowRef, WindowSpec,
 };
 use sqliters_types::{
     Collation, DatabaseId, ErrorCode, KeySortOrder, Result, SqliteError, TypeAffinity, Value,
@@ -2654,20 +2654,32 @@ pub fn try_compile_select_in_db_set(
     Ok(res)
 }
 
-/// Returns `Ok(None)` whenever `ins` specifies `UPSERT` (`ON CONFLICT ...`), targets a relation
-/// with active triggers, or uses any construct requiring full interpreter execution in `engine.rs`.
+/// Compiles simple `INSERT INTO <table> VALUES (...)` statements into a [`VdbeProgram`].
+/// Returns `Ok(None)` whenever `ins` specifies `UPSERT` (`ON CONFLICT ...`), non-`ABORT` conflict
+/// resolution, `RETURNING`, CTEs, `SELECT`/`DEFAULT VALUES` sources, active triggers, foreign keys,
+/// `CHECK` constraints, `STRICT` tables, `WITHOUT ROWID`, `AUTOINCREMENT`, generated columns, or
+/// expressions requiring full interpreter execution in `engine.rs`.
 pub fn try_compile_insert(ins: &InsertStmt, schema: &Schema) -> Result<Option<VdbeProgram>> {
     if !ins.upsert_clauses.is_empty() {
         return Ok(None);
     }
+    let Some(tbl) = resolve_main_table_for_compiler(&ins.table, schema)? else {
+        return Ok(None);
+    };
     if schema.triggers.iter().any(|tr| {
         tr.is_active()
-            && tr.tbl_name.eq_ignore_ascii_case(&ins.table.name)
+            && tr.tbl_name.eq_ignore_ascii_case(&tbl.name)
             && tr.matches_event_and_columns(TriggerEventKind::Insert, None)
     }) {
         return Ok(None);
     }
-    Ok(None)
+    try_compile_insert_core(
+        ins,
+        DatabaseId::MAIN,
+        schema,
+        &tbl,
+        &FunctionRegistry::default(),
+    )
 }
 
 /// Multi-database variant of [`try_compile_insert`]; delegates to `engine.rs` (`Ok(None)`) whenever
@@ -2676,28 +2688,499 @@ pub fn try_compile_insert(ins: &InsertStmt, schema: &Schema) -> Result<Option<Vd
 pub fn try_compile_insert_in_db_set(
     ins: &InsertStmt,
     db_set: &DatabaseSet,
-    _functions: &FunctionRegistry,
+    functions: &FunctionRegistry,
 ) -> Result<Option<VdbeProgram>> {
     if !ins.upsert_clauses.is_empty() {
         return Ok(None);
     }
-    if let Ok(Some((target_db_id, rel))) = db_set.find_relation_in_set(&ins.table) {
-        let rel_name = match &rel {
-            ResolvedRelation::Table(t) => t.name.as_str(),
-            ResolvedRelation::View(v) => v.name.as_str(),
-        };
-        if matches!(rel, ResolvedRelation::View(_))
-            || db_set.has_active_triggers_for_event(
-                target_db_id,
-                rel_name,
-                TriggerEventKind::Insert,
-                None,
-            )
+    let Some((target_db_id, _slot_name, slot_schema, tbl)) =
+        resolve_db_set_table_for_compiler(&ins.table, db_set)?
+    else {
+        return Ok(None);
+    };
+    if db_set.has_active_triggers_for_event(target_db_id, &tbl.name, TriggerEventKind::Insert, None)
+    {
+        return Ok(None);
+    }
+    try_compile_insert_core(ins, target_db_id, slot_schema, &tbl, functions)
+}
+
+#[derive(Clone, Copy)]
+enum InsertTargetSlot {
+    Rowid,
+    Col(usize),
+}
+
+fn is_vtab_shadow_table(tbl_name: &str, schema: &Schema) -> bool {
+    const SHADOW_SUFFIXES: [&str; 8] = [
+        "_data", "_idx", "_content", "_docsize", "_config", "_node", "_rowid", "_parent",
+    ];
+    if schema.virtual_tables.is_empty() {
+        return false;
+    }
+    for vt in &schema.virtual_tables {
+        if tbl_name.len() > vt.name.len()
+            && tbl_name[..vt.name.len()].eq_ignore_ascii_case(&vt.name)
+        {
+            let tail = &tbl_name[vt.name.len()..];
+            if SHADOW_SUFFIXES.iter().any(|s| tail.eq_ignore_ascii_case(s)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn expr_can_compile_in_insert(expr: &Expr, functions: &FunctionRegistry) -> bool {
+    match expr {
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Integer(_)
+        | Expr::Float(_)
+        | Expr::String(_)
+        | Expr::Blob(_)
+        | Expr::CurrentTimeKw(_)
+        | Expr::Bind(_) => true,
+        Expr::Unary { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => expr_can_compile_in_insert(inner, functions),
+        Expr::Binary { left, right, .. } => {
+            expr_can_compile_in_insert(left, functions)
+                && expr_can_compile_in_insert(right, functions)
+        }
+        Expr::Between {
+            expr: v, low, high, ..
+        } => {
+            expr_can_compile_in_insert(v, functions)
+                && expr_can_compile_in_insert(low, functions)
+                && expr_can_compile_in_insert(high, functions)
+        }
+        Expr::InList { expr: v, list, .. } => {
+            expr_can_compile_in_insert(v, functions)
+                && list
+                    .iter()
+                    .all(|e| expr_can_compile_in_insert(e, functions))
+        }
+        Expr::Like {
+            expr: v,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_can_compile_in_insert(v, functions)
+                && expr_can_compile_in_insert(pattern, functions)
+                && escape
+                    .as_deref()
+                    .is_none_or(|e| expr_can_compile_in_insert(e, functions))
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_deref()
+                .is_none_or(|e| expr_can_compile_in_insert(e, functions))
+                && branches.iter().all(|(w, t)| {
+                    expr_can_compile_in_insert(w, functions)
+                        && expr_can_compile_in_insert(t, functions)
+                })
+                && else_expr
+                    .as_deref()
+                    .is_none_or(|e| expr_can_compile_in_insert(e, functions))
+        }
+        Expr::FunctionCall {
+            name,
+            distinct: false,
+            args: FunctionArgs::Exprs(es),
+            filter: None,
+            over: None,
+        } => {
+            if name.eq_ignore_ascii_case("changes")
+                || name.eq_ignore_ascii_case("total_changes")
+                || name.eq_ignore_ascii_case("last_insert_rowid")
+                || name.eq_ignore_ascii_case("rtreecheck")
+                || name.eq_ignore_ascii_case("bm25")
+                || name.eq_ignore_ascii_case("highlight")
+                || name.eq_ignore_ascii_case("snippet")
+                || expr_contains_aggregate_with_functions(expr, functions)
+            {
+                return false;
+            }
+            es.iter().all(|e| expr_can_compile_in_insert(e, functions))
+        }
+        _ => false,
+    }
+}
+
+fn try_compile_insert_core(
+    ins: &InsertStmt,
+    db_id: DatabaseId,
+    slot_schema: &Schema,
+    tbl: &TableSchema,
+    functions: &FunctionRegistry,
+) -> Result<Option<VdbeProgram>> {
+    if !ins.ctes.is_empty()
+        || !matches!(ins.or_conflict, None | Some(ConflictAction::Abort))
+        || !ins.upsert_clauses.is_empty()
+        || !ins.returning.is_empty()
+    {
+        return Ok(None);
+    }
+    let InsertSource::Values(ref rows) = ins.source else {
+        return Ok(None);
+    };
+    if rows.is_empty() || rows.len() > 64 {
+        return Ok(None);
+    }
+    if db_id.index() >= 2
+        || Schema::is_schema_table_name(&tbl.name)
+        || (tbl.name.len() >= 7 && tbl.name[..7].eq_ignore_ascii_case("sqlite_"))
+        || slot_schema.find_virtual_table(&tbl.name).is_some()
+        || is_vtab_shadow_table(&tbl.name, slot_schema)
+        || tbl.without_rowid
+        || tbl.root_pgno == 0
+        || tbl.autoincrement
+        || tbl.strict
+        || !tbl.checks.is_empty()
+        || !tbl.foreign_keys.is_empty()
+        || tbl.rowid_pk_conflict != ConflictAction::Abort
+        || tbl.columns.is_empty()
+    {
+        return Ok(None);
+    }
+    for c in &tbl.columns {
+        if c.generated.is_some()
+            || c.not_null.is_some_and(|act| act != ConflictAction::Abort)
+            || c.default_expr
+                .as_ref()
+                .is_some_and(|de| !expr_can_compile_in_insert(de, functions))
         {
             return Ok(None);
         }
     }
-    Ok(None)
+
+    let mut indexes = slot_schema.indexes_for_table(&tbl.name);
+    for idx in &indexes {
+        if idx.root_pgno == 0
+            || idx.where_clause.is_some()
+            || (idx.unique && idx.conflict != ConflictAction::Abort)
+            || idx.columns.iter().any(|ic| {
+                ic.expr.is_some()
+                    || ic.col_idx.is_none()
+                    || ic.sort_order.custom_collation.is_some()
+            })
+        {
+            return Ok(None);
+        }
+    }
+    indexes.sort_by_key(|idx| {
+        if idx.unique && idx.origin == "pk" {
+            0u8
+        } else if idx.unique {
+            1u8
+        } else {
+            2u8
+        }
+    });
+
+    let n_cols = tbl.columns.len();
+    let mut seen_col = vec![false; n_cols];
+    let mut seen_rowid = false;
+    let mut targets = Vec::new();
+    if let Some(ref cnames) = ins.columns {
+        targets.reserve(cnames.len());
+        for cname in cnames {
+            if let Some((ci, _)) = tbl.find_column(cname) {
+                if seen_col[ci] {
+                    return Ok(None);
+                }
+                seen_col[ci] = true;
+                if tbl.rowid_alias_col == Some(ci) {
+                    if seen_rowid {
+                        return Ok(None);
+                    }
+                    seen_rowid = true;
+                    targets.push(InsertTargetSlot::Rowid);
+                } else {
+                    targets.push(InsertTargetSlot::Col(ci));
+                }
+            } else if tbl.is_implicit_rowid_name(cname) {
+                if seen_rowid {
+                    return Ok(None);
+                }
+                seen_rowid = true;
+                targets.push(InsertTargetSlot::Rowid);
+            } else {
+                return Ok(None);
+            }
+        }
+    } else {
+        targets.reserve(n_cols);
+        for (ci, seen) in seen_col.iter_mut().enumerate() {
+            *seen = true;
+            if tbl.rowid_alias_col == Some(ci) {
+                seen_rowid = true;
+                targets.push(InsertTargetSlot::Rowid);
+            } else {
+                targets.push(InsertTargetSlot::Col(ci));
+            }
+        }
+    }
+
+    for row in rows {
+        if row.len() != targets.len()
+            || row
+                .iter()
+                .any(|e| !expr_can_compile_in_insert(e, functions))
+        {
+            return Ok(None);
+        }
+    }
+
+    let has_rowid_expr = seen_rowid
+        || tbl
+            .rowid_alias_col
+            .is_some_and(|ipk| tbl.columns[ipk].default_expr.is_some());
+
+    let mut prog = VdbeProgram::new();
+    prog.read_only = false;
+    let init_addr = prog.emit(Instruction::new(Opcode::Init, 0, 1, 0));
+    let body_start = prog.current_addr();
+    prog.emit(Instruction::new(Opcode::Transaction, db_id.index() as i32, 1, 0).with_db(db_id));
+
+    let tcur = prog.alloc_cursor();
+    prog.emit(
+        Instruction::new(Opcode::OpenWrite, tcur, tbl.root_pgno as i32, n_cols as i32)
+            .with_db(db_id)
+            .with_comment(tbl.name.clone()),
+    );
+    let mut icurs = Vec::with_capacity(indexes.len());
+    for idx in &indexes {
+        let ic = prog.alloc_cursor();
+        let u_msg = if idx.unique {
+            let cols_str = idx
+                .columns
+                .iter()
+                .map(|c| format!("{}.{}", tbl.name, c.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("UNIQUE constraint failed: {cols_str}"))
+        } else {
+            None
+        };
+        prog.emit(
+            Instruction::new(Opcode::OpenWriteIndex, ic, idx.root_pgno as i32, 0)
+                .with_db(db_id)
+                .with_p4(P4::KeyInfo(idx.key_sort_orders()))
+                .with_comment(idx.name.clone()),
+        );
+        icurs.push((ic, idx, u_msg));
+    }
+
+    let rid_reg = prog.alloc_register();
+    let col_base = prog.alloc_registers(n_cols);
+    let rec_reg = prog.alloc_register();
+    let max_idx_width = indexes
+        .iter()
+        .map(|i| i.columns.len() + 1)
+        .max()
+        .unwrap_or(0);
+    let idx_key_base = if max_idx_width > 0 {
+        prog.alloc_registers(max_idx_width)
+    } else {
+        0
+    };
+    let idx_rec_reg = if !indexes.is_empty() {
+        prog.alloc_register()
+    } else {
+        0
+    };
+
+    let affs: Vec<TypeAffinity> = tbl
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            if tbl.rowid_alias_col == Some(i) {
+                TypeAffinity::Blob
+            } else {
+                c.affinity
+            }
+        })
+        .collect();
+    let any_affinity = affs.iter().any(|&a| a != TypeAffinity::Blob);
+
+    let (dup_ext_code, dup_msg) = match tbl.rowid_alias_col {
+        Some(ipk) => (
+            sqliters_types::extended::SQLITE_CONSTRAINT_PRIMARYKEY,
+            format!(
+                "UNIQUE constraint failed: {}.{}",
+                tbl.name, tbl.columns[ipk].name
+            ),
+        ),
+        None => (
+            sqliters_types::extended::SQLITE_CONSTRAINT_ROWID,
+            format!("UNIQUE constraint failed: {}.rowid", tbl.name),
+        ),
+    };
+
+    let mut notnull_jumps: Vec<(usize, usize)> = Vec::new();
+
+    for row in rows {
+        // 1. Populate defaults / NULLs for omitted columns and NULL for physical IPK slot.
+        for (ci, col) in tbl.columns.iter().enumerate() {
+            if !seen_col[ci] {
+                if tbl.rowid_alias_col == Some(ci) {
+                    prog.emit(Instruction::new(Opcode::Null, 0, col_base + ci as i32, 0));
+                    if let Some(ref de) = col.default_expr
+                        && compile_expr(&mut prog, de, None, functions, rid_reg).is_err()
+                    {
+                        return Ok(None);
+                    }
+                } else if let Some(ref de) = col.default_expr {
+                    if compile_expr(&mut prog, de, None, functions, col_base + ci as i32).is_err() {
+                        return Ok(None);
+                    }
+                } else {
+                    prog.emit(Instruction::new(Opcode::Null, 0, col_base + ci as i32, 0));
+                }
+            } else if tbl.rowid_alias_col == Some(ci) {
+                prog.emit(Instruction::new(Opcode::Null, 0, col_base + ci as i32, 0));
+            }
+        }
+
+        // 2. Evaluate supplied expressions in SQL target order.
+        for (slot, expr) in targets.iter().zip(row.iter()) {
+            let dst = match *slot {
+                InsertTargetSlot::Rowid => rid_reg,
+                InsertTargetSlot::Col(ci) => col_base + ci as i32,
+            };
+            if compile_expr(&mut prog, expr, None, functions, dst).is_err() {
+                return Ok(None);
+            }
+        }
+
+        // 3. Coerce explicit rowid (`OP_MustBeInt`) before `NOT NULL` checks.
+        if has_rowid_expr {
+            let j_skip_mbi = prog.emit(Instruction::new(Opcode::IsNull, rid_reg, 0, 0));
+            prog.emit(Instruction::new(Opcode::MustBeInt, rid_reg, 0, 0));
+            let after_mbi = prog.current_addr();
+            prog.patch_p2(j_skip_mbi, after_mbi);
+        }
+
+        // 4. Apply column affinities.
+        if any_affinity {
+            prog.emit(
+                Instruction::new(Opcode::Affinity, col_base, n_cols as i32, 0)
+                    .with_p4(P4::Affinity(affs.clone())),
+            );
+        }
+
+        // 5. Check `NOT NULL` constraints on non-IPK columns.
+        for (ci, col) in tbl.columns.iter().enumerate() {
+            if col.not_null.is_some() && tbl.rowid_alias_col != Some(ci) {
+                let j_nn = prog.emit(Instruction::new(Opcode::IsNull, col_base + ci as i32, 0, 0));
+                notnull_jumps.push((j_nn, ci));
+            }
+        }
+
+        // 6. Finalize rowid (`SeekRowid` PK check if explicit, or `NewRowid` if NULL/omitted).
+        if has_rowid_expr {
+            let j_alloc = prog.emit(Instruction::new(Opcode::IsNull, rid_reg, 0, 0));
+            let j_seek_miss = prog.emit(Instruction::new(Opcode::SeekRowid, tcur, 0, rid_reg));
+            prog.emit(
+                Instruction::new(Opcode::Halt, dup_ext_code, 0, 0)
+                    .with_p4(P4::Str(dup_msg.clone())),
+            );
+            let alloc_addr = prog.current_addr();
+            prog.patch_p2(j_alloc, alloc_addr);
+            prog.emit(Instruction::new(Opcode::NewRowid, tcur, rid_reg, 0));
+            let ready_addr = prog.current_addr();
+            prog.patch_p2(j_seek_miss, ready_addr);
+        } else {
+            prog.emit(Instruction::new(Opcode::NewRowid, tcur, rid_reg, 0));
+        }
+
+        // 7. Check & insert secondary indexes (`UNIQUE` indexes ordered before non-unique).
+        for (ic, idx, u_msg) in &icurs {
+            for (k, ic_col) in idx.columns.iter().enumerate() {
+                let ci = ic_col.col_idx.expect("validated col_idx");
+                let src_reg = if tbl.rowid_alias_col == Some(ci) {
+                    rid_reg
+                } else {
+                    col_base + ci as i32
+                };
+                prog.emit(Instruction::new(
+                    Opcode::Copy,
+                    src_reg,
+                    idx_key_base + k as i32,
+                    0,
+                ));
+            }
+            prog.emit(Instruction::new(
+                Opcode::Copy,
+                rid_reg,
+                idx_key_base + idx.columns.len() as i32,
+                0,
+            ));
+            prog.emit(Instruction::new(
+                Opcode::MakeRecord,
+                idx_key_base,
+                (idx.columns.len() + 1) as i32,
+                idx_rec_reg,
+            ));
+            let p5 = if !idx.unique {
+                0
+            } else if idx.origin == "pk" {
+                2
+            } else {
+                1
+            };
+            let mut idx_ins = Instruction::new(Opcode::IdxInsert, *ic, idx_rec_reg, 0).with_p5(p5);
+            if let Some(msg) = u_msg {
+                idx_ins = idx_ins.with_p4(P4::Str(msg.clone()));
+            }
+            prog.emit(idx_ins);
+        }
+
+        // 8. Encode & insert physical table record.
+        prog.emit(Instruction::new(
+            Opcode::MakeRecord,
+            col_base,
+            n_cols as i32,
+            rec_reg,
+        ));
+        prog.emit(Instruction::new(Opcode::Insert, tcur, rec_reg, rid_reg).with_p5(0x03));
+    }
+
+    for (ic, _, _) in icurs {
+        prog.emit(Instruction::new(Opcode::Close, ic, 0, 0));
+    }
+    prog.emit(Instruction::new(Opcode::Close, tcur, 0, 0));
+    prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
+
+    for (j_addr, ci) in notnull_jumps {
+        let halt_addr = prog.current_addr();
+        prog.patch_p2(j_addr, halt_addr);
+        let msg = format!(
+            "NOT NULL constraint failed: {}.{}",
+            tbl.name, tbl.columns[ci].name
+        );
+        prog.emit(
+            Instruction::new(
+                Opcode::Halt,
+                sqliters_types::extended::SQLITE_CONSTRAINT_NOTNULL,
+                0,
+                0,
+            )
+            .with_p4(P4::Str(msg)),
+        );
+    }
+
+    prog.patch_p2(init_addr, body_start);
+    Ok(Some(prog))
 }
 
 fn try_compile_select_core<'a, F>(

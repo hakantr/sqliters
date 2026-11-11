@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 C_SPEEDBENCH_SOURCE = r"""
+#define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <fcntl.h>
@@ -38,6 +39,7 @@ C_SPEEDBENCH_SOURCE = r"""
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -168,6 +170,29 @@ static void remove_db_family(const char *db_path) {
     }
 }
 
+static void read_proc_mem_kib(uint64_t *rss_kib, uint64_t *hwm_kib) {
+    *rss_kib = 0;
+    *hwm_kib = 0;
+    FILE *fp = fopen("/proc/self/status", "r");
+    if (!fp) {
+        return;
+    }
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        unsigned long long val = 0;
+        if (strncmp(line, "VmRSS:", 6) == 0) {
+            if (sscanf(line + 6, "%llu", &val) == 1) {
+                *rss_kib = (uint64_t)val;
+            }
+        } else if (strncmp(line, "VmHWM:", 6) == 0) {
+            if (sscanf(line + 6, "%llu", &val) == 1) {
+                *hwm_kib = (uint64_t)val;
+            }
+        }
+    }
+    fclose(fp);
+}
+
 typedef struct {
     const char *name;
     const char *storage;
@@ -175,6 +200,9 @@ typedef struct {
     const char *op_unit;
     double elapsed_ms;
     double ops_per_sec;
+    uint64_t rss_kib;
+    uint64_t hwm_kib;
+    uint64_t sqlite_heap_hi_kib;
     uint64_t digest;
 } WorkloadMetric;
 
@@ -187,12 +215,21 @@ static WorkloadMetric make_metric(
     Digest dg
 ) {
     WorkloadMetric m;
+    uint64_t rss_kib = 0;
+    uint64_t hwm_kib = 0;
+    read_proc_mem_kib(&rss_kib, &hwm_kib);
+    sqlite3_int64 mem_cur = 0;
+    sqlite3_int64 mem_hi = 0;
+    sqlite3_status64(SQLITE_STATUS_MEMORY_USED, &mem_cur, &mem_hi, 1);
     m.name = name;
     m.storage = storage;
     m.ops = ops;
     m.op_unit = op_unit;
     m.elapsed_ms = elapsed_sec * 1000.0;
     m.ops_per_sec = (elapsed_sec > 0.0) ? ((double)ops / elapsed_sec) : 0.0;
+    m.rss_kib = rss_kib;
+    m.hwm_kib = hwm_kib;
+    m.sqlite_heap_hi_kib = (mem_hi > 0) ? (uint64_t)((mem_hi + 1023) / 1024) : 0;
     m.digest = dg.h;
     return m;
 }
@@ -761,10 +798,11 @@ int main(int argc, char **argv) {
         sqlite3_finalize(grp);
 
         double elapsed = now_sec() - t0;
-        sqlite3_close(db);
-        results[n_results++] = make_metric(
+        WorkloadMetric w10_m = make_metric(
             "W10_jsonb_extract_agg", "memory", 5026, "ops", elapsed, dg
         );
+        sqlite3_close(db);
+        results[n_results++] = w10_m;
     }
 
     /* W11: FTS5 3,000 docs + 200 MATCH queries ordered by bm25() (:memory:) */
@@ -850,10 +888,11 @@ int main(int argc, char **argv) {
         sqlite3_finalize(qstmt);
 
         double elapsed = now_sec() - t0;
-        sqlite3_close(db);
-        results[n_results++] = make_metric(
+        WorkloadMetric w11_m = make_metric(
             "W11_fts5_index_and_bm25", "memory", 3200, "ops", elapsed, dg
         );
+        sqlite3_close(db);
+        results[n_results++] = w11_m;
     }
 
     /* W12: R-Tree 5,000 boxes + 500 bbox queries (:memory:) */
@@ -923,10 +962,11 @@ int main(int argc, char **argv) {
         sqlite3_finalize(qstmt);
 
         double elapsed = now_sec() - t0;
-        sqlite3_close(db);
-        results[n_results++] = make_metric(
+        WorkloadMetric w12_m = make_metric(
             "W12_rtree_insert_and_bbox", "memory", 5500, "ops", elapsed, dg
         );
+        sqlite3_close(db);
+        results[n_results++] = w12_m;
     }
 
     /* W13: 300 autocommit WAL transactions */
@@ -987,11 +1027,12 @@ int main(int argc, char **argv) {
         }
         sqlite3_finalize(agg);
 
-        sqlite3_close(db);
-        remove_db_family(w13_db);
-        results[n_results++] = make_metric(
+        WorkloadMetric w13_m = make_metric(
             "W13_autocommit_wal_txns", "disk_wal", 300, "txns", elapsed, dg
         );
+        sqlite3_close(db);
+        remove_db_family(w13_db);
+        results[n_results++] = w13_m;
     }
 
     /* W14: End-to-end CLI SQL batch execution */
@@ -1039,7 +1080,9 @@ int main(int argc, char **argv) {
         close(fd_in);
         close(fd_out);
         int status = 0;
-        if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        struct rusage child_ru;
+        memset(&child_ru, 0, sizeof(child_ru));
+        if (wait4(pid, &status, 0, &child_ru) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
             fprintf(stderr, "W14 C CLI failed: status=%d\n", status);
             return 1;
         }
@@ -1069,21 +1112,33 @@ int main(int argc, char **argv) {
 
         remove_db_family(w14_db);
         unlink(w14_out);
-        results[n_results++] = make_metric(
+        WorkloadMetric w14_m = make_metric(
             "W14_cli_sql_script", "disk_wal_cli", 2260, "sql_stmts", elapsed, dg
         );
+        if (child_ru.ru_maxrss > 0) {
+            w14_m.rss_kib = (uint64_t)child_ru.ru_maxrss;
+            w14_m.hwm_kib = (uint64_t)child_ru.ru_maxrss;
+        }
+        results[n_results++] = w14_m;
     }
 
     if (json_mode) {
+        uint64_t suite_rss_kib = 0;
+        uint64_t suite_hwm_kib = 0;
+        read_proc_mem_kib(&suite_rss_kib, &suite_hwm_kib);
         printf("{\n");
         printf("  \"engine\": \"c-sqlite-3.54.1-O3\",\n");
         printf("  \"sqlite_version\": \"%s\",\n", sqlite3_libversion());
+        printf("  \"suite_rss_kib\": %" PRIu64 ",\n", suite_rss_kib);
+        printf("  \"suite_hwm_kib\": %" PRIu64 ",\n", suite_hwm_kib);
         printf("  \"workloads\": [\n");
         for (int i = 0; i < n_results; i++) {
             const WorkloadMetric *m = &results[i];
             printf(
                 "    {\"name\": \"%s\", \"storage\": \"%s\", \"ops\": %" PRIu64 ", "
                 "\"op_unit\": \"%s\", \"elapsed_ms\": %.6f, \"ops_per_sec\": %.3f, "
+                "\"rss_kib\": %" PRIu64 ", \"hwm_kib\": %" PRIu64 ", "
+                "\"sqlite_heap_hi_kib\": %" PRIu64 ", "
                 "\"digest\": \"%016" PRIx64 "\"}%s\n",
                 m->name,
                 m->storage,
@@ -1091,6 +1146,9 @@ int main(int argc, char **argv) {
                 m->op_unit,
                 m->elapsed_ms,
                 m->ops_per_sec,
+                m->rss_kib,
+                m->hwm_kib,
+                m->sqlite_heap_hi_kib,
                 m->digest,
                 (i + 1 < n_results) ? "," : ""
             );
@@ -1099,8 +1157,8 @@ int main(int argc, char **argv) {
     } else {
         for (int i = 0; i < n_results; i++) {
             const WorkloadMetric *m = &results[i];
-            printf("%-28s %-13s %10" PRIu64 " %12.3f ms %14.1f ops/s  %016" PRIx64 "\n",
-                   m->name, m->storage, m->ops, m->elapsed_ms, m->ops_per_sec, m->digest);
+            printf("%-28s %-13s %10" PRIu64 " %12.3f ms %14.1f ops/s %8" PRIu64 " KiB  %016" PRIx64 "\n",
+                   m->name, m->storage, m->ops, m->elapsed_ms, m->ops_per_sec, m->rss_kib, m->digest);
         }
     }
 
@@ -1246,14 +1304,116 @@ def ensure_c_binaries(repo_root: Path) -> tuple[Path, Path]:
     return c_bench_bin, sqlite3_cli
 
 
+def measure_binary_sections(bin_path: Path) -> dict[str, int]:
+    file_bytes = bin_path.stat().st_size if bin_path.exists() else 0
+    text_bytes = 0
+    rodata_bytes = 0
+    eh_bytes = 0
+    try:
+        proc = subprocess.run(["size", "-A", str(bin_path)], text=True, capture_output=True, check=False)
+        for line in proc.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                sec, sz = parts[0], int(parts[1])
+                if sec == ".text":
+                    text_bytes = sz
+                elif sec == ".rodata":
+                    rodata_bytes = sz
+                elif sec in (".eh_frame", ".eh_frame_hdr", ".gcc_except_table"):
+                    eh_bytes += sz
+    except OSError:
+        pass
+    return {
+        "file_bytes": file_bytes,
+        "file_kib": round(file_bytes / 1024.0, 1),
+        "text_bytes": text_bytes,
+        "text_kib": round(text_bytes / 1024.0, 1),
+        "rodata_bytes": rodata_bytes,
+        "unwind_tables_bytes": eh_bytes,
+    }
+
+
+RSS_PROBE_SOURCE = r"""
+#define _DEFAULT_SOURCE
+#include <stdio.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    pid_t pid = fork();
+    if (pid < 0) return 2;
+    if (pid == 0) { execv(argv[1], &argv[1]); _exit(127); }
+    int st = 0; struct rusage ru = {0};
+    if (wait4(pid, &st, 0, &ru) < 0) return 2;
+    fprintf(stderr, "\nSQLITERS_PEAK_RSS_KIB=%ld\n", ru.ru_maxrss);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+}
+"""
+
+
+def ensure_rss_probe(repo_root: Path) -> Path:
+    ref_dir = repo_root / "target" / "sqlite-ref"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    src = ref_dir / "rss_probe.c"
+    bin_p = ref_dir / "rss_probe"
+    if not src.exists() or src.read_text(encoding="utf-8") != RSS_PROBE_SOURCE:
+        src.write_text(RSS_PROBE_SOURCE, encoding="utf-8")
+    if not bin_p.exists() or bin_p.stat().st_mtime < src.stat().st_mtime:
+        cc = os.environ.get("CC", "cc")
+        run_cmd([cc, "-O2", str(src), "-o", str(bin_p)], cwd=ref_dir, desc="compile rss_probe")
+    return bin_p
+
+
+def run_wait4_maxrss_kib(
+    cmd: list[str], cwd: Path, stdin_path: Path | None = None, stdout_path: Path | None = None
+) -> tuple[str, int]:
+    probe = ensure_rss_probe(Path(__file__).resolve().parent.parent)
+    stdin_fh = stdin_path.open("rb") if stdin_path else None
+    stdout_fh = stdout_path.open("wb") if stdout_path else None
+    try:
+        proc = subprocess.Popen(
+            [str(probe), *cmd],
+            cwd=cwd,
+            stdin=stdin_fh if stdin_fh else subprocess.DEVNULL,
+            stdout=stdout_fh if stdout_fh else subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=(stdout_fh is None),
+        )
+        out_str = ""
+        if stdout_fh is None and proc.stdout is not None:
+            out_str = proc.stdout.read()
+        err_raw = proc.stderr.read() if proc.stderr is not None else ""
+        err_str = err_raw.decode("utf-8", "replace") if isinstance(err_raw, bytes) else err_raw
+        exit_code = proc.wait()
+        maxrss_kib = 0
+        cleaned_err: list[str] = []
+        for line in err_str.splitlines():
+            if line.startswith("SQLITERS_PEAK_RSS_KIB="):
+                maxrss_kib = int(line.split("=", 1)[1].strip())
+            elif line.strip():
+                cleaned_err.append(line)
+        if exit_code != 0:
+            sys.stderr.write(f"ERROR in {' '.join(cmd)} (exit {exit_code}):\n" + "\n".join(cleaned_err) + "\n")
+            raise SystemExit(1)
+        return out_str, maxrss_kib
+    finally:
+        if stdin_fh:
+            stdin_fh.close()
+        if stdout_fh:
+            stdout_fh.close()
+
+
 def run_single_trial(
     cmd: list[str], cwd: Path, label: str
 ) -> dict[str, Any]:
-    proc = run_cmd(cmd, cwd=cwd, desc=label)
+    out_str, maxrss_kib = run_wait4_maxrss_kib(cmd, cwd=cwd)
     try:
-        return json.loads(proc.stdout)
+        payload = json.loads(out_str)
+        payload["wait4_maxrss_kib"] = maxrss_kib
+        return payload
     except json.JSONDecodeError as exc:
-        sys.stderr.write(f"Invalid JSON from {label}:\n{proc.stdout}\n")
+        sys.stderr.write(f"Invalid JSON from {label}:\n{out_str}\n")
         raise SystemExit(1) from exc
 
 
@@ -1365,6 +1525,19 @@ def main() -> int:
             rust_timed_runs.append(r_payload)
             c_timed_runs.append(c_payload)
 
+    # Measure standalone Rust CLI child Peak RSS on W14 (matching C's wait4 child measurement)
+    rust_w14_cli_peak_rss_kib = 0
+    if not args.filter or "W14_cli_sql_script".find(args.filter) >= 0:
+        with tempfile.TemporaryDirectory(dir=bench_scratch_parent, prefix="w14_rss_") as w14_dir:
+            w14_db = Path(w14_dir) / "w14_cli.db"
+            w14_out = Path(w14_dir) / "w14_stdout.txt"
+            _, rust_w14_cli_peak_rss_kib = run_wait4_maxrss_kib(
+                [str(rust_cli), "-list", "-noheader", str(w14_db)],
+                cwd=repo_root,
+                stdin_path=w14_sql_file,
+                stdout_path=w14_out,
+            )
+
     wall_elapsed_s = time.perf_counter() - wall_t0
     shutil.rmtree(bench_scratch_parent, ignore_errors=True)
 
@@ -1377,6 +1550,11 @@ def main() -> int:
     for w_idx, w_name in enumerate(workload_names):
         r_samples = [run["workloads"][w_idx]["elapsed_ms"] for run in rust_timed_runs]
         c_samples = [run["workloads"][w_idx]["elapsed_ms"] for run in c_timed_runs]
+        r_rss_samples = [int(run["workloads"][w_idx].get("rss_kib", 0)) for run in rust_timed_runs]
+        r_hwm_samples = [int(run["workloads"][w_idx].get("hwm_kib", 0)) for run in rust_timed_runs]
+        c_rss_samples = [int(run["workloads"][w_idx].get("rss_kib", 0)) for run in c_timed_runs]
+        c_hwm_samples = [int(run["workloads"][w_idx].get("hwm_kib", 0)) for run in c_timed_runs]
+        c_heap_samples = [int(run["workloads"][w_idx].get("sqlite_heap_hi_kib", 0)) for run in c_timed_runs]
         meta = rust_timed_runs[0]["workloads"][w_idx]
         ops = int(meta["ops"])
         op_unit = meta["op_unit"]
@@ -1390,6 +1568,19 @@ def main() -> int:
 
         r_med_ms = statistics.median(r_samples)
         c_med_ms = statistics.median(c_samples)
+        r_rss_kib = (
+            rust_w14_cli_peak_rss_kib
+            if w_name == "W14_cli_sql_script" and rust_w14_cli_peak_rss_kib > 0
+            else int(statistics.median(r_rss_samples))
+        )
+        r_hwm_kib = (
+            rust_w14_cli_peak_rss_kib
+            if w_name == "W14_cli_sql_script" and rust_w14_cli_peak_rss_kib > 0
+            else int(statistics.median(r_hwm_samples))
+        )
+        c_rss_kib = int(statistics.median(c_rss_samples))
+        c_hwm_kib = int(statistics.median(c_hwm_samples))
+        c_heap_kib = int(statistics.median(c_heap_samples))
         r_ops_sec = (ops / (r_med_ms / 1000.0)) if r_med_ms > 0.0 else 0.0
         c_ops_sec = (ops / (c_med_ms / 1000.0)) if c_med_ms > 0.0 else 0.0
         ratio = (r_med_ms / c_med_ms) if c_med_ms > 0.0 else 0.0
@@ -1409,9 +1600,14 @@ def main() -> int:
                 "rust_median_ms": round(r_med_ms, 3),
                 "rust_trials_ms": [round(x, 3) for x in r_samples],
                 "rust_ops_per_sec": round(r_ops_sec, 1),
+                "rust_rss_kib": r_rss_kib,
+                "rust_hwm_kib": r_hwm_kib,
                 "c_median_ms": round(c_med_ms, 3),
                 "c_trials_ms": [round(x, 3) for x in c_samples],
                 "c_ops_per_sec": round(c_ops_sec, 1),
+                "c_rss_kib": c_rss_kib,
+                "c_hwm_kib": c_hwm_kib,
+                "c_sqlite_heap_peak_kib": c_heap_kib,
                 "rust_over_c_ratio": round(ratio, 2),
                 "digest_fnv1a64": digest,
                 "digest_verified": True,
@@ -1424,24 +1620,38 @@ def main() -> int:
     total_rust_med_ms = sum(r["rust_median_ms"] for r in summary_rows)
     total_c_med_ms = sum(r["c_median_ms"] for r in summary_rows)
     total_wall_ratio = (total_rust_med_ms / total_c_med_ms) if total_c_med_ms > 0.0 else 0.0
+    rust_suite_peak_rss_kib = int(
+        statistics.median(int(run.get("wait4_maxrss_kib", 0)) for run in rust_timed_runs)
+    )
+    c_suite_peak_rss_kib = int(
+        statistics.median(int(run.get("wait4_maxrss_kib", 0)) for run in c_timed_runs)
+    )
 
     hotspots_sorted = sorted(summary_rows, key=lambda r: r["rust_over_c_ratio"], reverse=True)
 
     git_head = detect_tool_version(["git", "rev-parse", "--short", "HEAD"])
+    git_branch = detect_tool_version(["git", "rev-parse", "--abbrev-ref", "HEAD"])
     rustc_ver = detect_tool_version(["rustc", "--version"])
     cc_bin = os.environ.get("CC", "cc")
     cc_ver = detect_tool_version([cc_bin, "--version"])
+    rust_bin_info = measure_binary_sections(rust_cli)
+    c_bin_info = measure_binary_sections(c_cli)
 
     report_doc = {
-        "benchmark": "sqliters_baseline_speedbench",
+        "benchmark": "sqliters_speedbench",
+        "git_branch": git_branch,
         "git_commit": git_head,
         "sqlite_target_version": "3.54.1",
+        "binaries": {
+            "rust_cli": rust_bin_info,
+            "c_cli_o3": c_bin_info,
+        },
         "environment": {
             "os": f"{platform.system()} {platform.release()} ({platform.machine()})",
             "cpu": detect_cpu_model(),
             "logical_cpus": os.cpu_count() or 1,
             "rustc": rustc_ver,
-            "rust_profile": "release (default Cargo.toml profile on main)",
+            "rust_profile": "release",
             "c_compiler": cc_ver,
             "c_flags": C_O3_FLAGS,
         },
@@ -1464,6 +1674,8 @@ def main() -> int:
             "sum_median_rust_ms": round(total_rust_med_ms, 3),
             "sum_median_c_ms": round(total_c_med_ms, 3),
             "sum_median_rust_over_c": round(total_wall_ratio, 3),
+            "rust_suite_peak_rss_kib": rust_suite_peak_rss_kib,
+            "c_suite_peak_rss_kib": c_suite_peak_rss_kib,
             "top_slowdown_workloads": [
                 {
                     "name": h["name"],
@@ -1477,32 +1689,35 @@ def main() -> int:
         "workloads": summary_rows,
     }
 
+    out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(report_doc, indent=2) + "\n", encoding="utf-8")
     sys.stderr.write(f"[4/4] Wrote structured results to {out_json}\n\n")
 
     # Print clean Markdown report to stdout
-    print(f"## Baseline Performance Comparison (`main` @ `{git_head}` vs C SQLite 3.54.1 `-O3`)\n")
+    print(f"## Speedbench Comparison (`{git_branch}` @ `{git_head}` vs C SQLite 3.54.1 `-O3`)\n")
     print(
         f"- **Hardware / OS**: {report_doc['environment']['cpu']} "
         f"({report_doc['environment']['logical_cpus']} threads), {report_doc['environment']['os']}"
     )
-    print(f"- **Rust Toolchain**: `{rustc_ver}` (`--release`, `#![forbid(unsafe_code)]`, 0 external crates)")
-    print(f"- **C Reference**: `{cc_ver}` (`{' '.join(C_O3_FLAGS)}`)")
     print(
-        f"- **Protocol**: Page size `4096`, on-disk `WAL` + `synchronous = NORMAL` (and `:memory:` for extension-isolated workloads), "
-        f"`{args.warmup}` warmup + `{args.trials}` interleaved timed trials, 64-bit FNV-1a output checksum verification (`100%` match)\n"
+        f"- **Rust CLI Binary**: `{rust_bin_info['file_kib']:.1f} KiB` total (`{rust_bin_info['text_kib']:.1f} KiB` `.text`) | "
+        f"**C `-O3` CLI Binary**: `{c_bin_info['file_kib']:.1f} KiB` total (`{c_bin_info['text_kib']:.1f} KiB` `.text`)"
+    )
+    print(
+        f"- **Suite Peak RSS (`wait4 ru_maxrss`)**: Rust **`{rust_suite_peak_rss_kib:,} KiB`** (`{rust_suite_peak_rss_kib / 1024.0:.2f} MiB`) | "
+        f"C `-O3` **`{c_suite_peak_rss_kib:,} KiB`** (`{c_suite_peak_rss_kib / 1024.0:.2f} MiB`)\n"
     )
 
     print(
-        "| Workload | Storage | Ops | Rust `--release` (ms) | C `-O3` (ms) | Ratio (`Rust / C`) | Rust `ops/s` | C `ops/s` | Digest (`FNV-1a`) |"
+        "| Workload | Storage | Ops | Rust (ms) | C `-O3` (ms) | Ratio | Rust RSS (KiB) | C RSS (KiB) | C Heap Peak (KiB) | Digest (`FNV-1a`) |"
     )
-    print("| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- |")
+    print("| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |")
     for r in summary_rows:
         print(
             f"| `{r['name']}` | `{r['storage']}` | {r['ops']:,} | "
             f"{r['rust_median_ms']:.2f} | {r['c_median_ms']:.2f} | "
             f"**{r['rust_over_c_ratio']:.2f}x** | "
-            f"{r['rust_ops_per_sec']:,.1f} | {r['c_ops_per_sec']:,.1f} | "
+            f"{r['rust_rss_kib']:,} | {r['c_rss_kib']:,} | {r['c_sqlite_heap_peak_kib']:,} | "
             f"`{r['digest_fnv1a64']}` ✓ |"
         )
 
