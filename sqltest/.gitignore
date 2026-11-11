@@ -1,8 +1,0 @@
-/artifacts/
-__pycache__/
-*.pyc
-
-# Previously tracked sample data: parent removes only these paths from index.
-/examples/normal-sample.csv
-/examples/normal-sample.jsonl
-/examples/normal-sample.sql
