@@ -1023,6 +1023,38 @@ pub(crate) fn classify_and_validate_window_fn(
                 flags: FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS,
             });
         }
+        "JSON_GROUP_ARRAY" | "JSONB_GROUP_ARRAY" => {
+            if is_star || arg_count != 1 {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("wrong number of arguments to function {name}()"),
+                ));
+            }
+            let kind = AggregateKind::from_name(name, false).expect("verified json group array");
+            return Ok(WindowFnKind::Aggregate {
+                name: name.to_owned(),
+                arity: 1,
+                is_star: false,
+                distinct,
+                flags: kind.function_flags(),
+            });
+        }
+        "JSON_GROUP_OBJECT" | "JSONB_GROUP_OBJECT" => {
+            if is_star || arg_count != 2 {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("wrong number of arguments to function {name}()"),
+                ));
+            }
+            let kind = AggregateKind::from_name(name, false).expect("verified json group object");
+            return Ok(WindowFnKind::Aggregate {
+                name: name.to_owned(),
+                arity: 2,
+                is_star: false,
+                distinct,
+                flags: kind.function_flags(),
+            });
+        }
         _ => {}
     }
 

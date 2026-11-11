@@ -586,7 +586,7 @@ enum OpenAccumulatorSlot {
         name: String,
         flags: FunctionFlags,
         collation_name: String,
-        acc: AggregateAccumulator,
+        acc: Box<AggregateAccumulator>,
     },
     Custom {
         name: String,
@@ -880,9 +880,14 @@ impl ExecutionServices for ExecutionContext<'_> {
                 ("MIN", 1) => AggregateKind::Min,
                 ("MAX", 1) => AggregateKind::Max,
                 ("GROUP_CONCAT", 1 | 2) | ("STRING_AGG", 2) => AggregateKind::GroupConcat,
+                ("JSON_GROUP_ARRAY", 1) => AggregateKind::JsonGroupArray,
+                ("JSONB_GROUP_ARRAY", 1) => AggregateKind::JsonbGroupArray,
+                ("JSON_GROUP_OBJECT", 2) => AggregateKind::JsonGroupObject,
+                ("JSONB_GROUP_OBJECT", 2) => AggregateKind::JsonbGroupObject,
                 (
                     "COUNT" | "SUM" | "TOTAL" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT"
-                    | "STRING_AGG",
+                    | "STRING_AGG" | "JSON_GROUP_ARRAY" | "JSONB_GROUP_ARRAY" | "JSON_GROUP_OBJECT"
+                    | "JSONB_GROUP_OBJECT",
                     _,
                 ) => {
                     return Err(SqliteError::new(
@@ -906,10 +911,12 @@ impl ExecutionServices for ExecutionContext<'_> {
             let builtin_coll = Collation::from_name(collation_name).unwrap_or(Collation::Binary);
             OpenAccumulatorSlot::Builtin {
                 name: name.to_ascii_lowercase(),
-                flags: FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS,
+                flags: kind.function_flags(),
                 collation_name: collation_name.to_owned(),
-                acc: AggregateAccumulator::new_with_collation(kind, distinct, builtin_coll)
-                    .with_encoding(self.encoding),
+                acc: Box::new(
+                    AggregateAccumulator::new_with_collation(kind, distinct, builtin_coll)
+                        .with_encoding(self.encoding),
+                ),
             }
         };
 
@@ -956,9 +963,8 @@ impl ExecutionServices for ExecutionContext<'_> {
             } => {
                 let mut scratch = Vec::new();
                 let filtered = strip_unsubscribed_subtypes(*flags, args, &mut scratch);
-                let plain: Vec<Value> = filtered.iter().map(|rv| rv.value.clone()).collect();
                 let cname = collation_name.as_str();
-                acc.step_with_cmp(&plain, |a, b| match (a, b) {
+                acc.step_rt_with_cmp(filtered, |a, b| match (a, b) {
                     (Value::Text(la), Value::Text(lb)) => {
                         collations.compare(cname, la, lb, encoding)
                     }
@@ -1017,7 +1023,7 @@ impl ExecutionServices for ExecutionContext<'_> {
             OpenAccumulatorSlot::Builtin {
                 name, flags, acc, ..
             } => {
-                let rv = RuntimeValue::plain(acc.value()?);
+                let rv = acc.value_rt()?;
                 enforce_result_subtype_contract(name, *flags, strict, rv)
             }
             OpenAccumulatorSlot::Custom {
@@ -1050,8 +1056,7 @@ impl ExecutionServices for ExecutionContext<'_> {
             OpenAccumulatorSlot::Builtin { flags, acc, .. } => {
                 let mut scratch = Vec::new();
                 let filtered = strip_unsubscribed_subtypes(*flags, args, &mut scratch);
-                let plain: Vec<Value> = filtered.iter().map(|rv| rv.value.clone()).collect();
-                acc.inverse(&plain)
+                acc.inverse_rt(filtered)
             }
             OpenAccumulatorSlot::Custom {
                 name,
@@ -1089,7 +1094,7 @@ impl ExecutionServices for ExecutionContext<'_> {
             OpenAccumulatorSlot::Builtin {
                 name, flags, acc, ..
             } => {
-                let rv = RuntimeValue::plain(acc.finalize()?);
+                let rv = acc.finalize_rt()?;
                 enforce_result_subtype_contract(&name, flags, strict, rv)
             }
             OpenAccumulatorSlot::Custom {

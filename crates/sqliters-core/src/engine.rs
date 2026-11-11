@@ -340,17 +340,28 @@ impl ExecContext<'_> {
         args: &[RuntimeValue],
     ) -> Result<RuntimeValue> {
         self.publish();
-        let enc = self.encoding();
-        let mut svc = ExecutionContext {
-            interrupt_flag: self.interrupt_flag,
-            runtime: self.runtime,
-            encoding: enc,
-            functions: self.functions,
-            collations: self.collations,
-            progress: self.progress,
-            strict_subtype: self.strict_subtype,
+        let res = {
+            let enc = self.encoding();
+            let mut svc = ExecutionContext {
+                interrupt_flag: self.interrupt_flag,
+                runtime: self.runtime,
+                encoding: enc,
+                functions: self.functions,
+                collations: self.collations,
+                progress: self.progress,
+                strict_subtype: self.strict_subtype,
+            };
+            svc.call_scalar(name, args)
         };
-        svc.call_scalar(name, args)
+        match res {
+            Err(e)
+                if e.code == ErrorCode::Internal
+                    && e.message == "__sqliters_builtin_rtreecheck__" =>
+            {
+                eval_rtreecheck_in_engine(self, args)
+            }
+            other => other,
+        }
     }
 
     pub(crate) fn scan_table_in_db(
@@ -1450,6 +1461,7 @@ pub(crate) struct ScopedColumn {
     hidden_rowid: bool,
     omit_from_star: bool,
     merged_using: bool,
+    is_vtab: bool,
 }
 
 impl ScopedColumn {
@@ -1479,6 +1491,7 @@ impl ScopedColumn {
 pub(crate) struct EvalRow {
     cols: Rc<[ScopedColumn]>,
     vals: Vec<Value>,
+    subtypes: Rc<[u8]>,
     /// Precomputed window function outputs for `WIN_SLOT_SCHEMA` slots on this row.
     pub(crate) win_vals: Rc<[RuntimeValue]>,
     /// Active group rows when this scope represents an aggregated `SELECT` (`SF_Aggregate`).
@@ -1493,6 +1506,7 @@ impl Default for EvalRow {
         Self {
             cols: Rc::from([]),
             vals: Vec::new(),
+            subtypes: Rc::from([]),
             win_vals: Rc::from([]),
             agg_group_rows: None,
             qualified_only: false,
@@ -1508,6 +1522,19 @@ impl EvalRow {
         Self {
             cols,
             vals,
+            subtypes: Rc::from([]),
+            win_vals: Rc::from([]),
+            agg_group_rows: None,
+            qualified_only: false,
+        }
+    }
+
+    #[inline]
+    fn with_subtypes(cols: Rc<[ScopedColumn]>, vals: Vec<Value>, subtypes: Rc<[u8]>) -> Self {
+        Self {
+            cols,
+            vals,
+            subtypes,
             win_vals: Rc::from([]),
             agg_group_rows: None,
             qualified_only: false,
@@ -1532,6 +1559,23 @@ impl EvalRow {
         Ok(self
             .lookup_qual_full(cref.schema.as_deref(), cref.table.as_deref(), &cref.column)?
             .map(|(v, c, _)| (v, c)))
+    }
+
+    fn lookup_cref_rt(&self, cref: &ColumnRef) -> Result<Option<RuntimeValue>> {
+        Ok(self
+            .lookup_qual_idx(cref.schema.as_deref(), cref.table.as_deref(), &cref.column)?
+            .map(|idx| RuntimeValue {
+                value: self.vals[idx].clone(),
+                subtype: self.subtypes.get(idx).copied().unwrap_or(0),
+            }))
+    }
+
+    fn lookup_cref_is_vtab(&self, cref: &ColumnRef) -> bool {
+        self.lookup_qual_idx(cref.schema.as_deref(), cref.table.as_deref(), &cref.column)
+            .ok()
+            .flatten()
+            .and_then(|idx| self.cols.get(idx))
+            .is_some_and(|sc| sc.is_vtab)
     }
 
     fn lookup_cref_full(
@@ -1576,21 +1620,21 @@ impl EvalRow {
         if count == 1 { found } else { None }
     }
 
-    fn lookup_qual_full(
+    fn lookup_qual_idx(
         &self,
         schema_qual: Option<&str>,
         table_qual: Option<&str>,
         col_name: &str,
-    ) -> Result<Option<(Value, Collation, Option<TypeAffinity>)>> {
+    ) -> Result<Option<usize>> {
         if schema_qual == Some(STAR_SLOT_SCHEMA) {
             if self.qualified_only {
                 return Ok(None);
             }
             if let Ok(idx) = col_name.parse::<usize>()
-                && let Some(sc) = self.cols.get(idx)
-                && let Some(val) = self.vals.get(idx)
+                && idx < self.cols.len()
+                && idx < self.vals.len()
             {
-                return Ok(Some((val.clone(), sc.collation, sc.affinity)));
+                return Ok(Some(idx));
             }
             return Ok(None);
         }
@@ -1611,21 +1655,15 @@ impl EvalRow {
                 continue;
             }
             if sc.name.eq_ignore_ascii_case(col_name) {
-                matches.push((
-                    self.vals[i].clone(),
-                    sc.collation,
-                    sc.affinity,
-                    sc.merged_using,
-                ));
+                matches.push(i);
                 if schema_qual.is_none() && table_qual.is_none() && sc.merged_using {
-                    // Deduplicated USING / NATURAL column takes unambiguous precedence
-                    return Ok(Some((self.vals[i].clone(), sc.collation, sc.affinity)));
+                    return Ok(Some(i));
                 }
             }
         }
 
         if matches.len() == 1 {
-            return Ok(Some((matches[0].0.clone(), matches[0].1, matches[0].2)));
+            return Ok(Some(matches[0]));
         }
         if matches.len() > 1 {
             return Err(SqliteError::new(ErrorCode::Error, format_ambiguous()));
@@ -1643,19 +1681,10 @@ impl EvalRow {
                 if !sc.matches_qualifier(schema_qual, table_qual) {
                     continue;
                 }
-                matches.push((
-                    self.vals[i].clone(),
-                    Collation::Binary,
-                    Some(TypeAffinity::Integer),
-                    false,
-                ));
+                matches.push(i);
             }
             if matches.len() == 1 {
-                return Ok(Some((
-                    matches[0].0.clone(),
-                    Collation::Binary,
-                    Some(TypeAffinity::Integer),
-                )));
+                return Ok(Some(matches[0]));
             }
             if matches.len() > 1 {
                 return Err(SqliteError::new(ErrorCode::Error, format_ambiguous()));
@@ -1663,6 +1692,27 @@ impl EvalRow {
         }
 
         Ok(None)
+    }
+
+    fn lookup_qual_full(
+        &self,
+        schema_qual: Option<&str>,
+        table_qual: Option<&str>,
+        col_name: &str,
+    ) -> Result<Option<(Value, Collation, Option<TypeAffinity>)>> {
+        let Some(idx) = self.lookup_qual_idx(schema_qual, table_qual, col_name)? else {
+            return Ok(None);
+        };
+        let sc = &self.cols[idx];
+        if sc.hidden_rowid {
+            Ok(Some((
+                self.vals[idx].clone(),
+                Collation::Binary,
+                Some(TypeAffinity::Integer),
+            )))
+        } else {
+            Ok(Some((self.vals[idx].clone(), sc.collation, sc.affinity)))
+        }
     }
 }
 
@@ -3829,6 +3879,7 @@ fn exec_recursive_cte(
                     hidden_rowid: false,
                     omit_from_star: false,
                     merged_using: false,
+                    is_vtab: false,
                 }
             })
             .collect::<Vec<_>>()
@@ -5886,6 +5937,7 @@ fn vtab_scoped_cols(
             hidden_rowid: false,
             omit_from_star: declared.is_hidden(idx),
             merged_using: false,
+            is_vtab: true,
         })
         .collect();
     if !tbl.without_rowid {
@@ -5903,6 +5955,7 @@ fn vtab_scoped_cols(
             hidden_rowid: true,
             omit_from_star: false,
             merged_using: false,
+            is_vtab: true,
         });
     }
     cols
@@ -6209,8 +6262,14 @@ fn eval_vtab_scan(
     while !crate::vtab::catch_callback_panic("vtab xEof", || Ok(cursor.eof()))? {
         ctx.step_tick()?;
         let mut vals = Vec::with_capacity(shared_cols.len());
+        let mut subtypes: Option<Vec<u8>> = None;
         for col_idx in 0..num_cols {
             let v = crate::vtab::catch_callback_panic("vtab xColumn", || cursor.column(col_idx))?;
+            let st = cursor.column_subtype(col_idx);
+            if st != 0 {
+                let sv = subtypes.get_or_insert_with(|| vec![0u8; shared_cols.len()]);
+                sv[col_idx] = st;
+            }
             vals.push(v);
         }
         if !declared.table_schema.without_rowid {
@@ -6222,7 +6281,11 @@ fn eval_vtab_scan(
             }
             vals.push(Value::Integer(rowid));
         }
-        out.push(EvalRow::new(Rc::clone(&shared_cols), vals));
+        let erow = match subtypes {
+            Some(sv) => EvalRow::with_subtypes(Rc::clone(&shared_cols), vals, sv.into()),
+            None => EvalRow::new(Rc::clone(&shared_cols), vals),
+        };
+        out.push(erow);
         crate::vtab::catch_callback_panic("vtab xNext", || cursor.next())?;
     }
 
@@ -6363,6 +6426,7 @@ fn eval_table_or_subquery(
                             hidden_rowid: false,
                             omit_from_star: false,
                             merged_using: false,
+                            is_vtab: false,
                         }
                     })
                     .collect::<Vec<_>>()
@@ -6403,6 +6467,7 @@ fn eval_table_or_subquery(
                             hidden_rowid: false,
                             omit_from_star: false,
                             merged_using: false,
+                            is_vtab: false,
                         }
                     })
                     .collect::<Vec<_>>()
@@ -6469,6 +6534,7 @@ fn eval_table_or_subquery(
                     hidden_rowid: false,
                     omit_from_star: false,
                     merged_using: false,
+                    is_vtab: false,
                 })
                 .collect();
             if !tbl.without_rowid {
@@ -6486,6 +6552,7 @@ fn eval_table_or_subquery(
                     hidden_rowid: true,
                     omit_from_star: false,
                     merged_using: false,
+                    is_vtab: false,
                 });
             }
 
@@ -6523,6 +6590,7 @@ fn eval_table_or_subquery(
                         hidden_rowid: false,
                         omit_from_star: false,
                         merged_using: false,
+                        is_vtab: false,
                     }
                 })
                 .collect::<Vec<_>>()
@@ -7282,21 +7350,40 @@ fn apply_join(
 
     let combine_rows = |l: Option<&EvalRow>, r: Option<&EvalRow>| -> EvalRow {
         let mut vals = Vec::with_capacity(merged_cols.len());
+        let has_subtypes = l.is_some_and(|row| !row.subtypes.is_empty())
+            || r.is_some_and(|row| !row.subtypes.is_empty());
+        let mut subtypes = if has_subtypes {
+            Vec::with_capacity(merged_cols.len())
+        } else {
+            Vec::new()
+        };
         for (i, lc) in left_sample_cols.iter().enumerate() {
             let mut val = l.map_or(Value::Null, |row| row.vals[i].clone());
+            let mut st = l.map_or(0, |row| row.subtypes.get(i).copied().unwrap_or(0));
             if left_is_using[i]
                 && val.is_null()
                 && let Some(r_row) = r
                 && let Some((rv, _)) = r_row.lookup(None, &lc.name).ok().flatten()
             {
                 val = rv;
+                st = 0;
             }
             vals.push(val);
+            if has_subtypes {
+                subtypes.push(st);
+            }
         }
         for j in 0..right_sample_cols.len() {
             vals.push(r.map_or(Value::Null, |row| row.vals[j].clone()));
+            if has_subtypes {
+                subtypes.push(r.map_or(0, |row| row.subtypes.get(j).copied().unwrap_or(0)));
+            }
         }
-        EvalRow::new(Rc::clone(&shared_merged_cols), vals)
+        if has_subtypes {
+            EvalRow::with_subtypes(Rc::clone(&shared_merged_cols), vals, subtypes.into())
+        } else {
+            EvalRow::new(Rc::clone(&shared_merged_cols), vals)
+        }
     };
 
     let mut all_conjuncts: Vec<&Expr> = Vec::new();
@@ -7571,6 +7658,7 @@ fn schema_cols_for_tos(
                                 hidden_rowid: false,
                                 omit_from_star: false,
                                 merged_using: false,
+                                is_vtab: false,
                             }
                         })
                         .collect(),
@@ -7616,6 +7704,7 @@ fn schema_cols_for_tos(
                     hidden_rowid: false,
                     omit_from_star: false,
                     merged_using: false,
+                    is_vtab: false,
                 })
                 .collect();
             if !tbl.without_rowid {
@@ -7633,6 +7722,7 @@ fn schema_cols_for_tos(
                     hidden_rowid: true,
                     omit_from_star: false,
                     merged_using: false,
+                    is_vtab: false,
                 });
             }
             Some(cols)
@@ -7660,6 +7750,7 @@ fn schema_cols_for_tos(
                             hidden_rowid: false,
                             omit_from_star: false,
                             merged_using: false,
+                            is_vtab: false,
                         }
                     })
                     .collect(),
@@ -9456,6 +9547,7 @@ fn static_view_scoped_cols(
                         hidden_rowid: false,
                         omit_from_star: false,
                         merged_using: false,
+                        is_vtab: false,
                     }
                 })
                 .collect(),
@@ -9477,6 +9569,7 @@ fn static_view_scoped_cols(
                         hidden_rowid: false,
                         omit_from_star: false,
                         merged_using: false,
+                        is_vtab: false,
                     }
                 })
                 .collect(),
@@ -9519,6 +9612,7 @@ fn static_view_scoped_cols(
                     hidden_rowid: false,
                     omit_from_star: false,
                     merged_using: false,
+                    is_vtab: false,
                 }
             })
             .collect(),
@@ -9598,6 +9692,7 @@ fn static_schema_cols_for_tos(
                                 hidden_rowid: false,
                                 omit_from_star: false,
                                 merged_using: false,
+                                is_vtab: false,
                             }
                         })
                         .collect(),
@@ -9629,6 +9724,7 @@ fn static_schema_cols_for_tos(
                     hidden_rowid: false,
                     omit_from_star: false,
                     merged_using: false,
+                    is_vtab: false,
                 })
                 .collect();
             if !tbl.without_rowid {
@@ -9646,6 +9742,7 @@ fn static_schema_cols_for_tos(
                     hidden_rowid: true,
                     omit_from_star: false,
                     merged_using: false,
+                    is_vtab: false,
                 });
             }
             Some(cols)
@@ -9678,6 +9775,7 @@ fn static_schema_cols_for_tos(
                             hidden_rowid: false,
                             omit_from_star: false,
                             merged_using: false,
+                            is_vtab: false,
                         }
                     })
                     .collect(),
@@ -9953,9 +10051,9 @@ fn eval_expr_rt(
             }
             if cref.schema.as_deref() == Some(STAR_SLOT_SCHEMA) {
                 if let Some(last_scope) = scopes.last()
-                    && let Some((val, _)) = last_scope.lookup_cref(cref)?
+                    && let Some(rv) = last_scope.lookup_cref_rt(cref)?
                 {
-                    return Ok(RuntimeValue::plain(val));
+                    return Ok(rv);
                 }
                 return Err(SqliteError::new(
                     ErrorCode::Error,
@@ -9963,8 +10061,8 @@ fn eval_expr_rt(
                 ));
             }
             for scope in scopes.iter().rev() {
-                if let Some((val, _)) = scope.lookup_cref(cref)? {
-                    return Ok(RuntimeValue::plain(val));
+                if let Some(rv) = scope.lookup_cref_rt(cref)? {
+                    return Ok(rv);
                 }
             }
             if ctx.db_set.dqs_dml() && cref.schema.is_none() && cref.table.is_none() {
@@ -10568,6 +10666,15 @@ fn eval_expr_rt(
             if matches!(op, LikeOp::Regexp | LikeOp::Match)
                 || ctx.functions.find_scalar(fname, argc).is_some()
             {
+                if *op == LikeOp::Match
+                    && !ctx.functions.has_scalar_name("match")
+                    && expr_is_vtab_column_in_scopes(txt_e, scopes)
+                {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "unable to use function MATCH in the requested context",
+                    ));
+                }
                 // Lower `X [NOT] <OP> Y [ESCAPE E]` to `[NOT] <op>(Y, X [, E])` (`sqlite/src/parse.y`).
                 ctx.functions
                     .validate_call(fname, false, argc, false, false, false)?;
@@ -10811,6 +10918,8 @@ fn eval_expr_rt(
                     }
                     return Ok(RuntimeValue::plain(best.unwrap_or(Value::Null)));
                 }
+                let agg_flags = agg_kind.function_flags();
+                let preserve_arg_subtype = agg_flags.contains(FunctionFlags::SUBTYPE);
                 let mut custom_distinct_seen: Vec<Value> = Vec::new();
                 let mut acc = AggregateAccumulator::new_with_collation(
                     agg_kind,
@@ -10827,21 +10936,25 @@ fn eval_expr_rt(
                         }
                     }
                     if is_star {
-                        acc.step(&[])?;
+                        acc.step_rt(&[])?;
                     } else if let FunctionArgs::Exprs(es) = args {
                         let mut a_vals = Vec::with_capacity(es.len());
                         for ae in es {
-                            a_vals.push(eval_expr(ctx, ae, params, &row_scopes, ctes, None)?);
+                            let mut rv = eval_expr_rt(ctx, ae, params, &row_scopes, ctes, None)?;
+                            if !preserve_arg_subtype {
+                                rv.subtype = 0;
+                            }
+                            a_vals.push(rv);
                         }
                         if *distinct
                             && let (Some(spec), Some(first)) = (&custom_spec_opt, a_vals.first())
                         {
-                            if first.is_null() {
+                            if first.value.is_null() {
                                 continue;
                             }
                             let mut is_dup = false;
                             for prev in &custom_distinct_seen {
-                                if prev.cmp_sqlite_fallible(first, spec, enc)?.is_eq() {
+                                if prev.cmp_sqlite_fallible(&first.value, spec, enc)?.is_eq() {
                                     is_dup = true;
                                     break;
                                 }
@@ -10849,12 +10962,12 @@ fn eval_expr_rt(
                             if is_dup {
                                 continue;
                             }
-                            custom_distinct_seen.push(first.clone());
+                            custom_distinct_seen.push(first.value.clone());
                         }
-                        acc.step(&a_vals)?;
+                        acc.step_rt(&a_vals)?;
                     }
                 }
-                return acc.finalize().map(RuntimeValue::plain);
+                return acc.finalize_rt();
             }
 
             if let FunctionArgs::Exprs(es) = args
@@ -11975,6 +12088,7 @@ fn make_single_table_scope(
             hidden_rowid: false,
             omit_from_star: false,
             merged_using: false,
+            is_vtab: false,
         })
         .collect();
     let mut row_vals = vals.to_vec();
@@ -11989,6 +12103,7 @@ fn make_single_table_scope(
             hidden_rowid: true,
             omit_from_star: false,
             merged_using: false,
+            is_vtab: false,
         });
         row_vals.push(Value::Integer(rowid));
     }
@@ -12012,6 +12127,7 @@ fn make_returning_table_scope(tbl: &TableSchema, rowid: i64, vals: &[Value]) -> 
             hidden_rowid: false,
             omit_from_star: false,
             merged_using: false,
+            is_vtab: false,
         })
         .collect();
     let mut row_vals = vals.to_vec();
@@ -12026,6 +12142,7 @@ fn make_returning_table_scope(tbl: &TableSchema, rowid: i64, vals: &[Value]) -> 
             hidden_rowid: true,
             omit_from_star: false,
             merged_using: false,
+            is_vtab: false,
         });
         row_vals.push(Value::Integer(rowid));
     }
@@ -12048,6 +12165,7 @@ fn make_excluded_table_scope(tbl: &TableSchema, rowid: i64, vals: &[Value]) -> E
             hidden_rowid: false,
             omit_from_star: false,
             merged_using: false,
+            is_vtab: false,
         })
         .collect();
     let mut row_vals = vals.to_vec();
@@ -12062,12 +12180,14 @@ fn make_excluded_table_scope(tbl: &TableSchema, rowid: i64, vals: &[Value]) -> E
             hidden_rowid: true,
             omit_from_star: false,
             merged_using: false,
+            is_vtab: false,
         });
         row_vals.push(Value::Integer(rowid));
     }
     EvalRow {
         cols: cols.into(),
         vals: row_vals,
+        subtypes: Rc::from([]),
         win_vals: Rc::from([]),
         agg_group_rows: None,
         qualified_only: true,
@@ -12521,6 +12641,7 @@ fn make_runtime_table_pseudo_scope(
                 hidden_rowid: false,
                 omit_from_star: false,
                 merged_using: false,
+                is_vtab: false,
             });
             vals.push(rvals.get(i).cloned().unwrap_or(Value::Null));
         }
@@ -12535,6 +12656,7 @@ fn make_runtime_table_pseudo_scope(
                 hidden_rowid: true,
                 omit_from_star: false,
                 merged_using: false,
+                is_vtab: false,
             });
             vals.push(Value::Integer(rowid));
         }
@@ -12548,6 +12670,7 @@ fn make_runtime_table_pseudo_scope(
     Box::new(EvalRow {
         cols: cols.into(),
         vals,
+        subtypes: Rc::from([]),
         win_vals: Rc::from([]),
         agg_group_rows: None,
         qualified_only: true,
@@ -12574,6 +12697,7 @@ fn make_runtime_view_pseudo_scope(
                 hidden_rowid: false,
                 omit_from_star: false,
                 merged_using: false,
+                is_vtab: false,
             });
             vals.push(rvals.get(i).cloned().unwrap_or(Value::Null));
         }
@@ -12587,6 +12711,7 @@ fn make_runtime_view_pseudo_scope(
     Box::new(EvalRow {
         cols: cols.into(),
         vals,
+        subtypes: Rc::from([]),
         win_vals: Rc::from([]),
         agg_group_rows: None,
         qualified_only: true,
@@ -12611,6 +12736,7 @@ fn make_returning_view_scope(
             hidden_rowid: false,
             omit_from_star: false,
             merged_using: false,
+            is_vtab: false,
         });
         rvals.push(vals.get(i).cloned().unwrap_or(Value::Null));
     }
@@ -16740,6 +16866,7 @@ fn make_single_view_scope(
             hidden_rowid: false,
             omit_from_star: false,
             merged_using: false,
+            is_vtab: false,
         });
         rvals.push(vals.get(i).cloned().unwrap_or(Value::Null));
     }
@@ -18398,12 +18525,79 @@ fn run_view_insert_loop(
     })
 }
 
+fn conflict_action_to_vtab_mode(act: Option<ConflictAction>) -> sqliters_types::VTabConflictMode {
+    match act {
+        Some(ConflictAction::Rollback) => sqliters_types::VTabConflictMode::Rollback,
+        Some(ConflictAction::Ignore) => sqliters_types::VTabConflictMode::Ignore,
+        Some(ConflictAction::Fail) => sqliters_types::VTabConflictMode::Fail,
+        Some(ConflictAction::Replace) => sqliters_types::VTabConflictMode::Replace,
+        Some(ConflictAction::Abort) | None => sqliters_types::VTabConflictMode::Abort,
+    }
+}
+
+fn eval_rtreecheck_in_engine(
+    ctx: &mut ExecContext<'_>,
+    args: &[RuntimeValue],
+) -> Result<RuntimeValue> {
+    let (db_name, tbl_name) = match args.len() {
+        1 => ("main".to_owned(), args[0].value.to_text_lossy()),
+        2 => (args[0].value.to_text_lossy(), args[1].value.to_text_lossy()),
+        _ => {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                "wrong number of arguments to function rtreecheck()",
+            ));
+        }
+    };
+    let Some(db_id) = ctx.db_set.find_db_id(&db_name) else {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("no such table: {db_name}.{tbl_name}"),
+        ));
+    };
+    ctx.ensure_read_db(db_id, true)?;
+    let vt_info = ctx
+        .db_set
+        .slot(db_id)
+        .and_then(|s| s.schema.find_virtual_table(&tbl_name).cloned());
+    let (n_dim, is_int) = if let Some(vt) = vt_info {
+        let is_rtree = vt.module_name.eq_ignore_ascii_case("rtree");
+        let is_rtree_i32 = vt.module_name.eq_ignore_ascii_case("rtree_i32");
+        if !is_rtree && !is_rtree_i32 {
+            (0usize, false)
+        } else {
+            let coord_cols = vt
+                .args
+                .iter()
+                .skip(1)
+                .take_while(|a| !a.trim_start().starts_with('+'))
+                .count();
+            if coord_cols.is_multiple_of(2) {
+                (coord_cols / 2, is_rtree_i32)
+            } else {
+                (0usize, is_rtree_i32)
+            }
+        }
+    } else {
+        (0usize, false)
+    };
+    let report = sqliters_ext::run_rtreecheck(
+        |sql, p| query_internal_vtab_sql(ctx, sql, p),
+        &db_name,
+        &tbl_name,
+        n_dim,
+        is_int,
+    )?;
+    Ok(RuntimeValue::plain(Value::Text(report)))
+}
+
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn run_vtab_insert_loop(
     ctx: &mut ExecContext<'_>,
     mut p: Box<PreparedVTabInsert<'_>>,
     ins: &InsertStmt,
+    effective_or_conflict: Option<ConflictAction>,
     params: &[Value],
     outer_scopes: &[EvalRow],
     stmt_changes: &mut u64,
@@ -18488,7 +18682,8 @@ fn run_vtab_insert_loop(
             explicit_rowid = Some(col_vals[pk_ci].clone());
         }
 
-        let maybe_rowid = crate::vtab::vtab_perform_update(
+        let vtab_conflict = conflict_action_to_vtab_mode(effective_or_conflict);
+        let upd_res = crate::vtab::vtab_perform_update_with_conflict(
             ctx,
             &p.db_name,
             &p.table_name,
@@ -18496,6 +18691,7 @@ fn run_vtab_insert_loop(
                 new_rowid: explicit_rowid.clone(),
                 values: col_vals.clone(),
             },
+            vtab_conflict,
         )
         .map_err(|e| {
             if e.code == ErrorCode::ReadOnly && e.message == "virtual table is read-only" {
@@ -18506,7 +18702,19 @@ fn run_vtab_insert_loop(
             } else {
                 e
             }
-        })?;
+        });
+        let maybe_rowid = match upd_res {
+            Ok(mr) => mr,
+            Err(e)
+                if p.declared.constraint_support
+                    && vtab_conflict == sqliters_types::VTabConflictMode::Ignore
+                    && e.code == ErrorCode::Constraint =>
+            {
+                row_idx += 1;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
 
         let final_rowid = maybe_rowid
             .or_else(|| explicit_rowid.as_ref().and_then(Value::as_i64))
@@ -18587,6 +18795,7 @@ fn exec_insert_internal(
             ctx,
             p,
             ins,
+            effective_or_conflict,
             params,
             outer_scopes,
             &mut stmt_changes,
@@ -19793,6 +20002,7 @@ fn run_view_update_loop(
 fn run_vtab_update_loop(
     ctx: &mut ExecContext<'_>,
     mut p: Box<PreparedVTabUpdate<'_>>,
+    effective_or_conflict: Option<ConflictAction>,
     params: &[Value],
     outer_scopes: &[EvalRow],
     stmt_changes: &mut u64,
@@ -19922,7 +20132,8 @@ fn run_vtab_update_loop(
             explicit_rowid_val.unwrap_or_else(|| old_key.clone())
         };
 
-        let _ = crate::vtab::vtab_perform_update(
+        let vtab_conflict = conflict_action_to_vtab_mode(effective_or_conflict);
+        let upd_res = crate::vtab::vtab_perform_update_with_conflict(
             ctx,
             &p.db_name,
             &p.table_name,
@@ -19931,6 +20142,7 @@ fn run_vtab_update_loop(
                 new_rowid: new_key.clone(),
                 values: new_vals.clone(),
             },
+            vtab_conflict,
         )
         .map_err(|e| {
             if e.code == ErrorCode::ReadOnly && e.message == "virtual table is read-only" {
@@ -19941,7 +20153,18 @@ fn run_vtab_update_loop(
             } else {
                 e
             }
-        })?;
+        });
+        match upd_res {
+            Ok(_) => {}
+            Err(e)
+                if p.declared.constraint_support
+                    && vtab_conflict == sqliters_types::VTabConflictMode::Ignore
+                    && e.code == ErrorCode::Constraint =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
 
         *stmt_changes += 1;
         *count_changes_rows += 1;
@@ -20011,6 +20234,7 @@ fn exec_update_internal(
         Ok(PreparedUpdate::VirtualTable(p)) => run_vtab_update_loop(
             ctx,
             p,
+            effective_or_conflict,
             params,
             outer_scopes,
             &mut stmt_changes,
@@ -22981,6 +23205,7 @@ fn make_static_trigger_pseudo_scope(
                 hidden_rowid: false,
                 omit_from_star: false,
                 merged_using: false,
+                is_vtab: false,
             });
         }
         if has_hidden_rowid {
@@ -22994,6 +23219,7 @@ fn make_static_trigger_pseudo_scope(
                 hidden_rowid: true,
                 omit_from_star: false,
                 merged_using: false,
+                is_vtab: false,
             });
         }
     };
@@ -23009,6 +23235,7 @@ fn make_static_trigger_pseudo_scope(
     EvalRow {
         cols: pseudo_cols.into(),
         vals: vec![Value::Null; n],
+        subtypes: Rc::from([]),
         win_vals: Rc::from([]),
         agg_group_rows: None,
         qualified_only: true,
@@ -23044,6 +23271,7 @@ fn resolve_trigger_step_target_scope_static(
                     hidden_rowid: false,
                     omit_from_star: false,
                     merged_using: false,
+                    is_vtab: false,
                 });
             }
             Ok((scope, excl_cols))
@@ -23072,6 +23300,7 @@ fn resolve_trigger_step_target_scope_static(
                     hidden_rowid: false,
                     omit_from_star: false,
                     merged_using: false,
+                    is_vtab: false,
                 });
                 excl_cols.push(ScopedColumn {
                     schema_name: None,
@@ -23083,6 +23312,7 @@ fn resolve_trigger_step_target_scope_static(
                     hidden_rowid: false,
                     omit_from_star: false,
                     merged_using: false,
+                    is_vtab: false,
                 });
             }
             let n = scols.len();
@@ -23287,6 +23517,7 @@ fn validate_single_trigger_definition(
                     let excluded_scope = EvalRow {
                         cols: excl_cols.into(),
                         vals: vec![Value::Null; excl_n],
+                        subtypes: Rc::from([]),
                         win_vals: Rc::from([]),
                         agg_group_rows: None,
                         qualified_only: true,
@@ -30458,7 +30689,7 @@ fn exec_pragma(
                     {
                         continue;
                     }
-                    let ttype = if ctx.db_set.is_shadow_table_in_db(cur_id, &tbl.name) {
+                    let ttype = if ctx.db_set.is_shadow_table_metadata(cur_id, &tbl.name) {
                         "shadow"
                     } else {
                         "table"
@@ -35968,7 +36199,9 @@ fn expr_has_agg_owned_by_target(
                 true
             } else {
                 match name.to_ascii_uppercase().as_str() {
-                    "COUNT" | "SUM" | "TOTAL" | "AVG" | "GROUP_CONCAT" | "STRING_AGG" => true,
+                    "COUNT" | "SUM" | "TOTAL" | "AVG" | "GROUP_CONCAT" | "STRING_AGG"
+                    | "JSON_GROUP_ARRAY" | "JSONB_GROUP_ARRAY" | "JSON_GROUP_OBJECT"
+                    | "JSONB_GROUP_OBJECT" => true,
                     "MIN" | "MAX" => arg_count == 1,
                     _ => false,
                 }
@@ -36592,7 +36825,9 @@ fn first_regular_agg_in_order_by(
                 true
             } else {
                 match name.to_ascii_uppercase().as_str() {
-                    "COUNT" | "SUM" | "TOTAL" | "AVG" | "GROUP_CONCAT" | "STRING_AGG" => true,
+                    "COUNT" | "SUM" | "TOTAL" | "AVG" | "GROUP_CONCAT" | "STRING_AGG"
+                    | "JSON_GROUP_ARRAY" | "JSONB_GROUP_ARRAY" | "JSON_GROUP_OBJECT"
+                    | "JSONB_GROUP_OBJECT" => true,
                     "MIN" | "MAX" => arg_count == 1,
                     _ => false,
                 }
@@ -37229,6 +37464,7 @@ fn validate_tos_static(
                             hidden_rowid: false,
                             omit_from_star: false,
                             merged_using: false,
+                            is_vtab: false,
                         }
                     })
                     .collect());
@@ -37267,6 +37503,7 @@ fn validate_tos_static(
                             hidden_rowid: false,
                             omit_from_star: false,
                             merged_using: false,
+                            is_vtab: false,
                         }
                     })
                     .collect());
@@ -37315,6 +37552,7 @@ fn validate_tos_static(
                     hidden_rowid: false,
                     omit_from_star: false,
                     merged_using: false,
+                    is_vtab: false,
                 })
                 .collect();
             if !tbl.without_rowid {
@@ -37332,6 +37570,7 @@ fn validate_tos_static(
                     hidden_rowid: true,
                     omit_from_star: false,
                     merged_using: false,
+                    is_vtab: false,
                 });
             }
             Ok(cols)
@@ -37366,6 +37605,7 @@ fn validate_tos_static(
                         hidden_rowid: false,
                         omit_from_star: false,
                         merged_using: false,
+                        is_vtab: false,
                     }
                 })
                 .collect())
@@ -37594,6 +37834,21 @@ fn resolve_cte_columns_static(
 
     visited_ctes.pop();
     res
+}
+
+fn expr_is_vtab_column_in_scopes(mut expr: &Expr, scopes: &[EvalRow]) -> bool {
+    while let Expr::Collate { expr: inner, .. } = expr {
+        expr = inner;
+    }
+    let Expr::Column(cref) = expr else {
+        return false;
+    };
+    for scope in scopes.iter().rev() {
+        if let Ok(Some(_)) = scope.lookup_cref(cref) {
+            return scope.lookup_cref_is_vtab(cref);
+        }
+    }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -38147,9 +38402,15 @@ fn validate_expr_static_with_win_stage(
                 LikeOp::Match => "match",
             };
             let argc = if escape.is_some() { 3 } else { 2 };
-            if matches!(op, LikeOp::Regexp | LikeOp::Match)
-                || functions.find_scalar(fname, argc).is_some()
-                || (matches!(op, LikeOp::Like | LikeOp::Glob) && functions.has_scalar_name(fname))
+            let is_vtab_match = *op == LikeOp::Match
+                && escape.is_none()
+                && !functions.has_scalar_name("match")
+                && expr_is_vtab_column_in_scopes(txt_e, scopes);
+            if !is_vtab_match
+                && (matches!(op, LikeOp::Regexp | LikeOp::Match)
+                    || functions.find_scalar(fname, argc).is_some()
+                    || (matches!(op, LikeOp::Like | LikeOp::Glob)
+                        && functions.has_scalar_name(fname)))
             {
                 functions.validate_call(fname, false, argc, false, false, false)?;
             }
@@ -38435,7 +38696,9 @@ fn validate_expr_static_with_win_stage(
                 true
             } else {
                 match upper.as_str() {
-                    "COUNT" | "SUM" | "TOTAL" | "AVG" | "GROUP_CONCAT" | "STRING_AGG" => true,
+                    "COUNT" | "SUM" | "TOTAL" | "AVG" | "GROUP_CONCAT" | "STRING_AGG"
+                    | "JSON_GROUP_ARRAY" | "JSONB_GROUP_ARRAY" | "JSON_GROUP_OBJECT"
+                    | "JSONB_GROUP_OBJECT" => true,
                     "MIN" | "MAX" => arg_count == 1,
                     _ => false,
                 }

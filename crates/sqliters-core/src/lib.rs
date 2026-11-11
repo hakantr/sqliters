@@ -25,7 +25,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use sqliters_btree::{Btree, BtreeCursorState, CursorId};
-pub use sqliters_ext::GenerateSeriesModule;
+pub use sqliters_ext::{
+    Fts5AuxRegistry, Fts5Module, Fts5VocabModule, GenerateSeriesModule, JsonEachModule,
+    JsonTreeModule, JsonbEachModule, JsonbTreeModule, RTreeCoordMode, RTreeModule,
+};
 pub use sqliters_pager::{
     AutoVacuumMode, DatabaseHeader, JournalMode, LockingMode, WalCheckpointMode,
     WalCheckpointResult,
@@ -39,8 +42,8 @@ pub use sqliters_syntax::{ColumnRef, QualifiedName};
 pub use sqliters_types::{
     AggregateStepId, CustomCollation, DatabaseId, ExecutionServices, FunctionFlags, MAX_DB_SLOTS,
     RowMutationEvent, RowMutationOp, RuntimeValue, SQLITE_MAX_ATTACHED, VTabConfigOption,
-    VTabConstraint, VTabConstraintOp, VTabConstraintUsage, VTabHostContext, VTabIndexInfo,
-    VTabOrderBy, VTabRiskFlags, VTabUpdateOperation, VirtualCursor, VirtualTable,
+    VTabConflictMode, VTabConstraint, VTabConstraintOp, VTabConstraintUsage, VTabHostContext,
+    VTabIndexInfo, VTabOrderBy, VTabRiskFlags, VTabUpdateOperation, VirtualCursor, VirtualTable,
     VirtualTableModule,
 };
 use sqliters_types::{
@@ -114,6 +117,79 @@ impl Drop for ActiveConnStackGuard {
             {
                 s.remove(pos);
             }
+        });
+    }
+}
+
+fn register_builtin_extension_functions(
+    functions: &mut FunctionRegistry,
+    fts5_aux: Arc<Fts5AuxRegistry>,
+) {
+    let aux_bm25 = Arc::clone(&fts5_aux);
+    functions.register_scalar("bm25", None, FunctionFlags::INNOCUOUS, move |args| {
+        let vals: Vec<Value> = args.iter().map(|rv| rv.value.clone()).collect();
+        Ok(RuntimeValue::plain(aux_bm25.eval_bm25(&vals)?))
+    });
+
+    let aux_hl = Arc::clone(&fts5_aux);
+    functions.register_scalar(
+        "highlight",
+        Some(4),
+        FunctionFlags::INNOCUOUS,
+        move |args| {
+            let vals: Vec<Value> = args.iter().map(|rv| rv.value.clone()).collect();
+            Ok(RuntimeValue::plain(aux_hl.eval_highlight(&vals)?))
+        },
+    );
+
+    let aux_snip = fts5_aux;
+    functions.register_scalar("snippet", Some(6), FunctionFlags::INNOCUOUS, move |args| {
+        let vals: Vec<Value> = args.iter().map(|rv| rv.value.clone()).collect();
+        Ok(RuntimeValue::plain(aux_snip.eval_snippet(&vals)?))
+    });
+
+    functions.register_scalar(
+        "fts5_source_id",
+        Some(0),
+        FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS,
+        |_args| Ok(RuntimeValue::plain(Fts5AuxRegistry::eval_fts5_source_id())),
+    );
+
+    functions.register_scalar("fts5", Some(1), FunctionFlags::INNOCUOUS, |args| {
+        Ok(RuntimeValue::plain(Fts5AuxRegistry::eval_fts5_ptr_func(
+            &args[0].value,
+        )))
+    });
+
+    functions.register_scalar(
+        "rtreedepth",
+        Some(1),
+        FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS,
+        |args| {
+            Ok(RuntimeValue::plain(sqliters_ext::eval_rtreedepth(
+                &args[0].value,
+            )?))
+        },
+    );
+
+    functions.register_scalar(
+        "rtreenode",
+        Some(2),
+        FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS,
+        |args| {
+            Ok(RuntimeValue::plain(sqliters_ext::eval_rtreenode(
+                &args[0].value,
+                &args[1].value,
+            )?))
+        },
+    );
+
+    for arity in [1usize, 2usize] {
+        functions.register_scalar("rtreecheck", Some(arity), FunctionFlags::INNOCUOUS, |_| {
+            Err(SqliteError::new(
+                ErrorCode::Internal,
+                "__sqliters_builtin_rtreecheck__",
+            ))
         });
     }
 }
@@ -2458,6 +2534,10 @@ impl Connection {
             Arc::clone(&interrupt_flag),
         );
 
+        let fts5_aux = db_set.vtab_registry().fts5_aux_registry();
+        let mut functions = FunctionRegistry::default();
+        register_builtin_extension_functions(&mut functions, fts5_aux);
+
         let inner = ConnectionInner {
             db_set,
             connection_encoding,
@@ -2468,7 +2548,7 @@ impl Connection {
             savepoints: Vec::new(),
             runtime: VmRuntimeContext::default(),
             active_interrupt_flag: Arc::clone(&interrupt_flag),
-            functions: FunctionRegistry::default(),
+            functions,
             collations: CollationRegistry::default(),
             progress: ProgressTracker::default(),
             commit_hooks: CommitCoordinatorHooks::default(),

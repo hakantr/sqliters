@@ -49,6 +49,11 @@ fn next_prng_u64() -> u64 {
     next
 }
 
+use sqliters_types::json::{
+    EditMode, JsonGroupAccum, eval_json, eval_json_array, eval_json_array_length, eval_json_arrow,
+    eval_json_edit, eval_json_error_position, eval_json_extract, eval_json_object, eval_json_patch,
+    eval_json_pretty, eval_json_quote, eval_json_remove, eval_json_type, eval_json_valid,
+};
 use sqliters_types::{
     AggregateStepId, Collation, ErrorCode, FunctionFlags, Result, RuntimeValue, SQLITE_SOURCE_ID,
     SQLITE_VERSION, SqliteError, TextEncoding, Value, enforce_result_subtype_contract,
@@ -135,12 +140,18 @@ pub fn builtin_scalar_flags(name: &str, enable_test_functions: bool) -> Option<F
             Some(FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS | FunctionFlags::SUBTYPE)
         }
         "COALESCE" | "IFNULL" | "NULLIF" | "IIF" | "IF" | "MIN" | "MAX" | "LIKELY" | "UNLIKELY"
-        | "LIKELIHOOD" | "->" | "->>" => Some(
+        | "LIKELIHOOD" | "->" | "->>" | "JSON" | "JSON_ARRAY" | "JSON_ARRAY_INSERT"
+        | "JSON_EXTRACT" | "JSON_INSERT" | "JSON_OBJECT" | "JSON_PATCH" | "JSON_QUOTE"
+        | "JSON_REMOVE" | "JSON_REPLACE" | "JSON_SET" => Some(
             FunctionFlags::DETERMINISTIC
                 | FunctionFlags::INNOCUOUS
                 | FunctionFlags::SUBTYPE
                 | FunctionFlags::RESULT_SUBTYPE,
         ),
+        "JSONB_ARRAY" | "JSONB_ARRAY_INSERT" | "JSONB_INSERT" | "JSONB_OBJECT"
+        | "JSONB_REPLACE" | "JSONB_SET" => {
+            Some(FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS | FunctionFlags::SUBTYPE)
+        }
         "TEST_SET_SUBTYPE" if enable_test_functions => Some(
             FunctionFlags::DETERMINISTIC | FunctionFlags::SUBTYPE | FunctionFlags::RESULT_SUBTYPE,
         ),
@@ -318,7 +329,70 @@ pub fn eval_scalar_function_rt_with_strict(
         }
         "->" | "->>" => {
             check_arity_rt(name, filtered, 2, 2)?;
-            eval_json_arrow_operator(&filtered[0].value, &filtered[1].value, upper == "->>")?
+            eval_json_arrow(&filtered[0].value, &filtered[1].value, upper == "->>")?
+        }
+        "JSON" | "JSONB" => {
+            check_arity_rt(name, filtered, 1, 1)?;
+            eval_json(&filtered[0], upper == "JSONB")?
+        }
+        "JSON_ARRAY" | "JSONB_ARRAY" => eval_json_array(filtered, upper == "JSONB_ARRAY")?,
+        "JSON_OBJECT" | "JSONB_OBJECT" => eval_json_object(filtered, upper == "JSONB_OBJECT")?,
+        "JSON_QUOTE" => {
+            check_arity_rt(name, filtered, 1, 1)?;
+            eval_json_quote(&filtered[0])?
+        }
+        "JSON_ARRAY_LENGTH" => {
+            check_arity_rt(name, filtered, 1, 2)?;
+            eval_json_array_length(filtered)?
+        }
+        "JSON_TYPE" => {
+            check_arity_rt(name, filtered, 1, 2)?;
+            eval_json_type(filtered)?
+        }
+        "JSON_VALID" => {
+            check_arity_rt(name, filtered, 1, 2)?;
+            eval_json_valid(filtered)?
+        }
+        "JSON_ERROR_POSITION" => {
+            check_arity_rt(name, filtered, 1, 1)?;
+            eval_json_error_position(&filtered[0])?
+        }
+        "JSON_EXTRACT" | "JSONB_EXTRACT" => {
+            check_arity_rt(name, filtered, 2, usize::MAX)?;
+            eval_json_extract(filtered, upper == "JSONB_EXTRACT")?
+        }
+        "JSON_INSERT" | "JSONB_INSERT" => {
+            check_arity_rt(name, filtered, 1, usize::MAX)?;
+            eval_json_edit(name, filtered, EditMode::Insert, upper == "JSONB_INSERT")?
+        }
+        "JSON_REPLACE" | "JSONB_REPLACE" => {
+            check_arity_rt(name, filtered, 1, usize::MAX)?;
+            eval_json_edit(name, filtered, EditMode::Replace, upper == "JSONB_REPLACE")?
+        }
+        "JSON_SET" | "JSONB_SET" => {
+            check_arity_rt(name, filtered, 1, usize::MAX)?;
+            eval_json_edit(name, filtered, EditMode::Set, upper == "JSONB_SET")?
+        }
+        "JSON_ARRAY_INSERT" | "JSONB_ARRAY_INSERT" => {
+            check_arity_rt(name, filtered, 1, usize::MAX)?;
+            eval_json_edit(
+                name,
+                filtered,
+                EditMode::ArrayInsert,
+                upper == "JSONB_ARRAY_INSERT",
+            )?
+        }
+        "JSON_REMOVE" | "JSONB_REMOVE" => {
+            check_arity_rt(name, filtered, 1, usize::MAX)?;
+            eval_json_remove(filtered, upper == "JSONB_REMOVE")?
+        }
+        "JSON_PATCH" | "JSONB_PATCH" => {
+            check_arity_rt(name, filtered, 2, 2)?;
+            eval_json_patch(&filtered[0], &filtered[1], upper == "JSONB_PATCH")?
+        }
+        "JSON_PRETTY" => {
+            check_arity_rt(name, filtered, 1, 2)?;
+            eval_json_pretty(filtered)?
         }
         _ => {
             let plain_vals: Vec<Value> = filtered.iter().map(|rv| rv.value.clone()).collect();
@@ -826,25 +900,45 @@ fn scalar_function_arity_with_flag(
     enable_test_functions: bool,
 ) -> Option<(usize, usize)> {
     match upper {
-        "TYPEOF" | "SUBTYPE" | "ABS" | "SIGN" | "LENGTH" | "OCTET_LENGTH" | "LOWER" | "UPPER"
-        | "HEX" | "UNHEX" | "UNICODE" | "QUOTE" | "ZEROBLOB" | "RANDOMBLOB" | "LIKELY"
-        | "UNLIKELY" => Some((1, 1)),
+        "TYPEOF"
+        | "SUBTYPE"
+        | "ABS"
+        | "SIGN"
+        | "LENGTH"
+        | "OCTET_LENGTH"
+        | "LOWER"
+        | "UPPER"
+        | "HEX"
+        | "UNHEX"
+        | "UNICODE"
+        | "QUOTE"
+        | "ZEROBLOB"
+        | "RANDOMBLOB"
+        | "LIKELY"
+        | "UNLIKELY"
+        | "JSON"
+        | "JSONB"
+        | "JSON_QUOTE"
+        | "JSON_ERROR_POSITION" => Some((1, 1)),
         "RANDOM" | "SQLITE_VERSION" | "SQLITE_SOURCE_ID" | "LAST_INSERT_ROWID" | "CHANGES"
         | "TOTAL_CHANGES" | "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" => Some((0, 0)),
-        "COALESCE" | "IIF" | "IF" => Some((2, usize::MAX)),
-        "IFNULL" | "NULLIF" | "INSTR" | "GLOB" | "LIKELIHOOD" | "->" | "->>" => Some((2, 2)),
+        "COALESCE" | "IIF" | "IF" | "JSON_EXTRACT" | "JSONB_EXTRACT" => Some((2, usize::MAX)),
+        "IFNULL" | "NULLIF" | "INSTR" | "GLOB" | "LIKELIHOOD" | "->" | "->>" | "JSON_PATCH"
+        | "JSONB_PATCH" => Some((2, 2)),
         "RANDSTR" | "TEST_SET_SUBTYPE" | "TEST_BAD_SUBTYPE" if enable_test_functions => {
             Some((2, 2))
         }
         "TEST_ERROR" if enable_test_functions => Some((1, 2)),
         "TEST_PLAIN_ARG_SUBTYPE" if enable_test_functions => Some((1, 1)),
         "REPLACE" => Some((3, 3)),
-        "TRIM" | "LTRIM" | "RTRIM" | "ROUND" => Some((1, 2)),
+        "TRIM" | "LTRIM" | "RTRIM" | "ROUND" | "JSON_ARRAY_LENGTH" | "JSON_TYPE" | "JSON_VALID"
+        | "JSON_PRETTY" => Some((1, 2)),
         "SUBSTR" | "SUBSTRING" | "LIKE" => Some((2, 3)),
-        "CHAR" | "DATE" | "TIME" | "DATETIME" | "UNIXEPOCH" | "JULIANDAY" | "STRFTIME" => {
-            Some((0, usize::MAX))
-        }
-        "PRINTF" | "FORMAT" => Some((1, usize::MAX)),
+        "CHAR" | "DATE" | "TIME" | "DATETIME" | "UNIXEPOCH" | "JULIANDAY" | "STRFTIME"
+        | "JSON_ARRAY" | "JSONB_ARRAY" | "JSON_OBJECT" | "JSONB_OBJECT" => Some((0, usize::MAX)),
+        "PRINTF" | "FORMAT" | "JSON_INSERT" | "JSONB_INSERT" | "JSON_REPLACE" | "JSONB_REPLACE"
+        | "JSON_SET" | "JSONB_SET" | "JSON_REMOVE" | "JSONB_REMOVE" | "JSON_ARRAY_INSERT"
+        | "JSONB_ARRAY_INSERT" => Some((1, usize::MAX)),
         _ => None,
     }
 }
@@ -918,11 +1012,32 @@ pub fn validate_function_call(
             }
             Ok(())
         }
-        "SUM" | "TOTAL" | "AVG" => {
+        "SUM" | "TOTAL" | "AVG" | "JSON_GROUP_ARRAY" | "JSONB_GROUP_ARRAY" => {
             if star_args || arg_count != 1 {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!("wrong number of arguments to function {name}()"),
+                ));
+            }
+            if !allow_aggregates {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("misuse of aggregate function {name}()"),
+                ));
+            }
+            Ok(())
+        }
+        "JSON_GROUP_OBJECT" | "JSONB_GROUP_OBJECT" => {
+            if star_args || arg_count != 2 {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("wrong number of arguments to function {name}()"),
+                ));
+            }
+            if distinct {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    "DISTINCT aggregates must have exactly one argument",
                 ));
             }
             if !allow_aggregates {
@@ -1489,6 +1604,10 @@ pub enum AggregateKind {
     Min,
     Max,
     GroupConcat,
+    JsonGroupArray,
+    JsonbGroupArray,
+    JsonGroupObject,
+    JsonbGroupObject,
 }
 
 impl AggregateKind {
@@ -1502,7 +1621,27 @@ impl AggregateKind {
             "MIN" => Some(Self::Min),
             "MAX" => Some(Self::Max),
             "GROUP_CONCAT" | "STRING_AGG" => Some(Self::GroupConcat),
+            "JSON_GROUP_ARRAY" => Some(Self::JsonGroupArray),
+            "JSONB_GROUP_ARRAY" => Some(Self::JsonbGroupArray),
+            "JSON_GROUP_OBJECT" => Some(Self::JsonGroupObject),
+            "JSONB_GROUP_OBJECT" => Some(Self::JsonbGroupObject),
             _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn function_flags(self) -> FunctionFlags {
+        match self {
+            Self::JsonGroupArray | Self::JsonGroupObject => {
+                FunctionFlags::DETERMINISTIC
+                    | FunctionFlags::INNOCUOUS
+                    | FunctionFlags::SUBTYPE
+                    | FunctionFlags::RESULT_SUBTYPE
+            }
+            Self::JsonbGroupArray | Self::JsonbGroupObject => {
+                FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS | FunctionFlags::SUBTYPE
+            }
+            _ => FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS,
         }
     }
 }
@@ -1667,6 +1806,7 @@ pub struct AggregateAccumulator {
     concat_buf: String,
     concat_count: usize,
     concat_sep_lens: VecDeque<usize>,
+    json_accum: Option<Box<JsonGroupAccum>>,
 }
 
 #[inline]
@@ -1683,6 +1823,13 @@ impl AggregateAccumulator {
     }
 
     pub fn new_with_collation(kind: AggregateKind, distinct: bool, collation: Collation) -> Self {
+        let json_accum = match kind {
+            AggregateKind::JsonGroupArray => Some(Box::new(JsonGroupAccum::new_array(false))),
+            AggregateKind::JsonbGroupArray => Some(Box::new(JsonGroupAccum::new_array(true))),
+            AggregateKind::JsonGroupObject => Some(Box::new(JsonGroupAccum::new_object(false))),
+            AggregateKind::JsonbGroupObject => Some(Box::new(JsonGroupAccum::new_object(true))),
+            _ => None,
+        };
         Self {
             kind,
             distinct,
@@ -1696,6 +1843,7 @@ impl AggregateAccumulator {
             concat_buf: String::new(),
             concat_count: 0,
             concat_sep_lens: VecDeque::new(),
+            json_accum,
         }
     }
 
@@ -1705,8 +1853,13 @@ impl AggregateAccumulator {
         self
     }
 
+    #[inline]
+    pub fn kind(&self) -> AggregateKind {
+        self.kind
+    }
+
     /// Returns `true` if this accumulator supports O(1) sliding-frame row removal via
-    /// [`Self::inverse`] (`xInverse` in `sqlite/src/func.c`).
+    /// [`Self::inverse`] (`xInverse` in `sqlite/src/func.c` / `json.c`).
     #[inline]
     pub fn supports_inverse(&self) -> bool {
         !self.distinct
@@ -1718,7 +1871,52 @@ impl AggregateAccumulator {
                     | AggregateKind::Total
                     | AggregateKind::Avg
                     | AggregateKind::GroupConcat
+                    | AggregateKind::JsonGroupArray
+                    | AggregateKind::JsonbGroupArray
+                    | AggregateKind::JsonGroupObject
+                    | AggregateKind::JsonbGroupObject
             )
+    }
+
+    /// Feeds one row with [`RuntimeValue`] subtype tags preserved (`JSON_SUBTYPE = 74`).
+    pub fn step_rt(&mut self, args: &[RuntimeValue]) -> Result<()> {
+        let coll = self.collation;
+        self.step_rt_with_cmp(args, |a, b| Ok(a.cmp_sqlite(b, coll)))
+    }
+
+    /// Feeds one row with [`RuntimeValue`] subtype tags preserved and a fallible comparator.
+    pub fn step_rt_with_cmp<F>(&mut self, args: &[RuntimeValue], cmp_fn: F) -> Result<()>
+    where
+        F: FnOnce(&Value, &Value) -> Result<std::cmp::Ordering>,
+    {
+        if let Some(jacc) = &mut self.json_accum {
+            if self.distinct {
+                let Some(first) = args.first().map(|rv| &rv.value) else {
+                    return Ok(());
+                };
+                if self.collation == Collation::Binary {
+                    let key = sqliters_types::encode_record(std::slice::from_ref(first));
+                    if !self.seen.insert(key) {
+                        return Ok(());
+                    }
+                } else {
+                    let already = if first.is_null() {
+                        self.seen_collated.iter().any(Value::is_null)
+                    } else {
+                        self.seen_collated
+                            .iter()
+                            .any(|v| !v.is_null() && v.cmp_sqlite(first, self.collation).is_eq())
+                    };
+                    if already {
+                        return Ok(());
+                    }
+                    self.seen_collated.push(first.clone());
+                }
+            }
+            return jacc.step(args);
+        }
+        let plain: Vec<Value> = args.iter().map(|rv| rv.value.clone()).collect();
+        self.step_with_cmp(&plain, cmp_fn)
     }
 
     pub fn step(&mut self, args: &[Value]) -> Result<()> {
@@ -1732,6 +1930,11 @@ impl AggregateAccumulator {
     where
         F: FnOnce(&Value, &Value) -> Result<std::cmp::Ordering>,
     {
+        if self.json_accum.is_some() {
+            let rt_args: Vec<RuntimeValue> =
+                args.iter().cloned().map(RuntimeValue::plain).collect();
+            return self.step_rt_with_cmp(&rt_args, cmp_fn);
+        }
         if self.kind == AggregateKind::CountStar {
             self.count += 1;
             return Ok(());
@@ -1806,8 +2009,27 @@ impl AggregateAccumulator {
                     self.concat_count += 1;
                 }
             }
+            AggregateKind::JsonGroupArray
+            | AggregateKind::JsonbGroupArray
+            | AggregateKind::JsonGroupObject
+            | AggregateKind::JsonbGroupObject => unreachable!(),
         }
         Ok(())
+    }
+
+    /// Removes a departing window-frame row with [`RuntimeValue`] args (`xInverse`).
+    pub fn inverse_rt(&mut self, args: &[RuntimeValue]) -> Result<()> {
+        if !self.supports_inverse() {
+            return Err(SqliteError::misuse(
+                "aggregate accumulator does not support inverse",
+            ));
+        }
+        if let Some(jacc) = &mut self.json_accum {
+            jacc.inverse();
+            return Ok(());
+        }
+        let plain: Vec<Value> = args.iter().map(|rv| rv.value.clone()).collect();
+        self.inverse(&plain)
     }
 
     /// Removes a departing window-frame row from this accumulator (`xInverse` in `sqlite/src/func.c`).
@@ -1816,6 +2038,10 @@ impl AggregateAccumulator {
             return Err(SqliteError::misuse(
                 "aggregate accumulator does not support inverse",
             ));
+        }
+        if let Some(jacc) = &mut self.json_accum {
+            jacc.inverse();
+            return Ok(());
         }
         match self.kind {
             AggregateKind::CountStar => {
@@ -1854,12 +2080,31 @@ impl AggregateAccumulator {
                     "min/max accumulator does not support inverse",
                 ));
             }
+            AggregateKind::JsonGroupArray
+            | AggregateKind::JsonbGroupArray
+            | AggregateKind::JsonGroupObject
+            | AggregateKind::JsonbGroupObject => unreachable!(),
         }
         Ok(())
     }
 
+    /// Reads the current window value with [`RuntimeValue`] subtype preserved (`xValue`).
+    pub fn value_rt(&self) -> Result<RuntimeValue> {
+        if let Some(jacc) = &self.json_accum {
+            return jacc.compute();
+        }
+        Ok(RuntimeValue::plain(self.value()?))
+    }
+
+    pub fn finalize_rt(&self) -> Result<RuntimeValue> {
+        self.value_rt()
+    }
+
     /// Reads the current window value without consuming or resetting accumulator state (`xValue`).
     pub fn value(&self) -> Result<Value> {
+        if let Some(jacc) = &self.json_accum {
+            return jacc.compute().map(|rv| rv.value);
+        }
         match self.kind {
             AggregateKind::CountStar | AggregateKind::Count => Ok(Value::Integer(self.count)),
             AggregateKind::Sum => {
@@ -1900,6 +2145,10 @@ impl AggregateAccumulator {
                     Ok(Value::Text(self.concat_buf.clone()))
                 }
             }
+            AggregateKind::JsonGroupArray
+            | AggregateKind::JsonbGroupArray
+            | AggregateKind::JsonGroupObject
+            | AggregateKind::JsonbGroupObject => unreachable!(),
         }
     }
 
@@ -1939,8 +2188,14 @@ impl AccumulatorTable {
             ("MIN", 1) => AggregateKind::Min,
             ("MAX", 1) => AggregateKind::Max,
             ("GROUP_CONCAT", 1 | 2) | ("STRING_AGG", 2) => AggregateKind::GroupConcat,
+            ("JSON_GROUP_ARRAY", 1) => AggregateKind::JsonGroupArray,
+            ("JSONB_GROUP_ARRAY", 1) => AggregateKind::JsonbGroupArray,
+            ("JSON_GROUP_OBJECT", 2) => AggregateKind::JsonGroupObject,
+            ("JSONB_GROUP_OBJECT", 2) => AggregateKind::JsonbGroupObject,
             (
-                "COUNT" | "SUM" | "TOTAL" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "STRING_AGG",
+                "COUNT" | "SUM" | "TOTAL" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "STRING_AGG"
+                | "JSON_GROUP_ARRAY" | "JSONB_GROUP_ARRAY" | "JSON_GROUP_OBJECT"
+                | "JSONB_GROUP_OBJECT",
                 _,
             ) => {
                 return Err(SqliteError::new(
@@ -1957,7 +2212,7 @@ impl AccumulatorTable {
         };
         let acc = AggregateAccumulator::new_with_collation(kind, distinct, collation)
             .with_encoding(encoding);
-        let flags = FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS;
+        let flags = kind.function_flags();
         let entry = (name.to_ascii_lowercase(), flags, acc);
         if let Some((idx, slot)) = self.slots.iter_mut().enumerate().find(|(_, s)| s.is_none()) {
             *slot = Some(entry);
@@ -1985,8 +2240,7 @@ impl AccumulatorTable {
         };
         let mut scratch = Vec::new();
         let filtered = strip_unsubscribed_subtypes(*flags, args, &mut scratch);
-        let plain: Vec<Value> = filtered.iter().map(|rv| rv.value.clone()).collect();
-        acc.step(&plain)
+        acc.step_rt(filtered)
     }
 
     pub fn value(&self, id: AggregateStepId, strict_subtype: bool) -> Result<RuntimeValue> {
@@ -1995,7 +2249,7 @@ impl AccumulatorTable {
                 "aggregate value on unopened accumulator",
             ));
         };
-        let rv = RuntimeValue::plain(acc.value()?);
+        let rv = acc.value_rt()?;
         enforce_result_subtype_contract(name, *flags, strict_subtype, rv)
     }
 
@@ -2007,8 +2261,7 @@ impl AccumulatorTable {
         };
         let mut scratch = Vec::new();
         let filtered = strip_unsubscribed_subtypes(*flags, args, &mut scratch);
-        let plain: Vec<Value> = filtered.iter().map(|rv| rv.value.clone()).collect();
-        acc.inverse(&plain)
+        acc.inverse_rt(filtered)
     }
 
     pub fn finalize(&mut self, id: AggregateStepId, strict_subtype: bool) -> Result<RuntimeValue> {
@@ -2022,476 +2275,7 @@ impl AccumulatorTable {
                 "aggregate finalize on unopened accumulator",
             ));
         };
-        let rv = RuntimeValue::plain(acc.finalize()?);
+        let rv = acc.finalize_rt()?;
         enforce_result_subtype_contract(&name, flags, strict_subtype, rv)
-    }
-}
-
-#[derive(Debug, Clone)]
-enum MiniJsonValue {
-    Null,
-    Bool(bool),
-    Int(i64),
-    Float(f64, String),
-    Str(String),
-    Array(Vec<MiniJsonValue>),
-    Object(Vec<(String, MiniJsonValue)>),
-}
-
-impl MiniJsonValue {
-    fn to_json_text(&self) -> String {
-        match self {
-            Self::Null => "null".to_owned(),
-            Self::Bool(b) => if *b { "true" } else { "false" }.to_owned(),
-            Self::Int(i) => i.to_string(),
-            Self::Float(_, raw) => raw.clone(),
-            Self::Str(s) => {
-                let mut out = String::with_capacity(s.len() + 2);
-                out.push('"');
-                for ch in s.chars() {
-                    match ch {
-                        '"' => out.push_str("\\\""),
-                        '\\' => out.push_str("\\\\"),
-                        '\x08' => out.push_str("\\b"),
-                        '\x0C' => out.push_str("\\f"),
-                        '\n' => out.push_str("\\n"),
-                        '\r' => out.push_str("\\r"),
-                        '\t' => out.push_str("\\t"),
-                        c if (c as u32) < 0x20 => {
-                            out.push_str(&format!("\\u{:04x}", c as u32));
-                        }
-                        c => out.push(c),
-                    }
-                }
-                out.push('"');
-                out
-            }
-            Self::Array(items) => {
-                let mut out = String::from("[");
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    out.push_str(&item.to_json_text());
-                }
-                out.push(']');
-                out
-            }
-            Self::Object(entries) => {
-                let mut out = String::from("{");
-                for (i, (k, v)) in entries.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    out.push_str(&Self::Str(k.clone()).to_json_text());
-                    out.push(':');
-                    out.push_str(&v.to_json_text());
-                }
-                out.push('}');
-                out
-            }
-        }
-    }
-}
-
-fn parse_mini_json(src: &str) -> Result<MiniJsonValue> {
-    let bytes = src.as_bytes();
-    let mut pos = 0usize;
-    let val = parse_mini_json_val(src, bytes, &mut pos)?;
-    skip_json_ws(bytes, &mut pos);
-    if pos != bytes.len() {
-        return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
-    }
-    Ok(val)
-}
-
-fn skip_json_ws(bytes: &[u8], pos: &mut usize) {
-    while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\n' | b'\r') {
-        *pos += 1;
-    }
-}
-
-fn parse_mini_json_val(src: &str, bytes: &[u8], pos: &mut usize) -> Result<MiniJsonValue> {
-    skip_json_ws(bytes, pos);
-    if *pos >= bytes.len() {
-        return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
-    }
-    match bytes[*pos] {
-        b'n' => {
-            if src[*pos..].starts_with("null") {
-                *pos += 4;
-                Ok(MiniJsonValue::Null)
-            } else {
-                Err(SqliteError::new(ErrorCode::Error, "malformed JSON"))
-            }
-        }
-        b't' => {
-            if src[*pos..].starts_with("true") {
-                *pos += 4;
-                Ok(MiniJsonValue::Bool(true))
-            } else {
-                Err(SqliteError::new(ErrorCode::Error, "malformed JSON"))
-            }
-        }
-        b'f' => {
-            if src[*pos..].starts_with("false") {
-                *pos += 5;
-                Ok(MiniJsonValue::Bool(false))
-            } else {
-                Err(SqliteError::new(ErrorCode::Error, "malformed JSON"))
-            }
-        }
-        b'"' => {
-            let s = parse_mini_json_string(src, bytes, pos)?;
-            Ok(MiniJsonValue::Str(s))
-        }
-        b'[' => {
-            *pos += 1;
-            skip_json_ws(bytes, pos);
-            let mut items = Vec::new();
-            if *pos < bytes.len() && bytes[*pos] == b']' {
-                *pos += 1;
-                return Ok(MiniJsonValue::Array(items));
-            }
-            loop {
-                items.push(parse_mini_json_val(src, bytes, pos)?);
-                skip_json_ws(bytes, pos);
-                if *pos >= bytes.len() {
-                    return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
-                }
-                if bytes[*pos] == b']' {
-                    *pos += 1;
-                    break;
-                }
-                if bytes[*pos] != b',' {
-                    return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
-                }
-                *pos += 1;
-            }
-            Ok(MiniJsonValue::Array(items))
-        }
-        b'{' => {
-            *pos += 1;
-            skip_json_ws(bytes, pos);
-            let mut entries = Vec::new();
-            if *pos < bytes.len() && bytes[*pos] == b'}' {
-                *pos += 1;
-                return Ok(MiniJsonValue::Object(entries));
-            }
-            loop {
-                skip_json_ws(bytes, pos);
-                if *pos >= bytes.len() || bytes[*pos] != b'"' {
-                    return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
-                }
-                let key = parse_mini_json_string(src, bytes, pos)?;
-                skip_json_ws(bytes, pos);
-                if *pos >= bytes.len() || bytes[*pos] != b':' {
-                    return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
-                }
-                *pos += 1;
-                let val = parse_mini_json_val(src, bytes, pos)?;
-                entries.push((key, val));
-                skip_json_ws(bytes, pos);
-                if *pos >= bytes.len() {
-                    return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
-                }
-                if bytes[*pos] == b'}' {
-                    *pos += 1;
-                    break;
-                }
-                if bytes[*pos] != b',' {
-                    return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
-                }
-                *pos += 1;
-            }
-            Ok(MiniJsonValue::Object(entries))
-        }
-        b'-' | b'0'..=b'9' => {
-            let start = *pos;
-            if bytes[*pos] == b'-' {
-                *pos += 1;
-            }
-            if *pos >= bytes.len() || !bytes[*pos].is_ascii_digit() {
-                return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
-            }
-            while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
-                *pos += 1;
-            }
-            let mut is_float = false;
-            if *pos < bytes.len() && bytes[*pos] == b'.' {
-                is_float = true;
-                *pos += 1;
-                if *pos >= bytes.len() || !bytes[*pos].is_ascii_digit() {
-                    return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
-                }
-                while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
-                    *pos += 1;
-                }
-            }
-            if *pos < bytes.len() && matches!(bytes[*pos], b'e' | b'E') {
-                is_float = true;
-                *pos += 1;
-                if *pos < bytes.len() && matches!(bytes[*pos], b'+' | b'-') {
-                    *pos += 1;
-                }
-                if *pos >= bytes.len() || !bytes[*pos].is_ascii_digit() {
-                    return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
-                }
-                while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
-                    *pos += 1;
-                }
-            }
-            let num_str = &src[start..*pos];
-            if !is_float && let Ok(i) = num_str.parse::<i64>() {
-                return Ok(MiniJsonValue::Int(i));
-            }
-            let f = num_str
-                .parse::<f64>()
-                .map_err(|_| SqliteError::new(ErrorCode::Error, "malformed JSON"))?;
-            Ok(MiniJsonValue::Float(f, num_str.to_owned()))
-        }
-        _ => Err(SqliteError::new(ErrorCode::Error, "malformed JSON")),
-    }
-}
-
-fn parse_mini_json_string(src: &str, bytes: &[u8], pos: &mut usize) -> Result<String> {
-    *pos += 1; // skip opening '"'
-    let mut out = String::new();
-    while *pos < bytes.len() {
-        let b = bytes[*pos];
-        if b == b'"' {
-            *pos += 1;
-            return Ok(out);
-        }
-        if b == b'\\' {
-            *pos += 1;
-            if *pos >= bytes.len() {
-                return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
-            }
-            match bytes[*pos] {
-                b'"' => {
-                    out.push('"');
-                    *pos += 1;
-                }
-                b'\\' => {
-                    out.push('\\');
-                    *pos += 1;
-                }
-                b'/' => {
-                    out.push('/');
-                    *pos += 1;
-                }
-                b'b' => {
-                    out.push('\x08');
-                    *pos += 1;
-                }
-                b'f' => {
-                    out.push('\x0C');
-                    *pos += 1;
-                }
-                b'n' => {
-                    out.push('\n');
-                    *pos += 1;
-                }
-                b'r' => {
-                    out.push('\r');
-                    *pos += 1;
-                }
-                b't' => {
-                    out.push('\t');
-                    *pos += 1;
-                }
-                b'u' => {
-                    *pos += 1;
-                    if *pos + 4 > bytes.len() {
-                        return Err(SqliteError::new(ErrorCode::Error, "malformed JSON"));
-                    }
-                    let hex = &src[*pos..*pos + 4];
-                    let code = u32::from_str_radix(hex, 16)
-                        .map_err(|_| SqliteError::new(ErrorCode::Error, "malformed JSON"))?;
-                    *pos += 4;
-                    if let Some(ch) = char::from_u32(code) {
-                        out.push(ch);
-                    }
-                }
-                _ => return Err(SqliteError::new(ErrorCode::Error, "malformed JSON")),
-            }
-        } else {
-            let ch = src[*pos..].chars().next().unwrap();
-            out.push(ch);
-            *pos += ch.len_utf8();
-        }
-    }
-    Err(SqliteError::new(ErrorCode::Error, "malformed JSON"))
-}
-
-#[derive(Debug, Clone)]
-enum JsonPathStep {
-    Key(String),
-    Index { from_end: bool, offset: i64 },
-}
-
-fn parse_json_arrow_path(path_val: &Value) -> Result<Vec<JsonPathStep>> {
-    match path_val {
-        Value::Integer(i) => {
-            if *i >= 0 {
-                Ok(vec![JsonPathStep::Index {
-                    from_end: false,
-                    offset: *i,
-                }])
-            } else {
-                Ok(vec![JsonPathStep::Key(i.to_string())])
-            }
-        }
-        Value::Real(f) => Ok(vec![JsonPathStep::Key(format_sqlite_real(*f))]),
-        Value::Text(s) => {
-            if !s.starts_with('$') {
-                return Ok(vec![JsonPathStep::Key(s.clone())]);
-            }
-            let bytes = s.as_bytes();
-            let mut pos = 1usize;
-            let mut steps = Vec::new();
-            while pos < bytes.len() {
-                match bytes[pos] {
-                    b'.' => {
-                        pos += 1;
-                        if pos >= bytes.len() {
-                            return Err(SqliteError::new(ErrorCode::Error, "JSON path error"));
-                        }
-                        if bytes[pos] == b'"' {
-                            let key = parse_mini_json_string(s, bytes, &mut pos)?;
-                            steps.push(JsonPathStep::Key(key));
-                        } else {
-                            let start = pos;
-                            while pos < bytes.len() && bytes[pos] != b'.' && bytes[pos] != b'[' {
-                                pos += 1;
-                            }
-                            if start == pos {
-                                return Err(SqliteError::new(ErrorCode::Error, "JSON path error"));
-                            }
-                            steps.push(JsonPathStep::Key(s[start..pos].to_owned()));
-                        }
-                    }
-                    b'[' => {
-                        pos += 1;
-                        if pos >= bytes.len() {
-                            return Err(SqliteError::new(ErrorCode::Error, "JSON path error"));
-                        }
-                        let mut from_end = false;
-                        if bytes[pos] == b'#' {
-                            from_end = true;
-                            pos += 1;
-                        }
-                        let start = pos;
-                        while pos < bytes.len() && bytes[pos] != b']' {
-                            pos += 1;
-                        }
-                        if pos >= bytes.len() || bytes[pos] != b']' {
-                            return Err(SqliteError::new(ErrorCode::Error, "JSON path error"));
-                        }
-                        let idx_str = &s[start..pos];
-                        pos += 1; // skip ']'
-                        let offset = if from_end && idx_str.is_empty() {
-                            0
-                        } else {
-                            idx_str.parse::<i64>().map_err(|_| {
-                                SqliteError::new(ErrorCode::Error, "JSON path error")
-                            })?
-                        };
-                        if !from_end && offset < 0 {
-                            return Err(SqliteError::new(ErrorCode::Error, "JSON path error"));
-                        }
-                        steps.push(JsonPathStep::Index { from_end, offset });
-                    }
-                    _ => {
-                        return Err(SqliteError::new(ErrorCode::Error, "JSON path error"));
-                    }
-                }
-            }
-            Ok(steps)
-        }
-        Value::Null | Value::Blob(_) => Ok(Vec::new()),
-    }
-}
-
-fn eval_json_arrow_operator(
-    json_arg: &Value,
-    path_arg: &Value,
-    unquote_text: bool,
-) -> Result<RuntimeValue> {
-    if json_arg.is_null() || path_arg.is_null() {
-        return Ok(RuntimeValue::null());
-    }
-    if matches!(path_arg, Value::Blob(_)) {
-        return Err(SqliteError::new(ErrorCode::Error, "JSON path error"));
-    }
-    let json_str = match json_arg {
-        Value::Text(s) => s.clone(),
-        Value::Integer(i) => i.to_string(),
-        Value::Real(f) => format_sqlite_real(*f),
-        Value::Blob(_) => {
-            return Err(SqliteError::new(
-                ErrorCode::Error,
-                "JSON cannot hold BLOB values",
-            ));
-        }
-        Value::Null => return Ok(RuntimeValue::null()),
-    };
-    let root = parse_mini_json(&json_str)?;
-    let steps = parse_json_arrow_path(path_arg)?;
-    let mut cur = &root;
-    for step in &steps {
-        match (cur, step) {
-            (MiniJsonValue::Object(entries), JsonPathStep::Key(k)) => {
-                if let Some((_, v)) = entries.iter().find(|(ek, _)| ek == k) {
-                    cur = v;
-                } else {
-                    return Ok(RuntimeValue::null());
-                }
-            }
-            (MiniJsonValue::Array(items), JsonPathStep::Index { from_end, offset }) => {
-                let resolved_idx = if *from_end {
-                    (items.len() as i64) + *offset
-                } else {
-                    *offset
-                };
-                if resolved_idx < 0 || (resolved_idx as usize) >= items.len() {
-                    return Ok(RuntimeValue::null());
-                }
-                cur = &items[resolved_idx as usize];
-            }
-            (
-                MiniJsonValue::Object(entries),
-                JsonPathStep::Index {
-                    from_end: false,
-                    offset,
-                },
-            ) if matches!(path_arg, Value::Integer(_)) => {
-                let k = offset.to_string();
-                if let Some((_, v)) = entries.iter().find(|(ek, _)| *ek == k) {
-                    cur = v;
-                } else {
-                    return Ok(RuntimeValue::null());
-                }
-            }
-            _ => return Ok(RuntimeValue::null()),
-        }
-    }
-    if unquote_text {
-        match cur {
-            MiniJsonValue::Null => Ok(RuntimeValue::null()),
-            MiniJsonValue::Bool(b) => Ok(RuntimeValue::plain(Value::Integer(i64::from(*b)))),
-            MiniJsonValue::Int(i) => Ok(RuntimeValue::plain(Value::Integer(*i))),
-            MiniJsonValue::Float(f, _) => Ok(RuntimeValue::plain(Value::real(*f))),
-            MiniJsonValue::Str(s) => Ok(RuntimeValue::plain(Value::Text(s.clone()))),
-            MiniJsonValue::Array(_) | MiniJsonValue::Object(_) => {
-                Ok(RuntimeValue::plain(Value::Text(cur.to_json_text())))
-            }
-        }
-    } else {
-        Ok(RuntimeValue::with_subtype(
-            Value::Text(cur.to_json_text()),
-            u32::from(b'J'),
-        ))
     }
 }

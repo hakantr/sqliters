@@ -2428,9 +2428,14 @@ pub fn expr_contains_subquery(expr: &Expr) -> bool {
                 || else_expr.as_deref().is_some_and(expr_contains_subquery)
         }
         Expr::FunctionCall {
-            args, filter, over, ..
+            name,
+            args,
+            filter,
+            over,
+            ..
         } => {
-            over.is_some()
+            name.eq_ignore_ascii_case("rtreecheck")
+                || over.is_some()
                 || filter.as_deref().is_some_and(expr_contains_subquery)
                 || match args {
                     FunctionArgs::Star => false,

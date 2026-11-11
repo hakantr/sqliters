@@ -593,12 +593,8 @@ impl DatabaseSet {
         self.vtab_registry.trusted_schema
     }
 
-    /// Returns `true` if `table_name` in `db_id` is a shadow table of any virtual table in that schema
-    /// (unless currently executing inside a virtual table module's own internal sub-SQL).
-    pub fn is_shadow_table_in_db(&self, db_id: DatabaseId, table_name: &str) -> bool {
-        if self.vtab_registry.internal_sql_depth > 0 {
-            return false;
-        }
+    /// Returns `true` if `table_name` in `db_id` is a shadow table of any virtual table in that schema.
+    pub fn is_shadow_table_metadata(&self, db_id: DatabaseId, table_name: &str) -> bool {
         let Some(slot) = self.slot(db_id) else {
             return false;
         };
@@ -621,6 +617,13 @@ impl DatabaseSet {
             }
         }
         false
+    }
+
+    /// Returns `true` if `table_name` in `db_id` is a shadow table of any virtual table in that schema
+    /// (unless currently executing inside a virtual table module's own internal sub-SQL).
+    pub fn is_shadow_table_in_db(&self, db_id: DatabaseId, table_name: &str) -> bool {
+        self.vtab_registry.internal_sql_depth == 0
+            && self.is_shadow_table_metadata(db_id, table_name)
     }
 
     /// Returns `true` if any open database slot currently holds a `Read` or `Write` B-tree transaction.

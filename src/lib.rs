@@ -55,14 +55,15 @@ pub use sqliters_core::{
     AuthorizerAction, AuthorizerCallback, AuthorizerResult, Backup, BackupStepResult, Blob,
     CloseError, CollationCallback, CollationRegistry, ColumnSchema, CommitHookCallback, Connection,
     ConnectionOpenOptions, DbStatModule, DeclaredVTabSchema, ExecutionContext,
-    FallibleCollationCallback, ForeignKeySchema, FunctionRegistry, GenerateSeriesModule,
-    IndexSchema, InterruptHandle, MutationContext, MutationOrigin, MutationPipeline, MutationRow,
-    PragmaVTabModule, PrepareMode, ProgressCallback, ProgressTracker, QueryOutput, QueryResult,
-    RollbackHookCallback, Row, SQLITE_DEFAULT_WAL_AUTOCHECKPOINT, SQLITE_MAX_TRIGGER_DEPTH,
-    SQLITE_MAX_TRIGGER_STEPS, ScalarFunctionCallback, ScalarFunctionDef, Schema, Statement,
-    StepResult, TableSchema, TraceHookCallback, TriggerEventKind, TriggerSchema,
-    UpdateHookCallback, UpdateHookEvent, VTabInstanceKey, VTabRegistry, VirtualTableDef,
-    WindowAggregateInstance, WindowFunctionDef,
+    FallibleCollationCallback, ForeignKeySchema, Fts5AuxRegistry, Fts5Module, Fts5VocabModule,
+    FunctionRegistry, GenerateSeriesModule, IndexSchema, InterruptHandle, JsonEachModule,
+    JsonTreeModule, JsonbEachModule, JsonbTreeModule, MutationContext, MutationOrigin,
+    MutationPipeline, MutationRow, PragmaVTabModule, PrepareMode, ProgressCallback,
+    ProgressTracker, QueryOutput, QueryResult, RTreeCoordMode, RTreeModule, RollbackHookCallback,
+    Row, SQLITE_DEFAULT_WAL_AUTOCHECKPOINT, SQLITE_MAX_TRIGGER_DEPTH, SQLITE_MAX_TRIGGER_STEPS,
+    ScalarFunctionCallback, ScalarFunctionDef, Schema, Statement, StepResult, TableSchema,
+    TraceHookCallback, TriggerEventKind, TriggerSchema, UpdateHookCallback, UpdateHookEvent,
+    VTabInstanceKey, VTabRegistry, VirtualTableDef, WindowAggregateInstance, WindowFunctionDef,
 };
 pub use sqliters_pager::{
     AutoVacuumMode, DatabaseHeader, JournalMode, LockingMode, WalCheckpointMode,
@@ -77,9 +78,9 @@ pub use sqliters_types::{
     Result, RowMutationEvent, RowMutationOp, RuntimeValue, SQLITE_DEFAULT_PAGE_SIZE,
     SQLITE_FILE_HEADER, SQLITE_MAX_ATTACHED, SQLITE_SOURCE_ID, SQLITE_VERSION,
     SQLITE_VERSION_NUMBER, SqliteError, StorageClass, TextEncoding, TypeAffinity, VTabConfigOption,
-    VTabConstraint, VTabConstraintOp, VTabConstraintUsage, VTabHostContext, VTabIndexInfo,
-    VTabOrderBy, VTabRiskFlags, VTabUpdateOperation, Value, VirtualCursor, VirtualTable,
-    VirtualTableModule, fallible_sort_by,
+    VTabConflictMode, VTabConstraint, VTabConstraintOp, VTabConstraintUsage, VTabHostContext,
+    VTabIndexInfo, VTabOrderBy, VTabRiskFlags, VTabUpdateOperation, Value, VirtualCursor,
+    VirtualTable, VirtualTableModule, fallible_sort_by,
 };
 pub use sqliters_vdbe::BtreeAccess;
 pub use sqliters_vfs::{LockLevel, MemoryVfs, OpenFlags, OsVfs, SyncFlags, Vfs, VfsFile};

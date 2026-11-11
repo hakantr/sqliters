@@ -5,16 +5,19 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use sqliters_ext::GenerateSeriesModule;
+use sqliters_ext::{
+    Fts5AuxRegistry, Fts5Module, Fts5VocabModule, GenerateSeriesModule, JsonEachModule,
+    JsonTreeModule, JsonbEachModule, JsonbTreeModule, RTreeModule,
+};
 use sqliters_syntax::{
     Expr, FromClause, FunctionArgs, InsertSource, JoinConstraint, PragmaValue, QualifiedName,
     ResultColumn, SelectCore, SelectStmt, Stmt, TableOrSubquery, TriggerStep, WindowRef, dequote,
     parse_one,
 };
 use sqliters_types::{
-    DatabaseId, ErrorCode, Pgno, Result, SqliteError, VTabConfigOption, VTabConstraintOp,
-    VTabHostContext, VTabIndexInfo, VTabRiskFlags, VTabUpdateOperation, Value, VirtualCursor,
-    VirtualTable, VirtualTableModule, get_varint,
+    DatabaseId, ErrorCode, Pgno, Result, SqliteError, VTabConfigOption, VTabConflictMode,
+    VTabConstraintOp, VTabHostContext, VTabIndexInfo, VTabRiskFlags, VTabUpdateOperation, Value,
+    VirtualCursor, VirtualTable, VirtualTableModule, get_varint,
 };
 
 use crate::db_set::{DatabaseSet, ResolvedRelation};
@@ -141,6 +144,7 @@ impl ConnectedVTabEntry {
 pub struct VTabRegistry {
     modules: BTreeMap<String, (String, Arc<dyn VirtualTableModule>)>,
     connected: BTreeMap<(String, String), ConnectedVTabEntry>,
+    fts5_aux: Arc<Fts5AuxRegistry>,
     pub trusted_schema: bool,
     pub defensive_mode: bool,
     pub internal_sql_depth: usize,
@@ -165,18 +169,35 @@ impl Default for VTabRegistry {
 }
 
 impl VTabRegistry {
-    /// Creates a new `VTabRegistry` pre-populated with built-in modules (`generate_series`, `dbstat`).
+    /// Creates a new `VTabRegistry` pre-populated with built-in modules (`generate_series`, `dbstat`,
+    /// `json_each`, `json_tree`, `jsonb_each`, `jsonb_tree`, `fts5`, `fts5vocab`, `rtree`, `rtree_i32`).
     pub fn new() -> Self {
+        let fts5_aux = Arc::new(Fts5AuxRegistry::new());
         let mut reg = Self {
             modules: BTreeMap::new(),
             connected: BTreeMap::new(),
+            fts5_aux: Arc::clone(&fts5_aux),
             trusted_schema: true,
             defensive_mode: false,
             internal_sql_depth: 0,
         };
         reg.register_module(Arc::new(GenerateSeriesModule));
         reg.register_module(Arc::new(DbStatModule));
+        reg.register_module(Arc::new(JsonEachModule));
+        reg.register_module(Arc::new(JsonTreeModule));
+        reg.register_module(Arc::new(JsonbEachModule));
+        reg.register_module(Arc::new(JsonbTreeModule));
+        reg.register_module(Arc::new(Fts5Module::new(fts5_aux)));
+        reg.register_module(Arc::new(Fts5VocabModule));
+        reg.register_module(Arc::new(RTreeModule::new_f32()));
+        reg.register_module(Arc::new(RTreeModule::new_i32()));
         reg
+    }
+
+    /// Returns the connection-scoped FTS5 auxiliary function registry (`bm25`, `highlight`, `snippet`).
+    #[inline]
+    pub fn fts5_aux_registry(&self) -> Arc<Fts5AuxRegistry> {
+        Arc::clone(&self.fts5_aux)
     }
 
     /// Registers a virtual table module on the connection.
@@ -415,6 +436,7 @@ pub struct CoreVTabHostContext<'a, 'b> {
     pub declared: Option<VTabDeclaredSchema>,
     pub config_risk_flags: Option<VTabRiskFlags>,
     pub constraint_support: bool,
+    pub conflict_mode: VTabConflictMode,
 }
 
 impl<'a, 'b> CoreVTabHostContext<'a, 'b> {
@@ -430,6 +452,7 @@ impl<'a, 'b> CoreVTabHostContext<'a, 'b> {
             declared: None,
             config_risk_flags: None,
             constraint_support: false,
+            conflict_mode: VTabConflictMode::Abort,
         }
     }
 
@@ -484,6 +507,10 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_> {
             decl.constraint_support = self.constraint_support;
         }
         Ok(())
+    }
+
+    fn vtab_on_conflict(&self) -> VTabConflictMode {
+        self.conflict_mode
     }
 
     fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<usize> {
@@ -1474,12 +1501,24 @@ pub fn vtab_perform_update(
     table_name: &str,
     op: VTabUpdateOperation,
 ) -> Result<Option<i64>> {
+    vtab_perform_update_with_conflict(ctx, db_name, table_name, op, VTabConflictMode::Abort)
+}
+
+/// Performs `VirtualTable::update` on `(db_name, table_name)` with active `conflict_mode`.
+pub fn vtab_perform_update_with_conflict(
+    ctx: &mut ExecContext<'_>,
+    db_name: &str,
+    table_name: &str,
+    op: VTabUpdateOperation,
+    conflict_mode: VTabConflictMode,
+) -> Result<Option<i64>> {
     vtab_begin_if_needed(ctx, db_name, table_name)?;
     let (mut vt, _, _) = ctx
         .db_set
         .vtab_registry_mut()
         .checkout_vtab(db_name, table_name)?;
     let mut host_ctx = CoreVTabHostContext::new(ctx, db_name, table_name);
+    host_ctx.conflict_mode = conflict_mode;
     let res = catch_callback_panic("vtab xUpdate", || vt.update(&mut host_ctx, op));
     ctx.db_set
         .vtab_registry_mut()

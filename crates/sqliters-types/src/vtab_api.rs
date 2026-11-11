@@ -26,6 +26,17 @@ pub enum VTabConfigOption {
     DirectOnly,
 }
 
+/// Active conflict-resolution mode reported by [`VTabHostContext::vtab_on_conflict`] (`sqlite3_vtab_on_conflict`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum VTabConflictMode {
+    Rollback,
+    Ignore,
+    Fail,
+    #[default]
+    Abort,
+    Replace,
+}
+
 /// Virtual table constraint operator (`SQLITE_INDEX_CONSTRAINT_*`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VTabConstraintOp {
@@ -157,6 +168,10 @@ pub trait VTabHostContext {
     fn declare_vtab(&mut self, create_table_sql: &str) -> Result<()>;
     /// Sets virtual table configuration options (`sqlite3_vtab_config`).
     fn set_vtab_config(&mut self, opt: VTabConfigOption) -> Result<()>;
+    /// Returns the active DML conflict resolution mode (`sqlite3_vtab_on_conflict`).
+    fn vtab_on_conflict(&self) -> VTabConflictMode {
+        VTabConflictMode::Abort
+    }
     /// Executes an internal SQL statement within the active connection/transaction context.
     fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<usize>;
     /// Executes an internal SQL query within the active connection/transaction context and returns all rows.
@@ -294,6 +309,12 @@ pub trait VirtualCursor: Send + Sync {
 
     /// Returns the value of column `col_idx` for the current row (`xColumn`).
     fn column(&self, col_idx: usize) -> Result<Value>;
+
+    /// Returns the ephemeral result subtype (`sqlite3_result_subtype`) for column `col_idx`
+    /// of the current row (`0` when no subtype applies, e.g. `74` for JSON values).
+    fn column_subtype(&self, _col_idx: usize) -> u8 {
+        0
+    }
 
     /// Returns the 64-bit rowid for the current row (`xRowid`).
     fn rowid(&self) -> Result<i64>;

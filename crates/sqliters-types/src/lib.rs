@@ -5,6 +5,7 @@
 
 pub mod bitvec;
 pub mod error;
+pub mod json;
 pub mod limits;
 pub mod record;
 pub mod runtime_api;
@@ -33,9 +34,9 @@ pub use value::{
 };
 pub use varint::{get_varint, get_varint_i64, push_varint, put_varint, put_varint_i64, varint_len};
 pub use vtab_api::{
-    VTabConfigOption, VTabConstraint, VTabConstraintOp, VTabConstraintUsage, VTabHostContext,
-    VTabIndexInfo, VTabOrderBy, VTabRiskFlags, VTabUpdateOperation, VirtualCursor, VirtualTable,
-    VirtualTableModule,
+    VTabConfigOption, VTabConflictMode, VTabConstraint, VTabConstraintOp, VTabConstraintUsage,
+    VTabHostContext, VTabIndexInfo, VTabOrderBy, VTabRiskFlags, VTabUpdateOperation, VirtualCursor,
+    VirtualTable, VirtualTableModule,
 };
 
 #[cfg(test)]
