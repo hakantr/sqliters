@@ -200,6 +200,7 @@ impl std::fmt::Debug for DbSlot {
 
 pub const SQLITE_MAX_EXPR_DEPTH: usize = 1000;
 pub const SQLITE_MAX_COLUMN: usize = 2000;
+pub const SQLITE_HARD_MAX_COLUMN: usize = 32_767;
 
 /// Connection database array (`db->aDb[0..db->nDb]`) managing `"main"`, lazy `"temp"`, and
 /// attached databases (`2..nDb`).
@@ -210,6 +211,7 @@ pub struct DatabaseSet {
     enable_trigger: bool,
     dqs_dml: bool,
     expr_depth_limit: usize,
+    max_column_ceiling: usize,
     column_limit: usize,
     trigger_steps_limit: usize,
     trigger_depth_limit: usize,
@@ -281,6 +283,7 @@ impl DatabaseSet {
             enable_trigger: true,
             dqs_dml: true,
             expr_depth_limit: SQLITE_MAX_EXPR_DEPTH,
+            max_column_ceiling: SQLITE_MAX_COLUMN,
             column_limit: SQLITE_MAX_COLUMN,
             trigger_steps_limit: SQLITE_MAX_TRIGGER_STEPS,
             trigger_depth_limit: SQLITE_MAX_TRIGGER_DEPTH,
@@ -536,11 +539,27 @@ impl DatabaseSet {
         self.column_limit
     }
 
-    /// Sets `SQLITE_LIMIT_COLUMN` (clamped to `0..=SQLITE_MAX_COLUMN`), returning the new limit.
+    /// Current hard `SQLITE_MAX_COLUMN` ceiling on this connection.
+    #[inline]
+    pub const fn max_column_ceiling(&self) -> usize {
+        self.max_column_ceiling
+    }
+
+    /// Sets `SQLITE_LIMIT_COLUMN` (clamped to `0..=self.max_column_ceiling`), returning the new limit.
     #[inline]
     pub fn set_column_limit(&mut self, limit: usize) -> usize {
-        self.column_limit = limit.min(SQLITE_MAX_COLUMN);
+        self.column_limit = limit.min(self.max_column_ceiling);
         self.column_limit
+    }
+
+    /// Updates both the connection's `SQLITE_MAX_COLUMN` ceiling (clamped to `1..=32767`)
+    /// and its active `SQLITE_LIMIT_COLUMN` to that ceiling, returning the effective ceiling.
+    #[inline]
+    pub fn set_max_column_ceiling(&mut self, ceiling: usize) -> usize {
+        let effective = ceiling.clamp(1, SQLITE_HARD_MAX_COLUMN);
+        self.max_column_ceiling = effective;
+        self.column_limit = effective;
+        effective
     }
 
     /// Current `PRAGMA temp_store` mode.

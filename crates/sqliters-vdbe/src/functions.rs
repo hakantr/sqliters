@@ -619,21 +619,43 @@ fn eval_scalar_function_plain(
             Ok(Value::Text(out))
         }
         "UNHEX" => {
-            check_arity(name, args, 1, 1)?;
-            if args[0].is_null() {
+            check_arity(name, args, 1, 2)?;
+            if args[0].is_null() || (args.len() == 2 && args[1].is_null()) {
                 return Ok(Value::Null);
             }
             let s = args[0].to_text_lossy();
-            if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Ok(Value::Null);
+            if args.len() == 1 {
+                if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Ok(Value::Null);
+                }
+                let mut out = Vec::with_capacity(s.len() / 2);
+                for pair in s.as_bytes().as_chunks::<2>().0 {
+                    let byte = u8::from_str_radix(std::str::from_utf8(pair).unwrap_or("00"), 16)
+                        .unwrap_or(0);
+                    out.push(byte);
+                }
+                Ok(Value::Blob(out))
+            } else {
+                let ignore = args[1].to_text_lossy();
+                let mut out = Vec::with_capacity(s.len() / 2);
+                let mut chars = s.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if ignore.contains(c) {
+                        continue;
+                    }
+                    let Some(hi) = c.to_digit(16) else {
+                        return Ok(Value::Null);
+                    };
+                    let Some(c2) = chars.next() else {
+                        return Ok(Value::Null);
+                    };
+                    let Some(lo) = c2.to_digit(16) else {
+                        return Ok(Value::Null);
+                    };
+                    out.push(((hi << 4) | lo) as u8);
+                }
+                Ok(Value::Blob(out))
             }
-            let mut out = Vec::with_capacity(s.len() / 2);
-            for pair in s.as_bytes().as_chunks::<2>().0 {
-                let byte =
-                    u8::from_str_radix(std::str::from_utf8(pair).unwrap_or("00"), 16).unwrap_or(0);
-                out.push(byte);
-            }
-            Ok(Value::Blob(out))
         }
         "UNICODE" => {
             check_arity(name, args, 1, 1)?;
@@ -869,6 +891,92 @@ fn eval_scalar_function_plain(
             eval_datetime_function(upper, args, ctx)
         }
         "STRFTIME" => eval_strftime_function(args, ctx),
+        "PI" => {
+            check_arity(name, args, 0, 0)?;
+            Ok(Value::real(std::f64::consts::PI))
+        }
+        "CEIL" | "CEILING" | "FLOOR" | "TRUNC" => {
+            check_arity(name, args, 1, 1)?;
+            let Some(nv) = math_numeric_value(&args[0]) else {
+                return Ok(Value::Null);
+            };
+            match nv {
+                Value::Integer(i) => Ok(Value::Integer(i)),
+                Value::Real(r) => {
+                    let res = match upper {
+                        "CEIL" | "CEILING" => r.ceil(),
+                        "FLOOR" => r.floor(),
+                        _ => r.trunc(),
+                    };
+                    Ok(Value::real(res))
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+        "ACOS" | "ACOSH" | "ASIN" | "ASINH" | "ATAN" | "ATANH" | "COS" | "COSH" | "DEGREES"
+        | "EXP" | "LN" | "LOG10" | "LOG2" | "RADIANS" | "SIN" | "SINH" | "SQRT" | "TAN"
+        | "TANH" => {
+            check_arity(name, args, 1, 1)?;
+            let Some(x) = math_real_arg(&args[0]) else {
+                return Ok(Value::Null);
+            };
+            let res = match upper {
+                "ACOS" => x.acos(),
+                "ACOSH" => x.acosh(),
+                "ASIN" => x.asin(),
+                "ASINH" => x.asinh(),
+                "ATAN" => x.atan(),
+                "ATANH" => x.atanh(),
+                "COS" => x.cos(),
+                "COSH" => x.cosh(),
+                "DEGREES" => x.to_degrees(),
+                "EXP" => x.exp(),
+                "LN" => x.ln(),
+                "LOG10" => x.log10(),
+                "LOG2" => x.log2(),
+                "RADIANS" => x.to_radians(),
+                "SIN" => x.sin(),
+                "SINH" => x.sinh(),
+                "SQRT" => x.sqrt(),
+                "TAN" => x.tan(),
+                _ => x.tanh(),
+            };
+            Ok(Value::real(res))
+        }
+        "LOG" => {
+            check_arity(name, args, 1, 2)?;
+            if args.len() == 1 {
+                let Some(x) = math_real_arg(&args[0]) else {
+                    return Ok(Value::Null);
+                };
+                Ok(Value::real(x.log10()))
+            } else {
+                let (Some(b), Some(x)) = (math_real_arg(&args[0]), math_real_arg(&args[1])) else {
+                    return Ok(Value::Null);
+                };
+                if b <= 0.0 || b == 1.0 || x <= 0.0 {
+                    Ok(Value::Null)
+                } else if b == 2.0 {
+                    Ok(Value::real(x.log2()))
+                } else if b == 10.0 {
+                    Ok(Value::real(x.log10()))
+                } else {
+                    Ok(Value::real(x.log(b)))
+                }
+            }
+        }
+        "POW" | "POWER" | "ATAN2" | "MOD" => {
+            check_arity(name, args, 2, 2)?;
+            let (Some(a), Some(b)) = (math_real_arg(&args[0]), math_real_arg(&args[1])) else {
+                return Ok(Value::Null);
+            };
+            let res = match upper {
+                "POW" | "POWER" => a.powf(b),
+                "ATAN2" => a.atan2(b),
+                _ => a % b,
+            };
+            Ok(Value::real(res))
+        }
         _ => Err(SqliteError::new(
             ErrorCode::Error,
             format!("no such function: {name}"),
@@ -916,7 +1024,6 @@ fn scalar_function_arity_with_flag(
         | "LOWER"
         | "UPPER"
         | "HEX"
-        | "UNHEX"
         | "UNICODE"
         | "QUOTE"
         | "ZEROBLOB"
@@ -926,20 +1033,45 @@ fn scalar_function_arity_with_flag(
         | "JSON"
         | "JSONB"
         | "JSON_QUOTE"
-        | "JSON_ERROR_POSITION" => Some((1, 1)),
+        | "JSON_ERROR_POSITION"
+        | "ACOS"
+        | "ACOSH"
+        | "ASIN"
+        | "ASINH"
+        | "ATAN"
+        | "ATANH"
+        | "CEIL"
+        | "CEILING"
+        | "COS"
+        | "COSH"
+        | "DEGREES"
+        | "EXP"
+        | "FLOOR"
+        | "LN"
+        | "LOG10"
+        | "LOG2"
+        | "RADIANS"
+        | "SIN"
+        | "SINH"
+        | "SQRT"
+        | "TAN"
+        | "TANH"
+        | "TRUNC" => Some((1, 1)),
         "RANDOM" | "SQLITE_VERSION" | "SQLITE_SOURCE_ID" | "LAST_INSERT_ROWID" | "CHANGES"
-        | "TOTAL_CHANGES" | "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" => Some((0, 0)),
+        | "TOTAL_CHANGES" | "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" | "PI" => {
+            Some((0, 0))
+        }
         "COALESCE" | "IIF" | "IF" => Some((2, usize::MAX)),
         "IFNULL" | "NULLIF" | "INSTR" | "GLOB" | "LIKELIHOOD" | "->" | "->>" | "JSON_PATCH"
-        | "JSONB_PATCH" => Some((2, 2)),
+        | "JSONB_PATCH" | "POW" | "POWER" | "ATAN2" | "MOD" => Some((2, 2)),
         "RANDSTR" | "TEST_SET_SUBTYPE" | "TEST_BAD_SUBTYPE" if enable_test_functions => {
             Some((2, 2))
         }
         "TEST_ERROR" if enable_test_functions => Some((1, 2)),
         "TEST_PLAIN_ARG_SUBTYPE" if enable_test_functions => Some((1, 1)),
         "REPLACE" => Some((3, 3)),
-        "TRIM" | "LTRIM" | "RTRIM" | "ROUND" | "JSON_ARRAY_LENGTH" | "JSON_TYPE" | "JSON_VALID"
-        | "JSON_PRETTY" => Some((1, 2)),
+        "TRIM" | "LTRIM" | "RTRIM" | "ROUND" | "UNHEX" | "LOG" | "JSON_ARRAY_LENGTH"
+        | "JSON_TYPE" | "JSON_VALID" | "JSON_PRETTY" => Some((1, 2)),
         "SUBSTR" | "SUBSTRING" | "LIKE" => Some((2, 3)),
         "CHAR" | "DATE" | "TIME" | "DATETIME" | "UNIXEPOCH" | "JULIANDAY" | "STRFTIME"
         | "JSON_ARRAY" | "JSONB_ARRAY" | "JSON_OBJECT" | "JSONB_OBJECT" | "JSON_EXTRACT"
@@ -1184,13 +1316,13 @@ fn parse_time_value_to_unix_ms(
     for m in modifiers {
         let mod_str = m.to_text_lossy();
         let mt = mod_str.trim();
-        if mt.eq_ignore_ascii_case("unixepoch") || mt.eq_ignore_ascii_case("utc") {
+        if mt.eq_ignore_ascii_case("unixepoch")
+            || mt.eq_ignore_ascii_case("utc")
+            || mt.eq_ignore_ascii_case("auto")
+        {
             continue;
         }
-        {
-            let delta_ms = parse_relative_modifier_ms(mt)?;
-            ms = ms.saturating_add(delta_ms);
-        }
+        ms = apply_datetime_modifier_ms(ms, mt)?;
     }
     Some(ms)
 }
@@ -1256,21 +1388,87 @@ fn parse_hms_ms(s: &str) -> Option<i64> {
     Some((i64::from(hh) * 3_600 + i64::from(mm) * 60 + i64::from(ss)) * 1_000 + i64::from(ms))
 }
 
-fn parse_relative_modifier_ms(s: &str) -> Option<i64> {
+fn apply_datetime_modifier_ms(ms: i64, s: &str) -> Option<i64> {
+    let lower = s.to_ascii_lowercase();
+    match lower.as_str() {
+        "start of day" => {
+            let (y, mo, d, _, _, _) = utc_ymdhms_from_unix_ms(ms);
+            return Some(days_from_civil(i64::from(y), mo, d) * 86_400_000);
+        }
+        "start of month" => {
+            let (y, mo, _, _, _, _) = utc_ymdhms_from_unix_ms(ms);
+            return Some(days_from_civil(i64::from(y), mo, 1) * 86_400_000);
+        }
+        "start of year" => {
+            let (y, _, _, _, _, _) = utc_ymdhms_from_unix_ms(ms);
+            return Some(days_from_civil(i64::from(y), 1, 1) * 86_400_000);
+        }
+        "subsec" | "subsecond" => return Some(ms),
+        _ => {}
+    }
+    if let Some(rest) = lower.strip_prefix("weekday") {
+        if rest.is_empty() || !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let wf: f64 = rest.trim().parse().ok()?;
+        if !wf.is_finite() || wf.fract() != 0.0 || !(0.0..7.0).contains(&wf) {
+            return None;
+        }
+        let target_dow = wf as i64;
+        let days = ms.div_euclid(86_400_000);
+        let dow = (days + 4).rem_euclid(7);
+        let add_days = (target_dow - dow).rem_euclid(7);
+        return Some(ms.saturating_add(add_days * 86_400_000));
+    }
+
     let mut parts = s.split_whitespace();
     let num: f64 = parts.next()?.parse().ok()?;
+    if !num.is_finite() {
+        return None;
+    }
     let unit = parts.next()?.to_ascii_lowercase();
     if parts.next().is_some() {
         return None;
     }
-    let mult_ms = match unit.trim_end_matches('s') {
-        "second" => 1_000.0,
-        "minute" => 60_000.0,
-        "hour" => 3_600_000.0,
-        "day" => 86_400_000.0,
-        _ => return None,
-    };
-    Some((num * mult_ms).round() as i64)
+    match unit.trim_end_matches('s') {
+        "second" => Some(ms.saturating_add((num * 1_000.0).round() as i64)),
+        "minute" => Some(ms.saturating_add((num * 60_000.0).round() as i64)),
+        "hour" => Some(ms.saturating_add((num * 3_600_000.0).round() as i64)),
+        "day" => Some(ms.saturating_add((num * 86_400_000.0).round() as i64)),
+        "month" => {
+            let whole_months = num.trunc() as i64;
+            let frac_months = num - (whole_months as f64);
+            let (y, mo, d, _, _, _) = utc_ymdhms_from_unix_ms(ms);
+            let tod_ms = ms.rem_euclid(86_400_000);
+            let total_m0 = i64::from(y) * 12 + (i64::from(mo) - 1) + whole_months;
+            let new_y = total_m0.div_euclid(12);
+            let new_m = (total_m0.rem_euclid(12) + 1) as u32;
+            let base_days = days_from_civil(new_y, new_m, 1) + i64::from(d) - 1;
+            let frac_ms = (frac_months * 30.0 * 86_400_000.0).round() as i64;
+            Some(
+                base_days
+                    .saturating_mul(86_400_000)
+                    .saturating_add(tod_ms)
+                    .saturating_add(frac_ms),
+            )
+        }
+        "year" => {
+            let whole_years = num.trunc() as i64;
+            let frac_years = num - (whole_years as f64);
+            let (y, mo, d, _, _, _) = utc_ymdhms_from_unix_ms(ms);
+            let tod_ms = ms.rem_euclid(86_400_000);
+            let new_y = i64::from(y) + whole_years;
+            let base_days = days_from_civil(new_y, mo, 1) + i64::from(d) - 1;
+            let frac_ms = (frac_years * 365.0 * 86_400_000.0).round() as i64;
+            Some(
+                base_days
+                    .saturating_mul(86_400_000)
+                    .saturating_add(tod_ms)
+                    .saturating_add(frac_ms),
+            )
+        }
+        _ => None,
+    }
 }
 
 fn eval_datetime_function(
@@ -1528,6 +1726,183 @@ fn glob_rec(pat: &[char], txt: &[char]) -> bool {
     ti == txt.len()
 }
 
+fn math_numeric_value(v: &Value) -> Option<Value> {
+    match v {
+        Value::Integer(i) => Some(Value::Integer(*i)),
+        Value::Real(r) => Some(Value::Real(*r)),
+        Value::Text(s) => sqliters_types::parse_numeric_text(s),
+        Value::Null | Value::Blob(_) => None,
+    }
+}
+
+fn math_real_arg(v: &Value) -> Option<f64> {
+    match math_numeric_value(v)? {
+        Value::Integer(i) => Some(i as f64),
+        Value::Real(r) => Some(r),
+        _ => None,
+    }
+}
+
+fn format_sqlite_float_sci(abs: f64, prec: usize, upper: bool, force_dot: bool) -> String {
+    let raw = format!("{abs:.prec$e}");
+    let Some((mant, exp_str)) = raw.split_once('e') else {
+        return raw;
+    };
+    let exp = exp_str.parse::<i32>().unwrap_or(0);
+    let mut m = mant.to_owned();
+    if prec == 0 && force_dot && !m.contains('.') {
+        m.push('.');
+    }
+    let e_ch = if upper { 'E' } else { 'e' };
+    let e_sign = if exp < 0 { '-' } else { '+' };
+    let abs_exp = exp.unsigned_abs();
+    format!("{m}{e_ch}{e_sign}{abs_exp:02}")
+}
+
+fn format_sqlite_float_g(
+    abs: f64,
+    prec: Option<usize>,
+    upper: bool,
+    alt_hash: bool,
+    alt_bang: bool,
+) -> String {
+    let p = prec.unwrap_or(6).max(1);
+    if abs == 0.0 {
+        if alt_hash {
+            if p > 1 {
+                return format!("0.{}", "0".repeat(p - 1));
+            }
+            return "0".to_owned();
+        }
+        if alt_bang {
+            return "0.0".to_owned();
+        }
+        return "0".to_owned();
+    }
+
+    let sig = if alt_bang { p.min(26) } else { p.min(15) };
+    let sci_prec = sig.saturating_sub(1);
+    let raw = format!("{abs:.sci_prec$e}");
+    let Some((mant, exp_str)) = raw.split_once('e') else {
+        return raw;
+    };
+    let exp = exp_str.parse::<i32>().unwrap_or(0);
+    let digits: String = mant.chars().filter(|&c| c != '.').collect();
+
+    if exp >= -4 && exp < (p as i32) {
+        if exp < 0 {
+            let leading_zeros = (-1 - exp) as usize;
+            let mut s = format!("0.{}{digits}", "0".repeat(leading_zeros));
+            if alt_hash {
+                if p > digits.len() {
+                    s.push_str(&"0".repeat(p - digits.len()));
+                }
+            } else {
+                while s.ends_with('0') {
+                    s.pop();
+                }
+                if s.ends_with('.') {
+                    if alt_bang {
+                        s.push('0');
+                    } else {
+                        s.pop();
+                    }
+                }
+            }
+            s
+        } else {
+            let int_digits = (exp + 1) as usize;
+            if int_digits < digits.len() {
+                let mut s = format!("{}.{}", &digits[..int_digits], &digits[int_digits..]);
+                if alt_hash {
+                    if p > digits.len() {
+                        s.push_str(&"0".repeat(p - digits.len()));
+                    }
+                } else {
+                    while s.ends_with('0') {
+                        s.pop();
+                    }
+                    if s.ends_with('.') {
+                        if alt_bang {
+                            s.push('0');
+                        } else {
+                            s.pop();
+                        }
+                    }
+                }
+                s
+            } else {
+                let mut s = format!("{digits}{}", "0".repeat(int_digits - digits.len()));
+                if alt_hash {
+                    if p > int_digits {
+                        s.push('.');
+                        s.push_str(&"0".repeat(p - int_digits));
+                    }
+                } else if alt_bang {
+                    s.push_str(".0");
+                }
+                s
+            }
+        }
+    } else {
+        let mut m = if digits.len() <= 1 {
+            digits.clone()
+        } else {
+            format!("{}.{}", &digits[..1], &digits[1..])
+        };
+        if alt_hash {
+            if digits.len() <= 1 && p > 1 {
+                m.push('.');
+                m.push_str(&"0".repeat(p - 1));
+            } else if p > digits.len() {
+                if !m.contains('.') {
+                    m.push('.');
+                }
+                m.push_str(&"0".repeat(p - digits.len()));
+            }
+        } else if m.contains('.') {
+            while m.ends_with('0') {
+                m.pop();
+            }
+            if m.ends_with('.') {
+                if alt_bang {
+                    m.push('0');
+                } else {
+                    m.pop();
+                }
+            }
+        } else if alt_bang {
+            m.push_str(".0");
+        }
+        let e_ch = if upper { 'E' } else { 'e' };
+        let e_sign = if exp < 0 { '-' } else { '+' };
+        let abs_exp = exp.unsigned_abs();
+        format!("{m}{e_ch}{e_sign}{abs_exp:02}")
+    }
+}
+
+fn insert_thousands_commas(digits: &str) -> String {
+    let len = digits.len();
+    if len <= 3 {
+        return digits.to_owned();
+    }
+    let mut out = String::with_capacity(len + (len - 1) / 3);
+    let first_group = len % 3;
+    let mut idx = 0;
+    if first_group > 0 {
+        out.push_str(&digits[..first_group]);
+        idx = first_group;
+    }
+    while idx < len {
+        if !out.is_empty() {
+            out.push(',');
+        }
+        out.push_str(&digits[idx..idx + 3]);
+        idx += 3;
+    }
+    out
+}
+
 fn simple_sqlite_printf(fmt: &str, args: &[Value]) -> String {
     let mut out = String::with_capacity(fmt.len() + 16);
     let bytes = fmt.as_bytes();
@@ -1549,6 +1924,11 @@ fn simple_sqlite_printf(fmt: &str, args: &[Value]) -> String {
         }
         let mut zero_pad = false;
         let mut left_align = false;
+        let mut plus_sign = false;
+        let mut space_sign = false;
+        let mut alt_hash = false;
+        let mut alt_bang = false;
+        let mut comma_sep = false;
         while i < bytes.len() {
             match bytes[i] {
                 b'0' => {
@@ -1559,7 +1939,24 @@ fn simple_sqlite_printf(fmt: &str, args: &[Value]) -> String {
                     left_align = true;
                     i += 1;
                 }
-                b'+' | b' ' | b'#' | b'!' | b',' => {
+                b'+' => {
+                    plus_sign = true;
+                    i += 1;
+                }
+                b' ' => {
+                    space_sign = true;
+                    i += 1;
+                }
+                b'#' => {
+                    alt_hash = true;
+                    i += 1;
+                }
+                b'!' => {
+                    alt_bang = true;
+                    i += 1;
+                }
+                b',' => {
+                    comma_sep = true;
                     i += 1;
                 }
                 _ => break,
@@ -1601,7 +1998,7 @@ fn simple_sqlite_printf(fmt: &str, args: &[Value]) -> String {
                 prec = Some(p);
             }
         }
-        // Optional length modifiers (`l`, `ll`, `z`)
+        // Optional length modifiers (`l`, `ll`, `h`, `z`)
         while i < bytes.len() && matches!(bytes[i], b'l' | b'h') {
             i += 1;
         }
@@ -1613,47 +2010,125 @@ fn simple_sqlite_printf(fmt: &str, args: &[Value]) -> String {
         let val = args.get(arg_idx).cloned().unwrap_or(Value::Null);
         arg_idx += 1;
 
-        let formatted = match spec {
+        let (prefix, body) = match spec {
             'd' | 'i' => {
-                let raw = format!("{}", val.to_integer_lossy());
-                if let Some(p) = prec {
-                    if p == 0 && raw == "0" {
-                        String::new()
-                    } else if let Some(digits) = raw.strip_prefix('-') {
-                        if digits.len() < p {
-                            format!("-{}{digits}", "0".repeat(p - digits.len()))
-                        } else {
-                            raw
-                        }
-                    } else if raw.len() < p {
-                        format!("{}{raw}", "0".repeat(p - raw.len()))
-                    } else {
-                        raw
-                    }
+                let n = val.to_integer_lossy();
+                let sign = if n < 0 {
+                    "-"
+                } else if plus_sign {
+                    "+"
+                } else if space_sign {
+                    " "
                 } else {
-                    raw
+                    ""
+                };
+                let mut digits = format!("{}", n.unsigned_abs());
+                if let Some(p) = prec {
+                    if p == 0 && digits == "0" {
+                        digits.clear();
+                    } else if digits.len() < p {
+                        digits = format!("{}{digits}", "0".repeat(p - digits.len()));
+                    }
                 }
+                if comma_sep && !digits.is_empty() {
+                    digits = insert_thousands_commas(&digits);
+                }
+                (sign.to_owned(), digits)
             }
-            'u' => format!("{}", val.to_integer_lossy() as u64),
-            'o' => format!("{:o}", val.to_integer_lossy() as u64),
-            'x' => format!("{:x}", val.to_integer_lossy() as u64),
-            'X' => format!("{:X}", val.to_integer_lossy() as u64),
-            'f' => {
-                let p = prec.unwrap_or(6);
-                format!("{:.*}", p, val.to_real_lossy())
+            'u' => {
+                let mut digits = format!("{}", val.to_integer_lossy() as u64);
+                if let Some(p) = prec {
+                    if p == 0 && digits == "0" {
+                        digits.clear();
+                    } else if digits.len() < p {
+                        digits = format!("{}{digits}", "0".repeat(p - digits.len()));
+                    }
+                }
+                if comma_sep && !digits.is_empty() {
+                    digits = insert_thousands_commas(&digits);
+                }
+                (String::new(), digits)
             }
-            'e' => {
-                let p = prec.unwrap_or(6);
-                format!("{:.*e}", p, val.to_real_lossy())
+            'o' => {
+                let v = val.to_integer_lossy() as u64;
+                let mut digits = format!("{v:o}");
+                if let Some(p) = prec {
+                    if p == 0 && v == 0 {
+                        digits.clear();
+                    } else if digits.len() < p {
+                        digits = format!("{}{digits}", "0".repeat(p - digits.len()));
+                    }
+                }
+                let pfx = if alt_hash && v != 0 && !digits.starts_with('0') {
+                    "0"
+                } else {
+                    ""
+                };
+                (pfx.to_owned(), digits)
             }
-            'E' => {
-                let p = prec.unwrap_or(6);
-                format!("{:.*E}", p, val.to_real_lossy())
+            'x' | 'X' => {
+                let v = val.to_integer_lossy() as u64;
+                let mut digits = if spec == 'X' {
+                    format!("{v:X}")
+                } else {
+                    format!("{v:x}")
+                };
+                if let Some(p) = prec {
+                    if p == 0 && v == 0 {
+                        digits.clear();
+                    } else if digits.len() < p {
+                        digits = format!("{}{digits}", "0".repeat(p - digits.len()));
+                    }
+                }
+                let pfx = if alt_hash && v != 0 {
+                    if spec == 'X' { "0X" } else { "0x" }
+                } else {
+                    ""
+                };
+                (pfx.to_owned(), digits)
+            }
+            'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
+                let r = val.to_real_lossy();
+                if r.is_nan() {
+                    (String::new(), "NaN".to_owned())
+                } else {
+                    let is_neg = r < 0.0;
+                    let sign = if is_neg {
+                        "-"
+                    } else if plus_sign {
+                        "+"
+                    } else if space_sign {
+                        " "
+                    } else {
+                        ""
+                    };
+                    if r.is_infinite() {
+                        (sign.to_owned(), "Inf".to_owned())
+                    } else {
+                        let abs = if r == 0.0 { 0.0 } else { r.abs() };
+                        let rendered = match spec {
+                            'f' | 'F' => {
+                                let p = prec.unwrap_or(6);
+                                let mut s = format!("{abs:.p$}");
+                                if p == 0 && alt_hash && !s.contains('.') {
+                                    s.push('.');
+                                }
+                                s
+                            }
+                            'e' | 'E' => {
+                                let p = prec.unwrap_or(6);
+                                format_sqlite_float_sci(abs, p, spec == 'E', alt_hash)
+                            }
+                            _ => format_sqlite_float_g(abs, prec, spec == 'G', alt_hash, alt_bang),
+                        };
+                        (sign.to_owned(), rendered)
+                    }
+                }
             }
             'c' => {
                 let repeat = prec.unwrap_or(1).max(1);
                 let s = val.to_text_lossy();
-                if let Some(ch) = s.chars().next() {
+                let rendered = if let Some(ch) = s.chars().next() {
                     let mut buf = String::with_capacity(ch.len_utf8() * repeat);
                     for _ in 0..repeat {
                         buf.push(ch);
@@ -1661,57 +2136,71 @@ fn simple_sqlite_printf(fmt: &str, args: &[Value]) -> String {
                     buf
                 } else {
                     String::new()
-                }
+                };
+                (String::new(), rendered)
             }
             'q' => {
-                if val.is_null() {
+                let rendered = if val.is_null() {
                     "(NULL)".to_owned()
                 } else {
                     let s = val.to_text_lossy();
                     let before_nul = s.split('\0').next().unwrap_or("");
                     before_nul.replace('\'', "''")
-                }
+                };
+                (String::new(), rendered)
             }
             'Q' => {
-                if val.is_null() {
+                let rendered = if val.is_null() {
                     "NULL".to_owned()
                 } else {
                     let s = val.to_text_lossy();
                     let before_nul = s.split('\0').next().unwrap_or("");
                     format!("'{}'", before_nul.replace('\'', "''"))
-                }
+                };
+                (String::new(), rendered)
             }
             's' | 'z' => {
                 let s = val.to_text_lossy();
                 let before_nul = s.split('\0').next().unwrap_or("");
-                if let Some(p) = prec {
+                let rendered = if let Some(p) = prec {
                     before_nul.chars().take(p).collect()
                 } else {
                     before_nul.to_owned()
-                }
+                };
+                (String::new(), rendered)
             }
-            _ => val.to_text_lossy(),
+            _ => (String::new(), val.to_text_lossy()),
         };
-        let char_len = formatted.chars().count();
+
+        let char_len = prefix.chars().count() + body.chars().count();
         if char_len < width {
             let pad = width - char_len;
             if left_align {
-                out.push_str(&formatted);
+                out.push_str(&prefix);
+                out.push_str(&body);
                 for _ in 0..pad {
                     out.push(' ');
                 }
                 continue;
             }
-            let pad_ch = if zero_pad && !matches!(spec, 's' | 'z' | 'c' | 'q' | 'Q') {
-                '0'
-            } else {
-                ' '
-            };
+            let use_zero = zero_pad
+                && !matches!(spec, 's' | 'z' | 'c' | 'q' | 'Q')
+                && body != "Inf"
+                && body != "NaN";
+            if use_zero {
+                out.push_str(&prefix);
+                for _ in 0..pad {
+                    out.push('0');
+                }
+                out.push_str(&body);
+                continue;
+            }
             for _ in 0..pad {
-                out.push(pad_ch);
+                out.push(' ');
             }
         }
-        out.push_str(&formatted);
+        out.push_str(&prefix);
+        out.push_str(&body);
     }
     out
 }

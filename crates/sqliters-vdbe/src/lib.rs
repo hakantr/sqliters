@@ -1803,53 +1803,67 @@ pub fn eval_cast_with_encoding(val: Value, type_name: &str, enc: TextEncoding) -
             }
         },
         TypeAffinity::Text => match val {
-            Value::Blob(b) => {
-                let s = match enc {
-                    TextEncoding::Utf8 => String::from_utf8_lossy(&b).into_owned(),
-                    TextEncoding::Utf16Le => {
-                        let units: Vec<u16> = b
-                            .as_chunks::<2>()
-                            .0
-                            .iter()
-                            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                            .take_while(|&u| u != 0)
-                            .collect();
-                        String::from_utf16_lossy(&units)
-                    }
-                    TextEncoding::Utf16Be => {
-                        let units: Vec<u16> = b
-                            .as_chunks::<2>()
-                            .0
-                            .iter()
-                            .map(|c| u16::from_be_bytes([c[0], c[1]]))
-                            .take_while(|&u| u != 0)
-                            .collect();
-                        String::from_utf16_lossy(&units)
-                    }
-                };
-                Value::Text(s)
-            }
+            Value::Blob(b) => Value::Text(decode_blob_for_cast(&b, enc)),
             other => Value::Text(other.to_text_lossy()),
         },
         TypeAffinity::Integer => Value::Integer(val.to_integer_lossy()),
         TypeAffinity::Real => Value::real(val.to_real_lossy()),
-        TypeAffinity::Numeric => {
-            if let Value::Text(ref s) = val {
-                if let Some(n) = sqliters_types::parse_numeric_text(s) {
-                    return n;
-                }
-                let f = val.to_real_lossy();
-                let i = val.to_integer_lossy();
-                if (i as f64) == f {
-                    Value::Integer(i)
-                } else {
-                    Value::real(f)
-                }
-            } else {
-                val
+        TypeAffinity::Numeric => match val {
+            Value::Integer(_) | Value::Real(_) => val,
+            Value::Null => Value::Null,
+            Value::Text(s) => cast_text_to_numeric(&s),
+            Value::Blob(b) => {
+                let s = decode_blob_for_cast(&b, enc);
+                cast_text_to_numeric(&s)
             }
+        },
+    }
+}
+
+fn decode_blob_for_cast(b: &[u8], enc: TextEncoding) -> String {
+    match enc {
+        TextEncoding::Utf8 => String::from_utf8_lossy(b).into_owned(),
+        TextEncoding::Utf16Le => {
+            let units: Vec<u16> = b
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .take_while(|&u| u != 0)
+                .collect();
+            String::from_utf16_lossy(&units)
+        }
+        TextEncoding::Utf16Be => {
+            let units: Vec<u16> = b
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .take_while(|&u| u != 0)
+                .collect();
+            String::from_utf16_lossy(&units)
         }
     }
+}
+
+fn cast_text_to_numeric(s: &str) -> Value {
+    let trimmed = s.trim();
+    if !trimmed.is_empty()
+        && !trimmed.contains('.')
+        && !trimmed.contains('e')
+        && !trimmed.contains('E')
+        && let Ok(i) = trimmed.parse::<i64>()
+    {
+        return Value::Integer(i);
+    }
+    let f = sqliters_types::parse_leading_f64(s);
+    if f.is_finite() && (-2_251_799_813_685_248.0..2_251_799_813_685_248.0).contains(&f) {
+        let i = f as i64;
+        if (i as f64) == f {
+            return Value::Integer(i);
+        }
+    }
+    Value::real(f)
 }
 
 fn compare_sorter_rows(

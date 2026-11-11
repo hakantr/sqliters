@@ -30,7 +30,7 @@ pub use runtime_api::{
 };
 pub use value::{
     Collation, CustomCollation, StorageClass, TextEncoding, TypeAffinity, Value, cmp_int_float,
-    format_sqlite_real, parse_numeric_text,
+    format_sqlite_real, parse_leading_f64, parse_leading_i64, parse_numeric_text,
 };
 pub use varint::{get_varint, get_varint_i64, push_varint, put_varint, put_varint_i64, varint_len};
 pub use vtab_api::{

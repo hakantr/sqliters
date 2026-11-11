@@ -95,6 +95,7 @@ impl TypeAffinity {
                 };
                 match v {
                     Value::Integer(i) => Value::real(i as f64),
+                    Value::Real(r) if r.to_bits() == (-0.0_f64).to_bits() => Value::Real(0.0),
                     other => other,
                 }
             }
@@ -366,14 +367,12 @@ pub enum Value {
 }
 
 impl Value {
-    /// Constructs a `Real` value, normalizing IEEE `NaN` to `Value::Null` per SQLite semantics.
+    /// Constructs a `Real` value, normalizing IEEE `NaN` to `Value::Null` per SQLite semantics
+    /// while preserving IEEE `-0.0` sign bit (`0x8000_0000_0000_0000`).
     #[inline]
     pub fn real(v: f64) -> Self {
         if v.is_nan() {
             Self::Null
-        } else if v == 0.0 {
-            // Normalize -0.0 to +0.0 for deterministic serialization, matching SQLite.
-            Self::Real(0.0)
         } else {
             Self::Real(v)
         }
@@ -527,7 +526,13 @@ impl Value {
             (_, Self::Null) => Ordering::Greater,
 
             (Self::Integer(a), Self::Integer(b)) => a.cmp(b),
-            (Self::Real(a), Self::Real(b)) => a.total_cmp(b),
+            (Self::Real(a), Self::Real(b)) => {
+                if *a == 0.0 && *b == 0.0 {
+                    Ordering::Equal
+                } else {
+                    a.total_cmp(b)
+                }
+            }
             (Self::Integer(i), Self::Real(r)) => cmp_int_float(*i, *r),
             (Self::Real(r), Self::Integer(i)) => cmp_int_float(*i, *r).reverse(),
 
@@ -716,20 +721,43 @@ fn real_to_exact_int(r: f64) -> Option<i64> {
     if (i as f64) == r { Some(i) } else { None }
 }
 
-fn parse_leading_i64(s: &str) -> i64 {
+pub fn parse_leading_i64(s: &str) -> i64 {
     let trimmed = s.trim_start();
-    let mut end = 0;
     let bytes = trimmed.as_bytes();
-    if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
-        end += 1;
+    let mut idx = 0;
+    let mut neg = false;
+    if idx < bytes.len() && (bytes[idx] == b'+' || bytes[idx] == b'-') {
+        neg = bytes[idx] == b'-';
+        idx += 1;
     }
-    while end < bytes.len() && bytes[end].is_ascii_digit() {
-        end += 1;
+    let digit_start = idx;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
     }
-    trimmed[..end].parse::<i64>().unwrap_or(0)
+    if idx == digit_start {
+        return 0;
+    }
+    let mut acc: u64 = 0;
+    let limit: u64 = if neg { 1u64 << 63 } else { (1u64 << 63) - 1 };
+    for &b in &bytes[digit_start..idx] {
+        let d = u64::from(b - b'0');
+        acc = match acc.checked_mul(10).and_then(|v| v.checked_add(d)) {
+            Some(v) if v <= limit => v,
+            _ => return if neg { i64::MIN } else { i64::MAX },
+        };
+    }
+    if neg {
+        if acc == (1u64 << 63) {
+            i64::MIN
+        } else {
+            -(acc as i64)
+        }
+    } else {
+        acc as i64
+    }
 }
 
-fn parse_leading_f64(s: &str) -> f64 {
+pub fn parse_leading_f64(s: &str) -> f64 {
     let trimmed = s.trim_start();
     let bytes = trimmed.as_bytes();
     let mut end = 0;

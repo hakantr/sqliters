@@ -3272,7 +3272,7 @@ impl Connection {
         }
     }
 
-    /// Queries (`limit < 0`) or updates (`limit >= 0`, clamped to `0..=SQLITE_MAX_COLUMN`)
+    /// Queries (`limit < 0`) or updates (`limit >= 0`, clamped to `0..=max_column_ceiling`)
     /// `SQLITE_LIMIT_COLUMN`, returning the **previous** limit.
     pub fn set_column_limit(&self, limit: isize) -> usize {
         if let Ok(mut session) = self.shared.enter() {
@@ -3288,6 +3288,25 @@ impl Connection {
                 }
             }
             prev
+        } else {
+            db_set::SQLITE_MAX_COLUMN
+        }
+    }
+
+    /// Configures the connection's hard `SQLITE_MAX_COLUMN` ceiling (`1..=32767`, default `2000`)
+    /// and sets `SQLITE_LIMIT_COLUMN` to the same effective ceiling, returning the effective ceiling.
+    pub fn set_max_column_ceiling(&self, ceiling: usize) -> usize {
+        if let Ok(mut session) = self.shared.enter() {
+            if session.inner().ensure_usable().is_err() {
+                return db_set::SQLITE_MAX_COLUMN;
+            }
+            let prev = session.inner().db_set.column_limit();
+            let inner = session.inner_mut();
+            let actual = inner.db_set.set_max_column_ceiling(ceiling);
+            if actual != prev {
+                inner.schema_generation += 1;
+            }
+            actual
         } else {
             db_set::SQLITE_MAX_COLUMN
         }

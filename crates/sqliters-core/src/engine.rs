@@ -16500,6 +16500,13 @@ fn validate_set_assignments_static(
     allow_agg: bool,
     visited: &mut Vec<(usize, usize)>,
 ) -> Result<()> {
+    let total_set_cols: usize = assigns.iter().map(|a| a.columns.len()).sum();
+    if total_set_cols > db_set.column_limit() {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            "too many columns in set list",
+        ));
+    }
     let _ = resolve_set_assignments_for_table(tbl, assigns)?;
     for sa in assigns {
         validate_collations_in_expr(&sa.expr, collations)?;
@@ -33073,6 +33080,20 @@ pub(crate) fn validate_and_infer_columns(
                 }
             }
             let (tbl_preview, auto_idxs) = build_table_schema_from_ast(ct, 2)?;
+            if tbl_preview.columns.len() > db_set.column_limit() {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("too many columns on {}", tbl_preview.name),
+                ));
+            }
+            for idx in &auto_idxs {
+                if idx.columns.len() > db_set.column_limit() {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "too many columns in index",
+                    ));
+                }
+            }
             validate_table_collations(&tbl_preview, &auto_idxs, collations)?;
             let slot_name = db_set.slot(db_id).map_or("main", |s| s.name.as_str());
             let tbl_scope = make_static_table_scope(&tbl_preview, slot_name, None);
@@ -33210,6 +33231,16 @@ pub(crate) fn validate_and_infer_columns(
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!("object name reserved for internal use: {}", cv.name.name),
+                ));
+            }
+            if cv
+                .columns
+                .as_ref()
+                .is_some_and(|cols| cols.len() > db_set.column_limit())
+            {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("too many columns on {}", cv.name.name),
                 ));
             }
             validate_view_no_parameters(&cv.query)?;
@@ -33553,6 +33584,12 @@ pub(crate) fn validate_and_infer_columns(
                 ));
             }
             let idx_preview = build_index_schema_from_ast(ci, tbl, 2)?;
+            if idx_preview.columns.len() > db_set.column_limit() {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    "too many columns in index",
+                ));
+            }
             crate::schema::validate_index_collations(&idx_preview, collations)?;
             for ic in &idx_preview.columns {
                 if let Some(ref ie) = ic.expr {
@@ -33761,6 +33798,12 @@ pub(crate) fn validate_and_infer_columns(
                     }
                 }
                 AlterTableAction::AddColumn(cdef) => {
+                    if tbl.columns.len() + 1 > db_set.column_limit() {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("too many columns on {}", tbl.name),
+                        ));
+                    }
                     if tbl.find_column(&cdef.name).is_some() {
                         return Err(SqliteError::new(
                             ErrorCode::Error,
@@ -34205,6 +34248,13 @@ fn validate_set_assignments_for_view_static(
     allow_agg: bool,
     visited: &mut Vec<(usize, usize)>,
 ) -> Result<()> {
+    let total_set_cols: usize = assigns.iter().map(|a| a.columns.len()).sum();
+    if total_set_cols > db_set.column_limit() {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            "too many columns in set list",
+        ));
+    }
     let _ = resolve_set_assignments_for_view(col_specs, assigns)?;
     for sa in assigns {
         validate_collations_in_expr(&sa.expr, collations)?;
@@ -35921,6 +35971,12 @@ fn validate_select_stmt_static(
         }
 
         let width = head_cols.len();
+        if stmt.order_by.len() > db_set.column_limit() {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                "too many terms in ORDER BY clause",
+            ));
+        }
         for (ob_idx, ob) in stmt.order_by.iter().enumerate() {
             validate_subquery_from_tables_in_expr_static(
                 &ob.expr,
@@ -36045,6 +36101,12 @@ fn validate_single_select_core_static(
                 ));
             }
             if !order_by.is_empty() {
+                if order_by.len() > db_set.column_limit() {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        "too many terms in ORDER BY clause",
+                    ));
+                }
                 for (ob_idx, ob) in order_by.iter().enumerate() {
                     let mut inner = &ob.expr;
                     while let Expr::Collate { expr, .. } = inner {
@@ -36269,6 +36331,12 @@ fn validate_single_select_core_static(
                 )?;
             }
 
+            if group_by.len() > db_set.column_limit() {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    "too many terms in GROUP BY clause",
+                ));
+            }
             for (gi, ge) in group_by.iter().enumerate() {
                 if let Some(ord) = strip_collate_and_unary_plus(ge) {
                     if ord < 1 || (ord as usize) > expanded_proj.len() {
@@ -36343,6 +36411,12 @@ fn validate_single_select_core_static(
                 )?;
             }
 
+            if order_by.len() > db_set.column_limit() {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    "too many terms in ORDER BY clause",
+                ));
+            }
             let ob_scopes = &proj_scopes;
             for (oi, ob) in order_by.iter().enumerate() {
                 if let Some(ord) = strip_collate_and_unary_plus(&ob.expr) {
