@@ -1614,7 +1614,7 @@ fn test_zero_cursor_leak_across_done_reset_halt_error_and_statement_drop() {
     scan_prog.emit(Instruction::new(Opcode::OpenRead, 0, tbl_root as i32, 2));
     scan_prog.emit(
         Instruction::new(Opcode::OpenReadIndex, 1, idx_root as i32, 0)
-            .with_p4(P4::KeyInfo(orders.clone())),
+            .with_p4(P4::key_info(orders.clone())),
     );
     let rew = scan_prog.emit(Instruction::new(Opcode::Rewind, 0, 0, 0));
     scan_prog.emit(Instruction::new(Opcode::Rowid, 0, 1, 0));
@@ -1651,7 +1651,7 @@ fn test_zero_cursor_leak_across_done_reset_halt_error_and_statement_drop() {
     err_prog.emit(Instruction::new(Opcode::OpenRead, 0, tbl_root as i32, 2));
     err_prog.emit(
         Instruction::new(Opcode::OpenReadIndex, 1, idx_root as i32, 0)
-            .with_p4(P4::KeyInfo(orders.clone())),
+            .with_p4(P4::key_info(orders.clone())),
     );
     err_prog.emit(
         Instruction::new(Opcode::Halt, extended::SQLITE_CONSTRAINT_CHECK, 0, 0)
@@ -1675,7 +1675,7 @@ fn test_zero_cursor_leak_across_done_reset_halt_error_and_statement_drop() {
     uniq_prog.emit(Instruction::new(Opcode::OpenWrite, 0, tbl_root as i32, 2));
     uniq_prog.emit(
         Instruction::new(Opcode::OpenWriteIndex, 1, idx_root as i32, 0)
-            .with_p4(P4::KeyInfo(orders.clone())),
+            .with_p4(P4::key_info(orders.clone())),
     );
     uniq_prog.emit(Instruction::new(Opcode::String8, 0, 1, 0).with_p4(P4::Str("u-5".to_owned())));
     uniq_prog.emit(Instruction::new(Opcode::Integer, 999, 2, 0)); // conflicting rowid 999 != existing rowid 5!

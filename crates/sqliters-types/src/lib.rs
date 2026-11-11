@@ -17,11 +17,13 @@ pub use bitvec::Bitvec;
 pub use error::{ConflictResolutionEffect, ErrorCode, Result, SqliteError, extended};
 pub use limits::*;
 pub use record::{
-    KeySortOrder, compare_records, compare_records_with_encoding, decode_record,
-    decode_record_column, decode_record_column_with_encoding, decode_record_with_encoding,
-    decode_serial_value, decode_serial_value_with_encoding, encode_record,
-    encode_record_with_encoding, encode_runtime_record_with_encoding, fallible_sort_by,
-    serial_type_for, serial_type_for_with_encoding, serial_type_len,
+    KeySortOrder, compare_raw_records_with_encoding, compare_records,
+    compare_records_with_encoding, decode_record, decode_record_column,
+    decode_record_column_with_encoding, decode_record_with_encoding, decode_serial_value,
+    decode_serial_value_pooled, decode_serial_value_with_encoding, encode_record,
+    encode_record_into, encode_record_with_encoding, encode_runtime_record_into,
+    encode_runtime_record_with_encoding, encode_value_refs_record_into, fallible_sort_by,
+    raw_record_prefix_has_null, serial_type_for, serial_type_for_with_encoding, serial_type_len,
 };
 pub use runtime_api::{
     AggregateStepId, DatabaseId, ExecutionServices, FunctionFlags, MAX_DB_SLOTS, RowMutationEvent,

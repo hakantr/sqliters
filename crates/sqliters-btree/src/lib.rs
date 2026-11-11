@@ -7,7 +7,6 @@ pub mod page;
 pub mod ptrmap;
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -19,26 +18,45 @@ use sqliters_pager::{
 };
 use sqliters_types::{
     Bitvec, ErrorCode, KeySortOrder, Pgno, Result, SqliteError, TextEncoding, Value,
-    compare_records_with_encoding, decode_record_with_encoding, extended, get_varint,
-    get_varint_i64, serial_type_len,
+    compare_records_with_encoding, decode_record_with_encoding, decode_serial_value_with_encoding,
+    extended, get_varint, get_varint_i64, put_varint, serial_type_len, varint_len,
 };
 use sqliters_vfs::{OpenFlags, Vfs};
 
 pub use cursor::{
-    BTCURSOR_MAX_DEPTH, BtreeCursorState, CursorId, CursorKind, CursorPagePos, SavedCursorKey,
-    SkipNext,
+    BTCURSOR_MAX_DEPTH, BtreeCursorState, CursorId, CursorKind, CursorPagePos, CursorStack,
+    SavedCursorKey, SkipNext,
 };
 pub use page::{
     BtreePageType, IndexInteriorCell, IndexLeafCell, ParsedPage, PayloadBounds, RawIndexCell,
-    RawLeafDeleteOutcome, RawTableLeafCell, TableInteriorCell, TableLeafCell,
-    apply_insert_index_leaf_in_place, binary_search_table_leaf, find_index_interior_child_in_place,
-    find_table_interior_child, last_table_leaf_rowid, peek_page_type,
-    probe_insert_index_leaf_in_place, raw_cell_offset, raw_page_header, read_index_interior_cell,
-    read_index_leaf_cell, read_table_interior_cell, read_table_leaf_cell, read_table_leaf_rowid,
-    seek_table_leaf_cell, table_interior_right_child, try_delete_table_leaf_in_place,
-    try_insert_table_leaf_in_place,
+    RawIndexInteriorStep, RawLeafDeleteOutcome, RawTableLeafCell, TableInteriorCell, TableLeafCell,
+    TableLeafInsertProbe, apply_append_table_interior_rightmost, apply_delete_index_leaf_in_place,
+    apply_insert_index_leaf_in_place, apply_insert_index_leaf_raw, apply_insert_table_leaf_raw,
+    apply_replace_table_leaf_raw, binary_search_table_leaf, binary_search_table_leaf_with_span,
+    defragment_raw_leaf_in_place, find_index_interior_child_in_place,
+    find_index_interior_child_raw, find_table_interior_child,
+    find_table_interior_child_append_hint, init_single_cell_table_leaf_raw, last_table_leaf_rowid,
+    peek_page_type, probe_append_table_interior_rightmost, probe_delete_index_leaf_in_place,
+    probe_delete_index_leaf_raw, probe_index_interior_step_raw, probe_insert_index_leaf_in_place,
+    probe_insert_index_leaf_raw, probe_insert_table_leaf_raw, raw_cell_offset, raw_page_free_space,
+    raw_page_header, read_index_interior_cell, read_index_leaf_cell, read_table_interior_cell,
+    read_table_leaf_cell, read_table_leaf_rowid, seek_table_leaf_cell, table_interior_right_child,
+    try_delete_table_leaf_in_place, try_insert_table_leaf_in_place,
 };
 pub use ptrmap::{PtrmapType, RootPageMove, is_ptrmap_page, ptrmap_offset, ptrmap_pageno};
+
+/// Column projection descriptor for single-row `rowid` point `SELECT` fast path.
+#[derive(Clone, Debug)]
+pub enum PointProjCol {
+    /// Projects the row's `rowid` / `INTEGER PRIMARY KEY` (`Value::Integer(rowid)`).
+    Rowid,
+    /// Projects stored record column `col_idx` (0-based within the physical table record),
+    /// substituting `default_val` (or `Value::Null` when `None`) if the stored record omits it.
+    Column {
+        col_idx: u16,
+        default_val: Option<Value>,
+    },
+}
 
 /// Page allocation search policy (`BTALLOC_ANY`, `BTALLOC_EXACT`, `BTALLOC_LE` in `btree.c`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,11 +66,144 @@ pub enum AllocMode {
     Le(Pgno),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FastTableInsertOutcome {
+    Inserted,
+    Duplicate,
+    Fallback,
+}
+
+#[inline]
+fn decode_projected_cols_from_record(
+    payload: &[u8],
+    rowid: i64,
+    cols: &[PointProjCol],
+    enc: TextEncoding,
+) -> Result<Vec<Value>> {
+    let mut max_col: Option<usize> = None;
+    for c in cols {
+        if let PointProjCol::Column { col_idx, .. } = c {
+            let ci = *col_idx as usize;
+            max_col = Some(max_col.map_or(ci, |m| m.max(ci)));
+        }
+    }
+    let Some(max_ci) = max_col else {
+        let mut out = Vec::with_capacity(cols.len());
+        for _ in cols {
+            out.push(Value::Integer(rowid));
+        }
+        return Ok(out);
+    };
+    if payload.is_empty() {
+        let mut out = Vec::with_capacity(cols.len());
+        for c in cols {
+            match c {
+                PointProjCol::Rowid => out.push(Value::Integer(rowid)),
+                PointProjCol::Column { default_val, .. } => {
+                    out.push(default_val.clone().unwrap_or(Value::Null));
+                }
+            }
+        }
+        return Ok(out);
+    }
+
+    let (hdr_u64, mut hdr_pos) = get_varint(payload)?;
+    let hdr_len = usize::try_from(hdr_u64)
+        .ok()
+        .filter(|&h| h <= payload.len() && hdr_pos <= h)
+        .ok_or_else(|| SqliteError::corrupt("record header exceeds record length"))?;
+    let mut body_pos = hdr_len;
+
+    if max_ci < 32 {
+        let mut serials = [0u64; 32];
+        let mut offs = [0usize; 32];
+        let mut lens = [0usize; 32];
+        let mut parsed = 0usize;
+        while parsed <= max_ci && hdr_pos < hdr_len {
+            let (st, used) = get_varint(&payload[hdr_pos..hdr_len])?;
+            let len = serial_type_len(st)?;
+            let next_b = body_pos
+                .checked_add(len)
+                .filter(|&nb| nb <= payload.len())
+                .ok_or_else(|| SqliteError::corrupt("record payload truncated"))?;
+            serials[parsed] = st;
+            offs[parsed] = body_pos;
+            lens[parsed] = len;
+            hdr_pos += used;
+            body_pos = next_b;
+            parsed += 1;
+        }
+
+        let mut out = Vec::with_capacity(cols.len());
+        for c in cols {
+            match c {
+                PointProjCol::Rowid => out.push(Value::Integer(rowid)),
+                PointProjCol::Column {
+                    col_idx,
+                    default_val,
+                } => {
+                    let ci = *col_idx as usize;
+                    if ci >= parsed {
+                        out.push(default_val.clone().unwrap_or(Value::Null));
+                    } else {
+                        let start = offs[ci];
+                        let len = lens[ci];
+                        out.push(decode_serial_value_with_encoding(
+                            serials[ci],
+                            &payload[start..start + len],
+                            enc,
+                        )?);
+                    }
+                }
+            }
+        }
+        return Ok(out);
+    }
+
+    let mut meta: Vec<(u64, usize, usize)> = Vec::with_capacity(max_ci + 1);
+    while meta.len() <= max_ci && hdr_pos < hdr_len {
+        let (st, used) = get_varint(&payload[hdr_pos..hdr_len])?;
+        let len = serial_type_len(st)?;
+        let next_b = body_pos
+            .checked_add(len)
+            .filter(|&nb| nb <= payload.len())
+            .ok_or_else(|| SqliteError::corrupt("record payload truncated"))?;
+        meta.push((st, body_pos, len));
+        hdr_pos += used;
+        body_pos = next_b;
+    }
+
+    let mut out = Vec::with_capacity(cols.len());
+    for c in cols {
+        match c {
+            PointProjCol::Rowid => out.push(Value::Integer(rowid)),
+            PointProjCol::Column {
+                col_idx,
+                default_val,
+            } => {
+                let ci = *col_idx as usize;
+                if let Some(&(st, start, len)) = meta.get(ci) {
+                    out.push(decode_serial_value_with_encoding(
+                        st,
+                        &payload[start..start + len],
+                        enc,
+                    )?);
+                } else {
+                    out.push(default_val.clone().unwrap_or(Value::Null));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// SQLite B-Tree storage manager over a [`Pager`].
 pub struct Btree {
     pager: Pager,
-    pub(crate) cursors: BTreeMap<CursorId, cursor::BtreeCursor>,
-    pub(crate) next_cursor_id: u64,
+    pub(crate) cursor_slots: Vec<cursor::CursorSlot>,
+    pub(crate) free_cursor_slots: Vec<u32>,
+    pub(crate) open_cursor_count: usize,
+    pub(crate) next_cursor_gen: u32,
     interrupt_flag: Option<Arc<AtomicBool>>,
 }
 
@@ -60,8 +211,10 @@ impl Btree {
     pub fn new(pager: Pager) -> Self {
         Self {
             pager,
-            cursors: BTreeMap::new(),
-            next_cursor_id: 1,
+            cursor_slots: Vec::new(),
+            free_cursor_slots: Vec::new(),
+            open_cursor_count: 0,
+            next_cursor_gen: 1,
             interrupt_flag: None,
         }
     }
@@ -121,7 +274,7 @@ impl Btree {
     }
 
     pub fn close(&mut self) -> Result<()> {
-        self.cursors.clear();
+        self.close_all_cursors();
         self.pager.close()
     }
 
@@ -927,11 +1080,7 @@ impl Btree {
         if root_pgno < max_root {
             self.save_cursors_for_mutation(Some(max_root), None)?;
             self.relocate_page(max_root, PtrmapType::RootPage, 0, root_pgno, false)?;
-            for cur in self.cursors.values_mut() {
-                if cur.root_pgno == max_root {
-                    cur.root_pgno = root_pgno;
-                }
-            }
+            self.remap_open_cursor_roots(max_root, root_pgno);
             self.free_page(max_root)?;
             self.pager.header_mut()?.largest_root_btree_page = new_max;
             Ok(Some(RootPageMove {
@@ -1148,6 +1297,231 @@ impl Btree {
                 Err(next_pgno) => cur_pgno = next_pgno,
             }
         }
+    }
+
+    /// Single-pass `rowid` point lookup that decodes only the requested [`PointProjCol`] columns
+    /// directly from the raw `TableLeaf` page buffer without opening a `BtreeCursor` or allocating
+    /// a `Vec<u8>` record buffer when the row payload fits in-page.
+    pub fn point_lookup_table_columns(
+        &mut self,
+        root_pgno: Pgno,
+        rowid: i64,
+        cols: &[PointProjCol],
+    ) -> Result<Option<Vec<Value>>> {
+        if self.pager.page_count() == 0 {
+            return Ok(None);
+        }
+        let enc = self.encoding();
+        let usable = self.pager.usable_size();
+        let mut cur_pgno = root_pgno;
+        loop {
+            self.check_interrupted()?;
+            enum LookupStep {
+                Descend(Pgno),
+                Done(Option<Vec<Value>>),
+                Overflow(u32, Vec<u8>, Option<Pgno>),
+            }
+            let step = {
+                let raw = self.pager.read_page(cur_pgno)?;
+                let hdr_off = if cur_pgno == 1 { 100 } else { 0 };
+                if hdr_off >= usable as usize || raw.len() < usable as usize {
+                    return Err(SqliteError::corrupt("raw page smaller than usable_size"));
+                }
+                match raw[hdr_off] {
+                    x if x == BtreePageType::TableInterior as u8 => {
+                        let (_, next_pgno) =
+                            find_table_interior_child(cur_pgno, usable, raw, rowid)?;
+                        LookupStep::Descend(next_pgno)
+                    }
+                    x if x == BtreePageType::TableLeaf as u8 => {
+                        let (_, n_cell, _) = raw_page_header(cur_pgno, usable, raw)?;
+                        match binary_search_table_leaf_with_span(
+                            cur_pgno, usable, raw, n_cell, rowid,
+                        )? {
+                            Err(_) => LookupStep::Done(None),
+                            Ok((_, Some((p_start, p_end)))) => {
+                                let payload = &raw[p_start as usize..p_end as usize];
+                                let vals =
+                                    decode_projected_cols_from_record(payload, rowid, cols, enc)?;
+                                LookupStep::Done(Some(vals))
+                            }
+                            Ok((cell_idx, None)) => {
+                                let c =
+                                    read_table_leaf_cell(cur_pgno, usable, raw, n_cell, cell_idx)?;
+                                LookupStep::Overflow(
+                                    c.total_payload_len,
+                                    c.local_payload.to_vec(),
+                                    c.overflow_page,
+                                )
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(SqliteError::corrupt(format!(
+                            "expected table page at {cur_pgno}"
+                        )));
+                    }
+                }
+            };
+            match step {
+                LookupStep::Descend(next_pgno) => cur_pgno = next_pgno,
+                LookupStep::Done(res) => return Ok(res),
+                LookupStep::Overflow(total_len, local_copy, ovfl) => {
+                    let full = self.read_full_payload(total_len, &local_copy, ovfl)?;
+                    let vals = decode_projected_cols_from_record(&full, rowid, cols, enc)?;
+                    return Ok(Some(vals));
+                }
+            }
+        }
+    }
+
+    /// Scans all cells of the Table B+Tree rooted at `root_pgno` in ascending `rowid` order,
+    /// passing `(rowid, raw_record_slice)` directly from each `TableLeaf` page with zero heap
+    /// allocations for non-overflow cells (`1` `read_page` per leaf page).
+    pub fn scan_table_raw_cells<F>(&mut self, root_pgno: Pgno, mut visit: F) -> Result<()>
+    where
+        F: FnMut(i64, &[u8]) -> Result<()>,
+    {
+        if self.pager.page_count() == 0 {
+            return Ok(());
+        }
+        let usable = self.pager.usable_size();
+        let usable_usize = usable as usize;
+        let bounds = PayloadBounds::for_table_leaf(usable);
+        let max_local = bounds.max_local as usize;
+        let max_pages = (self.pager.page_count() as usize).saturating_add(2);
+        let mut visited_pages = 0usize;
+        let mut stack: Vec<(Pgno, usize)> = Vec::with_capacity(8);
+        stack.push((root_pgno, 0));
+
+        while let Some((pgno, next_idx)) = stack.pop() {
+            if next_idx == 0 {
+                self.check_interrupted()?;
+                visited_pages += 1;
+                if visited_pages > max_pages {
+                    return Err(SqliteError::corrupt("cycle detected in table B+Tree"));
+                }
+            }
+
+            enum PageKind {
+                InteriorStep {
+                    resume: Option<(Pgno, usize)>,
+                    child: Pgno,
+                },
+                Leaf,
+            }
+
+            let kind = {
+                let raw = self.pager.read_page(pgno)?;
+                let (ptype, n_cell, _) = raw_page_header(pgno, usable, raw)?;
+                match ptype {
+                    BtreePageType::TableInterior => {
+                        if next_idx < n_cell {
+                            let (left_child, _) =
+                                read_table_interior_cell(pgno, usable, raw, n_cell, next_idx)?;
+                            PageKind::InteriorStep {
+                                resume: Some((pgno, next_idx + 1)),
+                                child: left_child,
+                            }
+                        } else {
+                            let right_child = table_interior_right_child(pgno, usable, raw)?;
+                            PageKind::InteriorStep {
+                                resume: None,
+                                child: right_child,
+                            }
+                        }
+                    }
+                    BtreePageType::TableLeaf => PageKind::Leaf,
+                    _ => {
+                        return Err(SqliteError::corrupt(format!(
+                            "expected table page at {pgno}"
+                        )));
+                    }
+                }
+            };
+
+            match kind {
+                PageKind::InteriorStep { resume, child } => {
+                    if let Some(r) = resume {
+                        stack.push(r);
+                    }
+                    stack.push((child, 0));
+                }
+                PageKind::Leaf => {
+                    let mut ci = 0usize;
+                    loop {
+                        let ovfl_cell = {
+                            let raw = self.pager.read_page(pgno)?;
+                            let (_, n_cell, _) = raw_page_header(pgno, usable, raw)?;
+                            let hdr_off: usize = if pgno == 1 { 100 } else { 0 };
+                            let ptr_base = hdr_off + 8;
+                            let ptr_end = ptr_base
+                                .checked_add(2 * n_cell)
+                                .ok_or_else(|| SqliteError::corrupt("cell pointer overflow"))?;
+                            if ptr_end > usable_usize || raw.len() < usable_usize {
+                                return Err(SqliteError::corrupt("cell pointer out of bounds"));
+                            }
+                            let mut spilled = None;
+                            while ci < n_cell {
+                                let p = ptr_base + 2 * ci;
+                                let off = u16::from_be_bytes([raw[p], raw[p + 1]]) as usize;
+                                if off < ptr_end || off >= usable_usize {
+                                    return Err(SqliteError::corrupt("invalid cell offset"));
+                                }
+                                let (payload_u64, n1) = get_varint(&raw[off..usable_usize])?;
+                                let total_u32 = u32::try_from(payload_u64).map_err(|_| {
+                                    SqliteError::corrupt("table cell payload > 4GiB")
+                                })?;
+                                let total_len = total_u32 as usize;
+                                let (rowid, n2) = get_varint_i64(&raw[off + n1..usable_usize])?;
+                                let p_start = off + n1 + n2;
+                                if total_len <= max_local {
+                                    let p_end = p_start + total_len;
+                                    if p_end > usable_usize {
+                                        return Err(SqliteError::corrupt(
+                                            "table leaf cell extends past end of page",
+                                        ));
+                                    }
+                                    visit(rowid, &raw[p_start..p_end])?;
+                                    ci += 1;
+                                } else {
+                                    let local_len = bounds.local_len(total_u32);
+                                    let local_end = p_start + local_len;
+                                    if local_end + 4 > usable_usize {
+                                        return Err(SqliteError::corrupt(
+                                            "table leaf overflow cell extends past end of page",
+                                        ));
+                                    }
+                                    let ovfl_pgno = u32::from_be_bytes([
+                                        raw[local_end],
+                                        raw[local_end + 1],
+                                        raw[local_end + 2],
+                                        raw[local_end + 3],
+                                    ]);
+                                    spilled = Some((
+                                        rowid,
+                                        total_u32,
+                                        raw[p_start..local_end].to_vec(),
+                                        Some(ovfl_pgno),
+                                    ));
+                                    ci += 1;
+                                    break;
+                                }
+                            }
+                            spilled
+                        };
+
+                        if let Some((rowid, total_u32, local_copy, ovfl)) = ovfl_cell {
+                            let full = self.read_full_payload(total_u32, &local_copy, ovfl)?;
+                            visit(rowid, &full)?;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Locates the leaf page and cell payload layout `(leaf_pgno, local_start, local_len, total_payload_len, overflow_page)`
@@ -1447,6 +1821,7 @@ impl Btree {
         if data.is_empty() {
             return Ok(());
         }
+        self.invalidate_all_cursor_caches();
 
         let mut remaining_in = data;
         let mut cur_off = payload_offset;
@@ -1560,6 +1935,16 @@ impl Btree {
         self.save_cursors_for_mutation(Some(root_pgno), None)?;
         let usable = self.pager.usable_size();
         let bounds = PayloadBounds::for_table_leaf(usable);
+
+        if payload.len() <= bounds.max_local as usize
+            && matches!(
+                self.try_insert_table_fast_raw(root_pgno, usable, rowid, payload, true)?,
+                FastTableInsertOutcome::Inserted
+            )
+        {
+            return Ok(());
+        }
+
         let (total_len, local_payload, overflow_page) =
             self.prepare_cell_payload(bounds, payload)?;
         let new_cell = TableLeafCell {
@@ -1571,6 +1956,215 @@ impl Btree {
 
         let _ = self.insert_table_rec(root_pgno, new_cell, true, root_pgno != 1)?;
         Ok(())
+    }
+
+    /// Inserts `(rowid, payload)` into the Table B+Tree rooted at `root_pgno` if and only if
+    /// `rowid` is not already present, returning `Ok(true)` when inserted or `Ok(false)` on duplicate `rowid`
+    /// without mutating any B-tree page.
+    pub fn insert_table_unique(
+        &mut self,
+        root_pgno: Pgno,
+        rowid: i64,
+        payload: &[u8],
+    ) -> Result<bool> {
+        self.save_cursors_for_mutation(Some(root_pgno), None)?;
+        let usable = self.pager.usable_size();
+        let bounds = PayloadBounds::for_table_leaf(usable);
+
+        if payload.len() <= bounds.max_local as usize {
+            match self.try_insert_table_fast_raw(root_pgno, usable, rowid, payload, false)? {
+                FastTableInsertOutcome::Inserted => return Ok(true),
+                FastTableInsertOutcome::Duplicate => return Ok(false),
+                FastTableInsertOutcome::Fallback => {}
+            }
+        }
+
+        if self
+            .locate_table_leaf_cell_layout(root_pgno, rowid)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+
+        let (total_len, local_payload, overflow_page) =
+            self.prepare_cell_payload(bounds, payload)?;
+        let new_cell = TableLeafCell {
+            rowid,
+            total_payload_len: total_len,
+            local_payload,
+            overflow_page,
+        };
+
+        let _ = self.insert_table_rec(root_pgno, new_cell, true, root_pgno != 1)?;
+        Ok(true)
+    }
+
+    fn try_insert_table_fast_raw(
+        &mut self,
+        root_pgno: Pgno,
+        usable: u32,
+        rowid: i64,
+        payload: &[u8],
+        allow_replace: bool,
+    ) -> Result<FastTableInsertOutcome> {
+        enum RawLevelStep {
+            Descend {
+                idx: usize,
+                child: Pgno,
+                n_cells: usize,
+            },
+            Leaf(TableLeafInsertProbe),
+            Bail,
+        }
+
+        let mut cur_pgno = root_pgno;
+        let mut parent_pgno: Pgno = 0;
+        let mut allow_quick_in_parent = false;
+        let mut defragged_leaf = false;
+
+        for _ in 0..(BTCURSOR_MAX_DEPTH + 1) {
+            let hdr_off = if cur_pgno == 1 { 100 } else { 0 };
+            let step = {
+                let raw = self.pager.read_page(cur_pgno)?;
+                if hdr_off >= usable as usize || hdr_off >= raw.len() {
+                    RawLevelStep::Bail
+                } else {
+                    let ptype_byte = raw[hdr_off];
+                    if ptype_byte == BtreePageType::TableInterior as u8 {
+                        let (idx, child, n_cells) =
+                            find_table_interior_child_append_hint(cur_pgno, usable, raw, rowid)?;
+                        RawLevelStep::Descend {
+                            idx,
+                            child,
+                            n_cells,
+                        }
+                    } else if ptype_byte == BtreePageType::TableLeaf as u8 {
+                        RawLevelStep::Leaf(probe_insert_table_leaf_raw(
+                            cur_pgno,
+                            usable,
+                            raw,
+                            rowid,
+                            payload.len(),
+                        )?)
+                    } else {
+                        RawLevelStep::Bail
+                    }
+                }
+            };
+
+            let probe = match step {
+                RawLevelStep::Descend {
+                    idx,
+                    child,
+                    n_cells,
+                } => {
+                    allow_quick_in_parent = cur_pgno != 1 && idx == n_cells;
+                    parent_pgno = cur_pgno;
+                    cur_pgno = child;
+                    continue;
+                }
+                RawLevelStep::Leaf(p) => p,
+                RawLevelStep::Bail => return Ok(FastTableInsertOutcome::Fallback),
+            };
+
+            match probe {
+                TableLeafInsertProbe::Fit {
+                    insert_idx,
+                    content_top,
+                } => {
+                    let raw_mut = self.pager.write_page(cur_pgno)?;
+                    apply_insert_table_leaf_raw(
+                        cur_pgno,
+                        raw_mut,
+                        rowid,
+                        payload,
+                        insert_idx,
+                        content_top,
+                    );
+                    return Ok(FastTableInsertOutcome::Inserted);
+                }
+                TableLeafInsertProbe::Replace {
+                    idx,
+                    old_off,
+                    old_cell_len,
+                    content_top,
+                } => {
+                    if !allow_replace {
+                        return Ok(FastTableInsertOutcome::Duplicate);
+                    }
+                    let raw_mut = self.pager.write_page(cur_pgno)?;
+                    apply_replace_table_leaf_raw(
+                        cur_pgno,
+                        usable,
+                        raw_mut,
+                        rowid,
+                        payload,
+                        idx,
+                        old_off,
+                        old_cell_len,
+                        content_top,
+                    );
+                    return Ok(FastTableInsertOutcome::Inserted);
+                }
+                TableLeafInsertProbe::NeedsDefrag if !defragged_leaf => {
+                    defragged_leaf = true;
+                    let raw_mut = self.pager.write_page(cur_pgno)?;
+                    defragment_raw_leaf_in_place(cur_pgno, usable, raw_mut)?;
+                    continue;
+                }
+                TableLeafInsertProbe::DuplicateNeedsFallback => {
+                    return Ok(if allow_replace {
+                        FastTableInsertOutcome::Fallback
+                    } else {
+                        FastTableInsertOutcome::Duplicate
+                    });
+                }
+                TableLeafInsertProbe::QuickRightSplit { last_rowid }
+                    if allow_quick_in_parent && cur_pgno != root_pgno && cur_pgno != 1 =>
+                {
+                    let parent_top_opt = {
+                        let parent_raw = self.pager.read_page(parent_pgno)?;
+                        probe_append_table_interior_rightmost(
+                            parent_pgno,
+                            usable,
+                            parent_raw,
+                            last_rowid,
+                        )
+                    };
+                    if let Some(parent_top) = parent_top_opt {
+                        let new_leaf = self.allocate_page()?;
+                        {
+                            let new_leaf_mut = self.pager.write_page(new_leaf)?;
+                            init_single_cell_table_leaf_raw(
+                                new_leaf,
+                                usable,
+                                new_leaf_mut,
+                                rowid,
+                                payload,
+                            );
+                        }
+                        {
+                            let parent_mut = self.pager.write_page(parent_pgno)?;
+                            apply_append_table_interior_rightmost(
+                                parent_pgno,
+                                parent_mut,
+                                cur_pgno,
+                                last_rowid,
+                                new_leaf,
+                                parent_top,
+                            );
+                        }
+                        if self.is_auto_vacuum() {
+                            self.ptrmap_put(new_leaf, PtrmapType::BtreeNode, parent_pgno)?;
+                        }
+                        return Ok(FastTableInsertOutcome::Inserted);
+                    }
+                    return Ok(FastTableInsertOutcome::Fallback);
+                }
+                _ => return Ok(FastTableInsertOutcome::Fallback),
+            }
+        }
+        Ok(FastTableInsertOutcome::Fallback)
     }
 
     /// Inserts `cell` into subtree `pgno`. If a non-root `pgno` splits into `k + 1` sibling pages,
@@ -2592,6 +3186,18 @@ impl Btree {
     ) -> Result<()> {
         self.save_cursors_for_mutation(Some(root_pgno), None)?;
         let enc = self.encoding();
+        let usable = self.pager.usable_size();
+        let bounds = PayloadBounds::for_index(usable);
+
+        if record_bytes.len() <= bounds.max_local as usize
+            && let Some((leaf_pgno, insert_idx, content_top)) =
+                self.probe_fast_index_insert_raw(root_pgno, usable, record_bytes, orders, enc)?
+        {
+            let raw_mut = self.pager.write_page(leaf_pgno)?;
+            apply_insert_index_leaf_raw(leaf_pgno, raw_mut, record_bytes, insert_idx, content_top);
+            return Ok(());
+        }
+
         let full_vals = decode_record_with_encoding(record_bytes, enc)?;
         let key_len = if orders.is_empty() {
             full_vals.len()
@@ -2599,8 +3205,6 @@ impl Btree {
             orders.len().min(full_vals.len())
         };
         let key_vals = &full_vals[..key_len];
-        let usable = self.pager.usable_size();
-        let bounds = PayloadBounds::for_index(usable);
         let (total_len, local_payload, overflow_page) =
             self.prepare_cell_payload(bounds, record_bytes)?;
         let leaf_cell = IndexLeafCell {
@@ -2651,6 +3255,376 @@ impl Btree {
         Ok(())
     }
 
+    fn probe_fast_index_insert_raw(
+        &mut self,
+        root_pgno: Pgno,
+        usable: u32,
+        record_bytes: &[u8],
+        orders: &[KeySortOrder],
+        enc: TextEncoding,
+    ) -> Result<Option<(Pgno, usize, usize)>> {
+        let mut cur_pgno = root_pgno;
+        for _ in 0..BTCURSOR_MAX_DEPTH {
+            let raw = self.pager.read_page(cur_pgno)?;
+            let hdr_off = if cur_pgno == 1 { 100 } else { 0 };
+            if hdr_off >= raw.len() {
+                return Ok(None);
+            }
+            match raw[hdr_off] {
+                x if x == BtreePageType::IndexLeaf as u8 => {
+                    if let Some((ins_idx, top)) = probe_insert_index_leaf_raw(
+                        cur_pgno,
+                        usable,
+                        raw,
+                        record_bytes,
+                        orders,
+                        enc,
+                    )? {
+                        return Ok(Some((cur_pgno, ins_idx, top)));
+                    }
+                    let has_free = hdr_off + 8 <= raw.len()
+                        && (raw[hdr_off + 1] != 0
+                            || raw[hdr_off + 2] != 0
+                            || raw[hdr_off + 7] != 0);
+                    if has_free {
+                        let raw_mut = self.pager.write_page(cur_pgno)?;
+                        defragment_raw_leaf_in_place(cur_pgno, usable, raw_mut)?;
+                        let raw_after = self.pager.read_page(cur_pgno)?;
+                        return Ok(probe_insert_index_leaf_raw(
+                            cur_pgno,
+                            usable,
+                            raw_after,
+                            record_bytes,
+                            orders,
+                            enc,
+                        )?
+                        .map(|(ins_idx, top)| (cur_pgno, ins_idx, top)));
+                    }
+                    return Ok(None);
+                }
+                x if x == BtreePageType::IndexInterior as u8 => {
+                    let Some(child) = find_index_interior_child_raw(
+                        cur_pgno,
+                        usable,
+                        raw,
+                        record_bytes,
+                        orders,
+                        enc,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    cur_pgno = child;
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Bulk-loads pre-sorted, strictly distinct serialized index records into the Index B-Tree
+    /// rooted at `root_pgno` in a single bottom-up pass with zero page splits.
+    pub fn bulk_load_sorted_index<R: AsRef<[u8]>>(
+        &mut self,
+        root_pgno: Pgno,
+        sorted_records: &[R],
+    ) -> Result<()> {
+        self.save_cursors_for_mutation(Some(root_pgno), None)?;
+
+        let usable = self.pager.usable_size();
+        let usable_usize = usable as usize;
+        {
+            let raw = self.pager.read_page(root_pgno)?;
+            let (ptype, n_cell, _) = raw_page_header(root_pgno, usable, raw)?;
+            if ptype != BtreePageType::IndexLeaf || n_cell != 0 {
+                self.clear_tree(root_pgno)?;
+            }
+        }
+        let total = sorted_records.len();
+        if total == 0 {
+            return Ok(());
+        }
+
+        let bounds = PayloadBounds::for_index(usable);
+        let max_local = bounds.max_local as usize;
+        let auto_vac = self.is_auto_vacuum();
+
+        let leaf_cell_encoded_len = |rec_len: usize| -> Result<usize> {
+            let total_u32 = u32::try_from(rec_len)
+                .map_err(|_| SqliteError::new(ErrorCode::TooBig, "row payload exceeds 4GiB"))?;
+            let raw_len = if rec_len <= max_local {
+                varint_len(rec_len as u64) + rec_len
+            } else {
+                let loc = bounds.local_len(total_u32);
+                varint_len(rec_len as u64) + loc + 4
+            };
+            Ok(raw_len.max(4))
+        };
+
+        let mut leaf_sizes = Vec::with_capacity(total);
+        let mut root_leaf_bytes: usize = (if root_pgno == 1 { 100usize } else { 0usize }) + 8;
+        for rec in sorted_records {
+            let clen = leaf_cell_encoded_len(rec.as_ref().len())?;
+            leaf_sizes.push(clen);
+            root_leaf_bytes = root_leaf_bytes.saturating_add(2 + clen);
+        }
+
+        if root_leaf_bytes <= usable_usize {
+            return self.write_sorted_index_leaf_slice(
+                root_pgno,
+                usable,
+                bounds,
+                sorted_records,
+                &leaf_sizes,
+                auto_vac,
+            );
+        }
+
+        let leaf_budget = ((usable_usize - 8) * 9) / 10;
+        let mut dividers: Vec<(Pgno, usize)> = Vec::new();
+        let mut rightmost_child: Pgno = 0;
+        let mut pos = 0usize;
+        while pos < total {
+            let mut used = 2 + leaf_sizes[pos];
+            let mut end = pos + 1;
+            while end < total && used + 2 + leaf_sizes[end] <= leaf_budget {
+                used += 2 + leaf_sizes[end];
+                end += 1;
+            }
+            if end + 1 == total && end > pos + 1 {
+                end -= 1;
+            }
+            let leaf_pgno = self.allocate_page()?;
+            self.write_sorted_index_leaf_slice(
+                leaf_pgno,
+                usable,
+                bounds,
+                &sorted_records[pos..end],
+                &leaf_sizes[pos..end],
+                auto_vac,
+            )?;
+            if end < total {
+                dividers.push((leaf_pgno, end));
+                pos = end + 1;
+            } else {
+                rightmost_child = leaf_pgno;
+                break;
+            }
+        }
+
+        let int_cell_len = |rec_idx: usize| -> usize { 4 + leaf_sizes[rec_idx] };
+        let root_int_hdr: usize = (if root_pgno == 1 { 100usize } else { 0usize }) + 12;
+        let int_budget = usable_usize - 12;
+
+        loop {
+            let m = dividers.len();
+            let mut root_int_bytes: usize = root_int_hdr;
+            for &(_, ridx) in &dividers {
+                root_int_bytes = root_int_bytes.saturating_add(2 + int_cell_len(ridx));
+            }
+            if root_int_bytes <= usable_usize {
+                return self.write_sorted_index_interior_slice(
+                    root_pgno,
+                    usable,
+                    bounds,
+                    sorted_records,
+                    &leaf_sizes,
+                    &dividers,
+                    rightmost_child,
+                    auto_vac,
+                );
+            }
+
+            let mut next_dividers: Vec<(Pgno, usize)> = Vec::new();
+            let mut next_rightmost: Pgno = 0;
+            let mut dpos = 0usize;
+            while dpos < m {
+                let mut used = 2 + int_cell_len(dividers[dpos].1);
+                let mut dend = dpos + 1;
+                while dend < m && used + 2 + int_cell_len(dividers[dend].1) <= int_budget {
+                    used += 2 + int_cell_len(dividers[dend].1);
+                    dend += 1;
+                }
+                if dend + 1 == m && dend > dpos + 1 {
+                    dend -= 1;
+                }
+                let int_pgno = self.allocate_page()?;
+                if dend < m {
+                    let rchild = dividers[dend].0;
+                    let promoted_ridx = dividers[dend].1;
+                    self.write_sorted_index_interior_slice(
+                        int_pgno,
+                        usable,
+                        bounds,
+                        sorted_records,
+                        &leaf_sizes,
+                        &dividers[dpos..dend],
+                        rchild,
+                        auto_vac,
+                    )?;
+                    next_dividers.push((int_pgno, promoted_ridx));
+                    dpos = dend + 1;
+                } else {
+                    self.write_sorted_index_interior_slice(
+                        int_pgno,
+                        usable,
+                        bounds,
+                        sorted_records,
+                        &leaf_sizes,
+                        &dividers[dpos..m],
+                        rightmost_child,
+                        auto_vac,
+                    )?;
+                    next_rightmost = int_pgno;
+                    break;
+                }
+            }
+            dividers = next_dividers;
+            rightmost_child = next_rightmost;
+        }
+    }
+
+    fn write_sorted_index_leaf_slice<R: AsRef<[u8]>>(
+        &mut self,
+        pgno: Pgno,
+        usable: u32,
+        bounds: PayloadBounds,
+        records: &[R],
+        cell_sizes: &[usize],
+        auto_vac: bool,
+    ) -> Result<()> {
+        let usable_usize = usable as usize;
+        let max_local = bounds.max_local as usize;
+        let mut ovfl_entries: Vec<(usize, Pgno)> = Vec::new();
+        for (i, rec) in records.iter().enumerate() {
+            if rec.as_ref().len() > max_local {
+                let (_, _, Some(ovfl)) = self.prepare_cell_payload(bounds, rec.as_ref())? else {
+                    unreachable!()
+                };
+                ovfl_entries.push((i, ovfl));
+            }
+        }
+
+        let hdr_off = if pgno == 1 { 100 } else { 0 };
+        let ptr_base = hdr_off + 8;
+        let n_cell = records.len();
+        {
+            let raw = self.pager.write_page(pgno)?;
+            raw[hdr_off..usable_usize].fill(0);
+            let mut content_top = usable_usize;
+            let mut ovfl_cursor = 0usize;
+            for (i, (rec_ref, &clen)) in records.iter().zip(cell_sizes.iter()).enumerate() {
+                let rec = rec_ref.as_ref();
+                content_top -= clen;
+                let ip = ptr_base + 2 * i;
+                raw[ip..ip + 2].copy_from_slice(&(content_top as u16).to_be_bytes());
+                let mut pos = content_top;
+                pos += put_varint(&mut raw[pos..], rec.len() as u64);
+                if rec.len() <= max_local {
+                    raw[pos..pos + rec.len()].copy_from_slice(rec);
+                } else {
+                    let loc = bounds.local_len(rec.len() as u32);
+                    raw[pos..pos + loc].copy_from_slice(&rec[..loc]);
+                    pos += loc;
+                    let ovfl_pg = ovfl_entries[ovfl_cursor].1;
+                    ovfl_cursor += 1;
+                    raw[pos..pos + 4].copy_from_slice(&ovfl_pg.to_be_bytes());
+                }
+            }
+            raw[hdr_off] = BtreePageType::IndexLeaf as u8;
+            raw[hdr_off + 3..hdr_off + 5].copy_from_slice(&(n_cell as u16).to_be_bytes());
+            let encoded_top: u16 = if content_top == 65_536 {
+                0
+            } else {
+                content_top as u16
+            };
+            raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
+        }
+
+        if auto_vac {
+            for &(_, ovfl_pg) in &ovfl_entries {
+                self.ptrmap_put(ovfl_pg, PtrmapType::Overflow1, pgno)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_sorted_index_interior_slice<R: AsRef<[u8]>>(
+        &mut self,
+        pgno: Pgno,
+        usable: u32,
+        bounds: PayloadBounds,
+        all_records: &[R],
+        leaf_sizes: &[usize],
+        dividers: &[(Pgno, usize)],
+        right_child: Pgno,
+        auto_vac: bool,
+    ) -> Result<()> {
+        let usable_usize = usable as usize;
+        let max_local = bounds.max_local as usize;
+        let mut ovfl_entries: Vec<(usize, Pgno)> = Vec::new();
+        for (i, &(_, ridx)) in dividers.iter().enumerate() {
+            let rec = all_records[ridx].as_ref();
+            if rec.len() > max_local {
+                let (_, _, Some(ovfl)) = self.prepare_cell_payload(bounds, rec)? else {
+                    unreachable!()
+                };
+                ovfl_entries.push((i, ovfl));
+            }
+        }
+
+        let hdr_off = if pgno == 1 { 100 } else { 0 };
+        let ptr_base = hdr_off + 12;
+        let n_cell = dividers.len();
+        {
+            let raw = self.pager.write_page(pgno)?;
+            raw[hdr_off..usable_usize].fill(0);
+            let mut content_top = usable_usize;
+            let mut ovfl_cursor = 0usize;
+            for (i, &(left_child, ridx)) in dividers.iter().enumerate() {
+                let rec = all_records[ridx].as_ref();
+                let clen = 4 + leaf_sizes[ridx];
+                content_top -= clen;
+                let ip = ptr_base + 2 * i;
+                raw[ip..ip + 2].copy_from_slice(&(content_top as u16).to_be_bytes());
+                raw[content_top..content_top + 4].copy_from_slice(&left_child.to_be_bytes());
+                let mut pos = content_top + 4;
+                pos += put_varint(&mut raw[pos..], rec.len() as u64);
+                if rec.len() <= max_local {
+                    raw[pos..pos + rec.len()].copy_from_slice(rec);
+                } else {
+                    let loc = bounds.local_len(rec.len() as u32);
+                    raw[pos..pos + loc].copy_from_slice(&rec[..loc]);
+                    pos += loc;
+                    let ovfl_pg = ovfl_entries[ovfl_cursor].1;
+                    ovfl_cursor += 1;
+                    raw[pos..pos + 4].copy_from_slice(&ovfl_pg.to_be_bytes());
+                }
+            }
+            raw[hdr_off] = BtreePageType::IndexInterior as u8;
+            raw[hdr_off + 3..hdr_off + 5].copy_from_slice(&(n_cell as u16).to_be_bytes());
+            let encoded_top: u16 = if content_top == 65_536 {
+                0
+            } else {
+                content_top as u16
+            };
+            raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
+            raw[hdr_off + 8..hdr_off + 12].copy_from_slice(&right_child.to_be_bytes());
+        }
+
+        if auto_vac {
+            for &(left_child, _) in dividers {
+                self.ptrmap_put(left_child, PtrmapType::BtreeNode, pgno)?;
+            }
+            self.ptrmap_put(right_child, PtrmapType::BtreeNode, pgno)?;
+            for &(_, ovfl_pg) in &ovfl_entries {
+                self.ptrmap_put(ovfl_pg, PtrmapType::Overflow1, pgno)?;
+            }
+        }
+        Ok(())
+    }
+
     fn probe_fast_index_insert_target(
         &mut self,
         root_pgno: Pgno,
@@ -2669,10 +3643,25 @@ impl Btree {
             }
             match raw[hdr_off] {
                 x if x == BtreePageType::IndexLeaf as u8 => {
-                    return Ok(probe_insert_index_leaf_in_place(
+                    if let Some((ins_idx, top)) = probe_insert_index_leaf_in_place(
                         cur_pgno, usable, raw, cell, key_vals, orders, enc,
-                    )?
-                    .map(|(ins_idx, top)| (cur_pgno, ins_idx, top)));
+                    )? {
+                        return Ok(Some((cur_pgno, ins_idx, top)));
+                    }
+                    let has_free = hdr_off + 8 <= raw.len()
+                        && (raw[hdr_off + 1] != 0
+                            || raw[hdr_off + 2] != 0
+                            || raw[hdr_off + 7] != 0);
+                    if has_free {
+                        let raw_mut = self.pager.write_page(cur_pgno)?;
+                        defragment_raw_leaf_in_place(cur_pgno, usable, raw_mut)?;
+                        let raw_after = self.pager.read_page(cur_pgno)?;
+                        return Ok(probe_insert_index_leaf_in_place(
+                            cur_pgno, usable, raw_after, cell, key_vals, orders, enc,
+                        )?
+                        .map(|(ins_idx, top)| (cur_pgno, ins_idx, top)));
+                    }
+                    return Ok(None);
                 }
                 x if x == BtreePageType::IndexInterior as u8 => {
                     let Some(child) = find_index_interior_child_in_place(
@@ -3028,6 +4017,193 @@ impl Btree {
         )))
     }
 
+    /// Deletes a matching serialized entry `record_bytes` from an Index B-Tree rooted at `root_pgno`
+    /// without decoding cells into heap `Value`s on the common leaf/divider path.
+    pub fn delete_index_raw(
+        &mut self,
+        root_pgno: Pgno,
+        record_bytes: &[u8],
+        orders: &[KeySortOrder],
+    ) -> Result<bool> {
+        self.save_cursors_for_mutation(Some(root_pgno), None)?;
+        let enc = self.encoding();
+        let usable = self.pager.usable_size();
+        let usable_usize = usable as usize;
+        let bounds = PayloadBounds::for_index(usable);
+        let mut cur_pgno = root_pgno;
+        for _ in 0..BTCURSOR_MAX_DEPTH {
+            let hdr_off = if cur_pgno == 1 { 100 } else { 0 };
+            enum RawDelStep {
+                Descend(Pgno),
+                DividerHit {
+                    cell_idx: usize,
+                    left_child: Pgno,
+                },
+                LeafNotFound,
+                LeafHit {
+                    idx: usize,
+                    cell_off: usize,
+                    cell_len: usize,
+                },
+                Fallback,
+            }
+            let step = {
+                let raw = self.pager.read_page(cur_pgno)?;
+                if hdr_off < raw.len() {
+                    match raw[hdr_off] {
+                        x if x == BtreePageType::IndexInterior as u8 => {
+                            match probe_index_interior_step_raw(
+                                cur_pgno,
+                                usable,
+                                raw,
+                                record_bytes,
+                                orders,
+                                enc,
+                            )? {
+                                Some(RawIndexInteriorStep::Child(c)) => RawDelStep::Descend(c),
+                                Some(RawIndexInteriorStep::EqualAt {
+                                    cell_idx,
+                                    left_child,
+                                }) => RawDelStep::DividerHit {
+                                    cell_idx,
+                                    left_child,
+                                },
+                                None => RawDelStep::Fallback,
+                            }
+                        }
+                        x if x == BtreePageType::IndexLeaf as u8 => {
+                            match probe_delete_index_leaf_raw(
+                                cur_pgno,
+                                usable,
+                                raw,
+                                record_bytes,
+                                orders,
+                                enc,
+                                cur_pgno == root_pgno,
+                            )? {
+                                Some(None) => RawDelStep::LeafNotFound,
+                                Some(Some((idx, cell_off, cell_len, None))) => {
+                                    RawDelStep::LeafHit {
+                                        idx,
+                                        cell_off,
+                                        cell_len,
+                                    }
+                                }
+                                _ => RawDelStep::Fallback,
+                            }
+                        }
+                        _ => RawDelStep::Fallback,
+                    }
+                } else {
+                    RawDelStep::Fallback
+                }
+            };
+            match step {
+                RawDelStep::Descend(child) => {
+                    cur_pgno = child;
+                }
+                RawDelStep::LeafNotFound => return Ok(false),
+                RawDelStep::LeafHit {
+                    idx,
+                    cell_off,
+                    cell_len,
+                } => {
+                    let raw_mut = self.pager.write_page(cur_pgno)?;
+                    apply_delete_index_leaf_in_place(
+                        cur_pgno, usable, raw_mut, idx, cell_off, cell_len,
+                    );
+                    return Ok(true);
+                }
+                RawDelStep::DividerHit {
+                    cell_idx,
+                    left_child,
+                } => {
+                    // Walk right spine of `left_child` using raw headers without unpacking interior/leaf cells.
+                    let mut pred_pgno = left_child;
+                    let mut pred_extract: Option<(usize, usize, usize, Vec<u8>)> = None;
+                    for _ in 0..BTCURSOR_MAX_DEPTH {
+                        let raw_p = self.pager.read_page(pred_pgno)?;
+                        let (ptype, n_cell, rc) = raw_page_header(pred_pgno, usable, raw_p)?;
+                        match ptype {
+                            BtreePageType::IndexInterior => {
+                                if rc == 0 {
+                                    break;
+                                }
+                                pred_pgno = rc;
+                            }
+                            BtreePageType::IndexLeaf => {
+                                let p_hdr = if pred_pgno == 1 { 100 } else { 0 };
+                                if n_cell >= 2 && raw_p[p_hdr + 7] <= 60 {
+                                    let last_idx = n_cell - 1;
+                                    let off = raw_cell_offset(
+                                        pred_pgno, usable, raw_p, 8, n_cell, last_idx,
+                                    )?;
+                                    let (payload_u64, n1) = get_varint(&raw_p[off..usable_usize])?;
+                                    if let Ok(total_u32) = u32::try_from(payload_u64) {
+                                        let loc = bounds.local_len(total_u32);
+                                        if (loc as u32) == total_u32
+                                            && off + (n1 + loc).max(4) <= usable_usize
+                                        {
+                                            let c_len = (n1 + loc).max(4);
+                                            let payload = raw_p[off + n1..off + n1 + loc].to_vec();
+                                            pred_extract = Some((last_idx, off, c_len, payload));
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                            _ => break,
+                        }
+                    }
+                    if let Some((pred_idx, pred_off, pred_cell_len, pred_payload)) = pred_extract
+                        && let ParsedPage::IndexInterior {
+                            mut cells,
+                            right_child,
+                        } = self.read_parsed_page(cur_pgno)?
+                        && cell_idx < cells.len()
+                    {
+                        let old_div = std::mem::replace(
+                            &mut cells[cell_idx],
+                            IndexInteriorCell {
+                                left_child,
+                                total_payload_len: pred_payload.len() as u32,
+                                local_payload: pred_payload,
+                                overflow_page: None,
+                            },
+                        );
+                        let cand_int = ParsedPage::IndexInterior { cells, right_child };
+                        if cand_int.fits_in_page(cur_pgno, usable) {
+                            self.free_overflow_chain(old_div.overflow_page)?;
+                            {
+                                let raw_pred_mut = self.pager.write_page(pred_pgno)?;
+                                apply_delete_index_leaf_in_place(
+                                    pred_pgno,
+                                    usable,
+                                    raw_pred_mut,
+                                    pred_idx,
+                                    pred_off,
+                                    pred_cell_len,
+                                );
+                            }
+                            self.write_parsed_page(cur_pgno, &cand_int)?;
+                            return Ok(true);
+                        }
+                    }
+                    break;
+                }
+                RawDelStep::Fallback => break,
+            }
+        }
+
+        let vals = decode_record_with_encoding(record_bytes, enc)?;
+        let key_len = if orders.is_empty() {
+            vals.len()
+        } else {
+            orders.len().min(vals.len())
+        };
+        self.delete_index(root_pgno, &vals[..key_len], orders)
+    }
+
     /// Deletes a matching entry `key_vals` from an Index B-Tree rooted at `root_pgno`.
     pub fn delete_index(
         &mut self,
@@ -3060,10 +4236,7 @@ impl Btree {
         if !removed {
             return Ok(false);
         }
-        self.clear_tree(root_pgno)?;
-        for rec in remaining {
-            self.insert_index(root_pgno, &rec, orders)?;
-        }
+        self.bulk_load_sorted_index(root_pgno, &remaining)?;
         Ok(true)
     }
 
@@ -3074,8 +4247,54 @@ impl Btree {
         orders: &[KeySortOrder],
     ) -> Result<Option<bool>> {
         let enc = self.encoding();
+        let usable = self.pager.usable_size();
         let mut cur_pgno = root_pgno;
         loop {
+            let hdr_off = if cur_pgno == 1 { 100 } else { 0 };
+            let raw_probe = {
+                let raw = self.pager.read_page(cur_pgno)?;
+                if hdr_off < raw.len() {
+                    match raw[hdr_off] {
+                        x if x == BtreePageType::IndexInterior as u8 => {
+                            if let Some(child) = find_index_interior_child_in_place(
+                                cur_pgno, usable, raw, key_vals, orders, enc,
+                            )? {
+                                cur_pgno = child;
+                                continue;
+                            }
+                            None
+                        }
+                        x if x == BtreePageType::IndexLeaf as u8 => {
+                            probe_delete_index_leaf_in_place(
+                                cur_pgno,
+                                usable,
+                                raw,
+                                key_vals,
+                                orders,
+                                enc,
+                                cur_pgno == root_pgno,
+                            )?
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(leaf_outcome) = raw_probe {
+                return match leaf_outcome {
+                    None => Ok(Some(false)),
+                    Some((idx, cell_off, cell_len, ovfl)) => {
+                        self.free_overflow_chain(ovfl)?;
+                        let raw_mut = self.pager.write_page(cur_pgno)?;
+                        apply_delete_index_leaf_in_place(
+                            cur_pgno, usable, raw_mut, idx, cell_off, cell_len,
+                        );
+                        Ok(Some(true))
+                    }
+                };
+            }
+
             let parsed = self.read_parsed_page(cur_pgno)?;
             match parsed {
                 ParsedPage::IndexLeaf { mut cells } => {

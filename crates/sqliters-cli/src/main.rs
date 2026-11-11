@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 use std::env;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, IsTerminal, Write};
 use std::path::Path;
 use std::process::ExitCode;
@@ -291,6 +291,38 @@ fn process_input_stream<R: BufRead, W: Write>(
                 }
                 continue;
             }
+
+            if is_effectively_empty_sql(&raw_line) {
+                if interactive {
+                    let _ = write!(out, "sqliters> ");
+                    let _ = out.flush();
+                }
+                continue;
+            }
+
+            if is_complete(&raw_line) {
+                if let Err(e) = execute_sql_buffer(conn, cfg, &raw_line, out) {
+                    let _ = out.flush();
+                    eprintln!("Error: {e}");
+                    outcome.err_count += 1;
+                    if cfg.bail {
+                        outcome.bailed = true;
+                        return outcome;
+                    }
+                }
+                if interactive {
+                    let _ = write!(out, "sqliters> ");
+                    let _ = out.flush();
+                }
+                continue;
+            }
+
+            sql_buf.push_str(&raw_line);
+            if interactive {
+                let _ = write!(out, "   ...> ");
+                let _ = out.flush();
+            }
+            continue;
         }
 
         // Preserve exact line endings (including `\r\n` inside multiline SQL string literals).
@@ -367,12 +399,156 @@ fn execute_shell_input<W: Write>(
     Ok(())
 }
 
+/// Returns `true` when every statement in `sql` is a non-returning DML or transaction-control
+/// statement (`INSERT`, `REPLACE`, `UPDATE`, `DELETE`, `BEGIN`, `COMMIT`, `END`, `ROLLBACK`)
+/// containing no unquoted `RETURNING` keyword, so it never emits result rows or column headers
+/// and can be executed directly via [`Connection::execute_batch`].
+fn is_pure_non_returning_batch_sql(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+
+    loop {
+        while i < bytes.len() {
+            match bytes[i] {
+                b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\x0b' | b';' => i += 1,
+                b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                    i += 2;
+                    let mut closed = false;
+                    while i + 1 < bytes.len() {
+                        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                            i += 2;
+                            closed = true;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    if !closed {
+                        return false;
+                    }
+                }
+                _ => break,
+            }
+        }
+        if i >= bytes.len() {
+            return true;
+        }
+
+        if !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            return false;
+        }
+        let kw_start = i;
+        i += 1;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        let kw = &bytes[kw_start..i];
+        let is_dml = kw.eq_ignore_ascii_case(b"INSERT")
+            || kw.eq_ignore_ascii_case(b"REPLACE")
+            || kw.eq_ignore_ascii_case(b"UPDATE")
+            || kw.eq_ignore_ascii_case(b"DELETE");
+        let is_tcl = kw.eq_ignore_ascii_case(b"BEGIN")
+            || kw.eq_ignore_ascii_case(b"COMMIT")
+            || kw.eq_ignore_ascii_case(b"END")
+            || kw.eq_ignore_ascii_case(b"ROLLBACK");
+        if !is_dml && !is_tcl {
+            return false;
+        }
+
+        while i < bytes.len() {
+            match bytes[i] {
+                b';' => {
+                    i += 1;
+                    break;
+                }
+                b'\'' | b'"' | b'`' => {
+                    let delim = bytes[i];
+                    i += 1;
+                    let mut closed = false;
+                    while i < bytes.len() {
+                        if bytes[i] == delim {
+                            if i + 1 < bytes.len() && bytes[i + 1] == delim {
+                                i += 2;
+                                continue;
+                            }
+                            i += 1;
+                            closed = true;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    if !closed {
+                        return false;
+                    }
+                }
+                b'[' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b']' {
+                        i += 1;
+                    }
+                    if i >= bytes.len() {
+                        return false;
+                    }
+                    i += 1;
+                }
+                b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                    i += 2;
+                    let mut closed = false;
+                    while i + 1 < bytes.len() {
+                        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                            i += 2;
+                            closed = true;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    if !closed {
+                        return false;
+                    }
+                }
+                c if c.is_ascii_alphabetic() || c == b'_' => {
+                    let id_start = i;
+                    i += 1;
+                    while i < bytes.len()
+                        && (bytes[i].is_ascii_alphanumeric()
+                            || bytes[i] == b'_'
+                            || bytes[i] == b'$')
+                    {
+                        i += 1;
+                    }
+                    if is_dml
+                        && i - id_start == 9
+                        && bytes[id_start..i].eq_ignore_ascii_case(b"RETURNING")
+                    {
+                        return false;
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+    }
+}
+
 fn execute_sql_buffer<W: Write>(
     conn: &Connection,
     cfg: &ShellConfig,
     mut sql: &str,
     out: &mut W,
 ) -> sqliters::Result<()> {
+    if is_pure_non_returning_batch_sql(sql) {
+        return conn.execute_batch(sql);
+    }
     while !is_effectively_empty_sql(sql) {
         let mut stmt = conn.prepare(sql)?;
         let tail_len = stmt.tail().len();
@@ -722,7 +898,7 @@ fn handle_dot_command<W: Write>(
             };
             match File::open(Path::new(fpath)) {
                 Ok(file) => {
-                    let mut reader = BufReader::new(file);
+                    let mut reader = BufReader::with_capacity(64 * 1024, file);
                     let sub = process_input_stream(conn, cfg, &mut reader, out, false);
                     outcome.err_count += sub.err_count;
                     if sub.bailed {
@@ -857,8 +1033,9 @@ fn handle_import_command(
     let file_path = positional[0];
     let table_name = positional[1];
 
-    let data =
-        fs::read(Path::new(file_path)).map_err(|e| format!("cannot open \"{file_path}\": {e}"))?;
+    let file = File::open(Path::new(file_path))
+        .map_err(|e| format!("cannot open \"{file_path}\": {e}"))?;
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
 
     let (col_sep, use_quotes, row_sep_ascii) = if mode_csv {
         (b',', true, false)
@@ -876,23 +1053,25 @@ fn handle_import_command(
         None => quote_sql_ident(table_name),
     };
 
-    let mut pos = 0usize;
+    let mut at_file_start = true;
     let mut line_no = 0usize;
+    let mut scratch = CsvRecordScratch::default();
 
     let n_col = match conn.prepare(&format!("SELECT * FROM {qualified_table}")) {
         Ok(probe) => {
             let cols = probe.column_count();
             probe.finalize().map_err(|e| e.to_string())?;
             for _ in 0..skip_rows {
-                if csv_read_record(
-                    &data,
-                    &mut pos,
+                if !csv_read_record_streaming(
+                    &mut reader,
+                    &mut at_file_start,
                     &mut line_no,
                     col_sep,
                     use_quotes,
                     row_sep_ascii,
+                    &mut scratch,
                 )
-                .is_none()
+                .map_err(|e| format!("{file_path}: {e}"))?
                 {
                     return Ok(());
                 }
@@ -901,36 +1080,41 @@ fn handle_import_command(
         }
         Err(_) => {
             for _ in 0..skip_rows {
-                if csv_read_record(
-                    &data,
-                    &mut pos,
+                if !csv_read_record_streaming(
+                    &mut reader,
+                    &mut at_file_start,
                     &mut line_no,
                     col_sep,
                     use_quotes,
                     row_sep_ascii,
+                    &mut scratch,
                 )
-                .is_none()
+                .map_err(|e| format!("{file_path}: {e}"))?
                 {
                     return Err(format!("{file_path}: empty file"));
                 }
             }
-            let Some(hdr_rec) = csv_read_record(
-                &data,
-                &mut pos,
+            if !csv_read_record_streaming(
+                &mut reader,
+                &mut at_file_start,
                 &mut line_no,
                 col_sep,
                 use_quotes,
                 row_sep_ascii,
-            ) else {
+                &mut scratch,
+            )
+            .map_err(|e| format!("{file_path}: {e}"))?
+            {
                 return Err(format!("{file_path}: empty file"));
-            };
-            if hdr_rec.is_empty() {
+            }
+            if scratch.fields.is_empty() {
                 return Ok(());
             }
-            let col_defs: Vec<String> = hdr_rec
-                .into_iter()
-                .map(|b| {
-                    let cname = bytes_to_string(b);
+            let col_defs: Vec<String> = scratch
+                .fields
+                .iter()
+                .map(|&(s, e)| {
+                    let cname = String::from_utf8_lossy(&scratch.buf[s..e]);
                     format!("{} TEXT", quote_sql_ident(&cname))
                 })
                 .collect();
@@ -965,44 +1149,64 @@ fn handle_import_command(
         }
     };
 
-    let mut row_values = vec![Value::Null; n_col];
-    while let Some(rec) = csv_read_record(
-        &data,
-        &mut pos,
-        &mut line_no,
-        col_sep,
-        use_quotes,
-        row_sep_ascii,
-    ) {
+    let mut lossy_buf = String::new();
+    loop {
+        let has_rec = match csv_read_record_streaming(
+            &mut reader,
+            &mut at_file_start,
+            &mut line_no,
+            col_sep,
+            use_quotes,
+            row_sep_ascii,
+            &mut scratch,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = stmt.finalize();
+                if auto_tx && !conn.is_autocommit() {
+                    let _ = conn.execute("ROLLBACK");
+                }
+                return Err(format!("{file_path}: {e}"));
+            }
+        };
+        if !has_rec {
+            break;
+        }
         let start_line = line_no;
-        if rec.len() != n_col {
+        let rec_len = scratch.fields.len();
+        if rec_len != n_col {
             if cfg.bail {
                 let _ = stmt.finalize();
                 if auto_tx && !conn.is_autocommit() {
                     let _ = conn.execute("ROLLBACK");
                 }
                 return Err(format!(
-                    "{file_path}:{start_line}: expected {n_col} columns but found {}",
-                    rec.len()
+                    "{file_path}:{start_line}: expected {n_col} columns but found {rec_len}"
                 ));
             }
             eprintln!(
-                "{file_path}:{start_line}: expected {n_col} columns but found {} - filling the rest with NULL",
-                rec.len()
+                "{file_path}:{start_line}: expected {n_col} columns but found {rec_len} - filling the rest with NULL"
             );
         }
 
-        let mut iter = rec.into_iter();
-        for slot in &mut row_values {
-            if let Some(field_bytes) = iter.next() {
-                *slot = Value::Text(bytes_to_string(field_bytes));
-            } else {
-                *slot = Value::Null;
-            }
-        }
-
         let step_outcome = (|| -> sqliters::Result<()> {
-            stmt.bind_all(&row_values)?;
+            for col_idx in 0..n_col {
+                if let Some(&(s, e)) = scratch.fields.get(col_idx) {
+                    let field_bytes = &scratch.buf[s..e];
+                    match std::str::from_utf8(field_bytes) {
+                        Ok(valid) => {
+                            stmt.bind_text(col_idx + 1, valid)?;
+                        }
+                        Err(_) => {
+                            lossy_buf.clear();
+                            lossy_buf.push_str(&String::from_utf8_lossy(field_bytes));
+                            stmt.bind_text(col_idx + 1, &lossy_buf)?;
+                        }
+                    }
+                } else {
+                    stmt.bind(col_idx + 1, Value::Null)?;
+                }
+            }
             let _ = stmt.step()?;
             stmt.reset()?;
             Ok(())
@@ -1034,125 +1238,178 @@ fn handle_import_command(
     Ok(())
 }
 
-#[inline]
-fn bytes_to_string(bytes: Vec<u8>) -> String {
-    match String::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+struct CsvRecordScratch {
+    buf: Vec<u8>,
+    fields: Vec<(usize, usize)>,
+}
+
+impl Default for CsvRecordScratch {
+    fn default() -> Self {
+        Self {
+            buf: Vec::with_capacity(512),
+            fields: Vec::with_capacity(16),
+        }
     }
 }
 
-/// Reads one logical RFC 4180 / `shell.c` CSV record from `data[*pos..]`, preserving `\n` and
-/// `\r\n` inside double-quoted fields, unescaping `""` -> `"`, and treating unquoted `\r\n` or
-/// `\n` (or `\x1e` in `--ascii` mode) as the record terminator.
-fn csv_read_record(
-    data: &[u8],
-    pos: &mut usize,
+#[inline]
+fn peek_byte<R: BufRead>(reader: &mut R) -> io::Result<Option<u8>> {
+    let chunk = reader.fill_buf()?;
+    Ok(chunk.first().copied())
+}
+
+/// Streams one logical RFC 4180 / `shell.c` CSV record from `reader` into `scratch` with zero
+/// per-row heap allocations, preserving `\n` and `\r\n` inside double-quoted fields, unescaping
+/// `""` -> `"`, and treating unquoted `\r\n` or `\n` (or `\x1e` in `--ascii` mode) as the record
+/// terminator.
+fn csv_read_record_streaming<R: BufRead>(
+    reader: &mut R,
+    at_file_start: &mut bool,
     line_no: &mut usize,
     col_sep: u8,
     use_quotes: bool,
     row_sep_ascii: bool,
-) -> Option<Vec<Vec<u8>>> {
-    if *pos == 0 && data.starts_with(b"\xef\xbb\xbf") {
-        *pos = 3;
+    scratch: &mut CsvRecordScratch,
+) -> io::Result<bool> {
+    if *at_file_start {
+        *at_file_start = false;
+        let chunk = reader.fill_buf()?;
+        if chunk.starts_with(b"\xef\xbb\xbf") {
+            reader.consume(3);
+        }
     }
-    if *pos >= data.len() {
-        return None;
+
+    if peek_byte(reader)?.is_none() {
+        return Ok(false);
     }
 
     *line_no += 1;
-    let mut record: Vec<Vec<u8>> = Vec::new();
+    scratch.buf.clear();
+    scratch.fields.clear();
 
     loop {
-        let mut field = Vec::new();
-        if use_quotes && *pos < data.len() && data[*pos] == b'"' {
-            *pos += 1;
+        let field_start = scratch.buf.len();
+        if use_quotes && peek_byte(reader)? == Some(b'"') {
+            reader.consume(1);
             let mut next_field = false;
-            while *pos < data.len() {
-                let b = data[*pos];
-                *pos += 1;
-                if b == b'\n' {
-                    *line_no += 1;
+            loop {
+                let chunk = reader.fill_buf()?;
+                if chunk.is_empty() {
+                    break;
                 }
-                if b == b'"' {
-                    if *pos < data.len() && data[*pos] == b'"' {
-                        field.push(b'"');
-                        *pos += 1;
-                    } else {
-                        // Closing quote: advance to column separator, record separator, or EOF.
-                        while *pos < data.len() {
-                            let c = data[*pos];
-                            if c == col_sep {
-                                *pos += 1;
-                                next_field = true;
+                let mut k = 0usize;
+                while k < chunk.len() && chunk[k] != b'"' {
+                    if chunk[k] == b'\n' {
+                        *line_no += 1;
+                    }
+                    k += 1;
+                }
+                if k > 0 {
+                    scratch.buf.extend_from_slice(&chunk[..k]);
+                    reader.consume(k);
+                    continue;
+                }
+                // Next byte is `"`
+                reader.consume(1);
+                if peek_byte(reader)? == Some(b'"') {
+                    reader.consume(1);
+                    scratch.buf.push(b'"');
+                } else {
+                    // Closing quote: advance to column separator, record separator, or EOF.
+                    while let Some(c) = peek_byte(reader)? {
+                        reader.consume(1);
+                        if c == col_sep {
+                            next_field = true;
+                            break;
+                        }
+                        if !row_sep_ascii {
+                            if c == b'\n' {
                                 break;
                             }
-                            if !row_sep_ascii {
-                                if c == b'\n' {
-                                    *pos += 1;
+                            if c == b'\r' {
+                                let after_cr = peek_byte(reader)?;
+                                if after_cr == Some(b'\n') {
+                                    reader.consume(1);
+                                    break;
+                                } else if after_cr.is_none() {
                                     break;
                                 }
-                                if c == b'\r' {
-                                    if *pos + 1 < data.len() && data[*pos + 1] == b'\n' {
-                                        *pos += 2;
-                                        break;
-                                    } else if *pos + 1 == data.len() {
-                                        *pos += 1;
-                                        break;
-                                    }
-                                }
-                            } else if c == b'\x1e' {
-                                *pos += 1;
-                                break;
                             }
-                            *pos += 1;
+                        } else if c == b'\x1e' {
+                            break;
                         }
-                        break;
                     }
-                } else {
-                    field.push(b);
+                    break;
                 }
             }
-            record.push(field);
+            let field_end = scratch.buf.len();
+            scratch.fields.push((field_start, field_end));
             if next_field {
                 continue;
             }
-            return Some(record);
+            return Ok(true);
         } else {
             let mut next_field = false;
-            while *pos < data.len() {
-                let b = data[*pos];
+            loop {
+                let chunk = reader.fill_buf()?;
+                if chunk.is_empty() {
+                    break;
+                }
+                let mut k = 0usize;
+                if !row_sep_ascii {
+                    while k < chunk.len() {
+                        let b = chunk[k];
+                        if b == col_sep || b == b'\n' || b == b'\r' {
+                            break;
+                        }
+                        k += 1;
+                    }
+                } else {
+                    while k < chunk.len() {
+                        let b = chunk[k];
+                        if b == col_sep || b == b'\x1e' {
+                            break;
+                        }
+                        k += 1;
+                    }
+                }
+                if k > 0 {
+                    scratch.buf.extend_from_slice(&chunk[..k]);
+                    reader.consume(k);
+                    continue;
+                }
+                let b = chunk[0];
+                reader.consume(1);
                 if b == col_sep {
-                    *pos += 1;
                     next_field = true;
                     break;
                 }
                 if !row_sep_ascii {
                     if b == b'\n' {
-                        *pos += 1;
                         break;
                     }
                     if b == b'\r' {
-                        if *pos + 1 < data.len() && data[*pos + 1] == b'\n' {
-                            *pos += 2;
+                        let after_cr = peek_byte(reader)?;
+                        if after_cr == Some(b'\n') {
+                            reader.consume(1);
                             break;
-                        } else if *pos + 1 == data.len() {
-                            *pos += 1;
+                        } else if after_cr.is_none() {
                             break;
                         }
+                        scratch.buf.push(b'\r');
+                        continue;
                     }
                 } else if b == b'\x1e' {
-                    *pos += 1;
                     break;
                 }
-                field.push(b);
-                *pos += 1;
+                scratch.buf.push(b);
             }
-            record.push(field);
+            let field_end = scratch.buf.len();
+            scratch.fields.push((field_start, field_end));
             if next_field {
                 continue;
             }
-            return Some(record);
+            return Ok(true);
         }
     }
 }

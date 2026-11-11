@@ -674,6 +674,12 @@ impl ProgressTracker {
         Self::default()
     }
 
+    /// Returns whether a live progress handler callback is configured.
+    #[inline(always)]
+    pub fn is_enabled(&self) -> bool {
+        self.handler.is_some()
+    }
+
     /// Configures or clears the progress handler (`interval == 0` or `callback.is_none()` disables).
     pub fn set_handler(&mut self, interval: u32, callback: Option<ProgressCallback>) {
         if interval == 0 {
@@ -719,6 +725,12 @@ impl ProgressTracker {
             }
         }
         Ok(())
+    }
+
+    /// Batch-records `ticks` logical steps when no progress handler is installed.
+    #[inline(always)]
+    pub fn add_ticks_without_handler(&mut self, ticks: u64) {
+        self.op_count = self.op_count.wrapping_add(ticks);
     }
 }
 
@@ -858,6 +870,16 @@ impl ExecutionContext<'_> {
 }
 
 impl ExecutionServices for ExecutionContext<'_> {
+    #[inline(always)]
+    fn fast_interrupt_and_no_progress(&self) -> Option<&AtomicBool> {
+        (!self.progress.is_enabled()).then_some(self.interrupt_flag)
+    }
+
+    #[inline(always)]
+    fn add_ticks_without_handler(&mut self, ticks: u64) {
+        self.progress.add_ticks_without_handler(ticks);
+    }
+
     #[inline]
     fn check_interrupted(&mut self) -> Result<()> {
         if self.interrupt_flag.load(AtomicOrdering::Relaxed) {

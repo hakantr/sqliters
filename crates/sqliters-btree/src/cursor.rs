@@ -8,15 +8,15 @@ use std::cmp::Ordering;
 
 use sqliters_types::{
     ErrorCode, KeySortOrder, Pgno, Result, SqliteError, TextEncoding, Value,
-    decode_record_with_encoding, decode_serial_value_with_encoding, extended, get_varint,
-    serial_type_len,
+    decode_record_with_encoding, decode_serial_value_pooled, decode_serial_value_with_encoding,
+    extended, get_varint, serial_type_len,
 };
 
 use crate::Btree;
 use crate::page::{
-    BtreePageType, RawIndexCell, binary_search_table_leaf, find_table_interior_child,
-    raw_page_header, read_index_interior_cell, read_index_leaf_cell, read_table_interior_cell,
-    read_table_leaf_cell, read_table_leaf_rowid,
+    BtreePageType, RawIndexCell, binary_search_table_leaf, binary_search_table_leaf_with_span,
+    find_table_interior_child, raw_page_header, read_index_interior_cell, read_index_leaf_cell,
+    read_table_interior_cell, read_table_leaf_cell, read_table_leaf_rowid,
 };
 
 /// Maximum B-tree cursor stack depth (`BTCURSOR_MAX_DEPTH` in `btreeInt.h`).
@@ -73,14 +73,92 @@ pub struct CursorPagePos {
     pub cell_idx: usize,
 }
 
+/// Inline fixed-capacity root-to-current path stack (`apPage` / `aiIdx` in `BtCursor`),
+/// avoiding heap allocation on every cursor seek or scan.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub struct CursorStack {
+    frames: [CursorPagePos; BTCURSOR_MAX_DEPTH],
+    len: u8,
+}
+
+impl Default for CursorStack {
+    #[inline(always)]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CursorStack {
+    #[inline(always)]
+    pub const fn new() -> Self {
+        Self {
+            frames: [CursorPagePos {
+                pgno: 0,
+                cell_idx: 0,
+            }; BTCURSOR_MAX_DEPTH],
+            len: 0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, pos: CursorPagePos) {
+        let idx = self.len as usize;
+        self.frames[idx] = pos;
+        self.len += 1;
+    }
+
+    #[inline(always)]
+    pub fn pop(&mut self) -> Option<CursorPagePos> {
+        if self.len == 0 {
+            None
+        } else {
+            self.len -= 1;
+            Some(self.frames[self.len as usize])
+        }
+    }
+
+    #[inline(always)]
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[CursorPagePos] {
+        &self.frames[..self.len as usize]
+    }
+}
+
+impl std::ops::Deref for CursorStack {
+    type Target = [CursorPagePos];
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.frames[..self.len as usize]
+    }
+}
+
+impl std::ops::DerefMut for CursorStack {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.frames[..self.len as usize]
+    }
+}
+
+impl std::fmt::Debug for CursorStack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_slice().fmt(f)
+    }
+}
+
 /// Lifecycle state of an incremental [`Btree`] cursor (`CURSOR_*` in `btreeInt.h`).
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum BtreeCursorState {
     /// Newly opened or unpositioned after a missed point seek.
     Invalid,
     /// Positioned on a live cell at `stack.last()`, optionally carrying an unconsumed [`SkipNext`].
     Valid {
-        stack: Vec<CursorPagePos>,
+        stack: CursorStack,
         skip_next: SkipNext,
     },
     /// Invalidated by a same-connection B-tree mutation or `write_only` trip; will lazily reseek.
@@ -94,12 +172,84 @@ pub enum BtreeCursorState {
     Eof,
 }
 
+const INLINE_CACHED_COLS: usize = 16;
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct CellColumnCache {
+    pub(crate) valid: bool,
+    pub(crate) has_rowid: bool,
+    pub(crate) hdr_ready: bool,
+    pub(crate) parsed_cols: u8,
+    pub(crate) pgno: Pgno,
+    pub(crate) rowid: i64,
+    pub(crate) payload_start: u16,
+    pub(crate) payload_end: u16,
+    pub(crate) hdr_end: u16,
+    pub(crate) hdr_pos: u16,
+    pub(crate) body_pos: u16,
+    pub(crate) serials: [u64; INLINE_CACHED_COLS],
+    pub(crate) body_offs: [u16; INLINE_CACHED_COLS],
+}
+
+impl CellColumnCache {
+    #[inline(always)]
+    pub(crate) const fn empty() -> Self {
+        Self {
+            valid: false,
+            has_rowid: false,
+            hdr_ready: false,
+            parsed_cols: 0,
+            pgno: 0,
+            rowid: 0,
+            payload_start: 0,
+            payload_end: 0,
+            hdr_end: 0,
+            hdr_pos: 0,
+            body_pos: 0,
+            serials: [0; INLINE_CACHED_COLS],
+            body_offs: [0; INLINE_CACHED_COLS],
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn init_span(&mut self, pgno: Pgno, p_start: u16, p_end: u16, rowid: Option<i64>) {
+        self.valid = true;
+        self.hdr_ready = false;
+        self.parsed_cols = 0;
+        self.pgno = pgno;
+        self.payload_start = p_start;
+        self.payload_end = p_end;
+        if let Some(r) = rowid {
+            self.has_rowid = true;
+            self.rowid = r;
+        } else {
+            self.has_rowid = false;
+            self.rowid = 0;
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn clear(&mut self) {
+        self.valid = false;
+        self.has_rowid = false;
+        self.hdr_ready = false;
+        self.parsed_cols = 0;
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct BtreeCursor {
     pub(crate) root_pgno: Pgno,
     pub(crate) kind: CursorKind,
     pub(crate) writable: bool,
     pub(crate) state: BtreeCursorState,
+    pub(crate) col_cache: CellColumnCache,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CursorSlot {
+    pub(crate) generation: u32,
+    pub(crate) cursor: Option<BtreeCursor>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -153,18 +303,30 @@ impl Btree {
 
     /// Opens a new owned incremental cursor on `root_pgno`.
     pub fn open_cursor(&mut self, root_pgno: Pgno, kind: CursorKind, writable: bool) -> CursorId {
-        let id = CursorId(self.next_cursor_id);
-        self.next_cursor_id += 1;
-        self.cursors.insert(
-            id,
-            BtreeCursor {
-                root_pgno,
-                kind,
-                writable,
-                state: BtreeCursorState::Invalid,
-            },
-        );
-        id
+        let generation = self.next_cursor_gen;
+        self.next_cursor_gen = self.next_cursor_gen.wrapping_add(1).max(1);
+        let cur = BtreeCursor {
+            root_pgno,
+            kind,
+            writable,
+            state: BtreeCursorState::Invalid,
+            col_cache: CellColumnCache::empty(),
+        };
+        let slot = if let Some(slot) = self.free_cursor_slots.pop() {
+            let entry = &mut self.cursor_slots[slot as usize];
+            entry.generation = generation;
+            entry.cursor = Some(cur);
+            slot
+        } else {
+            let slot = self.cursor_slots.len() as u32;
+            self.cursor_slots.push(CursorSlot {
+                generation,
+                cursor: Some(cur),
+            });
+            slot
+        };
+        self.open_cursor_count += 1;
+        CursorId(((slot as u64) << 32) | u64::from(generation))
     }
 
     /// Convenience helper for opening a Table B+Tree cursor.
@@ -187,63 +349,152 @@ impl Btree {
     /// Closes a registered cursor, returning `true` if `id` was open.
     #[inline]
     pub fn close_cursor(&mut self, id: CursorId) -> bool {
-        self.cursors.remove(&id).is_some()
+        let slot = (id.0 >> 32) as usize;
+        let cur_gen = id.0 as u32;
+        if let Some(entry) = self.cursor_slots.get_mut(slot)
+            && entry.generation == cur_gen
+            && entry.cursor.take().is_some()
+        {
+            entry.generation = 0;
+            self.free_cursor_slots.push(slot as u32);
+            self.open_cursor_count -= 1;
+            return true;
+        }
+        false
     }
 
     /// Closes every open cursor registered on this `Btree`.
     #[inline]
     pub fn close_all_cursors(&mut self) {
-        self.cursors.clear();
+        if self.open_cursor_count == 0 {
+            return;
+        }
+        for (idx, entry) in self.cursor_slots.iter_mut().enumerate() {
+            if entry.cursor.take().is_some() {
+                entry.generation = 0;
+                self.free_cursor_slots.push(idx as u32);
+            }
+        }
+        self.open_cursor_count = 0;
+    }
+
+    #[inline(always)]
+    fn cursor_ref(&self, id: CursorId) -> Option<&BtreeCursor> {
+        let slot = (id.0 >> 32) as usize;
+        let cur_gen = id.0 as u32;
+        let entry = self.cursor_slots.get(slot)?;
+        if entry.generation == cur_gen {
+            entry.cursor.as_ref()
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn cursor_mut(&mut self, id: CursorId) -> Option<&mut BtreeCursor> {
+        let slot = (id.0 >> 32) as usize;
+        let cur_gen = id.0 as u32;
+        let entry = self.cursor_slots.get_mut(slot)?;
+        if entry.generation == cur_gen {
+            entry.cursor.as_mut()
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub(crate) fn invalidate_all_cursor_caches(&mut self) {
+        if self.open_cursor_count == 0 {
+            return;
+        }
+        for entry in &mut self.cursor_slots {
+            if let Some(ref mut cur) = entry.cursor {
+                cur.col_cache.clear();
+            }
+        }
+    }
+
+    pub(crate) fn remap_open_cursor_roots(&mut self, from_root: Pgno, to_root: Pgno) {
+        if self.open_cursor_count == 0 {
+            return;
+        }
+        for entry in &mut self.cursor_slots {
+            if let Some(ref mut cur) = entry.cursor
+                && cur.root_pgno == from_root
+            {
+                cur.root_pgno = to_root;
+                cur.col_cache.clear();
+            }
+        }
     }
 
     /// Inspects the current state of `id` (`None` if closed/unknown).
     #[inline]
     pub fn cursor_state(&self, id: CursorId) -> Option<&BtreeCursorState> {
-        self.cursors.get(&id).map(|c| &c.state)
+        self.cursor_ref(id).map(|c| &c.state)
     }
 
     /// Returns the `root_pgno` of `id` (`None` if closed/unknown).
     #[inline]
     pub fn cursor_root_pgno(&self, id: CursorId) -> Option<Pgno> {
-        self.cursors.get(&id).map(|c| c.root_pgno)
+        self.cursor_ref(id).map(|c| c.root_pgno)
     }
 
     /// Returns whether `id` was opened as writable (`None` if closed/unknown).
     #[inline]
     pub fn cursor_is_writable(&self, id: CursorId) -> Option<bool> {
-        self.cursors.get(&id).map(|c| c.writable)
+        self.cursor_ref(id).map(|c| c.writable)
     }
 
     /// Number of currently open cursors on this `Btree`.
     #[inline]
     pub fn open_cursor_count(&self) -> usize {
-        self.cursors.len()
+        self.open_cursor_count
     }
 
     /// Returns `true` if at least one cursor is open on this `Btree`.
     #[inline]
     pub fn has_open_cursors(&self) -> bool {
-        !self.cursors.is_empty()
+        self.open_cursor_count > 0
     }
 
     /// Returns `true` if any cursor other than `exclude` is open on `root_pgno` (`OP_Destroy` guard).
     pub fn has_other_cursors_on_root(&self, root_pgno: Pgno, exclude: Option<CursorId>) -> bool {
-        self.cursors
-            .iter()
-            .any(|(&cid, cur)| Some(cid) != exclude && cur.root_pgno == root_pgno)
+        if self.open_cursor_count == 0 {
+            return false;
+        }
+        self.cursor_slots.iter().enumerate().any(|(slot, entry)| {
+            if let Some(ref cur) = entry.cursor {
+                let cid = CursorId(((slot as u64) << 32) | u64::from(entry.generation));
+                Some(cid) != exclude && cur.root_pgno == root_pgno
+            } else {
+                false
+            }
+        })
     }
 
     /// Returns `true` if any cursor other than `exclude` is open anywhere in this `Btree`.
     pub fn has_any_other_open_cursor(&self, exclude: Option<CursorId>) -> bool {
-        self.cursors.keys().any(|&cid| Some(cid) != exclude)
+        if self.open_cursor_count == 0 {
+            return false;
+        }
+        self.cursor_slots.iter().enumerate().any(|(slot, entry)| {
+            if entry.cursor.is_some() {
+                let cid = CursorId(((slot as u64) << 32) | u64::from(entry.generation));
+                Some(cid) != exclude
+            } else {
+                false
+            }
+        })
     }
 
+    #[inline(always)]
     fn get_cursor(&self, id: CursorId) -> Result<&BtreeCursor> {
-        self.cursors
-            .get(&id)
+        self.cursor_ref(id)
             .ok_or_else(|| SqliteError::misuse(format!("invalid or closed cursor id {}", id.0)))
     }
 
+    #[inline(always)]
     fn check_cursor_not_faulted(&self, id: CursorId) -> Result<()> {
         let cur = self.get_cursor(id)?;
         if let BtreeCursorState::Fault(code) = cur.state {
@@ -264,7 +515,7 @@ impl Btree {
             match &cur.state {
                 BtreeCursorState::Fault(code) => return Err(fault_error(*code)),
                 BtreeCursorState::Valid { stack, skip_next } => {
-                    (cur.root_pgno, cur.kind.clone(), stack.clone(), *skip_next)
+                    (cur.root_pgno, cur.kind.clone(), *stack, *skip_next)
                 }
                 BtreeCursorState::RequireSeek { .. }
                 | BtreeCursorState::Invalid
@@ -306,7 +557,8 @@ impl Btree {
             }
         };
 
-        if let Some(cur) = self.cursors.get_mut(&id) {
+        if let Some(cur) = self.cursor_mut(id) {
+            cur.col_cache.clear();
             cur.state = BtreeCursorState::RequireSeek {
                 saved_key,
                 skip_next,
@@ -321,42 +573,54 @@ impl Btree {
         root_filter: Option<Pgno>,
         exclude: Option<CursorId>,
     ) -> Result<()> {
-        if self.cursors.is_empty() {
+        if self.open_cursor_count == 0 {
             return Ok(());
         }
-        let matching_ids: Vec<CursorId> = self
-            .cursors
-            .iter()
-            .filter_map(|(&cid, cur)| {
-                if Some(cid) == exclude {
-                    return None;
-                }
-                if let Some(rf) = root_filter
-                    && cur.root_pgno != rf
-                {
-                    return None;
-                }
-                if matches!(cur.state, BtreeCursorState::Valid { .. }) {
-                    Some(cid)
+        let mut inline_ids = [CursorId(0); 4];
+        let mut inline_len = 0usize;
+        let mut overflow_ids: Vec<CursorId> = Vec::new();
+        for (slot, entry) in self.cursor_slots.iter().enumerate() {
+            let Some(ref cur) = entry.cursor else {
+                continue;
+            };
+            let cid = CursorId(((slot as u64) << 32) | u64::from(entry.generation));
+            if Some(cid) == exclude {
+                continue;
+            }
+            if let Some(rf) = root_filter
+                && cur.root_pgno != rf
+            {
+                continue;
+            }
+            if matches!(cur.state, BtreeCursorState::Valid { .. }) {
+                if inline_len < inline_ids.len() {
+                    inline_ids[inline_len] = cid;
+                    inline_len += 1;
                 } else {
-                    None
+                    overflow_ids.push(cid);
                 }
-            })
-            .collect();
+            }
+        }
 
-        for cid in matching_ids {
+        for &cid in &inline_ids[..inline_len] {
+            self.save_cursor_position(cid)?;
+        }
+        for cid in overflow_ids {
             self.save_cursor_position(cid)?;
         }
         Ok(())
     }
 
     /// Pre-mutation hook saving any `Valid` cursors on `root_filter` (except `exclude`).
-    #[inline]
+    #[inline(always)]
     pub fn save_cursors_for_mutation(
         &mut self,
         root_filter: Option<Pgno>,
         exclude: Option<CursorId>,
     ) -> Result<()> {
+        if self.open_cursor_count == 0 {
+            return Ok(());
+        }
         self.save_all_cursors(root_filter, exclude)
     }
 
@@ -366,16 +630,29 @@ impl Btree {
     ///   cursors to `RequireSeek`. If saving any read-only cursor fails with `err`, immediately
     ///   escalates ALL open cursors on this `Btree` to `Fault(err.extended_code)` and returns `Err(err)`.
     pub fn trip_cursors(&mut self, trip_code: i32, write_only: bool) -> Result<()> {
+        if self.open_cursor_count == 0 {
+            return Ok(());
+        }
         if !write_only {
-            for cur in self.cursors.values_mut() {
-                cur.state = BtreeCursorState::Fault(trip_code);
+            for entry in &mut self.cursor_slots {
+                if let Some(ref mut cur) = entry.cursor {
+                    cur.col_cache.clear();
+                    cur.state = BtreeCursorState::Fault(trip_code);
+                }
             }
             return Ok(());
         }
 
-        let ids: Vec<CursorId> = self.cursors.keys().copied().collect();
+        let mut ids = Vec::with_capacity(self.open_cursor_count);
+        for (slot, entry) in self.cursor_slots.iter().enumerate() {
+            if entry.cursor.is_some() {
+                ids.push(CursorId(
+                    ((slot as u64) << 32) | u64::from(entry.generation),
+                ));
+            }
+        }
         for cid in ids {
-            let (is_writable, is_valid) = match self.cursors.get(&cid) {
+            let (is_writable, is_valid) = match self.cursor_ref(cid) {
                 Some(c) => (
                     c.writable,
                     matches!(c.state, BtreeCursorState::Valid { .. }),
@@ -383,13 +660,17 @@ impl Btree {
                 None => continue,
             };
             if is_writable {
-                if let Some(c) = self.cursors.get_mut(&cid) {
+                if let Some(c) = self.cursor_mut(cid) {
+                    c.col_cache.clear();
                     c.state = BtreeCursorState::Fault(trip_code);
                 }
             } else if is_valid && let Err(err) = self.save_cursor_position(cid) {
                 let fault_code = err.extended_code;
-                for cur in self.cursors.values_mut() {
-                    cur.state = BtreeCursorState::Fault(fault_code);
+                for entry in &mut self.cursor_slots {
+                    if let Some(ref mut cur) = entry.cursor {
+                        cur.col_cache.clear();
+                        cur.state = BtreeCursorState::Fault(fault_code);
+                    }
                 }
                 return Err(err);
             }
@@ -418,13 +699,14 @@ impl Btree {
         };
 
         if self.pager.page_count() == 0 || root_pgno == 0 {
-            if let Some(cur) = self.cursors.get_mut(&id) {
+            if let Some(cur) = self.cursor_mut(id) {
+                cur.col_cache.clear();
                 cur.state = BtreeCursorState::Eof;
             }
             return Ok(true);
         }
 
-        let mut stack = Vec::with_capacity(8);
+        let mut stack = CursorStack::new();
         let outcome = match (&kind, &saved_key) {
             (CursorKind::Table, SavedCursorKey::Table(target_rowid)) => {
                 self.seek_table_lower_bound(root_pgno, *target_rowid, &mut stack)?
@@ -464,7 +746,8 @@ impl Btree {
             ),
         };
 
-        if let Some(cur) = self.cursors.get_mut(&id) {
+        if let Some(cur) = self.cursor_mut(id) {
+            cur.col_cache.clear();
             cur.state = new_state;
         }
         Ok(moved)
@@ -501,20 +784,22 @@ impl Btree {
         };
 
         if self.pager.page_count() == 0 || root_pgno == 0 {
-            if let Some(cur) = self.cursors.get_mut(&id) {
+            if let Some(cur) = self.cursor_mut(id) {
+                cur.col_cache.clear();
                 cur.state = BtreeCursorState::Eof;
             }
             return Ok(false);
         }
 
-        let mut stack = Vec::with_capacity(8);
+        let mut stack = CursorStack::new();
         let found = if is_table {
             self.descend_table_leftmost(root_pgno, &mut stack)?
         } else {
             self.descend_index_leftmost(root_pgno, &mut stack)?
         };
 
-        if let Some(cur) = self.cursors.get_mut(&id) {
+        if let Some(cur) = self.cursor_mut(id) {
+            cur.col_cache.clear();
             cur.state = if found {
                 BtreeCursorState::Valid {
                     stack,
@@ -538,20 +823,22 @@ impl Btree {
         };
 
         if self.pager.page_count() == 0 || root_pgno == 0 {
-            if let Some(cur) = self.cursors.get_mut(&id) {
+            if let Some(cur) = self.cursor_mut(id) {
+                cur.col_cache.clear();
                 cur.state = BtreeCursorState::Eof;
             }
             return Ok(false);
         }
 
-        let mut stack = Vec::with_capacity(8);
+        let mut stack = CursorStack::new();
         let found = if is_table {
             self.descend_table_rightmost(root_pgno, &mut stack)?
         } else {
             self.descend_index_rightmost(root_pgno, &mut stack)?
         };
 
-        if let Some(cur) = self.cursors.get_mut(&id) {
+        if let Some(cur) = self.cursor_mut(id) {
+            cur.col_cache.clear();
             cur.state = if found {
                 BtreeCursorState::Valid {
                     stack,
@@ -582,22 +869,21 @@ impl Btree {
             match &cur.state {
                 BtreeCursorState::Fault(code) => return Err(fault_error(*code)),
                 BtreeCursorState::Eof | BtreeCursorState::Invalid => {
-                    if let Some(c) = self.cursors.get_mut(&id) {
+                    if let Some(c) = self.cursor_mut(id) {
+                        c.col_cache.clear();
                         c.state = BtreeCursorState::Eof;
                     }
                     return Ok(false);
                 }
-                BtreeCursorState::Valid { stack, skip_next } => (
-                    matches!(cur.kind, CursorKind::Table),
-                    stack.clone(),
-                    *skip_next,
-                ),
+                BtreeCursorState::Valid { stack, skip_next } => {
+                    (matches!(cur.kind, CursorKind::Table), *stack, *skip_next)
+                }
                 BtreeCursorState::RequireSeek { .. } => unreachable!("restored above"),
             }
         };
 
         if skip_next == SkipNext::SkipForward {
-            if let Some(cur) = self.cursors.get_mut(&id) {
+            if let Some(cur) = self.cursor_mut(id) {
                 cur.state = BtreeCursorState::Valid {
                     stack,
                     skip_next: SkipNext::None,
@@ -612,7 +898,8 @@ impl Btree {
             self.advance_index_stack(&mut stack)?
         };
 
-        if let Some(cur) = self.cursors.get_mut(&id) {
+        if let Some(cur) = self.cursor_mut(id) {
+            cur.col_cache.clear();
             cur.state = if has_more {
                 BtreeCursorState::Valid {
                     stack,
@@ -643,22 +930,21 @@ impl Btree {
             match &cur.state {
                 BtreeCursorState::Fault(code) => return Err(fault_error(*code)),
                 BtreeCursorState::Eof | BtreeCursorState::Invalid => {
-                    if let Some(c) = self.cursors.get_mut(&id) {
+                    if let Some(c) = self.cursor_mut(id) {
+                        c.col_cache.clear();
                         c.state = BtreeCursorState::Eof;
                     }
                     return Ok(false);
                 }
-                BtreeCursorState::Valid { stack, skip_next } => (
-                    matches!(cur.kind, CursorKind::Table),
-                    stack.clone(),
-                    *skip_next,
-                ),
+                BtreeCursorState::Valid { stack, skip_next } => {
+                    (matches!(cur.kind, CursorKind::Table), *stack, *skip_next)
+                }
                 BtreeCursorState::RequireSeek { .. } => unreachable!("restored above"),
             }
         };
 
         if skip_next == SkipNext::SkipBackward {
-            if let Some(cur) = self.cursors.get_mut(&id) {
+            if let Some(cur) = self.cursor_mut(id) {
                 cur.state = BtreeCursorState::Valid {
                     stack,
                     skip_next: SkipNext::None,
@@ -673,7 +959,8 @@ impl Btree {
             self.retreat_index_stack(&mut stack)?
         };
 
-        if let Some(cur) = self.cursors.get_mut(&id) {
+        if let Some(cur) = self.cursor_mut(id) {
+            cur.col_cache.clear();
             cur.state = if has_more {
                 BtreeCursorState::Valid {
                     stack,
@@ -689,10 +976,12 @@ impl Btree {
     /// Exact point-seek on a Table B+Tree cursor (`OP_SeekRowid`).
     /// Returns `Ok(true)` on exact `rowid` match (`Valid`), or `Ok(false)` on miss (`Invalid`).
     pub fn cursor_seek_rowid(&mut self, id: CursorId, rowid: i64) -> Result<bool> {
-        self.check_cursor_not_faulted(id)?;
         self.check_interrupted()?;
         let root_pgno = {
             let cur = self.get_cursor(id)?;
+            if let BtreeCursorState::Fault(code) = cur.state {
+                return Err(fault_error(code));
+            }
             if !matches!(cur.kind, CursorKind::Table) {
                 return Err(SqliteError::misuse(
                     "cursor_seek_rowid requires a Table cursor",
@@ -702,14 +991,15 @@ impl Btree {
         };
 
         if self.pager.page_count() == 0 || root_pgno == 0 {
-            if let Some(cur) = self.cursors.get_mut(&id) {
+            if let Some(cur) = self.cursor_mut(id) {
+                cur.col_cache.clear();
                 cur.state = BtreeCursorState::Invalid;
             }
             return Ok(false);
         }
 
         let usable = self.pager.usable_size();
-        let mut stack = Vec::with_capacity(8);
+        let mut stack = CursorStack::new();
         let mut cur_pgno = root_pgno;
 
         for _ in 0..BTCURSOR_MAX_DEPTH {
@@ -719,15 +1009,17 @@ impl Btree {
                 let (ptype, n_cell, _) = raw_page_header(cur_pgno, usable, raw)?;
                 match ptype {
                     BtreePageType::TableLeaf => {
-                        match binary_search_table_leaf(cur_pgno, usable, raw, n_cell, rowid)? {
-                            Ok(exact_idx) => {
+                        match binary_search_table_leaf_with_span(
+                            cur_pgno, usable, raw, n_cell, rowid,
+                        )? {
+                            Ok((exact_idx, inline_span)) => {
                                 stack.push(CursorPagePos {
                                     pgno: cur_pgno,
                                     cell_idx: exact_idx,
                                 });
-                                Ok(true)
+                                Ok(Some((cur_pgno, inline_span)))
                             }
-                            Err(_) => Ok(false),
+                            Err(_) => Ok(None),
                         }
                     }
                     BtreePageType::TableInterior => {
@@ -746,8 +1038,14 @@ impl Btree {
                 }
             };
             match next_step {
-                Ok(true) => {
-                    if let Some(cur) = self.cursors.get_mut(&id) {
+                Ok(Some((leaf_pgno, inline_span))) => {
+                    if let Some(cur) = self.cursor_mut(id) {
+                        if let Some((p_start, p_end)) = inline_span {
+                            cur.col_cache
+                                .init_span(leaf_pgno, p_start, p_end, Some(rowid));
+                        } else {
+                            cur.col_cache.clear();
+                        }
                         cur.state = BtreeCursorState::Valid {
                             stack,
                             skip_next: SkipNext::None,
@@ -755,8 +1053,9 @@ impl Btree {
                     }
                     return Ok(true);
                 }
-                Ok(false) => {
-                    if let Some(cur) = self.cursors.get_mut(&id) {
+                Ok(None) => {
+                    if let Some(cur) = self.cursor_mut(id) {
+                        cur.col_cache.clear();
                         cur.state = BtreeCursorState::Invalid;
                     }
                     return Ok(false);
@@ -783,15 +1082,17 @@ impl Btree {
             cur.root_pgno
         };
         if self.pager.page_count() == 0 || root_pgno == 0 {
-            if let Some(cur) = self.cursors.get_mut(&id) {
+            if let Some(cur) = self.cursor_mut(id) {
+                cur.col_cache.clear();
                 cur.state = BtreeCursorState::Eof;
             }
             return Ok(false);
         }
-        let mut stack = Vec::with_capacity(8);
+        let mut stack = CursorStack::new();
         let outcome = self.seek_table_lower_bound(root_pgno, target_rowid, &mut stack)?;
         let hit = matches!(outcome, LowerBoundResult::Exact | LowerBoundResult::After);
-        if let Some(cur) = self.cursors.get_mut(&id) {
+        if let Some(cur) = self.cursor_mut(id) {
+            cur.col_cache.clear();
             cur.state = if hit {
                 BtreeCursorState::Valid {
                     stack,
@@ -820,15 +1121,17 @@ impl Btree {
             }
         };
         if self.pager.page_count() == 0 || root_pgno == 0 {
-            if let Some(cur) = self.cursors.get_mut(&id) {
+            if let Some(cur) = self.cursor_mut(id) {
+                cur.col_cache.clear();
                 cur.state = BtreeCursorState::Eof;
             }
             return Ok(false);
         }
-        let mut stack = Vec::with_capacity(8);
+        let mut stack = CursorStack::new();
         let outcome = self.seek_index_lower_bound(root_pgno, key_values, &orders, &mut stack)?;
         let hit = matches!(outcome, LowerBoundResult::Exact | LowerBoundResult::After);
-        if let Some(cur) = self.cursors.get_mut(&id) {
+        if let Some(cur) = self.cursor_mut(id) {
+            cur.col_cache.clear();
             cur.state = if hit {
                 BtreeCursorState::Valid {
                     stack,
@@ -863,16 +1166,18 @@ impl Btree {
         };
 
         if self.pager.page_count() == 0 || root_pgno == 0 {
-            if let Some(cur) = self.cursors.get_mut(&id) {
+            if let Some(cur) = self.cursor_mut(id) {
+                cur.col_cache.clear();
                 cur.state = BtreeCursorState::Eof;
             }
             return Ok(false);
         }
 
-        let mut stack = Vec::with_capacity(8);
+        let mut stack = CursorStack::new();
         let outcome = self.seek_index_lower_bound(root_pgno, prefix_values, &orders, &mut stack)?;
         let matched = outcome == LowerBoundResult::Exact;
-        if let Some(cur) = self.cursors.get_mut(&id) {
+        if let Some(cur) = self.cursor_mut(id) {
+            cur.col_cache.clear();
             cur.state = if matched {
                 BtreeCursorState::Valid {
                     stack,
@@ -908,7 +1213,7 @@ impl Btree {
             let BtreeCursorState::Valid { stack, .. } = &cur.state else {
                 return Ok(false);
             };
-            (orders, stack.clone())
+            (orders, *stack)
         };
 
         let top = *stack
@@ -918,7 +1223,8 @@ impl Btree {
         if ord == Ordering::Equal {
             Ok(true)
         } else {
-            if let Some(cur) = self.cursors.get_mut(&id) {
+            if let Some(cur) = self.cursor_mut(id) {
+                cur.col_cache.clear();
                 cur.state = BtreeCursorState::Eof;
             }
             Ok(false)
@@ -941,7 +1247,7 @@ impl Btree {
             self.restore_cursor_position(id)?;
         }
 
-        let (is_table, top) = {
+        let (is_table, top, cached_rowid) = {
             let cur = self.get_cursor(id)?;
             match &cur.state {
                 BtreeCursorState::Fault(code) => return Err(fault_error(*code)),
@@ -949,7 +1255,12 @@ impl Btree {
                     let top = *stack
                         .last()
                         .ok_or_else(|| SqliteError::corrupt("empty valid cursor stack"))?;
-                    (matches!(cur.kind, CursorKind::Table), top)
+                    let cr = if cur.col_cache.valid && cur.col_cache.has_rowid {
+                        Some(cur.col_cache.rowid)
+                    } else {
+                        None
+                    };
+                    (matches!(cur.kind, CursorKind::Table), top, cr)
                 }
                 BtreeCursorState::Eof | BtreeCursorState::Invalid => {
                     return Err(SqliteError::misuse(
@@ -959,6 +1270,10 @@ impl Btree {
                 BtreeCursorState::RequireSeek { .. } => unreachable!("restored above"),
             }
         };
+
+        if let Some(rid) = cached_rowid {
+            return Ok(rid);
+        }
 
         if is_table {
             let usable = self.pager.usable_size();
@@ -993,7 +1308,7 @@ impl Btree {
             let cur = self.get_cursor(id)?;
             match &cur.state {
                 BtreeCursorState::Fault(code) => return Err(fault_error(*code)),
-                BtreeCursorState::Valid { stack, .. } => stack.clone(),
+                BtreeCursorState::Valid { stack, .. } => *stack,
                 BtreeCursorState::Eof | BtreeCursorState::Invalid => {
                     return Err(SqliteError::misuse(
                         "cursor_payload called on unpositioned/EOF cursor",
@@ -1010,15 +1325,30 @@ impl Btree {
     /// If `col_idx`'s header and payload bytes reside completely within `local_payload`,
     /// **zero overflow pages** are read! Even when `col_idx` spills into overflow pages,
     /// only overflow pages up to the end of `col_idx` are read.
+    #[inline]
     pub fn cursor_column(&mut self, id: CursorId, col_idx: usize) -> Result<Option<Value>> {
-        self.check_cursor_not_faulted(id)?;
-        if matches!(
-            self.get_cursor(id)?.state,
-            BtreeCursorState::RequireSeek { .. }
-        ) {
-            self.restore_cursor_position(id)?;
-        }
+        self.cursor_column_inner(id, col_idx, None)
+    }
 
+    /// Lazily decodes 0-based column `col_idx` of the current entry (`OP_Column`), reusing
+    /// pooled `String` / `Vec<u8>` buffers when `col_idx` resides inline on the page.
+    #[inline]
+    pub fn cursor_column_pooled(
+        &mut self,
+        id: CursorId,
+        col_idx: usize,
+        texts: &mut Vec<String>,
+        blobs: &mut Vec<Vec<u8>>,
+    ) -> Result<Option<Value>> {
+        self.cursor_column_inner(id, col_idx, Some((texts, blobs)))
+    }
+
+    fn cursor_column_inner(
+        &mut self,
+        id: CursorId,
+        col_idx: usize,
+        pools: Option<(&mut Vec<String>, &mut Vec<Vec<u8>>)>,
+    ) -> Result<Option<Value>> {
         let top = {
             let cur = self.get_cursor(id)?;
             match &cur.state {
@@ -1026,14 +1356,221 @@ impl Btree {
                 BtreeCursorState::Valid { stack, .. } => *stack
                     .last()
                     .ok_or_else(|| SqliteError::corrupt("empty valid cursor stack"))?,
+                BtreeCursorState::RequireSeek { .. } => {
+                    self.restore_cursor_position(id)?;
+                    let cur = self.get_cursor(id)?;
+                    match &cur.state {
+                        BtreeCursorState::Fault(code) => return Err(fault_error(*code)),
+                        BtreeCursorState::Valid { stack, .. } => *stack
+                            .last()
+                            .ok_or_else(|| SqliteError::corrupt("empty valid cursor stack"))?,
+                        _ => {
+                            return Err(SqliteError::misuse(
+                                "cursor_column called on unpositioned/EOF cursor",
+                            ));
+                        }
+                    }
+                }
                 BtreeCursorState::Eof | BtreeCursorState::Invalid => {
                     return Err(SqliteError::misuse(
                         "cursor_column called on unpositioned/EOF cursor",
                     ));
                 }
-                BtreeCursorState::RequireSeek { .. } => unreachable!("restored above"),
             }
         };
+
+        if col_idx < INLINE_CACHED_COLS {
+            let enc = self.encoding();
+            let usable = self.pager.usable_size();
+            if usable <= u32::from(u16::MAX) {
+                let slot_idx = (id.0 >> 32) as usize;
+                let cur_gen = id.0 as u32;
+                let inline_res = if let Some(entry) = self.cursor_slots.get_mut(slot_idx)
+                    && entry.generation == cur_gen
+                    && let Some(ref mut cur) = entry.cursor
+                {
+                    let cache = &mut cur.col_cache;
+                    let raw = self.pager.read_page(top.pgno)?;
+                    if !cache.valid {
+                        let (ptype, n_cell, _) = raw_page_header(top.pgno, usable, raw)?;
+                        match ptype {
+                            BtreePageType::TableLeaf => {
+                                let c = read_table_leaf_cell(
+                                    top.pgno,
+                                    usable,
+                                    raw,
+                                    n_cell,
+                                    top.cell_idx,
+                                )?;
+                                if c.overflow_page.is_none()
+                                    && c.local_payload.len() >= c.total_payload_len as usize
+                                {
+                                    let p_start = (c.local_payload.as_ptr() as usize
+                                        - raw.as_ptr() as usize)
+                                        as u16;
+                                    let p_end = p_start + (c.total_payload_len as u16);
+                                    cache.init_span(top.pgno, p_start, p_end, Some(c.rowid));
+                                }
+                            }
+                            BtreePageType::IndexLeaf => {
+                                let c = read_index_leaf_cell(
+                                    top.pgno,
+                                    usable,
+                                    raw,
+                                    n_cell,
+                                    top.cell_idx,
+                                )?;
+                                if c.overflow_page.is_none()
+                                    && c.local_payload.len() >= c.total_payload_len as usize
+                                {
+                                    let p_start = (c.local_payload.as_ptr() as usize
+                                        - raw.as_ptr() as usize)
+                                        as u16;
+                                    let p_end = p_start + (c.total_payload_len as u16);
+                                    cache.init_span(top.pgno, p_start, p_end, None);
+                                }
+                            }
+                            BtreePageType::IndexInterior => {
+                                let (_, c) = read_index_interior_cell(
+                                    top.pgno,
+                                    usable,
+                                    raw,
+                                    n_cell,
+                                    top.cell_idx,
+                                )?;
+                                if c.overflow_page.is_none()
+                                    && c.local_payload.len() >= c.total_payload_len as usize
+                                {
+                                    let p_start = (c.local_payload.as_ptr() as usize
+                                        - raw.as_ptr() as usize)
+                                        as u16;
+                                    let p_end = p_start + (c.total_payload_len as u16);
+                                    cache.init_span(top.pgno, p_start, p_end, None);
+                                }
+                            }
+                            BtreePageType::TableInterior => {
+                                return Err(SqliteError::corrupt(
+                                    "cannot decode column from TableInterior page",
+                                ));
+                            }
+                        }
+                    }
+
+                    if cache.valid {
+                        let p_start = cache.payload_start as usize;
+                        let p_end = cache.payload_end as usize;
+                        if p_start == p_end {
+                            Some(Ok(None))
+                        } else {
+                            let hdr_ok = if !cache.hdr_ready {
+                                match get_varint(&raw[p_start..p_end]) {
+                                    Ok((hdr_u64, used)) => {
+                                        if let Ok(hdr_sz) = usize::try_from(hdr_u64)
+                                            && hdr_sz <= p_end - p_start
+                                            && used <= hdr_sz
+                                        {
+                                            cache.hdr_end = (p_start + hdr_sz) as u16;
+                                            cache.hdr_pos = (p_start + used) as u16;
+                                            cache.body_pos = cache.hdr_end;
+                                            cache.hdr_ready = true;
+                                            Ok(())
+                                        } else {
+                                            Err(SqliteError::corrupt(
+                                                "record header exceeds record length",
+                                            ))
+                                        }
+                                    }
+                                    Err(e) => Err(e),
+                                }
+                            } else {
+                                Ok(())
+                            };
+
+                            match hdr_ok {
+                                Err(e) => {
+                                    cache.clear();
+                                    Some(Err(e))
+                                }
+                                Ok(()) => {
+                                    let hdr_end = cache.hdr_end as usize;
+                                    let mut parse_err = None;
+                                    while (cache.parsed_cols as usize) <= col_idx
+                                        && (cache.hdr_pos as usize) < hdr_end
+                                    {
+                                        match get_varint(&raw[cache.hdr_pos as usize..hdr_end]) {
+                                            Ok((st, used)) => match serial_type_len(st) {
+                                                Ok(len) => {
+                                                    let bpos = cache.body_pos as usize;
+                                                    match bpos.checked_add(len) {
+                                                        Some(next_b) if next_b <= p_end => {
+                                                            let ci = cache.parsed_cols as usize;
+                                                            cache.serials[ci] = st;
+                                                            cache.body_offs[ci] = cache.body_pos;
+                                                            cache.hdr_pos += used as u16;
+                                                            cache.body_pos = next_b as u16;
+                                                            cache.parsed_cols += 1;
+                                                        }
+                                                        _ => {
+                                                            parse_err = Some(SqliteError::corrupt(
+                                                                "record payload truncated",
+                                                            ));
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    parse_err = Some(e);
+                                                    break;
+                                                }
+                                            },
+                                            Err(e) => {
+                                                parse_err = Some(e);
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    if let Some(e) = parse_err {
+                                        cache.clear();
+                                        Some(Err(e))
+                                    } else if col_idx >= cache.parsed_cols as usize {
+                                        Some(Ok(None))
+                                    } else {
+                                        let st = cache.serials[col_idx];
+                                        match serial_type_len(st) {
+                                            Ok(len) => {
+                                                let start = cache.body_offs[col_idx] as usize;
+                                                let slice = &raw[start..start + len];
+                                                let decoded = match pools {
+                                                    Some((texts, blobs)) => {
+                                                        decode_serial_value_pooled(
+                                                            st, slice, enc, texts, blobs,
+                                                        )
+                                                    }
+                                                    None => decode_serial_value_with_encoding(
+                                                        st, slice, enc,
+                                                    ),
+                                                };
+                                                Some(decoded.map(Some))
+                                            }
+                                            Err(e) => Some(Err(e)),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(res) = inline_res {
+                    return res;
+                }
+            }
+        }
 
         self.read_cell_column_lazy(top.pgno, top.cell_idx, Some(col_idx))
     }
@@ -1531,7 +2068,7 @@ impl Btree {
     fn descend_table_leftmost(
         &mut self,
         start_pgno: Pgno,
-        stack: &mut Vec<CursorPagePos>,
+        stack: &mut CursorStack,
     ) -> Result<bool> {
         let usable = self.pager.usable_size();
         let mut cur_pgno = start_pgno;
@@ -1577,7 +2114,7 @@ impl Btree {
     fn descend_table_rightmost(
         &mut self,
         start_pgno: Pgno,
-        stack: &mut Vec<CursorPagePos>,
+        stack: &mut CursorStack,
     ) -> Result<bool> {
         let usable = self.pager.usable_size();
         let mut cur_pgno = start_pgno;
@@ -1615,7 +2152,7 @@ impl Btree {
         ))
     }
 
-    fn advance_table_stack(&mut self, stack: &mut Vec<CursorPagePos>) -> Result<bool> {
+    fn advance_table_stack(&mut self, stack: &mut CursorStack) -> Result<bool> {
         let usable = self.pager.usable_size();
         let Some(top) = stack.last_mut() else {
             return Ok(false);
@@ -1668,7 +2205,7 @@ impl Btree {
         Ok(false)
     }
 
-    fn retreat_table_stack(&mut self, stack: &mut Vec<CursorPagePos>) -> Result<bool> {
+    fn retreat_table_stack(&mut self, stack: &mut CursorStack) -> Result<bool> {
         let usable = self.pager.usable_size();
         let Some(top) = stack.last_mut() else {
             return Ok(false);
@@ -1706,7 +2243,7 @@ impl Btree {
         &mut self,
         root_pgno: Pgno,
         target_rowid: i64,
-        stack: &mut Vec<CursorPagePos>,
+        stack: &mut CursorStack,
     ) -> Result<LowerBoundResult> {
         let usable = self.pager.usable_size();
         let mut cur_pgno = root_pgno;
@@ -1766,7 +2303,7 @@ impl Btree {
             };
             match step {
                 Ok(()) => {
-                    let mut next_stack = stack.clone();
+                    let mut next_stack = *stack;
                     if self.advance_table_stack(&mut next_stack)? {
                         *stack = next_stack;
                         return Ok(LowerBoundResult::After);
@@ -1788,7 +2325,7 @@ impl Btree {
     fn descend_index_leftmost(
         &mut self,
         start_pgno: Pgno,
-        stack: &mut Vec<CursorPagePos>,
+        stack: &mut CursorStack,
     ) -> Result<bool> {
         let usable = self.pager.usable_size();
         let mut cur_pgno = start_pgno;
@@ -1834,7 +2371,7 @@ impl Btree {
     fn descend_index_rightmost(
         &mut self,
         start_pgno: Pgno,
-        stack: &mut Vec<CursorPagePos>,
+        stack: &mut CursorStack,
     ) -> Result<bool> {
         let usable = self.pager.usable_size();
         let mut cur_pgno = start_pgno;
@@ -1879,7 +2416,7 @@ impl Btree {
     ///   - if `cell_idx + 1 < n_cell`: increment `cell_idx`;
     ///   - else pop leaf and pop any `IndexInterior` ancestors whose `cell_idx == anc_n_cell` (`right_child`);
     ///     if an ancestor remains (`anc.cell_idx < anc_n_cell`), stop directly on that interior cell!
-    fn advance_index_stack(&mut self, stack: &mut Vec<CursorPagePos>) -> Result<bool> {
+    fn advance_index_stack(&mut self, stack: &mut CursorStack) -> Result<bool> {
         let usable = self.pager.usable_size();
         let Some(top) = stack.last().copied() else {
             return Ok(false);
@@ -1950,7 +2487,7 @@ impl Btree {
     ///   - else pop leaf and pop any `IndexInterior` ancestors whose `cell_idx == 0`;
     ///     if an ancestor remains (`anc.cell_idx > 0`), decrement `anc.cell_idx -= 1` so the cursor
     ///     sits directly on `cells[anc.cell_idx - 1]`!
-    fn retreat_index_stack(&mut self, stack: &mut Vec<CursorPagePos>) -> Result<bool> {
+    fn retreat_index_stack(&mut self, stack: &mut CursorStack) -> Result<bool> {
         let usable = self.pager.usable_size();
         let Some(top) = stack.last().copied() else {
             return Ok(false);
@@ -1999,7 +2536,7 @@ impl Btree {
         root_pgno: Pgno,
         target_values: &[Value],
         orders: &[KeySortOrder],
-        stack: &mut Vec<CursorPagePos>,
+        stack: &mut CursorStack,
     ) -> Result<LowerBoundResult> {
         let usable = self.pager.usable_size();
         let mut cur_pgno = root_pgno;
@@ -2050,7 +2587,7 @@ impl Btree {
                         pgno: cur_pgno,
                         cell_idx: n_cell - 1,
                     });
-                    let mut next_stack = stack.clone();
+                    let mut next_stack = *stack;
                     if self.advance_index_stack(&mut next_stack)? {
                         *stack = next_stack;
                         let top = *stack.last().expect("non-empty");

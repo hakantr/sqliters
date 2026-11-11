@@ -338,6 +338,18 @@ pub trait ExecutionServices {
     fn on_row_mutation(&mut self, _event: RowMutationEvent<'_>) -> Result<()> {
         Ok(())
     }
+
+    /// Returns a direct reference to the connection interrupt flag when no live progress handler
+    /// callback is installed, allowing tight VDBE loops to poll interrupts inline without vtable
+    /// dispatch on every instruction.
+    #[inline]
+    fn fast_interrupt_and_no_progress(&self) -> Option<&std::sync::atomic::AtomicBool> {
+        None
+    }
+
+    /// Batch-records `ticks` logical progress steps when no progress handler callback is installed.
+    #[inline]
+    fn add_ticks_without_handler(&mut self, _ticks: u64) {}
 }
 
 #[cfg(test)]

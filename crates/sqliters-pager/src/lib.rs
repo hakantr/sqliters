@@ -165,19 +165,336 @@ impl Default for PagerOpenOptions {
     }
 }
 
+const MAX_DENSE_PGNO: Pgno = 1_048_576;
+
+#[derive(Default, Clone, Copy)]
+struct MulXorHasher(u64);
+
+impl std::hash::Hasher for MulXorHasher {
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        let h = self.0;
+        h ^ (h >> 32)
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        for &b in bytes {
+            h = (h ^ u64::from(b)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+        self.0 = h;
+    }
+
+    #[inline(always)]
+    fn write_u32(&mut self, i: u32) {
+        self.0 = u64::from(i).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    #[inline(always)]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type MulXorBuildHasher = std::hash::BuildHasherDefault<MulXorHasher>;
+type FastPgnoMap<V> = HashMap<Pgno, V, MulXorBuildHasher>;
+
 #[derive(Debug, Clone)]
 struct SubsavepointSlot {
     orig_page_count: Pgno,
     orig_header: DatabaseHeader,
     /// Pre-images of pages (`<= orig_page_count`) modified or spilled since this subsavepoint opened.
-    saved_pages: HashMap<Pgno, Vec<u8>>,
+    saved_pages: FastPgnoMap<Vec<u8>>,
     /// 4-word WAL savepoint token (`[mx_frame, cksum0, cksum1, n_ckpt]`) when `use_wal` is active.
     wal_savepoint: Option<[u32; WAL_SAVEPOINT_NDATA]>,
 }
 
 struct CachedPage {
+    pgno: Pgno,
     data: Vec<u8>,
     dirty: bool,
+    in_dirty_list: bool,
+    occupied: bool,
+}
+
+const EMPTY_CACHE_SLOT: u32 = u32::MAX;
+
+struct PageCache {
+    dense_slots: Vec<u32>,
+    sparse_slots: FastPgnoMap<u32>,
+    entries: Vec<CachedPage>,
+    free_slots: Vec<u32>,
+    dirty_slots: Vec<u32>,
+    max_cached_pgno: Pgno,
+}
+
+impl PageCache {
+    fn new() -> Self {
+        Self {
+            dense_slots: Vec::new(),
+            sparse_slots: FastPgnoMap::default(),
+            entries: Vec::new(),
+            free_slots: Vec::new(),
+            dirty_slots: Vec::new(),
+            max_cached_pgno: 0,
+        }
+    }
+
+    fn with_capacity(cap: usize) -> Self {
+        let dense_cap = cap.saturating_add(1).min(MAX_DENSE_PGNO as usize + 1);
+        Self {
+            dense_slots: Vec::with_capacity(dense_cap),
+            sparse_slots: FastPgnoMap::default(),
+            entries: Vec::with_capacity(cap),
+            free_slots: Vec::new(),
+            dirty_slots: Vec::with_capacity(cap.min(256)),
+            max_cached_pgno: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn slot_of(&self, pgno: Pgno) -> Option<u32> {
+        if pgno <= MAX_DENSE_PGNO {
+            let s = *self.dense_slots.get(pgno as usize)?;
+            if s != EMPTY_CACHE_SLOT { Some(s) } else { None }
+        } else {
+            self.sparse_slots.get(&pgno).copied()
+        }
+    }
+
+    #[inline(always)]
+    fn entry_data(&self, slot: u32) -> &[u8] {
+        self.entries[slot as usize].data.as_slice()
+    }
+
+    #[inline(always)]
+    fn entry_data_mut(&mut self, slot: u32) -> &mut [u8] {
+        self.entries[slot as usize].data.as_mut_slice()
+    }
+
+    #[inline(always)]
+    fn is_dirty(&self, pgno: Pgno) -> bool {
+        self.slot_of(pgno)
+            .is_some_and(|slot| self.entries[slot as usize].dirty)
+    }
+
+    #[inline(always)]
+    fn get_data(&self, pgno: Pgno) -> Option<&[u8]> {
+        let slot = self.slot_of(pgno)?;
+        Some(self.entries[slot as usize].data.as_slice())
+    }
+
+    #[inline(always)]
+    fn get_data_mut(&mut self, pgno: Pgno) -> Option<&mut [u8]> {
+        let slot = self.slot_of(pgno)?;
+        Some(self.entries[slot as usize].data.as_mut_slice())
+    }
+
+    #[inline(always)]
+    fn mark_slot_dirty(&mut self, slot: u32) {
+        let entry = &mut self.entries[slot as usize];
+        entry.dirty = true;
+        if !entry.in_dirty_list {
+            entry.in_dirty_list = true;
+            self.dirty_slots.push(slot);
+        }
+    }
+
+    #[inline]
+    fn get_mut_and_mark_dirty(&mut self, pgno: Pgno) -> Option<&mut [u8]> {
+        let slot = self.slot_of(pgno)?;
+        self.mark_slot_dirty(slot);
+        Some(self.entries[slot as usize].data.as_mut_slice())
+    }
+
+    fn insert(&mut self, pgno: Pgno, data: Vec<u8>, dirty: bool) -> u32 {
+        if let Some(slot) = self.slot_of(pgno) {
+            let entry = &mut self.entries[slot as usize];
+            entry.data = data;
+            entry.dirty = dirty;
+            if dirty && !entry.in_dirty_list {
+                entry.in_dirty_list = true;
+                self.dirty_slots.push(slot);
+            }
+            return slot;
+        }
+
+        let slot = if let Some(slot) = self.free_slots.pop() {
+            let entry = &mut self.entries[slot as usize];
+            let already_listed = entry.in_dirty_list;
+            entry.pgno = pgno;
+            entry.data = data;
+            entry.dirty = dirty;
+            entry.occupied = true;
+            if dirty && !already_listed {
+                entry.in_dirty_list = true;
+                self.dirty_slots.push(slot);
+            }
+            slot
+        } else {
+            let slot = self.entries.len() as u32;
+            self.entries.push(CachedPage {
+                pgno,
+                data,
+                dirty,
+                in_dirty_list: dirty,
+                occupied: true,
+            });
+            if dirty {
+                self.dirty_slots.push(slot);
+            }
+            slot
+        };
+
+        if pgno <= MAX_DENSE_PGNO {
+            let idx = pgno as usize;
+            if idx >= self.dense_slots.len() {
+                self.dense_slots.resize(idx + 1, EMPTY_CACHE_SLOT);
+            }
+            self.dense_slots[idx] = slot;
+        } else {
+            self.sparse_slots.insert(pgno, slot);
+        }
+        if pgno > self.max_cached_pgno {
+            self.max_cached_pgno = pgno;
+        }
+        slot
+    }
+
+    fn remove(&mut self, pgno: Pgno) {
+        let removed = if pgno <= MAX_DENSE_PGNO {
+            self.dense_slots.get_mut(pgno as usize).and_then(|cell| {
+                let prev = std::mem::replace(cell, EMPTY_CACHE_SLOT);
+                (prev != EMPTY_CACHE_SLOT).then_some(prev)
+            })
+        } else {
+            self.sparse_slots.remove(&pgno)
+        };
+        if let Some(slot) = removed {
+            let entry = &mut self.entries[slot as usize];
+            entry.occupied = false;
+            entry.dirty = false;
+            entry.data = Vec::new();
+            self.free_slots.push(slot);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.dense_slots.clear();
+        self.sparse_slots.clear();
+        self.entries.clear();
+        self.free_slots.clear();
+        self.dirty_slots.clear();
+        self.max_cached_pgno = 0;
+    }
+
+    fn truncate_above(&mut self, max_pgno: Pgno) {
+        if self.max_cached_pgno <= max_pgno {
+            return;
+        }
+        let keep_len = (max_pgno.min(MAX_DENSE_PGNO) as usize) + 1;
+        if keep_len < self.dense_slots.len() {
+            for slot_cell in &mut self.dense_slots[keep_len..] {
+                let slot = std::mem::replace(slot_cell, EMPTY_CACHE_SLOT);
+                if slot != EMPTY_CACHE_SLOT {
+                    let entry = &mut self.entries[slot as usize];
+                    entry.occupied = false;
+                    entry.dirty = false;
+                    entry.data = Vec::new();
+                    self.free_slots.push(slot);
+                }
+            }
+            self.dense_slots.truncate(keep_len);
+        }
+        if !self.sparse_slots.is_empty() {
+            let entries = &mut self.entries;
+            let free_slots = &mut self.free_slots;
+            self.sparse_slots.retain(|&pgno, &mut slot| {
+                if pgno > max_pgno {
+                    let entry = &mut entries[slot as usize];
+                    entry.occupied = false;
+                    entry.dirty = false;
+                    entry.data = Vec::new();
+                    free_slots.push(slot);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        self.max_cached_pgno = max_pgno;
+    }
+
+    fn retain_dirty_only(&mut self) {
+        for (idx, entry) in self.entries.iter_mut().enumerate() {
+            if entry.occupied && !entry.dirty {
+                let pgno = entry.pgno;
+                if pgno <= MAX_DENSE_PGNO {
+                    if let Some(slot_cell) = self.dense_slots.get_mut(pgno as usize) {
+                        *slot_cell = EMPTY_CACHE_SLOT;
+                    }
+                } else {
+                    self.sparse_slots.remove(&pgno);
+                }
+                entry.occupied = false;
+                entry.data = Vec::new();
+                self.free_slots.push(idx as u32);
+            }
+        }
+    }
+
+    #[inline]
+    fn any_dirty(&self) -> bool {
+        self.dirty_slots.iter().any(|&slot| {
+            let e = &self.entries[slot as usize];
+            e.occupied && e.dirty
+        })
+    }
+
+    #[inline]
+    fn has_valid_dirty_pages(&self, page_count: Pgno, lock_byte_pgno: Pgno) -> bool {
+        self.dirty_slots.iter().any(|&slot| {
+            let e = &self.entries[slot as usize];
+            e.occupied && e.dirty && e.pgno <= page_count && e.pgno != lock_byte_pgno
+        })
+    }
+
+    #[inline]
+    fn count_valid_dirty_pages(&self, page_count: Pgno, lock_byte_pgno: Pgno) -> usize {
+        self.dirty_slots
+            .iter()
+            .filter(|&&slot| {
+                let e = &self.entries[slot as usize];
+                e.occupied && e.dirty && e.pgno <= page_count && e.pgno != lock_byte_pgno
+            })
+            .count()
+    }
+
+    fn collect_valid_dirty_pgnos_sorted(
+        &self,
+        page_count: Pgno,
+        lock_byte_pgno: Pgno,
+    ) -> Vec<Pgno> {
+        let mut pgnos = Vec::with_capacity(self.dirty_slots.len());
+        for &slot in &self.dirty_slots {
+            let e = &self.entries[slot as usize];
+            if e.occupied && e.dirty && e.pgno <= page_count && e.pgno != lock_byte_pgno {
+                pgnos.push(e.pgno);
+            }
+        }
+        pgnos.sort_unstable();
+        pgnos
+    }
+
+    #[inline]
+    fn clear_all_dirty(&mut self) {
+        for slot in self.dirty_slots.drain(..) {
+            let e = &mut self.entries[slot as usize];
+            e.dirty = false;
+            e.in_dirty_list = false;
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -255,7 +572,7 @@ pub struct Pager {
     pending_byte_copy: Option<PendingByteCopy>,
     staged_raw_copy: bool,
 
-    cache: HashMap<Pgno, CachedPage>,
+    cache: PageCache,
     state: TransactionState,
 
     /// Transaction-level undo state for atomic rollback
@@ -263,7 +580,7 @@ pub struct Pager {
     tx_orig_header: DatabaseHeader,
     tx_orig_auto_vacuum: AutoVacuumMode,
     tx_journaled: Bitvec,
-    tx_preimages: HashMap<Pgno, Vec<u8>>,
+    tx_preimages: FastPgnoMap<Vec<u8>>,
     journal_records_written: u32,
     journal_off: u64,
     journal_nonce: u32,
@@ -279,6 +596,8 @@ pub struct Pager {
     commit_phase_one_done: bool,
 
     subsavepoints: Vec<SubsavepointSlot>,
+    sp_slot_pool: Vec<SubsavepointSlot>,
+    sp_page_buf_pool: Vec<Vec<u8>>,
     backup_trackers: Vec<Arc<Mutex<BackupTracker>>>,
     backup_raw_staging: Option<BTreeMap<Pgno, Vec<u8>>>,
 }
@@ -483,13 +802,13 @@ impl Pager {
             next_page_size: None,
             pending_byte_copy: None,
             staged_raw_copy: false,
-            cache: HashMap::new(),
+            cache: PageCache::new(),
             state: TransactionState::Open,
             tx_orig_page_count: 0,
             tx_orig_header: DatabaseHeader::default(),
             tx_orig_auto_vacuum: AutoVacuumMode::None,
             tx_journaled: Bitvec::new(64),
-            tx_preimages: HashMap::new(),
+            tx_preimages: FastPgnoMap::default(),
             journal_records_written: 0,
             journal_off: 0,
             journal_nonce: 0,
@@ -501,6 +820,8 @@ impl Pager {
             set_super: false,
             commit_phase_one_done: false,
             subsavepoints: Vec::new(),
+            sp_slot_pool: Vec::new(),
+            sp_page_buf_pool: Vec::new(),
             backup_trackers: Vec::new(),
             backup_raw_staging: None,
         })
@@ -1025,18 +1346,21 @@ impl Pager {
 
     /// Spills dirty pages to `<db>-wal` when in an active WAL write transaction and the number of
     /// dirty cache pages exceeds [`Self::effective_max_cache_pages`].
+    #[inline]
     pub fn spill_if_over_cache_size(&mut self) -> Result<usize> {
         self.ensure_not_closed()?;
         if self.state != TransactionState::Write || !self.use_wal() {
             return Ok(0);
         }
+        let max_pages = self.effective_max_cache_pages();
+        if self.cache.dirty_slots.len() <= max_pages {
+            return Ok(0);
+        }
         let lock_byte_pg = self.lock_byte_page();
         let dirty_count = self
             .cache
-            .iter()
-            .filter(|&(&pgno, p)| p.dirty && pgno <= self.page_count && pgno != lock_byte_pg)
-            .count();
-        if dirty_count > self.effective_max_cache_pages() {
+            .count_valid_dirty_pages(self.page_count, lock_byte_pg);
+        if dirty_count > max_pages {
             self.spill_dirty_pages_to_wal()
         } else {
             Ok(0)
@@ -1047,7 +1371,7 @@ impl Pager {
     /// `pager.c:7536`): false if in a write transaction with dirty pages or `journal_off > 0`.
     pub fn ok_to_change_journal_mode(&self) -> bool {
         if self.state == TransactionState::Write
-            && (self.cache_modified || self.journal_off > 0 || self.cache.values().any(|p| p.dirty))
+            && (self.cache_modified || self.journal_off > 0 || self.cache.any_dirty())
         {
             return false;
         }
@@ -1257,9 +1581,8 @@ impl Pager {
                 self.header.write_version = 2;
                 self.header.read_version = 2;
                 let hdr_copy = self.header.clone();
-                if let Some(p1) = self.cache.get_mut(&1) {
-                    hdr_copy.write_into(&mut p1.data[0..DB_HEADER_SIZE]);
-                    p1.dirty = true;
+                if let Some(p1) = self.cache.get_mut_and_mark_dirty(1) {
+                    hdr_copy.write_into(&mut p1[0..DB_HEADER_SIZE]);
                 }
                 self.commit()
             })();
@@ -1307,9 +1630,8 @@ impl Pager {
                     self.header.write_version = 1;
                     self.header.read_version = 1;
                     let hdr_copy = self.header.clone();
-                    if let Some(p1) = self.cache.get_mut(&1) {
-                        hdr_copy.write_into(&mut p1.data[0..DB_HEADER_SIZE]);
-                        p1.dirty = true;
+                    if let Some(p1) = self.cache.get_mut_and_mark_dirty(1) {
+                        hdr_copy.write_into(&mut p1[0..DB_HEADER_SIZE]);
                     }
                     self.commit()?;
                 } else {
@@ -1513,35 +1835,26 @@ impl Pager {
         }
 
         let lock_byte_pgno = self.lock_byte_page();
-        if self.page_count > 0
-            && let Some(p1) = self.cache.get_mut(&1)
-            && p1.dirty
-        {
+        if self.page_count > 0 && self.cache.is_dirty(1) {
             self.header.write_version = 2;
             self.header.read_version = 2;
             self.header.database_size_pages = self.page_count;
-            self.header.write_into(&mut p1.data[0..DB_HEADER_SIZE]);
+            let hdr_copy = self.header.clone();
+            if let Some(p1) = self.cache.get_data_mut(1) {
+                hdr_copy.write_into(&mut p1[0..DB_HEADER_SIZE]);
+            }
         }
 
-        let mut dirty_pgnos: Vec<Pgno> = self
+        let dirty_pgnos = self
             .cache
-            .iter()
-            .filter_map(|(&pgno, p)| {
-                if p.dirty && pgno <= self.page_count && pgno != lock_byte_pgno {
-                    Some(pgno)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        dirty_pgnos.sort_unstable();
+            .collect_valid_dirty_pgnos_sorted(self.page_count, lock_byte_pgno);
         if dirty_pgnos.is_empty() {
             return Ok(0);
         }
 
         // Save pre-spill image into any open sub-savepoint slots (`subjournalPageIfRequired`)!
         for &pgno in &dirty_pgnos {
-            let cur_img = self.cache.get(&pgno).expect("dirty exists").data.clone();
+            let cur_img = self.cache.get_data(pgno).expect("dirty exists").to_vec();
             for sp in &mut self.subsavepoints {
                 if pgno <= sp.orig_page_count && !sp.saved_pages.contains_key(&pgno) {
                     sp.saved_pages.insert(pgno, cur_img.clone());
@@ -1555,7 +1868,7 @@ impl Pager {
         let mut spilled = 0usize;
 
         for pgno in dirty_pgnos {
-            let page_data = self.cache.get(&pgno).expect("dirty exists").data.clone();
+            let page_data = self.cache.get_data(pgno).expect("dirty exists").to_vec();
             let db_f = self
                 .file
                 .as_deref()
@@ -1572,7 +1885,7 @@ impl Pager {
                 w_sync,
                 c_sync,
             )?;
-            self.cache.remove(&pgno);
+            self.cache.remove(pgno);
             spilled += 1;
         }
 
@@ -1944,6 +2257,14 @@ impl Pager {
         }
 
         let wal_pages = self.wal.as_ref().unwrap().db_size();
+        if !changed
+            && self.header_loaded
+            && self.page_size_fixed
+            && wal_pages > 0
+            && self.page_count == wal_pages
+        {
+            return Ok(());
+        }
         let file_len = self.db_file()?.file_size()?;
         if wal_pages == 0 && file_len == 0 {
             if self.page_count != 0 {
@@ -2209,7 +2530,7 @@ impl Pager {
             if !self.use_wal() {
                 let _ = self.finalize_journal_after_tx(false);
             }
-            self.cache.remove(&1);
+            self.cache.remove(1);
             self.page_count = 0;
             self.header = self.tx_orig_header.clone();
             self.configured_auto_vacuum = self.tx_orig_auto_vacuum;
@@ -2361,18 +2682,38 @@ impl Pager {
         self.configured_auto_vacuum = effective_av;
         self.header_loaded = true;
         self.cache_modified = true;
-        self.cache.insert(
-            1,
-            CachedPage {
-                data: page1,
-                dirty: true,
-            },
-        );
+        self.cache.insert(1, page1, true);
         self.notify_backup_page_write(1);
         Ok(())
     }
 
+    #[inline]
+    fn ensure_page_cached(&mut self, pgno: Pgno) -> Result<u32> {
+        if let Some(slot) = self.cache.slot_of(pgno) {
+            return Ok(slot);
+        }
+        self.load_page_cold(pgno)
+    }
+
+    #[cold]
+    fn load_page_cold(&mut self, pgno: Pgno) -> Result<u32> {
+        let ps = self.header.page_size as usize;
+        let mut buf = vec![0u8; ps];
+        let wal_frame = match self.wal.as_ref() {
+            Some(wal) => wal.find_frame(pgno)?,
+            None => None,
+        };
+        if let Some(fno) = wal_frame {
+            self.wal.as_ref().unwrap().read_frame(fno, &mut buf)?;
+        } else {
+            let offset = u64::from(pgno - 1) * (ps as u64);
+            self.db_file()?.read_at(&mut buf, offset)?;
+        }
+        Ok(self.cache.insert(pgno, buf, false))
+    }
+
     /// Reads page `pgno` (1-based) into the page cache if needed and returns an immutable slice.
+    #[inline]
     pub fn read_page(&mut self, pgno: Pgno) -> Result<&[u8]> {
         self.ensure_not_closed()?;
         if pgno == 0 || pgno > self.page_count {
@@ -2386,37 +2727,12 @@ impl Pager {
                 "cannot read lock-byte page {pgno}"
             )));
         }
-        if !self.cache.contains_key(&pgno) {
-            let ps = self.header.page_size as usize;
-            let mut buf = vec![0u8; ps];
-            let wal_frame = match self.wal.as_ref() {
-                Some(wal) => wal.find_frame(pgno)?,
-                None => None,
-            };
-            if let Some(fno) = wal_frame {
-                self.wal.as_ref().unwrap().read_frame(fno, &mut buf)?;
-            } else {
-                let offset = u64::from(pgno - 1) * (ps as u64);
-                self.db_file()?.read_at(&mut buf, offset)?;
-            }
-            self.cache.insert(
-                pgno,
-                CachedPage {
-                    data: buf,
-                    dirty: false,
-                },
-            );
-        }
-        Ok(self
-            .cache
-            .get(&pgno)
-            .expect("just inserted")
-            .data
-            .as_slice())
+        let slot = self.ensure_page_cached(pgno)?;
+        Ok(self.cache.entry_data(slot))
     }
 
     /// Journals the pre-image of `pgno` (if not yet journaled in this tx/subsavepoints) and marks it dirty.
-    fn mark_page_writable(&mut self, pgno: Pgno) -> Result<()> {
+    fn mark_page_writable(&mut self, pgno: Pgno) -> Result<u32> {
         self.ensure_not_closed()?;
         if self.state != TransactionState::Write {
             return Err(SqliteError::misuse(
@@ -2435,7 +2751,7 @@ impl Pager {
         }
 
         // Ensure page is loaded into cache BEFORE opening journal so read errors leave state clean
-        let _ = self.read_page(pgno)?;
+        let slot = self.ensure_page_cached(pgno)?;
         self.ensure_journal_started()?;
 
         let need_tx_preimage = self.journal_mode != JournalMode::Off
@@ -2447,42 +2763,66 @@ impl Pager {
             .any(|sp| pgno <= sp.orig_page_count && !sp.saved_pages.contains_key(&pgno));
 
         if need_tx_preimage || need_sp_preimage {
-            let orig = self.cache.get(&pgno).expect("loaded").data.clone();
-
-            // Always record pre-images for active sub-savepoint slots (even in `JournalMode::Off`
-            // so `SAVEPOINT` / `ROLLBACK TO` works in cache per `savepoint-13.4`!).
-            for sp in &mut self.subsavepoints {
-                if pgno <= sp.orig_page_count && !sp.saved_pages.contains_key(&pgno) {
-                    sp.saved_pages.insert(pgno, orig.clone());
-                }
-            }
-
-            if need_tx_preimage {
+            let src = self.cache.entry_data(slot);
+            if need_tx_preimage && !need_sp_preimage {
+                let mut orig = self.sp_page_buf_pool.pop().unwrap_or_default();
+                orig.clear();
+                orig.extend_from_slice(src);
                 if !self.use_wal() && self.journal_file.is_some() {
                     self.append_journal_page(pgno, &orig)?;
                 }
                 self.tx_journaled.grow_to(self.tx_orig_page_count.max(pgno));
                 self.tx_journaled.set(pgno)?;
                 self.tx_preimages.insert(pgno, orig);
+            } else if !need_tx_preimage && self.subsavepoints.len() == 1 {
+                let sp = &mut self.subsavepoints[0];
+                if pgno <= sp.orig_page_count && !sp.saved_pages.contains_key(&pgno) {
+                    let mut orig = self.sp_page_buf_pool.pop().unwrap_or_default();
+                    orig.clear();
+                    orig.extend_from_slice(src);
+                    sp.saved_pages.insert(pgno, orig);
+                }
+            } else {
+                let mut orig = self.sp_page_buf_pool.pop().unwrap_or_default();
+                orig.clear();
+                orig.extend_from_slice(src);
+
+                // Always record pre-images for active sub-savepoint slots (even in `JournalMode::Off`
+                // so `SAVEPOINT` / `ROLLBACK TO` works in cache per `savepoint-13.4`!).
+                for sp in &mut self.subsavepoints {
+                    if pgno <= sp.orig_page_count && !sp.saved_pages.contains_key(&pgno) {
+                        let mut copy = self.sp_page_buf_pool.pop().unwrap_or_default();
+                        copy.clear();
+                        copy.extend_from_slice(&orig);
+                        sp.saved_pages.insert(pgno, copy);
+                    }
+                }
+
+                if need_tx_preimage {
+                    if !self.use_wal() && self.journal_file.is_some() {
+                        self.append_journal_page(pgno, &orig)?;
+                    }
+                    self.tx_journaled.grow_to(self.tx_orig_page_count.max(pgno));
+                    self.tx_journaled.set(pgno)?;
+                    self.tx_preimages.insert(pgno, orig);
+                } else if self.sp_page_buf_pool.len() < 64 {
+                    self.sp_page_buf_pool.push(orig);
+                }
             }
         }
 
-        self.cache.get_mut(&pgno).expect("loaded").dirty = true;
+        self.cache.mark_slot_dirty(slot);
         self.commit_phase_one_done = false;
         self.cache_modified = true;
         self.notify_backup_page_write(pgno);
-        Ok(())
+        Ok(slot)
     }
 
     /// Returns a mutable byte slice for page `pgno` (`1..=page_count`), journaling its pre-image first.
+    #[inline]
     pub fn write_page(&mut self, pgno: Pgno) -> Result<&mut [u8]> {
-        self.mark_page_writable(pgno)?;
-        Ok(self
-            .cache
-            .get_mut(&pgno)
-            .expect("loaded")
-            .data
-            .as_mut_slice())
+        let slot = self.mark_page_writable(pgno)?;
+        Ok(self.cache.entry_data_mut(slot))
     }
 
     /// Appends a brand-new zeroed page at the end of the database file, skipping the runtime
@@ -2521,13 +2861,7 @@ impl Pager {
         self.tx_journaled.grow_to(allocated_pgno);
         self.commit_phase_one_done = false;
         self.cache_modified = true;
-        self.cache.insert(
-            allocated_pgno,
-            CachedPage {
-                data: vec![0u8; ps],
-                dirty: true,
-            },
-        );
+        self.cache.insert(allocated_pgno, vec![0u8; ps], true);
         self.notify_backup_page_write(allocated_pgno);
         // Page 1 header will need `database_size_pages` updated on commit
         self.mark_page_writable(1)?;
@@ -2554,17 +2888,15 @@ impl Pager {
                     self.mark_page_writable(pgno)?;
                 }
             }
-            self.cache.retain(|&pgno, _| pgno <= new_count);
+            self.cache.truncate_above(new_count);
             self.page_count = new_count;
             self.header.database_size_pages = new_count;
             self.commit_phase_one_done = false;
             self.cache_modified = true;
             if new_count > 0 {
-                self.mark_page_writable(1)?;
+                let p1_slot = self.mark_page_writable(1)?;
                 let hdr_copy = self.header.clone();
-                if let Some(p1) = self.cache.get_mut(&1) {
-                    hdr_copy.write_into(&mut p1.data[0..DB_HEADER_SIZE]);
-                }
+                hdr_copy.write_into(&mut self.cache.entry_data_mut(p1_slot)[0..DB_HEADER_SIZE]);
             }
             self.notify_backup_restart();
         }
@@ -2695,16 +3027,10 @@ impl Pager {
                         continue;
                     }
                     let page_bytes = get_src_page(src, s_pgno)?;
-                    self.cache.insert(
-                        s_pgno,
-                        CachedPage {
-                            data: page_bytes,
-                            dirty: true,
-                        },
-                    );
+                    self.cache.insert(s_pgno, page_bytes, true);
                 }
-                self.cache
-                    .retain(|&pgno, _| pgno <= n_src_pages && pgno != dest_lock_pg);
+                self.cache.truncate_above(n_src_pages);
+                self.cache.remove(dest_lock_pg);
                 self.page_count = n_src_pages;
                 self.tx_journaled
                     .grow_to(self.tx_orig_page_count.max(n_src_pages));
@@ -2734,7 +3060,7 @@ impl Pager {
                 n_dest_pages = n_dest_pages.saturating_sub(1);
             }
 
-            let mut new_cache = HashMap::with_capacity(n_dest_pages as usize);
+            let mut new_cache = PageCache::with_capacity(n_dest_pages as usize);
             for d_pgno in 1..=n_dest_pages {
                 if d_pgno == dest_lock_pg {
                     continue;
@@ -2759,13 +3085,7 @@ impl Pager {
                         d_buf[dst_start..dst_start + pgsz_src as usize].copy_from_slice(&s_buf);
                     }
                 }
-                new_cache.insert(
-                    d_pgno,
-                    CachedPage {
-                        data: d_buf,
-                        dirty: true,
-                    },
-                );
+                new_cache.insert(d_pgno, d_buf, true);
             }
 
             let pb_off = self.lock_geometry.pending_byte_offset();
@@ -2862,13 +3182,7 @@ impl Pager {
             let ps = pgsz_dest as usize;
             for gap_pg in (self.page_count + 1)..s_pgno {
                 if gap_pg != dest_lock_pg {
-                    self.cache.insert(
-                        gap_pg,
-                        CachedPage {
-                            data: vec![0u8; ps],
-                            dirty: true,
-                        },
-                    );
+                    self.cache.insert(gap_pg, vec![0u8; ps], true);
                 }
             }
             self.page_count = s_pgno;
@@ -2877,13 +3191,7 @@ impl Pager {
                 .grow_to(self.tx_orig_page_count.max(s_pgno));
         }
 
-        self.cache.insert(
-            s_pgno,
-            CachedPage {
-                data: src_page_bytes.to_vec(),
-                dirty: true,
-            },
-        );
+        self.cache.insert(s_pgno, src_page_bytes.to_vec(), true);
         self.cache_modified = true;
         self.commit_phase_one_done = false;
         self.notify_backup_page_write(s_pgno);
@@ -2977,23 +3285,14 @@ impl Pager {
                 if self.page_count >= 1 {
                     self.mark_page_writable(1)?;
                 }
-                self.cache.insert(
-                    1,
-                    CachedPage {
-                        data: p1,
-                        dirty: true,
-                    },
-                );
+                self.cache.insert(1, p1, true);
             } else {
-                self.mark_page_writable(1)?;
-                if let Some(p1) = self.cache.get_mut(&1) {
-                    patched_hdr.write_into(&mut p1.data[0..DB_HEADER_SIZE]);
-                    p1.dirty = true;
-                }
+                let p1_slot = self.mark_page_writable(1)?;
+                patched_hdr.write_into(&mut self.cache.entry_data_mut(p1_slot)[0..DB_HEADER_SIZE]);
             }
             let dest_lock_pg = self.lock_byte_page();
-            self.cache
-                .retain(|&pgno, _| pgno <= n_src_pages && pgno != dest_lock_pg);
+            self.cache.truncate_above(n_src_pages);
+            self.cache.remove(dest_lock_pg);
             self.page_count = n_src_pages;
             self.tx_journaled
                 .grow_to(self.tx_orig_page_count.max(n_src_pages));
@@ -3054,7 +3353,7 @@ impl Pager {
             n_dest_pages = n_dest_pages.saturating_sub(1);
         }
 
-        let mut new_cache = HashMap::with_capacity(n_dest_pages as usize);
+        let mut new_cache = PageCache::with_capacity(n_dest_pages as usize);
         for d_pgno in 1..=n_dest_pages {
             if d_pgno == dest_lock_pg {
                 continue;
@@ -3079,13 +3378,7 @@ impl Pager {
                     d_buf[dst_start..dst_start + pgsz_src as usize].copy_from_slice(&s_buf);
                 }
             }
-            new_cache.insert(
-                d_pgno,
-                CachedPage {
-                    data: d_buf,
-                    dirty: true,
-                },
-            );
+            new_cache.insert(d_pgno, d_buf, true);
         }
 
         let pb_off = self.lock_geometry.pending_byte_offset();
@@ -3258,14 +3551,13 @@ impl Pager {
             let lock_byte_pgno = self.lock_byte_page();
             let has_dirty_pages = self
                 .cache
-                .iter()
-                .any(|(&pgno, p)| p.dirty && pgno <= self.page_count && pgno != lock_byte_pgno);
+                .has_valid_dirty_pages(self.page_count, lock_byte_pgno);
             let needs_db_flush = self.cache_modified
                 || has_dirty_pages
                 || self.page_count != self.tx_orig_page_count;
 
             if needs_db_flush && self.page_count > 0 {
-                let p1_already_dirty = self.cache.get(&1).is_some_and(|p| p.dirty);
+                let p1_already_dirty = self.cache.is_dirty(1);
                 // Match `pager.c:6565-6571` (Ticket `2d1a5c67dfc2`) & `pager.c:3272`:
                 // Only dirty Page 1 on WAL commit when Page 1 was already modified, all
                 // dirty pages were spilled earlier (`!has_dirty_pages`), the database page
@@ -3276,7 +3568,7 @@ impl Pager {
                     || self.header.write_version != 2
                     || self.header.read_version != 2;
                 if must_write_p1 {
-                    self.mark_page_writable(1)?;
+                    let p1_slot = self.mark_page_writable(1)?;
                     self.header.write_version = 2;
                     self.header.read_version = 2;
                     self.header.database_size_pages = self.page_count;
@@ -3291,23 +3583,12 @@ impl Pager {
                     }
 
                     let hdr_copy = self.header.clone();
-                    let p1 = self.cache.get_mut(&1).expect("page 1 in cache");
-                    hdr_copy.write_into(&mut p1.data[0..DB_HEADER_SIZE]);
-                    p1.dirty = true;
+                    hdr_copy.write_into(&mut self.cache.entry_data_mut(p1_slot)[0..DB_HEADER_SIZE]);
                 }
 
-                let mut dirty_pgnos: Vec<Pgno> = self
+                let dirty_pgnos = self
                     .cache
-                    .iter()
-                    .filter_map(|(&pgno, p)| {
-                        if p.dirty && pgno <= self.page_count && pgno != lock_byte_pgno {
-                            Some(pgno)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                dirty_pgnos.sort_unstable();
+                    .collect_valid_dirty_pgnos_sorted(self.page_count, lock_byte_pgno);
 
                 let ps = self.header.page_size;
                 let w_sync = self.wal_sync_flags();
@@ -3328,12 +3609,7 @@ impl Pager {
                         .iter()
                         .map(|&pgno| WalFrameInput {
                             pgno,
-                            data: self
-                                .cache
-                                .get(&pgno)
-                                .expect("dirty page exists")
-                                .data
-                                .as_slice(),
+                            data: self.cache.get_data(pgno).expect("dirty page exists"),
                         })
                         .collect();
                     wal.write_frames(
@@ -3347,12 +3623,8 @@ impl Pager {
                     )?;
                 }
 
-                self.cache.retain(|&pgno, _| pgno <= self.page_count);
-                for pgno in dirty_pgnos {
-                    if let Some(page) = self.cache.get_mut(&pgno) {
-                        page.dirty = false;
-                    }
-                }
+                self.cache.truncate_above(self.page_count);
+                self.cache.clear_all_dirty();
             } else if self.page_count == 0 {
                 self.wal
                     .as_mut()
@@ -3368,8 +3640,7 @@ impl Pager {
         let lock_byte_pgno = self.lock_byte_page();
         let has_dirty_pages = self
             .cache
-            .iter()
-            .any(|(&pgno, p)| p.dirty && pgno <= self.page_count && pgno != lock_byte_pgno);
+            .has_valid_dirty_pages(self.page_count, lock_byte_pgno);
         let needs_db_flush = self.cache_modified
             || has_dirty_pages
             || self.page_count != self.tx_orig_page_count
@@ -3381,7 +3652,7 @@ impl Pager {
             // Skip overwriting Page 1 header when `pending_byte_copy` is active so Page 1
             // retains its serialized `pgsz_src` header while `self.header` remains `pgsz_dest`.
             if self.page_count > 0 && self.pending_byte_copy.is_none() {
-                self.mark_page_writable(1)?;
+                let p1_slot = self.mark_page_writable(1)?;
                 self.header.database_size_pages = self.page_count;
                 if !self.change_counter_bumped {
                     self.header.change_counter = self.header.change_counter.wrapping_add(1);
@@ -3394,9 +3665,7 @@ impl Pager {
                 }
 
                 let hdr_copy = self.header.clone();
-                let p1 = self.cache.get_mut(&1).expect("page 1 in cache");
-                hdr_copy.write_into(&mut p1.data[0..DB_HEADER_SIZE]);
-                p1.dirty = true;
+                hdr_copy.write_into(&mut self.cache.entry_data_mut(p1_slot)[0..DB_HEADER_SIZE]);
             }
 
             // Step 1: Acquire EXCLUSIVE lock BEFORE modifying `.db` (`syncJournal` in `pager.c:4349`).
@@ -3417,23 +3686,14 @@ impl Pager {
             self.db_file_modified = true;
 
             let ps = u64::from(self.header.page_size);
-            let mut dirty_pgnos: Vec<Pgno> = self
+            let dirty_pgnos = self
                 .cache
-                .iter()
-                .filter_map(|(&pgno, p)| {
-                    if p.dirty && pgno <= self.page_count && pgno != lock_byte_pgno {
-                        Some(pgno)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            dirty_pgnos.sort_unstable();
+                .collect_valid_dirty_pgnos_sorted(self.page_count, lock_byte_pgno);
 
             for &pgno in &dirty_pgnos {
-                let page = self.cache.get(&pgno).expect("dirty page exists");
+                let page_data = self.cache.get_data(pgno).expect("dirty page exists");
                 let offset = u64::from(pgno - 1) * ps;
-                self.db_file()?.write_at(&page.data, offset)?;
+                self.db_file()?.write_at(page_data, offset)?;
             }
 
             let target_size = if let Some(ref pending) = self.pending_byte_copy {
@@ -3460,12 +3720,8 @@ impl Pager {
                 self.db_file()?.sync(SyncFlags::Normal)?;
             }
 
-            self.cache.retain(|&pgno, _| pgno <= self.page_count);
-            for pgno in dirty_pgnos {
-                if let Some(page) = self.cache.get_mut(&pgno) {
-                    page.dirty = false;
-                }
-            }
+            self.cache.truncate_above(self.page_count);
+            self.cache.clear_all_dirty();
             self.commit_phase_one_done = true;
             self.notify_backup_self_commit();
         } else if self.locking_mode == LockingMode::Exclusive {
@@ -3515,10 +3771,8 @@ impl Pager {
                             .end_write_transaction()?;
                     }
 
-                    self.cache.retain(|&pgno, _| pgno <= self.page_count);
-                    for page in self.cache.values_mut() {
-                        page.dirty = false;
-                    }
+                    self.cache.truncate_above(self.page_count);
+                    self.cache.clear_all_dirty();
                     self.set_super = false;
                     self.commit_phase_one_done = false;
                     self.db_file_modified = false;
@@ -3573,10 +3827,8 @@ impl Pager {
                     self.next_page_size = None;
                 }
                 if cleanup_benign {
-                    self.cache.retain(|&pgno, _| pgno <= self.page_count);
-                    for page in self.cache.values_mut() {
-                        page.dirty = false;
-                    }
+                    self.cache.truncate_above(self.page_count);
+                    self.cache.clear_all_dirty();
                 }
                 self.set_super = false;
                 self.staged_raw_copy = false;
@@ -3648,21 +3900,16 @@ impl Pager {
                         Ok(())
                     })?;
                     for pgno in reverted_pgnos {
-                        self.cache.remove(&pgno);
+                        self.cache.remove(pgno);
                     }
 
-                    self.cache.retain(|&pgno, _| pgno <= orig_count);
+                    self.cache.truncate_above(orig_count);
                     for (pgno, orig_data) in self.tx_preimages.drain() {
                         if pgno <= orig_count {
-                            self.cache.insert(
-                                pgno,
-                                CachedPage {
-                                    data: orig_data,
-                                    dirty: false,
-                                },
-                            );
+                            self.cache.insert(pgno, orig_data, false);
                         }
                     }
+                    self.cache.clear_all_dirty();
 
                     self.page_count = orig_count;
                     self.header = self.tx_orig_header.clone();
@@ -3733,20 +3980,15 @@ impl Pager {
                 }
 
                 // Remove any pages allocated during the aborted transaction
-                self.cache.retain(|&pgno, _| pgno <= orig_count);
+                self.cache.truncate_above(orig_count);
 
                 // Restore pre-images into cache
                 for (pgno, orig_data) in self.tx_preimages.drain() {
                     if pgno <= orig_count {
-                        self.cache.insert(
-                            pgno,
-                            CachedPage {
-                                data: orig_data,
-                                dirty: false,
-                            },
-                        );
+                        self.cache.insert(pgno, orig_data, false);
                     }
                 }
+                self.cache.clear_all_dirty();
 
                 self.page_count = orig_count;
                 self.header = self.tx_orig_header.clone();
@@ -3780,8 +4022,7 @@ impl Pager {
     }
 
     fn rollback_journal_mode_off(&mut self, retain_read: bool) -> Result<()> {
-        let was_modified =
-            self.cache_modified || self.db_file_modified || self.cache.values().any(|p| p.dirty);
+        let was_modified = self.cache_modified || self.db_file_modified || self.cache.any_dirty();
 
         if self.is_memdb_backing {
             // `pager.c:6850` / `2178`: in `MEMDB` with `journal_mode=OFF`, dirty flags are cleared
@@ -3789,23 +4030,27 @@ impl Pager {
             if was_modified && self.page_count > 0 {
                 self.header.database_size_pages = self.page_count;
                 let hdr_copy = self.header.clone();
-                if let Some(p1) = self.cache.get_mut(&1) {
-                    hdr_copy.write_into(&mut p1.data[0..DB_HEADER_SIZE]);
+                if let Some(p1) = self.cache.get_data_mut(1) {
+                    hdr_copy.write_into(&mut p1[0..DB_HEADER_SIZE]);
                 }
             }
             let ps = u64::from(self.header.page_size);
-            self.cache.retain(|&pgno, _| pgno <= self.page_count);
+            self.cache.truncate_above(self.page_count);
             if let Some(ref db_file) = self.file {
-                for (&pgno, page) in &mut self.cache {
-                    if page.dirty {
+                let lock_byte_pgno = self.lock_byte_page();
+                let dirty_pgnos = self
+                    .cache
+                    .collect_valid_dirty_pgnos_sorted(self.page_count, lock_byte_pgno);
+                for pgno in dirty_pgnos {
+                    if let Some(page_data) = self.cache.get_data(pgno) {
                         let offset = u64::from(pgno - 1) * ps;
-                        let _ = db_file.write_at(&page.data, offset);
-                        page.dirty = false;
+                        let _ = db_file.write_at(page_data, offset);
                     }
                 }
                 let target_size = u64::from(self.page_count) * ps;
                 let _ = db_file.truncate(target_size);
             }
+            self.cache.clear_all_dirty();
             self.page_size_fixed = self.page_count > 0;
             if self.page_count > 0 {
                 self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
@@ -3966,14 +4211,36 @@ impl Pager {
             return Ok(());
         }
         while self.subsavepoints.len() < target_depth {
-            self.subsavepoints.push(SubsavepointSlot {
-                orig_page_count: self.page_count,
-                orig_header: self.header.clone(),
-                saved_pages: HashMap::new(),
-                wal_savepoint: self.wal.as_ref().map(Wal::savepoint),
-            });
+            let wsp = self.wal.as_ref().map(Wal::savepoint);
+            let slot = if let Some(mut reused) = self.sp_slot_pool.pop() {
+                reused.orig_page_count = self.page_count;
+                reused.orig_header = self.header.clone();
+                reused.saved_pages.clear();
+                reused.wal_savepoint = wsp;
+                reused
+            } else {
+                SubsavepointSlot {
+                    orig_page_count: self.page_count,
+                    orig_header: self.header.clone(),
+                    saved_pages: FastPgnoMap::default(),
+                    wal_savepoint: wsp,
+                }
+            };
+            self.subsavepoints.push(slot);
         }
         Ok(())
+    }
+
+    #[inline]
+    fn recycle_subsavepoint_slot(&mut self, mut sp: SubsavepointSlot) {
+        for (_, buf) in sp.saved_pages.drain() {
+            if self.sp_page_buf_pool.len() < 64 {
+                self.sp_page_buf_pool.push(buf);
+            }
+        }
+        if self.sp_slot_pool.len() < 8 {
+            self.sp_slot_pool.push(sp);
+        }
     }
 
     /// Rolls back changes to sub-savepoint `index`, discarding slots above `index` and keeping
@@ -3987,6 +4254,7 @@ impl Pager {
         while self.subsavepoints.len() > index + 1 {
             let sp = self.subsavepoints.pop().expect("len checked");
             self.apply_subsavepoint_undo(&sp);
+            self.recycle_subsavepoint_slot(sp);
         }
         if self.use_wal()
             && let Some(mut wsp) = self.subsavepoints[index].wal_savepoint
@@ -3998,11 +4266,15 @@ impl Pager {
             self.subsavepoints[index].wal_savepoint = Some(wsp);
             // Evict any clean pages loaded from spilled WAL frames so restored savepoint pages
             // or committed WAL/DB pages are used instead.
-            self.cache.retain(|_, p| p.dirty);
+            self.cache.retain_dirty_only();
         }
         let target = self.subsavepoints[index].clone();
         self.apply_subsavepoint_undo(&target);
-        self.subsavepoints[index].saved_pages.clear();
+        for (_, buf) in self.subsavepoints[index].saved_pages.drain() {
+            if self.sp_page_buf_pool.len() < 64 {
+                self.sp_page_buf_pool.push(buf);
+            }
+        }
         self.notify_backup_restart();
         Ok(())
     }
@@ -4012,16 +4284,10 @@ impl Pager {
         self.pending_byte_copy = None;
         self.staged_raw_copy = false;
         self.backup_raw_staging = None;
-        self.cache.retain(|&pgno, _| pgno <= sp.orig_page_count);
+        self.cache.truncate_above(sp.orig_page_count);
         for (&pgno, orig_bytes) in &sp.saved_pages {
             if pgno <= sp.orig_page_count {
-                self.cache.insert(
-                    pgno,
-                    CachedPage {
-                        data: orig_bytes.clone(),
-                        dirty: true,
-                    },
-                );
+                self.cache.insert(pgno, orig_bytes.clone(), true);
             }
         }
         self.page_count = sp.orig_page_count;
@@ -4031,8 +4297,9 @@ impl Pager {
             self.configured_auto_vacuum = self.tx_orig_auto_vacuum;
         } else {
             self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
-            if let Some(p1) = self.cache.get_mut(&1) {
-                self.header.write_into(&mut p1.data[0..DB_HEADER_SIZE]);
+            let hdr_copy = self.header.clone();
+            if let Some(p1) = self.cache.get_data_mut(1) {
+                hdr_copy.write_into(&mut p1[0..DB_HEADER_SIZE]);
             }
         }
     }
@@ -4044,15 +4311,22 @@ impl Pager {
         if self.state != TransactionState::Write || index >= self.subsavepoints.len() {
             return Ok(());
         }
-        let drained: Vec<SubsavepointSlot> = self.subsavepoints.drain(index..).collect();
-        if index > 0 {
-            let parent = &mut self.subsavepoints[index - 1];
-            for sp in drained {
-                for (pgno, data) in sp.saved_pages {
-                    if pgno <= parent.orig_page_count {
-                        parent.saved_pages.entry(pgno).or_insert(data);
+        while self.subsavepoints.len() > index {
+            let mut sp = self.subsavepoints.pop().expect("len > index");
+            if index > 0 {
+                let parent = &mut self.subsavepoints[index - 1];
+                for (pgno, data) in sp.saved_pages.drain() {
+                    if pgno <= parent.orig_page_count && !parent.saved_pages.contains_key(&pgno) {
+                        parent.saved_pages.insert(pgno, data);
+                    } else if self.sp_page_buf_pool.len() < 64 {
+                        self.sp_page_buf_pool.push(data);
                     }
                 }
+                if self.sp_slot_pool.len() < 8 {
+                    self.sp_slot_pool.push(sp);
+                }
+            } else {
+                self.recycle_subsavepoint_slot(sp);
             }
         }
         Ok(())

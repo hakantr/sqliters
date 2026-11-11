@@ -9,11 +9,12 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
+pub use sqliters_btree::PointProjCol;
 use sqliters_btree::{Btree, CursorId};
 use sqliters_types::{
     AggregateStepId, Collation, DatabaseId, ErrorCode, ExecutionServices, KeySortOrder, Pgno,
     Result, RuntimeValue, SqliteError, TextEncoding, TypeAffinity, Value,
-    decode_record_with_encoding, encode_runtime_record_with_encoding, fallible_sort_by,
+    decode_record_with_encoding, encode_runtime_record_into, fallible_sort_by,
 };
 
 pub use functions::{
@@ -162,7 +163,7 @@ pub enum P4 {
     Blob(Vec<u8>),
     Collation(Collation),
     Affinity(Vec<TypeAffinity>),
-    KeyInfo(Vec<KeySortOrder>),
+    KeyInfo(Arc<[KeySortOrder]>),
     Func {
         name: String,
         argc: usize,
@@ -171,6 +172,10 @@ pub enum P4 {
 }
 
 impl P4 {
+    #[inline]
+    pub fn key_info(orders: impl Into<Arc<[KeySortOrder]>>) -> Self {
+        Self::KeyInfo(orders.into())
+    }
     pub fn display_explain(&self) -> String {
         match self {
             Self::None => String::new(),
@@ -392,6 +397,55 @@ impl Instruction {
     }
 }
 
+/// Key source for a single-shot `rowid` point `SELECT` fast path.
+#[derive(Debug, Clone, Copy)]
+pub enum RowidKeySource {
+    /// 1-based bind parameter (`?1`, `:id`, etc.).
+    Param1Based(u16),
+    /// Constant integer `rowid` literal.
+    ConstRowid(i64),
+}
+
+/// Precompiled direct B+Tree point-lookup plan for `SELECT <cols> FROM <tbl> WHERE <rowid/ipk> = ?`.
+#[derive(Debug, Clone)]
+pub struct RowidPointSelectPlan {
+    pub db: DatabaseId,
+    pub root_pgno: Pgno,
+    pub key: RowidKeySource,
+    pub cols: Vec<PointProjCol>,
+}
+
+/// Value source for a single-row direct `INSERT` plan.
+#[derive(Debug, Clone)]
+pub enum InsertValSource {
+    /// SQL `NULL` (or physical `INTEGER PRIMARY KEY` record slot).
+    Null,
+    /// Constant literal value.
+    Const(Value),
+    /// 1-based bind parameter (`?1`, `:x`, etc.).
+    Param1Based(u32),
+}
+
+/// Column specification in a [`SingleRowInsertPlan`].
+#[derive(Debug, Clone)]
+pub struct SingleRowInsertCol {
+    pub src: InsertValSource,
+    pub affinity: TypeAffinity,
+    pub notnull_msg: Option<String>,
+}
+
+/// Precompiled direct single-row table `INSERT` plan (when no secondary indexes, triggers, FKs,
+/// or SQL functions apply), bypassing VDBE register copying and per-opcode dispatch.
+#[derive(Debug, Clone)]
+pub struct SingleRowInsertPlan {
+    pub db: DatabaseId,
+    pub root_pgno: Pgno,
+    pub rowid_src: Option<InsertValSource>,
+    pub cols: Vec<SingleRowInsertCol>,
+    pub dup_ext_code: i32,
+    pub dup_msg: String,
+}
+
 /// Compiled VDBE bytecode program (`Vdbe` in `vdbeInt.h`).
 #[derive(Debug, Clone)]
 pub struct VdbeProgram {
@@ -400,6 +454,12 @@ pub struct VdbeProgram {
     pub num_cursors: usize,
     pub column_names: Vec<String>,
     pub read_only: bool,
+    referenced_db_mask: u16,
+    primary_write_db: Option<DatabaseId>,
+    has_function_call: bool,
+    needs_stmt_subsavepoint: bool,
+    rowid_point_select: Option<RowidPointSelectPlan>,
+    single_row_insert: Option<SingleRowInsertPlan>,
 }
 
 impl VdbeProgram {
@@ -410,7 +470,43 @@ impl VdbeProgram {
             num_cursors: 0,
             column_names: Vec::new(),
             read_only: true,
+            referenced_db_mask: 0,
+            primary_write_db: None,
+            has_function_call: false,
+            needs_stmt_subsavepoint: true,
+            rowid_point_select: None,
+            single_row_insert: None,
         }
+    }
+
+    #[inline(always)]
+    pub fn single_row_insert(&self) -> Option<&SingleRowInsertPlan> {
+        self.single_row_insert.as_ref()
+    }
+
+    #[inline]
+    pub fn set_single_row_insert(&mut self, plan: Option<SingleRowInsertPlan>) {
+        self.single_row_insert = plan;
+    }
+
+    #[inline(always)]
+    pub fn needs_stmt_subsavepoint(&self) -> bool {
+        self.needs_stmt_subsavepoint
+    }
+
+    #[inline]
+    pub fn set_needs_stmt_subsavepoint(&mut self, needed: bool) {
+        self.needs_stmt_subsavepoint = needed;
+    }
+
+    #[inline(always)]
+    pub fn rowid_point_select(&self) -> Option<&RowidPointSelectPlan> {
+        self.rowid_point_select.as_ref()
+    }
+
+    #[inline]
+    pub fn set_rowid_point_select(&mut self, plan: Option<RowidPointSelectPlan>) {
+        self.rowid_point_select = plan;
     }
 
     pub fn alloc_register(&mut self) -> i32 {
@@ -432,9 +528,50 @@ impl VdbeProgram {
     }
 
     pub fn emit(&mut self, op: Instruction) -> usize {
+        match op.opcode {
+            Opcode::Transaction => {
+                let db = if op.db != DatabaseId::MAIN {
+                    op.db
+                } else {
+                    DatabaseId(op.p1.max(0) as usize)
+                };
+                self.referenced_db_mask |= 1u16.checked_shl(db.index() as u32).unwrap_or(0);
+                if op.p2 != 0 && self.primary_write_db.is_none() {
+                    self.primary_write_db = Some(db);
+                }
+            }
+            Opcode::OpenRead | Opcode::OpenReadIndex => {
+                self.referenced_db_mask |= 1u16.checked_shl(op.db.index() as u32).unwrap_or(0);
+            }
+            Opcode::OpenWrite | Opcode::OpenWriteIndex => {
+                self.referenced_db_mask |= 1u16.checked_shl(op.db.index() as u32).unwrap_or(0);
+                if self.primary_write_db.is_none() {
+                    self.primary_write_db = Some(op.db);
+                }
+            }
+            Opcode::Function => {
+                self.has_function_call = true;
+            }
+            _ => {}
+        }
         let addr = self.ops.len();
         self.ops.push(op);
         addr
+    }
+
+    #[inline(always)]
+    pub fn referenced_db_mask(&self) -> u16 {
+        self.referenced_db_mask
+    }
+
+    #[inline(always)]
+    pub fn primary_write_db(&self) -> DatabaseId {
+        self.primary_write_db.unwrap_or(DatabaseId::MAIN)
+    }
+
+    #[inline(always)]
+    pub fn has_function_call(&self) -> bool {
+        self.has_function_call
     }
 
     pub fn patch_p2(&mut self, addr: usize, target: usize) {
@@ -512,15 +649,15 @@ enum CursorState {
     Closed,
     Table {
         db: DatabaseId,
-        cursor_id: CursorId,
+        cursor_id: Option<CursorId>,
         root_pgno: Pgno,
         writable: bool,
     },
     Index {
         db: DatabaseId,
-        cursor_id: CursorId,
+        cursor_id: Option<CursorId>,
         root_pgno: Pgno,
-        orders: Vec<KeySortOrder>,
+        orders: Arc<[KeySortOrder]>,
         writable: bool,
         eq_prefix: Option<Vec<Value>>,
     },
@@ -535,12 +672,194 @@ enum CursorState {
     },
 }
 
+#[derive(Debug, Default)]
+struct VdbePool {
+    blobs: Vec<Vec<u8>>,
+    texts: Vec<String>,
+    scratch_rec: Vec<u8>,
+}
+
+impl VdbePool {
+    #[inline]
+    fn recycle_value(&mut self, val: Value) {
+        match val {
+            Value::Blob(mut b)
+                if b.capacity() > 0 && b.capacity() <= 4096 && self.blobs.len() < 16 =>
+            {
+                b.clear();
+                self.blobs.push(b);
+            }
+            Value::Text(mut s)
+                if s.capacity() > 0 && s.capacity() <= 4096 && self.texts.len() < 32 =>
+            {
+                s.clear();
+                self.texts.push(s);
+            }
+            _ => {}
+        }
+    }
+
+    #[inline]
+    fn clear_registers(&mut self, regs: &mut [RuntimeValue]) {
+        for slot in regs {
+            let old = std::mem::replace(slot, RuntimeValue::null());
+            self.recycle_value(old.value);
+        }
+    }
+
+    #[inline]
+    fn assign_cloned_value(&mut self, dst: &mut RuntimeValue, src: &Value, subtype: u8) {
+        match src {
+            Value::Null => {
+                let old = std::mem::replace(
+                    dst,
+                    RuntimeValue {
+                        value: Value::Null,
+                        subtype,
+                    },
+                );
+                self.recycle_value(old.value);
+            }
+            Value::Integer(i) => {
+                let old = std::mem::replace(
+                    dst,
+                    RuntimeValue {
+                        value: Value::Integer(*i),
+                        subtype,
+                    },
+                );
+                self.recycle_value(old.value);
+            }
+            Value::Real(r) => {
+                let old = std::mem::replace(
+                    dst,
+                    RuntimeValue {
+                        value: Value::Real(*r),
+                        subtype,
+                    },
+                );
+                self.recycle_value(old.value);
+            }
+            Value::Text(s) => {
+                if let Value::Text(existing) = &mut dst.value {
+                    existing.clear();
+                    existing.push_str(s);
+                    dst.subtype = subtype;
+                } else {
+                    let mut buf = self.texts.pop().unwrap_or_default();
+                    buf.clear();
+                    buf.push_str(s);
+                    let old = std::mem::replace(
+                        dst,
+                        RuntimeValue {
+                            value: Value::Text(buf),
+                            subtype,
+                        },
+                    );
+                    self.recycle_value(old.value);
+                }
+            }
+            Value::Blob(b) => {
+                if let Value::Blob(existing) = &mut dst.value {
+                    existing.clear();
+                    existing.extend_from_slice(b);
+                    dst.subtype = subtype;
+                } else {
+                    let mut buf = self.blobs.pop().unwrap_or_default();
+                    buf.clear();
+                    buf.extend_from_slice(b);
+                    let old = std::mem::replace(
+                        dst,
+                        RuntimeValue {
+                            value: Value::Blob(buf),
+                            subtype,
+                        },
+                    );
+                    self.recycle_value(old.value);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn copy_params_into(&mut self, dst: &mut Vec<Value>, src: &[Value]) {
+        while dst.len() > src.len() {
+            if let Some(old) = dst.pop() {
+                self.recycle_value(old);
+            }
+        }
+        for (i, v) in src.iter().enumerate() {
+            if i < dst.len() {
+                match (&mut dst[i], v) {
+                    (Value::Text(existing), Value::Text(s)) => {
+                        existing.clear();
+                        existing.push_str(s);
+                    }
+                    (Value::Blob(existing), Value::Blob(b)) => {
+                        existing.clear();
+                        existing.extend_from_slice(b);
+                    }
+                    (slot, other) => {
+                        let next_val = match other {
+                            Value::Text(s) => {
+                                let mut buf = self.texts.pop().unwrap_or_default();
+                                buf.clear();
+                                buf.push_str(s);
+                                Value::Text(buf)
+                            }
+                            Value::Blob(b) => {
+                                let mut buf = self.blobs.pop().unwrap_or_default();
+                                buf.clear();
+                                buf.extend_from_slice(b);
+                                Value::Blob(buf)
+                            }
+                            Value::Null => Value::Null,
+                            Value::Integer(n) => Value::Integer(*n),
+                            Value::Real(r) => Value::Real(*r),
+                        };
+                        let old = std::mem::replace(slot, next_val);
+                        self.recycle_value(old);
+                    }
+                }
+            } else {
+                let next_val = match v {
+                    Value::Text(s) => {
+                        let mut buf = self.texts.pop().unwrap_or_default();
+                        buf.clear();
+                        buf.push_str(s);
+                        Value::Text(buf)
+                    }
+                    Value::Blob(b) => {
+                        let mut buf = self.blobs.pop().unwrap_or_default();
+                        buf.clear();
+                        buf.extend_from_slice(b);
+                        Value::Blob(buf)
+                    }
+                    Value::Null => Value::Null,
+                    Value::Integer(n) => Value::Integer(*n),
+                    Value::Real(r) => Value::Real(*r),
+                };
+                dst.push(next_val);
+            }
+        }
+    }
+}
+
 /// Reusable register and cursor scratch buffers for zero-allocation execution of compiled
 /// write [`VdbeProgram`]s across repeated prepared statement executions.
 #[derive(Debug, Default)]
 pub struct VdbeWriteScratch {
     regs: Vec<RuntimeValue>,
     cursors: Vec<CursorState>,
+    pool: VdbePool,
+}
+
+impl VdbeWriteScratch {
+    /// Reusable byte buffer for encoding records without per-statement allocation.
+    #[inline(always)]
+    pub fn scratch_rec_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.pool.scratch_rec
+    }
 }
 
 #[inline]
@@ -552,14 +871,23 @@ fn ensure_cursor_slot_vec(cursors: &mut Vec<CursorState>, cid: usize) {
 
 #[inline]
 fn close_cursor_slot_vec(cursors: &mut [CursorState], cid: usize, storage: &mut dyn BtreeAccess) {
-    if cid < cursors.len() {
+    if cid < cursors.len() && !matches!(cursors[cid], CursorState::Closed) {
         match std::mem::replace(&mut cursors[cid], CursorState::Closed) {
-            CursorState::Table { db, cursor_id, .. } | CursorState::Index { db, cursor_id, .. } => {
+            CursorState::Table {
+                db,
+                cursor_id: Some(cursor_id),
+                ..
+            }
+            | CursorState::Index {
+                db,
+                cursor_id: Some(cursor_id),
+                ..
+            } => {
                 if let Ok(btree) = storage.btree_mut(db) {
                     btree.close_cursor(cursor_id);
                 }
             }
-            CursorState::Closed | CursorState::Ephemeral { .. } | CursorState::Sorter { .. } => {}
+            _ => {}
         }
     }
 }
@@ -573,17 +901,39 @@ fn close_cursors_vec(cursors: &mut [CursorState], storage: &mut dyn BtreeAccess)
 
 /// Stateful VDBE virtual machine executing a [`VdbeProgram`] step-by-step (`sqlite3_step`).
 pub struct VdbeVm {
-    program: VdbeProgram,
+    program: Arc<VdbeProgram>,
     pc: usize,
     halted: bool,
     regs: Vec<RuntimeValue>,
     cursors: Vec<CursorState>,
     params: Vec<Value>,
+    pool: VdbePool,
     pub runtime_ctx: VmRuntimeContext,
 }
 
 impl VdbeVm {
     pub fn new(program: VdbeProgram, params: Vec<Value>, runtime_ctx: VmRuntimeContext) -> Self {
+        Self::from_shared_owned_params(Arc::new(program), params, runtime_ctx)
+    }
+
+    pub fn from_shared(
+        program: Arc<VdbeProgram>,
+        params: &[Value],
+        runtime_ctx: VmRuntimeContext,
+    ) -> Self {
+        let mut pool = VdbePool::default();
+        let mut owned_params = Vec::with_capacity(params.len());
+        pool.copy_params_into(&mut owned_params, params);
+        let mut vm = Self::from_shared_owned_params(program, owned_params, runtime_ctx);
+        vm.pool = pool;
+        vm
+    }
+
+    fn from_shared_owned_params(
+        program: Arc<VdbeProgram>,
+        params: Vec<Value>,
+        runtime_ctx: VmRuntimeContext,
+    ) -> Self {
         let n_regs = program.num_registers.max(1) + 4;
         let n_curs = program.num_cursors + 2;
         let mut cursors = Vec::with_capacity(n_curs);
@@ -597,8 +947,41 @@ impl VdbeVm {
             regs: vec![RuntimeValue::null(); n_regs],
             cursors,
             params,
+            pool: VdbePool::default(),
             runtime_ctx,
         }
+    }
+
+    /// Reinitializes an existing [`VdbeVm`] for a new execution of `program` without reallocating
+    /// registers, cursors, or parameter buffers.
+    pub fn prepare_for_reuse(
+        &mut self,
+        program: &Arc<VdbeProgram>,
+        params: &[Value],
+        runtime_ctx: VmRuntimeContext,
+    ) {
+        if !Arc::ptr_eq(&self.program, program) {
+            self.program = Arc::clone(program);
+        }
+        let n_regs = self.program.num_registers.max(1) + 4;
+        let clear_len = self.regs.len().min(n_regs);
+        self.pool.clear_registers(&mut self.regs[..clear_len]);
+        if self.regs.len() < n_regs {
+            self.regs.resize(n_regs, RuntimeValue::null());
+        } else if self.regs.len() > n_regs {
+            self.pool.clear_registers(&mut self.regs[n_regs..]);
+        }
+        let n_curs = self.program.num_cursors + 2;
+        for c in &mut self.cursors {
+            *c = CursorState::Closed;
+        }
+        if self.cursors.len() < n_curs {
+            self.cursors.resize_with(n_curs, || CursorState::Closed);
+        }
+        self.pool.copy_params_into(&mut self.params, params);
+        self.pc = 0;
+        self.halted = false;
+        self.runtime_ctx = runtime_ctx;
     }
 
     /// Executes a non-returning write [`VdbeProgram`] to completion using reusable `scratch`
@@ -627,13 +1010,14 @@ impl VdbeVm {
             &mut halted,
             &mut scratch.regs,
             &mut scratch.cursors,
+            &mut scratch.pool,
             params,
             runtime_ctx,
             storage,
             services,
         );
         close_cursors_vec(&mut scratch.cursors, storage);
-        scratch.regs[..n_regs].fill(RuntimeValue::null());
+        scratch.pool.clear_registers(&mut scratch.regs[..n_regs]);
         match res {
             Ok(VmStep::Done) => Ok(()),
             Ok(VmStep::Row(_)) => Err(SqliteError::misuse(
@@ -657,7 +1041,7 @@ impl VdbeVm {
     pub fn reset(&mut self) {
         self.pc = 0;
         self.halted = false;
-        self.regs.fill(RuntimeValue::null());
+        self.pool.clear_registers(&mut self.regs);
         for c in &mut self.cursors {
             *c = CursorState::Closed;
         }
@@ -687,6 +1071,7 @@ impl VdbeVm {
             &mut self.halted,
             &mut self.regs,
             &mut self.cursors,
+            &mut self.pool,
             &self.params,
             &mut self.runtime_ctx,
             storage,
@@ -714,14 +1099,59 @@ fn step_ops(
     halted: &mut bool,
     regs: &mut [RuntimeValue],
     cursors: &mut Vec<CursorState>,
+    pool: &mut VdbePool,
     params: &[Value],
     runtime_ctx: &mut VmRuntimeContext,
     storage: &mut dyn BtreeAccess,
     services: &mut dyn ExecutionServices,
 ) -> Result<VmStep> {
+    let mut local_ticks = 0u64;
+    let res = step_ops_loop(
+        ops,
+        pc,
+        halted,
+        regs,
+        cursors,
+        pool,
+        params,
+        runtime_ctx,
+        storage,
+        services,
+        &mut local_ticks,
+    );
+    if local_ticks != 0 {
+        services.add_ticks_without_handler(local_ticks);
+    }
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
+fn step_ops_loop(
+    ops: &[Instruction],
+    pc: &mut usize,
+    halted: &mut bool,
+    regs: &mut [RuntimeValue],
+    cursors: &mut Vec<CursorState>,
+    pool: &mut VdbePool,
+    params: &[Value],
+    runtime_ctx: &mut VmRuntimeContext,
+    storage: &mut dyn BtreeAccess,
+    services: &mut dyn ExecutionServices,
+    local_ticks: &mut u64,
+) -> Result<VmStep> {
+    let empty_orders: Arc<[KeySortOrder]> = Arc::from([]);
+    let mut fast_poll = services.fast_interrupt_and_no_progress();
     while *pc < ops.len() {
-        services.check_interrupted()?;
-        services.tick_progress()?;
+        if let Some(flag) = fast_poll {
+            if flag.load(AtomicOrdering::Relaxed) {
+                return Err(SqliteError::new(ErrorCode::Interrupt, "interrupted"));
+            }
+            *local_ticks += 1;
+        } else {
+            services.check_interrupted()?;
+            services.tick_progress()?;
+            fast_poll = None;
+        }
         let ins = &ops[*pc];
         let mut next_pc = *pc + 1;
 
@@ -770,8 +1200,13 @@ fn step_ops(
                 let db = ins.db;
                 ensure_cursor_slot_vec(cursors, cid);
                 close_cursor_slot_vec(cursors, cid, storage);
-                let btree = storage.btree_mut(db)?;
-                let cursor_id = btree.open_table_cursor(root_pgno, writable);
+                let cursor_id = if writable {
+                    let _ = storage.btree_mut(db)?;
+                    None
+                } else {
+                    let btree = storage.btree_mut(db)?;
+                    Some(btree.open_table_cursor(root_pgno, false))
+                };
                 cursors[cid] = CursorState::Table {
                     db,
                     cursor_id,
@@ -784,19 +1219,27 @@ fn step_ops(
                 let root_pgno = ins.p2 as Pgno;
                 let writable = ins.opcode == Opcode::OpenWriteIndex;
                 let db = ins.db;
-                let orders = match &ins.p4 {
-                    P4::KeyInfo(k) => k.clone(),
-                    _ => Vec::new(),
+                let orders: Arc<[KeySortOrder]> = match &ins.p4 {
+                    P4::KeyInfo(k) => Arc::clone(k),
+                    _ => Arc::clone(&empty_orders),
                 };
                 ensure_cursor_slot_vec(cursors, cid);
                 close_cursor_slot_vec(cursors, cid, storage);
-                let btree = storage.btree_mut(db)?;
-                let cursor_id = btree.open_index_cursor(root_pgno, orders.clone(), writable);
+                let (cursor_id, orders_for_state) = if writable {
+                    let _ = storage.btree_mut(db)?;
+                    (None, orders)
+                } else {
+                    let btree = storage.btree_mut(db)?;
+                    (
+                        Some(btree.open_index_cursor(root_pgno, orders.to_vec(), false)),
+                        Arc::clone(&empty_orders),
+                    )
+                };
                 cursors[cid] = CursorState::Index {
                     db,
                     cursor_id,
                     root_pgno,
-                    orders,
+                    orders: orders_for_state,
                     writable,
                     eq_prefix: None,
                 };
@@ -818,9 +1261,16 @@ fn step_ops(
                 let cid = ins.p1 as usize;
                 let jump_empty = ins.p2 as usize;
                 match &mut cursors[cid] {
-                    CursorState::Table { db, cursor_id, .. } => {
-                        let (db, id) = (*db, *cursor_id);
+                    CursorState::Table {
+                        db,
+                        cursor_id,
+                        root_pgno,
+                        writable,
+                    } => {
+                        let (db, root, wr) = (*db, *root_pgno, *writable);
                         let btree = storage.btree_mut(db)?;
+                        let id =
+                            *cursor_id.get_or_insert_with(|| btree.open_table_cursor(root, wr));
                         if !btree.cursor_first(id)? {
                             next_pc = jump_empty;
                         }
@@ -828,12 +1278,17 @@ fn step_ops(
                     CursorState::Index {
                         db,
                         cursor_id,
+                        root_pgno,
+                        orders,
+                        writable,
                         eq_prefix,
-                        ..
                     } => {
-                        let (db, id) = (*db, *cursor_id);
+                        let (db, root, wr) = (*db, *root_pgno, *writable);
                         *eq_prefix = None;
                         let btree = storage.btree_mut(db)?;
+                        let id = *cursor_id.get_or_insert_with(|| {
+                            btree.open_index_cursor(root, orders.to_vec(), wr)
+                        });
                         if !btree.cursor_first(id)? {
                             next_pc = jump_empty;
                         }
@@ -851,9 +1306,17 @@ fn step_ops(
                 let cid = ins.p1 as usize;
                 let loop_target = ins.p2 as usize;
                 match &mut cursors[cid] {
-                    CursorState::Table { db, cursor_id, .. }
-                    | CursorState::Index { db, cursor_id, .. } => {
-                        let (db, id) = (*db, *cursor_id);
+                    CursorState::Table {
+                        db,
+                        cursor_id: Some(id),
+                        ..
+                    }
+                    | CursorState::Index {
+                        db,
+                        cursor_id: Some(id),
+                        ..
+                    } => {
+                        let (db, id) = (*db, *id);
                         let btree = storage.btree_mut(db)?;
                         if btree.cursor_next(id)? {
                             next_pc = loop_target;
@@ -877,8 +1340,19 @@ fn step_ops(
                     *pc = jump_miss;
                     continue;
                 };
-                let (db, cursor_id) = match &cursors[cid] {
-                    CursorState::Table { db, cursor_id, .. } => (*db, *cursor_id),
+                let (db, cursor_id) = match &mut cursors[cid] {
+                    CursorState::Table {
+                        db,
+                        cursor_id,
+                        root_pgno,
+                        writable,
+                    } => {
+                        let (db, root, wr) = (*db, *root_pgno, *writable);
+                        let btree = storage.btree_mut(db)?;
+                        let id =
+                            *cursor_id.get_or_insert_with(|| btree.open_table_cursor(root, wr));
+                        (db, id)
+                    }
                     _ => return Err(SqliteError::misuse("SeekRowid on non-table cursor")),
                 };
                 let btree = storage.btree_mut(db)?;
@@ -892,41 +1366,58 @@ fn step_ops(
                 let jump_miss = ins.p2 as usize;
                 let start_reg = ins.p3 as usize;
                 let n_keys = ins.p5 as usize;
-                let prefix: Vec<Value> = regs[start_reg..start_reg + n_keys]
-                    .iter()
-                    .map(|rv| rv.value.clone())
-                    .collect();
-                let (db, cursor_id) = match &mut cursors[cid] {
-                    CursorState::Index {
-                        db,
-                        cursor_id,
-                        eq_prefix,
-                        ..
-                    } => {
-                        *eq_prefix = Some(prefix.clone());
-                        (*db, *cursor_id)
-                    }
-                    _ => return Err(SqliteError::misuse("SeekGE on non-index cursor")),
-                };
+                let (db, cursor_id, prefix_ref): (DatabaseId, CursorId, &[Value]) =
+                    match &mut cursors[cid] {
+                        CursorState::Index {
+                            db,
+                            cursor_id,
+                            root_pgno,
+                            orders,
+                            writable,
+                            eq_prefix,
+                        } => {
+                            let (db, root, wr) = (*db, *root_pgno, *writable);
+                            let id = match *cursor_id {
+                                Some(existing) => existing,
+                                None => {
+                                    let opened = storage.btree_mut(db)?.open_index_cursor(
+                                        root,
+                                        orders.to_vec(),
+                                        wr,
+                                    );
+                                    *cursor_id = Some(opened);
+                                    opened
+                                }
+                            };
+                            let buf = eq_prefix.get_or_insert_with(|| Vec::with_capacity(n_keys));
+                            buf.clear();
+                            for rv in &regs[start_reg..start_reg + n_keys] {
+                                buf.push(rv.value.clone());
+                            }
+                            (db, id, buf.as_slice())
+                        }
+                        _ => return Err(SqliteError::misuse("SeekGE on non-index cursor")),
+                    };
                 let btree = storage.btree_mut(db)?;
-                if !btree.cursor_seek_index_equal_first(cursor_id, &prefix)? {
+                if !btree.cursor_seek_index_equal_first(cursor_id, prefix_ref)? {
                     next_pc = jump_miss;
                 }
             }
             Opcode::IndexMatchNext => {
                 let cid = ins.p1 as usize;
                 let loop_target = ins.p2 as usize;
-                let (db, cursor_id, prefix) = match &cursors[cid] {
-                    CursorState::Index {
-                        db,
-                        cursor_id,
-                        eq_prefix,
-                        ..
-                    } => (*db, *cursor_id, eq_prefix.clone().unwrap_or_default()),
-                    _ => return Err(SqliteError::misuse("IdxNext on non-index cursor")),
-                };
+                let (db, cursor_id, prefix_ref): (DatabaseId, CursorId, &[Value]) =
+                    match &cursors[cid] {
+                        CursorState::Index {
+                            db,
+                            cursor_id: Some(id),
+                            eq_prefix,
+                            ..
+                        } => (*db, *id, eq_prefix.as_deref().unwrap_or(&[])),
+                        _ => return Err(SqliteError::misuse("IdxNext on non-index cursor")),
+                    };
                 let btree = storage.btree_mut(db)?;
-                if btree.cursor_next_index_matching(cursor_id, &prefix)? {
+                if btree.cursor_next_index_matching(cursor_id, prefix_ref)? {
                     next_pc = loop_target;
                 }
             }
@@ -935,14 +1426,22 @@ fn step_ops(
                 let cid = ins.p1 as usize;
                 let dest = ins.p2 as usize;
                 match &cursors[cid] {
-                    CursorState::Table { db, cursor_id, .. } => {
-                        let (db, id) = (*db, *cursor_id);
+                    CursorState::Table {
+                        db,
+                        cursor_id: Some(id),
+                        ..
+                    } => {
+                        let (db, id) = (*db, *id);
                         let rid = storage.btree_mut(db)?.cursor_rowid(id)?;
                         regs[dest] = RuntimeValue::plain(Value::Integer(rid));
                     }
-                    CursorState::Index { db, cursor_id, .. } => {
+                    CursorState::Index {
+                        db,
+                        cursor_id: Some(id),
+                        ..
+                    } => {
                         // In SQLite secondary indexes, the table rowid is the LAST column of the index record!
-                        let (db, id) = (*db, *cursor_id);
+                        let (db, id) = (*db, *id);
                         let val = storage
                             .btree_mut(db)?
                             .cursor_last_column(id)?
@@ -958,12 +1457,22 @@ fn step_ops(
                 let col_idx = ins.p2 as usize;
                 let dest = ins.p3 as usize;
                 match &cursors[cid] {
-                    CursorState::Table { db, cursor_id, .. }
-                    | CursorState::Index { db, cursor_id, .. } => {
-                        let (db, id) = (*db, *cursor_id);
+                    CursorState::Table {
+                        db,
+                        cursor_id: Some(id),
+                        ..
+                    }
+                    | CursorState::Index {
+                        db,
+                        cursor_id: Some(id),
+                        ..
+                    } => {
+                        let (db, id) = (*db, *id);
+                        let prev = std::mem::replace(&mut regs[dest], RuntimeValue::null());
+                        pool.recycle_value(prev.value);
                         let val = storage
                             .btree_mut(db)?
-                            .cursor_column(id, col_idx)?
+                            .cursor_column_pooled(id, col_idx, &mut pool.texts, &mut pool.blobs)?
                             .unwrap_or_else(|| match &ins.p4 {
                                 P4::Int64(i) => Value::Integer(*i),
                                 P4::Real(r) => Value::real(*r),
@@ -974,9 +1483,8 @@ fn step_ops(
                         regs[dest] = RuntimeValue::plain(val);
                     }
                     CursorState::Ephemeral { rows, pos } => {
-                        regs[dest] = RuntimeValue::plain(
-                            rows[*pos].get(col_idx).cloned().unwrap_or(Value::Null),
-                        );
+                        let src = rows[*pos].get(col_idx).unwrap_or(&Value::Null);
+                        pool.assign_cloned_value(&mut regs[dest], src, 0);
                     }
                     _ => return Err(SqliteError::misuse("Column on closed cursor")),
                 }
@@ -989,8 +1497,22 @@ fn step_ops(
                 let enc = storage
                     .btree_ref(DatabaseId::MAIN)
                     .map_or(TextEncoding::Utf8, Btree::encoding);
-                let bytes = encode_runtime_record_with_encoding(&regs[start..start + count], enc);
-                regs[dest] = RuntimeValue::plain(Value::Blob(bytes));
+                // Extract any reusable Vec<u8> from `regs[dest]` only if `dest` is outside `start..start + count`.
+                let mut bytes = if dest < start || dest >= start + count {
+                    match std::mem::replace(&mut regs[dest], RuntimeValue::null()).value {
+                        Value::Blob(b) => b,
+                        other => {
+                            pool.recycle_value(other);
+                            pool.blobs.pop().unwrap_or_default()
+                        }
+                    }
+                } else {
+                    pool.blobs.pop().unwrap_or_default()
+                };
+                encode_runtime_record_into(&regs[start..start + count], enc, &mut bytes);
+                let old =
+                    std::mem::replace(&mut regs[dest], RuntimeValue::plain(Value::Blob(bytes)));
+                pool.recycle_value(old.value);
             }
             Opcode::NewRowid => {
                 // p1 = table cursor, p2 = dest_reg
@@ -1004,7 +1526,8 @@ fn step_ops(
                 regs[dest] = RuntimeValue::plain(Value::Integer(rid));
             }
             Opcode::Insert => {
-                // p1 = table cursor, p2 = record_blob_reg, p3 = rowid_reg, p5 = update_meta_flags (1 = last_rowid, 2 = changes)
+                // p1 = table cursor, p2 = record_blob_reg, p3 = rowid_reg
+                // p5 flags: 0x01 = last_rowid, 0x02 = changes, 0x04 = fail on duplicate rowid, 0x08 = PRIMARYKEY ext code
                 let cid = ins.p1 as usize;
                 let rec_reg = ins.p2 as usize;
                 let rid_reg = ins.p3 as usize;
@@ -1015,21 +1538,39 @@ fn step_ops(
                 let Value::Blob(ref payload) = regs[rec_reg].value else {
                     return Err(SqliteError::misuse("OP_Insert expects record blob"));
                 };
-                let (db, root_pgno, writable) = match &cursors[cid] {
+                let (db, prev_cur_id, root_pgno, writable) = match &mut cursors[cid] {
                     CursorState::Table {
                         db,
+                        cursor_id,
                         root_pgno,
                         writable,
-                        ..
-                    } => (*db, *root_pgno, *writable),
+                    } => (*db, cursor_id.take(), *root_pgno, *writable),
                     _ => return Err(SqliteError::misuse("Insert on non-table cursor")),
                 };
                 if !writable {
                     return Err(SqliteError::misuse("Insert on read-only table cursor"));
                 }
-                storage
-                    .btree_mut(db)?
-                    .insert_table(root_pgno, rowid, payload)?;
+                let btree = storage.btree_mut(db)?;
+                if let Some(id) = prev_cur_id {
+                    btree.close_cursor(id);
+                }
+                if (ins.p5 & 0x04) != 0 {
+                    let inserted = btree.insert_table_unique(root_pgno, rowid, payload)?;
+                    if !inserted {
+                        let ext = if (ins.p5 & 0x08) != 0 {
+                            sqliters_types::extended::SQLITE_CONSTRAINT_PRIMARYKEY
+                        } else {
+                            sqliters_types::extended::SQLITE_CONSTRAINT_ROWID
+                        };
+                        let msg = match &ins.p4 {
+                            P4::Str(s) => s.clone(),
+                            _ => "UNIQUE constraint failed".to_owned(),
+                        };
+                        return Err(SqliteError::constraint(ext, msg));
+                    }
+                } else {
+                    btree.insert_table(root_pgno, rowid, payload)?;
+                }
                 if (ins.p5 & 0x01) != 0 {
                     runtime_ctx.last_insert_rowid = rowid;
                 }
@@ -1041,13 +1582,20 @@ fn step_ops(
             Opcode::Delete => {
                 // p1 = table cursor, p2 = rowid_reg (if >0, else current cursor rowid)
                 let cid = ins.p1 as usize;
-                let (db, cursor_id, root_pgno, writable) = match &cursors[cid] {
+                let (db, cursor_id, root_pgno, writable) = match &mut cursors[cid] {
                     CursorState::Table {
                         db,
                         cursor_id,
                         root_pgno,
                         writable,
-                    } => (*db, *cursor_id, *root_pgno, *writable),
+                    } => {
+                        let cid_opt = if ins.p2 > 0 {
+                            cursor_id.take()
+                        } else {
+                            *cursor_id
+                        };
+                        (*db, cid_opt, *root_pgno, *writable)
+                    }
                     _ => return Err(SqliteError::misuse("Delete on non-table cursor")),
                 };
                 if !writable {
@@ -1055,9 +1603,14 @@ fn step_ops(
                 }
                 let btree = storage.btree_mut(db)?;
                 let rowid = if ins.p2 > 0 {
+                    if let Some(id) = cursor_id {
+                        btree.close_cursor(id);
+                    }
                     regs[ins.p2 as usize].value.to_integer_lossy()
                 } else {
-                    btree.cursor_rowid(cursor_id)?
+                    let id = cursor_id
+                        .ok_or_else(|| SqliteError::misuse("Delete without positioned cursor"))?;
+                    btree.cursor_rowid(id)?
                 };
                 if btree.delete_table(root_pgno, rowid)? && (ins.p5 & 0x02) != 0 {
                     runtime_ctx.last_changes += 1;
@@ -1092,7 +1645,7 @@ fn step_ops(
                         if indexed_cols.iter().all(|v| !v.is_null()) {
                             let new_rowid = vals.last();
                             let probe_id =
-                                btree.open_index_cursor(root_pgno, orders.clone(), false);
+                                btree.open_index_cursor(root_pgno, orders.to_vec(), false);
                             let probe_res = (|| -> Result<bool> {
                                 if !btree.cursor_seek_index_equal_first(probe_id, indexed_cols)? {
                                     return Ok(false);
@@ -1130,10 +1683,6 @@ fn step_ops(
                 let cid = ins.p1 as usize;
                 let start = ins.p2 as usize;
                 let count = ins.p3 as usize;
-                let keys: Vec<Value> = regs[start..start + count]
-                    .iter()
-                    .map(|rv| rv.value.clone())
-                    .collect();
                 let CursorState::Index {
                     db,
                     root_pgno,
@@ -1147,17 +1696,29 @@ fn step_ops(
                 if !writable {
                     return Err(SqliteError::misuse("IdxDelete on read-only index cursor"));
                 }
-                storage
-                    .btree_mut(db)?
-                    .delete_index(root_pgno, &keys, orders)?;
+                let btree = storage.btree_mut(db)?;
+                encode_runtime_record_into(
+                    &regs[start..start + count],
+                    btree.encoding(),
+                    &mut pool.scratch_rec,
+                );
+                btree.delete_index_raw(root_pgno, &pool.scratch_rec, orders)?;
             }
             Opcode::ResultRow => {
                 let start = ins.p1 as usize;
                 let count = ins.p2 as usize;
-                let row: Vec<Value> = regs[start..start + count]
-                    .iter()
-                    .map(|rv| rv.value.clone())
-                    .collect();
+                let row: Vec<Value> = if ins.p5 != 0 {
+                    let mut out = Vec::with_capacity(count);
+                    for rv in &mut regs[start..start + count] {
+                        out.push(std::mem::replace(rv, RuntimeValue::null()).value);
+                    }
+                    out
+                } else {
+                    regs[start..start + count]
+                        .iter()
+                        .map(|rv| rv.value.clone())
+                        .collect()
+                };
                 *pc = next_pc;
                 return Ok(VmStep::Row(row));
             }
@@ -1195,15 +1756,13 @@ fn step_ops(
                 } else {
                     start
                 };
-                for r in &mut regs[start..=end] {
-                    *r = RuntimeValue::null();
-                }
+                pool.clear_registers(&mut regs[start..=end]);
             }
             Opcode::Variable => {
                 // p1 = 1-based parameter index, p2 = dest_reg
                 let idx = (ins.p1 as usize).saturating_sub(1);
-                regs[ins.p2 as usize] =
-                    RuntimeValue::plain(params.get(idx).cloned().unwrap_or(Value::Null));
+                let src = params.get(idx).unwrap_or(&Value::Null);
+                pool.assign_cloned_value(&mut regs[ins.p2 as usize], src, 0);
             }
             Opcode::Copy => {
                 let src = ins.p1 as usize;
@@ -1211,11 +1770,23 @@ fn step_ops(
                 let extra = ins.p3.max(0) as usize;
                 let clear_subtype = (ins.p5 & 0x0002) != 0;
                 for i in 0..=extra {
-                    let mut rv = regs[src + i].clone();
-                    if clear_subtype {
-                        rv.clear_subtype();
+                    let s_idx = src + i;
+                    let d_idx = dst + i;
+                    if s_idx == d_idx {
+                        if clear_subtype {
+                            regs[d_idx].clear_subtype();
+                        }
+                    } else if s_idx < d_idx {
+                        let (left, right) = regs.split_at_mut(d_idx);
+                        let src_rv = &left[s_idx];
+                        let sub = if clear_subtype { 0 } else { src_rv.subtype };
+                        pool.assign_cloned_value(&mut right[0], &src_rv.value, sub);
+                    } else {
+                        let (left, right) = regs.split_at_mut(s_idx);
+                        let src_rv = &right[0];
+                        let sub = if clear_subtype { 0 } else { src_rv.subtype };
+                        pool.assign_cloned_value(&mut left[d_idx], &src_rv.value, sub);
                     }
-                    regs[dst + i] = rv;
                 }
             }
             Opcode::Move => {
@@ -1287,34 +1858,44 @@ fn step_ops(
             | Opcode::IsNot => {
                 // Boolean evaluation into register: p1 = lhs, p2 = rhs, p3 = dest_reg
                 let aff = p5_to_affinity(ins.p5);
-                let lhs = regs[ins.p1 as usize].value.clone();
-                let rhs = regs[ins.p2 as usize].value.clone();
                 let enc = storage
                     .btree_ref(DatabaseId::MAIN)
                     .map_or(TextEncoding::Utf8, Btree::encoding);
                 let out = match &ins.p4 {
-                    P4::Str(custom_coll) => eval_comparison_with_services(
-                        ins.opcode,
-                        &lhs,
-                        &rhs,
-                        aff,
-                        custom_coll,
-                        enc,
-                        services,
-                    )?,
-                    P4::Collation(c) => {
-                        eval_comparison_with_affinity(ins.opcode, &lhs, &rhs, aff, *c, enc)
+                    P4::Str(custom_coll) => {
+                        let lhs = regs[ins.p1 as usize].value.clone();
+                        let rhs = regs[ins.p2 as usize].value.clone();
+                        let r = eval_comparison_with_services(
+                            ins.opcode,
+                            &lhs,
+                            &rhs,
+                            aff,
+                            custom_coll,
+                            enc,
+                            services,
+                        )?;
+                        fast_poll = services.fast_interrupt_and_no_progress();
+                        r
                     }
+                    P4::Collation(c) => eval_comparison_with_affinity(
+                        ins.opcode,
+                        &regs[ins.p1 as usize].value,
+                        &regs[ins.p2 as usize].value,
+                        aff,
+                        *c,
+                        enc,
+                    ),
                     _ => eval_comparison_with_affinity(
                         ins.opcode,
-                        &lhs,
-                        &rhs,
+                        &regs[ins.p1 as usize].value,
+                        &regs[ins.p2 as usize].value,
                         aff,
                         Collation::Binary,
                         enc,
                     ),
                 };
-                regs[ins.p3 as usize] = RuntimeValue::plain(out);
+                let old = std::mem::replace(&mut regs[ins.p3 as usize], RuntimeValue::plain(out));
+                pool.recycle_value(old.value);
             }
             Opcode::And => {
                 let a = regs[ins.p1 as usize].value.truthiness();
@@ -1421,6 +2002,7 @@ fn step_ops(
                     return Err(SqliteError::misuse("Function missing P4::Func"));
                 };
                 let res = services.call_scalar(name, &regs[start..start + argc])?;
+                fast_poll = services.fast_interrupt_and_no_progress();
                 regs[dest] = res;
             }
             Opcode::SorterOpen => {

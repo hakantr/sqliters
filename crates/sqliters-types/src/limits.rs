@@ -146,10 +146,14 @@ impl LockGeometry {
     }
 
     /// 1-based page number containing `PENDING_BYTE` (`PENDING_BYTE_PAGE(pBt)` in `sqlite/src/btreeInt.h:612`).
-    #[inline]
+    #[inline(always)]
     pub const fn lock_byte_page(&self, page_size: u32) -> Pgno {
-        assert!(page_size > 0, "page_size must be non-zero");
-        ((self.pending_byte_offset / (page_size as u64)) as u32) + 1
+        if page_size.is_power_of_two() {
+            ((self.pending_byte_offset >> page_size.trailing_zeros()) as u32) + 1
+        } else {
+            assert!(page_size > 0, "page_size must be non-zero");
+            ((self.pending_byte_offset / (page_size as u64)) as u32) + 1
+        }
     }
 
     /// Super-journal sentinel page number (`PAGER_SJ_PGNO_COMPUTED(x)` in `sqlite/src/pager.h:53`

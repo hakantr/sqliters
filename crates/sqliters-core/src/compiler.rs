@@ -4,16 +4,18 @@
 
 use sqliters_syntax::{
     BinaryOp, BindParam, ColumnRef, CommonTableExpr, CompoundOp, ConflictAction, CurrentTimeKind,
-    Expr, FromClause, FunctionArgs, IndexHint, InsertSource, InsertStmt, JoinConstraint, JoinType,
-    LikeOp, LimitClause, OrderByTerm, QualifiedName, ResultColumn, SelectBody, SelectCore,
-    SelectStmt, SetAssignment, Stmt, TableOrSubquery, TriggerStep, TriggerTiming, UnaryOp,
-    UpsertAction, WindowFrameBound, WindowRef, WindowSpec,
+    DeleteStmt, Expr, FromClause, FunctionArgs, IndexHint, InsertSource, InsertStmt,
+    JoinConstraint, JoinType, LikeOp, LimitClause, OrderByTerm, QualifiedName, ResultColumn,
+    SelectBody, SelectCore, SelectStmt, SetAssignment, Stmt, TableOrSubquery, TriggerStep,
+    TriggerTiming, UnaryOp, UpdateStmt, UpsertAction, WindowFrameBound, WindowRef, WindowSpec,
 };
 use sqliters_types::{
     Collation, DatabaseId, ErrorCode, KeySortOrder, Result, SqliteError, TypeAffinity, Value,
 };
 use sqliters_vdbe::{
-    AggregateKind, Instruction, Opcode, P4, VdbeProgram, affinity_to_p5, sqlite_compare_affinity,
+    AggregateKind, InsertValSource, Instruction, Opcode, P4, PointProjCol, RowidKeySource,
+    RowidPointSelectPlan, SingleRowInsertCol, SingleRowInsertPlan, VdbeProgram, affinity_to_p5,
+    sqlite_compare_affinity,
 };
 
 use crate::db_set::{DatabaseSet, ResolvedRelation};
@@ -2973,7 +2975,7 @@ fn try_compile_insert_core(
         prog.emit(
             Instruction::new(Opcode::OpenWriteIndex, ic, idx.root_pgno as i32, 0)
                 .with_db(db_id)
-                .with_p4(P4::KeyInfo(idx.key_sort_orders()))
+                .with_p4(P4::key_info(idx.key_sort_orders()))
                 .with_comment(idx.name.clone()),
         );
         icurs.push((ic, idx, u_msg));
@@ -3086,8 +3088,14 @@ fn try_compile_insert_core(
             }
         }
 
-        // 6. Finalize rowid (`SeekRowid` PK check if explicit, or `NewRowid` if NULL/omitted).
-        if has_rowid_expr {
+        // 6. Finalize rowid (`SeekRowid` PK check if explicit with indexes, single-pass `Insert` unique check if no indexes, or `NewRowid` if NULL/omitted).
+        let defer_dup_check_to_insert = has_rowid_expr && icurs.is_empty();
+        if defer_dup_check_to_insert {
+            let j_ready = prog.emit(Instruction::new(Opcode::NotNull, rid_reg, 0, 0));
+            prog.emit(Instruction::new(Opcode::NewRowid, tcur, rid_reg, 0));
+            let ready_addr = prog.current_addr();
+            prog.patch_p2(j_ready, ready_addr);
+        } else if has_rowid_expr {
             let j_alloc = prog.emit(Instruction::new(Opcode::IsNull, rid_reg, 0, 0));
             let j_seek_miss = prog.emit(Instruction::new(Opcode::SeekRowid, tcur, 0, rid_reg));
             prog.emit(
@@ -3152,9 +3160,27 @@ fn try_compile_insert_core(
             n_cols as i32,
             rec_reg,
         ));
-        prog.emit(Instruction::new(Opcode::Insert, tcur, rec_reg, rid_reg).with_p5(0x03));
+        if defer_dup_check_to_insert {
+            let pk_flag = if dup_ext_code == sqliters_types::extended::SQLITE_CONSTRAINT_PRIMARYKEY
+            {
+                0x08
+            } else {
+                0x00
+            };
+            prog.emit(
+                Instruction::new(Opcode::Insert, tcur, rec_reg, rid_reg)
+                    .with_p5(0x03 | 0x04 | pk_flag)
+                    .with_p4(P4::Str(dup_msg.clone())),
+            );
+        } else {
+            prog.emit(Instruction::new(Opcode::Insert, tcur, rec_reg, rid_reg).with_p5(0x03));
+        }
     }
 
+    let can_elide_stmt_sp =
+        rows.len() == 1 && icurs.iter().all(|(_, idx, _)| !idx.unique) && !prog.has_function_call();
+    let can_build_single_row_plan =
+        rows.len() == 1 && icurs.is_empty() && !prog.has_function_call() && n_cols <= 16;
     for (ic, _, _) in icurs {
         prog.emit(Instruction::new(Opcode::Close, ic, 0, 0));
     }
@@ -3180,6 +3206,655 @@ fn try_compile_insert_core(
     }
 
     prog.patch_p2(init_addr, body_start);
+    if can_elide_stmt_sp {
+        prog.set_needs_stmt_subsavepoint(false);
+    }
+    if can_build_single_row_plan {
+        let row = &rows[0];
+        let mut ok = true;
+        let mut rowid_src: Option<InsertValSource> = None;
+        let mut col_srcs: Vec<InsertValSource> = vec![InsertValSource::Null; n_cols];
+        for (ci, col) in tbl.columns.iter().enumerate() {
+            if !seen_col[ci] {
+                if tbl.rowid_alias_col == Some(ci) {
+                    if let Some(ref de) = col.default_expr {
+                        if let Some(s) = expr_to_insert_val_source(de) {
+                            rowid_src = Some(s);
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    }
+                } else if let Some(ref de) = col.default_expr {
+                    if let Some(s) = expr_to_insert_val_source(de) {
+                        col_srcs[ci] = s;
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if ok {
+            for (slot, expr) in targets.iter().zip(row.iter()) {
+                let Some(s) = expr_to_insert_val_source(expr) else {
+                    ok = false;
+                    break;
+                };
+                match *slot {
+                    InsertTargetSlot::Rowid => rowid_src = Some(s),
+                    InsertTargetSlot::Col(ci) => col_srcs[ci] = s,
+                }
+            }
+        }
+        if ok {
+            let cols = tbl
+                .columns
+                .iter()
+                .enumerate()
+                .zip(col_srcs)
+                .map(|((ci, col), src)| SingleRowInsertCol {
+                    src,
+                    affinity: affs[ci],
+                    notnull_msg: (col.not_null.is_some() && tbl.rowid_alias_col != Some(ci))
+                        .then(|| format!("NOT NULL constraint failed: {}.{}", tbl.name, col.name)),
+                })
+                .collect();
+            prog.set_single_row_insert(Some(SingleRowInsertPlan {
+                db: db_id,
+                root_pgno: tbl.root_pgno,
+                rowid_src,
+                cols,
+                dup_ext_code,
+                dup_msg,
+            }));
+        }
+    }
+    Ok(Some(prog))
+}
+
+fn expr_to_insert_val_source(expr: &Expr) -> Option<InsertValSource> {
+    match expr {
+        Expr::Null => Some(InsertValSource::Null),
+        Expr::Bool(b) => Some(InsertValSource::Const(Value::Integer(i64::from(*b)))),
+        Expr::Integer(i) => Some(InsertValSource::Const(Value::Integer(*i))),
+        Expr::Float(f) => Some(InsertValSource::Const(Value::real(*f))),
+        Expr::String(s) => Some(InsertValSource::Const(Value::Text(s.clone()))),
+        Expr::Blob(b) => Some(InsertValSource::Const(Value::Blob(b.clone()))),
+        Expr::Bind(bp) => {
+            let idx = match bp {
+                BindParam::Anonymous(i) | BindParam::Numbered(i) | BindParam::Named(_, i) => *i,
+            };
+            u32::try_from(idx)
+                .ok()
+                .filter(|&p| p >= 1)
+                .map(InsertValSource::Param1Based)
+        }
+        Expr::Unary {
+            op: UnaryOp::Negate,
+            expr: inner,
+        } => match inner.as_ref() {
+            Expr::Integer(i) => Some(InsertValSource::Const(
+                i.checked_neg()
+                    .map_or_else(|| Value::real(-(*i as f64)), Value::Integer),
+            )),
+            Expr::Float(f) => Some(InsertValSource::Const(Value::real(-*f))),
+            _ => None,
+        },
+        Expr::Unary {
+            op: UnaryOp::Plus,
+            expr: inner,
+        } => match inner.as_ref() {
+            Expr::Integer(i) => Some(InsertValSource::Const(Value::Integer(*i))),
+            Expr::Float(f) => Some(InsertValSource::Const(Value::real(*f))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn db_set_has_any_foreign_keys(db_set: &DatabaseSet) -> bool {
+    db_set
+        .slots()
+        .iter()
+        .any(|s| s.schema.tables.iter().any(|t| !t.foreign_keys.is_empty()))
+}
+
+fn table_and_indexes_can_compile_dml(
+    db_id: DatabaseId,
+    slot_schema: &Schema,
+    tbl: &TableSchema,
+) -> Option<Vec<IndexSchema>> {
+    if db_id.index() >= 2
+        || Schema::is_schema_table_name(&tbl.name)
+        || (tbl.name.len() >= 7 && tbl.name[..7].eq_ignore_ascii_case("sqlite_"))
+        || slot_schema.find_virtual_table(&tbl.name).is_some()
+        || is_vtab_shadow_table(&tbl.name, slot_schema)
+        || tbl.without_rowid
+        || tbl.root_pgno == 0
+        || tbl.strict
+        || !tbl.checks.is_empty()
+        || !tbl.foreign_keys.is_empty()
+        || tbl.columns.is_empty()
+    {
+        return None;
+    }
+    for c in &tbl.columns {
+        if c.generated.is_some()
+            || c.default_expr.is_some()
+            || c.not_null.is_some_and(|act| act != ConflictAction::Abort)
+        {
+            return None;
+        }
+    }
+    let mut indexes = slot_schema.indexes_for_table(&tbl.name);
+    for idx in &indexes {
+        if idx.root_pgno == 0
+            || idx.where_clause.is_some()
+            || (idx.unique && idx.conflict != ConflictAction::Abort)
+            || idx.columns.iter().any(|ic| {
+                ic.expr.is_some()
+                    || ic.col_idx.is_none()
+                    || ic.sort_order.custom_collation.is_some()
+            })
+        {
+            return None;
+        }
+    }
+    indexes.sort_by_key(|idx| {
+        if idx.unique && idx.origin == "pk" {
+            0u8
+        } else if idx.unique {
+            1u8
+        } else {
+            2u8
+        }
+    });
+    Some(indexes)
+}
+
+/// Compiles single-row `DELETE FROM <table> WHERE <rowid/ipk> = <expr>` into a zero-allocation
+/// VDBE write program when no triggers, foreign keys, `RETURNING`, or virtual tables apply.
+pub fn try_compile_delete_in_db_set(
+    del: &DeleteStmt,
+    db_set: &DatabaseSet,
+    functions: &FunctionRegistry,
+) -> Result<Option<VdbeProgram>> {
+    if !del.ctes.is_empty()
+        || del.indexed_by.is_some()
+        || !del.returning.is_empty()
+        || db_set_has_any_foreign_keys(db_set)
+    {
+        return Ok(None);
+    }
+    let Some(ref where_expr) = del.selection else {
+        return Ok(None);
+    };
+    let Some((db_id, slot_name, slot_schema, tbl)) =
+        resolve_db_set_table_for_compiler(&del.table, db_set)?
+    else {
+        return Ok(None);
+    };
+    if db_set.has_active_triggers_for_event(db_id, &tbl.name, TriggerEventKind::Delete, None) {
+        return Ok(None);
+    }
+    let Some(indexes) = table_and_indexes_can_compile_dml(db_id, slot_schema, &tbl) else {
+        return Ok(None);
+    };
+    if expr_has_unresolved_double_quoted_col(where_expr, &tbl) {
+        return Ok(None);
+    }
+    let alias = del.alias.as_deref();
+    let AccessPlan::RowidSeek { key_expr } =
+        choose_access_plan_with_schema_name(&tbl, slot_name, alias, Some(where_expr), slot_schema)
+    else {
+        return Ok(None);
+    };
+    if !expr_can_compile_in_insert(&key_expr, functions) {
+        return Ok(None);
+    }
+    let is_pure_single_eq = extract_table_col_eq(where_expr, &tbl, slot_name, alias)
+        .is_some_and(|(cname, _)| is_rowid_or_ipk_name(&tbl, &cname));
+
+    let n_cols = tbl.columns.len();
+    let mut prog = VdbeProgram::new();
+    prog.read_only = false;
+    let init_addr = prog.emit(Instruction::new(Opcode::Init, 0, 1, 0));
+    let body_start = prog.current_addr();
+    prog.emit(Instruction::new(Opcode::Transaction, db_id.index() as i32, 1, 0).with_db(db_id));
+
+    let tcur = prog.alloc_cursor();
+    prog.emit(
+        Instruction::new(Opcode::OpenWrite, tcur, tbl.root_pgno as i32, n_cols as i32)
+            .with_db(db_id)
+            .with_comment(tbl.name.clone()),
+    );
+    let mut icurs = Vec::with_capacity(indexes.len());
+    for idx in &indexes {
+        let ic = prog.alloc_cursor();
+        prog.emit(
+            Instruction::new(Opcode::OpenWriteIndex, ic, idx.root_pgno as i32, 0)
+                .with_db(db_id)
+                .with_p4(P4::key_info(idx.key_sort_orders()))
+                .with_comment(idx.name.clone()),
+        );
+        icurs.push((ic, idx));
+    }
+
+    let binding = TableBinding {
+        tbl: &tbl,
+        schema_name: slot_name,
+        alias,
+        cursor: tcur,
+        covering_index: None,
+    };
+
+    let key_reg = prog.alloc_register();
+    if compile_expr(&mut prog, &key_expr, None, functions, key_reg).is_err() {
+        return Ok(None);
+    }
+    let mut done_jumps = Vec::with_capacity(2);
+    done_jumps.push(prog.emit(Instruction::new(Opcode::SeekRowid, tcur, 0, key_reg)));
+
+    if !is_pure_single_eq {
+        let cond_reg = prog.alloc_register();
+        if compile_expr(&mut prog, where_expr, Some(&binding), functions, cond_reg).is_err() {
+            return Ok(None);
+        }
+        done_jumps.push(prog.emit(Instruction::new(Opcode::JumpIfFalse, cond_reg, 0, 1)));
+    }
+
+    let rid_reg = prog.alloc_register();
+    prog.emit(Instruction::new(Opcode::Rowid, tcur, rid_reg, 0));
+
+    let max_idx_width = indexes
+        .iter()
+        .map(|i| i.columns.len() + 1)
+        .max()
+        .unwrap_or(0);
+    let idx_key_base = if max_idx_width > 0 {
+        prog.alloc_registers(max_idx_width)
+    } else {
+        0
+    };
+
+    for (ic, idx) in &icurs {
+        for (k, ic_col) in idx.columns.iter().enumerate() {
+            let ci = ic_col.col_idx.expect("validated col_idx");
+            let dst_reg = idx_key_base + k as i32;
+            if tbl.rowid_alias_col == Some(ci) {
+                prog.emit(Instruction::new(Opcode::Copy, rid_reg, dst_reg, 0));
+            } else {
+                prog.emit(Instruction::new(Opcode::Column, tcur, ci as i32, dst_reg));
+            }
+        }
+        prog.emit(Instruction::new(
+            Opcode::Copy,
+            rid_reg,
+            idx_key_base + idx.columns.len() as i32,
+            0,
+        ));
+        prog.emit(Instruction::new(
+            Opcode::IdxDelete,
+            *ic,
+            idx_key_base,
+            (idx.columns.len() + 1) as i32,
+        ));
+    }
+
+    prog.emit(Instruction::new(Opcode::Delete, tcur, rid_reg, 0).with_p5(0x02));
+
+    let done_addr = prog.current_addr();
+    for j in done_jumps {
+        prog.patch_p2(j, done_addr);
+    }
+    for (ic, _) in icurs {
+        prog.emit(Instruction::new(Opcode::Close, ic, 0, 0));
+    }
+    prog.emit(Instruction::new(Opcode::Close, tcur, 0, 0));
+    prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
+    prog.patch_p2(init_addr, body_start);
+    if !prog.has_function_call() {
+        prog.set_needs_stmt_subsavepoint(false);
+    }
+    Ok(Some(prog))
+}
+
+/// Compiles single-row `UPDATE <table> SET col = <expr>, ... WHERE <rowid/ipk> = <expr>`
+/// (when rowid itself is not reassigned) into a zero-allocation VDBE write program.
+pub fn try_compile_update_in_db_set(
+    upd: &UpdateStmt,
+    db_set: &DatabaseSet,
+    functions: &FunctionRegistry,
+) -> Result<Option<VdbeProgram>> {
+    if !upd.ctes.is_empty()
+        || !matches!(upd.or_conflict, None | Some(ConflictAction::Abort))
+        || upd.indexed_by.is_some()
+        || upd.from.is_some()
+        || !upd.returning.is_empty()
+        || upd.assignments.is_empty()
+        || db_set_has_any_foreign_keys(db_set)
+    {
+        return Ok(None);
+    }
+    let Some(ref where_expr) = upd.selection else {
+        return Ok(None);
+    };
+    let Some((db_id, slot_name, slot_schema, tbl)) =
+        resolve_db_set_table_for_compiler(&upd.table, db_set)?
+    else {
+        return Ok(None);
+    };
+    let Some(indexes) = table_and_indexes_can_compile_dml(db_id, slot_schema, &tbl) else {
+        return Ok(None);
+    };
+    if expr_has_unresolved_double_quoted_col(where_expr, &tbl) {
+        return Ok(None);
+    }
+
+    let n_cols = tbl.columns.len();
+    let mut modified_col = vec![false; n_cols];
+    let mut assigned_exprs: Vec<(usize, &Expr)> = Vec::with_capacity(upd.assignments.len());
+    let mut mod_col_names: Vec<&str> = Vec::with_capacity(upd.assignments.len());
+    for sa in &upd.assignments {
+        if sa.row_value || sa.columns.len() != 1 {
+            return Ok(None);
+        }
+        let cname = &sa.columns[0];
+        if tbl.is_implicit_rowid_name(cname) {
+            return Ok(None);
+        }
+        let Some((ci, col_def)) = tbl.find_column(cname) else {
+            return Ok(None);
+        };
+        if tbl.rowid_alias_col == Some(ci) || modified_col[ci] {
+            return Ok(None);
+        }
+        if expr_has_unresolved_double_quoted_col(&sa.expr, &tbl) {
+            return Ok(None);
+        }
+        modified_col[ci] = true;
+        mod_col_names.push(col_def.name.as_str());
+        assigned_exprs.push((ci, &sa.expr));
+    }
+
+    if db_set.has_active_triggers_for_event(
+        db_id,
+        &tbl.name,
+        TriggerEventKind::Update,
+        Some(&mod_col_names),
+    ) {
+        return Ok(None);
+    }
+
+    let alias = upd.alias.as_deref();
+    let AccessPlan::RowidSeek { key_expr } =
+        choose_access_plan_with_schema_name(&tbl, slot_name, alias, Some(where_expr), slot_schema)
+    else {
+        return Ok(None);
+    };
+    if !expr_can_compile_in_insert(&key_expr, functions) {
+        return Ok(None);
+    }
+    let is_pure_single_eq = extract_table_col_eq(where_expr, &tbl, slot_name, alias)
+        .is_some_and(|(cname, _)| is_rowid_or_ipk_name(&tbl, &cname));
+
+    // Only open and maintain secondary indexes that reference at least one modified column!
+    let affected_indexes: Vec<IndexSchema> = indexes
+        .into_iter()
+        .filter(|idx| {
+            idx.columns
+                .iter()
+                .any(|ic| ic.col_idx.is_some_and(|ci| modified_col[ci]))
+        })
+        .collect();
+
+    let mut prog = VdbeProgram::new();
+    prog.read_only = false;
+    let init_addr = prog.emit(Instruction::new(Opcode::Init, 0, 1, 0));
+    let body_start = prog.current_addr();
+    prog.emit(Instruction::new(Opcode::Transaction, db_id.index() as i32, 1, 0).with_db(db_id));
+
+    let tcur = prog.alloc_cursor();
+    prog.emit(
+        Instruction::new(Opcode::OpenWrite, tcur, tbl.root_pgno as i32, n_cols as i32)
+            .with_db(db_id)
+            .with_comment(tbl.name.clone()),
+    );
+    let mut icurs = Vec::with_capacity(affected_indexes.len());
+    for idx in &affected_indexes {
+        let ic = prog.alloc_cursor();
+        let u_msg = if idx.unique {
+            let cols_str = idx
+                .columns
+                .iter()
+                .map(|c| format!("{}.{}", tbl.name, c.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("UNIQUE constraint failed: {cols_str}"))
+        } else {
+            None
+        };
+        prog.emit(
+            Instruction::new(Opcode::OpenWriteIndex, ic, idx.root_pgno as i32, 0)
+                .with_db(db_id)
+                .with_p4(P4::key_info(idx.key_sort_orders()))
+                .with_comment(idx.name.clone()),
+        );
+        icurs.push((ic, idx, u_msg));
+    }
+
+    let binding = TableBinding {
+        tbl: &tbl,
+        schema_name: slot_name,
+        alias,
+        cursor: tcur,
+        covering_index: None,
+    };
+
+    let key_reg = prog.alloc_register();
+    if compile_expr(&mut prog, &key_expr, None, functions, key_reg).is_err() {
+        return Ok(None);
+    }
+    let mut done_jumps = Vec::with_capacity(2);
+    done_jumps.push(prog.emit(Instruction::new(Opcode::SeekRowid, tcur, 0, key_reg)));
+
+    if !is_pure_single_eq {
+        let cond_reg = prog.alloc_register();
+        if compile_expr(&mut prog, where_expr, Some(&binding), functions, cond_reg).is_err() {
+            return Ok(None);
+        }
+        done_jumps.push(prog.emit(Instruction::new(Opcode::JumpIfFalse, cond_reg, 0, 1)));
+    }
+
+    let rid_reg = prog.alloc_register();
+    prog.emit(Instruction::new(Opcode::Rowid, tcur, rid_reg, 0));
+
+    let new_col_base = prog.alloc_registers(n_cols);
+    let mut old_mod_regs: Vec<Option<i32>> = vec![None; n_cols];
+    for ci in 0..n_cols {
+        if tbl.rowid_alias_col == Some(ci) {
+            prog.emit(Instruction::new(
+                Opcode::Null,
+                0,
+                new_col_base + ci as i32,
+                0,
+            ));
+        } else if !modified_col[ci] {
+            prog.emit(Instruction::new(
+                Opcode::Column,
+                tcur,
+                ci as i32,
+                new_col_base + ci as i32,
+            ));
+        } else if affected_indexes
+            .iter()
+            .any(|idx| idx.columns.iter().any(|ic| ic.col_idx == Some(ci)))
+        {
+            let old_r = prog.alloc_register();
+            prog.emit(Instruction::new(Opcode::Column, tcur, ci as i32, old_r));
+            old_mod_regs[ci] = Some(old_r);
+        }
+    }
+
+    for &(ci, expr) in &assigned_exprs {
+        if compile_expr(
+            &mut prog,
+            expr,
+            Some(&binding),
+            functions,
+            new_col_base + ci as i32,
+        )
+        .is_err()
+        {
+            return Ok(None);
+        }
+    }
+
+    let mut notnull_jumps: Vec<(usize, usize)> = Vec::new();
+    for &(ci, _) in &assigned_exprs {
+        let aff = tbl.columns[ci].affinity;
+        if aff != TypeAffinity::Blob {
+            prog.emit(
+                Instruction::new(Opcode::Affinity, new_col_base + ci as i32, 1, 0)
+                    .with_p4(P4::Affinity(vec![aff])),
+            );
+        }
+        if tbl.columns[ci].not_null.is_some() {
+            let j_nn = prog.emit(Instruction::new(
+                Opcode::IsNull,
+                new_col_base + ci as i32,
+                0,
+                0,
+            ));
+            notnull_jumps.push((j_nn, ci));
+        }
+    }
+
+    if !icurs.is_empty() {
+        let max_idx_width = affected_indexes
+            .iter()
+            .map(|i| i.columns.len() + 1)
+            .max()
+            .unwrap_or(0);
+        let idx_key_base = prog.alloc_registers(max_idx_width);
+        let idx_rec_reg = prog.alloc_register();
+
+        for (ic, idx, u_msg) in &icurs {
+            // Delete old index entry
+            for (k, ic_col) in idx.columns.iter().enumerate() {
+                let ci = ic_col.col_idx.expect("validated col_idx");
+                let src_reg = if tbl.rowid_alias_col == Some(ci) {
+                    rid_reg
+                } else if let Some(old_r) = old_mod_regs[ci] {
+                    old_r
+                } else {
+                    new_col_base + ci as i32
+                };
+                prog.emit(Instruction::new(
+                    Opcode::Copy,
+                    src_reg,
+                    idx_key_base + k as i32,
+                    0,
+                ));
+            }
+            prog.emit(Instruction::new(
+                Opcode::Copy,
+                rid_reg,
+                idx_key_base + idx.columns.len() as i32,
+                0,
+            ));
+            prog.emit(Instruction::new(
+                Opcode::IdxDelete,
+                *ic,
+                idx_key_base,
+                (idx.columns.len() + 1) as i32,
+            ));
+
+            // Insert new index entry
+            for (k, ic_col) in idx.columns.iter().enumerate() {
+                let ci = ic_col.col_idx.expect("validated col_idx");
+                let src_reg = if tbl.rowid_alias_col == Some(ci) {
+                    rid_reg
+                } else {
+                    new_col_base + ci as i32
+                };
+                prog.emit(Instruction::new(
+                    Opcode::Copy,
+                    src_reg,
+                    idx_key_base + k as i32,
+                    0,
+                ));
+            }
+            prog.emit(Instruction::new(
+                Opcode::Copy,
+                rid_reg,
+                idx_key_base + idx.columns.len() as i32,
+                0,
+            ));
+            prog.emit(Instruction::new(
+                Opcode::MakeRecord,
+                idx_key_base,
+                (idx.columns.len() + 1) as i32,
+                idx_rec_reg,
+            ));
+            let p5 = if !idx.unique {
+                0
+            } else if idx.origin == "pk" {
+                2
+            } else {
+                1
+            };
+            let mut idx_ins = Instruction::new(Opcode::IdxInsert, *ic, idx_rec_reg, 0).with_p5(p5);
+            if let Some(msg) = u_msg {
+                idx_ins = idx_ins.with_p4(P4::Str(msg.clone()));
+            }
+            prog.emit(idx_ins);
+        }
+    }
+
+    let rec_reg = prog.alloc_register();
+    prog.emit(Instruction::new(
+        Opcode::MakeRecord,
+        new_col_base,
+        n_cols as i32,
+        rec_reg,
+    ));
+    prog.emit(Instruction::new(Opcode::Insert, tcur, rec_reg, rid_reg).with_p5(0x02));
+
+    let done_addr = prog.current_addr();
+    for j in done_jumps {
+        prog.patch_p2(j, done_addr);
+    }
+    let can_elide_stmt_sp = affected_indexes.iter().all(|i| !i.unique) && !prog.has_function_call();
+    for (ic, _, _) in icurs {
+        prog.emit(Instruction::new(Opcode::Close, ic, 0, 0));
+    }
+    prog.emit(Instruction::new(Opcode::Close, tcur, 0, 0));
+    prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
+
+    for (j_addr, ci) in notnull_jumps {
+        let halt_addr = prog.current_addr();
+        prog.patch_p2(j_addr, halt_addr);
+        let msg = format!(
+            "NOT NULL constraint failed: {}.{}",
+            tbl.name, tbl.columns[ci].name
+        );
+        prog.emit(
+            Instruction::new(
+                Opcode::Halt,
+                sqliters_types::extended::SQLITE_CONSTRAINT_NOTNULL,
+                0,
+                0,
+            )
+            .with_p4(P4::Str(msg)),
+        );
+    }
+
+    prog.patch_p2(init_addr, body_start);
+    if can_elide_stmt_sp {
+        prog.set_needs_stmt_subsavepoint(false);
+    }
     Ok(Some(prog))
 }
 
@@ -3365,12 +4040,7 @@ fn compile_tableless_select(
             return Ok(None);
         }
     }
-    prog.emit(Instruction::new(
-        Opcode::ResultRow,
-        out_base,
-        proj_exprs.len() as i32,
-        0,
-    ));
+    prog.emit(Instruction::new(Opcode::ResultRow, out_base, proj_exprs.len() as i32, 0).with_p5(1));
 
     let halt_addr = prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
     for j in jumps_to_halt {
@@ -3552,7 +4222,7 @@ fn compile_single_table_select(
         prog.emit(
             Instruction::new(Opcode::OpenReadIndex, icur, cov_idx.root_pgno as i32, 0)
                 .with_db(db_id)
-                .with_p4(P4::KeyInfo(cov_idx.key_sort_orders()))
+                .with_p4(P4::key_info(cov_idx.key_sort_orders()))
                 .with_comment(cov_idx.name.clone()),
         );
         Some((cov_idx, icur))
@@ -3561,7 +4231,7 @@ fn compile_single_table_select(
             prog.emit(
                 Instruction::new(Opcode::OpenReadIndex, tbl_cursor, tbl.root_pgno as i32, 0)
                     .with_db(db_id)
-                    .with_p4(P4::KeyInfo(tbl.without_rowid_pk_orders()))
+                    .with_p4(P4::key_info(tbl.without_rowid_pk_orders()))
                     .with_comment(tbl.name.clone()),
             );
         } else {
@@ -3685,7 +4355,7 @@ fn compile_single_table_select(
                     (sort_sources.len() + expanded.len()) as i32,
                     0,
                 )
-                .with_p4(P4::KeyInfo(sort_orders)),
+                .with_p4(P4::key_info(sort_orders)),
             );
             Some((s_cursor, sort_sources))
         }
@@ -3721,7 +4391,7 @@ fn compile_single_table_select(
                 prog.emit(
                     Instruction::new(Opcode::OpenReadIndex, c, index.root_pgno as i32, 0)
                         .with_db(db_id)
-                        .with_p4(P4::KeyInfo(index.key_sort_orders()))
+                        .with_p4(P4::key_info(index.key_sort_orders()))
                         .with_comment(index.name.clone()),
                 );
                 c
@@ -3818,7 +4488,7 @@ fn compile_single_table_select(
                     prog.emit(
                         Instruction::new(Opcode::OpenReadIndex, c, index.root_pgno as i32, 0)
                             .with_db(db_id)
-                            .with_p4(P4::KeyInfo(index.key_sort_orders()))
+                            .with_p4(P4::key_info(index.key_sort_orders()))
                             .with_comment(index.name.clone()),
                     );
                     c
@@ -3878,7 +4548,14 @@ fn compile_single_table_select(
     };
 
     // Evaluate full WHERE filter (also handles residual conjuncts after index/rowid seek!)
-    if let Some(w) = selection {
+    let selection_consumed_by_rowid_seek = matches!(plan, AccessPlan::RowidSeek { .. })
+        && selection.is_some_and(|w| {
+            extract_table_col_eq(w, tbl, schema_name, alias)
+                .is_some_and(|(cname, _)| is_rowid_or_ipk_name(tbl, &cname))
+        });
+    if let Some(w) = selection
+        && !selection_consumed_by_rowid_seek
+    {
         let cond_reg = prog.alloc_register();
         if compile_expr(&mut prog, w, Some(&binding), functions, cond_reg).is_err() {
             // If `WHERE` references a SELECT result-column alias, fall back to the relational engine
@@ -3971,12 +4648,9 @@ fn compile_single_table_select(
                 out_base + j as i32,
             )?;
         }
-        prog.emit(Instruction::new(
-            Opcode::ResultRow,
-            out_base,
-            expanded.len() as i32,
-            0,
-        ));
+        prog.emit(
+            Instruction::new(Opcode::ResultRow, out_base, expanded.len() as i32, 0).with_p5(1),
+        );
     }
 
     // Advance loop (`Next` / `IndexMatchNext` / single-shot `RowidSeek`)
@@ -4028,6 +4702,14 @@ fn compile_single_table_select(
         prog.emit(Instruction::new(Opcode::Close, tbl_cursor, 0, 0));
     }
 
+    let can_attach_point_plan = !tbl.without_rowid
+        && tbl.root_pgno > 0
+        && covering_binding.is_none()
+        && sorter_setup.is_none()
+        && limit.is_none()
+        && selection_consumed_by_rowid_seek
+        && !prog.has_function_call();
+
     // Drain Sorter if ORDER BY was present
     if let Some((s_cursor, sort_exprs)) = sorter_setup {
         let mut jumps_done = Vec::new();
@@ -4078,12 +4760,9 @@ fn compile_single_table_select(
                 out_base + j as i32,
             ));
         }
-        prog.emit(Instruction::new(
-            Opcode::ResultRow,
-            out_base,
-            expanded.len() as i32,
-            0,
-        ));
+        prog.emit(
+            Instruction::new(Opcode::ResultRow, out_base, expanded.len() as i32, 0).with_p5(1),
+        );
 
         let s_next_addr = prog.current_addr();
         for j in jumps_sorter_next {
@@ -4105,6 +4784,75 @@ fn compile_single_table_select(
 
     prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
     prog.patch_p2(init_addr, body_start);
+
+    if can_attach_point_plan && let AccessPlan::RowidSeek { ref key_expr } = plan {
+        let key_src = match key_expr {
+            Expr::Bind(bp) => {
+                let idx = match bp {
+                    BindParam::Anonymous(i) | BindParam::Numbered(i) | BindParam::Named(_, i) => *i,
+                };
+                u16::try_from(idx)
+                    .ok()
+                    .filter(|&p| p >= 1)
+                    .map(RowidKeySource::Param1Based)
+            }
+            Expr::Integer(v) => Some(RowidKeySource::ConstRowid(*v)),
+            _ => None,
+        };
+        if let Some(key) = key_src {
+            let mut proj_cols = Vec::with_capacity(expanded.len());
+            let mut all_simple = true;
+            for (pe, _, _) in &expanded {
+                let Expr::Column(cref) = pe else {
+                    all_simple = false;
+                    break;
+                };
+                if !cref_matches_single_table(cref, tbl, schema_name, alias) {
+                    all_simple = false;
+                    break;
+                }
+                if let Some((col_idx, col_schema)) = tbl.find_column(&cref.column) {
+                    if tbl.rowid_alias_col == Some(col_idx) {
+                        proj_cols.push(PointProjCol::Rowid);
+                    } else if col_schema.generated.is_some() {
+                        all_simple = false;
+                        break;
+                    } else {
+                        let phys_slot = tbl.physical_record_slot(col_idx);
+                        let Ok(ci_u16) = u16::try_from(phys_slot) else {
+                            all_simple = false;
+                            break;
+                        };
+                        let default_val = match col_schema.default_p4_for_table(tbl.strict) {
+                            P4::Int64(i) => Some(Value::Integer(i)),
+                            P4::Real(r) => Some(Value::real(r)),
+                            P4::Str(s) => Some(Value::Text(s)),
+                            P4::Blob(b) => Some(Value::Blob(b)),
+                            _ => None,
+                        };
+                        proj_cols.push(PointProjCol::Column {
+                            col_idx: ci_u16,
+                            default_val,
+                        });
+                    }
+                } else if tbl.is_implicit_rowid_name(&cref.column) {
+                    proj_cols.push(PointProjCol::Rowid);
+                } else {
+                    all_simple = false;
+                    break;
+                }
+            }
+            if all_simple {
+                prog.set_rowid_point_select(Some(RowidPointSelectPlan {
+                    db: db_id,
+                    root_pgno: tbl.root_pgno,
+                    key,
+                    cols: proj_cols,
+                }));
+            }
+        }
+    }
+
     Ok(Some(prog))
 }
 
@@ -5550,7 +6298,7 @@ fn compile_insert_explain_table(
         prog.emit(
             Instruction::new(Opcode::OpenWriteIndex, ic, idx.root_pgno as i32, 0)
                 .with_db(db_id)
-                .with_p4(P4::KeyInfo(idx.key_sort_orders()))
+                .with_p4(P4::key_info(idx.key_sort_orders()))
                 .with_comment(idx.name.clone()),
         );
         icurs.push((ic, idx));

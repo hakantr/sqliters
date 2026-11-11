@@ -700,7 +700,12 @@ impl Wal {
     }
 
     /// Ends the current WAL read snapshot (`sqlite3WalEndReadTransaction`, `wal.c:3409-3416`).
+    #[inline]
     pub fn end_read_transaction(&mut self) -> Result<()> {
+        if !self.write_lock && matches!(self.active_lock, ActiveShmLock::None) {
+            self.read_lock = None;
+            return Ok(());
+        }
         self.end_write_transaction()?;
         let prev = std::mem::replace(&mut self.active_lock, ActiveShmLock::None);
         let res = match prev {
@@ -762,11 +767,14 @@ impl Wal {
         }
 
         // Step A.1: `!use_wal` reads/recovers `WalIndexHdr` (or validates `b_shm_unreliable`).
+        let mut prefetched_ckpt: Option<WalCkptInfoSnapshot> = None;
         if !use_wal {
             if !self.b_shm_unreliable {
                 match self.wal_index_read_hdr(db_file, changed)? {
-                    TryBeginOutcome::Ok => {}
-                    TryBeginOutcome::Retry => return Ok(TryBeginOutcome::Retry),
+                    (TryBeginOutcome::Ok, snap) => {
+                        prefetched_ckpt = snap;
+                    }
+                    (TryBeginOutcome::Retry, _) => return Ok(TryBeginOutcome::Retry),
                 }
             }
             if self.b_shm_unreliable {
@@ -774,22 +782,28 @@ impl Wal {
             }
         }
 
-        let shm = self.ensure_shm_attached(db_file)?;
+        if self.shm.is_none() {
+            let _ = self.ensure_shm_attached(db_file)?;
+        }
+        let shm_ref = self.shm.as_ref().expect("shm attached");
         let ckpt_info = match &self.active_lock {
             ActiveShmLock::Writer(wg) => wg.read_ckpt_info()?,
-            _ => {
-                let Some((_, info)) = shm.try_read_header_and_ckpt_info()? else {
-                    return Ok(TryBeginOutcome::Retry);
-                };
-                info
-            }
+            _ => match prefetched_ckpt {
+                Some(info) => info,
+                None => {
+                    let Some((_, info)) = shm_ref.try_read_header_and_ckpt_info()? else {
+                        return Ok(TryBeginOutcome::Retry);
+                    };
+                    info
+                }
+            },
         };
 
         let exclusive_db = self.exclusive_mode == WalExclusiveMode::Exclusive;
 
         // Step A.2 (`!use_wal && nBackfill == hdr.mx_frame`): acquire `READ(0)` and re-verify header.
         if !use_wal && ckpt_info.n_backfill == self.hdr.mx_frame {
-            match WalShm::acquire_owned_read_slot_with_mark(&shm, 0, None, exclusive_db) {
+            match WalShm::acquire_owned_read_slot_with_mark(shm_ref, 0, None, exclusive_db) {
                 Ok(rg) => {
                     if !rg.verify_post_lock(None, &self.hdr)? {
                         rg.unlock()?;
@@ -832,7 +846,9 @@ impl Wal {
                     ActiveShmLock::Writer(wg) => {
                         wg.try_claim_positive_read_mark_under_write(slot, mx_frame)?
                     }
-                    ActiveShmLock::None => shm.try_claim_read_mark(slot, mx_frame, exclusive_db)?,
+                    ActiveShmLock::None => {
+                        shm_ref.try_claim_read_mark(slot, mx_frame, exclusive_db)?
+                    }
                     ActiveShmLock::Reader(_) => {
                         return Err(SqliteError::misuse(
                             "unexpected active Reader guard inside wal_try_begin_read",
@@ -863,7 +879,7 @@ impl Wal {
         let lock_res = match &mut self.active_lock {
             ActiveShmLock::Writer(wg) => wg.acquire_positive_read_slot_under_write(mx_i, None),
             ActiveShmLock::None => {
-                match WalShm::acquire_owned_read_slot_with_mark(&shm, mx_i, None, exclusive_db) {
+                match WalShm::acquire_owned_read_slot_with_mark(shm_ref, mx_i, None, exclusive_db) {
                     Ok(rg) => {
                         self.active_lock = ActiveShmLock::Reader(rg);
                         Ok(())
@@ -924,15 +940,22 @@ impl Wal {
         &mut self,
         db_file: &dyn VfsFile,
         changed: &mut bool,
-    ) -> Result<TryBeginOutcome> {
-        let shm = self.ensure_shm_attached(db_file)?;
-        match shm.try_read_header_and_ckpt_info() {
-            Ok(Some((live_hdr, _))) => {
+    ) -> Result<(TryBeginOutcome, Option<WalCkptInfoSnapshot>)> {
+        if self.shm.is_none() {
+            let _ = self.ensure_shm_attached(db_file)?;
+        }
+        let hdr_probe = self
+            .shm
+            .as_ref()
+            .expect("shm attached")
+            .try_read_header_and_ckpt_info();
+        match hdr_probe {
+            Ok(Some((live_hdr, ckpt_info))) => {
                 if !self.hdr_valid || live_hdr != self.hdr {
                     self.apply_loaded_header(live_hdr);
                     *changed = true;
                 }
-                return Ok(TryBeginOutcome::Ok);
+                return Ok((TryBeginOutcome::Ok, Some(ckpt_info)));
             }
             Ok(None) => {
                 // Header uninitialized or torn write; fall through to `badHdr` handling.
@@ -946,23 +969,25 @@ impl Wal {
                         if let Some(h) = self.heap_index.hdr {
                             self.apply_loaded_header(h);
                         }
-                        return Ok(TryBeginOutcome::Ok);
+                        return Ok((TryBeginOutcome::Ok, None));
                     }
                     Err(rec_err) => {
                         self.b_shm_unreliable = false;
                         self.heap_index = HeapWalIndex::default();
                         if rec_err.extended_code == extended::SQLITE_IOERR_SHORT_READ {
-                            return Ok(TryBeginOutcome::Retry);
+                            return Ok((TryBeginOutcome::Retry, None));
                         }
                         return Err(rec_err);
                     }
                 }
             }
             Err(e) if e.code == ErrorCode::Busy => {
-                return Ok(TryBeginOutcome::Retry);
+                return Ok((TryBeginOutcome::Retry, None));
             }
             Err(other) => return Err(other),
         }
+
+        let shm = self.ensure_shm_attached(db_file)?;
 
         // `badHdr == true` on reliable `-shm`.
         let shm_readonly = (self.read_only_flags & WAL_SHM_RDONLY) != 0;
@@ -972,7 +997,7 @@ impl Wal {
                     extended::SQLITE_READONLY_RECOVERY,
                     "cannot recover WAL-index on read-only shared memory",
                 )),
-                ReadonlyHeaderProbe::WriterActiveRetry => Ok(TryBeginOutcome::Retry),
+                ReadonlyHeaderProbe::WriterActiveRetry => Ok((TryBeginOutcome::Retry, None)),
                 ReadonlyHeaderProbe::BusyRecovery => Err(SqliteError::with_extended(
                     extended::SQLITE_BUSY_RECOVERY,
                     "database is being recovered by another process",
@@ -986,7 +1011,7 @@ impl Wal {
             Err(e) if e.code == ErrorCode::Busy => {
                 return match shm.probe_recover_lock()? {
                     ReadonlyHeaderProbe::WriterActiveRetry
-                    | ReadonlyHeaderProbe::ReadonlyRecovery => Ok(TryBeginOutcome::Retry),
+                    | ReadonlyHeaderProbe::ReadonlyRecovery => Ok((TryBeginOutcome::Retry, None)),
                     ReadonlyHeaderProbe::BusyRecovery => Err(SqliteError::with_extended(
                         extended::SQLITE_BUSY_RECOVERY,
                         "database is being recovered by another process",
@@ -996,12 +1021,14 @@ impl Wal {
             Err(other) => return Err(other),
         };
 
+        let mut post_ckpt: Option<WalCkptInfoSnapshot> = None;
         let res: Result<TryBeginOutcome> = match init_write.extend_and_try_read_header()? {
-            Some((live_hdr, _)) => {
+            Some((live_hdr, info)) => {
                 if !self.hdr_valid || live_hdr != self.hdr {
                     self.apply_loaded_header(live_hdr);
                     *changed = true;
                 }
+                post_ckpt = Some(info);
                 Ok(TryBeginOutcome::Ok)
             }
             None => {
@@ -1014,7 +1041,7 @@ impl Wal {
         let release_res = init_write.release();
         res?;
         release_res?;
-        Ok(TryBeginOutcome::Ok)
+        Ok((TryBeginOutcome::Ok, post_ckpt))
     }
 
     /// Validates private heap WAL-index under `SHARED WAL_READ_LOCK(0)` (`walBeginShmUnreliable`,
@@ -2140,8 +2167,8 @@ impl Wal {
             let mut is_changed = false;
             loop {
                 match self.wal_index_read_hdr(db_file, &mut is_changed)? {
-                    TryBeginOutcome::Ok => break,
-                    TryBeginOutcome::Retry => continue,
+                    (TryBeginOutcome::Ok, _) => break,
+                    (TryBeginOutcome::Retry, _) => continue,
                 }
             }
             let shm = self.ensure_shm_attached(db_file)?;

@@ -9,7 +9,7 @@
 use crate::error::{Result, SqliteError};
 
 /// Returns the encoded byte length (1..=9) of `v` as an SQLite varint.
-#[inline]
+#[inline(always)]
 pub const fn varint_len(v: u64) -> usize {
     if v <= 0x7f {
         1
@@ -35,17 +35,22 @@ pub const fn varint_len(v: u64) -> usize {
 /// Writes `v` as a 1..=9 byte SQLite varint into `out[0..]`, returning the number of bytes written.
 ///
 /// Panics if `out.len() < varint_len(v)`.
-#[inline]
-pub fn put_varint(out: &mut [u8], mut v: u64) -> usize {
+#[inline(always)]
+pub fn put_varint(out: &mut [u8], v: u64) -> usize {
     if v <= 0x7f {
-        out[0] = (v & 0x7f) as u8;
+        out[0] = v as u8;
         return 1;
     }
     if v <= 0x3fff {
-        out[0] = (((v >> 7) & 0x7f) | 0x80) as u8;
-        out[1] = (v & 0x7f) as u8;
+        out[0] = (((v >> 7) as u8) & 0x7f) | 0x80;
+        out[1] = (v as u8) & 0x7f;
         return 2;
     }
+    put_varint_slow(out, v)
+}
+
+#[inline(never)]
+fn put_varint_slow(out: &mut [u8], mut v: u64) -> usize {
     if (v & 0xff00_0000_0000_0000) != 0 {
         out[8] = (v & 0xff) as u8;
         v >>= 8;
@@ -71,10 +76,18 @@ pub fn put_varint(out: &mut [u8], mut v: u64) -> usize {
 }
 
 /// Appends `v` as an SQLite varint onto a `Vec<u8>`, returning the number of bytes written.
-#[inline]
+#[inline(always)]
 pub fn push_varint(out: &mut Vec<u8>, v: u64) -> usize {
+    if v <= 0x7f {
+        out.push(v as u8);
+        return 1;
+    }
+    if v <= 0x3fff {
+        out.extend_from_slice(&[(((v >> 7) as u8) & 0x7f) | 0x80, (v as u8) & 0x7f]);
+        return 2;
+    }
     let mut tmp = [0u8; 9];
-    let n = put_varint(&mut tmp, v);
+    let n = put_varint_slow(&mut tmp, v);
     out.extend_from_slice(&tmp[..n]);
     n
 }
@@ -82,7 +95,7 @@ pub fn push_varint(out: &mut Vec<u8>, v: u64) -> usize {
 /// Reads an SQLite varint from the beginning of `input`, returning `(value, bytes_read)`.
 ///
 /// Returns `ErrorCode::Corrupt` if `input` ends mid-varint.
-#[inline]
+#[inline(always)]
 pub fn get_varint(input: &[u8]) -> Result<(u64, usize)> {
     let Some(&b0) = input.first() else {
         return Err(SqliteError::corrupt("truncated varint (empty slice)"));
@@ -90,8 +103,19 @@ pub fn get_varint(input: &[u8]) -> Result<(u64, usize)> {
     if b0 < 0x80 {
         return Ok((u64::from(b0), 1));
     }
-    let mut val = u64::from(b0 & 0x7f);
-    for idx in 1..8 {
+    let Some(&b1) = input.get(1) else {
+        return Err(SqliteError::corrupt("truncated varint"));
+    };
+    let val = (u64::from(b0 & 0x7f) << 7) | u64::from(b1 & 0x7f);
+    if b1 < 0x80 {
+        return Ok((val, 2));
+    }
+    get_varint_slow(input, val)
+}
+
+#[inline(never)]
+fn get_varint_slow(input: &[u8], mut val: u64) -> Result<(u64, usize)> {
+    for idx in 2..8 {
         let Some(&b) = input.get(idx) else {
             return Err(SqliteError::corrupt("truncated varint"));
         };
@@ -108,13 +132,13 @@ pub fn get_varint(input: &[u8]) -> Result<(u64, usize)> {
 }
 
 /// Encodes a signed 64-bit integer (such as an SQLite `rowid`) as a varint.
-#[inline]
+#[inline(always)]
 pub fn put_varint_i64(out: &mut [u8], v: i64) -> usize {
     put_varint(out, v as u64)
 }
 
 /// Reads a signed 64-bit integer (such as an SQLite `rowid`) from a varint.
-#[inline]
+#[inline(always)]
 pub fn get_varint_i64(input: &[u8]) -> Result<(i64, usize)> {
     let (u, n) = get_varint(input)?;
     Ok((u as i64, n))

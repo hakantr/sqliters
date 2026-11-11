@@ -2,6 +2,9 @@
 //! and `sqlite/src/prepare.c`.
 #![forbid(unsafe_code)]
 
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
+
 use sqliters_btree::Btree;
 use sqliters_syntax::FkAction;
 use sqliters_syntax::{
@@ -728,7 +731,7 @@ pub struct VirtualTableDef {
 
 /// Complete in-memory catalog of tables, indexes, views, and triggers loaded from `sqlite_schema` (Page 1).
 #[derive(Debug, Clone, Default)]
-pub struct Schema {
+pub struct SchemaData {
     pub tables: Vec<TableSchema>,
     pub virtual_tables: Vec<VirtualTableDef>,
     pub indexes: Vec<IndexSchema>,
@@ -739,7 +742,32 @@ pub struct Schema {
     pub had_pages: bool,
 }
 
+/// Copy-on-write (`Arc`-backed) schema handle so `Schema::clone` and `snapshot_open_schemas`
+/// are O(1) atomic refcount increments on DML/query hot paths, cloning [`SchemaData`] only on DDL.
+#[derive(Debug, Clone, Default)]
+pub struct Schema(Arc<SchemaData>);
+
+impl Deref for Schema {
+    type Target = SchemaData;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Schema {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
 impl Schema {
+    #[inline]
+    pub fn from_data(data: SchemaData) -> Self {
+        Self(Arc::new(data))
+    }
     pub fn is_schema_table_name(name: &str) -> bool {
         name.eq_ignore_ascii_case("sqlite_schema")
             || name.eq_ignore_ascii_case("sqlite_master")
@@ -870,10 +898,27 @@ impl Schema {
 
     /// Re-binds all custom collation comparators on tables and indexes in this schema against `collations`.
     pub fn rebind_collations(&mut self, collations: &CollationRegistry) {
-        for tbl in &mut self.tables {
+        let has_custom = self.tables.iter().any(|t| {
+            t.without_rowid_pk_cols
+                .iter()
+                .any(|ic| ic.sort_order.custom_collation.is_some())
+        }) || self.indexes.iter().any(|idx| {
+            idx.columns
+                .iter()
+                .any(|ic| ic.sort_order.custom_collation.is_some())
+                || idx
+                    .trailing_pk_cols
+                    .iter()
+                    .any(|ic| ic.sort_order.custom_collation.is_some())
+        });
+        if !has_custom {
+            return;
+        }
+        let data = Arc::make_mut(&mut self.0);
+        for tbl in &mut data.tables {
             rebind_table_collations(tbl, collations);
         }
-        for idx in &mut self.indexes {
+        for idx in &mut data.indexes {
             rebind_index_collations(idx, collations);
         }
     }
@@ -917,7 +962,7 @@ impl Schema {
         }
 
         let res = if btree.pager().page_count() == 0 {
-            Ok(Self {
+            Ok(Self::from_data(SchemaData {
                 tables: Vec::new(),
                 virtual_tables: Vec::new(),
                 indexes: Vec::new(),
@@ -926,7 +971,7 @@ impl Schema {
                 schema_cookie: btree.pager().header().schema_cookie,
                 loaded: true,
                 had_pages: false,
-            })
+            }))
         } else {
             Self::load_inner(btree, db_schema_name)
         };
@@ -1317,7 +1362,7 @@ impl Schema {
             }
         }
 
-        let mut schema = Self {
+        let mut schema = Self::from_data(SchemaData {
             tables,
             virtual_tables,
             indexes,
@@ -1326,7 +1371,7 @@ impl Schema {
             schema_cookie: btree.pager().header().schema_cookie,
             loaded: true,
             had_pages: true,
-        };
+        });
         let _ = schema.reload_stat1(btree);
         Ok(schema)
     }
@@ -1334,20 +1379,30 @@ impl Schema {
     /// Reloads `sqlite_stat1` statistics from disk into `self.tables` and `self.indexes`
     /// (`sqlite3AnalysisLoad` / `analysisLoader` in `sqlite/src/analyze.c:1593-1701`).
     pub fn reload_stat1(&mut self, btree: &mut Btree) -> Result<()> {
-        for tbl in &mut self.tables {
-            tbl.stat1 = TableStat1::default();
-            tbl.without_rowid_pk_stat1 = None;
-        }
-        for idx in &mut self.indexes {
-            idx.stat1 = None;
-        }
-
-        let Some(stat_tbl) = self
+        let stat_tbl_opt = self
             .tables
             .iter()
             .find(|t| t.name.eq_ignore_ascii_case("sqlite_stat1"))
-            .cloned()
-        else {
+            .cloned();
+        let any_had_stat1 = self
+            .tables
+            .iter()
+            .any(|t| t.stat1.has_stat1 || t.without_rowid_pk_stat1.is_some())
+            || self.indexes.iter().any(|i| i.stat1.is_some());
+        if stat_tbl_opt.is_none() && !any_had_stat1 {
+            return Ok(());
+        }
+
+        let data = Arc::make_mut(&mut self.0);
+        for tbl in &mut data.tables {
+            tbl.stat1 = TableStat1::default();
+            tbl.without_rowid_pk_stat1 = None;
+        }
+        for idx in &mut data.indexes {
+            idx.stat1 = None;
+        }
+
+        let Some(stat_tbl) = stat_tbl_opt else {
             return Ok(());
         };
         if stat_tbl.root_pgno <= 1 {

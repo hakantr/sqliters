@@ -13,7 +13,7 @@ use std::cmp::Ordering;
 
 use crate::error::{Result, SqliteError};
 use crate::runtime_api::RuntimeValue;
-use crate::value::{Collation, CustomCollation, TextEncoding, Value};
+use crate::value::{Collation, CustomCollation, TextEncoding, Value, cmp_int_float};
 use crate::varint::{get_varint, push_varint, varint_len};
 
 const MAX_6BYTE_INT: u64 = (0x0000_8000_u64 << 32) - 1; // 140_737_488_355_327
@@ -71,8 +71,11 @@ pub fn serial_type_for_with_encoding(value: &Value, enc: TextEncoding) -> (u64, 
 }
 
 /// Returns the payload byte length corresponding to `serial_type` (`sqlite3VdbeSerialTypeLen`).
-#[inline]
+#[inline(always)]
 pub fn serial_type_len(serial_type: u64) -> Result<usize> {
+    if serial_type >= 12 {
+        return Ok(((serial_type - 12) >> 1) as usize);
+    }
     match serial_type {
         0 | 8 | 9 => Ok(0),
         1 => Ok(1),
@@ -81,10 +84,9 @@ pub fn serial_type_len(serial_type: u64) -> Result<usize> {
         4 => Ok(4),
         5 => Ok(6),
         6 | 7 => Ok(8),
-        10 | 11 => Err(SqliteError::corrupt(format!(
+        _ => Err(SqliteError::corrupt(format!(
             "reserved serial type {serial_type} encountered in record"
         ))),
-        n => Ok(((n - 12) / 2) as usize),
     }
 }
 
@@ -93,8 +95,10 @@ pub fn encode_record(values: &[Value]) -> Vec<u8> {
     encode_record_with_encoding(values, TextEncoding::Utf8)
 }
 
-/// Serializes a slice of [`Value`]s into an SQLite Format-3 record using `enc` (`OP_MakeRecord`).
-pub fn encode_record_with_encoding(values: &[Value], enc: TextEncoding) -> Vec<u8> {
+/// Serializes a slice of [`Value`]s into an SQLite Format-3 record using `enc` (`OP_MakeRecord`),
+/// reusing `out`'s existing allocation.
+pub fn encode_record_into(values: &[Value], enc: TextEncoding, out: &mut Vec<u8>) {
+    out.clear();
     if values.len() <= 16 {
         let mut serials = [0u64; 16];
         let mut serial_bytes_len = 0usize;
@@ -109,16 +113,16 @@ pub fn encode_record_with_encoding(values: &[Value], enc: TextEncoding) -> Vec<u
         if varint_len(hdr_len as u64) + serial_bytes_len != hdr_len {
             hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 2) as u64);
         }
-        let mut out = Vec::with_capacity(hdr_len + body_len);
-        push_varint(&mut out, hdr_len as u64);
+        out.reserve(hdr_len + body_len);
+        push_varint(out, hdr_len as u64);
         for &st in &serials[..values.len()] {
-            push_varint(&mut out, st);
+            push_varint(out, st);
         }
         debug_assert_eq!(out.len(), hdr_len);
         for (v, &st) in values.iter().zip(serials[..values.len()].iter()) {
-            write_serial_value(&mut out, v, st, enc);
+            write_serial_value(out, v, st, enc);
         }
-        return out;
+        return;
     }
 
     let mut serials = Vec::with_capacity(values.len());
@@ -139,23 +143,83 @@ pub fn encode_record_with_encoding(values: &[Value], enc: TextEncoding) -> Vec<u
         hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 2) as u64);
     }
 
-    let mut out = Vec::with_capacity(hdr_len + body_len);
-    push_varint(&mut out, hdr_len as u64);
+    out.reserve(hdr_len + body_len);
+    push_varint(out, hdr_len as u64);
     for st in &serials {
-        push_varint(&mut out, *st);
+        push_varint(out, *st);
     }
     debug_assert_eq!(out.len(), hdr_len);
 
     for (v, &st) in values.iter().zip(serials.iter()) {
-        write_serial_value(&mut out, v, st, enc);
+        write_serial_value(out, v, st, enc);
+    }
+}
+
+/// Serializes a slice of [`Value`] references into an SQLite Format-3 record using `enc`
+/// (`OP_MakeRecord`), reusing `out`'s existing allocation without cloning [`Value`]s.
+pub fn encode_value_refs_record_into(values: &[&Value], enc: TextEncoding, out: &mut Vec<u8>) {
+    out.clear();
+    if values.len() <= 16 {
+        let mut serials = [0u64; 16];
+        let mut serial_bytes_len = 0usize;
+        let mut body_len = 0usize;
+        for (i, &v) in values.iter().enumerate() {
+            let (st, len) = serial_type_for_with_encoding(v, enc);
+            serial_bytes_len += varint_len(st);
+            body_len += len;
+            serials[i] = st;
+        }
+        let mut hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 1) as u64);
+        if varint_len(hdr_len as u64) + serial_bytes_len != hdr_len {
+            hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 2) as u64);
+        }
+        out.reserve(hdr_len + body_len);
+        push_varint(out, hdr_len as u64);
+        for &st in &serials[..values.len()] {
+            push_varint(out, st);
+        }
+        debug_assert_eq!(out.len(), hdr_len);
+        for (&v, &st) in values.iter().zip(serials[..values.len()].iter()) {
+            write_serial_value(out, v, st, enc);
+        }
+        return;
     }
 
+    let mut serials = Vec::with_capacity(values.len());
+    let mut serial_bytes_len = 0usize;
+    let mut body_len = 0usize;
+    for &v in values {
+        let (st, len) = serial_type_for_with_encoding(v, enc);
+        serial_bytes_len += varint_len(st);
+        body_len += len;
+        serials.push(st);
+    }
+    let mut hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 1) as u64);
+    if varint_len(hdr_len as u64) + serial_bytes_len != hdr_len {
+        hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 2) as u64);
+    }
+    out.reserve(hdr_len + body_len);
+    push_varint(out, hdr_len as u64);
+    for st in &serials {
+        push_varint(out, *st);
+    }
+    debug_assert_eq!(out.len(), hdr_len);
+    for (&v, &st) in values.iter().zip(serials.iter()) {
+        write_serial_value(out, v, st, enc);
+    }
+}
+
+/// Serializes a slice of [`Value`]s into an SQLite Format-3 record using `enc` (`OP_MakeRecord`).
+pub fn encode_record_with_encoding(values: &[Value], enc: TextEncoding) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_record_into(values, enc, &mut out);
     out
 }
 
-/// Serializes a slice of [`RuntimeValue`] registers directly into an SQLite Format-3 record
+/// Serializes a slice of [`RuntimeValue`] registers directly into `out`, reusing `out`'s capacity
 /// without cloning intermediate [`Value`] elements (`OP_MakeRecord`).
-pub fn encode_runtime_record_with_encoding(values: &[RuntimeValue], enc: TextEncoding) -> Vec<u8> {
+pub fn encode_runtime_record_into(values: &[RuntimeValue], enc: TextEncoding, out: &mut Vec<u8>) {
+    out.clear();
     if values.len() <= 16 {
         let mut serials = [0u64; 16];
         let mut serial_bytes_len = 0usize;
@@ -170,16 +234,16 @@ pub fn encode_runtime_record_with_encoding(values: &[RuntimeValue], enc: TextEnc
         if varint_len(hdr_len as u64) + serial_bytes_len != hdr_len {
             hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 2) as u64);
         }
-        let mut out = Vec::with_capacity(hdr_len + body_len);
-        push_varint(&mut out, hdr_len as u64);
+        out.reserve(hdr_len + body_len);
+        push_varint(out, hdr_len as u64);
         for &st in &serials[..values.len()] {
-            push_varint(&mut out, st);
+            push_varint(out, st);
         }
         debug_assert_eq!(out.len(), hdr_len);
         for (rv, &st) in values.iter().zip(serials[..values.len()].iter()) {
-            write_serial_value(&mut out, &rv.value, st, enc);
+            write_serial_value(out, &rv.value, st, enc);
         }
-        return out;
+        return;
     }
 
     let mut serials = Vec::with_capacity(values.len());
@@ -195,15 +259,22 @@ pub fn encode_runtime_record_with_encoding(values: &[RuntimeValue], enc: TextEnc
     if varint_len(hdr_len as u64) + serial_bytes_len != hdr_len {
         hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 2) as u64);
     }
-    let mut out = Vec::with_capacity(hdr_len + body_len);
-    push_varint(&mut out, hdr_len as u64);
+    out.reserve(hdr_len + body_len);
+    push_varint(out, hdr_len as u64);
     for st in &serials {
-        push_varint(&mut out, *st);
+        push_varint(out, *st);
     }
     debug_assert_eq!(out.len(), hdr_len);
     for (rv, &st) in values.iter().zip(serials.iter()) {
-        write_serial_value(&mut out, &rv.value, st, enc);
+        write_serial_value(out, &rv.value, st, enc);
     }
+}
+
+/// Serializes a slice of [`RuntimeValue`] registers directly into an SQLite Format-3 record
+/// without cloning intermediate [`Value`] elements (`OP_MakeRecord`).
+pub fn encode_runtime_record_with_encoding(values: &[RuntimeValue], enc: TextEncoding) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_runtime_record_into(values, enc, &mut out);
     out
 }
 
@@ -282,6 +353,77 @@ pub fn decode_serial_value_with_encoding(
         ))),
         n if (n & 1) == 0 => Ok(Value::Blob(buf.to_vec())),
         _ => Ok(Value::Text(enc.decode_bytes(buf))),
+    }
+}
+
+/// Decodes a single value given its `serial_type` and exact byte slice under `enc`
+/// (`sqlite3VdbeSerialGet`), reusing recycled `String` / `Vec<u8>` allocations from `texts` / `blobs`
+/// when available.
+pub fn decode_serial_value_pooled(
+    serial_type: u64,
+    buf: &[u8],
+    enc: TextEncoding,
+    texts: &mut Vec<String>,
+    blobs: &mut Vec<Vec<u8>>,
+) -> Result<Value> {
+    match serial_type {
+        0 => Ok(Value::Null),
+        1 => Ok(Value::Integer(i64::from(buf[0] as i8))),
+        2 => {
+            let v = i16::from_be_bytes([buf[0], buf[1]]);
+            Ok(Value::Integer(i64::from(v)))
+        }
+        3 => {
+            let sign = if (buf[0] & 0x80) != 0 { 0xff } else { 0x00 };
+            let v = i32::from_be_bytes([sign, buf[0], buf[1], buf[2]]);
+            Ok(Value::Integer(i64::from(v)))
+        }
+        4 => {
+            let v = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            Ok(Value::Integer(i64::from(v)))
+        }
+        5 => {
+            let sign = if (buf[0] & 0x80) != 0 { 0xff } else { 0x00 };
+            let v =
+                i64::from_be_bytes([sign, sign, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]]);
+            Ok(Value::Integer(v))
+        }
+        6 => {
+            let v = i64::from_be_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]);
+            Ok(Value::Integer(v))
+        }
+        7 => {
+            let bits = u64::from_be_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]);
+            let r = f64::from_bits(bits);
+            Ok(Value::real(r))
+        }
+        8 => Ok(Value::Integer(0)),
+        9 => Ok(Value::Integer(1)),
+        10 | 11 => Err(SqliteError::corrupt(format!(
+            "reserved serial type {serial_type}"
+        ))),
+        n if (n & 1) == 0 => {
+            let mut b = blobs.pop().unwrap_or_default();
+            b.clear();
+            b.extend_from_slice(buf);
+            Ok(Value::Blob(b))
+        }
+        _ => match enc {
+            TextEncoding::Utf8 => match std::str::from_utf8(buf) {
+                Ok(s) => {
+                    let mut out_s = texts.pop().unwrap_or_default();
+                    out_s.clear();
+                    out_s.push_str(s);
+                    Ok(Value::Text(out_s))
+                }
+                Err(_) => Ok(Value::Text(String::from_utf8_lossy(buf).into_owned())),
+            },
+            _ => Ok(Value::Text(enc.decode_bytes(buf))),
+        },
     }
 }
 
@@ -526,6 +668,262 @@ pub fn compare_records_with_encoding(
     }
 
     Ok(decided)
+}
+
+#[derive(Clone, Copy)]
+enum RawField<'a> {
+    Null,
+    Int(i64),
+    Float(f64),
+    Text(&'a [u8]),
+    Blob(&'a [u8]),
+}
+
+impl<'a> RawField<'a> {
+    #[inline(always)]
+    fn from_serial(serial_type: u64, buf: &'a [u8]) -> Result<Self> {
+        match serial_type {
+            0 => Ok(Self::Null),
+            1 => Ok(Self::Int(i64::from(buf[0] as i8))),
+            2 => Ok(Self::Int(i64::from(i16::from_be_bytes([buf[0], buf[1]])))),
+            3 => {
+                let sign = if (buf[0] & 0x80) != 0 { 0xff } else { 0x00 };
+                Ok(Self::Int(i64::from(i32::from_be_bytes([
+                    sign, buf[0], buf[1], buf[2],
+                ]))))
+            }
+            4 => Ok(Self::Int(i64::from(i32::from_be_bytes([
+                buf[0], buf[1], buf[2], buf[3],
+            ])))),
+            5 => {
+                let sign = if (buf[0] & 0x80) != 0 { 0xff } else { 0x00 };
+                Ok(Self::Int(i64::from_be_bytes([
+                    sign, sign, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5],
+                ])))
+            }
+            6 => Ok(Self::Int(i64::from_be_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]))),
+            7 => {
+                let r = f64::from_bits(u64::from_be_bytes([
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                ]));
+                if r.is_nan() {
+                    Ok(Self::Null)
+                } else {
+                    Ok(Self::Float(r))
+                }
+            }
+            8 => Ok(Self::Int(0)),
+            9 => Ok(Self::Int(1)),
+            10 | 11 => Err(SqliteError::corrupt(format!(
+                "reserved serial type {serial_type}"
+            ))),
+            n if (n & 1) == 0 => Ok(Self::Blob(buf)),
+            _ => Ok(Self::Text(buf)),
+        }
+    }
+
+    #[inline(always)]
+    const fn class_rank(self) -> u8 {
+        match self {
+            Self::Null => 0,
+            Self::Int(_) | Self::Float(_) => 1,
+            Self::Text(_) => 2,
+            Self::Blob(_) => 3,
+        }
+    }
+}
+
+#[inline]
+fn compare_raw_fields(
+    lhs: RawField<'_>,
+    rhs: RawField<'_>,
+    spec: &KeySortOrder,
+    enc: TextEncoding,
+) -> Result<Ordering> {
+    match (lhs, rhs) {
+        (RawField::Null, RawField::Null) => return Ok(Ordering::Equal),
+        (RawField::Null, _) => {
+            return Ok(if spec.nulls_last {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            });
+        }
+        (_, RawField::Null) => {
+            return Ok(if spec.nulls_last {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            });
+        }
+        _ => {}
+    }
+
+    let ra = lhs.class_rank();
+    let rb = rhs.class_rank();
+    let raw = if ra != rb {
+        ra.cmp(&rb)
+    } else {
+        match (lhs, rhs) {
+            (RawField::Int(a), RawField::Int(b)) => a.cmp(&b),
+            (RawField::Float(a), RawField::Float(b)) => {
+                if a == 0.0 && b == 0.0 {
+                    Ordering::Equal
+                } else {
+                    a.total_cmp(&b)
+                }
+            }
+            (RawField::Int(i), RawField::Float(r)) => cmp_int_float(i, r),
+            (RawField::Float(r), RawField::Int(i)) => cmp_int_float(i, r).reverse(),
+            (RawField::Blob(a), RawField::Blob(b)) => a.cmp(b),
+            (RawField::Text(a), RawField::Text(b)) => {
+                if enc == TextEncoding::Utf8
+                    && let (Ok(sa), Ok(sb)) = (std::str::from_utf8(a), std::str::from_utf8(b))
+                {
+                    if let Some(ref cc) = spec.custom_collation {
+                        (cc.comparator)(sa, sb)?
+                    } else {
+                        spec.collation.compare_str_with_encoding(sa, sb, enc)
+                    }
+                } else {
+                    let sa = enc.decode_bytes(a);
+                    let sb = enc.decode_bytes(b);
+                    if let Some(ref cc) = spec.custom_collation {
+                        (cc.comparator)(&sa, &sb)?
+                    } else {
+                        spec.collation.compare_str_with_encoding(&sa, &sb, enc)
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+    };
+    Ok(if spec.desc { raw.reverse() } else { raw })
+}
+
+/// Compares two serialized SQLite records directly on raw byte slices without decoding into
+/// heap [`Value`] vectors (`sqlite3VdbeRecordCompare`).
+///
+/// Compares up to `min(lhs_cols, rhs_cols, max_fields.unwrap_or(usize::MAX))` columns.
+pub fn compare_raw_records_with_encoding(
+    lhs_record: &[u8],
+    rhs_record: &[u8],
+    max_fields: Option<usize>,
+    orders: &[KeySortOrder],
+    enc: TextEncoding,
+) -> Result<Ordering> {
+    if lhs_record.is_empty() || rhs_record.is_empty() {
+        return Ok(Ordering::Equal);
+    }
+    let (lhs_hdr_u64, mut lhs_hdr_pos) = get_varint(lhs_record)?;
+    let lhs_hdr_size = usize::try_from(lhs_hdr_u64)
+        .map_err(|_| SqliteError::corrupt("record header size overflow"))?;
+    if lhs_hdr_size > lhs_record.len() || lhs_hdr_pos > lhs_hdr_size {
+        return Err(SqliteError::corrupt("record header exceeds record length"));
+    }
+
+    let (rhs_hdr_u64, mut rhs_hdr_pos) = get_varint(rhs_record)?;
+    let rhs_hdr_size = usize::try_from(rhs_hdr_u64)
+        .map_err(|_| SqliteError::corrupt("record header size overflow"))?;
+    if rhs_hdr_size > rhs_record.len() || rhs_hdr_pos > rhs_hdr_size {
+        return Err(SqliteError::corrupt("record header exceeds record length"));
+    }
+
+    let mut lhs_body_pos = lhs_hdr_size;
+    let mut rhs_body_pos = rhs_hdr_size;
+    let mut col_idx = 0usize;
+    let limit = max_fields.unwrap_or(usize::MAX);
+    let default_spec = KeySortOrder::default();
+
+    while col_idx < limit && lhs_hdr_pos < lhs_hdr_size && rhs_hdr_pos < rhs_hdr_size {
+        let (st_a, used_a) = get_varint(&lhs_record[lhs_hdr_pos..lhs_hdr_size])?;
+        lhs_hdr_pos += used_a;
+        let len_a = serial_type_len(st_a)?;
+        let end_a = lhs_body_pos
+            .checked_add(len_a)
+            .ok_or_else(|| SqliteError::corrupt("record body offset overflow"))?;
+        if end_a > lhs_record.len() {
+            return Err(SqliteError::corrupt("record payload truncated"));
+        }
+
+        let (st_b, used_b) = get_varint(&rhs_record[rhs_hdr_pos..rhs_hdr_size])?;
+        rhs_hdr_pos += used_b;
+        let len_b = serial_type_len(st_b)?;
+        let end_b = rhs_body_pos
+            .checked_add(len_b)
+            .ok_or_else(|| SqliteError::corrupt("record body offset overflow"))?;
+        if end_b > rhs_record.len() {
+            return Err(SqliteError::corrupt("record payload truncated"));
+        }
+
+        let fa = RawField::from_serial(st_a, &lhs_record[lhs_body_pos..end_a])?;
+        let fb = RawField::from_serial(st_b, &rhs_record[rhs_body_pos..end_b])?;
+        let spec = orders.get(col_idx).unwrap_or(&default_spec);
+        let cmp = compare_raw_fields(fa, fb, spec, enc)?;
+        if cmp != Ordering::Equal {
+            return Ok(cmp);
+        }
+
+        lhs_body_pos = end_a;
+        rhs_body_pos = end_b;
+        col_idx += 1;
+    }
+
+    Ok(Ordering::Equal)
+}
+
+/// Returns `true` if any of the first `prefix_cols` fields of `record` is SQL `NULL`
+/// (or if `record` has fewer than `prefix_cols` fields).
+pub fn raw_record_prefix_has_null(record: &[u8], prefix_cols: usize) -> Result<bool> {
+    if prefix_cols == 0 {
+        return Ok(false);
+    }
+    if record.is_empty() {
+        return Ok(true);
+    }
+    let (hdr_u64, mut hdr_pos) = get_varint(record)?;
+    let hdr_size = usize::try_from(hdr_u64)
+        .map_err(|_| SqliteError::corrupt("record header size overflow"))?;
+    if hdr_size > record.len() || hdr_pos > hdr_size {
+        return Err(SqliteError::corrupt("record header exceeds record length"));
+    }
+    let mut body_pos = hdr_size;
+    for _ in 0..prefix_cols {
+        if hdr_pos >= hdr_size {
+            return Ok(true);
+        }
+        let (st, used) = get_varint(&record[hdr_pos..hdr_size])?;
+        hdr_pos += used;
+        let len = serial_type_len(st)?;
+        let end = body_pos
+            .checked_add(len)
+            .ok_or_else(|| SqliteError::corrupt("record body offset overflow"))?;
+        if end > record.len() {
+            return Err(SqliteError::corrupt("record payload truncated"));
+        }
+        if st == 0 {
+            return Ok(true);
+        }
+        if st == 7 {
+            let bits = u64::from_be_bytes([
+                record[body_pos],
+                record[body_pos + 1],
+                record[body_pos + 2],
+                record[body_pos + 3],
+                record[body_pos + 4],
+                record[body_pos + 5],
+                record[body_pos + 6],
+                record[body_pos + 7],
+            ]);
+            if f64::from_bits(bits).is_nan() {
+                return Ok(true);
+            }
+        }
+        body_pos = end;
+    }
+    Ok(false)
 }
 
 /// Stable fallible merge sort for slices whose comparator may return `Err(SqliteError)`
