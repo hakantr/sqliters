@@ -1757,6 +1757,7 @@ pub enum RawIndexInteriorStep {
 /// Binary-searches a raw `IndexInterior` (`0x02`) page against a serialized `record_bytes` key
 /// without decoding `record_bytes` into heap `Value`s, distinguishing child descent from exact
 /// divider hits.
+#[inline]
 pub fn probe_index_interior_step_raw(
     pgno: Pgno,
     usable_size: u32,
@@ -1765,6 +1766,23 @@ pub fn probe_index_interior_step_raw(
     orders: &[KeySortOrder],
     enc: TextEncoding,
 ) -> Result<Option<RawIndexInteriorStep>> {
+    Ok(
+        probe_index_interior_slot_raw(pgno, usable_size, raw, record_bytes, orders, enc)?
+            .map(|(step, _)| step),
+    )
+}
+
+/// [`probe_index_interior_step_raw`] that additionally reports the child-pointer slot taken:
+/// `0..n_cell` selects that cell's left child (or the divider cell itself for `EqualAt`), and
+/// `n_cell` selects the page's right-most child.
+pub fn probe_index_interior_slot_raw(
+    pgno: Pgno,
+    usable_size: u32,
+    raw: &[u8],
+    record_bytes: &[u8],
+    orders: &[KeySortOrder],
+    enc: TextEncoding,
+) -> Result<Option<(RawIndexInteriorStep, usize)>> {
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
     if hdr_off + 12 > usable || raw[hdr_off] != BtreePageType::IndexInterior as u8 {
@@ -1837,10 +1855,13 @@ pub fn probe_index_interior_step_raw(
                 if left_child == 0 {
                     return Ok(None);
                 }
-                return Ok(Some(RawIndexInteriorStep::EqualAt {
-                    cell_idx: mid,
-                    left_child,
-                }));
+                return Ok(Some((
+                    RawIndexInteriorStep::EqualAt {
+                        cell_idx: mid,
+                        left_child,
+                    },
+                    mid,
+                )));
             }
         }
     }
@@ -1858,7 +1879,7 @@ pub fn probe_index_interior_step_raw(
     if child == 0 {
         return Ok(None);
     }
-    Ok(Some(RawIndexInteriorStep::Child(child)))
+    Ok(Some((RawIndexInteriorStep::Child(child), lo)))
 }
 
 /// Binary-searches a raw `IndexInterior` (`0x02`) page against a serialized `record_bytes` key

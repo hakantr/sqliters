@@ -1093,6 +1093,46 @@ fn compare_raw_fields(
     Ok(if spec.desc { raw.reverse() } else { raw })
 }
 
+/// Body length of an integer serial type given as its (single) header byte, `None` for every
+/// other serial type (NULL, REAL, reserved, TEXT/BLOB, or the first byte of a multi-byte varint).
+#[inline(always)]
+const fn int_serial_len(st: u8) -> Option<usize> {
+    match st {
+        1 => Some(1),
+        2 => Some(2),
+        3 => Some(3),
+        4 => Some(4),
+        5 => Some(6),
+        6 => Some(8),
+        8 | 9 => Some(0),
+        _ => None,
+    }
+}
+
+/// Decodes the body of an integer serial type accepted by [`int_serial_len`]; `buf` has exactly
+/// that length. Mirrors the integer arms of [`RawField::from_serial`].
+#[inline(always)]
+fn read_int_serial(st: u8, buf: &[u8]) -> i64 {
+    match st {
+        1 => i64::from(buf[0] as i8),
+        2 => i64::from(i16::from_be_bytes([buf[0], buf[1]])),
+        3 => {
+            let sign = if (buf[0] & 0x80) != 0 { 0xff } else { 0x00 };
+            i64::from(i32::from_be_bytes([sign, buf[0], buf[1], buf[2]]))
+        }
+        4 => i64::from(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]])),
+        5 => {
+            let sign = if (buf[0] & 0x80) != 0 { 0xff } else { 0x00 };
+            i64::from_be_bytes([sign, sign, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]])
+        }
+        6 => i64::from_be_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]),
+        9 => 1,
+        _ => 0,
+    }
+}
+
 /// Compares two serialized SQLite records directly on raw byte slices without decoding into
 /// heap [`Value`] vectors (`sqlite3VdbeRecordCompare`).
 ///
@@ -1128,6 +1168,32 @@ pub fn compare_raw_records_with_encoding(
     let default_spec = KeySortOrder::default();
 
     while col_idx < limit && lhs_hdr_pos < lhs_hdr_size && rhs_hdr_pos < rhs_hdr_size {
+        // Fast path for the dominant key shape: both fields are integers (serial types 1..=6,
+        // 8, 9 — always a one-byte header varint). Same bounds checks and ordering as the general
+        // path below, minus the `RawField` round trip.
+        let st_a0 = lhs_record[lhs_hdr_pos];
+        let st_b0 = rhs_record[rhs_hdr_pos];
+        if let (Some(len_a), Some(len_b)) = (int_serial_len(st_a0), int_serial_len(st_b0)) {
+            let end_a = lhs_body_pos + len_a;
+            let end_b = rhs_body_pos + len_b;
+            if end_a > lhs_record.len() || end_b > rhs_record.len() {
+                return Err(SqliteError::corrupt("record payload truncated"));
+            }
+            let ia = read_int_serial(st_a0, &lhs_record[lhs_body_pos..end_a]);
+            let ib = read_int_serial(st_b0, &rhs_record[rhs_body_pos..end_b]);
+            if ia != ib {
+                let ord = ia.cmp(&ib);
+                let desc = orders.get(col_idx).is_some_and(|spec| spec.desc);
+                return Ok(if desc { ord.reverse() } else { ord });
+            }
+            lhs_hdr_pos += 1;
+            rhs_hdr_pos += 1;
+            lhs_body_pos = end_a;
+            rhs_body_pos = end_b;
+            col_idx += 1;
+            continue;
+        }
+
         let (st_a, used_a) = get_varint(&lhs_record[lhs_hdr_pos..lhs_hdr_size])?;
         lhs_hdr_pos += used_a;
         let len_a = serial_type_len(st_a)?;
@@ -1276,6 +1342,99 @@ where
 mod tests {
     use super::*;
     use crate::RuntimeValue;
+
+    /// The integer fast path of the raw comparator must agree with the decoded-value comparator
+    /// for every integer width, mixed classes, DESC columns, field limits and truncated bodies.
+    #[test]
+    fn raw_record_compare_int_fast_path_matches_value_compare() {
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        fn pick(state: &mut u64) -> Value {
+            let r = next(state);
+            let magnitudes: [i64; 12] = [
+                0,
+                1,
+                2,
+                127,
+                128,
+                32_767,
+                32_768,
+                8_388_607,
+                8_388_608,
+                2_147_483_648,
+                140_737_488_355_328,
+                i64::MAX,
+            ];
+            let m = magnitudes[(r % 12) as usize];
+            match (r >> 8) % 10 {
+                0 => Value::Null,
+                1 => Value::Real((m as f64) + 0.5),
+                2 => Value::Text(format!("t{}", m % 7)),
+                3 => Value::Blob(vec![(m % 5) as u8; (m % 3) as usize]),
+                4 | 5 => Value::Integer(-m - ((r >> 20) % 2) as i64),
+                _ => Value::Integer(m - ((r >> 20) % 3) as i64),
+            }
+        }
+
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let asc = KeySortOrder::default();
+        let desc = KeySortOrder {
+            desc: true,
+            ..KeySortOrder::default()
+        };
+        for round in 0..20_000 {
+            let n_a = (next(&mut seed) % 4) as usize + 1;
+            let n_b = (next(&mut seed) % 4) as usize + 1;
+            let a: Vec<Value> = (0..n_a).map(|_| pick(&mut seed)).collect();
+            let mut b: Vec<Value> = (0..n_b).map(|_| pick(&mut seed)).collect();
+            // Make long equal prefixes common so later fields decide.
+            for i in 0..n_a.min(n_b) {
+                if !next(&mut seed).is_multiple_of(3) {
+                    b[i] = a[i].clone();
+                }
+            }
+            let orders: Vec<KeySortOrder> = (0..4)
+                .map(|i| {
+                    if (round >> i) & 1 == 1 {
+                        desc.clone()
+                    } else {
+                        asc.clone()
+                    }
+                })
+                .collect();
+            let orders = &orders[..(round % 5).min(4)];
+            let ra = encode_record(&a);
+            let rb = encode_record(&b);
+            for max_fields in [None, Some(1), Some(2), Some(4)] {
+                let lim = max_fields.unwrap_or(usize::MAX).min(n_b);
+                let expect =
+                    compare_records_with_encoding(&ra, &b[..lim], orders, TextEncoding::Utf8)
+                        .unwrap();
+                let got = compare_raw_records_with_encoding(
+                    &ra,
+                    &rb,
+                    max_fields,
+                    orders,
+                    TextEncoding::Utf8,
+                )
+                .unwrap();
+                assert_eq!(got, expect, "{a:?} vs {b:?} max_fields={max_fields:?}");
+            }
+        }
+
+        // A truncated integer body is reported as corruption on either side.
+        let full = encode_record(&[Value::Integer(5), Value::Integer(70_000)]);
+        let cut = &full[..full.len() - 1];
+        for (l, r) in [(cut, full.as_slice()), (full.as_slice(), cut)] {
+            let err =
+                compare_raw_records_with_encoding(l, r, None, &[], TextEncoding::Utf8).unwrap_err();
+            assert_eq!(err.code, crate::ErrorCode::Corrupt);
+        }
+    }
 
     #[test]
     fn record_codec_never_persists_runtime_subtype() {

@@ -10461,6 +10461,93 @@ mod tests {
     use super::*;
     use sqliters_vfs::MemoryVfs;
 
+    /// Streaming aggregate plans over a non-covering index scan must visit rows in index order
+    /// (ascending groups, per-group rowid order here) and group `1` with `1.0`.
+    #[test]
+    fn fast_aggregate_over_non_covering_index_scan_and_mixed_numeric_group_keys() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE j(id INTEGER PRIMARY KEY, b, p, r REAL);
+             CREATE INDEX j_b ON j(b, id);
+             INSERT INTO j VALUES
+               (1, 1,    '{\"v\":1,\"a\":true}',     0.5),
+               (2, 1.0,  '{\"v\":2.5,\"a\":true}',   0.25),
+               (3, 0,    '{\"v\":\"7\",\"a\":false}', 1.0),
+               (4, NULL, '{\"v\":4,\"a\":true}',     2.0),
+               (5, 'x',  '{\"a\":true}',             3.0),
+               (6, 1,    jsonb('{\"v\":10,\"a\":1}'), 4.0),
+               (7, 0,    '{\"v\":3,\"a\":true}',     5.0);",
+        )
+        .unwrap();
+        let rows = |sql: &str| -> Vec<Vec<Value>> {
+            conn.query(sql, &[])
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(Row::into_values)
+                .collect()
+        };
+        let text = |s: &str| Value::Text(s.to_owned());
+
+        assert_eq!(
+            rows(
+                "SELECT b, count(*), sum(p ->> '$.v'), group_concat(id) FROM j \
+                  WHERE (p ->> '$.a') = 1 GROUP BY b ORDER BY b"
+            ),
+            vec![
+                vec![Value::Null, Value::Integer(1), Value::Integer(4), text("4")],
+                vec![
+                    Value::Integer(0),
+                    Value::Integer(1),
+                    Value::Integer(3),
+                    text("7")
+                ],
+                vec![
+                    Value::Integer(1),
+                    Value::Integer(3),
+                    Value::Real(13.5),
+                    text("1,2,6")
+                ],
+                vec![text("x"), Value::Integer(1), Value::Null, text("5")],
+            ]
+        );
+        let counts = vec![
+            vec![Value::Null, Value::Integer(1)],
+            vec![Value::Integer(0), Value::Integer(2)],
+            vec![Value::Integer(1), Value::Integer(3)],
+            vec![text("x"), Value::Integer(1)],
+        ];
+        assert_eq!(
+            rows("SELECT b, count(p) FROM j INDEXED BY j_b GROUP BY b"),
+            counts
+        );
+        assert_eq!(
+            rows("SELECT b, count(p) FROM j NOT INDEXED GROUP BY b ORDER BY b"),
+            counts
+        );
+        assert_eq!(
+            rows(
+                "SELECT count(*), sum(r), group_concat(id) FROM j INDEXED BY j_b \
+                  WHERE p IS NOT NULL"
+            ),
+            vec![vec![
+                Value::Integer(7),
+                Value::Real(15.75),
+                text("4,3,7,1,2,6,5")
+            ]]
+        );
+
+        conn.execute("INSERT INTO j VALUES (8, 0, '{\"v\":1,', 6.0)")
+            .unwrap();
+        let err = conn
+            .query(
+                "SELECT b, sum(p ->> '$.v') FROM j GROUP BY b ORDER BY b",
+                &[],
+            )
+            .unwrap_err();
+        assert_eq!(err.message, "malformed JSON");
+    }
+
     #[test]
     fn multi_db_attach_detach_temp_ddl_dml_tx_and_pragmas_smoke() {
         let vfs = Arc::new(MemoryVfs::new());

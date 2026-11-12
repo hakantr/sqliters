@@ -19,9 +19,9 @@ use sqliters_pager::{
 };
 use sqliters_types::{
     Bitvec, ErrorCode, KeySortOrder, Pgno, RawField, Result, SqliteError, TextEncoding, Value,
-    compare_raw_record_range, compare_records_with_encoding, decode_record_with_encoding,
-    decode_serial_value_with_encoding, extended, get_varint, get_varint_i64,
-    parse_raw_record_prefix, put_varint, serial_type_len, varint_len,
+    compare_raw_record_range, compare_raw_records_with_encoding, compare_records_with_encoding,
+    decode_record_with_encoding, decode_serial_value_with_encoding, extended, get_varint,
+    get_varint_i64, parse_raw_record_prefix, push_varint, put_varint, serial_type_len, varint_len,
 };
 use sqliters_vfs::{OpenFlags, Vfs};
 
@@ -39,11 +39,12 @@ pub use page::{
     find_index_interior_child_raw, find_table_interior_child,
     find_table_interior_child_append_hint, init_single_cell_table_leaf_raw, last_table_leaf_rowid,
     peek_page_type, probe_append_table_interior_rightmost, probe_delete_index_leaf_in_place,
-    probe_delete_index_leaf_raw, probe_index_interior_step_raw, probe_insert_index_leaf_in_place,
-    probe_insert_index_leaf_raw, probe_insert_table_leaf_raw, raw_cell_offset, raw_page_free_space,
-    raw_page_header, read_index_interior_cell, read_index_leaf_cell, read_table_interior_cell,
-    read_table_leaf_cell, read_table_leaf_rowid, seek_table_leaf_cell, table_interior_right_child,
-    try_delete_table_leaf_in_place, try_insert_table_leaf_in_place,
+    probe_delete_index_leaf_raw, probe_index_interior_slot_raw, probe_index_interior_step_raw,
+    probe_insert_index_leaf_in_place, probe_insert_index_leaf_raw, probe_insert_table_leaf_raw,
+    raw_cell_offset, raw_page_free_space, raw_page_header, read_index_interior_cell,
+    read_index_leaf_cell, read_table_interior_cell, read_table_leaf_cell, read_table_leaf_rowid,
+    seek_table_leaf_cell, table_interior_right_child, try_delete_table_leaf_in_place,
+    try_insert_table_leaf_in_place,
 };
 pub use ptrmap::{PtrmapType, RootPageMove, is_ptrmap_page, ptrmap_offset, ptrmap_pageno};
 
@@ -4400,6 +4401,16 @@ impl Btree {
         record_bytes: &[u8],
         orders: &[KeySortOrder],
     ) -> Result<()> {
+        self.insert_index_impl(root_pgno, record_bytes, orders, true)
+    }
+
+    fn insert_index_impl(
+        &mut self,
+        root_pgno: Pgno,
+        record_bytes: &[u8],
+        orders: &[KeySortOrder],
+        raw_balance: bool,
+    ) -> Result<()> {
         self.save_cursors_for_mutation(Some(root_pgno), None)?;
         let enc = self.encoding();
         let usable = self.pager.usable_size();
@@ -4411,6 +4422,13 @@ impl Btree {
         {
             let raw_mut = self.pager.write_page(leaf_pgno)?;
             apply_insert_index_leaf_raw(leaf_pgno, raw_mut, record_bytes, insert_idx, content_top);
+            return Ok(());
+        }
+
+        if raw_balance
+            && record_bytes.len() <= bounds.max_local as usize
+            && self.try_insert_index_balance_raw(root_pgno, usable, record_bytes, orders, enc)?
+        {
             return Ok(());
         }
 
@@ -4453,22 +4471,364 @@ impl Btree {
         if let Some((promoted_cell, right_pgno)) =
             self.insert_index_rec(root_pgno, leaf_cell, key_vals, orders)?
         {
-            let left_parsed = self.read_parsed_page(root_pgno)?;
-            let left_pgno = self.allocate_page()?;
-            self.write_parsed_page(left_pgno, &left_parsed)?;
-
-            let new_root = ParsedPage::IndexInterior {
-                cells: vec![IndexInteriorCell {
-                    left_child: left_pgno,
-                    total_payload_len: promoted_cell.total_payload_len,
-                    local_payload: promoted_cell.local_payload,
-                    overflow_page: promoted_cell.overflow_page,
-                }],
-                right_child: right_pgno,
-            };
-            self.write_parsed_page(root_pgno, &new_root)?;
+            self.grow_index_root(root_pgno, promoted_cell, right_pgno)?;
         }
         Ok(())
+    }
+
+    /// Deepens an Index B-Tree whose root just split: the root's (left-half) content moves to a
+    /// fresh page and the root becomes an interior page holding the single promoted divider.
+    fn grow_index_root(
+        &mut self,
+        root_pgno: Pgno,
+        promoted_cell: IndexLeafCell,
+        right_pgno: Pgno,
+    ) -> Result<()> {
+        let left_parsed = self.read_parsed_page(root_pgno)?;
+        let left_pgno = self.allocate_page()?;
+        self.write_parsed_page(left_pgno, &left_parsed)?;
+
+        let new_root = ParsedPage::IndexInterior {
+            cells: vec![IndexInteriorCell {
+                left_child: left_pgno,
+                total_payload_len: promoted_cell.total_payload_len,
+                local_payload: promoted_cell.local_payload,
+                overflow_page: promoted_cell.overflow_page,
+            }],
+            right_child: right_pgno,
+        };
+        self.write_parsed_page(root_pgno, &new_root)
+    }
+
+    /// Raw-byte counterpart of the leaf-level sibling rebalance in [`Self::insert_index_rec`] for
+    /// a non-overflow `record_bytes` whose target leaf is full.
+    ///
+    /// Descends on raw pages, gathers the cells of the (up to three) sibling leaves plus their
+    /// parent dividers as byte ranges of a scratch copy, redistributes them with the same
+    /// algorithm as [`balance_index_leaf_siblings`] and rewrites the leaves and the parent
+    /// directly, so no per-cell heap `Vec` is ever built. The resulting pages are byte-identical
+    /// to what the parsed path produces.
+    ///
+    /// Returns `Ok(false)` without touching any page whenever the shape is not provably handled
+    /// (auto-vacuum pointer maps, root leaf, duplicate key, overflow cells on the search path,
+    /// anything that looks malformed); the caller then runs the general parsed path.
+    ///
+    /// Kept out of line so the in-place insert fast path of [`Self::insert_index`] stays compact.
+    #[inline(never)]
+    fn try_insert_index_balance_raw(
+        &mut self,
+        root_pgno: Pgno,
+        usable: u32,
+        record_bytes: &[u8],
+        orders: &[KeySortOrder],
+        enc: TextEncoding,
+    ) -> Result<bool> {
+        if self.is_auto_vacuum() {
+            return Ok(false);
+        }
+        let usable_usize = usable as usize;
+        let bounds = PayloadBounds::for_index(usable);
+        let leaf_tag = BtreePageType::IndexLeaf as u8;
+        let interior_tag = BtreePageType::IndexInterior as u8;
+
+        // 1. Raw descent to the interior page whose child is the target leaf.
+        let mut path: Vec<(Pgno, usize)> = Vec::new();
+        let mut cur = root_pgno;
+        let (parent_pgno, idx, target_pgno) = loop {
+            if path.len() >= BTCURSOR_MAX_DEPTH || cur <= 1 {
+                return Ok(false);
+            }
+            let raw = self.pager.read_page(cur)?;
+            if raw.len() < usable_usize || raw[0] != interior_tag {
+                return Ok(false);
+            }
+            let Some((RawIndexInteriorStep::Child(child), slot)) =
+                probe_index_interior_slot_raw(cur, usable, raw, record_bytes, orders, enc)?
+            else {
+                return Ok(false);
+            };
+            if child <= 1 {
+                return Ok(false);
+            }
+            let child_raw = self.pager.read_page(child)?;
+            if child_raw.len() < usable_usize {
+                return Ok(false);
+            }
+            let child_tag = child_raw[0];
+            if child_tag == leaf_tag {
+                break (cur, slot, child);
+            }
+            if child_tag != interior_tag {
+                return Ok(false);
+            }
+            path.push((cur, slot));
+            cur = child;
+        };
+
+        // 2. Snapshot the parent and index its cells.
+        let new_cell_len = varint_len(record_bytes.len() as u64) + record_bytes.len();
+        let mut arena: Vec<u8> = Vec::with_capacity(4 * usable_usize + new_cell_len);
+        {
+            let raw = self.pager.read_page(parent_pgno)?;
+            arena.extend_from_slice(&raw[..usable_usize]);
+        }
+        let mut parent_cells: Vec<RawCellRef> = Vec::new();
+        let Some(m) =
+            collect_raw_index_cells(&arena, 0, usable_usize, true, bounds, &mut parent_cells)
+        else {
+            return Ok(false);
+        };
+        if m == 0 || idx > m {
+            return Ok(false);
+        }
+        let parent_right = u32::from_be_bytes([arena[8], arena[9], arena[10], arena[11]]);
+        let (nx_div, n_old) = if m < 2 {
+            (0usize, 2usize)
+        } else if idx == 0 {
+            (0usize, 3usize)
+        } else if idx == m {
+            (m - 2, 3usize)
+        } else {
+            (idx - 1, 3usize)
+        };
+        let mut sib_pgnos = [0 as Pgno; 3];
+        for (s, slot) in sib_pgnos.iter_mut().enumerate().take(n_old) {
+            let child_slot = nx_div + s;
+            let pg = if child_slot < m {
+                raw_cell_left_child(&arena, parent_cells[child_slot])
+            } else {
+                parent_right
+            };
+            if pg <= 1 || pg == parent_pgno {
+                return Ok(false);
+            }
+            *slot = pg;
+        }
+        let sibs = &sib_pgnos[..n_old];
+        if sibs[idx - nx_div] != target_pgno
+            || sibs[0] == sibs[1]
+            || (n_old == 3 && (sibs[0] == sibs[2] || sibs[1] == sibs[2]))
+        {
+            return Ok(false);
+        }
+
+        // 3. Gather `sibling cells, divider, sibling cells, ...` with the new cell in place.
+        let max_fields = if orders.is_empty() {
+            None
+        } else {
+            Some(orders.len())
+        };
+        let mut all: Vec<RawCellRef> = Vec::new();
+        for (s, &sib_pgno) in sibs.iter().enumerate() {
+            let base = arena.len();
+            {
+                let raw = self.pager.read_page(sib_pgno)?;
+                if raw.len() < usable_usize || raw[0] != leaf_tag {
+                    return Ok(false);
+                }
+                arena.extend_from_slice(&raw[..usable_usize]);
+            }
+            let first = all.len();
+            let Some(n_cell) =
+                collect_raw_index_cells(&arena, base, usable_usize, false, bounds, &mut all)
+            else {
+                return Ok(false);
+            };
+            if nx_div + s == idx {
+                let used: usize = all[first..].iter().map(|c| c.leaf_size() + 2).sum();
+                if 8 + used + new_cell_len.max(4) + 2 <= usable_usize {
+                    // Not actually full: the parsed path rewrites just this one leaf.
+                    return Ok(false);
+                }
+                let mut lo = 0usize;
+                let mut hi = n_cell;
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let Some(existing) = raw_leaf_cell_local_record(&arena, all[first + mid])
+                    else {
+                        return Ok(false);
+                    };
+                    match compare_raw_records_with_encoding(
+                        existing,
+                        record_bytes,
+                        max_fields,
+                        orders,
+                        enc,
+                    ) {
+                        Ok(Ordering::Less) => lo = mid + 1,
+                        Ok(Ordering::Greater) => hi = mid,
+                        Ok(Ordering::Equal) => return Ok(false),
+                        Err(e) if e.code == ErrorCode::Corrupt => return Ok(false),
+                        Err(e) => return Err(e),
+                    }
+                }
+                let off = arena.len();
+                push_varint(&mut arena, record_bytes.len() as u64);
+                arena.extend_from_slice(record_bytes);
+                all.insert(
+                    first + lo,
+                    RawCellRef {
+                        off: off as u32,
+                        len: new_cell_len as u32,
+                    },
+                );
+            }
+            if s + 1 < n_old {
+                all.push(parent_cells[nx_div + s].without_left_child());
+            }
+        }
+
+        // 4. Redistribute, and prove every new leaf fits before the first page is modified.
+        let cnt_new = index_leaf_balance_counts(all.len(), |i| all[i].leaf_size(), usable);
+        let k = cnt_new.len();
+        let mut start = 0usize;
+        for (j, &end) in cnt_new.iter().enumerate() {
+            if end < start || end > all.len() || (j + 1 < k && end >= all.len()) {
+                return Ok(false);
+            }
+            let need: usize = 8 + all[start..end]
+                .iter()
+                .map(|c| c.leaf_size() + 2)
+                .sum::<usize>();
+            if need > usable_usize {
+                return Ok(false);
+            }
+            start = if j + 1 < k { end + 1 } else { end };
+        }
+
+        let mut avail_pgnos: Vec<Pgno> = sibs.to_vec();
+        while avail_pgnos.len() < k {
+            avail_pgnos.push(self.allocate_page()?);
+        }
+        while avail_pgnos.len() > k {
+            let extra_pg = avail_pgnos.pop().expect("len > k");
+            self.free_page(extra_pg)?;
+        }
+        avail_pgnos.sort_unstable();
+
+        let mut start = 0usize;
+        for (j, &end) in cnt_new.iter().enumerate() {
+            let raw = self.pager.write_page(avail_pgnos[j])?;
+            write_raw_index_leaf(raw, usable_usize, &arena, &all[start..end]);
+            start = end + 1;
+        }
+
+        // 5. Splice the new dividers into the parent.
+        let mut new_parent: Vec<(Pgno, RawCellRef)> = Vec::with_capacity(m + 2);
+        for &c in &parent_cells[..nx_div] {
+            new_parent.push((raw_cell_left_child(&arena, c), c.without_left_child()));
+        }
+        for j in 0..k - 1 {
+            new_parent.push((avail_pgnos[j], all[cnt_new[j]]));
+        }
+        let mut new_right = parent_right;
+        if nx_div + n_old - 1 < m {
+            new_parent.push((
+                avail_pgnos[k - 1],
+                parent_cells[nx_div + n_old - 1].without_left_child(),
+            ));
+            for &c in &parent_cells[nx_div + n_old..] {
+                new_parent.push((raw_cell_left_child(&arena, c), c.without_left_child()));
+            }
+        } else {
+            new_right = avail_pgnos[k - 1];
+        }
+        let parent_need: usize = 12
+            + new_parent
+                .iter()
+                .map(|(_, c)| 4 + c.len as usize + 2)
+                .sum::<usize>();
+        if parent_need <= usable_usize {
+            let raw = self.pager.write_page(parent_pgno)?;
+            write_raw_index_interior(raw, usable_usize, &arena, &new_parent, new_right);
+            return Ok(true);
+        }
+
+        // Parent overflow (rare): split it and propagate upwards through the parsed helpers.
+        let mut cells: Vec<IndexInteriorCell> = Vec::with_capacity(new_parent.len());
+        for &(left_child, c) in &new_parent {
+            let body = &arena[c.off as usize..(c.off + c.len) as usize];
+            let (payload_u64, n1) = get_varint(body)?;
+            let total_payload_len = u32::try_from(payload_u64)
+                .map_err(|_| SqliteError::corrupt("index interior payload > 4GiB"))?;
+            let local_len = bounds.local_len(total_payload_len);
+            let overflow_page = if (local_len as u32) < total_payload_len {
+                let o = n1 + local_len;
+                Some(u32::from_be_bytes([
+                    body[o],
+                    body[o + 1],
+                    body[o + 2],
+                    body[o + 3],
+                ]))
+            } else {
+                None
+            };
+            cells.push(IndexInteriorCell {
+                left_child,
+                total_payload_len,
+                local_payload: body[n1..n1 + local_len].to_vec(),
+                overflow_page,
+            });
+        }
+        let mut carry = self.split_index_interior(parent_pgno, cells, new_right)?;
+        let mut child = parent_pgno;
+        while let Some((promoted, new_right_child)) = carry.take() {
+            let Some((anc_pgno, anc_idx)) = path.pop() else {
+                self.grow_index_root(root_pgno, promoted, new_right_child)?;
+                break;
+            };
+            carry = self.insert_index_divider_parsed(
+                anc_pgno,
+                anc_idx,
+                child,
+                promoted,
+                new_right_child,
+            )?;
+            child = anc_pgno;
+        }
+        Ok(true)
+    }
+
+    /// Records in interior page `pgno` that its child at slot `idx` (`target_child`) split into
+    /// `target_child | promoted | new_right_child`, splitting `pgno` in turn when it overflows.
+    fn insert_index_divider_parsed(
+        &mut self,
+        pgno: Pgno,
+        idx: usize,
+        target_child: Pgno,
+        promoted: IndexLeafCell,
+        new_right_child: Pgno,
+    ) -> Result<Option<(IndexLeafCell, Pgno)>> {
+        let usable = self.pager.usable_size();
+        let ParsedPage::IndexInterior {
+            mut cells,
+            mut right_child,
+        } = self.read_parsed_page(pgno)?
+        else {
+            return Err(SqliteError::corrupt("expected index page in insert_index"));
+        };
+        let divider = IndexInteriorCell {
+            left_child: target_child,
+            total_payload_len: promoted.total_payload_len,
+            local_payload: promoted.local_payload,
+            overflow_page: promoted.overflow_page,
+        };
+        if idx < cells.len() {
+            cells[idx].left_child = new_right_child;
+            cells.insert(idx, divider);
+        } else {
+            cells.push(divider);
+            right_child = new_right_child;
+        }
+        let candidate = ParsedPage::IndexInterior { cells, right_child };
+        if candidate.fits_in_page(pgno, usable) {
+            self.write_parsed_page(pgno, &candidate)?;
+            return Ok(None);
+        }
+        let ParsedPage::IndexInterior { cells, right_child } = candidate else {
+            unreachable!()
+        };
+        self.split_index_interior(pgno, cells, right_child)
     }
 
     fn probe_fast_index_insert_raw(
@@ -5928,20 +6288,159 @@ impl Btree {
     }
 }
 
-fn balance_index_leaf_siblings(
-    cells: Vec<IndexLeafCell>,
+/// Byte range of one serialized index cell inside a scratch arena. `len` is the unpadded cell
+/// length (`[left_child(4)] varint(payload) local_payload [overflow_pgno(4)]`).
+#[derive(Debug, Clone, Copy)]
+struct RawCellRef {
+    off: u32,
+    len: u32,
+}
+
+impl RawCellRef {
+    /// On-page footprint as a leaf cell (cells are padded to the 4-byte freeblock minimum).
+    #[inline]
+    fn leaf_size(self) -> usize {
+        (self.len as usize).max(4)
+    }
+
+    /// An interior cell minus its leading 4-byte left-child pointer, i.e. its leaf-cell form.
+    #[inline]
+    fn without_left_child(self) -> Self {
+        Self {
+            off: self.off + 4,
+            len: self.len - 4,
+        }
+    }
+}
+
+#[inline]
+fn raw_cell_left_child(arena: &[u8], cell: RawCellRef) -> Pgno {
+    let o = cell.off as usize;
+    u32::from_be_bytes([arena[o], arena[o + 1], arena[o + 2], arena[o + 3]])
+}
+
+/// Returns the record bytes of a leaf-form cell, or `None` when part of it lives on overflow
+/// pages (or the cell is malformed).
+#[inline]
+fn raw_leaf_cell_local_record(arena: &[u8], cell: RawCellRef) -> Option<&[u8]> {
+    let body = arena.get(cell.off as usize..(cell.off + cell.len) as usize)?;
+    let (payload_u64, n1) = get_varint(body).ok()?;
+    if payload_u64 != (body.len() - n1) as u64 {
+        return None;
+    }
+    Some(&body[n1..])
+}
+
+/// Appends a [`RawCellRef`] for every cell of the index page copied at `arena[base..base+usable]`
+/// (never page 1) and returns the cell count; `None` if any pointer or cell is out of bounds,
+/// mirroring the checks of [`ParsedPage::parse`].
+fn collect_raw_index_cells(
+    arena: &[u8],
+    base: usize,
+    usable: usize,
+    interior: bool,
+    bounds: PayloadBounds,
+    out: &mut Vec<RawCellRef>,
+) -> Option<usize> {
+    let page = arena.get(base..base + usable)?;
+    let (hdr, lead) = if interior { (12, 4) } else { (8, 0) };
+    if usable < hdr {
+        return None;
+    }
+    let n_cell = u16::from_be_bytes([page[3], page[4]]) as usize;
+    let ptr_end = hdr + 2 * n_cell;
+    if ptr_end > usable {
+        return None;
+    }
+    out.reserve(n_cell + 2);
+    for i in 0..n_cell {
+        let p = hdr + 2 * i;
+        let off = u16::from_be_bytes([page[p], page[p + 1]]) as usize;
+        if off < ptr_end || off >= usable {
+            return None;
+        }
+        let slice = &page[off..];
+        if slice.len() <= lead {
+            return None;
+        }
+        let (payload_u64, n1) = get_varint(&slice[lead..]).ok()?;
+        let total = u32::try_from(payload_u64).ok()?;
+        let local_len = bounds.local_len(total);
+        let ovfl = if (local_len as u32) < total { 4 } else { 0 };
+        let needed = lead + n1 + local_len + ovfl;
+        if needed > slice.len() {
+            return None;
+        }
+        out.push(RawCellRef {
+            off: (base + off) as u32,
+            len: needed as u32,
+        });
+    }
+    Some(n_cell)
+}
+
+/// Serializes `cells` as a clean `IndexLeaf` page (same layout as [`ParsedPage::write`]).
+/// The caller has verified that the cells fit.
+fn write_raw_index_leaf(raw: &mut [u8], usable: usize, arena: &[u8], cells: &[RawCellRef]) {
+    raw[..usable].fill(0);
+    let mut top = usable;
+    for (i, c) in cells.iter().enumerate() {
+        let len = c.len as usize;
+        top -= c.leaf_size();
+        raw[top..top + len].copy_from_slice(&arena[c.off as usize..c.off as usize + len]);
+        let p = 8 + 2 * i;
+        raw[p..p + 2].copy_from_slice(&(top as u16).to_be_bytes());
+    }
+    raw[0] = BtreePageType::IndexLeaf as u8;
+    raw[3..5].copy_from_slice(&(cells.len() as u16).to_be_bytes());
+    let encoded_top: u16 = if top == 65_536 { 0 } else { top as u16 };
+    raw[5..7].copy_from_slice(&encoded_top.to_be_bytes());
+}
+
+/// Serializes `(left_child, leaf-form cell)` pairs as a clean `IndexInterior` page (same layout
+/// as [`ParsedPage::write`]). The caller has verified that the cells fit.
+fn write_raw_index_interior(
+    raw: &mut [u8],
+    usable: usize,
+    arena: &[u8],
+    cells: &[(Pgno, RawCellRef)],
+    right_child: Pgno,
+) {
+    raw[..usable].fill(0);
+    raw[8..12].copy_from_slice(&right_child.to_be_bytes());
+    let mut top = usable;
+    for (i, &(left_child, c)) in cells.iter().enumerate() {
+        let len = c.len as usize;
+        top -= 4 + len;
+        raw[top..top + 4].copy_from_slice(&left_child.to_be_bytes());
+        raw[top + 4..top + 4 + len].copy_from_slice(&arena[c.off as usize..c.off as usize + len]);
+        let p = 12 + 2 * i;
+        raw[p..p + 2].copy_from_slice(&(top as u16).to_be_bytes());
+    }
+    raw[0] = BtreePageType::IndexInterior as u8;
+    raw[3..5].copy_from_slice(&(cells.len() as u16).to_be_bytes());
+    let encoded_top: u16 = if top == 65_536 { 0 } else { top as u16 };
+    raw[5..7].copy_from_slice(&encoded_top.to_be_bytes());
+}
+
+/// Distributes `n` index cells (leaf footprint `enc_size(i)`) over sibling leaves: element `i`
+/// of the result is the exclusive end of leaf `i`, the cell at that position (for every leaf but
+/// the last) becomes the parent divider, and the next leaf starts right after it.
+fn index_leaf_balance_counts<F: Fn(usize) -> usize>(
+    n: usize,
+    enc_size: F,
     usable: u32,
-) -> (Vec<Vec<IndexLeafCell>>, Vec<IndexLeafCell>) {
+) -> Vec<usize> {
     let usable_space = (usable as usize).saturating_sub(8);
     let mut cnt_new: Vec<usize> = Vec::with_capacity(5);
     let mut sz_new: Vec<usize> = Vec::with_capacity(5);
 
     let mut start = 0usize;
-    while start < cells.len() {
+    while start < n {
         let mut cur_sz = 0usize;
         let mut j = start;
-        while j < cells.len() {
-            let w = cells[j].encoded_size() + 2;
+        while j < n {
+            let w = enc_size(j) + 2;
             if j > start && cur_sz + w > usable_space {
                 break;
             }
@@ -5950,12 +6449,12 @@ fn balance_index_leaf_siblings(
         }
         cnt_new.push(j);
         sz_new.push(cur_sz);
-        if j == cells.len() {
+        if j == n {
             break;
         }
         start = j + 1;
-        if start == cells.len() {
-            cnt_new.push(cells.len());
+        if start == n {
+            cnt_new.push(n);
             sz_new.push(0);
             break;
         }
@@ -5970,8 +6469,8 @@ fn balance_index_leaf_siblings(
         let pad = if i == k - 1 { 0 } else { 2 };
         while d > min_left_start + 1 {
             let r = d - 1;
-            let sz_r = cells[r].encoded_size();
-            let sz_d = cells[d].encoded_size();
+            let sz_r = enc_size(r);
+            let sz_d = enc_size(d);
             if sz_right != 0
                 && (sz_right + sz_d + 2 > sz_left.saturating_sub(sz_r + pad)
                     || sz_right + sz_d + 2 > usable_space)
@@ -5986,6 +6485,15 @@ fn balance_index_leaf_siblings(
         sz_new[i] = sz_right;
         sz_new[i - 1] = sz_left;
     }
+    cnt_new
+}
+
+fn balance_index_leaf_siblings(
+    cells: Vec<IndexLeafCell>,
+    usable: u32,
+) -> (Vec<Vec<IndexLeafCell>>, Vec<IndexLeafCell>) {
+    let cnt_new = index_leaf_balance_counts(cells.len(), |i| cells[i].encoded_size(), usable);
+    let k = cnt_new.len();
 
     let mut chunks = Vec::with_capacity(k);
     let mut dividers = Vec::with_capacity(k.saturating_sub(1));
@@ -6214,6 +6722,102 @@ mod tests {
     use super::*;
     use sqliters_types::decode_record;
     use sqliters_types::encode_record;
+
+    /// The raw sibling rebalance must leave every page byte-identical to the parsed path, across
+    /// leaf splits, parent splits, root growth, short (padded) cells and overflow cells.
+    #[test]
+    fn test_index_raw_balance_matches_parsed_path_byte_for_byte() {
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+
+        for (page_size, n_rows, mode) in [
+            (512u32, 6_000i64, 0u8),
+            (512, 3_000, 1),
+            (1024, 6_000, 2),
+            (4096, 20_000, 0),
+            (4096, 6_000, 3),
+        ] {
+            let mut raw_bt = Btree::open_in_memory().unwrap();
+            let mut parsed_bt = Btree::open_in_memory().unwrap();
+            raw_bt.pager_mut().set_page_size(page_size).unwrap();
+            parsed_bt.pager_mut().set_page_size(page_size).unwrap();
+            raw_bt.begin_write().unwrap();
+            parsed_bt.begin_write().unwrap();
+            let raw_root = raw_bt.create_index().unwrap();
+            let parsed_root = parsed_bt.create_index().unwrap();
+            assert_eq!(raw_root, parsed_root);
+            let orders = [KeySortOrder::default(), KeySortOrder::default()];
+            let single = [KeySortOrder::default()];
+
+            let mut seed = 0x9E37_79B9_7F4A_7C15u64 ^ u64::from(page_size) ^ u64::from(mode);
+            for i in 1..=n_rows {
+                let r = next(&mut seed);
+                let (rec, ord): (Vec<u8>, &[KeySortOrder]) = match mode {
+                    // Small `(bucket, rowid)` keys arriving in non-monotonic order.
+                    0 => (
+                        encode_record(&[Value::Integer((r % 25) as i64), Value::Integer(i)]),
+                        &orders,
+                    ),
+                    // Variable-width text keys, some spilling onto overflow pages.
+                    1 => {
+                        let len = if r.is_multiple_of(23) {
+                            700
+                        } else {
+                            (r % 40) as usize
+                        };
+                        let text: String = (0..len)
+                            .map(|j| char::from(b'a' + ((r >> (j % 48)) % 26) as u8))
+                            .collect();
+                        (
+                            encode_record(&[Value::Text(text), Value::Integer(i)]),
+                            &orders,
+                        )
+                    }
+                    // Single-column keys with many 2- and 3-byte (padded) cells and duplicates,
+                    // which exercise the replace/equal fallbacks.
+                    2 => (
+                        encode_record(&[Value::Integer((r % 3_000) as i64)]),
+                        &single,
+                    ),
+                    // Descending-ish arrival.
+                    _ => (
+                        encode_record(&[
+                            Value::Integer(n_rows - i + (r % 7) as i64),
+                            Value::Integer(i),
+                        ]),
+                        &orders,
+                    ),
+                };
+                raw_bt.insert_index(raw_root, &rec, ord).unwrap();
+                parsed_bt
+                    .insert_index_impl(parsed_root, &rec, ord, false)
+                    .unwrap();
+            }
+
+            let n_pages = raw_bt.pager().page_count();
+            assert_eq!(n_pages, parsed_bt.pager().page_count());
+            assert!(
+                n_pages > 8,
+                "expected a multi-level tree, got {n_pages} pages"
+            );
+            for pgno in 1..=n_pages {
+                let a = raw_bt.pager_mut().read_page(pgno).unwrap().to_vec();
+                let b = parsed_bt.pager_mut().read_page(pgno).unwrap().to_vec();
+                assert!(
+                    a == b,
+                    "page {pgno} differs (page_size {page_size}, mode {mode})"
+                );
+            }
+            assert_eq!(
+                raw_bt.integrity_check(&[1, raw_root]).unwrap(),
+                Vec::<String>::new()
+            );
+        }
+    }
 
     #[test]
     fn test_btree_multi_page_splits_overflows_deletes_and_integrity() {

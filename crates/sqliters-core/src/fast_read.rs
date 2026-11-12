@@ -2424,6 +2424,12 @@ enum FastSingleAccess {
         lower: Option<FastRangeBound>,
         upper: Option<FastRangeBound>,
     },
+    /// Non-covering full index scan: visits table rows in index order by looking each index
+    /// entry's trailing rowid (record field `rid_field_pos`) up in the table B+Tree.
+    IndexOrderedTableLookup {
+        index_root: Pgno,
+        rid_field_pos: usize,
+    },
 }
 
 #[inline]
@@ -2729,7 +2735,66 @@ where
                 },
             )
         }
+        FastSingleAccess::IndexOrderedTableLookup {
+            index_root,
+            rid_field_pos,
+        } => scan_index_ordered_table_rows(bt, td, *index_root, *rid_field_pos, &mut visit),
     }
+}
+
+/// Type-erased per-row callback of [`scan_single_table_rows`]: `(rowid, table columns)`.
+type RowVisitor<'v> = dyn FnMut(i64, &[RawField<'_>]) -> Result<ControlFlow<()>> + 'v;
+
+/// Non-covering full index scan: collects the rowids in index order, then visits each table row.
+/// Kept out of line (and behind `dyn`) so the hot scan arms above keep their codegen.
+#[inline(never)]
+fn scan_index_ordered_table_rows(
+    bt: &mut Btree,
+    td: &FastTableDesc,
+    index_root: Pgno,
+    rid_pos: usize,
+    visit: &mut RowVisitor<'_>,
+) -> Result<()> {
+    let col_buf_len = if td.needs_record_parse {
+        td.max_record_col + 1
+    } else {
+        0
+    };
+    let mut rowids: Vec<i64> = Vec::new();
+    bt.scan_index_raw_cells(index_root, false, |cell| {
+        let mut idx_local: [RawField<'_>; 16] = [RawField::Null; 16];
+        let mut idx_heap: Vec<RawField<'_>>;
+        let fields: &mut [RawField<'_>] = if rid_pos < 16 {
+            &mut idx_local[..rid_pos + 1]
+        } else {
+            idx_heap = vec![RawField::Null; rid_pos + 1];
+            &mut idx_heap
+        };
+        let n = parse_raw_record_prefix(cell, fields)?;
+        if rid_pos < n
+            && let RawField::Int(rid) = fields[rid_pos]
+        {
+            rowids.push(rid);
+        }
+        Ok(ControlFlow::Continue(()))
+    })?;
+    for rid in rowids {
+        let flow = bt.with_table_rowid_raw_cell(td.root_pgno, rid, |payload| {
+            let mut local_cols: [RawField<'_>; 16] = [RawField::Null; 16];
+            if col_buf_len <= 16 {
+                td.fill_from_table_payload(payload, &mut local_cols[..col_buf_len])?;
+                visit(rid, &local_cols[..col_buf_len])
+            } else {
+                let mut heap_cols = vec![RawField::Null; col_buf_len];
+                td.fill_from_table_payload(payload, &mut heap_cols)?;
+                visit(rid, &heap_cols)
+            }
+        })?;
+        if matches!(flow, Some(ControlFlow::Break(()))) {
+            break;
+        }
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -3107,10 +3172,17 @@ impl HashGroupByPlan {
                 return Ok(ControlFlow::Continue(()));
             }
             let gk_raw = ctx.get_col(self.group_col);
-            let grp_idx: usize = if let RawField::Int(iv) = gk_raw
-                && (0..256).contains(&iv)
-            {
-                let slot = &mut dense_slots[iv as usize];
+            // Small integral keys take the dense table; an integral REAL (`1.0`) must land in the
+            // same group as the equal INTEGER (`1`), exactly like the hashed path below.
+            let dense_key: Option<usize> = match gk_raw {
+                RawField::Int(iv) if (0..256).contains(&iv) => Some(iv as usize),
+                RawField::Float(fv) if (0.0..256.0).contains(&fv) && fv.fract() == 0.0 => {
+                    Some(fv as usize)
+                }
+                _ => None,
+            };
+            let grp_idx: usize = if let Some(dk) = dense_key {
+                let slot = &mut dense_slots[dk];
                 if *slot == u32::MAX {
                     let idx = groups.len();
                     let init_states = self
@@ -3118,7 +3190,7 @@ impl HashGroupByPlan {
                         .iter()
                         .map(|s| FastAggState::from_spec(s, enc))
                         .collect();
-                    groups.push((Value::Integer(iv), init_states));
+                    groups.push((gk_raw.to_owned_value(enc), init_states));
                     *slot = idx as u32;
                     idx
                 } else {
@@ -4944,6 +5016,33 @@ fn compile_fast_single_access(
     }
 }
 
+/// [`compile_fast_single_access`] for single-table aggregate plans, which can additionally run a
+/// non-covering full index scan (the planner picks one to feed `GROUP BY`/`ORDER BY` in index
+/// order) as an index-ordered rowid lookup: rows reach the aggregates in exactly the order the
+/// generic executor materializes them.
+fn compile_fast_agg_access(
+    ap: &AccessPlan,
+    tbl: &TableSchema,
+    td: &FastTableDesc,
+    exact_cols: &[bool],
+    needs_rowid: bool,
+) -> Option<FastSingleAccess> {
+    if let AccessPlan::IndexFullScan {
+        index,
+        is_covering: false,
+    } = ap
+    {
+        if tbl.without_rowid || index.root_pgno == tbl.root_pgno {
+            return None;
+        }
+        return Some(FastSingleAccess::IndexOrderedTableLookup {
+            index_root: index.root_pgno,
+            rid_field_pos: index.columns.len(),
+        });
+    }
+    compile_fast_single_access(ap, tbl, td, exact_cols, needs_rowid)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compile_group_sort_specs(
     order_by: &[OrderByTerm],
@@ -5095,7 +5194,7 @@ fn try_compile_single_table_core(
             &slot_schema,
             qctx,
         );
-        let access = compile_fast_single_access(&ap, tbl, &td, &exact_cols, needs_rowid)?;
+        let access = compile_fast_agg_access(&ap, tbl, &td, &exact_cols, needs_rowid)?;
 
         return Some(FastReadPlan {
             db_id,
@@ -5266,7 +5365,31 @@ fn try_compile_single_table_core(
             &slot_schema,
             qctx,
         );
-        let access = compile_fast_single_access(&ap, tbl, &td, &exact_cols, needs_rowid)?;
+        if let AccessPlan::IndexFullScan {
+            index,
+            is_covering: false,
+        } = &ap
+        {
+            // The hash plan emits groups in first-seen order. Walking the index is only
+            // equivalent to the generic sorter-based grouping when that order is ascending
+            // group-key order, i.e. the index leads with the group column itself.
+            let leads_with_group_col = index.columns.first().is_some_and(|ic| {
+                ic.expr.is_none()
+                    && matches!(
+                        gb_rc.src,
+                        FastColSrc::RecordCol { col_idx, .. }
+                            if ic.col_idx == Some(col_idx as usize)
+                    )
+                    && ic.sort_order.custom_collation.is_none()
+                    && ic.sort_order.collation == gb_coll
+                    && !ic.sort_order.desc
+                    && !ic.sort_order.nulls_last
+            });
+            if !leads_with_group_col {
+                return None;
+            }
+        }
+        let access = compile_fast_agg_access(&ap, tbl, &td, &exact_cols, needs_rowid)?;
         return Some(FastReadPlan {
             db_id,
             column_names: col_names,

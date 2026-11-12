@@ -688,6 +688,16 @@ impl<'a, 'b> TextParser<'a, 'b> {
         }
     }
 
+    /// [`Self::skip_ws_and_comments`] with the overwhelmingly common "already at a token" case
+    /// answered inline: any ASCII byte above space other than `/` ends the skip immediately.
+    #[inline(always)]
+    fn skip_ws(&mut self, i: usize) -> std::result::Result<usize, JsonTextParseError> {
+        match self.bytes.get(i) {
+            Some(&c) if c > b' ' && c < 0x80 && c != b'/' => Ok(i),
+            _ => self.skip_ws_and_comments(i),
+        }
+    }
+
     fn skip_ws_and_comments(
         &mut self,
         mut i: usize,
@@ -900,7 +910,7 @@ impl<'a, 'b> TextParser<'a, 'b> {
     }
 
     fn parse_value(&mut self, start: usize) -> std::result::Result<usize, JsonTextParseError> {
-        let i = self.skip_ws_and_comments(start)?;
+        let i = self.skip_ws(start)?;
         if i >= self.bytes.len() {
             return Err(self.err(i));
         }
@@ -913,7 +923,7 @@ impl<'a, 'b> TextParser<'a, 'b> {
                         too_deep: true,
                     });
                 }
-                let mut j = self.skip_ws_and_comments(i + 1)?;
+                let mut j = self.skip_ws(i + 1)?;
                 if j < self.bytes.len() && self.bytes[j] == b'}' {
                     self.depth -= 1;
                     jsonb_append_node(self.out, JSONB_OBJECT, &[]);
@@ -923,7 +933,7 @@ impl<'a, 'b> TextParser<'a, 'b> {
                 self.out.extend_from_slice(&[0, 0]);
                 let res = (|| -> std::result::Result<usize, JsonTextParseError> {
                     loop {
-                        j = self.skip_ws_and_comments(j)?;
+                        j = self.skip_ws(j)?;
                         if j >= self.bytes.len() {
                             return Err(self.err(j));
                         }
@@ -932,17 +942,17 @@ impl<'a, 'b> TextParser<'a, 'b> {
                         } else {
                             j = self.parse_unquoted_key(j)?;
                         }
-                        j = self.skip_ws_and_comments(j)?;
+                        j = self.skip_ws(j)?;
                         if j >= self.bytes.len() || self.bytes[j] != b':' {
                             return Err(self.err(j));
                         }
                         j = self.parse_value(j + 1)?;
-                        j = self.skip_ws_and_comments(j)?;
+                        j = self.skip_ws(j)?;
                         if j >= self.bytes.len() {
                             return Err(self.err(j));
                         }
                         if self.bytes[j] == b',' {
-                            let after_comma = self.skip_ws_and_comments(j + 1)?;
+                            let after_comma = self.skip_ws(j + 1)?;
                             if after_comma < self.bytes.len() && self.bytes[after_comma] == b'}' {
                                 self.has_nonstd = true;
                                 return Ok(after_comma + 1);
@@ -975,7 +985,7 @@ impl<'a, 'b> TextParser<'a, 'b> {
                         too_deep: true,
                     });
                 }
-                let mut j = self.skip_ws_and_comments(i + 1)?;
+                let mut j = self.skip_ws(i + 1)?;
                 if j < self.bytes.len() && self.bytes[j] == b']' {
                     self.depth -= 1;
                     jsonb_append_node(self.out, JSONB_ARRAY, &[]);
@@ -986,12 +996,12 @@ impl<'a, 'b> TextParser<'a, 'b> {
                 let res = (|| -> std::result::Result<usize, JsonTextParseError> {
                     loop {
                         j = self.parse_value(j)?;
-                        j = self.skip_ws_and_comments(j)?;
+                        j = self.skip_ws(j)?;
                         if j >= self.bytes.len() {
                             return Err(self.err(j));
                         }
                         if self.bytes[j] == b',' {
-                            let after_comma = self.skip_ws_and_comments(j + 1)?;
+                            let after_comma = self.skip_ws(j + 1)?;
                             if after_comma < self.bytes.len() && self.bytes[after_comma] == b']' {
                                 self.has_nonstd = true;
                                 return Ok(after_comma + 1);
@@ -1228,7 +1238,7 @@ pub fn parse_json_text_to_jsonb_into(
 ) -> std::result::Result<bool, JsonTextParseError> {
     let mut parser = TextParser::new(src, out);
     let end = parser.parse_value(0)?;
-    let tail = parser.skip_ws_and_comments(end)?;
+    let tail = parser.skip_ws(end)?;
     if tail != parser.bytes.len() {
         return Err(parser.err(tail));
     }
