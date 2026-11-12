@@ -11741,4 +11741,530 @@ mod tests {
             Some(3)
         );
     }
+
+    /// The R-Tree module mutates cached nodes in place, keeps a cached bounding box per node and
+    /// undoes failed statements / savepoints from small undo records. The tree that leaves
+    /// behind must be the tree a cold cache computes.
+    ///
+    /// Connection `warm` runs every batch of statements inside one transaction (the cache stays
+    /// dirty, so the in-place / incremental paths do all the work). Connection `cold` runs the
+    /// same statements but reads a shadow table directly after each one, which flushes the
+    /// module and drops its cache: every statement there starts from freshly decoded nodes.
+    /// Each statement must have the same outcome on both; after each batch the two trees must
+    /// be the same tree (same cells in the same order in every node, walking down from the
+    /// root; node numbers are not compared because the number given to a new node depends on
+    /// whether a node deleted by the same statement has reached the shadow table yet) and the
+    /// rowid table must hold the same rows, `rtreecheck` must pass, a failed statement must
+    /// leave the table as it was, and bounding-box aggregates (prepared once, re-bound every
+    /// time) must equal a brute-force evaluation over the table's rows.
+    #[test]
+    fn rtree_warm_cache_tree_matches_cold_cache_tree() {
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        type Outcome = std::result::Result<Vec<Vec<Value>>, (i32, String)>;
+        fn run(stmt: &mut Statement, params: &[Value]) -> Outcome {
+            for (i, p) in params.iter().enumerate() {
+                stmt.bind(i + 1, p.clone()).unwrap();
+            }
+            let mut rows = Vec::new();
+            let res = loop {
+                match stmt.step() {
+                    Ok(StepResult::Row(row)) => rows.push(row.into_values()),
+                    Ok(StepResult::Done) => break Ok(rows),
+                    Err(e) => break Err((e.extended_code, e.to_string())),
+                }
+            };
+            stmt.reset().ok();
+            res
+        }
+        fn num(v: &Value) -> f64 {
+            match v {
+                Value::Integer(i) => *i as f64,
+                Value::Real(r) => *r,
+                other => panic!("non-numeric coordinate {other:?}"),
+            }
+        }
+        /// One box: `2 * n_dim` coordinate values (`bad`: first dimension has min > max).
+        fn coords(state: &mut u64, n_dim: usize, span: u64, bad: bool) -> Vec<Value> {
+            let mut out = Vec::with_capacity(n_dim * 2);
+            for d in 0..n_dim {
+                let r = next(state);
+                let lo = ((r >> 8) % span) as i64;
+                let w = match (r >> 40) % 8 {
+                    0 | 1 => 0,
+                    2 | 3 => 1,
+                    4 => 7,
+                    5 => (span / 16) as i64,
+                    6 => (span / 4) as i64,
+                    _ => 3,
+                };
+                let (lo, hi) = if bad && d == 0 {
+                    (lo + w + 5, lo)
+                } else {
+                    (lo, lo + w)
+                };
+                if (r >> 52).is_multiple_of(4) {
+                    out.push(Value::Real(lo as f64 + 0.25));
+                    out.push(Value::Real(hi as f64 + 0.75));
+                } else if (r >> 52) % 4 == 1 {
+                    out.push(Value::Real(lo as f64));
+                    out.push(Value::Integer(hi));
+                } else {
+                    out.push(Value::Integer(lo));
+                    out.push(Value::Integer(hi));
+                }
+            }
+            out
+        }
+
+        /// The tree as (level, cell bytes) in depth-first cell order; child pointers left out.
+        fn tree_shape(conn: &Connection, n_dim: usize) -> Vec<(u16, Vec<u8>)> {
+            fn walk(
+                nodes: &HashMap<i64, Vec<u8>>,
+                nodeno: i64,
+                level: u16,
+                cell_len: usize,
+                out: &mut Vec<(u16, Vec<u8>)>,
+            ) {
+                let data = &nodes[&nodeno];
+                let n_cell = usize::from(u16::from_be_bytes([data[2], data[3]]));
+                for cell in data[4..4 + n_cell * cell_len].chunks_exact(cell_len) {
+                    if level == 0 {
+                        out.push((0, cell.to_vec()));
+                    } else {
+                        out.push((level, cell[8..].to_vec()));
+                        let child = i64::from_be_bytes(cell[..8].try_into().unwrap());
+                        walk(nodes, child, level - 1, cell_len, out);
+                    }
+                }
+            }
+            let mut nodes = HashMap::new();
+            for row in conn
+                .query("SELECT nodeno, data FROM t_node", &[])
+                .unwrap()
+                .rows
+            {
+                let mut vals = row.into_values();
+                let Some(Value::Blob(data)) = vals.pop() else {
+                    panic!("node data is not a blob");
+                };
+                nodes.insert(vals[0].as_i64().unwrap(), data);
+            }
+            let depth = u16::from_be_bytes([nodes[&1][0], nodes[&1][1]]);
+            let mut out = Vec::new();
+            walk(&nodes, 1, depth, 8 + n_dim * 8, &mut out);
+            out
+        }
+
+        let mut deepest = 0i64;
+        for (module, n_dim, n_aux, page_size, n_batches, batch_ops, span) in [
+            ("rtree", 2usize, 0usize, 4096u32, 14u64, 260u64, 2000u64),
+            ("rtree", 1, 1, 512, 24, 60, 400),
+            ("rtree_i32", 2, 0, 512, 24, 70, 300),
+            ("rtree", 3, 2, 1024, 16, 80, 100),
+            ("rtree_i32", 5, 0, 4096, 6, 120, 50),
+            ("rtree", 2, 0, 512, 30, 50, 1_000_000),
+        ] {
+            let mut seed = 0x5EED_0FA7_7EE5_u64 ^ (u64::from(page_size) << 24) ^ (n_dim as u64);
+            let warm = Connection::open_in_memory().unwrap();
+            let cold = Connection::open_in_memory().unwrap();
+            let conns = [&warm, &cold];
+            let coord_cols: Vec<String> = (0..n_dim * 2).map(|i| format!("c{i}")).collect();
+            let aux_cols: Vec<String> = (0..n_aux).map(|i| format!("+a{i}")).collect();
+            let n_cols = 1 + n_dim * 2 + n_aux;
+            for conn in conns {
+                conn.execute_batch(&format!(
+                    "PRAGMA page_size={page_size};
+                     CREATE VIRTUAL TABLE t USING {module}(id, {}{}{});",
+                    coord_cols.join(", "),
+                    if n_aux > 0 { ", " } else { "" },
+                    aux_cols.join(", "),
+                ))
+                .unwrap();
+            }
+            let ph = |from: usize| -> String {
+                (from..from + n_cols)
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let mut bbox_sql = String::from(
+                "SELECT count(*), coalesce(sum(id), 0) FROM t WHERE c1 >= ?1 AND c0 <= ?2",
+            );
+            if n_dim >= 2 {
+                bbox_sql.push_str(" AND c3 >= ?3 AND c2 <= ?4");
+            }
+            let sqls: Vec<String> = vec![
+                format!("INSERT INTO t VALUES ({})", ph(1)),
+                format!("INSERT OR REPLACE INTO t VALUES ({})", ph(1)),
+                format!(
+                    "INSERT INTO t VALUES ({}), ({}), ({})",
+                    ph(1),
+                    ph(1 + n_cols),
+                    ph(1 + 2 * n_cols)
+                ),
+                "UPDATE t SET c0 = ?1, c1 = ?2 WHERE id = ?3".to_owned(),
+                "UPDATE t SET id = ?1 WHERE id = ?2".to_owned(),
+                "UPDATE OR REPLACE t SET id = ?1 WHERE id = ?2".to_owned(),
+                "DELETE FROM t WHERE id = ?1".to_owned(),
+                "DELETE FROM t WHERE c0 >= ?1 AND c1 <= ?2".to_owned(),
+                bbox_sql,
+                "SELECT * FROM t".to_owned(),
+                "SELECT count(*) FROM t_node".to_owned(),
+            ];
+            const BBOX: usize = 8;
+            const ALL_ROWS: usize = 9;
+            const SHADOW_READ: usize = 10;
+            let mut stmts: Vec<[Statement; 2]> = sqls
+                .iter()
+                .map(|sql| conns.map(|conn| conn.prepare(sql).unwrap()))
+                .collect();
+            let id_span = (n_batches * batch_ops) as i64;
+            let mut next_seq = 0i64;
+            let aux_vals = |state: &mut u64| -> Vec<Value> {
+                (0..n_aux)
+                    .map(|_| match next(state) % 4 {
+                        0 => Value::Null,
+                        1 => Value::Integer((next(state) % 100) as i64),
+                        2 => Value::Text("aux".repeat((next(state) % 40) as usize)),
+                        _ => Value::Real(1.5),
+                    })
+                    .collect()
+            };
+
+            for batch in 0..n_batches {
+                let rolled_back = batch % 5 == 3;
+                let sp_at = (batch % 3 == 1).then_some(batch_ops / 3);
+                for conn in conns {
+                    conn.execute_batch("BEGIN").unwrap();
+                }
+                // Shrinking phases delete much more than they insert (condense / re-insert).
+                let shrinking = batch % 7 == 5;
+                for op in 0..batch_ops {
+                    if Some(op) == sp_at {
+                        for conn in conns {
+                            conn.execute_batch("SAVEPOINT s").unwrap();
+                        }
+                    }
+                    if sp_at.is_some_and(|at| op == at + batch_ops / 3) {
+                        let sql = if batch % 2 == 1 {
+                            "ROLLBACK TO s; RELEASE s"
+                        } else {
+                            "RELEASE s"
+                        };
+                        for conn in conns {
+                            conn.execute_batch(sql).unwrap();
+                        }
+                    }
+                    let r = next(&mut seed);
+                    let some_id = |state: &mut u64| -> Value {
+                        Value::Integer((next(state) % (id_span as u64 + 2)) as i64)
+                    };
+                    let new_id = |state: &mut u64, seq: &mut i64| -> Value {
+                        match next(state) % 8 {
+                            0 => Value::Null,
+                            1..=3 => {
+                                *seq += 1;
+                                Value::Integer(id_span + *seq)
+                            }
+                            _ => Value::Integer((next(state) % (id_span as u64 + 2)) as i64),
+                        }
+                    };
+                    let pick = (r >> 8) % 100;
+                    let (which, params): (usize, Vec<Value>) =
+                        if pick < if shrinking { 20 } else { 62 } {
+                            let mut p = vec![new_id(&mut seed, &mut next_seq)];
+                            p.extend(coords(&mut seed, n_dim, span, (r >> 32).is_multiple_of(40)));
+                            p.extend(aux_vals(&mut seed));
+                            (usize::from((r >> 20).is_multiple_of(6)), p)
+                        } else if pick < if shrinking { 24 } else { 68 } {
+                            let mut p = Vec::new();
+                            for row in 0..3 {
+                                p.push(new_id(&mut seed, &mut next_seq));
+                                p.extend(coords(
+                                    &mut seed,
+                                    n_dim,
+                                    span,
+                                    row == 2 && (r >> 32).is_multiple_of(2),
+                                ));
+                                p.extend(aux_vals(&mut seed));
+                            }
+                            (2, p)
+                        } else if pick < 76 {
+                            let c = coords(&mut seed, 1, span, (r >> 32).is_multiple_of(30));
+                            (3, vec![c[0].clone(), c[1].clone(), some_id(&mut seed)])
+                        } else if pick < 82 {
+                            let target = new_id(&mut seed, &mut next_seq);
+                            (
+                                4 + usize::from((r >> 20).is_multiple_of(2)),
+                                vec![target, some_id(&mut seed)],
+                            )
+                        } else if pick < if shrinking { 97 } else { 99 } {
+                            (6, vec![some_id(&mut seed)])
+                        } else {
+                            let lo = ((r >> 16) % span) as i64;
+                            (
+                                7,
+                                vec![Value::Integer(lo), Value::Integer(lo + (span / 3) as i64)],
+                            )
+                        };
+                    // Read on the cold connection only: a SELECT inside the transaction would
+                    // flush the warm connection's module too (it holds the same rows).
+                    let before = run(&mut stmts[ALL_ROWS][1], &[]).unwrap();
+                    let [w_stmt, c_stmt] = &mut stmts[which];
+                    let w_res = run(w_stmt, &params);
+                    let c_res = run(c_stmt, &params);
+                    assert_eq!(
+                        w_res, c_res,
+                        "{module} batch {batch} op {op}: {} {params:?}",
+                        sqls[which]
+                    );
+                    assert_eq!(warm.changes(), cold.changes(), "{} {params:?}", sqls[which]);
+                    if w_res.is_err() {
+                        let mut after = run(&mut stmts[ALL_ROWS][0], &[]).unwrap();
+                        let mut before = before;
+                        let key = |row: &Vec<Value>| row[0].as_i64().unwrap();
+                        before.sort_by_key(key);
+                        after.sort_by_key(key);
+                        assert_eq!(
+                            before, after,
+                            "failed statement changed the table: {}",
+                            sqls[which]
+                        );
+                    }
+                    // Flushes the cold connection's tree and drops its node cache.
+                    run(&mut stmts[SHADOW_READ][1], &[]).unwrap();
+                }
+                let end = if rolled_back { "ROLLBACK" } else { "COMMIT" };
+                for conn in conns {
+                    conn.execute_batch(end).unwrap();
+                }
+
+                assert!(
+                    tree_shape(&warm, n_dim) == tree_shape(&cold, n_dim),
+                    "{module} dim {n_dim} page {page_size} batch {batch}: trees differ"
+                );
+                let rowid_rows = |conn: &Connection| -> Vec<Vec<Value>> {
+                    conn.query("SELECT * FROM t_rowid ORDER BY rowid", &[])
+                        .unwrap()
+                        .rows
+                        .into_iter()
+                        .map(|row| {
+                            let mut vals = row.into_values();
+                            vals.remove(1); // the leaf's node number
+                            vals
+                        })
+                        .collect()
+                };
+                assert!(
+                    rowid_rows(&warm) == rowid_rows(&cold),
+                    "{module} dim {n_dim} page {page_size} batch {batch}: rowid tables differ"
+                );
+                for conn in conns {
+                    let chk = conn.query("SELECT rtreecheck('t')", &[]).unwrap();
+                    assert_eq!(chk.rows[0].get_str(0), Some("ok"), "{module} batch {batch}");
+                }
+                let depth = warm
+                    .query("SELECT rtreedepth(data) FROM t_node WHERE nodeno = 1", &[])
+                    .unwrap()
+                    .rows[0]
+                    .get_i64(0)
+                    .unwrap();
+                deepest = deepest.max(depth);
+
+                let all = run(&mut stmts[ALL_ROWS][0], &[]).unwrap();
+                for q in 0..12u64 {
+                    let r = next(&mut seed);
+                    let mut bounds = Vec::new();
+                    for d in 0..n_dim.min(2) {
+                        let lo = ((r >> (8 + 20 * d)) % span) as i64;
+                        let w = ((r >> 50) % (span / 2 + 1)) as i64;
+                        if q % 3 == 0 {
+                            bounds.push(Value::Integer(lo));
+                            bounds.push(Value::Integer(lo + w));
+                        } else {
+                            bounds.push(Value::Real(lo as f64 + 0.5));
+                            bounds.push(Value::Real((lo + w) as f64 + 0.5));
+                        }
+                    }
+                    let mut want_n = 0i64;
+                    let mut want_sum = 0i64;
+                    for row in &all {
+                        let hit = (0..n_dim.min(2)).all(|d| {
+                            num(&row[2 + 2 * d]) >= num(&bounds[2 * d])
+                                && num(&row[1 + 2 * d]) <= num(&bounds[2 * d + 1])
+                        });
+                        if hit {
+                            want_n += 1;
+                            want_sum += row[0].as_i64().unwrap();
+                        }
+                    }
+                    for (ci, stmt) in stmts[BBOX].iter_mut().enumerate() {
+                        let got = run(stmt, &bounds).unwrap();
+                        assert_eq!(
+                            got,
+                            vec![vec![Value::Integer(want_n), Value::Integer(want_sum)]],
+                            "{module} dim {n_dim} batch {batch} conn {ci} bounds {bounds:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            deepest >= 2,
+            "no configuration reached a three-level tree (depth {deepest})"
+        );
+    }
+
+    /// Several virtual tables written by the same transactions must leave the same database
+    /// file behind every time. Their dirty state reaches the shadow tables when the transaction
+    /// callbacks fan out over the participating tables, so that order decides which b-tree
+    /// gets which page; it has to be the order in which the tables joined the transaction, not
+    /// the iteration order of a hash map (each connection's registry hashes with its own
+    /// random seed, so fresh connections inside one process do exercise that).
+    #[test]
+    fn multi_vtab_transactions_write_identical_files_on_every_connection() {
+        const SCHEMA: &str = "PRAGMA page_size=1024;
+             CREATE VIRTUAL TABLE b USING rtree(id, x0, x1, y0, y1, +tag);
+             CREATE VIRTUAL TABLE bi USING rtree_i32(id, x0, x1);
+             CREATE VIRTUAL TABLE c USING rtree(id, x0, x1, y0, y1, z0, z1);
+             CREATE VIRTUAL TABLE d USING rtree_i32(id, x0, x1, y0, y1);
+             CREATE VIRTUAL TABLE docs USING fts5(body);
+             CREATE TABLE n(id INTEGER PRIMARY KEY, v);";
+        fn build_script() -> String {
+            let mut state = 0x00C0_FFEE_1234_5678_u64;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let mut sql = String::new();
+            let mut id = 0u64;
+            for block in 0..18u64 {
+                let explicit = block % 4 != 3;
+                if explicit {
+                    sql.push_str("BEGIN;\n");
+                }
+                for _ in 0..40 {
+                    id += 1;
+                    let x = next() % 9000;
+                    let y = next() % 9000;
+                    let w = next() % 300;
+                    // The tables join each transaction in an order that changes from block to
+                    // block, and not every table takes part in every block.
+                    let mut order = [0usize, 1, 2, 3, 4];
+                    order.rotate_left((block % 5) as usize);
+                    if block % 2 == 1 {
+                        order.reverse();
+                    }
+                    for which in order {
+                        if (block + which as u64) % 6 == 5 {
+                            continue;
+                        }
+                        let stmt = match which {
+                            0 => format!(
+                                "INSERT INTO b VALUES({id},{x}.5,{}.25,{y},{},'t{}');\n",
+                                x + w + 1,
+                                y + w,
+                                id % 7
+                            ),
+                            1 => format!("INSERT INTO bi VALUES({id},{x},{});\n", x + w),
+                            2 => format!(
+                                "INSERT INTO c VALUES({id},{x},{},{y},{},{w},{});\n",
+                                x + w,
+                                y + 3,
+                                w + 1
+                            ),
+                            3 => {
+                                format!("INSERT INTO d VALUES({id},{x},{},{y},{});\n", x + w, y + w)
+                            }
+                            _ => format!(
+                                "INSERT INTO docs(rowid, body) VALUES({id}, 'w{} w{} common');\n",
+                                x % 50,
+                                y % 50
+                            ),
+                        };
+                        sql.push_str(&stmt);
+                    }
+                    sql.push_str(&format!("INSERT INTO n VALUES({id},{});\n", id % 11));
+                    if id.is_multiple_of(9) {
+                        let victim = 1 + next() % id;
+                        sql.push_str(&format!(
+                            "DELETE FROM b WHERE id={victim}; DELETE FROM d WHERE id={victim};\n"
+                        ));
+                    }
+                    if id.is_multiple_of(13) {
+                        let target = 1 + next() % id;
+                        sql.push_str(&format!(
+                            "UPDATE bi SET x0={x}, x1={} WHERE id={target};\n",
+                            x + 5
+                        ));
+                    }
+                }
+                if explicit {
+                    sql.push_str(if block % 6 == 4 {
+                        "ROLLBACK;\n"
+                    } else {
+                        "COMMIT;\n"
+                    });
+                }
+            }
+            sql
+        }
+        fn file_bytes(vfs: &MemoryVfs, path: &Path) -> Vec<u8> {
+            let file = vfs
+                .open(Some(path), OpenFlags::READONLY | OpenFlags::MAIN_DB)
+                .unwrap();
+            let mut bytes = vec![0u8; file.file_size().unwrap() as usize];
+            assert_eq!(file.read_at(&mut bytes, 0).unwrap(), bytes.len());
+            bytes
+        }
+
+        let script = build_script();
+        let path = Path::new("/multi.db");
+        let mut first: Option<Vec<u8>> = None;
+        for run in 0..16 {
+            let vfs = Arc::new(MemoryVfs::new());
+            let conn = Connection::open_with_vfs(
+                vfs.clone(),
+                Some(path),
+                OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB,
+            )
+            .unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            conn.execute_batch(&script).unwrap();
+            for table in ["b", "bi", "c", "d"] {
+                let chk = conn
+                    .query(&format!("SELECT rtreecheck('{table}')"), &[])
+                    .unwrap();
+                assert_eq!(chk.rows[0].get_str(0), Some("ok"), "{table}");
+            }
+            let ic = conn.query("PRAGMA integrity_check", &[]).unwrap();
+            assert_eq!(ic.rows[0].get_str(0), Some("ok"));
+            assert!(conn.try_close().is_ok());
+            let bytes = file_bytes(&vfs, path);
+            assert!(
+                bytes.len() > 100 * 1024,
+                "only {} bytes written",
+                bytes.len()
+            );
+            match &first {
+                None => first = Some(bytes),
+                Some(want) => {
+                    let diff = want.iter().zip(&bytes).position(|(a, b)| a != b);
+                    assert!(
+                        *want == bytes,
+                        "run {run}: file differs from run 0 (lengths {} / {}, first difference at {diff:?})",
+                        want.len(),
+                        bytes.len()
+                    );
+                }
+            }
+        }
+    }
 }

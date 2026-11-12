@@ -4788,39 +4788,43 @@ fn exec_single_select_core(
                     } if expr_contains_window(expr)
                 )
             });
-            let pre_where_selection: Option<Expr> = if let Some(where_expr) = selection {
-                if has_win_proj_aliases {
-                    None
-                } else if has_proj_aliases {
-                    let preview_cols = from
-                        .as_ref()
-                        .and_then(|fc| {
-                            static_schema_cols_for_from(
-                                fc,
-                                outer_scopes,
-                                ctx.db_set,
-                                ctes,
-                                &mut Vec::new(),
-                            )
-                        })
-                        .unwrap_or_default();
-                    if let Ok((_, pre_proj)) = expand_projection(projection, &preview_cols) {
-                        Some(subst_select_aliases_in_expr_with_ctes(
-                            where_expr,
-                            &pre_proj,
-                            &preview_cols,
-                            ctx.db_set,
-                            ctes,
-                        ))
+            // Borrowed unless projection aliases have to be substituted into the WHERE clause.
+            let pre_where_selection: Option<std::borrow::Cow<'_, Expr>> =
+                if let Some(where_expr) = selection {
+                    if has_win_proj_aliases {
+                        None
+                    } else if has_proj_aliases {
+                        let preview_cols = from
+                            .as_ref()
+                            .and_then(|fc| {
+                                static_schema_cols_for_from(
+                                    fc,
+                                    outer_scopes,
+                                    ctx.db_set,
+                                    ctes,
+                                    &mut Vec::new(),
+                                )
+                            })
+                            .unwrap_or_default();
+                        if let Ok((_, pre_proj)) = expand_projection(projection, &preview_cols) {
+                            Some(std::borrow::Cow::Owned(
+                                subst_select_aliases_in_expr_with_ctes(
+                                    where_expr,
+                                    &pre_proj,
+                                    &preview_cols,
+                                    ctx.db_set,
+                                    ctes,
+                                ),
+                            ))
+                        } else {
+                            Some(std::borrow::Cow::Borrowed(where_expr))
+                        }
                     } else {
-                        Some(where_expr.clone())
+                        Some(std::borrow::Cow::Borrowed(where_expr))
                     }
                 } else {
-                    Some(where_expr.clone())
-                }
-            } else {
-                None
-            };
+                    None
+                };
 
             // 1. Evaluate FROM & JOINs
             let mut omitted_vtab_conjuncts: Vec<Expr> = Vec::new();
@@ -4831,7 +4835,7 @@ fn exec_single_select_core(
                         ctx,
                         core,
                         fc,
-                        pre_where_selection.as_ref(),
+                        pre_where_selection.as_deref(),
                         order_by,
                         limit,
                         params,
@@ -4845,7 +4849,7 @@ fn exec_single_select_core(
                             let single_qinfo = SingleVtabQueryInfo::from_single_select(
                                 projection,
                                 selection.as_ref(),
-                                pre_where_selection.as_ref(),
+                                pre_where_selection.as_deref(),
                                 group_by,
                                 having.as_ref(),
                                 windows,
@@ -4855,7 +4859,7 @@ fn exec_single_select_core(
                             eval_table_or_subquery(
                                 ctx,
                                 &fc.head,
-                                pre_where_selection.as_ref(),
+                                pre_where_selection.as_deref(),
                                 None,
                                 if group_by.is_empty() && windows.is_empty() {
                                     order_by
@@ -4874,7 +4878,7 @@ fn exec_single_select_core(
                 Some(fc) => eval_from_clause(
                     ctx,
                     fc,
-                    pre_where_selection.as_ref(),
+                    pre_where_selection.as_deref(),
                     &[],
                     params,
                     outer_scopes,
@@ -5892,6 +5896,18 @@ fn expr_can_eval_with_cols(
         Expr::RowValue(elems) => elems
             .iter()
             .all(|el| expr_can_eval_with_cols(el, avail_cols, full_scope_cols, outer_scopes)),
+    }
+}
+
+/// [`strip_omitted_conjuncts`] that hands back `expr` itself when nothing was omitted.
+fn strip_omitted_conjuncts_cow<'a>(
+    expr: &'a Expr,
+    omitted: &[Expr],
+) -> Option<std::borrow::Cow<'a, Expr>> {
+    if omitted.is_empty() {
+        Some(std::borrow::Cow::Borrowed(expr))
+    } else {
+        strip_omitted_conjuncts(expr, omitted).map(std::borrow::Cow::Owned)
     }
 }
 
@@ -7592,8 +7608,10 @@ fn open_filtered_vtab_cursor_inner(
     };
 
     let mut constraints: Vec<sqliters_types::VTabConstraint> = Vec::new();
-    let mut rhs_exprs: Vec<Option<Expr>> = Vec::new();
-    let mut source_conjuncts: Vec<Option<Expr>> = Vec::new();
+    // Borrowed from the hints: only conjuncts the module asks to omit are cloned.
+    let null_rhs = Expr::Null;
+    let mut rhs_exprs: Vec<Option<&Expr>> = Vec::new();
+    let mut source_conjuncts: Vec<Option<&Expr>> = Vec::new();
 
     if !matches!(indexed_by, Some(IndexHint::NotIndexed)) {
         if let Some(args) = tvf_args {
@@ -7604,7 +7622,7 @@ fn open_filtered_vtab_cursor_inner(
                     usable: true,
                     in_values: false,
                 });
-                rhs_exprs.push(Some(arg_expr.clone()));
+                rhs_exprs.push(Some(arg_expr));
                 source_conjuncts.push(None);
             }
         }
@@ -7642,8 +7660,8 @@ fn open_filtered_vtab_cursor_inner(
                                 usable,
                                 in_values: false,
                             });
-                            rhs_exprs.push(usable.then(|| (**right).clone()));
-                            source_conjuncts.push(Some(conj.clone()));
+                            rhs_exprs.push(usable.then_some(&**right));
+                            source_conjuncts.push(Some(conj));
                         } else if let Some(col_i) = resolve_vtab_col(right)
                             && let Some(vop) = map_bin_op(*op, true)
                         {
@@ -7654,8 +7672,8 @@ fn open_filtered_vtab_cursor_inner(
                                 usable,
                                 in_values: false,
                             });
-                            rhs_exprs.push(usable.then(|| (**left).clone()));
-                            source_conjuncts.push(Some(conj.clone()));
+                            rhs_exprs.push(usable.then_some(&**left));
+                            source_conjuncts.push(Some(conj));
                         }
                     }
                     Expr::Like {
@@ -7679,8 +7697,8 @@ fn open_filtered_vtab_cursor_inner(
                                 usable,
                                 in_values: false,
                             });
-                            rhs_exprs.push(usable.then(|| (**pattern).clone()));
-                            source_conjuncts.push(Some(conj.clone()));
+                            rhs_exprs.push(usable.then_some(&**pattern));
+                            source_conjuncts.push(Some(conj));
                         }
                     }
                     Expr::IsNull { expr: ie, negated } => {
@@ -7695,8 +7713,8 @@ fn open_filtered_vtab_cursor_inner(
                                 usable: true,
                                 in_values: false,
                             });
-                            rhs_exprs.push(Some(Expr::Null));
-                            source_conjuncts.push(Some(conj.clone()));
+                            rhs_exprs.push(Some(&null_rhs));
+                            source_conjuncts.push(Some(conj));
                         }
                     }
                     Expr::Between {
@@ -7713,7 +7731,7 @@ fn open_filtered_vtab_cursor_inner(
                                 usable: usable_low,
                                 in_values: false,
                             });
-                            rhs_exprs.push(usable_low.then(|| (**low).clone()));
+                            rhs_exprs.push(usable_low.then_some(&**low));
                             source_conjuncts.push(None);
 
                             let usable_high =
@@ -7724,7 +7742,7 @@ fn open_filtered_vtab_cursor_inner(
                                 usable: usable_high,
                                 in_values: false,
                             });
-                            rhs_exprs.push(usable_high.then(|| (**high).clone()));
+                            rhs_exprs.push(usable_high.then_some(&**high));
                             source_conjuncts.push(None);
                         }
                     }
@@ -7887,7 +7905,7 @@ fn open_filtered_vtab_cursor_inner(
                 ));
             }
             *seen_slot = true;
-            let val = match rhs_exprs.get(ci).and_then(|o| o.as_ref()) {
+            let val = match rhs_exprs.get(ci).copied().flatten() {
                 Some(re) => match re {
                     Expr::Bind(bp) => eval_bind_param(bp, params),
                     _ => eval_expr(ctx, re, params, outer_scopes, ctes, None)?,
@@ -7897,7 +7915,7 @@ fn open_filtered_vtab_cursor_inner(
             argv[slot_idx] = val;
         }
         if usage.omit
-            && let Some(Some(conj_expr)) = source_conjuncts.get(ci)
+            && let Some(Some(conj_expr)) = source_conjuncts.get(ci).copied()
             && !omitted_conjuncts.contains(conj_expr)
         {
             omitted_conjuncts.push(conj_expr.clone());
@@ -8160,6 +8178,35 @@ impl FastVtabWherePred {
                 col_on_left,
             } => {
                 let cv = Self::read_col(*col, cursor, rowid_alias_col, cached_rowid)?;
+                // Two numbers under a non-TEXT comparison affinity compare as they are (the
+                // affinity only converts text operands), so skip the generic value plumbing.
+                if !matches!(comp_aff, TypeAffinity::Text) {
+                    let ord = match (&cv, rhs) {
+                        (Value::Integer(a), Value::Integer(b)) => Some(a.cmp(b)),
+                        (Value::Real(a), Value::Real(b)) => Some(if *a == 0.0 && *b == 0.0 {
+                            Ordering::Equal
+                        } else {
+                            a.total_cmp(b)
+                        }),
+                        (
+                            Value::Integer(_) | Value::Real(_),
+                            Value::Integer(_) | Value::Real(_),
+                        ) => Some(cv.cmp_sqlite_with_encoding(rhs, *coll, enc)),
+                        _ => None,
+                    };
+                    if let Some(ord) = ord {
+                        let ord = if *col_on_left { ord } else { ord.reverse() };
+                        return Ok(match vdbe_op {
+                            Opcode::Eq | Opcode::Is => ord == Ordering::Equal,
+                            Opcode::Ne | Opcode::IsNot => ord != Ordering::Equal,
+                            Opcode::Lt => ord == Ordering::Less,
+                            Opcode::Le => ord != Ordering::Greater,
+                            Opcode::Gt => ord == Ordering::Greater,
+                            Opcode::Ge => ord != Ordering::Less,
+                            _ => unreachable!(),
+                        });
+                    }
+                }
                 let res = if *col_on_left {
                     eval_comparison_with_affinity(*vdbe_op, &cv, rhs, *comp_aff, *coll, enc)
                 } else {
@@ -8411,18 +8458,18 @@ fn try_exec_fast_single_vtab_select(
 
     let effective_where = selection.as_ref().map(|where_expr| {
         if expanded_proj.iter().any(|(_, _, al)| al.is_some()) {
-            subst_select_aliases_in_expr_with_ctes(
+            std::borrow::Cow::Owned(subst_select_aliases_in_expr_with_ctes(
                 where_expr,
                 &expanded_proj,
                 &cols,
                 ctx.db_set,
                 ctes,
-            )
+            ))
         } else {
-            where_expr.clone()
+            std::borrow::Cow::Borrowed(where_expr)
         }
     });
-    if effective_where.as_ref() != pre_where_selection {
+    if effective_where.as_deref() != pre_where_selection {
         return Ok(FastSingleVtabOutcome::NotApplicable);
     }
 
@@ -8630,7 +8677,7 @@ fn try_exec_fast_single_vtab_select(
         )?;
 
         let residual_preds = match pre_where_selection
-            .and_then(|we| strip_omitted_conjuncts(we, omitted_vtab_conjuncts))
+            .and_then(|we| strip_omitted_conjuncts_cow(we, omitted_vtab_conjuncts))
         {
             None => Vec::new(),
             Some(ref res_we) => {
@@ -8886,7 +8933,7 @@ fn try_exec_fast_single_vtab_select(
     )?;
 
     let residual_preds = match pre_where_selection
-        .and_then(|we| strip_omitted_conjuncts(we, omitted_vtab_conjuncts))
+        .and_then(|we| strip_omitted_conjuncts_cow(we, omitted_vtab_conjuncts))
     {
         None => Vec::new(),
         Some(ref res_we) => {
@@ -22205,7 +22252,8 @@ fn try_exec_fast_vtab_insert(
     }
 
     ctx.ensure_write_db(db_id, false)?;
-    let empty_ctes = CteStore::default();
+    // Only needed for value expressions that are not literals or bind parameters.
+    let mut empty_ctes: Option<CteStore> = None;
     let vtab_conflict = conflict_action_to_vtab_mode(effective_or_conflict);
     let db_name = db_ident.as_str();
     let table_name = tbl_ident.as_str();
@@ -22223,7 +22271,14 @@ fn try_exec_fast_vtab_insert(
                 Expr::String(s) => Value::Text(s.clone()),
                 Expr::Blob(b) => Value::Blob(b.clone()),
                 Expr::Bool(b) => Value::Integer(i64::from(*b)),
-                _ => eval_expr(ctx, e, params, &[], &empty_ctes, None)?,
+                _ => eval_expr(
+                    ctx,
+                    e,
+                    params,
+                    &[],
+                    empty_ctes.get_or_insert_with(CteStore::default),
+                    None,
+                )?,
             };
             let t_idx = target_map[i];
             if t_idx == usize::MAX {
@@ -24772,6 +24827,7 @@ fn exec_create_virtual_table(
             declared,
             state: crate::vtab::VTabInstanceState::Available(vt),
             in_tx: false,
+            tx_seq: 0,
         });
     crate::vtab::vtab_begin_if_needed(ctx, &db_name, &name.name)?;
 

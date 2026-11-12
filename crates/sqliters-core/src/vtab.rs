@@ -146,6 +146,10 @@ pub struct ConnectedVTabEntry {
     pub declared: Arc<VTabDeclaredSchema>,
     pub state: VTabInstanceState,
     pub in_tx: bool,
+    /// Position in the order in which tables joined the current transaction (assigned when
+    /// `in_tx` is set; meaningful only while it is). Transaction callbacks fan out in this
+    /// order, as C SQLite walks `db->aVTrans`.
+    pub tx_seq: u64,
 }
 
 impl ConnectedVTabEntry {
@@ -158,6 +162,10 @@ impl ConnectedVTabEntry {
 }
 
 const MAX_SUB_SQL_CACHE_ENTRIES: usize = 128;
+
+/// Up to this many distinct connected table names, [`VTabRegistry`] lookups scan the keys
+/// instead of hashing the requested name.
+const SMALL_REGISTRY_SCAN_LIMIT: usize = 4;
 
 /// Cached parse outcome for internal `VTabHostContext` sub-SQL.
 pub enum CachedSubSql {
@@ -172,6 +180,10 @@ pub struct VTabRegistry {
     connected: HashMap<String, Vec<ConnectedVTabEntry>>,
     sub_sql_cache: HashMap<String, Arc<Stmt>>,
     fts5_aux: Arc<Fts5AuxRegistry>,
+    /// Recycled name buffer for [`Self::take_active_tx_vtabs`] (carries no state).
+    tx_names_scratch: Vec<(u64, String, String)>,
+    /// Next [`ConnectedVTabEntry::tx_seq`] to hand out.
+    next_tx_seq: u64,
     pub trusted_schema: bool,
     pub defensive_mode: bool,
     pub internal_sql_depth: usize,
@@ -206,6 +218,8 @@ impl VTabRegistry {
             connected: HashMap::new(),
             sub_sql_cache: HashMap::new(),
             fts5_aux: Arc::clone(&fts5_aux),
+            tx_names_scratch: Vec::new(),
+            next_tx_seq: 0,
             trusted_schema: true,
             defensive_mode: false,
             internal_sql_depth: 0,
@@ -285,6 +299,15 @@ impl VTabRegistry {
         if self.connected.is_empty() {
             return None;
         }
+        // Keys are ASCII-lowercased table names: with only a few connected tables, comparing
+        // them directly is cheaper than case-folding and hashing the name on every lookup.
+        if self.connected.len() <= SMALL_REGISTRY_SCAN_LIMIT {
+            return self
+                .connected
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(table_name))
+                .map(|(_, bucket)| bucket);
+        }
         if !table_name.bytes().any(|b| b.is_ascii_uppercase()) {
             self.connected.get(table_name)
         } else {
@@ -297,6 +320,13 @@ impl VTabRegistry {
     fn get_bucket_mut(&mut self, table_name: &str) -> Option<&mut Vec<ConnectedVTabEntry>> {
         if self.connected.is_empty() {
             return None;
+        }
+        if self.connected.len() <= SMALL_REGISTRY_SCAN_LIMIT {
+            return self
+                .connected
+                .iter_mut()
+                .find(|(key, _)| key.eq_ignore_ascii_case(table_name))
+                .map(|(_, bucket)| bucket);
         }
         if !table_name.bytes().any(|b| b.is_ascii_uppercase()) {
             self.connected.get_mut(table_name)
@@ -482,14 +512,65 @@ impl VTabRegistry {
         !self.connected.is_empty() && self.connected.values().flatten().any(|e| e.in_tx)
     }
 
-    /// Returns all `(db_name, table_name)` keys currently marked `in_tx`.
+    /// Marks `(db_name, table_name)` as participating in the current transaction, after the
+    /// tables that joined it earlier.
+    pub fn mark_joined_tx(&mut self, db_name: &str, table_name: &str) {
+        let seq = self.next_tx_seq;
+        if let Some(entry) = self.get_connected_mut(db_name, table_name) {
+            entry.in_tx = true;
+            entry.tx_seq = seq;
+            self.next_tx_seq = seq + 1;
+        }
+    }
+
+    /// Returns all `(db_name, table_name)` keys currently marked `in_tx`, in the order in which
+    /// the tables joined the transaction (never in the map's hash order, which differs from
+    /// process to process and would make the order of shadow-table writes, and with it the
+    /// page layout of the database file, random).
     pub fn active_tx_vtabs(&self) -> Vec<(String, String)> {
-        self.connected
+        let mut active: Vec<&ConnectedVTabEntry> = self
+            .connected
             .values()
             .flatten()
             .filter(|e| e.in_tx)
+            .collect();
+        active.sort_unstable_by_key(|e| e.tx_seq);
+        active
+            .into_iter()
             .map(|e| (e.db_name.clone(), e.table_name.clone()))
             .collect()
+    }
+
+    /// Same tables in the same order as [`Self::active_tx_vtabs`], as `(tx_seq, db_name,
+    /// table_name)` written into a buffer recycled between calls so the per-statement savepoint
+    /// fan-out does not allocate. Hand the vector back with [`Self::recycle_tx_vtab_names`]
+    /// when done.
+    pub fn take_active_tx_vtabs(&mut self) -> Vec<(u64, String, String)> {
+        let mut out = std::mem::take(&mut self.tx_names_scratch);
+        let mut n = 0usize;
+        for e in self.connected.values().flatten().filter(|e| e.in_tx) {
+            if let Some((seq, db_name, table_name)) = out.get_mut(n) {
+                *seq = e.tx_seq;
+                db_name.clear();
+                db_name.push_str(&e.db_name);
+                table_name.clear();
+                table_name.push_str(&e.table_name);
+            } else {
+                out.push((e.tx_seq, e.db_name.clone(), e.table_name.clone()));
+            }
+            n += 1;
+        }
+        out.truncate(n);
+        if n > 1 {
+            out.sort_unstable_by_key(|(seq, _, _)| *seq);
+        }
+        out
+    }
+
+    /// Returns a vector obtained from [`Self::take_active_tx_vtabs`] for reuse.
+    #[inline]
+    pub fn recycle_tx_vtab_names(&mut self, names: Vec<(u64, String, String)>) {
+        self.tx_names_scratch = names;
     }
 
     /// Looks up a cached single-statement AST for internal `VTabHostContext` sub-SQL, or parses and
@@ -798,6 +879,7 @@ pub fn ensure_vtab_connected(
             declared: Arc::clone(&declared),
             state: VTabInstanceState::Available(vt_box),
             in_tx: false,
+            tx_seq: 0,
         };
         ctx.db_set.vtab_registry_mut().insert_connected(entry);
         return Ok(Some((db_name, vt_def.name, declared, effective_risk)));
@@ -838,6 +920,7 @@ pub fn ensure_vtab_connected(
                 declared: Arc::clone(&declared),
                 state: VTabInstanceState::Available(vt_box),
                 in_tx: false,
+                tx_seq: 0,
             };
             ctx.db_set.vtab_registry_mut().insert_connected(entry);
             return Ok(Some((db_name, mod_name, declared, effective_risk)));
@@ -1977,13 +2060,9 @@ pub fn vtab_begin_if_needed(
         .vtab_registry_mut()
         .restore_vtab(db_name, table_name, vt);
     res?;
-    if let Some(entry) = ctx
-        .db_set
+    ctx.db_set
         .vtab_registry_mut()
-        .get_connected_mut(db_name, table_name)
-    {
-        entry.in_tx = true;
-    }
+        .mark_joined_tx(db_name, table_name);
     Ok(())
 }
 
@@ -2109,42 +2188,66 @@ pub fn vtab_rollback_all(ctx: &mut ExecContext<'_>) {
 
 /// Invokes `VirtualTable::savepoint` on all virtual tables participating in the current transaction.
 pub fn vtab_savepoint_all(ctx: &mut ExecContext<'_>, idx: usize) -> Result<()> {
-    let active = ctx.db_set.vtab_registry().active_tx_vtabs();
-    for (db_name, table_name) in active {
-        let mut vt = ctx
+    let active = ctx.db_set.vtab_registry_mut().take_active_tx_vtabs();
+    let mut result = Ok(());
+    for (_, db_name, table_name) in &active {
+        let mut vt = match ctx
             .db_set
             .vtab_registry_mut()
-            .checkout_vtab_instance(&db_name, &table_name)?;
+            .checkout_vtab_instance(db_name, table_name)
+        {
+            Ok(vt) => vt,
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        };
         let res = {
-            let mut host_ctx = CoreVTabHostContext::new(ctx, &db_name, &table_name);
+            let mut host_ctx = CoreVTabHostContext::new(ctx, db_name, table_name);
             catch_callback_panic("vtab xSavepoint", || vt.savepoint(&mut host_ctx, idx))
         };
         ctx.db_set
             .vtab_registry_mut()
-            .restore_vtab(&db_name, &table_name, vt);
-        res?;
+            .restore_vtab(db_name, table_name, vt);
+        if let Err(e) = res {
+            result = Err(e);
+            break;
+        }
     }
-    Ok(())
+    ctx.db_set.vtab_registry_mut().recycle_tx_vtab_names(active);
+    result
 }
 
 /// Invokes `VirtualTable::release` on all virtual tables participating in the current transaction.
 pub fn vtab_release_all(ctx: &mut ExecContext<'_>, idx: usize) -> Result<()> {
-    let active = ctx.db_set.vtab_registry().active_tx_vtabs();
-    for (db_name, table_name) in active {
-        let mut vt = ctx
+    let active = ctx.db_set.vtab_registry_mut().take_active_tx_vtabs();
+    let mut result = Ok(());
+    for (_, db_name, table_name) in &active {
+        let mut vt = match ctx
             .db_set
             .vtab_registry_mut()
-            .checkout_vtab_instance(&db_name, &table_name)?;
+            .checkout_vtab_instance(db_name, table_name)
+        {
+            Ok(vt) => vt,
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        };
         let res = {
-            let mut host_ctx = CoreVTabHostContext::new(ctx, &db_name, &table_name);
+            let mut host_ctx = CoreVTabHostContext::new(ctx, db_name, table_name);
             catch_callback_panic("vtab xRelease", || vt.release(&mut host_ctx, idx))
         };
         ctx.db_set
             .vtab_registry_mut()
-            .restore_vtab(&db_name, &table_name, vt);
-        res?;
+            .restore_vtab(db_name, table_name, vt);
+        if let Err(e) = res {
+            result = Err(e);
+            break;
+        }
     }
-    Ok(())
+    ctx.db_set.vtab_registry_mut().recycle_tx_vtab_names(active);
+    result
 }
 
 /// Invokes `VirtualTable::rollback_to` on all virtual tables participating in the current transaction.
@@ -3378,3 +3481,100 @@ pub const SQLITE_BUILTIN_FUNCTION_LIST: &[(&str, &str, i64, i64)] = &[
     ("upper", "s", 1, 2099200),
     ("zeroblob", "s", 1, 2099200),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NullTable;
+
+    impl VirtualTable for NullTable {
+        fn best_index(&self, _info: &mut VTabIndexInfo) -> Result<()> {
+            Ok(())
+        }
+
+        fn open(&self) -> Result<Box<dyn VirtualCursor>> {
+            Err(SqliteError::new(ErrorCode::Error, "no cursor"))
+        }
+    }
+
+    fn entry(db_name: &str, table_name: &str) -> ConnectedVTabEntry {
+        let (table_schema, hidden_cols) =
+            parse_declare_vtab_sql(table_name, "CREATE TABLE x(a)").unwrap();
+        ConnectedVTabEntry {
+            db_name: db_name.to_owned(),
+            table_name: table_name.to_owned(),
+            module_name: "null".to_owned(),
+            module_risk_flags: VTabRiskFlags::Normal,
+            is_eponymous: false,
+            is_eponymous_only: false,
+            shadow_suffixes: Vec::new(),
+            declared: Arc::new(VTabDeclaredSchema {
+                table_schema,
+                hidden_cols,
+                config_risk_flags: None,
+                constraint_support: false,
+            }),
+            state: VTabInstanceState::Available(Box::new(NullTable)),
+            in_tx: false,
+            tx_seq: 0,
+        }
+    }
+
+    /// The tables of a transaction are reported in the order in which they joined it, whatever
+    /// order the registry's hash map happens to iterate in (every `VTabRegistry` has its own
+    /// hash seed, so several registries are tried).
+    #[test]
+    fn transaction_fan_out_follows_join_order() {
+        for round in 0..16usize {
+            let mut reg = VTabRegistry::new();
+            let names: Vec<String> = (0..24usize)
+                .map(|i| format!("T{}", (i * 7 + round) % 24))
+                .collect();
+            for (i, name) in names.iter().enumerate() {
+                reg.insert_connected(entry(if i % 5 == 0 { "temp" } else { "main" }, name));
+            }
+            assert!(reg.active_tx_vtabs().is_empty());
+            assert!(!reg.has_any_in_tx());
+
+            // Join in an order unrelated to the connection order, leaving some tables out.
+            let mut want: Vec<(String, String)> = Vec::new();
+            for (i, name) in names.iter().enumerate().rev().step_by(2) {
+                let db_name = if i % 5 == 0 { "temp" } else { "main" };
+                // Lookups are case-insensitive; the stored spelling is reported.
+                reg.mark_joined_tx(&db_name.to_ascii_uppercase(), &name.to_ascii_lowercase());
+                want.push((db_name.to_owned(), name.clone()));
+            }
+            assert!(reg.has_any_in_tx());
+            assert_eq!(reg.active_tx_vtabs(), want, "round {round}");
+            for _ in 0..2 {
+                let taken = reg.take_active_tx_vtabs();
+                let got: Vec<(String, String)> = taken
+                    .iter()
+                    .map(|(_, db_name, table_name)| (db_name.clone(), table_name.clone()))
+                    .collect();
+                assert_eq!(got, want, "round {round}");
+                reg.recycle_tx_vtab_names(taken);
+            }
+
+            // A table that leaves the transaction and joins the next one goes to the back.
+            let (first_db, first_name) = want.remove(0);
+            reg.get_connected_mut(&first_db, &first_name).unwrap().in_tx = false;
+            assert_eq!(reg.active_tx_vtabs(), want, "round {round}");
+            reg.mark_joined_tx(&first_db, &first_name);
+            want.push((first_db, first_name));
+            assert_eq!(reg.active_tx_vtabs(), want, "round {round}");
+            let taken = reg.take_active_tx_vtabs();
+            let got: Vec<(String, String)> = taken
+                .iter()
+                .map(|(_, db_name, table_name)| (db_name.clone(), table_name.clone()))
+                .collect();
+            assert_eq!(got, want, "round {round}");
+            reg.recycle_tx_vtab_names(taken);
+
+            // Unknown tables do not consume a position.
+            reg.mark_joined_tx("main", "no_such_table");
+            assert_eq!(reg.active_tx_vtabs(), want, "round {round}");
+        }
+    }
+}
