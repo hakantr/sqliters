@@ -34138,6 +34138,867 @@ fn apply_journal_mode_on_slot(
         .retry_btree(bt, |b| b.set_journal_mode(target))
 }
 
+/// `sqlite3GetInt32` as `PRAGMA integrity_check` applies it to its argument (the hexadecimal
+/// form aside): an optional sign and up to ten significant digits; text after the digits is
+/// ignored. `None` when `text` does not start with an integer that fits 32 bits.
+fn pragma_get_int32(text: &str) -> Option<i32> {
+    let b = text.as_bytes();
+    let (neg, mut i) = match b.first() {
+        Some(b'-') => (true, 1),
+        Some(b'+') => (false, 1),
+        _ => (false, 0),
+    };
+    if !b.get(i).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    while b.get(i) == Some(&b'0') {
+        i += 1;
+    }
+    let mut v: i64 = 0;
+    let mut n = 0;
+    while n < 11 {
+        match b.get(i + n) {
+            Some(c) if c.is_ascii_digit() => v = v * 10 + i64::from(c - b'0'),
+            _ => break,
+        }
+        n += 1;
+    }
+    if n > 10 || v - i64::from(neg) > 2_147_483_647 {
+        return None;
+    }
+    Some(if neg { -v } else { v } as i32)
+}
+
+/// The order in which C SQLite walks a schema's table hash (`sqliteHashFirst` / `sqliteHashNext`
+/// over `Schema.tblHash`) after `names` were inserted in the given order, as indices into
+/// `names`. `PRAGMA integrity_check` reports per table in this order.
+///
+/// Mirrors `sqlite3HashInsert` / `insertElement` / `rehash` of `hash.c`: without a bucket array
+/// a new element becomes the head of the list; with one it is linked in front of the previous
+/// head of its bucket; the array is (re)built at 5 elements and again past twice its size, up
+/// to the 64 buckets the soft allocation limit allows.
+fn c_table_hash_order(names: &[&str]) -> Vec<usize> {
+    const NONE: usize = usize::MAX;
+    struct Elem {
+        h: u32,
+        prev: usize,
+        next: usize,
+    }
+    fn str_hash(z: &str) -> u32 {
+        let mut h: u32 = 0;
+        for &c in z.as_bytes() {
+            h = h.wrapping_add(u32::from(c & 0xdf));
+            h = h.wrapping_mul(0x9e37_79b1);
+        }
+        h
+    }
+    // `insertElement`: `bucket` is `(count, chain)` of the element's bucket, if there is one.
+    fn insert_element(
+        elems: &mut [Elem],
+        first: &mut usize,
+        bucket: Option<&mut (u32, usize)>,
+        new: usize,
+    ) {
+        let head = match bucket {
+            Some(b) => {
+                let head = if b.0 > 0 { b.1 } else { NONE };
+                b.0 += 1;
+                b.1 = new;
+                head
+            }
+            None => NONE,
+        };
+        if head != NONE {
+            let head_prev = elems[head].prev;
+            elems[new].next = head;
+            elems[new].prev = head_prev;
+            if head_prev != NONE {
+                elems[head_prev].next = new;
+            } else {
+                *first = new;
+            }
+            elems[head].prev = new;
+        } else {
+            elems[new].next = *first;
+            if *first != NONE {
+                elems[*first].prev = new;
+            }
+            elems[new].prev = NONE;
+            *first = new;
+        }
+    }
+
+    let mut elems: Vec<Elem> = Vec::with_capacity(names.len());
+    let mut first = NONE;
+    let mut ht: Vec<(u32, usize)> = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        elems.push(Elem {
+            h: str_hash(name),
+            prev: NONE,
+            next: NONE,
+        });
+        let count = i + 1;
+        if count >= 5 && count > 2 * ht.len() {
+            let new_size = (count * 3).min(64);
+            if new_size != ht.len() {
+                ht = vec![(0, NONE); new_size];
+                let mut e = first;
+                first = NONE;
+                while e != NONE {
+                    let next = elems[e].next;
+                    let b = elems[e].h as usize % new_size;
+                    insert_element(&mut elems, &mut first, Some(&mut ht[b]), e);
+                    e = next;
+                }
+            }
+        }
+        let bucket = if ht.is_empty() {
+            None
+        } else {
+            let b = elems[i].h as usize % ht.len();
+            Some(&mut ht[b])
+        };
+        insert_element(&mut elems, &mut first, bucket, i);
+    }
+    let mut order = Vec::with_capacity(names.len());
+    let mut e = first;
+    while e != NONE {
+        order.push(e);
+        e = elems[e].next;
+    }
+    order
+}
+
+/// The indexes of `tbl` in the order of C's `pTab->pIndex` list: newest first, with the
+/// `ON CONFLICT REPLACE` indexes moved behind all others. `None` stands for the PRIMARY KEY
+/// index of a `WITHOUT ROWID` table, which is the table's own B-tree here.
+fn c_index_list_order<'a>(sch: &'a Schema, tbl: &TableSchema) -> Vec<Option<&'a IndexSchema>> {
+    let autoindex_no = |name: &str| -> Option<u32> {
+        name.strip_prefix("sqlite_autoindex_")
+            .and_then(|rest| rest.rsplit('_').next())
+            .and_then(|n| n.parse().ok())
+    };
+    // Creation order: the automatic indexes of the CREATE TABLE statement, then CREATE INDEX.
+    let mut created: Vec<Option<&IndexSchema>> = sch
+        .indexes
+        .iter()
+        .filter(|i| i.table_name.eq_ignore_ascii_case(&tbl.name) && i.root_pgno != tbl.root_pgno)
+        .map(Some)
+        .collect();
+    if tbl.without_rowid {
+        let pk_no = autoindex_no(&tbl.without_rowid_pk_autoindex_name).unwrap_or(0);
+        let pos = created
+            .iter()
+            .position(|i| {
+                i.is_some_and(|i| {
+                    !i.is_autoindex || autoindex_no(&i.name).is_none_or(|n| n > pk_no)
+                })
+            })
+            .unwrap_or(created.len());
+        created.insert(pos, None);
+    }
+    created.reverse();
+    let is_replace = |i: &Option<&IndexSchema>| match i {
+        Some(i) => i.conflict == ConflictAction::Replace,
+        None => tbl.without_rowid_pk_conflict == ConflictAction::Replace,
+    };
+    let (replace, mut ordered): (Vec<_>, Vec<_>) = created.into_iter().partition(is_replace);
+    ordered.extend(replace);
+    ordered
+}
+
+/// Result rows of `PRAGMA integrity_check` with the error budget of `integrityCheckResultRow`
+/// (`pragma.c`): every row uses up one error, and the check halts when the budget is spent.
+struct IntegrityCheckRows {
+    rows: Vec<Vec<Value>>,
+    /// Errors that may still be reported after the next one (register 1 of the C program).
+    remaining: i64,
+    halted: bool,
+}
+
+impl IntegrityCheckRows {
+    /// Adds a result row. Returns `false` once the check has to stop.
+    fn emit(&mut self, text: String) -> bool {
+        self.rows.push(vec![Value::Text(text)]);
+        if self.remaining > 0 {
+            self.remaining -= 1;
+        } else {
+            self.halted = true;
+        }
+        !self.halted
+    }
+}
+
+/// `PRAGMA [schema.]integrity_check[(N | table)]` and `quick_check` (`PragTyp_INTEGRITY_CHECK`
+/// in `pragma.c`): per database the B-tree level check, the index entry counts, the row-by-row
+/// checks of every ordinary table and the integrity methods of virtual tables.
+fn exec_integrity_check(
+    ctx: &mut ExecContext<'_>,
+    is_quick: bool,
+    schema: Option<&str>,
+    db_id: DatabaseId,
+    value: Option<&PragmaValue>,
+) -> Result<QueryOutput> {
+    /// `SQLITE_INTEGRITY_CHECK_ERROR_MAX`
+    const ERROR_MAX: i64 = 100;
+    let column_name = if is_quick {
+        "quick_check"
+    } else {
+        "integrity_check"
+    };
+
+    // The argument is either the maximum number of errors or the one table to check.
+    let mut mx_err = ERROR_MAX;
+    let mut obj_name: Option<String> = None;
+    if let Some(pv) = value {
+        let as_int = match pv {
+            PragmaValue::Integer(i) => pragma_get_int32(&i.to_string()),
+            PragmaValue::Ident(s) => pragma_get_int32(s),
+            // A quoted argument is never a number: `integrity_check('4')` looks for table "4".
+            PragmaValue::String(_) => None,
+        };
+        match as_int {
+            Some(n) if n > 0 => mx_err = i64::from(n),
+            Some(_) => {}
+            None => obj_name = Some(pragma_to_string(pv)),
+        }
+    }
+
+    crate::vtab::vtab_flush_shadow_all(ctx)?;
+    if schema.is_some() && db_id == DatabaseId::TEMP {
+        let enc = ctx.encoding();
+        ctx.db_set.ensure_temp_open(enc, *ctx.writable_schema)?;
+    }
+    let db_ids: Vec<DatabaseId> = if schema.is_some() {
+        vec![db_id]
+    } else {
+        (0..ctx.db_set.slot_count()).map(DatabaseId).collect()
+    };
+    for &cur_id in &db_ids {
+        if ctx.db_set.slot(cur_id).is_some_and(|s| s.btree.is_some()) {
+            ctx.ensure_read_db(cur_id, true)?;
+        }
+    }
+
+    // `sqlite3LocateTable`: the named table, view or virtual table, TEMP searched before MAIN.
+    let mut obj_target: Option<(DatabaseId, String)> = None;
+    if let Some(name) = obj_name {
+        let mut search = db_ids.clone();
+        if schema.is_none() && search.len() > 1 {
+            search.swap(0, 1);
+        }
+        for cand in search {
+            let Some(slot) = ctx.db_set.slot(cand) else {
+                continue;
+            };
+            if slot.btree.is_none() {
+                continue;
+            }
+            let sch = &slot.schema;
+            if sch.find_table(&name).is_some()
+                || sch.find_view(&name).is_some()
+                || sch.find_virtual_table(&name).is_some()
+            {
+                obj_target = Some((cand, name.clone()));
+                break;
+            }
+        }
+        if obj_target.is_none() {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such table: {name}"),
+            ));
+        }
+    }
+
+    let mut out = IntegrityCheckRows {
+        rows: Vec::new(),
+        remaining: mx_err - 1,
+        halted: false,
+    };
+    for &cur_id in &db_ids {
+        if out.halted {
+            break;
+        }
+        if let Some((target_db, _)) = obj_target
+            && target_db != cur_id
+        {
+            continue;
+        }
+        let Some(slot) = ctx.db_set.slot(cur_id) else {
+            continue;
+        };
+        if slot.btree.is_none() {
+            continue;
+        }
+        let slot_name = slot.name.clone();
+        let sch = slot.schema.clone();
+        let obj = obj_target.as_ref().map(|(_, n)| n.as_str());
+        let partial = obj.is_some();
+
+        // The tables, views and virtual tables of the schema in C's hash order: the schema
+        // table is entered first, the others as `sqlite_schema` lists them.
+        enum Obj<'a> {
+            SchemaTable,
+            Table(&'a TableSchema),
+            VTab(&'a crate::schema::VirtualTableDef),
+            View,
+        }
+        let mut objs: Vec<(i64, &str, Obj<'_>)> = Vec::new();
+        objs.push((
+            i64::MIN,
+            if cur_id == DatabaseId::TEMP {
+                "sqlite_temp_master"
+            } else {
+                "sqlite_master"
+            },
+            Obj::SchemaTable,
+        ));
+        for t in &sch.tables {
+            objs.push((t.schema_rowid, t.name.as_str(), Obj::Table(t)));
+        }
+        for vt in &sch.virtual_tables {
+            objs.push((vt.schema_rowid, vt.name.as_str(), Obj::VTab(vt)));
+        }
+        for v in &sch.views {
+            objs.push((v.schema_rowid, v.name.as_str(), Obj::View));
+        }
+        objs.sort_by_key(|o| o.0);
+        let names: Vec<&str> = objs.iter().map(|o| o.1).collect();
+        let selected: Vec<&Obj<'_>> = c_table_hash_order(&names)
+            .into_iter()
+            .map(|i| &objs[i])
+            .filter(|o| match (obj, &o.2) {
+                (None, _) => true,
+                (Some(name), Obj::SchemaTable) => Schema::is_schema_table_name(name),
+                (Some(name), _) => name.eq_ignore_ascii_case(o.1),
+            })
+            .map(|o| &o.2)
+            .collect();
+        let tables: Vec<(&TableSchema, Vec<Option<&IndexSchema>>)> = selected
+            .iter()
+            .filter_map(|o| match o {
+                Obj::Table(t) => Some((*t, c_index_list_order(&sch, t))),
+                _ => None,
+            })
+            .collect();
+
+        // Root pages: every selected table followed by its indexes.
+        let mut roots: Vec<Pgno> = Vec::new();
+        let push_root = |roots: &mut Vec<Pgno>, pg: Pgno| {
+            if pg > 0 && !roots.contains(&pg) {
+                roots.push(pg);
+            }
+        };
+        for o in &selected {
+            match o {
+                Obj::SchemaTable => push_root(&mut roots, 1),
+                Obj::Table(t) => {
+                    if !t.without_rowid && t.root_pgno > 1 {
+                        push_root(&mut roots, t.root_pgno);
+                    }
+                    for idx in c_index_list_order(&sch, t) {
+                        let root = idx.map_or(t.root_pgno, |i| i.root_pgno);
+                        if root > 1 {
+                            push_root(&mut roots, root);
+                        }
+                    }
+                }
+                Obj::VTab(_) | Obj::View => {}
+            }
+        }
+        if !partial {
+            // Trees the catalog knows but no listed table owns must not look unused.
+            for idx in &sch.indexes {
+                if idx.root_pgno > 1 {
+                    push_root(&mut roots, idx.root_pgno);
+                }
+            }
+        }
+
+        // The b-tree integrity checks: all problems of one database form a single row.
+        let mut counts: Vec<i64> = Vec::new();
+        let mut unwalkable: Vec<bool> = Vec::new();
+        if !roots.is_empty() {
+            let report = {
+                let slot = ctx.db_set.slot_mut(cur_id).unwrap();
+                let bt = slot.btree.as_mut().unwrap();
+                bt.integrity_check_report(&roots, partial, (out.remaining + 1) as usize)?
+            };
+            counts = report.row_counts;
+            unwalkable = report.unwalkable;
+            if !report.messages.is_empty() {
+                out.remaining -= report.messages.len() as i64 - 1;
+                if !out.emit(format!(
+                    "*** in database {slot_name} ***\n{}",
+                    report.messages.join("\n")
+                )) {
+                    break;
+                }
+            }
+        }
+        let count_of = |root: Pgno| -> i64 {
+            roots
+                .iter()
+                .position(|&r| r == root)
+                .map_or(0, |pos| counts[pos])
+        };
+
+        // Check that the indexes all have the right number of entries.
+        'counts: for (t, t_indexes) in &tables {
+            let n_table = count_of(t.root_pgno);
+            for idx in t_indexes.iter().flatten() {
+                if idx.where_clause.is_none()
+                    && count_of(idx.root_pgno) != n_table
+                    && !out.emit(format!("wrong # of entries in index {}", idx.name))
+                {
+                    break 'counts;
+                }
+            }
+        }
+
+        // Make sure all rows and index entries are constructed correctly.
+        for (t, t_indexes) in &tables {
+            if out.halted {
+                break;
+            }
+            if t.root_pgno <= 1 {
+                continue;
+            }
+            let indexes: Vec<&IndexSchema> = t_indexes.iter().flatten().copied().collect();
+            // A tree with an empty page below its root cannot be walked by a C cursor
+            // (`moveToChild` returns SQLITE_CORRUPT); ours would step over the page.
+            let tree_unwalkable = |root: Pgno| {
+                roots
+                    .iter()
+                    .position(|&r| r == root)
+                    .is_some_and(|pos| unwalkable.get(pos).copied().unwrap_or(false))
+            };
+            let walk = if tree_unwalkable(t.root_pgno)
+                || (!is_quick && indexes.iter().any(|i| tree_unwalkable(i.root_pgno)))
+            {
+                Err(SqliteError::corrupt("b-tree page without cells"))
+            } else {
+                integrity_check_table_rows(ctx, cur_id, &slot_name, t, &indexes, is_quick, &mut out)
+            };
+            match walk {
+                Ok(()) => {}
+                // A row that cannot be read ends the check: C reports the corruption as its
+                // last result row when a record is malformed (`op_column_corrupt`), and fails
+                // the statement with SQLITE_CORRUPT - after the rows already returned - when
+                // the tree cannot be walked. The rows found so far are kept in both cases.
+                Err(e) if e.code == ErrorCode::Corrupt => {
+                    out.emit("database disk image is malformed".to_owned());
+                    out.halted = true;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Second pass: the integrity method of virtual tables.
+        for o in &selected {
+            if out.halted {
+                break;
+            }
+            let Obj::VTab(vt) = o else {
+                continue;
+            };
+            let is_rtree = vt.module_name.eq_ignore_ascii_case("rtree");
+            let is_rtree_i32 = vt.module_name.eq_ignore_ascii_case("rtree_i32");
+            if !is_rtree && !is_rtree_i32 {
+                continue;
+            }
+            let coord_cols = vt
+                .args
+                .iter()
+                .skip(1)
+                .take_while(|a| !a.trim_start().starts_with('+'))
+                .count();
+            let n_dim = if coord_cols.is_multiple_of(2) {
+                coord_cols / 2
+            } else {
+                0usize
+            };
+            if let Ok(report) = sqliters_ext::run_rtreecheck(
+                |sql, p| query_internal_vtab_sql(ctx, sql, p),
+                &slot_name,
+                &vt.name,
+                n_dim,
+                is_rtree_i32,
+            ) && report != "ok"
+            {
+                out.emit(format!("In RTree {slot_name}.{}:\n{report}", vt.name));
+            }
+        }
+    }
+
+    let rows = if out.rows.is_empty() {
+        vec![vec![Value::Text("ok".to_owned())]]
+    } else {
+        out.rows
+    };
+    Ok(QueryOutput {
+        column_names: vec![column_name.to_owned()],
+        rows,
+    })
+}
+
+/// The record-header checks `OP_Column` makes when the integrity check reads stored column
+/// `mx_col` of a row, which "causes the entire record header to be parsed and sanity checked":
+/// the header must fit the payload, and - once its end is reached - must end exactly where it
+/// says and describe exactly as many bytes as the payload holds.
+fn record_header_is_sane(payload: &[u8], mx_col: usize) -> bool {
+    let Ok((hdr_size, n)) = sqliters_types::get_varint(payload) else {
+        return true;
+    };
+    let total = payload.len() as u64;
+    if hdr_size > 98_307 || hdr_size > total {
+        return false;
+    }
+    let end = hdr_size as usize;
+    let mut pos = n;
+    if pos >= end {
+        // Includes the zero-length header C accepts "for historical reasons".
+        return true;
+    }
+    let mut offset = hdr_size;
+    let mut i = 0usize;
+    loop {
+        let Ok((t, tn)) = sqliters_types::get_varint(&payload[pos..]) else {
+            return false;
+        };
+        pos += tn;
+        offset += match t.min(u64::from(u32::MAX)) {
+            0 | 8..=11 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 3,
+            4 => 4,
+            5 => 6,
+            6 | 7 => 8,
+            t => (t - 12) / 2,
+        };
+        i += 1;
+        if i > mx_col || pos >= end {
+            break;
+        }
+    }
+    !((pos >= end && (pos > end || offset != total)) || offset > total)
+}
+
+/// The row loop of `PRAGMA integrity_check` for one ordinary table (`pragma.c`): for every row,
+/// in storage order,
+///  * `WITHOUT ROWID` keys are ascending (not for `quick_check`),
+///  * NOT NULL columns hold no NULL, and stored datatypes agree with the declared column types,
+///  * the CHECK constraints hold,
+///  * every index has the entry for the row, and UNIQUE indexes no second entry with its key
+///    (not for `quick_check`).
+fn integrity_check_table_rows(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    schema_name: &str,
+    tbl: &TableSchema,
+    indexes: &[&IndexSchema],
+    is_quick: bool,
+    out: &mut IntegrityCheckRows,
+) -> Result<()> {
+    /// What a column has to be checked for.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum TypeRule {
+        None,
+        /// STRICT table: the stored value must be NULL or of the declared type.
+        Strict(&'static str),
+        /// TEXT affinity: must be NULL, TEXT or BLOB.
+        TextAffinity,
+        /// Numeric affinity: must not be TEXT that converts to a number.
+        NumericAffinity,
+    }
+
+    let (enc, _) = slot_encoding_and_name(ctx, db_id);
+    let rules: Vec<(bool, TypeRule)> = tbl
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(j, col)| {
+            if tbl.rowid_alias_col == Some(j) {
+                return (false, TypeRule::None);
+            }
+            let rule = if tbl.strict {
+                match col.type_name.trim().to_ascii_uppercase().as_str() {
+                    "BLOB" => TypeRule::Strict("BLOB"),
+                    "INT" => TypeRule::Strict("INT"),
+                    "INTEGER" => TypeRule::Strict("INTEGER"),
+                    "REAL" => TypeRule::Strict("REAL"),
+                    "TEXT" => TypeRule::Strict("TEXT"),
+                    _ => TypeRule::None,
+                }
+            } else {
+                match col.affinity {
+                    TypeAffinity::Text => TypeRule::TextAffinity,
+                    TypeAffinity::Numeric | TypeAffinity::Integer | TypeAffinity::Real => {
+                        TypeRule::NumericAffinity
+                    }
+                    TypeAffinity::Blob => TypeRule::None,
+                }
+            };
+            (col.not_null.is_some(), rule)
+        })
+        .collect();
+    let check_columns = rules
+        .iter()
+        .any(|&(not_null, rule)| not_null || rule != TypeRule::None);
+    let index_orders: Vec<Vec<KeySortOrder>> =
+        indexes.iter().map(|idx| idx.key_sort_orders()).collect();
+    let pk_orders = if tbl.without_rowid {
+        tbl.without_rowid_pk_orders()
+    } else {
+        Vec::new()
+    };
+    let needs_scope = !tbl.checks.is_empty();
+    // The right-most stored column (`mxCol`): the rowid alias has no slot of its own.
+    let mx_col: Option<usize> = if tbl.without_rowid {
+        (tbl.without_rowid_pk_cols.len() + tbl.without_rowid_extra_cols.len()).checked_sub(1)
+    } else {
+        let n_stored = tbl
+            .columns
+            .iter()
+            .filter(|c| !matches!(c.generated, Some((_, false))))
+            .count();
+        match n_stored.checked_sub(1) {
+            Some(last) if tbl.rowid_alias_col == Some(last) => last.checked_sub(1),
+            other => other,
+        }
+    };
+
+    let cid = {
+        let Some(bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) else {
+            return Ok(());
+        };
+        if tbl.without_rowid {
+            bt.open_index_cursor(tbl.root_pgno, pk_orders.clone(), false)
+        } else {
+            bt.open_table_cursor(tbl.root_pgno, false)
+        }
+    };
+    let res = (|| -> Result<()> {
+        let mut has_row = {
+            let bt = ctx
+                .db_set
+                .slot_mut(db_id)
+                .and_then(|s| s.btree.as_mut())
+                .ok_or_else(|| SqliteError::misuse("integrity_check: btree closed"))?;
+            bt.cursor_first(cid)?
+        };
+        // The number of the row within the table, as reported in the messages.
+        let mut n_row: i64 = 0;
+        let mut prev_pk: Option<Vec<Value>> = None;
+        while has_row {
+            let (rowid, payload) = {
+                let bt = ctx
+                    .db_set
+                    .slot_mut(db_id)
+                    .and_then(|s| s.btree.as_mut())
+                    .ok_or_else(|| SqliteError::misuse("integrity_check: btree closed"))?;
+                bt.check_interrupted()?;
+                let rowid = if tbl.without_rowid {
+                    0
+                } else {
+                    bt.cursor_rowid(cid)?
+                };
+                (rowid, bt.cursor_payload(cid)?)
+            };
+            n_row += 1;
+
+            // Reading the right-most stored column parses and sanity-checks the whole record
+            // header.
+            if let Some(mx_col) = mx_col
+                && !record_header_is_sane(&payload, mx_col)
+            {
+                return Err(SqliteError::corrupt("malformed record header"));
+            }
+            let scan_key = if tbl.without_rowid {
+                TableRowKey::WithoutRowidPk(Vec::new())
+            } else {
+                TableRowKey::Rowid(rowid)
+            };
+            let vals = decode_table_logical_row(ctx, db_id, tbl, &scan_key, &payload, &[])?;
+            let rkey = if tbl.without_rowid {
+                TableRowKey::WithoutRowidPk(tbl.extract_without_rowid_pk(&vals))
+            } else {
+                scan_key
+            };
+
+            if !is_quick && let TableRowKey::WithoutRowidPk(ref pk) = rkey {
+                // Verify that WITHOUT ROWID keys are in ascending order.
+                if let Some(ref prev) = prev_pk
+                    && sqliters_types::compare_records_with_encoding(
+                        &payload, prev, &pk_orders, enc,
+                    )? != Ordering::Greater
+                    && !out.emit(format!("row not in PRIMARY KEY order for {}", tbl.name))
+                {
+                    return Ok(());
+                }
+                prev_pk = Some(pk.clone());
+            }
+
+            // Verify datatypes for all columns.
+            if check_columns {
+                for (j, &(not_null, rule)) in rules.iter().enumerate() {
+                    let v = &vals[j];
+                    let col = &tbl.columns[j];
+                    let problem = if not_null && matches!(v, Value::Null) {
+                        // (1) NOT NULL columns may not contain a NULL.
+                        Some(format!("NULL value in {}.{}", tbl.name, col.name))
+                    } else {
+                        match rule {
+                            TypeRule::None => None,
+                            // (2) The datatype must be exact for non-ANY columns of STRICT
+                            //     tables; an integer is a legal REAL.
+                            TypeRule::Strict(ty) => {
+                                let ok = match v {
+                                    Value::Null => true,
+                                    Value::Integer(_) => {
+                                        matches!(ty, "INT" | "INTEGER" | "REAL")
+                                    }
+                                    Value::Real(_) => ty == "REAL",
+                                    Value::Text(_) => ty == "TEXT",
+                                    Value::Blob(_) => ty == "BLOB",
+                                };
+                                (!ok)
+                                    .then(|| format!("non-{ty} value in {}.{}", tbl.name, col.name))
+                            }
+                            // (3) TEXT columns of non-STRICT tables hold NULL, TEXT or BLOB.
+                            TypeRule::TextAffinity => {
+                                matches!(v, Value::Integer(_) | Value::Real(_))
+                                    .then(|| format!("NUMERIC value in {}.{}", tbl.name, col.name))
+                            }
+                            // (4) Numeric columns of non-STRICT tables hold no TEXT that can
+                            //     be converted to a number.
+                            TypeRule::NumericAffinity => (matches!(v, Value::Text(_))
+                                && !matches!(
+                                    TypeAffinity::Numeric.apply(v.clone()),
+                                    Value::Text(_)
+                                ))
+                            .then(|| format!("TEXT value in {}.{}", tbl.name, col.name)),
+                        }
+                    };
+                    if let Some(text) = problem
+                        && !out.emit(text)
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+
+            // Verify CHECK constraints: only an expression that is false fails.
+            if needs_scope {
+                let scope = make_single_table_scope(tbl, schema_name, None, rowid, &vals);
+                let mut failed = false;
+                for chk in &tbl.checks {
+                    let cv = eval_expr(
+                        ctx,
+                        &chk.expr,
+                        &[],
+                        std::slice::from_ref(&scope),
+                        &CteStore::default(),
+                        None,
+                    )?;
+                    if cv.truthiness() == Some(false) {
+                        failed = true;
+                        break;
+                    }
+                }
+                if failed && !out.emit(format!("CHECK constraint failed in {}", tbl.name)) {
+                    return Ok(());
+                }
+            }
+
+            // Validate the index entries for the current row.
+            if !is_quick {
+                for (idx, orders) in indexes.iter().zip(&index_orders) {
+                    if !index_row_passes_partial_where(
+                        ctx,
+                        schema_name,
+                        tbl,
+                        idx,
+                        rowid,
+                        &vals,
+                        &[],
+                    )? {
+                        continue;
+                    }
+                    let keys =
+                        eval_index_key_values(ctx, schema_name, tbl, idx, &rkey, &vals, &[])?;
+                    let bt = ctx
+                        .db_set
+                        .slot_mut(db_id)
+                        .and_then(|s| s.btree.as_mut())
+                        .ok_or_else(|| SqliteError::misuse("integrity_check: btree closed"))?;
+                    // An index entry must exist for the current table row.
+                    if !bt.index_contains_prefix_raw(idx.root_pgno, &keys, orders)? {
+                        if !out.emit(format!("row {n_row} missing from index {}", idx.name)) {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    // For UNIQUE indexes only one entry may exist with the current key. The
+                    // entry is unique if a (nullable) key column is NULL or the entry after
+                    // it has a different key.
+                    if idx.unique {
+                        let n_key = idx.columns.len();
+                        let has_null = idx.columns.iter().zip(&keys).any(|(ic, v)| {
+                            matches!(v, Value::Null)
+                                && !ic
+                                    .col_idx
+                                    .is_some_and(|ci| tbl.columns[ci].not_null.is_some())
+                        });
+                        if !has_null {
+                            let mut n_same = 0usize;
+                            let mut last_is_this_row = true;
+                            bt.seek_index_range_raw_cells(
+                                idx.root_pgno,
+                                &keys[..n_key],
+                                None,
+                                None,
+                                orders,
+                                false,
+                                |rec| {
+                                    n_same += 1;
+                                    last_is_this_row =
+                                        sqliters_types::compare_records_with_encoding(
+                                            rec, &keys, orders, enc,
+                                        )? == Ordering::Equal;
+                                    Ok(std::ops::ControlFlow::Continue(()))
+                                },
+                            )?;
+                            if n_same > 1
+                                && !last_is_this_row
+                                && !out.emit(format!("non-unique entry in index {}", idx.name))
+                            {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+
+            has_row = {
+                let bt = ctx
+                    .db_set
+                    .slot_mut(db_id)
+                    .and_then(|s| s.btree.as_mut())
+                    .ok_or_else(|| SqliteError::misuse("integrity_check: btree closed"))?;
+                bt.cursor_next(cid)?
+            };
+        }
+        Ok(())
+    })();
+    if let Some(bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
+        bt.close_cursor(cid);
+    }
+    res
+}
+
 fn exec_pragma(
     ctx: &mut ExecContext<'_>,
     schema: Option<&str>,
@@ -34507,98 +35368,7 @@ fn exec_pragma(
             ));
         }
         "INTEGRITY_CHECK" | "QUICK_CHECK" => {
-            let mut all_errs = Vec::new();
-            let mut rtree_targets: Vec<(String, String, usize, bool)> = Vec::new();
-            let target_table_filter: Option<String> = value.and_then(|pv| {
-                let s = pragma_to_string(pv);
-                let trimmed = s.trim();
-                if trimmed.is_empty() || trimmed.parse::<i64>().is_ok() {
-                    None
-                } else {
-                    Some(trimmed.to_owned())
-                }
-            });
-            let collect_rtrees =
-                |slot_name: &str,
-                 vts: &[crate::schema::VirtualTableDef],
-                 out: &mut Vec<(String, String, usize, bool)>| {
-                    if upper != "INTEGRITY_CHECK" {
-                        return;
-                    }
-                    for vt in vts {
-                        if let Some(ref tf) = target_table_filter
-                            && !vt.name.eq_ignore_ascii_case(tf)
-                        {
-                            continue;
-                        }
-                        let is_rtree = vt.module_name.eq_ignore_ascii_case("rtree");
-                        let is_rtree_i32 = vt.module_name.eq_ignore_ascii_case("rtree_i32");
-                        if !is_rtree && !is_rtree_i32 {
-                            continue;
-                        }
-                        let coord_cols = vt
-                            .args
-                            .iter()
-                            .skip(1)
-                            .take_while(|a| !a.trim_start().starts_with('+'))
-                            .count();
-                        let n_dim = if coord_cols.is_multiple_of(2) {
-                            coord_cols / 2
-                        } else {
-                            0usize
-                        };
-                        out.push((slot_name.to_owned(), vt.name.clone(), n_dim, is_rtree_i32));
-                    }
-                };
-            crate::vtab::vtab_flush_shadow_all(ctx)?;
-            if schema.is_none() {
-                for idx in 0..ctx.db_set.slot_count() {
-                    let cur_id = DatabaseId(idx);
-                    if ctx.db_set.slot(cur_id).is_none_or(|s| s.btree.is_none()) {
-                        continue;
-                    }
-                    ctx.ensure_read_db(cur_id, true)?;
-                    let slot = ctx.db_set.slot_mut(cur_id).unwrap();
-                    let roots = slot.schema.all_btree_roots();
-                    if let Some(ref mut bt) = slot.btree {
-                        all_errs.extend(bt.integrity_check(&roots)?);
-                    }
-                    collect_rtrees(&slot.name, &slot.schema.virtual_tables, &mut rtree_targets);
-                }
-            } else {
-                if db_id == DatabaseId::TEMP {
-                    let enc = ctx.encoding();
-                    ctx.db_set.ensure_temp_open(enc, *ctx.writable_schema)?;
-                }
-                ctx.ensure_read_db(db_id, true)?;
-                let slot = ctx.db_set.slot_mut(db_id).unwrap();
-                let roots = slot.schema.all_btree_roots();
-                if let Some(ref mut bt) = slot.btree {
-                    all_errs.extend(bt.integrity_check(&roots)?);
-                }
-                collect_rtrees(&slot.name, &slot.schema.virtual_tables, &mut rtree_targets);
-            }
-            for (slot_name, vt_name, n_dim, is_int) in rtree_targets {
-                if let Ok(report) = sqliters_ext::run_rtreecheck(
-                    |sql, p| query_internal_vtab_sql(ctx, sql, p),
-                    &slot_name,
-                    &vt_name,
-                    n_dim,
-                    is_int,
-                ) && report != "ok"
-                {
-                    all_errs.push(format!("In RTree {slot_name}.{vt_name}:\n{report}"));
-                }
-            }
-            let rows = if all_errs.is_empty() {
-                vec![vec![Value::Text("ok".to_owned())]]
-            } else {
-                all_errs.into_iter().map(|e| vec![Value::Text(e)]).collect()
-            };
-            return Ok(QueryOutput {
-                column_names: vec!["integrity_check".to_owned()],
-                rows,
-            });
+            return exec_integrity_check(ctx, upper == "QUICK_CHECK", schema, db_id, value);
         }
         "TABLE_INFO" | "TABLE_XINFO" => {
             let is_xinfo = upper == "TABLE_XINFO";
@@ -37316,7 +38086,8 @@ pub(crate) fn validate_and_infer_columns(
 
 fn infer_pragma_columns(name: &str, value: Option<&PragmaValue>) -> Vec<String> {
     match name.to_ascii_uppercase().as_str() {
-        "INTEGRITY_CHECK" | "QUICK_CHECK" => vec!["integrity_check".to_owned()],
+        "INTEGRITY_CHECK" => vec!["integrity_check".to_owned()],
+        "QUICK_CHECK" => vec!["quick_check".to_owned()],
         "PAGE_SIZE" => {
             if value.is_some() {
                 Vec::new()

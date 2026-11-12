@@ -12267,4 +12267,184 @@ mod tests {
             }
         }
     }
+
+    /// `PRAGMA integrity_check` / `quick_check` must answer like C SQLite 3.54.1. Every expected
+    /// row below is what the reference `sqlite3` prints for the same file.
+    #[test]
+    fn integrity_check_reports_what_c_sqlite_reports() {
+        fn open(vfs: &Arc<MemoryVfs>, path: &Path) -> Connection {
+            Connection::open_with_vfs(
+                vfs.clone(),
+                Some(path),
+                OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB,
+            )
+            .unwrap()
+        }
+        fn rows(conn: &Connection, sql: &str) -> Vec<String> {
+            conn.query(sql, &[])
+                .unwrap()
+                .rows
+                .iter()
+                .map(|r| r.get_str(0).unwrap().to_owned())
+                .collect()
+        }
+        fn patch(vfs: &MemoryVfs, path: &Path, offset: u64, bytes: &[u8]) {
+            let file = vfs
+                .open(Some(path), OpenFlags::READWRITE | OpenFlags::MAIN_DB)
+                .unwrap();
+            file.write_at(bytes, offset).unwrap();
+        }
+
+        // 1. Rows that violate what the (edited) schema declares.
+        let vfs = Arc::new(MemoryVfs::new());
+        let path = Path::new("/rows.db");
+        let conn = open(&vfs, path);
+        conn.execute_batch(
+            "PRAGMA page_size=1024;
+             CREATE TABLE t1(a,b);
+             CREATE INDEX t1a ON t1(a);
+             INSERT INTO t1 VALUES(1,1),(2,2),(3,3),(2,4),(NULL,5),(NULL,6);
+             CREATE TABLE s(id INTEGER PRIMARY KEY, i, t, r, bl, any1);
+             INSERT INTO s VALUES(1, 5, 'x', 1.5, x'00', 1),(2, 'five', 7, 'r', 9, 'z'),
+                                 (3, 2.5, x'01', 3, 'b', NULL),(4, NULL, NULL, NULL, NULL, NULL);
+             CREATE TABLE aff(x, y, z);
+             INSERT INTO aff VALUES(1, '12', 'abc'),(2.5, '1e2', 5),('t', ' 7 ', 7.5),(x'00', 'x1', NULL);
+             CREATE TABLE ck(p, q);
+             INSERT INTO ck VALUES(1, 2),(5, 1),(NULL, 3),(7, NULL),(0, 0);
+             CREATE TABLE w(k TEXT PRIMARY KEY, v) WITHOUT ROWID;
+             INSERT INTO w VALUES('a',1),('b',2),('c',NULL);",
+        )
+        .unwrap();
+        assert_eq!(rows(&conn, "PRAGMA integrity_check"), ["ok"]);
+        assert_eq!(rows(&conn, "PRAGMA quick_check"), ["ok"]);
+        conn.execute_batch(
+            "PRAGMA writable_schema=ON;
+             UPDATE sqlite_master SET sql='CREATE UNIQUE INDEX t1a ON t1(a)' WHERE name='t1a';
+             UPDATE sqlite_master SET sql='CREATE TABLE t1(a NOT NULL,b)' WHERE name='t1';
+             UPDATE sqlite_master SET sql='CREATE TABLE s(id INTEGER PRIMARY KEY, i INT, t TEXT, r REAL, bl BLOB, any1 ANY) STRICT' WHERE name='s';
+             UPDATE sqlite_master SET sql='CREATE TABLE aff(x TEXT, y NUMERIC, z INTEGER)' WHERE name='aff';
+             UPDATE sqlite_master SET sql='CREATE TABLE ck(p, q, CHECK(p > q), CHECK(q <> 3))' WHERE name='ck';
+             UPDATE sqlite_master SET sql='CREATE TABLE w(k TEXT PRIMARY KEY, v NOT NULL) WITHOUT ROWID' WHERE name='w';
+             PRAGMA writable_schema=OFF;",
+        )
+        .unwrap();
+        assert!(conn.try_close().is_ok());
+        let conn = open(&vfs, path);
+        let full = [
+            "NULL value in w.v",
+            "CHECK constraint failed in ck",
+            "CHECK constraint failed in ck",
+            "CHECK constraint failed in ck",
+            "non-unique entry in index t1a",
+            "NULL value in t1.a",
+            "non-unique entry in index t1a",
+            "NULL value in t1.a",
+            "non-INT value in s.i",
+            "non-TEXT value in s.t",
+            "non-REAL value in s.r",
+            "non-BLOB value in s.bl",
+            "non-INT value in s.i",
+            "non-TEXT value in s.t",
+            "non-BLOB value in s.bl",
+            "NUMERIC value in aff.x",
+            "TEXT value in aff.y",
+            "NUMERIC value in aff.x",
+            "TEXT value in aff.y",
+            "TEXT value in aff.y",
+        ];
+        assert_eq!(rows(&conn, "PRAGMA integrity_check"), full);
+        // quick_check skips the index checks only.
+        let quick: Vec<&str> = full
+            .iter()
+            .copied()
+            .filter(|m| !m.starts_with("non-unique"))
+            .collect();
+        assert_eq!(rows(&conn, "PRAGMA quick_check"), quick);
+        // The argument is an error limit or the one table to check.
+        assert_eq!(rows(&conn, "PRAGMA integrity_check(4)"), full[..4]);
+        assert_eq!(rows(&conn, "PRAGMA integrity_check(1)"), full[..1]);
+        assert_eq!(rows(&conn, "PRAGMA integrity_check(0)"), full);
+        assert_eq!(rows(&conn, "PRAGMA integrity_check(s)"), full[8..15]);
+        assert_eq!(rows(&conn, "PRAGMA quick_check(aff)"), full[15..]);
+        assert_eq!(rows(&conn, "PRAGMA main.integrity_check(w)"), full[..1]);
+        assert_eq!(rows(&conn, "PRAGMA integrity_check(sqlite_schema)"), ["ok"]);
+        for (sql, missing) in [
+            ("PRAGMA integrity_check(xyz)", "xyz"),
+            ("PRAGMA integrity_check='4'", "4"),
+        ] {
+            let err = conn.query(sql, &[]).unwrap_err();
+            assert_eq!(err.message, format!("no such table: {missing}"), "{sql}");
+        }
+        assert_eq!(
+            conn.query("PRAGMA quick_check", &[]).unwrap().column_names,
+            ["quick_check"]
+        );
+        assert_eq!(
+            conn.query("PRAGMA integrity_check", &[])
+                .unwrap()
+                .column_names,
+            ["integrity_check"]
+        );
+        assert!(conn.try_close().is_ok());
+
+        // 2. An index that lost its entries (`pragma-3.2` .. `pragma-3.7` of pragma.test) and a
+        //    page whose header disagrees with its content.
+        let vfs = Arc::new(MemoryVfs::new());
+        let path = Path::new("/pages.db");
+        let conn = open(&vfs, path);
+        conn.execute_batch(
+            "PRAGMA page_size=1024; PRAGMA auto_vacuum=OFF;
+             BEGIN;
+             CREATE TABLE t2(a,b,c);
+             CREATE INDEX i2 ON t2(a);
+             INSERT INTO t2 VALUES(11,2,3);
+             INSERT INTO t2 VALUES(22,3,4);
+             COMMIT;",
+        )
+        .unwrap();
+        let roots = conn
+            .query("SELECT rootpage FROM sqlite_master ORDER BY name", &[])
+            .unwrap();
+        let root_of = |i: usize| match roots.rows[i].values()[0] {
+            Value::Integer(pg) => pg as u64,
+            ref other => panic!("rootpage {other:?}"),
+        };
+        let (i2_root, t2_root) = (root_of(0), root_of(1));
+        assert!(conn.try_close().is_ok());
+
+        // The index root becomes an empty leaf.
+        patch(
+            &vfs,
+            path,
+            1024 * (i2_root - 1),
+            &[0x0a, 0, 0, 0, 0, 0x04, 0, 0, 0, 0, 0],
+        );
+        let conn = open(&vfs, path);
+        let lost = [
+            "wrong # of entries in index i2",
+            "row 1 missing from index i2",
+            "row 2 missing from index i2",
+        ];
+        assert_eq!(rows(&conn, "PRAGMA integrity_check"), lost);
+        assert_eq!(rows(&conn, "PRAGMA integrity_check=1"), lost[..1]);
+        assert_eq!(rows(&conn, "PRAGMA integrity_check=t2"), lost);
+        assert_eq!(rows(&conn, "PRAGMA quick_check"), lost[..1]);
+        assert_eq!(rows(&conn, "PRAGMA integrity_check=sqlite_schema"), ["ok"]);
+        conn.execute_batch("REINDEX t2").unwrap();
+        assert_eq!(rows(&conn, "PRAGMA integrity_check"), ["ok"]);
+        assert!(conn.try_close().is_ok());
+
+        // The table leaf claims five fragmented bytes it does not have: all b-tree level
+        // findings of one database come back as a single row.
+        patch(&vfs, path, 1024 * (t2_root - 1) + 7, &[5]);
+        let conn = open(&vfs, path);
+        let frag = format!(
+            "*** in database main ***\nFragmentation of 0 bytes reported as 5 on page {t2_root}"
+        );
+        assert_eq!(rows(&conn, "PRAGMA integrity_check"), [frag.as_str()]);
+        assert_eq!(rows(&conn, "PRAGMA quick_check"), [frag.as_str()]);
+        assert_eq!(rows(&conn, "PRAGMA integrity_check(t2)"), [frag.as_str()]);
+        assert_eq!(rows(&conn, "PRAGMA integrity_check(sqlite_schema)"), ["ok"]);
+        assert!(conn.try_close().is_ok());
+    }
 }

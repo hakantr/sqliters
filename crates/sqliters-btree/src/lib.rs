@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cursor;
+mod integrity;
 pub mod page;
 pub mod ptrmap;
 
@@ -18,8 +19,8 @@ use sqliters_pager::{
     WalCheckpointResult, create_super_journal_file,
 };
 use sqliters_types::{
-    Bitvec, ErrorCode, IntRangeProbe, KeySortOrder, Pgno, RawField, RawRecordKey, Result,
-    SqliteError, TextEncoding, Value, compare_raw_record_range, compare_raw_records_with_encoding,
+    ErrorCode, IntRangeProbe, KeySortOrder, Pgno, RawField, RawRecordKey, Result, SqliteError,
+    TextEncoding, Value, compare_raw_record_range, compare_raw_records_with_encoding,
     compare_records_with_encoding, decode_record_with_encoding, decode_serial_value_with_encoding,
     extended, get_varint, get_varint_i64, parse_raw_record_prefix, push_varint, put_varint,
     serial_type_len, varint_len,
@@ -30,6 +31,7 @@ pub use cursor::{
     BTCURSOR_MAX_DEPTH, BtreeCursorState, CursorId, CursorKind, CursorPagePos, CursorStack,
     SavedCursorKey, SkipNext,
 };
+pub use integrity::IntegrityReport;
 pub use page::{
     BtreePageType, IndexInteriorCell, IndexLeafCell, ParsedPage, PayloadBounds, RawIndexCell,
     RawIndexInteriorStep, RawIndexLeafView, RawLeafDeleteOutcome, RawTableLeafCell,
@@ -82,6 +84,22 @@ pub enum TableRowSeek {
     /// Row found, but its record is not available as one in-page slice (nothing copied): it
     /// continues on overflow pages, or the page is a 64 KiB page.
     Spilled,
+}
+
+/// What the parent of a table B+Tree page has to do after a row was deleted below that page
+/// (see [`Btree::delete_table_rec`]).
+#[derive(Debug)]
+enum TableDeleteFixup {
+    /// Nothing: the page is still a valid, non-empty member of the tree.
+    None,
+    /// The page lost its last cell and was freed: the parent drops its pointer to it.
+    Freed,
+    /// The page is a non-root interior page left with no cell and this single child. It is still
+    /// allocated and its stored content is stale: the parent merges it with a sibling.
+    LoneChild(Pgno),
+    /// The page is a non-root interior page that overflowed while taking over new dividers and
+    /// was split into itself plus `[(divider, right_sibling), ...]`.
+    Split(Vec<(i64, Pgno)>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2664,64 +2682,7 @@ impl Btree {
                 (cells, right_child)
             };
 
-            let candidate = ParsedPage::TableInterior { cells, right_child };
-            if candidate.fits_in_page(pgno, usable) {
-                self.write_parsed_page(pgno, &candidate)?;
-                return Ok(Vec::new());
-            }
-            if is_root && pgno == 1 && candidate.fits_in_page(2, usable) {
-                let child_pgno = self.allocate_page()?;
-                self.write_parsed_page(child_pgno, &candidate)?;
-                self.write_parsed_page(
-                    1,
-                    &ParsedPage::TableInterior {
-                        cells: Vec::new(),
-                        right_child: child_pgno,
-                    },
-                )?;
-                return Ok(Vec::new());
-            }
-
-            let ParsedPage::TableInterior {
-                mut cells,
-                right_child: orig_right,
-            } = candidate
-            else {
-                unreachable!()
-            };
-            let mid = cells.len() / 2;
-            let right_cells = cells.split_off(mid + 1);
-            let promoted = cells.pop().expect("mid exists");
-
-            let left_page = ParsedPage::TableInterior {
-                cells,
-                right_child: promoted.left_child,
-            };
-            let right_page = ParsedPage::TableInterior {
-                cells: right_cells,
-                right_child: orig_right,
-            };
-
-            if is_root {
-                let left_pgno = self.allocate_page()?;
-                let right_pgno = self.allocate_page()?;
-                self.write_parsed_page(left_pgno, &left_page)?;
-                self.write_parsed_page(right_pgno, &right_page)?;
-                let new_root = ParsedPage::TableInterior {
-                    cells: vec![TableInteriorCell {
-                        left_child: left_pgno,
-                        key: promoted.key,
-                    }],
-                    right_child: right_pgno,
-                };
-                self.write_parsed_page(pgno, &new_root)?;
-                return Ok(Vec::new());
-            }
-
-            let right_pgno = self.allocate_page()?;
-            self.write_parsed_page(pgno, &left_page)?;
-            self.write_parsed_page(right_pgno, &right_page)?;
-            return Ok(vec![(promoted.key, right_pgno)]);
+            return self.store_table_interior(pgno, cells, right_child, is_root);
         }
 
         if ptype == BtreePageType::TableLeaf {
@@ -2834,6 +2795,78 @@ impl Btree {
         }
     }
 
+    /// Writes the updated content `cells` / `right_child` of interior table page `pgno`, splitting
+    /// it when it no longer fits. A split root keeps its page number and grows the tree by one
+    /// level (`balance_deeper`); a split non-root page keeps its left half and returns
+    /// `[(divider, right_sibling)]` for the parent to absorb. Returns an empty `Vec` otherwise.
+    fn store_table_interior(
+        &mut self,
+        pgno: Pgno,
+        cells: Vec<TableInteriorCell>,
+        right_child: Pgno,
+        is_root: bool,
+    ) -> Result<Vec<(i64, Pgno)>> {
+        let usable = self.pager.usable_size();
+        let candidate = ParsedPage::TableInterior { cells, right_child };
+        if candidate.fits_in_page(pgno, usable) {
+            self.write_parsed_page(pgno, &candidate)?;
+            return Ok(Vec::new());
+        }
+        if is_root && pgno == 1 && candidate.fits_in_page(2, usable) {
+            let child_pgno = self.allocate_page()?;
+            self.write_parsed_page(child_pgno, &candidate)?;
+            self.write_parsed_page(
+                1,
+                &ParsedPage::TableInterior {
+                    cells: Vec::new(),
+                    right_child: child_pgno,
+                },
+            )?;
+            return Ok(Vec::new());
+        }
+
+        let ParsedPage::TableInterior {
+            mut cells,
+            right_child: orig_right,
+        } = candidate
+        else {
+            unreachable!()
+        };
+        let mid = cells.len() / 2;
+        let right_cells = cells.split_off(mid + 1);
+        let promoted = cells.pop().expect("mid exists");
+
+        let left_page = ParsedPage::TableInterior {
+            cells,
+            right_child: promoted.left_child,
+        };
+        let right_page = ParsedPage::TableInterior {
+            cells: right_cells,
+            right_child: orig_right,
+        };
+
+        if is_root {
+            let left_pgno = self.allocate_page()?;
+            let right_pgno = self.allocate_page()?;
+            self.write_parsed_page(left_pgno, &left_page)?;
+            self.write_parsed_page(right_pgno, &right_page)?;
+            let new_root = ParsedPage::TableInterior {
+                cells: vec![TableInteriorCell {
+                    left_child: left_pgno,
+                    key: promoted.key,
+                }],
+                right_child: right_pgno,
+            };
+            self.write_parsed_page(pgno, &new_root)?;
+            return Ok(Vec::new());
+        }
+
+        let right_pgno = self.allocate_page()?;
+        self.write_parsed_page(pgno, &left_page)?;
+        self.write_parsed_page(right_pgno, &right_page)?;
+        Ok(vec![(promoted.key, right_pgno)])
+    }
+
     /// Deletes `rowid` from the Table B+Tree rooted at `root_pgno`. Returns `true` if a row was deleted.
     pub fn delete_table(&mut self, root_pgno: Pgno, rowid: i64) -> Result<bool> {
         self.delete_table_at(root_pgno, rowid, None)
@@ -2907,16 +2940,14 @@ impl Btree {
         }
     }
 
-    /// Returns `(deleted, child_replacement)`:
-    /// - `None`: `pgno` still valid and non-empty (or is `is_root`).
-    /// - `Some(0)`: `pgno` was a non-root leaf that became completely empty and has been freed!
-    /// - `Some(sole_child)`: `pgno` was a non-root interior page reduced to 0 cells; freed and replaced by `sole_child`!
+    /// Returns `(deleted, fixup)`, where `fixup` tells the parent of `pgno` what is left to do;
+    /// see [`TableDeleteFixup`]. A root (`is_root`) always reports [`TableDeleteFixup::None`].
     fn delete_table_rec(
         &mut self,
         pgno: Pgno,
         rowid: i64,
         is_root: bool,
-    ) -> Result<(bool, Option<Pgno>)> {
+    ) -> Result<(bool, TableDeleteFixup)> {
         let usable = self.pager.usable_size();
         let ptype = {
             let raw = self.pager.read_page(pgno)?;
@@ -2928,12 +2959,11 @@ impl Btree {
                 let raw = self.pager.read_page(pgno)?;
                 find_table_interior_child(pgno, usable, raw, rowid)?
             };
-            let (deleted, replacement) = self.delete_table_rec(target_child, rowid, false)?;
-            if !deleted || replacement.is_none() {
-                return Ok((deleted, None));
+            let (deleted, fixup) = self.delete_table_rec(target_child, rowid, false)?;
+            if !deleted || matches!(fixup, TableDeleteFixup::None) {
+                return Ok((deleted, TableDeleteFixup::None));
             }
 
-            let rep = replacement.unwrap();
             let ParsedPage::TableInterior {
                 mut cells,
                 mut right_child,
@@ -2942,38 +2972,80 @@ impl Btree {
                 return Err(SqliteError::corrupt("expected table interior page"));
             };
 
-            if rep == 0 {
-                if idx < cells.len() {
-                    cells.remove(idx);
-                } else if let Some(last) = cells.pop() {
-                    right_child = last.left_child;
-                } else if is_root {
-                    self.write_parsed_page(pgno, &ParsedPage::TableLeaf { cells: Vec::new() })?;
-                    return Ok((true, None));
-                } else {
-                    return Ok((true, Some(0)));
+            match fixup {
+                TableDeleteFixup::None => unreachable!("handled above"),
+                TableDeleteFixup::Freed => {
+                    if idx < cells.len() {
+                        cells.remove(idx);
+                    } else if let Some(last) = cells.pop() {
+                        right_child = last.left_child;
+                    } else if is_root {
+                        self.write_parsed_page(pgno, &ParsedPage::TableLeaf { cells: Vec::new() })?;
+                        return Ok((true, TableDeleteFixup::None));
+                    } else {
+                        // Only child gone: this page holds nothing any more either.
+                        self.free_page(pgno)?;
+                        return Ok((true, TableDeleteFixup::Freed));
+                    }
                 }
-            } else if idx < cells.len() {
-                cells[idx].left_child = rep;
-            } else {
-                right_child = rep;
+                TableDeleteFixup::LoneChild(lone_child) => {
+                    if cells.is_empty() {
+                        // `target_child` is the only child of this page, so there is no sibling
+                        // to merge it with: drop that whole level instead. Every leaf below
+                        // moves up by one, which keeps the tree balanced.
+                        self.free_page(target_child)?;
+                        right_child = lone_child;
+                    } else {
+                        self.rebalance_lone_table_interior(
+                            &mut cells,
+                            &mut right_child,
+                            idx,
+                            lone_child,
+                        )?;
+                    }
+                }
+                TableDeleteFixup::Split(child_splits) => {
+                    let mut cur_left = target_child;
+                    let mut new_int_cells = Vec::with_capacity(child_splits.len());
+                    for &(div_key, next_sib) in &child_splits {
+                        new_int_cells.push(TableInteriorCell {
+                            left_child: cur_left,
+                            key: div_key,
+                        });
+                        cur_left = next_sib;
+                    }
+                    if idx < cells.len() {
+                        cells[idx].left_child = cur_left;
+                        cells.splice(idx..idx, new_int_cells);
+                    } else {
+                        cells.extend(new_int_cells);
+                        right_child = cur_left;
+                    }
+                }
             }
 
             if cells.is_empty() {
                 if !is_root {
-                    self.free_page(pgno)?;
-                    return Ok((true, Some(right_child)));
+                    // Left with a single child. Replacing this page by that child would make
+                    // the subtree one level shorter than its siblings, so the page stays and
+                    // the parent merges it with a sibling (`balance_nonroot`).
+                    return Ok((true, TableDeleteFixup::LoneChild(right_child)));
                 }
                 let child_parsed = self.read_parsed_page(right_child)?;
                 if child_parsed.fits_in_page(pgno, usable) {
                     self.write_parsed_page(pgno, &child_parsed)?;
                     self.free_page(right_child)?;
-                    return Ok((true, None));
+                    return Ok((true, TableDeleteFixup::None));
                 }
             }
 
-            self.write_parsed_page(pgno, &ParsedPage::TableInterior { cells, right_child })?;
-            return Ok((true, None));
+            let splits = self.store_table_interior(pgno, cells, right_child, is_root)?;
+            let fixup = if splits.is_empty() {
+                TableDeleteFixup::None
+            } else {
+                TableDeleteFixup::Split(splits)
+            };
+            return Ok((true, fixup));
         }
 
         if ptype == BtreePageType::TableLeaf {
@@ -2983,14 +3055,14 @@ impl Btree {
                 seek_table_leaf_cell(pgno, usable, raw, rowid)?.is_some()
             };
             if !exists {
-                return Ok((false, None));
+                return Ok((false, TableDeleteFixup::None));
             }
             let outcome = {
                 let raw_mut = self.pager.write_page(pgno)?;
                 try_delete_table_leaf_in_place(pgno, usable, raw_mut, rowid, is_root, None)?
             };
             match outcome {
-                RawLeafDeleteOutcome::NotFound => return Ok((false, None)),
+                RawLeafDeleteOutcome::NotFound => return Ok((false, TableDeleteFixup::None)),
                 RawLeafDeleteOutcome::DeletedInPlace {
                     overflow_page,
                     now_empty,
@@ -2998,9 +3070,9 @@ impl Btree {
                     self.free_overflow_chain(overflow_page)?;
                     if now_empty && !is_root {
                         self.free_page(pgno)?;
-                        return Ok((true, Some(0)));
+                        return Ok((true, TableDeleteFixup::Freed));
                     }
-                    return Ok((true, None));
+                    return Ok((true, TableDeleteFixup::None));
                 }
                 RawLeafDeleteOutcome::Fallback => {}
             }
@@ -3010,21 +3082,138 @@ impl Btree {
         match parsed {
             ParsedPage::TableLeaf { mut cells } => {
                 let Ok(idx) = cells.binary_search_by_key(&rowid, |c| c.rowid) else {
-                    return Ok((false, None));
+                    return Ok((false, TableDeleteFixup::None));
                 };
                 let removed = cells.remove(idx);
                 self.free_overflow_chain(removed.overflow_page)?;
 
                 if cells.is_empty() && !is_root {
                     self.free_page(pgno)?;
-                    return Ok((true, Some(0)));
+                    return Ok((true, TableDeleteFixup::Freed));
                 }
 
                 self.write_parsed_page(pgno, &ParsedPage::TableLeaf { cells })?;
-                Ok((true, None))
+                Ok((true, TableDeleteFixup::None))
             }
             _ => Err(SqliteError::corrupt("expected table page in delete")),
         }
+    }
+
+    /// `balance_nonroot` for the interior level of a table B+Tree, entered for the child at slot
+    /// `idx` of an interior page whose content is `cells` / `right_child`. That child has no
+    /// cells left and the single child `lone_child`; its page is still allocated but its stored
+    /// content is stale.
+    ///
+    /// As in C the child is rebalanced together with up to two adjacent siblings: the parent
+    /// dividers between them come down (taking the right-child pointer of the sibling on their
+    /// left), the combined cell list is redistributed with the sibling packing of
+    /// `balance_nonroot`, sibling pages that are no longer needed are freed and `cells` /
+    /// `right_child` receive the new dividers. Every page written holds at least one cell and
+    /// all of them stay at the level of the old siblings, so the leaves keep their depth.
+    fn rebalance_lone_table_interior(
+        &mut self,
+        cells: &mut Vec<TableInteriorCell>,
+        right_child: &mut Pgno,
+        idx: usize,
+        lone_child: Pgno,
+    ) -> Result<()> {
+        let usable = self.pager.usable_size();
+        let m = cells.len();
+        debug_assert!(m >= 1 && idx <= m);
+        let (nx_div, n_old) = if m < 2 {
+            (0usize, 2usize)
+        } else if idx == 0 {
+            (0usize, 3usize)
+        } else if idx == m {
+            (m - 2, 3usize)
+        } else {
+            (idx - 1, 3usize)
+        };
+
+        let mut avail_pgnos = Vec::with_capacity(n_old);
+        let mut all: Vec<TableInteriorCell> = Vec::new();
+        let mut last_right: Pgno = 0;
+        for pos in nx_div..(nx_div + n_old) {
+            let sib_pgno = cells.get(pos).map_or(*right_child, |c| c.left_child);
+            avail_pgnos.push(sib_pgno);
+            let sib_right = if pos == idx {
+                lone_child
+            } else {
+                let ParsedPage::TableInterior {
+                    cells: sib_cells,
+                    right_child: sib_right,
+                } = self.read_parsed_page(sib_pgno)?
+                else {
+                    return Err(SqliteError::corrupt("expected sibling table interior page"));
+                };
+                all.extend(sib_cells);
+                sib_right
+            };
+            if pos + 1 < nx_div + n_old {
+                all.push(TableInteriorCell {
+                    left_child: sib_right,
+                    key: cells[pos].key,
+                });
+            } else {
+                last_right = sib_right;
+            }
+        }
+
+        let cnt_new = interior_balance_counts(all.len(), |i| all[i].encoded_size(), usable);
+        let k = cnt_new.len();
+        let mut start = 0usize;
+        for (j, &end) in cnt_new.iter().enumerate() {
+            let last = j + 1 == k;
+            if end <= start
+                || end > all.len()
+                || (last && end != all.len())
+                || (!last && end >= all.len())
+            {
+                return Err(SqliteError::corrupt(
+                    "table interior rebalance produced an empty sibling",
+                ));
+            }
+            start = end + 1;
+        }
+
+        while avail_pgnos.len() < k {
+            avail_pgnos.push(self.allocate_page()?);
+        }
+        while avail_pgnos.len() > k {
+            let extra_pg = avail_pgnos.pop().expect("len > k");
+            self.free_page(extra_pg)?;
+        }
+        avail_pgnos.sort_unstable();
+
+        let mut start = 0usize;
+        for (j, &end) in cnt_new.iter().enumerate() {
+            let page_right = if j + 1 < k {
+                all[end].left_child
+            } else {
+                last_right
+            };
+            self.write_parsed_page(
+                avail_pgnos[j],
+                &ParsedPage::TableInterior {
+                    cells: all[start..end].to_vec(),
+                    right_child: page_right,
+                },
+            )?;
+            start = end + 1;
+        }
+
+        let new_dividers = (0..(k - 1)).map(|j| TableInteriorCell {
+            left_child: avail_pgnos[j],
+            key: all[cnt_new[j]].key,
+        });
+        if nx_div + n_old - 1 < m {
+            cells[nx_div + n_old - 1].left_child = avail_pgnos[k - 1];
+            cells.splice(nx_div..(nx_div + n_old - 1), new_dividers);
+        } else {
+            cells.splice(nx_div..m, new_dividers);
+            *right_child = avail_pgnos[k - 1];
+        }
+        Ok(())
     }
 
     // ========================================================================
@@ -3298,6 +3487,7 @@ impl Btree {
 
     /// Zero-allocation O(log N) existence check for whether any entry in the Index B-Tree rooted
     /// at `root_pgno` matches `prefix_values` under `orders[..prefix_values.len()]`.
+    /// An entry whose record has fewer fields than `prefix_values` is damaged and never matches.
     pub fn index_contains_prefix_raw(
         &mut self,
         root_pgno: Pgno,
@@ -3312,6 +3502,8 @@ impl Btree {
         let max_pages = (self.pager.page_count() as usize).saturating_add(2);
         let mut depth = 0usize;
         let mut pgno = root_pgno;
+        // All-integer keys are decided without the general record comparison.
+        let probe = IntRangeProbe::new(prefix_values, None, None, orders);
 
         loop {
             self.check_interrupted()?;
@@ -3330,18 +3522,20 @@ impl Btree {
                 let (ptype, n_cell, right_child) = raw_page_header(pgno, usable, raw)?;
                 match ptype {
                     BtreePageType::IndexLeaf => {
+                        let view = RawIndexLeafView::new(pgno, usable, raw, n_cell);
                         let mut lo = 0usize;
                         let mut hi = n_cell;
                         let mut slow = false;
                         let mut found = false;
                         while lo < hi {
                             let mid = lo + (hi - lo) / 2;
-                            let cell = read_index_leaf_cell(pgno, usable, raw, n_cell, mid)?;
+                            let cell = view.cell(mid)?;
                             if cell.overflow_page.is_some() {
                                 slow = true;
                                 break;
                             }
-                            let ord = compare_raw_record_range(
+                            let ord = compare_index_cell_range(
+                                probe.as_ref(),
                                 cell.local_payload,
                                 prefix_values,
                                 None,
@@ -3352,7 +3546,12 @@ impl Btree {
                             match ord {
                                 Ordering::Less => lo = mid + 1,
                                 Ordering::Equal => {
-                                    found = true;
+                                    // A record with fewer fields than the key compares equal
+                                    // on what it has, but it is not the entry looked for.
+                                    found = raw_record_has_fields(
+                                        cell.local_payload,
+                                        prefix_values.len(),
+                                    );
                                     break;
                                 }
                                 Ordering::Greater => hi = mid,
@@ -3370,6 +3569,7 @@ impl Btree {
                         let mut lo_child = right_child;
                         let mut slow = false;
                         let mut found = false;
+                        let mut short = false;
                         while lo < hi {
                             let mid = lo + (hi - lo) / 2;
                             let (lc, cell) =
@@ -3378,7 +3578,8 @@ impl Btree {
                                 slow = true;
                                 break;
                             }
-                            let ord = compare_raw_record_range(
+                            let ord = compare_index_cell_range(
+                                probe.as_ref(),
                                 cell.local_payload,
                                 prefix_values,
                                 None,
@@ -3390,6 +3591,10 @@ impl Btree {
                                 Ordering::Less => lo = mid + 1,
                                 Ordering::Equal => {
                                     found = true;
+                                    short = !raw_record_has_fields(
+                                        cell.local_payload,
+                                        prefix_values.len(),
+                                    );
                                     break;
                                 }
                                 Ordering::Greater => {
@@ -3401,7 +3606,7 @@ impl Btree {
                         if slow {
                             PrefixStep::SlowInterior(n_cell, right_child)
                         } else if found {
-                            PrefixStep::Found(true)
+                            PrefixStep::Found(!short)
                         } else {
                             PrefixStep::Descend(lo_child)
                         }
@@ -5857,7 +6062,8 @@ impl Btree {
         pgno: Pgno,
         mut cells: Vec<IndexLeafCell>,
     ) -> Result<Option<(IndexLeafCell, Pgno)>> {
-        let mid = cells.len() / 2;
+        let usable = self.pager.usable_size() as usize;
+        let mid = split_promote_index(cells.len(), |i| cells[i].encoded_size() + 2, usable - 8);
         let right_cells = cells.split_off(mid + 1);
         let promoted = cells.pop().expect("mid cell exists");
 
@@ -5873,7 +6079,8 @@ impl Btree {
         mut cells: Vec<IndexInteriorCell>,
         orig_right: Pgno,
     ) -> Result<Option<(IndexLeafCell, Pgno)>> {
-        let mid = cells.len() / 2;
+        let usable = self.pager.usable_size() as usize;
+        let mid = split_promote_index(cells.len(), |i| cells[i].encoded_size() + 2, usable - 12);
         let right_cells = cells.split_off(mid + 1);
         let promoted = cells.pop().expect("mid cell exists");
 
@@ -6274,320 +6481,6 @@ impl Btree {
             }
         }
     }
-
-    // ========================================================================
-    // PRAGMA integrity_check (`sqlite3BtreeIntegrityCheck`)
-    // ========================================================================
-
-    /// Verifies that every page `1..=page_count` is referenced exactly once across `roots`
-    /// (which must include `1`), their child pages, their overflow chains, and the freelist!
-    /// Returns an empty `Vec` when healthy (`"ok"`), or human-readable corruption diagnostics.
-    pub fn integrity_check(&mut self, roots: &[Pgno]) -> Result<Vec<String>> {
-        let total_pages = self.pager.page_count();
-        if total_pages == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut seen = Bitvec::new(total_pages);
-        let mut errors = Vec::new();
-        let usable_u32 = self.pager.usable_size();
-        let usable = usable_u32 as usize;
-        let lock_byte_pgno = self.lock_byte_page();
-
-        let max_root_in_list = roots.iter().copied().max().unwrap_or(1);
-        let hdr_max_root = self.pager.header().largest_root_btree_page;
-        let hdr_incr = self.pager.header().incremental_vacuum_mode;
-        let auto_vacuum = hdr_max_root > 0;
-
-        if hdr_max_root > 0 && max_root_in_list != hdr_max_root {
-            errors.push(format!(
-                "max rootpage ({max_root_in_list}) disagrees with header ({hdr_max_root})"
-            ));
-        }
-        if hdr_max_root == 0 && hdr_incr != 0 {
-            errors.push("incremental_vacuum enabled with a max rootpage of zero".to_string());
-        }
-        if hdr_max_root > 0 && hdr_incr > 1 {
-            errors.push(format!("invalid incremental_vacuum value ({hdr_incr})"));
-        }
-
-        #[allow(clippy::too_many_arguments)]
-        fn mark_page(
-            seen: &mut Bitvec,
-            total_pages: Pgno,
-            usable_u32: u32,
-            lock_byte_pgno: Pgno,
-            auto_vacuum: bool,
-            pgno: Pgno,
-            label: &str,
-            errs: &mut Vec<String>,
-        ) -> bool {
-            if pgno == 0 || pgno > total_pages {
-                errs.push(format!("{label} references out-of-range page {pgno}"));
-                false
-            } else if pgno == lock_byte_pgno {
-                errs.push(format!("{label} references lock-byte page {pgno}"));
-                false
-            } else if auto_vacuum && is_ptrmap_page(pgno, usable_u32, lock_byte_pgno) {
-                errs.push(format!("Page {pgno}: pointer map referenced"));
-                false
-            } else if let Ok(newly_set) = seen.set(pgno)
-                && !newly_set
-            {
-                errs.push(format!("2nd reference to page {pgno} ({label})"));
-                false
-            } else {
-                true
-            }
-        }
-
-        fn check_ptrmap(
-            btree: &mut Btree,
-            pgno: Pgno,
-            expected_type: PtrmapType,
-            expected_parent: Pgno,
-            errs: &mut Vec<String>,
-        ) {
-            if pgno < 2 {
-                return;
-            }
-            match btree.ptrmap_get(pgno) {
-                Ok((actual_type, actual_parent)) => {
-                    if actual_type != expected_type || actual_parent != expected_parent {
-                        errs.push(format!(
-                            "Bad ptr map entry key={pgno} expected=({},{expected_parent}) got=({},{actual_parent})",
-                            expected_type as u8, actual_type as u8
-                        ));
-                    }
-                }
-                Err(_) => {
-                    errs.push(format!("Failed to read ptrmap key={pgno}"));
-                }
-            }
-        }
-
-        #[allow(clippy::too_many_arguments)]
-        fn walk_ovfl(
-            mut ovfl: Option<Pgno>,
-            owner_pgno: Pgno,
-            total_pages: Pgno,
-            usable_u32: u32,
-            lock_byte_pgno: Pgno,
-            auto_vacuum: bool,
-            seen: &mut Bitvec,
-            btree: &mut Btree,
-            errs: &mut Vec<String>,
-        ) -> Result<()> {
-            let mut expected_type = PtrmapType::Overflow1;
-            let mut expected_parent = owner_pgno;
-            while let Some(opg) = ovfl.filter(|&p| p != 0) {
-                btree.check_interrupted()?;
-                if opg > total_pages {
-                    errs.push(format!("overflow page {opg} out of range"));
-                    break;
-                }
-                if opg == lock_byte_pgno {
-                    errs.push(format!("overflow page {opg} references lock-byte page"));
-                    break;
-                }
-                if auto_vacuum && is_ptrmap_page(opg, usable_u32, lock_byte_pgno) {
-                    errs.push(format!("Page {opg}: pointer map referenced"));
-                    break;
-                }
-                if auto_vacuum {
-                    check_ptrmap(btree, opg, expected_type, expected_parent, errs);
-                }
-                if let Ok(newly) = seen.set(opg)
-                    && !newly
-                {
-                    errs.push(format!("2nd reference to overflow page {opg}"));
-                    break;
-                }
-                let r = btree.pager.read_page(opg)?;
-                let nxt = u32::from_be_bytes([r[0], r[1], r[2], r[3]]);
-                expected_type = PtrmapType::Overflow2;
-                expected_parent = opg;
-                ovfl = if nxt == 0 { None } else { Some(nxt) };
-            }
-            Ok(())
-        }
-
-        // 1. Walk freelist
-        let mut trunk = self.pager.header().first_freelist_trunk_page;
-        let mut counted_free = 0u32;
-        while trunk != 0 {
-            self.check_interrupted()?;
-            let trunk_valid = mark_page(
-                &mut seen,
-                total_pages,
-                usable_u32,
-                lock_byte_pgno,
-                auto_vacuum,
-                trunk,
-                "freelist trunk",
-                &mut errors,
-            );
-            counted_free += 1;
-            if !trunk_valid {
-                break;
-            }
-            if auto_vacuum {
-                check_ptrmap(self, trunk, PtrmapType::FreePage, 0, &mut errors);
-            }
-            let raw = self.pager.read_page(trunk)?.to_vec();
-            let next_trunk = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
-            let n_leaves = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
-            for i in 0..n_leaves as usize {
-                let off = 8 + 4 * i;
-                if off + 4 > usable {
-                    errors.push(format!("freelist trunk {trunk} leaf count corrupt"));
-                    break;
-                }
-                let leaf = u32::from_be_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
-                let leaf_valid = mark_page(
-                    &mut seen,
-                    total_pages,
-                    usable_u32,
-                    lock_byte_pgno,
-                    auto_vacuum,
-                    leaf,
-                    "freelist leaf",
-                    &mut errors,
-                );
-                if leaf_valid && auto_vacuum {
-                    check_ptrmap(self, leaf, PtrmapType::FreePage, 0, &mut errors);
-                }
-                counted_free += 1;
-            }
-            trunk = next_trunk;
-        }
-        if counted_free != self.pager.header().total_freelist_pages {
-            errors.push(format!(
-                "freelist_count mismatch: header says {}, found {counted_free}",
-                self.pager.header().total_freelist_pages
-            ));
-        }
-
-        // 2. Walk every B-tree root
-        let mut stack: Vec<(Pgno, Option<Pgno>)> = roots.iter().map(|&r| (r, None)).collect();
-        while let Some((pgno, parent_opt)) = stack.pop() {
-            self.check_interrupted()?;
-            let is_root = parent_opt.is_none();
-            let page_valid = mark_page(
-                &mut seen,
-                total_pages,
-                usable_u32,
-                lock_byte_pgno,
-                auto_vacuum,
-                pgno,
-                "btree page",
-                &mut errors,
-            );
-            if !page_valid {
-                continue;
-            }
-            if auto_vacuum && pgno > 1 {
-                match parent_opt {
-                    None => check_ptrmap(self, pgno, PtrmapType::RootPage, 0, &mut errors),
-                    Some(parent_pgno) => {
-                        check_ptrmap(self, pgno, PtrmapType::BtreeNode, parent_pgno, &mut errors)
-                    }
-                }
-            }
-            let parsed = match self.read_parsed_page(pgno) {
-                Ok(p) => p,
-                Err(e) => {
-                    errors.push(format!("page {pgno}: {e}"));
-                    continue;
-                }
-            };
-            if !is_root && parsed.cell_count() == 0 {
-                errors.push(format!("non-root btree page {pgno} has 0 cells"));
-            }
-
-            match parsed {
-                ParsedPage::TableLeaf { cells } => {
-                    for w in cells.windows(2) {
-                        if w[0].rowid >= w[1].rowid {
-                            errors.push(format!("rowids out of order on table leaf {pgno}"));
-                            break;
-                        }
-                    }
-                    for c in cells {
-                        walk_ovfl(
-                            c.overflow_page,
-                            pgno,
-                            total_pages,
-                            usable_u32,
-                            lock_byte_pgno,
-                            auto_vacuum,
-                            &mut seen,
-                            self,
-                            &mut errors,
-                        )?;
-                    }
-                }
-                ParsedPage::TableInterior { cells, right_child } => {
-                    for w in cells.windows(2) {
-                        if w[0].key >= w[1].key {
-                            errors.push(format!("keys out of order on table interior {pgno}"));
-                            break;
-                        }
-                    }
-                    for c in cells {
-                        stack.push((c.left_child, Some(pgno)));
-                    }
-                    stack.push((right_child, Some(pgno)));
-                }
-                ParsedPage::IndexLeaf { cells } => {
-                    for c in cells {
-                        walk_ovfl(
-                            c.overflow_page,
-                            pgno,
-                            total_pages,
-                            usable_u32,
-                            lock_byte_pgno,
-                            auto_vacuum,
-                            &mut seen,
-                            self,
-                            &mut errors,
-                        )?;
-                    }
-                }
-                ParsedPage::IndexInterior { cells, right_child } => {
-                    for c in cells {
-                        walk_ovfl(
-                            c.overflow_page,
-                            pgno,
-                            total_pages,
-                            usable_u32,
-                            lock_byte_pgno,
-                            auto_vacuum,
-                            &mut seen,
-                            self,
-                            &mut errors,
-                        )?;
-                        stack.push((c.left_child, Some(pgno)));
-                    }
-                    stack.push((right_child, Some(pgno)));
-                }
-            }
-        }
-
-        // 3. Check for unreferenced pages
-        for pgno in 1..=total_pages {
-            if pgno == lock_byte_pgno
-                || (auto_vacuum && is_ptrmap_page(pgno, usable_u32, lock_byte_pgno))
-            {
-                continue;
-            }
-            if !seen.test(pgno) {
-                errors.push(format!("Page {pgno} is never used"));
-            }
-        }
-
-        Ok(errors)
-    }
 }
 
 /// Byte range of one serialized index cell inside a scratch arena. `len` is the unpadded cell
@@ -6788,6 +6681,75 @@ fn index_leaf_balance_counts<F: Fn(usize) -> usize>(
         sz_new[i - 1] = sz_left;
     }
     cnt_new
+}
+
+/// `true` when the header of the serialized record `rec` is well formed as far as its first
+/// `n` fields go, i.e. the record has at least that many fields.
+fn raw_record_has_fields(rec: &[u8], n: usize) -> bool {
+    let Ok((hdr_size, mut pos)) = get_varint(rec) else {
+        return false;
+    };
+    let Ok(end) = usize::try_from(hdr_size) else {
+        return false;
+    };
+    if end > rec.len() {
+        return false;
+    }
+    let mut count = 0usize;
+    while count < n {
+        if pos >= end {
+            return false;
+        }
+        let Ok((_, len)) = get_varint(&rec[pos..end]) else {
+            return false;
+        };
+        pos += len;
+        count += 1;
+    }
+    true
+}
+
+/// Picks the cell to promote when an overfull index page of `n` cells is split in two: cells
+/// before it stay, cells after it move to the new right sibling. `footprint(i)` is the size of
+/// cell `i` including its 2-byte pointer and `space` what a page offers after its header.
+///
+/// The middle cell by count is kept whenever both halves fit. Index cells differ in size by two
+/// orders of magnitude, though, so a half can come out larger than a page; the promoted cell
+/// then moves to the nearest position for which both halves fit. One exists whenever the cells
+/// overflow a single page by at most one cell, which is how such a page comes about.
+fn split_promote_index<F: Fn(usize) -> usize>(n: usize, footprint: F, space: usize) -> usize {
+    let mid = n / 2;
+    let mut prefix = Vec::with_capacity(n + 1);
+    prefix.push(0usize);
+    for i in 0..n {
+        prefix.push(prefix[i] + footprint(i));
+    }
+    let fits = |m: usize| prefix[m] <= space && prefix[n] - prefix[m + 1] <= space;
+    if n < 3 || fits(mid) {
+        return mid;
+    }
+    for delta in 1..n {
+        for m in [mid.checked_sub(delta), mid.checked_add(delta)]
+            .into_iter()
+            .flatten()
+        {
+            if (1..=n - 2).contains(&m) && fits(m) {
+                return m;
+            }
+        }
+    }
+    mid
+}
+
+/// [`index_leaf_balance_counts`] for interior pages, whose header is 12 bytes instead of 8:
+/// element `i` of the result is the exclusive end of sibling `i`, the cell at that position
+/// (for every sibling but the last) moves up as the parent divider.
+fn interior_balance_counts<F: Fn(usize) -> usize>(
+    n: usize,
+    enc_size: F,
+    usable: u32,
+) -> Vec<usize> {
+    index_leaf_balance_counts(n, enc_size, usable.saturating_sub(4))
 }
 
 fn balance_index_leaf_siblings(
@@ -7320,7 +7282,13 @@ mod tests {
                 3 => (page_size / 3) as usize,
                 _ => 20 + ((r >> 8) % 90) as usize,
             };
-            (0..len).map(|j| (r >> (j % 56)) as u8).collect()
+            let mut rec: Vec<u8> = (0..len).map(|j| (r >> (j % 56)) as u8).collect();
+            // `integrity_check` rejects a payload whose first byte (the record header size)
+            // is below 2, as C does ("Bad cell header size").
+            if let Some(first) = rec.first_mut() {
+                *first |= 2;
+            }
+            rec
         }
 
         for (page_size, auto_vacuum, n_rows, n_ops) in [
@@ -7482,5 +7450,704 @@ mod tests {
         );
         assert_eq!(bt.scan_table(tbl_root).unwrap().len(), 50);
         bt.commit().unwrap();
+    }
+
+    /// Height of the subtree below `pgno` (a leaf is 1), or a description of the first
+    /// structural defect: leaves at different depths, a non-root page without cells, an
+    /// interior root without cells anywhere but on page 1.
+    fn tree_height(bt: &mut Btree, pgno: Pgno, is_root: bool) -> std::result::Result<u32, String> {
+        let (n_cell, children) = match bt.read_parsed_page(pgno).map_err(|e| e.to_string())? {
+            ParsedPage::TableLeaf { cells } => (cells.len(), Vec::new()),
+            ParsedPage::IndexLeaf { cells } => (cells.len(), Vec::new()),
+            ParsedPage::TableInterior { cells, right_child } => {
+                let mut ch: Vec<Pgno> = cells.iter().map(|c| c.left_child).collect();
+                ch.push(right_child);
+                (cells.len(), ch)
+            }
+            ParsedPage::IndexInterior { cells, right_child } => {
+                let mut ch: Vec<Pgno> = cells.iter().map(|c| c.left_child).collect();
+                ch.push(right_child);
+                (cells.len(), ch)
+            }
+        };
+        if n_cell == 0 && !is_root {
+            return Err(format!("non-root page {pgno} has no cells"));
+        }
+        if n_cell == 0 && !children.is_empty() && pgno != 1 {
+            return Err(format!("interior root {pgno} has no cells"));
+        }
+        let mut height = 0u32;
+        for (i, &child) in children.iter().enumerate() {
+            let h = tree_height(bt, child, false)?;
+            if i > 0 && h != height {
+                return Err(format!(
+                    "page {pgno}: child {i} (page {child}) has height {h}, its left neighbours {height}"
+                ));
+            }
+            height = h;
+        }
+        Ok(height + 1)
+    }
+
+    /// Asserts that the tree is balanced and that the C-compatible integrity check agrees.
+    fn assert_healthy(bt: &mut Btree, roots: &[Pgno], what: &str) {
+        for &root in &roots[1..] {
+            if let Err(defect) = tree_height(bt, root, true) {
+                panic!("{what}: tree {root} is malformed: {defect}");
+            }
+        }
+        assert_eq!(
+            bt.integrity_check(roots).unwrap(),
+            Vec::<String>::new(),
+            "{what}"
+        );
+    }
+
+    /// A record-shaped payload of exactly `len >= 2` bytes (one BLOB column).
+    fn blob_record(len: usize, fill: u8) -> Vec<u8> {
+        let mut body = len - 2;
+        loop {
+            let rec = encode_record(&[Value::Blob(vec![fill; body])]);
+            if rec.len() <= len {
+                assert_eq!(rec.len(), len, "no record of {len} bytes");
+                return rec;
+            }
+            body -= 1;
+        }
+    }
+
+    /// Regression test for the unbalanced-tree defect: deleting the rows below a non-root
+    /// interior page until it had a single child left used to free that page and hook the
+    /// child directly into the grandparent, leaving its leaves one level above all others
+    /// (`Child page depth differs` in C's integrity check, and later `SQLITE_CORRUPT` from
+    /// our own insert path).
+    #[test]
+    fn test_delete_keeps_leaves_at_one_depth_when_interior_page_empties() {
+        // Two 200-byte rows per 512-byte leaf, ~60 leaves per interior page.
+        const N: i64 = 700;
+        let orders: [&dyn Fn(i64) -> i64; 4] = [
+            &|i| i + 1, // ascending
+            &|i| N - i, // descending
+            &|i| {
+                if i % 2 == 0 {
+                    N / 2 - i / 2
+                } else {
+                    N / 2 + 1 + i / 2
+                }
+            }, // middle out
+            &|i| (i * 311) % N + 1, // scattered (311 is coprime to 700)
+        ];
+        for (which, order) in orders.iter().enumerate() {
+            let mut bt = Btree::open_in_memory().unwrap();
+            bt.pager_mut().set_page_size(512).unwrap();
+            bt.begin_write().unwrap();
+            let root = bt.create_table().unwrap();
+            for rowid in 1..=N {
+                bt.insert_table(root, rowid, &blob_record(200, rowid as u8))
+                    .unwrap();
+            }
+            assert_eq!(
+                tree_height(&mut bt, root, true),
+                Ok(3),
+                "the scenario needs interior pages below the root"
+            );
+            assert_healthy(&mut bt, &[1, root], "after load");
+
+            let mut left = N;
+            for i in 0..N {
+                let rowid = order(i);
+                assert!(bt.delete_table(root, rowid).unwrap(), "rowid {rowid}");
+                left -= 1;
+                assert_healthy(
+                    &mut bt,
+                    &[1, root],
+                    &format!("order {which}: after deleting rowid {rowid} ({left} rows left)"),
+                );
+                if i % 97 == 0 {
+                    assert_eq!(bt.count_entries(root).unwrap(), left);
+                }
+            }
+            assert_eq!(bt.scan_table(root).unwrap(), Vec::new());
+            // The emptied tree is a single leaf again and can be refilled.
+            assert_eq!(tree_height(&mut bt, root, true), Ok(1));
+            for rowid in 1..=N {
+                bt.insert_table(root, rowid, &blob_record(200, rowid as u8))
+                    .unwrap();
+            }
+            assert_healthy(&mut bt, &[1, root], "after refill");
+            bt.commit().unwrap();
+        }
+    }
+
+    /// A rebalance at the interior level picks new dividers. With negative rowids (nine-byte
+    /// varints) next to small positive ones the parent can grow while a row is *deleted*, and
+    /// must then split like it does on insert.
+    #[test]
+    fn test_delete_rebalance_with_mixed_width_keys_keeps_tree_valid() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for page_size in [512u32, 1024] {
+            let mut bt = Btree::open_in_memory().unwrap();
+            bt.pager_mut().set_page_size(page_size).unwrap();
+            bt.begin_write().unwrap();
+            let root = bt.create_table().unwrap();
+            let big = (page_size - 60) as usize;
+            let mut live: Vec<i64> = Vec::new();
+            for round in 0..6 {
+                // One row per leaf, keys of every varint width on both sides of zero.
+                for _ in 0..1500 {
+                    let r = next();
+                    let magnitude = (r >> 8) % (1u64 << (7 * (1 + (r % 8) as u32)));
+                    let rowid = if r & 0x80 == 0 {
+                        magnitude as i64
+                    } else {
+                        -(magnitude as i64) - 1
+                    };
+                    bt.insert_table(root, rowid, &blob_record(big, r as u8))
+                        .unwrap();
+                    live.push(rowid);
+                }
+                live.sort_unstable();
+                live.dedup();
+                assert_healthy(&mut bt, &[1, root], "after inserts");
+                // Remove long runs of neighbouring keys so that whole interior pages drain.
+                let keep_every = 37 + round;
+                let mut kept = Vec::new();
+                for (pos, &rowid) in live.iter().enumerate() {
+                    if pos % keep_every == 0 {
+                        kept.push(rowid);
+                        continue;
+                    }
+                    assert!(bt.delete_table(root, rowid).unwrap());
+                    if pos % 5 == 0 {
+                        assert_healthy(&mut bt, &[1, root], "during deletes");
+                    }
+                }
+                live = kept;
+                assert_healthy(&mut bt, &[1, root], "after deletes");
+                let rows = bt.scan_table(root).unwrap();
+                assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), live);
+            }
+            bt.commit().unwrap();
+        }
+    }
+
+    /// A leaf page holding the single row `rowid`.
+    fn one_row_leaf(bt: &mut Btree, rowid: i64) -> Pgno {
+        let pgno = bt.allocate_page().unwrap();
+        let local_payload = encode_record(&[Value::Integer(rowid)]);
+        bt.write_parsed_page(
+            pgno,
+            &ParsedPage::TableLeaf {
+                cells: vec![TableLeafCell {
+                    rowid,
+                    total_payload_len: local_payload.len() as u32,
+                    local_payload,
+                    overflow_page: None,
+                }],
+            },
+        )
+        .unwrap();
+        pgno
+    }
+
+    /// An interior page over the given children, with `keys[i]` as the divider after child `i`.
+    fn interior_over(bt: &mut Btree, children: &[Pgno], keys: &[i64]) -> Pgno {
+        assert_eq!(children.len(), keys.len() + 1);
+        let pgno = bt.allocate_page().unwrap();
+        let page = ParsedPage::TableInterior {
+            cells: keys
+                .iter()
+                .zip(children)
+                .map(|(&key, &left_child)| TableInteriorCell { left_child, key })
+                .collect(),
+            right_child: *children.last().unwrap(),
+        };
+        assert!(page.fits_in_page(pgno, 512));
+        bt.write_parsed_page(pgno, &page).unwrap();
+        pgno
+    }
+
+    /// An interior page over one single-row leaf per rowid.
+    fn interior_over_rows(bt: &mut Btree, rowids: &[i64]) -> Pgno {
+        let leaves: Vec<Pgno> = rowids.iter().map(|&r| one_row_leaf(bt, r)).collect();
+        interior_over(bt, &leaves, &rowids[..rowids.len() - 1])
+    }
+
+    /// Deleting a row can make an interior page *grow*: when three interior siblings are
+    /// rebalanced, the dividers that go back up are different keys, and a larger key can need a
+    /// longer varint. Here the parent is full to the last byte, so it has to split and hand the
+    /// new divider to the root - during a DELETE.
+    #[test]
+    fn test_delete_rebalance_that_overflows_the_parent_splits_it() {
+        let mut bt = Btree::open_in_memory().unwrap();
+        bt.pager_mut().set_page_size(512).unwrap();
+        bt.begin_write().unwrap();
+        let root = bt.create_table().unwrap();
+
+        // Three neighbours below `g1`: `s1` full of one-byte keys, `p` with two leaves, `s2`
+        // full of two-byte keys. Their dividers in `g1` (72 and 120) are one-byte keys.
+        let s1 = interior_over_rows(&mut bt, &(1..=72).collect::<Vec<i64>>());
+        let p = interior_over_rows(&mut bt, &[100, 110]);
+        let s2 = interior_over_rows(&mut bt, &(200..=262).collect::<Vec<i64>>());
+        let mut children = vec![s1, p, s2];
+        let mut dividers = vec![72i64, 120, 300];
+        let mut n_rows = 72 + 2 + 63;
+        // 53 more children behind two-byte dividers and 6 behind three-byte ones fill `g1`
+        // to exactly 500 of its 500 bytes.
+        for j in 0..53 {
+            let base = 400 + 10 * j;
+            children.push(interior_over_rows(&mut bt, &[base + 1, base + 2]));
+            dividers.push(base + 5);
+        }
+        for j in 0..6 {
+            let base = 20_000 + 10 * j;
+            children.push(interior_over_rows(&mut bt, &[base + 1, base + 2]));
+            dividers.push(base + 5);
+        }
+        children.push(interior_over_rows(&mut bt, &[30_001, 30_002]));
+        n_rows += 2 * (53 + 6 + 1);
+        let g1 = interior_over(&mut bt, &children, &dividers);
+        let g1_page = bt.read_parsed_page(g1).unwrap();
+        assert_eq!(g1_page.required_bytes(0), 512, "g1 must be exactly full");
+
+        let g2_a = interior_over_rows(&mut bt, &[40_001, 40_002]);
+        let g2_b = interior_over_rows(&mut bt, &[40_011, 40_012]);
+        let g2 = interior_over(&mut bt, &[g2_a, g2_b], &[40_005]);
+        n_rows += 4;
+        bt.write_parsed_page(
+            root,
+            &ParsedPage::TableInterior {
+                cells: vec![TableInteriorCell {
+                    left_child: g1,
+                    key: 30_010,
+                }],
+                right_child: g2,
+            },
+        )
+        .unwrap();
+        assert_eq!(tree_height(&mut bt, root, true), Ok(4));
+        assert_healthy(&mut bt, &[1, root], "hand-built tree");
+        assert_eq!(bt.count_entries(root).unwrap(), n_rows);
+
+        // Emptying one leaf of `p` leaves it with a single child: `s1`, `p` and `s2` are
+        // rebalanced into three pages again, one of the new dividers is a two-byte key where
+        // a one-byte key stood, and `g1` no longer fits.
+        assert!(bt.delete_table(root, 100).unwrap());
+        assert_healthy(&mut bt, &[1, root], "after the delete");
+        assert_eq!(tree_height(&mut bt, root, true), Ok(4));
+        assert_eq!(bt.count_entries(root).unwrap(), n_rows - 1);
+        let ParsedPage::TableInterior { cells, .. } = bt.read_parsed_page(root).unwrap() else {
+            panic!("root is no longer an interior page");
+        };
+        assert_eq!(
+            cells.len(),
+            2,
+            "g1 must have split and given the root a divider"
+        );
+        let rowids: Vec<i64> = bt.scan_table(root).unwrap().iter().map(|r| r.0).collect();
+        assert!(rowids.is_sorted());
+        assert!(!rowids.contains(&100) && rowids.contains(&110) && rowids.contains(&72));
+        bt.rollback().unwrap();
+    }
+
+    /// A root on page 1 may consist of nothing but a pointer to one child. When that child is
+    /// an interior page that is left with a single child itself, there is no sibling to merge
+    /// it with: the level disappears, for every leaf alike.
+    #[test]
+    fn test_delete_drops_a_level_below_a_single_child_root() {
+        let mut bt = Btree::open_in_memory().unwrap();
+        bt.pager_mut().set_page_size(512).unwrap();
+        bt.begin_write().unwrap();
+        // Make sure page 1 exists as a table root before it is rewritten by hand.
+        bt.insert_table(1, 1, &blob_record(40, 1)).unwrap();
+        let child = interior_over_rows(&mut bt, &[1, 2]);
+        bt.write_parsed_page(
+            1,
+            &ParsedPage::TableInterior {
+                cells: Vec::new(),
+                right_child: child,
+            },
+        )
+        .unwrap();
+        assert_eq!(tree_height(&mut bt, 1, true), Ok(3));
+        assert_eq!(bt.integrity_check(&[1]).unwrap(), Vec::<String>::new());
+
+        assert!(bt.delete_table(1, 1).unwrap());
+        // The remaining row fits on page 1, which is a leaf again; both pages below are free.
+        assert_eq!(tree_height(&mut bt, 1, true), Ok(1));
+        assert_eq!(bt.integrity_check(&[1]).unwrap(), Vec::<String>::new());
+        let rows = bt.scan_table(1).unwrap();
+        assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), [2]);
+        bt.rollback().unwrap();
+    }
+
+    /// The integrity check must flag a tree whose leaves are not all at the same depth, with
+    /// the message C SQLite 3.54.1 prints for the same image.
+    #[test]
+    fn test_integrity_check_reports_child_page_depth_differs() {
+        let mut bt = Btree::open_in_memory().unwrap();
+        bt.pager_mut().set_page_size(512).unwrap();
+        bt.begin_write().unwrap();
+        let root = bt.create_table().unwrap();
+        let leaf = |range: std::ops::RangeInclusive<i64>| ParsedPage::TableLeaf {
+            cells: range
+                .map(|rowid| {
+                    let local_payload = encode_record(&[Value::Integer(rowid)]);
+                    TableLeafCell {
+                        rowid,
+                        total_payload_len: local_payload.len() as u32,
+                        local_payload,
+                        overflow_page: None,
+                    }
+                })
+                .collect(),
+        };
+        // root -> [ leaf a | 10 | interior b -> [ leaf c | 20 | leaf d ] ]
+        let a = bt.allocate_page().unwrap();
+        let b = bt.allocate_page().unwrap();
+        let c = bt.allocate_page().unwrap();
+        let d = bt.allocate_page().unwrap();
+        bt.write_parsed_page(a, &leaf(1..=10)).unwrap();
+        bt.write_parsed_page(c, &leaf(11..=20)).unwrap();
+        bt.write_parsed_page(d, &leaf(21..=30)).unwrap();
+        bt.write_parsed_page(
+            b,
+            &ParsedPage::TableInterior {
+                cells: vec![TableInteriorCell {
+                    left_child: c,
+                    key: 20,
+                }],
+                right_child: d,
+            },
+        )
+        .unwrap();
+        bt.write_parsed_page(
+            root,
+            &ParsedPage::TableInterior {
+                cells: vec![TableInteriorCell {
+                    left_child: a,
+                    key: 10,
+                }],
+                right_child: b,
+            },
+        )
+        .unwrap();
+
+        assert!(tree_height(&mut bt, root, true).is_err());
+        // Every row is still reachable; only the shape is wrong.
+        assert_eq!(bt.count_entries(root).unwrap(), 30);
+        assert_eq!(
+            bt.integrity_check(&[1, root]).unwrap(),
+            vec![format!(
+                "Tree {root} page {root} cell 0: Child page depth differs"
+            )]
+        );
+        let report = bt.integrity_check_report(&[1, root], false, 100).unwrap();
+        assert_eq!(report.row_counts, vec![0, 30]);
+
+        // Balanced again once `a` hangs below an interior page of its own.
+        let a_parent = bt.allocate_page().unwrap();
+        let a2 = bt.allocate_page().unwrap();
+        bt.write_parsed_page(a, &leaf(1..=5)).unwrap();
+        bt.write_parsed_page(a2, &leaf(6..=10)).unwrap();
+        bt.write_parsed_page(
+            a_parent,
+            &ParsedPage::TableInterior {
+                cells: vec![TableInteriorCell {
+                    left_child: a,
+                    key: 5,
+                }],
+                right_child: a2,
+            },
+        )
+        .unwrap();
+        bt.write_parsed_page(
+            root,
+            &ParsedPage::TableInterior {
+                cells: vec![TableInteriorCell {
+                    left_child: a_parent,
+                    key: 10,
+                }],
+                right_child: b,
+            },
+        )
+        .unwrap();
+        assert_healthy(&mut bt, &[1, root], "rebalanced by hand");
+        let report = bt.integrity_check_report(&[1, root], false, 100).unwrap();
+        assert_eq!(report.unwalkable, [false, false]);
+
+        // A well-formed but empty page below the root draws no b-tree level message (as in C),
+        // yet no cursor of C SQLite enters it: the report marks the tree.
+        bt.write_parsed_page(a, &ParsedPage::TableLeaf { cells: Vec::new() })
+            .unwrap();
+        let report = bt.integrity_check_report(&[1, root], false, 100).unwrap();
+        assert_eq!(report.messages, Vec::<String>::new());
+        assert_eq!(report.unwalkable, [false, true]);
+        assert_eq!(report.row_counts, [0, 25]);
+        bt.rollback().unwrap();
+    }
+
+    /// Mixed insert / update / delete workloads with overflow rows on small and default pages,
+    /// with and without auto-vacuum, on a table tree and an index tree: after every batch all
+    /// leaves are at one depth, the integrity check is clean and the content matches a model.
+    #[test]
+    fn test_random_workloads_keep_trees_balanced_and_intact() {
+        use std::collections::BTreeMap;
+
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        fn row_len(r: u64, page_size: u32) -> usize {
+            let p = page_size as usize;
+            match r % 16 {
+                0 => p * 3,                        // long overflow chain
+                1 => p + 17,                       // one overflow page
+                2 | 3 => p - 60,                   // one row per leaf
+                4..=6 => p / 3,                    // two or three rows per leaf
+                _ => 8 + ((r >> 8) % 40) as usize, // many rows per leaf
+            }
+        }
+
+        let orders = [KeySortOrder::default(), KeySortOrder::default()];
+        for (page_size, auto_vacuum, key_space, batches) in [
+            (512u32, false, 3_000u64, 60u32),
+            (512, true, 1_200, 40),
+            (1024, false, 4_000, 50),
+            (1024, true, 2_000, 30),
+            (4096, false, 9_000, 40),
+        ] {
+            let mut bt = Btree::open_in_memory().unwrap();
+            bt.pager_mut().set_page_size(page_size).unwrap();
+            if auto_vacuum {
+                bt.set_configured_auto_vacuum(AutoVacuumMode::Full);
+            }
+            bt.begin_write().unwrap();
+            let tbl = bt.create_table().unwrap();
+            let idx = bt.create_index().unwrap();
+            let roots = [1, tbl, idx];
+            let mut seed = 0xA076_1D64_78BD_642Fu64 ^ u64::from(page_size) ^ u64::from(auto_vacuum);
+            // rowid -> (payload length, fill byte); the index holds (text(rowid, len), rowid).
+            let mut model: BTreeMap<i64, (usize, u8)> = BTreeMap::new();
+            let idx_key = |rowid: i64, len: usize| {
+                [
+                    Value::Text(format!("{:05}-{}", rowid % 977, "k".repeat(len % 150))),
+                    Value::Integer(rowid),
+                ]
+            };
+
+            for batch in 0..batches {
+                // Phases: grow, churn, drain almost everything, grow again, ...
+                let delete_per_16 = match batch % 6 {
+                    0 | 1 => 2,
+                    2 | 3 => 8,
+                    _ => 14,
+                };
+                let what =
+                    format!("page_size {page_size}, auto_vacuum {auto_vacuum}, batch {batch}");
+                for _ in 0..400 {
+                    let r = next(&mut seed);
+                    let rowid = ((r >> 20) % key_space) as i64 - (key_space / 8) as i64;
+                    if (r >> 4) % 16 < delete_per_16 {
+                        // Delete `rowid` or, if absent, its successor: runs of neighbours go.
+                        let victim = model.range(rowid..).next().map(|(&k, &v)| (k, v));
+                        if let Some((k, (len, _))) = victim {
+                            assert!(bt.delete_table(tbl, k).unwrap(), "{what}");
+                            assert!(
+                                bt.delete_index(idx, &idx_key(k, len), &orders).unwrap(),
+                                "{what}"
+                            );
+                            model.remove(&k);
+                        } else {
+                            assert!(!bt.delete_table(tbl, rowid).unwrap(), "{what}");
+                        }
+                    } else {
+                        let len = row_len(next(&mut seed), page_size);
+                        let fill = (r >> 12) as u8;
+                        if let Some((old_len, _)) = model.insert(rowid, (len, fill)) {
+                            assert!(
+                                bt.delete_index(idx, &idx_key(rowid, old_len), &orders)
+                                    .unwrap(),
+                                "{what}"
+                            );
+                        }
+                        bt.insert_table(tbl, rowid, &blob_record(len, fill))
+                            .unwrap();
+                        bt.insert_index(idx, &encode_record(&idx_key(rowid, len)), &orders)
+                            .unwrap();
+                    }
+                }
+                assert_healthy(&mut bt, &roots, &what);
+                let report = bt.integrity_check_report(&roots, false, 100).unwrap();
+                assert_eq!(
+                    report.row_counts[1..],
+                    [model.len() as i64, model.len() as i64],
+                    "{what}"
+                );
+                if batch % 5 == 4 || batch + 1 == batches {
+                    let rows = bt.scan_table(tbl).unwrap();
+                    assert_eq!(rows.len(), model.len(), "{what}");
+                    for ((rowid, payload), (&m_rowid, &(len, fill))) in rows.iter().zip(&model) {
+                        assert_eq!(*rowid, m_rowid, "{what}");
+                        assert!(*payload == blob_record(len, fill), "{what}: rowid {rowid}");
+                    }
+                    assert_eq!(bt.scan_index(idx).unwrap().len(), model.len(), "{what}");
+                }
+            }
+            // Drain completely: both trees end as empty root leaves.
+            let keys: Vec<(i64, usize)> = model.iter().map(|(&k, &(len, _))| (k, len)).collect();
+            for (n, (k, len)) in keys.into_iter().enumerate() {
+                assert!(bt.delete_table(tbl, k).unwrap());
+                assert!(bt.delete_index(idx, &idx_key(k, len), &orders).unwrap());
+                if n % 64 == 0 {
+                    assert_healthy(&mut bt, &roots, "drain");
+                }
+            }
+            assert_healthy(&mut bt, &roots, "drained");
+            assert_eq!(tree_height(&mut bt, tbl, true), Ok(1));
+            assert_eq!(tree_height(&mut bt, idx, true), Ok(1));
+            bt.commit().unwrap();
+        }
+    }
+
+    /// `PRAGMA integrity_check` asks whether the index holds the entry of a row. A damaged index
+    /// record with fewer fields than the key compares equal on the fields it has; it must not
+    /// count as that entry (C reports the row as missing from the index).
+    #[test]
+    fn test_index_lookup_rejects_record_with_too_few_fields() {
+        let orders = [KeySortOrder::default(), KeySortOrder::default()];
+        let mut bt = Btree::open_in_memory().unwrap();
+        bt.begin_write().unwrap();
+        let idx = bt.create_index().unwrap();
+        // A record with a single field where every entry should have two.
+        bt.insert_index(idx, &encode_record(&[Value::Integer(7)]), &orders)
+            .unwrap();
+        let key = [Value::Integer(7), Value::Integer(1)];
+        assert!(!bt.index_contains_prefix_raw(idx, &key, &orders).unwrap());
+        assert!(
+            bt.index_contains_prefix_raw(idx, &key[..1], &orders)
+                .unwrap()
+        );
+        // Text keys take the general comparison instead of the integer probe.
+        let idx2 = bt.create_index().unwrap();
+        bt.insert_index(idx2, &encode_record(&[Value::Text("k".into())]), &orders)
+            .unwrap();
+        let key = [Value::Text("k".into()), Value::Integer(1)];
+        assert!(!bt.index_contains_prefix_raw(idx2, &key, &orders).unwrap());
+        // The complete record is the entry.
+        bt.insert_index(idx2, &encode_record(&key), &orders)
+            .unwrap();
+        assert!(bt.index_contains_prefix_raw(idx2, &key, &orders).unwrap());
+        bt.rollback().unwrap();
+    }
+
+    /// Index cells range from a few bytes to a quarter of a page. Splitting an overfull page at
+    /// the middle cell *by count* could leave one half larger than a page and made the INSERT
+    /// fail with "cells exceed usable B-tree page capacity".
+    #[test]
+    fn test_index_page_split_with_mixed_cell_sizes() {
+        let orders = [KeySortOrder::default(), KeySortOrder::default()];
+        // Root leaf: thirty small keys, then keys that are stored with (almost) the maximum
+        // local payload and sort after them.
+        let mut bt = Btree::open_in_memory().unwrap();
+        bt.begin_write().unwrap();
+        let idx = bt.create_index().unwrap();
+        let mut n = 0i64;
+        for i in 0..30 {
+            let rec = encode_record(&[Value::Text(format!("a{i:02}")), Value::Integer(i)]);
+            bt.insert_index(idx, &rec, &orders).unwrap();
+            n += 1;
+        }
+        for i in 0..6 {
+            let rec = encode_record(&[
+                Value::Text(format!("z{i}{}", "z".repeat(990))),
+                Value::Integer(100 + i),
+            ]);
+            bt.insert_index(idx, &rec, &orders).unwrap();
+            n += 1;
+            assert_healthy(&mut bt, &[1, idx], "root leaf split");
+        }
+        assert_eq!(bt.scan_index(idx).unwrap().len() as i64, n);
+        bt.commit().unwrap();
+
+        // Interior root: a few dozen small dividers (one per leaf of small keys), then large
+        // dividers to their right until the root itself has to split.
+        let mut bt = Btree::open_in_memory().unwrap();
+        bt.begin_write().unwrap();
+        let idx = bt.create_index().unwrap();
+        for i in 0..8_000 {
+            let rec = encode_record(&[Value::Text(format!("a{i:06}")), Value::Integer(i)]);
+            bt.insert_index(idx, &rec, &orders).unwrap();
+        }
+        assert_eq!(tree_height(&mut bt, idx, true), Ok(2));
+        for i in 0..60 {
+            let rec = encode_record(&[
+                Value::Text(format!("z{i:02}{}", "z".repeat(985))),
+                Value::Integer(i),
+            ]);
+            bt.insert_index(idx, &rec, &orders).unwrap();
+        }
+        assert_healthy(&mut bt, &[1, idx], "interior root split");
+        assert_eq!(tree_height(&mut bt, idx, true), Ok(3));
+        assert_eq!(bt.scan_index(idx).unwrap().len(), 8_060);
+        bt.commit().unwrap();
+
+        // Random mixes on every page size, inserted in random key order so that leaf, interior
+        // and root pages all split with small and large cells side by side.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for page_size in [512u32, 1024, 4096] {
+            let mut bt = Btree::open_in_memory().unwrap();
+            bt.pager_mut().set_page_size(page_size).unwrap();
+            bt.begin_write().unwrap();
+            let idx = bt.create_index().unwrap();
+            let mut keys = std::collections::BTreeSet::new();
+            for round in 0..40 {
+                for _ in 0..60 {
+                    let r = next();
+                    let len = match r % 8 {
+                        0 | 1 => (page_size as usize) / 4 + (r >> 8) as usize % 40, // around max local
+                        2 => page_size as usize,                                    // overflows
+                        _ => (r >> 8) as usize % 12,
+                    };
+                    // Large keys sort after the small ones, so pages hold runs of each kind.
+                    let key = format!(
+                        "{}{:06}{}",
+                        if len > 12 && round % 2 == 0 { 'z' } else { 'a' },
+                        (r >> 24) % 1_000_000,
+                        "k".repeat(len)
+                    );
+                    let rec = encode_record(&[Value::Text(key.clone()), Value::Integer(1)]);
+                    bt.insert_index(idx, &rec, &orders).unwrap();
+                    keys.insert(key);
+                }
+                assert_healthy(
+                    &mut bt,
+                    &[1, idx],
+                    &format!("page_size {page_size}, round {round}"),
+                );
+            }
+            let stored: Vec<String> = bt
+                .scan_index(idx)
+                .unwrap()
+                .iter()
+                .map(|rec| decode_record(rec).unwrap()[0].as_str().unwrap().to_owned())
+                .collect();
+            assert!(stored.iter().eq(keys.iter()), "page_size {page_size}");
+            bt.commit().unwrap();
+        }
     }
 }
