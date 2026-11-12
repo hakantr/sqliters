@@ -270,6 +270,19 @@ pub fn wal_encode_frame_header(
     Ok((hdr, next_cksum))
 }
 
+/// Encodes the 24-byte header `walEncodeFrame` (`wal.c:1021-1023`) produces while a checksum
+/// rewrite is pending (`iReCksum != 0`): page number and commit size followed by 16 zero bytes in
+/// place of the salt and the checksum, so the frame never validates until `walRewriteChecksums`
+/// rewrites its header.
+#[cold]
+#[inline(never)]
+fn wal_encode_unchained_frame_header(pgno: Pgno, n_truncate: u32) -> [u8; WAL_FRAME_HDRSIZE] {
+    let mut hdr = [0u8; WAL_FRAME_HDRSIZE];
+    hdr[0..4].copy_from_slice(&pgno.to_be_bytes());
+    hdr[4..8].copy_from_slice(&n_truncate.to_be_bytes());
+    hdr
+}
+
 /// Decodes and verifies a 24-byte WAL frame header + `page_data` (`walDecodeFrame`, `wal.c:1032`),
 /// returning `Ok(Some((pgno, n_truncate, next_cksum)))` when valid or `Ok(None)` on salt, pgno, or
 /// checksum mismatch.
@@ -1582,14 +1595,28 @@ impl Wal {
 
             i_frame += 1;
             let n_db_size = if is_commit && is_last { n_truncate } else { 0 };
-            let (fhdr, next_cksum) = wal_encode_frame_header(
-                frame.pgno,
-                n_db_size,
-                self.hdr.salt,
-                self.hdr.big_end_cksum != 0,
-                self.hdr.frame_cksum,
-                frame.data,
-            )?;
+            // `walEncodeFrame` (`wal.c:1001-1024`): while a checksum rewrite is pending
+            // (`iReCksum != 0`, i.e. an already-spilled frame of this transaction was overwritten
+            // in place, in this call or in an earlier spill) appended frames carry ZERO salt and
+            // ZERO checksum and the running checksum is left alone. Such frames (the commit frame
+            // included) cannot validate until `walRewriteChecksums` has re-chained the tail over
+            // the new page images, so a crash that keeps the appended frames but loses an in-place
+            // overwrite can never expose a commit frame chained over the stale images.
+            let (fhdr, next_cksum) = if self.i_re_cksum == 0 {
+                wal_encode_frame_header(
+                    frame.pgno,
+                    n_db_size,
+                    self.hdr.salt,
+                    self.hdr.big_end_cksum != 0,
+                    self.hdr.frame_cksum,
+                    frame.data,
+                )?
+            } else {
+                (
+                    wal_encode_unchained_frame_header(frame.pgno, n_db_size),
+                    self.hdr.frame_cksum,
+                )
+            };
             if frame_buf.is_empty() {
                 frame_buf_off = i_offset;
             }

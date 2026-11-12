@@ -5108,4 +5108,712 @@ mod tests {
         reader.close().unwrap();
         pager.close().unwrap();
     }
+
+    // ------------------------------------------------------------------------------------------
+    // WAL crash atomicity while a checksum rewrite is pending (`iReCksum`, `walRewriteChecksums`)
+    // ------------------------------------------------------------------------------------------
+
+    /// One operation issued against `<db>-wal`, in issue order.
+    #[derive(Clone, Debug)]
+    enum WalOp {
+        Write { off: u64, data: Vec<u8> },
+        Truncate(u64),
+        Sync,
+    }
+
+    /// `MemoryVfs` wrapper that records every write / truncate / sync issued against files whose
+    /// name ends in `-wal`, reports configurable device characteristics and hands out
+    /// deterministic "randomness" (so WAL salts are reproducible).
+    struct RecordingVfs {
+        inner: Arc<MemoryVfs>,
+        log: Arc<Mutex<Vec<WalOp>>>,
+        device_characteristics: u32,
+        rng: Mutex<u64>,
+    }
+
+    struct RecordingFile {
+        inner: Box<dyn VfsFile>,
+        log: Option<Arc<Mutex<Vec<WalOp>>>>,
+        device_characteristics: u32,
+    }
+
+    impl Vfs for RecordingVfs {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        fn lock_geometry(&self) -> LockGeometry {
+            self.inner.lock_geometry()
+        }
+        fn open(&self, path: Option<&Path>, flags: OpenFlags) -> Result<Box<dyn VfsFile>> {
+            let inner = self.inner.open(path, flags)?;
+            let is_wal = path.is_some_and(|p| p.to_string_lossy().ends_with("-wal"));
+            Ok(Box::new(RecordingFile {
+                inner,
+                log: is_wal.then(|| self.log.clone()),
+                device_characteristics: self.device_characteristics,
+            }))
+        }
+        fn delete(&self, path: &Path, sync_dir: bool) -> Result<()> {
+            self.inner.delete(path, sync_dir)
+        }
+        fn exists(&self, path: &Path) -> Result<bool> {
+            self.inner.exists(path)
+        }
+        fn full_pathname(&self, path: &Path) -> Result<PathBuf> {
+            self.inner.full_pathname(path)
+        }
+        fn randomness(&self, buf: &mut [u8]) {
+            let mut state = self.rng.lock().unwrap();
+            for b in buf {
+                *state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                *b = (*state >> 56) as u8;
+            }
+        }
+    }
+
+    impl VfsFile for RecordingFile {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+            self.inner.read_at(buf, offset)
+        }
+        fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
+            self.inner.write_at(buf, offset)?;
+            if let Some(log) = &self.log {
+                log.lock().unwrap().push(WalOp::Write {
+                    off: offset,
+                    data: buf.to_vec(),
+                });
+            }
+            Ok(())
+        }
+        fn truncate(&self, size: u64) -> Result<()> {
+            self.inner.truncate(size)?;
+            if let Some(log) = &self.log {
+                log.lock().unwrap().push(WalOp::Truncate(size));
+            }
+            Ok(())
+        }
+        fn sync(&self, flags: SyncFlags) -> Result<()> {
+            self.inner.sync(flags)?;
+            if let Some(log) = &self.log {
+                log.lock().unwrap().push(WalOp::Sync);
+            }
+            Ok(())
+        }
+        fn file_size(&self) -> Result<u64> {
+            self.inner.file_size()
+        }
+        fn lock(&self, level: LockLevel) -> Result<()> {
+            self.inner.lock(level)
+        }
+        fn unlock(&self, level: LockLevel) -> Result<()> {
+            self.inner.unlock(level)
+        }
+        fn check_reserved_lock(&self) -> Result<bool> {
+            self.inner.check_reserved_lock()
+        }
+        fn lock_level(&self) -> LockLevel {
+            self.inner.lock_level()
+        }
+        fn lock_state_for_diagnostics(&self) -> Result<Option<LockLevel>> {
+            self.inner.lock_state_for_diagnostics()
+        }
+        fn close(&mut self) -> Result<()> {
+            self.inner.close()
+        }
+        fn open_wal_shm_with_options(
+            &self,
+            options: ShmOpenOptions,
+        ) -> Result<sqliters_vfs::WalShm> {
+            self.inner.open_wal_shm_with_options(options)
+        }
+        fn supports_wal_shm(&self) -> bool {
+            self.inner.supports_wal_shm()
+        }
+        fn device_characteristics(&self) -> u32 {
+            self.device_characteristics
+        }
+        fn sector_size(&self) -> u32 {
+            self.inner.sector_size()
+        }
+        fn is_readonly(&self) -> bool {
+            self.inner.is_readonly()
+        }
+    }
+
+    fn vfs_file_image(vfs: &dyn Vfs, path: &Path) -> Vec<u8> {
+        if !vfs.exists(path).unwrap() {
+            return Vec::new();
+        }
+        let file = vfs.open(Some(path), OpenFlags::READONLY).unwrap();
+        let mut image = vec![0u8; file.file_size().unwrap() as usize];
+        if !image.is_empty() {
+            assert_eq!(file.read_at(&mut image, 0).unwrap(), image.len());
+        }
+        image
+    }
+
+    fn apply_wal_op(image: &mut Vec<u8>, op: &WalOp) {
+        match op {
+            WalOp::Write { off, data } => {
+                let end = *off as usize + data.len();
+                if image.len() < end {
+                    image.resize(end, 0);
+                }
+                image[*off as usize..end].copy_from_slice(data);
+            }
+            WalOp::Truncate(size) => image.resize(*size as usize, 0),
+            WalOp::Sync => {}
+        }
+    }
+
+    /// Database content as a fresh connection sees it: `(page_count, pages 1..=page_count)`.
+    type DbState = (Pgno, Vec<Vec<u8>>);
+
+    /// Runs WAL recovery over `db_image` + `wal_image` in a pristine VFS (no `-shm`) and returns
+    /// the state a new connection reads.
+    fn recovered_state(db_image: &[u8], wal_image: &[u8]) -> DbState {
+        let vfs = Arc::new(MemoryVfs::new());
+        let db_path = Path::new("crash.db");
+        let put = |path: &Path, image: &[u8]| {
+            let file = vfs
+                .open(Some(path), OpenFlags::READWRITE | OpenFlags::CREATE)
+                .unwrap();
+            file.write_at(image, 0).unwrap();
+        };
+        put(db_path, db_image);
+        if !wal_image.is_empty() {
+            put(Path::new("crash.db-wal"), wal_image);
+        }
+        let mut pager = Pager::open_with_vfs(
+            vfs.clone(),
+            Some(db_path),
+            OpenFlags::READWRITE | OpenFlags::MAIN_DB,
+        )
+        .unwrap();
+        pager.begin_read().unwrap();
+        let n_pages = pager.page_count();
+        let pages = (1..=n_pages)
+            .map(|pgno| pager.read_page(pgno).unwrap().to_vec())
+            .collect();
+        pager.end_read_if_unused().unwrap();
+        pager.close().unwrap();
+        (n_pages, pages)
+    }
+
+    /// Fills a whole (non-header) page with a pattern unique to `(pgno, version)`.
+    fn stamp_page(pager: &mut Pager, pgno: Pgno, version: u8) {
+        let buf = pager.write_page(pgno).unwrap();
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i as u8)
+                .wrapping_mul(7)
+                .wrapping_add((pgno as u8).wrapping_mul(31))
+                ^ version.wrapping_mul(0x9d);
+        }
+        buf[0..4].copy_from_slice(&pgno.to_be_bytes());
+        buf[4] = version;
+    }
+
+    /// Everything recorded about one write transaction run against a [`RecordingVfs`].
+    struct RecordedWalTxn {
+        page_size: usize,
+        /// `.db` image (unchanged by the transaction: nothing is checkpointed).
+        db_image: Vec<u8>,
+        /// `-wal` image when the transaction began (fully durable).
+        base_wal: Vec<u8>,
+        /// Every `-wal` operation of the transaction, in issue order.
+        ops: Vec<WalOp>,
+        /// Index into `ops` of the first operation issued by COMMIT.
+        commit_start: usize,
+        /// `-wal` image after COMMIT returned.
+        final_wal: Vec<u8>,
+        /// State a new connection reads before / after the transaction.
+        before: DbState,
+        after: DbState,
+    }
+
+    impl RecordedWalTxn {
+        fn sz_frame(&self) -> usize {
+            WAL_FRAME_HDRSIZE + self.page_size
+        }
+
+        /// Number of frames in the `-wal` file when the transaction began.
+        fn base_frames(&self) -> u32 {
+            (self.base_wal.len().saturating_sub(WAL_HDRSIZE) / self.sz_frame()) as u32
+        }
+
+        fn frame_offset(&self, frame_no: u32) -> u64 {
+            wal_frame_offset(frame_no, self.page_size as u32)
+        }
+
+        fn wal_header(&self) -> WalFileHeader {
+            let hdr: [u8; WAL_HDRSIZE] = self.final_wal[..WAL_HDRSIZE].try_into().unwrap();
+            WalFileHeader::decode_for_recovery(&hdr).unwrap().unwrap()
+        }
+
+        /// `(off, data)` of every write issued by COMMIT, in order.
+        fn commit_writes(&self) -> Vec<(u64, &[u8])> {
+            self.ops[self.commit_start..]
+                .iter()
+                .filter_map(|op| match op {
+                    WalOp::Write { off, data } => Some((*off, data.as_slice())),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// `-wal` image after the first `n_ops` operations of the transaction reached the file.
+        fn image_after(&self, n_ops: usize) -> Vec<u8> {
+            let mut image = self.base_wal.clone();
+            for op in &self.ops[..n_ops] {
+                apply_wal_op(&mut image, op);
+            }
+            image
+        }
+
+        /// Number of leading frames of `image` that validate against the salt and the checksum
+        /// chain, and the commit size carried by the last valid frame.
+        fn valid_chain(&self, image: &[u8]) -> (u32, u32) {
+            let wal_hdr = self.wal_header();
+            let mut cksum = wal_hdr.cksum;
+            let mut valid = 0u32;
+            let mut last_n_truncate = 0u32;
+            let n_frames = (image.len().saturating_sub(WAL_HDRSIZE) / self.sz_frame()) as u32;
+            for frame_no in 1..=n_frames {
+                let off = self.frame_offset(frame_no) as usize;
+                let fhdr: [u8; WAL_FRAME_HDRSIZE] =
+                    image[off..off + WAL_FRAME_HDRSIZE].try_into().unwrap();
+                let data = &image[off + WAL_FRAME_HDRSIZE..off + self.sz_frame()];
+                let Some((_, n_truncate, next)) =
+                    wal_decode_frame(&fhdr, data, wal_hdr.salt, wal_hdr.big_end_cksum, cksum)
+                        .unwrap()
+                else {
+                    break;
+                };
+                cksum = next;
+                valid = frame_no;
+                last_n_truncate = n_truncate;
+            }
+            (valid, last_n_truncate)
+        }
+
+        /// Crash model: everything issued before a sync is durable; of the writes issued since
+        /// the last sync ANY subset may have reached the disk (unordered writeback). Recovers
+        /// every such image and requires the pre-transaction state or the complete transaction.
+        /// Returns `(images recovered to "before", images recovered to "after")`.
+        fn assert_every_crash_state_is_atomic(&self) -> (usize, usize) {
+            let mut durable = self.base_wal.clone();
+            let mut epoch: Vec<(usize, &WalOp)> = Vec::new();
+            let (mut n_before, mut n_after) = (0usize, 0usize);
+            let end_marker = WalOp::Sync;
+            let numbered = self.ops.iter().enumerate();
+            for (op_idx, op) in numbered.chain(std::iter::once((self.ops.len(), &end_marker))) {
+                if !matches!(op, WalOp::Sync) {
+                    epoch.push((op_idx, op));
+                    continue;
+                }
+                assert!(
+                    epoch.len() <= 14,
+                    "scenario too large to enumerate: {} unsynced operations",
+                    epoch.len()
+                );
+                for mask in 0u32..(1u32 << epoch.len()) {
+                    let mut image = durable.clone();
+                    let mut kept = Vec::new();
+                    for (bit, (idx, pending)) in epoch.iter().enumerate() {
+                        if mask & (1 << bit) != 0 {
+                            apply_wal_op(&mut image, pending);
+                            kept.push(*idx);
+                        }
+                    }
+                    let got = recovered_state(&self.db_image, &image);
+                    if got == self.before {
+                        n_before += 1;
+                    } else if got == self.after {
+                        n_after += 1;
+                    } else {
+                        let lost: Vec<usize> = epoch
+                            .iter()
+                            .map(|(idx, _)| *idx)
+                            .filter(|idx| !kept.contains(idx))
+                            .collect();
+                        panic!(
+                            "HALF-APPLIED transaction after a crash before the sync at op \
+                             {op_idx}: -wal operations {kept:?} reached the disk, {lost:?} were \
+                             lost (COMMIT starts at op {}); recovered {} pages, valid chain {:?}",
+                            self.commit_start,
+                            got.0,
+                            self.valid_chain(&image),
+                        );
+                    }
+                }
+                for (_, pending) in epoch.drain(..) {
+                    apply_wal_op(&mut durable, pending);
+                }
+            }
+            assert_eq!(
+                durable, self.final_wal,
+                "recorder replays to the final -wal"
+            );
+            (n_before, n_after)
+        }
+    }
+
+    /// Builds a `n_pages`-page database in WAL mode on a [`RecordingVfs`], optionally commits two
+    /// WAL transactions first (so the transaction under test does not start the log), then runs
+    /// `body` inside one write transaction and commits it, recording every `-wal` operation.
+    fn record_wal_txn(
+        device_characteristics: u32,
+        synchronous: u8,
+        prior_wal_commits: bool,
+        body: impl FnOnce(&mut Pager),
+    ) -> RecordedWalTxn {
+        let inner = Arc::new(MemoryVfs::new());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let vfs = Arc::new(RecordingVfs {
+            inner: inner.clone(),
+            log: log.clone(),
+            device_characteristics,
+            rng: Mutex::new(0x5eed_1234_abcd_ef01),
+        });
+        let db_path = Path::new("rewrite.db");
+        let mut pager = Pager::open_with_vfs(
+            vfs,
+            Some(db_path),
+            OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB,
+        )
+        .unwrap();
+        pager.set_synchronous(synchronous);
+        pager.begin_write().unwrap();
+        while pager.page_count() < 8 {
+            let pgno = pager.allocate_raw_page().unwrap();
+            stamp_page(&mut pager, pgno, 0);
+        }
+        pager.commit().unwrap();
+        assert_eq!(
+            pager.set_journal_mode(JournalMode::Wal).unwrap(),
+            JournalMode::Wal
+        );
+        if prior_wal_commits {
+            pager.begin_write().unwrap();
+            stamp_page(&mut pager, 2, 1);
+            stamp_page(&mut pager, 7, 1);
+            pager.commit().unwrap();
+            pager.begin_write().unwrap();
+            stamp_page(&mut pager, 5, 1);
+            pager.commit().unwrap();
+        }
+        let page_size = pager.page_size() as usize;
+        let wal_path = pager.wal_path().unwrap().to_path_buf();
+        let db_image = vfs_file_image(inner.as_ref(), db_path);
+        let base_wal = vfs_file_image(inner.as_ref(), &wal_path);
+        let before = recovered_state(&db_image, &base_wal);
+
+        log.lock().unwrap().clear();
+        pager.begin_write().unwrap();
+        // A one-page cache: every statement boundary with two or more dirty pages spills.
+        pager.set_cache_size(1);
+        body(&mut pager);
+        let commit_start = log.lock().unwrap().len();
+        pager.commit().unwrap();
+        let ops = log.lock().unwrap().clone();
+
+        let final_wal = vfs_file_image(inner.as_ref(), &wal_path);
+        assert_eq!(
+            vfs_file_image(inner.as_ref(), db_path),
+            db_image,
+            "nothing is checkpointed during the transaction"
+        );
+        let after = recovered_state(&db_image, &final_wal);
+        assert_ne!(before, after);
+        pager.close().unwrap();
+        RecordedWalTxn {
+            page_size,
+            db_image,
+            base_wal,
+            ops,
+            commit_start,
+            final_wal,
+            before,
+            after,
+        }
+    }
+
+    /// The W1 situation: pages 2,3,4 are spilled, pages 3 and 4 are modified again, and COMMIT
+    /// overwrites their frames in place and appends two more frames (the last is the commit
+    /// frame). As in C (`walEncodeFrame` with `iReCksum != 0`), the appended frames must reach
+    /// the file with ZERO salt and ZERO checksum and become valid only through the header
+    /// rewrites of `walRewriteChecksums`; every subset of lost / kept unsynced writes must
+    /// recover to the pre-transaction state or to the complete transaction.
+    #[test]
+    fn test_wal_commit_overwriting_spilled_frames_is_crash_atomic_and_c_identical() {
+        let run = record_wal_txn(sqliters_vfs::IOCAP_POWERSAFE_OVERWRITE, 2, true, |pager| {
+            stamp_page(pager, 2, 2);
+            stamp_page(pager, 3, 2);
+            stamp_page(pager, 4, 2);
+            assert_eq!(pager.spill_if_over_cache_size().unwrap(), 3);
+            stamp_page(pager, 3, 3);
+            stamp_page(pager, 4, 3);
+            stamp_page(pager, 6, 3);
+            stamp_page(pager, 8, 3);
+        });
+        // Crash safety first: all 2^10 subsets of the transaction's 10 unsynced writes (plus
+        // the state after the final sync) recover to "before" or "after".
+        let (n_before, n_after) = run.assert_every_crash_state_is_atomic();
+        assert_eq!(n_before + n_after, (1 << 10) + 1);
+        assert!(n_before > 0 && n_after > 0);
+
+        // Then the bytes, write by write, against what C puts on disk.
+        let ps = run.page_size;
+        let szf = run.sz_frame();
+        let m = run.base_frames();
+        assert!(m >= 3, "two earlier WAL commits precede the transaction");
+        let wal_hdr = run.wal_header();
+        let salt_bytes: Vec<u8> = wal_hdr.salt.iter().flat_map(|s| s.to_be_bytes()).collect();
+
+        // Spill: three appended frames with the real salt and a valid (uncommitted) chain.
+        assert_eq!(run.commit_start, 3);
+        let spilled = run.image_after(run.commit_start);
+        assert_eq!(run.valid_chain(&spilled), (m + 3, 0));
+
+        // COMMIT, write by write (C: `walFrames` loop, then `walRewriteChecksums`).
+        let writes = run.commit_writes();
+        assert_eq!(
+            writes.len(),
+            7,
+            "2 in-place + 1 append run + 4 header rewrites"
+        );
+        // 1-2: page images of pages 3 and 4 over frames m+2 and m+3 (frame headers untouched).
+        for (i, frame_no) in [m + 2, m + 3].into_iter().enumerate() {
+            let (off, data) = writes[i];
+            assert_eq!(off, run.frame_offset(frame_no) + WAL_FRAME_HDRSIZE as u64);
+            assert_eq!(data.len(), ps);
+            assert_eq!(&data[0..4], &(3 + i as u32).to_be_bytes());
+        }
+        // 3: frames m+4 (page 6) and m+5 (page 8, commit) in one positioned write, both with
+        //    salt and checksum zeroed exactly as `memset(&aFrame[8], 0, 16)` leaves them.
+        let (off, data) = writes[2];
+        assert_eq!(off, run.frame_offset(m + 4));
+        assert_eq!(data.len(), 2 * szf);
+        for (i, (pgno, n_truncate)) in [(6u32, 0u32), (8, 8)].into_iter().enumerate() {
+            let fhdr = &data[i * szf..i * szf + WAL_FRAME_HDRSIZE];
+            assert_eq!(&fhdr[0..4], &pgno.to_be_bytes());
+            assert_eq!(&fhdr[4..8], &n_truncate.to_be_bytes());
+            assert_eq!(
+                &fhdr[8..24],
+                &[0u8; 16],
+                "frame appended while a checksum rewrite is pending must not carry a salt or \
+                 checksum (C writes zeroes)"
+            );
+        }
+        // Before `walRewriteChecksums` the log holds no valid frame past the first overwritten
+        // one, whatever happened to the in-place writes.
+        let pre_rewrite = run.image_after(run.commit_start + 3);
+        assert_eq!(run.valid_chain(&pre_rewrite), (m + 1, 0));
+        // 4-7: one 24-byte header per frame m+2 ..= m+5, ascending, now with the real salt.
+        for (i, frame_no) in (m + 2..=m + 5).enumerate() {
+            let (off, data) = writes[3 + i];
+            assert_eq!(off, run.frame_offset(frame_no));
+            assert_eq!(data.len(), WAL_FRAME_HDRSIZE);
+            assert_eq!(&data[8..16], salt_bytes.as_slice());
+        }
+        assert!(
+            matches!(run.ops.last(), Some(WalOp::Sync)),
+            "synchronous=FULL syncs the log after the rewrite"
+        );
+        assert_eq!(run.valid_chain(&run.final_wal), (m + 5, 8));
+
+        // The W1 hole: spilled frames and the appended commit frame durable, both in-place
+        // overwrites (and the header rewrites) lost.
+        let mut hole = spilled.clone();
+        apply_wal_op(&mut hole, &run.ops[run.commit_start + 2]);
+        assert_eq!(
+            run.valid_chain(&hole),
+            (m + 3, 0),
+            "the appended commit frame must not validate over the stale spilled frames"
+        );
+        assert!(
+            recovered_state(&run.db_image, &hole) == run.before,
+            "commit frame durable + in-place overwrites lost must discard the transaction"
+        );
+    }
+
+    /// The overwrite happens in a later SPILL (not at COMMIT): `iReCksum` stays set, so the
+    /// frames appended by that spill and by COMMIT are all written unchained (zero salt and
+    /// checksum) until COMMIT rewrites the checksums.
+    #[test]
+    fn test_wal_spill_overwriting_spilled_frame_is_crash_atomic() {
+        for synchronous in [1u8, 2] {
+            let run = record_wal_txn(
+                sqliters_vfs::IOCAP_POWERSAFE_OVERWRITE,
+                synchronous,
+                true,
+                |pager| {
+                    stamp_page(pager, 2, 2);
+                    stamp_page(pager, 3, 2);
+                    stamp_page(pager, 4, 2);
+                    assert_eq!(pager.spill_if_over_cache_size().unwrap(), 3);
+                    stamp_page(pager, 3, 3);
+                    stamp_page(pager, 6, 3);
+                    assert_eq!(pager.spill_if_over_cache_size().unwrap(), 2);
+                    stamp_page(pager, 8, 3);
+                },
+            );
+            let (n_before, n_after) = run.assert_every_crash_state_is_atomic();
+            assert!(n_before > 0 && n_after > 0);
+
+            let m = run.base_frames();
+            // Second spill: page 3 over frame m+2 in place, then page 6 appended unchained.
+            let WalOp::Write { off, data } = &run.ops[3] else {
+                panic!("in-place overwrite expected")
+            };
+            assert_eq!(*off, run.frame_offset(m + 2) + WAL_FRAME_HDRSIZE as u64);
+            assert_eq!(data.len(), run.page_size);
+            let WalOp::Write { off, data } = &run.ops[4] else {
+                panic!("appended spill frame expected")
+            };
+            assert_eq!(*off, run.frame_offset(m + 4));
+            assert_eq!(&data[0..4], &6u32.to_be_bytes());
+            assert_eq!(&data[4..24], &[0u8; 20], "spill frame written unchained");
+            assert_eq!(run.commit_start, 5);
+            // COMMIT: page 8 appended as an unchained commit frame, then 4 header rewrites.
+            let writes = run.commit_writes();
+            assert_eq!(writes.len(), 5);
+            assert_eq!(writes[0].0, run.frame_offset(m + 5));
+            assert_eq!(&writes[0].1[0..4], &8u32.to_be_bytes());
+            assert_eq!(&writes[0].1[4..8], &8u32.to_be_bytes());
+            assert_eq!(&writes[0].1[8..24], &[0u8; 16]);
+            let pre_rewrite = run.image_after(run.commit_start + 1);
+            assert_eq!(run.valid_chain(&pre_rewrite), (m + 1, 0));
+            assert_eq!(run.valid_chain(&run.final_wal), (m + 5, 8));
+        }
+    }
+
+    /// The transaction starts the log (WAL header written and synced inside it) and overwrites
+    /// frame 1, so the rewrite restarts from the WAL-header checksum (`iReCksum == 1`); the
+    /// device has no power-safe overwrite, so COMMIT also appends a sector-padding copy of the
+    /// commit frame after the rewrite, split around the sync point.
+    #[test]
+    fn test_wal_overwrite_of_frame_one_with_sector_padding_is_crash_atomic() {
+        let run = record_wal_txn(0, 2, false, |pager| {
+            stamp_page(pager, 2, 2);
+            stamp_page(pager, 3, 2);
+            assert_eq!(pager.spill_if_over_cache_size().unwrap(), 2);
+            stamp_page(pager, 2, 3);
+            stamp_page(pager, 5, 3);
+            assert_eq!(pager.spill_if_over_cache_size().unwrap(), 2);
+            stamp_page(pager, 8, 3);
+        });
+        let (n_before, n_after) = run.assert_every_crash_state_is_atomic();
+        assert!(n_before > 0 && n_after > 0);
+
+        assert_eq!(run.base_frames(), 0);
+        assert!(
+            matches!(run.ops[0], WalOp::Write { off: 0, ref data } if data.len() == WAL_HDRSIZE)
+        );
+        assert!(matches!(run.ops[1], WalOp::Sync), "WAL header is synced");
+        // Second spill: frame 1 (page 2) overwritten in place, page 5 appended unchained.
+        let WalOp::Write { off, data } = &run.ops[4] else {
+            panic!("in-place overwrite expected")
+        };
+        assert_eq!(*off, run.frame_offset(1) + WAL_FRAME_HDRSIZE as u64);
+        assert_eq!(data.len(), run.page_size);
+        let WalOp::Write { off, data } = &run.ops[5] else {
+            panic!("appended spill frame expected")
+        };
+        assert_eq!(*off, run.frame_offset(3));
+        assert_eq!(&data[4..24], &[0u8; 20]);
+        assert_eq!(run.commit_start, 6);
+        // COMMIT appends page 8 as an unchained commit frame at frame 4 ...
+        let writes = run.commit_writes();
+        assert_eq!(writes[0].0, run.frame_offset(4));
+        assert_eq!(writes[0].1.len(), run.sz_frame());
+        assert_eq!(&writes[0].1[0..4], &8u32.to_be_bytes());
+        assert_eq!(&writes[0].1[4..8], &8u32.to_be_bytes());
+        assert_eq!(&writes[0].1[8..24], &[0u8; 16]);
+        let pre_rewrite = run.image_after(run.commit_start + 1);
+        assert_eq!(run.valid_chain(&pre_rewrite), (0, 0));
+        // ... rewrites the headers of frames 1..=4 starting from the WAL-header checksum ...
+        for (i, frame_no) in (1u32..=4).enumerate() {
+            assert_eq!(writes[1 + i].0, run.frame_offset(frame_no));
+            assert_eq!(writes[1 + i].1.len(), WAL_FRAME_HDRSIZE);
+        }
+        let rewritten = run.image_after(run.commit_start + 5);
+        assert_eq!(run.valid_chain(&rewritten), (4, 8));
+        // ... and pads to the sector boundary with valid copies of the commit frame.
+        let (valid, n_truncate) = run.valid_chain(&run.final_wal);
+        assert!(valid > 4, "sector padding frame(s) follow the commit frame");
+        assert_eq!(n_truncate, 8);
+        assert_eq!(
+            run.final_wal.len(),
+            WAL_HDRSIZE + valid as usize * run.sz_frame()
+        );
+    }
+
+    /// A savepoint is opened while a checksum rewrite is pending, frames are spilled under it
+    /// and rolled back (`sqlite3WalSavepointUndo` keeps `iReCksum` because it is not above the
+    /// restored `mxFrame`), and COMMIT reuses their slots: the frames stay unchained until the
+    /// rewrite and the final log is one valid chain.
+    #[test]
+    fn test_wal_savepoint_rollback_under_pending_rewrite_is_crash_atomic() {
+        let run = record_wal_txn(sqliters_vfs::IOCAP_POWERSAFE_OVERWRITE, 2, true, |pager| {
+            stamp_page(pager, 2, 2);
+            stamp_page(pager, 3, 2);
+            assert_eq!(pager.spill_if_over_cache_size().unwrap(), 2);
+            stamp_page(pager, 3, 3);
+            stamp_page(pager, 6, 3);
+            assert_eq!(pager.spill_if_over_cache_size().unwrap(), 2);
+            pager.ensure_subsavepoints(1).unwrap();
+            stamp_page(pager, 4, 9);
+            stamp_page(pager, 7, 9);
+            assert_eq!(pager.spill_if_over_cache_size().unwrap(), 2);
+            pager.rollback_to_subsavepoint(0).unwrap();
+            pager.release_subsavepoint(0).unwrap();
+            stamp_page(pager, 8, 3);
+        });
+        let (n_before, n_after) = run.assert_every_crash_state_is_atomic();
+        assert!(n_before > 0 && n_after > 0);
+
+        let m = run.base_frames();
+        // Spills: m+1 (page 2), m+2 (page 3); page 3 in place over m+2, m+3 (page 6) unchained;
+        // under the savepoint m+4 (page 4) and m+5 (page 7), both unchained.
+        assert_eq!(run.commit_start, 6);
+        for (op, frame_no) in [(3usize, m + 3), (4, m + 4), (5, m + 5)] {
+            let WalOp::Write { off, data } = &run.ops[op] else {
+                panic!("appended spill frame expected")
+            };
+            assert_eq!(*off, run.frame_offset(frame_no));
+            assert_eq!(
+                &data[4..24],
+                &[0u8; 20],
+                "frame {frame_no} written unchained"
+            );
+        }
+        // COMMIT appends from frame m+4 again (the savepoint rollback dropped m+4 and m+5),
+        // every frame unchained, the last one carrying the commit size.
+        let writes = run.commit_writes();
+        let (off, data) = writes[0];
+        assert_eq!(off, run.frame_offset(m + 4));
+        let n_appended = data.len() / run.sz_frame();
+        assert_eq!(data.len(), n_appended * run.sz_frame());
+        for i in 0..n_appended {
+            let fhdr = &data[i * run.sz_frame()..i * run.sz_frame() + WAL_FRAME_HDRSIZE];
+            let n_truncate = if i + 1 == n_appended { 8u32 } else { 0 };
+            assert_eq!(&fhdr[4..8], &n_truncate.to_be_bytes());
+            assert_eq!(&fhdr[8..24], &[0u8; 16]);
+        }
+        let last = m + 3 + n_appended as u32;
+        let pre_rewrite = run.image_after(run.commit_start + 1);
+        assert_eq!(run.valid_chain(&pre_rewrite), (m + 1, 0));
+        assert_eq!(writes.len(), 1 + (last - (m + 1)) as usize);
+        for (i, frame_no) in (m + 2..=last).enumerate() {
+            assert_eq!(writes[1 + i].0, run.frame_offset(frame_no));
+            assert_eq!(writes[1 + i].1.len(), WAL_FRAME_HDRSIZE);
+        }
+        assert_eq!(run.valid_chain(&run.final_wal), (last, 8));
+        // The rolled-back images of pages 4 and 7 are not part of the committed state.
+        assert_eq!(run.after.1[3], run.before.1[3]);
+        assert_eq!(run.after.1[6], run.before.1[6]);
+    }
 }
