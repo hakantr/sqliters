@@ -26124,25 +26124,71 @@ fn populate_index_btree(
                 if let Some(max_ci) = max_needed_col
                     && !raw_rec.is_empty()
                 {
-                    let (hdr_u64, mut hdr_pos) = sqliters_types::get_varint(raw_rec)?;
-                    let hdr_len = usize::try_from(hdr_u64)
-                        .ok()
-                        .filter(|&h| h <= raw_rec.len() && hdr_pos <= h)
-                        .ok_or_else(|| SqliteError::corrupt("record header out of bounds"))?;
-                    let mut body_pos = hdr_len;
-                    while parsed_cols <= max_ci && hdr_pos < hdr_len {
-                        let (st, used) = sqliters_types::get_varint(&raw_rec[hdr_pos..hdr_len])?;
-                        let len = sqliters_types::serial_type_len(st)?;
-                        let next_b = body_pos
-                            .checked_add(len)
-                            .filter(|&nb| nb <= raw_rec.len())
-                            .ok_or_else(|| SqliteError::corrupt("record payload truncated"))?;
-                        rec_st[parsed_cols] = st;
-                        rec_off[parsed_cols] = body_pos;
-                        rec_len[parsed_cols] = len;
-                        hdr_pos += used;
-                        body_pos = next_b;
-                        parsed_cols += 1;
+                    if let Some((hdr_len, mut sts, swar_cols)) =
+                        sqliters_types::swar_decode_hdr(raw_rec)
+                    {
+                        let fast_stop = (max_ci + 1).min(swar_cols);
+                        let mut body_pos = hdr_len;
+                        while parsed_cols < fast_stop {
+                            let st = (sts & 0xff) as u8;
+                            sts >>= 8;
+                            let len_u8 = sqliters_types::swar_serial_len_1b(st);
+                            if len_u8 == 0xff {
+                                return Err(SqliteError::corrupt("reserved serial type"));
+                            }
+                            let len = usize::from(len_u8);
+                            let next_b = body_pos + len;
+                            if next_b > raw_rec.len() {
+                                return Err(SqliteError::corrupt("record payload truncated"));
+                            }
+                            rec_st[parsed_cols] = u64::from(st);
+                            rec_off[parsed_cols] = body_pos;
+                            rec_len[parsed_cols] = len;
+                            body_pos = next_b;
+                            parsed_cols += 1;
+                        }
+                        if parsed_cols <= max_ci && hdr_len > 8 {
+                            let mut hdr_pos = 8usize;
+                            while parsed_cols <= max_ci && hdr_pos < hdr_len {
+                                let (st, used) =
+                                    sqliters_types::get_varint(&raw_rec[hdr_pos..hdr_len])?;
+                                let len = sqliters_types::serial_type_len(st)?;
+                                let next_b = body_pos
+                                    .checked_add(len)
+                                    .filter(|&nb| nb <= raw_rec.len())
+                                    .ok_or_else(|| {
+                                        SqliteError::corrupt("record payload truncated")
+                                    })?;
+                                rec_st[parsed_cols] = st;
+                                rec_off[parsed_cols] = body_pos;
+                                rec_len[parsed_cols] = len;
+                                hdr_pos += used;
+                                body_pos = next_b;
+                                parsed_cols += 1;
+                            }
+                        }
+                    } else {
+                        let (hdr_u64, mut hdr_pos) = sqliters_types::get_varint(raw_rec)?;
+                        let hdr_len = usize::try_from(hdr_u64)
+                            .ok()
+                            .filter(|&h| h <= raw_rec.len() && hdr_pos <= h)
+                            .ok_or_else(|| SqliteError::corrupt("record header out of bounds"))?;
+                        let mut body_pos = hdr_len;
+                        while parsed_cols <= max_ci && hdr_pos < hdr_len {
+                            let (st, used) =
+                                sqliters_types::get_varint(&raw_rec[hdr_pos..hdr_len])?;
+                            let len = sqliters_types::serial_type_len(st)?;
+                            let next_b = body_pos
+                                .checked_add(len)
+                                .filter(|&nb| nb <= raw_rec.len())
+                                .ok_or_else(|| SqliteError::corrupt("record payload truncated"))?;
+                            rec_st[parsed_cols] = st;
+                            rec_off[parsed_cols] = body_pos;
+                            rec_len[parsed_cols] = len;
+                            hdr_pos += used;
+                            body_pos = next_b;
+                            parsed_cols += 1;
+                        }
                     }
                 }
 
@@ -26194,11 +26240,26 @@ fn populate_index_btree(
                             }
                         } else {
                             if k == 0 && use_prefix_key {
-                                let mut packed = 0u64;
-                                let n = b.len().min(7);
-                                for (bi, &byte) in b[..n].iter().enumerate() {
-                                    packed |= u64::from(byte) << (48 - bi * 8);
-                                }
+                                let packed = if b.len() >= 8 {
+                                    u64::from_be_bytes([
+                                        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                                    ]) >> 8
+                                } else if b.len() >= 4 {
+                                    let hi =
+                                        u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+                                            << 24;
+                                    let mut lo = 0u64;
+                                    for (bi, &byte) in b[4..].iter().enumerate() {
+                                        lo |= u64::from(byte) << (16 - bi * 8);
+                                    }
+                                    hi | lo
+                                } else {
+                                    let mut p = 0u64;
+                                    for (bi, &byte) in b.iter().enumerate() {
+                                        p |= u64::from(byte) << (48 - bi * 8);
+                                    }
+                                    p
+                                };
                                 let tag = if (st_in & 1) != 0 { 2u64 } else { 3u64 };
                                 col0_prefix = (tag << 56) | packed;
                             }

@@ -1631,6 +1631,40 @@ pub fn parse_escape_char(s: &str) -> Result<char> {
     Ok(c)
 }
 
+#[inline(always)]
+const fn swar_haszero_u64(x: u64) -> u64 {
+    x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080
+}
+
+#[inline]
+fn swar_find_ascii_byte(hay: &[u8], target_lower_or_exact: u8, fold_alpha: bool) -> Option<usize> {
+    let bcast = 0x0101_0101_0101_0101u64.wrapping_mul(u64::from(target_lower_or_exact));
+    let fold_mask = if fold_alpha {
+        0x2020_2020_2020_2020u64
+    } else {
+        0
+    };
+    let mut pos = 0usize;
+    while pos + 8 <= hay.len() {
+        let s = &hay[pos..pos + 8];
+        let w = u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]);
+        let x = (w | fold_mask) ^ bcast;
+        let hit = swar_haszero_u64(x);
+        if hit != 0 {
+            return Some(pos + (hit.trailing_zeros() >> 3) as usize);
+        }
+        pos += 8;
+    }
+    let fm8 = fold_mask as u8;
+    while pos < hay.len() {
+        if (hay[pos] | fm8) == target_lower_or_exact {
+            return Some(pos);
+        }
+        pos += 1;
+    }
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LikeToken {
     Star,
@@ -1650,15 +1684,19 @@ enum CompiledLikeKind {
         suffix: Box<[u8]>,
     },
     ContainsAsciiOne(u8),
-    ContainsAsciiBmh {
+    ContainsAsciiSwar {
         needle: Box<[u8]>,
-        skip: Box<[usize; 256]>,
+        first_bcast: u64,
+        last_bcast: u64,
+        first_fold: u64,
+        last_fold: u64,
+        packed_needle4_8: u64,
     },
     General(Box<[LikeToken]>),
 }
 
-/// Pre-compiled SQLite `LIKE` pattern with zero-allocation byte-slice matching and a pure
-/// safe-Rust Boyer-Moore-Horspool `[usize; 256]` skip table for `%<ascii_literal>%`.
+/// Pre-compiled SQLite `LIKE` pattern with zero-allocation byte-slice matching and a 64-bit
+/// SWAR first+last byte `haszero` filter + packed `u64` case-folded window matcher for `%<ascii_literal>%`.
 #[derive(Debug, Clone)]
 pub struct CompiledLikePattern {
     kind: CompiledLikeKind,
@@ -1738,17 +1776,41 @@ impl CompiledLikePattern {
                 };
             }
             let m = needle.len();
-            let mut skip = Box::new([m; 256]);
-            for i in 0..(m - 1) {
-                let b = needle[i];
-                let shift = m - 1 - i;
-                skip[b as usize] = shift;
-                if !case_sensitive && b.is_ascii_lowercase() {
-                    skip[b.to_ascii_uppercase() as usize] = shift;
-                }
-            }
+            let first = needle[0];
+            let last = needle[m - 1];
+            let first_bcast = 0x0101_0101_0101_0101u64.wrapping_mul(u64::from(first));
+            let last_bcast = 0x0101_0101_0101_0101u64.wrapping_mul(u64::from(last));
+            let first_fold = if !case_sensitive && first.is_ascii_lowercase() {
+                0x2020_2020_2020_2020u64
+            } else {
+                0
+            };
+            let last_fold = if !case_sensitive && last.is_ascii_lowercase() {
+                0x2020_2020_2020_2020u64
+            } else {
+                0
+            };
+            let packed_needle4_8 = if (4..=8).contains(&m) {
+                let lo = u32::from_le_bytes([needle[0], needle[1], needle[2], needle[3]]);
+                let hi = u32::from_le_bytes([
+                    needle[m - 4],
+                    needle[m - 3],
+                    needle[m - 2],
+                    needle[m - 1],
+                ]);
+                u64::from(lo) | (u64::from(hi) << 32)
+            } else {
+                0
+            };
             return Self {
-                kind: CompiledLikeKind::ContainsAsciiBmh { needle, skip },
+                kind: CompiledLikeKind::ContainsAsciiSwar {
+                    needle,
+                    first_bcast,
+                    last_bcast,
+                    first_fold,
+                    last_fold,
+                    packed_needle4_8,
+                },
                 case_sensitive,
             };
         }
@@ -1798,19 +1860,67 @@ impl CompiledLikePattern {
 
     #[inline]
     fn eq_slice_folded(hay: &[u8], lower_needle: &[u8], case_sensitive: bool) -> bool {
-        if hay.len() != lower_needle.len() {
+        let len = lower_needle.len();
+        if hay.len() != len {
             return false;
         }
         if case_sensitive {
-            hay == lower_needle
-        } else {
-            for i in 0..lower_needle.len() {
-                if hay[i].to_ascii_lowercase() != lower_needle[i] {
+            return hay == lower_needle;
+        }
+        if len >= 8 {
+            let mut pos = 0usize;
+            while pos + 8 <= len {
+                let sh = &hay[pos..pos + 8];
+                let sn = &lower_needle[pos..pos + 8];
+                let wh =
+                    u64::from_le_bytes([sh[0], sh[1], sh[2], sh[3], sh[4], sh[5], sh[6], sh[7]]);
+                let wn =
+                    u64::from_le_bytes([sn[0], sn[1], sn[2], sn[3], sn[4], sn[5], sn[6], sn[7]]);
+                if sqliters_types::swar_fold_ascii_lower_u64(wh) != wn {
+                    return false;
+                }
+                pos += 8;
+            }
+            if pos < len {
+                let t = len - 8;
+                let sh = &hay[t..len];
+                let sn = &lower_needle[t..len];
+                let wh =
+                    u64::from_le_bytes([sh[0], sh[1], sh[2], sh[3], sh[4], sh[5], sh[6], sh[7]]);
+                let wn =
+                    u64::from_le_bytes([sn[0], sn[1], sn[2], sn[3], sn[4], sn[5], sn[6], sn[7]]);
+                if sqliters_types::swar_fold_ascii_lower_u64(wh) != wn {
                     return false;
                 }
             }
-            true
+            return true;
         }
+        if len >= 4 {
+            let t = len - 4;
+            let h0 = u32::from_le_bytes([hay[0], hay[1], hay[2], hay[3]]);
+            let h1 = u32::from_le_bytes([hay[t], hay[t + 1], hay[t + 2], hay[t + 3]]);
+            let n0 = u32::from_le_bytes([
+                lower_needle[0],
+                lower_needle[1],
+                lower_needle[2],
+                lower_needle[3],
+            ]);
+            let n1 = u32::from_le_bytes([
+                lower_needle[t],
+                lower_needle[t + 1],
+                lower_needle[t + 2],
+                lower_needle[t + 3],
+            ]);
+            let wh = u64::from(h0) | (u64::from(h1) << 32);
+            let wn = u64::from(n0) | (u64::from(n1) << 32);
+            return sqliters_types::swar_fold_ascii_lower_u64(wh) == wn;
+        }
+        for i in 0..len {
+            if hay[i].to_ascii_lowercase() != lower_needle[i] {
+                return false;
+            }
+        }
+        true
     }
 
     /// Evaluates this pre-compiled `LIKE` pattern directly on UTF-8 bytes with zero heap allocation
@@ -1837,57 +1947,94 @@ impl CompiledLikePattern {
             }
             CompiledLikeKind::ContainsAsciiOne(target) => {
                 let t = *target;
-                if cs || !t.is_ascii_lowercase() {
-                    haystack.contains(&t)
-                } else {
-                    let upper = t.to_ascii_uppercase();
-                    for &b in haystack {
-                        if b == t || b == upper {
-                            return true;
-                        }
-                    }
-                    false
-                }
+                swar_find_ascii_byte(haystack, t, !cs && t.is_ascii_lowercase()).is_some()
             }
-            CompiledLikeKind::ContainsAsciiBmh { needle, skip } => {
+            CompiledLikeKind::ContainsAsciiSwar {
+                needle,
+                first_bcast,
+                last_bcast,
+                first_fold,
+                last_fold,
+                packed_needle4_8,
+            } => {
                 let m = needle.len();
                 let n = haystack.len();
                 if n < m {
                     return false;
                 }
-                let last_idx = m - 1;
-                let last_b = needle[last_idx];
-                let limit = n - m;
-                let mut pos = 0usize;
-                if !cs {
-                    while pos <= limit {
-                        let win = &haystack[pos..pos + m];
-                        let hb = win[last_idx];
-                        if hb.to_ascii_lowercase() == last_b {
-                            let mut ok = true;
-                            for k in 0..last_idx {
-                                if win[k].to_ascii_lowercase() != needle[k] {
-                                    ok = false;
-                                    break;
-                                }
-                            }
-                            if ok {
+                let span = n - m + 1;
+                let check_at = |idx: usize| -> bool {
+                    if (4..=8).contains(&m) {
+                        let win = &haystack[idx..idx + m];
+                        let lo = u32::from_le_bytes([win[0], win[1], win[2], win[3]]);
+                        let hi =
+                            u32::from_le_bytes([win[m - 4], win[m - 3], win[m - 2], win[m - 1]]);
+                        let w = u64::from(lo) | (u64::from(hi) << 32);
+                        let fw = if cs {
+                            w
+                        } else {
+                            sqliters_types::swar_fold_ascii_lower_u64(w)
+                        };
+                        fw == *packed_needle4_8
+                    } else {
+                        Self::eq_slice_folded(&haystack[idx..idx + m], needle, cs)
+                    }
+                };
+                if span >= 8 {
+                    let fb = *first_bcast;
+                    let lb = *last_bcast;
+                    let ff = *first_fold;
+                    let lf = *last_fold;
+                    let mut pos = 0usize;
+                    while pos + 8 <= span {
+                        let sf = &haystack[pos..pos + 8];
+                        let sl = &haystack[pos + m - 1..pos + m - 1 + 8];
+                        let wf = u64::from_le_bytes([
+                            sf[0], sf[1], sf[2], sf[3], sf[4], sf[5], sf[6], sf[7],
+                        ]);
+                        let wl = u64::from_le_bytes([
+                            sl[0], sl[1], sl[2], sl[3], sl[4], sl[5], sl[6], sl[7],
+                        ]);
+                        let mut hit =
+                            swar_haszero_u64((wf | ff) ^ fb) & swar_haszero_u64((wl | lf) ^ lb);
+                        while hit != 0 {
+                            let j = (hit.trailing_zeros() >> 3) as usize;
+                            if check_at(pos + j) {
                                 return true;
                             }
+                            hit &= hit - 1;
                         }
-                        pos += skip[hb as usize];
+                        pos += 8;
                     }
+                    if pos < span {
+                        let t = span - 8;
+                        let sf = &haystack[t..t + 8];
+                        let sl = &haystack[t + m - 1..t + m - 1 + 8];
+                        let wf = u64::from_le_bytes([
+                            sf[0], sf[1], sf[2], sf[3], sf[4], sf[5], sf[6], sf[7],
+                        ]);
+                        let wl = u64::from_le_bytes([
+                            sl[0], sl[1], sl[2], sl[3], sl[4], sl[5], sl[6], sl[7],
+                        ]);
+                        let mut hit =
+                            swar_haszero_u64((wf | ff) ^ fb) & swar_haszero_u64((wl | lf) ^ lb);
+                        while hit != 0 {
+                            let j = (hit.trailing_zeros() >> 3) as usize;
+                            if check_at(t + j) {
+                                return true;
+                            }
+                            hit &= hit - 1;
+                        }
+                    }
+                    false
                 } else {
-                    while pos <= limit {
-                        let win = &haystack[pos..pos + m];
-                        let hb = win[last_idx];
-                        if hb == last_b && win[..last_idx] == needle[..last_idx] {
+                    for idx in 0..span {
+                        if check_at(idx) {
                             return true;
                         }
-                        pos += skip[hb as usize];
                     }
+                    false
                 }
-                false
             }
             CompiledLikeKind::General(tokens) => {
                 if let Ok(s) = std::str::from_utf8(haystack) {
@@ -2041,6 +2188,15 @@ fn like_ascii_bytes_nocase(pat: &[u8], txt: &[u8]) -> bool {
                 if pi == pat.len() {
                     return true;
                 }
+                if pat[pi] != b'_' {
+                    let next_lo = pat[pi].to_ascii_lowercase();
+                    let Some(off) =
+                        swar_find_ascii_byte(&txt[ti..], next_lo, next_lo.is_ascii_lowercase())
+                    else {
+                        return false;
+                    };
+                    ti += off;
+                }
                 star_pi = pi;
                 star_ti = ti;
                 continue;
@@ -2053,6 +2209,18 @@ fn like_ascii_bytes_nocase(pat: &[u8], txt: &[u8]) -> bool {
         }
         if star_pi != usize::MAX {
             star_ti += 1;
+            if pat[star_pi] != b'_' {
+                if star_ti >= txt.len() {
+                    return false;
+                }
+                let next_lo = pat[star_pi].to_ascii_lowercase();
+                let Some(off) =
+                    swar_find_ascii_byte(&txt[star_ti..], next_lo, next_lo.is_ascii_lowercase())
+                else {
+                    return false;
+                };
+                star_ti += off;
+            }
             ti = star_ti;
             pi = star_pi;
             continue;
@@ -3525,5 +3693,41 @@ impl AccumulatorTable {
         };
         let rv = acc.finalize_rt()?;
         enforce_result_subtype_contract(&name, flags, strict_subtype, rv)
+    }
+}
+
+#[cfg(test)]
+mod swar_like_tests {
+    use super::*;
+
+    #[test]
+    fn swar_contains_and_folded_eq_boundaries_and_borrow_patterns() {
+        // Borrow-adjacent byte pattern: lane 0 matches (`xor == 0x00`), lane 1 has `xor == 0x01`
+        // (`t` followed by `u`, where `'u' ^ 't' == 0x01`). Must never false-match!
+        let pat = CompiledLikePattern::compile("%token42%", None, false);
+        assert!(!pat.matches_utf8_bytes(b"tuXXXX22YYYYYYYYYYYY"));
+        assert!(pat.matches_utf8_bytes(b"tuXXXX2YYYYYToKeN42Z"));
+        assert!(pat.matches_utf8_bytes(b"TOKEN42"));
+        assert!(!pat.matches_utf8_bytes(b"TOKEN4"));
+
+        let pat_cs = CompiledLikePattern::compile("%Token42%", None, true);
+        assert!(pat_cs.matches_utf8_bytes(b"xxToken42yy"));
+        assert!(!pat_cs.matches_utf8_bytes(b"xxtoken42yy"));
+
+        for m in 1..=18usize {
+            let needle: String = (0..m).map(|k| (b'a' + (k % 26) as u8) as char).collect();
+            let like_pat = format!("%{}%", needle.to_ascii_uppercase());
+            let compiled = CompiledLikePattern::compile(&like_pat, None, false);
+            for pad_l in [0usize, 1, 3, 7, 8, 9, 15, 16, 23] {
+                for pad_r in [0usize, 1, 4, 8, 13] {
+                    let hay = format!("{}{}{}", "-".repeat(pad_l), needle, ".".repeat(pad_r));
+                    assert!(
+                        compiled.matches_utf8_bytes(hay.as_bytes()),
+                        "expected match m={m} pad_l={pad_l} pad_r={pad_r}"
+                    );
+                    assert!(sqlite_like_match(&like_pat, &hay, None));
+                }
+            }
+        }
     }
 }

@@ -28,7 +28,7 @@ pub use record::{
     encode_record_into, encode_record_with_encoding, encode_runtime_record_into,
     encode_runtime_record_with_encoding, encode_value_refs_record_into, fallible_sort_by,
     parse_raw_record_prefix, raw_record_prefix_has_null, read_raw_record_field, serial_type_for,
-    serial_type_for_with_encoding, serial_type_len,
+    serial_type_for_with_encoding, serial_type_len, swar_decode_hdr, swar_serial_len_1b,
 };
 pub use runtime_api::{
     AggregateStepId, DatabaseId, ExecutionServices, FunctionFlags, MAX_DB_SLOTS, RowMutationEvent,
@@ -38,7 +38,8 @@ pub use runtime_api::{
 pub use value::{
     Collation, CustomCollation, StorageClass, TextEncoding, TypeAffinity, Value, cmp_int_float,
     format_sqlite_real, is_sqlite_ascii_space, parse_leading_f64, parse_leading_i64,
-    parse_numeric_text, sqlite_trim_ascii, sqlite_trim_ascii_start,
+    parse_numeric_text, sqlite_trim_ascii, sqlite_trim_ascii_start, swar_cmp_nocase_bytes,
+    swar_fold_ascii_lower_u64,
 };
 pub use varint::{get_varint, get_varint_i64, push_varint, put_varint, put_varint_i64, varint_len};
 pub use vtab_api::{
@@ -338,5 +339,55 @@ mod tests {
         assert!(decode_shm_page_size(0).is_err());
         assert!(decode_shm_page_size(2).is_err());
         assert!(decode_shm_page_size(0x0201).is_err());
+    }
+
+    #[test]
+    fn test_swar_serial_len_hdr_and_nocase_invariants() {
+        for st in 0u8..128 {
+            let swar = swar_serial_len_1b(st);
+            match serial_type_len(u64::from(st)) {
+                Ok(expected) => assert_eq!(usize::from(swar), expected, "st={st}"),
+                Err(_) => assert_eq!(swar, 0xff, "reserved st={st}"),
+            }
+        }
+        // Exhaustive 256-byte check on `swar_fold_ascii_lower_u64` across all 8 byte lanes
+        for base in (0..256usize).step_by(8) {
+            let raw = [
+                base as u8,
+                (base + 1) as u8,
+                (base + 2) as u8,
+                (base + 3) as u8,
+                (base + 4) as u8,
+                (base + 5) as u8,
+                (base + 6) as u8,
+                (base + 7) as u8,
+            ];
+            let folded = swar_fold_ascii_lower_u64(u64::from_le_bytes(raw)).to_le_bytes();
+            let expected = raw.map(|b| b.to_ascii_lowercase());
+            assert_eq!(folded, expected, "lane mismatch at base={base}");
+        }
+        // Boundary lengths `0..=25` and `[`..`` ` `` bracket bytes between 'Z' and 'a'
+        let a = b"AbCdEfGhIj[\\]^_`Zz012345";
+        let b = b"abcdefghij[\\]^_`zz012345";
+        for len in 0..=a.len() {
+            assert_eq!(swar_cmp_nocase_bytes(&a[..len], &b[..len]), Ordering::Equal);
+        }
+        assert_eq!(
+            swar_cmp_nocase_bytes(b"Alpha_Z", b"alpha_["),
+            Ordering::Greater // 'z' (0x7a) > '[' (0x5b)
+        );
+        // Corrupt reserved serial type 10 in 3-col record must still fail closed in range check
+        let corrupt_rec = [0x04u8, 0x01, 0x0a, 0x01, 0x2a, 0x07];
+        assert!(
+            compare_raw_record_range(
+                &corrupt_rec,
+                &[Value::Integer(42)],
+                Some((&Value::Integer(0), true)),
+                None,
+                &[],
+                TextEncoding::Utf8,
+            )
+            .is_err()
+        );
     }
 }

@@ -217,6 +217,83 @@ impl TextEncoding {
     }
 }
 
+/// Folds ASCII uppercase bytes `'A'..='Z'` (`0x41..=0x5A`) to lowercase (`0x61..=0x7A`) across
+/// all 8 byte lanes of `x` in parallel without cross-byte carry or non-ASCII (`>= 0x80`) mutation.
+#[inline(always)]
+pub const fn swar_fold_ascii_lower_u64(x: u64) -> u64 {
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const L7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    let l = x & L7;
+    let t1 = l.wrapping_add(0x3f3f_3f3f_3f3f_3f3f);
+    let t2 = l.wrapping_add(0x2525_2525_2525_2525);
+    let upper = t1 & !t2 & !x & HI;
+    x | (upper >> 2)
+}
+
+/// Compares two byte slices under SQLite's ASCII-only `NOCASE` rules using 64-bit big-endian
+/// SWAR case-folding (`swar_fold_ascii_lower_u64`).
+#[inline]
+pub fn swar_cmp_nocase_bytes(a: &[u8], b: &[u8]) -> Ordering {
+    let min_len = a.len().min(b.len());
+    if min_len >= 8 {
+        let mut pos = 0usize;
+        while pos + 8 <= min_len {
+            let sa = &a[pos..pos + 8];
+            let sb = &b[pos..pos + 8];
+            let wa = u64::from_be_bytes([sa[0], sa[1], sa[2], sa[3], sa[4], sa[5], sa[6], sa[7]]);
+            let wb = u64::from_be_bytes([sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], sb[6], sb[7]]);
+            if wa != wb {
+                let fa = swar_fold_ascii_lower_u64(wa);
+                let fb = swar_fold_ascii_lower_u64(wb);
+                if fa != fb {
+                    return fa.cmp(&fb);
+                }
+            }
+            pos += 8;
+        }
+        if pos < min_len {
+            let t = min_len - 8;
+            let sa = &a[t..min_len];
+            let sb = &b[t..min_len];
+            let wa = u64::from_be_bytes([sa[0], sa[1], sa[2], sa[3], sa[4], sa[5], sa[6], sa[7]]);
+            let wb = u64::from_be_bytes([sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], sb[6], sb[7]]);
+            if wa != wb {
+                let fa = swar_fold_ascii_lower_u64(wa);
+                let fb = swar_fold_ascii_lower_u64(wb);
+                if fa != fb {
+                    return fa.cmp(&fb);
+                }
+            }
+        }
+        return a.len().cmp(&b.len());
+    }
+    if min_len >= 4 {
+        let t = min_len - 4;
+        let wa0 = u32::from_be_bytes([a[0], a[1], a[2], a[3]]);
+        let wb0 = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+        let wa1 = u32::from_be_bytes([a[t], a[t + 1], a[t + 2], a[t + 3]]);
+        let wb1 = u32::from_be_bytes([b[t], b[t + 1], b[t + 2], b[t + 3]]);
+        let pa = (u64::from(wa0) << 32) | u64::from(wa1);
+        let pb = (u64::from(wb0) << 32) | u64::from(wb1);
+        if pa != pb {
+            let fa = swar_fold_ascii_lower_u64(pa);
+            let fb = swar_fold_ascii_lower_u64(pb);
+            if fa != fb {
+                return fa.cmp(&fb);
+            }
+        }
+        return a.len().cmp(&b.len());
+    }
+    for i in 0..min_len {
+        let la = a[i].to_ascii_lowercase();
+        let lb = b[i].to_ascii_lowercase();
+        if la != lb {
+            return la.cmp(&lb);
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
 /// Built-in SQLite collating sequences (`BINARY`, `NOCASE`, `RTRIM`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Collation {
@@ -281,17 +358,7 @@ impl Collation {
                     }
                 }
             },
-            Self::NoCase => {
-                for (&ba, &bb) in a.as_bytes().iter().zip(b.as_bytes().iter()) {
-                    let la = ba.to_ascii_lowercase();
-                    let lb = bb.to_ascii_lowercase();
-                    match la.cmp(&lb) {
-                        Ordering::Equal => continue,
-                        non_eq => return non_eq,
-                    }
-                }
-                a.len().cmp(&b.len())
-            }
+            Self::NoCase => swar_cmp_nocase_bytes(a.as_bytes(), b.as_bytes()),
             Self::RTrim => {
                 let ta = a.trim_end_matches(' ');
                 let tb = b.trim_end_matches(' ');

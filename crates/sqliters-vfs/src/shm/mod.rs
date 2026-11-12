@@ -110,6 +110,10 @@ pub fn wal_checksum_bytes(
 }
 
 /// Computes or extends the 8-byte SQLite WAL/SHM cumulative checksum using `endian`.
+///
+/// Hoists endian dispatch outside the loop and extracts `(w0, w1)` pairs from 64-bit SWAR
+/// loads across 64-byte (8-pair) unrolled blocks.
+#[inline(never)]
 pub fn wal_checksum_with_endian(
     endian: WalChecksumEndian,
     data: &[u8],
@@ -120,19 +124,52 @@ pub fn wal_checksum_with_endian(
             "walChecksumBytes requires a non-empty multiple of 8 bytes",
         ));
     }
-    let [mut s1, mut s2] = initial.unwrap_or([0, 0]);
-    for pair in data.as_chunks::<8>().0 {
-        let b0 = [pair[0], pair[1], pair[2], pair[3]];
-        let b1 = [pair[4], pair[5], pair[6], pair[7]];
-        let (w0, w1) = match endian {
-            WalChecksumEndian::Native => (u32::from_ne_bytes(b0), u32::from_ne_bytes(b1)),
-            WalChecksumEndian::Big => (u32::from_be_bytes(b0), u32::from_be_bytes(b1)),
-            WalChecksumEndian::Little => (u32::from_le_bytes(b0), u32::from_le_bytes(b1)),
+    #[inline(always)]
+    fn step_pair<const BE: bool>(pair: &[u8], s1: &mut u32, s2: &mut u32) {
+        let arr = [
+            pair[0], pair[1], pair[2], pair[3], pair[4], pair[5], pair[6], pair[7],
+        ];
+        let (w0, w1) = if BE {
+            let w = u64::from_be_bytes(arr);
+            ((w >> 32) as u32, w as u32)
+        } else {
+            let w = u64::from_le_bytes(arr);
+            (w as u32, (w >> 32) as u32)
         };
-        s1 = s1.wrapping_add(w0).wrapping_add(s2);
-        s2 = s2.wrapping_add(w1).wrapping_add(s1);
+        *s1 = s1.wrapping_add(w0).wrapping_add(*s2);
+        *s2 = s2.wrapping_add(w1).wrapping_add(*s1);
     }
-    Ok([s1, s2])
+
+    fn checksum_imp<const BE: bool>(data: &[u8], init: [u32; 2]) -> [u32; 2] {
+        let [mut s1, mut s2] = init;
+        let (blocks, rest) = data.as_chunks::<64>();
+        for blk in blocks {
+            step_pair::<BE>(&blk[0..8], &mut s1, &mut s2);
+            step_pair::<BE>(&blk[8..16], &mut s1, &mut s2);
+            step_pair::<BE>(&blk[16..24], &mut s1, &mut s2);
+            step_pair::<BE>(&blk[24..32], &mut s1, &mut s2);
+            step_pair::<BE>(&blk[32..40], &mut s1, &mut s2);
+            step_pair::<BE>(&blk[40..48], &mut s1, &mut s2);
+            step_pair::<BE>(&blk[48..56], &mut s1, &mut s2);
+            step_pair::<BE>(&blk[56..64], &mut s1, &mut s2);
+        }
+        for pair in rest.as_chunks::<8>().0 {
+            step_pair::<BE>(pair, &mut s1, &mut s2);
+        }
+        [s1, s2]
+    }
+
+    let init = initial.unwrap_or([0, 0]);
+    let is_big = match endian {
+        WalChecksumEndian::Big => true,
+        WalChecksumEndian::Little => false,
+        WalChecksumEndian::Native => cfg!(target_endian = "big"),
+    };
+    Ok(if is_big {
+        checksum_imp::<true>(data, init)
+    } else {
+        checksum_imp::<false>(data, init)
+    })
 }
 
 /// Returns the 0-based 32 KiB WAL-index region containing 1-based `frame_no`
@@ -2135,5 +2172,54 @@ impl WalShmOps for WalShm {
 impl Drop for WalShm {
     fn drop(&mut self) {
         let _ = self.close(false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scalar_ref(endian: WalChecksumEndian, data: &[u8], init: Option<[u32; 2]>) -> [u32; 2] {
+        let [mut s1, mut s2] = init.unwrap_or([0, 0]);
+        for pair in data.as_chunks::<8>().0 {
+            let b0 = [pair[0], pair[1], pair[2], pair[3]];
+            let b1 = [pair[4], pair[5], pair[6], pair[7]];
+            let (w0, w1) = match endian {
+                WalChecksumEndian::Native => (u32::from_ne_bytes(b0), u32::from_ne_bytes(b1)),
+                WalChecksumEndian::Big => (u32::from_be_bytes(b0), u32::from_be_bytes(b1)),
+                WalChecksumEndian::Little => (u32::from_le_bytes(b0), u32::from_le_bytes(b1)),
+            };
+            s1 = s1.wrapping_add(w0).wrapping_add(s2);
+            s2 = s2.wrapping_add(w1).wrapping_add(s1);
+        }
+        [s1, s2]
+    }
+
+    #[test]
+    fn swar_wal_checksum_matches_scalar_all_endians_and_sizes() {
+        let mut buf = vec![0u8; 4120];
+        let mut x = 0x9e37_79b9_7f4a_7c15_u64;
+        for b in &mut buf {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        for &sz in &[8usize, 16, 24, 40, 56, 64, 72, 128, 4096, 4120] {
+            for &init in &[None, Some([0x1234_5678, 0x9abc_def0])] {
+                for &mode in &[
+                    WalChecksumEndian::Native,
+                    WalChecksumEndian::Big,
+                    WalChecksumEndian::Little,
+                ] {
+                    let got = wal_checksum_with_endian(mode, &buf[..sz], init).unwrap();
+                    let exp = scalar_ref(mode, &buf[..sz], init);
+                    assert_eq!(
+                        got, exp,
+                        "mismatch at sz={sz}, mode={mode:?}, init={init:?}"
+                    );
+                }
+            }
+        }
     }
 }
