@@ -13,9 +13,9 @@ use sqliters_syntax::{
     TableOrSubquery, UnaryOp,
 };
 use sqliters_types::{
-    Collation, CompiledJsonArrowPath, DatabaseId, ErrorCode, KeySortOrder, Pgno, RawField, Result,
-    RuntimeValue, SqliteError, TextEncoding, TypeAffinity, Value, fallible_sort_by,
-    format_sqlite_real, parse_raw_record_prefix,
+    Collation, CompiledJsonArrowPath, DatabaseId, ErrorCode, INT_RECORD_MAX_SLOTS, KeySortOrder,
+    Pgno, RawField, Result, RuntimeValue, SqliteError, TextEncoding, TypeAffinity, Value,
+    fallible_sort_by, format_sqlite_real, parse_raw_record_prefix,
 };
 use sqliters_vdbe::{
     AggregateAccumulator, AggregateKind, CompiledLikePattern, FastSumAccum, Opcode, P4, eval_arith,
@@ -35,6 +35,32 @@ use crate::engine::{
 use crate::execution_context::{CollationRegistry, FunctionRegistry};
 use crate::schema::{IndexSchema, Schema, TableSchema};
 use crate::window::core_has_window;
+
+mod int_kernel;
+
+use int_kernel::{CovIntKernel, CovIntKernelShape, IntRow};
+
+#[cfg(test)]
+thread_local! {
+    /// `(rows aggregated by an integer kernel, rows a bound kernel handed to the general row
+    /// code)` on this thread (test instrumentation).
+    pub(crate) static INT_KERNEL_ROWS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Counts one row seen by a bound integer kernel (test instrumentation; compiled out otherwise).
+#[inline(always)]
+fn note_int_kernel_row(_decoded: bool) {
+    #[cfg(test)]
+    INT_KERNEL_ROWS.with(|rows| {
+        let (hits, misses) = rows.get();
+        rows.set(if _decoded {
+            (hits + 1, misses)
+        } else {
+            (hits, misses + 1)
+        });
+    });
+}
 
 // ============================================================================
 // Fast Non-Cryptographic Hasher (`std` only, 100% safe Rust)
@@ -342,6 +368,16 @@ struct FastTableDesc {
 }
 
 impl FastTableDesc {
+    /// Number of table column slots a decoded row of this table occupies.
+    #[inline]
+    const fn col_buf_len(&self) -> usize {
+        if self.needs_record_parse {
+            self.max_record_col + 1
+        } else {
+            0
+        }
+    }
+
     #[inline]
     fn default_raw_field<'a>(val: &'a Value) -> RawField<'a> {
         match val {
@@ -2567,6 +2603,90 @@ fn decode_covering_cell<'a>(
     Ok(0)
 }
 
+/// Decodes a covering-index `cell` into `col_buf_len` table column slots (on the stack when
+/// they fit) and hands `(rowid, columns)` to `f`.
+#[inline(always)]
+fn with_decoded_covering_cell<'a, R>(
+    cov: &FastCoveringIndex,
+    col_buf_len: usize,
+    cell: &'a [u8],
+    f: impl FnOnce(i64, &[RawField<'a>]) -> Result<R>,
+) -> Result<R> {
+    if cov.parse_prefix_len <= 16 && col_buf_len <= 16 {
+        let mut idx_local: [RawField<'a>; 16] = [RawField::Null; 16];
+        let mut tbl_local: [RawField<'a>; 16] = [RawField::Null; 16];
+        let rid = decode_covering_cell(
+            cov,
+            cell,
+            &mut idx_local[..cov.parse_prefix_len],
+            &mut tbl_local[..col_buf_len],
+        )?;
+        f(rid, &tbl_local[..col_buf_len])
+    } else {
+        let mut idx_heap = vec![RawField::Null; cov.parse_prefix_len];
+        let mut tbl_heap = vec![RawField::Null; col_buf_len];
+        let rid = decode_covering_cell(cov, cell, &mut idx_heap, &mut tbl_heap)?;
+        f(rid, &tbl_heap)
+    }
+}
+
+/// Resolves the seek keys of a [`FastSingleAccess::CoveringIndexRangeScan`] against `params`
+/// (applying the index column affinities) and visits the raw index cells of the range.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn seek_covering_index_range<F>(
+    bt: &mut Btree,
+    cov: &FastCoveringIndex,
+    prefix_keys: &[FastScalarRhs],
+    prefix_affinities: &[TypeAffinity],
+    range_aff: TypeAffinity,
+    lower: Option<&FastRangeBound>,
+    upper: Option<&FastRangeBound>,
+    params: &[Value],
+    visit_cell: F,
+) -> Result<()>
+where
+    F: FnMut(&[u8]) -> Result<ControlFlow<()>>,
+{
+    let mut prefix_vals: Vec<Value> = Vec::with_capacity(prefix_keys.len());
+    for (k, &aff) in prefix_keys.iter().zip(prefix_affinities.iter()) {
+        let coerced = apply_index_seek_affinity(aff, k.resolve(params).clone());
+        if coerced.is_null() {
+            return Ok(());
+        }
+        prefix_vals.push(coerced);
+    }
+    let lo_val: Option<(Value, bool)> = if let Some(lb) = lower {
+        let coerced = apply_index_seek_affinity(range_aff, lb.rhs.resolve(params).clone());
+        if coerced.is_null() {
+            return Ok(());
+        }
+        Some((coerced, lb.inclusive))
+    } else {
+        None
+    };
+    let hi_val: Option<(Value, bool)> = if let Some(ub) = upper {
+        let coerced = apply_index_seek_affinity(range_aff, ub.rhs.resolve(params).clone());
+        if coerced.is_null() {
+            return Ok(());
+        }
+        Some((coerced, ub.inclusive))
+    } else {
+        None
+    };
+    let lo_ref = lo_val.as_ref().map(|(v, inc)| (v, *inc));
+    let hi_ref = hi_val.as_ref().map(|(v, inc)| (v, *inc));
+    bt.seek_index_range_raw_cells(
+        cov.root_pgno,
+        &prefix_vals,
+        lo_ref,
+        hi_ref,
+        &cov.orders,
+        false,
+        visit_cell,
+    )
+}
+
 fn scan_single_table_rows<F>(
     bt: &mut Btree,
     td: &FastTableDesc,
@@ -2679,62 +2799,34 @@ where
             range_aff,
             lower,
             upper,
-        } => {
-            let mut prefix_vals: Vec<Value> = Vec::with_capacity(prefix_keys.len());
-            for (k, &aff) in prefix_keys.iter().zip(prefix_affinities.iter()) {
-                let coerced = apply_index_seek_affinity(aff, k.resolve(params).clone());
-                if coerced.is_null() {
-                    return Ok(());
+        } => seek_covering_index_range(
+            bt,
+            cov,
+            prefix_keys,
+            prefix_affinities,
+            *range_aff,
+            lower.as_ref(),
+            upper.as_ref(),
+            params,
+            |cell| {
+                let mut idx_local: [RawField<'_>; 16] = [RawField::Null; 16];
+                let mut tbl_local: [RawField<'_>; 16] = [RawField::Null; 16];
+                if cov.parse_prefix_len <= 16 && col_buf_len <= 16 {
+                    let rid = decode_covering_cell(
+                        cov,
+                        cell,
+                        &mut idx_local[..cov.parse_prefix_len],
+                        &mut tbl_local[..col_buf_len],
+                    )?;
+                    visit(rid, &tbl_local[..col_buf_len])
+                } else {
+                    let mut idx_heap = vec![RawField::Null; cov.parse_prefix_len];
+                    let mut tbl_heap = vec![RawField::Null; col_buf_len];
+                    let rid = decode_covering_cell(cov, cell, &mut idx_heap, &mut tbl_heap)?;
+                    visit(rid, &tbl_heap)
                 }
-                prefix_vals.push(coerced);
-            }
-            let lo_val: Option<(Value, bool)> = if let Some(lb) = lower {
-                let coerced = apply_index_seek_affinity(*range_aff, lb.rhs.resolve(params).clone());
-                if coerced.is_null() {
-                    return Ok(());
-                }
-                Some((coerced, lb.inclusive))
-            } else {
-                None
-            };
-            let hi_val: Option<(Value, bool)> = if let Some(ub) = upper {
-                let coerced = apply_index_seek_affinity(*range_aff, ub.rhs.resolve(params).clone());
-                if coerced.is_null() {
-                    return Ok(());
-                }
-                Some((coerced, ub.inclusive))
-            } else {
-                None
-            };
-            let lo_ref = lo_val.as_ref().map(|(v, inc)| (v, *inc));
-            let hi_ref = hi_val.as_ref().map(|(v, inc)| (v, *inc));
-            bt.seek_index_range_raw_cells(
-                cov.root_pgno,
-                &prefix_vals,
-                lo_ref,
-                hi_ref,
-                &cov.orders,
-                false,
-                |cell| {
-                    let mut idx_local: [RawField<'_>; 16] = [RawField::Null; 16];
-                    let mut tbl_local: [RawField<'_>; 16] = [RawField::Null; 16];
-                    if cov.parse_prefix_len <= 16 && col_buf_len <= 16 {
-                        let rid = decode_covering_cell(
-                            cov,
-                            cell,
-                            &mut idx_local[..cov.parse_prefix_len],
-                            &mut tbl_local[..col_buf_len],
-                        )?;
-                        visit(rid, &tbl_local[..col_buf_len])
-                    } else {
-                        let mut idx_heap = vec![RawField::Null; cov.parse_prefix_len];
-                        let mut tbl_heap = vec![RawField::Null; col_buf_len];
-                        let rid = decode_covering_cell(cov, cell, &mut idx_heap, &mut tbl_heap)?;
-                        visit(rid, &tbl_heap)
-                    }
-                },
-            )
-        }
+            },
+        ),
         FastSingleAccess::IndexOrderedTableLookup {
             index_root,
             rid_field_pos,
@@ -2924,6 +3016,8 @@ struct UngroupedAggPlan {
     where_pred: Option<FastExpr>,
     aggs: Box<[FastAggSpec]>,
     projections: Box<[FastGroupProjExpr]>,
+    /// Integer row kernel for covering-index accesses (`None` when the plan shape has none).
+    int_kernel: Option<CovIntKernelShape>,
 }
 
 impl UngroupedAggPlan {
@@ -2933,18 +3027,22 @@ impl UngroupedAggPlan {
             .iter()
             .map(|s| FastAggState::from_spec(s, enc))
             .collect();
-        scan_single_table_rows(bt, &self.table, &self.access, params, |rowid, cols| {
-            let ctx = FastRowCtx::single(rowid, cols, params, enc);
-            if let Some(ref pred) = self.where_pred
-                && !pred.eval_where_true(&ctx)?
-            {
-                return Ok(ControlFlow::Continue(()));
-            }
-            for (st, spec) in states.iter_mut().zip(self.aggs.iter()) {
-                st.step(spec, &ctx)?;
-            }
-            Ok(ControlFlow::Continue(()))
-        })?;
+        if let Some(kernel) = self.int_kernel.as_ref().and_then(|k| k.bind(params)) {
+            self.scan_covering_with_kernel(bt, params, enc, &kernel, &mut states)?;
+        } else {
+            scan_single_table_rows(bt, &self.table, &self.access, params, |rowid, cols| {
+                let ctx = FastRowCtx::single(rowid, cols, params, enc);
+                if let Some(ref pred) = self.where_pred
+                    && !pred.eval_where_true(&ctx)?
+                {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                for (st, spec) in states.iter_mut().zip(self.aggs.iter()) {
+                    st.step(spec, &ctx)?;
+                }
+                Ok(ControlFlow::Continue(()))
+            })?;
+        }
 
         let mut agg_vals = Vec::with_capacity(self.aggs.len());
         for (st, spec) in states.iter().zip(self.aggs.iter()) {
@@ -2955,6 +3053,72 @@ impl UngroupedAggPlan {
             out.push(p.eval(&[], &agg_vals));
         }
         Ok(out)
+    }
+
+    /// Covering-index scan with the integer row kernel: cells the kernel decodes are filtered
+    /// and aggregated as plain integers, every other cell takes the general row code of
+    /// [`UngroupedAggPlan::execute`].
+    fn scan_covering_with_kernel(
+        &self,
+        bt: &mut Btree,
+        params: &[Value],
+        enc: TextEncoding,
+        kernel: &CovIntKernel<'_>,
+        states: &mut [FastAggState],
+    ) -> Result<()> {
+        let col_buf_len = self.table.col_buf_len();
+        let (FastSingleAccess::CoveringIndexFullScan { cov }
+        | FastSingleAccess::CoveringIndexRangeScan { cov, .. }) = &self.access
+        else {
+            return Err(SqliteError::new(
+                ErrorCode::Internal,
+                "integer kernel bound to a non-covering access",
+            ));
+        };
+        let visit_cell = |cell: &[u8]| -> Result<ControlFlow<()>> {
+            let mut row: IntRow = [0; INT_RECORD_MAX_SLOTS];
+            if kernel.decode(cell, &mut row) {
+                note_int_kernel_row(true);
+                if kernel.passes(&row) {
+                    kernel.step(states, &row, enc);
+                }
+                return Ok(ControlFlow::Continue(()));
+            }
+            note_int_kernel_row(false);
+            with_decoded_covering_cell(cov, col_buf_len, cell, |rowid, cols| {
+                let ctx = FastRowCtx::single(rowid, cols, params, enc);
+                if let Some(ref pred) = self.where_pred
+                    && !pred.eval_where_true(&ctx)?
+                {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                for (st, spec) in states.iter_mut().zip(self.aggs.iter()) {
+                    st.step(spec, &ctx)?;
+                }
+                Ok(ControlFlow::Continue(()))
+            })
+        };
+        match &self.access {
+            FastSingleAccess::CoveringIndexRangeScan {
+                cov,
+                prefix_keys,
+                prefix_affinities,
+                range_aff,
+                lower,
+                upper,
+            } => seek_covering_index_range(
+                bt,
+                cov,
+                prefix_keys,
+                prefix_affinities,
+                *range_aff,
+                lower.as_ref(),
+                upper.as_ref(),
+                params,
+                visit_cell,
+            ),
+            _ => bt.scan_index_raw_cells(cov.root_pgno, false, visit_cell),
+        }
     }
 }
 
@@ -2972,6 +3136,8 @@ struct OrderedCoveringGroupByPlan {
     where_pred: Option<FastExpr>,
     aggs: Box<[FastAggSpec]>,
     projections: Box<[FastGroupProjExpr]>,
+    /// Integer row kernel (`None` when the plan shape has none).
+    int_kernel: Option<CovIntKernelShape>,
 }
 
 impl OrderedCoveringGroupByPlan {
@@ -3014,7 +3180,41 @@ impl OrderedCoveringGroupByPlan {
             Ok(())
         };
 
+        let kernel = self.int_kernel.as_ref().and_then(|k| k.bind(params));
+
         bt.scan_index_raw_cells(self.cov.root_pgno, self.reverse, |cell| {
+            // Integer rows: same filter / group-break / aggregate steps as the general code
+            // below, on plain integers.
+            if let Some(ref kernel) = kernel {
+                let mut row: IntRow = [0; INT_RECORD_MAX_SLOTS];
+                if kernel.decode(cell, &mut row) {
+                    note_int_kernel_row(true);
+                    if !kernel.passes(&row) {
+                        return Ok(ControlFlow::Continue(()));
+                    }
+                    let gk = kernel.group_key(&row);
+                    let same_group = match cur_group_key.as_ref() {
+                        None | Some(Value::Null) => false,
+                        Some(Value::Integer(prev)) => *prev == gk,
+                        Some(prev) => {
+                            let spec = key_order_for_collation(self.group_collation);
+                            RawField::Int(gk)
+                                .compare_sql_to_nonnull_value(prev, &spec, enc)
+                                .unwrap_or(Ordering::Equal)
+                                == Ordering::Equal
+                        }
+                    };
+                    if !same_group {
+                        if let Some(prev_key) = cur_group_key.take() {
+                            flush_group(prev_key, &mut states, &mut out_rows)?;
+                        }
+                        cur_group_key = Some(Value::Integer(gk));
+                    }
+                    kernel.step(&mut states, &row, enc);
+                    return Ok(ControlFlow::Continue(()));
+                }
+                note_int_kernel_row(false);
+            }
             let mut idx_local: [RawField<'_>; 16] = [RawField::Null; 16];
             let mut tbl_local: [RawField<'_>; 16] = [RawField::Null; 16];
             let mut idx_heap: Vec<RawField<'_>>;
@@ -4728,6 +4928,30 @@ impl FastReadPlan {
     }
 }
 
+#[cfg(test)]
+impl FastReadPlan {
+    /// Whether the plan carries an integer row kernel (test instrumentation).
+    pub(crate) fn has_int_kernel(&self) -> bool {
+        match &self.kind {
+            FastReadKind::UngroupedAgg(p) => p.int_kernel.is_some(),
+            FastReadKind::OrderedCoveringGroupBy(p) => p.int_kernel.is_some(),
+            _ => false,
+        }
+    }
+
+    /// The same plan with its integer row kernel removed, so that every row takes the general
+    /// row code (test instrumentation).
+    pub(crate) fn without_int_kernel(&self) -> Self {
+        let mut plan = self.clone();
+        match &mut plan.kind {
+            FastReadKind::UngroupedAgg(p) => p.int_kernel = None,
+            FastReadKind::OrderedCoveringGroupBy(p) => p.int_kernel = None,
+            _ => {}
+        }
+        plan
+    }
+}
+
 fn validate_and_resolve_table_tos(
     tos: &TableOrSubquery,
     selection: Option<&Expr>,
@@ -5195,6 +5419,17 @@ fn try_compile_single_table_core(
             qctx,
         );
         let access = compile_fast_agg_access(&ap, tbl, &td, &exact_cols, needs_rowid)?;
+        let int_kernel = match &access {
+            FastSingleAccess::CoveringIndexFullScan { cov }
+            | FastSingleAccess::CoveringIndexRangeScan { cov, .. } => CovIntKernelShape::build(
+                cov,
+                td.col_buf_len(),
+                compiled_where.as_ref(),
+                None,
+                &aggs,
+            ),
+            _ => None,
+        };
 
         return Some(FastReadPlan {
             db_id,
@@ -5206,6 +5441,7 @@ fn try_compile_single_table_core(
                 where_pred: compiled_where,
                 aggs: aggs.into_boxed_slice(),
                 projections: projs.into_boxed_slice(),
+                int_kernel,
             }),
         });
     }
@@ -5330,6 +5566,13 @@ fn try_compile_single_table_core(
                     None => false,
                     Some(want_desc) => want_desc != idx_desc,
                 };
+                let int_kernel = CovIntKernelShape::build(
+                    &cov,
+                    td.col_buf_len(),
+                    compiled_where.as_ref(),
+                    Some(gb_rc.src),
+                    &aggs,
+                );
                 return Some(FastReadPlan {
                     db_id,
                     column_names: col_names,
@@ -5343,6 +5586,7 @@ fn try_compile_single_table_core(
                         where_pred: compiled_where,
                         aggs: aggs.into_boxed_slice(),
                         projections: projs.into_boxed_slice(),
+                        int_kernel,
                     }),
                 });
             }

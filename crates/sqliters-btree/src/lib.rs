@@ -18,8 +18,8 @@ use sqliters_pager::{
     WalCheckpointResult, create_super_journal_file,
 };
 use sqliters_types::{
-    Bitvec, ErrorCode, KeySortOrder, Pgno, RawField, RawRecordKey, Result, SqliteError,
-    TextEncoding, Value, compare_raw_record_range, compare_raw_records_with_encoding,
+    Bitvec, ErrorCode, IntRangeProbe, KeySortOrder, Pgno, RawField, RawRecordKey, Result,
+    SqliteError, TextEncoding, Value, compare_raw_record_range, compare_raw_records_with_encoding,
     compare_records_with_encoding, decode_record_with_encoding, decode_serial_value_with_encoding,
     extended, get_varint, get_varint_i64, parse_raw_record_prefix, push_varint, put_varint,
     serial_type_len, varint_len,
@@ -32,12 +32,12 @@ pub use cursor::{
 };
 pub use page::{
     BtreePageType, IndexInteriorCell, IndexLeafCell, ParsedPage, PayloadBounds, RawIndexCell,
-    RawIndexInteriorStep, RawLeafDeleteOutcome, RawTableLeafCell, TableInteriorCell, TableLeafCell,
-    TableLeafInsertProbe, apply_append_table_interior_rightmost, apply_delete_index_leaf_in_place,
-    apply_insert_index_leaf_in_place, apply_insert_index_leaf_raw, apply_insert_table_leaf_raw,
-    apply_replace_table_leaf_raw, binary_search_table_leaf, binary_search_table_leaf_with_span,
-    defragment_raw_leaf_in_place, find_index_interior_child_in_place,
-    find_index_interior_child_raw, find_table_interior_child,
+    RawIndexInteriorStep, RawIndexLeafView, RawLeafDeleteOutcome, RawTableLeafCell,
+    TableInteriorCell, TableLeafCell, TableLeafInsertProbe, apply_append_table_interior_rightmost,
+    apply_delete_index_leaf_in_place, apply_insert_index_leaf_in_place,
+    apply_insert_index_leaf_raw, apply_insert_table_leaf_raw, apply_replace_table_leaf_raw,
+    binary_search_table_leaf, binary_search_table_leaf_with_span, defragment_raw_leaf_in_place,
+    find_index_interior_child_in_place, find_index_interior_child_raw, find_table_interior_child,
     find_table_interior_child_append_hint, init_single_cell_table_leaf_raw, last_table_leaf_rowid,
     peek_page_type, probe_append_table_interior_rightmost, probe_delete_index_leaf_in_place,
     probe_delete_index_leaf_raw, probe_index_interior_slot_raw, probe_index_interior_step_raw,
@@ -89,6 +89,27 @@ enum FastTableInsertOutcome {
     Inserted,
     Duplicate,
     Fallback,
+}
+
+/// [`compare_raw_record_range`] with the all-integer shortcut of an [`IntRangeProbe`] built
+/// from the same arguments: the probe answers for the records it can decide, and every other
+/// record takes the general comparison.
+#[inline(always)]
+fn compare_index_cell_range(
+    probe: Option<&IntRangeProbe>,
+    rec: &[u8],
+    prefix_values: &[Value],
+    lower_bound: Option<(&Value, bool)>,
+    upper_bound: Option<(&Value, bool)>,
+    orders: &[KeySortOrder],
+    enc: TextEncoding,
+) -> Result<Ordering> {
+    if let Some(p) = probe
+        && let Some(ord) = p.compare(rec)
+    {
+        return Ok(ord);
+    }
+    compare_raw_record_range(rec, prefix_values, lower_bound, upper_bound, orders, enc)
 }
 
 #[inline]
@@ -3082,9 +3103,10 @@ impl Btree {
                         }
                         let step = {
                             let raw = self.pager.read_page(pgno)?;
+                            let view = RawIndexLeafView::new(pgno, usable, raw, n_cell);
                             let mut st = LeafStep::Done;
                             while ci < n_cell {
-                                let cell = read_index_leaf_cell(pgno, usable, raw, n_cell, ci)?;
+                                let cell = view.cell(ci)?;
                                 ci += 1;
                                 if cell.overflow_page.is_none() {
                                     if visit(cell.local_payload)?.is_break() {
@@ -3123,10 +3145,11 @@ impl Btree {
                         }
                         let step = {
                             let raw = self.pager.read_page(pgno)?;
+                            let view = RawIndexLeafView::new(pgno, usable, raw, n_cell);
                             let mut st = LeafRevStep::Done;
                             while rem > 0 {
                                 rem -= 1;
-                                let cell = read_index_leaf_cell(pgno, usable, raw, n_cell, rem)?;
+                                let cell = view.cell(rem)?;
                                 if cell.overflow_page.is_none() {
                                     if visit(cell.local_payload)?.is_break() {
                                         st = LeafRevStep::Broke;
@@ -3836,6 +3859,7 @@ impl Btree {
         let usable = self.pager.usable_size();
         let max_pages = (self.pager.page_count() as usize).saturating_add(2);
         let mut visited_pages = 0usize;
+        let probe = IntRangeProbe::new(prefix_values, lower_bound, upper_bound, orders);
         let _ = self.seek_index_range_raw_cells_rec(
             root_pgno,
             usable,
@@ -3844,6 +3868,7 @@ impl Btree {
             upper_bound,
             orders,
             enc,
+            probe.as_ref(),
             reverse,
             &mut visited_pages,
             max_pages,
@@ -3924,6 +3949,7 @@ impl Btree {
         upper_bound: Option<(&Value, bool)>,
         orders: &[KeySortOrder],
         enc: TextEncoding,
+        probe: Option<&IntRangeProbe>,
         reverse: bool,
         visited_pages: &mut usize,
         max_pages: usize,
@@ -3960,17 +3986,19 @@ impl Btree {
             let (ptype, n_cell, right_child) = raw_page_header(pgno, usable, raw)?;
             match ptype {
                 BtreePageType::IndexLeaf => {
+                    let view = RawIndexLeafView::new(pgno, usable, raw, n_cell);
                     let mut lo = 0usize;
                     let mut hi = n_cell;
                     let mut has_ovfl = false;
                     while lo < hi {
                         let mid = lo + (hi - lo) / 2;
-                        let cell = read_index_leaf_cell(pgno, usable, raw, n_cell, mid)?;
+                        let cell = view.cell(mid)?;
                         if cell.overflow_page.is_some() {
                             has_ovfl = true;
                             break;
                         }
-                        let ord = compare_raw_record_range(
+                        let ord = compare_index_cell_range(
+                            probe,
                             cell.local_payload,
                             prefix_values,
                             lower_bound,
@@ -3994,13 +4022,14 @@ impl Btree {
                         let mut ci = lo;
                         let mut ovfl_at = None;
                         while ci < n_cell {
-                            let cell = read_index_leaf_cell(pgno, usable, raw, n_cell, ci)?;
+                            let cell = view.cell(ci)?;
                             if cell.overflow_page.is_some() {
                                 ovfl_at = Some(ci);
                                 break;
                             }
                             ci += 1;
-                            match compare_raw_record_range(
+                            match compare_index_cell_range(
+                                probe,
                                 cell.local_payload,
                                 prefix_values,
                                 lower_bound,
@@ -4031,12 +4060,13 @@ impl Btree {
                         let mut uhi = n_cell;
                         while ulo < uhi {
                             let mid = ulo + (uhi - ulo) / 2;
-                            let cell = read_index_leaf_cell(pgno, usable, raw, n_cell, mid)?;
+                            let cell = view.cell(mid)?;
                             if cell.overflow_page.is_some() {
                                 has_ovfl = true;
                                 break;
                             }
-                            let ord = compare_raw_record_range(
+                            let ord = compare_index_cell_range(
+                                probe,
                                 cell.local_payload,
                                 prefix_values,
                                 lower_bound,
@@ -4052,10 +4082,7 @@ impl Btree {
                         }
                         if !has_ovfl {
                             for idx in (lo..ulo).rev() {
-                                if read_index_leaf_cell(pgno, usable, raw, n_cell, idx)?
-                                    .overflow_page
-                                    .is_some()
-                                {
+                                if view.cell(idx)?.overflow_page.is_some() {
                                     has_ovfl = true;
                                     break;
                                 }
@@ -4069,8 +4096,9 @@ impl Btree {
                         } else {
                             let mut cf = ControlFlow::Continue(());
                             for idx in (lo..ulo).rev() {
-                                let cell = read_index_leaf_cell(pgno, usable, raw, n_cell, idx)?;
-                                if compare_raw_record_range(
+                                let cell = view.cell(idx)?;
+                                if compare_index_cell_range(
+                                    probe,
                                     cell.local_payload,
                                     prefix_values,
                                     lower_bound,
@@ -4099,7 +4127,8 @@ impl Btree {
                             has_ovfl = true;
                             break;
                         }
-                        let ord = compare_raw_record_range(
+                        let ord = compare_index_cell_range(
+                            probe,
                             cell.local_payload,
                             prefix_values,
                             lower_bound,
@@ -4129,7 +4158,8 @@ impl Btree {
                                 has_ovfl = true;
                                 break;
                             }
-                            let ord = compare_raw_record_range(
+                            let ord = compare_index_cell_range(
+                                probe,
                                 cell.local_payload,
                                 prefix_values,
                                 lower_bound,
@@ -4433,6 +4463,7 @@ impl Btree {
                         upper_bound,
                         orders,
                         enc,
+                        probe,
                         false,
                         visited_pages,
                         max_pages,
@@ -4494,6 +4525,7 @@ impl Btree {
                 upper_bound,
                 orders,
                 enc,
+                probe,
                 false,
                 visited_pages,
                 max_pages,
@@ -4509,6 +4541,7 @@ impl Btree {
                     upper_bound,
                     orders,
                     enc,
+                    probe,
                     true,
                     visited_pages,
                     max_pages,
@@ -4572,6 +4605,7 @@ impl Btree {
                         upper_bound,
                         orders,
                         enc,
+                        probe,
                         true,
                         visited_pages,
                         max_pages,
@@ -7084,6 +7118,185 @@ mod tests {
                 raw_bt.integrity_check(&[1, raw_root]).unwrap(),
                 Vec::<String>::new()
             );
+        }
+    }
+
+    /// The raw index walkers (page-level leaf view, integer range probe) must visit exactly the
+    /// records the general record comparison selects, in index order: `scan_index_raw_cells`
+    /// against the sorted list of inserted records, `seek_index_range_raw_cells` (forward and
+    /// reverse) against a full scan filtered with `compare_raw_record_range`. Covers integer,
+    /// REAL, TEXT, BLOB and NULL keys and targets, the i64 extremes, inclusive / exclusive /
+    /// missing / inverted bounds, bounds on duplicate keys, DESC columns (no probe), early
+    /// `Break`, overflow cells and multi-level trees on 512-byte to 64 KiB pages.
+    #[test]
+    fn test_index_raw_scan_and_int_range_seek_match_general_compare() {
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        fn key_value(state: &mut u64, span: u64, odd_per_32: u64) -> Value {
+            let r = next(state);
+            if (r >> 40) % 32 >= odd_per_32 {
+                return Value::Integer(((r >> 8) % span) as i64);
+            }
+            match (r >> 8) % 8 {
+                0 => Value::Null,
+                1 => Value::Real(((r >> 16) % span) as f64 + 0.5),
+                2 => Value::Real(((r >> 16) % span) as f64),
+                3 => Value::Text(["abc", "", "7", "Z"][((r >> 16) % 4) as usize].to_owned()),
+                4 => Value::Blob(vec![1u8; ((r >> 16) % 3) as usize]),
+                5 => Value::Integer([i64::MAX, i64::MIN, 1 << 40][((r >> 16) % 3) as usize]),
+                6 => Value::Text("w".repeat(100 + ((r >> 16) % 900) as usize)),
+                _ => Value::Integer(-(((r >> 16) % span) as i64)),
+            }
+        }
+        fn target(state: &mut u64, span: u64) -> Value {
+            let r = next(state);
+            let i = ((r >> 8) % (span + 2)) as i64 - 1;
+            match (r >> 40) % 20 {
+                0 => Value::Null,
+                1 => Value::Real(i as f64 + 0.5),
+                2 => Value::Real(i as f64),
+                3 => Value::Text("abc".to_owned()),
+                4 => Value::Integer([i64::MAX, i64::MIN][((r >> 16) % 2) as usize]),
+                _ => Value::Integer(i),
+            }
+        }
+
+        let enc = TextEncoding::Utf8;
+        let asc = KeySortOrder::default();
+        let desc = KeySortOrder {
+            desc: true,
+            ..KeySortOrder::default()
+        };
+        for (page_size, n_rows, odd_per_32, desc_col) in [
+            (512u32, 5_000i64, 0u64, None),
+            (512, 4_000, 3, None),
+            (4096, 12_000, 1, None),
+            (4096, 3_000, 2, Some(1usize)),
+            (1024, 3_000, 2, Some(0)),
+            (65_536, 4_000, 4, None),
+            (4096, 0, 0, None),
+            (512, 1, 0, None),
+        ] {
+            let mut bt = Btree::open_in_memory().unwrap();
+            bt.pager_mut().set_page_size(page_size).unwrap();
+            bt.begin_write().unwrap();
+            let root = bt.create_index().unwrap();
+            let mut orders = [asc.clone(), asc.clone(), asc.clone()];
+            if let Some(col) = desc_col {
+                orders[col] = desc.clone();
+            }
+            let mut seed = 0xA076_1D64_78BD_642Fu64 ^ u64::from(page_size) ^ (n_rows as u64) << 24;
+            let mut inserted: Vec<Vec<u8>> = Vec::new();
+            for i in 1..=n_rows {
+                let rec = encode_record(&[
+                    key_value(&mut seed, 9, odd_per_32),
+                    key_value(&mut seed, 400, odd_per_32),
+                    Value::Integer(i),
+                ]);
+                bt.insert_index(root, &rec, &orders).unwrap();
+                inserted.push(rec);
+            }
+            if n_rows >= 3_000 && page_size <= 4096 {
+                assert!(bt.pager().page_count() > 8, "expected a multi-level tree");
+            }
+
+            // Full scans, both directions, against the sorted inserted records.
+            inserted.sort_by(|a, b| {
+                compare_raw_records_with_encoding(a, b, None, &orders, enc).unwrap()
+            });
+            let scan = |bt: &mut Btree, reverse: bool, stop_after: usize| -> Vec<Vec<u8>> {
+                let mut out = Vec::new();
+                bt.scan_index_raw_cells(root, reverse, |rec| {
+                    out.push(rec.to_vec());
+                    Ok(if out.len() == stop_after {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    })
+                })
+                .unwrap();
+                out
+            };
+            let forward = scan(&mut bt, false, usize::MAX);
+            assert!(forward == inserted, "forward scan (page {page_size})");
+            let mut backward = scan(&mut bt, true, usize::MAX);
+            backward.reverse();
+            assert!(backward == inserted, "reverse scan (page {page_size})");
+            assert!(scan(&mut bt, false, 7) == inserted[..inserted.len().min(7)]);
+
+            // Range seeks against the general comparison applied to every record.
+            let mut probed = 0usize;
+            let mut matched = 0usize;
+            for round in 0..1_500usize {
+                let k = [1usize, 1, 1, 0, 2][round % 5];
+                let prefix: Vec<Value> =
+                    [target(&mut seed, 9), target(&mut seed, 400)][..k].to_vec();
+                let span = if k == 0 { 9 } else { 400 };
+                let bound = |seed: &mut u64| -> Option<(Value, bool)> {
+                    if next(seed).is_multiple_of(4) || k == 2 {
+                        return None;
+                    }
+                    Some((target(seed, span), next(seed).is_multiple_of(2)))
+                };
+                let lower = bound(&mut seed);
+                let upper = bound(&mut seed);
+                let lo_ref = lower.as_ref().map(|(v, inc)| (v, *inc));
+                let hi_ref = upper.as_ref().map(|(v, inc)| (v, *inc));
+                probed +=
+                    usize::from(IntRangeProbe::new(&prefix, lo_ref, hi_ref, &orders).is_some());
+                let expect: Vec<&Vec<u8>> = inserted
+                    .iter()
+                    .filter(|rec| {
+                        compare_raw_record_range(rec, &prefix, lo_ref, hi_ref, &orders, enc)
+                            .unwrap()
+                            == Ordering::Equal
+                    })
+                    .collect();
+                matched += expect.len();
+                for reverse in [false, true] {
+                    let stop_after = if round % 7 == 3 { 5 } else { usize::MAX };
+                    let mut got: Vec<Vec<u8>> = Vec::new();
+                    bt.seek_index_range_raw_cells(
+                        root,
+                        &prefix,
+                        lo_ref,
+                        hi_ref,
+                        &orders,
+                        reverse,
+                        |rec| {
+                            got.push(rec.to_vec());
+                            Ok(if got.len() == stop_after {
+                                ControlFlow::Break(())
+                            } else {
+                                ControlFlow::Continue(())
+                            })
+                        },
+                    )
+                    .unwrap();
+                    let want: Vec<&Vec<u8>> = if reverse {
+                        expect.iter().rev().take(stop_after).copied().collect()
+                    } else {
+                        expect.iter().take(stop_after).copied().collect()
+                    };
+                    assert!(
+                        got.iter().eq(want.iter().copied()),
+                        "page {page_size} reverse {reverse}: {prefix:?} {lower:?} {upper:?}: \
+                         {} records, expected {}",
+                        got.len(),
+                        want.len()
+                    );
+                }
+            }
+            if n_rows >= 3_000 {
+                if desc_col.is_none() {
+                    assert!(probed > 300, "only {probed} seeks used the integer probe");
+                }
+                assert!(matched > 20_000, "only {matched} records matched");
+            }
         }
     }
 

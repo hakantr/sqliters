@@ -11136,6 +11136,327 @@ mod tests {
         }
     }
 
+    /// The integer row kernel of the covering-index aggregate plans (and the integer range
+    /// probe of the index seek under them) must be invisible: for every statement and binding,
+    /// the plan with its kernel and the same plan with the kernel removed (every row through
+    /// the general row code) return the same rows or the same error. Where the result cannot
+    /// depend on the order rows reach the aggregates (no i64 overflow), the generic executor
+    /// (a connection with a progress handler never takes a fast-read plan) must agree too.
+    ///
+    /// Covers statements re-used across bindings of every type (INTEGER, REAL, numeric and
+    /// other TEXT, BLOB, NULL, the i64 extremes), `=` / `<` / `<=` / `>` / `>=` / `!=` / `IS` /
+    /// `BETWEEN` / `NOT BETWEEN`, `count` / `sum` / `total` / `avg` / `min` / `max` including
+    /// integer overflow, rowid columns read from the index, a `DESC` index, group keys mixing
+    /// `1`, `1.0`, text, blobs and NULL, rows that leave the kernel mid-scan (NULL / REAL /
+    /// TEXT / BLOB values in otherwise integer columns), ranges that are empty, cover
+    /// everything or end on duplicate keys, and 512-byte to 64 KiB pages (multi-level indexes).
+    #[test]
+    fn int_kernel_covering_aggregates_match_general_row_code() {
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        /// A value for an indexed column: mostly small integers.
+        fn cell(state: &mut u64, span: u64, odd_per_64: u64, extremes: bool) -> Value {
+            let r = next(state);
+            if (r >> 40) % 64 >= odd_per_64 {
+                return Value::Integer(((r >> 8) % span) as i64);
+            }
+            match (r >> 8) % if extremes { 8 } else { 6 } {
+                0 | 1 => Value::Null,
+                2 => Value::Real(((r >> 16) % span) as f64 + 0.5),
+                3 => Value::Real(((r >> 16) % span) as f64),
+                4 => Value::Text(["abc", "", "7x", "Z"][((r >> 16) % 4) as usize].to_owned()),
+                5 => Value::Blob(vec![1u8; ((r >> 16) % 3) as usize]),
+                6 => Value::Integer(
+                    [i64::MAX, i64::MIN, i64::MAX / 2, -40_000, 1 << 40][((r >> 16) % 5) as usize],
+                ),
+                7 => Value::Integer(-(((r >> 16) % span) as i64)),
+                _ => Value::Integer(-(((r >> 16) % span) as i64)),
+            }
+        }
+        /// A comparison operand: mostly integers in (and just around) the stored range.
+        fn operand(state: &mut u64, span: u64) -> Value {
+            let r = next(state);
+            let i = ((r >> 8) % (span + 2)) as i64 - 1;
+            match (r >> 40) % 24 {
+                0 => Value::Null,
+                1 => Value::Real(i as f64 + 0.5),
+                2 => Value::Real(i as f64),
+                3 => Value::Text(i.to_string()),
+                4 => Value::Text("abc".to_owned()),
+                5 => Value::Blob(vec![1]),
+                6 => Value::Integer([i64::MAX, i64::MIN, i64::MAX / 2][((r >> 16) % 3) as usize]),
+                _ => Value::Integer(i),
+            }
+        }
+
+        const SCHEMA: &str = "CREATE TABLE t(id INTEGER PRIMARY KEY, g INT, s INT, x, y TEXT);
+             CREATE INDEX t_gs ON t(g, s);
+             CREATE INDEX t_xg ON t(x, g, id);
+             CREATE TABLE u(a INTEGER, b INTEGER, c INTEGER, d);
+             CREATE INDEX u_abc ON u(a, b, c);
+             CREATE INDEX u_c_desc ON u(c DESC, a);";
+        // (statement, must carry an integer kernel)
+        let statements: [(&str, bool); 22] = [
+            (
+                "SELECT count(*), sum(s) FROM t WHERE g = ?1 AND s BETWEEN ?2 AND ?3",
+                true,
+            ),
+            (
+                "SELECT g, count(*), sum(s), avg(s) FROM t WHERE s > ?2 GROUP BY g ORDER BY g",
+                true,
+            ),
+            (
+                "SELECT g, count(*), total(s), min(s), max(s) FROM t \
+                 WHERE s >= ?2 AND s < ?3 GROUP BY g ORDER BY g DESC",
+                true,
+            ),
+            (
+                "SELECT count(s), min(s), max(s), total(s), avg(s) FROM t WHERE g = ?1",
+                true,
+            ),
+            (
+                "SELECT count(*), sum(s), max(id), min(id) FROM t WHERE g = ?1 AND s > ?2",
+                true,
+            ),
+            (
+                "SELECT count(*), sum(s) FROM t WHERE g = ?1 AND s NOT BETWEEN ?2 AND ?3",
+                true,
+            ),
+            (
+                "SELECT count(*), count(s), sum(s) FROM t WHERE g IS ?1 AND s != ?2",
+                true,
+            ),
+            (
+                "SELECT count(*), sum(s) FROM t WHERE g = ?1 AND s <= ?3 AND ?2 <= s",
+                true,
+            ),
+            (
+                "SELECT g, count(*), sum(s) FROM t WHERE s BETWEEN ?2 AND ?3 GROUP BY g",
+                true,
+            ),
+            ("SELECT g, max(s), min(s), count(g) FROM t GROUP BY g", true),
+            (
+                "SELECT count(*), sum(b), sum(c) FROM u WHERE a = ?1 AND b >= ?2",
+                true,
+            ),
+            (
+                "SELECT count(*), total(b), avg(c), min(c), max(b) FROM u WHERE a = ?1 AND b = ?2",
+                true,
+            ),
+            (
+                "SELECT a, sum(b), total(b), avg(c), count(c) FROM u WHERE c != ?2 GROUP BY a",
+                true,
+            ),
+            (
+                "SELECT a, sum(c), count(*) FROM u WHERE b < ?3 GROUP BY a ORDER BY a DESC",
+                true,
+            ),
+            (
+                "SELECT c, count(*), sum(a) FROM u INDEXED BY u_c_desc GROUP BY c ORDER BY c DESC",
+                true,
+            ),
+            (
+                "SELECT count(*), sum(a), max(a) FROM u INDEXED BY u_c_desc WHERE c = ?2 AND a > ?1",
+                true,
+            ),
+            (
+                "SELECT x, count(*), sum(g), min(id) FROM t INDEXED BY t_xg \
+                 WHERE g < ?1 GROUP BY x ORDER BY x",
+                true,
+            ),
+            (
+                "SELECT count(*), sum(g), sum(id) FROM t INDEXED BY t_xg WHERE x = ?1 AND g >= ?1",
+                true,
+            ),
+            (
+                "SELECT count(*), sum(s), total(g) FROM t INDEXED BY t_gs",
+                true,
+            ),
+            // Shapes outside the kernel: they must simply keep working.
+            (
+                "SELECT count(*), sum(s) FROM t WHERE g = ?1 AND (s < ?2 OR s > ?3)",
+                false,
+            ),
+            (
+                "SELECT count(*), sum(s + 1) FROM t WHERE g = ?1 AND s BETWEEN ?2 AND ?3",
+                false,
+            ),
+            (
+                "SELECT count(*), sum(s) FROM t WHERE g = ?1 AND y BETWEEN ?2 AND ?3",
+                false,
+            ),
+        ];
+
+        type Outcome = std::result::Result<Vec<Vec<Value>>, (i32, String)>;
+        fn run(stmt: &mut Statement, sql: &str, params: &[Value]) -> Outcome {
+            for (i, p) in params.iter().enumerate() {
+                if sql.contains(&format!("?{}", i + 1)) {
+                    stmt.bind(i + 1, p.clone()).unwrap();
+                }
+            }
+            let mut rows = Vec::new();
+            let res = loop {
+                match stmt.step() {
+                    Ok(StepResult::Row(row)) => rows.push(row.into_values()),
+                    Ok(StepResult::Done) => break Ok(rows),
+                    Err(e) => break Err((e.extended_code, e.to_string())),
+                }
+            };
+            stmt.reset().ok();
+            res
+        }
+
+        // `extremes`: values near the i64 limits, so that sums overflow (then the outcome
+        // depends on the order rows are aggregated in, which only the two plan variants share).
+        for (page_size, n_rows, odd_per_64, extremes) in [
+            (4096u32, 5_000u64, 2u64, true),
+            (4096, 3_000, 2, false),
+            (512, 2_000, 3, true),
+            (512, 2_000, 4, false),
+            (65_536, 1_500, 0, true),
+            (1024, 1_000, 20, false),
+            (4096, 0, 0, false),
+            (512, 1, 0, false),
+        ] {
+            let kernel_conn = Connection::open_in_memory().unwrap();
+            let general_conn = Connection::open_in_memory().unwrap();
+            let generic_conn = Connection::open_in_memory().unwrap();
+            let conns = [&kernel_conn, &general_conn, &generic_conn];
+            let mut seed = 0x0D15_EA5E_F00D_4B1Du64 ^ (u64::from(page_size) << 20) ^ n_rows;
+            for conn in conns {
+                conn.execute_batch(&format!("PRAGMA page_size={page_size};"))
+                    .unwrap();
+                conn.execute_batch(SCHEMA).unwrap();
+                conn.execute_batch("BEGIN").unwrap();
+            }
+            for id in 1..=n_rows {
+                let t_row = [
+                    Value::Integer(id as i64),
+                    cell(&mut seed, 12, odd_per_64, extremes),
+                    cell(&mut seed, 10_000, odd_per_64, extremes),
+                    cell(&mut seed, 4, 24, extremes),
+                    Value::Text(format!("y{}", id % 7)),
+                ];
+                // `u`: integers only, with sums that overflow i64 for some `a`.
+                let r = next(&mut seed);
+                let big = [i64::MAX / 2, i64::MAX / 3, i64::MIN / 2, 1 << 50];
+                let u_row = [
+                    Value::Integer(((r >> 8) % 9) as i64),
+                    if extremes && (r >> 16).is_multiple_of(5) {
+                        Value::Integer(big[((r >> 24) % 4) as usize])
+                    } else {
+                        Value::Integer(((r >> 24) % 300) as i64 - 20)
+                    },
+                    if extremes && (r >> 40).is_multiple_of(40) {
+                        Value::Integer(i64::MAX - ((r >> 48) % 3) as i64)
+                    } else {
+                        Value::Integer(((r >> 48) % 50) as i64)
+                    },
+                    cell(&mut seed, 5, odd_per_64, extremes),
+                ];
+                for conn in conns {
+                    conn.query("INSERT INTO t VALUES (?1, ?2, ?3, ?4, ?5)", &t_row)
+                        .unwrap();
+                    conn.query("INSERT INTO u VALUES (?1, ?2, ?3, ?4)", &u_row)
+                        .unwrap();
+                }
+            }
+            for conn in conns {
+                conn.execute_batch("COMMIT").unwrap();
+            }
+            generic_conn
+                .progress_handler(i32::MAX, Some(Box::new(|| false)))
+                .unwrap();
+
+            let mut stmts: Vec<[Statement; 3]> = statements
+                .iter()
+                .map(|(sql, _)| conns.map(|conn| conn.prepare(sql).unwrap()))
+                .collect();
+            for (trio, (sql, expect_kernel)) in stmts.iter_mut().zip(statements) {
+                let plan = trio[0].compiled_fast_read.as_deref();
+                assert_eq!(
+                    plan.is_some_and(fast_read::FastReadPlan::has_int_kernel),
+                    expect_kernel,
+                    "integer kernel of {sql}"
+                );
+                // Same plan, every row through the general row code.
+                let stripped = trio[1]
+                    .compiled_fast_read
+                    .as_deref()
+                    .map(|p| Arc::new(p.without_int_kernel()));
+                trio[1].compiled_fast_read = stripped;
+            }
+
+            let rows_before = fast_read::INT_KERNEL_ROWS.with(std::cell::Cell::get);
+            let mut errors = 0u32;
+            let mut nonempty = 0u32;
+            for op in 0..700u32 {
+                let which = (next(&mut seed) % statements.len() as u64) as usize;
+                let sql = statements[which].0;
+                let lo = operand(&mut seed, 10_000);
+                let mut hi = operand(&mut seed, 10_000);
+                if let (Value::Integer(a), Value::Integer(b)) = (&lo, &hi)
+                    && !next(&mut seed).is_multiple_of(6)
+                {
+                    hi = Value::Integer((*a).max(*b));
+                }
+                let params = [operand(&mut seed, 12), lo, hi];
+                let [k, g, v] = &mut stmts[which];
+                let with_kernel = run(k, sql, &params);
+                let without_kernel = run(g, sql, &params);
+                let generic = run(v, sql, &params);
+                assert_eq!(
+                    with_kernel, without_kernel,
+                    "op {op} page {page_size}: kernel vs general row code: {sql} with {params:?}"
+                );
+                if !extremes {
+                    assert_eq!(
+                        with_kernel, generic,
+                        "op {op} page {page_size}: fast-read plan vs generic executor: {sql} with {params:?}"
+                    );
+                }
+                match &with_kernel {
+                    Err(_) => errors += 1,
+                    Ok(rows) => {
+                        if rows
+                            .iter()
+                            .any(|r| !matches!(r.first(), Some(Value::Integer(0))))
+                        {
+                            nonempty += 1;
+                        }
+                    }
+                }
+            }
+            let (hits, misses) = fast_read::INT_KERNEL_ROWS.with(std::cell::Cell::get);
+            let (hits, misses) = (hits - rows_before.0, misses - rows_before.1);
+            if n_rows >= 1_000 {
+                assert!(hits > 50_000, "page {page_size}: only {hits} kernel rows");
+                assert!(
+                    nonempty > 250,
+                    "page {page_size}: only {nonempty} non-empty results"
+                );
+                if extremes {
+                    assert!(
+                        errors > 5,
+                        "page {page_size}: only {errors} overflow errors"
+                    );
+                } else {
+                    assert_eq!(errors, 0, "page {page_size}: unexpected errors");
+                }
+                if odd_per_64 > 0 {
+                    assert!(
+                        misses > 3_000,
+                        "page {page_size}: only {misses} fallback rows"
+                    );
+                }
+            }
+        }
+    }
+
     /// Streaming aggregate plans over a non-covering index scan must visit rows in index order
     /// (ascending groups, per-group rowid order here) and group `1` with `1.0`.
     #[test]

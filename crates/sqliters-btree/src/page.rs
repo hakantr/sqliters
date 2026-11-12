@@ -2875,6 +2875,86 @@ pub fn read_index_leaf_cell(
     })
 }
 
+/// A raw `IndexLeaf` (`0x0a`) page with the per-page invariants of [`read_index_leaf_cell`]
+/// (usable size, cell pointer array bounds, local payload limit) resolved once, for loops that
+/// read many cells of the same page.
+///
+/// [`RawIndexLeafView::cell`] returns exactly what [`read_index_leaf_cell`] returns for the same
+/// page and index: it only short-cuts cells whose payload size is a one-byte varint and fits
+/// the page locally, and defers every other cell (overflow, damaged, out of range) to it.
+#[derive(Debug, Clone, Copy)]
+pub struct RawIndexLeafView<'a> {
+    pgno: Pgno,
+    usable_size: u32,
+    raw: &'a [u8],
+    /// `raw[..usable]`, or empty when the page-level checks of [`raw_cell_offset`] fail.
+    page: &'a [u8],
+    n_cell: usize,
+    ptr_base: usize,
+    ptr_end: usize,
+    /// Largest payload that is both a one-byte varint and stored without overflow.
+    max_inline: usize,
+}
+
+impl<'a> RawIndexLeafView<'a> {
+    #[inline]
+    pub fn new(pgno: Pgno, usable_size: u32, raw: &'a [u8], n_cell: usize) -> Self {
+        let usable = usable_size as usize;
+        let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+        let ptr_base = hdr_off + 8;
+        let ptr_end = ptr_base.saturating_add(n_cell.saturating_mul(2));
+        let page = if ptr_end <= usable && raw.len() >= usable {
+            &raw[..usable]
+        } else {
+            &[]
+        };
+        // `PayloadBounds::for_index(usable_size).max_local`, without underflow on absurd sizes.
+        let max_local = (usable.saturating_sub(12) * 64 / 255).saturating_sub(23);
+        Self {
+            pgno,
+            usable_size,
+            raw,
+            page,
+            n_cell,
+            ptr_base,
+            ptr_end,
+            max_inline: max_local.min(0x7f),
+        }
+    }
+
+    /// Number of cells on the page (as passed to [`RawIndexLeafView::new`]).
+    #[inline(always)]
+    pub const fn n_cell(&self) -> usize {
+        self.n_cell
+    }
+
+    /// Same as [`read_index_leaf_cell`] for cell `cell_idx` of this page.
+    #[inline(always)]
+    pub fn cell(&self, cell_idx: usize) -> Result<RawIndexCell<'a>> {
+        if cell_idx < self.n_cell {
+            let p = self.ptr_base + 2 * cell_idx;
+            if let Some(ptr) = self.page.get(p..p + 2) {
+                let off = u16::from_be_bytes([ptr[0], ptr[1]]) as usize;
+                if off >= self.ptr_end
+                    && let Some(&len_byte) = self.page.get(off)
+                {
+                    let len = len_byte as usize;
+                    if len <= self.max_inline
+                        && let Some(local_payload) = self.page.get(off + 1..off + 1 + len)
+                    {
+                        return Ok(RawIndexCell {
+                            total_payload_len: len as u32,
+                            local_payload,
+                            overflow_page: None,
+                        });
+                    }
+                }
+            }
+        }
+        read_index_leaf_cell(self.pgno, self.usable_size, self.raw, self.n_cell, cell_idx)
+    }
+}
+
 /// Reads `(left_child, RawIndexCell)` at `cell_idx` on a raw `IndexInterior` (`0x02`) page.
 pub fn read_index_interior_cell(
     pgno: Pgno,

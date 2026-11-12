@@ -1162,6 +1162,237 @@ pub fn compare_raw_record_range(
     Ok(decided)
 }
 
+/// Marks a one-byte serial type that is reserved (10, 11) or not a one-byte varint (`>= 0x80`).
+const SERIAL_1B_INVALID: u8 = u8::MAX;
+
+/// Body length of every serial type that is stored as a single header byte
+/// ([`SERIAL_1B_INVALID`] otherwise); same values as [`serial_type_len`].
+const SERIAL_1B_LEN: [u8; 256] = {
+    let mut table = [SERIAL_1B_INVALID; 256];
+    let mut st = 0usize;
+    while st < 0x80 {
+        table[st] = match st {
+            0 | 8 | 9 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 3,
+            4 => 4,
+            5 => 6,
+            6 | 7 => 8,
+            10 | 11 => SERIAL_1B_INVALID,
+            _ => ((st - 12) >> 1) as u8,
+        };
+        st += 1;
+    }
+    table
+};
+
+/// Decodes the integer stored under one-byte serial type `st` at `rec[at..]`, returning the
+/// value and its body length exactly like [`RawField::from_serial`]; `None` when `st` is not an
+/// integer serial type (1..=6, 8, 9) or the body is cut short.
+#[inline(always)]
+fn read_serial_int(st: u8, rec: &[u8], at: usize) -> Option<(i64, usize)> {
+    match st {
+        1 => {
+            let b = *rec.get(at)?;
+            Some((i64::from(b as i8), 1))
+        }
+        2 => {
+            let s = rec.get(at..at + 2)?;
+            Some((i64::from(i16::from_be_bytes([s[0], s[1]])), 2))
+        }
+        3 => {
+            let s = rec.get(at..at + 3)?;
+            let sign = if (s[0] & 0x80) != 0 { 0xff } else { 0x00 };
+            Some((i64::from(i32::from_be_bytes([sign, s[0], s[1], s[2]])), 3))
+        }
+        4 => {
+            let s = rec.get(at..at + 4)?;
+            Some((i64::from(i32::from_be_bytes([s[0], s[1], s[2], s[3]])), 4))
+        }
+        5 => {
+            let s = rec.get(at..at + 6)?;
+            let sign = if (s[0] & 0x80) != 0 { 0xff } else { 0x00 };
+            Some((
+                i64::from_be_bytes([sign, sign, s[0], s[1], s[2], s[3], s[4], s[5]]),
+                6,
+            ))
+        }
+        6 => {
+            let s = rec.get(at..at + 8)?;
+            Some((
+                i64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]),
+                8,
+            ))
+        }
+        8 => Some((0, 0)),
+        9 => Some((1, 0)),
+        _ => None,
+    }
+}
+
+/// Number of integer slots [`decode_int_record_fields`] can fill.
+pub const INT_RECORD_MAX_SLOTS: usize = 8;
+
+/// `field_slots` entry of [`decode_int_record_fields`] for a field that is stepped over.
+pub const INT_RECORD_SKIP: u8 = u8::MAX;
+
+/// Integer-only companion of [`parse_raw_record_prefix`] for the first `field_slots.len()`
+/// fields of `rec`: field `i` is stored into `vals[field_slots[i]]`, or only stepped over when
+/// `field_slots[i]` is [`INT_RECORD_SKIP`].
+///
+/// Returns `true` only when `parse_raw_record_prefix(rec, &mut out[..field_slots.len()])` would
+/// succeed, decode all `field_slots.len()` fields, and yield `RawField::Int(v)` for every
+/// non-skipped field (with `v` the value stored into `vals`). Any other record — a wider
+/// header, fewer fields, a NULL / REAL / TEXT / BLOB in a wanted field, damage — returns
+/// `false` (leaving `vals` unspecified) and must go through the general decoder.
+#[inline(always)]
+pub fn decode_int_record_fields(
+    rec: &[u8],
+    field_slots: &[u8],
+    vals: &mut [i64; INT_RECORD_MAX_SLOTS],
+) -> bool {
+    let n = field_slots.len();
+    let Some(&h) = rec.first() else {
+        return false;
+    };
+    let hdr = h as usize;
+    // A one-byte header size that leaves room for `n` one-byte serial types.
+    if h >= 0x80 || hdr <= n || hdr > rec.len() {
+        return false;
+    }
+    let mut body = hdr;
+    for (&st, &slot) in rec[1..=n].iter().zip(field_slots) {
+        if slot == INT_RECORD_SKIP {
+            let len = SERIAL_1B_LEN[st as usize];
+            if len == SERIAL_1B_INVALID {
+                return false;
+            }
+            body += len as usize;
+        } else {
+            let Some((v, len)) = read_serial_int(st, rec, body) else {
+                return false;
+            };
+            let Some(out) = vals.get_mut(slot as usize) else {
+                return false;
+            };
+            *out = v;
+            body += len;
+        }
+    }
+    body <= rec.len()
+}
+
+/// Largest number of equality-prefix columns an [`IntRangeProbe`] keeps inline.
+const INT_PROBE_MAX_PREFIX: usize = 4;
+
+/// The target of [`compare_raw_record_range`] when every prefix value and every present bound
+/// is an INTEGER and none of the compared index columns is `DESC`, resolved once per seek.
+///
+/// [`IntRangeProbe::compare`] answers only for records it can decide by integer comparisons
+/// alone and whose whole header it has checked the way the general comparison does; for those
+/// it returns exactly what [`compare_raw_record_range`] returns. Every other record (and every
+/// damaged one) gets `None` and must be passed to [`compare_raw_record_range`].
+#[derive(Debug, Clone, Copy)]
+pub struct IntRangeProbe {
+    k: usize,
+    prefix: [i64; INT_PROBE_MAX_PREFIX],
+    lower: Option<(i64, bool)>,
+    upper: Option<(i64, bool)>,
+}
+
+impl IntRangeProbe {
+    /// Builds the probe for the arguments of [`compare_raw_record_range`], or `None` when they
+    /// are not of the all-integer ascending shape.
+    pub fn new(
+        prefix_values: &[Value],
+        lower_bound: Option<(&Value, bool)>,
+        upper_bound: Option<(&Value, bool)>,
+        orders: &[KeySortOrder],
+    ) -> Option<Self> {
+        let k = prefix_values.len();
+        if k > INT_PROBE_MAX_PREFIX {
+            return None;
+        }
+        let has_bounds = lower_bound.is_some() || upper_bound.is_some();
+        let compared = k + usize::from(has_bounds);
+        if orders.iter().take(compared).any(|o| o.desc) {
+            return None;
+        }
+        let mut prefix = [0i64; INT_PROBE_MAX_PREFIX];
+        for (slot, v) in prefix.iter_mut().zip(prefix_values) {
+            let Value::Integer(i) = v else {
+                return None;
+            };
+            *slot = *i;
+        }
+        let as_int_bound = |b: Option<(&Value, bool)>| -> Option<Option<(i64, bool)>> {
+            match b {
+                None => Some(None),
+                Some((Value::Integer(i), inclusive)) => Some(Some((*i, inclusive))),
+                Some(_) => None,
+            }
+        };
+        Some(Self {
+            k,
+            prefix,
+            lower: as_int_bound(lower_bound)?,
+            upper: as_int_bound(upper_bound)?,
+        })
+    }
+
+    /// See the type documentation.
+    #[inline(always)]
+    pub fn compare(&self, rec: &[u8]) -> Option<Ordering> {
+        let k = self.k;
+        let has_bounds = self.lower.is_some() || self.upper.is_some();
+        let compared = k + usize::from(has_bounds);
+        let &h = rec.first()?;
+        let hdr = h as usize;
+        // A one-byte header size holding at least `compared` one-byte serial types.
+        if h >= 0x80 || hdr <= compared || hdr > rec.len() {
+            return None;
+        }
+        let types = &rec[1..hdr];
+        let mut body = hdr;
+        let mut decided = Ordering::Equal;
+        for (&st, target) in types.iter().zip(&self.prefix[..k]) {
+            let (v, len) = read_serial_int(st, rec, body)?;
+            body += len;
+            if decided == Ordering::Equal {
+                decided = v.cmp(target);
+            }
+        }
+        if has_bounds {
+            let (v, len) = read_serial_int(types[k], rec, body)?;
+            body += len;
+            if decided == Ordering::Equal {
+                if let Some((lo, inclusive)) = self.lower
+                    && (v < lo || (!inclusive && v == lo))
+                {
+                    decided = Ordering::Less;
+                } else if let Some((hi, inclusive)) = self.upper
+                    && (v > hi || (!inclusive && v == hi))
+                {
+                    decided = Ordering::Greater;
+                }
+            }
+        }
+        // The general comparison walks (and validates) every remaining field as well.
+        for &st in &types[compared..] {
+            let len = SERIAL_1B_LEN[st as usize];
+            if len == SERIAL_1B_INVALID {
+                return None;
+            }
+            body += len as usize;
+        }
+        if body > rec.len() {
+            return None;
+        }
+        Some(decided)
+    }
+}
+
 /// `true` when TEXT under `spec` on an `enc` database orders by plain byte comparison of
 /// valid UTF-8 (built-in `BINARY`, no custom collation, UTF-8 storage).
 ///
@@ -1807,6 +2038,226 @@ mod tests {
             let err =
                 compare_raw_records_with_encoding(l, r, None, &[], TextEncoding::Utf8).unwrap_err();
             assert_eq!(err.code, crate::ErrorCode::Corrupt);
+        }
+    }
+
+    /// `IntRangeProbe::compare` may only answer when `compare_raw_record_range` succeeds, and
+    /// then with the same ordering; `decode_int_record_fields` may only succeed when
+    /// `parse_raw_record_prefix` decodes the same integers. Both must actually take their fast
+    /// path for clean all-integer records. Covers every integer width, NULL / REAL / TEXT /
+    /// BLOB fields, two-byte serial types, short records, DESC orders, non-integer targets,
+    /// and truncated or damaged records.
+    #[test]
+    fn int_probe_and_int_decode_match_general_record_code() {
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        fn pick_int(state: &mut u64) -> i64 {
+            let r = next(state);
+            let magnitudes: [i64; 14] = [
+                0,
+                1,
+                2,
+                5,
+                127,
+                128,
+                32_767,
+                32_768,
+                8_388_607,
+                8_388_608,
+                2_147_483_648,
+                140_737_488_355_328,
+                i64::MAX - 1,
+                i64::MAX,
+            ];
+            let m = magnitudes[(r % 14) as usize];
+            match (r >> 8) % 4 {
+                0 => -m,
+                1 => (-m).wrapping_sub(1),
+                2 => m.wrapping_sub(1),
+                _ => m,
+            }
+        }
+        fn pick(state: &mut u64, int_bias: u64) -> Value {
+            let r = next(state);
+            if r % 16 < int_bias {
+                return Value::Integer(pick_int(state));
+            }
+            match (r >> 8) % 6 {
+                0 => Value::Null,
+                1 => Value::Real((pick_int(state) as f64) + 0.5),
+                2 => Value::Text(format!("t{}", r % 7)),
+                3 => Value::Text("x".repeat(40 + (r % 90) as usize)),
+                4 => Value::Blob(vec![(r % 5) as u8; (r % 3) as usize]),
+                _ => Value::Integer(pick_int(state)),
+            }
+        }
+
+        let enc = TextEncoding::Utf8;
+        let asc = KeySortOrder::default();
+        let desc = KeySortOrder {
+            desc: true,
+            ..KeySortOrder::default()
+        };
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let (mut probe_hits, mut decode_hits) = (0usize, 0usize);
+        for round in 0..60_000usize {
+            let int_bias = [16, 14, 8][round % 3];
+            let n_cols = (next(&mut seed) % 5) as usize + usize::from(round % 7 != 0);
+            let vals: Vec<Value> = (0..n_cols).map(|_| pick(&mut seed, int_bias)).collect();
+            let mut rec = encode_record(&vals);
+            // Damage some records: truncation, a reserved / multi-byte serial type, a wrong
+            // header size.
+            match next(&mut seed) % 12 {
+                0 if !rec.is_empty() => {
+                    let cut = (next(&mut seed) as usize) % rec.len();
+                    rec.truncate(cut);
+                }
+                1 if rec.len() > 1 => {
+                    let at = 1 + (next(&mut seed) as usize) % (rec.len() - 1);
+                    rec[at] = [10u8, 11, 0x81, 0xff, 7, 0][(next(&mut seed) % 6) as usize];
+                }
+                2 if !rec.is_empty() => {
+                    rec[0] = (next(&mut seed) % 12) as u8;
+                }
+                _ => {}
+            }
+
+            // --- IntRangeProbe vs compare_raw_record_range
+            let k = (next(&mut seed) % 4) as usize;
+            let mut prefix: Vec<Value> = (0..k).map(|_| pick(&mut seed, 15)).collect();
+            for (i, p) in prefix.iter_mut().enumerate() {
+                if i < vals.len() && !next(&mut seed).is_multiple_of(4) {
+                    *p = vals[i].clone();
+                }
+            }
+            let bound = |seed: &mut u64| -> Option<(Value, bool)> {
+                if next(seed).is_multiple_of(3) {
+                    return None;
+                }
+                let v = match vals.get(k) {
+                    Some(v) if next(seed).is_multiple_of(2) => v.clone(),
+                    _ => pick(seed, 15),
+                };
+                Some((v, next(seed).is_multiple_of(2)))
+            };
+            let lower = bound(&mut seed);
+            let upper = bound(&mut seed);
+            let lo_ref = lower.as_ref().map(|(v, inc)| (v, *inc));
+            let hi_ref = upper.as_ref().map(|(v, inc)| (v, *inc));
+            let orders: Vec<KeySortOrder> = (0..5)
+                .map(|i| {
+                    if round % 11 == 0 && (round >> i) & 1 == 1 {
+                        desc.clone()
+                    } else {
+                        asc.clone()
+                    }
+                })
+                .collect();
+            let orders = &orders[..(round % 6).min(5)];
+            let general = compare_raw_record_range(&rec, &prefix, lo_ref, hi_ref, orders, enc);
+            let probe = IntRangeProbe::new(&prefix, lo_ref, hi_ref, orders);
+            let all_int_target = prefix.iter().all(|v| matches!(v, Value::Integer(_)))
+                && lower
+                    .iter()
+                    .chain(upper.iter())
+                    .all(|(v, _)| matches!(v, Value::Integer(_)));
+            let compared = k + usize::from(lower.is_some() || upper.is_some());
+            let no_desc = orders.iter().take(compared).all(|o| !o.desc);
+            assert_eq!(probe.is_some(), all_int_target && no_desc);
+            if let Some(p) = probe {
+                match p.compare(&rec) {
+                    Some(ord) => {
+                        probe_hits += 1;
+                        assert_eq!(
+                            general.as_ref().ok(),
+                            Some(&ord),
+                            "{vals:?} / {rec:?} vs {prefix:?} {lower:?} {upper:?}"
+                        );
+                    }
+                    None => {
+                        // The fast path must not be skipped for a clean all-integer record.
+                        let clean = encode_record(&vals) == rec
+                            && vals.len() >= compared
+                            && vals.len() <= 100
+                            && vals
+                                .iter()
+                                .take(compared)
+                                .all(|v| matches!(v, Value::Integer(_)))
+                            && vals.iter().all(|v| match v {
+                                Value::Text(s) => s.len() <= 57,
+                                Value::Blob(b) => b.len() <= 57,
+                                _ => true,
+                            });
+                        assert!(!clean, "fast path skipped for {vals:?}");
+                    }
+                }
+            }
+
+            // --- decode_int_record_fields vs parse_raw_record_prefix
+            let n = (next(&mut seed) % 6) as usize;
+            let mut slots = vec![INT_RECORD_SKIP; n];
+            let mut next_slot = 0u8;
+            for s in slots.iter_mut() {
+                if !next(&mut seed).is_multiple_of(3) {
+                    *s = next_slot;
+                    next_slot += 1;
+                }
+            }
+            let mut ints = [0i64; INT_RECORD_MAX_SLOTS];
+            let mut fields = [RawField::Null; 8];
+            let parsed = parse_raw_record_prefix(&rec, &mut fields[..n]);
+            if decode_int_record_fields(&rec, &slots, &mut ints) {
+                decode_hits += 1;
+                if n > 0 {
+                    assert_eq!(
+                        parsed.as_ref().ok(),
+                        Some(&n),
+                        "{vals:?} / {rec:?} {slots:?}"
+                    );
+                }
+                for (i, &s) in slots.iter().enumerate() {
+                    if s != INT_RECORD_SKIP {
+                        assert_eq!(fields[i], RawField::Int(ints[s as usize]));
+                    }
+                }
+            } else {
+                let clean = encode_record(&vals) == rec
+                    && vals.len() >= n
+                    && slots.iter().zip(&vals).all(|(&s, v)| match v {
+                        Value::Integer(_) => true,
+                        Value::Text(t) => s == INT_RECORD_SKIP && t.len() <= 57,
+                        Value::Blob(b) => s == INT_RECORD_SKIP && b.len() <= 57,
+                        _ => s == INT_RECORD_SKIP,
+                    });
+                assert!(!clean, "int decode skipped for {vals:?} {slots:?}");
+            }
+        }
+        assert!(probe_hits > 2_000, "probe fast path hits: {probe_hits}");
+        assert!(decode_hits > 5_000, "decode fast path hits: {decode_hits}");
+
+        // Exclusive / inclusive bounds at the i64 extremes.
+        let rec = encode_record(&[Value::Integer(7), Value::Integer(i64::MAX)]);
+        let seven = [Value::Integer(7)];
+        for (lo, hi) in [
+            (Some((i64::MAX, false)), None),
+            (Some((i64::MAX, true)), None),
+            (None, Some((i64::MAX, false))),
+            (None, Some((i64::MIN, true))),
+            (Some((i64::MIN, false)), Some((i64::MAX, true))),
+        ] {
+            let lo_v = lo.map(|(v, inc)| (Value::Integer(v), inc));
+            let hi_v = hi.map(|(v, inc)| (Value::Integer(v), inc));
+            let lo_ref = lo_v.as_ref().map(|(v, inc)| (v, *inc));
+            let hi_ref = hi_v.as_ref().map(|(v, inc)| (v, *inc));
+            let probe = IntRangeProbe::new(&seven, lo_ref, hi_ref, &[]).unwrap();
+            assert_eq!(
+                probe.compare(&rec),
+                compare_raw_record_range(&rec, &seven, lo_ref, hi_ref, &[], enc).ok()
+            );
         }
     }
 
