@@ -12455,6 +12455,9 @@ mod tests {
 /// Regression tests for behaviour that has to match C SQLite 3.54.1 (step 5e): every expected
 /// value below is what the reference `sqlite3` produces for the same statements.
 #[cfg(test)]
+mod fts5_c_compat_tests;
+
+#[cfg(test)]
 mod c_parity_tests {
     use super::*;
     use sqliters_vfs::MemoryVfs;

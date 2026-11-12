@@ -23671,6 +23671,15 @@ fn run_vtab_update_loop(
     let sample_cols: Rc<[ScopedColumn]> =
         vtab_scoped_cols(&p.db_name, &p.table_name, &p.declared).into();
     let mut ret_rows = Vec::new();
+    // `sqlite3_value_nochange`: the columns this UPDATE does not assign.
+    let mut nochange_cols = vec![true; n_cols];
+    for (col_idxs, _, _) in &p.resolved_assigns {
+        for &ci in col_idxs {
+            if ci < n_cols {
+                nochange_cols[ci] = false;
+            }
+        }
+    }
 
     for row in matched_rows {
         ctx.step_tick()?;
@@ -23800,7 +23809,7 @@ fn run_vtab_update_loop(
         };
 
         let vtab_conflict = conflict_action_to_vtab_mode(effective_or_conflict);
-        let upd_res = crate::vtab::vtab_perform_update_with_conflict(
+        let upd_res = crate::vtab::vtab_perform_update_with_nochange(
             ctx,
             &p.db_name,
             &p.table_name,
@@ -23810,6 +23819,7 @@ fn run_vtab_update_loop(
                 values: new_vals.clone(),
             },
             vtab_conflict,
+            &nochange_cols,
         )
         .map_err(|e| {
             if e.code == ErrorCode::ReadOnly && e.message == "virtual table is read-only" {

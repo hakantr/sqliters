@@ -665,6 +665,9 @@ pub struct CoreVTabHostContext<'a, 'b, 'c> {
     pub config_risk_flags: Option<VTabRiskFlags>,
     pub constraint_support: bool,
     pub conflict_mode: VTabConflictMode,
+    /// For an UPDATE: `true` for every column the statement does not assign
+    /// (`sqlite3_value_nochange`).
+    pub nochange_cols: Vec<bool>,
 }
 
 impl<'a, 'b, 'c> CoreVTabHostContext<'a, 'b, 'c> {
@@ -678,6 +681,7 @@ impl<'a, 'b, 'c> CoreVTabHostContext<'a, 'b, 'c> {
             config_risk_flags: None,
             constraint_support: false,
             conflict_mode: VTabConflictMode::Abort,
+            nochange_cols: Vec::new(),
         }
     }
 
@@ -736,6 +740,10 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
 
     fn vtab_on_conflict(&self) -> VTabConflictMode {
         self.conflict_mode
+    }
+
+    fn vtab_nochange(&self, col_idx: usize) -> bool {
+        self.nochange_cols.get(col_idx).copied().unwrap_or(false)
     }
 
     fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<usize> {
@@ -2084,6 +2092,19 @@ pub fn vtab_perform_update_with_conflict(
     op: VTabUpdateOperation,
     conflict_mode: VTabConflictMode,
 ) -> Result<Option<i64>> {
+    vtab_perform_update_with_nochange(ctx, db_name, table_name, op, conflict_mode, &[])
+}
+
+/// Like [`vtab_perform_update_with_conflict`]; `nochange_cols[i]` is true for every column an
+/// UPDATE statement leaves unassigned (reported through `VTabHostContext::vtab_nochange`).
+pub fn vtab_perform_update_with_nochange(
+    ctx: &mut ExecContext<'_>,
+    db_name: &str,
+    table_name: &str,
+    op: VTabUpdateOperation,
+    conflict_mode: VTabConflictMode,
+    nochange_cols: &[bool],
+) -> Result<Option<i64>> {
     vtab_begin_if_needed(ctx, db_name, table_name)?;
     let mut vt = ctx
         .db_set
@@ -2092,6 +2113,7 @@ pub fn vtab_perform_update_with_conflict(
     let res = {
         let mut host_ctx = CoreVTabHostContext::new(ctx, db_name, table_name);
         host_ctx.conflict_mode = conflict_mode;
+        host_ctx.nochange_cols = nochange_cols.to_vec();
         catch_callback_panic("vtab xUpdate", || vt.update(&mut host_ctx, op))
     };
     ctx.db_set

@@ -172,6 +172,11 @@ pub trait VTabHostContext {
     fn vtab_on_conflict(&self) -> VTabConflictMode {
         VTabConflictMode::Abort
     }
+    /// True if column `col_idx` of the row passed to an `Update` operation was not assigned by
+    /// the UPDATE statement (`sqlite3_value_nochange`). Always false for other operations.
+    fn vtab_nochange(&self, _col_idx: usize) -> bool {
+        false
+    }
     /// Executes an internal SQL statement within the active connection/transaction context.
     fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<usize>;
     /// Executes an internal SQL query within the active connection/transaction context and returns all rows.
