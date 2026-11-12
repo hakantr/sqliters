@@ -291,12 +291,41 @@ pub trait Vfs: Send + Sync {
 // Shared in-process lock table helper for 8-slot WAL lock arrays (`0..8`)
 // ============================================================================
 
+/// Hasher for the process-local, monotonically assigned `u64` connection ids keying
+/// [`InProcessShmLocks::connections`]. The ids are never attacker controlled, so the keyed
+/// SipHash of `RandomState` buys nothing here while costing two hash computations on every
+/// WAL lock and unlock; a multiplicative (Fibonacci) mix spreads sequential ids across buckets.
+#[derive(Default, Clone, Copy)]
+struct ConnIdHasher(u64);
+
+impl std::hash::Hasher for ConnIdHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // Generic fallback (unused for `u64` keys): FNV-1a style byte fold.
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        self.0 = (self.0 ^ v).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+type ConnIdBuildHasher = std::hash::BuildHasherDefault<ConnIdHasher>;
+
 #[derive(Default)]
 struct InProcessShmLocks {
     /// Per-slot state (`0` = unlocked, `-1` = exclusive, `> 0` = shared holder count).
     slots: [i32; WAL_SHM_NLOCK as usize],
     /// Per-connection `(shared_mask, excl_mask)`.
-    connections: HashMap<u64, (u16, u16)>,
+    connections: HashMap<u64, (u16, u16), ConnIdBuildHasher>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1173,11 +1202,26 @@ struct UnixShmNode {
     shm_init_lock: Arc<Mutex<()>>,
     backing: Arc<sys::unix::SysShmBacking>,
     state: Mutex<UnixShmNodeState>,
+    /// Lock-free mirror of `!state.is_unlocked`. `is_unlocked` only ever transitions
+    /// `true -> false` (the shared DMS lock is then held until the node is torn down), and this
+    /// flag is raised under the `state` mutex right after that transition, so a `true` reading
+    /// lets [`Self::ensure_dms_locked`] return without taking the mutex.
+    dms_locked: AtomicBool,
 }
 
 #[cfg(unix)]
 impl UnixShmNode {
+    #[inline]
     fn ensure_dms_locked(&self) -> Result<()> {
+        if self.dms_locked.load(AtomicOrdering::Acquire) {
+            return Ok(());
+        }
+        self.ensure_dms_locked_slow()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn ensure_dms_locked_slow(&self) -> Result<()> {
         use std::os::fd::AsRawFd;
 
         let mut guard = self
@@ -1238,6 +1282,7 @@ impl UnixShmNode {
 
         res?;
         guard.is_unlocked = false;
+        self.dms_locked.store(true, AtomicOrdering::Release);
         Ok(())
     }
 }
@@ -2979,6 +3024,7 @@ impl VfsFile for OsFile {
                     chunks: Vec::new(),
                     regions_per_map,
                 }),
+                dms_locked: AtomicBool::new(!is_unlocked),
             });
 
             {
@@ -3823,6 +3869,283 @@ mod tests {
         rec.release().unwrap();
         r2.release().unwrap();
         r3.release().unwrap();
+    }
+
+    /// Reference `walChecksumBytes`: one byte-assembled 32-bit word at a time.
+    fn reference_wal_checksum(
+        endian: WalChecksumEndian,
+        data: &[u8],
+        initial: Option<[u32; 2]>,
+    ) -> [u32; 2] {
+        let [mut s1, mut s2] = initial.unwrap_or([0, 0]);
+        let word = |b: &[u8]| -> u32 {
+            let be = (u32::from(b[0]) << 24)
+                | (u32::from(b[1]) << 16)
+                | (u32::from(b[2]) << 8)
+                | u32::from(b[3]);
+            let big = match endian {
+                WalChecksumEndian::Big => true,
+                WalChecksumEndian::Little => false,
+                WalChecksumEndian::Native => cfg!(target_endian = "big"),
+            };
+            if big { be } else { be.swap_bytes() }
+        };
+        let mut i = 0;
+        while i < data.len() {
+            s1 = s1.wrapping_add(word(&data[i..i + 4])).wrapping_add(s2);
+            s2 = s2.wrapping_add(word(&data[i + 4..i + 8])).wrapping_add(s1);
+            i += 8;
+        }
+        [s1, s2]
+    }
+
+    #[test]
+    fn test_wal_checksum_matches_reference_for_every_byte_order_and_length() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut data = vec![0u8; 65_536];
+        for b in &mut data {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *b = (seed >> 56) as u8;
+        }
+        for endian in [
+            WalChecksumEndian::Native,
+            WalChecksumEndian::Big,
+            WalChecksumEndian::Little,
+        ] {
+            for len in [8usize, 16, 24, 40, 48, 512, 4096, 65_536] {
+                for start in [0usize, 1, 3] {
+                    if start + len > data.len() {
+                        continue;
+                    }
+                    let slice = &data[start..start + len];
+                    for initial in [None, Some([0xdead_beef, 0x0bad_f00d])] {
+                        assert_eq!(
+                            wal_checksum_with_endian(endian, slice, initial).unwrap(),
+                            reference_wal_checksum(endian, slice, initial),
+                            "endian={endian:?} len={len} start={start} initial={initial:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // Chaining a split buffer equals checksumming it whole (header 8 bytes + page payload).
+        let whole =
+            wal_checksum_with_endian(WalChecksumEndian::Little, &data[..4104], None).unwrap();
+        let head = wal_checksum_with_endian(WalChecksumEndian::Little, &data[..8], None).unwrap();
+        let tail = wal_checksum_with_endian(WalChecksumEndian::Little, &data[8..4104], Some(head))
+            .unwrap();
+        assert_eq!(whole, tail);
+
+        assert_eq!(
+            wal_checksum_bytes(true, &data[..40], None).unwrap(),
+            reference_wal_checksum(WalChecksumEndian::Native, &data[..40], None)
+        );
+        for bad in [0usize, 4, 7, 12, 4097] {
+            assert_eq!(
+                wal_checksum_with_endian(WalChecksumEndian::Native, &data[..bad], None)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::Misuse
+            );
+        }
+    }
+
+    #[test]
+    fn test_shm_chunk_offset_validation_accepts_exactly_the_documented_accesses() {
+        use std::sync::atomic::Ordering as AO;
+
+        let vfs = MemoryVfs::new();
+        let path = Path::new("offsets.db");
+        let db = vfs
+            .open(Some(path), OpenFlags::READWRITE | OpenFlags::CREATE)
+            .unwrap();
+        let shm = db.open_wal_shm().unwrap();
+        let mut writer = shm.acquire_writer().unwrap();
+        let chunk0 = writer.ensure_region(0).unwrap();
+        let chunk1 = writer.ensure_region(1).unwrap();
+
+        let offsets: Vec<usize> = (0..200)
+            .chain(16_380..16_390)
+            .chain(32_756..32_776)
+            .chain([usize::MAX - 3, usize::MAX - 1, usize::MAX])
+            .collect();
+        for (region, chunk) in [(0u32, &chunk0), (1u32, &chunk1)] {
+            for &off in &offsets {
+                for width in [4usize, 2] {
+                    let in_range = off % width == 0
+                        && off.checked_add(width).is_some_and(|e| e <= SHM_CHUNK_SIZE);
+                    let firewalled = region == 0
+                        && off < WAL_LOCK_OFFSET + WAL_LOCK_LEN
+                        && off.saturating_add(width) > WAL_LOCK_OFFSET;
+                    let expect_ok = in_range && !firewalled;
+                    let (load_ok, store_ok) = if width == 4 {
+                        (
+                            chunk.load_u32(off, AO::Acquire).is_ok(),
+                            chunk.store_u32(off, 0, AO::Release).is_ok(),
+                        )
+                    } else {
+                        (
+                            chunk.load_u16(off, AO::Acquire).is_ok(),
+                            chunk.store_u16(off, 0, AO::Release).is_ok(),
+                        )
+                    };
+                    assert_eq!(
+                        load_ok, expect_ok,
+                        "load region={region} off={off} w={width}"
+                    );
+                    assert_eq!(
+                        store_ok, expect_ok,
+                        "store region={region} off={off} w={width}"
+                    );
+                    if !expect_ok {
+                        let err = if width == 4 {
+                            chunk.load_u32(off, AO::Acquire).unwrap_err()
+                        } else {
+                            chunk.load_u16(off, AO::Acquire).unwrap_err()
+                        };
+                        assert_eq!(err.code, ErrorCode::Misuse);
+                    }
+                }
+            }
+        }
+
+        // Values round-trip through the accepted fast path at the region edges.
+        chunk1
+            .store_u32(SHM_CHUNK_SIZE - 4, 0xa1b2_c3d4, AO::Release)
+            .unwrap();
+        assert_eq!(
+            chunk1.load_u32(SHM_CHUNK_SIZE - 4, AO::Acquire).unwrap(),
+            0xa1b2_c3d4
+        );
+        chunk1
+            .store_u16(SHM_CHUNK_SIZE - 6, 0xbeef, AO::Release)
+            .unwrap();
+        assert_eq!(
+            chunk1.load_u16(SHM_CHUNK_SIZE - 6, AO::Acquire).unwrap(),
+            0xbeef
+        );
+        chunk0.store_u32(128, 77, AO::Release).unwrap();
+        assert_eq!(chunk0.load_u32(128, AO::Acquire).unwrap(), 77);
+        writer.release().unwrap();
+
+        // A read-only `-shm` view still loads but reports `SQLITE_READONLY` on stores.
+        let ro_db = vfs.open(Some(path), OpenFlags::READONLY).unwrap();
+        let ro_shm = ro_db.open_wal_shm().unwrap();
+        let ro_chunk = ro_shm.inspect_mapped_chunk(1).unwrap().unwrap();
+        assert_eq!(
+            ro_chunk.load_u32(SHM_CHUNK_SIZE - 4, AO::Acquire).unwrap(),
+            0xa1b2_c3d4
+        );
+        assert_eq!(
+            ro_chunk.store_u32(0, 1, AO::Release).unwrap_err().code,
+            ErrorCode::ReadOnly
+        );
+        assert_eq!(
+            ro_chunk.store_u16(2, 1, AO::Release).unwrap_err().code,
+            ErrorCode::ReadOnly
+        );
+    }
+
+    #[test]
+    fn test_wal_shm_post_read_lock_verify_matches_separate_steps_and_cache_is_released_on_close() {
+        let vfs = MemoryVfs::new();
+        let path = Path::new("postlock.db");
+        let db1 = vfs
+            .open(Some(path), OpenFlags::READWRITE | OpenFlags::CREATE)
+            .unwrap();
+        let db2 = vfs.open(Some(path), OpenFlags::READWRITE).unwrap();
+        let shm1 = Arc::new(db1.open_wal_shm().unwrap());
+        let shm2 = Arc::new(db2.open_wal_shm().unwrap());
+
+        // Before region 0 exists: no header, and nothing is cached.
+        assert!(shm2.try_read_header_and_ckpt_info().unwrap().is_none());
+
+        let hdr = {
+            let mut w1 = shm1.acquire_writer().unwrap();
+            for f in 1..=25u32 {
+                w1.record_frame(f, f, f - 1).unwrap();
+            }
+            let hdr = WalIndexHeaderData::new(4096, 25, 25, 1, false, [1, 1], [10, 20]).unwrap();
+            let published = w1.publish_header(&hdr).unwrap();
+            w1.release().unwrap();
+            published
+        };
+
+        // The first probe above saw an unmapped region 0; later probes must see the new mapping.
+        let (live, ckpt) = shm2.try_read_header_and_ckpt_info().unwrap().unwrap();
+        assert_eq!(live, hdr);
+        assert_eq!(ckpt.n_backfill, 0);
+
+        assert!(shm2.try_claim_read_mark(1, 25, false).unwrap());
+        let rg = WalShm::acquire_owned_read_slot_with_mark(&shm2, 1, None, false).unwrap();
+        assert_eq!(
+            shm2.lock_state().unwrap().mode(),
+            WalLockMode::Reading { slot: 1 }
+        );
+        assert!(
+            shm2.lock_state()
+                .unwrap()
+                .holds_shared(wal_read_lock_slot(1).unwrap())
+        );
+
+        let mut other = hdr;
+        other.change_counter += 1;
+        for (mark, expected_hdr) in [(25u32, hdr), (24, hdr), (25, other), (7, other)] {
+            let separate = (
+                rg.read_ckpt_info().unwrap().n_backfill,
+                rg.verify_post_lock(Some(mark), &expected_hdr).unwrap(),
+            );
+            let combined = rg
+                .read_backfill_and_verify_post_lock(mark, &expected_hdr)
+                .unwrap();
+            assert_eq!(combined, separate, "mark={mark}");
+            assert_eq!(combined.1, mark == 25 && expected_hdr == hdr);
+        }
+
+        // A concurrent commit (new header published by the other connection) is detected by both.
+        let hdr2 = {
+            let mut w1 = shm1.acquire_writer().unwrap();
+            w1.record_frame(26, 3, 25).unwrap();
+            let next = WalIndexHeaderData::new(4096, 26, 25, 2, false, [2, 2], [10, 20]).unwrap();
+            let published = w1.publish_header(&next).unwrap();
+            w1.release().unwrap();
+            published
+        };
+        assert!(!rg.verify_post_lock(Some(25), &hdr).unwrap());
+        assert_eq!(
+            rg.read_backfill_and_verify_post_lock(25, &hdr).unwrap(),
+            (0, false)
+        );
+        assert_eq!(
+            rg.read_backfill_and_verify_post_lock(25, &hdr2).unwrap(),
+            (0, true)
+        );
+        assert_eq!(rg.read_header_verified().unwrap(), hdr2);
+        rg.unlock().unwrap();
+        assert_eq!(shm2.lock_state().unwrap().mode(), WalLockMode::Idle);
+        assert_eq!(shm2.lock_state().unwrap().held_mask(), 0);
+
+        // The cached region-0 mapping is dropped by `close_shared`, and a closed handle refuses
+        // further reads instead of repopulating it.
+        let probe = shm1.inspect_mapped_chunk(0).unwrap().unwrap();
+        let refs_with_cache = Arc::strong_count(probe.view());
+        shm2.close_shared(false).unwrap();
+        assert_eq!(Arc::strong_count(probe.view()), refs_with_cache - 1);
+        assert_eq!(
+            shm2.try_read_header_and_ckpt_info().unwrap_err().code,
+            ErrorCode::Misuse
+        );
+        assert_eq!(
+            WalShm::acquire_owned_read_slot_with_mark(&shm2, 0, None, false)
+                .unwrap_err()
+                .code,
+            ErrorCode::Misuse
+        );
+        assert_eq!(Arc::strong_count(probe.view()), refs_with_cache - 1);
+        drop(probe);
+        shm1.close_shared(true).unwrap();
     }
 
     #[test]

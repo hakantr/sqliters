@@ -1172,6 +1172,21 @@ impl OwnedWalReadGuard {
             .verify_post_read_lock_internal(self.logical_slot, expected_mark, expected_hdr)
     }
 
+    /// Reads `WalCkptInfo.nBackfill` and then performs [`Self::verify_post_lock`] with
+    /// `Some(expected_mark)` in one pass over a single mapping of WAL-index region 0
+    /// (`walTryBeginRead`, `wal.c:3308-3320`). Returns `(n_backfill, verified)`.
+    pub fn read_backfill_and_verify_post_lock(
+        &self,
+        expected_mark: u32,
+        expected_hdr: &WalIndexHeaderData,
+    ) -> Result<(u32, bool)> {
+        self.shm.read_backfill_and_verify_post_read_lock_internal(
+            self.logical_slot,
+            expected_mark,
+            expected_hdr,
+        )
+    }
+
     /// Searches WAL-index hash tables for the latest frame of `pgno` in `[min_frame, max_frame]`.
     pub fn lookup_page_in_range(
         &self,

@@ -872,8 +872,42 @@ impl SysMapView {
         self.ptr.as_ptr() as usize
     }
 
-    #[inline]
+    /// Hot-path offset validation: a single well-predicted branch that accepts exactly the
+    /// accesses [`Self::validate_offset_checked`] accepts (write permission, 2/4-byte width,
+    /// natural alignment, 32 KiB region bound, region-0 `120..128` lock-byte firewall, and
+    /// `MapView` bounds). Anything else is re-validated by the outlined checked routine so the
+    /// reported error is identical. `#[inline(always)]` lets the constant `width`/`write`
+    /// arguments (and usually `rel_offset`) fold away at every call site.
+    #[inline(always)]
     fn validate_offset(
+        &self,
+        subrange_offset: usize,
+        region_index: u32,
+        rel_offset: usize,
+        width: usize,
+        write: bool,
+    ) -> Result<usize> {
+        if (!write || self.writable)
+            && (width == 2 || width == 4)
+            && rel_offset & (width - 1) == 0
+            && rel_offset <= SHM_LOGICAL_REGION_BYTES - width
+            && !(region_index == 0
+                && rel_offset < WAL_LOCK_BYTES_END
+                && rel_offset + width > WAL_LOCK_BYTES_START)
+            && let Some(abs_end) = subrange_offset.checked_add(rel_offset + width)
+            && abs_end <= self.len
+        {
+            let abs_offset = abs_end - width;
+            debug_assert_eq!((self.ptr.as_ptr() as usize + abs_offset) % width, 0);
+            return Ok(abs_offset);
+        }
+        self.validate_offset_checked(subrange_offset, region_index, rel_offset, width, write)
+    }
+
+    /// Fully itemized validation (cold): produces the precise error for a rejected access.
+    #[cold]
+    #[inline(never)]
+    fn validate_offset_checked(
         &self,
         subrange_offset: usize,
         region_index: u32,

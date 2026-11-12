@@ -236,6 +236,10 @@ const fn cksum_endian(big_end_cksum: bool) -> WalChecksumEndian {
     }
 }
 
+/// Upper bound on the bytes of consecutive appended WAL frames staged for one positioned write
+/// in [`Wal::write_frames`] (a single frame larger than this is still written in one piece).
+const WAL_APPEND_BATCH_BYTES: usize = 64 * 1024;
+
 /// Computes the byte offset in `-wal` of 1-based `frame_no` (`walFrameOffset`, `wal.c:556`).
 #[inline]
 pub const fn wal_frame_offset(frame_no: u32, page_size: u32) -> u64 {
@@ -901,16 +905,14 @@ impl Wal {
         }
 
         // Step A.4: Read `nBackfill + 1`, `shm_barrier()`, verify `aReadMark[mx_i] == mx_read_mark` & `WalIndexHdr == self.hdr`.
-        let (post_ckpt, verified) = match &self.active_lock {
+        let (post_n_backfill, verified) = match &self.active_lock {
             ActiveShmLock::Reader(rg) => {
-                let info = rg.read_ckpt_info()?;
-                let ok = rg.verify_post_lock(Some(mx_read_mark), &self.hdr)?;
-                (info, ok)
+                rg.read_backfill_and_verify_post_lock(mx_read_mark, &self.hdr)?
             }
             ActiveShmLock::Writer(wg) => {
                 let info = wg.read_ckpt_info()?;
                 let ok = wg.verify_post_read_lock(Some(mx_read_mark), &self.hdr)?;
-                (info, ok)
+                (info.n_backfill, ok)
             }
             ActiveShmLock::None => unreachable!(),
         };
@@ -929,7 +931,7 @@ impl Wal {
             return Ok(TryBeginOutcome::Retry);
         }
 
-        self.min_frame = post_ckpt.n_backfill + 1;
+        self.min_frame = post_n_backfill + 1;
         self.read_lock = Some(mx_i);
         Ok(TryBeginOutcome::Ok)
     }
@@ -1540,6 +1542,16 @@ impl Wal {
         let mut i_offset = wal_frame_offset(i_frame + 1, page_size);
         let mut appended_pgnos: Vec<Pgno> = Vec::with_capacity(frames.len());
         let mut last_idx: Option<usize> = None;
+        // Appended frames are laid out back to back in `-wal`, so consecutive
+        // `[24-byte frame header | page image]` records are staged in one contiguous buffer and
+        // written with a single positioned write per run (bounded by `WAL_APPEND_BATCH_BYTES`)
+        // instead of a header write plus a page write per frame. The bytes and file offsets are
+        // identical and the WAL only becomes durable at the sync below, so this is
+        // durability-neutral; the buffer is always flushed before any other `-wal` I/O.
+        let batch_cap = WAL_APPEND_BATCH_BYTES.max(sz_frame as usize);
+        let mut frame_buf: Vec<u8> =
+            Vec::with_capacity((frames.len().saturating_mul(sz_frame as usize)).min(batch_cap));
+        let mut frame_buf_off = i_offset;
 
         for (idx, frame) in frames.iter().enumerate() {
             if frame.data.len() != page_size as usize {
@@ -1559,10 +1571,12 @@ impl Wal {
                 if self.i_re_cksum == 0 || i_write < self.i_re_cksum {
                     self.i_re_cksum = i_write;
                 }
-                self.wal_file
-                    .as_ref()
-                    .expect("checked Some")
-                    .write_at(frame.data, data_off)?;
+                let wal_fd = self.wal_file.as_ref().expect("checked Some");
+                if !frame_buf.is_empty() {
+                    wal_fd.write_at(&frame_buf, frame_buf_off)?;
+                    frame_buf.clear();
+                }
+                wal_fd.write_at(frame.data, data_off)?;
                 continue;
             }
 
@@ -1576,14 +1590,26 @@ impl Wal {
                 self.hdr.frame_cksum,
                 frame.data,
             )?;
-            let wal_fd = self.wal_file.as_ref().expect("checked Some");
-            wal_fd.write_at(&fhdr, i_offset)?;
-            wal_fd.write_at(frame.data, i_offset + (WAL_FRAME_HDRSIZE as u64))?;
+            if frame_buf.is_empty() {
+                frame_buf_off = i_offset;
+            }
+            frame_buf.extend_from_slice(&fhdr);
+            frame_buf.extend_from_slice(frame.data);
+            if frame_buf.len() + (sz_frame as usize) > batch_cap {
+                let wal_fd = self.wal_file.as_ref().expect("checked Some");
+                wal_fd.write_at(&frame_buf, frame_buf_off)?;
+                frame_buf.clear();
+            }
             self.hdr.frame_cksum = next_cksum;
             i_offset += sz_frame;
             appended_pgnos.push(frame.pgno);
             last_idx = Some(idx);
         }
+        if !frame_buf.is_empty() {
+            let wal_fd = self.wal_file.as_ref().expect("checked Some");
+            wal_fd.write_at(&frame_buf, frame_buf_off)?;
+        }
+        drop(frame_buf);
 
         // Recompute checksum chain if any earlier uncommitted frame was overwritten (`wal.c:4262-4265`).
         if is_commit && self.i_re_cksum > 0 {

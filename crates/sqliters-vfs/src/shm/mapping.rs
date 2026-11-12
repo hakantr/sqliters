@@ -92,8 +92,37 @@ impl MemMapView {
         Self { storage, writable }
     }
 
-    #[inline]
+    /// Hot-path offset validation: accepts exactly the accesses
+    /// [`Self::validate_offset_checked`] accepts with one well-predicted branch; every rejected
+    /// access is re-validated by the outlined checked routine so the reported error is identical.
+    #[inline(always)]
     fn validate_offset(
+        &self,
+        subrange_offset: usize,
+        region_index: u32,
+        rel_offset: usize,
+        width: usize,
+        write: bool,
+    ) -> Result<usize> {
+        if (!write || self.writable)
+            && (width == 2 || width == 4)
+            && rel_offset & (width - 1) == 0
+            && rel_offset <= SHM_CHUNK_SIZE - width
+            && !(region_index == 0
+                && rel_offset < (WAL_LOCK_OFFSET + WAL_LOCK_LEN)
+                && rel_offset + width > WAL_LOCK_OFFSET)
+            && let Some(abs_end) = subrange_offset.checked_add(rel_offset + width)
+            && abs_end <= self.storage.byte_len()
+        {
+            return Ok(abs_end - width);
+        }
+        self.validate_offset_checked(subrange_offset, region_index, rel_offset, width, write)
+    }
+
+    /// Fully itemized validation (cold): produces the precise error for a rejected access.
+    #[cold]
+    #[inline(never)]
+    fn validate_offset_checked(
         &self,
         subrange_offset: usize,
         region_index: u32,

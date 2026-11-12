@@ -2078,10 +2078,15 @@ impl Pager {
         }
 
         let had_wal_before = self.wal.is_some();
-        let prev_lock = self
-            .file
-            .as_ref()
-            .map_or(LockLevel::NoLock, |f| f.lock_level());
+        // Only the no-WAL-yet failure path below consults the prior `.db` lock level, so skip
+        // the query (a mutex round trip in the VFS) once a WAL is attached.
+        let prev_lock = if had_wal_before {
+            LockLevel::NoLock
+        } else {
+            self.file
+                .as_ref()
+                .map_or(LockLevel::NoLock, |f| f.lock_level())
+        };
 
         self.lock_db_file(LockLevel::Shared)?;
         if let Err(e) = self.begin_read_under_shared_lock() {
@@ -4949,5 +4954,158 @@ mod tests {
         assert_eq!(pager2.page_count(), 2);
         assert_eq!(&pager2.read_page(2).unwrap()[0..4], b"ABCD");
         pager2.close().unwrap();
+    }
+
+    /// A WAL commit larger than one append batch must put exactly the same bytes in `-wal` as
+    /// frame-by-frame writes: every frame decodes with the running checksum chain, page numbers
+    /// ascend, only the final frame carries the commit size, and a second connection reads back
+    /// every page through the WAL-index.
+    #[test]
+    fn test_wal_commit_spanning_multiple_append_batches_is_byte_exact() {
+        let vfs = Arc::new(MemoryVfs::new());
+        let db_path = Path::new("wal_batch.db");
+        let mut pager = Pager::open_with_vfs(
+            vfs.clone(),
+            Some(db_path),
+            OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB,
+        )
+        .unwrap();
+        pager.begin_write().unwrap();
+        let p2 = pager.allocate_raw_page().unwrap();
+        pager.write_page(p2).unwrap()[0..4].copy_from_slice(b"INIT");
+        pager.commit().unwrap();
+        assert_eq!(
+            pager.set_journal_mode(JournalMode::Wal).unwrap(),
+            JournalMode::Wal
+        );
+
+        // 1 small commit, then one commit of 49 frames (3 full 15-frame batches + a 4-frame tail
+        // at 4096-byte pages), then a 2-frame commit.
+        let page_size = pager.page_size() as usize;
+        let stamp = |pgno: Pgno, round: u8, buf: &mut [u8]| {
+            for (i, b) in buf.iter_mut().enumerate().skip(16) {
+                *b = (i as u8) ^ (pgno as u8).wrapping_mul(31) ^ round;
+            }
+            buf[16..20].copy_from_slice(&pgno.to_be_bytes());
+            buf[20] = round;
+        };
+
+        pager.begin_write().unwrap();
+        stamp(2, 1, pager.write_page(2).unwrap());
+        pager.commit().unwrap();
+
+        pager.begin_write().unwrap();
+        let mut big_pages = vec![2];
+        stamp(2, 2, pager.write_page(2).unwrap());
+        for _ in 0..47 {
+            let pgno = pager.allocate_raw_page().unwrap();
+            stamp(pgno, 2, pager.write_page(pgno).unwrap());
+            big_pages.push(pgno);
+        }
+        pager.commit().unwrap();
+        let final_pages = pager.page_count();
+        assert_eq!(final_pages, 49);
+
+        pager.begin_write().unwrap();
+        stamp(7, 3, pager.write_page(7).unwrap());
+        stamp(40, 3, pager.write_page(40).unwrap());
+        pager.commit().unwrap();
+
+        // Walk `-wal` independently of the WAL-index.
+        let wal_path = pager.wal_path().unwrap().to_path_buf();
+        let wal_file = vfs.open(Some(&wal_path), OpenFlags::READONLY).unwrap();
+        let mut hdr_buf = [0u8; WAL_HDRSIZE];
+        assert_eq!(wal_file.read_at(&mut hdr_buf, 0).unwrap(), WAL_HDRSIZE);
+        let wal_hdr = WalFileHeader::decode_for_recovery(&hdr_buf)
+            .unwrap()
+            .unwrap();
+        assert_eq!(wal_hdr.page_size as usize, page_size);
+
+        let sz_frame = (WAL_FRAME_HDRSIZE + page_size) as u64;
+        let n_frames = (wal_file.file_size().unwrap() - WAL_HDRSIZE as u64) / sz_frame;
+        assert_eq!(
+            wal_file.file_size().unwrap(),
+            WAL_HDRSIZE as u64 + n_frames * sz_frame
+        );
+        let mut cksum = wal_hdr.cksum;
+        let mut frames: Vec<(Pgno, u32)> = Vec::new();
+        let mut latest: HashMap<Pgno, Vec<u8>> = HashMap::new();
+        for frame_no in 1..=(n_frames as u32) {
+            let off = wal_frame_offset(frame_no, page_size as u32);
+            let mut fhdr = [0u8; WAL_FRAME_HDRSIZE];
+            let mut data = vec![0u8; page_size];
+            assert_eq!(wal_file.read_at(&mut fhdr, off).unwrap(), WAL_FRAME_HDRSIZE);
+            assert_eq!(
+                wal_file
+                    .read_at(&mut data, off + WAL_FRAME_HDRSIZE as u64)
+                    .unwrap(),
+                page_size
+            );
+            let (pgno, n_truncate, next) =
+                wal_decode_frame(&fhdr, &data, wal_hdr.salt, wal_hdr.big_end_cksum, cksum)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("frame {frame_no} fails checksum/salt validation"));
+            cksum = next;
+            frames.push((pgno, n_truncate));
+            latest.insert(pgno, data);
+        }
+
+        // Split the frame log into commits (a commit frame has `n_truncate != 0`).
+        let mut commits: Vec<(Vec<Pgno>, u32)> = Vec::new();
+        let mut open_commit: Vec<Pgno> = Vec::new();
+        for &(pgno, n_truncate) in &frames {
+            open_commit.push(pgno);
+            if n_truncate != 0 {
+                commits.push((std::mem::take(&mut open_commit), n_truncate));
+            }
+        }
+        assert!(open_commit.is_empty(), "WAL must end on a commit frame");
+        let big_idx = commits
+            .iter()
+            .position(|(pgnos, _)| pgnos.len() >= 48)
+            .expect("one commit spanning several append batches");
+        // (Commits may be followed by sector-padding frames that repeat the commit frame.)
+        assert!(big_idx + 1 < commits.len());
+        for (i, (pgnos, n_truncate)) in commits.iter().enumerate() {
+            assert!(
+                pgnos.windows(2).all(|w| w[0] < w[1]),
+                "frames ascend by pgno"
+            );
+            assert_eq!(*n_truncate, if i < big_idx { 2 } else { final_pages });
+        }
+        let big = &commits[big_idx].0;
+        for pgno in &big_pages {
+            assert!(
+                big.contains(pgno),
+                "page {pgno} missing from the large commit"
+            );
+        }
+        assert!(
+            commits[big_idx + 1..]
+                .iter()
+                .any(|(pgnos, _)| pgnos.contains(&7) && pgnos.contains(&40)),
+            "final two-page commit present after the large commit"
+        );
+
+        // A second connection sees every page through the WAL-index, matching the frame bytes.
+        let mut reader =
+            Pager::open_with_vfs(vfs.clone(), Some(db_path), OpenFlags::READWRITE).unwrap();
+        reader.begin_read().unwrap();
+        assert_eq!(reader.page_count(), final_pages);
+        for &pgno in &big_pages {
+            let round = if pgno == 7 || pgno == 40 { 3 } else { 2 };
+            let mut expect = vec![0u8; page_size];
+            stamp(pgno, round, &mut expect);
+            let got = reader.read_page(pgno).unwrap();
+            assert_eq!(&got[16..], &expect[16..], "page {pgno} content");
+            assert_eq!(
+                &latest[&pgno][16..],
+                &expect[16..],
+                "page {pgno} frame bytes"
+            );
+        }
+        reader.end_read_if_unused().unwrap();
+        reader.close().unwrap();
+        pager.close().unwrap();
     }
 }

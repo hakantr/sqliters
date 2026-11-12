@@ -11,7 +11,7 @@
 pub mod locks;
 pub mod mapping;
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use sqliters_types::{
@@ -120,19 +120,31 @@ pub fn wal_checksum_with_endian(
             "walChecksumBytes requires a non-empty multiple of 8 bytes",
         ));
     }
-    let [mut s1, mut s2] = initial.unwrap_or([0, 0]);
-    for pair in data.as_chunks::<8>().0 {
-        let b0 = [pair[0], pair[1], pair[2], pair[3]];
-        let b1 = [pair[4], pair[5], pair[6], pair[7]];
-        let (w0, w1) = match endian {
-            WalChecksumEndian::Native => (u32::from_ne_bytes(b0), u32::from_ne_bytes(b1)),
-            WalChecksumEndian::Big => (u32::from_be_bytes(b0), u32::from_be_bytes(b1)),
-            WalChecksumEndian::Little => (u32::from_le_bytes(b0), u32::from_le_bytes(b1)),
-        };
-        s1 = s1.wrapping_add(w0).wrapping_add(s2);
-        s2 = s2.wrapping_add(w1).wrapping_add(s1);
+    let [s1, s2] = initial.unwrap_or([0, 0]);
+    // `data.len()` is a multiple of 8, so it splits exactly into 4-byte words and word pairs.
+    let words = data.as_chunks::<4>().0;
+    Ok(match endian {
+        WalChecksumEndian::Native => wal_checksum_words(words, s1, s2, u32::from_ne_bytes),
+        WalChecksumEndian::Big => wal_checksum_words(words, s1, s2, u32::from_be_bytes),
+        WalChecksumEndian::Little => wal_checksum_words(words, s1, s2, u32::from_le_bytes),
+    })
+}
+
+/// Checksum kernel over whole 4-byte words, monomorphized per byte order so each variant is a
+/// tight loop of two word loads and four additions per 8 input bytes (the loop-carried
+/// dependency is the two `s2 -> s1 -> s2` additions).
+#[inline(always)]
+fn wal_checksum_words(
+    words: &[[u8; 4]],
+    mut s1: u32,
+    mut s2: u32,
+    decode: impl Fn([u8; 4]) -> u32,
+) -> [u32; 2] {
+    for pair in words.as_chunks::<2>().0 {
+        s1 = s1.wrapping_add(decode(pair[0])).wrapping_add(s2);
+        s2 = s2.wrapping_add(decode(pair[1])).wrapping_add(s1);
     }
-    Ok([s1, s2])
+    [s1, s2]
 }
 
 /// Returns the 0-based 32 KiB WAL-index region containing 1-based `frame_no`
@@ -371,6 +383,14 @@ pub trait WalShmOps {
     fn acquire_checkpointer(&self) -> Result<CheckpointTxnGuard<'_>>;
 }
 
+/// Session-level WAL-index backend.
+///
+/// Invariants every implementation upholds for as long as a session stays open (i.e. until its
+/// `close_session`), which [`WalShm`] relies on to cache its mapping of region 0:
+/// - once `ensure_dms_ready()` has succeeded it keeps succeeding (the shared Deadman Switch is
+///   held until the last session on the node closes), and
+/// - once `map_region(r, _)` has returned `Some(chunk)`, region `r` stays backed by that same
+///   mapping (regions are appended, never relocated or replaced, until the node is torn down).
 pub(crate) trait ShmBackend: Send + Sync {
     fn is_readonly(&self) -> bool;
     fn dms_state(&self) -> ShmDmsState;
@@ -387,6 +407,20 @@ pub struct WalShm {
     backend: Arc<dyn ShmBackend>,
     state: Mutex<WalLockState>,
     closed: Mutex<bool>,
+    /// Immutable copy of `state.connection_id()` (fixed at construction) so hot paths that only
+    /// need the id do not have to take the `state` mutex.
+    conn_id: u64,
+    /// Lock-free summary of "`closed` is set OR `state` is poisoned". It is raised (never
+    /// lowered) while the corresponding mutex is still held, so a `false` reading proves the
+    /// handle was open and healthy at that instant and the per-operation health check can skip
+    /// both mutexes; a `true` reading falls back to the fully itemized check.
+    closed_or_poisoned: AtomicBool,
+    /// This connection's mapping of WAL-index region 0 (header + `WalCkptInfo`), cached after the
+    /// first successful `ensure_dms_ready()` + `map_region(0, false)` so the per-transaction
+    /// header/read-mark reads do not repeat the backend round trip. Valid until close by the
+    /// [`ShmBackend`] invariants; emptied in `close_shared` BEFORE the backend session is closed
+    /// so this handle never keeps a mapping alive past `xShmUnmap`.
+    region0: Mutex<Option<ShmChunk>>,
 }
 
 impl std::fmt::Debug for WalShm {
@@ -404,6 +438,9 @@ impl WalShm {
             backend,
             state: Mutex::new(WalLockState::new(connection_id)),
             closed: Mutex::new(false),
+            conn_id: connection_id,
+            closed_or_poisoned: AtomicBool::new(false),
+            region0: Mutex::new(None),
         }
     }
 
@@ -611,7 +648,16 @@ impl WalShm {
         };
 
         *closed_guard = true;
+        self.closed_or_poisoned.store(true, Ordering::Release);
         drop(closed_guard);
+
+        // Release the cached region-0 mapping before the backend tears the session down (the
+        // closed flag is already visible, so `region0_for_read` cannot repopulate the slot).
+        let cached_region0 = match self.region0.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        drop(cached_region0);
 
         let close_res = self.backend.close_session(conn_id, delete_if_last);
         if let Some(err) = poisoned_err {
@@ -701,9 +747,8 @@ impl WalShm {
         let lock_idx =
             wal_read_lock_slot(slot).ok_or_else(|| SqliteError::misuse("reader slot > 4"))?;
         let conn_id = self.begin_idle_transition()?;
-        self.backend.ensure_dms_ready()?;
-
-        let chunk0 = self.backend.map_region(0, false)?.ok_or_else(|| {
+        let region0 = self.region0_for_read()?;
+        let chunk0 = region0.as_ref().ok_or_else(|| {
             SqliteError::corrupt("WAL-index region 0 missing while updating aReadMark")
         })?;
 
@@ -751,6 +796,29 @@ impl WalShm {
     ) -> Result<OwnedWalReadGuard> {
         let lock_idx =
             wal_read_lock_slot(slot).ok_or_else(|| SqliteError::misuse("reader slot > 4"))?;
+
+        if claim_mark.is_none() && !exclusive_db_mode {
+            // Common case (plain `SHARED WAL_READ_LOCK(slot)`): identical steps to the general
+            // path below, but the per-connection `state` mutex is taken once and held across
+            // the idle check, the OS lock and the bookkeeping instead of twice.
+            let mut st = shm.begin_idle_transition_locked()?;
+            if slot > 0 {
+                shm.backend.ensure_dms_ready()?;
+            }
+            shm.backend
+                .lock_slot(st.connection_id(), lock_idx, ShmLockKind::Shared)?;
+            st.record_lock(lock_idx, ShmLockKind::Shared);
+            st.set_mode(WalLockMode::Reading { slot });
+            let epoch = st.epoch();
+            drop(st);
+            return Ok(OwnedWalReadGuard::new(
+                Arc::clone(shm),
+                Some(slot),
+                slot,
+                epoch,
+            ));
+        }
+
         let conn_id = shm.begin_idle_transition()?;
 
         if slot > 0 {
@@ -889,7 +957,45 @@ impl WalShm {
             .map_err(|_| SqliteError::new(ErrorCode::Internal, "poisoned WalLockState mutex"))
     }
 
+    /// Locks the region-0 cache slot, populating it through the backend (`ensure_dms_ready()` then
+    /// `map_region(0, false)`) when empty. The slot stays `None` while region 0 is not yet
+    /// allocated/mapped. Callers must already have passed [`Self::ensure_open_and_healthy`] /
+    /// [`Self::begin_idle_transition`] and must not re-enter this method while holding the guard.
+    #[inline]
+    fn region0_for_read(&self) -> Result<std::sync::MutexGuard<'_, Option<ShmChunk>>> {
+        let mut slot = self.region0.lock().map_err(|_| {
+            SqliteError::new(ErrorCode::Internal, "poisoned WalShm region-0 cache mutex")
+        })?;
+        if slot.is_none() {
+            self.fill_region0_slot(&mut slot)?;
+        }
+        Ok(slot)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn fill_region0_slot(&self, slot: &mut Option<ShmChunk>) -> Result<()> {
+        // A concurrent `close_shared` empties the slot only after raising the flag, so never
+        // (re)populate once the handle is closed.
+        if self.closed_or_poisoned.load(Ordering::Acquire) {
+            let _ = self.ensure_open_and_healthy_checked()?;
+        }
+        self.backend.ensure_dms_ready()?;
+        *slot = self.backend.map_region(0, false)?;
+        Ok(())
+    }
+
+    #[inline]
     fn ensure_open_and_healthy(&self) -> Result<u64> {
+        if !self.closed_or_poisoned.load(Ordering::Acquire) {
+            return Ok(self.conn_id);
+        }
+        self.ensure_open_and_healthy_checked()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn ensure_open_and_healthy_checked(&self) -> Result<u64> {
         let is_closed = self
             .closed
             .lock()
@@ -904,13 +1010,22 @@ impl WalShm {
     }
 
     fn begin_idle_transition(&self) -> Result<u64> {
-        let is_closed = self
-            .closed
-            .lock()
-            .map(|g| *g)
-            .map_err(|_| SqliteError::new(ErrorCode::Internal, "poisoned closed mutex"))?;
-        if is_closed {
-            return Err(SqliteError::misuse("WalShm handle already closed"));
+        Ok(self.begin_idle_transition_locked()?.connection_id())
+    }
+
+    /// [`Self::begin_idle_transition`] that hands back the still-locked `state` guard so the
+    /// caller can record the lock it is about to take without re-locking the mutex.
+    #[inline]
+    fn begin_idle_transition_locked(&self) -> Result<std::sync::MutexGuard<'_, WalLockState>> {
+        if self.closed_or_poisoned.load(Ordering::Acquire) {
+            let is_closed = self
+                .closed
+                .lock()
+                .map(|g| *g)
+                .map_err(|_| SqliteError::new(ErrorCode::Internal, "poisoned closed mutex"))?;
+            if is_closed {
+                return Err(SqliteError::misuse("WalShm handle already closed"));
+            }
         }
         let st = self.lock_state_guard()?;
         st.ensure_healthy()?;
@@ -919,12 +1034,13 @@ impl WalShm {
                 "WalShm connection already holds an active transaction guard",
             ));
         }
-        Ok(st.connection_id())
+        Ok(st)
     }
 
     pub(crate) fn poison_connection(&self, reason: impl Into<String>) {
         if let Ok(mut st) = self.state.lock() {
             st.mark_poisoned(reason);
+            self.closed_or_poisoned.store(true, Ordering::Release);
         }
     }
 
@@ -932,21 +1048,31 @@ impl WalShm {
         &self,
     ) -> Result<Option<(WalIndexHeaderData, WalCkptInfoSnapshot)>> {
         let _ = self.ensure_open_and_healthy()?;
-        self.backend.ensure_dms_ready()?;
-        let Some(chunk0) = self.backend.map_region(0, false)? else {
+        let region0 = self.region0_for_read()?;
+        let Some(chunk0) = region0.as_ref() else {
             return Ok(None);
         };
 
-        let copy1 = Self::load_raw_header_copy(&chunk0, WALINDEX_HDR_COPY1_OFFSET)?;
-        shm_barrier();
-        let copy2 = Self::load_raw_header_copy(&chunk0, WALINDEX_HDR_COPY2_OFFSET)?;
-        let hdr = match WalIndexHeaderData::decode_verified_pair(&copy1, &copy2) {
-            Ok(h) => h,
-            Err(e) if e.code == ErrorCode::CantOpen => return Err(e),
-            Err(_) => return Ok(None),
+        let Some(hdr) = Self::try_read_header_from_chunk(chunk0)? else {
+            return Ok(None);
         };
-        let ckpt = self.read_ckpt_info_from_chunk(&chunk0)?;
+        let ckpt = self.read_ckpt_info_from_chunk(chunk0)?;
         Ok(Some((hdr, ckpt)))
+    }
+
+    /// Dual-copy `WalIndexHdr` read from an already mapped region 0 (`walIndexTryHdr`): copy 1,
+    /// `shm_barrier()`, copy 2, then byte equality + `isInit` + checksum + version verification.
+    /// `Ok(None)` means "dirty/uninitialized header"; an unsupported version is `Err(CantOpen)`.
+    #[inline]
+    fn try_read_header_from_chunk(chunk0: &ShmChunk) -> Result<Option<WalIndexHeaderData>> {
+        let copy1 = Self::load_raw_header_copy(chunk0, WALINDEX_HDR_COPY1_OFFSET)?;
+        shm_barrier();
+        let copy2 = Self::load_raw_header_copy(chunk0, WALINDEX_HDR_COPY2_OFFSET)?;
+        match WalIndexHeaderData::decode_verified_pair(&copy1, &copy2) {
+            Ok(h) => Ok(Some(h)),
+            Err(e) if e.code == ErrorCode::CantOpen => Err(e),
+            Err(_) => Ok(None),
+        }
     }
 
     fn read_ckpt_info_from_chunk(&self, chunk0: &ShmChunk) -> Result<WalCkptInfoSnapshot> {
@@ -1018,10 +1144,54 @@ impl WalShm {
                 return Ok(false);
             }
         }
-        let Some((live_hdr, _)) = self.try_read_header_and_ckpt_info_internal()? else {
+        let _ = self.ensure_open_and_healthy()?;
+        let region0 = self.region0_for_read()?;
+        let Some(chunk0) = region0.as_ref() else {
+            return Ok(false);
+        };
+        let Some(live_hdr) = Self::try_read_header_from_chunk(chunk0)? else {
             return Ok(false);
         };
         Ok(live_hdr == *expected_hdr)
+    }
+
+    /// `walTryBeginRead` post-lock step for a positive reader slot (`wal.c:3308-3320`), performed
+    /// against ONE mapping of region 0: read `nBackfill` (for `minFrame = nBackfill + 1`),
+    /// `shm_barrier()`, re-check `aReadMark[slot] == expected_mark`, then re-read and fully
+    /// re-verify the dual-copy `WalIndexHdr` against `expected_hdr`.
+    ///
+    /// Returns `(n_backfill, verified)`. Equivalent to `read_ckpt_info_internal()?.n_backfill`
+    /// followed by `verify_post_read_lock_internal(slot, Some(expected_mark), expected_hdr)`,
+    /// minus the repeated handle-health / DMS / region-lookup round trips between the reads and
+    /// the `WalCkptInfo` words (`aReadMark[..]`, `nBackfillAttempted`) the caller never uses.
+    pub(crate) fn read_backfill_and_verify_post_read_lock_internal(
+        &self,
+        slot: u8,
+        expected_mark: u32,
+        expected_hdr: &WalIndexHeaderData,
+    ) -> Result<(u32, bool)> {
+        let _ = self.ensure_open_and_healthy()?;
+        if usize::from(slot) >= WAL_NREADER {
+            return Err(SqliteError::misuse("reader slot out of range"));
+        }
+        let region0 = self.region0_for_read()?;
+        let chunk0 = region0
+            .as_ref()
+            .ok_or_else(|| SqliteError::corrupt("WAL-index region 0 is not mapped"))?;
+        let n_backfill = chunk0.load_u32(WAL_CKPT_NBACKFILL_OFFSET, Ordering::Acquire)?;
+
+        shm_barrier();
+        let live_mark = chunk0.load_u32(
+            WAL_CKPT_READMARK_OFFSET + usize::from(slot) * 4,
+            Ordering::Acquire,
+        )?;
+        if live_mark != expected_mark {
+            return Ok((n_backfill, false));
+        }
+        let Some(live_hdr) = Self::try_read_header_from_chunk(chunk0)? else {
+            return Ok((n_backfill, false));
+        };
+        Ok((n_backfill, live_hdr == *expected_hdr))
     }
 
     pub(crate) fn release_reader_under_write_internal(&self, slot: u8) -> Result<()> {
@@ -1280,16 +1450,16 @@ impl WalShm {
 
     pub(crate) fn read_header_verified_internal(&self) -> Result<WalIndexHeaderData> {
         let _ = self.ensure_open_and_healthy()?;
-        self.backend.ensure_dms_ready()?;
-        let Some(chunk0) = self.backend.map_region(0, false)? else {
+        let region0 = self.region0_for_read()?;
+        let Some(chunk0) = region0.as_ref() else {
             return Err(SqliteError::corrupt(
                 "WAL-index region 0 is not yet initialized",
             ));
         };
 
-        let copy1 = Self::load_raw_header_copy(&chunk0, WALINDEX_HDR_COPY1_OFFSET)?;
+        let copy1 = Self::load_raw_header_copy(chunk0, WALINDEX_HDR_COPY1_OFFSET)?;
         shm_barrier();
-        let copy2 = Self::load_raw_header_copy(&chunk0, WALINDEX_HDR_COPY2_OFFSET)?;
+        let copy2 = Self::load_raw_header_copy(chunk0, WALINDEX_HDR_COPY2_OFFSET)?;
         WalIndexHeaderData::decode_verified_pair(&copy1, &copy2)
     }
 
@@ -1340,10 +1510,9 @@ impl WalShm {
         if usize::from(slot) >= WAL_NREADER {
             return Err(SqliteError::misuse("reader slot out of range"));
         }
-        self.backend.ensure_dms_ready()?;
-        let chunk0 = self
-            .backend
-            .map_region(0, false)?
+        let region0 = self.region0_for_read()?;
+        let chunk0 = region0
+            .as_ref()
             .ok_or_else(|| SqliteError::corrupt("WAL-index region 0 is not mapped"))?;
         chunk0.load_u32(
             WAL_CKPT_READMARK_OFFSET + usize::from(slot) * 4,
@@ -1353,23 +1522,11 @@ impl WalShm {
 
     pub(crate) fn read_ckpt_info_internal(&self) -> Result<WalCkptInfoSnapshot> {
         let _ = self.ensure_open_and_healthy()?;
-        self.backend.ensure_dms_ready()?;
-        let chunk0 = self
-            .backend
-            .map_region(0, false)?
+        let region0 = self.region0_for_read()?;
+        let chunk0 = region0
+            .as_ref()
             .ok_or_else(|| SqliteError::corrupt("WAL-index region 0 is not mapped"))?;
-        let n_backfill = chunk0.load_u32(WAL_CKPT_NBACKFILL_OFFSET, Ordering::Acquire)?;
-        let mut read_marks = [0u32; WAL_NREADER];
-        for (i, mark) in read_marks.iter_mut().enumerate() {
-            *mark = chunk0.load_u32(WAL_CKPT_READMARK_OFFSET + i * 4, Ordering::Acquire)?;
-        }
-        let n_backfill_attempted =
-            chunk0.load_u32(WAL_CKPT_BACKFILL_ATTEMPTED_OFFSET, Ordering::Acquire)?;
-        Ok(WalCkptInfoSnapshot {
-            n_backfill,
-            read_marks,
-            n_backfill_attempted,
-        })
+        self.read_ckpt_info_from_chunk(chunk0)
     }
 
     pub(crate) fn ensure_region_writable_internal(&self, region: u32) -> Result<ShmChunk> {
@@ -1571,17 +1728,15 @@ impl WalShm {
 
     pub(crate) fn upgrade_reader_to_writer_internal(&self, slot: u8) -> Result<u64> {
         let conn_id = self.ensure_open_and_healthy()?;
-        {
-            let st = self.lock_state_guard()?;
-            if st.mode() != (WalLockMode::Reading { slot }) {
-                return Err(SqliteError::misuse(
-                    "WalShm is not in matching Reading mode for writer upgrade",
-                ));
-            }
+        // One `state` critical section spanning the mode check, the OS lock and the bookkeeping.
+        let mut st = self.lock_state_guard()?;
+        if st.mode() != (WalLockMode::Reading { slot }) {
+            return Err(SqliteError::misuse(
+                "WalShm is not in matching Reading mode for writer upgrade",
+            ));
         }
         self.backend
             .lock_slot(conn_id, WAL_WRITE_LOCK, ShmLockKind::Exclusive)?;
-        let mut st = self.lock_state_guard()?;
         st.record_lock(WAL_WRITE_LOCK, ShmLockKind::Exclusive);
         st.set_mode(WalLockMode::Writing {
             reader_slot: Some(slot),
@@ -1609,10 +1764,7 @@ impl WalShm {
         let Some(lock_idx) = wal_read_lock_slot(slot) else {
             return Err(SqliteError::misuse("invalid reader slot"));
         };
-        let conn_id = {
-            let st = self.lock_state_guard()?;
-            st.connection_id()
-        };
+        let conn_id = self.conn_id;
         let res = self
             .backend
             .unlock_slot(conn_id, lock_idx, ShmLockKind::Shared);
@@ -1622,6 +1774,7 @@ impl WalShm {
                 st.set_mode(WalLockMode::Idle);
             } else if from_drop && let Err(ref e) = res {
                 st.mark_poisoned(format!("failed to unlock WAL_READ_LOCK({slot}): {e}"));
+                self.closed_or_poisoned.store(true, Ordering::Release);
             }
         }
         res
@@ -1632,10 +1785,7 @@ impl WalShm {
         reader_slot: Option<u8>,
         from_drop: bool,
     ) -> Result<()> {
-        let conn_id = {
-            let st = self.lock_state_guard()?;
-            st.connection_id()
-        };
+        let conn_id = self.conn_id;
         let mut first_err: Option<SqliteError> = None;
 
         // Release in reverse order: `WRITE` first, then `READ(slot)` if co-held.
@@ -1672,6 +1822,7 @@ impl WalShm {
             if let Some(ref e) = first_err {
                 if from_drop {
                     st.mark_poisoned(format!("failed to release WriterTxnGuard: {e}"));
+                    self.closed_or_poisoned.store(true, Ordering::Release);
                 }
             } else {
                 st.set_mode(WalLockMode::Idle);
@@ -1919,6 +2070,7 @@ impl WalShm {
             if let Some(ref e) = first_err {
                 if from_drop {
                     st.mark_poisoned(format!("failed to release CheckpointTxnGuard: {e}"));
+                    self.closed_or_poisoned.store(true, Ordering::Release);
                 }
             } else {
                 st.set_mode(WalLockMode::Idle);
@@ -2091,6 +2243,7 @@ impl WalShm {
             if let Some(ref e) = first_err {
                 if from_drop {
                     st.mark_poisoned(format!("failed to release RecoveryTxnGuard: {e}"));
+                    self.closed_or_poisoned.store(true, Ordering::Release);
                 }
             } else {
                 st.set_mode(WalLockMode::Idle);
