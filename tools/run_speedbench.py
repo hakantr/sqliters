@@ -1208,20 +1208,31 @@ def detect_tool_version(cmd: list[str]) -> str:
         return "unknown"
 
 
-def ensure_rust_binaries(repo_root: Path) -> tuple[Path, Path]:
-    sys.stderr.write("[1/4] Building Rust sqliters (--release: example speedbench + sqliters CLI)...\n")
-    run_cmd(
-        ["cargo", "build", "--release", "-p", "sqliters", "--example", "speedbench"],
-        cwd=repo_root,
-        desc="cargo build --release --example speedbench",
-    )
-    run_cmd(
-        ["cargo", "build", "--release", "-p", "sqliters-cli", "--bin", "sqliters"],
-        cwd=repo_root,
-        desc="cargo build --release --bin sqliters",
-    )
+def ensure_rust_binaries(repo_root: Path, skip_build: bool = False) -> tuple[Path, Path]:
     rust_bench = repo_root / "target" / "release" / "examples" / "speedbench"
     rust_cli = repo_root / "target" / "release" / "sqliters"
+    pgo_script = repo_root / "tools" / "build_pgo.py"
+    if skip_build:
+        sys.stderr.write("[1/4] Skipping Rust build (--skip-rust-build); using existing target/release/ binaries...\n")
+    elif pgo_script.exists():
+        sys.stderr.write("[1/4] Ensuring PGO-optimized Rust binaries via tools/build_pgo.py --reuse-profdata...\n")
+        run_cmd(
+            [sys.executable, str(pgo_script), "--reuse-profdata"],
+            cwd=repo_root,
+            desc="tools/build_pgo.py --reuse-profdata",
+        )
+    else:
+        sys.stderr.write("[1/4] Building Rust sqliters (--release: example speedbench + sqliters CLI)...\n")
+        run_cmd(
+            ["cargo", "build", "--release", "-p", "sqliters", "--example", "speedbench"],
+            cwd=repo_root,
+            desc="cargo build --release --example speedbench",
+        )
+        run_cmd(
+            ["cargo", "build", "--release", "-p", "sqliters-cli", "--bin", "sqliters"],
+            cwd=repo_root,
+            desc="cargo build --release --bin sqliters",
+        )
     if not rust_bench.exists() or not rust_cli.exists():
         raise SystemExit("Missing compiled Rust release binaries under target/release/")
     return rust_bench, rust_cli
@@ -1431,6 +1442,11 @@ def main() -> int:
     parser.add_argument("--trials", type=int, default=3, help="Number of timed iterations (default: 3)")
     parser.add_argument("--filter", type=str, default="", help="Optional substring filter on workload name")
     parser.add_argument(
+        "--skip-rust-build",
+        action="store_true",
+        help="Use existing target/release/{examples/speedbench,sqliters} binaries without invoking cargo",
+    )
+    parser.add_argument(
         "--output-json",
         type=Path,
         default=None,
@@ -1443,7 +1459,7 @@ def main() -> int:
     ref_dir.mkdir(parents=True, exist_ok=True)
     out_json = args.output_json or (ref_dir / "baseline_main_bench.json")
 
-    rust_bench, rust_cli = ensure_rust_binaries(repo_root)
+    rust_bench, rust_cli = ensure_rust_binaries(repo_root, skip_build=args.skip_rust_build)
     c_bench, c_cli = ensure_c_binaries(repo_root)
 
     bench_scratch_parent = ref_dir / "bench_runs"
@@ -1651,7 +1667,11 @@ def main() -> int:
             "cpu": detect_cpu_model(),
             "logical_cpus": os.cpu_count() or 1,
             "rustc": rustc_ver,
-            "rust_profile": "release",
+            "rust_profile": (
+                "release+pgo+lld-relr-split"
+                if (repo_root / "tools" / "build_pgo.py").exists()
+                else "release"
+            ),
             "c_compiler": cc_ver,
             "c_flags": C_O3_FLAGS,
         },
