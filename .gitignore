@@ -8,3 +8,8 @@ implementation_plan.md
 sqltest/
 /benchmarks/*
 !/benchmarks/benchmark_report.md
+# Per-branch measurement records: publish the Markdown reports, keep JSON, scripts and patches local.
+!/benchmarks/*/
+/benchmarks/*/**
+!/benchmarks/*/**/
+!/benchmarks/*/**/*.md
