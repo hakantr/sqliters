@@ -1881,11 +1881,83 @@ pub(crate) fn collect_and_rewrite_window_calls(
     }
 }
 
+/// Inline-first container for per-row window function results (`<= 4` window calls without heap allocation).
+pub(crate) enum InlineWinVals {
+    Inline { len: u8, slots: [RuntimeValue; 4] },
+    Heap(Vec<RuntimeValue>),
+}
+
+impl Default for InlineWinVals {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InlineWinVals {
+    #[inline]
+    pub const fn new() -> Self {
+        Self::Inline {
+            len: 0,
+            slots: [
+                RuntimeValue::null(),
+                RuntimeValue::null(),
+                RuntimeValue::null(),
+                RuntimeValue::null(),
+            ],
+        }
+    }
+
+    #[inline]
+    pub fn init_nulls(&mut self, count: usize) {
+        if count <= 4 {
+            *self = Self::Inline {
+                len: count as u8,
+                slots: [
+                    RuntimeValue::null(),
+                    RuntimeValue::null(),
+                    RuntimeValue::null(),
+                    RuntimeValue::null(),
+                ],
+            };
+        } else {
+            *self = Self::Heap(vec![RuntimeValue::null(); count]);
+        }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[RuntimeValue] {
+        match self {
+            Self::Inline { len, slots } => &slots[..*len as usize],
+            Self::Heap(v) => v.as_slice(),
+        }
+    }
+}
+
+impl std::ops::Deref for InlineWinVals {
+    type Target = [RuntimeValue];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl std::ops::DerefMut for InlineWinVals {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Inline { len, slots } => &mut slots[..*len as usize],
+            Self::Heap(v) => v.as_mut_slice(),
+        }
+    }
+}
+
 /// One row (or post-`GROUP BY` group) flowing through the multi-stage window pipeline.
 pub(crate) struct WindowExecItem {
     pub row: EvalRow,
     pub group_rows: Option<Vec<EvalRow>>,
-    pub win_vals: Vec<RuntimeValue>,
+    pub win_vals: InlineWinVals,
 }
 
 struct WindowStage {
@@ -1920,12 +1992,35 @@ pub(crate) fn execute_window_pipeline(
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
 ) -> Result<()> {
+    execute_window_pipeline_opts(
+        ctx,
+        items,
+        calls,
+        sample_cols,
+        params,
+        outer_scopes,
+        ctes,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_window_pipeline_opts(
+    ctx: &mut ExecContext<'_>,
+    items: &mut [WindowExecItem],
+    calls: &[CollectedWindowCall],
+    sample_cols: &[ScopedColumn],
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    ctes: &CteStore,
+    sync_row_win_vals: bool,
+) -> Result<()> {
     let total_calls = calls.len();
     if total_calls == 0 || items.is_empty() {
         return Ok(());
     }
     for item in items.iter_mut() {
-        item.win_vals = vec![RuntimeValue::null(); total_calls];
+        item.win_vals.init_nulls(total_calls);
     }
 
     let mut stages: Vec<WindowStage> = Vec::new();
@@ -1944,7 +2039,7 @@ pub(crate) fn execute_window_pipeline(
         }) {
             st.calls.push(call.clone());
         } else {
-            stages.push(WindowStage {
+            let new_stage = WindowStage {
                 partition_by: call.spec.partition_by.clone(),
                 order_by: call.spec.order_by.clone(),
                 units: call.spec.units,
@@ -1952,7 +2047,16 @@ pub(crate) fn execute_window_pipeline(
                 end: call.spec.end.clone(),
                 exclude: call.spec.exclude,
                 calls: vec![call.clone()],
-            });
+            };
+            // Match `sqlite3WindowLink`: keep stages with identical `(partition_by, order_by)`
+            // adjacent so the second stage finds `items` already sorted in a single linear check.
+            if let Some(adj_pos) = stages.iter().rposition(|st| {
+                st.partition_by == new_stage.partition_by && st.order_by == new_stage.order_by
+            }) {
+                stages.insert(adj_pos + 1, new_stage);
+            } else {
+                stages.push(new_stage);
+            }
         }
     }
 
@@ -1968,8 +2072,10 @@ pub(crate) fn execute_window_pipeline(
         execute_single_window_stage(ctx, items, stage, sample_cols, params, outer_scopes, ctes)?;
     }
 
-    for item in items.iter_mut() {
-        item.row.win_vals = Rc::from(item.win_vals.as_slice());
+    if sync_row_win_vals {
+        for item in items.iter_mut() {
+            item.row.win_vals = Rc::from(item.win_vals.as_slice());
+        }
     }
     Ok(())
 }
@@ -2348,13 +2454,10 @@ fn execute_single_window_stage(
         }
 
         if !stage.partition_by.is_empty() || !stage.order_by.is_empty() {
-            let mut perm: Vec<usize> = (0..n_total).collect();
             let has_p = !part_metas.is_empty();
             let has_o = !order_metas.is_empty();
             if all_infallible {
-                perm.sort_by(|&ia, &ib| {
-                    let (pa, oa) = &keys[ia];
-                    let (pb, ob) = &keys[ib];
+                let cmp_pair = |pa: &Value, oa: &Value, pb: &Value, ob: &Value| -> Ordering {
                     if has_p {
                         let ord = part_metas[0].compare_vals_infallible(pa, pb, enc);
                         if ord != Ordering::Equal {
@@ -2368,8 +2471,22 @@ fn execute_single_window_stage(
                         }
                     }
                     Ordering::Equal
-                });
+                };
+                let already_sorted = keys
+                    .windows(2)
+                    .all(|w| cmp_pair(&w[0].0, &w[0].1, &w[1].0, &w[1].1) != Ordering::Greater);
+                if !already_sorted {
+                    let mut perm: Vec<usize> = (0..n_total).collect();
+                    perm.sort_by(|&ia, &ib| {
+                        let (pa, oa) = &keys[ia];
+                        let (pb, ob) = &keys[ib];
+                        cmp_pair(pa, oa, pb, ob)
+                    });
+                    apply_permutation_in_place(items, &perm);
+                    apply_permutation_in_place(&mut keys, &perm);
+                }
             } else {
+                let mut perm: Vec<usize> = (0..n_total).collect();
                 let collations = ctx.collations;
                 fallible_sort_by(&mut perm, |&ia, &ib| {
                     let (pa, oa) = &keys[ia];
@@ -2388,9 +2505,9 @@ fn execute_single_window_stage(
                     }
                     Ok(Ordering::Equal)
                 })?;
+                apply_permutation_in_place(items, &perm);
+                apply_permutation_in_place(&mut keys, &perm);
             }
-            apply_permutation_in_place(items, &perm);
-            apply_permutation_in_place(&mut keys, &perm);
         }
 
         let mut part_start = 0usize;

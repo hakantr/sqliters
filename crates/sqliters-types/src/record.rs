@@ -13,10 +13,210 @@ use std::cmp::Ordering;
 
 use crate::error::{Result, SqliteError};
 use crate::runtime_api::RuntimeValue;
+#[cfg(not(target_arch = "x86_64"))]
+use crate::value::swar_fold_ascii_lower_u64;
 use crate::value::{Collation, CustomCollation, TextEncoding, Value, cmp_int_float};
 use crate::varint::{get_varint, push_varint, varint_len};
 
 const MAX_6BYTE_INT: u64 = (0x0000_8000_u64 << 32) - 1; // 140_737_488_355_327
+
+/// Packed 64-bit SWAR nibble LUT mapping serial types `0..=11` to their byte lengths
+/// (`0, 1, 2, 3, 4, 6, 8, 8, 0, 0`, with `0xf` marking reserved corrupt serial types `10 | 11`).
+const ST_SMALL_NIBBLES: u64 = 0x0000_ff00_8864_3210;
+
+/// Computes the payload byte length of a 1-byte serial type (`< 128`) in pure register SWAR
+/// without L1 table loads or jump tables; returns `0xff` for reserved corrupt types `10 | 11`.
+#[inline(always)]
+pub const fn swar_serial_len_1b(st: u8) -> u8 {
+    if st >= 12 {
+        (st - 12) >> 1
+    } else if (st & !1) == 10 {
+        0xff
+    } else {
+        ((ST_SMALL_NIBBLES >> ((st as u32) << 2)) & 0xf) as u8
+    }
+}
+
+/// SWAR 32/64-bit parallel MSB continuation-bit header decoder for Format-3 records.
+///
+/// When `rec` starts with a single-byte `hdr_size` (`2 <= hdr_size <= rec.len()`) and all bytes
+/// in the leading 32-bit or 64-bit header word have bit 7 clear (`0x8080... == 0`), returns
+/// `Some((hdr_size, packed_serial_types_le, swar_col_count))` in a single word test.
+#[inline(always)]
+pub fn swar_decode_hdr(rec: &[u8]) -> Option<(usize, u64, usize)> {
+    if rec.len() >= 8 {
+        let w = u64::from_le_bytes([
+            rec[0], rec[1], rec[2], rec[3], rec[4], rec[5], rec[6], rec[7],
+        ]);
+        let hdr_size = (w & 0xff) as usize;
+        if hdr_size >= 2 && hdr_size <= rec.len() {
+            let check = hdr_size.min(8);
+            let msb_mask = 0x8080_8080_8080_8080u64 >> ((8 - check) * 8);
+            if (w & msb_mask) == 0 {
+                return Some((hdr_size, w >> 8, check - 1));
+            }
+        }
+    } else if rec.len() >= 4 {
+        let w32 = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
+        let hdr_size = (w32 & 0xff) as usize;
+        if (2..=4).contains(&hdr_size) && hdr_size <= rec.len() {
+            let msb_mask = 0x8080_8080u32 >> ((4 - hdr_size) * 8);
+            if (w32 & msb_mask) == 0 {
+                return Some((hdr_size, u64::from(w32 >> 8), hdr_size - 1));
+            }
+        }
+    }
+    None
+}
+
+/// SWAR pure-ASCII big-endian word comparator (`0x8080_8080_8080_8080` MSB mask + `u64`/`u32`
+/// big-endian word compare) for `Collation::Binary` under UTF-8. Returns `None` if any inspected
+/// byte is non-ASCII (`>= 0x80`) so the caller can fall back to full UTF-8 decoding.
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn swar_cmp_ascii_binary(a: &[u8], b: &[u8]) -> Option<Ordering> {
+    let min_len = a.len().min(b.len());
+    if min_len >= 8 {
+        let mut pos = 0usize;
+        while pos + 8 <= min_len {
+            let sa = &a[pos..pos + 8];
+            let sb = &b[pos..pos + 8];
+            let wa = u64::from_be_bytes([sa[0], sa[1], sa[2], sa[3], sa[4], sa[5], sa[6], sa[7]]);
+            let wb = u64::from_be_bytes([sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], sb[6], sb[7]]);
+            if ((wa | wb) & 0x8080_8080_8080_8080) != 0 {
+                return None;
+            }
+            if wa != wb {
+                return Some(wa.cmp(&wb));
+            }
+            pos += 8;
+        }
+        if pos < min_len {
+            let t = min_len - 8;
+            let sa = &a[t..min_len];
+            let sb = &b[t..min_len];
+            let wa = u64::from_be_bytes([sa[0], sa[1], sa[2], sa[3], sa[4], sa[5], sa[6], sa[7]]);
+            let wb = u64::from_be_bytes([sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], sb[6], sb[7]]);
+            if ((wa | wb) & 0x8080_8080_8080_8080) != 0 {
+                return None;
+            }
+            if wa != wb {
+                return Some(wa.cmp(&wb));
+            }
+        }
+        return Some(a.len().cmp(&b.len()));
+    }
+    if min_len >= 4 {
+        let t = min_len - 4;
+        let wa0 = u32::from_be_bytes([a[0], a[1], a[2], a[3]]);
+        let wb0 = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+        let wa1 = u32::from_be_bytes([a[t], a[t + 1], a[t + 2], a[t + 3]]);
+        let wb1 = u32::from_be_bytes([b[t], b[t + 1], b[t + 2], b[t + 3]]);
+        let pa = (u64::from(wa0) << 32) | u64::from(wa1);
+        let pb = (u64::from(wb0) << 32) | u64::from(wb1);
+        if ((pa | pb) & 0x8080_8080_8080_8080) != 0 {
+            return None;
+        }
+        if pa != pb {
+            return Some(pa.cmp(&pb));
+        }
+        return Some(a.len().cmp(&b.len()));
+    }
+    let mut i = 0usize;
+    while i < min_len {
+        let ba = a[i];
+        let bb = b[i];
+        if ((ba | bb) & 0x80) != 0 {
+            return None;
+        }
+        if ba != bb {
+            return Some(ba.cmp(&bb));
+        }
+        i += 1;
+    }
+    Some(a.len().cmp(&b.len()))
+}
+
+/// SWAR pure-ASCII big-endian word comparator for `Collation::NoCase` under UTF-8. Returns `None`
+/// if any inspected byte is non-ASCII (`>= 0x80`) so the caller can fall back to UTF-8 decoding.
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn swar_cmp_ascii_nocase(a: &[u8], b: &[u8]) -> Option<Ordering> {
+    let min_len = a.len().min(b.len());
+    if min_len >= 8 {
+        let mut pos = 0usize;
+        while pos + 8 <= min_len {
+            let sa = &a[pos..pos + 8];
+            let sb = &b[pos..pos + 8];
+            let wa = u64::from_be_bytes([sa[0], sa[1], sa[2], sa[3], sa[4], sa[5], sa[6], sa[7]]);
+            let wb = u64::from_be_bytes([sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], sb[6], sb[7]]);
+            if ((wa | wb) & 0x8080_8080_8080_8080) != 0 {
+                return None;
+            }
+            if wa != wb {
+                let fa = swar_fold_ascii_lower_u64(wa);
+                let fb = swar_fold_ascii_lower_u64(wb);
+                if fa != fb {
+                    return Some(fa.cmp(&fb));
+                }
+            }
+            pos += 8;
+        }
+        if pos < min_len {
+            let t = min_len - 8;
+            let sa = &a[t..min_len];
+            let sb = &b[t..min_len];
+            let wa = u64::from_be_bytes([sa[0], sa[1], sa[2], sa[3], sa[4], sa[5], sa[6], sa[7]]);
+            let wb = u64::from_be_bytes([sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], sb[6], sb[7]]);
+            if ((wa | wb) & 0x8080_8080_8080_8080) != 0 {
+                return None;
+            }
+            if wa != wb {
+                let fa = swar_fold_ascii_lower_u64(wa);
+                let fb = swar_fold_ascii_lower_u64(wb);
+                if fa != fb {
+                    return Some(fa.cmp(&fb));
+                }
+            }
+        }
+        return Some(a.len().cmp(&b.len()));
+    }
+    if min_len >= 4 {
+        let t = min_len - 4;
+        let wa0 = u32::from_be_bytes([a[0], a[1], a[2], a[3]]);
+        let wb0 = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+        let wa1 = u32::from_be_bytes([a[t], a[t + 1], a[t + 2], a[t + 3]]);
+        let wb1 = u32::from_be_bytes([b[t], b[t + 1], b[t + 2], b[t + 3]]);
+        let pa = (u64::from(wa0) << 32) | u64::from(wa1);
+        let pb = (u64::from(wb0) << 32) | u64::from(wb1);
+        if ((pa | pb) & 0x8080_8080_8080_8080) != 0 {
+            return None;
+        }
+        if pa != pb {
+            let fa = swar_fold_ascii_lower_u64(pa);
+            let fb = swar_fold_ascii_lower_u64(pb);
+            if fa != fb {
+                return Some(fa.cmp(&fb));
+            }
+        }
+        return Some(a.len().cmp(&b.len()));
+    }
+    let mut i = 0usize;
+    while i < min_len {
+        let ba = a[i];
+        let bb = b[i];
+        if ((ba | bb) & 0x80) != 0 {
+            return None;
+        }
+        let la = ba.to_ascii_lowercase();
+        let lb = bb.to_ascii_lowercase();
+        if la != lb {
+            return Some(la.cmp(&lb));
+        }
+        i += 1;
+    }
+    Some(a.len().cmp(&b.len()))
+}
 
 /// Computes `(serial_type, data_byte_len)` for `value` under UTF-8 SQLite file format 4 (`vdbeaux.c:3919`).
 #[inline]
@@ -71,22 +271,24 @@ pub fn serial_type_for_with_encoding(value: &Value, enc: TextEncoding) -> (u64, 
 }
 
 /// Returns the payload byte length corresponding to `serial_type` (`sqlite3VdbeSerialTypeLen`).
-#[inline(always)]
+#[cold]
+#[inline(never)]
+fn err_reserved_serial(serial_type: u64) -> SqliteError {
+    SqliteError::corrupt(format!(
+        "reserved serial type {serial_type} encountered in record"
+    ))
+}
+
+#[inline]
 pub fn serial_type_len(serial_type: u64) -> Result<usize> {
     if serial_type >= 12 {
         return Ok(((serial_type - 12) >> 1) as usize);
     }
-    match serial_type {
-        0 | 8 | 9 => Ok(0),
-        1 => Ok(1),
-        2 => Ok(2),
-        3 => Ok(3),
-        4 => Ok(4),
-        5 => Ok(6),
-        6 | 7 => Ok(8),
-        _ => Err(SqliteError::corrupt(format!(
-            "reserved serial type {serial_type} encountered in record"
-        ))),
+    let nib = (ST_SMALL_NIBBLES >> ((serial_type as u32) << 2)) & 0xf;
+    if nib != 0xf {
+        Ok(nib as usize)
+    } else {
+        Err(err_reserved_serial(serial_type))
     }
 }
 
@@ -548,6 +750,103 @@ impl KeySortOrder {
     }
 }
 
+#[inline(never)]
+fn compare_raw_text_to_str(
+    buf: &[u8],
+    rs: &str,
+    spec: &KeySortOrder,
+    enc: TextEncoding,
+) -> Result<Ordering> {
+    if enc == TextEncoding::Utf8 && spec.custom_collation.is_none() {
+        match spec.collation {
+            Collation::Binary => {
+                #[cfg(target_arch = "x86_64")]
+                let fast = sqliters_asm::cmp_utf8_ascii_binary(buf, rs.as_bytes());
+                #[cfg(not(target_arch = "x86_64"))]
+                let fast = swar_cmp_ascii_binary(buf, rs.as_bytes());
+                if let Some(ord) = fast {
+                    return Ok(ord);
+                }
+            }
+            Collation::NoCase => {
+                #[cfg(target_arch = "x86_64")]
+                let fast = sqliters_asm::cmp_utf8_ascii_nocase(buf, rs.as_bytes());
+                #[cfg(not(target_arch = "x86_64"))]
+                let fast = swar_cmp_ascii_nocase(buf, rs.as_bytes());
+                if let Some(ord) = fast {
+                    return Ok(ord);
+                }
+            }
+            Collation::RTrim => {}
+        }
+    }
+    if enc == TextEncoding::Utf8
+        && let Ok(lhs_s) = std::str::from_utf8(buf)
+    {
+        if let Some(ref cc) = spec.custom_collation {
+            (cc.comparator)(lhs_s, rs)
+        } else {
+            Ok(spec.collation.compare_str_with_encoding(lhs_s, rs, enc))
+        }
+    } else {
+        let lhs_s = enc.decode_bytes(buf);
+        if let Some(ref cc) = spec.custom_collation {
+            (cc.comparator)(&lhs_s, rs)
+        } else {
+            Ok(spec.collation.compare_str_with_encoding(&lhs_s, rs, enc))
+        }
+    }
+}
+
+#[inline(never)]
+fn compare_raw_text_slices(
+    a: &[u8],
+    b: &[u8],
+    spec: &KeySortOrder,
+    enc: TextEncoding,
+) -> Result<Ordering> {
+    if enc == TextEncoding::Utf8 && spec.custom_collation.is_none() {
+        match spec.collation {
+            Collation::Binary => {
+                #[cfg(target_arch = "x86_64")]
+                let fast = sqliters_asm::cmp_utf8_ascii_binary(a, b);
+                #[cfg(not(target_arch = "x86_64"))]
+                let fast = swar_cmp_ascii_binary(a, b);
+                if let Some(ord) = fast {
+                    return Ok(ord);
+                }
+            }
+            Collation::NoCase => {
+                #[cfg(target_arch = "x86_64")]
+                let fast = sqliters_asm::cmp_utf8_ascii_nocase(a, b);
+                #[cfg(not(target_arch = "x86_64"))]
+                let fast = swar_cmp_ascii_nocase(a, b);
+                if let Some(ord) = fast {
+                    return Ok(ord);
+                }
+            }
+            Collation::RTrim => {}
+        }
+    }
+    if enc == TextEncoding::Utf8
+        && let (Ok(sa), Ok(sb)) = (std::str::from_utf8(a), std::str::from_utf8(b))
+    {
+        if let Some(ref cc) = spec.custom_collation {
+            (cc.comparator)(sa, sb)
+        } else {
+            Ok(spec.collation.compare_str_with_encoding(sa, sb, enc))
+        }
+    } else {
+        let sa = enc.decode_bytes(a);
+        let sb = enc.decode_bytes(b);
+        if let Some(ref cc) = spec.custom_collation {
+            (cc.comparator)(&sa, &sb)
+        } else {
+            Ok(spec.collation.compare_str_with_encoding(&sa, &sb, enc))
+        }
+    }
+}
+
 /// Compares two serialized SQLite index records under UTF-8 (`sqlite3VdbeRecordCompare`).
 pub fn compare_records(
     lhs_record: &[u8],
@@ -629,7 +928,7 @@ pub fn compare_records_with_encoding(
                 }
             } else if (st & 1) == 0 {
                 let raw = match b {
-                    Value::Blob(rb) => buf.cmp(rb.as_slice()),
+                    Value::Blob(rb) => sqliters_asm::cmp_bytes_binary(buf, rb.as_slice()),
                     _ => Ordering::Greater,
                 };
                 if spec.desc { raw.reverse() } else { raw }
@@ -637,26 +936,7 @@ pub fn compare_records_with_encoding(
                 let raw = match b {
                     Value::Integer(_) | Value::Real(_) => Ordering::Greater,
                     Value::Blob(_) => Ordering::Less,
-                    Value::Text(rs) => {
-                        if enc == TextEncoding::Utf8
-                            && let Ok(lhs_s) = std::str::from_utf8(buf)
-                        {
-                            if let Some(ref cc) = spec.custom_collation {
-                                (cc.comparator)(lhs_s, rs.as_str())?
-                            } else {
-                                spec.collation
-                                    .compare_str_with_encoding(lhs_s, rs.as_str(), enc)
-                            }
-                        } else {
-                            let lhs_s = enc.decode_bytes(buf);
-                            if let Some(ref cc) = spec.custom_collation {
-                                (cc.comparator)(&lhs_s, rs.as_str())?
-                            } else {
-                                spec.collation
-                                    .compare_str_with_encoding(&lhs_s, rs.as_str(), enc)
-                            }
-                        }
-                    }
+                    Value::Text(rs) => compare_raw_text_to_str(buf, rs.as_str(), spec, enc)?,
                     Value::Null => unreachable!(),
                 };
                 if spec.desc { raw.reverse() } else { raw }
@@ -789,28 +1069,11 @@ impl<'a> RawField<'a> {
             (Self::Text(_), Value::Integer(_) | Value::Real(_)) => Ok(Ordering::Greater),
             (Self::Text(_), Value::Blob(_)) => Ok(Ordering::Less),
             (Self::Text(buf), Value::Text(rs)) => {
-                if enc == TextEncoding::Utf8
-                    && let Ok(lhs_s) = std::str::from_utf8(buf)
-                {
-                    if let Some(ref cc) = spec.custom_collation {
-                        (cc.comparator)(lhs_s, rs.as_str())
-                    } else {
-                        Ok(spec
-                            .collation
-                            .compare_str_with_encoding(lhs_s, rs.as_str(), enc))
-                    }
-                } else {
-                    let lhs_s = enc.decode_bytes(buf);
-                    if let Some(ref cc) = spec.custom_collation {
-                        (cc.comparator)(&lhs_s, rs.as_str())
-                    } else {
-                        Ok(spec
-                            .collation
-                            .compare_str_with_encoding(&lhs_s, rs.as_str(), enc))
-                    }
-                }
+                compare_raw_text_to_str(buf, rs.as_str(), spec, enc)
             }
-            (Self::Blob(buf), Value::Blob(rb)) => Ok(buf.cmp(rb.as_slice())),
+            (Self::Blob(buf), Value::Blob(rb)) => {
+                Ok(sqliters_asm::cmp_bytes_binary(buf, rb.as_slice()))
+            }
             (Self::Blob(_), _) => Ok(Ordering::Greater),
         }
     }
@@ -940,6 +1203,87 @@ pub fn compare_raw_record_range(
             Ordering::Equal
         });
     }
+    // 32-bit SWAR fast path for 2- and 3-column single-byte-header index records
+    // (`[0x03, st0, st1, ...]` and `[0x04, st0, st1, st2, ...]`).
+    if rec.len() >= 4 && k <= 2 {
+        let w32 = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
+        let hdr_size = (w32 & 0xff) as usize;
+        if (hdr_size == 4 && (w32 & 0x8080_8080) == 0)
+            || (hdr_size == 3 && (w32 & 0x0080_8080) == 0)
+        {
+            let st0 = ((w32 >> 8) & 0xff) as u8;
+            let st1 = ((w32 >> 16) & 0xff) as u8;
+            let l0 = swar_serial_len_1b(st0);
+            let l1 = swar_serial_len_1b(st1);
+            let l2 = if hdr_size == 4 {
+                swar_serial_len_1b(((w32 >> 24) & 0xff) as u8)
+            } else {
+                0
+            };
+            if ((l0 | l1 | l2) & 0x80) == 0
+                && hdr_size + usize::from(l0) + usize::from(l1) + usize::from(l2) <= rec.len()
+            {
+                let default_so = KeySortOrder::default();
+                let ncols = hdr_size - 1;
+                let sts = [st0, st1, ((w32 >> 24) & 0xff) as u8];
+                let lens = [usize::from(l0), usize::from(l1), usize::from(l2)];
+                let mut body_pos = hdr_size;
+                let prefix_stop = k.min(ncols);
+                for col_idx in 0..prefix_stop {
+                    let end = body_pos + lens[col_idx];
+                    let f = RawField::from_serial(u64::from(sts[col_idx]), &rec[body_pos..end])?;
+                    let spec = orders.get(col_idx).unwrap_or(&default_so);
+                    let ord = f.compare_key_to_value(&prefix_values[col_idx], spec, enc)?;
+                    if ord != Ordering::Equal {
+                        return Ok(ord);
+                    }
+                    body_pos = end;
+                }
+                if !has_bounds {
+                    return Ok(Ordering::Equal);
+                }
+                if k >= ncols {
+                    return Ok(Ordering::Less);
+                }
+                let end = body_pos + lens[k];
+                let f = RawField::from_serial(u64::from(sts[k]), &rec[body_pos..end])?;
+                let range_so = orders.get(k).unwrap_or(&default_so);
+                if f.is_null() {
+                    return Ok(if range_so.nulls_last {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    });
+                }
+                if let Some((lo_val, lo_inc)) = lower_bound
+                    && !lo_val.is_null()
+                {
+                    let cmp = f.compare_sql_to_nonnull_value(lo_val, range_so, enc)?;
+                    if cmp == Ordering::Less || (!lo_inc && cmp == Ordering::Equal) {
+                        return Ok(if range_so.desc {
+                            Ordering::Greater
+                        } else {
+                            Ordering::Less
+                        });
+                    }
+                }
+                if let Some((hi_val, hi_inc)) = upper_bound {
+                    if hi_val.is_null() {
+                        return Ok(Ordering::Greater);
+                    }
+                    let cmp = f.compare_sql_to_nonnull_value(hi_val, range_so, enc)?;
+                    if cmp == Ordering::Greater || (!hi_inc && cmp == Ordering::Equal) {
+                        return Ok(if range_so.desc {
+                            Ordering::Less
+                        } else {
+                            Ordering::Greater
+                        });
+                    }
+                }
+                return Ok(Ordering::Equal);
+            }
+        }
+    }
     let (hdr_u64, mut hdr_pos) = get_varint(rec)?;
     let hdr_size = usize::try_from(hdr_u64)
         .map_err(|_| SqliteError::corrupt("record header size overflow"))?;
@@ -1067,30 +1411,40 @@ fn compare_raw_fields(
             }
             (RawField::Int(i), RawField::Float(r)) => cmp_int_float(i, r),
             (RawField::Float(r), RawField::Int(i)) => cmp_int_float(i, r).reverse(),
-            (RawField::Blob(a), RawField::Blob(b)) => a.cmp(b),
-            (RawField::Text(a), RawField::Text(b)) => {
-                if enc == TextEncoding::Utf8
-                    && let (Ok(sa), Ok(sb)) = (std::str::from_utf8(a), std::str::from_utf8(b))
-                {
-                    if let Some(ref cc) = spec.custom_collation {
-                        (cc.comparator)(sa, sb)?
-                    } else {
-                        spec.collation.compare_str_with_encoding(sa, sb, enc)
-                    }
-                } else {
-                    let sa = enc.decode_bytes(a);
-                    let sb = enc.decode_bytes(b);
-                    if let Some(ref cc) = spec.custom_collation {
-                        (cc.comparator)(&sa, &sb)?
-                    } else {
-                        spec.collation.compare_str_with_encoding(&sa, &sb, enc)
-                    }
-                }
-            }
+            (RawField::Blob(a), RawField::Blob(b)) => sqliters_asm::cmp_bytes_binary(a, b),
+            (RawField::Text(a), RawField::Text(b)) => compare_raw_text_slices(a, b, spec, enc)?,
             _ => unreachable!(),
         }
     };
     Ok(if spec.desc { raw.reverse() } else { raw })
+}
+
+#[inline(always)]
+fn decode_int_serial_1b(st: u8, bytes: &[u8]) -> Option<i64> {
+    match st {
+        8 => Some(0),
+        9 => Some(1),
+        1 => Some(i64::from(bytes[0] as i8)),
+        2 => Some(i64::from(i16::from_be_bytes([bytes[0], bytes[1]]))),
+        3 => {
+            let sign_ext = (bytes[0] as i8) as i32;
+            Some(i64::from(
+                (sign_ext << 16) | ((bytes[1] as i32) << 8) | (bytes[2] as i32),
+            ))
+        }
+        4 => Some(i64::from(i32::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ]))),
+        5 => {
+            let hi = i16::from_be_bytes([bytes[0], bytes[1]]) as i64;
+            let lo = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as i64;
+            Some((hi << 32) | lo)
+        }
+        6 => Some(i64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ])),
+        _ => None,
+    }
 }
 
 /// Compares two serialized SQLite records directly on raw byte slices without decoding into
@@ -1107,6 +1461,79 @@ pub fn compare_raw_records_with_encoding(
     if lhs_record.is_empty() || rhs_record.is_empty() {
         return Ok(Ordering::Equal);
     }
+
+    // Fast path for UTF-8 records with 1-byte header sizes (`2..=8`) and 1-byte serial types.
+    let lh0 = lhs_record[0];
+    let rh0 = rhs_record[0];
+    if enc == TextEncoding::Utf8
+        && (2..=8).contains(&lh0)
+        && (2..=8).contains(&rh0)
+        && usize::from(lh0) <= lhs_record.len()
+        && usize::from(rh0) <= rhs_record.len()
+    {
+        let l_hdr = usize::from(lh0);
+        let r_hdr = usize::from(rh0);
+        let stop = (l_hdr - 1)
+            .min(r_hdr - 1)
+            .min(max_fields.unwrap_or(usize::MAX));
+        let mut l_body = l_hdr;
+        let mut r_body = r_hdr;
+        let mut fast_ok = true;
+        let default_spec = KeySortOrder::default();
+        for col_idx in 0..stop {
+            let st_a = lhs_record[1 + col_idx];
+            let st_b = rhs_record[1 + col_idx];
+            let la = swar_serial_len_1b(st_a);
+            let lb = swar_serial_len_1b(st_b);
+            if ((st_a | st_b | la | lb) & 0x80) != 0 {
+                fast_ok = false;
+                break;
+            }
+            let end_a = l_body + usize::from(la);
+            let end_b = r_body + usize::from(lb);
+            if end_a > lhs_record.len() || end_b > rhs_record.len() {
+                return Err(SqliteError::corrupt("record payload truncated"));
+            }
+            let spec = orders.get(col_idx).unwrap_or(&default_spec);
+            let cmp = if let (Some(ia), Some(ib)) = (
+                decode_int_serial_1b(st_a, &lhs_record[l_body..end_a]),
+                decode_int_serial_1b(st_b, &rhs_record[r_body..end_b]),
+            ) {
+                let raw = ia.cmp(&ib);
+                if spec.desc { raw.reverse() } else { raw }
+            } else if st_a >= 13
+                && st_b >= 13
+                && ((st_a & st_b) & 1) == 1
+                && spec.collation == Collation::Binary
+                && spec.custom_collation.is_none()
+            {
+                let sa = &lhs_record[l_body..end_a];
+                let sb = &rhs_record[r_body..end_b];
+                if let Some(raw) = sqliters_asm::cmp_utf8_ascii_binary(sa, sb) {
+                    if spec.desc { raw.reverse() } else { raw }
+                } else {
+                    let fa = RawField::Text(sa);
+                    let fb = RawField::Text(sb);
+                    compare_raw_fields(fa, fb, spec, enc)?
+                }
+            } else {
+                let fa = RawField::from_serial(u64::from(st_a), &lhs_record[l_body..end_a])?;
+                let fb = RawField::from_serial(u64::from(st_b), &rhs_record[r_body..end_b])?;
+                compare_raw_fields(fa, fb, spec, enc)?
+            };
+            if cmp != Ordering::Equal {
+                return Ok(cmp);
+            }
+            l_body = end_a;
+            r_body = end_b;
+        }
+        if fast_ok {
+            // Validate remaining serial types in the compared prefix weren't truncated/corrupt;
+            // we already validated `0..stop`, so matching `sqlite3VdbeRecordCompare`, Equal holds!
+            return Ok(Ordering::Equal);
+        }
+    }
+
     let (lhs_hdr_u64, mut lhs_hdr_pos) = get_varint(lhs_record)?;
     let lhs_hdr_size = usize::try_from(lhs_hdr_u64)
         .map_err(|_| SqliteError::corrupt("record header size overflow"))?;

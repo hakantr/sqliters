@@ -2,8 +2,10 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, OnceLock};
+
+use sqliters_ext::Fts5AuxRegistry;
 
 use sqliters_syntax::ConflictAction;
 use sqliters_types::{
@@ -169,11 +171,152 @@ fn with_ascii_upper_key<R>(name: &str, f: impl for<'k> FnOnce(&'k str) -> R) -> 
     f(&owned)
 }
 
+#[inline(always)]
+fn is_builtin_ext_scalar_name(name: &str) -> bool {
+    match name.len() {
+        4 => name.eq_ignore_ascii_case("bm25") || name.eq_ignore_ascii_case("fts5"),
+        7 => name.eq_ignore_ascii_case("snippet"),
+        9 => name.eq_ignore_ascii_case("highlight") || name.eq_ignore_ascii_case("rtreenode"),
+        10 => name.eq_ignore_ascii_case("rtreedepth") || name.eq_ignore_ascii_case("rtreecheck"),
+        14 => name.eq_ignore_ascii_case("fts5_source_id"),
+        _ => false,
+    }
+}
+
+struct SharedExtScalars {
+    fts5: ScalarFunctionDef,
+    fts5_source_id: ScalarFunctionDef,
+    rtreecheck_1: ScalarFunctionDef,
+    rtreecheck_2: ScalarFunctionDef,
+    rtreedepth: ScalarFunctionDef,
+    rtreenode: ScalarFunctionDef,
+}
+
+static SHARED_EXT_SCALARS: OnceLock<SharedExtScalars> = OnceLock::new();
+
+#[inline]
+fn shared_ext_scalars() -> &'static SharedExtScalars {
+    SHARED_EXT_SCALARS.get_or_init(|| SharedExtScalars {
+        fts5: ScalarFunctionDef {
+            name: "fts5".to_owned(),
+            arity: Some(1),
+            flags: FunctionFlags::INNOCUOUS,
+            callback: Arc::new(|args| {
+                Ok(RuntimeValue::plain(Fts5AuxRegistry::eval_fts5_ptr_func(
+                    &args[0].value,
+                )))
+            }),
+        },
+        fts5_source_id: ScalarFunctionDef {
+            name: "fts5_source_id".to_owned(),
+            arity: Some(0),
+            flags: FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS,
+            callback: Arc::new(|_args| {
+                Ok(RuntimeValue::plain(Fts5AuxRegistry::eval_fts5_source_id()))
+            }),
+        },
+        rtreecheck_1: ScalarFunctionDef {
+            name: "rtreecheck".to_owned(),
+            arity: Some(1),
+            flags: FunctionFlags::INNOCUOUS,
+            callback: Arc::new(|_| {
+                Err(SqliteError::new(
+                    ErrorCode::Internal,
+                    "__sqliters_builtin_rtreecheck__",
+                ))
+            }),
+        },
+        rtreecheck_2: ScalarFunctionDef {
+            name: "rtreecheck".to_owned(),
+            arity: Some(2),
+            flags: FunctionFlags::INNOCUOUS,
+            callback: Arc::new(|_| {
+                Err(SqliteError::new(
+                    ErrorCode::Internal,
+                    "__sqliters_builtin_rtreecheck__",
+                ))
+            }),
+        },
+        rtreedepth: ScalarFunctionDef {
+            name: "rtreedepth".to_owned(),
+            arity: Some(1),
+            flags: FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS,
+            callback: Arc::new(|args| {
+                Ok(RuntimeValue::plain(sqliters_ext::eval_rtreedepth(
+                    &args[0].value,
+                )?))
+            }),
+        },
+        rtreenode: ScalarFunctionDef {
+            name: "rtreenode".to_owned(),
+            arity: Some(2),
+            flags: FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS,
+            callback: Arc::new(|args| {
+                Ok(RuntimeValue::plain(sqliters_ext::eval_rtreenode(
+                    &args[0].value,
+                    &args[1].value,
+                )?))
+            }),
+        },
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ConnFts5AuxScalars {
+    bm25: ScalarFunctionDef,
+    highlight: ScalarFunctionDef,
+    snippet: ScalarFunctionDef,
+}
+
+fn build_conn_fts5_aux_scalars(fts5_aux: Arc<Fts5AuxRegistry>) -> ConnFts5AuxScalars {
+    let aux_bm25 = Arc::clone(&fts5_aux);
+    let bm25 = ScalarFunctionDef {
+        name: "bm25".to_owned(),
+        arity: None,
+        flags: FunctionFlags::INNOCUOUS,
+        callback: Arc::new(move |args| {
+            if args.len() == 1 {
+                return Ok(RuntimeValue::plain(
+                    aux_bm25.eval_bm25(std::slice::from_ref(&args[0].value))?,
+                ));
+            }
+            let vals: Vec<Value> = args.iter().map(|rv| rv.value.clone()).collect();
+            Ok(RuntimeValue::plain(aux_bm25.eval_bm25(&vals)?))
+        }),
+    };
+    let aux_hl = Arc::clone(&fts5_aux);
+    let highlight = ScalarFunctionDef {
+        name: "highlight".to_owned(),
+        arity: Some(4),
+        flags: FunctionFlags::INNOCUOUS,
+        callback: Arc::new(move |args| {
+            let vals: Vec<Value> = args.iter().map(|rv| rv.value.clone()).collect();
+            Ok(RuntimeValue::plain(aux_hl.eval_highlight(&vals)?))
+        }),
+    };
+    let snippet = ScalarFunctionDef {
+        name: "snippet".to_owned(),
+        arity: Some(6),
+        flags: FunctionFlags::INNOCUOUS,
+        callback: Arc::new(move |args| {
+            let vals: Vec<Value> = args.iter().map(|rv| rv.value.clone()).collect();
+            Ok(RuntimeValue::plain(fts5_aux.eval_snippet(&vals)?))
+        }),
+    };
+    ConnFts5AuxScalars {
+        bm25,
+        highlight,
+        snippet,
+    }
+}
+
 /// Connection-level registry for custom and extension scalar, aggregate, and window SQL functions.
 #[derive(Debug, Default, Clone)]
 pub struct FunctionRegistry {
     scalars: BTreeMap<String, Vec<ScalarFunctionDef>>,
     aggregates: BTreeMap<String, Vec<WindowFunctionDef>>,
+    lazy_fts5_aux: Option<Arc<OnceLock<Arc<Fts5AuxRegistry>>>>,
+    conn_fts5_scalars: OnceLock<ConnFts5AuxScalars>,
     user_modified: bool,
 }
 
@@ -182,6 +325,22 @@ impl FunctionRegistry {
     #[inline]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a connection function registry backed by lazily materialized FTS5/R-Tree extension
+    /// scalar functions (`bm25`, `highlight`, `snippet`, `fts5`, `fts5_source_id`, `rtreedepth`,
+    /// `rtreenode`, `rtreecheck`) with zero upfront `BTreeMap` or closure allocations.
+    #[inline]
+    pub fn with_lazy_builtin_extensions(
+        lazy_fts5_aux: Arc<OnceLock<Arc<Fts5AuxRegistry>>>,
+    ) -> Self {
+        Self {
+            scalars: BTreeMap::new(),
+            aggregates: BTreeMap::new(),
+            lazy_fts5_aux: Some(lazy_fts5_aux),
+            conn_fts5_scalars: OnceLock::new(),
+            user_modified: false,
+        }
     }
 
     /// Marks built-in extension function registration complete so fast paths can check
@@ -198,6 +357,97 @@ impl FunctionRegistry {
         self.user_modified
     }
 
+    #[inline]
+    fn ensure_conn_fts5_scalars(
+        &self,
+        slot: &Arc<OnceLock<Arc<Fts5AuxRegistry>>>,
+    ) -> &ConnFts5AuxScalars {
+        self.conn_fts5_scalars.get_or_init(|| {
+            let aux = Arc::clone(slot.get_or_init(|| Arc::new(Fts5AuxRegistry::new())));
+            build_conn_fts5_aux_scalars(aux)
+        })
+    }
+
+    #[cold]
+    fn materialize_lazy_builtin_scalars(&mut self) {
+        let Some(slot) = self.lazy_fts5_aux.take() else {
+            return;
+        };
+        let conn_fts = self.conn_fts5_scalars.take().unwrap_or_else(|| {
+            let aux = Arc::clone(slot.get_or_init(|| Arc::new(Fts5AuxRegistry::new())));
+            build_conn_fts5_aux_scalars(aux)
+        });
+        let shared = shared_ext_scalars();
+        self.scalars.insert("BM25".to_owned(), vec![conn_fts.bm25]);
+        self.scalars
+            .insert("FTS5".to_owned(), vec![shared.fts5.clone()]);
+        self.scalars.insert(
+            "FTS5_SOURCE_ID".to_owned(),
+            vec![shared.fts5_source_id.clone()],
+        );
+        self.scalars
+            .insert("HIGHLIGHT".to_owned(), vec![conn_fts.highlight]);
+        self.scalars.insert(
+            "RTREECHECK".to_owned(),
+            vec![shared.rtreecheck_1.clone(), shared.rtreecheck_2.clone()],
+        );
+        self.scalars
+            .insert("RTREEDEPTH".to_owned(), vec![shared.rtreedepth.clone()]);
+        self.scalars
+            .insert("RTREENODE".to_owned(), vec![shared.rtreenode.clone()]);
+        self.scalars
+            .insert("SNIPPET".to_owned(), vec![conn_fts.snippet]);
+    }
+
+    #[cold]
+    fn find_lazy_builtin_scalar(
+        &self,
+        slot: &Arc<OnceLock<Arc<Fts5AuxRegistry>>>,
+        name: &str,
+        argc: usize,
+    ) -> Option<&ScalarFunctionDef> {
+        match name.len() {
+            4 => {
+                if name.eq_ignore_ascii_case("bm25") {
+                    Some(&self.ensure_conn_fts5_scalars(slot).bm25)
+                } else if name.eq_ignore_ascii_case("fts5") && argc == 1 {
+                    Some(&shared_ext_scalars().fts5)
+                } else {
+                    None
+                }
+            }
+            7 if argc == 6 && name.eq_ignore_ascii_case("snippet") => {
+                Some(&self.ensure_conn_fts5_scalars(slot).snippet)
+            }
+            9 => {
+                if argc == 4 && name.eq_ignore_ascii_case("highlight") {
+                    Some(&self.ensure_conn_fts5_scalars(slot).highlight)
+                } else if argc == 2 && name.eq_ignore_ascii_case("rtreenode") {
+                    Some(&shared_ext_scalars().rtreenode)
+                } else {
+                    None
+                }
+            }
+            10 => {
+                if argc == 1 && name.eq_ignore_ascii_case("rtreedepth") {
+                    Some(&shared_ext_scalars().rtreedepth)
+                } else if name.eq_ignore_ascii_case("rtreecheck") {
+                    match argc {
+                        1 => Some(&shared_ext_scalars().rtreecheck_1),
+                        2 => Some(&shared_ext_scalars().rtreecheck_2),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            14 if argc == 0 && name.eq_ignore_ascii_case("fts5_source_id") => {
+                Some(&shared_ext_scalars().fts5_source_id)
+            }
+            _ => None,
+        }
+    }
+
     /// Registers or replaces a scalar function (`arity: Some(n)` for fixed arity, `None` for variadic).
     pub fn register_scalar<F>(
         &mut self,
@@ -208,6 +458,7 @@ impl FunctionRegistry {
     ) where
         F: Fn(&[RuntimeValue]) -> Result<RuntimeValue> + Send + Sync + 'static,
     {
+        self.materialize_lazy_builtin_scalars();
         self.user_modified = true;
         let name = name.into();
         let key = name.to_ascii_uppercase();
@@ -227,6 +478,7 @@ impl FunctionRegistry {
 
     /// Removes a registered scalar function overload, returning `true` if one was removed.
     pub fn unregister_scalar(&mut self, name: &str, arity: Option<usize>) -> bool {
+        self.materialize_lazy_builtin_scalars();
         self.user_modified = true;
         let key = name.to_ascii_uppercase();
         let Some(overloads) = self.scalars.get_mut(&key) else {
@@ -245,7 +497,7 @@ impl FunctionRegistry {
     #[inline]
     pub fn has_scalar_name(&self, name: &str) -> bool {
         if self.scalars.is_empty() {
-            return false;
+            return self.lazy_fts5_aux.is_some() && is_builtin_ext_scalar_name(name);
         }
         with_ascii_upper_key(name, |k| self.scalars.contains_key(k))
     }
@@ -255,6 +507,11 @@ impl FunctionRegistry {
     #[inline]
     pub fn find_scalar(&self, name: &str, argc: usize) -> Option<&ScalarFunctionDef> {
         if self.scalars.is_empty() {
+            if let Some(ref slot) = self.lazy_fts5_aux
+                && is_builtin_ext_scalar_name(name)
+            {
+                return self.find_lazy_builtin_scalar(slot, name, argc);
+            }
             return None;
         }
         let overloads = with_ascii_upper_key(name, |k| self.scalars.get(k))?;
@@ -423,14 +680,30 @@ impl FunctionRegistry {
     /// Returns metadata `(name, type_str, narg, flags)` for all registered custom functions.
     pub fn custom_function_entries(&self) -> Vec<(String, &'static str, i64, i64)> {
         let mut out = Vec::new();
-        for overloads in self.scalars.values() {
-            for def in overloads {
-                out.push((
-                    def.name.clone(),
-                    "s",
-                    def.arity.map_or(-1, |a| a as i64),
-                    i64::from(def.flags.0),
-                ));
+        if self.scalars.is_empty() && self.lazy_fts5_aux.is_some() {
+            let inn = i64::from(FunctionFlags::INNOCUOUS.0);
+            let det_inn = i64::from((FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS).0);
+            out.extend([
+                ("bm25".to_owned(), "s", -1, inn),
+                ("fts5".to_owned(), "s", 1, inn),
+                ("fts5_source_id".to_owned(), "s", 0, det_inn),
+                ("highlight".to_owned(), "s", 4, inn),
+                ("rtreecheck".to_owned(), "s", 1, inn),
+                ("rtreecheck".to_owned(), "s", 2, inn),
+                ("rtreedepth".to_owned(), "s", 1, det_inn),
+                ("rtreenode".to_owned(), "s", 2, det_inn),
+                ("snippet".to_owned(), "s", 6, inn),
+            ]);
+        } else {
+            for overloads in self.scalars.values() {
+                for def in overloads {
+                    out.push((
+                        def.name.clone(),
+                        "s",
+                        def.arity.map_or(-1, |a| a as i64),
+                        i64::from(def.flags.0),
+                    ));
+                }
             }
         }
         for overloads in self.aggregates.values() {
@@ -781,6 +1054,12 @@ impl CommitCoordinatorHooks {
     /// Sets or clears the connection rollback hook (`sqlite3_rollback_hook`).
     pub fn set_rollback_hook(&mut self, hook: Option<RollbackHookCallback>) {
         self.rollback_hook = hook;
+    }
+
+    /// Returns `true` if a commit hook is currently registered.
+    #[inline]
+    pub const fn has_commit_hook(&self) -> bool {
+        self.commit_hook.is_some()
     }
 
     /// Returns `true` if a rollback hook is currently registered.

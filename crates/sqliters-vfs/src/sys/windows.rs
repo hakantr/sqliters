@@ -843,6 +843,24 @@ impl SysMapView {
     }
 
     #[inline]
+    pub(crate) fn load_u32_words<const N: usize>(
+        &self,
+        subrange_offset: usize,
+        region_index: u32,
+        rel_offset: usize,
+        ordering: Ordering,
+    ) -> Result<[u32; N]> {
+        let mut out = [0u32; N];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let off = rel_offset
+                .checked_add(i * 4)
+                .ok_or_else(|| SqliteError::misuse("WAL-index relative offset overflow"))?;
+            *slot = self.load_u32(subrange_offset, region_index, off, ordering)?;
+        }
+        Ok(out)
+    }
+
+    #[inline]
     pub(crate) fn store_u32(
         &self,
         subrange_offset: usize,

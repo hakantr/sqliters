@@ -1,0 +1,8 @@
+[package]
+name = "sqliters-simd"
+description = "Safe-API hardware SIMD kernels (x86_64 SSE2/AVX2 intrinsics with scalar fallback) for sqliters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

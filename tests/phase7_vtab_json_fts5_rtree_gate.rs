@@ -424,7 +424,16 @@ fn phase7_gate_1_capability_crate_dag_and_manifest_audit() {
             if cargo_toml.is_file() {
                 let deps = parse_cargo_workspace_deps(&cargo_toml);
                 dag.insert(crate_name.clone(), deps);
-                if crate_name != "sqliters-vfs" {
+                if crate_name == "sqliters-asm" || crate_name == "sqliters-simd" {
+                    let entry_rs = entry.path().join("src/lib.rs");
+                    let src = fs::read_to_string(&entry_rs).expect("read leaf crate lib.rs");
+                    assert!(
+                        src.contains("#![allow(unsafe_code)]")
+                            && src.contains("#![deny(unsafe_op_in_unsafe_fn)]"),
+                        "leaf crate {} must declare #![allow(unsafe_code)] and #![deny(unsafe_op_in_unsafe_fn)]",
+                        entry_rs.display()
+                    );
+                } else if crate_name != "sqliters-vfs" {
                     let entry_rs = if entry.path().join("src/lib.rs").is_file() {
                         entry.path().join("src/lib.rs")
                     } else {
@@ -433,7 +442,7 @@ fn phase7_gate_1_capability_crate_dag_and_manifest_audit() {
                     let src = fs::read_to_string(&entry_rs).expect("read crate root rs");
                     assert!(
                         src.contains("#![forbid(unsafe_code)]"),
-                        "non-VFS crate {} must declare #![forbid(unsafe_code)]",
+                        "non-VFS/leaf crate {} must declare #![forbid(unsafe_code)]",
                         entry_rs.display()
                     );
                 }
@@ -444,14 +453,33 @@ fn phase7_gate_1_capability_crate_dag_and_manifest_audit() {
         has_acyclic_dag(&dag),
         "workspace crate graph must be acyclic"
     );
+    if let Some(asm_deps) = dag.get("sqliters-asm") {
+        assert!(
+            asm_deps.is_empty(),
+            "sqliters-asm must be a 0-dependency leaf crate"
+        );
+    }
+    if let Some(simd_deps) = dag.get("sqliters-simd") {
+        assert!(
+            simd_deps.is_empty(),
+            "sqliters-simd must be a 0-dependency leaf crate"
+        );
+    }
     assert!(
-        dag["sqliters-types"].is_empty(),
-        "sqliters-types must have 0 dependencies"
+        dag["sqliters-types"].is_subset(&BTreeSet::from([
+            "sqliters-asm".to_owned(),
+            "sqliters-simd".to_owned(),
+        ])),
+        "sqliters-types must depend at most on leaf sqliters-asm/sqliters-simd"
     );
-    assert_eq!(
-        dag["sqliters-ext"],
-        BTreeSet::from(["sqliters-types".to_owned()]),
-        "sqliters-ext must depend solely on sqliters-types"
+    assert!(
+        dag["sqliters-ext"].contains("sqliters-types")
+            && dag["sqliters-ext"].is_subset(&BTreeSet::from([
+                "sqliters-types".to_owned(),
+                "sqliters-asm".to_owned(),
+                "sqliters-simd".to_owned(),
+            ])),
+        "sqliters-ext must depend solely on sqliters-types (and optional leaf sqliters-asm/sqliters-simd)"
     );
     assert!(
         !dag["sqliters-vdbe"].contains("sqliters-core")

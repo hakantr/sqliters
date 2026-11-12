@@ -217,6 +217,83 @@ impl TextEncoding {
     }
 }
 
+/// Folds ASCII uppercase bytes `'A'..='Z'` (`0x41..=0x5A`) to lowercase (`0x61..=0x7A`) across
+/// all 8 byte lanes of `x` in parallel without cross-byte carry or non-ASCII (`>= 0x80`) mutation.
+#[inline(always)]
+pub const fn swar_fold_ascii_lower_u64(x: u64) -> u64 {
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const L7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    let l = x & L7;
+    let t1 = l.wrapping_add(0x3f3f_3f3f_3f3f_3f3f);
+    let t2 = l.wrapping_add(0x2525_2525_2525_2525);
+    let upper = t1 & !t2 & !x & HI;
+    x | (upper >> 2)
+}
+
+/// Compares two byte slices under SQLite's ASCII-only `NOCASE` rules using 64-bit big-endian
+/// SWAR case-folding (`swar_fold_ascii_lower_u64`).
+#[inline]
+pub fn swar_cmp_nocase_bytes(a: &[u8], b: &[u8]) -> Ordering {
+    let min_len = a.len().min(b.len());
+    if min_len >= 8 {
+        let mut pos = 0usize;
+        while pos + 8 <= min_len {
+            let sa = &a[pos..pos + 8];
+            let sb = &b[pos..pos + 8];
+            let wa = u64::from_be_bytes([sa[0], sa[1], sa[2], sa[3], sa[4], sa[5], sa[6], sa[7]]);
+            let wb = u64::from_be_bytes([sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], sb[6], sb[7]]);
+            if wa != wb {
+                let fa = swar_fold_ascii_lower_u64(wa);
+                let fb = swar_fold_ascii_lower_u64(wb);
+                if fa != fb {
+                    return fa.cmp(&fb);
+                }
+            }
+            pos += 8;
+        }
+        if pos < min_len {
+            let t = min_len - 8;
+            let sa = &a[t..min_len];
+            let sb = &b[t..min_len];
+            let wa = u64::from_be_bytes([sa[0], sa[1], sa[2], sa[3], sa[4], sa[5], sa[6], sa[7]]);
+            let wb = u64::from_be_bytes([sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], sb[6], sb[7]]);
+            if wa != wb {
+                let fa = swar_fold_ascii_lower_u64(wa);
+                let fb = swar_fold_ascii_lower_u64(wb);
+                if fa != fb {
+                    return fa.cmp(&fb);
+                }
+            }
+        }
+        return a.len().cmp(&b.len());
+    }
+    if min_len >= 4 {
+        let t = min_len - 4;
+        let wa0 = u32::from_be_bytes([a[0], a[1], a[2], a[3]]);
+        let wb0 = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+        let wa1 = u32::from_be_bytes([a[t], a[t + 1], a[t + 2], a[t + 3]]);
+        let wb1 = u32::from_be_bytes([b[t], b[t + 1], b[t + 2], b[t + 3]]);
+        let pa = (u64::from(wa0) << 32) | u64::from(wa1);
+        let pb = (u64::from(wb0) << 32) | u64::from(wb1);
+        if pa != pb {
+            let fa = swar_fold_ascii_lower_u64(pa);
+            let fb = swar_fold_ascii_lower_u64(pb);
+            if fa != fb {
+                return fa.cmp(&fb);
+            }
+        }
+        return a.len().cmp(&b.len());
+    }
+    for i in 0..min_len {
+        let la = a[i].to_ascii_lowercase();
+        let lb = b[i].to_ascii_lowercase();
+        if la != lb {
+            return la.cmp(&lb);
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
 /// Built-in SQLite collating sequences (`BINARY`, `NOCASE`, `RTRIM`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Collation {
@@ -249,7 +326,7 @@ impl Collation {
     pub fn compare_str_with_encoding(self, a: &str, b: &str, enc: TextEncoding) -> Ordering {
         match self {
             Self::Binary => match enc {
-                TextEncoding::Utf8 => a.as_bytes().cmp(b.as_bytes()),
+                TextEncoding::Utf8 => sqliters_asm::cmp_bytes_binary(a.as_bytes(), b.as_bytes()),
                 TextEncoding::Utf16Le => {
                     let mut ia = a.encode_utf16();
                     let mut ib = b.encode_utf16();
@@ -282,20 +359,19 @@ impl Collation {
                 }
             },
             Self::NoCase => {
-                for (&ba, &bb) in a.as_bytes().iter().zip(b.as_bytes().iter()) {
-                    let la = ba.to_ascii_lowercase();
-                    let lb = bb.to_ascii_lowercase();
-                    match la.cmp(&lb) {
-                        Ordering::Equal => continue,
-                        non_eq => return non_eq,
-                    }
+                #[cfg(target_arch = "x86_64")]
+                {
+                    sqliters_asm::cmp_bytes_ascii_nocase(a.as_bytes(), b.as_bytes())
                 }
-                a.len().cmp(&b.len())
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    swar_cmp_nocase_bytes(a.as_bytes(), b.as_bytes())
+                }
             }
             Self::RTrim => {
                 let ta = a.trim_end_matches(' ');
                 let tb = b.trim_end_matches(' ');
-                ta.as_bytes().cmp(tb.as_bytes())
+                sqliters_asm::cmp_bytes_binary(ta.as_bytes(), tb.as_bytes())
             }
         }
     }
@@ -561,7 +637,7 @@ impl Value {
             (Self::Text(_), Self::Blob(_)) => Ordering::Less,
             (Self::Blob(_), Self::Text(_)) => Ordering::Greater,
 
-            (Self::Blob(a), Self::Blob(b)) => a.cmp(b),
+            (Self::Blob(a), Self::Blob(b)) => sqliters_asm::cmp_bytes_binary(a, b),
         }
     }
 
@@ -886,4 +962,473 @@ pub fn parse_leading_f64(s: &str) -> f64 {
         }
     }
     trimmed[..end].parse::<f64>().unwrap_or(0.0)
+}
+
+/// Maximum byte length of a UTF-8 `TEXT` or `BLOB` stored inline inside [`InlineVal`].
+pub const INLINE_VAL_CAP: usize = 22;
+
+/// Maximum number of columns stored without heap allocation inside [`InlineRow`].
+pub const INLINE_ROW_COLS: usize = 4;
+
+/// Borrowed view over a single SQLite column value (`Row::get_ref`).
+#[derive(Debug, Clone, Copy)]
+pub enum ValueRef<'a> {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(&'a str),
+    Blob(&'a [u8]),
+}
+
+impl<'a> ValueRef<'a> {
+    #[inline]
+    pub const fn from_value(v: &'a Value) -> Self {
+        match v {
+            Value::Null => Self::Null,
+            Value::Integer(i) => Self::Integer(*i),
+            Value::Real(r) => Self::Real(*r),
+            Value::Text(s) => Self::Text(s.as_str()),
+            Value::Blob(b) => Self::Blob(b.as_slice()),
+        }
+    }
+
+    #[inline]
+    pub fn to_owned_value(self) -> Value {
+        match self {
+            Self::Null => Value::Null,
+            Self::Integer(i) => Value::Integer(i),
+            Self::Real(r) => Value::real(r),
+            Self::Text(s) => Value::Text(s.to_owned()),
+            Self::Blob(b) => Value::Blob(b.to_vec()),
+        }
+    }
+
+    #[inline]
+    pub fn eq_value_ref(self, other: ValueRef<'_>) -> bool {
+        match (self, other) {
+            (ValueRef::Null, ValueRef::Null) => true,
+            (ValueRef::Integer(a), ValueRef::Integer(b)) => a == b,
+            (ValueRef::Real(a), ValueRef::Real(b)) => {
+                if a == 0.0 && b == 0.0 {
+                    true
+                } else {
+                    a.total_cmp(&b) == Ordering::Equal
+                }
+            }
+            (ValueRef::Integer(i), ValueRef::Real(r))
+            | (ValueRef::Real(r), ValueRef::Integer(i)) => cmp_int_float(i, r) == Ordering::Equal,
+            (ValueRef::Text(a), ValueRef::Text(b)) => a.as_bytes() == b.as_bytes(),
+            (ValueRef::Blob(a), ValueRef::Blob(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// Zero-heap inline representation of scalar SQLite values including short UTF-8 `TEXT` and `BLOB`
+/// (`<= 22` bytes, exact 24-byte `Copy` layout).
+#[derive(Clone, Copy)]
+pub enum InlineVal {
+    Null,
+    Integer(i64),
+    Real(f64),
+    ShortText { len: u8, buf: [u8; INLINE_VAL_CAP] },
+    ShortBlob { len: u8, buf: [u8; INLINE_VAL_CAP] },
+}
+
+const _: () = assert!(std::mem::size_of::<InlineVal>() == 24);
+
+impl fmt::Debug for InlineVal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_value_ref().fmt(f)
+    }
+}
+
+impl InlineVal {
+    #[inline]
+    pub fn real(v: f64) -> Self {
+        if v.is_nan() {
+            Self::Null
+        } else {
+            Self::Real(v)
+        }
+    }
+
+    #[inline]
+    pub fn try_short_text(s: &str) -> Option<Self> {
+        let bytes = s.as_bytes();
+        if bytes.len() > INLINE_VAL_CAP {
+            return None;
+        }
+        let mut buf = [0u8; INLINE_VAL_CAP];
+        buf[..bytes.len()].copy_from_slice(bytes);
+        Some(Self::ShortText {
+            len: bytes.len() as u8,
+            buf,
+        })
+    }
+
+    #[inline]
+    pub fn try_short_blob(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() > INLINE_VAL_CAP {
+            return None;
+        }
+        let mut buf = [0u8; INLINE_VAL_CAP];
+        buf[..bytes.len()].copy_from_slice(bytes);
+        Some(Self::ShortBlob {
+            len: bytes.len() as u8,
+            buf,
+        })
+    }
+
+    #[inline]
+    pub fn try_from_value(v: &Value) -> Option<Self> {
+        match v {
+            Value::Null => Some(Self::Null),
+            Value::Integer(i) => Some(Self::Integer(*i)),
+            Value::Real(r) => Some(Self::real(*r)),
+            Value::Text(s) => Self::try_short_text(s),
+            Value::Blob(b) => Self::try_short_blob(b),
+        }
+    }
+
+    #[inline]
+    pub fn try_from_raw_field(rf: crate::RawField<'_>, enc: TextEncoding) -> Option<Self> {
+        match rf {
+            crate::RawField::Null => Some(Self::Null),
+            crate::RawField::Int(i) => Some(Self::Integer(i)),
+            crate::RawField::Float(r) => Some(Self::real(r)),
+            crate::RawField::Blob(b) => Self::try_short_blob(b),
+            crate::RawField::Text(b) => {
+                if enc == TextEncoding::Utf8 && b.len() <= INLINE_VAL_CAP {
+                    std::str::from_utf8(b).ok().and_then(Self::try_short_text)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Attempts to decode an on-disk Format-3 serial value directly into an [`InlineVal`] without
+    /// heap allocation. Returns `Ok(None)` when a `TEXT` or `BLOB` exceeds [`INLINE_VAL_CAP`], uses
+    /// non-UTF-8 database encoding, or requires UTF-8 replacement characters.
+    #[inline]
+    pub fn try_from_serial_bytes(
+        serial_type: u64,
+        buf: &[u8],
+        enc: TextEncoding,
+    ) -> Result<Option<Self>> {
+        match serial_type {
+            0 => Ok(Some(Self::Null)),
+            1 => Ok(Some(Self::Integer(i64::from(buf[0] as i8)))),
+            2 => Ok(Some(Self::Integer(i64::from(i16::from_be_bytes([
+                buf[0], buf[1],
+            ]))))),
+            3 => {
+                let sign = if (buf[0] & 0x80) != 0 { 0xff } else { 0x00 };
+                let v = i32::from_be_bytes([sign, buf[0], buf[1], buf[2]]);
+                Ok(Some(Self::Integer(i64::from(v))))
+            }
+            4 => {
+                let v = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                Ok(Some(Self::Integer(i64::from(v))))
+            }
+            5 => {
+                let sign = if (buf[0] & 0x80) != 0 { 0xff } else { 0x00 };
+                let v = i64::from_be_bytes([
+                    sign, sign, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5],
+                ]);
+                Ok(Some(Self::Integer(v)))
+            }
+            6 => {
+                let v = i64::from_be_bytes([
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                ]);
+                Ok(Some(Self::Integer(v)))
+            }
+            7 => {
+                let bits = u64::from_be_bytes([
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                ]);
+                Ok(Some(Self::real(f64::from_bits(bits))))
+            }
+            8 => Ok(Some(Self::Integer(0))),
+            9 => Ok(Some(Self::Integer(1))),
+            10 | 11 => Err(SqliteError::corrupt(format!(
+                "reserved serial type {serial_type}"
+            ))),
+            n if (n & 1) == 0 => Ok(Self::try_short_blob(buf)),
+            _ => match enc {
+                TextEncoding::Utf8 if buf.len() <= INLINE_VAL_CAP => {
+                    match std::str::from_utf8(buf) {
+                        Ok(s) => Ok(Self::try_short_text(s)),
+                        Err(_) => Ok(None),
+                    }
+                }
+                _ => Ok(None),
+            },
+        }
+    }
+
+    #[inline]
+    pub const fn as_i64(&self) -> Option<i64> {
+        match self {
+            Self::Integer(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub const fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Real(v) => Some(*v),
+            Self::Integer(v) => Some(*v as f64),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::ShortText { len, buf } => std::str::from_utf8(&buf[..*len as usize]).ok(),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_blob(&self) -> Option<&[u8]> {
+        match self {
+            Self::ShortBlob { len, buf } => Some(&buf[..*len as usize]),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_value_ref(&self) -> ValueRef<'_> {
+        match self {
+            Self::Null => ValueRef::Null,
+            Self::Integer(i) => ValueRef::Integer(*i),
+            Self::Real(r) => ValueRef::Real(*r),
+            Self::ShortText { len, buf } => {
+                ValueRef::Text(std::str::from_utf8(&buf[..*len as usize]).unwrap_or(""))
+            }
+            Self::ShortBlob { len, buf } => ValueRef::Blob(&buf[..*len as usize]),
+        }
+    }
+
+    #[inline]
+    pub fn to_value(&self) -> Value {
+        self.as_value_ref().to_owned_value()
+    }
+}
+
+/// Zero-heap inline row container holding `0..=4` [`InlineVal`] columns on the stack.
+#[derive(Debug, Clone, Copy)]
+pub struct InlineRow {
+    len: u8,
+    cols: [InlineVal; INLINE_ROW_COLS],
+}
+
+impl Default for InlineRow {
+    #[inline]
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl InlineRow {
+    #[inline]
+    pub const fn empty() -> Self {
+        Self {
+            len: 0,
+            cols: [InlineVal::Null; INLINE_ROW_COLS],
+        }
+    }
+
+    #[inline]
+    pub const fn single(v0: InlineVal) -> Self {
+        Self {
+            len: 1,
+            cols: [v0, InlineVal::Null, InlineVal::Null, InlineVal::Null],
+        }
+    }
+
+    #[inline]
+    pub const fn pair(v0: InlineVal, v1: InlineVal) -> Self {
+        Self {
+            len: 2,
+            cols: [v0, v1, InlineVal::Null, InlineVal::Null],
+        }
+    }
+
+    #[inline]
+    pub const fn from_raw_parts(len: u8, cols: [InlineVal; INLINE_ROW_COLS]) -> Self {
+        debug_assert!((len as usize) <= INLINE_ROW_COLS);
+        Self { len, cols }
+    }
+
+    #[inline]
+    pub fn push(&mut self, v: InlineVal) -> bool {
+        let idx = self.len as usize;
+        if idx >= INLINE_ROW_COLS {
+            return false;
+        }
+        self.cols[idx] = v;
+        self.len = (idx + 1) as u8;
+        true
+    }
+
+    #[inline]
+    pub fn try_from_values(values: &[Value]) -> Option<Self> {
+        if values.len() > INLINE_ROW_COLS {
+            return None;
+        }
+        let mut cols = [InlineVal::Null; INLINE_ROW_COLS];
+        for (i, v) in values.iter().enumerate() {
+            cols[i] = InlineVal::try_from_value(v)?;
+        }
+        Some(Self {
+            len: values.len() as u8,
+            cols,
+        })
+    }
+
+    #[inline]
+    pub fn try_from_runtime_values(values: &[crate::RuntimeValue]) -> Option<Self> {
+        if values.len() > INLINE_ROW_COLS {
+            return None;
+        }
+        let mut cols = [InlineVal::Null; INLINE_ROW_COLS];
+        for (i, rv) in values.iter().enumerate() {
+            cols[i] = InlineVal::try_from_value(&rv.value)?;
+        }
+        Some(Self {
+            len: values.len() as u8,
+            cols,
+        })
+    }
+
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    pub fn get(&self, idx: usize) -> Option<&InlineVal> {
+        if idx < self.len as usize {
+            Some(&self.cols[idx])
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[InlineVal] {
+        &self.cols[..self.len as usize]
+    }
+
+    pub fn to_vec_values(&self) -> Vec<Value> {
+        let n = self.len as usize;
+        let mut out = Vec::with_capacity(n);
+        for c in &self.cols[..n] {
+            out.push(c.to_value());
+        }
+        out
+    }
+
+    pub fn to_boxed_values(&self) -> Box<[Value]> {
+        self.to_vec_values().into_boxed_slice()
+    }
+}
+
+#[cfg(test)]
+mod morsel_inline_tests {
+    use super::*;
+
+    #[test]
+    fn test_inline_val_and_row_sso_ascii_multibyte_and_boundaries() {
+        // 0..=64-byte ASCII and multi-byte UTF-8 boundary checks (`INLINE_VAL_CAP == 22`)
+        for len in 0..=64usize {
+            let ascii = "a".repeat(len);
+            let v_txt = Value::Text(ascii.clone());
+            let opt_iv = InlineVal::try_from_value(&v_txt);
+            if len <= INLINE_VAL_CAP {
+                let iv = opt_iv.expect("<= 22B ASCII must fit inline");
+                assert_eq!(iv.as_str(), Some(ascii.as_str()));
+                assert!(iv.as_value_ref().eq_value_ref(ValueRef::Text(&ascii)));
+                assert_eq!(iv.to_value(), v_txt);
+            } else {
+                assert!(opt_iv.is_none(), "> 22B ASCII must spill to heap");
+            }
+
+            let blob = vec![0xA5u8; len];
+            let v_blob = Value::Blob(blob.clone());
+            let opt_ib = InlineVal::try_from_value(&v_blob);
+            if len <= INLINE_VAL_CAP {
+                let ib = opt_ib.expect("<= 22B BLOB must fit inline");
+                assert_eq!(ib.as_blob(), Some(blob.as_slice()));
+                assert!(ib.as_value_ref().eq_value_ref(ValueRef::Blob(&blob)));
+                assert_eq!(ib.to_value(), v_blob);
+            } else {
+                assert!(opt_ib.is_none(), "> 22B BLOB must spill to heap");
+            }
+        }
+
+        // Multi-byte UTF-8 strings (2-byte Turkish, 3-byte symbols, 4-byte emoji) up to 64 bytes
+        let samples = [
+            "",
+            "ç",
+            "çğıöşü",               // 12 bytes
+            "çğıöşü🦀🦀!",          // 21 bytes
+            "çğıöşü🦀🦀!!",         // 22 bytes (exact SSO cap)
+            "çğıöşü🦀🦀!!!",        // 23 bytes (1 over cap)
+            &"ğüşıöç🦀€".repeat(6), // > 64 bytes
+        ];
+        for s in samples {
+            let opt = InlineVal::try_short_text(s);
+            if s.len() <= INLINE_VAL_CAP {
+                let iv = opt.unwrap();
+                assert_eq!(iv.as_str(), Some(s));
+                assert_eq!(iv.to_value(), Value::Text(s.to_owned()));
+            } else {
+                assert!(opt.is_none());
+            }
+        }
+
+        // Null, Integer, Real (-0.0, NaN canonicalization), and ValueRef numeric equality
+        assert_eq!(InlineVal::Null.to_value(), Value::Null);
+        assert_eq!(InlineVal::Integer(i64::MIN).as_i64(), Some(i64::MIN));
+        let neg_zero = InlineVal::real(-0.0);
+        assert!(InlineVal::real(f64::NAN).to_value().is_null());
+        assert!(
+            ValueRef::Integer(42).eq_value_ref(ValueRef::Real(42.0))
+                && neg_zero.as_value_ref().eq_value_ref(ValueRef::Integer(0))
+        );
+
+        // 0..=8 columns in InlineRow::try_from_values (`INLINE_ROW_COLS == 4`)
+        for ncols in 0..=8usize {
+            let vals: Vec<Value> = (0..ncols)
+                .map(|i| match i % 5 {
+                    0 => Value::Null,
+                    1 => Value::Integer(i as i64 * -17),
+                    2 => Value::real(i as f64 + 0.5),
+                    3 => Value::Text(format!("t-{i}-çğ")),
+                    _ => Value::Blob(vec![i as u8; 4]),
+                })
+                .collect();
+            let ir = InlineRow::try_from_values(&vals);
+            if ncols <= INLINE_ROW_COLS {
+                let row = ir.expect("<= 4 cols must fit InlineRow");
+                assert_eq!(row.len(), ncols);
+                assert_eq!(row.is_empty(), ncols == 0);
+                assert_eq!(row.to_vec_values(), vals);
+            } else {
+                assert!(ir.is_none(), "> 4 cols must spill to heap");
+            }
+        }
+    }
 }

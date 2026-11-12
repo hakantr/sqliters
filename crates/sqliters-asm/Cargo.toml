@@ -1,0 +1,12 @@
+[package]
+name = "sqliters-asm"
+description = "Zero-dependency leaf crate encapsulating hand-written inline x86-64 assembly kernels behind safe slice-validated APIs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints.rust]
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+
+[dependencies]

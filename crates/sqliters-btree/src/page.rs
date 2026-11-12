@@ -577,7 +577,14 @@ pub fn find_table_interior_child(
                 "invalid table interior cell offset {off} on page {pgno}"
             )));
         }
-        let (key, _) = get_varint_i64(&raw[off + 4..usable])?;
+        let b0 = raw[off + 4];
+        let key = if b0 < 0x80 {
+            i64::from(b0)
+        } else if off + 6 <= usable && raw[off + 5] < 0x80 {
+            (i64::from(b0 & 0x7f) << 7) | i64::from(raw[off + 5])
+        } else {
+            get_varint_i64(&raw[off + 4..usable])?.0
+        };
         if key < rowid {
             lo = mid + 1;
         } else {
@@ -906,6 +913,55 @@ pub fn raw_page_free_space(
     true
 }
 
+/// Searches the Format-3 freeblock chain starting at `hdr_off + 1` for a block of size `>= need_len`,
+/// allocating from the high end of the block (matching `allocateSpace` in `btree.c`) so pages do not
+/// prematurely exhaust `content_top` during repeated `UPDATE`s.
+#[inline]
+pub fn raw_page_alloc_freeblock(
+    raw: &mut [u8],
+    hdr_off: usize,
+    usable: usize,
+    need_len: usize,
+) -> Option<usize> {
+    if need_len < 4 || hdr_off + 8 > usable {
+        return None;
+    }
+    let raw_top = u16::from_be_bytes([raw[hdr_off + 5], raw[hdr_off + 6]]) as usize;
+    let content_top = if raw_top == 0 { 65_536 } else { raw_top };
+    let mut prev_ptr = hdr_off + 1;
+    let mut fb = u16::from_be_bytes([raw[prev_ptr], raw[prev_ptr + 1]]) as usize;
+    let mut hops = 0usize;
+    while fb != 0 && hops < 16_384 {
+        if fb < content_top || fb > usable.saturating_sub(4) || fb <= prev_ptr {
+            return None;
+        }
+        let next_fb = u16::from_be_bytes([raw[fb], raw[fb + 1]]) as usize;
+        let fb_sz = u16::from_be_bytes([raw[fb + 2], raw[fb + 3]]) as usize;
+        if fb_sz < 4 || fb + fb_sz > usable {
+            return None;
+        }
+        if fb_sz >= need_len {
+            let rem = fb_sz - need_len;
+            if rem < 4 {
+                let cur_frag = usize::from(raw[hdr_off + 7]);
+                if cur_frag + rem <= 60 {
+                    raw[prev_ptr..prev_ptr + 2].copy_from_slice(&(next_fb as u16).to_be_bytes());
+                    raw[hdr_off + 7] = (cur_frag + rem) as u8;
+                    raw[fb..fb + rem].fill(0);
+                    return Some(fb + rem);
+                }
+            } else {
+                raw[fb + 2..fb + 4].copy_from_slice(&(rem as u16).to_be_bytes());
+                return Some(fb + rem);
+            }
+        }
+        prev_ptr = fb;
+        fb = next_fb;
+        hops += 1;
+    }
+    None
+}
+
 /// Compacts all live cells on a raw `TableLeaf` (`0x0d`) or `IndexLeaf` (`0x0a`) page into a single
 /// contiguous cell-content area (`first_fb = 0`, `frag = 0`), using a 4 KiB stack buffer when
 /// `usable_size <= 4096` (zero heap allocation).
@@ -1067,7 +1123,13 @@ pub fn probe_insert_table_leaf_raw(
         if off + old_cell_len > usable {
             return TableLeafInsertProbe::DuplicateNeedsFallback;
         }
-        if cell_len == old_cell_len || ptr_end + cell_len <= content_top {
+        if cell_len == old_cell_len
+            || ptr_end + cell_len <= content_top
+            || (cell_len < old_cell_len
+                && (old_cell_len - cell_len >= 4
+                    || off == content_top
+                    || usize::from(frag) + (old_cell_len - cell_len) <= 60))
+        {
             return TableLeafInsertProbe::Replace {
                 idx,
                 old_off: off,
@@ -1212,13 +1274,75 @@ pub fn apply_replace_table_leaf_raw(
         return;
     }
 
+    if let Some(fb_off) = raw_page_alloc_freeblock(raw, hdr_off, usable, new_cell_len) {
+        let mut pos = fb_off;
+        pos += put_varint(&mut raw[pos..], payload.len() as u64);
+        pos += put_varint(&mut raw[pos..], rowid as u64);
+        raw[pos..pos + payload.len()].copy_from_slice(payload);
+        pos += payload.len();
+        while pos < fb_off + new_cell_len {
+            raw[pos] = 0;
+            pos += 1;
+        }
+        let ip = ptr_base + 2 * idx;
+        raw[ip..ip + 2].copy_from_slice(&(fb_off as u16).to_be_bytes());
+        return;
+    }
+
     // Note: `raw_page_free_space` may have increased `hdr[5..7]` if `old_off == content_top`!
+    let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
+    let ptr_end = ptr_base + 2 * n_cell;
     let raw_top_after = u16::from_be_bytes([raw[hdr_off + 5], raw[hdr_off + 6]]) as usize;
-    let cur_top_after = if raw_top_after == 0 {
+    let mut cur_top_after = if raw_top_after == 0 {
         65_536
     } else {
         raw_top_after
     };
+    if ptr_end + new_cell_len > cur_top_after {
+        // Zero out `idx` temporarily during defragment? Instead, point `idx` to a dummy? No: `idx` was already freed!
+        // Because `raw_page_free_space` succeeded, if `new_cell_len <= old_cell_len` and `fb_off` was None only due to
+        // `frag + rem > 60`, compacting the other `n_cell - 1` cells reclaims all fragmented bytes cleanly!
+        let mut ptrs = [0u16; 2048];
+        if n_cell <= ptrs.len() {
+            let mut scratch = [0u8; 4096];
+            let mut heap_scratch = Vec::new();
+            let buf: &mut [u8] = if usable <= 4096 {
+                &mut scratch[..usable]
+            } else {
+                heap_scratch.resize(usable, 0);
+                &mut heap_scratch[..usable]
+            };
+            let bounds = PayloadBounds::for_table_leaf(usable_size);
+            let mut new_c_top = usable;
+            for (j, ptr_slot) in ptrs.iter_mut().enumerate().take(n_cell) {
+                if j == idx {
+                    continue;
+                }
+                let p = ptr_base + 2 * j;
+                let c_off = u16::from_be_bytes([raw[p], raw[p + 1]]) as usize;
+                let (p_u64, n1) = get_varint(&raw[c_off..usable]).unwrap_or((0, 1));
+                let (_, n2) = get_varint_i64(&raw[c_off + n1..usable]).unwrap_or((0, 1));
+                let tot = p_u64 as u32;
+                let loc = bounds.local_len(tot);
+                let has_ovfl = (loc as u32) < tot;
+                let c_len = (n1 + n2 + loc + if has_ovfl { 4 } else { 0 }).max(4);
+                new_c_top -= c_len;
+                buf[new_c_top..new_c_top + c_len].copy_from_slice(&raw[c_off..c_off + c_len]);
+                *ptr_slot = new_c_top as u16;
+            }
+            raw[ptr_end..new_c_top].fill(0);
+            raw[new_c_top..usable].copy_from_slice(&buf[new_c_top..usable]);
+            for (j, &new_ptr) in ptrs[..n_cell].iter().enumerate() {
+                if j != idx {
+                    let p = ptr_base + 2 * j;
+                    raw[p..p + 2].copy_from_slice(&new_ptr.to_be_bytes());
+                }
+            }
+            raw[hdr_off + 1..hdr_off + 3].fill(0);
+            raw[hdr_off + 7] = 0;
+            cur_top_after = new_c_top;
+        }
+    }
     let new_top = cur_top_after - new_cell_len;
     let mut pos = new_top;
     pos += put_varint(&mut raw[pos..], payload.len() as u64);
@@ -2272,45 +2396,64 @@ pub enum RawLeafDeleteOutcome {
     Fallback,
 }
 
-/// Attempts an in-place deletion from a raw `TableLeaf` (`0x0d`) page in O(log N) search + O(1) freeblock link.
-pub fn try_delete_table_leaf_in_place(
+/// Outcome of probing a `TableLeaf` (`0x0d`) page for a `rowid` deletion.
+#[derive(Debug, Clone, Copy)]
+pub enum TableLeafDeleteProbe {
+    NotFound,
+    Found {
+        idx: usize,
+        n_cell: usize,
+        cell_off: usize,
+        cell_len: usize,
+        payload_start: usize,
+        local_len: usize,
+        total_payload_len: u32,
+        overflow_page: Option<Pgno>,
+    },
+    Fallback,
+}
+
+/// Read-only O(log N) binary-search probe on a `TableLeaf` (`0x0d`) page locating `rowid`
+/// and returning both its payload span and cell freeblock bounds without dirtying the page.
+pub fn probe_delete_table_leaf_raw(
     pgno: Pgno,
     usable_size: u32,
-    raw: &mut [u8],
+    raw: &[u8],
     rowid: i64,
-    is_root: bool,
-) -> Result<RawLeafDeleteOutcome> {
+) -> Result<TableLeafDeleteProbe> {
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
-    if raw[hdr_off] != BtreePageType::TableLeaf as u8 || raw[hdr_off + 7] > 60 {
-        return Ok(RawLeafDeleteOutcome::Fallback);
+    if hdr_off + 8 > usable
+        || raw[hdr_off] != BtreePageType::TableLeaf as u8
+        || raw[hdr_off + 7] > 60
+    {
+        return Ok(TableLeafDeleteProbe::Fallback);
     }
 
     let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
     if n_cell == 0 {
-        return Ok(RawLeafDeleteOutcome::NotFound);
+        return Ok(TableLeafDeleteProbe::NotFound);
     }
     let ptr_base = hdr_off + 8;
     let ptr_end = ptr_base + 2 * n_cell;
     if ptr_end > usable {
-        return Ok(RawLeafDeleteOutcome::Fallback);
+        return Ok(TableLeafDeleteProbe::Fallback);
     }
     let raw_top = u16::from_be_bytes([raw[hdr_off + 5], raw[hdr_off + 6]]) as usize;
     let content_top = if raw_top == 0 { 65_536 } else { raw_top };
     if content_top > usable || content_top < ptr_end {
-        return Ok(RawLeafDeleteOutcome::Fallback);
+        return Ok(TableLeafDeleteProbe::Fallback);
     }
 
     let mut lo = 0usize;
     let mut hi = n_cell;
-    let mut found: Option<(usize, usize, usize, Option<Pgno>)> = None;
     let bounds = PayloadBounds::for_table_leaf(usable_size);
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         let p = ptr_base + 2 * mid;
         let off = u16::from_be_bytes([raw[p], raw[p + 1]]) as usize;
         if off < content_top || off >= usable {
-            return Ok(RawLeafDeleteOutcome::Fallback);
+            return Ok(TableLeafDeleteProbe::Fallback);
         }
         let slice = &raw[off..usable];
         let (payload_u64, n1) = get_varint(slice)?;
@@ -2326,7 +2469,7 @@ pub fn try_delete_table_leaf_in_place(
                 let body_end = n1 + n2 + local_len;
                 let cell_len = (body_end + if has_ovfl { 4 } else { 0 }).max(4);
                 if off + cell_len > usable {
-                    return Ok(RawLeafDeleteOutcome::Fallback);
+                    return Ok(TableLeafDeleteProbe::Fallback);
                 }
                 let ovfl = if has_ovfl {
                     Some(u32::from_be_bytes([
@@ -2338,22 +2481,47 @@ pub fn try_delete_table_leaf_in_place(
                 } else {
                     None
                 };
-                found = Some((mid, off, cell_len, ovfl));
-                break;
+                return Ok(TableLeafDeleteProbe::Found {
+                    idx: mid,
+                    n_cell,
+                    cell_off: off,
+                    cell_len,
+                    payload_start: off + n1 + n2,
+                    local_len,
+                    total_payload_len,
+                    overflow_page: ovfl,
+                });
             }
         }
     }
 
-    let Some((idx, cell_off, cell_len, overflow_page)) = found else {
-        return Ok(RawLeafDeleteOutcome::NotFound);
-    };
+    Ok(TableLeafDeleteProbe::NotFound)
+}
 
+/// Applies an already-probed `TableLeaf` cell deletion in O(1) without repeating the binary search.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn apply_delete_table_leaf_in_place(
+    pgno: Pgno,
+    usable_size: u32,
+    raw: &mut [u8],
+    idx: usize,
+    n_cell: usize,
+    cell_off: usize,
+    cell_len: usize,
+    overflow_page: Option<Pgno>,
+    is_root: bool,
+) -> Result<RawLeafDeleteOutcome> {
     if n_cell == 1 && !is_root {
         return Ok(RawLeafDeleteOutcome::DeletedInPlace {
             overflow_page,
             now_empty: true,
         });
     }
+
+    let usable = usable_size as usize;
+    let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+    let ptr_base = hdr_off + 8;
 
     if idx + 1 < n_cell {
         raw.copy_within(
@@ -2379,6 +2547,38 @@ pub fn try_delete_table_leaf_in_place(
         overflow_page,
         now_empty: new_n == 0,
     })
+}
+
+/// Attempts an in-place deletion from a raw `TableLeaf` (`0x0d`) page in O(log N) search + O(1) freeblock link.
+pub fn try_delete_table_leaf_in_place(
+    pgno: Pgno,
+    usable_size: u32,
+    raw: &mut [u8],
+    rowid: i64,
+    is_root: bool,
+) -> Result<RawLeafDeleteOutcome> {
+    match probe_delete_table_leaf_raw(pgno, usable_size, raw, rowid)? {
+        TableLeafDeleteProbe::NotFound => Ok(RawLeafDeleteOutcome::NotFound),
+        TableLeafDeleteProbe::Fallback => Ok(RawLeafDeleteOutcome::Fallback),
+        TableLeafDeleteProbe::Found {
+            idx,
+            n_cell,
+            cell_off,
+            cell_len,
+            overflow_page,
+            ..
+        } => apply_delete_table_leaf_in_place(
+            pgno,
+            usable_size,
+            raw,
+            idx,
+            n_cell,
+            cell_off,
+            cell_len,
+            overflow_page,
+            is_root,
+        ),
+    }
 }
 
 /// Borrowed view of a single cell on a raw `TableLeaf` (`0x0d`) page without heap allocation.
@@ -2737,8 +2937,27 @@ pub fn binary_search_table_leaf_with_span(
             )));
         }
         let slice = &raw[off..usable];
-        let (payload_u64, n1) = get_varint(slice)?;
-        let (cell_rowid, n2) = get_varint_i64(&slice[n1..])?;
+        let (payload_u64, n1, cell_rowid, n2) = if slice.len() >= 3 && slice[0] < 0x80 {
+            let p_u64 = u64::from(slice[0]);
+            let b1 = slice[1];
+            if b1 < 0x80 {
+                (p_u64, 1usize, i64::from(b1), 1usize)
+            } else if slice[2] < 0x80 {
+                (
+                    p_u64,
+                    1usize,
+                    (i64::from(b1 & 0x7f) << 7) | i64::from(slice[2]),
+                    2usize,
+                )
+            } else {
+                let (rid, rn) = get_varint_i64(&slice[1..])?;
+                (p_u64, 1usize, rid, rn)
+            }
+        } else {
+            let (p_u64, pn) = get_varint(slice)?;
+            let (rid, rn) = get_varint_i64(&slice[pn..])?;
+            (p_u64, pn, rid, rn)
+        };
         match cell_rowid.cmp(&target_rowid) {
             std::cmp::Ordering::Less => lo = mid + 1,
             std::cmp::Ordering::Greater => hi = mid,

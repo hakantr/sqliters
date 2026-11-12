@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use sqliters::{
     Connection, OpenFlags, QueryResult, SQLITE_SOURCE_ID, SQLITE_VERSION, StepResult, Value,
-    is_complete, types::format_sqlite_real,
+    ValueRef, is_complete, types::format_sqlite_real,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,7 +242,55 @@ fn is_effectively_empty_sql(sql: &str) -> bool {
     true
 }
 
-fn process_input_stream<R: BufRead, W: Write>(
+fn coalesced_non_returning_lines_len(avail: &[u8]) -> usize {
+    let mut pos = 0usize;
+    while pos < avail.len() {
+        let Some(rel_nl) = avail[pos..].iter().position(|&b| b == b'\n') else {
+            break;
+        };
+        let line_end = pos + rel_nl + 1;
+        let Ok(line_str) = std::str::from_utf8(&avail[pos..line_end]) else {
+            break;
+        };
+        let trimmed = line_str.trim_start_matches([' ', '\t']);
+        if trimmed.starts_with('.') {
+            break;
+        }
+        if is_effectively_empty_sql(line_str) || is_pure_non_returning_batch_sql(line_str) {
+            pos = line_end;
+        } else {
+            break;
+        }
+    }
+    pos
+}
+
+trait PeekBuf: BufRead {
+    #[inline]
+    fn buffered(&self) -> &[u8] {
+        &[]
+    }
+}
+
+impl<R: io::Read> PeekBuf for BufReader<R> {
+    #[inline]
+    fn buffered(&self) -> &[u8] {
+        self.buffer()
+    }
+}
+
+impl<T: AsRef<[u8]>> PeekBuf for io::Cursor<T> {
+    #[inline]
+    fn buffered(&self) -> &[u8] {
+        let slice = self.get_ref().as_ref();
+        let pos = (self.position() as usize).min(slice.len());
+        &slice[pos..]
+    }
+}
+
+impl PeekBuf for io::StdinLock<'_> {}
+
+fn process_input_stream<R: PeekBuf, W: Write>(
     conn: &mut Connection,
     cfg: &mut ShellConfig,
     reader: &mut R,
@@ -252,6 +300,8 @@ fn process_input_stream<R: BufRead, W: Write>(
     let mut outcome = StreamOutcome::default();
     let mut sql_buf = String::new();
     let mut raw_line = String::new();
+    let mut row_scratch: Vec<u8> = Vec::with_capacity(8192);
+    let mut out_dirty = false;
 
     if interactive {
         let _ = write!(out, "sqliters> ");
@@ -259,11 +309,16 @@ fn process_input_stream<R: BufRead, W: Write>(
     }
 
     loop {
+        if out_dirty && (interactive || reader.buffered().is_empty()) {
+            let _ = out.flush();
+            out_dirty = false;
+        }
         raw_line.clear();
         let n_read = match reader.read_line(&mut raw_line) {
             Ok(n) => n,
             Err(e) => {
                 let _ = out.flush();
+                out_dirty = false;
                 eprintln!("Error: {e}");
                 outcome.err_count += 1;
                 if cfg.bail {
@@ -279,6 +334,10 @@ fn process_input_stream<R: BufRead, W: Write>(
         if sql_buf.is_empty() {
             let trimmed_start = raw_line.trim_start_matches([' ', '\t']);
             if trimmed_start.starts_with('.') {
+                if out_dirty {
+                    let _ = out.flush();
+                    out_dirty = false;
+                }
                 let cmd_line = trimmed_start.trim_end_matches(['\r', '\n']);
                 let dot_out = handle_dot_command(conn, cfg, cmd_line, out);
                 outcome.err_count += dot_out.err_count;
@@ -305,19 +364,85 @@ fn process_input_stream<R: BufRead, W: Write>(
                 continue;
             }
 
-            if is_complete(&raw_line) {
-                if let Err(e) = execute_sql_buffer(conn, cfg, &raw_line, out) {
+            if !interactive && is_pure_non_returning_batch_sql(&raw_line) {
+                let mut bailed_now = false;
+                match conn.execute_non_returning_lines(&raw_line, |e| {
                     let _ = out.flush();
+                    out_dirty = false;
                     eprintln!("Error: {e}");
                     outcome.err_count += 1;
-                    if cfg.bail {
+                    cfg.bail
+                }) {
+                    Ok(true) => {
                         outcome.bailed = true;
                         return outcome;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        let _ = out.flush();
+                        out_dirty = false;
+                        eprintln!("Error: {e}");
+                        outcome.err_count += 1;
+                        if cfg.bail {
+                            outcome.bailed = true;
+                            return outcome;
+                        }
+                    }
+                }
+                let coalesced_len = coalesced_non_returning_lines_len(reader.buffered());
+                if coalesced_len > 0 {
+                    let batch_res = {
+                        let avail = &reader.buffered()[..coalesced_len];
+                        let batch_str = std::str::from_utf8(avail)
+                            .expect("coalesced_non_returning_lines_len validated UTF-8");
+                        conn.execute_non_returning_lines(batch_str, |e| {
+                            let _ = out.flush();
+                            out_dirty = false;
+                            eprintln!("Error: {e}");
+                            outcome.err_count += 1;
+                            cfg.bail
+                        })
+                    };
+                    reader.consume(coalesced_len);
+                    match batch_res {
+                        Ok(true) => bailed_now = true,
+                        Ok(false) => {}
+                        Err(e) => {
+                            let _ = out.flush();
+                            out_dirty = false;
+                            eprintln!("Error: {e}");
+                            outcome.err_count += 1;
+                            if cfg.bail {
+                                bailed_now = true;
+                            }
+                        }
+                    }
+                }
+                if bailed_now {
+                    outcome.bailed = true;
+                    return outcome;
+                }
+                continue;
+            }
+
+            if is_complete(&raw_line) {
+                match execute_sql_buffer(conn, cfg, &raw_line, out, &mut row_scratch) {
+                    Ok(wrote) => out_dirty |= wrote,
+                    Err(e) => {
+                        let _ = out.flush();
+                        out_dirty = false;
+                        eprintln!("Error: {e}");
+                        outcome.err_count += 1;
+                        if cfg.bail {
+                            outcome.bailed = true;
+                            return outcome;
+                        }
                     }
                 }
                 if interactive {
                     let _ = write!(out, "sqliters> ");
                     let _ = out.flush();
+                    out_dirty = false;
                 }
                 continue;
             }
@@ -326,6 +451,7 @@ fn process_input_stream<R: BufRead, W: Write>(
             if interactive {
                 let _ = write!(out, "   ...> ");
                 let _ = out.flush();
+                out_dirty = false;
             }
             continue;
         }
@@ -338,41 +464,56 @@ fn process_input_stream<R: BufRead, W: Write>(
             if interactive {
                 let _ = write!(out, "sqliters> ");
                 let _ = out.flush();
+                out_dirty = false;
             }
             continue;
         }
 
         if is_complete(&sql_buf) {
-            if let Err(e) = execute_sql_buffer(conn, cfg, &sql_buf, out) {
-                let _ = out.flush();
-                eprintln!("Error: {e}");
-                outcome.err_count += 1;
-                if cfg.bail {
-                    outcome.bailed = true;
-                    return outcome;
+            match execute_sql_buffer(conn, cfg, &sql_buf, out, &mut row_scratch) {
+                Ok(wrote) => out_dirty |= wrote,
+                Err(e) => {
+                    let _ = out.flush();
+                    out_dirty = false;
+                    eprintln!("Error: {e}");
+                    outcome.err_count += 1;
+                    if cfg.bail {
+                        outcome.bailed = true;
+                        return outcome;
+                    }
                 }
             }
             sql_buf.clear();
             if interactive {
                 let _ = write!(out, "sqliters> ");
                 let _ = out.flush();
+                out_dirty = false;
             }
         } else if interactive {
             let _ = write!(out, "   ...> ");
             let _ = out.flush();
+            out_dirty = false;
         }
     }
 
     if !is_effectively_empty_sql(&sql_buf) {
         sql_buf.push(';');
-        if let Err(e) = execute_sql_buffer(conn, cfg, &sql_buf, out) {
-            let _ = out.flush();
-            eprintln!("Parse error: {e}");
-            outcome.err_count += 1;
-            if cfg.bail {
-                outcome.bailed = true;
+        match execute_sql_buffer(conn, cfg, &sql_buf, out, &mut row_scratch) {
+            Ok(wrote) => out_dirty |= wrote,
+            Err(e) => {
+                let _ = out.flush();
+                out_dirty = false;
+                eprintln!("Parse error: {e}");
+                outcome.err_count += 1;
+                if cfg.bail {
+                    outcome.bailed = true;
+                }
             }
         }
+    }
+
+    if out_dirty {
+        let _ = out.flush();
     }
 
     outcome
@@ -397,10 +538,18 @@ fn execute_shell_input<W: Write>(
         return Ok(());
     }
     if !input.contains('\n') && !input.contains('\r') && is_complete(input) {
-        if let Err(e) = execute_sql_buffer(conn, cfg, input, out) {
-            let _ = out.flush();
-            eprintln!("Error: {e}");
-            return Err(ExitCode::from(1));
+        let mut row_scratch: Vec<u8> = Vec::with_capacity(512);
+        match execute_sql_buffer(conn, cfg, input, out, &mut row_scratch) {
+            Ok(wrote) => {
+                if wrote {
+                    let _ = out.flush();
+                }
+            }
+            Err(e) => {
+                let _ = out.flush();
+                eprintln!("Error: {e}");
+                return Err(ExitCode::from(1));
+            }
         }
         return Ok(());
     }
@@ -412,14 +561,15 @@ fn execute_shell_input<W: Write>(
     Ok(())
 }
 
-/// Returns `true` when every statement in `sql` is a semicolon-terminated non-returning DML or
-/// transaction-control statement (`INSERT`, `REPLACE`, `UPDATE`, `DELETE`, `BEGIN`, `COMMIT`,
-/// `END`, `ROLLBACK`) containing no unquoted `RETURNING` keyword, so it never emits result rows or
-/// column headers and can be executed directly via [`Connection::execute_batch`].
-fn is_pure_non_returning_batch_sql(sql: &str) -> bool {
+/// Returns the byte length of the longest leading prefix of complete semicolon-terminated
+/// non-returning DML or transaction-control statements (`INSERT`, `REPLACE`, `UPDATE`, `DELETE`,
+/// `BEGIN`, `COMMIT`, `END`, `ROLLBACK`) containing no unquoted `RETURNING` keyword, allowing
+/// contiguous DML batches inside mixed SQL scripts (`W14`) to execute directly via
+/// [`Connection::execute_batch`].
+fn pure_non_returning_prefix_len(sql: &str) -> usize {
     let bytes = sql.as_bytes();
     let mut i = 0usize;
-    let mut saw_stmt = false;
+    let mut last_good_end = 0usize;
 
     loop {
         while i < bytes.len() {
@@ -443,18 +593,18 @@ fn is_pure_non_returning_batch_sql(sql: &str) -> bool {
                         i += 1;
                     }
                     if !closed {
-                        return false;
+                        return last_good_end;
                     }
                 }
                 _ => break,
             }
         }
         if i >= bytes.len() {
-            return saw_stmt;
+            return if last_good_end > 0 { i } else { 0 };
         }
 
         if !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
-            return false;
+            return last_good_end;
         }
         let kw_start = i;
         i += 1;
@@ -471,9 +621,8 @@ fn is_pure_non_returning_batch_sql(sql: &str) -> bool {
             || kw.eq_ignore_ascii_case(b"END")
             || kw.eq_ignore_ascii_case(b"ROLLBACK");
         if !is_dml && !is_tcl {
-            return false;
+            return last_good_end;
         }
-        saw_stmt = true;
         let mut terminated = false;
 
         while i < bytes.len() {
@@ -500,7 +649,7 @@ fn is_pure_non_returning_batch_sql(sql: &str) -> bool {
                         i += 1;
                     }
                     if !closed {
-                        return false;
+                        return last_good_end;
                     }
                 }
                 b'[' => {
@@ -509,7 +658,7 @@ fn is_pure_non_returning_batch_sql(sql: &str) -> bool {
                         i += 1;
                     }
                     if i >= bytes.len() {
-                        return false;
+                        return last_good_end;
                     }
                     i += 1;
                 }
@@ -531,7 +680,7 @@ fn is_pure_non_returning_batch_sql(sql: &str) -> bool {
                         i += 1;
                     }
                     if !closed {
-                        return false;
+                        return last_good_end;
                     }
                 }
                 c if c.is_ascii_alphabetic() || c == b'_' => {
@@ -548,16 +697,24 @@ fn is_pure_non_returning_batch_sql(sql: &str) -> bool {
                         && i - id_start == 9
                         && bytes[id_start..i].eq_ignore_ascii_case(b"RETURNING")
                     {
-                        return false;
+                        return last_good_end;
                     }
                 }
                 _ => i += 1,
             }
         }
         if !terminated {
-            return false;
+            return last_good_end;
         }
+        last_good_end = i;
     }
+}
+
+/// Returns `true` when every statement in `sql` is a semicolon-terminated non-returning DML or
+/// transaction-control statement containing no unquoted `RETURNING` keyword.
+fn is_pure_non_returning_batch_sql(sql: &str) -> bool {
+    let pfx = pure_non_returning_prefix_len(sql);
+    pfx > 0 && is_effectively_empty_sql(&sql[pfx..])
 }
 
 fn execute_sql_buffer<W: Write>(
@@ -565,91 +722,110 @@ fn execute_sql_buffer<W: Write>(
     cfg: &ShellConfig,
     mut sql: &str,
     out: &mut W,
-) -> sqliters::Result<()> {
-    if is_pure_non_returning_batch_sql(sql) {
-        return conn.execute_batch(sql);
-    }
+    row_scratch: &mut Vec<u8>,
+) -> sqliters::Result<bool> {
+    let mut wrote_any = false;
     while !is_effectively_empty_sql(sql) {
-        let mut stmt = conn.prepare(sql)?;
-        let tail_len = stmt.tail().len();
+        let pfx = pure_non_returning_prefix_len(sql);
+        if pfx > 0 {
+            conn.execute_batch(&sql[..pfx])?;
+            sql = &sql[pfx..];
+            continue;
+        }
         let cur_len = sql.len();
-        if matches!(
+        let tail_len = if matches!(
             cfg.mode,
             OutputMode::List | OutputMode::Csv | OutputMode::Line
         ) {
-            let col_names: Vec<String> = stmt.column_names().to_vec();
-            let has_cols = !col_names.is_empty();
-            let max_w = if cfg.mode == OutputMode::Line && has_cols {
-                col_names
-                    .iter()
-                    .map(|s| s.chars().count())
-                    .max()
-                    .unwrap_or(0)
-            } else {
-                0
-            };
             let mut row_idx = 0usize;
-            let step_res = (|| -> sqliters::Result<()> {
-                while let StepResult::Row(r) = stmt.step()? {
-                    if !has_cols {
-                        continue;
-                    }
-                    match cfg.mode {
-                        OutputMode::List => {
-                            if row_idx == 0 && cfg.headers {
-                                let _ = writeln!(out, "{}", col_names.join(&cfg.separator));
-                            }
-                            let sep_bytes = cfg.separator.as_bytes();
-                            for (ci, v) in r.values().iter().enumerate() {
-                                if ci > 0 {
-                                    let _ = out.write_all(sep_bytes);
-                                }
-                                write_cell_value(out, v, &cfg.null_value);
-                            }
-                            let _ = out.write_all(b"\n");
-                        }
-                        OutputMode::Csv => {
-                            if row_idx == 0 && cfg.headers {
-                                let hdr: Vec<String> =
-                                    col_names.iter().map(|s| csv_escape(s)).collect();
-                                let _ = writeln!(out, "{}", hdr.join(","));
-                            }
-                            for (ci, v) in r.values().iter().enumerate() {
-                                if ci > 0 {
-                                    let _ = out.write_all(b",");
-                                }
-                                let esc = csv_escape(&format_cell_value(v, &cfg.null_value));
-                                let _ = out.write_all(esc.as_bytes());
-                            }
-                            let _ = out.write_all(b"\n");
-                        }
-                        OutputMode::Line => {
-                            if row_idx > 0 {
-                                let _ = out.write_all(b"\n");
-                            }
-                            for (ci, v) in r.values().iter().enumerate() {
-                                let val = format_cell_value(v, &cfg.null_value);
-                                let _ = writeln!(
-                                    out,
-                                    "{:>width$} = {val}",
-                                    col_names[ci],
-                                    width = max_w
-                                );
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
-                    row_idx += 1;
+            let mut max_w: Option<usize> = None;
+            row_scratch.clear();
+            let tlen = conn.execute_cli_statement(sql, |col_names, r| {
+                if col_names.is_empty() {
+                    return;
                 }
-                Ok(())
-            })();
-            let fin_res = stmt.finalize();
-            step_res?;
-            fin_res?;
-            if row_idx > 0 {
-                let _ = out.flush();
+                let n_cells = r.len();
+                match cfg.mode {
+                    OutputMode::List => {
+                        if row_idx == 0 && cfg.headers {
+                            for (ci, name) in col_names.iter().enumerate() {
+                                if ci > 0 {
+                                    row_scratch.extend_from_slice(cfg.separator.as_bytes());
+                                }
+                                row_scratch.extend_from_slice(name.as_bytes());
+                            }
+                            row_scratch.push(b'\n');
+                        }
+                        let sep_bytes = cfg.separator.as_bytes();
+                        for ci in 0..n_cells {
+                            if ci > 0 {
+                                row_scratch.extend_from_slice(sep_bytes);
+                            }
+                            let vref = r.get_ref(ci).unwrap_or(ValueRef::Null);
+                            append_cell_value_ref(row_scratch, vref, &cfg.null_value);
+                        }
+                        row_scratch.push(b'\n');
+                        if row_scratch.len() >= 8192 {
+                            let _ = out.write_all(row_scratch);
+                            row_scratch.clear();
+                        }
+                    }
+                    OutputMode::Csv => {
+                        if row_idx == 0 && cfg.headers {
+                            for (ci, name) in col_names.iter().enumerate() {
+                                if ci > 0 {
+                                    row_scratch.push(b',');
+                                }
+                                append_csv_escaped_str(row_scratch, name);
+                            }
+                            row_scratch.push(b'\n');
+                        }
+                        for ci in 0..n_cells {
+                            if ci > 0 {
+                                row_scratch.push(b',');
+                            }
+                            let vref = r.get_ref(ci).unwrap_or(ValueRef::Null);
+                            append_csv_cell_value_ref(row_scratch, vref, &cfg.null_value);
+                        }
+                        row_scratch.push(b'\n');
+                        if row_scratch.len() >= 8192 {
+                            let _ = out.write_all(row_scratch);
+                            row_scratch.clear();
+                        }
+                    }
+                    OutputMode::Line => {
+                        let mw = *max_w.get_or_insert_with(|| {
+                            col_names
+                                .iter()
+                                .map(|s| s.chars().count())
+                                .max()
+                                .unwrap_or(0)
+                        });
+                        if row_idx > 0 {
+                            let _ = out.write_all(b"\n");
+                        }
+                        for (ci, col_name) in col_names.iter().enumerate().take(n_cells) {
+                            let vref = r.get_ref(ci).unwrap_or(ValueRef::Null);
+                            let val = format_cell_value_ref(vref, &cfg.null_value);
+                            let _ = writeln!(out, "{col_name:>mw$} = {val}");
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                row_idx += 1;
+            });
+            if !row_scratch.is_empty() {
+                let _ = out.write_all(row_scratch);
+                row_scratch.clear();
             }
+            let tlen = tlen?;
+            if row_idx > 0 {
+                wrote_any = true;
+            }
+            tlen
         } else {
+            let mut stmt = conn.prepare(sql)?;
+            let tlen = stmt.tail().len();
             let step_res = (|| -> sqliters::Result<QueryResult> {
                 let mut rows = Vec::new();
                 while let StepResult::Row(r) = stmt.step()? {
@@ -667,15 +843,16 @@ fn execute_sql_buffer<W: Write>(
                 || (cfg.headers && !qres.column_names.is_empty() && cfg.mode == OutputMode::Json)
             {
                 render_query_result(&qres, cfg, out);
-                let _ = out.flush();
+                wrote_any = true;
             }
-        }
+            tlen
+        };
         if tail_len == cur_len {
             break;
         }
         sql = &sql[(cur_len - tail_len)..];
     }
-    Ok(())
+    Ok(wrote_any)
 }
 
 /// Parses a dot-command line using C `shell.c` quoting rules (`'...'` literal, `"..."` with
@@ -1713,6 +1890,90 @@ fn write_cell_value<W: Write>(out: &mut W, v: &Value, null_str: &str) {
         Value::Blob(b) => {
             let _ = out.write_all(String::from_utf8_lossy(b).as_bytes());
         }
+    }
+}
+
+#[inline]
+fn append_i64_ascii(out: &mut Vec<u8>, i: i64) {
+    let mut buf = [0u8; 24];
+    let mut pos = buf.len();
+    let neg = i < 0;
+    let mut mag: u64 = if neg {
+        i.wrapping_neg() as u64
+    } else {
+        i as u64
+    };
+    loop {
+        pos -= 1;
+        buf[pos] = b'0' + (mag % 10) as u8;
+        mag /= 10;
+        if mag == 0 {
+            break;
+        }
+    }
+    if neg {
+        pos -= 1;
+        buf[pos] = b'-';
+    }
+    out.extend_from_slice(&buf[pos..]);
+}
+
+#[inline]
+fn append_cell_value_ref(out: &mut Vec<u8>, v: ValueRef<'_>, null_str: &str) {
+    match v {
+        ValueRef::Null => out.extend_from_slice(null_str.as_bytes()),
+        ValueRef::Integer(i) => append_i64_ascii(out, i),
+        ValueRef::Real(r) => {
+            let s = format_sqlite_real(r);
+            out.extend_from_slice(s.as_bytes());
+        }
+        ValueRef::Text(s) => out.extend_from_slice(s.as_bytes()),
+        ValueRef::Blob(b) => out.extend_from_slice(String::from_utf8_lossy(b).as_bytes()),
+    }
+}
+
+#[inline]
+fn append_csv_escaped_str(out: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    if bytes
+        .iter()
+        .any(|&b| matches!(b, b',' | b'"' | b'\n' | b'\r'))
+    {
+        out.push(b'"');
+        for &b in bytes {
+            if b == b'"' {
+                out.extend_from_slice(b"\"\"");
+            } else {
+                out.push(b);
+            }
+        }
+        out.push(b'"');
+    } else {
+        out.extend_from_slice(bytes);
+    }
+}
+
+#[inline]
+fn append_csv_cell_value_ref(out: &mut Vec<u8>, v: ValueRef<'_>, null_str: &str) {
+    match v {
+        ValueRef::Null => append_csv_escaped_str(out, null_str),
+        ValueRef::Integer(i) => append_i64_ascii(out, i),
+        ValueRef::Real(r) => {
+            let s = format_sqlite_real(r);
+            append_csv_escaped_str(out, &s);
+        }
+        ValueRef::Text(s) => append_csv_escaped_str(out, s),
+        ValueRef::Blob(b) => append_csv_escaped_str(out, &String::from_utf8_lossy(b)),
+    }
+}
+
+fn format_cell_value_ref(v: ValueRef<'_>, null_str: &str) -> String {
+    match v {
+        ValueRef::Null => null_str.to_owned(),
+        ValueRef::Integer(i) => i.to_string(),
+        ValueRef::Real(r) => format_sqlite_real(r),
+        ValueRef::Text(s) => s.to_owned(),
+        ValueRef::Blob(b) => String::from_utf8_lossy(b).into_owned(),
     }
 }
 

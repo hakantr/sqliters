@@ -101,7 +101,22 @@ impl Bitvec {
 
     /// Resets all bits to 0.
     pub fn clear_all(&mut self) {
-        self.words.fill(0);
-        self.count_set = 0;
+        if self.count_set > 0 {
+            self.words.fill(0);
+            self.count_set = 0;
+        }
+    }
+
+    /// Resets all bits to 0 and resizes upper bound to `size`, reusing existing backing capacity.
+    pub fn reset_for_size(&mut self, size: u32) {
+        if self.count_set > 0 {
+            self.words.fill(0);
+            self.count_set = 0;
+        }
+        let word_count = (size as usize).div_ceil(64);
+        if self.words.len() < word_count {
+            self.words.resize(word_count, 0);
+        }
+        self.size = size;
     }
 }

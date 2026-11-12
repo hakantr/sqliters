@@ -5,9 +5,12 @@ Renders `/home/hakanbiris/github/sqliters/benchmarks/benchmark_report.md` from a
   1. Cross-stage summary (Binary size, CPU time, Peak RSS, Geomean vs Saf Rust & vs C SQLite 3.54.1)
   2. Cross-stage `./sqltest` (126 CLI samples) & `speedbench` (W01-W14) matrices
   3. Dedicated per-branch / per-stage sections under their own headings (`## ...`), evaluating
-     `performans-swar`, `performans-simd`, `performans-asm`, and `performans-hibrit` directly
-     against Pure Safe Rust (`performans`, `03_performans_p1c`) as well as C SQLite 3.54.1
+     every experimental branch directly against Pure Safe Rust (`performans`, `03_performans_p1c`)
+     as well as C SQLite 3.54.1
   4. Optional `benchmarks/final_c_comparison_analysis.md` section for CPU & RAM root-cause analysis
+  5. Always-last standing Leaderboard ("Sürekli Güncellenen En Hızlılar Listesi") showing
+     `performans` baseline duration, every step's duration + step badge (`[Belirteç]`), the fastest
+     Rust branch per workload, and the overall fastest implementation (including C SQLite).
 """
 
 from __future__ import annotations
@@ -21,66 +24,82 @@ from typing import Any
 STAGE_META: dict[str, dict[str, str]] = {
     "00_main_baseline": {
         "short": "main",
+        "badge": "main",
         "heading": "Başlangıç Referansı: `main` Dalı (Optimizasyon Öncesi Port)",
     },
     "01_performans_p1a": {
         "short": "P1-A",
+        "badge": "P1-A",
         "heading": "`performans` (Adım P1-A) — Sanal Tablolar (`FTS5`/`R-Tree`), İkili `JSONB` ve Kayıt Karşılaştırma",
     },
     "02_performans_p1b": {
         "short": "P1-B",
+        "badge": "P1-B",
         "heading": "`performans` (Adım P1-B) — Yoğun Pager/WAL, Ham B-Tree, Sıfır Kilitli `Statement` ve CLI Veri Yükleme",
     },
     "03_performans_p1c": {
         "short": "Saf Rust (performans)",
+        "badge": "performans",
         "heading": "`performans` (Adım P1-C) — %100 Güvenli Saf Rust Tavanı (`#![forbid(unsafe_code)]`, SWAR/SIMD/ASM Yok)",
     },
     "04_performans_swar": {
         "short": "SWAR (performans-swar)",
+        "badge": "D1:SWAR",
         "heading": "Dal 1: `performans-swar` — Saf Rust'a Karşı Yazmaç-İçi SWAR Deneyi (`#![forbid(unsafe_code)]`)",
     },
     "05_performans_simd": {
         "short": "SIMD (performans-simd)",
+        "badge": "D2:SIMD",
         "heading": "Dal 2: `performans-simd` — Saf Rust'a Karşı Donanım SIMD (`core::arch` AVX2/SSE2/BMI2) Deneyi",
     },
     "06_performans_asm": {
         "short": "ASM (performans-asm)",
+        "badge": "D3:ASM",
         "heading": "Dal 3: `performans-asm` — Saf Rust'a Karşı El Yazımı Satır-İçi Assembly (`asm!`) Deneyi",
     },
     "07_performans_morsel": {
         "short": "Morsel/SSO (performans-morsel)",
+        "badge": "D4:Morsel",
         "heading": "Dal 4: `performans-morsel` — Sütunsal Mikro-Yığın (Vectorized Batch / SOA) & Sıfır-Tahsis Satır/Değer (`German-String SSO`) Deneyi",
     },
     "08_performans_io_mmap": {
         "short": "IO/mmap (performans-io-mmap)",
+        "badge": "D5:IO-mmap",
         "heading": "Dal 5: `performans-io-mmap` — Sıfır-Kopya `mmap` Okuma, Vektörel `pwritev` WAL G/Ç ve Hızlı Oturum Kapısı Deneyi",
     },
     "09_performans_pgo": {
         "short": "PGO/Derleyici (performans-pgo)",
+        "badge": "D6:PGO",
         "heading": "Dal 6: `performans-pgo` — LLVM Profil Güdümlü Optimizasyon (`PGO` + `znver4` + `build-std`/`panic=abort`) Deneyi",
     },
     "10_performans_hibrit": {
         "short": "Birleşik (performans-hibrit)",
+        "badge": "D7:Hibrit",
         "heading": "Dal 7: `performans-hibrit` — Saf Rust'a Karşı Üstünlük Kanıtlayan Tüm Yaklaşımların Birleşimi",
     },
     "11_performans_1": {
         "short": "performans-1",
+        "badge": "P3:perf-1",
         "heading": "Format Türevi 1: `performans-1` — Hizalı Sabit Ofsetli Kayıt & Yaprak Parmak İzi",
     },
     "12_performans_2": {
         "short": "performans-2",
+        "badge": "P3:perf-2",
         "heading": "Format Türevi 2: `performans-2` — PAX / Sayfa-İçi Sütunsal Yaprak Düzeni",
     },
 }
 
 
-def load_stages(bench_dir: Path) -> list[tuple[str, str, str, dict[str, Any]]]:
-    items: list[tuple[str, str, str, dict[str, Any]]] = []
+def load_stages(bench_dir: Path) -> list[tuple[str, str, str, str, dict[str, Any]]]:
+    items: list[tuple[str, str, str, str, dict[str, Any]]] = []
     for p in sorted(bench_dir.glob("[0-9][0-9]_*.json")):
         doc = json.loads(p.read_text(encoding="utf-8"))
         key = p.stem
-        meta = STAGE_META.get(key, {"short": key, "heading": f"Aşama / Dal: `{key}`"})
-        items.append((key, meta["short"], meta["heading"], doc))
+        meta = STAGE_META.get(
+            key,
+            {"short": key, "badge": key, "heading": f"Aşama / Dal: `{key}`"},
+        )
+        items.append((key, meta["short"], meta["badge"], meta["heading"], doc))
     return items
 
 
@@ -177,7 +196,6 @@ def render_stage_section(
 
     lines.append("")
 
-    # Optional kernel scope notes (included vs excluded kernels)
     scope_notes = doc.get("experiment_notes")
     if isinstance(scope_notes, dict):
         if scope_notes.get("summary"):
@@ -195,7 +213,6 @@ def render_stage_section(
                 lines.append(f"- {item}")
             lines.append("")
 
-    # Per-stage ./sqltest table
     if "sqltest_cli_command_set" in doc:
         lines.append(f"### {short_label} — `./sqltest` CLI Komut Seti (`126` Örnek, Süre & Tepe RAM)\n")
         if compare_to_pure and pure_rust_doc is not None and "sqltest_cli_command_set" in pure_rust_doc:
@@ -231,7 +248,6 @@ def render_stage_section(
                 )
         lines.append("")
 
-    # Per-stage speedbench table
     lines.append(f"### {short_label} — `speedbench` Özellik & Motor İş Yükleri (`W01`–`W14`, Süre & RAM)\n")
     if compare_to_pure and pure_rust_doc is not None:
         pr_map = {w["name"]: w for w in pure_rust_doc["workloads"]}
@@ -264,19 +280,373 @@ def render_stage_section(
     return lines
 
 
+def render_fastest_leaderboard(
+    stages: list[tuple[str, str, str, str, dict[str, Any]]],
+    pure_rust_doc: dict[str, Any] | None,
+) -> list[str]:
+    """
+    Renders the always-last standing Leaderboard section:
+      - `performans` baseline duration (`[performans]`)
+      - One column per experimental step (`04_*`..`12_*`) with `<ms> [<badge>]`
+      - Fastest Rust step (`<ms> [<badge>]`)
+      - C SQLite reference (`<ms> [C]`)
+      - Overall fastest implementation across ALL apps (`<ms> [<badge>]`)
+    Automatically updates whenever a new stage JSON is added.
+    """
+    lines: list[str] = []
+    lines.append("## Güncel En Hızlılar Listesi (Tüm Aşamalar Arası Dinamik Liderlik Tablosu)\n")
+
+    exp_stages = [
+        (k, short, badge, doc)
+        for (k, short, badge, _, doc) in stages
+        if k not in ("00_main_baseline", "01_performans_p1a", "02_performans_p1b", "03_performans_p1c")
+    ]
+    latest_doc = stages[-1][4]
+
+    legend_parts = ["`[performans]` = Saf Rust Tavanı (`03_performans_p1c`)"]
+    for _, short, badge, doc in exp_stages:
+        legend_parts.append(f"`[{badge}]` = `{doc.get('git_branch', short)}`")
+    legend_parts.append("`[C-O3]` / `[C-O2]` = C SQLite `3.54.1`")
+    lines.append(
+        "> **Otomatik Güncellenen Özet:** Bu bölüm her yeni aşama eklendiğinde tüm kayıtlı JSON ölçümlerinden otomatik yeniden üretilir. "
+        "Her hücrede ilgili adımın medyan süresi (`ms`) ve adım belirteci birlikte gösterilir.  \n"
+        "> **Belirteç Anahtarı:** " + " · ".join(legend_parts) + "\n"
+    )
+
+    if pure_rust_doc is None:
+        lines.append("_`performans` (`03_performans_p1c.json`) baz ölçümü henüz bulunamadı._\n")
+        return lines
+
+    # --- Table A: speedbench (W01..W14) ---
+    lines.append("### A. `speedbench` İş Yükleri (`W01`–`W14`) — Adım Bazlı Süreler ve En Hızlı Uygulama\n")
+    sb_hdr = ["İş Yükü", "`performans` Bazı (`ms`)"]
+    for _, _, badge, _ in exp_stages:
+        sb_hdr.append(f"`{badge}` (`ms`)")
+    sb_hdr.extend(
+        [
+            "En Hızlı Rust Adımı (`ms`)",
+            "C `-O3` (`ms`)",
+            "En Hızlı Uygulama (C Dahil)",
+        ]
+    )
+    lines.append("| " + " | ".join(sb_hdr) + " |")
+    lines.append("| :--- | ---: | " + " | ".join(["---:" for _ in exp_stages]) + " | ---: | ---: | :--- |")
+
+    pr_w_map = {w["name"]: w for w in pure_rust_doc["workloads"]}
+    latest_w_map = {w["name"]: w for w in latest_doc["workloads"]}
+    exp_w_maps = [(badge, {w["name"]: w for w in doc["workloads"]}) for (_, _, badge, doc) in exp_stages]
+
+    sum_pure_ms = 0.0
+    sum_best_rust_ms = 0.0
+    sum_c_ms = 0.0
+    sum_overall_best_ms = 0.0
+    rust_wins_over_c = 0
+
+    for w_name in [w["name"] for w in pure_rust_doc["workloads"]]:
+        pure_ms = float(pr_w_map[w_name]["rust_median_ms"])
+        c_ms = float(latest_w_map[w_name]["c_median_ms"])
+        sum_pure_ms += pure_ms
+        sum_c_ms += c_ms
+
+        rust_candidates: list[tuple[float, str]] = [(pure_ms, "performans")]
+        for badge, wmap in exp_w_maps:
+            if w_name in wmap:
+                rust_candidates.append((float(wmap[w_name]["rust_median_ms"]), badge))
+
+        best_rust_ms, best_rust_badge = min(rust_candidates, key=lambda x: x[0])
+        sum_best_rust_ms += best_rust_ms
+
+        all_candidates = rust_candidates + [(c_ms, "C-O3")]
+        best_all_ms, best_all_badge = min(all_candidates, key=lambda x: x[0])
+        sum_overall_best_ms += best_all_ms
+        if best_all_badge != "C-O3":
+            rust_wins_over_c += 1
+
+        pure_cell = (
+            f"**`{pure_ms:.2f} ms`** `[performans]`"
+            if best_rust_badge == "performans"
+            else f"`{pure_ms:.2f} ms` `[performans]`"
+        )
+        row = [f"`{w_name}`", pure_cell]
+        for badge, wmap in exp_w_maps:
+            if w_name in wmap:
+                ms = float(wmap[w_name]["rust_median_ms"])
+                if badge == best_rust_badge:
+                    row.append(f"**`{ms:.2f} ms`** `[{badge}]`")
+                else:
+                    row.append(f"`{ms:.2f} ms` `[{badge}]`")
+            else:
+                row.append("`—`")
+
+        vs_pure_ratio = best_rust_ms / pure_ms if pure_ms > 0 else 1.0
+        row.append(f"**`{best_rust_ms:.2f} ms`** `[{best_rust_badge}]` (`{vs_pure_ratio:.2f}x` baz)")
+        row.append(f"`{c_ms:.2f} ms` `[C-O3]`")
+        if best_all_badge == "C-O3":
+            row.append(
+                f"**`{best_all_ms:.2f} ms` `[C-O3]`** *(Rust: `{best_rust_ms:.2f} ms` `[{best_rust_badge}]`)*"
+            )
+        else:
+            vs_c_ratio = best_all_ms / c_ms if c_ms > 0 else 1.0
+            row.append(f"**`{best_all_ms:.2f} ms` `[{best_all_badge}]`** (`{vs_c_ratio:.2f}x` C)")
+
+        lines.append("| " + " | ".join(row) + " |")
+
+    # Summary row for speedbench totals
+    stage_totals: list[tuple[float, str]] = [
+        (float(pure_rust_doc["summary"]["sum_median_rust_ms"]), "performans")
+    ]
+    for _, _, badge, doc in exp_stages:
+        stage_totals.append((float(doc["summary"]["sum_median_rust_ms"]), badge))
+    best_stage_total_ms, best_stage_total_badge = min(stage_totals, key=lambda x: x[0])
+
+    total_row = [
+        "**Toplam (`W01`–`W14`)**",
+        f"`{sum_pure_ms:.2f} ms` `[performans]`",
+    ]
+    for _, _, badge, doc in exp_stages:
+        tot = float(doc["summary"]["sum_median_rust_ms"])
+        if badge == best_stage_total_badge:
+            total_row.append(f"**`{tot:.2f} ms`** `[{badge}]`")
+        else:
+            total_row.append(f"`{tot:.2f} ms` `[{badge}]`")
+
+    total_row.append(
+        f"**`{best_stage_total_ms:.2f} ms`** `[{best_stage_total_badge}]` "
+        f"*(Sanal zarf: `{sum_best_rust_ms:.2f} ms`)*"
+    )
+    total_row.append(f"`{sum_c_ms:.2f} ms` `[C-O3]`")
+    if best_stage_total_ms <= sum_c_ms:
+        total_row.append(
+            f"**`{best_stage_total_ms:.2f} ms` `[{best_stage_total_badge}]`** "
+            f"(`{best_stage_total_ms / sum_c_ms:.2f}x` C, `{rust_wins_over_c}/14` iş yükünde Rust lider)"
+        )
+    else:
+        total_row.append(
+            f"**`{sum_c_ms:.2f} ms` `[C-O3]`** "
+            f"*(En hızlı tekil dal: `{best_stage_total_ms:.2f} ms` `[{best_stage_total_badge}]`, "
+            f"Sanal Rust zarfı: `{sum_best_rust_ms:.2f} ms`, `{rust_wins_over_c}/14` Rust lider)*"
+        )
+    lines.append("| " + " | ".join(total_row) + " |\n")
+
+    # --- Table B: ./sqltest (7 CLI families, 126 samples) ---
+    if "sqltest_cli_command_set" in pure_rust_doc:
+        lines.append("### B. `./sqltest` Uçtan Uca CLI Aileleri (`126` Örnek) — Adım Bazlı Süreler ve En Hızlı Uygulama\n")
+        st_exp = [
+            (badge, doc["sqltest_cli_command_set"])
+            for (_, _, badge, doc) in exp_stages
+            if "sqltest_cli_command_set" in doc
+        ]
+        st_hdr = ["CLI Komut Ailesi", "`performans` Bazı (`ms`)"]
+        for badge, _ in st_exp:
+            st_hdr.append(f"`{badge}` (`ms`)")
+        st_hdr.extend(
+            [
+                "En Hızlı Rust Adımı (`ms`)",
+                "C SQLite (`ms`)",
+                "En Hızlı Uygulama (C Dahil)",
+            ]
+        )
+        lines.append("| " + " | ".join(st_hdr) + " |")
+        lines.append("| :--- | ---: | " + " | ".join(["---:" for _ in st_exp]) + " | ---: | ---: | :--- |")
+
+        pr_fams = {
+            f["family_case"]: f for f in pure_rust_doc["sqltest_cli_command_set"]["families"]
+        }
+        exp_fam_maps = [
+            (badge, {f["family_case"]: f for f in st_doc["families"]})
+            for (badge, st_doc) in st_exp
+        ]
+
+        cli_rust_wins = 0
+        for fam_name in [f["family_case"] for f in pure_rust_doc["sqltest_cli_command_set"]["families"]]:
+            pf = pr_fams[fam_name]
+            pure_ms = float(pf["candidate_median_ms"])
+            c_ms = float(pf["c_reference_median_ms"])
+
+            rust_cands: list[tuple[float, str]] = [(pure_ms, "performans")]
+            for badge, fmap in exp_fam_maps:
+                if fam_name in fmap:
+                    rust_cands.append((float(fmap[fam_name]["candidate_median_ms"]), badge))
+
+            best_r_ms, best_r_badge = min(rust_cands, key=lambda x: x[0])
+            best_all_ms, best_all_badge = min(rust_cands + [(c_ms, "C-O2")], key=lambda x: x[0])
+            if best_all_badge != "C-O2":
+                cli_rust_wins += 1
+
+            p_cell = (
+                f"**`{pure_ms:.2f} ms`** `[performans]`"
+                if best_r_badge == "performans"
+                else f"`{pure_ms:.2f} ms` `[performans]`"
+            )
+            row = [f"`{fam_name}`", p_cell]
+            for badge, fmap in exp_fam_maps:
+                if fam_name in fmap:
+                    ms = float(fmap[fam_name]["candidate_median_ms"])
+                    if badge == best_r_badge:
+                        row.append(f"**`{ms:.2f} ms`** `[{badge}]`")
+                    else:
+                        row.append(f"`{ms:.2f} ms` `[{badge}]`")
+                else:
+                    row.append("`—`")
+
+            vs_pure = best_r_ms / pure_ms if pure_ms > 0 else 1.0
+            row.append(f"**`{best_r_ms:.2f} ms`** `[{best_r_badge}]` (`{vs_pure:.2f}x` baz)")
+            row.append(f"`{c_ms:.2f} ms` `[C-O2]`")
+            if best_all_badge == "C-O2":
+                row.append(
+                    f"**`{best_all_ms:.2f} ms` `[C-O2]`** *(Rust: `{best_r_ms:.2f} ms` `[{best_r_badge}]`)*"
+                )
+            else:
+                row.append(
+                    f"**`{best_all_ms:.2f} ms` `[{best_all_badge}]`** (`{best_all_ms / c_ms:.2f}x` C)"
+                )
+            lines.append("| " + " | ".join(row) + " |")
+
+        # Geomean summary row for ./sqltest
+        pr_gm = float(pure_rust_doc["sqltest_cli_command_set"]["geometric_mean_candidate_over_c"])
+        gm_cands: list[tuple[float, str]] = [(pr_gm, "performans")]
+        for badge, st_doc in st_exp:
+            gm_cands.append((float(st_doc["geometric_mean_candidate_over_c"]), badge))
+        best_gm, best_gm_badge = min(gm_cands, key=lambda x: x[0])
+
+        gm_row = ["**Geomean (`Rust / C`)**", f"`{pr_gm:.3f}x` `[performans]`"]
+        for badge, st_doc in st_exp:
+            g = float(st_doc["geometric_mean_candidate_over_c"])
+            if badge == best_gm_badge:
+                gm_row.append(f"**`{g:.3f}x`** `[{badge}]`")
+            else:
+                gm_row.append(f"`{g:.3f}x` `[{badge}]`")
+        gm_row.append(f"**`{best_gm:.3f}x`** `[{best_gm_badge}]`")
+        gm_row.append("`1.000x` `[C-O2]`")
+        gm_row.append(
+            f"**`{best_gm:.3f}x` `[{best_gm_badge}]`** (`{cli_rust_wins}/7` CLI ailesinde Rust lider)"
+        )
+        lines.append("| " + " | ".join(gm_row) + " |\n")
+
+    # --- Table C & D: Cumulative Fastest Progression Across Steps ---
+    if exp_stages:
+        lines.append("### C. Adım Adım Kümülatif En Hızlı Uygulama Evrimi (`speedbench` `W01`–`W14`)\n")
+        lines.append(
+            "> Her sütun, o adıma kadar ulaşılan **en hızlı süreyi** ve bu rekorun **hangi adıma ait olduğunu (`[Belirteç]`)** gösterir.\n"
+        )
+        cum_hdr = ["İş Yükü", "`performans` Dalı (`ms`)"]
+        for idx, (_, _, badge, _) in enumerate(exp_stages, start=1):
+            cum_hdr.append(f"Adım {idx} (`{badge}` Sonrası En Hızlı)")
+        cum_hdr.extend(["C `-O3` (`ms`)", "Güncel Mutlak En Hızlı (C Dahil)"])
+        lines.append("| " + " | ".join(cum_hdr) + " |")
+        lines.append("| :--- | ---: | " + " | ".join(["---:" for _ in exp_stages]) + " | ---: | :--- |")
+
+        cum_envelope_sums = [0.0 for _ in exp_stages]
+        for w_name in [w["name"] for w in pure_rust_doc["workloads"]]:
+            pure_ms = float(pr_w_map[w_name]["rust_median_ms"])
+            c_ms = float(latest_w_map[w_name]["c_median_ms"])
+            cur_best_ms = pure_ms
+            cur_best_badge = "performans"
+
+            row = [f"`{w_name}`", f"`{pure_ms:.2f} ms` `[performans]`"]
+            for s_idx, (badge, wmap) in enumerate(exp_w_maps):
+                if w_name in wmap:
+                    cand_ms = float(wmap[w_name]["rust_median_ms"])
+                    if cand_ms < cur_best_ms:
+                        cur_best_ms = cand_ms
+                        cur_best_badge = badge
+                cum_envelope_sums[s_idx] += cur_best_ms
+                if cur_best_badge == badge:
+                    row.append(f"**`{cur_best_ms:.2f} ms`** `[{cur_best_badge}]`")
+                else:
+                    row.append(f"`{cur_best_ms:.2f} ms` `[{cur_best_badge}]`")
+
+            row.append(f"`{c_ms:.2f} ms` `[C-O3]`")
+            if c_ms < cur_best_ms:
+                row.append(
+                    f"**`{c_ms:.2f} ms` `[C-O3]`** *(En iyi Rust: `{cur_best_ms:.2f} ms` `[{cur_best_badge}]`)*"
+                )
+            else:
+                row.append(
+                    f"**`{cur_best_ms:.2f} ms` `[{cur_best_badge}]`** (`{cur_best_ms / c_ms:.2f}x` C)"
+                )
+            lines.append("| " + " | ".join(row) + " |")
+
+        env_row = ["**En Hızlılar Toplamı (`W01`–`W14`)**", f"`{sum_pure_ms:.2f} ms` `[performans]`"]
+        for s_idx, (_, _, badge, _) in enumerate(exp_stages):
+            env_row.append(f"**`{cum_envelope_sums[s_idx]:.2f} ms`** `[<= {badge}]`")
+        env_row.append(f"`{sum_c_ms:.2f} ms` `[C-O3]`")
+        final_env = cum_envelope_sums[-1]
+        env_row.append(
+            f"**`{final_env:.2f} ms` `[Birleşik En Hızlı Rust Zarfı]`** (`{final_env / sum_c_ms:.2f}x` C)"
+        )
+        lines.append("| " + " | ".join(env_row) + " |\n")
+
+    if "sqltest_cli_command_set" in pure_rust_doc and exp_stages:
+        st_exp = [
+            (badge, doc["sqltest_cli_command_set"])
+            for (_, _, badge, doc) in exp_stages
+            if "sqltest_cli_command_set" in doc
+        ]
+        if st_exp:
+            lines.append("### D. Adım Adım Kümülatif En Hızlı Uygulama Evrimi (`./sqltest` `126` Örnek CLI)\n")
+            st_cum_hdr = ["CLI Komut Ailesi", "`performans` Dalı (`ms`)"]
+            for idx, (badge, _) in enumerate(st_exp, start=1):
+                st_cum_hdr.append(f"Adım {idx} (`{badge}` Sonrası En Hızlı)")
+            st_cum_hdr.extend(["C SQLite (`ms`)", "Güncel Mutlak En Hızlı (C Dahil)"])
+            lines.append("| " + " | ".join(st_cum_hdr) + " |")
+            lines.append("| :--- | ---: | " + " | ".join(["---:" for _ in st_exp]) + " | ---: | :--- |")
+
+            pr_fams = {
+                f["family_case"]: f for f in pure_rust_doc["sqltest_cli_command_set"]["families"]
+            }
+            exp_fam_maps = [
+                (badge, {f["family_case"]: f for f in st_doc["families"]})
+                for (badge, st_doc) in st_exp
+            ]
+
+            for fam_name in [f["family_case"] for f in pure_rust_doc["sqltest_cli_command_set"]["families"]]:
+                pf = pr_fams[fam_name]
+                pure_ms = float(pf["candidate_median_ms"])
+                c_ms = float(pf["c_reference_median_ms"])
+                cur_best_ms = pure_ms
+                cur_best_badge = "performans"
+
+                row = [f"`{fam_name}`", f"`{pure_ms:.2f} ms` `[performans]`"]
+                for badge, fmap in exp_fam_maps:
+                    if fam_name in fmap:
+                        cand_ms = float(fmap[fam_name]["candidate_median_ms"])
+                        if cand_ms < cur_best_ms:
+                            cur_best_ms = cand_ms
+                            cur_best_badge = badge
+                    if cur_best_badge == badge:
+                        row.append(f"**`{cur_best_ms:.2f} ms`** `[{cur_best_badge}]`")
+                    else:
+                        row.append(f"`{cur_best_ms:.2f} ms` `[{cur_best_badge}]`")
+
+                row.append(f"`{c_ms:.2f} ms` `[C-O2]`")
+                if c_ms < cur_best_ms:
+                    row.append(
+                        f"**`{c_ms:.2f} ms` `[C-O2]`** *(En iyi Rust: `{cur_best_ms:.2f} ms` `[{cur_best_badge}]`)*"
+                    )
+                else:
+                    row.append(
+                        f"**`{cur_best_ms:.2f} ms` `[{cur_best_badge}]`** (`{cur_best_ms / c_ms:.2f}x` C)"
+                    )
+                lines.append("| " + " | ".join(row) + " |")
+            lines.append("")
+
+    return lines
+
+
 def render_markdown(
-    stages: list[tuple[str, str, str, dict[str, Any]]],
+    stages: list[tuple[str, str, str, str, dict[str, Any]]],
     bench_dir: Path,
 ) -> str:
     if not stages:
         return "# Performans Karşılaştırma Raporu\n\nHenüz ölçüm bulunamadı.\n"
 
-    base_doc = stages[0][3]
-    latest_doc = stages[-1][3]
-    pure_rust_doc = next((d for (k, _, _, d) in stages if k == "03_performans_p1c"), None)
+    base_doc = stages[0][4]
+    latest_doc = stages[-1][4]
+    pure_rust_doc = next((d for (k, _, _, _, d) in stages if k == "03_performans_p1c"), None)
 
     lines: list[str] = []
-    lines.append("# `sqliters` — Kapsamlı Performans, Saf Rust / SWAR / SIMD / ASM Deney Matrisi ve RAM Raporu\n")
+    lines.append("# `sqliters` — Kapsamlı Performans, Saf Rust / SWAR / SIMD / ASM / Morsel / IO / PGO Deney Matrisi ve RAM Raporu\n")
     lines.append(
         f"- **Donanım / İS**: `{latest_doc['environment']['cpu']}` "
         f"({latest_doc['environment']['logical_cpus']} iş parçacığı), `{latest_doc['environment']['os']}`"
@@ -303,7 +673,7 @@ def render_markdown(
         f"**`{c_total_ms:,.2f}`** | `—` | **`1.000x`** | **`{c_peak_rss:,}`** | `—` | **`1.000x`** |"
     )
 
-    for key, short_label, _, doc in stages:
+    for key, short_label, _, _, doc in stages:
         r_bin = doc.get("binaries", {}).get("rust_cli", {})
         s = doc["summary"]
         st = doc.get("sqltest_cli_command_set", {})
@@ -354,7 +724,7 @@ def render_markdown(
 
     # 2. Cross-stage ./sqltest matrix
     sqltest_stages = [
-        (k, lbl, d) for (k, lbl, _, d) in stages if "sqltest_cli_command_set" in d
+        (k, lbl, d) for (k, lbl, _, _, d) in stages if "sqltest_cli_command_set" in d
     ]
     if sqltest_stages:
         lines.append("## 2. Toplu `./sqltest` Uçtan Uca CLI Matrisi (`126` Örnek)\n")
@@ -387,7 +757,7 @@ def render_markdown(
     # 3. Cross-stage speedbench matrix
     lines.append("## 3. Toplu `speedbench` Özellik & Motor API Matrisi (`W01`–`W14`)\n")
     sb_hdr = ["İş Yükü", "C `-O3` (`ms`)"]
-    for _, lbl, _, _ in stages:
+    for _, lbl, _, _, _ in stages:
         sb_hdr.append(f"{lbl} (`ms` / C oranı)")
     lines.append("| " + " | ".join(sb_hdr) + " |")
     lines.append("| :--- | ---: | " + " | ".join(["---:" for _ in stages]) + " |")
@@ -395,7 +765,7 @@ def render_markdown(
     for w_name in w_names:
         latest_w = next(w for w in latest_doc["workloads"] if w["name"] == w_name)
         row = [f"`{w_name}`", f"`{latest_w['c_median_ms']:.2f}`"]
-        for _, _, _, d in stages:
+        for _, _, _, _, d in stages:
             w = next(x for x in d["workloads"] if x["name"] == w_name)
             row.append(f"`{w['rust_median_ms']:.2f}` (**{w['rust_over_c_ratio']:.2f}x**)")
         lines.append("| " + " | ".join(row) + " |")
@@ -404,28 +774,32 @@ def render_markdown(
     lines.append("---\n")
 
     # 4+. Dedicated Individual Headings for EVERY Recorded Branch / Stage
-    for key, short_label, heading, doc in stages:
+    for key, short_label, _, heading, doc in stages:
         lines.extend(render_stage_section(key, short_label, heading, doc, pure_rust_doc))
         lines.append("---\n")
 
-    # Optional Final Root-Cause Analysis Appendix
+    # Optional Final Root-Cause Analysis Appendix (kept BEFORE the always-last Leaderboard!)
     analysis_md = bench_dir / "final_c_comparison_analysis.md"
     if analysis_md.exists():
         lines.append(analysis_md.read_text(encoding="utf-8").rstrip())
-        lines.append("")
+        lines.append("\n---\n")
+
+    # ALWAYS-LAST SECTION: Standing Fastest-Implementation Leaderboard
+    lines.extend(render_fastest_leaderboard(stages, pure_rust_doc))
 
     return "\n".join(lines)
 
 
 def main() -> int:
-    repo_root = Path(__file__).resolve().parent.parent
-    bench_dir = repo_root / "benchmarks"
+    bench_dir = Path(__file__).resolve().parent
+    if bench_dir.name != "benchmarks":
+        bench_dir = bench_dir.parent / "benchmarks"
     bench_dir.mkdir(parents=True, exist_ok=True)
     stages = load_stages(bench_dir)
     md = render_markdown(stages, bench_dir)
     out_path = bench_dir / "benchmark_report.md"
     out_path.write_text(md, encoding="utf-8")
-    print(f"Wrote {out_path} ({len(stages)} stages)")
+    print(f"Wrote {out_path} ({len(stages)} stages, including trailing Fastest Leaderboard)")
     return 0
 
 

@@ -7,3 +7,7 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+sqliters-asm = { path = "../sqliters-asm" }
+sqliters-simd = { path = "../sqliters-simd" }

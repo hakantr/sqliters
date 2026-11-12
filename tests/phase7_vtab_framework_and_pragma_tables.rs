@@ -124,14 +124,18 @@ fn test_acyclic_workspace_crate_dependency_graph() {
             ext_deps.push(dep_name.trim().to_owned());
         }
     }
-    assert_eq!(
-        ext_deps,
-        vec!["sqliters-types".to_owned()],
-        "sqliters-ext must depend ONLY on sqliters-types"
+    assert!(
+        ext_deps.contains(&"sqliters-types".to_owned())
+            && ext_deps
+                .iter()
+                .all(|d| d == "sqliters-types" || d == "sqliters-asm" || d == "sqliters-simd"),
+        "sqliters-ext must depend ONLY on sqliters-types (and optionally leaf sqliters-asm/sqliters-simd), got {ext_deps:?}"
     );
 
     // Also verify all workspace crates' Cargo.toml files form a strict DAG with zero external crates.
     let workspace_crates = [
+        ("sqliters-asm", "crates/sqliters-asm/Cargo.toml"),
+        ("sqliters-simd", "crates/sqliters-simd/Cargo.toml"),
         ("sqliters-types", "crates/sqliters-types/Cargo.toml"),
         ("sqliters-vfs", "crates/sqliters-vfs/Cargo.toml"),
         ("sqliters-pager", "crates/sqliters-pager/Cargo.toml"),
@@ -173,6 +177,14 @@ fn test_acyclic_workspace_crate_dependency_graph() {
         }
         adj.insert((*pkg_name).to_owned(), deps);
     }
+    assert!(
+        adj["sqliters-asm"].is_empty(),
+        "sqliters-asm must be a zero-dependency leaf crate"
+    );
+    assert!(
+        adj["sqliters-simd"].is_empty(),
+        "sqliters-simd must be a zero-dependency leaf crate"
+    );
 
     // Topological sort / cycle check
     fn has_cycle(

@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::{Arc, Mutex};
 
 use sqliters_types::{
@@ -31,21 +32,27 @@ pub enum RTreeCoordMode {
     Int32,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct RTreeCell {
-    id: i64,
-    coords: [u32; RTREE_MAX_COORDS],
+type RTreeCell = sqliters_asm::RTreeCell10;
+
+#[inline]
+const fn rtree_cell_zero() -> RTreeCell {
+    RTreeCell {
+        id: 0,
+        coords: [0; RTREE_MAX_COORDS],
+    }
 }
 
-impl RTreeCell {
-    #[inline]
-    fn zero() -> Self {
-        Self {
-            id: 0,
-            coords: [0; RTREE_MAX_COORDS],
-        }
-    }
+trait RTreeCellExt {
+    fn coord_f64(&self, idx: usize, mode: RTreeCoordMode) -> f64;
+    fn coord_sql_value(&self, idx: usize, mode: RTreeCoordMode) -> Value;
+    fn area(&self, n_dim: usize, mode: RTreeCoordMode) -> f64;
+    fn margin(&self, n_dim: usize, mode: RTreeCoordMode) -> f64;
+    fn union_in_place(&mut self, other: &Self, n_dim: usize, mode: RTreeCoordMode);
+    fn contains(&self, other: &Self, n_dim: usize, mode: RTreeCoordMode) -> bool;
+    fn overlap(&self, other: &Self, n_dim: usize, mode: RTreeCoordMode) -> f64;
+}
 
+impl RTreeCellExt for RTreeCell {
     #[inline]
     fn coord_f64(&self, idx: usize, mode: RTreeCoordMode) -> f64 {
         let bits = self.coords[idx];
@@ -112,6 +119,10 @@ impl RTreeCell {
     fn union_in_place(&mut self, other: &Self, n_dim: usize, mode: RTreeCoordMode) {
         match mode {
             RTreeCoordMode::Float32 => {
+                if n_dim == 2 {
+                    sqliters_asm::rtree_cell_union_2d_f32_in_place(self, other);
+                    return;
+                }
                 for d in 0..n_dim {
                     let i0 = d * 2;
                     let i1 = i0 + 1;
@@ -249,30 +260,134 @@ struct RTreeSavepoint {
     flushed: bool,
 }
 
+const DENSE_NODE_LIMIT: usize = 65_536;
+
+#[derive(Default)]
+struct IntHasher(u64);
+
+impl Hasher for IntHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        for &b in bytes {
+            h = (h ^ u64::from(b)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+        self.0 = h;
+    }
+
+    #[inline]
+    fn write_i64(&mut self, i: i64) {
+        self.0 = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 32)
+    }
+}
+
+type IntHashMap<V> = HashMap<i64, V, BuildHasherDefault<IntHasher>>;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PersistedRowidBound {
+    #[default]
+    Unknown,
+    Empty,
+    Max(i64),
+}
+
 #[derive(Debug, Default)]
 struct RTreeCache {
-    nodes: HashMap<i64, Option<CachedNode>>,
-    rowids: HashMap<i64, CachedRowid>,
-    parents: HashMap<i64, CachedParent>,
+    dense_nodes: Vec<Option<Option<CachedNode>>>,
+    sparse_nodes: IntHashMap<Option<CachedNode>>,
+    rowids: IntHashMap<CachedRowid>,
+    parents: IntHashMap<CachedParent>,
     max_nodeno: Option<i64>,
     max_rowid: Option<i64>,
     deleted_max_rowid: bool,
+    persisted_rowid_bound: PersistedRowidBound,
     root1_blob: Option<Vec<u8>>,
     in_tx: bool,
     has_dirty: bool,
     recording_undo: bool,
     undo_log: Vec<RTreeUndo>,
     savepoints: Vec<RTreeSavepoint>,
+    scratch_cells: Option<Vec<RTreeCell>>,
+    scratch_visited: Option<Vec<i64>>,
 }
 
 impl RTreeCache {
+    #[inline]
+    fn dense_idx(nodeno: i64) -> Option<usize> {
+        if nodeno >= 1 && nodeno <= DENSE_NODE_LIMIT as i64 {
+            Some((nodeno - 1) as usize)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn get_node_slot(&self, nodeno: i64) -> Option<&Option<CachedNode>> {
+        if let Some(idx) = Self::dense_idx(nodeno) {
+            self.dense_nodes.get(idx).and_then(Option::as_ref)
+        } else {
+            self.sparse_nodes.get(&nodeno)
+        }
+    }
+
+    #[inline]
+    fn get_node_present(&self, nodeno: i64) -> Option<&CachedNode> {
+        self.get_node_slot(nodeno).and_then(Option::as_ref)
+    }
+
+    #[inline]
+    fn get_node_present_mut(&mut self, nodeno: i64) -> Option<&mut CachedNode> {
+        if let Some(idx) = Self::dense_idx(nodeno) {
+            self.dense_nodes
+                .get_mut(idx)
+                .and_then(Option::as_mut)
+                .and_then(Option::as_mut)
+        } else {
+            self.sparse_nodes.get_mut(&nodeno).and_then(Option::as_mut)
+        }
+    }
+
+    #[inline]
+    fn set_node_slot(&mut self, nodeno: i64, slot: Option<CachedNode>) {
+        if let Some(idx) = Self::dense_idx(nodeno) {
+            if idx >= self.dense_nodes.len() {
+                let target = (idx + 1)
+                    .max(self.dense_nodes.len().saturating_mul(2))
+                    .max(64);
+                self.dense_nodes
+                    .resize_with(target.min(DENSE_NODE_LIMIT), || None);
+            }
+            self.dense_nodes[idx] = Some(slot);
+        } else {
+            self.sparse_nodes.insert(nodeno, slot);
+        }
+    }
+
+    #[inline]
+    fn remove_node_slot(&mut self, nodeno: i64) {
+        if let Some(idx) = Self::dense_idx(nodeno) {
+            if let Some(s) = self.dense_nodes.get_mut(idx) {
+                *s = None;
+            }
+        } else {
+            self.sparse_nodes.remove(&nodeno);
+        }
+    }
+
     fn clear_data(&mut self) {
-        self.nodes.clear();
+        self.dense_nodes.clear();
+        self.sparse_nodes.clear();
         self.rowids.clear();
         self.parents.clear();
         self.max_nodeno = None;
         self.max_rowid = None;
         self.deleted_max_rowid = false;
+        self.persisted_rowid_bound = PersistedRowidBound::Unknown;
         self.root1_blob = None;
         self.has_dirty = false;
         self.undo_log.clear();
@@ -293,13 +408,15 @@ impl RTreeCache {
         }
     }
 
+    #[inline]
     fn record_node_before(&mut self, nodeno: i64) {
         if self.should_record_undo() {
-            let prev = self.nodes.get(&nodeno).cloned();
+            let prev = self.get_node_slot(nodeno).cloned();
             self.undo_log.push(RTreeUndo::Node(nodeno, prev));
         }
     }
 
+    #[inline]
     fn record_rowid_before(&mut self, rowid: i64) {
         if self.should_record_undo() {
             let prev = self.rowids.get(&rowid).cloned();
@@ -307,6 +424,7 @@ impl RTreeCache {
         }
     }
 
+    #[inline]
     fn record_parent_before(&mut self, nodeno: i64) {
         if self.should_record_undo() {
             let prev = self.parents.get(&nodeno).copied();
@@ -314,12 +432,14 @@ impl RTreeCache {
         }
     }
 
+    #[inline]
     fn record_max_nodeno_before(&mut self) {
         if self.should_record_undo() {
             self.undo_log.push(RTreeUndo::MaxNodeno(self.max_nodeno));
         }
     }
 
+    #[inline]
     fn record_max_rowid_before(&mut self) {
         if self.should_record_undo() {
             self.undo_log
@@ -335,10 +455,10 @@ impl RTreeCache {
             match item {
                 RTreeUndo::Node(nodeno, prev) => match prev {
                     Some(slot) => {
-                        self.nodes.insert(nodeno, slot);
+                        self.set_node_slot(nodeno, slot);
                     }
                     None => {
-                        self.nodes.remove(&nodeno);
+                        self.remove_node_slot(nodeno);
                     }
                 },
                 RTreeUndo::Rowid(rowid, prev) => match prev {
@@ -611,17 +731,19 @@ impl RTreeTable {
                 &format!("INSERT INTO {q_db}.{q_node} VALUES(1, ?1)"),
                 &[Value::Blob(root_zero.clone())],
             )?;
+            let max_cells_cap = (node_size - 4) / bytes_per_cell + 1;
             init_cache.root1_blob = Some(root_zero);
-            init_cache.nodes.insert(
+            init_cache.set_node_slot(
                 1,
                 Some(CachedNode {
                     depth: 0,
-                    cells: Vec::new(),
+                    cells: Vec::with_capacity(max_cells_cap),
                     dirty: false,
                 }),
             );
             init_cache.max_nodeno = Some(1);
             init_cache.max_rowid = Some(0);
+            init_cache.persisted_rowid_bound = PersistedRowidBound::Empty;
         }
 
         Ok(Self {
@@ -677,7 +799,11 @@ impl RTreeTable {
 
     fn decode_node_cells(&self, data: &[u8]) -> Vec<RTreeCell> {
         let n_cell = read_u16_be(&data[2..4]) as usize;
-        let mut cells = Vec::with_capacity(n_cell);
+        let mut cells = Vec::with_capacity(self.max_cells().max(n_cell) + 1);
+        if self.n_dim2 == 4 {
+            sqliters_asm::rtree_decode_2d_cells(data, n_cell, &mut cells);
+            return cells;
+        }
         let bpc = self.bytes_per_cell;
         let nd2 = self.n_dim2;
         for i in 0..n_cell {
@@ -700,6 +826,10 @@ impl RTreeTable {
 
     fn encode_node_cells(&self, depth: u16, cells: &[RTreeCell]) -> Vec<u8> {
         let mut buf = vec![0u8; self.node_size];
+        if self.n_dim2 == 4 {
+            sqliters_asm::rtree_encode_2d_cells(depth, cells, &mut buf);
+            return buf;
+        }
         buf[0..2].copy_from_slice(&depth.to_be_bytes());
         buf[2..4].copy_from_slice(&(cells.len() as u16).to_be_bytes());
         let bpc = self.bytes_per_cell;
@@ -720,7 +850,7 @@ impl RTreeTable {
             return Ok(());
         }
         if let Some(ref root1) = cache.root1_blob
-            && cache.nodes.get(&1).is_some_and(Option::is_some)
+            && cache.get_node_present(1).is_some()
             && ctx.shadow_rowid_blob_eq(&self.node_shadow, 1, 1, root1)? == Some(true)
         {
             return Ok(());
@@ -741,20 +871,23 @@ impl RTreeTable {
             }
         };
         if cache.root1_blob.as_deref() == Some(data.as_slice()) {
-            cache.nodes.entry(1).or_insert_with(|| {
+            if cache.get_node_slot(1).is_none() {
                 let cells = self.decode_node_cells(data);
-                Some(CachedNode {
-                    depth,
-                    cells,
-                    dirty: false,
-                })
-            });
+                cache.set_node_slot(
+                    1,
+                    Some(CachedNode {
+                        depth,
+                        cells,
+                        dirty: false,
+                    }),
+                );
+            }
             return Ok(());
         }
         cache.clear_data();
         let cells = self.decode_node_cells(data);
         cache.root1_blob = Some(data.clone());
-        cache.nodes.insert(
+        cache.set_node_slot(
             1,
             Some(CachedNode {
                 depth,
@@ -765,6 +898,7 @@ impl RTreeTable {
         Ok(())
     }
 
+    #[inline]
     fn load_node_into_cache(
         &self,
         cache: &mut RTreeCache,
@@ -777,7 +911,7 @@ impl RTreeTable {
                 "corrupt rtree node id",
             ));
         }
-        match cache.nodes.get(&nodeno) {
+        match cache.get_node_slot(nodeno) {
             Some(Some(_)) => return Ok(()),
             Some(None) => {
                 return Err(SqliteError::new(
@@ -787,6 +921,16 @@ impl RTreeTable {
             }
             None => {}
         }
+        self.load_node_into_cache_cold(cache, ctx, nodeno)
+    }
+
+    #[cold]
+    fn load_node_into_cache_cold(
+        &self,
+        cache: &mut RTreeCache,
+        ctx: &mut dyn VTabHostContext,
+        nodeno: i64,
+    ) -> Result<()> {
         let row = ctx.shadow_get_rowid(&self.node_shadow, nodeno)?;
         let Some(Value::Blob(data)) = row.as_ref().and_then(|r| r.get(1)) else {
             return Err(SqliteError::new(
@@ -796,7 +940,7 @@ impl RTreeTable {
         };
         let (depth, _) = self.validate_node_blob(nodeno, data)?;
         let cells = self.decode_node_cells(data);
-        cache.nodes.insert(
+        cache.set_node_slot(
             nodeno,
             Some(CachedNode {
                 depth,
@@ -814,16 +958,12 @@ impl RTreeTable {
         nodeno: i64,
     ) -> Result<(u16, Vec<RTreeCell>)> {
         self.load_node_into_cache(cache, ctx, nodeno)?;
-        let node = cache
-            .nodes
-            .get(&nodeno)
-            .and_then(|s| s.as_ref())
-            .ok_or_else(|| {
-                SqliteError::new(
-                    ErrorCode::Corrupt,
-                    format!("missing or invalid RTree node {nodeno}"),
-                )
-            })?;
+        let node = cache.get_node_present(nodeno).ok_or_else(|| {
+            SqliteError::new(
+                ErrorCode::Corrupt,
+                format!("missing or invalid RTree node {nodeno}"),
+            )
+        })?;
         Ok((node.depth, node.cells.clone()))
     }
 
@@ -836,7 +976,7 @@ impl RTreeTable {
             cache.record_max_nodeno_before();
             cache.max_nodeno = Some(nodeno);
         }
-        cache.nodes.insert(
+        cache.set_node_slot(
             nodeno,
             Some(CachedNode {
                 depth,
@@ -856,7 +996,15 @@ impl RTreeTable {
             Some(m) => m,
             None => {
                 let mut m = ctx.shadow_max_rowid(&self.node_shadow)?.unwrap_or(1);
-                for (&id, slot) in &cache.nodes {
+                for (idx, slot) in cache.dense_nodes.iter().enumerate() {
+                    if matches!(slot, Some(Some(_))) {
+                        let id = (idx + 1) as i64;
+                        if id > m {
+                            m = id;
+                        }
+                    }
+                }
+                for (&id, slot) in &cache.sparse_nodes {
                     if slot.is_some() && id > m {
                         m = id;
                     }
@@ -881,11 +1029,11 @@ impl RTreeTable {
     ) -> Result<()> {
         cache.mark_dirty();
         cache.record_node_before(nodeno);
-        cache.nodes.insert(nodeno, None);
+        cache.set_node_slot(nodeno, None);
         if cache.max_nodeno == Some(nodeno) {
             let mut new_max = 1_i64;
             for probe in (1..nodeno).rev() {
-                match cache.nodes.get(&probe) {
+                match cache.get_node_slot(probe) {
                     Some(Some(_)) => {
                         new_max = probe;
                         break;
@@ -913,6 +1061,23 @@ impl RTreeTable {
     ) -> Result<Option<i64>> {
         if let Some(entry) = cache.rowids.get(&rowid) {
             return Ok(entry.nodeno);
+        }
+        match cache.persisted_rowid_bound {
+            PersistedRowidBound::Empty => return Ok(None),
+            PersistedRowidBound::Max(m) if rowid > m => return Ok(None),
+            PersistedRowidBound::Max(_) => {}
+            PersistedRowidBound::Unknown => match ctx.shadow_max_rowid(&self.rowid_shadow)? {
+                None => {
+                    cache.persisted_rowid_bound = PersistedRowidBound::Empty;
+                    return Ok(None);
+                }
+                Some(m) => {
+                    cache.persisted_rowid_bound = PersistedRowidBound::Max(m);
+                    if rowid > m {
+                        return Ok(None);
+                    }
+                }
+            },
         }
         let Some(row) = ctx.shadow_get_rowid(&self.rowid_shadow, rowid)? else {
             return Ok(None);
@@ -1098,20 +1263,28 @@ impl RTreeTable {
             return Ok(());
         }
 
-        let mut dirty_node_ids: Vec<i64> = cache
-            .nodes
-            .iter()
-            .filter_map(|(&id, slot)| match slot {
-                Some(n) if n.dirty => Some(id),
-                None => Some(id),
-                _ => None,
-            })
-            .collect();
-        dirty_node_ids.sort_unstable();
+        let mut dirty_node_ids: Vec<i64> = Vec::new();
+        for (idx, slot) in cache.dense_nodes.iter().enumerate() {
+            match slot {
+                Some(Some(n)) if n.dirty => dirty_node_ids.push((idx + 1) as i64),
+                Some(None) => dirty_node_ids.push((idx + 1) as i64),
+                _ => {}
+            }
+        }
+        if !cache.sparse_nodes.is_empty() {
+            for (&id, slot) in &cache.sparse_nodes {
+                match slot {
+                    Some(n) if n.dirty => dirty_node_ids.push(id),
+                    None => dirty_node_ids.push(id),
+                    _ => {}
+                }
+            }
+            dirty_node_ids.sort_unstable();
+        }
 
         let mut new_root1: Option<Vec<u8>> = None;
         for nodeno in dirty_node_ids {
-            match cache.nodes.get(&nodeno) {
+            match cache.get_node_slot(nodeno) {
                 Some(Some(node)) => {
                     let encoded = self.encode_node_cells(node.depth, &node.cells);
                     if nodeno == 1 {
@@ -1130,14 +1303,27 @@ impl RTreeTable {
                 None => {}
             }
         }
-        cache.nodes.retain(|_, slot| {
-            if let Some(n) = slot {
-                n.dirty = false;
-                true
-            } else {
-                false
+        for slot in &mut cache.dense_nodes {
+            match slot {
+                Some(Some(n)) => {
+                    n.dirty = false;
+                }
+                Some(None) => {
+                    *slot = None;
+                }
+                None => {}
             }
-        });
+        }
+        if !cache.sparse_nodes.is_empty() {
+            cache.sparse_nodes.retain(|_, slot| {
+                if let Some(n) = slot {
+                    n.dirty = false;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
         if let Some(r1) = new_root1 {
             cache.root1_blob = Some(r1);
         }
@@ -1160,6 +1346,13 @@ impl RTreeTable {
                                 &[Value::Integer(rowid), Value::Integer(nodeno)],
                                 true,
                             )?;
+                            cache.persisted_rowid_bound = match cache.persisted_rowid_bound {
+                                PersistedRowidBound::Empty => PersistedRowidBound::Max(rowid),
+                                PersistedRowidBound::Max(m) => {
+                                    PersistedRowidBound::Max(m.max(rowid))
+                                }
+                                PersistedRowidBound::Unknown => PersistedRowidBound::Unknown,
+                            };
                         }
                         None => {
                             ctx.shadow_delete_rowid(&self.rowid_shadow, rowid)?;
@@ -1187,6 +1380,11 @@ impl RTreeTable {
                             row_buf.push(aux_vals.get(i).cloned().unwrap_or(Value::Null));
                         }
                         ctx.shadow_put_rowid(&self.rowid_shadow, rowid, &row_buf, true)?;
+                        cache.persisted_rowid_bound = match cache.persisted_rowid_bound {
+                            PersistedRowidBound::Empty => PersistedRowidBound::Max(rowid),
+                            PersistedRowidBound::Max(m) => PersistedRowidBound::Max(m.max(rowid)),
+                            PersistedRowidBound::Unknown => PersistedRowidBound::Unknown,
+                        };
                     }
                     None => {
                         ctx.shadow_delete_rowid(&self.rowid_shadow, rowid)?;
@@ -1250,6 +1448,9 @@ impl RTreeTable {
 
     #[inline]
     fn compute_bbox(&self, cells: &[RTreeCell], node_id: i64) -> RTreeCell {
+        if self.n_dim == 2 && self.mode == RTreeCoordMode::Float32 {
+            return sqliters_asm::rtree_bbox_union_2d_f32(cells, node_id);
+        }
         let mut bbox = cells[0];
         for cell in &cells[1..] {
             bbox.union_in_place(cell, self.n_dim, self.mode);
@@ -1258,31 +1459,30 @@ impl RTreeTable {
         bbox
     }
 
-    fn choose_subtree_path(
+    fn choose_subtree_path_into(
         &self,
         cache: &mut RTreeCache,
         ctx: &mut dyn VTabHostContext,
         cell: &RTreeCell,
         target_height: usize,
-    ) -> Result<(usize, Vec<i64>)> {
+        path_buf: &mut [i64; RTREE_MAX_DEPTH + 2],
+    ) -> Result<(usize, usize)> {
         self.load_node_into_cache(cache, ctx, 1)?;
         let root_depth = cache
-            .nodes
-            .get(&1)
-            .and_then(|s| s.as_ref())
+            .get_node_present(1)
             .map(|n| n.depth as usize)
             .ok_or_else(|| {
                 SqliteError::new(ErrorCode::Corrupt, "missing or invalid RTree node 1")
             })?;
-        if target_height > root_depth {
+        if target_height > root_depth || root_depth > RTREE_MAX_DEPTH {
             return Err(SqliteError::new(
                 ErrorCode::Corrupt,
                 "corrupt RTree subtree height",
             ));
         }
         let steps = root_depth - target_height;
-        let mut path = Vec::with_capacity(steps + 1);
-        path.push(1);
+        path_buf[0] = 1;
+        let mut path_len = 1usize;
         let mut cur_id = 1_i64;
         let n_dim = self.n_dim;
         let mode = self.mode;
@@ -1290,9 +1490,7 @@ impl RTreeTable {
             self.load_node_into_cache(cache, ctx, cur_id)?;
             let best_id = {
                 let cells = &cache
-                    .nodes
-                    .get(&cur_id)
-                    .and_then(|s| s.as_ref())
+                    .get_node_present(cur_id)
                     .ok_or_else(|| {
                         SqliteError::new(
                             ErrorCode::Corrupt,
@@ -1306,47 +1504,52 @@ impl RTreeTable {
                         "corrupt empty internal RTree node",
                     ));
                 }
-                let mut best_id = cells[0].id;
-                let mut found_containing = false;
-                let mut min_area = 0.0_f64;
-                for c in cells {
-                    if c.contains(cell, n_dim, mode) {
-                        let area = c.area(n_dim, mode);
-                        if !found_containing || area < min_area {
-                            best_id = c.id;
-                            min_area = area;
-                            found_containing = true;
+                if n_dim == 2 && mode == RTreeCoordMode::Float32 {
+                    sqliters_asm::rtree_choose_subtree_2d_f32(cells, cell)
+                } else {
+                    let mut best_id = cells[0].id;
+                    let mut found_containing = false;
+                    let mut min_area = 0.0_f64;
+                    for c in cells {
+                        if c.contains(cell, n_dim, mode) {
+                            let area = c.area(n_dim, mode);
+                            if !found_containing || area < min_area {
+                                best_id = c.id;
+                                min_area = area;
+                                found_containing = true;
+                            }
                         }
                     }
-                }
-                if !found_containing {
-                    let mut min_growth = 0.0_f64;
-                    for (idx, c) in cells.iter().enumerate() {
-                        let area = c.area(n_dim, mode);
-                        let mut u = *c;
-                        u.union_in_place(cell, n_dim, mode);
-                        let growth = u.area(n_dim, mode) - area;
-                        if idx == 0
-                            || growth < min_growth
-                            || (growth == min_growth && area < min_area)
-                        {
-                            min_growth = growth;
-                            min_area = area;
-                            best_id = c.id;
+                    if !found_containing {
+                        let mut min_growth = 0.0_f64;
+                        for (idx, c) in cells.iter().enumerate() {
+                            let area = c.area(n_dim, mode);
+                            let mut u = *c;
+                            u.union_in_place(cell, n_dim, mode);
+                            let growth = u.area(n_dim, mode) - area;
+                            if idx == 0
+                                || growth < min_growth
+                                || (growth == min_growth && area < min_area)
+                            {
+                                min_growth = growth;
+                                min_area = area;
+                                best_id = c.id;
+                            }
                         }
                     }
+                    best_id
                 }
-                best_id
             };
-            if path.contains(&best_id) {
+            if path_buf[..path_len].contains(&best_id) {
                 return Err(SqliteError::new(ErrorCode::Corrupt, "cycle in RTree"));
             }
-            path.push(best_id);
+            path_buf[path_len] = best_id;
+            path_len += 1;
             if step + 1 < steps {
                 cur_id = best_id;
             }
         }
-        Ok((root_depth, path))
+        Ok((root_depth, path_len))
     }
 
     fn split_cells_rstar(&self, all_cells: &[RTreeCell]) -> (Vec<RTreeCell>, Vec<RTreeCell>) {
@@ -1355,27 +1558,31 @@ impl RTreeTable {
         let max_left = (n_cell - min_c).max(min_c);
         let n_dim = self.n_dim;
         let mode = self.mode;
+        let node_cap = self.max_cells() + 1;
 
         if n_cell <= 64 {
             let mut best_split = min_c;
             let mut best_margin = 0.0_f64;
             let mut best_idxs = [0usize; 64];
             let mut cur_idxs = [0usize; 64];
-            let mut suffix_boxes = [RTreeCell::zero(); 64];
+            let mut c0 = [0.0_f64; 64];
+            let mut c1 = [0.0_f64; 64];
+            let mut suffix_boxes = [rtree_cell_zero(); 64];
 
             for dim in 0..n_dim {
-                for (i, slot) in cur_idxs.iter_mut().enumerate().take(n_cell) {
-                    *slot = i;
-                }
-                let idxs = &mut cur_idxs[..n_cell];
                 let d0 = dim * 2;
                 let d1 = d0 + 1;
-                idxs.sort_by(|&a, &b| {
-                    let a0 = all_cells[a].coord_f64(d0, mode);
-                    let a1 = all_cells[a].coord_f64(d1, mode);
-                    let b0 = all_cells[b].coord_f64(d0, mode);
-                    let b1 = all_cells[b].coord_f64(d1, mode);
-                    a0.total_cmp(&b0).then_with(|| a1.total_cmp(&b1))
+                for i in 0..n_cell {
+                    cur_idxs[i] = i;
+                    c0[i] = all_cells[i].coord_f64(d0, mode);
+                    c1[i] = all_cells[i].coord_f64(d1, mode);
+                }
+                let idxs = &mut cur_idxs[..n_cell];
+                idxs.sort_unstable_by(|&a, &b| {
+                    c0[a]
+                        .total_cmp(&c0[b])
+                        .then_with(|| c1[a].total_cmp(&c1[b]))
+                        .then_with(|| a.cmp(&b))
                 });
 
                 suffix_boxes[n_cell - 1] = all_cells[idxs[n_cell - 1]];
@@ -1420,14 +1627,14 @@ impl RTreeTable {
                 }
             }
 
-            let left_cells = best_idxs[..best_split]
-                .iter()
-                .map(|&i| all_cells[i])
-                .collect();
-            let right_cells = best_idxs[best_split..n_cell]
-                .iter()
-                .map(|&i| all_cells[i])
-                .collect();
+            let mut left_cells = Vec::with_capacity(node_cap.max(best_split));
+            for &i in &best_idxs[..best_split] {
+                left_cells.push(all_cells[i]);
+            }
+            let mut right_cells = Vec::with_capacity(node_cap.max(n_cell - best_split));
+            for &i in &best_idxs[best_split..n_cell] {
+                right_cells.push(all_cells[i]);
+            }
             return (left_cells, right_cells);
         }
 
@@ -1445,7 +1652,7 @@ impl RTreeTable {
                 let b1 = all_cells[b].coord_f64(d1, mode);
                 a0.total_cmp(&b0).then_with(|| a1.total_cmp(&b1))
             });
-            let mut suffix_boxes = vec![RTreeCell::zero(); n_cell];
+            let mut suffix_boxes = vec![rtree_cell_zero(); n_cell];
             suffix_boxes[n_cell - 1] = all_cells[idxs[n_cell - 1]];
             for k in (min_c..n_cell - 1).rev() {
                 let mut b = all_cells[idxs[k]];
@@ -1504,21 +1711,135 @@ impl RTreeTable {
         root_depth: usize,
     ) -> Result<()> {
         for &parent_id in ancestors.iter().rev() {
-            let (_, mut p_cells) = self.read_node_decoded(cache, ctx, parent_id)?;
+            self.load_node_into_cache(cache, ctx, parent_id)?;
             let depth_field = if parent_id == 1 { root_depth as u16 } else { 0 };
-            let Some(pos) = p_cells.iter().position(|c| c.id == child_id) else {
+            let pos = {
+                let p_node = cache.get_node_present(parent_id).ok_or_else(|| {
+                    SqliteError::new(
+                        ErrorCode::Corrupt,
+                        format!("missing or invalid RTree node {parent_id}"),
+                    )
+                })?;
+                let Some(pos) = p_node.cells.iter().position(|c| c.id == child_id) else {
+                    return Err(SqliteError::new(
+                        ErrorCode::Corrupt,
+                        "missing child entry in parent RTree node",
+                    ));
+                };
+                if p_node.depth == depth_field
+                    && p_node.cells[pos].coords[..self.n_dim2] == child_bbox.coords[..self.n_dim2]
+                {
+                    break;
+                }
+                pos
+            };
+            cache.mark_dirty();
+            cache.record_node_before(parent_id);
+            let next_bbox = {
+                let p_node = cache.get_node_present_mut(parent_id).unwrap();
+                p_node.depth = depth_field;
+                p_node.dirty = true;
+                p_node.cells[pos] = child_bbox;
+                self.compute_bbox(&p_node.cells, parent_id)
+            };
+            child_id = parent_id;
+            child_bbox = next_bbox;
+        }
+        Ok(())
+    }
+
+    fn try_fast_infallible_leaf_insert(
+        &self,
+        cache: &mut RTreeCache,
+        ctx: &mut dyn VTabHostContext,
+        cell: RTreeCell,
+        aux_vals: Option<&[Value]>,
+    ) -> Result<bool> {
+        let mut path_buf = [0_i64; RTREE_MAX_DEPTH + 2];
+        let (root_depth, path_len) =
+            self.choose_subtree_path_into(cache, ctx, &cell, 0, &mut path_buf)?;
+        let path = &path_buf[..path_len];
+        let node_id = *path.last().unwrap_or(&1);
+        let ancestors = &path[..path_len.saturating_sub(1)];
+        self.load_node_into_cache(cache, ctx, node_id)?;
+        let cur_len = cache
+            .get_node_present(node_id)
+            .ok_or_else(|| {
+                SqliteError::new(
+                    ErrorCode::Corrupt,
+                    format!("missing or invalid RTree node {node_id}"),
+                )
+            })?
+            .cells
+            .len();
+        if cur_len >= self.max_cells() {
+            return Ok(false);
+        }
+
+        let mut anc_pos = [0usize; RTREE_MAX_DEPTH + 2];
+        let mut expect_child = node_id;
+        for (rev_i, &parent_id) in ancestors.iter().rev().enumerate() {
+            self.load_node_into_cache(cache, ctx, parent_id)?;
+            let p_node = cache.get_node_present(parent_id).ok_or_else(|| {
+                SqliteError::new(
+                    ErrorCode::Corrupt,
+                    format!("missing or invalid RTree node {parent_id}"),
+                )
+            })?;
+            let Some(pos) = p_node.cells.iter().position(|c| c.id == expect_child) else {
                 return Err(SqliteError::new(
                     ErrorCode::Corrupt,
                     "missing child entry in parent RTree node",
                 ));
             };
-            p_cells[pos] = child_bbox;
-            let next_bbox = self.compute_bbox(&p_cells, parent_id);
-            self.put_node(cache, parent_id, depth_field, p_cells);
-            child_id = parent_id;
-            child_bbox = next_bbox;
+            anc_pos[rev_i] = pos;
+            expect_child = parent_id;
         }
-        Ok(())
+
+        // All fallible validations have passed; apply in-place mutations.
+        cache.mark_dirty();
+        if let Some(cur_max) = cache.max_nodeno
+            && node_id > cur_max
+        {
+            cache.max_nodeno = Some(node_id);
+        }
+        let depth_field = if node_id == 1 { root_depth as u16 } else { 0 };
+        let bbox_opt = {
+            let leaf = cache.get_node_present_mut(node_id).unwrap();
+            leaf.depth = depth_field;
+            leaf.dirty = true;
+            leaf.cells.push(cell);
+            if !ancestors.is_empty() {
+                Some(self.compute_bbox(&leaf.cells, node_id))
+            } else {
+                None
+            }
+        };
+        self.write_rowid_mapping(cache, cell.id, node_id);
+        if let Some(mut child_bbox) = bbox_opt {
+            for (rev_i, &parent_id) in ancestors.iter().rev().enumerate() {
+                let p_depth = if parent_id == 1 { root_depth as u16 } else { 0 };
+                let pos = anc_pos[rev_i];
+                let next_bbox = {
+                    let p_node = cache.get_node_present_mut(parent_id).unwrap();
+                    if p_node.depth == p_depth
+                        && p_node.cells[pos].coords[..self.n_dim2]
+                            == child_bbox.coords[..self.n_dim2]
+                    {
+                        break;
+                    }
+                    p_node.depth = p_depth;
+                    p_node.dirty = true;
+                    p_node.cells[pos] = child_bbox;
+                    self.compute_bbox(&p_node.cells, parent_id)
+                };
+                child_bbox = next_bbox;
+            }
+        }
+        if let Some(aux_slice) = aux_vals {
+            self.write_aux_values(cache, cell.id, aux_slice);
+        }
+        Ok(true)
     }
 
     fn insert_cell_at_height(
@@ -1528,8 +1849,17 @@ impl RTreeTable {
         cell: RTreeCell,
         target_height: usize,
     ) -> Result<()> {
-        let (root_depth, path) = self.choose_subtree_path(cache, ctx, &cell, target_height)?;
-        self.insert_into_path(cache, ctx, &path, cell, target_height, root_depth)
+        let mut path_buf = [0_i64; RTREE_MAX_DEPTH + 2];
+        let (root_depth, path_len) =
+            self.choose_subtree_path_into(cache, ctx, &cell, target_height, &mut path_buf)?;
+        self.insert_into_path(
+            cache,
+            ctx,
+            &path_buf[..path_len],
+            cell,
+            target_height,
+            root_depth,
+        )
     }
 
     fn insert_into_path(
@@ -1543,17 +1873,39 @@ impl RTreeTable {
     ) -> Result<()> {
         let node_id = *path.last().unwrap_or(&1);
         let ancestors = &path[..path.len().saturating_sub(1)];
-        let (_, mut cells) = self.read_node_decoded(cache, ctx, node_id)?;
+        self.load_node_into_cache(cache, ctx, node_id)?;
+        let cur_len = cache
+            .get_node_present(node_id)
+            .ok_or_else(|| {
+                SqliteError::new(
+                    ErrorCode::Corrupt,
+                    format!("missing or invalid RTree node {node_id}"),
+                )
+            })?
+            .cells
+            .len();
 
-        if cells.len() < self.max_cells() {
-            cells.push(cell);
+        if cur_len < self.max_cells() {
+            cache.mark_dirty();
+            cache.record_node_before(node_id);
+            if let Some(cur_max) = cache.max_nodeno
+                && node_id > cur_max
+            {
+                cache.record_max_nodeno_before();
+                cache.max_nodeno = Some(node_id);
+            }
             let depth_field = if node_id == 1 { root_depth as u16 } else { 0 };
-            let bbox_opt = if !ancestors.is_empty() {
-                Some(self.compute_bbox(&cells, node_id))
-            } else {
-                None
+            let bbox_opt = {
+                let leaf = cache.get_node_present_mut(node_id).unwrap();
+                leaf.depth = depth_field;
+                leaf.dirty = true;
+                leaf.cells.push(cell);
+                if !ancestors.is_empty() {
+                    Some(self.compute_bbox(&leaf.cells, node_id))
+                } else {
+                    None
+                }
             };
-            self.put_node(cache, node_id, depth_field, cells);
             self.update_child_mapping(cache, cell.id, node_id, height);
             if let Some(bbox) = bbox_opt {
                 self.adjust_ancestors(cache, ctx, ancestors, node_id, bbox, root_depth)?;
@@ -1561,6 +1913,7 @@ impl RTreeTable {
             return Ok(());
         }
 
+        let (_, mut cells) = self.read_node_decoded(cache, ctx, node_id)?;
         cells.push(cell);
         let (left_cells, right_cells) = self.split_cells_rstar(&cells);
 
@@ -1574,14 +1927,27 @@ impl RTreeTable {
             let left_bbox_no_id = self.compute_bbox(&left_cells, 0);
             let right_bbox_no_id = self.compute_bbox(&right_cells, 0);
 
-            let left_id = self.alloc_new_node(cache, ctx, left_cells.clone())?;
-            let right_id = self.alloc_new_node(cache, ctx, right_cells.clone())?;
+            let left_id = self.alloc_new_node(cache, ctx, left_cells)?;
+            let right_id = self.alloc_new_node(cache, ctx, right_cells)?;
 
-            for c in &left_cells {
-                self.update_child_mapping(cache, c.id, left_id, height);
+            let mut child_ids = [0_i64; 64];
+            if let Some(ln) = cache.get_node_present(left_id) {
+                let n = ln.cells.len();
+                for (dst, c) in child_ids[..n].iter_mut().zip(ln.cells.iter()) {
+                    *dst = c.id;
+                }
+                for &cid in &child_ids[..n] {
+                    self.update_child_mapping(cache, cid, left_id, height);
+                }
             }
-            for c in &right_cells {
-                self.update_child_mapping(cache, c.id, right_id, height);
+            if let Some(rn) = cache.get_node_present(right_id) {
+                let n = rn.cells.len();
+                for (dst, c) in child_ids[..n].iter_mut().zip(rn.cells.iter()) {
+                    *dst = c.id;
+                }
+                for &cid in &child_ids[..n] {
+                    self.update_child_mapping(cache, cid, right_id, height);
+                }
             }
 
             let mut left_bbox = left_bbox_no_id;
@@ -1589,7 +1955,9 @@ impl RTreeTable {
             let mut right_bbox = right_bbox_no_id;
             right_bbox.id = right_id;
             let new_depth = (root_depth + 1) as u16;
-            let root_cells = vec![left_bbox, right_bbox];
+            let mut root_cells = Vec::with_capacity(self.max_cells() + 1);
+            root_cells.push(left_bbox);
+            root_cells.push(right_bbox);
             self.put_node(cache, 1, new_depth, root_cells);
             self.write_parent_mapping(cache, left_id, 1);
             self.write_parent_mapping(cache, right_id, 1);
@@ -1601,11 +1969,20 @@ impl RTreeTable {
             }
             self.put_node(cache, node_id, 0, left_cells);
 
-            let right_id = self.alloc_new_node(cache, ctx, right_cells.clone())?;
-            for c in &right_cells {
-                self.update_child_mapping(cache, c.id, right_id, height);
+            let right_bbox_no_id = self.compute_bbox(&right_cells, 0);
+            let right_id = self.alloc_new_node(cache, ctx, right_cells)?;
+            let mut child_ids = [0_i64; 64];
+            if let Some(rn) = cache.get_node_present(right_id) {
+                let n = rn.cells.len();
+                for (dst, c) in child_ids[..n].iter_mut().zip(rn.cells.iter()) {
+                    *dst = c.id;
+                }
+                for &cid in &child_ids[..n] {
+                    self.update_child_mapping(cache, cid, right_id, height);
+                }
             }
-            let right_bbox = self.compute_bbox(&right_cells, right_id);
+            let mut right_bbox = right_bbox_no_id;
+            right_bbox.id = right_id;
 
             self.adjust_ancestors(cache, ctx, ancestors, node_id, left_bbox, root_depth)?;
             self.insert_into_path(cache, ctx, ancestors, right_bbox, height + 1, root_depth)
@@ -1648,9 +2025,7 @@ impl RTreeTable {
     ) -> Result<()> {
         self.load_node_into_cache(cache, ctx, 1)?;
         let mut root_depth = cache
-            .nodes
-            .get(&1)
-            .and_then(|s| s.as_ref())
+            .get_node_present(1)
             .map(|n| n.depth as usize)
             .ok_or_else(|| {
                 SqliteError::new(ErrorCode::Corrupt, "missing or invalid RTree node 1")
@@ -1842,13 +2217,13 @@ impl VirtualTable for RTreeTable {
                 continue;
             }
             if c.i_column >= 1 && (c.i_column as usize) <= self.n_dim2 {
-                let op_ch = match c.op {
-                    VTabConstraintOp::Eq => Some('A'),
-                    VTabConstraintOp::Le => Some('B'),
-                    VTabConstraintOp::Lt => Some('C'),
-                    VTabConstraintOp::Ge => Some('D'),
-                    VTabConstraintOp::Gt => Some('E'),
-                    _ => None,
+                let (op_ch, do_omit) = match c.op {
+                    VTabConstraintOp::Eq => (Some('A'), false),
+                    VTabConstraintOp::Le => (Some('B'), true),
+                    VTabConstraintOp::Lt => (Some('C'), false),
+                    VTabConstraintOp::Ge => (Some('D'), true),
+                    VTabConstraintOp::Gt => (Some('E'), false),
+                    _ => (None, false),
                 };
                 if let Some(ch) = op_ch {
                     argv_idx += 1;
@@ -1856,7 +2231,7 @@ impl VirtualTable for RTreeTable {
                     idx_str.push(ch);
                     idx_str.push(char::from(b'0' + coord_idx));
                     info.constraint_usage[i].argv_index = argv_idx;
-                    info.constraint_usage[i].omit = false;
+                    info.constraint_usage[i].omit = do_omit;
                 }
             }
         }
@@ -1873,9 +2248,15 @@ impl VirtualTable for RTreeTable {
     }
 
     fn open(&self) -> Result<Box<dyn VirtualCursor>> {
+        let pooled_cells = self
+            .cache
+            .try_lock()
+            .ok()
+            .and_then(|mut c| c.scratch_cells.take())
+            .unwrap_or_default();
         Ok(Box::new(RTreeCursor {
             table: self.clone(),
-            cells: Vec::new(),
+            cells: pooled_cells,
             aux_rows: Vec::new(),
             pos: 0,
         }))
@@ -1992,6 +2373,27 @@ impl VirtualTable for RTreeTable {
                         Some(v) => Some(value_to_i64(v)),
                     },
                 };
+
+                if let Some(id) = explicit_id
+                    && !flush_after
+                    && !prev_rec
+                    && cache.savepoints.is_empty()
+                    && self.read_rowid_nodeno(&mut cache, ctx, id)?.is_none()
+                {
+                    cache.recording_undo = false;
+                    let aux_opt = (self.n_aux > 0).then(|| {
+                        if values.len() > 1 + self.n_dim2 {
+                            &values[1 + self.n_dim2..]
+                        } else {
+                            &[][..]
+                        }
+                    });
+                    let cell = RTreeCell { id, coords };
+                    if self.try_fast_infallible_leaf_insert(&mut cache, ctx, cell, aux_opt)? {
+                        return Ok(Some(id));
+                    }
+                    cache.recording_undo = true;
+                }
 
                 let final_id = if let Some(id) = explicit_id {
                     if self.read_rowid_nodeno(&mut cache, ctx, id)?.is_some() {
@@ -2287,6 +2689,24 @@ struct RTreeCursor {
     pos: usize,
 }
 
+impl Drop for RTreeCursor {
+    fn drop(&mut self) {
+        if self.cells.capacity() > 0 {
+            self.cells.clear();
+            let buf = std::mem::take(&mut self.cells);
+            if let Ok(mut cache) = self.table.cache.try_lock() {
+                let keep = match cache.scratch_cells {
+                    Some(ref cur) => buf.capacity() > cur.capacity(),
+                    None => true,
+                };
+                if keep {
+                    cache.scratch_cells = Some(buf);
+                }
+            }
+        }
+    }
+}
+
 impl RTreeCursor {
     #[allow(clippy::too_many_arguments)]
     fn walk_subtree_2d_f32(
@@ -2308,48 +2728,42 @@ impl RTreeCursor {
         visited.push(node_id);
         table.load_node_into_cache(cache, ctx, node_id)?;
         if level == 0 {
-            if let Some(Some(node)) = cache.nodes.get(&node_id) {
-                for cell in &node.cells {
-                    let min_x = f64::from(f32::from_bits(cell.coords[0]));
-                    let max_x = f64::from(f32::from_bits(cell.coords[1]));
-                    let min_y = f64::from(f32::from_bits(cell.coords[2]));
-                    let max_y = f64::from(f32::from_bits(cell.coords[3]));
-                    if max_x >= q.q_min_x
-                        && min_x <= q.q_max_x
-                        && max_y >= q.q_min_y
-                        && min_y <= q.q_max_y
-                    {
-                        out.push(*cell);
-                    }
-                }
+            if let Some(node) = cache.get_node_present(node_id) {
+                sqliters_asm::rtree_filter_2d_f32_cells(
+                    &node.cells,
+                    q.q_min_x,
+                    q.q_max_x,
+                    q.q_min_y,
+                    q.q_max_y,
+                    out,
+                );
             }
         } else {
             let mut stack_children = [0_i64; 64];
             let mut n_stack = 0usize;
             let mut heap_children: Option<Vec<i64>> = None;
-            if let Some(Some(node)) = cache.nodes.get(&node_id) {
-                for cell in &node.cells {
-                    let min_x = f64::from(f32::from_bits(cell.coords[0]));
-                    let max_x = f64::from(f32::from_bits(cell.coords[1]));
-                    let min_y = f64::from(f32::from_bits(cell.coords[2]));
-                    let max_y = f64::from(f32::from_bits(cell.coords[3]));
-                    if max_x >= q.q_min_x
-                        && min_x <= q.q_max_x
-                        && max_y >= q.q_min_y
-                        && min_y <= q.q_max_y
-                    {
-                        if let Some(ref mut v) = heap_children {
-                            v.push(cell.id);
-                        } else if n_stack < 64 {
-                            stack_children[n_stack] = cell.id;
-                            n_stack += 1;
-                        } else {
-                            let mut v = Vec::with_capacity(node.cells.len());
-                            v.extend_from_slice(&stack_children[..n_stack]);
-                            v.push(cell.id);
-                            heap_children = Some(v);
-                        }
-                    }
+            if let Some(node) = cache.get_node_present(node_id) {
+                if node.cells.len() <= stack_children.len() {
+                    n_stack = sqliters_asm::rtree_filter_2d_f32_ids(
+                        &node.cells,
+                        q.q_min_x,
+                        q.q_max_x,
+                        q.q_min_y,
+                        q.q_max_y,
+                        &mut stack_children,
+                    );
+                } else {
+                    let mut v = vec![0_i64; node.cells.len()];
+                    let n_match = sqliters_asm::rtree_filter_2d_f32_ids(
+                        &node.cells,
+                        q.q_min_x,
+                        q.q_max_x,
+                        q.q_min_y,
+                        q.q_max_y,
+                        &mut v,
+                    );
+                    v.truncate(n_match);
+                    heap_children = Some(v);
                 }
             }
             if let Some(children) = heap_children {
@@ -2386,7 +2800,7 @@ impl RTreeCursor {
         visited.push(node_id);
         table.load_node_into_cache(cache, ctx, node_id)?;
         if level == 0 {
-            if let Some(Some(node)) = cache.nodes.get(&node_id) {
+            if let Some(node) = cache.get_node_present(node_id) {
                 for cell in &node.cells {
                     let min_x = f64::from(cell.coords[0] as i32);
                     let max_x = f64::from(cell.coords[1] as i32);
@@ -2405,7 +2819,7 @@ impl RTreeCursor {
             let mut stack_children = [0_i64; 64];
             let mut n_stack = 0usize;
             let mut heap_children: Option<Vec<i64>> = None;
-            if let Some(Some(node)) = cache.nodes.get(&node_id) {
+            if let Some(node) = cache.get_node_present(node_id) {
                 for cell in &node.cells {
                     let min_x = f64::from(cell.coords[0] as i32);
                     let max_x = f64::from(cell.coords[1] as i32);
@@ -2465,7 +2879,7 @@ impl RTreeCursor {
         table.load_node_into_cache(cache, ctx, node_id)?;
         let mode = table.mode;
         if level == 0 {
-            if let Some(Some(node)) = cache.nodes.get(&node_id) {
+            if let Some(node) = cache.get_node_present(node_id) {
                 for cell in &node.cells {
                     if constraints.iter().all(|c| c.matches_leaf(cell, mode)) {
                         out.push(*cell);
@@ -2476,7 +2890,7 @@ impl RTreeCursor {
             let mut stack_children = [0_i64; 64];
             let mut n_stack = 0usize;
             let mut heap_children: Option<Vec<i64>> = None;
-            if let Some(Some(node)) = cache.nodes.get(&node_id) {
+            if let Some(node) = cache.get_node_present(node_id) {
                 for cell in &node.cells {
                     if constraints.iter().all(|c| c.matches_nonleaf(cell, mode)) {
                         if let Some(ref mut v) = heap_children {
@@ -2561,9 +2975,7 @@ impl VirtualCursor for RTreeCursor {
             };
             self.table.load_node_into_cache(&mut cache, ctx, nodeno)?;
             let found_cell = cache
-                .nodes
-                .get(&nodeno)
-                .and_then(|s| s.as_ref())
+                .get_node_present(nodeno)
                 .and_then(|n| n.cells.iter().find(|c| c.id == rowid).copied());
             let Some(cell) = found_cell else {
                 return Err(SqliteError::new(
@@ -2608,16 +3020,18 @@ impl VirtualCursor for RTreeCursor {
         let active_constraints = &constraints[..n_constraints];
 
         let root_depth = cache
-            .nodes
-            .get(&1)
-            .and_then(|s| s.as_ref())
+            .get_node_present(1)
             .map(|n| n.depth as usize)
             .ok_or_else(|| {
                 SqliteError::new(ErrorCode::Corrupt, "missing or invalid RTree node 1")
             })?;
-        let mut visited = Vec::with_capacity(root_depth + 2);
+        let mut visited = cache
+            .scratch_visited
+            .take()
+            .unwrap_or_else(|| Vec::with_capacity(root_depth + 2));
+        visited.clear();
 
-        if self.table.n_dim == 2
+        let walk_res = if self.table.n_dim == 2
             && let Some(bbox2d) = try_extract_2d_bbox(active_constraints)
         {
             match self.table.mode {
@@ -2630,7 +3044,7 @@ impl VirtualCursor for RTreeCursor {
                     bbox2d,
                     &mut visited,
                     &mut self.cells,
-                )?,
+                ),
                 RTreeCoordMode::Int32 => Self::walk_subtree_2d_i32(
                     &self.table,
                     &mut cache,
@@ -2640,7 +3054,7 @@ impl VirtualCursor for RTreeCursor {
                     bbox2d,
                     &mut visited,
                     &mut self.cells,
-                )?,
+                ),
             }
         } else {
             Self::walk_subtree_general(
@@ -2652,8 +3066,11 @@ impl VirtualCursor for RTreeCursor {
                 active_constraints,
                 &mut visited,
                 &mut self.cells,
-            )?;
-        }
+            )
+        };
+        visited.clear();
+        cache.scratch_visited = Some(visited);
+        walk_res?;
 
         if self.table.n_aux > 0 {
             self.aux_rows.reserve(self.cells.len());
@@ -3189,8 +3606,13 @@ fn classify_numeric_arg(v: &Value) -> NumericArg {
             if let Ok(i) = t.parse::<i64>() {
                 return NumericArg::Int(i);
             }
-            if let Ok(f) = t.parse::<f64>()
-                && f.is_finite()
+            let b0 = t.as_bytes()[0];
+            if (b0.is_ascii_digit() || b0 == b'+' || b0 == b'-' || b0 == b'.')
+                && !t
+                    .bytes()
+                    .any(|b| b.is_ascii_alphabetic() && b != b'e' && b != b'E')
+                && let Ok(f) = t.parse::<f64>()
+                && !f.is_nan()
             {
                 return NumericArg::Float(f);
             }

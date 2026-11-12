@@ -227,6 +227,7 @@ pub struct DatabaseSet {
     temp_store: TempStoreMode,
     disk_vfs: Arc<dyn Vfs>,
     default_page_size: u32,
+    default_mmap_size: u64,
     lock_geometry: LockGeometry,
     interrupt_flag: Arc<AtomicBool>,
     temp_trigger_bindings: Vec<TempTriggerBinding>,
@@ -299,6 +300,7 @@ impl DatabaseSet {
             temp_store,
             disk_vfs,
             default_page_size,
+            default_mmap_size: 0,
             lock_geometry,
             interrupt_flag,
             temp_trigger_bindings: Vec::new(),
@@ -592,6 +594,18 @@ impl DatabaseSet {
     #[inline]
     pub fn set_default_page_size(&mut self, page_size: u32) {
         self.default_page_size = page_size;
+    }
+
+    /// Connection default `mmap_size` inherited by newly attached disk databases (`db->szMmap`).
+    #[inline]
+    pub const fn default_mmap_size(&self) -> u64 {
+        self.default_mmap_size
+    }
+
+    /// Updates the connection default `mmap_size` (`db->szMmap`).
+    #[inline]
+    pub fn set_default_mmap_size(&mut self, limit: u64) {
+        self.default_mmap_size = limit;
     }
 
     /// Whether defensive mode (`SQLITE_DBCONFIG_DEFENSIVE`) is enabled on this connection.
@@ -1320,6 +1334,9 @@ impl DatabaseSet {
             ));
         }
         btree.set_interrupt_flag(Some(Arc::clone(&self.interrupt_flag)));
+        if self.default_mmap_size > 0 {
+            let _ = btree.set_mmap_size(self.default_mmap_size, false);
+        }
         let instance_id = SchemaInstanceId(self.next_schema_instance_id);
         self.next_schema_instance_id += 1;
         let db_id = DatabaseId(self.slots.len());

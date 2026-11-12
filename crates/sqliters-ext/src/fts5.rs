@@ -1246,21 +1246,81 @@ impl TokenizerSpec {
                 tokenchars,
                 separators,
             } => {
-                if text.is_ascii() && tokenchars.is_empty() && separators.is_empty() {
+                let mut rest_offset = 0usize;
+                if tokenchars.is_empty() && separators.is_empty() {
                     let bytes = text.as_bytes();
                     let mut i = 0usize;
                     let mut scratch = String::new();
-                    while i < bytes.len() {
-                        if !bytes[i].is_ascii_alphanumeric() {
-                            i += 1;
+                    let mut hit_non_ascii = false;
+                    while i + 8 <= bytes.len() {
+                        let s = &bytes[i..i + 8];
+                        let w =
+                            u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]);
+                        if (w & 0x8080_8080_8080_8080) != 0 {
+                            rest_offset = i;
+                            hit_non_ascii = true;
+                            break;
+                        }
+                        let (alnum, up) = swar_ascii_alnum_and_upper_msbs(w);
+                        if alnum == 0 {
+                            i += 8;
                             continue;
                         }
+                        let lead_sep = (alnum.trailing_zeros() >> 3) as usize;
+                        if lead_sep > 0 {
+                            i += lead_sep;
+                            continue;
+                        }
+                        let non_alnum = !alnum & 0x8080_8080_8080_8080;
+                        if non_alnum != 0 {
+                            let tok_len = (non_alnum.trailing_zeros() >> 3) as usize;
+                            let tok_mask = u64::MAX >> ((8 - tok_len) * 8);
+                            if (up & tok_mask) == 0 {
+                                emit(&text[i..i + tok_len]);
+                            } else {
+                                let folded = (w | (up >> 2)).to_le_bytes();
+                                if let Ok(fs) = std::str::from_utf8(&folded[..tok_len]) {
+                                    emit(fs);
+                                }
+                            }
+                            i += tok_len + 1;
+                            continue;
+                        }
+                        // Token starts at `i` and spans all 8 ASCII alnum bytes `i..i+8`.
                         let start = i;
-                        let mut has_upper = bytes[i].is_ascii_uppercase();
-                        i += 1;
+                        let mut has_upper = up != 0;
+                        i += 8;
+                        while i + 8 <= bytes.len() {
+                            let s2 = &bytes[i..i + 8];
+                            let w2 = u64::from_le_bytes([
+                                s2[0], s2[1], s2[2], s2[3], s2[4], s2[5], s2[6], s2[7],
+                            ]);
+                            if (w2 & 0x8080_8080_8080_8080) != 0 {
+                                break;
+                            }
+                            let (alnum2, up2) = swar_ascii_alnum_and_upper_msbs(w2);
+                            if alnum2 == 0x8080_8080_8080_8080 {
+                                has_upper |= up2 != 0;
+                                i += 8;
+                            } else {
+                                let rem = ((!alnum2 & 0x8080_8080_8080_8080).trailing_zeros() >> 3)
+                                    as usize;
+                                if rem > 0 {
+                                    let m2 = u64::MAX >> ((8 - rem) * 8);
+                                    has_upper |= (up2 & m2) != 0;
+                                    i += rem;
+                                }
+                                break;
+                            }
+                        }
                         while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
                             has_upper |= bytes[i].is_ascii_uppercase();
                             i += 1;
+                        }
+                        if i < bytes.len() && bytes[i] >= 0x80 {
+                            rest_offset = start;
+                            hit_non_ascii = true;
+                            break;
                         }
                         if !has_upper {
                             emit(&text[start..i]);
@@ -1272,12 +1332,51 @@ impl TokenizerSpec {
                             }
                             emit(&scratch);
                         }
+                        i += 1;
                     }
-                    return;
+                    if !hit_non_ascii {
+                        while i < bytes.len() {
+                            if bytes[i] >= 0x80 {
+                                rest_offset = i;
+                                hit_non_ascii = true;
+                                break;
+                            }
+                            if !bytes[i].is_ascii_alphanumeric() {
+                                i += 1;
+                                continue;
+                            }
+                            let start = i;
+                            let mut has_upper = bytes[i].is_ascii_uppercase();
+                            i += 1;
+                            while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
+                                has_upper |= bytes[i].is_ascii_uppercase();
+                                i += 1;
+                            }
+                            if i < bytes.len() && bytes[i] >= 0x80 {
+                                rest_offset = start;
+                                hit_non_ascii = true;
+                                break;
+                            }
+                            if !has_upper {
+                                emit(&text[start..i]);
+                            } else {
+                                scratch.clear();
+                                scratch.reserve(i - start);
+                                for &b in &bytes[start..i] {
+                                    scratch.push(b.to_ascii_lowercase() as char);
+                                }
+                                emit(&scratch);
+                            }
+                            i += 1;
+                        }
+                    }
+                    if !hit_non_ascii {
+                        return;
+                    }
                 }
                 let mut cur_term = String::new();
                 let mut in_tok = false;
-                for (_, ch) in text.char_indices() {
+                for (_, ch) in text[rest_offset..].char_indices() {
                     if is_unicode61_token_char(ch, tokenchars, separators) {
                         in_tok = true;
                         fold_unicode61_char(ch, *remove_diacritics, &mut cur_term);
@@ -1481,6 +1580,19 @@ fn is_unicode61_token_char(
     ch.is_alphanumeric() || is_combining_mark(ch)
 }
 
+/// Given a 64-bit word `w` already verified pure ASCII (`(w & 0x8080_8080_8080_8080) == 0`),
+/// computes `(alnum_msbs, upper_msbs)` across all 8 byte lanes in parallel using branchless SWAR.
+#[inline(always)]
+const fn swar_ascii_alnum_and_upper_msbs(w: u64) -> (u64, u64) {
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let d = w.wrapping_add(0x5050_5050_5050_5050) & !w.wrapping_add(0x4646_4646_4646_4646);
+    let fl = w | 0x2020_2020_2020_2020;
+    let a = fl.wrapping_add(0x1f1f_1f1f_1f1f_1f1f) & !fl.wrapping_add(0x0505_0505_0505_0505);
+    let alnum = (d | a) & HI;
+    let up = w.wrapping_add(0x3f3f_3f3f_3f3f_3f3f) & !w.wrapping_add(0x2525_2525_2525_2525) & HI;
+    (alnum, up)
+}
+
 fn tokenize_unicode61(
     text: &str,
     remove_diacritics: u8,
@@ -1488,11 +1600,117 @@ fn tokenize_unicode61(
     separators: &BTreeSet<char>,
 ) -> Vec<EmittedToken> {
     let mut out = Vec::new();
+    let mut rest_offset = 0usize;
+    if tokenchars.is_empty() && separators.is_empty() {
+        let bytes = text.as_bytes();
+        let mut i = 0usize;
+        let mut hit_non_ascii = false;
+        while i + 8 <= bytes.len() {
+            let s = &bytes[i..i + 8];
+            let w = u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]);
+            if (w & 0x8080_8080_8080_8080) != 0 {
+                rest_offset = i;
+                hit_non_ascii = true;
+                break;
+            }
+            let (alnum, up) = swar_ascii_alnum_and_upper_msbs(w);
+            if alnum == 0 {
+                i += 8;
+                continue;
+            }
+            let lead_sep = (alnum.trailing_zeros() >> 3) as usize;
+            if lead_sep > 0 {
+                i += lead_sep;
+                continue;
+            }
+            let non_alnum = !alnum & 0x8080_8080_8080_8080;
+            if non_alnum != 0 {
+                let tok_len = (non_alnum.trailing_zeros() >> 3) as usize;
+                let tok_mask = u64::MAX >> ((8 - tok_len) * 8);
+                let term = if (up & tok_mask) == 0 {
+                    text[i..i + tok_len].to_owned()
+                } else {
+                    let folded = (w | (up >> 2)).to_le_bytes();
+                    String::from_utf8_lossy(&folded[..tok_len]).into_owned()
+                };
+                out.push(EmittedToken {
+                    term,
+                    start_byte: i,
+                    end_byte: i + tok_len,
+                });
+                i += tok_len + 1;
+                continue;
+            }
+            let start = i;
+            let mut has_upper = up != 0;
+            i += 8;
+            while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
+                has_upper |= bytes[i].is_ascii_uppercase();
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] >= 0x80 {
+                rest_offset = start;
+                hit_non_ascii = true;
+                break;
+            }
+            let term = if !has_upper {
+                text[start..i].to_owned()
+            } else {
+                text[start..i].to_ascii_lowercase()
+            };
+            out.push(EmittedToken {
+                term,
+                start_byte: start,
+                end_byte: i,
+            });
+            i += 1;
+        }
+        if !hit_non_ascii {
+            while i < bytes.len() {
+                if bytes[i] >= 0x80 {
+                    rest_offset = i;
+                    hit_non_ascii = true;
+                    break;
+                }
+                if !bytes[i].is_ascii_alphanumeric() {
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                let mut has_upper = bytes[i].is_ascii_uppercase();
+                i += 1;
+                while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
+                    has_upper |= bytes[i].is_ascii_uppercase();
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] >= 0x80 {
+                    rest_offset = start;
+                    hit_non_ascii = true;
+                    break;
+                }
+                let term = if !has_upper {
+                    text[start..i].to_owned()
+                } else {
+                    text[start..i].to_ascii_lowercase()
+                };
+                out.push(EmittedToken {
+                    term,
+                    start_byte: start,
+                    end_byte: i,
+                });
+                i += 1;
+            }
+        }
+        if !hit_non_ascii {
+            return out;
+        }
+    }
     let mut cur_term = String::new();
     let mut cur_start: Option<usize> = None;
-    let mut last_end = 0usize;
+    let mut last_end = rest_offset;
 
-    for (idx, ch) in text.char_indices() {
+    for (rel_idx, ch) in text[rest_offset..].char_indices() {
+        let idx = rest_offset + rel_idx;
         if is_unicode61_token_char(ch, tokenchars, separators) {
             if cur_start.is_none() {
                 cur_start = Some(idx);
