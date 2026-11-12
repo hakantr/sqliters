@@ -353,8 +353,11 @@ impl Btree {
         let cur_gen = id.0 as u32;
         if let Some(entry) = self.cursor_slots.get_mut(slot)
             && entry.generation == cur_gen
-            && entry.cursor.take().is_some()
+            && entry.cursor.is_some()
         {
+            // Dropped in place: `take()` would first move the whole cursor (path stack and
+            // column cache) out of the slot.
+            entry.cursor = None;
             entry.generation = 0;
             self.free_cursor_slots.push(slot as u32);
             self.open_cursor_count -= 1;
@@ -432,6 +435,25 @@ impl Btree {
     #[inline]
     pub fn cursor_state(&self, id: CursorId) -> Option<&BtreeCursorState> {
         self.cursor_ref(id).map(|c| &c.state)
+    }
+
+    /// `(leaf_pgno, cell_idx)` of the row a table cursor on `root_pgno` currently rests on, or
+    /// `None` unless the cursor is `Valid` with no pending skip (any mutation of that tree since
+    /// the cursor was positioned turns it `RequireSeek`). Meant for
+    /// [`Btree::insert_table_at`] / [`Btree::delete_table_at`], which re-validate it.
+    #[inline]
+    pub fn table_cursor_position(&self, id: CursorId, root_pgno: Pgno) -> Option<(Pgno, usize)> {
+        let cur = self.cursor_ref(id)?;
+        if cur.root_pgno != root_pgno || !matches!(cur.kind, CursorKind::Table) {
+            return None;
+        }
+        match &cur.state {
+            BtreeCursorState::Valid {
+                stack,
+                skip_next: SkipNext::None,
+            } => stack.last().map(|top| (top.pgno, top.cell_idx)),
+            _ => None,
+        }
     }
 
     /// Returns the `root_pgno` of `id` (`None` if closed/unknown).

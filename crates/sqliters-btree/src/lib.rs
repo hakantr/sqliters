@@ -18,10 +18,11 @@ use sqliters_pager::{
     WalCheckpointResult, create_super_journal_file,
 };
 use sqliters_types::{
-    Bitvec, ErrorCode, KeySortOrder, Pgno, RawField, Result, SqliteError, TextEncoding, Value,
-    compare_raw_record_range, compare_raw_records_with_encoding, compare_records_with_encoding,
-    decode_record_with_encoding, decode_serial_value_with_encoding, extended, get_varint,
-    get_varint_i64, parse_raw_record_prefix, push_varint, put_varint, serial_type_len, varint_len,
+    Bitvec, ErrorCode, KeySortOrder, Pgno, RawField, RawRecordKey, Result, SqliteError,
+    TextEncoding, Value, compare_raw_record_range, compare_raw_records_with_encoding,
+    compare_records_with_encoding, decode_record_with_encoding, decode_serial_value_with_encoding,
+    extended, get_varint, get_varint_i64, parse_raw_record_prefix, push_varint, put_varint,
+    serial_type_len, varint_len,
 };
 use sqliters_vfs::{OpenFlags, Vfs};
 
@@ -41,9 +42,10 @@ pub use page::{
     peek_page_type, probe_append_table_interior_rightmost, probe_delete_index_leaf_in_place,
     probe_delete_index_leaf_raw, probe_index_interior_slot_raw, probe_index_interior_step_raw,
     probe_insert_index_leaf_in_place, probe_insert_index_leaf_raw, probe_insert_table_leaf_raw,
-    raw_cell_offset, raw_page_free_space, raw_page_header, read_index_interior_cell,
-    read_index_leaf_cell, read_table_interior_cell, read_table_leaf_cell, read_table_leaf_rowid,
-    seek_table_leaf_cell, table_interior_right_child, try_delete_table_leaf_in_place,
+    probe_table_leaf_replace_at_raw, raw_cell_offset, raw_page_free_space, raw_page_header,
+    read_index_interior_cell, read_index_leaf_cell, read_table_interior_cell, read_table_leaf_cell,
+    read_table_leaf_rowid, replace_table_leaf_repack_raw, seek_table_leaf_cell,
+    table_interior_right_child, table_leaf_cell_has_rowid, try_delete_table_leaf_in_place,
     try_insert_table_leaf_in_place,
 };
 pub use ptrmap::{PtrmapType, RootPageMove, is_ptrmap_page, ptrmap_offset, ptrmap_pageno};
@@ -67,6 +69,19 @@ pub enum AllocMode {
     Any,
     Exact(Pgno),
     Le(Pgno),
+}
+
+/// Outcome of [`Btree::seek_table_row_local`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableRowSeek {
+    /// No row with that `rowid`.
+    Missing,
+    /// Row found with its whole record on the leaf (copied out); `(leaf_pgno, cell_idx)` is
+    /// where it sits.
+    Local { leaf_pgno: Pgno, cell_idx: usize },
+    /// Row found, but its record is not available as one in-page slice (nothing copied): it
+    /// continues on overflow pages, or the page is a 64 KiB page.
+    Spilled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1302,6 +1317,62 @@ impl Btree {
         }
     }
 
+    /// Point lookup of `rowid` that follows the same descent as [`Self::cursor_seek_rowid`] and,
+    /// when the row's record is stored entirely on its leaf (and the page is smaller than
+    /// 64 KiB), copies it into `record` (cleared first) and reports where the row sits — the
+    /// position accepted by [`Self::insert_table_at`] / [`Self::delete_table_at`]. No cursor is
+    /// opened.
+    pub fn seek_table_row_local(
+        &mut self,
+        root_pgno: Pgno,
+        rowid: i64,
+        record: &mut Vec<u8>,
+    ) -> Result<TableRowSeek> {
+        record.clear();
+        if self.pager.page_count() == 0 || root_pgno == 0 {
+            return Ok(TableRowSeek::Missing);
+        }
+        let usable = self.pager.usable_size();
+        let mut cur_pgno = root_pgno;
+        for _ in 0..BTCURSOR_MAX_DEPTH {
+            let raw = self.pager.read_page(cur_pgno)?;
+            let (ptype, n_cell, _) = raw_page_header(cur_pgno, usable, raw)?;
+            match ptype {
+                BtreePageType::TableLeaf => {
+                    return Ok(
+                        match binary_search_table_leaf_with_span(
+                            cur_pgno, usable, raw, n_cell, rowid,
+                        )? {
+                            Ok((cell_idx, Some((p_start, p_end)))) => {
+                                record.extend_from_slice(
+                                    &raw[usize::from(p_start)..usize::from(p_end)],
+                                );
+                                TableRowSeek::Local {
+                                    leaf_pgno: cur_pgno,
+                                    cell_idx,
+                                }
+                            }
+                            Ok((_, None)) => TableRowSeek::Spilled,
+                            Err(_) => TableRowSeek::Missing,
+                        },
+                    );
+                }
+                BtreePageType::TableInterior => {
+                    let (_, child) = find_table_interior_child(cur_pgno, usable, raw, rowid)?;
+                    cur_pgno = child;
+                }
+                other => {
+                    return Err(SqliteError::corrupt(format!(
+                        "expected table B-tree page at {cur_pgno}, found {other:?}"
+                    )));
+                }
+            }
+        }
+        Err(SqliteError::corrupt(
+            "btree depth exceeded BTCURSOR_MAX_DEPTH in seek_table_row_local",
+        ))
+    }
+
     /// Single-pass `rowid` point lookup that decodes only the requested [`PointProjCol`] columns
     /// directly from the raw `TableLeaf` page buffer without opening a `BtreeCursor` or allocating
     /// a `Vec<u8>` record buffer when the row payload fits in-page.
@@ -2012,17 +2083,54 @@ impl Btree {
     /// Inserts or replaces `(rowid, payload)` in the Table B+Tree rooted at `root_pgno`.
     /// Automatically handles overflow chains and multi-level B+Tree splits (preserving `root_pgno`, including Page 1!).
     pub fn insert_table(&mut self, root_pgno: Pgno, rowid: i64, payload: &[u8]) -> Result<()> {
+        self.insert_table_at(root_pgno, rowid, payload, None)
+    }
+
+    /// [`Self::insert_table`] for a caller that already located `rowid`: `position` is the
+    /// `(leaf_pgno, cell_idx)` reported by [`Self::table_cursor_position`] for a cursor on
+    /// `root_pgno` that was positioned on `rowid` and has not been invalidated since. The
+    /// position only saves the descent and the leaf search — it is re-validated against the
+    /// page and ignored when it does not hold `rowid`; the resulting pages are the same.
+    pub fn insert_table_at(
+        &mut self,
+        root_pgno: Pgno,
+        rowid: i64,
+        payload: &[u8],
+        position: Option<(Pgno, usize)>,
+    ) -> Result<()> {
+        self.insert_table_impl(root_pgno, rowid, payload, position, true)
+    }
+
+    /// `raw_repack == false` routes size-changing replacements that do not fit the contiguous
+    /// gap through the parsed page path instead of [`replace_table_leaf_repack_raw`]; both
+    /// produce the same pages (see the byte-for-byte test).
+    fn insert_table_impl(
+        &mut self,
+        root_pgno: Pgno,
+        rowid: i64,
+        payload: &[u8],
+        position: Option<(Pgno, usize)>,
+        raw_repack: bool,
+    ) -> Result<()> {
         self.save_cursors_for_mutation(Some(root_pgno), None)?;
         let usable = self.pager.usable_size();
         let bounds = PayloadBounds::for_table_leaf(usable);
 
-        if payload.len() <= bounds.max_local as usize
-            && matches!(
-                self.try_insert_table_fast_raw(root_pgno, usable, rowid, payload, true)?,
+        if payload.len() <= bounds.max_local as usize {
+            if raw_repack
+                && let Some((leaf_pgno, cell_idx)) = position
+                && self.try_replace_table_row_at(usable, leaf_pgno, cell_idx, rowid, payload)?
+            {
+                return Ok(());
+            }
+            if matches!(
+                self.try_insert_table_fast_raw(
+                    root_pgno, usable, rowid, payload, true, raw_repack
+                )?,
                 FastTableInsertOutcome::Inserted
-            )
-        {
-            return Ok(());
+            ) {
+                return Ok(());
+            }
         }
 
         let (total_len, local_payload, overflow_page) =
@@ -2052,7 +2160,7 @@ impl Btree {
         let bounds = PayloadBounds::for_table_leaf(usable);
 
         if payload.len() <= bounds.max_local as usize {
-            match self.try_insert_table_fast_raw(root_pgno, usable, rowid, payload, false)? {
+            match self.try_insert_table_fast_raw(root_pgno, usable, rowid, payload, false, true)? {
                 FastTableInsertOutcome::Inserted => return Ok(true),
                 FastTableInsertOutcome::Duplicate => return Ok(false),
                 FastTableInsertOutcome::Fallback => {}
@@ -2079,6 +2187,81 @@ impl Btree {
         Ok(true)
     }
 
+    /// Replaces the non-overflow row `rowid` sitting at `cell_idx` of table leaf `leaf_pgno`
+    /// with the non-overflow `payload`, exactly as the replace arms of
+    /// [`Self::try_insert_table_fast_raw`] would after descending to that leaf. Returns
+    /// `Ok(false)` (nothing modified) when the position does not hold `rowid` or the
+    /// replacement is not one of those in-page cases.
+    fn try_replace_table_row_at(
+        &mut self,
+        usable: u32,
+        leaf_pgno: Pgno,
+        cell_idx: usize,
+        rowid: i64,
+        payload: &[u8],
+    ) -> Result<bool> {
+        if leaf_pgno == 0
+            || leaf_pgno > self.pager.page_count()
+            || leaf_pgno == self.lock_byte_page()
+        {
+            return Ok(false);
+        }
+        let hdr_off = if leaf_pgno == 1 { 100 } else { 0 };
+        let probe = {
+            let raw = self.pager.read_page(leaf_pgno)?;
+            if hdr_off >= usable as usize
+                || hdr_off >= raw.len()
+                || raw[hdr_off] != BtreePageType::TableLeaf as u8
+            {
+                return Ok(false);
+            }
+            probe_table_leaf_replace_at_raw(leaf_pgno, usable, raw, cell_idx, rowid, payload.len())
+        };
+        match probe {
+            Some(TableLeafInsertProbe::Replace {
+                idx,
+                old_off,
+                old_cell_len,
+                content_top,
+            }) => {
+                let raw_mut = self.pager.write_page(leaf_pgno)?;
+                apply_replace_table_leaf_raw(
+                    leaf_pgno,
+                    usable,
+                    raw_mut,
+                    rowid,
+                    payload,
+                    idx,
+                    old_off,
+                    old_cell_len,
+                    content_top,
+                );
+                Ok(true)
+            }
+            Some(TableLeafInsertProbe::ReplaceRepack {
+                idx,
+                old_off,
+                old_cell_len,
+                ..
+            }) => {
+                let reject_overflow_cells = self.is_auto_vacuum();
+                let raw_mut = self.pager.write_page(leaf_pgno)?;
+                replace_table_leaf_repack_raw(
+                    leaf_pgno,
+                    usable,
+                    raw_mut,
+                    rowid,
+                    payload,
+                    idx,
+                    old_off,
+                    old_cell_len,
+                    reject_overflow_cells,
+                )
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn try_insert_table_fast_raw(
         &mut self,
         root_pgno: Pgno,
@@ -2086,6 +2269,7 @@ impl Btree {
         rowid: i64,
         payload: &[u8],
         allow_replace: bool,
+        raw_repack: bool,
     ) -> Result<FastTableInsertOutcome> {
         enum RawLevelStep {
             Descend {
@@ -2101,6 +2285,9 @@ impl Btree {
         let mut parent_pgno: Pgno = 0;
         let mut allow_quick_in_parent = false;
         let mut defragged_leaf = false;
+        // Size-changing replacements are repacked on the raw page; once that declines, the
+        // probe reverts to its plain answers (`NeedsDefrag` / `DuplicateNeedsFallback`).
+        let mut repack_replace = allow_replace && raw_repack;
 
         for _ in 0..(BTCURSOR_MAX_DEPTH + 1) {
             let hdr_off = if cur_pgno == 1 { 100 } else { 0 };
@@ -2125,6 +2312,8 @@ impl Btree {
                             raw,
                             rowid,
                             payload.len(),
+                            repack_replace,
+                            None,
                         )?)
                     } else {
                         RawLevelStep::Bail
@@ -2185,6 +2374,37 @@ impl Btree {
                         content_top,
                     );
                     return Ok(FastTableInsertOutcome::Inserted);
+                }
+                TableLeafInsertProbe::ReplaceRepack {
+                    idx,
+                    old_off,
+                    old_cell_len,
+                    legacy_defrag,
+                } => {
+                    let reject_overflow_cells = self.is_auto_vacuum();
+                    let raw_mut = self.pager.write_page(cur_pgno)?;
+                    if replace_table_leaf_repack_raw(
+                        cur_pgno,
+                        usable,
+                        raw_mut,
+                        rowid,
+                        payload,
+                        idx,
+                        old_off,
+                        old_cell_len,
+                        reject_overflow_cells,
+                    )? {
+                        return Ok(FastTableInsertOutcome::Inserted);
+                    }
+                    // Not handled (split needed or unusual page): continue exactly as the
+                    // plain probe answer would have.
+                    if legacy_defrag && !defragged_leaf {
+                        defragged_leaf = true;
+                        repack_replace = false;
+                        defragment_raw_leaf_in_place(cur_pgno, usable, raw_mut)?;
+                        continue;
+                    }
+                    return Ok(FastTableInsertOutcome::Fallback);
                 }
                 TableLeafInsertProbe::NeedsDefrag if !defragged_leaf => {
                     defragged_leaf = true;
@@ -2595,9 +2815,75 @@ impl Btree {
 
     /// Deletes `rowid` from the Table B+Tree rooted at `root_pgno`. Returns `true` if a row was deleted.
     pub fn delete_table(&mut self, root_pgno: Pgno, rowid: i64) -> Result<bool> {
+        self.delete_table_at(root_pgno, rowid, None)
+    }
+
+    /// [`Self::delete_table`] for a caller that already located `rowid`; see
+    /// [`Self::insert_table_at`] for the meaning and validation of `position`.
+    pub fn delete_table_at(
+        &mut self,
+        root_pgno: Pgno,
+        rowid: i64,
+        position: Option<(Pgno, usize)>,
+    ) -> Result<bool> {
         self.save_cursors_for_mutation(Some(root_pgno), None)?;
+        if let Some((leaf_pgno, cell_idx)) = position
+            && self.try_delete_table_row_at(root_pgno, leaf_pgno, cell_idx, rowid)?
+        {
+            return Ok(true);
+        }
         let (deleted, _) = self.delete_table_rec(root_pgno, rowid, true)?;
         Ok(deleted)
+    }
+
+    /// Deletes row `rowid` sitting at `cell_idx` of table leaf `leaf_pgno` in place, exactly as
+    /// the leaf step of [`Self::delete_table_rec`] would. Returns `Ok(false)` (nothing modified)
+    /// when the position does not hold `rowid`, when removing the row would empty a non-root
+    /// leaf (the parent then needs fixing up), or when the page needs the parsed path.
+    fn try_delete_table_row_at(
+        &mut self,
+        root_pgno: Pgno,
+        leaf_pgno: Pgno,
+        cell_idx: usize,
+        rowid: i64,
+    ) -> Result<bool> {
+        if leaf_pgno == 0
+            || leaf_pgno > self.pager.page_count()
+            || leaf_pgno == self.lock_byte_page()
+        {
+            return Ok(false);
+        }
+        let usable = self.pager.usable_size();
+        let is_root = leaf_pgno == root_pgno;
+        {
+            let raw = self.pager.read_page(leaf_pgno)?;
+            if !table_leaf_cell_has_rowid(leaf_pgno, usable, raw, cell_idx, rowid, is_root) {
+                return Ok(false);
+            }
+        }
+        let outcome = {
+            let raw_mut = self.pager.write_page(leaf_pgno)?;
+            try_delete_table_leaf_in_place(
+                leaf_pgno,
+                usable,
+                raw_mut,
+                rowid,
+                is_root,
+                Some(cell_idx),
+            )?
+        };
+        match outcome {
+            RawLeafDeleteOutcome::DeletedInPlace {
+                overflow_page,
+                now_empty,
+            } if is_root || !now_empty => {
+                self.free_overflow_chain(overflow_page)?;
+                Ok(true)
+            }
+            // `NotFound`, `Fallback`, and the sole cell of a non-root leaf (already refused by
+            // the check above) all leave the page untouched: the general path takes over.
+            _ => Ok(false),
+        }
     }
 
     /// Returns `(deleted, child_replacement)`:
@@ -2680,7 +2966,7 @@ impl Btree {
             }
             let outcome = {
                 let raw_mut = self.pager.write_page(pgno)?;
-                try_delete_table_leaf_in_place(pgno, usable, raw_mut, rowid, is_root)?
+                try_delete_table_leaf_in_place(pgno, usable, raw_mut, rowid, is_root, None)?
             };
             match outcome {
                 RawLeafDeleteOutcome::NotFound => return Ok((false, None)),
@@ -4532,6 +4818,7 @@ impl Btree {
         let interior_tag = BtreePageType::IndexInterior as u8;
 
         // 1. Raw descent to the interior page whose child is the target leaf.
+        let key = RawRecordKey::for_index_orders(record_bytes, orders);
         let mut path: Vec<(Pgno, usize)> = Vec::new();
         let mut cur = root_pgno;
         let (parent_pgno, idx, target_pgno) = loop {
@@ -4543,7 +4830,7 @@ impl Btree {
                 return Ok(false);
             }
             let Some((RawIndexInteriorStep::Child(child), slot)) =
-                probe_index_interior_slot_raw(cur, usable, raw, record_bytes, orders, enc)?
+                probe_index_interior_slot_raw(cur, usable, raw, &key, orders, enc)?
             else {
                 return Ok(false);
             };
@@ -4839,6 +5126,7 @@ impl Btree {
         orders: &[KeySortOrder],
         enc: TextEncoding,
     ) -> Result<Option<(Pgno, usize, usize)>> {
+        let key = RawRecordKey::for_index_orders(record_bytes, orders);
         let mut cur_pgno = root_pgno;
         for _ in 0..BTCURSOR_MAX_DEPTH {
             let raw = self.pager.read_page(cur_pgno)?;
@@ -4848,14 +5136,9 @@ impl Btree {
             }
             match raw[hdr_off] {
                 x if x == BtreePageType::IndexLeaf as u8 => {
-                    if let Some((ins_idx, top)) = probe_insert_index_leaf_raw(
-                        cur_pgno,
-                        usable,
-                        raw,
-                        record_bytes,
-                        orders,
-                        enc,
-                    )? {
+                    if let Some((ins_idx, top)) =
+                        probe_insert_index_leaf_raw(cur_pgno, usable, raw, &key, orders, enc)?
+                    {
                         return Ok(Some((cur_pgno, ins_idx, top)));
                     }
                     let has_free = hdr_off + 8 <= raw.len()
@@ -4867,26 +5150,15 @@ impl Btree {
                         defragment_raw_leaf_in_place(cur_pgno, usable, raw_mut)?;
                         let raw_after = self.pager.read_page(cur_pgno)?;
                         return Ok(probe_insert_index_leaf_raw(
-                            cur_pgno,
-                            usable,
-                            raw_after,
-                            record_bytes,
-                            orders,
-                            enc,
+                            cur_pgno, usable, raw_after, &key, orders, enc,
                         )?
                         .map(|(ins_idx, top)| (cur_pgno, ins_idx, top)));
                     }
                     return Ok(None);
                 }
                 x if x == BtreePageType::IndexInterior as u8 => {
-                    let Some(child) = find_index_interior_child_raw(
-                        cur_pgno,
-                        usable,
-                        raw,
-                        record_bytes,
-                        orders,
-                        enc,
-                    )?
+                    let Some(child) =
+                        find_index_interior_child_raw(cur_pgno, usable, raw, &key, orders, enc)?
                     else {
                         return Ok(None);
                     };
@@ -5606,6 +5878,7 @@ impl Btree {
         let usable = self.pager.usable_size();
         let usable_usize = usable as usize;
         let bounds = PayloadBounds::for_index(usable);
+        let key = RawRecordKey::for_index_orders(record_bytes, orders);
         let mut cur_pgno = root_pgno;
         for _ in 0..BTCURSOR_MAX_DEPTH {
             let hdr_off = if cur_pgno == 1 { 100 } else { 0 };
@@ -5629,12 +5902,7 @@ impl Btree {
                     match raw[hdr_off] {
                         x if x == BtreePageType::IndexInterior as u8 => {
                             match probe_index_interior_step_raw(
-                                cur_pgno,
-                                usable,
-                                raw,
-                                record_bytes,
-                                orders,
-                                enc,
+                                cur_pgno, usable, raw, &key, orders, enc,
                             )? {
                                 Some(RawIndexInteriorStep::Child(c)) => RawDelStep::Descend(c),
                                 Some(RawIndexInteriorStep::EqualAt {
@@ -5652,7 +5920,7 @@ impl Btree {
                                 cur_pgno,
                                 usable,
                                 raw,
-                                record_bytes,
+                                &key,
                                 orders,
                                 enc,
                                 cur_pgno == root_pgno,
@@ -6814,6 +7082,120 @@ mod tests {
             }
             assert_eq!(
                 raw_bt.integrity_check(&[1, raw_root]).unwrap(),
+                Vec::<String>::new()
+            );
+        }
+    }
+
+    /// Size-changing row replacements repacked on the raw page, and replacements / deletions
+    /// addressed through a positioned cursor, must leave every page byte-identical to the
+    /// general (descend, search, parse) path — across full leaves, freeblocks, short padded
+    /// cells, overflow rows, splits, emptied leaves, Page-1 roots and auto-vacuum.
+    #[test]
+    fn test_table_repack_and_positioned_ops_match_general_path_byte_for_byte() {
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        fn payload(r: u64, page_size: u32) -> Vec<u8> {
+            let len = match r % 23 {
+                0 => 0,
+                1 => 1,
+                2 => page_size as usize, // overflows
+                3 => (page_size / 3) as usize,
+                _ => 20 + ((r >> 8) % 90) as usize,
+            };
+            (0..len).map(|j| (r >> (j % 56)) as u8).collect()
+        }
+
+        for (page_size, auto_vacuum, n_rows, n_ops) in [
+            (512u32, false, 400i64, 12_000u32),
+            (1024, false, 1_500, 20_000),
+            (4096, false, 4_000, 30_000),
+            (4096, true, 2_000, 20_000),
+            (65_536, false, 3_000, 12_000),
+            (512, true, 40, 4_000),
+        ] {
+            let mut fast = Btree::open_in_memory().unwrap();
+            let mut general = Btree::open_in_memory().unwrap();
+            for bt in [&mut fast, &mut general] {
+                bt.pager_mut().set_page_size(page_size).unwrap();
+                if auto_vacuum {
+                    bt.set_configured_auto_vacuum(AutoVacuumMode::Full);
+                }
+                bt.begin_write().unwrap();
+            }
+            let root = fast.create_table().unwrap();
+            assert_eq!(root, general.create_table().unwrap());
+            assert_eq!(fast.is_auto_vacuum(), auto_vacuum);
+
+            let mut seed = 0xD1B5_4A32_D192_ED03u64 ^ u64::from(page_size) ^ (n_rows as u64);
+            // Sequential load packs the leaves full, like a bulk INSERT.
+            for rowid in 1..=n_rows {
+                let rec = payload(next(&mut seed) | 4, page_size);
+                fast.insert_table(root, rowid, &rec).unwrap();
+                general
+                    .insert_table_impl(root, rowid, &rec, None, false)
+                    .unwrap();
+            }
+
+            let mut positioned_hits = 0u32;
+            for op in 0..n_ops {
+                let r = next(&mut seed);
+                let rowid = 1 + ((r >> 16) % (n_rows as u64 + 20)) as i64;
+                let position = {
+                    let cur = fast.open_table_cursor(root, true);
+                    let pos = if fast.cursor_seek_rowid(cur, rowid).unwrap() {
+                        fast.table_cursor_position(cur, root)
+                    } else {
+                        None
+                    };
+                    fast.close_cursor(cur);
+                    pos
+                };
+                // A stale / wrong position must be harmless.
+                let position = match (position, r % 97) {
+                    (Some((pg, idx)), 0) => Some((pg, idx + 1)),
+                    (Some((pg, idx)), 1) => Some((pg + 1, idx)),
+                    (None, 2) => Some((root, 0)),
+                    (p, _) => p,
+                };
+                positioned_hits += u32::from(position.is_some());
+                if r.is_multiple_of(4) {
+                    let a = fast.delete_table_at(root, rowid, position).unwrap();
+                    let b = general.delete_table(root, rowid).unwrap();
+                    assert_eq!(a, b, "delete outcome differs at op {op}");
+                } else {
+                    let rec = payload(next(&mut seed), page_size);
+                    fast.insert_table_at(root, rowid, &rec, position).unwrap();
+                    general
+                        .insert_table_impl(root, rowid, &rec, None, false)
+                        .unwrap();
+                }
+                if op % 257 == 0 || op + 1 == n_ops {
+                    let n_pages = fast.pager().page_count();
+                    assert_eq!(n_pages, general.pager().page_count());
+                    let lock_pg = fast.lock_byte_page();
+                    for pgno in (1..=n_pages).filter(|&p| p != lock_pg) {
+                        let a = fast.pager_mut().read_page(pgno).unwrap().to_vec();
+                        let b = general.pager_mut().read_page(pgno).unwrap().to_vec();
+                        assert!(
+                            a == b,
+                            "page {pgno} differs after op {op} (page_size {page_size}, \
+                             auto_vacuum {auto_vacuum})"
+                        );
+                    }
+                }
+            }
+            assert!(positioned_hits > n_ops / 2);
+            assert_eq!(
+                fast.scan_table(root).unwrap(),
+                general.scan_table(root).unwrap()
+            );
+            assert_eq!(
+                fast.integrity_check(&[1, root]).unwrap(),
                 Vec::<String>::new()
             );
         }

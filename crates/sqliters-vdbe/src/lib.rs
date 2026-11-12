@@ -460,6 +460,61 @@ pub struct SingleRowInsertPlan {
     pub dup_msg: String,
 }
 
+/// Secondary index maintained by a [`RowidPointUpdatePlan`] / [`RowidPointDeletePlan`].
+#[derive(Debug, Clone)]
+pub struct PointDmlIndex {
+    pub root_pgno: Pgno,
+    /// Full key sort orders of the index record (indexed columns, then the trailing rowid).
+    pub orders: Arc<[KeySortOrder]>,
+    /// Logical column index (`Some(ci)`) or `None` for the `INTEGER PRIMARY KEY` / `rowid`.
+    pub col_slots: Vec<Option<usize>>,
+}
+
+/// One `SET col = <bind parameter | literal>` assignment of a [`RowidPointUpdatePlan`].
+#[derive(Debug, Clone)]
+pub struct PointUpdateSet {
+    pub col: usize,
+    pub src: InsertValSource,
+    pub affinity: TypeAffinity,
+    pub not_null: bool,
+}
+
+/// Direct B-tree plan for `UPDATE <tbl> SET c = <param|literal>, ... WHERE <rowid/ipk> = <param|literal>`
+/// attached to the VDBE program compiled for the same statement.
+///
+/// It performs exactly the B-tree calls of that program on its straight-line paths (row found
+/// and rewritten, or row absent) and declines every other situation, which then runs the
+/// program itself. `ticks_hit` / `ticks_miss` are the opcode counts the program executes on
+/// those two paths.
+#[derive(Debug, Clone)]
+pub struct RowidPointUpdatePlan {
+    pub root_pgno: Pgno,
+    pub n_cols: usize,
+    pub rowid_alias_col: Option<usize>,
+    pub key: InsertValSource,
+    pub sets: Vec<PointUpdateSet>,
+    /// Indexes with at least one assigned column (never UNIQUE), in program order.
+    pub indexes: Vec<PointDmlIndex>,
+    /// Bit `ci` set: the program reads stored column `ci` (to rebuild the row or an index key).
+    pub read_mask: u32,
+    pub ticks_hit: u64,
+    pub ticks_miss: u64,
+}
+
+/// Direct B-tree plan for `DELETE FROM <tbl> WHERE <rowid/ipk> = <param|literal>`; see
+/// [`RowidPointUpdatePlan`] for the contract.
+#[derive(Debug, Clone)]
+pub struct RowidPointDeletePlan {
+    pub root_pgno: Pgno,
+    pub n_cols: usize,
+    pub key: InsertValSource,
+    pub indexes: Vec<PointDmlIndex>,
+    /// Bit `ci` set: the program reads stored column `ci` (to build an index key).
+    pub read_mask: u32,
+    pub ticks_hit: u64,
+    pub ticks_miss: u64,
+}
+
 /// Compiled VDBE bytecode program (`Vdbe` in `vdbeInt.h`).
 #[derive(Debug, Clone)]
 pub struct VdbeProgram {
@@ -475,6 +530,8 @@ pub struct VdbeProgram {
     needs_stmt_subsavepoint: bool,
     rowid_point_select: Option<RowidPointSelectPlan>,
     single_row_insert: Option<SingleRowInsertPlan>,
+    rowid_point_update: Option<RowidPointUpdatePlan>,
+    rowid_point_delete: Option<RowidPointDeletePlan>,
 }
 
 impl VdbeProgram {
@@ -492,7 +549,29 @@ impl VdbeProgram {
             needs_stmt_subsavepoint: true,
             rowid_point_select: None,
             single_row_insert: None,
+            rowid_point_update: None,
+            rowid_point_delete: None,
         }
+    }
+
+    #[inline(always)]
+    pub fn rowid_point_update(&self) -> Option<&RowidPointUpdatePlan> {
+        self.rowid_point_update.as_ref()
+    }
+
+    #[inline]
+    pub fn set_rowid_point_update(&mut self, plan: Option<RowidPointUpdatePlan>) {
+        self.rowid_point_update = plan;
+    }
+
+    #[inline(always)]
+    pub fn rowid_point_delete(&self) -> Option<&RowidPointDeletePlan> {
+        self.rowid_point_delete.as_ref()
+    }
+
+    #[inline]
+    pub fn set_rowid_point_delete(&mut self, plan: Option<RowidPointDeletePlan>) {
+        self.rowid_point_delete = plan;
     }
 
     #[inline(always)]
@@ -892,9 +971,17 @@ pub struct VdbeWriteScratch {
     cursors: Vec<CursorState>,
     pool: VdbePool,
     scratch_jsonb: Vec<u8>,
+    scratch_row: Vec<u8>,
 }
 
 impl VdbeWriteScratch {
+    /// Reusable `(stored row copy, record under construction)` byte buffers for the direct
+    /// point `UPDATE` / `DELETE` plans.
+    #[inline(always)]
+    pub fn point_dml_buffers_mut(&mut self) -> (&mut Vec<u8>, &mut Vec<u8>) {
+        (&mut self.scratch_row, &mut self.pool.scratch_rec)
+    }
+
     /// Reusable byte buffer for encoding records without per-statement allocation.
     #[inline(always)]
     pub fn scratch_rec_mut(&mut self) -> &mut Vec<u8> {
@@ -1597,7 +1684,13 @@ fn step_ops_loop(
                     return Err(SqliteError::misuse("Insert on read-only table cursor"));
                 }
                 let btree = storage.btree_mut(db)?;
+                // A cursor still resting on the target row (single-row UPDATE) tells the B-tree
+                // where the row is, sparing a second descent.
+                let mut position = None;
                 if let Some(id) = prev_cur_id {
+                    if (ins.p5 & 0x04) == 0 {
+                        position = btree.table_cursor_position(id, root_pgno);
+                    }
                     btree.close_cursor(id);
                 }
                 if (ins.p5 & 0x04) != 0 {
@@ -1615,7 +1708,7 @@ fn step_ops_loop(
                         return Err(SqliteError::constraint(ext, msg));
                     }
                 } else {
-                    btree.insert_table(root_pgno, rowid, payload)?;
+                    btree.insert_table_at(root_pgno, rowid, payload, position)?;
                 }
                 if (ins.p5 & 0x01) != 0 {
                     runtime_ctx.last_insert_rowid = rowid;
@@ -1648,8 +1741,10 @@ fn step_ops_loop(
                     return Err(SqliteError::misuse("Delete on read-only table cursor"));
                 }
                 let btree = storage.btree_mut(db)?;
+                let mut position = None;
                 let rowid = if ins.p2 > 0 {
                     if let Some(id) = cursor_id {
+                        position = btree.table_cursor_position(id, root_pgno);
                         btree.close_cursor(id);
                     }
                     regs[ins.p2 as usize].value.to_integer_lossy()
@@ -1658,7 +1753,7 @@ fn step_ops_loop(
                         .ok_or_else(|| SqliteError::misuse("Delete without positioned cursor"))?;
                     btree.cursor_rowid(id)?
                 };
-                if btree.delete_table(root_pgno, rowid)? && (ins.p5 & 0x02) != 0 {
+                if btree.delete_table_at(root_pgno, rowid, position)? && (ins.p5 & 0x02) != 0 {
                     runtime_ctx.last_changes += 1;
                     runtime_ctx.total_changes += 1;
                 }

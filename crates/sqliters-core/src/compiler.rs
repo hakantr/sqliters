@@ -2,6 +2,8 @@
 //! `EXPLAIN` / `EXPLAIN QUERY PLAN` planner.
 #![forbid(unsafe_code)]
 
+use std::sync::Arc;
+
 use sqliters_syntax::{
     BinaryOp, BindParam, ColumnRef, CommonTableExpr, CompoundOp, ConflictAction, CurrentTimeKind,
     DeleteStmt, Expr, FromClause, FunctionArgs, IndexHint, InsertSource, InsertStmt,
@@ -13,8 +15,9 @@ use sqliters_types::{
     Collation, DatabaseId, ErrorCode, KeySortOrder, Result, SqliteError, TypeAffinity, Value,
 };
 use sqliters_vdbe::{
-    AggregateKind, InsertValSource, Instruction, Opcode, P4, PointProjCol, RowidKeySource,
-    RowidPointSelectPlan, SingleRowInsertCol, SingleRowInsertIndex, SingleRowInsertPlan,
+    AggregateKind, InsertValSource, Instruction, Opcode, P4, PointDmlIndex, PointProjCol,
+    PointUpdateSet, RowidKeySource, RowidPointDeletePlan, RowidPointSelectPlan,
+    RowidPointUpdatePlan, SingleRowInsertCol, SingleRowInsertIndex, SingleRowInsertPlan,
     VdbeProgram, affinity_to_p5, sqlite_compare_affinity,
 };
 
@@ -3572,6 +3575,7 @@ pub fn try_compile_delete_in_db_set(
 
     prog.emit(Instruction::new(Opcode::Delete, tcur, rid_reg, 0).with_p5(0x02));
 
+    let seek_addr = done_jumps[0];
     let done_addr = prog.current_addr();
     for j in done_jumps {
         prog.patch_p2(j, done_addr);
@@ -3580,12 +3584,80 @@ pub fn try_compile_delete_in_db_set(
         prog.emit(Instruction::new(Opcode::Close, ic, 0, 0));
     }
     prog.emit(Instruction::new(Opcode::Close, tcur, 0, 0));
-    prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
+    let halt_addr = prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
     prog.patch_p2(init_addr, body_start);
     if !prog.has_function_call() {
         prog.set_needs_stmt_subsavepoint(false);
     }
+    if is_pure_single_eq
+        && db_id == DatabaseId::MAIN
+        && n_cols <= POINT_DML_MAX_COLS
+        && !prog.has_function_call()
+        && let Some(key) = expr_to_point_dml_source(&key_expr)
+        && let Some(plan_indexes) = point_dml_indexes(&tbl, indexes.iter())
+    {
+        let read_mask = plan_indexes
+            .iter()
+            .flat_map(|idx| idx.col_slots.iter().flatten())
+            .fold(0u32, |mask, &ci| mask | (1u32 << ci));
+        prog.set_rowid_point_delete(Some(RowidPointDeletePlan {
+            root_pgno: tbl.root_pgno,
+            n_cols,
+            key,
+            indexes: plan_indexes,
+            read_mask,
+            ticks_hit: (halt_addr + 1) as u64,
+            ticks_miss: (seek_addr + 1 + (halt_addr - done_addr + 1)) as u64,
+        }));
+    }
     Ok(Some(prog))
+}
+
+/// Widest table / index key a direct point `UPDATE` / `DELETE` plan handles.
+const POINT_DML_MAX_COLS: usize = 16;
+
+/// A bind parameter or plain literal as a point-plan value source: exactly the expressions
+/// whose compiled form is a single `Variable` / `Null` / `Integer` / `Int64` / `Real` /
+/// `String8` / `Blob` instruction loading that same value.
+fn expr_to_point_dml_source(expr: &Expr) -> Option<InsertValSource> {
+    if !matches!(
+        expr,
+        Expr::Null
+            | Expr::Bool(_)
+            | Expr::Integer(_)
+            | Expr::Float(_)
+            | Expr::String(_)
+            | Expr::Blob(_)
+            | Expr::Bind(_)
+    ) {
+        return None;
+    }
+    let mut has_builtin_jsonb = false;
+    expr_to_insert_val_source(expr, false, &mut has_builtin_jsonb)
+}
+
+/// Index descriptions for a point plan, or `None` when a key is too wide for it.
+fn point_dml_indexes<'a>(
+    tbl: &TableSchema,
+    indexes: impl Iterator<Item = &'a IndexSchema>,
+) -> Option<Vec<PointDmlIndex>> {
+    let mut out = Vec::new();
+    for idx in indexes {
+        if idx.columns.len() >= POINT_DML_MAX_COLS {
+            return None;
+        }
+        let mut col_slots = Vec::with_capacity(idx.columns.len());
+        for ic in &idx.columns {
+            let ci = ic.col_idx?;
+            col_slots.push((tbl.rowid_alias_col != Some(ci)).then_some(ci));
+        }
+        out.push(PointDmlIndex {
+            root_pgno: idx.root_pgno,
+            orders: Arc::from(idx.key_sort_orders()),
+            col_slots,
+        });
+    }
+    Some(out)
 }
 
 /// Compiles single-row `UPDATE <table> SET col = <expr>, ... WHERE <rowid/ipk> = <expr>`
@@ -3890,6 +3962,7 @@ pub fn try_compile_update_in_db_set(
     ));
     prog.emit(Instruction::new(Opcode::Insert, tcur, rec_reg, rid_reg).with_p5(0x02));
 
+    let seek_addr = done_jumps[0];
     let done_addr = prog.current_addr();
     for j in done_jumps {
         prog.patch_p2(j, done_addr);
@@ -3899,7 +3972,7 @@ pub fn try_compile_update_in_db_set(
         prog.emit(Instruction::new(Opcode::Close, ic, 0, 0));
     }
     prog.emit(Instruction::new(Opcode::Close, tcur, 0, 0));
-    prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
+    let halt_addr = prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
 
     for (j_addr, ci) in notnull_jumps {
         let halt_addr = prog.current_addr();
@@ -3922,6 +3995,45 @@ pub fn try_compile_update_in_db_set(
     prog.patch_p2(init_addr, body_start);
     if can_elide_stmt_sp {
         prog.set_needs_stmt_subsavepoint(false);
+    }
+    if is_pure_single_eq
+        && can_elide_stmt_sp
+        && db_id == DatabaseId::MAIN
+        && n_cols <= POINT_DML_MAX_COLS
+        && let Some(key) = expr_to_point_dml_source(&key_expr)
+        && let Some(sets) = assigned_exprs
+            .iter()
+            .map(|&(ci, expr)| {
+                expr_to_point_dml_source(expr).map(|src| PointUpdateSet {
+                    col: ci,
+                    src,
+                    affinity: tbl.columns[ci].affinity,
+                    not_null: tbl.columns[ci].not_null.is_some(),
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+        && let Some(plan_indexes) = point_dml_indexes(&tbl, affected_indexes.iter())
+    {
+        let mut read_mask = 0u32;
+        for (ci, &modified) in modified_col.iter().enumerate() {
+            let in_affected_index = affected_indexes
+                .iter()
+                .any(|idx| idx.columns.iter().any(|ic| ic.col_idx == Some(ci)));
+            if tbl.rowid_alias_col != Some(ci) && (!modified || in_affected_index) {
+                read_mask |= 1u32 << ci;
+            }
+        }
+        prog.set_rowid_point_update(Some(RowidPointUpdatePlan {
+            root_pgno: tbl.root_pgno,
+            n_cols,
+            rowid_alias_col: tbl.rowid_alias_col,
+            key,
+            sets,
+            indexes: plan_indexes,
+            read_mask,
+            ticks_hit: (halt_addr + 1) as u64,
+            ticks_miss: (seek_addr + 1 + (halt_addr - done_addr + 1)) as u64,
+        }));
     }
     Ok(Some(prog))
 }

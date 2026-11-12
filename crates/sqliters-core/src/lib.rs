@@ -48,14 +48,15 @@ pub use sqliters_types::{
     VirtualTableModule,
 };
 use sqliters_types::{
-    ConflictResolutionEffect, DatabaseKind, ErrorCode, LockGeometry, Pgno, Result,
-    SQLITE_DEFAULT_PAGE_SIZE, SqliteError, TextEncoding, TypeAffinity, Value,
-    encode_value_refs_record_into, extended,
+    ConflictResolutionEffect, DatabaseKind, ErrorCode, LockGeometry, Pgno, RawFieldSpan,
+    RecordPart, Result, SQLITE_DEFAULT_PAGE_SIZE, SqliteError, TextEncoding, TypeAffinity, Value,
+    encode_record_parts_into, encode_value_refs_record_into, extended,
+    locate_roundtrip_stable_fields,
 };
 pub use sqliters_vdbe::BtreeAccess;
 use sqliters_vdbe::{
-    InsertValSource, RowidKeySource, SingleRowInsertPlan, TestFunctionsScope, VdbeProgram, VdbeVm,
-    VmRuntimeContext, VmStep,
+    InsertValSource, PointDmlIndex, RowidKeySource, RowidPointDeletePlan, RowidPointUpdatePlan,
+    SingleRowInsertPlan, TestFunctionsScope, VdbeProgram, VdbeVm, VmRuntimeContext, VmStep,
 };
 use sqliters_vfs::{MemoryVfs, OpenFlags, OsVfs, Vfs};
 
@@ -9541,6 +9542,262 @@ fn execute_single_row_insert_plan(
     run_res
 }
 
+/// Result of a direct point `UPDATE` / `DELETE` plan.
+enum PointDmlOutcome {
+    /// The statement ran to completion: `changes` rows changed, and the VDBE program would have
+    /// executed `ticks` instructions.
+    Done { changes: u64, ticks: u64 },
+    /// Nothing was modified; the VDBE program must run the statement.
+    NotHandled,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Statements completed by a direct point plan on this thread (test instrumentation).
+    static POINT_DML_PLAN_RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Columns / key fields a point plan handles (`POINT_DML_MAX_COLS` in the compiler).
+const POINT_DML_MAX_FIELDS: usize = 16;
+
+/// Reads the row `rowid` of a point plan: `Ok(Some((leaf_pgno, cell_idx)))` with its record in
+/// `row` and its first `n_cols` fields in `spans`, `Ok(None)` when there is no such row, and
+/// `Err(())` when the plan has to decline (record on overflow pages, unreadable page, a field
+/// the program would read that does not survive `decode -> encode`, or fewer stored fields
+/// than columns).
+#[allow(clippy::too_many_arguments)]
+fn point_dml_read_row(
+    bt: &mut Btree,
+    root_pgno: Pgno,
+    rowid: i64,
+    n_cols: usize,
+    read_mask: u32,
+    parse_record: bool,
+    row: &mut Vec<u8>,
+    spans: &mut [RawFieldSpan; POINT_DML_MAX_FIELDS],
+) -> std::result::Result<Option<(Pgno, usize)>, ()> {
+    match bt.seek_table_row_local(root_pgno, rowid, row) {
+        Ok(sqliters_btree::TableRowSeek::Missing) => Ok(None),
+        Ok(sqliters_btree::TableRowSeek::Local {
+            leaf_pgno,
+            cell_idx,
+        }) => {
+            if parse_record
+                && !locate_roundtrip_stable_fields(
+                    row,
+                    bt.encoding(),
+                    read_mask,
+                    &mut spans[..n_cols],
+                )
+            {
+                return Err(());
+            }
+            Ok(Some((leaf_pgno, cell_idx)))
+        }
+        Ok(sqliters_btree::TableRowSeek::Spilled) | Err(_) => Err(()),
+    }
+}
+
+/// Builds the key record of `idx` for the row `rowid`: stored fields are copied from `row`
+/// except the columns overridden by `new_vals` (assigned columns of an `UPDATE`).
+fn point_dml_index_key(
+    idx: &PointDmlIndex,
+    row: &[u8],
+    spans: &[RawFieldSpan; POINT_DML_MAX_FIELDS],
+    new_vals: Option<&[Option<&Value>; POINT_DML_MAX_FIELDS]>,
+    rid_val: &Value,
+    enc: TextEncoding,
+    out: &mut Vec<u8>,
+) {
+    let mut parts = [RecordPart::Value(rid_val); POINT_DML_MAX_FIELDS + 1];
+    let k_len = idx.col_slots.len();
+    for (part, slot) in parts.iter_mut().zip(&idx.col_slots) {
+        if let Some(ci) = *slot {
+            *part = match new_vals.and_then(|nv| nv[ci]) {
+                Some(v) => RecordPart::Value(v),
+                None => RecordPart::Raw {
+                    serial_type: spans[ci].serial_type,
+                    body: &row[spans[ci].start..spans[ci].end],
+                },
+            };
+        }
+    }
+    encode_record_parts_into(&parts[..=k_len], enc, out);
+}
+
+/// Runs `DELETE FROM <tbl> WHERE <rowid> = <param|literal>` directly on the B-tree: the same
+/// index and table deletions, with the same key bytes, as the VDBE program compiled for the
+/// statement. Declines (`NotHandled`, nothing modified) whenever it cannot prove that.
+fn execute_rowid_point_delete_plan(
+    plan: &RowidPointDeletePlan,
+    params: &[Value],
+    row: &mut Vec<u8>,
+    rec: &mut Vec<u8>,
+    bt: &mut Btree,
+) -> Result<PointDmlOutcome> {
+    let enc = bt.encoding();
+    if enc != TextEncoding::Utf8
+        || plan.n_cols > POINT_DML_MAX_FIELDS
+        || plan
+            .indexes
+            .iter()
+            .any(|i| i.col_slots.len() >= POINT_DML_MAX_FIELDS)
+    {
+        return Ok(PointDmlOutcome::NotHandled);
+    }
+    bt.check_interrupted()?;
+    if bt.transaction_state() != TransactionState::Write {
+        bt.begin_write()?;
+    }
+    let Some(rowid) = resolve_insert_val_source(&plan.key, params).to_exact_rowid_i64() else {
+        return Ok(PointDmlOutcome::Done {
+            changes: 0,
+            ticks: plan.ticks_miss,
+        });
+    };
+    let mut spans = [RawFieldSpan::default(); POINT_DML_MAX_FIELDS];
+    let position = match point_dml_read_row(
+        bt,
+        plan.root_pgno,
+        rowid,
+        plan.n_cols,
+        plan.read_mask,
+        !plan.indexes.is_empty(),
+        row,
+        &mut spans,
+    ) {
+        Ok(Some(position)) => position,
+        Ok(None) => {
+            return Ok(PointDmlOutcome::Done {
+                changes: 0,
+                ticks: plan.ticks_miss,
+            });
+        }
+        Err(()) => return Ok(PointDmlOutcome::NotHandled),
+    };
+
+    let rid_val = Value::Integer(rowid);
+    for idx in &plan.indexes {
+        point_dml_index_key(idx, row, &spans, None, &rid_val, enc, rec);
+        bt.delete_index_raw(idx.root_pgno, rec, &idx.orders)?;
+    }
+    let deleted = bt.delete_table_at(plan.root_pgno, rowid, Some(position))?;
+    Ok(PointDmlOutcome::Done {
+        changes: u64::from(deleted),
+        ticks: plan.ticks_hit,
+    })
+}
+
+/// Runs `UPDATE <tbl> SET c = <param|literal>, ... WHERE <rowid> = <param|literal>` directly on
+/// the B-tree: the same index deletions / insertions and row replacement, with the same record
+/// bytes, as the VDBE program compiled for the statement. Declines (`NotHandled`, nothing
+/// modified) whenever it cannot prove that — including a NOT NULL violation, which the program
+/// then reports.
+fn execute_rowid_point_update_plan(
+    plan: &RowidPointUpdatePlan,
+    params: &[Value],
+    row: &mut Vec<u8>,
+    rec: &mut Vec<u8>,
+    bt: &mut Btree,
+) -> Result<PointDmlOutcome> {
+    let enc = bt.encoding();
+    if enc != TextEncoding::Utf8
+        || plan.n_cols > POINT_DML_MAX_FIELDS
+        || plan.sets.len() > POINT_DML_MAX_FIELDS
+        || plan
+            .indexes
+            .iter()
+            .any(|i| i.col_slots.len() >= POINT_DML_MAX_FIELDS)
+    {
+        return Ok(PointDmlOutcome::NotHandled);
+    }
+    bt.check_interrupted()?;
+    if bt.transaction_state() != TransactionState::Write {
+        bt.begin_write()?;
+    }
+    let Some(rowid) = resolve_insert_val_source(&plan.key, params).to_exact_rowid_i64() else {
+        return Ok(PointDmlOutcome::Done {
+            changes: 0,
+            ticks: plan.ticks_miss,
+        });
+    };
+    let mut spans = [RawFieldSpan::default(); POINT_DML_MAX_FIELDS];
+    let position = match point_dml_read_row(
+        bt,
+        plan.root_pgno,
+        rowid,
+        plan.n_cols,
+        plan.read_mask,
+        true,
+        row,
+        &mut spans,
+    ) {
+        Ok(Some(position)) => position,
+        Ok(None) => {
+            return Ok(PointDmlOutcome::Done {
+                changes: 0,
+                ticks: plan.ticks_miss,
+            });
+        }
+        Err(()) => return Ok(PointDmlOutcome::NotHandled),
+    };
+
+    // New values: column affinity, then NOT NULL (left to the program to report).
+    let mut coerced: [Value; POINT_DML_MAX_FIELDS] = std::array::from_fn(|_| Value::Null);
+    let mut is_coerced = [false; POINT_DML_MAX_FIELDS];
+    for (i, set) in plan.sets.iter().enumerate() {
+        let raw_val = resolve_insert_val_source(&set.src, params);
+        let is_null = if set.affinity == TypeAffinity::Blob
+            || affinity_is_noop_for_insert(set.affinity, raw_val)
+        {
+            raw_val.is_null()
+        } else {
+            coerced[i] = set.affinity.apply(raw_val.clone());
+            is_coerced[i] = true;
+            coerced[i].is_null()
+        };
+        if is_null && set.not_null {
+            return Ok(PointDmlOutcome::NotHandled);
+        }
+    }
+    let mut new_vals: [Option<&Value>; POINT_DML_MAX_FIELDS] = [None; POINT_DML_MAX_FIELDS];
+    for (i, set) in plan.sets.iter().enumerate() {
+        new_vals[set.col] = Some(if is_coerced[i] {
+            &coerced[i]
+        } else {
+            resolve_insert_val_source(&set.src, params)
+        });
+    }
+
+    let rid_val = Value::Integer(rowid);
+    for idx in &plan.indexes {
+        point_dml_index_key(idx, row, &spans, None, &rid_val, enc, rec);
+        bt.delete_index_raw(idx.root_pgno, rec, &idx.orders)?;
+        point_dml_index_key(idx, row, &spans, Some(&new_vals), &rid_val, enc, rec);
+        bt.insert_index(idx.root_pgno, rec, &idx.orders)?;
+    }
+
+    let mut parts = [RecordPart::Value(&Value::Null); POINT_DML_MAX_FIELDS];
+    for (ci, part) in parts[..plan.n_cols].iter_mut().enumerate() {
+        if plan.rowid_alias_col == Some(ci) {
+            continue;
+        }
+        *part = match new_vals[ci] {
+            Some(v) => RecordPart::Value(v),
+            None => RecordPart::Raw {
+                serial_type: spans[ci].serial_type,
+                body: &row[spans[ci].start..spans[ci].end],
+            },
+        };
+    }
+    encode_record_parts_into(&parts[..plan.n_cols], enc, rec);
+    bt.insert_table_at(plan.root_pgno, rowid, rec, Some(position))?;
+    Ok(PointDmlOutcome::Done {
+        changes: 1,
+        ticks: plan.ticks_hit,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn try_fast_read_plan_fields(
     hid: HandleId,
@@ -9976,6 +10233,38 @@ fn try_fast_compiled_main_write_fields(
             }
             Err(e) => (Err(e), inner.runtime.last_insert_rowid, 0u64),
         }
+    } else if let Some(point_res) = {
+        // Direct B-tree plan for single-row `UPDATE` / `DELETE` by rowid, when one is attached
+        // and applies; otherwise the VDBE program below runs.
+        let point_outcome = if inner.progress.is_enabled() {
+            None
+        } else if let Some(upd_plan) = prog.rowid_point_update() {
+            let bt = inner.db_set.slots_mut()[0].btree.as_mut().unwrap();
+            let (row, rec) = write_vm_scratch.point_dml_buffers_mut();
+            Some(execute_rowid_point_update_plan(
+                upd_plan, params, row, rec, bt,
+            ))
+        } else if let Some(del_plan) = prog.rowid_point_delete() {
+            let bt = inner.db_set.slots_mut()[0].btree.as_mut().unwrap();
+            let (row, rec) = write_vm_scratch.point_dml_buffers_mut();
+            Some(execute_rowid_point_delete_plan(
+                del_plan, params, row, rec, bt,
+            ))
+        } else {
+            None
+        };
+        match point_outcome {
+            Some(Ok(PointDmlOutcome::Done { changes, ticks })) => {
+                #[cfg(test)]
+                POINT_DML_PLAN_RUNS.with(|runs| runs.set(runs.get() + 1));
+                inner.progress.add_ticks_without_handler(ticks);
+                Some((Ok(()), inner.runtime.last_insert_rowid, changes))
+            }
+            Some(Err(e)) => Some((Err(e), inner.runtime.last_insert_rowid, 0u64)),
+            Some(Ok(PointDmlOutcome::NotHandled)) | None => None,
+        }
+    } {
+        point_res
     } else {
         let prev_ts = inner.runtime.stmt_timestamp_ms;
         let stmt_ts = if prev_ts.is_some() {
@@ -10460,6 +10749,392 @@ fn collect_window_spec_params(
 mod tests {
     use super::*;
     use sqliters_vfs::MemoryVfs;
+
+    /// The direct point `UPDATE` / `DELETE` plans must be indistinguishable from the VDBE
+    /// programs they shadow: same outcome and error per statement, same `changes()` /
+    /// `total_changes()`, same progress-tick count, same table and index contents. One
+    /// connection runs the plans; the other has a (never firing) progress handler installed,
+    /// which routes every statement through the VDBE program.
+    ///
+    /// Covers bound parameters and literals of every type (column affinity, NOT NULL, rowid keys
+    /// given as text / real / NULL / blob), missing rows, rows on overflow pages (old or new),
+    /// rows shorter than the table (`ALTER TABLE ADD COLUMN`), NOCASE / DESC / rowid index
+    /// columns, explicit transactions and savepoints with rollbacks, a `SELECT` being stepped
+    /// on the same table, and schema changes (index, trigger, dropped index) under statements
+    /// that stay prepared.
+    #[test]
+    fn point_update_delete_plans_match_vdbe_programs() {
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum Plan {
+            Update,
+            Delete,
+            None,
+        }
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        /// A value of any type; text / blob stay short (they may land in indexed columns).
+        fn value(state: &mut u64) -> Value {
+            let r = next(state);
+            let ints: [i64; 10] = [
+                0,
+                1,
+                -1,
+                100,
+                -129,
+                40_000,
+                -9_000_000,
+                3_000_000_000,
+                150_000_000_000_000,
+                i64::MIN,
+            ];
+            match (r >> 8) % 12 {
+                0 => Value::Null,
+                1..=3 => Value::Integer(ints[((r >> 16) % 10) as usize]),
+                4 => Value::Integer(((r >> 16) % 50) as i64),
+                5 => Value::Real([1.5, -0.0, 3.0, -2.25, 1e300][((r >> 16) % 5) as usize]),
+                6 => Value::Text(
+                    [
+                        "12", " 7 ", "1e2", "abc", "ABC", "", "h\u{e9}", "0x10", "-3.0",
+                    ][((r >> 16) % 9) as usize]
+                        .to_owned(),
+                ),
+                7 => Value::Text(format!("C-{:04}", (r >> 16) % 40)),
+                8 => Value::Text("x".repeat(((r >> 16) % 40) as usize)),
+                9 => Value::Blob(vec![(r >> 16) as u8; ((r >> 24) % 5) as usize]),
+                _ => Value::Integer(((r >> 16) % 10_000) as i64),
+            }
+        }
+        /// A value for non-indexed columns: often long enough to push the row (or, on small
+        /// pages, the value alone) onto overflow pages.
+        fn wide_value(state: &mut u64, page_size: u32) -> Value {
+            let r = next(state);
+            match (r >> 8) % 6 {
+                0 => Value::Text("w".repeat(((r >> 16) % (2 * page_size as u64)) as usize)),
+                1 => Value::Blob(vec![7u8; ((r >> 16) % (page_size as u64 / 2)) as usize]),
+                2 => Value::Text("m".repeat(((r >> 16) % 200) as usize)),
+                _ => value(state),
+            }
+        }
+        fn key(state: &mut u64, n_rows: i64) -> Value {
+            let r = next(state);
+            let id = 1 + ((r >> 16) % (n_rows as u64 + 5)) as i64;
+            match (r >> 8) % 16 {
+                0 => Value::Null,
+                1 => Value::Text(id.to_string()),
+                2 => Value::Real(id as f64),
+                3 => Value::Real(id as f64 + 0.5),
+                4 => Value::Blob(vec![1]),
+                5 => Value::Text("nope".to_owned()),
+                6 => Value::Text(format!(" {id}.0 ")),
+                _ => Value::Integer(id),
+            }
+        }
+
+        const SCHEMA: &str =
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a, b TEXT, c REAL NOT NULL, d INT, e BLOB);
+             CREATE INDEX t_ad ON t(a, d);
+             CREATE INDEX t_b ON t(b COLLATE NOCASE);
+             CREATE INDEX t_c ON t(c DESC, id, a);
+             CREATE TABLE u(x NOT NULL, y);
+             CREATE TABLE v(id INTEGER PRIMARY KEY, p UNIQUE, q);
+             CREATE TABLE w(k INTEGER PRIMARY KEY, a, b);
+             CREATE TABLE log(id, a);";
+        // Rows of `w` written before this are two fields short of the table.
+        const WIDEN_W: &str = "ALTER TABLE w ADD COLUMN z;
+             ALTER TABLE w ADD COLUMN y TEXT;
+             CREATE INDEX w_za ON w(z, a);";
+        // ?1, ?2: short values; ?3: rowid key; ?4: wide value (never indexed).
+        let statements: [(&str, Plan); 30] = [
+            ("UPDATE t SET d = ?1, a = ?2 WHERE id = ?3", Plan::Update),
+            ("UPDATE t SET b = ?1 WHERE id = ?3", Plan::Update),
+            ("UPDATE t SET c = ?2 WHERE id = ?3", Plan::Update),
+            (
+                "UPDATE t SET e = ?4, c = ?2, b = ?1 WHERE rowid = ?3",
+                Plan::Update,
+            ),
+            ("UPDATE t SET a = 7, d = 'seven' WHERE id = 5", Plan::Update),
+            (
+                "UPDATE t SET a = NULL, b = x'00ff', c = 2.5, d = TRUE WHERE id = '7'",
+                Plan::Update,
+            ),
+            (
+                "UPDATE t SET d = 3.0, a = '12', c = 4, b = 5 WHERE id = 9.0",
+                Plan::Update,
+            ),
+            ("UPDATE t SET c = NULL WHERE id = ?3", Plan::Update),
+            ("UPDATE t SET e = ?4 WHERE ?3 = id", Plan::Update),
+            (
+                "UPDATE t SET e = ?4, d = ?1 WHERE _rowid_ = ?3",
+                Plan::Update,
+            ),
+            ("DELETE FROM t WHERE id = ?3", Plan::Delete),
+            ("DELETE FROM t WHERE id = 11", Plan::Delete),
+            ("DELETE FROM t WHERE rowid = '13'", Plan::Delete),
+            ("DELETE FROM t WHERE 17.0 = id", Plan::Delete),
+            ("UPDATE u SET x = ?1, y = ?4 WHERE rowid = ?3", Plan::Update),
+            ("DELETE FROM u WHERE rowid = ?3", Plan::Delete),
+            ("UPDATE v SET q = ?4 WHERE id = ?3", Plan::Update),
+            ("DELETE FROM v WHERE id = ?3", Plan::Delete),
+            ("UPDATE w SET a = ?1 WHERE k = ?3", Plan::Update),
+            ("UPDATE w SET z = ?2, b = ?4 WHERE k = ?3", Plan::Update),
+            ("UPDATE w SET y = ?1 WHERE k = ?3", Plan::Update),
+            ("DELETE FROM w WHERE k = ?3", Plan::Delete),
+            // Shapes a point plan must not be attached to.
+            ("UPDATE v SET p = ?1 WHERE id = ?3", Plan::None),
+            ("UPDATE t SET d = d + 1 WHERE id = ?3", Plan::None),
+            (
+                "UPDATE t SET a = ?1 WHERE id = ?3 AND d IS NOT NULL",
+                Plan::None,
+            ),
+            ("UPDATE OR REPLACE t SET a = ?1 WHERE id = ?3", Plan::None),
+            ("DELETE FROM t WHERE id = ?3 + 0", Plan::None),
+            // Refills, so that the tables do not drain.
+            (
+                "INSERT OR IGNORE INTO t VALUES (?3, ?1, ?2, 0.5, ?2, ?4)",
+                Plan::None,
+            ),
+            ("INSERT OR IGNORE INTO v VALUES (?3, ?3, ?4)", Plan::None),
+            (
+                "INSERT OR IGNORE INTO w(k, a, b) VALUES (?3, ?1, ?2)",
+                Plan::None,
+            ),
+        ];
+        let dumps = [
+            "SELECT * FROM t ORDER BY id",
+            "SELECT id FROM t ORDER BY a, d, id",
+            "SELECT id FROM t ORDER BY b COLLATE NOCASE, id",
+            "SELECT id FROM t ORDER BY c DESC, id, a",
+            "SELECT rowid, * FROM u ORDER BY rowid",
+            "SELECT * FROM v ORDER BY id",
+            "SELECT k FROM v, w WHERE k = id AND p IS q ORDER BY p",
+            "SELECT * FROM w ORDER BY k",
+            "SELECT k FROM w ORDER BY z, a, k",
+            "SELECT count(*), total(id), group_concat(a) FROM log",
+            "PRAGMA integrity_check",
+        ];
+        let tx_controls = [
+            "BEGIN",
+            "COMMIT",
+            "ROLLBACK",
+            "SAVEPOINT s1",
+            "RELEASE s1",
+            "ROLLBACK TO s1",
+            "COMMIT",
+            "SAVEPOINT s2",
+        ];
+        // Applied one after another while the statements stay prepared.
+        let schema_changes = [
+            "CREATE INDEX t_d ON t(d, b)",
+            "CREATE TRIGGER t_au AFTER UPDATE OF a ON t BEGIN INSERT INTO log VALUES (old.id, new.a); END",
+            "DROP INDEX t_ad",
+            "DROP TRIGGER t_au",
+        ];
+
+        for (page_size, n_rows, auto_vacuum) in [
+            (4096u32, 600i64, false),
+            (512, 300, false),
+            (1024, 40, true),
+            (65_536, 200, false),
+        ] {
+            let plan_conn = Connection::open_in_memory().unwrap();
+            let vdbe_conn = Connection::open_in_memory().unwrap();
+            let conns = [&plan_conn, &vdbe_conn];
+            let mut seed = 0x51_7C_C1_B7_27_22_0A_95u64 ^ u64::from(page_size);
+            for conn in conns {
+                conn.execute_batch(&format!(
+                    "PRAGMA page_size={page_size}; PRAGMA auto_vacuum={};",
+                    u8::from(auto_vacuum)
+                ))
+                .unwrap();
+                conn.execute_batch(SCHEMA).unwrap();
+            }
+            for id in 1..=n_rows {
+                let params = [
+                    Value::Integer(id),
+                    value(&mut seed),
+                    value(&mut seed),
+                    Value::Real(id as f64 / 4.0),
+                    value(&mut seed),
+                    wide_value(&mut seed, page_size),
+                ];
+                for conn in conns {
+                    conn.query("INSERT INTO t VALUES (?1, ?2, ?3, ?4, ?5, ?6)", &params)
+                        .unwrap();
+                    // `u.x` is NOT NULL: a NULL here is simply skipped on both connections.
+                    conn.query(
+                        "INSERT INTO u VALUES (?1, ?2)",
+                        &[params[1].clone(), params[5].clone()],
+                    )
+                    .ok();
+                    conn.query(
+                        "INSERT INTO v VALUES (?1, ?1, ?2)",
+                        &[params[0].clone(), params[5].clone()],
+                    )
+                    .unwrap();
+                    conn.query("INSERT INTO w VALUES (?1, ?2, ?3)", &params[..3])
+                        .unwrap();
+                }
+            }
+            for conn in conns {
+                conn.execute_batch(WIDEN_W).unwrap();
+            }
+            vdbe_conn
+                .progress_handler(i32::MAX, Some(Box::new(|| false)))
+                .unwrap();
+
+            let mut plan_stmts: Vec<Statement> = statements
+                .iter()
+                .map(|(sql, _)| plan_conn.prepare(sql).unwrap())
+                .collect();
+            let mut vdbe_stmts: Vec<Statement> = statements
+                .iter()
+                .map(|(sql, _)| vdbe_conn.prepare(sql).unwrap())
+                .collect();
+            for (stmt, (sql, expect)) in plan_stmts.iter().zip(statements) {
+                let got = match stmt.compiled_vdbe.as_deref() {
+                    Some(prog) if prog.rowid_point_update().is_some() => Plan::Update,
+                    Some(prog) if prog.rowid_point_delete().is_some() => Plan::Delete,
+                    _ => Plan::None,
+                };
+                assert_eq!(got, expect, "point plan of {sql}");
+            }
+            let mut plan_readers: Vec<Statement> = Vec::new();
+            let mut vdbe_readers: Vec<Statement> = Vec::new();
+            for sql in ["SELECT id, a, d FROM t ORDER BY id", "SELECT k, z FROM w"] {
+                plan_readers.push(plan_conn.prepare(sql).unwrap());
+                vdbe_readers.push(vdbe_conn.prepare(sql).unwrap());
+            }
+
+            let plan_runs_before = POINT_DML_PLAN_RUNS.with(std::cell::Cell::get);
+            let mut rows_changed = 0u64;
+            let mut readers_open = false;
+            let n_ops = 9_000u32;
+            for op in 0..n_ops {
+                let r = next(&mut seed);
+                if r.is_multiple_of(97) {
+                    let sql = tx_controls[((r >> 8) % tx_controls.len() as u64) as usize];
+                    let a = plan_conn.execute_batch(sql).map_err(|e| e.to_string());
+                    let b = vdbe_conn.execute_batch(sql).map_err(|e| e.to_string());
+                    assert_eq!(a, b, "op {op}: {sql}");
+                    continue;
+                }
+                if r.is_multiple_of(if readers_open { 151 } else { 1_201 }) {
+                    // Start (or finish) scans that stay open across the following statements.
+                    for (readers, label) in
+                        [(&mut plan_readers, "plan"), (&mut vdbe_readers, "vdbe")]
+                    {
+                        for reader in readers.iter_mut() {
+                            if readers_open {
+                                reader.reset().unwrap();
+                            } else {
+                                assert!(
+                                    matches!(reader.step(), Ok(StepResult::Row(_))),
+                                    "{label} reader"
+                                );
+                            }
+                        }
+                    }
+                    readers_open = !readers_open;
+                    continue;
+                }
+                if readers_open && r.is_multiple_of(7) {
+                    let mut seen = Vec::new();
+                    for readers in [&mut plan_readers, &mut vdbe_readers] {
+                        for reader in readers.iter_mut() {
+                            seen.push(match reader.step() {
+                                Ok(StepResult::Row(row)) => Ok(Some(row.get(0).cloned())),
+                                Ok(StepResult::Done) => Ok(None),
+                                Err(e) => Err(e.to_string()),
+                            });
+                        }
+                    }
+                    let (plan_seen, vdbe_seen) = seen.split_at(plan_readers.len());
+                    assert_eq!(plan_seen, vdbe_seen, "op {op}: open scans diverged");
+                }
+                if op > n_ops / 2 && (op - n_ops / 2).is_multiple_of(n_ops / 10) {
+                    let idx = ((op - n_ops / 2) / (n_ops / 10)) as usize - 1;
+                    if let Some(sql) = schema_changes.get(idx) {
+                        // DDL on a table with a scan in progress is refused (SQLITE_LOCKED).
+                        if readers_open {
+                            for reader in plan_readers.iter_mut().chain(&mut vdbe_readers) {
+                                reader.reset().unwrap();
+                            }
+                            readers_open = false;
+                        }
+                        for conn in conns {
+                            conn.execute_batch(sql).unwrap();
+                        }
+                    }
+                }
+                let which = ((r >> 8) % statements.len() as u64) as usize;
+                let sql = statements[which].0;
+                let params = [
+                    value(&mut seed),
+                    value(&mut seed),
+                    key(&mut seed, n_rows),
+                    wide_value(&mut seed, page_size),
+                ];
+                let ticks_before = (
+                    plan_conn.progress_op_count().unwrap(),
+                    vdbe_conn.progress_op_count().unwrap(),
+                );
+                let mut outcomes = Vec::new();
+                for (conn, stmts) in [(&plan_conn, &mut plan_stmts), (&vdbe_conn, &mut vdbe_stmts)]
+                {
+                    let stmt = &mut stmts[which];
+                    for (i, p) in params.iter().enumerate() {
+                        if sql.contains(&format!("?{}", i + 1)) {
+                            stmt.bind(i + 1, p.clone()).unwrap();
+                        }
+                    }
+                    let res = stmt
+                        .step()
+                        .map(|r| matches!(r, StepResult::Done))
+                        .map_err(|e| (e.extended_code, e.to_string()));
+                    stmt.reset().ok();
+                    outcomes.push((res, conn.changes(), conn.total_changes()));
+                }
+                assert_eq!(outcomes[0], outcomes[1], "op {op}: {sql} with {params:?}");
+                if statements[which].1 != Plan::None {
+                    assert_eq!(
+                        plan_conn.progress_op_count().unwrap() - ticks_before.0,
+                        vdbe_conn.progress_op_count().unwrap() - ticks_before.1,
+                        "op {op}: tick count of {sql} with {params:?}"
+                    );
+                }
+                if outcomes[0].0.is_ok() {
+                    rows_changed += outcomes[0].1;
+                }
+                if op % 500 == 499 || op + 1 == n_ops {
+                    for sql in dumps {
+                        let a = plan_conn.query(sql, &[]).unwrap().rows;
+                        let b = vdbe_conn.query(sql, &[]).unwrap().rows;
+                        assert_eq!(a, b, "{sql} after op {op}");
+                    }
+                }
+            }
+            assert!(rows_changed > 1_500, "only {rows_changed} rows changed");
+            let plan_runs = POINT_DML_PLAN_RUNS.with(std::cell::Cell::get) - plan_runs_before;
+            // (On 64 KiB pages only statements that find no row are completed by a plan.)
+            assert!(
+                plan_runs > 3_000,
+                "only {plan_runs} statements took a point plan"
+            );
+            drop((plan_readers, vdbe_readers));
+            for conn in conns {
+                while conn.execute_batch("COMMIT").is_ok() {}
+                let ok = conn
+                    .query_row("PRAGMA integrity_check", &[])
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(ok.get(0), Some(&Value::Text("ok".to_owned())));
+            }
+        }
+    }
 
     /// Streaming aggregate plans over a non-covering index scan must visit rows in index order
     /// (ascending groups, per-group rowid order here) and group `1` with `1.0`.

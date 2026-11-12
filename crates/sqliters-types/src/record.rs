@@ -270,6 +270,143 @@ pub fn encode_runtime_record_into(values: &[RuntimeValue], enc: TextEncoding, ou
     }
 }
 
+/// Byte range of one field body inside a stored record, with its serial type.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RawFieldSpan {
+    pub serial_type: u64,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// `true` when decoding the stored field `(serial_type, body)` to a [`Value`] and encoding that
+/// value again yields the same serial type and bytes: NULL, minimally encoded integers,
+/// non-NaN reals, blobs, and text that is valid UTF-8 on a UTF-8 database.
+#[inline]
+pub fn raw_field_is_roundtrip_stable(serial_type: u64, body: &[u8], enc: TextEncoding) -> bool {
+    match serial_type {
+        0 | 8 | 9 => true,
+        1..=6 => match int_serial_len(serial_type as u8) {
+            Some(len) if len == body.len() => {
+                let v = read_int_serial(serial_type as u8, body);
+                serial_type_for_with_encoding(&Value::Integer(v), enc).0 == serial_type
+            }
+            _ => false,
+        },
+        7 => {
+            <[u8; 8]>::try_from(body).is_ok_and(|b| !f64::from_bits(u64::from_be_bytes(b)).is_nan())
+        }
+        10 | 11 => false,
+        n if (n & 1) == 0 => true,
+        _ => enc == TextEncoding::Utf8 && std::str::from_utf8(body).is_ok(),
+    }
+}
+
+/// Locates the first `spans.len()` fields of the stored `record` with the same header checks
+/// as a column read. Returns `false` when the record does not hold that many well-formed
+/// fields, or when a field selected by `stable_mask` (bit `i` = field `i`) is not
+/// [`raw_field_is_roundtrip_stable`].
+pub fn locate_roundtrip_stable_fields(
+    record: &[u8],
+    enc: TextEncoding,
+    stable_mask: u32,
+    spans: &mut [RawFieldSpan],
+) -> bool {
+    if record.is_empty() {
+        return false;
+    }
+    let Ok((hdr_u64, mut hdr_pos)) = get_varint(record) else {
+        return false;
+    };
+    let Ok(hdr_size) = usize::try_from(hdr_u64) else {
+        return false;
+    };
+    if hdr_size > record.len() || hdr_pos > hdr_size {
+        return false;
+    }
+    let mut body_pos = hdr_size;
+    for (i, span) in spans.iter_mut().enumerate() {
+        if hdr_pos >= hdr_size {
+            return false;
+        }
+        let Ok((st, used)) = get_varint(&record[hdr_pos..hdr_size]) else {
+            return false;
+        };
+        let Ok(len) = serial_type_len(st) else {
+            return false;
+        };
+        let Some(end) = body_pos.checked_add(len) else {
+            return false;
+        };
+        if end > record.len() {
+            return false;
+        }
+        if i < 32
+            && (stable_mask >> i) & 1 == 1
+            && !raw_field_is_roundtrip_stable(st, &record[body_pos..end], enc)
+        {
+            return false;
+        }
+        *span = RawFieldSpan {
+            serial_type: st,
+            start: body_pos,
+            end,
+        };
+        hdr_pos += used;
+        body_pos = end;
+    }
+    true
+}
+
+/// One field of a record assembled by [`encode_record_parts_into`].
+#[derive(Debug, Clone, Copy)]
+pub enum RecordPart<'a> {
+    /// A field copied verbatim from a stored record (see [`raw_field_is_roundtrip_stable`]).
+    Raw { serial_type: u64, body: &'a [u8] },
+    /// A value encoded exactly as [`encode_record_into`] encodes it.
+    Value(&'a Value),
+}
+
+/// Serializes `parts` into an SQLite Format-3 record. With every `Raw` part round-trip stable,
+/// the result equals [`encode_record_into`] over the decoded values.
+pub fn encode_record_parts_into(parts: &[RecordPart<'_>], enc: TextEncoding, out: &mut Vec<u8>) {
+    out.clear();
+    let mut serials_inline = [0u64; 32];
+    let mut serials_heap: Vec<u64> = Vec::new();
+    let serials: &mut [u64] = if parts.len() <= serials_inline.len() {
+        &mut serials_inline[..parts.len()]
+    } else {
+        serials_heap.resize(parts.len(), 0);
+        &mut serials_heap
+    };
+    let mut serial_bytes_len = 0usize;
+    let mut body_len = 0usize;
+    for (slot, part) in serials.iter_mut().zip(parts) {
+        let (st, len) = match part {
+            RecordPart::Raw { serial_type, body } => (*serial_type, body.len()),
+            RecordPart::Value(v) => serial_type_for_with_encoding(v, enc),
+        };
+        serial_bytes_len += varint_len(st);
+        body_len += len;
+        *slot = st;
+    }
+    let mut hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 1) as u64);
+    if varint_len(hdr_len as u64) + serial_bytes_len != hdr_len {
+        hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 2) as u64);
+    }
+    out.reserve(hdr_len + body_len);
+    push_varint(out, hdr_len as u64);
+    for &st in serials.iter() {
+        push_varint(out, st);
+    }
+    debug_assert_eq!(out.len(), hdr_len);
+    for (part, &st) in parts.iter().zip(serials.iter()) {
+        match part {
+            RecordPart::Raw { body, .. } => out.extend_from_slice(body),
+            RecordPart::Value(v) => write_serial_value(out, v, st, enc),
+        }
+    }
+}
+
 /// Serializes a slice of [`RuntimeValue`] registers directly into an SQLite Format-3 record
 /// without cloning intermediate [`Value`] elements (`OP_MakeRecord`).
 pub fn encode_runtime_record_with_encoding(values: &[RuntimeValue], enc: TextEncoding) -> Vec<u8> {
@@ -1025,6 +1162,37 @@ pub fn compare_raw_record_range(
     Ok(decided)
 }
 
+/// `true` when TEXT under `spec` on an `enc` database orders by plain byte comparison of
+/// valid UTF-8 (built-in `BINARY`, no custom collation, UTF-8 storage).
+///
+/// Under that ordering, text that is not valid UTF-8 is compared after lossy decoding. When one
+/// operand is pure ASCII the plain byte comparison still gives the same answer whatever the
+/// other operand holds: up to the first differing byte both are the same ASCII text; at that
+/// byte the ASCII side is `< 0x80`, while the other side is either a byte of a valid sequence
+/// (compared as is) or the start of an invalid one, which lossy decoding replaces by U+FFFD
+/// (lead byte `0xEF`) — `>= 0x80` both ways; and a proper prefix stays a proper prefix.
+#[inline(always)]
+fn raw_text_is_plain_binary(spec: &KeySortOrder, enc: TextEncoding) -> bool {
+    enc == TextEncoding::Utf8
+        && spec.custom_collation.is_none()
+        && spec.collation == Collation::Binary
+}
+
+/// Lexicographic byte comparison; short keys are compared inline instead of through `memcmp`.
+#[inline(always)]
+fn cmp_bytes(a: &[u8], b: &[u8]) -> Ordering {
+    let n = a.len().min(b.len());
+    if n > 24 {
+        return a.cmp(b);
+    }
+    for i in 0..n {
+        if a[i] != b[i] {
+            return a[i].cmp(&b[i]);
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
 #[inline]
 fn compare_raw_fields(
     lhs: RawField<'_>,
@@ -1069,7 +1237,9 @@ fn compare_raw_fields(
             (RawField::Float(r), RawField::Int(i)) => cmp_int_float(i, r).reverse(),
             (RawField::Blob(a), RawField::Blob(b)) => a.cmp(b),
             (RawField::Text(a), RawField::Text(b)) => {
-                if enc == TextEncoding::Utf8
+                if raw_text_is_plain_binary(spec, enc) && (b.is_ascii() || a.is_ascii()) {
+                    cmp_bytes(a, b)
+                } else if enc == TextEncoding::Utf8
                     && let (Ok(sa), Ok(sb)) = (std::str::from_utf8(a), std::str::from_utf8(b))
                 {
                     if let Some(ref cc) = spec.custom_collation {
@@ -1228,6 +1398,210 @@ pub fn compare_raw_records_with_encoding(
     }
 
     Ok(Ordering::Equal)
+}
+
+/// Number of leading key fields a [`RawRecordKey`] decodes ahead of time.
+const RAW_KEY_MAX_FIELDS: usize = 8;
+
+/// One pre-decoded field of a [`RawRecordKey`].
+#[derive(Clone, Copy)]
+enum RawKeyField<'a> {
+    /// Any integer serial type (1..=6, 8, 9).
+    Int(i64),
+    /// TEXT consisting only of ASCII bytes (hence valid UTF-8).
+    AsciiText(&'a [u8]),
+    /// Everything else, compared through [`compare_raw_fields`].
+    Other(RawField<'a>),
+}
+
+/// A serialized search key whose leading fields are decoded once, so that probing it against
+/// many stored records (a B-tree descent) only walks the header of each stored record.
+///
+/// [`RawRecordKey::compare_stored`] returns exactly what
+/// [`compare_raw_records_with_encoding`]`(stored, key, max_fields, orders, enc)` returns, errors
+/// included. A key that is not a cleanly decodable record (or has more compared fields than
+/// are decoded inline) simply delegates to that function.
+pub struct RawRecordKey<'a> {
+    record: &'a [u8],
+    max_fields: Option<usize>,
+    decoded: bool,
+    n_fields: usize,
+    fields: [RawKeyField<'a>; RAW_KEY_MAX_FIELDS],
+}
+
+impl<'a> RawRecordKey<'a> {
+    /// Prepares `record` for comparisons limited to its first `max_fields` fields
+    /// (`None` = all fields).
+    pub fn new(record: &'a [u8], max_fields: Option<usize>) -> Self {
+        let mut key = Self {
+            record,
+            max_fields,
+            decoded: false,
+            n_fields: 0,
+            fields: [RawKeyField::Int(0); RAW_KEY_MAX_FIELDS],
+        };
+        key.decoded = key.decode().is_some();
+        key
+    }
+
+    /// Prepares an index key record the way the B-tree index probes limit comparisons:
+    /// to `orders.len()` fields, or to every field when `orders` is empty.
+    #[inline]
+    pub fn for_index_orders(record: &'a [u8], orders: &[KeySortOrder]) -> Self {
+        Self::new(
+            record,
+            if orders.is_empty() {
+                None
+            } else {
+                Some(orders.len())
+            },
+        )
+    }
+
+    /// The serialized key record this was built from.
+    #[inline(always)]
+    pub const fn record(&self) -> &'a [u8] {
+        self.record
+    }
+
+    fn decode(&mut self) -> Option<()> {
+        let record = self.record;
+        if record.is_empty() {
+            return None;
+        }
+        let (hdr_u64, mut hdr_pos) = get_varint(record).ok()?;
+        let hdr_size = usize::try_from(hdr_u64).ok()?;
+        if hdr_size > record.len() || hdr_pos > hdr_size {
+            return None;
+        }
+        let limit = self.max_fields.unwrap_or(usize::MAX);
+        let mut body_pos = hdr_size;
+        let mut n = 0usize;
+        while n < limit && hdr_pos < hdr_size {
+            if n == RAW_KEY_MAX_FIELDS {
+                return None;
+            }
+            if let Some(len) = int_serial_len(record[hdr_pos]) {
+                let end = body_pos + len;
+                if end > record.len() {
+                    return None;
+                }
+                self.fields[n] =
+                    RawKeyField::Int(read_int_serial(record[hdr_pos], &record[body_pos..end]));
+                hdr_pos += 1;
+                body_pos = end;
+                n += 1;
+                continue;
+            }
+            let (st, used) = get_varint(&record[hdr_pos..hdr_size]).ok()?;
+            let len = serial_type_len(st).ok()?;
+            let end = body_pos.checked_add(len)?;
+            if end > record.len() {
+                return None;
+            }
+            self.fields[n] = match RawField::from_serial(st, &record[body_pos..end]).ok()? {
+                RawField::Int(i) => RawKeyField::Int(i),
+                RawField::Text(t) if t.is_ascii() => RawKeyField::AsciiText(t),
+                other => RawKeyField::Other(other),
+            };
+            hdr_pos += used;
+            body_pos = end;
+            n += 1;
+        }
+        self.n_fields = n;
+        Some(())
+    }
+
+    /// Compares the stored record `stored` (left-hand side) against this key; see the type
+    /// documentation for the exact contract.
+    #[inline]
+    pub fn compare_stored(
+        &self,
+        stored: &[u8],
+        orders: &[KeySortOrder],
+        enc: TextEncoding,
+    ) -> Result<Ordering> {
+        if !self.decoded {
+            return compare_raw_records_with_encoding(
+                stored,
+                self.record,
+                self.max_fields,
+                orders,
+                enc,
+            );
+        }
+        if stored.is_empty() {
+            return Ok(Ordering::Equal);
+        }
+        let (hdr_u64, mut hdr_pos) = get_varint(stored)?;
+        let hdr_size = usize::try_from(hdr_u64)
+            .map_err(|_| SqliteError::corrupt("record header size overflow"))?;
+        if hdr_size > stored.len() || hdr_pos > hdr_size {
+            return Err(SqliteError::corrupt("record header exceeds record length"));
+        }
+        let mut body_pos = hdr_size;
+        for (col_idx, key_field) in self.fields[..self.n_fields].iter().enumerate() {
+            if hdr_pos >= hdr_size {
+                break;
+            }
+            if let RawKeyField::Int(key_int) = *key_field
+                && let Some(len) = int_serial_len(stored[hdr_pos])
+            {
+                let end = body_pos + len;
+                if end > stored.len() {
+                    return Err(SqliteError::corrupt("record payload truncated"));
+                }
+                let stored_int = read_int_serial(stored[hdr_pos], &stored[body_pos..end]);
+                if stored_int != key_int {
+                    let ord = stored_int.cmp(&key_int);
+                    let desc = orders.get(col_idx).is_some_and(|spec| spec.desc);
+                    return Ok(if desc { ord.reverse() } else { ord });
+                }
+                hdr_pos += 1;
+                body_pos = end;
+                continue;
+            }
+
+            let (st, used) = get_varint(&stored[hdr_pos..hdr_size])?;
+            hdr_pos += used;
+            let len = serial_type_len(st)?;
+            let end = body_pos
+                .checked_add(len)
+                .ok_or_else(|| SqliteError::corrupt("record body offset overflow"))?;
+            if end > stored.len() {
+                return Err(SqliteError::corrupt("record payload truncated"));
+            }
+            let stored_field = RawField::from_serial(st, &stored[body_pos..end])?;
+            let default_spec;
+            let spec = match orders.get(col_idx) {
+                Some(spec) => spec,
+                None => {
+                    default_spec = KeySortOrder::default();
+                    &default_spec
+                }
+            };
+            let cmp = match (stored_field, *key_field) {
+                (RawField::Text(a), RawKeyField::AsciiText(b))
+                    if raw_text_is_plain_binary(spec, enc) =>
+                {
+                    let raw = cmp_bytes(a, b);
+                    if spec.desc { raw.reverse() } else { raw }
+                }
+                (_, RawKeyField::Int(i)) => {
+                    compare_raw_fields(stored_field, RawField::Int(i), spec, enc)?
+                }
+                (_, RawKeyField::AsciiText(b)) => {
+                    compare_raw_fields(stored_field, RawField::Text(b), spec, enc)?
+                }
+                (_, RawKeyField::Other(f)) => compare_raw_fields(stored_field, f, spec, enc)?,
+            };
+            if cmp != Ordering::Equal {
+                return Ok(cmp);
+            }
+            body_pos = end;
+        }
+        Ok(Ordering::Equal)
+    }
 }
 
 /// Returns `true` if any of the first `prefix_cols` fields of `record` is SQL `NULL`
@@ -1433,6 +1807,285 @@ mod tests {
             let err =
                 compare_raw_records_with_encoding(l, r, None, &[], TextEncoding::Utf8).unwrap_err();
             assert_eq!(err.code, crate::ErrorCode::Corrupt);
+        }
+    }
+
+    /// `RawRecordKey::compare_stored` must agree with `compare_raw_records_with_encoding` on
+    /// every input (result and error code), and both must agree with the decoded-`Value`
+    /// comparison whenever the key decodes — including non-ASCII and invalid UTF-8 text, every
+    /// built-in collation, DESC / NULLS LAST, keys wider than the inline decode window, and
+    /// truncated or damaged records on either side.
+    #[test]
+    fn raw_record_key_matches_raw_record_compare() {
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        fn raw_record(fields: &[(u64, Vec<u8>)]) -> Vec<u8> {
+            let mut hdr = Vec::new();
+            for (st, _) in fields {
+                push_varint(&mut hdr, *st);
+            }
+            let mut out = Vec::new();
+            push_varint(&mut out, (hdr.len() + 1) as u64);
+            out.extend_from_slice(&hdr);
+            for (_, body) in fields {
+                out.extend_from_slice(body);
+            }
+            out
+        }
+        fn pick(state: &mut u64) -> (u64, Vec<u8>) {
+            let r = next(state);
+            let texts: [&[u8]; 12] = [
+                b"",
+                b"a",
+                b"A",
+                b"a ",
+                b"ab",
+                b"C-0042",
+                b"C-0043",
+                "\u{e9}t\u{e9}".as_bytes(),
+                "\u{ffff}".as_bytes(),
+                b"\xff",
+                b"a\xc3",
+                b"\xef\xbf\xbd",
+            ];
+            match (r >> 8) % 12 {
+                0 => (0, Vec::new()),
+                1 => (8, Vec::new()),
+                2 => (9, Vec::new()),
+                3 => (1, vec![(r >> 16) as u8 % 4]),
+                4 => (2, vec![(r >> 16) as u8 % 3, (r >> 24) as u8]),
+                5 => (6, ((r >> 16) as i64 - 30_000).to_be_bytes().to_vec()),
+                6 => (7, (((r >> 16) % 5) as f64 - 1.5).to_be_bytes().to_vec()),
+                7 => {
+                    let b = vec![(r >> 16) as u8 % 3; ((r >> 20) % 3) as usize];
+                    (12 + 2 * b.len() as u64, b)
+                }
+                _ => {
+                    let t = texts[((r >> 16) % 12) as usize];
+                    (13 + 2 * t.len() as u64, t.to_vec())
+                }
+            }
+        }
+        fn same(a: &Result<Ordering>, b: &Result<Ordering>) -> bool {
+            match (a, b) {
+                (Ok(x), Ok(y)) => x == y,
+                (Err(x), Err(y)) => x.code == y.code,
+                _ => false,
+            }
+        }
+
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let collations = [Collation::Binary, Collation::NoCase, Collation::RTrim];
+        for round in 0..40_000u64 {
+            let n_a = (next(&mut seed) % 5) as usize + 1;
+            let n_b = if round % 97 == 0 {
+                10
+            } else {
+                (next(&mut seed) % 5) as usize + 1
+            };
+            let a: Vec<(u64, Vec<u8>)> = (0..n_a).map(|_| pick(&mut seed)).collect();
+            let mut b: Vec<(u64, Vec<u8>)> = (0..n_b).map(|_| pick(&mut seed)).collect();
+            for i in 0..n_a.min(n_b) {
+                if !next(&mut seed).is_multiple_of(3) {
+                    b[i] = a[i].clone();
+                }
+            }
+            let orders: Vec<KeySortOrder> = (0..5)
+                .map(|_| {
+                    let r = next(&mut seed);
+                    KeySortOrder {
+                        desc: r & 1 == 1,
+                        nulls_last: r & 2 == 2,
+                        collation: collations[((r >> 2) % 3) as usize],
+                        custom_collation: None,
+                    }
+                })
+                .collect();
+            let orders = &orders[..(round % 6) as usize];
+            let mut ra = raw_record(&a);
+            let mut rb = raw_record(&b);
+            // Occasionally damage one side: truncation or a clobbered byte.
+            match next(&mut seed) % 40 {
+                0 => ra.truncate((next(&mut seed) as usize) % (ra.len() + 1)),
+                1 => rb.truncate((next(&mut seed) as usize) % (rb.len() + 1)),
+                2 => {
+                    let i = (next(&mut seed) as usize) % ra.len();
+                    ra[i] = (next(&mut seed) % 14) as u8;
+                }
+                3 => {
+                    let i = (next(&mut seed) as usize) % rb.len();
+                    rb[i] = (next(&mut seed) % 14) as u8;
+                }
+                _ => {}
+            }
+            for enc in [TextEncoding::Utf8, TextEncoding::Utf16Le] {
+                for max_fields in [None, Some(1), Some(2), Some(3), Some(9)] {
+                    let reference =
+                        compare_raw_records_with_encoding(&ra, &rb, max_fields, orders, enc);
+                    let key = RawRecordKey::new(&rb, max_fields);
+                    let got = key.compare_stored(&ra, orders, enc);
+                    assert!(
+                        same(&got, &reference),
+                        "key compare {got:?} != raw compare {reference:?} for {ra:?} vs {rb:?} \
+                         max_fields={max_fields:?} orders={orders:?} enc={enc:?}"
+                    );
+                    // Independent oracle: the decoded-value comparison.
+                    if let (Ok(ord), Ok(vals_b)) =
+                        (&reference, decode_record_with_encoding(&rb, enc))
+                        && !ra.is_empty()
+                    {
+                        let lim = max_fields.unwrap_or(usize::MAX).min(vals_b.len());
+                        if let Ok(expect) =
+                            compare_records_with_encoding(&ra, &vals_b[..lim], orders, enc)
+                        {
+                            assert_eq!(
+                                *ord, expect,
+                                "raw compare != value compare for {ra:?} vs {rb:?} \
+                                 max_fields={max_fields:?} orders={orders:?} enc={enc:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `raw_field_is_roundtrip_stable` must hold exactly when `decode -> encode` reproduces the
+    /// stored field, and `encode_record_parts_into` must equal `encode_record_into` over the
+    /// decoded values whenever its raw parts are stable.
+    #[test]
+    fn record_parts_and_roundtrip_stability_match_value_codec() {
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        fn field(state: &mut u64) -> (u64, Vec<u8>) {
+            let r = next(state);
+            let small = ((r >> 20) % 5) as i64 - 2;
+            match (r >> 8) % 14 {
+                0 => (0, Vec::new()),
+                1 => (8, Vec::new()),
+                2 => (9, Vec::new()),
+                // Integers in every width, minimal or not.
+                3 => (1, vec![small as u8]),
+                4 => (2, ((small * 100) as i16).to_be_bytes().to_vec()),
+                5 => (3, ((small * 40_000) as i32).to_be_bytes()[1..].to_vec()),
+                6 => (4, ((small * 9_000_000) as i32).to_be_bytes().to_vec()),
+                7 => (5, (small * 3_000_000_000).to_be_bytes()[2..].to_vec()),
+                8 => (6, (small * 150_000_000_000_000).to_be_bytes().to_vec()),
+                9 => {
+                    let f = [1.5f64, -0.0, f64::NAN, f64::INFINITY, 3.0][((r >> 24) % 5) as usize];
+                    (7, f.to_bits().to_be_bytes().to_vec())
+                }
+                10 => {
+                    let b = vec![(r >> 16) as u8; ((r >> 24) % 4) as usize];
+                    (12 + 2 * b.len() as u64, b)
+                }
+                _ => {
+                    let texts: [&[u8]; 6] = [
+                        b"",
+                        b"C-0042",
+                        "h\u{e9}".as_bytes(),
+                        b"\xff",
+                        b"a\xc3",
+                        b"ok",
+                    ];
+                    let t = texts[((r >> 16) % 6) as usize];
+                    (13 + 2 * t.len() as u64, t.to_vec())
+                }
+            }
+        }
+
+        let mut seed = 0xA076_1D64_78BD_642Fu64;
+        for _ in 0..30_000 {
+            let n = (next(&mut seed) % 6) as usize + 1;
+            let fields: Vec<(u64, Vec<u8>)> = (0..n).map(|_| field(&mut seed)).collect();
+            let mut hdr = Vec::new();
+            for (st, _) in &fields {
+                push_varint(&mut hdr, *st);
+            }
+            let mut stored = Vec::new();
+            push_varint(&mut stored, (hdr.len() + 1) as u64);
+            stored.extend_from_slice(&hdr);
+            for (_, body) in &fields {
+                stored.extend_from_slice(body);
+            }
+            for enc in [TextEncoding::Utf8, TextEncoding::Utf16Le] {
+                let decoded = decode_record_with_encoding(&stored, enc).unwrap();
+                let mut reencoded = Vec::new();
+                encode_record_into(&decoded, enc, &mut reencoded);
+
+                // Per field: stable <=> the single-field record survives decode -> encode.
+                let mut all_stable = true;
+                for ((st, body), value) in fields.iter().zip(&decoded) {
+                    let mut one = Vec::new();
+                    encode_record_into(std::slice::from_ref(value), enc, &mut one);
+                    let mut raw_one = Vec::new();
+                    push_varint(&mut raw_one, 1 + varint_len(*st) as u64);
+                    push_varint(&mut raw_one, *st);
+                    raw_one.extend_from_slice(body);
+                    let stable = raw_field_is_roundtrip_stable(*st, body, enc);
+                    if enc == TextEncoding::Utf8 || *st < 13 || (*st & 1) == 0 {
+                        assert_eq!(stable, one == raw_one, "field {st} {body:?} {enc:?}");
+                    } else {
+                        // UTF-16 text is never claimed stable (a conservative answer).
+                        assert!(!stable);
+                    }
+                    all_stable &= stable;
+                }
+
+                let mut spans = vec![RawFieldSpan::default(); n];
+                let located = locate_roundtrip_stable_fields(&stored, enc, u32::MAX, &mut spans);
+                assert_eq!(located, all_stable);
+                assert!(locate_roundtrip_stable_fields(&stored, enc, 0, &mut spans));
+                // One field too many, or a truncated record, is refused.
+                let mut too_many = vec![RawFieldSpan::default(); n + 1];
+                assert!(!locate_roundtrip_stable_fields(
+                    &stored,
+                    enc,
+                    0,
+                    &mut too_many
+                ));
+                if stored.len() > hdr.len() + 1 {
+                    let cut = &stored[..stored.len() - 1];
+                    assert!(!locate_roundtrip_stable_fields(
+                        cut,
+                        enc,
+                        0,
+                        &mut spans.clone()
+                    ));
+                }
+
+                if all_stable {
+                    // Mix raw parts with values: must equal the plain value encoding.
+                    let pick = next(&mut seed);
+                    let parts: Vec<RecordPart<'_>> = spans
+                        .iter()
+                        .zip(&decoded)
+                        .enumerate()
+                        .map(|(i, (span, value))| {
+                            if (pick >> i) & 1 == 0 {
+                                RecordPart::Raw {
+                                    serial_type: span.serial_type,
+                                    body: &stored[span.start..span.end],
+                                }
+                            } else {
+                                RecordPart::Value(value)
+                            }
+                        })
+                        .collect();
+                    let mut assembled = vec![0xAA; 3];
+                    encode_record_parts_into(&parts, enc, &mut assembled);
+                    assert_eq!(assembled, reencoded);
+                    assert_eq!(assembled, stored);
+                }
+            }
         }
     }
 

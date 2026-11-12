@@ -3,9 +3,8 @@
 
 use sqliters_pager::DB_HEADER_SIZE;
 use sqliters_types::{
-    ErrorCode, KeySortOrder, Pgno, Result, SqliteError, TextEncoding, Value,
-    compare_raw_records_with_encoding, compare_records_with_encoding, get_varint, get_varint_i64,
-    push_varint, put_varint, varint_len,
+    ErrorCode, KeySortOrder, Pgno, RawRecordKey, Result, SqliteError, TextEncoding, Value,
+    compare_records_with_encoding, get_varint, get_varint_i64, push_varint, put_varint, varint_len,
 };
 
 /// On-disk B-tree page flag byte (`PTF_*` in `btreeInt.h` / `decodeFlags` in `btree.c:2055`).
@@ -803,6 +802,17 @@ pub enum TableLeafInsertProbe {
     },
     /// Matching `rowid` exists on this leaf, but replacement requires overflow cleanup or page split.
     DuplicateNeedsFallback,
+    /// Matching non-overflow `rowid` cell exists at `idx`, the new cell has a different size and
+    /// does not fit in the contiguous gap: the caller may rewrite the leaf with
+    /// [`replace_table_leaf_repack_raw`]. Only produced when the probe is asked for it;
+    /// `legacy_defrag` records whether the probe would otherwise have answered `NeedsDefrag`
+    /// (`true`) or `DuplicateNeedsFallback` (`false`).
+    ReplaceRepack {
+        idx: usize,
+        old_off: usize,
+        old_cell_len: usize,
+        legacy_defrag: bool,
+    },
     /// Defragmented leaf is full, `n_cell >= 1`, `rowid > last_rowid`, and the new cell fits on a fresh leaf (`balance_quick`).
     QuickRightSplit { last_rowid: i64 },
     /// Leaf has freeblocks/fragments that should be compacted in-place before retrying.
@@ -1003,6 +1013,8 @@ pub fn probe_insert_table_leaf_raw(
     raw: &[u8],
     rowid: i64,
     payload_len: usize,
+    repack_replace: bool,
+    idx_hint: Option<usize>,
 ) -> Result<TableLeafInsertProbe> {
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
@@ -1075,11 +1087,37 @@ pub fn probe_insert_table_leaf_raw(
                 content_top,
             };
         }
-        if has_reclaimable || ptr_end + cell_len <= content_top + old_cell_len {
+        let legacy_defrag = has_reclaimable || ptr_end + cell_len <= content_top + old_cell_len;
+        if repack_replace {
+            return TableLeafInsertProbe::ReplaceRepack {
+                idx,
+                old_off: off,
+                old_cell_len,
+                legacy_defrag,
+            };
+        }
+        if legacy_defrag {
             return TableLeafInsertProbe::NeedsDefrag;
         }
         TableLeafInsertProbe::DuplicateNeedsFallback
     };
+
+    // A caller that already knows where `rowid` lives on this leaf (a positioned cursor) skips
+    // the search; any mismatch simply falls through to it.
+    if let Some(hint) = idx_hint
+        && hint < n_cell
+    {
+        let p = ptr_base + 2 * hint;
+        let off = u16::from_be_bytes([raw[p], raw[p + 1]]) as usize;
+        if off >= ptr_end
+            && off < usable
+            && let Ok((hp_u64, hn1)) = get_varint(&raw[off..usable])
+            && let Ok((hint_rowid, hn2)) = get_varint_i64(&raw[off + hn1..usable])
+            && hint_rowid == rowid
+        {
+            return Ok(probe_replace(hint, off, hp_u64, hn1, hn2));
+        }
+    }
 
     let lp = ptr_base + 2 * (n_cell - 1);
     let loff = u16::from_be_bytes([raw[lp], raw[lp + 1]]) as usize;
@@ -1138,6 +1176,59 @@ pub fn probe_insert_table_leaf_raw(
         insert_idx: lo,
         content_top,
     })
+}
+
+/// [`probe_insert_table_leaf_raw`] restricted to replacing `rowid` on this leaf, for a caller
+/// that expects it at cell `idx`. Returns the `Replace` / `ReplaceRepack` answer, or `None`
+/// when `rowid` is not on the page, the page is unusual, or the replacement is not in-page.
+pub fn probe_table_leaf_replace_at_raw(
+    pgno: Pgno,
+    usable_size: u32,
+    raw: &[u8],
+    idx: usize,
+    rowid: i64,
+    payload_len: usize,
+) -> Option<TableLeafInsertProbe> {
+    match probe_insert_table_leaf_raw(pgno, usable_size, raw, rowid, payload_len, true, Some(idx)) {
+        Ok(
+            probe @ (TableLeafInsertProbe::Replace { .. }
+            | TableLeafInsertProbe::ReplaceRepack { .. }),
+        ) => Some(probe),
+        _ => None,
+    }
+}
+
+/// `true` when cell `idx` of the raw `TableLeaf` (`0x0d`) page carries `rowid` and deleting it
+/// leaves the page in the tree (the page is the root, or keeps at least one other cell).
+pub fn table_leaf_cell_has_rowid(
+    pgno: Pgno,
+    usable_size: u32,
+    raw: &[u8],
+    idx: usize,
+    rowid: i64,
+    is_root: bool,
+) -> bool {
+    let usable = usable_size as usize;
+    let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+    if raw.len() < usable || hdr_off + 8 > usable || raw[hdr_off] != BtreePageType::TableLeaf as u8
+    {
+        return false;
+    }
+    let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
+    let ptr_base = hdr_off + 8;
+    let ptr_end = ptr_base + 2 * n_cell;
+    if idx >= n_cell || ptr_end > usable || (n_cell == 1 && !is_root) {
+        return false;
+    }
+    let p = ptr_base + 2 * idx;
+    let off = u16::from_be_bytes([raw[p], raw[p + 1]]) as usize;
+    if off < ptr_end || off >= usable {
+        return false;
+    }
+    let Ok((_, n1)) = get_varint(&raw[off..usable]) else {
+        return false;
+    };
+    matches!(get_varint_i64(&raw[off + n1..usable]), Ok((cell_rowid, _)) if cell_rowid == rowid)
 }
 
 /// Replaces an existing non-overflow `(rowid, payload)` cell in-place on a `TableLeaf` (`0x0d`) page
@@ -1234,6 +1325,175 @@ pub fn apply_replace_table_leaf_raw(
     raw[ip..ip + 2].copy_from_slice(&(new_top as u16).to_be_bytes());
     let encoded_top: u16 = if new_top == 65_536 { 0 } else { new_top as u16 };
     raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
+}
+
+/// Replaces the non-overflow cell `idx` (`rowid`, at `old_off`, `old_cell_len` bytes) of a raw
+/// `TableLeaf` (`0x0d`) page with a non-overflow `(rowid, payload)` cell of a different size that
+/// does not fit in the contiguous gap, without parsing the page into heap cells.
+///
+/// Produces exactly the bytes of the general path it replaces:
+/// - when the new cell fits above the cell content once the page is compacted, the page is
+///   defragmented and the old cell is released / the new one allocated at the content top
+///   ([`defragment_raw_leaf_in_place`] + [`apply_replace_table_leaf_raw`]);
+/// - otherwise, when the page still holds every cell after the substitution, it is rewritten in
+///   the canonical packed layout of [`ParsedPage::write`] (cells in key order from the page end,
+///   no freeblocks, no fragments, zeroed gap).
+///
+/// Returns `Ok(false)` with `raw` untouched when the substitution needs a split or the page is
+/// not provably well formed (bad offsets, non-minimal varints, non-zero padding of a short cell,
+/// or — with `reject_overflow_cells` — any cell with an overflow chain).
+#[allow(clippy::too_many_arguments)]
+pub fn replace_table_leaf_repack_raw(
+    pgno: Pgno,
+    usable_size: u32,
+    raw: &mut [u8],
+    rowid: i64,
+    payload: &[u8],
+    idx: usize,
+    old_off: usize,
+    old_cell_len: usize,
+    reject_overflow_cells: bool,
+) -> Result<bool> {
+    let usable = usable_size as usize;
+    let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+    if raw.len() < usable || hdr_off + 8 > usable || raw[hdr_off] != BtreePageType::TableLeaf as u8
+    {
+        return Ok(false);
+    }
+    let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
+    let ptr_base = hdr_off + 8;
+    let ptr_end = ptr_base + 2 * n_cell;
+    if idx >= n_cell || ptr_end > usable {
+        return Ok(false);
+    }
+    let bounds = PayloadBounds::for_table_leaf(usable_size);
+    if payload.len() > bounds.max_local as usize {
+        return Ok(false);
+    }
+    let new_cell_len =
+        (varint_len(payload.len() as u64) + varint_len(rowid as u64) + payload.len()).max(4);
+
+    // Pass 1: validate every cell and record its length; nothing is written yet.
+    let mut lens_inline = [0u16; 512];
+    let mut lens_heap: Vec<u16> = Vec::new();
+    let lens: &mut [u16] = if n_cell <= lens_inline.len() {
+        &mut lens_inline[..n_cell]
+    } else {
+        lens_heap.resize(n_cell, 0);
+        &mut lens_heap
+    };
+    let mut live = 0usize;
+    let mut prev_rowid: Option<i64> = None;
+    for (i, len_slot) in lens.iter_mut().enumerate() {
+        let p = ptr_base + 2 * i;
+        let off = u16::from_be_bytes([raw[p], raw[p + 1]]) as usize;
+        if off < ptr_end || off >= usable {
+            return Ok(false);
+        }
+        let slice = &raw[off..usable];
+        let Ok((payload_u64, n1)) = get_varint(slice) else {
+            return Ok(false);
+        };
+        let Ok(total_len) = u32::try_from(payload_u64) else {
+            return Ok(false);
+        };
+        let Ok((cell_rowid, n2)) = get_varint_i64(&slice[n1..]) else {
+            return Ok(false);
+        };
+        if n1 != varint_len(payload_u64) || n2 != varint_len(cell_rowid as u64) {
+            return Ok(false);
+        }
+        if prev_rowid.is_some_and(|prev| prev >= cell_rowid) {
+            return Ok(false);
+        }
+        prev_rowid = Some(cell_rowid);
+        let local_len = bounds.local_len(total_len);
+        let has_ovfl = (local_len as u32) < total_len;
+        if has_ovfl && reject_overflow_cells {
+            return Ok(false);
+        }
+        let body_len = n1 + n2 + local_len + if has_ovfl { 4 } else { 0 };
+        let cell_len = body_len.max(4);
+        if cell_len > slice.len() || cell_len > usize::from(u16::MAX) {
+            return Ok(false);
+        }
+        if slice[body_len..cell_len].iter().any(|&b| b != 0) {
+            return Ok(false);
+        }
+        if i == idx
+            && (off != old_off || cell_len != old_cell_len || cell_rowid != rowid || has_ovfl)
+        {
+            return Ok(false);
+        }
+        *len_slot = cell_len as u16;
+        live += cell_len;
+    }
+    if ptr_end + live > usable || old_cell_len == new_cell_len {
+        return Ok(false);
+    }
+    let packed_top = usable - live;
+
+    if ptr_end + new_cell_len <= packed_top {
+        // Enough room once compacted: compact, then release the old cell and allocate on top.
+        defragment_raw_leaf_in_place(pgno, usable_size, raw)?;
+        let p = ptr_base + 2 * idx;
+        let moved_off = u16::from_be_bytes([raw[p], raw[p + 1]]) as usize;
+        apply_replace_table_leaf_raw(
+            pgno,
+            usable_size,
+            raw,
+            rowid,
+            payload,
+            idx,
+            moved_off,
+            old_cell_len,
+            packed_top,
+        );
+        return Ok(true);
+    }
+    if ptr_end + new_cell_len > packed_top + old_cell_len {
+        return Ok(false);
+    }
+
+    // Canonical repack with cell `idx` substituted.
+    let mut stack_copy = [0u8; 4096];
+    let heap_copy: Vec<u8>;
+    let src: &[u8] = if usable <= stack_copy.len() {
+        stack_copy[ptr_end..usable].copy_from_slice(&raw[ptr_end..usable]);
+        &stack_copy[..usable]
+    } else {
+        let mut v = vec![0u8; usable];
+        v[ptr_end..usable].copy_from_slice(&raw[ptr_end..usable]);
+        heap_copy = v;
+        &heap_copy
+    };
+    let mut cursor = usable;
+    for (i, &len) in lens.iter().enumerate() {
+        let p = ptr_base + 2 * i;
+        if i == idx {
+            cursor -= new_cell_len;
+            let mut pos = cursor;
+            pos += put_varint(&mut raw[pos..], payload.len() as u64);
+            pos += put_varint(&mut raw[pos..], rowid as u64);
+            raw[pos..pos + payload.len()].copy_from_slice(payload);
+            pos += payload.len();
+            raw[pos..cursor + new_cell_len].fill(0);
+        } else {
+            let cell_len = usize::from(len);
+            let off = u16::from_be_bytes([raw[p], raw[p + 1]]) as usize;
+            cursor -= cell_len;
+            if off != cursor {
+                raw[cursor..cursor + cell_len].copy_from_slice(&src[off..off + cell_len]);
+            }
+        }
+        raw[p..p + 2].copy_from_slice(&(cursor as u16).to_be_bytes());
+    }
+    raw[ptr_end..cursor].fill(0);
+    raw[hdr_off + 1..hdr_off + 3].fill(0);
+    let encoded_top: u16 = if cursor == 65_536 { 0 } else { cursor as u16 };
+    raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
+    raw[hdr_off + 7] = 0;
+    Ok(true)
 }
 
 /// Writes a non-overflow `(rowid, payload)` cell directly into `raw` at `(insert_idx, content_top)`
@@ -1762,12 +2022,12 @@ pub fn probe_index_interior_step_raw(
     pgno: Pgno,
     usable_size: u32,
     raw: &[u8],
-    record_bytes: &[u8],
+    key: &RawRecordKey<'_>,
     orders: &[KeySortOrder],
     enc: TextEncoding,
 ) -> Result<Option<RawIndexInteriorStep>> {
     Ok(
-        probe_index_interior_slot_raw(pgno, usable_size, raw, record_bytes, orders, enc)?
+        probe_index_interior_slot_raw(pgno, usable_size, raw, key, orders, enc)?
             .map(|(step, _)| step),
     )
 }
@@ -1779,7 +2039,7 @@ pub fn probe_index_interior_slot_raw(
     pgno: Pgno,
     usable_size: u32,
     raw: &[u8],
-    record_bytes: &[u8],
+    key: &RawRecordKey<'_>,
     orders: &[KeySortOrder],
     enc: TextEncoding,
 ) -> Result<Option<(RawIndexInteriorStep, usize)>> {
@@ -1803,11 +2063,6 @@ pub fn probe_index_interior_slot_raw(
         return Ok(None);
     }
 
-    let max_fields = if orders.is_empty() {
-        None
-    } else {
-        Some(orders.len())
-    };
     let bounds = PayloadBounds::for_index(usable_size);
     let mut lo = 0usize;
     let mut hi = n_cell;
@@ -1835,13 +2090,7 @@ pub fn probe_index_interior_slot_raw(
         if body_end > usable {
             return Ok(None);
         }
-        let cmp = match compare_raw_records_with_encoding(
-            &raw[body_start..body_end],
-            record_bytes,
-            max_fields,
-            orders,
-            enc,
-        ) {
+        let cmp = match key.compare_stored(&raw[body_start..body_end], orders, enc) {
             Ok(ord) => ord,
             Err(e) if e.code == ErrorCode::Corrupt => return Ok(None),
             Err(e) => return Err(e),
@@ -1889,11 +2138,11 @@ pub fn find_index_interior_child_raw(
     pgno: Pgno,
     usable_size: u32,
     raw: &[u8],
-    record_bytes: &[u8],
+    key: &RawRecordKey<'_>,
     orders: &[KeySortOrder],
     enc: TextEncoding,
 ) -> Result<Option<Pgno>> {
-    match probe_index_interior_step_raw(pgno, usable_size, raw, record_bytes, orders, enc)? {
+    match probe_index_interior_step_raw(pgno, usable_size, raw, key, orders, enc)? {
         Some(RawIndexInteriorStep::Child(child)) => Ok(Some(child)),
         _ => Ok(None),
     }
@@ -1905,10 +2154,11 @@ pub fn probe_insert_index_leaf_raw(
     pgno: Pgno,
     usable_size: u32,
     raw: &[u8],
-    record_bytes: &[u8],
+    key: &RawRecordKey<'_>,
     orders: &[KeySortOrder],
     enc: TextEncoding,
 ) -> Result<Option<(usize, usize)>> {
+    let record_bytes = key.record();
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
     if hdr_off + 8 > usable || raw[hdr_off] != BtreePageType::IndexLeaf as u8 {
@@ -1948,11 +2198,6 @@ pub fn probe_insert_index_leaf_raw(
         return Ok(None);
     }
 
-    let max_fields = if orders.is_empty() {
-        None
-    } else {
-        Some(orders.len())
-    };
     let bounds = PayloadBounds::for_index(usable_size);
     let cmp_cell_at = |idx: usize| -> Result<Option<std::cmp::Ordering>> {
         let p = ptr_base + 2 * idx;
@@ -1977,13 +2222,7 @@ pub fn probe_insert_index_leaf_raw(
         if body_end > usable {
             return Ok(None);
         }
-        match compare_raw_records_with_encoding(
-            &raw[body_start..body_end],
-            record_bytes,
-            max_fields,
-            orders,
-            enc,
-        ) {
+        match key.compare_stored(&raw[body_start..body_end], orders, enc) {
             Ok(ord) => Ok(Some(ord)),
             Err(e) if e.code == ErrorCode::Corrupt => Ok(None),
             Err(e) => Err(e),
@@ -2066,7 +2305,7 @@ pub fn probe_delete_index_leaf_raw(
     pgno: Pgno,
     usable_size: u32,
     raw: &[u8],
-    record_bytes: &[u8],
+    key: &RawRecordKey<'_>,
     orders: &[KeySortOrder],
     enc: TextEncoding,
     is_root: bool,
@@ -2100,11 +2339,6 @@ pub fn probe_delete_index_leaf_raw(
         return Ok(None);
     }
 
-    let max_fields = if orders.is_empty() {
-        None
-    } else {
-        Some(orders.len())
-    };
     let bounds = PayloadBounds::for_index(usable_size);
     let mut lo = 0usize;
     let mut hi = n_cell;
@@ -2131,13 +2365,7 @@ pub fn probe_delete_index_leaf_raw(
         if off + cell_len > usable {
             return Ok(None);
         }
-        let cmp = match compare_raw_records_with_encoding(
-            &slice[n1..body_end],
-            record_bytes,
-            max_fields,
-            orders,
-            enc,
-        ) {
+        let cmp = match key.compare_stored(&slice[n1..body_end], orders, enc) {
             Ok(ord) => ord,
             Err(e) if e.code == ErrorCode::Corrupt => return Ok(None),
             Err(e) => return Err(e),
@@ -2294,12 +2522,16 @@ pub enum RawLeafDeleteOutcome {
 }
 
 /// Attempts an in-place deletion from a raw `TableLeaf` (`0x0d`) page in O(log N) search + O(1) freeblock link.
+///
+/// `idx_hint` is the cell index a positioned cursor already resolved for `rowid`; it is used only
+/// when that cell really carries `rowid`, otherwise the page is searched.
 pub fn try_delete_table_leaf_in_place(
     pgno: Pgno,
     usable_size: u32,
     raw: &mut [u8],
     rowid: i64,
     is_root: bool,
+    idx_hint: Option<usize>,
 ) -> Result<RawLeafDeleteOutcome> {
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
@@ -2324,6 +2556,22 @@ pub fn try_delete_table_leaf_in_place(
 
     let mut lo = 0usize;
     let mut hi = n_cell;
+    if let Some(hint) = idx_hint
+        && hint < n_cell
+    {
+        let p = ptr_base + 2 * hint;
+        let off = u16::from_be_bytes([raw[p], raw[p + 1]]) as usize;
+        if off >= content_top
+            && off < usable
+            && let Ok((_, n1)) = get_varint(&raw[off..usable])
+            && let Ok((cell_rowid, _)) = get_varint_i64(&raw[off + n1..usable])
+            && cell_rowid == rowid
+        {
+            // Narrow the search to exactly the hinted cell.
+            lo = hint;
+            hi = hint + 1;
+        }
+    }
     let mut found: Option<(usize, usize, usize, Option<Pgno>)> = None;
     let bounds = PayloadBounds::for_table_leaf(usable_size);
     while lo < hi {
