@@ -79,7 +79,7 @@ pub use sqliters_types::{
     SQLITE_FILE_HEADER, SQLITE_MAX_ATTACHED, SQLITE_SOURCE_ID, SQLITE_VERSION,
     SQLITE_VERSION_NUMBER, SqliteError, StorageClass, TextEncoding, TypeAffinity, VTabConfigOption,
     VTabConflictMode, VTabConstraint, VTabConstraintOp, VTabConstraintUsage, VTabHostContext,
-    VTabIndexInfo, VTabOrderBy, VTabRiskFlags, VTabUpdateOperation, Value, VirtualCursor,
+    VTabIndexInfo, VTabOrderBy, VTabRiskFlags, VTabUpdateOperation, Value, ValueRef, VirtualCursor,
     VirtualTable, VirtualTableModule, fallible_sort_by,
 };
 pub use sqliters_vdbe::BtreeAccess;

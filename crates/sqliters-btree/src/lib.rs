@@ -18,10 +18,10 @@ use sqliters_pager::{
     WalCheckpointResult, create_super_journal_file,
 };
 use sqliters_types::{
-    Bitvec, ErrorCode, KeySortOrder, Pgno, RawField, Result, SqliteError, TextEncoding, Value,
-    compare_raw_record_range, compare_records_with_encoding, decode_record_with_encoding,
-    decode_serial_value_with_encoding, extended, get_varint, get_varint_i64,
-    parse_raw_record_prefix, put_varint, serial_type_len, varint_len,
+    Bitvec, ErrorCode, INLINE_ROW_COLS, InlineRow, InlineVal, KeySortOrder, Pgno, RawField, Result,
+    SqliteError, TextEncoding, Value, compare_raw_record_range, compare_records_with_encoding,
+    decode_record_with_encoding, decode_serial_value_with_encoding, extended, get_varint,
+    get_varint_i64, parse_raw_record_prefix, put_varint, serial_type_len, varint_len,
 };
 use sqliters_vfs::{OpenFlags, Vfs};
 
@@ -32,20 +32,31 @@ pub use cursor::{
 pub use page::{
     BtreePageType, IndexInteriorCell, IndexLeafCell, ParsedPage, PayloadBounds, RawIndexCell,
     RawIndexInteriorStep, RawLeafDeleteOutcome, RawTableLeafCell, TableInteriorCell, TableLeafCell,
-    TableLeafInsertProbe, apply_append_table_interior_rightmost, apply_delete_index_leaf_in_place,
+    TableLeafDeleteProbe, TableLeafInsertProbe, apply_append_table_interior_rightmost,
+    apply_delete_index_leaf_in_place, apply_delete_table_leaf_in_place,
     apply_insert_index_leaf_in_place, apply_insert_index_leaf_raw, apply_insert_table_leaf_raw,
     apply_replace_table_leaf_raw, binary_search_table_leaf, binary_search_table_leaf_with_span,
     defragment_raw_leaf_in_place, find_index_interior_child_in_place,
     find_index_interior_child_raw, find_table_interior_child,
     find_table_interior_child_append_hint, init_single_cell_table_leaf_raw, last_table_leaf_rowid,
     peek_page_type, probe_append_table_interior_rightmost, probe_delete_index_leaf_in_place,
-    probe_delete_index_leaf_raw, probe_index_interior_step_raw, probe_insert_index_leaf_in_place,
-    probe_insert_index_leaf_raw, probe_insert_table_leaf_raw, raw_cell_offset, raw_page_free_space,
-    raw_page_header, read_index_interior_cell, read_index_leaf_cell, read_table_interior_cell,
-    read_table_leaf_cell, read_table_leaf_rowid, seek_table_leaf_cell, table_interior_right_child,
+    probe_delete_index_leaf_raw, probe_delete_table_leaf_raw, probe_index_interior_step_raw,
+    probe_insert_index_leaf_in_place, probe_insert_index_leaf_raw, probe_insert_table_leaf_raw,
+    raw_cell_offset, raw_page_alloc_freeblock, raw_page_free_space, raw_page_header,
+    read_index_interior_cell, read_index_leaf_cell, read_table_interior_cell, read_table_leaf_cell,
+    read_table_leaf_rowid, seek_table_leaf_cell, table_interior_right_child,
     try_delete_table_leaf_in_place, try_insert_table_leaf_in_place,
 };
 pub use ptrmap::{PtrmapType, RootPageMove, is_ptrmap_page, ptrmap_offset, ptrmap_pageno};
+
+/// Compact 16-byte arena descriptor `(prefix, off, len)` for contiguous byte-arena `CREATE INDEX`
+/// sorting and zero-slice-allocation B-tree bulk loading.
+#[derive(Clone, Copy, Debug)]
+pub struct ArenaIndexEntry {
+    pub prefix: u64,
+    pub off: u32,
+    pub len: u32,
+}
 
 /// Column projection descriptor for single-row `rowid` point `SELECT` fast path.
 #[derive(Clone, Debug)]
@@ -73,6 +84,322 @@ enum FastTableInsertOutcome {
     Inserted,
     Duplicate,
     Fallback,
+}
+
+/// Decoded result row from [`Btree::point_lookup_table_columns_row`].
+#[derive(Clone, Debug)]
+pub enum PointLookupRow {
+    Inline(InlineRow),
+    Heap(Vec<Value>),
+}
+
+/// Borrowed view of an `IndexLeaf` B-tree page with precomputed pointer-array and overflow bounds
+/// for zero-allocation in-page binary search and tight slice morsel scanning.
+pub struct IndexLeafMorsel<'a> {
+    pgno: Pgno,
+    usable_usize: usize,
+    raw: &'a [u8],
+    ptr_base: usize,
+    ptr_end: usize,
+    n_cell: usize,
+    bounds: PayloadBounds,
+    max_local: usize,
+}
+
+impl<'a> IndexLeafMorsel<'a> {
+    #[inline]
+    pub fn new(pgno: Pgno, usable: u32, raw: &'a [u8], n_cell: usize) -> Result<Self> {
+        let usable_usize = usable as usize;
+        if raw.len() < usable_usize {
+            return Err(SqliteError::corrupt(format!(
+                "index leaf page {pgno} buffer smaller than usable_size"
+            )));
+        }
+        let hdr_off: usize = if pgno == 1 { 100 } else { 0 };
+        let ptr_base = hdr_off + 8;
+        let ptr_end = ptr_base
+            .checked_add(n_cell.saturating_mul(2))
+            .ok_or_else(|| SqliteError::corrupt("index leaf cell pointer overflow"))?;
+        if ptr_end > usable_usize {
+            return Err(SqliteError::corrupt(format!(
+                "index leaf cell pointer array extends past usable_size on page {pgno}"
+            )));
+        }
+        let bounds = PayloadBounds::for_index(usable);
+        let max_local = bounds.max_local as usize;
+        Ok(Self {
+            pgno,
+            usable_usize,
+            raw,
+            ptr_base,
+            ptr_end,
+            n_cell,
+            bounds,
+            max_local,
+        })
+    }
+
+    #[inline(always)]
+    pub const fn len(&self) -> usize {
+        self.n_cell
+    }
+
+    #[inline(always)]
+    pub const fn is_empty(&self) -> bool {
+        self.n_cell == 0
+    }
+
+    /// Returns `Ok(Some(payload_slice))` when cell `ci` fits entirely in-page, or `Ok(None)` when
+    /// it spills onto an overflow chain.
+    #[inline(always)]
+    pub fn local_cell(&self, ci: usize) -> Result<Option<&'a [u8]>> {
+        let p = self.ptr_base + 2 * ci;
+        let off = u16::from_be_bytes([self.raw[p], self.raw[p + 1]]) as usize;
+        if off < self.ptr_end || off >= self.usable_usize {
+            return Err(SqliteError::corrupt(format!(
+                "invalid index leaf cell offset on page {}",
+                self.pgno
+            )));
+        }
+        let b0 = self.raw[off];
+        if b0 < 0x80 {
+            let total_len = b0 as usize;
+            if total_len <= self.max_local {
+                let p_start = off + 1;
+                let p_end = p_start + total_len;
+                if p_end > self.usable_usize {
+                    return Err(SqliteError::corrupt(format!(
+                        "index leaf cell extends past end of page {}",
+                        self.pgno
+                    )));
+                }
+                return Ok(Some(&self.raw[p_start..p_end]));
+            }
+        }
+        let slice = &self.raw[off..self.usable_usize];
+        let (payload_u64, n1) = get_varint(slice)?;
+        let total_u32 = u32::try_from(payload_u64)
+            .map_err(|_| SqliteError::corrupt("index leaf payload > 4GiB"))?;
+        let total_len = total_u32 as usize;
+        if total_len <= self.max_local {
+            let body_end = n1 + total_len;
+            if body_end > slice.len() {
+                return Err(SqliteError::corrupt(format!(
+                    "index leaf cell extends past end of page {}",
+                    self.pgno
+                )));
+            }
+            Ok(Some(&slice[n1..body_end]))
+        } else {
+            let local_len = self.bounds.local_len(total_u32);
+            if n1 + local_len + 4 > slice.len() {
+                return Err(SqliteError::corrupt(format!(
+                    "index leaf cell extends past end of page {}",
+                    self.pgno
+                )));
+            }
+            Ok(None)
+        }
+    }
+
+    #[inline]
+    pub fn read_cell(&self, ci: usize) -> Result<RawIndexCell<'a>> {
+        read_index_leaf_cell(
+            self.pgno,
+            self.usable_usize as u32,
+            self.raw,
+            self.n_cell,
+            ci,
+        )
+    }
+}
+
+/// Control step returned by [`Btree::scan_index_morsels`] and [`Btree::seek_index_range_morsels`] visitors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MorselStep {
+    Continue,
+    Break,
+    /// Signals that cell `ci` inside a `LeafMorsel` spilled onto an overflow chain;
+    /// the scanner reassembles `ci` via `IndexScanItem::SingleCell` and resumes `ci + 1..end`.
+    OverflowAt(usize),
+}
+
+/// Item yielded in index sort order by [`Btree::scan_index_morsels`] and [`Btree::seek_index_range_morsels`].
+pub enum IndexScanItem<'a> {
+    LeafMorsel {
+        morsel: &'a IndexLeafMorsel<'a>,
+        start: usize,
+        end: usize,
+    },
+    SingleCell(&'a [u8]),
+}
+
+#[inline]
+fn decode_projected_cols_to_lookup_row(
+    payload: &[u8],
+    rowid: i64,
+    cols: &[PointProjCol],
+    max_col_idx: Option<u16>,
+    enc: TextEncoding,
+) -> Result<PointLookupRow> {
+    if cols.len() <= INLINE_ROW_COLS {
+        let Some(max_ci_u16) = max_col_idx else {
+            let mut inline_cols = [InlineVal::Null; INLINE_ROW_COLS];
+            for slot in inline_cols.iter_mut().take(cols.len()) {
+                *slot = InlineVal::Integer(rowid);
+            }
+            return Ok(PointLookupRow::Inline(InlineRow::from_raw_parts(
+                cols.len() as u8,
+                inline_cols,
+            )));
+        };
+        let max_ci = max_ci_u16 as usize;
+        if payload.is_empty() {
+            let mut inline_cols = [InlineVal::Null; INLINE_ROW_COLS];
+            let mut all_inline = true;
+            for (i, c) in cols.iter().enumerate() {
+                match c {
+                    PointProjCol::Rowid => inline_cols[i] = InlineVal::Integer(rowid),
+                    PointProjCol::Column { default_val, .. } => match default_val {
+                        None => inline_cols[i] = InlineVal::Null,
+                        Some(v) => match InlineVal::try_from_value(v) {
+                            Some(iv) => inline_cols[i] = iv,
+                            None => {
+                                all_inline = false;
+                                break;
+                            }
+                        },
+                    },
+                }
+            }
+            if all_inline {
+                return Ok(PointLookupRow::Inline(InlineRow::from_raw_parts(
+                    cols.len() as u8,
+                    inline_cols,
+                )));
+            }
+            return Ok(PointLookupRow::Heap(decode_projected_cols_from_record(
+                payload, rowid, cols, enc,
+            )?));
+        }
+
+        if max_ci < 8 {
+            let b0 = payload[0];
+            let (hdr_u64, mut hdr_pos) = if b0 < 0x80 {
+                (u64::from(b0), 1usize)
+            } else {
+                get_varint(payload)?
+            };
+            let hdr_len = usize::try_from(hdr_u64)
+                .ok()
+                .filter(|&h| h <= payload.len() && hdr_pos <= h)
+                .ok_or_else(|| SqliteError::corrupt("record header exceeds record length"))?;
+            let mut body_pos = hdr_len;
+
+            let mut serials = [0u64; 8];
+            let mut offs = [0usize; 8];
+            let mut lens = [0usize; 8];
+            let mut parsed = 0usize;
+            while parsed <= max_ci && hdr_pos < hdr_len {
+                let hb = payload[hdr_pos];
+                let (st, used) = if hb < 0x80 {
+                    (u64::from(hb), 1usize)
+                } else {
+                    get_varint(&payload[hdr_pos..hdr_len])?
+                };
+                let len = serial_type_len(st)?;
+                let next_b = body_pos
+                    .checked_add(len)
+                    .filter(|&nb| nb <= payload.len())
+                    .ok_or_else(|| SqliteError::corrupt("record payload truncated"))?;
+                serials[parsed] = st;
+                offs[parsed] = body_pos;
+                lens[parsed] = len;
+                hdr_pos += used;
+                body_pos = next_b;
+                parsed += 1;
+            }
+
+            let mut inline_cols = [InlineVal::Null; INLINE_ROW_COLS];
+            let mut fallback_from: Option<usize> = None;
+            for (i, c) in cols.iter().enumerate() {
+                match c {
+                    PointProjCol::Rowid => inline_cols[i] = InlineVal::Integer(rowid),
+                    PointProjCol::Column {
+                        col_idx,
+                        default_val,
+                    } => {
+                        let ci = *col_idx as usize;
+                        if ci >= parsed {
+                            match default_val {
+                                None => inline_cols[i] = InlineVal::Null,
+                                Some(v) => match InlineVal::try_from_value(v) {
+                                    Some(iv) => inline_cols[i] = iv,
+                                    None => {
+                                        fallback_from = Some(i);
+                                        break;
+                                    }
+                                },
+                            }
+                        } else {
+                            let start = offs[ci];
+                            let len = lens[ci];
+                            match InlineVal::try_from_serial_bytes(
+                                serials[ci],
+                                &payload[start..start + len],
+                                enc,
+                            )? {
+                                Some(iv) => inline_cols[i] = iv,
+                                None => {
+                                    fallback_from = Some(i);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(first_heap_idx) = fallback_from {
+                let mut out = Vec::with_capacity(cols.len());
+                for iv in &inline_cols[..first_heap_idx] {
+                    out.push(iv.to_value());
+                }
+                for c in &cols[first_heap_idx..] {
+                    match c {
+                        PointProjCol::Rowid => out.push(Value::Integer(rowid)),
+                        PointProjCol::Column {
+                            col_idx,
+                            default_val,
+                        } => {
+                            let ci = *col_idx as usize;
+                            if ci >= parsed {
+                                out.push(default_val.clone().unwrap_or(Value::Null));
+                            } else {
+                                let start = offs[ci];
+                                let len = lens[ci];
+                                out.push(decode_serial_value_with_encoding(
+                                    serials[ci],
+                                    &payload[start..start + len],
+                                    enc,
+                                )?);
+                            }
+                        }
+                    }
+                }
+                return Ok(PointLookupRow::Heap(out));
+            }
+
+            return Ok(PointLookupRow::Inline(InlineRow::from_raw_parts(
+                cols.len() as u8,
+                inline_cols,
+            )));
+        }
+    }
+
+    Ok(PointLookupRow::Heap(decode_projected_cols_from_record(
+        payload, rowid, cols, enc,
+    )?))
 }
 
 #[inline]
@@ -1377,6 +1704,89 @@ impl Btree {
         }
     }
 
+    /// Zero-heap `rowid` point lookup decoding directly from the raw `TableLeaf` cell into an
+    /// inline [`PointLookupRow::Inline`] whenever `cols.len() <= 4` and all projected text/blob
+    /// values fit in [`INLINE_VAL_CAP`].
+    pub fn point_lookup_table_columns_row(
+        &mut self,
+        root_pgno: Pgno,
+        rowid: i64,
+        cols: &[PointProjCol],
+        max_col_idx: Option<u16>,
+    ) -> Result<Option<PointLookupRow>> {
+        if self.pager.page_count() == 0 {
+            return Ok(None);
+        }
+        let enc = self.encoding();
+        let usable = self.pager.usable_size();
+        let mut cur_pgno = root_pgno;
+        loop {
+            self.check_interrupted()?;
+            enum RowLookupStep {
+                Descend(Pgno),
+                Done(Option<PointLookupRow>),
+                Overflow(u32, Vec<u8>, Option<Pgno>),
+            }
+            let step = {
+                let raw = self.pager.read_page(cur_pgno)?;
+                let hdr_off = if cur_pgno == 1 { 100 } else { 0 };
+                if hdr_off >= usable as usize || raw.len() < usable as usize {
+                    return Err(SqliteError::corrupt("raw page smaller than usable_size"));
+                }
+                match raw[hdr_off] {
+                    x if x == BtreePageType::TableInterior as u8 => {
+                        let (_, next_pgno) =
+                            find_table_interior_child(cur_pgno, usable, raw, rowid)?;
+                        RowLookupStep::Descend(next_pgno)
+                    }
+                    x if x == BtreePageType::TableLeaf as u8 => {
+                        let (_, n_cell, _) = raw_page_header(cur_pgno, usable, raw)?;
+                        match binary_search_table_leaf_with_span(
+                            cur_pgno, usable, raw, n_cell, rowid,
+                        )? {
+                            Err(_) => RowLookupStep::Done(None),
+                            Ok((_, Some((p_start, p_end)))) => {
+                                let payload = &raw[p_start as usize..p_end as usize];
+                                let row = decode_projected_cols_to_lookup_row(
+                                    payload,
+                                    rowid,
+                                    cols,
+                                    max_col_idx,
+                                    enc,
+                                )?;
+                                RowLookupStep::Done(Some(row))
+                            }
+                            Ok((cell_idx, None)) => {
+                                let c =
+                                    read_table_leaf_cell(cur_pgno, usable, raw, n_cell, cell_idx)?;
+                                RowLookupStep::Overflow(
+                                    c.total_payload_len,
+                                    c.local_payload.to_vec(),
+                                    c.overflow_page,
+                                )
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(SqliteError::corrupt(format!(
+                            "expected table page at {cur_pgno}"
+                        )));
+                    }
+                }
+            };
+            match step {
+                RowLookupStep::Descend(next_pgno) => cur_pgno = next_pgno,
+                RowLookupStep::Done(res) => return Ok(res),
+                RowLookupStep::Overflow(total_len, local_copy, ovfl) => {
+                    let full = self.read_full_payload(total_len, &local_copy, ovfl)?;
+                    let row =
+                        decode_projected_cols_to_lookup_row(&full, rowid, cols, max_col_idx, enc)?;
+                    return Ok(Some(row));
+                }
+            }
+        }
+    }
+
     /// Zero-allocation `rowid` point lookup that passes the borrowed record payload slice directly
     /// to `visit` when the cell fits in-page (falling back to overflow assembly only for oversized cells).
     pub fn with_table_rowid_raw_cell<R, F>(
@@ -2595,7 +3005,22 @@ impl Btree {
     /// Deletes `rowid` from the Table B+Tree rooted at `root_pgno`. Returns `true` if a row was deleted.
     pub fn delete_table(&mut self, root_pgno: Pgno, rowid: i64) -> Result<bool> {
         self.save_cursors_for_mutation(Some(root_pgno), None)?;
-        let (deleted, _) = self.delete_table_rec(root_pgno, rowid, true)?;
+        let (deleted, _) = self.delete_table_rec(root_pgno, rowid, true, None)?;
+        Ok(deleted)
+    }
+
+    /// Deletes `rowid` from the Table B+Tree rooted at `root_pgno` in a single root-to-leaf traversal
+    /// and single leaf binary search, copying the deleted row's full Format-3 record payload into
+    /// `old_payload_out` (reusing its heap capacity) when found.
+    pub fn delete_table_returning_raw_into(
+        &mut self,
+        root_pgno: Pgno,
+        rowid: i64,
+        old_payload_out: &mut Vec<u8>,
+    ) -> Result<bool> {
+        self.save_cursors_for_mutation(Some(root_pgno), None)?;
+        old_payload_out.clear();
+        let (deleted, _) = self.delete_table_rec(root_pgno, rowid, true, Some(old_payload_out))?;
         Ok(deleted)
     }
 
@@ -2608,6 +3033,7 @@ impl Btree {
         pgno: Pgno,
         rowid: i64,
         is_root: bool,
+        mut old_payload_out: Option<&mut Vec<u8>>,
     ) -> Result<(bool, Option<Pgno>)> {
         let usable = self.pager.usable_size();
         let ptype = {
@@ -2620,7 +3046,8 @@ impl Btree {
                 let raw = self.pager.read_page(pgno)?;
                 find_table_interior_child(pgno, usable, raw, rowid)?
             };
-            let (deleted, replacement) = self.delete_table_rec(target_child, rowid, false)?;
+            let (deleted, replacement) =
+                self.delete_table_rec(target_child, rowid, false, old_payload_out)?;
             if !deleted || replacement.is_none() {
                 return Ok((deleted, None));
             }
@@ -2669,32 +3096,76 @@ impl Btree {
         }
 
         if ptype == BtreePageType::TableLeaf {
-            // Probe existence first via read_page so missing-key deletes don't dirty pages!
-            let exists = {
+            // Single binary-search probe via `read_page` so missing-key deletes don't dirty pages
+            // and matching deletes neither re-search nor allocate!
+            let probe = {
                 let raw = self.pager.read_page(pgno)?;
-                seek_table_leaf_cell(pgno, usable, raw, rowid)?.is_some()
-            };
-            if !exists {
-                return Ok((false, None));
-            }
-            let outcome = {
-                let raw_mut = self.pager.write_page(pgno)?;
-                try_delete_table_leaf_in_place(pgno, usable, raw_mut, rowid, is_root)?
-            };
-            match outcome {
-                RawLeafDeleteOutcome::NotFound => return Ok((false, None)),
-                RawLeafDeleteOutcome::DeletedInPlace {
-                    overflow_page,
-                    now_empty,
-                } => {
-                    self.free_overflow_chain(overflow_page)?;
-                    if now_empty && !is_root {
-                        self.free_page(pgno)?;
-                        return Ok((true, Some(0)));
-                    }
-                    return Ok((true, None));
+                let p = probe_delete_table_leaf_raw(pgno, usable, raw, rowid)?;
+                if let TableLeafDeleteProbe::Found {
+                    payload_start,
+                    local_len,
+                    overflow_page: None,
+                    ..
+                } = p
+                    && let Some(ref mut out_buf) = old_payload_out
+                {
+                    out_buf.clear();
+                    out_buf.extend_from_slice(&raw[payload_start..payload_start + local_len]);
                 }
-                RawLeafDeleteOutcome::Fallback => {}
+                p
+            };
+            match probe {
+                TableLeafDeleteProbe::NotFound => return Ok((false, None)),
+                TableLeafDeleteProbe::Found {
+                    idx,
+                    n_cell,
+                    cell_off,
+                    cell_len,
+                    payload_start,
+                    local_len,
+                    total_payload_len,
+                    overflow_page,
+                } => {
+                    if overflow_page.is_some()
+                        && let Some(ref mut out_buf) = old_payload_out
+                    {
+                        let local_copy = {
+                            let raw = self.pager.read_page(pgno)?;
+                            raw[payload_start..payload_start + local_len].to_vec()
+                        };
+                        let full =
+                            self.read_full_payload(total_payload_len, &local_copy, overflow_page)?;
+                        out_buf.clear();
+                        out_buf.extend_from_slice(&full);
+                    }
+                    let outcome = {
+                        let raw_mut = self.pager.write_page(pgno)?;
+                        apply_delete_table_leaf_in_place(
+                            pgno,
+                            usable,
+                            raw_mut,
+                            idx,
+                            n_cell,
+                            cell_off,
+                            cell_len,
+                            overflow_page,
+                            is_root,
+                        )?
+                    };
+                    if let RawLeafDeleteOutcome::DeletedInPlace {
+                        overflow_page,
+                        now_empty,
+                    } = outcome
+                    {
+                        self.free_overflow_chain(overflow_page)?;
+                        if now_empty && !is_root {
+                            self.free_page(pgno)?;
+                            return Ok((true, Some(0)));
+                        }
+                        return Ok((true, None));
+                    }
+                }
+                TableLeafDeleteProbe::Fallback => {}
             }
         }
 
@@ -2705,6 +3176,15 @@ impl Btree {
                     return Ok((false, None));
                 };
                 let removed = cells.remove(idx);
+                if let Some(out_buf) = old_payload_out {
+                    let full = self.read_full_payload(
+                        removed.total_payload_len,
+                        &removed.local_payload,
+                        removed.overflow_page,
+                    )?;
+                    out_buf.clear();
+                    out_buf.extend_from_slice(&full);
+                }
                 self.free_overflow_chain(removed.overflow_page)?;
 
                 if cells.is_empty() && !is_root {
@@ -2745,6 +3225,28 @@ impl Btree {
     where
         F: FnMut(&[u8]) -> Result<ControlFlow<()>>,
     {
+        if !reverse {
+            return self.scan_index_morsels(root_pgno, false, |item| match item {
+                IndexScanItem::LeafMorsel { morsel, start, end } => {
+                    for ci in start..end {
+                        let Some(payload) = morsel.local_cell(ci)? else {
+                            return Ok(MorselStep::OverflowAt(ci));
+                        };
+                        if visit(payload)?.is_break() {
+                            return Ok(MorselStep::Break);
+                        }
+                    }
+                    Ok(MorselStep::Continue)
+                }
+                IndexScanItem::SingleCell(payload) => {
+                    if visit(payload)?.is_break() {
+                        Ok(MorselStep::Break)
+                    } else {
+                        Ok(MorselStep::Continue)
+                    }
+                }
+            });
+        }
         if self.pager.page_count() == 0 || root_pgno == 0 {
             return Ok(());
         }
@@ -2754,12 +3256,168 @@ impl Btree {
         let _ = self.scan_index_raw_rec(
             root_pgno,
             usable,
-            reverse,
+            true,
             &mut visited_pages,
             max_pages,
             &mut visit,
         )?;
         Ok(())
+    }
+
+    /// Walks an Index B-Tree yielding whole `IndexLeafMorsel` page slices on leaves (when `!reverse`)
+    /// and `SingleCell` for interior divider cells and rare overflow cells.
+    pub fn scan_index_morsels<F>(
+        &mut self,
+        root_pgno: Pgno,
+        reverse: bool,
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(IndexScanItem<'_>) -> Result<MorselStep>,
+    {
+        if self.pager.page_count() == 0 || root_pgno == 0 {
+            return Ok(());
+        }
+        let usable = self.pager.usable_size();
+        let max_pages = (self.pager.page_count() as usize).saturating_add(2);
+        let mut visited_pages = 0usize;
+        if reverse {
+            let mut single_visit = |payload: &[u8]| match visit(IndexScanItem::SingleCell(payload))?
+            {
+                MorselStep::Break => Ok(ControlFlow::Break(())),
+                MorselStep::Continue | MorselStep::OverflowAt(_) => Ok(ControlFlow::Continue(())),
+            };
+            let _ = self.scan_index_raw_rec(
+                root_pgno,
+                usable,
+                true,
+                &mut visited_pages,
+                max_pages,
+                &mut single_visit,
+            )?;
+            return Ok(());
+        }
+        let _ = self.scan_index_morsels_rec(
+            root_pgno,
+            usable,
+            &mut visited_pages,
+            max_pages,
+            &mut visit,
+        )?;
+        Ok(())
+    }
+
+    fn scan_index_morsels_rec<F>(
+        &mut self,
+        pgno: Pgno,
+        usable: u32,
+        visited_pages: &mut usize,
+        max_pages: usize,
+        visit: &mut F,
+    ) -> Result<ControlFlow<()>>
+    where
+        F: FnMut(IndexScanItem<'_>) -> Result<MorselStep>,
+    {
+        self.check_interrupted()?;
+        *visited_pages += 1;
+        if *visited_pages > max_pages {
+            return Err(SqliteError::corrupt("cycle detected in index B-Tree"));
+        }
+        let (ptype, n_cell, right_child) = {
+            let raw = self.pager.read_page(pgno)?;
+            raw_page_header(pgno, usable, raw)?
+        };
+        match ptype {
+            BtreePageType::IndexLeaf => {
+                let mut ci = 0usize;
+                while ci < n_cell {
+                    enum LeafMorselAction {
+                        Done,
+                        Broke,
+                        Overflow(usize, u32, Vec<u8>, Option<Pgno>),
+                    }
+                    let act = {
+                        let raw = self.pager.read_page(pgno)?;
+                        let morsel = IndexLeafMorsel::new(pgno, usable, raw, n_cell)?;
+                        match visit(IndexScanItem::LeafMorsel {
+                            morsel: &morsel,
+                            start: ci,
+                            end: n_cell,
+                        })? {
+                            MorselStep::Continue => LeafMorselAction::Done,
+                            MorselStep::Break => LeafMorselAction::Broke,
+                            MorselStep::OverflowAt(ovfl_ci) => {
+                                let cell = morsel.read_cell(ovfl_ci)?;
+                                LeafMorselAction::Overflow(
+                                    ovfl_ci + 1,
+                                    cell.total_payload_len,
+                                    cell.local_payload.to_vec(),
+                                    cell.overflow_page,
+                                )
+                            }
+                        }
+                    };
+                    match act {
+                        LeafMorselAction::Done => break,
+                        LeafMorselAction::Broke => return Ok(ControlFlow::Break(())),
+                        LeafMorselAction::Overflow(next_ci, tlen, local_copy, ovfl) => {
+                            ci = next_ci;
+                            let full = self.read_full_payload(tlen, &local_copy, ovfl)?;
+                            if visit(IndexScanItem::SingleCell(&full))? == MorselStep::Break {
+                                return Ok(ControlFlow::Break(()));
+                            }
+                        }
+                    }
+                }
+                Ok(ControlFlow::Continue(()))
+            }
+            BtreePageType::IndexInterior => {
+                for ci in 0..n_cell {
+                    let left_child = {
+                        let raw = self.pager.read_page(pgno)?;
+                        read_index_interior_cell(pgno, usable, raw, n_cell, ci)?.0
+                    };
+                    if self
+                        .scan_index_morsels_rec(
+                            left_child,
+                            usable,
+                            visited_pages,
+                            max_pages,
+                            visit,
+                        )?
+                        .is_break()
+                    {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    let ovfl = {
+                        let raw = self.pager.read_page(pgno)?;
+                        let (_, cell) = read_index_interior_cell(pgno, usable, raw, n_cell, ci)?;
+                        if cell.overflow_page.is_none() {
+                            if visit(IndexScanItem::SingleCell(cell.local_payload))?
+                                == MorselStep::Break
+                            {
+                                return Ok(ControlFlow::Break(()));
+                            }
+                            None
+                        } else {
+                            Some((
+                                cell.total_payload_len,
+                                cell.local_payload.to_vec(),
+                                cell.overflow_page,
+                            ))
+                        }
+                    };
+                    if let Some((tlen, local_copy, ovfl_pg)) = ovfl {
+                        let full = self.read_full_payload(tlen, &local_copy, ovfl_pg)?;
+                        if visit(IndexScanItem::SingleCell(&full))? == MorselStep::Break {
+                            return Ok(ControlFlow::Break(()));
+                        }
+                    }
+                }
+                self.scan_index_morsels_rec(right_child, usable, visited_pages, max_pages, visit)
+            }
+            _ => Err(SqliteError::corrupt("expected index page in scan")),
+        }
     }
 
     fn scan_index_raw_rec<F>(
@@ -3542,6 +4200,36 @@ impl Btree {
     where
         F: FnMut(&[u8]) -> Result<ControlFlow<()>>,
     {
+        if !reverse {
+            return self.seek_index_range_morsels(
+                root_pgno,
+                prefix_values,
+                lower_bound,
+                upper_bound,
+                orders,
+                false,
+                |item| match item {
+                    IndexScanItem::LeafMorsel { morsel, start, end } => {
+                        for ci in start..end {
+                            let Some(payload) = morsel.local_cell(ci)? else {
+                                return Ok(MorselStep::OverflowAt(ci));
+                            };
+                            if visit(payload)?.is_break() {
+                                return Ok(MorselStep::Break);
+                            }
+                        }
+                        Ok(MorselStep::Continue)
+                    }
+                    IndexScanItem::SingleCell(payload) => {
+                        if visit(payload)?.is_break() {
+                            Ok(MorselStep::Break)
+                        } else {
+                            Ok(MorselStep::Continue)
+                        }
+                    }
+                },
+            );
+        }
         if self.pager.page_count() == 0 || root_pgno == 0 {
             return Ok(());
         }
@@ -3557,12 +4245,580 @@ impl Btree {
             upper_bound,
             orders,
             enc,
-            reverse,
+            true,
             &mut visited_pages,
             max_pages,
             &mut visit,
         )?;
         Ok(())
+    }
+
+    /// Forward/reverse Index B-Tree range scan yielding validated in-range leaf slices
+    /// (`IndexScanItem::LeafMorsel { morsel, start, end }`) using a `last_cell <= upper_bound`
+    /// full-leaf fast path or `O(log N)` upper-bound binary search + immediate range termination.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seek_index_range_morsels<F>(
+        &mut self,
+        root_pgno: Pgno,
+        prefix_values: &[Value],
+        lower_bound: Option<(&Value, bool)>,
+        upper_bound: Option<(&Value, bool)>,
+        orders: &[KeySortOrder],
+        reverse: bool,
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(IndexScanItem<'_>) -> Result<MorselStep>,
+    {
+        if self.pager.page_count() == 0 || root_pgno == 0 {
+            return Ok(());
+        }
+        let enc = self.encoding();
+        let usable = self.pager.usable_size();
+        let max_pages = (self.pager.page_count() as usize).saturating_add(2);
+        let mut visited_pages = 0usize;
+        if reverse {
+            let mut single_visit = |payload: &[u8]| match visit(IndexScanItem::SingleCell(payload))?
+            {
+                MorselStep::Break => Ok(ControlFlow::Break(())),
+                MorselStep::Continue | MorselStep::OverflowAt(_) => Ok(ControlFlow::Continue(())),
+            };
+            let _ = self.seek_index_range_raw_cells_rec(
+                root_pgno,
+                usable,
+                prefix_values,
+                lower_bound,
+                upper_bound,
+                orders,
+                enc,
+                true,
+                &mut visited_pages,
+                max_pages,
+                &mut single_visit,
+            )?;
+            return Ok(());
+        }
+        let _ = self.seek_index_range_morsels_fwd_rec(
+            root_pgno,
+            usable,
+            prefix_values,
+            lower_bound,
+            upper_bound,
+            orders,
+            enc,
+            &mut visited_pages,
+            max_pages,
+            &mut visit,
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seek_index_range_morsels_fwd_rec<F>(
+        &mut self,
+        pgno: Pgno,
+        usable: u32,
+        prefix_values: &[Value],
+        lower_bound: Option<(&Value, bool)>,
+        upper_bound: Option<(&Value, bool)>,
+        orders: &[KeySortOrder],
+        enc: TextEncoding,
+        visited_pages: &mut usize,
+        max_pages: usize,
+        visit: &mut F,
+    ) -> Result<ControlFlow<()>>
+    where
+        F: FnMut(IndexScanItem<'_>) -> Result<MorselStep>,
+    {
+        self.check_interrupted()?;
+        *visited_pages += 1;
+        if *visited_pages > max_pages {
+            return Err(SqliteError::corrupt("cycle detected in index B-Tree"));
+        }
+        enum FastFwdOutcome {
+            LeafCompleted(ControlFlow<()>),
+            SlowLeaf {
+                n_cell: usize,
+                resume_ci: Option<usize>,
+            },
+            InteriorBounds {
+                n_cell: usize,
+                lo: usize,
+                eq_end: usize,
+                child_after_eq: Pgno,
+            },
+            SlowInterior {
+                n_cell: usize,
+                right_child: Pgno,
+            },
+        }
+
+        let fast_outcome = {
+            let raw = self.pager.read_page(pgno)?;
+            let (ptype, n_cell, right_child) = raw_page_header(pgno, usable, raw)?;
+            match ptype {
+                BtreePageType::IndexLeaf => {
+                    let morsel = IndexLeafMorsel::new(pgno, usable, raw, n_cell)?;
+                    let mut lo = 0usize;
+                    let mut hi = n_cell;
+                    let mut has_ovfl = false;
+                    while lo < hi {
+                        let mid = lo + (hi - lo) / 2;
+                        let Some(payload) = morsel.local_cell(mid)? else {
+                            has_ovfl = true;
+                            break;
+                        };
+                        let ord = compare_raw_record_range(
+                            payload,
+                            prefix_values,
+                            lower_bound,
+                            upper_bound,
+                            orders,
+                            enc,
+                        )?;
+                        if ord == Ordering::Less {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    if has_ovfl {
+                        FastFwdOutcome::SlowLeaf {
+                            n_cell,
+                            resume_ci: None,
+                        }
+                    } else if lo == n_cell {
+                        FastFwdOutcome::LeafCompleted(ControlFlow::Continue(()))
+                    } else {
+                        // Probe `last_cell` (`n_cell - 1`) against the upper bound:
+                        // - `Equal`: every cell in `lo..n_cell` is guaranteed in-range!
+                        // - `Greater`: binary-search `lo..(n_cell - 1)` in `O(log N)` for exact `end_idx`,
+                        //   visit `lo..end_idx` in a tight morsel, and terminate range scan immediately!
+                        match morsel.local_cell(n_cell - 1)? {
+                            None => FastFwdOutcome::SlowLeaf {
+                                n_cell,
+                                resume_ci: Some(lo),
+                            },
+                            Some(last_payload) => {
+                                let last_ord = compare_raw_record_range(
+                                    last_payload,
+                                    prefix_values,
+                                    lower_bound,
+                                    upper_bound,
+                                    orders,
+                                    enc,
+                                )?;
+                                match last_ord {
+                                    Ordering::Equal => {
+                                        match visit(IndexScanItem::LeafMorsel {
+                                            morsel: &morsel,
+                                            start: lo,
+                                            end: n_cell,
+                                        })? {
+                                            MorselStep::Continue => FastFwdOutcome::LeafCompleted(
+                                                ControlFlow::Continue(()),
+                                            ),
+                                            MorselStep::Break => FastFwdOutcome::LeafCompleted(
+                                                ControlFlow::Break(()),
+                                            ),
+                                            MorselStep::OverflowAt(ovfl_ci) => {
+                                                FastFwdOutcome::SlowLeaf {
+                                                    n_cell,
+                                                    resume_ci: Some(ovfl_ci),
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Ordering::Greater => {
+                                        let mut ulo = lo;
+                                        let mut uhi = n_cell - 1;
+                                        let mut mid_ovfl = false;
+                                        while ulo < uhi {
+                                            let mid = ulo + (uhi - ulo) / 2;
+                                            let Some(mid_payload) = morsel.local_cell(mid)? else {
+                                                mid_ovfl = true;
+                                                break;
+                                            };
+                                            let ord = compare_raw_record_range(
+                                                mid_payload,
+                                                prefix_values,
+                                                lower_bound,
+                                                upper_bound,
+                                                orders,
+                                                enc,
+                                            )?;
+                                            if ord == Ordering::Greater {
+                                                uhi = mid;
+                                            } else {
+                                                ulo = mid + 1;
+                                            }
+                                        }
+                                        if mid_ovfl {
+                                            FastFwdOutcome::SlowLeaf {
+                                                n_cell,
+                                                resume_ci: Some(lo),
+                                            }
+                                        } else if ulo == lo {
+                                            FastFwdOutcome::LeafCompleted(ControlFlow::Break(()))
+                                        } else {
+                                            match visit(IndexScanItem::LeafMorsel {
+                                                morsel: &morsel,
+                                                start: lo,
+                                                end: ulo,
+                                            })? {
+                                                MorselStep::Continue | MorselStep::Break => {
+                                                    FastFwdOutcome::LeafCompleted(
+                                                        ControlFlow::Break(()),
+                                                    )
+                                                }
+                                                MorselStep::OverflowAt(ovfl_ci) => {
+                                                    FastFwdOutcome::SlowLeaf {
+                                                        n_cell,
+                                                        resume_ci: Some(ovfl_ci),
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Ordering::Less => FastFwdOutcome::SlowLeaf {
+                                        n_cell,
+                                        resume_ci: Some(lo),
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
+                BtreePageType::IndexInterior => {
+                    let mut lo = 0usize;
+                    let mut hi = n_cell;
+                    let mut has_ovfl = false;
+                    while lo < hi {
+                        let mid = lo + (hi - lo) / 2;
+                        let (_, cell) = read_index_interior_cell(pgno, usable, raw, n_cell, mid)?;
+                        if cell.overflow_page.is_some() {
+                            has_ovfl = true;
+                            break;
+                        }
+                        let ord = compare_raw_record_range(
+                            cell.local_payload,
+                            prefix_values,
+                            lower_bound,
+                            upper_bound,
+                            orders,
+                            enc,
+                        )?;
+                        if ord == Ordering::Less {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    if has_ovfl {
+                        FastFwdOutcome::SlowInterior {
+                            n_cell,
+                            right_child,
+                        }
+                    } else {
+                        let mut ulo = lo;
+                        let mut uhi = n_cell;
+                        while ulo < uhi {
+                            let mid = ulo + (uhi - ulo) / 2;
+                            let (_, cell) =
+                                read_index_interior_cell(pgno, usable, raw, n_cell, mid)?;
+                            if cell.overflow_page.is_some() {
+                                has_ovfl = true;
+                                break;
+                            }
+                            let ord = compare_raw_record_range(
+                                cell.local_payload,
+                                prefix_values,
+                                lower_bound,
+                                upper_bound,
+                                orders,
+                                enc,
+                            )?;
+                            if ord == Ordering::Greater {
+                                uhi = mid;
+                            } else {
+                                ulo = mid + 1;
+                            }
+                        }
+                        if has_ovfl {
+                            FastFwdOutcome::SlowInterior {
+                                n_cell,
+                                right_child,
+                            }
+                        } else {
+                            let eq_end = ulo;
+                            let child_after_eq = if eq_end < n_cell {
+                                read_index_interior_cell(pgno, usable, raw, n_cell, eq_end)?.0
+                            } else {
+                                right_child
+                            };
+                            FastFwdOutcome::InteriorBounds {
+                                n_cell,
+                                lo,
+                                eq_end,
+                                child_after_eq,
+                            }
+                        }
+                    }
+                }
+                _ => return Err(SqliteError::corrupt("expected index page in range seek")),
+            }
+        };
+
+        let (n_cell, lo, eq_end, child_after_eq) = match fast_outcome {
+            FastFwdOutcome::LeafCompleted(cf) => return Ok(cf),
+            FastFwdOutcome::SlowLeaf { n_cell, resume_ci } => {
+                let mut ci = if let Some(start_ci) = resume_ci {
+                    start_ci
+                } else {
+                    let mut lo = 0usize;
+                    let mut hi = n_cell;
+                    while lo < hi {
+                        let mid = lo + (hi - lo) / 2;
+                        let (_, ord) = self.compare_raw_index_cell_at(
+                            pgno,
+                            usable,
+                            false,
+                            n_cell,
+                            mid,
+                            prefix_values,
+                            lower_bound,
+                            upper_bound,
+                            orders,
+                            enc,
+                        )?;
+                        if ord == Ordering::Less {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    lo
+                };
+
+                while ci < n_cell {
+                    enum LeafRangeStep {
+                        Done,
+                        HitGreater,
+                        Broke,
+                        Overflow(u32, Vec<u8>, Option<Pgno>),
+                    }
+                    let step = {
+                        let raw = self.pager.read_page(pgno)?;
+                        let mut st = LeafRangeStep::Done;
+                        while ci < n_cell {
+                            let cell = read_index_leaf_cell(pgno, usable, raw, n_cell, ci)?;
+                            ci += 1;
+                            if cell.overflow_page.is_none() {
+                                match compare_raw_record_range(
+                                    cell.local_payload,
+                                    prefix_values,
+                                    lower_bound,
+                                    upper_bound,
+                                    orders,
+                                    enc,
+                                )? {
+                                    Ordering::Less => continue,
+                                    Ordering::Equal => {
+                                        if visit(IndexScanItem::SingleCell(cell.local_payload))?
+                                            == MorselStep::Break
+                                        {
+                                            st = LeafRangeStep::Broke;
+                                            break;
+                                        }
+                                    }
+                                    Ordering::Greater => {
+                                        st = LeafRangeStep::HitGreater;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                st = LeafRangeStep::Overflow(
+                                    cell.total_payload_len,
+                                    cell.local_payload.to_vec(),
+                                    cell.overflow_page,
+                                );
+                                break;
+                            }
+                        }
+                        st
+                    };
+                    match step {
+                        LeafRangeStep::Done => break,
+                        LeafRangeStep::HitGreater => return Ok(ControlFlow::Break(())),
+                        LeafRangeStep::Broke => return Ok(ControlFlow::Break(())),
+                        LeafRangeStep::Overflow(tlen, local_copy, ovfl) => {
+                            let full = self.read_full_payload(tlen, &local_copy, ovfl)?;
+                            match compare_raw_record_range(
+                                &full,
+                                prefix_values,
+                                lower_bound,
+                                upper_bound,
+                                orders,
+                                enc,
+                            )? {
+                                Ordering::Less => continue,
+                                Ordering::Equal => {
+                                    if visit(IndexScanItem::SingleCell(&full))? == MorselStep::Break
+                                    {
+                                        return Ok(ControlFlow::Break(()));
+                                    }
+                                }
+                                Ordering::Greater => return Ok(ControlFlow::Break(())),
+                            }
+                        }
+                    }
+                }
+                return Ok(ControlFlow::Continue(()));
+            }
+            FastFwdOutcome::InteriorBounds {
+                n_cell,
+                lo,
+                eq_end,
+                child_after_eq,
+            } => (n_cell, lo, eq_end, child_after_eq),
+            FastFwdOutcome::SlowInterior {
+                n_cell,
+                right_child,
+            } => {
+                let mut lo = 0usize;
+                let mut hi = n_cell;
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let (_, ord) = self.compare_raw_index_cell_at(
+                        pgno,
+                        usable,
+                        true,
+                        n_cell,
+                        mid,
+                        prefix_values,
+                        lower_bound,
+                        upper_bound,
+                        orders,
+                        enc,
+                    )?;
+                    if ord == Ordering::Less {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                let mut ulo = lo;
+                let mut uhi = n_cell;
+                while ulo < uhi {
+                    let mid = ulo + (uhi - ulo) / 2;
+                    let (_, ord) = self.compare_raw_index_cell_at(
+                        pgno,
+                        usable,
+                        true,
+                        n_cell,
+                        mid,
+                        prefix_values,
+                        lower_bound,
+                        upper_bound,
+                        orders,
+                        enc,
+                    )?;
+                    if ord == Ordering::Greater {
+                        uhi = mid;
+                    } else {
+                        ulo = mid + 1;
+                    }
+                }
+                let eq_end = ulo;
+                let child_after_eq = if eq_end < n_cell {
+                    let raw = self.pager.read_page(pgno)?;
+                    read_index_interior_cell(pgno, usable, raw, n_cell, eq_end)?.0
+                } else {
+                    right_child
+                };
+                (n_cell, lo, eq_end, child_after_eq)
+            }
+        };
+
+        for ci in lo..eq_end {
+            let left_child = {
+                let raw = self.pager.read_page(pgno)?;
+                read_index_interior_cell(pgno, usable, raw, n_cell, ci)?.0
+            };
+            if self
+                .seek_index_range_morsels_fwd_rec(
+                    left_child,
+                    usable,
+                    prefix_values,
+                    lower_bound,
+                    upper_bound,
+                    orders,
+                    enc,
+                    visited_pages,
+                    max_pages,
+                    visit,
+                )?
+                .is_break()
+            {
+                return Ok(ControlFlow::Break(()));
+            }
+            let (ovfl, broke_inline) = {
+                let raw = self.pager.read_page(pgno)?;
+                let (_, cell) = read_index_interior_cell(pgno, usable, raw, n_cell, ci)?;
+                if cell.overflow_page.is_none() {
+                    let brk = compare_raw_record_range(
+                        cell.local_payload,
+                        prefix_values,
+                        lower_bound,
+                        upper_bound,
+                        orders,
+                        enc,
+                    )? == Ordering::Equal
+                        && visit(IndexScanItem::SingleCell(cell.local_payload))?
+                            == MorselStep::Break;
+                    (None, brk)
+                } else {
+                    (
+                        Some((
+                            cell.total_payload_len,
+                            cell.local_payload.to_vec(),
+                            cell.overflow_page,
+                        )),
+                        false,
+                    )
+                }
+            };
+            if broke_inline {
+                return Ok(ControlFlow::Break(()));
+            }
+            if let Some((tlen, local_copy, ovfl_pg)) = ovfl {
+                let full = self.read_full_payload(tlen, &local_copy, ovfl_pg)?;
+                if compare_raw_record_range(
+                    &full,
+                    prefix_values,
+                    lower_bound,
+                    upper_bound,
+                    orders,
+                    enc,
+                )? == Ordering::Equal
+                    && visit(IndexScanItem::SingleCell(&full))? == MorselStep::Break
+                {
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+        }
+        self.seek_index_range_morsels_fwd_rec(
+            child_after_eq,
+            usable,
+            prefix_values,
+            lower_bound,
+            upper_bound,
+            orders,
+            enc,
+            visited_pages,
+            max_pages,
+            visit,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4721,7 +5977,7 @@ impl Btree {
             }
         }
 
-        let hdr_off = if pgno == 1 { 100 } else { 0 };
+        let hdr_off: usize = if pgno == 1 { 100 } else { 0 };
         let ptr_base = hdr_off + 8;
         let n_cell = records.len();
         {
@@ -4790,7 +6046,7 @@ impl Btree {
             }
         }
 
-        let hdr_off = if pgno == 1 { 100 } else { 0 };
+        let hdr_off: usize = if pgno == 1 { 100 } else { 0 };
         let ptr_base = hdr_off + 12;
         let n_cell = dividers.len();
         {
@@ -4827,6 +6083,358 @@ impl Btree {
             };
             raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
             raw[hdr_off + 8..hdr_off + 12].copy_from_slice(&right_child.to_be_bytes());
+        }
+
+        if auto_vac {
+            for &(left_child, _) in dividers {
+                self.ptrmap_put(left_child, PtrmapType::BtreeNode, pgno)?;
+            }
+            self.ptrmap_put(right_child, PtrmapType::BtreeNode, pgno)?;
+            for &(_, ovfl_pg) in &ovfl_entries {
+                self.ptrmap_put(ovfl_pg, PtrmapType::Overflow1, pgno)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Bottom-up O(N) bulk loader over a contiguous byte arena + sorted [`ArenaIndexEntry`]
+    /// slice, eliminating both `Vec<&[u8]>` slice-pointer allocation and `Vec<usize>` leaf-size
+    /// allocation during `CREATE INDEX`.
+    pub fn bulk_load_sorted_arena(
+        &mut self,
+        root_pgno: Pgno,
+        arena: &[u8],
+        entries: &[ArenaIndexEntry],
+    ) -> Result<()> {
+        self.save_cursors_for_mutation(Some(root_pgno), None)?;
+
+        let usable = self.pager.usable_size();
+        let usable_usize = usable as usize;
+        {
+            let raw = self.pager.read_page(root_pgno)?;
+            let (ptype, n_cell, _) = raw_page_header(root_pgno, usable, raw)?;
+            if ptype != BtreePageType::IndexLeaf || n_cell != 0 {
+                self.clear_tree(root_pgno)?;
+            }
+        }
+        let total = entries.len();
+        if total == 0 {
+            return Ok(());
+        }
+
+        let bounds = PayloadBounds::for_index(usable);
+        let max_local = bounds.max_local as usize;
+        let auto_vac = self.is_auto_vacuum();
+
+        let leaf_cell_len = |rec_len: usize| -> usize {
+            if rec_len <= 127 && rec_len <= max_local {
+                (1 + rec_len).max(4)
+            } else if rec_len <= max_local {
+                varint_len(rec_len as u64) + rec_len
+            } else {
+                let loc = bounds.local_len(rec_len as u32);
+                (varint_len(rec_len as u64) + loc + 4).max(4)
+            }
+        };
+
+        let root_leaf_hdr = (if root_pgno == 1 { 100usize } else { 0usize }) + 8;
+        let mut root_leaf_bytes = root_leaf_hdr;
+        let mut fits_single_leaf = true;
+        for e in entries {
+            root_leaf_bytes += 2 + leaf_cell_len(e.len as usize);
+            if root_leaf_bytes > usable_usize {
+                fits_single_leaf = false;
+                break;
+            }
+        }
+
+        if fits_single_leaf {
+            return self.write_sorted_index_leaf_arena(
+                root_pgno, usable, bounds, arena, entries, auto_vac,
+            );
+        }
+
+        let leaf_budget = ((usable_usize - 8) * 9) / 10;
+        let mut dividers: Vec<(Pgno, usize)> = Vec::with_capacity(total / 32 + 4);
+        let mut rightmost_child: Pgno = 0;
+        let mut pos = 0usize;
+        while pos < total {
+            let mut used = 2 + leaf_cell_len(entries[pos].len as usize);
+            let mut end = pos + 1;
+            while end < total {
+                let next_sz = 2 + leaf_cell_len(entries[end].len as usize);
+                if used + next_sz > leaf_budget {
+                    break;
+                }
+                used += next_sz;
+                end += 1;
+            }
+            if end + 1 == total && end > pos + 1 {
+                end -= 1;
+            }
+            let leaf_pgno = self.allocate_page()?;
+            self.write_sorted_index_leaf_arena(
+                leaf_pgno,
+                usable,
+                bounds,
+                arena,
+                &entries[pos..end],
+                auto_vac,
+            )?;
+            if end < total {
+                dividers.push((leaf_pgno, end));
+                pos = end + 1;
+            } else {
+                rightmost_child = leaf_pgno;
+                break;
+            }
+        }
+
+        let int_cell_len =
+            |rec_idx: usize| -> usize { 4 + leaf_cell_len(entries[rec_idx].len as usize) };
+        let root_int_hdr: usize = (if root_pgno == 1 { 100usize } else { 0usize }) + 12;
+        let int_budget = usable_usize - 12;
+
+        loop {
+            let m = dividers.len();
+            let mut root_int_bytes: usize = root_int_hdr;
+            for &(_, ridx) in &dividers {
+                root_int_bytes = root_int_bytes.saturating_add(2 + int_cell_len(ridx));
+            }
+            if root_int_bytes <= usable_usize {
+                return self.write_sorted_index_interior_arena(
+                    root_pgno,
+                    usable,
+                    bounds,
+                    arena,
+                    entries,
+                    &dividers,
+                    rightmost_child,
+                    auto_vac,
+                );
+            }
+
+            let mut next_dividers: Vec<(Pgno, usize)> = Vec::new();
+            let mut next_rightmost: Pgno = 0;
+            let mut dpos = 0usize;
+            while dpos < m {
+                let mut used = 2 + int_cell_len(dividers[dpos].1);
+                let mut dend = dpos + 1;
+                while dend < m && used + 2 + int_cell_len(dividers[dend].1) <= int_budget {
+                    used += 2 + int_cell_len(dividers[dend].1);
+                    dend += 1;
+                }
+                if dend + 1 == m && dend > dpos + 1 {
+                    dend -= 1;
+                }
+                let int_pgno = self.allocate_page()?;
+                if dend < m {
+                    let rchild = dividers[dend].0;
+                    let promoted_ridx = dividers[dend].1;
+                    self.write_sorted_index_interior_arena(
+                        int_pgno,
+                        usable,
+                        bounds,
+                        arena,
+                        entries,
+                        &dividers[dpos..dend],
+                        rchild,
+                        auto_vac,
+                    )?;
+                    next_dividers.push((int_pgno, promoted_ridx));
+                    dpos = dend + 1;
+                } else {
+                    self.write_sorted_index_interior_arena(
+                        int_pgno,
+                        usable,
+                        bounds,
+                        arena,
+                        entries,
+                        &dividers[dpos..m],
+                        rightmost_child,
+                        auto_vac,
+                    )?;
+                    next_rightmost = int_pgno;
+                    break;
+                }
+            }
+            dividers = next_dividers;
+            rightmost_child = next_rightmost;
+        }
+    }
+
+    fn write_sorted_index_leaf_arena(
+        &mut self,
+        pgno: Pgno,
+        usable: u32,
+        bounds: PayloadBounds,
+        arena: &[u8],
+        entries: &[ArenaIndexEntry],
+        auto_vac: bool,
+    ) -> Result<()> {
+        let usable_usize = usable as usize;
+        let max_local = bounds.max_local as usize;
+        let mut ovfl_entries: Vec<(usize, Pgno)> = Vec::new();
+        for (i, e) in entries.iter().enumerate() {
+            let rlen = e.len as usize;
+            if rlen > max_local {
+                let off = e.off as usize;
+                let (_, _, Some(ovfl)) =
+                    self.prepare_cell_payload(bounds, &arena[off..off + rlen])?
+                else {
+                    unreachable!()
+                };
+                ovfl_entries.push((i, ovfl));
+            }
+        }
+
+        let hdr_off: usize = if pgno == 1 { 100 } else { 0 };
+        let ptr_base = hdr_off + 8;
+        let n_cell = entries.len();
+        {
+            let raw = self.pager.write_page(pgno)?;
+            let mut content_top = usable_usize;
+            let mut ovfl_cursor = 0usize;
+            for (i, e) in entries.iter().enumerate() {
+                let off = e.off as usize;
+                let rlen = e.len as usize;
+                let rec = &arena[off..off + rlen];
+                if rlen <= 127 && rlen <= max_local {
+                    let clen = (1 + rlen).max(4);
+                    content_top -= clen;
+                    let ip = ptr_base + 2 * i;
+                    raw[ip..ip + 2].copy_from_slice(&(content_top as u16).to_be_bytes());
+                    raw[content_top] = rlen as u8;
+                    raw[content_top + 1..content_top + 1 + rlen].copy_from_slice(rec);
+                    if 1 + rlen < 4 {
+                        raw[content_top + 1 + rlen..content_top + 4].fill(0);
+                    }
+                } else if rlen <= max_local {
+                    let vlen = varint_len(rlen as u64);
+                    let clen = (vlen + rlen).max(4);
+                    content_top -= clen;
+                    let ip = ptr_base + 2 * i;
+                    raw[ip..ip + 2].copy_from_slice(&(content_top as u16).to_be_bytes());
+                    let mut pos = content_top;
+                    pos += put_varint(&mut raw[pos..], rlen as u64);
+                    raw[pos..pos + rlen].copy_from_slice(rec);
+                } else {
+                    let loc = bounds.local_len(rlen as u32);
+                    let clen = (varint_len(rlen as u64) + loc + 4).max(4);
+                    content_top -= clen;
+                    let ip = ptr_base + 2 * i;
+                    raw[ip..ip + 2].copy_from_slice(&(content_top as u16).to_be_bytes());
+                    let mut pos = content_top;
+                    pos += put_varint(&mut raw[pos..], rlen as u64);
+                    raw[pos..pos + loc].copy_from_slice(&rec[..loc]);
+                    pos += loc;
+                    let ovfl_pg = ovfl_entries[ovfl_cursor].1;
+                    ovfl_cursor += 1;
+                    raw[pos..pos + 4].copy_from_slice(&ovfl_pg.to_be_bytes());
+                }
+            }
+            raw[hdr_off] = BtreePageType::IndexLeaf as u8;
+            raw[hdr_off + 1..hdr_off + 3].fill(0);
+            raw[hdr_off + 3..hdr_off + 5].copy_from_slice(&(n_cell as u16).to_be_bytes());
+            let encoded_top: u16 = if content_top == 65_536 {
+                0
+            } else {
+                content_top as u16
+            };
+            raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
+            raw[hdr_off + 7] = 0;
+            raw[ptr_base + 2 * n_cell..content_top].fill(0);
+        }
+
+        if auto_vac {
+            for &(_, ovfl_pg) in &ovfl_entries {
+                self.ptrmap_put(ovfl_pg, PtrmapType::Overflow1, pgno)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_sorted_index_interior_arena(
+        &mut self,
+        pgno: Pgno,
+        usable: u32,
+        bounds: PayloadBounds,
+        arena: &[u8],
+        all_entries: &[ArenaIndexEntry],
+        dividers: &[(Pgno, usize)],
+        right_child: Pgno,
+        auto_vac: bool,
+    ) -> Result<()> {
+        let usable_usize = usable as usize;
+        let max_local = bounds.max_local as usize;
+        let mut ovfl_entries: Vec<(usize, Pgno)> = Vec::new();
+        for (i, &(_, ridx)) in dividers.iter().enumerate() {
+            let e = all_entries[ridx];
+            let rlen = e.len as usize;
+            if rlen > max_local {
+                let off = e.off as usize;
+                let (_, _, Some(ovfl)) =
+                    self.prepare_cell_payload(bounds, &arena[off..off + rlen])?
+                else {
+                    unreachable!()
+                };
+                ovfl_entries.push((i, ovfl));
+            }
+        }
+
+        let hdr_off: usize = if pgno == 1 { 100 } else { 0 };
+        let ptr_base = hdr_off + 12;
+        let n_cell = dividers.len();
+        {
+            let raw = self.pager.write_page(pgno)?;
+            let mut content_top = usable_usize;
+            let mut ovfl_cursor = 0usize;
+            for (i, &(left_child, ridx)) in dividers.iter().enumerate() {
+                let e = all_entries[ridx];
+                let off = e.off as usize;
+                let rlen = e.len as usize;
+                let rec = &arena[off..off + rlen];
+                let leaf_clen = if rlen <= 127 && rlen <= max_local {
+                    (1 + rlen).max(4)
+                } else if rlen <= max_local {
+                    varint_len(rlen as u64) + rlen
+                } else {
+                    (varint_len(rlen as u64) + bounds.local_len(rlen as u32) + 4).max(4)
+                };
+                let clen = 4 + leaf_clen;
+                content_top -= clen;
+                let ip = ptr_base + 2 * i;
+                raw[ip..ip + 2].copy_from_slice(&(content_top as u16).to_be_bytes());
+                raw[content_top..content_top + 4].copy_from_slice(&left_child.to_be_bytes());
+                let mut pos = content_top + 4;
+                pos += put_varint(&mut raw[pos..], rlen as u64);
+                if rlen <= max_local {
+                    raw[pos..pos + rlen].copy_from_slice(rec);
+                    if pos + rlen < content_top + clen {
+                        raw[pos + rlen..content_top + clen].fill(0);
+                    }
+                } else {
+                    let loc = bounds.local_len(rlen as u32);
+                    raw[pos..pos + loc].copy_from_slice(&rec[..loc]);
+                    pos += loc;
+                    let ovfl_pg = ovfl_entries[ovfl_cursor].1;
+                    ovfl_cursor += 1;
+                    raw[pos..pos + 4].copy_from_slice(&ovfl_pg.to_be_bytes());
+                }
+            }
+            raw[hdr_off] = BtreePageType::IndexInterior as u8;
+            raw[hdr_off + 1..hdr_off + 3].fill(0);
+            raw[hdr_off + 3..hdr_off + 5].copy_from_slice(&(n_cell as u16).to_be_bytes());
+            let encoded_top: u16 = if content_top == 65_536 {
+                0
+            } else {
+                content_top as u16
+            };
+            raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
+            raw[hdr_off + 7] = 0;
+            raw[hdr_off + 8..hdr_off + 12].copy_from_slice(&right_child.to_be_bytes());
+            raw[ptr_base + 2 * n_cell..content_top].fill(0);
         }
 
         if auto_vac {
@@ -5750,9 +7358,10 @@ impl Btree {
             Ok(())
         }
 
-        // 1. Walk freelist
+        // 1. Walk freelist using a single reusable `freelist_leaves` buffer (zero per-trunk `raw.to_vec()`)
         let mut trunk = self.pager.header().first_freelist_trunk_page;
         let mut counted_free = 0u32;
+        let mut freelist_leaves: Vec<Pgno> = Vec::new();
         while trunk != 0 {
             self.check_interrupted()?;
             let trunk_valid = mark_page(
@@ -5772,16 +7381,27 @@ impl Btree {
             if auto_vacuum {
                 check_ptrmap(self, trunk, PtrmapType::FreePage, 0, &mut errors);
             }
-            let raw = self.pager.read_page(trunk)?.to_vec();
-            let next_trunk = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
-            let n_leaves = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
-            for i in 0..n_leaves as usize {
-                let off = 8 + 4 * i;
-                if off + 4 > usable {
-                    errors.push(format!("freelist trunk {trunk} leaf count corrupt"));
-                    break;
+            let next_trunk = {
+                let raw = self.pager.read_page(trunk)?;
+                let nt = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                let n_leaves = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
+                freelist_leaves.clear();
+                for i in 0..n_leaves as usize {
+                    let off = 8 + 4 * i;
+                    if off + 4 > usable {
+                        errors.push(format!("freelist trunk {trunk} leaf count corrupt"));
+                        break;
+                    }
+                    freelist_leaves.push(u32::from_be_bytes([
+                        raw[off],
+                        raw[off + 1],
+                        raw[off + 2],
+                        raw[off + 3],
+                    ]));
                 }
-                let leaf = u32::from_be_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+                nt
+            };
+            for &leaf in &freelist_leaves {
                 let leaf_valid = mark_page(
                     &mut seen,
                     total_pages,
@@ -5806,8 +7426,15 @@ impl Btree {
             ));
         }
 
-        // 2. Walk every B-tree root
+        // 2. Walk every B-tree root using reusable scratch buffers (zero per-page `Vec<Cell>` or
+        // per-cell `local_payload: Vec<u8>` allocations on healthy pages!)
+        let tbl_bounds = PayloadBounds::for_table_leaf(usable_u32);
+        let idx_bounds = PayloadBounds::for_index(usable_u32);
+        let mut intervals_scratch: Vec<(u32, u32)> = Vec::with_capacity(128);
+        let mut ovfl_scratch: Vec<Pgno> = Vec::new();
+        let mut child_scratch: Vec<Pgno> = Vec::with_capacity(64);
         let mut stack: Vec<(Pgno, Option<Pgno>)> = roots.iter().map(|&r| (r, None)).collect();
+
         while let Some((pgno, parent_opt)) = stack.pop() {
             self.check_interrupted()?;
             let is_root = parent_opt.is_none();
@@ -5832,83 +7459,256 @@ impl Btree {
                     }
                 }
             }
-            let parsed = match self.read_parsed_page(pgno) {
-                Ok(p) => p,
-                Err(e) => {
-                    errors.push(format!("page {pgno}: {e}"));
-                    continue;
+
+            intervals_scratch.clear();
+            ovfl_scratch.clear();
+            child_scratch.clear();
+
+            let raw_verify: Result<()> = (|| {
+                let raw = self.pager.read_page(pgno)?;
+                if raw.len() < usable {
+                    return Err(SqliteError::corrupt(
+                        "raw page buffer smaller than usable_size",
+                    ));
                 }
-            };
-            if !is_root && parsed.cell_count() == 0 {
-                errors.push(format!("non-root btree page {pgno} has 0 cells"));
+                let hdr_off = if pgno == 1 { 100 } else { 0 };
+                let page_type = BtreePageType::from_byte(raw[hdr_off])?;
+                let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
+                let hdr_size = page_type.header_size();
+                let ptr_base = hdr_off + hdr_size;
+                let ptr_end = ptr_base
+                    .checked_add(2 * n_cell)
+                    .ok_or_else(|| SqliteError::corrupt("cell pointer array overflow"))?;
+                if ptr_end > usable {
+                    return Err(SqliteError::corrupt(format!(
+                        "cell pointer array ({ptr_end}) exceeds usable page size ({usable}) on page {pgno}"
+                    )));
+                }
+                if !is_root && n_cell == 0 {
+                    errors.push(format!("non-root btree page {pgno} has 0 cells"));
+                }
+
+                let raw_top = u16::from_be_bytes([raw[hdr_off + 5], raw[hdr_off + 6]]) as usize;
+                let content_top = if n_cell == 0 && raw[hdr_off + 1] == 0 && raw[hdr_off + 2] == 0 {
+                    if raw_top == 0 { 65_536 } else { raw_top }
+                } else if raw_top == 0 {
+                    65_536
+                } else {
+                    raw_top
+                };
+                if content_top < ptr_end || content_top > usable {
+                    return Err(SqliteError::corrupt(format!(
+                        "invalid cell content offset {content_top} on page {pgno}"
+                    )));
+                }
+
+                // Walk freeblock chain if non-empty
+                let mut fb = u16::from_be_bytes([raw[hdr_off + 1], raw[hdr_off + 2]]) as usize;
+                let mut prev_fb = 0usize;
+                let mut fb_hops = 0usize;
+                while fb != 0 {
+                    fb_hops += 1;
+                    if fb_hops > usable / 4 || fb < content_top || fb <= prev_fb || fb + 4 > usable
+                    {
+                        return Err(SqliteError::corrupt(format!(
+                            "corrupt freeblock {fb} on page {pgno}"
+                        )));
+                    }
+                    let next_fb = u16::from_be_bytes([raw[fb], raw[fb + 1]]) as usize;
+                    let fb_sz = u16::from_be_bytes([raw[fb + 2], raw[fb + 3]]) as usize;
+                    if fb_sz < 4 || fb + fb_sz > usable {
+                        return Err(SqliteError::corrupt(format!(
+                            "corrupt freeblock size {fb_sz} on page {pgno}"
+                        )));
+                    }
+                    intervals_scratch.push((fb as u32, (fb + fb_sz) as u32));
+                    prev_fb = fb;
+                    fb = next_fb;
+                }
+
+                let right_child = if page_type.is_leaf() {
+                    0
+                } else {
+                    u32::from_be_bytes([
+                        raw[hdr_off + 8],
+                        raw[hdr_off + 9],
+                        raw[hdr_off + 10],
+                        raw[hdr_off + 11],
+                    ])
+                };
+
+                let cell_offset_at = |idx: usize| -> Result<usize> {
+                    let p = ptr_base + 2 * idx;
+                    let off = u16::from_be_bytes([raw[p], raw[p + 1]]) as usize;
+                    if off < content_top || off >= usable {
+                        return Err(SqliteError::corrupt(format!(
+                            "invalid cell offset {off} on page {pgno}"
+                        )));
+                    }
+                    Ok(off)
+                };
+
+                match page_type {
+                    BtreePageType::TableLeaf => {
+                        let mut prev_rowid: Option<i64> = None;
+                        let mut ordered_err = false;
+                        for i in 0..n_cell {
+                            let off = cell_offset_at(i)?;
+                            let slice = &raw[off..usable];
+                            let (payload_u64, n1) = get_varint(slice)?;
+                            let total_payload_len = u32::try_from(payload_u64)
+                                .map_err(|_| SqliteError::corrupt("table cell payload > 4GiB"))?;
+                            let (rowid, n2) = get_varint_i64(&slice[n1..])?;
+                            let local_len = tbl_bounds.local_len(total_payload_len);
+                            let body_end = n1 + n2 + local_len;
+                            let has_ovfl = (local_len as u32) < total_payload_len;
+                            let needed = body_end + if has_ovfl { 4 } else { 0 };
+                            if needed > slice.len() {
+                                return Err(SqliteError::corrupt(format!(
+                                    "table leaf cell extends past end of page {pgno}"
+                                )));
+                            }
+                            if !ordered_err
+                                && let Some(prev) = prev_rowid
+                                && prev >= rowid
+                            {
+                                errors.push(format!("rowids out of order on table leaf {pgno}"));
+                                ordered_err = true;
+                            }
+                            prev_rowid = Some(rowid);
+                            intervals_scratch.push((off as u32, (off + needed) as u32));
+                            if has_ovfl {
+                                ovfl_scratch.push(u32::from_be_bytes([
+                                    slice[body_end],
+                                    slice[body_end + 1],
+                                    slice[body_end + 2],
+                                    slice[body_end + 3],
+                                ]));
+                            }
+                        }
+                    }
+                    BtreePageType::TableInterior => {
+                        let mut prev_key: Option<i64> = None;
+                        let mut ordered_err = false;
+                        for i in 0..n_cell {
+                            let off = cell_offset_at(i)?;
+                            let slice = &raw[off..usable];
+                            if slice.len() < 5 {
+                                return Err(SqliteError::corrupt("truncated table interior cell"));
+                            }
+                            let left_child =
+                                u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]);
+                            let (key, k_used) = get_varint_i64(&slice[4..])?;
+                            if !ordered_err
+                                && let Some(prev) = prev_key
+                                && prev >= key
+                            {
+                                errors.push(format!("keys out of order on table interior {pgno}"));
+                                ordered_err = true;
+                            }
+                            prev_key = Some(key);
+                            intervals_scratch.push((off as u32, (off + 4 + k_used) as u32));
+                            child_scratch.push(left_child);
+                        }
+                        child_scratch.push(right_child);
+                    }
+                    BtreePageType::IndexLeaf => {
+                        for i in 0..n_cell {
+                            let off = cell_offset_at(i)?;
+                            let slice = &raw[off..usable];
+                            let (payload_u64, n1) = get_varint(slice)?;
+                            let total_payload_len = u32::try_from(payload_u64)
+                                .map_err(|_| SqliteError::corrupt("index cell payload > 4GiB"))?;
+                            let local_len = idx_bounds.local_len(total_payload_len);
+                            let body_end = n1 + local_len;
+                            let has_ovfl = (local_len as u32) < total_payload_len;
+                            let needed = body_end + if has_ovfl { 4 } else { 0 };
+                            if needed > slice.len() {
+                                return Err(SqliteError::corrupt(format!(
+                                    "index leaf cell extends past end of page {pgno}"
+                                )));
+                            }
+                            intervals_scratch.push((off as u32, (off + needed) as u32));
+                            if has_ovfl {
+                                ovfl_scratch.push(u32::from_be_bytes([
+                                    slice[body_end],
+                                    slice[body_end + 1],
+                                    slice[body_end + 2],
+                                    slice[body_end + 3],
+                                ]));
+                            }
+                        }
+                    }
+                    BtreePageType::IndexInterior => {
+                        for i in 0..n_cell {
+                            let off = cell_offset_at(i)?;
+                            let slice = &raw[off..usable];
+                            if slice.len() < 5 {
+                                return Err(SqliteError::corrupt("truncated index interior cell"));
+                            }
+                            let left_child =
+                                u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]);
+                            let (payload_u64, n1) = get_varint(&slice[4..])?;
+                            let total_payload_len = u32::try_from(payload_u64).map_err(|_| {
+                                SqliteError::corrupt("index interior payload > 4GiB")
+                            })?;
+                            let local_len = idx_bounds.local_len(total_payload_len);
+                            let body_end = 4 + n1 + local_len;
+                            let has_ovfl = (local_len as u32) < total_payload_len;
+                            let needed = body_end + if has_ovfl { 4 } else { 0 };
+                            if needed > slice.len() {
+                                return Err(SqliteError::corrupt(format!(
+                                    "index interior cell extends past end of page {pgno}"
+                                )));
+                            }
+                            intervals_scratch.push((off as u32, (off + needed) as u32));
+                            if has_ovfl {
+                                ovfl_scratch.push(u32::from_be_bytes([
+                                    slice[body_end],
+                                    slice[body_end + 1],
+                                    slice[body_end + 2],
+                                    slice[body_end + 3],
+                                ]));
+                            }
+                            child_scratch.push(left_child);
+                        }
+                        child_scratch.push(right_child);
+                    }
+                }
+
+                if intervals_scratch.len() > 1 {
+                    intervals_scratch.sort_unstable_by_key(|x| x.0);
+                    for w in intervals_scratch.windows(2) {
+                        if w[0].1 > w[1].0 {
+                            return Err(SqliteError::corrupt(format!(
+                                "overlapping cells or freeblocks on page {pgno}"
+                            )));
+                        }
+                    }
+                }
+                Ok(())
+            })();
+
+            if let Err(e) = raw_verify {
+                errors.push(format!("page {pgno}: {e}"));
+                continue;
             }
 
-            match parsed {
-                ParsedPage::TableLeaf { cells } => {
-                    for w in cells.windows(2) {
-                        if w[0].rowid >= w[1].rowid {
-                            errors.push(format!("rowids out of order on table leaf {pgno}"));
-                            break;
-                        }
-                    }
-                    for c in cells {
-                        walk_ovfl(
-                            c.overflow_page,
-                            pgno,
-                            total_pages,
-                            usable_u32,
-                            lock_byte_pgno,
-                            auto_vacuum,
-                            &mut seen,
-                            self,
-                            &mut errors,
-                        )?;
-                    }
-                }
-                ParsedPage::TableInterior { cells, right_child } => {
-                    for w in cells.windows(2) {
-                        if w[0].key >= w[1].key {
-                            errors.push(format!("keys out of order on table interior {pgno}"));
-                            break;
-                        }
-                    }
-                    for c in cells {
-                        stack.push((c.left_child, Some(pgno)));
-                    }
-                    stack.push((right_child, Some(pgno)));
-                }
-                ParsedPage::IndexLeaf { cells } => {
-                    for c in cells {
-                        walk_ovfl(
-                            c.overflow_page,
-                            pgno,
-                            total_pages,
-                            usable_u32,
-                            lock_byte_pgno,
-                            auto_vacuum,
-                            &mut seen,
-                            self,
-                            &mut errors,
-                        )?;
-                    }
-                }
-                ParsedPage::IndexInterior { cells, right_child } => {
-                    for c in cells {
-                        walk_ovfl(
-                            c.overflow_page,
-                            pgno,
-                            total_pages,
-                            usable_u32,
-                            lock_byte_pgno,
-                            auto_vacuum,
-                            &mut seen,
-                            self,
-                            &mut errors,
-                        )?;
-                        stack.push((c.left_child, Some(pgno)));
-                    }
-                    stack.push((right_child, Some(pgno)));
-                }
+            for &ovfl_root in &ovfl_scratch {
+                walk_ovfl(
+                    Some(ovfl_root),
+                    pgno,
+                    total_pages,
+                    usable_u32,
+                    lock_byte_pgno,
+                    auto_vacuum,
+                    &mut seen,
+                    self,
+                    &mut errors,
+                )?;
+            }
+            for &child_pgno in &child_scratch {
+                stack.push((child_pgno, Some(pgno)));
             }
         }
 
@@ -6283,5 +8083,258 @@ mod tests {
         );
         assert_eq!(bt.scan_table(tbl_root).unwrap().len(), 50);
         bt.commit().unwrap();
+    }
+
+    #[test]
+    fn test_seek_index_range_morsels_upper_bound_edges_and_overflow() {
+        let mut bt = Btree::open_in_memory().unwrap();
+        bt.pager_mut().set_page_size(512).unwrap();
+        bt.begin_write().unwrap();
+
+        let idx_root = bt.create_index().unwrap();
+        let orders = [
+            KeySortOrder::default(),
+            KeySortOrder::default(),
+            KeySortOrder::default(),
+        ];
+
+        let collect_morsels =
+            |bt: &mut Btree,
+             cat: i64,
+             lo: Option<(&Value, bool)>,
+             hi: Option<(&Value, bool)>|
+             -> Vec<i64> {
+                let mut out = Vec::new();
+                let prefix = [Value::Integer(cat)];
+                bt.seek_index_range_morsels(idx_root, &prefix, lo, hi, &orders, false, |item| {
+                    match item {
+                        IndexScanItem::LeafMorsel { morsel, start, end } => {
+                            for ci in start..end {
+                                let Some(raw) = morsel.local_cell(ci)? else {
+                                    return Ok(MorselStep::OverflowAt(ci));
+                                };
+                                let vals = decode_record(raw)?;
+                                out.push(vals[1].as_i64().unwrap());
+                            }
+                            Ok(MorselStep::Continue)
+                        }
+                        IndexScanItem::SingleCell(raw) => {
+                            let vals = decode_record(raw)?;
+                            out.push(vals[1].as_i64().unwrap());
+                            Ok(MorselStep::Continue)
+                        }
+                    }
+                })
+                .unwrap();
+                out
+            };
+
+        // 0-row empty index
+        assert!(collect_morsels(&mut bt, 1, None, None).is_empty());
+
+        // 1-row index: match, below-range, above-range, wrong prefix
+        let r1 = encode_record(&[
+            Value::Integer(1),
+            Value::Integer(50),
+            Value::Text("a".into()),
+        ]);
+        bt.insert_index(idx_root, &r1, &orders).unwrap();
+        assert_eq!(collect_morsels(&mut bt, 1, None, None), vec![50]);
+        assert_eq!(
+            collect_morsels(
+                &mut bt,
+                1,
+                Some((&Value::Integer(50), true)),
+                Some((&Value::Integer(50), true))
+            ),
+            vec![50]
+        );
+        assert!(
+            collect_morsels(
+                &mut bt,
+                1,
+                Some((&Value::Integer(50), false)),
+                Some((&Value::Integer(60), true))
+            )
+            .is_empty()
+        );
+        assert!(
+            collect_morsels(
+                &mut bt,
+                1,
+                Some((&Value::Integer(10), true)),
+                Some((&Value::Integer(50), false))
+            )
+            .is_empty()
+        );
+        assert!(collect_morsels(&mut bt, 2, None, None).is_empty());
+
+        // Populate multi-leaf index with categories 0, 1, 2 and >512B overflow payloads
+        bt.clear_tree(idx_root).unwrap();
+        for cat in 0..=2i64 {
+            for amt in 1..=90i64 {
+                let pad = if cat == 1 && (amt == 17 || amt == 63) {
+                    "Z".repeat(900)
+                } else {
+                    format!("p-{cat}-{amt}")
+                };
+                let rec = encode_record(&[
+                    Value::Integer(cat),
+                    Value::Integer(amt * 10),
+                    Value::Text(pad),
+                ]);
+                bt.insert_index(idx_root, &rec, &orders).unwrap();
+            }
+        }
+        assert!(bt.pager().page_count() > 12);
+
+        // All-match for cat=1
+        let expected_all: Vec<i64> = (1..=90).map(|a| a * 10).collect();
+        assert_eq!(collect_morsels(&mut bt, 1, None, None), expected_all);
+        assert_eq!(
+            collect_morsels(
+                &mut bt,
+                1,
+                Some((&Value::Integer(0), true)),
+                Some((&Value::Integer(10_000), true))
+            ),
+            expected_all
+        );
+
+        // Multi-leaf sub-ranges (including exact leaf boundaries and overflow cells 170 & 630)
+        for (lo, lo_inc, hi, hi_inc) in [
+            (100, true, 700, true),
+            (170, true, 630, true),
+            (170, false, 630, false),
+            (910, true, 990, true),
+            (1, true, 9, true),
+        ] {
+            let got = collect_morsels(
+                &mut bt,
+                1,
+                Some((&Value::Integer(lo), lo_inc)),
+                Some((&Value::Integer(hi), hi_inc)),
+            );
+            let want: Vec<i64> = expected_all
+                .iter()
+                .copied()
+                .filter(|&v| {
+                    (if lo_inc { v >= lo } else { v > lo })
+                        && (if hi_inc { v <= hi } else { v < hi })
+                })
+                .collect();
+            assert_eq!(got, want, "range ({lo}, {lo_inc})..({hi}, {hi_inc})");
+        }
+        bt.commit().unwrap();
+    }
+
+    #[test]
+    fn test_bulk_load_sorted_arena_and_integrity_check_corruptions() {
+        let mut bt = Btree::open_in_memory().unwrap();
+        bt.pager_mut().set_page_size(512).unwrap();
+        bt.begin_write().unwrap();
+
+        let tbl_root = bt.create_table().unwrap();
+        let idx_root = bt.create_index().unwrap();
+
+        // Bulk-load 120 sorted entries via contiguous byte arena (including >512B overflow entry)
+        let mut arena = Vec::new();
+        let mut entries = Vec::new();
+        for i in 1..=120i64 {
+            let txt = if i == 55 {
+                "K".repeat(800)
+            } else {
+                format!("k-{i:04}")
+            };
+            let rec = encode_record(&[Value::Integer(i), Value::Text(txt)]);
+            let off = arena.len() as u32;
+            let len = rec.len() as u32;
+            arena.extend_from_slice(&rec);
+            entries.push(ArenaIndexEntry {
+                prefix: i as u64,
+                off,
+                len,
+            });
+            bt.insert_table(tbl_root, i, &rec).unwrap();
+        }
+        bt.bulk_load_sorted_arena(idx_root, &arena, &entries)
+            .unwrap();
+        assert_eq!(
+            bt.integrity_check(&[1, tbl_root, idx_root]).unwrap(),
+            Vec::<String>::new()
+        );
+
+        // Verify delete_table_returning_raw_into returns exact payload and leaves valid B-tree
+        let mut old_buf = Vec::new();
+        assert!(
+            bt.delete_table_returning_raw_into(tbl_root, 55, &mut old_buf)
+                .unwrap()
+        );
+        let decoded55 = decode_record(&old_buf).unwrap();
+        assert_eq!(decoded55[0], Value::Integer(55));
+        assert_eq!(decoded55[1].as_str().unwrap().len(), 800);
+        assert!(
+            !bt.delete_table_returning_raw_into(tbl_root, 999_999, &mut old_buf)
+                .unwrap()
+        );
+        assert_eq!(
+            bt.integrity_check(&[1, tbl_root, idx_root]).unwrap(),
+            Vec::<String>::new()
+        );
+
+        // Corruption 1: Unreferenced page (omit `idx_root` from known roots)
+        let errs_missing = bt.integrity_check(&[1, tbl_root]).unwrap();
+        assert!(
+            errs_missing.iter().any(|m| m.contains("never used")),
+            "expected never-used error, got {errs_missing:?}"
+        );
+
+        // Corruption 2: Duplicate root/page reference
+        let errs_dup = bt
+            .integrity_check(&[1, tbl_root, tbl_root, idx_root])
+            .unwrap();
+        assert!(
+            errs_dup.iter().any(|m| m.contains("2nd reference")),
+            "expected duplicate reference error, got {errs_dup:?}"
+        );
+
+        // Corruption 3: Out-of-order rowids on a fresh table leaf
+        let bad_tbl = bt.create_table().unwrap();
+        let rec_a = encode_record(&[Value::Integer(1)]);
+        bt.insert_table(bad_tbl, 10, &rec_a).unwrap();
+        bt.insert_table(bad_tbl, 20, &rec_a).unwrap();
+        {
+            let raw = bt.pager_mut().write_page(bad_tbl).unwrap();
+            // Swap the two 2-byte cell pointers at offsets 8..10 and 10..12 so rowid 20 precedes 10!
+            let p0 = [raw[8], raw[9]];
+            let p1 = [raw[10], raw[11]];
+            raw[8] = p1[0];
+            raw[9] = p1[1];
+            raw[10] = p0[0];
+            raw[11] = p0[1];
+        }
+        let errs_order = bt
+            .integrity_check(&[1, tbl_root, idx_root, bad_tbl])
+            .unwrap();
+        assert!(
+            errs_order
+                .iter()
+                .any(|m| m.to_ascii_lowercase().contains("rowid") && m.contains("out of order")),
+            "expected out-of-order rowid error, got {errs_order:?}"
+        );
+
+        // Corruption 4: Out-of-bounds cell pointer on `bad_tbl`
+        {
+            let raw = bt.pager_mut().write_page(bad_tbl).unwrap();
+            raw[8] = 0x00;
+            raw[9] = 0x02; // inside page header (< hdr_len)!
+        }
+        let errs_ptr = bt
+            .integrity_check(&[1, tbl_root, idx_root, bad_tbl])
+            .unwrap();
+        assert!(
+            !errs_ptr.is_empty(),
+            "expected corruption report for invalid cell pointer"
+        );
     }
 }

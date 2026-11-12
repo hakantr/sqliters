@@ -16,8 +16,8 @@ pub mod vtab_api;
 pub use bitvec::Bitvec;
 pub use error::{ConflictResolutionEffect, ErrorCode, Result, SqliteError, extended};
 pub use json::{
-    CompiledJsonArrowPath, eval_jsonb_value_into, parse_json_text_to_jsonb,
-    parse_json_text_to_jsonb_into,
+    CompiledJsonArrowPath, FastJsonIntOut, append_runtime_value_json_elem, eval_jsonb_value_into,
+    parse_json_text_to_jsonb, parse_json_text_to_jsonb_into,
 };
 pub use limits::*;
 pub use record::{
@@ -36,9 +36,10 @@ pub use runtime_api::{
     strip_unsubscribed_subtypes,
 };
 pub use value::{
-    Collation, CustomCollation, StorageClass, TextEncoding, TypeAffinity, Value, cmp_int_float,
-    format_sqlite_real, is_sqlite_ascii_space, parse_leading_f64, parse_leading_i64,
-    parse_numeric_text, sqlite_trim_ascii, sqlite_trim_ascii_start,
+    Collation, CustomCollation, INLINE_ROW_COLS, INLINE_VAL_CAP, InlineRow, InlineVal,
+    StorageClass, TextEncoding, TypeAffinity, Value, ValueRef, cmp_int_float, format_sqlite_real,
+    is_sqlite_ascii_space, parse_leading_f64, parse_leading_i64, parse_numeric_text,
+    sqlite_trim_ascii, sqlite_trim_ascii_start,
 };
 pub use varint::{get_varint, get_varint_i64, push_varint, put_varint, put_varint_i64, varint_len};
 pub use vtab_api::{

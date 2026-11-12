@@ -2387,7 +2387,22 @@ pub fn authorize_stmt_with_slot_and_fks(
     if !slot.is_some() {
         return Ok((Some(stmt.clone()), Vec::new()));
     }
-    let mut cloned = stmt.clone();
+    authorize_stmt_owned_with_slot_and_fks(stmt.clone(), db_set, functions, foreign_keys, slot)
+}
+
+/// Owned-AST variant of [`authorize_stmt_with_slot_and_fks`] that avoids cloning `stmt` when no
+/// compile-time authorizer callback is installed (`!slot.is_some()`).
+#[allow(clippy::type_complexity)]
+pub fn authorize_stmt_owned_with_slot_and_fks(
+    mut stmt: Stmt,
+    db_set: &DatabaseSet,
+    functions: &FunctionRegistry,
+    foreign_keys: bool,
+    slot: &mut AuthorizerSlot,
+) -> Result<(Option<Stmt>, Vec<(DatabaseId, String)>)> {
+    if !slot.is_some() {
+        return Ok((Some(stmt), Vec::new()));
+    }
     let mut ctx = AuthWalkCtx {
         db_set,
         functions,
@@ -2401,8 +2416,8 @@ pub fn authorize_stmt_with_slot_and_fks(
         ignored_fk_parent_tables: Vec::new(),
     };
     let _ = ctx.current_context();
-    if ctx.authorize_stmt(&mut cloned, &[])? {
-        Ok((Some(cloned), ctx.ignored_fk_parent_tables))
+    if ctx.authorize_stmt(&mut stmt, &[])? {
+        Ok((Some(stmt), ctx.ignored_fk_parent_tables))
     } else {
         Ok((None, ctx.ignored_fk_parent_tables))
     }

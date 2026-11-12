@@ -2934,6 +2934,23 @@ impl FastSumAccum {
     }
 
     #[inline(always)]
+    pub const fn is_exact_int(&self) -> bool {
+        !self.ctx.approx
+    }
+
+    #[inline(always)]
+    pub fn try_step_i64_batch(&mut self, batch_count: i64, batch_sum: i64) -> bool {
+        if !self.ctx.approx
+            && let Some(next) = self.ctx.i_sum.checked_add(batch_sum)
+        {
+            self.count += batch_count;
+            self.ctx.i_sum = next;
+            return true;
+        }
+        false
+    }
+
+    #[inline(always)]
     pub fn step_i64(&mut self, i: i64) {
         self.count += 1;
         if !self.ctx.approx {

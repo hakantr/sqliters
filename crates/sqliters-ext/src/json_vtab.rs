@@ -1,7 +1,7 @@
 //! `json_each`, `json_tree`, `jsonb_each`, and `jsonb_tree` eponymous virtual table modules (`sqlite/src/json.c`).
 #![forbid(unsafe_code)]
 
-use sqliters_types::json::{JsonWalkRow, build_json_walk_rows};
+use sqliters_types::json::{JsonWalkRow, build_json_walk_rows_into};
 use sqliters_types::{
     ErrorCode, Result, SqliteError, VTabConfigOption, VTabConstraintOp, VTabHostContext,
     VTabIndexInfo, VTabRiskFlags, Value, VirtualCursor, VirtualTable, VirtualTableModule,
@@ -160,6 +160,7 @@ impl VirtualTable for JsonWalkTable {
             is_tree: self.is_tree,
             as_blob_containers: self.as_blob_containers,
             rows: Vec::new(),
+            scratch_jsonb: Vec::new(),
             pos: 0,
             raw_json: Value::Null,
             raw_root: Value::Null,
@@ -172,6 +173,7 @@ struct JsonWalkCursor {
     is_tree: bool,
     as_blob_containers: bool,
     rows: Vec<JsonWalkRow>,
+    scratch_jsonb: Vec<u8>,
     pos: usize,
     raw_json: Value,
     raw_root: Value,
@@ -206,11 +208,13 @@ impl VirtualCursor for JsonWalkCursor {
             None => Value::Text("$".to_owned()),
         };
 
-        self.rows = build_json_walk_rows(
+        build_json_walk_rows_into(
             &json_val,
             root_opt.as_ref(),
             self.is_tree,
             self.as_blob_containers,
+            &mut self.scratch_jsonb,
+            &mut self.rows,
         )?;
         Ok(())
     }

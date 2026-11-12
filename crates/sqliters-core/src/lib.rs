@@ -23,9 +23,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
-use sqliters_btree::{Btree, BtreeCursorState, CursorId};
+use sqliters_btree::{Btree, BtreeCursorState, CursorId, PointLookupRow};
 pub use sqliters_ext::{
     Fts5AuxRegistry, Fts5Module, Fts5VocabModule, GenerateSeriesModule, JsonEachModule,
     JsonTreeModule, JsonbEachModule, JsonbTreeModule, RTreeCoordMode, RTreeModule,
@@ -44,18 +44,19 @@ pub use sqliters_types::{
     AggregateStepId, CustomCollation, DatabaseId, ExecutionServices, FunctionFlags, MAX_DB_SLOTS,
     RowMutationEvent, RowMutationOp, RuntimeValue, SQLITE_MAX_ATTACHED, VTabConfigOption,
     VTabConflictMode, VTabConstraint, VTabConstraintOp, VTabConstraintUsage, VTabHostContext,
-    VTabIndexInfo, VTabOrderBy, VTabRiskFlags, VTabUpdateOperation, VirtualCursor, VirtualTable,
-    VirtualTableModule,
+    VTabIndexInfo, VTabOrderBy, VTabRiskFlags, VTabUpdateOperation, ValueRef, VirtualCursor,
+    VirtualTable, VirtualTableModule,
 };
 use sqliters_types::{
-    ConflictResolutionEffect, DatabaseKind, ErrorCode, LockGeometry, Pgno, Result,
-    SQLITE_DEFAULT_PAGE_SIZE, SqliteError, TextEncoding, TypeAffinity, Value,
+    ConflictResolutionEffect, DatabaseKind, ErrorCode, InlineRow, InlineVal, LockGeometry, Pgno,
+    Result, SQLITE_DEFAULT_PAGE_SIZE, SqliteError, TextEncoding, TypeAffinity, Value,
     encode_value_refs_record_into, extended,
 };
 pub use sqliters_vdbe::BtreeAccess;
 use sqliters_vdbe::{
-    InsertValSource, RowidKeySource, SingleRowInsertPlan, TestFunctionsScope, VdbeProgram, VdbeVm,
-    VmRuntimeContext, VmStep,
+    InsertValSource, Opcode, RowidKeySource, SingleRowDeletePlan, SingleRowInsertPlan,
+    SingleRowUpdatePlan, SingleRowUpdateRhs, TestFunctionsScope, VdbeProgram, VdbeVm,
+    VmRuntimeContext, VmStepOut, eval_arith,
 };
 use sqliters_vfs::{MemoryVfs, OpenFlags, OsVfs, Vfs};
 
@@ -63,7 +64,7 @@ use crate::engine::{
     ActivitySummary, BusyPolicy, CommitFailureDisposition, ExecContext, LeaseCursorSpec,
     SqlSavepoint, StmtCategory, StmtTxTracker, classify_stmt_category,
     collect_select_referenced_roots, commit_all_databases, commit_transaction,
-    execute_control_stmt, execute_nolock_stmt, execute_read_body, execute_write_body,
+    execute_control_stmt, execute_nolock_stmt, execute_read_body_for_step, execute_write_body,
     parse_auto_vacuum_pragma, parse_incremental_vacuum_limit, parse_sqlite_uri,
     release_savepoint_op, rollback_all_databases, stmt_loads_schema_on_prepare,
     stmt_requires_schema, validate_and_infer_columns,
@@ -259,63 +260,203 @@ const _: () = {
     assert_send::<InterruptHandle>();
     assert_sync::<InterruptHandle>();
     assert_send::<TestBlobHandle>();
+    assert_send::<Row>();
+    assert_sync::<Row>();
 };
 
+enum RowRepr {
+    Inline {
+        row: InlineRow,
+        materialized: OnceLock<Box<[Value]>>,
+    },
+    Heap(Vec<Value>),
+}
+
 /// Single result row returned by a query (`sqlite3_column_*`).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Stores rows with `<= 4` columns (including UTF-8 short `TEXT` and `BLOB` `<= 22` bytes)
+/// inline on the stack without heap allocation, lazily materializing owned [`Value`]s only if
+/// [`Row::values`], [`Row::get`], or `row[idx]` is requested.
 pub struct Row {
-    values: Vec<Value>,
+    repr: RowRepr,
+}
+
+impl Clone for Row {
+    #[inline]
+    fn clone(&self) -> Self {
+        match &self.repr {
+            RowRepr::Inline { row, .. } => Self::from_inline(*row),
+            RowRepr::Heap(values) => Self {
+                repr: RowRepr::Heap(values.clone()),
+            },
+        }
+    }
+}
+
+impl PartialEq for Row {
+    fn eq(&self, other: &Self) -> bool {
+        let n = self.len();
+        if n != other.len() {
+            return false;
+        }
+        for i in 0..n {
+            let Some(a) = self.get_ref(i) else {
+                return false;
+            };
+            let Some(b) = other.get_ref(i) else {
+                return false;
+            };
+            if !a.eq_value_ref(b) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl fmt::Debug for Row {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Row")
+            .field("values", &self.values())
+            .finish()
+    }
 }
 
 impl Row {
+    #[inline]
     pub fn new(values: Vec<Value>) -> Self {
-        Self { values }
+        if values.is_empty() && values.capacity() == 0 {
+            return Self::from_inline(InlineRow::empty());
+        }
+        Self {
+            repr: RowRepr::Heap(values),
+        }
+    }
+
+    #[inline]
+    pub fn from_slice(values: &[Value]) -> Self {
+        match InlineRow::try_from_values(values) {
+            Some(inline) => Self::from_inline(inline),
+            None => Self {
+                repr: RowRepr::Heap(values.to_vec()),
+            },
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn from_inline(row: InlineRow) -> Self {
+        Self {
+            repr: RowRepr::Inline {
+                row,
+                materialized: OnceLock::new(),
+            },
+        }
+    }
+
+    #[inline]
+    fn from_lookup_row(row: PointLookupRow) -> Self {
+        match row {
+            PointLookupRow::Inline(ir) => Self::from_inline(ir),
+            PointLookupRow::Heap(vals) => Self::new(vals),
+        }
+    }
+
+    /// Returns `true` when this row's columns are stored inline without a heap `Vec<Value>`
+    /// (and without having materialized the lazy `OnceLock<Box<[Value]>>` slice).
+    #[inline]
+    pub fn is_inline_unmaterialized(&self) -> bool {
+        match &self.repr {
+            RowRepr::Inline { materialized, .. } => materialized.get().is_none(),
+            RowRepr::Heap(_) => false,
+        }
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.values.len()
+        match &self.repr {
+            RowRepr::Inline { row, .. } => row.len(),
+            RowRepr::Heap(values) => values.len(),
+        }
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
+        self.len() == 0
     }
 
     #[inline]
     pub fn values(&self) -> &[Value] {
-        &self.values
+        match &self.repr {
+            RowRepr::Inline { row, materialized } => {
+                materialized.get_or_init(|| row.to_boxed_values())
+            }
+            RowRepr::Heap(values) => values.as_slice(),
+        }
     }
 
     pub fn into_values(self) -> Vec<Value> {
-        self.values
+        match self.repr {
+            RowRepr::Inline { row, materialized } => match materialized.into_inner() {
+                Some(boxed) => boxed.into_vec(),
+                None => row.to_vec_values(),
+            },
+            RowRepr::Heap(values) => values,
+        }
+    }
+
+    #[inline]
+    pub fn get_ref(&self, idx: usize) -> Option<ValueRef<'_>> {
+        match &self.repr {
+            RowRepr::Inline { row, .. } => row.get(idx).map(InlineVal::as_value_ref),
+            RowRepr::Heap(values) => values.get(idx).map(ValueRef::from_value),
+        }
     }
 
     #[inline]
     pub fn get(&self, idx: usize) -> Option<&Value> {
-        self.values.get(idx)
+        match &self.repr {
+            RowRepr::Inline { row, materialized } => {
+                if idx >= row.len() {
+                    return None;
+                }
+                materialized.get_or_init(|| row.to_boxed_values()).get(idx)
+            }
+            RowRepr::Heap(values) => values.get(idx),
+        }
     }
 
     #[inline]
     pub fn get_i64(&self, idx: usize) -> Option<i64> {
-        self.values.get(idx).and_then(Value::as_i64)
+        match &self.repr {
+            RowRepr::Inline { row, .. } => row.get(idx).and_then(InlineVal::as_i64),
+            RowRepr::Heap(values) => values.get(idx).and_then(Value::as_i64),
+        }
     }
 
     #[inline]
     pub fn get_f64(&self, idx: usize) -> Option<f64> {
-        self.values.get(idx).and_then(Value::as_f64)
+        match &self.repr {
+            RowRepr::Inline { row, .. } => row.get(idx).and_then(InlineVal::as_f64),
+            RowRepr::Heap(values) => values.get(idx).and_then(Value::as_f64),
+        }
     }
 
     #[inline]
     pub fn get_str(&self, idx: usize) -> Option<&str> {
-        self.values.get(idx).and_then(Value::as_str)
+        match &self.repr {
+            RowRepr::Inline { row, .. } => row.get(idx).and_then(InlineVal::as_str),
+            RowRepr::Heap(values) => values.get(idx).and_then(Value::as_str),
+        }
     }
 
     #[inline]
     pub fn get_blob(&self, idx: usize) -> Option<&[u8]> {
-        match self.values.get(idx)? {
-            Value::Blob(b) => Some(b.as_slice()),
-            _ => None,
+        match &self.repr {
+            RowRepr::Inline { row, .. } => row.get(idx).and_then(InlineVal::as_blob),
+            RowRepr::Heap(values) => match values.get(idx)? {
+                Value::Blob(b) => Some(b.as_slice()),
+                _ => None,
+            },
         }
     }
 }
@@ -324,7 +465,7 @@ impl std::ops::Index<usize> for Row {
     type Output = Value;
 
     fn index(&self, index: usize) -> &Self::Output {
-        &self.values[index]
+        &self.values()[index]
     }
 }
 
@@ -336,6 +477,7 @@ pub struct QueryResult {
 }
 
 /// Outcome of [`Statement::step`] (`SQLITE_ROW` vs `SQLITE_DONE`).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum StepResult {
     Row(Row),
@@ -841,6 +983,11 @@ pub(crate) enum RunningExec {
         lease_cursors: Vec<(SchemaInstanceId, CursorId)>,
         read_instances: SmallInstVec,
     },
+    MaterializedInlineRead {
+        rows: std::vec::IntoIter<InlineRow>,
+        lease_cursors: Vec<(SchemaInstanceId, CursorId)>,
+        read_instances: SmallInstVec,
+    },
     FastSingleTextArena {
         arena: String,
         spans: Vec<(u32, u32)>,
@@ -978,6 +1125,8 @@ pub(crate) struct ConnectionInner {
     pub(crate) lit_insert_params: Vec<Value>,
     pub(crate) lit_insert_shapes: Vec<LitArgShape>,
     pub(crate) lit_insert_scratch: sqliters_vdbe::VdbeWriteScratch,
+    pub(crate) pooled_read_vm: Option<VdbeVm>,
+    pub(crate) pooled_write_scratch: sqliters_vdbe::VdbeWriteScratch,
 }
 
 pub(crate) struct ConnectionShared {
@@ -1275,6 +1424,7 @@ impl Drop for ConnectionShared {
                                 vm.close_cursors(&mut inner.db_set);
                             }
                             RunningExec::MaterializedRead { lease_cursors, .. }
+                            | RunningExec::MaterializedInlineRead { lease_cursors, .. }
                             | RunningExec::FastSingleTextArena { lease_cursors, .. } => {
                                 for (inst, cid) in lease_cursors {
                                     if let Some(slot) = inner.db_set.slot_by_instance_mut(inst)
@@ -2417,6 +2567,9 @@ impl ConnectionInner {
                 read_instances,
             } => {
                 vm.close_cursors(&mut self.db_set);
+                if self.pooled_read_vm.is_none() {
+                    self.pooled_read_vm = Some(vm);
+                }
                 self.finish_activity(
                     hid,
                     ActivityFinish::ReadDone {
@@ -2435,6 +2588,11 @@ impl ConnectionInner {
                 shared,
             ),
             RunningExec::MaterializedRead {
+                lease_cursors,
+                read_instances,
+                ..
+            }
+            | RunningExec::MaterializedInlineRead {
                 lease_cursors,
                 read_instances,
                 ..
@@ -2969,6 +3127,8 @@ impl Connection {
             lit_insert_params: Vec::new(),
             lit_insert_shapes: Vec::new(),
             lit_insert_scratch: sqliters_vdbe::VdbeWriteScratch::default(),
+            pooled_read_vm: None,
+            pooled_write_scratch: sqliters_vdbe::VdbeWriteScratch::default(),
         };
 
         let shared = Arc::new(ConnectionShared {
@@ -3097,8 +3257,13 @@ impl Connection {
     pub fn execute_params(&self, sql: &str, params: &[Value]) -> Result<u64> {
         let mut session = self.shared.enter()?;
         session.inner().ensure_usable()?;
-        let mut stmt =
-            Statement::prepare_in_session(&self.shared, session.inner_mut(), sql, PrepareMode::V2)?;
+        let (mut stmt, _) = Statement::prepare_in_session_opts(
+            &self.shared,
+            session.inner_mut(),
+            sql,
+            PrepareMode::V2,
+            false,
+        )?;
         let res = (|| -> Result<()> {
             stmt.bind_all_in_session(session.inner(), params)?;
             while let StepResult::Row(_) =
@@ -3131,13 +3296,13 @@ impl Connection {
                     continue;
                 }
             }
-            let mut stmt = Statement::prepare_in_session(
+            let (mut stmt, next_tail_len) = Statement::prepare_in_session_opts(
                 &self.shared,
                 session.inner_mut(),
                 sql,
                 PrepareMode::V2,
+                false,
             )?;
-            let next_tail_len = stmt.unparsed_tail.len();
             let cur_len = sql.len();
             let step_res = (|| -> Result<()> {
                 while let StepResult::Row(_) =
@@ -3156,12 +3321,120 @@ impl Connection {
         Ok(())
     }
 
+    /// Executes a newline-separated batch of complete non-returning DML/TCL lines under a single
+    /// connection session, invoking `on_error` (`true` => bail immediately, `false` => skip to the
+    /// next `\n`-delimited line and continue) whenever a statement errors.
+    #[doc(hidden)]
+    pub fn execute_non_returning_lines<F>(&self, mut sql: &str, mut on_error: F) -> Result<bool>
+    where
+        F: FnMut(SqliteError) -> bool,
+    {
+        let mut session = self.shared.enter()?;
+        session.inner().ensure_usable()?;
+        fn skip_line(s: &str) -> &str {
+            match s.find('\n') {
+                Some(idx) => &s[(idx + 1)..],
+                None => "",
+            }
+        }
+        while !sql.is_empty() {
+            if session.inner().trace_hook.is_none() {
+                let trimmed = sql.trim_start_matches([' ', '\t', '\r', '\n']);
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((res, tail)) = session
+                    .inner_mut()
+                    .try_fast_exec_literal_insert_step(&self.shared, trimmed)
+                {
+                    if let Err(e) = res
+                        && on_error(e)
+                    {
+                        return Ok(true);
+                    }
+                    sql = tail;
+                    continue;
+                }
+            }
+            let (mut stmt, next_tail_len) = match Statement::prepare_in_session_opts(
+                &self.shared,
+                session.inner_mut(),
+                sql,
+                PrepareMode::V2,
+                false,
+            ) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    if on_error(e) {
+                        return Ok(true);
+                    }
+                    sql = skip_line(sql);
+                    continue;
+                }
+            };
+            let cur_len = sql.len();
+            let step_res = (|| -> Result<()> {
+                while let StepResult::Row(_) =
+                    stmt.step_in_session(&self.shared, session.inner_mut())?
+                {}
+                Ok(())
+            })();
+            let fin_res = stmt.finalize_in_session(&self.shared, session.inner_mut());
+            if let Err(e) = step_res.and(fin_res)
+                && on_error(e)
+            {
+                return Ok(true);
+            }
+            if next_tail_len == cur_len {
+                break;
+            }
+            sql = &sql[(cur_len - next_tail_len)..];
+        }
+        Ok(false)
+    }
+
+    /// Compiles, steps, and finalizes the first SQL statement in `sql` within a single connection
+    /// session (`keep_tail = false`), streaming `(column_names, row)` to `on_row` and returning
+    /// the unparsed tail byte length.
+    #[doc(hidden)]
+    pub fn execute_cli_statement<F>(&self, sql: &str, mut on_row: F) -> Result<usize>
+    where
+        F: FnMut(&[String], &Row),
+    {
+        let mut session = self.shared.enter()?;
+        session.inner().ensure_usable()?;
+        let (mut stmt, next_tail_len) = Statement::prepare_in_session_opts(
+            &self.shared,
+            session.inner_mut(),
+            sql,
+            PrepareMode::V2,
+            false,
+        )?;
+        let step_res = (|| -> Result<()> {
+            while let StepResult::Row(r) =
+                stmt.step_in_session(&self.shared, session.inner_mut())?
+            {
+                on_row(&stmt.column_names, &r);
+            }
+            Ok(())
+        })();
+        let fin_res = stmt.finalize_in_session(&self.shared, session.inner_mut());
+        step_res?;
+        fin_res?;
+        Ok(next_tail_len)
+    }
+
     /// Executes a query with optional positional parameters and returns all columns & rows.
     pub fn query(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
         let mut session = self.shared.enter()?;
         session.inner().ensure_usable()?;
-        let mut stmt =
-            Statement::prepare_in_session(&self.shared, session.inner_mut(), sql, PrepareMode::V2)?;
+        let (mut stmt, _) = Statement::prepare_in_session_opts(
+            &self.shared,
+            session.inner_mut(),
+            sql,
+            PrepareMode::V2,
+            false,
+        )?;
         let res = (|| -> Result<QueryResult> {
             stmt.bind_all_in_session(session.inner(), params)?;
             let mut rows = Vec::new();
@@ -3185,8 +3458,13 @@ impl Connection {
     pub fn query_row(&self, sql: &str, params: &[Value]) -> Result<Option<Row>> {
         let mut session = self.shared.enter()?;
         session.inner().ensure_usable()?;
-        let mut stmt =
-            Statement::prepare_in_session(&self.shared, session.inner_mut(), sql, PrepareMode::V2)?;
+        let (mut stmt, _) = Statement::prepare_in_session_opts(
+            &self.shared,
+            session.inner_mut(),
+            sql,
+            PrepareMode::V2,
+            false,
+        )?;
         let res = (|| -> Result<Option<Row>> {
             stmt.bind_all_in_session(session.inner(), params)?;
             match stmt.step_in_session(&self.shared, session.inner_mut())? {
@@ -4705,8 +4983,8 @@ fn compile_parsed_stmt(
         collations,
     )?;
 
-    let (stmt_opt_auth, ignored_fk_parent_tables) = driver::authorize_stmt_with_slot_and_fks(
-        &stmt,
+    let (stmt_opt_auth, ignored_fk_parent_tables) = driver::authorize_stmt_owned_with_slot_and_fks(
+        stmt,
         db_set,
         functions,
         foreign_keys,
@@ -6223,10 +6501,25 @@ impl Statement {
         sql: &str,
         mode: PrepareMode,
     ) -> Result<Self> {
+        Self::prepare_in_session_opts(shared, inner, sql, mode, true).map(|(st, _)| st)
+    }
+
+    fn prepare_in_session_opts(
+        shared: &Arc<ConnectionShared>,
+        inner: &mut ConnectionInner,
+        sql: &str,
+        mode: PrepareMode,
+        keep_tail: bool,
+    ) -> Result<(Self, usize)> {
         let (stmt_opt, tail) = parse_one(sql)?;
-        let consumed_len = sql.len().saturating_sub(tail.len());
+        let tail_len = tail.len();
+        let consumed_len = sql.len().saturating_sub(tail_len);
         let raw_sql = sql[..consumed_len].to_owned();
-        let unparsed_tail = tail.to_owned();
+        let unparsed_tail = if keep_tail && !tail.is_empty() {
+            tail.to_owned()
+        } else {
+            String::new()
+        };
 
         let needs_schema = stmt_opt.as_ref().is_some_and(stmt_loads_schema_on_prepare);
         if !inner.db_set.is_temp_open()
@@ -6269,7 +6562,7 @@ impl Statement {
                 )
             };
 
-        let mut artifacts = match try_compile(inner, stmt_opt.clone()) {
+        let mut artifacts = match try_compile(inner, stmt_opt) {
             Ok(a) => a,
             Err(err)
                 if needs_schema
@@ -6282,7 +6575,8 @@ impl Statement {
             {
                 // Cached schema might be stale due to an external writer: check on-disk cookies once!
                 if inner.ensure_schemas_loaded_for_prepare(true)? {
-                    try_compile(inner, stmt_opt)?
+                    let (reparsed_opt, _) = parse_one(&raw_sql)?;
+                    try_compile(inner, reparsed_opt)?
                 } else {
                     return Err(err);
                 }
@@ -6293,30 +6587,38 @@ impl Statement {
         apply_prepare_auto_vacuum_pragma(inner, &mut artifacts);
 
         let hid = inner.register_handle(HandleKind::Statement);
-        Ok(Self {
-            shared: Arc::clone(shared),
-            handle_id: Some(hid),
-            mode,
-            raw_sql,
-            stmt: artifacts.stmt,
-            requires_schema: artifacts.requires_schema,
-            category: artifacts.category,
-            compiled_vdbe: artifacts.compiled_vdbe,
-            compiled_fast_read: artifacts.compiled_fast_read,
-            cached_read_vm: None,
-            write_vm_scratch: sqliters_vdbe::VdbeWriteScratch::default(),
-            compiled_schema_generation: inner.schema_generation,
-            compiled_v1_expire_generation: inner.v1_expire_generation,
-            compiled_advisory_expire_generation: inner.advisory_expire_generation,
-            compiled_slot_cookies: inner.snapshot_slot_cookies(),
-            expired: false,
-            column_names: artifacts.column_names,
-            params: vec![Value::Null; artifacts.max_param],
-            named_params: artifacts.named_params,
-            ignored_fk_parent_tables: artifacts.ignored_fk_parent_tables,
-            unparsed_tail,
-            lifecycle: StatementLifecycle::Ready,
-        })
+        let params = if artifacts.max_param == 0 {
+            Vec::new()
+        } else {
+            vec![Value::Null; artifacts.max_param]
+        };
+        Ok((
+            Self {
+                shared: Arc::clone(shared),
+                handle_id: Some(hid),
+                mode,
+                raw_sql,
+                stmt: artifacts.stmt,
+                requires_schema: artifacts.requires_schema,
+                category: artifacts.category,
+                compiled_vdbe: artifacts.compiled_vdbe,
+                compiled_fast_read: artifacts.compiled_fast_read,
+                cached_read_vm: inner.pooled_read_vm.take(),
+                write_vm_scratch: std::mem::take(&mut inner.pooled_write_scratch),
+                compiled_schema_generation: inner.schema_generation,
+                compiled_v1_expire_generation: inner.v1_expire_generation,
+                compiled_advisory_expire_generation: inner.advisory_expire_generation,
+                compiled_slot_cookies: inner.snapshot_slot_cookies(),
+                expired: false,
+                column_names: artifacts.column_names,
+                params,
+                named_params: artifacts.named_params,
+                ignored_fk_parent_tables: artifacts.ignored_fk_parent_tables,
+                unparsed_tail,
+                lifecycle: StatementLifecycle::Ready,
+            },
+            tail_len,
+        ))
     }
 
     /// Remaining uncompiled SQL text after the first semicolon (`pzTail` in `sqlite3_prepare_v2`).
@@ -6779,6 +7081,14 @@ impl Statement {
             },
             StatementLifecycle::Running(run) => inner.finish_running_exec(hid, run, shared),
         };
+        if inner.pooled_read_vm.is_none() {
+            inner.pooled_read_vm = self.cached_read_vm.take();
+        }
+        if inner.pooled_write_scratch.is_empty_capacity()
+            && !self.write_vm_scratch.is_empty_capacity()
+        {
+            inner.pooled_write_scratch = std::mem::take(&mut self.write_vm_scratch);
+        }
         inner.open_handles.remove(&hid);
         res
     }
@@ -6971,11 +7281,12 @@ impl Statement {
             && let Some(plan) = prog.rowid_point_select()
             && plan.db == DatabaseId::MAIN
         {
+            #[allow(clippy::large_enum_variant)]
             enum PointOutcome {
                 Fallback,
                 EarlyErr(SqliteError),
                 HaltedErr(SqliteError),
-                Hit(Vec<Value>, SmallInstVec),
+                Hit(PointLookupRow, SmallInstVec),
                 Miss,
             }
             let outcome = {
@@ -7070,10 +7381,11 @@ impl Statement {
                                             .btree
                                             .as_mut()
                                             .unwrap()
-                                            .point_lookup_table_columns(
+                                            .point_lookup_table_columns_row(
                                                 plan.root_pgno,
                                                 rowid,
                                                 &plan.cols,
+                                                plan.max_col_idx,
                                             ),
                                     },
                                 };
@@ -7150,12 +7462,12 @@ impl Statement {
                     };
                     return Err(e);
                 }
-                PointOutcome::Hit(vals, read_instances) => {
+                PointOutcome::Hit(lookup_row, read_instances) => {
                     self.lifecycle =
                         StatementLifecycle::Running(RunningExec::PointSelectRowYielded {
                             read_instances,
                         });
-                    return Ok(StepResult::Row(Row::new(vals)));
+                    return Ok(StepResult::Row(Row::from_lookup_row(lookup_row)));
                 }
                 PointOutcome::Miss => {
                     self.lifecycle = StatementLifecycle::Halted { last_error: None };
@@ -8147,6 +8459,7 @@ impl Statement {
                 }
                 let mut expire_self_only = false;
                 let mut stmt_tx = StmtTxTracker::default();
+                let mut step_inline_rows: Vec<InlineRow> = Vec::new();
                 let exec_res = inner.with_exec_ctx(
                     shared,
                     summary,
@@ -8154,7 +8467,12 @@ impl Statement {
                     &mut expire_self_only,
                     |ctx| {
                         crate::vtab::ensure_stmt_vtabs_connected(ctx, stmt_ref)?;
-                        execute_read_body(ctx, stmt_ref, &self.params)
+                        execute_read_body_for_step(
+                            ctx,
+                            stmt_ref,
+                            &self.params,
+                            &mut step_inline_rows,
+                        )
                     },
                 );
                 inner.runtime.stmt_timestamp_ms = prev_ts;
@@ -8172,6 +8490,17 @@ impl Statement {
                     Ok(out) => {
                         if !out.column_names.is_empty() {
                             self.column_names = out.column_names;
+                        }
+                        if !step_inline_rows.is_empty() {
+                            let mut iter = step_inline_rows.into_iter();
+                            let first_inline = iter.next().expect("non-empty step_inline_rows");
+                            self.lifecycle =
+                                StatementLifecycle::Running(RunningExec::MaterializedInlineRead {
+                                    rows: iter,
+                                    lease_cursors,
+                                    read_instances,
+                                });
+                            return Ok(StepResult::Row(Row::from_inline(first_inline)));
                         }
                         let mut iter = out.rows.into_iter();
                         if let Some(first_row) = iter.next() {
@@ -8869,10 +9198,22 @@ impl Statement {
                         progress: &mut inner.progress,
                         strict_subtype: inner.strict_subtype,
                     };
-                    vm.step(&mut inner.db_set, &mut services)
+                    vm.step_out(&mut inner.db_set, &mut services)
                 };
                 match step_res {
-                    Ok(VmStep::Row(vals)) => {
+                    Ok(VmStepOut::InlineRow(ir)) => {
+                        let rt_changed = inner.runtime.last_insert_rowid
+                            != vm.runtime_ctx.last_insert_rowid
+                            || inner.runtime.last_changes != vm.runtime_ctx.last_changes
+                            || inner.runtime.total_changes != vm.runtime_ctx.total_changes;
+                        inner.runtime = vm.runtime_ctx;
+                        inner.runtime.stmt_timestamp_ms = None;
+                        if rt_changed {
+                            inner.publish(shared);
+                        }
+                        Ok(StepResult::Row(Row::from_inline(ir)))
+                    }
+                    Ok(VmStepOut::Row(vals)) => {
                         let rt_changed = inner.runtime.last_insert_rowid
                             != vm.runtime_ctx.last_insert_rowid
                             || inner.runtime.last_changes != vm.runtime_ctx.last_changes
@@ -8884,7 +9225,7 @@ impl Statement {
                         }
                         Ok(StepResult::Row(Row::new(vals)))
                     }
-                    Ok(VmStep::Done) => {
+                    Ok(VmStepOut::Done) => {
                         vm.close_cursors(&mut inner.db_set);
                         let r_insts = std::mem::take(read_instances);
                         let rt_changed = inner.runtime.last_insert_rowid
@@ -9035,6 +9376,99 @@ impl Statement {
                 }
             }
 
+            RunningExec::MaterializedInlineRead {
+                rows,
+                lease_cursors,
+                read_instances,
+            } => {
+                if let Err(e) = inner.check_any_interrupted() {
+                    let cursors = std::mem::take(lease_cursors);
+                    let r_insts = std::mem::take(read_instances);
+                    let _ = inner.finish_activity(
+                        hid,
+                        ActivityFinish::ReadAborted {
+                            lease_cursors: cursors,
+                            read_instances: r_insts,
+                        },
+                        shared,
+                    );
+                    self.lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(e.clone()),
+                    };
+                    return Err(e);
+                }
+
+                for &(inst, cid) in lease_cursors.iter() {
+                    let Some(slot) = inner.db_set.slot_by_instance_mut(inst) else {
+                        continue;
+                    };
+                    let Some(ref mut bt) = slot.btree else {
+                        continue;
+                    };
+                    if let Some(&BtreeCursorState::Fault(code)) = bt.cursor_state(cid) {
+                        let msg = if code == extended::SQLITE_ABORT_ROLLBACK {
+                            "abort due to ROLLBACK"
+                        } else {
+                            ErrorCode::from_raw_primary(code).as_str()
+                        };
+                        let err = SqliteError::with_extended(code, msg);
+                        let cursors = std::mem::take(lease_cursors);
+                        let r_insts = std::mem::take(read_instances);
+                        let _ = inner.finish_activity(
+                            hid,
+                            ActivityFinish::ReadAborted {
+                                lease_cursors: cursors,
+                                read_instances: r_insts,
+                            },
+                            shared,
+                        );
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(err.clone()),
+                        };
+                        return Err(err);
+                    }
+                    if let Err(e) = bt.restore_cursor_position(cid) {
+                        let cursors = std::mem::take(lease_cursors);
+                        let r_insts = std::mem::take(read_instances);
+                        let _ = inner.finish_activity(
+                            hid,
+                            ActivityFinish::ReadAborted {
+                                lease_cursors: cursors,
+                                read_instances: r_insts,
+                            },
+                            shared,
+                        );
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        return Err(e);
+                    }
+                }
+
+                if let Some(ir) = rows.next() {
+                    Ok(StepResult::Row(Row::from_inline(ir)))
+                } else {
+                    let cursors = std::mem::take(lease_cursors);
+                    let r_insts = std::mem::take(read_instances);
+                    let fin_res = inner.finish_activity(
+                        hid,
+                        ActivityFinish::ReadDone {
+                            lease_cursors: cursors,
+                            read_instances: r_insts,
+                        },
+                        shared,
+                    );
+                    if let Err(e) = fin_res {
+                        self.lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        return Err(e);
+                    }
+                    self.lifecycle = StatementLifecycle::Halted { last_error: None };
+                    Ok(StepResult::Done)
+                }
+            }
+
             RunningExec::FastSingleTextArena {
                 arena,
                 spans,
@@ -9115,12 +9549,17 @@ impl Statement {
                 if *pos < spans.len() {
                     let (off, len) = spans[*pos];
                     *pos += 1;
-                    let val = if len == u32::MAX {
-                        Value::Null
+                    let row = if len == u32::MAX {
+                        Row::from_inline(InlineRow::single(InlineVal::Null))
                     } else {
-                        Value::Text(arena[off as usize..(off + len) as usize].to_owned())
+                        let s = &arena[off as usize..(off + len) as usize];
+                        if let Some(iv) = InlineVal::try_short_text(s) {
+                            Row::from_inline(InlineRow::single(iv))
+                        } else {
+                            Row::new(vec![Value::Text(s.to_owned())])
+                        }
                     };
-                    Ok(StepResult::Row(Row::new(vec![val])))
+                    Ok(StepResult::Row(row))
                 } else {
                     std::mem::take(arena);
                     std::mem::take(spans);
@@ -9372,7 +9811,9 @@ fn affinity_is_noop_for_insert(aff: TypeAffinity, val: &Value) -> bool {
 fn resolve_insert_val_source<'a>(src: &'a InsertValSource, params: &'a [Value]) -> &'a Value {
     match src {
         InsertValSource::Null => &Value::Null,
-        InsertValSource::Const(v) => v,
+        InsertValSource::Const(v)
+        | InsertValSource::JsonbConstOk(v)
+        | InsertValSource::JsonbConstErr(v) => v,
         InsertValSource::Param1Based(p) | InsertValSource::JsonbParam1Based(p) => {
             params.get((*p as usize) - 1).unwrap_or(&Value::Null)
         }
@@ -9390,6 +9831,75 @@ fn reclaim_jsonb_scratch(coerced: &mut [Value], scratch_jsonb: &mut Vec<u8>) {
     }
 }
 
+#[inline]
+fn resolve_explicit_insert_rowid(
+    rowid_src: &Option<InsertValSource>,
+    params: &[Value],
+) -> Result<Option<i64>> {
+    match rowid_src {
+        None => Ok(None),
+        Some(src) => {
+            let raw_rid = resolve_insert_val_source(src, params);
+            if raw_rid.is_null() {
+                Ok(None)
+            } else if let Value::Integer(rid) = *raw_rid {
+                Ok(Some(rid))
+            } else {
+                match TypeAffinity::Integer.apply(raw_rid.clone()) {
+                    Value::Integer(rid) => Ok(Some(rid)),
+                    _ => Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch")),
+                }
+            }
+        }
+    }
+}
+
+#[inline]
+fn finish_single_row_insert_write(
+    plan: &SingleRowInsertPlan,
+    explicit_rowid: Option<i64>,
+    val_refs: &[&Value],
+    scratch_rec: &mut Vec<u8>,
+    bt: &mut Btree,
+) -> Result<i64> {
+    let (rowid, need_dup_check) = match explicit_rowid {
+        Some(rid) => (rid, true),
+        None => (bt.next_rowid(plan.root_pgno)?, false),
+    };
+
+    let enc = bt.encoding();
+    encode_value_refs_record_into(val_refs, enc, scratch_rec);
+    if need_dup_check {
+        if !bt.insert_table_unique(plan.root_pgno, rowid, scratch_rec)? {
+            return Err(SqliteError::constraint(
+                plan.dup_ext_code,
+                plan.dup_msg.clone(),
+            ));
+        }
+    } else {
+        bt.insert_table(plan.root_pgno, rowid, scratch_rec)?;
+    }
+
+    if !plan.indexes.is_empty() {
+        let rid_val = Value::Integer(rowid);
+        let mut idx_refs: [&Value; 17] = [&Value::Null; 17];
+        for idx in &plan.indexes {
+            let k_len = idx.col_slots.len();
+            for (k, &slot) in idx.col_slots.iter().enumerate() {
+                idx_refs[k] = match slot {
+                    None => &rid_val,
+                    Some(ci) => val_refs[ci],
+                };
+            }
+            idx_refs[k_len] = &rid_val;
+            encode_value_refs_record_into(&idx_refs[..=k_len], enc, scratch_rec);
+            bt.insert_index(idx.root_pgno, scratch_rec, &idx.orders)?;
+        }
+    }
+
+    Ok(rowid)
+}
+
 fn execute_single_row_insert_plan(
     plan: &SingleRowInsertPlan,
     params: &[Value],
@@ -9402,54 +9912,189 @@ fn execute_single_row_insert_plan(
     }
 
     let n_cols = plan.cols.len();
+
+    // Ultra-light zero-`Value::Drop` fast path when no `jsonb(...)` expression is present and
+    // every column already matches its target affinity (`W01` 10,000-row bulk insert!).
+    if !plan.has_builtin_jsonb {
+        let explicit_rowid = resolve_explicit_insert_rowid(&plan.rowid_src, params)?;
+        let mut val_refs: [&Value; 16] = [&Value::Null; 16];
+        let mut need_coercion = false;
+        for (i, col) in plan.cols.iter().enumerate() {
+            let raw_val = resolve_insert_val_source(&col.src, params);
+            if affinity_is_noop_for_insert(col.affinity, raw_val) {
+                if raw_val.is_null()
+                    && let Some(ref msg) = col.notnull_msg
+                {
+                    return Err(SqliteError::constraint(
+                        extended::SQLITE_CONSTRAINT_NOTNULL,
+                        msg.clone(),
+                    ));
+                }
+                val_refs[i] = raw_val;
+            } else {
+                need_coercion = true;
+                break;
+            }
+        }
+        if !need_coercion {
+            return finish_single_row_insert_write(
+                plan,
+                explicit_rowid,
+                &val_refs[..n_cols],
+                scratch_rec,
+                bt,
+            );
+        }
+    }
+
+    // Compact 4-column fast path when `n_cols <= 4` (`W10`: `id, bucket, jsonb(?3)`), avoiding
+    // initializing and dropping a 16-slot `[Value; 16]` array on every row!
+    if n_cols <= 4 {
+        let mut coerced: [Value; 4] = [Value::Null, Value::Null, Value::Null, Value::Null];
+        let mut is_coerced = [false; 4];
+
+        if plan.has_builtin_jsonb {
+            for (i, col) in plan.cols.iter().enumerate() {
+                match col.src {
+                    InsertValSource::JsonbParam1Based(p) => {
+                        let raw_arg = params.get((p as usize) - 1).unwrap_or(&Value::Null);
+                        let mut jb_buf = std::mem::take(scratch_jsonb);
+                        match sqliters_types::eval_jsonb_value_into(raw_arg, &mut jb_buf) {
+                            Ok(true) => {
+                                coerced[i] = Value::Blob(jb_buf);
+                                is_coerced[i] = true;
+                            }
+                            Ok(false) => {
+                                *scratch_jsonb = jb_buf;
+                                coerced[i] = Value::Null;
+                                is_coerced[i] = true;
+                            }
+                            Err(e) => {
+                                *scratch_jsonb = jb_buf;
+                                reclaim_jsonb_scratch(&mut coerced[..n_cols], scratch_jsonb);
+                                return Err(e);
+                            }
+                        }
+                    }
+                    InsertValSource::JsonbConstErr(ref bad_val) => {
+                        let mut jb_buf = std::mem::take(scratch_jsonb);
+                        let res = sqliters_types::eval_jsonb_value_into(bad_val, &mut jb_buf);
+                        *scratch_jsonb = jb_buf;
+                        if let Err(e) = res {
+                            reclaim_jsonb_scratch(&mut coerced[..n_cols], scratch_jsonb);
+                            return Err(e);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let run_res = (|| -> Result<i64> {
+            let explicit_rowid = resolve_explicit_insert_rowid(&plan.rowid_src, params)?;
+            for (i, col) in plan.cols.iter().enumerate() {
+                if is_coerced[i] {
+                    if coerced[i].is_null()
+                        && let Some(ref msg) = col.notnull_msg
+                    {
+                        return Err(SqliteError::constraint(
+                            extended::SQLITE_CONSTRAINT_NOTNULL,
+                            msg.clone(),
+                        ));
+                    }
+                    continue;
+                }
+                let raw_val = resolve_insert_val_source(&col.src, params);
+                if affinity_is_noop_for_insert(col.affinity, raw_val) {
+                    if raw_val.is_null()
+                        && let Some(ref msg) = col.notnull_msg
+                    {
+                        return Err(SqliteError::constraint(
+                            extended::SQLITE_CONSTRAINT_NOTNULL,
+                            msg.clone(),
+                        ));
+                    }
+                } else {
+                    let v = col.affinity.apply(raw_val.clone());
+                    if v.is_null()
+                        && let Some(ref msg) = col.notnull_msg
+                    {
+                        return Err(SqliteError::constraint(
+                            extended::SQLITE_CONSTRAINT_NOTNULL,
+                            msg.clone(),
+                        ));
+                    }
+                    coerced[i] = v;
+                    is_coerced[i] = true;
+                }
+            }
+
+            let mut val_refs: [&Value; 4] = [&Value::Null; 4];
+            for (i, col) in plan.cols.iter().enumerate() {
+                val_refs[i] = if is_coerced[i] {
+                    &coerced[i]
+                } else {
+                    resolve_insert_val_source(&col.src, params)
+                };
+            }
+            finish_single_row_insert_write(
+                plan,
+                explicit_rowid,
+                &val_refs[..n_cols],
+                scratch_rec,
+                bt,
+            )
+        })();
+
+        if plan.has_builtin_jsonb {
+            reclaim_jsonb_scratch(&mut coerced[..n_cols], scratch_jsonb);
+        }
+        return run_res;
+    }
+
     let mut coerced: [Value; 16] = std::array::from_fn(|_| Value::Null);
     let mut is_coerced = [false; 16];
 
-    // 1. Evaluate any built-in `jsonb(?p)` expressions first (matching VDBE step-2 expression order).
+    // 1. Evaluate any built-in `jsonb(...)` expressions first (matching VDBE step-2 expression order).
     if plan.has_builtin_jsonb {
         for (i, col) in plan.cols.iter().enumerate() {
-            if let InsertValSource::JsonbParam1Based(p) = col.src {
-                let raw_arg = params.get((p as usize) - 1).unwrap_or(&Value::Null);
-                let mut jb_buf = std::mem::take(scratch_jsonb);
-                match sqliters_types::eval_jsonb_value_into(raw_arg, &mut jb_buf) {
-                    Ok(true) => {
-                        coerced[i] = Value::Blob(jb_buf);
-                        is_coerced[i] = true;
+            match col.src {
+                InsertValSource::JsonbParam1Based(p) => {
+                    let raw_arg = params.get((p as usize) - 1).unwrap_or(&Value::Null);
+                    let mut jb_buf = std::mem::take(scratch_jsonb);
+                    match sqliters_types::eval_jsonb_value_into(raw_arg, &mut jb_buf) {
+                        Ok(true) => {
+                            coerced[i] = Value::Blob(jb_buf);
+                            is_coerced[i] = true;
+                        }
+                        Ok(false) => {
+                            *scratch_jsonb = jb_buf;
+                            coerced[i] = Value::Null;
+                            is_coerced[i] = true;
+                        }
+                        Err(e) => {
+                            *scratch_jsonb = jb_buf;
+                            reclaim_jsonb_scratch(&mut coerced[..n_cols], scratch_jsonb);
+                            return Err(e);
+                        }
                     }
-                    Ok(false) => {
-                        *scratch_jsonb = jb_buf;
-                        coerced[i] = Value::Null;
-                        is_coerced[i] = true;
-                    }
-                    Err(e) => {
-                        *scratch_jsonb = jb_buf;
+                }
+                InsertValSource::JsonbConstErr(ref bad_val) => {
+                    let mut jb_buf = std::mem::take(scratch_jsonb);
+                    let res = sqliters_types::eval_jsonb_value_into(bad_val, &mut jb_buf);
+                    *scratch_jsonb = jb_buf;
+                    if let Err(e) = res {
                         reclaim_jsonb_scratch(&mut coerced[..n_cols], scratch_jsonb);
                         return Err(e);
                     }
                 }
+                _ => {}
             }
         }
     }
 
     let run_res = (|| -> Result<i64> {
-        let explicit_rowid = match plan.rowid_src {
-            None => None,
-            Some(ref src) => {
-                let raw_rid = resolve_insert_val_source(src, params);
-                if raw_rid.is_null() {
-                    None
-                } else if let Value::Integer(rid) = *raw_rid {
-                    Some(rid)
-                } else {
-                    match TypeAffinity::Integer.apply(raw_rid.clone()) {
-                        Value::Integer(rid) => Some(rid),
-                        _ => {
-                            return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
-                        }
-                    }
-                }
-            }
-        };
+        let explicit_rowid = resolve_explicit_insert_rowid(&plan.rowid_src, params)?;
 
         for (i, col) in plan.cols.iter().enumerate() {
             if is_coerced[i] {
@@ -9497,48 +10142,501 @@ fn execute_single_row_insert_plan(
             };
         }
 
-        let (rowid, need_dup_check) = match explicit_rowid {
-            Some(rid) => (rid, true),
-            None => (bt.next_rowid(plan.root_pgno)?, false),
-        };
-
-        let enc = bt.encoding();
-        encode_value_refs_record_into(&val_refs[..n_cols], enc, scratch_rec);
-        if need_dup_check {
-            if !bt.insert_table_unique(plan.root_pgno, rowid, scratch_rec)? {
-                return Err(SqliteError::constraint(
-                    plan.dup_ext_code,
-                    plan.dup_msg.clone(),
-                ));
-            }
-        } else {
-            bt.insert_table(plan.root_pgno, rowid, scratch_rec)?;
-        }
-
-        if !plan.indexes.is_empty() {
-            let rid_val = Value::Integer(rowid);
-            let mut idx_refs: [&Value; 17] = [&Value::Null; 17];
-            for idx in &plan.indexes {
-                let k_len = idx.col_slots.len();
-                for (k, &slot) in idx.col_slots.iter().enumerate() {
-                    idx_refs[k] = match slot {
-                        None => &rid_val,
-                        Some(ci) => val_refs[ci],
-                    };
-                }
-                idx_refs[k_len] = &rid_val;
-                encode_value_refs_record_into(&idx_refs[..=k_len], enc, scratch_rec);
-                bt.insert_index(idx.root_pgno, scratch_rec, &idx.orders)?;
-            }
-        }
-
-        Ok(rowid)
+        finish_single_row_insert_write(plan, explicit_rowid, &val_refs[..n_cols], scratch_rec, bt)
     })();
 
     if plan.has_builtin_jsonb {
         reclaim_jsonb_scratch(&mut coerced[..n_cols], scratch_jsonb);
     }
     run_res
+}
+
+#[derive(Copy, Clone)]
+enum RawRecField<'a> {
+    Empty,
+    Slice(&'a [u8]),
+    Inline8([u8; 8], u8),
+}
+
+impl<'a> RawRecField<'a> {
+    #[inline(always)]
+    fn len(self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Slice(s) => s.len(),
+            Self::Inline8(_, n) => n as usize,
+        }
+    }
+}
+
+#[inline(always)]
+fn encode_i64_raw_field(i: i64) -> (u64, RawRecField<'static>) {
+    const MAX_6B: u64 = (0x0000_8000_u64 << 32) - 1;
+    if i == 0 {
+        return (8, RawRecField::Empty);
+    }
+    if i == 1 {
+        return (9, RawRecField::Empty);
+    }
+    let u = if i < 0 { (!i) as u64 } else { i as u64 };
+    if u <= 127 {
+        (1, RawRecField::Inline8([i as u8, 0, 0, 0, 0, 0, 0, 0], 1))
+    } else if u <= 32_767 {
+        let b = (i as i16).to_be_bytes();
+        (2, RawRecField::Inline8([b[0], b[1], 0, 0, 0, 0, 0, 0], 2))
+    } else if u <= 8_388_607 {
+        let b = (i as i32).to_be_bytes();
+        (
+            3,
+            RawRecField::Inline8([b[1], b[2], b[3], 0, 0, 0, 0, 0], 3),
+        )
+    } else if u <= 2_147_483_647 {
+        let b = (i as i32).to_be_bytes();
+        (
+            4,
+            RawRecField::Inline8([b[0], b[1], b[2], b[3], 0, 0, 0, 0], 4),
+        )
+    } else if u <= MAX_6B {
+        let b = i.to_be_bytes();
+        (
+            5,
+            RawRecField::Inline8([b[2], b[3], b[4], b[5], b[6], b[7], 0, 0], 6),
+        )
+    } else {
+        (6, RawRecField::Inline8(i.to_be_bytes(), 8))
+    }
+}
+
+#[inline(always)]
+fn decode_raw_int_field(st: u64, b: &[u8]) -> i64 {
+    match st {
+        8 => 0,
+        9 => 1,
+        1 => (b[0] as i8) as i64,
+        2 => i16::from_be_bytes([b[0], b[1]]) as i64,
+        3 => {
+            let sign_ext = (b[0] as i8) as i32;
+            ((sign_ext << 16) | ((b[1] as i32) << 8) | (b[2] as i32)) as i64
+        }
+        4 => i32::from_be_bytes([b[0], b[1], b[2], b[3]]) as i64,
+        5 => {
+            let hi = i16::from_be_bytes([b[0], b[1]]) as i64;
+            let lo = u32::from_be_bytes([b[2], b[3], b[4], b[5]]) as i64;
+            (hi << 32) | lo
+        }
+        6 => i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        _ => 0,
+    }
+}
+
+#[inline(always)]
+fn canonicalize_raw_utf8_field(st_in: u64, b: &[u8]) -> (u64, RawRecField<'_>) {
+    if st_in == 0 {
+        (0, RawRecField::Empty)
+    } else if st_in == 7 {
+        let f = f64::from_bits(u64::from_be_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]));
+        if f.is_nan() {
+            (0, RawRecField::Empty)
+        } else if f == 0.0 {
+            (7, RawRecField::Inline8([0; 8], 8))
+        } else {
+            (7, RawRecField::Slice(b))
+        }
+    } else if st_in < 12 {
+        encode_i64_raw_field(decode_raw_int_field(st_in, b))
+    } else {
+        (st_in, RawRecField::Slice(b))
+    }
+}
+
+#[inline(always)]
+fn value_to_utf8_raw_field(v: &Value) -> (u64, RawRecField<'_>) {
+    match v {
+        Value::Null => (0, RawRecField::Empty),
+        Value::Integer(i) => encode_i64_raw_field(*i),
+        Value::Real(r) => {
+            if r.is_nan() {
+                (0, RawRecField::Empty)
+            } else if *r == 0.0 {
+                (7, RawRecField::Inline8([0; 8], 8))
+            } else {
+                (7, RawRecField::Inline8(r.to_bits().to_be_bytes(), 8))
+            }
+        }
+        Value::Blob(b) => (12 + 2 * (b.len() as u64), RawRecField::Slice(b.as_slice())),
+        Value::Text(s) => (13 + 2 * (s.len() as u64), RawRecField::Slice(s.as_bytes())),
+    }
+}
+
+#[inline]
+fn pack_raw_fields_into(sts: &[u64], srcs: &[RawRecField<'_>], out: &mut Vec<u8>) {
+    let mut serial_bytes_len = 0usize;
+    let mut body_len = 0usize;
+    for (&st, &src) in sts.iter().zip(srcs.iter()) {
+        serial_bytes_len += sqliters_types::varint_len(st);
+        body_len += src.len();
+    }
+    let mut hdr_len = serial_bytes_len + sqliters_types::varint_len((serial_bytes_len + 1) as u64);
+    if sqliters_types::varint_len(hdr_len as u64) + serial_bytes_len != hdr_len {
+        hdr_len = serial_bytes_len + sqliters_types::varint_len((serial_bytes_len + 2) as u64);
+    }
+    let total = hdr_len + body_len;
+    out.clear();
+    out.reserve(total);
+    sqliters_types::push_varint(out, hdr_len as u64);
+    for &st in sts {
+        sqliters_types::push_varint(out, st);
+    }
+    for src in srcs {
+        match *src {
+            RawRecField::Empty => {}
+            RawRecField::Slice(s) => out.extend_from_slice(s),
+            RawRecField::Inline8(ref buf, n) => out.extend_from_slice(&buf[..n as usize]),
+        }
+    }
+}
+
+fn parse_raw_record_prefix<const N: usize>(
+    raw_rec: &[u8],
+    max_col: usize,
+    rec_st: &mut [u64; N],
+    rec_off: &mut [usize; N],
+    rec_len: &mut [usize; N],
+) -> Result<usize> {
+    if raw_rec.is_empty() {
+        return Ok(0);
+    }
+    let (hdr_u64, mut hdr_pos) = sqliters_types::get_varint(raw_rec)?;
+    let hdr_len = usize::try_from(hdr_u64)
+        .ok()
+        .filter(|&h| h <= raw_rec.len() && hdr_pos <= h)
+        .ok_or_else(|| SqliteError::corrupt("record header out of bounds"))?;
+    let mut body_pos = hdr_len;
+    let mut parsed = 0usize;
+    let limit = max_col.min(N - 1);
+    while parsed <= limit && hdr_pos < hdr_len {
+        let (st, used) = sqliters_types::get_varint(&raw_rec[hdr_pos..hdr_len])?;
+        let len = sqliters_types::serial_type_len(st)?;
+        let next_b = body_pos
+            .checked_add(len)
+            .filter(|&nb| nb <= raw_rec.len())
+            .ok_or_else(|| SqliteError::corrupt("record payload truncated"))?;
+        rec_st[parsed] = st;
+        rec_off[parsed] = body_pos;
+        rec_len[parsed] = len;
+        hdr_pos += used;
+        body_pos = next_b;
+        parsed += 1;
+    }
+    Ok(parsed)
+}
+
+fn execute_single_row_delete_plan(
+    plan: &SingleRowDeletePlan,
+    params: &[Value],
+    scratch_rec: &mut Vec<u8>,
+    scratch_old_rec: &mut Vec<u8>,
+    bt: &mut Btree,
+) -> Result<u64> {
+    if bt.transaction_state() != TransactionState::Write {
+        bt.begin_write()?;
+    }
+    let key_val = resolve_insert_val_source(&plan.key_src, params);
+    let Some(target_rowid) = key_val.to_exact_rowid_i64() else {
+        return Ok(0);
+    };
+
+    if plan.indexes.is_empty() {
+        return Ok(u64::from(bt.delete_table(plan.root_pgno, target_rowid)?));
+    }
+
+    if !bt.delete_table_returning_raw_into(plan.root_pgno, target_rowid, scratch_old_rec)? {
+        return Ok(0);
+    }
+
+    let mut rec_st = [0u64; 32];
+    let mut rec_off = [0usize; 32];
+    let mut rec_len = [0usize; 32];
+    let parsed_cols = if let Some(max_ci) = plan.max_needed_col {
+        parse_raw_record_prefix(
+            scratch_old_rec,
+            max_ci,
+            &mut rec_st,
+            &mut rec_off,
+            &mut rec_len,
+        )?
+    } else {
+        0
+    };
+
+    let (rid_st, rid_src) = encode_i64_raw_field(target_rowid);
+    let mut idx_st = [0u64; 16];
+    let mut idx_src = [RawRecField::Empty; 16];
+    for idx in &plan.indexes {
+        let k_len = idx.col_slots.len();
+        for (k, &slot) in idx.col_slots.iter().enumerate() {
+            let (st, src) = match slot {
+                None => (rid_st, rid_src),
+                Some(ci) if ci < parsed_cols => {
+                    let b = &scratch_old_rec[rec_off[ci]..rec_off[ci] + rec_len[ci]];
+                    canonicalize_raw_utf8_field(rec_st[ci], b)
+                }
+                Some(_) => (0, RawRecField::Empty),
+            };
+            idx_st[k] = st;
+            idx_src[k] = src;
+        }
+        idx_st[k_len] = rid_st;
+        idx_src[k_len] = rid_src;
+        pack_raw_fields_into(&idx_st[..=k_len], &idx_src[..=k_len], scratch_rec);
+        bt.delete_index_raw(idx.root_pgno, scratch_rec, &idx.orders)?;
+    }
+
+    Ok(1)
+}
+
+fn execute_single_row_update_plan(
+    plan: &SingleRowUpdatePlan,
+    params: &[Value],
+    scratch_rec: &mut Vec<u8>,
+    scratch_old_rec: &mut Vec<u8>,
+    bt: &mut Btree,
+) -> Result<u64> {
+    if bt.transaction_state() != TransactionState::Write {
+        bt.begin_write()?;
+    }
+    let key_val = resolve_insert_val_source(&plan.key_src, params);
+    let Some(target_rowid) = key_val.to_exact_rowid_i64() else {
+        return Ok(0);
+    };
+
+    let found = bt.with_table_rowid_raw_cell(plan.root_pgno, target_rowid, |raw| {
+        scratch_old_rec.clear();
+        scratch_old_rec.extend_from_slice(raw);
+        Ok(())
+    })?;
+    if found.is_none() {
+        return Ok(0);
+    }
+
+    let n_cols = plan.n_cols;
+    let mut rec_st = [0u64; 16];
+    let mut rec_off = [0usize; 16];
+    let mut rec_len = [0usize; 16];
+    let parsed_cols = parse_raw_record_prefix(
+        scratch_old_rec,
+        n_cols.saturating_sub(1),
+        &mut rec_st,
+        &mut rec_off,
+        &mut rec_len,
+    )?;
+
+    // Fast path when every assigned value already satisfies target affinity (zero `Value` drops!).
+    let mut coerced: [Value; 16] = [
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+    ];
+    let mut new_refs: [&Value; 16] = [&Value::Null; 16];
+    let mut assigned_mask = 0u16;
+    for (a, c_slot) in plan.assignments.iter().zip(coerced.iter_mut()) {
+        let final_ref = match &a.rhs {
+            SingleRowUpdateRhs::Value(src) => {
+                let raw_val = resolve_insert_val_source(src, params);
+                if affinity_is_noop_for_insert(a.affinity, raw_val) {
+                    if raw_val.is_null()
+                        && let Some(ref msg) = a.notnull_msg
+                    {
+                        return Err(SqliteError::constraint(
+                            extended::SQLITE_CONSTRAINT_NOTNULL,
+                            msg.clone(),
+                        ));
+                    }
+                    raw_val
+                } else {
+                    let v = a.affinity.apply(raw_val.clone());
+                    if v.is_null()
+                        && let Some(ref msg) = a.notnull_msg
+                    {
+                        return Err(SqliteError::constraint(
+                            extended::SQLITE_CONSTRAINT_NOTNULL,
+                            msg.clone(),
+                        ));
+                    }
+                    *c_slot = v;
+                    &*c_slot
+                }
+            }
+            SingleRowUpdateRhs::ColArith { src_col, op, rhs } => {
+                let rhs_val = resolve_insert_val_source(rhs, params);
+                let computed = if let Value::Integer(delta) = rhs_val {
+                    let fast_lhs = if plan.rowid_alias_col == Some(*src_col) {
+                        Some(target_rowid)
+                    } else if *src_col < parsed_cols {
+                        let st = rec_st[*src_col];
+                        let b = &scratch_old_rec
+                            [rec_off[*src_col]..rec_off[*src_col] + rec_len[*src_col]];
+                        match st {
+                            8 => Some(0),
+                            9 => Some(1),
+                            1 if b.len() == 1 => Some(i64::from(b[0] as i8)),
+                            2 if b.len() == 2 => Some(i64::from(i16::from_be_bytes([b[0], b[1]]))),
+                            3 if b.len() == 3 => {
+                                let sign = if (b[0] & 0x80) != 0 { 0xFF } else { 0x00 };
+                                Some(i64::from(i32::from_be_bytes([sign, b[0], b[1], b[2]])))
+                            }
+                            4 if b.len() == 4 => {
+                                Some(i64::from(i32::from_be_bytes([b[0], b[1], b[2], b[3]])))
+                            }
+                            5 if b.len() == 6 => {
+                                let s = if (b[0] & 0x80) != 0 { 0xFF } else { 0x00 };
+                                Some(i64::from_be_bytes([
+                                    s, s, b[0], b[1], b[2], b[3], b[4], b[5],
+                                ]))
+                            }
+                            6 if b.len() == 8 => Some(i64::from_be_bytes([
+                                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                            ])),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(lhs_i) = fast_lhs {
+                        let ov = match op {
+                            Opcode::Add => lhs_i.checked_add(*delta),
+                            Opcode::Subtract => lhs_i.checked_sub(*delta),
+                            _ => None,
+                        };
+                        if let Some(res_i) = ov {
+                            Value::Integer(res_i)
+                        } else {
+                            eval_arith(*op, &Value::Integer(lhs_i), rhs_val)
+                        }
+                    } else {
+                        let lhs_val = if plan.rowid_alias_col == Some(*src_col) {
+                            Value::Integer(target_rowid)
+                        } else if *src_col < parsed_cols {
+                            let b = &scratch_old_rec
+                                [rec_off[*src_col]..rec_off[*src_col] + rec_len[*src_col]];
+                            sqliters_types::decode_serial_value(rec_st[*src_col], b)?
+                        } else {
+                            Value::Null
+                        };
+                        eval_arith(*op, &lhs_val, rhs_val)
+                    }
+                } else {
+                    let lhs_val = if plan.rowid_alias_col == Some(*src_col) {
+                        Value::Integer(target_rowid)
+                    } else if *src_col < parsed_cols {
+                        let b = &scratch_old_rec
+                            [rec_off[*src_col]..rec_off[*src_col] + rec_len[*src_col]];
+                        sqliters_types::decode_serial_value(rec_st[*src_col], b)?
+                    } else {
+                        Value::Null
+                    };
+                    eval_arith(*op, &lhs_val, rhs_val)
+                };
+                let v = if affinity_is_noop_for_insert(a.affinity, &computed) {
+                    computed
+                } else {
+                    a.affinity.apply(computed)
+                };
+                if v.is_null()
+                    && let Some(ref msg) = a.notnull_msg
+                {
+                    return Err(SqliteError::constraint(
+                        extended::SQLITE_CONSTRAINT_NOTNULL,
+                        msg.clone(),
+                    ));
+                }
+                *c_slot = v;
+                &*c_slot
+            }
+        };
+        new_refs[a.col_idx] = final_ref;
+        assigned_mask |= 1u16 << a.col_idx;
+    }
+
+    let mut new_st = [0u64; 16];
+    let mut new_src = [RawRecField::Empty; 16];
+    for ci in 0..n_cols {
+        if plan.rowid_alias_col == Some(ci) {
+            new_st[ci] = 0;
+            new_src[ci] = RawRecField::Empty;
+        } else if (assigned_mask & (1u16 << ci)) != 0 {
+            let (st, src) = value_to_utf8_raw_field(new_refs[ci]);
+            new_st[ci] = st;
+            new_src[ci] = src;
+        } else if ci < parsed_cols {
+            let b = &scratch_old_rec[rec_off[ci]..rec_off[ci] + rec_len[ci]];
+            let (st, src) = canonicalize_raw_utf8_field(rec_st[ci], b);
+            new_st[ci] = st;
+            new_src[ci] = src;
+        } else {
+            new_st[ci] = 0;
+            new_src[ci] = RawRecField::Empty;
+        }
+    }
+
+    if !plan.affected_indexes.is_empty() {
+        let (rid_st, rid_src) = encode_i64_raw_field(target_rowid);
+        let mut idx_st = [0u64; 16];
+        let mut idx_src = [RawRecField::Empty; 16];
+        for idx in &plan.affected_indexes {
+            let k_len = idx.col_slots.len();
+            // 1. Delete old index key
+            for (k, &slot) in idx.col_slots.iter().enumerate() {
+                let (st, src) = match slot {
+                    None => (rid_st, rid_src),
+                    Some(ci) if ci < parsed_cols => {
+                        let b = &scratch_old_rec[rec_off[ci]..rec_off[ci] + rec_len[ci]];
+                        canonicalize_raw_utf8_field(rec_st[ci], b)
+                    }
+                    Some(_) => (0, RawRecField::Empty),
+                };
+                idx_st[k] = st;
+                idx_src[k] = src;
+            }
+            idx_st[k_len] = rid_st;
+            idx_src[k_len] = rid_src;
+            pack_raw_fields_into(&idx_st[..=k_len], &idx_src[..=k_len], scratch_rec);
+            bt.delete_index_raw(idx.root_pgno, scratch_rec, &idx.orders)?;
+
+            // 2. Insert new index key
+            for (k, &slot) in idx.col_slots.iter().enumerate() {
+                let (st, src) = match slot {
+                    None => (rid_st, rid_src),
+                    Some(ci) => (new_st[ci], new_src[ci]),
+                };
+                idx_st[k] = st;
+                idx_src[k] = src;
+            }
+            idx_st[k_len] = rid_st;
+            idx_src[k_len] = rid_src;
+            pack_raw_fields_into(&idx_st[..=k_len], &idx_src[..=k_len], scratch_rec);
+            bt.insert_index(idx.root_pgno, scratch_rec, &idx.orders)?;
+        }
+    }
+
+    pack_raw_fields_into(&new_st[..n_cols], &new_src[..n_cols], scratch_rec);
+    bt.insert_table(plan.root_pgno, target_rowid, scratch_rec)?;
+    Ok(1)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9668,6 +10766,22 @@ fn try_fast_read_plan_fields(
             *lifecycle = StatementLifecycle::Halted { last_error: None };
             Some(Ok(StepResult::Done))
         }
+        Ok(fast_read::FastReadExecOut::SingleInlineRow(ir)) => {
+            if !inner.is_autocommit() {
+                inner.in_user_btree_tx = true;
+            }
+            let read_instances = SmallInstVec::single(main_inst);
+            inner.activity.start_with_instances(
+                hid,
+                true,
+                false,
+                read_instances.clone(),
+                SmallInstVec::new(),
+            );
+            *lifecycle =
+                StatementLifecycle::Running(RunningExec::PointSelectRowYielded { read_instances });
+            Some(Ok(StepResult::Row(Row::from_inline(ir))))
+        }
         Ok(fast_read::FastReadExecOut::SingleRow(vals)) => {
             if !inner.is_autocommit() {
                 inner.in_user_btree_tx = true;
@@ -9723,6 +10837,16 @@ fn try_fast_read_plan_fields(
             }
 
             match out_multi {
+                fast_read::FastReadExecOut::InlineRows(rows) => {
+                    let mut iter = rows.into_iter();
+                    let first = iter.next().expect("InlineRows has >= 2 elements");
+                    *lifecycle = StatementLifecycle::Running(RunningExec::MaterializedInlineRead {
+                        rows: iter,
+                        lease_cursors,
+                        read_instances,
+                    });
+                    Some(Ok(StepResult::Row(Row::from_inline(first))))
+                }
                 fast_read::FastReadExecOut::Rows(rows) => {
                     let mut iter = rows.into_iter();
                     let first = iter.next().expect("Rows has >= 2 elements");
@@ -9735,10 +10859,15 @@ fn try_fast_read_plan_fields(
                 }
                 fast_read::FastReadExecOut::SingleTextArena { arena, spans } => {
                     let (off0, len0) = spans[0];
-                    let first_val = if len0 == u32::MAX {
-                        Value::Null
+                    let first_row = if len0 == u32::MAX {
+                        Row::from_inline(InlineRow::single(InlineVal::Null))
                     } else {
-                        Value::Text(arena[off0 as usize..(off0 + len0) as usize].to_owned())
+                        let s = &arena[off0 as usize..(off0 + len0) as usize];
+                        if let Some(iv) = InlineVal::try_short_text(s) {
+                            Row::from_inline(InlineRow::single(iv))
+                        } else {
+                            Row::new(vec![Value::Text(s.to_owned())])
+                        }
                     };
                     *lifecycle = StatementLifecycle::Running(RunningExec::FastSingleTextArena {
                         arena,
@@ -9747,7 +10876,7 @@ fn try_fast_read_plan_fields(
                         lease_cursors,
                         read_instances,
                     });
-                    Some(Ok(StepResult::Row(Row::new(vec![first_val]))))
+                    Some(Ok(StepResult::Row(first_row)))
                 }
                 _ => unreachable!(),
             }
@@ -9973,6 +11102,36 @@ fn try_fast_compiled_main_write_fields(
                     .progress
                     .add_ticks_without_handler(prog.ops.len() as u64);
                 (Ok(()), rid, 1u64)
+            }
+            Err(e) => (Err(e), inner.runtime.last_insert_rowid, 0u64),
+        }
+    } else if let Some(upd_plan) = prog.single_row_update()
+        && !inner.progress.is_enabled()
+        && inner.effective_encoding() == TextEncoding::Utf8
+    {
+        let bt = inner.db_set.slots_mut()[0].btree.as_mut().unwrap();
+        let (scratch_rec, scratch_old) = write_vm_scratch.scratch_buffers_mut();
+        match execute_single_row_update_plan(upd_plan, params, scratch_rec, scratch_old, bt) {
+            Ok(changed) => {
+                inner
+                    .progress
+                    .add_ticks_without_handler(prog.ops.len() as u64);
+                (Ok(()), inner.runtime.last_insert_rowid, changed)
+            }
+            Err(e) => (Err(e), inner.runtime.last_insert_rowid, 0u64),
+        }
+    } else if let Some(del_plan) = prog.single_row_delete()
+        && !inner.progress.is_enabled()
+        && inner.effective_encoding() == TextEncoding::Utf8
+    {
+        let bt = inner.db_set.slots_mut()[0].btree.as_mut().unwrap();
+        let (scratch_rec, scratch_old) = write_vm_scratch.scratch_buffers_mut();
+        match execute_single_row_delete_plan(del_plan, params, scratch_rec, scratch_old, bt) {
+            Ok(changed) => {
+                inner
+                    .progress
+                    .add_ticks_without_handler(prog.ops.len() as u64);
+                (Ok(()), inner.runtime.last_insert_rowid, changed)
             }
             Err(e) => (Err(e), inner.runtime.last_insert_rowid, 0u64),
         }
@@ -10657,5 +11816,249 @@ mod tests {
                 .get_i64(0),
             Some(3)
         );
+    }
+
+    #[test]
+    fn test_morsel_row_inline_sso_and_heap_parity() {
+        // Test 0..=8 columns and 0..=64-byte ASCII + multi-byte UTF-8 strings across all Row getters
+        for ncols in 0..=8usize {
+            for str_len in [0usize, 1, 15, 21, 22, 23, 32, 64] {
+                let s = if str_len >= 4 {
+                    let mut u = String::from("ç🦀"); // 6 bytes
+                    while u.len() < str_len {
+                        u.push('x');
+                    }
+                    while !u.is_char_boundary(str_len) {
+                        u.push('y');
+                    }
+                    u[..str_len].to_owned()
+                } else {
+                    "z".repeat(str_len)
+                };
+                let vals: Vec<Value> = (0..ncols)
+                    .map(|ci| match ci % 5 {
+                        0 => Value::Text(s.clone()),
+                        1 => Value::Integer(ci as i64 * 101 - 50),
+                        2 => Value::real(ci as f64 * 1.25),
+                        3 => Value::Blob(vec![0x5Au8; str_len]),
+                        _ => Value::Null,
+                    })
+                    .collect();
+
+                let row_from_slice = Row::from_slice(&vals);
+                let row_heap = Row::new(vals.clone());
+                assert_eq!(row_from_slice.len(), ncols);
+                assert_eq!(row_from_slice.is_empty(), ncols == 0);
+                assert_eq!(row_from_slice, row_heap);
+                assert_eq!(row_from_slice.clone(), row_heap);
+
+                for (ci, v) in vals.iter().enumerate() {
+                    assert_eq!(row_from_slice.get_str(ci), v.as_str());
+                    let want_blob = match v {
+                        Value::Blob(b) => Some(b.as_slice()),
+                        _ => None,
+                    };
+                    assert_eq!(row_from_slice.get_blob(ci), want_blob);
+                    assert_eq!(row_from_slice.get_i64(ci), v.as_i64());
+                    assert_eq!(row_from_slice.get_f64(ci), v.as_f64());
+                    assert_eq!(row_from_slice.get(ci), Some(v));
+                    assert_eq!(&row_from_slice[ci], v);
+                }
+                assert!(row_from_slice.get_ref(ncols).is_none());
+                assert_eq!(row_from_slice.values(), vals.as_slice());
+                assert_eq!(row_from_slice.into_values(), vals);
+            }
+        }
+    }
+
+    #[test]
+    fn test_morsel_jsonb_scratch_rtree_savepoint_and_single_row_dml() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        // 1. JSONB scratch reuse (`SingleRowInsertPlan` jsonb(?2) + jsonb('const'), `->>` grouping, `jsonb_set`, `json_each`)
+        conn.execute_batch(
+            "CREATE TABLE jdocs(id INTEGER PRIMARY KEY, doc BLOB NOT NULL, meta BLOB NOT NULL);",
+        )
+        .unwrap();
+        let mut ins = conn
+            .prepare("INSERT INTO jdocs VALUES (?1, jsonb(?2), jsonb('{\"fixed\":true}'))")
+            .unwrap();
+        for i in 1..=60i64 {
+            let tier = if i % 2 == 0 { "gold" } else { "silver" };
+            ins.bind(1, i).unwrap();
+            ins.bind(
+                2,
+                format!("{{\"tier\":\"{tier}\",\"amt\":{},\"arr\":[1,2,3]}}", i * 10),
+            )
+            .unwrap();
+            assert_eq!(ins.step().unwrap(), StepResult::Done);
+            ins.reset().unwrap();
+        }
+        ins.finalize().unwrap();
+
+        let grp = conn
+            .query(
+                "SELECT doc ->> '$.tier' AS t, count(*), sum(CAST(doc ->> '$.amt' AS INTEGER)) \
+                 FROM jdocs GROUP BY t ORDER BY t",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(grp.rows.len(), 2);
+        assert_eq!(grp.rows[0].get_str(0), Some("gold"));
+        assert_eq!(grp.rows[0].get_i64(1), Some(30));
+        assert_eq!(grp.rows[0].get_i64(2), Some(9300));
+        assert_eq!(grp.rows[1].get_str(0), Some("silver"));
+        assert_eq!(grp.rows[1].get_i64(1), Some(30));
+        assert_eq!(grp.rows[1].get_i64(2), Some(9000));
+
+        conn.execute_batch("UPDATE jdocs SET doc = jsonb_set(doc, '$.amt', 999) WHERE id <= 5;")
+            .unwrap();
+        let je_sum = conn
+            .query_row(
+                "SELECT sum(CAST(je.value AS INTEGER)) FROM jdocs, json_each(jdocs.doc, '$.arr') je WHERE jdocs.id <= 10",
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(je_sum.get_i64(0), Some(60));
+
+        // 2. SingleRowUpdatePlan (`Value` + `ColArith` `col + ?`, `col - ?`, shrinking/growing, NOT NULL, secondary index) & SingleRowDeletePlan & ArenaIndexEntry ties
+        conn.execute_batch(
+            "CREATE TABLE accounts(
+                id INTEGER PRIMARY KEY,
+                grp INTEGER NOT NULL,
+                bal INTEGER NOT NULL,
+                tag TEXT NOT NULL,
+                note TEXT NOT NULL
+            );
+            INSERT INTO accounts VALUES
+                (1, 10, 100, 'A-01', 'short'),
+                (2, 10, 100, 'A-01', 'medium-length-note-payload'),
+                (3, 20, 250, 'B-02', 'another-note');
+            CREATE INDEX idx_acc_grp_bal ON accounts(grp, bal);
+            CREATE INDEX idx_acc_tag ON accounts(tag);",
+        )
+        .unwrap();
+
+        let mut upd_arith = conn
+            .prepare("UPDATE accounts SET bal = bal + ?1, tag = ?2 WHERE id = ?3")
+            .unwrap();
+        upd_arith.bind(1, 55i64).unwrap();
+        upd_arith.bind(2, "Z-99").unwrap();
+        upd_arith.bind(3, 1i64).unwrap();
+        assert_eq!(upd_arith.step().unwrap(), StepResult::Done);
+        upd_arith.reset().unwrap();
+
+        // Missing rowid is a clean 0-change no-op
+        upd_arith.bind(1, 10i64).unwrap();
+        upd_arith.bind(2, "NOOP").unwrap();
+        upd_arith.bind(3, 999i64).unwrap();
+        assert_eq!(upd_arith.step().unwrap(), StepResult::Done);
+        assert_eq!(conn.changes(), 0);
+
+        // NOT NULL constraint violation aborts cleanly without corrupting indexes
+        upd_arith.reset().unwrap();
+        upd_arith.bind(1, Value::Null).unwrap();
+        upd_arith.bind(2, "Z-99").unwrap();
+        upd_arith.bind(3, 1i64).unwrap();
+        assert_eq!(upd_arith.step().unwrap_err().code, ErrorCode::Constraint);
+        assert_eq!(
+            upd_arith.finalize().unwrap_err().code,
+            ErrorCode::Constraint
+        );
+
+        let mut del_stmt = conn.prepare("DELETE FROM accounts WHERE id = ?1").unwrap();
+        del_stmt.bind(1, 2i64).unwrap();
+        assert_eq!(del_stmt.step().unwrap(), StepResult::Done);
+        assert_eq!(conn.changes(), 1);
+        del_stmt.finalize().unwrap();
+
+        assert_eq!(
+            conn.query_row("SELECT bal, tag FROM accounts WHERE tag = 'Z-99'", &[])
+                .unwrap()
+                .unwrap()
+                .get_i64(0),
+            Some(155)
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA integrity_check;", &[])
+                .unwrap()
+                .unwrap()
+                .get_str(0),
+            Some("ok")
+        );
+
+        // 3. R-Tree decoded node cache, splits, savepoint rollback, duplicate rowid abort, and `rtreecheck`
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE boxes USING rtree(id, minX, maxX, minY, maxY);
+             BEGIN;",
+        )
+        .unwrap();
+        for id in 1..=120i64 {
+            let x = (id % 15) as f64 * 4.0;
+            let y = (id / 15) as f64 * 4.0;
+            conn.execute_params(
+                "INSERT INTO boxes VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    Value::Integer(id),
+                    Value::real(x),
+                    Value::real(x + 3.0),
+                    Value::real(y),
+                    Value::real(y + 3.0),
+                ],
+            )
+            .unwrap();
+        }
+        // Duplicate rowid inside BEGIN..COMMIT aborts statement only and leaves tree consistent
+        let dup = conn
+            .execute("INSERT INTO boxes VALUES (50, 0, 1, 0, 1);")
+            .unwrap_err();
+        assert_eq!(dup.code, ErrorCode::Constraint);
+
+        // Nested SAVEPOINT with additional splits + deletes, then ROLLBACK TO!
+        conn.execute_batch("SAVEPOINT sp_rtree;").unwrap();
+        for id in 121..=220i64 {
+            let x = (id % 20) as f64 * 2.0;
+            conn.execute_params(
+                "INSERT INTO boxes VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    Value::Integer(id),
+                    Value::real(x),
+                    Value::real(x + 5.0),
+                    Value::real(0.0),
+                    Value::real(5.0),
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "DELETE FROM boxes WHERE id <= 30; ROLLBACK TO sp_rtree; RELEASE sp_rtree; COMMIT;",
+        )
+        .unwrap();
+
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM boxes;", &[])
+                .unwrap()
+                .unwrap()
+                .get_i64(0),
+            Some(120)
+        );
+        assert_eq!(
+            conn.query_row("SELECT rtreecheck('boxes');", &[])
+                .unwrap()
+                .unwrap()
+                .get_str(0),
+            Some("ok")
+        );
+        let hits = conn
+            .query_row(
+                "SELECT count(*) FROM boxes WHERE maxX >= 8.0 AND minX <= 16.0 AND maxY >= 4.0 AND minY <= 12.0;",
+                &[],
+            )
+            .unwrap()
+            .unwrap()
+            .get_i64(0)
+            .unwrap();
+        assert!(hits > 0);
     }
 }

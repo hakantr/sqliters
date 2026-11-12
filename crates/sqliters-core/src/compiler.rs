@@ -14,7 +14,8 @@ use sqliters_types::{
 };
 use sqliters_vdbe::{
     AggregateKind, InsertValSource, Instruction, Opcode, P4, PointProjCol, RowidKeySource,
-    RowidPointSelectPlan, SingleRowInsertCol, SingleRowInsertIndex, SingleRowInsertPlan,
+    RowidPointSelectPlan, SingleRowDeletePlan, SingleRowInsertCol, SingleRowInsertIndex,
+    SingleRowInsertPlan, SingleRowUpdateAssign, SingleRowUpdatePlan, SingleRowUpdateRhs,
     VdbeProgram, affinity_to_p5, sqlite_compare_affinity,
 };
 
@@ -3351,6 +3352,21 @@ fn expr_to_insert_val_source(
                     *has_builtin_jsonb = true;
                     return Some(InsertValSource::JsonbParam1Based(p));
                 }
+            } else if let Some(InsertValSource::Null) =
+                expr_to_insert_val_source(&es[0], false, has_builtin_jsonb)
+            {
+                *has_builtin_jsonb = true;
+                return Some(InsertValSource::JsonbConstOk(Value::Null));
+            } else if let Some(InsertValSource::Const(lit)) =
+                expr_to_insert_val_source(&es[0], false, has_builtin_jsonb)
+            {
+                *has_builtin_jsonb = true;
+                let mut jb = Vec::new();
+                return match sqliters_types::eval_jsonb_value_into(&lit, &mut jb) {
+                    Ok(true) => Some(InsertValSource::JsonbConstOk(Value::Blob(jb))),
+                    Ok(false) => Some(InsertValSource::JsonbConstOk(Value::Null)),
+                    Err(_) => Some(InsertValSource::JsonbConstErr(lit)),
+                };
             }
             None
         }
@@ -3584,6 +3600,46 @@ pub fn try_compile_delete_in_db_set(
     prog.patch_p2(init_addr, body_start);
     if !prog.has_function_call() {
         prog.set_needs_stmt_subsavepoint(false);
+    }
+    if db_id == DatabaseId::MAIN
+        && is_pure_single_eq
+        && n_cols <= 32
+        && indexes.iter().all(|idx| idx.columns.len() <= 15)
+    {
+        let mut dummy_jb = false;
+        if let Some(key_src) = expr_to_insert_val_source(&key_expr, false, &mut dummy_jb) {
+            let mut max_needed_col: Option<usize> = None;
+            let plan_indexes = indexes
+                .iter()
+                .map(|idx| {
+                    let col_slots = idx
+                        .columns
+                        .iter()
+                        .map(|ic| {
+                            let ci = ic.col_idx.expect("validated col_idx");
+                            if tbl.rowid_alias_col == Some(ci) {
+                                None
+                            } else {
+                                max_needed_col = Some(max_needed_col.map_or(ci, |m| m.max(ci)));
+                                Some(ci)
+                            }
+                        })
+                        .collect();
+                    SingleRowInsertIndex {
+                        root_pgno: idx.root_pgno,
+                        orders: idx.key_sort_orders(),
+                        col_slots,
+                    }
+                })
+                .collect();
+            prog.set_single_row_delete(Some(SingleRowDeletePlan {
+                db: db_id,
+                root_pgno: tbl.root_pgno,
+                key_src,
+                indexes: plan_indexes,
+                max_needed_col,
+            }));
+        }
     }
     Ok(Some(prog))
 }
@@ -3922,6 +3978,123 @@ pub fn try_compile_update_in_db_set(
     prog.patch_p2(init_addr, body_start);
     if can_elide_stmt_sp {
         prog.set_needs_stmt_subsavepoint(false);
+    }
+    if db_id == DatabaseId::MAIN
+        && is_pure_single_eq
+        && can_elide_stmt_sp
+        && n_cols <= 16
+        && affected_indexes.iter().all(|idx| idx.columns.len() <= 15)
+    {
+        let mut dummy_jb = false;
+        if let Some(key_src) = expr_to_insert_val_source(&key_expr, false, &mut dummy_jb) {
+            let mut plan_assigns = Vec::with_capacity(assigned_exprs.len());
+            let mut all_ok = true;
+            let resolve_tbl_col = |e: &Expr| -> Option<usize> {
+                if let Expr::Column(cref) = e
+                    && cref_matches_single_table(cref, &tbl, slot_name, alias)
+                    && let Some((src_ci, _)) = tbl.find_column(&cref.column)
+                {
+                    Some(src_ci)
+                } else {
+                    None
+                }
+            };
+            for &(ci, expr) in &assigned_exprs {
+                let rhs_opt =
+                    if let Some(src) = expr_to_insert_val_source(expr, false, &mut dummy_jb) {
+                        Some(SingleRowUpdateRhs::Value(src))
+                    } else if let Expr::Binary { left, op, right } = expr {
+                        match op {
+                            BinaryOp::Add => {
+                                if let Some(src_col) = resolve_tbl_col(left)
+                                    && let Some(rhs_src) =
+                                        expr_to_insert_val_source(right, false, &mut dummy_jb)
+                                {
+                                    Some(SingleRowUpdateRhs::ColArith {
+                                        src_col,
+                                        op: Opcode::Add,
+                                        rhs: rhs_src,
+                                    })
+                                } else if let Some(src_col) = resolve_tbl_col(right)
+                                    && let Some(lhs_src) =
+                                        expr_to_insert_val_source(left, false, &mut dummy_jb)
+                                {
+                                    Some(SingleRowUpdateRhs::ColArith {
+                                        src_col,
+                                        op: Opcode::Add,
+                                        rhs: lhs_src,
+                                    })
+                                } else {
+                                    None
+                                }
+                            }
+                            BinaryOp::Subtract => {
+                                if let Some(src_col) = resolve_tbl_col(left)
+                                    && let Some(rhs_src) =
+                                        expr_to_insert_val_source(right, false, &mut dummy_jb)
+                                {
+                                    Some(SingleRowUpdateRhs::ColArith {
+                                        src_col,
+                                        op: Opcode::Subtract,
+                                        rhs: rhs_src,
+                                    })
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                if let Some(rhs) = rhs_opt {
+                    plan_assigns.push(SingleRowUpdateAssign {
+                        col_idx: ci,
+                        rhs,
+                        affinity: tbl.columns[ci].affinity,
+                        notnull_msg: tbl.columns[ci].not_null.is_some().then(|| {
+                            format!(
+                                "NOT NULL constraint failed: {}.{}",
+                                tbl.name, tbl.columns[ci].name
+                            )
+                        }),
+                    });
+                } else {
+                    all_ok = false;
+                    break;
+                }
+            }
+            if all_ok {
+                let plan_indexes = affected_indexes
+                    .iter()
+                    .map(|idx| SingleRowInsertIndex {
+                        root_pgno: idx.root_pgno,
+                        orders: idx.key_sort_orders(),
+                        col_slots: idx
+                            .columns
+                            .iter()
+                            .map(|ic| {
+                                let ci = ic.col_idx.expect("validated col_idx");
+                                if tbl.rowid_alias_col == Some(ci) {
+                                    None
+                                } else {
+                                    Some(ci)
+                                }
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                prog.set_single_row_update(Some(SingleRowUpdatePlan {
+                    db: db_id,
+                    root_pgno: tbl.root_pgno,
+                    n_cols,
+                    rowid_alias_col: tbl.rowid_alias_col,
+                    key_src,
+                    assignments: plan_assigns,
+                    affected_indexes: plan_indexes,
+                }));
+            }
+        }
     }
     Ok(Some(prog))
 }
@@ -4911,12 +5084,12 @@ fn compile_single_table_select(
                 }
             }
             if all_simple {
-                prog.set_rowid_point_select(Some(RowidPointSelectPlan {
-                    db: db_id,
-                    root_pgno: tbl.root_pgno,
+                prog.set_rowid_point_select(Some(RowidPointSelectPlan::new(
+                    db_id,
+                    tbl.root_pgno,
                     key,
-                    cols: proj_cols,
-                }));
+                    proj_cols,
+                )));
             }
         }
     }

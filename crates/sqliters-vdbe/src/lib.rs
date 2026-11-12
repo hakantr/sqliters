@@ -9,11 +9,11 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
-pub use sqliters_btree::PointProjCol;
 use sqliters_btree::{Btree, CursorId};
+pub use sqliters_btree::{PointLookupRow, PointProjCol};
 use sqliters_types::{
-    AggregateStepId, Collation, DatabaseId, ErrorCode, ExecutionServices, KeySortOrder, Pgno,
-    Result, RuntimeValue, SqliteError, TextEncoding, TypeAffinity, Value,
+    AggregateStepId, Collation, DatabaseId, ErrorCode, ExecutionServices, InlineRow, KeySortOrder,
+    Pgno, Result, RuntimeValue, SqliteError, TextEncoding, TypeAffinity, Value,
     decode_record_with_encoding, encode_runtime_record_into, fallible_sort_by,
 };
 
@@ -414,6 +414,30 @@ pub struct RowidPointSelectPlan {
     pub root_pgno: Pgno,
     pub key: RowidKeySource,
     pub cols: Vec<PointProjCol>,
+    pub max_col_idx: Option<u16>,
+}
+
+impl RowidPointSelectPlan {
+    pub fn new(
+        db: DatabaseId,
+        root_pgno: Pgno,
+        key: RowidKeySource,
+        cols: Vec<PointProjCol>,
+    ) -> Self {
+        let mut max_col_idx: Option<u16> = None;
+        for c in &cols {
+            if let PointProjCol::Column { col_idx, .. } = c {
+                max_col_idx = Some(max_col_idx.map_or(*col_idx, |m| m.max(*col_idx)));
+            }
+        }
+        Self {
+            db,
+            root_pgno,
+            key,
+            cols,
+            max_col_idx,
+        }
+    }
 }
 
 /// Value source for a single-row direct `INSERT` plan.
@@ -427,6 +451,10 @@ pub enum InsertValSource {
     Param1Based(u32),
     /// Built-in `jsonb(?p)` call on a 1-based bind parameter.
     JsonbParam1Based(u32),
+    /// Pre-encoded built-in `jsonb(<const>)` literal (`Value::Blob` or `Value::Null`).
+    JsonbConstOk(Value),
+    /// Built-in `jsonb(<const>)` literal that failed compile-time validation (error deferred to `step()`).
+    JsonbConstErr(Value),
 }
 
 /// Column specification in a [`SingleRowInsertPlan`].
@@ -460,6 +488,51 @@ pub struct SingleRowInsertPlan {
     pub dup_msg: String,
 }
 
+/// Precompiled direct single-row `DELETE FROM <table> WHERE <rowid/ipk> = <key>` plan
+/// bypassing VDBE opcode dispatch, cursor allocation, and `String` decoding of index columns.
+#[derive(Debug, Clone)]
+pub struct SingleRowDeletePlan {
+    pub db: DatabaseId,
+    pub root_pgno: Pgno,
+    pub key_src: InsertValSource,
+    pub indexes: Vec<SingleRowInsertIndex>,
+    pub max_needed_col: Option<usize>,
+}
+
+/// Right-hand expression of a [`SingleRowUpdateAssign`].
+#[derive(Debug, Clone)]
+pub enum SingleRowUpdateRhs {
+    Value(InsertValSource),
+    ColArith {
+        src_col: usize,
+        op: Opcode,
+        rhs: InsertValSource,
+    },
+}
+
+/// Single assigned column in a [`SingleRowUpdatePlan`].
+#[derive(Debug, Clone)]
+pub struct SingleRowUpdateAssign {
+    pub col_idx: usize,
+    pub rhs: SingleRowUpdateRhs,
+    pub affinity: TypeAffinity,
+    pub notnull_msg: Option<String>,
+}
+
+/// Precompiled direct single-row `UPDATE <table> SET ... WHERE <rowid/ipk> = <key>` plan
+/// bypassing VDBE opcode dispatch, cursor allocation, and `String` decoding/re-encoding of
+/// unmodified table columns.
+#[derive(Debug, Clone)]
+pub struct SingleRowUpdatePlan {
+    pub db: DatabaseId,
+    pub root_pgno: Pgno,
+    pub n_cols: usize,
+    pub rowid_alias_col: Option<usize>,
+    pub key_src: InsertValSource,
+    pub assignments: Vec<SingleRowUpdateAssign>,
+    pub affected_indexes: Vec<SingleRowInsertIndex>,
+}
+
 /// Compiled VDBE bytecode program (`Vdbe` in `vdbeInt.h`).
 #[derive(Debug, Clone)]
 pub struct VdbeProgram {
@@ -475,6 +548,8 @@ pub struct VdbeProgram {
     needs_stmt_subsavepoint: bool,
     rowid_point_select: Option<RowidPointSelectPlan>,
     single_row_insert: Option<SingleRowInsertPlan>,
+    single_row_delete: Option<SingleRowDeletePlan>,
+    single_row_update: Option<SingleRowUpdatePlan>,
 }
 
 impl VdbeProgram {
@@ -492,6 +567,8 @@ impl VdbeProgram {
             needs_stmt_subsavepoint: true,
             rowid_point_select: None,
             single_row_insert: None,
+            single_row_delete: None,
+            single_row_update: None,
         }
     }
 
@@ -503,6 +580,26 @@ impl VdbeProgram {
     #[inline]
     pub fn set_single_row_insert(&mut self, plan: Option<SingleRowInsertPlan>) {
         self.single_row_insert = plan;
+    }
+
+    #[inline(always)]
+    pub fn single_row_delete(&self) -> Option<&SingleRowDeletePlan> {
+        self.single_row_delete.as_ref()
+    }
+
+    #[inline]
+    pub fn set_single_row_delete(&mut self, plan: Option<SingleRowDeletePlan>) {
+        self.single_row_delete = plan;
+    }
+
+    #[inline(always)]
+    pub fn single_row_update(&self) -> Option<&SingleRowUpdatePlan> {
+        self.single_row_update.as_ref()
+    }
+
+    #[inline]
+    pub fn set_single_row_update(&mut self, plan: Option<SingleRowUpdatePlan>) {
+        self.single_row_update = plan;
     }
 
     #[inline(always)]
@@ -679,6 +776,14 @@ impl Default for VdbeProgram {
 /// Outcome of a single `VdbeVm::step()` invocation (`SQLITE_ROW` vs `SQLITE_DONE`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmStep {
+    Row(Vec<Value>),
+    Done,
+}
+
+/// Zero-heap-capable outcome of [`VdbeVm::step_out`].
+#[derive(Debug, Clone)]
+pub enum VmStepOut {
+    InlineRow(InlineRow),
     Row(Vec<Value>),
     Done,
 }
@@ -906,6 +1011,14 @@ impl VdbeWriteScratch {
     pub fn scratch_buffers_mut(&mut self) -> (&mut Vec<u8>, &mut Vec<u8>) {
         (&mut self.pool.scratch_rec, &mut self.scratch_jsonb)
     }
+
+    /// Returns `true` when none of the reusable scratch buffers have allocated heap capacity yet.
+    #[inline(always)]
+    pub fn is_empty_capacity(&self) -> bool {
+        self.regs.capacity() == 0
+            && self.pool.scratch_rec.capacity() == 0
+            && self.scratch_jsonb.capacity() == 0
+    }
 }
 
 #[inline]
@@ -1065,8 +1178,8 @@ impl VdbeVm {
         close_cursors_vec(&mut scratch.cursors, storage);
         scratch.pool.clear_registers(&mut scratch.regs[..n_regs]);
         match res {
-            Ok(VmStep::Done) => Ok(()),
-            Ok(VmStep::Row(_)) => Err(SqliteError::misuse(
+            Ok(VmStepOut::Done) => Ok(()),
+            Ok(VmStepOut::InlineRow(_)) | Ok(VmStepOut::Row(_)) => Err(SqliteError::misuse(
                 "unexpected ResultRow in write VDBE program",
             )),
             Err(err) => Err(err),
@@ -1102,14 +1215,14 @@ impl VdbeVm {
         self.regs.get(idx)
     }
 
-    /// Executes bytecode instructions until either `OP_ResultRow` yields a row or `OP_Halt` completes execution.
-    pub fn step(
+    /// Executes bytecode instructions until `OP_ResultRow` yields an inline or heap row, or `OP_Halt` completes execution.
+    pub fn step_out(
         &mut self,
         storage: &mut dyn BtreeAccess,
         services: &mut dyn ExecutionServices,
-    ) -> Result<VmStep> {
+    ) -> Result<VmStepOut> {
         if self.halted {
-            return Ok(VmStep::Done);
+            return Ok(VmStepOut::Done);
         }
         match step_ops(
             &self.program.ops,
@@ -1123,17 +1236,31 @@ impl VdbeVm {
             storage,
             services,
         ) {
-            Ok(VmStep::Row(row)) => Ok(VmStep::Row(row)),
-            Ok(VmStep::Done) => {
+            Ok(VmStepOut::InlineRow(row)) => Ok(VmStepOut::InlineRow(row)),
+            Ok(VmStepOut::Row(row)) => Ok(VmStepOut::Row(row)),
+            Ok(VmStepOut::Done) => {
                 self.halted = true;
                 self.close_cursors(storage);
-                Ok(VmStep::Done)
+                Ok(VmStepOut::Done)
             }
             Err(err) => {
                 self.halted = true;
                 self.close_cursors(storage);
                 Err(err)
             }
+        }
+    }
+
+    /// Executes bytecode instructions until either `OP_ResultRow` yields a row or `OP_Halt` completes execution.
+    pub fn step(
+        &mut self,
+        storage: &mut dyn BtreeAccess,
+        services: &mut dyn ExecutionServices,
+    ) -> Result<VmStep> {
+        match self.step_out(storage, services)? {
+            VmStepOut::InlineRow(inline) => Ok(VmStep::Row(inline.to_vec_values())),
+            VmStepOut::Row(row) => Ok(VmStep::Row(row)),
+            VmStepOut::Done => Ok(VmStep::Done),
         }
     }
 }
@@ -1150,7 +1277,7 @@ fn step_ops(
     runtime_ctx: &mut VmRuntimeContext,
     storage: &mut dyn BtreeAccess,
     services: &mut dyn ExecutionServices,
-) -> Result<VmStep> {
+) -> Result<VmStepOut> {
     let mut local_ticks = 0u64;
     let res = step_ops_loop(
         ops,
@@ -1184,7 +1311,7 @@ fn step_ops_loop(
     storage: &mut dyn BtreeAccess,
     services: &mut dyn ExecutionServices,
     local_ticks: &mut u64,
-) -> Result<VmStep> {
+) -> Result<VmStepOut> {
     let empty_orders: Arc<[KeySortOrder]> = Arc::from([]);
     let mut fast_poll = services.fast_interrupt_and_no_progress();
     while *pc < ops.len() {
@@ -1222,7 +1349,7 @@ fn step_ops_loop(
                     };
                     return Err(SqliteError::with_extended(ins.p1, msg));
                 }
-                return Ok(VmStep::Done);
+                return Ok(VmStepOut::Done);
             }
             Opcode::Transaction => {
                 let db = if ins.db != DatabaseId::MAIN {
@@ -1753,6 +1880,15 @@ fn step_ops_loop(
             Opcode::ResultRow => {
                 let start = ins.p1 as usize;
                 let count = ins.p2 as usize;
+                if let Some(inline_row) =
+                    InlineRow::try_from_runtime_values(&regs[start..start + count])
+                {
+                    if ins.p5 != 0 {
+                        pool.clear_registers(&mut regs[start..start + count]);
+                    }
+                    *pc = next_pc;
+                    return Ok(VmStepOut::InlineRow(inline_row));
+                }
                 let row: Vec<Value> = if ins.p5 != 0 {
                     let mut out = Vec::with_capacity(count);
                     for rv in &mut regs[start..start + count] {
@@ -1766,7 +1902,7 @@ fn step_ops_loop(
                         .collect()
                 };
                 *pc = next_pc;
-                return Ok(VmStep::Row(row));
+                return Ok(VmStepOut::Row(row));
             }
             Opcode::Integer => {
                 regs[ins.p2 as usize] = RuntimeValue::plain(Value::Integer(i64::from(ins.p1)));
@@ -2129,7 +2265,7 @@ fn step_ops_loop(
     }
 
     *halted = true;
-    Ok(VmStep::Done)
+    Ok(VmStepOut::Done)
 }
 
 pub fn eval_arith(op: Opcode, lhs: &Value, rhs: &Value) -> Value {

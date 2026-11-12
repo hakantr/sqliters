@@ -6,15 +6,16 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 
-use sqliters_btree::Btree;
+use sqliters_btree::{Btree, IndexScanItem, MorselStep};
 use sqliters_syntax::{
     BinaryOp, BindParam, ColumnRef, Expr, FromClause, FunctionArgs, IndexHint, JoinConstraint,
     JoinType, LikeOp, LimitClause, OrderByTerm, ResultColumn, SelectCore, SelectStmt,
     TableOrSubquery, UnaryOp,
 };
 use sqliters_types::{
-    Collation, CompiledJsonArrowPath, DatabaseId, ErrorCode, KeySortOrder, Pgno, RawField, Result,
-    RuntimeValue, SqliteError, TextEncoding, TypeAffinity, Value, fallible_sort_by,
+    Collation, CompiledJsonArrowPath, DatabaseId, ErrorCode, FastJsonIntOut, INLINE_ROW_COLS,
+    InlineRow, InlineVal, KeySortOrder, Pgno, RawField, Result, RuntimeValue, SqliteError,
+    TextEncoding, TypeAffinity, Value, append_runtime_value_json_elem, fallible_sort_by,
     format_sqlite_real, parse_raw_record_prefix,
 };
 use sqliters_vdbe::{
@@ -569,6 +570,21 @@ impl FastScalarRhs {
             Self::Param(idx) => params.get(*idx).unwrap_or(&Value::Null),
         }
     }
+
+    fn same_source(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Param(a), Self::Param(b)) => a == b,
+            (Self::Const(a), Self::Const(b)) => match (a, b) {
+                (Value::Null, Value::Null) => true,
+                (Value::Integer(x), Value::Integer(y)) => x == y,
+                (Value::Real(x), Value::Real(y)) => x.to_bits() == y.to_bits(),
+                (Value::Text(x), Value::Text(y)) => x == y,
+                (Value::Blob(x), Value::Blob(y)) => x == y,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -955,8 +971,35 @@ impl FastExpr {
                 rhs,
             } => {
                 let cf = ctx.get_col(*col);
-                let extracted = path.eval_raw_field(cf, ctx.enc, *as_text)?.value;
                 let rv = rhs.resolve(ctx.params);
+                match path.eval_raw_field_int_fast(cf, *as_text)? {
+                    FastJsonIntOut::Int(li) => {
+                        if let Value::Integer(ri) = rv {
+                            return Ok(op.matches_ordering(li.cmp(ri)));
+                        }
+                        let lv = Value::Integer(li);
+                        if matches!(op, FastCmpOp::Is | FastCmpOp::IsNot) {
+                            let eq = !rv.is_null()
+                                && lv.cmp_sqlite_with_encoding(rv, Collation::Binary, ctx.enc)
+                                    == Ordering::Equal;
+                            return Ok(if *op == FastCmpOp::Is { eq } else { !eq });
+                        }
+                        if rv.is_null() {
+                            return Ok(false);
+                        }
+                        let ord = lv.cmp_sqlite_with_encoding(rv, Collation::Binary, ctx.enc);
+                        return Ok(op.matches_ordering(ord));
+                    }
+                    FastJsonIntOut::Null => {
+                        if matches!(op, FastCmpOp::Is | FastCmpOp::IsNot) {
+                            let eq = rv.is_null();
+                            return Ok(if *op == FastCmpOp::Is { eq } else { !eq });
+                        }
+                        return Ok(false);
+                    }
+                    FastJsonIntOut::Fallback => {}
+                }
+                let extracted = path.eval_raw_field(cf, ctx.enc, *as_text)?.value;
                 if let (Value::Integer(li), Value::Integer(ri)) = (&extracted, rv) {
                     return Ok(op.matches_ordering(li.cmp(ri)));
                 }
@@ -1013,11 +1056,19 @@ impl FastExpr {
                 Ok(())
             }
             Self::JsonArrow { col, path, as_text } => {
-                let v = path
-                    .eval_raw_field(ctx.get_col(*col), ctx.enc, *as_text)?
-                    .value;
-                acc.step_value(&v);
-                Ok(())
+                let cf = ctx.get_col(*col);
+                match path.eval_raw_field_int_fast(cf, *as_text)? {
+                    FastJsonIntOut::Int(i) => {
+                        acc.step_i64(i);
+                        Ok(())
+                    }
+                    FastJsonIntOut::Null => Ok(()),
+                    FastJsonIntOut::Fallback => {
+                        let v = path.eval_raw_field(cf, ctx.enc, *as_text)?.value;
+                        acc.step_value(&v);
+                        Ok(())
+                    }
+                }
             }
             Self::ArithCols { left, op, right } => {
                 let lf = ctx.get_col(*left);
@@ -1393,6 +1444,40 @@ impl FastExpr {
                 path.eval_raw_field(ctx.get_col(*col), ctx.enc, *as_text)
             }
             _ => Ok(RuntimeValue::plain(self.eval_value(ctx)?)),
+        }
+    }
+
+    #[inline]
+    fn eval_inline_or_value(
+        &self,
+        ctx: &FastRowCtx<'_>,
+    ) -> Result<std::result::Result<InlineVal, Value>> {
+        match self {
+            Self::Col(c) => {
+                let rf = ctx.get_col(*c);
+                Ok(InlineVal::try_from_raw_field(rf, ctx.enc)
+                    .ok_or_else(|| rf.to_owned_value(ctx.enc)))
+            }
+            Self::JsonArrow { col, path, as_text } => {
+                path.eval_raw_field_inline(ctx.get_col(*col), ctx.enc, *as_text)
+            }
+            _ => {
+                let v = self.eval_value(ctx)?;
+                Ok(InlineVal::try_from_value(&v).ok_or(v))
+            }
+        }
+    }
+
+    #[inline]
+    fn append_json_elem(&self, ctx: &FastRowCtx<'_>, out: &mut String) -> Result<()> {
+        match self {
+            Self::JsonArrow { col, path, as_text } => {
+                path.append_raw_field_json_elem(ctx.get_col(*col), ctx.enc, *as_text, out)
+            }
+            _ => {
+                let rv = self.eval_runtime_value(ctx)?;
+                append_runtime_value_json_elem(&rv, out)
+            }
         }
     }
 
@@ -2576,14 +2661,16 @@ where
     } else {
         0
     };
-    let mut tbl_cols: Vec<RawField<'_>> = vec![RawField::Null; col_buf_len];
 
     match access {
         FastSingleAccess::TableFullScan => {
             bt.scan_table_range_raw_cells(td.root_pgno, None, None, |rowid, payload| {
-                // Short-lived borrow scoped strictly to this closure invocation:
-                let mut local_cols: [RawField<'_>; 16] = [RawField::Null; 16];
-                if col_buf_len <= 16 {
+                if col_buf_len <= 4 {
+                    let mut local_cols: [RawField<'_>; 4] = [RawField::Null; 4];
+                    td.fill_from_table_payload(payload, &mut local_cols[..col_buf_len])?;
+                    visit(rowid, &local_cols[..col_buf_len])
+                } else if col_buf_len <= 16 {
+                    let mut local_cols: [RawField<'_>; 16] = [RawField::Null; 16];
                     td.fill_from_table_payload(payload, &mut local_cols[..col_buf_len])?;
                     visit(rowid, &local_cols[..col_buf_len])
                 } else {
@@ -2599,8 +2686,12 @@ where
                 return Ok(());
             };
             let _ = bt.with_table_rowid_raw_cell(td.root_pgno, rid, |payload| {
-                let mut local_cols: [RawField<'_>; 16] = [RawField::Null; 16];
-                if col_buf_len <= 16 {
+                if col_buf_len <= 4 {
+                    let mut local_cols: [RawField<'_>; 4] = [RawField::Null; 4];
+                    td.fill_from_table_payload(payload, &mut local_cols[..col_buf_len])?;
+                    let _ = visit(rid, &local_cols[..col_buf_len])?;
+                } else if col_buf_len <= 16 {
+                    let mut local_cols: [RawField<'_>; 16] = [RawField::Null; 16];
                     td.fill_from_table_payload(payload, &mut local_cols[..col_buf_len])?;
                     let _ = visit(rid, &local_cols[..col_buf_len])?;
                 } else {
@@ -2634,8 +2725,12 @@ where
                 None
             };
             bt.scan_table_range_raw_cells(td.root_pgno, min_rid, max_rid, |rowid, payload| {
-                let mut local_cols: [RawField<'_>; 16] = [RawField::Null; 16];
-                if col_buf_len <= 16 {
+                if col_buf_len <= 4 {
+                    let mut local_cols: [RawField<'_>; 4] = [RawField::Null; 4];
+                    td.fill_from_table_payload(payload, &mut local_cols[..col_buf_len])?;
+                    visit(rowid, &local_cols[..col_buf_len])
+                } else if col_buf_len <= 16 {
+                    let mut local_cols: [RawField<'_>; 16] = [RawField::Null; 16];
                     td.fill_from_table_payload(payload, &mut local_cols[..col_buf_len])?;
                     visit(rowid, &local_cols[..col_buf_len])
                 } else {
@@ -2646,11 +2741,20 @@ where
             })
         }
         FastSingleAccess::CoveringIndexFullScan { cov } => {
-            let _ = &mut tbl_cols;
             bt.scan_index_raw_cells(cov.root_pgno, false, |cell| {
-                let mut idx_local: [RawField<'_>; 16] = [RawField::Null; 16];
-                let mut tbl_local: [RawField<'_>; 16] = [RawField::Null; 16];
-                if cov.parse_prefix_len <= 16 && col_buf_len <= 16 {
+                if cov.parse_prefix_len <= 4 && col_buf_len <= 4 {
+                    let mut idx_local: [RawField<'_>; 4] = [RawField::Null; 4];
+                    let mut tbl_local: [RawField<'_>; 4] = [RawField::Null; 4];
+                    let rid = decode_covering_cell(
+                        cov,
+                        cell,
+                        &mut idx_local[..cov.parse_prefix_len],
+                        &mut tbl_local[..col_buf_len],
+                    )?;
+                    visit(rid, &tbl_local[..col_buf_len])
+                } else if cov.parse_prefix_len <= 16 && col_buf_len <= 16 {
+                    let mut idx_local: [RawField<'_>; 16] = [RawField::Null; 16];
+                    let mut tbl_local: [RawField<'_>; 16] = [RawField::Null; 16];
                     let rid = decode_covering_cell(
                         cov,
                         cell,
@@ -2674,14 +2778,28 @@ where
             lower,
             upper,
         } => {
-            let mut prefix_vals: Vec<Value> = Vec::with_capacity(prefix_keys.len());
-            for (k, &aff) in prefix_keys.iter().zip(prefix_affinities.iter()) {
-                let coerced = apply_index_seek_affinity(aff, k.resolve(params).clone());
-                if coerced.is_null() {
-                    return Ok(());
+            let mut prefix_stack: [Value; 4] = [Value::Null, Value::Null, Value::Null, Value::Null];
+            let mut prefix_heap: Vec<Value> = Vec::new();
+            let prefix_slice: &[Value] = if prefix_keys.len() <= 4 {
+                for (i, (k, &aff)) in prefix_keys.iter().zip(prefix_affinities.iter()).enumerate() {
+                    let coerced = apply_index_seek_affinity(aff, k.resolve(params).clone());
+                    if coerced.is_null() {
+                        return Ok(());
+                    }
+                    prefix_stack[i] = coerced;
                 }
-                prefix_vals.push(coerced);
-            }
+                &prefix_stack[..prefix_keys.len()]
+            } else {
+                prefix_heap.reserve(prefix_keys.len());
+                for (k, &aff) in prefix_keys.iter().zip(prefix_affinities.iter()) {
+                    let coerced = apply_index_seek_affinity(aff, k.resolve(params).clone());
+                    if coerced.is_null() {
+                        return Ok(());
+                    }
+                    prefix_heap.push(coerced);
+                }
+                &prefix_heap
+            };
             let lo_val: Option<(Value, bool)> = if let Some(lb) = lower {
                 let coerced = apply_index_seek_affinity(*range_aff, lb.rhs.resolve(params).clone());
                 if coerced.is_null() {
@@ -2704,15 +2822,25 @@ where
             let hi_ref = hi_val.as_ref().map(|(v, inc)| (v, *inc));
             bt.seek_index_range_raw_cells(
                 cov.root_pgno,
-                &prefix_vals,
+                prefix_slice,
                 lo_ref,
                 hi_ref,
                 &cov.orders,
                 false,
                 |cell| {
-                    let mut idx_local: [RawField<'_>; 16] = [RawField::Null; 16];
-                    let mut tbl_local: [RawField<'_>; 16] = [RawField::Null; 16];
-                    if cov.parse_prefix_len <= 16 && col_buf_len <= 16 {
+                    if cov.parse_prefix_len <= 4 && col_buf_len <= 4 {
+                        let mut idx_local: [RawField<'_>; 4] = [RawField::Null; 4];
+                        let mut tbl_local: [RawField<'_>; 4] = [RawField::Null; 4];
+                        let rid = decode_covering_cell(
+                            cov,
+                            cell,
+                            &mut idx_local[..cov.parse_prefix_len],
+                            &mut tbl_local[..col_buf_len],
+                        )?;
+                        visit(rid, &tbl_local[..col_buf_len])
+                    } else if cov.parse_prefix_len <= 16 && col_buf_len <= 16 {
+                        let mut idx_local: [RawField<'_>; 16] = [RawField::Null; 16];
+                        let mut tbl_local: [RawField<'_>; 16] = [RawField::Null; 16];
                         let rid = decode_covering_cell(
                             cov,
                             cell,
@@ -2849,6 +2977,480 @@ fn compile_group_proj_expr(
 }
 
 // ============================================================================
+// Tight In-Page Integer Morsel Helpers (`MORSEL-2` — `W04`, `W05`, `W14` Q1)
+// ============================================================================
+
+#[derive(Debug, Clone, Copy)]
+enum MorselIntAggSlot {
+    Count,
+    SumCol0,
+    SumCol1,
+}
+
+#[derive(Debug, Clone)]
+struct UngroupedMorselRangeSpec {
+    slots: Box<[MorselIntAggSlot]>,
+}
+
+#[derive(Debug, Clone)]
+struct GroupCol1FilterMorselSpec {
+    rhs: FastScalarRhs,
+    inclusive: bool,
+    slots: Box<[MorselIntAggSlot]>,
+}
+
+#[inline(always)]
+fn small_int_serial_len(st: u8) -> Option<usize> {
+    match st {
+        8 | 9 => Some(0),
+        1 => Some(1),
+        2 => Some(2),
+        3 => Some(3),
+        4 => Some(4),
+        5 => Some(6),
+        6 => Some(8),
+        _ => None,
+    }
+}
+
+#[inline(always)]
+fn decode_int_serial_fast(st: u8, b: &[u8]) -> i64 {
+    match st {
+        8 => 0,
+        9 => 1,
+        1 => i64::from(b[0] as i8),
+        2 => i64::from(i16::from_be_bytes([b[0], b[1]])),
+        3 => i64::from(((b[0] as i8 as i32) << 16) | ((b[1] as i32) << 8) | (b[2] as i32)),
+        4 => i64::from(i32::from_be_bytes([b[0], b[1], b[2], b[3]])),
+        5 => {
+            ((b[0] as i8 as i64) << 40)
+                | ((b[1] as i64) << 32)
+                | ((b[2] as i64) << 24)
+                | ((b[3] as i64) << 16)
+                | ((b[4] as i64) << 8)
+                | (b[5] as i64)
+        }
+        6 => i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        _ => unreachable!(),
+    }
+}
+
+#[inline(always)]
+fn decode_index_col0_int(rec: &[u8]) -> Option<i64> {
+    if rec.len() < 2 {
+        return None;
+    }
+    let hdr_b = rec[0];
+    if hdr_b >= 0x80 {
+        return None;
+    }
+    let hdr_len = hdr_b as usize;
+    if hdr_len < 2 || hdr_len > rec.len() {
+        return None;
+    }
+    let st0 = rec[1];
+    let len0 = small_int_serial_len(st0)?;
+    let end0 = hdr_len + len0;
+    if end0 > rec.len() {
+        return None;
+    }
+    Some(decode_int_serial_fast(st0, &rec[hdr_len..end0]))
+}
+
+#[inline(always)]
+fn decode_index_col0_col1_ints(rec: &[u8]) -> Option<(i64, i64)> {
+    if rec.len() < 3 {
+        return None;
+    }
+    let hdr_b = rec[0];
+    if hdr_b >= 0x80 {
+        return None;
+    }
+    let hdr_len = hdr_b as usize;
+    if hdr_len < 3 || hdr_len > rec.len() {
+        return None;
+    }
+    let st0 = rec[1];
+    let len0 = small_int_serial_len(st0)?;
+    let st1 = rec[2];
+    let len1 = small_int_serial_len(st1)?;
+    let end0 = hdr_len + len0;
+    let end1 = end0 + len1;
+    if end1 > rec.len() {
+        return None;
+    }
+    let v0 = decode_int_serial_fast(st0, &rec[hdr_len..end0]);
+    let v1 = decode_int_serial_fast(st1, &rec[end0..end1]);
+    Some((v0, v1))
+}
+
+#[inline(always)]
+fn decode_index_col1_int_with_int_col0(rec: &[u8]) -> Option<i64> {
+    if rec.len() < 3 {
+        return None;
+    }
+    let hdr_b = rec[0];
+    if hdr_b >= 0x80 {
+        return None;
+    }
+    let hdr_len = hdr_b as usize;
+    if hdr_len < 3 || hdr_len > rec.len() {
+        return None;
+    }
+    let st0 = rec[1];
+    let len0 = small_int_serial_len(st0)?;
+    let st1 = rec[2];
+    let len1 = small_int_serial_len(st1)?;
+    let end0 = hdr_len + len0;
+    let end1 = end0 + len1;
+    if end1 > rec.len() {
+        return None;
+    }
+    Some(decode_int_serial_fast(st1, &rec[end0..end1]))
+}
+
+#[inline(always)]
+fn apply_morsel_int_batch(
+    states: &mut [FastAggState],
+    slots: &[MorselIntAggSlot],
+    batch_cnt: i64,
+    col0_val: i64,
+    batch_sum1: i64,
+) -> bool {
+    if batch_cnt == 0 {
+        return true;
+    }
+    // Pre-validate that every Sum slot can accept the batch without `i64` overflow:
+    let col0_sum_opt = col0_val.checked_mul(batch_cnt);
+    for (st, slot) in states.iter().zip(slots.iter()) {
+        match (st, slot) {
+            (FastAggState::Count(_), MorselIntAggSlot::Count) => {}
+            (FastAggState::Sum(acc), MorselIntAggSlot::SumCol1) => {
+                if !acc.is_exact_int() {
+                    return false;
+                }
+            }
+            (FastAggState::Sum(acc), MorselIntAggSlot::SumCol0) => {
+                if !acc.is_exact_int() || col0_sum_opt.is_none() {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    // Check `i_sum + batch_sum` overflow across all Sum slots before mutating any slot:
+    for (st, slot) in states.iter().zip(slots.iter()) {
+        match (st, slot) {
+            (FastAggState::Sum(acc), MorselIntAggSlot::SumCol1) => {
+                let mut probe = acc.clone();
+                if !probe.try_step_i64_batch(batch_cnt, batch_sum1) {
+                    return false;
+                }
+            }
+            (FastAggState::Sum(acc), MorselIntAggSlot::SumCol0) => {
+                let mut probe = acc.clone();
+                if !probe.try_step_i64_batch(batch_cnt, col0_sum_opt.unwrap()) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    for (st, slot) in states.iter_mut().zip(slots.iter()) {
+        match (st, slot) {
+            (FastAggState::Count(n), MorselIntAggSlot::Count) => *n += batch_cnt,
+            (FastAggState::Sum(acc), MorselIntAggSlot::SumCol1) => {
+                let ok = acc.try_step_i64_batch(batch_cnt, batch_sum1);
+                debug_assert!(ok);
+            }
+            (FastAggState::Sum(acc), MorselIntAggSlot::SumCol0) => {
+                let ok = acc.try_step_i64_batch(batch_cnt, col0_sum_opt.unwrap());
+                debug_assert!(ok);
+            }
+            _ => unreachable!(),
+        }
+    }
+    true
+}
+
+#[inline(always)]
+fn step_morsel_int_single(
+    states: &mut [FastAggState],
+    slots: &[MorselIntAggSlot],
+    col0_val: i64,
+    col1_val: i64,
+) {
+    for (st, slot) in states.iter_mut().zip(slots.iter()) {
+        match (st, slot) {
+            (FastAggState::Count(n), MorselIntAggSlot::Count) => *n += 1,
+            (FastAggState::Sum(acc), MorselIntAggSlot::SumCol0) => acc.step_i64(col0_val),
+            (FastAggState::Sum(acc), MorselIntAggSlot::SumCol1) => acc.step_i64(col1_val),
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn compile_morsel_int_agg_slots(
+    aggs: &[FastAggSpec],
+    col0_tbl: u16,
+    col1_tbl: Option<u16>,
+) -> Option<Box<[MorselIntAggSlot]>> {
+    if aggs.is_empty() || aggs.len() > 4 {
+        return None;
+    }
+    let mut slots = Vec::with_capacity(aggs.len());
+    for a in aggs {
+        match a {
+            FastAggSpec::CountStar => slots.push(MorselIntAggSlot::Count),
+            FastAggSpec::Count(FastExpr::Col(FastColSrc::RecordCol {
+                side: 0,
+                col_idx,
+                is_ipk: false,
+            })) if *col_idx == col0_tbl || Some(*col_idx) == col1_tbl => {
+                slots.push(MorselIntAggSlot::Count);
+            }
+            FastAggSpec::Sum(FastExpr::Col(FastColSrc::RecordCol {
+                side: 0,
+                col_idx,
+                is_ipk: false,
+            }))
+            | FastAggSpec::Total(FastExpr::Col(FastColSrc::RecordCol {
+                side: 0,
+                col_idx,
+                is_ipk: false,
+            }))
+            | FastAggSpec::Avg(FastExpr::Col(FastColSrc::RecordCol {
+                side: 0,
+                col_idx,
+                is_ipk: false,
+            })) => {
+                if Some(*col_idx) == col1_tbl {
+                    slots.push(MorselIntAggSlot::SumCol1);
+                } else if *col_idx == col0_tbl {
+                    slots.push(MorselIntAggSlot::SumCol0);
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(slots.into_boxed_slice())
+}
+
+fn flatten_and_conjuncts<'a>(expr: &'a FastExpr, out: &mut Vec<&'a FastExpr>) {
+    if let FastExpr::And(l, r) = expr {
+        flatten_and_conjuncts(l, out);
+        flatten_and_conjuncts(r, out);
+    } else {
+        out.push(expr);
+    }
+}
+
+fn try_compile_ungrouped_morsel_range_spec(
+    access: &FastSingleAccess,
+    where_pred: Option<&FastExpr>,
+    aggs: &[FastAggSpec],
+) -> Option<UngroupedMorselRangeSpec> {
+    let FastSingleAccess::CoveringIndexRangeScan {
+        cov,
+        prefix_keys,
+        lower,
+        upper,
+        ..
+    } = access
+    else {
+        return None;
+    };
+    if prefix_keys.len() != 1 || cov.idx_to_tbl_col.is_empty() {
+        return None;
+    }
+    let so0 = cov.orders.first()?;
+    if so0.collation != Collation::Binary
+        || so0.custom_collation.is_some()
+        || so0.nulls_last != so0.desc
+    {
+        return None;
+    }
+    let col0_tbl = (*cov.idx_to_tbl_col.first()?)?;
+    let col1_tbl = cov.idx_to_tbl_col.get(1).copied().flatten();
+    if lower.is_some() || upper.is_some() {
+        col1_tbl?;
+        let so1 = cov.orders.get(1)?;
+        if so1.collation != Collation::Binary
+            || so1.custom_collation.is_some()
+            || so1.nulls_last != so1.desc
+        {
+            return None;
+        }
+    }
+    let slots = compile_morsel_int_agg_slots(aggs, col0_tbl, col1_tbl)?;
+    if slots.iter().any(|s| matches!(s, MorselIntAggSlot::SumCol1)) && col1_tbl.is_none() {
+        return None;
+    }
+
+    let wp = where_pred?;
+    let mut conj = Vec::with_capacity(4);
+    flatten_and_conjuncts(wp, &mut conj);
+
+    let mut matched_eq0 = false;
+    let mut matched_lo = lower.is_none();
+    let mut matched_hi = upper.is_none();
+
+    for c in conj {
+        match c {
+            FastExpr::ColCmpRhs {
+                col:
+                    FastColSrc::RecordCol {
+                        side: 0,
+                        col_idx,
+                        is_ipk: false,
+                    },
+                op: FastCmpOp::Eq,
+                rhs,
+                collation: Collation::Binary,
+                ..
+            } if !matched_eq0 && *col_idx == col0_tbl && rhs.same_source(&prefix_keys[0]) => {
+                matched_eq0 = true;
+            }
+            FastExpr::ColBetweenRhs {
+                col:
+                    FastColSrc::RecordCol {
+                        side: 0,
+                        col_idx,
+                        is_ipk: false,
+                    },
+                low,
+                high,
+                negated: false,
+                collation: Collation::Binary,
+                ..
+            } if !matched_lo
+                && !matched_hi
+                && Some(*col_idx) == col1_tbl
+                && lower
+                    .as_ref()
+                    .is_some_and(|lb| lb.inclusive && lb.rhs.same_source(low))
+                && upper
+                    .as_ref()
+                    .is_some_and(|ub| ub.inclusive && ub.rhs.same_source(high)) =>
+            {
+                matched_lo = true;
+                matched_hi = true;
+            }
+            FastExpr::ColCmpRhs {
+                col:
+                    FastColSrc::RecordCol {
+                        side: 0,
+                        col_idx,
+                        is_ipk: false,
+                    },
+                op: op @ (FastCmpOp::Ge | FastCmpOp::Gt),
+                rhs,
+                collation: Collation::Binary,
+                ..
+            } if !matched_lo
+                && Some(*col_idx) == col1_tbl
+                && lower.as_ref().is_some_and(|lb| {
+                    lb.inclusive == matches!(op, FastCmpOp::Ge) && lb.rhs.same_source(rhs)
+                }) =>
+            {
+                matched_lo = true;
+            }
+            FastExpr::ColCmpRhs {
+                col:
+                    FastColSrc::RecordCol {
+                        side: 0,
+                        col_idx,
+                        is_ipk: false,
+                    },
+                op: op @ (FastCmpOp::Le | FastCmpOp::Lt),
+                rhs,
+                collation: Collation::Binary,
+                ..
+            } if !matched_hi
+                && Some(*col_idx) == col1_tbl
+                && upper.as_ref().is_some_and(|ub| {
+                    ub.inclusive == matches!(op, FastCmpOp::Le) && ub.rhs.same_source(rhs)
+                }) =>
+            {
+                matched_hi = true;
+            }
+            _ => return None,
+        }
+    }
+
+    if matched_eq0 && matched_lo && matched_hi {
+        Some(UngroupedMorselRangeSpec { slots })
+    } else {
+        None
+    }
+}
+
+fn try_compile_group_col1_morsel_spec(
+    cov: &FastCoveringIndex,
+    reverse: bool,
+    group_col: FastColSrc,
+    group_collation: Collation,
+    where_pred: Option<&FastExpr>,
+    aggs: &[FastAggSpec],
+) -> Option<GroupCol1FilterMorselSpec> {
+    if reverse || group_collation != Collation::Binary || cov.idx_to_tbl_col.len() < 2 {
+        return None;
+    }
+    let FastColSrc::RecordCol {
+        side: 0,
+        col_idx: gb_tbl_col,
+        is_ipk: false,
+    } = group_col
+    else {
+        return None;
+    };
+    let col0_tbl = cov.idx_to_tbl_col[0]?;
+    let col1_tbl = cov.idx_to_tbl_col[1]?;
+    if col0_tbl != gb_tbl_col {
+        return None;
+    }
+    let so0 = cov.orders.first()?;
+    let so1 = cov.orders.get(1)?;
+    if so0.desc
+        || so0.nulls_last
+        || so0.collation != Collation::Binary
+        || so0.custom_collation.is_some()
+        || so1.desc
+        || so1.nulls_last
+        || so1.collation != Collation::Binary
+        || so1.custom_collation.is_some()
+    {
+        return None;
+    }
+    let FastExpr::ColCmpRhs {
+        col:
+            FastColSrc::RecordCol {
+                side: 0,
+                col_idx: w_col,
+                is_ipk: false,
+            },
+        op: op @ (FastCmpOp::Gt | FastCmpOp::Ge),
+        rhs,
+        affinity: TypeAffinity::Integer | TypeAffinity::Numeric | TypeAffinity::Real,
+        collation: Collation::Binary,
+    } = where_pred?
+    else {
+        return None;
+    };
+    if *w_col != col1_tbl {
+        return None;
+    }
+    let slots = compile_morsel_int_agg_slots(aggs, col0_tbl, Some(col1_tbl))?;
+    Some(GroupCol1FilterMorselSpec {
+        rhs: rhs.clone(),
+        inclusive: matches!(op, FastCmpOp::Ge),
+        slots,
+    })
+}
+
+// ============================================================================
 // Plan 1: Ungrouped Streaming Aggregate (`W04`, `W09`, `W14` Q1, `COUNT(*)`)
 // ============================================================================
 
@@ -2859,27 +3461,354 @@ struct UngroupedAggPlan {
     where_pred: Option<FastExpr>,
     aggs: Box<[FastAggSpec]>,
     projections: Box<[FastGroupProjExpr]>,
+    morsel_range: Option<UngroupedMorselRangeSpec>,
 }
 
 impl UngroupedAggPlan {
-    fn execute(&self, bt: &mut Btree, params: &[Value], enc: TextEncoding) -> Result<Vec<Value>> {
-        let mut states: Vec<FastAggState> = self
-            .aggs
-            .iter()
-            .map(|s| FastAggState::from_spec(s, enc))
-            .collect();
-        scan_single_table_rows(bt, &self.table, &self.access, params, |rowid, cols| {
-            let ctx = FastRowCtx::single(rowid, cols, params, enc);
-            if let Some(ref pred) = self.where_pred
-                && !pred.eval_where_true(&ctx)?
-            {
-                return Ok(ControlFlow::Continue(()));
+    fn execute(
+        &self,
+        bt: &mut Btree,
+        params: &[Value],
+        enc: TextEncoding,
+    ) -> Result<FastReadExecOut> {
+        let mut states_stack: [FastAggState; 4] = [
+            FastAggState::Count(0),
+            FastAggState::Count(0),
+            FastAggState::Count(0),
+            FastAggState::Count(0),
+        ];
+        let mut states_heap: Vec<FastAggState> = Vec::new();
+        let states: &mut [FastAggState] = if self.aggs.len() <= 4 {
+            for (i, s) in self.aggs.iter().enumerate() {
+                states_stack[i] = FastAggState::from_spec(s, enc);
             }
-            for (st, spec) in states.iter_mut().zip(self.aggs.iter()) {
-                st.step(spec, &ctx)?;
+            &mut states_stack[..self.aggs.len()]
+        } else {
+            states_heap.reserve(self.aggs.len());
+            for s in self.aggs.iter() {
+                states_heap.push(FastAggState::from_spec(s, enc));
             }
-            Ok(ControlFlow::Continue(()))
-        })?;
+            &mut states_heap
+        };
+
+        let mut ran_morsel = false;
+        if let Some(ref mspec) = self.morsel_range
+            && let FastSingleAccess::CoveringIndexRangeScan {
+                ref cov,
+                ref prefix_keys,
+                ref prefix_affinities,
+                range_aff,
+                ref lower,
+                ref upper,
+            } = self.access
+            && prefix_keys.len() == 1
+        {
+            let p0_coerced = apply_index_seek_affinity(
+                prefix_affinities[0],
+                prefix_keys[0].resolve(params).clone(),
+            );
+            if p0_coerced.is_null() {
+                ran_morsel = true;
+            } else if let Value::Integer(p0_int) = p0_coerced {
+                let lo_res = match lower {
+                    None => Ok(None),
+                    Some(lb) => {
+                        let c =
+                            apply_index_seek_affinity(range_aff, lb.rhs.resolve(params).clone());
+                        if c.is_null() {
+                            Err(true)
+                        } else if matches!(c, Value::Integer(_)) {
+                            Ok(Some((c, lb.inclusive)))
+                        } else {
+                            Err(false)
+                        }
+                    }
+                };
+                let hi_res = match upper {
+                    None => Ok(None),
+                    Some(ub) => {
+                        let c =
+                            apply_index_seek_affinity(range_aff, ub.rhs.resolve(params).clone());
+                        if c.is_null() {
+                            Err(true)
+                        } else if matches!(c, Value::Integer(_)) {
+                            Ok(Some((c, ub.inclusive)))
+                        } else {
+                            Err(false)
+                        }
+                    }
+                };
+                match (lo_res, hi_res) {
+                    (Err(true), _) | (_, Err(true)) => {
+                        ran_morsel = true;
+                    }
+                    (Ok(lo_opt), Ok(hi_opt)) => {
+                        ran_morsel = true;
+                        let col_buf_len = if self.table.needs_record_parse {
+                            self.table.max_record_col + 1
+                        } else {
+                            0
+                        };
+                        let prefix_arr = [Value::Integer(p0_int)];
+                        let lo_ref = lo_opt.as_ref().map(|(v, inc)| (v, *inc));
+                        let hi_ref = hi_opt.as_ref().map(|(v, inc)| (v, *inc));
+                        let need_col1 = mspec
+                            .slots
+                            .iter()
+                            .any(|s| matches!(s, MorselIntAggSlot::SumCol1));
+                        bt.seek_index_range_morsels(
+                            cov.root_pgno,
+                            &prefix_arr,
+                            lo_ref,
+                            hi_ref,
+                            &cov.orders,
+                            false,
+                            |item| {
+                                let step_cell_slow =
+                                    |cell: &[u8], states: &mut [FastAggState]| -> Result<()> {
+                                        let mut idx_local: [RawField<'_>; 16] =
+                                            [RawField::Null; 16];
+                                        let mut tbl_local: [RawField<'_>; 16] =
+                                            [RawField::Null; 16];
+                                        let rid = decode_covering_cell(
+                                            cov,
+                                            cell,
+                                            &mut idx_local[..cov.parse_prefix_len],
+                                            &mut tbl_local[..col_buf_len],
+                                        )?;
+                                        let ctx = FastRowCtx::single(
+                                            rid,
+                                            &tbl_local[..col_buf_len],
+                                            params,
+                                            enc,
+                                        );
+                                        if let Some(ref pred) = self.where_pred
+                                            && !pred.eval_where_true(&ctx)?
+                                        {
+                                            return Ok(());
+                                        }
+                                        for (st, spec) in states.iter_mut().zip(self.aggs.iter()) {
+                                            st.step(spec, &ctx)?;
+                                        }
+                                        Ok(())
+                                    };
+                                match item {
+                                    IndexScanItem::LeafMorsel { morsel, start, end } => {
+                                        let mut batch_cnt = 0i64;
+                                        let mut batch_sum1 = 0i64;
+                                        for ci in start..end {
+                                            let Some(payload) = morsel.local_cell(ci)? else {
+                                                if batch_cnt > 0
+                                                    && !apply_morsel_int_batch(
+                                                        states,
+                                                        &mspec.slots,
+                                                        batch_cnt,
+                                                        p0_int,
+                                                        batch_sum1,
+                                                    )
+                                                {
+                                                    for k in (ci - batch_cnt as usize)..ci {
+                                                        let pk = morsel.local_cell(k)?.unwrap();
+                                                        let v1 = if need_col1 {
+                                                            decode_index_col1_int_with_int_col0(pk)
+                                                                .unwrap()
+                                                        } else {
+                                                            0
+                                                        };
+                                                        step_morsel_int_single(
+                                                            states,
+                                                            &mspec.slots,
+                                                            p0_int,
+                                                            v1,
+                                                        );
+                                                    }
+                                                }
+                                                return Ok(MorselStep::OverflowAt(ci));
+                                            };
+                                            let fast_v1 = if need_col1 {
+                                                decode_index_col1_int_with_int_col0(payload)
+                                            } else {
+                                                decode_index_col0_int(payload).map(|_| 0)
+                                            };
+                                            if let Some(v1) = fast_v1 {
+                                                if let Some(ns) = batch_sum1.checked_add(v1) {
+                                                    batch_cnt += 1;
+                                                    batch_sum1 = ns;
+                                                } else {
+                                                    if batch_cnt > 0
+                                                        && !apply_morsel_int_batch(
+                                                            states,
+                                                            &mspec.slots,
+                                                            batch_cnt,
+                                                            p0_int,
+                                                            batch_sum1,
+                                                        )
+                                                    {
+                                                        for k in (ci - batch_cnt as usize)..ci {
+                                                            let pk = morsel.local_cell(k)?.unwrap();
+                                                            let kv1 = if need_col1 {
+                                                                decode_index_col1_int_with_int_col0(
+                                                                    pk,
+                                                                )
+                                                                .unwrap()
+                                                            } else {
+                                                                0
+                                                            };
+                                                            step_morsel_int_single(
+                                                                states,
+                                                                &mspec.slots,
+                                                                p0_int,
+                                                                kv1,
+                                                            );
+                                                        }
+                                                    }
+                                                    batch_cnt = 0;
+                                                    batch_sum1 = 0;
+                                                    step_morsel_int_single(
+                                                        states,
+                                                        &mspec.slots,
+                                                        p0_int,
+                                                        v1,
+                                                    );
+                                                }
+                                            } else {
+                                                if batch_cnt > 0 {
+                                                    if !apply_morsel_int_batch(
+                                                        states,
+                                                        &mspec.slots,
+                                                        batch_cnt,
+                                                        p0_int,
+                                                        batch_sum1,
+                                                    ) {
+                                                        for k in (ci - batch_cnt as usize)..ci {
+                                                            let pk = morsel.local_cell(k)?.unwrap();
+                                                            let kv1 = if need_col1 {
+                                                                decode_index_col1_int_with_int_col0(
+                                                                    pk,
+                                                                )
+                                                                .unwrap()
+                                                            } else {
+                                                                0
+                                                            };
+                                                            step_morsel_int_single(
+                                                                states,
+                                                                &mspec.slots,
+                                                                p0_int,
+                                                                kv1,
+                                                            );
+                                                        }
+                                                    }
+                                                    batch_cnt = 0;
+                                                    batch_sum1 = 0;
+                                                }
+                                                step_cell_slow(payload, states)?;
+                                            }
+                                        }
+                                        if batch_cnt > 0
+                                            && !apply_morsel_int_batch(
+                                                states,
+                                                &mspec.slots,
+                                                batch_cnt,
+                                                p0_int,
+                                                batch_sum1,
+                                            )
+                                        {
+                                            for k in (end - batch_cnt as usize)..end {
+                                                let pk = morsel.local_cell(k)?.unwrap();
+                                                let kv1 = if need_col1 {
+                                                    decode_index_col1_int_with_int_col0(pk).unwrap()
+                                                } else {
+                                                    0
+                                                };
+                                                step_morsel_int_single(
+                                                    states,
+                                                    &mspec.slots,
+                                                    p0_int,
+                                                    kv1,
+                                                );
+                                            }
+                                        }
+                                        Ok(MorselStep::Continue)
+                                    }
+                                    IndexScanItem::SingleCell(payload) => {
+                                        let fast_v1 = if need_col1 {
+                                            decode_index_col1_int_with_int_col0(payload)
+                                        } else {
+                                            decode_index_col0_int(payload).map(|_| 0)
+                                        };
+                                        if let Some(v1) = fast_v1 {
+                                            step_morsel_int_single(
+                                                states,
+                                                &mspec.slots,
+                                                p0_int,
+                                                v1,
+                                            );
+                                        } else {
+                                            step_cell_slow(payload, states)?;
+                                        }
+                                        Ok(MorselStep::Continue)
+                                    }
+                                }
+                            },
+                        )?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if !ran_morsel {
+            scan_single_table_rows(bt, &self.table, &self.access, params, |rowid, cols| {
+                let ctx = FastRowCtx::single(rowid, cols, params, enc);
+                if let Some(ref pred) = self.where_pred
+                    && !pred.eval_where_true(&ctx)?
+                {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                for (st, spec) in states.iter_mut().zip(self.aggs.iter()) {
+                    st.step(spec, &ctx)?;
+                }
+                Ok(ControlFlow::Continue(()))
+            })?;
+        }
+
+        if self.aggs.len() <= 4 && self.projections.len() <= INLINE_ROW_COLS {
+            let mut agg_arr: [Value; 4] = [Value::Null, Value::Null, Value::Null, Value::Null];
+            for (i, (st, spec)) in states.iter().zip(self.aggs.iter()).enumerate() {
+                agg_arr[i] = st.finalize(spec)?;
+            }
+            let agg_slice = &agg_arr[..self.aggs.len()];
+            let mut inline_cols = [InlineVal::Null; INLINE_ROW_COLS];
+            let mut all_inline = true;
+            let mut first_heap: Option<(usize, Value)> = None;
+            for (i, p) in self.projections.iter().enumerate() {
+                let v = p.eval(&[], agg_slice);
+                match InlineVal::try_from_value(&v) {
+                    Some(iv) => inline_cols[i] = iv,
+                    None => {
+                        all_inline = false;
+                        first_heap = Some((i, v));
+                        break;
+                    }
+                }
+            }
+            if all_inline {
+                return Ok(FastReadExecOut::SingleInlineRow(InlineRow::from_raw_parts(
+                    self.projections.len() as u8,
+                    inline_cols,
+                )));
+            }
+            let (fail_idx, fail_val) = first_heap.unwrap();
+            let mut out = Vec::with_capacity(self.projections.len());
+            for iv in &inline_cols[..fail_idx] {
+                out.push(iv.to_value());
+            }
+            out.push(fail_val);
+            for p in &self.projections[fail_idx + 1..] {
+                out.push(p.eval(&[], agg_slice));
+            }
+            return Ok(FastReadExecOut::SingleRow(out));
+        }
 
         let mut agg_vals = Vec::with_capacity(self.aggs.len());
         for (st, spec) in states.iter().zip(self.aggs.iter()) {
@@ -2889,7 +3818,7 @@ impl UngroupedAggPlan {
         for p in self.projections.iter() {
             out.push(p.eval(&[], &agg_vals));
         }
-        Ok(out)
+        Ok(FastReadExecOut::SingleRow(out))
     }
 }
 
@@ -2907,6 +3836,7 @@ struct OrderedCoveringGroupByPlan {
     where_pred: Option<FastExpr>,
     aggs: Box<[FastAggSpec]>,
     projections: Box<[FastGroupProjExpr]>,
+    morsel_grp: Option<GroupCol1FilterMorselSpec>,
 }
 
 impl OrderedCoveringGroupByPlan {
@@ -2915,47 +3845,512 @@ impl OrderedCoveringGroupByPlan {
         bt: &mut Btree,
         params: &[Value],
         enc: TextEncoding,
-    ) -> Result<Vec<Vec<Value>>> {
+    ) -> Result<FastReadExecOut> {
         let col_buf_len = if self.table.needs_record_parse {
             self.table.max_record_col + 1
         } else {
             0
         };
-        let mut states: Vec<FastAggState> = self
-            .aggs
-            .iter()
-            .map(|s| FastAggState::from_spec(s, enc))
-            .collect();
+        let mut states_stack: [FastAggState; 4] = [
+            FastAggState::Count(0),
+            FastAggState::Count(0),
+            FastAggState::Count(0),
+            FastAggState::Count(0),
+        ];
+        let mut states_heap: Vec<FastAggState> = Vec::new();
+        let states: &mut [FastAggState] = if self.aggs.len() <= 4 {
+            for (i, s) in self.aggs.iter().enumerate() {
+                states_stack[i] = FastAggState::from_spec(s, enc);
+            }
+            &mut states_stack[..self.aggs.len()]
+        } else {
+            states_heap.reserve(self.aggs.len());
+            for s in self.aggs.iter() {
+                states_heap.push(FastAggState::from_spec(s, enc));
+            }
+            &mut states_heap
+        };
         let mut cur_group_key: Option<Value> = None;
-        let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(64);
+        let can_try_inline = self.projections.len() <= INLINE_ROW_COLS && self.aggs.len() <= 4;
+        let mut inline_rows: Vec<InlineRow> = if can_try_inline {
+            Vec::with_capacity(64)
+        } else {
+            Vec::new()
+        };
+        let mut heap_rows: Vec<Vec<Value>> = Vec::new();
 
         let flush_group = |key: Value,
                            states: &mut [FastAggState],
-                           out_rows: &mut Vec<Vec<Value>>|
+                           inline_rows: &mut Vec<InlineRow>,
+                           heap_rows: &mut Vec<Vec<Value>>|
          -> Result<()> {
-            let mut agg_vals = Vec::with_capacity(self.aggs.len());
-            for (st, spec) in states.iter().zip(self.aggs.iter()) {
-                agg_vals.push(st.finalize(spec)?);
+            if can_try_inline && heap_rows.is_empty() {
+                let mut agg_arr: [Value; 4] = [Value::Null, Value::Null, Value::Null, Value::Null];
+                for (i, (st, spec)) in states.iter().zip(self.aggs.iter()).enumerate() {
+                    agg_arr[i] = st.finalize(spec)?;
+                }
+                let agg_slice = &agg_arr[..self.aggs.len()];
+                let key_arr = [key];
+                let mut cols = [InlineVal::Null; INLINE_ROW_COLS];
+                let mut first_heap: Option<(usize, Value)> = None;
+                for (i, p) in self.projections.iter().enumerate() {
+                    let v = p.eval(&key_arr, agg_slice);
+                    match InlineVal::try_from_value(&v) {
+                        Some(iv) => cols[i] = iv,
+                        None => {
+                            first_heap = Some((i, v));
+                            break;
+                        }
+                    }
+                }
+                if let Some((fail_idx, fail_val)) = first_heap {
+                    heap_rows.reserve(inline_rows.len() + 1);
+                    for ir in inline_rows.drain(..) {
+                        heap_rows.push(ir.to_vec_values());
+                    }
+                    let mut row = Vec::with_capacity(self.projections.len());
+                    for iv in &cols[..fail_idx] {
+                        row.push(iv.to_value());
+                    }
+                    row.push(fail_val);
+                    for p in &self.projections[fail_idx + 1..] {
+                        row.push(p.eval(&key_arr, agg_slice));
+                    }
+                    heap_rows.push(row);
+                } else {
+                    inline_rows.push(InlineRow::from_raw_parts(
+                        self.projections.len() as u8,
+                        cols,
+                    ));
+                }
+            } else {
+                let mut agg_vals = Vec::with_capacity(self.aggs.len());
+                for (st, spec) in states.iter().zip(self.aggs.iter()) {
+                    agg_vals.push(st.finalize(spec)?);
+                }
+                let key_arr = [key];
+                let mut row = Vec::with_capacity(self.projections.len());
+                for p in self.projections.iter() {
+                    row.push(p.eval(&key_arr, &agg_vals));
+                }
+                heap_rows.push(row);
             }
-            let key_arr = [key];
-            let mut row = Vec::with_capacity(self.projections.len());
-            for p in self.projections.iter() {
-                row.push(p.eval(&key_arr, &agg_vals));
-            }
-            out_rows.push(row);
             for (st, spec) in states.iter_mut().zip(self.aggs.iter()) {
                 st.reset(spec, enc);
             }
             Ok(())
         };
 
+        if let Some(ref gspec) = self.morsel_grp
+            && !self.reverse
+            && let Value::Integer(thresh) = *gspec.rhs.resolve(params)
+        {
+            let min_inc_opt = if gspec.inclusive {
+                Some(thresh)
+            } else {
+                thresh.checked_add(1)
+            };
+            bt.scan_index_morsels(self.cov.root_pgno, false, |item| {
+                let step_single = |cell: &[u8],
+                                   cur_gk: &mut Option<Value>,
+                                   states: &mut [FastAggState],
+                                   inline_rows: &mut Vec<InlineRow>,
+                                   heap_rows: &mut Vec<Vec<Value>>|
+                 -> Result<()> {
+                    let mut idx_local: [RawField<'_>; 4] = [RawField::Null; 4];
+                    let mut tbl_local: [RawField<'_>; 4] = [RawField::Null; 4];
+                    let mut idx_local16: [RawField<'_>; 16];
+                    let mut tbl_local16: [RawField<'_>; 16];
+                    let (rid, tbl_slice): (i64, &[RawField<'_>]) =
+                        if self.cov.parse_prefix_len <= 4 && col_buf_len <= 4 {
+                            let r = decode_covering_cell(
+                                &self.cov,
+                                cell,
+                                &mut idx_local[..self.cov.parse_prefix_len],
+                                &mut tbl_local[..col_buf_len],
+                            )?;
+                            (r, &tbl_local[..col_buf_len])
+                        } else {
+                            idx_local16 = [RawField::Null; 16];
+                            tbl_local16 = [RawField::Null; 16];
+                            let r = decode_covering_cell(
+                                &self.cov,
+                                cell,
+                                &mut idx_local16[..self.cov.parse_prefix_len],
+                                &mut tbl_local16[..col_buf_len],
+                            )?;
+                            (r, &tbl_local16[..col_buf_len])
+                        };
+                    let ctx = FastRowCtx::single(rid, tbl_slice, params, enc);
+                    if let Some(ref pred) = self.where_pred
+                        && !pred.eval_where_true(&ctx)?
+                    {
+                        return Ok(());
+                    }
+                    let raw_gk = ctx.get_col(self.group_col);
+                    let same_group = match cur_gk.as_ref() {
+                        None => false,
+                        Some(prev) => match (raw_gk, prev) {
+                            (RawField::Int(a), Value::Integer(b)) => a == *b,
+                            (RawField::Null, Value::Null) => true,
+                            (RawField::Null, _) | (_, Value::Null) => false,
+                            (rf, pv) => {
+                                let spec = key_order_for_collation(self.group_collation);
+                                rf.compare_sql_to_nonnull_value(pv, &spec, enc)
+                                    .unwrap_or(Ordering::Equal)
+                                    == Ordering::Equal
+                            }
+                        },
+                    };
+                    if !same_group {
+                        if let Some(prev_key) = cur_gk.take() {
+                            flush_group(prev_key, states, inline_rows, heap_rows)?;
+                        }
+                        *cur_gk = Some(raw_gk.to_owned_value(enc));
+                    }
+                    for (st, spec) in states.iter_mut().zip(self.aggs.iter()) {
+                        st.step(spec, &ctx)?;
+                    }
+                    Ok(())
+                };
+
+                match item {
+                    IndexScanItem::SingleCell(payload) => {
+                        if let Some((g, v1)) = decode_index_col0_col1_ints(payload) {
+                            if let Some(min_inc) = min_inc_opt
+                                && v1 >= min_inc
+                            {
+                                let same = match cur_group_key.as_ref() {
+                                    Some(Value::Integer(prev)) => *prev == g,
+                                    Some(other) => {
+                                        RawField::Int(g)
+                                            .compare_sql_to_nonnull_value(
+                                                other,
+                                                &KeySortOrder::default(),
+                                                enc,
+                                            )
+                                            .unwrap_or(Ordering::Equal)
+                                            == Ordering::Equal
+                                    }
+                                    None => false,
+                                };
+                                if !same {
+                                    if let Some(prev_key) = cur_group_key.take() {
+                                        flush_group(
+                                            prev_key,
+                                            states,
+                                            &mut inline_rows,
+                                            &mut heap_rows,
+                                        )?;
+                                    }
+                                    cur_group_key = Some(Value::Integer(g));
+                                }
+                                step_morsel_int_single(states, &gspec.slots, g, v1);
+                            }
+                        } else {
+                            step_single(
+                                payload,
+                                &mut cur_group_key,
+                                states,
+                                &mut inline_rows,
+                                &mut heap_rows,
+                            )?;
+                        }
+                        Ok(MorselStep::Continue)
+                    }
+                    IndexScanItem::LeafMorsel { morsel, start, end } => {
+                        let mut ci = start;
+                        while ci < end {
+                            let Some(p_ci) = morsel.local_cell(ci)? else {
+                                return Ok(MorselStep::OverflowAt(ci));
+                            };
+                            let Some((g, v0)) = decode_index_col0_col1_ints(p_ci) else {
+                                step_single(
+                                    p_ci,
+                                    &mut cur_group_key,
+                                    states,
+                                    &mut inline_rows,
+                                    &mut heap_rows,
+                                )?;
+                                ci += 1;
+                                continue;
+                            };
+
+                            // Find `grp_end` in `(ci + 1)..=end`:
+                            // Probe `end - 1` first (O(1) when rest of leaf belongs to group `g`!),
+                            // else binary-search `(ci + 1)..(end - 1)` in `O(log N)`.
+                            let grp_end_opt: Option<usize> = if ci + 1 == end {
+                                Some(end)
+                            } else if let Some(p_last) = morsel.local_cell(end - 1)?
+                                && decode_index_col0_int(p_last) == Some(g)
+                            {
+                                Some(end)
+                            } else {
+                                let mut lo_g = ci + 1;
+                                let mut hi_g = end - 1;
+                                let mut ok_g = true;
+                                while lo_g < hi_g {
+                                    let mid = lo_g + (hi_g - lo_g) / 2;
+                                    let Some(p_mid) = morsel.local_cell(mid)? else {
+                                        ok_g = false;
+                                        break;
+                                    };
+                                    let Some(mg) = decode_index_col0_int(p_mid) else {
+                                        ok_g = false;
+                                        break;
+                                    };
+                                    if mg <= g {
+                                        lo_g = mid + 1;
+                                    } else {
+                                        hi_g = mid;
+                                    }
+                                }
+                                ok_g.then_some(lo_g)
+                            };
+
+                            let Some(grp_end) = grp_end_opt else {
+                                step_single(
+                                    p_ci,
+                                    &mut cur_group_key,
+                                    states,
+                                    &mut inline_rows,
+                                    &mut heap_rows,
+                                )?;
+                                ci += 1;
+                                continue;
+                            };
+
+                            // Check `grp_end - 1`: if its `col1 < min_inc`, skip the entire group run in O(1)!
+                            let last_ints = morsel
+                                .local_cell(grp_end - 1)?
+                                .and_then(decode_index_col0_col1_ints);
+                            let Some((g_last, v_last)) = last_ints else {
+                                step_single(
+                                    p_ci,
+                                    &mut cur_group_key,
+                                    states,
+                                    &mut inline_rows,
+                                    &mut heap_rows,
+                                )?;
+                                ci += 1;
+                                continue;
+                            };
+                            if g_last != g {
+                                step_single(
+                                    p_ci,
+                                    &mut cur_group_key,
+                                    states,
+                                    &mut inline_rows,
+                                    &mut heap_rows,
+                                )?;
+                                ci += 1;
+                                continue;
+                            }
+                            let Some(min_inc) = min_inc_opt else {
+                                // `thresh == i64::MAX` with `>`: no `i64` can exceed `i64::MAX`!
+                                ci = grp_end;
+                                continue;
+                            };
+                            if v_last < min_inc {
+                                ci = grp_end;
+                                continue;
+                            }
+
+                            // Binary-search `pass_start` in `ci..grp_end` where `col1 >= min_inc`.
+                            let pass_start_opt: Option<usize> = if v0 >= min_inc {
+                                Some(ci)
+                            } else {
+                                let mut lo_p = ci + 1;
+                                let mut hi_p = grp_end - 1;
+                                let mut ok_p = true;
+                                while lo_p < hi_p {
+                                    let mid = lo_p + (hi_p - lo_p) / 2;
+                                    let Some(p_mid) = morsel.local_cell(mid)? else {
+                                        ok_p = false;
+                                        break;
+                                    };
+                                    let Some((_, mv)) = decode_index_col0_col1_ints(p_mid) else {
+                                        ok_p = false;
+                                        break;
+                                    };
+                                    if mv < min_inc {
+                                        lo_p = mid + 1;
+                                    } else {
+                                        hi_p = mid;
+                                    }
+                                }
+                                ok_p.then_some(lo_p)
+                            };
+
+                            let Some(pass_start) = pass_start_opt else {
+                                while ci < grp_end {
+                                    let Some(pk) = morsel.local_cell(ci)? else {
+                                        return Ok(MorselStep::OverflowAt(ci));
+                                    };
+                                    step_single(
+                                        pk,
+                                        &mut cur_group_key,
+                                        states,
+                                        &mut inline_rows,
+                                        &mut heap_rows,
+                                    )?;
+                                    ci += 1;
+                                }
+                                continue;
+                            };
+
+                            // At least 1 passing row in `pass_start..grp_end`!
+                            let same = match cur_group_key.as_ref() {
+                                Some(Value::Integer(prev)) => *prev == g,
+                                Some(other) => {
+                                    RawField::Int(g)
+                                        .compare_sql_to_nonnull_value(
+                                            other,
+                                            &KeySortOrder::default(),
+                                            enc,
+                                        )
+                                        .unwrap_or(Ordering::Equal)
+                                        == Ordering::Equal
+                                }
+                                None => false,
+                            };
+                            if !same {
+                                if let Some(prev_key) = cur_group_key.take() {
+                                    flush_group(
+                                        prev_key,
+                                        states,
+                                        &mut inline_rows,
+                                        &mut heap_rows,
+                                    )?;
+                                }
+                                cur_group_key = Some(Value::Integer(g));
+                            }
+
+                            let mut batch_cnt = 0i64;
+                            let mut batch_sum1 = 0i64;
+                            for k in pass_start..grp_end {
+                                let Some(pk) = morsel.local_cell(k)? else {
+                                    if batch_cnt > 0
+                                        && !apply_morsel_int_batch(
+                                            states,
+                                            &gspec.slots,
+                                            batch_cnt,
+                                            g,
+                                            batch_sum1,
+                                        )
+                                    {
+                                        for j in (k - batch_cnt as usize)..k {
+                                            let pj = morsel.local_cell(j)?.unwrap();
+                                            let (_, vj) = decode_index_col0_col1_ints(pj).unwrap();
+                                            step_morsel_int_single(states, &gspec.slots, g, vj);
+                                        }
+                                    }
+                                    return Ok(MorselStep::OverflowAt(k));
+                                };
+                                if let Some((_, vk)) = decode_index_col0_col1_ints(pk) {
+                                    if let Some(ns) = batch_sum1.checked_add(vk) {
+                                        batch_cnt += 1;
+                                        batch_sum1 = ns;
+                                    } else {
+                                        if batch_cnt > 0
+                                            && !apply_morsel_int_batch(
+                                                states,
+                                                &gspec.slots,
+                                                batch_cnt,
+                                                g,
+                                                batch_sum1,
+                                            )
+                                        {
+                                            for j in (k - batch_cnt as usize)..k {
+                                                let pj = morsel.local_cell(j)?.unwrap();
+                                                let (_, vj) =
+                                                    decode_index_col0_col1_ints(pj).unwrap();
+                                                step_morsel_int_single(states, &gspec.slots, g, vj);
+                                            }
+                                        }
+                                        batch_cnt = 0;
+                                        batch_sum1 = 0;
+                                        step_morsel_int_single(states, &gspec.slots, g, vk);
+                                    }
+                                } else {
+                                    if batch_cnt > 0 {
+                                        if !apply_morsel_int_batch(
+                                            states,
+                                            &gspec.slots,
+                                            batch_cnt,
+                                            g,
+                                            batch_sum1,
+                                        ) {
+                                            for j in (k - batch_cnt as usize)..k {
+                                                let pj = morsel.local_cell(j)?.unwrap();
+                                                let (_, vj) =
+                                                    decode_index_col0_col1_ints(pj).unwrap();
+                                                step_morsel_int_single(states, &gspec.slots, g, vj);
+                                            }
+                                        }
+                                        batch_cnt = 0;
+                                        batch_sum1 = 0;
+                                    }
+                                    step_single(
+                                        pk,
+                                        &mut cur_group_key,
+                                        states,
+                                        &mut inline_rows,
+                                        &mut heap_rows,
+                                    )?;
+                                }
+                            }
+                            if batch_cnt > 0
+                                && !apply_morsel_int_batch(
+                                    states,
+                                    &gspec.slots,
+                                    batch_cnt,
+                                    g,
+                                    batch_sum1,
+                                )
+                            {
+                                for j in (grp_end - batch_cnt as usize)..grp_end {
+                                    let pj = morsel.local_cell(j)?.unwrap();
+                                    let (_, vj) = decode_index_col0_col1_ints(pj).unwrap();
+                                    step_morsel_int_single(states, &gspec.slots, g, vj);
+                                }
+                            }
+                            ci = grp_end;
+                        }
+                        Ok(MorselStep::Continue)
+                    }
+                }
+            })?;
+
+            if let Some(last_key) = cur_group_key.take() {
+                flush_group(last_key, states, &mut inline_rows, &mut heap_rows)?;
+            }
+            return if !heap_rows.is_empty() {
+                Ok(FastReadExecOut::from_rows(heap_rows))
+            } else {
+                Ok(FastReadExecOut::from_inline_rows(inline_rows))
+            };
+        }
+
         bt.scan_index_raw_cells(self.cov.root_pgno, self.reverse, |cell| {
-            let mut idx_local: [RawField<'_>; 16] = [RawField::Null; 16];
-            let mut tbl_local: [RawField<'_>; 16] = [RawField::Null; 16];
+            let mut idx_local4: [RawField<'_>; 4] = [RawField::Null; 4];
+            let mut tbl_local4: [RawField<'_>; 4] = [RawField::Null; 4];
+            let mut idx_local: [RawField<'_>; 16];
+            let mut tbl_local: [RawField<'_>; 16];
             let mut idx_heap: Vec<RawField<'_>>;
             let mut tbl_heap: Vec<RawField<'_>>;
             let (rid, tbl_slice): (i64, &[RawField<'_>]) =
-                if self.cov.parse_prefix_len <= 16 && col_buf_len <= 16 {
+                if self.cov.parse_prefix_len <= 4 && col_buf_len <= 4 {
+                    let r = decode_covering_cell(
+                        &self.cov,
+                        cell,
+                        &mut idx_local4[..self.cov.parse_prefix_len],
+                        &mut tbl_local4[..col_buf_len],
+                    )?;
+                    (r, &tbl_local4[..col_buf_len])
+                } else if self.cov.parse_prefix_len <= 16 && col_buf_len <= 16 {
+                    idx_local = [RawField::Null; 16];
+                    tbl_local = [RawField::Null; 16];
                     let r = decode_covering_cell(
                         &self.cov,
                         cell,
@@ -2964,7 +4359,7 @@ impl OrderedCoveringGroupByPlan {
                     )?;
                     (r, &tbl_local[..col_buf_len])
                 } else {
-                    idx_heap = vec![RawField::Null; self.cov.parse_prefix_len];
+                    idx_heap = vec![RawField::Null; cov_len(&self.cov)];
                     tbl_heap = vec![RawField::Null; col_buf_len];
                     let r = decode_covering_cell(&self.cov, cell, &mut idx_heap, &mut tbl_heap)?;
                     (r, &tbl_heap)
@@ -2979,6 +4374,7 @@ impl OrderedCoveringGroupByPlan {
             let same_group = match cur_group_key.as_ref() {
                 None => false,
                 Some(prev) => match (raw_gk, prev) {
+                    (RawField::Int(a), Value::Integer(b)) => a == *b,
                     (RawField::Null, Value::Null) => true,
                     (RawField::Null, _) | (_, Value::Null) => false,
                     (rf, pv) => {
@@ -2991,7 +4387,7 @@ impl OrderedCoveringGroupByPlan {
             };
             if !same_group {
                 if let Some(prev_key) = cur_group_key.take() {
-                    flush_group(prev_key, &mut states, &mut out_rows)?;
+                    flush_group(prev_key, states, &mut inline_rows, &mut heap_rows)?;
                 }
                 cur_group_key = Some(raw_gk.to_owned_value(enc));
             }
@@ -3002,10 +4398,19 @@ impl OrderedCoveringGroupByPlan {
         })?;
 
         if let Some(last_key) = cur_group_key.take() {
-            flush_group(last_key, &mut states, &mut out_rows)?;
+            flush_group(last_key, states, &mut inline_rows, &mut heap_rows)?;
         }
-        Ok(out_rows)
+        if !heap_rows.is_empty() {
+            Ok(FastReadExecOut::from_rows(heap_rows))
+        } else {
+            Ok(FastReadExecOut::from_inline_rows(inline_rows))
+        }
     }
+}
+
+#[inline(always)]
+const fn cov_len(cov: &FastCoveringIndex) -> usize {
+    cov.parse_prefix_len
 }
 
 // ============================================================================
@@ -3088,16 +4493,197 @@ impl std::hash::Hash for HashGroupBucketKey {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
+enum SmallGroupAggStates {
+    Inline([FastAggState; 4]),
+    Heap(Box<[FastAggState]>),
+}
+
+impl SmallGroupAggStates {
+    #[inline]
+    fn from_specs(aggs: &[FastAggSpec], enc: TextEncoding) -> Self {
+        if aggs.len() <= 4 {
+            let mut arr = [
+                FastAggState::Count(0),
+                FastAggState::Count(0),
+                FastAggState::Count(0),
+                FastAggState::Count(0),
+            ];
+            for (i, s) in aggs.iter().enumerate() {
+                arr[i] = FastAggState::from_spec(s, enc);
+            }
+            Self::Inline(arr)
+        } else {
+            Self::Heap(
+                aggs.iter()
+                    .map(|s| FastAggState::from_spec(s, enc))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            )
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self, len: usize) -> &[FastAggState] {
+        match self {
+            Self::Inline(arr) => &arr[..len],
+            Self::Heap(b) => b,
+        }
+    }
+
+    #[inline]
+    fn as_mut_slice(&mut self, len: usize) -> &mut [FastAggState] {
+        match self {
+            Self::Inline(arr) => &mut arr[..len],
+            Self::Heap(b) => b,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum SmallGroupAggVals {
+    Inline([Value; 4]),
+    Heap(Box<[Value]>),
+}
+
+impl SmallGroupAggVals {
+    #[inline]
+    fn as_slice(&self, len: usize) -> &[Value] {
+        match self {
+            Self::Inline(arr) => &arr[..len],
+            Self::Heap(b) => b,
+        }
+    }
+}
+
+fn finalize_and_emit_group_rows(
+    groups: Vec<(Value, SmallGroupAggStates)>,
+    aggs: &[FastAggSpec],
+    order_by: &[GroupSortSpec],
+    projections: &[FastGroupProjExpr],
+    enc: TextEncoding,
+) -> Result<FastReadExecOut> {
+    if groups.is_empty() {
+        return Ok(FastReadExecOut::Empty);
+    }
+
+    let n_aggs = aggs.len();
+    let mut finalized: Vec<(Value, SmallGroupAggVals)> = Vec::with_capacity(groups.len());
+    for (gk, states) in groups {
+        let st_slice = states.as_slice(n_aggs);
+        let agg_vals = if n_aggs <= 4 {
+            let mut arr = [const { Value::Null }; 4];
+            for (i, (st, spec)) in st_slice.iter().zip(aggs.iter()).enumerate() {
+                arr[i] = st.finalize(spec)?;
+            }
+            SmallGroupAggVals::Inline(arr)
+        } else {
+            let mut v = Vec::with_capacity(n_aggs);
+            for (st, spec) in st_slice.iter().zip(aggs.iter()) {
+                v.push(st.finalize(spec)?);
+            }
+            SmallGroupAggVals::Heap(v.into_boxed_slice())
+        };
+        finalized.push((gk, agg_vals));
+    }
+
+    if !order_by.is_empty() && finalized.len() > 1 {
+        fallible_sort_by(&mut finalized, |(k_a, a_a), (k_b, a_b)| {
+            let ka_slice = std::slice::from_ref(k_a);
+            let kb_slice = std::slice::from_ref(k_b);
+            let aa_slice = a_a.as_slice(n_aggs);
+            let ab_slice = a_b.as_slice(n_aggs);
+            for ob in order_by.iter() {
+                let va = ob.proj_or_key.eval(ka_slice, aa_slice);
+                let vb = ob.proj_or_key.eval(kb_slice, ab_slice);
+                let ord =
+                    compare_order_by_values(&va, &vb, ob.desc, ob.nulls_last, ob.collation, enc);
+                if ord != Ordering::Equal {
+                    return Ok(ord);
+                }
+            }
+            Ok(Ordering::Equal)
+        })?;
+    }
+
+    if projections.len() <= INLINE_ROW_COLS {
+        let mut inline_rows: Vec<InlineRow> = Vec::with_capacity(finalized.len());
+        let mut heap_rows: Vec<Vec<Value>> = Vec::new();
+        for (gk, agg_vals) in finalized {
+            let key_slice = std::slice::from_ref(&gk);
+            let agg_slice = agg_vals.as_slice(n_aggs);
+            if heap_rows.is_empty() {
+                let mut cols = [InlineVal::Null; INLINE_ROW_COLS];
+                let mut ok = true;
+                let mut fail_idx = 0usize;
+                let mut fail_val = Value::Null;
+                for (i, p) in projections.iter().enumerate() {
+                    let v = p.eval(key_slice, agg_slice);
+                    match InlineVal::try_from_value(&v) {
+                        Some(iv) => cols[i] = iv,
+                        None => {
+                            ok = false;
+                            fail_idx = i;
+                            fail_val = v;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    inline_rows.push(InlineRow::from_raw_parts(projections.len() as u8, cols));
+                    continue;
+                }
+                heap_rows.reserve(inline_rows.len() + 1);
+                for ir in inline_rows.drain(..) {
+                    heap_rows.push(ir.to_vec_values());
+                }
+                let mut row = Vec::with_capacity(projections.len());
+                for iv in &cols[..fail_idx] {
+                    row.push(iv.to_value());
+                }
+                row.push(fail_val);
+                for p in &projections[fail_idx + 1..] {
+                    row.push(p.eval(key_slice, agg_slice));
+                }
+                heap_rows.push(row);
+            } else {
+                let mut row = Vec::with_capacity(projections.len());
+                for p in projections.iter() {
+                    row.push(p.eval(key_slice, agg_slice));
+                }
+                heap_rows.push(row);
+            }
+        }
+        if !heap_rows.is_empty() {
+            return Ok(FastReadExecOut::from_rows(heap_rows));
+        }
+        return Ok(FastReadExecOut::from_inline_rows(inline_rows));
+    }
+
+    let mut out_rows = Vec::with_capacity(finalized.len());
+    for (gk, agg_vals) in finalized {
+        let key_slice = std::slice::from_ref(&gk);
+        let agg_slice = agg_vals.as_slice(n_aggs);
+        let mut row = Vec::with_capacity(projections.len());
+        for p in projections.iter() {
+            row.push(p.eval(key_slice, agg_slice));
+        }
+        out_rows.push(row);
+    }
+    Ok(FastReadExecOut::from_rows(out_rows))
+}
+
 impl HashGroupByPlan {
     fn execute(
         &self,
         bt: &mut Btree,
         params: &[Value],
         enc: TextEncoding,
-    ) -> Result<Vec<Vec<Value>>> {
+    ) -> Result<FastReadExecOut> {
         let mut dense_slots: [u32; 256] = [u32::MAX; 256];
         let mut map: HashMap<HashGroupBucketKey, u32, FastBuildHasher> = HashMap::default();
-        let mut groups: Vec<(Value, Vec<FastAggState>)> = Vec::with_capacity(32);
+        let mut groups: Vec<(Value, SmallGroupAggStates)> = Vec::with_capacity(32);
+        let n_aggs = self.aggs.len();
 
         scan_single_table_rows(bt, &self.table, &self.access, params, |rowid, cols| {
             let ctx = FastRowCtx::single(rowid, cols, params, enc);
@@ -3113,11 +4699,7 @@ impl HashGroupByPlan {
                 let slot = &mut dense_slots[iv as usize];
                 if *slot == u32::MAX {
                     let idx = groups.len();
-                    let init_states = self
-                        .aggs
-                        .iter()
-                        .map(|s| FastAggState::from_spec(s, enc))
-                        .collect();
+                    let init_states = SmallGroupAggStates::from_specs(&self.aggs, enc);
                     groups.push((Value::Integer(iv), init_states));
                     *slot = idx as u32;
                     idx
@@ -3135,70 +4717,21 @@ impl HashGroupByPlan {
                     idx as usize
                 } else {
                     let idx = groups.len();
-                    let init_states = self
-                        .aggs
-                        .iter()
-                        .map(|s| FastAggState::from_spec(s, enc))
-                        .collect();
+                    let init_states = SmallGroupAggStates::from_specs(&self.aggs, enc);
                     groups.push((owned, init_states));
                     map.insert(bkey, idx as u32);
                     idx
                 }
             };
 
-            let states = &mut groups[grp_idx].1;
+            let states = groups[grp_idx].1.as_mut_slice(n_aggs);
             for (st, spec) in states.iter_mut().zip(self.aggs.iter()) {
                 st.step(spec, &ctx)?;
             }
             Ok(ControlFlow::Continue(()))
         })?;
 
-        if groups.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut finalized: Vec<(Value, Vec<Value>)> = Vec::with_capacity(groups.len());
-        for (gk, states) in groups {
-            let mut agg_vals = Vec::with_capacity(self.aggs.len());
-            for (st, spec) in states.iter().zip(self.aggs.iter()) {
-                agg_vals.push(st.finalize(spec)?);
-            }
-            finalized.push((gk, agg_vals));
-        }
-
-        if !self.order_by.is_empty() && finalized.len() > 1 {
-            fallible_sort_by(&mut finalized, |(k_a, a_a), (k_b, a_b)| {
-                let ka_arr = [k_a.clone()];
-                let kb_arr = [k_b.clone()];
-                for ob in self.order_by.iter() {
-                    let va = ob.proj_or_key.eval(&ka_arr, a_a);
-                    let vb = ob.proj_or_key.eval(&kb_arr, a_b);
-                    let ord = compare_order_by_values(
-                        &va,
-                        &vb,
-                        ob.desc,
-                        ob.nulls_last,
-                        ob.collation,
-                        enc,
-                    );
-                    if ord != Ordering::Equal {
-                        return Ok(ord);
-                    }
-                }
-                Ok(Ordering::Equal)
-            })?;
-        }
-
-        let mut out_rows = Vec::with_capacity(finalized.len());
-        for (gk, agg_vals) in finalized {
-            let key_arr = [gk];
-            let mut row = Vec::with_capacity(self.projections.len());
-            for p in self.projections.iter() {
-                row.push(p.eval(&key_arr, &agg_vals));
-            }
-            out_rows.push(row);
-        }
-        Ok(out_rows)
+        finalize_and_emit_group_rows(groups, &self.aggs, &self.order_by, &self.projections, enc)
     }
 }
 
@@ -3268,37 +4801,216 @@ struct OrderedIndexSelectPlan {
 }
 
 impl OrderedIndexSelectPlan {
+    fn collect_remaining_exact_rowids(
+        &self,
+        bt: &mut Btree,
+        prefix_vals: &[Value],
+        reverse: bool,
+        skip_count: usize,
+        stop_on_idx: bool,
+    ) -> Result<Vec<i64>> {
+        let rid_field_pos = self.n_index_cols;
+        let mut seen = 0usize;
+        let mut rest: Vec<i64> = Vec::with_capacity(self.limit.min(256));
+        bt.seek_index_range_raw_cells(
+            self.index_root,
+            prefix_vals,
+            None,
+            None,
+            &self.index_orders,
+            reverse,
+            |cell| {
+                let rid_opt = if rid_field_pos < 4 {
+                    let mut idx_fields: [RawField<'_>; 4] = [RawField::Null; 4];
+                    let n = parse_raw_record_prefix(cell, &mut idx_fields[..rid_field_pos + 1])?;
+                    if rid_field_pos < n
+                        && let RawField::Int(rid) = idx_fields[rid_field_pos]
+                    {
+                        Some(rid)
+                    } else {
+                        None
+                    }
+                } else if rid_field_pos < 16 {
+                    let mut idx_fields: [RawField<'_>; 16] = [RawField::Null; 16];
+                    let n = parse_raw_record_prefix(cell, &mut idx_fields[..rid_field_pos + 1])?;
+                    if rid_field_pos < n
+                        && let RawField::Int(rid) = idx_fields[rid_field_pos]
+                    {
+                        Some(rid)
+                    } else {
+                        None
+                    }
+                } else {
+                    let mut heap_f = vec![RawField::Null; rid_field_pos + 1];
+                    let n = parse_raw_record_prefix(cell, &mut heap_f)?;
+                    if rid_field_pos < n
+                        && let RawField::Int(rid) = heap_f[rid_field_pos]
+                    {
+                        Some(rid)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(rid) = rid_opt {
+                    if seen < skip_count {
+                        seen += 1;
+                    } else {
+                        rest.push(rid);
+                        if stop_on_idx && skip_count + rest.len() >= self.limit {
+                            return Ok(ControlFlow::Break(()));
+                        }
+                    }
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
+        Ok(rest)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn probe_and_emit_row(
+        &self,
+        bt: &mut Btree,
+        rid: i64,
+        col_buf_len: usize,
+        check_extra_where: bool,
+        params: &[Value],
+        enc: TextEncoding,
+        inline_rows: &mut Vec<InlineRow>,
+        heap_rows: &mut Vec<Vec<Value>>,
+    ) -> Result<bool> {
+        let matched_opt = bt.with_table_rowid_raw_cell(self.table.root_pgno, rid, |payload| {
+            let mut local_cols8: [RawField<'_>; 8] = [RawField::Null; 8];
+            let mut local_cols16: [RawField<'_>; 16];
+            let mut heap_cols: Vec<RawField<'_>>;
+            let cols_slice: &[RawField<'_>] = if col_buf_len <= 8 {
+                self.table
+                    .fill_from_table_payload(payload, &mut local_cols8[..col_buf_len])?;
+                &local_cols8[..col_buf_len]
+            } else if col_buf_len <= 16 {
+                local_cols16 = [RawField::Null; 16];
+                self.table
+                    .fill_from_table_payload(payload, &mut local_cols16[..col_buf_len])?;
+                &local_cols16[..col_buf_len]
+            } else {
+                heap_cols = vec![RawField::Null; col_buf_len];
+                self.table
+                    .fill_from_table_payload(payload, &mut heap_cols)?;
+                &heap_cols
+            };
+            let ctx = FastRowCtx::single(rid, cols_slice, params, enc);
+            if check_extra_where
+                && let Some(ref pred) = self.extra_where
+                && !pred.eval_where_true(&ctx)?
+            {
+                return Ok(false);
+            }
+            if self.projections.len() <= INLINE_ROW_COLS && heap_rows.is_empty() {
+                let mut cols = [InlineVal::Null; INLINE_ROW_COLS];
+                let mut ok = true;
+                let mut fail_idx = 0usize;
+                let mut fail_val = Value::Null;
+                for (i, p) in self.projections.iter().enumerate() {
+                    match p.eval_inline_or_value(&ctx)? {
+                        Ok(iv) => cols[i] = iv,
+                        Err(v) => {
+                            ok = false;
+                            fail_idx = i;
+                            fail_val = v;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    inline_rows.push(InlineRow::from_raw_parts(
+                        self.projections.len() as u8,
+                        cols,
+                    ));
+                    return Ok(true);
+                }
+                heap_rows.reserve(inline_rows.len() + 1);
+                for ir in inline_rows.drain(..) {
+                    heap_rows.push(ir.to_vec_values());
+                }
+                let mut vals = Vec::with_capacity(self.projections.len());
+                for iv in &cols[..fail_idx] {
+                    vals.push(iv.to_value());
+                }
+                vals.push(fail_val);
+                for p in &self.projections[fail_idx + 1..] {
+                    vals.push(p.eval_value(&ctx)?);
+                }
+                heap_rows.push(vals);
+                return Ok(true);
+            }
+
+            let mut vals = Vec::with_capacity(self.projections.len());
+            for p in self.projections.iter() {
+                vals.push(p.eval_value(&ctx)?);
+            }
+            heap_rows.push(vals);
+            Ok(true)
+        })?;
+        Ok(matched_opt.unwrap_or(false))
+    }
+
     fn execute(
         &self,
         bt: &mut Btree,
         params: &[Value],
         enc: TextEncoding,
     ) -> Result<FastReadExecOut> {
-        let mut prefix_vals: Vec<Value> = Vec::with_capacity(self.prefix_keys.len());
-        for (k, &aff) in self.prefix_keys.iter().zip(self.prefix_affinities.iter()) {
-            let coerced = apply_index_seek_affinity(aff, k.resolve(params).clone());
-            if coerced.is_null() {
-                return match self.mode {
-                    OrderedIndexMode::ExactStream {
-                        outer_json_group_array: true,
-                        ..
-                    } => Ok(FastReadExecOut::SingleRow(vec![Value::Text(
-                        "[]".to_owned(),
-                    )])),
-                    _ => Ok(FastReadExecOut::Empty),
-                };
+        let empty_json_arr = || {
+            FastReadExecOut::SingleInlineRow(InlineRow::single(
+                InlineVal::try_short_text("[]").unwrap(),
+            ))
+        };
+        let mut prefix_stack: [Value; 4] = [const { Value::Null }; 4];
+        let mut prefix_heap: Vec<Value> = Vec::new();
+        let prefix_vals: &[Value] = if self.prefix_keys.len() <= 4 {
+            for (i, (k, &aff)) in self
+                .prefix_keys
+                .iter()
+                .zip(self.prefix_affinities.iter())
+                .enumerate()
+            {
+                let coerced = apply_index_seek_affinity(aff, k.resolve(params).clone());
+                if coerced.is_null() {
+                    return match self.mode {
+                        OrderedIndexMode::ExactStream {
+                            outer_json_group_array: true,
+                            ..
+                        } => Ok(empty_json_arr()),
+                        _ => Ok(FastReadExecOut::Empty),
+                    };
+                }
+                prefix_stack[i] = coerced;
             }
-            prefix_vals.push(coerced);
-        }
+            &prefix_stack[..self.prefix_keys.len()]
+        } else {
+            prefix_heap.reserve(self.prefix_keys.len());
+            for (k, &aff) in self.prefix_keys.iter().zip(self.prefix_affinities.iter()) {
+                let coerced = apply_index_seek_affinity(aff, k.resolve(params).clone());
+                if coerced.is_null() {
+                    return match self.mode {
+                        OrderedIndexMode::ExactStream {
+                            outer_json_group_array: true,
+                            ..
+                        } => Ok(empty_json_arr()),
+                        _ => Ok(FastReadExecOut::Empty),
+                    };
+                }
+                prefix_heap.push(coerced);
+            }
+            &prefix_heap
+        };
 
         if self.limit == 0 {
             return match self.mode {
                 OrderedIndexMode::ExactStream {
                     outer_json_group_array: true,
                     ..
-                } => Ok(FastReadExecOut::SingleRow(vec![Value::Text(
-                    "[]".to_owned(),
-                )])),
+                } => Ok(empty_json_arr()),
                 _ => Ok(FastReadExecOut::Empty),
             };
         }
@@ -3316,17 +5028,19 @@ impl OrderedIndexSelectPlan {
                 outer_json_group_array,
             } => {
                 let stop_on_idx = self.extra_where.is_none();
-                let mut candidate_rowids: Vec<i64> = Vec::with_capacity(self.limit.min(256));
+                let mut first_rids: [i64; 96] = [0; 96];
+                let mut first_len = 0usize;
+                let mut more_in_idx = false;
                 bt.seek_index_range_raw_cells(
                     self.index_root,
-                    &prefix_vals,
+                    prefix_vals,
                     None,
                     None,
                     &self.index_orders,
                     *reverse,
                     |cell| {
-                        let mut idx_fields: [RawField<'_>; 16] = [RawField::Null; 16];
-                        if rid_field_pos < 16 {
+                        let rid_opt = if rid_field_pos < 4 {
+                            let mut idx_fields: [RawField<'_>; 4] = [RawField::Null; 4];
                             let n = parse_raw_record_prefix(
                                 cell,
                                 &mut idx_fields[..rid_field_pos + 1],
@@ -3334,7 +5048,22 @@ impl OrderedIndexSelectPlan {
                             if rid_field_pos < n
                                 && let RawField::Int(rid) = idx_fields[rid_field_pos]
                             {
-                                candidate_rowids.push(rid);
+                                Some(rid)
+                            } else {
+                                None
+                            }
+                        } else if rid_field_pos < 16 {
+                            let mut idx_fields: [RawField<'_>; 16] = [RawField::Null; 16];
+                            let n = parse_raw_record_prefix(
+                                cell,
+                                &mut idx_fields[..rid_field_pos + 1],
+                            )?;
+                            if rid_field_pos < n
+                                && let RawField::Int(rid) = idx_fields[rid_field_pos]
+                            {
+                                Some(rid)
+                            } else {
+                                None
                             }
                         } else {
                             let mut heap_f = vec![RawField::Null; rid_field_pos + 1];
@@ -3342,71 +5071,53 @@ impl OrderedIndexSelectPlan {
                             if rid_field_pos < n
                                 && let RawField::Int(rid) = heap_f[rid_field_pos]
                             {
-                                candidate_rowids.push(rid);
+                                Some(rid)
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(rid) = rid_opt {
+                            if first_len < first_rids.len() {
+                                first_rids[first_len] = rid;
+                                first_len += 1;
+                                if stop_on_idx && first_len >= self.limit {
+                                    return Ok(ControlFlow::Break(()));
+                                }
+                            } else {
+                                more_in_idx = true;
+                                return Ok(ControlFlow::Break(()));
                             }
                         }
-                        if stop_on_idx && candidate_rowids.len() >= self.limit {
-                            Ok(ControlFlow::Break(()))
-                        } else {
-                            Ok(ControlFlow::Continue(()))
-                        }
+                        Ok(ControlFlow::Continue(()))
                     },
                 )?;
 
                 if *outer_json_group_array {
-                    let mut json_acc =
-                        AggregateAccumulator::new(AggregateKind::JsonGroupArray, false)
-                            .with_encoding(enc);
+                    let mut out = String::with_capacity(self.limit.min(64) * 10 + 2);
+                    out.push('[');
                     let mut matched = 0usize;
-                    for rid in candidate_rowids {
-                        let step_opt =
-                            bt.with_table_rowid_raw_cell(self.table.root_pgno, rid, |payload| {
-                                let mut local_cols: [RawField<'_>; 16] = [RawField::Null; 16];
-                                let mut heap_cols: Vec<RawField<'_>>;
-                                let cols_slice: &[RawField<'_>] = if col_buf_len <= 16 {
-                                    self.table.fill_from_table_payload(
-                                        payload,
-                                        &mut local_cols[..col_buf_len],
-                                    )?;
-                                    &local_cols[..col_buf_len]
-                                } else {
-                                    heap_cols = vec![RawField::Null; col_buf_len];
-                                    self.table
-                                        .fill_from_table_payload(payload, &mut heap_cols)?;
-                                    &heap_cols
-                                };
-                                let ctx = FastRowCtx::single(rid, cols_slice, params, enc);
-                                if let Some(ref pred) = self.extra_where
-                                    && !pred.eval_where_true(&ctx)?
-                                {
-                                    return Ok(None);
-                                }
-                                Ok(Some(self.projections[0].eval_runtime_value(&ctx)?))
-                            })?;
-                        if let Some(Some(rv)) = step_opt {
-                            json_acc.step_rt(&[rv])?;
-                            matched += 1;
-                            if matched >= self.limit {
-                                break;
-                            }
-                        }
-                    }
-                    return Ok(FastReadExecOut::SingleRow(vec![json_acc.finalize()?]));
-                }
-
-                let mut rows: Vec<Vec<Value>> =
-                    Vec::with_capacity(self.limit.min(candidate_rowids.len()));
-                for rid in candidate_rowids {
-                    let row_opt =
+                    let probe_rid_json = |bt: &mut Btree,
+                                          rid: i64,
+                                          out: &mut String,
+                                          matched: &mut usize|
+                     -> Result<()> {
                         bt.with_table_rowid_raw_cell(self.table.root_pgno, rid, |payload| {
-                            let mut local_cols: [RawField<'_>; 16] = [RawField::Null; 16];
+                            let mut local_cols8: [RawField<'_>; 8] = [RawField::Null; 8];
+                            let mut local_cols16: [RawField<'_>; 16];
                             let mut heap_cols: Vec<RawField<'_>>;
-                            let cols_slice: &[RawField<'_>] = if col_buf_len <= 16 {
+                            let cols_slice: &[RawField<'_>] = if col_buf_len <= 8 {
                                 self.table.fill_from_table_payload(
                                     payload,
-                                    &mut local_cols[..col_buf_len],
+                                    &mut local_cols8[..col_buf_len],
                                 )?;
-                                &local_cols[..col_buf_len]
+                                &local_cols8[..col_buf_len]
+                            } else if col_buf_len <= 16 {
+                                local_cols16 = [RawField::Null; 16];
+                                self.table.fill_from_table_payload(
+                                    payload,
+                                    &mut local_cols16[..col_buf_len],
+                                )?;
+                                &local_cols16[..col_buf_len]
                             } else {
                                 heap_cols = vec![RawField::Null; col_buf_len];
                                 self.table
@@ -3417,22 +5128,106 @@ impl OrderedIndexSelectPlan {
                             if let Some(ref pred) = self.extra_where
                                 && !pred.eval_where_true(&ctx)?
                             {
-                                return Ok(None);
+                                return Ok(());
                             }
-                            let mut vals = Vec::with_capacity(self.projections.len());
-                            for p in self.projections.iter() {
-                                vals.push(p.eval_value(&ctx)?);
+                            if *matched > 0 {
+                                out.push(',');
                             }
-                            Ok(Some(vals))
+                            self.projections[0].append_json_elem(&ctx, out)?;
+                            *matched += 1;
+                            Ok(())
                         })?;
-                    if let Some(Some(vals)) = row_opt {
-                        rows.push(vals);
-                        if rows.len() >= self.limit {
+                        Ok(())
+                    };
+
+                    for &rid in &first_rids[..first_len] {
+                        probe_rid_json(bt, rid, &mut out, &mut matched)?;
+                        if matched >= self.limit {
+                            break;
+                        }
+                    }
+                    if matched < self.limit && more_in_idx {
+                        let rest_rids = self.collect_remaining_exact_rowids(
+                            bt,
+                            prefix_vals,
+                            *reverse,
+                            first_len,
+                            stop_on_idx,
+                        )?;
+                        for rid in rest_rids {
+                            probe_rid_json(bt, rid, &mut out, &mut matched)?;
+                            if matched >= self.limit {
+                                break;
+                            }
+                        }
+                    }
+                    out.push(']');
+                    if let Some(iv) = InlineVal::try_short_text(&out) {
+                        return Ok(FastReadExecOut::SingleInlineRow(InlineRow::single(iv)));
+                    }
+                    return Ok(FastReadExecOut::SingleRow(vec![Value::Text(out)]));
+                }
+
+                let cap = self.limit.min(first_len.max(8));
+                let mut inline_rows: Vec<InlineRow> = if self.projections.len() <= INLINE_ROW_COLS {
+                    Vec::with_capacity(cap)
+                } else {
+                    Vec::new()
+                };
+                let mut heap_rows: Vec<Vec<Value>> = if self.projections.len() <= INLINE_ROW_COLS {
+                    Vec::new()
+                } else {
+                    Vec::with_capacity(cap)
+                };
+                let mut matched = 0usize;
+                for &rid in &first_rids[..first_len] {
+                    if self.probe_and_emit_row(
+                        bt,
+                        rid,
+                        col_buf_len,
+                        true,
+                        params,
+                        enc,
+                        &mut inline_rows,
+                        &mut heap_rows,
+                    )? {
+                        matched += 1;
+                        if matched >= self.limit {
                             break;
                         }
                     }
                 }
-                Ok(FastReadExecOut::from_rows(rows))
+                if matched < self.limit && more_in_idx {
+                    let rest_rids = self.collect_remaining_exact_rowids(
+                        bt,
+                        prefix_vals,
+                        *reverse,
+                        first_len,
+                        stop_on_idx,
+                    )?;
+                    for rid in rest_rids {
+                        if self.probe_and_emit_row(
+                            bt,
+                            rid,
+                            col_buf_len,
+                            true,
+                            params,
+                            enc,
+                            &mut inline_rows,
+                            &mut heap_rows,
+                        )? {
+                            matched += 1;
+                            if matched >= self.limit {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if !heap_rows.is_empty() {
+                    Ok(FastReadExecOut::from_rows(heap_rows))
+                } else {
+                    Ok(FastReadExecOut::from_inline_rows(inline_rows))
+                }
             }
             OrderedIndexMode::ReverseTieBreakRowidAsc {
                 sort_idx_pos,
@@ -3444,22 +5239,35 @@ impl OrderedIndexSelectPlan {
                 let mut candidates: Vec<(Value, i64)> = Vec::with_capacity(self.limit + 4);
                 bt.seek_index_range_raw_cells(
                     self.index_root,
-                    &prefix_vals,
+                    prefix_vals,
                     None,
                     None,
                     &self.index_orders,
                     true,
                     |cell| {
-                        let mut idx_fields: [RawField<'_>; 16] = [RawField::Null; 16];
-                        let n =
-                            parse_raw_record_prefix(cell, &mut idx_fields[..rid_field_pos + 1])?;
+                        let mut idx_fields4: [RawField<'_>; 4] = [RawField::Null; 4];
+                        let mut idx_fields16: [RawField<'_>; 16];
+                        let (n, idx_slice): (usize, &[RawField<'_>]) = if rid_field_pos < 4 {
+                            let n = parse_raw_record_prefix(
+                                cell,
+                                &mut idx_fields4[..rid_field_pos + 1],
+                            )?;
+                            (n, &idx_fields4[..rid_field_pos + 1])
+                        } else {
+                            idx_fields16 = [RawField::Null; 16];
+                            let n = parse_raw_record_prefix(
+                                cell,
+                                &mut idx_fields16[..rid_field_pos + 1],
+                            )?;
+                            (n, &idx_fields16[..rid_field_pos + 1])
+                        };
                         if rid_field_pos >= n {
                             return Ok(ControlFlow::Continue(()));
                         }
-                        let RawField::Int(rid) = idx_fields[rid_field_pos] else {
+                        let RawField::Int(rid) = idx_slice[rid_field_pos] else {
                             return Ok(ControlFlow::Continue(()));
                         };
-                        let sv_raw = idx_fields[*sort_idx_pos];
+                        let sv_raw = idx_slice[*sort_idx_pos];
                         if candidates.len() >= self.limit {
                             let kth = &candidates[self.limit - 1].0;
                             let strictly_smaller = match (sv_raw, kth) {
@@ -3496,36 +5304,33 @@ impl OrderedIndexSelectPlan {
                 });
                 candidates.truncate(self.limit);
 
-                let mut rows: Vec<Vec<Value>> = Vec::with_capacity(candidates.len());
+                let mut inline_rows: Vec<InlineRow> = if self.projections.len() <= INLINE_ROW_COLS {
+                    Vec::with_capacity(candidates.len())
+                } else {
+                    Vec::new()
+                };
+                let mut heap_rows: Vec<Vec<Value>> = if self.projections.len() <= INLINE_ROW_COLS {
+                    Vec::new()
+                } else {
+                    Vec::with_capacity(candidates.len())
+                };
                 for (_, rid) in candidates {
-                    let row_opt =
-                        bt.with_table_rowid_raw_cell(self.table.root_pgno, rid, |payload| {
-                            let mut local_cols: [RawField<'_>; 16] = [RawField::Null; 16];
-                            let mut heap_cols: Vec<RawField<'_>>;
-                            let cols_slice: &[RawField<'_>] = if col_buf_len <= 16 {
-                                self.table.fill_from_table_payload(
-                                    payload,
-                                    &mut local_cols[..col_buf_len],
-                                )?;
-                                &local_cols[..col_buf_len]
-                            } else {
-                                heap_cols = vec![RawField::Null; col_buf_len];
-                                self.table
-                                    .fill_from_table_payload(payload, &mut heap_cols)?;
-                                &heap_cols
-                            };
-                            let ctx = FastRowCtx::single(rid, cols_slice, params, enc);
-                            let mut vals = Vec::with_capacity(self.projections.len());
-                            for p in self.projections.iter() {
-                                vals.push(p.eval_value(&ctx)?);
-                            }
-                            Ok(vals)
-                        })?;
-                    if let Some(vals) = row_opt {
-                        rows.push(vals);
-                    }
+                    self.probe_and_emit_row(
+                        bt,
+                        rid,
+                        col_buf_len,
+                        false,
+                        params,
+                        enc,
+                        &mut inline_rows,
+                        &mut heap_rows,
+                    )?;
                 }
-                Ok(FastReadExecOut::from_rows(rows))
+                if !heap_rows.is_empty() {
+                    Ok(FastReadExecOut::from_rows(heap_rows))
+                } else {
+                    Ok(FastReadExecOut::from_inline_rows(inline_rows))
+                }
             }
         }
     }
@@ -3596,10 +5401,11 @@ impl EquiJoinGroupByPlan {
         bt: &mut Btree,
         params: &[Value],
         enc: TextEncoding,
-    ) -> Result<Vec<Vec<Value>>> {
+    ) -> Result<FastReadExecOut> {
         // 1. Scan filtered build table into compact `ArenaMultiMap`:
         let mut build_map: ArenaMultiMap<BuildSideRow> = ArenaMultiMap::with_capacity(512, 12);
         let n_kept = self.build_kept_cols.len();
+        let n_aggs = self.aggs.len();
 
         scan_single_table_rows(
             bt,
@@ -3670,13 +5476,13 @@ impl EquiJoinGroupByPlan {
         )?;
 
         if build_map.used_buckets == 0 {
-            return Ok(Vec::new());
+            return Ok(FastReadExecOut::Empty);
         }
 
         // 2. Stream probe table once, probing `build_map` and accumulating directly into groups:
         let mut dense_slots: [u32; 256] = [u32::MAX; 256];
         let mut group_map: HashMap<HashGroupBucketKey, u32, FastBuildHasher> = HashMap::default();
-        let mut groups: Vec<(Value, Vec<FastAggState>)> = Vec::with_capacity(32);
+        let mut groups: Vec<(Value, SmallGroupAggStates)> = Vec::with_capacity(32);
         let b_col_len = if self.build_table.needs_record_parse {
             self.build_table.max_record_col + 1
         } else {
@@ -3737,14 +5543,22 @@ impl EquiJoinGroupByPlan {
                     let (ref brow, next_idx) = build_map.entries[cur_entry as usize];
                     cur_entry = next_idx;
 
-                    let mut b_raw_local: [RawField<'_>; 16] = [RawField::Null; 16];
+                    let mut b_raw_local8: [RawField<'_>; 8] = [RawField::Null; 8];
+                    let mut b_raw_local16: [RawField<'_>; 16];
                     let mut b_raw_heap: Vec<RawField<'_>>;
-                    let b_slice: &[RawField<'_>] = if b_col_len <= 16 {
+                    let b_slice: &[RawField<'_>] = if b_col_len <= 8 {
                         let kv = brow.kept_vals.as_slice(n_kept);
                         for (slot, &ci) in self.build_kept_cols.iter().enumerate() {
-                            b_raw_local[ci as usize] = value_as_raw_field(&kv[slot]);
+                            b_raw_local8[ci as usize] = value_as_raw_field(&kv[slot]);
                         }
-                        &b_raw_local[..b_col_len]
+                        &b_raw_local8[..b_col_len]
+                    } else if b_col_len <= 16 {
+                        b_raw_local16 = [RawField::Null; 16];
+                        let kv = brow.kept_vals.as_slice(n_kept);
+                        for (slot, &ci) in self.build_kept_cols.iter().enumerate() {
+                            b_raw_local16[ci as usize] = value_as_raw_field(&kv[slot]);
+                        }
+                        &b_raw_local16[..b_col_len]
                     } else {
                         b_raw_heap = vec![RawField::Null; b_col_len];
                         let kv = brow.kept_vals.as_slice(n_kept);
@@ -3775,11 +5589,7 @@ impl EquiJoinGroupByPlan {
                         let slot = &mut dense_slots[iv as usize];
                         if *slot == u32::MAX {
                             let idx = groups.len();
-                            let init_states = self
-                                .aggs
-                                .iter()
-                                .map(|s| FastAggState::from_spec(s, enc))
-                                .collect();
+                            let init_states = SmallGroupAggStates::from_specs(&self.aggs, enc);
                             groups.push((Value::Integer(iv), init_states));
                             *slot = idx as u32;
                             idx
@@ -3797,18 +5607,14 @@ impl EquiJoinGroupByPlan {
                             idx as usize
                         } else {
                             let idx = groups.len();
-                            let init_states = self
-                                .aggs
-                                .iter()
-                                .map(|s| FastAggState::from_spec(s, enc))
-                                .collect();
+                            let init_states = SmallGroupAggStates::from_specs(&self.aggs, enc);
                             groups.push((owned, init_states));
                             group_map.insert(bkey, idx as u32);
                             idx
                         }
                     };
 
-                    let states = &mut groups[grp_idx].1;
+                    let states = groups[grp_idx].1.as_mut_slice(n_aggs);
                     for (st, spec) in states.iter_mut().zip(self.aggs.iter()) {
                         st.step(spec, &j_ctx)?;
                     }
@@ -3817,52 +5623,7 @@ impl EquiJoinGroupByPlan {
             },
         )?;
 
-        if groups.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut finalized: Vec<(Value, Vec<Value>)> = Vec::with_capacity(groups.len());
-        for (gk, states) in groups {
-            let mut agg_vals = Vec::with_capacity(self.aggs.len());
-            for (st, spec) in states.iter().zip(self.aggs.iter()) {
-                agg_vals.push(st.finalize(spec)?);
-            }
-            finalized.push((gk, agg_vals));
-        }
-
-        if !self.order_by.is_empty() && finalized.len() > 1 {
-            fallible_sort_by(&mut finalized, |(k_a, a_a), (k_b, a_b)| {
-                let ka_arr = [k_a.clone()];
-                let kb_arr = [k_b.clone()];
-                for ob in self.order_by.iter() {
-                    let va = ob.proj_or_key.eval(&ka_arr, a_a);
-                    let vb = ob.proj_or_key.eval(&kb_arr, a_b);
-                    let ord = compare_order_by_values(
-                        &va,
-                        &vb,
-                        ob.desc,
-                        ob.nulls_last,
-                        ob.collation,
-                        enc,
-                    );
-                    if ord != Ordering::Equal {
-                        return Ok(ord);
-                    }
-                }
-                Ok(Ordering::Equal)
-            })?;
-        }
-
-        let mut out_rows = Vec::with_capacity(finalized.len());
-        for (gk, agg_vals) in finalized {
-            let key_arr = [gk];
-            let mut row = Vec::with_capacity(self.projections.len());
-            for p in self.projections.iter() {
-                row.push(p.eval(&key_arr, &agg_vals));
-            }
-            out_rows.push(row);
-        }
-        Ok(out_rows)
+        finalize_and_emit_group_rows(groups, &self.aggs, &self.order_by, &self.projections, enc)
     }
 }
 
@@ -4088,7 +5849,9 @@ struct EquiJoinProjectPlan {
 /// Output of executing a [`FastReadPlan`].
 pub enum FastReadExecOut {
     Empty,
+    SingleInlineRow(InlineRow),
     SingleRow(Vec<Value>),
+    InlineRows(Vec<InlineRow>),
     Rows(Vec<Vec<Value>>),
     /// Ultra-compact arena representation of N single-column `Text` (or `Null` when `len == u32::MAX`) rows.
     SingleTextArena {
@@ -4099,18 +5862,52 @@ pub enum FastReadExecOut {
 
 impl FastReadExecOut {
     #[inline]
+    fn from_inline_rows(mut rows: Vec<InlineRow>) -> Self {
+        match rows.len() {
+            0 => Self::Empty,
+            1 => Self::SingleInlineRow(rows.pop().unwrap()),
+            _ => Self::InlineRows(rows),
+        }
+    }
+
+    #[inline]
     fn from_rows(mut rows: Vec<Vec<Value>>) -> Self {
         match rows.len() {
             0 => Self::Empty,
-            1 => Self::SingleRow(rows.pop().unwrap()),
-            _ => Self::Rows(rows),
+            1 => {
+                let first = rows.pop().unwrap();
+                match InlineRow::try_from_values(&first) {
+                    Some(ir) => Self::SingleInlineRow(ir),
+                    None => Self::SingleRow(first),
+                }
+            }
+            _ => {
+                if rows.first().is_some_and(|r| r.len() <= INLINE_ROW_COLS) {
+                    let mut inline_out = Vec::with_capacity(rows.len());
+                    let mut all_ok = true;
+                    for r in &rows {
+                        if let Some(ir) = InlineRow::try_from_values(r) {
+                            inline_out.push(ir);
+                        } else {
+                            all_ok = false;
+                            break;
+                        }
+                    }
+                    if all_ok {
+                        return Self::InlineRows(inline_out);
+                    }
+                }
+                Self::Rows(rows)
+            }
         }
     }
 
     pub fn into_materialized_rows(self) -> Vec<Vec<Value>> {
         match self {
             Self::Empty => Vec::new(),
+            Self::SingleInlineRow(ir) => vec![ir.to_vec_values()],
             Self::SingleRow(r) => vec![r],
+            Self::InlineRows(irs) => irs.into_iter().map(|ir| ir.to_vec_values()).collect(),
             Self::Rows(rs) => rs,
             Self::SingleTextArena { arena, spans } => spans
                 .into_iter()
@@ -4638,19 +6435,11 @@ impl FastReadPlan {
         enc: TextEncoding,
     ) -> Result<FastReadExecOut> {
         match &self.kind {
-            FastReadKind::UngroupedAgg(p) => {
-                Ok(FastReadExecOut::SingleRow(p.execute(bt, params, enc)?))
-            }
-            FastReadKind::OrderedCoveringGroupBy(p) => {
-                Ok(FastReadExecOut::from_rows(p.execute(bt, params, enc)?))
-            }
-            FastReadKind::HashGroupBy(p) => {
-                Ok(FastReadExecOut::from_rows(p.execute(bt, params, enc)?))
-            }
+            FastReadKind::UngroupedAgg(p) => p.execute(bt, params, enc),
+            FastReadKind::OrderedCoveringGroupBy(p) => p.execute(bt, params, enc),
+            FastReadKind::HashGroupBy(p) => p.execute(bt, params, enc),
             FastReadKind::OrderedIndexSelect(p) => p.execute(bt, params, enc),
-            FastReadKind::EquiJoinGroupBy(p) => {
-                Ok(FastReadExecOut::from_rows(p.execute(bt, params, enc)?))
-            }
+            FastReadKind::EquiJoinGroupBy(p) => p.execute(bt, params, enc),
             FastReadKind::EquiJoinProject(p) => p.execute(bt, params, enc),
         }
     }
@@ -5097,6 +6886,9 @@ fn try_compile_single_table_core(
         );
         let access = compile_fast_single_access(&ap, tbl, &td, &exact_cols, needs_rowid)?;
 
+        let morsel_range =
+            try_compile_ungrouped_morsel_range_spec(&access, compiled_where.as_ref(), &aggs);
+
         return Some(FastReadPlan {
             db_id,
             column_names: col_names,
@@ -5107,6 +6899,7 @@ fn try_compile_single_table_core(
                 where_pred: compiled_where,
                 aggs: aggs.into_boxed_slice(),
                 projections: projs.into_boxed_slice(),
+                morsel_range,
             }),
         });
     }
@@ -5231,6 +7024,14 @@ fn try_compile_single_table_core(
                     None => false,
                     Some(want_desc) => want_desc != idx_desc,
                 };
+                let morsel_grp = try_compile_group_col1_morsel_spec(
+                    &cov,
+                    reverse,
+                    gb_rc.src,
+                    gb_coll,
+                    compiled_where.as_ref(),
+                    &aggs,
+                );
                 return Some(FastReadPlan {
                     db_id,
                     column_names: col_names,
@@ -5244,6 +7045,7 @@ fn try_compile_single_table_core(
                         where_pred: compiled_where,
                         aggs: aggs.into_boxed_slice(),
                         projections: projs.into_boxed_slice(),
+                        morsel_grp,
                     }),
                 });
             }

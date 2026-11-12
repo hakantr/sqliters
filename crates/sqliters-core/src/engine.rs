@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use sqliters_btree::{Btree, RootPageMove, commit_btrees_two_phase};
+use sqliters_btree::{ArenaIndexEntry, Btree, RootPageMove, commit_btrees_two_phase};
 use sqliters_pager::{
     AutoVacuumMode, JournalMode, LockingMode, PagerOpenOptions, TransactionState,
     WalCheckpointMode, WalCheckpointResult,
@@ -26,9 +26,9 @@ use sqliters_syntax::{
 };
 use sqliters_types::{
     Collation, ConflictResolutionEffect, DatabaseId, DatabaseKind, ErrorCode, ExecutionServices,
-    FunctionFlags, KeySortOrder, Pgno, Result, RuntimeValue, SqliteError, TextEncoding,
-    TypeAffinity, Value, decode_record_with_encoding, encode_record_with_encoding, extended,
-    fallible_sort_by,
+    FunctionFlags, INLINE_ROW_COLS, InlineRow, InlineVal, KeySortOrder, Pgno, Result, RuntimeValue,
+    SqliteError, TextEncoding, TypeAffinity, Value, decode_record_with_encoding,
+    encode_record_with_encoding, extended, fallible_sort_by,
 };
 use sqliters_vdbe::{
     AggregateAccumulator, AggregateKind, Opcode, VmRuntimeContext, builtin_window_arity,
@@ -67,11 +67,11 @@ use crate::trigger::{
     validate_trigger_body_dml_targets,
 };
 use crate::window::{
-    ResolvedWindowSpec, WIN_SLOT_SCHEMA, WindowExecItem, chain_window_definitions,
+    InlineWinVals, ResolvedWindowSpec, WIN_SLOT_SCHEMA, WindowExecItem, chain_window_definitions,
     check_aliased_window_misuse, classify_and_validate_window_fn, collect_and_rewrite_window_calls,
-    core_has_regular_aggregates, core_has_window, execute_window_pipeline, expr_contains_window,
-    finalize_window_spec_for_fn, first_window_function_name_in_expr, is_window_bound_constant,
-    resolve_over_clause,
+    core_has_regular_aggregates, core_has_window, execute_window_pipeline,
+    execute_window_pipeline_opts, expr_contains_window, finalize_window_spec_for_fn,
+    first_window_function_name_in_expr, is_window_bound_constant, resolve_over_clause,
 };
 
 /// Materialized result set (`column_names` + `rows`) produced by executing a statement.
@@ -2371,6 +2371,38 @@ pub(crate) fn execute_read_body(
     }
 }
 
+/// Executes a `Read` statement body for `Statement::step()`, populating `inline_out` without
+/// per-row `Vec<Value>` allocations when eligible (`<= 4` inline columns).
+pub(crate) fn execute_read_body_for_step(
+    ctx: &mut ExecContext<'_>,
+    stmt: &Stmt,
+    params: &[Value],
+    inline_out: &mut Vec<InlineRow>,
+) -> Result<QueryOutput> {
+    if let Stmt::Select(sel) = stmt
+        && sel.ctes.is_empty()
+        && sel.body.compounds.is_empty()
+        && sel.limit.is_none()
+        && let SelectCore::Select { ref projection, .. } = sel.body.head
+        && (projection
+            .iter()
+            .any(|rc| matches!(rc, ResultColumn::Expr { expr, .. } if expr_contains_window(expr)))
+            || sel.order_by.iter().any(|ob| expr_contains_window(&ob.expr)))
+    {
+        return exec_single_select_core_opts(
+            ctx,
+            &sel.body.head,
+            &sel.order_by,
+            None,
+            params,
+            &[],
+            &CteStore::default(),
+            Some(inline_out),
+        );
+    }
+    execute_read_body(ctx, stmt, params)
+}
+
 /// Fast-path VDBE execution for compiled single-table DML (`INSERT`, `UPDATE`, `DELETE`) programs.
 pub(crate) fn try_execute_compiled_insert(
     ctx: &mut ExecContext<'_>,
@@ -3286,7 +3318,11 @@ pub fn shadow_put_rowid_direct(
             let fk_enabled = *ctx.foreign_keys;
             let inst_id = slot.schema_instance_id;
             let max_pages = slot.max_page_count;
-            let mut fast_payload: Option<(Pgno, Vec<u8>)> = None;
+            enum FastShadowPayload {
+                Stack(Pgno, [u8; 16], usize),
+                Heap(Pgno, Vec<u8>),
+            }
+            let mut fast_payload: Option<FastShadowPayload> = None;
             if let Some(tbl) = slot
                 .schema
                 .tables
@@ -3321,24 +3357,97 @@ pub fn shadow_put_rowid_direct(
                     && let Some(ref bt) = slot.btree
                 {
                     let enc = bt.encoding();
-                    let mut rec_vals = Vec::with_capacity(cols.len());
-                    for (i, v) in cols.iter().enumerate() {
-                        if Some(i) == tbl.rowid_alias_col {
-                            rec_vals.push(Value::Null);
-                        } else {
-                            rec_vals.push(tbl.columns[i].affinity.apply(v.clone()));
+                    if cols.len() == 2 && tbl.rowid_alias_col == Some(0) {
+                        let col1_aff = tbl.columns[1].affinity;
+                        if let Value::Integer(n) = cols[1]
+                            && matches!(
+                                col1_aff,
+                                TypeAffinity::Blob | TypeAffinity::Integer | TypeAffinity::Numeric
+                            )
+                        {
+                            let mut sbuf = [0u8; 16];
+                            sbuf[0] = 3;
+                            sbuf[1] = 0;
+                            let slen = if n == 0 {
+                                sbuf[2] = 8;
+                                3
+                            } else if n == 1 {
+                                sbuf[2] = 9;
+                                3
+                            } else {
+                                let u = if n < 0 { (!n) as u64 } else { n as u64 };
+                                if u <= 127 {
+                                    sbuf[2] = 1;
+                                    sbuf[3] = n as u8;
+                                    4
+                                } else if u <= 32_767 {
+                                    sbuf[2] = 2;
+                                    let b = (n as i16).to_be_bytes();
+                                    sbuf[3] = b[0];
+                                    sbuf[4] = b[1];
+                                    5
+                                } else if u <= 8_388_607 {
+                                    sbuf[2] = 3;
+                                    let b = (n as i32).to_be_bytes();
+                                    sbuf[3..6].copy_from_slice(&b[1..4]);
+                                    6
+                                } else if u <= 2_147_483_647 {
+                                    sbuf[2] = 4;
+                                    let b = (n as i32).to_be_bytes();
+                                    sbuf[3..7].copy_from_slice(&b);
+                                    7
+                                } else if u <= 0x0000_7fff_ffff_ffff {
+                                    sbuf[2] = 5;
+                                    let b = n.to_be_bytes();
+                                    sbuf[3..9].copy_from_slice(&b[2..8]);
+                                    9
+                                } else {
+                                    sbuf[2] = 6;
+                                    let b = n.to_be_bytes();
+                                    sbuf[3..11].copy_from_slice(&b);
+                                    11
+                                }
+                            };
+                            fast_payload =
+                                Some(FastShadowPayload::Stack(tbl.root_pgno, sbuf, slen));
+                        } else if matches!(&cols[1], Value::Blob(_))
+                            && col1_aff == TypeAffinity::Blob
+                        {
+                            let mut hbuf = Vec::new();
+                            sqliters_types::encode_value_refs_record_into(
+                                &[&Value::Null, &cols[1]],
+                                enc,
+                                &mut hbuf,
+                            );
+                            fast_payload = Some(FastShadowPayload::Heap(tbl.root_pgno, hbuf));
                         }
                     }
-                    fast_payload =
-                        Some((tbl.root_pgno, encode_record_with_encoding(&rec_vals, enc)));
+                    if fast_payload.is_none() {
+                        let mut rec_vals = Vec::with_capacity(cols.len());
+                        for (i, v) in cols.iter().enumerate() {
+                            if Some(i) == tbl.rowid_alias_col {
+                                rec_vals.push(Value::Null);
+                            } else {
+                                rec_vals.push(tbl.columns[i].affinity.apply(v.clone()));
+                            }
+                        }
+                        fast_payload = Some(FastShadowPayload::Heap(
+                            tbl.root_pgno,
+                            encode_record_with_encoding(&rec_vals, enc),
+                        ));
+                    }
                 }
             }
-            if let Some((root_pgno, payload)) = fast_payload
+            if let Some(ref fp) = fast_payload
                 && let Some(ref mut bt) = slot.btree
             {
+                let (root_pgno, payload): (Pgno, &[u8]) = match fp {
+                    FastShadowPayload::Stack(pg, buf, len) => (*pg, &buf[..*len]),
+                    FastShadowPayload::Heap(pg, buf) => (*pg, buf.as_slice()),
+                };
                 let duplicate = !or_replace && bt.seek_table_rowid(root_pgno, rowid)?.is_some();
                 if !duplicate {
-                    bt.insert_table(root_pgno, rowid, &payload)?;
+                    bt.insert_table(root_pgno, rowid, payload)?;
                     if bt.pager().page_count() > max_pages {
                         return Err(SqliteError::new(
                             ErrorCode::Full,
@@ -4686,6 +4795,20 @@ fn exec_single_select_core(
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
 ) -> Result<QueryOutput> {
+    exec_single_select_core_opts(ctx, core, order_by, limit, params, outer_scopes, ctes, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exec_single_select_core_opts(
+    ctx: &mut ExecContext<'_>,
+    core: &SelectCore,
+    order_by: &[OrderByTerm],
+    limit: Option<&LimitClause>,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    ctes: &CteStore,
+    inline_out: Option<&mut Vec<InlineRow>>,
+) -> Result<QueryOutput> {
     match core {
         SelectCore::Values(expr_rows) => {
             if expr_rows.is_empty() {
@@ -4717,7 +4840,7 @@ fn exec_single_select_core(
                     let mut items = vec![WindowExecItem {
                         row: EvalRow::default(),
                         group_rows: None,
-                        win_vals: Vec::new(),
+                        win_vals: InlineWinVals::new(),
                     }];
                     execute_window_pipeline(
                         ctx,
@@ -5167,7 +5290,7 @@ fn exec_single_select_core(
                         win_items.push(WindowExecItem {
                             row: rep_row,
                             group_rows: Some(group_rows),
-                            win_vals: Vec::new(),
+                            win_vals: InlineWinVals::new(),
                         });
                     }
                 } else {
@@ -5175,20 +5298,10 @@ fn exec_single_select_core(
                         win_items.push(WindowExecItem {
                             row,
                             group_rows: None,
-                            win_vals: Vec::new(),
+                            win_vals: InlineWinVals::new(),
                         });
                     }
                 }
-
-                execute_window_pipeline(
-                    ctx,
-                    &mut win_items,
-                    &win_calls,
-                    &sample_cols,
-                    params,
-                    outer_scopes,
-                    ctes,
-                )?;
 
                 #[derive(Clone, Copy)]
                 enum FastPostWinProj {
@@ -5204,26 +5317,192 @@ fn exec_single_select_core(
                     } else {
                         None
                     };
+                let resolve_post_win_expr = |pe: &Expr| -> Option<FastPostWinProj> {
+                    let Expr::Column(cref) = pe else {
+                        return None;
+                    };
+                    if cref.schema.as_deref() == Some(WIN_SLOT_SCHEMA) {
+                        return cref.column.parse::<usize>().ok().map(FastPostWinProj::Win);
+                    }
+                    let dummy = dummy_post_win.as_ref()?;
+                    match dummy.lookup_qual_idx(
+                        cref.schema.as_deref(),
+                        cref.table.as_deref(),
+                        &cref.column,
+                    ) {
+                        Ok(Some(idx)) => Some(FastPostWinProj::Row(idx)),
+                        _ => None,
+                    }
+                };
                 let fast_proj_slots: Vec<Option<FastPostWinProj>> = rewritten_proj
                     .iter()
-                    .map(|(pe, _, _)| {
-                        let Expr::Column(cref) = pe else {
-                            return None;
-                        };
-                        if cref.schema.as_deref() == Some(WIN_SLOT_SCHEMA) {
-                            return cref.column.parse::<usize>().ok().map(FastPostWinProj::Win);
-                        }
-                        let dummy = dummy_post_win.as_ref()?;
-                        match dummy.lookup_qual_idx(
-                            cref.schema.as_deref(),
-                            cref.table.as_deref(),
-                            &cref.column,
-                        ) {
-                            Ok(Some(idx)) => Some(FastPostWinProj::Row(idx)),
-                            _ => None,
-                        }
-                    })
+                    .map(|(pe, _, _)| resolve_post_win_expr(pe))
                     .collect();
+                let all_proj_fast = !is_agg
+                    && outer_scopes.is_empty()
+                    && fast_proj_slots.iter().all(Option::is_some);
+                let fast_single_ob: Option<(FastPostWinProj, KeySortOrder)> = if all_proj_fast
+                    && !*distinct
+                    && limit.is_none()
+                    && order_by.len() == 1
+                {
+                    let ob = &order_by[0];
+                    let rob = &rewritten_ob[0];
+                    let ob_slot = if let Some(ord) = strip_collate_and_unary_plus(&ob.expr) {
+                        fast_proj_slots[(ord as usize) - 1]
+                    } else {
+                        resolve_post_win_expr(rob).or_else(|| {
+                            if let Expr::Column(cref) = rob
+                                && cref.schema.is_none()
+                                && cref.table.is_none()
+                            {
+                                rewritten_proj
+                                    .iter()
+                                    .position(|(_, _, al)| {
+                                        al.as_ref()
+                                            .is_some_and(|a| a.eq_ignore_ascii_case(&cref.column))
+                                    })
+                                    .and_then(|pi| fast_proj_slots[pi])
+                            } else {
+                                None
+                            }
+                        })
+                    };
+                    if let Some(slot) = ob_slot
+                        && infer_order_by_custom_collation(&ob.expr, &expanded_proj, &sample_cols)
+                            .is_none()
+                    {
+                        let coll = infer_order_by_collation(&ob.expr, &expanded_proj, &sample_cols);
+                        Some((
+                            slot,
+                            KeySortOrder {
+                                desc: ob.desc,
+                                nulls_last: ob.nulls_last.unwrap_or(ob.desc),
+                                collation: coll,
+                                custom_collation: None,
+                            },
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let can_emit_inline = inline_out.is_some()
+                    && all_proj_fast
+                    && !*distinct
+                    && limit.is_none()
+                    && rewritten_proj.len() <= INLINE_ROW_COLS
+                    && (order_by.is_empty() || fast_single_ob.is_some());
+
+                execute_window_pipeline_opts(
+                    ctx,
+                    &mut win_items,
+                    &win_calls,
+                    &sample_cols,
+                    params,
+                    outer_scopes,
+                    ctes,
+                    !can_emit_inline && !(all_proj_fast && order_by.is_empty()),
+                )?;
+
+                if can_emit_inline {
+                    if col_names.len() > ctx.db_set.column_limit() {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            "too many columns in result set",
+                        ));
+                    }
+                    fn read_slot_val(item: &WindowExecItem, slot: FastPostWinProj) -> &Value {
+                        match slot {
+                            FastPostWinProj::Row(idx) => &item.row.vals[idx],
+                            FastPostWinProj::Win(idx) => {
+                                item.win_vals.get(idx).map_or(&Value::Null, |rv| &rv.value)
+                            }
+                        }
+                    }
+                    let n_proj = rewritten_proj.len();
+                    let enc = ctx.encoding();
+                    if let Some((ob_slot, ob_spec)) = fast_single_ob {
+                        let cmp_ob = |a: &Value, b: &Value| -> Ordering {
+                            match (a.is_null(), b.is_null()) {
+                                (true, true) => Ordering::Equal,
+                                (true, false) => {
+                                    if ob_spec.nulls_last {
+                                        Ordering::Greater
+                                    } else {
+                                        Ordering::Less
+                                    }
+                                }
+                                (false, true) => {
+                                    if ob_spec.nulls_last {
+                                        Ordering::Less
+                                    } else {
+                                        Ordering::Greater
+                                    }
+                                }
+                                (false, false) => {
+                                    let raw = a.cmp_sqlite_with_encoding(b, ob_spec.collation, enc);
+                                    if ob_spec.desc { raw.reverse() } else { raw }
+                                }
+                            }
+                        };
+                        let already_sorted = win_items.windows(2).all(|w| {
+                            cmp_ob(read_slot_val(&w[0], ob_slot), read_slot_val(&w[1], ob_slot))
+                                != Ordering::Greater
+                        });
+                        if !already_sorted {
+                            win_items.sort_by(|ia, ib| {
+                                cmp_ob(read_slot_val(ia, ob_slot), read_slot_val(ib, ob_slot))
+                            });
+                        }
+                    }
+
+                    let mut built_inline: Vec<InlineRow> = Vec::with_capacity(win_items.len());
+                    let mut all_fit = true;
+                    for (item_idx, item) in win_items.iter().enumerate() {
+                        if (item_idx & 63) == 0 {
+                            ctx.step_tick()?;
+                        }
+                        let mut cols = [InlineVal::Null; INLINE_ROW_COLS];
+                        for (pi, slot_opt) in fast_proj_slots.iter().enumerate().take(n_proj) {
+                            let v = read_slot_val(item, slot_opt.unwrap());
+                            if let Some(iv) = InlineVal::try_from_value(v) {
+                                cols[pi] = iv;
+                            } else {
+                                all_fit = false;
+                                break;
+                            }
+                        }
+                        if !all_fit {
+                            break;
+                        }
+                        built_inline.push(InlineRow::from_raw_parts(n_proj as u8, cols));
+                    }
+
+                    if all_fit {
+                        *inline_out.unwrap() = built_inline;
+                        return Ok(QueryOutput {
+                            column_names: col_names,
+                            rows: Vec::new(),
+                        });
+                    }
+                    // Fallback if any value exceeded `INLINE_VAL_CAP`: `win_items` is already in
+                    // final sort order, so materialize `QueryOutput.rows` directly!
+                    let mut out_rows = Vec::with_capacity(win_items.len());
+                    for item in &win_items {
+                        let mut r = Vec::with_capacity(n_proj);
+                        for slot_opt in fast_proj_slots.iter().take(n_proj) {
+                            r.push(read_slot_val(item, slot_opt.unwrap()).clone());
+                        }
+                        out_rows.push(r);
+                    }
+                    return Ok(QueryOutput {
+                        column_names: col_names,
+                        rows: out_rows,
+                    });
+                }
 
                 result_rows_with_sort.reserve(win_items.len());
                 for item in win_items {
@@ -5248,8 +5527,7 @@ fn exec_single_select_core(
                                 }
                                 FastPostWinProj::Win(idx) => {
                                     out_vals.push(
-                                        item.row
-                                            .win_vals
+                                        item.win_vals
                                             .get(idx)
                                             .map_or(Value::Null, |rv| rv.value.clone()),
                                     );
@@ -7591,9 +7869,10 @@ fn open_filtered_vtab_cursor_inner(
         None
     };
 
+    static NULL_EXPR: Expr = Expr::Null;
     let mut constraints: Vec<sqliters_types::VTabConstraint> = Vec::new();
-    let mut rhs_exprs: Vec<Option<Expr>> = Vec::new();
-    let mut source_conjuncts: Vec<Option<Expr>> = Vec::new();
+    let mut rhs_exprs: Vec<Option<&Expr>> = Vec::new();
+    let mut source_conjuncts: Vec<Option<&Expr>> = Vec::new();
 
     if !matches!(indexed_by, Some(IndexHint::NotIndexed)) {
         if let Some(args) = tvf_args {
@@ -7604,7 +7883,7 @@ fn open_filtered_vtab_cursor_inner(
                     usable: true,
                     in_values: false,
                 });
-                rhs_exprs.push(Some(arg_expr.clone()));
+                rhs_exprs.push(Some(arg_expr));
                 source_conjuncts.push(None);
             }
         }
@@ -7642,8 +7921,8 @@ fn open_filtered_vtab_cursor_inner(
                                 usable,
                                 in_values: false,
                             });
-                            rhs_exprs.push(usable.then(|| (**right).clone()));
-                            source_conjuncts.push(Some(conj.clone()));
+                            rhs_exprs.push(usable.then_some(right.as_ref()));
+                            source_conjuncts.push(Some(conj));
                         } else if let Some(col_i) = resolve_vtab_col(right)
                             && let Some(vop) = map_bin_op(*op, true)
                         {
@@ -7654,8 +7933,8 @@ fn open_filtered_vtab_cursor_inner(
                                 usable,
                                 in_values: false,
                             });
-                            rhs_exprs.push(usable.then(|| (**left).clone()));
-                            source_conjuncts.push(Some(conj.clone()));
+                            rhs_exprs.push(usable.then_some(left.as_ref()));
+                            source_conjuncts.push(Some(conj));
                         }
                     }
                     Expr::Like {
@@ -7679,8 +7958,8 @@ fn open_filtered_vtab_cursor_inner(
                                 usable,
                                 in_values: false,
                             });
-                            rhs_exprs.push(usable.then(|| (**pattern).clone()));
-                            source_conjuncts.push(Some(conj.clone()));
+                            rhs_exprs.push(usable.then_some(pattern.as_ref()));
+                            source_conjuncts.push(Some(conj));
                         }
                     }
                     Expr::IsNull { expr: ie, negated } => {
@@ -7695,8 +7974,8 @@ fn open_filtered_vtab_cursor_inner(
                                 usable: true,
                                 in_values: false,
                             });
-                            rhs_exprs.push(Some(Expr::Null));
-                            source_conjuncts.push(Some(conj.clone()));
+                            rhs_exprs.push(Some(&NULL_EXPR));
+                            source_conjuncts.push(Some(conj));
                         }
                     }
                     Expr::Between {
@@ -7713,7 +7992,7 @@ fn open_filtered_vtab_cursor_inner(
                                 usable: usable_low,
                                 in_values: false,
                             });
-                            rhs_exprs.push(usable_low.then(|| (**low).clone()));
+                            rhs_exprs.push(usable_low.then_some(low.as_ref()));
                             source_conjuncts.push(None);
 
                             let usable_high =
@@ -7724,7 +8003,7 @@ fn open_filtered_vtab_cursor_inner(
                                 usable: usable_high,
                                 in_values: false,
                             });
-                            rhs_exprs.push(usable_high.then(|| (**high).clone()));
+                            rhs_exprs.push(usable_high.then_some(high.as_ref()));
                             source_conjuncts.push(None);
                         }
                     }
@@ -7887,7 +8166,7 @@ fn open_filtered_vtab_cursor_inner(
                 ));
             }
             *seen_slot = true;
-            let val = match rhs_exprs.get(ci).and_then(|o| o.as_ref()) {
+            let val = match rhs_exprs.get(ci).copied().flatten() {
                 Some(re) => match re {
                     Expr::Bind(bp) => eval_bind_param(bp, params),
                     _ => eval_expr(ctx, re, params, outer_scopes, ctes, None)?,
@@ -7897,7 +8176,7 @@ fn open_filtered_vtab_cursor_inner(
             argv[slot_idx] = val;
         }
         if usage.omit
-            && let Some(Some(conj_expr)) = source_conjuncts.get(ci)
+            && let Some(Some(conj_expr)) = source_conjuncts.get(ci).copied()
             && !omitted_conjuncts.contains(conj_expr)
         {
             omitted_conjuncts.push(conj_expr.clone());
@@ -8160,6 +8439,34 @@ impl FastVtabWherePred {
                 col_on_left,
             } => {
                 let cv = Self::read_col(*col, cursor, rowid_alias_col, cached_rowid)?;
+                if *comp_aff != TypeAffinity::Text {
+                    let (lv, rv) = if *col_on_left { (&cv, rhs) } else { (rhs, &cv) };
+                    match (lv, rv) {
+                        (Value::Real(a), Value::Real(b)) => {
+                            return Ok(match *vdbe_op {
+                                Opcode::Eq | Opcode::Is => *a == *b,
+                                Opcode::Ne | Opcode::IsNot => *a != *b,
+                                Opcode::Lt => *a < *b,
+                                Opcode::Le => *a <= *b,
+                                Opcode::Gt => *a > *b,
+                                Opcode::Ge => *a >= *b,
+                                _ => false,
+                            });
+                        }
+                        (Value::Integer(a), Value::Integer(b)) => {
+                            return Ok(match *vdbe_op {
+                                Opcode::Eq | Opcode::Is => *a == *b,
+                                Opcode::Ne | Opcode::IsNot => *a != *b,
+                                Opcode::Lt => *a < *b,
+                                Opcode::Le => *a <= *b,
+                                Opcode::Gt => *a > *b,
+                                Opcode::Ge => *a >= *b,
+                                _ => false,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
                 let res = if *col_on_left {
                     eval_comparison_with_affinity(*vdbe_op, &cv, rhs, *comp_aff, *coll, enc)
                 } else {
@@ -8178,6 +8485,7 @@ impl FastVtabWherePred {
 
 fn try_compile_fast_vtab_where_preds<F>(
     residual_where: &Expr,
+    omitted: &[Expr],
     params: &[Value],
     declared: &crate::vtab::VTabDeclaredSchema,
     resolve_col: &F,
@@ -8201,8 +8509,11 @@ where
     };
     let mut conjs = Vec::new();
     split_where_conjuncts(residual_where, &mut conjs);
-    let mut preds = Vec::with_capacity(conjs.len());
+    let mut preds = Vec::new();
     for conj in conjs {
+        if !omitted.is_empty() && omitted.contains(conj) {
+            continue;
+        }
         match conj {
             Expr::Binary { left, op, right } => {
                 let vdbe_op = match op {
@@ -8409,20 +8720,25 @@ fn try_exec_fast_single_vtab_select(
         ));
     }
 
-    let effective_where = selection.as_ref().map(|where_expr| {
-        if expanded_proj.iter().any(|(_, _, al)| al.is_some()) {
-            subst_select_aliases_in_expr_with_ctes(
-                where_expr,
-                &expanded_proj,
-                &cols,
-                ctx.db_set,
-                ctes,
-            )
-        } else {
-            where_expr.clone()
+    let aliased_where: Option<Expr>;
+    let effective_where: Option<&Expr> = match selection.as_ref() {
+        None => None,
+        Some(where_expr) => {
+            if expanded_proj.iter().any(|(_, _, al)| al.is_some()) {
+                aliased_where = Some(subst_select_aliases_in_expr_with_ctes(
+                    where_expr,
+                    &expanded_proj,
+                    &cols,
+                    ctx.db_set,
+                    ctes,
+                ));
+                aliased_where.as_ref()
+            } else {
+                Some(where_expr)
+            }
         }
-    });
-    if effective_where.as_ref() != pre_where_selection {
+    };
+    if effective_where != pre_where_selection {
         return Ok(FastSingleVtabOutcome::NotApplicable);
     }
 
@@ -8629,14 +8945,16 @@ fn try_exec_fast_single_vtab_select(
             Some(&qinfo),
         )?;
 
-        let residual_preds = match pre_where_selection
-            .and_then(|we| strip_omitted_conjuncts(we, omitted_vtab_conjuncts))
-        {
+        let residual_preds = match pre_where_selection {
             None => Vec::new(),
-            Some(ref res_we) => {
-                let Some(preds) =
-                    try_compile_fast_vtab_where_preds(res_we, params, &declared, &resolve_fast_col)
-                else {
+            Some(we) => {
+                let Some(preds) = try_compile_fast_vtab_where_preds(
+                    we,
+                    omitted_vtab_conjuncts,
+                    params,
+                    &declared,
+                    &resolve_fast_col,
+                ) else {
                     let rows =
                         materialize_open_vtab_cursor(ctx, &mut *cursor, &declared, cols, col_used)?;
                     return Ok(FastSingleVtabOutcome::FallbackRows(rows));
@@ -8885,14 +9203,16 @@ fn try_exec_fast_single_vtab_select(
         Some(&qinfo),
     )?;
 
-    let residual_preds = match pre_where_selection
-        .and_then(|we| strip_omitted_conjuncts(we, omitted_vtab_conjuncts))
-    {
+    let residual_preds = match pre_where_selection {
         None => Vec::new(),
-        Some(ref res_we) => {
-            let Some(preds) =
-                try_compile_fast_vtab_where_preds(res_we, params, &declared, &resolve_fast_col)
-            else {
+        Some(we) => {
+            let Some(preds) = try_compile_fast_vtab_where_preds(
+                we,
+                omitted_vtab_conjuncts,
+                params,
+                &declared,
+                &resolve_fast_col,
+            ) else {
                 let rows =
                     materialize_open_vtab_cursor(ctx, &mut *cursor, &declared, cols, col_used)?;
                 return Ok(FastSingleVtabOutcome::FallbackRows(rows));
@@ -22741,7 +23061,7 @@ fn prepare_update_exec<'a>(
                             .map(|(_, sc)| WindowExecItem {
                                 row: sc.clone(),
                                 group_rows: None,
-                                win_vals: Vec::new(),
+                                win_vals: InlineWinVals::new(),
                             })
                             .collect();
                         execute_window_pipeline(
@@ -26011,8 +26331,21 @@ fn populate_index_btree(
                 })
         });
 
-    let mut arena: Vec<u8> = Vec::with_capacity(64 * 1024);
-    let mut descriptors: Vec<(u64, usize, usize)> = Vec::with_capacity(1024);
+    let (est_rows, est_arena) =
+        if let Some(bt) = ctx.db_set.slot(db_id).and_then(|s| s.btree.as_ref()) {
+            let pages = bt.pager().page_count();
+            if pages > 4 {
+                let r = (pages as usize).min(65_536) * 64;
+                (r, r * 16)
+            } else {
+                (128, 4096)
+            }
+        } else {
+            (1024, 16 * 1024)
+        };
+    let mut arena: Vec<u8> = Vec::with_capacity(est_arena);
+    let mut descriptors: Vec<ArenaIndexEntry> = Vec::with_capacity(est_rows);
+    let mut exact_bijective = false;
 
     if can_fast_scan
         && n_key <= 15
@@ -26026,6 +26359,15 @@ fn populate_index_btree(
             Empty,
             Slice(&'a [u8]),
             Inline8([u8; 8], u8),
+        }
+
+        #[derive(Copy, Clone, PartialEq, Eq)]
+        enum BijectiveKind {
+            Undecided1Col,
+            Int1Col,
+            FixedText1Col(usize),
+            Int2Col,
+            Disabled,
         }
 
         #[inline(always)]
@@ -26100,6 +26442,45 @@ fn populate_index_btree(
             (1u64 << 56) | (ord >> 11)
         }
 
+        #[inline]
+        fn raw_record_col0_prefix_utf8(rec: &[u8]) -> u64 {
+            let Ok((hdr_u64, hdr_pos)) = sqliters_types::get_varint(rec) else {
+                return 0;
+            };
+            let hdr_len = hdr_u64 as usize;
+            if hdr_len > rec.len() || hdr_pos >= hdr_len {
+                return 0;
+            }
+            let Ok((st0, _)) = sqliters_types::get_varint(&rec[hdr_pos..hdr_len]) else {
+                return 0;
+            };
+            let Ok(len0) = sqliters_types::serial_type_len(st0) else {
+                return 0;
+            };
+            if hdr_len + len0 > rec.len() {
+                return 0;
+            }
+            let b = &rec[hdr_len..hdr_len + len0];
+            if st0 == 0 {
+                0
+            } else if st0 == 7 {
+                let f = f64::from_bits(u64::from_be_bytes([
+                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                ]));
+                if f.is_nan() { 0 } else { f64_prefix_u64(f) }
+            } else if st0 < 12 {
+                f64_prefix_u64(decode_raw_int(st0, b) as f64)
+            } else {
+                let mut packed = 0u64;
+                let n = b.len().min(7);
+                for (bi, &byte) in b[..n].iter().enumerate() {
+                    packed |= u64::from(byte) << (48 - bi * 8);
+                }
+                let tag = if (st0 & 1) != 0 { 2u64 } else { 3u64 };
+                (tag << 56) | packed
+            }
+        }
+
         let mut col_specs = [(0usize, false, false); 15];
         let mut max_needed_col: Option<usize> = None;
         for (k, ic) in idx_schema.columns.iter().enumerate() {
@@ -26113,6 +26494,24 @@ fn populate_index_btree(
         }
         let specs = &col_specs[..n_key];
         let n_total = n_key + 1;
+
+        let all_asc_binary = enc == TextEncoding::Utf8
+            && !idx_schema.unique
+            && orders.iter().all(|o| {
+                !o.desc
+                    && !o.nulls_last
+                    && o.collation == Collation::Binary
+                    && o.custom_collation.is_none()
+            });
+        let mut bij_kind = if !all_asc_binary {
+            BijectiveKind::Disabled
+        } else if n_key == 1 && !specs[0].2 {
+            BijectiveKind::Undecided1Col
+        } else if n_key == 2 && !specs[0].2 && !specs[1].2 {
+            BijectiveKind::Int2Col
+        } else {
+            BijectiveKind::Disabled
+        };
 
         if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
             bt.scan_table_raw_cells(tbl.root_pgno, |rowid, raw_rec| {
@@ -26151,10 +26550,17 @@ fn populate_index_btree(
                 let mut serial_bytes_len = 0usize;
                 let mut body_len = 0usize;
                 let mut col0_prefix: u64 = 0;
+                let mut col_ints = [0i64; 2];
+                let mut col_is_int = [false; 2];
+                let mut col0_text_slice: Option<&[u8]> = None;
 
                 for (k, &(ci, is_ipk, is_real)) in specs.iter().enumerate() {
                     let (st, src) = if is_ipk {
-                        if k == 0 && use_prefix_key {
+                        if k < 2 {
+                            col_ints[k] = rowid;
+                            col_is_int[k] = true;
+                        }
+                        if k == 0 && use_prefix_key && bij_kind == BijectiveKind::Disabled {
                             col0_prefix = f64_prefix_u64(rowid as f64);
                         }
                         encode_i64_inline(rowid)
@@ -26172,7 +26578,7 @@ fn populate_index_btree(
                             if f.is_nan() {
                                 (0, IdxFieldSrc::Empty)
                             } else {
-                                if k == 0 && use_prefix_key {
+                                if k == 0 && use_prefix_key && bij_kind == BijectiveKind::Disabled {
                                     col0_prefix = f64_prefix_u64(f);
                                 }
                                 if f == 0.0 {
@@ -26183,7 +26589,11 @@ fn populate_index_btree(
                             }
                         } else if st_in < 12 {
                             let iv = decode_raw_int(st_in, b);
-                            if k == 0 && use_prefix_key {
+                            if !is_real && k < 2 {
+                                col_ints[k] = iv;
+                                col_is_int[k] = true;
+                            }
+                            if k == 0 && use_prefix_key && bij_kind == BijectiveKind::Disabled {
                                 col0_prefix = f64_prefix_u64(iv as f64);
                             }
                             if is_real {
@@ -26193,7 +26603,10 @@ fn populate_index_btree(
                                 encode_i64_inline(iv)
                             }
                         } else {
-                            if k == 0 && use_prefix_key {
+                            if k == 0 && (st_in & 1) != 0 {
+                                col0_text_slice = Some(b);
+                            }
+                            if k == 0 && use_prefix_key && bij_kind == BijectiveKind::Disabled {
                                 let mut packed = 0u64;
                                 let n = b.len().min(7);
                                 for (bi, &byte) in b[..n].iter().enumerate() {
@@ -26234,6 +26647,13 @@ fn populate_index_btree(
 
                 let rec_total = hdr_len + body_len;
                 let start = arena.len();
+                let new_end = start
+                    .checked_add(rec_total)
+                    .and_then(|e| u32::try_from(e).ok())
+                    .ok_or_else(|| {
+                        SqliteError::new(ErrorCode::TooBig, "index arena exceeds 4GiB")
+                    })?;
+                let _ = new_end;
                 arena.reserve(rec_total);
                 sqliters_types::push_varint(&mut arena, hdr_len as u64);
                 for &st in &out_st[..n_total] {
@@ -26248,9 +26668,107 @@ fn populate_index_btree(
                         }
                     }
                 }
-                descriptors.push((col0_prefix, start, rec_total));
+
+                if bij_kind != BijectiveKind::Disabled {
+                    const MIN_I40: i64 = -(1i64 << 39);
+                    const MAX_I40: i64 = (1i64 << 39) - 1;
+                    let bij_opt: Option<u64> = match bij_kind {
+                        BijectiveKind::Undecided1Col => {
+                            if col_is_int[0]
+                                && (MIN_I40..=MAX_I40).contains(&col_ints[0])
+                                && (0..=0x00FF_FFFF).contains(&rowid)
+                            {
+                                bij_kind = BijectiveKind::Int1Col;
+                                let u0 = (col_ints[0] - MIN_I40) as u64;
+                                Some((u0 << 24) | (rowid as u64))
+                            } else if let Some(tb) = col0_text_slice
+                                && tb.len() <= 6
+                                && (0..=0xFFFF).contains(&rowid)
+                            {
+                                bij_kind = BijectiveKind::FixedText1Col(tb.len());
+                                let mut k64 = 0u64;
+                                for (bi, &byte) in tb.iter().enumerate() {
+                                    k64 |= u64::from(byte) << (56 - bi * 8);
+                                }
+                                Some(k64 | (rowid as u64))
+                            } else {
+                                None
+                            }
+                        }
+                        BijectiveKind::Int1Col => {
+                            if col_is_int[0]
+                                && (MIN_I40..=MAX_I40).contains(&col_ints[0])
+                                && (0..=0x00FF_FFFF).contains(&rowid)
+                            {
+                                let u0 = (col_ints[0] - MIN_I40) as u64;
+                                Some((u0 << 24) | (rowid as u64))
+                            } else {
+                                None
+                            }
+                        }
+                        BijectiveKind::FixedText1Col(expected_len) => {
+                            if let Some(tb) = col0_text_slice
+                                && tb.len() == expected_len
+                                && (0..=0xFFFF).contains(&rowid)
+                            {
+                                let mut k64 = 0u64;
+                                for (bi, &byte) in tb.iter().enumerate() {
+                                    k64 |= u64::from(byte) << (56 - bi * 8);
+                                }
+                                Some(k64 | (rowid as u64))
+                            } else {
+                                None
+                            }
+                        }
+                        BijectiveKind::Int2Col => {
+                            if col_is_int[0]
+                                && col_is_int[1]
+                                && (-32_768..=32_767).contains(&col_ints[0])
+                                && (-8_388_608..=8_388_607).contains(&col_ints[1])
+                                && (0..=0x00FF_FFFF).contains(&rowid)
+                            {
+                                let u0 = (col_ints[0] + 32_768) as u64;
+                                let u1 = (col_ints[1] + 8_388_608) as u64;
+                                Some((u0 << 48) | (u1 << 24) | (rowid as u64))
+                            } else {
+                                None
+                            }
+                        }
+                        BijectiveKind::Disabled => None,
+                    };
+
+                    if let Some(k64) = bij_opt {
+                        col0_prefix = k64;
+                    } else {
+                        bij_kind = BijectiveKind::Disabled;
+                        if use_prefix_key {
+                            for prev in &mut descriptors {
+                                let po = prev.off as usize;
+                                let pl = prev.len as usize;
+                                prev.prefix = raw_record_col0_prefix_utf8(&arena[po..po + pl]);
+                            }
+                            col0_prefix =
+                                raw_record_col0_prefix_utf8(&arena[start..start + rec_total]);
+                        } else {
+                            for prev in &mut descriptors {
+                                prev.prefix = 0;
+                            }
+                            col0_prefix = 0;
+                        }
+                    }
+                }
+
+                descriptors.push(ArenaIndexEntry {
+                    prefix: col0_prefix,
+                    off: start as u32,
+                    len: rec_total as u32,
+                });
                 Ok(())
             })?;
+            exact_bijective = matches!(
+                bij_kind,
+                BijectiveKind::Int1Col | BijectiveKind::FixedText1Col(_) | BijectiveKind::Int2Col
+            );
         }
     } else if can_fast_scan {
         if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
@@ -26284,8 +26802,19 @@ fn populate_index_btree(
                     key_vals.push(Value::Integer(rowid));
                     sqliters_types::encode_record_into(&key_vals, enc, &mut rec_buf);
                     let start = arena.len();
+                    let new_end = start
+                        .checked_add(rec_buf.len())
+                        .and_then(|e| u32::try_from(e).ok())
+                        .ok_or_else(|| {
+                            SqliteError::new(ErrorCode::TooBig, "index arena exceeds 4GiB")
+                        })?;
+                    let _ = new_end;
                     arena.extend_from_slice(&rec_buf);
-                    descriptors.push((prefix, start, rec_buf.len()));
+                    descriptors.push(ArenaIndexEntry {
+                        prefix,
+                        off: start as u32,
+                        len: rec_buf.len() as u32,
+                    });
                     has_row = bt.cursor_next(cid)?;
                 }
                 Ok(())
@@ -26320,8 +26849,17 @@ fn populate_index_btree(
             };
             sqliters_types::encode_record_into(&keys, enc, &mut rec_buf);
             let start = arena.len();
+            let new_end = start
+                .checked_add(rec_buf.len())
+                .and_then(|e| u32::try_from(e).ok())
+                .ok_or_else(|| SqliteError::new(ErrorCode::TooBig, "index arena exceeds 4GiB"))?;
+            let _ = new_end;
             arena.extend_from_slice(&rec_buf);
-            descriptors.push((prefix, start, rec_buf.len()));
+            descriptors.push(ArenaIndexEntry {
+                prefix,
+                off: start as u32,
+                len: rec_buf.len() as u32,
+            });
         }
     }
 
@@ -26330,13 +26868,19 @@ fn populate_index_btree(
     }
 
     if descriptors.len() > 1 {
-        if orders.iter().all(|o| o.custom_collation.is_none()) {
+        if exact_bijective {
+            descriptors.sort_unstable_by_key(|d| d.prefix);
+        } else if orders.iter().all(|o| o.custom_collation.is_none()) {
             let arena_ref = arena.as_slice();
             descriptors.sort_unstable_by(|a, b| {
-                a.0.cmp(&b.0).then_with(|| {
+                a.prefix.cmp(&b.prefix).then_with(|| {
+                    let ao = a.off as usize;
+                    let al = a.len as usize;
+                    let bo = b.off as usize;
+                    let bl = b.len as usize;
                     sqliters_types::compare_raw_records_with_encoding(
-                        &arena_ref[a.1..a.1 + a.2],
-                        &arena_ref[b.1..b.1 + b.2],
+                        &arena_ref[ao..ao + al],
+                        &arena_ref[bo..bo + bl],
                         None,
                         &orders,
                         enc,
@@ -26351,13 +26895,17 @@ fn populate_index_btree(
                 if sort_err.is_some() {
                     return std::cmp::Ordering::Equal;
                 }
-                let p_ord = a.0.cmp(&b.0);
+                let p_ord = a.prefix.cmp(&b.prefix);
                 if p_ord != std::cmp::Ordering::Equal {
                     return p_ord;
                 }
+                let ao = a.off as usize;
+                let al = a.len as usize;
+                let bo = b.off as usize;
+                let bl = b.len as usize;
                 match sqliters_types::compare_raw_records_with_encoding(
-                    &arena_ref[a.1..a.1 + a.2],
-                    &arena_ref[b.1..b.1 + b.2],
+                    &arena_ref[ao..ao + al],
+                    &arena_ref[bo..bo + bl],
                     None,
                     &orders,
                     enc,
@@ -26375,19 +26923,16 @@ fn populate_index_btree(
         }
     }
 
-    let sorted_slices: Vec<&[u8]> = descriptors
-        .iter()
-        .map(|&(_, off, len)| &arena[off..off + len])
-        .collect();
-
     if idx_schema.unique {
         let key_orders = &orders[..n_key];
-        for pair in sorted_slices.windows(2) {
-            if !sqliters_types::raw_record_prefix_has_null(pair[0], n_key)?
-                && !sqliters_types::raw_record_prefix_has_null(pair[1], n_key)?
+        for pair in descriptors.windows(2) {
+            let s0 = &arena[pair[0].off as usize..pair[0].off as usize + pair[0].len as usize];
+            let s1 = &arena[pair[1].off as usize..pair[1].off as usize + pair[1].len as usize];
+            if !sqliters_types::raw_record_prefix_has_null(s0, n_key)?
+                && !sqliters_types::raw_record_prefix_has_null(s1, n_key)?
                 && sqliters_types::compare_raw_records_with_encoding(
-                    pair[0],
-                    pair[1],
+                    s0,
+                    s1,
                     Some(n_key),
                     key_orders,
                     enc,
@@ -26407,7 +26952,7 @@ fn populate_index_btree(
     }
 
     if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
-        bt.bulk_load_sorted_index(idx_schema.root_pgno, &sorted_slices)?;
+        bt.bulk_load_sorted_arena(idx_schema.root_pgno, &arena, &descriptors)?;
     }
     Ok(())
 }
