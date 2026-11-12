@@ -31,21 +31,27 @@ pub enum RTreeCoordMode {
     Int32,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct RTreeCell {
-    id: i64,
-    coords: [u32; RTREE_MAX_COORDS],
+type RTreeCell = sqliters_asm::RTreeCell10;
+
+#[inline]
+const fn rtree_cell_zero() -> RTreeCell {
+    RTreeCell {
+        id: 0,
+        coords: [0; RTREE_MAX_COORDS],
+    }
 }
 
-impl RTreeCell {
-    #[inline]
-    fn zero() -> Self {
-        Self {
-            id: 0,
-            coords: [0; RTREE_MAX_COORDS],
-        }
-    }
+trait RTreeCellExt {
+    fn coord_f64(&self, idx: usize, mode: RTreeCoordMode) -> f64;
+    fn coord_sql_value(&self, idx: usize, mode: RTreeCoordMode) -> Value;
+    fn area(&self, n_dim: usize, mode: RTreeCoordMode) -> f64;
+    fn margin(&self, n_dim: usize, mode: RTreeCoordMode) -> f64;
+    fn union_in_place(&mut self, other: &Self, n_dim: usize, mode: RTreeCoordMode);
+    fn contains(&self, other: &Self, n_dim: usize, mode: RTreeCoordMode) -> bool;
+    fn overlap(&self, other: &Self, n_dim: usize, mode: RTreeCoordMode) -> f64;
+}
 
+impl RTreeCellExt for RTreeCell {
     #[inline]
     fn coord_f64(&self, idx: usize, mode: RTreeCoordMode) -> f64 {
         let bits = self.coords[idx];
@@ -112,6 +118,10 @@ impl RTreeCell {
     fn union_in_place(&mut self, other: &Self, n_dim: usize, mode: RTreeCoordMode) {
         match mode {
             RTreeCoordMode::Float32 => {
+                if n_dim == 2 {
+                    sqliters_asm::rtree_cell_union_2d_f32_in_place(self, other);
+                    return;
+                }
                 for d in 0..n_dim {
                     let i0 = d * 2;
                     let i1 = i0 + 1;
@@ -678,6 +688,10 @@ impl RTreeTable {
     fn decode_node_cells(&self, data: &[u8]) -> Vec<RTreeCell> {
         let n_cell = read_u16_be(&data[2..4]) as usize;
         let mut cells = Vec::with_capacity(n_cell);
+        if self.n_dim2 == 4 {
+            sqliters_asm::rtree_decode_2d_cells(data, n_cell, &mut cells);
+            return cells;
+        }
         let bpc = self.bytes_per_cell;
         let nd2 = self.n_dim2;
         for i in 0..n_cell {
@@ -700,6 +714,10 @@ impl RTreeTable {
 
     fn encode_node_cells(&self, depth: u16, cells: &[RTreeCell]) -> Vec<u8> {
         let mut buf = vec![0u8; self.node_size];
+        if self.n_dim2 == 4 {
+            sqliters_asm::rtree_encode_2d_cells(depth, cells, &mut buf);
+            return buf;
+        }
         buf[0..2].copy_from_slice(&depth.to_be_bytes());
         buf[2..4].copy_from_slice(&(cells.len() as u16).to_be_bytes());
         let bpc = self.bytes_per_cell;
@@ -1250,6 +1268,9 @@ impl RTreeTable {
 
     #[inline]
     fn compute_bbox(&self, cells: &[RTreeCell], node_id: i64) -> RTreeCell {
+        if self.n_dim == 2 && self.mode == RTreeCoordMode::Float32 {
+            return sqliters_asm::rtree_bbox_union_2d_f32(cells, node_id);
+        }
         let mut bbox = cells[0];
         for cell in &cells[1..] {
             bbox.union_in_place(cell, self.n_dim, self.mode);
@@ -1306,37 +1327,41 @@ impl RTreeTable {
                         "corrupt empty internal RTree node",
                     ));
                 }
-                let mut best_id = cells[0].id;
-                let mut found_containing = false;
-                let mut min_area = 0.0_f64;
-                for c in cells {
-                    if c.contains(cell, n_dim, mode) {
-                        let area = c.area(n_dim, mode);
-                        if !found_containing || area < min_area {
-                            best_id = c.id;
-                            min_area = area;
-                            found_containing = true;
+                if n_dim == 2 && mode == RTreeCoordMode::Float32 {
+                    sqliters_asm::rtree_choose_subtree_2d_f32(cells, cell)
+                } else {
+                    let mut best_id = cells[0].id;
+                    let mut found_containing = false;
+                    let mut min_area = 0.0_f64;
+                    for c in cells {
+                        if c.contains(cell, n_dim, mode) {
+                            let area = c.area(n_dim, mode);
+                            if !found_containing || area < min_area {
+                                best_id = c.id;
+                                min_area = area;
+                                found_containing = true;
+                            }
                         }
                     }
-                }
-                if !found_containing {
-                    let mut min_growth = 0.0_f64;
-                    for (idx, c) in cells.iter().enumerate() {
-                        let area = c.area(n_dim, mode);
-                        let mut u = *c;
-                        u.union_in_place(cell, n_dim, mode);
-                        let growth = u.area(n_dim, mode) - area;
-                        if idx == 0
-                            || growth < min_growth
-                            || (growth == min_growth && area < min_area)
-                        {
-                            min_growth = growth;
-                            min_area = area;
-                            best_id = c.id;
+                    if !found_containing {
+                        let mut min_growth = 0.0_f64;
+                        for (idx, c) in cells.iter().enumerate() {
+                            let area = c.area(n_dim, mode);
+                            let mut u = *c;
+                            u.union_in_place(cell, n_dim, mode);
+                            let growth = u.area(n_dim, mode) - area;
+                            if idx == 0
+                                || growth < min_growth
+                                || (growth == min_growth && area < min_area)
+                            {
+                                min_growth = growth;
+                                min_area = area;
+                                best_id = c.id;
+                            }
                         }
                     }
+                    best_id
                 }
-                best_id
             };
             if path.contains(&best_id) {
                 return Err(SqliteError::new(ErrorCode::Corrupt, "cycle in RTree"));
@@ -1361,7 +1386,7 @@ impl RTreeTable {
             let mut best_margin = 0.0_f64;
             let mut best_idxs = [0usize; 64];
             let mut cur_idxs = [0usize; 64];
-            let mut suffix_boxes = [RTreeCell::zero(); 64];
+            let mut suffix_boxes = [rtree_cell_zero(); 64];
 
             for dim in 0..n_dim {
                 for (i, slot) in cur_idxs.iter_mut().enumerate().take(n_cell) {
@@ -1445,7 +1470,7 @@ impl RTreeTable {
                 let b1 = all_cells[b].coord_f64(d1, mode);
                 a0.total_cmp(&b0).then_with(|| a1.total_cmp(&b1))
             });
-            let mut suffix_boxes = vec![RTreeCell::zero(); n_cell];
+            let mut suffix_boxes = vec![rtree_cell_zero(); n_cell];
             suffix_boxes[n_cell - 1] = all_cells[idxs[n_cell - 1]];
             for k in (min_c..n_cell - 1).rev() {
                 let mut b = all_cells[idxs[k]];
@@ -2309,47 +2334,41 @@ impl RTreeCursor {
         table.load_node_into_cache(cache, ctx, node_id)?;
         if level == 0 {
             if let Some(Some(node)) = cache.nodes.get(&node_id) {
-                for cell in &node.cells {
-                    let min_x = f64::from(f32::from_bits(cell.coords[0]));
-                    let max_x = f64::from(f32::from_bits(cell.coords[1]));
-                    let min_y = f64::from(f32::from_bits(cell.coords[2]));
-                    let max_y = f64::from(f32::from_bits(cell.coords[3]));
-                    if max_x >= q.q_min_x
-                        && min_x <= q.q_max_x
-                        && max_y >= q.q_min_y
-                        && min_y <= q.q_max_y
-                    {
-                        out.push(*cell);
-                    }
-                }
+                sqliters_asm::rtree_filter_2d_f32_cells(
+                    &node.cells,
+                    q.q_min_x,
+                    q.q_max_x,
+                    q.q_min_y,
+                    q.q_max_y,
+                    out,
+                );
             }
         } else {
             let mut stack_children = [0_i64; 64];
             let mut n_stack = 0usize;
             let mut heap_children: Option<Vec<i64>> = None;
             if let Some(Some(node)) = cache.nodes.get(&node_id) {
-                for cell in &node.cells {
-                    let min_x = f64::from(f32::from_bits(cell.coords[0]));
-                    let max_x = f64::from(f32::from_bits(cell.coords[1]));
-                    let min_y = f64::from(f32::from_bits(cell.coords[2]));
-                    let max_y = f64::from(f32::from_bits(cell.coords[3]));
-                    if max_x >= q.q_min_x
-                        && min_x <= q.q_max_x
-                        && max_y >= q.q_min_y
-                        && min_y <= q.q_max_y
-                    {
-                        if let Some(ref mut v) = heap_children {
-                            v.push(cell.id);
-                        } else if n_stack < 64 {
-                            stack_children[n_stack] = cell.id;
-                            n_stack += 1;
-                        } else {
-                            let mut v = Vec::with_capacity(node.cells.len());
-                            v.extend_from_slice(&stack_children[..n_stack]);
-                            v.push(cell.id);
-                            heap_children = Some(v);
-                        }
-                    }
+                if node.cells.len() <= stack_children.len() {
+                    n_stack = sqliters_asm::rtree_filter_2d_f32_ids(
+                        &node.cells,
+                        q.q_min_x,
+                        q.q_max_x,
+                        q.q_min_y,
+                        q.q_max_y,
+                        &mut stack_children,
+                    );
+                } else {
+                    let mut v = vec![0_i64; node.cells.len()];
+                    let n_match = sqliters_asm::rtree_filter_2d_f32_ids(
+                        &node.cells,
+                        q.q_min_x,
+                        q.q_max_x,
+                        q.q_min_y,
+                        q.q_max_y,
+                        &mut v,
+                    );
+                    v.truncate(n_match);
+                    heap_children = Some(v);
                 }
             }
             if let Some(children) = heap_children {

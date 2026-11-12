@@ -10,4 +10,5 @@ unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 
 [dependencies]
+sqliters-asm = { path = "../sqliters-asm" }
 sqliters-types = { path = "../sqliters-types" }

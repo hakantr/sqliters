@@ -249,7 +249,7 @@ impl Collation {
     pub fn compare_str_with_encoding(self, a: &str, b: &str, enc: TextEncoding) -> Ordering {
         match self {
             Self::Binary => match enc {
-                TextEncoding::Utf8 => a.as_bytes().cmp(b.as_bytes()),
+                TextEncoding::Utf8 => sqliters_asm::cmp_bytes_binary(a.as_bytes(), b.as_bytes()),
                 TextEncoding::Utf16Le => {
                     let mut ia = a.encode_utf16();
                     let mut ib = b.encode_utf16();
@@ -281,21 +281,11 @@ impl Collation {
                     }
                 }
             },
-            Self::NoCase => {
-                for (&ba, &bb) in a.as_bytes().iter().zip(b.as_bytes().iter()) {
-                    let la = ba.to_ascii_lowercase();
-                    let lb = bb.to_ascii_lowercase();
-                    match la.cmp(&lb) {
-                        Ordering::Equal => continue,
-                        non_eq => return non_eq,
-                    }
-                }
-                a.len().cmp(&b.len())
-            }
+            Self::NoCase => sqliters_asm::cmp_bytes_ascii_nocase(a.as_bytes(), b.as_bytes()),
             Self::RTrim => {
                 let ta = a.trim_end_matches(' ');
                 let tb = b.trim_end_matches(' ');
-                ta.as_bytes().cmp(tb.as_bytes())
+                sqliters_asm::cmp_bytes_binary(ta.as_bytes(), tb.as_bytes())
             }
         }
     }
@@ -561,7 +551,7 @@ impl Value {
             (Self::Text(_), Self::Blob(_)) => Ordering::Less,
             (Self::Blob(_), Self::Text(_)) => Ordering::Greater,
 
-            (Self::Blob(a), Self::Blob(b)) => a.cmp(b),
+            (Self::Blob(a), Self::Blob(b)) => sqliters_asm::cmp_bytes_binary(a, b),
         }
     }
 

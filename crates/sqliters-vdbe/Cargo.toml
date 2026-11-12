@@ -9,5 +9,6 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+sqliters-asm = { path = "../sqliters-asm" }
 sqliters-types = { path = "../sqliters-types" }
 sqliters-btree = { path = "../sqliters-btree" }

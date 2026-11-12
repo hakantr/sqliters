@@ -1650,15 +1650,12 @@ enum CompiledLikeKind {
         suffix: Box<[u8]>,
     },
     ContainsAsciiOne(u8),
-    ContainsAsciiBmh {
-        needle: Box<[u8]>,
-        skip: Box<[usize; 256]>,
-    },
+    ContainsAscii(Box<[u8]>),
     General(Box<[LikeToken]>),
 }
 
-/// Pre-compiled SQLite `LIKE` pattern with zero-allocation byte-slice matching and a pure
-/// safe-Rust Boyer-Moore-Horspool `[usize; 256]` skip table for `%<ascii_literal>%`.
+/// Pre-compiled SQLite `LIKE` pattern with zero-allocation byte-slice matching and inline
+/// `x86-64` SIMD substring/equality acceleration via `sqliters-asm`.
 #[derive(Debug, Clone)]
 pub struct CompiledLikePattern {
     kind: CompiledLikeKind,
@@ -1737,18 +1734,8 @@ impl CompiledLikePattern {
                     case_sensitive,
                 };
             }
-            let m = needle.len();
-            let mut skip = Box::new([m; 256]);
-            for i in 0..(m - 1) {
-                let b = needle[i];
-                let shift = m - 1 - i;
-                skip[b as usize] = shift;
-                if !case_sensitive && b.is_ascii_lowercase() {
-                    skip[b.to_ascii_uppercase() as usize] = shift;
-                }
-            }
             return Self {
-                kind: CompiledLikeKind::ContainsAsciiBmh { needle, skip },
+                kind: CompiledLikeKind::ContainsAscii(needle),
                 case_sensitive,
             };
         }
@@ -1798,18 +1785,10 @@ impl CompiledLikePattern {
 
     #[inline]
     fn eq_slice_folded(hay: &[u8], lower_needle: &[u8], case_sensitive: bool) -> bool {
-        if hay.len() != lower_needle.len() {
-            return false;
-        }
         if case_sensitive {
-            hay == lower_needle
+            sqliters_asm::eq_exact(hay, lower_needle)
         } else {
-            for i in 0..lower_needle.len() {
-                if hay[i].to_ascii_lowercase() != lower_needle[i] {
-                    return false;
-                }
-            }
-            true
+            sqliters_asm::eq_ascii_nocase(hay, lower_needle)
         }
     }
 
@@ -1838,56 +1817,17 @@ impl CompiledLikePattern {
             CompiledLikeKind::ContainsAsciiOne(target) => {
                 let t = *target;
                 if cs || !t.is_ascii_lowercase() {
-                    haystack.contains(&t)
+                    sqliters_asm::memchr1(haystack, t).is_some()
                 } else {
-                    let upper = t.to_ascii_uppercase();
-                    for &b in haystack {
-                        if b == t || b == upper {
-                            return true;
-                        }
-                    }
-                    false
+                    sqliters_asm::memchr2(haystack, t, t.to_ascii_uppercase()).is_some()
                 }
             }
-            CompiledLikeKind::ContainsAsciiBmh { needle, skip } => {
-                let m = needle.len();
-                let n = haystack.len();
-                if n < m {
-                    return false;
-                }
-                let last_idx = m - 1;
-                let last_b = needle[last_idx];
-                let limit = n - m;
-                let mut pos = 0usize;
-                if !cs {
-                    while pos <= limit {
-                        let win = &haystack[pos..pos + m];
-                        let hb = win[last_idx];
-                        if hb.to_ascii_lowercase() == last_b {
-                            let mut ok = true;
-                            for k in 0..last_idx {
-                                if win[k].to_ascii_lowercase() != needle[k] {
-                                    ok = false;
-                                    break;
-                                }
-                            }
-                            if ok {
-                                return true;
-                            }
-                        }
-                        pos += skip[hb as usize];
-                    }
+            CompiledLikeKind::ContainsAscii(needle) => {
+                if cs {
+                    sqliters_asm::memmem_exact(haystack, needle)
                 } else {
-                    while pos <= limit {
-                        let win = &haystack[pos..pos + m];
-                        let hb = win[last_idx];
-                        if hb == last_b && win[..last_idx] == needle[..last_idx] {
-                            return true;
-                        }
-                        pos += skip[hb as usize];
-                    }
+                    sqliters_asm::memmem_ascii_nocase(haystack, needle)
                 }
-                false
             }
             CompiledLikeKind::General(tokens) => {
                 if let Ok(s) = std::str::from_utf8(haystack) {
@@ -2042,6 +1982,19 @@ fn like_ascii_bytes_nocase(pat: &[u8], txt: &[u8]) -> bool {
                     return true;
                 }
                 star_pi = pi;
+                let anchor = pat[star_pi];
+                if anchor != b'_' {
+                    let lo = anchor.to_ascii_lowercase();
+                    let found = if lo.is_ascii_lowercase() {
+                        sqliters_asm::memchr2(&txt[ti..], lo, lo.to_ascii_uppercase())
+                    } else {
+                        sqliters_asm::memchr1(&txt[ti..], lo)
+                    };
+                    let Some(rel) = found else {
+                        return false;
+                    };
+                    ti += rel;
+                }
                 star_ti = ti;
                 continue;
             }
@@ -2053,6 +2006,22 @@ fn like_ascii_bytes_nocase(pat: &[u8], txt: &[u8]) -> bool {
         }
         if star_pi != usize::MAX {
             star_ti += 1;
+            let anchor = pat[star_pi];
+            if anchor != b'_' {
+                if star_ti >= txt.len() {
+                    return false;
+                }
+                let lo = anchor.to_ascii_lowercase();
+                let found = if lo.is_ascii_lowercase() {
+                    sqliters_asm::memchr2(&txt[star_ti..], lo, lo.to_ascii_uppercase())
+                } else {
+                    sqliters_asm::memchr1(&txt[star_ti..], lo)
+                };
+                let Some(rel) = found else {
+                    return false;
+                };
+                star_ti += rel;
+            }
             ti = star_ti;
             pi = star_pi;
             continue;
@@ -2141,9 +2110,139 @@ fn ascii_eq_nocase(a: char, b: char) -> bool {
 
 /// SQLite `GLOB` matcher (`*` = 0+ chars, `?` = 1 char, `[abc]`/`[a-z]`/`[^a]` character classes, case-sensitive).
 pub fn sqlite_glob_match(pattern: &str, text: &str) -> bool {
+    if pattern.is_ascii() && text.is_ascii() {
+        return glob_ascii_bytes(pattern.as_bytes(), text.as_bytes());
+    }
     let pchars: Vec<char> = pattern.chars().collect();
     let tchars: Vec<char> = text.chars().collect();
     glob_rec(&pchars, &tchars)
+}
+
+#[inline]
+fn is_plain_glob_slice(s: &[u8]) -> bool {
+    for &b in s {
+        if b == b'*' || b == b'?' || b == b'[' {
+            return false;
+        }
+    }
+    true
+}
+
+#[inline]
+fn glob_ascii_bytes(pat: &[u8], txt: &[u8]) -> bool {
+    if pat.first() == Some(&b'*') && pat.last() == Some(&b'*') {
+        let mut s = 0usize;
+        while s < pat.len() && pat[s] == b'*' {
+            s += 1;
+        }
+        if s == pat.len() {
+            return true;
+        }
+        let mut e = pat.len();
+        while e > s && pat[e - 1] == b'*' {
+            e -= 1;
+        }
+        let inner = &pat[s..e];
+        if is_plain_glob_slice(inner) {
+            return sqliters_asm::memmem_exact(txt, inner);
+        }
+    } else if is_plain_glob_slice(pat) {
+        return sqliters_asm::eq_exact(txt, pat);
+    }
+    glob_ascii_rec(pat, txt)
+}
+
+fn glob_ascii_rec(pat: &[u8], txt: &[u8]) -> bool {
+    let mut pi = 0usize;
+    let mut ti = 0usize;
+    while pi < pat.len() {
+        match pat[pi] {
+            b'*' => {
+                while pi < pat.len() && pat[pi] == b'*' {
+                    pi += 1;
+                }
+                if pi == pat.len() {
+                    return true;
+                }
+                let anchor = pat[pi];
+                if anchor != b'?' && anchor != b'[' {
+                    let mut k = ti;
+                    while k < txt.len() {
+                        let Some(rel) = sqliters_asm::memchr1(&txt[k..], anchor) else {
+                            return false;
+                        };
+                        let hit = k + rel;
+                        if glob_ascii_rec(&pat[pi..], &txt[hit..]) {
+                            return true;
+                        }
+                        k = hit + 1;
+                    }
+                    return false;
+                }
+                for k in ti..=txt.len() {
+                    if glob_ascii_rec(&pat[pi..], &txt[k..]) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            b'?' => {
+                if ti >= txt.len() {
+                    return false;
+                }
+                pi += 1;
+                ti += 1;
+            }
+            b'[' => {
+                if ti >= txt.len() {
+                    return false;
+                }
+                let ch = txt[ti];
+                pi += 1;
+                let invert = pi < pat.len() && pat[pi] == b'^';
+                if invert {
+                    pi += 1;
+                }
+                let mut matched = false;
+                let mut first = true;
+                while pi < pat.len() && (first || pat[pi] != b']') {
+                    first = false;
+                    let c1 = pat[pi];
+                    if pi + 2 < pat.len() && pat[pi + 1] == b'-' && pat[pi + 2] != b']' {
+                        let c2 = pat[pi + 2];
+                        if ch >= c1 && ch <= c2 {
+                            matched = true;
+                        }
+                        pi += 3;
+                    } else {
+                        if ch == c1 {
+                            matched = true;
+                        }
+                        pi += 1;
+                    }
+                }
+                if pi >= pat.len() || pat[pi] != b']' {
+                    return false;
+                }
+                if invert {
+                    matched = !matched;
+                }
+                if !matched {
+                    return false;
+                }
+                pi += 1;
+                ti += 1;
+            }
+            c => {
+                if ti >= txt.len() || txt[ti] != c {
+                    return false;
+                }
+                pi += 1;
+                ti += 1;
+            }
+        }
+    }
+    ti == txt.len()
 }
 
 fn glob_rec(pat: &[char], txt: &[char]) -> bool {

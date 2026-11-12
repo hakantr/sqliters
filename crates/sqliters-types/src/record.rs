@@ -548,6 +548,87 @@ impl KeySortOrder {
     }
 }
 
+#[inline(never)]
+fn compare_raw_text_to_str(
+    buf: &[u8],
+    rs: &str,
+    spec: &KeySortOrder,
+    enc: TextEncoding,
+) -> Result<Ordering> {
+    if enc == TextEncoding::Utf8 && spec.custom_collation.is_none() {
+        match spec.collation {
+            Collation::Binary => {
+                if let Some(ord) = sqliters_asm::cmp_utf8_ascii_binary(buf, rs.as_bytes()) {
+                    return Ok(ord);
+                }
+            }
+            Collation::NoCase => {
+                if let Some(ord) = sqliters_asm::cmp_utf8_ascii_nocase(buf, rs.as_bytes()) {
+                    return Ok(ord);
+                }
+            }
+            Collation::RTrim => {}
+        }
+    }
+    if enc == TextEncoding::Utf8
+        && let Ok(lhs_s) = std::str::from_utf8(buf)
+    {
+        if let Some(ref cc) = spec.custom_collation {
+            (cc.comparator)(lhs_s, rs)
+        } else {
+            Ok(spec.collation.compare_str_with_encoding(lhs_s, rs, enc))
+        }
+    } else {
+        let lhs_s = enc.decode_bytes(buf);
+        if let Some(ref cc) = spec.custom_collation {
+            (cc.comparator)(&lhs_s, rs)
+        } else {
+            Ok(spec.collation.compare_str_with_encoding(&lhs_s, rs, enc))
+        }
+    }
+}
+
+#[inline(never)]
+fn compare_raw_text_slices(
+    a: &[u8],
+    b: &[u8],
+    spec: &KeySortOrder,
+    enc: TextEncoding,
+) -> Result<Ordering> {
+    if enc == TextEncoding::Utf8 && spec.custom_collation.is_none() {
+        match spec.collation {
+            Collation::Binary => {
+                if let Some(ord) = sqliters_asm::cmp_utf8_ascii_binary(a, b) {
+                    return Ok(ord);
+                }
+            }
+            Collation::NoCase => {
+                if let Some(ord) = sqliters_asm::cmp_utf8_ascii_nocase(a, b) {
+                    return Ok(ord);
+                }
+            }
+            Collation::RTrim => {}
+        }
+    }
+    if enc == TextEncoding::Utf8
+        && let (Ok(sa), Ok(sb)) = (std::str::from_utf8(a), std::str::from_utf8(b))
+    {
+        if let Some(ref cc) = spec.custom_collation {
+            (cc.comparator)(sa, sb)
+        } else {
+            Ok(spec.collation.compare_str_with_encoding(sa, sb, enc))
+        }
+    } else {
+        let sa = enc.decode_bytes(a);
+        let sb = enc.decode_bytes(b);
+        if let Some(ref cc) = spec.custom_collation {
+            (cc.comparator)(&sa, &sb)
+        } else {
+            Ok(spec.collation.compare_str_with_encoding(&sa, &sb, enc))
+        }
+    }
+}
+
 /// Compares two serialized SQLite index records under UTF-8 (`sqlite3VdbeRecordCompare`).
 pub fn compare_records(
     lhs_record: &[u8],
@@ -629,7 +710,7 @@ pub fn compare_records_with_encoding(
                 }
             } else if (st & 1) == 0 {
                 let raw = match b {
-                    Value::Blob(rb) => buf.cmp(rb.as_slice()),
+                    Value::Blob(rb) => sqliters_asm::cmp_bytes_binary(buf, rb.as_slice()),
                     _ => Ordering::Greater,
                 };
                 if spec.desc { raw.reverse() } else { raw }
@@ -637,26 +718,7 @@ pub fn compare_records_with_encoding(
                 let raw = match b {
                     Value::Integer(_) | Value::Real(_) => Ordering::Greater,
                     Value::Blob(_) => Ordering::Less,
-                    Value::Text(rs) => {
-                        if enc == TextEncoding::Utf8
-                            && let Ok(lhs_s) = std::str::from_utf8(buf)
-                        {
-                            if let Some(ref cc) = spec.custom_collation {
-                                (cc.comparator)(lhs_s, rs.as_str())?
-                            } else {
-                                spec.collation
-                                    .compare_str_with_encoding(lhs_s, rs.as_str(), enc)
-                            }
-                        } else {
-                            let lhs_s = enc.decode_bytes(buf);
-                            if let Some(ref cc) = spec.custom_collation {
-                                (cc.comparator)(&lhs_s, rs.as_str())?
-                            } else {
-                                spec.collation
-                                    .compare_str_with_encoding(&lhs_s, rs.as_str(), enc)
-                            }
-                        }
-                    }
+                    Value::Text(rs) => compare_raw_text_to_str(buf, rs.as_str(), spec, enc)?,
                     Value::Null => unreachable!(),
                 };
                 if spec.desc { raw.reverse() } else { raw }
@@ -789,28 +851,11 @@ impl<'a> RawField<'a> {
             (Self::Text(_), Value::Integer(_) | Value::Real(_)) => Ok(Ordering::Greater),
             (Self::Text(_), Value::Blob(_)) => Ok(Ordering::Less),
             (Self::Text(buf), Value::Text(rs)) => {
-                if enc == TextEncoding::Utf8
-                    && let Ok(lhs_s) = std::str::from_utf8(buf)
-                {
-                    if let Some(ref cc) = spec.custom_collation {
-                        (cc.comparator)(lhs_s, rs.as_str())
-                    } else {
-                        Ok(spec
-                            .collation
-                            .compare_str_with_encoding(lhs_s, rs.as_str(), enc))
-                    }
-                } else {
-                    let lhs_s = enc.decode_bytes(buf);
-                    if let Some(ref cc) = spec.custom_collation {
-                        (cc.comparator)(&lhs_s, rs.as_str())
-                    } else {
-                        Ok(spec
-                            .collation
-                            .compare_str_with_encoding(&lhs_s, rs.as_str(), enc))
-                    }
-                }
+                compare_raw_text_to_str(buf, rs.as_str(), spec, enc)
             }
-            (Self::Blob(buf), Value::Blob(rb)) => Ok(buf.cmp(rb.as_slice())),
+            (Self::Blob(buf), Value::Blob(rb)) => {
+                Ok(sqliters_asm::cmp_bytes_binary(buf, rb.as_slice()))
+            }
             (Self::Blob(_), _) => Ok(Ordering::Greater),
         }
     }
@@ -1067,26 +1112,8 @@ fn compare_raw_fields(
             }
             (RawField::Int(i), RawField::Float(r)) => cmp_int_float(i, r),
             (RawField::Float(r), RawField::Int(i)) => cmp_int_float(i, r).reverse(),
-            (RawField::Blob(a), RawField::Blob(b)) => a.cmp(b),
-            (RawField::Text(a), RawField::Text(b)) => {
-                if enc == TextEncoding::Utf8
-                    && let (Ok(sa), Ok(sb)) = (std::str::from_utf8(a), std::str::from_utf8(b))
-                {
-                    if let Some(ref cc) = spec.custom_collation {
-                        (cc.comparator)(sa, sb)?
-                    } else {
-                        spec.collation.compare_str_with_encoding(sa, sb, enc)
-                    }
-                } else {
-                    let sa = enc.decode_bytes(a);
-                    let sb = enc.decode_bytes(b);
-                    if let Some(ref cc) = spec.custom_collation {
-                        (cc.comparator)(&sa, &sb)?
-                    } else {
-                        spec.collation.compare_str_with_encoding(&sa, &sb, enc)
-                    }
-                }
-            }
+            (RawField::Blob(a), RawField::Blob(b)) => sqliters_asm::cmp_bytes_binary(a, b),
+            (RawField::Text(a), RawField::Text(b)) => compare_raw_text_slices(a, b, spec, enc)?,
             _ => unreachable!(),
         }
     };

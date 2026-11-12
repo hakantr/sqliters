@@ -18,6 +18,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqliters-asm"
+version = "0.1.0"
+
+[[package]]
 name = "sqliters-btree"
 version = "0.1.0"
 dependencies = [
@@ -50,6 +54,7 @@ dependencies = [
 name = "sqliters-ext"
 version = "0.1.0"
 dependencies = [
+ "sqliters-asm",
  "sqliters-types",
 ]
 
@@ -84,11 +89,15 @@ dependencies = [
 [[package]]
 name = "sqliters-types"
 version = "0.1.0"
+dependencies = [
+ "sqliters-asm",
+]
 
 [[package]]
 name = "sqliters-vdbe"
 version = "0.1.0"
 dependencies = [
+ "sqliters-asm",
  "sqliters-btree",
  "sqliters-types",
 ]
@@ -97,5 +106,6 @@ dependencies = [
 name = "sqliters-vfs"
 version = "0.1.0"
 dependencies = [
+ "sqliters-asm",
  "sqliters-types",
 ]

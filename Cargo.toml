@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/sqliters-asm",
     "crates/sqliters-types",
     "crates/sqliters-vfs",
     "crates/sqliters-pager",
