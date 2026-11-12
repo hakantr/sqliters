@@ -1252,21 +1252,33 @@ pub(crate) fn commit_all_databases(
     }
 
     // Step 5: Atomic two-phase commit across all open `Btree`s (`commit_btrees_two_phase`).
-    let vfs = Arc::clone(ctx.db_set.disk_vfs());
-    let main_db_path = ctx.db_set.main_btree().db_path().map(Path::to_path_buf);
-    let enable_8_3 = ctx.db_set.slots().iter().any(|s| s.enable_8_3_names);
-
-    let mut open_indices = Vec::with_capacity(ctx.db_set.slot_count());
-    let mut retain_reads = Vec::with_capacity(ctx.db_set.slot_count());
-    for (idx, slot) in ctx.db_set.slots().iter().enumerate() {
-        if slot.btree.is_some() {
-            open_indices.push(idx);
-            let bit = 1u16.checked_shl(idx as u32).unwrap_or(0);
-            retain_reads.push((ctx.activity.other_read_db_mask & bit) != 0);
+    let two_phase_res = if ctx.db_set.slot_count() == 2 && ctx.db_set.slots()[1].btree.is_none() {
+        let retain = (ctx.activity.other_read_db_mask & 1) != 0;
+        if let Some(ref mut bt) = ctx.db_set.slots_mut()[0].btree {
+            let r: Result<()> = (|| {
+                if bt.transaction_state() == TransactionState::Write {
+                    bt.acquire_exclusive_lock()?;
+                    bt.commit_phase_one(None)?;
+                }
+                bt.commit_phase_two(retain, false)
+            })();
+            r
+        } else {
+            Ok(())
         }
-    }
+    } else {
+        let vfs = Arc::clone(ctx.db_set.disk_vfs());
+        let main_db_path = ctx.db_set.main_btree().db_path().map(Path::to_path_buf);
+        let enable_8_3 = ctx.db_set.slots().iter().any(|s| s.enable_8_3_names);
 
-    let two_phase_res = {
+        let mut retain_reads = Vec::with_capacity(ctx.db_set.slot_count());
+        for (idx, slot) in ctx.db_set.slots().iter().enumerate() {
+            if slot.btree.is_some() {
+                let bit = 1u16.checked_shl(idx as u32).unwrap_or(0);
+                retain_reads.push((ctx.activity.other_read_db_mask & bit) != 0);
+            }
+        }
+
         let mut bt_refs: Vec<&mut Btree> = ctx
             .db_set
             .slots_mut()
@@ -35695,6 +35707,53 @@ fn exec_pragma(
                 Ok(single_col("cache_size", Value::Integer(i64::from(cur))))
             }
         }
+        "MMAP_SIZE" => {
+            if let Some(pv) = value {
+                let raw = pragma_to_i64(pv);
+                let target_u64 = if raw < 0 {
+                    0u64
+                } else {
+                    (raw as u64).min(sqliters_vfs::MAX_MMAP_SIZE)
+                };
+                let active_mask =
+                    ctx.activity.other_read_db_mask | ctx.activity.other_write_db_mask;
+                if schema.is_none() {
+                    ctx.db_set.set_default_mmap_size(target_u64);
+                    let n_slots = ctx.db_set.slot_count();
+                    for idx in 0..n_slots {
+                        let bit = 1u16.checked_shl(idx as u32).unwrap_or(0);
+                        let has_other_lease = (active_mask & bit) != 0;
+                        if let Some(ref mut bt) = ctx
+                            .db_set
+                            .slot_mut(DatabaseId(idx))
+                            .and_then(|s| s.btree.as_mut())
+                        {
+                            bt.set_mmap_size(target_u64, has_other_lease)?;
+                        }
+                    }
+                } else {
+                    let bit = 1u16.checked_shl(db_id.index() as u32).unwrap_or(0);
+                    let has_other_lease = (active_mask & bit) != 0;
+                    if let Some(ref mut bt) =
+                        ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut())
+                    {
+                        bt.set_mmap_size(target_u64, has_other_lease)?;
+                    }
+                }
+            }
+            let effective = ctx
+                .db_set
+                .slot(db_id)
+                .and_then(|s| s.btree.as_ref())
+                .and_then(Btree::mmap_size);
+            match effective {
+                Some(sz) => Ok(single_col("mmap_size", Value::Integer(sz as i64))),
+                None => Ok(QueryOutput {
+                    column_names: vec!["mmap_size".to_owned()],
+                    rows: Vec::new(),
+                }),
+            }
+        }
         _ => {
             // Unknown PRAGMAs in SQLite are silently ignored (no error)
             let _ = HashMap::<u8, u8>::new();
@@ -37396,6 +37455,7 @@ fn infer_pragma_columns(name: &str, value: Option<&PragmaValue>) -> Vec<String> 
                 vec!["cache_size".to_owned()]
             }
         }
+        "MMAP_SIZE" => vec!["mmap_size".to_owned()],
         "DATABASE_LIST" => vec!["seq".to_owned(), "name".to_owned(), "file".to_owned()],
         "TABLE_INFO" => {
             if value.is_none() {

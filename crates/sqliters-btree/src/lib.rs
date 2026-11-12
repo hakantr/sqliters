@@ -533,6 +533,23 @@ impl Btree {
         self.pager.set_cache_size(size);
     }
 
+    /// Returns `Some(effective_mmap_size)` when backed by a named disk database supporting `mmap`,
+    /// or `None` for `:memory:` / temporary databases (`PRAGMA mmap_size`).
+    #[inline]
+    pub fn mmap_size(&self) -> Option<u64> {
+        self.pager.mmap_size()
+    }
+
+    /// Updates the advisory `mmap_size` limit (`PRAGMA mmap_size = N`).
+    #[inline]
+    pub fn set_mmap_size(
+        &mut self,
+        limit: u64,
+        has_other_active_lease: bool,
+    ) -> Result<Option<u64>> {
+        self.pager.set_mmap_size(limit, has_other_active_lease)
+    }
+
     // ========================================================================
     // Freelist & Page Allocation (`btreeInt.h:206-215`, `allocateBtreePage`)
     // ========================================================================

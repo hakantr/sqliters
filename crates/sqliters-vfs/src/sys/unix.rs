@@ -2,6 +2,7 @@
 //! WAL-index views (`mmap`/`munmap`), component-by-component pathname/symlink resolution
 //! (`unixFullPathname`), durability (`fsync`/`fdatasync`), and explicit close error reporting.
 #![allow(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 #[cfg(not(all(
     target_pointer_width = "64",
@@ -19,13 +20,14 @@ compile_error!(
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, IoSlice};
+use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU16, AtomicU32, Ordering, fence};
+use std::sync::atomic::{AtomicI32, AtomicU16, AtomicU32, Ordering, fence};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use sqliters_types::{ErrorCode, Result, SqliteError, extended};
@@ -100,6 +102,17 @@ use platform::{
 pub(crate) use platform::{F_RDLCK, F_UNLCK, F_WRLCK};
 
 const MAP_FAILED_ADDR: usize = usize::MAX;
+const POSIX_IOV_MAX: usize = 1024;
+const POSIX_IOV_SMALL: usize = 64;
+const MAX_PWRITEV_BYTES: usize = 0x7fff_f000;
+
+/// POSIX `<sys/uio.h>` scatter-gather descriptor (`struct iovec`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PosixIoVec {
+    iov_base: *const core::ffi::c_void,
+    iov_len: usize,
+}
 
 #[cfg(target_os = "linux")]
 #[repr(C, align(8))]
@@ -112,6 +125,7 @@ unsafe extern "C" {
     fn fsync(fd: i32) -> i32;
     #[cfg(target_os = "linux")]
     fn fdatasync(fd: i32) -> i32;
+    fn pwritev(fd: i32, iov: *const PosixIoVec, iovcnt: i32, offset: i64) -> isize;
     fn mmap(
         addr: *mut core::ffi::c_void,
         length: usize,
@@ -250,6 +264,122 @@ pub(crate) fn pwrite_all(file: &File, buf: &[u8], offset: u64, ioerr_code: i32) 
                     return Err(SqliteError::new(ErrorCode::Full, e.to_string()));
                 }
                 return Err(SqliteError::with_extended(ioerr_code, e.to_string()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Writes all non-empty slices in `slices` sequentially starting at `offset` using POSIX
+/// scatter-gather `pwritev`, chunking at `IOV_MAX` (`1024`), advancing across partial writes,
+/// retrying `EINTR`, and translating `ENOSPC` to `SQLITE_FULL`.
+pub(crate) fn pwritev_all(
+    file: &File,
+    slices: &[IoSlice<'_>],
+    offset: u64,
+    ioerr_code: i32,
+) -> Result<()> {
+    match slices.len() {
+        0 => Ok(()),
+        1 => pwrite_all(file, &slices[0], offset, ioerr_code),
+        2..=POSIX_IOV_SMALL => pwritev_chunked::<POSIX_IOV_SMALL>(file, slices, offset, ioerr_code),
+        _ => pwritev_chunked::<POSIX_IOV_MAX>(file, slices, offset, ioerr_code),
+    }
+}
+
+fn pwritev_chunked<const CAP: usize>(
+    file: &File,
+    slices: &[IoSlice<'_>],
+    mut offset: u64,
+    ioerr_code: i32,
+) -> Result<()> {
+    let fd = file.as_raw_fd();
+    let mut iovs: [MaybeUninit<PosixIoVec>; CAP] = [const { MaybeUninit::uninit() }; CAP];
+    let mut slice_idx = 0usize;
+    let mut lead_skip = 0usize;
+
+    while slice_idx < slices.len() {
+        while slice_idx < slices.len() && slices[slice_idx].len() <= lead_skip {
+            lead_skip = 0;
+            slice_idx += 1;
+        }
+        if slice_idx >= slices.len() {
+            break;
+        }
+
+        let off_i64 = i64::try_from(offset)
+            .map_err(|_| SqliteError::with_extended(ioerr_code, "pwritev offset overflow"))?;
+
+        let mut iov_cnt = 0usize;
+        let mut planned_bytes = 0usize;
+        let mut scan_idx = slice_idx;
+        let mut scan_skip = lead_skip;
+        while scan_idx < slices.len() && iov_cnt < CAP && planned_bytes < MAX_PWRITEV_BYTES {
+            let raw: &[u8] = &slices[scan_idx];
+            let sub = &raw[scan_skip..];
+            scan_skip = 0;
+            scan_idx += 1;
+            if sub.is_empty() {
+                continue;
+            }
+            let take_len = sub.len().min(MAX_PWRITEV_BYTES - planned_bytes);
+            iovs[iov_cnt].write(PosixIoVec {
+                iov_base: sub.as_ptr().cast::<core::ffi::c_void>(),
+                iov_len: take_len,
+            });
+            iov_cnt += 1;
+            planned_bytes += take_len;
+            if take_len < sub.len() {
+                break;
+            }
+        }
+        if iov_cnt == 0 {
+            break;
+        }
+
+        // SAFETY: `fd` is a valid open writable file descriptor borrowed from `file` for the
+        // duration of this syscall; `iovs[0..iov_cnt]` was initialized above with `PosixIoVec`
+        // entries whose `iov_base` pointers reference live `&[u8]` slices borrowed from `slices`
+        // for at least `iov_len` readable bytes; `iov_cnt <= CAP <= POSIX_IOV_MAX` fits in `i32`
+        // and `off_i64 >= 0` was checked via `i64::try_from`. `pwritev` reads user memory only,
+        // does not mutate the file descriptor's seek cursor, and is safe across threads.
+        let rc = unsafe {
+            pwritev(
+                fd,
+                iovs.as_ptr().cast::<PosixIoVec>(),
+                iov_cnt as i32,
+                off_i64,
+            )
+        };
+        if rc > 0 {
+            let mut rem = rc as usize;
+            offset = offset
+                .checked_add(rem as u64)
+                .ok_or_else(|| SqliteError::with_extended(ioerr_code, "pwritev offset overflow"))?;
+            while rem > 0 {
+                let avail = slices[slice_idx].len() - lead_skip;
+                if rem < avail {
+                    lead_skip += rem;
+                    rem = 0;
+                } else {
+                    rem -= avail;
+                    lead_skip = 0;
+                    slice_idx += 1;
+                }
+            }
+        } else if rc == 0 {
+            return Err(SqliteError::with_extended(
+                ioerr_code,
+                "pwritev returned 0 bytes written",
+            ));
+        } else {
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(e) if e == EINTR => continue,
+                Some(e) if e == ENOSPC => {
+                    return Err(SqliteError::new(ErrorCode::Full, err.to_string()));
+                }
+                _ => return Err(SqliteError::with_extended(ioerr_code, err.to_string())),
             }
         }
     }
@@ -614,6 +744,7 @@ pub(crate) type DeferFileCloseHook = Box<dyn Fn(File) -> Option<File> + Send + S
 /// descriptor is unlocked (DMS byte 128) and closed.
 pub(crate) struct SysShmBacking {
     file: Mutex<Option<File>>,
+    raw_fd: AtomicI32,
     shm_path: PathBuf,
     inode_key: (u64, u64),
     readonly: bool,
@@ -629,14 +760,27 @@ impl SysShmBacking {
         readonly: bool,
         defer_close_fn: Option<DeferFileCloseHook>,
     ) -> Self {
+        let fd = file.as_raw_fd();
         Self {
             file: Mutex::new(Some(file)),
+            raw_fd: AtomicI32::new(fd),
             shm_path,
             inode_key,
             readonly,
             delete_on_drop: Mutex::new(false),
             defer_close_fn,
         }
+    }
+
+    /// Returns the open `-shm` descriptor without acquiring `self.file` when called under an
+    /// active `UnixShmNode` lock (teardown clears `raw_fd` to `-1` before closing `File`).
+    #[inline]
+    pub(crate) fn raw_fd_checked(&self) -> Result<RawFd> {
+        let fd = self.raw_fd.load(Ordering::Acquire);
+        if fd < 0 {
+            return Err(SqliteError::misuse("WAL-index backing file already closed"));
+        }
+        Ok(fd)
     }
 
     #[inline]
@@ -679,6 +823,7 @@ impl SysShmBacking {
                 .file
                 .lock()
                 .map_err(|_| SqliteError::new(ErrorCode::Internal, "poisoned shm backing mutex"))?;
+            self.raw_fd.store(-1, Ordering::Release);
             guard.take()
         };
         let should_delete = delete_file || self.delete_on_drop.lock().map(|g| *g).unwrap_or(false);
@@ -948,6 +1093,61 @@ impl SysMapView {
     }
 
     #[inline]
+    pub(crate) fn load_u32_words<const N: usize>(
+        &self,
+        subrange_offset: usize,
+        region_index: u32,
+        rel_offset: usize,
+        ordering: Ordering,
+    ) -> Result<[u32; N]> {
+        if N == 0 {
+            return Ok([0u32; N]);
+        }
+        let span = N
+            .checked_mul(4)
+            .ok_or_else(|| SqliteError::misuse("WAL-index word span overflow"))?;
+        if !rel_offset.is_multiple_of(4) {
+            return Err(SqliteError::misuse("unaligned WAL-index bulk u32 load"));
+        }
+        let rel_end = rel_offset
+            .checked_add(span)
+            .ok_or_else(|| SqliteError::misuse("WAL-index relative offset overflow"))?;
+        if rel_end > SHM_LOGICAL_REGION_BYTES {
+            return Err(SqliteError::misuse(
+                "WAL-index bulk load exceeds 32 KiB region",
+            ));
+        }
+        if region_index == 0 && rel_offset < WAL_LOCK_BYTES_END && rel_end > WAL_LOCK_BYTES_START {
+            return Err(SqliteError::misuse(
+                "access to reserved WAL lock byte range 120..128 is forbidden",
+            ));
+        }
+        let abs_offset = subrange_offset
+            .checked_add(rel_offset)
+            .ok_or_else(|| SqliteError::misuse("WAL-index view offset overflow"))?;
+        let abs_end = abs_offset
+            .checked_add(span)
+            .ok_or_else(|| SqliteError::misuse("WAL-index view end overflow"))?;
+        if abs_end > self.len {
+            return Err(SqliteError::misuse(
+                "WAL-index access out of MapView bounds",
+            ));
+        }
+        let mut out = [0u32; N];
+        // SAFETY: `abs_offset..abs_end` (`span = N * 4` bytes) was verified in-bounds of
+        // `self.len`, 4-byte aligned, and disjoint from region-0 `aLock` (`120..128`). The OS
+        // mapping stays valid for `&self`'s lifetime, and each 32-bit word is loaded via an
+        // atomic `AtomicU32` operation without forming any `&[u8]` slice over shared memory.
+        unsafe {
+            let base = self.ptr.as_ptr().add(abs_offset).cast::<u32>();
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = AtomicU32::from_ptr(base.add(i)).load(ordering);
+            }
+        }
+        Ok(out)
+    }
+
+    #[inline]
     pub(crate) fn store_u32(
         &self,
         subrange_offset: usize,
@@ -1048,4 +1248,101 @@ impl Drop for SysMapView {
 #[inline]
 pub(crate) fn shm_barrier() {
     fence(Ordering::SeqCst);
+}
+
+/// Read-only `PROT_READ | MAP_SHARED` database file window (`unixMapfile` / `unixFetch` in
+/// `sqlite/src/os_unix.c`), unmapped automatically on `Drop`.
+pub(crate) struct ReadMapInner {
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+// SAFETY: `ReadMapInner` owns an immutable (`PROT_READ`, `MAP_SHARED`) virtual memory mapping
+// whose lifetime is governed by `Arc<ReadMapWindow>` reference counting and released via thread-safe
+// POSIX `munmap` on `Drop`.
+unsafe impl Send for ReadMapInner {}
+// SAFETY: All accesses through `ReadMapInner` are read-only byte loads within `[0, len)` while the
+// caller holds a `SHARED` file lock or WAL read-mark snapshot preventing concurrent `.db` page mutation.
+unsafe impl Sync for ReadMapInner {}
+
+impl ReadMapInner {
+    pub(crate) fn map_readonly(fd: RawFd, len: usize) -> Result<Self> {
+        if len == 0 {
+            return Err(SqliteError::misuse("cannot mmap zero-length read window"));
+        }
+        // SAFETY: Passing `addr = NULL` lets the kernel choose a fresh page-aligned virtual address
+        // range of `len` bytes with `PROT_READ` and `MAP_SHARED` from `fd` at offset `0`. `fd` is a
+        // valid open file descriptor with physical size `>= len` verified by the caller. On failure
+        // `MAP_FAILED` (`usize::MAX`) is detected before constructing `NonNull`.
+        let raw = unsafe { mmap(core::ptr::null_mut(), len, PROT_READ, MAP_SHARED, fd, 0) };
+        if (raw as usize) == MAP_FAILED_ADDR {
+            let err = std::io::Error::last_os_error();
+            return Err(SqliteError::new(ErrorCode::IoErr, err.to_string()));
+        }
+        let ptr = NonNull::new(raw.cast::<u8>())
+            .ok_or_else(|| SqliteError::new(ErrorCode::IoErr, "mmap returned null pointer"))?;
+        Ok(Self { ptr, len })
+    }
+
+    #[inline(always)]
+    pub(crate) const fn mapped_len(&self) -> usize {
+        self.len
+    }
+
+    /// Copies `dst.len()` bytes starting at `offset` within `[0, valid_len)` into `dst`.
+    #[inline]
+    pub(crate) fn copy_range(&self, offset: usize, valid_len: usize, dst: &mut [u8]) -> bool {
+        let cap = valid_len.min(self.len);
+        let Some(end) = offset.checked_add(dst.len()) else {
+            return false;
+        };
+        if end > cap {
+            return false;
+        }
+        // SAFETY: `offset..end` is verified in-bounds of `cap <= self.len`, `self.ptr` is a live
+        // `PROT_READ` mapping backed by at least `valid_len` file bytes, and `dst` is a disjoint
+        // caller-owned mutable heap/stack slice, so `copy_nonoverlapping` cannot alias or fault.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                self.ptr.as_ptr().add(offset),
+                dst.as_mut_ptr(),
+                dst.len(),
+            );
+        }
+        true
+    }
+
+    /// Borrows an immutable slice `[offset..offset + len)` within `[0, valid_len)`.
+    ///
+    /// Callers (`Pager::read_page`) invoke this only while holding a `SHARED` file lock (rollback
+    /// mode) or an active WAL `READ_MARK` snapshot for pages absent from `-wal` (`find_frame == None`),
+    /// which by SQLite's locking/checkpoint protocol prevents any concurrent writer or checkpointer
+    /// from mutating those `.db` page bytes during the returned slice's borrow.
+    #[inline(always)]
+    pub(crate) fn slice_in_snapshot(
+        &self,
+        offset: usize,
+        len: usize,
+        valid_len: usize,
+    ) -> Option<&[u8]> {
+        let cap = valid_len.min(self.len);
+        let end = offset.checked_add(len)?;
+        if end > cap {
+            return None;
+        }
+        // SAFETY: `offset..end` is verified in-bounds of `cap <= self.len` on a live `PROT_READ`
+        // mapping valid until `Self::drop` (`munmap`), `u8` has alignment 1, and the caller's
+        // active Pager read/WAL snapshot guarantees these `.db` page bytes are not concurrently
+        // mutated for the duration of the `&self` borrow.
+        Some(unsafe { core::slice::from_raw_parts(self.ptr.as_ptr().add(offset), len) })
+    }
+}
+
+impl Drop for ReadMapInner {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` and `self.len` originate from a successful `mmap` in `map_readonly`,
+        // and `Drop` runs only after the last `Arc<ReadMapWindow>` reference is released, so no
+        // borrowed slice from `slice_in_snapshot` can exist.
+        let _ = unsafe { munmap(self.ptr.as_ptr().cast::<core::ffi::c_void>(), self.len) };
+    }
 }

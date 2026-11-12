@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use sqliters_ext::{
     Fts5AuxRegistry, Fts5Module, Fts5VocabModule, GenerateSeriesModule, JsonEachModule,
@@ -167,11 +167,60 @@ pub enum CachedSubSql {
 }
 
 /// Per-connection registry of virtual table modules and connected virtual table instances.
+/// Lazily initialized connection-scoped `Fts5AuxRegistry` shared between `VTabRegistry` and
+/// `FunctionRegistry` so opening a connection that never touches FTS5 auxiliary functions avoids
+/// allocating the 64-slot ring buffer up front.
+pub type LazyFts5Aux = Arc<OnceLock<Arc<Fts5AuxRegistry>>>;
+
+struct SharedBuiltinModules {
+    dbstat: Arc<dyn VirtualTableModule>,
+    fts5vocab: Arc<dyn VirtualTableModule>,
+    generate_series: Arc<dyn VirtualTableModule>,
+    json_each: Arc<dyn VirtualTableModule>,
+    json_tree: Arc<dyn VirtualTableModule>,
+    jsonb_each: Arc<dyn VirtualTableModule>,
+    jsonb_tree: Arc<dyn VirtualTableModule>,
+    rtree: Arc<dyn VirtualTableModule>,
+    rtree_i32: Arc<dyn VirtualTableModule>,
+}
+
+static SHARED_BUILTIN_MODULES: OnceLock<SharedBuiltinModules> = OnceLock::new();
+
+#[inline]
+fn shared_builtin_modules() -> &'static SharedBuiltinModules {
+    SHARED_BUILTIN_MODULES.get_or_init(|| SharedBuiltinModules {
+        dbstat: Arc::new(DbStatModule),
+        fts5vocab: Arc::new(Fts5VocabModule),
+        generate_series: Arc::new(GenerateSeriesModule),
+        json_each: Arc::new(JsonEachModule),
+        json_tree: Arc::new(JsonTreeModule),
+        jsonb_each: Arc::new(JsonbEachModule),
+        jsonb_tree: Arc::new(JsonbTreeModule),
+        rtree: Arc::new(RTreeModule::new_f32()),
+        rtree_i32: Arc::new(RTreeModule::new_i32()),
+    })
+}
+
+const DEFAULT_BUILTIN_MODULE_NAMES_SORTED: [&str; 10] = [
+    "dbstat",
+    "fts5",
+    "fts5vocab",
+    "generate_series",
+    "json_each",
+    "json_tree",
+    "jsonb_each",
+    "jsonb_tree",
+    "rtree",
+    "rtree_i32",
+];
+
 pub struct VTabRegistry {
     modules: BTreeMap<String, (String, Arc<dyn VirtualTableModule>)>,
+    modules_customized: bool,
+    fts5_module: OnceLock<Arc<dyn VirtualTableModule>>,
     connected: HashMap<String, Vec<ConnectedVTabEntry>>,
     sub_sql_cache: HashMap<String, Arc<Stmt>>,
-    fts5_aux: Arc<Fts5AuxRegistry>,
+    fts5_aux: LazyFts5Aux,
     pub trusted_schema: bool,
     pub defensive_mode: bool,
     pub internal_sql_depth: usize,
@@ -179,8 +228,13 @@ pub struct VTabRegistry {
 
 impl std::fmt::Debug for VTabRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = if self.modules_customized {
+            self.modules.len()
+        } else {
+            DEFAULT_BUILTIN_MODULE_NAMES_SORTED.len()
+        };
         f.debug_struct("VTabRegistry")
-            .field("module_count", &self.modules.len())
+            .field("module_count", &count)
             .field("connected", &self.connected)
             .field("sub_sql_cache_len", &self.sub_sql_cache.len())
             .field("trusted_schema", &self.trusted_schema)
@@ -197,40 +251,111 @@ impl Default for VTabRegistry {
 }
 
 impl VTabRegistry {
-    /// Creates a new `VTabRegistry` pre-populated with built-in modules (`generate_series`, `dbstat`,
-    /// `json_each`, `json_tree`, `jsonb_each`, `jsonb_tree`, `fts5`, `fts5vocab`, `rtree`, `rtree_i32`).
+    /// Creates a new `VTabRegistry` exposing all built-in modules (`generate_series`, `dbstat`,
+    /// `json_each`, `json_tree`, `jsonb_each`, `jsonb_tree`, `fts5`, `fts5vocab`, `rtree`, `rtree_i32`)
+    /// lazily on demand without upfront `BTreeMap` or module allocations.
     pub fn new() -> Self {
-        let fts5_aux = Arc::new(Fts5AuxRegistry::new());
-        let mut reg = Self {
+        Self {
             modules: BTreeMap::new(),
+            modules_customized: false,
+            fts5_module: OnceLock::new(),
             connected: HashMap::new(),
             sub_sql_cache: HashMap::new(),
-            fts5_aux: Arc::clone(&fts5_aux),
+            fts5_aux: Arc::new(OnceLock::new()),
             trusted_schema: true,
             defensive_mode: false,
             internal_sql_depth: 0,
-        };
-        reg.register_module(Arc::new(GenerateSeriesModule));
-        reg.register_module(Arc::new(DbStatModule));
-        reg.register_module(Arc::new(JsonEachModule));
-        reg.register_module(Arc::new(JsonTreeModule));
-        reg.register_module(Arc::new(JsonbEachModule));
-        reg.register_module(Arc::new(JsonbTreeModule));
-        reg.register_module(Arc::new(Fts5Module::new(fts5_aux)));
-        reg.register_module(Arc::new(Fts5VocabModule));
-        reg.register_module(Arc::new(RTreeModule::new_f32()));
-        reg.register_module(Arc::new(RTreeModule::new_i32()));
-        reg
+        }
+    }
+
+    /// Returns the lazy handle to the connection-scoped FTS5 auxiliary function registry.
+    #[inline]
+    pub fn lazy_fts5_aux(&self) -> LazyFts5Aux {
+        Arc::clone(&self.fts5_aux)
     }
 
     /// Returns the connection-scoped FTS5 auxiliary function registry (`bm25`, `highlight`, `snippet`).
     #[inline]
     pub fn fts5_aux_registry(&self) -> Arc<Fts5AuxRegistry> {
-        Arc::clone(&self.fts5_aux)
+        Arc::clone(
+            self.fts5_aux
+                .get_or_init(|| Arc::new(Fts5AuxRegistry::new())),
+        )
+    }
+
+    #[inline]
+    fn fts5_builtin_module(&self) -> Arc<dyn VirtualTableModule> {
+        Arc::clone(self.fts5_module.get_or_init(|| {
+            let aux = self.fts5_aux_registry();
+            Arc::new(Fts5Module::new(aux))
+        }))
+    }
+
+    fn lookup_default_builtin_module(&self, name: &str) -> Option<Arc<dyn VirtualTableModule>> {
+        match name.len() {
+            4 if name.eq_ignore_ascii_case("fts5") => Some(self.fts5_builtin_module()),
+            5 if name.eq_ignore_ascii_case("rtree") => {
+                Some(Arc::clone(&shared_builtin_modules().rtree))
+            }
+            6 if name.eq_ignore_ascii_case("dbstat") => {
+                Some(Arc::clone(&shared_builtin_modules().dbstat))
+            }
+            9 => {
+                if name.eq_ignore_ascii_case("json_each") {
+                    Some(Arc::clone(&shared_builtin_modules().json_each))
+                } else if name.eq_ignore_ascii_case("json_tree") {
+                    Some(Arc::clone(&shared_builtin_modules().json_tree))
+                } else if name.eq_ignore_ascii_case("fts5vocab") {
+                    Some(Arc::clone(&shared_builtin_modules().fts5vocab))
+                } else if name.eq_ignore_ascii_case("rtree_i32") {
+                    Some(Arc::clone(&shared_builtin_modules().rtree_i32))
+                } else {
+                    None
+                }
+            }
+            10 => {
+                if name.eq_ignore_ascii_case("jsonb_each") {
+                    Some(Arc::clone(&shared_builtin_modules().jsonb_each))
+                } else if name.eq_ignore_ascii_case("jsonb_tree") {
+                    Some(Arc::clone(&shared_builtin_modules().jsonb_tree))
+                } else {
+                    None
+                }
+            }
+            15 if name.eq_ignore_ascii_case("generate_series") => {
+                Some(Arc::clone(&shared_builtin_modules().generate_series))
+            }
+            _ => None,
+        }
+    }
+
+    fn ensure_modules_materialized(&mut self) {
+        if self.modules_customized {
+            return;
+        }
+        self.modules_customized = true;
+        let shared = shared_builtin_modules();
+        let fts5 = self.fts5_builtin_module();
+        let entries: [(&str, Arc<dyn VirtualTableModule>); 10] = [
+            ("dbstat", Arc::clone(&shared.dbstat)),
+            ("fts5", fts5),
+            ("fts5vocab", Arc::clone(&shared.fts5vocab)),
+            ("generate_series", Arc::clone(&shared.generate_series)),
+            ("json_each", Arc::clone(&shared.json_each)),
+            ("json_tree", Arc::clone(&shared.json_tree)),
+            ("jsonb_each", Arc::clone(&shared.jsonb_each)),
+            ("jsonb_tree", Arc::clone(&shared.jsonb_tree)),
+            ("rtree", Arc::clone(&shared.rtree)),
+            ("rtree_i32", Arc::clone(&shared.rtree_i32)),
+        ];
+        for (name, m) in entries {
+            self.modules.insert(name.to_owned(), (name.to_owned(), m));
+        }
     }
 
     /// Registers a virtual table module on the connection.
     pub fn register_module(&mut self, module: Arc<dyn VirtualTableModule>) {
+        self.ensure_modules_materialized();
         let orig_name = module.name().to_owned();
         let key = orig_name.to_ascii_lowercase();
         self.modules.insert(key, (orig_name, module));
@@ -238,6 +363,7 @@ impl VTabRegistry {
 
     /// Unregisters a virtual table module by name (`sqlite3_create_module_v2` with `pModule == NULL`).
     pub fn unregister_module(&mut self, name: &str) -> bool {
+        self.ensure_modules_materialized();
         let key = name.to_ascii_lowercase();
         self.modules.remove(&key).is_some()
     }
@@ -245,14 +371,22 @@ impl VTabRegistry {
     /// Looks up a registered module by name (case-insensitive), lazily registering `pragma_<name>`
     /// eponymous modules when requested (`sqlite3PragmaVtabRegister` parity).
     pub fn get_or_register_module(&mut self, name: &str) -> Option<Arc<dyn VirtualTableModule>> {
-        let key = name.to_ascii_lowercase();
-        if let Some((_, m)) = self.modules.get(&key) {
-            return Some(Arc::clone(m));
+        if !self.modules_customized
+            && let Some(m) = self.lookup_default_builtin_module(name)
+        {
+            return Some(m);
+        }
+        if self.modules_customized {
+            let key = name.to_ascii_lowercase();
+            if let Some((_, m)) = self.modules.get(&key) {
+                return Some(Arc::clone(m));
+            }
         }
         if let Some(pragma_mod) = PragmaVTabModule::try_for_module_name(name) {
+            self.ensure_modules_materialized();
+            let key = name.to_ascii_lowercase();
             let arc: Arc<dyn VirtualTableModule> = Arc::new(pragma_mod);
-            self.modules
-                .insert(key, (name.to_ascii_lowercase(), Arc::clone(&arc)));
+            self.modules.insert(key.clone(), (key, Arc::clone(&arc)));
             return Some(arc);
         }
         None
@@ -260,6 +394,9 @@ impl VTabRegistry {
 
     /// Looks up an already-registered module without lazy `pragma_*` registration.
     pub fn get_module(&self, name: &str) -> Option<Arc<dyn VirtualTableModule>> {
+        if !self.modules_customized {
+            return self.lookup_default_builtin_module(name);
+        }
         if !name.bytes().any(|b| b.is_ascii_uppercase()) {
             return self.modules.get(name).map(|(_, m)| Arc::clone(m));
         }
@@ -269,6 +406,12 @@ impl VTabRegistry {
 
     /// Returns the sorted list of currently registered module names (`PRAGMA module_list`).
     pub fn module_names(&self) -> Vec<String> {
+        if !self.modules_customized {
+            return DEFAULT_BUILTIN_MODULE_NAMES_SORTED
+                .iter()
+                .map(|&s| s.to_owned())
+                .collect();
+        }
         let mut names: Vec<String> = self.modules.values().map(|(n, _)| n.clone()).collect();
         names.sort();
         names

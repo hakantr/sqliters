@@ -11,7 +11,8 @@
 pub mod locks;
 pub mod mapping;
 
-use std::sync::atomic::Ordering;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use sqliters_types::{
@@ -321,6 +322,58 @@ impl WalIndexHeaderData {
             cksum: [cksum0, cksum1],
         })
     }
+
+    /// Encodes a previously checksum-verified header back into its exact 12 native `u32` words
+    /// in `-shm` (`0..48` / `48..96`), allowing steady-state `walIndexTryHdr` / post-lock checks
+    /// to compare 12 `u32` words directly without re-running `walChecksumBytes`.
+    #[inline]
+    pub const fn try_to_raw_words(&self) -> Option<[u32; 12]> {
+        if self.is_init != 1 || self.version != WALINDEX_MAX_VERSION {
+            return None;
+        }
+        let raw_sz_page = if self.mx_frame == 0 && self.page_size == 0 {
+            0u16
+        } else if self.page_size == 65_536 {
+            1u16
+        } else if self.page_size >= 512
+            && self.page_size <= 32_768
+            && self.page_size.is_power_of_two()
+        {
+            self.page_size as u16
+        } else {
+            return None;
+        };
+        let sz_ne = raw_sz_page.to_ne_bytes();
+        let w3 = u32::from_ne_bytes([self.is_init, self.big_end_cksum, sz_ne[0], sz_ne[1]]);
+        Some([
+            self.version,
+            self.unused,
+            self.change_counter,
+            w3,
+            self.mx_frame,
+            self.n_page,
+            self.frame_cksum[0],
+            self.frame_cksum[1],
+            u32::from_ne_bytes(self.salt[0].to_be_bytes()),
+            u32::from_ne_bytes(self.salt[1].to_be_bytes()),
+            self.cksum[0],
+            self.cksum[1],
+        ])
+    }
+
+    /// Verifies and decodes two 12-word `u32` copies of `WalIndexHdr`.
+    pub fn decode_verified_words(copy1: &[u32; 12], copy2: &[u32; 12]) -> Result<Self> {
+        if copy1 != copy2 {
+            return Err(SqliteError::corrupt(
+                "WAL-index header copies 0..48 and 48..96 do not match",
+            ));
+        }
+        let mut raw = [0u8; WALINDEX_HDR_COPY_LEN];
+        for (i, &w) in copy1.iter().enumerate() {
+            raw[i * 4..i * 4 + 4].copy_from_slice(&w.to_ne_bytes());
+        }
+        Self::decode_verified_pair(&raw, &raw)
+    }
 }
 
 /// Owned snapshot of `WalCkptInfo` (`96..136`) excluding `aLock[0..8]` (`120..128`).
@@ -382,11 +435,52 @@ pub(crate) trait ShmBackend: Send + Sync {
     fn close_session(&self, connection_id: u64, delete_on_last: bool) -> Result<()>;
 }
 
+struct WalShmInner {
+    lock: WalLockState,
+    cached_chunks: Vec<Option<ShmChunk>>,
+}
+
+impl Deref for WalShmInner {
+    type Target = WalLockState;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.lock
+    }
+}
+
+impl DerefMut for WalShmInner {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.lock
+    }
+}
+
+/// Outcome of [`WalShm::try_fast_begin_read_snapshot`].
+#[derive(Debug)]
+pub enum FastBeginReadOutcome {
+    /// Steady-state reader snapshot acquired and post-lock verified in a single pass.
+    Acquired {
+        guard: OwnedWalReadGuard,
+        slot: u8,
+        min_frame: u32,
+        live_hdr: Option<WalIndexHeaderData>,
+    },
+    /// Transient race detected during lock acquisition or post-lock barrier verification.
+    Retry {
+        live_hdr: Option<WalIndexHeaderData>,
+    },
+    /// Falls back to the full general recovery / `aReadMark`-claim path.
+    FallbackSlowPath,
+}
+
 /// Safe per-connection WAL-index handle bound to an open `.db` file's verified identity.
 pub struct WalShm {
+    connection_id: u64,
     backend: Arc<dyn ShmBackend>,
-    state: Mutex<WalLockState>,
-    closed: Mutex<bool>,
+    state: Mutex<WalShmInner>,
+    closed: AtomicBool,
+    poisoned: AtomicBool,
 }
 
 impl std::fmt::Debug for WalShm {
@@ -401,9 +495,14 @@ impl std::fmt::Debug for WalShm {
 impl WalShm {
     pub(crate) fn new(connection_id: u64, backend: Arc<dyn ShmBackend>) -> Self {
         Self {
+            connection_id,
             backend,
-            state: Mutex::new(WalLockState::new(connection_id)),
-            closed: Mutex::new(false),
+            state: Mutex::new(WalShmInner {
+                lock: WalLockState::new(connection_id),
+                cached_chunks: Vec::new(),
+            }),
+            closed: AtomicBool::new(false),
+            poisoned: AtomicBool::new(false),
         }
     }
 
@@ -413,7 +512,7 @@ impl WalShm {
             .state
             .lock()
             .map_err(|_| SqliteError::new(ErrorCode::Internal, "poisoned WalLockState mutex"))?;
-        Ok(guard.clone())
+        Ok(guard.lock.clone())
     }
 
     /// Returns whether the underlying `-shm` handle was opened read-only.
@@ -582,16 +681,11 @@ impl WalShm {
     /// Explicitly closes this `WalShm` session via `&self` (allowing `Arc<WalShm>` teardown once
     /// all transaction guards on this connection have been dropped).
     pub fn close_shared(&self, delete_if_last: bool) -> Result<()> {
-        let mut closed_guard = self
-            .closed
-            .lock()
-            .map_err(|_| SqliteError::new(ErrorCode::Internal, "poisoned closed mutex"))?;
-        if *closed_guard {
-            return Ok(());
-        }
-
-        let (conn_id, poisoned_err) = {
-            let st = self.lock_state_guard()?;
+        let (conn_id, poisoned_err, dropped_chunks) = {
+            let mut st = self.lock_state_guard()?;
+            if self.closed.load(Ordering::Acquire) {
+                return Ok(());
+            }
             if st.held_mask() != 0 && !st.is_poisoned() {
                 return Err(SqliteError::new(
                     ErrorCode::Busy,
@@ -607,11 +701,14 @@ impl WalShm {
             } else {
                 None
             };
-            (st.connection_id(), perr)
+            self.closed.store(true, Ordering::Release);
+            let chunks = std::mem::take(&mut st.cached_chunks);
+            (st.connection_id(), perr, chunks)
         };
 
-        *closed_guard = true;
-        drop(closed_guard);
+        // Drop per-connection cached `ShmChunk`s BEFORE `close_session` so `MapView`/`SysShmBacking`
+        // refcounts reach 1 when the last session detaches!
+        drop(dropped_chunks);
 
         let close_res = self.backend.close_session(conn_id, delete_if_last);
         if let Some(err) = poisoned_err {
@@ -883,33 +980,28 @@ impl WalShm {
     // Internal guard-verified state & shared-memory helpers
     // ========================================================================
 
-    fn lock_state_guard(&self) -> Result<std::sync::MutexGuard<'_, WalLockState>> {
+    #[inline]
+    fn lock_state_guard(&self) -> Result<std::sync::MutexGuard<'_, WalShmInner>> {
         self.state
             .lock()
             .map_err(|_| SqliteError::new(ErrorCode::Internal, "poisoned WalLockState mutex"))
     }
 
+    #[inline]
     fn ensure_open_and_healthy(&self) -> Result<u64> {
-        let is_closed = self
-            .closed
-            .lock()
-            .map(|g| *g)
-            .map_err(|_| SqliteError::new(ErrorCode::Internal, "poisoned closed mutex"))?;
-        if is_closed {
+        if self.closed.load(Ordering::Acquire) {
             return Err(SqliteError::misuse("WalShm handle already closed"));
         }
-        let st = self.lock_state_guard()?;
-        st.ensure_healthy()?;
-        Ok(st.connection_id())
+        if self.poisoned.load(Ordering::Acquire) {
+            let st = self.lock_state_guard()?;
+            st.ensure_healthy()?;
+        }
+        Ok(self.connection_id)
     }
 
+    #[inline]
     fn begin_idle_transition(&self) -> Result<u64> {
-        let is_closed = self
-            .closed
-            .lock()
-            .map(|g| *g)
-            .map_err(|_| SqliteError::new(ErrorCode::Internal, "poisoned closed mutex"))?;
-        if is_closed {
+        if self.closed.load(Ordering::Acquire) {
             return Err(SqliteError::misuse("WalShm handle already closed"));
         }
         let st = self.lock_state_guard()?;
@@ -919,12 +1011,219 @@ impl WalShm {
                 "WalShm connection already holds an active transaction guard",
             ));
         }
-        Ok(st.connection_id())
+        Ok(self.connection_id)
+    }
+
+    #[inline]
+    fn get_or_map_region(&self, region: u32, extend: bool) -> Result<Option<ShmChunk>> {
+        let reg_usize = region as usize;
+        {
+            let st = self.lock_state_guard()?;
+            if let Some(Some(chunk)) = st.cached_chunks.get(reg_usize) {
+                return Ok(Some(chunk.clone()));
+            }
+        }
+        self.backend.ensure_dms_ready()?;
+        let Some(chunk) = self.backend.map_region(region, extend)? else {
+            return Ok(None);
+        };
+        let mut st = self.lock_state_guard()?;
+        if !self.closed.load(Ordering::Acquire) {
+            if st.cached_chunks.len() <= reg_usize {
+                st.cached_chunks.resize(reg_usize + 1, None);
+            }
+            st.cached_chunks[reg_usize] = Some(chunk.clone());
+        }
+        Ok(Some(chunk))
+    }
+
+    /// Single-pass steady-state WAL read snapshot acquisition (`walTryBeginRead`,
+    /// `sqlite/src/wal.c:3205-3355`) combining raw 12-word header comparison, `WalCkptInfo`
+    /// inspection, shared read-slot lock acquisition, and single-barrier post-lock verification.
+    pub fn try_fast_begin_read_snapshot(
+        shm: &Arc<Self>,
+        known_hdr: Option<&WalIndexHeaderData>,
+        exclusive_db_mode: bool,
+    ) -> Result<FastBeginReadOutcome> {
+        if shm.closed.load(Ordering::Acquire) || shm.poisoned.load(Ordering::Acquire) {
+            return Ok(FastBeginReadOutcome::FallbackSlowPath);
+        }
+        if shm.backend.ensure_dms_ready().is_err() {
+            return Ok(FastBeginReadOutcome::FallbackSlowPath);
+        }
+
+        let (slot, mx_read_mark, live_hdr, expected_words) = {
+            let mut st = shm.lock_state_guard()?;
+            if shm.closed.load(Ordering::Acquire)
+                || st.is_poisoned()
+                || st.mode() != WalLockMode::Idle
+                || st.held_mask() != 0
+            {
+                return Ok(FastBeginReadOutcome::FallbackSlowPath);
+            }
+            if st.cached_chunks.first().and_then(|c| c.as_ref()).is_none() {
+                drop(st);
+                let Some(_) = shm.get_or_map_region(0, false)? else {
+                    return Ok(FastBeginReadOutcome::FallbackSlowPath);
+                };
+                st = shm.lock_state_guard()?;
+                if shm.closed.load(Ordering::Acquire)
+                    || st.is_poisoned()
+                    || st.mode() != WalLockMode::Idle
+                    || st.held_mask() != 0
+                    || st.cached_chunks.first().and_then(|c| c.as_ref()).is_none()
+                {
+                    return Ok(FastBeginReadOutcome::FallbackSlowPath);
+                }
+            }
+            let chunk0 = st.cached_chunks[0].as_ref().expect("region 0 cached");
+
+            let copy1 =
+                chunk0.load_u32_words::<12>(WALINDEX_HDR_COPY1_OFFSET, Ordering::Acquire)?;
+            shm_barrier();
+            let copy2 =
+                chunk0.load_u32_words::<12>(WALINDEX_HDR_COPY2_OFFSET, Ordering::Acquire)?;
+            if copy1 != copy2 {
+                return Ok(FastBeginReadOutcome::FallbackSlowPath);
+            }
+
+            let (loaded_hdr, hdr_ref, exp_words) = if let Some(known) = known_hdr
+                && let Some(known_words) = known.try_to_raw_words()
+                && copy1 == known_words
+            {
+                (None, *known, known_words)
+            } else {
+                match WalIndexHeaderData::decode_verified_words(&copy1, &copy2) {
+                    Ok(decoded) => {
+                        let Some(words) = decoded.try_to_raw_words() else {
+                            return Ok(FastBeginReadOutcome::FallbackSlowPath);
+                        };
+                        (Some(decoded), decoded, words)
+                    }
+                    Err(e) if e.code == ErrorCode::CantOpen => return Err(e),
+                    Err(_) => return Ok(FastBeginReadOutcome::FallbackSlowPath),
+                }
+            };
+
+            let ckpt_words =
+                chunk0.load_u32_words::<6>(WAL_CKPT_NBACKFILL_OFFSET, Ordering::Acquire)?;
+            let n_backfill = ckpt_words[0];
+            let mx_frame = hdr_ref.mx_frame;
+
+            if n_backfill == mx_frame {
+                (0u8, None, loaded_hdr, exp_words)
+            } else {
+                let mut best_mark = 0u32;
+                let mut best_slot = 0u8;
+                for s in 1..(WAL_NREADER as u8) {
+                    let m = ckpt_words[1 + usize::from(s)];
+                    if m != READMARK_NOT_USED && best_mark <= m && m <= mx_frame {
+                        best_mark = m;
+                        best_slot = s;
+                    }
+                }
+                let shm_readonly = shm.backend.is_readonly();
+                if (!shm_readonly && (best_mark < mx_frame || best_slot == 0)) || best_slot == 0 {
+                    return Ok(FastBeginReadOutcome::FallbackSlowPath);
+                }
+                (best_slot, Some(best_mark), loaded_hdr, exp_words)
+            }
+        };
+
+        let lock_idx = WAL_READ_LOCK_BASE + slot;
+        if !exclusive_db_mode {
+            match shm
+                .backend
+                .lock_slot(shm.connection_id, lock_idx, ShmLockKind::Shared)
+            {
+                Ok(()) => {}
+                Err(e) if e.code == ErrorCode::Busy => {
+                    return if slot == 0 {
+                        Ok(FastBeginReadOutcome::FallbackSlowPath)
+                    } else {
+                        Ok(FastBeginReadOutcome::Retry { live_hdr })
+                    };
+                }
+                Err(other) => return Err(other),
+            }
+        }
+
+        let post_check = {
+            let mut st = shm.lock_state_guard()?;
+            let Some(chunk0) = st.cached_chunks.first().and_then(|c| c.as_ref()) else {
+                drop(st);
+                if !exclusive_db_mode {
+                    shm.backend
+                        .unlock_slot(shm.connection_id, lock_idx, ShmLockKind::Shared)?;
+                }
+                return Ok(FastBeginReadOutcome::FallbackSlowPath);
+            };
+
+            let (verified, min_frame) = if slot == 0 {
+                shm_barrier();
+                let post_hdr =
+                    chunk0.load_u32_words::<12>(WALINDEX_HDR_COPY1_OFFSET, Ordering::Acquire)?;
+                (post_hdr == expected_words, 0u32)
+            } else {
+                let exp_mark = mx_read_mark.expect("positive slot has mark");
+                let post_backfill =
+                    chunk0.load_u32(WAL_CKPT_NBACKFILL_OFFSET, Ordering::Acquire)?;
+                shm_barrier();
+                let post_mark = chunk0.load_u32(
+                    WAL_CKPT_READMARK_OFFSET + usize::from(slot) * 4,
+                    Ordering::Acquire,
+                )?;
+                let post_hdr =
+                    chunk0.load_u32_words::<12>(WALINDEX_HDR_COPY1_OFFSET, Ordering::Acquire)?;
+                (
+                    post_mark == exp_mark && post_hdr == expected_words,
+                    post_backfill + 1,
+                )
+            };
+
+            if verified {
+                let epoch = if exclusive_db_mode {
+                    st.epoch()
+                } else {
+                    st.record_lock(lock_idx, ShmLockKind::Shared);
+                    st.set_mode(WalLockMode::Reading { slot });
+                    st.epoch()
+                };
+                Some((min_frame, epoch))
+            } else {
+                None
+            }
+        };
+
+        match post_check {
+            Some((min_frame, epoch)) => {
+                let guard = OwnedWalReadGuard::new(
+                    Arc::clone(shm),
+                    (!exclusive_db_mode).then_some(slot),
+                    slot,
+                    epoch,
+                );
+                Ok(FastBeginReadOutcome::Acquired {
+                    guard,
+                    slot,
+                    min_frame,
+                    live_hdr,
+                })
+            }
+            None => {
+                if !exclusive_db_mode {
+                    shm.backend
+                        .unlock_slot(shm.connection_id, lock_idx, ShmLockKind::Shared)?;
+                }
+                Ok(FastBeginReadOutcome::Retry { live_hdr })
+            }
+        }
     }
 
     pub(crate) fn poison_connection(&self, reason: impl Into<String>) {
         if let Ok(mut st) = self.state.lock() {
             st.mark_poisoned(reason);
+            self.poisoned.store(true, Ordering::Release);
         }
     }
 
@@ -932,15 +1231,14 @@ impl WalShm {
         &self,
     ) -> Result<Option<(WalIndexHeaderData, WalCkptInfoSnapshot)>> {
         let _ = self.ensure_open_and_healthy()?;
-        self.backend.ensure_dms_ready()?;
-        let Some(chunk0) = self.backend.map_region(0, false)? else {
+        let Some(chunk0) = self.get_or_map_region(0, false)? else {
             return Ok(None);
         };
 
-        let copy1 = Self::load_raw_header_copy(&chunk0, WALINDEX_HDR_COPY1_OFFSET)?;
+        let copy1 = chunk0.load_u32_words::<12>(WALINDEX_HDR_COPY1_OFFSET, Ordering::Acquire)?;
         shm_barrier();
-        let copy2 = Self::load_raw_header_copy(&chunk0, WALINDEX_HDR_COPY2_OFFSET)?;
-        let hdr = match WalIndexHeaderData::decode_verified_pair(&copy1, &copy2) {
+        let copy2 = chunk0.load_u32_words::<12>(WALINDEX_HDR_COPY2_OFFSET, Ordering::Acquire)?;
+        let hdr = match WalIndexHeaderData::decode_verified_words(&copy1, &copy2) {
             Ok(h) => h,
             Err(e) if e.code == ErrorCode::CantOpen => return Err(e),
             Err(_) => return Ok(None),
@@ -950,16 +1248,12 @@ impl WalShm {
     }
 
     fn read_ckpt_info_from_chunk(&self, chunk0: &ShmChunk) -> Result<WalCkptInfoSnapshot> {
-        let n_backfill = chunk0.load_u32(WAL_CKPT_NBACKFILL_OFFSET, Ordering::Acquire)?;
-        let mut read_marks = [0u32; WAL_NREADER];
-        for (i, mark) in read_marks.iter_mut().enumerate() {
-            *mark = chunk0.load_u32(WAL_CKPT_READMARK_OFFSET + i * 4, Ordering::Acquire)?;
-        }
+        let low = chunk0.load_u32_words::<6>(WAL_CKPT_NBACKFILL_OFFSET, Ordering::Acquire)?;
         let n_backfill_attempted =
             chunk0.load_u32(WAL_CKPT_BACKFILL_ATTEMPTED_OFFSET, Ordering::Acquire)?;
         Ok(WalCkptInfoSnapshot {
-            n_backfill,
-            read_marks,
+            n_backfill: low[0],
+            read_marks: [low[1], low[2], low[3], low[4], low[5]],
             n_backfill_attempted,
         })
     }
@@ -1011,12 +1305,27 @@ impl WalShm {
         expected_mark: Option<u32>,
         expected_hdr: &WalIndexHeaderData,
     ) -> Result<bool> {
+        let _ = self.ensure_open_and_healthy()?;
+        let Some(chunk0) = self.get_or_map_region(0, false)? else {
+            return Ok(false);
+        };
         shm_barrier();
         if let Some(exp_mark) = expected_mark {
-            let live_mark = self.read_slot_mark_internal(slot)?;
+            if usize::from(slot) >= WAL_NREADER {
+                return Err(SqliteError::misuse("reader slot out of range"));
+            }
+            let live_mark = chunk0.load_u32(
+                WAL_CKPT_READMARK_OFFSET + usize::from(slot) * 4,
+                Ordering::Acquire,
+            )?;
             if live_mark != exp_mark {
                 return Ok(false);
             }
+        }
+        if let Some(exp_words) = expected_hdr.try_to_raw_words() {
+            let live_words =
+                chunk0.load_u32_words::<12>(WALINDEX_HDR_COPY1_OFFSET, Ordering::Acquire)?;
+            return Ok(live_words == exp_words);
         }
         let Some((live_hdr, _)) = self.try_read_header_and_ckpt_info_internal()? else {
             return Ok(false);
@@ -1236,8 +1545,7 @@ impl WalShm {
     pub(crate) fn read_live_header_salt_internal(&self) -> Result<[u32; 2]> {
         let _ = self.verify_holds_exclusive(WAL_CKPT_LOCK)?;
         let chunk0 = self
-            .backend
-            .map_region(0, false)?
+            .get_or_map_region(0, false)?
             .ok_or_else(|| SqliteError::corrupt("WAL-index region 0 is not mapped"))?;
         let w0 = chunk0.load_u32(32, Ordering::Acquire)?;
         let w1 = chunk0.load_u32(36, Ordering::Acquire)?;
@@ -1253,7 +1561,7 @@ impl WalShm {
         }
         self.backend.ensure_dms_ready()?;
         let region = wal_frame_page(frame_no);
-        let chunk = self.backend.map_region(region, false)?.ok_or_else(|| {
+        let chunk = self.get_or_map_region(region, false)?.ok_or_else(|| {
             SqliteError::corrupt(format!(
                 "WAL-index missing mapped region {region} for frame {frame_no}"
             ))
@@ -1265,6 +1573,47 @@ impl WalShm {
         }
         let pgno_rel = pgno_base + ((idx - 1) as usize) * 4;
         chunk.load_u32(pgno_rel, Ordering::Acquire)
+    }
+
+    pub(crate) fn for_each_frame_pgno_internal(
+        &self,
+        start_frame: u32,
+        end_frame: u32,
+        f: &mut dyn FnMut(u32, u32),
+    ) -> Result<()> {
+        let _ = self.ensure_open_and_healthy()?;
+        if start_frame == 0 {
+            return Err(SqliteError::misuse("WAL frame_no must be >= 1"));
+        }
+        if start_frame > end_frame {
+            return Ok(());
+        }
+        self.backend.ensure_dms_ready()?;
+        let mut fno = start_frame;
+        while fno <= end_frame {
+            let region = wal_frame_page(fno);
+            let chunk = self.get_or_map_region(region, false)?.ok_or_else(|| {
+                SqliteError::corrupt(format!(
+                    "WAL-index missing mapped region {region} for frame {fno}"
+                ))
+            })?;
+            let (i_zero, pgno_base, capacity) = Self::region_hash_params(region)?;
+            let region_last = i_zero.saturating_add(capacity).min(end_frame);
+            while fno <= region_last {
+                let idx = fno - i_zero;
+                if idx == 0 || idx > capacity {
+                    return Err(SqliteError::misuse("WAL frame index out of block capacity"));
+                }
+                let pgno_rel = pgno_base + ((idx - 1) as usize) * 4;
+                let pgno = chunk.load_u32(pgno_rel, Ordering::Acquire)?;
+                f(fno, pgno);
+                if fno == u32::MAX {
+                    return Ok(());
+                }
+                fno += 1;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn reset_region_for_recovery_internal(&self, region: u32) -> Result<()> {
@@ -1340,10 +1689,8 @@ impl WalShm {
         if usize::from(slot) >= WAL_NREADER {
             return Err(SqliteError::misuse("reader slot out of range"));
         }
-        self.backend.ensure_dms_ready()?;
         let chunk0 = self
-            .backend
-            .map_region(0, false)?
+            .get_or_map_region(0, false)?
             .ok_or_else(|| SqliteError::corrupt("WAL-index region 0 is not mapped"))?;
         chunk0.load_u32(
             WAL_CKPT_READMARK_OFFSET + usize::from(slot) * 4,
@@ -1353,30 +1700,15 @@ impl WalShm {
 
     pub(crate) fn read_ckpt_info_internal(&self) -> Result<WalCkptInfoSnapshot> {
         let _ = self.ensure_open_and_healthy()?;
-        self.backend.ensure_dms_ready()?;
         let chunk0 = self
-            .backend
-            .map_region(0, false)?
+            .get_or_map_region(0, false)?
             .ok_or_else(|| SqliteError::corrupt("WAL-index region 0 is not mapped"))?;
-        let n_backfill = chunk0.load_u32(WAL_CKPT_NBACKFILL_OFFSET, Ordering::Acquire)?;
-        let mut read_marks = [0u32; WAL_NREADER];
-        for (i, mark) in read_marks.iter_mut().enumerate() {
-            *mark = chunk0.load_u32(WAL_CKPT_READMARK_OFFSET + i * 4, Ordering::Acquire)?;
-        }
-        let n_backfill_attempted =
-            chunk0.load_u32(WAL_CKPT_BACKFILL_ATTEMPTED_OFFSET, Ordering::Acquire)?;
-        Ok(WalCkptInfoSnapshot {
-            n_backfill,
-            read_marks,
-            n_backfill_attempted,
-        })
+        self.read_ckpt_info_from_chunk(&chunk0)
     }
 
     pub(crate) fn ensure_region_writable_internal(&self, region: u32) -> Result<ShmChunk> {
         self.verify_holds_exclusive(WAL_WRITE_LOCK)?;
-        self.backend.ensure_dms_ready()?;
-        self.backend
-            .map_region(region, true)?
+        self.get_or_map_region(region, true)?
             .ok_or_else(|| SqliteError::with_extended(extended::SQLITE_IOERR_SHMMAP, "map failed"))
     }
 
@@ -1459,6 +1791,80 @@ impl WalShm {
         }
     }
 
+    pub(crate) fn record_frames_batch_internal(
+        &self,
+        first_frame_no: u32,
+        pgnos: &[u32],
+    ) -> Result<()> {
+        if pgnos.is_empty() {
+            return Ok(());
+        }
+        if first_frame_no == 0 {
+            return Err(SqliteError::misuse("WAL frame_no must be >= 1"));
+        }
+        self.verify_holds_exclusive(WAL_WRITE_LOCK)?;
+        let mut pos = 0usize;
+        while pos < pgnos.len() {
+            let cur_frame = first_frame_no
+                .checked_add(pos as u32)
+                .ok_or_else(|| SqliteError::misuse("WAL frame index overflow"))?;
+            let region = wal_frame_page(cur_frame);
+            let chunk = self.get_or_map_region(region, true)?.ok_or_else(|| {
+                SqliteError::with_extended(extended::SQLITE_IOERR_SHMMAP, "map failed")
+            })?;
+            let (i_zero, pgno_base, capacity) = Self::region_hash_params(region)?;
+            let region_end_frame = i_zero.saturating_add(capacity);
+            while pos < pgnos.len() {
+                let frame_no = first_frame_no
+                    .checked_add(pos as u32)
+                    .ok_or_else(|| SqliteError::misuse("WAL frame index overflow"))?;
+                if frame_no > region_end_frame {
+                    break;
+                }
+                let pgno = pgnos[pos];
+                if pgno == 0 {
+                    return Err(SqliteError::misuse("WAL pgno must be >= 1"));
+                }
+                let idx = frame_no - i_zero;
+                if idx == 0 || idx > capacity {
+                    return Err(SqliteError::misuse("WAL frame index out of block capacity"));
+                }
+                if idx == 1 {
+                    chunk.zero_aligned_u32_range(pgno_base, SHM_CHUNK_SIZE)?;
+                }
+                let pgno_rel = pgno_base + ((idx - 1) as usize) * 4;
+                if chunk.load_u32(pgno_rel, Ordering::Relaxed)? != 0 {
+                    self.truncate_frames_above_internal(frame_no - 1)?;
+                    if chunk.load_u32(pgno_rel, Ordering::Relaxed)? != 0 {
+                        return Err(SqliteError::misuse(
+                            "cannot overwrite already committed frame slot without truncating first",
+                        ));
+                    }
+                }
+                let mut key = wal_hash_slot(pgno);
+                let mut collisions_left = idx;
+                loop {
+                    let slot_rel = HASH_TABLE_BYTE_OFFSET + key * 2;
+                    let cur = chunk.load_u16(slot_rel, Ordering::Relaxed)?;
+                    if cur == 0 {
+                        chunk.store_u32(pgno_rel, pgno, Ordering::Release)?;
+                        chunk.store_u16(slot_rel, idx as u16, Ordering::Release)?;
+                        break;
+                    }
+                    if collisions_left == 0 {
+                        return Err(SqliteError::corrupt(
+                            "WAL-index hash table full / corrupt collision chain",
+                        ));
+                    }
+                    collisions_left -= 1;
+                    key = wal_next_hash_slot(key);
+                }
+                pos += 1;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn truncate_frames_above_internal(&self, max_frame: u32) -> Result<()> {
         self.verify_holds_exclusive(WAL_WRITE_LOCK)?;
         let mapped_count = self.backend.mapped_region_count()?;
@@ -1513,53 +1919,31 @@ impl WalShm {
         if pgno == 0 || max_frame == 0 || min_frame > max_frame {
             return Ok(None);
         }
-        self.backend.ensure_dms_ready()?;
 
         let min_clamped = min_frame.max(1);
         let min_region = wal_frame_page(min_clamped);
         let max_region = wal_frame_page(max_frame);
 
+        // Fast steady-state path: when the entire snapshot fits in region 0 (`<= 4,062` frames)
+        // and region 0 is already cached on this connection, probe in-place without cloning `Arc`.
+        if max_region == 0 {
+            let st = self.lock_state_guard()?;
+            if let Some(Some(chunk)) = st.cached_chunks.first() {
+                return Self::probe_chunk_for_page(chunk, 0, pgno, min_clamped, max_frame);
+            }
+        }
+
         let mut region = max_region;
         loop {
-            let chunk = self.backend.map_region(region, false)?.ok_or_else(|| {
+            let chunk = self.get_or_map_region(region, false)?.ok_or_else(|| {
                 SqliteError::corrupt(format!(
                     "WAL-index missing mapped region {region} for snapshot max_frame={max_frame}"
                 ))
             })?;
-            let (i_zero, pgno_base, capacity) = Self::region_hash_params(region)?;
-
-            let mut key = wal_hash_slot(pgno);
-            let mut collisions_left = HASHTABLE_NSLOT;
-            let mut match_frame = None;
-            loop {
-                let slot_val =
-                    chunk.load_u16(HASH_TABLE_BYTE_OFFSET + key * 2, Ordering::Acquire)?;
-                if slot_val == 0 {
-                    break;
-                }
-                if u32::from(slot_val) > capacity {
-                    return Err(SqliteError::corrupt(
-                        "WAL-index hash slot exceeds block capacity",
-                    ));
-                }
-                let frame = i_zero + u32::from(slot_val);
-                if frame >= min_clamped && frame <= max_frame {
-                    let pgno_rel = pgno_base + (usize::from(slot_val) - 1) * 4;
-                    if chunk.load_u32(pgno_rel, Ordering::Acquire)? == pgno {
-                        match_frame = Some(frame);
-                    }
-                }
-                if collisions_left == 0 {
-                    return Err(SqliteError::corrupt(
-                        "WAL-index hash lookup exceeded HASHTABLE_NSLOT without empty slot",
-                    ));
-                }
-                collisions_left -= 1;
-                key = wal_next_hash_slot(key);
-            }
-
-            if match_frame.is_some() {
-                return Ok(match_frame);
+            if let Some(found) =
+                Self::probe_chunk_for_page(&chunk, region, pgno, min_clamped, max_frame)?
+            {
+                return Ok(Some(found));
             }
             if region == min_region {
                 break;
@@ -1567,6 +1951,46 @@ impl WalShm {
             region -= 1;
         }
         Ok(None)
+    }
+
+    #[inline]
+    fn probe_chunk_for_page(
+        chunk: &ShmChunk,
+        region: u32,
+        pgno: u32,
+        min_clamped: u32,
+        max_frame: u32,
+    ) -> Result<Option<u32>> {
+        let (i_zero, pgno_base, capacity) = Self::region_hash_params(region)?;
+        let mut key = wal_hash_slot(pgno);
+        let mut collisions_left = HASHTABLE_NSLOT;
+        let mut match_frame = None;
+        loop {
+            let slot_val = chunk.load_u16(HASH_TABLE_BYTE_OFFSET + key * 2, Ordering::Acquire)?;
+            if slot_val == 0 {
+                break;
+            }
+            if u32::from(slot_val) > capacity {
+                return Err(SqliteError::corrupt(
+                    "WAL-index hash slot exceeds block capacity",
+                ));
+            }
+            let frame = i_zero + u32::from(slot_val);
+            if frame >= min_clamped && frame <= max_frame {
+                let pgno_rel = pgno_base + (usize::from(slot_val) - 1) * 4;
+                if chunk.load_u32(pgno_rel, Ordering::Acquire)? == pgno {
+                    match_frame = Some(frame);
+                }
+            }
+            if collisions_left == 0 {
+                return Err(SqliteError::corrupt(
+                    "WAL-index hash lookup exceeded HASHTABLE_NSLOT without empty slot",
+                ));
+            }
+            collisions_left -= 1;
+            key = wal_next_hash_slot(key);
+        }
+        Ok(match_frame)
     }
 
     pub(crate) fn upgrade_reader_to_writer_internal(&self, slot: u8) -> Result<u64> {
@@ -1605,23 +2029,21 @@ impl WalShm {
         Ok(st.epoch())
     }
 
+    #[inline]
     pub(crate) fn release_reader_internal(&self, slot: u8, from_drop: bool) -> Result<()> {
         let Some(lock_idx) = wal_read_lock_slot(slot) else {
             return Err(SqliteError::misuse("invalid reader slot"));
         };
-        let conn_id = {
-            let st = self.lock_state_guard()?;
-            st.connection_id()
-        };
         let res = self
             .backend
-            .unlock_slot(conn_id, lock_idx, ShmLockKind::Shared);
+            .unlock_slot(self.connection_id, lock_idx, ShmLockKind::Shared);
         if let Ok(mut st) = self.state.lock() {
             if res.is_ok() {
                 st.record_unlock(lock_idx, ShmLockKind::Shared);
                 st.set_mode(WalLockMode::Idle);
             } else if from_drop && let Err(ref e) = res {
                 st.mark_poisoned(format!("failed to unlock WAL_READ_LOCK({slot}): {e}"));
+                self.poisoned.store(true, Ordering::Release);
             }
         }
         res
@@ -1672,6 +2094,7 @@ impl WalShm {
             if let Some(ref e) = first_err {
                 if from_drop {
                     st.mark_poisoned(format!("failed to release WriterTxnGuard: {e}"));
+                    self.poisoned.store(true, Ordering::Release);
                 }
             } else {
                 st.set_mode(WalLockMode::Idle);
@@ -1806,8 +2229,7 @@ impl WalShm {
     ) -> Result<u32> {
         let conn_id = self.verify_holds_exclusive(WAL_CKPT_LOCK)?;
         let chunk0 = self
-            .backend
-            .map_region(0, false)?
+            .get_or_map_region(0, false)?
             .ok_or_else(|| SqliteError::corrupt("WAL-index region 0 is not mapped"))?;
 
         let mut mx_safe = mx_frame;
@@ -1876,8 +2298,7 @@ impl WalShm {
     pub(crate) fn write_backfill_attempted_internal(&self, frame: u32) -> Result<()> {
         let _ = self.verify_holds_exclusive(WAL_CKPT_LOCK)?;
         let chunk0 = self
-            .backend
-            .map_region(0, false)?
+            .get_or_map_region(0, false)?
             .ok_or_else(|| SqliteError::corrupt("WAL-index region 0 is not mapped"))?;
         chunk0.store_u32(WAL_CKPT_BACKFILL_ATTEMPTED_OFFSET, frame, Ordering::Release)
     }
@@ -1885,8 +2306,7 @@ impl WalShm {
     pub(crate) fn write_backfill_completed_internal(&self, frame: u32) -> Result<()> {
         let _ = self.verify_holds_exclusive(WAL_CKPT_LOCK)?;
         let chunk0 = self
-            .backend
-            .map_region(0, false)?
+            .get_or_map_region(0, false)?
             .ok_or_else(|| SqliteError::corrupt("WAL-index region 0 is not mapped"))?;
         chunk0.store_u32(WAL_CKPT_NBACKFILL_OFFSET, frame, Ordering::Release)
     }
@@ -1919,6 +2339,7 @@ impl WalShm {
             if let Some(ref e) = first_err {
                 if from_drop {
                     st.mark_poisoned(format!("failed to release CheckpointTxnGuard: {e}"));
+                    self.poisoned.store(true, Ordering::Release);
                 }
             } else {
                 st.set_mode(WalLockMode::Idle);
@@ -2091,6 +2512,7 @@ impl WalShm {
             if let Some(ref e) = first_err {
                 if from_drop {
                     st.mark_poisoned(format!("failed to release RecoveryTxnGuard: {e}"));
+                    self.poisoned.store(true, Ordering::Release);
                 }
             } else {
                 st.set_mode(WalLockMode::Idle);

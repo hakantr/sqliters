@@ -7,6 +7,7 @@ pub mod super_journal;
 pub mod wal;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::IoSlice;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -16,7 +17,8 @@ use sqliters_types::{
     SQLITE_VERSION_NUMBER, SqliteError, TextEncoding, decode_db_header_page_size, extended,
 };
 use sqliters_vfs::{
-    LockLevel, MemoryVfs, OpenFlags, OsVfs, ShmOpenOptions, SyncFlags, Vfs, VfsFile,
+    LockLevel, MAX_MMAP_SIZE, MemoryVfs, OpenFlags, OsVfs, ReadMapWindow, ShmOpenOptions,
+    SyncFlags, Vfs, VfsFile,
 };
 
 pub use header::{AutoVacuumMode, DB_HEADER_SIZE, DatabaseHeader};
@@ -163,6 +165,12 @@ impl Default for PagerOpenOptions {
             persist_wal: false,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum ColdPageSource {
+    Cached(u32),
+    Mapped,
 }
 
 const MAX_DENSE_PGNO: Pgno = 1_048_576;
@@ -573,6 +581,8 @@ pub struct Pager {
     staged_raw_copy: bool,
 
     cache: PageCache,
+    mmap_limit: u64,
+    active_read_map: Option<Arc<ReadMapWindow>>,
     state: TransactionState,
 
     /// Transaction-level undo state for atomic rollback
@@ -725,35 +735,12 @@ impl Pager {
                     ro,
                 )
             }
-            DatabaseKind::Memory => {
-                let mem_vfs = MemoryVfs::with_lock_geometry(lock_geometry);
-                let mem_flags = if flags.is_readonly() {
-                    OpenFlags::READONLY | OpenFlags::MEMORY
-                } else {
-                    OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MEMORY
-                };
-                let opened = mem_vfs.open(None, mem_flags)?;
-                let ro = opened.is_readonly() || flags.is_readonly();
-                (None, None, None, None, Some(opened), ro)
-            }
-            DatabaseKind::PrivateTemporary => {
-                if is_memdb_backing {
-                    let mem_vfs = MemoryVfs::with_lock_geometry(lock_geometry);
-                    let mem_flags = if flags.is_readonly() {
-                        OpenFlags::READONLY | OpenFlags::MEMORY
-                    } else {
-                        OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MEMORY
-                    };
-                    let opened = mem_vfs.open(None, mem_flags)?;
-                    let ro = opened.is_readonly() || flags.is_readonly();
-                    (None, None, None, None, Some(opened), ro)
-                } else {
-                    // File-backed temporary DB (`temp_in_memory == false`):
-                    // defer opening the anonymous `TEMP_DB | DELETEONCLOSE | EXCLUSIVE` OS file
-                    // until the first write transaction!
-                    let ro = flags.is_readonly();
-                    (None, None, None, None, None, ro)
-                }
+            DatabaseKind::Memory | DatabaseKind::PrivateTemporary => {
+                // Keep private `:memory:` and `temp_in_memory` pages single-copy in `self.cache`
+                // without eagerly allocating a duplicate `MemoryVfs` `MemFile` buffer, and defer
+                // opening file-backed `PrivateTemporary` handles until the first write transaction.
+                let ro = flags.is_readonly();
+                (None, None, None, None, None, ro)
             }
         };
 
@@ -803,11 +790,13 @@ impl Pager {
             pending_byte_copy: None,
             staged_raw_copy: false,
             cache: PageCache::new(),
+            mmap_limit: 0,
+            active_read_map: None,
             state: TransactionState::Open,
             tx_orig_page_count: 0,
             tx_orig_header: DatabaseHeader::default(),
             tx_orig_auto_vacuum: AutoVacuumMode::None,
-            tx_journaled: Bitvec::new(64),
+            tx_journaled: Bitvec::new(0),
             tx_preimages: FastPgnoMap::default(),
             journal_records_written: 0,
             journal_off: 0,
@@ -1330,6 +1319,60 @@ impl Pager {
         self.cache_size = size;
     }
 
+    #[inline(always)]
+    fn release_read_map(&mut self, unmap_vfs: bool) {
+        self.active_read_map = None;
+        if unmap_vfs
+            && self.mmap_limit > 0
+            && let Some(ref f) = self.file
+        {
+            f.unmap_read_memory();
+        }
+    }
+
+    /// Returns `Some(effective_mmap_size)` when this pager is backed by a named disk database whose
+    /// VFS handle supports `PRAGMA mmap_size`, or `None` for `:memory:` / temporary databases
+    /// (`SQLITE_NOTFOUND` in `pragma.c:967-974`).
+    #[inline]
+    pub fn mmap_size(&self) -> Option<u64> {
+        if self.db_kind != DatabaseKind::NamedDisk {
+            return None;
+        }
+        let f = self.file.as_ref()?;
+        if !f.supports_mmap() {
+            return None;
+        }
+        Some(f.mmap_size_limit())
+    }
+
+    /// Configures the `mmap_size` limit (capped at [`MAX_MMAP_SIZE`]). If another statement holds
+    /// an active lease on this database while a positive `mmap_size` is already active
+    /// (`nFetchOut > 0` in `os_unix.c:4243`), preserves the existing limit.
+    pub fn set_mmap_size(
+        &mut self,
+        limit: u64,
+        has_other_active_lease: bool,
+    ) -> Result<Option<u64>> {
+        self.ensure_not_closed()?;
+        if self.db_kind != DatabaseKind::NamedDisk {
+            return Ok(None);
+        }
+        let Some(ref f) = self.file else {
+            return Ok(None);
+        };
+        if !f.supports_mmap() {
+            return Ok(None);
+        }
+        if has_other_active_lease && self.mmap_limit > 0 {
+            return Ok(Some(self.mmap_limit));
+        }
+        let capped = limit.min(MAX_MMAP_SIZE);
+        self.active_read_map = None;
+        let effective = f.set_mmap_size_limit(capped)?;
+        self.mmap_limit = effective;
+        Ok(Some(effective))
+    }
+
     /// Computes the effective dirty-page spill threshold in pages from [`Self::cache_size`] and
     /// [`Self::page_size`] (`pragma.c:884-891`).
     #[inline]
@@ -1800,6 +1843,8 @@ impl Pager {
         }
 
         let ckpt_sync = self.ckpt_sync_flags();
+        // Release any active `.db` read mapping BEFORE checkpoint backfills/truncates `.db`.
+        self.release_read_map(true);
         let db_f = self
             .file
             .as_deref()
@@ -1853,11 +1898,13 @@ impl Pager {
         }
 
         // Save pre-spill image into any open sub-savepoint slots (`subjournalPageIfRequired`)!
-        for &pgno in &dirty_pgnos {
-            let cur_img = self.cache.get_data(pgno).expect("dirty exists").to_vec();
-            for sp in &mut self.subsavepoints {
-                if pgno <= sp.orig_page_count && !sp.saved_pages.contains_key(&pgno) {
-                    sp.saved_pages.insert(pgno, cur_img.clone());
+        if !self.subsavepoints.is_empty() {
+            for &pgno in &dirty_pgnos {
+                let cur_img = self.cache.get_data(pgno).expect("dirty exists");
+                for sp in &mut self.subsavepoints {
+                    if pgno <= sp.orig_page_count && !sp.saved_pages.contains_key(&pgno) {
+                        sp.saved_pages.insert(pgno, cur_img.to_vec());
+                    }
                 }
             }
         }
@@ -1865,28 +1912,28 @@ impl Pager {
         let ps = self.header.page_size;
         let w_sync = self.wal_sync_flags();
         let c_sync = self.ckpt_sync_flags();
-        let mut spilled = 0usize;
-
-        for pgno in dirty_pgnos {
-            let page_data = self.cache.get_data(pgno).expect("dirty exists").to_vec();
-            let db_f = self
-                .file
-                .as_deref()
-                .ok_or_else(|| SqliteError::misuse("missing db file during WAL spill"))?;
-            self.wal.as_mut().unwrap().write_frames(
-                db_f,
-                ps,
-                &[WalFrameInput {
-                    pgno,
-                    data: &page_data,
-                }],
-                0,
-                false,
-                w_sync,
-                c_sync,
-            )?;
-            self.cache.remove(pgno);
-            spilled += 1;
+        let spilled = dirty_pgnos.len();
+        if spilled > 0 {
+            {
+                let db_f = self
+                    .file
+                    .as_deref()
+                    .ok_or_else(|| SqliteError::misuse("missing db file during WAL spill"))?;
+                let inputs: Vec<WalFrameInput<'_>> = dirty_pgnos
+                    .iter()
+                    .map(|&pgno| WalFrameInput {
+                        pgno,
+                        data: self.cache.get_data(pgno).expect("dirty exists"),
+                    })
+                    .collect();
+                self.wal
+                    .as_mut()
+                    .unwrap()
+                    .write_frames(db_f, ps, &inputs, 0, false, w_sync, c_sync)?;
+            }
+            for pgno in dirty_pgnos {
+                self.cache.remove(pgno);
+            }
         }
 
         self.cache_modified = true;
@@ -2065,7 +2112,7 @@ impl Pager {
         if self.state != TransactionState::Open {
             return Ok(());
         }
-        if self.is_memdb_backing {
+        if self.is_memdb_backing && (self.header_loaded || self.file.is_none()) {
             self.lock_db_file(LockLevel::Shared)?;
             self.header_loaded = true;
             self.state = TransactionState::Read;
@@ -2090,6 +2137,7 @@ impl Pager {
                     let _ = wal.end_read_transaction();
                 }
             } else {
+                self.release_read_map(true);
                 if let Some(wal) = self.wal.take() {
                     wal.abort_open();
                     self.journal_mode = JournalMode::Delete;
@@ -2223,6 +2271,7 @@ impl Pager {
                     if invalidate_cache {
                         if self.header_loaded {
                             self.notify_backup_restart();
+                            self.release_read_map(true);
                         }
                         self.cache.clear();
                     }
@@ -2252,6 +2301,7 @@ impl Pager {
         if changed || !self.header_loaded {
             if self.header_loaded && changed {
                 self.notify_backup_restart();
+                self.release_read_map(true);
             }
             self.cache.clear();
         }
@@ -2277,6 +2327,18 @@ impl Pager {
             }
             self.header_loaded = true;
             return Ok(());
+        }
+        if wal_pages == 0
+            && !changed
+            && self.header_loaded
+            && self.page_size_fixed
+            && self.page_count > 0
+            && !self.wal.as_ref().unwrap().is_shm_unreliable()
+        {
+            let ps = u64::from(self.header.page_size);
+            if ps > 0 && (file_len.div_ceil(ps) as Pgno) == self.page_count {
+                return Ok(());
+            }
         }
 
         let mut hdr_bytes = [0u8; DB_HEADER_SIZE];
@@ -2339,6 +2401,7 @@ impl Pager {
         if invalidate_cache {
             if self.header_loaded {
                 self.notify_backup_restart();
+                self.release_read_map(true);
             }
             self.cache.clear();
         }
@@ -2414,6 +2477,7 @@ impl Pager {
                 "attempt to write a readonly database",
             ));
         }
+        self.active_read_map = None;
 
         if self.state == TransactionState::Write {
             if !self.use_wal() && target_lock >= LockLevel::Exclusive && !self.is_memdb_backing {
@@ -2497,7 +2561,7 @@ impl Pager {
         self.tx_orig_page_count = self.page_count;
         self.tx_orig_header = self.header.clone();
         self.tx_orig_auto_vacuum = self.configured_auto_vacuum;
-        self.tx_journaled = Bitvec::new(self.page_count.max(64));
+        self.tx_journaled.reset_for_size(self.page_count);
         self.tx_preimages.clear();
         self.journal_records_written = 0;
         self.journal_off = 0;
@@ -2705,14 +2769,67 @@ impl Pager {
         };
         if let Some(fno) = wal_frame {
             self.wal.as_ref().unwrap().read_frame(fno, &mut buf)?;
-        } else {
+        } else if !(self.is_memdb_backing && self.file.is_none()) {
             let offset = u64::from(pgno - 1) * (ps as u64);
             self.db_file()?.read_at(&mut buf, offset)?;
         }
         Ok(self.cache.insert(pgno, buf, false))
     }
 
-    /// Reads page `pgno` (1-based) into the page cache if needed and returns an immutable slice.
+    #[cold]
+    fn read_page_cold_or_mmap(&mut self, pgno: Pgno) -> Result<Option<ColdPageSource>> {
+        let ps = self.header.page_size as usize;
+        let wal_frame = match self.wal.as_ref() {
+            Some(wal) => wal.find_frame(pgno)?,
+            None => None,
+        };
+        if let Some(fno) = wal_frame {
+            let mut buf = vec![0u8; ps];
+            self.wal.as_ref().unwrap().read_frame(fno, &mut buf)?;
+            return Ok(Some(ColdPageSource::Cached(
+                self.cache.insert(pgno, buf, false),
+            )));
+        }
+
+        let offset = u64::from(pgno - 1) * (ps as u64);
+        let Some(min_end) = offset.checked_add(ps as u64) else {
+            return Ok(None);
+        };
+        if min_end > self.mmap_limit {
+            return Ok(None);
+        }
+        let already_covered = self
+            .active_read_map
+            .as_ref()
+            .is_some_and(|m| m.slice(offset, ps).is_some());
+        if !already_covered {
+            if let Some(ref f) = self.file {
+                match f.fetch_read_map(min_end)? {
+                    Some(win) => {
+                        self.active_read_map = Some(win);
+                    }
+                    None => {
+                        self.mmap_limit = f.mmap_size_limit();
+                        return Ok(None);
+                    }
+                }
+            } else {
+                return Ok(None);
+            }
+        }
+        if self
+            .active_read_map
+            .as_ref()
+            .is_some_and(|m| m.slice(offset, ps).is_some())
+        {
+            Ok(Some(ColdPageSource::Mapped))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Reads page `pgno` (1-based) from the page cache, zero-copy `mmap` window (when enabled and
+    /// clean in `.db`), or OS file into cache, returning an immutable slice.
     #[inline]
     pub fn read_page(&mut self, pgno: Pgno) -> Result<&[u8]> {
         self.ensure_not_closed()?;
@@ -2727,7 +2844,26 @@ impl Pager {
                 "cannot read lock-byte page {pgno}"
             )));
         }
-        let slot = self.ensure_page_cached(pgno)?;
+        if let Some(slot) = self.cache.slot_of(pgno) {
+            return Ok(self.cache.entry_data(slot));
+        }
+        if self.mmap_limit > 0
+            && let Some(source) = self.read_page_cold_or_mmap(pgno)?
+        {
+            return match source {
+                ColdPageSource::Cached(slot) => Ok(self.cache.entry_data(slot)),
+                ColdPageSource::Mapped => {
+                    let ps = self.header.page_size as usize;
+                    let offset = u64::from(pgno - 1) * (ps as u64);
+                    Ok(self
+                        .active_read_map
+                        .as_ref()
+                        .and_then(|m| m.slice(offset, ps))
+                        .expect("mapped slice verified"))
+                }
+            };
+        }
+        let slot = self.load_page_cold(pgno)?;
         Ok(self.cache.entry_data(slot))
     }
 
@@ -2858,7 +2994,6 @@ impl Pager {
 
         self.page_count = allocated_pgno;
         self.header.database_size_pages = allocated_pgno;
-        self.tx_journaled.grow_to(allocated_pgno);
         self.commit_phase_one_done = false;
         self.cache_modified = true;
         self.cache.insert(allocated_pgno, vec![0u8; ps], true);
@@ -2889,6 +3024,7 @@ impl Pager {
                 }
             }
             self.cache.truncate_above(new_count);
+            self.active_read_map = None;
             self.page_count = new_count;
             self.header.database_size_pages = new_count;
             self.commit_phase_one_done = false;
@@ -2926,6 +3062,7 @@ impl Pager {
                 "attempt to write a readonly database",
             ));
         }
+        self.active_read_map = None;
 
         let opened_src_read = if src.state == TransactionState::Open {
             src.begin_read()?;
@@ -3683,41 +3820,83 @@ impl Pager {
             }
 
             // Step 4: Write all dirty pages in ascending `Pgno` order to `.db`, truncate, and sync.
+            // For private single-owner `is_memdb_backing` databases (`file.is_none()`), `self.cache`
+            // IS the authoritative single-copy page store unless a cross-page-size `pending_byte_copy`
+            // requires byte-level re-slicing across `commit_phase_two`.
             self.db_file_modified = true;
 
-            let ps = u64::from(self.header.page_size);
-            let dirty_pgnos = self
-                .cache
-                .collect_valid_dirty_pgnos_sorted(self.page_count, lock_byte_pgno);
-
-            for &pgno in &dirty_pgnos {
-                let page_data = self.cache.get_data(pgno).expect("dirty page exists");
-                let offset = u64::from(pgno - 1) * ps;
-                self.db_file()?.write_at(page_data, offset)?;
+            if self.is_memdb_backing && self.file.is_none() && self.pending_byte_copy.is_some() {
+                let mem_vfs = MemoryVfs::with_lock_geometry(self.lock_geometry);
+                let opened = mem_vfs.open(
+                    None,
+                    OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MEMORY,
+                )?;
+                self.file = Some(opened);
             }
 
-            let target_size = if let Some(ref pending) = self.pending_byte_copy {
-                if let Some((tail_off, ref tail_bytes)) = pending.post_pending_tail {
-                    self.db_file()?.write_at(tail_bytes, tail_off)?;
+            if !self.is_memdb_backing || self.file.is_some() {
+                let ps = u64::from(self.header.page_size);
+                let dirty_pgnos = self
+                    .cache
+                    .collect_valid_dirty_pgnos_sorted(self.page_count, lock_byte_pgno);
+
+                {
+                    let db_f = self.db_file()?;
+                    let mut iovs: Vec<IoSlice<'_>> = Vec::new();
+                    let mut idx = 0usize;
+                    while idx < dirty_pgnos.len() {
+                        let first_pgno = dirty_pgnos[idx];
+                        let run_offset = u64::from(first_pgno - 1) * ps;
+                        let mut run_len = 1usize;
+                        while idx + run_len < dirty_pgnos.len()
+                            && dirty_pgnos[idx + run_len] == first_pgno + (run_len as u32)
+                        {
+                            run_len += 1;
+                        }
+                        if run_len == 1 {
+                            let page_data =
+                                self.cache.get_data(first_pgno).expect("dirty page exists");
+                            db_f.write_at(page_data, run_offset)?;
+                        } else {
+                            iovs.clear();
+                            if iovs.capacity() < run_len {
+                                iovs.reserve(run_len - iovs.capacity());
+                            }
+                            for &pgno in &dirty_pgnos[idx..idx + run_len] {
+                                let page_data =
+                                    self.cache.get_data(pgno).expect("dirty page exists");
+                                iovs.push(IoSlice::new(page_data));
+                            }
+                            db_f.write_vectored_at(&iovs, run_offset)?;
+                        }
+                        idx += run_len;
+                    }
                 }
-                pending.raw_byte_size
-            } else {
-                let effective_disk_pages = if self.page_count == lock_byte_pgno {
-                    self.page_count - 1
-                } else {
-                    self.page_count
-                };
-                u64::from(effective_disk_pages) * ps
-            };
-            if self.db_file()?.file_size()? != target_size {
-                self.db_file()?.truncate(target_size)?;
-            }
 
-            if !self.is_memdb_backing
-                && self.db_kind != DatabaseKind::PrivateTemporary
-                && self.synchronous > 0
-            {
-                self.db_file()?.sync(SyncFlags::Normal)?;
+                let target_size = if let Some(ref pending) = self.pending_byte_copy {
+                    if let Some((tail_off, ref tail_bytes)) = pending.post_pending_tail {
+                        self.db_file()?.write_at(tail_bytes, tail_off)?;
+                    }
+                    pending.raw_byte_size
+                } else {
+                    let effective_disk_pages = if self.page_count == lock_byte_pgno {
+                        self.page_count - 1
+                    } else {
+                        self.page_count
+                    };
+                    u64::from(effective_disk_pages) * ps
+                };
+                if self.db_file()?.file_size()? != target_size {
+                    self.release_read_map(true);
+                    self.db_file()?.truncate(target_size)?;
+                }
+
+                if !self.is_memdb_backing
+                    && self.db_kind != DatabaseKind::PrivateTemporary
+                    && self.synchronous > 0
+                {
+                    self.db_file()?.sync(SyncFlags::Normal)?;
+                }
             }
 
             self.cache.truncate_above(self.page_count);
@@ -3971,6 +4150,7 @@ impl Pager {
 
                     let orig_size = u64::from(orig_count) * ps;
                     if self.db_file()?.file_size()? != orig_size {
+                        self.release_read_map(true);
                         self.db_file()?.truncate(orig_size)?;
                     }
                     if self.db_kind != DatabaseKind::PrivateTemporary && self.synchronous > 0 {
@@ -4355,6 +4535,8 @@ impl Pager {
             self.state = TransactionState::Open;
         }
 
+        self.release_read_map(true);
+
         if let Some(wal) = self.wal.take() {
             let ckpt_sync = self.ckpt_sync_flags();
             let persist_wal = self.persist_wal;
@@ -4667,6 +4849,7 @@ impl Pager {
 
         let playback_res: Result<()> = (|| {
             // Truncate main DB back to its pre-transaction size (`pager.c:2959`).
+            self.release_read_map(true);
             self.db_file()?
                 .truncate(u64::from(orig_pages) * u64::from(page_size))?;
 

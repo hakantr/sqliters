@@ -16,21 +16,21 @@ pub mod shm;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read};
+use std::io::{ErrorKind, IoSlice, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sqliters_types::{ErrorCode, LockGeometry, Result, SqliteError, extended};
 
 pub use shm::{
-    CheckpointMode, CheckpointTxnGuard, CkptRecoveryGuard, HASHTABLE_HASH_PRIME, HASHTABLE_NPAGE,
-    HASHTABLE_NPAGE_ONE, HASHTABLE_NSLOT, InitRecoveryGuard, MapView, OwnedInitWriteGuard,
-    OwnedWalReadGuard, OwnedWriterTxnGuard, READMARK_NOT_USED, ReadonlyHeaderProbe,
-    RecoveryTxnGuard, SHM_CHUNK_SIZE, ShmChunk, ShmDmsState, ShmError, ShmLockKind, ShmOpenOptions,
-    WAL_CKPT_BACKFILL_ATTEMPTED_OFFSET, WAL_CKPT_INFO_OFFSET, WAL_CKPT_LOCK,
-    WAL_CKPT_LOCK_ARRAY_OFFSET, WAL_CKPT_NBACKFILL_OFFSET, WAL_CKPT_READMARK_OFFSET,
+    CheckpointMode, CheckpointTxnGuard, CkptRecoveryGuard, FastBeginReadOutcome,
+    HASHTABLE_HASH_PRIME, HASHTABLE_NPAGE, HASHTABLE_NPAGE_ONE, HASHTABLE_NSLOT, InitRecoveryGuard,
+    MapView, OwnedInitWriteGuard, OwnedWalReadGuard, OwnedWriterTxnGuard, READMARK_NOT_USED,
+    ReadonlyHeaderProbe, RecoveryTxnGuard, SHM_CHUNK_SIZE, ShmChunk, ShmDmsState, ShmError,
+    ShmLockKind, ShmOpenOptions, WAL_CKPT_BACKFILL_ATTEMPTED_OFFSET, WAL_CKPT_INFO_OFFSET,
+    WAL_CKPT_LOCK, WAL_CKPT_LOCK_ARRAY_OFFSET, WAL_CKPT_NBACKFILL_OFFSET, WAL_CKPT_READMARK_OFFSET,
     WAL_CKPT_RESERVED_OFFSET, WAL_LOCK_LEN, WAL_LOCK_OFFSET, WAL_NREADER, WAL_READ_LOCK_BASE,
     WAL_RECOVER_LOCK, WAL_SHM_DMS_OFFSET, WAL_SHM_NLOCK, WAL_WRITE_LOCK, WALINDEX_HDR_COPY_LEN,
     WALINDEX_HDR_COPY1_OFFSET, WALINDEX_HDR_COPY2_OFFSET, WALINDEX_HDR_TOTAL_SIZE,
@@ -42,6 +42,88 @@ pub use shm::{
 
 /// Device characteristic bit indicating writes occur sequentially (`SQLITE_IOCAP_SEQUENTIAL`).
 pub const IOCAP_SEQUENTIAL: u32 = 0x0000_0400;
+
+/// Maximum database `mmap` window size (`SQLITE_MAX_MMAP_SIZE = 0x7fff0000` on 64-bit platforms).
+pub const MAX_MMAP_SIZE: u64 = 0x7fff_0000;
+
+/// Safe reference-counted read-only `mmap` window over a database file (`xFetch` / `xUnfetch`).
+pub struct ReadMapWindow {
+    #[cfg(unix)]
+    inner: sys::unix::ReadMapInner,
+    valid_len: AtomicUsize,
+}
+
+impl std::fmt::Debug for ReadMapWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadMapWindow")
+            .field("valid_len", &self.len())
+            .finish()
+    }
+}
+
+impl ReadMapWindow {
+    #[cfg(unix)]
+    #[inline]
+    fn new_unix(inner: sys::unix::ReadMapInner, valid_len: usize) -> Self {
+        let capped = valid_len.min(inner.mapped_len());
+        Self {
+            inner,
+            valid_len: AtomicUsize::new(capped),
+        }
+    }
+
+    /// Returns the currently valid mapped byte length (`<=` physical file length).
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.valid_len.load(AtomicOrdering::Acquire)
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    fn shrink_valid_len(&self, new_len: usize) {
+        self.valid_len.fetch_min(new_len, AtomicOrdering::Release);
+    }
+
+    /// Copies `dst.len()` bytes starting at `offset` if `[offset, offset + dst.len())` lies inside
+    /// the valid mapped window.
+    #[inline]
+    pub fn copy_range(&self, offset: u64, dst: &mut [u8]) -> bool {
+        #[cfg(unix)]
+        {
+            let Ok(off) = usize::try_from(offset) else {
+                return false;
+            };
+            let vlen = self.valid_len.load(AtomicOrdering::Acquire);
+            self.inner.copy_range(off, vlen, dst)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (offset, dst);
+            false
+        }
+    }
+
+    /// Borrows an immutable byte slice `[offset..offset + len)` from the mapped window while the
+    /// caller holds an active Pager read/WAL snapshot.
+    #[inline(always)]
+    pub fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
+        #[cfg(unix)]
+        {
+            let off = usize::try_from(offset).ok()?;
+            let vlen = self.valid_len.load(AtomicOrdering::Acquire);
+            self.inner.slice_in_snapshot(off, len, vlen)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (offset, len);
+            None
+        }
+    }
+}
 /// Device characteristic bit indicating power-safe overwrites (`SQLITE_IOCAP_POWERSAFE_OVERWRITE`).
 pub const IOCAP_POWERSAFE_OVERWRITE: u32 = 0x0000_1000;
 
@@ -167,6 +249,23 @@ pub trait VfsFile: Send + Sync {
     /// Writes all bytes of `buf` at `offset` (`xWrite`).
     fn write_at(&self, buf: &[u8], offset: u64) -> Result<()>;
 
+    /// Writes a contiguous scatter-gather batch of slices starting at `offset` (`pwritev` on Unix
+    /// `OsFile`, single-lock copy on `MemFile`, sequential `write_at` fallback elsewhere).
+    fn write_vectored_at(&self, bufs: &[IoSlice<'_>], mut offset: u64) -> Result<()> {
+        for buf in bufs {
+            if !buf.is_empty() {
+                self.write_at(buf, offset)?;
+                offset = offset.checked_add(buf.len() as u64).ok_or_else(|| {
+                    SqliteError::with_extended(
+                        extended::SQLITE_IOERR_WRITE,
+                        "write offset overflow",
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Truncates (or extends) the file to `size` bytes (`xTruncate`).
     fn truncate(&self, size: u64) -> Result<()>;
 
@@ -237,6 +336,33 @@ pub trait VfsFile: Send + Sync {
 
     /// Whether this handle was opened read-only.
     fn is_readonly(&self) -> bool;
+
+    /// Returns `true` if this file handle supports `SQLITE_FCNTL_MMAP_SIZE` / `PRAGMA mmap_size`.
+    fn supports_mmap(&self) -> bool {
+        false
+    }
+
+    /// Returns the configured `mmap_size` limit in bytes (`0` when disabled).
+    fn mmap_size_limit(&self) -> u64 {
+        0
+    }
+
+    /// Updates the advisory `mmap_size` limit in bytes (capped at [`MAX_MMAP_SIZE`]) and returns
+    /// the effective configured limit.
+    fn set_mmap_size_limit(&self, _limit: u64) -> Result<u64> {
+        Ok(0)
+    }
+
+    /// Fetches (mapping or remapping on demand up to `min(file_size, mmap_size_limit)`) a shared
+    /// read-only memory window covering at least `min_end` bytes, or `Ok(None)` when `mmap` is
+    /// disabled or `min_end` exceeds the mapped file window (`xFetch`).
+    fn fetch_read_map(&self, _min_end: u64) -> Result<Option<Arc<ReadMapWindow>>> {
+        Ok(None)
+    }
+
+    /// Drops any cached OS read mapping so external truncations or file closes never observe stale
+    /// mapped pages (`xUnfetch(fd, 0, NULL)`).
+    fn unmap_read_memory(&self) {}
 }
 
 /// Operating system VFS interface corresponding to `sqlite3_vfs`.
@@ -295,8 +421,9 @@ pub trait Vfs: Send + Sync {
 struct InProcessShmLocks {
     /// Per-slot state (`0` = unlocked, `-1` = exclusive, `> 0` = shared holder count).
     slots: [i32; WAL_SHM_NLOCK as usize],
-    /// Per-connection `(shared_mask, excl_mask)`.
-    connections: HashMap<u64, (u16, u16)>,
+    /// Per-connection `(conn_id, shared_mask, excl_mask)` — typically 1..4 entries in-process,
+    /// avoiding SipHash overhead on every autocommit WAL read lock/unlock.
+    connections: Vec<(u64, u16, u16)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,23 +440,40 @@ enum LocalUnlockAction {
 
 impl InProcessShmLocks {
     fn register_connection(&mut self, conn_id: u64) {
-        self.connections.entry(conn_id).or_insert((0, 0));
+        if !self.connections.iter().any(|&(id, _, _)| id == conn_id) {
+            self.connections.push((conn_id, 0, 0));
+        }
     }
 
+    #[inline]
+    fn find_connection(&self, conn_id: u64) -> Option<usize> {
+        self.connections
+            .iter()
+            .position(|&(id, _, _)| id == conn_id)
+    }
+
+    #[inline]
+    fn connection_masks(&self, conn_id: u64) -> Option<(u16, u16)> {
+        self.connections
+            .iter()
+            .find_map(|&(id, s, e)| (id == conn_id).then_some((s, e)))
+    }
+
+    #[inline]
     fn precheck_lock(
         &self,
         conn_id: u64,
         lock_idx: u8,
         kind: ShmLockKind,
-    ) -> Result<LocalLockAction> {
+    ) -> Result<(usize, LocalLockAction)> {
         if lock_idx >= WAL_SHM_NLOCK {
             return Err(SqliteError::misuse("WAL lock index out of range"));
         }
         let bit = 1u16 << lock_idx;
-        let &(shared_mask, excl_mask) = self
-            .connections
-            .get(&conn_id)
+        let conn_idx = self
+            .find_connection(conn_id)
             .ok_or_else(|| SqliteError::misuse("unregistered WAL-index connection"))?;
+        let (_, shared_mask, excl_mask) = self.connections[conn_idx];
         if (shared_mask & bit) != 0 || (excl_mask & bit) != 0 {
             return Err(SqliteError::misuse(
                 "duplicate or direct shared<->exclusive WAL lock transition on same connection",
@@ -345,51 +489,52 @@ impl InProcessShmLocks {
                         "WAL lock held exclusively",
                     ))
                 } else if slot_state == 0 {
-                    Ok(LocalLockAction::AcquireOsLock)
+                    Ok((conn_idx, LocalLockAction::AcquireOsLock))
                 } else {
-                    Ok(LocalLockAction::ReuseInProcessShared)
+                    Ok((conn_idx, LocalLockAction::ReuseInProcessShared))
                 }
             }
             ShmLockKind::Exclusive => {
                 if slot_state != 0 {
                     Err(SqliteError::new(ErrorCode::Busy, "WAL lock is busy"))
                 } else {
-                    Ok(LocalLockAction::AcquireOsLock)
+                    Ok((conn_idx, LocalLockAction::AcquireOsLock))
                 }
             }
         }
     }
 
-    fn commit_lock(&mut self, conn_id: u64, lock_idx: u8, kind: ShmLockKind) {
+    #[inline]
+    fn commit_lock(&mut self, conn_idx: usize, lock_idx: u8, kind: ShmLockKind) {
         let bit = 1u16 << lock_idx;
-        if let Some((shared_mask, excl_mask)) = self.connections.get_mut(&conn_id) {
-            match kind {
-                ShmLockKind::Shared => {
-                    *shared_mask |= bit;
-                    self.slots[usize::from(lock_idx)] += 1;
-                }
-                ShmLockKind::Exclusive => {
-                    *excl_mask |= bit;
-                    self.slots[usize::from(lock_idx)] = -1;
-                }
+        let (_, ref mut shared_mask, ref mut excl_mask) = self.connections[conn_idx];
+        match kind {
+            ShmLockKind::Shared => {
+                *shared_mask |= bit;
+                self.slots[usize::from(lock_idx)] += 1;
+            }
+            ShmLockKind::Exclusive => {
+                *excl_mask |= bit;
+                self.slots[usize::from(lock_idx)] = -1;
             }
         }
     }
 
+    #[inline]
     fn precheck_unlock(
         &self,
         conn_id: u64,
         lock_idx: u8,
         kind: ShmLockKind,
-    ) -> Result<LocalUnlockAction> {
+    ) -> Result<(usize, LocalUnlockAction)> {
         if lock_idx >= WAL_SHM_NLOCK {
             return Err(SqliteError::misuse("WAL lock index out of range"));
         }
         let bit = 1u16 << lock_idx;
-        let &(shared_mask, excl_mask) = self
-            .connections
-            .get(&conn_id)
+        let conn_idx = self
+            .find_connection(conn_id)
             .ok_or_else(|| SqliteError::misuse("unregistered WAL-index connection"))?;
+        let (_, shared_mask, excl_mask) = self.connections[conn_idx];
         let slot_state = self.slots[usize::from(lock_idx)];
         match kind {
             ShmLockKind::Shared => {
@@ -399,9 +544,9 @@ impl InProcessShmLocks {
                     ));
                 }
                 if slot_state > 1 {
-                    Ok(LocalUnlockAction::DecrementInProcessSharedOnly)
+                    Ok((conn_idx, LocalUnlockAction::DecrementInProcessSharedOnly))
                 } else {
-                    Ok(LocalUnlockAction::ReleaseOsLock)
+                    Ok((conn_idx, LocalUnlockAction::ReleaseOsLock))
                 }
             }
             ShmLockKind::Exclusive => {
@@ -410,29 +555,30 @@ impl InProcessShmLocks {
                         "connection does not hold exclusive WAL lock",
                     ));
                 }
-                Ok(LocalUnlockAction::ReleaseOsLock)
+                Ok((conn_idx, LocalUnlockAction::ReleaseOsLock))
             }
         }
     }
 
-    fn commit_unlock(&mut self, conn_id: u64, lock_idx: u8, kind: ShmLockKind) {
+    #[inline]
+    fn commit_unlock(&mut self, conn_idx: usize, lock_idx: u8, kind: ShmLockKind) {
         let bit = 1u16 << lock_idx;
-        if let Some((shared_mask, excl_mask)) = self.connections.get_mut(&conn_id) {
-            match kind {
-                ShmLockKind::Shared => {
-                    *shared_mask &= !bit;
-                    self.slots[usize::from(lock_idx)] -= 1;
-                }
-                ShmLockKind::Exclusive => {
-                    *excl_mask &= !bit;
-                    self.slots[usize::from(lock_idx)] = 0;
-                }
+        let (_, ref mut shared_mask, ref mut excl_mask) = self.connections[conn_idx];
+        match kind {
+            ShmLockKind::Shared => {
+                *shared_mask &= !bit;
+                self.slots[usize::from(lock_idx)] -= 1;
+            }
+            ShmLockKind::Exclusive => {
+                *excl_mask &= !bit;
+                self.slots[usize::from(lock_idx)] = 0;
             }
         }
     }
 
     fn unregister_connection(&mut self, conn_id: u64) -> usize {
-        if let Some((shared_mask, excl_mask)) = self.connections.remove(&conn_id) {
+        if let Some(pos) = self.find_connection(conn_id) {
+            let (_, shared_mask, excl_mask) = self.connections.swap_remove(pos);
             for idx in 0..(WAL_SHM_NLOCK as usize) {
                 let bit = 1u16 << idx;
                 if (excl_mask & bit) != 0 && self.slots[idx] == -1 {
@@ -537,8 +683,8 @@ impl shm::ShmBackend for MemShmSession {
             .inner
             .lock()
             .map_err(|_| SqliteError::new(ErrorCode::Internal, "poisoned MemShmNode"))?;
-        let _ = guard.locks.precheck_lock(connection_id, lock_idx, kind)?;
-        guard.locks.commit_lock(connection_id, lock_idx, kind);
+        let (conn_idx, _) = guard.locks.precheck_lock(connection_id, lock_idx, kind)?;
+        guard.locks.commit_lock(conn_idx, lock_idx, kind);
         Ok(())
     }
 
@@ -548,8 +694,8 @@ impl shm::ShmBackend for MemShmSession {
             .inner
             .lock()
             .map_err(|_| SqliteError::new(ErrorCode::Internal, "poisoned MemShmNode"))?;
-        let _ = guard.locks.precheck_unlock(connection_id, lock_idx, kind)?;
-        guard.locks.commit_unlock(connection_id, lock_idx, kind);
+        let (conn_idx, _) = guard.locks.precheck_unlock(connection_id, lock_idx, kind)?;
+        guard.locks.commit_unlock(conn_idx, lock_idx, kind);
         Ok(())
     }
 
@@ -725,6 +871,47 @@ impl VfsFile for MemFile {
             guard.resize(end, 0);
         }
         guard[start..end].copy_from_slice(buf);
+        Ok(())
+    }
+
+    fn write_vectored_at(&self, bufs: &[IoSlice<'_>], offset: u64) -> Result<()> {
+        self.ensure_open()?;
+        if self.readonly {
+            return Err(SqliteError::readonly("attempt to write a readonly memdb"));
+        }
+        if bufs.is_empty() {
+            return Ok(());
+        }
+        let mut total_len = 0usize;
+        for b in bufs {
+            total_len = total_len.checked_add(b.len()).ok_or_else(|| {
+                SqliteError::with_extended(extended::SQLITE_IOERR_WRITE, "write size overflow")
+            })?;
+        }
+        if total_len == 0 {
+            return Ok(());
+        }
+        let mut guard = self
+            .entry
+            .data
+            .write()
+            .map_err(|_| SqliteError::new(ErrorCode::Internal, "poisoned memdb lock"))?;
+        let mut cur = usize::try_from(offset).map_err(|_| {
+            SqliteError::with_extended(extended::SQLITE_IOERR_WRITE, "offset overflow")
+        })?;
+        let end = cur.checked_add(total_len).ok_or_else(|| {
+            SqliteError::with_extended(extended::SQLITE_IOERR_WRITE, "write size overflow")
+        })?;
+        if end > guard.len() {
+            guard.resize(end, 0);
+        }
+        for b in bufs {
+            if !b.is_empty() {
+                let next = cur + b.len();
+                guard[cur..next].copy_from_slice(b);
+                cur = next;
+            }
+        }
         Ok(())
     }
 
@@ -1172,12 +1359,22 @@ struct UnixShmNode {
     db_inode_info: Arc<Mutex<UnixInodeInfo>>,
     shm_init_lock: Arc<Mutex<()>>,
     backing: Arc<sys::unix::SysShmBacking>,
+    dms_ready: AtomicBool,
     state: Mutex<UnixShmNodeState>,
 }
 
 #[cfg(unix)]
 impl UnixShmNode {
+    #[inline]
     fn ensure_dms_locked(&self) -> Result<()> {
+        if self.dms_ready.load(AtomicOrdering::Acquire) {
+            return Ok(());
+        }
+        self.ensure_dms_locked_slow()
+    }
+
+    #[cold]
+    fn ensure_dms_locked_slow(&self) -> Result<()> {
         use std::os::fd::AsRawFd;
 
         let mut guard = self
@@ -1185,6 +1382,7 @@ impl UnixShmNode {
             .lock()
             .map_err(|_| SqliteError::new(ErrorCode::Internal, "poisoned UnixShmNode"))?;
         if !guard.is_unlocked {
+            self.dms_ready.store(true, AtomicOrdering::Release);
             return Ok(());
         }
 
@@ -1238,6 +1436,7 @@ impl UnixShmNode {
 
         res?;
         guard.is_unlocked = false;
+        self.dms_ready.store(true, AtomicOrdering::Release);
         Ok(())
     }
 }
@@ -1254,6 +1453,9 @@ impl shm::ShmBackend for UnixShmSession {
     }
 
     fn dms_state(&self) -> ShmDmsState {
+        if self.node.dms_ready.load(AtomicOrdering::Acquire) {
+            return ShmDmsState::ActiveShared;
+        }
         let Ok(guard) = self.node.state.lock() else {
             return ShmDmsState::ReadonlyCantInit;
         };
@@ -1264,61 +1466,50 @@ impl shm::ShmBackend for UnixShmSession {
         }
     }
 
+    #[inline]
     fn ensure_dms_ready(&self) -> Result<()> {
         self.node.ensure_dms_locked()
     }
 
     fn lock_slot(&self, connection_id: u64, lock_idx: u8, kind: ShmLockKind) -> Result<()> {
-        use std::os::fd::AsRawFd;
-
         let mut guard = self
             .node
             .state
             .lock()
             .map_err(|_| SqliteError::new(ErrorCode::Internal, "poisoned UnixShmNode"))?;
-        let action = guard.locks.precheck_lock(connection_id, lock_idx, kind)?;
+        let (conn_idx, action) = guard.locks.precheck_lock(connection_id, lock_idx, kind)?;
         if action == LocalLockAction::AcquireOsLock {
             let l_type = match kind {
                 ShmLockKind::Shared => sys::unix::F_RDLCK,
                 ShmLockKind::Exclusive => sys::unix::F_WRLCK,
             };
             let offset = sys::unix::UNIX_SHM_BASE + i64::from(lock_idx);
-            self.node.backing.with_file(|file| {
-                sys::unix::set_posix_lock(
-                    file.as_raw_fd(),
-                    l_type,
-                    offset,
-                    1,
-                    extended::SQLITE_IOERR_SHMLOCK,
-                )
-            })?;
+            let fd = self.node.backing.raw_fd_checked()?;
+            sys::unix::set_posix_lock(fd, l_type, offset, 1, extended::SQLITE_IOERR_SHMLOCK)?;
         }
-        guard.locks.commit_lock(connection_id, lock_idx, kind);
+        guard.locks.commit_lock(conn_idx, lock_idx, kind);
         Ok(())
     }
 
     fn unlock_slot(&self, connection_id: u64, lock_idx: u8, kind: ShmLockKind) -> Result<()> {
-        use std::os::fd::AsRawFd;
-
         let mut guard = self
             .node
             .state
             .lock()
             .map_err(|_| SqliteError::new(ErrorCode::Internal, "poisoned UnixShmNode"))?;
-        let action = guard.locks.precheck_unlock(connection_id, lock_idx, kind)?;
+        let (conn_idx, action) = guard.locks.precheck_unlock(connection_id, lock_idx, kind)?;
         if action == LocalUnlockAction::ReleaseOsLock {
             let offset = sys::unix::UNIX_SHM_BASE + i64::from(lock_idx);
-            self.node.backing.with_file(|file| {
-                sys::unix::set_posix_lock(
-                    file.as_raw_fd(),
-                    sys::unix::F_UNLCK,
-                    offset,
-                    1,
-                    extended::SQLITE_IOERR_SHMLOCK,
-                )
-            })?;
+            let fd = self.node.backing.raw_fd_checked()?;
+            sys::unix::set_posix_lock(
+                fd,
+                sys::unix::F_UNLCK,
+                offset,
+                1,
+                extended::SQLITE_IOERR_SHMLOCK,
+            )?;
         }
-        guard.locks.commit_unlock(connection_id, lock_idx, kind);
+        guard.locks.commit_unlock(conn_idx, lock_idx, kind);
         Ok(())
     }
 
@@ -1429,7 +1620,7 @@ impl shm::ShmBackend for UnixShmSession {
                 .state
                 .lock()
                 .map_err(|_| SqliteError::new(ErrorCode::Internal, "poisoned UnixShmNode"))?;
-            if let Some(&(s_mask, e_mask)) = guard.locks.connections.get(&connection_id) {
+            if let Some((s_mask, e_mask)) = guard.locks.connection_masks(connection_id) {
                 for idx in 0..WAL_SHM_NLOCK {
                     let bit = 1u16 << idx;
                     if (e_mask & bit) != 0
@@ -2045,6 +2236,13 @@ struct OsFile {
     lock_geometry: LockGeometry,
     min_shm_granularity: usize,
     lock_level: Mutex<LockLevel>,
+    fast_lock_level: AtomicU8,
+    #[cfg(unix)]
+    mmap_limit: AtomicU64,
+    #[cfg(unix)]
+    last_known_eof: AtomicU64,
+    #[cfg(unix)]
+    read_map: Mutex<Option<Arc<ReadMapWindow>>>,
     #[cfg(unix)]
     inode_key: (u64, u64),
     #[cfg(unix)]
@@ -2062,6 +2260,24 @@ impl OsFile {
             .as_ref()
             .ok_or_else(|| SqliteError::misuse("file handle already closed"))
     }
+
+    #[inline]
+    fn decode_lock_level(raw: u8) -> LockLevel {
+        match raw {
+            1 => LockLevel::Shared,
+            2 => LockLevel::Reserved,
+            3 => LockLevel::Pending,
+            4 => LockLevel::Exclusive,
+            _ => LockLevel::NoLock,
+        }
+    }
+
+    #[inline]
+    fn set_file_lock(&self, guard: &mut LockLevel, next: LockLevel) {
+        *guard = next;
+        self.fast_lock_level
+            .store(next as u8, AtomicOrdering::Release);
+    }
 }
 
 impl Drop for OsFile {
@@ -2075,6 +2291,25 @@ impl VfsFile for OsFile {
         let file = self.file_ref()?;
         #[cfg(unix)]
         {
+            if !buf.is_empty() {
+                let limit = self.mmap_limit.load(AtomicOrdering::Relaxed);
+                if limit > 0 && offset < limit {
+                    let copied_all = {
+                        let guard = self.read_map.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.as_ref().is_some_and(|m| m.copy_range(offset, buf))
+                    };
+                    if copied_all {
+                        return Ok(buf.len());
+                    }
+                    if let Some(end) = offset.checked_add(buf.len() as u64)
+                        && end <= limit
+                        && let Some(win) = self.fetch_read_map(end)?
+                        && win.copy_range(offset, buf)
+                    {
+                        return Ok(buf.len());
+                    }
+                }
+            }
             sys::unix::pread_until_eof(file, buf, offset)
         }
         #[cfg(windows)]
@@ -2090,11 +2325,51 @@ impl VfsFile for OsFile {
         let file = self.file_ref()?;
         #[cfg(unix)]
         {
-            sys::unix::pwrite_all(file, buf, offset, extended::SQLITE_IOERR_WRITE)
+            sys::unix::pwrite_all(file, buf, offset, extended::SQLITE_IOERR_WRITE)?;
+            if self.mmap_limit.load(AtomicOrdering::Relaxed) > 0
+                && let Some(end) = offset.checked_add(buf.len() as u64)
+            {
+                self.last_known_eof.fetch_max(end, AtomicOrdering::Relaxed);
+            }
+            Ok(())
         }
         #[cfg(windows)]
         {
             sys::windows::pwrite_all(file, buf, offset, extended::SQLITE_IOERR_WRITE)
+        }
+    }
+
+    fn write_vectored_at(&self, bufs: &[IoSlice<'_>], offset: u64) -> Result<()> {
+        if self.readonly {
+            return Err(SqliteError::readonly("attempt to write a readonly file"));
+        }
+        let file = self.file_ref()?;
+        #[cfg(unix)]
+        {
+            sys::unix::pwritev_all(file, bufs, offset, extended::SQLITE_IOERR_WRITE)?;
+            if self.mmap_limit.load(AtomicOrdering::Relaxed) > 0 {
+                let total: u64 = bufs.iter().map(|b| b.len() as u64).sum();
+                if let Some(end) = offset.checked_add(total) {
+                    self.last_known_eof.fetch_max(end, AtomicOrdering::Relaxed);
+                }
+            }
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            let mut cur = offset;
+            for buf in bufs {
+                if !buf.is_empty() {
+                    sys::windows::pwrite_all(file, buf, cur, extended::SQLITE_IOERR_WRITE)?;
+                    cur = cur.checked_add(buf.len() as u64).ok_or_else(|| {
+                        SqliteError::with_extended(
+                            extended::SQLITE_IOERR_WRITE,
+                            "write offset overflow",
+                        )
+                    })?;
+                }
+            }
+            Ok(())
         }
     }
 
@@ -2106,6 +2381,23 @@ impl VfsFile for OsFile {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
+            // Shrink/unmap any active `ReadMapWindow` BEFORE calling `ftruncate` so no thread can
+            // ever dereference mapped virtual memory past the truncated file end (`SIGBUS`).
+            if self.mmap_limit.load(AtomicOrdering::Acquire) > 0 {
+                let dropped_map = {
+                    let mut guard = self.read_map.lock().unwrap_or_else(|e| e.into_inner());
+                    self.last_known_eof.store(size, AtomicOrdering::Relaxed);
+                    if let Some(existing) = guard.as_ref()
+                        && size < existing.len() as u64
+                    {
+                        existing.shrink_valid_len(usize::try_from(size).unwrap_or(usize::MAX));
+                        guard.take()
+                    } else {
+                        None
+                    }
+                };
+                drop(dropped_map);
+            }
             sys::unix::ftruncate_fd(file.as_raw_fd(), size, extended::SQLITE_IOERR_TRUNCATE)
         }
         #[cfg(windows)]
@@ -2172,6 +2464,11 @@ impl VfsFile for OsFile {
         if level == LockLevel::NoLock {
             return Ok(());
         }
+        if self.file.is_some()
+            && Self::decode_lock_level(self.fast_lock_level.load(AtomicOrdering::Acquire)) >= level
+        {
+            return Ok(());
+        }
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
@@ -2221,7 +2518,7 @@ impl VfsFile for OsFile {
                 && (inode.e_file_lock == LockLevel::Shared
                     || inode.e_file_lock == LockLevel::Reserved)
             {
-                *file_lock = LockLevel::Shared;
+                self.set_file_lock(&mut file_lock, LockLevel::Shared);
                 inode.n_shared += 1;
                 inode.n_lock += 1;
                 return Ok(());
@@ -2248,7 +2545,7 @@ impl VfsFile for OsFile {
                     extended::SQLITE_IOERR_LOCK,
                 )?;
                 if level == LockLevel::Exclusive {
-                    *file_lock = LockLevel::Pending;
+                    self.set_file_lock(&mut file_lock, LockLevel::Pending);
                     inode.e_file_lock = LockLevel::Pending;
                 }
             }
@@ -2271,7 +2568,7 @@ impl VfsFile for OsFile {
                 shared_res?;
                 unlock_pending_res?;
 
-                *file_lock = LockLevel::Shared;
+                self.set_file_lock(&mut file_lock, LockLevel::Shared);
                 inode.e_file_lock = LockLevel::Shared;
                 inode.n_lock += 1;
                 inode.n_shared = 1;
@@ -2296,7 +2593,7 @@ impl VfsFile for OsFile {
                 extended::SQLITE_IOERR_LOCK,
             )?;
 
-            *file_lock = level;
+            self.set_file_lock(&mut file_lock, level);
             inode.e_file_lock = level;
             Ok(())
         }
@@ -2355,7 +2652,7 @@ impl VfsFile for OsFile {
                 );
                 shared_res?;
                 unlock_pending?;
-                *cur = LockLevel::Shared;
+                self.set_file_lock(&mut cur, LockLevel::Shared);
                 return Ok(());
             }
 
@@ -2367,7 +2664,7 @@ impl VfsFile for OsFile {
                     true,
                     extended::SQLITE_IOERR_LOCK,
                 )?;
-                *cur = LockLevel::Reserved;
+                self.set_file_lock(&mut cur, LockLevel::Reserved);
                 return Ok(());
             }
 
@@ -2379,7 +2676,7 @@ impl VfsFile for OsFile {
                     true,
                     extended::SQLITE_IOERR_LOCK,
                 )?;
-                *cur = LockLevel::Pending;
+                self.set_file_lock(&mut cur, LockLevel::Pending);
             }
             if level == LockLevel::Pending {
                 return Ok(());
@@ -2400,7 +2697,7 @@ impl VfsFile for OsFile {
                 extended::SQLITE_IOERR_LOCK,
             ) {
                 Ok(()) => {
-                    *cur = LockLevel::Exclusive;
+                    self.set_file_lock(&mut cur, LockLevel::Exclusive);
                     Ok(())
                 }
                 Err(err) => {
@@ -2419,6 +2716,11 @@ impl VfsFile for OsFile {
 
     fn unlock(&self, level: LockLevel) -> Result<()> {
         let target = level.min(LockLevel::Shared);
+        if self.file.is_some()
+            && Self::decode_lock_level(self.fast_lock_level.load(AtomicOrdering::Acquire)) <= target
+        {
+            return Ok(());
+        }
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
@@ -2461,7 +2763,7 @@ impl VfsFile for OsFile {
                         extended::SQLITE_IOERR_UNLOCK,
                     )?;
                     inode.e_file_lock = LockLevel::Shared;
-                    *file_lock = LockLevel::Shared;
+                    self.set_file_lock(&mut file_lock, LockLevel::Shared);
                 }
 
                 let mut res = Ok(());
@@ -2482,7 +2784,7 @@ impl VfsFile for OsFile {
                         // Take deferred FDs out so they are closed OUTSIDE `UnixInodeInfo` mutex!
                         deferred_fds_to_close = std::mem::take(&mut inode.pending_close_fds);
                     }
-                    *file_lock = LockLevel::NoLock;
+                    self.set_file_lock(&mut file_lock, LockLevel::NoLock);
                 }
                 res
             };
@@ -2526,7 +2828,7 @@ impl VfsFile for OsFile {
                         extended::SQLITE_IOERR_RDLOCK,
                     )?;
                 }
-                *cur = LockLevel::Pending;
+                self.set_file_lock(&mut cur, LockLevel::Pending);
             }
             if *cur >= LockLevel::Pending {
                 let _ = sys::windows::unlock_file_range(
@@ -2552,7 +2854,7 @@ impl VfsFile for OsFile {
                     extended::SQLITE_IOERR_UNLOCK,
                 )?;
             }
-            *cur = target;
+            self.set_file_lock(&mut cur, target);
             Ok(())
         }
     }
@@ -2603,11 +2905,9 @@ impl VfsFile for OsFile {
         }
     }
 
+    #[inline]
     fn lock_level(&self) -> LockLevel {
-        self.lock_level
-            .lock()
-            .map(|g| *g)
-            .unwrap_or(LockLevel::NoLock)
+        Self::decode_lock_level(self.fast_lock_level.load(AtomicOrdering::Acquire))
     }
 
     fn lock_state_for_diagnostics(&self) -> Result<Option<LockLevel>> {
@@ -2622,6 +2922,18 @@ impl VfsFile for OsFile {
     fn close(&mut self) -> Result<()> {
         if self.file.is_none() {
             return Ok(());
+        }
+
+        #[cfg(unix)]
+        {
+            self.mmap_limit.store(0, AtomicOrdering::Release);
+            self.last_known_eof.store(0, AtomicOrdering::Relaxed);
+            let dropped = self
+                .read_map
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            drop(dropped);
         }
 
         let unlock_res = self.unlock(LockLevel::NoLock);
@@ -2973,6 +3285,7 @@ impl VfsFile for OsFile {
                 db_inode_info: Arc::clone(&self.inode_info),
                 shm_init_lock: Arc::clone(&shm_init_mutex),
                 backing,
+                dms_ready: AtomicBool::new(!is_unlocked),
                 state: Mutex::new(UnixShmNodeState {
                     locks,
                     is_unlocked,
@@ -3134,6 +3447,147 @@ impl VfsFile for OsFile {
 
     fn supports_wal_shm(&self) -> bool {
         self.path.is_some()
+    }
+
+    fn supports_mmap(&self) -> bool {
+        cfg!(unix) && !self.delete_on_close && self.path.is_some()
+    }
+
+    fn mmap_size_limit(&self) -> u64 {
+        #[cfg(unix)]
+        {
+            self.mmap_limit.load(AtomicOrdering::Acquire)
+        }
+        #[cfg(not(unix))]
+        {
+            0
+        }
+    }
+
+    fn set_mmap_size_limit(&self, limit: u64) -> Result<u64> {
+        let _ = self.file_ref()?;
+        #[cfg(unix)]
+        {
+            if !self.supports_mmap() {
+                return Ok(0);
+            }
+            let capped = limit.min(MAX_MMAP_SIZE);
+            let dropped = {
+                let mut guard = self.read_map.lock().unwrap_or_else(|e| e.into_inner());
+                let prev = self.mmap_limit.swap(capped, AtomicOrdering::AcqRel);
+                if capped == 0 || (capped != prev && guard.is_some()) {
+                    self.last_known_eof.store(0, AtomicOrdering::Relaxed);
+                    guard.take()
+                } else {
+                    None
+                }
+            };
+            drop(dropped);
+            Ok(capped)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = limit;
+            Ok(0)
+        }
+    }
+
+    fn fetch_read_map(&self, min_end: u64) -> Result<Option<Arc<ReadMapWindow>>> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            let limit = self.mmap_limit.load(AtomicOrdering::Acquire);
+            if limit == 0 || min_end == 0 || min_end > limit {
+                return Ok(None);
+            }
+            let file = self.file_ref()?;
+
+            let mut guard = self.read_map.lock().unwrap_or_else(|e| e.into_inner());
+            let limit = self.mmap_limit.load(AtomicOrdering::Acquire);
+            if limit == 0 || min_end > limit {
+                return Ok(None);
+            }
+
+            if let Some(existing) = guard.as_ref() {
+                let cur_len = existing.len() as u64;
+                if min_end <= cur_len {
+                    return Ok(Some(Arc::clone(existing)));
+                }
+                let known_eof = self.last_known_eof.load(AtomicOrdering::Relaxed);
+                if known_eof != 0 && cur_len >= known_eof.min(limit) {
+                    return Ok(None);
+                }
+            }
+
+            let fsize = file
+                .metadata()
+                .map_err(|e| {
+                    SqliteError::with_extended(extended::SQLITE_IOERR_FSTAT, e.to_string())
+                })?
+                .len();
+            self.last_known_eof.store(fsize, AtomicOrdering::Relaxed);
+            let target_u64 = fsize.min(limit);
+            let Ok(target_len) = usize::try_from(target_u64) else {
+                return Ok(None);
+            };
+            if target_len == 0 {
+                let prev = guard.take();
+                drop(guard);
+                drop(prev);
+                return Ok(None);
+            }
+
+            if let Some(existing) = guard.as_ref()
+                && existing.len() == target_len
+            {
+                return Ok(if min_end <= target_u64 {
+                    Some(Arc::clone(existing))
+                } else {
+                    None
+                });
+            }
+
+            // Unmap old window before mapping new window so virtual address space never doubles.
+            let prev = guard.take();
+            drop(prev);
+
+            match sys::unix::ReadMapInner::map_readonly(file.as_raw_fd(), target_len) {
+                Ok(inner) => {
+                    let win = Arc::new(ReadMapWindow::new_unix(inner, target_len));
+                    let out = if min_end <= target_u64 {
+                        Some(Arc::clone(&win))
+                    } else {
+                        None
+                    };
+                    *guard = Some(win);
+                    Ok(out)
+                }
+                Err(_) => {
+                    // Graceful fallback to `pread` if filesystem/ulimit denies `mmap` (`os_unix.c:5652`).
+                    self.mmap_limit.store(0, AtomicOrdering::Release);
+                    Ok(None)
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = min_end;
+            Ok(None)
+        }
+    }
+
+    fn unmap_read_memory(&self) {
+        #[cfg(unix)]
+        {
+            self.last_known_eof.store(0, AtomicOrdering::Relaxed);
+            let dropped = self
+                .read_map
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            drop(dropped);
+        }
     }
 
     fn device_characteristics(&self) -> u32 {
@@ -3407,6 +3861,13 @@ impl Vfs for OsVfs {
             lock_geometry: self.lock_geometry,
             min_shm_granularity: self.min_shm_granularity,
             lock_level: Mutex::new(LockLevel::NoLock),
+            fast_lock_level: AtomicU8::new(LockLevel::NoLock as u8),
+            #[cfg(unix)]
+            mmap_limit: AtomicU64::new(0),
+            #[cfg(unix)]
+            last_known_eof: AtomicU64::new(0),
+            #[cfg(unix)]
+            read_map: Mutex::new(None),
             #[cfg(unix)]
             inode_key,
             #[cfg(unix)]
@@ -4115,6 +4576,64 @@ mod tests {
 
             os_vfs.delete(&target, true).unwrap();
             assert!(!os_vfs.exists(&target).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_write_vectored_at_pwritev_iov_max_chunking_and_readonly() {
+        let os_vfs = OsVfs::new();
+        let mem_vfs = MemoryVfs::new();
+        let target = make_temp_file_path();
+        let _ = os_vfs.delete(&target, false);
+
+        // Build 1300 buffers (> POSIX IOV_MAX = 1024) including empty slices and odd lengths.
+        let mut owned_chunks: Vec<Vec<u8>> = Vec::with_capacity(1300);
+        let mut expected: Vec<u8> = Vec::new();
+        for i in 0..1300usize {
+            if i % 97 == 0 {
+                owned_chunks.push(Vec::new());
+            } else {
+                let len = (i % 37) + 1;
+                let mut v = Vec::with_capacity(len);
+                for j in 0..len {
+                    v.push(((i.wrapping_mul(31) ^ j.wrapping_mul(17)) & 0xff) as u8);
+                }
+                expected.extend_from_slice(&v);
+                owned_chunks.push(v);
+            }
+        }
+        let iovs: Vec<IoSlice<'_>> = owned_chunks.iter().map(|v| IoSlice::new(v)).collect();
+
+        for (vfs, p) in [
+            (&os_vfs as &dyn Vfs, Some(target.as_path())),
+            (&mem_vfs as &dyn Vfs, Some(Path::new("vectored_mem.db"))),
+        ] {
+            let mut wf = vfs
+                .open(p, OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::WAL)
+                .unwrap();
+            wf.write_vectored_at(&[], 17).unwrap();
+            assert_eq!(wf.file_size().unwrap(), 0);
+            wf.write_at(&[0xAA; 13], 0).unwrap();
+            wf.write_vectored_at(&iovs, 13).unwrap();
+            assert_eq!(wf.file_size().unwrap(), (13 + expected.len()) as u64);
+
+            let mut actual = vec![0u8; 13 + expected.len()];
+            assert_eq!(wf.read_at(&mut actual, 0).unwrap(), actual.len());
+            assert_eq!(&actual[..13], &[0xAA; 13]);
+            assert_eq!(&actual[13..], expected.as_slice());
+            wf.close().unwrap();
+
+            let mut ro = vfs.open(p, OpenFlags::READONLY | OpenFlags::WAL).unwrap();
+            assert_eq!(
+                ro.write_vectored_at(&[IoSlice::new(b"x")], 0)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::ReadOnly
+            );
+            ro.close().unwrap();
+            if let Some(path) = p {
+                vfs.delete(path, false).unwrap();
+            }
         }
     }
 }

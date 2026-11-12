@@ -154,6 +154,58 @@ impl MemMapView {
     }
 
     #[inline]
+    fn load_u32_words<const N: usize>(
+        &self,
+        subrange_offset: usize,
+        region_index: u32,
+        rel_offset: usize,
+        ordering: Ordering,
+    ) -> Result<[u32; N]> {
+        if N == 0 {
+            return Ok([0u32; N]);
+        }
+        let span = N
+            .checked_mul(4)
+            .ok_or_else(|| SqliteError::misuse("WAL-index word span overflow"))?;
+        if !rel_offset.is_multiple_of(4) {
+            return Err(SqliteError::misuse("unaligned WAL-index bulk u32 load"));
+        }
+        let rel_end = rel_offset
+            .checked_add(span)
+            .ok_or_else(|| SqliteError::misuse("WAL-index relative offset overflow"))?;
+        if rel_end > SHM_CHUNK_SIZE {
+            return Err(SqliteError::misuse(
+                "WAL-index bulk load exceeds 32 KiB region",
+            ));
+        }
+        if region_index == 0
+            && rel_offset < (WAL_LOCK_OFFSET + WAL_LOCK_LEN)
+            && rel_end > WAL_LOCK_OFFSET
+        {
+            return Err(SqliteError::misuse(
+                "access to reserved WAL lock byte range 120..128 is forbidden",
+            ));
+        }
+        let abs_offset = subrange_offset
+            .checked_add(rel_offset)
+            .ok_or_else(|| SqliteError::misuse("WAL-index view offset overflow"))?;
+        let abs_end = abs_offset
+            .checked_add(span)
+            .ok_or_else(|| SqliteError::misuse("WAL-index view end overflow"))?;
+        if abs_end > self.storage.byte_len() {
+            return Err(SqliteError::misuse(
+                "in-memory WAL-index access out of MapView bounds",
+            ));
+        }
+        let base_idx = abs_offset / 4;
+        let mut out = [0u32; N];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = self.storage.words[base_idx + i].load(ordering);
+        }
+        Ok(out)
+    }
+
+    #[inline]
     fn store_u32(
         &self,
         subrange_offset: usize,
@@ -378,6 +430,28 @@ impl ShmChunk {
                 ordering,
             ),
             MapViewInner::Memory(m) => m.load_u32(
+                self.subrange_offset,
+                self.region_index,
+                rel_offset,
+                ordering,
+            ),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn load_u32_words<const N: usize>(
+        &self,
+        rel_offset: usize,
+        ordering: Ordering,
+    ) -> Result<[u32; N]> {
+        match &self.view.inner {
+            MapViewInner::Os(v) => v.load_u32_words(
+                self.subrange_offset,
+                self.region_index,
+                rel_offset,
+                ordering,
+            ),
+            MapViewInner::Memory(m) => m.load_u32_words(
                 self.subrange_offset,
                 self.region_index,
                 rel_offset,

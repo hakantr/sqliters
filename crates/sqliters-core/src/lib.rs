@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use sqliters_btree::{Btree, BtreeCursorState, CursorId};
 pub use sqliters_ext::{
@@ -106,6 +106,45 @@ struct ActiveConnStackGuard {
 
 impl ActiveConnStackGuard {
     #[inline(always)]
+    fn try_push(conn_id: u64) -> Result<Self> {
+        let mut in_top = false;
+        let ok = ACTIVE_CONN_TOP.with(|cell| {
+            let (top, extra) = cell.get();
+            if top == conn_id {
+                false
+            } else if top == 0 && extra == 0 {
+                cell.set((conn_id, 0));
+                in_top = true;
+                true
+            } else if extra > 0
+                && EXTRA_ACTIVE_CONNS
+                    .with(|stack| stack.try_borrow().is_ok_and(|s| s.contains(&conn_id)))
+            {
+                false
+            } else if top == 0 {
+                cell.set((conn_id, extra));
+                in_top = true;
+                true
+            } else {
+                cell.set((top, extra + 1));
+                EXTRA_ACTIVE_CONNS.with(|stack| {
+                    if let Ok(mut s) = stack.try_borrow_mut() {
+                        s.push(conn_id);
+                    }
+                });
+                true
+            }
+        });
+        if ok {
+            Ok(Self { conn_id, in_top })
+        } else {
+            Err(SqliteError::misuse(
+                "reentrant call into active Connection on the same thread",
+            ))
+        }
+    }
+
+    #[inline(always)]
     fn push(conn_id: u64) -> Self {
         let mut in_top = false;
         ACTIVE_CONN_TOP.with(|cell| {
@@ -151,81 +190,14 @@ impl Drop for ActiveConnStackGuard {
     }
 }
 
-fn register_builtin_extension_functions(
-    functions: &mut FunctionRegistry,
-    fts5_aux: Arc<Fts5AuxRegistry>,
-) {
-    let aux_bm25 = Arc::clone(&fts5_aux);
-    functions.register_scalar("bm25", None, FunctionFlags::INNOCUOUS, move |args| {
-        if args.len() == 1 {
-            return Ok(RuntimeValue::plain(
-                aux_bm25.eval_bm25(std::slice::from_ref(&args[0].value))?,
-            ));
-        }
-        let vals: Vec<Value> = args.iter().map(|rv| rv.value.clone()).collect();
-        Ok(RuntimeValue::plain(aux_bm25.eval_bm25(&vals)?))
-    });
+static DEFAULT_OS_VFS: OnceLock<Arc<dyn Vfs>> = OnceLock::new();
 
-    let aux_hl = Arc::clone(&fts5_aux);
-    functions.register_scalar(
-        "highlight",
-        Some(4),
-        FunctionFlags::INNOCUOUS,
-        move |args| {
-            let vals: Vec<Value> = args.iter().map(|rv| rv.value.clone()).collect();
-            Ok(RuntimeValue::plain(aux_hl.eval_highlight(&vals)?))
-        },
-    );
-
-    let aux_snip = fts5_aux;
-    functions.register_scalar("snippet", Some(6), FunctionFlags::INNOCUOUS, move |args| {
-        let vals: Vec<Value> = args.iter().map(|rv| rv.value.clone()).collect();
-        Ok(RuntimeValue::plain(aux_snip.eval_snippet(&vals)?))
-    });
-
-    functions.register_scalar(
-        "fts5_source_id",
-        Some(0),
-        FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS,
-        |_args| Ok(RuntimeValue::plain(Fts5AuxRegistry::eval_fts5_source_id())),
-    );
-
-    functions.register_scalar("fts5", Some(1), FunctionFlags::INNOCUOUS, |args| {
-        Ok(RuntimeValue::plain(Fts5AuxRegistry::eval_fts5_ptr_func(
-            &args[0].value,
-        )))
-    });
-
-    functions.register_scalar(
-        "rtreedepth",
-        Some(1),
-        FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS,
-        |args| {
-            Ok(RuntimeValue::plain(sqliters_ext::eval_rtreedepth(
-                &args[0].value,
-            )?))
-        },
-    );
-
-    functions.register_scalar(
-        "rtreenode",
-        Some(2),
-        FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS,
-        |args| {
-            Ok(RuntimeValue::plain(sqliters_ext::eval_rtreenode(
-                &args[0].value,
-                &args[1].value,
-            )?))
-        },
-    );
-
-    for arity in [1usize, 2usize] {
-        functions.register_scalar("rtreecheck", Some(arity), FunctionFlags::INNOCUOUS, |_| {
-            Err(SqliteError::new(
-                ErrorCode::Internal,
-                "__sqliters_builtin_rtreecheck__",
-            ))
-        });
+#[inline]
+fn os_vfs_for_geometry(lock_geometry: LockGeometry) -> Arc<dyn Vfs> {
+    if lock_geometry == LockGeometry::default() {
+        Arc::clone(DEFAULT_OS_VFS.get_or_init(|| Arc::new(OsVfs::new())))
+    } else {
+        Arc::new(OsVfs::with_lock_geometry(lock_geometry))
     }
 }
 
@@ -654,9 +626,7 @@ pub(crate) struct ActivityTracker {
 impl ActivityTracker {
     #[inline]
     pub(crate) fn new() -> Self {
-        Self {
-            leases: Vec::with_capacity(4),
-        }
+        Self { leases: Vec::new() }
     }
 
     #[inline]
@@ -673,6 +643,23 @@ impl ActivityTracker {
             write_instances: SmallInstVec::new(),
         };
         if let Some(slot) = self.leases.iter_mut().find(|(hid, _)| *hid == id) {
+            slot.1 = lease;
+        } else {
+            self.leases.push((id, lease));
+        }
+    }
+
+    #[inline]
+    pub(crate) fn start_single_read(&mut self, id: HandleId, inst: SchemaInstanceId) {
+        let lease = ActiveLease {
+            is_reader: true,
+            is_writer: false,
+            read_instances: SmallInstVec::single(inst),
+            write_instances: SmallInstVec::new(),
+        };
+        if !self.leases.is_empty()
+            && let Some(slot) = self.leases.iter_mut().find(|(hid, _)| *hid == id)
+        {
             slot.1 = lease;
         } else {
             self.leases.push((id, lease));
@@ -834,7 +821,7 @@ pub(crate) enum RunningExec {
         read_instances: SmallInstVec,
     },
     PointSelectRowYielded {
-        read_instances: SmallInstVec,
+        main_inst: SchemaInstanceId,
     },
     MaterializedRead {
         rows: std::vec::IntoIter<Vec<Value>>,
@@ -980,6 +967,9 @@ pub(crate) struct ConnectionInner {
     pub(crate) lit_insert_scratch: sqliters_vdbe::VdbeWriteScratch,
 }
 
+const GATE_BUSY: u8 = 1;
+const GATE_PENDING_DROPS: u8 = 2;
+
 pub(crate) struct ConnectionShared {
     pub(crate) conn_id: u64,
     pub(crate) db_path: Option<PathBuf>,
@@ -988,9 +978,8 @@ pub(crate) struct ConnectionShared {
     pub(crate) open_options: ConnectionOpenOptions,
     pub(crate) interrupt_flag: Arc<AtomicBool>,
     pub(crate) has_external_interrupt: AtomicBool,
-    pub(crate) gate_busy: AtomicBool,
+    pub(crate) gate_state: AtomicU8,
     pub(crate) conn_state: AtomicU8,
-    pub(crate) has_pending_drops: AtomicBool,
     pub(crate) mirror_last_insert_rowid: AtomicI64,
     pub(crate) mirror_changes: AtomicU64,
     pub(crate) mirror_total_changes: AtomicU64,
@@ -1043,28 +1032,48 @@ impl ConnectionShared {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub(crate) fn enter(&self) -> Result<ConnSession<'_>> {
-        if is_conn_active_on_current_thread(self.conn_id) {
-            return Err(SqliteError::misuse(
-                "reentrant call into active Connection on the same thread",
-            ));
-        }
-        if self
-            .gate_busy
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
+    #[inline(always)]
+    fn claim_gate_busy(&self) -> Result<bool> {
+        match self
+            .gate_state
+            .compare_exchange(0, GATE_BUSY, Ordering::Acquire, Ordering::Relaxed)
         {
-            return Err(SqliteError::new(
-                ErrorCode::Busy,
-                "database connection is busy",
-            ));
+            Ok(_) => Ok(false),
+            Err(prev) => self.claim_gate_busy_slow(prev),
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn claim_gate_busy_slow(&self, mut cur: u8) -> Result<bool> {
+        loop {
+            if (cur & GATE_BUSY) != 0 {
+                return Err(SqliteError::new(
+                    ErrorCode::Busy,
+                    "database connection is busy",
+                ));
+            }
+            match self.gate_state.compare_exchange_weak(
+                cur,
+                cur | GATE_BUSY,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok((cur & GATE_PENDING_DROPS) != 0),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn enter(&self) -> Result<ConnSession<'_>> {
+        let stack_guard = ActiveConnStackGuard::try_push(self.conn_id)?;
+        let had_pending = self.claim_gate_busy()?;
 
         let mut gate_unwind = GateReleaseOnUnwind {
             shared: self,
             armed: true,
         };
-        let stack_guard = ActiveConnStackGuard::push(self.conn_id);
         let inner_guard = self.lock_inner();
         // Transfer gate release responsibility to `ConnSession` BEFORE running `process_pending_drops`!
         gate_unwind.armed = false;
@@ -1073,20 +1082,27 @@ impl ConnectionShared {
             guard: Some(inner_guard),
             _stack_guard: stack_guard,
         };
-        if self.has_pending_drops.load(Ordering::SeqCst) {
-            let initial_drops = {
-                let mut pq = self.lock_pending_drops();
-                let batch = std::mem::take(&mut *pq);
-                self.has_pending_drops.store(false, Ordering::SeqCst);
-                batch
-            };
-            if !initial_drops.is_empty() {
-                session
-                    .inner_mut()
-                    .process_pending_drops(initial_drops, self);
-            }
+        if had_pending || (self.gate_state.load(Ordering::Acquire) & GATE_PENDING_DROPS) != 0 {
+            self.drain_initial_drops(&mut session);
         }
         Ok(session)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn drain_initial_drops(&self, session: &mut ConnSession<'_>) {
+        let initial_drops = {
+            let mut pq = self.lock_pending_drops();
+            let batch = std::mem::take(&mut *pq);
+            self.gate_state
+                .fetch_and(!GATE_PENDING_DROPS, Ordering::Release);
+            batch
+        };
+        if !initial_drops.is_empty() {
+            session
+                .inner_mut()
+                .process_pending_drops(initial_drops, self);
+        }
     }
 
     pub(crate) fn enter_dual<'a>(src: &'a Self, dst: &'a Self) -> Result<DualConnSession<'a>> {
@@ -1110,31 +1126,13 @@ impl ConnectionShared {
             (dst, src, false)
         };
 
-        if first
-            .gate_busy
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            return Err(SqliteError::new(
-                ErrorCode::Busy,
-                "database connection is busy",
-            ));
-        }
+        let first_had_pending = first.claim_gate_busy()?;
         let mut first_unwind = GateReleaseOnUnwind {
             shared: first,
             armed: true,
         };
 
-        if second
-            .gate_busy
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            return Err(SqliteError::new(
-                ErrorCode::Busy,
-                "database connection is busy",
-            ));
-        }
+        let second_had_pending = second.claim_gate_busy()?;
         let mut second_unwind = GateReleaseOnUnwind {
             shared: second,
             armed: true,
@@ -1157,11 +1155,14 @@ impl ConnectionShared {
             _first_stack: first_stack,
         };
 
-        if first.has_pending_drops.load(Ordering::SeqCst) {
+        if first_had_pending || (first.gate_state.load(Ordering::Acquire) & GATE_PENDING_DROPS) != 0
+        {
             let first_drops = {
                 let mut pq = first.lock_pending_drops();
                 let batch = std::mem::take(&mut *pq);
-                first.has_pending_drops.store(false, Ordering::SeqCst);
+                first
+                    .gate_state
+                    .fetch_and(!GATE_PENDING_DROPS, Ordering::Release);
                 batch
             };
             if !first_drops.is_empty() {
@@ -1173,11 +1174,15 @@ impl ConnectionShared {
             }
         }
 
-        if second.has_pending_drops.load(Ordering::SeqCst) {
+        if second_had_pending
+            || (second.gate_state.load(Ordering::Acquire) & GATE_PENDING_DROPS) != 0
+        {
             let second_drops = {
                 let mut pq = second.lock_pending_drops();
                 let batch = std::mem::take(&mut *pq);
-                second.has_pending_drops.store(false, Ordering::SeqCst);
+                second
+                    .gate_state
+                    .fetch_and(!GATE_PENDING_DROPS, Ordering::Release);
                 batch
             };
             if !second_drops.is_empty() {
@@ -1196,29 +1201,32 @@ impl ConnectionShared {
         let claimed = {
             let mut pq = self.lock_pending_drops();
             pq.push(item);
-            self.has_pending_drops.store(true, Ordering::SeqCst);
-            self.gate_busy
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
+            let prev = self
+                .gate_state
+                .fetch_or(GATE_BUSY | GATE_PENDING_DROPS, Ordering::AcqRel);
+            (prev & GATE_BUSY) == 0
         };
         if claimed {
             let _stack_guard = ActiveConnStackGuard::push(self.conn_id);
-            self.drain_and_release_gate();
+            self.drain_and_release_gate_slow();
         }
     }
 
+    #[inline]
     fn drain_and_release_gate(&self) {
-        if !self.has_pending_drops.load(Ordering::SeqCst) {
-            self.gate_busy.store(false, Ordering::SeqCst);
-            if !self.has_pending_drops.load(Ordering::SeqCst)
-                || self
-                    .gate_busy
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
-                    .is_err()
-            {
-                return;
-            }
+        if self
+            .gate_state
+            .compare_exchange(GATE_BUSY, 0, Ordering::Release, Ordering::Acquire)
+            .is_ok()
+        {
+            return;
         }
+        self.drain_and_release_gate_slow();
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn drain_and_release_gate_slow(&self) {
         let mut gate_unwind = GateReleaseOnUnwind {
             shared: self,
             armed: true,
@@ -1228,11 +1236,12 @@ impl ConnectionShared {
                 let mut pq = self.lock_pending_drops();
                 let batch = std::mem::take(&mut *pq);
                 if batch.is_empty() {
-                    self.has_pending_drops.store(false, Ordering::SeqCst);
-                    self.gate_busy.store(false, Ordering::SeqCst);
+                    self.gate_state.store(0, Ordering::Release);
                     gate_unwind.armed = false;
                     return;
                 }
+                self.gate_state
+                    .fetch_and(!GATE_PENDING_DROPS, Ordering::Release);
                 batch
             };
             let mut inner = self.lock_inner();
@@ -1251,7 +1260,9 @@ struct GateReleaseOnUnwind<'a> {
 impl Drop for GateReleaseOnUnwind<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.shared.gate_busy.store(false, Ordering::Release);
+            self.shared
+                .gate_state
+                .fetch_and(!GATE_BUSY, Ordering::Release);
         }
     }
 }
@@ -1265,7 +1276,7 @@ impl Drop for ConnectionShared {
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner);
         let batch = std::mem::take(pending);
-        self.has_pending_drops.store(false, Ordering::Relaxed);
+        self.gate_state.store(0, Ordering::Relaxed);
         for item in batch {
             match item {
                 PendingDrop::Statement { handle_id, running } => {
@@ -1381,11 +1392,12 @@ impl ConnSession<'_> {
 }
 
 impl Drop for ConnSession<'_> {
+    #[inline]
     fn drop(&mut self) {
-        if let Some(ref g) = self.guard {
+        if let Some(g) = self.guard.take() {
             self.shared.sync_conn_state(&g.state);
+            drop(g);
         }
-        drop(self.guard.take());
         self.shared.drain_and_release_gate();
     }
 }
@@ -1452,10 +1464,16 @@ impl ConnectionInner {
 
     #[inline]
     pub(crate) fn check_any_interrupted(&self) -> Result<()> {
-        if self.active_interrupt_flag.load(Ordering::SeqCst) {
+        if self.active_interrupt_flag.load(Ordering::Relaxed) {
             return Err(SqliteError::new(ErrorCode::Interrupt, "interrupted"));
         }
-        self.db_set.main_btree().check_interrupted()
+        if let Some(bt_flag) = self.db_set.main_btree().interrupt_flag()
+            && !Arc::ptr_eq(&self.active_interrupt_flag, bt_flag)
+            && bt_flag.load(Ordering::Relaxed)
+        {
+            return Err(SqliteError::new(ErrorCode::Interrupt, "interrupted"));
+        }
+        Ok(())
     }
 
     pub(crate) fn publish(&self, shared: &ConnectionShared) {
@@ -1785,6 +1803,41 @@ impl ConnectionInner {
             }
         }
         Ok(final_res)
+    }
+
+    #[inline]
+    fn finish_point_select_main_read(
+        &mut self,
+        hid: HandleId,
+        main_inst: SchemaInstanceId,
+        shared: &ConnectionShared,
+    ) -> Result<()> {
+        if self.simulated_cleanup_io_error.is_none()
+            && self.activity.leases.len() == 1
+            && self.activity.leases[0].0 == hid
+            && self.db_set.slots().len() == 2
+            && self.db_set.slots()[1].btree.is_none()
+            && self.db_set.slots()[0].schema_instance_id == main_inst
+        {
+            self.activity.leases.clear();
+            if !self.in_user_btree_tx
+                && self.is_autocommit()
+                && let Some(ref mut bt) = self.db_set.slots_mut()[0].btree
+                && bt.transaction_state() == TransactionState::Read
+                && let Err(e) = bt.pager_mut().end_read_if_unused()
+            {
+                return Err(self.poison_with(e));
+            }
+            return Ok(());
+        }
+        self.finish_activity(
+            hid,
+            ActivityFinish::ReadDone {
+                lease_cursors: Vec::new(),
+                read_instances: SmallInstVec::single(main_inst),
+            },
+            shared,
+        )
     }
 
     fn finish_activity(
@@ -2426,14 +2479,9 @@ impl ConnectionInner {
                     shared,
                 )
             }
-            RunningExec::PointSelectRowYielded { read_instances } => self.finish_activity(
-                hid,
-                ActivityFinish::ReadDone {
-                    lease_cursors: Vec::new(),
-                    read_instances,
-                },
-                shared,
-            ),
+            RunningExec::PointSelectRowYielded { main_inst } => {
+                self.finish_point_select_main_read(hid, main_inst, shared)
+            }
             RunningExec::MaterializedRead {
                 lease_cursors,
                 read_instances,
@@ -2607,7 +2655,7 @@ impl Connection {
     pub fn open_in_memory_with_options(options: ConnectionOpenOptions) -> Result<Self> {
         let pager_opts = options.to_pager_options(DatabaseKind::Memory);
         let mem_vfs: Arc<dyn Vfs> = Arc::new(MemoryVfs::with_lock_geometry(options.lock_geometry));
-        let disk_vfs: Arc<dyn Vfs> = Arc::new(OsVfs::with_lock_geometry(options.lock_geometry));
+        let disk_vfs = os_vfs_for_geometry(options.lock_geometry);
         let btree = Btree::open_with_options(
             mem_vfs,
             Some(Path::new(":memory:")),
@@ -2625,7 +2673,7 @@ impl Connection {
     /// Opens an isolated private temporary database (`""`) with explicit [`ConnectionOpenOptions`].
     pub fn open_private_temporary_with_options(options: ConnectionOpenOptions) -> Result<Self> {
         let pager_opts = options.to_pager_options(DatabaseKind::PrivateTemporary);
-        let disk_vfs: Arc<dyn Vfs> = Arc::new(OsVfs::with_lock_geometry(options.lock_geometry));
+        let disk_vfs = os_vfs_for_geometry(options.lock_geometry);
         let btree = Btree::open_private_temporary(Arc::clone(&disk_vfs), pager_opts)?;
         Self::from_btree_with_disk_vfs(btree, disk_vfs, options, false)
     }
@@ -2649,7 +2697,7 @@ impl Connection {
         options: ConnectionOpenOptions,
     ) -> Result<Self> {
         let p = path.as_ref();
-        let disk_vfs: Arc<dyn Vfs> = Arc::new(OsVfs::with_lock_geometry(options.lock_geometry));
+        let disk_vfs = os_vfs_for_geometry(options.lock_geometry);
         let mut pager_opts = options.to_pager_options(DatabaseKind::NamedDisk);
         pager_opts.immutable = true;
         let btree = Btree::open_with_options(
@@ -2673,7 +2721,7 @@ impl Connection {
         if flags.contains(OpenFlags::URI) {
             effective_options.uri = true;
         }
-        let disk_vfs: Arc<dyn Vfs> = Arc::new(OsVfs::with_lock_geometry(options.lock_geometry));
+        let disk_vfs = os_vfs_for_geometry(options.lock_geometry);
 
         if uri_enabled
             && let Some(s) = p.to_str()
@@ -2869,7 +2917,7 @@ impl Connection {
                     ))
                 };
                 let d_vfs: Arc<dyn Vfs> = if vfs.name() == "memdb" {
-                    Arc::new(OsVfs::with_lock_geometry(effective_options.lock_geometry))
+                    os_vfs_for_geometry(effective_options.lock_geometry)
                 } else {
                     vfs
                 };
@@ -2921,10 +2969,8 @@ impl Connection {
             Arc::clone(&interrupt_flag),
         );
 
-        let fts5_aux = db_set.vtab_registry().fts5_aux_registry();
-        let mut functions = FunctionRegistry::default();
-        register_builtin_extension_functions(&mut functions, fts5_aux);
-        functions.mark_builtin_init_complete();
+        let functions =
+            FunctionRegistry::with_lazy_builtin_extensions(db_set.vtab_registry().lazy_fts5_aux());
 
         let inner = ConnectionInner {
             db_set,
@@ -2979,9 +3025,8 @@ impl Connection {
             open_options,
             interrupt_flag,
             has_external_interrupt: AtomicBool::new(false),
-            gate_busy: AtomicBool::new(false),
+            gate_state: AtomicU8::new(0),
             conn_state: AtomicU8::new(CONN_STATE_OPEN),
-            has_pending_drops: AtomicBool::new(false),
             mirror_last_insert_rowid: AtomicI64::new(0),
             mirror_changes: AtomicU64::new(0),
             mirror_total_changes: AtomicU64::new(0),
@@ -4505,7 +4550,9 @@ impl Connection {
                 handle_id: hid,
                 running,
             });
-            self.shared.has_pending_drops.store(true, Ordering::SeqCst);
+            self.shared
+                .gate_state
+                .fetch_or(GATE_PENDING_DROPS, Ordering::Release);
         }
         Ok(())
     }
@@ -6553,8 +6600,7 @@ impl Statement {
     fn can_fast_bind(&self) -> bool {
         self.handle_id.is_some()
             && self.shared.conn_state.load(Ordering::Acquire) == CONN_STATE_OPEN
-            && !self.shared.has_pending_drops.load(Ordering::Acquire)
-            && !self.shared.gate_busy.load(Ordering::Acquire)
+            && self.shared.gate_state.load(Ordering::Acquire) == 0
     }
 
     /// Binds a 1-based parameter (`?1`, `?`, etc.) (`sqlite3_bind_*`).
@@ -6930,31 +6976,38 @@ impl Statement {
     /// connection lease, preserves bound parameters, and starts a fresh execution.
     pub fn step(&mut self) -> Result<StepResult> {
         // Zero-`Arc::clone` fast completion for step #2 of a single-row `rowid` point `SELECT`.
-        if let StatementLifecycle::Running(RunningExec::PointSelectRowYielded {
-            ref read_instances,
-        }) = self.lifecycle
+        if let StatementLifecycle::Running(RunningExec::PointSelectRowYielded { main_inst }) =
+            self.lifecycle
             && let Some(hid) = self.handle_id
         {
-            let r_insts = read_instances.clone();
             let fin_res = {
                 let mut session = self.shared.enter()?;
                 let inner = session.inner_mut();
                 inner.ensure_usable()?;
                 inner.runtime.stmt_timestamp_ms = None;
-                inner.finish_activity(
-                    hid,
-                    ActivityFinish::ReadDone {
-                        lease_cursors: Vec::new(),
-                        read_instances: r_insts,
-                    },
-                    &self.shared,
-                )
+                inner.finish_point_select_main_read(hid, main_inst, &self.shared)
             };
             self.lifecycle = StatementLifecycle::Halted {
                 last_error: fin_res.as_ref().err().cloned(),
             };
             fin_res?;
             return Ok(StepResult::Done);
+        }
+
+        // Zero-`Arc::clone` fast advance for already-running multi-row queries (`RunningExec`).
+        if matches!(self.lifecycle, StatementLifecycle::Running(_))
+            && let Some(hid) = self.handle_id
+        {
+            let Self {
+                ref shared,
+                ref mut lifecycle,
+                ref mut cached_read_vm,
+                ..
+            } = *self;
+            let mut session = shared.enter()?;
+            let inner = session.inner_mut();
+            inner.ensure_usable()?;
+            return advance_running_fields(hid, shared, inner, lifecycle, cached_read_vm);
         }
 
         // Zero-`Arc::clone` / zero-`VdbeVm` / zero-`BtreeCursor` fast path for step #1 of
@@ -6975,7 +7028,7 @@ impl Statement {
                 Fallback,
                 EarlyErr(SqliteError),
                 HaltedErr(SqliteError),
-                Hit(Vec<Value>, SmallInstVec),
+                Hit(Vec<Value>, SchemaInstanceId),
                 Miss,
             }
             let outcome = {
@@ -7083,15 +7136,8 @@ impl Statement {
                                         if !inner.is_autocommit() {
                                             inner.in_user_btree_tx = true;
                                         }
-                                        let read_instances = SmallInstVec::single(main_inst);
-                                        inner.activity.start_with_instances(
-                                            hid,
-                                            true,
-                                            false,
-                                            read_instances.clone(),
-                                            SmallInstVec::new(),
-                                        );
-                                        PointOutcome::Hit(vals, read_instances)
+                                        inner.activity.start_single_read(hid, main_inst);
+                                        PointOutcome::Hit(vals, main_inst)
                                     }
                                     Ok(None) => {
                                         if !inner.is_autocommit() {
@@ -7150,10 +7196,10 @@ impl Statement {
                     };
                     return Err(e);
                 }
-                PointOutcome::Hit(vals, read_instances) => {
+                PointOutcome::Hit(vals, main_inst) => {
                     self.lifecycle =
                         StatementLifecycle::Running(RunningExec::PointSelectRowYielded {
-                            read_instances,
+                            main_inst,
                         });
                     return Ok(StepResult::Row(Row::new(vals)));
                 }
@@ -8828,491 +8874,20 @@ impl Statement {
         }
     }
 
+    #[inline]
     fn advance_running_in_session(
         &mut self,
         hid: HandleId,
         shared: &Arc<ConnectionShared>,
         inner: &mut ConnectionInner,
     ) -> Result<StepResult> {
-        let StatementLifecycle::Running(ref mut running) = self.lifecycle else {
-            unreachable!("advance_running_in_session requires Running state");
-        };
-
-        match running {
-            RunningExec::PointSelectRowYielded { read_instances } => {
-                let r_insts = std::mem::take(read_instances);
-                inner.runtime.stmt_timestamp_ms = None;
-                let fin_res = inner.finish_activity(
-                    hid,
-                    ActivityFinish::ReadDone {
-                        lease_cursors: Vec::new(),
-                        read_instances: r_insts,
-                    },
-                    shared,
-                );
-                self.lifecycle = StatementLifecycle::Halted {
-                    last_error: fin_res.as_ref().err().cloned(),
-                };
-                fin_res?;
-                Ok(StepResult::Done)
-            }
-            RunningExec::Vdbe { vm, read_instances } => {
-                let step_res = {
-                    let encoding = inner.effective_encoding();
-                    let rt_snapshot = vm.runtime_ctx;
-                    let mut services = ExecutionContext {
-                        interrupt_flag: &inner.active_interrupt_flag,
-                        runtime: &rt_snapshot,
-                        encoding,
-                        functions: &inner.functions,
-                        collations: &inner.collations,
-                        progress: &mut inner.progress,
-                        strict_subtype: inner.strict_subtype,
-                    };
-                    vm.step(&mut inner.db_set, &mut services)
-                };
-                match step_res {
-                    Ok(VmStep::Row(vals)) => {
-                        let rt_changed = inner.runtime.last_insert_rowid
-                            != vm.runtime_ctx.last_insert_rowid
-                            || inner.runtime.last_changes != vm.runtime_ctx.last_changes
-                            || inner.runtime.total_changes != vm.runtime_ctx.total_changes;
-                        inner.runtime = vm.runtime_ctx;
-                        inner.runtime.stmt_timestamp_ms = None;
-                        if rt_changed {
-                            inner.publish(shared);
-                        }
-                        Ok(StepResult::Row(Row::new(vals)))
-                    }
-                    Ok(VmStep::Done) => {
-                        vm.close_cursors(&mut inner.db_set);
-                        let r_insts = std::mem::take(read_instances);
-                        let rt_changed = inner.runtime.last_insert_rowid
-                            != vm.runtime_ctx.last_insert_rowid
-                            || inner.runtime.last_changes != vm.runtime_ctx.last_changes
-                            || inner.runtime.total_changes != vm.runtime_ctx.total_changes;
-                        inner.runtime = vm.runtime_ctx;
-                        inner.runtime.stmt_timestamp_ms = None;
-                        if rt_changed {
-                            inner.publish(shared);
-                        }
-                        let fin_res = inner.finish_activity(
-                            hid,
-                            ActivityFinish::ReadDone {
-                                lease_cursors: Vec::new(),
-                                read_instances: r_insts,
-                            },
-                            shared,
-                        );
-                        let prev = std::mem::replace(
-                            &mut self.lifecycle,
-                            StatementLifecycle::Halted {
-                                last_error: fin_res.as_ref().err().cloned(),
-                            },
-                        );
-                        if let StatementLifecycle::Running(RunningExec::Vdbe { vm, .. }) = prev {
-                            self.cached_read_vm = Some(vm);
-                        }
-                        fin_res?;
-                        Ok(StepResult::Done)
-                    }
-                    Err(e) => {
-                        vm.close_cursors(&mut inner.db_set);
-                        let r_insts = std::mem::take(read_instances);
-                        inner.runtime.stmt_timestamp_ms = None;
-                        let _ = inner.finish_activity(
-                            hid,
-                            ActivityFinish::ReadAborted {
-                                lease_cursors: Vec::new(),
-                                read_instances: r_insts,
-                            },
-                            shared,
-                        );
-                        let prev = std::mem::replace(
-                            &mut self.lifecycle,
-                            StatementLifecycle::Halted {
-                                last_error: Some(e.clone()),
-                            },
-                        );
-                        if let StatementLifecycle::Running(RunningExec::Vdbe { vm, .. }) = prev {
-                            self.cached_read_vm = Some(vm);
-                        }
-                        Err(e)
-                    }
-                }
-            }
-
-            RunningExec::MaterializedRead {
-                rows,
-                lease_cursors,
-                read_instances,
-            } => {
-                if let Err(e) = inner.check_any_interrupted() {
-                    let cursors = std::mem::take(lease_cursors);
-                    let r_insts = std::mem::take(read_instances);
-                    let _ = inner.finish_activity(
-                        hid,
-                        ActivityFinish::ReadAborted {
-                            lease_cursors: cursors,
-                            read_instances: r_insts,
-                        },
-                        shared,
-                    );
-                    self.lifecycle = StatementLifecycle::Halted {
-                        last_error: Some(e.clone()),
-                    };
-                    return Err(e);
-                }
-
-                for &(inst, cid) in lease_cursors.iter() {
-                    let Some(slot) = inner.db_set.slot_by_instance_mut(inst) else {
-                        continue;
-                    };
-                    let Some(ref mut bt) = slot.btree else {
-                        continue;
-                    };
-                    if let Some(&BtreeCursorState::Fault(code)) = bt.cursor_state(cid) {
-                        let msg = if code == extended::SQLITE_ABORT_ROLLBACK {
-                            "abort due to ROLLBACK"
-                        } else {
-                            ErrorCode::from_raw_primary(code).as_str()
-                        };
-                        let err = SqliteError::with_extended(code, msg);
-                        let cursors = std::mem::take(lease_cursors);
-                        let r_insts = std::mem::take(read_instances);
-                        let _ = inner.finish_activity(
-                            hid,
-                            ActivityFinish::ReadAborted {
-                                lease_cursors: cursors,
-                                read_instances: r_insts,
-                            },
-                            shared,
-                        );
-                        self.lifecycle = StatementLifecycle::Halted {
-                            last_error: Some(err.clone()),
-                        };
-                        return Err(err);
-                    }
-                    if let Err(e) = bt.restore_cursor_position(cid) {
-                        let cursors = std::mem::take(lease_cursors);
-                        let r_insts = std::mem::take(read_instances);
-                        let _ = inner.finish_activity(
-                            hid,
-                            ActivityFinish::ReadAborted {
-                                lease_cursors: cursors,
-                                read_instances: r_insts,
-                            },
-                            shared,
-                        );
-                        self.lifecycle = StatementLifecycle::Halted {
-                            last_error: Some(e.clone()),
-                        };
-                        return Err(e);
-                    }
-                }
-
-                if let Some(vals) = rows.next() {
-                    Ok(StepResult::Row(Row::new(vals)))
-                } else {
-                    let cursors = std::mem::take(lease_cursors);
-                    let r_insts = std::mem::take(read_instances);
-                    let fin_res = inner.finish_activity(
-                        hid,
-                        ActivityFinish::ReadDone {
-                            lease_cursors: cursors,
-                            read_instances: r_insts,
-                        },
-                        shared,
-                    );
-                    if let Err(e) = fin_res {
-                        self.lifecycle = StatementLifecycle::Halted {
-                            last_error: Some(e.clone()),
-                        };
-                        return Err(e);
-                    }
-                    self.lifecycle = StatementLifecycle::Halted { last_error: None };
-                    Ok(StepResult::Done)
-                }
-            }
-
-            RunningExec::FastSingleTextArena {
-                arena,
-                spans,
-                pos,
-                lease_cursors,
-                read_instances,
-            } => {
-                if let Err(e) = inner.check_any_interrupted() {
-                    std::mem::take(arena);
-                    std::mem::take(spans);
-                    let cursors = std::mem::take(lease_cursors);
-                    let r_insts = std::mem::take(read_instances);
-                    let _ = inner.finish_activity(
-                        hid,
-                        ActivityFinish::ReadAborted {
-                            lease_cursors: cursors,
-                            read_instances: r_insts,
-                        },
-                        shared,
-                    );
-                    self.lifecycle = StatementLifecycle::Halted {
-                        last_error: Some(e.clone()),
-                    };
-                    return Err(e);
-                }
-
-                for &(inst, cid) in lease_cursors.iter() {
-                    let Some(slot) = inner.db_set.slot_by_instance_mut(inst) else {
-                        continue;
-                    };
-                    let Some(ref mut bt) = slot.btree else {
-                        continue;
-                    };
-                    if let Some(&BtreeCursorState::Fault(code)) = bt.cursor_state(cid) {
-                        let msg = if code == extended::SQLITE_ABORT_ROLLBACK {
-                            "abort due to ROLLBACK"
-                        } else {
-                            ErrorCode::from_raw_primary(code).as_str()
-                        };
-                        let err = SqliteError::with_extended(code, msg);
-                        std::mem::take(arena);
-                        std::mem::take(spans);
-                        let cursors = std::mem::take(lease_cursors);
-                        let r_insts = std::mem::take(read_instances);
-                        let _ = inner.finish_activity(
-                            hid,
-                            ActivityFinish::ReadAborted {
-                                lease_cursors: cursors,
-                                read_instances: r_insts,
-                            },
-                            shared,
-                        );
-                        self.lifecycle = StatementLifecycle::Halted {
-                            last_error: Some(err.clone()),
-                        };
-                        return Err(err);
-                    }
-                    if let Err(e) = bt.restore_cursor_position(cid) {
-                        std::mem::take(arena);
-                        std::mem::take(spans);
-                        let cursors = std::mem::take(lease_cursors);
-                        let r_insts = std::mem::take(read_instances);
-                        let _ = inner.finish_activity(
-                            hid,
-                            ActivityFinish::ReadAborted {
-                                lease_cursors: cursors,
-                                read_instances: r_insts,
-                            },
-                            shared,
-                        );
-                        self.lifecycle = StatementLifecycle::Halted {
-                            last_error: Some(e.clone()),
-                        };
-                        return Err(e);
-                    }
-                }
-
-                if *pos < spans.len() {
-                    let (off, len) = spans[*pos];
-                    *pos += 1;
-                    let val = if len == u32::MAX {
-                        Value::Null
-                    } else {
-                        Value::Text(arena[off as usize..(off + len) as usize].to_owned())
-                    };
-                    Ok(StepResult::Row(Row::new(vec![val])))
-                } else {
-                    std::mem::take(arena);
-                    std::mem::take(spans);
-                    let cursors = std::mem::take(lease_cursors);
-                    let r_insts = std::mem::take(read_instances);
-                    let fin_res = inner.finish_activity(
-                        hid,
-                        ActivityFinish::ReadDone {
-                            lease_cursors: cursors,
-                            read_instances: r_insts,
-                        },
-                        shared,
-                    );
-                    if let Err(e) = fin_res {
-                        self.lifecycle = StatementLifecycle::Halted {
-                            last_error: Some(e.clone()),
-                        };
-                        return Err(e);
-                    }
-                    self.lifecycle = StatementLifecycle::Halted { last_error: None };
-                    Ok(StepResult::Done)
-                }
-            }
-
-            RunningExec::MaterializedNoLock { rows } => {
-                if let Some(vals) = rows.next() {
-                    Ok(StepResult::Row(Row::new(vals)))
-                } else {
-                    let _ = inner.finish_activity(hid, ActivityFinish::NoLock, shared);
-                    inner.maybe_run_wal_autocheckpoint();
-                    self.lifecycle = StatementLifecycle::Halted { last_error: None };
-                    Ok(StepResult::Done)
-                }
-            }
-
-            RunningExec::ReturningWrite {
-                rows,
-                abort_snapshot,
-            } => {
-                if let Err(e) = inner.check_any_interrupted() {
-                    let snap = abort_snapshot.clone();
-                    let final_err = inner.abort_write_statement(hid, &e, snap, shared);
-                    self.lifecycle = StatementLifecycle::Halted {
-                        last_error: Some(final_err.clone()),
-                    };
-                    return Err(final_err);
-                }
-
-                if let Some(vals) = rows.next() {
-                    Ok(StepResult::Row(Row::new(vals)))
-                } else {
-                    let snap = abort_snapshot.clone();
-                    match inner.finish_activity(
-                        hid,
-                        ActivityFinish::WriteCompleted {
-                            abort_snapshot: snap,
-                        },
-                        shared,
-                    ) {
-                        Ok(()) => {
-                            self.lifecycle = StatementLifecycle::Halted { last_error: None };
-                            Ok(StepResult::Done)
-                        }
-                        Err(e) => {
-                            self.lifecycle = StatementLifecycle::Halted {
-                                last_error: Some(e.clone()),
-                            };
-                            Err(e)
-                        }
-                    }
-                }
-            }
-
-            RunningExec::IncrementalVacuum {
-                db_instance,
-                remaining,
-                abort_snapshot,
-            } => {
-                if let Err(e) = inner.check_any_interrupted() {
-                    let snap = abort_snapshot.clone();
-                    let final_err = inner.abort_write_statement(hid, &e, snap, shared);
-                    self.lifecycle = StatementLifecycle::Halted {
-                        last_error: Some(final_err.clone()),
-                    };
-                    return Err(final_err);
-                }
-
-                if *remaining == 0 {
-                    let snap = abort_snapshot.clone();
-                    return match inner.finish_activity(
-                        hid,
-                        ActivityFinish::WriteCompleted {
-                            abort_snapshot: snap,
-                        },
-                        shared,
-                    ) {
-                        Ok(()) => {
-                            self.lifecycle = StatementLifecycle::Halted { last_error: None };
-                            Ok(StepResult::Done)
-                        }
-                        Err(e) => {
-                            self.lifecycle = StatementLifecycle::Halted {
-                                last_error: Some(e.clone()),
-                            };
-                            Err(e)
-                        }
-                    };
-                }
-
-                *remaining -= 1;
-                let step_res = match inner
-                    .db_set
-                    .slot_by_instance_mut(*db_instance)
-                    .and_then(|s| s.btree.as_mut())
-                {
-                    Some(bt) => bt.incremental_vacuum_step(),
-                    None => Ok(false),
-                };
-                match step_res {
-                    Ok(true) => Ok(StepResult::Row(Row::new(Vec::new()))),
-                    Ok(false) => {
-                        let snap = abort_snapshot.clone();
-                        match inner.finish_activity(
-                            hid,
-                            ActivityFinish::WriteCompleted {
-                                abort_snapshot: snap,
-                            },
-                            shared,
-                        ) {
-                            Ok(()) => {
-                                self.lifecycle = StatementLifecycle::Halted { last_error: None };
-                                Ok(StepResult::Done)
-                            }
-                            Err(e) => {
-                                self.lifecycle = StatementLifecycle::Halted {
-                                    last_error: Some(e.clone()),
-                                };
-                                Err(e)
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        let snap = abort_snapshot.clone();
-                        let final_err = inner.abort_write_statement(hid, &err, snap, shared);
-                        self.lifecycle = StatementLifecycle::Halted {
-                            last_error: Some(final_err.clone()),
-                        };
-                        Err(final_err)
-                    }
-                }
-            }
-
-            RunningExec::PendingCommit {
-                release_savepoint,
-                last_busy,
-            } => {
-                let summary = inner.activity.summary_excluding(hid, &inner.db_set);
-                let rel_opt = release_savepoint.clone();
-                let mut expire_self_only = false;
-                let mut stmt_tx = StmtTxTracker::default();
-                let res = inner.with_exec_ctx(
-                    shared,
-                    summary,
-                    &mut stmt_tx,
-                    &mut expire_self_only,
-                    |ctx| match rel_opt {
-                        Some(ref sp) => release_savepoint_op(ctx, sp),
-                        None => commit_transaction(ctx),
-                    },
-                );
-
-                match res {
-                    Ok(()) => {
-                        inner.activity.remove(hid);
-                        inner.maybe_run_wal_autocheckpoint();
-                        self.lifecycle = StatementLifecycle::Halted { last_error: None };
-                        Ok(StepResult::Done)
-                    }
-                    Err(e) if e.code == ErrorCode::Busy && summary.other_writers == 0 => {
-                        *last_busy = e.clone();
-                        Err(e)
-                    }
-                    Err(e) => {
-                        inner.activity.remove(hid);
-                        self.lifecycle = StatementLifecycle::Halted {
-                            last_error: Some(e.clone()),
-                        };
-                        Err(e)
-                    }
-                }
-            }
-        }
+        advance_running_fields(
+            hid,
+            shared,
+            inner,
+            &mut self.lifecycle,
+            &mut self.cached_read_vm,
+        )
     }
 
     /// Steps through all remaining rows and collects them into a `Vec<Row>`.
@@ -9322,6 +8897,497 @@ impl Statement {
             rows.push(r);
         }
         Ok(rows)
+    }
+}
+
+fn advance_running_fields(
+    hid: HandleId,
+    shared: &ConnectionShared,
+    inner: &mut ConnectionInner,
+    lifecycle: &mut StatementLifecycle,
+    cached_read_vm: &mut Option<VdbeVm>,
+) -> Result<StepResult> {
+    let StatementLifecycle::Running(ref mut running) = *lifecycle else {
+        unreachable!("advance_running_fields requires Running state");
+    };
+
+    match running {
+        RunningExec::PointSelectRowYielded { main_inst } => {
+            let inst = *main_inst;
+            inner.runtime.stmt_timestamp_ms = None;
+            let fin_res = inner.finish_point_select_main_read(hid, inst, shared);
+            *lifecycle = StatementLifecycle::Halted {
+                last_error: fin_res.as_ref().err().cloned(),
+            };
+            fin_res?;
+            Ok(StepResult::Done)
+        }
+        RunningExec::Vdbe { vm, read_instances } => {
+            let step_res = {
+                let encoding = inner.effective_encoding();
+                let rt_snapshot = vm.runtime_ctx;
+                let mut services = ExecutionContext {
+                    interrupt_flag: &inner.active_interrupt_flag,
+                    runtime: &rt_snapshot,
+                    encoding,
+                    functions: &inner.functions,
+                    collations: &inner.collations,
+                    progress: &mut inner.progress,
+                    strict_subtype: inner.strict_subtype,
+                };
+                vm.step(&mut inner.db_set, &mut services)
+            };
+            match step_res {
+                Ok(VmStep::Row(vals)) => {
+                    let rt_changed = inner.runtime.last_insert_rowid
+                        != vm.runtime_ctx.last_insert_rowid
+                        || inner.runtime.last_changes != vm.runtime_ctx.last_changes
+                        || inner.runtime.total_changes != vm.runtime_ctx.total_changes;
+                    inner.runtime = vm.runtime_ctx;
+                    inner.runtime.stmt_timestamp_ms = None;
+                    if rt_changed {
+                        inner.publish(shared);
+                    }
+                    Ok(StepResult::Row(Row::new(vals)))
+                }
+                Ok(VmStep::Done) => {
+                    vm.close_cursors(&mut inner.db_set);
+                    let r_insts = std::mem::take(read_instances);
+                    let rt_changed = inner.runtime.last_insert_rowid
+                        != vm.runtime_ctx.last_insert_rowid
+                        || inner.runtime.last_changes != vm.runtime_ctx.last_changes
+                        || inner.runtime.total_changes != vm.runtime_ctx.total_changes;
+                    inner.runtime = vm.runtime_ctx;
+                    inner.runtime.stmt_timestamp_ms = None;
+                    if rt_changed {
+                        inner.publish(shared);
+                    }
+                    let fin_res = inner.finish_activity(
+                        hid,
+                        ActivityFinish::ReadDone {
+                            lease_cursors: Vec::new(),
+                            read_instances: r_insts,
+                        },
+                        shared,
+                    );
+                    let prev = std::mem::replace(
+                        lifecycle,
+                        StatementLifecycle::Halted {
+                            last_error: fin_res.as_ref().err().cloned(),
+                        },
+                    );
+                    if let StatementLifecycle::Running(RunningExec::Vdbe { vm, .. }) = prev {
+                        *cached_read_vm = Some(vm);
+                    }
+                    fin_res?;
+                    Ok(StepResult::Done)
+                }
+                Err(e) => {
+                    vm.close_cursors(&mut inner.db_set);
+                    let r_insts = std::mem::take(read_instances);
+                    inner.runtime.stmt_timestamp_ms = None;
+                    let _ = inner.finish_activity(
+                        hid,
+                        ActivityFinish::ReadAborted {
+                            lease_cursors: Vec::new(),
+                            read_instances: r_insts,
+                        },
+                        shared,
+                    );
+                    let prev = std::mem::replace(
+                        lifecycle,
+                        StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        },
+                    );
+                    if let StatementLifecycle::Running(RunningExec::Vdbe { vm, .. }) = prev {
+                        *cached_read_vm = Some(vm);
+                    }
+                    Err(e)
+                }
+            }
+        }
+
+        RunningExec::MaterializedRead {
+            rows,
+            lease_cursors,
+            read_instances,
+        } => {
+            if let Err(e) = inner.check_any_interrupted() {
+                let cursors = std::mem::take(lease_cursors);
+                let r_insts = std::mem::take(read_instances);
+                let _ = inner.finish_activity(
+                    hid,
+                    ActivityFinish::ReadAborted {
+                        lease_cursors: cursors,
+                        read_instances: r_insts,
+                    },
+                    shared,
+                );
+                *lifecycle = StatementLifecycle::Halted {
+                    last_error: Some(e.clone()),
+                };
+                return Err(e);
+            }
+
+            for &(inst, cid) in lease_cursors.iter() {
+                let Some(slot) = inner.db_set.slot_by_instance_mut(inst) else {
+                    continue;
+                };
+                let Some(ref mut bt) = slot.btree else {
+                    continue;
+                };
+                match bt.cursor_state(cid) {
+                    Some(&BtreeCursorState::Fault(code)) => {
+                        let msg = if code == extended::SQLITE_ABORT_ROLLBACK {
+                            "abort due to ROLLBACK"
+                        } else {
+                            ErrorCode::from_raw_primary(code).as_str()
+                        };
+                        let err = SqliteError::with_extended(code, msg);
+                        let cursors = std::mem::take(lease_cursors);
+                        let r_insts = std::mem::take(read_instances);
+                        let _ = inner.finish_activity(
+                            hid,
+                            ActivityFinish::ReadAborted {
+                                lease_cursors: cursors,
+                                read_instances: r_insts,
+                            },
+                            shared,
+                        );
+                        *lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(err.clone()),
+                        };
+                        return Err(err);
+                    }
+                    Some(BtreeCursorState::RequireSeek { .. }) => {
+                        if let Err(e) = bt.restore_cursor_position(cid) {
+                            let cursors = std::mem::take(lease_cursors);
+                            let r_insts = std::mem::take(read_instances);
+                            let _ = inner.finish_activity(
+                                hid,
+                                ActivityFinish::ReadAborted {
+                                    lease_cursors: cursors,
+                                    read_instances: r_insts,
+                                },
+                                shared,
+                            );
+                            *lifecycle = StatementLifecycle::Halted {
+                                last_error: Some(e.clone()),
+                            };
+                            return Err(e);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(vals) = rows.next() {
+                Ok(StepResult::Row(Row::new(vals)))
+            } else {
+                let cursors = std::mem::take(lease_cursors);
+                let r_insts = std::mem::take(read_instances);
+                let fin_res = inner.finish_activity(
+                    hid,
+                    ActivityFinish::ReadDone {
+                        lease_cursors: cursors,
+                        read_instances: r_insts,
+                    },
+                    shared,
+                );
+                if let Err(e) = fin_res {
+                    *lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(e.clone()),
+                    };
+                    return Err(e);
+                }
+                *lifecycle = StatementLifecycle::Halted { last_error: None };
+                Ok(StepResult::Done)
+            }
+        }
+
+        RunningExec::FastSingleTextArena {
+            arena,
+            spans,
+            pos,
+            lease_cursors,
+            read_instances,
+        } => {
+            if let Err(e) = inner.check_any_interrupted() {
+                std::mem::take(arena);
+                std::mem::take(spans);
+                let cursors = std::mem::take(lease_cursors);
+                let r_insts = std::mem::take(read_instances);
+                let _ = inner.finish_activity(
+                    hid,
+                    ActivityFinish::ReadAborted {
+                        lease_cursors: cursors,
+                        read_instances: r_insts,
+                    },
+                    shared,
+                );
+                *lifecycle = StatementLifecycle::Halted {
+                    last_error: Some(e.clone()),
+                };
+                return Err(e);
+            }
+
+            for &(inst, cid) in lease_cursors.iter() {
+                let Some(slot) = inner.db_set.slot_by_instance_mut(inst) else {
+                    continue;
+                };
+                let Some(ref mut bt) = slot.btree else {
+                    continue;
+                };
+                match bt.cursor_state(cid) {
+                    Some(&BtreeCursorState::Fault(code)) => {
+                        let msg = if code == extended::SQLITE_ABORT_ROLLBACK {
+                            "abort due to ROLLBACK"
+                        } else {
+                            ErrorCode::from_raw_primary(code).as_str()
+                        };
+                        let err = SqliteError::with_extended(code, msg);
+                        std::mem::take(arena);
+                        std::mem::take(spans);
+                        let cursors = std::mem::take(lease_cursors);
+                        let r_insts = std::mem::take(read_instances);
+                        let _ = inner.finish_activity(
+                            hid,
+                            ActivityFinish::ReadAborted {
+                                lease_cursors: cursors,
+                                read_instances: r_insts,
+                            },
+                            shared,
+                        );
+                        *lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(err.clone()),
+                        };
+                        return Err(err);
+                    }
+                    Some(BtreeCursorState::RequireSeek { .. }) => {
+                        if let Err(e) = bt.restore_cursor_position(cid) {
+                            std::mem::take(arena);
+                            std::mem::take(spans);
+                            let cursors = std::mem::take(lease_cursors);
+                            let r_insts = std::mem::take(read_instances);
+                            let _ = inner.finish_activity(
+                                hid,
+                                ActivityFinish::ReadAborted {
+                                    lease_cursors: cursors,
+                                    read_instances: r_insts,
+                                },
+                                shared,
+                            );
+                            *lifecycle = StatementLifecycle::Halted {
+                                last_error: Some(e.clone()),
+                            };
+                            return Err(e);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if *pos < spans.len() {
+                let (off, len) = spans[*pos];
+                *pos += 1;
+                let val = if len == u32::MAX {
+                    Value::Null
+                } else {
+                    Value::Text(arena[off as usize..(off + len) as usize].to_owned())
+                };
+                Ok(StepResult::Row(Row::new(vec![val])))
+            } else {
+                std::mem::take(arena);
+                std::mem::take(spans);
+                let cursors = std::mem::take(lease_cursors);
+                let r_insts = std::mem::take(read_instances);
+                let fin_res = inner.finish_activity(
+                    hid,
+                    ActivityFinish::ReadDone {
+                        lease_cursors: cursors,
+                        read_instances: r_insts,
+                    },
+                    shared,
+                );
+                if let Err(e) = fin_res {
+                    *lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(e.clone()),
+                    };
+                    return Err(e);
+                }
+                *lifecycle = StatementLifecycle::Halted { last_error: None };
+                Ok(StepResult::Done)
+            }
+        }
+
+        RunningExec::MaterializedNoLock { rows } => {
+            if let Some(vals) = rows.next() {
+                Ok(StepResult::Row(Row::new(vals)))
+            } else {
+                let _ = inner.finish_activity(hid, ActivityFinish::NoLock, shared);
+                inner.maybe_run_wal_autocheckpoint();
+                *lifecycle = StatementLifecycle::Halted { last_error: None };
+                Ok(StepResult::Done)
+            }
+        }
+
+        RunningExec::ReturningWrite {
+            rows,
+            abort_snapshot,
+        } => {
+            if let Err(e) = inner.check_any_interrupted() {
+                let snap = abort_snapshot.clone();
+                let final_err = inner.abort_write_statement(hid, &e, snap, shared);
+                *lifecycle = StatementLifecycle::Halted {
+                    last_error: Some(final_err.clone()),
+                };
+                return Err(final_err);
+            }
+
+            if let Some(vals) = rows.next() {
+                Ok(StepResult::Row(Row::new(vals)))
+            } else {
+                let snap = abort_snapshot.clone();
+                match inner.finish_activity(
+                    hid,
+                    ActivityFinish::WriteCompleted {
+                        abort_snapshot: snap,
+                    },
+                    shared,
+                ) {
+                    Ok(()) => {
+                        *lifecycle = StatementLifecycle::Halted { last_error: None };
+                        Ok(StepResult::Done)
+                    }
+                    Err(e) => {
+                        *lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        Err(e)
+                    }
+                }
+            }
+        }
+
+        RunningExec::IncrementalVacuum {
+            db_instance,
+            remaining,
+            abort_snapshot,
+        } => {
+            if let Err(e) = inner.check_any_interrupted() {
+                let snap = abort_snapshot.clone();
+                let final_err = inner.abort_write_statement(hid, &e, snap, shared);
+                *lifecycle = StatementLifecycle::Halted {
+                    last_error: Some(final_err.clone()),
+                };
+                return Err(final_err);
+            }
+
+            if *remaining == 0 {
+                let snap = abort_snapshot.clone();
+                return match inner.finish_activity(
+                    hid,
+                    ActivityFinish::WriteCompleted {
+                        abort_snapshot: snap,
+                    },
+                    shared,
+                ) {
+                    Ok(()) => {
+                        *lifecycle = StatementLifecycle::Halted { last_error: None };
+                        Ok(StepResult::Done)
+                    }
+                    Err(e) => {
+                        *lifecycle = StatementLifecycle::Halted {
+                            last_error: Some(e.clone()),
+                        };
+                        Err(e)
+                    }
+                };
+            }
+
+            *remaining -= 1;
+            let step_res = match inner
+                .db_set
+                .slot_by_instance_mut(*db_instance)
+                .and_then(|s| s.btree.as_mut())
+            {
+                Some(bt) => bt.incremental_vacuum_step(),
+                None => Ok(false),
+            };
+            match step_res {
+                Ok(true) => Ok(StepResult::Row(Row::new(Vec::new()))),
+                Ok(false) => {
+                    let snap = abort_snapshot.clone();
+                    match inner.finish_activity(
+                        hid,
+                        ActivityFinish::WriteCompleted {
+                            abort_snapshot: snap,
+                        },
+                        shared,
+                    ) {
+                        Ok(()) => {
+                            *lifecycle = StatementLifecycle::Halted { last_error: None };
+                            Ok(StepResult::Done)
+                        }
+                        Err(e) => {
+                            *lifecycle = StatementLifecycle::Halted {
+                                last_error: Some(e.clone()),
+                            };
+                            Err(e)
+                        }
+                    }
+                }
+                Err(err) => {
+                    let snap = abort_snapshot.clone();
+                    let final_err = inner.abort_write_statement(hid, &err, snap, shared);
+                    *lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(final_err.clone()),
+                    };
+                    Err(final_err)
+                }
+            }
+        }
+
+        RunningExec::PendingCommit {
+            release_savepoint,
+            last_busy,
+        } => {
+            let summary = inner.activity.summary_excluding(hid, &inner.db_set);
+            let rel_opt = release_savepoint.clone();
+            let mut expire_self_only = false;
+            let mut stmt_tx = StmtTxTracker::default();
+            let res = inner.with_exec_ctx(
+                shared,
+                summary,
+                &mut stmt_tx,
+                &mut expire_self_only,
+                |ctx| match rel_opt {
+                    Some(ref sp) => release_savepoint_op(ctx, sp),
+                    None => commit_transaction(ctx),
+                },
+            );
+
+            match res {
+                Ok(()) => {
+                    inner.activity.remove(hid);
+                    inner.maybe_run_wal_autocheckpoint();
+                    *lifecycle = StatementLifecycle::Halted { last_error: None };
+                    Ok(StepResult::Done)
+                }
+                Err(e) if e.code == ErrorCode::Busy && summary.other_writers == 0 => {
+                    *last_busy = e.clone();
+                    Err(e)
+                }
+                Err(e) => {
+                    inner.activity.remove(hid);
+                    *lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(e.clone()),
+                    };
+                    Err(e)
+                }
+            }
+        }
     }
 }
 
@@ -9672,16 +9738,9 @@ fn try_fast_read_plan_fields(
             if !inner.is_autocommit() {
                 inner.in_user_btree_tx = true;
             }
-            let read_instances = SmallInstVec::single(main_inst);
-            inner.activity.start_with_instances(
-                hid,
-                true,
-                false,
-                read_instances.clone(),
-                SmallInstVec::new(),
-            );
+            inner.activity.start_single_read(hid, main_inst);
             *lifecycle =
-                StatementLifecycle::Running(RunningExec::PointSelectRowYielded { read_instances });
+                StatementLifecycle::Running(RunningExec::PointSelectRowYielded { main_inst });
             Some(Ok(StepResult::Row(Row::new(vals))))
         }
         Ok(out_multi) => {
@@ -10086,6 +10145,70 @@ fn try_fast_compiled_main_write_fields(
         inner.publish(shared);
         *lifecycle = StatementLifecycle::Halted { last_error: None };
         return Some(Ok(StepResult::Done));
+    }
+
+    if is_autocommit
+        && inner.simulated_cleanup_io_error.is_none()
+        && inner.deferred_fk_suspects.is_empty()
+        && !inner.commit_hooks.has_commit_hook()
+        && inner.db_set.slot_count() == 2
+        && inner.db_set.slots()[1].btree.is_none()
+    {
+        let fast_commit: Result<()> = {
+            let bt = inner.db_set.slots_mut()[0].btree.as_mut().unwrap();
+            if bt.transaction_state() == TransactionState::Write {
+                inner
+                    .busy_policy
+                    .retry_btree(bt, Btree::acquire_exclusive_lock)
+                    .and_then(|()| bt.commit_phase_one(None))
+                    .and_then(|()| bt.commit_phase_two(false, false))
+            } else {
+                bt.commit_phase_two(false, false)
+            }
+        };
+        if let Ok(()) = fast_commit {
+            inner.schema_changed_in_tx = false;
+            inner.publish(shared);
+            inner.maybe_run_wal_autocheckpoint();
+            *lifecycle = StatementLifecycle::Halted { last_error: None };
+            return Some(Ok(StepResult::Done));
+        } else if let Err(cm_err) = fast_commit {
+            let mut expire_self_unused = false;
+            let mut stmt_tx_unused = StmtTxTracker::default();
+            let rb_res = inner.with_exec_ctx(
+                shared,
+                ActivitySummary::default(),
+                &mut stmt_tx_unused,
+                &mut expire_self_unused,
+                |ctx| rollback_all_databases(ctx, false),
+            );
+            if let Err(rb_err) = rb_res {
+                let root_err = if cm_err.code == ErrorCode::Busy {
+                    rb_err
+                } else {
+                    cm_err
+                };
+                inner.deferred_fk_suspects.clear();
+                inner.schema_changed_in_tx = false;
+                inner.publish(shared);
+                let p_err = inner.poison_with(root_err);
+                *lifecycle = StatementLifecycle::Halted {
+                    last_error: Some(p_err.clone()),
+                };
+                return Some(Err(p_err));
+            }
+            inner.runtime.last_changes = 0;
+            inner.runtime.total_changes = rt_before.total_changes;
+            inner.runtime.last_insert_rowid = rt_before.last_insert_rowid;
+            inner.mutation_pipeline.truncate(mutation_len_before);
+            inner.deferred_fk_suspects.clear();
+            inner.schema_changed_in_tx = false;
+            inner.publish(shared);
+            *lifecycle = StatementLifecycle::Halted {
+                last_error: Some(cm_err.clone()),
+            };
+            return Some(Err(cm_err));
+        }
     }
 
     let snap = WriteAbortSnapshot {
@@ -10657,5 +10780,330 @@ mod tests {
                 .get_i64(0),
             Some(3)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_pragma_mmap_size_lifecycle_grow_vacuum_truncate_and_active_lease() {
+        // `:memory:` and `temp` return 0 rows with `mmap_size` column, matching SQLite 3.54.1.
+        let mem_conn = Connection::open_in_memory().unwrap();
+        let mem_q = mem_conn.query("PRAGMA mmap_size;", &[]).unwrap();
+        assert_eq!(mem_q.column_names, vec!["mmap_size".to_owned()]);
+        assert!(mem_q.rows.is_empty());
+        let mem_set = mem_conn.query("PRAGMA mmap_size = 65536;", &[]).unwrap();
+        assert_eq!(mem_set.column_names, vec!["mmap_size".to_owned()]);
+        assert!(mem_set.rows.is_empty());
+
+        let dir = std::env::temp_dir().join(format!(
+            "sqliters_mmap_lifecycle_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("main.db");
+        let aux_path = dir.join("aux.db");
+
+        let conn = Connection::open(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA mmap_size;", &[])
+                .unwrap()
+                .unwrap()
+                .get_i64(0),
+            Some(0)
+        );
+        // Set unqualified `mmap_size`: applies to `main` and is inherited by future `ATTACH`.
+        assert_eq!(
+            conn.query_row("PRAGMA mmap_size = 262144;", &[])
+                .unwrap()
+                .unwrap()
+                .get_i64(0),
+            Some(262_144)
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA mmap_size = 9999999999999;", &[])
+                .unwrap()
+                .unwrap()
+                .get_i64(0),
+            Some(sqliters_vfs::MAX_MMAP_SIZE as i64)
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA mmap_size = 524288;", &[])
+                .unwrap()
+                .unwrap()
+                .get_i64(0),
+            Some(524_288)
+        );
+
+        // Grow file across many pages, close & reopen cold with `mmap_size` active to exercise
+        // zero-copy mapped clean page reads + `VACUUM` shrink/truncate safety.
+        conn.execute(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE items(id INTEGER PRIMARY KEY, payload BLOB);
+             WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 200)
+             INSERT INTO items SELECT x, zeroblob(1500) FROM seq;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+        conn.execute(&format!("ATTACH '{}' AS aux1;", aux_path.display()))
+            .unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA aux1.mmap_size;", &[])
+                .unwrap()
+                .unwrap()
+                .get_i64(0),
+            Some(524_288)
+        );
+        // `temp` returns 0 rows.
+        conn.execute("CREATE TEMP TABLE t_tmp(v INT);").unwrap();
+        assert!(
+            conn.query("PRAGMA temp.mmap_size;", &[])
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        conn.try_close().unwrap();
+
+        let reader = Connection::open(&db_path).unwrap();
+        reader.execute("PRAGMA mmap_size = 67108864;").unwrap();
+        assert_eq!(
+            reader
+                .query_row("SELECT count(*), sum(length(payload)) FROM items;", &[])
+                .unwrap()
+                .unwrap()
+                .get_i64(1),
+            Some(300_000)
+        );
+
+        // Active read lease while `mmap_size > 0` preserves current limit (`mmap3-1.4`).
+        let mut stmt = reader
+            .prepare("SELECT id FROM items WHERE id BETWEEN 10 AND 15 ORDER BY id;")
+            .unwrap();
+        assert!(matches!(stmt.step().unwrap(), StepResult::Row(_)));
+        assert_eq!(
+            reader
+                .query_row("PRAGMA mmap_size = 0;", &[])
+                .unwrap()
+                .unwrap()
+                .get_i64(0),
+            Some(67_108_864)
+        );
+        stmt.reset().unwrap();
+        drop(stmt);
+
+        // Once lease ends, `PRAGMA mmap_size = -1` resets to default `0`, and while `0` an active
+        // lease DOES allow raising `mmap_size` (`mmap3-1.8`).
+        assert_eq!(
+            reader
+                .query_row("PRAGMA mmap_size = -1;", &[])
+                .unwrap()
+                .unwrap()
+                .get_i64(0),
+            Some(0)
+        );
+        let mut stmt2 = reader
+            .prepare("SELECT id FROM items WHERE id BETWEEN 10 AND 15 ORDER BY id;")
+            .unwrap();
+        assert!(matches!(stmt2.step().unwrap(), StepResult::Row(_)));
+        assert_eq!(
+            reader
+                .query_row("PRAGMA mmap_size = 131072;", &[])
+                .unwrap()
+                .unwrap()
+                .get_i64(0),
+            Some(131_072)
+        );
+        stmt2.reset().unwrap();
+        drop(stmt2);
+
+        // Shrink via DELETE + VACUUM while `mmap_size > 0` must unmap cleanly before truncate.
+        reader
+            .execute("DELETE FROM items WHERE id > 5; VACUUM;")
+            .unwrap();
+        assert_eq!(
+            reader
+                .query_row("SELECT count(*) FROM items;", &[])
+                .unwrap()
+                .unwrap()
+                .get_i64(0),
+            Some(5)
+        );
+        reader.try_close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_session_gate_state_reentrancy_busy_and_concurrent_drop_drain() {
+        let conn = Arc::new(Connection::open_in_memory().unwrap());
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER); INSERT INTO t VALUES (1, 10), (2, 20);")
+            .unwrap();
+
+        let reentrant_stmt = Arc::new(Mutex::new(Some(
+            conn.prepare("SELECT v FROM t WHERE id = ?1;").unwrap(),
+        )));
+        let cross_thread_stmt = Arc::new(Mutex::new(Some(
+            conn.prepare("SELECT v FROM t WHERE id = 2;").unwrap(),
+        )));
+        // Advance `cross_thread_stmt` to `Running` (`PointSelectRowYielded`) before entering callback
+        // so dropping it on another thread exercises active-lease cleanup via `GATE_PENDING_DROPS`.
+        assert!(matches!(
+            cross_thread_stmt
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .step()
+                .unwrap(),
+            StepResult::Row(_)
+        ));
+
+        let conn_for_cb = Arc::clone(&conn);
+        let reent_for_cb = Arc::clone(&reentrant_stmt);
+        let cross_for_cb = Arc::clone(&cross_thread_stmt);
+
+        conn.register_scalar_function("gate_probe", 0, FunctionFlags::INNOCUOUS, move |_| {
+            // 1. Same-thread re-entrant `execute` and `bind` MUST return `ErrorCode::Misuse`
+            // (never bypassing via `can_fast_bind` while `GATE_BUSY` is held).
+            let err_exec = conn_for_cb.execute("SELECT 1;").unwrap_err();
+            assert_eq!(err_exec.code, ErrorCode::Misuse);
+            {
+                let mut g = reent_for_cb.lock().unwrap();
+                let s = g.as_mut().unwrap();
+                assert_eq!(s.bind(1, 1_i64).unwrap_err().code, ErrorCode::Misuse);
+            }
+
+            // 2. Cross-thread contention MUST return `ErrorCode::Busy`, and dropping a `Running`
+            // `Statement` from another thread while `GATE_BUSY` is held MUST queue onto
+            // `GATE_PENDING_DROPS` and drain cleanly on outer session exit.
+            let conn_bg = Arc::clone(&conn_for_cb);
+            let stmt_to_drop = cross_for_cb.lock().unwrap().take().unwrap();
+            std::thread::spawn(move || {
+                let busy_err = conn_bg.prepare("SELECT 1;").unwrap_err();
+                assert_eq!(busy_err.code, ErrorCode::Busy);
+                drop(stmt_to_drop);
+            })
+            .join()
+            .unwrap();
+
+            Ok(RuntimeValue::plain(Value::Integer(42)))
+        })
+        .unwrap();
+
+        let probe_val = conn
+            .query_row("SELECT gate_probe();", &[])
+            .unwrap()
+            .unwrap()
+            .get_i64(0);
+        assert_eq!(probe_val, Some(42));
+
+        // Drop the remaining prepared statement and verify `try_close()` succeeds cleanly
+        // (proving `cross_thread_stmt` was drained from `pending_drops` on session exit!).
+        drop(reentrant_stmt.lock().unwrap().take());
+        drop(reentrant_stmt);
+        drop(cross_thread_stmt);
+        // Clear registered closure holding `Arc<Connection>` so `Arc::try_unwrap` succeeds.
+        conn.register_scalar_function("gate_probe", 0, FunctionFlags::INNOCUOUS, |_| {
+            Ok(RuntimeValue::plain(Value::Integer(0)))
+        })
+        .unwrap();
+        let owned = Arc::try_unwrap(conn).expect("unique Connection owner");
+        owned.try_close().unwrap();
+    }
+
+    #[test]
+    fn test_single_copy_memdb_and_lazy_builtin_registries() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        // 1. Verify lazy `module_list` and `function_list` parity before any VTab/ext calls.
+        let mods = conn.query("PRAGMA module_list;", &[]).unwrap();
+        let mod_names: Vec<String> = mods
+            .rows
+            .iter()
+            .map(|r| r.get_str(0).unwrap().to_owned())
+            .collect();
+        assert!(mod_names.contains(&"fts5".to_owned()));
+        assert!(mod_names.contains(&"rtree".to_owned()));
+        assert!(mod_names.contains(&"generate_series".to_owned()));
+
+        let fns = conn
+            .query("SELECT name, builtin FROM pragma_function_list WHERE name IN ('bm25','rtreedepth','fts5_source_id') ORDER BY name;", &[])
+            .unwrap();
+        assert_eq!(fns.rows.len(), 3);
+
+        // 2. Exercise single-copy `:memory:` commit, rollback, `journal_mode=OFF` rollback,
+        // and FTS5 `bm25()` / `highlight()` lazy auxiliary binding.
+        conn.execute_batch(
+            "CREATE TABLE kv(id INTEGER PRIMARY KEY, body TEXT);
+             INSERT INTO kv VALUES (1, 'alpha'), (2, 'beta');
+             BEGIN;
+             INSERT INTO kv VALUES (3, 'gamma');
+             ROLLBACK;
+             PRAGMA journal_mode = OFF;
+             BEGIN;
+             INSERT INTO kv VALUES (4, 'delta');
+             ROLLBACK;
+             PRAGMA journal_mode = MEMORY;
+             CREATE VIRTUAL TABLE docs USING fts5(title);
+             INSERT INTO docs VALUES ('zero copy mmap window'), ('scatter gather pwritev');",
+        )
+        .unwrap();
+
+        let cnt = conn
+            .query_row("SELECT COUNT(*), SUM(id) FROM kv;", &[])
+            .unwrap()
+            .unwrap();
+        // Row 3 rolled back under MEMORY journal; row 4 retained under journal_mode=OFF on MEMDB.
+        assert_eq!(cnt.get_i64(0), Some(3));
+        assert_eq!(cnt.get_i64(1), Some(7));
+
+        let hl = conn
+            .query_row(
+                "SELECT highlight(docs, 0, '[', ']') FROM docs WHERE docs MATCH 'pwritev' ORDER BY bm25(docs);",
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(hl.get_str(0), Some("scatter gather [pwritev]"));
+
+        // 3. Cross-page-size `Backup` (`1024 -> 4096`) into `:memory:` destination.
+        let src = Connection::open_in_memory().unwrap();
+        src.execute_batch(
+            "PRAGMA page_size = 1024;
+             CREATE TABLE s(k INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO s VALUES (10, 'ten'), (20, 'twenty');",
+        )
+        .unwrap();
+        let dst = Connection::open_in_memory().unwrap();
+        dst.execute_batch("CREATE TABLE dummy(x);").unwrap();
+        {
+            let mut backup = Backup::init(&src, "main", &dst, "main").unwrap();
+            assert_eq!(backup.step(-1).unwrap(), BackupStepResult::Done);
+            backup.finish().unwrap();
+        }
+        let ps_after = dst
+            .query_row("PRAGMA page_size;", &[])
+            .unwrap()
+            .unwrap()
+            .get_i64(0);
+        let sum_after = dst
+            .query_row("SELECT SUM(k) FROM s;", &[])
+            .unwrap()
+            .unwrap()
+            .get_i64(0);
+        assert_eq!(ps_after, Some(1024));
+        assert_eq!(sum_after, Some(30));
+
+        // 4. Unregistering / overriding lazy built-in extension scalar works identically.
+        assert!(
+            conn.unregister_scalar_function("fts5_source_id", 0)
+                .unwrap()
+        );
+        assert!(conn.prepare("SELECT fts5_source_id();").is_err());
+
+        conn.try_close().unwrap();
+        src.try_close().unwrap();
+        dst.try_close().unwrap();
     }
 }

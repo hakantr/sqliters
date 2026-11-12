@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::io::IoSlice;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,9 +12,9 @@ use sqliters_types::{
     extended,
 };
 use sqliters_vfs::{
-    CheckpointMode, IOCAP_POWERSAFE_OVERWRITE, IOCAP_SEQUENTIAL, OpenFlags, OwnedWalReadGuard,
-    OwnedWriterTxnGuard, READMARK_NOT_USED, ReadonlyHeaderProbe, ShmDmsState, ShmOpenOptions,
-    SyncFlags, Vfs, VfsFile, WAL_NREADER, WALINDEX_MAX_VERSION, WalChecksumEndian,
+    CheckpointMode, FastBeginReadOutcome, IOCAP_POWERSAFE_OVERWRITE, IOCAP_SEQUENTIAL, OpenFlags,
+    OwnedWalReadGuard, OwnedWriterTxnGuard, READMARK_NOT_USED, ReadonlyHeaderProbe, ShmDmsState,
+    ShmOpenOptions, SyncFlags, Vfs, VfsFile, WAL_NREADER, WALINDEX_MAX_VERSION, WalChecksumEndian,
     WalCkptInfoSnapshot, WalIndexHeaderData, WalShm, wal_checksum_with_endian, wal_frame_page,
 };
 
@@ -441,6 +442,9 @@ pub struct Wal {
     write_lock: bool,
     i_re_cksum: u32,
     i_callback: u32,
+    write_hdr_scratch: Vec<[u8; WAL_FRAME_HDRSIZE]>,
+    appended_pgnos_scratch: Vec<Pgno>,
+    pending_append_pairs: Vec<(usize, usize)>,
 }
 
 impl std::fmt::Debug for Wal {
@@ -550,6 +554,9 @@ impl Wal {
             write_lock: false,
             i_re_cksum: 0,
             i_callback: 0,
+            write_hdr_scratch: Vec::new(),
+            appended_pgnos_scratch: Vec::new(),
+            pending_append_pairs: Vec::new(),
         })
     }
 
@@ -764,6 +771,43 @@ impl Wal {
                 self.min_frame = self.heap_index.ckpt.n_backfill + 1;
             }
             return Ok(TryBeginOutcome::Ok);
+        }
+
+        // Fast steady-state path (`!use_wal`, reliable `-shm` attached, no active lock):
+        // combines raw 12-word header comparison, `WalCkptInfo` read, `WAL_READ_LOCK(slot)`,
+        // and single-barrier post-lock verification without redundant locks or checksums.
+        if !use_wal
+            && !self.b_shm_unreliable
+            && matches!(self.active_lock, ActiveShmLock::None)
+            && let Some(ref shm_arc) = self.shm
+        {
+            let known_hdr = self.hdr_valid.then_some(&self.hdr);
+            let exclusive_db = self.exclusive_mode == WalExclusiveMode::Exclusive;
+            match WalShm::try_fast_begin_read_snapshot(shm_arc, known_hdr, exclusive_db)? {
+                FastBeginReadOutcome::Acquired {
+                    guard,
+                    slot,
+                    min_frame,
+                    live_hdr,
+                } => {
+                    if let Some(loaded) = live_hdr {
+                        self.apply_loaded_header(loaded);
+                        *changed = true;
+                    }
+                    self.read_lock = Some(slot);
+                    self.min_frame = min_frame;
+                    self.active_lock = ActiveShmLock::Reader(guard);
+                    return Ok(TryBeginOutcome::Ok);
+                }
+                FastBeginReadOutcome::Retry { live_hdr } => {
+                    if let Some(loaded) = live_hdr {
+                        self.apply_loaded_header(loaded);
+                        *changed = true;
+                    }
+                    return Ok(TryBeginOutcome::Retry);
+                }
+                FastBeginReadOutcome::FallbackSlowPath => {}
+            }
         }
 
         // Step A.1: `!use_wal` reads/recovers `WalIndexHdr` (or validates `b_shm_unreliable`).
@@ -1481,6 +1525,7 @@ impl Wal {
 
         // Write 32-byte WAL file header when starting at frame 0 (`wal.c:4173-4211`).
         let mut i_frame = self.hdr.mx_frame;
+        let mut pending_file_hdr: Option<[u8; WAL_HDRSIZE]> = None;
         if i_frame == 0 {
             if self.n_ckpt == 0 {
                 let mut salt_bytes = [0u8; 8];
@@ -1507,7 +1552,6 @@ impl Wal {
             let wal_fd = self.wal_file.as_ref().ok_or_else(|| {
                 SqliteError::new(ErrorCode::CantOpen, "missing writable -wal handle")
             })?;
-            wal_fd.write_at(&hdr_bytes, 0)?;
 
             self.sz_page = page_size;
             self.hdr.page_size = page_size;
@@ -1519,7 +1563,10 @@ impl Wal {
             if self.sync_header
                 && let Some(c_sync) = ckpt_sync_flags
             {
+                wal_fd.write_at(&hdr_bytes, 0)?;
                 wal_fd.sync(c_sync)?;
+            } else {
+                pending_file_hdr = Some(hdr_bytes);
             }
         }
 
@@ -1538,8 +1585,57 @@ impl Wal {
         }
         let sz_frame = (WAL_FRAME_HDRSIZE as u64) + u64::from(page_size);
         let mut i_offset = wal_frame_offset(i_frame + 1, page_size);
-        let mut appended_pgnos: Vec<Pgno> = Vec::with_capacity(frames.len());
+        let mut run_start_offset = if pending_file_hdr.is_some() {
+            0
+        } else {
+            i_offset
+        };
         let mut last_idx: Option<usize> = None;
+
+        self.write_hdr_scratch.clear();
+        if self.write_hdr_scratch.capacity() < frames.len() {
+            self.write_hdr_scratch
+                .reserve(frames.len() - self.write_hdr_scratch.capacity());
+        }
+        self.appended_pgnos_scratch.clear();
+        if self.appended_pgnos_scratch.capacity() < frames.len() + 2 {
+            self.appended_pgnos_scratch
+                .reserve(frames.len() + 2 - self.appended_pgnos_scratch.capacity());
+        }
+        self.pending_append_pairs.clear();
+        if self.pending_append_pairs.capacity() < frames.len() {
+            self.pending_append_pairs
+                .reserve(frames.len() - self.pending_append_pairs.capacity());
+        }
+
+        let flush_append_run = |wal_fd: &dyn VfsFile,
+                                pending_hdr: &mut Option<[u8; WAL_HDRSIZE]>,
+                                hdr_scratch: &[[u8; WAL_FRAME_HDRSIZE]],
+                                pairs: &mut Vec<(usize, usize)>,
+                                start_off: u64|
+         -> Result<()> {
+            if pending_hdr.is_none() && pairs.is_empty() {
+                return Ok(());
+            }
+            if pairs.is_empty() {
+                let hb = pending_hdr.take().unwrap();
+                return wal_fd.write_at(&hb, 0);
+            }
+            let hdr_ref = pending_hdr.as_ref();
+            let mut iovs: Vec<IoSlice<'_>> =
+                Vec::with_capacity(usize::from(hdr_ref.is_some()) + pairs.len() * 2);
+            if let Some(hb) = hdr_ref {
+                iovs.push(IoSlice::new(hb));
+            }
+            for &(h_idx, f_idx) in pairs.iter() {
+                iovs.push(IoSlice::new(&hdr_scratch[h_idx]));
+                iovs.push(IoSlice::new(frames[f_idx].data));
+            }
+            wal_fd.write_vectored_at(&iovs, start_off)?;
+            *pending_hdr = None;
+            pairs.clear();
+            Ok(())
+        };
 
         for (idx, frame) in frames.iter().enumerate() {
             if frame.data.len() != page_size as usize {
@@ -1555,6 +1651,17 @@ impl Wal {
                 && let Some(i_write) = self.find_frame(frame.pgno)?
                 && i_write >= i_first
             {
+                {
+                    let wal_fd = self.wal_file.as_ref().expect("checked Some");
+                    flush_append_run(
+                        wal_fd.as_ref(),
+                        &mut pending_file_hdr,
+                        &self.write_hdr_scratch,
+                        &mut self.pending_append_pairs,
+                        run_start_offset,
+                    )?;
+                }
+                run_start_offset = i_offset;
                 let data_off = wal_frame_offset(i_write, page_size) + (WAL_FRAME_HDRSIZE as u64);
                 if self.i_re_cksum == 0 || i_write < self.i_re_cksum {
                     self.i_re_cksum = i_write;
@@ -1576,13 +1683,24 @@ impl Wal {
                 self.hdr.frame_cksum,
                 frame.data,
             )?;
-            let wal_fd = self.wal_file.as_ref().expect("checked Some");
-            wal_fd.write_at(&fhdr, i_offset)?;
-            wal_fd.write_at(frame.data, i_offset + (WAL_FRAME_HDRSIZE as u64))?;
+            let hdr_idx = self.write_hdr_scratch.len();
+            self.write_hdr_scratch.push(fhdr);
+            self.pending_append_pairs.push((hdr_idx, idx));
             self.hdr.frame_cksum = next_cksum;
             i_offset += sz_frame;
-            appended_pgnos.push(frame.pgno);
+            self.appended_pgnos_scratch.push(frame.pgno);
             last_idx = Some(idx);
+        }
+
+        {
+            let wal_fd = self.wal_file.as_ref().expect("checked Some");
+            flush_append_run(
+                wal_fd.as_ref(),
+                &mut pending_file_hdr,
+                &self.write_hdr_scratch,
+                &mut self.pending_append_pairs,
+                run_start_offset,
+            )?;
         }
 
         // Recompute checksum chain if any earlier uncommitted frame was overwritten (`wal.c:4262-4265`).
@@ -1611,20 +1729,25 @@ impl Wal {
                             self.hdr.frame_cksum,
                             last_frame.data,
                         )?;
-                        Self::write_with_sync_point(
-                            wal_fd.as_ref(),
-                            &fhdr,
-                            i_offset,
-                            i_sync_point,
-                            w_sync,
-                        )?;
-                        Self::write_with_sync_point(
-                            wal_fd.as_ref(),
-                            last_frame.data,
-                            i_offset + (WAL_FRAME_HDRSIZE as u64),
-                            i_sync_point,
-                            w_sync,
-                        )?;
+                        if i_offset + sz_frame < i_sync_point {
+                            let pad_iovs = [IoSlice::new(&fhdr), IoSlice::new(last_frame.data)];
+                            wal_fd.write_vectored_at(&pad_iovs, i_offset)?;
+                        } else {
+                            Self::write_with_sync_point(
+                                wal_fd.as_ref(),
+                                &fhdr,
+                                i_offset,
+                                i_sync_point,
+                                w_sync,
+                            )?;
+                            Self::write_with_sync_point(
+                                wal_fd.as_ref(),
+                                last_frame.data,
+                                i_offset + (WAL_FRAME_HDRSIZE as u64),
+                                i_sync_point,
+                                w_sync,
+                            )?;
+                        }
                         self.hdr.frame_cksum = next_cksum;
                         i_offset += sz_frame;
                         n_extra += 1;
@@ -1648,17 +1771,22 @@ impl Wal {
         }
 
         // Append newly written frames (plus any sector-padding frames) into the WAL-index (`wal.c:4320-4331`).
-        let mut idx_frame = self.hdr.mx_frame;
-        for &pgno in &appended_pgnos {
-            idx_frame += 1;
-            self.record_index_frame(idx_frame, pgno)?;
-        }
-        if let Some(li) = last_idx {
+        if let Some(li) = last_idx
+            && n_extra > 0
+        {
             let last_pgno = frames[li].pgno;
             for _ in 0..n_extra {
-                idx_frame += 1;
-                self.record_index_frame(idx_frame, last_pgno)?;
+                self.appended_pgnos_scratch.push(last_pgno);
             }
+        }
+        let idx_frame = self
+            .hdr
+            .mx_frame
+            .checked_add(self.appended_pgnos_scratch.len() as u32)
+            .ok_or_else(|| SqliteError::misuse("WAL frame index overflow"))?;
+        if !self.appended_pgnos_scratch.is_empty() {
+            let first_new_frame = self.hdr.mx_frame + 1;
+            self.record_index_frames_batch(first_new_frame)?;
         }
 
         // Update local header and (if `is_commit`) publish `WalIndexHdr` (`wal.c:4334-4347`).
@@ -1771,14 +1899,20 @@ impl Wal {
         }
     }
 
-    fn record_index_frame(&mut self, frame_no: u32, pgno: Pgno) -> Result<()> {
+    fn record_index_frames_batch(&mut self, first_frame_no: u32) -> Result<()> {
         if self.exclusive_mode == WalExclusiveMode::HeapMemory {
-            return self.heap_index.record_frame(frame_no, pgno);
+            for (i, &pgno) in self.appended_pgnos_scratch.iter().enumerate() {
+                self.heap_index
+                    .record_frame(first_frame_no + (i as u32), pgno)?;
+            }
+            return Ok(());
         }
         match &mut self.active_lock {
-            ActiveShmLock::Writer(wg) => wg.record_frame(frame_no, pgno, frame_no - 1),
+            ActiveShmLock::Writer(wg) => {
+                wg.record_frames_batch(first_frame_no, &self.appended_pgnos_scratch)
+            }
             _ => Err(SqliteError::misuse(
-                "record_index_frame requires OwnedWriterTxnGuard",
+                "record_index_frames_batch requires OwnedWriterTxnGuard",
             )),
         }
     }
@@ -2483,27 +2617,41 @@ impl Wal {
 
         // Build deduplicated `(pgno, latest_frame)` list over `(start_backfill, mx_safe_frame]`
         // sorted in ascending `pgno` order (`walIteratorInit` / `walIteratorNext`, `wal.c:1833-2099`)!
-        let mut latest_by_pgno: HashMap<Pgno, u32> = HashMap::new();
-        for fno in (start_backfill + 1)..=mx_safe_frame {
-            let pgno = ckpt_guard.read_frame_pgno(fno)?;
-            if pgno > 0 && pgno <= n_page {
-                latest_by_pgno.insert(pgno, fno);
+        let ordered_pages: Vec<(Pgno, u32)> = if n_page <= 16_384 {
+            let mut dense = vec![0u32; (n_page as usize) + 1];
+            ckpt_guard.for_each_frame_pgno(
+                start_backfill + 1,
+                mx_safe_frame,
+                &mut |fno, pgno| {
+                    if pgno > 0 && pgno <= n_page {
+                        dense[pgno as usize] = fno;
+                    }
+                },
+            )?;
+            let mut out = Vec::with_capacity((mx_safe_frame - start_backfill).min(n_page) as usize);
+            for (idx, &fno) in dense.iter().enumerate().skip(1) {
+                if fno != 0 {
+                    out.push((idx as Pgno, fno));
+                }
             }
-        }
-        let mut ordered_pages: Vec<(Pgno, u32)> = latest_by_pgno.into_iter().collect();
-        ordered_pages.sort_unstable_by_key(|&(pgno, _)| pgno);
+            out
+        } else {
+            let mut latest_by_pgno: HashMap<Pgno, u32> = HashMap::new();
+            ckpt_guard.for_each_frame_pgno(
+                start_backfill + 1,
+                mx_safe_frame,
+                &mut |fno, pgno| {
+                    if pgno > 0 && pgno <= n_page {
+                        latest_by_pgno.insert(pgno, fno);
+                    }
+                },
+            )?;
+            let mut out: Vec<(Pgno, u32)> = latest_by_pgno.into_iter().collect();
+            out.sort_unstable_by_key(|&(pgno, _)| pgno);
+            out
+        };
 
-        let mut buf = vec![0u8; sz_page as usize];
-        for (pgno, fno) in ordered_pages {
-            if let Some(flag) = interrupt_flag
-                && flag.load(Ordering::SeqCst)
-            {
-                return Err(SqliteError::new(ErrorCode::Interrupt, "interrupted"));
-            }
-            self.read_frame(fno, &mut buf)?;
-            let db_off = u64::from(pgno - 1) * u64::from(sz_page);
-            db_file.write_at(&buf, db_off)?;
-        }
+        self.backfill_ordered_pages_coalesced(db_file, &ordered_pages, sz_page, interrupt_flag)?;
 
         // Full vs Partial backfill (`wal.c:2409-2421`):
         // ONLY when `mx_safe_frame == live_hdr.mx_frame` (full backfill) do we truncate & sync `.db`!
@@ -2521,6 +2669,50 @@ impl Wal {
         }
 
         ckpt_guard.set_backfill_completed(mx_safe_frame)?;
+        Ok(())
+    }
+
+    fn backfill_ordered_pages_coalesced(
+        &self,
+        db_file: &dyn VfsFile,
+        ordered_pages: &[(Pgno, u32)],
+        sz_page: u32,
+        interrupt_flag: Option<&AtomicBool>,
+    ) -> Result<()> {
+        if ordered_pages.is_empty() {
+            return Ok(());
+        }
+        let ps = sz_page as usize;
+        let max_run_pages = (65_536 / ps).max(1).min(ordered_pages.len());
+        let mut run_buf = vec![0u8; ps * max_run_pages];
+        let mut idx = 0usize;
+        while idx < ordered_pages.len() {
+            let (first_pgno, first_fno) = ordered_pages[idx];
+            if let Some(flag) = interrupt_flag
+                && flag.load(Ordering::SeqCst)
+            {
+                return Err(SqliteError::new(ErrorCode::Interrupt, "interrupted"));
+            }
+            self.read_frame(first_fno, &mut run_buf[..ps])?;
+            let mut run_pages = 1usize;
+            while run_pages < max_run_pages
+                && idx + run_pages < ordered_pages.len()
+                && ordered_pages[idx + run_pages].0 == first_pgno + (run_pages as u32)
+            {
+                if let Some(flag) = interrupt_flag
+                    && flag.load(Ordering::SeqCst)
+                {
+                    return Err(SqliteError::new(ErrorCode::Interrupt, "interrupted"));
+                }
+                let fno = ordered_pages[idx + run_pages].1;
+                let dst_start = run_pages * ps;
+                self.read_frame(fno, &mut run_buf[dst_start..dst_start + ps])?;
+                run_pages += 1;
+            }
+            let db_off = u64::from(first_pgno - 1) * u64::from(sz_page);
+            db_file.write_at(&run_buf[..run_pages * ps], db_off)?;
+            idx += run_pages;
+        }
         Ok(())
     }
 
@@ -2587,16 +2779,7 @@ impl Wal {
             let mut ordered: Vec<(Pgno, u32)> = latest_by_pgno.into_iter().collect();
             ordered.sort_unstable_by_key(|&(pgno, _)| pgno);
 
-            let mut buf = vec![0u8; sz_page as usize];
-            for (pgno, fno) in ordered {
-                if let Some(flag) = interrupt_flag
-                    && flag.load(Ordering::SeqCst)
-                {
-                    return Err(SqliteError::new(ErrorCode::Interrupt, "interrupted"));
-                }
-                self.read_frame(fno, &mut buf)?;
-                db_file.write_at(&buf, u64::from(pgno - 1) * u64::from(sz_page))?;
-            }
+            self.backfill_ordered_pages_coalesced(db_file, &ordered, sz_page, interrupt_flag)?;
 
             db_file.truncate(u64::from(n_page) * u64::from(sz_page))?;
             if let Some(sflags) = sync_flags {

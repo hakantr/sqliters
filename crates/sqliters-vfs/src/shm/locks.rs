@@ -695,6 +695,18 @@ impl<'a> CheckpointTxnGuard<'a> {
         self.shm.read_frame_pgno_internal(frame_no)
     }
 
+    /// Scans `(frame_no, pgno)` across `start_frame..=end_frame` in the WAL-index `aPgno` array,
+    /// reusing each 32 KiB region mapping for the entire block.
+    pub fn for_each_frame_pgno(
+        &self,
+        start_frame: u32,
+        end_frame: u32,
+        f: &mut dyn FnMut(u32, u32),
+    ) -> Result<()> {
+        self.shm
+            .for_each_frame_pgno_internal(start_frame, end_frame, f)
+    }
+
     /// Acquires `EXCLUSIVE WAL_READ_LOCK(1..=4)` for `Restart` or `Truncate` (`wal.c:2456`),
     /// rolling back any acquired subset if a slot fails or returns `Busy`.
     pub fn lock_all_positive_readers_with_busy(
@@ -1318,6 +1330,12 @@ impl OwnedWriterTxnGuard {
     ) -> Result<()> {
         self.shm
             .record_frame_internal(frame_no, pgno, committed_mx_frame)
+    }
+
+    /// Appends a contiguous slice of `pgnos` starting at `first_frame_no` into the WAL-index
+    /// `aPgno` + `aHash` tables (`walIndexAppend`), resolving each 32 KiB region once per block.
+    pub fn record_frames_batch(&mut self, first_frame_no: u32, pgnos: &[u32]) -> Result<()> {
+        self.shm.record_frames_batch_internal(first_frame_no, pgnos)
     }
 
     /// Removes hash-table slots and `aPgno` entries strictly above `max_frame` (`walCleanupHash`).
