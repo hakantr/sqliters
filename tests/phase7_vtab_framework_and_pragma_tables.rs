@@ -124,14 +124,17 @@ fn test_acyclic_workspace_crate_dependency_graph() {
             ext_deps.push(dep_name.trim().to_owned());
         }
     }
-    assert_eq!(
-        ext_deps,
-        vec!["sqliters-types".to_owned()],
-        "sqliters-ext must depend ONLY on sqliters-types"
+    assert!(
+        ext_deps.contains(&"sqliters-types".to_owned())
+            && ext_deps
+                .iter()
+                .all(|d| d == "sqliters-types" || d == "sqliters-simd"),
+        "sqliters-ext must depend ONLY on sqliters-types (and leaf sqliters-simd), got {ext_deps:?}"
     );
 
     // Also verify all workspace crates' Cargo.toml files form a strict DAG with zero external crates.
     let workspace_crates = [
+        ("sqliters-simd", "crates/sqliters-simd/Cargo.toml"),
         ("sqliters-types", "crates/sqliters-types/Cargo.toml"),
         ("sqliters-vfs", "crates/sqliters-vfs/Cargo.toml"),
         ("sqliters-pager", "crates/sqliters-pager/Cargo.toml"),

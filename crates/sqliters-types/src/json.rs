@@ -497,7 +497,7 @@ pub fn jsonb_validity_check(blob: &[u8], i: usize, i_end: usize, depth: usize) -
             if seen == 0 { i + 1 } else { 0 }
         }
         JSONB_TEXT => {
-            let mut j = payload_start;
+            let mut j = payload_start + sqliters_simd::scan_json_plain_ascii_string(payload);
             while j < payload_end {
                 if !is_json_plain_ok_byte(blob[j]) && blob[j] != b'\'' {
                     return j + 1;
@@ -766,14 +766,7 @@ impl<'a, 'b> TextParser<'a, 'b> {
         let delim = bytes[i];
         let mut j = i + 1;
         if delim == b'"' {
-            while j < bytes.len() {
-                let c = bytes[j];
-                if (0x20..0x80).contains(&c) && c != b'"' && c != b'\\' {
-                    j += 1;
-                } else {
-                    break;
-                }
-            }
+            j += sqliters_simd::scan_json_plain_ascii_string(&bytes[j..]);
             if j < bytes.len() && bytes[j] == b'"' {
                 jsonb_append_node(self.out, JSONB_TEXT, &bytes[i + 1..j]);
                 return Ok(j + 1);
@@ -1220,12 +1213,274 @@ fn is_json5_ident_char(ch: char, is_first: bool) -> bool {
     false
 }
 
+struct Stage1JsonParser<'a, 'b> {
+    bytes: &'a [u8],
+    out: &'b mut Vec<u8>,
+    win_base: usize,
+    win_end: usize,
+    masks: sqliters_simd::JsonStage1Masks,
+    depth: usize,
+}
+
+impl<'a, 'b> Stage1JsonParser<'a, 'b> {
+    #[inline(always)]
+    fn ensure_at(&mut self, i: usize) -> Option<usize> {
+        if i < self.win_end {
+            return Some(i - self.win_base);
+        }
+        let (base, end, masks) = sqliters_simd::classify_json_stage1_at(self.bytes, i)?;
+        self.win_base = base;
+        self.win_end = end;
+        self.masks = masks;
+        Some(i - base)
+    }
+
+    #[inline(always)]
+    fn skip_spaces(&mut self, mut i: usize) -> Option<usize> {
+        if i < self.win_end {
+            let rem = self.masks.non_space_mask >> (i - self.win_base);
+            if rem != 0 {
+                return Some(i + rem.trailing_zeros() as usize);
+            }
+            i = self.win_end;
+        }
+        while i < self.bytes.len() {
+            let (base, end, masks) = sqliters_simd::classify_json_stage1_at(self.bytes, i)?;
+            self.win_base = base;
+            self.win_end = end;
+            self.masks = masks;
+            let rem = masks.non_space_mask >> (i - base);
+            if rem != 0 {
+                return Some(i + rem.trailing_zeros() as usize);
+            }
+            i = end;
+        }
+        Some(i)
+    }
+
+    #[inline(always)]
+    fn parse_string(&mut self, i: usize) -> Option<usize> {
+        let start = i + 1;
+        let mut cur = start;
+        while cur < self.bytes.len() {
+            let rel = self.ensure_at(cur)?;
+            let rem_q = self.masks.quote_mask >> rel;
+            if rem_q != 0 {
+                let end_q = cur + rem_q.trailing_zeros() as usize;
+                jsonb_append_node(self.out, JSONB_TEXT, &self.bytes[start..end_q]);
+                return Some(end_q + 1);
+            }
+            cur = self.win_end;
+        }
+        None
+    }
+
+    #[inline(always)]
+    fn skip_digits(&mut self, mut cur: usize) -> Option<usize> {
+        while cur < self.bytes.len() {
+            let rel = self.ensure_at(cur)?;
+            let run = (self.masks.digit_mask >> rel).trailing_ones() as usize;
+            cur += run;
+            if cur < self.win_end || cur >= self.bytes.len() {
+                break;
+            }
+        }
+        Some(cur)
+    }
+
+    #[inline(always)]
+    fn parse_number(&mut self, i: usize) -> Option<usize> {
+        let b = self.bytes;
+        let p = if b[i] == b'-' { i + 1 } else { i };
+        let &first = b.get(p)?;
+        let mut j = if first == b'0' {
+            if b.get(p + 1).is_some_and(u8::is_ascii_digit) {
+                return None;
+            }
+            p + 1
+        } else if first.is_ascii_digit() {
+            self.skip_digits(p)?
+        } else {
+            return None;
+        };
+
+        let mut is_float = false;
+        if b.get(j) == Some(&b'.') {
+            if !b.get(j + 1).is_some_and(u8::is_ascii_digit) {
+                return None;
+            }
+            is_float = true;
+            j = self.skip_digits(j + 1)?;
+        }
+        if matches!(b.get(j), Some(b'e' | b'E')) {
+            is_float = true;
+            j += 1;
+            if matches!(b.get(j), Some(b'+' | b'-')) {
+                j += 1;
+            }
+            if !b.get(j).is_some_and(u8::is_ascii_digit) {
+                return None;
+            }
+            j = self.skip_digits(j)?;
+        }
+        if b.get(j)
+            .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_' || *c == b'.')
+        {
+            return None;
+        }
+        let etype = if is_float { JSONB_FLOAT } else { JSONB_INT };
+        jsonb_append_node(self.out, etype, &b[i..j]);
+        Some(j)
+    }
+
+    fn parse_value(&mut self, start: usize) -> Option<usize> {
+        let i = self.skip_spaces(start)?;
+        let &c = self.bytes.get(i)?;
+        match c {
+            b'{' => {
+                self.depth += 1;
+                if self.depth > JSON_MAX_DEPTH {
+                    return None;
+                }
+                let mut j = self.skip_spaces(i + 1)?;
+                if self.bytes.get(j) == Some(&b'}') {
+                    self.depth -= 1;
+                    jsonb_append_node(self.out, JSONB_OBJECT, &[]);
+                    return Some(j + 1);
+                }
+                let hdr_pos = self.out.len();
+                self.out.extend_from_slice(&[0, 0]);
+                loop {
+                    if self.bytes.get(j) != Some(&b'"') {
+                        return None;
+                    }
+                    j = self.parse_string(j)?;
+                    j = self.skip_spaces(j)?;
+                    if self.bytes.get(j) != Some(&b':') {
+                        return None;
+                    }
+                    j = self.parse_value(j + 1)?;
+                    j = self.skip_spaces(j)?;
+                    match self.bytes.get(j) {
+                        Some(&b',') => {
+                            j = self.skip_spaces(j + 1)?;
+                            if self.bytes.get(j) == Some(&b'}') {
+                                return None;
+                            }
+                        }
+                        Some(&b'}') => {
+                            self.depth -= 1;
+                            finish_container_in_place(self.out, hdr_pos, JSONB_OBJECT);
+                            return Some(j + 1);
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            b'[' => {
+                self.depth += 1;
+                if self.depth > JSON_MAX_DEPTH {
+                    return None;
+                }
+                let mut j = self.skip_spaces(i + 1)?;
+                if self.bytes.get(j) == Some(&b']') {
+                    self.depth -= 1;
+                    jsonb_append_node(self.out, JSONB_ARRAY, &[]);
+                    return Some(j + 1);
+                }
+                let hdr_pos = self.out.len();
+                self.out.extend_from_slice(&[0, 0]);
+                loop {
+                    j = self.parse_value(j)?;
+                    j = self.skip_spaces(j)?;
+                    match self.bytes.get(j) {
+                        Some(&b',') => {
+                            j = self.skip_spaces(j + 1)?;
+                            if self.bytes.get(j) == Some(&b']') {
+                                return None;
+                            }
+                        }
+                        Some(&b']') => {
+                            self.depth -= 1;
+                            finish_container_in_place(self.out, hdr_pos, JSONB_ARRAY);
+                            return Some(j + 1);
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            b'"' => self.parse_string(i),
+            b't' => {
+                if self.bytes[i..].starts_with(b"true")
+                    && !self.bytes.get(i + 4).is_some_and(u8::is_ascii_alphanumeric)
+                {
+                    jsonb_append_node(self.out, JSONB_TRUE, &[]);
+                    Some(i + 4)
+                } else {
+                    None
+                }
+            }
+            b'f' => {
+                if self.bytes[i..].starts_with(b"false")
+                    && !self.bytes.get(i + 5).is_some_and(u8::is_ascii_alphanumeric)
+                {
+                    jsonb_append_node(self.out, JSONB_FALSE, &[]);
+                    Some(i + 5)
+                } else {
+                    None
+                }
+            }
+            b'n' => {
+                if self.bytes[i..].starts_with(b"null")
+                    && !self.bytes.get(i + 4).is_some_and(u8::is_ascii_alphanumeric)
+                {
+                    jsonb_append_node(self.out, JSONB_NULL, &[]);
+                    Some(i + 4)
+                } else {
+                    None
+                }
+            }
+            b'-' | b'0'..=b'9' => self.parse_number(i),
+            _ => None,
+        }
+    }
+}
+
+#[inline]
+fn try_parse_json_stage1_simd(src: &str, out: &mut Vec<u8>) -> bool {
+    let bytes = src.as_bytes();
+    let Some((win_base, win_end, masks)) = sqliters_simd::classify_json_stage1_at(bytes, 0) else {
+        return false;
+    };
+    out.clear();
+    out.reserve(bytes.len().saturating_add(16));
+    let mut fast = Stage1JsonParser {
+        bytes,
+        out,
+        win_base,
+        win_end,
+        masks,
+        depth: 0,
+    };
+    if let Some(end) = fast.parse_value(0)
+        && let Some(tail) = fast.skip_spaces(end)
+        && tail == bytes.len()
+    {
+        return true;
+    }
+    out.clear();
+    false
+}
+
 /// Parses JSON or JSON5 text into `out` as canonical SQLite 3.54.1 JSONB bytes, returning
 /// `Ok(has_nonstd)` without allocating temporary container buffers.
 pub fn parse_json_text_to_jsonb_into(
     src: &str,
     out: &mut Vec<u8>,
 ) -> std::result::Result<bool, JsonTextParseError> {
+    if try_parse_json_stage1_simd(src, out) {
+        return Ok(false);
+    }
     let mut parser = TextParser::new(src, out);
     let end = parser.parse_value(0)?;
     let tail = parser.skip_ws_and_comments(end)?;
@@ -1365,7 +1620,18 @@ pub fn parse_func_arg_to_jsonb(val: &Value) -> Result<Option<Vec<u8>>> {
 /// Appends a raw UTF-8 string as a canonical double-quoted RFC-8259 JSON string literal.
 pub fn append_escaped_json_string(out: &mut String, s: &str) {
     out.push('"');
-    for ch in s.chars() {
+    let bytes = s.as_bytes();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let run = sqliters_simd::scan_json_plain_ascii_string(&bytes[pos..]);
+        if run > 0 {
+            out.push_str(&s[pos..pos + run]);
+            pos += run;
+            if pos >= bytes.len() {
+                break;
+            }
+        }
+        let ch = s[pos..].chars().next().expect("valid UTF-8 slice");
         match ch {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
@@ -1380,6 +1646,7 @@ pub fn append_escaped_json_string(out: &mut String, s: &str) {
             }
             c => out.push(c),
         }
+        pos += ch.len_utf8();
     }
     out.push('"');
 }
@@ -1743,9 +2010,14 @@ pub fn append_sql_arg_as_jsonb(out: &mut Vec<u8>, arg: &RuntimeValue) -> Result<
                     Err(_) => return Err(err_malformed()),
                 }
             } else {
-                let plain = s.bytes().all(|b| is_json_plain_ok_byte(b) || b == b'\'');
+                let sb = s.as_bytes();
+                let plain_len = sqliters_simd::scan_json_plain_ascii_string(sb);
+                let plain = plain_len == sb.len()
+                    || sb[plain_len..]
+                        .iter()
+                        .all(|&b| is_json_plain_ok_byte(b) || b == b'\'');
                 let etype = if plain { JSONB_TEXT } else { JSONB_TEXTRAW };
-                jsonb_append_node(out, etype, s.as_bytes());
+                jsonb_append_node(out, etype, sb);
             }
         }
         Value::Blob(b) => {

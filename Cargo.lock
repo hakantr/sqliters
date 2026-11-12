@@ -50,6 +50,7 @@ dependencies = [
 name = "sqliters-ext"
 version = "0.1.0"
 dependencies = [
+ "sqliters-simd",
  "sqliters-types",
 ]
 
@@ -60,6 +61,10 @@ dependencies = [
  "sqliters-types",
  "sqliters-vfs",
 ]
+
+[[package]]
+name = "sqliters-simd"
+version = "0.1.0"
 
 [[package]]
 name = "sqliters-syntax"
@@ -84,12 +89,16 @@ dependencies = [
 [[package]]
 name = "sqliters-types"
 version = "0.1.0"
+dependencies = [
+ "sqliters-simd",
+]
 
 [[package]]
 name = "sqliters-vdbe"
 version = "0.1.0"
 dependencies = [
  "sqliters-btree",
+ "sqliters-simd",
  "sqliters-types",
 ]
 
@@ -97,5 +106,6 @@ dependencies = [
 name = "sqliters-vfs"
 version = "0.1.0"
 dependencies = [
+ "sqliters-simd",
  "sqliters-types",
 ]

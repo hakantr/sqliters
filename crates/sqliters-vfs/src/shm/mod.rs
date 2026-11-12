@@ -120,19 +120,16 @@ pub fn wal_checksum_with_endian(
             "walChecksumBytes requires a non-empty multiple of 8 bytes",
         ));
     }
-    let [mut s1, mut s2] = initial.unwrap_or([0, 0]);
-    for pair in data.as_chunks::<8>().0 {
-        let b0 = [pair[0], pair[1], pair[2], pair[3]];
-        let b1 = [pair[4], pair[5], pair[6], pair[7]];
-        let (w0, w1) = match endian {
-            WalChecksumEndian::Native => (u32::from_ne_bytes(b0), u32::from_ne_bytes(b1)),
-            WalChecksumEndian::Big => (u32::from_be_bytes(b0), u32::from_be_bytes(b1)),
-            WalChecksumEndian::Little => (u32::from_le_bytes(b0), u32::from_le_bytes(b1)),
-        };
-        s1 = s1.wrapping_add(w0).wrapping_add(s2);
-        s2 = s2.wrapping_add(w1).wrapping_add(s1);
-    }
-    Ok([s1, s2])
+    let swap_bytes = match endian {
+        WalChecksumEndian::Native => false,
+        WalChecksumEndian::Big => cfg!(target_endian = "little"),
+        WalChecksumEndian::Little => cfg!(target_endian = "big"),
+    };
+    Ok(sqliters_simd::wal_checksum_simd(
+        data,
+        initial.unwrap_or([0, 0]),
+        swap_bytes,
+    ))
 }
 
 /// Returns the 0-based 32 KiB WAL-index region containing 1-based `frame_no`

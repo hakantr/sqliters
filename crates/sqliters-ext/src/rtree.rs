@@ -112,6 +112,12 @@ impl RTreeCell {
     fn union_in_place(&mut self, other: &Self, n_dim: usize, mode: RTreeCoordMode) {
         match mode {
             RTreeCoordMode::Float32 => {
+                if n_dim == 2 {
+                    let a4: &mut [u32; 4] = (&mut self.coords[..4]).try_into().unwrap();
+                    let b4: &[u32; 4] = (&other.coords[..4]).try_into().unwrap();
+                    sqliters_simd::rtree_2d_f32_union_in_place(a4, b4);
+                    return;
+                }
                 for d in 0..n_dim {
                     let i0 = d * 2;
                     let i1 = i0 + 1;
@@ -146,6 +152,11 @@ impl RTreeCell {
     fn contains(&self, other: &Self, n_dim: usize, mode: RTreeCoordMode) -> bool {
         match mode {
             RTreeCoordMode::Float32 => {
+                if n_dim == 2 {
+                    let a4: &[u32; 4] = (&self.coords[..4]).try_into().unwrap();
+                    let b4: &[u32; 4] = (&other.coords[..4]).try_into().unwrap();
+                    return sqliters_simd::rtree_2d_f32_contains(a4, b4);
+                }
                 for d in 0..n_dim {
                     let i0 = d * 2;
                     let i1 = i0 + 1;
@@ -680,6 +691,18 @@ impl RTreeTable {
         let mut cells = Vec::with_capacity(n_cell);
         let bpc = self.bytes_per_cell;
         let nd2 = self.n_dim2;
+        if nd2 == 4 {
+            for i in 0..n_cell {
+                let base = 4 + i * bpc;
+                let id = read_i64_be(&data[base..base + 8]);
+                let raw16: &[u8; 16] = (&data[base + 8..base + 24]).try_into().unwrap();
+                let c4 = sqliters_simd::rtree_bswap_u32x4(raw16);
+                let mut coords = [0u32; RTREE_MAX_COORDS];
+                coords[..4].copy_from_slice(&c4);
+                cells.push(RTreeCell { id, coords });
+            }
+            return cells;
+        }
         for i in 0..n_cell {
             let base = 4 + i * bpc;
             let id = read_i64_be(&data[base..base + 8]);
@@ -704,6 +727,16 @@ impl RTreeTable {
         buf[2..4].copy_from_slice(&(cells.len() as u16).to_be_bytes());
         let bpc = self.bytes_per_cell;
         let nd2 = self.n_dim2;
+        if nd2 == 4 {
+            for (i, cell) in cells.iter().enumerate() {
+                let base = 4 + i * bpc;
+                buf[base..base + 8].copy_from_slice(&cell.id.to_be_bytes());
+                let c4: &[u32; 4] = (&cell.coords[..4]).try_into().unwrap();
+                let dst16: &mut [u8; 16] = (&mut buf[base + 8..base + 24]).try_into().unwrap();
+                sqliters_simd::rtree_encode_u32x4_be(c4, dst16);
+            }
+            return buf;
+        }
         for (i, cell) in cells.iter().enumerate() {
             let base = 4 + i * bpc;
             buf[base..base + 8].copy_from_slice(&cell.id.to_be_bytes());
@@ -1321,18 +1354,35 @@ impl RTreeTable {
                 }
                 if !found_containing {
                     let mut min_growth = 0.0_f64;
-                    for (idx, c) in cells.iter().enumerate() {
-                        let area = c.area(n_dim, mode);
-                        let mut u = *c;
-                        u.union_in_place(cell, n_dim, mode);
-                        let growth = u.area(n_dim, mode) - area;
-                        if idx == 0
-                            || growth < min_growth
-                            || (growth == min_growth && area < min_area)
-                        {
-                            min_growth = growth;
-                            min_area = area;
-                            best_id = c.id;
+                    if n_dim == 2 && mode == RTreeCoordMode::Float32 {
+                        let t4: &[u32; 4] = (&cell.coords[..4]).try_into().unwrap();
+                        for (idx, c) in cells.iter().enumerate() {
+                            let c4: &[u32; 4] = (&c.coords[..4]).try_into().unwrap();
+                            let (area, growth) =
+                                sqliters_simd::rtree_2d_f32_area_and_growth(c4, t4);
+                            if idx == 0
+                                || growth < min_growth
+                                || (growth == min_growth && area < min_area)
+                            {
+                                min_growth = growth;
+                                min_area = area;
+                                best_id = c.id;
+                            }
+                        }
+                    } else {
+                        for (idx, c) in cells.iter().enumerate() {
+                            let area = c.area(n_dim, mode);
+                            let mut u = *c;
+                            u.union_in_place(cell, n_dim, mode);
+                            let growth = u.area(n_dim, mode) - area;
+                            if idx == 0
+                                || growth < min_growth
+                                || (growth == min_growth && area < min_area)
+                            {
+                                min_growth = growth;
+                                min_area = area;
+                                best_id = c.id;
+                            }
                         }
                     }
                 }
@@ -1400,9 +1450,18 @@ impl RTreeTable {
                         left_box.union_in_place(&all_cells[idxs[n_left - 1]], n_dim, mode);
                     }
                     let right_box = &suffix_boxes[n_left];
-                    margin_sum += left_box.margin(n_dim, mode) + right_box.margin(n_dim, mode);
-                    let overlap = left_box.overlap(right_box, n_dim, mode);
-                    let area = left_box.area(n_dim, mode) + right_box.area(n_dim, mode);
+                    let (m_pair, overlap, area) = if n_dim == 2 && mode == RTreeCoordMode::Float32 {
+                        let l4: &[u32; 4] = (&left_box.coords[..4]).try_into().unwrap();
+                        let r4: &[u32; 4] = (&right_box.coords[..4]).try_into().unwrap();
+                        sqliters_simd::rtree_2d_f32_split_metrics(l4, r4)
+                    } else {
+                        (
+                            left_box.margin(n_dim, mode) + right_box.margin(n_dim, mode),
+                            left_box.overlap(right_box, n_dim, mode),
+                            left_box.area(n_dim, mode) + right_box.area(n_dim, mode),
+                        )
+                    };
+                    margin_sum += m_pair;
                     if n_left == min_c
                         || overlap < dim_best_overlap
                         || (overlap == dim_best_overlap && area < dim_best_area)
@@ -2307,18 +2366,12 @@ impl RTreeCursor {
         }
         visited.push(node_id);
         table.load_node_into_cache(cache, ctx, node_id)?;
+        let q_bounds = [q.q_min_x, q.q_max_x, q.q_min_y, q.q_max_y];
         if level == 0 {
             if let Some(Some(node)) = cache.nodes.get(&node_id) {
                 for cell in &node.cells {
-                    let min_x = f64::from(f32::from_bits(cell.coords[0]));
-                    let max_x = f64::from(f32::from_bits(cell.coords[1]));
-                    let min_y = f64::from(f32::from_bits(cell.coords[2]));
-                    let max_y = f64::from(f32::from_bits(cell.coords[3]));
-                    if max_x >= q.q_min_x
-                        && min_x <= q.q_max_x
-                        && max_y >= q.q_min_y
-                        && min_y <= q.q_max_y
-                    {
+                    let c4: &[u32; 4] = (&cell.coords[..4]).try_into().unwrap();
+                    if sqliters_simd::rtree_2d_f32_intersects(c4, &q_bounds) {
                         out.push(*cell);
                     }
                 }
@@ -2329,15 +2382,8 @@ impl RTreeCursor {
             let mut heap_children: Option<Vec<i64>> = None;
             if let Some(Some(node)) = cache.nodes.get(&node_id) {
                 for cell in &node.cells {
-                    let min_x = f64::from(f32::from_bits(cell.coords[0]));
-                    let max_x = f64::from(f32::from_bits(cell.coords[1]));
-                    let min_y = f64::from(f32::from_bits(cell.coords[2]));
-                    let max_y = f64::from(f32::from_bits(cell.coords[3]));
-                    if max_x >= q.q_min_x
-                        && min_x <= q.q_max_x
-                        && max_y >= q.q_min_y
-                        && min_y <= q.q_max_y
-                    {
+                    let c4: &[u32; 4] = (&cell.coords[..4]).try_into().unwrap();
+                    if sqliters_simd::rtree_2d_f32_intersects(c4, &q_bounds) {
                         if let Some(ref mut v) = heap_children {
                             v.push(cell.id);
                         } else if n_stack < 64 {
