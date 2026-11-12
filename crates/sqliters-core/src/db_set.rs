@@ -233,6 +233,12 @@ pub struct DatabaseSet {
     xferopt_delta: std::sync::atomic::AtomicU64,
     open_blobs: std::collections::HashMap<u64, OpenBlobState>,
     vtab_registry: crate::vtab::VTabRegistry,
+    /// `PRAGMA analysis_limit` (`sqlite3.nAnalysisLimit`): approximate number of index rows
+    /// `ANALYZE` examines per index; `0` = no limit.
+    analysis_limit: i32,
+    /// `PRAGMA cell_size_check` (`SQLITE_CellSizeCk` in `sqlite3.flags`), applied to every
+    /// database of the connection, including ones opened later.
+    cell_size_check: bool,
 }
 
 impl std::fmt::Debug for DatabaseSet {
@@ -302,6 +308,8 @@ impl DatabaseSet {
             lock_geometry,
             interrupt_flag,
             temp_trigger_bindings: Vec::new(),
+            analysis_limit: 0,
+            cell_size_check: false,
             xferopt_delta: std::sync::atomic::AtomicU64::new(0),
             open_blobs: std::collections::HashMap::new(),
             vtab_registry: crate::vtab::VTabRegistry::new(),
@@ -570,6 +578,56 @@ impl DatabaseSet {
         effective
     }
 
+    /// Current `PRAGMA analysis_limit` (`0` = unlimited).
+    #[inline]
+    pub const fn analysis_limit(&self) -> i32 {
+        self.analysis_limit
+    }
+
+    /// Sets `PRAGMA analysis_limit` (callers pass a non-negative value).
+    #[inline]
+    pub fn set_analysis_limit(&mut self, limit: i32) {
+        self.analysis_limit = limit.max(0);
+    }
+
+    /// `DBFLAG_EncodingFixed` (`sqliteInt.h`): `true` once any open database of the connection
+    /// has, or ever had, a schema object — C sets the flag for every schema row
+    /// `sqlite3InitCallback` parses — after which `PRAGMA encoding = X` is ignored. A database
+    /// that ever held a table records that in its header (schema format, offset 44), which
+    /// also covers objects created and dropped again.
+    pub fn encoding_fixed(&mut self) -> Result<bool> {
+        for slot in &mut self.slots {
+            let Some(ref mut bt) = slot.btree else {
+                continue;
+            };
+            if !slot.schema.tables.is_empty()
+                || !slot.schema.views.is_empty()
+                || !slot.schema.virtual_tables.is_empty()
+                || bt.pager_mut().ensure_header_loaded()?.file_format_is_set()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Current `PRAGMA cell_size_check` flag.
+    #[inline]
+    pub const fn cell_size_check(&self) -> bool {
+        self.cell_size_check
+    }
+
+    /// Sets `PRAGMA cell_size_check` for every open database of the connection; databases
+    /// opened afterwards (`ATTACH`, lazy `temp`) pick the flag up when they are opened.
+    pub fn set_cell_size_check(&mut self, enabled: bool) {
+        self.cell_size_check = enabled;
+        for slot in &mut self.slots {
+            if let Some(ref mut bt) = slot.btree {
+                bt.set_cell_size_check(enabled);
+            }
+        }
+    }
+
     /// Current `PRAGMA temp_store` mode.
     #[inline]
     pub const fn temp_store(&self) -> TempStoreMode {
@@ -789,6 +847,7 @@ impl DatabaseSet {
             let mut bt = Btree::open_private_temporary(Arc::clone(&self.disk_vfs), opts)?;
             bt.set_interrupt_flag(Some(Arc::clone(&self.interrupt_flag)));
             bt.set_writable_schema(writable_schema);
+            bt.set_cell_size_check(self.cell_size_check);
             let _ = bt.pager_mut().set_locking_mode(LockingMode::Exclusive);
             bt.pager_mut().set_encoding(encoding)?;
             for tracker in &self.slots[1].backup_trackers {

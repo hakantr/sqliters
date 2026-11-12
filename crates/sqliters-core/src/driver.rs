@@ -719,7 +719,10 @@ impl<'a> AuthWalkCtx<'a> {
                 {
                     return Ok(false);
                 }
-                if let AlterTableAction::AddColumn(col_def) = action {
+                if let AlterTableAction::AddColumn {
+                    column: col_def, ..
+                } = action
+                {
                     let empty_ctes = HashMap::new();
                     self.authorize_column_def(col_def, &empty_ctes, outer_scopes)?;
                 }

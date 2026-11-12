@@ -1072,18 +1072,38 @@ impl<'a> Parser<'a> {
                     e
                 } else if self.at(TokenKind::Plus) || self.at(TokenKind::Minus) {
                     let sign_tok = self.advance();
+                    // `-9223372036854775808` is an integer, although its magnitude alone is
+                    // not (`valueFromExpr` folds the sign into the literal).
+                    let lit = self.peek();
+                    let min_int = sign_tok.kind == TokenKind::Minus
+                        && lit.kind == TokenKind::Integer
+                        && lit.text.trim_start_matches('0') == "9223372036854775808";
                     let base = self.parse_primary_expr()?;
-                    let op = if sign_tok.kind == TokenKind::Minus {
-                        UnaryOp::Negate
+                    if min_int {
+                        Expr::Integer(i64::MIN)
                     } else {
-                        UnaryOp::Plus
-                    };
-                    Expr::Unary {
-                        op,
-                        expr: Box::new(base),
+                        let op = if sign_tok.kind == TokenKind::Minus {
+                            UnaryOp::Negate
+                        } else {
+                            UnaryOp::Plus
+                        };
+                        Expr::Unary {
+                            op,
+                            expr: Box::new(base),
+                        }
                     }
                 } else {
-                    self.parse_primary_expr()?
+                    // `ccons ::= DEFAULT scantok id`: a bare or quoted identifier after DEFAULT
+                    // is a string literal (`tokenExpr(pParse, TK_STRING, X)` in `parse.y`).
+                    match self.parse_primary_expr()? {
+                        Expr::Column(ColumnRef {
+                            schema: None,
+                            table: None,
+                            column,
+                            ..
+                        }) => Expr::String(column),
+                        other => other,
+                    }
                 };
                 constraints.push(ColumnConstraint::Default(expr));
             } else if self.eat(TokenKind::Collate) {
@@ -1437,10 +1457,37 @@ impl<'a> Parser<'a> {
             }
         } else if self.eat(TokenKind::Add) {
             let _ = self.eat(TokenKind::ColumnKw);
+            let def_start = self.peek().offset;
             let col = self.parse_column_def()?;
+            // `parse.y`: the column definition token runs from the column name to the end of
+            // the last token the parser has seen when the statement is reduced — the
+            // terminating `;`, or the end of the input when there is none.
+            let next = self.peek();
+            let def_end = match next.kind {
+                TokenKind::Semi => next.offset + next.text.len(),
+                TokenKind::Eof => self.sql.len(),
+                _ => next.offset,
+            }
+            .clamp(def_start, self.sql.len());
+            // `sqlite3AlterFinishAddColumn`: drop trailing `;` and whitespace (never the first
+            // byte).
+            let raw = &self.sql.as_bytes()[def_start..def_end];
+            let mut keep = raw.len();
+            while keep > 1
+                && matches!(
+                    raw[keep - 1],
+                    b';' | b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'
+                )
+            {
+                keep -= 1;
+            }
+            let column_sql = String::from_utf8_lossy(&raw[..keep]).into_owned();
             Ok(Stmt::AlterTable {
                 table,
-                action: AlterTableAction::AddColumn(col),
+                action: AlterTableAction::AddColumn {
+                    column: col,
+                    column_sql,
+                },
             })
         } else if self.eat(TokenKind::Drop) {
             let _ = self.eat(TokenKind::ColumnKw);

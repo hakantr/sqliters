@@ -8,11 +8,11 @@ use std::sync::Arc;
 use sqliters_btree::Btree;
 use sqliters_syntax::FkAction;
 use sqliters_syntax::{
-    ColumnConstraint, ColumnDef, ColumnRef, CommonTableExpr, ConflictAction, CreateIndexStmt,
-    CreateTableStmt, Expr, FromClause, FunctionArgs, IndexedColumn, JoinClause, JoinConstraint,
-    LimitClause, OrderByTerm, QualifiedName, ResultColumn, SelectBody, SelectCore, SelectStmt,
-    Stmt, TableConstraint, TableOrSubquery, TriggerTiming, WindowFrame, WindowFrameBound,
-    WindowRef, WindowSpec, parse_one,
+    ColumnConstraint, ColumnRef, CommonTableExpr, ConflictAction, CreateIndexStmt, CreateTableStmt,
+    Expr, FromClause, FunctionArgs, IndexedColumn, JoinClause, JoinConstraint, LimitClause,
+    OrderByTerm, QualifiedName, ResultColumn, SelectBody, SelectCore, SelectStmt, Stmt,
+    TableConstraint, TableOrSubquery, TriggerTiming, WindowFrame, WindowFrameBound, WindowRef,
+    WindowSpec, parse_one,
 };
 use sqliters_types::{
     Collation, CustomCollation, ErrorCode, ExecutionServices, KeySortOrder, Pgno, Result,
@@ -52,6 +52,53 @@ pub struct ColumnSchema {
     pub pk_order: usize,
 }
 
+/// `valueFromExpr` (`vdbemem.c:1795`): the constant a DEFAULT expression stands for when a
+/// row is shorter than the table (rows written before `ALTER TABLE ... ADD COLUMN`), with
+/// `affinity` applied; `None` when the expression is not one of the forms C can fold — a
+/// literal (number, string, blob, NULL, TRUE/FALSE) under any nesting of unary `+` / `-` and
+/// `CAST` — in which case such rows read NULL.
+fn default_value_from_expr(expr: &Expr, affinity: TypeAffinity) -> Option<Value> {
+    use sqliters_syntax::UnaryOp;
+    match expr {
+        Expr::Unary {
+            op: UnaryOp::Plus,
+            expr,
+        } => default_value_from_expr(expr, affinity),
+        Expr::Cast { expr, type_name } => {
+            let cast_affinity = TypeAffinity::from_declared_type(type_name);
+            let inner = default_value_from_expr(expr, cast_affinity)?;
+            Some(affinity.apply(sqliters_vdbe::eval_cast(inner, type_name)))
+        }
+        Expr::Unary {
+            op: UnaryOp::Negate,
+            expr: inner,
+        } => match inner.as_ref() {
+            // A negative numeric literal is folded in one step.
+            Expr::Integer(i) => Some(affinity.apply(Value::Integer(i.wrapping_neg()))),
+            Expr::Float(f) => Some(affinity.apply(Value::real(-*f))),
+            // `-(-5)`, `-'12'`, `-x'31'`: evaluate, `sqlite3VdbeMemNumerify`, negate.
+            _ => {
+                let v = default_value_from_expr(inner, affinity)?;
+                let negated = match sqliters_vdbe::eval_cast(v, "NUMERIC") {
+                    Value::Null => Value::Null,
+                    Value::Real(r) => Value::real(-r),
+                    Value::Integer(i64::MIN) => Value::real(-(i64::MIN as f64)),
+                    Value::Integer(i) => Value::Integer(-i),
+                    other => other,
+                };
+                Some(affinity.apply(negated))
+            }
+        },
+        Expr::Null => Some(Value::Null),
+        Expr::Bool(b) => Some(affinity.apply(Value::Integer(i64::from(*b)))),
+        Expr::Integer(i) => Some(affinity.apply(Value::Integer(*i))),
+        Expr::Float(f) => Some(affinity.apply(Value::real(*f))),
+        Expr::String(s) => Some(affinity.apply(Value::Text(s.clone()))),
+        Expr::Blob(b) => Some(Value::Blob(b.clone())),
+        _ => None,
+    }
+}
+
 impl ColumnSchema {
     pub fn collation_name(&self) -> &str {
         if let Some(ref cname) = self.custom_collation {
@@ -79,34 +126,15 @@ impl ColumnSchema {
     /// Extracts a constant `P4` fallback (with column affinity + `STRICT` `REAL` coercion) for
     /// `OP_Column` when reading rows written prior to `ALTER TABLE ... ADD COLUMN`.
     pub fn default_p4_for_table(&self, table_strict: bool) -> P4 {
-        let raw_val = match &self.default_expr {
-            Some(Expr::Integer(i)) => Some(Value::Integer(*i)),
-            Some(Expr::Bool(b)) => Some(Value::Integer(i64::from(*b))),
-            Some(Expr::Float(f)) => Some(Value::real(*f)),
-            Some(Expr::String(s)) => Some(Value::Text(s.clone())),
-            Some(Expr::Blob(b)) => Some(Value::Blob(b.clone())),
-            Some(Expr::Unary {
-                op: sqliters_syntax::UnaryOp::Plus,
-                expr,
-            }) => match expr.as_ref() {
-                Expr::Integer(i) => Some(Value::Integer(*i)),
-                Expr::Float(f) => Some(Value::real(*f)),
-                _ => None,
-            },
-            Some(Expr::Unary {
-                op: sqliters_syntax::UnaryOp::Negate,
-                expr,
-            }) => match expr.as_ref() {
-                Expr::Integer(i) => Some(Value::Integer(i.wrapping_neg())),
-                Expr::Float(f) => Some(Value::real(-*f)),
-                _ => None,
-            },
-            _ => None,
-        };
-        let Some(v) = raw_val else {
+        // `sqlite3ColumnDefault` → `sqlite3ValueFromExpr(db, pDflt, enc, pCol->affinity, &v)`.
+        let Some(v) = self
+            .default_expr
+            .as_ref()
+            .and_then(|e| default_value_from_expr(e, self.affinity))
+        else {
             return P4::None;
         };
-        let mut coerced = self.affinity.apply(v);
+        let mut coerced = v;
         if table_strict
             && self.type_name.trim().eq_ignore_ascii_case("REAL")
             && let Value::Integer(iv) = coerced
@@ -2199,92 +2227,6 @@ pub fn resolve_column_affinity(
     }
 }
 
-pub fn build_column_schema_from_def(
-    tbl_name: &str,
-    strict: bool,
-    cdef: &ColumnDef,
-) -> Result<ColumnSchema> {
-    let affinity = resolve_column_affinity(tbl_name, &cdef.name, &cdef.type_name, strict)?;
-    let mut collation = Collation::Binary;
-    let mut custom_collation = None;
-    let mut not_null = None;
-    let mut default_expr = None;
-    let mut generated = None;
-    for cons in &cdef.constraints {
-        match cons {
-            ColumnConstraint::PrimaryKey { .. } => {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    "Cannot add a PRIMARY KEY column",
-                ));
-            }
-            ColumnConstraint::Unique { .. } => {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    "Cannot add a UNIQUE column",
-                ));
-            }
-            ColumnConstraint::NotNull { conflict } => {
-                not_null = Some(*conflict);
-            }
-            ColumnConstraint::Default(e) => {
-                reject_window_in_ddl_expr(e)?;
-                default_expr = Some(e.clone());
-            }
-            ColumnConstraint::Check { expr, .. } => {
-                reject_raise_outside_trigger_expr(expr)?;
-                reject_window_in_ddl_expr(expr)?;
-            }
-            ColumnConstraint::Generated { expr, stored } => {
-                if *stored {
-                    return Err(SqliteError::new(
-                        ErrorCode::Error,
-                        "cannot add a STORED column",
-                    ));
-                }
-                reject_raise_outside_trigger_expr(expr)?;
-                reject_window_in_ddl_expr(expr)?;
-                generated = Some((expr.clone(), false));
-            }
-            ColumnConstraint::Collate(cname) => {
-                if let Some(c) = Collation::from_name(cname) {
-                    collation = c;
-                    custom_collation = None;
-                } else {
-                    collation = Collation::Binary;
-                    custom_collation = Some(cname.clone());
-                }
-            }
-            _ => {}
-        }
-    }
-    if not_null.is_some() && default_expr.is_none() && generated.is_none() {
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            "Cannot add a NOT NULL column with default value NULL",
-        ));
-    }
-    let mut is_unique = false;
-    for cons in &cdef.constraints {
-        if matches!(cons, ColumnConstraint::Unique { .. }) {
-            is_unique = true;
-        }
-    }
-    Ok(ColumnSchema {
-        name: cdef.name.clone(),
-        type_name: cdef.type_name.clone(),
-        affinity,
-        collation,
-        custom_collation,
-        not_null,
-        default_expr,
-        generated,
-        is_primary_key: false,
-        is_unique,
-        pk_order: 0,
-    })
-}
-
 fn resolve_indexed_columns(
     table_cols: &[ColumnSchema],
     idx_cols: &[IndexedColumn],
@@ -2520,9 +2462,9 @@ pub fn delete_schema_entry(btree: &mut Btree, schema_rowid: i64) -> Result<()> {
 pub fn bump_schema_cookie(btree: &mut Btree) -> Result<()> {
     let hdr = btree.pager_mut().header_mut()?;
     hdr.schema_cookie = hdr.schema_cookie.wrapping_add(1);
-    if hdr.schema_format == 0 {
-        hdr.schema_format = 4;
-    }
+    // The first schema row of a database is a table, view or virtual table: this is where C
+    // records the schema format and the text encoding in the header (`sqlite3StartTable`).
+    hdr.set_file_format_for_first_table();
     Ok(())
 }
 

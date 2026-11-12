@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 pub use sqliters_pager::{AutoVacuumMode, BackupTracker};
 use sqliters_pager::{
-    JournalMode, LockingMode, Pager, PagerOpenOptions, TransactionState, WalCheckpointMode,
-    WalCheckpointResult, create_super_journal_file,
+    JournalMode, LockingMode, PageLoadCheck, Pager, PagerOpenOptions, TransactionState,
+    WalCheckpointMode, WalCheckpointResult, create_super_journal_file,
 };
 use sqliters_types::{
     ErrorCode, IntRangeProbe, KeySortOrder, Pgno, RawField, RawRecordKey, Result, SqliteError,
@@ -262,6 +262,11 @@ pub struct Btree {
     pub(crate) open_cursor_count: usize,
     pub(crate) next_cursor_gen: u32,
     interrupt_flag: Option<Arc<AtomicBool>>,
+    /// `PRAGMA secure_delete` state of this database (`BtShared.btsFlags & BTS_FAST_SECURE`):
+    /// `0` = off, `1` = `BTS_SECURE_DELETE` (ON), `2` = `BTS_OVERWRITE` (FAST).
+    secure_delete: u8,
+    /// `PRAGMA cell_size_check` state (mirrors the hook installed in the pager).
+    cell_size_check: bool,
 }
 
 impl Btree {
@@ -273,7 +278,57 @@ impl Btree {
             open_cursor_count: 0,
             next_cursor_gen: 1,
             interrupt_flag: None,
+            secure_delete: 0,
+            cell_size_check: false,
         }
+    }
+
+    /// Queries (`None`) or changes (`Some(0|1|2)`) the secure-delete mode and returns the value
+    /// now in force (`sqlite3BtreeSecureDelete`, `btree.c:3211`):
+    ///
+    /// * `0` — deleted content is left in place;
+    /// * `1` (`ON`, `BTS_SECURE_DELETE`) — deleted content is overwritten with zeros, including
+    ///   whole pages moved to the freelist;
+    /// * `2` (`FAST`, `BTS_OVERWRITE`) — deleted content is overwritten with zeros where that
+    ///   costs no extra I/O (cells freed inside a page that is being written anyway).
+    ///
+    /// This engine always zero-fills, journals and writes a page that goes to the freelist
+    /// (inventory class U4), so `FAST` is at least as strong here as in C; the mode only decides
+    /// whether cells released inside a live page are overwritten (`freeSpace`, `btree.c:2019`).
+    pub fn secure_delete(&mut self, new_flag: Option<u8>) -> u8 {
+        if let Some(flag) = new_flag {
+            self.secure_delete = flag.min(2);
+        }
+        self.secure_delete
+    }
+
+    /// `BTS_FAST_SECURE` test: `true` when cells freed inside a page must be zeroed.
+    #[inline]
+    fn zero_freed_cells(&self) -> bool {
+        self.secure_delete != 0
+    }
+
+    /// `PRAGMA cell_size_check` (`SQLITE_CellSizeCk`): when on, every b-tree page loaded from
+    /// disk is validated with [`page::cell_size_check_page`] (`btreeCellSizeCheck`) the first
+    /// time it is used, and a page with a cell that does not fit fails with `SQLITE_CORRUPT`.
+    pub fn set_cell_size_check(&mut self, enabled: bool) {
+        self.pager
+            .set_page_load_check(enabled.then_some(page::cell_size_check_page as PageLoadCheck));
+        self.cell_size_check = enabled;
+    }
+
+    /// Returns `true` when `PRAGMA cell_size_check` is on for this database.
+    #[inline]
+    pub fn cell_size_check(&self) -> bool {
+        self.cell_size_check
+    }
+
+    /// `sqlite3BtreeGetMeta(BTREE_DATA_VERSION)`: the value of `PRAGMA data_version`. It
+    /// changes when the database content was changed by another connection (or the cache page
+    /// size changed) and never because of a commit of this connection.
+    #[inline]
+    pub fn data_version(&self) -> u32 {
+        self.pager.data_version()
     }
 
     /// Attaches or clears a shared atomic interrupt flag (`sqlite3_interrupt`).
@@ -663,7 +718,7 @@ impl Btree {
                 validate_free_pg(cur_trunk)?;
                 n_search += 1;
 
-                let trunk_bytes = self.pager.read_page(cur_trunk)?.to_vec();
+                let trunk_bytes = self.pager.read_page_unchecked(cur_trunk)?.to_vec();
                 let next_trunk = u32::from_be_bytes([
                     trunk_bytes[0],
                     trunk_bytes[1],
@@ -865,7 +920,7 @@ impl Btree {
         let first_trunk = self.pager.header().first_freelist_trunk_page;
 
         if first_trunk != 0 {
-            let trunk_ro = self.pager.read_page(first_trunk)?;
+            let trunk_ro = self.pager.read_page_unchecked(first_trunk)?;
             let leaf_count =
                 u32::from_be_bytes([trunk_ro[4], trunk_ro[5], trunk_ro[6], trunk_ro[7]]);
             if leaf_count < max_leaves {
@@ -983,7 +1038,7 @@ impl Btree {
                     "cycle detected in overflow page chain",
                 ));
             }
-            let raw = self.pager.read_page(ovfl_pgno)?;
+            let raw = self.pager.read_page_unchecked(ovfl_pgno)?;
             let nxt = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
             let remaining = total - out.len();
             let take = remaining.min(usable - 4);
@@ -1004,7 +1059,7 @@ impl Btree {
                 ));
             }
             let nxt = {
-                let raw = self.pager.read_page(pgno)?;
+                let raw = self.pager.read_page_unchecked(pgno)?;
                 u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]])
             };
             self.free_page(pgno)?;
@@ -1958,7 +2013,7 @@ impl Btree {
                 if hops > max_pages {
                     return Err(SqliteError::corrupt("overflow chain cycle"));
                 }
-                let raw = self.pager.read_page(pgno)?;
+                let raw = self.pager.read_page_unchecked(pgno)?;
                 let next_ovfl = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
                 let page_payload_len = total_len.saturating_sub(ovfl_stream_off).min(chunk_cap);
                 if cur_off < ovfl_stream_off + page_payload_len {
@@ -2042,7 +2097,7 @@ impl Btree {
                     return Err(SqliteError::corrupt("overflow chain cycle"));
                 }
                 let next_ovfl = {
-                    let raw = self.pager.read_page(pgno)?;
+                    let raw = self.pager.read_page_unchecked(pgno)?;
                     u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]])
                 };
                 let page_payload_len = total_len.saturating_sub(ovfl_stream_off).min(chunk_cap);
@@ -2263,6 +2318,7 @@ impl Btree {
                 old_cell_len,
                 content_top,
             }) => {
+                let secure = self.zero_freed_cells();
                 let raw_mut = self.pager.write_page(leaf_pgno)?;
                 apply_replace_table_leaf_raw(
                     leaf_pgno,
@@ -2274,6 +2330,7 @@ impl Btree {
                     old_off,
                     old_cell_len,
                     content_top,
+                    secure,
                 );
                 Ok(true)
             }
@@ -2284,6 +2341,7 @@ impl Btree {
                 ..
             }) => {
                 let reject_overflow_cells = self.is_auto_vacuum();
+                let secure = self.zero_freed_cells();
                 let raw_mut = self.pager.write_page(leaf_pgno)?;
                 replace_table_leaf_repack_raw(
                     leaf_pgno,
@@ -2295,6 +2353,7 @@ impl Btree {
                     old_off,
                     old_cell_len,
                     reject_overflow_cells,
+                    secure,
                 )
             }
             _ => Ok(false),
@@ -2400,6 +2459,7 @@ impl Btree {
                     if !allow_replace {
                         return Ok(FastTableInsertOutcome::Duplicate);
                     }
+                    let secure = self.zero_freed_cells();
                     let raw_mut = self.pager.write_page(cur_pgno)?;
                     apply_replace_table_leaf_raw(
                         cur_pgno,
@@ -2411,6 +2471,7 @@ impl Btree {
                         old_off,
                         old_cell_len,
                         content_top,
+                        secure,
                     );
                     return Ok(FastTableInsertOutcome::Inserted);
                 }
@@ -2421,6 +2482,7 @@ impl Btree {
                     legacy_defrag,
                 } => {
                     let reject_overflow_cells = self.is_auto_vacuum();
+                    let secure = self.zero_freed_cells();
                     let raw_mut = self.pager.write_page(cur_pgno)?;
                     if replace_table_leaf_repack_raw(
                         cur_pgno,
@@ -2432,6 +2494,7 @@ impl Btree {
                         old_off,
                         old_cell_len,
                         reject_overflow_cells,
+                        secure,
                     )? {
                         return Ok(FastTableInsertOutcome::Inserted);
                     }
@@ -2916,6 +2979,7 @@ impl Btree {
             }
         }
         let outcome = {
+            let secure = self.zero_freed_cells();
             let raw_mut = self.pager.write_page(leaf_pgno)?;
             try_delete_table_leaf_in_place(
                 leaf_pgno,
@@ -2924,6 +2988,7 @@ impl Btree {
                 rowid,
                 is_root,
                 Some(cell_idx),
+                secure,
             )?
         };
         match outcome {
@@ -3058,8 +3123,9 @@ impl Btree {
                 return Ok((false, TableDeleteFixup::None));
             }
             let outcome = {
+                let secure = self.zero_freed_cells();
                 let raw_mut = self.pager.write_page(pgno)?;
-                try_delete_table_leaf_in_place(pgno, usable, raw_mut, rowid, is_root, None)?
+                try_delete_table_leaf_in_place(pgno, usable, raw_mut, rowid, is_root, None, secure)?
             };
             match outcome {
                 RawLeafDeleteOutcome::NotFound => return Ok((false, TableDeleteFixup::None)),
@@ -6193,9 +6259,10 @@ impl Btree {
                     cell_off,
                     cell_len,
                 } => {
+                    let secure = self.zero_freed_cells();
                     let raw_mut = self.pager.write_page(cur_pgno)?;
                     apply_delete_index_leaf_in_place(
-                        cur_pgno, usable, raw_mut, idx, cell_off, cell_len,
+                        cur_pgno, usable, raw_mut, idx, cell_off, cell_len, secure,
                     );
                     return Ok(true);
                 }
@@ -6260,6 +6327,7 @@ impl Btree {
                         if cand_int.fits_in_page(cur_pgno, usable) {
                             self.free_overflow_chain(old_div.overflow_page)?;
                             {
+                                let secure = self.zero_freed_cells();
                                 let raw_pred_mut = self.pager.write_page(pred_pgno)?;
                                 apply_delete_index_leaf_in_place(
                                     pred_pgno,
@@ -6268,6 +6336,7 @@ impl Btree {
                                     pred_idx,
                                     pred_off,
                                     pred_cell_len,
+                                    secure,
                                 );
                             }
                             self.write_parsed_page(cur_pgno, &cand_int)?;
@@ -6371,9 +6440,10 @@ impl Btree {
                     None => Ok(Some(false)),
                     Some((idx, cell_off, cell_len, ovfl)) => {
                         self.free_overflow_chain(ovfl)?;
+                        let secure = self.zero_freed_cells();
                         let raw_mut = self.pager.write_page(cur_pgno)?;
                         apply_delete_index_leaf_in_place(
-                            cur_pgno, usable, raw_mut, idx, cell_off, cell_len,
+                            cur_pgno, usable, raw_mut, idx, cell_off, cell_len, secure,
                         );
                         Ok(Some(true))
                     }
@@ -8148,6 +8218,170 @@ mod tests {
                 .collect();
             assert!(stored.iter().eq(keys.iter()), "page_size {page_size}");
             bt.commit().unwrap();
+        }
+    }
+    /// `PRAGMA secure_delete` (`BTS_SECURE_DELETE` / `BTS_OVERWRITE`): with the mode off the
+    /// payload of deleted and replaced cells stays readable in the page image; with `ON` (1) or
+    /// `FAST` (2) no byte of it may survive anywhere in the database — cells freed inside a leaf
+    /// (`freeSpace`), the last cell of a root leaf (`dropCell`), replaced cells of another size,
+    /// index entries, overflow chains, cleared and dropped trees. The mode must not change the
+    /// tree structure: the image differs from the mode-0 image only where that one keeps stale
+    /// bytes.
+    #[test]
+    fn test_secure_delete_overwrites_deleted_content() {
+        const MARK: &[u8] = b"DELME";
+        fn count_marker(bt: &mut Btree) -> usize {
+            let n = bt.pager().page_count();
+            let mut hits = 0;
+            for pgno in 1..=n {
+                let raw = bt.pager_mut().read_page(pgno).unwrap();
+                hits += raw.windows(MARK.len()).filter(|w| *w == MARK).count();
+            }
+            hits
+        }
+        fn image(bt: &mut Btree) -> Vec<Vec<u8>> {
+            let n = bt.pager().page_count();
+            (1..=n)
+                .map(|pgno| bt.pager_mut().read_page(pgno).unwrap().to_vec())
+                .collect()
+        }
+        let orders = [KeySortOrder::default(), KeySortOrder::default()];
+        let text = |i: i64, doomed: bool| {
+            format!(
+                "{}-{i:05}-{}",
+                if doomed { "DELME" } else { "KEEPME" },
+                "p".repeat(10 + (i as usize * 7) % 50)
+            )
+        };
+
+        let mut images: Vec<Vec<Vec<u8>>> = Vec::new();
+        let mut residue = Vec::new();
+        for mode in [0u8, 1, 2] {
+            for page_size in [512u32, 4096] {
+                let mut bt = Btree::open_in_memory().unwrap();
+                bt.pager_mut().set_page_size(page_size).unwrap();
+                assert_eq!(
+                    bt.secure_delete(None),
+                    0,
+                    "default is off, as in the C build"
+                );
+                assert_eq!(bt.secure_delete(Some(mode)), mode);
+                bt.begin_write().unwrap();
+                let tbl = bt.create_table().unwrap();
+                let idx = bt.create_index().unwrap();
+                let one = bt.create_table().unwrap();
+                let one_idx = bt.create_index().unwrap();
+                let big = bt.create_table().unwrap();
+                let gone = bt.create_table().unwrap();
+                let cleared = bt.create_table().unwrap();
+                let n = 600i64;
+                for i in 1..=n {
+                    let doomed = i % 3 == 0;
+                    let t = text(i, doomed);
+                    bt.insert_table(tbl, i, &encode_record(&[Value::Text(t.clone())]))
+                        .unwrap();
+                    bt.insert_index(
+                        idx,
+                        &encode_record(&[Value::Text(t), Value::Integer(i)]),
+                        &orders,
+                    )
+                    .unwrap();
+                }
+                // Root leaves that lose their only cell.
+                bt.insert_table(one, 1, &encode_record(&[Value::Text(text(1, true))]))
+                    .unwrap();
+                bt.insert_index(
+                    one_idx,
+                    &encode_record(&[Value::Text(text(1, true)), Value::Integer(1)]),
+                    &orders,
+                )
+                .unwrap();
+                // Rows on overflow chains, and whole trees that are dropped / cleared.
+                for i in 1..=8i64 {
+                    let wide = "DELME".repeat(page_size as usize);
+                    bt.insert_table(big, i, &encode_record(&[Value::Text(wide.clone())]))
+                        .unwrap();
+                    bt.insert_table(gone, i, &encode_record(&[Value::Text(wide.clone())]))
+                        .unwrap();
+                    bt.insert_table(cleared, i, &encode_record(&[Value::Text(wide)]))
+                        .unwrap();
+                }
+                bt.commit().unwrap();
+                assert!(count_marker(&mut bt) > 0);
+
+                bt.begin_write().unwrap();
+                for i in (3..=n).step_by(3) {
+                    let t = text(i, true);
+                    if i % 2 == 0 {
+                        // Replace with a row of another size (shorter or longer).
+                        let fresh = format!("KEEPME-{i}-{}", "q".repeat((i as usize * 11) % 90));
+                        bt.insert_table(tbl, i, &encode_record(&[Value::Text(fresh)]))
+                            .unwrap();
+                    } else {
+                        assert!(bt.delete_table(tbl, i).unwrap());
+                    }
+                    assert!(
+                        bt.delete_index_raw(
+                            idx,
+                            &encode_record(&[Value::Text(t), Value::Integer(i)]),
+                            &orders
+                        )
+                        .unwrap()
+                    );
+                }
+                assert!(bt.delete_table(one, 1).unwrap());
+                assert!(
+                    bt.delete_index_raw(
+                        one_idx,
+                        &encode_record(&[Value::Text(text(1, true)), Value::Integer(1)]),
+                        &orders
+                    )
+                    .unwrap()
+                );
+                for i in 1..=8i64 {
+                    assert!(bt.delete_table(big, i).unwrap());
+                }
+                bt.drop_tree(gone).unwrap();
+                bt.clear_tree(cleared).unwrap();
+                bt.commit().unwrap();
+
+                assert_eq!(
+                    bt.integrity_check(&[1, tbl, idx, one, one_idx, big, cleared])
+                        .unwrap(),
+                    Vec::<String>::new()
+                );
+                assert_eq!(bt.scan_index(idx).unwrap().len(), 400);
+                residue.push((mode, page_size, count_marker(&mut bt)));
+                images.push(image(&mut bt));
+            }
+        }
+        for &(mode, page_size, hits) in &residue {
+            if mode == 0 {
+                assert!(
+                    hits > 0,
+                    "mode 0, page {page_size}: deleted cells are expected to stay in place"
+                );
+            } else {
+                assert_eq!(
+                    hits, 0,
+                    "mode {mode}, page {page_size}: deleted content left in the file"
+                );
+            }
+        }
+        // Same structure in every mode: a secure image only differs from the mode-0 image in
+        // bytes it has zeroed.
+        for secure in 2..images.len() {
+            let plain = &images[secure % 2];
+            assert_eq!(plain.len(), images[secure].len());
+            for (pgno, (a, b)) in plain.iter().zip(&images[secure]).enumerate() {
+                for (off, (x, y)) in a.iter().zip(b).enumerate() {
+                    assert!(
+                        x == y || *y == 0,
+                        "image {secure}, page {}, offset {off}: {x:#x} vs {y:#x}",
+                        pgno + 1
+                    );
+                }
+            }
         }
     }
 }

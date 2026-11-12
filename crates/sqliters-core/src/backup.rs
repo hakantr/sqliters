@@ -450,7 +450,7 @@ impl Backup {
                     .as_mut()
                     .unwrap()
                     .pager_mut()
-                    .read_page(dirty_pgno)?;
+                    .read_page_unchecked(dirty_pgno)?;
                 dst_inner
                     .db_set
                     .slot_mut(dst_db_id)
@@ -485,7 +485,7 @@ impl Backup {
                         .as_mut()
                         .unwrap()
                         .pager_mut()
-                        .read_page(src_pgno)?;
+                        .read_page_unchecked(src_pgno)?;
                     dst_inner
                         .db_set
                         .slot_mut(dst_db_id)

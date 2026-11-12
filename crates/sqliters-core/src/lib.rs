@@ -3245,6 +3245,9 @@ impl Connection {
                 .pager_mut()
                 .load_deserialized_image(data, readonly)?;
             main_bt.set_writable_schema(writable_schema);
+            // `sqlite3_deserialize` reopens the database as a fresh MemDB b-tree (`attach.c`
+            // `REOPEN_AS_MEMDB`), so the secure-delete mode falls back to the build default.
+            main_bt.secure_delete(Some(0));
             if main_bt.pager().page_count() > 0 {
                 inner.connection_encoding = main_bt.encoding();
             }
@@ -12445,6 +12448,779 @@ mod tests {
         assert_eq!(rows(&conn, "PRAGMA quick_check"), [frag.as_str()]);
         assert_eq!(rows(&conn, "PRAGMA integrity_check(t2)"), [frag.as_str()]);
         assert_eq!(rows(&conn, "PRAGMA integrity_check(sqlite_schema)"), ["ok"]);
+        assert!(conn.try_close().is_ok());
+    }
+}
+
+/// Regression tests for behaviour that has to match C SQLite 3.54.1 (step 5e): every expected
+/// value below is what the reference `sqlite3` produces for the same statements.
+#[cfg(test)]
+mod c_parity_tests {
+    use super::*;
+    use sqliters_vfs::MemoryVfs;
+
+    fn open(vfs: &Arc<MemoryVfs>, path: &Path) -> Connection {
+        Connection::open_with_vfs(
+            vfs.clone(),
+            Some(path),
+            OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB,
+        )
+        .unwrap()
+    }
+    fn file_bytes(vfs: &MemoryVfs, path: &Path) -> Vec<u8> {
+        let file = vfs
+            .open(Some(path), OpenFlags::READONLY | OpenFlags::MAIN_DB)
+            .unwrap();
+        let mut bytes = vec![0u8; file.file_size().unwrap() as usize];
+        assert_eq!(file.read_at(&mut bytes, 0).unwrap(), bytes.len());
+        bytes
+    }
+    fn count(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count()
+    }
+    /// The single integer a statement returns, or `None` when it returns no row.
+    fn int(conn: &Connection, sql: &str) -> Option<i64> {
+        let res = conn.query(sql, &[]).unwrap();
+        res.rows.first().map(|r| r.get_i64(0).unwrap())
+    }
+    fn texts(conn: &Connection, sql: &str) -> Vec<String> {
+        conn.query(sql, &[])
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r.get_str(0).unwrap().to_owned())
+            .collect()
+    }
+
+    /// `PRAGMA secure_delete` (`pragma.c` `PragTyp_SECURE_DELETE`): every form returns the
+    /// setting, `FAST` is 2, other values are booleans, an unqualified assignment reaches every
+    /// open database, `ATTACH` inherits the mode of `main`.
+    #[test]
+    fn secure_delete_pragma_forms() {
+        let conn = Connection::open_in_memory().unwrap();
+        let col = conn.query("PRAGMA secure_delete", &[]).unwrap();
+        assert_eq!(col.column_names, ["secure_delete"]);
+        for (sql, want) in [
+            ("PRAGMA secure_delete", 0),
+            ("PRAGMA secure_delete=FAST", 2),
+            ("PRAGMA secure_delete", 2),
+            ("PRAGMA secure_delete=ON", 1),
+            ("PRAGMA main.secure_delete=0", 0),
+            ("PRAGMA secure_delete", 0),
+            ("PRAGMA secure_delete=2", 1),
+            ("PRAGMA secure_delete=3", 1),
+            ("PRAGMA secure_delete=foo", 0),
+            ("PRAGMA secure_delete(1)", 1),
+            // `temp` is opened by the qualified query and was not open for the assignments.
+            ("PRAGMA temp.secure_delete", 0),
+            ("PRAGMA secure_delete='fast'", 2),
+            ("PRAGMA temp.secure_delete", 2),
+            ("PRAGMA temp.secure_delete=off", 0),
+            ("PRAGMA secure_delete", 2),
+            ("PRAGMA secure_delete=-1", 0),
+            ("PRAGMA secure_delete=256", 1),
+            ("PRAGMA secure_delete=1.5", 1),
+            ("PRAGMA secure_delete=0x10", 1),
+            ("PRAGMA secure_delete=00", 0),
+            ("PRAGMA secure_delete=yes", 1),
+            ("PRAGMA secure_delete=no", 0),
+            ("PRAGMA secure_delete=fAsT", 2),
+        ] {
+            assert_eq!(int(&conn, sql), Some(want), "{sql}");
+        }
+        conn.execute_batch("ATTACH ':memory:' AS a2").unwrap();
+        assert_eq!(int(&conn, "PRAGMA a2.secure_delete"), Some(2));
+        assert_eq!(int(&conn, "PRAGMA a2.secure_delete=1"), Some(1));
+        assert_eq!(int(&conn, "PRAGMA secure_delete"), Some(2));
+        assert_eq!(int(&conn, "PRAGMA secure_delete=off"), Some(0));
+        assert_eq!(int(&conn, "PRAGMA a2.secure_delete"), Some(0));
+    }
+
+    /// With `secure_delete` on, nothing of a deleted / replaced / dropped row may stay in the
+    /// database file — in rollback and WAL mode, with and without auto-vacuum, for table rows,
+    /// index entries, overflow pages, truncated and dropped tables, deleted schema rows and
+    /// after `VACUUM`. With the mode off the same script leaves the content behind (which is
+    /// what makes the assertion meaningful) and the file is otherwise identical in structure.
+    #[test]
+    fn secure_delete_leaves_no_deleted_content_in_the_file() {
+        fn script(mode: &str, journal: &str, auto_vacuum: &str) -> String {
+            let mut sql = format!(
+                "PRAGMA auto_vacuum={auto_vacuum};\nPRAGMA journal_mode={journal};\n\
+                 PRAGMA secure_delete={mode};\n\
+                 CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b TEXT);\n\
+                 CREATE INDEX tb ON t(b);\n\
+                 CREATE TABLE big(id INTEGER PRIMARY KEY, b TEXT);\n\
+                 CREATE TABLE gone(id INTEGER PRIMARY KEY, b TEXT);\n\
+                 CREATE INDEX gone_b ON gone(b);\n\
+                 CREATE TABLE emptied(id INTEGER PRIMARY KEY, b TEXT);\n\
+                 CREATE TABLE one(id INTEGER PRIMARY KEY, b TEXT UNIQUE);\n\
+                 CREATE VIEW v_doomed AS SELECT 'DELME-in-a-view-definition' AS x;\n\
+                 BEGIN;\n"
+            );
+            for i in 1..=400 {
+                let tag = if i % 3 == 0 { "DELME" } else { "KEEPME" };
+                let pad = "p".repeat(5 + (i * 7) % 60);
+                sql.push_str(&format!(
+                    "INSERT INTO t VALUES({i},{i},'{tag}-{i}-{pad}');\n"
+                ));
+                sql.push_str(&format!(
+                    "INSERT INTO gone VALUES({i},'DELME-{i}-{pad}');\n"
+                ));
+                sql.push_str(&format!(
+                    "INSERT INTO emptied VALUES({i},'DELME-{i}-{pad}');\n"
+                ));
+            }
+            for i in 1..=6 {
+                let wide = "DELME".repeat(1500);
+                sql.push_str(&format!("INSERT INTO big VALUES({i},'{wide}{i}');\n"));
+            }
+            sql.push_str("INSERT INTO one VALUES(1,'DELME-only-row');\nCOMMIT;\n");
+            sql.push_str(
+                "DELETE FROM t WHERE id%3=0 AND id%2=0;\n\
+                 UPDATE t SET b='KEEPME-'||id WHERE id%3=0 AND id%2=1 AND id<200;\n\
+                 UPDATE t SET b='KEEPME-'||id||'-grown-well-beyond-the-length-of-the-old-value-\
+                 so-that-the-cell-has-to-move-somewhere-else' WHERE id%3=0 AND id%2=1;\n\
+                 DELETE FROM big WHERE id<>3;\n\
+                 UPDATE big SET b='KEEPME';\n\
+                 DELETE FROM emptied;\n\
+                 DROP TABLE gone;\n\
+                 DELETE FROM one;\n\
+                 DROP VIEW v_doomed;\n",
+            );
+            sql
+        }
+        for journal in ["delete", "wal"] {
+            for auto_vacuum in ["none", "full"] {
+                let mut residue = Vec::new();
+                for mode in ["OFF", "ON", "FAST"] {
+                    let vfs = Arc::new(MemoryVfs::new());
+                    let path = Path::new("/sd.db");
+                    let conn = open(&vfs, path);
+                    conn.execute_batch(&script(mode, journal, auto_vacuum))
+                        .unwrap();
+                    assert_eq!(texts(&conn, "PRAGMA integrity_check"), ["ok"]);
+                    assert_eq!(int(&conn, "SELECT count(*) FROM t"), Some(334));
+                    if journal == "wal" {
+                        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                            .unwrap();
+                    }
+                    let before_vacuum = count(&file_bytes(&vfs, path), b"DELME");
+                    conn.execute_batch("VACUUM").unwrap();
+                    if journal == "wal" {
+                        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                            .unwrap();
+                    }
+                    assert!(conn.try_close().is_ok());
+                    let bytes = file_bytes(&vfs, path);
+                    assert_eq!(
+                        count(&bytes, b"DELME"),
+                        0,
+                        "{journal}/{auto_vacuum}/{mode}: content survived VACUUM"
+                    );
+                    assert!(count(&bytes, b"KEEPME") >= 334);
+                    residue.push((mode, before_vacuum));
+                }
+                assert!(
+                    residue[0].1 > 0,
+                    "{journal}/{auto_vacuum}: with secure_delete=OFF deleted cells stay in place"
+                );
+                assert_eq!(residue[1].1, 0, "{journal}/{auto_vacuum}: secure_delete=ON");
+                assert_eq!(
+                    residue[2].1, 0,
+                    "{journal}/{auto_vacuum}: secure_delete=FAST"
+                );
+            }
+        }
+    }
+
+    /// `analysis_limit`, `cell_size_check`, `mmap_size` and `data_version` return what C
+    /// returns: a row with the setting (no row for the `cell_size_check` assignment).
+    #[test]
+    fn pragmas_that_report_a_setting_return_one_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        for (sql, want) in [
+            ("PRAGMA analysis_limit", Some(0)),
+            ("PRAGMA analysis_limit=100", Some(100)),
+            ("PRAGMA analysis_limit=-5", Some(100)),
+            ("PRAGMA analysis_limit=abc", Some(100)),
+            ("PRAGMA analysis_limit=0x10", Some(16)),
+            ("PRAGMA analysis_limit=1.5", Some(16)),
+            ("PRAGMA analysis_limit='20'", Some(20)),
+            ("PRAGMA analysis_limit=4294967297", Some(1)),
+            ("PRAGMA analysis_limit=2147483648", Some(0)),
+            (
+                "PRAGMA analysis_limit=9223372036854775807",
+                Some(2_147_483_647),
+            ),
+            ("PRAGMA main.analysis_limit=3", Some(3)),
+            ("PRAGMA temp.analysis_limit", Some(3)),
+            ("PRAGMA analysis_limit(44)", Some(44)),
+            ("PRAGMA analysis_limit=+7", Some(7)),
+            ("PRAGMA analysis_limit=on", Some(7)),
+            ("PRAGMA analysis_limit=' 12 '", Some(12)),
+            ("PRAGMA analysis_limit='0X1f'", Some(31)),
+            ("PRAGMA analysis_limit='12abc'", Some(31)),
+            ("PRAGMA analysis_limit=0", Some(0)),
+            ("PRAGMA cell_size_check", Some(0)),
+            ("PRAGMA cell_size_check=1", None),
+            ("PRAGMA cell_size_check", Some(1)),
+            ("PRAGMA cell_size_check=off", None),
+            ("PRAGMA cell_size_check", Some(0)),
+            ("PRAGMA main.cell_size_check=yes", None),
+            ("PRAGMA temp.cell_size_check", Some(1)),
+            ("PRAGMA cell_size_check=foo", None),
+            ("PRAGMA cell_size_check", Some(0)),
+            ("PRAGMA cell_size_check(true)", None),
+            ("PRAGMA cell_size_check", Some(1)),
+            ("PRAGMA cell_size_check=-1", None),
+            ("PRAGMA cell_size_check", Some(0)),
+            // No memory mapping in this engine: the effective limit is always 0, as in a C
+            // build with `SQLITE_MAX_MMAP_SIZE=0`.
+            ("PRAGMA mmap_size", Some(0)),
+            ("PRAGMA mmap_size=1048576", Some(0)),
+            ("PRAGMA main.mmap_size", Some(0)),
+            ("PRAGMA data_version", Some(1)),
+            ("PRAGMA data_version=7", Some(1)),
+            ("PRAGMA temp.data_version", Some(1)),
+        ] {
+            assert_eq!(int(&conn, sql), want, "{sql}");
+        }
+        for (sql, name) in [
+            ("PRAGMA analysis_limit", "analysis_limit"),
+            ("PRAGMA cell_size_check", "cell_size_check"),
+            ("PRAGMA mmap_size", "mmap_size"),
+            ("PRAGMA data_version", "data_version"),
+        ] {
+            assert_eq!(conn.query(sql, &[]).unwrap().column_names, [name], "{sql}");
+        }
+    }
+
+    /// `ANALYZE` under `PRAGMA analysis_limit` produces the `sqlite_stat1` rows C produces:
+    /// the scan of an index stops (or skips ahead) once the limit is exceeded, the first number
+    /// is still the exact entry count, the averages come from the rows visited.
+    #[test]
+    fn analyze_honours_analysis_limit() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b TEXT, c INT);
+             CREATE INDEX ta ON t(a);
+             CREATE INDEX tab ON t(a,b);
+             CREATE INDEX tc ON t(c DESC, a);
+             CREATE TABLE same(a INT, b INT);
+             CREATE INDEX sab ON same(a,b);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2000)
+               INSERT INTO t SELECT i, CASE WHEN i%40=0 THEN NULL ELSE i%7 END, 'v'||(i%13), i/50 FROM n;
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<900)
+               INSERT INTO same SELECT 5, i%3 FROM n;",
+        )
+        .unwrap();
+        let unlimited = [
+            "sab=900 900 300",
+            "ta=2000 250",
+            "tab=2000 250 20",
+            "tc=2000 49 7",
+        ];
+        for (limit, want) in [
+            (0, unlimited),
+            (
+                1,
+                ["sab=900 2 2", "ta=2000 2", "tab=2000 2 2", "tc=2000 1 1"],
+            ),
+            (
+                10,
+                [
+                    "sab=900 11 11",
+                    "ta=2000 11",
+                    "tab=2000 11 6",
+                    "tc=2000 6 3",
+                ],
+            ),
+            (
+                300,
+                [
+                    "sab=900 301 151",
+                    "ta=2000 151",
+                    "tab=2000 151 13",
+                    "tc=2000 43 7",
+                ],
+            ),
+            (5000, unlimited),
+        ] {
+            assert_eq!(
+                int(&conn, &format!("PRAGMA analysis_limit={limit}")),
+                Some(limit)
+            );
+            conn.execute_batch("ANALYZE").unwrap();
+            assert_eq!(
+                texts(
+                    &conn,
+                    "SELECT idx||'='||stat FROM sqlite_stat1 ORDER BY idx"
+                ),
+                want,
+                "analysis_limit={limit}"
+            );
+        }
+    }
+
+    /// `PRAGMA data_version` moves when another connection commits and stays put for commits,
+    /// rollbacks, `VACUUM` and checkpoints of the connection itself. The absolute values are
+    /// C's (1 after open; +1 for the first snapshot through a WAL).
+    #[test]
+    fn data_version_changes_only_for_other_connections() {
+        for (journal, start) in [("delete", 1i64), ("wal", 2), ("truncate", 1)] {
+            let vfs = Arc::new(MemoryVfs::new());
+            let path = Path::new("/dv.db");
+            let a = open(&vfs, path);
+            let b = open(&vfs, path);
+            let dv = |c: &Connection| int(c, "PRAGMA data_version").unwrap();
+            a.execute_batch(&format!(
+                "PRAGMA journal_mode={journal}; CREATE TABLE t(a);"
+            ))
+            .unwrap();
+            assert_eq!(int(&b, "SELECT count(*) FROM t"), Some(0));
+            assert_eq!(dv(&a), start, "{journal}");
+            a.execute_batch(
+                "INSERT INTO t VALUES(1);
+                 BEGIN; INSERT INTO t VALUES(2); COMMIT;
+                 BEGIN; INSERT INTO t VALUES(3); ROLLBACK;
+                 CREATE INDEX ta ON t(a); DROP INDEX ta;
+                 PRAGMA user_version=3;
+                 VACUUM;",
+            )
+            .unwrap();
+            assert_eq!(dv(&a), start, "{journal}: own commits");
+
+            b.execute_batch("INSERT INTO t VALUES(10)").unwrap();
+            assert_eq!(dv(&a), start + 1, "{journal}: commit by another connection");
+            assert_eq!(dv(&a), start + 1, "{journal}: stable between changes");
+            b.execute_batch("BEGIN; INSERT INTO t VALUES(11); ROLLBACK;")
+                .unwrap();
+            assert_eq!(int(&b, "SELECT count(*) FROM t"), Some(3));
+            assert_eq!(dv(&a), start + 1, "{journal}: rollback / read elsewhere");
+            b.execute_batch("BEGIN; INSERT INTO t VALUES(12); INSERT INTO t VALUES(13); COMMIT;")
+                .unwrap();
+            assert_eq!(dv(&a), start + 2, "{journal}: one transaction, one step");
+            a.execute_batch("INSERT INTO t VALUES(4)").unwrap();
+            assert_eq!(
+                dv(&a),
+                start + 2,
+                "{journal}: own commit after a foreign one"
+            );
+
+            // Inside a read transaction the snapshot, and with it the value, is frozen.
+            a.execute_batch("BEGIN; SELECT count(*) FROM t;").unwrap();
+            if journal == "wal" {
+                b.execute_batch("INSERT INTO t VALUES(30)").unwrap();
+            }
+            assert_eq!(dv(&a), start + 2, "{journal}: inside own read transaction");
+            a.execute_batch("COMMIT").unwrap();
+            let expect = if journal == "wal" {
+                start + 3
+            } else {
+                start + 2
+            };
+            assert_eq!(dv(&a), expect, "{journal}: after the read transaction");
+
+            // The other connection kept its own count.
+            assert!(dv(&b) > 1);
+            assert!(a.try_close().is_ok());
+            assert!(b.try_close().is_ok());
+        }
+    }
+
+    /// `PRAGMA cell_size_check=ON` (`btreeCellSizeCheck`): a b-tree page with a cell pointer
+    /// outside the cell content area, or a cell that runs past the end of the page, is refused
+    /// with `SQLITE_CORRUPT` as soon as the page is loaded — also for statements that never
+    /// touch the damaged cell, which is all the lazy validation without the pragma notices.
+    #[test]
+    fn cell_size_check_validates_pages_on_load() {
+        let vfs = Arc::new(MemoryVfs::new());
+        let path = Path::new("/csc.db");
+        let conn = open(&vfs, path);
+        conn.execute_batch(
+            "PRAGMA page_size=1024;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, b TEXT);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<600)
+               INSERT INTO t SELECT i, 'row-'||i||'-'||substr('xxxxxxxxxxxxxxxxxxxxxxxx',1,i%23) FROM n;
+             CREATE TABLE healthy(id INTEGER PRIMARY KEY, b TEXT);
+             INSERT INTO healthy VALUES(1,'one');",
+        )
+        .unwrap();
+        let root = int(&conn, "SELECT rootpage FROM sqlite_schema WHERE name='t'").unwrap();
+        assert!(conn.try_close().is_ok());
+
+        // The root is an interior page; damage its second leaf: point the last cell at
+        // `usable - 2`, beyond the last possible cell offset (`usable - 4`).
+        let bytes = file_bytes(&vfs, path);
+        let page = |n: usize| &bytes[(n - 1) * 1024..n * 1024];
+        let root_page = page(root as usize);
+        assert_eq!(root_page[0], 0x05, "table root must be an interior page");
+        let cell1 = u16::from_be_bytes([root_page[14], root_page[15]]) as usize;
+        let leaf = u32::from_be_bytes(root_page[cell1..cell1 + 4].try_into().unwrap()) as usize;
+        let leaf_page = page(leaf);
+        assert_eq!(leaf_page[0], 0x0d);
+        let n_cell = u16::from_be_bytes([leaf_page[3], leaf_page[4]]) as usize;
+        let first_ptr = u16::from_be_bytes([leaf_page[8], leaf_page[9]]) as usize;
+        // Rowid of the first cell of that leaf: payload-size varint, then the rowid varint.
+        let (_, n1) = sqliters_types::get_varint(&leaf_page[first_ptr..]).unwrap();
+        let (first_rowid, _) =
+            sqliters_types::get_varint_i64(&leaf_page[first_ptr + n1..]).unwrap();
+        {
+            let file = vfs
+                .open(Some(path), OpenFlags::READWRITE | OpenFlags::MAIN_DB)
+                .unwrap();
+            let slot = (leaf - 1) * 1024 + 8 + 2 * (n_cell - 1);
+            file.write_at(&1022u16.to_be_bytes(), slot as u64).unwrap();
+        }
+
+        let probe = format!("SELECT id FROM t WHERE id={first_rowid}");
+        // Without the check the undamaged first cell of the page is still served.
+        let conn = open(&vfs, path);
+        assert_eq!(int(&conn, "PRAGMA cell_size_check"), Some(0));
+        assert_eq!(int(&conn, &probe), Some(first_rowid));
+        assert!(conn.try_close().is_ok());
+
+        let conn = open(&vfs, path);
+        conn.execute_batch("PRAGMA cell_size_check=ON").unwrap();
+        for sql in [
+            probe.clone(),
+            format!("UPDATE t SET b='z' WHERE id={first_rowid}"),
+            format!("DELETE FROM t WHERE id={}", first_rowid + 1),
+            "SELECT sum(length(b)) FROM t".to_owned(),
+        ] {
+            let err = conn.query(&sql, &[]).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Corrupt, "{sql}");
+            assert_eq!(err.message, "database disk image is malformed", "{sql}");
+        }
+        // Pages without a bad cell are not affected, in this and in other tables.
+        assert_eq!(int(&conn, "SELECT id FROM t WHERE id=1"), Some(1));
+        assert_eq!(texts(&conn, "SELECT b FROM healthy"), ["one"]);
+        assert!(conn.try_close().is_ok());
+
+        // The flag belongs to the connection: a database attached later is checked as well.
+        let other = open(&vfs, Path::new("/other.db"));
+        other
+            .execute_batch("PRAGMA cell_size_check=ON; ATTACH '/csc.db' AS x;")
+            .unwrap();
+        let attached_probe = format!("SELECT id FROM x.t WHERE id={first_rowid}");
+        let err = other.query(&attached_probe, &[]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Corrupt);
+        other.execute_batch("PRAGMA cell_size_check=OFF").unwrap();
+        assert_eq!(int(&other, &attached_probe), Some(first_rowid));
+        assert!(other.try_close().is_ok());
+    }
+
+    /// `ALTER TABLE ... ADD COLUMN` (`sqlite3AlterFinishAddColumn`, `alter.c`): the column
+    /// definition is spliced into the stored `CREATE TABLE` text exactly as written (C's
+    /// `addColOffset` rule), rows that predate the column read the default the way
+    /// `sqlite3ValueFromExpr` folds it, and every refusal carries C's message and
+    /// `SQLITE_ERROR` — the checks that only apply to a table with rows included. Each expected
+    /// value is what the reference `sqlite3` 3.54.1 produces: `Ok((stored sql,
+    /// typeof|quote of the new column in the first existing row))` or `Err(message)`.
+    #[test]
+    fn alter_table_add_column_matches_c() {
+        type Want = std::result::Result<(&'static str, &'static str), &'static str>;
+        #[rustfmt::skip]
+        let cases: &[(&str, &str, &str, usize, bool, Want)] = &[
+            ("CREATE TABLE t(a);", "t", "b", 2, false, Ok(("CREATE TABLE t(a, b)", "null|NULL"))),
+            ("CREATE TABLE t(a);", "t", "b DEFAULT 7", 2, false, Ok(("CREATE TABLE t(a, b DEFAULT 7)", "integer|7"))),
+            ("CREATE TABLE t(a);", "t", "c TEXT DEFAULT 'x y'", 2, false, Ok(("CREATE TABLE t(a, c TEXT DEFAULT 'x y')", "text|'x y'"))),
+            ("CREATE TABLE t(a);", "t", "e DEFAULT -5", 2, false, Ok(("CREATE TABLE t(a, e DEFAULT -5)", "integer|-5"))),
+            ("CREATE TABLE t(a);", "t", "f DEFAULT NULL", 2, false, Ok(("CREATE TABLE t(a, f DEFAULT NULL)", "null|NULL"))),
+            ("CREATE TABLE t(a);", "t", "g INT NOT NULL DEFAULT 0 CHECK(g >= 0)", 2, false, Ok(("CREATE TABLE t(a, g INT NOT NULL DEFAULT 0 CHECK(g >= 0))", "integer|0"))),
+            ("CREATE TABLE t(a);", "t", "h REFERENCES t(a)", 2, false, Ok(("CREATE TABLE t(a, h REFERENCES t(a))", "null|NULL"))),
+            ("CREATE TABLE t(a);", "t", "i GENERATED ALWAYS AS (a+1)", 2, false, Ok(("CREATE TABLE t(a, i GENERATED ALWAYS AS (a+1))", "integer|11"))),
+            ("CREATE TABLE t(a);", "t", "i2 AS (a+1) VIRTUAL", 2, false, Ok(("CREATE TABLE t(a, i2 AS (a+1) VIRTUAL)", "integer|11"))),
+            ("CREATE TABLE t(a);", "t", "j DEFAULT 1.5 COLLATE nocase", 2, false, Ok(("CREATE TABLE t(a, j DEFAULT 1.5 COLLATE nocase)", "real|1.5"))),
+            ("CREATE TABLE t(a);", "t", "\"k k\" DEFAULT x'00'", 2, false, Ok(("CREATE TABLE t(a, \"k k\" DEFAULT x'00')", "blob|X'00'"))),
+            ("CREATE TABLE t(a);", "t", "k2 BLOB DEFAULT X'0102ff'", 2, false, Ok(("CREATE TABLE t(a, k2 BLOB DEFAULT X'0102ff')", "blob|X'0102FF'"))),
+            ("CREATE TABLE t(a);", "t", "m VARCHAR(10, 2) DEFAULT 'a''b'", 2, false, Ok(("CREATE TABLE t(a, m VARCHAR(10, 2) DEFAULT 'a''b')", "text|'a''b'"))),
+            ("CREATE TABLE t(a);", "t", "[n n] INT", 2, false, Ok(("CREATE TABLE t(a, [n n] INT)", "null|NULL"))),
+            ("CREATE TABLE t(a);", "t", "`o` REAL", 2, false, Ok(("CREATE TABLE t(a, `o` REAL)", "null|NULL"))),
+            ("CREATE TABLE t(a);", "t", "p DEFAULT \"str\"", 2, false, Ok(("CREATE TABLE t(a, p DEFAULT \"str\")", "text|'str'"))),
+            ("CREATE TABLE t(a);", "t", "b DEFAULT a", 2, false, Ok(("CREATE TABLE t(a, b DEFAULT a)", "text|'a'"))),
+            ("CREATE TABLE t(a);", "t", "s DEFAULT TRUE", 2, false, Ok(("CREATE TABLE t(a, s DEFAULT TRUE)", "integer|1"))),
+            ("CREATE TABLE t(a);", "t", "b /* c */ INT /* d */ ", 2, false, Ok(("CREATE TABLE t(a, b /* c */ INT /* d */)", "null|NULL"))),
+            ("CREATE TABLE t(a);", "t", "b\n  INT\n  DEFAULT 5\n", 2, false, Ok(("CREATE TABLE t(a, b\n  INT\n  DEFAULT 5)", "integer|5"))),
+            ("CREATE TABLE t(a);", "t", "b INT   ;; ", 2, false, Ok(("CREATE TABLE t(a, b INT)", "null|NULL"))),
+            ("CREATE TABLE t(a);", "t", "b CONSTRAINT nn NOT NULL DEFAULT 5", 2, false, Ok(("CREATE TABLE t(a, b CONSTRAINT nn NOT NULL DEFAULT 5)", "integer|5"))),
+            ("CREATE TABLE t(a);", "t", "b DEFAULT (CAST(5 AS TEXT))", 2, false, Ok(("CREATE TABLE t(a, b DEFAULT (CAST(5 AS TEXT)))", "text|'5'"))),
+            ("CREATE TABLE t(a);", "t", "b DEFAULT (-(5))", 2, false, Ok(("CREATE TABLE t(a, b DEFAULT (-(5)))", "integer|-5"))),
+            ("CREATE TABLE t(a);", "t", "b DEFAULT ((2))", 2, false, Ok(("CREATE TABLE t(a, b DEFAULT ((2)))", "integer|2"))),
+            ("CREATE TABLE t(a);", "t", "b DEFAULT -9223372036854775808", 2, false, Ok(("CREATE TABLE t(a, b DEFAULT -9223372036854775808)", "integer|-9223372036854775808"))),
+            ("CREATE TABLE t(a);", "t", "b DEFAULT (-x'31')", 2, false, Ok(("CREATE TABLE t(a, b DEFAULT (-x'31'))", "integer|-1"))),
+            ("CREATE TABLE t(a);", "t", "b DEFAULT (CAST(x'31' AS INT))", 2, false, Ok(("CREATE TABLE t(a, b DEFAULT (CAST(x'31' AS INT)))", "integer|1"))),
+            ("CREATE TABLE t(a);", "t", "b REAL DEFAULT 3", 2, false, Ok(("CREATE TABLE t(a, b REAL DEFAULT 3)", "real|3.0"))),
+            ("CREATE TABLE t(a);", "t", "b INT DEFAULT '12'", 2, false, Ok(("CREATE TABLE t(a, b INT DEFAULT '12')", "integer|12"))),
+            ("CREATE TABLE t(a);", "t", "b REFERENCES t(a) DEFAULT 5", 2, false, Ok(("CREATE TABLE t(a, b REFERENCES t(a) DEFAULT 5)", "integer|5"))),
+            ("CREATE TABLE t(a);", "t", "b REFERENCES t(a) DEFAULT 5", 0, true, Ok(("CREATE TABLE t(a, b REFERENCES t(a) DEFAULT 5)", ""))),
+            ("CREATE TABLE t(a);", "t", "b REFERENCES t(a) DEFAULT 5", 2, true, Err("Cannot add a REFERENCES column with non-NULL default value")),
+            ("CREATE TABLE t(a);", "t", "b REFERENCES t(a) DEFAULT NULL", 2, true, Ok(("CREATE TABLE t(a, b REFERENCES t(a) DEFAULT NULL)", "null|NULL"))),
+            ("CREATE TABLE t(a);", "t", "b INT REFERENCES t(a) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED", 2, true, Ok(("CREATE TABLE t(a, b INT REFERENCES t(a) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED)", "null|NULL"))),
+            ("CREATE TABLE t(a);", "t", "b CHECK(b>0) DEFAULT 1", 2, false, Ok(("CREATE TABLE t(a, b CHECK(b>0) DEFAULT 1)", "integer|1"))),
+            ("CREATE TABLE t(a);", "t", "b CHECK(b>0) DEFAULT -1", 0, false, Ok(("CREATE TABLE t(a, b CHECK(b>0) DEFAULT -1)", ""))),
+            ("CREATE TABLE t(a);", "t", "b CHECK(b>0) DEFAULT -1", 2, false, Err("CHECK constraint failed")),
+            ("CREATE TABLE t(a);", "t", "b INT NOT NULL AS (NULL)", 0, false, Ok(("CREATE TABLE t(a, b INT NOT NULL AS (NULL))", ""))),
+            ("CREATE TABLE t(a);", "t", "b INT NOT NULL AS (NULL)", 2, false, Err("NOT NULL constraint failed")),
+            ("CREATE TABLE t(a);", "t", "b INT NOT NULL AS (a) VIRTUAL", 2, false, Ok(("CREATE TABLE t(a, b INT NOT NULL AS (a) VIRTUAL)", "integer|10"))),
+            ("CREATE TABLE t(a);", "t", "d DEFAULT (1+2)", 0, false, Ok(("CREATE TABLE t(a, d DEFAULT (1+2))", ""))),
+            ("CREATE TABLE t(a);", "t", "d DEFAULT (1+2)", 2, false, Err("Cannot add a column with non-constant default")),
+            ("CREATE TABLE t(a);", "t", "l DEFAULT CURRENT_TIMESTAMP", 0, false, Ok(("CREATE TABLE t(a, l DEFAULT CURRENT_TIMESTAMP)", ""))),
+            ("CREATE TABLE t(a);", "t", "l DEFAULT CURRENT_TIMESTAMP", 2, false, Err("Cannot add a column with non-constant default")),
+            ("CREATE TABLE t(a);", "t", "b DEFAULT (abs(-3))", 0, false, Ok(("CREATE TABLE t(a, b DEFAULT (abs(-3)))", ""))),
+            ("CREATE TABLE t(a);", "t", "b DEFAULT (abs(-3))", 2, false, Err("Cannot add a column with non-constant default")),
+            ("CREATE TABLE t(a);", "t", "b DEFAULT (a)", 2, false, Err("default value of column [b] is not constant")),
+            ("CREATE TABLE t(a);", "t", "b DEFAULT (?)", 2, false, Err("default value of column [b] is not constant")),
+            ("CREATE TABLE t(a);", "t", "i3 INT AS (a) STORED", 0, false, Ok(("CREATE TABLE t(a, i3 INT AS (a) STORED)", ""))),
+            ("CREATE TABLE t(a);", "t", "i3 INT AS (a) STORED", 2, false, Err("cannot add a STORED column")),
+            ("CREATE TABLE t(a);", "t", "v NOT NULL", 0, false, Ok(("CREATE TABLE t(a, v NOT NULL)", ""))),
+            ("CREATE TABLE t(a);", "t", "v NOT NULL", 2, false, Err("Cannot add a NOT NULL column with default value NULL")),
+            ("CREATE TABLE t(a);", "t", "w NOT NULL DEFAULT NULL", 0, false, Ok(("CREATE TABLE t(a, w NOT NULL DEFAULT NULL)", ""))),
+            ("CREATE TABLE t(a);", "t", "w NOT NULL DEFAULT NULL", 2, false, Err("Cannot add a NOT NULL column with default value NULL")),
+            ("CREATE TABLE t(a);", "t", "x PRIMARY KEY", 2, false, Err("Cannot add a PRIMARY KEY column")),
+            ("CREATE TABLE t(a);", "t", "x2 INTEGER PRIMARY KEY AUTOINCREMENT", 2, false, Err("Cannot add a PRIMARY KEY column")),
+            ("CREATE TABLE t(a);", "t", "y UNIQUE", 2, false, Err("Cannot add a UNIQUE column")),
+            ("CREATE TABLE t(a);", "t", "rowid INT", 2, false, Err("cannot add rowid alias: rowid")),
+            ("CREATE TABLE t(a);", "t", "A INT", 2, false, Err("duplicate column name: A")),
+            ("CREATE TABLE t(a);", "t", "b COLLATE nosuchcoll", 2, false, Err("no such collation sequence: nosuchcoll")),
+            ("CREATE TABLE t(a);", "t", "b AS (a) DEFAULT 5", 2, false, Err("cannot use DEFAULT on a generated column")),
+            ("CREATE TABLE t(a);", "t", "b AS (a) PRIMARY KEY", 2, false, Err("generated columns cannot be part of the PRIMARY KEY")),
+            ("CREATE TABLE t(a);", "t", "b AS (c)", 2, false, Err("error in table t after add column: no such column: c")),
+            ("CREATE TABLE t(a INT, b0 TEXT, PRIMARY KEY(a));", "t", "b DEFAULT 7", 2, false, Ok(("CREATE TABLE t(a INT, b0 TEXT, b DEFAULT 7, PRIMARY KEY(a))", "integer|7"))),
+            ("CREATE TABLE t(a , CONSTRAINT c1 CHECK(a>0) );", "t", "c TEXT DEFAULT 'x y'", 2, false, Ok(("CREATE TABLE t(a , c TEXT DEFAULT 'x y', CONSTRAINT c1 CHECK(a>0) )", "text|'x y'"))),
+            ("CREATE TABLE t(a INT,b0,UNIQUE(b0),FOREIGN KEY(a) REFERENCES t(b0));", "t", "b", 2, false, Ok(("CREATE TABLE t(a INT,b0, b,UNIQUE(b0),FOREIGN KEY(a) REFERENCES t(b0))", "null|NULL"))),
+            ("CREATE TABLE \"t t\"(a)  ;", "\"t t\"", "b DEFAULT 7", 2, false, Ok(("CREATE TABLE \"t t\"(a, b DEFAULT 7)", "integer|7"))),
+            ("CREATE TABLE t(a /* c */ )   ;", "t", "b DEFAULT 7", 2, false, Ok(("CREATE TABLE t(a /* c */ , b DEFAULT 7)", "integer|7"))),
+            ("CREATE TABLE t(\n  a INT, -- first\n  b0 TEXT -- second\n);", "t", "b DEFAULT 7", 2, false, Ok(("CREATE TABLE t(\n  a INT, -- first\n  b0 TEXT -- second\n, b DEFAULT 7)", "integer|7"))),
+            ("CREATE TABLE t(a PRIMARY KEY) WITHOUT ROWID;", "t", "b DEFAULT 7", 2, false, Ok(("CREATE TABLE t(a PRIMARY KEY, b DEFAULT 7) WITHOUT ROWID", "integer|7"))),
+            ("CREATE TABLE t(a PRIMARY KEY) WITHOUT ROWID;", "t", "rowid INT", 2, false, Ok(("CREATE TABLE t(a PRIMARY KEY, rowid INT) WITHOUT ROWID", "null|NULL"))),
+            ("CREATE TABLE t(a INT) STRICT;", "t", "b ANY DEFAULT 'x'", 2, false, Ok(("CREATE TABLE t(a INT, b ANY DEFAULT 'x') STRICT", "text|'x'"))),
+            ("CREATE TABLE t(a INT) STRICT;", "t", "b INT DEFAULT 'x'", 0, false, Ok(("CREATE TABLE t(a INT, b INT DEFAULT 'x') STRICT", ""))),
+            ("CREATE TABLE t(a INT) STRICT;", "t", "b INT DEFAULT 'x'", 2, false, Err("type mismatch on DEFAULT")),
+            ("CREATE TABLE t(a INT) STRICT;", "t", "b BADTYPE", 2, false, Err("error in table t after add column: unknown datatype for t.b: \"BADTYPE\"")),
+            ("CREATE TABLE t(a INT) STRICT;", "t", "b", 2, false, Err("error in table t after add column: missing datatype for t.b")),
+            ("create table t(a);", "t", "b DEFAULT 7", 2, false, Ok(("CREATE TABLE t(a, b DEFAULT 7)", "integer|7"))),
+            ("CREATE TABLE IF NOT EXISTS main.t(a);", "t", "b DEFAULT 7", 2, false, Ok(("CREATE TABLE t(a, b DEFAULT 7)", "integer|7"))),
+            ("CREATE TABLE old(a); ALTER TABLE old RENAME TO t;", "t", "b DEFAULT 7", 2, false, Ok(("CREATE TABLE \"t\"(a, b DEFAULT 7)", "integer|7"))),
+            ("CREATE TABLE t(a); ALTER TABLE t ADD COLUMN z0 INT DEFAULT 3;", "t", "b DEFAULT 7", 2, false, Ok(("CREATE TABLE t(a, z0 INT DEFAULT 3, b DEFAULT 7)", "integer|7"))),
+            ("CREATE TABLE t(a, z0, z1); ALTER TABLE t DROP COLUMN z1;", "t", "b DEFAULT 7", 2, false, Ok(("CREATE TABLE t(a, z0, b DEFAULT 7)", "integer|7"))),
+            ("CREATE TABLE \"tü\"(a TEXT);", "\"tü\"", "\"ö\" DEFAULT 'ß'", 2, false, Ok(("CREATE TABLE \"tü\"(a TEXT, \"ö\" DEFAULT 'ß')", "text|'ß'"))),
+            ("CREATE TABLE\tt\t(\ta\t)\t;", "t", "b DEFAULT 7", 2, false, Ok(("CREATE TABLE t\t(\ta\t, b DEFAULT 7)", "integer|7"))),
+            ("CREATE TABLE t(a,PRIMARY KEY(a));", "t", "b DEFAULT 7", 2, false, Ok(("CREATE TABLE t(a, b DEFAULT 7,PRIMARY KEY(a))", "integer|7"))),
+            ("CREATE TABLE src(a); CREATE TABLE t AS SELECT a FROM src;", "t", "b DEFAULT 7", 2, false, Ok(("CREATE TABLE t(a, b DEFAULT 7)", "integer|7"))),
+            ("CREATE TABLE t(a); CREATE VIEW v AS SELECT a FROM t;", "v", "b", 0, false, Err("Cannot add a column to a view")),
+            ("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT);", "sqlite_sequence", "b", 0, false, Err("table sqlite_sequence may not be altered")),
+            ("CREATE TABLE t(a);", "sqlite_schema", "b", 0, false, Err("table sqlite_master may not be altered")),
+            ("CREATE TABLE t(a);", "nosuch", "b", 0, false, Err("no such table: nosuch")),
+        ];
+        let stored = |conn: &Connection| -> Vec<String> {
+            texts(
+                conn,
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name IN ('t','t t','tü')",
+            )
+        };
+        for &(setup, table, col, rows, fk, want) in cases {
+            let what = format!("{setup} / ADD COLUMN {col} / rows={rows} fk={fk}");
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!("PRAGMA foreign_keys={}", i32::from(fk)))
+                .unwrap();
+            conn.execute_batch(setup).unwrap();
+            for k in 0..rows {
+                conn.execute_batch(&format!("INSERT INTO {table}(a) VALUES({})", 10 * (k + 1)))
+                    .unwrap();
+            }
+            let before = stored(&conn);
+            let res = conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col};"));
+            match want {
+                Ok((sql, val)) => {
+                    res.unwrap_or_else(|e| panic!("{what}: {}", e.message));
+                    assert_eq!(stored(&conn), [sql], "{what}");
+                    if rows > 0 {
+                        let name = sqliters_syntax::parse_one(&format!("ALTER TABLE x ADD {col}"))
+                            .ok()
+                            .and_then(|(stmt, _)| match stmt {
+                                Some(Stmt::AlterTable {
+                                    action:
+                                        sqliters_syntax::AlterTableAction::AddColumn { column, .. },
+                                    ..
+                                }) => Some(column.name),
+                                _ => None,
+                            })
+                            .unwrap();
+                        let q = format!("\"{}\"", name.replace('"', "\"\""));
+                        assert_eq!(
+                            texts(
+                                &conn,
+                                &format!(
+                                    "SELECT typeof({q})||'|'||quote({q}) FROM {table} LIMIT 1"
+                                )
+                            ),
+                            [val],
+                            "{what}"
+                        );
+                    }
+                    assert_eq!(texts(&conn, "PRAGMA integrity_check"), ["ok"], "{what}");
+                }
+                Err(msg) => {
+                    let err = res.expect_err(&what);
+                    assert_eq!(err.message, msg, "{what}");
+                    // C returns SQLITE_ERROR for every one of these. The two failures of the
+                    // post-ALTER row check keep SQLITE_CONSTRAINT, which the integration test
+                    // for finding Y8 (`tests/bulgular_regressions.rs`) requires.
+                    let want_code = match msg {
+                        "CHECK constraint failed" | "NOT NULL constraint failed" => {
+                            ErrorCode::Constraint
+                        }
+                        _ => ErrorCode::Error,
+                    };
+                    assert_eq!(err.code, want_code, "{what}");
+                    assert_eq!(stored(&conn), before, "{what}: schema must be unchanged");
+                }
+            }
+        }
+
+        // A rejected ALTER inside a transaction leaves the table usable and unchanged, and the
+        // text survives a round trip through another connection's schema load.
+        let vfs = Arc::new(MemoryVfs::new());
+        let path = Path::new("/alter.db");
+        let conn = open(&vfs, path);
+        conn.execute_batch(
+            "CREATE TABLE t(a, PRIMARY KEY(a)); INSERT INTO t VALUES(1),(2);
+             BEGIN;
+             ALTER TABLE t ADD COLUMN k DEFAULT x'00ff10';",
+        )
+        .unwrap();
+        assert!(
+            conn.execute_batch("ALTER TABLE t ADD COLUMN c CHECK(c>0) DEFAULT -1")
+                .is_err()
+        );
+        conn.execute_batch("ALTER TABLE t ADD COLUMN c CHECK(c>0) DEFAULT 1; COMMIT;")
+            .unwrap();
+        let want_sql =
+            "CREATE TABLE t(a, k DEFAULT x'00ff10', c CHECK(c>0) DEFAULT 1, PRIMARY KEY(a))";
+        assert_eq!(stored(&conn), [want_sql]);
+        assert!(conn.try_close().is_ok());
+        let conn = open(&vfs, path);
+        assert_eq!(stored(&conn), [want_sql]);
+        conn.execute_batch("INSERT INTO t(a) VALUES(3)").unwrap();
+        assert_eq!(
+            texts(&conn, "SELECT a||'|'||quote(k)||'|'||c FROM t ORDER BY a"),
+            ["1|X'00FF10'|1", "2|X'00FF10'|1", "3|X'00FF10'|1"]
+        );
+    }
+
+    /// Header of a database that has no table yet (inventory class H2): after a first
+    /// statement such as `PRAGMA journal_mode=WAL`, `auto_vacuum`, `user_version`, an empty
+    /// write transaction or `VACUUM`, the schema format (offset 44) and the text encoding
+    /// (offset 56) are still 0 as in C, and `PRAGMA encoding` is honoured until the connection
+    /// has seen a schema object (`DBFLAG_EncodingFixed`).
+    #[test]
+    fn table_less_database_header_and_pragma_encoding_rule() {
+        fn fields(vfs: &MemoryVfs, path: &Path) -> (u32, u32) {
+            let b = file_bytes(vfs, path);
+            let u = |off: usize| u32::from_be_bytes(b[off..off + 4].try_into().unwrap());
+            (u(44), u(56))
+        }
+        let path = Path::new("/h2.db");
+        for (first, encoding, want_code) in [
+            ("PRAGMA journal_mode=WAL", "UTF-16be", 3u32),
+            ("PRAGMA auto_vacuum=FULL", "UTF-16le", 2),
+            ("PRAGMA user_version=5", "UTF-16be", 3),
+            ("PRAGMA application_id=7", "UTF-16le", 2),
+            ("BEGIN IMMEDIATE; COMMIT", "UTF-16be", 3),
+            ("VACUUM", "UTF-16le", 2),
+            ("PRAGMA page_size=8192; VACUUM", "UTF-16be", 3),
+            ("PRAGMA schema_version=9", "UTF-8", 1),
+        ] {
+            let vfs = Arc::new(MemoryVfs::new());
+            let conn = open(&vfs, path);
+            conn.execute_batch(first).unwrap();
+            if first.contains("WAL") {
+                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .unwrap();
+            }
+            assert_eq!(fields(&vfs, path), (0, 0), "{first}");
+            assert_eq!(texts(&conn, "PRAGMA encoding"), ["UTF-8"], "{first}");
+            assert!(conn.try_close().is_ok());
+
+            // A second connection finds page 1 on disk and may still choose the encoding.
+            let conn = open(&vfs, path);
+            conn.execute_batch(&format!("PRAGMA encoding='{encoding}'"))
+                .unwrap();
+            assert_eq!(texts(&conn, "PRAGMA encoding"), [encoding], "{first}");
+            conn.execute_batch("PRAGMA user_version=11").unwrap();
+            assert_eq!(texts(&conn, "PRAGMA encoding"), [encoding], "{first}");
+            conn.execute_batch(
+                "CREATE TABLE t(a TEXT); INSERT INTO t VALUES('\u{e9}xyz');                  PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+            assert_eq!(fields(&vfs, path), (4, want_code), "{first}");
+            // Once a table exists the encoding is final.
+            conn.execute_batch("PRAGMA encoding='UTF-8'; PRAGMA encoding='latin1';")
+                .unwrap();
+            assert_eq!(texts(&conn, "PRAGMA encoding"), [encoding], "{first}");
+            assert!(conn.try_close().is_ok());
+            let stored: &[u8] = match want_code {
+                1 => b"\xc3\xa9xyz",
+                2 => b"\xe9\0x\0y\0z\0",
+                _ => b"\0\xe9\0x\0y\0z",
+            };
+            assert_eq!(count(&file_bytes(&vfs, path), stored), 1, "{first}");
+            let conn = open(&vfs, path);
+            assert_eq!(texts(&conn, "PRAGMA encoding"), [encoding], "{first}");
+            assert_eq!(texts(&conn, "SELECT a FROM t"), ["\u{e9}xyz"], "{first}");
+            assert_eq!(texts(&conn, "PRAGMA integrity_check"), ["ok"]);
+            assert!(conn.try_close().is_ok());
+        }
+
+        // `DBFLAG_EncodingFixed`: a schema object anywhere in the connection (a TEMP table is
+        // enough) ends the choice; an unknown name is only an error while it could apply.
+        let vfs = Arc::new(MemoryVfs::new());
+        let conn = open(&vfs, path);
+        conn.execute_batch("PRAGMA user_version=5").unwrap();
+        let err = conn.execute_batch("PRAGMA encoding='latin1'").unwrap_err();
+        assert_eq!(err.message, "unsupported encoding: latin1");
+        assert_eq!(err.code, ErrorCode::Error);
+        conn.execute_batch("CREATE TEMP TABLE tt(a); PRAGMA encoding='UTF-16be';")
+            .unwrap();
+        assert_eq!(texts(&conn, "PRAGMA encoding"), ["UTF-8"]);
+        conn.execute_batch("PRAGMA encoding='latin1'; CREATE TABLE t(a TEXT);")
+            .unwrap();
+        assert_eq!(fields(&vfs, path), (4, 1));
+        assert!(conn.try_close().is_ok());
+
+        // VACUUM copies the header fields as stored: a file whose only table was dropped keeps
+        // its recorded encoding and loses the schema format, as in C.
+        let vfs = Arc::new(MemoryVfs::new());
+        let conn = open(&vfs, path);
+        conn.execute_batch("CREATE TABLE z(a); DROP TABLE z;")
+            .unwrap();
+        assert_eq!(fields(&vfs, path), (4, 1));
+        conn.execute_batch("VACUUM").unwrap();
+        assert_eq!(fields(&vfs, path), (0, 1));
+        assert!(conn.try_close().is_ok());
+        let conn = open(&vfs, path);
+        conn.execute_batch("PRAGMA encoding='UTF-16be'; CREATE TABLE t(a TEXT);")
+            .unwrap();
+        assert_eq!(texts(&conn, "PRAGMA encoding"), ["UTF-8"]);
+        assert_eq!(fields(&vfs, path), (4, 1));
+        assert!(conn.try_close().is_ok());
+
+        // An attached database that has no table yet follows the connection encoding.
+        let vfs = Arc::new(MemoryVfs::new());
+        let conn = open(&vfs, path);
+        conn.execute_batch(
+            "PRAGMA user_version=5; ATTACH '/h2aux.db' AS aux; PRAGMA aux.user_version=6;
+             PRAGMA encoding='UTF-16be';
+             CREATE TABLE aux.t(a TEXT); INSERT INTO aux.t VALUES('q');",
+        )
+        .unwrap();
+        assert_eq!(texts(&conn, "PRAGMA encoding"), ["UTF-16be"]);
+        assert_eq!(fields(&vfs, Path::new("/h2aux.db")), (4, 3));
+        assert_eq!(fields(&vfs, path), (0, 0));
         assert!(conn.try_close().is_ok());
     }
 }

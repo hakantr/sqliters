@@ -106,7 +106,7 @@ impl Btree {
         }
         let offset = ptrmap_offset(i_ptrmap, key, usable)?;
         {
-            let ro = self.pager.read_page(i_ptrmap)?;
+            let ro = self.pager.read_page_unchecked(i_ptrmap)?;
             let cur_type = ro[offset];
             let cur_parent = u32::from_be_bytes([
                 ro[offset + 1],
@@ -142,7 +142,7 @@ impl Btree {
             )));
         }
         let offset = ptrmap_offset(i_ptrmap, key, usable)?;
-        let ro = self.pager.read_page(i_ptrmap)?;
+        let ro = self.pager.read_page_unchecked(i_ptrmap)?;
         let raw_type = ro[offset];
         let parent = u32::from_be_bytes([
             ro[offset + 1],
@@ -377,7 +377,7 @@ impl Btree {
             let _ = self.pager.write_page(from_pgno)?;
         }
 
-        let page_bytes = self.pager.read_page(from_pgno)?.to_vec();
+        let page_bytes = self.pager.read_page_unchecked(from_pgno)?.to_vec();
         {
             let dst = self.pager.write_page(to_pgno)?;
             dst.copy_from_slice(&page_bytes);

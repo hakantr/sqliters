@@ -426,8 +426,18 @@ pub struct CreateTriggerStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterTableAction {
     RenameTo(String),
-    RenameColumn { old_name: String, new_name: String },
-    AddColumn(ColumnDef),
+    RenameColumn {
+        old_name: String,
+        new_name: String,
+    },
+    /// `ALTER TABLE ... ADD [COLUMN] <column-def>`.
+    AddColumn {
+        column: ColumnDef,
+        /// The column definition exactly as written, from the column name to the end of the
+        /// statement with trailing `;` and whitespace removed. This is the text C splices into
+        /// the stored `CREATE TABLE` statement (`sqlite3AlterFinishAddColumn`, `alter.c`).
+        column_sql: String,
+    },
     DropColumn(String),
 }
 

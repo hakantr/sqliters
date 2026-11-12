@@ -336,7 +336,7 @@ impl IntegrityCk<'_> {
             let next = if is_free_list {
                 let mut buf = std::mem::take(&mut self.list_buf);
                 buf.clear();
-                match self.bt.pager.read_page(i_page) {
+                match self.bt.pager.read_page_unchecked(i_page) {
                     Ok(raw) => buf.extend_from_slice(raw),
                     Err(_) => {
                         self.list_buf = buf;
@@ -366,7 +366,7 @@ impl IntegrityCk<'_> {
                 self.list_buf = buf;
                 next
             } else {
-                let next = match self.bt.pager.read_page(i_page) {
+                let next = match self.bt.pager.read_page_unchecked(i_page) {
                     Ok(raw) => get4(raw, 0),
                     Err(_) => {
                         self.append_msg(format_args!("failed to get page {i_page}"));
@@ -446,7 +446,7 @@ impl IntegrityCk<'_> {
         let mut depth: i32 = -1;
 
         data.clear();
-        match self.bt.pager.read_page(i_page) {
+        match self.bt.pager.read_page_unchecked(i_page) {
             Ok(raw) => {
                 data.extend_from_slice(raw);
                 data.resize(raw.len().max(usable as usize) + PAGE_PAD, 0);

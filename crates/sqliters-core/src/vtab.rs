@@ -2717,7 +2717,11 @@ fn collect_btree_dbstat_pages(
     if pgno == 0 || !visited.insert(pgno) {
         return;
     }
-    let Ok(page_buf) = btree.pager_mut().read_page(pgno).map(|p| p.to_vec()) else {
+    let Ok(page_buf) = btree
+        .pager_mut()
+        .read_page_unchecked(pgno)
+        .map(|p| p.to_vec())
+    else {
         return;
     };
     let hdr_off = if pgno == 1 { 100usize } else { 0usize };
@@ -2872,7 +2876,11 @@ fn collect_btree_dbstat_pages(
         let mut chain_idx = 0usize;
         let max_per_ovf = (usable_size - 4).max(1);
         while cur_ovf != 0 && rem_payload > 0 && visited.insert(cur_ovf) {
-            let Ok(ovf_buf) = btree.pager_mut().read_page(cur_ovf).map(|p| p.to_vec()) else {
+            let Ok(ovf_buf) = btree
+                .pager_mut()
+                .read_page_unchecked(cur_ovf)
+                .map(|p| p.to_vec())
+            else {
                 break;
             };
             if ovf_buf.len() < 4 {

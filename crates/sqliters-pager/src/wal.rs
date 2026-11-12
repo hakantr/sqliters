@@ -1694,8 +1694,11 @@ impl Wal {
             let min_bytes = wal_frame_offset(i_frame + n_extra + 1, page_size);
             let target_sz = (self.mx_wal_size as u64).max(min_bytes);
             let wal_fd = self.wal_file.as_ref().expect("checked Some");
-            if wal_fd.file_size()? > target_sz {
-                wal_fd.truncate(target_sz)?;
+            // `walLimitSize` (`wal.c:2483`): "If an error occurs while doing so, ignore it."
+            // The commit frame is already written and synced here; failing now would report
+            // a failed COMMIT for a transaction the next recovery brings back.
+            if wal_fd.file_size().is_ok_and(|sz| sz > target_sz) {
+                let _ = wal_fd.truncate(target_sz);
             }
             self.truncate_on_commit = false;
         }
@@ -2758,10 +2761,11 @@ impl Wal {
                             is_delete = true;
                         } else if self.mx_wal_size >= 0
                             && let Some(ref wal_fd) = self.wal_file
-                            && let Err(e) = wal_fd.truncate(0)
-                            && first_err.is_none()
                         {
-                            first_err = Some(e);
+                            // `walLimitSize(pWal, 0)`: errors are ignored here as well.
+                            if wal_fd.file_size().is_ok_and(|sz| sz > 0) {
+                                let _ = wal_fd.truncate(0);
+                            }
                         }
                     }
                     Ok(_) => {}

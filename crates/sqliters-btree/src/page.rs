@@ -824,12 +824,17 @@ pub enum TableLeafInsertProbe {
 /// Returns `[i_start .. i_start + i_size]` (`i_size >= 4`) to the Format-3 sorted freeblock list
 /// (`freeSpace` in `sqlite/src/btree.c:1945-2041`), coalescing adjacent freeblocks or advancing
 /// `cell_content_top` (`hdr[5..7]`) in O(freeblocks). Returns `false` if page metadata is corrupt.
+///
+/// With `secure` (`BTS_FAST_SECURE`, i.e. `PRAGMA secure_delete` = `ON` or `FAST`) the released
+/// range — after coalescing, exactly as `freeSpace` does — is overwritten with zeros before the
+/// freeblock header is written, so no deleted content survives inside the page.
 pub fn raw_page_free_space(
     raw: &mut [u8],
     hdr_off: usize,
     usable: usize,
     mut i_start: usize,
     mut i_size: usize,
+    secure: bool,
 ) -> bool {
     if i_size < 4 || hdr_off + 8 > usable || i_start > usable.saturating_sub(i_size) {
         return false;
@@ -898,6 +903,11 @@ pub fn raw_page_free_space(
         raw[hdr_off + 7] -= n_frag as u8;
     }
 
+    if secure {
+        // `btree.c:2019`: "Overwrite deleted information with zeros when the secure_delete
+        // option is enabled".
+        raw[i_start..i_start + i_size].fill(0);
+    }
     if i_start == content_top {
         if i_ptr != hdr_off + 1 {
             return false;
@@ -912,6 +922,119 @@ pub fn raw_page_free_space(
         raw[i_ptr..i_ptr + 2].copy_from_slice(&(i_start as u16).to_be_bytes());
         raw[i_start..i_start + 2].copy_from_slice(&(i_free_blk as u16).to_be_bytes());
         raw[i_start + 2..i_start + 4].copy_from_slice(&(i_size as u16).to_be_bytes());
+    }
+    true
+}
+
+/// `btreeCellSizeCheck` (`btree.c`, run by `btreeInitPage` when `PRAGMA cell_size_check` is on):
+/// every cell pointer of a b-tree page must lie between the end of the cell pointer array and
+/// `usable - 4` (`usable - 5` on interior pages), and the cell it names — sized exactly like the
+/// page's `xCellSize` method, 16-bit truncation included — must end within the usable area.
+///
+/// Returns `true` for a page that passes and for a page whose flag byte is not one of the four
+/// b-tree page types (overflow / freelist content is not a b-tree page and is not judged here).
+pub fn cell_size_check_page(pgno: Pgno, usable_size: u32, raw: &[u8]) -> bool {
+    let usable = usable_size as usize;
+    let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+    if raw.len() < usable || hdr_off + 12 > usable {
+        return true;
+    }
+    let flags = raw[hdr_off];
+    let (leaf, table) = match flags {
+        0x0d => (true, true),
+        0x05 => (false, true),
+        0x0a => (true, false),
+        0x02 => (false, false),
+        _ => return true,
+    };
+    let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
+    // `btreeInitPage`: more than `MX_CELL` cells is corrupt whatever the flag says.
+    if n_cell > (raw.len() - 8) / 6 {
+        return false;
+    }
+    let cell_offset = hdr_off + if leaf { 8 } else { 12 };
+    let i_cell_first = cell_offset + 2 * n_cell;
+    let i_cell_last = usable - if leaf { 4 } else { 5 };
+    let (max_local, min_local) = if table && leaf {
+        let b = PayloadBounds::for_table_leaf(usable_size);
+        (b.max_local, b.min_local)
+    } else {
+        let b = PayloadBounds::for_index(usable_size);
+        (b.max_local, b.min_local)
+    };
+    // Bytes past the end of the buffer read as zero (C reads its own padding there).
+    let at = |i: usize| -> u8 { raw.get(i).copied().unwrap_or(0) };
+    for i in 0..n_cell {
+        let p = cell_offset + 2 * i;
+        let pc = u16::from_be_bytes([at(p), at(p + 1)]) as usize;
+        if pc < i_cell_first || pc > i_cell_last {
+            return false;
+        }
+        let mut it = pc;
+        let sz: u16 = if table && !leaf {
+            // `cellSizePtrNoPayload`: 4-byte child pointer + rowid varint.
+            it += 4;
+            let end = it + 9;
+            loop {
+                let b = at(it);
+                it += 1;
+                if b & 0x80 == 0 || it >= end {
+                    break;
+                }
+            }
+            (it - pc) as u16
+        } else {
+            if !leaf {
+                it += 4;
+            }
+            // Payload size: the 32-bit varint loop of `cellSizePtr*`.
+            let mut n_size = u32::from(at(it));
+            if n_size >= 0x80 {
+                let end = it + 8;
+                n_size &= 0x7f;
+                loop {
+                    it += 1;
+                    n_size = (n_size << 7) | u32::from(at(it) & 0x7f);
+                    if at(it) < 0x80 || it >= end {
+                        break;
+                    }
+                }
+            }
+            it += 1;
+            if table {
+                // `cellSizePtrTableLeaf`: skip the rowid varint (at most 9 bytes).
+                let mut n = 0;
+                loop {
+                    let b = at(it);
+                    it += 1;
+                    n += 1;
+                    if b & 0x80 == 0 {
+                        break;
+                    }
+                    if n == 8 {
+                        it += 1;
+                        break;
+                    }
+                }
+            }
+            let head = (it - pc) as u32;
+            if n_size <= max_local {
+                let mut total = n_size.wrapping_add(head);
+                if leaf && total < 4 {
+                    total = 4;
+                }
+                total as u16
+            } else {
+                let mut local = min_local + (n_size - min_local) % (usable_size - 4);
+                if local > max_local {
+                    local = min_local;
+                }
+                local.wrapping_add(4 + u32::from(head as u16)) as u16
+            }
+        };
+        if pc + usize::from(sz) > usable {
+            return false;
+        }
     }
     true
 }
@@ -1246,6 +1369,7 @@ pub fn apply_replace_table_leaf_raw(
     old_off: usize,
     old_cell_len: usize,
     _content_top: usize,
+    secure: bool,
 ) {
     let usable = usable_size as usize;
     let new_cell_len =
@@ -1266,7 +1390,7 @@ pub fn apply_replace_table_leaf_raw(
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
     let ptr_base = hdr_off + 8;
 
-    if !raw_page_free_space(raw, hdr_off, usable, old_off, old_cell_len) {
+    if !raw_page_free_space(raw, hdr_off, usable, old_off, old_cell_len, secure) {
         // Fallback: shift/compact cleanly if freeblock chain was unexpected.
         let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
         let raw_top = u16::from_be_bytes([raw[hdr_off + 5], raw[hdr_off + 6]]) as usize;
@@ -1295,6 +1419,10 @@ pub fn apply_replace_table_leaf_raw(
         while pos < new_top + new_cell_len {
             raw[pos] = 0;
             pos += 1;
+        }
+        if secure && new_top > cur_top {
+            // The shifted cells left a stale copy of their first bytes below the new top.
+            raw[cur_top..new_top].fill(0);
         }
         let ip = ptr_base + 2 * idx;
         raw[ip..ip + 2].copy_from_slice(&(new_top as u16).to_be_bytes());
@@ -1353,6 +1481,7 @@ pub fn replace_table_leaf_repack_raw(
     old_off: usize,
     old_cell_len: usize,
     reject_overflow_cells: bool,
+    secure: bool,
 ) -> Result<bool> {
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
@@ -1448,6 +1577,7 @@ pub fn replace_table_leaf_repack_raw(
             moved_off,
             old_cell_len,
             packed_top,
+            secure,
         );
         return Ok(true);
     }
@@ -2481,6 +2611,7 @@ pub fn apply_delete_index_leaf_in_place(
     idx: usize,
     cell_off: usize,
     cell_len: usize,
+    secure: bool,
 ) {
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
@@ -2499,6 +2630,12 @@ pub fn apply_delete_index_leaf_in_place(
     let new_n = n_cell - 1;
     raw[hdr_off + 3..hdr_off + 5].copy_from_slice(&(new_n as u16).to_be_bytes());
     if new_n == 0 {
+        if secure {
+            // `dropCell` runs `freeSpace` (which zeroes under secure_delete) before it resets
+            // the header of a page that just lost its last cell. Nothing on the page is live
+            // any more, so clear the whole body (C leaves one stale freeblock header behind).
+            raw[ptr_base..usable].fill(0);
+        }
         raw[hdr_off + 1..hdr_off + 3].fill(0);
         let encoded_top: u16 = if usable == 65_536 { 0 } else { usable as u16 };
         raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
@@ -2506,7 +2643,7 @@ pub fn apply_delete_index_leaf_in_place(
         return;
     }
 
-    if !raw_page_free_space(raw, hdr_off, usable, cell_off, cell_len) {
+    if !raw_page_free_space(raw, hdr_off, usable, cell_off, cell_len, secure) {
         let _ = defragment_raw_leaf_in_place(pgno, usable_size, raw);
     }
 }
@@ -2532,6 +2669,7 @@ pub fn try_delete_table_leaf_in_place(
     rowid: i64,
     is_root: bool,
     idx_hint: Option<usize>,
+    secure: bool,
 ) -> Result<RawLeafDeleteOutcome> {
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
@@ -2636,11 +2774,16 @@ pub fn try_delete_table_leaf_in_place(
     let new_n = n_cell - 1;
     raw[hdr_off + 3..hdr_off + 5].copy_from_slice(&(new_n as u16).to_be_bytes());
     if new_n == 0 {
+        if secure {
+            // `dropCell` → `freeSpace` zeroes the last cell before the header is reset; nothing
+            // on the page is live any more, so clear the whole body.
+            raw[ptr_base..usable].fill(0);
+        }
         raw[hdr_off + 1..hdr_off + 3].fill(0);
         let encoded_top: u16 = if usable == 65_536 { 0 } else { usable as u16 };
         raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
         raw[hdr_off + 7] = 0;
-    } else if !raw_page_free_space(raw, hdr_off, usable, cell_off, cell_len) {
+    } else if !raw_page_free_space(raw, hdr_off, usable, cell_off, cell_len, secure) {
         let _ = defragment_raw_leaf_in_place(pgno, usable_size, raw)?;
     }
 

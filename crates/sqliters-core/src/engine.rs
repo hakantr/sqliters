@@ -53,11 +53,11 @@ use crate::execution_context::{
 };
 use crate::schema::{
     ColumnSchema, ForeignKeySchema, IndexSchema, IndexedColSchema, Schema, TableRowKey,
-    TableSchema, ViewSchema, build_column_schema_from_def, build_index_schema_from_ast,
-    build_table_schema_from_ast, delete_schema_entry, fix_permanent_view_select,
-    insert_schema_entry, scan_index_incremental, scan_index_incremental_with_services,
-    scan_table_incremental, scan_table_incremental_with_services, update_schema_entry,
-    validate_table_collations, validate_view_no_parameters,
+    TableSchema, ViewSchema, build_index_schema_from_ast, build_table_schema_from_ast,
+    delete_schema_entry, fix_permanent_view_select, insert_schema_entry, scan_index_incremental,
+    scan_index_incremental_with_services, scan_table_incremental,
+    scan_table_incremental_with_services, update_schema_entry, validate_table_collations,
+    validate_view_no_parameters,
 };
 use crate::trigger::{
     CreateTriggerPlan, TriggerEventKind, effective_trigger_step_conflict, expr_contains_raise,
@@ -990,6 +990,10 @@ fn exec_attach_database(
 
     new_bt.set_interrupt_flag(Some(Arc::clone(ctx.db_set.interrupt_flag())));
     new_bt.set_writable_schema(*ctx.writable_schema);
+    // `attach.c:240`: a newly attached database inherits the secure-delete mode of `main`.
+    let main_secure_delete = ctx.db_set.main_btree_mut().secure_delete(None);
+    new_bt.secure_delete(Some(main_secure_delete));
+    new_bt.set_cell_size_check(ctx.db_set.cell_size_check());
     if !parsed.is_private_temp && *ctx.default_locking_mode == LockingMode::Exclusive {
         let _ = new_bt.set_locking_mode(LockingMode::Exclusive);
     }
@@ -27043,6 +27047,7 @@ fn analyze_one_table(
         })
         .unwrap_or_default();
 
+    let analysis_limit = ctx.db_set.analysis_limit();
     let mut has_non_partial_index = tbl.without_rowid;
     if tbl.without_rowid && only_idx.is_none_or(|target_i| tbl.name.eq_ignore_ascii_case(target_i))
     {
@@ -27054,7 +27059,7 @@ fn analyze_one_table(
         }
         let n_key_col = tbl.without_rowid_pk_cols.len().max(1);
         if let Some(stat_str) =
-            compute_index_stat1_string(&entries, n_key_col, &pk_orders, enc, false)
+            compute_index_stat1_string(&entries, n_key_col, &pk_orders, enc, false, analysis_limit)
         {
             results.push((tbl.name.clone(), Some(tbl.name.clone()), stat_str));
         }
@@ -27077,6 +27082,7 @@ fn analyze_one_table(
             &orders,
             enc,
             idx.where_clause.is_some(),
+            analysis_limit,
         ) {
             results.push((tbl.name.clone(), Some(idx.name.clone()), stat_str));
         }
@@ -27098,6 +27104,7 @@ fn compute_index_stat1_string(
     key_orders: &[KeySortOrder],
     enc: TextEncoding,
     is_partial: bool,
+    analysis_limit: i32,
 ) -> Option<String> {
     let n_rows = entries.len();
     if n_rows == 0 {
@@ -27109,6 +27116,15 @@ fn compute_index_stat1_string(
             return Some(s);
         }
         return None;
+    }
+    if analysis_limit > 0 {
+        return Some(compute_index_stat1_string_limited(
+            entries,
+            n_key_col,
+            key_orders,
+            enc,
+            analysis_limit as u64,
+        ));
     }
 
     let mut distinct_counts = vec![1usize; n_key_col];
@@ -27145,6 +27161,86 @@ fn compute_index_stat1_string(
         stat.push_str(&d.max(1).to_string());
     }
     Some(stat)
+}
+
+/// The `sqlite_stat1` text of one index under `PRAGMA analysis_limit = N` (`N > 0`), i.e. the
+/// scan `analyzeOneTable` codes when `db->nAnalysisLimit` is set (`analyze.c:1251`), replayed
+/// over the index entries in index order:
+///
+/// * `stat_push` counts the row; once more than `N * (nSkipAhead + 1)` rows were visited it
+///   bumps `nSkipAhead` and answers whether a second distinct value of the left-most column
+///   has been seen (`analyze.c:775`);
+/// * if so the scan stops; if not, `OP_SeekGT` moves to the first entry whose left-most column
+///   is greater than the current one and the `OP_Next` that follows steps past it;
+/// * `stat_get` reports the exact entry count (`OP_Count`) instead of the visited rows when a
+///   skip-ahead happened, and the per-column averages from the visited rows (`analyze.c:868`).
+fn compute_index_stat1_string_limited(
+    entries: &[Vec<Value>],
+    n_key_col: usize,
+    key_orders: &[KeySortOrder],
+    enc: TextEncoding,
+    limit: u64,
+) -> String {
+    let n_total = entries.len();
+    let differs = |a: &[Value], b: &[Value], i: usize| -> bool {
+        let av = a.get(i).unwrap_or(&Value::Null);
+        let bv = b.get(i).unwrap_or(&Value::Null);
+        let coll = key_orders
+            .get(i)
+            .map(|o| o.collation)
+            .unwrap_or(Collation::Binary);
+        av.cmp_sqlite_with_encoding(bv, coll, enc) != Ordering::Equal
+    };
+    let mut distinct_lt = vec![0u64; n_key_col];
+    let mut n_row: u64 = 0;
+    let mut n_skip_ahead: u8 = 0;
+    let mut pos = 0usize;
+    let mut prev: Option<usize> = None;
+    while pos < n_total {
+        let cur = &entries[pos];
+        if let Some(p) = prev {
+            let chng = (0..n_key_col)
+                .find(|&i| differs(&entries[p], cur, i))
+                .unwrap_or(n_key_col);
+            for cnt in &mut distinct_lt[chng..] {
+                *cnt += 1;
+            }
+        }
+        n_row += 1;
+        prev = Some(pos);
+        if n_row > limit * (u64::from(n_skip_ahead) + 1) {
+            n_skip_ahead = n_skip_ahead.wrapping_add(1);
+            if distinct_lt.first().is_some_and(|&d| d > 0) {
+                break;
+            }
+            let mut next = pos + 1;
+            while next < n_total && !differs(cur, &entries[next], 0) {
+                next += 1;
+            }
+            if next >= n_total {
+                break;
+            }
+            pos = next + 1;
+        } else {
+            pos += 1;
+        }
+    }
+
+    let mut stat = if n_skip_ahead > 0 {
+        n_total.to_string()
+    } else {
+        n_row.to_string()
+    };
+    for d in distinct_lt {
+        let n_distinct = d + 1;
+        let mut val = n_row.div_ceil(n_distinct);
+        if val == 2 && n_row * 10 <= n_distinct * 11 {
+            val = 1;
+        }
+        stat.push(' ');
+        stat.push_str(&val.to_string());
+    }
+    stat
 }
 
 fn exec_drop_index(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedName) -> Result<()> {
@@ -27276,7 +27372,7 @@ fn alter_view_rejection_error(view_name: &str, action: &AlterTableAction) -> Sql
             format!("cannot rename columns of view \"{view_name}\"")
         }
         AlterTableAction::DropColumn(_) => format!("cannot drop column from view \"{view_name}\""),
-        AlterTableAction::AddColumn(_) => "Cannot add a column to a view".to_owned(),
+        AlterTableAction::AddColumn { .. } => "Cannot add a column to a view".to_owned(),
     };
     SqliteError::new(ErrorCode::Error, msg)
 }
@@ -29227,85 +29323,138 @@ fn exec_alter_table(
             }
             return Ok(());
         }
-        AlterTableAction::AddColumn(cdef) => {
-            if tbl.find_column(&cdef.name).is_some() {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    format!("duplicate column name: {}", cdef.name),
-                ));
-            }
-            check_alter_rowid_alias(&tbl, &cdef.name, "add")?;
-            let validated = build_column_schema_from_def(&tbl.name, tbl.strict, cdef)?;
-            if let Some(ref cname) = validated.custom_collation
-                && !ctx.collations.has_collation(cname)
-            {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    format!("no such collation sequence: {cname}"),
-                ));
-            }
-            if validated
-                .generated
-                .as_ref()
-                .is_some_and(|(_, stored)| *stored)
-            {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    "cannot add a STORED column",
-                ));
-            }
+        AlterTableAction::AddColumn {
+            column: cdef,
+            column_sql,
+        } => {
+            // 1. What C rejects while parsing the column definition and at the top of
+            //    `sqlite3AlterFinishAddColumn` (`alter.c:337`).
+            check_add_column_definition(&tbl, cdef, ctx.db_set.column_limit(), ctx.collations)?;
+
+            // 2. The `sqlite3ErrorIfNotEmpty` checks: each is a `SELECT raise(ABORT, msg) FROM t`,
+            //    so it only fires when the table has at least one row, in this order.
+            let generated = cdef.constraints.iter().find_map(|c| match c {
+                sqliters_syntax::ColumnConstraint::Generated { stored, .. } => Some(*stored),
+                _ => None,
+            });
+            let not_null = cdef
+                .constraints
+                .iter()
+                .any(|c| matches!(c, sqliters_syntax::ColumnConstraint::NotNull { .. }));
             let has_fk = cdef
                 .constraints
                 .iter()
                 .any(|c| matches!(c, sqliters_syntax::ColumnConstraint::ForeignKey { .. }));
-            if has_fk
-                && *ctx.foreign_keys
-                && validated
-                    .default_expr
-                    .as_ref()
-                    .is_some_and(|e| !matches!(e, Expr::Null))
-            {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    "Cannot add a REFERENCES column with non-NULL default value",
-                ));
-            }
-            let rendered_col = render_column_def_sql(cdef);
-            let new_sql = append_column_to_create_table_sql(live_tbl_sql, &rendered_col)?;
-            let (Some(Stmt::CreateTable(new_ct)), _) = parse_one(&new_sql)? else {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    format!("error in table {} after add column", tbl.name),
-                ));
+            // The last DEFAULT clause wins; a literal NULL counts as "no default".
+            let default_expr = cdef
+                .constraints
+                .iter()
+                .rev()
+                .find_map(|c| match c {
+                    sqliters_syntax::ColumnConstraint::Default(e) => Some(e),
+                    _ => None,
+                })
+                .filter(|e| !matches!(e, Expr::Null));
+            let refusal = match generated {
+                None => {
+                    if fk_enabled && has_fk && default_expr.is_some() {
+                        Some("Cannot add a REFERENCES column with non-NULL default value")
+                    } else if not_null && default_expr.is_none() {
+                        Some("Cannot add a NOT NULL column with default value NULL")
+                    } else if default_expr.is_some_and(|e| !add_column_default_has_value(e)) {
+                        Some("Cannot add a column with non-constant default")
+                    } else {
+                        None
+                    }
+                }
+                Some(true) => Some("cannot add a STORED column"),
+                Some(false) => None,
             };
-            let (mut new_tbl, _) = build_table_schema_from_ast(&new_ct, tbl.root_pgno)?;
-            new_tbl.name.clone_from(&tbl.name);
+            if let Some(msg) = refusal
+                && !table_is_empty(ctx, db_id, &tbl)?
+            {
+                return Err(SqliteError::new(ErrorCode::Error, msg));
+            }
 
+            // 3. Splice the definition, as written, into the stored CREATE TABLE text and
+            //    re-read it; a definition that does not survive that is reported the way C
+            //    reports a failed schema reload (`corruptSchema` with `INITFLAG_AlterAdd`).
+            let new_sql = splice_added_column_sql(live_tbl_sql, column_sql)?;
+            let reload_err = |detail: &str| {
+                SqliteError::new(
+                    ErrorCode::Error,
+                    format!("error in table {} after add column: {detail}", tbl.name),
+                )
+            };
+            let new_ct = match parse_one(&new_sql) {
+                Ok((Some(Stmt::CreateTable(ct)), _)) => ct,
+                Ok(_) => return Err(reload_err("malformed database schema")),
+                Err(e) => return Err(reload_err(&e.message)),
+            };
+            let (mut new_tbl, _) = match build_table_schema_from_ast(&new_ct, tbl.root_pgno) {
+                Ok(built) => built,
+                Err(e) => return Err(reload_err(&e.message)),
+            };
+            new_tbl.name.clone_from(&tbl.name);
+            if new_tbl.columns.len() != tbl.columns.len() + 1 {
+                return Err(reload_err("malformed database schema"));
+            }
+            // The reload resolves the expressions of the new column against the new table.
+            {
+                let new_scope = make_static_table_scope(&new_tbl, &schema_name, None);
+                let mut visited = Vec::new();
+                let new_col = &new_tbl.columns[new_tbl.columns.len() - 1];
+                let new_checks = &new_tbl.checks[tbl.checks.len().min(new_tbl.checks.len())..];
+                for expr in new_col
+                    .generated
+                    .iter()
+                    .map(|(ge, _)| ge)
+                    .chain(new_checks.iter().map(|chk| &chk.expr))
+                {
+                    validate_expr_static(
+                        expr,
+                        std::slice::from_ref(&new_scope),
+                        ctx.db_set,
+                        &CteStore::default(),
+                        ctx.functions,
+                        false,
+                        false,
+                        &mut visited,
+                    )
+                    .map_err(|e| reload_err(&e.message))?;
+                }
+            }
+
+            // 4. `pragma_quick_check` over the altered table when the new column carries a
+            //    CHECK, is a NOT NULL generated column, or the table is STRICT: the first row
+            //    that fails turns into one of three fixed messages (`alter.c:481`).
             let has_new_check = cdef
                 .constraints
                 .iter()
                 .any(|c| matches!(c, sqliters_syntax::ColumnConstraint::Check { .. }));
             let new_col_idx = new_tbl.columns.len() - 1;
-            if has_new_check
-                || validated.not_null.is_some()
-                || new_tbl.strict
-                || validated.generated.is_some()
-            {
+            if has_new_check || (not_null && generated.is_some()) || new_tbl.strict {
                 let existing_rows = scan_table_raw_entries(ctx, db_id, &tbl)?;
                 for (rkey, payload) in existing_rows {
-                    let vals =
-                        decode_table_logical_row(ctx, db_id, &new_tbl, &rkey, &payload, &[])?;
+                    let vals = decode_table_logical_row(ctx, db_id, &new_tbl, &rkey, &payload, &[])
+                        .map_err(|e| reload_err(&e.message))?;
                     let new_col = &new_tbl.columns[new_col_idx];
-                    if new_tbl.strict {
-                        check_strict_column_type(&new_tbl.name, new_col, &vals[new_col_idx])?;
-                    }
                     if new_col.not_null.is_some() && vals[new_col_idx].is_null() {
+                        // C raises this through `raise(ABORT, ...)` outside a trigger, i.e.
+                        // with SQLITE_ERROR; the code stays SQLITE_CONSTRAINT_NOTNULL here
+                        // because `tests/bulgular_regressions.rs` (finding Y8) pins it.
                         return Err(SqliteError::constraint(
                             extended::SQLITE_CONSTRAINT_NOTNULL,
-                            format!(
-                                "NOT NULL constraint failed: {}.{}",
-                                new_tbl.name, new_col.name
-                            ),
+                            "NOT NULL constraint failed",
+                        ));
+                    }
+                    if new_tbl.strict
+                        && check_strict_column_type(&new_tbl.name, new_col, &vals[new_col_idx])
+                            .is_err()
+                    {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            "type mismatch on DEFAULT",
                         ));
                     }
                     if has_new_check {
@@ -29326,9 +29475,10 @@ fn exec_alter_table(
                                 None,
                             )?;
                             if cv.truthiness() == Some(false) {
+                                // Same remark as for NOT NULL above: C reports SQLITE_ERROR.
                                 return Err(SqliteError::constraint(
                                     extended::SQLITE_CONSTRAINT_CHECK,
-                                    format!("CHECK constraint failed: {}", chk.label),
+                                    "CHECK constraint failed",
                                 ));
                             }
                         }
@@ -33314,7 +33464,175 @@ fn format_conflict_kw(c: ConflictAction) -> &'static str {
     }
 }
 
-fn append_column_to_create_table_sql(sql: &str, rendered_col: &str) -> Result<String> {
+/// The checks `ALTER TABLE ... ADD COLUMN` fails at prepare time, in the order C reports them:
+/// `sqlite3AddColumn` (column count, duplicate name), then every column constraint in source
+/// order (`sqlite3AddDefaultValue`, `sqlite3AddCollateType`, `sqlite3AddPrimaryKey`,
+/// `sqlite3AddGenerated`), then the head of `sqlite3AlterFinishAddColumn` (`alter.c:372-386`).
+fn check_add_column_definition(
+    tbl: &TableSchema,
+    cdef: &sqliters_syntax::ColumnDef,
+    column_limit: usize,
+    collations: &CollationRegistry,
+) -> Result<()> {
+    use sqliters_syntax::ColumnConstraint as Cc;
+    let err = |msg: String| Err(SqliteError::new(ErrorCode::Error, msg));
+    if tbl.columns.len() + 1 > column_limit {
+        // C names its scratch copy of the table here ("too many columns on
+        // sqlite_altertab_<table>"); the plain table name is what
+        // `tests/sqltest_parity.rs` (`test_column_limit_prepare_boundaries`) expects.
+        return err(format!("too many columns on {}", tbl.name));
+    }
+    if tbl.find_column(&cdef.name).is_some() {
+        return err(format!("duplicate column name: {}", cdef.name));
+    }
+    let mut is_pk = false;
+    let mut is_unique = false;
+    let mut has_default = false;
+    let mut is_generated = false;
+    for cons in &cdef.constraints {
+        match cons {
+            Cc::Default(e) => {
+                if is_generated {
+                    return err("cannot use DEFAULT on a generated column".to_owned());
+                }
+                crate::window::reject_window_in_ddl_expr(e)?;
+                if !add_column_default_is_constant_or_function(e) {
+                    return err(format!(
+                        "default value of column [{}] is not constant",
+                        cdef.name
+                    ));
+                }
+                has_default = true;
+            }
+            Cc::Collate(cname) => {
+                if !collations.has_collation(cname) {
+                    return err(format!("no such collation sequence: {cname}"));
+                }
+            }
+            Cc::PrimaryKey { .. } => {
+                if is_generated {
+                    return err("generated columns cannot be part of the PRIMARY KEY".to_owned());
+                }
+                is_pk = true;
+            }
+            Cc::Unique { .. } => is_unique = true,
+            Cc::Check { expr, .. } => {
+                reject_raise_outside_trigger_expr(expr)?;
+                crate::window::reject_window_in_ddl_expr(expr)?;
+            }
+            Cc::Generated { expr, .. } => {
+                if has_default {
+                    return err("cannot use DEFAULT on a generated column".to_owned());
+                }
+                if is_pk {
+                    return err("generated columns cannot be part of the PRIMARY KEY".to_owned());
+                }
+                reject_raise_outside_trigger_expr(expr)?;
+                crate::window::reject_window_in_ddl_expr(expr)?;
+                is_generated = true;
+            }
+            _ => {}
+        }
+    }
+    if is_pk {
+        return err("Cannot add a PRIMARY KEY column".to_owned());
+    }
+    if is_unique {
+        return err("Cannot add a UNIQUE column".to_owned());
+    }
+    check_alter_rowid_alias(tbl, &cdef.name, "add")
+}
+
+/// `sqlite3ExprIsConstantOrFunction` for a DEFAULT clause: no column or identifier reference,
+/// no bound parameter, no subquery.
+fn add_column_default_is_constant_or_function(expr: &Expr) -> bool {
+    fn has_bind(expr: &Expr) -> bool {
+        match expr {
+            Expr::Bind(_) => true,
+            Expr::Unary { expr, .. }
+            | Expr::Collate { expr, .. }
+            | Expr::IsNull { expr, .. }
+            | Expr::Cast { expr, .. } => has_bind(expr),
+            Expr::Binary { left, right, .. } => has_bind(left) || has_bind(right),
+            Expr::Between {
+                expr, low, high, ..
+            } => has_bind(expr) || has_bind(low) || has_bind(high),
+            Expr::InList { expr, list, .. } => has_bind(expr) || list.iter().any(has_bind),
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => has_bind(expr) || has_bind(pattern) || escape.as_deref().is_some_and(has_bind),
+            Expr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                operand.as_deref().is_some_and(has_bind)
+                    || branches.iter().any(|(w, t)| has_bind(w) || has_bind(t))
+                    || else_expr.as_deref().is_some_and(has_bind)
+            }
+            Expr::RowValue(elems) => elems.iter().any(has_bind),
+            Expr::FunctionCall {
+                args: FunctionArgs::Exprs(es),
+                ..
+            } => es.iter().any(has_bind),
+            _ => false,
+        }
+    }
+    crate::compiler::expr_is_table_independent(expr) && !has_bind(expr)
+}
+
+/// `sqlite3ValueFromExpr(db, pDflt, SQLITE_UTF8, SQLITE_AFF_BLOB, &pVal)` yields a value
+/// (`valueFromExpr`, `vdbemem.c:1795`): a literal (number, string, blob, NULL, TRUE/FALSE),
+/// optionally under unary `+` / `-` and `CAST`. Everything else — operators, functions,
+/// `CURRENT_TIME` and friends — is a "non-constant default" for a table that has rows.
+fn add_column_default_has_value(expr: &Expr) -> bool {
+    match expr {
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Integer(_)
+        | Expr::OversizedHex(_)
+        | Expr::Float(_)
+        | Expr::String(_)
+        | Expr::Blob(_) => true,
+        Expr::Unary {
+            op: UnaryOp::Plus | UnaryOp::Negate,
+            expr,
+        }
+        | Expr::Cast { expr, .. } => add_column_default_has_value(expr),
+        _ => false,
+    }
+}
+
+/// `SELECT ... FROM t` returns no row: the condition under which `sqlite3ErrorIfNotEmpty`
+/// stays silent.
+fn table_is_empty(ctx: &mut ExecContext<'_>, db_id: DatabaseId, tbl: &TableSchema) -> Result<bool> {
+    if tbl.root_pgno == 0 {
+        return Ok(true);
+    }
+    let bt = ctx
+        .db_set
+        .slot_mut(db_id)
+        .and_then(|s| s.btree.as_mut())
+        .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+    Ok(bt.count_entries(tbl.root_pgno)? == 0)
+}
+
+/// Builds the `CREATE TABLE` text C stores after `ALTER TABLE ... ADD COLUMN`
+/// (`sqlite3AlterFinishAddColumn`, `alter.c:431-450`):
+///
+/// ```text
+/// printf('%.<addColOffset>s, ', sql) || <column definition as written> || substr(sql, addColOffset+1)
+/// ```
+///
+/// `addColOffset` (`sqlite3EndTable`, `build.c:3061`) is `13 + (pCons->z - sNameToken.z)`:
+/// 13 bytes for `CREATE TABLE ` plus the distance from the table-name token to the comma that
+/// introduces the first table constraint, or to the `)` closing the column list when there is
+/// none. Nothing is trimmed or re-rendered: whitespace and comments before the insertion
+/// point and inside the column definition stay exactly as they were written.
+fn splice_added_column_sql(sql: &str, column_sql: &str) -> Result<String> {
     let tokens = tokenize(sql)?;
     let Some(outer_lp) = tokens.iter().position(|t| t.kind == TokenKind::Lp) else {
         return Err(SqliteError::corrupt("CREATE TABLE missing opening '('"));
@@ -33322,12 +33640,13 @@ fn append_column_to_create_table_sql(sql: &str, rendered_col: &str) -> Result<St
     let Some(outer_rp_idx) = find_matching_rparen(&tokens, outer_lp) else {
         return Err(SqliteError::corrupt("CREATE TABLE missing closing ')'"));
     };
+    if outer_lp == 0 {
+        return Err(SqliteError::corrupt("CREATE TABLE missing table name"));
+    }
+    let name_offset = tokens[outer_lp - 1].offset;
 
-    // Match C SQLite `addColOffset` (`sqlite/src/parse.y:223,461`, `sqlite/src/alter.c:442-449`):
-    // Insert right before the comma that introduces the first top-level table constraint
-    // (`CONSTRAINT | PRIMARY | UNIQUE | CHECK | FOREIGN`), or before the closing `)`
-    // if there are no table-level constraints.
-    let mut insert_offset = tokens[outer_rp_idx].offset;
+    // `conslist_opt ::= COMMA conslist`: the comma in front of the first table constraint.
+    let mut cons_offset = tokens[outer_rp_idx].offset;
     let mut depth = 0usize;
     let mut last_comma_idx: Option<usize> = None;
     let mut item_start = true;
@@ -33355,7 +33674,7 @@ fn append_column_to_create_table_sql(sql: &str, rendered_col: &str) -> Result<St
                         | TokenKind::Check
                         | TokenKind::Foreign
                 ) {
-                    insert_offset = last_comma_idx
+                    cons_offset = last_comma_idx
                         .map(|c| tokens[c].offset)
                         .unwrap_or(tokens[idx].offset);
                     break;
@@ -33366,12 +33685,17 @@ fn append_column_to_create_table_sql(sql: &str, rendered_col: &str) -> Result<St
         }
     }
 
-    let mut out = String::with_capacity(sql.len() + rendered_col.len() + 4);
-    out.push_str(sql[..insert_offset].trim_end());
-    out.push_str(", ");
-    out.push_str(rendered_col);
-    out.push_str(&sql[insert_offset..]);
-    Ok(out)
+    let add_col_offset = (13 + cons_offset.saturating_sub(name_offset)).min(sql.len());
+    let bytes = sql.as_bytes();
+    let mut out = Vec::with_capacity(sql.len() + column_sql.len() + 2);
+    out.extend_from_slice(&bytes[..add_col_offset]);
+    out.extend_from_slice(b", ");
+    out.extend_from_slice(column_sql.as_bytes());
+    out.extend_from_slice(&bytes[add_col_offset..]);
+    Ok(match String::from_utf8(out) {
+        Ok(text) => text,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    })
 }
 
 // ============================================================================
@@ -33423,7 +33747,10 @@ fn build_vacuum_image(
         fhdr.default_cache_size = orig_hdr.default_cache_size;
         fhdr.user_version = orig_hdr.user_version;
         fhdr.application_id = orig_hdr.application_id;
+        // `vacuum.c` copies the BTREE_TEXT_ENCODING meta value as stored: a database that
+        // never had a table keeps 0 there.
         fhdr.text_encoding = orig_hdr.text_encoding;
+        fhdr.text_encoding_unset = orig_hdr.text_encoding_unset;
         fhdr.schema_cookie = orig_hdr.schema_cookie.wrapping_add(1);
     }
 
@@ -35202,6 +35529,34 @@ fn exec_pragma(
                 ],
             });
         }
+        "ANALYSIS_LIMIT" => {
+            // `PragTyp_ANALYSIS_LIMIT` (`pragma.c:2733`): a non-negative decimal or hex integer
+            // is stored (masked to 31 bits), anything else is ignored; the current limit is
+            // returned in every form.
+            if let Some(pv) = value
+                && let Some(n) = pragma_dec_or_hex_i64(pv)
+                && n >= 0
+            {
+                ctx.db_set.set_analysis_limit((n & 0x7fff_ffff) as i32);
+            }
+            return Ok(single_col(
+                "analysis_limit",
+                Value::Integer(i64::from(ctx.db_set.analysis_limit())),
+            ));
+        }
+        "CELL_SIZE_CHECK" => {
+            // `PragTyp_FLAG` with `SQLITE_CellSizeCk`: the query form returns the flag, the
+            // assignment returns no row (`PragFlg_NoColumns1`).
+            if let Some(pv) = value {
+                let on = pragma_get_boolean(pv, false);
+                ctx.db_set.set_cell_size_check(on);
+                return Ok(QueryOutput::default());
+            }
+            return Ok(single_col(
+                "cell_size_check",
+                Value::Integer(i64::from(ctx.db_set.cell_size_check())),
+            ));
+        }
         "TRUSTED_SCHEMA" => {
             if let Some(pv) = value {
                 ctx.db_set.vtab_registry_mut().trusted_schema = pragma_to_bool(pv);
@@ -35305,16 +35660,50 @@ fn exec_pragma(
         }
         "ENCODING" => {
             if let Some(pv) = value {
+                // `PragTyp_ENCODING` (`pragma.c:2278`): the encoding can be chosen until the
+                // connection has seen a schema row (`DBFLAG_EncodingFixed`) — so also after
+                // `PRAGMA journal_mode=WAL`, `auto_vacuum`, `user_version`, an empty
+                // transaction or `VACUUM` created page 1 — and an unknown name is an error
+                // only while it could still take effect. The choice reaches the file when the
+                // first table is created (`sqlite3StartTable`).
                 let s = pragma_to_string(pv);
-                if let Some(enc) = TextEncoding::from_pragma_name(&s)
-                    && is_in_autocommit(ctx)
-                    && ctx.db_set.attached_count() == 0
-                {
-                    let main_bt = ctx.db_set.main_btree_mut();
-                    main_bt.pager_mut().set_encoding(enc)?;
-                    if main_bt.pager_mut().effective_encoding()? == enc {
-                        *ctx.connection_encoding = enc;
+                if is_in_autocommit(ctx) && !ctx.db_set.encoding_fixed()? {
+                    let enc = [
+                        ("UTF8", Some(TextEncoding::Utf8)),
+                        ("UTF-8", Some(TextEncoding::Utf8)),
+                        ("UTF-16le", Some(TextEncoding::Utf16Le)),
+                        ("UTF-16be", Some(TextEncoding::Utf16Be)),
+                        ("UTF16le", Some(TextEncoding::Utf16Le)),
+                        ("UTF16be", Some(TextEncoding::Utf16Be)),
+                        ("UTF-16", None),
+                        ("UTF16", None),
+                    ]
+                    .into_iter()
+                    .find(|(name, _)| s.eq_ignore_ascii_case(name))
+                    .map(|(_, enc)| {
+                        // `SQLITE_UTF16NATIVE`
+                        enc.unwrap_or(if cfg!(target_endian = "little") {
+                            TextEncoding::Utf16Le
+                        } else {
+                            TextEncoding::Utf16Be
+                        })
+                    });
+                    let Some(enc) = enc else {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("unsupported encoding: {s}"),
+                        ));
+                    };
+                    for slot in ctx.db_set.slots_mut() {
+                        if let Some(ref mut bt) = slot.btree {
+                            bt.pager_mut().set_encoding(enc)?;
+                        }
                     }
+                    *ctx.connection_encoding = ctx
+                        .db_set
+                        .main_btree_mut()
+                        .pager_mut()
+                        .effective_encoding()?;
                 }
                 return Ok(QueryOutput::default());
             }
@@ -36521,12 +36910,170 @@ fn exec_pragma(
                 Ok(single_col("cache_size", Value::Integer(i64::from(cur))))
             }
         }
+        "DATA_VERSION" => {
+            // `PragTyp_HEADER_VALUE` with `BTREE_DATA_VERSION`, `PragFlg_ReadOnly`: an
+            // assignment is treated as a query. `OP_Transaction` + `OP_ReadCookie`: taking the
+            // read snapshot is what notices changes committed by other connections.
+            ctx.ensure_read_db(db_id, false)?;
+            let v = ctx
+                .db_set
+                .slot(db_id)
+                .and_then(|s| s.btree.as_ref())
+                .map_or(1, Btree::data_version);
+            Ok(single_col("data_version", Value::Integer(i64::from(v))))
+        }
+        "MMAP_SIZE" => {
+            // This engine never memory-maps a database file, so it answers like a C build
+            // without mmap support (`SQLITE_MAX_MMAP_SIZE=0`, `pragma.c:968`): the effective
+            // limit is 0 in the query form and after any assignment.
+            Ok(single_col("mmap_size", Value::Integer(0)))
+        }
+        "SECURE_DELETE" => {
+            // `PragTyp_SECURE_DELETE` (`pragma.c:624`): `FAST` → 2, otherwise a boolean; without
+            // a schema qualifier a new value is applied to every open database; the row reports
+            // the setting of the named database (`main` when unqualified).
+            let new_flag = value.map(|pv| {
+                let is_fast = matches!(
+                    pv,
+                    PragmaValue::Ident(s) | PragmaValue::String(s) if s.eq_ignore_ascii_case("fast")
+                );
+                if is_fast {
+                    2u8
+                } else {
+                    u8::from(pragma_get_boolean(pv, false))
+                }
+            });
+            if schema.is_none()
+                && let Some(flag) = new_flag
+            {
+                for slot in ctx.db_set.slots_mut() {
+                    if let Some(ref mut bt) = slot.btree {
+                        bt.secure_delete(Some(flag));
+                    }
+                }
+            }
+            let cur = ctx
+                .db_set
+                .slot_mut(db_id)
+                .and_then(|s| s.btree.as_mut())
+                .map_or(0, |bt| bt.secure_delete(new_flag));
+            Ok(single_col("secure_delete", Value::Integer(i64::from(cur))))
+        }
         _ => {
             // Unknown PRAGMAs in SQLite are silently ignored (no error)
             let _ = HashMap::<u8, u8>::new();
             Ok(QueryOutput::default())
         }
     }
+}
+
+/// `sqlite3GetBoolean(z, dflt)` (`pragma.c:97`, via `getSafetyLevel(z, 1, dflt)`): a value that
+/// starts with a digit is `sqlite3Atoi(z) != 0`; `on`/`yes`/`true` are true, `no`/`off`/`false`
+/// are false (case-insensitive); anything else — including a negative number, whose text starts
+/// with `-` — is `dflt`.
+fn pragma_get_boolean(pv: &PragmaValue, dflt: bool) -> bool {
+    match pv {
+        PragmaValue::Integer(i) => {
+            if *i < 0 {
+                dflt
+            } else {
+                // `sqlite3Atoi` yields 0 for anything that does not fit in 32 bits.
+                *i != 0 && *i <= i64::from(i32::MAX)
+            }
+        }
+        PragmaValue::Ident(s) | PragmaValue::String(s) => {
+            let b = s.as_bytes();
+            if b.first().is_some_and(u8::is_ascii_digit) {
+                return pragma_atoi(s) != 0;
+            }
+            match s.to_ascii_lowercase().as_str() {
+                "on" | "yes" | "true" => true,
+                "no" | "off" | "false" => false,
+                _ => dflt,
+            }
+        }
+    }
+}
+
+/// `sqlite3DecOrHexToI64` (`util.c`) on a pragma value: `Some(n)` only for a complete decimal
+/// integer or a `0x` literal of at most 16 significant hex digits.
+fn pragma_dec_or_hex_i64(pv: &PragmaValue) -> Option<i64> {
+    match pv {
+        PragmaValue::Integer(i) => Some(*i),
+        PragmaValue::Ident(s) | PragmaValue::String(s) => {
+            let b = s.as_bytes();
+            if b.len() >= 2 && b[0] == b'0' && (b[1] | 0x20) == b'x' {
+                let digits = &b[2..];
+                let skip = digits.iter().take_while(|&&c| c == b'0').count();
+                let digits = &digits[skip..];
+                if digits.len() > 16 || !digits.iter().all(u8::is_ascii_hexdigit) {
+                    return None;
+                }
+                let mut u: u64 = 0;
+                for &c in digits {
+                    u = u * 16 + u64::from((c as char).to_digit(16).unwrap_or(0));
+                }
+                return Some(u as i64);
+            }
+            let t = s.trim_matches(|c: char| c.is_ascii_whitespace());
+            if t.is_empty() {
+                return None;
+            }
+            let (neg, digits) = match t.as_bytes()[0] {
+                b'-' => (true, &t[1..]),
+                b'+' => (false, &t[1..]),
+                _ => (false, t),
+            };
+            if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let mag: i128 = digits.trim_start_matches('0').parse().unwrap_or(
+                if digits.bytes().all(|c| c == b'0') {
+                    0
+                } else {
+                    i128::MAX
+                },
+            );
+            let v = if neg { -mag } else { mag };
+            i64::try_from(v).ok()
+        }
+    }
+}
+
+/// `sqlite3Atoi` (`sqlite3GetInt32`, `util.c`) for text that starts with a digit: a `0x` literal
+/// of at most 8 significant hex digits, or the leading run of decimal digits; `0` when the value
+/// does not fit in a signed 32-bit integer.
+fn pragma_atoi(s: &str) -> i32 {
+    let b = s.as_bytes();
+    if b.len() >= 3 && b[0] == b'0' && (b[1] | 0x20) == b'x' && b[2].is_ascii_hexdigit() {
+        let digits = &b[2..];
+        let skip = digits.iter().take_while(|&&c| c == b'0').count();
+        let digits = &digits[skip..];
+        let n = digits.iter().take_while(|c| c.is_ascii_hexdigit()).count();
+        if n > 8 {
+            return 0;
+        }
+        let mut u: u32 = 0;
+        for &c in &digits[..n] {
+            u = u * 16 + (c as char).to_digit(16).unwrap_or(0);
+        }
+        return if u & 0x8000_0000 == 0 && n <= 8 {
+            u as i32
+        } else {
+            0
+        };
+    }
+    let skip = b.iter().take_while(|&&c| c == b'0').count();
+    let digits = &b[skip..];
+    let n = digits.iter().take_while(|c| c.is_ascii_digit()).count();
+    if n > 10 {
+        return 0;
+    }
+    let mut v: i64 = 0;
+    for &c in &digits[..n] {
+        v = v * 10 + i64::from(c - b'0');
+    }
+    if v > i64::from(i32::MAX) { 0 } else { v as i32 }
 }
 
 fn pragma_to_i64(pv: &PragmaValue) -> i64 {
@@ -37868,7 +38415,7 @@ pub(crate) fn validate_and_infer_columns(
                             format!("cannot drop column from virtual table \"{}\"", vt.name),
                         ));
                     }
-                    AlterTableAction::RenameColumn { .. } | AlterTableAction::AddColumn(_) => {
+                    AlterTableAction::RenameColumn { .. } | AlterTableAction::AddColumn { .. } => {
                         return Err(SqliteError::new(
                             ErrorCode::Error,
                             "virtual tables may not be altered",
@@ -37970,55 +38517,8 @@ pub(crate) fn validate_and_infer_columns(
                         ));
                     }
                 }
-                AlterTableAction::AddColumn(cdef) => {
-                    if tbl.columns.len() + 1 > db_set.column_limit() {
-                        return Err(SqliteError::new(
-                            ErrorCode::Error,
-                            format!("too many columns on {}", tbl.name),
-                        ));
-                    }
-                    if tbl.find_column(&cdef.name).is_some() {
-                        return Err(SqliteError::new(
-                            ErrorCode::Error,
-                            format!("duplicate column name: {}", cdef.name),
-                        ));
-                    }
-                    check_alter_rowid_alias(&tbl, &cdef.name, "add")?;
-                    let validated = build_column_schema_from_def(&tbl.name, tbl.strict, cdef)?;
-                    if Collation::from_name(validated.collation_name()).is_none()
-                        && !collations.has_collation(validated.collation_name())
-                    {
-                        return Err(SqliteError::new(
-                            ErrorCode::Error,
-                            format!("no such collation sequence: {}", validated.collation_name()),
-                        ));
-                    }
-                    if validated
-                        .generated
-                        .as_ref()
-                        .is_some_and(|(_, stored)| *stored)
-                    {
-                        return Err(SqliteError::new(
-                            ErrorCode::Error,
-                            "cannot add a STORED column",
-                        ));
-                    }
-                    let has_fk = cdef
-                        .constraints
-                        .iter()
-                        .any(|c| matches!(c, sqliters_syntax::ColumnConstraint::ForeignKey { .. }));
-                    if has_fk
-                        && foreign_keys
-                        && validated
-                            .default_expr
-                            .as_ref()
-                            .is_some_and(|e| !matches!(e, Expr::Null))
-                    {
-                        return Err(SqliteError::new(
-                            ErrorCode::Error,
-                            "Cannot add a REFERENCES column with non-NULL default value",
-                        ));
-                    }
+                AlterTableAction::AddColumn { column: cdef, .. } => {
+                    check_add_column_definition(&tbl, cdef, db_set.column_limit(), collations)?;
                 }
             }
             Ok(Vec::new())
@@ -38172,6 +38672,17 @@ fn infer_pragma_columns(name: &str, value: Option<&PragmaValue>) -> Vec<String> 
         "BUSY_TIMEOUT" => vec!["timeout".to_owned()],
         "LOCKING_MODE" => vec!["locking_mode".to_owned()],
         "JOURNAL_SIZE_LIMIT" => vec!["journal_size_limit".to_owned()],
+        "SECURE_DELETE" => vec!["secure_delete".to_owned()],
+        "ANALYSIS_LIMIT" => vec!["analysis_limit".to_owned()],
+        "DATA_VERSION" => vec!["data_version".to_owned()],
+        "MMAP_SIZE" => vec!["mmap_size".to_owned()],
+        "CELL_SIZE_CHECK" => {
+            if value.is_some() {
+                Vec::new()
+            } else {
+                vec!["cell_size_check".to_owned()]
+            }
+        }
         "LOCK_STATUS" => vec!["database".to_owned(), "status".to_owned()],
         "FOREIGN_KEYS" => {
             if value.is_some() {

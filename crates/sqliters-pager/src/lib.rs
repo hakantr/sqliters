@@ -497,6 +497,10 @@ impl PageCache {
     }
 }
 
+/// Validation hook for `PRAGMA cell_size_check` (see [`Pager::set_page_load_check`]): returns
+/// `false` when page `pgno` (`raw`, `usable_size` usable bytes) is a malformed b-tree page.
+pub type PageLoadCheck = fn(pgno: Pgno, usable_size: u32, raw: &[u8]) -> bool;
+
 #[derive(Debug, Clone)]
 struct PendingByteCopy {
     raw_byte_size: u64,
@@ -565,6 +569,24 @@ pub struct Pager {
     header: DatabaseHeader,
     header_loaded: bool,
     page_size_fixed: bool,
+    /// `Pager.iDataVersion` (`pager.c:669`), the value behind `PRAGMA data_version`: starts at 1
+    /// (C resets the cache once while opening) and is incremented wherever C calls
+    /// `pager_reset()` — the database was changed by another connection, or the page size of
+    /// the cache changed. Commits of this connection leave it alone (C adds one in
+    /// `sqlite3PagerCommitPhaseTwo` and takes it back in `sqlite3BtreeCommitPhaseTwo`).
+    data_version: u32,
+    /// Encoding chosen with `PRAGMA encoding` (or inherited from the connection) for a database
+    /// whose header does not record one yet. The header is re-read from disk at the start of
+    /// every transaction, so the choice is kept here and re-applied until the first table
+    /// writes it into the file.
+    pending_encoding: Option<TextEncoding>,
+    /// This connection committed page 1 into the WAL since it last loaded it. C stamps such a
+    /// page with `dbFileVers + 1` without updating `Pager.dbFileVers`, so the first shared lock
+    /// taken after it leaves WAL mode sees a "changed" file and resets the cache once.
+    dv_wal_page1_written: bool,
+    /// `PRAGMA cell_size_check`: validation run on a page when it is loaded from disk to be
+    /// read as a b-tree page (`btreeInitPage` → `btreeCellSizeCheck`).
+    page_load_check: Option<PageLoadCheck>,
     page_count: Pgno,
     configured_auto_vacuum: AutoVacuumMode,
     writable_schema: bool,
@@ -796,6 +818,10 @@ impl Pager {
             header: candidate_header,
             header_loaded: false,
             page_size_fixed: false,
+            data_version: 1,
+            pending_encoding: None,
+            dv_wal_page1_written: false,
+            page_load_check: None,
             page_count: 0,
             configured_auto_vacuum: AutoVacuumMode::None,
             writable_schema: false,
@@ -1163,7 +1189,12 @@ impl Pager {
         if let Some(wal) = self.wal.take()
             && let Some(ref df) = self.file
         {
-            let _ = wal.close(&**df, None, self.persist_wal);
+            // C closes the old b-tree the ordinary way (`attach.c` `REOPEN_AS_MEMDB` →
+            // `sqlite3BtreeClose` → `sqlite3WalClose` with the pager's sync flags): the
+            // close-time checkpoint syncs the log, copies the frames, syncs the database and
+            // only then removes the log. Its result is not looked at there either.
+            let ckpt_sync = self.ckpt_sync_flags();
+            let _ = wal.close(&**df, ckpt_sync, self.persist_wal);
         }
         if let Some(mut jf) = self.journal_file.take() {
             let _ = jf.close();
@@ -1203,7 +1234,31 @@ impl Pager {
         self.backup_raw_staging = None;
         self.set_super = false;
         self.notify_backup_restart();
+        // A deserialized image is a new database (C opens a new b-tree for it).
+        self.pending_encoding = None;
+        self.data_version = 1;
+        self.dv_wal_page1_written = false;
         Ok(())
+    }
+
+    /// `sqlite3PagerDataVersion` (`pager.c:1830`): the counter behind `PRAGMA data_version`.
+    #[inline]
+    pub const fn data_version(&self) -> u32 {
+        self.data_version
+    }
+
+    /// The cache content was (or must be assumed) replaced by something this connection did not
+    /// write itself — the `pPager->iDataVersion++` of `pager_reset()`.
+    #[inline]
+    fn bump_data_version(&mut self) {
+        self.data_version = self.data_version.wrapping_add(1);
+    }
+
+    /// Installs (or removes) the validation that [`Self::read_page`] runs on a page it has to
+    /// load from disk (`PRAGMA cell_size_check`). Pages that are already cached count as
+    /// validated, exactly like a `MemPage` whose `isInit` is set in C.
+    pub fn set_page_load_check(&mut self, check: Option<PageLoadCheck>) {
+        self.page_load_check = check;
     }
 
     /// Returns any deferred page size requested via [`Self::set_page_size`].
@@ -1607,6 +1662,12 @@ impl Pager {
             }
 
             self.close_wal_for_mode_switch()?;
+            if std::mem::take(&mut self.dv_wal_page1_written) {
+                // `sqlite3PagerSharedLock` of the header rewrite below: the database file now
+                // carries the page 1 this connection committed through the WAL, which is not
+                // what `Pager.dbFileVers` remembers → `pager_reset()`.
+                self.bump_data_version();
+            }
 
             // `.db` currently holds `LockLevel::Exclusive`, and `self.wal` is `None`.
             // Suppress automatic WAL re-open while rewriting Page 1 `(2, 2) -> (1, 1)` under a
@@ -1923,17 +1984,34 @@ impl Pager {
         self.header.encoding()
     }
 
-    /// Sets the database text encoding before the database is initialized (`PRAGMA encoding`).
-    /// Per SQLite semantics, changing encoding after pages exist is a no-op.
+    /// Sets the database text encoding (`PRAGMA encoding`, or the connection encoding handed
+    /// to a newly attached / temporary database). As in C this is possible until the first
+    /// table is created: the header of a table-less database carries no encoding (bytes
+    /// 56..59 are 0) even when page 1 already exists because of `PRAGMA journal_mode=WAL`,
+    /// `auto_vacuum`, `user_version`, an empty transaction or `VACUUM`. Once the file records
+    /// an encoding the call is a no-op.
     pub fn set_encoding(&mut self, enc: TextEncoding) -> Result<()> {
         self.ensure_not_closed()?;
         if self.state == TransactionState::Open && !self.header_loaded {
             let _ = self.ensure_header_loaded()?;
         }
-        if !self.page_size_fixed && self.page_count == 0 {
+        if !self.header.file_format_is_set() && self.header.text_encoding_unset {
+            self.pending_encoding = Some(enc);
             self.header.text_encoding = enc as u32;
         }
         Ok(())
+    }
+
+    /// Installs a header freshly read from the file, keeping the encoding chosen for a
+    /// database that does not record one yet.
+    #[inline]
+    fn adopt_loaded_header(&mut self, hdr: DatabaseHeader) {
+        self.header = hdr;
+        if self.header.text_encoding_unset
+            && let Some(enc) = self.pending_encoding
+        {
+            self.header.text_encoding = enc as u32;
+        }
     }
 
     #[inline]
@@ -2033,6 +2111,8 @@ impl Pager {
         if !self.page_size_fixed && self.page_count == 0 && !self.is_wal_mode() {
             if self.header.page_size != new_size {
                 self.notify_backup_restart();
+                // `sqlite3PagerSetPagesize` → `pager_reset()`.
+                self.bump_data_version();
             }
             self.header.page_size = new_size;
             self.cache.clear();
@@ -2228,12 +2308,19 @@ impl Pager {
                     if invalidate_cache {
                         if self.header_loaded {
                             self.notify_backup_restart();
+                            // `sqlite3PagerSharedLock`: the 16 bytes at offset 24 differ from
+                            // what this pager last saw → `pager_reset()`.
+                            self.bump_data_version();
                         }
                         self.cache.clear();
                     }
+                    if disk_hdr.page_size != self.header.page_size {
+                        // `lockBtree` → `sqlite3PagerSetPagesize` → `pager_reset()`.
+                        self.bump_data_version();
+                    }
 
                     self.configured_auto_vacuum = AutoVacuumMode::from_header(&disk_hdr);
-                    self.header = disk_hdr;
+                    self.adopt_loaded_header(disk_hdr);
                     self.page_count = effective_pages;
                     self.page_size_fixed = true;
                     self.header_loaded = true;
@@ -2259,6 +2346,14 @@ impl Pager {
                 self.notify_backup_restart();
             }
             self.cache.clear();
+        }
+        if changed {
+            // Page 1 is reloaded from the new snapshot (`readDbPage` refreshes `dbFileVers`).
+            self.dv_wal_page1_written = false;
+            // `pagerBeginReadTransaction`: `sqlite3WalBeginReadTransaction` reported a wal-index
+            // header other than the one this connection last used → `pager_reset()`. As in C
+            // this includes the first snapshot taken through a newly opened WAL.
+            self.bump_data_version();
         }
 
         let wal_pages = self.wal.as_ref().unwrap().db_size();
@@ -2347,9 +2442,13 @@ impl Pager {
             }
             self.cache.clear();
         }
+        if snap_hdr.page_size != self.header.page_size {
+            // `lockBtree` → `sqlite3PagerSetPagesize` → `pager_reset()`.
+            self.bump_data_version();
+        }
 
         self.configured_auto_vacuum = AutoVacuumMode::from_header(&snap_hdr);
-        self.header = snap_hdr;
+        self.adopt_loaded_header(snap_hdr);
         self.page_count = effective_pages;
         self.page_size_fixed = true;
         self.header_loaded = true;
@@ -2667,7 +2766,8 @@ impl Pager {
         self.header.database_size_pages = 1;
         self.header.change_counter = 1;
         self.header.version_valid_for = 1;
-        self.header.schema_format = 4;
+        // `newDatabase` (`btree.c`): schema format and text encoding stay 0 in the file until
+        // the first table is created.
         if self.header.text_encoding == 0 {
             self.header.text_encoding = 1;
         }
@@ -2718,6 +2818,12 @@ impl Pager {
     }
 
     /// Reads page `pgno` (1-based) into the page cache if needed and returns an immutable slice.
+    ///
+    /// This is the accessor for b-tree pages: with `PRAGMA cell_size_check` on, a page that has
+    /// to be loaded from disk is validated before it is handed out, and the read fails with
+    /// `SQLITE_CORRUPT` if a cell does not fit the page. The check lives on the load path only,
+    /// so a cached page costs nothing extra. Pages that are not b-tree pages (pointer map,
+    /// overflow, freelist) and raw page copies go through [`Self::read_page_unchecked`].
     #[inline]
     pub fn read_page(&mut self, pgno: Pgno) -> Result<&[u8]> {
         self.ensure_not_closed()?;
@@ -2732,8 +2838,51 @@ impl Pager {
                 "cannot read lock-byte page {pgno}"
             )));
         }
+        let slot = self.ensure_btree_page_cached(pgno)?;
+        Ok(self.cache.entry_data(slot))
+    }
+
+    /// [`Self::read_page`] without the `PRAGMA cell_size_check` validation.
+    #[inline]
+    pub fn read_page_unchecked(&mut self, pgno: Pgno) -> Result<&[u8]> {
+        self.ensure_not_closed()?;
+        if pgno == 0 || pgno > self.page_count {
+            return Err(SqliteError::corrupt(format!(
+                "requested invalid page {pgno} (page_count = {})",
+                self.page_count
+            )));
+        }
+        if pgno == self.lock_byte_page() {
+            return Err(SqliteError::corrupt(format!(
+                "cannot read lock-byte page {pgno}"
+            )));
+        }
         let slot = self.ensure_page_cached(pgno)?;
         Ok(self.cache.entry_data(slot))
+    }
+
+    #[inline]
+    fn ensure_btree_page_cached(&mut self, pgno: Pgno) -> Result<u32> {
+        if let Some(slot) = self.cache.slot_of(pgno) {
+            return Ok(slot);
+        }
+        self.load_btree_page_cold(pgno)
+    }
+
+    /// Loads a page that is about to be used as a b-tree page: `btreeInitPage` with
+    /// `SQLITE_CellSizeCk`. A page that fails is not kept, so every later read loads and
+    /// rejects it again (C leaves `MemPage.isInit` clear).
+    #[cold]
+    fn load_btree_page_cold(&mut self, pgno: Pgno) -> Result<u32> {
+        let slot = self.load_page_cold(pgno)?;
+        if let Some(check) = self.page_load_check
+            && !check(pgno, self.header.usable_size(), self.cache.entry_data(slot))
+        {
+            self.cache.remove(pgno);
+            // `SQLITE_CORRUPT_PAGE()` out of `btreeCellSizeCheck`.
+            return Err(SqliteError::corrupt("database disk image is malformed"));
+        }
+        Ok(slot)
     }
 
     /// Journals the pre-image of `pgno` (if not yet journaled in this tx/subsavepoints) and marks it dirty.
@@ -2863,6 +3012,10 @@ impl Pager {
 
         self.page_count = allocated_pgno;
         self.header.database_size_pages = allocated_pgno;
+        // The first page after page 1 is the root of the first table (in every state C can
+        // produce a table-less database is exactly one page long): the schema format and the
+        // text encoding are recorded from here on, as `sqlite3StartTable` does.
+        self.header.set_file_format_for_first_table();
         self.tx_journaled.grow_to(allocated_pgno);
         self.commit_phase_one_done = false;
         self.cache_modified = true;
@@ -2968,7 +3121,6 @@ impl Pager {
                         patched_hdr.incremental_vacuum_mode = 1;
                     }
                 }
-                patched_hdr.schema_format = 4;
                 if patched_hdr.text_encoding == 0 {
                     patched_hdr.text_encoding = 1;
                 }
@@ -3039,6 +3191,9 @@ impl Pager {
                 self.page_count = n_src_pages;
                 self.tx_journaled
                     .grow_to(self.tx_orig_page_count.max(n_src_pages));
+                if patched_hdr.page_size != self.header.page_size {
+                    self.bump_data_version();
+                }
                 self.header = patched_hdr;
                 self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
                 self.change_counter_bumped = true;
@@ -3243,7 +3398,6 @@ impl Pager {
                     patched_hdr.incremental_vacuum_mode = 1;
                 }
             }
-            patched_hdr.schema_format = 4;
             if patched_hdr.text_encoding == 0 {
                 patched_hdr.text_encoding = 1;
             }
@@ -3301,6 +3455,9 @@ impl Pager {
             self.page_count = n_src_pages;
             self.tx_journaled
                 .grow_to(self.tx_orig_page_count.max(n_src_pages));
+            if patched_hdr.page_size != self.header.page_size {
+                self.bump_data_version();
+            }
             self.header = patched_hdr;
             self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
             self.change_counter_bumped = true;
@@ -3573,6 +3730,7 @@ impl Pager {
                     || self.header.write_version != 2
                     || self.header.read_version != 2;
                 if must_write_p1 {
+                    self.dv_wal_page1_written = true;
                     let p1_slot = self.mark_page_writable(1)?;
                     self.header.write_version = 2;
                     self.header.read_version = 2;
@@ -3827,6 +3985,11 @@ impl Pager {
 
                 if let Some(pending) = self.pending_byte_copy.take() {
                     self.cache.clear();
+                    if pending.new_header.page_size != self.header.page_size {
+                        // The copy changed the page size of the cache
+                        // (`sqlite3PagerSetPagesize` → `pager_reset()`).
+                        self.bump_data_version();
+                    }
                     self.header = pending.new_header;
                     self.page_count = pending.new_page_count;
                     self.next_page_size = None;
@@ -5815,5 +5978,390 @@ mod tests {
         // The rolled-back images of pages 4 and 7 are not part of the committed state.
         assert_eq!(run.after.1[3], run.before.1[3]);
         assert_eq!(run.after.1[6], run.before.1[6]);
+    }
+
+    /// A database without a table carries 0 for the schema format (offset 44) and the text
+    /// encoding (offset 56), exactly like a file C has only run `PRAGMA user_version`, an empty
+    /// transaction, `journal_mode=WAL` or `VACUUM` on, and its encoding can still be chosen —
+    /// by this pager or, after a reopen, by another one. The first table stamps both fields
+    /// (`sqlite3StartTable`), after which the encoding is final.
+    #[test]
+    fn test_header_of_table_less_database_keeps_format_and_encoding_unset() {
+        fn header_fields(vfs: &MemoryVfs, path: &Path) -> (u32, u32, i32) {
+            let file = vfs.open(Some(path), OpenFlags::READONLY).unwrap();
+            let mut hdr = [0u8; DB_HEADER_SIZE];
+            assert_eq!(file.read_at(&mut hdr, 0).unwrap(), DB_HEADER_SIZE);
+            let u = |off: usize| u32::from_be_bytes(hdr[off..off + 4].try_into().unwrap());
+            (u(44), u(56), u(60) as i32)
+        }
+        let vfs = Arc::new(MemoryVfs::new());
+        let path = Path::new("tableless.db");
+        let flags = OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB;
+
+        let mut pager = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+        pager.begin_write().unwrap();
+        pager.header_mut().unwrap().user_version = 5;
+        pager.commit().unwrap();
+        assert_eq!(header_fields(&vfs, path), (0, 0, 5));
+        assert_eq!(pager.encoding(), TextEncoding::Utf8);
+        assert!(!pager.header().file_format_is_set());
+
+        // The choice survives the header reloads at the start of later transactions and is
+        // not written before a table exists.
+        pager.set_encoding(TextEncoding::Utf16Be).unwrap();
+        assert_eq!(pager.encoding(), TextEncoding::Utf16Be);
+        pager.begin_write().unwrap();
+        pager.header_mut().unwrap().user_version = 6;
+        pager.commit().unwrap();
+        pager.begin_read().unwrap();
+        assert_eq!(pager.encoding(), TextEncoding::Utf16Be);
+        pager.end_read_if_unused().unwrap();
+        assert_eq!(header_fields(&vfs, path), (0, 0, 6));
+        pager.close().unwrap();
+
+        // Another connection sees an undecided file and may decide differently.
+        let mut pager = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+        assert_eq!(pager.effective_encoding().unwrap(), TextEncoding::Utf8);
+        pager.set_encoding(TextEncoding::Utf16Le).unwrap();
+        pager.begin_write().unwrap();
+        pager
+            .header_mut()
+            .unwrap()
+            .set_file_format_for_first_table();
+        pager.commit().unwrap();
+        assert_eq!(header_fields(&vfs, path), (4, 2, 6));
+        // From here on the encoding is fixed, for this pager and for new ones.
+        pager.set_encoding(TextEncoding::Utf8).unwrap();
+        assert_eq!(pager.encoding(), TextEncoding::Utf16Le);
+        pager.close().unwrap();
+        let mut pager = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+        pager.set_encoding(TextEncoding::Utf16Be).unwrap();
+        assert_eq!(pager.effective_encoding().unwrap(), TextEncoding::Utf16Le);
+        assert!(pager.header().file_format_is_set());
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // WAL intermediate states under I/O faults (`walLimitSize`, close-time checkpoint)
+    // ------------------------------------------------------------------------------------------
+
+    /// What a [`FaultVfs`] injects and observes.
+    #[derive(Default)]
+    struct FaultCtl {
+        /// `xFileSize` of `<db>-wal` fails.
+        fail_wal_file_size: std::sync::atomic::AtomicBool,
+        /// `xTruncate` of `<db>-wal` fails.
+        fail_wal_truncate: std::sync::atomic::AtomicBool,
+        /// Ordered trace of the operations that matter for durability.
+        events: Mutex<Vec<&'static str>>,
+    }
+
+    impl FaultCtl {
+        fn take_events(&self) -> Vec<&'static str> {
+            std::mem::take(&mut *self.events.lock().unwrap())
+        }
+    }
+
+    /// `MemoryVfs` wrapper that can fail `file_size` / `truncate` on `-wal` files and records
+    /// writes and syncs of the database and the `-wal`, and the removal of the `-wal`.
+    struct FaultVfs {
+        inner: Arc<MemoryVfs>,
+        ctl: Arc<FaultCtl>,
+    }
+
+    struct FaultFile {
+        inner: Box<dyn VfsFile>,
+        ctl: Arc<FaultCtl>,
+        is_wal: bool,
+        is_db: bool,
+    }
+
+    impl Vfs for FaultVfs {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        fn lock_geometry(&self) -> LockGeometry {
+            self.inner.lock_geometry()
+        }
+        fn open(&self, path: Option<&Path>, flags: OpenFlags) -> Result<Box<dyn VfsFile>> {
+            let inner = self.inner.open(path, flags)?;
+            let name = path
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Ok(Box::new(FaultFile {
+                inner,
+                ctl: self.ctl.clone(),
+                is_wal: name.ends_with("-wal"),
+                is_db: name.ends_with(".db"),
+            }))
+        }
+        fn delete(&self, path: &Path, sync_dir: bool) -> Result<()> {
+            if path.to_string_lossy().ends_with("-wal") {
+                self.ctl.events.lock().unwrap().push("wal-delete");
+            }
+            self.inner.delete(path, sync_dir)
+        }
+        fn exists(&self, path: &Path) -> Result<bool> {
+            self.inner.exists(path)
+        }
+        fn full_pathname(&self, path: &Path) -> Result<PathBuf> {
+            self.inner.full_pathname(path)
+        }
+        fn randomness(&self, buf: &mut [u8]) {
+            self.inner.randomness(buf);
+        }
+    }
+
+    impl VfsFile for FaultFile {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+            self.inner.read_at(buf, offset)
+        }
+        fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
+            if self.is_db {
+                self.ctl.events.lock().unwrap().push("db-write");
+            }
+            self.inner.write_at(buf, offset)
+        }
+        fn truncate(&self, size: u64) -> Result<()> {
+            if self.is_wal
+                && self
+                    .ctl
+                    .fail_wal_truncate
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(SqliteError::new(
+                    ErrorCode::IoErr,
+                    "injected truncate failure",
+                ));
+            }
+            self.inner.truncate(size)
+        }
+        fn sync(&self, flags: SyncFlags) -> Result<()> {
+            if self.is_db {
+                self.ctl.events.lock().unwrap().push("db-sync");
+            } else if self.is_wal {
+                self.ctl.events.lock().unwrap().push("wal-sync");
+            }
+            self.inner.sync(flags)
+        }
+        fn file_size(&self) -> Result<u64> {
+            if self.is_wal
+                && self
+                    .ctl
+                    .fail_wal_file_size
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(SqliteError::new(ErrorCode::IoErr, "injected fstat failure"));
+            }
+            self.inner.file_size()
+        }
+        fn lock(&self, level: LockLevel) -> Result<()> {
+            self.inner.lock(level)
+        }
+        fn unlock(&self, level: LockLevel) -> Result<()> {
+            self.inner.unlock(level)
+        }
+        fn check_reserved_lock(&self) -> Result<bool> {
+            self.inner.check_reserved_lock()
+        }
+        fn lock_level(&self) -> LockLevel {
+            self.inner.lock_level()
+        }
+        fn lock_state_for_diagnostics(&self) -> Result<Option<LockLevel>> {
+            self.inner.lock_state_for_diagnostics()
+        }
+        fn close(&mut self) -> Result<()> {
+            self.inner.close()
+        }
+        fn open_wal_shm_with_options(
+            &self,
+            options: ShmOpenOptions,
+        ) -> Result<sqliters_vfs::WalShm> {
+            self.inner.open_wal_shm_with_options(options)
+        }
+        fn supports_wal_shm(&self) -> bool {
+            self.inner.supports_wal_shm()
+        }
+        fn device_characteristics(&self) -> u32 {
+            self.inner.device_characteristics()
+        }
+        fn sector_size(&self) -> u32 {
+            self.inner.sector_size()
+        }
+        fn is_readonly(&self) -> bool {
+            self.inner.is_readonly()
+        }
+    }
+
+    /// An 8-page database in WAL mode on a [`FaultVfs`], with `synchronous = FULL`.
+    fn open_wal_db_on_fault_vfs(db_path: &Path) -> (Arc<MemoryVfs>, Arc<FaultCtl>, Pager) {
+        let inner = Arc::new(MemoryVfs::new());
+        let ctl = Arc::new(FaultCtl::default());
+        let vfs = Arc::new(FaultVfs {
+            inner: inner.clone(),
+            ctl: ctl.clone(),
+        });
+        let mut pager = Pager::open_with_vfs(
+            vfs,
+            Some(db_path),
+            OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB,
+        )
+        .unwrap();
+        pager.set_synchronous(2);
+        pager.begin_write().unwrap();
+        while pager.page_count() < 8 {
+            let pgno = pager.allocate_raw_page().unwrap();
+            stamp_page(&mut pager, pgno, 0);
+        }
+        pager.commit().unwrap();
+        assert_eq!(
+            pager.set_journal_mode(JournalMode::Wal).unwrap(),
+            JournalMode::Wal
+        );
+        (inner, ctl, pager)
+    }
+
+    /// `journal_size_limit` is applied by the first commit after the log was reset
+    /// (`sqlite3WalFrames`, `wal.c:4306-4313`) through `walLimitSize`, which IGNORES a failing
+    /// `xFileSize` / `xTruncate` ("If an error occurs while doing so, ignore it"). At that point
+    /// the commit frame is already written and synced: reporting the failure would make COMMIT
+    /// fail and roll the connection back while the `-wal` holds a valid, durable commit that
+    /// the next recovery brings back.
+    #[test]
+    fn test_wal_size_limit_failure_does_not_fail_a_durable_commit() {
+        for fault in ["none", "file_size", "truncate"] {
+            let db_path = Path::new("limit.db");
+            let (inner, ctl, mut pager) = open_wal_db_on_fault_vfs(db_path);
+            let page_size = pager.page_size() as u64;
+            let wal_path = pager.wal_path().unwrap().to_path_buf();
+            let frame = page_size + WAL_FRAME_HDRSIZE as u64;
+            // Grow the log to at least seven frames, then checkpoint everything so that the
+            // next writer restarts it from frame 1.
+            pager.begin_write().unwrap();
+            for pgno in 2..=8 {
+                stamp_page(&mut pager, pgno, 1);
+            }
+            pager.commit().unwrap();
+            let big_len = vfs_file_image(inner.as_ref(), &wal_path).len() as u64;
+            let big_frames = (big_len - WAL_HDRSIZE as u64) / frame;
+            assert!(big_frames >= 7 && big_len == WAL_HDRSIZE as u64 + big_frames * frame);
+            let ckpt = pager
+                .wal_checkpoint(WalCheckpointMode::Full, None, None)
+                .unwrap();
+            assert_eq!(
+                (i64::from(ckpt.n_log), i64::from(ckpt.n_ckpt)),
+                (big_frames as i64, big_frames as i64)
+            );
+            // A limit smaller than one frame: the commit below must cut the file down to the
+            // two frames it writes.
+            assert_eq!(pager.set_journal_size_limit(1000), 1000);
+
+            match fault {
+                "file_size" => ctl
+                    .fail_wal_file_size
+                    .store(true, std::sync::atomic::Ordering::Relaxed),
+                "truncate" => ctl
+                    .fail_wal_truncate
+                    .store(true, std::sync::atomic::Ordering::Relaxed),
+                _ => {}
+            }
+            pager.begin_write().unwrap();
+            stamp_page(&mut pager, 3, 2);
+            stamp_page(&mut pager, 6, 2);
+            let commit = pager.commit();
+            ctl.fail_wal_file_size
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            ctl.fail_wal_truncate
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                commit.is_ok(),
+                "{fault}: COMMIT failed after its frames were made durable: {:?}",
+                commit.err().map(|e| e.message)
+            );
+
+            // The connection and a recovery of what is on disk agree: the transaction is in.
+            let mut expect3 = vec![0u8; page_size as usize];
+            let mut expect6 = vec![0u8; page_size as usize];
+            pager.begin_read().unwrap();
+            expect3.copy_from_slice(pager.read_page(3).unwrap());
+            expect6.copy_from_slice(pager.read_page(6).unwrap());
+            pager.end_read_if_unused().unwrap();
+            assert_eq!((expect3[4], expect6[4]), (2, 2), "{fault}");
+            let wal_image = vfs_file_image(inner.as_ref(), &wal_path);
+            let (n_pages, pages) =
+                recovered_state(&vfs_file_image(inner.as_ref(), db_path), &wal_image);
+            assert_eq!(n_pages, 8, "{fault}");
+            assert_eq!(pages[2], expect3, "{fault}: page 3 after recovery");
+            assert_eq!(pages[5], expect6, "{fault}: page 6 after recovery");
+
+            // Only the size differs: with the fault the log keeps its old tail.
+            let new_len = wal_image.len() as u64;
+            if fault == "none" {
+                let new_frames = (new_len - WAL_HDRSIZE as u64) / frame;
+                assert!(
+                    (2..=3).contains(&new_frames)
+                        && new_len == WAL_HDRSIZE as u64 + new_frames * frame,
+                    "the log is cut down to the frames of the commit, got {new_len} bytes"
+                );
+            } else {
+                assert_eq!(new_len, big_len, "{fault}");
+            }
+
+            // Later transactions work, and the limit is honoured again once the fault is gone.
+            pager.begin_write().unwrap();
+            stamp_page(&mut pager, 4, 3);
+            pager.commit().unwrap();
+            pager.close().unwrap();
+        }
+    }
+
+    /// `sqlite3_deserialize` replaces the database of a connection: C closes the old b-tree the
+    /// normal way (`attach.c` `REOPEN_AS_MEMDB` → `sqlite3BtreeClose` → `sqlite3WalClose` with
+    /// the pager's sync flags), so the close-time checkpoint syncs the log before it copies
+    /// frames into the database file and syncs the database file before the `-wal` is removed.
+    /// Without the syncs a power failure after the unlink can leave a database file that has
+    /// neither the frames nor a log to recover them from.
+    #[test]
+    fn test_deserialize_closes_the_wal_with_a_synced_checkpoint() {
+        let db_path = Path::new("deser.db");
+        let (inner, ctl, mut pager) = open_wal_db_on_fault_vfs(db_path);
+        let wal_path = pager.wal_path().unwrap().to_path_buf();
+        pager.begin_write().unwrap();
+        stamp_page(&mut pager, 2, 7);
+        stamp_page(&mut pager, 5, 7);
+        pager.commit().unwrap();
+        assert!(inner.exists(&wal_path).unwrap());
+        let db_before = vfs_file_image(inner.as_ref(), db_path);
+        ctl.take_events();
+
+        // Any image will do; an empty one makes the connection an empty in-memory database.
+        pager.load_deserialized_image(&[], false).unwrap();
+
+        let events = ctl.take_events();
+        let db_after = vfs_file_image(inner.as_ref(), db_path);
+        assert_ne!(
+            db_before, db_after,
+            "the checkpoint moved frames into the file"
+        );
+        assert_eq!(
+            db_after[2 * 4096 - 4096 + 4],
+            7,
+            "page 2 is the version from the log"
+        );
+        assert!(!inner.exists(&wal_path).unwrap(), "the log is gone");
+        let pos = |what: &str| events.iter().position(|e| *e == what);
+        let last = |what: &str| events.iter().rposition(|e| *e == what);
+        let (Some(first_write), Some(last_write), Some(delete)) =
+            (pos("db-write"), last("db-write"), pos("wal-delete"))
+        else {
+            panic!("unexpected trace: {events:?}");
+        };
+        assert!(
+            pos("wal-sync").is_some_and(|i| i < first_write),
+            "the log must be synced before its frames are copied: {events:?}"
+        );
+        assert!(
+            last("db-sync").is_some_and(|i| i > last_write && i < delete),
+            "the database must be synced before the log is removed: {events:?}"
+        );
     }
 }

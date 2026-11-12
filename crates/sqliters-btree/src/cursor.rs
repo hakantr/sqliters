@@ -1722,7 +1722,7 @@ impl Btree {
                     "cycle detected in overflow page chain",
                 ));
             }
-            let raw = self.pager.read_page(ovfl_pgno)?;
+            let raw = self.pager.read_page_unchecked(ovfl_pgno)?;
             let nxt = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
             let remaining = target - out.len();
             let take = remaining.min(usable - 4);

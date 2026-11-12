@@ -556,4 +556,77 @@ mod tests {
             "DISTINCT is not supported for window functions"
         );
     }
+
+    /// `ALTER TABLE ... ADD [COLUMN]` keeps the column definition as written — from the column
+    /// name to the end of the statement, minus trailing `;` and whitespace — because that text,
+    /// not a rendering of the AST, is what goes into the stored `CREATE TABLE` statement
+    /// (`sqlite3AlterFinishAddColumn`).
+    #[test]
+    fn alter_table_add_column_keeps_the_definition_text() {
+        for (sql, want) in [
+            (
+                "ALTER TABLE t ADD COLUMN b INT DEFAULT 7;",
+                "b INT DEFAULT 7",
+            ),
+            ("ALTER TABLE t ADD b", "b"),
+            (
+                "ALTER TABLE t ADD COLUMN \"k k\" DEFAULT x'00'  ;  ",
+                "\"k k\" DEFAULT x'00'",
+            ),
+            (
+                "ALTER TABLE t ADD COLUMN b /* c */ INT /* d */ ;",
+                "b /* c */ INT /* d */",
+            ),
+            (
+                "ALTER TABLE t ADD COLUMN b\n  INT\n  DEFAULT 5\n;SELECT 1;",
+                "b\n  INT\n  DEFAULT 5",
+            ),
+            ("ALTER TABLE t ADD COLUMN c INT -- tail\n", "c INT -- tail"),
+            (
+                "ALTER TABLE main.t ADD g INT NOT NULL DEFAULT 0 CHECK(g >= 0);",
+                "g INT NOT NULL DEFAULT 0 CHECK(g >= 0)",
+            ),
+            (
+                "ALTER TABLE t ADD COLUMN i GENERATED ALWAYS AS (a+1) ;",
+                "i GENERATED ALWAYS AS (a+1)",
+            ),
+            (
+                "ALTER TABLE t ADD COLUMN m VARCHAR(10, 2) DEFAULT 'a''b';;",
+                "m VARCHAR(10, 2) DEFAULT 'a''b'",
+            ),
+        ] {
+            let (stmt, _) = parse_one(sql).unwrap();
+            let Some(Stmt::AlterTable {
+                action: AlterTableAction::AddColumn { column_sql, .. },
+                ..
+            }) = stmt
+            else {
+                panic!("{sql}: not an ADD COLUMN statement");
+            };
+            assert_eq!(column_sql, want, "{sql}");
+        }
+
+        // A DEFAULT that is a bare or quoted identifier is a string literal, and the most
+        // negative integer is an integer (`parse.y`, `ccons ::= DEFAULT ...`).
+        for (def, want) in [
+            ("b DEFAULT abc", Expr::String("abc".to_owned())),
+            ("b DEFAULT \"q r\"", Expr::String("q r".to_owned())),
+            ("b DEFAULT -9223372036854775808", Expr::Integer(i64::MIN)),
+            ("b DEFAULT TRUE", Expr::Bool(true)),
+        ] {
+            let (stmt, _) = parse_one(&format!("ALTER TABLE t ADD COLUMN {def}")).unwrap();
+            let Some(Stmt::AlterTable {
+                action: AlterTableAction::AddColumn { column, .. },
+                ..
+            }) = stmt
+            else {
+                panic!("{def}");
+            };
+            assert_eq!(
+                column.constraints,
+                [ColumnConstraint::Default(want)],
+                "{def}"
+            );
+        }
+    }
 }

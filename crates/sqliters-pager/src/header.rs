@@ -67,7 +67,14 @@ pub struct DatabaseHeader {
     pub schema_format: u32,
     pub default_cache_size: i32,
     pub largest_root_btree_page: Pgno,
+    /// The text encoding in force (1 = UTF-8, 2 = UTF-16le, 3 = UTF-16be); never 0 in memory.
     pub text_encoding: u32,
+    /// `true` while bytes 56..59 of the file are (to be) zero: no table has been created yet,
+    /// so the encoding is not recorded in the file and `PRAGMA encoding` may still choose it.
+    /// C writes the field together with the schema format (offset 44) when the first table,
+    /// view or virtual table is created (`sqlite3StartTable`, `build.c`); until then a new
+    /// database carries 0 in both.
+    pub text_encoding_unset: bool,
     pub user_version: i32,
     pub incremental_vacuum_mode: u32,
     pub application_id: i32,
@@ -93,10 +100,12 @@ impl DatabaseHeader {
             first_freelist_trunk_page: 0,
             total_freelist_pages: 0,
             schema_cookie: 0,
-            schema_format: 4,
+            // 0 until the first table is created (`OP_SetCookie BTREE_FILE_FORMAT`).
+            schema_format: 0,
             default_cache_size: 0,
             largest_root_btree_page: 0,
             text_encoding: 1, // 1 = UTF-8
+            text_encoding_unset: true,
             user_version: 0,
             incremental_vacuum_mode: 0,
             application_id: 0,
@@ -117,6 +126,24 @@ impl DatabaseHeader {
         match TextEncoding::from_header_u32(self.text_encoding) {
             Some(enc) => enc,
             None => TextEncoding::Utf8,
+        }
+    }
+
+    /// `true` once a table, view or virtual table has ever been created in this database: the
+    /// schema format (offset 44) and the text encoding (offset 56) are recorded in the file.
+    #[inline]
+    pub const fn file_format_is_set(&self) -> bool {
+        self.schema_format != 0
+    }
+
+    /// `sqlite3StartTable`: the first table of a database stamps the schema format (4) and the
+    /// text encoding in force into the header (`OP_SetCookie BTREE_FILE_FORMAT` /
+    /// `BTREE_TEXT_ENCODING`, emitted only while the file-format cookie is still 0).
+    #[inline]
+    pub fn set_file_format_for_first_table(&mut self) {
+        if self.schema_format == 0 {
+            self.schema_format = 4;
+            self.text_encoding_unset = false;
         }
     }
 
@@ -235,13 +262,11 @@ impl DatabaseHeader {
             first_freelist_trunk_page: get_u32(32),
             total_freelist_pages: get_u32(36),
             schema_cookie: get_u32(40),
-            schema_format: {
-                let sf = get_u32(44);
-                if sf == 0 { 4 } else { sf }
-            },
+            schema_format: get_u32(44),
             default_cache_size: get_i32(48),
             largest_root_btree_page: get_u32(52),
             text_encoding: normalized_encoding,
+            text_encoding_unset: text_encoding == 0,
             user_version: get_i32(60),
             incremental_vacuum_mode: get_u32(64),
             application_id: get_i32(68),
@@ -274,7 +299,12 @@ impl DatabaseHeader {
         out[44..48].copy_from_slice(&self.schema_format.to_be_bytes());
         out[48..52].copy_from_slice(&self.default_cache_size.to_be_bytes());
         out[52..56].copy_from_slice(&self.largest_root_btree_page.to_be_bytes());
-        out[56..60].copy_from_slice(&self.text_encoding.to_be_bytes());
+        let stored_encoding = if self.text_encoding_unset {
+            0
+        } else {
+            self.text_encoding
+        };
+        out[56..60].copy_from_slice(&stored_encoding.to_be_bytes());
         out[60..64].copy_from_slice(&self.user_version.to_be_bytes());
         out[64..68].copy_from_slice(&self.incremental_vacuum_mode.to_be_bytes());
         out[68..72].copy_from_slice(&self.application_id.to_be_bytes());
