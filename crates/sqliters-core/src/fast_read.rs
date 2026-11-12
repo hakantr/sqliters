@@ -365,6 +365,10 @@ struct FastTableDesc {
     columns: Box<[FastColMeta]>,
     needs_record_parse: bool,
     max_record_col: usize,
+    /// Columns with REAL affinity. C stores an integral value of such a column as an integer
+    /// (`OP_MakeRecord` with an affinity string) and turns it back into a real when the column
+    /// is read (`OP_RealAffinity`); every decoded row gets the same treatment here.
+    real_cols: Box<[u16]>,
 }
 
 impl FastTableDesc {
@@ -389,7 +393,7 @@ impl FastTableDesc {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn fill_from_table_payload<'a>(
         &'a self,
         payload: &'a [u8],
@@ -408,7 +412,23 @@ impl FastTableDesc {
                 *slot = Self::default_raw_field(&meta.default_val);
             }
         }
+        if !self.real_cols.is_empty() {
+            self.apply_real_affinity(out);
+        }
         Ok(())
+    }
+
+    /// `OP_RealAffinity` for the decoded row (kept out of line: most tables have no REAL column).
+    #[cold]
+    #[inline(never)]
+    fn apply_real_affinity(&self, out: &mut [RawField<'_>]) {
+        for &ci in &self.real_cols {
+            if let Some(slot) = out.get_mut(ci as usize)
+                && let RawField::Int(i) = *slot
+            {
+                *slot = RawField::Float(i as f64);
+            }
+        }
     }
 }
 
@@ -1695,11 +1715,26 @@ fn build_fast_table_desc(tbl: &TableSchema) -> Option<FastTableDesc> {
             default_val: default_value_for_column(c, tbl.strict),
         });
     }
+    let real_cols: Vec<u16> = tbl
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(ci, c)| {
+            c.affinity == TypeAffinity::Real
+                && tbl.rowid_alias_col != Some(*ci)
+                && u16::try_from(*ci).is_ok()
+        })
+        .map(|(ci, _)| ci as u16)
+        .collect();
+    if tbl.columns.len() > usize::from(u16::MAX) && !real_cols.is_empty() {
+        return None;
+    }
     Some(FastTableDesc {
         root_pgno: tbl.root_pgno,
         columns: cols.into_boxed_slice(),
         needs_record_parse: false,
         max_record_col: 0,
+        real_cols: real_cols.into_boxed_slice(),
     })
 }
 
@@ -2434,6 +2469,11 @@ struct FastCoveringIndex {
     orders: Box<[KeySortOrder]>,
     /// For each index key column `0..n_idx_cols`, `Some(tbl_col_idx)` or `None` (if IPK).
     idx_to_tbl_col: Box<[Option<u16>]>,
+    /// For each index key column: whether the table column has REAL affinity (an integer found
+    /// in the index entry is then a real, see [`FastTableDesc::real_cols`]).
+    idx_col_is_real: Box<[bool]>,
+    /// Whether any entry of `idx_col_is_real` is set.
+    has_real_col: bool,
     /// Number of index record fields to parse per cell (`0` if neither cols nor rowid needed).
     parse_prefix_len: usize,
     needs_rowid: bool,
@@ -2533,10 +2573,25 @@ fn build_covering_index_desc(
         max_i
     };
 
+    let idx_col_is_real: Vec<bool> = index
+        .columns
+        .iter()
+        .map(|ic| {
+            ic.col_idx.is_some_and(|ci| {
+                tbl.rowid_alias_col != Some(ci)
+                    && tbl
+                        .columns
+                        .get(ci)
+                        .is_some_and(|c| c.affinity == TypeAffinity::Real)
+            })
+        })
+        .collect();
     Some(FastCoveringIndex {
         root_pgno: index.root_pgno,
         orders: index.key_sort_orders().into_boxed_slice(),
         idx_to_tbl_col: idx_to_tbl.into_boxed_slice(),
+        has_real_col: idx_col_is_real.contains(&true),
+        idx_col_is_real: idx_col_is_real.into_boxed_slice(),
         parse_prefix_len,
         needs_rowid,
     })
@@ -2586,7 +2641,12 @@ fn decode_covering_cell<'a>(
             && (tc as usize) < tbl_cols.len()
         {
             tbl_cols[tc as usize] = if i < parsed {
-                idx_scratch[i]
+                match idx_scratch[i] {
+                    RawField::Int(iv) if cov.has_real_col && cov.idx_col_is_real[i] => {
+                        RawField::Float(iv as f64)
+                    }
+                    other => other,
+                }
             } else {
                 RawField::Null
             };
@@ -5420,14 +5480,20 @@ fn try_compile_single_table_core(
         );
         let access = compile_fast_agg_access(&ap, tbl, &td, &exact_cols, needs_rowid)?;
         let int_kernel = match &access {
+            // The integer kernel computes on the stored integers; an integer stored for a
+            // REAL-affinity column is a real to SQL, so such an index takes the general code.
             FastSingleAccess::CoveringIndexFullScan { cov }
-            | FastSingleAccess::CoveringIndexRangeScan { cov, .. } => CovIntKernelShape::build(
-                cov,
-                td.col_buf_len(),
-                compiled_where.as_ref(),
-                None,
-                &aggs,
-            ),
+            | FastSingleAccess::CoveringIndexRangeScan { cov, .. }
+                if !cov.has_real_col =>
+            {
+                CovIntKernelShape::build(
+                    cov,
+                    td.col_buf_len(),
+                    compiled_where.as_ref(),
+                    None,
+                    &aggs,
+                )
+            }
             _ => None,
         };
 
@@ -5566,13 +5632,17 @@ fn try_compile_single_table_core(
                     None => false,
                     Some(want_desc) => want_desc != idx_desc,
                 };
-                let int_kernel = CovIntKernelShape::build(
-                    &cov,
-                    td.col_buf_len(),
-                    compiled_where.as_ref(),
-                    Some(gb_rc.src),
-                    &aggs,
-                );
+                let int_kernel = if cov.has_real_col {
+                    None
+                } else {
+                    CovIntKernelShape::build(
+                        &cov,
+                        td.col_buf_len(),
+                        compiled_where.as_ref(),
+                        Some(gb_rc.src),
+                        &aggs,
+                    )
+                };
                 return Some(FastReadPlan {
                     db_id,
                     column_names: col_names,

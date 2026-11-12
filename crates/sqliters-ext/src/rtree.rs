@@ -2382,7 +2382,8 @@ impl VirtualTable for RTreeTable {
             cache.clear_data();
         }
         let q_db = quote_ident(&self.db_name);
-        for suffix in ["node", "parent", "rowid"] {
+        // `rtreeDestroy`: "DROP TABLE node; DROP TABLE rowid; DROP TABLE parent" in this order.
+        for suffix in ["node", "rowid", "parent"] {
             let q_tbl = quote_ident(&format!("{}_{suffix}", self.table_name));
             ctx.execute_sql(&format!("DROP TABLE IF EXISTS {q_db}.{q_tbl}"), &[])?;
         }

@@ -7255,7 +7255,8 @@ impl VirtualTable for Fts5Table {
         st.pending.clear();
         st.read_cache.clear_all();
         let db_q = quote_ident(ctx.db_name());
-        for suf in SHADOW_SUFFIXES {
+        // `sqlite3Fts5DropAll`: data, idx, config, then docsize, then content.
+        for suf in ["data", "idx", "config", "docsize", "content"] {
             let sq = quote_ident(&format!("{}_{suf}", st.shadows.table_name));
             ctx.execute_sql(&format!("DROP TABLE IF EXISTS {db_q}.{sq}"), &[])?;
         }

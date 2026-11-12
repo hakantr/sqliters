@@ -233,6 +233,8 @@ pub struct DatabaseSet {
     xferopt_delta: std::sync::atomic::AtomicU64,
     open_blobs: std::collections::HashMap<u64, OpenBlobState>,
     vtab_registry: crate::vtab::VTabRegistry,
+    /// Nesting depth of running DDL statements (schema-cookie scopes).
+    ddl_cookie_depth: u32,
     /// `PRAGMA analysis_limit` (`sqlite3.nAnalysisLimit`): approximate number of index rows
     /// `ANALYZE` examines per index; `0` = no limit.
     analysis_limit: i32,
@@ -313,6 +315,7 @@ impl DatabaseSet {
             xferopt_delta: std::sync::atomic::AtomicU64::new(0),
             open_blobs: std::collections::HashMap::new(),
             vtab_registry: crate::vtab::VTabRegistry::new(),
+            ddl_cookie_depth: 0,
         }
     }
 
@@ -749,6 +752,39 @@ impl DatabaseSet {
             }
         }
         self.interrupt_flag = flag;
+    }
+
+    /// Starts the schema-cookie scope of one DDL statement on every open database (see
+    /// [`sqliters_btree::CookieStmt`]) and returns the states to hand back to
+    /// [`Self::cookie_scope_exit`]. Scopes nest (a virtual-table module running DDL).
+    pub(crate) fn cookie_scope_enter(&mut self) -> Vec<sqliters_btree::CookieStmt> {
+        self.ddl_cookie_depth += 1;
+        self.slots
+            .iter_mut()
+            .map(|slot| {
+                slot.btree
+                    .as_mut()
+                    .map_or(sqliters_btree::CookieStmt::Off, |bt| {
+                        bt.replace_cookie_stmt(sqliters_btree::CookieStmt::Pending)
+                    })
+            })
+            .collect()
+    }
+
+    /// Ends the scope opened by [`Self::cookie_scope_enter`].
+    pub(crate) fn cookie_scope_exit(&mut self, saved: &[sqliters_btree::CookieStmt]) {
+        self.ddl_cookie_depth = self.ddl_cookie_depth.saturating_sub(1);
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if let Some(bt) = slot.btree.as_mut() {
+                bt.replace_cookie_stmt(saved.get(i).copied().unwrap_or_default());
+            }
+        }
+    }
+
+    /// Whether a DDL statement's schema-cookie scope is active.
+    #[inline]
+    pub(crate) const fn in_cookie_scope(&self) -> bool {
+        self.ddl_cookie_depth != 0
     }
 
     /// Immutable slice of all slots (`0..nDb`).

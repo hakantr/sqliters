@@ -2885,15 +2885,9 @@ fn try_compile_insert_core(
             return Ok(None);
         }
     }
-    indexes.sort_by_key(|idx| {
-        if idx.unique && idx.origin == "pk" {
-            0u8
-        } else if idx.unique {
-            1u8
-        } else {
-            2u8
-        }
-    });
+    // `pTab->pIndex` order: the order in which C checks the UNIQUE constraints and writes or
+    // deletes the index entries (newest index first, `ON CONFLICT REPLACE` ones last).
+    indexes = crate::engine::dml_ordered_indexes(tbl, &indexes);
 
     let n_cols = tbl.columns.len();
     let mut seen_col = vec![false; n_cols];
@@ -2953,6 +2947,23 @@ fn try_compile_insert_core(
         || tbl
             .rowid_alias_col
             .is_some_and(|ipk| tbl.columns[ipk].default_expr.is_some());
+
+    // Storage form of integral values in REAL-affinity columns for this statement.
+    if tbl.strict && tbl.has_real_col() && !indexes.is_empty() {
+        return Ok(None);
+    }
+    let real_as_int = crate::engine::real_cols_stored_as_int_on_insert(tbl, !indexes.is_empty());
+    sqliters_types::dtrace!(
+        "TR|real|stmt|kind=insert tbl={} o={}",
+        tbl.name,
+        if !tbl.has_real_col() {
+            "no-real-column"
+        } else if real_as_int {
+            "int-form"
+        } else {
+            "float-form"
+        }
+    );
 
     let mut prog = VdbeProgram::new();
     prog.read_only = false;
@@ -3162,12 +3173,21 @@ fn try_compile_insert_core(
         }
 
         // 8. Encode & insert physical table record.
-        prog.emit(Instruction::new(
-            Opcode::MakeRecord,
-            col_base,
-            n_cols as i32,
-            rec_reg,
-        ));
+        if real_as_int {
+            // C: `OP_MakeRecord` carrying the table's affinity string (no `OP_Affinity` ran).
+            prog.emit(
+                Instruction::new(Opcode::MakeRecordAff, col_base, n_cols as i32, rec_reg).with_p4(
+                    P4::Affinity(tbl.columns.iter().map(|c| c.affinity).collect()),
+                ),
+            );
+        } else {
+            prog.emit(Instruction::new(
+                Opcode::MakeRecord,
+                col_base,
+                n_cols as i32,
+                rec_reg,
+            ));
+        }
         if defer_dup_check_to_insert {
             let pk_flag = if dup_ext_code == sqliters_types::extended::SQLITE_CONSTRAINT_PRIMARYKEY
             {
@@ -3308,6 +3328,7 @@ fn try_compile_insert_core(
                 cols,
                 indexes: plan_indexes,
                 has_builtin_jsonb,
+                real_as_int,
                 dup_ext_code,
                 dup_msg,
             }));
@@ -3432,15 +3453,9 @@ fn table_and_indexes_can_compile_dml(
             return None;
         }
     }
-    indexes.sort_by_key(|idx| {
-        if idx.unique && idx.origin == "pk" {
-            0u8
-        } else if idx.unique {
-            1u8
-        } else {
-            2u8
-        }
-    });
+    // `pTab->pIndex` order: the order in which C checks the UNIQUE constraints and writes or
+    // deletes the index entries (newest index first, `ON CONFLICT REPLACE` ones last).
+    indexes = crate::engine::dml_ordered_indexes(tbl, &indexes);
     Some(indexes)
 }
 
@@ -3739,6 +3754,29 @@ pub fn try_compile_update_in_db_set(
     let is_pure_single_eq = extract_table_col_eq(where_expr, &tbl, slot_name, alias)
         .is_some_and(|(cname, _)| is_rowid_or_ipk_name(&tbl, &cname));
 
+    // Storage form of integral values in REAL-affinity columns for this statement.
+    if tbl.strict && tbl.has_real_col() && !indexes.is_empty() {
+        return Ok(None);
+    }
+    let real_as_int = crate::engine::real_cols_stored_as_int_on_update(
+        &tbl,
+        &indexes,
+        &modified_col,
+        false,
+        false,
+    );
+    sqliters_types::dtrace!(
+        "TR|real|stmt|kind=update tbl={} o={}",
+        tbl.name,
+        if !tbl.has_real_col() {
+            "no-real-column"
+        } else if real_as_int {
+            "int-form"
+        } else {
+            "float-form"
+        }
+    );
+
     // Only open and maintain secondary indexes that reference at least one modified column!
     let affected_indexes: Vec<IndexSchema> = indexes
         .into_iter()
@@ -3827,6 +3865,14 @@ pub fn try_compile_update_in_db_set(
                 ci as i32,
                 new_col_base + ci as i32,
             ));
+            if tbl.columns[ci].affinity == TypeAffinity::Real {
+                prog.emit(Instruction::new(
+                    Opcode::RealAffinity,
+                    new_col_base + ci as i32,
+                    0,
+                    0,
+                ));
+            }
         } else if affected_indexes
             .iter()
             .any(|idx| idx.columns.iter().any(|ic| ic.col_idx == Some(ci)))
@@ -3880,7 +3926,9 @@ pub fn try_compile_update_in_db_set(
         let idx_key_base = prog.alloc_registers(max_idx_width);
         let idx_rec_reg = prog.alloc_register();
 
-        for (ic, idx, u_msg) in &icurs {
+        // update.c: all old index entries are deleted first (`sqlite3GenerateRowIndexDelete`),
+        // then the new entries are inserted (`sqlite3CompleteInsertion`), the table row last.
+        for (ic, idx, _) in &icurs {
             // Delete old index entry
             for (k, ic_col) in idx.columns.iter().enumerate() {
                 let ci = ic_col.col_idx.expect("validated col_idx");
@@ -3910,7 +3958,8 @@ pub fn try_compile_update_in_db_set(
                 idx_key_base,
                 (idx.columns.len() + 1) as i32,
             ));
-
+        }
+        for (ic, idx, u_msg) in &icurs {
             // Insert new index entry
             for (k, ic_col) in idx.columns.iter().enumerate() {
                 let ci = ic_col.col_idx.expect("validated col_idx");
@@ -3954,12 +4003,20 @@ pub fn try_compile_update_in_db_set(
     }
 
     let rec_reg = prog.alloc_register();
-    prog.emit(Instruction::new(
-        Opcode::MakeRecord,
-        new_col_base,
-        n_cols as i32,
-        rec_reg,
-    ));
+    if real_as_int {
+        prog.emit(
+            Instruction::new(Opcode::MakeRecordAff, new_col_base, n_cols as i32, rec_reg).with_p4(
+                P4::Affinity(tbl.columns.iter().map(|c| c.affinity).collect()),
+            ),
+        );
+    } else {
+        prog.emit(Instruction::new(
+            Opcode::MakeRecord,
+            new_col_base,
+            n_cols as i32,
+            rec_reg,
+        ));
+    }
     prog.emit(Instruction::new(Opcode::Insert, tcur, rec_reg, rid_reg).with_p5(0x02));
 
     let seek_addr = done_jumps[0];
@@ -4031,6 +4088,16 @@ pub fn try_compile_update_in_db_set(
             sets,
             indexes: plan_indexes,
             read_mask,
+            real_cols: tbl
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(ci, c)| {
+                    c.affinity == TypeAffinity::Real && tbl.rowid_alias_col != Some(*ci)
+                })
+                .map(|(ci, _)| ci)
+                .collect(),
+            real_as_int,
             ticks_hit: (halt_addr + 1) as u64,
             ticks_miss: (seek_addr + 1 + (halt_addr - done_addr + 1)) as u64,
         }));
@@ -5405,6 +5472,9 @@ fn compile_expr(
                                 .with_p4(col_schema.default_p4_for_table(b.tbl.strict))
                                 .with_comment(col_schema.name.clone()),
                         );
+                        if col_schema.affinity == TypeAffinity::Real {
+                            prog.emit(Instruction::new(Opcode::RealAffinity, dest, 0, 0));
+                        }
                     } else if !b.tbl.without_rowid && b.tbl.rowid_alias_col == Some(col_idx) {
                         prog.emit(
                             Instruction::new(Opcode::Rowid, cov_cur, dest, 0)
@@ -5442,6 +5512,9 @@ fn compile_expr(
                             .with_p4(col_schema.default_p4_for_table(b.tbl.strict))
                             .with_comment(col_schema.name.clone()),
                     );
+                    if col_schema.affinity == TypeAffinity::Real {
+                        prog.emit(Instruction::new(Opcode::RealAffinity, dest, 0, 0));
+                    }
                 }
             } else if b.tbl.is_implicit_rowid_name(&cref.column) {
                 prog.emit(Instruction::new(Opcode::Rowid, b.cursor, dest, 0));

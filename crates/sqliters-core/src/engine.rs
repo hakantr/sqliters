@@ -125,6 +125,15 @@ pub struct StmtTxTracker {
     /// Active `OP_Program` frame stack (`Some((schema_inst, schema_rowid))` for user triggers,
     /// `None` for FK action subprograms; `len()` mirrors `Vdbe::nFrame` in `vdbe.c:7683`).
     pub subprogram_stack: Vec<Option<(SchemaInstanceId, i64)>>,
+    /// Set while the transfer optimisation writes a row: the storage form of the source row.
+    pub insert_real_as_int: Option<bool>,
+    /// Set while an UPDATE writes a row: per secondary index (in the order the statement holds
+    /// them), whether C rewrites its entry (`aRegIdx[i] != 0` in update.c). Entries of the
+    /// other indexes are left untouched and the table row is overwritten in place.
+    pub update_index_rewrite: Option<(Pgno, Vec<bool>)>,
+    /// Set while an UPDATE writes a row: whether this statement stores integral values of
+    /// REAL-affinity columns as integers (see `real_cols_stored_as_int_on_update`).
+    pub update_real_as_int: Option<bool>,
     /// Top-level statement immediate FK suspects (`Vdbe::nFkConstraint` in `vdbeaux.c:3306-3309`).
     pub stmt_fk_suspects: Vec<(SchemaInstanceId, String, TableRowKey, usize)>,
     /// Table roots pinned by `OP_CursorLock` during `UPDATE` `OE_Replace` conflict delete triggers
@@ -468,6 +477,7 @@ impl ExecContext<'_> {
         let required_depth =
             self.savepoints.len() + usize::from(self.stmt_tx.stmt_sp_slot.is_some());
 
+        let in_cookie_scope = self.db_set.in_cookie_scope();
         let slot = self
             .db_set
             .slot_mut(db_id)
@@ -485,6 +495,10 @@ impl ExecContext<'_> {
                 b.pager_mut()
                     .begin_write_with_savepoint_depth(required_depth)
             })?;
+        }
+        if in_cookie_scope {
+            // The cookie the statement starts from (`pSchema->schema_cookie` when C prepares it).
+            bt.capture_cookie_stmt_base();
         }
         self.stmt_tx.touched_write_mask |= bit;
         if !autocommit {
@@ -2455,6 +2469,37 @@ pub(crate) fn execute_write_body(
     stmt: &Stmt,
     params: &[Value],
 ) -> Result<QueryOutput> {
+    // Statements that call `sqlite3ChangeCookie` in C: however many `sqlite_schema` rows they
+    // write, the schema cookie ends at "value when the statement started" + 1.
+    let changes_cookie = matches!(
+        stmt,
+        Stmt::CreateTable(_)
+            | Stmt::CreateTableAs { .. }
+            | Stmt::CreateVirtualTable { .. }
+            | Stmt::CreateView(_)
+            | Stmt::CreateTrigger(_)
+            | Stmt::DropTable { .. }
+            | Stmt::DropView { .. }
+            | Stmt::DropTrigger { .. }
+            | Stmt::CreateIndex(_)
+            | Stmt::DropIndex { .. }
+            | Stmt::AlterTable { .. }
+            | Stmt::Analyze(_)
+    );
+    if !changes_cookie {
+        return execute_write_body_inner(ctx, stmt, params);
+    }
+    let saved = ctx.db_set.cookie_scope_enter();
+    let res = execute_write_body_inner(ctx, stmt, params);
+    ctx.db_set.cookie_scope_exit(&saved);
+    res
+}
+
+fn execute_write_body_inner(
+    ctx: &mut ExecContext<'_>,
+    stmt: &Stmt,
+    params: &[Value],
+) -> Result<QueryOutput> {
     match stmt {
         Stmt::Insert(ins) => {
             validate_dml_matching_triggers_hex(
@@ -2591,7 +2636,13 @@ pub(crate) fn execute_write_body(
                     let slot = ctx.db_set.slot_mut(db_id).unwrap();
                     let slot_name = slot.name.clone();
                     if let Some(ref mut bt) = slot.btree {
-                        bt.pager_mut().header_mut()?.schema_cookie = v;
+                        let hdr = bt.pager_mut().header_mut()?;
+                        sqliters_types::dtrace!(
+                            "TR|cookie|set|kind=NamedDisk old={} new={}",
+                            hdr.schema_cookie,
+                            v
+                        );
+                        hdr.schema_cookie = v;
                         slot.schema = Schema::load_for_schema(bt, Some(&slot_name))?;
                         slot.schema.rebind_collations(ctx.collations);
                     }
@@ -15326,10 +15377,61 @@ fn decode_table_logical_row(
     Ok(logical_vals)
 }
 
+/// The value stored for column `ci` of `tbl`: with `real_as_int`, an integral real in a
+/// REAL-affinity column is stored as an integer (`OP_MakeRecord` with an affinity string, see
+/// `real_cols_stored_as_int_on_insert`).
+#[inline]
+fn table_storage_value(tbl: &TableSchema, ci: usize, v: &Value, real_as_int: bool) -> Value {
+    if real_as_int
+        && let Value::Real(r) = v
+        && tbl
+            .columns
+            .get(ci)
+            .is_some_and(|c| c.affinity == TypeAffinity::Real)
+        && let Some(i) = sqliters_types::real_affinity_storage_int(*r)
+    {
+        return Value::Integer(i);
+    }
+    v.clone()
+}
+
+/// Storage form of a stored table record (physical values, integers not yet turned into
+/// reals): `true` when a REAL-affinity column holds an integer, i.e. the row was written in
+/// integer form; a row with no integral value in such a column reads the same either way.
+fn stored_real_form_is_int(tbl: &TableSchema, phys_vals: &[Value]) -> bool {
+    let mut slot = 0usize;
+    for (ci, col) in tbl.columns.iter().enumerate() {
+        if col.generated.as_ref().is_some_and(|(_, stored)| !*stored) {
+            continue;
+        }
+        if col.affinity == TypeAffinity::Real
+            && tbl.rowid_alias_col != Some(ci)
+            && matches!(phys_vals.get(slot), Some(Value::Integer(_)))
+        {
+            return true;
+        }
+        slot += 1;
+    }
+    false
+}
+
+/// Index keys of a STRICT table: integral reals of REAL columns in their integer form.
+fn strict_real_index_keys_as_int(tbl: &TableSchema, idx: &IndexSchema, keys: &mut [Value]) {
+    for (k, ic) in idx.columns.iter().enumerate() {
+        if ic.expr.is_none()
+            && let Some(ci) = ic.col_idx
+            && let Some(slot) = keys.get_mut(k)
+        {
+            *slot = table_storage_value(tbl, ci, slot, true);
+        }
+    }
+}
+
 fn encode_table_physical_record(
     tbl: &TableSchema,
     logical_vals: &[Value],
     enc: TextEncoding,
+    real_as_int: bool,
 ) -> Vec<u8> {
     if tbl.without_rowid {
         let mut slots = Vec::with_capacity(
@@ -15337,10 +15439,10 @@ fn encode_table_physical_record(
         );
         for ic in &tbl.without_rowid_pk_cols {
             let ci = ic.col_idx.expect("WITHOUT ROWID PK col has col_idx");
-            slots.push(logical_vals[ci].clone());
+            slots.push(table_storage_value(tbl, ci, &logical_vals[ci], real_as_int));
         }
         for &ci in &tbl.without_rowid_extra_cols {
-            slots.push(logical_vals[ci].clone());
+            slots.push(table_storage_value(tbl, ci, &logical_vals[ci], real_as_int));
         }
         return encode_record_with_encoding(&slots, enc);
     }
@@ -15359,7 +15461,7 @@ fn encode_table_physical_record(
         if tbl.rowid_alias_col == Some(i) {
             slots.push(Value::Null);
         } else {
-            slots.push(v.clone());
+            slots.push(table_storage_value(tbl, i, v, real_as_int));
         }
     }
     if slots.is_empty() {
@@ -15765,6 +15867,28 @@ fn ordered_table_indexes(tbl: &TableSchema, indexes: &[IndexSchema]) -> Vec<Inde
         out.push(idx);
     }
     out
+}
+
+/// The secondary indexes of `tbl` in `pTab->pIndex` order (newest first, `ON CONFLICT REPLACE`
+/// ones last), without the PRIMARY KEY of a WITHOUT ROWID table (which is the table itself).
+pub(crate) fn dml_ordered_indexes(tbl: &TableSchema, indexes: &[IndexSchema]) -> Vec<IndexSchema> {
+    if indexes.len() < 2 {
+        return indexes.to_vec();
+    }
+    ordered_table_indexes(tbl, indexes)
+        .into_iter()
+        .filter(|i| !(tbl.without_rowid && i.root_pgno == tbl.root_pgno))
+        .collect()
+}
+
+/// For a WITHOUT ROWID table: how many of its secondary indexes (`indexes`, already in
+/// `pTab->pIndex` order) precede the PRIMARY KEY index in that list, i.e. are written before the
+/// table's own b-tree.
+fn without_rowid_pk_list_position(tbl: &TableSchema, indexes: &[IndexSchema]) -> usize {
+    let all = ordered_table_indexes(tbl, indexes);
+    all.iter()
+        .position(|i| i.root_pgno == tbl.root_pgno)
+        .unwrap_or(all.len())
 }
 
 fn ordered_unique_indexes(tbl: &TableSchema, indexes: &[IndexSchema]) -> Vec<IndexSchema> {
@@ -16739,6 +16863,7 @@ fn validate_and_write_row(
 
     // 7. If updating an existing row, re-verify `old_key` still exists (`update.c:1050-1057`),
     // check parent UPDATE RESTRICT before mutating, and remove the old row + index entries!
+    let mut update_in_place = false;
     let old_logical_vals_opt = if let Some(old_key) = existing_self_key {
         let Some(op) = seek_table_raw_entry(ctx, db_id, tbl, old_key)? else {
             return Ok(None);
@@ -16747,7 +16872,57 @@ fn validate_and_write_row(
         if *ctx.foreign_keys {
             check_parent_update_restrict(ctx, db_id, tbl, &old_vals, &raw_vals, params)?;
         }
-        remove_row_and_indexes(ctx, db_id, tbl, indexes, old_key, params)?;
+        // update.c: only the entries of the indexes the statement rewrites are deleted; the
+        // table row itself is deleted only when its rowid changes (otherwise the new record
+        // overwrites it in place).
+        update_in_place = !tbl.without_rowid
+            && old_key.rowid_or_zero() == rowid
+            && ctx
+                .stmt_tx
+                .update_index_rewrite
+                .as_ref()
+                .is_some_and(|(root, m)| *root == tbl.root_pgno && m.len() == indexes.len());
+        if update_in_place {
+            check_table_not_pinned(ctx, db_id, tbl.root_pgno)?;
+            let mask = ctx
+                .stmt_tx
+                .update_index_rewrite
+                .as_ref()
+                .map(|(_, m)| m.clone())
+                .unwrap_or_default();
+            for (idx, _) in indexes.iter().zip(&mask).filter(|(_, m)| **m) {
+                if index_row_passes_partial_where(
+                    ctx,
+                    &schema_name,
+                    tbl,
+                    idx,
+                    rowid,
+                    &old_vals,
+                    params,
+                )? {
+                    let keys = eval_index_key_values(
+                        ctx,
+                        &schema_name,
+                        tbl,
+                        idx,
+                        old_key,
+                        &old_vals,
+                        params,
+                    )?;
+                    let orders = idx.key_sort_orders();
+                    if let Some(ref mut bt) =
+                        ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut())
+                    {
+                        bt.delete_index(idx.root_pgno, &keys, &orders)?;
+                    }
+                }
+            }
+            if let Some(inst_id) = ctx.db_set.slot(db_id).map(|s| s.schema_instance_id) {
+                ctx.db_set.expire_blobs_for_row(inst_id, &tbl.name, rowid);
+            }
+        } else {
+            remove_row_and_indexes(ctx, db_id, tbl, indexes, old_key, params)?;
+        }
         Some(old_vals)
     } else {
         None
@@ -16755,25 +16930,87 @@ fn validate_and_write_row(
 
     // 8. Write table primary B-Tree record & secondary index records
     check_table_not_pinned(ctx, db_id, tbl.root_pgno)?;
-    let phys_rec = encode_table_physical_record(tbl, &raw_vals, enc);
-    if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
-        if tbl.without_rowid {
+    let real_as_int = tbl.has_real_col()
+        && match (existing_self_key, ctx.stmt_tx.update_real_as_int) {
+            (Some(_), Some(as_int)) => as_int,
+            (None, _) if ctx.stmt_tx.insert_real_as_int.is_some() => {
+                ctx.stmt_tx.insert_real_as_int.unwrap_or(false)
+            }
+            _ => {
+                let table_has_index = ctx.db_set.slot(db_id).is_some_and(|s| {
+                    s.schema
+                        .indexes
+                        .iter()
+                        .any(|i| i.table_name.eq_ignore_ascii_case(&tbl.name))
+                });
+                real_cols_stored_as_int_on_insert(tbl, table_has_index)
+            }
+        };
+    sqliters_types::dtrace!(
+        "TR|real|record|tbl={} o={}",
+        tbl.name,
+        if !tbl.has_real_col() || ctx.stmt_tx.insert_real_as_int.is_some() {
+            // (the transfer optimisation copies the stored form: no decision is made)
+            "no-real-column"
+        } else if real_as_int {
+            "int-form"
+        } else {
+            "float-form"
+        }
+    );
+    let phys_rec = encode_table_physical_record(tbl, &raw_vals, enc, real_as_int);
+    // `sqlite3CompleteInsertion`: the index entries go in first, in `pTab->pIndex` order, and
+    // the table row last. The PRIMARY KEY b-tree of a WITHOUT ROWID table is written at its
+    // own position in that list.
+    let pk_pos = if tbl.without_rowid && !indexes.is_empty() {
+        without_rowid_pk_list_position(tbl, indexes)
+    } else {
+        usize::MAX
+    };
+    let rewrite_mask: Option<Vec<bool>> = if update_in_place {
+        ctx.stmt_tx
+            .update_index_rewrite
+            .as_ref()
+            .map(|(_, m)| m.clone())
+    } else {
+        None
+    };
+    for (idx_no, idx) in indexes.iter().enumerate() {
+        if idx_no == pk_pos
+            && let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut())
+        {
             let pk_orders = tbl.without_rowid_pk_orders();
             bt.insert_index(tbl.root_pgno, &phys_rec, &pk_orders)?;
-        } else {
-            bt.insert_table(tbl.root_pgno, rowid, &phys_rec)?;
         }
-    }
-
-    for idx in indexes {
+        if rewrite_mask
+            .as_ref()
+            .is_some_and(|m| !m.get(idx_no).copied().unwrap_or(true))
+        {
+            continue;
+        }
         if index_row_passes_partial_where(ctx, &schema_name, tbl, idx, rowid, &raw_vals, params)? {
-            let keys =
+            let mut keys =
                 eval_index_key_values(ctx, &schema_name, tbl, idx, &final_key, &raw_vals, params)?;
+            if real_as_int && tbl.strict {
+                // `OP_TypeCheck` leaves `MEM_IntReal` in the registers the index keys are
+                // built from, so the index entries of a STRICT table carry the integer too.
+                strict_real_index_keys_as_int(tbl, idx, &mut keys);
+            }
             let idx_rec = encode_record_with_encoding(&keys, enc);
             let orders = idx.key_sort_orders();
             if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
                 bt.insert_index(idx.root_pgno, &idx_rec, &orders)?;
             }
+        }
+    }
+    if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
+        if tbl.without_rowid {
+            if pk_pos >= indexes.len() {
+                let pk_orders = tbl.without_rowid_pk_orders();
+                bt.insert_index(tbl.root_pgno, &phys_rec, &pk_orders)?;
+            }
+        } else {
+            bt.insert_table(tbl.root_pgno, rowid, &phys_rec)?;
         }
     }
 
@@ -17266,12 +17503,25 @@ fn write_update_row_and_build_after_scope<F>(
     mutation_dispatch: Option<(MutationOrigin, Option<MutationRow>)>,
     is_catalog: bool,
     params: &[Value],
+    modified_col_mask: &[bool],
     on_written: F,
 ) -> Result<Option<Option<Box<EvalRow>>>>
 where
     F: FnOnce(&mut ExecContext<'_>, &TableRowKey, &[Value]) -> Result<()>,
 {
-    let Some((written_key, written_vals)) = validate_and_write_row(
+    // The statement's rules for this row (which indexes it rewrites, the storage form of REAL
+    // columns) are in force for the write only; this function is not on the recursive-trigger
+    // path, so the bookkeeping costs that path no stack.
+    let (saved_real_as_int, saved_index_rewrite) = enter_update_row_storage_rules(
+        ctx,
+        db_id,
+        tbl,
+        indexes,
+        modified_col_mask,
+        new_rowid_opt,
+        old_key,
+    );
+    let written = validate_and_write_row(
         ctx,
         db_id,
         tbl,
@@ -17284,8 +17534,10 @@ where
         false,
         mutation_dispatch,
         is_catalog,
-    )?
-    else {
+    );
+    ctx.stmt_tx.update_real_as_int = saved_real_as_int;
+    ctx.stmt_tx.update_index_rewrite = saved_index_rewrite;
+    let Some((written_key, written_vals)) = written? else {
         return Ok(None);
     };
     on_written(ctx, &written_key, &written_vals)?;
@@ -17299,6 +17551,59 @@ where
         None
     };
     Ok(Some(after_scope))
+}
+
+/// Sets, for the row an UPDATE is about to write, which secondary indexes the statement
+/// rewrites (`StmtTxTracker::update_index_rewrite`) and the storage form of REAL-affinity
+/// columns (`update_real_as_int`); returns the previous values for the caller to restore.
+#[inline(never)]
+fn enter_update_row_storage_rules(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    indexes: &[IndexSchema],
+    modified_col_mask: &[bool],
+    new_rowid_opt: Option<i64>,
+    old_key: &TableRowKey,
+) -> (Option<bool>, Option<(Pgno, Vec<bool>)>) {
+    let saved_real_as_int = ctx.stmt_tx.update_real_as_int;
+    let rowid_changes = tbl
+        .rowid_alias_col
+        .is_some_and(|c| modified_col_mask.get(c).copied().unwrap_or(false))
+        || (!tbl.without_rowid && new_rowid_opt.is_some_and(|r| r != old_key.rowid_or_zero()));
+    let saved_index_rewrite = ctx.stmt_tx.update_index_rewrite.take();
+    let modified_with_generated;
+    let modified_col_mask: &[bool] = if tbl.columns.iter().any(|c| c.generated.is_some()) {
+        modified_with_generated = modified_cols_with_generated(tbl, modified_col_mask);
+        &modified_with_generated
+    } else {
+        modified_col_mask
+    };
+    // (Also for a table without indexes: the row is then simply overwritten in place.)
+    if !tbl.without_rowid {
+        ctx.stmt_tx.update_index_rewrite = Some((
+            tbl.root_pgno,
+            indexes
+                .iter()
+                .map(|idx| update_rewrites_index(tbl, idx, modified_col_mask, rowid_changes, false))
+                .collect(),
+        ));
+    }
+    if tbl.has_real_col() {
+        let all_indexes = ctx
+            .db_set
+            .slot(db_id)
+            .map(|s| s.schema.indexes_for_table(&tbl.name))
+            .unwrap_or_default();
+        ctx.stmt_tx.update_real_as_int = Some(real_cols_stored_as_int_on_update(
+            tbl,
+            &all_indexes,
+            modified_col_mask,
+            rowid_changes,
+            false,
+        ));
+    }
+    (saved_real_as_int, saved_index_rewrite)
 }
 
 #[inline(never)]
@@ -17377,6 +17682,7 @@ where
         mutation_dispatch,
         is_catalog,
         params,
+        modified_col_mask,
         on_written,
     )?
     else {
@@ -18686,7 +18992,10 @@ fn prepare_dml_write_slot(
                 format!("no such table: {}", qn.display_name()),
             )
         })?;
-    let indexes = slot.schema.indexes_for_table(&tbl.name);
+    // The secondary indexes in `pTab->pIndex` order — the order in which C checks UNIQUE
+    // constraints and writes / deletes index entries (`sqlite3CompleteInsertion`,
+    // `sqlite3GenerateRowIndexDelete`).
+    let indexes = dml_ordered_indexes(&tbl, &slot.schema.indexes_for_table(&tbl.name));
     Ok((tbl, indexes, sname))
 }
 
@@ -19900,6 +20209,223 @@ fn expr_mentions_implicit_rowid(expr: &Expr, tbl: &TableSchema) -> bool {
     }
 }
 
+/// Whether `expr` mentions a column for which `pred` holds (the expression forms a CHECK
+/// constraint, a partial-index WHERE clause or an indexed expression can take).
+fn expr_mentions_column(expr: &Expr, pred: &dyn Fn(&ColumnRef) -> bool) -> bool {
+    match expr {
+        Expr::Column(cref) => pred(cref),
+        Expr::Unary { expr: e, .. }
+        | Expr::Collate { expr: e, .. }
+        | Expr::Cast { expr: e, .. }
+        | Expr::IsNull { expr: e, .. } => expr_mentions_column(e, pred),
+        Expr::Binary { left, right, .. } => {
+            expr_mentions_column(left, pred) || expr_mentions_column(right, pred)
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            expr_mentions_column(e, pred)
+                || expr_mentions_column(low, pred)
+                || expr_mentions_column(high, pred)
+        }
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_mentions_column(e, pred)
+                || expr_mentions_column(pattern, pred)
+                || escape
+                    .as_deref()
+                    .is_some_and(|esc| expr_mentions_column(esc, pred))
+        }
+        Expr::InList { expr: e, list, .. } => {
+            expr_mentions_column(e, pred) || list.iter().any(|x| expr_mentions_column(x, pred))
+        }
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
+            let args_r = match args {
+                FunctionArgs::Star => false,
+                FunctionArgs::Exprs(es) => es.iter().any(|e| expr_mentions_column(e, pred)),
+            };
+            let over_r = match over {
+                Some(WindowRef::Spec(ws)) => {
+                    ws.partition_by
+                        .iter()
+                        .any(|pe| expr_mentions_column(pe, pred))
+                        || ws
+                            .order_by
+                            .iter()
+                            .any(|ob| expr_mentions_column(&ob.expr, pred))
+                        || ws.frame.as_ref().is_some_and(|wf| {
+                            [&wf.start, &wf.end].into_iter().any(|b| match b {
+                                WindowFrameBound::Preceding(be)
+                                | WindowFrameBound::Following(be) => expr_mentions_column(be, pred),
+                                _ => false,
+                            })
+                        })
+                }
+                _ => false,
+            };
+            args_r
+                || filter
+                    .as_deref()
+                    .is_some_and(|f| expr_mentions_column(f, pred))
+                || over_r
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|o| expr_mentions_column(o, pred))
+                || branches
+                    .iter()
+                    .any(|(w, t)| expr_mentions_column(w, pred) || expr_mentions_column(t, pred))
+                || else_expr
+                    .as_deref()
+                    .is_some_and(|el| expr_mentions_column(el, pred))
+        }
+        Expr::RowValue(es) => es.iter().any(|e| expr_mentions_column(e, pred)),
+        _ => false,
+    }
+}
+
+/// C's `bAffinityDone == 0` at the end of `sqlite3GenerateConstraintChecks` (insert.c) for an
+/// INSERT: the table record is built by `OP_MakeRecord` *with* the affinity string, which stores
+/// an integral value of a REAL-affinity column as an integer (`MEM_IntReal`). A CHECK constraint
+/// or any index makes C apply the affinities with a separate `OP_Affinity` first, which turns
+/// such values into genuine reals, stored as 8-byte floats. STRICT tables go through
+/// `OP_TypeCheck`, which always produces the integer form (also in index entries).
+pub(crate) fn real_cols_stored_as_int_on_insert(tbl: &TableSchema, table_has_index: bool) -> bool {
+    if !tbl.has_real_col() {
+        return false;
+    }
+    if tbl.strict {
+        return true;
+    }
+    !tbl.without_rowid && tbl.checks.is_empty() && !table_has_index
+}
+
+/// [`real_cols_stored_as_int_on_insert`] for an UPDATE (update.c `aRegIdx` + the same code in
+/// insert.c): only a CHECK constraint that mentions an updated column, or an index that the
+/// statement has to rewrite, makes C run `OP_Affinity`. An index is rewritten when the rowid
+/// changes, when `fk_forces_index_rewrite` (`hasFK > 1`), when one of its columns or indexed
+/// expressions is updated or when its partial-index WHERE clause mentions an updated column;
+/// the PRIMARY KEY of a WITHOUT ROWID table always is.
+pub(crate) fn real_cols_stored_as_int_on_update(
+    tbl: &TableSchema,
+    indexes: &[IndexSchema],
+    modified_col: &[bool],
+    rowid_changes: bool,
+    fk_forces_index_rewrite: bool,
+) -> bool {
+    if !tbl.has_real_col() {
+        return false;
+    }
+    if tbl.strict {
+        return true;
+    }
+    if tbl.without_rowid {
+        return false;
+    }
+    let updated = |cref: &ColumnRef| -> bool {
+        match tbl.find_column(&cref.column) {
+            Some((ci, _)) => {
+                modified_col.get(ci).copied().unwrap_or(false)
+                    || (rowid_changes && tbl.rowid_alias_col == Some(ci))
+            }
+            None => rowid_changes && tbl.is_implicit_rowid_name(&cref.column),
+        }
+    };
+    if tbl
+        .checks
+        .iter()
+        .any(|ck| expr_mentions_column(&ck.expr, &updated))
+    {
+        return false;
+    }
+    !indexes.iter().any(|idx| {
+        update_rewrites_index(
+            tbl,
+            idx,
+            modified_col,
+            rowid_changes,
+            fk_forces_index_rewrite,
+        )
+    })
+}
+
+/// update.c: "Mark generated columns as changing if their generator expressions reference any
+/// changing column" — the assigned columns plus every generated column that (transitively)
+/// depends on one of them.
+pub(crate) fn modified_cols_with_generated(tbl: &TableSchema, modified_col: &[bool]) -> Vec<bool> {
+    let mut mask: Vec<bool> = (0..tbl.columns.len())
+        .map(|ci| modified_col.get(ci).copied().unwrap_or(false))
+        .collect();
+    if !tbl.columns.iter().any(|c| c.generated.is_some()) {
+        return mask;
+    }
+    loop {
+        let mut changed = false;
+        for (ci, col) in tbl.columns.iter().enumerate() {
+            if mask[ci] {
+                continue;
+            }
+            if let Some((gexpr, _)) = &col.generated {
+                let depends = expr_mentions_column(gexpr, &|cref: &ColumnRef| {
+                    tbl.find_column(&cref.column)
+                        .is_some_and(|(dep, _)| mask[dep])
+                });
+                if depends {
+                    mask[ci] = true;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return mask;
+        }
+    }
+}
+
+/// update.c `aRegIdx[i] != 0`: whether an UPDATE has to rewrite the entry of `idx` — the rowid
+/// changes, `hasFK > 1`, one of its columns or indexed expressions is assigned, or its
+/// partial-index WHERE clause mentions an assigned column.
+pub(crate) fn update_rewrites_index(
+    tbl: &TableSchema,
+    idx: &IndexSchema,
+    modified_col: &[bool],
+    rowid_changes: bool,
+    fk_forces_index_rewrite: bool,
+) -> bool {
+    if rowid_changes || fk_forces_index_rewrite {
+        return true;
+    }
+    let updated = |cref: &ColumnRef| -> bool {
+        match tbl.find_column(&cref.column) {
+            Some((ci, _)) => modified_col.get(ci).copied().unwrap_or(false),
+            None => false,
+        }
+    };
+    if idx
+        .where_clause
+        .as_ref()
+        .is_some_and(|w| expr_mentions_column(w, &updated))
+    {
+        return true;
+    }
+    idx.columns.iter().any(|ic| match (&ic.expr, ic.col_idx) {
+        (Some(e), _) => expr_mentions_column(e, &updated),
+        (None, Some(ci)) => modified_col.get(ci).copied().unwrap_or(false),
+        (None, None) => false,
+    })
+}
+
 fn xfer_compatible_index(dest: &IndexSchema, src: &IndexSchema) -> bool {
     if dest.columns.len() != src.columns.len()
         || dest.trailing_pk_cols.len() != src.trailing_pk_cols.len()
@@ -20319,6 +20845,9 @@ struct PreparedTableInsert<'a> {
     implicit_non_gen_cols: Vec<usize>,
     source: PreparedInsertSource<'a>,
     xfer_preserve_rowids: Option<Vec<i64>>,
+    /// Transfer optimisation (`INSERT INTO t SELECT * FROM s`): per source row, whether its
+    /// REAL-affinity columns are stored in integer form. C copies the records byte for byte.
+    xfer_real_as_int: Option<Vec<bool>>,
     ordered_uniques: Vec<IndexSchema>,
     upsert_steps: Vec<UpsertCheckStep>,
     resolved_do_updates: Vec<Vec<(Vec<usize>, bool, &'a Expr)>>,
@@ -20542,6 +21071,7 @@ fn prepare_insert_exec<'a>(
                 None
             };
             let mut xfer_preserve_rowids: Option<Vec<i64>> = None;
+            let mut xfer_real_as_int: Option<Vec<bool>> = None;
             let source = match &ins.source {
                 InsertSource::DefaultValues => PreparedInsertSource::Materialized(vec![Vec::new()]),
                 InsertSource::Values(expr_rows) => {
@@ -20616,6 +21146,21 @@ fn prepare_insert_exec<'a>(
                         {
                             xfer_preserve_rowids = Some(src_rids);
                         }
+                        if initial_tbl.has_real_col()
+                            && !initial_tbl.without_rowid
+                            && !src_tbl.without_rowid
+                        {
+                            let (src_enc, _) = slot_encoding_and_name(ctx, src_db_id);
+                            let raw = scan_table_raw_entries(ctx, src_db_id, src_tbl)?;
+                            if raw.len() == rows.len() {
+                                let mut forms = Vec::with_capacity(raw.len());
+                                for (_, payload) in &raw {
+                                    let phys = decode_record_with_encoding(payload, src_enc)?;
+                                    forms.push(stored_real_form_is_int(src_tbl, &phys));
+                                }
+                                xfer_real_as_int = Some(forms);
+                            }
+                        }
                     }
                     PreparedInsertSource::Materialized(rows)
                 }
@@ -20687,6 +21232,7 @@ fn prepare_insert_exec<'a>(
                 implicit_non_gen_cols,
                 source,
                 xfer_preserve_rowids,
+                xfer_real_as_int,
                 ordered_uniques,
                 upsert_steps,
                 resolved_do_updates,
@@ -21218,6 +21764,10 @@ fn execute_single_table_insert_row(
         return Ok(());
     }
 
+    ctx.stmt_tx.insert_real_as_int = p
+        .xfer_real_as_int
+        .as_ref()
+        .and_then(|forms| forms.get(row_idx).copied());
     if ins.upsert_clauses.is_empty() {
         let Some(after_scope_opt) = write_plain_table_insert_and_build_after_scope(
             ctx,
@@ -21600,16 +22150,42 @@ fn execute_upsert_table_insert_row(
     }
 
     check_table_not_pinned(ctx, p.db_id, p.tbl.root_pgno)?;
-    let phys_rec = encode_table_physical_record(&p.tbl, &raw_vals, p.enc);
-    if let Some(ref mut bt) = ctx.db_set.slot_mut(p.db_id).and_then(|s| s.btree.as_mut()) {
-        if p.tbl.without_rowid {
+    let real_as_int = p.tbl.has_real_col()
+        && real_cols_stored_as_int_on_insert(
+            &p.tbl,
+            ctx.db_set.slot(p.db_id).is_some_and(|s| {
+                s.schema
+                    .indexes
+                    .iter()
+                    .any(|i| i.table_name.eq_ignore_ascii_case(&p.tbl.name))
+            }),
+        );
+    sqliters_types::dtrace!(
+        "TR|real|record|tbl={} o={}",
+        p.tbl.name,
+        if !p.tbl.has_real_col() {
+            "no-real-column"
+        } else if real_as_int {
+            "int-form"
+        } else {
+            "float-form"
+        }
+    );
+    let phys_rec = encode_table_physical_record(&p.tbl, &raw_vals, p.enc, real_as_int);
+    // Index entries first (`pTab->pIndex` order), the table row last (`sqlite3CompleteInsertion`);
+    // the PRIMARY KEY b-tree of a WITHOUT ROWID table at its position in that list.
+    let pk_pos = if p.tbl.without_rowid && !p.indexes.is_empty() {
+        without_rowid_pk_list_position(&p.tbl, &p.indexes)
+    } else {
+        usize::MAX
+    };
+    for (idx_no, idx) in p.indexes.iter().enumerate() {
+        if idx_no == pk_pos
+            && let Some(ref mut bt) = ctx.db_set.slot_mut(p.db_id).and_then(|s| s.btree.as_mut())
+        {
             let pk_orders = p.tbl.without_rowid_pk_orders();
             bt.insert_index(p.tbl.root_pgno, &phys_rec, &pk_orders)?;
-        } else {
-            bt.insert_table(p.tbl.root_pgno, rowid, &phys_rec)?;
         }
-    }
-    for idx in &p.indexes {
         if index_row_passes_partial_where(
             ctx,
             &p.schema_name,
@@ -21628,11 +22204,25 @@ fn execute_upsert_table_insert_row(
                 &raw_vals,
                 params,
             )?;
+            let mut keys = keys;
+            if real_as_int && p.tbl.strict {
+                strict_real_index_keys_as_int(&p.tbl, idx, &mut keys);
+            }
             let idx_rec = encode_record_with_encoding(&keys, p.enc);
             let orders = idx.key_sort_orders();
             if let Some(ref mut bt) = ctx.db_set.slot_mut(p.db_id).and_then(|s| s.btree.as_mut()) {
                 bt.insert_index(idx.root_pgno, &idx_rec, &orders)?;
             }
+        }
+    }
+    if let Some(ref mut bt) = ctx.db_set.slot_mut(p.db_id).and_then(|s| s.btree.as_mut()) {
+        if p.tbl.without_rowid {
+            if pk_pos >= p.indexes.len() {
+                let pk_orders = p.tbl.without_rowid_pk_orders();
+                bt.insert_index(p.tbl.root_pgno, &phys_rec, &pk_orders)?;
+            }
+        } else {
+            bt.insert_table(p.tbl.root_pgno, rowid, &phys_rec)?;
         }
     }
     if p.tbl.autoincrement {
@@ -24072,17 +24662,16 @@ fn prepare_delete_exec(
                 && del.indexed_by.is_none()
             {
                 check_table_not_pinned(ctx, db_id, tbl.root_pgno)?;
-                let count = if tbl.without_rowid {
-                    ctx.scan_index_in_db(db_id, tbl.root_pgno, tbl.without_rowid_pk_orders())?
-                        .len() as u64
-                } else {
-                    ctx.scan_table_in_db(db_id, tbl.root_pgno)?.len() as u64
-                };
+                // `OP_Clear` counts the rows while it frees the pages (`pnChange`).
+                let mut count = 0u64;
                 if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut())
                 {
-                    bt.clear_tree(tbl.root_pgno)?;
-                    for idx in &indexes {
-                        bt.clear_tree(idx.root_pgno)?;
+                    count = bt.clear_tree_counting(tbl.root_pgno)?;
+                    // One `OP_Clear` per index, in `pTab->pIndex` order.
+                    for idx in ordered_table_indexes(&tbl, &indexes) {
+                        if idx.root_pgno != tbl.root_pgno {
+                            bt.clear_tree(idx.root_pgno)?;
+                        }
                     }
                 }
                 if let Some(inst_id) = ctx.db_set.slot(db_id).map(|s| s.schema_instance_id) {
@@ -24673,8 +25262,18 @@ fn exec_create_table(ctx: &mut ExecContext<'_>, ct: &CreateTableStmt) -> Result<
     } else {
         bt.create_table()?
     };
-    insert_schema_entry(
+    // `sqlite3StartTable` inserts a placeholder row (five NULLs) for the table, the automatic
+    // indexes add their rows while the column definitions are parsed, and `sqlite3EndTable`
+    // then rewrites the placeholder with the real row (`UPDATE sqlite_schema ... WHERE
+    // rowid=#N`). The rewritten cell therefore lands below the index rows on the page.
+    let tbl_rowid = crate::schema::insert_schema_placeholder(bt)?;
+    for auto in pending_autos {
+        let idx_root = bt.create_index()?;
+        insert_schema_entry(bt, "index", &auto.name, &ct.name.name, idx_root, None)?;
+    }
+    update_schema_entry(
         bt,
+        tbl_rowid,
         "table",
         &ct.name.name,
         &ct.name.name,
@@ -24682,15 +25281,10 @@ fn exec_create_table(ctx: &mut ExecContext<'_>, ct: &CreateTableStmt) -> Result<
         Some(&ct.catalog_sql),
     )?;
 
-    for auto in pending_autos {
-        let idx_root = bt.create_index()?;
-        insert_schema_entry(bt, "index", &auto.name, &ct.name.name, idx_root, None)?;
-    }
-
     // Create `sqlite_sequence` table inside `db_id` if `AUTOINCREMENT` is used and `sqlite_sequence` doesn't exist yet
     if need_seq {
         let seq_root = bt.create_table()?;
-        insert_schema_entry(
+        crate::schema::insert_schema_entry_over_placeholder(
             bt,
             "table",
             "sqlite_sequence",
@@ -24791,6 +25385,33 @@ fn exec_create_virtual_table(
         ));
     }
 
+    {
+        let slot = ctx
+            .db_set
+            .slot_mut(db_id)
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        let bt = slot
+            .btree
+            .as_mut()
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        // `sqlite3VtabFinishParse`: the table's own `sqlite_schema` row and the cookie change
+        // come first; `OP_VCreate` (`xCreate`, which creates the shadow tables) runs after them.
+        crate::schema::insert_schema_entry_over_placeholder(
+            bt,
+            "table",
+            &name.name,
+            &name.name,
+            0,
+            Some(catalog_sql),
+        )?;
+        if bt.pager().page_count() > slot.max_page_count {
+            return Err(SqliteError::new(
+                ErrorCode::Full,
+                "database or disk is full",
+            ));
+        }
+    }
+
     let (vt, declared) = {
         let mut host_ctx = crate::vtab::CoreVTabHostContext::new(ctx, &db_name, &name.name);
         let vt = crate::vtab::catch_callback_panic("virtual table create", || {
@@ -24801,25 +25422,14 @@ fn exec_create_virtual_table(
     };
 
     {
-        let slot = ctx
-            .db_set
-            .slot_mut(db_id)
-            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-        let bt = slot
-            .btree
-            .as_mut()
-            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-        insert_schema_entry(bt, "table", &name.name, &name.name, 0, Some(catalog_sql))?;
-        if bt.pager().page_count() > slot.max_page_count {
-            return Err(SqliteError::new(
-                ErrorCode::Full,
-                "database or disk is full",
-            ));
-        }
+        // The catalogue now holds the table and whatever `xCreate` added.
         if db_id == DatabaseId::TEMP {
             ctx.db_set.reload_temp_schema_preserving_bindings()?;
         } else {
-            slot.reload_schema()?;
+            ctx.db_set
+                .slot_mut(db_id)
+                .ok_or_else(|| SqliteError::misuse("database slot closed"))?
+                .reload_schema()?;
         }
     }
 
@@ -25099,7 +25709,7 @@ fn exec_create_view(ctx: &mut ExecContext<'_>, cv: &CreateViewStmt) -> Result<()
         .btree
         .as_mut()
         .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-    insert_schema_entry(
+    crate::schema::insert_schema_entry_over_placeholder(
         bt,
         "view",
         &cv.name.name,
@@ -25495,6 +26105,26 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
             .slot(db_id)
             .map(|s| s.name.clone())
             .unwrap_or_else(|| "main".to_owned());
+        // `sqlite3CodeDropTable`: the table's own catalogue row is deleted first; `OP_VDestroy`
+        // (`xDestroy`, which drops the shadow tables) runs after it.
+        {
+            let slot = ctx
+                .db_set
+                .slot_mut(db_id)
+                .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+            let vt_rowid = slot
+                .schema
+                .find_virtual_table(&vt_def.name)
+                .map(|v| v.schema_rowid)
+                .unwrap_or(vt_def.schema_rowid);
+            let bt = slot
+                .btree
+                .as_mut()
+                .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+            if vt_rowid != 0 {
+                crate::schema::delete_schema_row(bt, vt_rowid)?;
+            }
+        }
         let mut vt = ctx
             .db_set
             .vtab_registry_mut()
@@ -25517,17 +26147,13 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
             .db_set
             .slot_mut(db_id)
             .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-        let vt_rowid = slot
-            .schema
-            .find_virtual_table(&vt_def.name)
-            .map(|v| v.schema_rowid)
-            .unwrap_or(vt_def.schema_rowid);
-        let bt = slot
-            .btree
-            .as_mut()
-            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-        if vt_rowid != 0 {
-            delete_schema_entry(bt, vt_rowid)?;
+        {
+            // The statement's own cookie change comes last (after the nested DROPs of `xDestroy`).
+            let bt = slot
+                .btree
+                .as_mut()
+                .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+            crate::schema::bump_schema_cookie(bt)?;
         }
         if db_id == DatabaseId::TEMP {
             ctx.db_set.reload_temp_schema_preserving_bindings()?;
@@ -25622,6 +26248,25 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
         }
     }
 
+    // `sqlite3DropTable` → `sqlite3ClearStatTables`: the table's `sqlite_stat1` rows go first,
+    // before the triggers, the `sqlite_sequence` row, the catalogue rows and the trees
+    // (`sqlite3CodeDropTable`).
+    if !tbl.name.eq_ignore_ascii_case("sqlite_stat1")
+        && let Some(slot) = ctx.db_set.slot_mut(db_id)
+        && let Some(stat_tbl) = slot.schema.find_user_table("sqlite_stat1").cloned()
+        && !stat_tbl.without_rowid
+        && let Some(ref mut bt) = slot.btree
+    {
+        let enc = bt.encoding();
+        let rows = scan_table_incremental(bt, stat_tbl.root_pgno)?;
+        for (rid, payload) in rows {
+            let cols = decode_record_with_encoding(&payload, enc)?;
+            if cols.first().and_then(Value::as_str) == Some(tbl.name.as_str()) {
+                bt.delete_table(stat_tbl.root_pgno, rid)?;
+            }
+        }
+    }
+
     // Delete all triggers attached to `tbl.name` in `db_id` and `TEMP` (`sqlite3CodeDropTable`)
     let temp_triggers_deleted = cascade_delete_triggers_for_relation(ctx, db_id, &tbl.name)?;
 
@@ -25655,21 +26300,43 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
                 .retain(|i| !i.name.eq_ignore_ascii_case(&idx.name));
         }
     }
+    // `sqlite3CodeDropTable`: "DELETE FROM sqlite_sequence WHERE name=%Q" precedes the
+    // catalogue rows.
+    if let Some(seq_tbl) = slot.schema.find_user_table("sqlite_sequence").cloned()
+        && let Some(ref mut bt) = slot.btree
+    {
+        let enc = bt.encoding();
+        let rows = scan_table_incremental(bt, seq_tbl.root_pgno)?;
+        for (rid, payload) in rows {
+            let cols = decode_record_with_encoding(&payload, enc)?;
+            if cols.first().and_then(Value::as_str) == Some(tbl.name.as_str()) {
+                bt.delete_table(seq_tbl.root_pgno, rid)?;
+            }
+        }
+    }
+
+    // "DELETE FROM sqlite_schema WHERE tbl_name=%Q and type!='trigger'": the table's row and its
+    // index rows leave the catalogue in rowid order, before any tree is destroyed.
+    {
+        let mut rowids: Vec<i64> = roots.iter().map(|r| r.1).filter(|r| *r != 0).collect();
+        rowids.sort_unstable();
+        if let Some(ref mut bt) = slot.btree {
+            for rowid in rowids {
+                delete_schema_entry(bt, rowid)?;
+            }
+        }
+    }
     // Drop roots in strictly descending `root_pgno` order (`sqlite/src/build.c:destroyTable`)!
     roots.sort_by_key(|a| std::cmp::Reverse(a.0));
     let mut relocated_roots: Vec<RootPageMove> = Vec::new();
 
-    for (root_pgno, schema_rowid, kind) in roots {
+    for (root_pgno, _schema_rowid, kind) in roots {
         let mv = {
             let bt = slot
                 .btree
                 .as_mut()
                 .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-            let mv = bt.drop_tree_relocating(root_pgno)?;
-            if schema_rowid != 0 {
-                delete_schema_entry(bt, schema_rowid)?;
-            }
-            mv
+            bt.drop_tree_relocating(root_pgno)?
         };
         match kind {
             DropRootKind::Table => {
@@ -25690,36 +26357,6 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
                 .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
             apply_root_page_move(bt, &mut slot.schema, mv)?;
             relocated_roots.push(mv);
-        }
-    }
-
-    // Also delete entry from `sqlite_sequence` inside `db_id` if present (using its possibly-relocated `root_pgno`!)
-    if let Some(seq_tbl) = slot.schema.find_user_table("sqlite_sequence").cloned()
-        && let Some(ref mut bt) = slot.btree
-    {
-        let enc = bt.encoding();
-        let rows = scan_table_incremental(bt, seq_tbl.root_pgno)?;
-        for (rid, payload) in rows {
-            let cols = decode_record_with_encoding(&payload, enc)?;
-            if cols.first().and_then(Value::as_str) == Some(tbl.name.as_str()) {
-                bt.delete_table(seq_tbl.root_pgno, rid)?;
-            }
-        }
-    }
-
-    // Per `sqlite/src/build.c:3504-3508`: remove rows for `tbl.name` from `sqlite_stat1` in `db_id`.
-    if !tbl.name.eq_ignore_ascii_case("sqlite_stat1")
-        && let Some(stat_tbl) = slot.schema.find_user_table("sqlite_stat1").cloned()
-        && !stat_tbl.without_rowid
-        && let Some(ref mut bt) = slot.btree
-    {
-        let enc = bt.encoding();
-        let rows = scan_table_incremental(bt, stat_tbl.root_pgno)?;
-        for (rid, payload) in rows {
-            let cols = decode_record_with_encoding(&payload, enc)?;
-            if cols.first().and_then(Value::as_str) == Some(tbl.name.as_str()) {
-                bt.delete_table(stat_tbl.root_pgno, rid)?;
-            }
         }
     }
 
@@ -26170,13 +26807,12 @@ fn populate_index_btree(
             (1u64 << 56) | (ord >> 11)
         }
 
-        let mut col_specs = [(0usize, false, false); 15];
+        let mut col_specs = [(0usize, false); 15];
         let mut max_needed_col: Option<usize> = None;
         for (k, ic) in idx_schema.columns.iter().enumerate() {
             let ci = ic.col_idx.unwrap();
             let is_ipk = tbl.rowid_alias_col == Some(ci);
-            let is_real = tbl.columns[ci].affinity == TypeAffinity::Real;
-            col_specs[k] = (ci, is_ipk, is_real);
+            col_specs[k] = (ci, is_ipk);
             if !is_ipk {
                 max_needed_col = Some(max_needed_col.map_or(ci, |m| m.max(ci)));
             }
@@ -26222,7 +26858,7 @@ fn populate_index_btree(
                 let mut body_len = 0usize;
                 let mut col0_prefix: u64 = 0;
 
-                for (k, &(ci, is_ipk, is_real)) in specs.iter().enumerate() {
+                for (k, &(ci, is_ipk)) in specs.iter().enumerate() {
                     let (st, src) = if is_ipk {
                         if k == 0 && use_prefix_key {
                             col0_prefix = f64_prefix_u64(rowid as f64);
@@ -26256,12 +26892,9 @@ fn populate_index_btree(
                             if k == 0 && use_prefix_key {
                                 col0_prefix = f64_prefix_u64(iv as f64);
                             }
-                            if is_real {
-                                let f = if iv == 0 { 0.0 } else { iv as f64 };
-                                (7, IdxFieldSrc::Inline8(f.to_bits().to_be_bytes(), 8))
-                            } else {
-                                encode_i64_inline(iv)
-                            }
+                            // Stored form kept (see the `OP_RealAffinity` note below): an
+                            // integer stored for a REAL column stays an integer in the index.
+                            encode_i64_inline(iv)
                         } else {
                             if k == 0 && use_prefix_key {
                                 let mut packed = 0u64;
@@ -26337,12 +26970,10 @@ fn populate_index_btree(
                         if tbl.rowid_alias_col == Some(ci) {
                             key_vals.push(Value::Integer(rowid));
                         } else {
-                            let mut val = bt.cursor_column(cid, ci)?.unwrap_or(Value::Null);
-                            if tbl.columns[ci].affinity == TypeAffinity::Real
-                                && let Value::Integer(i) = val
-                            {
-                                val = Value::real(i as f64);
-                            }
+                            // `sqlite3GenerateIndexKey` drops the `OP_RealAffinity` after the
+                            // column read: an integer stored for a REAL column goes into the
+                            // index entry as the integer it is.
+                            let val = bt.cursor_column(cid, ci)?.unwrap_or(Value::Null);
                             key_vals.push(val);
                         }
                     }
@@ -26942,7 +27573,7 @@ fn ensure_stat1_table_and_clear(
                 .as_mut()
                 .ok_or_else(|| SqliteError::misuse("btree not open"))?;
             let root_pgno = bt.create_table()?;
-            insert_schema_entry(
+            crate::schema::insert_schema_entry_over_placeholder(
                 bt,
                 "table",
                 "sqlite_stat1",
@@ -26969,23 +27600,30 @@ fn analyze_one_db(
     only_tbl: Option<&str>,
     only_idx: Option<&str>,
 ) -> Result<()> {
+    let had_stat1 = ctx
+        .db_set
+        .slot(db_id)
+        .is_some_and(|s| s.schema.find_user_table("sqlite_stat1").is_some());
     let stat1_tbl = ensure_stat1_table_and_clear(ctx, db_id, only_tbl, only_idx)?;
     if only_tbl != Some("sqlite_master") {
         let tables_to_analyze: Vec<TableSchema> = ctx
             .db_set
             .slot(db_id)
             .map(|s| {
-                s.schema
-                    .tables
-                    .iter()
-                    .filter(|t| {
-                        if let Some(target_t) = only_tbl {
-                            t.name.eq_ignore_ascii_case(target_t)
-                        } else {
-                            !is_reserved_sqlite_name(&t.name)
-                        }
-                    })
-                    .cloned()
+                if let Some(target_t) = only_tbl {
+                    return s
+                        .schema
+                        .tables
+                        .iter()
+                        .filter(|t| t.name.eq_ignore_ascii_case(target_t))
+                        .cloned()
+                        .collect();
+                }
+                // `analyzeDatabase` walks the schema's table hash (`sqliteHashFirst(&tblHash)`)
+                // as it is when the statement is compiled, i.e. before sqlite_stat1 is created.
+                crate::schema::c_table_hash_order(&s.schema, db_id == DatabaseId::TEMP, had_stat1)
+                    .into_iter()
+                    .filter(|t| !is_reserved_sqlite_name(&t.name))
                     .collect()
             })
             .unwrap_or_default();
@@ -27043,42 +27681,50 @@ fn analyze_one_table(
         .slot(db_id)
         .and_then(|s| s.btree.as_ref().map(|bt| bt.encoding()))
         .unwrap_or(TextEncoding::Utf8);
-    let indexes: Vec<IndexSchema> = ctx
+    // `analyzeOneTable` walks `pTab->pIndex` (newest index first; the PRIMARY KEY of a WITHOUT
+    // ROWID table wherever it sits in that list), which fixes the order of the sqlite_stat1 rows.
+    let all_indexes: Vec<IndexSchema> = ctx
         .db_set
         .slot(db_id)
-        .map(|s| {
-            s.schema
-                .indexes_for_table(&tbl.name)
-                .into_iter()
-                .filter(|idx| {
-                    only_idx.is_none_or(|target_i| idx.name.eq_ignore_ascii_case(target_i))
-                })
-                .collect()
-        })
+        .map(|s| s.schema.indexes_for_table(&tbl.name))
         .unwrap_or_default();
+    let indexes = ordered_table_indexes(tbl, &all_indexes);
 
     let analysis_limit = ctx.db_set.analysis_limit();
     let mut has_non_partial_index = tbl.without_rowid;
-    if tbl.without_rowid && only_idx.is_none_or(|target_i| tbl.name.eq_ignore_ascii_case(target_i))
-    {
-        let pk_orders = tbl.without_rowid_pk_orders();
-        let raw_entries = ctx.scan_index_in_db(db_id, tbl.root_pgno, pk_orders.clone())?;
-        let mut entries = Vec::with_capacity(raw_entries.len());
-        for raw in &raw_entries {
-            entries.push(decode_record_with_encoding(raw, enc)?);
-        }
-        let n_key_col = tbl.without_rowid_pk_cols.len().max(1);
-        if let Some(stat_str) =
-            compute_index_stat1_string(&entries, n_key_col, &pk_orders, enc, false, analysis_limit)
-        {
-            results.push((tbl.name.clone(), Some(tbl.name.clone()), stat_str));
-        }
-    }
-
     for idx in &indexes {
+        if tbl.without_rowid && idx.root_pgno == tbl.root_pgno {
+            // The PRIMARY KEY index is the table itself; its row is named after the table.
+            if !only_idx.is_none_or(|target_i| tbl.name.eq_ignore_ascii_case(target_i)) {
+                continue;
+            }
+            sqliters_types::dtrace!("TR|stat|idx|tbl={} idx={}", tbl.name, tbl.name);
+            let pk_orders = tbl.without_rowid_pk_orders();
+            let raw_entries = ctx.scan_index_in_db(db_id, tbl.root_pgno, pk_orders.clone())?;
+            let mut entries = Vec::with_capacity(raw_entries.len());
+            for raw in &raw_entries {
+                entries.push(decode_record_with_encoding(raw, enc)?);
+            }
+            let n_key_col = tbl.without_rowid_pk_cols.len().max(1);
+            if let Some(stat_str) = compute_index_stat1_string(
+                &entries,
+                n_key_col,
+                &pk_orders,
+                enc,
+                false,
+                analysis_limit,
+            ) {
+                results.push((tbl.name.clone(), Some(tbl.name.clone()), stat_str));
+            }
+            continue;
+        }
+        if !only_idx.is_none_or(|target_i| idx.name.eq_ignore_ascii_case(target_i)) {
+            continue;
+        }
         if idx.where_clause.is_none() {
             has_non_partial_index = true;
         }
+        sqliters_types::dtrace!("TR|stat|idx|tbl={} idx={}", tbl.name, idx.name);
         let orders = idx.key_sort_orders();
         let raw_entries = ctx.scan_index_in_db(db_id, idx.root_pgno, orders.clone())?;
         let mut entries = Vec::with_capacity(raw_entries.len());
@@ -27099,6 +27745,7 @@ fn analyze_one_table(
     }
 
     if only_idx.is_none() && !has_non_partial_index {
+        sqliters_types::dtrace!("TR|stat|tblcnt|tbl={}", tbl.name);
         let row_count = ctx.scan_table_in_db(db_id, tbl.root_pgno)?.len();
         if row_count > 0 {
             results.push((tbl.name.clone(), None, row_count.to_string()));
@@ -28235,7 +28882,15 @@ fn rewrite_physical_rows_for_drop_column(
                         Some(de) => eval_expr(ctx, de, &[], &[], &CteStore::default(), None)?,
                         None => Value::Null,
                     };
-                    let mut coerced = col.affinity.apply(def_val);
+                    // `sqlite3AlterDropColumn` reads REAL columns with NUMERIC affinity (so that no
+                    // `OP_RealAffinity` is coded): a default that is an integral number is
+                    // written as an integer.
+                    let read_aff = if col.affinity == TypeAffinity::Real && !old_tbl.strict {
+                        TypeAffinity::Numeric
+                    } else {
+                        col.affinity
+                    };
+                    let mut coerced = read_aff.apply(def_val);
                     if old_tbl.strict
                         && col.type_name.trim().eq_ignore_ascii_case("REAL")
                         && let Value::Integer(iv) = coerced
@@ -28247,7 +28902,13 @@ fn rewrite_physical_rows_for_drop_column(
                 old_logical[ci] = v;
             }
             old_logical.remove(dropped_col_idx);
-            new_records.push(encode_table_physical_record(new_tbl, &old_logical, enc));
+            // `sqlite3AlterDropColumn` copies every value in the form it is stored in.
+            new_records.push(encode_table_physical_record(
+                new_tbl,
+                &old_logical,
+                enc,
+                false,
+            ));
         }
         let pk_orders = new_tbl.without_rowid_pk_orders();
         let bt = ctx
@@ -28283,7 +28944,15 @@ fn rewrite_physical_rows_for_drop_column(
                     Some(de) => eval_expr(ctx, de, &[], &[], &CteStore::default(), None)?,
                     None => Value::Null,
                 };
-                let mut coerced = col.affinity.apply(def_val);
+                // `sqlite3AlterDropColumn` reads REAL columns with NUMERIC affinity (so that no
+                // `OP_RealAffinity` is coded): a default that is an integral number is
+                // written as an integer.
+                let read_aff = if col.affinity == TypeAffinity::Real && !old_tbl.strict {
+                    TypeAffinity::Numeric
+                } else {
+                    col.affinity
+                };
+                let mut coerced = read_aff.apply(def_val);
                 if old_tbl.strict
                     && col.type_name.trim().eq_ignore_ascii_case("REAL")
                     && let Value::Integer(iv) = coerced
@@ -28294,7 +28963,7 @@ fn rewrite_physical_rows_for_drop_column(
             }
         }
         old_logical.remove(dropped_col_idx);
-        let new_rec = encode_table_physical_record(new_tbl, &old_logical, enc);
+        let new_rec = encode_table_physical_record(new_tbl, &old_logical, enc, false);
         rewritten.push((rid, new_rec));
     }
 
@@ -33761,8 +34430,16 @@ fn build_vacuum_image(
         // never had a table keeps 0 there.
         fhdr.text_encoding = orig_hdr.text_encoding;
         fhdr.text_encoding_unset = orig_hdr.text_encoding_unset;
+        // `sqlite3RunVacuum` copies the BTREE_SCHEMA_VERSION meta value plus one, whatever the
+        // rebuild wrote into the new catalogue.
         fhdr.schema_cookie = orig_hdr.schema_cookie.wrapping_add(1);
+        sqliters_types::dtrace!(
+            "TR|cookie|vacuum|old={} new={}",
+            orig_hdr.schema_cookie,
+            orig_hdr.schema_cookie.wrapping_add(1)
+        );
     }
+    target_btree.replace_cookie_stmt(sqliters_btree::CookieStmt::Base(orig_hdr.schema_cookie));
 
     let (_, schema_name) = slot_encoding_and_name(ctx, src_db_id);
     let (tables_snapshot, indexes_snapshot, views_snapshot, triggers_snapshot, vtabs_snapshot) = {
@@ -33778,49 +34455,82 @@ fn build_vacuum_image(
             slot.schema.virtual_tables.clone(),
         )
     };
-    let has_any_autoincrement = tables_snapshot
+    // Phase A (`vacuum.c`: "SELECT sql FROM sqlite_schema WHERE type='table' AND
+    // name<>'sqlite_sequence' AND coalesce(rootpage,1)>0", executed as CREATE TABLE statements in
+    // rowid order): each table gets its root and its catalogue row, immediately followed by the
+    // roots and rows of its automatic indexes (they are created while the CREATE TABLE is
+    // parsed), and `sqlite_sequence` is created by the first AUTOINCREMENT table
+    // (`sqlite3EndTable`), right after that table's rows.
+    let mut tables_in_rowid_order = tables_snapshot;
+    tables_in_rowid_order.sort_by_key(|t| t.schema_rowid);
+    let mut indexes_in_rowid_order = indexes_snapshot;
+    indexes_in_rowid_order.sort_by_key(|i| i.schema_rowid);
+    let seq_table = tables_in_rowid_order
         .iter()
-        .any(|t| !t.name.eq_ignore_ascii_case("sqlite_sequence") && t.autoincrement);
-
-    // Phase A: Allocate roots & insert `sqlite_schema` entries for all tables FIRST (`vacuum.c:298-307`)!
-    let mut mapped_tables: Vec<(TableSchema, Pgno)> = Vec::with_capacity(tables_snapshot.len());
-    for tbl in tables_snapshot {
+        .find(|t| t.name.eq_ignore_ascii_case("sqlite_sequence"))
+        .cloned();
+    let mut seq_created = false;
+    let mut mapped_tables: Vec<(TableSchema, Pgno)> =
+        Vec::with_capacity(tables_in_rowid_order.len());
+    let mut mapped_indexes: Vec<(IndexSchema, Pgno)> =
+        Vec::with_capacity(indexes_in_rowid_order.len());
+    for tbl in tables_in_rowid_order {
         if tbl.name.eq_ignore_ascii_case("sqlite_sequence") {
-            if !has_any_autoincrement {
-                // Omit orphaned `sqlite_sequence` when no `AUTOINCREMENT` table remains (`vacuum2-1.1, 3.1`)!
-                continue;
-            }
+            continue;
+        }
+        let new_tbl_root = if tbl.without_rowid {
+            target_btree.create_index()?
+        } else {
+            target_btree.create_table()?
+        };
+        insert_schema_entry(
+            target_btree,
+            "table",
+            &tbl.name,
+            &tbl.name,
+            new_tbl_root,
+            Some(&tbl.raw_sql),
+        )?;
+        for idx in indexes_in_rowid_order
+            .iter()
+            .filter(|i| i.raw_sql.is_none() && i.table_name.eq_ignore_ascii_case(&tbl.name))
+        {
+            let new_idx_root = target_btree.create_index()?;
+            insert_schema_entry(
+                target_btree,
+                "index",
+                &idx.name,
+                &idx.table_name,
+                new_idx_root,
+                None,
+            )?;
+            mapped_indexes.push((idx.clone(), new_idx_root));
+        }
+        let wants_sequence = tbl.autoincrement && !seq_created;
+        mapped_tables.push((tbl, new_tbl_root));
+        if wants_sequence && let Some(seq) = seq_table.clone() {
+            // An orphaned `sqlite_sequence` (no AUTOINCREMENT table left) is not recreated
+            // (`vacuum2-1.1, 3.1`).
             let seq_root = target_btree.create_table()?;
             insert_schema_entry(
                 target_btree,
                 "table",
-                &tbl.name,
-                &tbl.name,
+                &seq.name,
+                &seq.name,
                 seq_root,
-                Some(&tbl.raw_sql),
+                Some(&seq.raw_sql),
             )?;
-            mapped_tables.push((tbl, seq_root));
-        } else {
-            let new_tbl_root = if tbl.without_rowid {
-                target_btree.create_index()?
-            } else {
-                target_btree.create_table()?
-            };
-            insert_schema_entry(
-                target_btree,
-                "table",
-                &tbl.name,
-                &tbl.name,
-                new_tbl_root,
-                Some(&tbl.raw_sql),
-            )?;
-            mapped_tables.push((tbl, new_tbl_root));
+            mapped_tables.push((seq, seq_root));
+            seq_created = true;
         }
     }
 
-    // Phase B: Allocate roots & insert `sqlite_schema` entries for all indexes (`vacuum.c:309-315`)!
-    let mut mapped_indexes: Vec<(IndexSchema, Pgno)> = Vec::with_capacity(indexes_snapshot.len());
-    for idx in indexes_snapshot {
+    // Phase B (`vacuum.c`: "SELECT sql FROM sqlite_schema WHERE sql LIKE 'CREATE%INDEX%'"):
+    // explicit indexes in rowid order.
+    for idx in indexes_in_rowid_order {
+        if idx.raw_sql.is_none() {
+            continue;
+        }
         let new_idx_root = target_btree.create_index()?;
         insert_schema_entry(
             target_btree,
@@ -33987,6 +34697,7 @@ fn build_vacuum_image(
         }
     }
 
+    sqliters_types::dtrace!("TR|cookie|vacuum-end|");
     Ok(())
 }
 
@@ -36729,7 +37440,13 @@ fn exec_pragma(
                 let slot = ctx.db_set.slot_mut(db_id).unwrap();
                 let sname = slot.name.clone();
                 if let Some(ref mut bt) = slot.btree {
-                    bt.pager_mut().header_mut()?.schema_cookie = v;
+                    let hdr = bt.pager_mut().header_mut()?;
+                    sqliters_types::dtrace!(
+                        "TR|cookie|set|kind=NamedDisk old={} new={}",
+                        hdr.schema_cookie,
+                        v
+                    );
+                    hdr.schema_cookie = v;
                     slot.schema = Schema::load_for_schema(bt, Some(&sname))?;
                     slot.schema.rebind_collations(ctx.collations);
                 }

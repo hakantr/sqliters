@@ -445,6 +445,15 @@ pub struct TableSchema {
 }
 
 impl TableSchema {
+    /// Whether any column has REAL affinity (C stores integral values of such columns as
+    /// integers in some statements and converts them back when the column is read).
+    #[inline]
+    pub fn has_real_col(&self) -> bool {
+        self.columns
+            .iter()
+            .any(|c| c.affinity == TypeAffinity::Real)
+    }
+
     /// Built-in descriptor for `sqlite_schema` / `sqlite_master` stored on root page 1.
     pub fn sqlite_schema_table() -> Self {
         let mk_col = |name: &str, ty: &str, aff: TypeAffinity| ColumnSchema {
@@ -2430,6 +2439,181 @@ pub fn insert_schema_entry(
     Ok(rowid)
 }
 
+/// `strHash` of `hash.c`: case-insensitive Knuth multiplicative hash of a schema object name.
+fn c_str_hash(key: &str) -> u32 {
+    let mut h: u32 = 0;
+    for &b in key.as_bytes() {
+        h = h.wrapping_add(u32::from(b & 0xdf));
+        h = h.wrapping_mul(0x9e37_79b1);
+    }
+    h
+}
+
+/// Order in which C iterates a `Hash` (`hash.c`: `sqliteHashFirst` / `sqliteHashNext`) after
+/// `keys` were inserted in the given order with `sqlite3HashInsert`. Returns indices into `keys`.
+///
+/// Without a bucket array (fewer than 5 keys) every insert goes to the front of the element
+/// list; with one, a key is linked in front of the current head of its bucket, and every
+/// `rehash` (when the count reaches 5 and exceeds twice the bucket count; new size `count * 3`,
+/// at most `SQLITE_MALLOC_SOFT_LIMIT / sizeof(struct _ht)` = 64) relinks the whole list.
+pub(crate) fn c_hash_iteration_order(keys: &[&str]) -> Vec<usize> {
+    const NONE: usize = usize::MAX;
+    const MAX_BUCKETS: usize = 1024 / 16;
+    struct Elem {
+        h: u32,
+        prev: usize,
+        next: usize,
+    }
+    struct Bucket {
+        count: u32,
+        chain: usize,
+    }
+    fn insert_element(
+        elems: &mut [Elem],
+        first: &mut usize,
+        bucket: Option<&mut Bucket>,
+        new: usize,
+    ) {
+        let head = match bucket {
+            Some(b) => {
+                let head = if b.count != 0 { b.chain } else { NONE };
+                b.count += 1;
+                b.chain = new;
+                head
+            }
+            None => NONE,
+        };
+        if head != NONE {
+            let head_prev = elems[head].prev;
+            elems[new].next = head;
+            elems[new].prev = head_prev;
+            if head_prev != NONE {
+                elems[head_prev].next = new;
+            } else {
+                *first = new;
+            }
+            elems[head].prev = new;
+        } else {
+            elems[new].next = *first;
+            if *first != NONE {
+                elems[*first].prev = new;
+            }
+            elems[new].prev = NONE;
+            *first = new;
+        }
+    }
+
+    let mut elems: Vec<Elem> = Vec::with_capacity(keys.len());
+    let mut first = NONE;
+    let mut ht: Vec<Bucket> = Vec::new();
+    for (i, key) in keys.iter().enumerate() {
+        elems.push(Elem {
+            h: c_str_hash(key),
+            prev: NONE,
+            next: NONE,
+        });
+        let count = i + 1;
+        if count >= 5 && count > 2 * ht.len() {
+            let new_size = (count * 3).min(MAX_BUCKETS);
+            if new_size != ht.len() {
+                ht = (0..new_size)
+                    .map(|_| Bucket {
+                        count: 0,
+                        chain: NONE,
+                    })
+                    .collect();
+                let mut elem = first;
+                first = NONE;
+                while elem != NONE {
+                    let next = elems[elem].next;
+                    let slot = elems[elem].h as usize % new_size;
+                    insert_element(&mut elems, &mut first, Some(&mut ht[slot]), elem);
+                    elem = next;
+                }
+            }
+        }
+        let bucket = if ht.is_empty() {
+            None
+        } else {
+            let slot = elems[i].h as usize % ht.len();
+            Some(&mut ht[slot])
+        };
+        insert_element(&mut elems, &mut first, bucket, i);
+    }
+    let mut out = Vec::with_capacity(keys.len());
+    let mut elem = first;
+    while elem != NONE {
+        out.push(elem);
+        elem = elems[elem].next;
+    }
+    out
+}
+
+/// The rowid tables of `schema` in the order C's `analyzeDatabase` visits them: the iteration
+/// order of the schema's table hash, which `sqlite3InitOne` fills with the schema table itself
+/// and then every table, view and virtual table in `sqlite_schema` rowid order.
+/// `include_stat1 == false` leaves out an `sqlite_stat1` that the running `ANALYZE` created.
+///
+/// The hash of a C connection also remembers its history (tables created and dropped since the
+/// schema was last loaded); this reproduces a freshly loaded schema, which is what a connection
+/// has unless it dropped tables since.
+pub(crate) fn c_table_hash_order(
+    schema: &Schema,
+    is_temp: bool,
+    include_stat1: bool,
+) -> Vec<TableSchema> {
+    let mut objs: Vec<(i64, &str, Option<&TableSchema>)> = Vec::new();
+    for t in &schema.tables {
+        if !include_stat1 && t.name.eq_ignore_ascii_case("sqlite_stat1") {
+            continue;
+        }
+        objs.push((t.schema_rowid, t.name.as_str(), Some(t)));
+    }
+    for v in &schema.views {
+        objs.push((v.schema_rowid, v.name.as_str(), None));
+    }
+    for v in &schema.virtual_tables {
+        objs.push((v.schema_rowid, v.name.as_str(), None));
+    }
+    objs.sort_by_key(|o| o.0);
+    let mut keys: Vec<&str> = Vec::with_capacity(objs.len() + 1);
+    keys.push(if is_temp {
+        "sqlite_temp_master"
+    } else {
+        "sqlite_master"
+    });
+    keys.extend(objs.iter().map(|o| o.1));
+    c_hash_iteration_order(&keys)
+        .into_iter()
+        .filter_map(|i| i.checked_sub(1).and_then(|j| objs[j].2).cloned())
+        .collect()
+}
+
+/// The placeholder row `sqlite3StartTable` writes for a table being created (`OP_Blob 6
+/// nullRow`: a record of five NULLs); [`update_schema_entry`] replaces it with the real row.
+/// Does not touch the schema cookie.
+pub fn insert_schema_placeholder(btree: &mut Btree) -> Result<i64> {
+    let rowid = btree.next_rowid(1)?;
+    btree.insert_table(1, rowid, &[6, 0, 0, 0, 0, 0])?;
+    Ok(rowid)
+}
+
+/// [`insert_schema_entry`] the way C writes the row of a view or virtual table: the placeholder
+/// of `sqlite3StartTable` first, then the real row over it (`sqlite3EndTable` /
+/// `sqlite3VtabFinishParse`).
+pub fn insert_schema_entry_over_placeholder(
+    btree: &mut Btree,
+    obj_type: &str,
+    name: &str,
+    tbl_name: &str,
+    rootpage: Pgno,
+    sql: Option<&str>,
+) -> Result<i64> {
+    let rowid = insert_schema_placeholder(btree)?;
+    update_schema_entry(btree, rowid, obj_type, name, tbl_name, rootpage, sql)?;
+    Ok(rowid)
+}
+
 pub fn update_schema_entry(
     btree: &mut Btree,
     schema_rowid: i64,
@@ -2454,14 +2638,21 @@ pub fn update_schema_entry(
     bump_schema_cookie(btree)
 }
 
+/// Deletes a catalogue row without changing the schema cookie (the caller changes it where C
+/// codes its `OP_SetCookie`).
+pub fn delete_schema_row(btree: &mut Btree, schema_rowid: i64) -> Result<()> {
+    btree.delete_table(1, schema_rowid)?;
+    Ok(())
+}
+
 pub fn delete_schema_entry(btree: &mut Btree, schema_rowid: i64) -> Result<()> {
     btree.delete_table(1, schema_rowid)?;
     bump_schema_cookie(btree)
 }
 
 pub fn bump_schema_cookie(btree: &mut Btree) -> Result<()> {
+    btree.change_schema_cookie()?;
     let hdr = btree.pager_mut().header_mut()?;
-    hdr.schema_cookie = hdr.schema_cookie.wrapping_add(1);
     // The first schema row of a database is a table, view or virtual table: this is where C
     // records the schema format and the text encoding in the header (`sqlite3StartTable`).
     hdr.set_file_format_for_first_table();

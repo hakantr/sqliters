@@ -70,6 +70,25 @@ pub fn serial_type_for_with_encoding(value: &Value, enc: TextEncoding) -> (u64, 
     }
 }
 
+/// The integer C stores in place of real `r` for a column with REAL affinity when the record is
+/// built by `OP_MakeRecord` with an affinity string: `applyAffinity` turns a real that is an
+/// exact integer into an integer (`sqlite3VdbeIntegerAffinity`: `r == (double)(i64)r`, not at
+/// either end of the 64-bit range), the opcode marks it `MEM_IntReal`, and an `MEM_IntReal`
+/// that would need 8 bytes is written as a float after all. `None` = stored as a float.
+/// `-0.0` is stored as integer 0, exactly as in C.
+#[inline]
+#[must_use]
+pub fn real_affinity_storage_int(r: f64) -> Option<i64> {
+    // `doubleToInt64`: saturating conversion; a NaN never compares equal below.
+    let ix = r as i64;
+    #[allow(clippy::float_cmp)]
+    if (ix as f64) != r || ix == i64::MIN || ix == i64::MAX {
+        return None;
+    }
+    let u = if ix < 0 { (!ix) as u64 } else { ix as u64 };
+    (u <= MAX_6BYTE_INT).then_some(ix)
+}
+
 /// Returns the payload byte length corresponding to `serial_type` (`sqlite3VdbeSerialTypeLen`).
 #[inline(always)]
 pub fn serial_type_len(serial_type: u64) -> Result<usize> {

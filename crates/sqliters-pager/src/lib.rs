@@ -279,6 +279,16 @@ impl PageCache {
             .is_some_and(|slot| self.entries[slot as usize].dirty)
     }
 
+    /// Drops the dirty mark of `pgno` (the page stays cached with its current content).
+    /// Returns whether the page was dirty.
+    #[inline]
+    fn clear_dirty(&mut self, pgno: Pgno) -> bool {
+        match self.slot_of(pgno) {
+            Some(slot) => std::mem::replace(&mut self.entries[slot as usize].dirty, false),
+            None => false,
+        }
+    }
+
     #[inline(always)]
     fn get_data(&self, pgno: Pgno) -> Option<&[u8]> {
         let slot = self.slot_of(pgno)?;
@@ -610,6 +620,11 @@ pub struct Pager {
     journal_started_in_tx: bool,
     cache_modified: bool,
     change_counter_bumped: bool,
+    /// `Pager.dbFileVers` (`pager.c`), change-counter part: the counter of the page 1 image this
+    /// pager last loaded from storage (database file or WAL) or last wrote to the database file
+    /// itself. A commit stamps `db_file_vers_cc + 1` (`pager_write_changecounter`); a WAL commit
+    /// does not advance it, so the stamp stays constant while page 1 stays cached.
+    db_file_vers_cc: u32,
     /// True once `commit` has started writing/truncating the main database file (`PAGER_WRITER_DBMOD`).
     db_file_modified: bool,
     /// True once `write_super_journal` has recorded a super-journal pointer in this tx (`pPager->setSuper`).
@@ -842,6 +857,7 @@ impl Pager {
             journal_started_in_tx: false,
             cache_modified: false,
             change_counter_bumped: false,
+            db_file_vers_cc: 0,
             db_file_modified: false,
             set_super: false,
             commit_phase_one_done: false,
@@ -2320,6 +2336,8 @@ impl Pager {
                     }
 
                     self.configured_auto_vacuum = AutoVacuumMode::from_header(&disk_hdr);
+                    // `sqlite3PagerSharedLock` reads bytes 24..39 of the file into `dbFileVers`.
+                    self.db_file_vers_cc = disk_hdr.change_counter;
                     self.adopt_loaded_header(disk_hdr);
                     self.page_count = effective_pages;
                     self.page_size_fixed = true;
@@ -2448,6 +2466,11 @@ impl Pager {
         }
 
         self.configured_auto_vacuum = AutoVacuumMode::from_header(&snap_hdr);
+        if invalidate_cache {
+            // `readDbPage(1)`: page 1 is (re-)read from the WAL snapshot or the database file
+            // only when it is not cached; a cached page 1 keeps the older `dbFileVers`.
+            self.db_file_vers_cc = snap_hdr.change_counter;
+        }
         self.adopt_loaded_header(snap_hdr);
         self.page_count = effective_pages;
         self.page_size_fixed = true;
@@ -2764,8 +2787,11 @@ impl Pager {
         self.header.write_version = ver;
         self.header.read_version = ver;
         self.header.database_size_pages = 1;
-        self.header.change_counter = 1;
-        self.header.version_valid_for = 1;
+        // `newDatabase` (`btree.c`): bytes 24..99 of a new page 1 are zero; the first commit
+        // stamps change counter 1 (`pager_write_changecounter`: `dbFileVers` (0) + 1).
+        self.header.change_counter = 0;
+        self.header.version_valid_for = 0;
+        self.db_file_vers_cc = 0;
         // `newDatabase` (`btree.c`): schema format and text encoding stay 0 in the file until
         // the first table is created.
         if self.header.text_encoding == 0 {
@@ -2979,6 +3005,24 @@ impl Pager {
         Ok(self.cache.entry_data_mut(slot))
     }
 
+    /// `sqlite3PagerDontWrite` (`pager.c`): the b-tree layer says the content of `pgno` no
+    /// longer matters (it has just become a free-list leaf). A page this transaction dirtied
+    /// is then not written to the database file at commit, exactly as in C: only for a
+    /// rollback-journal database file (not a temporary or in-memory one; in WAL mode C sets the
+    /// flag but still writes the frame) and only while no savepoint is open (`nSavepoint==0`).
+    /// The page keeps its cached content and its journalled pre-image, so rollback is
+    /// unaffected. Returns whether a pending write was dropped.
+    pub fn dont_write(&mut self, pgno: Pgno) -> bool {
+        if self.state != TransactionState::Write
+            || self.use_wal()
+            || self.db_kind != DatabaseKind::NamedDisk
+            || !self.subsavepoints.is_empty()
+        {
+            return false;
+        }
+        self.cache.clear_dirty(pgno)
+    }
+
     /// Appends a brand-new zeroed page at the end of the database file, skipping the runtime
     /// `lock_byte_page` (`PENDING_BYTE_PAGE`), and returning its `Pgno`.
     pub fn allocate_raw_page(&mut self) -> Result<Pgno> {
@@ -3131,10 +3175,7 @@ impl Pager {
             patched_hdr.read_version = ver;
             patched_hdr.database_size_pages = n_src_pages;
 
-            let mut next_cc = self.tx_orig_header.change_counter.wrapping_add(1);
-            if next_cc == 0 {
-                next_cc = 1;
-            }
+            let next_cc = self.db_file_vers_cc.wrapping_add(1);
             patched_hdr.change_counter = next_cc;
             patched_hdr.version_valid_for = next_cc;
             patched_hdr.sqlite_version_number = SQLITE_VERSION_NUMBER;
@@ -3417,10 +3458,7 @@ impl Pager {
         patched_hdr.read_version = ver;
         patched_hdr.database_size_pages = n_src_pages;
 
-        let mut next_cc = self.tx_orig_header.change_counter.wrapping_add(1);
-        if next_cc == 0 {
-            next_cc = 1;
-        }
+        let next_cc = self.db_file_vers_cc.wrapping_add(1);
         patched_hdr.change_counter = next_cc;
         patched_hdr.version_valid_for = next_cc;
         patched_hdr.sqlite_version_number = SQLITE_VERSION_NUMBER;
@@ -3736,10 +3774,9 @@ impl Pager {
                     self.header.read_version = 2;
                     self.header.database_size_pages = self.page_count;
                     if !self.change_counter_bumped {
-                        self.header.change_counter = self.header.change_counter.wrapping_add(1);
-                        if self.header.change_counter == 0 {
-                            self.header.change_counter = 1;
-                        }
+                        // `pagerWalFrames` → `pager_write_changecounter`: `dbFileVers + 1`.
+                        // `dbFileVers` is not advanced by a WAL commit.
+                        self.header.change_counter = self.db_file_vers_cc.wrapping_add(1);
                         self.header.version_valid_for = self.header.change_counter;
                         self.header.sqlite_version_number = SQLITE_VERSION_NUMBER;
                         self.change_counter_bumped = true;
@@ -3818,10 +3855,10 @@ impl Pager {
                 let p1_slot = self.mark_page_writable(1)?;
                 self.header.database_size_pages = self.page_count;
                 if !self.change_counter_bumped {
-                    self.header.change_counter = self.header.change_counter.wrapping_add(1);
-                    if self.header.change_counter == 0 {
-                        self.header.change_counter = 1;
-                    }
+                    // `pager_incr_changecounter` → `pager_write_changecounter`:
+                    // `dbFileVers + 1`; `pager_write_pagelist` then copies page 1's bytes
+                    // 24..39 back into `dbFileVers`.
+                    self.header.change_counter = self.db_file_vers_cc.wrapping_add(1);
                     self.header.version_valid_for = self.header.change_counter;
                     self.header.sqlite_version_number = SQLITE_VERSION_NUMBER;
                     self.change_counter_bumped = true;
@@ -4004,6 +4041,10 @@ impl Pager {
                 self.commit_phase_one_done = false;
                 self.db_file_modified = false;
                 self.cache_modified = false;
+                if self.change_counter_bumped {
+                    // `pager_write_pagelist`: page 1 reached the database file.
+                    self.db_file_vers_cc = self.header.change_counter;
+                }
                 self.change_counter_bumped = false;
                 self.journal_started_in_tx = false;
                 self.tx_preimages.clear();
@@ -4072,6 +4113,9 @@ impl Pager {
                     }
 
                     self.cache.truncate_above(orig_count);
+                    // `pagerRollbackWal` → `pagerUndoCallback` → `readDbPage(1)`: a page 1 that
+                    // was dirty is re-read, which refreshes `dbFileVers`.
+                    let page1_restored = self.tx_preimages.contains_key(&1);
                     for (pgno, orig_data) in self.tx_preimages.drain() {
                         if pgno <= orig_count {
                             self.cache.insert(pgno, orig_data, false);
@@ -4081,6 +4125,9 @@ impl Pager {
 
                     self.page_count = orig_count;
                     self.header = self.tx_orig_header.clone();
+                    if page1_restored {
+                        self.db_file_vers_cc = self.header.change_counter;
+                    }
                     self.page_size_fixed = orig_count > 0;
                     self.configured_auto_vacuum = if orig_count > 0 {
                         AutoVacuumMode::from_header(&self.header)
@@ -4460,6 +4507,11 @@ impl Pager {
         }
         self.page_count = sp.orig_page_count;
         self.header = sp.orig_header.clone();
+        if sp.saved_pages.contains_key(&1) {
+            // `pager_playback_one_page`: "If this was page 1, then restore the value of
+            // Pager.dbFileVers".
+            self.db_file_vers_cc = self.header.change_counter;
+        }
         if self.page_count == 0 {
             self.page_size_fixed = self.tx_orig_page_count > 0;
             self.configured_auto_vacuum = self.tx_orig_auto_vacuum;
@@ -4574,7 +4626,27 @@ impl Pager {
     // Rollback Journal Binary Format (`writeJournalHdr`, `syncJournal`, `pager_playback`)
     // ========================================================================
 
+    /// `setSectorSize` (`pager.c`): 512 for a temporary file or when the device promises
+    /// power-safe overwrite (`SQLITE_IOCAP_POWERSAFE_OVERWRITE`, the default of the OS layer);
+    /// otherwise the VFS sector size. It is the size of the rollback-journal header segment.
     fn effective_sector_size(&self) -> u32 {
+        let psow = self.file.as_deref().is_some_and(|f| {
+            f.device_characteristics() & sqliters_vfs::IOCAP_POWERSAFE_OVERWRITE != 0
+        });
+        sqliters_types::dtrace!(
+            "TR|journal|sector|o={}",
+            if self.db_kind != DatabaseKind::NamedDisk {
+                "temp-512"
+            } else if psow {
+                "psow-512"
+            } else {
+                "vfs-sector-size"
+            }
+        );
+        // (`tempFile` covers C's temporary and in-memory pagers alike.)
+        if self.db_kind != DatabaseKind::NamedDisk || psow {
+            return 512;
+        }
         let raw = self
             .file
             .as_deref()

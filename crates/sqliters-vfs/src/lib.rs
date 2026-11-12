@@ -2847,13 +2847,27 @@ impl VfsFile for OsFile {
             // Open `-shm` OUTSIDE the `UnixInodeInfo` mutex (`os_unix.c:5032-5044`).
             let mut shm_readonly = options.readonly_shm;
             let shm_file = if !shm_readonly {
-                match OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(&shm_path)
+                // `unixOpenSharedMemory`: `robust_open(zShm, O_RDWR|O_CREAT|O_NOFOLLOW,
+                // sStat.st_mode & 0777)` + `robustFchown` — the `-shm` file takes the mode and
+                // owner of the database file.
+                let mut shm_opts = OpenOptions::new();
+                shm_opts.read(true).write(true).create(true).truncate(false);
+                let shm_mode = db_meta.mode() & 0o777;
                 {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    shm_opts.mode(shm_mode);
+                    if sys::unix::O_NOFOLLOW != 0 {
+                        shm_opts.custom_flags(sys::unix::O_NOFOLLOW);
+                    }
+                }
+                sqliters_types::dtrace!("TR|open|mode|o=shm-db-mode m={:o}", shm_mode);
+                match shm_opts.open(&shm_path).inspect(|f| {
+                    sys::unix::apply_created_file_mode(
+                        f,
+                        shm_mode,
+                        Some((db_meta.uid(), db_meta.gid())),
+                    );
+                }) {
                     Ok(f) => f,
                     Err(e)
                         if e.kind() == ErrorKind::PermissionDenied
@@ -3304,6 +3318,28 @@ impl Vfs for OsVfs {
         let delete_on_close = flags.contains(OpenFlags::DELETEONCLOSE) || path.is_none();
         let mut readonly = flags.is_readonly();
 
+        // `findCreateFileMode` + `robust_open` (`os_unix.c`): a new file is created 0644 (minus
+        // the umask); a rollback journal or WAL file gets the mode and owner of its database
+        // file, a delete-on-close file 0600. Every open carries `O_NOFOLLOW`.
+        #[cfg(unix)]
+        let created_mode: Option<(u32, Option<(u32, u32)>)> = sys::unix::find_create_file_mode(
+            &target_path,
+            flags.contains(OpenFlags::MAIN_JOURNAL) || flags.contains(OpenFlags::WAL),
+            delete_on_close,
+        );
+        #[cfg(unix)]
+        if !delete_on_close {
+            sqliters_types::dtrace!(
+                "TR|open|mode|o={} m={:o}",
+                if created_mode.is_some() {
+                    "db-mode"
+                } else {
+                    "default-0644"
+                },
+                created_mode.map_or(sys::unix::DEFAULT_FILE_PERMISSIONS, |(m, _)| m)
+            );
+        }
+
         let file = if !readonly {
             let mut opts = OpenOptions::new();
             opts.read(true).write(true);
@@ -3314,8 +3350,22 @@ impl Vfs for OsVfs {
                     opts.create(true);
                 }
             }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(created_mode.map_or(sys::unix::DEFAULT_FILE_PERMISSIONS, |(m, _)| m));
+                if sys::unix::O_NOFOLLOW != 0 {
+                    opts.custom_flags(sys::unix::O_NOFOLLOW);
+                }
+            }
             match opts.open(&target_path) {
-                Ok(f) => f,
+                Ok(f) => {
+                    #[cfg(unix)]
+                    if let Some((mode, owner)) = created_mode {
+                        sys::unix::apply_created_file_mode(&f, mode, owner);
+                    }
+                    f
+                }
                 Err(err)
                     if (err.kind() == ErrorKind::PermissionDenied
                         || err.kind() == ErrorKind::ReadOnlyFilesystem)

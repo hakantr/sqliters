@@ -270,6 +270,13 @@ pub enum Opcode {
     SorterColumn,
     SorterNext,
     Noop,
+    /// `OP_MakeRecord` with an affinity string (`P4::Affinity`, one entry per register): like
+    /// `MakeRecord`, but an integral real in a register whose affinity is REAL is written as an
+    /// integer (C's `MEM_IntReal`). The registers themselves keep their values.
+    MakeRecordAff,
+    /// `OP_RealAffinity`: if register `p1` holds an integer, make it a real. Emitted after
+    /// reading a column with REAL affinity, whose integral values are stored as integers.
+    RealAffinity,
 }
 
 impl Opcode {
@@ -338,6 +345,8 @@ impl Opcode {
             Self::JumpIfNull => "IfNull",
             Self::MustBeInt => "MustBeInt",
             Self::Affinity => "Affinity",
+            Self::RealAffinity => "RealAffinity",
+            Self::MakeRecordAff => "MakeRecord",
             Self::Cast => "Cast",
             Self::Function => "Function",
             Self::SorterOpen => "SorterOpen",
@@ -456,6 +465,9 @@ pub struct SingleRowInsertPlan {
     pub cols: Vec<SingleRowInsertCol>,
     pub indexes: Vec<SingleRowInsertIndex>,
     pub has_builtin_jsonb: bool,
+    /// Integral reals in REAL-affinity columns are stored as integers (C's `OP_MakeRecord`
+    /// with an affinity string); never set together with `indexes`.
+    pub real_as_int: bool,
     pub dup_ext_code: i32,
     pub dup_msg: String,
 }
@@ -497,6 +509,11 @@ pub struct RowidPointUpdatePlan {
     pub indexes: Vec<PointDmlIndex>,
     /// Bit `ci` set: the program reads stored column `ci` (to rebuild the row or an index key).
     pub read_mask: u32,
+    /// Columns with REAL affinity (not the rowid alias). C re-encodes every one of them when it
+    /// rewrites the row: as integers where the value is integral (`real_as_int`, `OP_MakeRecord`
+    /// with the affinity string) or as floats (`OP_Affinity` ran because an index is rewritten).
+    pub real_cols: Vec<usize>,
+    pub real_as_int: bool,
     pub ticks_hit: u64,
     pub ticks_miss: u64,
 }
@@ -1647,6 +1664,35 @@ fn step_ops_loop(
                     std::mem::replace(&mut regs[dest], RuntimeValue::plain(Value::Blob(bytes)));
                 pool.recycle_value(old.value);
             }
+            Opcode::MakeRecordAff => {
+                // p1 = first_reg, p2 = n_regs, p3 = dest_reg (outside the range), p4 = Affinity
+                let start = ins.p1 as usize;
+                let count = ins.p2 as usize;
+                let dest = ins.p3 as usize;
+                let enc = storage
+                    .btree_ref(DatabaseId::MAIN)
+                    .map_or(TextEncoding::Utf8, Btree::encoding);
+                let mut swapped: Vec<(usize, f64)> = Vec::new();
+                if let P4::Affinity(affs) = &ins.p4 {
+                    for (k, aff) in affs.iter().enumerate().take(count) {
+                        if *aff == TypeAffinity::Real
+                            && let Value::Real(r) = regs[start + k].value
+                            && let Some(i) = sqliters_types::real_affinity_storage_int(r)
+                        {
+                            regs[start + k].value = Value::Integer(i);
+                            swapped.push((start + k, r));
+                        }
+                    }
+                }
+                let mut bytes = pool.blobs.pop().unwrap_or_default();
+                encode_runtime_record_into(&regs[start..start + count], enc, &mut bytes);
+                for (reg, r) in swapped {
+                    regs[reg].value = Value::real(r);
+                }
+                let old =
+                    std::mem::replace(&mut regs[dest], RuntimeValue::plain(Value::Blob(bytes)));
+                pool.recycle_value(old.value);
+            }
             Opcode::NewRowid => {
                 // p1 = table cursor, p2 = dest_reg
                 let cid = ins.p1 as usize;
@@ -2121,6 +2167,12 @@ fn step_ops_loop(
                         let v = std::mem::replace(&mut regs[start + i].value, Value::Null);
                         regs[start + i] = RuntimeValue::plain(aff.apply(v));
                     }
+                }
+            }
+            Opcode::RealAffinity => {
+                let reg = &mut regs[ins.p1 as usize];
+                if let Value::Integer(i) = reg.value {
+                    reg.value = Value::real(i as f64);
                 }
             }
             Opcode::Cast => {

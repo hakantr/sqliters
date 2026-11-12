@@ -32,6 +32,94 @@ use sqliters_types::{ErrorCode, Result, SqliteError, extended};
 
 const SEEK_SET: i16 = 0;
 
+/// `O_NOFOLLOW` of `open(2)` (C passes it on every open in `unixOpen` and for the `-shm` file):
+/// the final path component must not be a symbolic link. `0` on targets whose value is not
+/// listed here (the flag is then not applied; the explicit symlink checks still run).
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "riscv64",
+        target_arch = "s390x",
+        target_arch = "loongarch64"
+    )
+))]
+pub(crate) const O_NOFOLLOW: i32 = 0o400_000;
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "powerpc64"
+    )
+))]
+pub(crate) const O_NOFOLLOW: i32 = 0o100_000;
+#[cfg(target_os = "macos")]
+pub(crate) const O_NOFOLLOW: i32 = 0x0100;
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        any(
+            target_arch = "x86_64",
+            target_arch = "x86",
+            target_arch = "riscv64",
+            target_arch = "s390x",
+            target_arch = "loongarch64",
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "powerpc64"
+        )
+    ),
+    target_os = "macos"
+)))]
+pub(crate) const O_NOFOLLOW: i32 = 0;
+
+/// `SQLITE_DEFAULT_FILE_PERMISSIONS` (`os_unix.c`): permission bits requested for a new
+/// database file (the process umask still applies).
+pub(crate) const DEFAULT_FILE_PERMISSIONS: u32 = 0o644;
+
+/// `findCreateFileMode` (`os_unix.c`): the permission bits a file about to be created must
+/// get, and the owner it should get. A rollback journal or WAL file takes the mode and owner
+/// of its database file (found by cutting the name at its last `-`); a delete-on-close file
+/// gets 0600; any other file gets the default (`None`).
+pub(crate) fn find_create_file_mode(
+    path: &Path,
+    is_journal_or_wal: bool,
+    delete_on_close: bool,
+) -> Option<(u32, Option<(u32, u32)>)> {
+    use std::os::unix::fs::MetadataExt;
+    if is_journal_or_wal {
+        let bytes = path.as_os_str().as_bytes();
+        let cut = bytes.iter().rposition(|&b| b == b'-')?;
+        let db_path = Path::new(OsStr::from_bytes(&bytes[..cut]));
+        let meta = fs::metadata(db_path).ok()?;
+        return Some((meta.mode() & 0o777, Some((meta.uid(), meta.gid()))));
+    }
+    if delete_on_close {
+        return Some((0o600, None));
+    }
+    None
+}
+
+/// The tail of `robust_open` plus `robustFchown`: a file that was just created empty with an
+/// explicit mode gets exactly that mode (the umask may have removed bits), and a journal or WAL
+/// file gets the owner of its database (which only succeeds for a privileged process, as in C).
+pub(crate) fn apply_created_file_mode(file: &File, mode: u32, owner: Option<(u32, u32)>) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(meta) = file.metadata() else {
+        return;
+    };
+    if meta.len() == 0 && (meta.mode() & 0o777) != mode {
+        let _ = file.set_permissions(fs::Permissions::from_mode(mode));
+    }
+    if let Some((uid, gid)) = owner
+        && (meta.uid() != uid || meta.gid() != gid)
+    {
+        let _ = std::os::unix::fs::fchown(file, Some(uid), Some(gid));
+    }
+}
+
 /// Maximum pathname length for the Unix VFS (`MAX_PATHNAME` in `sqlite/src/os_unix.c:180`).
 pub(crate) const MAX_PATHNAME: usize = 512;
 

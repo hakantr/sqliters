@@ -3,6 +3,35 @@
 //! ported from SQLite 3.54.1.
 #![forbid(unsafe_code)]
 
+/// Decision trace for C-parity checks: compiled in only with `RUSTFLAGS="--cfg sqliters_dtrace"`
+/// and absent (zero cost) otherwise. Prints to stderr when the `DTRACE` environment variable is
+/// set, in the `TR|class|event|key=value ...` format of the instrumented C amalgamation the
+/// traces are diffed against. Use in statement position only.
+#[macro_export]
+macro_rules! dtrace {
+    ($($arg:tt)*) => {
+        #[allow(unexpected_cfgs)]
+        {
+            // (a `cfg` attribute, not `cfg!()`: without the flag nothing is compiled at all — an
+            // unoptimised build would otherwise still reserve stack for the arguments, in
+            // functions that recurse deeply.)
+            #[cfg(sqliters_dtrace)]
+            {
+                if $crate::dtrace_enabled() {
+                    eprintln!($($arg)*);
+                }
+            }
+        }
+    };
+}
+
+/// Whether the decision trace is switched on at run time (see [`dtrace!`]).
+#[must_use]
+pub fn dtrace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("DTRACE").is_some())
+}
+
 pub mod bitvec;
 pub mod error;
 pub mod json;
@@ -30,7 +59,7 @@ pub use record::{
     encode_runtime_record_into, encode_runtime_record_with_encoding, encode_value_refs_record_into,
     fallible_sort_by, locate_roundtrip_stable_fields, parse_raw_record_prefix,
     raw_field_is_roundtrip_stable, raw_record_prefix_has_null, read_raw_record_field,
-    serial_type_for, serial_type_for_with_encoding, serial_type_len,
+    real_affinity_storage_int, serial_type_for, serial_type_for_with_encoding, serial_type_len,
 };
 pub use runtime_api::{
     AggregateStepId, DatabaseId, ExecutionServices, FunctionFlags, MAX_DB_SLOTS, RowMutationEvent,

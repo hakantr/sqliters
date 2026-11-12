@@ -2539,10 +2539,17 @@ impl Wal {
 
         // Build deduplicated `(pgno, latest_frame)` list over `(start_backfill, mx_safe_frame]`
         // sorted in ascending `pgno` order (`walIteratorInit` / `walIteratorNext`, `wal.c:1833-2099`)!
+        //
+        // The iterator covers the whole log after `nBackfill` (up to `hdr.mxFrame`) and yields,
+        // per page, its newest frame; `walCheckpoint` then skips a page whose newest frame lies
+        // beyond `mxSafeFrame` (`if( iFrame<=nBackfill || iFrame>mxSafeFrame || iDbpage>mxPage )
+        // continue;`). An older frame of that page inside the safe range is not copied either:
+        // the next checkpoint writes the page once, with its newest content.
+        let iter_last = self.hdr.mx_frame.max(mx_safe_frame);
         let mut latest_by_pgno: HashMap<Pgno, u32> = HashMap::new();
-        for fno in (start_backfill + 1)..=mx_safe_frame {
+        for fno in (start_backfill + 1)..=iter_last {
             let pgno = ckpt_guard.read_frame_pgno(fno)?;
-            if pgno > 0 && pgno <= n_page {
+            if pgno > 0 {
                 latest_by_pgno.insert(pgno, fno);
             }
         }
@@ -2556,6 +2563,20 @@ impl Wal {
             {
                 return Err(SqliteError::new(ErrorCode::Interrupt, "interrupted"));
             }
+            if fno > mx_safe_frame || pgno > n_page {
+                sqliters_types::dtrace!(
+                    "TR|ckpt|page|pg={} frame={} o={}",
+                    pgno,
+                    fno,
+                    if fno > mx_safe_frame {
+                        "skip-newest-frame-beyond-safe"
+                    } else {
+                        "skip-page-beyond-db-size"
+                    }
+                );
+                continue;
+            }
+            sqliters_types::dtrace!("TR|ckpt|page|pg={} frame={} o=copy", pgno, fno);
             self.read_frame(fno, &mut buf)?;
             let db_off = u64::from(pgno - 1) * u64::from(sz_page);
             db_file.write_at(&buf, db_off)?;

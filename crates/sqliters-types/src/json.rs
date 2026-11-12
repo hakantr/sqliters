@@ -1727,6 +1727,21 @@ pub fn jsonb_to_pretty_text(blob: &[u8], indent: &str) -> Result<String> {
 /// `TEXT` with `subtype == JSON_SUBTYPE` is parsed & embedded as JSON; `BLOB` passing
 /// `blob_is_jsonb` is validated & embedded as JSONB; any other `BLOB` errors with
 /// `"JSON cannot hold BLOB values"`.
+/// `jsonFunctionArgToBlob` (json.c): the value argument of `json_set` / `json_insert` /
+/// `json_replace` / `json_array_insert`. An SQL text that is not JSON becomes a `TEXTRAW`
+/// element whatever it contains (the functions that build their result as JSON text first, such
+/// as `jsonb_array`, let the parser pick `TEXT` for plain strings).
+fn append_edit_arg_as_jsonb(out: &mut Vec<u8>, arg: &RuntimeValue) -> Result<()> {
+    if let Value::Text(s) = &arg.value
+        && u32::from(arg.subtype) != JSON_SUBTYPE
+    {
+        crate::dtrace!("TR|jsonb|argtext|o=TEXTRAW");
+        jsonb_append_node(out, JSONB_TEXTRAW, s.as_bytes());
+        return Ok(());
+    }
+    append_sql_arg_as_jsonb(out, arg)
+}
+
 pub fn append_sql_arg_as_jsonb(out: &mut Vec<u8>, arg: &RuntimeValue) -> Result<()> {
     match &arg.value {
         Value::Null => jsonb_append_node(out, JSONB_NULL, &[]),
@@ -2664,6 +2679,16 @@ fn check_jsonb_depth(blob: &[u8], offset: usize, depth: usize) -> Result<usize> 
     }
 }
 
+/// Label of an object member created by a path edit (`jsonLookupStep`): `TEXTRAW`. (C writes
+/// `TEXT5` with the escaped spelling when the path quotes the key and it contains a backslash;
+/// the path steps here hold the unescaped key, so that spelling is not reproduced.)
+fn encode_new_label_jsonb(key: &str) -> Vec<u8> {
+    let mut raw = Vec::with_capacity(key.len() + 2);
+    crate::dtrace!("TR|jsonb|label|o=TEXTRAW");
+    jsonb_append_node(&mut raw, JSONB_TEXTRAW, key.as_bytes());
+    raw
+}
+
 fn encode_key_jsonb(key: &str) -> Vec<u8> {
     let mut raw = Vec::with_capacity(key.len() + 2);
     let plain = key.bytes().all(|b| is_json_plain_ok_byte(b) || b == b'\'');
@@ -2684,7 +2709,7 @@ fn build_intermediate_for_steps(steps: &[PathStep], new_val: EditNode) -> Option
             let child = build_intermediate_for_steps(rest, new_val)?;
             Some(EditNode::Object(vec![(
                 k.clone(),
-                encode_key_jsonb(k),
+                encode_new_label_jsonb(k),
                 child,
             )]))
         }
@@ -2721,7 +2746,7 @@ fn apply_edit(node: &mut EditNode, steps: &[PathStep], mode: EditMode, new_val: 
                         if let Some(v) = new_val {
                             entries.push((
                                 k.clone(),
-                                encode_key_jsonb(k),
+                                encode_new_label_jsonb(k),
                                 EditNode::Raw(v.to_vec()),
                             ));
                         }
@@ -2744,7 +2769,7 @@ fn apply_edit(node: &mut EditNode, steps: &[PathStep], mode: EditMode, new_val: 
             ) && let Some(v) = new_val
                 && let Some(sub) = build_intermediate_for_steps(rest, EditNode::Raw(v.to_vec()))
             {
-                entries.push((k.clone(), encode_key_jsonb(k), sub));
+                entries.push((k.clone(), encode_new_label_jsonb(k), sub));
             }
         }
         (EditNode::Array(items), PathStep::ArrayIndex(idx)) => {
@@ -3614,7 +3639,7 @@ pub fn eval_json_edit(
             return Err(err_not_array_element(&path_str));
         }
         let mut val_jsonb = Vec::new();
-        append_sql_arg_as_jsonb(&mut val_jsonb, &pair[1])?;
+        append_edit_arg_as_jsonb(&mut val_jsonb, &pair[1])?;
         apply_edit(&mut root, &steps, mode, Some(&val_jsonb));
     }
     let mut out = Vec::new();
