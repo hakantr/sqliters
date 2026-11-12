@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
-use sqliters_btree::{Btree, BtreeCursorState, CursorId, PointLookupRow};
+use sqliters_btree::{Btree, BtreeCursorState, CursorId, PointLookupRow, TableRowRef};
 pub use sqliters_ext::{
     Fts5AuxRegistry, Fts5Module, Fts5VocabModule, GenerateSeriesModule, JsonEachModule,
     JsonTreeModule, JsonbEachModule, JsonbTreeModule, RTreeCoordMode, RTreeModule,
@@ -9939,6 +9939,47 @@ fn finish_single_row_insert_write(
     };
 
     let enc = bt.encoding();
+    if bt.is_p3v2_utf8() {
+        if !bt.insert_table_pax_refs(
+            plan.root_pgno,
+            rowid,
+            val_refs,
+            !need_dup_check,
+            scratch_rec,
+        )? {
+            return Err(SqliteError::constraint(
+                plan.dup_ext_code,
+                plan.dup_msg.clone(),
+            ));
+        }
+
+        if !plan.indexes.is_empty() {
+            let rid_val = Value::Integer(rowid);
+            let mut idx_refs: [&Value; 17] = [&Value::Null; 17];
+            for idx in &plan.indexes {
+                let k_len = idx.col_slots.len();
+                for (k, &slot) in idx.col_slots.iter().enumerate() {
+                    idx_refs[k] = match slot {
+                        None => &rid_val,
+                        Some(ci) => val_refs[ci],
+                    };
+                }
+                idx_refs[k_len] = &rid_val;
+                if let Some(n_keys) = sqliters_btree::orders_allow_pax_index(&idx.orders)
+                    && let Some(entry) =
+                        sqliters_btree::value_refs_as_pax_index_entry(&idx_refs[..=k_len], n_keys)
+                {
+                    bt.insert_index_pax_entry(idx.root_pgno, n_keys, entry, &idx.orders)?;
+                } else {
+                    encode_value_refs_record_into(&idx_refs[..=k_len], enc, scratch_rec);
+                    bt.insert_index(idx.root_pgno, scratch_rec, &idx.orders)?;
+                }
+            }
+        }
+
+        return Ok(rowid);
+    }
+
     encode_value_refs_record_into(val_refs, enc, scratch_rec);
     if need_dup_check {
         if !bt.insert_table_unique(plan.root_pgno, rowid, scratch_rec)? {
@@ -10478,6 +10519,20 @@ fn parse_raw_record_prefix<const N: usize>(
     Ok(parsed)
 }
 
+#[inline]
+fn exact_bits_value_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Real(x), Value::Real(y)) => {
+            (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits()
+        }
+        (Value::Text(x), Value::Text(y)) => x == y,
+        (Value::Blob(x), Value::Blob(y)) => x == y,
+        _ => false,
+    }
+}
+
 fn execute_single_row_delete_plan(
     plan: &SingleRowDeletePlan,
     params: &[Value],
@@ -10495,6 +10550,68 @@ fn execute_single_row_delete_plan(
 
     if plan.indexes.is_empty() {
         return Ok(u64::from(bt.delete_table(plan.root_pgno, target_rowid)?));
+    }
+
+    if bt.is_p3v2_utf8() && plan.max_needed_col.is_none_or(|m| m < 32) {
+        let mut needed_mask = 0u32;
+        for idx in &plan.indexes {
+            for &slot in &idx.col_slots {
+                if let Some(ci) = slot {
+                    needed_mask |= 1u32 << ci;
+                }
+            }
+        }
+        let mut old_vals: [Value; 32] = std::array::from_fn(|_| Value::Null);
+        let probe =
+            bt.with_table_rowid_morsel_row(
+                plan.root_pgno,
+                target_rowid,
+                |row_ref| match row_ref {
+                    TableRowRef::Pax { view, row_idx } => {
+                        let mut m = needed_mask;
+                        while m != 0 {
+                            let ci = m.trailing_zeros() as usize;
+                            m &= m - 1;
+                            old_vals[ci] = view.read_value(ci, row_idx)?.unwrap_or(Value::Null);
+                        }
+                        Ok(true)
+                    }
+                    TableRowRef::Raw(_) => Ok(false),
+                },
+            )?;
+        match probe {
+            None => return Ok(0),
+            Some(true) => {
+                let deleted = bt.delete_table(plan.root_pgno, target_rowid)?;
+                debug_assert!(deleted);
+                let enc = bt.encoding();
+                let rid_val = Value::Integer(target_rowid);
+                let mut idx_refs: [&Value; 17] = [&Value::Null; 17];
+                for idx in &plan.indexes {
+                    let k_len = idx.col_slots.len();
+                    for (k, &slot) in idx.col_slots.iter().enumerate() {
+                        idx_refs[k] = match slot {
+                            None => &rid_val,
+                            Some(ci) => &old_vals[ci],
+                        };
+                    }
+                    idx_refs[k_len] = &rid_val;
+                    if let Some(n_keys) = sqliters_btree::orders_allow_pax_index(&idx.orders)
+                        && let Some(entry) = sqliters_btree::value_refs_as_pax_index_entry(
+                            &idx_refs[..=k_len],
+                            n_keys,
+                        )
+                    {
+                        bt.delete_index_pax_entry(idx.root_pgno, n_keys, entry, &idx.orders)?;
+                    } else {
+                        encode_value_refs_record_into(&idx_refs[..=k_len], enc, scratch_rec);
+                        bt.delete_index_raw(idx.root_pgno, scratch_rec, &idx.orders)?;
+                    }
+                }
+                return Ok(1);
+            }
+            Some(false) => {}
+        }
     }
 
     if !bt.delete_table_returning_raw_into(plan.root_pgno, target_rowid, scratch_old_rec)? {
@@ -10556,6 +10673,263 @@ fn execute_single_row_update_plan(
     let Some(target_rowid) = key_val.to_exact_rowid_i64() else {
         return Ok(0);
     };
+
+    if bt.is_p3v2_utf8() && plan.n_cols <= 16 {
+        let mut read_mask = 0u16;
+        for a in &plan.assignments {
+            if let SingleRowUpdateRhs::ColArith { src_col, .. } = a.rhs
+                && plan.rowid_alias_col != Some(src_col)
+            {
+                read_mask |= 1u16 << src_col;
+            }
+        }
+        for idx in &plan.affected_indexes {
+            for &slot in &idx.col_slots {
+                if let Some(ci) = slot {
+                    read_mask |= 1u16 << ci;
+                }
+            }
+        }
+
+        let mut old_vals: [Value; 16] = std::array::from_fn(|_| Value::Null);
+        let probe =
+            bt.with_table_rowid_morsel_row(
+                plan.root_pgno,
+                target_rowid,
+                |row_ref| match row_ref {
+                    TableRowRef::Pax { view, row_idx } => {
+                        let mut m = read_mask;
+                        while m != 0 {
+                            let ci = m.trailing_zeros() as usize;
+                            m &= m - 1;
+                            old_vals[ci] = view.read_value(ci, row_idx)?.unwrap_or(Value::Null);
+                        }
+                        Ok(Some((view.pgno(), row_idx)))
+                    }
+                    TableRowRef::Raw(_) => Ok(None),
+                },
+            )?;
+
+        match probe {
+            None => return Ok(0),
+            Some(Some((leaf_pgno, row_idx))) => {
+                let mut assigned_mask = 0u16;
+                let mut new_vals: [Value; 16] = std::array::from_fn(|_| Value::Null);
+                let mut scalar_updates: [(usize, Value); 16] =
+                    std::array::from_fn(|_| (0usize, Value::Null));
+                let mut all_scalar = true;
+
+                for (ai, a) in plan.assignments.iter().enumerate() {
+                    assigned_mask |= 1u16 << a.col_idx;
+                    let final_v = match &a.rhs {
+                        SingleRowUpdateRhs::Value(src) => {
+                            let raw_val = resolve_insert_val_source(src, params);
+                            let v = if affinity_is_noop_for_insert(a.affinity, raw_val) {
+                                raw_val.clone()
+                            } else {
+                                a.affinity.apply(raw_val.clone())
+                            };
+                            match v {
+                                Value::Real(r) if r.is_nan() => Value::Null,
+                                other => other,
+                            }
+                        }
+                        SingleRowUpdateRhs::ColArith { src_col, op, rhs } => {
+                            let rhs_val = resolve_insert_val_source(rhs, params);
+                            let lhs_ref = if plan.rowid_alias_col == Some(*src_col) {
+                                None
+                            } else {
+                                Some(&old_vals[*src_col])
+                            };
+                            let computed = match (lhs_ref, rhs_val) {
+                                (None, Value::Integer(delta)) => match op {
+                                    Opcode::Add => target_rowid
+                                        .checked_add(*delta)
+                                        .map(Value::Integer)
+                                        .unwrap_or_else(|| {
+                                            eval_arith(*op, &Value::Integer(target_rowid), rhs_val)
+                                        }),
+                                    Opcode::Subtract => target_rowid
+                                        .checked_sub(*delta)
+                                        .map(Value::Integer)
+                                        .unwrap_or_else(|| {
+                                            eval_arith(*op, &Value::Integer(target_rowid), rhs_val)
+                                        }),
+                                    _ => eval_arith(*op, &Value::Integer(target_rowid), rhs_val),
+                                },
+                                (Some(Value::Integer(lhs_i)), Value::Integer(delta)) => match op {
+                                    Opcode::Add => (*lhs_i)
+                                        .checked_add(*delta)
+                                        .map(Value::Integer)
+                                        .unwrap_or_else(|| {
+                                            eval_arith(*op, lhs_ref.unwrap(), rhs_val)
+                                        }),
+                                    Opcode::Subtract => (*lhs_i)
+                                        .checked_sub(*delta)
+                                        .map(Value::Integer)
+                                        .unwrap_or_else(|| {
+                                            eval_arith(*op, lhs_ref.unwrap(), rhs_val)
+                                        }),
+                                    _ => eval_arith(*op, lhs_ref.unwrap(), rhs_val),
+                                },
+                                (None, _) => {
+                                    eval_arith(*op, &Value::Integer(target_rowid), rhs_val)
+                                }
+                                (Some(lv), _) => eval_arith(*op, lv, rhs_val),
+                            };
+                            let v = if affinity_is_noop_for_insert(a.affinity, &computed) {
+                                computed
+                            } else {
+                                a.affinity.apply(computed)
+                            };
+                            match v {
+                                Value::Real(r) if r.is_nan() => Value::Null,
+                                other => other,
+                            }
+                        }
+                    };
+
+                    if final_v.is_null()
+                        && let Some(ref msg) = a.notnull_msg
+                    {
+                        return Err(SqliteError::constraint(
+                            extended::SQLITE_CONSTRAINT_NOTNULL,
+                            msg.clone(),
+                        ));
+                    }
+
+                    if matches!(final_v, Value::Null | Value::Integer(_) | Value::Real(_)) {
+                        scalar_updates[ai] = (a.col_idx, final_v.clone());
+                    } else {
+                        all_scalar = false;
+                    }
+                    new_vals[a.col_idx] = final_v;
+                }
+
+                if !plan.affected_indexes.is_empty() {
+                    let enc = bt.encoding();
+                    let rid_val = Value::Integer(target_rowid);
+                    let mut old_refs: [&Value; 17] = [&Value::Null; 17];
+                    let mut new_refs: [&Value; 17] = [&Value::Null; 17];
+                    for idx in &plan.affected_indexes {
+                        let k_len = idx.col_slots.len();
+                        let mut key_changed = false;
+                        for (k, &slot) in idx.col_slots.iter().enumerate() {
+                            match slot {
+                                None => {
+                                    old_refs[k] = &rid_val;
+                                    new_refs[k] = &rid_val;
+                                }
+                                Some(ci) => {
+                                    let ov = &old_vals[ci];
+                                    let nv = if (assigned_mask & (1u16 << ci)) != 0 {
+                                        &new_vals[ci]
+                                    } else {
+                                        ov
+                                    };
+                                    if !exact_bits_value_eq(ov, nv) {
+                                        key_changed = true;
+                                    }
+                                    old_refs[k] = ov;
+                                    new_refs[k] = nv;
+                                }
+                            }
+                        }
+                        if !key_changed {
+                            continue;
+                        }
+                        old_refs[k_len] = &rid_val;
+                        new_refs[k_len] = &rid_val;
+                        let pax_n_keys = sqliters_btree::orders_allow_pax_index(&idx.orders);
+
+                        if let Some(n_keys) = pax_n_keys
+                            && let Some(old_entry) = sqliters_btree::value_refs_as_pax_index_entry(
+                                &old_refs[..=k_len],
+                                n_keys,
+                            )
+                        {
+                            bt.delete_index_pax_entry(
+                                idx.root_pgno,
+                                n_keys,
+                                old_entry,
+                                &idx.orders,
+                            )?;
+                        } else {
+                            encode_value_refs_record_into(&old_refs[..=k_len], enc, scratch_rec);
+                            bt.delete_index_raw(idx.root_pgno, scratch_rec, &idx.orders)?;
+                        }
+
+                        if let Some(n_keys) = pax_n_keys
+                            && let Some(new_entry) = sqliters_btree::value_refs_as_pax_index_entry(
+                                &new_refs[..=k_len],
+                                n_keys,
+                            )
+                        {
+                            bt.insert_index_pax_entry(
+                                idx.root_pgno,
+                                n_keys,
+                                new_entry,
+                                &idx.orders,
+                            )?;
+                        } else {
+                            encode_value_refs_record_into(&new_refs[..=k_len], enc, scratch_rec);
+                            bt.insert_index(idx.root_pgno, scratch_rec, &idx.orders)?;
+                        }
+                    }
+                }
+
+                if all_scalar
+                    && bt.try_update_table_pax_scalars_at(
+                        plan.root_pgno,
+                        leaf_pgno,
+                        row_idx,
+                        target_rowid,
+                        &scalar_updates[..plan.assignments.len()],
+                    )?
+                {
+                    return Ok(1);
+                }
+
+                // Fallback when updating a `TEXT`/`BLOB` column or widening a PAX scalar mode:
+                // read only the remaining unmodified non-IPK columns and replace the PAX row!
+                let unread_mask = ((1u32 << plan.n_cols) - 1) as u16 & !assigned_mask & !read_mask;
+                if unread_mask != 0 {
+                    bt.with_table_rowid_morsel_row(plan.root_pgno, target_rowid, |row_ref| {
+                        if let TableRowRef::Pax { view, row_idx: r } = row_ref {
+                            let mut m = unread_mask;
+                            while m != 0 {
+                                let ci = m.trailing_zeros() as usize;
+                                m &= m - 1;
+                                if plan.rowid_alias_col != Some(ci) {
+                                    old_vals[ci] = view.read_value(ci, r)?.unwrap_or(Value::Null);
+                                }
+                            }
+                        }
+                        Ok(())
+                    })?;
+                }
+                let mut full_refs: [&Value; 16] = [&Value::Null; 16];
+                for ci in 0..plan.n_cols {
+                    full_refs[ci] = if plan.rowid_alias_col == Some(ci) {
+                        &Value::Null
+                    } else if (assigned_mask & (1u16 << ci)) != 0 {
+                        &new_vals[ci]
+                    } else {
+                        &old_vals[ci]
+                    };
+                }
+                bt.insert_table_pax_refs(
+                    plan.root_pgno,
+                    target_rowid,
+                    &full_refs[..plan.n_cols],
+                    true,
+                    scratch_rec,
+                )?;
+                return Ok(1);
+            }
+            Some(None) => {}
+        }
+    }
 
     let Some(local_span) =
         bt.read_table_rowid_into_with_local_span(plan.root_pgno, target_rowid, scratch_old_rec)?
@@ -12589,5 +12963,462 @@ mod tests {
         conn.try_close().unwrap();
         src.try_close().unwrap();
         dst.try_close().unwrap();
+    }
+
+    #[test]
+    fn test_p3v2_pax_column_modes_manifest_typing_and_page_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "sqliters_p3v2_modes_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("p3v2_modes.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE pax_t(
+                    id INTEGER PRIMARY KEY,
+                    c_null,
+                    c_int,
+                    c_real,
+                    c_bytes,
+                    c_mixed
+                 );
+                 CREATE INDEX idx_pax_1k ON pax_t(c_int);
+                 CREATE INDEX idx_pax_2k ON pax_t(c_int, id);",
+            )
+            .unwrap();
+
+            // Row 1: ALL_NULL, I32, F64 (-0.0), empty TEXT '', I32 in c_mixed
+            conn.execute_params(
+                "INSERT INTO pax_t VALUES (1, NULL, -42, ?1, '', 7);",
+                &[Value::Real(-0.0)],
+            )
+            .unwrap();
+            // Row 2: ALL_NULL, I32, F64 (NaN -> NULL), empty BLOB X'', I32 in c_mixed
+            conn.execute_params(
+                "INSERT INTO pax_t VALUES (2, NULL, 100, ?1, X'', 8);",
+                &[Value::Real(f64::NAN)],
+            )
+            .unwrap();
+            // Row 3: ALL_NULL, I64 promotion (> i32::MAX), F64, TEXT 'abc', I64 promotion in c_mixed
+            let big_i64 = i64::from(i32::MAX) + 5000;
+            conn.execute_params(
+                "INSERT INTO pax_t VALUES (3, NULL, ?1, 3.25, 'abc', ?1);",
+                &[Value::Integer(big_i64)],
+            )
+            .unwrap();
+            // Row 4: ALL_NULL, NULL in c_int, F64, BLOB X'616263', MIXED promotion (TEXT in c_mixed!)
+            conn.execute_params(
+                "INSERT INTO pax_t VALUES (4, NULL, NULL, -12.5, X'616263', 'manifest');",
+                &[],
+            )
+            .unwrap();
+            // Row 5: Real + Blob in c_mixed within the same PAX leaf!
+            conn.execute_params(
+                "INSERT INTO pax_t VALUES (5, NULL, 100, 0.0, 'hello', X'deadbeef');",
+                &[],
+            )
+            .unwrap();
+
+            assert_eq!(
+                conn.query("PRAGMA integrity_check;", &[]).unwrap().rows[0].get_str(0),
+                Some("ok")
+            );
+
+            // Verify typeof() and exact values across all 6 column encodings
+            let rows = conn
+                .query(
+                    "SELECT id, typeof(c_null), typeof(c_int), c_int, typeof(c_real), c_real,
+                            typeof(c_bytes), length(c_bytes), typeof(c_mixed), c_mixed
+                       FROM pax_t ORDER BY id;",
+                    &[],
+                )
+                .unwrap()
+                .rows;
+            assert_eq!(rows.len(), 5);
+            // Row 1: -0.0 preserves IEEE-754 sign bit in PAX_COL_F64, '' is text of len 0
+            assert_eq!(rows[0].get_str(1), Some("null"));
+            assert_eq!(rows[0].get_str(2), Some("integer"));
+            assert_eq!(rows[0].get_i64(3), Some(-42));
+            assert_eq!(rows[0].get_str(4), Some("real"));
+            assert_eq!(rows[0].get_f64(5).unwrap().to_bits(), (-0.0f64).to_bits());
+            assert_eq!(rows[0].get_str(6), Some("text"));
+            assert_eq!(rows[0].get_i64(7), Some(0));
+            assert_eq!(rows[0].get_str(8), Some("integer"));
+            assert_eq!(rows[0].get_i64(9), Some(7));
+
+            // Row 2: NaN canonicalized to NULL, X'' is blob of len 0
+            assert_eq!(rows[1].get_str(4), Some("null"));
+            assert_eq!(rows[1].get_str(6), Some("blob"));
+            assert_eq!(rows[1].get_i64(7), Some(0));
+
+            // Row 3 vs Row 4: 'abc' (text) vs X'616263' (blob) + I64 + MIXED text
+            assert_eq!(rows[2].get_i64(3), Some(big_i64));
+            assert_eq!(rows[2].get_str(6), Some("text"));
+            assert_eq!(rows[3].get_str(2), Some("null"));
+            assert_eq!(rows[3].get_str(6), Some("blob"));
+            assert_eq!(rows[3].get_str(8), Some("text"));
+            assert_eq!(rows[3].get_str(9), Some("manifest"));
+            assert_eq!(rows[4].get_str(8), Some("blob"));
+
+            // Verify 0x2a covering index range scan + NULL lookup + UPDATE/DELETE
+            let idx_sum = conn
+                .query_row(
+                    "SELECT COUNT(*), SUM(id) FROM pax_t WHERE c_int >= -50;",
+                    &[],
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(idx_sum.get_i64(0), Some(4));
+            assert_eq!(idx_sum.get_i64(1), Some(1 + 2 + 3 + 5));
+
+            conn.execute("UPDATE pax_t SET c_int = c_int + 10 WHERE id = 2;")
+                .unwrap();
+            conn.execute("DELETE FROM pax_t WHERE id = 5;").unwrap();
+            assert_eq!(
+                conn.query("PRAGMA integrity_check;", &[]).unwrap().rows[0].get_str(0),
+                Some("ok")
+            );
+            conn.try_close().unwrap();
+        }
+
+        // Inspect raw on-disk header magic (`b"P3v2"` at [72..76]), page 1 (`0x0d`), and PAX leaves (`0x2d` / `0x2a`)
+        let raw_db = std::fs::read(&db_path).unwrap();
+        assert_eq!(&raw_db[72..76], b"P3v2");
+        assert_eq!(raw_db[100], sqliters_btree::BtreePageType::TableLeaf as u8);
+        let page_types: Vec<u8> = (1..raw_db.len() / 4096).map(|p| raw_db[p * 4096]).collect();
+        assert!(
+            page_types.contains(&sqliters_btree::PAX_TABLE_LEAF_BYTE),
+            "expected 0x2d PAX table leaf on disk, got {page_types:?}"
+        );
+        assert!(
+            page_types.contains(&sqliters_btree::PAX_INDEX_LEAF_BYTE),
+            "expected 0x2a PAX index leaf on disk, got {page_types:?}"
+        );
+
+        // Verify automatic 0x2a -> 0x0a fallback when a manifest-typed text value enters c_int!
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute("INSERT INTO pax_t VALUES (6, NULL, 'text_key_in_idx', 1.5, 'ok', 1);")
+                .unwrap();
+            assert_eq!(
+                conn.query("PRAGMA integrity_check;", &[]).unwrap().rows[0].get_str(0),
+                Some("ok")
+            );
+            let hit = conn
+                .query_row("SELECT id FROM pax_t WHERE c_int = 'text_key_in_idx';", &[])
+                .unwrap()
+                .unwrap();
+            assert_eq!(hit.get_i64(0), Some(6));
+            conn.try_close().unwrap();
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_p3v2_pax_splits_merges_wide_2000_cols_and_100kib_overflow_coexistence() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE mix_tbl(id INTEGER PRIMARY KEY, cat INT, score REAL, tag TEXT, payload BLOB);
+             CREATE INDEX idx_mix_cat ON mix_tbl(cat, id);",
+        )
+        .unwrap();
+
+        // Sequential & random inserts causing multiple 0x2d & 0x2a leaf splits + 115 KiB overflow rows!
+        conn.execute("BEGIN;").unwrap();
+        for i in 1..=260i64 {
+            let rowid = if i % 2 == 0 { i * 10 } else { 5000 - i * 7 };
+            let blob = if i == 50 || i == 180 {
+                vec![0x5Au8; 115_000]
+            } else {
+                vec![(i & 0xff) as u8; 24]
+            };
+            conn.execute_params(
+                "INSERT INTO mix_tbl VALUES (?1, ?2, ?3, ?4, ?5);",
+                &[
+                    Value::Integer(rowid),
+                    Value::Integer(rowid.rem_euclid(17)),
+                    Value::Real(rowid as f64 * 0.5),
+                    Value::Text(format!("tag_{i:04}")),
+                    Value::Blob(blob),
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute("COMMIT;").unwrap();
+
+        assert_eq!(
+            conn.query("PRAGMA integrity_check;", &[]).unwrap().rows[0].get_str(0),
+            Some("ok")
+        );
+        let ovfl_len = conn
+            .query_row(
+                "SELECT SUM(length(payload)) FROM mix_tbl WHERE length(payload) > 100000;",
+                &[],
+            )
+            .unwrap()
+            .unwrap()
+            .get_i64(0);
+        assert_eq!(ovfl_len, Some(230_000));
+
+        // Verify dbstat sees both PAX leaves and overflow pages cleanly
+        let dbstat_cnt = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dbstat WHERE name = 'mix_tbl' AND pagetype = 'leaf';",
+                &[],
+            )
+            .unwrap()
+            .unwrap()
+            .get_i64(0)
+            .unwrap();
+        assert!(dbstat_cnt >= 3);
+
+        // Delete 85% of rows to exercise 0x2d & 0x2a merges/rebalancing, then re-verify
+        conn.execute("DELETE FROM mix_tbl WHERE cat != 3;").unwrap();
+        assert_eq!(
+            conn.query("PRAGMA integrity_check;", &[]).unwrap().rows[0].get_str(0),
+            Some("ok")
+        );
+
+        // 2000-column wide table escaping cleanly to 0x0d + overflow
+        let cols_ddl = (0..2000)
+            .map(|c| format!("c{c} INT"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute(&format!("CREATE TABLE wide2000({cols_ddl});"))
+            .unwrap();
+        let vals_sql = (0..2000)
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute(&format!("INSERT INTO wide2000 VALUES ({vals_sql});"))
+            .unwrap();
+        let wide_row = conn
+            .query_row("SELECT c0, c999, c1999 FROM wide2000;", &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(wide_row.get_i64(0), Some(0));
+        assert_eq!(wide_row.get_i64(1), Some(999));
+        assert_eq!(wide_row.get_i64(2), Some(1999));
+        assert_eq!(
+            conn.query("PRAGMA integrity_check;", &[]).unwrap().rows[0].get_str(0),
+            Some("ok")
+        );
+        conn.try_close().unwrap();
+    }
+
+    #[test]
+    fn test_p3v2_pax_alter_vacuum_autovacuum_savepoint_wal_backup_blob_and_legacy_fallback() {
+        let dir = std::env::temp_dir().join(format!(
+            "sqliters_p3v2_acid_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main_db = dir.join("acid_pax.db");
+        let vac_into_db = dir.join("vac_into_pax.db");
+        let backup_db = dir.join("backup_pax.db");
+        let legacy_db = dir.join("legacy_fmt3.db");
+
+        // 1. WAL + INCREMENTAL autovacuum + SAVEPOINT + ALTER TABLE ADD/DROP COLUMN + incrblob + VACUUM + Backup
+        {
+            let conn = Connection::open(&main_db).unwrap();
+            conn.execute_batch(
+                "PRAGMA page_size = 4096;
+                 PRAGMA auto_vacuum = INCREMENTAL;
+                 PRAGMA journal_mode = WAL;
+                 CREATE TABLE items(id INTEGER PRIMARY KEY, grp INT, v INT, raw BLOB, obsolete TEXT);
+                 CREATE INDEX idx_items_grp ON items(grp, v);",
+            )
+            .unwrap();
+
+            conn.execute("BEGIN;").unwrap();
+            for i in 1..=220i64 {
+                conn.execute_params(
+                    "INSERT INTO items VALUES (?1, ?2, ?3, ?4, 'drop_me');",
+                    &[
+                        Value::Integer(i),
+                        Value::Integer(i % 10),
+                        Value::Integer(i * 3),
+                        Value::Blob(vec![b'a'; 32]),
+                    ],
+                )
+                .unwrap();
+            }
+            conn.execute("COMMIT;").unwrap();
+
+            // SAVEPOINT rollback across PAX splits, updates, and deletes
+            conn.execute_batch(
+                "SAVEPOINT sp_pax;
+                 UPDATE items SET v = v + 1000 WHERE grp = 2;
+                 DELETE FROM items WHERE grp = 5;
+                 INSERT INTO items VALUES (9999, 1, 999, X'0102', 'tmp');
+                 ROLLBACK TO sp_pax;
+                 RELEASE sp_pax;",
+            )
+            .unwrap();
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*), SUM(v) FROM items;", &[])
+                    .unwrap()
+                    .unwrap()
+                    .get_i64(0),
+                Some(220)
+            );
+
+            // ALTER TABLE ADD COLUMN (NULL & DEFAULT) + DROP COLUMN
+            conn.execute_batch(
+                "ALTER TABLE items ADD COLUMN extra_null INT;
+                 ALTER TABLE items ADD COLUMN extra_def TEXT DEFAULT 'varsayilan';
+                 ALTER TABLE items DROP COLUMN obsolete;",
+            )
+            .unwrap();
+            let alt_row = conn
+                .query_row(
+                    "SELECT extra_null, extra_def FROM items WHERE id = 15;",
+                    &[],
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(alt_row.get(0), Some(&Value::Null));
+            assert_eq!(alt_row.get_str(1), Some("varsayilan"));
+
+            // Incremental BLOB read/write directly on 0x2d PAX_COL_BYTES!
+            {
+                let mut bh = conn.blob_open("main", "items", "raw", 10, true).unwrap();
+                assert_eq!(bh.len(), 32);
+                let mut prefix = [0u8; 4];
+                bh.read_at(&mut prefix, 0).unwrap();
+                assert_eq!(&prefix, b"aaaa");
+                bh.write_at(b"PAX!", 4).unwrap();
+                bh.close().unwrap();
+            }
+            let blob_after = conn
+                .query_row("SELECT raw FROM items WHERE id = 10;", &[])
+                .unwrap()
+                .unwrap();
+            assert_eq!(&blob_after.get_blob(0).unwrap()[0..8], b"aaaaPAX!");
+
+            // Delete bulk rows + PRAGMA incremental_vacuum relocating 0x2d/0x2a pages
+            conn.execute_batch(
+                "DELETE FROM items WHERE id > 40;
+                 PRAGMA incremental_vacuum;",
+            )
+            .unwrap();
+            assert_eq!(
+                conn.query("PRAGMA integrity_check;", &[]).unwrap().rows[0].get_str(0),
+                Some("ok")
+            );
+
+            // Online Backup (`main_db` -> `backup_db`) + `VACUUM INTO` + in-place `VACUUM`
+            let dst = Connection::open(&backup_db).unwrap();
+            {
+                let mut b = Backup::init(&conn, "main", &dst, "main").unwrap();
+                assert_eq!(b.step(-1).unwrap(), BackupStepResult::Done);
+                b.finish().unwrap();
+            }
+            dst.try_close().unwrap();
+
+            conn.execute_params(
+                "VACUUM INTO ?1;",
+                &[Value::Text(vac_into_db.to_string_lossy().into_owned())],
+            )
+            .unwrap();
+            conn.execute("VACUUM;").unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            conn.try_close().unwrap();
+        }
+
+        for p in [&main_db, &vac_into_db, &backup_db] {
+            let hdr_bytes = std::fs::read(p).unwrap();
+            assert_eq!(&hdr_bytes[72..76], b"P3v2");
+            let c = Connection::open(p).unwrap();
+            assert_eq!(
+                c.query("PRAGMA integrity_check;", &[]).unwrap().rows[0].get_str(0),
+                Some("ok")
+            );
+            assert_eq!(
+                c.query_row("SELECT COUNT(*) FROM items;", &[])
+                    .unwrap()
+                    .unwrap()
+                    .get_i64(0),
+                Some(40)
+            );
+            c.try_close().unwrap();
+        }
+
+        // 2. Corrupting a 0x2d PAX leaf header (`n_rows > cap`) must be caught by `PRAGMA integrity_check`!
+        let corrupt_db = dir.join("corrupt_pax.db");
+        std::fs::copy(&vac_into_db, &corrupt_db).unwrap();
+        {
+            let mut raw = std::fs::read(&corrupt_db).unwrap();
+            let pax_pg = (1..raw.len() / 4096)
+                .find(|&pg| raw[pg * 4096] == sqliters_btree::PAX_TABLE_LEAF_BYTE)
+                .expect("expected 0x2d page in vac_into_db");
+            let off = pax_pg * 4096;
+            raw[off + 2..off + 4].copy_from_slice(&9999u16.to_le_bytes()); // n_rows = 9999 > cap
+            std::fs::write(&corrupt_db, &raw).unwrap();
+
+            let c = Connection::open(&corrupt_db).unwrap();
+            let ic = c.query("PRAGMA integrity_check;", &[]).unwrap();
+            assert_ne!(ic.rows[0].get_str(0), Some("ok"));
+            c.try_close().unwrap();
+        }
+
+        // 3. Transparent Format-3 fallback when reopening a non-P3v2 `.db` WITHOUT LegacyFormat3Guard!
+        {
+            let _guard = sqliters_types::LegacyFormat3Guard::enter();
+            let c = Connection::open(&legacy_db).unwrap();
+            c.execute_batch(
+                "CREATE TABLE leg(id INTEGER PRIMARY KEY, name TEXT, score INT);
+                 CREATE INDEX idx_leg_score ON leg(score);
+                 INSERT INTO leg VALUES (1, 'alpha', 10), (2, 'beta', 20);",
+            )
+            .unwrap();
+            c.try_close().unwrap();
+        }
+        let leg_bytes = std::fs::read(&legacy_db).unwrap();
+        assert_eq!(&leg_bytes[72..76], &[0u8; 4]);
+        {
+            // Reopen in default P3v2 process mode: header lacks b"P3v2", so Format-3 stays active!
+            let c = Connection::open(&legacy_db).unwrap();
+            c.execute(
+                "INSERT INTO leg VALUES (3, 'gamma', 30); UPDATE leg SET score = 25 WHERE id = 2;",
+            )
+            .unwrap();
+            assert_eq!(
+                c.query("PRAGMA integrity_check;", &[]).unwrap().rows[0].get_str(0),
+                Some("ok")
+            );
+            let sum = c
+                .query_row("SELECT SUM(score) FROM leg;", &[])
+                .unwrap()
+                .unwrap()
+                .get_i64(0);
+            assert_eq!(sum, Some(65));
+            c.try_close().unwrap();
+        }
+        let leg_bytes_after = std::fs::read(&legacy_db).unwrap();
+        assert_eq!(&leg_bytes_after[72..76], &[0u8; 4]);
+        assert!(
+            !(1..leg_bytes_after.len() / 4096).any(|pg| {
+                matches!(
+                    leg_bytes_after[pg * 4096],
+                    sqliters_btree::PAX_TABLE_LEAF_BYTE | sqliters_btree::PAX_INDEX_LEAF_BYTE
+                )
+            }),
+            "Format-3 database must never emit 0x2d/0x2a pages"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

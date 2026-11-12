@@ -1970,15 +1970,6 @@ struct WindowStage {
     calls: Vec<CollectedWindowCall>,
 }
 
-fn specs_share_stage(a: &ResolvedWindowSpec, b: &ResolvedWindowSpec) -> bool {
-    a.partition_by == b.partition_by
-        && a.order_by == b.order_by
-        && a.units == b.units
-        && a.start == b.start
-        && a.end == b.end
-        && a.exclude == b.exclude
-}
-
 /// Groups collected window calls into stages matching `sqlite3WindowLink` (`window.c:1338-1386`)
 /// and executes them from innermost (`stages.last()`) to outermost (`stages[0]`), populating
 /// `item.row.win_vals` on every item.
@@ -2004,6 +1995,35 @@ pub(crate) fn execute_window_pipeline(
     )
 }
 
+fn call_is_frame_independent_implicit(call: &CollectedWindowCall) -> bool {
+    call.spec.implicit_frame
+        && matches!(
+            call.fn_kind,
+            WindowFnKind::Builtin(
+                BuiltinWinFn::RowNumber
+                    | BuiltinWinFn::Rank
+                    | BuiltinWinFn::DenseRank
+                    | BuiltinWinFn::PercentRank
+                    | BuiltinWinFn::CumeDist
+                    | BuiltinWinFn::Ntile
+                    | BuiltinWinFn::Lag
+                    | BuiltinWinFn::Lead
+            )
+        )
+}
+
+fn call_needs_peers(call: &CollectedWindowCall) -> bool {
+    matches!(
+        call.fn_kind,
+        WindowFnKind::Builtin(
+            BuiltinWinFn::Rank
+                | BuiltinWinFn::DenseRank
+                | BuiltinWinFn::PercentRank
+                | BuiltinWinFn::CumeDist
+        )
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_window_pipeline_opts(
     ctx: &mut ExecContext<'_>,
@@ -2025,18 +2045,29 @@ pub(crate) fn execute_window_pipeline_opts(
 
     let mut stages: Vec<WindowStage> = Vec::new();
     for call in calls {
+        let is_fi = call_is_frame_independent_implicit(call);
         if let Some(st) = stages.iter_mut().find(|st| {
-            let st_spec = ResolvedWindowSpec {
-                partition_by: st.partition_by.clone(),
-                order_by: st.order_by.clone(),
-                units: st.units,
-                start: st.start.clone(),
-                end: st.end.clone(),
-                exclude: st.exclude,
-                implicit_frame: false,
-            };
-            specs_share_stage(&st_spec, &call.spec)
+            if st.partition_by != call.spec.partition_by || st.order_by != call.spec.order_by {
+                return false;
+            }
+            if is_fi {
+                return true;
+            }
+            if st.units == call.spec.units
+                && st.start == call.spec.start
+                && st.end == call.spec.end
+                && st.exclude == call.spec.exclude
+            {
+                return true;
+            }
+            st.calls.iter().all(call_is_frame_independent_implicit)
         }) {
+            if !is_fi && st.calls.iter().all(call_is_frame_independent_implicit) {
+                st.units = call.spec.units;
+                st.start = call.spec.start.clone();
+                st.end = call.spec.end.clone();
+                st.exclude = call.spec.exclude;
+            }
             st.calls.push(call.clone());
         } else {
             let new_stage = WindowStage {
@@ -2476,12 +2507,53 @@ fn execute_single_window_stage(
                     .windows(2)
                     .all(|w| cmp_pair(&w[0].0, &w[0].1, &w[1].0, &w[1].1) != Ordering::Greater);
                 if !already_sorted {
-                    let mut perm: Vec<usize> = (0..n_total).collect();
-                    perm.sort_by(|&ia, &ib| {
-                        let (pa, oa) = &keys[ia];
-                        let (pb, ob) = &keys[ib];
-                        cmp_pair(pa, oa, pb, ob)
-                    });
+                    // Contiguous integer-key sort fast path (`O(N log N)` on flat 24B tuples with
+                    // zero pointer indirection into `keys`).
+                    let mut int_keys: Vec<(i64, i64, usize)> = Vec::with_capacity(n_total);
+                    let mut all_int = true;
+                    for (idx, (pv, ov)) in keys.iter().enumerate() {
+                        let ip = if has_p {
+                            if let Value::Integer(v) = pv {
+                                *v
+                            } else {
+                                all_int = false;
+                                break;
+                            }
+                        } else {
+                            0
+                        };
+                        let io = if has_o {
+                            if let Value::Integer(v) = ov {
+                                *v
+                            } else {
+                                all_int = false;
+                                break;
+                            }
+                        } else {
+                            0
+                        };
+                        int_keys.push((ip, io, idx));
+                    }
+                    let perm: Vec<usize> = if all_int {
+                        let o_desc = has_o && order_metas[0].order.desc;
+                        if o_desc {
+                            int_keys.sort_unstable_by_key(|&(ip, io, idx)| {
+                                (ip, std::cmp::Reverse(io), idx)
+                            });
+                        } else {
+                            int_keys.sort_unstable_by_key(|&(ip, io, idx)| (ip, io, idx));
+                        }
+                        int_keys.into_iter().map(|(_, _, idx)| idx).collect()
+                    } else {
+                        drop(int_keys);
+                        let mut perm: Vec<usize> = (0..n_total).collect();
+                        perm.sort_by(|&ia, &ib| {
+                            let (pa, oa) = &keys[ia];
+                            let (pb, ob) = &keys[ib];
+                            cmp_pair(pa, oa, pb, ob)
+                        });
+                        perm
+                    };
                     apply_permutation_in_place(items, &perm);
                     apply_permutation_in_place(&mut keys, &perm);
                 }
@@ -2982,238 +3054,262 @@ fn execute_stage_on_partition(
     }
     let enc = ctx.encoding();
 
-    // 1. Evaluate frame start/end offsets on row 0 of the partition (`window.c:2945-2952`)
-    let eval_start = eval_bound_on_first_row(
-        ctx,
-        &stage.start,
-        stage.units,
-        true,
-        &part_items[0],
-        params,
-        outer_scopes,
-        ctes,
-    )?;
-    let eval_end = eval_bound_on_first_row(
-        ctx,
-        &stage.end,
-        stage.units,
-        false,
-        &part_items[0],
-        params,
-        outer_scopes,
-        ctes,
-    )?;
+    let all_frame_independent = stage.calls.iter().all(call_is_frame_independent_implicit);
+    let stage_needs_peers = (!all_frame_independent
+        && (stage.units != WindowFrameUnits::Rows
+            || matches!(
+                stage.exclude,
+                WindowFrameExclude::Group | WindowFrameExclude::Ties
+            )))
+        || stage.calls.iter().any(call_needs_peers);
 
-    // 2. Build peer groups `(g_start, g_end)` and `row_peer_group[0..n]`
-    let mut peer_groups: Vec<(usize, usize)> = Vec::new();
-    let mut row_peer_group: Vec<usize> = vec![0; n];
-    if stage.order_by.is_empty() {
-        peer_groups.push((0, n));
+    // 1. Evaluate frame start/end offsets on row 0 of the partition (`window.c:2945-2952`)
+    let (eval_start, eval_end) = if all_frame_independent {
+        (
+            EvalFrameBound::UnboundedPreceding,
+            EvalFrameBound::CurrentRow,
+        )
     } else {
-        let mut g_start = 0usize;
-        while g_start < n {
-            let g_id = peer_groups.len();
-            row_peer_group[g_start] = g_id;
-            let mut g_end = g_start + 1;
-            while g_end < n {
-                let mut same_peer = true;
-                for (k, om) in order_metas.iter().enumerate() {
-                    if om.compare_vals(
-                        part_keys.order_val(g_start, k),
-                        part_keys.order_val(g_end, k),
-                        ctx.collations,
-                        enc,
-                    )? != Ordering::Equal
-                    {
-                        same_peer = false;
+        (
+            eval_bound_on_first_row(
+                ctx,
+                &stage.start,
+                stage.units,
+                true,
+                &part_items[0],
+                params,
+                outer_scopes,
+                ctes,
+            )?,
+            eval_bound_on_first_row(
+                ctx,
+                &stage.end,
+                stage.units,
+                false,
+                &part_items[0],
+                params,
+                outer_scopes,
+                ctes,
+            )?,
+        )
+    };
+
+    // 2. Build peer groups `(g_start, g_end)` and `row_peer_group[0..n]` when needed
+    let mut peer_groups: Vec<(usize, usize)> = Vec::new();
+    let mut row_peer_group: Vec<usize> = Vec::new();
+    if stage_needs_peers {
+        row_peer_group.resize(n, 0);
+        if stage.order_by.is_empty() {
+            peer_groups.push((0, n));
+        } else {
+            let mut g_start = 0usize;
+            while g_start < n {
+                let g_id = peer_groups.len();
+                row_peer_group[g_start] = g_id;
+                let mut g_end = g_start + 1;
+                while g_end < n {
+                    let mut same_peer = true;
+                    for (k, om) in order_metas.iter().enumerate() {
+                        if om.compare_vals(
+                            part_keys.order_val(g_start, k),
+                            part_keys.order_val(g_end, k),
+                            ctx.collations,
+                            enc,
+                        )? != Ordering::Equal
+                        {
+                            same_peer = false;
+                            break;
+                        }
+                    }
+                    if !same_peer {
                         break;
                     }
+                    row_peer_group[g_end] = g_id;
+                    g_end += 1;
                 }
-                if !same_peer {
-                    break;
-                }
-                row_peer_group[g_end] = g_id;
-                g_end += 1;
+                peer_groups.push((g_start, g_end));
+                g_start = g_end;
             }
-            peer_groups.push((g_start, g_end));
-            g_start = g_end;
         }
     }
     let num_groups = peer_groups.len();
 
     // 3. Compute half-open `[start_idx, end_idx)` frame intervals (`0 <= start <= end <= n`)
-    let mut frames: Vec<(usize, usize)> = Vec::with_capacity(n);
-    match stage.units {
-        WindowFrameUnits::Rows => {
-            for i in 0..n {
-                let s = match eval_start {
-                    EvalFrameBound::UnboundedPreceding => 0,
-                    EvalFrameBound::PrecedingInt(k) => {
-                        (i as i128 - i128::from(k)).clamp(0, n as i128) as usize
-                    }
-                    EvalFrameBound::CurrentRow => i,
-                    EvalFrameBound::FollowingInt(k) => {
-                        (i as i128 + i128::from(k)).clamp(0, n as i128) as usize
-                    }
-                    _ => unreachable!(),
-                };
-                let e = match eval_end {
-                    EvalFrameBound::PrecedingInt(k) => {
-                        (i as i128 - i128::from(k) + 1).clamp(0, n as i128) as usize
-                    }
-                    EvalFrameBound::CurrentRow => i + 1,
-                    EvalFrameBound::FollowingInt(k) => {
-                        (i as i128 + i128::from(k) + 1).clamp(0, n as i128) as usize
-                    }
-                    EvalFrameBound::UnboundedFollowing => n,
-                    _ => unreachable!(),
-                };
-                frames.push((s, e.max(s)));
-            }
-        }
-        WindowFrameUnits::Groups => {
-            for &g in row_peer_group.iter().take(n) {
-                let sg = match eval_start {
-                    EvalFrameBound::UnboundedPreceding => 0,
-                    EvalFrameBound::PrecedingInt(k) => {
-                        (g as i128 - i128::from(k)).clamp(0, num_groups as i128) as usize
-                    }
-                    EvalFrameBound::CurrentRow => g,
-                    EvalFrameBound::FollowingInt(k) => {
-                        (g as i128 + i128::from(k)).clamp(0, num_groups as i128) as usize
-                    }
-                    _ => unreachable!(),
-                };
-                let eg = match eval_end {
-                    EvalFrameBound::PrecedingInt(k) => {
-                        (g as i128 - i128::from(k) + 1).clamp(0, num_groups as i128) as usize
-                    }
-                    EvalFrameBound::CurrentRow => g + 1,
-                    EvalFrameBound::FollowingInt(k) => {
-                        (g as i128 + i128::from(k) + 1).clamp(0, num_groups as i128) as usize
-                    }
-                    EvalFrameBound::UnboundedFollowing => num_groups,
-                    _ => unreachable!(),
-                };
-                if eg <= sg {
-                    let anchor = if sg < num_groups {
-                        peer_groups[sg].0
-                    } else {
-                        n
+    let mut frames: Vec<(usize, usize)> = Vec::new();
+    if !all_frame_independent {
+        frames.reserve(n);
+        match stage.units {
+            WindowFrameUnits::Rows => {
+                for i in 0..n {
+                    let s = match eval_start {
+                        EvalFrameBound::UnboundedPreceding => 0,
+                        EvalFrameBound::PrecedingInt(k) => {
+                            (i as i128 - i128::from(k)).clamp(0, n as i128) as usize
+                        }
+                        EvalFrameBound::CurrentRow => i,
+                        EvalFrameBound::FollowingInt(k) => {
+                            (i as i128 + i128::from(k)).clamp(0, n as i128) as usize
+                        }
+                        _ => unreachable!(),
                     };
-                    frames.push((anchor, anchor));
-                } else {
-                    frames.push((peer_groups[sg].0, peer_groups[eg - 1].1));
+                    let e = match eval_end {
+                        EvalFrameBound::PrecedingInt(k) => {
+                            (i as i128 - i128::from(k) + 1).clamp(0, n as i128) as usize
+                        }
+                        EvalFrameBound::CurrentRow => i + 1,
+                        EvalFrameBound::FollowingInt(k) => {
+                            (i as i128 + i128::from(k) + 1).clamp(0, n as i128) as usize
+                        }
+                        EvalFrameBound::UnboundedFollowing => n,
+                        _ => unreachable!(),
+                    };
+                    frames.push((s, e.max(s)));
                 }
             }
-        }
-        WindowFrameUnits::Range => {
-            let mut cur_sg = 0usize;
-            let mut cur_eg = 0usize;
-            for g in 0..num_groups {
-                let curr_row_idx = peer_groups[g].0;
-                let sg = match &eval_start {
-                    EvalFrameBound::UnboundedPreceding => 0,
-                    EvalFrameBound::CurrentRow => g,
-                    EvalFrameBound::PrecedingNum(off) => {
-                        let om = &order_metas[0];
-                        let curr_v = part_keys.order_val(curr_row_idx, 0);
-                        while cur_sg < num_groups {
-                            let cand_v = part_keys.order_val(peer_groups[cur_sg].0, 0);
-                            if window_code_range_test(
-                                RangeTestOp::Ge,
-                                cand_v,
-                                off,
-                                curr_v,
-                                om,
-                                ctx.collations,
-                                enc,
-                            )? {
-                                break;
-                            }
-                            cur_sg += 1;
+            WindowFrameUnits::Groups => {
+                for &g in row_peer_group.iter().take(n) {
+                    let sg = match eval_start {
+                        EvalFrameBound::UnboundedPreceding => 0,
+                        EvalFrameBound::PrecedingInt(k) => {
+                            (g as i128 - i128::from(k)).clamp(0, num_groups as i128) as usize
                         }
-                        cur_sg
-                    }
-                    EvalFrameBound::FollowingNum(off) => {
-                        let om = &order_metas[0];
-                        let curr_v = part_keys.order_val(curr_row_idx, 0);
-                        while cur_sg < num_groups {
-                            let cand_v = part_keys.order_val(peer_groups[cur_sg].0, 0);
-                            if window_code_range_test(
-                                RangeTestOp::Le,
-                                curr_v,
-                                off,
-                                cand_v,
-                                om,
-                                ctx.collations,
-                                enc,
-                            )? {
-                                break;
-                            }
-                            cur_sg += 1;
+                        EvalFrameBound::CurrentRow => g,
+                        EvalFrameBound::FollowingInt(k) => {
+                            (g as i128 + i128::from(k)).clamp(0, num_groups as i128) as usize
                         }
-                        cur_sg
-                    }
-                    _ => unreachable!(),
-                };
-                let eg = match &eval_end {
-                    EvalFrameBound::CurrentRow => g + 1,
-                    EvalFrameBound::UnboundedFollowing => num_groups,
-                    EvalFrameBound::PrecedingNum(off) => {
-                        let om = &order_metas[0];
-                        let curr_v = part_keys.order_val(curr_row_idx, 0);
-                        while cur_eg < num_groups {
-                            let cand_v = part_keys.order_val(peer_groups[cur_eg].0, 0);
-                            if window_code_range_test(
-                                RangeTestOp::Gt,
-                                cand_v,
-                                off,
-                                curr_v,
-                                om,
-                                ctx.collations,
-                                enc,
-                            )? {
-                                break;
-                            }
-                            cur_eg += 1;
-                        }
-                        cur_eg
-                    }
-                    EvalFrameBound::FollowingNum(off) => {
-                        let om = &order_metas[0];
-                        let curr_v = part_keys.order_val(curr_row_idx, 0);
-                        while cur_eg < num_groups {
-                            let cand_v = part_keys.order_val(peer_groups[cur_eg].0, 0);
-                            if !window_code_range_test(
-                                RangeTestOp::Ge,
-                                curr_v,
-                                off,
-                                cand_v,
-                                om,
-                                ctx.collations,
-                                enc,
-                            )? {
-                                break;
-                            }
-                            cur_eg += 1;
-                        }
-                        cur_eg
-                    }
-                    _ => unreachable!(),
-                };
-                let frame_pair = if eg <= sg {
-                    let anchor = if sg < num_groups {
-                        peer_groups[sg].0
-                    } else {
-                        n
+                        _ => unreachable!(),
                     };
-                    (anchor, anchor)
-                } else {
-                    (peer_groups[sg].0, peer_groups[eg - 1].1)
-                };
-                for _ in peer_groups[g].0..peer_groups[g].1 {
-                    frames.push(frame_pair);
+                    let eg = match eval_end {
+                        EvalFrameBound::PrecedingInt(k) => {
+                            (g as i128 - i128::from(k) + 1).clamp(0, num_groups as i128) as usize
+                        }
+                        EvalFrameBound::CurrentRow => g + 1,
+                        EvalFrameBound::FollowingInt(k) => {
+                            (g as i128 + i128::from(k) + 1).clamp(0, num_groups as i128) as usize
+                        }
+                        EvalFrameBound::UnboundedFollowing => num_groups,
+                        _ => unreachable!(),
+                    };
+                    if eg <= sg {
+                        let anchor = if sg < num_groups {
+                            peer_groups[sg].0
+                        } else {
+                            n
+                        };
+                        frames.push((anchor, anchor));
+                    } else {
+                        frames.push((peer_groups[sg].0, peer_groups[eg - 1].1));
+                    }
+                }
+            }
+            WindowFrameUnits::Range => {
+                let mut cur_sg = 0usize;
+                let mut cur_eg = 0usize;
+                for g in 0..num_groups {
+                    let curr_row_idx = peer_groups[g].0;
+                    let sg = match &eval_start {
+                        EvalFrameBound::UnboundedPreceding => 0,
+                        EvalFrameBound::CurrentRow => g,
+                        EvalFrameBound::PrecedingNum(off) => {
+                            let om = &order_metas[0];
+                            let curr_v = part_keys.order_val(curr_row_idx, 0);
+                            while cur_sg < num_groups {
+                                let cand_v = part_keys.order_val(peer_groups[cur_sg].0, 0);
+                                if window_code_range_test(
+                                    RangeTestOp::Ge,
+                                    cand_v,
+                                    off,
+                                    curr_v,
+                                    om,
+                                    ctx.collations,
+                                    enc,
+                                )? {
+                                    break;
+                                }
+                                cur_sg += 1;
+                            }
+                            cur_sg
+                        }
+                        EvalFrameBound::FollowingNum(off) => {
+                            let om = &order_metas[0];
+                            let curr_v = part_keys.order_val(curr_row_idx, 0);
+                            while cur_sg < num_groups {
+                                let cand_v = part_keys.order_val(peer_groups[cur_sg].0, 0);
+                                if window_code_range_test(
+                                    RangeTestOp::Le,
+                                    curr_v,
+                                    off,
+                                    cand_v,
+                                    om,
+                                    ctx.collations,
+                                    enc,
+                                )? {
+                                    break;
+                                }
+                                cur_sg += 1;
+                            }
+                            cur_sg
+                        }
+                        _ => unreachable!(),
+                    };
+                    let eg = match &eval_end {
+                        EvalFrameBound::CurrentRow => g + 1,
+                        EvalFrameBound::UnboundedFollowing => num_groups,
+                        EvalFrameBound::PrecedingNum(off) => {
+                            let om = &order_metas[0];
+                            let curr_v = part_keys.order_val(curr_row_idx, 0);
+                            while cur_eg < num_groups {
+                                let cand_v = part_keys.order_val(peer_groups[cur_eg].0, 0);
+                                if window_code_range_test(
+                                    RangeTestOp::Gt,
+                                    cand_v,
+                                    off,
+                                    curr_v,
+                                    om,
+                                    ctx.collations,
+                                    enc,
+                                )? {
+                                    break;
+                                }
+                                cur_eg += 1;
+                            }
+                            cur_eg
+                        }
+                        EvalFrameBound::FollowingNum(off) => {
+                            let om = &order_metas[0];
+                            let curr_v = part_keys.order_val(curr_row_idx, 0);
+                            while cur_eg < num_groups {
+                                let cand_v = part_keys.order_val(peer_groups[cur_eg].0, 0);
+                                if !window_code_range_test(
+                                    RangeTestOp::Ge,
+                                    curr_v,
+                                    off,
+                                    cand_v,
+                                    om,
+                                    ctx.collations,
+                                    enc,
+                                )? {
+                                    break;
+                                }
+                                cur_eg += 1;
+                            }
+                            cur_eg
+                        }
+                        _ => unreachable!(),
+                    };
+                    let frame_pair = if eg <= sg {
+                        let anchor = if sg < num_groups {
+                            peer_groups[sg].0
+                        } else {
+                            n
+                        };
+                        (anchor, anchor)
+                    } else {
+                        (peer_groups[sg].0, peer_groups[eg - 1].1)
+                    };
+                    for _ in peer_groups[g].0..peer_groups[g].1 {
+                        frames.push(frame_pair);
+                    }
                 }
             }
         }

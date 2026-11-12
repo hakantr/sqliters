@@ -1379,6 +1379,37 @@ impl Btree {
             }
         };
 
+        if top.pgno >= 2 {
+            let enc = self.encoding();
+            let usable = self.pager.usable_size();
+            let raw = self.pager.read_page(top.pgno)?;
+            if raw.first().copied() == Some(crate::pax::PAX_TABLE_LEAF_BYTE) {
+                let view = crate::pax::PaxTableLeafView::new(top.pgno, usable, raw)?;
+                if top.cell_idx >= view.len() {
+                    return Err(SqliteError::corrupt(
+                        "PAX table cursor cell_idx out of bounds",
+                    ));
+                }
+                return match pools {
+                    Some((texts, blobs)) => {
+                        view.read_value_pooled(col_idx, top.cell_idx, texts, blobs)
+                    }
+                    None => view.read_value(col_idx, top.cell_idx),
+                };
+            }
+            if raw.first().copied() == Some(crate::pax::PAX_INDEX_LEAF_BYTE) {
+                let view = crate::pax::PaxIndexLeafView::new(top.pgno, usable, raw)?;
+                if top.cell_idx >= view.len() {
+                    return Err(SqliteError::corrupt(
+                        "PAX index cursor cell_idx out of bounds",
+                    ));
+                }
+                return Ok(view
+                    .raw_field_at(top.cell_idx, col_idx)
+                    .map(|rf| rf.to_owned_value(enc)));
+            }
+        }
+
         if col_idx < INLINE_CACHED_COLS {
             let enc = self.encoding();
             let usable = self.pager.usable_size();
@@ -1615,6 +1646,26 @@ impl Btree {
         let usable = self.pager.usable_size();
         let (total_len, local_copy, ovfl) = {
             let raw = self.pager.read_page(top.pgno)?;
+            if top.pgno >= 2 && raw.first().copied() == Some(crate::pax::PAX_TABLE_LEAF_BYTE) {
+                let view = crate::pax::PaxTableLeafView::new(top.pgno, usable, raw)?;
+                if top.cell_idx >= view.len() {
+                    return Err(SqliteError::corrupt(
+                        "PAX table cursor cell_idx out of bounds",
+                    ));
+                }
+                let mut out = Vec::new();
+                view.encode_row_record_into(top.cell_idx, &mut out)?;
+                return Ok(out);
+            }
+            if top.pgno >= 2 && raw.first().copied() == Some(crate::pax::PAX_INDEX_LEAF_BYTE) {
+                let view = crate::pax::PaxIndexLeafView::new(top.pgno, usable, raw)?;
+                if top.cell_idx >= view.len() {
+                    return Err(SqliteError::corrupt(
+                        "PAX index cursor cell_idx out of bounds",
+                    ));
+                }
+                return Ok(view.encode_row_vec(top.cell_idx));
+            }
             let (ptype, n_cell, _) = raw_page_header(top.pgno, usable, raw)?;
             match ptype {
                 BtreePageType::TableLeaf => {
@@ -1739,6 +1790,31 @@ impl Btree {
 
         let plan = {
             let raw = self.pager.read_page(pgno)?;
+            if pgno >= 2 && raw.first().copied() == Some(crate::pax::PAX_TABLE_LEAF_BYTE) {
+                let view = crate::pax::PaxTableLeafView::new(pgno, usable, raw)?;
+                if cell_idx >= view.len() {
+                    return Err(SqliteError::corrupt(
+                        "PAX table cursor cell_idx out of bounds",
+                    ));
+                }
+                if view.n_cols() == 0 {
+                    return Ok(None);
+                }
+                let want = target_col.unwrap_or_else(|| view.n_cols() - 1);
+                return view.read_value(want, cell_idx);
+            }
+            if pgno >= 2 && raw.first().copied() == Some(crate::pax::PAX_INDEX_LEAF_BYTE) {
+                let view = crate::pax::PaxIndexLeafView::new(pgno, usable, raw)?;
+                if cell_idx >= view.len() {
+                    return Err(SqliteError::corrupt(
+                        "PAX index cursor cell_idx out of bounds",
+                    ));
+                }
+                let want = target_col.unwrap_or_else(|| usize::from(view.n_keys()));
+                return Ok(view
+                    .raw_field_at(cell_idx, want)
+                    .map(|rf| rf.to_owned_value(enc)));
+            }
             let (ptype, n_cell, _) = raw_page_header(pgno, usable, raw)?;
             let (total_len, local_slice, ovfl) = match ptype {
                 BtreePageType::TableLeaf => {
@@ -1933,6 +2009,15 @@ impl Btree {
 
         let spilled = {
             let raw = self.pager.read_page(pgno)?;
+            if pgno >= 2 && raw.first().copied() == Some(crate::pax::PAX_INDEX_LEAF_BYTE) {
+                let view = crate::pax::PaxIndexLeafView::new(pgno, usable, raw)?;
+                if cell_idx >= view.len() {
+                    return Err(SqliteError::corrupt(
+                        "PAX index cursor cell_idx out of bounds",
+                    ));
+                }
+                return view.compare_to_values(cell_idx, rhs_values, orders, enc);
+            }
             let (ptype, n_cell, _) = raw_page_header(pgno, usable, raw)?;
             let cell: RawIndexCell<'_> = match ptype {
                 BtreePageType::IndexLeaf => {

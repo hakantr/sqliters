@@ -17,7 +17,7 @@ pub use bitvec::Bitvec;
 pub use error::{ConflictResolutionEffect, ErrorCode, Result, SqliteError, extended};
 pub use json::{
     CompiledJsonArrowPath, FastJsonIntOut, append_runtime_value_json_elem, eval_jsonb_value_into,
-    parse_json_text_to_jsonb, parse_json_text_to_jsonb_into,
+    is_p3v2_jsonb, parse_json_text_to_jsonb, parse_json_text_to_jsonb_into,
 };
 pub use limits::*;
 pub use record::{
@@ -47,6 +47,71 @@ pub use vtab_api::{
     VTabHostContext, VTabIndexInfo, VTabOrderBy, VTabRiskFlags, VTabUpdateOperation, VirtualCursor,
     VirtualTable, VirtualTableModule,
 };
+
+static LEGACY_FORMAT3_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+std::thread_local! {
+    static LEGACY_FORMAT3_TLS_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns `true` only when legacy Format-3 output mode has been explicitly requested via
+/// `SQLITERS_LEGACY_FORMAT3=1` or an active [`LegacyFormat3Guard`] (e.g. cross-engine C CLI tests).
+/// By default (`false`), all newly created databases and `JSONB` documents use `P3v2`.
+#[inline(always)]
+pub fn legacy_format3_mode() -> bool {
+    let state = LEGACY_FORMAT3_STATE.load(std::sync::atomic::Ordering::Relaxed);
+    if state == 1 {
+        return false;
+    }
+    legacy_format3_mode_slow(state)
+}
+
+#[cold]
+#[inline(never)]
+fn legacy_format3_mode_slow(state: u8) -> bool {
+    match state {
+        0 => {
+            let env_on = std::env::var_os("SQLITERS_LEGACY_FORMAT3").is_some_and(|v| v == "1");
+            let next = if env_on { 2 } else { 1 };
+            let _ = LEGACY_FORMAT3_STATE.compare_exchange(
+                0,
+                next,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            if env_on {
+                true
+            } else {
+                LEGACY_FORMAT3_TLS_DEPTH.with(|c| c.get() > 0)
+            }
+        }
+        2 => true,
+        _ => {
+            std::env::var_os("SQLITERS_LEGACY_FORMAT3").is_some_and(|v| v == "1")
+                || LEGACY_FORMAT3_TLS_DEPTH.with(|c| c.get() > 0)
+        }
+    }
+}
+
+/// Scoped thread-local RAII guard enabling legacy Format-3 output for cross-engine C SQLite CLI
+/// interoperability tests without requiring `unsafe` process environment mutation.
+pub struct LegacyFormat3Guard {
+    _private: (),
+}
+
+impl LegacyFormat3Guard {
+    pub fn enter() -> Self {
+        LEGACY_FORMAT3_STATE.store(3, std::sync::atomic::Ordering::Relaxed);
+        LEGACY_FORMAT3_TLS_DEPTH.with(|c| c.set(c.get().saturating_add(1)));
+        Self { _private: () }
+    }
+}
+
+impl Drop for LegacyFormat3Guard {
+    fn drop(&mut self) {
+        LEGACY_FORMAT3_TLS_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
 
 #[cfg(test)]
 mod tests {

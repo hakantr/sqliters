@@ -27,8 +27,8 @@ impl BtreePageType {
         match b {
             0x02 => Ok(Self::IndexInterior),
             0x05 => Ok(Self::TableInterior),
-            0x0a => Ok(Self::IndexLeaf),
-            0x0d => Ok(Self::TableLeaf),
+            0x0a | 0x2a => Ok(Self::IndexLeaf),
+            0x0d | 0x2d => Ok(Self::TableLeaf),
             other => Err(SqliteError::corrupt(format!(
                 "invalid btree page flags byte: {other:#04x}"
             ))),
@@ -265,6 +265,26 @@ impl ParsedPage {
             ));
         }
         let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+        if pgno == 1
+            && matches!(
+                raw[hdr_off],
+                crate::pax::PAX_TABLE_LEAF_BYTE | crate::pax::PAX_INDEX_LEAF_BYTE
+            )
+        {
+            return Err(SqliteError::corrupt(
+                "PAX leaf page flags disallowed on Page 1",
+            ));
+        }
+        if pgno >= 2 && raw[0] == crate::pax::PAX_TABLE_LEAF_BYTE {
+            return Ok(Self::TableLeaf {
+                cells: crate::pax::pax_table_leaf_to_cells(pgno, usable_size, raw)?,
+            });
+        }
+        if pgno >= 2 && raw[0] == crate::pax::PAX_INDEX_LEAF_BYTE {
+            return Ok(Self::IndexLeaf {
+                cells: crate::pax::pax_index_leaf_to_cells(pgno, usable_size, raw)?,
+            });
+        }
         let page_type = BtreePageType::from_byte(raw[hdr_off])?;
         let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
         let hdr_size = page_type.header_size();
@@ -536,6 +556,16 @@ pub fn peek_page_type(pgno: Pgno, usable_size: u32, raw: &[u8]) -> Result<BtreeP
             "raw page buffer smaller than usable_size",
         ));
     }
+    if pgno == 1
+        && matches!(
+            raw[hdr_off],
+            crate::pax::PAX_TABLE_LEAF_BYTE | crate::pax::PAX_INDEX_LEAF_BYTE
+        )
+    {
+        return Err(SqliteError::corrupt(
+            "PAX leaf page flags disallowed on Page 1",
+        ));
+    }
     BtreePageType::from_byte(raw[hdr_off])
 }
 
@@ -698,6 +728,9 @@ pub fn table_interior_right_child(pgno: Pgno, usable_size: u32, raw: &[u8]) -> R
 
 /// Returns the maximum `rowid` stored on a raw `TableLeaf` (`0x0d`) page without parsing other cells.
 pub fn last_table_leaf_rowid(pgno: Pgno, usable_size: u32, raw: &[u8]) -> Result<Option<i64>> {
+    if pgno >= 2 && raw.first().copied() == Some(crate::pax::PAX_TABLE_LEAF_BYTE) {
+        return Ok(crate::pax::PaxTableLeafView::new(pgno, usable_size, raw)?.last_rowid());
+    }
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
     let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
@@ -731,6 +764,17 @@ pub fn seek_table_leaf_cell(
     raw: &[u8],
     rowid: i64,
 ) -> Result<Option<(u32, Vec<u8>, Option<Pgno>)>> {
+    if pgno >= 2 && raw.first().copied() == Some(crate::pax::PAX_TABLE_LEAF_BYTE) {
+        let view = crate::pax::PaxTableLeafView::new(pgno, usable_size, raw)?;
+        return match view.binary_search_rowid(rowid) {
+            Ok(idx) => {
+                let mut buf = Vec::new();
+                view.encode_row_record_into(idx, &mut buf)?;
+                Ok(Some((buf.len() as u32, buf, None)))
+            }
+            Err(_) => Ok(None),
+        };
+    }
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
     let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
@@ -970,6 +1014,14 @@ pub fn defragment_raw_leaf_in_place(pgno: Pgno, usable_size: u32, raw: &mut [u8]
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
     if raw.len() < usable || hdr_off + 8 > usable {
         return Err(SqliteError::corrupt("truncated leaf page in defragment"));
+    }
+    if matches!(
+        raw[hdr_off],
+        crate::pax::PAX_TABLE_LEAF_BYTE | crate::pax::PAX_INDEX_LEAF_BYTE
+    ) {
+        return Err(SqliteError::corrupt(
+            "defragment_raw_leaf called on PAX leaf",
+        ));
     }
     let ptype = BtreePageType::from_byte(raw[hdr_off])?;
     let is_table_leaf = match ptype {
@@ -2618,6 +2670,24 @@ pub fn raw_page_header(
             "truncated btree page header on page {pgno}"
         )));
     }
+    if pgno == 1
+        && matches!(
+            raw[hdr_off],
+            crate::pax::PAX_TABLE_LEAF_BYTE | crate::pax::PAX_INDEX_LEAF_BYTE
+        )
+    {
+        return Err(SqliteError::corrupt(
+            "PAX leaf page flags disallowed on Page 1",
+        ));
+    }
+    if pgno >= 2 && raw[0] == crate::pax::PAX_TABLE_LEAF_BYTE {
+        let view = crate::pax::PaxTableLeafView::new(pgno, usable_size, raw)?;
+        return Ok((BtreePageType::TableLeaf, view.len(), 0));
+    }
+    if pgno >= 2 && raw[0] == crate::pax::PAX_INDEX_LEAF_BYTE {
+        let view = crate::pax::PaxIndexLeafView::new(pgno, usable_size, raw)?;
+        return Ok((BtreePageType::IndexLeaf, view.len(), 0));
+    }
     let page_type = BtreePageType::from_byte(raw[hdr_off])?;
     let hdr_size = page_type.header_size();
     if hdr_off + hdr_size > usable {
@@ -2692,6 +2762,16 @@ pub fn read_table_leaf_rowid(
     n_cell: usize,
     cell_idx: usize,
 ) -> Result<i64> {
+    if pgno >= 2 && raw.first().copied() == Some(crate::pax::PAX_TABLE_LEAF_BYTE) {
+        let view = crate::pax::PaxTableLeafView::new(pgno, usable_size, raw)?;
+        if cell_idx >= view.len() {
+            return Err(SqliteError::corrupt(format!(
+                "PAX table cell index {cell_idx} out of bounds ({}) on page {pgno}",
+                view.len()
+            )));
+        }
+        return Ok(view.rowid_at(cell_idx));
+    }
     let usable = usable_size as usize;
     let off = raw_cell_offset(pgno, usable_size, raw, 8, n_cell, cell_idx)?;
     let slice = &raw[off..usable];
@@ -2866,6 +2946,10 @@ pub fn binary_search_table_leaf(
     n_cell: usize,
     target_rowid: i64,
 ) -> Result<std::result::Result<usize, usize>> {
+    if pgno >= 2 && raw.first().copied() == Some(crate::pax::PAX_TABLE_LEAF_BYTE) {
+        return Ok(crate::pax::PaxTableLeafView::new(pgno, usable_size, raw)?
+            .binary_search_rowid(target_rowid));
+    }
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
     let ptr_base = hdr_off + 8;
@@ -2913,6 +2997,11 @@ pub fn binary_search_table_leaf_with_span(
     n_cell: usize,
     target_rowid: i64,
 ) -> Result<std::result::Result<(usize, Option<(u16, u16)>), usize>> {
+    if pgno >= 2 && raw.first().copied() == Some(crate::pax::PAX_TABLE_LEAF_BYTE) {
+        return Ok(crate::pax::PaxTableLeafView::new(pgno, usable_size, raw)?
+            .binary_search_rowid(target_rowid)
+            .map(|idx| (idx, None)));
+    }
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
     let ptr_base = hdr_off + 8;

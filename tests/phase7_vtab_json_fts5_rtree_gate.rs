@@ -175,7 +175,10 @@ fn ensure_sqliters_cli_binary() -> PathBuf {
         } else {
             "sqliters"
         });
-        if candidate.is_file() {
+        let is_fresh = std::fs::metadata(&candidate)
+            .and_then(|cm| Ok((cm.modified()?, std::fs::metadata(&cur_exe)?.modified()?)))
+            .is_ok_and(|(ct, et)| ct >= et);
+        if is_fresh {
             return candidate;
         }
     }
@@ -1149,6 +1152,7 @@ fn phase7_gate_3_cross_feature_vtab_backup_vacuum_security_jsonb_subtype_matrix(
     let bak_db = sandbox.path().join("p7_backup.db");
 
     {
+        let _legacy = sqliters_types::LegacyFormat3Guard::enter();
         let conn = Connection::open(&src_db).expect("open source db");
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -1411,6 +1415,7 @@ fn phase7_gate_4_cli_to_c_sqlite354_sequential_smoke_test() {
 ";
 
     let cli_out = Command::new(&sqliters_cli)
+        .env("SQLITERS_LEGACY_FORMAT3", "1")
         .arg(&tam_test_db)
         .arg(rust_cli_sql)
         .current_dir(sandbox.path())

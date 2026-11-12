@@ -5465,8 +5465,82 @@ fn exec_single_select_core_opts(
                                 != Ordering::Greater
                         });
                         if !already_sorted {
-                            win_items.sort_by(|ia, ib| {
-                                cmp_ob(read_slot_val(ia, ob_slot), read_slot_val(ib, ob_slot))
+                            // Sort a compact index array rather than swapping 200-byte `WindowExecItem`s!
+                            let n_items = win_items.len();
+                            let mut int_perm: Vec<(i64, u32)> = Vec::with_capacity(n_items);
+                            let mut all_int = true;
+                            for (idx, item) in win_items.iter().enumerate() {
+                                if let Value::Integer(iv) = read_slot_val(item, ob_slot) {
+                                    int_perm.push((*iv, idx as u32));
+                                } else {
+                                    all_int = false;
+                                    break;
+                                }
+                            }
+                            let sorted_indices: Vec<u32> = if all_int {
+                                if ob_spec.desc {
+                                    int_perm.sort_unstable_by_key(|&(iv, idx)| {
+                                        (std::cmp::Reverse(iv), idx)
+                                    });
+                                } else {
+                                    int_perm.sort_unstable_by_key(|&(iv, idx)| (iv, idx));
+                                }
+                                int_perm.into_iter().map(|(_, idx)| idx).collect()
+                            } else {
+                                drop(int_perm);
+                                let mut perm: Vec<u32> = (0..n_items as u32).collect();
+                                perm.sort_by(|&ia, &ib| {
+                                    cmp_ob(
+                                        read_slot_val(&win_items[ia as usize], ob_slot),
+                                        read_slot_val(&win_items[ib as usize], ob_slot),
+                                    )
+                                });
+                                perm
+                            };
+
+                            let mut built_inline: Vec<InlineRow> = Vec::with_capacity(n_items);
+                            let mut all_fit = true;
+                            for (step_i, &raw_idx) in sorted_indices.iter().enumerate() {
+                                if (step_i & 63) == 0 {
+                                    ctx.step_tick()?;
+                                }
+                                let item = &win_items[raw_idx as usize];
+                                let mut cols = [InlineVal::Null; INLINE_ROW_COLS];
+                                for (pi, slot_opt) in
+                                    fast_proj_slots.iter().enumerate().take(n_proj)
+                                {
+                                    let v = read_slot_val(item, slot_opt.unwrap());
+                                    if let Some(iv) = InlineVal::try_from_value(v) {
+                                        cols[pi] = iv;
+                                    } else {
+                                        all_fit = false;
+                                        break;
+                                    }
+                                }
+                                if !all_fit {
+                                    break;
+                                }
+                                built_inline.push(InlineRow::from_raw_parts(n_proj as u8, cols));
+                            }
+                            if all_fit {
+                                *inline_out.unwrap() = built_inline;
+                                return Ok(QueryOutput {
+                                    column_names: col_names,
+                                    rows: Vec::new(),
+                                });
+                            }
+                            let mut out_rows = Vec::with_capacity(n_items);
+                            for &raw_idx in &sorted_indices {
+                                let item = &win_items[raw_idx as usize];
+                                let mut r = Vec::with_capacity(n_proj);
+                                for slot_opt in fast_proj_slots.iter().take(n_proj) {
+                                    r.push(read_slot_val(item, slot_opt.unwrap()).clone());
+                                }
+                                out_rows.push(r);
+                            }
+                            return Ok(QueryOutput {
+                                column_names: col_names,
+                                rows: out_rows,
                             });
                         }
                     }
@@ -9753,15 +9827,43 @@ fn eval_table_or_subquery(
 
                 let decode_selective_row =
                     |rowid: i64, payload: &[u8], db_enc: TextEncoding| -> Result<EvalRow> {
-                        let mut raw_fields = [sqliters_types::RawField::Null; 64];
+                        let n_cols = tbl.columns.len();
+                        let mut raw_small = [sqliters_types::RawField::Null; 8];
+                        let mut raw_large;
                         let parsed_cnt = match max_needed_phys_col {
-                            Some(max_ci) => sqliters_types::parse_raw_record_prefix(
+                            Some(max_ci) if max_ci < 8 => sqliters_types::parse_raw_record_prefix(
                                 payload,
-                                &mut raw_fields[..=max_ci],
+                                &mut raw_small[..=max_ci],
                             )?,
+                            Some(max_ci) => {
+                                raw_large = [sqliters_types::RawField::Null; 64];
+                                let cnt = sqliters_types::parse_raw_record_prefix(
+                                    payload,
+                                    &mut raw_large[..=max_ci],
+                                )?;
+                                let mut vals = Vec::with_capacity(n_cols + 1);
+                                for ci in 0..n_cols {
+                                    if tbl.rowid_alias_col == Some(ci) {
+                                        vals.push(Value::Integer(rowid));
+                                    } else if (col_mask & (1u64 << ci)) == 0 {
+                                        vals.push(Value::Null);
+                                    } else if ci < cnt {
+                                        let mut pv = raw_large[ci].to_owned_value(db_enc);
+                                        if tbl.columns[ci].affinity == TypeAffinity::Real
+                                            && let Value::Integer(iv) = pv
+                                        {
+                                            pv = Value::real(iv as f64);
+                                        }
+                                        vals.push(pv);
+                                    } else {
+                                        vals.push(default_vals[ci].clone());
+                                    }
+                                }
+                                vals.push(Value::Integer(rowid));
+                                return Ok(EvalRow::new(Rc::clone(&shared_cols), vals));
+                            }
                             None => 0,
                         };
-                        let n_cols = tbl.columns.len();
                         let mut vals = Vec::with_capacity(n_cols + 1);
                         for ci in 0..n_cols {
                             if tbl.rowid_alias_col == Some(ci) {
@@ -9769,7 +9871,7 @@ fn eval_table_or_subquery(
                             } else if (col_mask & (1u64 << ci)) == 0 {
                                 vals.push(Value::Null);
                             } else if ci < parsed_cnt {
-                                let mut pv = raw_fields[ci].to_owned_value(db_enc);
+                                let mut pv = raw_small[ci].to_owned_value(db_enc);
                                 if tbl.columns[ci].affinity == TypeAffinity::Real
                                     && let Value::Integer(iv) = pv
                                 {
@@ -9778,6 +9880,33 @@ fn eval_table_or_subquery(
                                 vals.push(pv);
                             } else {
                                 vals.push(default_vals[ci].clone());
+                            }
+                        }
+                        vals.push(Value::Integer(rowid));
+                        Ok(EvalRow::new(Rc::clone(&shared_cols), vals))
+                    };
+
+                let decode_selective_pax_row =
+                    |view: &sqliters_btree::PaxTableLeafView<'_>, r: usize| -> Result<EvalRow> {
+                        let rowid = view.rowid_at(r);
+                        let n_cols = tbl.columns.len();
+                        let leaf_cols = view.n_cols();
+                        let mut vals = Vec::with_capacity(n_cols + 1);
+                        for (ci, def_val) in default_vals.iter().enumerate().take(n_cols) {
+                            if tbl.rowid_alias_col == Some(ci) {
+                                vals.push(Value::Integer(rowid));
+                            } else if (col_mask & (1u64 << ci)) == 0 {
+                                vals.push(Value::Null);
+                            } else if ci < leaf_cols {
+                                let mut pv = view.read_value(ci, r)?.unwrap_or(Value::Null);
+                                if tbl.columns[ci].affinity == TypeAffinity::Real
+                                    && let Value::Integer(iv) = pv
+                                {
+                                    pv = Value::real(iv as f64);
+                                }
+                                vals.push(pv);
+                            } else {
+                                vals.push(def_val.clone());
                             }
                         }
                         vals.push(Value::Integer(rowid));
@@ -9818,11 +9947,11 @@ fn eval_table_or_subquery(
                                 let mut out = Vec::new();
                                 if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree
                                 {
-                                    bt.scan_table_range_raw_cells(
+                                    bt.scan_table_range_morsels(
                                         tbl.root_pgno,
                                         None,
                                         None,
-                                        |rowid, payload| {
+                                        |item| {
                                             if interrupt_flag
                                                 .load(std::sync::atomic::Ordering::Relaxed)
                                             {
@@ -9831,17 +9960,40 @@ fn eval_table_or_subquery(
                                                     "interrupted",
                                                 ));
                                             }
-                                            out.push(decode_selective_row(rowid, payload, db_enc)?);
-                                            Ok(std::ops::ControlFlow::Continue(()))
+                                            match item {
+                                                sqliters_btree::TableScanMorselItem::PaxLeaf {
+                                                    view,
+                                                    start,
+                                                    end,
+                                                } => {
+                                                    out.reserve(end - start);
+                                                    for r in start..end {
+                                                        out.push(decode_selective_pax_row(
+                                                            &view, r,
+                                                        )?);
+                                                    }
+                                                }
+                                                sqliters_btree::TableScanMorselItem::RawRow {
+                                                    rowid,
+                                                    payload,
+                                                } => {
+                                                    out.push(decode_selective_row(
+                                                        rowid, payload, db_enc,
+                                                    )?);
+                                                }
+                                            }
+                                            Ok(true)
                                         },
                                     )?;
                                 }
                                 return Ok(out);
                             }
                             AccessPlan::RowidRange { lower, upper } => {
+                                let mut lo_is_exact_int = false;
                                 let low_bound = if let Some(lb) = lower {
                                     let v =
                                         eval_expr(ctx, &lb.expr, params, outer_scopes, ctes, None)?;
+                                    lo_is_exact_int = matches!(v, Value::Integer(_));
                                     let Some(b) = eval_rowid_range_bound(v, lb.inclusive, true)
                                     else {
                                         return Ok(Vec::new());
@@ -9850,9 +10002,11 @@ fn eval_table_or_subquery(
                                 } else {
                                     None
                                 };
+                                let mut hi_is_exact_int = false;
                                 let high_bound = if let Some(ub) = upper {
                                     let v =
                                         eval_expr(ctx, &ub.expr, params, outer_scopes, ctes, None)?;
+                                    hi_is_exact_int = matches!(v, Value::Integer(_));
                                     let Some(b) = eval_rowid_range_bound(v, ub.inclusive, false)
                                     else {
                                         return Ok(Vec::new());
@@ -9861,14 +10015,56 @@ fn eval_table_or_subquery(
                                 } else {
                                     None
                                 };
+                                if outer_scopes.is_empty()
+                                    && lo_is_exact_int
+                                    && hi_is_exact_int
+                                    && let Some(wh) = where_hint
+                                    && let Expr::Between {
+                                        expr: bexpr,
+                                        negated: false,
+                                        low: blow,
+                                        high: bhigh,
+                                    } = wh
+                                    && matches!(blow.as_ref(), Expr::Bind(_) | Expr::Integer(_))
+                                    && matches!(bhigh.as_ref(), Expr::Bind(_) | Expr::Integer(_))
+                                    && let Expr::Column(cref) = bexpr.as_ref()
+                                    && cref.schema.is_none()
+                                    && (cref.table.is_none()
+                                        || cref.table.as_deref().is_some_and(|qt| {
+                                            shared_cols
+                                                .last()
+                                                .and_then(|sc| sc.table_alias.as_deref())
+                                                .is_some_and(|ta| ta.eq_ignore_ascii_case(qt))
+                                        }))
+                                {
+                                    let exact_rid_col = if let Some(rid_ci) = tbl.rowid_alias_col
+                                        && tbl.columns[rid_ci]
+                                            .name
+                                            .eq_ignore_ascii_case(&cref.column)
+                                    {
+                                        tbl.columns[rid_ci].collation == Collation::Binary
+                                            && tbl.columns[rid_ci].custom_collation.is_none()
+                                    } else {
+                                        (cref.column.eq_ignore_ascii_case("rowid")
+                                            || cref.column.eq_ignore_ascii_case("_rowid_")
+                                            || cref.column.eq_ignore_ascii_case("oid"))
+                                            && !tbl
+                                                .columns
+                                                .iter()
+                                                .any(|c| c.name.eq_ignore_ascii_case(&cref.column))
+                                    };
+                                    if exact_rid_col {
+                                        omitted_conjuncts.push(wh.clone());
+                                    }
+                                }
                                 let mut out = Vec::new();
                                 if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree
                                 {
-                                    bt.scan_table_range_raw_cells(
+                                    bt.scan_table_range_morsels(
                                         tbl.root_pgno,
                                         low_bound,
                                         high_bound,
-                                        |rowid, payload| {
+                                        |item| {
                                             if interrupt_flag
                                                 .load(std::sync::atomic::Ordering::Relaxed)
                                             {
@@ -9877,8 +10073,29 @@ fn eval_table_or_subquery(
                                                     "interrupted",
                                                 ));
                                             }
-                                            out.push(decode_selective_row(rowid, payload, db_enc)?);
-                                            Ok(std::ops::ControlFlow::Continue(()))
+                                            match item {
+                                                sqliters_btree::TableScanMorselItem::PaxLeaf {
+                                                    view,
+                                                    start,
+                                                    end,
+                                                } => {
+                                                    out.reserve(end - start);
+                                                    for r in start..end {
+                                                        out.push(decode_selective_pax_row(
+                                                            &view, r,
+                                                        )?);
+                                                    }
+                                                }
+                                                sqliters_btree::TableScanMorselItem::RawRow {
+                                                    rowid,
+                                                    payload,
+                                                } => {
+                                                    out.push(decode_selective_row(
+                                                        rowid, payload, db_enc,
+                                                    )?);
+                                                }
+                                            }
+                                            Ok(true)
                                         },
                                     )?;
                                 }
@@ -26343,18 +26560,362 @@ fn populate_index_btree(
                 })
         });
 
-    let (est_rows, est_arena) =
+    let (est_rows, est_arena, db_is_p3v2_utf8) =
         if let Some(bt) = ctx.db_set.slot(db_id).and_then(|s| s.btree.as_ref()) {
             let pages = bt.pager().page_count();
+            let is_p3v2 = bt.is_p3v2_utf8();
             if pages > 4 {
                 let r = (pages as usize).min(65_536) * 64;
-                (r, r * 16)
+                (r, r * 16, is_p3v2)
             } else {
-                (128, 4096)
+                (128, 4096, is_p3v2)
             }
         } else {
-            (1024, 16 * 1024)
+            (1024, 16 * 1024, false)
         };
+
+    // Fast `0x2a` PAX SoA covering index bulk-load path (`P3v2` 1-key or 2-key integer indexes):
+    // scans ONLY the indexed column vectors on `0x2d` PAX table leaves, sorts compact 8-byte
+    // packed `u64` keys in L2 cache when in range (or `PaxIndexEntry` when nulls/wide `i64`s exist),
+    // and bulk-loads `0x2a` leaves with zero Format-3 record encoding!
+    if can_fast_scan
+        && db_is_p3v2_utf8
+        && enc == TextEncoding::Utf8
+        && let Some(pax_n_keys) = sqliters_btree::orders_allow_pax_index(&orders)
+        && idx_schema.columns.iter().all(|ic| {
+            let aff = tbl.columns[ic.col_idx.unwrap()].affinity;
+            !matches!(aff, TypeAffinity::Real | TypeAffinity::Text)
+        })
+    {
+        const MIN_I40: i64 = -(1i64 << 39);
+        const MAX_I40: i64 = (1i64 << 39) - 1;
+
+        let c0 = idx_schema.columns[0].col_idx.unwrap();
+        let c0_ipk = tbl.rowid_alias_col == Some(c0);
+        let (c1, c1_ipk) = if pax_n_keys == 2 {
+            let ci = idx_schema.columns[1].col_idx.unwrap();
+            (ci, tbl.rowid_alias_col == Some(ci))
+        } else {
+            (0, false)
+        };
+        let max_raw_ci = match (c0_ipk, pax_n_keys == 2 && !c1_ipk) {
+            (true, false) => None,
+            (true, true) => Some(c1),
+            (false, false) => Some(c0),
+            (false, true) => Some(c0.max(c1)),
+        };
+
+        let unpack_packed =
+            |packed: &mut Vec<u64>, out: &mut Vec<sqliters_btree::PaxIndexEntry>| {
+                out.reserve(packed.len());
+                if pax_n_keys == 1 {
+                    for &p in packed.iter() {
+                        let k0 = ((p >> 24) as i64) + MIN_I40;
+                        let rid = (p & 0x00FF_FFFF) as i64;
+                        out.push(sqliters_btree::PaxIndexEntry {
+                            k0: Some(k0),
+                            k1: None,
+                            rid,
+                        });
+                    }
+                } else {
+                    for &p in packed.iter() {
+                        let k0 = ((p >> 48) as i64) - 32_768;
+                        let k1 = (((p >> 24) & 0x00FF_FFFF) as i64) - 8_388_608;
+                        let rid = (p & 0x00FF_FFFF) as i64;
+                        out.push(sqliters_btree::PaxIndexEntry {
+                            k0: Some(k0),
+                            k1: Some(k1),
+                            rid,
+                        });
+                    }
+                }
+                packed.clear();
+            };
+
+        let mut packed_u64: Vec<u64> = Vec::with_capacity(est_rows);
+        let mut pax_entries: Vec<sqliters_btree::PaxIndexEntry> = Vec::new();
+        let mut use_packed = true;
+        let mut all_pax_eligible = true;
+
+        let push_pax_row =
+            |k0_opt: Option<i64>,
+             k1_opt: Option<i64>,
+             rid: i64,
+             use_packed: &mut bool,
+             packed_u64: &mut Vec<u64>,
+             pax_entries: &mut Vec<sqliters_btree::PaxIndexEntry>| {
+                if *use_packed {
+                    if pax_n_keys == 1 {
+                        if let Some(k0) = k0_opt
+                            && (MIN_I40..=MAX_I40).contains(&k0)
+                            && (0..=0x00FF_FFFF).contains(&rid)
+                        {
+                            let u0 = (k0 - MIN_I40) as u64;
+                            packed_u64.push((u0 << 24) | (rid as u64));
+                            return;
+                        }
+                    } else if let (Some(k0), Some(k1)) = (k0_opt, k1_opt)
+                        && (-32_768..=32_767).contains(&k0)
+                        && (-8_388_608..=8_388_607).contains(&k1)
+                        && (0..=0x00FF_FFFF).contains(&rid)
+                    {
+                        let u0 = (k0 + 32_768) as u64;
+                        let u1 = (k1 + 8_388_608) as u64;
+                        packed_u64.push((u0 << 48) | (u1 << 24) | (rid as u64));
+                        return;
+                    }
+                    *use_packed = false;
+                    unpack_packed(packed_u64, pax_entries);
+                }
+                pax_entries.push(sqliters_btree::PaxIndexEntry {
+                    k0: k0_opt,
+                    k1: if pax_n_keys == 2 { k1_opt } else { None },
+                    rid,
+                });
+            };
+
+        if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
+            bt.scan_table_morsels(tbl.root_pgno, |item| match item {
+                sqliters_btree::TableScanMorselItem::PaxLeaf { view, start, end } => {
+                    let cnt = end - start;
+                    if pax_n_keys == 2
+                        && !c0_ipk
+                        && !c1_ipk
+                        && use_packed
+                        && let Some((b0, None)) = view.col_i32_le_bytes(c0, start, end)
+                        && let Some((b1, None)) = view.col_i32_le_bytes(c1, start, end)
+                    {
+                        let rbytes = view.rowids_le_bytes(start, end);
+                        packed_u64.reserve(cnt);
+                        for idx in 0..cnt {
+                            let k0 = i64::from(i32::from_le_bytes([
+                                b0[4 * idx],
+                                b0[4 * idx + 1],
+                                b0[4 * idx + 2],
+                                b0[4 * idx + 3],
+                            ]));
+                            let k1 = i64::from(i32::from_le_bytes([
+                                b1[4 * idx],
+                                b1[4 * idx + 1],
+                                b1[4 * idx + 2],
+                                b1[4 * idx + 3],
+                            ]));
+                            let rid = i64::from_le_bytes([
+                                rbytes[8 * idx],
+                                rbytes[8 * idx + 1],
+                                rbytes[8 * idx + 2],
+                                rbytes[8 * idx + 3],
+                                rbytes[8 * idx + 4],
+                                rbytes[8 * idx + 5],
+                                rbytes[8 * idx + 6],
+                                rbytes[8 * idx + 7],
+                            ]);
+                            push_pax_row(
+                                Some(k0),
+                                Some(k1),
+                                rid,
+                                &mut use_packed,
+                                &mut packed_u64,
+                                &mut pax_entries,
+                            );
+                        }
+                        return Ok(true);
+                    }
+                    if pax_n_keys == 1
+                        && !c0_ipk
+                        && use_packed
+                        && let Some((b0, None)) = view.col_i32_le_bytes(c0, start, end)
+                    {
+                        let rbytes = view.rowids_le_bytes(start, end);
+                        packed_u64.reserve(cnt);
+                        for idx in 0..cnt {
+                            let k0 = i64::from(i32::from_le_bytes([
+                                b0[4 * idx],
+                                b0[4 * idx + 1],
+                                b0[4 * idx + 2],
+                                b0[4 * idx + 3],
+                            ]));
+                            let rid = i64::from_le_bytes([
+                                rbytes[8 * idx],
+                                rbytes[8 * idx + 1],
+                                rbytes[8 * idx + 2],
+                                rbytes[8 * idx + 3],
+                                rbytes[8 * idx + 4],
+                                rbytes[8 * idx + 5],
+                                rbytes[8 * idx + 6],
+                                rbytes[8 * idx + 7],
+                            ]);
+                            push_pax_row(
+                                Some(k0),
+                                None,
+                                rid,
+                                &mut use_packed,
+                                &mut packed_u64,
+                                &mut pax_entries,
+                            );
+                        }
+                        return Ok(true);
+                    }
+
+                    for r in start..end {
+                        let rid = view.rowid_at(r);
+                        let k0_opt = if c0_ipk {
+                            Some(rid)
+                        } else {
+                            match view.read_raw_field(c0, r)? {
+                                None | Some(sqliters_types::RawField::Null) => None,
+                                Some(sqliters_types::RawField::Int(iv)) => Some(iv),
+                                _ => {
+                                    all_pax_eligible = false;
+                                    return Ok(false);
+                                }
+                            }
+                        };
+                        let k1_opt = if pax_n_keys == 2 {
+                            if c1_ipk {
+                                Some(rid)
+                            } else {
+                                match view.read_raw_field(c1, r)? {
+                                    None | Some(sqliters_types::RawField::Null) => None,
+                                    Some(sqliters_types::RawField::Int(iv)) => Some(iv),
+                                    _ => {
+                                        all_pax_eligible = false;
+                                        return Ok(false);
+                                    }
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        push_pax_row(
+                            k0_opt,
+                            k1_opt,
+                            rid,
+                            &mut use_packed,
+                            &mut packed_u64,
+                            &mut pax_entries,
+                        );
+                    }
+                    Ok(true)
+                }
+                sqliters_btree::TableScanMorselItem::RawRow { rowid, payload } => {
+                    let mut raw_fields = [sqliters_types::RawField::Null; 64];
+                    let parsed = match max_raw_ci {
+                        Some(m) if m < 64 => {
+                            sqliters_types::parse_raw_record_prefix(payload, &mut raw_fields[..=m])?
+                        }
+                        Some(_) => {
+                            all_pax_eligible = false;
+                            return Ok(false);
+                        }
+                        None => 0,
+                    };
+                    let k0_opt = if c0_ipk {
+                        Some(rowid)
+                    } else if c0 >= parsed {
+                        None
+                    } else {
+                        match raw_fields[c0] {
+                            sqliters_types::RawField::Null => None,
+                            sqliters_types::RawField::Int(iv) => Some(iv),
+                            _ => {
+                                all_pax_eligible = false;
+                                return Ok(false);
+                            }
+                        }
+                    };
+                    let k1_opt = if pax_n_keys == 2 {
+                        if c1_ipk {
+                            Some(rowid)
+                        } else if c1 >= parsed {
+                            None
+                        } else {
+                            match raw_fields[c1] {
+                                sqliters_types::RawField::Null => None,
+                                sqliters_types::RawField::Int(iv) => Some(iv),
+                                _ => {
+                                    all_pax_eligible = false;
+                                    return Ok(false);
+                                }
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    push_pax_row(
+                        k0_opt,
+                        k1_opt,
+                        rowid,
+                        &mut use_packed,
+                        &mut packed_u64,
+                        &mut pax_entries,
+                    );
+                    Ok(true)
+                }
+            })?;
+        }
+
+        if all_pax_eligible {
+            if use_packed {
+                if packed_u64.is_empty() {
+                    return Ok(());
+                }
+                if packed_u64.len() > 1 {
+                    packed_u64.sort_unstable();
+                }
+                if idx_schema.unique {
+                    for pair in packed_u64.windows(2) {
+                        if (pair[0] >> 24) == (pair[1] >> 24) {
+                            let ext_code = if idx_schema.origin == "pk" {
+                                extended::SQLITE_CONSTRAINT_PRIMARYKEY
+                            } else {
+                                extended::SQLITE_CONSTRAINT_UNIQUE
+                            };
+                            return Err(SqliteError::constraint(
+                                ext_code,
+                                format_unique_index_failure(tbl, idx_schema),
+                            ));
+                        }
+                    }
+                }
+                unpack_packed(&mut packed_u64, &mut pax_entries);
+            } else {
+                if pax_entries.is_empty() {
+                    return Ok(());
+                }
+                if pax_entries.len() > 1 {
+                    pax_entries.sort_unstable();
+                }
+                if idx_schema.unique {
+                    for pair in pax_entries.windows(2) {
+                        let a = &pair[0];
+                        let b = &pair[1];
+                        if a.k0.is_some()
+                            && (pax_n_keys == 1 || a.k1.is_some())
+                            && a.k0 == b.k0
+                            && a.k1 == b.k1
+                        {
+                            let ext_code = if idx_schema.origin == "pk" {
+                                extended::SQLITE_CONSTRAINT_PRIMARYKEY
+                            } else {
+                                extended::SQLITE_CONSTRAINT_UNIQUE
+                            };
+                            return Err(SqliteError::constraint(
+                                ext_code,
+                                format_unique_index_failure(tbl, idx_schema),
+                            ));
+                        }
+                    }
+                }
+            }
+            if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
+                bt.bulk_load_sorted_pax_index(idx_schema.root_pgno, pax_n_keys, &pax_entries)?;
+            }
+            return Ok(());
+        }
+    }
+
     let mut arena: Vec<u8> = Vec::with_capacity(est_arena);
     let mut descriptors: Vec<ArenaIndexEntry> = Vec::with_capacity(est_rows);
     let mut exact_bijective = false;
@@ -26526,7 +27087,261 @@ fn populate_index_btree(
         };
 
         if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
-            bt.scan_table_raw_cells(tbl.root_pgno, |rowid, raw_rec| {
+            bt.scan_table_morsels(tbl.root_pgno, |item| {
+                if let sqliters_btree::TableScanMorselItem::PaxLeaf { view, start, end } = item {
+                    for r in start..end {
+                        let rowid = view.rowid_at(r);
+                        let mut out_st = [0u64; 16];
+                        let mut out_src = [IdxFieldSrc::Empty; 16];
+                        let mut serial_bytes_len = 0usize;
+                        let mut body_len = 0usize;
+                        let mut col0_prefix: u64 = 0;
+                        let mut col_ints = [0i64; 2];
+                        let mut col_is_int = [false; 2];
+                        let mut col0_text_slice: Option<&[u8]> = None;
+
+                        for (k, &(ci, is_ipk, is_real)) in specs.iter().enumerate() {
+                            let (st, src) = if is_ipk {
+                                if k < 2 {
+                                    col_ints[k] = rowid;
+                                    col_is_int[k] = true;
+                                }
+                                if k == 0 && use_prefix_key && bij_kind == BijectiveKind::Disabled {
+                                    col0_prefix = f64_prefix_u64(rowid as f64);
+                                }
+                                encode_i64_inline(rowid)
+                            } else {
+                                match view.read_raw_field(ci, r)? {
+                                    None | Some(sqliters_types::RawField::Null) => {
+                                        (0, IdxFieldSrc::Empty)
+                                    }
+                                    Some(sqliters_types::RawField::Float(f)) => {
+                                        if f.is_nan() {
+                                            (0, IdxFieldSrc::Empty)
+                                        } else {
+                                            if k == 0
+                                                && use_prefix_key
+                                                && bij_kind == BijectiveKind::Disabled
+                                            {
+                                                col0_prefix = f64_prefix_u64(f);
+                                            }
+                                            let norm = if f == 0.0 { 0.0 } else { f };
+                                            (
+                                                7,
+                                                IdxFieldSrc::Inline8(
+                                                    norm.to_bits().to_be_bytes(),
+                                                    8,
+                                                ),
+                                            )
+                                        }
+                                    }
+                                    Some(sqliters_types::RawField::Int(iv)) => {
+                                        if !is_real && k < 2 {
+                                            col_ints[k] = iv;
+                                            col_is_int[k] = true;
+                                        }
+                                        if k == 0
+                                            && use_prefix_key
+                                            && bij_kind == BijectiveKind::Disabled
+                                        {
+                                            col0_prefix = f64_prefix_u64(iv as f64);
+                                        }
+                                        if is_real {
+                                            let f = if iv == 0 { 0.0 } else { iv as f64 };
+                                            (7, IdxFieldSrc::Inline8(f.to_bits().to_be_bytes(), 8))
+                                        } else {
+                                            encode_i64_inline(iv)
+                                        }
+                                    }
+                                    Some(sqliters_types::RawField::Text(b)) => {
+                                        if k == 0 {
+                                            col0_text_slice = Some(b);
+                                        }
+                                        if k == 0
+                                            && use_prefix_key
+                                            && bij_kind == BijectiveKind::Disabled
+                                        {
+                                            let mut p = 0u64;
+                                            for (bi, &byte) in b.iter().take(7).enumerate() {
+                                                p |= u64::from(byte) << (48 - bi * 8);
+                                            }
+                                            col0_prefix = (2u64 << 56) | p;
+                                        }
+                                        ((b.len() as u64) * 2 + 13, IdxFieldSrc::Slice(b))
+                                    }
+                                    Some(sqliters_types::RawField::Blob(b)) => {
+                                        if k == 0
+                                            && use_prefix_key
+                                            && bij_kind == BijectiveKind::Disabled
+                                        {
+                                            let mut p = 0u64;
+                                            for (bi, &byte) in b.iter().take(7).enumerate() {
+                                                p |= u64::from(byte) << (48 - bi * 8);
+                                            }
+                                            col0_prefix = (3u64 << 56) | p;
+                                        }
+                                        ((b.len() as u64) * 2 + 12, IdxFieldSrc::Slice(b))
+                                    }
+                                }
+                            };
+                            out_st[k] = st;
+                            out_src[k] = src;
+                            serial_bytes_len += sqliters_types::varint_len(st);
+                            body_len += match src {
+                                IdxFieldSrc::Empty => 0,
+                                IdxFieldSrc::Slice(s) => s.len(),
+                                IdxFieldSrc::Inline8(_, n) => n as usize,
+                            };
+                        }
+
+                        let (rid_st, rid_src) = encode_i64_inline(rowid);
+                        out_st[n_key] = rid_st;
+                        out_src[n_key] = rid_src;
+                        serial_bytes_len += sqliters_types::varint_len(rid_st);
+                        body_len += match rid_src {
+                            IdxFieldSrc::Empty => 0,
+                            IdxFieldSrc::Slice(s) => s.len(),
+                            IdxFieldSrc::Inline8(_, n) => n as usize,
+                        };
+
+                        let mut hdr_len = serial_bytes_len
+                            + sqliters_types::varint_len((serial_bytes_len + 1) as u64);
+                        if sqliters_types::varint_len(hdr_len as u64) + serial_bytes_len != hdr_len
+                        {
+                            hdr_len = serial_bytes_len
+                                + sqliters_types::varint_len((serial_bytes_len + 2) as u64);
+                        }
+
+                        let rec_total = hdr_len + body_len;
+                        let start_off = arena.len();
+                        let _ = start_off
+                            .checked_add(rec_total)
+                            .and_then(|e| u32::try_from(e).ok())
+                            .ok_or_else(|| {
+                                SqliteError::new(ErrorCode::TooBig, "index arena exceeds 4GiB")
+                            })?;
+                        arena.reserve(rec_total);
+                        sqliters_types::push_varint(&mut arena, hdr_len as u64);
+                        for &st in &out_st[..n_total] {
+                            sqliters_types::push_varint(&mut arena, st);
+                        }
+                        for src in &out_src[..n_total] {
+                            match src {
+                                IdxFieldSrc::Empty => {}
+                                IdxFieldSrc::Slice(s) => arena.extend_from_slice(s),
+                                IdxFieldSrc::Inline8(buf, n) => {
+                                    arena.extend_from_slice(&buf[..*n as usize])
+                                }
+                            }
+                        }
+
+                        if bij_kind != BijectiveKind::Disabled {
+                            const MIN_I40: i64 = -(1i64 << 39);
+                            const MAX_I40: i64 = (1i64 << 39) - 1;
+                            let bij_opt: Option<u64> = match bij_kind {
+                                BijectiveKind::Undecided1Col => {
+                                    if col_is_int[0]
+                                        && (MIN_I40..=MAX_I40).contains(&col_ints[0])
+                                        && (0..=0x00FF_FFFF).contains(&rowid)
+                                    {
+                                        bij_kind = BijectiveKind::Int1Col;
+                                        let u0 = (col_ints[0] - MIN_I40) as u64;
+                                        Some((u0 << 24) | (rowid as u64))
+                                    } else if let Some(tb) = col0_text_slice
+                                        && tb.len() <= 6
+                                        && (0..=0xFFFF).contains(&rowid)
+                                    {
+                                        bij_kind = BijectiveKind::FixedText1Col(tb.len());
+                                        let mut k64 = 0u64;
+                                        for (bi, &byte) in tb.iter().enumerate() {
+                                            k64 |= u64::from(byte) << (56 - bi * 8);
+                                        }
+                                        Some(k64 | (rowid as u64))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                BijectiveKind::Int1Col => {
+                                    if col_is_int[0]
+                                        && (MIN_I40..=MAX_I40).contains(&col_ints[0])
+                                        && (0..=0x00FF_FFFF).contains(&rowid)
+                                    {
+                                        let u0 = (col_ints[0] - MIN_I40) as u64;
+                                        Some((u0 << 24) | (rowid as u64))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                BijectiveKind::FixedText1Col(expected_len) => {
+                                    if let Some(tb) = col0_text_slice
+                                        && tb.len() == expected_len
+                                        && (0..=0xFFFF).contains(&rowid)
+                                    {
+                                        let mut k64 = 0u64;
+                                        for (bi, &byte) in tb.iter().enumerate() {
+                                            k64 |= u64::from(byte) << (56 - bi * 8);
+                                        }
+                                        Some(k64 | (rowid as u64))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                BijectiveKind::Int2Col => {
+                                    if col_is_int[0]
+                                        && col_is_int[1]
+                                        && (-32_768..=32_767).contains(&col_ints[0])
+                                        && (-8_388_608..=8_388_607).contains(&col_ints[1])
+                                        && (0..=0x00FF_FFFF).contains(&rowid)
+                                    {
+                                        let u0 = (col_ints[0] + 32_768) as u64;
+                                        let u1 = (col_ints[1] + 8_388_608) as u64;
+                                        Some((u0 << 48) | (u1 << 24) | (rowid as u64))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                BijectiveKind::Disabled => None,
+                            };
+
+                            if let Some(k64) = bij_opt {
+                                col0_prefix = k64;
+                            } else {
+                                bij_kind = BijectiveKind::Disabled;
+                                if use_prefix_key {
+                                    for prev in &mut descriptors {
+                                        let po = prev.off as usize;
+                                        let pl = prev.len as usize;
+                                        prev.prefix =
+                                            raw_record_col0_prefix_utf8(&arena[po..po + pl]);
+                                    }
+                                    col0_prefix = raw_record_col0_prefix_utf8(
+                                        &arena[start_off..start_off + rec_total],
+                                    );
+                                } else {
+                                    for prev in &mut descriptors {
+                                        prev.prefix = 0;
+                                    }
+                                    col0_prefix = 0;
+                                }
+                            }
+                        }
+
+                        descriptors.push(ArenaIndexEntry {
+                            prefix: col0_prefix,
+                            off: start_off as u32,
+                            len: rec_total as u32,
+                        });
+                    }
+                    return Ok(true);
+                }
+
+                let sqliters_btree::TableScanMorselItem::RawRow {
+                    rowid,
+                    payload: raw_rec,
+                } = item
+                else {
+                    unreachable!()
+                };
                 let mut rec_st = [0u64; 32];
                 let mut rec_off = [0usize; 32];
                 let mut rec_len = [0usize; 32];
@@ -26836,7 +27651,7 @@ fn populate_index_btree(
                     off: start as u32,
                     len: rec_total as u32,
                 });
-                Ok(())
+                Ok(true)
             })?;
             exact_bijective = matches!(
                 bij_kind,
@@ -33987,6 +34802,7 @@ fn build_vacuum_image(
         fhdr.application_id = orig_hdr.application_id;
         fhdr.text_encoding = orig_hdr.text_encoding;
         fhdr.schema_cookie = orig_hdr.schema_cookie.wrapping_add(1);
+        fhdr.is_p3v2 = orig_hdr.is_p3v2;
     }
 
     let (_, schema_name) = slot_encoding_and_name(ctx, src_db_id);

@@ -4275,7 +4275,10 @@ pub fn resolve_testfixture_binary() -> PathBuf {
                         parent
                     };
                     let candidate = profile_dir.join(bin_name);
-                    if candidate.exists() {
+                    let is_fresh = std::fs::metadata(&candidate)
+                        .and_then(|cm| Ok((cm.modified()?, std::fs::metadata(&exe)?.modified()?)))
+                        .is_ok_and(|(ct, et)| ct >= et);
+                    if is_fresh {
                         return candidate;
                     }
                     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());

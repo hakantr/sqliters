@@ -2033,6 +2033,27 @@ impl Pager {
         Ok(self.ensure_header_loaded()?.encoding())
     }
 
+    /// Returns whether this database uses the `P3v2` PAX storage format (`b"P3v2"` in header bytes `72..76`).
+    #[inline]
+    pub const fn is_p3v2(&self) -> bool {
+        self.header.is_p3v2
+    }
+
+    /// Returns the authoritative `P3v2` format flag, performing a brief locked header read if needed.
+    pub fn effective_is_p3v2(&mut self) -> Result<bool> {
+        Ok(self.ensure_header_loaded()?.is_p3v2)
+    }
+
+    /// Configures whether an uninitialized (`page_count == 0`) database will be initialized as `P3v2`
+    /// (`true`, default) or legacy Format-3 (`false`). No-op once `page_count > 0`.
+    pub fn set_p3v2(&mut self, enabled: bool) -> Result<()> {
+        let _ = self.ensure_header_loaded()?;
+        if self.page_count == 0 {
+            self.header.is_p3v2 = enabled;
+        }
+        Ok(())
+    }
+
     pub fn header_mut(&mut self) -> Result<&mut DatabaseHeader> {
         self.ensure_not_closed()?;
         if self.state != TransactionState::Write {

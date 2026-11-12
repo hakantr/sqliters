@@ -755,6 +755,7 @@ fn read_raw_page_1k(db_path: &Path, pgno: u32) -> [u8; 1024] {
 
 #[test]
 fn group17_sparse_1gib_rust_to_c_and_c_to_rust_parity() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     // --- Direction A: Rust extends DB across >1 GiB (`1_048_577`, `1_048_578`, `1_048_782`) ---
     {
         let guard = SparseDbGuard::new("rust_to_c");
@@ -937,6 +938,7 @@ fn group17_sparse_1gib_rust_to_c_and_c_to_rust_parity() {
 
 #[test]
 fn group36_root_placement_relocation_drop_schema_sync_and_reprepare() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let sandbox = TempSandbox::new("g36_reloc");
     let opts = ConnectionOpenOptions {
         default_page_size: 1024,
@@ -1121,6 +1123,7 @@ fn group36_root_placement_relocation_drop_schema_sync_and_reprepare() {
 
 #[test]
 fn group36_pragma_auto_vacuum_streaming_incrvacuum_recovery_and_incrvacuum2() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let sandbox = TempSandbox::new("g36_incrvac");
     let db_path = sandbox.path().join("modes.db");
 
@@ -1369,6 +1372,7 @@ fn group36_pragma_auto_vacuum_streaming_incrvacuum_recovery_and_incrvacuum2() {
 
 #[test]
 fn group49_integrity_check_ptrmap_and_pending_byte_corruption_detection() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let sandbox = TempSandbox::new("g49_corrupt");
     let base_db = sandbox.path().join("clean.db");
     {
@@ -1565,6 +1569,7 @@ fn group49_integrity_check_ptrmap_and_pending_byte_corruption_detection() {
 
 #[test]
 fn group51_vacuum_ast_into_modes_errors_and_rowid_semantics() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let sandbox = TempSandbox::new("g51_vacuum");
     let src_db = sandbox.path().join("src.db");
 
@@ -1808,6 +1813,7 @@ fn group51_vacuum_ast_into_modes_errors_and_rowid_semantics() {
 
 #[test]
 fn group56_page_size_transitions_hot_journal_recovery_and_orphaned_sequence() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let sandbox = TempSandbox::new("g56_pagesize");
 
     // 1. Page-size transitions `512 -> 1024 -> 4096 -> 8192 -> 65536 -> 512` across `TEST_64K`

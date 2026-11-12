@@ -264,6 +264,16 @@ impl Btree {
             }
             PtrmapType::Overflow1 => {
                 let raw = self.pager.write_page(ptr_page)?;
+                if ptr_page >= 2
+                    && matches!(
+                        raw.first().copied(),
+                        Some(crate::pax::PAX_TABLE_LEAF_BYTE | crate::pax::PAX_INDEX_LEAF_BYTE)
+                    )
+                {
+                    return Err(SqliteError::corrupt(format!(
+                        "ptrmap Overflow1 parent {ptr_page} is a PAX leaf (no overflow chains)"
+                    )));
+                }
                 let (ptype, n_cell, _) = raw_page_header(ptr_page, usable, raw)?;
                 if ptype == BtreePageType::TableInterior {
                     return Err(SqliteError::corrupt(format!(
@@ -385,8 +395,28 @@ impl Btree {
 
         match e_type {
             PtrmapType::BtreeNode | PtrmapType::RootPage => {
-                let parsed = self.read_parsed_page(to_pgno)?;
-                self.set_child_ptrmaps_for_parsed(to_pgno, &parsed)?;
+                if to_pgno >= 2
+                    && page_bytes.first().copied() == Some(crate::pax::PAX_TABLE_LEAF_BYTE)
+                {
+                    crate::pax::validate_pax_table_leaf(
+                        to_pgno,
+                        self.pager.usable_size(),
+                        &page_bytes,
+                        e_type == PtrmapType::RootPage,
+                    )?;
+                } else if to_pgno >= 2
+                    && page_bytes.first().copied() == Some(crate::pax::PAX_INDEX_LEAF_BYTE)
+                {
+                    crate::pax::validate_pax_index_leaf(
+                        to_pgno,
+                        self.pager.usable_size(),
+                        &page_bytes,
+                        e_type == PtrmapType::RootPage,
+                    )?;
+                } else {
+                    let parsed = self.read_parsed_page(to_pgno)?;
+                    self.set_child_ptrmaps_for_parsed(to_pgno, &parsed)?;
+                }
             }
             PtrmapType::Overflow1 | PtrmapType::Overflow2 => {
                 let next_ovfl = u32::from_be_bytes([
@@ -1446,6 +1476,7 @@ mod tests {
 
     #[test]
     fn test_balance_quick_1024_sequential_rows_packing_and_cursor_root_remap() {
+        let _legacy = sqliters_types::LegacyFormat3Guard::enter();
         let vfs = Arc::new(MemoryVfs::new());
         let mut bt = open_av_disk_btree(vfs, "av_quick_pack.db", 1024, AutoVacuumMode::Full);
 

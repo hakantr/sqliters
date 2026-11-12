@@ -2765,6 +2765,48 @@ fn collect_btree_dbstat_pages(
         return;
     }
     let flags = page_buf[hdr_off];
+    if pgno >= 2 && flags == sqliters_btree::PAX_TABLE_LEAF_BYTE {
+        if let Ok(view) = sqliters_btree::PaxTableLeafView::new(pgno, usable_size as u32, &page_buf)
+            && let Ok((page_payload, unused, mx_payload)) = view.dbstat_metrics()
+        {
+            out.push(DbStatRow {
+                name: obj_name.to_owned(),
+                path: Some(path.to_owned()),
+                pageno: i64::from(pgno),
+                pagetype: Some("leaf".to_owned()),
+                ncell: view.len() as i64,
+                payload: page_payload,
+                unused: unused.max(0),
+                mx_payload,
+                pgoffset: Some((i64::from(pgno) - 1) * page_size),
+                pgsize: page_size,
+                schema: schema_name.to_owned(),
+                aggregate: i64::from(aggregate),
+            });
+        }
+        return;
+    }
+    if pgno >= 2 && flags == sqliters_btree::PAX_INDEX_LEAF_BYTE {
+        if let Ok(view) = sqliters_btree::PaxIndexLeafView::new(pgno, usable_size as u32, &page_buf)
+        {
+            let (page_payload, unused, mx_payload) = view.dbstat_metrics();
+            out.push(DbStatRow {
+                name: obj_name.to_owned(),
+                path: Some(path.to_owned()),
+                pageno: i64::from(pgno),
+                pagetype: Some("leaf".to_owned()),
+                ncell: view.len() as i64,
+                payload: page_payload,
+                unused: unused.max(0),
+                mx_payload,
+                pgoffset: Some((i64::from(pgno) - 1) * page_size),
+                pgsize: page_size,
+                schema: schema_name.to_owned(),
+                aggregate: i64::from(aggregate),
+            });
+        }
+        return;
+    }
     let is_interior = matches!(flags, 0x02 | 0x05);
     let is_table = matches!(flags, 0x05 | 0x0d);
     let hdr_size = if is_interior { 12usize } else { 8usize };

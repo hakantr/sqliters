@@ -723,6 +723,7 @@ fn test_select_limit_1_and_cursor_column_lazy_page_and_overflow_guarantee() {
 // ============================================================================
 
 fn seed_differential_mutation_db(path: &Path) {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let conn = Connection::open(path).unwrap();
     conn.execute(
         "PRAGMA page_size = 512;

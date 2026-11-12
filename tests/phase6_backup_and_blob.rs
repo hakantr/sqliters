@@ -172,6 +172,7 @@ fn backup_init_guards_distinct_connection_file_unknown_db_readonly_and_in_use() 
 
 #[test]
 fn backup_step_bclosetrans_releases_source_read_lock_unless_user_read_tx_open() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let dir = TempDirGuard::new("backup_bclosetrans");
     let src_path = dir.file("src.db");
     let dst_path = dir.file("dst.db");
@@ -239,6 +240,7 @@ fn backup_step_bclosetrans_releases_source_read_lock_unless_user_read_tx_open() 
 
 #[test]
 fn backup_leaf_dirty_page_tracking_and_restart_on_rollback_or_external_write() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let dir = TempDirGuard::new("backup_dirty_and_restart");
     let src_path = dir.file("src.db");
     let dst_path = dir.file("dst.db");
@@ -299,6 +301,7 @@ fn backup_leaf_dirty_page_tracking_and_restart_on_rollback_or_external_write() {
 
 #[test]
 fn backup_page_size_conversion_and_wal_page_size_mismatch_guard() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let dir = TempDirGuard::new("backup_pagesize");
     let src_1k_path = dir.file("src_1k.db");
     let dst_4k_path = dir.file("dst_4k.db");

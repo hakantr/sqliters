@@ -1236,6 +1236,7 @@ fn test_generate_series_differential_parity_with_c_sqlite() {
 
 #[test]
 fn test_eponymous_pragma_virtual_tables_differential_parity() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let tmp_dir =
         std::env::temp_dir().join(format!("sqliters_phase7_pragma_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_dir);

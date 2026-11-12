@@ -4,6 +4,7 @@
 
 pub mod cursor;
 pub mod page;
+pub mod pax;
 pub mod ptrmap;
 
 use std::cmp::Ordering;
@@ -20,8 +21,9 @@ use sqliters_pager::{
 use sqliters_types::{
     Bitvec, ErrorCode, INLINE_ROW_COLS, InlineRow, InlineVal, KeySortOrder, Pgno, RawField, Result,
     SqliteError, TextEncoding, Value, compare_raw_record_range, compare_records_with_encoding,
-    decode_record_with_encoding, decode_serial_value_with_encoding, extended, get_varint,
-    get_varint_i64, parse_raw_record_prefix, put_varint, serial_type_len, varint_len,
+    decode_record_with_encoding, decode_serial_value_with_encoding, encode_value_refs_record_into,
+    extended, get_varint, get_varint_i64, parse_raw_record_prefix, put_varint, serial_type_len,
+    varint_len,
 };
 use sqliters_vfs::{OpenFlags, Vfs};
 
@@ -47,7 +49,36 @@ pub use page::{
     read_table_leaf_rowid, seek_table_leaf_cell, table_interior_right_child,
     try_delete_table_leaf_in_place, try_insert_table_leaf_in_place,
 };
+pub use pax::{
+    PAX_COL_ALL_NULL, PAX_COL_BYTES, PAX_COL_F64, PAX_COL_HAS_NULLS, PAX_COL_I32, PAX_COL_I64,
+    PAX_COL_MIXED, PAX_INDEX_LEAF_BYTE, PAX_MAX_COLS, PAX_MIN_USABLE_SIZE, PAX_TABLE_LEAF_BYTE,
+    PaxColDir, PaxIndexEntry, PaxIndexInsertOutcome, PaxIndexLeafView, PaxTableDeleteOutcome,
+    PaxTableInsertOutcome, PaxTableLeafView, PaxValueInput, choose_pax_index_leaf_end,
+    delete_pax_index_leaf_entry, delete_pax_table_leaf_row, encode_pax_index_entry_stack,
+    entries_fit_single_pax_index_leaf, init_pax_table_leaf_single, max_pax_index_cap_for_widths,
+    orders_allow_pax_index, parse_record_as_pax_index_entry, pop_last_pax_index_leaf_as_record,
+    reset_empty_slotted_leaf, split_pax_index_leaf, split_pax_table_leaf,
+    try_insert_pax_index_leaf, try_insert_pax_table_leaf, try_update_pax_table_row_scalars_at,
+    validate_pax_index_leaf, validate_pax_table_leaf, value_refs_as_pax_index_entry,
+    values_as_pax_index_entry, write_pax_index_leaf_slice,
+};
 pub use ptrmap::{PtrmapType, RootPageMove, is_ptrmap_page, ptrmap_offset, ptrmap_pageno};
+
+/// Item yielded by [`Btree::scan_table_morsels`] and [`Btree::scan_table_range_morsels`]:
+/// whole `0x2d` PAX leaf views (`PaxLeaf`) for zero-record-decode columnar execution, or
+/// individual `RawRow` slices for `0x0d` slotted / overflow rows.
+#[allow(clippy::large_enum_variant)]
+pub enum TableScanMorselItem<'a> {
+    PaxLeaf {
+        view: PaxTableLeafView<'a>,
+        start: usize,
+        end: usize,
+    },
+    RawRow {
+        rowid: i64,
+        payload: &'a [u8],
+    },
+}
 
 /// Compact 16-byte arena descriptor `(prefix, off, len)` for contiguous byte-arena `CREATE INDEX`
 /// sorting and zero-slice-allocation B-tree bulk loading.
@@ -93,6 +124,17 @@ pub enum PointLookupRow {
     Heap(Vec<Value>),
 }
 
+/// Zero-copy borrowed reference to a single table row located by `rowid`:
+/// either a row index inside a `0x2d` PAX table leaf or a raw Format-3 record slice.
+#[allow(clippy::large_enum_variant)]
+pub enum TableRowRef<'a> {
+    Pax {
+        view: PaxTableLeafView<'a>,
+        row_idx: usize,
+    },
+    Raw(&'a [u8]),
+}
+
 /// Borrowed view of an `IndexLeaf` B-tree page with precomputed pointer-array and overflow bounds
 /// for zero-allocation in-page binary search and tight slice morsel scanning.
 pub struct IndexLeafMorsel<'a> {
@@ -104,6 +146,7 @@ pub struct IndexLeafMorsel<'a> {
     n_cell: usize,
     bounds: PayloadBounds,
     max_local: usize,
+    pax: Option<PaxIndexLeafView<'a>>,
 }
 
 impl<'a> IndexLeafMorsel<'a> {
@@ -114,6 +157,23 @@ impl<'a> IndexLeafMorsel<'a> {
             return Err(SqliteError::corrupt(format!(
                 "index leaf page {pgno} buffer smaller than usable_size"
             )));
+        }
+        if pgno >= 2 && raw.first().copied() == Some(PAX_INDEX_LEAF_BYTE) {
+            let view = PaxIndexLeafView::new(pgno, usable, raw)?;
+            let len = view.len();
+            let bounds = PayloadBounds::for_index(usable);
+            let max_local = bounds.max_local as usize;
+            return Ok(Self {
+                pgno,
+                usable_usize,
+                raw,
+                ptr_base: 0,
+                ptr_end: 0,
+                n_cell: len,
+                bounds,
+                max_local,
+                pax: Some(view),
+            });
         }
         let hdr_off: usize = if pgno == 1 { 100 } else { 0 };
         let ptr_base = hdr_off + 8;
@@ -136,7 +196,13 @@ impl<'a> IndexLeafMorsel<'a> {
             n_cell,
             bounds,
             max_local,
+            pax: None,
         })
+    }
+
+    #[inline(always)]
+    pub const fn pax_view(&self) -> Option<&PaxIndexLeafView<'a>> {
+        self.pax.as_ref()
     }
 
     #[inline(always)]
@@ -150,9 +216,13 @@ impl<'a> IndexLeafMorsel<'a> {
     }
 
     /// Returns `Ok(Some(payload_slice))` when cell `ci` fits entirely in-page, or `Ok(None)` when
-    /// it spills onto an overflow chain.
+    /// it spills onto an overflow chain (or resides on a `0x2a` PAX leaf without a specialized
+    /// `pax_view()` caller, triggering stack record synthesis via `OverflowAt(ci)`).
     #[inline(always)]
     pub fn local_cell(&self, ci: usize) -> Result<Option<&'a [u8]>> {
+        if self.pax.is_some() {
+            return Ok(None);
+        }
         let p = self.ptr_base + 2 * ci;
         let off = u16::from_be_bytes([self.raw[p], self.raw[p + 1]]) as usize;
         if off < self.ptr_end || off >= self.usable_usize {
@@ -776,6 +846,21 @@ impl Btree {
     #[inline]
     pub const fn encoding(&self) -> TextEncoding {
         self.pager.encoding()
+    }
+
+    #[inline]
+    pub fn is_p3v2(&self) -> bool {
+        self.pager.is_p3v2() && !sqliters_types::legacy_format3_mode()
+    }
+
+    #[inline]
+    pub fn is_p3v2_utf8(&self) -> bool {
+        self.is_p3v2() && self.pager.encoding() == TextEncoding::Utf8
+    }
+
+    #[inline]
+    pub fn set_p3v2(&mut self, enabled: bool) -> Result<()> {
+        self.pager.set_p3v2(enabled)
     }
 
     #[inline]
@@ -1459,24 +1544,52 @@ impl Btree {
             }
             ParsedPage::TableInterior { cells, right_child } => {
                 for c in cells {
-                    let child = self.read_parsed_page(c.left_child)?;
-                    self.free_subtree_children(&child)?;
-                    self.free_page(c.left_child)?;
+                    if c.left_child >= 2
+                        && self.pager.read_page(c.left_child)?.first().copied()
+                            == Some(PAX_TABLE_LEAF_BYTE)
+                    {
+                        self.free_page(c.left_child)?;
+                    } else {
+                        let child = self.read_parsed_page(c.left_child)?;
+                        self.free_subtree_children(&child)?;
+                        self.free_page(c.left_child)?;
+                    }
                 }
-                let rchild = self.read_parsed_page(*right_child)?;
-                self.free_subtree_children(&rchild)?;
-                self.free_page(*right_child)?;
+                if *right_child >= 2
+                    && self.pager.read_page(*right_child)?.first().copied()
+                        == Some(PAX_TABLE_LEAF_BYTE)
+                {
+                    self.free_page(*right_child)?;
+                } else {
+                    let rchild = self.read_parsed_page(*right_child)?;
+                    self.free_subtree_children(&rchild)?;
+                    self.free_page(*right_child)?;
+                }
             }
             ParsedPage::IndexInterior { cells, right_child } => {
                 for c in cells {
                     self.free_overflow_chain(c.overflow_page)?;
-                    let child = self.read_parsed_page(c.left_child)?;
-                    self.free_subtree_children(&child)?;
-                    self.free_page(c.left_child)?;
+                    if c.left_child >= 2
+                        && self.pager.read_page(c.left_child)?.first().copied()
+                            == Some(PAX_INDEX_LEAF_BYTE)
+                    {
+                        self.free_page(c.left_child)?;
+                    } else {
+                        let child = self.read_parsed_page(c.left_child)?;
+                        self.free_subtree_children(&child)?;
+                        self.free_page(c.left_child)?;
+                    }
                 }
-                let rchild = self.read_parsed_page(*right_child)?;
-                self.free_subtree_children(&rchild)?;
-                self.free_page(*right_child)?;
+                if *right_child >= 2
+                    && self.pager.read_page(*right_child)?.first().copied()
+                        == Some(PAX_INDEX_LEAF_BYTE)
+                {
+                    self.free_page(*right_child)?;
+                } else {
+                    let rchild = self.read_parsed_page(*right_child)?;
+                    self.free_subtree_children(&rchild)?;
+                    self.free_page(*right_child)?;
+                }
             }
         }
         Ok(())
@@ -1520,6 +1633,7 @@ impl Btree {
             let n_cells = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
             match ptype {
                 0x0d | 0x0a => return Ok(n_cells as i64),
+                0x2d | 0x2a if pgno >= 2 => return Ok(n_cells as i64),
                 0x05 | 0x02 => {
                     if raw.len() < hdr_off + 12 + n_cells * 2 {
                         return Err(SqliteError::corrupt("truncated interior B-tree page"));
@@ -1679,6 +1793,30 @@ impl Btree {
                             find_table_interior_child(cur_pgno, usable, raw, rowid)?;
                         LookupStep::Descend(next_pgno)
                     }
+                    x if cur_pgno >= 2 && x == PAX_TABLE_LEAF_BYTE => {
+                        let view = PaxTableLeafView::new(cur_pgno, usable, raw)?;
+                        match view.binary_search_rowid(rowid) {
+                            Err(_) => LookupStep::Done(None),
+                            Ok(row_idx) => {
+                                let mut out = Vec::with_capacity(cols.len());
+                                for c in cols {
+                                    match c {
+                                        PointProjCol::Rowid => out.push(Value::Integer(rowid)),
+                                        PointProjCol::Column {
+                                            col_idx,
+                                            default_val,
+                                        } => match view.read_value(*col_idx as usize, row_idx)? {
+                                            Some(v) => out.push(v),
+                                            None => {
+                                                out.push(default_val.clone().unwrap_or(Value::Null))
+                                            }
+                                        },
+                                    }
+                                }
+                                LookupStep::Done(Some(out))
+                            }
+                        }
+                    }
                     x if x == BtreePageType::TableLeaf as u8 => {
                         let (_, n_cell, _) = raw_page_header(cur_pgno, usable, raw)?;
                         match binary_search_table_leaf_with_span(
@@ -1755,6 +1893,16 @@ impl Btree {
                         let (_, next_pgno) =
                             find_table_interior_child(cur_pgno, usable, raw, rowid)?;
                         RowLookupStep::Descend(next_pgno)
+                    }
+                    x if cur_pgno >= 2 && x == PAX_TABLE_LEAF_BYTE => {
+                        let view = PaxTableLeafView::new(cur_pgno, usable, raw)?;
+                        match view.binary_search_rowid(rowid) {
+                            Err(_) => RowLookupStep::Done(None),
+                            Ok(row_idx) => {
+                                let row = view.project_point_lookup_row(row_idx, rowid, cols)?;
+                                RowLookupStep::Done(Some(row))
+                            }
+                        }
                     }
                     x if x == BtreePageType::TableLeaf as u8 => {
                         let (_, n_cell, _) = raw_page_header(cur_pgno, usable, raw)?;
@@ -1840,6 +1988,18 @@ impl Btree {
                             find_table_interior_child(cur_pgno, usable, raw, rowid)?;
                         RawStep::Descend(next_pgno)
                     }
+                    x if cur_pgno >= 2 && x == PAX_TABLE_LEAF_BYTE => {
+                        let view = PaxTableLeafView::new(cur_pgno, usable, raw)?;
+                        match view.binary_search_rowid(rowid) {
+                            Err(_) => RawStep::Done(None),
+                            Ok(row_idx) => {
+                                let mut buf = Vec::new();
+                                view.encode_row_record_into(row_idx, &mut buf)?;
+                                let f = visit_opt.take().unwrap();
+                                RawStep::Done(Some(f(&buf)?))
+                            }
+                        }
+                    }
                     x if x == BtreePageType::TableLeaf as u8 => {
                         let (_, n_cell, _) = raw_page_header(cur_pgno, usable, raw)?;
                         match binary_search_table_leaf_with_span(
@@ -1881,6 +2041,93 @@ impl Btree {
         }
     }
 
+    /// Zero-allocation point lookup for `rowid` that yields a [`TableRowRef::Pax`] directly on
+    /// `0x2d` PAX leaves (without encoding a Format-3 record!) and [`TableRowRef::Raw`] on `0x0d`.
+    pub fn with_table_rowid_morsel_row<R, F>(
+        &mut self,
+        root_pgno: Pgno,
+        rowid: i64,
+        visit: F,
+    ) -> Result<Option<R>>
+    where
+        F: FnOnce(TableRowRef<'_>) -> Result<R>,
+    {
+        if self.pager.page_count() == 0 {
+            return Ok(None);
+        }
+        self.check_interrupted()?;
+        let usable = self.pager.usable_size();
+        let mut cur_pgno = root_pgno;
+        let mut visit_opt = Some(visit);
+        loop {
+            enum MorselRowStep<T> {
+                Descend(Pgno),
+                Done(Option<T>),
+                Overflow(u32, Vec<u8>, Option<Pgno>),
+            }
+            let step = {
+                let raw = self.pager.read_page(cur_pgno)?;
+                let hdr_off = if cur_pgno == 1 { 100 } else { 0 };
+                if hdr_off >= usable as usize || raw.len() < usable as usize {
+                    return Err(SqliteError::corrupt("raw page smaller than usable_size"));
+                }
+                match raw[hdr_off] {
+                    x if x == BtreePageType::TableInterior as u8 => {
+                        let (_, next_pgno) =
+                            find_table_interior_child(cur_pgno, usable, raw, rowid)?;
+                        MorselRowStep::Descend(next_pgno)
+                    }
+                    x if cur_pgno >= 2 && x == PAX_TABLE_LEAF_BYTE => {
+                        let view = PaxTableLeafView::new(cur_pgno, usable, raw)?;
+                        match view.binary_search_rowid(rowid) {
+                            Err(_) => MorselRowStep::Done(None),
+                            Ok(row_idx) => {
+                                let f = visit_opt.take().unwrap();
+                                MorselRowStep::Done(Some(f(TableRowRef::Pax { view, row_idx })?))
+                            }
+                        }
+                    }
+                    x if x == BtreePageType::TableLeaf as u8 => {
+                        let (_, n_cell, _) = raw_page_header(cur_pgno, usable, raw)?;
+                        match binary_search_table_leaf_with_span(
+                            cur_pgno, usable, raw, n_cell, rowid,
+                        )? {
+                            Err(_) => MorselRowStep::Done(None),
+                            Ok((_, Some((p_start, p_end)))) => {
+                                let payload = &raw[p_start as usize..p_end as usize];
+                                let f = visit_opt.take().unwrap();
+                                MorselRowStep::Done(Some(f(TableRowRef::Raw(payload))?))
+                            }
+                            Ok((cell_idx, None)) => {
+                                let c =
+                                    read_table_leaf_cell(cur_pgno, usable, raw, n_cell, cell_idx)?;
+                                MorselRowStep::Overflow(
+                                    c.total_payload_len,
+                                    c.local_payload.to_vec(),
+                                    c.overflow_page,
+                                )
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(SqliteError::corrupt(format!(
+                            "expected table page at {cur_pgno}"
+                        )));
+                    }
+                }
+            };
+            match step {
+                MorselRowStep::Descend(next_pgno) => cur_pgno = next_pgno,
+                MorselRowStep::Done(res) => return Ok(res),
+                MorselRowStep::Overflow(total_len, local_copy, ovfl) => {
+                    let full = self.read_full_payload(total_len, &local_copy, ovfl)?;
+                    let f = visit_opt.take().unwrap();
+                    return Ok(Some(f(TableRowRef::Raw(&full))?));
+                }
+            }
+        }
+    }
+
     /// Reads the table record for `rowid` into `dst`, returning `Ok(None)` when absent or
     /// `Ok(Some(local_span))` where `local_span` is `Some((leaf_pgno, p_start, p_end))` when the
     /// entire cell payload resides inline on `leaf_pgno` without overflow pages and auto-vacuum is disabled.
@@ -1915,6 +2162,16 @@ impl Btree {
                         let (_, next_pgno) =
                             find_table_interior_child(cur_pgno, usable, raw, rowid)?;
                         Step::Descend(next_pgno)
+                    }
+                    x if cur_pgno >= 2 && x == PAX_TABLE_LEAF_BYTE => {
+                        let view = PaxTableLeafView::new(cur_pgno, usable, raw)?;
+                        match view.binary_search_rowid(rowid) {
+                            Err(_) => Step::Missing,
+                            Ok(row_idx) => {
+                                view.encode_row_record_into(row_idx, dst)?;
+                                return Ok(Some(None));
+                            }
+                        }
                     }
                     x if x == BtreePageType::TableLeaf as u8 => {
                         let (_, n_cell, _) = raw_page_header(cur_pgno, usable, raw)?;
@@ -2052,6 +2309,19 @@ impl Btree {
                     stack.push((child, 0));
                 }
                 PageKind::Leaf => {
+                    if pgno >= 2
+                        && self.pager.read_page(pgno)?.first().copied() == Some(PAX_TABLE_LEAF_BYTE)
+                    {
+                        let raw = self.pager.read_page(pgno)?;
+                        let view = PaxTableLeafView::new(pgno, usable, raw)?;
+                        let mut rec_buf = Vec::new();
+                        for ci in 0..view.len() {
+                            let rid = view.rowid_at(ci);
+                            view.encode_row_record_into(ci, &mut rec_buf)?;
+                            visit(rid, &rec_buf)?;
+                        }
+                        continue;
+                    }
                     let mut ci = 0usize;
                     loop {
                         let ovfl_cell = {
@@ -2128,6 +2398,314 @@ impl Btree {
         Ok(())
     }
 
+    /// Scans all entries of the Table B+Tree rooted at `root_pgno` in ascending `rowid` order,
+    /// yielding whole `PaxTableLeafView` morsels for `0x2d` PAX leaves (zero record materialization!)
+    /// and individual `RawRow` slices for `0x0d` slotted leaves / overflow rows.
+    pub fn scan_table_morsels<F>(&mut self, root_pgno: Pgno, visit: F) -> Result<()>
+    where
+        F: FnMut(TableScanMorselItem<'_>) -> Result<bool>,
+    {
+        self.scan_table_range_morsels(root_pgno, None, None, visit)
+    }
+
+    /// Scans entries of the Table B+Tree rooted at `root_pgno` whose `rowid` satisfies
+    /// `(lower, upper)` bounds, yielding `PaxTableLeafView` range morsels `[start..end)` on `0x2d`
+    /// PAX leaves and `RawRow` items on `0x0d` slotted leaves. Returning `Ok(false)` stops early.
+    pub fn scan_table_range_morsels<F>(
+        &mut self,
+        root_pgno: Pgno,
+        lower: Option<(i64, bool)>,
+        upper: Option<(i64, bool)>,
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(TableScanMorselItem<'_>) -> Result<bool>,
+    {
+        if self.pager.page_count() == 0 {
+            return Ok(());
+        }
+        if let (Some((lo, lo_inc)), Some((hi, hi_inc))) = (lower, upper)
+            && (lo > hi || (lo == hi && (!lo_inc || !hi_inc)))
+        {
+            return Ok(());
+        }
+        let usable = self.pager.usable_size();
+        let max_pages = (self.pager.page_count() as usize).saturating_add(2);
+        let mut visited_pages = 0usize;
+        let _ = self.scan_table_range_morsels_rec(
+            root_pgno,
+            usable,
+            lower,
+            upper,
+            &mut visited_pages,
+            max_pages,
+            &mut visit,
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_table_range_morsels_rec<F>(
+        &mut self,
+        pgno: Pgno,
+        usable: u32,
+        lower: Option<(i64, bool)>,
+        upper: Option<(i64, bool)>,
+        visited_pages: &mut usize,
+        max_pages: usize,
+        visit: &mut F,
+    ) -> Result<bool>
+    where
+        F: FnMut(TableScanMorselItem<'_>) -> Result<bool>,
+    {
+        self.check_interrupted()?;
+        *visited_pages += 1;
+        if *visited_pages > max_pages {
+            return Err(SqliteError::corrupt("cycle detected in table B+Tree"));
+        }
+        let usable_usize = usable as usize;
+        let bounds = PayloadBounds::for_table_leaf(usable);
+        let max_local = bounds.max_local as usize;
+
+        enum PagePlan {
+            PaxLeaf,
+            SlottedLeaf { n_cell: usize },
+            Interior { children: Vec<Pgno> },
+        }
+
+        let plan = {
+            let raw = self.pager.read_page(pgno)?;
+            if pgno >= 2 && raw.first().copied() == Some(PAX_TABLE_LEAF_BYTE) {
+                PagePlan::PaxLeaf
+            } else {
+                let (ptype, n_cell, _) = raw_page_header(pgno, usable, raw)?;
+                match ptype {
+                    BtreePageType::TableLeaf => PagePlan::SlottedLeaf { n_cell },
+                    BtreePageType::TableInterior => {
+                        let start_idx = if let Some((lo_val, lo_inc)) = lower {
+                            let target = if lo_inc {
+                                lo_val
+                            } else {
+                                match lo_val.checked_add(1) {
+                                    Some(t) => t,
+                                    None => return Ok(true),
+                                }
+                            };
+                            let (idx, _) = find_table_interior_child(pgno, usable, raw, target)?;
+                            idx
+                        } else {
+                            0
+                        };
+                        let mut children = Vec::with_capacity(n_cell.saturating_sub(start_idx) + 1);
+                        let mut pruned_right = false;
+                        for ci in start_idx..n_cell {
+                            let (left_child, key) =
+                                read_table_interior_cell(pgno, usable, raw, n_cell, ci)?;
+                            children.push(left_child);
+                            if let Some((hi_val, hi_inc)) = upper
+                                && (key > hi_val || (key == hi_val && !hi_inc))
+                            {
+                                pruned_right = true;
+                                break;
+                            }
+                        }
+                        if !pruned_right {
+                            children.push(table_interior_right_child(pgno, usable, raw)?);
+                        }
+                        PagePlan::Interior { children }
+                    }
+                    _ => {
+                        return Err(SqliteError::corrupt(format!(
+                            "expected table page at {pgno}"
+                        )));
+                    }
+                }
+            }
+        };
+
+        match plan {
+            PagePlan::PaxLeaf => {
+                let raw = self.pager.read_page(pgno)?;
+                let view = PaxTableLeafView::new(pgno, usable, raw)?;
+                let n = view.len();
+                if n == 0 {
+                    return Ok(true);
+                }
+                let start = if let Some((lo_val, lo_inc)) = lower {
+                    let s = view.lower_bound_rowid(lo_val);
+                    if !lo_inc && s < n && view.rowid_at(s) == lo_val {
+                        s + 1
+                    } else {
+                        s
+                    }
+                } else {
+                    0
+                };
+                if start >= n {
+                    if let Some((hi_val, hi_inc)) = upper {
+                        let last = view.rowid_at(n - 1);
+                        if last > hi_val || (last == hi_val && !hi_inc) {
+                            return Ok(false);
+                        }
+                    }
+                    return Ok(true);
+                }
+                let (end, hit_upper) = if let Some((hi_val, hi_inc)) = upper {
+                    let s = view.lower_bound_rowid(hi_val);
+                    if s < n {
+                        let r = view.rowid_at(s);
+                        if r == hi_val && hi_inc {
+                            (s + 1, s + 1 < n)
+                        } else {
+                            (s, true)
+                        }
+                    } else {
+                        (n, false)
+                    }
+                } else {
+                    (n, false)
+                };
+                if start < end {
+                    let keep = visit(TableScanMorselItem::PaxLeaf { view, start, end })?;
+                    if !keep {
+                        return Ok(false);
+                    }
+                }
+                Ok(!hit_upper)
+            }
+            PagePlan::SlottedLeaf { n_cell } => {
+                let mut ci = if let Some((lo_val, lo_inc)) = lower {
+                    let raw = self.pager.read_page(pgno)?;
+                    match binary_search_table_leaf(pgno, usable, raw, n_cell, lo_val)? {
+                        Ok(idx) => {
+                            if lo_inc {
+                                idx
+                            } else {
+                                idx + 1
+                            }
+                        }
+                        Err(idx) => idx,
+                    }
+                } else {
+                    0
+                };
+                while ci < n_cell {
+                    enum SlottedStep {
+                        DoneLeaf(bool),
+                        Overflow {
+                            rowid: i64,
+                            total_u32: u32,
+                            local_copy: Vec<u8>,
+                            ovfl: Option<Pgno>,
+                        },
+                    }
+                    let step = {
+                        let raw = self.pager.read_page(pgno)?;
+                        let hdr_off: usize = if pgno == 1 { 100 } else { 0 };
+                        let ptr_base = hdr_off + 8;
+                        let ptr_end = ptr_base + 2 * n_cell;
+                        let mut out_step = SlottedStep::DoneLeaf(true);
+                        while ci < n_cell {
+                            let p = ptr_base + 2 * ci;
+                            let off = u16::from_be_bytes([raw[p], raw[p + 1]]) as usize;
+                            if off < ptr_end || off >= usable_usize {
+                                return Err(SqliteError::corrupt("invalid cell offset"));
+                            }
+                            let (payload_u64, n1) = get_varint(&raw[off..usable_usize])?;
+                            let total_u32 = u32::try_from(payload_u64)
+                                .map_err(|_| SqliteError::corrupt("table cell payload > 4GiB"))?;
+                            let total_len = total_u32 as usize;
+                            let (rowid, n2) = get_varint_i64(&raw[off + n1..usable_usize])?;
+                            if let Some((hi_val, hi_inc)) = upper
+                                && (rowid > hi_val || (rowid == hi_val && !hi_inc))
+                            {
+                                out_step = SlottedStep::DoneLeaf(false);
+                                break;
+                            }
+                            let p_start = off + n1 + n2;
+                            if total_len <= max_local {
+                                let p_end = p_start + total_len;
+                                if p_end > usable_usize {
+                                    return Err(SqliteError::corrupt(
+                                        "table leaf cell extends past end of page",
+                                    ));
+                                }
+                                let keep = visit(TableScanMorselItem::RawRow {
+                                    rowid,
+                                    payload: &raw[p_start..p_end],
+                                })?;
+                                ci += 1;
+                                if !keep {
+                                    out_step = SlottedStep::DoneLeaf(false);
+                                    break;
+                                }
+                            } else {
+                                let local_len = bounds.local_len(total_u32);
+                                let local_end = p_start + local_len;
+                                if local_end + 4 > usable_usize {
+                                    return Err(SqliteError::corrupt(
+                                        "table leaf overflow cell extends past end of page",
+                                    ));
+                                }
+                                let ovfl_pgno = u32::from_be_bytes([
+                                    raw[local_end],
+                                    raw[local_end + 1],
+                                    raw[local_end + 2],
+                                    raw[local_end + 3],
+                                ]);
+                                ci += 1;
+                                out_step = SlottedStep::Overflow {
+                                    rowid,
+                                    total_u32,
+                                    local_copy: raw[p_start..local_end].to_vec(),
+                                    ovfl: Some(ovfl_pgno),
+                                };
+                                break;
+                            }
+                        }
+                        out_step
+                    };
+                    match step {
+                        SlottedStep::DoneLeaf(cont) => return Ok(cont),
+                        SlottedStep::Overflow {
+                            rowid,
+                            total_u32,
+                            local_copy,
+                            ovfl,
+                        } => {
+                            let full = self.read_full_payload(total_u32, &local_copy, ovfl)?;
+                            let keep = visit(TableScanMorselItem::RawRow {
+                                rowid,
+                                payload: &full,
+                            })?;
+                            if !keep {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                }
+                Ok(true)
+            }
+            PagePlan::Interior { children } => {
+                for child in children {
+                    let cont = self.scan_table_range_morsels_rec(
+                        child,
+                        usable,
+                        lower,
+                        upper,
+                        visited_pages,
+                        max_pages,
+                        visit,
+                    )?;
+                    if !cont {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+        }
+    }
+
     /// Locates the leaf page and cell payload layout `(leaf_pgno, local_start, local_len, total_payload_len, overflow_page)`
     /// for `rowid` in the Table B+Tree rooted at `root_pgno`.
     #[allow(clippy::type_complexity)]
@@ -2144,6 +2722,13 @@ impl Btree {
         loop {
             self.check_interrupted()?;
             let raw = self.pager.read_page(cur_pgno)?;
+            if cur_pgno >= 2 && raw.first().copied() == Some(PAX_TABLE_LEAF_BYTE) {
+                let view = PaxTableLeafView::new(cur_pgno, usable, raw)?;
+                if view.binary_search_rowid(rowid).is_ok() {
+                    return Ok(Some((cur_pgno, 0, usable as usize, usable, None)));
+                }
+                return Ok(None);
+            }
             match peek_page_type(cur_pgno, usable, raw)? {
                 BtreePageType::TableLeaf => {
                     let (_, n_cell, _) = raw_page_header(cur_pgno, usable, raw)?;
@@ -2218,7 +2803,15 @@ impl Btree {
         if overflow_page.is_some() || (local_len as u32) != total_payload_len {
             return Ok(None);
         }
+        let usable = self.pager.usable_size();
         let raw = self.pager.read_page(leaf_pgno)?;
+        if leaf_pgno >= 2 && raw.first().copied() == Some(PAX_TABLE_LEAF_BYTE) {
+            let view = PaxTableLeafView::new(leaf_pgno, usable, raw)?;
+            let Ok(row_idx) = view.binary_search_rowid(rowid) else {
+                return Ok(Some(false));
+            };
+            return Ok(Some(view.col_blob_eq(row_idx, col_idx, expected)?));
+        }
         let payload = &raw[local_start..local_start + local_len];
         if payload.is_empty() {
             return Err(SqliteError::corrupt("empty record payload"));
@@ -2263,6 +2856,34 @@ impl Btree {
         rowid: i64,
         col_idx: usize,
     ) -> Result<Option<(usize, usize)>> {
+        if self.pager.page_count() > 0 {
+            let usable = self.pager.usable_size();
+            let mut cur_pgno = root_pgno;
+            loop {
+                self.check_interrupted()?;
+                let raw = self.pager.read_page(cur_pgno)?;
+                if cur_pgno >= 2 && raw.first().copied() == Some(PAX_TABLE_LEAF_BYTE) {
+                    let view = PaxTableLeafView::new(cur_pgno, usable, raw)?;
+                    let Ok(row_idx) = view.binary_search_rowid(rowid) else {
+                        return Ok(None);
+                    };
+                    return view.inspect_col_bytes_span(row_idx, col_idx).map(Some);
+                }
+                match peek_page_type(cur_pgno, usable, raw)? {
+                    BtreePageType::TableInterior => {
+                        let (_, next_pgno) =
+                            find_table_interior_child(cur_pgno, usable, raw, rowid)?;
+                        cur_pgno = next_pgno;
+                    }
+                    BtreePageType::TableLeaf => break,
+                    _ => {
+                        return Err(SqliteError::corrupt(format!(
+                            "expected table page at {cur_pgno}"
+                        )));
+                    }
+                }
+            }
+        }
         let Some(payload) = self.seek_table_rowid(root_pgno, rowid)? else {
             return Ok(None);
         };
@@ -2603,6 +3224,324 @@ impl Btree {
         Ok(true)
     }
 
+    /// Direct typed-column `P3v2` PAX table insert (`0x2d`), bypassing Format-3 record encoding
+    /// completely on the common path (`W01`, `W10`, `W13`, `W14`), and encoding into `scratch_rec`
+    /// only when escaping to a slotted `0x0d` / overflow page or legacy Format-3 database!
+    pub fn insert_table_pax_refs(
+        &mut self,
+        root_pgno: Pgno,
+        rowid: i64,
+        refs: &[&Value],
+        allow_replace: bool,
+        scratch_rec: &mut Vec<u8>,
+    ) -> Result<bool> {
+        let usable = self.pager.usable_size();
+        if root_pgno >= 2
+            && self.encoding() == TextEncoding::Utf8
+            && usable >= PAX_MIN_USABLE_SIZE as u32
+        {
+            self.save_cursors_for_mutation(Some(root_pgno), None)?;
+            match self.try_insert_table_pax_fast(
+                root_pgno,
+                usable,
+                rowid,
+                PaxValueInput::Refs(refs),
+                allow_replace,
+            )? {
+                FastTableInsertOutcome::Inserted => return Ok(true),
+                FastTableInsertOutcome::Duplicate => return Ok(false),
+                FastTableInsertOutcome::Fallback => {}
+            }
+        }
+        encode_value_refs_record_into(refs, self.encoding(), scratch_rec);
+        if allow_replace {
+            self.insert_table(root_pgno, rowid, scratch_rec)?;
+            Ok(true)
+        } else {
+            self.insert_table_unique(root_pgno, rowid, scratch_rec)
+        }
+    }
+
+    /// Overwrites scalar (`NULL` / `INTEGER` / `REAL`) columns of `rowid` directly in place inside
+    /// a `0x2d` PAX table leaf (`4 B` or `8 B` direct slice write, zero record re-encoding or cell
+    /// reallocation!). Returns `Ok(false)` without mutating the page if `rowid` is on a `0x0d` leaf
+    /// or any updated column requires mode widening / variable-byte heap allocation.
+    pub fn try_update_table_pax_scalars(
+        &mut self,
+        root_pgno: Pgno,
+        rowid: i64,
+        updates: &[(usize, Value)],
+    ) -> Result<bool> {
+        if root_pgno < 2 || self.pager.page_count() == 0 {
+            return Ok(false);
+        }
+        let usable = self.pager.usable_size();
+        let mut cur_pgno = root_pgno;
+        let row_idx = loop {
+            self.check_interrupted()?;
+            let raw = self.pager.read_page(cur_pgno)?;
+            if cur_pgno >= 2 && raw.first().copied() == Some(PAX_TABLE_LEAF_BYTE) {
+                let view = PaxTableLeafView::new(cur_pgno, usable, raw)?;
+                match view.binary_search_rowid(rowid) {
+                    Ok(idx) => break idx,
+                    Err(_) => return Ok(false),
+                }
+            }
+            match peek_page_type(cur_pgno, usable, raw)? {
+                BtreePageType::TableInterior => {
+                    let (_, next_pgno) = find_table_interior_child(cur_pgno, usable, raw, rowid)?;
+                    cur_pgno = next_pgno;
+                }
+                _ => return Ok(false),
+            }
+        };
+        self.save_cursors_for_mutation(Some(root_pgno), None)?;
+        let raw_mut = self.pager.write_page(cur_pgno)?;
+        try_update_pax_table_row_scalars_at(cur_pgno, usable, raw_mut, row_idx, updates)
+    }
+
+    /// Overwrites scalar (`NULL` / `INTEGER` / `REAL`) columns at known `(leaf_pgno, row_idx)` on a
+    /// `0x2d` PAX table leaf in `O(1)` (verifying `rowid` match without re-descending the B-tree!).
+    pub fn try_update_table_pax_scalars_at(
+        &mut self,
+        root_pgno: Pgno,
+        leaf_pgno: Pgno,
+        row_idx: usize,
+        rowid: i64,
+        updates: &[(usize, Value)],
+    ) -> Result<bool> {
+        if root_pgno < 2 || leaf_pgno < 2 || self.pager.page_count() == 0 {
+            return Ok(false);
+        }
+        if self.is_auto_vacuum() {
+            return self.try_update_table_pax_scalars(root_pgno, rowid, updates);
+        }
+        let usable = self.pager.usable_size();
+        {
+            let raw = self.pager.read_page(leaf_pgno)?;
+            if raw.first().copied() != Some(PAX_TABLE_LEAF_BYTE) {
+                return Ok(false);
+            }
+            let view = PaxTableLeafView::new(leaf_pgno, usable, raw)?;
+            if row_idx >= view.len() || view.rowid_at(row_idx) != rowid {
+                return Ok(false);
+            }
+        }
+        self.save_cursors_for_mutation(Some(root_pgno), None)?;
+        let raw_mut = self.pager.write_page(leaf_pgno)?;
+        try_update_pax_table_row_scalars_at(leaf_pgno, usable, raw_mut, row_idx, updates)
+    }
+
+    fn try_insert_table_pax_fast(
+        &mut self,
+        root_pgno: Pgno,
+        usable: u32,
+        rowid: i64,
+        input: PaxValueInput<'_>,
+        allow_replace: bool,
+    ) -> Result<FastTableInsertOutcome> {
+        if root_pgno == 1
+            || self.encoding() != TextEncoding::Utf8
+            || usable < PAX_MIN_USABLE_SIZE as u32
+        {
+            return Ok(FastTableInsertOutcome::Fallback);
+        }
+        let is_p3v2 = self.is_p3v2_utf8();
+        let mut cur_pgno = root_pgno;
+        let mut parent_pgno: Pgno = 0;
+        let mut allow_quick_in_parent = false;
+
+        for _ in 0..(BTCURSOR_MAX_DEPTH + 1) {
+            enum PaxStep {
+                Descend {
+                    idx: usize,
+                    child: Pgno,
+                    n_cells: usize,
+                },
+                PaxLeaf {
+                    duplicate: bool,
+                },
+                EmptySlottedLeaf,
+                Bail,
+            }
+            let step = {
+                let raw = self.pager.read_page(cur_pgno)?;
+                let hdr_off = if cur_pgno == 1 { 100 } else { 0 };
+                if hdr_off >= usable as usize || hdr_off >= raw.len() {
+                    PaxStep::Bail
+                } else {
+                    let b = raw[hdr_off];
+                    if b == BtreePageType::TableInterior as u8 {
+                        let (idx, child, n_cells) =
+                            find_table_interior_child_append_hint(cur_pgno, usable, raw, rowid)?;
+                        PaxStep::Descend {
+                            idx,
+                            child,
+                            n_cells,
+                        }
+                    } else if cur_pgno >= 2 && b == PAX_TABLE_LEAF_BYTE {
+                        let dup = if !allow_replace {
+                            let view = PaxTableLeafView::new(cur_pgno, usable, raw)?;
+                            match view.last_rowid() {
+                                None => false,
+                                Some(last_rid) if rowid > last_rid => false,
+                                Some(last_rid) if rowid == last_rid => true,
+                                Some(_) => view.binary_search_rowid(rowid).is_ok(),
+                            }
+                        } else {
+                            false
+                        };
+                        PaxStep::PaxLeaf { duplicate: dup }
+                    } else if cur_pgno >= 2 && is_p3v2 && b == BtreePageType::TableLeaf as u8 {
+                        let n_cell = u16::from_be_bytes([raw[3], raw[4]]);
+                        if n_cell == 0 {
+                            PaxStep::EmptySlottedLeaf
+                        } else {
+                            PaxStep::Bail
+                        }
+                    } else {
+                        PaxStep::Bail
+                    }
+                }
+            };
+
+            match step {
+                PaxStep::Descend {
+                    idx,
+                    child,
+                    n_cells,
+                } => {
+                    allow_quick_in_parent = cur_pgno != 1 && idx == n_cells;
+                    parent_pgno = cur_pgno;
+                    cur_pgno = child;
+                }
+                PaxStep::Bail => return Ok(FastTableInsertOutcome::Fallback),
+                PaxStep::EmptySlottedLeaf => {
+                    let ok = {
+                        let raw_mut = self.pager.write_page(cur_pgno)?;
+                        init_pax_table_leaf_single(usable, raw_mut, rowid, input)?
+                    };
+                    return Ok(if ok {
+                        FastTableInsertOutcome::Inserted
+                    } else {
+                        FastTableInsertOutcome::Fallback
+                    });
+                }
+                PaxStep::PaxLeaf { duplicate: true } => {
+                    return Ok(FastTableInsertOutcome::Duplicate);
+                }
+                PaxStep::PaxLeaf { duplicate: false } => {
+                    let outcome = {
+                        let raw_mut = self.pager.write_page(cur_pgno)?;
+                        try_insert_pax_table_leaf(
+                            cur_pgno,
+                            usable,
+                            raw_mut,
+                            rowid,
+                            input,
+                            allow_replace,
+                        )?
+                    };
+                    return match outcome {
+                        PaxTableInsertOutcome::Inserted => Ok(FastTableInsertOutcome::Inserted),
+                        PaxTableInsertOutcome::Duplicate => Ok(FastTableInsertOutcome::Duplicate),
+                        PaxTableInsertOutcome::EscapeToSlotted => {
+                            Ok(FastTableInsertOutcome::Fallback)
+                        }
+                        PaxTableInsertOutcome::NeedsSplit { last_rowid } => {
+                            // Fast right-heavy append split on non-root rightmost `0x2d` leaf (`balance_quick`)!
+                            if allow_quick_in_parent
+                                && cur_pgno != root_pgno
+                                && cur_pgno >= 2
+                                && rowid > last_rowid
+                            {
+                                let parent_top_opt = {
+                                    let parent_raw = self.pager.read_page(parent_pgno)?;
+                                    probe_append_table_interior_rightmost(
+                                        parent_pgno,
+                                        usable,
+                                        parent_raw,
+                                        last_rowid,
+                                    )
+                                };
+                                if let Some(parent_top) = parent_top_opt {
+                                    let new_leaf = self.allocate_page()?;
+                                    let ok = {
+                                        let new_leaf_mut = self.pager.write_page(new_leaf)?;
+                                        init_pax_table_leaf_single(
+                                            usable,
+                                            new_leaf_mut,
+                                            rowid,
+                                            input,
+                                        )?
+                                    };
+                                    if ok {
+                                        {
+                                            let parent_mut = self.pager.write_page(parent_pgno)?;
+                                            apply_append_table_interior_rightmost(
+                                                parent_pgno,
+                                                parent_mut,
+                                                cur_pgno,
+                                                last_rowid,
+                                                new_leaf,
+                                                parent_top,
+                                            );
+                                        }
+                                        if self.is_auto_vacuum() {
+                                            self.ptrmap_put(
+                                                new_leaf,
+                                                PtrmapType::BtreeNode,
+                                                parent_pgno,
+                                            )?;
+                                        }
+                                        return Ok(FastTableInsertOutcome::Inserted);
+                                    }
+                                    self.free_page(new_leaf)?;
+                                }
+                                return Ok(FastTableInsertOutcome::Fallback);
+                            }
+
+                            // Fast root split when `cur_pgno == root_pgno >= 2`!
+                            if cur_pgno == root_pgno && cur_pgno >= 2 {
+                                let usable_usize = usable as usize;
+                                let mut left_buf =
+                                    self.pager.read_page(cur_pgno)?[..usable_usize].to_vec();
+                                let mut right_buf = vec![0u8; usable_usize];
+                                if let Some(div_key) = split_pax_table_leaf(
+                                    2,
+                                    usable,
+                                    &mut left_buf,
+                                    &mut right_buf,
+                                    rowid,
+                                    input,
+                                    rowid > last_rowid,
+                                )? {
+                                    let left_pgno = self.allocate_page()?;
+                                    let right_pgno = self.allocate_page()?;
+                                    self.pager.write_page(left_pgno)?[..usable_usize]
+                                        .copy_from_slice(&left_buf);
+                                    self.pager.write_page(right_pgno)?[..usable_usize]
+                                        .copy_from_slice(&right_buf);
+                                    let new_root = ParsedPage::TableInterior {
+                                        cells: vec![TableInteriorCell {
+                                            left_child: left_pgno,
+                                            key: div_key,
+                                        }],
+                                        right_child: right_pgno,
+                                    };
+                                    self.write_parsed_page(cur_pgno, &new_root)?;
+                                    return Ok(FastTableInsertOutcome::Inserted);
+                                }
+                            }
+                            Ok(FastTableInsertOutcome::Fallback)
+                        }
+                    };
+                }
+            }
+        }
+        Ok(FastTableInsertOutcome::Fallback)
+    }
+
     fn try_insert_table_fast_raw(
         &mut self,
         root_pgno: Pgno,
@@ -2611,6 +3550,22 @@ impl Btree {
         payload: &[u8],
         allow_replace: bool,
     ) -> Result<FastTableInsertOutcome> {
+        if root_pgno >= 2
+            && self.encoding() == TextEncoding::Utf8
+            && usable >= PAX_MIN_USABLE_SIZE as u32
+        {
+            match self.try_insert_table_pax_fast(
+                root_pgno,
+                usable,
+                rowid,
+                PaxValueInput::Payload(payload),
+                allow_replace,
+            )? {
+                FastTableInsertOutcome::Inserted => return Ok(FastTableInsertOutcome::Inserted),
+                FastTableInsertOutcome::Duplicate => return Ok(FastTableInsertOutcome::Duplicate),
+                FastTableInsertOutcome::Fallback => {}
+            }
+        }
         enum RawLevelStep {
             Descend {
                 idx: usize,
@@ -2795,12 +3750,14 @@ impl Btree {
                 (idx, target_child, n_cells)
             };
             let child_allow_quick = pgno != 1 && idx == n_cells;
-            let target_ptype = {
+            let (target_ptype, target_is_pax) = {
                 let raw = self.pager.read_page(target_child)?;
-                peek_page_type(target_child, usable, raw)?
+                let is_pax = target_child >= 2 && raw.first().copied() == Some(PAX_TABLE_LEAF_BYTE);
+                (peek_page_type(target_child, usable, raw)?, is_pax)
             };
 
             let (cells, right_child) = if !child_allow_quick
+                && !target_is_pax
                 && n_cells >= 1
                 && target_ptype == BtreePageType::TableLeaf
             {
@@ -3008,18 +3965,91 @@ impl Btree {
         }
 
         if ptype == BtreePageType::TableLeaf {
-            // Fast path: O(1) zero-allocation in-place insert when page is defragmented and has room!
-            let inserted_fast = {
-                let raw_mut = self.pager.write_page(pgno)?;
-                try_insert_table_leaf_in_place(pgno, usable, raw_mut, &cell)?
+            let (is_pax, is_empty_slotted) = {
+                let raw = self.pager.read_page(pgno)?;
+                let is_pax = pgno >= 2 && raw.first().copied() == Some(PAX_TABLE_LEAF_BYTE);
+                let is_empty = pgno >= 2
+                    && raw.first().copied() == Some(BtreePageType::TableLeaf as u8)
+                    && u16::from_be_bytes([raw[3], raw[4]]) == 0;
+                (is_pax, is_empty)
             };
-            if inserted_fast {
-                if self.is_auto_vacuum()
-                    && let Some(ovfl) = cell.overflow_page
-                {
-                    self.ptrmap_put(ovfl, PtrmapType::Overflow1, pgno)?;
+
+            if cell.overflow_page.is_none()
+                && self.encoding() == TextEncoding::Utf8
+                && usable >= PAX_MIN_USABLE_SIZE as u32
+                && (is_pax || (is_empty_slotted && self.is_p3v2_utf8()))
+            {
+                let pax_out = {
+                    let raw_mut = self.pager.write_page(pgno)?;
+                    try_insert_pax_table_leaf(
+                        pgno,
+                        usable,
+                        raw_mut,
+                        cell.rowid,
+                        PaxValueInput::Payload(&cell.local_payload),
+                        true,
+                    )?
+                };
+                match pax_out {
+                    PaxTableInsertOutcome::Inserted | PaxTableInsertOutcome::Duplicate => {
+                        return Ok(Vec::new());
+                    }
+                    PaxTableInsertOutcome::NeedsSplit { .. } => {
+                        let usable_usize = usable as usize;
+                        let mut left_buf = self.pager.read_page(pgno)?[..usable_usize].to_vec();
+                        let mut right_buf = vec![0u8; usable_usize];
+                        let split_pgno = if is_root { 2 } else { pgno };
+                        if let Some(div_key) = split_pax_table_leaf(
+                            split_pgno,
+                            usable,
+                            &mut left_buf,
+                            &mut right_buf,
+                            cell.rowid,
+                            PaxValueInput::Payload(&cell.local_payload),
+                            allow_quick_balance,
+                        )? {
+                            if is_root {
+                                let left_pgno = self.allocate_page()?;
+                                let right_pgno = self.allocate_page()?;
+                                self.pager.write_page(left_pgno)?[..usable_usize]
+                                    .copy_from_slice(&left_buf);
+                                self.pager.write_page(right_pgno)?[..usable_usize]
+                                    .copy_from_slice(&right_buf);
+                                let new_root = ParsedPage::TableInterior {
+                                    cells: vec![TableInteriorCell {
+                                        left_child: left_pgno,
+                                        key: div_key,
+                                    }],
+                                    right_child: right_pgno,
+                                };
+                                self.write_parsed_page(pgno, &new_root)?;
+                                return Ok(Vec::new());
+                            }
+                            let sib_pgno = self.allocate_page()?;
+                            self.pager.write_page(pgno)?[..usable_usize].copy_from_slice(&left_buf);
+                            self.pager.write_page(sib_pgno)?[..usable_usize]
+                                .copy_from_slice(&right_buf);
+                            return Ok(vec![(div_key, sib_pgno)]);
+                        }
+                    }
+                    PaxTableInsertOutcome::EscapeToSlotted => {}
                 }
-                return Ok(Vec::new());
+            }
+
+            if !is_pax {
+                // Fast path: O(1) zero-allocation in-place insert when page is defragmented and has room!
+                let inserted_fast = {
+                    let raw_mut = self.pager.write_page(pgno)?;
+                    try_insert_table_leaf_in_place(pgno, usable, raw_mut, &cell)?
+                };
+                if inserted_fast {
+                    if self.is_auto_vacuum()
+                        && let Some(ovfl) = cell.overflow_page
+                    {
+                        self.ptrmap_put(ovfl, PtrmapType::Overflow1, pgno)?;
+                    }
+                    return Ok(Vec::new());
+                }
             }
         }
 
@@ -3198,6 +4228,16 @@ impl Btree {
                     self.free_page(pgno)?;
                     return Ok((true, Some(right_child)));
                 }
+                if pgno >= 2
+                    && self.pager.read_page(right_child)?.first().copied()
+                        == Some(PAX_TABLE_LEAF_BYTE)
+                {
+                    let usable_usize = usable as usize;
+                    let child_copy = self.pager.read_page(right_child)?[..usable_usize].to_vec();
+                    self.pager.write_page(pgno)?[..usable_usize].copy_from_slice(&child_copy);
+                    self.free_page(right_child)?;
+                    return Ok((true, None));
+                }
                 let child_parsed = self.read_parsed_page(right_child)?;
                 if child_parsed.fits_in_page(pgno, usable) {
                     self.write_parsed_page(pgno, &child_parsed)?;
@@ -3211,6 +4251,40 @@ impl Btree {
         }
 
         if ptype == BtreePageType::TableLeaf {
+            if pgno >= 2
+                && self.pager.read_page(pgno)?.first().copied() == Some(PAX_TABLE_LEAF_BYTE)
+            {
+                let present = {
+                    let raw = self.pager.read_page(pgno)?;
+                    let view = PaxTableLeafView::new(pgno, usable, raw)?;
+                    view.binary_search_rowid(rowid).is_ok()
+                };
+                if !present {
+                    return Ok((false, None));
+                }
+                let outcome = {
+                    let raw_mut = self.pager.write_page(pgno)?;
+                    delete_pax_table_leaf_row(
+                        pgno,
+                        usable,
+                        raw_mut,
+                        rowid,
+                        is_root,
+                        old_payload_out,
+                    )?
+                };
+                return match outcome {
+                    PaxTableDeleteOutcome::NotFound => Ok((false, None)),
+                    PaxTableDeleteOutcome::Deleted { now_empty } => {
+                        if now_empty && !is_root {
+                            self.free_page(pgno)?;
+                            Ok((true, Some(0)))
+                        } else {
+                            Ok((true, None))
+                        }
+                    }
+                };
+            }
             // Single binary-search probe via `read_page` so missing-key deletes don't dirty pages
             // and matching deletes neither re-search nor allocate!
             let probe = {
@@ -3343,6 +4417,16 @@ impl Btree {
         if !reverse {
             return self.scan_index_morsels(root_pgno, false, |item| match item {
                 IndexScanItem::LeafMorsel { morsel, start, end } => {
+                    if let Some(pv) = morsel.pax_view() {
+                        let mut sbuf = [0u8; 32];
+                        for ci in start..end {
+                            let n = pv.encode_row_stack(ci, &mut sbuf);
+                            if visit(&sbuf[..n])?.is_break() {
+                                return Ok(MorselStep::Break);
+                            }
+                        }
+                        return Ok(MorselStep::Continue);
+                    }
                     for ci in start..end {
                         let Some(payload) = morsel.local_cell(ci)? else {
                             return Ok(MorselStep::OverflowAt(ci));
@@ -3449,6 +4533,7 @@ impl Btree {
                     enum LeafMorselAction {
                         Done,
                         Broke,
+                        PaxSingle(usize, [u8; 32], usize),
                         Overflow(usize, u32, Vec<u8>, Option<Pgno>),
                     }
                     let act = {
@@ -3462,19 +4547,31 @@ impl Btree {
                             MorselStep::Continue => LeafMorselAction::Done,
                             MorselStep::Break => LeafMorselAction::Broke,
                             MorselStep::OverflowAt(ovfl_ci) => {
-                                let cell = morsel.read_cell(ovfl_ci)?;
-                                LeafMorselAction::Overflow(
-                                    ovfl_ci + 1,
-                                    cell.total_payload_len,
-                                    cell.local_payload.to_vec(),
-                                    cell.overflow_page,
-                                )
+                                if let Some(pv) = morsel.pax_view() {
+                                    let mut sbuf = [0u8; 32];
+                                    let n = pv.encode_row_stack(ovfl_ci, &mut sbuf);
+                                    LeafMorselAction::PaxSingle(ovfl_ci + 1, sbuf, n)
+                                } else {
+                                    let cell = morsel.read_cell(ovfl_ci)?;
+                                    LeafMorselAction::Overflow(
+                                        ovfl_ci + 1,
+                                        cell.total_payload_len,
+                                        cell.local_payload.to_vec(),
+                                        cell.overflow_page,
+                                    )
+                                }
                             }
                         }
                     };
                     match act {
                         LeafMorselAction::Done => break,
                         LeafMorselAction::Broke => return Ok(ControlFlow::Break(())),
+                        LeafMorselAction::PaxSingle(next_ci, sbuf, n) => {
+                            ci = next_ci;
+                            if visit(IndexScanItem::SingleCell(&sbuf[..n]))? == MorselStep::Break {
+                                return Ok(ControlFlow::Break(()));
+                            }
+                        }
                         LeafMorselAction::Overflow(next_ci, tlen, local_copy, ovfl) => {
                             ci = next_ci;
                             let full = self.read_full_payload(tlen, &local_copy, ovfl)?;
@@ -3558,6 +4655,29 @@ impl Btree {
         };
         match ptype {
             BtreePageType::IndexLeaf => {
+                if pgno >= 2
+                    && self.pager.read_page(pgno)?.first().copied() == Some(PAX_INDEX_LEAF_BYTE)
+                {
+                    let raw = self.pager.read_page(pgno)?;
+                    let pv = PaxIndexLeafView::new(pgno, usable, raw)?;
+                    let mut sbuf = [0u8; 32];
+                    if !reverse {
+                        for ci in 0..pv.len() {
+                            let n = pv.encode_row_stack(ci, &mut sbuf);
+                            if visit(&sbuf[..n])?.is_break() {
+                                return Ok(ControlFlow::Break(()));
+                            }
+                        }
+                    } else {
+                        for ci in (0..pv.len()).rev() {
+                            let n = pv.encode_row_stack(ci, &mut sbuf);
+                            if visit(&sbuf[..n])?.is_break() {
+                                return Ok(ControlFlow::Break(()));
+                            }
+                        }
+                    }
+                    return Ok(ControlFlow::Continue(()));
+                }
                 if !reverse {
                     let mut ci = 0usize;
                     while ci < n_cell {
@@ -3793,38 +4913,64 @@ impl Btree {
                 let (ptype, n_cell, right_child) = raw_page_header(pgno, usable, raw)?;
                 match ptype {
                     BtreePageType::IndexLeaf => {
-                        let mut lo = 0usize;
-                        let mut hi = n_cell;
-                        let mut slow = false;
-                        let mut found = false;
-                        while lo < hi {
-                            let mid = lo + (hi - lo) / 2;
-                            let cell = read_index_leaf_cell(pgno, usable, raw, n_cell, mid)?;
-                            if cell.overflow_page.is_some() {
-                                slow = true;
-                                break;
+                        if pgno >= 2 && raw.first().copied() == Some(PAX_INDEX_LEAF_BYTE) {
+                            let pv = PaxIndexLeafView::new(pgno, usable, raw)?;
+                            let mut lo = 0usize;
+                            let mut hi = pv.len();
+                            let mut found = false;
+                            while lo < hi {
+                                let mid = lo + (hi - lo) / 2;
+                                match pv.compare_range_at(
+                                    mid,
+                                    prefix_values,
+                                    None,
+                                    None,
+                                    orders,
+                                    enc,
+                                )? {
+                                    Ordering::Less => lo = mid + 1,
+                                    Ordering::Equal => {
+                                        found = true;
+                                        break;
+                                    }
+                                    Ordering::Greater => hi = mid,
+                                }
                             }
-                            let ord = compare_raw_record_range(
-                                cell.local_payload,
-                                prefix_values,
-                                None,
-                                None,
-                                orders,
-                                enc,
-                            )?;
-                            match ord {
-                                Ordering::Less => lo = mid + 1,
-                                Ordering::Equal => {
-                                    found = true;
+                            PrefixStep::Found(found)
+                        } else {
+                            let mut lo = 0usize;
+                            let mut hi = n_cell;
+                            let mut slow = false;
+                            let mut found = false;
+                            while lo < hi {
+                                let mid = lo + (hi - lo) / 2;
+                                let cell = read_index_leaf_cell(pgno, usable, raw, n_cell, mid)?;
+                                if cell.overflow_page.is_some() {
+                                    slow = true;
                                     break;
                                 }
-                                Ordering::Greater => hi = mid,
+                                let ord = compare_raw_record_range(
+                                    cell.local_payload,
+                                    prefix_values,
+                                    None,
+                                    None,
+                                    orders,
+                                    enc,
+                                )?;
+                                match ord {
+                                    Ordering::Less => lo = mid + 1,
+                                    Ordering::Equal => {
+                                        found = true;
+                                        break;
+                                    }
+                                    Ordering::Greater => hi = mid,
+                                }
                             }
-                        }
-                        if slow {
-                            PrefixStep::SlowLeaf(n_cell)
-                        } else {
-                            PrefixStep::Found(found)
+                            if slow {
+                                PrefixStep::SlowLeaf(n_cell)
+                            } else {
+                                PrefixStep::Found(found)
+                            }
                         }
                     }
                     BtreePageType::IndexInterior => {
@@ -4083,6 +5229,27 @@ impl Btree {
 
         match ptype {
             BtreePageType::TableLeaf => {
+                if pgno >= 2
+                    && self.pager.read_page(pgno)?.first().copied() == Some(PAX_TABLE_LEAF_BYTE)
+                {
+                    let raw = self.pager.read_page(pgno)?;
+                    let view = PaxTableLeafView::new(pgno, usable, raw)?;
+                    let start = lo_inc.map_or(0, |lo| view.lower_bound_rowid(lo));
+                    let mut rec_buf = Vec::new();
+                    for ci in start..view.len() {
+                        let rowid = view.rowid_at(ci);
+                        if let Some(hi) = hi_inc
+                            && rowid > hi
+                        {
+                            break;
+                        }
+                        view.encode_row_record_into(ci, &mut rec_buf)?;
+                        if visit(rowid, &rec_buf)?.is_break() {
+                            return Ok(ControlFlow::Break(()));
+                        }
+                    }
+                    return Ok(ControlFlow::Continue(()));
+                }
                 let mut ci = if let Some(lo) = lo_inc {
                     let raw = self.pager.read_page(pgno)?;
                     match binary_search_table_leaf(pgno, usable, raw, n_cell, lo)? {
@@ -4325,6 +5492,16 @@ impl Btree {
                 false,
                 |item| match item {
                     IndexScanItem::LeafMorsel { morsel, start, end } => {
+                        if let Some(pv) = morsel.pax_view() {
+                            let mut sbuf = [0u8; 32];
+                            for ci in start..end {
+                                let n = pv.encode_row_stack(ci, &mut sbuf);
+                                if visit(&sbuf[..n])?.is_break() {
+                                    return Ok(MorselStep::Break);
+                                }
+                            }
+                            return Ok(MorselStep::Continue);
+                        }
                         for ci in start..end {
                             let Some(payload) = morsel.local_cell(ci)? else {
                                 return Ok(MorselStep::OverflowAt(ci));
@@ -4474,118 +5651,109 @@ impl Btree {
             match ptype {
                 BtreePageType::IndexLeaf => {
                     let morsel = IndexLeafMorsel::new(pgno, usable, raw, n_cell)?;
-                    let mut lo = 0usize;
-                    let mut hi = n_cell;
-                    let mut has_ovfl = false;
-                    while lo < hi {
-                        let mid = lo + (hi - lo) / 2;
-                        let Some(payload) = morsel.local_cell(mid)? else {
-                            has_ovfl = true;
-                            break;
-                        };
-                        let ord = compare_raw_record_range(
-                            payload,
+                    if let Some(pv) = morsel.pax_view() {
+                        let (lo, ulo, hit_greater) = pv.find_range_bounds(
                             prefix_values,
                             lower_bound,
                             upper_bound,
                             orders,
                             enc,
                         )?;
-                        if ord == Ordering::Less {
-                            lo = mid + 1;
+                        let mut cf = if hit_greater {
+                            ControlFlow::Break(())
                         } else {
-                            hi = mid;
-                        }
-                    }
-                    if has_ovfl {
-                        FastFwdOutcome::SlowLeaf {
-                            n_cell,
-                            resume_ci: None,
-                        }
-                    } else if lo == n_cell {
-                        FastFwdOutcome::LeafCompleted(ControlFlow::Continue(()))
-                    } else {
-                        // Probe `last_cell` (`n_cell - 1`) against the upper bound:
-                        // - `Equal`: every cell in `lo..n_cell` is guaranteed in-range!
-                        // - `Greater`: binary-search `lo..(n_cell - 1)` in `O(log N)` for exact `end_idx`,
-                        //   visit `lo..end_idx` in a tight morsel, and terminate range scan immediately!
-                        match morsel.local_cell(n_cell - 1)? {
-                            None => FastFwdOutcome::SlowLeaf {
-                                n_cell,
-                                resume_ci: Some(lo),
-                            },
-                            Some(last_payload) => {
-                                let last_ord = compare_raw_record_range(
-                                    last_payload,
-                                    prefix_values,
-                                    lower_bound,
-                                    upper_bound,
-                                    orders,
-                                    enc,
-                                )?;
-                                match last_ord {
-                                    Ordering::Equal => {
-                                        match visit(IndexScanItem::LeafMorsel {
-                                            morsel: &morsel,
-                                            start: lo,
-                                            end: n_cell,
-                                        })? {
-                                            MorselStep::Continue => FastFwdOutcome::LeafCompleted(
-                                                ControlFlow::Continue(()),
-                                            ),
-                                            MorselStep::Break => FastFwdOutcome::LeafCompleted(
-                                                ControlFlow::Break(()),
-                                            ),
-                                            MorselStep::OverflowAt(ovfl_ci) => {
-                                                FastFwdOutcome::SlowLeaf {
-                                                    n_cell,
-                                                    resume_ci: Some(ovfl_ci),
-                                                }
-                                            }
+                            ControlFlow::Continue(())
+                        };
+                        if ulo > lo {
+                            match visit(IndexScanItem::LeafMorsel {
+                                morsel: &morsel,
+                                start: lo,
+                                end: ulo,
+                            })? {
+                                MorselStep::Continue => {}
+                                MorselStep::Break => {
+                                    cf = ControlFlow::Break(());
+                                }
+                                MorselStep::OverflowAt(ovfl_ci) => {
+                                    let mut sbuf = [0u8; 32];
+                                    for ci in ovfl_ci..ulo {
+                                        let n = pv.encode_row_stack(ci, &mut sbuf);
+                                        if visit(IndexScanItem::SingleCell(&sbuf[..n]))?
+                                            == MorselStep::Break
+                                        {
+                                            cf = ControlFlow::Break(());
+                                            break;
                                         }
                                     }
-                                    Ordering::Greater => {
-                                        let mut ulo = lo;
-                                        let mut uhi = n_cell - 1;
-                                        let mut mid_ovfl = false;
-                                        while ulo < uhi {
-                                            let mid = ulo + (uhi - ulo) / 2;
-                                            let Some(mid_payload) = morsel.local_cell(mid)? else {
-                                                mid_ovfl = true;
-                                                break;
-                                            };
-                                            let ord = compare_raw_record_range(
-                                                mid_payload,
-                                                prefix_values,
-                                                lower_bound,
-                                                upper_bound,
-                                                orders,
-                                                enc,
-                                            )?;
-                                            if ord == Ordering::Greater {
-                                                uhi = mid;
-                                            } else {
-                                                ulo = mid + 1;
-                                            }
-                                        }
-                                        if mid_ovfl {
-                                            FastFwdOutcome::SlowLeaf {
-                                                n_cell,
-                                                resume_ci: Some(lo),
-                                            }
-                                        } else if ulo == lo {
-                                            FastFwdOutcome::LeafCompleted(ControlFlow::Break(()))
-                                        } else {
+                                }
+                            }
+                        }
+                        FastFwdOutcome::LeafCompleted(cf)
+                    } else {
+                        let mut lo = 0usize;
+                        let mut hi = n_cell;
+                        let mut has_ovfl = false;
+                        while lo < hi {
+                            let mid = lo + (hi - lo) / 2;
+                            let Some(payload) = morsel.local_cell(mid)? else {
+                                has_ovfl = true;
+                                break;
+                            };
+                            let ord = compare_raw_record_range(
+                                payload,
+                                prefix_values,
+                                lower_bound,
+                                upper_bound,
+                                orders,
+                                enc,
+                            )?;
+                            if ord == Ordering::Less {
+                                lo = mid + 1;
+                            } else {
+                                hi = mid;
+                            }
+                        }
+                        if has_ovfl {
+                            FastFwdOutcome::SlowLeaf {
+                                n_cell,
+                                resume_ci: None,
+                            }
+                        } else if lo == n_cell {
+                            FastFwdOutcome::LeafCompleted(ControlFlow::Continue(()))
+                        } else {
+                            // Probe `last_cell` (`n_cell - 1`) against the upper bound:
+                            // - `Equal`: every cell in `lo..n_cell` is guaranteed in-range!
+                            // - `Greater`: binary-search `lo..(n_cell - 1)` in `O(log N)` for exact `end_idx`,
+                            //   visit `lo..end_idx` in a tight morsel, and terminate range scan immediately!
+                            match morsel.local_cell(n_cell - 1)? {
+                                None => FastFwdOutcome::SlowLeaf {
+                                    n_cell,
+                                    resume_ci: Some(lo),
+                                },
+                                Some(last_payload) => {
+                                    let last_ord = compare_raw_record_range(
+                                        last_payload,
+                                        prefix_values,
+                                        lower_bound,
+                                        upper_bound,
+                                        orders,
+                                        enc,
+                                    )?;
+                                    match last_ord {
+                                        Ordering::Equal => {
                                             match visit(IndexScanItem::LeafMorsel {
                                                 morsel: &morsel,
                                                 start: lo,
-                                                end: ulo,
+                                                end: n_cell,
                                             })? {
-                                                MorselStep::Continue | MorselStep::Break => {
+                                                MorselStep::Continue => {
                                                     FastFwdOutcome::LeafCompleted(
-                                                        ControlFlow::Break(()),
+                                                        ControlFlow::Continue(()),
                                                     )
                                                 }
+                                                MorselStep::Break => FastFwdOutcome::LeafCompleted(
+                                                    ControlFlow::Break(()),
+                                                ),
                                                 MorselStep::OverflowAt(ovfl_ci) => {
                                                     FastFwdOutcome::SlowLeaf {
                                                         n_cell,
@@ -4594,11 +5762,65 @@ impl Btree {
                                                 }
                                             }
                                         }
+                                        Ordering::Greater => {
+                                            let mut ulo = lo;
+                                            let mut uhi = n_cell - 1;
+                                            let mut mid_ovfl = false;
+                                            while ulo < uhi {
+                                                let mid = ulo + (uhi - ulo) / 2;
+                                                let Some(mid_payload) = morsel.local_cell(mid)?
+                                                else {
+                                                    mid_ovfl = true;
+                                                    break;
+                                                };
+                                                let ord = compare_raw_record_range(
+                                                    mid_payload,
+                                                    prefix_values,
+                                                    lower_bound,
+                                                    upper_bound,
+                                                    orders,
+                                                    enc,
+                                                )?;
+                                                if ord == Ordering::Greater {
+                                                    uhi = mid;
+                                                } else {
+                                                    ulo = mid + 1;
+                                                }
+                                            }
+                                            if mid_ovfl {
+                                                FastFwdOutcome::SlowLeaf {
+                                                    n_cell,
+                                                    resume_ci: Some(lo),
+                                                }
+                                            } else if ulo == lo {
+                                                FastFwdOutcome::LeafCompleted(
+                                                    ControlFlow::Break(()),
+                                                )
+                                            } else {
+                                                match visit(IndexScanItem::LeafMorsel {
+                                                    morsel: &morsel,
+                                                    start: lo,
+                                                    end: ulo,
+                                                })? {
+                                                    MorselStep::Continue | MorselStep::Break => {
+                                                        FastFwdOutcome::LeafCompleted(
+                                                            ControlFlow::Break(()),
+                                                        )
+                                                    }
+                                                    MorselStep::OverflowAt(ovfl_ci) => {
+                                                        FastFwdOutcome::SlowLeaf {
+                                                            n_cell,
+                                                            resume_ci: Some(ovfl_ci),
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Ordering::Less => FastFwdOutcome::SlowLeaf {
+                                            n_cell,
+                                            resume_ci: Some(lo),
+                                        },
                                     }
-                                    Ordering::Less => FastFwdOutcome::SlowLeaf {
-                                        n_cell,
-                                        resume_ci: Some(lo),
-                                    },
                                 }
                             }
                         }
@@ -4972,6 +6194,18 @@ impl Btree {
                     cell.overflow_page,
                 )
             } else {
+                if pgno >= 2 && raw.first().copied() == Some(PAX_INDEX_LEAF_BYTE) {
+                    let pv = PaxIndexLeafView::new(pgno, usable, raw)?;
+                    let ord = pv.compare_range_at(
+                        idx,
+                        prefix_values,
+                        lower_bound,
+                        upper_bound,
+                        orders,
+                        enc,
+                    )?;
+                    return Ok((0, ord));
+                }
                 let cell = read_index_leaf_cell(pgno, usable, raw, n_cell, idx)?;
                 if cell.overflow_page.is_none() {
                     let ord = compare_raw_record_range(
@@ -5044,77 +6278,47 @@ impl Btree {
             let (ptype, n_cell, right_child) = raw_page_header(pgno, usable, raw)?;
             match ptype {
                 BtreePageType::IndexLeaf => {
-                    let mut lo = 0usize;
-                    let mut hi = n_cell;
-                    let mut has_ovfl = false;
-                    while lo < hi {
-                        let mid = lo + (hi - lo) / 2;
-                        let cell = read_index_leaf_cell(pgno, usable, raw, n_cell, mid)?;
-                        if cell.overflow_page.is_some() {
-                            has_ovfl = true;
-                            break;
-                        }
-                        let ord = compare_raw_record_range(
-                            cell.local_payload,
+                    if pgno >= 2 && raw.first().copied() == Some(PAX_INDEX_LEAF_BYTE) {
+                        let pv = PaxIndexLeafView::new(pgno, usable, raw)?;
+                        let (lo, ulo, hit_greater) = pv.find_range_bounds(
                             prefix_values,
                             lower_bound,
                             upper_bound,
                             orders,
                             enc,
                         )?;
-                        if ord == Ordering::Less {
-                            lo = mid + 1;
-                        } else {
-                            hi = mid;
-                        }
-                    }
-                    if has_ovfl {
-                        FastPageOutcome::SlowLeaf {
-                            n_cell,
-                            resume_ci: None,
-                        }
-                    } else if !reverse {
-                        let mut cf = ControlFlow::Continue(());
-                        let mut ci = lo;
-                        let mut ovfl_at = None;
-                        while ci < n_cell {
-                            let cell = read_index_leaf_cell(pgno, usable, raw, n_cell, ci)?;
-                            if cell.overflow_page.is_some() {
-                                ovfl_at = Some(ci);
-                                break;
-                            }
-                            ci += 1;
-                            match compare_raw_record_range(
-                                cell.local_payload,
-                                prefix_values,
-                                lower_bound,
-                                upper_bound,
-                                orders,
-                                enc,
-                            )? {
-                                Ordering::Less => continue,
-                                Ordering::Equal => {
-                                    if visit(cell.local_payload)?.is_break() {
-                                        cf = ControlFlow::Break(());
-                                        break;
-                                    }
+                        let mut sbuf = [0u8; 32];
+                        if !reverse {
+                            let mut cf = if hit_greater {
+                                ControlFlow::Break(())
+                            } else {
+                                ControlFlow::Continue(())
+                            };
+                            for ci in lo..ulo {
+                                let n = pv.encode_row_stack(ci, &mut sbuf);
+                                if visit(&sbuf[..n])?.is_break() {
+                                    cf = ControlFlow::Break(());
+                                    break;
                                 }
-                                Ordering::Greater => break,
                             }
-                        }
-                        if let Some(resume_idx) = ovfl_at {
-                            FastPageOutcome::SlowLeaf {
-                                n_cell,
-                                resume_ci: Some(resume_idx),
-                            }
+                            FastPageOutcome::LeafCompleted(cf)
                         } else {
+                            let mut cf = ControlFlow::Continue(());
+                            for ci in (lo..ulo).rev() {
+                                let n = pv.encode_row_stack(ci, &mut sbuf);
+                                if visit(&sbuf[..n])?.is_break() {
+                                    cf = ControlFlow::Break(());
+                                    break;
+                                }
+                            }
                             FastPageOutcome::LeafCompleted(cf)
                         }
                     } else {
-                        let mut ulo = lo;
-                        let mut uhi = n_cell;
-                        while ulo < uhi {
-                            let mid = ulo + (uhi - ulo) / 2;
+                        let mut lo = 0usize;
+                        let mut hi = n_cell;
+                        let mut has_ovfl = false;
+                        while lo < hi {
+                            let mid = lo + (hi - lo) / 2;
                             let cell = read_index_leaf_cell(pgno, usable, raw, n_cell, mid)?;
                             if cell.overflow_page.is_some() {
                                 has_ovfl = true;
@@ -5128,21 +6332,10 @@ impl Btree {
                                 orders,
                                 enc,
                             )?;
-                            if ord == Ordering::Greater {
-                                uhi = mid;
+                            if ord == Ordering::Less {
+                                lo = mid + 1;
                             } else {
-                                ulo = mid + 1;
-                            }
-                        }
-                        if !has_ovfl {
-                            for idx in (lo..ulo).rev() {
-                                if read_index_leaf_cell(pgno, usable, raw, n_cell, idx)?
-                                    .overflow_page
-                                    .is_some()
-                                {
-                                    has_ovfl = true;
-                                    break;
-                                }
+                                hi = mid;
                             }
                         }
                         if has_ovfl {
@@ -5150,25 +6343,104 @@ impl Btree {
                                 n_cell,
                                 resume_ci: None,
                             }
-                        } else {
+                        } else if !reverse {
                             let mut cf = ControlFlow::Continue(());
-                            for idx in (lo..ulo).rev() {
-                                let cell = read_index_leaf_cell(pgno, usable, raw, n_cell, idx)?;
-                                if compare_raw_record_range(
+                            let mut ci = lo;
+                            let mut ovfl_at = None;
+                            while ci < n_cell {
+                                let cell = read_index_leaf_cell(pgno, usable, raw, n_cell, ci)?;
+                                if cell.overflow_page.is_some() {
+                                    ovfl_at = Some(ci);
+                                    break;
+                                }
+                                ci += 1;
+                                match compare_raw_record_range(
                                     cell.local_payload,
                                     prefix_values,
                                     lower_bound,
                                     upper_bound,
                                     orders,
                                     enc,
-                                )? == Ordering::Equal
-                                    && visit(cell.local_payload)?.is_break()
-                                {
-                                    cf = ControlFlow::Break(());
-                                    break;
+                                )? {
+                                    Ordering::Less => continue,
+                                    Ordering::Equal => {
+                                        if visit(cell.local_payload)?.is_break() {
+                                            cf = ControlFlow::Break(());
+                                            break;
+                                        }
+                                    }
+                                    Ordering::Greater => break,
                                 }
                             }
-                            FastPageOutcome::LeafCompleted(cf)
+                            if let Some(resume_idx) = ovfl_at {
+                                FastPageOutcome::SlowLeaf {
+                                    n_cell,
+                                    resume_ci: Some(resume_idx),
+                                }
+                            } else {
+                                FastPageOutcome::LeafCompleted(cf)
+                            }
+                        } else {
+                            let mut ulo = lo;
+                            let mut uhi = n_cell;
+                            while ulo < uhi {
+                                let mid = ulo + (uhi - ulo) / 2;
+                                let cell = read_index_leaf_cell(pgno, usable, raw, n_cell, mid)?;
+                                if cell.overflow_page.is_some() {
+                                    has_ovfl = true;
+                                    break;
+                                }
+                                let ord = compare_raw_record_range(
+                                    cell.local_payload,
+                                    prefix_values,
+                                    lower_bound,
+                                    upper_bound,
+                                    orders,
+                                    enc,
+                                )?;
+                                if ord == Ordering::Greater {
+                                    uhi = mid;
+                                } else {
+                                    ulo = mid + 1;
+                                }
+                            }
+                            if !has_ovfl {
+                                for idx in (lo..ulo).rev() {
+                                    if read_index_leaf_cell(pgno, usable, raw, n_cell, idx)?
+                                        .overflow_page
+                                        .is_some()
+                                    {
+                                        has_ovfl = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if has_ovfl {
+                                FastPageOutcome::SlowLeaf {
+                                    n_cell,
+                                    resume_ci: None,
+                                }
+                            } else {
+                                let mut cf = ControlFlow::Continue(());
+                                for idx in (lo..ulo).rev() {
+                                    let cell =
+                                        read_index_leaf_cell(pgno, usable, raw, n_cell, idx)?;
+                                    if compare_raw_record_range(
+                                        cell.local_payload,
+                                        prefix_values,
+                                        lower_bound,
+                                        upper_bound,
+                                        orders,
+                                        enc,
+                                    )? == Ordering::Equal
+                                        && visit(cell.local_payload)?.is_break()
+                                    {
+                                        cf = ControlFlow::Break(());
+                                        break;
+                                    }
+                                }
+                                FastPageOutcome::LeafCompleted(cf)
+                            }
                         }
                     }
                 }
@@ -5771,6 +7043,15 @@ impl Btree {
         record_bytes: &[u8],
         orders: &[KeySortOrder],
     ) -> Result<()> {
+        if root_pgno >= 2
+            && self.encoding() == TextEncoding::Utf8
+            && self.pager.usable_size() >= PAX_MIN_USABLE_SIZE as u32
+            && let Some(n_keys) = orders_allow_pax_index(orders)
+            && let Some(entry) = parse_record_as_pax_index_entry(record_bytes, n_keys)
+        {
+            return self.insert_index_pax_entry(root_pgno, n_keys, entry, orders);
+        }
+
         self.save_cursors_for_mutation(Some(root_pgno), None)?;
         let enc = self.encoding();
         let usable = self.pager.usable_size();
@@ -5824,9 +7105,17 @@ impl Btree {
         if let Some((promoted_cell, right_pgno)) =
             self.insert_index_rec(root_pgno, leaf_cell, key_vals, orders)?
         {
-            let left_parsed = self.read_parsed_page(root_pgno)?;
             let left_pgno = self.allocate_page()?;
-            self.write_parsed_page(left_pgno, &left_parsed)?;
+            if root_pgno >= 2
+                && self.pager.read_page(root_pgno)?.first().copied() == Some(PAX_INDEX_LEAF_BYTE)
+            {
+                let usable_usize = usable as usize;
+                let left_copy = self.pager.read_page(root_pgno)?[..usable_usize].to_vec();
+                self.pager.write_page(left_pgno)?[..usable_usize].copy_from_slice(&left_copy);
+            } else {
+                let left_parsed = self.read_parsed_page(root_pgno)?;
+                self.write_parsed_page(left_pgno, &left_parsed)?;
+            }
 
             let new_root = ParsedPage::IndexInterior {
                 cells: vec![IndexInteriorCell {
@@ -5840,6 +7129,337 @@ impl Btree {
             self.write_parsed_page(root_pgno, &new_root)?;
         }
         Ok(())
+    }
+
+    /// Direct typed-integer `P3v2` SoA index insert (`0x2a`), bypassing Format-3 record encoding
+    /// completely on `0x2a` leaves (`W01`, `W08`, `W10`, `W14`).
+    pub fn insert_index_pax_entry(
+        &mut self,
+        root_pgno: Pgno,
+        n_keys: u8,
+        entry: PaxIndexEntry,
+        orders: &[KeySortOrder],
+    ) -> Result<()> {
+        self.save_cursors_for_mutation(Some(root_pgno), None)?;
+        let usable = self.pager.usable_size();
+        let enc = self.encoding();
+        if root_pgno >= 2
+            && enc == TextEncoding::Utf8
+            && usable >= PAX_MIN_USABLE_SIZE as u32
+            && matches!(n_keys, 1 | 2)
+        {
+            let is_p3v2 = self.is_p3v2_utf8();
+            let mut sbuf = [0u8; 32];
+            let mut slen = 0usize;
+            let mut cur_pgno = root_pgno;
+
+            for _ in 0..BTCURSOR_MAX_DEPTH {
+                enum PaxIdxStep {
+                    Descend(Pgno),
+                    AlreadyPresent,
+                    PaxOrEmptyLeaf,
+                    Bail,
+                }
+                let step = {
+                    let raw = self.pager.read_page(cur_pgno)?;
+                    let hdr_off = if cur_pgno == 1 { 100 } else { 0 };
+                    if hdr_off >= raw.len() {
+                        PaxIdxStep::Bail
+                    } else {
+                        let b = raw[hdr_off];
+                        if b == BtreePageType::IndexInterior as u8 {
+                            if slen == 0 {
+                                slen = encode_pax_index_entry_stack(n_keys, entry, &mut sbuf);
+                            }
+                            match probe_index_interior_step_raw(
+                                cur_pgno,
+                                usable,
+                                raw,
+                                &sbuf[..slen],
+                                orders,
+                                enc,
+                            )? {
+                                Some(RawIndexInteriorStep::Child(c)) => PaxIdxStep::Descend(c),
+                                Some(RawIndexInteriorStep::EqualAt { .. }) => {
+                                    PaxIdxStep::AlreadyPresent
+                                }
+                                None => PaxIdxStep::Bail,
+                            }
+                        } else if cur_pgno >= 2 && b == PAX_INDEX_LEAF_BYTE {
+                            PaxIdxStep::PaxOrEmptyLeaf
+                        } else if cur_pgno >= 2 && is_p3v2 && b == BtreePageType::IndexLeaf as u8 {
+                            let n_cell = u16::from_be_bytes([raw[3], raw[4]]);
+                            if n_cell == 0 {
+                                PaxIdxStep::PaxOrEmptyLeaf
+                            } else {
+                                PaxIdxStep::Bail
+                            }
+                        } else {
+                            PaxIdxStep::Bail
+                        }
+                    }
+                };
+                match step {
+                    PaxIdxStep::Descend(c) => cur_pgno = c,
+                    PaxIdxStep::AlreadyPresent => return Ok(()),
+                    PaxIdxStep::Bail => break,
+                    PaxIdxStep::PaxOrEmptyLeaf => {
+                        let outcome = {
+                            let raw_mut = self.pager.write_page(cur_pgno)?;
+                            try_insert_pax_index_leaf(cur_pgno, usable, raw_mut, n_keys, entry)?
+                        };
+                        match outcome {
+                            PaxIndexInsertOutcome::Inserted | PaxIndexInsertOutcome::Replaced => {
+                                return Ok(());
+                            }
+                            PaxIndexInsertOutcome::NeedsSplit if cur_pgno == root_pgno => {
+                                let usable_usize = usable as usize;
+                                let mut left_buf =
+                                    self.pager.read_page(cur_pgno)?[..usable_usize].to_vec();
+                                let mut right_buf = vec![0u8; usable_usize];
+                                let promoted = split_pax_index_leaf(
+                                    2,
+                                    usable,
+                                    &mut left_buf,
+                                    &mut right_buf,
+                                    n_keys,
+                                    entry,
+                                )?;
+                                let left_pgno = self.allocate_page()?;
+                                let right_pgno = self.allocate_page()?;
+                                self.pager.write_page(left_pgno)?[..usable_usize]
+                                    .copy_from_slice(&left_buf);
+                                self.pager.write_page(right_pgno)?[..usable_usize]
+                                    .copy_from_slice(&right_buf);
+                                let new_root = ParsedPage::IndexInterior {
+                                    cells: vec![IndexInteriorCell {
+                                        left_child: left_pgno,
+                                        total_payload_len: promoted.total_payload_len,
+                                        local_payload: promoted.local_payload,
+                                        overflow_page: None,
+                                    }],
+                                    right_child: right_pgno,
+                                };
+                                self.write_parsed_page(cur_pgno, &new_root)?;
+                                return Ok(());
+                            }
+                            PaxIndexInsertOutcome::NeedsSplit
+                            | PaxIndexInsertOutcome::EscapeToSlotted => break,
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut sbuf = [0u8; 32];
+        let slen = encode_pax_index_entry_stack(n_keys, entry, &mut sbuf);
+        let rec_bytes = &sbuf[..slen];
+        let bounds = PayloadBounds::for_index(usable);
+        if rec_bytes.len() <= bounds.max_local as usize
+            && let Some((leaf_pgno, insert_idx, content_top)) =
+                self.probe_fast_index_insert_raw(root_pgno, usable, rec_bytes, orders, enc)?
+        {
+            let raw_mut = self.pager.write_page(leaf_pgno)?;
+            apply_insert_index_leaf_raw(leaf_pgno, raw_mut, rec_bytes, insert_idx, content_top);
+            return Ok(());
+        }
+
+        let key_vals_arr = [
+            entry.k0.map_or(Value::Null, Value::Integer),
+            if n_keys == 2 {
+                entry.k1.map_or(Value::Null, Value::Integer)
+            } else {
+                Value::Integer(entry.rid)
+            },
+            Value::Integer(entry.rid),
+        ];
+        let full_len = usize::from(n_keys) + 1;
+        let key_len = if orders.is_empty() {
+            full_len
+        } else {
+            orders.len().min(full_len)
+        };
+        let leaf_cell = IndexLeafCell {
+            total_payload_len: slen as u32,
+            local_payload: rec_bytes.to_vec(),
+            overflow_page: None,
+        };
+        if let Some((promoted_cell, right_pgno)) =
+            self.insert_index_rec(root_pgno, leaf_cell, &key_vals_arr[..key_len], orders)?
+        {
+            let left_pgno = self.allocate_page()?;
+            if root_pgno >= 2
+                && self.pager.read_page(root_pgno)?.first().copied() == Some(PAX_INDEX_LEAF_BYTE)
+            {
+                let usable_usize = usable as usize;
+                let left_copy = self.pager.read_page(root_pgno)?[..usable_usize].to_vec();
+                self.pager.write_page(left_pgno)?[..usable_usize].copy_from_slice(&left_copy);
+            } else {
+                let left_parsed = self.read_parsed_page(root_pgno)?;
+                self.write_parsed_page(left_pgno, &left_parsed)?;
+            }
+            let new_root = ParsedPage::IndexInterior {
+                cells: vec![IndexInteriorCell {
+                    left_child: left_pgno,
+                    total_payload_len: promoted_cell.total_payload_len,
+                    local_payload: promoted_cell.local_payload,
+                    overflow_page: promoted_cell.overflow_page,
+                }],
+                right_child: right_pgno,
+            };
+            self.write_parsed_page(root_pgno, &new_root)?;
+        }
+        Ok(())
+    }
+
+    /// Bottom-up O(N) bulk loader for pre-sorted [`PaxIndexEntry`] slices directly into `0x2a`
+    /// SoA covering index leaves (`W02_create_indexes`), with `0x02` `IndexInterior` divider pages.
+    pub fn bulk_load_sorted_pax_index(
+        &mut self,
+        root_pgno: Pgno,
+        n_keys: u8,
+        entries: &[PaxIndexEntry],
+    ) -> Result<()> {
+        self.save_cursors_for_mutation(Some(root_pgno), None)?;
+        let usable = self.pager.usable_size();
+        {
+            let raw = self.pager.read_page(root_pgno)?;
+            let is_pax = root_pgno >= 2 && raw.first().copied() == Some(PAX_INDEX_LEAF_BYTE);
+            if is_pax {
+                self.clear_tree(root_pgno)?;
+            } else {
+                let (ptype, n_cell, _) = raw_page_header(root_pgno, usable, raw)?;
+                if ptype != BtreePageType::IndexLeaf || n_cell != 0 {
+                    self.clear_tree(root_pgno)?;
+                }
+            }
+        }
+        if entries.is_empty() {
+            return Ok(());
+        }
+        if root_pgno == 1
+            || usable < PAX_MIN_USABLE_SIZE as u32
+            || !matches!(n_keys, 1 | 2)
+            || !self.is_p3v2_utf8()
+        {
+            let mut recs = Vec::with_capacity(entries.len());
+            let mut sbuf = [0u8; 32];
+            for &e in entries {
+                let n = encode_pax_index_entry_stack(n_keys, e, &mut sbuf);
+                recs.push(sbuf[..n].to_vec());
+            }
+            return self.bulk_load_sorted_index(root_pgno, &recs);
+        }
+
+        if entries_fit_single_pax_index_leaf(usable, n_keys, entries) {
+            let raw = self.pager.write_page(root_pgno)?;
+            write_pax_index_leaf_slice(usable, raw, n_keys, entries);
+            return Ok(());
+        }
+
+        let total = entries.len();
+        let usable_usize = usable as usize;
+        let bounds = PayloadBounds::for_index(usable);
+        let auto_vac = self.is_auto_vacuum();
+
+        let mut div_records: Vec<Vec<u8>> = Vec::with_capacity(total / 200 + 4);
+        let mut div_leaf_sizes: Vec<usize> = Vec::with_capacity(total / 200 + 4);
+        let mut dividers: Vec<(Pgno, usize)> = Vec::with_capacity(total / 200 + 4);
+        let mut rightmost_child: Pgno = 0;
+        let mut sbuf = [0u8; 32];
+        let mut pos = 0usize;
+
+        while pos < total {
+            let end = choose_pax_index_leaf_end(usable, n_keys, entries, pos);
+            let leaf_pgno = self.allocate_page()?;
+            {
+                let raw = self.pager.write_page(leaf_pgno)?;
+                write_pax_index_leaf_slice(usable, raw, n_keys, &entries[pos..end]);
+            }
+            if end < total {
+                let slen = encode_pax_index_entry_stack(n_keys, entries[end], &mut sbuf);
+                let clen = (1 + slen).max(4);
+                let didx = div_records.len();
+                div_records.push(sbuf[..slen].to_vec());
+                div_leaf_sizes.push(clen);
+                dividers.push((leaf_pgno, didx));
+                pos = end + 1;
+            } else {
+                rightmost_child = leaf_pgno;
+                break;
+            }
+        }
+
+        let int_cell_len = |didx: usize| -> usize { 4 + div_leaf_sizes[didx] };
+        let root_int_hdr: usize = 12;
+        let int_budget = usable_usize - 12;
+
+        loop {
+            let m = dividers.len();
+            let mut root_int_bytes: usize = root_int_hdr;
+            for &(_, didx) in &dividers {
+                root_int_bytes = root_int_bytes.saturating_add(2 + int_cell_len(didx));
+            }
+            if root_int_bytes <= usable_usize {
+                return self.write_sorted_index_interior_slice(
+                    root_pgno,
+                    usable,
+                    bounds,
+                    &div_records,
+                    &div_leaf_sizes,
+                    &dividers,
+                    rightmost_child,
+                    auto_vac,
+                );
+            }
+
+            let mut next_dividers: Vec<(Pgno, usize)> = Vec::new();
+            let mut next_rightmost: Pgno = 0;
+            let mut dpos = 0usize;
+            while dpos < m {
+                let mut used = 2 + int_cell_len(dividers[dpos].1);
+                let mut dend = dpos + 1;
+                while dend < m && used + 2 + int_cell_len(dividers[dend].1) <= int_budget {
+                    used += 2 + int_cell_len(dividers[dend].1);
+                    dend += 1;
+                }
+                if dend + 1 == m && dend > dpos + 1 {
+                    dend -= 1;
+                }
+                let int_pgno = self.allocate_page()?;
+                if dend < m {
+                    let rchild = dividers[dend].0;
+                    let promoted_didx = dividers[dend].1;
+                    self.write_sorted_index_interior_slice(
+                        int_pgno,
+                        usable,
+                        bounds,
+                        &div_records,
+                        &div_leaf_sizes,
+                        &dividers[dpos..dend],
+                        rchild,
+                        auto_vac,
+                    )?;
+                    next_dividers.push((int_pgno, promoted_didx));
+                    dpos = dend + 1;
+                } else {
+                    self.write_sorted_index_interior_slice(
+                        int_pgno,
+                        usable,
+                        bounds,
+                        &div_records,
+                        &div_leaf_sizes,
+                        &dividers[dpos..m],
+                        rightmost_child,
+                        auto_vac,
+                    )?;
+                    next_rightmost = int_pgno;
+                    break;
+                }
+            }
+            dividers = next_dividers;
+            rightmost_child = next_rightmost;
+        }
     }
 
     fn probe_fast_index_insert_raw(
@@ -6692,6 +8312,55 @@ impl Btree {
     ) -> Result<Option<(IndexLeafCell, Pgno)>> {
         let enc = self.encoding();
         let usable = self.pager.usable_size();
+
+        if pgno >= 2
+            && enc == TextEncoding::Utf8
+            && usable >= PAX_MIN_USABLE_SIZE as u32
+            && new_cell.overflow_page.is_none()
+            && let Some(n_keys) = orders_allow_pax_index(orders)
+            && let Some(entry) = parse_record_as_pax_index_entry(&new_cell.local_payload, n_keys)
+        {
+            let is_p3v2 = self.is_p3v2_utf8();
+            let can_use_pax = {
+                let raw = self.pager.read_page(pgno)?;
+                let b = raw.first().copied().unwrap_or(0);
+                b == PAX_INDEX_LEAF_BYTE
+                    || (is_p3v2
+                        && b == BtreePageType::IndexLeaf as u8
+                        && u16::from_be_bytes([raw[3], raw[4]]) == 0)
+            };
+            if can_use_pax {
+                let outcome = {
+                    let raw_mut = self.pager.write_page(pgno)?;
+                    try_insert_pax_index_leaf(pgno, usable, raw_mut, n_keys, entry)?
+                };
+                match outcome {
+                    PaxIndexInsertOutcome::Inserted | PaxIndexInsertOutcome::Replaced => {
+                        return Ok(None);
+                    }
+                    PaxIndexInsertOutcome::NeedsSplit => {
+                        let usable_usize = usable as usize;
+                        let mut left_buf = self.pager.read_page(pgno)?[..usable_usize].to_vec();
+                        let mut right_buf = vec![0u8; usable_usize];
+                        let promoted = split_pax_index_leaf(
+                            pgno,
+                            usable,
+                            &mut left_buf,
+                            &mut right_buf,
+                            n_keys,
+                            entry,
+                        )?;
+                        let right_pgno = self.allocate_page()?;
+                        self.pager.write_page(pgno)?[..usable_usize].copy_from_slice(&left_buf);
+                        self.pager.write_page(right_pgno)?[..usable_usize]
+                            .copy_from_slice(&right_buf);
+                        return Ok(Some((promoted, right_pgno)));
+                    }
+                    PaxIndexInsertOutcome::EscapeToSlotted => {}
+                }
+            }
+        }
+
         let parsed = self.read_parsed_page(pgno)?;
 
         match parsed {
@@ -6758,12 +8427,14 @@ impl Btree {
                 } else {
                     right_child
                 };
-                let target_ptype = {
+                let (target_ptype, target_is_pax) = {
                     let raw = self.pager.read_page(target_child)?;
-                    peek_page_type(target_child, usable, raw)?
+                    let is_pax =
+                        target_child >= 2 && raw.first().copied() == Some(PAX_INDEX_LEAF_BYTE);
+                    (peek_page_type(target_child, usable, raw)?, is_pax)
                 };
 
-                if !cells.is_empty() && target_ptype == BtreePageType::IndexLeaf {
+                if !cells.is_empty() && !target_is_pax && target_ptype == BtreePageType::IndexLeaf {
                     let ParsedPage::IndexLeaf {
                         cells: mut target_cells,
                     } = self.read_parsed_page(target_child)?
@@ -6956,6 +8627,93 @@ impl Btree {
         )))
     }
 
+    /// Direct typed-integer `P3v2` SoA index delete (`0x2a`), bypassing Format-3 record encoding
+    /// completely on `0x2a` leaves (`W08`, `W14`).
+    pub fn delete_index_pax_entry(
+        &mut self,
+        root_pgno: Pgno,
+        n_keys: u8,
+        entry: PaxIndexEntry,
+        orders: &[KeySortOrder],
+    ) -> Result<bool> {
+        self.save_cursors_for_mutation(Some(root_pgno), None)?;
+        let usable = self.pager.usable_size();
+        let enc = self.encoding();
+        if root_pgno >= 2
+            && enc == TextEncoding::Utf8
+            && usable >= PAX_MIN_USABLE_SIZE as u32
+            && matches!(n_keys, 1 | 2)
+        {
+            let mut sbuf = [0u8; 32];
+            let mut slen = 0usize;
+            let mut cur_pgno = root_pgno;
+            for _ in 0..BTCURSOR_MAX_DEPTH {
+                enum PaxDelStep {
+                    Descend(Pgno),
+                    PaxLeaf { present: bool },
+                    Bail,
+                }
+                let step = {
+                    let raw = self.pager.read_page(cur_pgno)?;
+                    let hdr_off = if cur_pgno == 1 { 100 } else { 0 };
+                    if hdr_off >= raw.len() {
+                        PaxDelStep::Bail
+                    } else {
+                        let b = raw[hdr_off];
+                        if b == BtreePageType::IndexInterior as u8 {
+                            if slen == 0 {
+                                slen = encode_pax_index_entry_stack(n_keys, entry, &mut sbuf);
+                            }
+                            match probe_index_interior_step_raw(
+                                cur_pgno,
+                                usable,
+                                raw,
+                                &sbuf[..slen],
+                                orders,
+                                enc,
+                            )? {
+                                Some(RawIndexInteriorStep::Child(c)) => PaxDelStep::Descend(c),
+                                _ => PaxDelStep::Bail,
+                            }
+                        } else if cur_pgno >= 2 && b == PAX_INDEX_LEAF_BYTE {
+                            let pv = PaxIndexLeafView::new(cur_pgno, usable, raw)?;
+                            let present =
+                                pv.n_keys() == n_keys && pv.binary_search_entry(entry).is_ok();
+                            PaxDelStep::PaxLeaf { present }
+                        } else {
+                            PaxDelStep::Bail
+                        }
+                    }
+                };
+                match step {
+                    PaxDelStep::Descend(c) => cur_pgno = c,
+                    PaxDelStep::PaxLeaf { present: false } => return Ok(false),
+                    PaxDelStep::PaxLeaf { present: true } => {
+                        let out = {
+                            let raw_mut = self.pager.write_page(cur_pgno)?;
+                            delete_pax_index_leaf_entry(
+                                cur_pgno,
+                                usable,
+                                raw_mut,
+                                entry,
+                                cur_pgno == root_pgno,
+                            )?
+                        };
+                        if let Some(done) = out {
+                            return Ok(done);
+                        }
+                        break;
+                    }
+                    PaxDelStep::Bail => break,
+                }
+            }
+        }
+
+        let mut sbuf = [0u8; 32];
+        let slen = encode_pax_index_entry_stack(n_keys, entry, &mut sbuf);
+        self.delete_index_raw(root_pgno, &sbuf[..slen], orders)
+    }
+
     /// Deletes a matching serialized entry `record_bytes` from an Index B-Tree rooted at `root_pgno`
     /// without decoding cells into heap `Value`s on the common leaf/divider path.
     pub fn delete_index_raw(
@@ -6984,6 +8742,7 @@ impl Btree {
                     cell_off: usize,
                     cell_len: usize,
                 },
+                PaxLeafHit(PaxIndexEntry),
                 Fallback,
             }
             let step = {
@@ -7008,6 +8767,25 @@ impl Btree {
                                     left_child,
                                 },
                                 None => RawDelStep::Fallback,
+                            }
+                        }
+                        x if cur_pgno >= 2 && x == PAX_INDEX_LEAF_BYTE => {
+                            if let Some(n_keys) = orders_allow_pax_index(orders)
+                                && let Some(entry) =
+                                    parse_record_as_pax_index_entry(record_bytes, n_keys)
+                            {
+                                let pv = PaxIndexLeafView::new(cur_pgno, usable, raw)?;
+                                if pv.n_keys() == n_keys {
+                                    if pv.binary_search_entry(entry).is_err() {
+                                        RawDelStep::LeafNotFound
+                                    } else {
+                                        RawDelStep::PaxLeafHit(entry)
+                                    }
+                                } else {
+                                    RawDelStep::Fallback
+                                }
+                            } else {
+                                RawDelStep::Fallback
                             }
                         }
                         x if x == BtreePageType::IndexLeaf as u8 => {
@@ -7053,6 +8831,22 @@ impl Btree {
                     );
                     return Ok(true);
                 }
+                RawDelStep::PaxLeafHit(entry) => {
+                    let done = {
+                        let raw_mut = self.pager.write_page(cur_pgno)?;
+                        delete_pax_index_leaf_entry(
+                            cur_pgno,
+                            usable,
+                            raw_mut,
+                            entry,
+                            cur_pgno == root_pgno,
+                        )?
+                    };
+                    if let Some(res) = done {
+                        return Ok(res);
+                    }
+                    break;
+                }
                 RawDelStep::DividerHit {
                     cell_idx,
                     left_child,
@@ -7060,8 +8854,16 @@ impl Btree {
                     // Walk right spine of `left_child` using raw headers without unpacking interior/leaf cells.
                     let mut pred_pgno = left_child;
                     let mut pred_extract: Option<(usize, usize, usize, Vec<u8>)> = None;
+                    let mut pred_pax_payload: Option<Vec<u8>> = None;
                     for _ in 0..BTCURSOR_MAX_DEPTH {
                         let raw_p = self.pager.read_page(pred_pgno)?;
+                        if pred_pgno >= 2 && raw_p.first().copied() == Some(PAX_INDEX_LEAF_BYTE) {
+                            let pv = PaxIndexLeafView::new(pred_pgno, usable, raw_p)?;
+                            if pv.len() >= 2 {
+                                pred_pax_payload = Some(pv.encode_row_vec(pv.len() - 1));
+                            }
+                            break;
+                        }
                         let (ptype, n_cell, rc) = raw_page_header(pred_pgno, usable, raw_p)?;
                         match ptype {
                             BtreePageType::IndexInterior => {
@@ -7092,6 +8894,37 @@ impl Btree {
                                 break;
                             }
                             _ => break,
+                        }
+                    }
+                    if let Some(pred_payload) = pred_pax_payload
+                        && let ParsedPage::IndexInterior {
+                            mut cells,
+                            right_child,
+                        } = self.read_parsed_page(cur_pgno)?
+                        && cell_idx < cells.len()
+                    {
+                        let old_div = std::mem::replace(
+                            &mut cells[cell_idx],
+                            IndexInteriorCell {
+                                left_child,
+                                total_payload_len: pred_payload.len() as u32,
+                                local_payload: pred_payload,
+                                overflow_page: None,
+                            },
+                        );
+                        let cand_int = ParsedPage::IndexInterior { cells, right_child };
+                        if cand_int.fits_in_page(cur_pgno, usable) {
+                            self.free_overflow_chain(old_div.overflow_page)?;
+                            {
+                                let raw_pred_mut = self.pager.write_page(pred_pgno)?;
+                                let _ = pop_last_pax_index_leaf_as_record(
+                                    pred_pgno,
+                                    usable,
+                                    raw_pred_mut,
+                                )?;
+                            }
+                            self.write_parsed_page(cur_pgno, &cand_int)?;
+                            return Ok(true);
                         }
                     }
                     if let Some((pred_idx, pred_off, pred_cell_len, pred_payload)) = pred_extract
@@ -7175,6 +9008,26 @@ impl Btree {
         if !removed {
             return Ok(false);
         }
+        if root_pgno >= 2
+            && self.is_p3v2_utf8()
+            && self.pager.usable_size() >= PAX_MIN_USABLE_SIZE as u32
+            && let Some(n_keys) = orders_allow_pax_index(orders)
+        {
+            let mut pax_entries = Vec::with_capacity(remaining.len());
+            let mut all_pax = true;
+            for rec in &remaining {
+                if let Some(e) = parse_record_as_pax_index_entry(rec, n_keys) {
+                    pax_entries.push(e);
+                } else {
+                    all_pax = false;
+                    break;
+                }
+            }
+            if all_pax {
+                self.bulk_load_sorted_pax_index(root_pgno, n_keys, &pax_entries)?;
+                return Ok(true);
+            }
+        }
         self.bulk_load_sorted_index(root_pgno, &remaining)?;
         Ok(true)
     }
@@ -7190,6 +9043,28 @@ impl Btree {
         let mut cur_pgno = root_pgno;
         loop {
             let hdr_off = if cur_pgno == 1 { 100 } else { 0 };
+            if cur_pgno >= 2
+                && self.pager.read_page(cur_pgno)?.first().copied() == Some(PAX_INDEX_LEAF_BYTE)
+                && let Some(n_keys) = orders_allow_pax_index(orders)
+                && let Some(entry) = values_as_pax_index_entry(key_vals, n_keys)
+            {
+                let present = {
+                    let raw = self.pager.read_page(cur_pgno)?;
+                    let pv = PaxIndexLeafView::new(cur_pgno, usable, raw)?;
+                    pv.n_keys() == n_keys && pv.binary_search_entry(entry).is_ok()
+                };
+                if !present {
+                    return Ok(Some(false));
+                }
+                let raw_mut = self.pager.write_page(cur_pgno)?;
+                return delete_pax_index_leaf_entry(
+                    cur_pgno,
+                    usable,
+                    raw_mut,
+                    entry,
+                    cur_pgno == root_pgno,
+                );
+            }
             let raw_probe = {
                 let raw = self.pager.read_page(cur_pgno)?;
                 if hdr_off < raw.len() {
@@ -7281,47 +9156,98 @@ impl Btree {
                                 // whenever that leaf has >= 2 cells and the replacement divider fits!
                                 let div_left_child = c.left_child;
                                 let mut pred_pgno = div_left_child;
-                                let pred_leaf = loop {
+                                loop {
+                                    let is_pax = pred_pgno >= 2
+                                        && self.pager.read_page(pred_pgno)?.first().copied()
+                                            == Some(PAX_INDEX_LEAF_BYTE);
+                                    if is_pax {
+                                        let pred_rec = {
+                                            let raw_p = self.pager.read_page(pred_pgno)?;
+                                            let pv =
+                                                PaxIndexLeafView::new(pred_pgno, usable, raw_p)?;
+                                            if pv.len() >= 2 {
+                                                Some(pv.encode_row_vec(pv.len() - 1))
+                                            } else {
+                                                None
+                                            }
+                                        };
+                                        if let Some(pred_payload) = pred_rec {
+                                            let mut new_int_cells = cells;
+                                            let old_div = std::mem::replace(
+                                                &mut new_int_cells[ci],
+                                                IndexInteriorCell {
+                                                    left_child: div_left_child,
+                                                    total_payload_len: pred_payload.len() as u32,
+                                                    local_payload: pred_payload,
+                                                    overflow_page: None,
+                                                },
+                                            );
+                                            let cand_int = ParsedPage::IndexInterior {
+                                                cells: new_int_cells,
+                                                right_child,
+                                            };
+                                            if cand_int.fits_in_page(cur_pgno, usable) {
+                                                self.free_overflow_chain(old_div.overflow_page)?;
+                                                {
+                                                    let raw_pred_mut =
+                                                        self.pager.write_page(pred_pgno)?;
+                                                    let _ = pop_last_pax_index_leaf_as_record(
+                                                        pred_pgno,
+                                                        usable,
+                                                        raw_pred_mut,
+                                                    )?;
+                                                }
+                                                self.write_parsed_page(cur_pgno, &cand_int)?;
+                                                return Ok(Some(true));
+                                            }
+                                        }
+                                        return Ok(None);
+                                    }
                                     match self.read_parsed_page(pred_pgno)? {
                                         ParsedPage::IndexInterior {
                                             right_child: rc, ..
                                         } => pred_pgno = rc,
-                                        ParsedPage::IndexLeaf { cells: pcells } => break pcells,
+                                        ParsedPage::IndexLeaf { cells: pred_leaf } => {
+                                            if pred_leaf.len() >= 2 {
+                                                let mut pred_cells = pred_leaf;
+                                                let pred = pred_cells.pop().expect("len >= 2");
+                                                let mut new_int_cells = cells;
+                                                let old_div = std::mem::replace(
+                                                    &mut new_int_cells[ci],
+                                                    IndexInteriorCell {
+                                                        left_child: div_left_child,
+                                                        total_payload_len: pred.total_payload_len,
+                                                        local_payload: pred.local_payload,
+                                                        overflow_page: pred.overflow_page,
+                                                    },
+                                                );
+                                                let cand_int = ParsedPage::IndexInterior {
+                                                    cells: new_int_cells,
+                                                    right_child,
+                                                };
+                                                if cand_int.fits_in_page(cur_pgno, usable) {
+                                                    self.free_overflow_chain(
+                                                        old_div.overflow_page,
+                                                    )?;
+                                                    self.write_parsed_page(
+                                                        pred_pgno,
+                                                        &ParsedPage::IndexLeaf {
+                                                            cells: pred_cells,
+                                                        },
+                                                    )?;
+                                                    self.write_parsed_page(cur_pgno, &cand_int)?;
+                                                    return Ok(Some(true));
+                                                }
+                                            }
+                                            return Ok(None);
+                                        }
                                         _ => {
                                             return Err(SqliteError::corrupt(
                                                 "expected index page in predecessor walk",
                                             ));
                                         }
                                     }
-                                };
-                                if pred_leaf.len() >= 2 {
-                                    let mut pred_cells = pred_leaf;
-                                    let pred = pred_cells.pop().expect("len >= 2");
-                                    let mut new_int_cells = cells;
-                                    let old_div = std::mem::replace(
-                                        &mut new_int_cells[ci],
-                                        IndexInteriorCell {
-                                            left_child: div_left_child,
-                                            total_payload_len: pred.total_payload_len,
-                                            local_payload: pred.local_payload,
-                                            overflow_page: pred.overflow_page,
-                                        },
-                                    );
-                                    let cand_int = ParsedPage::IndexInterior {
-                                        cells: new_int_cells,
-                                        right_child,
-                                    };
-                                    if cand_int.fits_in_page(cur_pgno, self.pager.usable_size()) {
-                                        self.free_overflow_chain(old_div.overflow_page)?;
-                                        self.write_parsed_page(
-                                            pred_pgno,
-                                            &ParsedPage::IndexLeaf { cells: pred_cells },
-                                        )?;
-                                        self.write_parsed_page(cur_pgno, &cand_int)?;
-                                        return Ok(Some(true));
-                                    }
                                 }
-                                return Ok(None);
                             }
                             Ordering::Greater => {
                                 next_child = c.left_child;
@@ -7587,6 +9513,15 @@ impl Btree {
                     ));
                 }
                 let hdr_off = if pgno == 1 { 100 } else { 0 };
+                if pgno == 1 && matches!(raw[hdr_off], PAX_TABLE_LEAF_BYTE | PAX_INDEX_LEAF_BYTE) {
+                    return Err(SqliteError::corrupt("PAX leaf disallowed on page 1"));
+                }
+                if pgno >= 2 && raw[hdr_off] == PAX_TABLE_LEAF_BYTE {
+                    return validate_pax_table_leaf(pgno, usable_u32, raw, is_root);
+                }
+                if pgno >= 2 && raw[hdr_off] == PAX_INDEX_LEAF_BYTE {
+                    return validate_pax_index_leaf(pgno, usable_u32, raw, is_root);
+                }
                 let page_type = BtreePageType::from_byte(raw[hdr_off])?;
                 let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
                 let hdr_size = page_type.header_size();

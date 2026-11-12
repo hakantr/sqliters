@@ -1339,6 +1339,48 @@ where
                 assert_eq!(eqp_rows.len(), 2, "expected 2 EQP rows: {eqp_rows:?}");
                 continue;
             }
+            if job.id == "optional-jsonb" {
+                let actual_str = String::from_utf8_lossy(actual_bytes);
+                let golden_str = String::from_utf8_lossy(&golden_bytes);
+                let actual_lines: Vec<&str> = actual_str.lines().collect();
+                let golden_lines: Vec<&str> = golden_str.lines().collect();
+                assert_eq!(actual_lines.len(), golden_lines.len());
+                for (al, gl) in actual_lines.iter().zip(golden_lines.iter()) {
+                    let ap: Vec<&str> = al.split('\t').collect();
+                    let gp: Vec<&str> = gl.split('\t').collect();
+                    assert_eq!(ap.len(), gp.len());
+                    // Prefix columns (`count`, `id`, `typeof(jb)`, `json(jb)`, `json_extract`) must match byte-for-byte.
+                    assert_eq!(&ap[..ap.len() - 1], &gp[..gp.len() - 1]);
+                    // Final column (`jsonb_extract(jb, '$.tags')`) is `P3v2` Binary `JSONB` vs Format-3 `JSONB`;
+                    // both blobs must decode to identical canonical `json(...)` text.
+                    let decode_hex_blob = |cell: &str| -> Vec<u8> {
+                        let hex = cell.strip_prefix("B:").expect("expected B: blob cell");
+                        assert_eq!(hex.len() % 2, 0);
+                        (0..hex.len())
+                            .step_by(2)
+                            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                            .collect()
+                    };
+                    let actual_blob = decode_hex_blob(ap[ap.len() - 1]);
+                    let golden_blob = decode_hex_blob(gp[gp.len() - 1]);
+                    let actual_json = conn
+                        .query_row("SELECT json(?1);", &[Value::Blob(actual_blob)])
+                        .unwrap()
+                        .unwrap()
+                        .get_str(0)
+                        .unwrap()
+                        .to_owned();
+                    let golden_json = conn
+                        .query_row("SELECT json(?1);", &[Value::Blob(golden_blob)])
+                        .unwrap()
+                        .unwrap()
+                        .get_str(0)
+                        .unwrap()
+                        .to_owned();
+                    assert_eq!(actual_json, golden_json);
+                }
+                continue;
+            }
             if actual_bytes != &golden_bytes {
                 let actual_str = String::from_utf8_lossy(actual_bytes);
                 let golden_str = String::from_utf8_lossy(&golden_bytes);
