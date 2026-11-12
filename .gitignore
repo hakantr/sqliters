@@ -6,4 +6,5 @@
 *.db-shm
 implementation_plan.md
 sqltest/
-/benchmarks/
+/benchmarks/*
+!/benchmarks/benchmark_report.md
