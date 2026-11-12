@@ -3,10 +3,161 @@
 
 use sqliters_pager::DB_HEADER_SIZE;
 use sqliters_types::{
-    ErrorCode, KeySortOrder, Pgno, Result, SqliteError, TextEncoding, Value,
+    Collation, ErrorCode, KeySortOrder, Pgno, RawField, Result, SqliteError, TextEncoding, Value,
     compare_raw_records_with_encoding, compare_records_with_encoding, get_varint, get_varint_i64,
-    push_varint, put_varint, varint_len,
+    push_varint, put_varint, read_raw_record_field, read_raw_record_int_pair, varint_len,
 };
+
+/// `P3v1` Index B-Tree leaf page flag byte (`12`-byte header + contiguous `12`-byte `(fp_u64, off_u16, len_u16)` directory).
+pub const P3V1_INDEX_LEAF_BYTE: u8 = 0x1a;
+/// `P3v1` Table B+Tree leaf page flag byte (`8`-byte header + contiguous `12`-byte `(rowid_i64, off_u16, len_u16)` directory).
+pub const P3V1_TABLE_LEAF_BYTE: u8 = 0x1d;
+/// Sentinel `len_flags` value (`0xFFFF`) marking an overflow cell on `0x1d` / `0x1a` leaves.
+/// Every non-overflow cell has `total_payload_len <= max_local <= 65_501 < 0xFFFF`.
+pub const P3V1_OVFL_SENTINEL: u16 = 0xFFFF;
+
+/// `0x1a` fingerprint mode: disabled (custom collation, `DESC`, `NULLS LAST`, non-UTF8, or spilled col0).
+pub const FP_MODE_NONE: u8 = 0;
+/// `0x1a` fingerprint mode: lossless bijective `(col0: i32, col1: i32)` pair packed into `u64`.
+pub const FP_MODE_INT32_PAIR: u8 = 1;
+/// `0x1a` fingerprint mode: universal order-preserving `u64` prefix of `col0` across `Null < Int/Real < Text < Blob`.
+pub const FP_MODE_UNIVERSAL_COL0: u8 = 4;
+
+#[inline(always)]
+pub const fn is_p3v1_leaf_byte(b: u8) -> bool {
+    matches!(b, P3V1_INDEX_LEAF_BYTE | P3V1_TABLE_LEAF_BYTE)
+}
+
+#[inline(always)]
+pub const fn is_table_leaf_byte(b: u8) -> bool {
+    matches!(b, 0x0d | P3V1_TABLE_LEAF_BYTE)
+}
+
+#[inline(always)]
+pub const fn is_index_leaf_byte(b: u8) -> bool {
+    matches!(b, 0x0a | P3V1_INDEX_LEAF_BYTE)
+}
+
+/// Decodes `(page_type, hdr_size, slot_stride, is_p3v1_leaf)` directly from a raw page flag byte.
+#[inline(always)]
+pub fn decode_raw_page_layout(b: u8) -> Result<(BtreePageType, usize, usize, bool)> {
+    match b {
+        0x02 => Ok((BtreePageType::IndexInterior, 12, 2, false)),
+        0x05 => Ok((BtreePageType::TableInterior, 12, 2, false)),
+        0x0a => Ok((BtreePageType::IndexLeaf, 8, 2, false)),
+        0x0d => Ok((BtreePageType::TableLeaf, 8, 2, false)),
+        P3V1_INDEX_LEAF_BYTE => Ok((BtreePageType::IndexLeaf, 12, 12, true)),
+        P3V1_TABLE_LEAF_BYTE => Ok((BtreePageType::TableLeaf, 8, 12, true)),
+        other => Err(SqliteError::corrupt(format!(
+            "invalid btree page flags byte: {other:#04x}"
+        ))),
+    }
+}
+
+#[inline(always)]
+pub const fn pack_int32_pair_fp(c0: i32, c1: i32) -> u64 {
+    let u0 = (c0 as u32) ^ 0x8000_0000;
+    let u1 = (c1 as u32) ^ 0x8000_0000;
+    ((u0 as u64) << 32) | (u1 as u64)
+}
+
+#[inline(always)]
+pub const fn unpack_int32_pair_fp(fp: u64) -> (i64, i64) {
+    let c0 = (((fp >> 32) as u32) ^ 0x8000_0000) as i32 as i64;
+    let c1 = ((fp as u32) ^ 0x8000_0000) as i32 as i64;
+    (c0, c1)
+}
+
+#[inline(always)]
+pub fn ord_numeric_col0_fp(f: f64) -> u64 {
+    if f.is_nan() {
+        return 0;
+    }
+    let canon = if f == 0.0 { 0.0 } else { f };
+    let bits = canon.to_bits();
+    let ord = if (bits & (1u64 << 63)) != 0 {
+        !bits
+    } else {
+        bits ^ (1u64 << 63)
+    };
+    (0x10u64 << 56) | (ord >> 8)
+}
+
+#[inline(always)]
+fn pack_prefix_7_be(b: &[u8]) -> u64 {
+    if b.len() >= 7 {
+        u64::from_be_bytes([0, b[0], b[1], b[2], b[3], b[4], b[5], b[6]])
+    } else {
+        let mut buf = [0u8; 8];
+        buf[1..1 + b.len()].copy_from_slice(b);
+        u64::from_be_bytes(buf)
+    }
+}
+
+#[inline(always)]
+pub fn orders_allow_col0_fp(orders: &[KeySortOrder], enc: TextEncoding) -> bool {
+    if enc != TextEncoding::Utf8 {
+        return false;
+    }
+    orders.first().is_none_or(|s0| {
+        !s0.desc
+            && !s0.nulls_last
+            && s0.collation == Collation::Binary
+            && s0.custom_collation.is_none()
+    })
+}
+
+#[inline(always)]
+pub fn orders_allow_int32_pair_fp(orders: &[KeySortOrder]) -> bool {
+    let ok = |s: &KeySortOrder| {
+        !s.desc && !s.nulls_last && s.collation == Collation::Binary && s.custom_collation.is_none()
+    };
+    orders.first().is_none_or(ok) && orders.get(1).is_none_or(ok)
+}
+
+#[inline(always)]
+pub fn compute_int32_pair_fp_from_record(rec: &[u8]) -> Option<u64> {
+    let (v0, v1) = read_raw_record_int_pair(rec, 0, 1).ok()??;
+    let i0 = i32::try_from(v0).ok()?;
+    let i1 = i32::try_from(v1).ok()?;
+    Some(pack_int32_pair_fp(i0, i1))
+}
+
+#[inline(always)]
+pub fn compute_int32_pair_fp_from_values(vals: &[Value]) -> Option<u64> {
+    if vals.len() < 2 {
+        return None;
+    }
+    let (Value::Integer(v0), Value::Integer(v1)) = (&vals[0], &vals[1]) else {
+        return None;
+    };
+    let i0 = i32::try_from(*v0).ok()?;
+    let i1 = i32::try_from(*v1).ok()?;
+    Some(pack_int32_pair_fp(i0, i1))
+}
+
+#[inline(always)]
+pub fn compute_universal_col0_fp_from_record(rec: &[u8]) -> Option<u64> {
+    let field = read_raw_record_field(rec, 0).ok()??;
+    Some(match field {
+        RawField::Null => 0,
+        RawField::Int(i) => ord_numeric_col0_fp(i as f64),
+        RawField::Float(r) => ord_numeric_col0_fp(r),
+        RawField::Text(b) => (0x20u64 << 56) | pack_prefix_7_be(b),
+        RawField::Blob(b) => (0x30u64 << 56) | pack_prefix_7_be(b),
+    })
+}
+
+#[inline(always)]
+pub fn compute_universal_col0_fp_from_value(v: &Value) -> u64 {
+    match v {
+        Value::Null => 0,
+        Value::Integer(i) => ord_numeric_col0_fp(*i as f64),
+        Value::Real(r) => ord_numeric_col0_fp(*r),
+        Value::Text(s) => (0x20u64 << 56) | pack_prefix_7_be(s.as_bytes()),
+        Value::Blob(b) => (0x30u64 << 56) | pack_prefix_7_be(b),
+    }
+}
 
 /// On-disk B-tree page flag byte (`PTF_*` in `btreeInt.h` / `decodeFlags` in `btree.c:2055`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,9 +167,9 @@ pub enum BtreePageType {
     IndexInterior = 0x02,
     /// `0x05` (`PTF_LEAFDATA | PTF_INTKEY`): Table B+Tree interior page (12-byte header).
     TableInterior = 0x05,
-    /// `0x0a` (`PTF_ZERODATA | PTF_LEAF`): Index B-Tree leaf page (8-byte header).
+    /// `0x0a` / `0x1a`: Index B-Tree leaf page.
     IndexLeaf = 0x0a,
-    /// `0x0d` (`PTF_LEAFDATA | PTF_INTKEY | PTF_LEAF`): Table B+Tree leaf page (8-byte header).
+    /// `0x0d` / `0x1d`: Table B+Tree leaf page.
     TableLeaf = 0x0d,
 }
 
@@ -27,8 +178,8 @@ impl BtreePageType {
         match b {
             0x02 => Ok(Self::IndexInterior),
             0x05 => Ok(Self::TableInterior),
-            0x0a => Ok(Self::IndexLeaf),
-            0x0d => Ok(Self::TableLeaf),
+            0x0a | P3V1_INDEX_LEAF_BYTE => Ok(Self::IndexLeaf),
+            0x0d | P3V1_TABLE_LEAF_BYTE => Ok(Self::TableLeaf),
             other => Err(SqliteError::corrupt(format!(
                 "invalid btree page flags byte: {other:#04x}"
             ))),
@@ -110,6 +261,15 @@ impl TableLeafCell {
         raw.max(4)
     }
 
+    #[inline(always)]
+    pub fn encoded_size_p3v1(&self) -> usize {
+        if self.overflow_page.is_some() {
+            8 + self.local_payload.len()
+        } else {
+            self.local_payload.len().max(4)
+        }
+    }
+
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         let start = out.len();
         push_varint(out, u64::from(self.total_payload_len));
@@ -154,6 +314,15 @@ impl IndexLeafCell {
             + self.local_payload.len()
             + if self.overflow_page.is_some() { 4 } else { 0 };
         raw.max(4)
+    }
+
+    #[inline(always)]
+    pub fn encoded_size_p3v1(&self) -> usize {
+        if self.overflow_page.is_some() {
+            8 + self.local_payload.len()
+        } else {
+            self.local_payload.len().max(4)
+        }
     }
 
     pub fn encode_into(&self, out: &mut Vec<u8>) {
@@ -234,7 +403,7 @@ impl ParsedPage {
         }
     }
 
-    /// Computes the exact byte footprint required on a page with header offset `hdr_off` (100 on Page 1, 0 otherwise).
+    /// Computes the exact byte footprint required on a Format-3 page with header offset `hdr_off`.
     pub fn required_bytes(&self, hdr_off: usize) -> usize {
         let hdr_len = self.page_type().header_size();
         let ptr_array_len = 2 * self.cell_count();
@@ -251,12 +420,36 @@ impl ParsedPage {
         hdr_off + hdr_len + ptr_array_len + cells_bytes
     }
 
+    /// Computes the exact byte footprint required on either a `P3v1` leaf (`is_p3v1 == true`)
+    /// or Format-3 / interior page.
+    pub fn required_bytes_for_format(&self, hdr_off: usize, is_p3v1: bool) -> usize {
+        if !is_p3v1 {
+            return self.required_bytes(hdr_off);
+        }
+        match self {
+            Self::TableLeaf { cells } => {
+                let bodies: usize = cells.iter().map(TableLeafCell::encoded_size_p3v1).sum();
+                hdr_off + 8 + 12 * cells.len() + bodies
+            }
+            Self::IndexLeaf { cells } => {
+                let bodies: usize = cells.iter().map(IndexLeafCell::encoded_size_p3v1).sum();
+                hdr_off + 12 + 12 * cells.len() + bodies
+            }
+            Self::TableInterior { .. } | Self::IndexInterior { .. } => self.required_bytes(hdr_off),
+        }
+    }
+
     pub fn fits_in_page(&self, pgno: Pgno, usable_size: u32) -> bool {
         let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
         self.required_bytes(hdr_off) <= (usable_size as usize)
     }
 
-    /// Parses an on-disk SQLite B-tree page (handling arbitrary cell pointer ordering, freeblocks, and fragments).
+    pub fn fits_in_page_for_format(&self, pgno: Pgno, usable_size: u32, is_p3v1: bool) -> bool {
+        let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+        self.required_bytes_for_format(hdr_off, is_p3v1) <= (usable_size as usize)
+    }
+
+    /// Parses an on-disk B-tree page (`P3v1` `0x1d`/`0x1a` or Format-3 `0x0d`/`0x0a`/`0x05`/`0x02`).
     pub fn parse(pgno: Pgno, usable_size: u32, raw: &[u8]) -> Result<Self> {
         let usable = usable_size as usize;
         if raw.len() < usable {
@@ -265,12 +458,18 @@ impl ParsedPage {
             ));
         }
         let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
-        let page_type = BtreePageType::from_byte(raw[hdr_off])?;
+        if hdr_off + 8 > usable {
+            return Err(SqliteError::corrupt("truncated page header"));
+        }
+        let (page_type, hdr_size, slot_stride, is_p3v1_leaf) =
+            decode_raw_page_layout(raw[hdr_off])?;
+        if hdr_off + hdr_size > usable {
+            return Err(SqliteError::corrupt("truncated page header"));
+        }
         let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
-        let hdr_size = page_type.header_size();
         let ptr_base = hdr_off + hdr_size;
         let ptr_end = ptr_base
-            .checked_add(2 * n_cell)
+            .checked_add(slot_stride.saturating_mul(n_cell))
             .ok_or_else(|| SqliteError::corrupt("cell pointer array overflow"))?;
         if ptr_end > usable {
             return Err(SqliteError::corrupt(format!(
@@ -290,8 +489,13 @@ impl ParsedPage {
         };
 
         let cell_offset_at = |idx: usize| -> Result<usize> {
-            let p = ptr_base + 2 * idx;
-            let off = u16::from_be_bytes([raw[p], raw[p + 1]]) as usize;
+            let off = if is_p3v1_leaf {
+                let s = ptr_base + 12 * idx;
+                u16::from_le_bytes([raw[s + 8], raw[s + 9]]) as usize
+            } else {
+                let p = ptr_base + 2 * idx;
+                u16::from_be_bytes([raw[p], raw[p + 1]]) as usize
+            };
             if off < ptr_end || off >= usable {
                 return Err(SqliteError::corrupt(format!(
                     "invalid cell offset {off} on page {pgno}"
@@ -301,6 +505,70 @@ impl ParsedPage {
         };
 
         match page_type {
+            BtreePageType::TableLeaf if is_p3v1_leaf => {
+                let bounds = PayloadBounds::for_table_leaf(usable_size);
+                let mut cells = Vec::with_capacity(n_cell);
+                for i in 0..n_cell {
+                    let s = ptr_base + 12 * i;
+                    let rowid = i64::from_le_bytes([
+                        raw[s],
+                        raw[s + 1],
+                        raw[s + 2],
+                        raw[s + 3],
+                        raw[s + 4],
+                        raw[s + 5],
+                        raw[s + 6],
+                        raw[s + 7],
+                    ]);
+                    let off = cell_offset_at(i)?;
+                    let len_flags = u16::from_le_bytes([raw[s + 10], raw[s + 11]]);
+                    if len_flags < P3V1_OVFL_SENTINEL {
+                        let len = len_flags as usize;
+                        if off + len > usable {
+                            return Err(SqliteError::corrupt(format!(
+                                "table leaf cell extends past end of page {pgno}"
+                            )));
+                        }
+                        cells.push(TableLeafCell {
+                            rowid,
+                            total_payload_len: u32::from(len_flags),
+                            local_payload: raw[off..off + len].to_vec(),
+                            overflow_page: None,
+                        });
+                    } else {
+                        if off + 8 > usable {
+                            return Err(SqliteError::corrupt(format!(
+                                "table leaf overflow header extends past end of page {pgno}"
+                            )));
+                        }
+                        let total_payload_len = u32::from_le_bytes([
+                            raw[off],
+                            raw[off + 1],
+                            raw[off + 2],
+                            raw[off + 3],
+                        ]);
+                        let ovfl = u32::from_be_bytes([
+                            raw[off + 4],
+                            raw[off + 5],
+                            raw[off + 6],
+                            raw[off + 7],
+                        ]);
+                        let local_len = bounds.local_len(total_payload_len);
+                        if off + 8 + local_len > usable {
+                            return Err(SqliteError::corrupt(format!(
+                                "table leaf overflow cell extends past end of page {pgno}"
+                            )));
+                        }
+                        cells.push(TableLeafCell {
+                            rowid,
+                            total_payload_len,
+                            local_payload: raw[off + 8..off + 8 + local_len].to_vec(),
+                            overflow_page: Some(ovfl),
+                        });
+                    }
+                }
+                Ok(Self::TableLeaf { cells })
+            }
             BtreePageType::TableLeaf => {
                 let bounds = PayloadBounds::for_table_leaf(usable_size);
                 let mut cells = Vec::with_capacity(n_cell);
@@ -355,6 +623,58 @@ impl ParsedPage {
                     cells.push(TableInteriorCell { left_child, key });
                 }
                 Ok(Self::TableInterior { cells, right_child })
+            }
+            BtreePageType::IndexLeaf if is_p3v1_leaf => {
+                let bounds = PayloadBounds::for_index(usable_size);
+                let mut cells = Vec::with_capacity(n_cell);
+                for i in 0..n_cell {
+                    let s = ptr_base + 12 * i;
+                    let off = cell_offset_at(i)?;
+                    let len_flags = u16::from_le_bytes([raw[s + 10], raw[s + 11]]);
+                    if len_flags < P3V1_OVFL_SENTINEL {
+                        let len = len_flags as usize;
+                        if off + len > usable {
+                            return Err(SqliteError::corrupt(format!(
+                                "index leaf cell extends past end of page {pgno}"
+                            )));
+                        }
+                        cells.push(IndexLeafCell {
+                            total_payload_len: u32::from(len_flags),
+                            local_payload: raw[off..off + len].to_vec(),
+                            overflow_page: None,
+                        });
+                    } else {
+                        if off + 8 > usable {
+                            return Err(SqliteError::corrupt(format!(
+                                "index leaf overflow header extends past end of page {pgno}"
+                            )));
+                        }
+                        let total_payload_len = u32::from_le_bytes([
+                            raw[off],
+                            raw[off + 1],
+                            raw[off + 2],
+                            raw[off + 3],
+                        ]);
+                        let ovfl = u32::from_be_bytes([
+                            raw[off + 4],
+                            raw[off + 5],
+                            raw[off + 6],
+                            raw[off + 7],
+                        ]);
+                        let local_len = bounds.local_len(total_payload_len);
+                        if off + 8 + local_len > usable {
+                            return Err(SqliteError::corrupt(format!(
+                                "index leaf overflow cell extends past end of page {pgno}"
+                            )));
+                        }
+                        cells.push(IndexLeafCell {
+                            total_payload_len,
+                            local_payload: raw[off + 8..off + 8 + local_len].to_vec(),
+                            overflow_page: Some(ovfl),
+                        });
+                    }
+                }
+                Ok(Self::IndexLeaf { cells })
             }
             BtreePageType::IndexLeaf => {
                 let bounds = PayloadBounds::for_index(usable_size);
@@ -439,7 +759,7 @@ impl ParsedPage {
         }
     }
 
-    /// Serializes this page into `raw` as a clean, defragmented SQLite slotted page.
+    /// Serializes this page into `raw` as a clean, defragmented Format-3 slotted page.
     /// Preserves `raw[0..100]` when `pgno == 1`.
     pub fn write(&self, pgno: Pgno, usable_size: u32, raw: &mut [u8]) -> Result<()> {
         let usable = usable_size as usize;
@@ -518,6 +838,136 @@ impl ParsedPage {
         };
         raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
         raw[hdr_off + 7] = 0; // fragmented free bytes = 0
+        Ok(())
+    }
+
+    /// Serializes this page into `raw` as a `P3v1` leaf (`0x1d` / `0x1a`) when `is_p3v1` is `true`
+    /// and `self` is a leaf, or as Format-3 otherwise.
+    pub fn write_for_format(
+        &self,
+        pgno: Pgno,
+        usable_size: u32,
+        is_p3v1: bool,
+        orders: Option<&[KeySortOrder]>,
+        enc: TextEncoding,
+        raw: &mut [u8],
+    ) -> Result<()> {
+        if !is_p3v1 || !self.page_type().is_leaf() {
+            return self.write(pgno, usable_size, raw);
+        }
+        let usable = usable_size as usize;
+        let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+        if self.required_bytes_for_format(hdr_off, true) > usable {
+            return Err(SqliteError::new(
+                ErrorCode::Full,
+                "cells exceed usable B-tree page capacity",
+            ));
+        }
+
+        raw[hdr_off..usable].fill(0);
+        let n_cell = self.cell_count();
+        let mut content_cursor = usable;
+
+        match self {
+            Self::TableLeaf { cells } => {
+                let dir_base = hdr_off + 8;
+                for (i, cell) in cells.iter().enumerate() {
+                    let s = dir_base + 12 * i;
+                    raw[s..s + 8].copy_from_slice(&cell.rowid.to_le_bytes());
+                    if let Some(ovfl) = cell.overflow_page {
+                        let clen = 8 + cell.local_payload.len();
+                        content_cursor -= clen;
+                        raw[content_cursor..content_cursor + 4]
+                            .copy_from_slice(&cell.total_payload_len.to_le_bytes());
+                        raw[content_cursor + 4..content_cursor + 8]
+                            .copy_from_slice(&ovfl.to_be_bytes());
+                        raw[content_cursor + 8..content_cursor + clen]
+                            .copy_from_slice(&cell.local_payload);
+                        raw[s + 8..s + 10].copy_from_slice(&(content_cursor as u16).to_le_bytes());
+                        raw[s + 10..s + 12].copy_from_slice(&P3V1_OVFL_SENTINEL.to_le_bytes());
+                    } else {
+                        let plen = cell.local_payload.len();
+                        let clen = plen.max(4);
+                        content_cursor -= clen;
+                        raw[content_cursor..content_cursor + plen]
+                            .copy_from_slice(&cell.local_payload);
+                        raw[s + 8..s + 10].copy_from_slice(&(content_cursor as u16).to_le_bytes());
+                        raw[s + 10..s + 12].copy_from_slice(&(plen as u16).to_le_bytes());
+                    }
+                }
+                raw[hdr_off] = P3V1_TABLE_LEAF_BYTE;
+            }
+            Self::IndexLeaf { cells } => {
+                let fp_mode = if cells.is_empty() {
+                    FP_MODE_NONE
+                } else if let Some(ord) = orders {
+                    if orders_allow_int32_pair_fp(ord)
+                        && cells
+                            .iter()
+                            .all(|c| compute_int32_pair_fp_from_record(&c.local_payload).is_some())
+                    {
+                        FP_MODE_INT32_PAIR
+                    } else if orders_allow_col0_fp(ord, enc)
+                        && cells.iter().all(|c| {
+                            compute_universal_col0_fp_from_record(&c.local_payload).is_some()
+                        })
+                    {
+                        FP_MODE_UNIVERSAL_COL0
+                    } else {
+                        FP_MODE_NONE
+                    }
+                } else {
+                    FP_MODE_NONE
+                };
+                let dir_base = hdr_off + 12;
+                for (i, cell) in cells.iter().enumerate() {
+                    let s = dir_base + 12 * i;
+                    let fp = match fp_mode {
+                        FP_MODE_INT32_PAIR => {
+                            compute_int32_pair_fp_from_record(&cell.local_payload).unwrap_or(0)
+                        }
+                        FP_MODE_UNIVERSAL_COL0 => {
+                            compute_universal_col0_fp_from_record(&cell.local_payload).unwrap_or(0)
+                        }
+                        _ => 0,
+                    };
+                    raw[s..s + 8].copy_from_slice(&fp.to_le_bytes());
+                    if let Some(ovfl) = cell.overflow_page {
+                        let clen = 8 + cell.local_payload.len();
+                        content_cursor -= clen;
+                        raw[content_cursor..content_cursor + 4]
+                            .copy_from_slice(&cell.total_payload_len.to_le_bytes());
+                        raw[content_cursor + 4..content_cursor + 8]
+                            .copy_from_slice(&ovfl.to_be_bytes());
+                        raw[content_cursor + 8..content_cursor + clen]
+                            .copy_from_slice(&cell.local_payload);
+                        raw[s + 8..s + 10].copy_from_slice(&(content_cursor as u16).to_le_bytes());
+                        raw[s + 10..s + 12].copy_from_slice(&P3V1_OVFL_SENTINEL.to_le_bytes());
+                    } else {
+                        let plen = cell.local_payload.len();
+                        let clen = plen.max(4);
+                        content_cursor -= clen;
+                        raw[content_cursor..content_cursor + plen]
+                            .copy_from_slice(&cell.local_payload);
+                        raw[s + 8..s + 10].copy_from_slice(&(content_cursor as u16).to_le_bytes());
+                        raw[s + 10..s + 12].copy_from_slice(&(plen as u16).to_le_bytes());
+                    }
+                }
+                raw[hdr_off] = P3V1_INDEX_LEAF_BYTE;
+                raw[hdr_off + 8] = fp_mode;
+            }
+            Self::TableInterior { .. } | Self::IndexInterior { .. } => unreachable!(),
+        }
+
+        raw[hdr_off + 1..hdr_off + 3].copy_from_slice(&0u16.to_be_bytes());
+        raw[hdr_off + 3..hdr_off + 5].copy_from_slice(&(n_cell as u16).to_be_bytes());
+        let encoded_top: u16 = if content_cursor == 65_536 {
+            0
+        } else {
+            content_cursor as u16
+        };
+        raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
+        raw[hdr_off + 7] = 0;
         Ok(())
     }
 }
@@ -696,13 +1146,35 @@ pub fn table_interior_right_child(pgno: Pgno, usable_size: u32, raw: &[u8]) -> R
     ]))
 }
 
-/// Returns the maximum `rowid` stored on a raw `TableLeaf` (`0x0d`) page without parsing other cells.
+/// Returns the maximum `rowid` stored on a raw `TableLeaf` (`0x0d` / `0x1d`) page without parsing other cells.
 pub fn last_table_leaf_rowid(pgno: Pgno, usable_size: u32, raw: &[u8]) -> Result<Option<i64>> {
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+    if hdr_off + 8 > usable || raw.len() < usable {
+        return Err(SqliteError::corrupt("truncated table leaf header"));
+    }
     let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
     if n_cell == 0 {
         return Ok(None);
+    }
+    if raw[hdr_off] == P3V1_TABLE_LEAF_BYTE {
+        let dir_end = (hdr_off + 8)
+            .checked_add(12 * n_cell)
+            .ok_or_else(|| SqliteError::corrupt("cell directory overflow"))?;
+        if dir_end > usable {
+            return Err(SqliteError::corrupt("cell directory exceeds usable"));
+        }
+        let s = dir_end - 12;
+        return Ok(Some(i64::from_le_bytes([
+            raw[s],
+            raw[s + 1],
+            raw[s + 2],
+            raw[s + 3],
+            raw[s + 4],
+            raw[s + 5],
+            raw[s + 6],
+            raw[s + 7],
+        ])));
     }
     let ptr_base = hdr_off + 8;
     let ptr_end = ptr_base
@@ -723,7 +1195,7 @@ pub fn last_table_leaf_rowid(pgno: Pgno, usable_size: u32, raw: &[u8]) -> Result
     Ok(Some(rowid))
 }
 
-/// Binary-searches a raw `TableLeaf` (`0x0d`) page for `rowid`, decoding only the matching cell!
+/// Binary-searches a raw `TableLeaf` (`0x0d` / `0x1d`) page for `rowid`, decoding only the matching cell!
 #[allow(clippy::type_complexity)]
 pub fn seek_table_leaf_cell(
     pgno: Pgno,
@@ -733,7 +1205,90 @@ pub fn seek_table_leaf_cell(
 ) -> Result<Option<(u32, Vec<u8>, Option<Pgno>)>> {
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+    if hdr_off + 8 > usable || raw.len() < usable {
+        return Err(SqliteError::corrupt("truncated table leaf header"));
+    }
     let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
+    if raw[hdr_off] == P3V1_TABLE_LEAF_BYTE {
+        let dir_base = hdr_off + 8;
+        let dir_end = dir_base
+            .checked_add(12 * n_cell)
+            .ok_or_else(|| SqliteError::corrupt("cell directory overflow"))?;
+        if dir_end > usable {
+            return Err(SqliteError::corrupt(format!(
+                "cell directory ({dir_end}) exceeds usable page size ({usable}) on page {pgno}"
+            )));
+        }
+        let mut lo = 0usize;
+        let mut hi = n_cell;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let s = dir_base + 12 * mid;
+            let cell_rowid = i64::from_le_bytes([
+                raw[s],
+                raw[s + 1],
+                raw[s + 2],
+                raw[s + 3],
+                raw[s + 4],
+                raw[s + 5],
+                raw[s + 6],
+                raw[s + 7],
+            ]);
+            match cell_rowid.cmp(&rowid) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    let off = u16::from_le_bytes([raw[s + 8], raw[s + 9]]) as usize;
+                    let len_flags = u16::from_le_bytes([raw[s + 10], raw[s + 11]]);
+                    if off < dir_end || off >= usable {
+                        return Err(SqliteError::corrupt(format!(
+                            "invalid cell offset {off} on page {pgno}"
+                        )));
+                    }
+                    if len_flags < P3V1_OVFL_SENTINEL {
+                        let len = len_flags as usize;
+                        if off + len > usable {
+                            return Err(SqliteError::corrupt(format!(
+                                "table leaf cell extends past end of page {pgno}"
+                            )));
+                        }
+                        return Ok(Some((
+                            u32::from(len_flags),
+                            raw[off..off + len].to_vec(),
+                            None,
+                        )));
+                    }
+                    if off + 8 > usable {
+                        return Err(SqliteError::corrupt(format!(
+                            "table leaf overflow header extends past end of page {pgno}"
+                        )));
+                    }
+                    let total_payload_len =
+                        u32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+                    let ovfl = u32::from_be_bytes([
+                        raw[off + 4],
+                        raw[off + 5],
+                        raw[off + 6],
+                        raw[off + 7],
+                    ]);
+                    let bounds = PayloadBounds::for_table_leaf(usable_size);
+                    let local_len = bounds.local_len(total_payload_len);
+                    if off + 8 + local_len > usable {
+                        return Err(SqliteError::corrupt(format!(
+                            "table leaf overflow cell extends past end of page {pgno}"
+                        )));
+                    }
+                    return Ok(Some((
+                        total_payload_len,
+                        raw[off + 8..off + 8 + local_len].to_vec(),
+                        Some(ovfl),
+                    )));
+                }
+            }
+        }
+        return Ok(None);
+    }
+
     let ptr_base = hdr_off + 8;
     let ptr_end = ptr_base
         .checked_add(2 * n_cell)
@@ -962,16 +1517,19 @@ pub fn raw_page_alloc_freeblock(
     None
 }
 
-/// Compacts all live cells on a raw `TableLeaf` (`0x0d`) or `IndexLeaf` (`0x0a`) page into a single
-/// contiguous cell-content area (`first_fb = 0`, `frag = 0`), using a 4 KiB stack buffer when
-/// `usable_size <= 4096` (zero heap allocation).
+/// Compacts all live cells on a raw `TableLeaf` (`0x0d`/`0x1d`) or `IndexLeaf` (`0x0a`/`0x1a`) page
+/// into a single contiguous cell-content area (`first_fb = 0`, `frag = 0`), using a 4 KiB stack buffer
+/// when `usable_size <= 4096` (zero heap allocation).
 pub fn defragment_raw_leaf_in_place(pgno: Pgno, usable_size: u32, raw: &mut [u8]) -> Result<usize> {
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
     if raw.len() < usable || hdr_off + 8 > usable {
         return Err(SqliteError::corrupt("truncated leaf page in defragment"));
     }
-    let ptype = BtreePageType::from_byte(raw[hdr_off])?;
+    let (ptype, hdr_size, slot_stride, is_p3v1_leaf) = decode_raw_page_layout(raw[hdr_off])?;
+    if hdr_off + hdr_size > usable {
+        return Err(SqliteError::corrupt("truncated leaf header in defragment"));
+    }
     let is_table_leaf = match ptype {
         BtreePageType::TableLeaf => true,
         BtreePageType::IndexLeaf => false,
@@ -982,9 +1540,9 @@ pub fn defragment_raw_leaf_in_place(pgno: Pgno, usable_size: u32, raw: &mut [u8]
         }
     };
     let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
-    let ptr_base = hdr_off + 8;
+    let ptr_base = hdr_off + hdr_size;
     let ptr_end = ptr_base
-        .checked_add(2 * n_cell)
+        .checked_add(slot_stride.saturating_mul(n_cell))
         .ok_or_else(|| SqliteError::corrupt("cell pointer overflow"))?;
     if ptr_end > usable {
         return Err(SqliteError::corrupt("cell pointer exceeds usable_size"));
@@ -1006,31 +1564,58 @@ pub fn defragment_raw_leaf_in_place(pgno: Pgno, usable_size: u32, raw: &mut [u8]
 
     let compact_from = |src: &[u8], dst: &mut [u8]| -> Result<usize> {
         let mut cursor = usable;
-        for i in 0..n_cell {
-            let p = ptr_base + 2 * i;
-            let off = u16::from_be_bytes([dst[p], dst[p + 1]]) as usize;
-            if off < ptr_end || off >= usable {
-                return Err(SqliteError::corrupt("invalid cell offset during defrag"));
+        if is_p3v1_leaf {
+            for i in 0..n_cell {
+                let s = ptr_base + 12 * i;
+                let off = u16::from_le_bytes([dst[s + 8], dst[s + 9]]) as usize;
+                let len_flags = u16::from_le_bytes([dst[s + 10], dst[s + 11]]);
+                if off < ptr_end || off >= usable {
+                    return Err(SqliteError::corrupt("invalid cell offset during defrag"));
+                }
+                let cell_len = if len_flags < P3V1_OVFL_SENTINEL {
+                    (len_flags as usize).max(4)
+                } else {
+                    if off + 8 > usable {
+                        return Err(SqliteError::corrupt("truncated overflow cell in defrag"));
+                    }
+                    let total_len =
+                        u32::from_le_bytes([src[off], src[off + 1], src[off + 2], src[off + 3]]);
+                    8 + bounds.local_len(total_len)
+                };
+                if off + cell_len > usable || cursor < ptr_end + cell_len {
+                    return Err(SqliteError::corrupt("corrupt cell bounds during defrag"));
+                }
+                cursor -= cell_len;
+                dst[cursor..cursor + cell_len].copy_from_slice(&src[off..off + cell_len]);
+                dst[s + 8..s + 10].copy_from_slice(&(cursor as u16).to_le_bytes());
             }
-            let slice = &src[off..usable];
-            let (payload_u64, n1) = get_varint(slice)?;
-            let total_len = u32::try_from(payload_u64)
-                .map_err(|_| SqliteError::corrupt("cell payload > 4GiB"))?;
-            let local_len = bounds.local_len(total_len);
-            let has_ovfl = (local_len as u32) < total_len;
-            let n2 = if is_table_leaf {
-                let (_, used2) = get_varint_i64(&slice[n1..])?;
-                used2
-            } else {
-                0
-            };
-            let cell_len = (n1 + n2 + local_len + if has_ovfl { 4 } else { 0 }).max(4);
-            if off + cell_len > usable || cursor < ptr_end + cell_len {
-                return Err(SqliteError::corrupt("corrupt cell bounds during defrag"));
+        } else {
+            for i in 0..n_cell {
+                let p = ptr_base + 2 * i;
+                let off = u16::from_be_bytes([dst[p], dst[p + 1]]) as usize;
+                if off < ptr_end || off >= usable {
+                    return Err(SqliteError::corrupt("invalid cell offset during defrag"));
+                }
+                let slice = &src[off..usable];
+                let (payload_u64, n1) = get_varint(slice)?;
+                let total_len = u32::try_from(payload_u64)
+                    .map_err(|_| SqliteError::corrupt("cell payload > 4GiB"))?;
+                let local_len = bounds.local_len(total_len);
+                let has_ovfl = (local_len as u32) < total_len;
+                let n2 = if is_table_leaf {
+                    let (_, used2) = get_varint_i64(&slice[n1..])?;
+                    used2
+                } else {
+                    0
+                };
+                let cell_len = (n1 + n2 + local_len + if has_ovfl { 4 } else { 0 }).max(4);
+                if off + cell_len > usable || cursor < ptr_end + cell_len {
+                    return Err(SqliteError::corrupt("corrupt cell bounds during defrag"));
+                }
+                cursor -= cell_len;
+                dst[cursor..cursor + cell_len].copy_from_slice(&src[off..off + cell_len]);
+                dst[p..p + 2].copy_from_slice(&(cursor as u16).to_be_bytes());
             }
-            cursor -= cell_len;
-            dst[cursor..cursor + cell_len].copy_from_slice(&src[off..off + cell_len]);
-            dst[p..p + 2].copy_from_slice(&(cursor as u16).to_be_bytes());
         }
         dst[ptr_end..cursor].fill(0);
         dst[hdr_off + 1..hdr_off + 3].fill(0);
@@ -1051,8 +1636,8 @@ pub fn defragment_raw_leaf_in_place(pgno: Pgno, usable_size: u32, raw: &mut [u8]
     }
 }
 
-/// Probes a raw `TableLeaf` (`0x0d`) page for zero-allocation insertion or replacement of `(rowid, payload)`
-/// when `payload.len() <= max_local` (no overflow page).
+/// Probes a raw `TableLeaf` (`0x0d` / `0x1d`) page for zero-allocation insertion or replacement
+/// of `(rowid, payload)` when `payload.len() <= max_local` (no overflow page).
 pub fn probe_insert_table_leaf_raw(
     pgno: Pgno,
     usable_size: u32,
@@ -1062,19 +1647,21 @@ pub fn probe_insert_table_leaf_raw(
 ) -> Result<TableLeafInsertProbe> {
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
-    if hdr_off + 8 > usable || raw[hdr_off] != BtreePageType::TableLeaf as u8 {
+    if hdr_off + 8 > usable || !is_table_leaf_byte(raw[hdr_off]) {
         return Ok(TableLeafInsertProbe::Fallback);
     }
+    let is_p3v1 = raw[hdr_off] == P3V1_TABLE_LEAF_BYTE;
     let first_fb = u16::from_be_bytes([raw[hdr_off + 1], raw[hdr_off + 2]]);
     let frag = raw[hdr_off + 7];
     let has_reclaimable = first_fb != 0 || frag != 0;
 
     let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
+    let slot_stride = if is_p3v1 { 12usize } else { 2usize };
     let ptr_base = hdr_off + 8;
-    let Some(ptr_end) = ptr_base.checked_add(2 * n_cell) else {
+    let Some(ptr_end) = ptr_base.checked_add(slot_stride.saturating_mul(n_cell)) else {
         return Ok(TableLeafInsertProbe::Fallback);
     };
-    let ptr_end_after = ptr_end + 2;
+    let ptr_end_after = ptr_end + slot_stride;
     if ptr_end > usable {
         return Ok(TableLeafInsertProbe::Fallback);
     }
@@ -1091,7 +1678,11 @@ pub fn probe_insert_table_leaf_raw(
         return Ok(TableLeafInsertProbe::Fallback);
     }
 
-    let cell_len = (varint_len(payload_len as u64) + varint_len(rowid as u64) + payload_len).max(4);
+    let cell_len = if is_p3v1 {
+        payload_len.max(4)
+    } else {
+        (varint_len(payload_len as u64) + varint_len(rowid as u64) + payload_len).max(4)
+    };
     let fits_here = ptr_end_after <= usable && ptr_end_after + cell_len <= content_top;
 
     if n_cell == 0 {
@@ -1104,6 +1695,102 @@ pub fn probe_insert_table_leaf_raw(
             TableLeafInsertProbe::NeedsDefrag
         } else {
             TableLeafInsertProbe::Fallback
+        });
+    }
+
+    if is_p3v1 {
+        let probe_replace_p3v1 = |idx: usize| -> TableLeafInsertProbe {
+            let s = ptr_base + 12 * idx;
+            let off = u16::from_le_bytes([raw[s + 8], raw[s + 9]]) as usize;
+            let len_flags = u16::from_le_bytes([raw[s + 10], raw[s + 11]]);
+            if off < content_top || len_flags == P3V1_OVFL_SENTINEL {
+                return TableLeafInsertProbe::DuplicateNeedsFallback;
+            }
+            let old_cell_len = (len_flags as usize).max(4);
+            if off + old_cell_len > usable {
+                return TableLeafInsertProbe::DuplicateNeedsFallback;
+            }
+            if cell_len == old_cell_len
+                || ptr_end + cell_len <= content_top
+                || (cell_len < old_cell_len
+                    && (old_cell_len - cell_len >= 4
+                        || off == content_top
+                        || usize::from(frag) + (old_cell_len - cell_len) <= 60))
+            {
+                return TableLeafInsertProbe::Replace {
+                    idx,
+                    old_off: off,
+                    old_cell_len,
+                    content_top,
+                };
+            }
+            if has_reclaimable || ptr_end + cell_len <= content_top + old_cell_len {
+                return TableLeafInsertProbe::NeedsDefrag;
+            }
+            TableLeafInsertProbe::DuplicateNeedsFallback
+        };
+
+        let ls = ptr_end - 12;
+        let last_rowid = i64::from_le_bytes([
+            raw[ls],
+            raw[ls + 1],
+            raw[ls + 2],
+            raw[ls + 3],
+            raw[ls + 4],
+            raw[ls + 5],
+            raw[ls + 6],
+            raw[ls + 7],
+        ]);
+        if rowid > last_rowid {
+            if fits_here {
+                return Ok(TableLeafInsertProbe::Fit {
+                    insert_idx: n_cell,
+                    content_top,
+                });
+            }
+            if has_reclaimable {
+                return Ok(TableLeafInsertProbe::NeedsDefrag);
+            }
+            if 8 + 12 + cell_len <= usable {
+                return Ok(TableLeafInsertProbe::QuickRightSplit { last_rowid });
+            }
+            return Ok(TableLeafInsertProbe::Fallback);
+        }
+        if rowid == last_rowid {
+            return Ok(probe_replace_p3v1(n_cell - 1));
+        }
+
+        let mut lo = 0usize;
+        let mut hi = n_cell - 1;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let s = ptr_base + 12 * mid;
+            let mid_rowid = i64::from_le_bytes([
+                raw[s],
+                raw[s + 1],
+                raw[s + 2],
+                raw[s + 3],
+                raw[s + 4],
+                raw[s + 5],
+                raw[s + 6],
+                raw[s + 7],
+            ]);
+            match mid_rowid.cmp(&rowid) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Ok(probe_replace_p3v1(mid)),
+            }
+        }
+        if !fits_here {
+            return Ok(if has_reclaimable {
+                TableLeafInsertProbe::NeedsDefrag
+            } else {
+                TableLeafInsertProbe::Fallback
+            });
+        }
+        return Ok(TableLeafInsertProbe::Fit {
+            insert_idx: lo,
+            content_top,
         });
     }
 
@@ -1202,7 +1889,7 @@ pub fn probe_insert_table_leaf_raw(
     })
 }
 
-/// Replaces an existing non-overflow `(rowid, payload)` cell in-place on a `TableLeaf` (`0x0d`) page
+/// Replaces an existing non-overflow `(rowid, payload)` cell in-place on a `TableLeaf` (`0x0d`/`0x1d`) page
 /// in O(1) without heap allocations (`new_cell_len == old_cell_len` overwrites in place; otherwise
 /// frees the old `>= 4`-byte cell to the freeblock list and allocates from `content_top`).
 #[inline]
@@ -1219,6 +1906,129 @@ pub fn apply_replace_table_leaf_raw(
     _content_top: usize,
 ) {
     let usable = usable_size as usize;
+    let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+    if raw[hdr_off] == P3V1_TABLE_LEAF_BYTE {
+        let ptr_base = hdr_off + 8;
+        let s = ptr_base + 12 * idx;
+        let plen = payload.len();
+        let new_cell_len = plen.max(4);
+        if new_cell_len == old_cell_len {
+            raw[old_off..old_off + plen].copy_from_slice(payload);
+            if plen < new_cell_len {
+                raw[old_off + plen..old_off + new_cell_len].fill(0);
+            }
+            raw[s + 10..s + 12].copy_from_slice(&(plen as u16).to_le_bytes());
+            return;
+        }
+        if !raw_page_free_space(raw, hdr_off, usable, old_off, old_cell_len) {
+            let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
+            let raw_top = u16::from_be_bytes([raw[hdr_off + 5], raw[hdr_off + 6]]) as usize;
+            let cur_top = if raw_top == 0 { 65_536 } else { raw_top };
+            if old_off > cur_top {
+                raw.copy_within(cur_top..old_off, cur_top + old_cell_len);
+            }
+            let old_off_u16 = old_off as u16;
+            let shift = old_cell_len as u16;
+            for j in 0..n_cell {
+                if j != idx {
+                    let sj = ptr_base + 12 * j;
+                    let cur = u16::from_le_bytes([raw[sj + 8], raw[sj + 9]]);
+                    if cur < old_off_u16 {
+                        raw[sj + 8..sj + 10].copy_from_slice(&(cur + shift).to_le_bytes());
+                    }
+                }
+            }
+            let freed_top = cur_top + old_cell_len;
+            let new_top = freed_top - new_cell_len;
+            raw[new_top..new_top + plen].copy_from_slice(payload);
+            if plen < new_cell_len {
+                raw[new_top + plen..new_top + new_cell_len].fill(0);
+            }
+            raw[s + 8..s + 10].copy_from_slice(&(new_top as u16).to_le_bytes());
+            raw[s + 10..s + 12].copy_from_slice(&(plen as u16).to_le_bytes());
+            let encoded_top: u16 = if new_top == 65_536 { 0 } else { new_top as u16 };
+            raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
+            return;
+        }
+
+        if let Some(fb_off) = raw_page_alloc_freeblock(raw, hdr_off, usable, new_cell_len) {
+            raw[fb_off..fb_off + plen].copy_from_slice(payload);
+            if plen < new_cell_len {
+                raw[fb_off + plen..fb_off + new_cell_len].fill(0);
+            }
+            raw[s + 8..s + 10].copy_from_slice(&(fb_off as u16).to_le_bytes());
+            raw[s + 10..s + 12].copy_from_slice(&(plen as u16).to_le_bytes());
+            return;
+        }
+
+        let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
+        let ptr_end = ptr_base + 12 * n_cell;
+        let raw_top_after = u16::from_be_bytes([raw[hdr_off + 5], raw[hdr_off + 6]]) as usize;
+        let mut cur_top_after = if raw_top_after == 0 {
+            65_536
+        } else {
+            raw_top_after
+        };
+        if ptr_end + new_cell_len > cur_top_after {
+            let mut ptrs = [0u16; 2048];
+            if n_cell <= ptrs.len() {
+                let mut scratch = [0u8; 4096];
+                let mut heap_scratch = Vec::new();
+                let buf: &mut [u8] = if usable <= 4096 {
+                    &mut scratch[..usable]
+                } else {
+                    heap_scratch.resize(usable, 0);
+                    &mut heap_scratch[..usable]
+                };
+                let bounds = PayloadBounds::for_table_leaf(usable_size);
+                let mut new_c_top = usable;
+                for (j, ptr_slot) in ptrs.iter_mut().enumerate().take(n_cell) {
+                    if j == idx {
+                        continue;
+                    }
+                    let sj = ptr_base + 12 * j;
+                    let c_off = u16::from_le_bytes([raw[sj + 8], raw[sj + 9]]) as usize;
+                    let lf = u16::from_le_bytes([raw[sj + 10], raw[sj + 11]]);
+                    let c_len = if lf < P3V1_OVFL_SENTINEL {
+                        (lf as usize).max(4)
+                    } else {
+                        let tot = u32::from_le_bytes([
+                            raw[c_off],
+                            raw[c_off + 1],
+                            raw[c_off + 2],
+                            raw[c_off + 3],
+                        ]);
+                        8 + bounds.local_len(tot)
+                    };
+                    new_c_top -= c_len;
+                    buf[new_c_top..new_c_top + c_len].copy_from_slice(&raw[c_off..c_off + c_len]);
+                    *ptr_slot = new_c_top as u16;
+                }
+                raw[ptr_end..new_c_top].fill(0);
+                raw[new_c_top..usable].copy_from_slice(&buf[new_c_top..usable]);
+                for (j, &new_ptr) in ptrs[..n_cell].iter().enumerate() {
+                    if j != idx {
+                        let sj = ptr_base + 12 * j;
+                        raw[sj + 8..sj + 10].copy_from_slice(&new_ptr.to_le_bytes());
+                    }
+                }
+                raw[hdr_off + 1..hdr_off + 3].fill(0);
+                raw[hdr_off + 7] = 0;
+                cur_top_after = new_c_top;
+            }
+        }
+        let new_top = cur_top_after - new_cell_len;
+        raw[new_top..new_top + plen].copy_from_slice(payload);
+        if plen < new_cell_len {
+            raw[new_top + plen..new_top + new_cell_len].fill(0);
+        }
+        raw[s + 8..s + 10].copy_from_slice(&(new_top as u16).to_le_bytes());
+        raw[s + 10..s + 12].copy_from_slice(&(plen as u16).to_le_bytes());
+        let encoded_top: u16 = if new_top == 65_536 { 0 } else { new_top as u16 };
+        raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
+        return;
+    }
+
     let new_cell_len =
         (varint_len(payload.len() as u64) + varint_len(rowid as u64) + payload.len()).max(4);
     if new_cell_len == old_cell_len {
@@ -1234,7 +2044,6 @@ pub fn apply_replace_table_leaf_raw(
         return;
     }
 
-    let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
     let ptr_base = hdr_off + 8;
 
     if !raw_page_free_space(raw, hdr_off, usable, old_off, old_cell_len) {
@@ -1289,7 +2098,6 @@ pub fn apply_replace_table_leaf_raw(
         return;
     }
 
-    // Note: `raw_page_free_space` may have increased `hdr[5..7]` if `old_off == content_top`!
     let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
     let ptr_end = ptr_base + 2 * n_cell;
     let raw_top_after = u16::from_be_bytes([raw[hdr_off + 5], raw[hdr_off + 6]]) as usize;
@@ -1299,9 +2107,6 @@ pub fn apply_replace_table_leaf_raw(
         raw_top_after
     };
     if ptr_end + new_cell_len > cur_top_after {
-        // Zero out `idx` temporarily during defragment? Instead, point `idx` to a dummy? No: `idx` was already freed!
-        // Because `raw_page_free_space` succeeded, if `new_cell_len <= old_cell_len` and `fb_off` was None only due to
-        // `frag + rem > 60`, compacting the other `n_cell - 1` cells reclaims all fragmented bytes cleanly!
         let mut ptrs = [0u16; 2048];
         if n_cell <= ptrs.len() {
             let mut scratch = [0u8; 4096];
@@ -1374,6 +2179,31 @@ pub fn apply_insert_table_leaf_raw(
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
     let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
     let ptr_base = hdr_off + 8;
+    if raw[hdr_off] == P3V1_TABLE_LEAF_BYTE {
+        let plen = payload.len();
+        let cell_len = plen.max(4);
+        let new_top = content_top - cell_len;
+        if insert_idx < n_cell {
+            raw.copy_within(
+                ptr_base + 12 * insert_idx..ptr_base + 12 * n_cell,
+                ptr_base + 12 * (insert_idx + 1),
+            );
+        }
+        let s = ptr_base + 12 * insert_idx;
+        raw[s..s + 8].copy_from_slice(&rowid.to_le_bytes());
+        raw[s + 8..s + 10].copy_from_slice(&(new_top as u16).to_le_bytes());
+        raw[s + 10..s + 12].copy_from_slice(&(plen as u16).to_le_bytes());
+        raw[new_top..new_top + plen].copy_from_slice(payload);
+        if plen < cell_len {
+            raw[new_top + plen..new_top + cell_len].fill(0);
+        }
+        let new_n = (n_cell + 1) as u16;
+        raw[hdr_off + 3..hdr_off + 5].copy_from_slice(&new_n.to_be_bytes());
+        let encoded_top: u16 = if new_top == 65_536 { 0 } else { new_top as u16 };
+        raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
+        return;
+    }
+
     let cell_len =
         (varint_len(payload.len() as u64) + varint_len(rowid as u64) + payload.len()).max(4);
     let new_top = content_top - cell_len;
@@ -1403,11 +2233,12 @@ pub fn apply_insert_table_leaf_raw(
     raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
 }
 
-/// Initializes a freshly allocated non-Page-1 `TableLeaf` (`0x0d`) containing a single non-overflow cell
-/// `(rowid, payload)` (`balance_quick` right sibling).
+/// Initializes a freshly allocated non-Page-1 `TableLeaf` (`0x0d` / `0x1d`) containing a single
+/// non-overflow cell `(rowid, payload)` (`balance_quick` right sibling).
 pub fn init_single_cell_table_leaf_raw(
     pgno: Pgno,
     usable_size: u32,
+    is_p3v1: bool,
     raw: &mut [u8],
     rowid: i64,
     payload: &[u8],
@@ -1415,6 +2246,22 @@ pub fn init_single_cell_table_leaf_raw(
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
     raw[hdr_off..usable].fill(0);
+
+    if is_p3v1 {
+        let plen = payload.len();
+        let cell_len = plen.max(4);
+        let new_top = usable - cell_len;
+        raw[new_top..new_top + plen].copy_from_slice(payload);
+        raw[hdr_off] = P3V1_TABLE_LEAF_BYTE;
+        raw[hdr_off + 3..hdr_off + 5].copy_from_slice(&1u16.to_be_bytes());
+        let encoded_top: u16 = if new_top == 65_536 { 0 } else { new_top as u16 };
+        raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
+        let s = hdr_off + 8;
+        raw[s..s + 8].copy_from_slice(&rowid.to_le_bytes());
+        raw[s + 8..s + 10].copy_from_slice(&(new_top as u16).to_le_bytes());
+        raw[s + 10..s + 12].copy_from_slice(&(plen as u16).to_le_bytes());
+        return;
+    }
 
     let cell_len =
         (varint_len(payload.len() as u64) + varint_len(rowid as u64) + payload.len()).max(4);
@@ -1504,10 +2351,8 @@ pub fn apply_append_table_interior_rightmost(
     raw[hdr_off + 8..hdr_off + 12].copy_from_slice(&new_right_child.to_be_bytes());
 }
 
-/// Attempts an O(1) in-place defragmented insertion into a raw `TableLeaf` (`0x0d`) page
-/// when `rowid` is not already present, the page has no freeblocks/fragments, and enough
-/// contiguous space exists between the cell pointer array and `cell_content_top`.
-/// Returns `Ok(true)` if inserted in-place, or `Ok(false)` if caller should fall back to full page parse/split.
+/// Attempts an O(1) in-place defragmented insertion into a raw `TableLeaf` (`0x0d` / `0x1d`) page
+/// when `rowid` is not already present and enough space exists (compacting freeblocks if needed).
 pub fn try_insert_table_leaf_in_place(
     pgno: Pgno,
     usable_size: u32,
@@ -1516,16 +2361,18 @@ pub fn try_insert_table_leaf_in_place(
 ) -> Result<bool> {
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
-    if raw[hdr_off] != BtreePageType::TableLeaf as u8 {
+    if hdr_off + 8 > usable || !is_table_leaf_byte(raw[hdr_off]) {
         return Ok(false);
     }
+    let is_p3v1 = raw[hdr_off] == P3V1_TABLE_LEAF_BYTE;
+    let slot_stride = if is_p3v1 { 12usize } else { 2usize };
     let first_fb = u16::from_be_bytes([raw[hdr_off + 1], raw[hdr_off + 2]]);
     let frag = raw[hdr_off + 7];
 
     let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
     let ptr_base = hdr_off + 8;
-    let ptr_end = ptr_base + 2 * n_cell;
-    let ptr_end_after = ptr_end + 2;
+    let ptr_end = ptr_base + slot_stride * n_cell;
+    let ptr_end_after = ptr_end + slot_stride;
     if ptr_end_after > usable {
         return Ok(false);
     }
@@ -1542,7 +2389,11 @@ pub fn try_insert_table_leaf_in_place(
         return Ok(false);
     }
 
-    let cell_len = cell.encoded_size();
+    let cell_len = if is_p3v1 {
+        cell.encoded_size_p3v1()
+    } else {
+        cell.encoded_size()
+    };
     if ptr_end_after + cell_len > content_top {
         if first_fb != 0 || frag != 0 {
             let Ok(compacted_top) = defragment_raw_leaf_in_place(pgno, usable_size, raw) else {
@@ -1553,6 +2404,81 @@ pub fn try_insert_table_leaf_in_place(
         if ptr_end_after + cell_len > content_top {
             return Ok(false);
         }
+    }
+
+    if is_p3v1 {
+        let insert_idx = if n_cell == 0 {
+            0
+        } else {
+            let ls = ptr_end - 12;
+            let last_rowid = i64::from_le_bytes([
+                raw[ls],
+                raw[ls + 1],
+                raw[ls + 2],
+                raw[ls + 3],
+                raw[ls + 4],
+                raw[ls + 5],
+                raw[ls + 6],
+                raw[ls + 7],
+            ]);
+            if cell.rowid > last_rowid {
+                n_cell
+            } else if cell.rowid == last_rowid {
+                return Ok(false);
+            } else {
+                let mut lo = 0usize;
+                let mut hi = n_cell;
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let s = ptr_base + 12 * mid;
+                    let mid_rowid = i64::from_le_bytes([
+                        raw[s],
+                        raw[s + 1],
+                        raw[s + 2],
+                        raw[s + 3],
+                        raw[s + 4],
+                        raw[s + 5],
+                        raw[s + 6],
+                        raw[s + 7],
+                    ]);
+                    match mid_rowid.cmp(&cell.rowid) {
+                        std::cmp::Ordering::Less => lo = mid + 1,
+                        std::cmp::Ordering::Greater => hi = mid,
+                        std::cmp::Ordering::Equal => return Ok(false),
+                    }
+                }
+                lo
+            }
+        };
+
+        let new_top = content_top - cell_len;
+        if insert_idx < n_cell {
+            raw.copy_within(
+                ptr_base + 12 * insert_idx..ptr_base + 12 * n_cell,
+                ptr_base + 12 * (insert_idx + 1),
+            );
+        }
+        let s = ptr_base + 12 * insert_idx;
+        raw[s..s + 8].copy_from_slice(&cell.rowid.to_le_bytes());
+        raw[s + 8..s + 10].copy_from_slice(&(new_top as u16).to_le_bytes());
+        if let Some(ovfl) = cell.overflow_page {
+            raw[s + 10..s + 12].copy_from_slice(&P3V1_OVFL_SENTINEL.to_le_bytes());
+            raw[new_top..new_top + 4].copy_from_slice(&cell.total_payload_len.to_le_bytes());
+            raw[new_top + 4..new_top + 8].copy_from_slice(&ovfl.to_be_bytes());
+            raw[new_top + 8..new_top + cell_len].copy_from_slice(&cell.local_payload);
+        } else {
+            let plen = cell.local_payload.len();
+            raw[s + 10..s + 12].copy_from_slice(&(plen as u16).to_le_bytes());
+            raw[new_top..new_top + plen].copy_from_slice(&cell.local_payload);
+            if plen < cell_len {
+                raw[new_top + plen..new_top + cell_len].fill(0);
+            }
+        }
+        let new_n = (n_cell + 1) as u16;
+        raw[hdr_off + 3..hdr_off + 5].copy_from_slice(&new_n.to_be_bytes());
+        let encoded_top: u16 = if new_top == 65_536 { 0 } else { new_top as u16 };
+        raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
+        return Ok(true);
     }
 
     // Fast check: monotonic append (`n_cell == 0` or `cell.rowid > last_rowid`)!
@@ -1715,7 +2641,83 @@ pub fn find_index_interior_child_in_place(
     Ok(Some(child))
 }
 
-/// Probes a raw `IndexLeaf` (`0x0a`) page for O(log N) in-place defragmented insertion without
+#[inline]
+fn p3v1_prepare_index_insert_fp(
+    raw: &mut [u8],
+    hdr_off: usize,
+    n_cell: usize,
+    local_payload: &[u8],
+    has_ovfl: bool,
+    orders: &[KeySortOrder],
+    enc: TextEncoding,
+) -> u64 {
+    if n_cell == 0 {
+        if !has_ovfl
+            && orders_allow_int32_pair_fp(orders)
+            && let Some(fp) = compute_int32_pair_fp_from_record(local_payload)
+        {
+            raw[hdr_off + 8] = FP_MODE_INT32_PAIR;
+            return fp;
+        }
+        if orders_allow_col0_fp(orders, enc)
+            && let Some(fp) = compute_universal_col0_fp_from_record(local_payload)
+        {
+            raw[hdr_off + 8] = FP_MODE_UNIVERSAL_COL0;
+            return fp;
+        }
+        raw[hdr_off + 8] = FP_MODE_NONE;
+        return 0;
+    }
+
+    match raw[hdr_off + 8] {
+        FP_MODE_INT32_PAIR => {
+            if !has_ovfl
+                && orders_allow_int32_pair_fp(orders)
+                && let Some(fp) = compute_int32_pair_fp_from_record(local_payload)
+            {
+                return fp;
+            }
+            if orders_allow_col0_fp(orders, enc)
+                && let Some(fp) = compute_universal_col0_fp_from_record(local_payload)
+            {
+                let dir_base = hdr_off + 12;
+                for i in 0..n_cell {
+                    let s = dir_base + 12 * i;
+                    let old_fp = u64::from_le_bytes([
+                        raw[s],
+                        raw[s + 1],
+                        raw[s + 2],
+                        raw[s + 3],
+                        raw[s + 4],
+                        raw[s + 5],
+                        raw[s + 6],
+                        raw[s + 7],
+                    ]);
+                    let c0 = (((old_fp >> 32) as u32) ^ 0x8000_0000) as i32;
+                    let conv_fp = ord_numeric_col0_fp(c0 as f64);
+                    raw[s..s + 8].copy_from_slice(&conv_fp.to_le_bytes());
+                }
+                raw[hdr_off + 8] = FP_MODE_UNIVERSAL_COL0;
+                return fp;
+            }
+            raw[hdr_off + 8] = FP_MODE_NONE;
+            0
+        }
+        FP_MODE_UNIVERSAL_COL0 => {
+            if orders_allow_col0_fp(orders, enc)
+                && let Some(fp) = compute_universal_col0_fp_from_record(local_payload)
+            {
+                fp
+            } else {
+                raw[hdr_off + 8] = FP_MODE_NONE;
+                0
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Probes a raw `IndexLeaf` (`0x0a` / `0x1a`) page for O(log N) in-place defragmented insertion without
 /// mutating the page. Returns `Ok(Some((insert_idx, content_top)))` when `key_vals` is not already
 /// present, all probed cells are local (no overflow), the page has no freeblocks/fragments, and
 /// enough contiguous space exists between the pointer array and `content_top`.
@@ -1730,10 +2732,13 @@ pub fn probe_insert_index_leaf_in_place(
 ) -> Result<Option<(usize, usize)>> {
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
-    if hdr_off + 8 > usable || raw[hdr_off] != BtreePageType::IndexLeaf as u8 {
+    if hdr_off + 8 > usable || !is_index_leaf_byte(raw[hdr_off]) {
         return Ok(None);
     }
-    if raw[hdr_off + 7] > 60 {
+    let is_p3v1 = raw[hdr_off] == P3V1_INDEX_LEAF_BYTE;
+    let hdr_size = if is_p3v1 { 12 } else { 8 };
+    let slot_stride = if is_p3v1 { 12 } else { 2 };
+    if hdr_off + hdr_size > usable || raw[hdr_off + 7] > 60 {
         return Ok(None);
     }
 
@@ -1741,11 +2746,11 @@ pub fn probe_insert_index_leaf_in_place(
     if n_cell == 0 && (raw[hdr_off + 1] != 0 || raw[hdr_off + 2] != 0 || raw[hdr_off + 7] != 0) {
         return Ok(None);
     }
-    let ptr_base = hdr_off + 8;
-    let Some(ptr_end) = ptr_base.checked_add(2 * n_cell) else {
+    let ptr_base = hdr_off + hdr_size;
+    let Some(ptr_end) = ptr_base.checked_add(slot_stride * n_cell) else {
         return Ok(None);
     };
-    let ptr_end_after = ptr_end + 2;
+    let ptr_end_after = ptr_end + slot_stride;
     if ptr_end_after > usable {
         return Ok(None);
     }
@@ -1762,9 +2767,142 @@ pub fn probe_insert_index_leaf_in_place(
         return Ok(None);
     }
 
-    let cell_len = cell.encoded_size();
+    let cell_len = if is_p3v1 {
+        cell.encoded_size_p3v1()
+    } else {
+        cell.encoded_size()
+    };
     if ptr_end_after + cell_len > content_top {
         return Ok(None);
+    }
+
+    if is_p3v1 {
+        let fp_mode = raw[hdr_off + 8];
+        let probe_pair_fp = if fp_mode == FP_MODE_INT32_PAIR
+            && orders_allow_int32_pair_fp(orders)
+            && key_vals.len() >= 2
+        {
+            compute_int32_pair_fp_from_values(key_vals)
+        } else {
+            None
+        };
+        let exact_pair = key_vals.len() == 2;
+        let probe_col0_i32_u32 = if fp_mode == FP_MODE_INT32_PAIR
+            && key_vals.len() == 1
+            && orders_allow_col0_fp(orders, enc)
+            && let Value::Integer(v0) = key_vals[0]
+            && let Ok(i0) = i32::try_from(v0)
+        {
+            Some((i0 as u32) ^ 0x8000_0000)
+        } else {
+            None
+        };
+        let probe_col0_fp = if fp_mode == FP_MODE_UNIVERSAL_COL0
+            && !key_vals.is_empty()
+            && orders_allow_col0_fp(orders, enc)
+        {
+            Some(compute_universal_col0_fp_from_value(&key_vals[0]))
+        } else {
+            None
+        };
+
+        let cmp_cell_at = |idx: usize| -> Result<Option<std::cmp::Ordering>> {
+            let s = ptr_base + 12 * idx;
+            if let Some(pfp) = probe_pair_fp {
+                let cfp = u64::from_le_bytes([
+                    raw[s],
+                    raw[s + 1],
+                    raw[s + 2],
+                    raw[s + 3],
+                    raw[s + 4],
+                    raw[s + 5],
+                    raw[s + 6],
+                    raw[s + 7],
+                ]);
+                match cfp.cmp(&pfp) {
+                    std::cmp::Ordering::Less => return Ok(Some(std::cmp::Ordering::Less)),
+                    std::cmp::Ordering::Greater => return Ok(Some(std::cmp::Ordering::Greater)),
+                    std::cmp::Ordering::Equal if exact_pair => {
+                        return Ok(Some(std::cmp::Ordering::Equal));
+                    }
+                    std::cmp::Ordering::Equal => {}
+                }
+            } else if let Some(pu0) = probe_col0_i32_u32 {
+                let cfp = u64::from_le_bytes([
+                    raw[s],
+                    raw[s + 1],
+                    raw[s + 2],
+                    raw[s + 3],
+                    raw[s + 4],
+                    raw[s + 5],
+                    raw[s + 6],
+                    raw[s + 7],
+                ]);
+                return Ok(Some(((cfp >> 32) as u32).cmp(&pu0)));
+            } else if let Some(pfp) = probe_col0_fp {
+                let cfp = u64::from_le_bytes([
+                    raw[s],
+                    raw[s + 1],
+                    raw[s + 2],
+                    raw[s + 3],
+                    raw[s + 4],
+                    raw[s + 5],
+                    raw[s + 6],
+                    raw[s + 7],
+                ]);
+                match cfp.cmp(&pfp) {
+                    std::cmp::Ordering::Less => return Ok(Some(std::cmp::Ordering::Less)),
+                    std::cmp::Ordering::Greater => return Ok(Some(std::cmp::Ordering::Greater)),
+                    std::cmp::Ordering::Equal => {}
+                }
+            }
+            let off = u16::from_le_bytes([raw[s + 8], raw[s + 9]]) as usize;
+            let len_flags = u16::from_le_bytes([raw[s + 10], raw[s + 11]]);
+            if len_flags == P3V1_OVFL_SENTINEL || off < ptr_end {
+                return Ok(None);
+            }
+            let plen = len_flags as usize;
+            let Some(body_end) = off.checked_add(plen) else {
+                return Ok(None);
+            };
+            if body_end > usable {
+                return Ok(None);
+            }
+            match compare_records_with_encoding(&raw[off..body_end], key_vals, orders, enc) {
+                Ok(ord) => Ok(Some(ord)),
+                Err(e) if e.code == ErrorCode::Corrupt => Ok(None),
+                Err(e) => Err(e),
+            }
+        };
+
+        let insert_idx = if n_cell == 0 {
+            0
+        } else {
+            let Some(last_ord) = cmp_cell_at(n_cell - 1)? else {
+                return Ok(None);
+            };
+            match last_ord {
+                std::cmp::Ordering::Less => n_cell,
+                std::cmp::Ordering::Equal => return Ok(None),
+                std::cmp::Ordering::Greater => {
+                    let mut lo = 0usize;
+                    let mut hi = n_cell - 1;
+                    while lo < hi {
+                        let mid = lo + (hi - lo) / 2;
+                        let Some(ord) = cmp_cell_at(mid)? else {
+                            return Ok(None);
+                        };
+                        match ord {
+                            std::cmp::Ordering::Less => lo = mid + 1,
+                            std::cmp::Ordering::Greater => hi = mid,
+                            std::cmp::Ordering::Equal => return Ok(None),
+                        }
+                    }
+                    lo
+                }
+            }
+        };
+        return Ok(Some((insert_idx, content_top)));
     }
 
     let bounds = PayloadBounds::for_index(usable_size);
@@ -1836,9 +2974,53 @@ pub fn apply_insert_index_leaf_in_place(
     cell: &IndexLeafCell,
     insert_idx: usize,
     content_top: usize,
+    orders: &[KeySortOrder],
+    enc: TextEncoding,
 ) {
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
     let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
+    if raw[hdr_off] == P3V1_INDEX_LEAF_BYTE {
+        let new_fp = p3v1_prepare_index_insert_fp(
+            raw,
+            hdr_off,
+            n_cell,
+            &cell.local_payload,
+            cell.overflow_page.is_some(),
+            orders,
+            enc,
+        );
+        let dir_base = hdr_off + 12;
+        let cell_len = cell.encoded_size_p3v1();
+        let new_top = content_top - cell_len;
+        if insert_idx < n_cell {
+            raw.copy_within(
+                dir_base + 12 * insert_idx..dir_base + 12 * n_cell,
+                dir_base + 12 * (insert_idx + 1),
+            );
+        }
+        let s = dir_base + 12 * insert_idx;
+        raw[s..s + 8].copy_from_slice(&new_fp.to_le_bytes());
+        raw[s + 8..s + 10].copy_from_slice(&(new_top as u16).to_le_bytes());
+        if let Some(ovfl) = cell.overflow_page {
+            raw[s + 10..s + 12].copy_from_slice(&P3V1_OVFL_SENTINEL.to_le_bytes());
+            raw[new_top..new_top + 4].copy_from_slice(&cell.total_payload_len.to_le_bytes());
+            raw[new_top + 4..new_top + 8].copy_from_slice(&ovfl.to_be_bytes());
+            raw[new_top + 8..new_top + cell_len].copy_from_slice(&cell.local_payload);
+        } else {
+            let plen = cell.local_payload.len();
+            raw[s + 10..s + 12].copy_from_slice(&(plen as u16).to_le_bytes());
+            raw[new_top..new_top + plen].copy_from_slice(&cell.local_payload);
+            if plen < cell_len {
+                raw[new_top + plen..new_top + cell_len].fill(0);
+            }
+        }
+        let new_n = (n_cell + 1) as u16;
+        raw[hdr_off + 3..hdr_off + 5].copy_from_slice(&new_n.to_be_bytes());
+        let encoded_top: u16 = if new_top == 65_536 { 0 } else { new_top as u16 };
+        raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
+        return;
+    }
+
     let ptr_base = hdr_off + 8;
     let cell_len = cell.encoded_size();
     let new_top = content_top - cell_len;
@@ -1874,7 +3056,7 @@ pub fn apply_insert_index_leaf_in_place(
 /// Result of probing a raw `IndexInterior` (`0x02`) page against a serialized `record_bytes` key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawIndexInteriorStep {
-    Child(Pgno),
+    Child { idx: usize, child: Pgno },
     EqualAt { cell_idx: usize, left_child: Pgno },
 }
 
@@ -1982,7 +3164,7 @@ pub fn probe_index_interior_step_raw(
     if child == 0 {
         return Ok(None);
     }
-    Ok(Some(RawIndexInteriorStep::Child(child)))
+    Ok(Some(RawIndexInteriorStep::Child { idx: lo, child }))
 }
 
 /// Binary-searches a raw `IndexInterior` (`0x02`) page against a serialized `record_bytes` key
@@ -1997,12 +3179,28 @@ pub fn find_index_interior_child_raw(
     enc: TextEncoding,
 ) -> Result<Option<Pgno>> {
     match probe_index_interior_step_raw(pgno, usable_size, raw, record_bytes, orders, enc)? {
-        Some(RawIndexInteriorStep::Child(child)) => Ok(Some(child)),
+        Some(RawIndexInteriorStep::Child { child, .. }) => Ok(Some(child)),
         _ => Ok(None),
     }
 }
 
-/// Probes a raw `IndexLeaf` (`0x0a`) page for zero-allocation in-place insertion of a non-overflow
+/// Like [`find_index_interior_child_raw`], returning `(child_slot_idx, child_pgno)`.
+#[inline]
+pub fn find_index_interior_child_with_idx_raw(
+    pgno: Pgno,
+    usable_size: u32,
+    raw: &[u8],
+    record_bytes: &[u8],
+    orders: &[KeySortOrder],
+    enc: TextEncoding,
+) -> Result<Option<(usize, Pgno)>> {
+    match probe_index_interior_step_raw(pgno, usable_size, raw, record_bytes, orders, enc)? {
+        Some(RawIndexInteriorStep::Child { idx, child }) => Ok(Some((idx, child))),
+        _ => Ok(None),
+    }
+}
+
+/// Probes a raw `IndexLeaf` (`0x0a` / `0x1a`) page for zero-allocation in-place insertion of a non-overflow
 /// `record_bytes` payload (`record_bytes.len() <= max_local`).
 pub fn probe_insert_index_leaf_raw(
     pgno: Pgno,
@@ -2014,10 +3212,13 @@ pub fn probe_insert_index_leaf_raw(
 ) -> Result<Option<(usize, usize)>> {
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
-    if hdr_off + 8 > usable || raw[hdr_off] != BtreePageType::IndexLeaf as u8 {
+    if hdr_off + 8 > usable || !is_index_leaf_byte(raw[hdr_off]) {
         return Ok(None);
     }
-    if raw[hdr_off + 7] > 60 {
+    let is_p3v1 = raw[hdr_off] == P3V1_INDEX_LEAF_BYTE;
+    let hdr_size = if is_p3v1 { 12 } else { 8 };
+    let slot_stride = if is_p3v1 { 12 } else { 2 };
+    if hdr_off + hdr_size > usable || raw[hdr_off + 7] > 60 {
         return Ok(None);
     }
 
@@ -2025,11 +3226,11 @@ pub fn probe_insert_index_leaf_raw(
     if n_cell == 0 && (raw[hdr_off + 1] != 0 || raw[hdr_off + 2] != 0 || raw[hdr_off + 7] != 0) {
         return Ok(None);
     }
-    let ptr_base = hdr_off + 8;
-    let Some(ptr_end) = ptr_base.checked_add(2 * n_cell) else {
+    let ptr_base = hdr_off + hdr_size;
+    let Some(ptr_end) = ptr_base.checked_add(slot_stride * n_cell) else {
         return Ok(None);
     };
-    let ptr_end_after = ptr_end + 2;
+    let ptr_end_after = ptr_end + slot_stride;
     if ptr_end_after > usable {
         return Ok(None);
     }
@@ -2046,7 +3247,11 @@ pub fn probe_insert_index_leaf_raw(
         return Ok(None);
     }
 
-    let cell_len = (varint_len(record_bytes.len() as u64) + record_bytes.len()).max(4);
+    let cell_len = if is_p3v1 {
+        record_bytes.len().max(4)
+    } else {
+        (varint_len(record_bytes.len() as u64) + record_bytes.len()).max(4)
+    };
     if ptr_end_after + cell_len > content_top {
         return Ok(None);
     }
@@ -2056,6 +3261,140 @@ pub fn probe_insert_index_leaf_raw(
     } else {
         Some(orders.len())
     };
+
+    if is_p3v1 {
+        let fp_mode = raw[hdr_off + 8];
+        let probe_pair_fp = if fp_mode == FP_MODE_INT32_PAIR
+            && orders_allow_int32_pair_fp(orders)
+            && max_fields.is_none_or(|m| m >= 2)
+        {
+            compute_int32_pair_fp_from_record(record_bytes)
+        } else {
+            None
+        };
+        let exact_pair = max_fields == Some(2);
+        let probe_col0_i32_u32 = if fp_mode == FP_MODE_INT32_PAIR
+            && max_fields == Some(1)
+            && orders_allow_col0_fp(orders, enc)
+            && let Ok(Some(RawField::Int(v0))) = read_raw_record_field(record_bytes, 0)
+            && let Ok(i0) = i32::try_from(v0)
+        {
+            Some((i0 as u32) ^ 0x8000_0000)
+        } else {
+            None
+        };
+        let probe_col0_fp =
+            if fp_mode == FP_MODE_UNIVERSAL_COL0 && orders_allow_col0_fp(orders, enc) {
+                compute_universal_col0_fp_from_record(record_bytes)
+            } else {
+                None
+            };
+
+        let cmp_cell_at = |idx: usize| -> Result<Option<std::cmp::Ordering>> {
+            let s = ptr_base + 12 * idx;
+            if let Some(pfp) = probe_pair_fp {
+                let cfp = u64::from_le_bytes([
+                    raw[s],
+                    raw[s + 1],
+                    raw[s + 2],
+                    raw[s + 3],
+                    raw[s + 4],
+                    raw[s + 5],
+                    raw[s + 6],
+                    raw[s + 7],
+                ]);
+                match cfp.cmp(&pfp) {
+                    std::cmp::Ordering::Less => return Ok(Some(std::cmp::Ordering::Less)),
+                    std::cmp::Ordering::Greater => return Ok(Some(std::cmp::Ordering::Greater)),
+                    std::cmp::Ordering::Equal if exact_pair => {
+                        return Ok(Some(std::cmp::Ordering::Equal));
+                    }
+                    std::cmp::Ordering::Equal => {}
+                }
+            } else if let Some(pu0) = probe_col0_i32_u32 {
+                let cfp = u64::from_le_bytes([
+                    raw[s],
+                    raw[s + 1],
+                    raw[s + 2],
+                    raw[s + 3],
+                    raw[s + 4],
+                    raw[s + 5],
+                    raw[s + 6],
+                    raw[s + 7],
+                ]);
+                return Ok(Some(((cfp >> 32) as u32).cmp(&pu0)));
+            } else if let Some(pfp) = probe_col0_fp {
+                let cfp = u64::from_le_bytes([
+                    raw[s],
+                    raw[s + 1],
+                    raw[s + 2],
+                    raw[s + 3],
+                    raw[s + 4],
+                    raw[s + 5],
+                    raw[s + 6],
+                    raw[s + 7],
+                ]);
+                match cfp.cmp(&pfp) {
+                    std::cmp::Ordering::Less => return Ok(Some(std::cmp::Ordering::Less)),
+                    std::cmp::Ordering::Greater => return Ok(Some(std::cmp::Ordering::Greater)),
+                    std::cmp::Ordering::Equal => {}
+                }
+            }
+            let off = u16::from_le_bytes([raw[s + 8], raw[s + 9]]) as usize;
+            let len_flags = u16::from_le_bytes([raw[s + 10], raw[s + 11]]);
+            if len_flags == P3V1_OVFL_SENTINEL || off < ptr_end {
+                return Ok(None);
+            }
+            let plen = len_flags as usize;
+            let Some(body_end) = off.checked_add(plen) else {
+                return Ok(None);
+            };
+            if body_end > usable {
+                return Ok(None);
+            }
+            match compare_raw_records_with_encoding(
+                &raw[off..body_end],
+                record_bytes,
+                max_fields,
+                orders,
+                enc,
+            ) {
+                Ok(ord) => Ok(Some(ord)),
+                Err(e) if e.code == ErrorCode::Corrupt => Ok(None),
+                Err(e) => Err(e),
+            }
+        };
+
+        let insert_idx = if n_cell == 0 {
+            0
+        } else {
+            let Some(last_ord) = cmp_cell_at(n_cell - 1)? else {
+                return Ok(None);
+            };
+            match last_ord {
+                std::cmp::Ordering::Less => n_cell,
+                std::cmp::Ordering::Equal => return Ok(None),
+                std::cmp::Ordering::Greater => {
+                    let mut lo = 0usize;
+                    let mut hi = n_cell - 1;
+                    while lo < hi {
+                        let mid = lo + (hi - lo) / 2;
+                        let Some(ord) = cmp_cell_at(mid)? else {
+                            return Ok(None);
+                        };
+                        match ord {
+                            std::cmp::Ordering::Less => lo = mid + 1,
+                            std::cmp::Ordering::Greater => hi = mid,
+                            std::cmp::Ordering::Equal => return Ok(None),
+                        }
+                    }
+                    lo
+                }
+            }
+        };
+        return Ok(Some((insert_idx, content_top)));
+    }
+
     let bounds = PayloadBounds::for_index(usable_size);
     let cmp_cell_at = |idx: usize| -> Result<Option<std::cmp::Ordering>> {
         let p = ptr_base + 2 * idx;
@@ -2124,16 +3463,46 @@ pub fn probe_insert_index_leaf_raw(
     Ok(Some((insert_idx, content_top)))
 }
 
-/// Applies a zero-allocation in-place non-overflow insertion onto a raw `IndexLeaf` (`0x0a`) page.
+/// Applies a zero-allocation in-place non-overflow insertion onto a raw `IndexLeaf` (`0x0a` / `0x1a`) page.
 pub fn apply_insert_index_leaf_raw(
     pgno: Pgno,
     raw: &mut [u8],
     record_bytes: &[u8],
     insert_idx: usize,
     content_top: usize,
+    orders: &[KeySortOrder],
+    enc: TextEncoding,
 ) {
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
     let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
+    if raw[hdr_off] == P3V1_INDEX_LEAF_BYTE {
+        let new_fp =
+            p3v1_prepare_index_insert_fp(raw, hdr_off, n_cell, record_bytes, false, orders, enc);
+        let dir_base = hdr_off + 12;
+        let plen = record_bytes.len();
+        let cell_len = plen.max(4);
+        let new_top = content_top - cell_len;
+        if insert_idx < n_cell {
+            raw.copy_within(
+                dir_base + 12 * insert_idx..dir_base + 12 * n_cell,
+                dir_base + 12 * (insert_idx + 1),
+            );
+        }
+        let s = dir_base + 12 * insert_idx;
+        raw[s..s + 8].copy_from_slice(&new_fp.to_le_bytes());
+        raw[s + 8..s + 10].copy_from_slice(&(new_top as u16).to_le_bytes());
+        raw[s + 10..s + 12].copy_from_slice(&(plen as u16).to_le_bytes());
+        raw[new_top..new_top + plen].copy_from_slice(record_bytes);
+        if plen < cell_len {
+            raw[new_top + plen..new_top + cell_len].fill(0);
+        }
+        let new_n = (n_cell + 1) as u16;
+        raw[hdr_off + 3..hdr_off + 5].copy_from_slice(&new_n.to_be_bytes());
+        let encoded_top: u16 = if new_top == 65_536 { 0 } else { new_top as u16 };
+        raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
+        return;
+    }
+
     let ptr_base = hdr_off + 8;
     let cell_len = (varint_len(record_bytes.len() as u64) + record_bytes.len()).max(4);
     let new_top = content_top - cell_len;
@@ -2162,7 +3531,399 @@ pub fn apply_insert_index_leaf_raw(
     raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
 }
 
-/// Probes a raw `IndexLeaf` (`0x0a`) page for in-place deletion of serialized `record_bytes`
+/// Probes a full non-root `P3v1` `IndexLeaf` (`0x1a`) page (`usable_size <= 4096`) for a
+/// zero-allocation 2-way split when inserting non-overflow `record_bytes`, returning
+/// `Ok(Some((n_cell, insert_idx, div_len)))`.
+pub fn probe_p3v1_index_leaf_split_raw(
+    pgno: Pgno,
+    usable_size: u32,
+    raw: &[u8],
+    record_bytes: &[u8],
+    orders: &[KeySortOrder],
+    enc: TextEncoding,
+) -> Result<Option<(usize, usize, usize)>> {
+    let usable = usable_size as usize;
+    if pgno == 1 || !(64..=4096).contains(&usable) || raw.len() < usable {
+        return Ok(None);
+    }
+    if raw[0] != P3V1_INDEX_LEAF_BYTE || raw[9..12] != [0, 0, 0] {
+        return Ok(None);
+    }
+    let n_cell = u16::from_be_bytes([raw[3], raw[4]]) as usize;
+    if n_cell < 4 {
+        return Ok(None);
+    }
+    let dir_base = 12usize;
+    let Some(ptr_end) = dir_base.checked_add(12 * n_cell) else {
+        return Ok(None);
+    };
+    if ptr_end > usable {
+        return Ok(None);
+    }
+    for i in 0..n_cell {
+        let s = dir_base + 12 * i;
+        let off = u16::from_le_bytes([raw[s + 8], raw[s + 9]]) as usize;
+        let len_flags = u16::from_le_bytes([raw[s + 10], raw[s + 11]]);
+        if len_flags == P3V1_OVFL_SENTINEL || off < ptr_end {
+            return Ok(None);
+        }
+        let clen = (len_flags as usize).max(4);
+        if off.checked_add(clen).is_none_or(|e| e > usable) {
+            return Ok(None);
+        }
+    }
+
+    let max_fields = if orders.is_empty() {
+        None
+    } else {
+        Some(orders.len())
+    };
+    let fp_mode = raw[8];
+    let probe_pair_fp = if fp_mode == FP_MODE_INT32_PAIR
+        && orders_allow_int32_pair_fp(orders)
+        && max_fields.is_none_or(|m| m >= 2)
+    {
+        compute_int32_pair_fp_from_record(record_bytes)
+    } else {
+        None
+    };
+    let exact_pair = max_fields == Some(2);
+    let probe_col0_i32_u32 = if fp_mode == FP_MODE_INT32_PAIR
+        && max_fields == Some(1)
+        && orders_allow_col0_fp(orders, enc)
+        && let Ok(Some(RawField::Int(v0))) = read_raw_record_field(record_bytes, 0)
+        && let Ok(i0) = i32::try_from(v0)
+    {
+        Some((i0 as u32) ^ 0x8000_0000)
+    } else {
+        None
+    };
+    let probe_col0_fp = if fp_mode == FP_MODE_UNIVERSAL_COL0 && orders_allow_col0_fp(orders, enc) {
+        compute_universal_col0_fp_from_record(record_bytes)
+    } else {
+        None
+    };
+
+    let cmp_cell_at = |idx: usize| -> Result<Option<std::cmp::Ordering>> {
+        let s = dir_base + 12 * idx;
+        if let Some(pfp) = probe_pair_fp {
+            let cfp = u64::from_le_bytes([
+                raw[s],
+                raw[s + 1],
+                raw[s + 2],
+                raw[s + 3],
+                raw[s + 4],
+                raw[s + 5],
+                raw[s + 6],
+                raw[s + 7],
+            ]);
+            match cfp.cmp(&pfp) {
+                std::cmp::Ordering::Less => return Ok(Some(std::cmp::Ordering::Less)),
+                std::cmp::Ordering::Greater => return Ok(Some(std::cmp::Ordering::Greater)),
+                std::cmp::Ordering::Equal if exact_pair => {
+                    return Ok(Some(std::cmp::Ordering::Equal));
+                }
+                std::cmp::Ordering::Equal => {}
+            }
+        } else if let Some(pu0) = probe_col0_i32_u32 {
+            let cfp = u64::from_le_bytes([
+                raw[s],
+                raw[s + 1],
+                raw[s + 2],
+                raw[s + 3],
+                raw[s + 4],
+                raw[s + 5],
+                raw[s + 6],
+                raw[s + 7],
+            ]);
+            return Ok(Some(((cfp >> 32) as u32).cmp(&pu0)));
+        } else if let Some(pfp) = probe_col0_fp {
+            let cfp = u64::from_le_bytes([
+                raw[s],
+                raw[s + 1],
+                raw[s + 2],
+                raw[s + 3],
+                raw[s + 4],
+                raw[s + 5],
+                raw[s + 6],
+                raw[s + 7],
+            ]);
+            match cfp.cmp(&pfp) {
+                std::cmp::Ordering::Less => return Ok(Some(std::cmp::Ordering::Less)),
+                std::cmp::Ordering::Greater => return Ok(Some(std::cmp::Ordering::Greater)),
+                std::cmp::Ordering::Equal => {}
+            }
+        }
+        let off = u16::from_le_bytes([raw[s + 8], raw[s + 9]]) as usize;
+        let plen = u16::from_le_bytes([raw[s + 10], raw[s + 11]]) as usize;
+        match compare_raw_records_with_encoding(
+            &raw[off..off + plen],
+            record_bytes,
+            max_fields,
+            orders,
+            enc,
+        ) {
+            Ok(ord) => Ok(Some(ord)),
+            Err(e) if e.code == ErrorCode::Corrupt => Ok(None),
+            Err(e) => Err(e),
+        }
+    };
+
+    let Some(last_ord) = cmp_cell_at(n_cell - 1)? else {
+        return Ok(None);
+    };
+    let insert_idx = match last_ord {
+        std::cmp::Ordering::Less => n_cell,
+        std::cmp::Ordering::Equal => return Ok(None),
+        std::cmp::Ordering::Greater => {
+            let mut lo = 0usize;
+            let mut hi = n_cell - 1;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let Some(ord) = cmp_cell_at(mid)? else {
+                    return Ok(None);
+                };
+                match ord {
+                    std::cmp::Ordering::Less => lo = mid + 1,
+                    std::cmp::Ordering::Greater => hi = mid,
+                    std::cmp::Ordering::Equal => return Ok(None),
+                }
+            }
+            lo
+        }
+    };
+
+    let total = n_cell + 1;
+    let mid = total / 2;
+    let v_plen = |v_idx: usize| -> usize {
+        if v_idx == insert_idx {
+            record_bytes.len()
+        } else {
+            let old_i = if v_idx < insert_idx { v_idx } else { v_idx - 1 };
+            let s = dir_base + 12 * old_i;
+            u16::from_le_bytes([raw[s + 10], raw[s + 11]]) as usize
+        }
+    };
+    let mut left_bytes = 12 + 12 * mid;
+    for v_idx in 0..mid {
+        left_bytes += v_plen(v_idx).max(4);
+    }
+    let right_count = total - 1 - mid;
+    let mut right_bytes = 12 + 12 * right_count;
+    for v_idx in (mid + 1)..total {
+        right_bytes += v_plen(v_idx).max(4);
+    }
+    if left_bytes > usable || right_bytes > usable {
+        return Ok(None);
+    }
+    Ok(Some((n_cell, insert_idx, v_plen(mid))))
+}
+
+/// Probes whether a raw `IndexInterior` (`0x02`) page has contiguous unallocated space to insert
+/// a non-overflow divider of length `div_len` at `parent_idx` for child `expected_child`.
+pub fn probe_insert_index_interior_divider_raw(
+    pgno: Pgno,
+    usable_size: u32,
+    raw: &[u8],
+    parent_idx: usize,
+    expected_child: Pgno,
+    div_len: usize,
+) -> Option<usize> {
+    let usable = usable_size as usize;
+    let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+    if hdr_off + 12 > usable
+        || raw.len() < usable
+        || raw[hdr_off] != BtreePageType::IndexInterior as u8
+    {
+        return None;
+    }
+    if raw[hdr_off + 1] != 0 || raw[hdr_off + 2] != 0 || raw[hdr_off + 7] > 60 {
+        return None;
+    }
+    let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
+    if parent_idx > n_cell {
+        return None;
+    }
+    let ptr_base = hdr_off + 12;
+    let ptr_end = ptr_base.checked_add(2 * n_cell)?;
+    let ptr_end_after = ptr_end + 2;
+    if ptr_end_after > usable {
+        return None;
+    }
+    let raw_top = u16::from_be_bytes([raw[hdr_off + 5], raw[hdr_off + 6]]) as usize;
+    let content_top = if n_cell == 0 {
+        usable
+    } else if raw_top == 0 {
+        65_536
+    } else {
+        raw_top
+    };
+    if content_top > usable || content_top < ptr_end {
+        return None;
+    }
+    if parent_idx < n_cell {
+        let p = ptr_base + 2 * parent_idx;
+        let off = u16::from_be_bytes([raw[p], raw[p + 1]]) as usize;
+        if off < ptr_end || off + 4 > usable {
+            return None;
+        }
+        let lc = u32::from_be_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+        if lc != expected_child {
+            return None;
+        }
+    } else {
+        let rc = u32::from_be_bytes([
+            raw[hdr_off + 8],
+            raw[hdr_off + 9],
+            raw[hdr_off + 10],
+            raw[hdr_off + 11],
+        ]);
+        if rc != expected_child {
+            return None;
+        }
+    }
+    let div_cell_len = (4 + varint_len(div_len as u64) + div_len).max(4);
+    if ptr_end_after.checked_add(div_cell_len)? > content_top {
+        return None;
+    }
+    Some(content_top)
+}
+
+/// Splits a full non-root `P3v1` `IndexLeaf` (`0x1a`) snapshot `old_leaf_copy[..usable]` +
+/// `record_bytes` at `insert_idx` into `left_out[..usable]` and `right_out[..usable]`, returning
+/// the borrowed promoted divider slice from either `old_leaf_copy` or `record_bytes`.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_split_p3v1_index_leaf_raw<'a>(
+    usable_size: u32,
+    old_leaf_copy: &'a mut [u8],
+    n_cell: usize,
+    insert_idx: usize,
+    record_bytes: &'a [u8],
+    orders: &[KeySortOrder],
+    enc: TextEncoding,
+    left_out: &mut [u8],
+    right_out: &mut [u8],
+) -> &'a [u8] {
+    let usable = usable_size as usize;
+    let new_fp = p3v1_prepare_index_insert_fp(
+        &mut old_leaf_copy[..usable],
+        0,
+        n_cell,
+        record_bytes,
+        false,
+        orders,
+        enc,
+    );
+    let fp_mode = old_leaf_copy[8];
+    let old_ref: &'a [u8] = &old_leaf_copy[..usable];
+
+    let entry_at = |v_idx: usize| -> (u64, &'a [u8]) {
+        if v_idx == insert_idx {
+            (new_fp, record_bytes)
+        } else {
+            let old_i = if v_idx < insert_idx { v_idx } else { v_idx - 1 };
+            let s = 12 + 12 * old_i;
+            let fp = u64::from_le_bytes([
+                old_ref[s],
+                old_ref[s + 1],
+                old_ref[s + 2],
+                old_ref[s + 3],
+                old_ref[s + 4],
+                old_ref[s + 5],
+                old_ref[s + 6],
+                old_ref[s + 7],
+            ]);
+            let off = u16::from_le_bytes([old_ref[s + 8], old_ref[s + 9]]) as usize;
+            let plen = u16::from_le_bytes([old_ref[s + 10], old_ref[s + 11]]) as usize;
+            (fp, &old_ref[off..off + plen])
+        }
+    };
+
+    let total = n_cell + 1;
+    let mid = total / 2;
+
+    let write_half = |dst: &mut [u8], start_v: usize, count: usize| {
+        let mut top = usable;
+        let dir_base = 12usize;
+        for j in 0..count {
+            let (fp, rec) = entry_at(start_v + j);
+            let plen = rec.len();
+            let clen = plen.max(4);
+            top -= clen;
+            let s = dir_base + 12 * j;
+            dst[s..s + 8].copy_from_slice(&fp.to_le_bytes());
+            dst[s + 8..s + 10].copy_from_slice(&(top as u16).to_le_bytes());
+            dst[s + 10..s + 12].copy_from_slice(&(plen as u16).to_le_bytes());
+            dst[top..top + plen].copy_from_slice(rec);
+            if plen < clen {
+                dst[top + plen..top + clen].fill(0);
+            }
+        }
+        dst[dir_base + 12 * count..top].fill(0);
+        dst[0] = P3V1_INDEX_LEAF_BYTE;
+        dst[1..3].fill(0);
+        dst[3..5].copy_from_slice(&(count as u16).to_be_bytes());
+        let enc_top: u16 = if top == 65_536 { 0 } else { top as u16 };
+        dst[5..7].copy_from_slice(&enc_top.to_be_bytes());
+        dst[7] = 0;
+        dst[8] = fp_mode;
+        dst[9..12].fill(0);
+    };
+
+    write_half(&mut left_out[..usable], 0, mid);
+    write_half(&mut right_out[..usable], mid + 1, total - 1 - mid);
+    entry_at(mid).1
+}
+
+/// Inserts a promoted non-overflow divider `(left_pgno, div_bytes)` at `parent_idx` and wires
+/// `right_pgno` into a raw `IndexInterior` (`0x02`) page verified by
+/// [`probe_insert_index_interior_divider_raw`].
+pub fn apply_insert_index_interior_divider_raw(
+    pgno: Pgno,
+    raw: &mut [u8],
+    parent_idx: usize,
+    left_pgno: Pgno,
+    right_pgno: Pgno,
+    div_bytes: &[u8],
+    content_top: usize,
+) {
+    let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+    let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
+    let ptr_base = hdr_off + 12;
+
+    if parent_idx < n_cell {
+        let p = ptr_base + 2 * parent_idx;
+        let next_off = u16::from_be_bytes([raw[p], raw[p + 1]]) as usize;
+        raw[next_off..next_off + 4].copy_from_slice(&right_pgno.to_be_bytes());
+        raw.copy_within(
+            ptr_base + 2 * parent_idx..ptr_base + 2 * n_cell,
+            ptr_base + 2 * (parent_idx + 1),
+        );
+    } else {
+        raw[hdr_off + 8..hdr_off + 12].copy_from_slice(&right_pgno.to_be_bytes());
+    }
+
+    let div_cell_len = (4 + varint_len(div_bytes.len() as u64) + div_bytes.len()).max(4);
+    let new_top = content_top - div_cell_len;
+    let ip = ptr_base + 2 * parent_idx;
+    raw[ip..ip + 2].copy_from_slice(&(new_top as u16).to_be_bytes());
+
+    raw[new_top..new_top + 4].copy_from_slice(&left_pgno.to_be_bytes());
+    let mut pos = new_top + 4;
+    pos += put_varint(&mut raw[pos..], div_bytes.len() as u64);
+    raw[pos..pos + div_bytes.len()].copy_from_slice(div_bytes);
+    pos += div_bytes.len();
+    if pos < new_top + div_cell_len {
+        raw[pos..new_top + div_cell_len].fill(0);
+    }
+
+    let new_n = (n_cell + 1) as u16;
+    raw[hdr_off + 3..hdr_off + 5].copy_from_slice(&new_n.to_be_bytes());
+    let encoded_top: u16 = if new_top == 65_536 { 0 } else { new_top as u16 };
+    raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
+}
+
+/// Probes a raw `IndexLeaf` (`0x0a` / `0x1a`) page for in-place deletion of serialized `record_bytes`
 /// without decoding `record_bytes` or leaf cells into heap `Value`s.
 #[allow(clippy::type_complexity)]
 pub fn probe_delete_index_leaf_raw(
@@ -2176,10 +3937,13 @@ pub fn probe_delete_index_leaf_raw(
 ) -> Result<Option<Option<(usize, usize, usize, Option<Pgno>)>>> {
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
-    if hdr_off + 8 > usable || raw[hdr_off] != BtreePageType::IndexLeaf as u8 {
+    if hdr_off + 8 > usable || !is_index_leaf_byte(raw[hdr_off]) {
         return Ok(None);
     }
-    if raw[hdr_off + 7] > 60 {
+    let is_p3v1 = raw[hdr_off] == P3V1_INDEX_LEAF_BYTE;
+    let hdr_size = if is_p3v1 { 12 } else { 8 };
+    let slot_stride = if is_p3v1 { 12 } else { 2 };
+    if hdr_off + hdr_size > usable || raw[hdr_off + 7] > 60 {
         return Ok(None);
     }
 
@@ -2190,8 +3954,8 @@ pub fn probe_delete_index_leaf_raw(
     if n_cell == 0 {
         return Ok(Some(None));
     }
-    let ptr_base = hdr_off + 8;
-    let Some(ptr_end) = ptr_base.checked_add(2 * n_cell) else {
+    let ptr_base = hdr_off + hdr_size;
+    let Some(ptr_end) = ptr_base.checked_add(slot_stride * n_cell) else {
         return Ok(None);
     };
     if ptr_end > usable {
@@ -2208,6 +3972,116 @@ pub fn probe_delete_index_leaf_raw(
     } else {
         Some(orders.len())
     };
+
+    if is_p3v1 {
+        let fp_mode = raw[hdr_off + 8];
+        let probe_pair_fp = if fp_mode == FP_MODE_INT32_PAIR
+            && orders_allow_int32_pair_fp(orders)
+            && max_fields.is_none_or(|m| m >= 2)
+        {
+            compute_int32_pair_fp_from_record(record_bytes)
+        } else {
+            None
+        };
+        let exact_pair = max_fields == Some(2);
+        let probe_col0_fp =
+            if fp_mode == FP_MODE_UNIVERSAL_COL0 && orders_allow_col0_fp(orders, enc) {
+                compute_universal_col0_fp_from_record(record_bytes)
+            } else {
+                None
+            };
+
+        let mut lo = 0usize;
+        let mut hi = n_cell;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let s = ptr_base + 12 * mid;
+            let off = u16::from_le_bytes([raw[s + 8], raw[s + 9]]) as usize;
+            let len_flags = u16::from_le_bytes([raw[s + 10], raw[s + 11]]);
+            if len_flags == P3V1_OVFL_SENTINEL || off < content_top {
+                return Ok(None);
+            }
+            let plen = len_flags as usize;
+            let cell_len = plen.max(4);
+            if off + cell_len > usable {
+                return Ok(None);
+            }
+            if let Some(pfp) = probe_pair_fp {
+                let cfp = u64::from_le_bytes([
+                    raw[s],
+                    raw[s + 1],
+                    raw[s + 2],
+                    raw[s + 3],
+                    raw[s + 4],
+                    raw[s + 5],
+                    raw[s + 6],
+                    raw[s + 7],
+                ]);
+                match cfp.cmp(&pfp) {
+                    std::cmp::Ordering::Less => {
+                        lo = mid + 1;
+                        continue;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        hi = mid;
+                        continue;
+                    }
+                    std::cmp::Ordering::Equal if exact_pair => {
+                        if n_cell == 1 && !is_root {
+                            return Ok(None);
+                        }
+                        return Ok(Some(Some((mid, off, cell_len, None))));
+                    }
+                    std::cmp::Ordering::Equal => {}
+                }
+            } else if let Some(pfp) = probe_col0_fp {
+                let cfp = u64::from_le_bytes([
+                    raw[s],
+                    raw[s + 1],
+                    raw[s + 2],
+                    raw[s + 3],
+                    raw[s + 4],
+                    raw[s + 5],
+                    raw[s + 6],
+                    raw[s + 7],
+                ]);
+                match cfp.cmp(&pfp) {
+                    std::cmp::Ordering::Less => {
+                        lo = mid + 1;
+                        continue;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        hi = mid;
+                        continue;
+                    }
+                    std::cmp::Ordering::Equal => {}
+                }
+            }
+            let cmp = match compare_raw_records_with_encoding(
+                &raw[off..off + plen],
+                record_bytes,
+                max_fields,
+                orders,
+                enc,
+            ) {
+                Ok(ord) => ord,
+                Err(e) if e.code == ErrorCode::Corrupt => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            match cmp {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    if n_cell == 1 && !is_root {
+                        return Ok(None);
+                    }
+                    return Ok(Some(Some((mid, off, cell_len, None))));
+                }
+            }
+        }
+        return Ok(Some(None));
+    }
+
     let bounds = PayloadBounds::for_index(usable_size);
     let mut lo = 0usize;
     let mut hi = n_cell;
@@ -2259,7 +4133,7 @@ pub fn probe_delete_index_leaf_raw(
     Ok(Some(None))
 }
 
-/// Probes a raw `IndexLeaf` (`0x0a`) page for in-place deletion of `key_vals` without allocating.
+/// Probes a raw `IndexLeaf` (`0x0a` / `0x1a`) page for in-place deletion of `key_vals` without allocating.
 /// Returns `Ok(Some(None))` when `key_vals` is absent on this leaf, `Ok(Some(Some((idx, cell_off, cell_len, ovfl))))`
 /// when found on a defragmented leaf, or `Ok(None)` when caller should fall back to parsed page handling.
 #[allow(clippy::type_complexity)]
@@ -2274,10 +4148,13 @@ pub fn probe_delete_index_leaf_in_place(
 ) -> Result<Option<Option<(usize, usize, usize, Option<Pgno>)>>> {
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
-    if hdr_off + 8 > usable || raw[hdr_off] != BtreePageType::IndexLeaf as u8 {
+    if hdr_off + 8 > usable || !is_index_leaf_byte(raw[hdr_off]) {
         return Ok(None);
     }
-    if raw[hdr_off + 7] > 60 {
+    let is_p3v1 = raw[hdr_off] == P3V1_INDEX_LEAF_BYTE;
+    let hdr_size = if is_p3v1 { 12 } else { 8 };
+    let slot_stride = if is_p3v1 { 12 } else { 2 };
+    if hdr_off + hdr_size > usable || raw[hdr_off + 7] > 60 {
         return Ok(None);
     }
 
@@ -2288,8 +4165,8 @@ pub fn probe_delete_index_leaf_in_place(
     if n_cell == 0 {
         return Ok(Some(None));
     }
-    let ptr_base = hdr_off + 8;
-    let Some(ptr_end) = ptr_base.checked_add(2 * n_cell) else {
+    let ptr_base = hdr_off + hdr_size;
+    let Some(ptr_end) = ptr_base.checked_add(slot_stride * n_cell) else {
         return Ok(None);
     };
     if ptr_end > usable {
@@ -2299,6 +4176,112 @@ pub fn probe_delete_index_leaf_in_place(
     let content_top = if raw_top == 0 { 65_536 } else { raw_top };
     if content_top > usable || content_top < ptr_end {
         return Ok(None);
+    }
+
+    if is_p3v1 {
+        let fp_mode = raw[hdr_off + 8];
+        let probe_pair_fp = if fp_mode == FP_MODE_INT32_PAIR
+            && orders_allow_int32_pair_fp(orders)
+            && key_vals.len() >= 2
+        {
+            compute_int32_pair_fp_from_values(key_vals)
+        } else {
+            None
+        };
+        let exact_pair = key_vals.len() == 2;
+        let probe_col0_fp = if fp_mode == FP_MODE_UNIVERSAL_COL0
+            && !key_vals.is_empty()
+            && orders_allow_col0_fp(orders, enc)
+        {
+            Some(compute_universal_col0_fp_from_value(&key_vals[0]))
+        } else {
+            None
+        };
+
+        let mut lo = 0usize;
+        let mut hi = n_cell;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let s = ptr_base + 12 * mid;
+            let off = u16::from_le_bytes([raw[s + 8], raw[s + 9]]) as usize;
+            let len_flags = u16::from_le_bytes([raw[s + 10], raw[s + 11]]);
+            if len_flags == P3V1_OVFL_SENTINEL || off < content_top {
+                return Ok(None);
+            }
+            let plen = len_flags as usize;
+            let cell_len = plen.max(4);
+            if off + cell_len > usable {
+                return Ok(None);
+            }
+            if let Some(pfp) = probe_pair_fp {
+                let cfp = u64::from_le_bytes([
+                    raw[s],
+                    raw[s + 1],
+                    raw[s + 2],
+                    raw[s + 3],
+                    raw[s + 4],
+                    raw[s + 5],
+                    raw[s + 6],
+                    raw[s + 7],
+                ]);
+                match cfp.cmp(&pfp) {
+                    std::cmp::Ordering::Less => {
+                        lo = mid + 1;
+                        continue;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        hi = mid;
+                        continue;
+                    }
+                    std::cmp::Ordering::Equal if exact_pair => {
+                        if n_cell == 1 && !is_root {
+                            return Ok(None);
+                        }
+                        return Ok(Some(Some((mid, off, cell_len, None))));
+                    }
+                    std::cmp::Ordering::Equal => {}
+                }
+            } else if let Some(pfp) = probe_col0_fp {
+                let cfp = u64::from_le_bytes([
+                    raw[s],
+                    raw[s + 1],
+                    raw[s + 2],
+                    raw[s + 3],
+                    raw[s + 4],
+                    raw[s + 5],
+                    raw[s + 6],
+                    raw[s + 7],
+                ]);
+                match cfp.cmp(&pfp) {
+                    std::cmp::Ordering::Less => {
+                        lo = mid + 1;
+                        continue;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        hi = mid;
+                        continue;
+                    }
+                    std::cmp::Ordering::Equal => {}
+                }
+            }
+            let cmp =
+                match compare_records_with_encoding(&raw[off..off + plen], key_vals, orders, enc) {
+                    Ok(ord) => ord,
+                    Err(e) if e.code == ErrorCode::Corrupt => return Ok(None),
+                    Err(e) => return Err(e),
+                };
+            match cmp {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    if n_cell == 1 && !is_root {
+                        return Ok(None);
+                    }
+                    return Ok(Some(Some((mid, off, cell_len, None))));
+                }
+            }
+        }
+        return Ok(Some(None));
     }
 
     let bounds = PayloadBounds::for_index(usable_size);
@@ -2347,7 +4330,7 @@ pub fn probe_delete_index_leaf_in_place(
     Ok(Some(None))
 }
 
-/// Applies a probed in-place cell deletion (`probe_delete_index_leaf_in_place`) onto a raw `IndexLeaf` (`0x0a`) page
+/// Applies a probed in-place cell deletion (`probe_delete_index_leaf_in_place`) onto a raw `IndexLeaf` (`0x0a` / `0x1a`) page
 /// in O(1) via `raw_page_free_space` (zero cell-content shifts, zero pointer-array rewrites).
 pub fn apply_delete_index_leaf_in_place(
     pgno: Pgno,
@@ -2360,16 +4343,19 @@ pub fn apply_delete_index_leaf_in_place(
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
     let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
-    let ptr_base = hdr_off + 8;
+    let is_p3v1 = raw[hdr_off] == P3V1_INDEX_LEAF_BYTE;
+    let hdr_size = if is_p3v1 { 12 } else { 8 };
+    let slot_stride = if is_p3v1 { 12 } else { 2 };
+    let ptr_base = hdr_off + hdr_size;
 
     if idx + 1 < n_cell {
         raw.copy_within(
-            ptr_base + 2 * (idx + 1)..ptr_base + 2 * n_cell,
-            ptr_base + 2 * idx,
+            ptr_base + slot_stride * (idx + 1)..ptr_base + slot_stride * n_cell,
+            ptr_base + slot_stride * idx,
         );
     }
-    let vacated_ptr = ptr_base + 2 * (n_cell - 1);
-    raw[vacated_ptr..vacated_ptr + 2].fill(0);
+    let vacated_ptr = ptr_base + slot_stride * (n_cell - 1);
+    raw[vacated_ptr..vacated_ptr + slot_stride].fill(0);
 
     let new_n = n_cell - 1;
     raw[hdr_off + 3..hdr_off + 5].copy_from_slice(&(new_n as u16).to_be_bytes());
@@ -2378,6 +4364,9 @@ pub fn apply_delete_index_leaf_in_place(
         let encoded_top: u16 = if usable == 65_536 { 0 } else { usable as u16 };
         raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
         raw[hdr_off + 7] = 0;
+        if is_p3v1 {
+            raw[hdr_off + 8..hdr_off + 12].fill(0);
+        }
         return;
     }
 
@@ -2386,7 +4375,7 @@ pub fn apply_delete_index_leaf_in_place(
     }
 }
 
-/// Outcome of attempting an in-place deletion on a raw `TableLeaf` (`0x0d`) page.
+/// Outcome of attempting an in-place deletion on a raw `TableLeaf` (`0x0d` / `0x1d`) page.
 pub enum RawLeafDeleteOutcome {
     NotFound,
     DeletedInPlace {
@@ -2396,7 +4385,7 @@ pub enum RawLeafDeleteOutcome {
     Fallback,
 }
 
-/// Outcome of probing a `TableLeaf` (`0x0d`) page for a `rowid` deletion.
+/// Outcome of probing a `TableLeaf` (`0x0d` / `0x1d`) page for a `rowid` deletion.
 #[derive(Debug, Clone, Copy)]
 pub enum TableLeafDeleteProbe {
     NotFound,
@@ -2413,7 +4402,7 @@ pub enum TableLeafDeleteProbe {
     Fallback,
 }
 
-/// Read-only O(log N) binary-search probe on a `TableLeaf` (`0x0d`) page locating `rowid`
+/// Read-only O(log N) binary-search probe on a `TableLeaf` (`0x0d` / `0x1d`) page locating `rowid`
 /// and returning both its payload span and cell freeblock bounds without dirtying the page.
 pub fn probe_delete_table_leaf_raw(
     pgno: Pgno,
@@ -2423,19 +4412,20 @@ pub fn probe_delete_table_leaf_raw(
 ) -> Result<TableLeafDeleteProbe> {
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
-    if hdr_off + 8 > usable
-        || raw[hdr_off] != BtreePageType::TableLeaf as u8
-        || raw[hdr_off + 7] > 60
-    {
+    if hdr_off + 8 > usable || !is_table_leaf_byte(raw[hdr_off]) || raw[hdr_off + 7] > 60 {
         return Ok(TableLeafDeleteProbe::Fallback);
     }
+    let is_p3v1 = raw[hdr_off] == P3V1_TABLE_LEAF_BYTE;
+    let slot_stride = if is_p3v1 { 12 } else { 2 };
 
     let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
     if n_cell == 0 {
         return Ok(TableLeafDeleteProbe::NotFound);
     }
     let ptr_base = hdr_off + 8;
-    let ptr_end = ptr_base + 2 * n_cell;
+    let Some(ptr_end) = ptr_base.checked_add(slot_stride * n_cell) else {
+        return Ok(TableLeafDeleteProbe::Fallback);
+    };
     if ptr_end > usable {
         return Ok(TableLeafDeleteProbe::Fallback);
     }
@@ -2445,9 +4435,87 @@ pub fn probe_delete_table_leaf_raw(
         return Ok(TableLeafDeleteProbe::Fallback);
     }
 
+    let bounds = PayloadBounds::for_table_leaf(usable_size);
+    if is_p3v1 {
+        let mut lo = 0usize;
+        let mut hi = n_cell;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let s = ptr_base + 12 * mid;
+            let cell_rowid = i64::from_le_bytes([
+                raw[s],
+                raw[s + 1],
+                raw[s + 2],
+                raw[s + 3],
+                raw[s + 4],
+                raw[s + 5],
+                raw[s + 6],
+                raw[s + 7],
+            ]);
+            match cell_rowid.cmp(&rowid) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    let off = u16::from_le_bytes([raw[s + 8], raw[s + 9]]) as usize;
+                    let len_flags = u16::from_le_bytes([raw[s + 10], raw[s + 11]]);
+                    if off < content_top || off >= usable {
+                        return Ok(TableLeafDeleteProbe::Fallback);
+                    }
+                    if len_flags == P3V1_OVFL_SENTINEL {
+                        if off + 8 > usable {
+                            return Ok(TableLeafDeleteProbe::Fallback);
+                        }
+                        let total_payload_len = u32::from_le_bytes([
+                            raw[off],
+                            raw[off + 1],
+                            raw[off + 2],
+                            raw[off + 3],
+                        ]);
+                        let local_len = bounds.local_len(total_payload_len);
+                        let cell_len = 8 + local_len;
+                        if off + cell_len > usable {
+                            return Ok(TableLeafDeleteProbe::Fallback);
+                        }
+                        let ovfl = Some(u32::from_be_bytes([
+                            raw[off + 4],
+                            raw[off + 5],
+                            raw[off + 6],
+                            raw[off + 7],
+                        ]));
+                        return Ok(TableLeafDeleteProbe::Found {
+                            idx: mid,
+                            n_cell,
+                            cell_off: off,
+                            cell_len,
+                            payload_start: off + 8,
+                            local_len,
+                            total_payload_len,
+                            overflow_page: ovfl,
+                        });
+                    }
+                    let local_len = len_flags as usize;
+                    let cell_len = local_len.max(4);
+                    if off + cell_len > usable {
+                        return Ok(TableLeafDeleteProbe::Fallback);
+                    }
+                    return Ok(TableLeafDeleteProbe::Found {
+                        idx: mid,
+                        n_cell,
+                        cell_off: off,
+                        cell_len,
+                        payload_start: off,
+                        local_len,
+                        total_payload_len: len_flags as u32,
+                        overflow_page: None,
+                    });
+                }
+            }
+        }
+        return Ok(TableLeafDeleteProbe::NotFound);
+    }
+
     let mut lo = 0usize;
     let mut hi = n_cell;
-    let bounds = PayloadBounds::for_table_leaf(usable_size);
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         let p = ptr_base + 2 * mid;
@@ -2521,16 +4589,21 @@ pub fn apply_delete_table_leaf_in_place(
 
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+    let slot_stride = if raw[hdr_off] == P3V1_TABLE_LEAF_BYTE {
+        12
+    } else {
+        2
+    };
     let ptr_base = hdr_off + 8;
 
     if idx + 1 < n_cell {
         raw.copy_within(
-            ptr_base + 2 * (idx + 1)..ptr_base + 2 * n_cell,
-            ptr_base + 2 * idx,
+            ptr_base + slot_stride * (idx + 1)..ptr_base + slot_stride * n_cell,
+            ptr_base + slot_stride * idx,
         );
     }
-    let vacated_ptr = ptr_base + 2 * (n_cell - 1);
-    raw[vacated_ptr..vacated_ptr + 2].fill(0);
+    let vacated_ptr = ptr_base + slot_stride * (n_cell - 1);
+    raw[vacated_ptr..vacated_ptr + slot_stride].fill(0);
 
     let new_n = n_cell - 1;
     raw[hdr_off + 3..hdr_off + 5].copy_from_slice(&(new_n as u16).to_be_bytes());
@@ -2618,8 +4691,7 @@ pub fn raw_page_header(
             "truncated btree page header on page {pgno}"
         )));
     }
-    let page_type = BtreePageType::from_byte(raw[hdr_off])?;
-    let hdr_size = page_type.header_size();
+    let (page_type, hdr_size, slot_stride, _) = decode_raw_page_layout(raw[hdr_off])?;
     if hdr_off + hdr_size > usable {
         return Err(SqliteError::corrupt(format!(
             "truncated interior btree page header on page {pgno}"
@@ -2627,7 +4699,7 @@ pub fn raw_page_header(
     }
     let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
     let ptr_end = (hdr_off + hdr_size)
-        .checked_add(2 * n_cell)
+        .checked_add(slot_stride * n_cell)
         .ok_or_else(|| SqliteError::corrupt("cell pointer array overflow"))?;
     if ptr_end > usable {
         return Err(SqliteError::corrupt(format!(
@@ -2664,11 +4736,40 @@ pub fn raw_cell_offset(
     }
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+    if hdr_off >= usable || raw.len() < usable {
+        return Err(SqliteError::corrupt(format!(
+            "cell pointer array out of bounds on page {pgno}"
+        )));
+    }
+    if is_p3v1_leaf_byte(raw[hdr_off]) {
+        let actual_hdr = if raw[hdr_off] == P3V1_INDEX_LEAF_BYTE {
+            12
+        } else {
+            8
+        };
+        let dir_base = hdr_off + actual_hdr;
+        let ptr_end = dir_base
+            .checked_add(12 * n_cell)
+            .ok_or_else(|| SqliteError::corrupt("cell directory overflow"))?;
+        if ptr_end > usable {
+            return Err(SqliteError::corrupt(format!(
+                "cell directory out of bounds on page {pgno}"
+            )));
+        }
+        let s = dir_base + 12 * cell_idx;
+        let off = u16::from_le_bytes([raw[s + 8], raw[s + 9]]) as usize;
+        if off < ptr_end || off >= usable {
+            return Err(SqliteError::corrupt(format!(
+                "invalid cell offset {off} on page {pgno}"
+            )));
+        }
+        return Ok(off);
+    }
     let ptr_base = hdr_off + hdr_size;
     let ptr_end = ptr_base
         .checked_add(2 * n_cell)
         .ok_or_else(|| SqliteError::corrupt("cell pointer array overflow"))?;
-    if ptr_end > usable || raw.len() < usable {
+    if ptr_end > usable {
         return Err(SqliteError::corrupt(format!(
             "cell pointer array out of bounds on page {pgno}"
         )));
@@ -2683,7 +4784,7 @@ pub fn raw_cell_offset(
     Ok(off)
 }
 
-/// Reads only the `rowid` of `cell_idx` on a raw `TableLeaf` (`0x0d`) page.
+/// Reads only the `rowid` of `cell_idx` on a raw `TableLeaf` (`0x0d` / `0x1d`) page.
 #[inline]
 pub fn read_table_leaf_rowid(
     pgno: Pgno,
@@ -2693,6 +4794,34 @@ pub fn read_table_leaf_rowid(
     cell_idx: usize,
 ) -> Result<i64> {
     let usable = usable_size as usize;
+    let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+    if hdr_off < usable && raw.len() >= usable && raw[hdr_off] == P3V1_TABLE_LEAF_BYTE {
+        if cell_idx >= n_cell {
+            return Err(SqliteError::corrupt(format!(
+                "cell index {cell_idx} out of bounds ({n_cell}) on page {pgno}"
+            )));
+        }
+        let dir_base = hdr_off + 8;
+        let ptr_end = dir_base
+            .checked_add(12 * n_cell)
+            .ok_or_else(|| SqliteError::corrupt("cell directory overflow"))?;
+        if ptr_end > usable {
+            return Err(SqliteError::corrupt(format!(
+                "cell directory out of bounds on page {pgno}"
+            )));
+        }
+        let s = dir_base + 12 * cell_idx;
+        return Ok(i64::from_le_bytes([
+            raw[s],
+            raw[s + 1],
+            raw[s + 2],
+            raw[s + 3],
+            raw[s + 4],
+            raw[s + 5],
+            raw[s + 6],
+            raw[s + 7],
+        ]));
+    }
     let off = raw_cell_offset(pgno, usable_size, raw, 8, n_cell, cell_idx)?;
     let slice = &raw[off..usable];
     let (_, n1) = get_varint(slice)?;
@@ -2700,7 +4829,98 @@ pub fn read_table_leaf_rowid(
     Ok(rowid)
 }
 
-/// Reads a single borrowed `RawTableLeafCell` at `cell_idx` on a raw `TableLeaf` (`0x0d`) page.
+/// Reads `(local_start, local_len, total_payload_len, overflow_page)` at `cell_idx` on a raw `TableLeaf` (`0x0d` / `0x1d`) page.
+#[inline]
+pub fn read_table_leaf_cell_layout(
+    pgno: Pgno,
+    usable_size: u32,
+    raw: &[u8],
+    n_cell: usize,
+    cell_idx: usize,
+) -> Result<(usize, usize, u32, Option<Pgno>)> {
+    let usable = usable_size as usize;
+    let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+    if hdr_off < usable && raw.len() >= usable && raw[hdr_off] == P3V1_TABLE_LEAF_BYTE {
+        if cell_idx >= n_cell {
+            return Err(SqliteError::corrupt(format!(
+                "cell index {cell_idx} out of bounds ({n_cell}) on page {pgno}"
+            )));
+        }
+        let dir_base = hdr_off + 8;
+        let ptr_end = dir_base
+            .checked_add(12 * n_cell)
+            .ok_or_else(|| SqliteError::corrupt("cell directory overflow"))?;
+        if ptr_end > usable {
+            return Err(SqliteError::corrupt(format!(
+                "cell directory out of bounds on page {pgno}"
+            )));
+        }
+        let s = dir_base + 12 * cell_idx;
+        let off = u16::from_le_bytes([raw[s + 8], raw[s + 9]]) as usize;
+        let len_flags = u16::from_le_bytes([raw[s + 10], raw[s + 11]]);
+        if off < ptr_end || off >= usable {
+            return Err(SqliteError::corrupt(format!(
+                "invalid cell offset {off} on page {pgno}"
+            )));
+        }
+        if len_flags == P3V1_OVFL_SENTINEL {
+            if off + 8 > usable {
+                return Err(SqliteError::corrupt(format!(
+                    "table leaf overflow cell truncated on page {pgno}"
+                )));
+            }
+            let total_payload_len =
+                u32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+            let bounds = PayloadBounds::for_table_leaf(usable_size);
+            let local_len = bounds.local_len(total_payload_len);
+            if off + 8 + local_len > usable {
+                return Err(SqliteError::corrupt(format!(
+                    "table leaf cell extends past end of page {pgno}"
+                )));
+            }
+            let ovfl = u32::from_be_bytes([raw[off + 4], raw[off + 5], raw[off + 6], raw[off + 7]]);
+            return Ok((off + 8, local_len, total_payload_len, Some(ovfl)));
+        }
+        let local_len = len_flags as usize;
+        if off + local_len > usable {
+            return Err(SqliteError::corrupt(format!(
+                "table leaf cell extends past end of page {pgno}"
+            )));
+        }
+        return Ok((off, local_len, len_flags as u32, None));
+    }
+
+    let off = raw_cell_offset(pgno, usable_size, raw, 8, n_cell, cell_idx)?;
+    let slice = &raw[off..usable];
+    let (payload_u64, n1) = get_varint(slice)?;
+    let total_payload_len = u32::try_from(payload_u64)
+        .map_err(|_| SqliteError::corrupt("table cell payload > 4GiB"))?;
+    let (_, n2) = get_varint_i64(&slice[n1..])?;
+    let bounds = PayloadBounds::for_table_leaf(usable_size);
+    let local_start = off + n1 + n2;
+    let local_len = bounds.local_len(total_payload_len);
+    let local_end = local_start + local_len;
+    let has_ovfl = (local_len as u32) < total_payload_len;
+    let needed = local_end + if has_ovfl { 4 } else { 0 };
+    if needed > usable {
+        return Err(SqliteError::corrupt(format!(
+            "table leaf cell extends past end of page {pgno}"
+        )));
+    }
+    let overflow_page = if has_ovfl {
+        Some(u32::from_be_bytes([
+            raw[local_end],
+            raw[local_end + 1],
+            raw[local_end + 2],
+            raw[local_end + 3],
+        ]))
+    } else {
+        None
+    };
+    Ok((local_start, local_len, total_payload_len, overflow_page))
+}
+
+/// Reads a single borrowed `RawTableLeafCell` at `cell_idx` on a raw `TableLeaf` (`0x0d` / `0x1d`) page.
 pub fn read_table_leaf_cell(
     pgno: Pgno,
     usable_size: u32,
@@ -2709,6 +4929,18 @@ pub fn read_table_leaf_cell(
     cell_idx: usize,
 ) -> Result<RawTableLeafCell<'_>> {
     let usable = usable_size as usize;
+    let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+    if hdr_off < usable && raw.len() >= usable && raw[hdr_off] == P3V1_TABLE_LEAF_BYTE {
+        let rowid = read_table_leaf_rowid(pgno, usable_size, raw, n_cell, cell_idx)?;
+        let (local_start, local_len, total_payload_len, overflow_page) =
+            read_table_leaf_cell_layout(pgno, usable_size, raw, n_cell, cell_idx)?;
+        return Ok(RawTableLeafCell {
+            rowid,
+            total_payload_len,
+            local_payload: &raw[local_start..local_start + local_len],
+            overflow_page,
+        });
+    }
     let off = raw_cell_offset(pgno, usable_size, raw, 8, n_cell, cell_idx)?;
     let slice = &raw[off..usable];
     let (payload_u64, n1) = get_varint(slice)?;
@@ -2765,7 +4997,7 @@ pub fn read_table_interior_cell(
     Ok((left_child, key))
 }
 
-/// Reads a single borrowed `RawIndexCell` at `cell_idx` on a raw `IndexLeaf` (`0x0a`) page.
+/// Reads a single borrowed `RawIndexCell` at `cell_idx` on a raw `IndexLeaf` (`0x0a` / `0x1a`) page.
 pub fn read_index_leaf_cell(
     pgno: Pgno,
     usable_size: u32,
@@ -2774,6 +5006,65 @@ pub fn read_index_leaf_cell(
     cell_idx: usize,
 ) -> Result<RawIndexCell<'_>> {
     let usable = usable_size as usize;
+    let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+    if hdr_off < usable && raw.len() >= usable && raw[hdr_off] == P3V1_INDEX_LEAF_BYTE {
+        if cell_idx >= n_cell {
+            return Err(SqliteError::corrupt(format!(
+                "cell index {cell_idx} out of bounds ({n_cell}) on page {pgno}"
+            )));
+        }
+        let dir_base = hdr_off + 12;
+        let ptr_end = dir_base
+            .checked_add(12 * n_cell)
+            .ok_or_else(|| SqliteError::corrupt("cell directory overflow"))?;
+        if ptr_end > usable {
+            return Err(SqliteError::corrupt(format!(
+                "cell directory out of bounds on page {pgno}"
+            )));
+        }
+        let s = dir_base + 12 * cell_idx;
+        let off = u16::from_le_bytes([raw[s + 8], raw[s + 9]]) as usize;
+        let len_flags = u16::from_le_bytes([raw[s + 10], raw[s + 11]]);
+        if off < ptr_end || off >= usable {
+            return Err(SqliteError::corrupt(format!(
+                "invalid cell offset {off} on page {pgno}"
+            )));
+        }
+        if len_flags == P3V1_OVFL_SENTINEL {
+            if off + 8 > usable {
+                return Err(SqliteError::corrupt(format!(
+                    "index leaf overflow cell truncated on page {pgno}"
+                )));
+            }
+            let total_payload_len =
+                u32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+            let bounds = PayloadBounds::for_index(usable_size);
+            let local_len = bounds.local_len(total_payload_len);
+            if off + 8 + local_len > usable {
+                return Err(SqliteError::corrupt(format!(
+                    "index leaf cell extends past end of page {pgno}"
+                )));
+            }
+            let ovfl = u32::from_be_bytes([raw[off + 4], raw[off + 5], raw[off + 6], raw[off + 7]]);
+            return Ok(RawIndexCell {
+                total_payload_len,
+                local_payload: &raw[off + 8..off + 8 + local_len],
+                overflow_page: Some(ovfl),
+            });
+        }
+        let local_len = len_flags as usize;
+        if off + local_len > usable {
+            return Err(SqliteError::corrupt(format!(
+                "index leaf cell extends past end of page {pgno}"
+            )));
+        }
+        return Ok(RawIndexCell {
+            total_payload_len: len_flags as u32,
+            local_payload: &raw[off..off + local_len],
+            overflow_page: None,
+        });
+    }
+
     let off = raw_cell_offset(pgno, usable_size, raw, 8, n_cell, cell_idx)?;
     let slice = &raw[off..usable];
     let (payload_u64, n1) = get_varint(slice)?;
@@ -2804,6 +5095,58 @@ pub fn read_index_leaf_cell(
         local_payload: &slice[n1..body_end],
         overflow_page,
     })
+}
+
+/// Extracted `(last_idx, cell_off, cell_len, payload_vec)` tuple from an `IndexLeaf`.
+pub type ExtractedDividerCell = (usize, usize, usize, Vec<u8>);
+
+/// Extracts `(last_idx, cell_off, cell_len, payload_vec)` of the last cell on an `IndexLeaf`
+/// (`0x0a` / `0x1a`) when `n_cell >= 2`, `frag <= 60`, and the last cell is non-overflow.
+pub fn extract_last_index_leaf_cell_for_divider(
+    pgno: Pgno,
+    usable_size: u32,
+    raw: &[u8],
+    n_cell: usize,
+) -> Result<Option<ExtractedDividerCell>> {
+    let usable = usable_size as usize;
+    let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+    if n_cell < 2 || hdr_off + 8 > usable || raw[hdr_off + 7] > 60 {
+        return Ok(None);
+    }
+    let last_idx = n_cell - 1;
+    if raw[hdr_off] == P3V1_INDEX_LEAF_BYTE {
+        let dir_base = hdr_off + 12;
+        let Some(ptr_end) = dir_base.checked_add(12 * n_cell) else {
+            return Ok(None);
+        };
+        if ptr_end > usable {
+            return Ok(None);
+        }
+        let s = dir_base + 12 * last_idx;
+        let off = u16::from_le_bytes([raw[s + 8], raw[s + 9]]) as usize;
+        let len_flags = u16::from_le_bytes([raw[s + 10], raw[s + 11]]);
+        if len_flags == P3V1_OVFL_SENTINEL || off < ptr_end {
+            return Ok(None);
+        }
+        let plen = len_flags as usize;
+        let c_len = plen.max(4);
+        if off + c_len > usable {
+            return Ok(None);
+        }
+        return Ok(Some((last_idx, off, c_len, raw[off..off + plen].to_vec())));
+    }
+    let off = raw_cell_offset(pgno, usable_size, raw, 8, n_cell, last_idx)?;
+    let (payload_u64, n1) = get_varint(&raw[off..usable])?;
+    if let Ok(total_u32) = u32::try_from(payload_u64) {
+        let bounds = PayloadBounds::for_index(usable_size);
+        let loc = bounds.local_len(total_u32);
+        let c_len = (n1 + loc).max(4);
+        if (loc as u32) == total_u32 && off + c_len <= usable {
+            let payload = raw[off + n1..off + n1 + loc].to_vec();
+            return Ok(Some((last_idx, off, c_len, payload)));
+        }
+    }
+    Ok(None)
 }
 
 /// Reads `(left_child, RawIndexCell)` at `cell_idx` on a raw `IndexInterior` (`0x02`) page.
@@ -2856,7 +5199,7 @@ pub fn read_index_interior_cell(
     ))
 }
 
-/// Binary-searches a raw `TableLeaf` (`0x0d`) page for `target_rowid` without allocating,
+/// Binary-searches a raw `TableLeaf` (`0x0d` / `0x1d`) page for `target_rowid` without allocating,
 /// returning `Ok(exact_idx)` on exact match or `Err(insert_idx)` (`0..=n_cell`) on miss.
 #[inline]
 pub fn binary_search_table_leaf(
@@ -2868,6 +5211,40 @@ pub fn binary_search_table_leaf(
 ) -> Result<std::result::Result<usize, usize>> {
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+    if hdr_off < usable && raw.len() >= usable && raw[hdr_off] == P3V1_TABLE_LEAF_BYTE {
+        let dir_base = hdr_off + 8;
+        let ptr_end = dir_base
+            .checked_add(12 * n_cell)
+            .ok_or_else(|| SqliteError::corrupt("cell directory overflow"))?;
+        if ptr_end > usable {
+            return Err(SqliteError::corrupt(format!(
+                "cell directory out of bounds on page {pgno}"
+            )));
+        }
+        let mut lo = 0usize;
+        let mut hi = n_cell;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let s = dir_base + 12 * mid;
+            let cell_rowid = i64::from_le_bytes([
+                raw[s],
+                raw[s + 1],
+                raw[s + 2],
+                raw[s + 3],
+                raw[s + 4],
+                raw[s + 5],
+                raw[s + 6],
+                raw[s + 7],
+            ]);
+            match cell_rowid.cmp(&target_rowid) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Ok(Ok(mid)),
+            }
+        }
+        return Ok(Err(lo));
+    }
+
     let ptr_base = hdr_off + 8;
     let ptr_end = ptr_base
         .checked_add(2 * n_cell)
@@ -2901,7 +5278,7 @@ pub fn binary_search_table_leaf(
     Ok(Err(lo))
 }
 
-/// Binary-searches a raw `TableLeaf` (`0x0d`) page for `target_rowid` and, on exact match,
+/// Binary-searches a raw `TableLeaf` (`0x0d` / `0x1d`) page for `target_rowid` and, on exact match,
 /// also returns `Some((payload_start, payload_end))` if the payload resides completely in-page
 /// (`overflow_page.is_none()` and `usable <= u16::MAX as usize`).
 #[inline]
@@ -2915,6 +5292,61 @@ pub fn binary_search_table_leaf_with_span(
 ) -> Result<std::result::Result<(usize, Option<(u16, u16)>), usize>> {
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
+    if hdr_off < usable && raw.len() >= usable && raw[hdr_off] == P3V1_TABLE_LEAF_BYTE {
+        let dir_base = hdr_off + 8;
+        let ptr_end = dir_base
+            .checked_add(12 * n_cell)
+            .ok_or_else(|| SqliteError::corrupt("cell directory overflow"))?;
+        if ptr_end > usable {
+            return Err(SqliteError::corrupt(format!(
+                "cell directory out of bounds on page {pgno}"
+            )));
+        }
+        let dir = &raw[dir_base..ptr_end];
+        let mut lo = 0usize;
+        let mut hi = n_cell;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let d = 12 * mid;
+            let cell_rowid = i64::from_le_bytes([
+                dir[d],
+                dir[d + 1],
+                dir[d + 2],
+                dir[d + 3],
+                dir[d + 4],
+                dir[d + 5],
+                dir[d + 6],
+                dir[d + 7],
+            ]);
+            match cell_rowid.cmp(&target_rowid) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    let off = u16::from_le_bytes([dir[d + 8], dir[d + 9]]) as usize;
+                    let len_flags = u16::from_le_bytes([dir[d + 10], dir[d + 11]]);
+                    if off < ptr_end || off >= usable {
+                        return Err(SqliteError::corrupt(format!(
+                            "invalid cell offset {off} on page {pgno}"
+                        )));
+                    }
+                    let inline_span =
+                        if len_flags != P3V1_OVFL_SENTINEL && usable <= u16::MAX as usize {
+                            let p_end = off + (len_flags as usize);
+                            if p_end <= usable {
+                                Some((off as u16, p_end as u16))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                    return Ok(Ok((mid, inline_span)));
+                }
+            }
+        }
+        return Ok(Err(lo));
+    }
+
     let ptr_base = hdr_off + 8;
     let ptr_end = ptr_base
         .checked_add(2 * n_cell)

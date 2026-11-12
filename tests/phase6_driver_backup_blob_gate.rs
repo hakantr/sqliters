@@ -716,6 +716,7 @@ finish_test
 
 #[test]
 fn phase6_gate_4_c_sqlite_3541_differential_backup_blob_vacuum_and_subtypes() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let sandbox = TempSandbox::new("diff_e2e");
 
     // 1. Online `Backup` with page-size conversion (`1024 -> 4096`) and live source updates,

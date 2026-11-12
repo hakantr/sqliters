@@ -17,18 +17,28 @@ pub use bitvec::Bitvec;
 pub use error::{ConflictResolutionEffect, ErrorCode, Result, SqliteError, extended};
 pub use json::{
     CompiledJsonArrowPath, FastJsonIntOut, append_runtime_value_json_elem, eval_jsonb_value_into,
-    parse_json_text_to_jsonb, parse_json_text_to_jsonb_into,
+    is_p3v1_jsonb, parse_json_text_to_jsonb, parse_json_text_to_jsonb_into,
 };
 pub use limits::*;
 pub use record::{
-    KeySortOrder, RawField, compare_raw_record_range, compare_raw_records_with_encoding,
-    compare_records, compare_records_with_encoding, decode_record, decode_record_column,
-    decode_record_column_with_encoding, decode_record_with_encoding, decode_serial_value,
-    decode_serial_value_pooled, decode_serial_value_with_encoding, encode_record,
-    encode_record_into, encode_record_with_encoding, encode_runtime_record_into,
-    encode_runtime_record_with_encoding, encode_value_refs_record_into, fallible_sort_by,
-    parse_raw_record_prefix, raw_record_prefix_has_null, read_raw_record_field, serial_type_for,
-    serial_type_for_with_encoding, serial_type_len, swar_decode_hdr, swar_serial_len_1b,
+    KeySortOrder, P3V1_RECORD_MAGIC, P3V1_TAG_BLOB, P3V1_TAG_EMPTY_BLOB, P3V1_TAG_EMPTY_TEXT,
+    P3V1_TAG_F64_LE, P3V1_TAG_I8, P3V1_TAG_I16_LE, P3V1_TAG_I32_LE, P3V1_TAG_I64_LE, P3V1_TAG_NULL,
+    P3V1_TAG_ONE, P3V1_TAG_TEXT, P3V1_TAG_ZERO, P3V1_WIDE_FLAG, RawField, compare_raw_record_range,
+    compare_raw_records_with_encoding, compare_records, compare_records_with_encoding,
+    decode_p3v1_int_tag, decode_p3v1_tag_value_pooled, decode_p3v1_tag_value_with_encoding,
+    decode_record, decode_record_column, decode_record_column_with_encoding,
+    decode_record_with_encoding, decode_serial_value, decode_serial_value_pooled,
+    decode_serial_value_with_encoding, encode_raw_fields_for_format_into, encode_record,
+    encode_record_for_format_into, encode_record_format3, encode_record_format3_into,
+    encode_record_into, encode_record_with_encoding, encode_runtime_record_for_format_into,
+    encode_runtime_record_format3_into, encode_runtime_record_into,
+    encode_runtime_record_with_encoding, encode_value_refs_record_for_format_into,
+    encode_value_refs_record_format3_into, encode_value_refs_record_into, fallible_sort_by,
+    is_p3v1_record, p3v1_column_offset_and_tag, p3v1_compact_col_span, p3v1_fixed_tag_width,
+    p3v1_header_info, parse_raw_record_prefix, raw_record_prefix_has_null, read_raw_record_field,
+    read_raw_record_inline_val, read_raw_record_int_at, read_raw_record_int_pair,
+    record_column_count, serial_type_for, serial_type_for_with_encoding, serial_type_len,
+    swar_decode_hdr, swar_serial_len_1b, transcode_p3v1_to_format3,
 };
 pub use runtime_api::{
     AggregateStepId, DatabaseId, ExecutionServices, FunctionFlags, MAX_DB_SLOTS, RowMutationEvent,
@@ -47,6 +57,71 @@ pub use vtab_api::{
     VTabHostContext, VTabIndexInfo, VTabOrderBy, VTabRiskFlags, VTabUpdateOperation, VirtualCursor,
     VirtualTable, VirtualTableModule,
 };
+
+static LEGACY_FORMAT3_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+std::thread_local! {
+    static LEGACY_FORMAT3_TLS_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns `true` only when legacy Format-3 output mode has been explicitly requested via
+/// `SQLITERS_LEGACY_FORMAT3=1` or an active [`LegacyFormat3Guard`] (e.g. cross-engine C CLI tests).
+/// By default (`false`), all newly created databases and `JSONB` documents use `P3v1`.
+#[inline(always)]
+pub fn legacy_format3_mode() -> bool {
+    let state = LEGACY_FORMAT3_STATE.load(std::sync::atomic::Ordering::Relaxed);
+    if state == 1 {
+        return false;
+    }
+    legacy_format3_mode_slow(state)
+}
+
+#[cold]
+#[inline(never)]
+fn legacy_format3_mode_slow(state: u8) -> bool {
+    match state {
+        0 => {
+            let env_on = std::env::var_os("SQLITERS_LEGACY_FORMAT3").is_some_and(|v| v == "1");
+            let next = if env_on { 2 } else { 1 };
+            let _ = LEGACY_FORMAT3_STATE.compare_exchange(
+                0,
+                next,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            if env_on {
+                true
+            } else {
+                LEGACY_FORMAT3_TLS_DEPTH.with(|c| c.get() > 0)
+            }
+        }
+        2 => true,
+        _ => {
+            std::env::var_os("SQLITERS_LEGACY_FORMAT3").is_some_and(|v| v == "1")
+                || LEGACY_FORMAT3_TLS_DEPTH.with(|c| c.get() > 0)
+        }
+    }
+}
+
+/// Scoped thread-local RAII guard enabling legacy Format-3 output for cross-engine C SQLite CLI
+/// interoperability tests without requiring `unsafe` process environment mutation.
+pub struct LegacyFormat3Guard {
+    _private: (),
+}
+
+impl LegacyFormat3Guard {
+    pub fn enter() -> Self {
+        LEGACY_FORMAT3_STATE.store(3, std::sync::atomic::Ordering::Relaxed);
+        LEGACY_FORMAT3_TLS_DEPTH.with(|c| c.set(c.get().saturating_add(1)));
+        Self { _private: () }
+    }
+}
+
+impl Drop for LegacyFormat3Guard {
+    fn drop(&mut self) {
+        LEGACY_FORMAT3_TLS_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
 
 #[cfg(test)]
 mod tests {

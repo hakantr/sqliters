@@ -1,13 +1,26 @@
-//! SQLite on-disk Record format (serial types + payloads),
+//! On-disk Record codecs (`P3v1` direct-offset little-endian records + Format-3 fallback),
 //! ported from `OP_MakeRecord`, `sqlite3VdbeSerialTypeLen`, and `sqlite3VdbeSerialGet`
 //! in `sqlite/src/vdbe.c` and `sqlite/src/vdbeaux.c`.
 //!
-//! Record binary layout:
+//! `P3v1` compact record binary layout (`col_count < 128`, `body_len < 4096`):
+//! ```text
+//! [ 0x00 : magic ] [ col_count : u8 ] [ desc_0 : u16_le ] ... [ desc_{N-1} : u16_le ]
+//! [ body_0 ] ... [ body_{N-1} ]
+//! ```
+//! where `desc_k = ((body_end_k as u16) << 4) | (tag_k as u16)`.
+//!
+//! `P3v1` wide record binary layout (`col_count >= 128` or `body_len >= 4096`):
+//! ```text
+//! [ 0x00 : magic ] [ 0x80 : wide ] [ col_count : u16_le ]
+//! [ tag_0 .. tag_{N-1} : u8 ] [ body_end_0 .. body_end_{N-1} : u32_le ]
+//! [ body_0 ] ... [ body_{N-1} ]
+//! ```
+//!
+//! Format-3 fallback binary layout (`record[0] != 0x00`):
 //! ```text
 //! [ header_size : varint ] [ serial_type_0 : varint ] ... [ serial_type_{N-1} : varint ]
 //! [ body_0 ] ... [ body_{N-1} ]
 //! ```
-//! where `header_size` is the total number of bytes in the header INCLUDING `header_size` itself.
 
 use std::cmp::Ordering;
 
@@ -15,10 +28,220 @@ use crate::error::{Result, SqliteError};
 use crate::runtime_api::RuntimeValue;
 #[cfg(not(target_arch = "x86_64"))]
 use crate::value::swar_fold_ascii_lower_u64;
-use crate::value::{Collation, CustomCollation, TextEncoding, Value, cmp_int_float};
+use crate::value::{Collation, CustomCollation, InlineVal, TextEncoding, Value, cmp_int_float};
 use crate::varint::{get_varint, push_varint, varint_len};
 
 const MAX_6BYTE_INT: u64 = (0x0000_8000_u64 << 32) - 1; // 140_737_488_355_327
+
+/// Leading magic byte identifying a `P3v1` direct-offset little-endian record.
+/// Valid Format-3 records always begin with `header_size >= 1`, so `0x00` is disjoint.
+pub const P3V1_RECORD_MAGIC: u8 = 0x00;
+
+/// Flag in `record[1]` marking a wide `P3v1` header (`col_count >= 128` or `body_len >= 4096`).
+pub const P3V1_WIDE_FLAG: u8 = 0x80;
+
+pub const P3V1_TAG_NULL: u8 = 0;
+pub const P3V1_TAG_ZERO: u8 = 1;
+pub const P3V1_TAG_ONE: u8 = 2;
+pub const P3V1_TAG_I8: u8 = 3;
+pub const P3V1_TAG_I16_LE: u8 = 4;
+pub const P3V1_TAG_I32_LE: u8 = 5;
+pub const P3V1_TAG_I64_LE: u8 = 6;
+pub const P3V1_TAG_F64_LE: u8 = 7;
+pub const P3V1_TAG_EMPTY_BLOB: u8 = 8;
+pub const P3V1_TAG_EMPTY_TEXT: u8 = 9;
+pub const P3V1_TAG_BLOB: u8 = 10;
+pub const P3V1_TAG_TEXT: u8 = 11;
+
+/// Packed 64-bit nibble LUT mapping fixed-width `P3v1` tags `0..=9` to byte widths
+/// (`0, 0, 0, 1, 2, 4, 8, 8, 0, 0`).
+const P3V1_FIXED_WIDTH_NIBBLES: u64 = 0x0000_0000_8842_1000;
+
+#[inline(always)]
+pub const fn is_p3v1_record(rec: &[u8]) -> bool {
+    !rec.is_empty() && rec[0] == P3V1_RECORD_MAGIC
+}
+
+#[inline(always)]
+pub const fn p3v1_fixed_tag_width(tag: u8) -> usize {
+    ((P3V1_FIXED_WIDTH_NIBBLES >> ((tag as u32) << 2)) & 0xf) as usize
+}
+
+#[cold]
+#[inline(never)]
+fn err_corrupt_p3v1_record() -> SqliteError {
+    SqliteError::corrupt("corrupt P3v1 record")
+}
+
+/// Parses the leading header metadata `(col_count, hdr_len, is_wide)` of a `P3v1` record prefix.
+#[inline(always)]
+pub fn p3v1_header_info(rec_prefix: &[u8]) -> Result<(usize, usize, bool)> {
+    if rec_prefix.len() < 2 || rec_prefix[0] != P3V1_RECORD_MAGIC {
+        return Err(err_corrupt_p3v1_record());
+    }
+    let b1 = rec_prefix[1];
+    if b1 < P3V1_WIDE_FLAG {
+        let n = usize::from(b1);
+        let hdr_len = 2 + 2 * n;
+        if hdr_len > rec_prefix.len() {
+            return Err(err_corrupt_p3v1_record());
+        }
+        Ok((n, hdr_len, false))
+    } else if b1 == P3V1_WIDE_FLAG {
+        if rec_prefix.len() < 4 {
+            return Err(err_corrupt_p3v1_record());
+        }
+        let n = usize::from(u16::from_le_bytes([rec_prefix[2], rec_prefix[3]]));
+        let hdr_len = 4 + 5 * n;
+        if hdr_len > rec_prefix.len() {
+            return Err(err_corrupt_p3v1_record());
+        }
+        Ok((n, hdr_len, true))
+    } else {
+        Err(err_corrupt_p3v1_record())
+    }
+}
+
+/// Computes `(abs_start, abs_end, tag)` for column `col_idx` in true `O(1)` time from a `P3v1`
+/// record header prefix (`rec_prefix.len() >= hdr_len`), without scanning columns `0..col_idx`.
+#[inline(always)]
+pub fn p3v1_column_offset_and_tag(
+    rec_prefix: &[u8],
+    col_idx: usize,
+) -> Result<Option<(usize, usize, u8)>> {
+    if rec_prefix.len() < 2 || rec_prefix[0] != P3V1_RECORD_MAGIC {
+        return Err(err_corrupt_p3v1_record());
+    }
+    let b1 = rec_prefix[1];
+    if b1 < P3V1_WIDE_FLAG {
+        let n = usize::from(b1);
+        let hdr_len = 2 + 2 * n;
+        if hdr_len > rec_prefix.len() {
+            return Err(err_corrupt_p3v1_record());
+        }
+        if col_idx >= n {
+            return Ok(None);
+        }
+        let (start_rel, end_rel, tag) = if col_idx == 0 {
+            let d = u16::from_le_bytes([rec_prefix[2], rec_prefix[3]]);
+            (0usize, usize::from(d >> 4), (d & 0x0f) as u8)
+        } else {
+            let off = 2 * col_idx;
+            let pair = u32::from_le_bytes([
+                rec_prefix[off],
+                rec_prefix[off + 1],
+                rec_prefix[off + 2],
+                rec_prefix[off + 3],
+            ]);
+            (
+                ((pair & 0xffff) >> 4) as usize,
+                (pair >> 20) as usize,
+                ((pair >> 16) & 0x0f) as u8,
+            )
+        };
+        if tag > P3V1_TAG_TEXT || start_rel > end_rel {
+            return Err(err_corrupt_p3v1_record());
+        }
+        if tag < P3V1_TAG_BLOB && (end_rel - start_rel) != p3v1_fixed_tag_width(tag) {
+            return Err(err_corrupt_p3v1_record());
+        }
+        Ok(Some((hdr_len + start_rel, hdr_len + end_rel, tag)))
+    } else if b1 == P3V1_WIDE_FLAG {
+        if rec_prefix.len() < 4 {
+            return Err(err_corrupt_p3v1_record());
+        }
+        let n = usize::from(u16::from_le_bytes([rec_prefix[2], rec_prefix[3]]));
+        let hdr_len = 4 + 5 * n;
+        if hdr_len > rec_prefix.len() {
+            return Err(err_corrupt_p3v1_record());
+        }
+        if col_idx >= n {
+            return Ok(None);
+        }
+        let tag = rec_prefix[4 + col_idx];
+        let ends_base = 4 + n;
+        let end_off = ends_base + 4 * col_idx;
+        let end_rel = u32::from_le_bytes([
+            rec_prefix[end_off],
+            rec_prefix[end_off + 1],
+            rec_prefix[end_off + 2],
+            rec_prefix[end_off + 3],
+        ]) as usize;
+        let start_rel = if col_idx == 0 {
+            0usize
+        } else {
+            let prev_off = end_off - 4;
+            u32::from_le_bytes([
+                rec_prefix[prev_off],
+                rec_prefix[prev_off + 1],
+                rec_prefix[prev_off + 2],
+                rec_prefix[prev_off + 3],
+            ]) as usize
+        };
+        if tag > P3V1_TAG_TEXT || start_rel > end_rel {
+            return Err(err_corrupt_p3v1_record());
+        }
+        if tag < P3V1_TAG_BLOB && (end_rel - start_rel) != p3v1_fixed_tag_width(tag) {
+            return Err(err_corrupt_p3v1_record());
+        }
+        let abs_start = hdr_len
+            .checked_add(start_rel)
+            .ok_or_else(err_corrupt_p3v1_record)?;
+        let abs_end = hdr_len
+            .checked_add(end_rel)
+            .ok_or_else(err_corrupt_p3v1_record)?;
+        Ok(Some((abs_start, abs_end, tag)))
+    } else {
+        Err(err_corrupt_p3v1_record())
+    }
+}
+
+/// Fast `O(1)` column span extractor on an already-validated compact `P3v1` header slice
+/// (`hdr == &payload[..hdr_len]` with `hdr_len == 2 + 2 * n` and `col_idx < n`).
+#[inline(always)]
+pub fn p3v1_compact_col_span(
+    hdr: &[u8],
+    hdr_len: usize,
+    col_idx: usize,
+) -> Result<(usize, usize, u8)> {
+    let (start_rel, end_rel, tag) = if col_idx == 0 {
+        let d = u16::from_le_bytes([hdr[2], hdr[3]]);
+        (0usize, usize::from(d >> 4), (d & 0x0f) as u8)
+    } else {
+        let off = 2 * col_idx;
+        let pair = u32::from_le_bytes([hdr[off], hdr[off + 1], hdr[off + 2], hdr[off + 3]]);
+        (
+            ((pair & 0xffff) >> 4) as usize,
+            (pair >> 20) as usize,
+            ((pair >> 16) & 0x0f) as u8,
+        )
+    };
+    if tag > P3V1_TAG_TEXT || start_rel > end_rel {
+        return Err(err_corrupt_p3v1_record());
+    }
+    if tag < P3V1_TAG_BLOB && (end_rel - start_rel) != p3v1_fixed_tag_width(tag) {
+        return Err(err_corrupt_p3v1_record());
+    }
+    Ok((hdr_len + start_rel, hdr_len + end_rel, tag))
+}
+
+/// Decodes an integer `P3v1` column payload (`ZERO..=I64_LE`) in native little-endian.
+#[inline(always)]
+pub fn decode_p3v1_int_tag(tag: u8, bytes: &[u8]) -> Option<i64> {
+    match tag {
+        P3V1_TAG_ZERO => Some(0),
+        P3V1_TAG_ONE => Some(1),
+        P3V1_TAG_I8 => Some(i64::from(bytes[0] as i8)),
+        P3V1_TAG_I16_LE => Some(i64::from(i16::from_le_bytes([bytes[0], bytes[1]]))),
+        P3V1_TAG_I32_LE => Some(i64::from(i32::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ]))),
+        P3V1_TAG_I64_LE => Some(i64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ])),
+        _ => None,
+    }
+}
 
 /// Packed 64-bit SWAR nibble LUT mapping serial types `0..=11` to their byte lengths
 /// (`0, 1, 2, 3, 4, 6, 8, 8, 0, 0`, with `0xf` marking reserved corrupt serial types `10 | 11`).
@@ -292,14 +515,245 @@ pub fn serial_type_len(serial_type: u64) -> Result<usize> {
     }
 }
 
-/// Serializes a slice of [`Value`]s into an SQLite Format-3 record using UTF-8 (`OP_MakeRecord`).
+#[inline(always)]
+fn p3v1_tag_for_value(value: &Value, enc: TextEncoding) -> (u8, usize) {
+    match value {
+        Value::Null => (P3V1_TAG_NULL, 0),
+        Value::Integer(i) => {
+            let x = *i;
+            if x == 0 {
+                (P3V1_TAG_ZERO, 0)
+            } else if x == 1 {
+                (P3V1_TAG_ONE, 0)
+            } else if i64::from(x as i8) == x {
+                (P3V1_TAG_I8, 1)
+            } else if i64::from(x as i16) == x {
+                (P3V1_TAG_I16_LE, 2)
+            } else if i64::from(x as i32) == x {
+                (P3V1_TAG_I32_LE, 4)
+            } else {
+                (P3V1_TAG_I64_LE, 8)
+            }
+        }
+        Value::Real(r) => {
+            if r.is_nan() {
+                (P3V1_TAG_NULL, 0)
+            } else {
+                (P3V1_TAG_F64_LE, 8)
+            }
+        }
+        Value::Blob(b) => {
+            if b.is_empty() {
+                (P3V1_TAG_EMPTY_BLOB, 0)
+            } else {
+                (P3V1_TAG_BLOB, b.len())
+            }
+        }
+        Value::Text(s) => {
+            let n = enc.encoded_byte_len(s);
+            if n == 0 {
+                (P3V1_TAG_EMPTY_TEXT, 0)
+            } else {
+                (P3V1_TAG_TEXT, n)
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn write_p3v1_value(out: &mut Vec<u8>, value: &Value, tag: u8, enc: TextEncoding) {
+    match (value, tag) {
+        (Value::Null, _)
+        | (
+            _,
+            P3V1_TAG_NULL | P3V1_TAG_ZERO | P3V1_TAG_ONE | P3V1_TAG_EMPTY_BLOB
+            | P3V1_TAG_EMPTY_TEXT,
+        ) => {}
+        (Value::Integer(i), P3V1_TAG_I8) => out.push(*i as u8),
+        (Value::Integer(i), P3V1_TAG_I16_LE) => out.extend_from_slice(&(*i as i16).to_le_bytes()),
+        (Value::Integer(i), P3V1_TAG_I32_LE) => out.extend_from_slice(&(*i as i32).to_le_bytes()),
+        (Value::Integer(i), P3V1_TAG_I64_LE) => out.extend_from_slice(&i.to_le_bytes()),
+        (Value::Real(r), P3V1_TAG_F64_LE) => out.extend_from_slice(&r.to_bits().to_le_bytes()),
+        (Value::Blob(b), P3V1_TAG_BLOB) => out.extend_from_slice(b),
+        (Value::Text(s), P3V1_TAG_TEXT) => enc.encode_into(s, out),
+        _ => unreachable!("p3v1 tag matched value in encode_record"),
+    }
+}
+
+#[inline(never)]
+fn encode_p3v1_wide_values_into(values: &[Value], enc: TextEncoding, out: &mut Vec<u8>) {
+    if values.len() > usize::from(u16::MAX) {
+        encode_record_format3_into(values, enc, out);
+        return;
+    }
+    let n = values.len();
+    let hdr_len = 4 + 5 * n;
+    let mut tags = Vec::with_capacity(n);
+    let mut ends = Vec::with_capacity(n);
+    let mut body_len = 0usize;
+    for v in values {
+        let (tag, len) = p3v1_tag_for_value(v, enc);
+        body_len += len;
+        tags.push(tag);
+        ends.push(body_len as u32);
+    }
+    out.clear();
+    out.reserve(hdr_len + body_len);
+    out.push(P3V1_RECORD_MAGIC);
+    out.push(P3V1_WIDE_FLAG);
+    out.extend_from_slice(&(n as u16).to_le_bytes());
+    out.extend_from_slice(&tags);
+    for &end in &ends {
+        out.extend_from_slice(&end.to_le_bytes());
+    }
+    for (v, &tag) in values.iter().zip(tags.iter()) {
+        write_p3v1_value(out, v, tag, enc);
+    }
+}
+
+#[inline(never)]
+fn encode_p3v1_wide_value_refs_into(values: &[&Value], enc: TextEncoding, out: &mut Vec<u8>) {
+    if values.len() > usize::from(u16::MAX) {
+        encode_value_refs_record_format3_into(values, enc, out);
+        return;
+    }
+    let n = values.len();
+    let hdr_len = 4 + 5 * n;
+    let mut tags = Vec::with_capacity(n);
+    let mut ends = Vec::with_capacity(n);
+    let mut body_len = 0usize;
+    for &v in values {
+        let (tag, len) = p3v1_tag_for_value(v, enc);
+        body_len += len;
+        tags.push(tag);
+        ends.push(body_len as u32);
+    }
+    out.clear();
+    out.reserve(hdr_len + body_len);
+    out.push(P3V1_RECORD_MAGIC);
+    out.push(P3V1_WIDE_FLAG);
+    out.extend_from_slice(&(n as u16).to_le_bytes());
+    out.extend_from_slice(&tags);
+    for &end in &ends {
+        out.extend_from_slice(&end.to_le_bytes());
+    }
+    for (&v, &tag) in values.iter().zip(tags.iter()) {
+        write_p3v1_value(out, v, tag, enc);
+    }
+}
+
+#[inline(never)]
+fn encode_p3v1_wide_runtime_into(values: &[RuntimeValue], enc: TextEncoding, out: &mut Vec<u8>) {
+    if values.len() > usize::from(u16::MAX) {
+        encode_runtime_record_format3_into(values, enc, out);
+        return;
+    }
+    let n = values.len();
+    let hdr_len = 4 + 5 * n;
+    let mut tags = Vec::with_capacity(n);
+    let mut ends = Vec::with_capacity(n);
+    let mut body_len = 0usize;
+    for rv in values {
+        let (tag, len) = p3v1_tag_for_value(&rv.value, enc);
+        body_len += len;
+        tags.push(tag);
+        ends.push(body_len as u32);
+    }
+    out.clear();
+    out.reserve(hdr_len + body_len);
+    out.push(P3V1_RECORD_MAGIC);
+    out.push(P3V1_WIDE_FLAG);
+    out.extend_from_slice(&(n as u16).to_le_bytes());
+    out.extend_from_slice(&tags);
+    for &end in &ends {
+        out.extend_from_slice(&end.to_le_bytes());
+    }
+    for (rv, &tag) in values.iter().zip(tags.iter()) {
+        write_p3v1_value(out, &rv.value, tag, enc);
+    }
+}
+
+/// Serializes a slice of [`Value`]s into a `P3v1` direct-offset little-endian record using UTF-8.
 pub fn encode_record(values: &[Value]) -> Vec<u8> {
     encode_record_with_encoding(values, TextEncoding::Utf8)
 }
 
-/// Serializes a slice of [`Value`]s into an SQLite Format-3 record using `enc` (`OP_MakeRecord`),
+/// Serializes a slice of [`Value`]s into a `P3v1` direct-offset little-endian record using `enc`,
 /// reusing `out`'s existing allocation.
 pub fn encode_record_into(values: &[Value], enc: TextEncoding, out: &mut Vec<u8>) {
+    let n = values.len();
+    if n <= 16 {
+        let mut hdr_buf = [0u8; 34];
+        let mut tags = [0u8; 16];
+        let mut body_len = 0usize;
+        for (i, v) in values.iter().enumerate() {
+            let (tag, len) = p3v1_tag_for_value(v, enc);
+            body_len += len;
+            tags[i] = tag;
+            if body_len < 4096 {
+                let desc = ((body_len as u16) << 4) | u16::from(tag);
+                let db = desc.to_le_bytes();
+                hdr_buf[2 + 2 * i] = db[0];
+                hdr_buf[2 + 2 * i + 1] = db[1];
+            }
+        }
+        if body_len >= 4096 {
+            encode_p3v1_wide_values_into(values, enc, out);
+            return;
+        }
+        hdr_buf[0] = P3V1_RECORD_MAGIC;
+        hdr_buf[1] = n as u8;
+        let hdr_len = 2 + 2 * n;
+        out.clear();
+        out.reserve(hdr_len + body_len);
+        out.extend_from_slice(&hdr_buf[..hdr_len]);
+        for (v, &tag) in values.iter().zip(tags[..n].iter()) {
+            write_p3v1_value(out, v, tag, enc);
+        }
+        return;
+    }
+    if n < 128 {
+        let mut hdr_buf = [0u8; 258];
+        let mut tags = [0u8; 128];
+        let mut body_len = 0usize;
+        for (i, v) in values.iter().enumerate() {
+            let (tag, len) = p3v1_tag_for_value(v, enc);
+            body_len += len;
+            tags[i] = tag;
+            if body_len < 4096 {
+                let desc = ((body_len as u16) << 4) | u16::from(tag);
+                let db = desc.to_le_bytes();
+                hdr_buf[2 + 2 * i] = db[0];
+                hdr_buf[2 + 2 * i + 1] = db[1];
+            }
+        }
+        if body_len >= 4096 {
+            encode_p3v1_wide_values_into(values, enc, out);
+            return;
+        }
+        hdr_buf[0] = P3V1_RECORD_MAGIC;
+        hdr_buf[1] = n as u8;
+        let hdr_len = 2 + 2 * n;
+        out.clear();
+        out.reserve(hdr_len + body_len);
+        out.extend_from_slice(&hdr_buf[..hdr_len]);
+        for (v, &tag) in values.iter().zip(tags[..n].iter()) {
+            write_p3v1_value(out, v, tag, enc);
+        }
+        return;
+    }
+    encode_p3v1_wide_values_into(values, enc, out);
+}
+
+/// Serializes a slice of [`Value`]s into an explicit Format-3 record using UTF-8.
+pub fn encode_record_format3(values: &[Value]) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_record_format3_into(values, TextEncoding::Utf8, &mut out);
+    out
+}
+
+/// Serializes a slice of [`Value`]s into an explicit Format-3 record using `enc`.
+pub fn encode_record_format3_into(values: &[Value], enc: TextEncoding, out: &mut Vec<u8>) {
     out.clear();
     if values.len() <= 16 {
         let mut serials = [0u64; 16];
@@ -338,8 +792,6 @@ pub fn encode_record_into(values: &[Value], enc: TextEncoding, out: &mut Vec<u8>
         serials.push(st);
     }
 
-    // header_size includes its own varint length!
-    // Check if adding varint_len(header_size) crosses a varint boundary (e.g. 127 -> 128).
     let mut hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 1) as u64);
     if varint_len(hdr_len as u64) + serial_bytes_len != hdr_len {
         hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 2) as u64);
@@ -357,9 +809,94 @@ pub fn encode_record_into(values: &[Value], enc: TextEncoding, out: &mut Vec<u8>
     }
 }
 
-/// Serializes a slice of [`Value`] references into an SQLite Format-3 record using `enc`
-/// (`OP_MakeRecord`), reusing `out`'s existing allocation without cloning [`Value`]s.
+/// Serializes [`Value`]s into `out` as `P3v1` (`is_p3v1 == true`) or Format-3 (`is_p3v1 == false`).
+#[inline]
+pub fn encode_record_for_format_into(
+    values: &[Value],
+    enc: TextEncoding,
+    is_p3v1: bool,
+    out: &mut Vec<u8>,
+) {
+    if is_p3v1 {
+        encode_record_into(values, enc, out);
+    } else {
+        encode_record_format3_into(values, enc, out);
+    }
+}
+
+/// Serializes a slice of [`Value`] references into a `P3v1` record using `enc`,
+/// reusing `out`'s existing allocation without cloning [`Value`]s.
 pub fn encode_value_refs_record_into(values: &[&Value], enc: TextEncoding, out: &mut Vec<u8>) {
+    let n = values.len();
+    if n <= 16 {
+        let mut hdr_buf = [0u8; 34];
+        let mut tags = [0u8; 16];
+        let mut body_len = 0usize;
+        for (i, &v) in values.iter().enumerate() {
+            let (tag, len) = p3v1_tag_for_value(v, enc);
+            body_len += len;
+            tags[i] = tag;
+            if body_len < 4096 {
+                let desc = ((body_len as u16) << 4) | u16::from(tag);
+                let db = desc.to_le_bytes();
+                hdr_buf[2 + 2 * i] = db[0];
+                hdr_buf[2 + 2 * i + 1] = db[1];
+            }
+        }
+        if body_len >= 4096 {
+            encode_p3v1_wide_value_refs_into(values, enc, out);
+            return;
+        }
+        hdr_buf[0] = P3V1_RECORD_MAGIC;
+        hdr_buf[1] = n as u8;
+        let hdr_len = 2 + 2 * n;
+        out.clear();
+        out.reserve(hdr_len + body_len);
+        out.extend_from_slice(&hdr_buf[..hdr_len]);
+        for (&v, &tag) in values.iter().zip(tags[..n].iter()) {
+            write_p3v1_value(out, v, tag, enc);
+        }
+        return;
+    }
+    if n < 128 {
+        let mut hdr_buf = [0u8; 258];
+        let mut tags = [0u8; 128];
+        let mut body_len = 0usize;
+        for (i, &v) in values.iter().enumerate() {
+            let (tag, len) = p3v1_tag_for_value(v, enc);
+            body_len += len;
+            tags[i] = tag;
+            if body_len < 4096 {
+                let desc = ((body_len as u16) << 4) | u16::from(tag);
+                let db = desc.to_le_bytes();
+                hdr_buf[2 + 2 * i] = db[0];
+                hdr_buf[2 + 2 * i + 1] = db[1];
+            }
+        }
+        if body_len >= 4096 {
+            encode_p3v1_wide_value_refs_into(values, enc, out);
+            return;
+        }
+        hdr_buf[0] = P3V1_RECORD_MAGIC;
+        hdr_buf[1] = n as u8;
+        let hdr_len = 2 + 2 * n;
+        out.clear();
+        out.reserve(hdr_len + body_len);
+        out.extend_from_slice(&hdr_buf[..hdr_len]);
+        for (&v, &tag) in values.iter().zip(tags[..n].iter()) {
+            write_p3v1_value(out, v, tag, enc);
+        }
+        return;
+    }
+    encode_p3v1_wide_value_refs_into(values, enc, out);
+}
+
+/// Serializes a slice of [`Value`] references into an explicit Format-3 record using `enc`.
+pub fn encode_value_refs_record_format3_into(
+    values: &[&Value],
+    enc: TextEncoding,
+    out: &mut Vec<u8>,
+) {
     out.clear();
     if values.len() <= 16 {
         let mut serials = [0u64; 16];
@@ -411,16 +948,101 @@ pub fn encode_value_refs_record_into(values: &[&Value], enc: TextEncoding, out: 
     }
 }
 
-/// Serializes a slice of [`Value`]s into an SQLite Format-3 record using `enc` (`OP_MakeRecord`).
+/// Serializes [`Value`] references into `out` as `P3v1` or Format-3.
+#[inline]
+pub fn encode_value_refs_record_for_format_into(
+    values: &[&Value],
+    enc: TextEncoding,
+    is_p3v1: bool,
+    out: &mut Vec<u8>,
+) {
+    if is_p3v1 {
+        encode_value_refs_record_into(values, enc, out);
+    } else {
+        encode_value_refs_record_format3_into(values, enc, out);
+    }
+}
+
+/// Serializes a slice of [`Value`]s into a `P3v1` record using `enc` (`OP_MakeRecord`).
 pub fn encode_record_with_encoding(values: &[Value], enc: TextEncoding) -> Vec<u8> {
     let mut out = Vec::new();
     encode_record_into(values, enc, &mut out);
     out
 }
 
-/// Serializes a slice of [`RuntimeValue`] registers directly into `out`, reusing `out`'s capacity
-/// without cloning intermediate [`Value`] elements (`OP_MakeRecord`).
+/// Serializes a slice of [`RuntimeValue`] registers directly into `out` as a `P3v1` record,
+/// reusing `out`'s capacity without cloning intermediate [`Value`] elements (`OP_MakeRecord`).
 pub fn encode_runtime_record_into(values: &[RuntimeValue], enc: TextEncoding, out: &mut Vec<u8>) {
+    let n = values.len();
+    if n <= 16 {
+        let mut hdr_buf = [0u8; 34];
+        let mut tags = [0u8; 16];
+        let mut body_len = 0usize;
+        for (i, rv) in values.iter().enumerate() {
+            let (tag, len) = p3v1_tag_for_value(&rv.value, enc);
+            body_len += len;
+            tags[i] = tag;
+            if body_len < 4096 {
+                let desc = ((body_len as u16) << 4) | u16::from(tag);
+                let db = desc.to_le_bytes();
+                hdr_buf[2 + 2 * i] = db[0];
+                hdr_buf[2 + 2 * i + 1] = db[1];
+            }
+        }
+        if body_len >= 4096 {
+            encode_p3v1_wide_runtime_into(values, enc, out);
+            return;
+        }
+        hdr_buf[0] = P3V1_RECORD_MAGIC;
+        hdr_buf[1] = n as u8;
+        let hdr_len = 2 + 2 * n;
+        out.clear();
+        out.reserve(hdr_len + body_len);
+        out.extend_from_slice(&hdr_buf[..hdr_len]);
+        for (rv, &tag) in values.iter().zip(tags[..n].iter()) {
+            write_p3v1_value(out, &rv.value, tag, enc);
+        }
+        return;
+    }
+    if n < 128 {
+        let mut hdr_buf = [0u8; 258];
+        let mut tags = [0u8; 128];
+        let mut body_len = 0usize;
+        for (i, rv) in values.iter().enumerate() {
+            let (tag, len) = p3v1_tag_for_value(&rv.value, enc);
+            body_len += len;
+            tags[i] = tag;
+            if body_len < 4096 {
+                let desc = ((body_len as u16) << 4) | u16::from(tag);
+                let db = desc.to_le_bytes();
+                hdr_buf[2 + 2 * i] = db[0];
+                hdr_buf[2 + 2 * i + 1] = db[1];
+            }
+        }
+        if body_len >= 4096 {
+            encode_p3v1_wide_runtime_into(values, enc, out);
+            return;
+        }
+        hdr_buf[0] = P3V1_RECORD_MAGIC;
+        hdr_buf[1] = n as u8;
+        let hdr_len = 2 + 2 * n;
+        out.clear();
+        out.reserve(hdr_len + body_len);
+        out.extend_from_slice(&hdr_buf[..hdr_len]);
+        for (rv, &tag) in values.iter().zip(tags[..n].iter()) {
+            write_p3v1_value(out, &rv.value, tag, enc);
+        }
+        return;
+    }
+    encode_p3v1_wide_runtime_into(values, enc, out);
+}
+
+/// Serializes [`RuntimeValue`]s into an explicit Format-3 record using `enc`.
+pub fn encode_runtime_record_format3_into(
+    values: &[RuntimeValue],
+    enc: TextEncoding,
+    out: &mut Vec<u8>,
+) {
     out.clear();
     if values.len() <= 16 {
         let mut serials = [0u64; 16];
@@ -472,7 +1094,22 @@ pub fn encode_runtime_record_into(values: &[RuntimeValue], enc: TextEncoding, ou
     }
 }
 
-/// Serializes a slice of [`RuntimeValue`] registers directly into an SQLite Format-3 record
+/// Serializes [`RuntimeValue`]s into `out` as `P3v1` or Format-3.
+#[inline]
+pub fn encode_runtime_record_for_format_into(
+    values: &[RuntimeValue],
+    enc: TextEncoding,
+    is_p3v1: bool,
+    out: &mut Vec<u8>,
+) {
+    if is_p3v1 {
+        encode_runtime_record_into(values, enc, out);
+    } else {
+        encode_runtime_record_format3_into(values, enc, out);
+    }
+}
+
+/// Serializes a slice of [`RuntimeValue`] registers directly into a `P3v1` record
 /// without cloning intermediate [`Value`] elements (`OP_MakeRecord`).
 pub fn encode_runtime_record_with_encoding(values: &[RuntimeValue], enc: TextEncoding) -> Vec<u8> {
     let mut out = Vec::new();
@@ -500,6 +1137,294 @@ fn write_serial_value(out: &mut Vec<u8>, value: &Value, serial_type: u64, enc: T
         (Value::Text(s), _) => enc.encode_into(s, out),
         _ => unreachable!("serial_type matched value in encode_record"),
     }
+}
+
+#[inline(always)]
+fn p3v1_tag_for_raw_field(field: RawField<'_>) -> (u8, usize) {
+    match field {
+        RawField::Null => (P3V1_TAG_NULL, 0),
+        RawField::Int(x) => {
+            if x == 0 {
+                (P3V1_TAG_ZERO, 0)
+            } else if x == 1 {
+                (P3V1_TAG_ONE, 0)
+            } else if i64::from(x as i8) == x {
+                (P3V1_TAG_I8, 1)
+            } else if i64::from(x as i16) == x {
+                (P3V1_TAG_I16_LE, 2)
+            } else if i64::from(x as i32) == x {
+                (P3V1_TAG_I32_LE, 4)
+            } else {
+                (P3V1_TAG_I64_LE, 8)
+            }
+        }
+        RawField::Float(r) => {
+            if r.is_nan() {
+                (P3V1_TAG_NULL, 0)
+            } else {
+                (P3V1_TAG_F64_LE, 8)
+            }
+        }
+        RawField::Blob(b) => {
+            if b.is_empty() {
+                (P3V1_TAG_EMPTY_BLOB, 0)
+            } else {
+                (P3V1_TAG_BLOB, b.len())
+            }
+        }
+        RawField::Text(b) => {
+            if b.is_empty() {
+                (P3V1_TAG_EMPTY_TEXT, 0)
+            } else {
+                (P3V1_TAG_TEXT, b.len())
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn write_p3v1_raw_field(out: &mut Vec<u8>, field: RawField<'_>, tag: u8) {
+    match (field, tag) {
+        (RawField::Null, _)
+        | (
+            _,
+            P3V1_TAG_NULL | P3V1_TAG_ZERO | P3V1_TAG_ONE | P3V1_TAG_EMPTY_BLOB
+            | P3V1_TAG_EMPTY_TEXT,
+        ) => {}
+        (RawField::Int(i), P3V1_TAG_I8) => out.push(i as u8),
+        (RawField::Int(i), P3V1_TAG_I16_LE) => out.extend_from_slice(&(i as i16).to_le_bytes()),
+        (RawField::Int(i), P3V1_TAG_I32_LE) => out.extend_from_slice(&(i as i32).to_le_bytes()),
+        (RawField::Int(i), P3V1_TAG_I64_LE) => out.extend_from_slice(&i.to_le_bytes()),
+        (RawField::Float(r), P3V1_TAG_F64_LE) => out.extend_from_slice(&r.to_bits().to_le_bytes()),
+        (RawField::Blob(b), P3V1_TAG_BLOB) | (RawField::Text(b), P3V1_TAG_TEXT) => {
+            out.extend_from_slice(b);
+        }
+        _ => unreachable!("p3v1 tag matched RawField"),
+    }
+}
+
+#[inline(always)]
+fn serial_type_for_raw_field(field: RawField<'_>) -> (u64, usize) {
+    match field {
+        RawField::Null => (0, 0),
+        RawField::Int(i) => {
+            if i == 0 {
+                return (8, 0);
+            }
+            if i == 1 {
+                return (9, 0);
+            }
+            let u = if i < 0 { (!i) as u64 } else { i as u64 };
+            if u <= 127 {
+                (1, 1)
+            } else if u <= 32_767 {
+                (2, 2)
+            } else if u <= 8_388_607 {
+                (3, 3)
+            } else if u <= 2_147_483_647 {
+                (4, 4)
+            } else if u <= MAX_6BYTE_INT {
+                (5, 6)
+            } else {
+                (6, 8)
+            }
+        }
+        RawField::Float(r) => {
+            if r.is_nan() {
+                (0, 0)
+            } else {
+                (7, 8)
+            }
+        }
+        RawField::Blob(b) => ((b.len() as u64) * 2 + 12, b.len()),
+        RawField::Text(b) => ((b.len() as u64) * 2 + 13, b.len()),
+    }
+}
+
+#[inline(always)]
+fn write_format3_raw_field(out: &mut Vec<u8>, field: RawField<'_>, st: u64) {
+    match (field, st) {
+        (RawField::Null, _) | (_, 0 | 8 | 9) => {}
+        (RawField::Int(i), 1) => out.push(i as u8),
+        (RawField::Int(i), 2) => out.extend_from_slice(&(i as i16).to_be_bytes()),
+        (RawField::Int(i), 3) => {
+            let b = (i as i32).to_be_bytes();
+            out.extend_from_slice(&b[1..4]);
+        }
+        (RawField::Int(i), 4) => out.extend_from_slice(&(i as i32).to_be_bytes()),
+        (RawField::Int(i), 5) => {
+            let b = i.to_be_bytes();
+            out.extend_from_slice(&b[2..8]);
+        }
+        (RawField::Int(i), 6) => out.extend_from_slice(&i.to_be_bytes()),
+        (RawField::Float(r), 7) => out.extend_from_slice(&r.to_bits().to_be_bytes()),
+        (RawField::Blob(b) | RawField::Text(b), _) => out.extend_from_slice(b),
+        _ => unreachable!(),
+    }
+}
+
+/// Serializes borrowed [`RawField`] slices directly into `out` as `P3v1` or Format-3 without
+/// intermediate [`Value`] allocations (used by `SingleRowUpdatePlan`, `SingleRowDeletePlan`,
+/// and bulk `CREATE INDEX`).
+pub fn encode_raw_fields_for_format_into(
+    fields: &[RawField<'_>],
+    is_p3v1: bool,
+    out: &mut Vec<u8>,
+) {
+    if is_p3v1 {
+        let n = fields.len();
+        if n <= 16 {
+            let mut hdr_buf = [0u8; 34];
+            let mut tags = [0u8; 16];
+            let mut body_len = 0usize;
+            for (i, &f) in fields.iter().enumerate() {
+                let (tag, len) = p3v1_tag_for_raw_field(f);
+                body_len += len;
+                tags[i] = tag;
+                if body_len < 4096 {
+                    let desc = ((body_len as u16) << 4) | u16::from(tag);
+                    let db = desc.to_le_bytes();
+                    hdr_buf[2 + 2 * i] = db[0];
+                    hdr_buf[2 + 2 * i + 1] = db[1];
+                }
+            }
+            if body_len < 4096 {
+                hdr_buf[0] = P3V1_RECORD_MAGIC;
+                hdr_buf[1] = n as u8;
+                let hdr_len = 2 + 2 * n;
+                out.clear();
+                out.reserve(hdr_len + body_len);
+                out.extend_from_slice(&hdr_buf[..hdr_len]);
+                for (&f, &tag) in fields.iter().zip(tags[..n].iter()) {
+                    write_p3v1_raw_field(out, f, tag);
+                }
+                return;
+            }
+        }
+        if n < 128 {
+            let mut hdr_buf = [0u8; 258];
+            let mut tags = [0u8; 128];
+            let mut body_len = 0usize;
+            for (i, &f) in fields.iter().enumerate() {
+                let (tag, len) = p3v1_tag_for_raw_field(f);
+                body_len += len;
+                tags[i] = tag;
+                if body_len < 4096 {
+                    let desc = ((body_len as u16) << 4) | u16::from(tag);
+                    let db = desc.to_le_bytes();
+                    hdr_buf[2 + 2 * i] = db[0];
+                    hdr_buf[2 + 2 * i + 1] = db[1];
+                }
+            }
+            if body_len < 4096 {
+                hdr_buf[0] = P3V1_RECORD_MAGIC;
+                hdr_buf[1] = n as u8;
+                let hdr_len = 2 + 2 * n;
+                out.clear();
+                out.reserve(hdr_len + body_len);
+                out.extend_from_slice(&hdr_buf[..hdr_len]);
+                for (&f, &tag) in fields.iter().zip(tags[..n].iter()) {
+                    write_p3v1_raw_field(out, f, tag);
+                }
+                return;
+            }
+        }
+        if n <= usize::from(u16::MAX) {
+            let hdr_len = 4 + 5 * n;
+            let mut tags = Vec::with_capacity(n);
+            let mut ends = Vec::with_capacity(n);
+            let mut body_len = 0usize;
+            for &f in fields {
+                let (tag, len) = p3v1_tag_for_raw_field(f);
+                body_len += len;
+                tags.push(tag);
+                ends.push(body_len as u32);
+            }
+            out.clear();
+            out.reserve(hdr_len + body_len);
+            out.push(P3V1_RECORD_MAGIC);
+            out.push(P3V1_WIDE_FLAG);
+            out.extend_from_slice(&(n as u16).to_le_bytes());
+            out.extend_from_slice(&tags);
+            for &end in &ends {
+                out.extend_from_slice(&end.to_le_bytes());
+            }
+            for (&f, &tag) in fields.iter().zip(tags.iter()) {
+                write_p3v1_raw_field(out, f, tag);
+            }
+            return;
+        }
+    }
+
+    out.clear();
+    if fields.len() <= 16 {
+        let mut serials = [0u64; 16];
+        let mut serial_bytes_len = 0usize;
+        let mut body_len = 0usize;
+        for (i, &f) in fields.iter().enumerate() {
+            let (st, len) = serial_type_for_raw_field(f);
+            serial_bytes_len += varint_len(st);
+            body_len += len;
+            serials[i] = st;
+        }
+        let mut hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 1) as u64);
+        if varint_len(hdr_len as u64) + serial_bytes_len != hdr_len {
+            hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 2) as u64);
+        }
+        out.reserve(hdr_len + body_len);
+        push_varint(out, hdr_len as u64);
+        for &st in &serials[..fields.len()] {
+            push_varint(out, st);
+        }
+        for (&f, &st) in fields.iter().zip(serials[..fields.len()].iter()) {
+            write_format3_raw_field(out, f, st);
+        }
+        return;
+    }
+    let mut serials = Vec::with_capacity(fields.len());
+    let mut serial_bytes_len = 0usize;
+    let mut body_len = 0usize;
+    for &f in fields {
+        let (st, len) = serial_type_for_raw_field(f);
+        serial_bytes_len += varint_len(st);
+        body_len += len;
+        serials.push(st);
+    }
+    let mut hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 1) as u64);
+    if varint_len(hdr_len as u64) + serial_bytes_len != hdr_len {
+        hdr_len = serial_bytes_len + varint_len((serial_bytes_len + 2) as u64);
+    }
+    out.reserve(hdr_len + body_len);
+    push_varint(out, hdr_len as u64);
+    for &st in &serials {
+        push_varint(out, st);
+    }
+    for (&f, &st) in fields.iter().zip(serials.iter()) {
+        write_format3_raw_field(out, f, st);
+    }
+}
+
+/// Losslessly transcodes a `P3v1` record (`record[0] == 0x00`) into an equivalent Format-3
+/// record in `out`, preserving raw `TEXT` / `BLOB` encodings (`UTF-8`, `UTF-16le`, `UTF-16be`)
+/// byte-for-byte. If `record` is already Format-3, copies `record` into `out`.
+pub fn transcode_p3v1_to_format3(record: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    if !is_p3v1_record(record) {
+        out.clear();
+        out.extend_from_slice(record);
+        return Ok(());
+    }
+    let (n, _hdr_len, _is_wide) = p3v1_header_info(record)?;
+    let mut fields = Vec::with_capacity(n);
+    for col_idx in 0..n {
+        let (start, end, tag) =
+            p3v1_column_offset_and_tag(record, col_idx)?.ok_or_else(err_corrupt_p3v1_record)?;
+        if end > record.len() {
+            return Err(err_corrupt_p3v1_record());
+        }
+        fields.push(RawField::from_p3v1_tag(tag, &record[start..end])?);
+    }
+    encode_raw_fields_for_format_into(&fields, false, out);
+    Ok(())
 }
 
 /// Decodes a single value given its `serial_type` and exact byte slice under UTF-8 (`sqlite3VdbeSerialGet`).
@@ -629,6 +1554,127 @@ pub fn decode_serial_value_pooled(
     }
 }
 
+/// Decodes a single `P3v1` column value given its 4-bit `tag` and exact byte slice under `enc`.
+#[inline]
+pub fn decode_p3v1_tag_value_with_encoding(
+    tag: u8,
+    buf: &[u8],
+    enc: TextEncoding,
+) -> Result<Value> {
+    match tag {
+        P3V1_TAG_NULL => Ok(Value::Null),
+        P3V1_TAG_ZERO => Ok(Value::Integer(0)),
+        P3V1_TAG_ONE => Ok(Value::Integer(1)),
+        P3V1_TAG_I8 => Ok(Value::Integer(i64::from(buf[0] as i8))),
+        P3V1_TAG_I16_LE => Ok(Value::Integer(i64::from(i16::from_le_bytes([
+            buf[0], buf[1],
+        ])))),
+        P3V1_TAG_I32_LE => Ok(Value::Integer(i64::from(i32::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3],
+        ])))),
+        P3V1_TAG_I64_LE => Ok(Value::Integer(i64::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]))),
+        P3V1_TAG_F64_LE => {
+            let bits = u64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]);
+            Ok(Value::real(f64::from_bits(bits)))
+        }
+        P3V1_TAG_EMPTY_BLOB => Ok(Value::Blob(Vec::new())),
+        P3V1_TAG_EMPTY_TEXT => Ok(Value::Text(String::new())),
+        P3V1_TAG_BLOB => Ok(Value::Blob(buf.to_vec())),
+        P3V1_TAG_TEXT => Ok(Value::Text(enc.decode_bytes(buf))),
+        _ => Err(err_corrupt_p3v1_record()),
+    }
+}
+
+/// Decodes a single `P3v1` column value reusing recycled `String` / `Vec<u8>` buffers.
+#[inline]
+pub fn decode_p3v1_tag_value_pooled(
+    tag: u8,
+    buf: &[u8],
+    enc: TextEncoding,
+    texts: &mut Vec<String>,
+    blobs: &mut Vec<Vec<u8>>,
+) -> Result<Value> {
+    match tag {
+        P3V1_TAG_NULL => Ok(Value::Null),
+        P3V1_TAG_ZERO => Ok(Value::Integer(0)),
+        P3V1_TAG_ONE => Ok(Value::Integer(1)),
+        P3V1_TAG_I8 => Ok(Value::Integer(i64::from(buf[0] as i8))),
+        P3V1_TAG_I16_LE => Ok(Value::Integer(i64::from(i16::from_le_bytes([
+            buf[0], buf[1],
+        ])))),
+        P3V1_TAG_I32_LE => Ok(Value::Integer(i64::from(i32::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3],
+        ])))),
+        P3V1_TAG_I64_LE => Ok(Value::Integer(i64::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]))),
+        P3V1_TAG_F64_LE => {
+            let bits = u64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]);
+            Ok(Value::real(f64::from_bits(bits)))
+        }
+        P3V1_TAG_EMPTY_BLOB => {
+            let mut b = blobs.pop().unwrap_or_default();
+            b.clear();
+            Ok(Value::Blob(b))
+        }
+        P3V1_TAG_EMPTY_TEXT => {
+            let mut s = texts.pop().unwrap_or_default();
+            s.clear();
+            Ok(Value::Text(s))
+        }
+        P3V1_TAG_BLOB => {
+            let mut b = blobs.pop().unwrap_or_default();
+            b.clear();
+            b.extend_from_slice(buf);
+            Ok(Value::Blob(b))
+        }
+        P3V1_TAG_TEXT => match enc {
+            TextEncoding::Utf8 => match std::str::from_utf8(buf) {
+                Ok(s) => {
+                    let mut out_s = texts.pop().unwrap_or_default();
+                    out_s.clear();
+                    out_s.push_str(s);
+                    Ok(Value::Text(out_s))
+                }
+                Err(_) => Ok(Value::Text(String::from_utf8_lossy(buf).into_owned())),
+            },
+            _ => Ok(Value::Text(enc.decode_bytes(buf))),
+        },
+        _ => Err(err_corrupt_p3v1_record()),
+    }
+}
+
+/// Returns the number of columns in `record` (`O(1)` for `P3v1`, varint header walk for Format-3).
+#[inline]
+pub fn record_column_count(record: &[u8]) -> Result<usize> {
+    if record.is_empty() {
+        return Ok(0);
+    }
+    if is_p3v1_record(record) {
+        let (n, _, _) = p3v1_header_info(record)?;
+        return Ok(n);
+    }
+    let (hdr_u64, mut hdr_pos) = get_varint(record)?;
+    let hdr_size = usize::try_from(hdr_u64)
+        .map_err(|_| SqliteError::corrupt("record header size overflow"))?;
+    if hdr_size > record.len() || hdr_pos > hdr_size {
+        return Err(SqliteError::corrupt("record header exceeds record length"));
+    }
+    let mut n = 0usize;
+    while hdr_pos < hdr_size {
+        let (_, used) = get_varint(&record[hdr_pos..hdr_size])?;
+        hdr_pos += used;
+        n += 1;
+    }
+    Ok(n)
+}
+
 /// Decodes all columns from a serialized UTF-8 SQLite record.
 pub fn decode_record(record: &[u8]) -> Result<Vec<Value>> {
     decode_record_with_encoding(record, TextEncoding::Utf8)
@@ -638,6 +1684,49 @@ pub fn decode_record(record: &[u8]) -> Result<Vec<Value>> {
 pub fn decode_record_with_encoding(record: &[u8], enc: TextEncoding) -> Result<Vec<Value>> {
     if record.is_empty() {
         return Ok(Vec::new());
+    }
+    if is_p3v1_record(record) {
+        let (n, hdr_len, is_wide) = p3v1_header_info(record)?;
+        let mut values = Vec::with_capacity(n);
+        if !is_wide {
+            let mut prev_end = 0usize;
+            for col_idx in 0..n {
+                let d = u16::from_le_bytes([record[2 + 2 * col_idx], record[3 + 2 * col_idx]]);
+                let tag = (d & 0x0f) as u8;
+                let end_rel = usize::from(d >> 4);
+                if tag > P3V1_TAG_TEXT || prev_end > end_rel {
+                    return Err(err_corrupt_p3v1_record());
+                }
+                if tag < P3V1_TAG_BLOB && (end_rel - prev_end) != p3v1_fixed_tag_width(tag) {
+                    return Err(err_corrupt_p3v1_record());
+                }
+                let start = hdr_len + prev_end;
+                let end = hdr_len + end_rel;
+                if end > record.len() {
+                    return Err(SqliteError::corrupt("record payload truncated"));
+                }
+                values.push(decode_p3v1_tag_value_with_encoding(
+                    tag,
+                    &record[start..end],
+                    enc,
+                )?);
+                prev_end = end_rel;
+            }
+        } else {
+            for col_idx in 0..n {
+                let (start, end, tag) = p3v1_column_offset_and_tag(record, col_idx)?
+                    .ok_or_else(err_corrupt_p3v1_record)?;
+                if end > record.len() {
+                    return Err(SqliteError::corrupt("record payload truncated"));
+                }
+                values.push(decode_p3v1_tag_value_with_encoding(
+                    tag,
+                    &record[start..end],
+                    enc,
+                )?);
+            }
+        }
+        return Ok(values);
     }
     let (hdr_size_u64, mut hdr_pos) = get_varint(record)?;
     let hdr_size = usize::try_from(hdr_size_u64)
@@ -674,8 +1763,7 @@ pub fn decode_record_column(record: &[u8], col_idx: usize) -> Result<Option<Valu
 }
 
 /// Fast single-column extraction (`OP_Column`) under `enc`: decodes only column `col_idx` (0-based).
-/// If the record has fewer columns than `col_idx + 1` (e.g. after `ALTER TABLE ADD COLUMN`),
-/// returns `Ok(None)` so the caller can substitute the column's `DEFAULT` value (`NULL` if none).
+/// On `P3v1` records, projects `col_idx` in true `O(1)` time without scanning columns `0..col_idx`.
 pub fn decode_record_column_with_encoding(
     record: &[u8],
     col_idx: usize,
@@ -683,6 +1771,19 @@ pub fn decode_record_column_with_encoding(
 ) -> Result<Option<Value>> {
     if record.is_empty() {
         return Ok(None);
+    }
+    if is_p3v1_record(record) {
+        let Some((start, end, tag)) = p3v1_column_offset_and_tag(record, col_idx)? else {
+            return Ok(None);
+        };
+        if end > record.len() {
+            return Err(SqliteError::corrupt("record payload truncated"));
+        }
+        return Ok(Some(decode_p3v1_tag_value_with_encoding(
+            tag,
+            &record[start..end],
+            enc,
+        )?));
     }
     let (hdr_size_u64, mut hdr_pos) = get_varint(record)?;
     let hdr_size = usize::try_from(hdr_size_u64)
@@ -867,6 +1968,62 @@ pub fn compare_records_with_encoding(
     if lhs_record.is_empty() {
         return Ok(Ordering::Equal);
     }
+    if is_p3v1_record(lhs_record) {
+        let (n, hdr_len, is_wide) = p3v1_header_info(lhs_record)?;
+        let default_spec = KeySortOrder::default();
+        let stop = n.min(rhs_values.len());
+        if !is_wide {
+            if n > 0 {
+                let last_d =
+                    u16::from_le_bytes([lhs_record[2 + 2 * (n - 1)], lhs_record[3 + 2 * (n - 1)]]);
+                let last_tag = (last_d & 0x0f) as u8;
+                let last_end = hdr_len + usize::from(last_d >> 4);
+                if last_tag > P3V1_TAG_TEXT || last_end > lhs_record.len() {
+                    return Err(err_corrupt_p3v1_record());
+                }
+            }
+            let mut prev_end = 0usize;
+            for col_idx in 0..stop {
+                let d =
+                    u16::from_le_bytes([lhs_record[2 + 2 * col_idx], lhs_record[3 + 2 * col_idx]]);
+                let tag = (d & 0x0f) as u8;
+                let end_rel = usize::from(d >> 4);
+                if tag > P3V1_TAG_TEXT || prev_end > end_rel {
+                    return Err(err_corrupt_p3v1_record());
+                }
+                if tag < P3V1_TAG_BLOB && (end_rel - prev_end) != p3v1_fixed_tag_width(tag) {
+                    return Err(err_corrupt_p3v1_record());
+                }
+                let start = hdr_len + prev_end;
+                let end = hdr_len + end_rel;
+                if end > lhs_record.len() {
+                    return Err(SqliteError::corrupt("record payload truncated"));
+                }
+                let f = RawField::from_p3v1_tag(tag, &lhs_record[start..end])?;
+                let spec = orders.get(col_idx).unwrap_or(&default_spec);
+                let ord = f.compare_key_to_value(&rhs_values[col_idx], spec, enc)?;
+                if ord != Ordering::Equal {
+                    return Ok(ord);
+                }
+                prev_end = end_rel;
+            }
+            return Ok(Ordering::Equal);
+        }
+        for (col_idx, rhs_val) in rhs_values.iter().enumerate().take(stop) {
+            let (start, end, tag) = p3v1_column_offset_and_tag(lhs_record, col_idx)?
+                .ok_or_else(err_corrupt_p3v1_record)?;
+            if end > lhs_record.len() {
+                return Err(SqliteError::corrupt("record payload truncated"));
+            }
+            let f = RawField::from_p3v1_tag(tag, &lhs_record[start..end])?;
+            let spec = orders.get(col_idx).unwrap_or(&default_spec);
+            let ord = f.compare_key_to_value(rhs_val, spec, enc)?;
+            if ord != Ordering::Equal {
+                return Ok(ord);
+            }
+        }
+        return Ok(Ordering::Equal);
+    }
     let (hdr_size_u64, mut hdr_pos) = get_varint(lhs_record)?;
     let hdr_size = usize::try_from(hdr_size_u64)
         .map_err(|_| SqliteError::corrupt("record header size overflow"))?;
@@ -950,7 +2107,7 @@ pub fn compare_records_with_encoding(
     Ok(decided)
 }
 
-/// Borrowed field view decoded directly from a raw SQLite Format-3 record slice without
+/// Borrowed field view decoded directly from a raw `P3v1` or Format-3 record slice without
 /// heap allocation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RawField<'a> {
@@ -962,6 +2119,38 @@ pub enum RawField<'a> {
 }
 
 impl<'a> RawField<'a> {
+    #[inline(always)]
+    pub fn from_p3v1_tag(tag: u8, buf: &'a [u8]) -> Result<Self> {
+        match tag {
+            P3V1_TAG_NULL => Ok(Self::Null),
+            P3V1_TAG_ZERO => Ok(Self::Int(0)),
+            P3V1_TAG_ONE => Ok(Self::Int(1)),
+            P3V1_TAG_I8 => Ok(Self::Int(i64::from(buf[0] as i8))),
+            P3V1_TAG_I16_LE => Ok(Self::Int(i64::from(i16::from_le_bytes([buf[0], buf[1]])))),
+            P3V1_TAG_I32_LE => Ok(Self::Int(i64::from(i32::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3],
+            ])))),
+            P3V1_TAG_I64_LE => Ok(Self::Int(i64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]))),
+            P3V1_TAG_F64_LE => {
+                let r = f64::from_bits(u64::from_le_bytes([
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                ]));
+                if r.is_nan() {
+                    Ok(Self::Null)
+                } else {
+                    Ok(Self::Float(r))
+                }
+            }
+            P3V1_TAG_EMPTY_BLOB => Ok(Self::Blob(&[])),
+            P3V1_TAG_EMPTY_TEXT => Ok(Self::Text(&[])),
+            P3V1_TAG_BLOB => Ok(Self::Blob(buf)),
+            P3V1_TAG_TEXT => Ok(Self::Text(buf)),
+            _ => Err(err_corrupt_p3v1_record()),
+        }
+    }
+
     #[inline(always)]
     pub fn from_serial(serial_type: u64, buf: &'a [u8]) -> Result<Self> {
         match serial_type {
@@ -1117,6 +2306,41 @@ pub fn parse_raw_record_prefix<'a>(
     if raw.is_empty() || out_fields.is_empty() {
         return Ok(0);
     }
+    if is_p3v1_record(raw) {
+        let (n, hdr_len, is_wide) = p3v1_header_info(raw)?;
+        let stop = n.min(out_fields.len());
+        if !is_wide {
+            let mut prev_end = 0usize;
+            for (col_idx, dst) in out_fields[..stop].iter_mut().enumerate() {
+                let d = u16::from_le_bytes([raw[2 + 2 * col_idx], raw[3 + 2 * col_idx]]);
+                let tag = (d & 0x0f) as u8;
+                let end_rel = usize::from(d >> 4);
+                if tag > P3V1_TAG_TEXT || prev_end > end_rel {
+                    return Err(err_corrupt_p3v1_record());
+                }
+                if tag < P3V1_TAG_BLOB && (end_rel - prev_end) != p3v1_fixed_tag_width(tag) {
+                    return Err(err_corrupt_p3v1_record());
+                }
+                let start = hdr_len + prev_end;
+                let end = hdr_len + end_rel;
+                if end > raw.len() {
+                    return Err(SqliteError::corrupt("record payload truncated"));
+                }
+                *dst = RawField::from_p3v1_tag(tag, &raw[start..end])?;
+                prev_end = end_rel;
+            }
+            return Ok(stop);
+        }
+        for (col_idx, dst) in out_fields[..stop].iter_mut().enumerate() {
+            let (start, end, tag) =
+                p3v1_column_offset_and_tag(raw, col_idx)?.ok_or_else(err_corrupt_p3v1_record)?;
+            if end > raw.len() {
+                return Err(SqliteError::corrupt("record payload truncated"));
+            }
+            *dst = RawField::from_p3v1_tag(tag, &raw[start..end])?;
+        }
+        return Ok(stop);
+    }
     let (hdr_u64, mut hdr_pos) = get_varint(raw)?;
     let hdr_size = usize::try_from(hdr_u64)
         .map_err(|_| SqliteError::corrupt("record header size overflow"))?;
@@ -1144,10 +2368,20 @@ pub fn parse_raw_record_prefix<'a>(
 }
 
 /// Reads a single column `col_idx` directly as a borrowed [`RawField`] without heap allocation.
+/// On `P3v1` records, executes in true `O(1)` time without scanning columns `0..col_idx`.
 #[inline]
 pub fn read_raw_record_field(raw: &[u8], col_idx: usize) -> Result<Option<RawField<'_>>> {
     if raw.is_empty() {
         return Ok(None);
+    }
+    if is_p3v1_record(raw) {
+        let Some((start, end, tag)) = p3v1_column_offset_and_tag(raw, col_idx)? else {
+            return Ok(None);
+        };
+        if end > raw.len() {
+            return Err(SqliteError::corrupt("record payload truncated"));
+        }
+        return Ok(Some(RawField::from_p3v1_tag(tag, &raw[start..end])?));
     }
     let (hdr_u64, mut hdr_pos) = get_varint(raw)?;
     let hdr_size = usize::try_from(hdr_u64)
@@ -1179,6 +2413,116 @@ pub fn read_raw_record_field(raw: &[u8], col_idx: usize) -> Result<Option<RawFie
     Ok(None)
 }
 
+/// Reads an integer column `col_idx` in `O(1)` time on `P3v1` records (with Format-3 fallback).
+/// Returns `Ok(None)` if `col_idx >= col_count` or the column is not an SQL `INTEGER`.
+#[inline(always)]
+pub fn read_raw_record_int_at(raw: &[u8], col_idx: usize) -> Result<Option<i64>> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if raw[0] == P3V1_RECORD_MAGIC {
+        let Some((start, end, tag)) = p3v1_column_offset_and_tag(raw, col_idx)? else {
+            return Ok(None);
+        };
+        if end > raw.len() {
+            return Err(SqliteError::corrupt("record payload truncated"));
+        }
+        return Ok(decode_p3v1_int_tag(tag, &raw[start..end]));
+    }
+    Ok(match read_raw_record_field(raw, col_idx)? {
+        Some(RawField::Int(v)) => Some(v),
+        _ => None,
+    })
+}
+
+/// Reads two integer columns `(col0, col1)` in `O(1)` time on `P3v1` records (with Format-3 fallback).
+#[inline(always)]
+pub fn read_raw_record_int_pair(
+    raw: &[u8],
+    col0: usize,
+    col1: usize,
+) -> Result<Option<(i64, i64)>> {
+    if raw.len() >= 6 && raw[0] == P3V1_RECORD_MAGIC && raw[1] < P3V1_WIDE_FLAG {
+        let n = usize::from(raw[1]);
+        let hdr_len = 2 + 2 * n;
+        if hdr_len > raw.len() {
+            return Err(err_corrupt_p3v1_record());
+        }
+        if col0 == 0 && col1 == 1 && n >= 2 {
+            let d0 = u16::from_le_bytes([raw[2], raw[3]]);
+            let d1 = u16::from_le_bytes([raw[4], raw[5]]);
+            let t0 = (d0 & 0x0f) as u8;
+            let t1 = (d1 & 0x0f) as u8;
+            let e0 = hdr_len + usize::from(d0 >> 4);
+            let e1 = hdr_len + usize::from(d1 >> 4);
+            if t0 > P3V1_TAG_TEXT || t1 > P3V1_TAG_TEXT || e0 > e1 || e1 > raw.len() {
+                return Err(err_corrupt_p3v1_record());
+            }
+            let Some(v0) = decode_p3v1_int_tag(t0, &raw[hdr_len..e0]) else {
+                return Ok(None);
+            };
+            let Some(v1) = decode_p3v1_int_tag(t1, &raw[e0..e1]) else {
+                return Ok(None);
+            };
+            return Ok(Some((v0, v1)));
+        }
+        if col0 >= n || col1 >= n {
+            return Ok(None);
+        }
+        let Some((s0, e0, t0)) = p3v1_column_offset_and_tag(raw, col0)? else {
+            return Ok(None);
+        };
+        let Some((s1, e1, t1)) = p3v1_column_offset_and_tag(raw, col1)? else {
+            return Ok(None);
+        };
+        if e0 > raw.len() || e1 > raw.len() {
+            return Err(SqliteError::corrupt("record payload truncated"));
+        }
+        let Some(v0) = decode_p3v1_int_tag(t0, &raw[s0..e0]) else {
+            return Ok(None);
+        };
+        let Some(v1) = decode_p3v1_int_tag(t1, &raw[s1..e1]) else {
+            return Ok(None);
+        };
+        return Ok(Some((v0, v1)));
+    }
+    let Some(v0) = read_raw_record_int_at(raw, col0)? else {
+        return Ok(None);
+    };
+    let Some(v1) = read_raw_record_int_at(raw, col1)? else {
+        return Ok(None);
+    };
+    Ok(Some((v0, v1)))
+}
+
+/// Reads column `col_idx` directly into an [`InlineVal`] in `O(1)` time on `P3v1` records.
+/// Returns `Ok(None)` when `col_idx >= col_count`, `Ok(Some(Some(iv)))` when inline-decodable,
+/// or `Ok(Some(None))` when the column is a long text/blob requiring heap materialization.
+#[inline(always)]
+pub fn read_raw_record_inline_val(
+    raw: &[u8],
+    col_idx: usize,
+    enc: TextEncoding,
+) -> Result<Option<Option<InlineVal>>> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if raw[0] == P3V1_RECORD_MAGIC {
+        let Some((start, end, tag)) = p3v1_column_offset_and_tag(raw, col_idx)? else {
+            return Ok(None);
+        };
+        if end > raw.len() {
+            return Err(SqliteError::corrupt("record payload truncated"));
+        }
+        return Ok(Some(InlineVal::try_from_p3v1_bytes(
+            tag,
+            &raw[start..end],
+            enc,
+        )?));
+    }
+    Ok(read_raw_record_field(raw, col_idx)?.map(|rf| InlineVal::try_from_raw_field(rf, enc)))
+}
+
 /// Compares a raw serialized index record `rec` against `prefix_values` plus optional
 /// `lower_bound` / `upper_bound` on column `k = prefix_values.len()` with zero heap allocations.
 ///
@@ -1202,6 +2546,78 @@ pub fn compare_raw_record_range(
         } else {
             Ordering::Equal
         });
+    }
+    if rec[0] == P3V1_RECORD_MAGIC {
+        let (ncols, hdr_len, is_wide) = p3v1_header_info(rec)?;
+        if !is_wide && ncols > 0 {
+            let last_d = u16::from_le_bytes([rec[2 + 2 * (ncols - 1)], rec[3 + 2 * (ncols - 1)]]);
+            if (last_d & 0x0f) as u8 > P3V1_TAG_TEXT
+                || hdr_len + usize::from(last_d >> 4) > rec.len()
+            {
+                return Err(err_corrupt_p3v1_record());
+            }
+        }
+        let default_so = KeySortOrder::default();
+        let prefix_stop = k.min(ncols);
+        for (col_idx, pref_val) in prefix_values.iter().enumerate().take(prefix_stop) {
+            let (start, end, tag) =
+                p3v1_column_offset_and_tag(rec, col_idx)?.ok_or_else(err_corrupt_p3v1_record)?;
+            if end > rec.len() {
+                return Err(SqliteError::corrupt("record payload truncated"));
+            }
+            let f = RawField::from_p3v1_tag(tag, &rec[start..end])?;
+            let spec = orders.get(col_idx).unwrap_or(&default_so);
+            let ord = f.compare_key_to_value(pref_val, spec, enc)?;
+            if ord != Ordering::Equal {
+                return Ok(ord);
+            }
+        }
+        if !has_bounds {
+            return Ok(Ordering::Equal);
+        }
+        if k >= ncols {
+            return Ok(Ordering::Less);
+        }
+        let (start, end, tag) =
+            p3v1_column_offset_and_tag(rec, k)?.ok_or_else(err_corrupt_p3v1_record)?;
+        if end > rec.len() {
+            return Err(SqliteError::corrupt("record payload truncated"));
+        }
+        let f = RawField::from_p3v1_tag(tag, &rec[start..end])?;
+        let range_so = orders.get(k).unwrap_or(&default_so);
+        if f.is_null() {
+            return Ok(if range_so.nulls_last {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            });
+        }
+        if let Some((lo_val, lo_inc)) = lower_bound
+            && !lo_val.is_null()
+        {
+            let cmp = f.compare_sql_to_nonnull_value(lo_val, range_so, enc)?;
+            if cmp == Ordering::Less || (!lo_inc && cmp == Ordering::Equal) {
+                return Ok(if range_so.desc {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                });
+            }
+        }
+        if let Some((hi_val, hi_inc)) = upper_bound {
+            if hi_val.is_null() {
+                return Ok(Ordering::Greater);
+            }
+            let cmp = f.compare_sql_to_nonnull_value(hi_val, range_so, enc)?;
+            if cmp == Ordering::Greater || (!hi_inc && cmp == Ordering::Equal) {
+                return Ok(if range_so.desc {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                });
+            }
+        }
+        return Ok(Ordering::Equal);
     }
     // 32-bit SWAR fast path for 2- and 3-column single-byte-header index records
     // (`[0x03, st0, st1, ...]` and `[0x04, st0, st1, st2, ...]`).
@@ -1462,9 +2878,105 @@ pub fn compare_raw_records_with_encoding(
         return Ok(Ordering::Equal);
     }
 
-    // Fast path for UTF-8 records with 1-byte header sizes (`2..=8`) and 1-byte serial types.
     let lh0 = lhs_record[0];
     let rh0 = rhs_record[0];
+
+    // Native `P3v1` compact-vs-compact fast path (used by bulk `CREATE INDEX` sorting and index
+    // leaf splits/comparisons).
+    if lh0 == P3V1_RECORD_MAGIC
+        && rh0 == P3V1_RECORD_MAGIC
+        && lhs_record.len() >= 2
+        && rhs_record.len() >= 2
+        && lhs_record[1] < P3V1_WIDE_FLAG
+        && rhs_record[1] < P3V1_WIDE_FLAG
+    {
+        let ln = usize::from(lhs_record[1]);
+        let rn = usize::from(rhs_record[1]);
+        let l_hdr = 2 + 2 * ln;
+        let r_hdr = 2 + 2 * rn;
+        if l_hdr > lhs_record.len() || r_hdr > rhs_record.len() {
+            return Err(err_corrupt_p3v1_record());
+        }
+        let stop = ln.min(rn).min(max_fields.unwrap_or(usize::MAX));
+        let mut l_prev = 0usize;
+        let mut r_prev = 0usize;
+        let default_spec = KeySortOrder::default();
+        for col_idx in 0..stop {
+            let da = u16::from_le_bytes([lhs_record[2 + 2 * col_idx], lhs_record[3 + 2 * col_idx]]);
+            let db = u16::from_le_bytes([rhs_record[2 + 2 * col_idx], rhs_record[3 + 2 * col_idx]]);
+            let ta = (da & 0x0f) as u8;
+            let tb = (db & 0x0f) as u8;
+            let ea_rel = usize::from(da >> 4);
+            let eb_rel = usize::from(db >> 4);
+            if ta > P3V1_TAG_TEXT || tb > P3V1_TAG_TEXT || l_prev > ea_rel || r_prev > eb_rel {
+                return Err(err_corrupt_p3v1_record());
+            }
+            if (ta < P3V1_TAG_BLOB && (ea_rel - l_prev) != p3v1_fixed_tag_width(ta))
+                || (tb < P3V1_TAG_BLOB && (eb_rel - r_prev) != p3v1_fixed_tag_width(tb))
+            {
+                return Err(err_corrupt_p3v1_record());
+            }
+            let sa = l_hdr + l_prev;
+            let ea = l_hdr + ea_rel;
+            let sb = r_hdr + r_prev;
+            let eb = r_hdr + eb_rel;
+            if ea > lhs_record.len() || eb > rhs_record.len() {
+                return Err(SqliteError::corrupt("record payload truncated"));
+            }
+            let spec = orders.get(col_idx).unwrap_or(&default_spec);
+            let cmp = if let (Some(ia), Some(ib)) = (
+                decode_p3v1_int_tag(ta, &lhs_record[sa..ea]),
+                decode_p3v1_int_tag(tb, &rhs_record[sb..eb]),
+            ) {
+                let raw = ia.cmp(&ib);
+                if spec.desc { raw.reverse() } else { raw }
+            } else if enc == TextEncoding::Utf8
+                && matches!(ta, P3V1_TAG_TEXT | P3V1_TAG_EMPTY_TEXT)
+                && matches!(tb, P3V1_TAG_TEXT | P3V1_TAG_EMPTY_TEXT)
+                && spec.collation == Collation::Binary
+                && spec.custom_collation.is_none()
+            {
+                let ba = &lhs_record[sa..ea];
+                let bb = &rhs_record[sb..eb];
+                if let Some(raw) = sqliters_asm::cmp_utf8_ascii_binary(ba, bb) {
+                    if spec.desc { raw.reverse() } else { raw }
+                } else {
+                    compare_raw_fields(RawField::Text(ba), RawField::Text(bb), spec, enc)?
+                }
+            } else {
+                let fa = RawField::from_p3v1_tag(ta, &lhs_record[sa..ea])?;
+                let fb = RawField::from_p3v1_tag(tb, &rhs_record[sb..eb])?;
+                compare_raw_fields(fa, fb, spec, enc)?
+            };
+            if cmp != Ordering::Equal {
+                return Ok(cmp);
+            }
+            l_prev = ea_rel;
+            r_prev = eb_rel;
+        }
+        return Ok(Ordering::Equal);
+    }
+
+    if lh0 == P3V1_RECORD_MAGIC || rh0 == P3V1_RECORD_MAGIC {
+        let ln = record_column_count(lhs_record)?;
+        let rn = record_column_count(rhs_record)?;
+        let stop = ln.min(rn).min(max_fields.unwrap_or(usize::MAX));
+        let default_spec = KeySortOrder::default();
+        for col_idx in 0..stop {
+            let fa = read_raw_record_field(lhs_record, col_idx)?
+                .ok_or_else(|| SqliteError::corrupt("record payload truncated"))?;
+            let fb = read_raw_record_field(rhs_record, col_idx)?
+                .ok_or_else(|| SqliteError::corrupt("record payload truncated"))?;
+            let spec = orders.get(col_idx).unwrap_or(&default_spec);
+            let cmp = compare_raw_fields(fa, fb, spec, enc)?;
+            if cmp != Ordering::Equal {
+                return Ok(cmp);
+            }
+        }
+        return Ok(Ordering::Equal);
+    }
+
+    // Fast path for UTF-8 Format-3 records with 1-byte header sizes (`2..=8`) and 1-byte serial types.
     if enc == TextEncoding::Utf8
         && (2..=8).contains(&lh0)
         && (2..=8).contains(&rh0)
@@ -1528,8 +3040,6 @@ pub fn compare_raw_records_with_encoding(
             r_body = end_b;
         }
         if fast_ok {
-            // Validate remaining serial types in the compared prefix weren't truncated/corrupt;
-            // we already validated `0..stop`, so matching `sqlite3VdbeRecordCompare`, Equal holds!
             return Ok(Ordering::Equal);
         }
     }
@@ -1599,6 +3109,77 @@ pub fn raw_record_prefix_has_null(record: &[u8], prefix_cols: usize) -> Result<b
     }
     if record.is_empty() {
         return Ok(true);
+    }
+    if record[0] == P3V1_RECORD_MAGIC {
+        let (n, hdr_len, is_wide) = p3v1_header_info(record)?;
+        if n < prefix_cols {
+            return Ok(true);
+        }
+        if !is_wide {
+            let mut prev_end = 0usize;
+            for col_idx in 0..prefix_cols {
+                let d = u16::from_le_bytes([record[2 + 2 * col_idx], record[3 + 2 * col_idx]]);
+                let tag = (d & 0x0f) as u8;
+                let end_rel = usize::from(d >> 4);
+                if tag > P3V1_TAG_TEXT || prev_end > end_rel {
+                    return Err(err_corrupt_p3v1_record());
+                }
+                if tag < P3V1_TAG_BLOB && (end_rel - prev_end) != p3v1_fixed_tag_width(tag) {
+                    return Err(err_corrupt_p3v1_record());
+                }
+                let start = hdr_len + prev_end;
+                let end = hdr_len + end_rel;
+                if end > record.len() {
+                    return Err(SqliteError::corrupt("record payload truncated"));
+                }
+                if tag == P3V1_TAG_NULL {
+                    return Ok(true);
+                }
+                if tag == P3V1_TAG_F64_LE {
+                    let bits = u64::from_le_bytes([
+                        record[start],
+                        record[start + 1],
+                        record[start + 2],
+                        record[start + 3],
+                        record[start + 4],
+                        record[start + 5],
+                        record[start + 6],
+                        record[start + 7],
+                    ]);
+                    if f64::from_bits(bits).is_nan() {
+                        return Ok(true);
+                    }
+                }
+                prev_end = end_rel;
+            }
+            return Ok(false);
+        }
+        for col_idx in 0..prefix_cols {
+            let (start, end, tag) =
+                p3v1_column_offset_and_tag(record, col_idx)?.ok_or_else(err_corrupt_p3v1_record)?;
+            if end > record.len() {
+                return Err(SqliteError::corrupt("record payload truncated"));
+            }
+            if tag == P3V1_TAG_NULL {
+                return Ok(true);
+            }
+            if tag == P3V1_TAG_F64_LE {
+                let bits = u64::from_le_bytes([
+                    record[start],
+                    record[start + 1],
+                    record[start + 2],
+                    record[start + 3],
+                    record[start + 4],
+                    record[start + 5],
+                    record[start + 6],
+                    record[start + 7],
+                ]);
+                if f64::from_bits(bits).is_nan() {
+                    return Ok(true);
+                }
+            }
+        }
+        return Ok(false);
     }
     let (hdr_u64, mut hdr_pos) = get_varint(record)?;
     let hdr_size = usize::try_from(hdr_u64)
@@ -1716,5 +3297,126 @@ mod tests {
         assert_eq!(decoded.len(), 1);
         let rt = RuntimeValue::from(decoded.into_iter().next().unwrap());
         assert_eq!(rt.subtype, 0);
+    }
+
+    #[test]
+    fn p3v1_record_compact_wide_o1_projection_and_format3_fallback() {
+        let cols = vec![
+            Value::Null,
+            Value::Integer(0),
+            Value::Integer(1),
+            Value::Integer(-128),
+            Value::Integer(127),
+            Value::Integer(-32_768),
+            Value::Integer(32_767),
+            Value::Integer(i32::MIN as i64),
+            Value::Integer(i32::MAX as i64),
+            Value::Integer(i64::MIN),
+            Value::Integer(i64::MAX),
+            Value::Real(-0.0),
+            Value::Real(f64::NAN),
+            Value::Real(std::f64::consts::PI),
+            Value::Text(String::new()),
+            Value::Text("merhaba-utf8-çğıöşü".to_owned()),
+            Value::Blob(Vec::new()),
+            Value::Blob(vec![0xde, 0xad, 0xbe, 0xef, 0x42]),
+        ];
+
+        let mut p3_bytes = Vec::new();
+        encode_record_for_format_into(&cols, TextEncoding::Utf8, true, &mut p3_bytes);
+        assert!(is_p3v1_record(&p3_bytes));
+        assert!(p3_bytes[1] < P3V1_WIDE_FLAG);
+        assert_eq!(record_column_count(&p3_bytes).unwrap(), cols.len());
+
+        let decoded = decode_record_with_encoding(&p3_bytes, TextEncoding::Utf8).unwrap();
+        assert_eq!(decoded.len(), cols.len());
+        assert_eq!(decoded[0], Value::Null);
+        assert_eq!(decoded[12], Value::Null); // NaN normalizes to SQL NULL
+        assert_eq!(decoded[11], Value::Real(0.0));
+        for idx in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 15, 16, 17] {
+            assert_eq!(decoded[idx], cols[idx], "mismatch at col {idx}");
+            assert_eq!(
+                decode_record_column_with_encoding(&p3_bytes, idx, TextEncoding::Utf8).unwrap(),
+                Some(cols[idx].clone())
+            );
+            let rf = read_raw_record_field(&p3_bytes, idx).unwrap().unwrap();
+            assert_eq!(rf.to_owned_value(TextEncoding::Utf8), cols[idx]);
+        }
+        assert_eq!(
+            decode_record_column_with_encoding(&p3_bytes, 99, TextEncoding::Utf8).unwrap(),
+            None
+        );
+        assert_eq!(
+            read_raw_record_int_at(&p3_bytes, 9).unwrap(),
+            Some(i64::MIN)
+        );
+        assert_eq!(
+            read_raw_record_int_pair(&p3_bytes, 3, 10).unwrap(),
+            Some((-128, i64::MAX))
+        );
+
+        // Transcode to Format-3 and verify cross-format raw comparison parity.
+        let mut f3_bytes = Vec::new();
+        transcode_p3v1_to_format3(&p3_bytes, &mut f3_bytes).unwrap();
+        assert!(!is_p3v1_record(&f3_bytes));
+        assert_eq!(
+            decode_record_with_encoding(&f3_bytes, TextEncoding::Utf8).unwrap(),
+            decoded
+        );
+        let orders = vec![KeySortOrder::default(); cols.len()];
+        assert_eq!(
+            compare_raw_records_with_encoding(
+                &p3_bytes,
+                &f3_bytes,
+                None,
+                &orders,
+                TextEncoding::Utf8
+            )
+            .unwrap(),
+            Ordering::Equal
+        );
+
+        // UTF-16le and UTF-16be round-trip on P3v1.
+        for enc in [TextEncoding::Utf16Le, TextEncoding::Utf16Be] {
+            let mut u16_rec = Vec::new();
+            encode_record_for_format_into(&cols, enc, true, &mut u16_rec);
+            assert_eq!(decode_record_with_encoding(&u16_rec, enc).unwrap(), decoded);
+            assert_eq!(
+                decode_record_column_with_encoding(&u16_rec, 15, enc).unwrap(),
+                Some(cols[15].clone())
+            );
+        }
+
+        // 2,000-column wide row (`SQLITE_MAX_COLUMN = 2000`) + >4 KiB body.
+        let wide_cols: Vec<Value> = (0..2000_i64)
+            .map(|i| match i % 5 {
+                0 => Value::Integer(i * 100_003),
+                1 => Value::Text(format!("col-{i:04}-payload")),
+                2 => Value::Blob(vec![(i & 0xff) as u8; 6]),
+                3 => Value::Real(i as f64 * 0.25),
+                _ => Value::Null,
+            })
+            .collect();
+        let mut wide_p3 = Vec::new();
+        encode_record_for_format_into(&wide_cols, TextEncoding::Utf8, true, &mut wide_p3);
+        assert!(is_p3v1_record(&wide_p3));
+        assert_eq!(wide_p3[1], P3V1_WIDE_FLAG);
+        assert_eq!(record_column_count(&wide_p3).unwrap(), 2000);
+        for probe in [0usize, 1, 127, 128, 999, 1501, 1998, 1999] {
+            assert_eq!(
+                decode_record_column_with_encoding(&wide_p3, probe, TextEncoding::Utf8).unwrap(),
+                Some(wide_cols[probe].clone())
+            );
+        }
+        assert_eq!(
+            decode_record_with_encoding(&wide_p3, TextEncoding::Utf8).unwrap(),
+            wide_cols
+        );
+
+        // Corrupt non-monotonic descriptor offset rejection.
+        let mut bad = vec![P3V1_RECORD_MAGIC, 2, 0x24, 0x00, 0x14, 0x00, 1, 2];
+        assert!(decode_record(&bad).is_err());
+        bad.truncate(3);
+        assert!(decode_record(&bad).is_err());
     }
 }

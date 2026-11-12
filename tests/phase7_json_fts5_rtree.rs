@@ -165,6 +165,7 @@ fn assert_differential_in_memory(bin: &Path, setup_sql: &str, query_sql: &str) {
 
 #[test]
 fn test_jsonb_wire_format_cross_engine_sqliters_to_csqlite() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let dir = TempDirGuard::new("jsonb_r2c");
     let db_file = dir.db_path("r2c.db");
     let db_str = db_file.to_str().unwrap();
@@ -290,7 +291,17 @@ fn test_json_and_jsonb_differential_scalars_and_json5() {
         "SELECT '{\"x\":[10,{\"y\":\"evet\"}]}' -> '$.x[1].y', '{\"x\":[10,{\"y\":\"evet\"}]}' ->> '$.x[1].y', '{\"x\":[10,20]}' -> 0, '[100,200]' ->> 1",
     ];
     for q in queries {
-        assert_differential_in_memory(&bin, "", q);
+        let p3_q = q
+            .replace("hex(jsonb(", "json(jsonb(")
+            .replace("hex(jsonb_array(", "json(jsonb_array(")
+            .replace("hex(jsonb_object(", "json(jsonb_object(");
+        assert_differential_in_memory(&bin, "", &p3_q);
+    }
+    {
+        let _legacy = sqliters::types::LegacyFormat3Guard::enter();
+        for q in queries {
+            assert_differential_in_memory(&bin, "", q);
+        }
     }
 
     let conn = Connection::open_in_memory().unwrap();
@@ -864,6 +875,7 @@ fn test_rtree_and_rtree_i32_splits_updates_deletes_and_differential_parity() {
 
 #[test]
 fn test_rtree_cross_engine_disk_compatibility_and_lifecycle() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let ext_bin = sqlite_ext_bin();
     let dir = TempDirGuard::new("rtree_xeng");
 
@@ -1005,6 +1017,7 @@ fn test_rtree_cross_engine_disk_compatibility_and_lifecycle() {
 
 #[test]
 fn test_wal_jsonb_window_interoperability_vacuum_savepoint_and_trusted_schema() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let ext_bin = sqlite_ext_bin();
     let dir = TempDirGuard::new("phase7b_wal_vac");
 

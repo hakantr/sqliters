@@ -1016,6 +1016,7 @@ fn test_suite1_format3_header_versions_and_two_phase_wal_discovery() {
 
 #[test]
 fn test_suite2_read0_to_positive_slot_all_three_restart_paths_and_busy_snapshot() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let sandbox = TempSandbox::new("suite2_group24");
     let db_path = sandbox.path().join("g24.db");
 
@@ -1161,6 +1162,7 @@ impl CacheTestExt for Pager {
 
 #[test]
 fn test_suite3_wal_savepoints_spill_irecksum_overwrite_and_log_wrap() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let sandbox = TempSandbox::new("suite3_savepoints");
     let db_path = sandbox.path().join("sp_wal.db");
 
@@ -1347,6 +1349,7 @@ impl BtreeTestExt for Btree {
 
 #[test]
 fn test_suite4_wal_index_block_boundaries_12255_frames_and_64k_bidirectional_c_interop() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let sandbox = TempSandbox::new("suite4_blocks_64k");
 
     // 4A. Commit across `4062/4063`, `8158/8159`, and `12254/12255` WAL frames (4 SHM 32 KiB regions = 131072 bytes)!
@@ -1945,6 +1948,7 @@ fn test_suite6_checkpoint_modes_and_march_2026_salt_race_guard() {
 
 #[test]
 fn test_suite7_readonly_unreliable_shm_immutable_exclusive_transitions_and_close() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let sandbox = TempSandbox::new("suite7_modes");
 
     // 7A. `WAL_SHM_RDONLY` / `bShmUnreliable` (`ReadonlyCantInit` -> heap index under `READ(0)`)

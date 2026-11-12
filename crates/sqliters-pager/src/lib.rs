@@ -2033,6 +2033,27 @@ impl Pager {
         Ok(self.ensure_header_loaded()?.encoding())
     }
 
+    /// Returns whether this database uses the `P3v1` storage format (`b"P3v1"` in header bytes `72..76`).
+    #[inline]
+    pub const fn is_p3v1(&self) -> bool {
+        self.header.is_p3v1
+    }
+
+    /// Returns the authoritative `P3v1` format flag, performing a brief locked header read if needed.
+    pub fn effective_is_p3v1(&mut self) -> Result<bool> {
+        Ok(self.ensure_header_loaded()?.is_p3v1)
+    }
+
+    /// Configures whether an uninitialized (`page_count == 0`) database will be initialized as `P3v1`
+    /// (`true`, default) or legacy Format-3 (`false`). No-op once `page_count > 0`.
+    pub fn set_p3v1(&mut self, enabled: bool) -> Result<()> {
+        let _ = self.ensure_header_loaded()?;
+        if self.page_count == 0 {
+            self.header.is_p3v1 = enabled;
+        }
+        Ok(())
+    }
+
     pub fn header_mut(&mut self) -> Result<&mut DatabaseHeader> {
         self.ensure_not_closed()?;
         if self.state != TransactionState::Write {
@@ -2733,8 +2754,8 @@ impl Pager {
         self.header.sqlite_version_number = SQLITE_VERSION_NUMBER;
         self.header.write_into(&mut page1[0..DB_HEADER_SIZE]);
 
-        // Page 1 B-tree header at offset 100: empty table leaf B-tree (flags = 0x0d)
-        page1[100] = 0x0d; // PTF_INTKEY | PTF_LEAFDATA | PTF_LEAF
+        // Page 1 B-tree header at offset 100: empty table leaf B-tree
+        page1[100] = if self.header.is_p3v1 { 0x1d } else { 0x0d };
         page1[101..103].copy_from_slice(&0u16.to_be_bytes()); // first freeblock = 0
         page1[103..105].copy_from_slice(&0u16.to_be_bytes()); // cell count = 0
         let content_start: u16 = if usable == 65_536 { 0 } else { usable as u16 };
@@ -3132,7 +3153,7 @@ impl Pager {
                 let page_bytes = if s_pgno == 1 {
                     let mut p1 = vec![0u8; pgsz_src as usize];
                     if raw_src_pages == 0 {
-                        p1[100] = 0x0d;
+                        p1[100] = if patched_hdr.is_p3v1 { 0x1d } else { 0x0d };
                         let usable = patched_hdr.usable_size();
                         let content_start: u16 = if usable == 65_536 { 0 } else { usable as u16 };
                         p1[105..107].copy_from_slice(&content_start.to_be_bytes());
@@ -3414,7 +3435,7 @@ impl Pager {
             }
             if raw_src_pages == 0 {
                 let mut p1 = vec![0u8; pgsz_src as usize];
-                p1[100] = 0x0d;
+                p1[100] = if patched_hdr.is_p3v1 { 0x1d } else { 0x0d };
                 let usable = patched_hdr.usable_size();
                 let content_start: u16 = if usable == 65_536 { 0 } else { usable as u16 };
                 p1[105..107].copy_from_slice(&content_start.to_be_bytes());
@@ -3454,7 +3475,7 @@ impl Pager {
             if s_pgno == 1 {
                 let mut p1 = if raw_src_pages == 0 {
                     let mut buf = vec![0u8; pgsz_src as usize];
-                    buf[100] = 0x0d;
+                    buf[100] = if patched_hdr.is_p3v1 { 0x1d } else { 0x0d };
                     let usable = patched_hdr.usable_size();
                     let content_start: u16 = if usable == 65_536 { 0 } else { usable as u16 };
                     buf[105..107].copy_from_slice(&content_start.to_be_bytes());

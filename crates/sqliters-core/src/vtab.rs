@@ -2766,8 +2766,13 @@ fn collect_btree_dbstat_pages(
     }
     let flags = page_buf[hdr_off];
     let is_interior = matches!(flags, 0x02 | 0x05);
-    let is_table = matches!(flags, 0x05 | 0x0d);
-    let hdr_size = if is_interior { 12usize } else { 8usize };
+    let is_table = matches!(flags, 0x05 | 0x0d | 0x1d);
+    let is_p3v1_leaf = matches!(flags, 0x1a | 0x1d);
+    let hdr_size = if is_interior || flags == 0x1a {
+        12usize
+    } else {
+        8usize
+    };
     if hdr_off + hdr_size > page_buf.len() {
         return;
     }
@@ -2781,7 +2786,8 @@ fn collect_btree_dbstat_pages(
     } else {
         usize::from(raw_content_off)
     };
-    let ptr_array_end = hdr_off + hdr_size + ncell * 2;
+    let slot_stride = if is_p3v1_leaf { 12usize } else { 2usize };
+    let ptr_array_end = hdr_off + hdr_size + ncell * slot_stride;
     let mut unused = content_off.saturating_sub(ptr_array_end) as i64;
 
     // Add freeblock bytes
@@ -2818,6 +2824,42 @@ fn collect_btree_dbstat_pages(
     let min_local = ((u.saturating_sub(12)) * 32 / 255).saturating_sub(23);
 
     for cell_idx in 0..ncell {
+        if is_p3v1_leaf {
+            let s = hdr_off + hdr_size + cell_idx * 12;
+            if s + 12 > page_buf.len() {
+                break;
+            }
+            let cell_off = usize::from(u16::from_le_bytes([page_buf[s + 8], page_buf[s + 9]]));
+            let len_flags = u16::from_le_bytes([page_buf[s + 10], page_buf[s + 11]]);
+            if len_flags == 0xFFFF {
+                if cell_off + 8 > page_buf.len() {
+                    continue;
+                }
+                let payload_sz = u32::from_le_bytes([
+                    page_buf[cell_off],
+                    page_buf[cell_off + 1],
+                    page_buf[cell_off + 2],
+                    page_buf[cell_off + 3],
+                ]) as usize;
+                let first_ovf = u32::from_be_bytes([
+                    page_buf[cell_off + 4],
+                    page_buf[cell_off + 5],
+                    page_buf[cell_off + 6],
+                    page_buf[cell_off + 7],
+                ]);
+                mx_payload = mx_payload.max(payload_sz as i64);
+                let k = min_local + (payload_sz - min_local) % (u.saturating_sub(4).max(1));
+                let local_bytes = if k <= max_local { k } else { min_local };
+                page_payload += local_bytes as i64;
+                let rem = (payload_sz - local_bytes) as i64;
+                overflow_roots.push((first_ovf, rem, format!("{path}{cell_idx:03x}+000000")));
+            } else {
+                let payload_sz = usize::from(len_flags);
+                mx_payload = mx_payload.max(payload_sz as i64);
+                page_payload += payload_sz as i64;
+            }
+            continue;
+        }
         let ptr_pos = hdr_off + hdr_size + cell_idx * 2;
         if ptr_pos + 2 > page_buf.len() {
             break;

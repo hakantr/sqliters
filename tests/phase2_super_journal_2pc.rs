@@ -1225,6 +1225,7 @@ fn test_trailer_binary_format_non_ascii_i8_checksum_sector_align_persist_truncat
 
 #[test]
 fn test_sync_ordering_and_post_unlink_benign_phase2_fault_c_and_rust_reopen() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let sandbox = TempSandbox::new("sync_order");
     let db1_path = sandbox.path().join("db1.db");
     let db2_path = sandbox.path().join("db2.db");

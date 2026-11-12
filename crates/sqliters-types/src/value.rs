@@ -1169,6 +1169,62 @@ impl InlineVal {
         }
     }
 
+    /// Attempts to decode an on-disk `P3v1` column value directly into an [`InlineVal`] without
+    /// heap allocation. Returns `Ok(None)` when a `TEXT` or `BLOB` exceeds [`INLINE_VAL_CAP`], uses
+    /// non-UTF-8 database encoding, or requires UTF-8 replacement characters.
+    #[inline(always)]
+    pub fn try_from_p3v1_bytes(tag: u8, buf: &[u8], enc: TextEncoding) -> Result<Option<Self>> {
+        match tag {
+            crate::record::P3V1_TAG_NULL => Ok(Some(Self::Null)),
+            crate::record::P3V1_TAG_ZERO => Ok(Some(Self::Integer(0))),
+            crate::record::P3V1_TAG_ONE => Ok(Some(Self::Integer(1))),
+            crate::record::P3V1_TAG_I8 => Ok(Some(Self::Integer(i64::from(buf[0] as i8)))),
+            crate::record::P3V1_TAG_I16_LE => {
+                Ok(Some(Self::Integer(i64::from(i16::from_le_bytes([
+                    buf[0], buf[1],
+                ])))))
+            }
+            crate::record::P3V1_TAG_I32_LE => {
+                Ok(Some(Self::Integer(i64::from(i32::from_le_bytes([
+                    buf[0], buf[1], buf[2], buf[3],
+                ])))))
+            }
+            crate::record::P3V1_TAG_I64_LE => Ok(Some(Self::Integer(i64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ])))),
+            crate::record::P3V1_TAG_F64_LE => {
+                let bits = u64::from_le_bytes([
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                ]);
+                Ok(Some(Self::real(f64::from_bits(bits))))
+            }
+            crate::record::P3V1_TAG_EMPTY_BLOB => Ok(Some(Self::ShortBlob {
+                len: 0,
+                buf: [0u8; INLINE_VAL_CAP],
+            })),
+            crate::record::P3V1_TAG_EMPTY_TEXT => Ok(match enc {
+                TextEncoding::Utf8 => Some(Self::ShortText {
+                    len: 0,
+                    buf: [0u8; INLINE_VAL_CAP],
+                }),
+                _ => None,
+            }),
+            crate::record::P3V1_TAG_BLOB => Ok(Self::try_short_blob(buf)),
+            crate::record::P3V1_TAG_TEXT => match enc {
+                TextEncoding::Utf8 if buf.len() <= INLINE_VAL_CAP => {
+                    match std::str::from_utf8(buf) {
+                        Ok(s) => Ok(Self::try_short_text(s)),
+                        Err(_) => Ok(None),
+                    }
+                }
+                _ => Ok(None),
+            },
+            _ => Err(SqliteError::corrupt(format!(
+                "invalid P3v1 column type tag {tag}"
+            ))),
+        }
+    }
+
     #[inline]
     pub const fn as_i64(&self) -> Option<i64> {
         match self {

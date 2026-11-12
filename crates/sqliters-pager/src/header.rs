@@ -8,6 +8,9 @@ use sqliters_types::{
 /// Size in bytes of the database file header on Page 1.
 pub const DB_HEADER_SIZE: usize = 100;
 
+/// 4-byte `P3v1` format marker stored in header bytes `[72..76]` on newly created databases.
+pub const P3V1_DB_HEADER_MAGIC: &[u8; 4] = b"P3v1";
+
 /// Database auto-vacuum mode encoded in header bytes `[52..56]` and `[64..68]` (`btree.c:3232-3270`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AutoVacuumMode {
@@ -73,6 +76,7 @@ pub struct DatabaseHeader {
     pub application_id: i32,
     pub version_valid_for: u32,
     pub sqlite_version_number: u32,
+    pub is_p3v1: bool,
 }
 
 impl Default for DatabaseHeader {
@@ -82,7 +86,7 @@ impl Default for DatabaseHeader {
 }
 
 impl DatabaseHeader {
-    pub const fn new_with_page_size(page_size: u32) -> Self {
+    pub fn new_with_page_size(page_size: u32) -> Self {
         Self {
             page_size,
             write_version: 1,
@@ -102,6 +106,7 @@ impl DatabaseHeader {
             application_id: 0,
             version_valid_for: 1,
             sqlite_version_number: SQLITE_VERSION_NUMBER,
+            is_p3v1: !sqliters_types::legacy_format3_mode(),
         }
     }
 
@@ -247,6 +252,7 @@ impl DatabaseHeader {
             application_id: get_i32(68),
             version_valid_for: get_u32(92),
             sqlite_version_number: get_u32(96),
+            is_p3v1: &buf[72..76] == P3V1_DB_HEADER_MAGIC,
         })
     }
 
@@ -279,6 +285,9 @@ impl DatabaseHeader {
         out[64..68].copy_from_slice(&self.incremental_vacuum_mode.to_be_bytes());
         out[68..72].copy_from_slice(&self.application_id.to_be_bytes());
         out[72..92].fill(0);
+        if self.is_p3v1 {
+            out[72..76].copy_from_slice(P3V1_DB_HEADER_MAGIC);
+        }
         out[92..96].copy_from_slice(&self.version_valid_for.to_be_bytes());
         out[96..100].copy_from_slice(&self.sqlite_version_number.to_be_bytes());
     }

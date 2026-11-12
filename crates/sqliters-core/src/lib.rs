@@ -48,9 +48,13 @@ pub use sqliters_types::{
     VirtualTable, VirtualTableModule,
 };
 use sqliters_types::{
-    ConflictResolutionEffect, DatabaseKind, ErrorCode, InlineRow, InlineVal, LockGeometry, Pgno,
-    Result, SQLITE_DEFAULT_PAGE_SIZE, SqliteError, TextEncoding, TypeAffinity, Value,
-    encode_value_refs_record_into, extended,
+    ConflictResolutionEffect, DatabaseKind, ErrorCode, InlineRow, InlineVal, LockGeometry,
+    P3V1_RECORD_MAGIC, P3V1_TAG_BLOB, P3V1_TAG_EMPTY_BLOB, P3V1_TAG_EMPTY_TEXT, P3V1_TAG_F64_LE,
+    P3V1_TAG_I8, P3V1_TAG_I16_LE, P3V1_TAG_I32_LE, P3V1_TAG_I64_LE, P3V1_TAG_NULL, P3V1_TAG_ONE,
+    P3V1_TAG_TEXT, P3V1_TAG_ZERO, P3V1_WIDE_FLAG, Pgno, Result, SQLITE_DEFAULT_PAGE_SIZE,
+    SqliteError, TextEncoding, TypeAffinity, Value, decode_p3v1_int_tag,
+    decode_p3v1_tag_value_with_encoding, encode_value_refs_record_for_format_into, extended,
+    is_p3v1_record, p3v1_column_offset_and_tag, p3v1_header_info,
 };
 pub use sqliters_vdbe::BtreeAccess;
 use sqliters_vdbe::{
@@ -9939,7 +9943,8 @@ fn finish_single_row_insert_write(
     };
 
     let enc = bt.encoding();
-    encode_value_refs_record_into(val_refs, enc, scratch_rec);
+    let is_p3v1 = bt.is_p3v1();
+    encode_value_refs_record_for_format_into(val_refs, enc, is_p3v1, scratch_rec);
     if need_dup_check {
         if !bt.insert_table_unique(plan.root_pgno, rowid, scratch_rec)? {
             return Err(SqliteError::constraint(
@@ -9963,7 +9968,12 @@ fn finish_single_row_insert_write(
                 };
             }
             idx_refs[k_len] = &rid_val;
-            encode_value_refs_record_into(&idx_refs[..=k_len], enc, scratch_rec);
+            encode_value_refs_record_for_format_into(
+                &idx_refs[..=k_len],
+                enc,
+                is_p3v1,
+                scratch_rec,
+            );
             bt.insert_index(idx.root_pgno, scratch_rec, &idx.orders)?;
         }
     }
@@ -10478,6 +10488,150 @@ fn parse_raw_record_prefix<const N: usize>(
     Ok(parsed)
 }
 
+#[inline(always)]
+fn encode_i64_p3v1_field(i: i64) -> (u8, RawRecField<'static>) {
+    if i == 0 {
+        return (P3V1_TAG_ZERO, RawRecField::Empty);
+    }
+    if i == 1 {
+        return (P3V1_TAG_ONE, RawRecField::Empty);
+    }
+    let u = if i < 0 { (!i) as u64 } else { i as u64 };
+    if u <= 127 {
+        (
+            P3V1_TAG_I8,
+            RawRecField::Inline8([i as u8, 0, 0, 0, 0, 0, 0, 0], 1),
+        )
+    } else if u <= 32_767 {
+        let b = (i as i16).to_le_bytes();
+        (
+            P3V1_TAG_I16_LE,
+            RawRecField::Inline8([b[0], b[1], 0, 0, 0, 0, 0, 0], 2),
+        )
+    } else if u <= 2_147_483_647 {
+        let b = (i as i32).to_le_bytes();
+        (
+            P3V1_TAG_I32_LE,
+            RawRecField::Inline8([b[0], b[1], b[2], b[3], 0, 0, 0, 0], 4),
+        )
+    } else {
+        (P3V1_TAG_I64_LE, RawRecField::Inline8(i.to_le_bytes(), 8))
+    }
+}
+
+#[inline(always)]
+fn value_to_utf8_p3v1_field(v: &Value) -> (u8, RawRecField<'_>) {
+    match v {
+        Value::Null => (P3V1_TAG_NULL, RawRecField::Empty),
+        Value::Integer(i) => encode_i64_p3v1_field(*i),
+        Value::Real(r) => {
+            if r.is_nan() {
+                (P3V1_TAG_NULL, RawRecField::Empty)
+            } else {
+                (
+                    P3V1_TAG_F64_LE,
+                    RawRecField::Inline8(r.to_bits().to_le_bytes(), 8),
+                )
+            }
+        }
+        Value::Blob(b) => {
+            if b.is_empty() {
+                (P3V1_TAG_EMPTY_BLOB, RawRecField::Empty)
+            } else {
+                (P3V1_TAG_BLOB, RawRecField::Slice(b.as_slice()))
+            }
+        }
+        Value::Text(s) => {
+            if s.is_empty() {
+                (P3V1_TAG_EMPTY_TEXT, RawRecField::Empty)
+            } else {
+                (P3V1_TAG_TEXT, RawRecField::Slice(s.as_bytes()))
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn scalar_to_static_p3v1_field(v: &Value) -> Option<(u8, RawRecField<'static>)> {
+    match v {
+        Value::Null => Some((P3V1_TAG_NULL, RawRecField::Empty)),
+        Value::Integer(i) => Some(encode_i64_p3v1_field(*i)),
+        Value::Real(r) => Some(if r.is_nan() {
+            (P3V1_TAG_NULL, RawRecField::Empty)
+        } else {
+            (
+                P3V1_TAG_F64_LE,
+                RawRecField::Inline8(r.to_bits().to_le_bytes(), 8),
+            )
+        }),
+        _ => None,
+    }
+}
+
+#[inline]
+fn pack_p3v1_fields_into(tags: &[u8], srcs: &[RawRecField<'_>], out: &mut Vec<u8>) {
+    let n = tags.len();
+    let mut body_len = 0usize;
+    for src in srcs {
+        body_len += src.len();
+    }
+    if n < usize::from(P3V1_WIDE_FLAG) && body_len < 4096 {
+        let hdr_len = 2 + 2 * n;
+        out.clear();
+        out.reserve(hdr_len + body_len);
+        if n <= 16 {
+            let mut hdr_buf = [0u8; 34];
+            hdr_buf[0] = P3V1_RECORD_MAGIC;
+            hdr_buf[1] = n as u8;
+            let mut end_rel = 0u16;
+            for (i, (&tag, src)) in tags.iter().zip(srcs.iter()).enumerate() {
+                end_rel += src.len() as u16;
+                let db = ((end_rel << 4) | u16::from(tag)).to_le_bytes();
+                hdr_buf[2 + 2 * i] = db[0];
+                hdr_buf[2 + 2 * i + 1] = db[1];
+            }
+            out.extend_from_slice(&hdr_buf[..hdr_len]);
+        } else {
+            out.push(P3V1_RECORD_MAGIC);
+            out.push(n as u8);
+            let mut end_rel = 0u16;
+            for (&tag, src) in tags.iter().zip(srcs.iter()) {
+                end_rel += src.len() as u16;
+                let d = (end_rel << 4) | u16::from(tag);
+                out.extend_from_slice(&d.to_le_bytes());
+            }
+        }
+        for src in srcs {
+            match *src {
+                RawRecField::Empty => {}
+                RawRecField::Slice(s) => out.extend_from_slice(s),
+                RawRecField::Inline8(ref buf, len) => out.extend_from_slice(&buf[..len as usize]),
+            }
+        }
+        return;
+    }
+
+    let hdr_len = 4 + 5 * n;
+    out.clear();
+    out.reserve(hdr_len + body_len);
+    out.push(P3V1_RECORD_MAGIC);
+    out.push(P3V1_WIDE_FLAG);
+    out.extend_from_slice(&(n as u16).to_le_bytes());
+    out.extend_from_slice(tags);
+    let mut end_rel = 0u32;
+    for src in srcs {
+        end_rel += src.len() as u32;
+        out.extend_from_slice(&end_rel.to_le_bytes());
+    }
+    for src in srcs {
+        match *src {
+            RawRecField::Empty => {}
+            RawRecField::Slice(s) => out.extend_from_slice(s),
+            RawRecField::Inline8(ref buf, len) => out.extend_from_slice(&buf[..len as usize]),
+        }
+    }
+}
+
 fn execute_single_row_delete_plan(
     plan: &SingleRowDeletePlan,
     params: &[Value],
@@ -10499,6 +10653,42 @@ fn execute_single_row_delete_plan(
 
     if !bt.delete_table_returning_raw_into(plan.root_pgno, target_rowid, scratch_old_rec)? {
         return Ok(0);
+    }
+
+    if bt.is_p3v1() && is_p3v1_record(scratch_old_rec) {
+        let (old_col_count, _, _) = p3v1_header_info(scratch_old_rec)?;
+        let (rid_tag, rid_src) = encode_i64_p3v1_field(target_rowid);
+        let mut idx_tags = [0u8; 16];
+        let mut idx_src = [RawRecField::Empty; 16];
+        for idx in &plan.indexes {
+            let k_len = idx.col_slots.len();
+            for (k, &slot) in idx.col_slots.iter().enumerate() {
+                let (tag, src) = match slot {
+                    None => (rid_tag, rid_src),
+                    Some(ci) if ci < old_col_count => {
+                        let (start, end, t) = p3v1_column_offset_and_tag(scratch_old_rec, ci)?
+                            .ok_or_else(|| SqliteError::corrupt("corrupt P3v1 record"))?;
+                        if end > scratch_old_rec.len() {
+                            return Err(SqliteError::corrupt("record payload truncated"));
+                        }
+                        let s = if start == end {
+                            RawRecField::Empty
+                        } else {
+                            RawRecField::Slice(&scratch_old_rec[start..end])
+                        };
+                        (t, s)
+                    }
+                    Some(_) => (P3V1_TAG_NULL, RawRecField::Empty),
+                };
+                idx_tags[k] = tag;
+                idx_src[k] = src;
+            }
+            idx_tags[k_len] = rid_tag;
+            idx_src[k_len] = rid_src;
+            pack_p3v1_fields_into(&idx_tags[..=k_len], &idx_src[..=k_len], scratch_rec);
+            bt.delete_index_raw(idx.root_pgno, scratch_rec, &idx.orders)?;
+        }
+        return Ok(1);
     }
 
     let mut rec_st = [0u64; 32];
@@ -10564,6 +10754,251 @@ fn execute_single_row_update_plan(
     };
 
     let n_cols = plan.n_cols;
+    if bt.is_p3v1() && is_p3v1_record(scratch_old_rec) {
+        let (old_col_count, _, _) = p3v1_header_info(scratch_old_rec)?;
+        let mut coerced_opt: Option<Vec<Value>> = None;
+        let mut col_to_ai = [0u8; 16];
+        let mut deferred_mask = 0u16;
+        let mut assigned_mask = 0u16;
+        let mut new_tags = [0u8; 16];
+        let mut new_src = [RawRecField::Empty; 16];
+
+        for (ai, a) in plan.assignments.iter().enumerate() {
+            assigned_mask |= 1u16 << a.col_idx;
+            match &a.rhs {
+                SingleRowUpdateRhs::Value(src) => {
+                    let raw_val = resolve_insert_val_source(src, params);
+                    if affinity_is_noop_for_insert(a.affinity, raw_val) {
+                        if raw_val.is_null()
+                            && let Some(ref msg) = a.notnull_msg
+                        {
+                            return Err(SqliteError::constraint(
+                                extended::SQLITE_CONSTRAINT_NOTNULL,
+                                msg.clone(),
+                            ));
+                        }
+                        let (tag, rf) = value_to_utf8_p3v1_field(raw_val);
+                        new_tags[a.col_idx] = tag;
+                        new_src[a.col_idx] = rf;
+                    } else {
+                        let v = a.affinity.apply(raw_val.clone());
+                        if v.is_null()
+                            && let Some(ref msg) = a.notnull_msg
+                        {
+                            return Err(SqliteError::constraint(
+                                extended::SQLITE_CONSTRAINT_NOTNULL,
+                                msg.clone(),
+                            ));
+                        }
+                        if let Some((tag, rf)) = scalar_to_static_p3v1_field(&v) {
+                            new_tags[a.col_idx] = tag;
+                            new_src[a.col_idx] = rf;
+                        } else {
+                            let cvec = coerced_opt
+                                .get_or_insert_with(|| vec![Value::Null; plan.assignments.len()]);
+                            cvec[ai] = v;
+                            col_to_ai[a.col_idx] = ai as u8;
+                            deferred_mask |= 1u16 << a.col_idx;
+                        }
+                    }
+                }
+                SingleRowUpdateRhs::ColArith { src_col, op, rhs } => {
+                    let rhs_val = resolve_insert_val_source(rhs, params);
+                    let computed = if let Value::Integer(delta) = rhs_val {
+                        let mut src_cell: Option<(usize, usize, u8)> = None;
+                        let fast_lhs = if plan.rowid_alias_col == Some(*src_col) {
+                            Some(target_rowid)
+                        } else if *src_col < old_col_count {
+                            let (start, end, tag) =
+                                p3v1_column_offset_and_tag(scratch_old_rec, *src_col)?
+                                    .ok_or_else(|| SqliteError::corrupt("corrupt P3v1 record"))?;
+                            if end > scratch_old_rec.len() {
+                                return Err(SqliteError::corrupt("record payload truncated"));
+                            }
+                            src_cell = Some((start, end, tag));
+                            decode_p3v1_int_tag(tag, &scratch_old_rec[start..end])
+                        } else {
+                            None
+                        };
+                        if let Some(lhs_i) = fast_lhs {
+                            let ov = match op {
+                                Opcode::Add => lhs_i.checked_add(*delta),
+                                Opcode::Subtract => lhs_i.checked_sub(*delta),
+                                _ => None,
+                            };
+                            if let Some(res_i) = ov {
+                                Value::Integer(res_i)
+                            } else {
+                                eval_arith(*op, &Value::Integer(lhs_i), rhs_val)
+                            }
+                        } else {
+                            let lhs_val = if plan.rowid_alias_col == Some(*src_col) {
+                                Value::Integer(target_rowid)
+                            } else if let Some((start, end, tag)) = src_cell {
+                                decode_p3v1_tag_value_with_encoding(
+                                    tag,
+                                    &scratch_old_rec[start..end],
+                                    TextEncoding::Utf8,
+                                )?
+                            } else {
+                                Value::Null
+                            };
+                            eval_arith(*op, &lhs_val, rhs_val)
+                        }
+                    } else {
+                        let lhs_val = if plan.rowid_alias_col == Some(*src_col) {
+                            Value::Integer(target_rowid)
+                        } else if *src_col < old_col_count {
+                            let (start, end, tag) =
+                                p3v1_column_offset_and_tag(scratch_old_rec, *src_col)?
+                                    .ok_or_else(|| SqliteError::corrupt("corrupt P3v1 record"))?;
+                            if end > scratch_old_rec.len() {
+                                return Err(SqliteError::corrupt("record payload truncated"));
+                            }
+                            decode_p3v1_tag_value_with_encoding(
+                                tag,
+                                &scratch_old_rec[start..end],
+                                TextEncoding::Utf8,
+                            )?
+                        } else {
+                            Value::Null
+                        };
+                        eval_arith(*op, &lhs_val, rhs_val)
+                    };
+                    let v = if affinity_is_noop_for_insert(a.affinity, &computed) {
+                        computed
+                    } else {
+                        a.affinity.apply(computed)
+                    };
+                    if v.is_null()
+                        && let Some(ref msg) = a.notnull_msg
+                    {
+                        return Err(SqliteError::constraint(
+                            extended::SQLITE_CONSTRAINT_NOTNULL,
+                            msg.clone(),
+                        ));
+                    }
+                    if let Some((tag, rf)) = scalar_to_static_p3v1_field(&v) {
+                        new_tags[a.col_idx] = tag;
+                        new_src[a.col_idx] = rf;
+                    } else {
+                        let cvec = coerced_opt
+                            .get_or_insert_with(|| vec![Value::Null; plan.assignments.len()]);
+                        cvec[ai] = v;
+                        col_to_ai[a.col_idx] = ai as u8;
+                        deferred_mask |= 1u16 << a.col_idx;
+                    }
+                }
+            }
+        }
+
+        if let Some(ref cvec) = coerced_opt {
+            for ci in 0..n_cols {
+                if (deferred_mask & (1u16 << ci)) != 0 {
+                    let (tag, rf) = value_to_utf8_p3v1_field(&cvec[col_to_ai[ci] as usize]);
+                    new_tags[ci] = tag;
+                    new_src[ci] = rf;
+                }
+            }
+        }
+
+        for ci in 0..n_cols {
+            if plan.rowid_alias_col == Some(ci) {
+                new_tags[ci] = P3V1_TAG_NULL;
+                new_src[ci] = RawRecField::Empty;
+            } else if (assigned_mask & (1u16 << ci)) != 0 {
+                // Already populated in `new_tags[ci]` / `new_src[ci]`.
+            } else if ci < old_col_count {
+                let (start, end, tag) = p3v1_column_offset_and_tag(scratch_old_rec, ci)?
+                    .ok_or_else(|| SqliteError::corrupt("corrupt P3v1 record"))?;
+                if end > scratch_old_rec.len() {
+                    return Err(SqliteError::corrupt("record payload truncated"));
+                }
+                new_tags[ci] = tag;
+                new_src[ci] = if start == end {
+                    RawRecField::Empty
+                } else {
+                    RawRecField::Slice(&scratch_old_rec[start..end])
+                };
+            } else {
+                new_tags[ci] = P3V1_TAG_NULL;
+                new_src[ci] = RawRecField::Empty;
+            }
+        }
+
+        if !plan.affected_indexes.is_empty() {
+            let (rid_tag, rid_src) = encode_i64_p3v1_field(target_rowid);
+            let mut idx_tags = [0u8; 16];
+            let mut idx_src = [RawRecField::Empty; 16];
+            for idx in &plan.affected_indexes {
+                let k_len = idx.col_slots.len();
+                let mut key_changed = false;
+                for (k, &slot) in idx.col_slots.iter().enumerate() {
+                    let (tag, src) = match slot {
+                        None => (rid_tag, rid_src),
+                        Some(ci) if ci < old_col_count => {
+                            let (start, end, t) = p3v1_column_offset_and_tag(scratch_old_rec, ci)?
+                                .ok_or_else(|| SqliteError::corrupt("corrupt P3v1 record"))?;
+                            if end > scratch_old_rec.len() {
+                                return Err(SqliteError::corrupt("record payload truncated"));
+                            }
+                            let s = if start == end {
+                                RawRecField::Empty
+                            } else {
+                                RawRecField::Slice(&scratch_old_rec[start..end])
+                            };
+                            (t, s)
+                        }
+                        Some(_) => (P3V1_TAG_NULL, RawRecField::Empty),
+                    };
+                    if let Some(ci) = slot
+                        && (tag != new_tags[ci] || src.as_bytes() != new_src[ci].as_bytes())
+                    {
+                        key_changed = true;
+                    }
+                    idx_tags[k] = tag;
+                    idx_src[k] = src;
+                }
+                if !key_changed {
+                    continue;
+                }
+                idx_tags[k_len] = rid_tag;
+                idx_src[k_len] = rid_src;
+                pack_p3v1_fields_into(&idx_tags[..=k_len], &idx_src[..=k_len], scratch_rec);
+                bt.delete_index_raw(idx.root_pgno, scratch_rec, &idx.orders)?;
+
+                for (k, &slot) in idx.col_slots.iter().enumerate() {
+                    let (tag, src) = match slot {
+                        None => (rid_tag, rid_src),
+                        Some(ci) => (new_tags[ci], new_src[ci]),
+                    };
+                    idx_tags[k] = tag;
+                    idx_src[k] = src;
+                }
+                idx_tags[k_len] = rid_tag;
+                idx_src[k_len] = rid_src;
+                pack_p3v1_fields_into(&idx_tags[..=k_len], &idx_src[..=k_len], scratch_rec);
+                bt.insert_index(idx.root_pgno, scratch_rec, &idx.orders)?;
+            }
+        }
+
+        pack_p3v1_fields_into(&new_tags[..n_cols], &new_src[..n_cols], scratch_rec);
+        if let Some((leaf_pgno, p_start, p_end)) = local_span
+            && usize::from(p_end - p_start) == scratch_rec.len()
+        {
+            bt.overwrite_table_leaf_span_in_place(
+                plan.root_pgno,
+                leaf_pgno,
+                p_start,
+                p_end,
+                scratch_rec,
+            )?;
+        } else {
+            bt.insert_table(plan.root_pgno, target_rowid, scratch_rec)?;
+        }
+        return Ok(1);
+    }
+
     let mut rec_st = [0u64; 16];
     let mut rec_off = [0usize; 16];
     let mut rec_len = [0usize; 16];
@@ -12589,5 +13024,157 @@ mod tests {
         conn.try_close().unwrap();
         src.try_close().unwrap();
         dst.try_close().unwrap();
+    }
+
+    #[test]
+    fn p3v1_storage_btree_splits_overflow_alter_vacuum_wal_backup_and_integrity() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "sqliters_p3v1_unit_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let db_path = tmp_dir.join("p3v1_main.db");
+        let bak_path = tmp_dir.join("p3v1_bak.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "PRAGMA page_size = 4096;
+                 PRAGMA auto_vacuum = INCREMENTAL;
+                 PRAGMA journal_mode = WAL;
+                 CREATE TABLE items(
+                     id INTEGER PRIMARY KEY,
+                     grp INTEGER NOT NULL,
+                     tag TEXT NOT NULL,
+                     big BLOB,
+                     doc BLOB NOT NULL
+                 );
+                 CREATE INDEX idx_items_grp_id ON items(grp, id);
+                 CREATE INDEX idx_items_tag ON items(tag);",
+            )
+            .unwrap();
+
+            // Insert 600 rows exercising 0x1d table splits, 0x1a 2-way raw index splits,
+            // overflow chains (>6 KiB blobs), and compact P3v1 JSONB.
+            conn.execute_batch("BEGIN;").unwrap();
+            let mut ins = conn
+                .prepare("INSERT INTO items VALUES (?1, ?2, ?3, ?4, jsonb(?5));")
+                .unwrap();
+            for i in 1..=600_i64 {
+                let grp = (i * 37) % 19;
+                let tag = format!("tag-{grp:02}-{i:04}");
+                let big = if i % 45 == 0 {
+                    Value::Blob(vec![(i & 0xff) as u8; 6_500])
+                } else {
+                    Value::Blob(vec![(i & 0xff) as u8; 16])
+                };
+                let jtxt = format!(
+                    "{{\"k\":\"{tag}\",\"flag\":{},\"nested\":{{\"n\":{i}}}}}",
+                    if i % 2 == 0 { "true" } else { "false" }
+                );
+                ins.bind(1, i).unwrap();
+                ins.bind(2, grp).unwrap();
+                ins.bind(3, tag).unwrap();
+                ins.bind(4, big).unwrap();
+                ins.bind(5, jtxt).unwrap();
+                ins.step().unwrap();
+                ins.reset().unwrap();
+            }
+            ins.finalize().unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+
+            // Verify ALTER TABLE ADD COLUMN default trailing projection on P3v1 rows,
+            // deletes, updates (triggering index fp_mode + rebalance/defrag), SAVEPOINT, and incremental_vacuum.
+            conn.execute_batch(
+                "ALTER TABLE items ADD COLUMN extra INTEGER DEFAULT 42;
+                 SAVEPOINT sp1;
+                 DELETE FROM items WHERE id % 3 = 0;
+                 UPDATE items SET grp = grp + 10000000000, tag = 'upd-' || id WHERE id % 7 = 0;
+                 SAVEPOINT sp2;
+                 DELETE FROM items WHERE id <= 50;
+                 ROLLBACK TO sp2;
+                 RELEASE sp1;
+                 PRAGMA incremental_vacuum;
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+
+            let ic = conn
+                .query_row("PRAGMA integrity_check;", &[])
+                .unwrap()
+                .unwrap();
+            assert_eq!(ic.get_str(0), Some("ok"));
+
+            let row = conn
+                .query_row(
+                    "SELECT COUNT(*), SUM(extra), SUM(doc ->> '$.nested.n') FROM items WHERE (doc ->> '$.flag') = 1;",
+                    &[],
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.get_i64(0), Some(200));
+            assert_eq!(row.get_i64(1), Some(200 * 42));
+            assert!(row.get_i64(2).unwrap() > 0);
+
+            // Verify P3v1 header marker (`b"P3v1"` at `[72..76]`) and WAL version (`2, 2`) on disk.
+            let raw_hdr = std::fs::read(&db_path).unwrap();
+            assert_eq!(&raw_hdr[72..76], b"P3v1");
+            assert_eq!(raw_hdr[18], 2);
+            assert_eq!(raw_hdr[19], 2);
+
+            // Online Backup + VACUUM preserving P3v1 integrity.
+            let dst = Connection::open(&bak_path).unwrap();
+            {
+                let mut b = Backup::init(&conn, "main", &dst, "main").unwrap();
+                assert_eq!(b.step(-1).unwrap(), BackupStepResult::Done);
+                b.finish().unwrap();
+            }
+            dst.execute_batch("VACUUM;").unwrap();
+            let dst_ic = dst
+                .query_row("PRAGMA integrity_check;", &[])
+                .unwrap()
+                .unwrap();
+            assert_eq!(dst_ic.get_str(0), Some("ok"));
+            dst.try_close().unwrap();
+            conn.try_close().unwrap();
+        }
+
+        // Reopen persisted P3v1 database + test 2,000-column wide table row.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let ic = conn
+                .query_row("PRAGMA integrity_check;", &[])
+                .unwrap()
+                .unwrap();
+            assert_eq!(ic.get_str(0), Some("ok"));
+
+            let cols_ddl: String = (0..2000)
+                .map(|c| format!("c{c} INT"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let vals_sql: String = (0..2000)
+                .map(|c| format!("{}", c * 3 - 500))
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.execute_batch(&format!(
+                "CREATE TABLE wide2000({cols_ddl});
+                 INSERT INTO wide2000 VALUES ({vals_sql});"
+            ))
+            .unwrap();
+            let w = conn
+                .query_row("SELECT c0, c999, c1999 FROM wide2000;", &[])
+                .unwrap()
+                .unwrap();
+            assert_eq!(w.get_i64(0), Some(-500));
+            assert_eq!(w.get_i64(1), Some(999 * 3 - 500));
+            assert_eq!(w.get_i64(2), Some(1999 * 3 - 500));
+            conn.try_close().unwrap();
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

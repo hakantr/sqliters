@@ -7,16 +7,20 @@
 use std::cmp::Ordering;
 
 use sqliters_types::{
-    ErrorCode, KeySortOrder, Pgno, Result, SqliteError, TextEncoding, Value,
+    ErrorCode, KeySortOrder, P3V1_RECORD_MAGIC, P3V1_WIDE_FLAG, Pgno, Result, SqliteError,
+    TextEncoding, Value, decode_p3v1_tag_value_pooled, decode_p3v1_tag_value_with_encoding,
     decode_record_with_encoding, decode_serial_value_pooled, decode_serial_value_with_encoding,
-    extended, get_varint, serial_type_len,
+    extended, get_varint, is_p3v1_record, p3v1_column_offset_and_tag, serial_type_len,
 };
 
 use crate::Btree;
 use crate::page::{
-    BtreePageType, RawIndexCell, binary_search_table_leaf, binary_search_table_leaf_with_span,
-    find_table_interior_child, raw_page_header, read_index_interior_cell, read_index_leaf_cell,
-    read_table_interior_cell, read_table_leaf_cell, read_table_leaf_rowid,
+    BtreePageType, FP_MODE_INT32_PAIR, FP_MODE_UNIVERSAL_COL0, P3V1_INDEX_LEAF_BYTE, RawIndexCell,
+    binary_search_table_leaf, binary_search_table_leaf_with_span,
+    compute_int32_pair_fp_from_values, compute_universal_col0_fp_from_value,
+    find_table_interior_child, orders_allow_col0_fp, orders_allow_int32_pair_fp, raw_page_header,
+    read_index_interior_cell, read_index_leaf_cell, read_table_interior_cell, read_table_leaf_cell,
+    read_table_leaf_rowid,
 };
 
 /// Maximum B-tree cursor stack depth (`BTCURSOR_MAX_DEPTH` in `btreeInt.h`).
@@ -1379,7 +1383,7 @@ impl Btree {
             }
         };
 
-        if col_idx < INLINE_CACHED_COLS {
+        {
             let enc = self.encoding();
             let usable = self.pager.usable_size();
             if usable <= u32::from(u16::MAX) {
@@ -1461,6 +1465,34 @@ impl Btree {
                         let p_end = cache.payload_end as usize;
                         if p_start == p_end {
                             Some(Ok(None))
+                        } else if is_p3v1_record(&raw[p_start..p_end]) {
+                            let rec = &raw[p_start..p_end];
+                            match p3v1_column_offset_and_tag(rec, col_idx) {
+                                Err(e) => {
+                                    cache.clear();
+                                    Some(Err(e))
+                                }
+                                Ok(None) => Some(Ok(None)),
+                                Ok(Some((start, end, tag))) => {
+                                    if end > rec.len() {
+                                        cache.clear();
+                                        Some(Err(SqliteError::corrupt("record payload truncated")))
+                                    } else {
+                                        let slice = &rec[start..end];
+                                        let decoded = match pools {
+                                            Some((texts, blobs)) => decode_p3v1_tag_value_pooled(
+                                                tag, slice, enc, texts, blobs,
+                                            ),
+                                            None => {
+                                                decode_p3v1_tag_value_with_encoding(tag, slice, enc)
+                                            }
+                                        };
+                                        Some(decoded.map(Some))
+                                    }
+                                }
+                            }
+                        } else if col_idx >= INLINE_CACHED_COLS {
+                            None
                         } else {
                             let hdr_ok = if !cache.hdr_ready {
                                 match get_varint(&raw[p_start..p_end]) {
@@ -1710,6 +1742,28 @@ impl Btree {
         Ok(out)
     }
 
+    /// Extracts `(col_count, hdr_len)` from a `P3v1` prefix if at least the header-size bytes are present.
+    #[inline(always)]
+    fn p3v1_prefix_counts(prefix: &[u8]) -> Result<Option<(usize, usize)>> {
+        if prefix.len() < 2 || prefix[0] != P3V1_RECORD_MAGIC {
+            return Ok(None);
+        }
+        let b1 = prefix[1];
+        if b1 < P3V1_WIDE_FLAG {
+            let n = usize::from(b1);
+            Ok(Some((n, 2 + 2 * n)))
+        } else if b1 == P3V1_WIDE_FLAG {
+            if prefix.len() < 4 {
+                Ok(None)
+            } else {
+                let n = usize::from(u16::from_le_bytes([prefix[2], prefix[3]]));
+                Ok(Some((n, 4 + 5 * n)))
+            }
+        } else {
+            Err(SqliteError::corrupt("corrupt P3v1 record"))
+        }
+    }
+
     /// If `target_col` is `Some(col_idx)`, decodes that column; if `None`, decodes the last column.
     fn read_cell_column_lazy(
         &mut self,
@@ -1719,6 +1773,19 @@ impl Btree {
     ) -> Result<Option<Value>> {
         enum FastColumnPlan {
             Done(Option<Value>),
+            P3v1NeedRange {
+                tag: u8,
+                body_start: usize,
+                body_end: usize,
+                total_len: u32,
+                local_copy: Vec<u8>,
+                ovfl: Option<Pgno>,
+            },
+            P3v1HeaderSpilled {
+                total_len: u32,
+                local_copy: Vec<u8>,
+                ovfl: Option<Pgno>,
+            },
             NeedRange {
                 serial_type: u64,
                 body_start: usize,
@@ -1763,6 +1830,72 @@ impl Btree {
             let total = total_len as usize;
             if total == 0 {
                 FastColumnPlan::Done(None)
+            } else if is_p3v1_record(local_slice) {
+                match Self::p3v1_prefix_counts(local_slice)? {
+                    None => {
+                        if local_slice.len() >= total {
+                            return Err(SqliteError::corrupt("corrupt P3v1 record"));
+                        }
+                        FastColumnPlan::P3v1HeaderSpilled {
+                            total_len,
+                            local_copy: local_slice.to_vec(),
+                            ovfl,
+                        }
+                    }
+                    Some((col_count, hdr_len)) => {
+                        if hdr_len > total {
+                            return Err(SqliteError::corrupt(
+                                "record header exceeds record length",
+                            ));
+                        }
+                        if hdr_len > local_slice.len() {
+                            FastColumnPlan::P3v1HeaderSpilled {
+                                total_len,
+                                local_copy: local_slice.to_vec(),
+                                ovfl,
+                            }
+                        } else if col_count == 0 {
+                            FastColumnPlan::Done(None)
+                        } else {
+                            let want_idx = match target_col {
+                                Some(idx) => idx,
+                                None => col_count - 1,
+                            };
+                            match p3v1_column_offset_and_tag(local_slice, want_idx)? {
+                                None => FastColumnPlan::Done(None),
+                                Some((start, end, tag)) => {
+                                    if end > total {
+                                        return Err(SqliteError::corrupt(
+                                            "record payload truncated",
+                                        ));
+                                    }
+                                    if start == end {
+                                        FastColumnPlan::Done(Some(
+                                            decode_p3v1_tag_value_with_encoding(tag, &[], enc)?,
+                                        ))
+                                    } else if end <= local_slice.len() {
+                                        FastColumnPlan::Done(Some(
+                                            decode_p3v1_tag_value_with_encoding(
+                                                tag,
+                                                &local_slice[start..end],
+                                                enc,
+                                            )?,
+                                        ))
+                                    } else {
+                                        FastColumnPlan::P3v1NeedRange {
+                                            tag,
+                                            body_start: start,
+                                            body_end: end,
+                                            total_len,
+                                            local_copy: local_slice.to_vec(),
+                                            ovfl,
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             } else if local_slice.len() < total && local_slice.len() < 9 {
                 FastColumnPlan::HeaderSpilled {
                     total_len,
@@ -1843,6 +1976,58 @@ impl Btree {
 
         match plan {
             FastColumnPlan::Done(v) => Ok(v),
+            FastColumnPlan::P3v1NeedRange {
+                tag,
+                body_start,
+                body_end,
+                total_len,
+                local_copy,
+                ovfl,
+            } => {
+                let prefix = self.read_payload_prefix(total_len, &local_copy, ovfl, body_end)?;
+                let val =
+                    decode_p3v1_tag_value_with_encoding(tag, &prefix[body_start..body_end], enc)?;
+                Ok(Some(val))
+            }
+            FastColumnPlan::P3v1HeaderSpilled {
+                total_len,
+                local_copy,
+                ovfl,
+            } => {
+                let total = total_len as usize;
+                let init_bytes =
+                    self.read_payload_prefix(total_len, &local_copy, ovfl, 4.min(total))?;
+                let Some((col_count, hdr_len)) = Self::p3v1_prefix_counts(&init_bytes)? else {
+                    return Err(SqliteError::corrupt("corrupt P3v1 record"));
+                };
+                if hdr_len > total {
+                    return Err(SqliteError::corrupt("record header exceeds record length"));
+                }
+                if col_count == 0 {
+                    return Ok(None);
+                }
+                let hdr_buf = self.read_payload_prefix(total_len, &local_copy, ovfl, hdr_len)?;
+                let want_idx = match target_col {
+                    Some(idx) => idx,
+                    None => col_count - 1,
+                };
+                let Some((start, end, tag)) = p3v1_column_offset_and_tag(&hdr_buf, want_idx)?
+                else {
+                    return Ok(None);
+                };
+                if end > total {
+                    return Err(SqliteError::corrupt("record payload truncated"));
+                }
+                if start == end {
+                    return Ok(Some(decode_p3v1_tag_value_with_encoding(tag, &[], enc)?));
+                }
+                let prefix = self.read_payload_prefix(total_len, &local_copy, ovfl, end)?;
+                Ok(Some(decode_p3v1_tag_value_with_encoding(
+                    tag,
+                    &prefix[start..end],
+                    enc,
+                )?))
+            }
             FastColumnPlan::NeedRange {
                 serial_type,
                 body_start,
@@ -1867,6 +2052,39 @@ impl Btree {
                 let total = total_len as usize;
                 let init_bytes =
                     self.read_payload_prefix(total_len, &local_copy, ovfl, 9.min(total))?;
+                if is_p3v1_record(&init_bytes) {
+                    let Some((col_count, hdr_len)) = Self::p3v1_prefix_counts(&init_bytes)? else {
+                        return Err(SqliteError::corrupt("corrupt P3v1 record"));
+                    };
+                    if hdr_len > total {
+                        return Err(SqliteError::corrupt("record header exceeds record length"));
+                    }
+                    if col_count == 0 {
+                        return Ok(None);
+                    }
+                    let hdr_buf =
+                        self.read_payload_prefix(total_len, &local_copy, ovfl, hdr_len)?;
+                    let want_idx = match target_col {
+                        Some(idx) => idx,
+                        None => col_count - 1,
+                    };
+                    let Some((start, end, tag)) = p3v1_column_offset_and_tag(&hdr_buf, want_idx)?
+                    else {
+                        return Ok(None);
+                    };
+                    if end > total {
+                        return Err(SqliteError::corrupt("record payload truncated"));
+                    }
+                    if start == end {
+                        return Ok(Some(decode_p3v1_tag_value_with_encoding(tag, &[], enc)?));
+                    }
+                    let prefix = self.read_payload_prefix(total_len, &local_copy, ovfl, end)?;
+                    return Ok(Some(decode_p3v1_tag_value_with_encoding(
+                        tag,
+                        &prefix[start..end],
+                        enc,
+                    )?));
+                }
                 let (hdr_size_u64, mut hdr_pos) = get_varint(&init_bytes)?;
                 let hdr_size = usize::try_from(hdr_size_u64)
                     .map_err(|_| SqliteError::corrupt("record header size overflow"))?;
@@ -1936,6 +2154,56 @@ impl Btree {
             let (ptype, n_cell, _) = raw_page_header(pgno, usable, raw)?;
             let cell: RawIndexCell<'_> = match ptype {
                 BtreePageType::IndexLeaf => {
+                    let hdr_off = if pgno == 1 {
+                        sqliters_pager::DB_HEADER_SIZE
+                    } else {
+                        0
+                    };
+                    if raw[hdr_off] == P3V1_INDEX_LEAF_BYTE && cell_idx < n_cell {
+                        let fp_mode = raw[hdr_off + 8];
+                        let s = hdr_off + 12 + 12 * cell_idx;
+                        let cfp = u64::from_le_bytes([
+                            raw[s],
+                            raw[s + 1],
+                            raw[s + 2],
+                            raw[s + 3],
+                            raw[s + 4],
+                            raw[s + 5],
+                            raw[s + 6],
+                            raw[s + 7],
+                        ]);
+                        if fp_mode == FP_MODE_INT32_PAIR {
+                            if rhs_values.len() >= 2
+                                && orders_allow_int32_pair_fp(orders)
+                                && let Some(pfp) = compute_int32_pair_fp_from_values(rhs_values)
+                            {
+                                match cfp.cmp(&pfp) {
+                                    Ordering::Less => return Ok(Ordering::Less),
+                                    Ordering::Greater => return Ok(Ordering::Greater),
+                                    Ordering::Equal if rhs_values.len() == 2 => {
+                                        return Ok(Ordering::Equal);
+                                    }
+                                    Ordering::Equal => {}
+                                }
+                            } else if rhs_values.len() == 1
+                                && orders_allow_col0_fp(orders, enc)
+                                && let Value::Integer(v0) = rhs_values[0]
+                                && let Ok(i0) = i32::try_from(v0)
+                            {
+                                let pu0 = (i0 as u32) ^ 0x8000_0000;
+                                return Ok(((cfp >> 32) as u32).cmp(&pu0));
+                            }
+                        } else if fp_mode == FP_MODE_UNIVERSAL_COL0
+                            && orders_allow_col0_fp(orders, enc)
+                        {
+                            let pfp = compute_universal_col0_fp_from_value(&rhs_values[0]);
+                            match cfp.cmp(&pfp) {
+                                Ordering::Less => return Ok(Ordering::Less),
+                                Ordering::Greater => return Ok(Ordering::Greater),
+                                Ordering::Equal => {}
+                            }
+                        }
+                    }
                     read_index_leaf_cell(pgno, usable, raw, n_cell, cell_idx)?
                 }
                 BtreePageType::IndexInterior => {
@@ -1952,7 +2220,77 @@ impl Btree {
             if total == 0 {
                 return Ok(Ordering::Equal);
             }
-            if cell.local_payload.len() >= 9 || cell.local_payload.len() == total {
+            if is_p3v1_record(cell.local_payload) {
+                match Self::p3v1_prefix_counts(cell.local_payload)? {
+                    Some((col_count, hdr_len)) => {
+                        if hdr_len > total {
+                            return Err(SqliteError::corrupt(
+                                "record header exceeds record length",
+                            ));
+                        }
+                        if hdr_len <= cell.local_payload.len() {
+                            let limit = col_count.min(rhs_values.len());
+                            let mut need_ovfl = false;
+                            let mut end_needed = hdr_len;
+                            for (col_i, rhs_val) in rhs_values.iter().enumerate().take(limit) {
+                                let (start, end, tag) =
+                                    p3v1_column_offset_and_tag(cell.local_payload, col_i)?
+                                        .ok_or_else(|| {
+                                            SqliteError::corrupt("corrupt P3v1 record")
+                                        })?;
+                                if end > total {
+                                    return Err(SqliteError::corrupt("record payload truncated"));
+                                }
+                                if !need_ovfl && (start == end || end <= cell.local_payload.len()) {
+                                    let slice = if start == end {
+                                        &[][..]
+                                    } else {
+                                        &cell.local_payload[start..end]
+                                    };
+                                    let a = decode_p3v1_tag_value_with_encoding(tag, slice, enc)?;
+                                    let default_spec = KeySortOrder::default();
+                                    let spec = orders.get(col_i).unwrap_or(&default_spec);
+                                    let ord =
+                                        compare_two_values_with_order(&a, rhs_val, spec, enc)?;
+                                    if ord != Ordering::Equal {
+                                        return Ok(ord);
+                                    }
+                                } else {
+                                    need_ovfl = true;
+                                    end_needed = end;
+                                }
+                            }
+                            if !need_ovfl {
+                                return Ok(Ordering::Equal);
+                            }
+                            Some((
+                                cell.total_payload_len,
+                                cell.local_payload.to_vec(),
+                                cell.overflow_page,
+                                Some(end_needed),
+                            ))
+                        } else {
+                            Some((
+                                cell.total_payload_len,
+                                cell.local_payload.to_vec(),
+                                cell.overflow_page,
+                                None,
+                            ))
+                        }
+                    }
+                    None => {
+                        if cell.local_payload.len() >= total {
+                            return Err(SqliteError::corrupt("corrupt P3v1 record"));
+                        }
+                        Some((
+                            cell.total_payload_len,
+                            cell.local_payload.to_vec(),
+                            cell.overflow_page,
+                            None,
+                        ))
+                    }
+                }
+            } else if cell.local_payload.len() >= 9 || cell.local_payload.len() == total {
                 let (hdr_size_u64, mut hdr_pos) = get_varint(cell.local_payload)?;
                 let hdr_size = usize::try_from(hdr_size_u64)
                     .map_err(|_| SqliteError::corrupt("record header size overflow"))?;
@@ -2029,6 +2367,31 @@ impl Btree {
             }
             None => self.read_full_payload(total_len, &local_copy, ovfl)?,
         };
+
+        if is_p3v1_record(&buf) {
+            let Some((col_count, hdr_len)) = Self::p3v1_prefix_counts(&buf)? else {
+                return Err(SqliteError::corrupt("corrupt P3v1 record"));
+            };
+            if hdr_len > total_len as usize || hdr_len > buf.len() {
+                return Err(SqliteError::corrupt("record header exceeds record length"));
+            }
+            let limit = col_count.min(rhs_values.len());
+            for (col_i, rhs_val) in rhs_values.iter().enumerate().take(limit) {
+                let (start, end, tag) = p3v1_column_offset_and_tag(&buf, col_i)?
+                    .ok_or_else(|| SqliteError::corrupt("corrupt P3v1 record"))?;
+                if end > buf.len() {
+                    return Err(SqliteError::corrupt("record payload truncated"));
+                }
+                let a = decode_p3v1_tag_value_with_encoding(tag, &buf[start..end], enc)?;
+                let default_spec = KeySortOrder::default();
+                let spec = orders.get(col_i).unwrap_or(&default_spec);
+                let ord = compare_two_values_with_order(&a, rhs_val, spec, enc)?;
+                if ord != Ordering::Equal {
+                    return Ok(ord);
+                }
+            }
+            return Ok(Ordering::Equal);
+        }
 
         let (hdr_size_u64, mut hdr_pos) = get_varint(&buf)?;
         let hdr_size = usize::try_from(hdr_size_u64)

@@ -4,7 +4,10 @@
 use sqliters_pager::{AutoVacuumMode, DB_HEADER_SIZE, TransactionState};
 use sqliters_types::{Pgno, Result, SqliteError, get_varint, get_varint_i64};
 
-use crate::page::{BtreePageType, ParsedPage, PayloadBounds, raw_cell_offset, raw_page_header};
+use crate::page::{
+    BtreePageType, P3V1_INDEX_LEAF_BYTE, P3V1_OVFL_SENTINEL, ParsedPage, PayloadBounds,
+    is_p3v1_leaf_byte, raw_cell_offset, raw_page_header,
+};
 use crate::{AllocMode, Btree};
 
 /// Entry type stored in byte `0` of each 5-byte pointer-map record (`btreeInt.h:664-668`).
@@ -270,59 +273,76 @@ impl Btree {
                         "ptrmap Overflow1 parent {ptr_page} is a table interior page"
                     )));
                 }
+                let hdr_off = if ptr_page == 1 { DB_HEADER_SIZE } else { 0 };
+                let is_p3v1_leaf = is_p3v1_leaf_byte(raw[hdr_off]);
                 let hdr_size = ptype.header_size();
                 let tbl_bounds = PayloadBounds::for_table_leaf(usable);
                 let idx_bounds = PayloadBounds::for_index(usable);
 
                 for i in 0..n_cell {
                     let cell_off = raw_cell_offset(ptr_page, usable, raw, hdr_size, n_cell, i)?;
-                    let ovfl_ptr_off = match ptype {
-                        BtreePageType::TableLeaf => {
-                            let slice = &raw[cell_off..usable_usize];
-                            let (payload_u64, n1) = get_varint(slice)?;
-                            let (_, n2) = get_varint_i64(&slice[n1..])?;
-                            let total_len = u32::try_from(payload_u64).map_err(|_| {
-                                SqliteError::corrupt("table leaf cell payload exceeds 4GiB")
-                            })?;
-                            let local_len = tbl_bounds.local_len(total_len);
-                            if (local_len as u32) < total_len {
-                                Some(cell_off + n1 + n2 + local_len)
-                            } else {
-                                None
-                            }
+                    let ovfl_ptr_off = if is_p3v1_leaf {
+                        let actual_hdr = if raw[hdr_off] == P3V1_INDEX_LEAF_BYTE {
+                            12
+                        } else {
+                            8
+                        };
+                        let s = hdr_off + actual_hdr + 12 * i;
+                        let len_flags = u16::from_le_bytes([raw[s + 10], raw[s + 11]]);
+                        if len_flags == P3V1_OVFL_SENTINEL {
+                            Some(cell_off + 4)
+                        } else {
+                            None
                         }
-                        BtreePageType::IndexLeaf => {
-                            let slice = &raw[cell_off..usable_usize];
-                            let (payload_u64, n1) = get_varint(slice)?;
-                            let total_len = u32::try_from(payload_u64).map_err(|_| {
-                                SqliteError::corrupt("index leaf cell payload exceeds 4GiB")
-                            })?;
-                            let local_len = idx_bounds.local_len(total_len);
-                            if (local_len as u32) < total_len {
-                                Some(cell_off + n1 + local_len)
-                            } else {
-                                None
+                    } else {
+                        match ptype {
+                            BtreePageType::TableLeaf => {
+                                let slice = &raw[cell_off..usable_usize];
+                                let (payload_u64, n1) = get_varint(slice)?;
+                                let (_, n2) = get_varint_i64(&slice[n1..])?;
+                                let total_len = u32::try_from(payload_u64).map_err(|_| {
+                                    SqliteError::corrupt("table leaf cell payload exceeds 4GiB")
+                                })?;
+                                let local_len = tbl_bounds.local_len(total_len);
+                                if (local_len as u32) < total_len {
+                                    Some(cell_off + n1 + n2 + local_len)
+                                } else {
+                                    None
+                                }
                             }
+                            BtreePageType::IndexLeaf => {
+                                let slice = &raw[cell_off..usable_usize];
+                                let (payload_u64, n1) = get_varint(slice)?;
+                                let total_len = u32::try_from(payload_u64).map_err(|_| {
+                                    SqliteError::corrupt("index leaf cell payload exceeds 4GiB")
+                                })?;
+                                let local_len = idx_bounds.local_len(total_len);
+                                if (local_len as u32) < total_len {
+                                    Some(cell_off + n1 + local_len)
+                                } else {
+                                    None
+                                }
+                            }
+                            BtreePageType::IndexInterior => {
+                                if cell_off + 4 >= usable_usize {
+                                    return Err(SqliteError::corrupt(format!(
+                                        "truncated index interior cell on page {ptr_page}"
+                                    )));
+                                }
+                                let slice = &raw[cell_off + 4..usable_usize];
+                                let (payload_u64, n1) = get_varint(slice)?;
+                                let total_len = u32::try_from(payload_u64).map_err(|_| {
+                                    SqliteError::corrupt("index interior cell payload exceeds 4GiB")
+                                })?;
+                                let local_len = idx_bounds.local_len(total_len);
+                                if (local_len as u32) < total_len {
+                                    Some(cell_off + 4 + n1 + local_len)
+                                } else {
+                                    None
+                                }
+                            }
+                            BtreePageType::TableInterior => unreachable!("checked above"),
                         }
-                        BtreePageType::IndexInterior => {
-                            if cell_off + 4 >= usable_usize {
-                                return Err(SqliteError::corrupt(format!(
-                                    "truncated index interior cell on page {ptr_page}"
-                                )));
-                            }
-                            let slice = &raw[cell_off + 4..usable_usize];
-                            let (payload_u64, n1) = get_varint(slice)?;
-                            let total_len = u32::try_from(payload_u64).map_err(|_| {
-                                SqliteError::corrupt("index interior cell payload exceeds 4GiB")
-                            })?;
-                            let local_len = idx_bounds.local_len(total_len);
-                            if (local_len as u32) < total_len {
-                                Some(cell_off + 4 + n1 + local_len)
-                            } else {
-                                None
-                            }
-                        }
-                        BtreePageType::TableInterior => unreachable!("checked above"),
                     };
 
                     if let Some(ptr_off) = ovfl_ptr_off {
@@ -1448,6 +1468,7 @@ mod tests {
     fn test_balance_quick_1024_sequential_rows_packing_and_cursor_root_remap() {
         let vfs = Arc::new(MemoryVfs::new());
         let mut bt = open_av_disk_btree(vfs, "av_quick_pack.db", 1024, AutoVacuumMode::Full);
+        bt.set_p3v1(false).unwrap();
 
         bt.begin_write().unwrap();
         let t1 = bt.create_table().unwrap();

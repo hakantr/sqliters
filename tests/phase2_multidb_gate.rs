@@ -1140,6 +1140,7 @@ finish_test
 
 #[test]
 fn test_gate2_3_name_resolution_vdbe_vs_interpreter_c_parity_and_autovacuum() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let sandbox = Gate2Sandbox::new("resolution");
 
     // --- 3A. Unqualified `temp -> main -> attached` Resolution Across SELECT/INSERT/UPDATE/DELETE/DROP ---
@@ -1420,6 +1421,7 @@ fn test_gate2_3_name_resolution_vdbe_vs_interpreter_c_parity_and_autovacuum() {
 
 #[test]
 fn test_gate2_4_intra_db_foreign_keys_and_multidb_savepoint_stack() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let sandbox = Gate2Sandbox::new("fk_savepoint");
 
     // --- 4A. Intra-`DatabaseId` Immediate & Deferred Foreign Keys + `PRAGMA aux.foreign_key_check` ---
@@ -1580,6 +1582,7 @@ fn test_gate2_4_intra_db_foreign_keys_and_multidb_savepoint_stack() {
 
 #[test]
 fn test_gate2_5_multidb_pragmas_and_vacuum_into() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let sandbox = Gate2Sandbox::new("pragmas_vacuum");
 
     // --- 5A. `PRAGMA database_list` vs `PRAGMA lock_status` (`closed`, `unknown`, `exclusive`, disk lock) ---
@@ -1765,6 +1768,7 @@ fn test_gate2_5_multidb_pragmas_and_vacuum_into() {
 
 #[test]
 fn test_gate2_6_sql_vdbe_commit_coordinator_commit_hook_and_c_2pc_interop() {
+    let _legacy = sqliters::types::LegacyFormat3Guard::enter();
     let sandbox = Gate2Sandbox::new("2pc_coordinator");
 
     // --- 6A. `main` (`DELETE`) + `aux` (`DELETE`) -> `-mj` Created + Pre/Post-Unlink Crash Recovery in C & Rust ---
