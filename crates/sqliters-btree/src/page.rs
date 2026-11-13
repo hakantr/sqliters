@@ -1321,8 +1321,7 @@ pub fn probe_table_leaf_replace_at_raw(
     }
 }
 
-/// `true` when cell `idx` of the raw `TableLeaf` (`0x0d`) page carries `rowid` and deleting it
-/// leaves the page in the tree (the page is the root, or keeps at least one other cell).
+/// `true` when cell `idx` of the raw `TableLeaf` (`0x0d`) page carries `rowid`.
 pub fn table_leaf_cell_has_rowid(
     pgno: Pgno,
     usable_size: u32,
@@ -1340,7 +1339,8 @@ pub fn table_leaf_cell_has_rowid(
     let n_cell = u16::from_be_bytes([raw[hdr_off + 3], raw[hdr_off + 4]]) as usize;
     let ptr_base = hdr_off + 8;
     let ptr_end = ptr_base + 2 * n_cell;
-    if idx >= n_cell || ptr_end > usable || (n_cell == 1 && !is_root) {
+    let _ = is_root;
+    if idx >= n_cell || ptr_end > usable {
         return false;
     }
     let p = ptr_base + 2 * idx;
@@ -1923,6 +1923,22 @@ pub fn find_index_interior_child_in_place(
     orders: &[KeySortOrder],
     enc: TextEncoding,
 ) -> Result<Option<Pgno>> {
+    Ok(
+        find_index_interior_slot_in_place(pgno, usable_size, raw, key_vals, orders, enc)?
+            .map(|(_, child)| child),
+    )
+}
+
+/// [`find_index_interior_child_in_place`] that also reports the child-pointer slot taken
+/// (`0..n_cell` = left child of that cell, `n_cell` = the right-most child).
+pub fn find_index_interior_slot_in_place(
+    pgno: Pgno,
+    usable_size: u32,
+    raw: &[u8],
+    key_vals: &[Value],
+    orders: &[KeySortOrder],
+    enc: TextEncoding,
+) -> Result<Option<(usize, Pgno)>> {
     let usable = usable_size as usize;
     let hdr_off = if pgno == 1 { DB_HEADER_SIZE } else { 0 };
     if hdr_off + 12 > usable || raw[hdr_off] != BtreePageType::IndexInterior as u8 {
@@ -2000,7 +2016,7 @@ pub fn find_index_interior_child_in_place(
     if child == 0 {
         return Ok(None);
     }
-    Ok(Some(child))
+    Ok(Some((lo, child)))
 }
 
 /// Probes a raw `IndexLeaf` (`0x0a`) page for O(log N) in-place defragmented insertion without
@@ -2777,12 +2793,8 @@ pub fn try_delete_table_leaf_in_place(
         return Ok(RawLeafDeleteOutcome::NotFound);
     };
 
-    if n_cell == 1 && !is_root {
-        return Ok(RawLeafDeleteOutcome::DeletedInPlace {
-            overflow_page,
-            now_empty: true,
-        });
-    }
+    // (`dropCell` empties a non-root leaf in place as well; `balance()` then merges it.)
+    let _ = is_root;
 
     if idx + 1 < n_cell {
         raw.copy_within(

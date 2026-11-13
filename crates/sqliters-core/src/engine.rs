@@ -15803,7 +15803,26 @@ fn remove_row_and_indexes(
     rkey: &TableRowKey,
     params: &[Value],
 ) -> Result<bool> {
+    remove_row_and_indexes_opt(ctx, db_id, tbl, indexes, rkey, params, false)
+}
+
+/// [`remove_row_and_indexes`]; with `keep_table_row` only the index entries of the row are
+/// deleted (`sqlite3GenerateRowIndexDelete`) and the table row stays where it is, to be
+/// overwritten by the insert that follows (C: `REPLACE` on a rowid conflict without DELETE
+/// triggers or foreign keys, `insert.c` `case OE_Replace` of the rowid constraint).
+fn remove_row_and_indexes_opt(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    indexes: &[IndexSchema],
+    rkey: &TableRowKey,
+    params: &[Value],
+    keep_table_row: bool,
+) -> Result<bool> {
     check_table_not_pinned(ctx, db_id, tbl.root_pgno)?;
+    if indexes.is_empty() && keep_table_row {
+        return Ok(seek_table_raw_entry(ctx, db_id, tbl, rkey)?.is_some());
+    }
     if indexes.is_empty() {
         let Some(slot) = ctx.db_set.slot_mut(db_id) else {
             return Ok(false);
@@ -15835,6 +15854,12 @@ fn remove_row_and_indexes(
         }
     }
     let inst_id_opt = ctx.db_set.slot(db_id).map(|s| s.schema_instance_id);
+    if keep_table_row {
+        if let (TableRowKey::Rowid(rid), Some(inst_id)) = (rkey, inst_id_opt) {
+            ctx.db_set.expire_blobs_for_row(inst_id, &tbl.name, *rid);
+        }
+        return Ok(true);
+    }
     let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) else {
         return Ok(false);
     };
@@ -15933,6 +15958,36 @@ fn delete_row_via_pipeline(
     is_catalog: bool,
     params: &[Value],
 ) -> Result<bool> {
+    delete_row_via_pipeline_opt(
+        ctx,
+        db_id,
+        tbl,
+        indexes,
+        rkey,
+        old_vals_opt,
+        origin,
+        effective_conflict,
+        is_catalog,
+        params,
+        false,
+    )
+}
+
+/// [`delete_row_via_pipeline`]; `keep_table_row` as in [`remove_row_and_indexes_opt`].
+#[allow(clippy::too_many_arguments)]
+fn delete_row_via_pipeline_opt(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    indexes: &[IndexSchema],
+    rkey: &TableRowKey,
+    old_vals_opt: Option<&[Value]>,
+    origin: MutationOrigin,
+    effective_conflict: ConflictAction,
+    is_catalog: bool,
+    params: &[Value],
+    keep_table_row: bool,
+) -> Result<bool> {
     let captured_old = if ctx.mutation_pipeline.is_trace_enabled() {
         if let Some(ov) = old_vals_opt {
             Some(ov.to_vec())
@@ -15947,7 +16002,8 @@ fn delete_row_via_pipeline(
         None
     };
 
-    let deleted = remove_row_and_indexes(ctx, db_id, tbl, indexes, rkey, params)?;
+    let deleted =
+        remove_row_and_indexes_opt(ctx, db_id, tbl, indexes, rkey, params, keep_table_row)?;
     if deleted {
         let emit_update_hook = match origin {
             MutationOrigin::ReplaceConflictDelete => false,
@@ -16431,6 +16487,7 @@ fn replace_conflict_delete_row(
     ckey: &TableRowKey,
     is_catalog: bool,
     pin_data_cursor: bool,
+    rowid_conflict: bool,
     params: &[Value],
     did_replace_delete: &mut bool,
     did_replace_trigger: &mut bool,
@@ -16497,7 +16554,21 @@ fn replace_conflict_delete_row(
         if *ctx.foreign_keys {
             check_parent_delete_restrict(ctx, db_id, tbl, &cvals2, params)?;
         }
-        delete_row_via_pipeline(
+        // `insert.c`, rowid constraint, `case OE_Replace`: with DELETE triggers (and
+        // recursive triggers on) or foreign keys the conflicting row is deleted
+        // (`sqlite3GenerateRowDelete`); otherwise only its index entries are
+        // (`sqlite3GenerateRowIndexDelete`) and the table b-tree entry "will be replaced by the
+        // new entry when it is inserted" - no delete, hence no rebalance, of the table tree.
+        let keep_table_row = rowid_conflict
+            && !tbl.without_rowid
+            && !run_del_triggers
+            && !(*ctx.foreign_keys
+                && (!tbl.foreign_keys.is_empty()
+                    || ctx
+                        .db_set
+                        .slot(db_id)
+                        .is_some_and(|s| !find_referencing_fks(&s.schema, &tbl.name).is_empty())));
+        delete_row_via_pipeline_opt(
             ctx,
             db_id,
             tbl,
@@ -16508,6 +16579,7 @@ fn replace_conflict_delete_row(
             ConflictAction::Replace,
             is_catalog,
             params,
+            keep_table_row,
         )?;
         *did_replace_delete = true;
         if *ctx.foreign_keys {
@@ -16708,6 +16780,7 @@ fn validate_and_write_row(
                         &conflict_key,
                         is_catalog,
                         false,
+                        true,
                         params,
                         did_replace_delete,
                         did_replace_trigger,
@@ -16763,6 +16836,7 @@ fn validate_and_write_row(
                             &conflict_key,
                             is_catalog,
                             existing_self_key.is_some(),
+                            false,
                             params,
                             &mut did_replace_delete,
                             &mut did_replace_trigger,
@@ -16829,6 +16903,7 @@ fn validate_and_write_row(
                             &ckey,
                             is_catalog,
                             existing_self_key.is_some(),
+                            false,
                             params,
                             &mut did_replace_delete,
                             &mut did_replace_trigger,
@@ -21897,6 +21972,7 @@ fn execute_upsert_table_insert_row(
                                 &ckey,
                                 p.is_catalog,
                                 false,
+                                true,
                                 params,
                                 &mut did_replace_delete,
                                 &mut did_replace_trigger,
@@ -21947,6 +22023,7 @@ fn execute_upsert_table_insert_row(
                                     &p.indexes,
                                     &ckey,
                                     p.is_catalog,
+                                    false,
                                     false,
                                     params,
                                     &mut did_replace_delete,
@@ -22038,6 +22115,7 @@ fn execute_upsert_table_insert_row(
                                         &p.indexes,
                                         &ckey,
                                         p.is_catalog,
+                                        false,
                                         false,
                                         params,
                                         &mut did_replace_delete,

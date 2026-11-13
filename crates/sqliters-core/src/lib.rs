@@ -12759,6 +12759,8 @@ mod c_align_5g_tests;
 mod c_align_5h_tests;
 #[cfg(test)]
 mod c_align_5j_tests;
+#[cfg(test)]
+mod c_align_h1_tests;
 /// Regression tests for behaviour that has to match C SQLite 3.54.1 (step 5e): every expected
 /// value below is what the reference `sqlite3` produces for the same statements.
 #[cfg(test)]
