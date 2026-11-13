@@ -29,9 +29,10 @@ fn test_cli_binary_json_csv_dump_and_sqlite3_compat() {
         .output()
         .expect("run sqliters cli -json");
     assert!(json_out.status.success());
+    // C SQLite 3.54.1 (`sqlite3 -json`): one row per line, rows separated by "},\n{".
     assert_eq!(
-        String::from_utf8_lossy(&json_out.stdout).trim(),
-        r#"[{"id":1,"name":"İstanbul"},{"id":2,"name":"Ankara"}]"#
+        String::from_utf8_lossy(&json_out.stdout),
+        "[{\"id\":1,\"name\":\"İstanbul\"},\n{\"id\":2,\"name\":\"Ankara\"}]\n"
     );
 
     let csv_out = Command::new(bin)
@@ -42,9 +43,11 @@ fn test_cli_binary_json_csv_dump_and_sqlite3_compat() {
         .output()
         .expect("run sqliters cli -csv");
     assert!(csv_out.status.success());
+    // C SQLite 3.54.1 (`sqlite3 -csv -header`): rows end with CR LF and a text field that
+    // holds a non-ASCII byte is quoted.
     assert_eq!(
-        String::from_utf8_lossy(&csv_out.stdout).trim(),
-        "id,name\n1,İstanbul\n2,Ankara"
+        String::from_utf8_lossy(&csv_out.stdout),
+        "id,name\r\n1,\"İstanbul\"\r\n2,Ankara\r\n"
     );
 
     let c_check = Command::new("sqlite3")

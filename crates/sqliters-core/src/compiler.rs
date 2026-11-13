@@ -8986,9 +8986,8 @@ where
                     &mut active_views,
                     &mut push_node,
                 )?;
-            } else {
-                let _ = push_node(0, "EXECUTE STATEMENT".to_owned());
             }
+            // (INSERT ... VALUES has no query plan: C returns no row.)
         }
         Stmt::Update(upd) => {
             if let Some((_, sname, slot_schema, ResolvedRelation::Table(tbl))) =
@@ -9052,9 +9051,9 @@ where
                 emit_plan_nodes(0, &plan, disp, "", &mut push_node);
             }
         }
-        _ => {
-            let _ = push_node(0, "EXECUTE STATEMENT".to_owned());
-        }
+        // Every other statement (DDL, PRAGMA, transaction control ...) has no query plan: like
+        // C SQLite, EXPLAIN QUERY PLAN returns no row for it.
+        _ => {}
     }
 
     Ok(rows)

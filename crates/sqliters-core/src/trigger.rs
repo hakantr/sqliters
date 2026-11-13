@@ -203,8 +203,21 @@ pub fn resolve_and_validate_create_trigger(
         }
     };
 
+    // 3b. `trigger.c:189`: no triggers on shadow tables while they are read-only.
+    if let ResolvedRelation::Table(t) = &target_rel
+        && db_set.defensive()
+        && db_set.is_shadow_table_in_db(target_db_id, &t.name)
+    {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            "cannot create triggers on shadow tables",
+        ));
+    }
+
     // 4. `sqlite3CheckObjectName` (`trigger.c:201`)
-    if !writable_schema && is_reserved_trigger_or_system_name(&ct.name.name) {
+    if (!writable_schema && is_reserved_trigger_or_system_name(&ct.name.name))
+        || db_set.is_reserved_shadow_name(&ct.name.name)
+    {
         return Err(SqliteError::new(
             ErrorCode::Error,
             format!("object name reserved for internal use: {}", ct.name.name),
@@ -291,6 +304,28 @@ pub fn resolve_and_validate_create_trigger(
         let _ = fix_permanent_trigger(&ct.name.name, slot_name, ct.when_clause.as_ref(), &ct.body)?;
     } else {
         validate_trigger_no_parameters(ct.when_clause.as_ref(), &ct.body)?;
+    }
+
+    // 11. `sqlite3FinishTrigger` (`trigger.c:377-388`): while shadow tables are read-only a new
+    // trigger may not write to one.
+    for step in &ct.body {
+        let target = match step {
+            TriggerStep::Select(_) => None,
+            TriggerStep::Insert(ins) => Some(&ins.table.name),
+            TriggerStep::Update(upd) => Some(&upd.table.name),
+            TriggerStep::Delete(del) => Some(&del.table.name),
+        };
+        if let Some(name) = target
+            && db_set.is_reserved_shadow_name(name)
+        {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!(
+                    "trigger \"{}\" may not write to shadow table \"{name}\"",
+                    ct.name.name
+                ),
+            ));
+        }
     }
 
     let target_schema_instance_id = db_set

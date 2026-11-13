@@ -1583,6 +1583,19 @@ impl Drop for DualConnSession<'_> {
 }
 
 impl ConnectionInner {
+    /// Recomputes the effective `writable_schema` state (`sqlite3WritableSchema()`: the
+    /// `SQLITE_WriteSchema` bit set and `SQLITE_Defensive` clear) after either flag changed
+    /// and pushes it down to the open b-trees.
+    pub(crate) fn sync_writable_schema(&mut self) {
+        let on = self.db_set.writable_schema_effective();
+        self.writable_schema = on;
+        for slot in self.db_set.slots_mut() {
+            if let Some(ref mut bt) = slot.btree {
+                bt.set_writable_schema(on);
+            }
+        }
+    }
+
     pub(crate) fn ensure_usable(&self) -> Result<()> {
         match &self.state {
             ConnectionState::Open => Ok(()),
@@ -4257,6 +4270,7 @@ impl Connection {
         inner.ensure_usable()?;
         let prev = inner.db_set.defensive();
         inner.db_set.set_defensive(enabled);
+        inner.sync_writable_schema();
         if prev != enabled {
             inner.schema_generation += 1;
             inner.v1_expire_generation += 1;
@@ -4283,6 +4297,7 @@ impl Connection {
                 let inner = session.inner_mut();
                 let prev = inner.db_set.defensive();
                 let cur = inner.db_set.set_defensive(flag);
+                inner.sync_writable_schema();
                 if prev != cur {
                     inner.schema_generation += 1;
                     inner.v1_expire_generation += 1;
@@ -4291,6 +4306,32 @@ impl Connection {
             } else {
                 session.inner().db_set.defensive()
             }
+        } else {
+            false
+        }
+    }
+
+    /// Queries (`enabled == None`) or updates (`enabled == Some(b)`)
+    /// `SQLITE_DBCONFIG_WRITABLE_SCHEMA`, returning the state of the flag. Like
+    /// `sqlite3_db_config()` this sets the `SQLITE_WriteSchema` bit even in defensive mode
+    /// (where `PRAGMA writable_schema=ON` is ignored); the schema is writable only while the
+    /// bit is set and defensive mode is off.
+    pub fn db_config_writable_schema(&self, enabled: Option<bool>) -> bool {
+        if let Ok(mut session) = self.shared.enter() {
+            if session.inner().ensure_usable().is_err() {
+                return false;
+            }
+            if let Some(flag) = enabled {
+                let inner = session.inner_mut();
+                let prev = inner.db_set.writable_schema_flag();
+                inner.db_set.set_writable_schema_flag(flag);
+                inner.sync_writable_schema();
+                if prev != flag {
+                    inner.schema_generation += 1;
+                    inner.v1_expire_generation += 1;
+                }
+            }
+            session.inner().db_set.writable_schema_flag()
         } else {
             false
         }
@@ -12709,11 +12750,15 @@ mod tests {
 #[cfg(test)]
 mod backup_c_align_5i_tests;
 #[cfg(test)]
+mod backup_c_align_5j_tests;
+#[cfg(test)]
 mod backup_locking_tests;
 #[cfg(test)]
 mod c_align_5g_tests;
 #[cfg(test)]
 mod c_align_5h_tests;
+#[cfg(test)]
+mod c_align_5j_tests;
 /// Regression tests for behaviour that has to match C SQLite 3.54.1 (step 5e): every expected
 /// value below is what the reference `sqlite3` produces for the same statements.
 #[cfg(test)]

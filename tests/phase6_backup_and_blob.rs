@@ -156,10 +156,16 @@ fn backup_init_guards_distinct_connection_file_unknown_db_readonly_and_in_use() 
     assert_eq!(err.code, ErrorCode::Error);
     assert!(err.message.contains("unknown database no_such_dst"));
 
-    // 4. Read-only destination connection rejected with `ErrorCode::ReadOnly`.
+    // 4. Read-only destination connection: as in C SQLite 3.54.1, `sqlite3_backup_init` accepts
+    // it, and the first `sqlite3_backup_step` (which starts the destination's write
+    // transaction) and then `sqlite3_backup_finish` return `SQLITE_READONLY` (8).
     dst_conn.execute("CREATE TABLE dummy(a INT);").unwrap();
     let ro_dst = Connection::open_with_flags(&dst_path, OpenFlags::READONLY).unwrap();
-    let err = conn.backup_init("main", &ro_dst, "main").unwrap_err();
+    let mut ro_bkp = conn.backup_init("main", &ro_dst, "main").unwrap();
+    let err = ro_bkp.step(5).unwrap_err();
+    assert_eq!(err.code, ErrorCode::ReadOnly);
+    assert_eq!((ro_bkp.remaining(), ro_bkp.pagecount()), (0, 0));
+    let err = ro_bkp.finish().unwrap_err();
     assert_eq!(err.code, ErrorCode::ReadOnly);
 
     // 5. Destination connection with an active transaction rejected (`destination database is in use`).
@@ -385,7 +391,9 @@ fn backup_page_size_conversion_and_wal_page_size_mismatch_guard() {
     let mut bad_bkp = src_1k.backup_init("main", &dst_wal, "main").unwrap();
     let err = bad_bkp.step(1).unwrap_err();
     assert_eq!(err.code, ErrorCode::ReadOnly);
-    bad_bkp.finish().unwrap();
+    // C SQLite 3.54.1: `sqlite3_backup_finish` returns the result of the failed step.
+    let err = bad_bkp.finish().unwrap_err();
+    assert_eq!(err.code, ErrorCode::ReadOnly);
 }
 
 #[test]

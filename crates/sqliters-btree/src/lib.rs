@@ -2751,6 +2751,16 @@ impl Btree {
                 old_cell_len,
                 content_top,
             }) => {
+                if page::table_leaf_cell_is_identical(
+                    self.pager.read_page(leaf_pgno)?,
+                    rowid,
+                    payload,
+                    old_off,
+                    old_cell_len,
+                ) {
+                    // Same bytes: C does not make the page writable (`btreeOverwriteContent`).
+                    return Ok(true);
+                }
                 let secure = self.zero_freed_cells();
                 let raw_mut = self.pager.write_page(leaf_pgno)?;
                 apply_replace_table_leaf_raw(
@@ -2891,6 +2901,16 @@ impl Btree {
                 } => {
                     if !allow_replace {
                         return Ok(FastTableInsertOutcome::Duplicate);
+                    }
+                    if page::table_leaf_cell_is_identical(
+                        self.pager.read_page(cur_pgno)?,
+                        rowid,
+                        payload,
+                        old_off,
+                        old_cell_len,
+                    ) {
+                        // Same bytes: C does not make the page writable (`btreeOverwriteContent`).
+                        return Ok(FastTableInsertOutcome::Inserted);
                     }
                     let secure = self.zero_freed_cells();
                     let raw_mut = self.pager.write_page(cur_pgno)?;

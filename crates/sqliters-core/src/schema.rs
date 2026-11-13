@@ -35,6 +35,21 @@ pub struct CheckSchema {
     pub expr: Expr,
 }
 
+/// The declared type of a column as C SQLite keeps it (`sqlite3AddColumn` / `sqlite3StdType[]`
+/// in build.c): a type that is exactly one of the standard type names (in any letter case) is
+/// stored as a code, not as text, and reads back in its canonical upper-case spelling
+/// (`PRAGMA table_info`, `sqlite3_column_decltype`, the column list of `CREATE TABLE ... AS`).
+/// Every other type keeps the text of the declaration.
+pub(crate) fn canonical_std_type_name(decl: &str) -> String {
+    const STD: [&str; 6] = ["ANY", "BLOB", "INT", "INTEGER", "REAL", "TEXT"];
+    for t in STD {
+        if decl.eq_ignore_ascii_case(t) {
+            return t.to_owned();
+        }
+    }
+    decl.to_owned()
+}
+
 #[derive(Debug, Clone)]
 pub struct ColumnSchema {
     pub name: String,
@@ -1748,7 +1763,7 @@ pub fn build_table_schema_from_ast(
         let pk_order = usize::from(is_pk);
         columns.push(ColumnSchema {
             name: cdef.name.clone(),
-            type_name: cdef.type_name.clone(),
+            type_name: canonical_std_type_name(&cdef.type_name),
             affinity,
             collation,
             custom_collation: custom_collation.clone(),

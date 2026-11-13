@@ -2633,6 +2633,10 @@ fn execute_write_body_inner(
                 }
                 "SCHEMA_VERSION" => {
                     ctx.ensure_write_db(db_id, false)?;
+                    if ctx.db_set.defensive() {
+                        // pragma.c: PRAGMA schema_version=VALUE is a no-op in defensive mode.
+                        return Ok(QueryOutput::default());
+                    }
                     let v = pragma_to_i64(pv) as u32;
                     let slot = ctx.db_set.slot_mut(db_id).unwrap();
                     let slot_name = slot.name.clone();
@@ -18823,9 +18827,15 @@ fn resolve_dml_target_in_set(
 ) -> Result<DmlTarget> {
     if let Some(cat_db_id) = db_set.resolve_catalog_table(qn)? {
         if !writable_schema {
+            // (C names the table by its internal name whatever alias the statement used.)
+            let canonical = if cat_db_id == DatabaseId::TEMP {
+                "sqlite_temp_master"
+            } else {
+                "sqlite_master"
+            };
             return Err(SqliteError::new(
                 ErrorCode::Error,
-                format!("table {} may not be modified", qn.name),
+                format!("table {canonical} may not be modified"),
             ));
         }
         let mut tbl = TableSchema::sqlite_schema_table();
@@ -25266,7 +25276,9 @@ fn exec_create_table_started(
     started: Option<(Pgno, i64)>,
 ) -> Result<()> {
     let db_id = resolve_create_table_target(ctx.db_set, ct.temp, &ct.name)?;
-    if !*ctx.writable_schema && is_reserved_sqlite_name(&ct.name.name) {
+    if (!*ctx.writable_schema && is_reserved_sqlite_name(&ct.name.name))
+        || ctx.db_set.is_reserved_shadow_name(&ct.name.name)
+    {
         return Err(SqliteError::new(
             ErrorCode::Error,
             format!("object name reserved for internal use: {}", ct.name.name),
@@ -25435,7 +25447,9 @@ fn exec_create_virtual_table(
     catalog_sql: &str,
 ) -> Result<()> {
     let db_id = resolve_create_table_target(ctx.db_set, false, name)?;
-    if !*ctx.writable_schema && is_reserved_sqlite_name(&name.name) {
+    if (!*ctx.writable_schema && is_reserved_sqlite_name(&name.name))
+        || ctx.db_set.is_reserved_shadow_name(&name.name)
+    {
         return Err(SqliteError::new(
             ErrorCode::Error,
             format!("object name reserved for internal use: {}", name.name),
@@ -25584,7 +25598,9 @@ fn exec_create_table_as(
     params: &[Value],
 ) -> Result<()> {
     let db_id = resolve_create_table_target(ctx.db_set, temp, name)?;
-    if !*ctx.writable_schema && is_reserved_sqlite_name(&name.name) {
+    if (!*ctx.writable_schema && is_reserved_sqlite_name(&name.name))
+        || ctx.db_set.is_reserved_shadow_name(&name.name)
+    {
         return Err(SqliteError::new(
             ErrorCode::Error,
             format!("object name reserved for internal use: {}", name.name),
@@ -25790,7 +25806,9 @@ fn apply_root_page_move(btree: &mut Btree, schema: &mut Schema, mv: RootPageMove
 
 fn exec_create_view(ctx: &mut ExecContext<'_>, cv: &CreateViewStmt) -> Result<()> {
     let db_id = resolve_create_table_target(ctx.db_set, cv.temp, &cv.name)?;
-    if !*ctx.writable_schema && is_reserved_sqlite_name(&cv.name.name) {
+    if (!*ctx.writable_schema && is_reserved_sqlite_name(&cv.name.name))
+        || ctx.db_set.is_reserved_shadow_name(&cv.name.name)
+    {
         return Err(SqliteError::new(
             ErrorCode::Error,
             format!("object name reserved for internal use: {}", cv.name.name),
@@ -26524,16 +26542,23 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
 }
 
 fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<()> {
-    if !*ctx.writable_schema && is_reserved_sqlite_name(&ci.name.name) {
+    if (!*ctx.writable_schema && is_reserved_sqlite_name(&ci.name.name))
+        || ctx.db_set.is_reserved_shadow_name(&ci.name.name)
+    {
         return Err(SqliteError::new(
             ErrorCode::Error,
             format!("object name reserved for internal use: {}", ci.name.name),
         ));
     }
     if Schema::is_schema_table_name(&ci.table_name) {
+        let canonical = if Schema::is_temp_schema_table_name(&ci.table_name) {
+            "sqlite_temp_master"
+        } else {
+            "sqlite_master"
+        };
         return Err(SqliteError::new(
             ErrorCode::Error,
-            format!("table {} may not be indexed", ci.table_name),
+            format!("table {canonical} may not be indexed"),
         ));
     }
 
@@ -29266,7 +29291,9 @@ fn exec_alter_table(
                         "virtual tables may not be altered",
                     ));
                 };
-                if !*ctx.writable_schema && is_reserved_sqlite_name(new_name) {
+                if (!*ctx.writable_schema && is_reserved_sqlite_name(new_name))
+                    || ctx.db_set.is_reserved_shadow_name_absent(new_name)
+                {
                     return Err(SqliteError::new(
                         ErrorCode::Error,
                         format!("object name reserved for internal use: {new_name}"),
@@ -29410,7 +29437,9 @@ fn exec_alter_table(
 
     match action {
         AlterTableAction::RenameTo(new_name) => {
-            if !writable_schema && is_reserved_sqlite_name(new_name) {
+            if (!writable_schema && is_reserved_sqlite_name(new_name))
+                || ctx.db_set.is_reserved_shadow_name_absent(new_name)
+            {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!("object name reserved for internal use: {new_name}"),
@@ -36497,7 +36526,18 @@ fn exec_pragma(
                     PragmaValue::Ident(s) | PragmaValue::String(s)
                         if s.trim().eq_ignore_ascii_case("reset")
                 );
-                let on = pragma_to_bool(pv) || is_reset;
+                // pragma.c (flag pragmas): the SQLITE_WriteSchema bit cannot be switched on
+                // while SQLITE_DBCONFIG_DEFENSIVE is set; switching it off always works. The
+                // schema is writable only when the bit is set and defensive mode is off
+                // (sqlite3WritableSchema()).
+                if pragma_to_bool(pv) && !is_reset {
+                    if !ctx.db_set.defensive() {
+                        ctx.db_set.set_writable_schema_flag(true);
+                    }
+                } else {
+                    ctx.db_set.set_writable_schema_flag(false);
+                }
+                let on = ctx.db_set.writable_schema_effective();
                 *ctx.writable_schema = on;
                 for slot in ctx.db_set.slots_mut() {
                     if let Some(ref mut bt) = slot.btree {
@@ -36505,11 +36545,7 @@ fn exec_pragma(
                     }
                 }
                 if is_reset {
-                    *ctx.writable_schema = false;
                     for slot in ctx.db_set.slots_mut() {
-                        if let Some(ref mut bt) = slot.btree {
-                            bt.set_writable_schema(false);
-                        }
                         slot.schema = Schema::default();
                     }
                     *ctx.schema_generation += 1;
@@ -36519,7 +36555,7 @@ fn exec_pragma(
             }
             return Ok(single_col(
                 "writable_schema",
-                Value::Integer(i64::from(*ctx.writable_schema)),
+                Value::Integer(i64::from(ctx.db_set.writable_schema_flag())),
             ));
         }
         "FOREIGN_KEYS" => {
@@ -36798,7 +36834,12 @@ fn exec_pragma(
             if schema.is_none() {
                 if let Some(pv) = value {
                     let s = pragma_to_string(pv);
-                    if let Some(target) = JournalMode::from_pragma_str(s.trim()) {
+                    // pragma.c: journal mode OFF is not allowed in defensive mode ("the
+                    // database can become corrupted using ordinary SQL when the journal is
+                    // off"); the statement becomes a query of the current mode.
+                    let target_opt = JournalMode::from_pragma_str(s.trim())
+                        .filter(|t| !(ctx.db_set.defensive() && *t == JournalMode::Off));
+                    if let Some(target) = target_opt {
                         let mut main_mode = JournalMode::Delete;
                         for idx in (0..ctx.db_set.slot_count()).rev() {
                             if ctx.db_set.slots()[idx].btree.is_none() {
@@ -36822,9 +36863,11 @@ fn exec_pragma(
                     Value::Text(active.as_str().to_owned()),
                 ));
             }
+            let defensive = ctx.db_set.defensive();
             let target_opt = value.and_then(|pv| {
                 let s = pragma_to_string(pv);
                 JournalMode::from_pragma_str(s.trim())
+                    .filter(|t| !(defensive && *t == JournalMode::Off))
             });
             let active = apply_journal_mode_on_slot(ctx, db_id, target_opt)?;
             return Ok(single_col(
@@ -37796,6 +37839,12 @@ fn exec_pragma(
             if let Some(pv) = value {
                 let v = pragma_to_i64(pv) as u32;
                 ctx.ensure_write_db(db_id, false)?;
+                if ctx.db_set.defensive() {
+                    // pragma.c: "Do not allow the use of PRAGMA schema_version=VALUE in
+                    // defensive mode. Change the OP_SetCookie opcode into a no-op." (The
+                    // write transaction is still opened, like the OP_Transaction of C.)
+                    return Ok(QueryOutput::default());
+                }
                 let slot = ctx.db_set.slot_mut(db_id).unwrap();
                 let sname = slot.name.clone();
                 if let Some(ref mut bt) = slot.btree {
@@ -38849,7 +38898,9 @@ pub(crate) fn validate_and_infer_columns(
 
         Stmt::CreateTable(ct) => {
             let db_id = resolve_create_table_target(db_set, ct.temp, &ct.name)?;
-            if !writable_schema && is_reserved_sqlite_name(&ct.name.name) {
+            if (!writable_schema && is_reserved_sqlite_name(&ct.name.name))
+                || db_set.is_reserved_shadow_name(&ct.name.name)
+            {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!("object name reserved for internal use: {}", ct.name.name),
@@ -38952,7 +39003,9 @@ pub(crate) fn validate_and_infer_columns(
             query,
         } => {
             let db_id = resolve_create_table_target(db_set, *temp, name)?;
-            if !writable_schema && is_reserved_sqlite_name(&name.name) {
+            if (!writable_schema && is_reserved_sqlite_name(&name.name))
+                || db_set.is_reserved_shadow_name(&name.name)
+            {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!("object name reserved for internal use: {}", name.name),
@@ -39033,7 +39086,9 @@ pub(crate) fn validate_and_infer_columns(
 
         Stmt::CreateView(cv) => {
             let db_id = resolve_create_table_target(db_set, cv.temp, &cv.name)?;
-            if !writable_schema && is_reserved_sqlite_name(&cv.name.name) {
+            if (!writable_schema && is_reserved_sqlite_name(&cv.name.name))
+                || db_set.is_reserved_shadow_name(&cv.name.name)
+            {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!("object name reserved for internal use: {}", cv.name.name),
@@ -39097,7 +39152,9 @@ pub(crate) fn validate_and_infer_columns(
             ..
         } => {
             let db_id = resolve_create_table_target(db_set, false, name)?;
-            if !writable_schema && is_reserved_sqlite_name(&name.name) {
+            if (!writable_schema && is_reserved_sqlite_name(&name.name))
+                || db_set.is_reserved_shadow_name(&name.name)
+            {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!("object name reserved for internal use: {}", name.name),
@@ -39255,10 +39312,25 @@ pub(crate) fn validate_and_infer_columns(
         }
 
         Stmt::CreateIndex(ci) => {
-            if !writable_schema && is_reserved_sqlite_name(&ci.name.name) {
+            if (!writable_schema && is_reserved_sqlite_name(&ci.name.name))
+                || db_set.is_reserved_shadow_name(&ci.name.name)
+            {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!("object name reserved for internal use: {}", ci.name.name),
+                ));
+            }
+            if Schema::is_schema_table_name(&ci.table_name) {
+                // build.c sqlite3CreateIndex: "table %s may not be indexed" with the internal
+                // name of the schema table.
+                let canonical = if Schema::is_temp_schema_table_name(&ci.table_name) {
+                    "sqlite_temp_master"
+                } else {
+                    "sqlite_master"
+                };
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("table {canonical} may not be indexed"),
                 ));
             }
             let target_qn = QualifiedName {
@@ -39474,7 +39546,9 @@ pub(crate) fn validate_and_infer_columns(
             if let Some((vt_db_id, vt)) = db_set.find_virtual_table_in_set(table) {
                 match action {
                     AlterTableAction::RenameTo(new_name) => {
-                        if !writable_schema && is_reserved_sqlite_name(new_name) {
+                        if (!writable_schema && is_reserved_sqlite_name(new_name))
+                            || db_set.is_reserved_shadow_name_absent(new_name)
+                        {
                             return Err(SqliteError::new(
                                 ErrorCode::Error,
                                 format!("object name reserved for internal use: {new_name}"),
@@ -39536,7 +39610,9 @@ pub(crate) fn validate_and_infer_columns(
                 .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
             match action {
                 AlterTableAction::RenameTo(new_name) => {
-                    if !writable_schema && is_reserved_sqlite_name(new_name) {
+                    if (!writable_schema && is_reserved_sqlite_name(new_name))
+                        || db_set.is_reserved_shadow_name_absent(new_name)
+                    {
                         return Err(SqliteError::new(
                             ErrorCode::Error,
                             format!("object name reserved for internal use: {new_name}"),

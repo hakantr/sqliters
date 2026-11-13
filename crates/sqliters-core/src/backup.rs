@@ -56,6 +56,9 @@ pub struct Backup {
     dest_locked: bool,
     is_done: bool,
     fatal_error: Option<SqliteError>,
+    /// `p->rc` when it is an error: the result of the most recent [`Backup::step`] that failed
+    /// (including `SQLITE_BUSY` / `SQLITE_LOCKED`). [`Backup::finish`] returns it.
+    last_step_error: Option<SqliteError>,
     remaining: i32,
     pagecount: i32,
     last_src_page_size: u32,
@@ -150,12 +153,8 @@ impl Backup {
                 .as_ref()
                 .ok_or_else(|| SqliteError::misuse("destination database slot closed"))?;
 
-            if dst_shared.is_readonly || dst_bt.pager().is_readonly() {
-                return Err(SqliteError::new(
-                    ErrorCode::ReadOnly,
-                    "destination database is read-only",
-                ));
-            }
+            // (A read-only destination is accepted here, as in C: the first step fails with
+            // `SQLITE_READONLY` when it tries to start the destination's write transaction.)
 
             // Reject if both `src_db` and `dst_db` resolve to the same physical on-disk file.
             if src_bt.pager().db_kind() == DatabaseKind::NamedDisk
@@ -186,11 +185,13 @@ impl Backup {
             // `checkReadTransaction(pDestDb, pDest)` in `sqlite/src/backup.c:125-131`:
             // Reject if destination database already has an open transaction or active lease.
             let dst_instance_id = dst_slot.schema_instance_id;
+            // (Another backup object that targets the same destination but has not started
+            // its transaction yet does not make the destination "in use": C only looks at the
+            // transaction state of the destination b-tree.)
             if dst_bt.transaction_state() != TransactionState::Open
                 || dst_inner
                     .activity
                     .has_active_tx_on_instance(dst_instance_id)
-                || dst_slot.active_backups > 0
             {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
@@ -224,6 +225,7 @@ impl Backup {
             dest_locked: false,
             is_done: false,
             fatal_error: None,
+            last_step_error: None,
             // `sqlite3_backup_remaining()` / `sqlite3_backup_pagecount()` report 0 until the first
             // step has counted the source pages (the C object is zero-initialised).
             remaining: 0,
@@ -257,7 +259,22 @@ impl Backup {
         if let Some(ref err) = self.fatal_error {
             return Err(err.clone());
         }
+        let step_result = self.step_impl(n_pages);
+        // `p->rc = rc;`: every error but SQLITE_BUSY / SQLITE_LOCKED is final for the backup,
+        // and whatever the step returned is what `finish()` reports.
+        match step_result {
+            Err(ref err) => {
+                if err.code != ErrorCode::Busy && err.code != ErrorCode::Locked {
+                    self.fatal_error = Some(err.clone());
+                }
+                self.last_step_error = Some(err.clone());
+            }
+            Ok(_) => self.last_step_error = None,
+        }
+        step_result
+    }
 
+    fn step_impl(&mut self, n_pages: i32) -> Result<BackupStepResult> {
         let mut session = ConnectionShared::enter_dual(&self.src, &self.dst)?;
         let (src_inner, dst_inner) = session.src_and_dst_mut();
         src_inner.ensure_usable()?;
@@ -338,12 +355,20 @@ impl Backup {
                         "destination database is busy",
                     ));
                 }
+                let dst_readonly = self.dst.is_readonly;
                 let dst_slot = dst_inner.db_set.slot_mut(dst_db_id).unwrap();
                 let dst_bt = dst_slot.btree.as_mut().unwrap();
                 if dst_bt.transaction_state() != TransactionState::Open {
                     return Err(SqliteError::new(
                         ErrorCode::Busy,
                         "destination database is busy",
+                    ));
+                }
+                // `sqlite3BtreeBeginTrans(pDest, 2, ..)` on a read-only b-tree: SQLITE_READONLY.
+                if dst_readonly || dst_bt.pager().is_readonly() {
+                    return Err(SqliteError::new(
+                        ErrorCode::ReadOnly,
+                        "attempt to write a readonly database",
                     ));
                 }
                 if !dst_bt.pager().is_page_size_fixed()
@@ -428,15 +453,24 @@ impl Backup {
             let mut dirty_to_recopy: Vec<Pgno> = Vec::new();
             if self.has_started_copy {
                 let mut tr = self.tracker.lock().unwrap_or_else(PoisonError::into_inner);
-                let external_change = (cur_src_cc != self.last_src_cc
-                    && tr.last_self_cc != Some(cur_src_cc))
-                    || (cur_src_wal != self.last_src_wal && tr.last_self_wal != cur_src_wal);
-                let shrunk_below_progress = cur_src_pages.saturating_add(1) < self.i_next;
+                // A change of the file's change counter that this connection did not commit
+                // itself (C: the `dbFileVers` comparison of `sqlite3PagerSharedLock` →
+                // `pager_reset()` → `sqlite3BackupRestart()`). A WAL source needs no test here:
+                // the pager restarts the backup when the read transaction it opens sees a
+                // wal-index header other than its own (`pagerBeginReadTransaction`), and it does
+                // not when this connection only checkpointed or restarted its log.
+                let external_change =
+                    cur_src_cc != self.last_src_cc && tr.last_self_cc != Some(cur_src_cc);
+                let _ = (&cur_src_wal, &tr.last_self_wal);
                 let ps_changed = src_ps != self.last_src_page_size;
 
-                if tr.needs_restart || external_change || shrunk_below_progress || ps_changed {
+                // (A source that became smaller than the backup's position does not restart
+                // the backup in C: `iNext` stays, the step reports `SQLITE_DONE` and
+                // `sqlite3_backup_remaining()` goes negative.)
+                if tr.needs_restart || external_change || ps_changed {
                     self.i_next = 1;
                     tr.needs_restart = false;
+                    tr.all_dirty = false;
                     tr.dirty_pages.clear();
                     dst_inner
                         .db_set
@@ -447,6 +481,13 @@ impl Backup {
                         .unwrap()
                         .pager_mut()
                         .backup_reset_raw_staging();
+                } else if tr.all_dirty {
+                    // Every page copied so far is copied again (`sqlite3BackupUpdate()` for
+                    // each page of a bulk rewrite); the position is kept.
+                    let end = self.i_next.saturating_sub(1).min(cur_src_pages);
+                    dirty_to_recopy = (1..=end).collect();
+                    tr.all_dirty = false;
+                    tr.dirty_pages.clear();
                 } else {
                     let i_next = self.i_next;
                     dirty_to_recopy = tr
@@ -460,6 +501,7 @@ impl Backup {
             } else {
                 let mut tr = self.tracker.lock().unwrap_or_else(PoisonError::into_inner);
                 tr.needs_restart = false;
+                tr.all_dirty = false;
                 tr.dirty_pages.clear();
             }
 
@@ -552,8 +594,10 @@ impl Backup {
                 tr.last_self_wal = cur_src_wal;
             }
 
+            // `p->nPagecount = nSrcPage; p->nRemaining = nSrcPage+1-p->iNext;` (negative when
+            // the source shrank below the position).
             self.pagecount = cur_src_pages as i32;
-            self.remaining = (cur_src_pages + 1).saturating_sub(self.i_next) as i32;
+            self.remaining = (i64::from(cur_src_pages) + 1 - i64::from(self.i_next)) as i32;
 
             if self.i_next > cur_src_pages {
                 // 7. Finalize and commit destination database (`rc == SQLITE_DONE` in `backup.c:444-568`).
@@ -612,7 +656,6 @@ impl Backup {
                 }
                 self.dest_locked = false;
                 self.is_done = true;
-                self.remaining = 0;
                 Ok(BackupStepResult::Done)
             } else {
                 Ok(BackupStepResult::More)
@@ -625,13 +668,6 @@ impl Backup {
             && let Some(ref mut src_bt) = src_slot.btree
         {
             let _ = src_bt.pager_mut().end_read_if_unused();
-        }
-
-        if let Err(ref err) = step_result
-            && err.code != ErrorCode::Busy
-            && err.code != ErrorCode::Locked
-        {
-            self.fatal_error = Some(err.clone());
         }
 
         step_result
@@ -688,7 +724,12 @@ impl Backup {
 
         rb_res?;
         let _ = self.fatal_error.take();
-        Ok(())
+        // `rc = (p->rc==SQLITE_DONE) ? SQLITE_OK : p->rc;`: the result of the last step when
+        // that step failed (SQLITE_BUSY and SQLITE_LOCKED included).
+        match self.last_step_error.take() {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 }
 

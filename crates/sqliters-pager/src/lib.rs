@@ -525,9 +525,15 @@ struct PendingByteCopy {
 pub struct BackupTracker {
     /// Page numbers modified on the source connection since the last backup step.
     pub dirty_pages: BTreeSet<Pgno>,
-    /// Set when the source database rolls back, shrinks, changes page size, or observes an
-    /// external modification requiring the backup to restart from Page 1.
+    /// Set where C calls `sqlite3BackupRestart()`: the source pager was reset (an external
+    /// modification was detected, the page size changed, the database was deserialized), a WAL
+    /// transaction was rolled back, or an in-memory source committed. The backup starts again
+    /// at page 1.
     pub needs_restart: bool,
+    /// Set where C feeds every rewritten page to `sqlite3BackupUpdate()` (a VACUUM or a backup
+    /// *into* the source, a truncation): every page the backup has already copied has to be
+    /// copied again, but the backup keeps its position (`iNext`).
+    pub all_dirty: bool,
     /// Monotonic counter incremented on every tracker event.
     pub generation: u64,
     /// Last `change_counter` committed by this connection itself.
@@ -1113,6 +1119,20 @@ impl Pager {
             let mut guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
             guard.needs_restart = true;
             guard.dirty_pages.clear();
+            guard.generation = guard.generation.wrapping_add(1);
+        }
+    }
+
+    /// Every page may have changed without the page-level tracking seeing it (bulk rewrite):
+    /// the backups re-copy what they have copied so far, at their current position.
+    #[inline]
+    fn notify_backup_all_dirty(&self) {
+        if self.backup_trackers.is_empty() {
+            return;
+        }
+        for tracker in &self.backup_trackers {
+            let mut guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            guard.all_dirty = true;
             guard.generation = guard.generation.wrapping_add(1);
         }
     }
@@ -3100,7 +3120,7 @@ impl Pager {
                 let hdr_copy = self.header.clone();
                 hdr_copy.write_into(&mut self.cache.entry_data_mut(p1_slot)[0..DB_HEADER_SIZE]);
             }
-            self.notify_backup_restart();
+            self.notify_backup_all_dirty();
         }
         Ok(())
     }
@@ -3326,7 +3346,7 @@ impl Pager {
             let _ = src.end_read_if_unused();
         }
         if copy_res.is_ok() {
-            self.notify_backup_restart();
+            self.notify_backup_all_dirty();
         }
         copy_res
     }
@@ -3474,15 +3494,25 @@ impl Pager {
                 self.shrink_page_count(n_src_pages)?;
             }
             if raw_src_pages == 0 {
-                let mut p1 = vec![0u8; pgsz_src as usize];
+                // `sqlite3BtreeNewDb(p->pDest)` → `newDatabase()` → `zeroPage(pP1, ..)`: the
+                // file header and the 8-byte b-tree header of page 1 are rewritten; without
+                // secure-delete the rest of an existing page 1 keeps the bytes it had (the old
+                // cell pointers and cells are simply no longer referenced).
+                let mut p1 = if self.page_count >= 1 {
+                    let slot = self.mark_page_writable(1)?;
+                    let mut old = self.cache.entry_data_mut(slot).to_vec();
+                    old.resize(pgsz_src as usize, 0);
+                    old
+                } else {
+                    vec![0u8; pgsz_src as usize]
+                };
                 p1[100] = 0x0d;
+                p1[101..105].fill(0);
                 let usable = patched_hdr.usable_size();
                 let content_start: u16 = if usable == 65_536 { 0 } else { usable as u16 };
                 p1[105..107].copy_from_slice(&content_start.to_be_bytes());
+                p1[107] = 0;
                 patched_hdr.write_into(&mut p1[0..DB_HEADER_SIZE]);
-                if self.page_count >= 1 {
-                    self.mark_page_writable(1)?;
-                }
                 self.cache.insert(1, p1, true);
             } else {
                 let p1_slot = self.mark_page_writable(1)?;
@@ -3506,7 +3536,7 @@ impl Pager {
             self.backup_raw_staging = None;
             self.staged_raw_copy = true;
             self.next_page_size = None;
-            self.notify_backup_restart();
+            self.notify_backup_all_dirty();
             return Ok(());
         }
 
@@ -3612,7 +3642,7 @@ impl Pager {
         self.staged_raw_copy = true;
         self.cache_modified = true;
         self.commit_phase_one_done = false;
-        self.notify_backup_restart();
+        self.notify_backup_all_dirty();
         Ok(())
     }
 
@@ -3925,10 +3955,12 @@ impl Pager {
             self.cache.clear_all_dirty();
             self.commit_phase_one_done = true;
             self.notify_backup_self_commit();
-            if self.is_memdb_backing {
+            if self.is_memdb_backing && self.cache_modified {
                 // `sqlite3PagerCommitPhaseOne` (`pager.c:6554-6560`): "If this is an in-memory db
                 // ... any backup in progress needs to be restarted." C does not feed the changed
-                // pages of an in-memory source to its backups, it restarts them at page 1.
+                // pages of an in-memory source to its backups, it restarts them at page 1. (C
+                // returns before that when the transaction made no page writable:
+                // `if( pPager->eState<PAGER_WRITER_CACHEMOD ) return SQLITE_OK;`.)
                 self.notify_backup_restart();
             }
         } else if self.locking_mode == LockingMode::Exclusive {
@@ -4115,6 +4147,12 @@ impl Pager {
                         reverted_pgnos.push(pgno);
                         Ok(())
                     })?;
+                    // `pagerRollbackWal` calls `pagerUndoCallback` — which restarts the backups
+                    // (`sqlite3BackupRestart`) — once per frame this transaction wrote to the
+                    // log and once per page that is dirty in the cache. A transaction that
+                    // changed no page (for example a statement that failed on its first row)
+                    // restarts nothing.
+                    let wal_tx_changed_pages = !reverted_pgnos.is_empty() || self.cache_modified;
                     for pgno in reverted_pgnos {
                         self.cache.remove(pgno);
                     }
@@ -4152,7 +4190,9 @@ impl Pager {
                     self.staged_raw_copy = false;
                     self.backup_raw_staging = None;
                     self.subsavepoints.clear();
-                    self.notify_backup_restart();
+                    if wal_tx_changed_pages {
+                        self.notify_backup_restart();
+                    }
 
                     self.wal
                         .as_mut()
@@ -4229,7 +4269,10 @@ impl Pager {
                 self.staged_raw_copy = false;
                 self.backup_raw_staging = None;
                 self.subsavepoints.clear();
-                self.notify_backup_restart();
+                // C plays the rollback journal back page by page and feeds each restored page
+                // to `sqlite3BackupUpdate()` (`pager_playback_one_page`); a backup is not
+                // restarted. The pages of this transaction are still in the trackers' dirty
+                // sets, so the next step copies their restored content again.
 
                 // Finalize journal file (`Delete` unlinks even if `journal_file` was already closed
                 // by a failed `commit()`, `Truncate` truncates to 0, `Persist` zeroes 28B) BEFORE
@@ -4497,7 +4540,8 @@ impl Pager {
                 self.sp_page_buf_pool.push(buf);
             }
         }
-        self.notify_backup_restart();
+        // (C: a savepoint rollback restores the pages in the cache; backups are neither
+        // restarted nor updated. The pages stay in the trackers' dirty sets.)
         Ok(())
     }
 

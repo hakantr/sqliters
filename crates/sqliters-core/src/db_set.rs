@@ -668,6 +668,71 @@ impl DatabaseSet {
         self.vtab_registry.defensive_mode
     }
 
+    /// The `SQLITE_WriteSchema` bit as set by `PRAGMA writable_schema` /
+    /// `SQLITE_DBCONFIG_WRITABLE_SCHEMA`. It is the *requested* state: the schema is writable
+    /// only while defensive mode is off (`sqlite3WritableSchema()` in build.c).
+    #[inline]
+    pub const fn writable_schema_flag(&self) -> bool {
+        self.vtab_registry.writable_schema_flag
+    }
+
+    /// Sets the `SQLITE_WriteSchema` bit.
+    #[inline]
+    pub fn set_writable_schema_flag(&mut self, on: bool) {
+        self.vtab_registry.writable_schema_flag = on;
+    }
+
+    /// `sqlite3WritableSchema()`: the schema may be written directly when the
+    /// `writable_schema` bit is set and defensive mode is off.
+    #[inline]
+    pub const fn writable_schema_effective(&self) -> bool {
+        self.vtab_registry.writable_schema_flag && !self.vtab_registry.defensive_mode
+    }
+
+    /// As [`Self::is_reserved_shadow_name`], for `ALTER TABLE ... RENAME TO name`: C looks for an
+    /// existing table or index of that name first ("there is already another table or index
+    /// with this name"), so the reservation only applies when no such table exists.
+    pub fn is_reserved_shadow_name_absent(&self, name: &str) -> bool {
+        self.is_reserved_shadow_name(name)
+            && !self.slots.iter().any(|slot| {
+                slot.btree.is_some()
+                    && (slot.schema.find_user_table(name).is_some()
+                        || slot.schema.find_index(name).is_some())
+            })
+    }
+
+    /// `sqlite3ReadOnlyShadowTables() && sqlite3ShadowTableName(db, zName)`: in defensive
+    /// mode (and outside the internal SQL of a virtual table) `name` is the name of a shadow
+    /// table of some virtual table of the connection, whether that table exists or not.
+    pub fn is_reserved_shadow_name(&self, name: &str) -> bool {
+        if !self.vtab_registry.defensive_mode || self.vtab_registry.internal_sql_depth > 0 {
+            return false;
+        }
+        // sqlite3ShadowTableName(): the part before the last '_' must name a virtual table
+        // (in any schema: sqlite3FindTable(db, zCopy, 0)).
+        let Some(pos) = name.rfind('_') else {
+            return false;
+        };
+        let (owner, suffix) = (&name[..pos], &name[pos + 1..]);
+        for slot in &self.slots {
+            if slot.btree.is_none() {
+                continue;
+            }
+            for vt in &slot.schema.virtual_tables {
+                if vt.name.eq_ignore_ascii_case(owner)
+                    && let Some(module) = self.vtab_registry.get_module(&vt.module_name)
+                    && module
+                        .shadow_table_suffixes()
+                        .iter()
+                        .any(|s| s.eq_ignore_ascii_case(suffix))
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Whether `PRAGMA trusted_schema` (`SQLITE_DBCONFIG_TRUSTED_SCHEMA`) is enabled on this connection.
     #[inline]
     pub const fn trusted_schema(&self) -> bool {

@@ -84,7 +84,9 @@ fn test_multiline_sql_preserves_embedded_crlf_and_comments() {
     );
     assert!(out.stderr.is_empty());
 
-    let expected_hex: String = b"first\r\n.not_a_dot_cmd\r\nthird"
+    // C SQLite 3.54.1: the shell reads its input line by line and drops a CR in front of
+    // the LF of every line (`local_getline`), also inside a multi-line string literal.
+    let expected_hex: String = b"first\n.not_a_dot_cmd\nthird"
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();

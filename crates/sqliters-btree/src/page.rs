@@ -1354,6 +1354,28 @@ pub fn table_leaf_cell_has_rowid(
     matches!(get_varint_i64(&raw[off + n1..usable]), Ok((cell_rowid, _)) if cell_rowid == rowid)
 }
 
+/// `btreeOverwriteCell` / `btreeOverwriteContent` (`btree.c`): a row that is replaced by a
+/// record of the same size is overwritten in place, and "only if the new content is different
+/// from the old" is the page made writable at all. Returns `true` when the cell at `old_off`
+/// already holds exactly `(rowid, payload)`, i.e. when the replace must not touch the page.
+#[inline]
+pub fn table_leaf_cell_is_identical(
+    raw: &[u8],
+    rowid: i64,
+    payload: &[u8],
+    old_off: usize,
+    old_cell_len: usize,
+) -> bool {
+    let mut hdr = [0u8; 18];
+    let mut n = put_varint(&mut hdr, payload.len() as u64);
+    n += put_varint(&mut hdr[n..], rowid as u64);
+    let new_cell_len = n + payload.len();
+    new_cell_len == old_cell_len
+        && raw.len() >= old_off + new_cell_len
+        && raw[old_off..old_off + n] == hdr[..n]
+        && raw[old_off + n..old_off + new_cell_len] == *payload
+}
+
 /// Replaces an existing non-overflow `(rowid, payload)` cell in-place on a `TableLeaf` (`0x0d`) page
 /// in O(1) without heap allocations (`new_cell_len == old_cell_len` overwrites in place; otherwise
 /// frees the old `>= 4`-byte cell to the freeblock list and allocates from `content_top`).

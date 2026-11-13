@@ -8,7 +8,7 @@ pub mod rewrite;
 pub mod token;
 
 pub use ast::*;
-pub use complete::is_complete;
+pub use complete::{first_statement_end_offset, is_complete};
 pub use parser::{
     IdentSpanMap, TokenSpan, parse_one, parse_one_with_spans, parse_statements, split_vtab_raw_args,
 };

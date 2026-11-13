@@ -114,6 +114,11 @@ pub fn parse_declare_vtab_sql(
         hidden_cols.push(is_hidden);
     }
     let (mut tbl, _) = build_table_schema_from_ast(&ct, 0)?;
+    // The standard-type spelling was decided above on the type as declared (before the
+    // HIDDEN keyword was removed): "b integer hidden" stays "integer", like in C.
+    for (col, cdef) in tbl.columns.iter_mut().zip(&ct.columns) {
+        col.type_name.clone_from(&cdef.type_name);
+    }
     tbl.name = table_name.to_owned();
     Ok((tbl, hidden_cols))
 }
@@ -186,6 +191,8 @@ pub struct VTabRegistry {
     next_tx_seq: u64,
     pub trusted_schema: bool,
     pub defensive_mode: bool,
+    /// The `SQLITE_WriteSchema` flag bit (see `DatabaseSet::writable_schema_flag`).
+    pub writable_schema_flag: bool,
     pub internal_sql_depth: usize,
 }
 
@@ -222,6 +229,7 @@ impl VTabRegistry {
             next_tx_seq: 0,
             trusted_schema: true,
             defensive_mode: false,
+            writable_schema_flag: false,
             internal_sql_depth: 0,
         };
         reg.register_module(Arc::new(GenerateSeriesModule));
@@ -637,6 +645,9 @@ pub fn check_defensive_shadow_table_write(
     let Some(slot) = db_set.slot(db_id) else {
         return Ok(());
     };
+    if slot.schema.virtual_tables.is_empty() {
+        return Ok(());
+    }
     let candidate_lower = table_name.to_ascii_lowercase();
     for vt_def in &slot.schema.virtual_tables {
         let prefix = format!("{}_", vt_def.name.to_ascii_lowercase());

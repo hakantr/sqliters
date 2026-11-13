@@ -1,857 +1,1246 @@
-//! `sqliters` interactive REPL and batch command-line shell, ported from SQLite's `shell.c.in`.
+//! `sqliters` command-line shell: a port of SQLite's `shell.c.in` (3.54.1) for the parts this
+//! shell implements. Structure and names follow the C source: `ShellState`, `Mode`,
+//! `modeChange`, `process_input`, `runOneSqlLine`, `shell_exec`, `do_meta_command`.
 #![forbid(unsafe_code)]
+// The code follows the C functions it ports statement by statement (index loops over argv,
+// explicit prefix tests): the lints below would only move it away from the original.
+#![allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::needless_range_loop,
+    clippy::manual_strip,
+    clippy::sliced_string_as_bytes,
+    clippy::while_let_loop
+)]
+
+mod dotcmd;
+mod help;
+mod import;
+mod qrf;
+mod util;
 
 use std::env;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, IsTerminal, Write};
-use std::path::Path;
-use std::process::ExitCode;
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+use std::process::{Child, ExitCode};
 
-use sqliters::{
-    Connection, OpenFlags, SQLITE_SOURCE_ID, SQLITE_VERSION, StepResult, Value, is_complete,
-    types::format_sqlite_real,
+use qrf::{
+    QRF_ALWAYS, QRF_AUTO, QRF_BLOB_AUTO, QRF_BLOB_JSON, QRF_BLOB_SQL, QRF_BLOB_TEXT, QRF_NO,
+    QRF_STYLE_AUTO, QRF_STYLE_EQP, QRF_STYLE_EXPLAIN, QRF_STYLE_HTML, QRF_TEXT_JSON,
+    QRF_TEXT_RELAXED, QRF_TEXT_SQL, QRF_YES, QrfSpec,
 };
+use sqliters::{Connection, OpenFlags, SQLITE_SOURCE_ID, SQLITE_VERSION, SqliteError, Value};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutputMode {
-    Box,
-    Table,
-    List,
-    Csv,
-    Json,
-    Line,
+pub const MFLG_ECHO: u8 = 0x01;
+pub const MFLG_CRLF: u8 = 0x02;
+pub const MFLG_HDR: u8 = 0x04;
+
+pub const CLISTAT_VMSTEP: u8 = 0x01;
+pub const CLISTAT_STMT: u8 = 0x02;
+pub const CLISTAT_MEM: u8 = 0x04;
+pub const CLISTAT_XSTMT: u8 = 0x08;
+pub const CLISTAT_XMEM: u8 = 0x10;
+pub const CLISTAT_IO: u8 = 0x20;
+pub const CLISTAT_ZIPVFS: u8 = 0x40;
+pub const CLISTAT_ON: u8 = 0x17;
+pub const CLISTAT_ALL: u8 = 0x7f;
+pub const CLISTAT_RESET: u8 = 0x80;
+
+pub const SHFLG_BACKSLASH: u32 = 0x0000_0004;
+pub const SHFLG_PRESERVE_ROWID: u32 = 0x0000_0008;
+pub const SHFLG_COUNT_CHANGES: u32 = 0x0000_0020;
+pub const SHFLG_DUMP_DATA_ONLY: u32 = 0x0000_0100;
+pub const SHFLG_DUMP_NO_SYS: u32 = 0x0000_0200;
+pub const SHFLG_TESTING_MODE: u32 = 0x0000_0400;
+
+pub const MODE_ASCII: u8 = 0;
+pub const MODE_COLUMN: u8 = 3;
+pub const MODE_CSV: u8 = 5;
+pub const MODE_INSERT: u8 = 7;
+pub const MODE_LIST: u8 = 12;
+pub const MODE_QBOX: u8 = 16;
+pub const MODE_SPLIT: u8 = 18;
+pub const MODE_WWW: u8 = 22;
+pub const MODE_BATCH: u8 = 50;
+pub const MODE_TTY: u8 = 51;
+pub const MODE_USER: u8 = 75;
+pub const MODE_N_USER: usize = 25;
+
+pub const DFLT_CHAR_LIMIT: i32 = 300;
+pub const DFLT_LINE_LIMIT: i16 = 5;
+pub const DFLT_TITLE_LIMIT: i16 = 20;
+pub const DFLT_MULTI_INSERT: u32 = 3000;
+
+const MAX_INPUT_NESTING: i32 = 25;
+
+/// `ModeInfo`: a built-in display mode.
+pub struct ModeInfo {
+    pub name: &'static str,
+    pub e_csep: u8,
+    pub e_rsep: u8,
+    pub e_null: u8,
+    pub e_text: u8,
+    pub e_hdr: u8,
+    pub e_blob: u8,
+    pub b_hdr: u8,
+    pub e_style: u8,
+    pub e_cx: u8,
+    pub m_flg: u8,
 }
 
-struct ShellConfig {
-    mode: OutputMode,
-    headers: bool,
-    separator: String,
-    null_value: String,
-    readonly: bool,
-    bail: bool,
-    /// `-header` (QRF_Always): the title row is shown even when the query returns no row.
-    headers_always: bool,
-    /// "tabs" mode: list layout with CSV quoting of text (`aModeInfo[]`: eText = csv).
-    list_csv_quote: bool,
+/// `aModeStr[]`.
+pub const A_MODE_STR: [Option<&str>; 14] = [
+    None,
+    Some("\n"),
+    Some("|"),
+    Some(" "),
+    Some(","),
+    Some("\r\n"),
+    Some("\x1e"),
+    Some("\x1f"),
+    Some("\t"),
+    Some(""),
+    Some("NULL"),
+    Some("null"),
+    Some("\"\""),
+    Some(": "),
+];
+
+macro_rules! mi {
+    ($n:expr, $c:expr, $r:expr, $nu:expr, $t:expr, $h:expr, $b:expr, $bh:expr, $s:expr, $cx:expr, $f:expr) => {
+        ModeInfo {
+            name: $n,
+            e_csep: $c,
+            e_rsep: $r,
+            e_null: $nu,
+            e_text: $t,
+            e_hdr: $h,
+            e_blob: $b,
+            b_hdr: $bh,
+            e_style: $s,
+            e_cx: $cx,
+            m_flg: $f,
+        }
+    };
 }
 
-impl Default for ShellConfig {
-    fn default() -> Self {
+/// `aModeInfo[]`.
+pub const A_MODE_INFO: [ModeInfo; 23] = [
+    mi!("ascii", 7, 6, 9, 1, 1, 0, 1, 12, 0, 0),
+    mi!("box", 0, 0, 9, 1, 1, 0, 3, 1, 2, 0),
+    mi!("c", 4, 1, 10, 5, 5, 4, 1, 12, 0, 0),
+    mi!("column", 0, 0, 9, 1, 1, 0, 3, 2, 2, 0),
+    mi!("count", 0, 0, 0, 0, 0, 0, 0, 3, 0, 0),
+    mi!("csv", 4, 5, 9, 3, 3, 0, 1, 12, 0, 0),
+    mi!("html", 0, 0, 9, 4, 4, 0, 3, 7, 0, 0),
+    mi!("insert", 0, 0, 10, 2, 2, 0, 1, 8, 0, 0),
+    mi!("jatom", 4, 1, 11, 6, 6, 0, 1, 12, 0, 0),
+    mi!("jobject", 0, 1, 11, 6, 6, 0, 0, 10, 0, 0),
+    mi!("json", 0, 0, 11, 6, 6, 0, 0, 9, 0, 0),
+    mi!("line", 13, 1, 9, 1, 1, 0, 0, 11, 1, 0),
+    mi!("list", 2, 1, 9, 1, 1, 0, 1, 12, 0, 0),
+    mi!("markdown", 0, 0, 9, 1, 1, 0, 3, 13, 2, 0),
+    mi!("off", 0, 0, 0, 0, 0, 0, 0, 14, 0, 0),
+    mi!("psql", 0, 0, 9, 1, 1, 0, 3, 19, 2, 5),
+    mi!("qbox", 0, 0, 10, 2, 1, 0, 3, 1, 2, 0),
+    mi!("quote", 4, 1, 10, 2, 2, 0, 1, 12, 0, 0),
+    mi!("split", 0, 0, 9, 1, 1, 0, 1, 2, 2, 2),
+    mi!("table", 0, 0, 9, 1, 1, 0, 3, 19, 2, 0),
+    mi!("tabs", 8, 1, 9, 3, 3, 0, 1, 12, 0, 0),
+    mi!("tcl", 3, 1, 12, 5, 5, 4, 1, 12, 0, 0),
+    mi!("www", 0, 0, 9, 4, 4, 0, 3, 7, 0, 0),
+];
+
+/// `Mode`: everything that determines how query results are rendered.
+#[derive(Clone, Default)]
+pub struct Mode {
+    pub auto_explain: u8,
+    pub auto_eqp: u8,
+    pub scanstats_on: u8,
+    pub b_auto_screen_width: bool,
+    pub m_flags: u8,
+    pub e_mode: u8,
+    pub spec: QrfSpec,
+}
+
+/// Where `p->out` goes when it is not standard output.
+pub enum Redirect {
+    File(io::BufWriter<File>),
+    Pipe(Child),
+    /// `.output memory`: the text is kept until `.output --show`.
+    Memory(Vec<u8>),
+    Null,
+}
+
+/// A writer with the buffering of a C `FILE*` on a non-terminal: a fixed buffer that is filled
+/// completely before it is written out (so the chunk boundaries are those of stdio).
+pub struct StdioBuf<W: Write> {
+    inner: W,
+    buf: Vec<u8>,
+    cap: usize,
+}
+
+impl<W: Write> StdioBuf<W> {
+    pub fn new(inner: W, cap: usize) -> Self {
         Self {
-            mode: OutputMode::Box,
-            headers: true,
-            separator: "|".to_owned(),
-            null_value: String::new(),
-            readonly: false,
-            bail: false,
-            headers_always: false,
-            list_csv_quote: false,
+            inner,
+            buf: Vec::with_capacity(cap),
+            cap,
         }
     }
 }
 
+impl<W: Write> Write for StdioBuf<W> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let mut d = data;
+        if self.buf.len() + d.len() < self.cap {
+            self.buf.extend_from_slice(d);
+            return Ok(data.len());
+        }
+        // Fill the buffer, write it, then write whole blocks directly.
+        if !self.buf.is_empty() {
+            let room = self.cap - self.buf.len();
+            self.buf.extend_from_slice(&d[..room]);
+            d = &d[room..];
+            let _ = self.inner.write_all(&self.buf);
+            self.buf.clear();
+        }
+        let whole = d.len() - d.len() % self.cap;
+        if whole > 0 {
+            let _ = self.inner.write_all(&d[..whole]);
+            d = &d[whole..];
+        }
+        self.buf.extend_from_slice(d);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.buf.is_empty() {
+            let _ = self.inner.write_all(&self.buf);
+            self.buf.clear();
+        }
+        self.inner.flush()
+    }
+}
+
+/// `struct AuxDb`.
 #[derive(Default)]
-struct StreamOutcome {
-    quit: bool,
-    bailed: bool,
-    err_count: usize,
+pub struct AuxDb {
+    pub db: Option<Connection>,
+    pub z_db_filename: Option<String>,
 }
 
-fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
-    let mut force_batch = false;
-    for a in &args {
-        if matches!(a.as_str(), "-batch" | "--batch") {
-            force_batch = true;
+/// `struct DotCmdLine`.
+#[derive(Default)]
+pub struct DotCmdLine {
+    pub z_orig: String,
+    pub az_arg: Vec<String>,
+    pub ai_ofst: Vec<usize>,
+    pub ab_quot: Vec<bool>,
+    pub n_arg: usize,
+}
+
+/// `ShellState`.
+pub struct ShellState {
+    pub db: Option<Connection>,
+    pub open_readonly: bool,
+    pub open_create: bool,
+    pub open_flags_set: bool,
+    pub open_nofollow: bool,
+    pub open_deserialize: bool,
+    pub b_safe_mode: bool,
+    pub b_safe_mode_persist: bool,
+    pub e_restore_state: u8,
+    pub m_stats: u8,
+    pub n_pop_output: u8,
+    pub n_pop_mode: u8,
+    pub enable_timer: u8,
+    pub input_nesting: i32,
+    pub prev_timer: f64,
+    pub lineno: i64,
+    pub z_in_file: Option<String>,
+    pub input: Option<Box<dyn BufRead>>,
+    pub stdout: StdioBuf<io::Stdout>,
+    pub redirect: Option<Redirect>,
+    pub pipe_out: Option<StdioBuf<std::process::ChildStdin>>,
+    pub n_err: i32,
+    pub writable_schema: bool,
+    pub shell_flgs: u32,
+    pub z_err_prefix: Option<String>,
+    pub mode: Mode,
+    pub mode_stack: Vec<Mode>,
+    pub saved_modes: Vec<(String, Mode)>,
+    pub aux: [AuxDb; 5],
+    pub i_aux: usize,
+    pub dot: DotCmdLine,
+    pub outfile: String,
+    pub bail_on_error: bool,
+    pub stdin_is_interactive: bool,
+    pub stdout_is_console: bool,
+    pub stdout_tty_width: i32,
+    pub argv0: String,
+    pub prompts: [Option<String>; 2],
+    pub busy_timeout: i64,
+    /// Shell-side copies of `sqlite3_db_config` booleans the engine has no switch for (shown
+    /// by `.dbconfig`; index = position in the `.dbconfig` list).
+    pub dbcfg_shadow: [i32; 22],
+    /// Shell-side copies of `sqlite3_limit` values the engine has no setting for.
+    pub limits: [i32; 15],
+    pub exit_code: Option<i32>,
+}
+
+impl ShellState {
+    /// `p->out`.
+    pub fn out(&mut self) -> &mut dyn Write {
+        match &mut self.redirect {
+            None => &mut self.stdout,
+            Some(Redirect::File(f)) => f,
+            Some(Redirect::Pipe(_)) => match &mut self.pipe_out {
+                Some(w) => w,
+                None => &mut self.stdout,
+            },
+            Some(Redirect::Memory(v)) => v,
+            Some(Redirect::Null) => &mut self.stdout,
         }
     }
-    let interactive = !force_batch && io::stdin().is_terminal();
 
-    let mut cfg = ShellConfig {
-        mode: if interactive {
-            OutputMode::Box
+    pub fn out_bytes(&mut self, b: &[u8]) {
+        if matches!(self.redirect, Some(Redirect::Null)) {
+            return;
+        }
+        let _ = self.out().write_all(b);
+    }
+
+    pub fn outs(&mut self, s: &str) {
+        self.out_bytes(s.as_bytes());
+    }
+
+    /// `cli_printf(stdout, ...)`.
+    pub fn stdouts(&mut self, s: &str) {
+        let _ = self.stdout.write_all(s.as_bytes());
+    }
+
+    pub fn has_flag(&self, f: u32) -> bool {
+        self.shell_flgs & f != 0
+    }
+
+    pub fn db(&self) -> &Connection {
+        self.db.as_ref().expect("database is open")
+    }
+
+    /// `modeSetLimit()`: 0 on success.
+    pub fn mode_set_limit(&mut self, z_arg: Option<&str>) -> bool {
+        let k = match z_arg {
+            None | Some("off") => 1,
+            Some("on") => 0,
+            Some(_) => -1,
+        };
+        if k == 0 {
+            self.mode.spec.n_line_limit = DFLT_LINE_LIMIT;
+            self.mode.spec.n_char_limit = DFLT_CHAR_LIMIT;
+            self.mode.spec.n_title_limit = DFLT_TITLE_LIMIT;
+        } else if k == 1 {
+            self.mode.spec.n_line_limit = 0;
+            self.mode.spec.n_char_limit = 0;
+            self.mode.spec.n_title_limit = 0;
         } else {
-            OutputMode::List
-        },
-        headers: interactive,
-        ..ShellConfig::default()
-    };
-
-    let mut positional = Vec::new();
-    // Index of each positional argument in argv (1-based like C's `argv[i]`): error messages
-    // name the argument ("in 2nd command line argument").
-    let mut positional_idx: Vec<usize> = Vec::new();
-    let mut init_cmds: Vec<(usize, String)> = Vec::new();
-    let mut i = 0usize;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-version" | "--version" => {
-                println!("{SQLITE_VERSION} {SQLITE_SOURCE_ID} (sqliters pure safe Rust)");
-                return ExitCode::SUCCESS;
+            // sscanf(zArg, "%d,%d,%d", &L, &C, &T)
+            let mut nums: Vec<i64> = Vec::new();
+            let mut rest = z_arg.unwrap_or("");
+            loop {
+                let t = rest.trim_start();
+                let b = t.as_bytes();
+                let mut i = usize::from(!b.is_empty() && (b[0] == b'-' || b[0] == b'+'));
+                let ds = i;
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i == ds {
+                    break;
+                }
+                nums.push(t[..i].parse::<i64>().unwrap_or(i64::MAX));
+                rest = &t[i..];
+                if nums.len() == 3 || !rest.starts_with(',') {
+                    break;
+                }
+                rest = &rest[1..];
             }
-            "-help" | "--help" | "-h" => {
-                print_cli_usage();
-                return ExitCode::SUCCESS;
+            if nums.len() < 2 || nums.iter().any(|&x| x < 0) {
+                return true;
             }
-            "-readonly" | "--readonly" => cfg.readonly = true,
-            "-bail" | "--bail" => cfg.bail = true,
-            "-batch" | "--batch" => {}
-            "-box" | "--box" => {
-                cfg.mode = OutputMode::Box;
-                cfg.headers = true;
-            }
-            "-table" | "--table" | "-column" | "--column" => {
-                cfg.mode = OutputMode::Table;
-                cfg.headers = true;
-            }
-            "-csv" | "--csv" => {
-                cfg.mode = OutputMode::Csv;
-                cfg.separator = ",".to_owned();
-            }
-            "-tabs" | "--tabs" => {
-                cfg.mode = OutputMode::List;
-                cfg.separator = "\t".to_owned();
-                cfg.list_csv_quote = true;
-            }
-            "-json" | "--json" => cfg.mode = OutputMode::Json,
-            "-line" | "--line" => cfg.mode = OutputMode::Line,
-            "-list" | "--list" => {
-                // modeChange(): every mode switch sets its own separators.
-                cfg.mode = OutputMode::List;
-                cfg.separator = "|".to_owned();
-                cfg.list_csv_quote = false;
-            }
-            "-header" | "--header" => {
-                cfg.headers = true;
-                cfg.headers_always = true;
-            }
-            "-noheader" | "--noheader" => cfg.headers = false,
-            "-separator" | "--separator" if i + 1 < args.len() => {
-                i += 1;
-                cfg.separator.clone_from(&args[i]);
-            }
-            "-nullvalue" | "--nullvalue" if i + 1 < args.len() => {
-                i += 1;
-                cfg.null_value.clone_from(&args[i]);
-            }
-            "-cmd" if i + 1 < args.len() => {
-                i += 1;
-                init_cmds.push((i + 1, args[i].clone()));
-            }
-            other if other.starts_with('-') => {
-                let argv0 = env::args().next().unwrap_or_else(|| "sqliters".to_owned());
-                eprintln!("{argv0}: Error: unknown option: {other}");
-                eprintln!("Use -help for a list of options.");
-                return ExitCode::from(1);
-            }
-            other => {
-                positional.push(other.to_owned());
-                positional_idx.push(i + 1);
+            self.mode.spec.n_line_limit = nums[0] as i16;
+            self.mode.spec.n_char_limit = nums[1] as i32;
+            if nums.len() == 3 {
+                self.mode.spec.n_title_limit = nums[2] as i16;
             }
         }
-        i += 1;
+        false
     }
 
-    let db_target = positional.first().map_or(":memory:", String::as_str);
+    /// `modeFree()`.
+    pub fn mode_free(&mut self) {
+        let auto_explain = self.mode.auto_explain;
+        self.mode = Mode::default();
+        self.mode.auto_explain = auto_explain;
+    }
 
-    let mut conn = match open_db(db_target, cfg.readonly) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Error: unable to open database \"{db_target}\": {e}");
-            return ExitCode::from(1);
-        }
-    };
-
-    let mut stdout = BufWriter::with_capacity(64 * 1024, io::stdout());
-
-    // shell.c main(): a failing `-cmd` argument does not stop the shell and does not change
-    // the exit code (unless -bail is given).
-    for (argi, cmd) in &init_cmds {
-        let failed =
-            execute_shell_input(&mut conn, &mut cfg, cmd, &mut stdout, *argi, interactive).is_err();
-        if cfg.bail {
-            let _ = stdout.flush();
-            return if failed {
-                ExitCode::from(1)
+    /// `modeChange()`.
+    pub fn mode_change(&mut self, e_mode: u8) {
+        if usize::from(e_mode) < A_MODE_INFO.len() {
+            let pi = &A_MODE_INFO[usize::from(e_mode)];
+            let pm = &mut self.mode;
+            pm.e_mode = e_mode;
+            if pi.e_csep != 0 {
+                pm.spec.z_column_sep = A_MODE_STR[usize::from(pi.e_csep)].map(str::to_owned);
+            }
+            if pi.e_rsep != 0 {
+                pm.spec.z_row_sep = A_MODE_STR[usize::from(pi.e_rsep)].map(str::to_owned);
+            }
+            if pi.e_null != 0 {
+                pm.spec.z_null = A_MODE_STR[usize::from(pi.e_null)].map(str::to_owned);
+            }
+            pm.spec.e_text = pi.e_text;
+            pm.spec.e_blob = pi.e_blob;
+            if pm.m_flags & MFLG_HDR == 0 {
+                pm.spec.b_titles = pi.b_hdr;
+            }
+            pm.spec.e_title = pi.e_hdr;
+            pm.spec.b_border = if pi.m_flg & 0x01 != 0 {
+                QRF_NO
             } else {
-                ExitCode::SUCCESS
+                QRF_AUTO
             };
+            if pi.m_flg & 0x02 != 0 {
+                pm.spec.b_split_column = QRF_YES;
+                pm.b_auto_screen_width = true;
+            } else {
+                pm.spec.b_split_column = QRF_NO;
+            }
+            pm.spec.b_row_count = if pi.m_flg & 0x04 != 0 {
+                QRF_YES
+            } else {
+                QRF_NO
+            };
+        } else if e_mode >= MODE_USER && usize::from(e_mode - MODE_USER) < self.saved_modes.len() {
+            self.mode = self.saved_modes[usize::from(e_mode - MODE_USER)].1.clone();
+        } else if e_mode == MODE_BATCH {
+            let m_flags = self.mode.m_flags;
+            self.mode_free();
+            self.mode_change(MODE_LIST);
+            self.mode_set_limit(Some("off"));
+            self.mode.m_flags = m_flags;
+        } else if e_mode == MODE_TTY {
+            let m_flags = self.mode.m_flags;
+            self.mode_free();
+            self.mode_change(MODE_QBOX);
+            self.mode.b_auto_screen_width = true;
+            self.mode.spec.e_text = QRF_TEXT_RELAXED;
+            self.mode.spec.n_char_limit = DFLT_CHAR_LIMIT;
+            self.mode.spec.n_line_limit = DFLT_LINE_LIMIT;
+            self.mode.spec.b_text_jsonb = QRF_YES;
+            self.mode.spec.n_title_limit = DFLT_TITLE_LIMIT;
+            self.mode.spec.n_multi_insert = DFLT_MULTI_INSERT;
+            self.mode.m_flags = m_flags;
         }
     }
 
-    // One-shot command mode: `sqliters mydb.db "SELECT ..." "..."`
-    if positional.len() > 1 {
-        for (cmd, argi) in positional[1..].iter().zip(&positional_idx[1..]) {
-            if let Err(exit) =
-                execute_shell_input(&mut conn, &mut cfg, cmd, &mut stdout, *argi, false)
-            {
-                let _ = stdout.flush();
-                return exit;
+    /// `modeDefault()`.
+    fn mode_default(&mut self) {
+        self.mode.auto_explain = 1;
+        if self.stdin_is_interactive || self.stdout_is_console {
+            self.mode_change(MODE_TTY);
+        } else {
+            self.mode_change(MODE_BATCH);
+        }
+    }
+
+    /// `modeFind()`.
+    pub fn mode_find(&self, name: &str) -> i32 {
+        if let Some(i) = A_MODE_INFO.iter().position(|m| m.name == name) {
+            return i as i32;
+        }
+        if let Some(i) = self.saved_modes.iter().position(|m| m.0 == name) {
+            return i as i32 + i32::from(MODE_USER);
+        }
+        match name {
+            "batch" => i32::from(MODE_BATCH),
+            "tty" => i32::from(MODE_TTY),
+            _ => -1,
+        }
+    }
+
+    pub fn mode_push(&mut self) {
+        self.mode_stack.push(self.mode.clone());
+    }
+
+    pub fn mode_pop(&mut self) {
+        if let Some(m) = self.mode_stack.pop() {
+            self.mode = m;
+        }
+    }
+
+    /// `shellErrorLocation()`.
+    pub fn error_location(&self) -> String {
+        if let Some(p) = &self.z_err_prefix {
+            p.clone()
+        } else {
+            match self.z_in_file.as_deref() {
+                None | Some("<stdin>") => format!("line {}:", self.lineno),
+                Some(f) => format!("{f}:{}:", self.lineno),
             }
         }
-        let _ = stdout.flush();
-        return ExitCode::SUCCESS;
     }
 
-    if interactive {
-        let _ = writeln!(
-            stdout,
-            "SQLite version {SQLITE_VERSION} (sqliters pure safe Rust port)"
-        );
-        let _ = writeln!(stdout, "Enter \".help\" for usage hints.");
-        if db_target == ":memory:" {
-            let _ = writeln!(stdout, "Connected to a transient in-memory database.");
-            let _ = writeln!(
-                stdout,
-                "Use \".open FILENAME\" to reopen on a persistent database."
-            );
+    /// `dotCmdError()`.
+    pub fn dot_cmd_error(&mut self, i_arg: usize, z_brief: Option<&str>, z_detail: Option<&str>) {
+        let loc = self.error_location();
+        if let Some(brief) = z_brief
+            && i_arg < self.dot.n_arg
+        {
+            let i = self.dot.ai_ofst[i_arg];
+            let n_prompt = brief.len() + 5;
+            eprintln!("{loc} {}", self.dot.z_orig);
+            if i > n_prompt {
+                eprintln!("{loc} {:w$}{brief} ---^", "", w = 1 + i - n_prompt);
+            } else {
+                eprintln!("{loc} {:i$}^--- {brief}", "");
+            }
         }
-        let _ = stdout.flush();
+        if let Some(d) = z_detail {
+            eprintln!("{loc} {d}");
+        }
     }
 
-    let stdin = io::stdin();
-    let outcome = if interactive {
-        let mut reader = stdin.lock();
-        process_input_stream(
-            &mut conn,
-            &mut cfg,
-            &mut reader,
-            &mut stdout,
-            true,
-            &InputSrc::Stdin,
-        )
-    } else {
-        let mut reader = BufReader::with_capacity(64 * 1024, stdin.lock());
-        process_input_stream(
-            &mut conn,
-            &mut cfg,
-            &mut reader,
-            &mut stdout,
-            false,
-            &InputSrc::Stdin,
-        )
-    };
-    let _ = stdout.flush();
+    /// `failIfSafeMode()`: prints the message and returns true when the shell must exit(1).
+    pub fn fail_if_safe_mode(&mut self, msg: &str) -> bool {
+        if self.b_safe_mode {
+            let loc = self.error_location();
+            eprintln!("{loc} {msg}");
+            self.exit_code = Some(1);
+            return true;
+        }
+        false
+    }
 
-    if outcome.bailed || (!interactive && outcome.err_count > 0) {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
+    /// `shellScreenWidth()`.
+    pub fn screen_width(&self) -> i32 {
+        if self.stdout_tty_width > 0 {
+            return self.stdout_tty_width;
+        }
+        if let Ok(c) = env::var("COLUMNS")
+            && let Ok(n) = c.trim().parse::<i32>()
+            && n > 0
+        {
+            return n;
+        }
+        80
+    }
+
+    /// `output_reset()`.
+    pub fn output_reset(&mut self) {
+        let _ = self.stdout.flush();
+        match self.redirect.take() {
+            Some(Redirect::Pipe(mut child)) => {
+                if let Some(mut w) = self.pipe_out.take() {
+                    let _ = w.flush();
+                    drop(w);
+                }
+                let _ = child.wait();
+            }
+            Some(Redirect::File(mut f)) => {
+                if self.mode.e_mode == MODE_WWW {
+                    let _ = f.write_all(b"</PRE></BODY></HTML>\n");
+                }
+                let _ = f.flush();
+            }
+            Some(Redirect::Null | Redirect::Memory(_)) | None => {
+                if self.mode.e_mode == MODE_WWW {
+                    self.stdouts("</PRE></BODY></HTML>\n");
+                }
+            }
+        }
+        self.outfile.clear();
+    }
+
+    /// The database file name of the active connection (`p->pAuxDb->zDbFilename`).
+    pub fn db_filename(&self) -> Option<&str> {
+        self.aux[self.i_aux].z_db_filename.as_deref()
+    }
+
+    /// `open_db()`. With `keep_alive` an open failure falls back to an in-memory database;
+    /// otherwise the shell exits (returns false with `exit_code` set).
+    pub fn open_db(&mut self, keep_alive: bool) -> bool {
+        if self.db.is_none() {
+            let mut name = self.db_filename().map(str::to_owned);
+            if let Some(n) = &name
+                && n.starts_with("~/")
+                && !std::path::Path::new(n).exists()
+                && let Ok(home) = env::var("HOME")
+                && !home.is_empty()
+            {
+                name = Some(format!("{home}{}", &n[1..]));
+            }
+            if !self.open_flags_set {
+                self.open_create = true;
+                self.open_readonly = false;
+                self.open_flags_set = true;
+            }
+            let res = open_connection(
+                name.as_deref(),
+                self.open_readonly,
+                self.open_create,
+                self.open_nofollow,
+                self.open_deserialize,
+            );
+            match res {
+                Ok(c) => self.db = Some(c),
+                Err(e) => {
+                    // sqlite3_errmsg() of a failed open is the text of the result code.
+                    let msg = match e.code {
+                        sqliters::ErrorCode::NoMem
+                        | sqliters::ErrorCode::NotADb
+                        | sqliters::ErrorCode::Misuse => e.message.clone(),
+                        _ => "unable to open database file".to_owned(),
+                    };
+                    eprintln!(
+                        "Error: unable to open database \"{}\": {}",
+                        name.as_deref().unwrap_or(""),
+                        msg
+                    );
+                    if !keep_alive {
+                        self.exit_code = Some(1);
+                        return false;
+                    }
+                    match Connection::open_in_memory() {
+                        Ok(c) => {
+                            eprintln!(
+                                "Notice: using substitute in-memory database instead of \"{}\"",
+                                name.as_deref().unwrap_or("")
+                            );
+                            self.db = Some(c);
+                        }
+                        Err(_) => {
+                            eprintln!("Also: unable to open substitute in-memory database.");
+                            self.exit_code = Some(1);
+                            return false;
+                        }
+                    }
+                }
+            }
+            let testmode_on = self.has_flag(SHFLG_TESTING_MODE);
+            if let Some(db) = &self.db {
+                let _ = db.set_trusted_schema(testmode_on);
+                let _ = db.db_config_defensive(Some(!testmode_on));
+                if self.busy_timeout > 0 {
+                    let _ = db.busy_timeout(self.busy_timeout as u64);
+                }
+            }
+            self.dbcfg_shadow = dotcmd::DBCFG_DEFAULTS;
+            self.limits = dotcmd::LIMIT_DEFAULTS;
+        }
+        true
     }
 }
 
-fn open_db(target: &str, readonly: bool) -> sqliters::Result<Connection> {
-    if target == ":memory:" {
-        Connection::open_in_memory()
-    } else if target.is_empty() {
-        Connection::open_private_temporary()
-    } else if readonly {
-        Connection::open_with_flags(target, OpenFlags::READONLY)
-    } else {
-        Connection::open(target)
+/// `sqlite3_open_v2()` for the shell: `None` / "" = private temporary database, ":memory:" =
+/// in-memory database, anything else a file (or a `file:` URI).
+fn open_connection(
+    name: Option<&str>,
+    readonly: bool,
+    create: bool,
+    nofollow: bool,
+    deserialize: bool,
+) -> sqliters::Result<Connection> {
+    match name {
+        None | Some("") => Connection::open_private_temporary(),
+        Some(":memory:") => Connection::open_in_memory(),
+        Some(path) => {
+            if deserialize {
+                let c = Connection::open_in_memory()?;
+                // readFile() failure: the connection stays an empty database.
+                if let Ok(data) = std::fs::read(path)
+                    && let Err(e) = c.deserialize(&data, false)
+                {
+                    eprintln!("Error: sqlite3_deserialize() returns {}", e.code as i32);
+                }
+                return Ok(c);
+            }
+            let mut flags = if readonly {
+                OpenFlags::READONLY
+            } else if create {
+                OpenFlags(OpenFlags::READWRITE.0 | OpenFlags::CREATE.0)
+            } else {
+                OpenFlags::READWRITE
+            };
+            flags = OpenFlags(flags.0 | OpenFlags::URI.0);
+            if nofollow {
+                flags = OpenFlags(flags.0 | OpenFlags::NOFOLLOW.0);
+            }
+            Connection::open_with_flags(path, flags)
+        }
     }
 }
 
-/// Returns `true` if `sql` contains only ASCII whitespace, `--` line comments, or closed `/*...*/`
-/// block comments (and no unclosed `/*` block comment or SQL tokens).
-fn is_effectively_empty_sql(sql: &str) -> bool {
-    let bytes = sql.as_bytes();
+/// `line_is_all_whitespace()`.
+fn line_is_all_whitespace(z: &[u8]) -> bool {
+    let at = |i: usize| z.get(i).copied().unwrap_or(0);
     let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\x0b' => {
+    while at(i) != 0 {
+        let c = at(i);
+        if is_space(c) {
+            i += 1;
+            continue;
+        }
+        if c == b'/' && at(i + 1) == b'*' {
+            i += 2;
+            while at(i) != 0 && (at(i) != b'*' || at(i + 1) != b'/') {
                 i += 1;
             }
-            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
-                i += 2;
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
+            if at(i) == 0 {
+                return false;
             }
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                i += 2;
-                let mut closed = false;
-                while i + 1 < bytes.len() {
-                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                        i += 2;
-                        closed = true;
-                        break;
-                    }
-                    i += 1;
-                }
-                if !closed {
-                    return false;
-                }
-            }
-            _ => return false,
+            i += 2;
+            continue;
         }
+        if c == b'-' && at(i + 1) == b'-' {
+            i += 2;
+            while at(i) != 0 && at(i) != b'\n' {
+                i += 1;
+            }
+            if at(i) == 0 {
+                return true;
+            }
+            i += 1;
+            continue;
+        }
+        return false;
     }
     true
 }
 
-/// Where a piece of SQL came from; decides the prefix of its error messages
-/// (`runOneSqlLine` in shell.c).
-enum InputSrc {
-    /// Standard input: `near line N:`.
-    Stdin,
-    /// A script read with `.read`: `near line N of FILE:`.
-    File(String),
-    /// A command-line argument: `in <ordinal> command line argument:`.
-    CmdLine(usize),
+/// C `isspace()` in the "C" locale.
+pub fn is_space(c: u8) -> bool {
+    matches!(c, b' ' | 9..=13)
+}
+
+/// `sqlite3_incomplete()` (complete.c of 3.54.1): 0 when `z` is one or more complete
+/// statements, `SQLITE_EMPTY` (16) when it holds nothing, otherwise a description of what is
+/// missing: bits 0-7 = 1, bits 8-15 = what ends the statement (1 `;`, 2 `END;`, 3 `;END;`),
+/// bits 16-23 = the unmatched structure character, bits 32.. = open parentheses.
+pub fn sqlite3_incomplete(z: &[u8]) -> i64 {
+    const TRANS: [[u8; 8]; 8] = [
+        [1, 0, 2, 3, 4, 2, 2, 2],
+        [1, 1, 2, 3, 4, 2, 2, 2],
+        [1, 2, 2, 2, 2, 2, 2, 2],
+        [1, 3, 3, 2, 4, 2, 2, 2],
+        [1, 4, 2, 2, 2, 4, 5, 2],
+        [6, 5, 5, 5, 5, 5, 5, 5],
+        [6, 6, 5, 5, 5, 5, 5, 7],
+        [1, 7, 5, 5, 5, 5, 5, 5],
+    ];
+    const STATEMAP: [u8; 8] = [0, 0, 1, 1, 1, 3, 2, 1];
+    // (A C string ends at its first NUL.)
+    let z = if z.contains(&0) {
+        crate::qrf::cstr(z)
+    } else {
+        z
+    };
+    let n = z.len();
+    let id_char = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
+    let mut state = 0u8;
+    let mut pending = 0u8;
+    let mut n_paren: i32 = 0;
+    let mut i = 0usize;
+    'outer: while i < n {
+        // In the states NORMAL (2) and TRIGGER (5) every token but a semicolon leaves the
+        // state as it is, so only the bytes that start something to skip or to count matter.
+        if state == 2 || state == 5 {
+            while i < n
+                && !matches!(
+                    z[i],
+                    b';' | b'/' | b'-' | b'[' | b'`' | b'"' | b'\'' | b'(' | b')'
+                )
+            {
+                i += 1;
+            }
+            if i >= n {
+                break;
+            }
+        }
+        let token: usize;
+        match z[i] {
+            b';' => token = 0,
+            b' ' | b'\r' | b'\t' | b'\n' | 0x0c => token = 1,
+            b'/' => {
+                if i + 1 >= n || z[i + 1] != b'*' {
+                    token = 2;
+                } else {
+                    i += 2;
+                    while i < n && (z[i] != b'*' || i + 1 >= n || z[i + 1] != b'/') {
+                        i += 1;
+                    }
+                    if i >= n {
+                        pending = b'/';
+                        break 'outer;
+                    }
+                    i += 1;
+                    token = 1;
+                }
+            }
+            b'-' => {
+                if i + 1 >= n || z[i + 1] != b'-' {
+                    token = 2;
+                } else {
+                    while i < n && z[i] != b'\n' {
+                        i += 1;
+                    }
+                    if i >= n {
+                        pending = b'-';
+                        break 'outer;
+                    }
+                    token = 1;
+                }
+            }
+            b'[' => {
+                i += 1;
+                while i < n && z[i] != b']' {
+                    i += 1;
+                }
+                if i >= n {
+                    pending = b']';
+                    break 'outer;
+                }
+                token = 2;
+            }
+            c @ (b'`' | b'"' | b'\'') => {
+                i += 1;
+                while i < n && z[i] != c {
+                    i += 1;
+                }
+                if i >= n {
+                    pending = c;
+                    break 'outer;
+                }
+                token = 2;
+            }
+            b'(' => {
+                n_paren += 1;
+                token = 2;
+            }
+            b')' => {
+                n_paren -= 1;
+                token = 2;
+            }
+            c => {
+                if id_char(c) {
+                    let mut n_id = 1usize;
+                    while i + n_id < n && id_char(z[i + n_id]) {
+                        n_id += 1;
+                    }
+                    token = if matches!(c, b'c' | b'C' | b't' | b'T' | b'e' | b'E') {
+                        let w = &z[i..i + n_id];
+                        match c {
+                            b'c' | b'C' if w.eq_ignore_ascii_case(b"create") => 4,
+                            b't' | b'T' if w.eq_ignore_ascii_case(b"trigger") => 6,
+                            b't' | b'T'
+                                if w.eq_ignore_ascii_case(b"temp")
+                                    || w.eq_ignore_ascii_case(b"temporary") =>
+                            {
+                                5
+                            }
+                            b'e' | b'E' if w.eq_ignore_ascii_case(b"end") => 7,
+                            b'e' | b'E' if w.eq_ignore_ascii_case(b"explain") => 3,
+                            _ => 2,
+                        }
+                    } else {
+                        2
+                    };
+                    i += n_id - 1;
+                } else {
+                    token = 2;
+                }
+            }
+        }
+        state = TRANS[usize::from(state)][token];
+        i += 1;
+    }
+    if state == 0 && pending == 0 {
+        return 16;
+    }
+    if state == 1 {
+        n_paren = 0;
+    }
+    ((i64::from(n_paren as u32)) << 32)
+        | (i64::from(pending) << 16)
+        | (i64::from(STATEMAP[usize::from(state)]) << 8)
+        | i64::from(state > 1 || pending != 0)
+}
+
+/// `line_is_complete()`.
+fn line_is_complete(z_sql: &[u8]) -> bool {
+    let x = sqlite3_incomplete(z_sql);
+    if x == 0x00 || x == 0x10 {
+        return true;
+    }
+    if x == 0x2d_0001 {
+        let mut t = z_sql.to_vec();
+        t.push(b'\n');
+        let x = sqlite3_incomplete(&t);
+        if x == 0x00 || x == 0x10 {
+            return true;
+        }
+    }
+    false
+}
+
+/// `fgets()`: reads up to `max-1` bytes, stopping after a newline. `None` at end of file.
+fn fgets(r: &mut dyn BufRead, max: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    while out.len() + 1 < max {
+        let buf = match r.fill_buf() {
+            Ok(b) => b,
+            Err(_) => break,
+        };
+        if buf.is_empty() {
+            break;
+        }
+        let room = max - 1 - out.len();
+        let take = buf.len().min(room);
+        if let Some(p) = buf[..take].iter().position(|&c| c == b'\n') {
+            out.extend_from_slice(&buf[..=p]);
+            r.consume(p + 1);
+            return Some(out);
+        }
+        out.extend_from_slice(&buf[..take]);
+        r.consume(take);
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// `local_getline()`: one line of input without its line terminator (LF or CR LF). Like the C
+/// function it works on C strings: a NUL in the input hides the rest of that read chunk.
+pub fn local_getline(r: &mut dyn BufRead) -> Option<Vec<u8>> {
+    // The common case: the whole line is in the reader's buffer and holds no NUL. Then the
+    // chunked reads below produce exactly the line without its terminator.
+    if let Ok(buf) = r.fill_buf()
+        && let Some(pos) = buf
+            .split(|&c| c == b'\n')
+            .next()
+            .map(<[u8]>::len)
+            .filter(|&n| n < buf.len())
+    {
+        let line = &buf[..pos];
+        if !line.contains(&0) {
+            let end = if pos > 0 && line[pos - 1] == b'\r' {
+                pos - 1
+            } else {
+                pos
+            };
+            let z = line[..end].to_vec();
+            r.consume(pos + 1);
+            return Some(z);
+        }
+    }
+    let mut z: Vec<u8> = Vec::new();
+    let mut n_line = 0usize;
+    let mut n = 0usize;
+    loop {
+        if n + 100 > n_line {
+            n_line = n_line * 2 + 100;
+        }
+        let Some(chunk) = fgets(r, n_line - n) else {
+            if n == 0 {
+                return None;
+            }
+            z.truncate(n);
+            break;
+        };
+        z.truncate(n);
+        let len = chunk.iter().position(|&c| c == 0).unwrap_or(chunk.len());
+        z.extend_from_slice(&chunk[..len]);
+        n += len;
+        if n > 0 && z[n - 1] == b'\n' {
+            n -= 1;
+            if n > 0 && z[n - 1] == b'\r' {
+                n -= 1;
+            }
+            z.truncate(n);
+            break;
+        }
+    }
+    Some(z)
+}
+
+/// `integerValue()`.
+pub fn integer_value(z_arg: &str) -> i64 {
+    const MULT: [(&str, u64); 9] = [
+        ("KiB", 1024),
+        ("MiB", 1024 * 1024),
+        ("GiB", 1024 * 1024 * 1024),
+        ("KB", 1000),
+        ("MB", 1_000_000),
+        ("GB", 1_000_000_000),
+        ("K", 1000),
+        ("M", 1_000_000),
+        ("G", 1_000_000_000),
+    ];
+    let mut z = z_arg.as_bytes();
+    let mut is_neg = false;
+    if z.first() == Some(&b'-') {
+        is_neg = true;
+        z = &z[1..];
+    } else if z.first() == Some(&b'+') {
+        z = &z[1..];
+    }
+    let overflow = if is_neg { i64::MIN } else { i64::MAX };
+    let mut v: u64 = 0;
+    if z.len() >= 2 && z[0] == b'0' && z[1] == b'x' {
+        z = &z[2..];
+        while let Some(x) = z.first().and_then(|c| (*c as char).to_digit(16)) {
+            if v > 0x0fff_ffff_ffff_ffff {
+                return overflow;
+            }
+            v = (v << 4) + u64::from(x);
+            z = &z[1..];
+        }
+    } else {
+        while let Some(&c) = z.first() {
+            if !c.is_ascii_digit() {
+                break;
+            }
+            if v >= 922_337_203_685_477_580 && (v > 922_337_203_685_477_580 || c >= b'8') {
+                return overflow;
+            }
+            v = v * 10 + u64::from(c - b'0');
+            z = &z[1..];
+        }
+    }
+    for (suffix, mult) in MULT {
+        if z.eq_ignore_ascii_case(suffix.as_bytes()) {
+            if 0x7fff_ffff_ffff_ffff / mult < v {
+                return overflow;
+            }
+            v *= mult;
+            break;
+        }
+    }
+    if is_neg && v > 0x7fff_ffff_ffff_ffff {
+        return overflow;
+    }
+    if is_neg {
+        (v as i64).wrapping_neg()
+    } else {
+        v as i64
+    }
+}
+
+/// `booleanValue()`.
+pub fn boolean_value(z_arg: &str) -> i32 {
+    let b = z_arg.as_bytes();
+    let i = if b.len() >= 2 && b[0] == b'0' && b[1] == b'x' {
+        2 + b[2..].iter().take_while(|c| c.is_ascii_hexdigit()).count()
+    } else {
+        b.iter().take_while(|c| c.is_ascii_digit()).count()
+    };
+    if i > 0 && i == b.len() {
+        return (integer_value(z_arg) & 0xffff_ffff) as i32;
+    }
+    if z_arg.eq_ignore_ascii_case("on") || z_arg.eq_ignore_ascii_case("yes") {
+        return 1;
+    }
+    if z_arg.eq_ignore_ascii_case("off") || z_arg.eq_ignore_ascii_case("no") {
+        return 0;
+    }
+    eprintln!("ERROR: Not a boolean value: \"{z_arg}\". Assuming \"no\".");
+    0
+}
+
+/// `resolve_backslashes()`.
+pub fn resolve_backslashes(z: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(z.len());
+    let mut i = 0usize;
+    while i < z.len() {
+        let mut c = z[i];
+        if c == b'\\' && i + 1 < z.len() {
+            i += 1;
+            c = z[i];
+            match c {
+                b'a' => c = 7,
+                b'b' => c = 8,
+                b't' => c = b'\t',
+                b'n' => c = b'\n',
+                b'v' => c = 0x0b,
+                b'f' => c = 0x0c,
+                b'r' => c = b'\r',
+                b'x' => {
+                    let mut nhd = 0usize;
+                    let mut hv = 0u8;
+                    while nhd < 2 {
+                        let Some(d) = z.get(i + 1 + nhd).and_then(|x| (*x as char).to_digit(16))
+                        else {
+                            break;
+                        };
+                        hv = (hv << 4) | d as u8;
+                        nhd += 1;
+                    }
+                    i += nhd;
+                    c = hv;
+                }
+                b'0'..=b'7' => {
+                    let mut v = u32::from(c - b'0');
+                    if z.get(i + 1).is_some_and(|x| (b'0'..=b'7').contains(x)) {
+                        i += 1;
+                        v = (v << 3) + u32::from(z[i] - b'0');
+                        if z.get(i + 1).is_some_and(|x| (b'0'..=b'7').contains(x)) {
+                            i += 1;
+                            v = (v << 3) + u32::from(z[i] - b'0');
+                        }
+                    }
+                    c = v as u8;
+                }
+                _ => {}
+            }
+        }
+        if c == 0 {
+            // (The result is a C string.)
+            break;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// `output_c_string()` / `append_c_string()`.
+pub fn c_string(z: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in z.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\x0c' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\{:03o}", c as u32))
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// A failed SQL "line" (`shell_exec`): the error, whether it came from preparing a statement,
 /// and the SQL text that was being prepared (for the caret context).
-struct ShellSqlError {
-    err: sqliters::SqliteError,
-    in_prepare: bool,
-    sql: String,
+pub struct ShellSqlError {
+    pub err: SqliteError,
+    pub in_prepare: bool,
+    pub sql: String,
+    /// The error has no message of its own (`save_err_msg(db, "stepping", ...)`): it is
+    /// reported as "Runtime error".
+    pub stepping: bool,
 }
 
-/// `shell_error_context()`: the two extra lines of a parse error that show the SQL around the
-/// error offset with a caret, or nothing when the engine reported no offset.
-fn shell_error_context(sql: &str, offset: Option<usize>) -> String {
-    let Some(mut off) = offset else {
-        return String::new();
+/// CPU times of this process in seconds (user, system), from /proc.
+fn cpu_times() -> (f64, f64) {
+    let Ok(s) = std::fs::read_to_string("/proc/self/stat") else {
+        return (0.0, 0.0);
     };
-    // (The C shell joins the input lines with '\n' and has no newline after the last one.)
-    let sql = sql.trim_end_matches(['\r', '\n']);
-    let bytes = sql.as_bytes();
-    if off >= bytes.len() {
-        return String::new();
-    }
-    let mut start = 0usize;
-    while off > 50 {
-        off -= 1;
-        start += 1;
-        while start < bytes.len() && (bytes[start] & 0xc0) == 0x80 {
-            start += 1;
-            off = off.saturating_sub(1);
-        }
-    }
-    let rest = &bytes[start..];
-    let mut len = rest.len();
-    if len > 78 {
-        len = 78;
-        while len > 0 && (rest[len] & 0xc0) == 0x80 {
-            len -= 1;
-        }
-    }
-    let code: Vec<u8> = rest[..len]
-        .iter()
-        .map(|&c| {
-            if c.is_ascii_whitespace() || c == 0x0b {
-                b' '
-            } else {
-                c
-            }
-        })
-        .collect();
-    let code = String::from_utf8_lossy(&code);
-    if off < 25 {
-        format!("\n  {code}\n  {:off$}^--- error here", "")
-    } else {
-        format!("\n  {code}\n  {:w$}error here ---^", "", w = off - 14)
-    }
-}
-
-/// Where the C library would report the error offset (`sqlite3_error_offset`) for the
-/// messages that name a token, when the engine reported none. The engine does not record the
-/// position of the offending identifier for these, so the first matching token of the
-/// statement is taken: the first use of the column / function, or the name in a CREATE
-/// statement. `None` for every other message (C has no offset for those either, e.g. "no such
-/// table").
-fn guess_error_offset(sql: &str, msg: &str) -> Option<usize> {
-    use sqliters::syntax::{TokenKind, dequote, tokenize};
-    enum Want<'m> {
-        /// A (possibly qualified) column name.
-        Column(&'m str),
-        /// A function name followed by `(`.
-        Function(&'m str),
-        /// The object name of a CREATE statement.
-        Created(&'m str),
-    }
-    let want = if let Some(rest) = msg.strip_prefix("no such column: ") {
-        let name = rest.split(" - should this be").next().unwrap_or(rest);
-        Want::Column(name.trim_matches('"'))
-    } else if let Some(rest) = msg.strip_prefix("ambiguous column name: ") {
-        Want::Column(rest)
-    } else if let Some(rest) = msg.strip_prefix("no such function: ") {
-        Want::Function(rest)
-    } else if let Some(rest) = msg
-        .strip_prefix("wrong number of arguments to function ")
-        .or_else(|| msg.strip_prefix("misuse of aggregate function "))
-        .or_else(|| msg.strip_prefix("misuse of window function "))
-        .or_else(|| msg.strip_prefix("misuse of aggregate: "))
-    {
-        Want::Function(rest.strip_suffix("()")?)
-    } else {
-        let rest = msg.strip_suffix(" already exists")?;
-        let name = rest
-            .strip_prefix("table ")
-            .or_else(|| rest.strip_prefix("index "))
-            .or_else(|| rest.strip_prefix("view "))
-            .or_else(|| rest.strip_prefix("trigger "))?;
-        Want::Created(name)
+    let Some(pos) = s.rfind(')') else {
+        return (0.0, 0.0);
     };
-    let mut tokens = tokenize(sql).ok()?;
-    // Only the statement that failed (the text starts with it).
-    if let Some(semi) = tokens.iter().position(|t| t.kind == TokenKind::Semi) {
-        tokens.truncate(semi);
-    }
-    let is_name = |i: usize, name: &str| -> bool {
-        tokens.get(i).is_some_and(|t| {
-            (t.kind == TokenKind::Id
-                || t.kind == TokenKind::QuotedId
-                || (t.kind != TokenKind::StringLiteral
-                    && t.text
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                    && !t.text.is_empty()
-                    && !t.text.as_bytes()[0].is_ascii_digit()))
-                && dequote(t.text).eq_ignore_ascii_case(name)
-        })
-    };
-    match want {
-        Want::Function(name) => (0..tokens.len())
-            .find(|&i| {
-                is_name(i, name) && tokens.get(i + 1).is_some_and(|t| t.kind == TokenKind::Lp)
-            })
-            .map(|i| tokens[i].offset),
-        Want::Created(name) => (0..tokens.len())
-            .find(|&i| is_name(i, name))
-            .map(|i| tokens[i].offset),
-        Want::Column(full) => {
-            let parts: Vec<&str> = full.split('.').collect();
-            (0..tokens.len())
-                .find(|&i| {
-                    parts.iter().enumerate().all(|(k, p)| {
-                        is_name(i + 2 * k, p)
-                            && (k == 0
-                                || tokens
-                                    .get(i + 2 * k - 1)
-                                    .is_some_and(|t| t.kind == TokenKind::Dot))
-                    }) && !tokens
-                        .get(i + 2 * parts.len() - 1)
-                        .is_some_and(|t| t.kind == TokenKind::Lp)
-                })
-                .map(|i| tokens[i].offset)
-        }
-    }
+    let f: Vec<&str> = s[pos + 1..].split_whitespace().collect();
+    let tick = 100.0;
+    let u = f.get(11).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0) / tick;
+    let sy = f.get(12).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0) / tick;
+    (u, sy)
 }
 
-/// English ordinal as printf's `%r` renders it (1st, 2nd, 3rd, 4th, 11th ...).
-fn ordinal(n: usize) -> String {
-    let x = n % 10;
-    let suffix = if x >= 4 || (n / 10) % 10 == 1 {
-        "th"
-    } else {
-        ["th", "st", "nd", "rd"][x]
-    };
-    format!("{n}{suffix}")
-}
-
-/// Prints the message of a failed SQL line in the format of the C shell:
-/// `Parse error near line N: msg[ (rc)]` plus the caret context, or `Error near line N: msg`
-/// for an error raised while stepping (the query result formatter reports those).
-fn report_sql_error(e: &ShellSqlError, src: &InputSrc, startline: usize, interactive: bool) {
-    let kind = if e.in_prepare { "Parse error" } else { "Error" };
-    let prefix = if interactive {
-        format!("{kind}:")
-    } else {
-        match src {
-            InputSrc::Stdin => format!("{kind} near line {startline}:"),
-            InputSrc::File(name) => format!("{kind} near line {startline} of {name}:"),
-            InputSrc::CmdLine(i) => {
-                format!("{kind} in {} command line argument:", ordinal(*i))
-            }
-        }
-    };
-    let mut tail = e.err.message.clone();
-    if e.in_prepare {
-        let rc = e.err.code as i32;
-        if rc > 1 {
-            tail.push_str(&format!(" ({rc})"));
-        }
-        let offset = e
-            .err
-            .offset
-            .or_else(|| guess_error_offset(&e.sql, &e.err.message));
-        tail.push_str(&shell_error_context(&e.sql, offset));
+/// `bind_prepared_stmt()`.
+fn bind_prepared_stmt(p: &ShellState, stmt: &mut sqliters::Statement) {
+    let n_var = stmt.parameter_count();
+    if n_var == 0 {
+        return;
     }
-    eprintln!("{prefix} {tail}");
-}
-
-/// Runs one accumulated SQL "line" (`runOneSqlLine`); returns `true` when it failed.
-fn run_one_sql_line<W: Write>(
-    conn: &Connection,
-    cfg: &ShellConfig,
-    sql: &str,
-    out: &mut W,
-    src: &InputSrc,
-    startline: usize,
-    interactive: bool,
-) -> bool {
-    // The C shell joins input lines with '\n' and passes no newline after the last one.
-    let sql = sql
-        .strip_suffix('\n')
-        .map_or(sql, |t| t.strip_suffix('\r').unwrap_or(t));
-    match execute_sql_buffer(conn, cfg, sql, out) {
-        Ok(()) => false,
-        Err(e) => {
-            // (No flush here: like the C shell, standard output is flushed once per input
-            // line, so the message precedes rows of the same line that are still buffered.)
-            report_sql_error(&e, src, startline, interactive);
-            true
+    let db = p.db();
+    let mut names: Vec<Option<String>> = vec![None; n_var + 1];
+    for (name, idx) in stmt.named_parameters() {
+        if *idx <= n_var {
+            names[*idx] = Some(name.clone());
         }
     }
-}
-
-fn process_input_stream<R: BufRead, W: Write>(
-    conn: &mut Connection,
-    cfg: &mut ShellConfig,
-    reader: &mut R,
-    out: &mut W,
-    interactive: bool,
-    src: &InputSrc,
-) -> StreamOutcome {
-    let mut outcome = StreamOutcome::default();
-    let mut sql_buf = String::new();
-    let mut raw_line = String::new();
-    let mut lineno = 0usize;
-    let mut startline = 0usize;
-
-    if interactive {
-        let _ = write!(out, "sqliters> ");
-        let _ = out.flush();
-    }
-
-    loop {
-        // process_input(): `fflush(p->out)` before every line that is read.
-        let _ = out.flush();
-        raw_line.clear();
-        let n_read = match reader.read_line(&mut raw_line) {
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("Error: {e}");
-                outcome.err_count += 1;
-                if cfg.bail {
-                    outcome.bailed = true;
-                }
-                break;
-            }
-        };
-        if n_read == 0 {
-            break;
+    let have_table = db
+        .prepare("SELECT key FROM temp.sqlite_parameters LIMIT 0")
+        .map(|s| s.finalize())
+        .is_ok();
+    for i in 1..=n_var {
+        let z_var = names[i].clone().unwrap_or_else(|| format!("?{i}"));
+        let mut bound = false;
+        if have_table
+            && let Ok(Some(row)) = db.query_row(
+                "SELECT value FROM temp.sqlite_parameters WHERE key=?1",
+                &[Value::Text(z_var.clone())],
+            )
+            && let Some(v) = row.get(0)
+        {
+            let _ = stmt.bind(i, v.clone());
+            bound = true;
         }
-        lineno += 1;
-
-        if sql_buf.is_empty() {
-            if is_effectively_empty_sql(&raw_line) {
-                if interactive {
-                    let _ = write!(out, "sqliters> ");
-                    let _ = out.flush();
-                }
-                continue;
-            }
-            // A dot-command or a `#` comment starts in the first column (shell.c
-            // process_input: `zLine[0]=='.' || zLine[0]=='#'`).
-            if raw_line.starts_with('#') {
-                continue;
-            }
-            if raw_line.starts_with('.') {
-                let cmd_line = raw_line.trim_end_matches(['\r', '\n']);
-                let dot_out = handle_dot_command(conn, cfg, cmd_line, out);
-                outcome.err_count += dot_out.err_count;
-                if dot_out.bailed {
-                    outcome.bailed = true;
-                    return outcome;
-                }
-                if dot_out.quit {
-                    outcome.quit = true;
-                    return outcome;
-                }
-                if interactive {
-                    let _ = write!(out, "sqliters> ");
-                    let _ = out.flush();
-                }
-                continue;
-            }
-            startline = lineno;
-
-            if is_complete(&raw_line) {
-                if run_one_sql_line(conn, cfg, &raw_line, out, src, startline, interactive) {
-                    outcome.err_count += 1;
-                    if cfg.bail {
-                        outcome.bailed = true;
-                        return outcome;
-                    }
-                }
-                if interactive {
-                    let _ = write!(out, "sqliters> ");
-                    let _ = out.flush();
-                }
-                continue;
-            }
-
-            sql_buf.push_str(&raw_line);
-            if interactive {
-                let _ = write!(out, "   ...> ");
-                let _ = out.flush();
-            }
+        if bound {
             continue;
         }
-
-        // Preserve exact line endings (including `\r\n` inside multiline SQL string literals).
-        sql_buf.push_str(&raw_line);
-
-        if is_effectively_empty_sql(&sql_buf) {
-            sql_buf.clear();
-            if interactive {
-                let _ = write!(out, "sqliters> ");
-                let _ = out.flush();
-            }
-            continue;
-        }
-
-        if is_complete(&sql_buf) {
-            if run_one_sql_line(conn, cfg, &sql_buf, out, src, startline, interactive) {
-                outcome.err_count += 1;
-                if cfg.bail {
-                    outcome.bailed = true;
-                    return outcome;
-                }
-            }
-            sql_buf.clear();
-            if interactive {
-                let _ = write!(out, "sqliters> ");
-                let _ = out.flush();
-            }
-        } else if interactive {
-            let _ = write!(out, "   ...> ");
-            let _ = out.flush();
-        }
-    }
-
-    if !is_effectively_empty_sql(&sql_buf) {
-        // "This may be incomplete. Let the SQL parser deal with that."
-        if run_one_sql_line(conn, cfg, &sql_buf, out, src, startline, interactive) {
-            outcome.err_count += 1;
-            if cfg.bail {
-                outcome.bailed = true;
-            }
-        }
-    }
-
-    outcome
-}
-
-fn execute_shell_input<W: Write>(
-    conn: &mut Connection,
-    cfg: &mut ShellConfig,
-    input: &str,
-    out: &mut W,
-    arg_index: usize,
-    interactive: bool,
-) -> Result<(), ExitCode> {
-    let _ = interactive;
-    if input.trim().is_empty() {
-        return Ok(());
-    }
-    if input.starts_with('.') {
-        let cmd_line = input.trim_end_matches(['\r', '\n']);
-        let dot_out = handle_dot_command(conn, cfg, cmd_line, out);
-        if dot_out.bailed || dot_out.err_count > 0 {
-            return Err(ExitCode::from(1));
-        }
-        return Ok(());
-    }
-    // A command-line argument is one SQL "line" whatever it contains (`runOneSqlLine(&data,
-    // azCmd[i], "cmdline", aiCmd[i])`).
-    if run_one_sql_line(
-        conn,
-        cfg,
-        input,
-        out,
-        &InputSrc::CmdLine(arg_index),
-        0,
-        false,
-    ) {
-        return Err(ExitCode::from(1));
-    }
-    Ok(())
-}
-
-/// Returns `true` when every statement in `sql` is a semicolon-terminated non-returning DML or
-/// transaction-control statement (`INSERT`, `REPLACE`, `UPDATE`, `DELETE`, `BEGIN`, `COMMIT`,
-/// `END`, `ROLLBACK`) containing no unquoted `RETURNING` keyword, so it never emits result rows or
-/// column headers and can be executed directly via [`Connection::execute_batch`].
-fn is_pure_non_returning_batch_sql(sql: &str) -> bool {
-    let bytes = sql.as_bytes();
-    let mut i = 0usize;
-    let mut saw_stmt = false;
-
-    loop {
-        while i < bytes.len() {
-            match bytes[i] {
-                b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\x0b' | b';' => i += 1,
-                b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
-                    i += 2;
-                    while i < bytes.len() && bytes[i] != b'\n' {
-                        i += 1;
-                    }
-                }
-                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                    i += 2;
-                    let mut closed = false;
-                    while i + 1 < bytes.len() {
-                        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                            i += 2;
-                            closed = true;
-                            break;
-                        }
-                        i += 1;
-                    }
-                    if !closed {
-                        return false;
-                    }
-                }
-                _ => break,
-            }
-        }
-        if i >= bytes.len() {
-            return saw_stmt;
-        }
-
-        if !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
-            return false;
-        }
-        let kw_start = i;
-        i += 1;
-        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-            i += 1;
-        }
-        let kw = &bytes[kw_start..i];
-        let is_dml = kw.eq_ignore_ascii_case(b"INSERT")
-            || kw.eq_ignore_ascii_case(b"REPLACE")
-            || kw.eq_ignore_ascii_case(b"UPDATE")
-            || kw.eq_ignore_ascii_case(b"DELETE");
-        let is_tcl = kw.eq_ignore_ascii_case(b"BEGIN")
-            || kw.eq_ignore_ascii_case(b"COMMIT")
-            || kw.eq_ignore_ascii_case(b"END")
-            || kw.eq_ignore_ascii_case(b"ROLLBACK");
-        if !is_dml && !is_tcl {
-            return false;
-        }
-        saw_stmt = true;
-        let mut terminated = false;
-
-        while i < bytes.len() {
-            match bytes[i] {
-                b';' => {
-                    i += 1;
-                    terminated = true;
-                    break;
-                }
-                b'\'' | b'"' | b'`' => {
-                    let delim = bytes[i];
-                    i += 1;
-                    let mut closed = false;
-                    while i < bytes.len() {
-                        if bytes[i] == delim {
-                            if i + 1 < bytes.len() && bytes[i + 1] == delim {
-                                i += 2;
-                                continue;
-                            }
-                            i += 1;
-                            closed = true;
-                            break;
-                        }
-                        i += 1;
-                    }
-                    if !closed {
-                        return false;
-                    }
-                }
-                b'[' => {
-                    i += 1;
-                    while i < bytes.len() && bytes[i] != b']' {
-                        i += 1;
-                    }
-                    if i >= bytes.len() {
-                        return false;
-                    }
-                    i += 1;
-                }
-                b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
-                    i += 2;
-                    while i < bytes.len() && bytes[i] != b'\n' {
-                        i += 1;
-                    }
-                }
-                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                    i += 2;
-                    let mut closed = false;
-                    while i + 1 < bytes.len() {
-                        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                            i += 2;
-                            closed = true;
-                            break;
-                        }
-                        i += 1;
-                    }
-                    if !closed {
-                        return false;
-                    }
-                }
-                c if c.is_ascii_alphabetic() || c == b'_' => {
-                    let id_start = i;
-                    i += 1;
-                    while i < bytes.len()
-                        && (bytes[i].is_ascii_alphanumeric()
-                            || bytes[i] == b'_'
-                            || bytes[i] == b'$')
-                    {
-                        i += 1;
-                    }
-                    if is_dml
-                        && i - id_start == 9
-                        && bytes[id_start..i].eq_ignore_ascii_case(b"RETURNING")
-                    {
-                        return false;
-                    }
-                }
-                _ => i += 1,
-            }
-        }
-        if !terminated {
-            return false;
+        let like = |pat: &str| sqliters::vdbe::sqlite_like_match(pat, &z_var, None);
+        if like("_NAN") {
+            let _ = stmt.bind(i, Value::Null);
+        } else if like("_INF") {
+            let _ = stmt.bind(i, Value::Real(f64::INFINITY));
+        } else if let Some(rest) = z_var.strip_prefix("$int_") {
+            let n: i64 = rest
+                .bytes()
+                .take_while(u8::is_ascii_digit)
+                .fold(0i64, |a, c| {
+                    a.wrapping_mul(10).wrapping_add(i64::from(c - b'0'))
+                });
+            let _ = stmt.bind(i, Value::Integer(i64::from(n as i32)));
+        } else if let Some(rest) = z_var.strip_prefix("$text_") {
+            let _ = stmt.bind(i, Value::Text(rest.to_owned()));
+        } else if z_var == "$TIMER" {
+            let _ = stmt.bind(i, Value::Real(p.prev_timer));
+        } else {
+            let _ = stmt.bind(i, Value::Null);
         }
     }
 }
 
-fn execute_sql_buffer<W: Write>(
-    conn: &Connection,
-    cfg: &ShellConfig,
-    mut sql: &str,
-    out: &mut W,
-) -> Result<(), ShellSqlError> {
-    if is_pure_non_returning_batch_sql(sql) {
-        return match conn.execute_batch(sql) {
+/// `shell_exec()`: runs every statement of `z_sql` and renders the results.
+pub fn shell_exec(p: &mut ShellState, z_sql: &str) -> Result<(), ShellSqlError> {
+    // (The "count" mode prints a row count for every statement, also those without rows.)
+    let plain = p.mode.auto_eqp == 0
+        && p.m_stats == 0
+        && p.mode.scanstats_on == 0
+        && A_MODE_INFO[usize::from(p.mode.e_mode)].e_style != qrf::QRF_STYLE_COUNT;
+    // Statements that produce no rows and take no parameters go through the engine's batch
+    // executor: the observable behaviour is the same, error classification included.
+    if plain && util::is_pure_non_returning_batch_sql(z_sql) {
+        let db = p.db();
+        return match db.execute_batch(z_sql) {
             Ok(()) => Ok(()),
             Err(err) => {
-                // The batch stopped at its first failing statement. It consists of DML and
-                // transaction control only, so preparing the statements again tells whether
-                // that one failed to compile (C: "Parse error") or failed while running.
-                let mut rest = sql;
-                while !is_effectively_empty_sql(rest) {
-                    rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
-                    match conn.prepare(rest) {
+                let mut rest = z_sql;
+                loop {
+                    rest = rest.trim_start_matches(|c: char| c.is_ascii() && is_space(c as u8));
+                    if rest.is_empty() {
+                        break;
+                    }
+                    match db.prepare(rest) {
                         Err(pe) => {
                             return Err(ShellSqlError {
                                 err: pe,
                                 in_prepare: true,
                                 sql: rest.to_owned(),
+                                stepping: false,
                             });
                         }
                         Ok(stmt) => {
@@ -868,1551 +1257,1071 @@ fn execute_sql_buffer<W: Write>(
                     err,
                     in_prepare: false,
                     sql: String::new(),
+                    stepping: false,
                 })
             }
         };
     }
-    while !is_effectively_empty_sql(sql) {
-        // shell_exec: `while( IsSpace(zSql[0]) ) zSql++;` (error offsets count from here).
-        sql = sql.trim_start_matches(|c: char| c.is_ascii_whitespace());
-        let mut stmt = conn.prepare(sql).map_err(|err| ShellSqlError {
-            err,
-            in_prepare: true,
-            sql: sql.to_owned(),
-        })?;
-        let tail_len = stmt.tail().len();
-        let cur_len = sql.len();
-        let col_names: Vec<String> = stmt.column_names().to_vec();
-        let mut printer = RowPrinter::new(cfg, &col_names);
-        let step_res = (|| -> sqliters::Result<()> {
-            while let StepResult::Row(r) = stmt.step()? {
-                printer.row(out, r.values());
+    let mut spec = p.mode.spec.clone();
+    if p.mode.e_mode == MODE_INSERT && p.has_flag(SHFLG_PRESERVE_ROWID) {
+        spec.b_titles = QRF_YES;
+    }
+    let e_style = A_MODE_INFO[usize::from(p.mode.e_mode)].e_style;
+    if p.mode.b_auto_screen_width {
+        spec.n_screen_width = p.screen_width().min(i32::from(i16::MAX)) as i16;
+    }
+    if spec.e_blob == QRF_BLOB_AUTO {
+        spec.e_blob = match spec.e_text {
+            QRF_TEXT_RELAXED | QRF_TEXT_SQL => QRF_BLOB_SQL,
+            QRF_TEXT_JSON => QRF_BLOB_JSON,
+            _ => QRF_BLOB_TEXT,
+        };
+    }
+    let mut z = z_sql;
+    while !z.is_empty() {
+        // SQLITE_LIMIT_SQL_LENGTH (`.limit sql_length`): the tokenizer of the C library gives
+        // up once the tokens of a statement exceed it.
+        let mx_sql = p.limits[1];
+        let prep = if mx_sql < 1_000_000_000
+            && sqliters::syntax::first_statement_end_offset(z) > mx_sql.max(0) as usize
+        {
+            Err(SqliteError::new(
+                sqliters::ErrorCode::TooBig,
+                "string or blob too big",
+            ))
+        } else {
+            p.db().prepare(z)
+        };
+        let mut stmt = match prep {
+            Ok(s) => s,
+            Err(err) => {
+                return Err(ShellSqlError {
+                    err,
+                    in_prepare: true,
+                    sql: z.to_owned(),
+                    stepping: false,
+                });
             }
+        };
+        let tail_len = stmt.tail().len();
+        let cur_len = z.len();
+        let stmt_sql = &z[..cur_len - tail_len];
+        if stmt_sql.bytes().all(|c| is_space(c) || c == b';')
+            || line_is_all_whitespace(stmt_sql.as_bytes())
+        {
+            // "this happens for a comment or white-space"
+            let _ = stmt.finalize();
+            z = &z[cur_len - tail_len..];
+            z = z.trim_start_matches(|c: char| c.is_ascii() && is_space(c as u8));
+            if tail_len == cur_len {
+                break;
+            }
+            continue;
+        }
+        let is_explain = qrf::stmt_isexplain(stmt_sql);
+        if p.b_safe_mode && util::first_keyword_is(stmt_sql, "attach") {
+            // safeModeAuth(): SQLITE_ATTACH is refused in safe mode (the shell exits).
+            let _ = stmt.finalize();
+            p.fail_if_safe_mode("cannot run ATTACH in safe mode");
+            return Ok(());
+        }
+        if p.mode.auto_eqp != 0 && is_explain == 0 && p.dot.n_arg == 0 {
+            let saved_timer = p.enable_timer;
+            p.enable_timer = 0;
+            let mut s2 = spec.clone();
+            s2.e_style = QRF_STYLE_AUTO;
+            let eqp_sql = format!("EXPLAIN QUERY PLAN {stmt_sql}");
+            if let Ok(mut es) = p.db().prepare(&eqp_sql) {
+                let mut buf = Vec::new();
+                let _ = qrf::format_query_result(&mut es, 2, &s2, &mut buf);
+                let _ = es.finalize();
+                p.out_bytes(&buf);
+            }
+            if p.mode.auto_eqp >= 3 {
+                let ex_sql = format!("EXPLAIN {stmt_sql}");
+                if let Ok(mut es) = p.db().prepare(&ex_sql) {
+                    let mut buf = Vec::new();
+                    let _ = qrf::format_query_result(&mut es, 1, &s2, &mut buf);
+                    let _ = es.finalize();
+                    p.out_bytes(&buf);
+                }
+            }
+            p.enable_timer = saved_timer;
+        }
+        bind_prepared_stmt(p, &mut stmt);
+        let mut s2 = spec.clone();
+
+        let rc = if is_explain != 0 && p.mode.auto_explain != 0 {
+            s2.e_style = if is_explain == 1 {
+                QRF_STYLE_EXPLAIN
+            } else {
+                QRF_STYLE_EQP
+            };
+            run_qrf(p, &mut stmt, is_explain, &s2)
+        } else if p.mode.e_mode == MODE_WWW {
+            p.outs("</PRE>\n<TABLE border='1' cellspacing='0' cellpadding='2'>\n");
+            s2.e_style = QRF_STYLE_HTML;
+            let _ = run_qrf(p, &mut stmt, is_explain, &s2);
+            p.outs("</TABLE>\n<PRE>");
             Ok(())
-        })();
-        // Rows that were produced before a runtime error are still shown (the C shell writes
-        // each row as it is stepped; columnar modes show nothing on an error).
-        printer.finish(out, step_res.is_ok());
-        let fin_res = stmt.finalize();
-        step_res.and(fin_res).map_err(|err| ShellSqlError {
-            err,
-            in_prepare: false,
-            sql: String::new(),
-        })?;
+        } else {
+            s2.e_style = e_style;
+            run_qrf(p, &mut stmt, is_explain, &s2)
+        };
+        if p.m_stats != 0 {
+            dotcmd::display_stats(p);
+        }
+        if p.mode.scanstats_on != 0 {
+            // The scan-status styles are "not available in this build" of the C shell either:
+            // the message goes to stderr and the SQL line fails with the connection's
+            // (unset) error message.
+            eprintln!("Stats query failed: not available in this build");
+            let _ = stmt.finalize();
+            return Err(ShellSqlError {
+                err: SqliteError::new(sqliters::ErrorCode::Error, "not an error"),
+                in_prepare: false,
+                sql: String::new(),
+                stepping: true,
+            });
+        }
+        let fin = stmt.finalize();
+        if let Err(err) = rc.and(fin) {
+            return Err(ShellSqlError {
+                err,
+                in_prepare: false,
+                sql: String::new(),
+                stepping: false,
+            });
+        }
         if tail_len == cur_len {
             break;
         }
-        sql = &sql[(cur_len - tail_len)..];
+        z = &z[cur_len - tail_len..];
+        z = z.trim_start_matches(|c: char| c.is_ascii() && is_space(c as u8));
     }
     Ok(())
 }
 
-/// Per-statement output state: the simple modes write each row as it arrives, the columnar
-/// modes (box, table) collect the rows to size the columns.
-struct RowPrinter<'a> {
-    cfg: &'a ShellConfig,
-    names: &'a [String],
-    n_row: usize,
-    /// Rendered cells of the columnar modes: `(text bytes, is_number)`.
-    cells: Vec<Vec<(Vec<u8>, bool)>>,
-    line_width: usize,
+/// Runs the formatter with the shell's current output as the sink.
+fn run_qrf(
+    p: &mut ShellState,
+    stmt: &mut sqliters::Statement,
+    is_explain: u8,
+    spec: &QrfSpec,
+) -> Result<(), SqliteError> {
+    if matches!(p.redirect, Some(Redirect::Null)) {
+        let mut sink = io::sink();
+        return qrf::format_query_result(stmt, is_explain, spec, &mut sink);
+    }
+    qrf::format_query_result(stmt, is_explain, spec, p.out())
 }
 
-impl<'a> RowPrinter<'a> {
-    fn new(cfg: &'a ShellConfig, names: &'a [String]) -> Self {
-        let line_width = names
-            .iter()
-            .map(|s| display_width(s.as_bytes()))
-            .max()
-            .unwrap_or(0);
-        Self {
-            cfg,
-            names,
-            n_row: 0,
-            cells: Vec::new(),
-            line_width,
-        }
+/// `doAutoDetectRestore()`.
+fn do_auto_detect_restore(p: &mut ShellState, z_sql: &str) {
+    if p.e_restore_state >= 7 {
+        return;
     }
-
-    fn row<W: Write>(&mut self, out: &mut W, vals: &[Value]) {
-        let cfg = self.cfg;
-        match cfg.mode {
-            OutputMode::List => {
-                if self.n_row == 0 {
-                    self.title(out);
-                }
-                // A statement without result columns still ends each row with the row
-                // separator (PRAGMA incremental_vacuum: one empty line per freed page).
-                let sep_bytes = cfg.separator.as_bytes();
-                for (ci, v) in vals.iter().enumerate() {
-                    if ci > 0 {
-                        let _ = out.write_all(sep_bytes);
-                    }
-                    match v {
-                        Value::Text(t) if cfg.list_csv_quote => {
-                            let t = t.split('\0').next().unwrap_or("");
-                            let mut b = Vec::new();
-                            escape_ctrl_into(&mut b, csv_escape_sep(t, &cfg.separator).as_bytes());
-                            let _ = out.write_all(&b);
-                        }
-                        _ => write_cell_value(out, v, &cfg.null_value),
-                    }
-                }
-                let _ = out.write_all(b"\n");
-            }
-            OutputMode::Csv => {
-                if self.n_row == 0 {
-                    self.title(out);
-                }
-                for (ci, v) in vals.iter().enumerate() {
-                    if ci > 0 {
-                        let _ = out.write_all(b",");
-                    }
-                    match v {
-                        // CSV: a NULL is empty, text is quoted when it needs to be, a blob
-                        // is written as it is (shell_exec: eBlob = text).
-                        Value::Null => {}
-                        Value::Blob(b) => {
-                            let mut e = Vec::with_capacity(b.len());
-                            escape_ctrl_into(&mut e, b);
-                            let _ = out.write_all(&e);
-                        }
-                        Value::Text(t) => {
-                            let t = t.split('\0').next().unwrap_or("");
-                            let mut e = Vec::with_capacity(t.len() + 2);
-                            escape_ctrl_into(&mut e, csv_escape(t).as_bytes());
-                            let _ = out.write_all(&e);
-                        }
-                        other => {
-                            let _ = out.write_all(format_cell_value(other, "").as_bytes());
-                        }
-                    }
-                }
-                let _ = out.write_all(b"\n");
-            }
-            OutputMode::Line => {
-                if self.names.is_empty() {
-                    self.n_row += 1;
-                    return;
-                }
-                if self.n_row > 0 {
-                    let _ = out.write_all(b"\n");
-                }
-                for (ci, v) in vals.iter().enumerate() {
-                    let name = &self.names[ci];
-                    let pad = self
-                        .line_width
-                        .saturating_sub(display_width(name.as_bytes()));
-                    let mut val = Vec::new();
-                    render_plain_value(&mut val, v, &cfg.null_value);
-                    // Continuation lines of a multi-line value are indented to the value.
-                    // (Line mode keeps a CR in front of the line break.)
-                    let mut pieces: Vec<&[u8]> = val.split(|&c| c == b'\n').collect();
-                    if pieces.len() > 1 && pieces.last().is_some_and(|l| l.is_empty()) {
-                        pieces.pop();
-                    }
-                    for (li, piece) in pieces.iter().enumerate() {
-                        if li == 0 {
-                            let _ = write!(out, "{:pad$}{name}: ", "");
-                        } else {
-                            let _ = write!(out, "{:w$}", "", w = self.line_width + 2);
-                        }
-                        let _ = out.write_all(piece);
-                        let _ = out.write_all(b"\n");
-                    }
-                }
-            }
-            OutputMode::Json => {
-                // (Rows are joined with "," on one line: `crates/sqliters-cli/tests/
-                // cli_smoke.rs` expects that layout; C puts each row on its own line.)
-                let _ = out.write_all(if self.n_row == 0 { b"[{" } else { b",{" });
-                for (ci, v) in vals.iter().enumerate() {
-                    if ci > 0 {
-                        let _ = out.write_all(b",");
-                    }
-                    let _ = write!(out, "{}:{}", json_quote(&self.names[ci]), json_value(v));
-                }
-                let _ = out.write_all(b"}");
-            }
-            OutputMode::Table | OutputMode::Box => {
-                let row = vals
-                    .iter()
-                    .map(|v| {
-                        let mut b = Vec::new();
-                        render_plain_value(&mut b, v, &cfg.null_value);
-                        (b, matches!(v, Value::Integer(_) | Value::Real(_)))
-                    })
-                    .collect();
-                self.cells.push(row);
-            }
-        }
-        self.n_row += 1;
-    }
-
-    /// The title row of the list and CSV modes (`qrfSimpleTitle`).
-    fn title<W: Write>(&self, out: &mut W) {
-        let cfg = self.cfg;
-        if !cfg.headers || self.names.is_empty() {
-            return;
-        }
-        let mut line = Vec::new();
-        for (i, n) in self.names.iter().enumerate() {
-            if i > 0 {
-                line.extend_from_slice(cfg.separator.as_bytes());
-            }
-            if cfg.mode == OutputMode::Csv {
-                line.extend_from_slice(csv_escape(n).as_bytes());
-            } else if cfg.list_csv_quote {
-                escape_ctrl_into(&mut line, csv_escape_sep(n, &cfg.separator).as_bytes());
+    match p.e_restore_state {
+        0 => {
+            let expect = "PRAGMA foreign_keys=OFF;";
+            p.e_restore_state = if !p.b_safe_mode && z_sql == expect {
+                1
             } else {
-                escape_ctrl_into(&mut line, n.as_bytes());
+                7
+            };
+        }
+        1 => {
+            let mut is_dump = false;
+            if z_sql == "BEGIN TRANSACTION;" {
+                is_dump = !matches!(
+                    p.db().query_row("SELECT 1 FROM sqlite_schema LIMIT 1", &[]),
+                    Ok(Some(_))
+                );
+            }
+            if is_dump {
+                let defense = p.db().db_config_defensive(None);
+                let dqs_ddl = p.dbcfg_shadow[dotcmd::DBCFG_DQS_DDL] != 0;
+                p.db().db_config_defensive(Some(false));
+                p.dbcfg_shadow[dotcmd::DBCFG_DQS_DDL] = 1;
+                p.e_restore_state = (if defense { 2 } else { 0 }) + (if dqs_ddl { 4 } else { 0 });
+                if p.e_restore_state == 0 {
+                    // (State 0 would restart the detection; C has the same quirk.)
+                }
+            } else {
+                p.e_restore_state = 7;
             }
         }
-        line.push(b'\n');
-        let _ = out.write_all(&line);
-    }
-
-    fn finish<W: Write>(&mut self, out: &mut W, ok: bool) {
-        // `-header`: titles even for an empty result (QRF_Always).
-        if ok
-            && self.n_row == 0
-            && self.cfg.headers_always
-            && matches!(self.cfg.mode, OutputMode::List | OutputMode::Csv)
-        {
-            self.title(out);
+        _ => {
+            if p.db().is_autocommit() {
+                if p.e_restore_state & 2 != 0 {
+                    p.db().db_config_defensive(Some(true));
+                }
+                if p.e_restore_state & 4 != 0 {
+                    p.dbcfg_shadow[dotcmd::DBCFG_DQS_DDL] = 0;
+                }
+                p.e_restore_state = 7;
+            }
         }
-        match self.cfg.mode {
-            OutputMode::Json => {
-                if self.n_row > 0 {
-                    let _ = out.write_all(b"]\n");
+    }
+}
+
+/// `runOneSqlLine()`: returns the number of errors (0 or 1).
+pub fn run_one_sql_line(
+    p: &mut ShellState,
+    z_sql: &[u8],
+    z_filename: Option<&str>,
+    startline: i64,
+) -> i32 {
+    if !p.open_db(false) {
+        return 1;
+    }
+    let owned;
+    let bytes: &[u8] = if p.has_flag(SHFLG_BACKSLASH) {
+        owned = resolve_backslashes(z_sql);
+        &owned
+    } else {
+        z_sql
+    };
+    let sql_cow;
+    let sql: &str = match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            sql_cow = String::from_utf8_lossy(bytes);
+            &sql_cow
+        }
+    };
+    let timer = p.enable_timer != 0;
+    let (t0, cpu0) = if timer {
+        (Some(std::time::Instant::now()), cpu_times())
+    } else {
+        (None, (0.0, 0.0))
+    };
+    let res = shell_exec(p, sql);
+    if p.enable_timer != 0
+        && let Some(t0) = t0
+    {
+        let cpu1 = cpu_times();
+        p.prev_timer = t0.elapsed().as_secs_f64();
+        let line = format!(
+            "Run Time: real {:.6} user {:.6} sys {:.6}\n",
+            p.prev_timer,
+            cpu1.0 - cpu0.0,
+            cpu1.1 - cpu0.1
+        );
+        p.outs(&line);
+        if p.enable_timer == 1 {
+            p.enable_timer = 0;
+        }
+    }
+    match res {
+        Err(e) => {
+            let kind = if e.in_prepare {
+                "Parse error"
+            } else if e.stepping {
+                "Runtime error"
+            } else {
+                "Error"
+            };
+            let mut tail = e.err.message.clone();
+            if e.in_prepare {
+                let rc = e.err.code as i32;
+                if rc > 1 {
+                    tail.push_str(&format!(" ({rc})"));
+                }
+                let offset = e
+                    .err
+                    .offset
+                    .or_else(|| util::guess_error_offset(&e.sql, &e.err.message));
+                tail.push_str(&util::shell_error_context(&e.sql, offset));
+            }
+            let prefix = if z_filename.is_some() || !p.stdin_is_interactive {
+                match z_filename {
+                    Some("cmdline") => format!(
+                        "{kind} in {} command line argument:",
+                        util::ordinal(startline as usize)
+                    ),
+                    Some("<stdin>") => format!("{kind} near line {startline}:"),
+                    Some(f) => format!("{kind} near line {startline} of {f}:"),
+                    None => format!("{kind} near line {startline} of (null):"),
+                }
+            } else {
+                format!("{kind}:")
+            };
+            eprintln!("{prefix} {tail}");
+            1
+        }
+        Ok(()) => {
+            if p.has_flag(SHFLG_COUNT_CHANGES) {
+                let line = format!(
+                    "changes: {}   total_changes: {}\n",
+                    p.db().changes(),
+                    p.db().total_changes()
+                );
+                p.outs(&line);
+            }
+            do_auto_detect_restore(p, sql);
+            0
+        }
+    }
+}
+
+/// `echo_group_input()`.
+fn echo_group_input(p: &mut ShellState, z: &[u8]) {
+    if p.mode.m_flags & MFLG_ECHO != 0 {
+        p.out_bytes(z);
+        p.out_bytes(b"\n");
+        let _ = p.out().flush();
+    }
+}
+
+/// `process_input()`: reads `p.input` to its end. Returns true when there was an error.
+pub fn process_input(p: &mut ShellState, z_src: &str) -> bool {
+    if p.input_nesting == MAX_INPUT_NESTING {
+        eprintln!(
+            "{z_src}: Input nesting limit ({MAX_INPUT_NESTING}) reached at line {}. Check recursion.",
+            p.lineno
+        );
+        return true;
+    }
+    p.input_nesting += 1;
+    let saved_in_file = p.z_in_file.replace(z_src.to_owned());
+    let saved_lineno = p.lineno;
+    p.lineno = 0;
+    let mut z_sql: Vec<u8> = Vec::new();
+    let mut have_sql = false;
+    let mut err_cnt = 0i32;
+    let mut has_semi = false;
+    let mut startline = 0i64;
+    let interactive_in = p.input.is_none() && p.stdin_is_interactive;
+    while err_cnt == 0 || !p.bail_on_error || interactive_in {
+        let _ = p.out().flush();
+        if interactive_in {
+            let prompt = if have_sql {
+                p.prompts[1]
+                    .clone()
+                    .unwrap_or_else(|| "   ...> ".to_owned())
+            } else {
+                p.prompts[0]
+                    .clone()
+                    .unwrap_or_else(|| "sqlite> ".to_owned())
+            };
+            p.stdouts(&prompt);
+            let _ = p.stdout.flush();
+        }
+        let line = match &mut p.input {
+            Some(r) => local_getline(r.as_mut()),
+            None => {
+                let stdin = io::stdin();
+                let mut lock = stdin.lock();
+                local_getline(&mut lock)
+            }
+        };
+        let Some(z_line) = line else {
+            if interactive_in {
+                p.outs("\n");
+            }
+            break;
+        };
+        p.lineno += 1;
+        if !have_sql && line_is_all_whitespace(&z_line) {
+            echo_group_input(p, &z_line);
+            continue;
+        }
+        if !have_sql && matches!(z_line.first(), Some(b'.' | b'#')) {
+            echo_group_input(p, &z_line);
+            if z_line[0] == b'.' {
+                let rc = dotcmd::do_meta_command(&z_line, p);
+                if rc == 2 || p.exit_code.is_some() {
+                    break;
+                } else if rc != 0 {
+                    err_cnt += 1;
                 }
             }
-            OutputMode::Table | OutputMode::Box if ok && !self.names.is_empty() => {
-                render_columnar(out, self.cfg, self.names, &self.cells);
+            continue;
+        }
+        if z_line.contains(&b';') {
+            has_semi = true;
+        }
+        if !have_sql {
+            let i = z_line.iter().take_while(|&&c| is_space(c)).count();
+            z_sql.clear();
+            z_sql.extend_from_slice(&z_line[i..]);
+            startline = p.lineno;
+            have_sql = !z_sql.is_empty();
+            if !have_sql {
+                // (nSql==0: the next line starts a fresh statement.)
+                continue;
+            }
+        } else {
+            z_sql.push(b'\n');
+            z_sql.extend_from_slice(&z_line);
+        }
+        if have_sql && has_semi && line_is_complete(&z_sql) {
+            echo_group_input(p, &z_sql);
+            let src = p.z_in_file.take();
+            err_cnt += run_one_sql_line(p, &z_sql, src.as_deref(), startline);
+            p.z_in_file = src;
+            have_sql = false;
+            z_sql.clear();
+            if p.n_pop_output != 0 {
+                p.output_reset();
+                p.n_pop_output = 0;
+            }
+            if p.n_pop_mode != 0 {
+                p.mode_pop();
+                p.n_pop_mode = 0;
+            }
+            p.b_safe_mode = p.b_safe_mode_persist;
+            if p.exit_code.is_some() {
+                break;
+            }
+        } else if have_sql && line_is_all_whitespace(&z_sql) {
+            echo_group_input(p, &z_sql);
+            have_sql = false;
+            z_sql.clear();
+        }
+    }
+    if have_sql {
+        echo_group_input(p, &z_sql);
+        let src = p.z_in_file.clone();
+        err_cnt += run_one_sql_line(p, &z_sql, src.as_deref(), startline);
+    }
+    p.input_nesting -= 1;
+    p.z_in_file = saved_in_file;
+    p.lineno = saved_lineno;
+    err_cnt > 0
+}
+
+/// `fileSize()`.
+fn file_size(z: &str) -> i64 {
+    std::fs::metadata(z).map_or(-1, |m| if m.is_file() { m.len() as i64 } else { -1 })
+}
+
+/// `isDatabaseFile()`.
+fn is_database_file(z: &str) -> bool {
+    let sz = file_size(z);
+    if sz < 512 || sz % 512 != 0 {
+        return false;
+    }
+    match Connection::open_with_flags(z, OpenFlags::READONLY) {
+        Ok(c) => matches!(
+            c.query_row("SELECT count(*) FROM sqlite_schema", &[]),
+            Ok(Some(_))
+        ),
+        Err(_) => false,
+    }
+}
+
+/// `isScriptFile()`.
+fn is_script_file(z: &str) -> bool {
+    let sz = file_size(z);
+    if sz <= 0 {
+        return false;
+    }
+    if sz % 512 == 0 && is_database_file(z) {
+        return false;
+    }
+    let l = z.to_ascii_lowercase();
+    l.ends_with(".sql") || l.ends_with(".txt")
+}
+
+/// `openChrSource()`.
+pub fn open_chr_source(z: &str) -> Option<Box<dyn BufRead>> {
+    use std::os::unix::fs::FileTypeExt;
+    let md = std::fs::metadata(z).ok()?;
+    let ft = md.file_type();
+    if ft.is_file() || ft.is_fifo() || ft.is_char_device() {
+        File::open(z)
+            .ok()
+            .map(|f| Box::new(BufReader::new(f)) as Box<dyn BufRead>)
+    } else {
+        None
+    }
+}
+
+/// `find_home_dir()`: the home directory of the user in the password database
+/// (`getpwuid(getuid())`), else `$HOME`.
+fn find_home_dir() -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(md) = std::fs::metadata("/proc/self") {
+        let uid = md.uid();
+        if let Ok(pw) = std::fs::read_to_string("/etc/passwd") {
+            let uid_text = uid.to_string();
+            for line in pw.lines() {
+                let mut f = line.split(':');
+                if f.nth(2) == Some(uid_text.as_str()) {
+                    // name:passwd:uid:gid:gecos:dir:shell
+                    if let Some(dir) = f.nth(2) {
+                        return Some(dir.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    env::var("HOME").ok()
+}
+
+/// `process_sqliterc()`.
+fn process_sqliterc(p: &mut ShellState, override_file: Option<&str>) {
+    let mut rc_file = override_file.map(str::to_owned);
+    if rc_file.is_none() {
+        // find_xdg_file("XDG_CONFIG_HOME", ".config", "sqlite3/sqliterc")
+        let f = match env::var("XDG_CONFIG_HOME") {
+            Ok(x) => Some(format!("{x}/sqlite3/sqliterc")),
+            Err(_) => find_home_dir().map(|h| format!("{h}/.config/sqlite3/sqliterc")),
+        };
+        if let Some(f) = f
+            && std::path::Path::new(&f).exists()
+        {
+            rc_file = Some(f);
+        }
+    }
+    if rc_file.is_none() {
+        match find_home_dir() {
+            Some(h) => rc_file = Some(format!("{h}/.sqliterc")),
+            None => {
+                eprintln!("-- warning: cannot find home directory; cannot read ~/.sqliterc");
+                return;
+            }
+        }
+    }
+    let rc_file = rc_file.unwrap_or_default();
+    let saved_in = p.input.take();
+    let saved_lineno = p.lineno;
+    match File::open(&rc_file) {
+        Ok(f) => {
+            p.input = Some(Box::new(BufReader::new(f)));
+            if p.stdin_is_interactive {
+                eprintln!("-- Loading resources from {rc_file}");
+            }
+            if process_input(p, &rc_file) && p.bail_on_error {
+                p.exit_code = Some(1);
+            }
+        }
+        Err(_) => {
+            if override_file.is_some() {
+                eprintln!("cannot open: \"{rc_file}\"");
+                if p.bail_on_error {
+                    p.exit_code = Some(1);
+                }
+            }
+        }
+    }
+    p.input = saved_in;
+    p.lineno = saved_lineno;
+}
+
+const Z_OPTIONS: &str = concat!(
+    "   --                   treat no subsequent arguments as options\n",
+    "   -append              append the database to the end of the file\n",
+    "   -ascii               set '.mode ascii'\n",
+    "   -bail                stop after hitting an error\n",
+    "   -batch               force batch I/O\n",
+    "   -box                 set '.mode box'\n",
+    "   -cmd COMMAND         run \"COMMAND\" before reading stdin\n",
+    "   -cmdline-edit BOOL   enable or disable command-line editing\n",
+    "   -column              set '.mode column'\n",
+    "   -csv                 set '.mode csv -limits off'\n",
+    "   -deserialize         open the database using sqlite3_deserialize()\n",
+    "   -echo                print inputs before execution\n",
+    "   -escape T            ctrl-char escape; T is one of: symbol, ascii, off\n",
+    "   -init FILENAME       read/process named file\n",
+    "   -[no]header          turn headers on or off\n",
+    "   -help                show this message\n",
+    "   -html                set '.mode html'\n",
+    "   -ifexists            only open if database already exists\n",
+    "   -interactive         force interactive I/O\n",
+    "   -json                set '.mode json'\n",
+    "   -line                set '.mode line'\n",
+    "   -list                set '.mode list'\n",
+    "   -lookaside SIZE N    use N entries of SZ bytes for lookaside memory\n",
+    "   -markdown            set '.mode markdown'\n",
+    "   -maxsize N           maximum size for a --deserialize database\n",
+    "   -memtrace            trace all memory allocations and deallocations\n",
+    "   -mmap N              default mmap size set to N\n",
+    "   -newline SEP         set output row separator. Default: '\\n'\n",
+    "   -nofollow            refuse to open symbolic links to database files\n",
+    "   -noinit              Do not read the ~/.sqliterc file at startup\n",
+    "   -nonce STRING        set the safe-mode escape nonce\n",
+    "   -no-rowid-in-view    Disable rowid-in-view using sqlite3_config()\n",
+    "   -nullvalue TEXT      set text string for NULL values. Default ''\n",
+    "   -pagecache SIZE N    use N slots of SZ bytes each for page cache memory\n",
+    "   -pcachetrace         trace all page cache operations\n",
+    "   -quote               set '.mode quote'\n",
+    "   -readonly            open the database read-only\n",
+    "   -safe                enable safe-mode\n",
+    "   -screenwidth N       use N as the default screenwidth \n",
+    "   -separator SEP       set output column separator. Default: '|'\n",
+    "   -stats               print memory stats before each finalize\n",
+    "   -table               set '.mode table'\n",
+    "   -tabs                set '.mode tabs'\n",
+    "   -unsafe-testing      allow unsafe commands and modes for testing\n",
+    "   -version             show SQLite version\n",
+    "   -vfs NAME            use NAME as the default VFS\n",
+    "   -vfstrace            enable tracing of all VFS calls\n",
+);
+
+/// `usage()`.
+fn usage(argv0: &str, show_detail: bool) {
+    eprint!(
+        "Usage: {argv0} [OPTIONS] [FILENAME [SQL...]]\n\
+         FILENAME is the name of an SQLite database. A new database is created\n\
+         if the file does not previously exist. Defaults to :memory:.\n"
+    );
+    if show_detail {
+        eprint!("OPTIONS include:\n{Z_OPTIONS}");
+    } else {
+        eprintln!("Use the -help option for additional information");
+    }
+}
+
+fn atoi(z: &str) -> i32 {
+    let t = z.trim_start();
+    let b = t.as_bytes();
+    let mut i = usize::from(!b.is_empty() && (b[0] == b'-' || b[0] == b'+'));
+    let mut v: i64 = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        v = (v * 10 + i64::from(b[i] - b'0')).min(i64::from(i32::MAX) + 1);
+        i += 1;
+    }
+    if b.first() == Some(&b'-') {
+        (-v) as i32
+    } else {
+        v.min(i64::from(i32::MAX)) as i32
+    }
+}
+
+fn main() -> ExitCode {
+    let argv: Vec<String> = env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let rc = shell_main(&argv);
+    ExitCode::from((rc & 0xff) as u8)
+}
+
+fn shell_main(argv: &[String]) -> i32 {
+    let argc = argv.len();
+    let argv0 = argv
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "sqliters".to_owned());
+    let mut p = ShellState {
+        db: None,
+        open_readonly: false,
+        open_create: false,
+        open_flags_set: false,
+        open_nofollow: false,
+        open_deserialize: false,
+        b_safe_mode: false,
+        b_safe_mode_persist: false,
+        e_restore_state: 0,
+        m_stats: 0,
+        n_pop_output: 0,
+        n_pop_mode: 0,
+        enable_timer: 0,
+        input_nesting: 0,
+        prev_timer: 0.0,
+        lineno: 0,
+        z_in_file: None,
+        input: None,
+        stdout: StdioBuf::new(io::stdout(), 4096),
+        redirect: None,
+        pipe_out: None,
+        n_err: 0,
+        writable_schema: false,
+        shell_flgs: 0,
+        z_err_prefix: None,
+        mode: Mode::default(),
+        mode_stack: Vec::new(),
+        saved_modes: Vec::new(),
+        aux: Default::default(),
+        i_aux: 0,
+        dot: DotCmdLine::default(),
+        outfile: String::new(),
+        bail_on_error: false,
+        stdin_is_interactive: io::stdin().is_terminal(),
+        stdout_is_console: io::stdout().is_terminal(),
+        stdout_tty_width: -1,
+        argv0: argv0.clone(),
+        prompts: [None, None],
+        busy_timeout: 0,
+        dbcfg_shadow: dotcmd::DBCFG_DEFAULTS,
+        limits: dotcmd::LIMIT_DEFAULTS,
+        exit_code: None,
+    };
+    let mut z_init_file: Option<String> = None;
+    let mut warn_inmemory_db = false;
+    let mut read_stdin = true;
+    let mut no_init = false;
+    let mut az_cmd: Vec<(String, usize)> = Vec::new();
+    let mut n_opts_end = argc;
+    let mut rc = 0i32;
+
+    macro_rules! option_value {
+        ($i:expr) => {{
+            if $i >= argc {
+                eprintln!("{}: Error: missing argument to {}", argv0, argv[argc - 1]);
+                return 1;
+            }
+            argv[$i].as_str()
+        }};
+    }
+
+    // First pass: the database name, the init file and the options that must be known early.
+    let mut i = 1usize;
+    while i < argc {
+        let z_full = argv[i].as_str();
+        if !z_full.starts_with('-') || i > n_opts_end {
+            if p.aux[0].z_db_filename.is_none() && !is_script_file(z_full) {
+                p.aux[0].z_db_filename = Some(z_full.to_owned());
+            } else {
+                read_stdin = false;
+                p.stdin_is_interactive = false;
+                az_cmd.push((z_full.to_owned(), i));
+            }
+            i += 1;
+            continue;
+        }
+        let z = if z_full.as_bytes().get(1) == Some(&b'-') {
+            &z_full[1..]
+        } else {
+            z_full
+        };
+        match z {
+            "-" => n_opts_end = i,
+            "-separator" | "-nullvalue" | "-newline" | "-cmd" => {
+                i += 1;
+                let _ = option_value!(i);
+            }
+            "-init" => {
+                i += 1;
+                z_init_file = Some(option_value!(i).to_owned());
+            }
+            "-batch" => {
+                p.stdin_is_interactive = false;
+                p.stdout_is_console = false;
+                p.mode_change(MODE_BATCH);
+            }
+            "-screenwidth" => {
+                i += 1;
+                let n = atoi(option_value!(i));
+                if n < 2 {
+                    eprintln!("minimum --screenwidth is 2");
+                    return 1;
+                }
+                p.stdout_tty_width = n;
+            }
+            "-heap" | "-mmap" | "-vfs" | "-nonce" | "-cmdline-edit" | "-threadsafe" => {
+                i += 1;
+                let v = option_value!(i);
+                if z == "-vfs" && !matches!(v, "unix" | "unix-none" | "unix-dotfile" | "unix-excl")
+                {
+                    eprintln!("no such VFS: \"{v}\"");
+                    return 1;
+                }
+                if z == "-cmdline-edit" {
+                    let _ = boolean_value(v);
+                }
+            }
+            "-pagecache" | "-lookaside" => {
+                i += 1;
+                let _ = option_value!(i);
+                i += 1;
+                let _ = option_value!(i);
+            }
+            "-deserialize" => p.open_deserialize = true,
+            "-maxsize" if i + 1 < argc => i += 1,
+            "-readonly" => {
+                p.open_readonly = true;
+                p.open_create = false;
+                p.open_flags_set = true;
+            }
+            "-nofollow" => p.open_nofollow = true,
+            "-noinit" => no_init = true,
+            "-ifexists" => {
+                p.open_create = false;
+                p.open_flags_set = true;
+            }
+            "-bail" => p.bail_on_error = true,
+            "-unsafe-testing" => p.shell_flgs |= SHFLG_TESTING_MODE,
+            "-escape" if i + 1 < argc => i += 1,
+            "-test-argv" => {
+                for (kk, a) in argv.iter().enumerate() {
+                    println!("argv[{kk}] = \"{a}\"");
+                }
+                return 0;
             }
             _ => {}
         }
+        i += 1;
     }
-}
+    if p.aux[0].z_db_filename.is_none() {
+        p.aux[0].z_db_filename = Some(":memory:".to_owned());
+        warn_inmemory_db = argc == 1;
+    }
+    p.mode_default();
 
-/// Parses a dot-command line using C `shell.c` quoting rules (`'...'` literal, `"..."` with
-/// backslash escapes, unquoted whitespace-delimited tokens).
-fn parse_dot_args(line: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut chars = line.chars().peekable();
+    // Open the database now if the file exists; otherwise the open is delayed so that a
+    // mistyped name does not create an empty file.
+    if p.db_filename()
+        .is_some_and(|f| std::path::Path::new(f).exists())
+        && !p.open_db(false)
+    {
+        return finish(&mut p, 1);
+    }
 
-    while let Some(&ch) = chars.peek() {
-        if ch.is_ascii_whitespace() {
-            chars.next();
+    if !no_init {
+        process_sqliterc(&mut p, z_init_file.as_deref());
+        if let Some(c) = p.exit_code {
+            return finish(&mut p, c);
+        }
+    }
+
+    // Second pass: options that override the init file, and the -cmd commands.
+    let mut i = 1usize;
+    'second: while i < argc {
+        let z_full = argv[i].as_str();
+        if !z_full.starts_with('-') || i >= n_opts_end {
+            i += 1;
             continue;
         }
-        if ch == '\'' {
-            chars.next();
-            let mut token = String::new();
-            for c in chars.by_ref() {
-                if c == '\'' {
-                    break;
-                }
-                token.push(c);
-            }
-            args.push(token);
-        } else if ch == '"' {
-            chars.next();
-            let mut token = String::new();
-            while let Some(c) = chars.next() {
-                if c == '"' {
-                    break;
-                }
-                if c == '\\' {
-                    if let Some(esc) = chars.next() {
-                        match esc {
-                            'n' => token.push('\n'),
-                            'r' => token.push('\r'),
-                            't' => token.push('\t'),
-                            'a' => token.push('\x07'),
-                            'b' => token.push('\x08'),
-                            'f' => token.push('\x0c'),
-                            'v' => token.push('\x0b'),
-                            '0' => token.push('\0'),
-                            '\\' => token.push('\\'),
-                            '"' => token.push('"'),
-                            '\'' => token.push('\''),
-                            'x' => {
-                                let h1 = chars.peek().copied();
-                                if let Some(d1) = h1.and_then(|x| x.to_digit(16)) {
-                                    chars.next();
-                                    if let Some(d2) =
-                                        chars.peek().copied().and_then(|x| x.to_digit(16))
-                                    {
-                                        chars.next();
-                                        token.push(((d1 * 16 + d2) as u8) as char);
-                                    } else {
-                                        token.push((d1 as u8) as char);
-                                    }
-                                } else {
-                                    token.push('x');
-                                }
-                            }
-                            other => token.push(other),
-                        }
-                    }
-                } else {
-                    token.push(c);
-                }
-            }
-            args.push(token);
+        let z = if z_full.as_bytes().get(1) == Some(&b'-') {
+            &z_full[1..]
         } else {
-            let mut token = String::new();
-            while let Some(&c) = chars.peek() {
-                if c.is_ascii_whitespace() {
-                    break;
-                }
-                token.push(c);
-                chars.next();
+            z_full
+        };
+        match z {
+            "-init" => i += 1,
+            "-html" => p.mode_change(6),
+            "-list" => p.mode_change(MODE_LIST),
+            "-quote" => p.mode_change(17),
+            "-line" => p.mode_change(11),
+            "-column" => p.mode_change(MODE_COLUMN),
+            "-json" => p.mode_change(10),
+            "-markdown" => p.mode_change(13),
+            "-table" => p.mode_change(19),
+            "-psql" => p.mode_change(15),
+            "-box" => p.mode_change(1),
+            "-csv" => {
+                p.mode_change(MODE_CSV);
+                p.mode_set_limit(Some("off"));
             }
-            args.push(token);
-        }
-    }
-
-    args
-}
-
-fn parse_bool_arg(s: &str) -> Option<bool> {
-    match s.to_ascii_lowercase().as_str() {
-        "on" | "1" | "true" | "yes" => Some(true),
-        "off" | "0" | "false" | "no" => Some(false),
-        _ => None,
-    }
-}
-
-fn record_dot_error<W: Write>(
-    outcome: &mut StreamOutcome,
-    cfg: &ShellConfig,
-    out: &mut W,
-    msg: &str,
-) {
-    let _ = out.flush();
-    eprintln!("{msg}");
-    outcome.err_count += 1;
-    if cfg.bail {
-        outcome.bailed = true;
-    }
-}
-
-fn handle_dot_command<W: Write>(
-    conn: &mut Connection,
-    cfg: &mut ShellConfig,
-    cmd_line: &str,
-    out: &mut W,
-) -> StreamOutcome {
-    let mut outcome = StreamOutcome::default();
-    let parts = parse_dot_args(cmd_line);
-    let Some(cmd) = parts.first().map(String::as_str) else {
-        return outcome;
-    };
-
-    match cmd {
-        ".quit" | ".exit" | ".q" => {
-            outcome.quit = true;
-        }
-        ".help" => {
-            print_dot_help(out);
-            let _ = out.flush();
-        }
-        ".bail" => {
-            if let Some(arg) = parts.get(1) {
-                if let Some(b) = parse_bool_arg(arg) {
-                    cfg.bail = b;
-                } else {
-                    record_dot_error(
-                        &mut outcome,
-                        cfg,
-                        out,
-                        &format!("Error:Not a boolean value: \"{arg}\". Assuming \"no\"."),
-                    );
-                    cfg.bail = false;
-                }
-            }
-        }
-        ".print" => {
-            if parts.len() > 1 {
-                let _ = writeln!(out, "{}", parts[1..].join(" "));
-            } else {
-                let _ = writeln!(out);
-            }
-            let _ = out.flush();
-        }
-        ".tables" => match conn.schema_snapshot() {
-            Ok(schema) => {
-                let filter = parts.get(1).map(String::as_str);
-                let mut names: Vec<String> = schema
-                    .tables
+            "-escape" if i + 1 < argc => {
+                i += 1;
+                let z_esc = argv[i].as_str();
+                match dotcmd::QRF_ESC_NAMES
                     .iter()
-                    .map(|t| t.name.clone())
-                    .filter(|n| {
-                        if let Some(pat) = filter {
-                            sqliters::vdbe::sqlite_like_match(pat, n, None)
-                        } else {
-                            true
+                    .position(|n| n.eq_ignore_ascii_case(z_esc))
+                {
+                    Some(k) => p.mode.spec.e_esc = k as u8,
+                    None => {
+                        eprintln!(
+                            "unknown control character escape mode \"{z_esc}\" - choices: {}",
+                            dotcmd::QRF_ESC_NAMES.join(" ")
+                        );
+                        return 1;
+                    }
+                }
+            }
+            "-append" | "-deserialize" | "-nofollow" | "-noinit" | "-exclusive" | "-bail"
+            | "-batch" | "-utf8" | "-no-utf8" | "-no-rowid-in-view" | "-unsafe-testing" => {}
+            "-maxsize" if i + 1 < argc => i += 1,
+            "-readonly" => {
+                p.open_readonly = true;
+                p.open_create = false;
+                p.open_flags_set = true;
+            }
+            "-ifexists" => {
+                p.open_create = false;
+                p.open_flags_set = true;
+            }
+            "-ascii" => p.mode_change(MODE_ASCII),
+            "-tabs" => p.mode_change(20),
+            "-separator" => {
+                i += 1;
+                p.mode.spec.z_column_sep = Some(option_value!(i).to_owned());
+            }
+            "-newline" => {
+                i += 1;
+                p.mode.spec.z_row_sep = Some(option_value!(i).to_owned());
+            }
+            "-nullvalue" => {
+                i += 1;
+                p.mode.spec.z_null = Some(option_value!(i).to_owned());
+            }
+            "-header" => {
+                p.mode.spec.b_titles = QRF_ALWAYS;
+                p.mode.m_flags |= MFLG_HDR;
+            }
+            "-noheader" => {
+                p.mode.spec.b_titles = QRF_NO;
+                p.mode.m_flags |= MFLG_HDR;
+            }
+            "-echo" => p.mode.m_flags |= MFLG_ECHO,
+            "-eqp" => p.mode.auto_eqp = 1,
+            "-eqpfull" => p.mode.auto_eqp = 3,
+            "-stats" => p.m_stats = CLISTAT_ON,
+            "-scanstats" => p.mode.scanstats_on = 1,
+            "-backslash" => p.shell_flgs |= SHFLG_BACKSLASH,
+            "-version" => {
+                p.stdouts(&format!("{SQLITE_VERSION} {} (64-bit)\n", source_id()));
+                return finish(&mut p, 0);
+            }
+            "-interactive" => p.stdin_is_interactive = true,
+            "-screenwidth" | "-heap" | "-mmap" | "-memtrace" | "-pcachetrace" | "-vfs"
+            | "-vfstrace" => i += 1,
+            "-pagecache" | "-lookaside" | "-threadsafe" | "-nonce" | "-cmdline-edit" => i += 2,
+            "-help" => {
+                usage(&argv0, true);
+                return finish(&mut p, 0);
+            }
+            "-cmd" => {
+                if i == argc - 1 {
+                    break 'second;
+                }
+                i += 1;
+                let zc = argv[i].clone();
+                if zc.starts_with('.') {
+                    rc = dotcmd::do_meta_command(zc.as_bytes(), &mut p);
+                    if let Some(c) = p.exit_code {
+                        return finish(&mut p, c);
+                    }
+                    if rc != 0 && (p.bail_on_error || rc == 2) {
+                        if rc == 2 {
+                            rc = 0;
                         }
-                    })
-                    .collect();
-                names.sort();
-                if !names.is_empty() {
-                    let _ = writeln!(out, "{}", names.join("  "));
-                    let _ = out.flush();
-                }
-            }
-            Err(e) => record_dot_error(&mut outcome, cfg, out, &format!("Error: {e}")),
-        },
-        ".schema" => match conn.schema_snapshot() {
-            Ok(schema) => {
-                let filter = parts.get(1).map(String::as_str);
-                for tbl in &schema.tables {
-                    if filter.is_none_or(|f| tbl.name.eq_ignore_ascii_case(f)) {
-                        let _ = writeln!(out, "{};", tbl.raw_sql.trim_end_matches(';'));
+                        return finish(&mut p, rc);
                     }
-                }
-                for idx in &schema.indexes {
-                    if let Some(ref raw) = idx.raw_sql
-                        && filter.is_none_or(|f| {
-                            idx.table_name.eq_ignore_ascii_case(f)
-                                || idx.name.eq_ignore_ascii_case(f)
-                        })
-                    {
-                        let _ = writeln!(out, "{};", raw.trim_end_matches(';'));
-                    }
-                }
-                let _ = out.flush();
-            }
-            Err(e) => record_dot_error(&mut outcome, cfg, out, &format!("Error: {e}")),
-        },
-        ".indexes" => match conn.schema_snapshot() {
-            Ok(schema) => {
-                let filter = parts.get(1).map(String::as_str);
-                for idx in &schema.indexes {
-                    if filter.is_none_or(|f| idx.table_name.eq_ignore_ascii_case(f)) {
-                        let _ = writeln!(out, "{}", idx.name);
-                    }
-                }
-                let _ = out.flush();
-            }
-            Err(e) => record_dot_error(&mut outcome, cfg, out, &format!("Error: {e}")),
-        },
-        ".dbconfig" => {
-            // The C shell opens databases with SQLITE_DBCONFIG_DEFENSIVE on; this engine has no
-            // defensive mode, i.e. it always behaves like ".dbconfig defensive off". The
-            // command is accepted so that one script can drive both shells.
-            match (
-                parts.get(1).map(String::as_str),
-                parts.get(2).map(String::as_str),
-            ) {
-                (Some("defensive"), Some("off" | "0" | "no" | "false"))
-                | (Some("defensive"), None) => {
-                    let _ = writeln!(out, "{:>19} off", "defensive");
-                }
-                _ => record_dot_error(
-                    &mut outcome,
-                    cfg,
-                    out,
-                    "Error: only \".dbconfig defensive off\" is supported",
-                ),
-            }
-        }
-        ".dbinfo" => match (
-            conn.database_header(),
-            conn.page_count(),
-            conn.schema_snapshot(),
-        ) {
-            (Ok(hdr), Ok(pg_cnt), Ok(schema)) => {
-                let _ = writeln!(out, "database page size:  {}", hdr.page_size);
-                let _ = writeln!(out, "write format:        {}", hdr.write_version);
-                let _ = writeln!(out, "read format:         {}", hdr.read_version);
-                let _ = writeln!(out, "reserved bytes:      {}", hdr.reserved_bytes);
-                let _ = writeln!(out, "file change counter: {}", hdr.change_counter);
-                let _ = writeln!(out, "database page count: {pg_cnt}");
-                let _ = writeln!(out, "freelist page count: {}", hdr.total_freelist_pages);
-                let _ = writeln!(out, "schema cookie:       {}", hdr.schema_cookie);
-                let _ = writeln!(out, "schema format:       {}", hdr.schema_format);
-                let _ = writeln!(out, "text encoding:       {} (utf8)", hdr.text_encoding);
-                let _ = writeln!(out, "user version:        {}", hdr.user_version);
-                let _ = writeln!(out, "application id:      {}", hdr.application_id);
-                let _ = writeln!(out, "software version:    {}", hdr.sqlite_version_number);
-                let _ = writeln!(out, "number of tables:    {}", schema.tables.len());
-                let _ = writeln!(out, "number of indexes:   {}", schema.indexes.len());
-                let _ = out.flush();
-            }
-            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
-                record_dot_error(&mut outcome, cfg, out, &format!("Error: {e}"));
-            }
-        },
-        ".mode" => {
-            if let Some(m) = parts.get(1) {
-                match m.to_ascii_lowercase().as_str() {
-                    "box" => cfg.mode = OutputMode::Box,
-                    "table" | "column" => cfg.mode = OutputMode::Table,
-                    "list" => {
-                        cfg.mode = OutputMode::List;
-                        cfg.separator = "|".to_owned();
-                        cfg.list_csv_quote = false;
-                    }
-                    "csv" => {
-                        cfg.mode = OutputMode::Csv;
-                        cfg.separator = ",".to_owned();
-                    }
-                    "tabs" => {
-                        cfg.mode = OutputMode::List;
-                        cfg.separator = "\t".to_owned();
-                        cfg.list_csv_quote = true;
-                    }
-                    "ascii" => {
-                        cfg.mode = OutputMode::List;
-                        cfg.separator = "\x1f".to_owned();
-                        cfg.list_csv_quote = false;
-                    }
-                    "json" => cfg.mode = OutputMode::Json,
-                    "line" => cfg.mode = OutputMode::Line,
-                    other => record_dot_error(
-                        &mut outcome,
-                        cfg,
-                        out,
-                        &format!("Error: unknown mode \"{other}\""),
-                    ),
-                }
-            } else {
-                let _ = writeln!(out, "current output mode: {:?}", cfg.mode);
-                let _ = out.flush();
-            }
-        }
-        ".headers" | ".header" => {
-            if let Some(arg) = parts.get(1) {
-                if let Some(b) = parse_bool_arg(arg) {
-                    cfg.headers = b;
                 } else {
-                    record_dot_error(
-                        &mut outcome,
-                        cfg,
-                        out,
-                        &format!("Error:Not a boolean value: \"{arg}\". Assuming \"no\"."),
-                    );
-                    cfg.headers = false;
-                }
-            }
-        }
-        ".separator" => {
-            if let Some(sep) = parts.get(1) {
-                cfg.separator.clone_from(sep);
-            }
-        }
-        ".nullvalue" => {
-            cfg.null_value = parts.get(1).cloned().unwrap_or_default();
-        }
-        ".open" => {
-            let mut ro = cfg.readonly;
-            let mut target = ":memory:";
-            let mut idx = 1usize;
-            while idx < parts.len() {
-                match parts[idx].as_str() {
-                    "--readonly" => ro = true,
-                    "--new" => {}
-                    s => target = s,
-                }
-                idx += 1;
-            }
-            match open_db(target, ro) {
-                Ok(new_conn) => {
-                    cfg.readonly = ro;
-                    *conn = new_conn;
-                }
-                Err(e) => record_dot_error(
-                    &mut outcome,
-                    cfg,
-                    out,
-                    &format!("Error: unable to open \"{target}\": {e}"),
-                ),
-            }
-        }
-        ".read" => {
-            let Some(fpath) = parts.get(1) else {
-                record_dot_error(&mut outcome, cfg, out, "Usage: .read FILE");
-                return outcome;
-            };
-            match std::fs::read(Path::new(fpath)) {
-                Ok(bytes) => {
-                    let mut cursor = io::Cursor::new(bytes.as_slice());
-                    let sub = process_input_stream(
-                        conn,
-                        cfg,
-                        &mut cursor,
-                        out,
-                        false,
-                        &InputSrc::File(fpath.clone()),
-                    );
-                    outcome.err_count += sub.err_count;
-                    if sub.bailed {
-                        outcome.bailed = true;
+                    rc = run_one_sql_line(&mut p, zc.as_bytes(), Some("cmdline"), i as i64);
+                    if let Some(c) = p.exit_code {
+                        return finish(&mut p, c);
                     }
-                    if sub.quit {
-                        outcome.quit = true;
+                    if p.bail_on_error {
+                        return finish(&mut p, rc);
                     }
                 }
-                Err(e) => record_dot_error(
-                    &mut outcome,
-                    cfg,
-                    out,
-                    &format!("Error: cannot open \"{fpath}\": {e}"),
-                ),
             }
-        }
-        ".import" => {
-            if let Err(err_msg) = handle_import_command(conn, cfg, &parts[1..]) {
-                record_dot_error(&mut outcome, cfg, out, &format!("Error: {err_msg}"));
+            "-safe" => {
+                p.b_safe_mode = true;
+                p.b_safe_mode_persist = true;
             }
-        }
-        ".dump" => match conn.schema_snapshot() {
-            Ok(schema) => {
-                let _ = writeln!(out, "PRAGMA foreign_keys=OFF;");
-                let _ = writeln!(out, "BEGIN TRANSACTION;");
-                for tbl in &schema.tables {
-                    let _ = writeln!(out, "{};", tbl.raw_sql.trim_end_matches(';'));
-                    if let Ok(qres) = conn.query(
-                        &format!("SELECT * FROM \"{}\"", tbl.name.replace('"', "\"\"")),
-                        &[],
-                    ) {
-                        let dump_ident = format_dump_ident(&tbl.name);
-                        for row in &qres.rows {
-                            let vals: Vec<String> =
-                                row.values().iter().map(format_sql_literal).collect();
-                            let _ = writeln!(
-                                out,
-                                "INSERT INTO {dump_ident} VALUES({});",
-                                vals.join(",")
-                            );
-                        }
-                    }
-                }
-                for idx in &schema.indexes {
-                    if let Some(ref raw) = idx.raw_sql {
-                        let _ = writeln!(out, "{};", raw.trim_end_matches(';'));
-                    }
-                }
-                let _ = writeln!(out, "COMMIT;");
-                let _ = out.flush();
+            _ => {
+                eprintln!("{argv0}: Error: unknown option: {z}");
+                eprintln!("Use -help for a list of options.");
+                return finish(&mut p, 1);
             }
-            Err(e) => record_dot_error(&mut outcome, cfg, out, &format!("Error: {e}")),
-        },
-        other => {
-            record_dot_error(
-                &mut outcome,
-                cfg,
-                out,
-                &format!(
-                    "Error: unknown command or invalid arguments: \"{other}\". Enter \".help\" for help"
-                ),
-            );
-        }
-    }
-
-    outcome
-}
-
-fn quote_sql_ident(ident: &str) -> String {
-    format!("\"{}\"", ident.replace('"', "\"\""))
-}
-
-fn format_dump_ident(ident: &str) -> String {
-    let bytes = ident.as_bytes();
-    let is_simple = !bytes.is_empty()
-        && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
-        && bytes[1..]
-            .iter()
-            .all(|b| b.is_ascii_alphanumeric() || *b == b'_');
-    if is_simple {
-        ident.to_owned()
-    } else {
-        quote_sql_ident(ident)
-    }
-}
-
-fn handle_import_command(
-    conn: &Connection,
-    cfg: &ShellConfig,
-    args: &[String],
-) -> Result<(), String> {
-    let mut mode_csv = false;
-    let mut mode_ascii = false;
-    let mut skip_rows: usize = 0;
-    let mut schema_name: Option<&str> = None;
-    let mut positional: Vec<&str> = Vec::new();
-
-    let mut i = 0usize;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--csv" => mode_csv = true,
-            "--ascii" => mode_ascii = true,
-            "-v" => {}
-            "--skip" => {
-                i += 1;
-                let Some(val) = args.get(i) else {
-                    return Err("Usage: .import [--csv] [--ascii] [--skip N] FILE TABLE".to_owned());
-                };
-                skip_rows = val
-                    .parse::<usize>()
-                    .map_err(|_| format!("invalid --skip count: \"{val}\""))?;
-            }
-            "--schema" => {
-                i += 1;
-                let Some(val) = args.get(i) else {
-                    return Err("missing argument to --schema".to_owned());
-                };
-                schema_name = Some(val.as_str());
-            }
-            other if other.starts_with('-') && positional.is_empty() => {
-                return Err(format!("unknown option to .import: \"{other}\""));
-            }
-            other => positional.push(other),
         }
         i += 1;
     }
 
-    if positional.len() != 2 {
-        return Err("Usage: .import [--csv] [--ascii] [--skip N] FILE TABLE".to_owned());
-    }
-    let file_path = positional[0];
-    let table_name = positional[1];
-
-    let file = File::open(Path::new(file_path))
-        .map_err(|e| format!("cannot open \"{file_path}\": {e}"))?;
-    let mut reader = BufReader::with_capacity(64 * 1024, file);
-
-    let (col_sep, use_quotes, row_sep_ascii) = if mode_csv {
-        (b',', true, false)
-    } else if mode_ascii {
-        (b'\x1f', false, true)
-    } else if cfg.mode == OutputMode::Csv {
-        (b',', true, false)
+    if !read_stdin {
+        let n_cmd = az_cmd.len();
+        let mut k = 0usize;
+        while k < n_cmd {
+            let (cmd, argi) = az_cmd[k].clone();
+            echo_group_input(&mut p, cmd.as_bytes());
+            if is_script_file(&cmd) {
+                let saved_in = p.input.take();
+                let saved_lineno = p.lineno;
+                let mut res = true;
+                if let Some(r) = open_chr_source(&cmd) {
+                    p.input = Some(r);
+                    res = process_input(&mut p, &cmd);
+                }
+                p.input = saved_in;
+                p.lineno = saved_lineno;
+                if let Some(c) = p.exit_code {
+                    return finish(&mut p, c);
+                }
+                if res {
+                    k = n_cmd;
+                }
+            } else if cmd.starts_with('.') {
+                p.z_in_file = Some("<cmdline>".to_owned());
+                p.z_err_prefix = Some(format!("argv[{argi}]:"));
+                rc = dotcmd::do_meta_command(cmd.as_bytes(), &mut p);
+                p.z_err_prefix = None;
+                if let Some(c) = p.exit_code {
+                    return finish(&mut p, c);
+                }
+                if rc != 0 {
+                    if rc == 2 {
+                        rc = 0;
+                    }
+                    return finish(&mut p, rc);
+                }
+            } else {
+                rc = run_one_sql_line(&mut p, cmd.as_bytes(), Some("cmdline"), argi as i64);
+                if p.n_pop_mode != 0 {
+                    p.mode_pop();
+                    p.n_pop_mode = 0;
+                }
+                if let Some(c) = p.exit_code {
+                    return finish(&mut p, c);
+                }
+                if rc != 0 {
+                    return finish(&mut p, rc);
+                }
+            }
+            if p.n_pop_output != 0 && !cmd.starts_with('.') {
+                p.output_reset();
+                p.n_pop_output = 0;
+            }
+            k += 1;
+        }
+    } else if p.stdin_is_interactive {
+        p.stdouts(&format!(
+            "SQLite version {SQLITE_VERSION} {:.19}\nEnter \".help\" for usage hints.\n",
+            source_id()
+        ));
+        if warn_inmemory_db {
+            p.stdouts("Connected to a ");
+            if env::var_os("NO_COLOR").is_some() {
+                p.stdouts("transient in-memory database");
+            } else {
+                p.stdouts("\x1b[1;36m\x1b[3mtransient in-memory database\x1b[0m");
+            }
+            p.stdouts(".\nUse \".open FILENAME\" to reopen on a persistent database.\n");
+        }
+        p.input = None;
+        if !p.open_db(false) {
+            return finish(&mut p, 1);
+        }
+        rc = i32::from(process_input(&mut p, "<stdin>"));
     } else {
-        let sep = cfg.separator.as_bytes().first().copied().unwrap_or(b'|');
-        (sep, true, false)
-    };
-
-    let qualified_table = match schema_name {
-        Some(s) => format!("{}.{}", quote_sql_ident(s), quote_sql_ident(table_name)),
-        None => quote_sql_ident(table_name),
-    };
-
-    let mut at_file_start = true;
-    let mut line_no = 0usize;
-    let mut scratch = CsvRecordScratch::default();
-
-    let n_col = match conn.prepare(&format!("SELECT * FROM {qualified_table}")) {
-        Ok(probe) => {
-            let cols = probe.column_count();
-            probe.finalize().map_err(|e| e.to_string())?;
-            for _ in 0..skip_rows {
-                if !csv_read_record_streaming(
-                    &mut reader,
-                    &mut at_file_start,
-                    &mut line_no,
-                    col_sep,
-                    use_quotes,
-                    row_sep_ascii,
-                    &mut scratch,
-                )
-                .map_err(|e| format!("{file_path}: {e}"))?
-                {
-                    return Ok(());
-                }
-            }
-            cols
-        }
-        Err(_) => {
-            for _ in 0..skip_rows {
-                if !csv_read_record_streaming(
-                    &mut reader,
-                    &mut at_file_start,
-                    &mut line_no,
-                    col_sep,
-                    use_quotes,
-                    row_sep_ascii,
-                    &mut scratch,
-                )
-                .map_err(|e| format!("{file_path}: {e}"))?
-                {
-                    return Err(format!("{file_path}: empty file"));
-                }
-            }
-            if !csv_read_record_streaming(
-                &mut reader,
-                &mut at_file_start,
-                &mut line_no,
-                col_sep,
-                use_quotes,
-                row_sep_ascii,
-                &mut scratch,
-            )
-            .map_err(|e| format!("{file_path}: {e}"))?
-            {
-                return Err(format!("{file_path}: empty file"));
-            }
-            if scratch.fields.is_empty() {
-                return Ok(());
-            }
-            let col_defs: Vec<String> = scratch
-                .fields
-                .iter()
-                .map(|&(s, e)| {
-                    let cname = String::from_utf8_lossy(&scratch.buf[s..e]);
-                    format!("{} TEXT", quote_sql_ident(&cname))
-                })
-                .collect();
-            let ncols = col_defs.len();
-            let create_sql = format!("CREATE TABLE {qualified_table}({})", col_defs.join(","));
-            conn.execute(&create_sql).map_err(|e| e.to_string())?;
-            ncols
-        }
-    };
-
-    if n_col == 0 {
-        return Ok(());
+        // Standard input is read through one buffered reader so that `.import <<END` and
+        // the line reader see the same stream position.
+        p.input = Some(Box::new(BufReader::with_capacity(64 * 1024, io::stdin())));
+        rc = i32::from(process_input(&mut p, "<stdin>"));
     }
-
-    let auto_tx = conn.is_autocommit();
-    if auto_tx {
-        conn.execute("BEGIN").map_err(|e| e.to_string())?;
+    if let Some(c) = p.exit_code {
+        return finish(&mut p, c);
     }
-
-    let placeholders: String = (1..=n_col)
-        .map(|idx| format!("?{idx}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let insert_sql = format!("INSERT INTO {qualified_table} VALUES({placeholders})");
-    let mut stmt = match conn.prepare(&insert_sql) {
-        Ok(s) => s,
-        Err(e) => {
-            if auto_tx && !conn.is_autocommit() {
-                let _ = conn.execute("ROLLBACK");
-            }
-            return Err(e.to_string());
-        }
-    };
-
-    let mut lossy_buf = String::new();
-    loop {
-        let has_rec = match csv_read_record_streaming(
-            &mut reader,
-            &mut at_file_start,
-            &mut line_no,
-            col_sep,
-            use_quotes,
-            row_sep_ascii,
-            &mut scratch,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = stmt.finalize();
-                if auto_tx && !conn.is_autocommit() {
-                    let _ = conn.execute("ROLLBACK");
-                }
-                return Err(format!("{file_path}: {e}"));
-            }
-        };
-        if !has_rec {
-            break;
-        }
-        let start_line = line_no;
-        let rec_len = scratch.fields.len();
-        if rec_len != n_col {
-            if cfg.bail {
-                let _ = stmt.finalize();
-                if auto_tx && !conn.is_autocommit() {
-                    let _ = conn.execute("ROLLBACK");
-                }
-                return Err(format!(
-                    "{file_path}:{start_line}: expected {n_col} columns but found {rec_len}"
-                ));
-            }
-            eprintln!(
-                "{file_path}:{start_line}: expected {n_col} columns but found {rec_len} - filling the rest with NULL"
-            );
-        }
-
-        let step_outcome = (|| -> sqliters::Result<()> {
-            for col_idx in 0..n_col {
-                if let Some(&(s, e)) = scratch.fields.get(col_idx) {
-                    let field_bytes = &scratch.buf[s..e];
-                    match std::str::from_utf8(field_bytes) {
-                        Ok(valid) => {
-                            stmt.bind_text(col_idx + 1, valid)?;
-                        }
-                        Err(_) => {
-                            lossy_buf.clear();
-                            lossy_buf.push_str(&String::from_utf8_lossy(field_bytes));
-                            stmt.bind_text(col_idx + 1, &lossy_buf)?;
-                        }
-                    }
-                } else {
-                    stmt.bind(col_idx + 1, Value::Null)?;
-                }
-            }
-            let _ = stmt.step()?;
-            stmt.reset()?;
-            Ok(())
-        })();
-
-        if let Err(e) = step_outcome {
-            let _ = stmt.finalize();
-            if auto_tx && !conn.is_autocommit() {
-                let _ = conn.execute("ROLLBACK");
-            }
-            return Err(e.to_string());
-        }
-    }
-
-    if let Err(e) = stmt.finalize() {
-        if auto_tx && !conn.is_autocommit() {
-            let _ = conn.execute("ROLLBACK");
-        }
-        return Err(e.to_string());
-    }
-
-    if auto_tx && !conn.is_autocommit() {
-        conn.execute("COMMIT").map_err(|e| {
-            let _ = conn.execute("ROLLBACK");
-            e.to_string()
-        })?;
-    }
-
-    Ok(())
+    finish(&mut p, rc)
 }
 
-struct CsvRecordScratch {
-    buf: Vec<u8>,
-    fields: Vec<(usize, usize)>,
+/// `sqlite3_sourceid()` as the C shell prints it: the engine's identifier without the
+/// " (sqliters)" marker that the port appends.
+pub fn source_id() -> &'static str {
+    SQLITE_SOURCE_ID
+        .strip_suffix(" (sqliters)")
+        .unwrap_or(SQLITE_SOURCE_ID)
 }
 
-impl Default for CsvRecordScratch {
-    fn default() -> Self {
-        Self {
-            buf: Vec::with_capacity(512),
-            fields: Vec::with_capacity(16),
-        }
-    }
-}
-
-#[inline]
-fn peek_byte<R: BufRead>(reader: &mut R) -> io::Result<Option<u8>> {
-    let chunk = reader.fill_buf()?;
-    Ok(chunk.first().copied())
-}
-
-/// Streams one logical RFC 4180 / `shell.c` CSV record from `reader` into `scratch` with zero
-/// per-row heap allocations, preserving `\n` and `\r\n` inside double-quoted fields, unescaping
-/// `""` -> `"`, and treating unquoted `\r\n` or `\n` (or `\x1e` in `--ascii` mode) as the record
-/// terminator.
-fn csv_read_record_streaming<R: BufRead>(
-    reader: &mut R,
-    at_file_start: &mut bool,
-    line_no: &mut usize,
-    col_sep: u8,
-    use_quotes: bool,
-    row_sep_ascii: bool,
-    scratch: &mut CsvRecordScratch,
-) -> io::Result<bool> {
-    if *at_file_start {
-        *at_file_start = false;
-        let chunk = reader.fill_buf()?;
-        if chunk.starts_with(b"\xef\xbb\xbf") {
-            reader.consume(3);
-        }
-    }
-
-    if peek_byte(reader)?.is_none() {
-        return Ok(false);
-    }
-
-    *line_no += 1;
-    scratch.buf.clear();
-    scratch.fields.clear();
-
-    loop {
-        let field_start = scratch.buf.len();
-        if use_quotes && peek_byte(reader)? == Some(b'"') {
-            reader.consume(1);
-            let mut next_field = false;
-            loop {
-                let chunk = reader.fill_buf()?;
-                if chunk.is_empty() {
-                    break;
-                }
-                let mut k = 0usize;
-                while k < chunk.len() && chunk[k] != b'"' {
-                    if chunk[k] == b'\n' {
-                        *line_no += 1;
-                    }
-                    k += 1;
-                }
-                if k > 0 {
-                    scratch.buf.extend_from_slice(&chunk[..k]);
-                    reader.consume(k);
-                    continue;
-                }
-                // Next byte is `"`
-                reader.consume(1);
-                if peek_byte(reader)? == Some(b'"') {
-                    reader.consume(1);
-                    scratch.buf.push(b'"');
-                } else {
-                    // Closing quote: advance to column separator, record separator, or EOF.
-                    while let Some(c) = peek_byte(reader)? {
-                        reader.consume(1);
-                        if c == col_sep {
-                            next_field = true;
-                            break;
-                        }
-                        if !row_sep_ascii {
-                            if c == b'\n' {
-                                break;
-                            }
-                            if c == b'\r' {
-                                let after_cr = peek_byte(reader)?;
-                                if after_cr == Some(b'\n') {
-                                    reader.consume(1);
-                                    break;
-                                } else if after_cr.is_none() {
-                                    break;
-                                }
-                            }
-                        } else if c == b'\x1e' {
-                            break;
-                        }
-                    }
-                    break;
-                }
-            }
-            let field_end = scratch.buf.len();
-            scratch.fields.push((field_start, field_end));
-            if next_field {
-                continue;
-            }
-            return Ok(true);
-        } else {
-            let mut next_field = false;
-            loop {
-                let chunk = reader.fill_buf()?;
-                if chunk.is_empty() {
-                    break;
-                }
-                let mut k = 0usize;
-                if !row_sep_ascii {
-                    while k < chunk.len() {
-                        let b = chunk[k];
-                        if b == col_sep || b == b'\n' || b == b'\r' {
-                            break;
-                        }
-                        k += 1;
-                    }
-                } else {
-                    while k < chunk.len() {
-                        let b = chunk[k];
-                        if b == col_sep || b == b'\x1e' {
-                            break;
-                        }
-                        k += 1;
-                    }
-                }
-                if k > 0 {
-                    scratch.buf.extend_from_slice(&chunk[..k]);
-                    reader.consume(k);
-                    continue;
-                }
-                let b = chunk[0];
-                reader.consume(1);
-                if b == col_sep {
-                    next_field = true;
-                    break;
-                }
-                if !row_sep_ascii {
-                    if b == b'\n' {
-                        break;
-                    }
-                    if b == b'\r' {
-                        let after_cr = peek_byte(reader)?;
-                        if after_cr == Some(b'\n') {
-                            reader.consume(1);
-                            break;
-                        } else if after_cr.is_none() {
-                            break;
-                        }
-                        scratch.buf.push(b'\r');
-                        continue;
-                    }
-                } else if b == b'\x1e' {
-                    break;
-                }
-                scratch.buf.push(b);
-            }
-            let field_end = scratch.buf.len();
-            scratch.fields.push((field_start, field_end));
-            if next_field {
-                continue;
-            }
-            return Ok(true);
-        }
-    }
-}
-
-/// Display width in terminal cells of the code point `u` (`sqlite3_qrf_wcwidth`,
-/// simplified: East Asian wide characters count two, combining marks zero).
-fn char_width(u: u32) -> usize {
-    if u < 0x20 || (0x300..0x370).contains(&u) || (0x200b..=0x200f).contains(&u) {
-        0
-    } else if (0x1100..0x1160).contains(&u)
-        || (0x2e80..0xa4d0).contains(&u)
-        || (0xac00..0xd7a4).contains(&u)
-        || (0xf900..0xfb00).contains(&u)
-        || (0xfe30..0xfe70).contains(&u)
-        || (0xff00..0xff61).contains(&u)
-        || (0xffe0..0xffe7).contains(&u)
-        || (0x1f300..0x1f650).contains(&u)
-        || (0x1f900..0x1fa00).contains(&u)
-        || (0x20000..0x3fffe).contains(&u)
+/// The tail of `main()`: closes everything and returns the exit code.
+fn finish(p: &mut ShellState, rc: i32) -> i32 {
+    p.output_reset();
+    let _ = p.stdout.flush();
+    if let Some(db) = p.db.take()
+        && let Err(e) = db.try_close()
     {
-        2
-    } else {
-        1
+        eprintln!("Error: sqlite3_close() returns {}: {}", 5, e);
     }
+    rc
 }
 
-/// Display width of one line of text (`qrfDisplayWidth`): a tab moves to the next multiple
-/// of eight, a byte that is not part of valid UTF-8 counts as one cell.
-fn display_width(z: &[u8]) -> usize {
-    let mut w = 0usize;
-    let mut i = 0usize;
-    while i < z.len() {
-        let c = z[i];
-        if c == b'\t' {
-            w = (w + 8) & !7;
-            i += 1;
-        } else if c < 0x80 {
-            w += usize::from(c >= 0x20);
-            i += 1;
-        } else {
-            let len = match c {
-                0xc0..=0xdf => 2,
-                0xe0..=0xef => 3,
-                0xf0..=0xf7 => 4,
-                _ => 1,
-            };
-            match z.get(i..i + len).and_then(|b| std::str::from_utf8(b).ok()) {
-                Some(s) => {
-                    w += s.chars().next().map_or(1, |ch| char_width(ch as u32));
-                    i += len;
-                }
-                None => {
-                    w += 1;
-                    i += 1;
-                }
-            }
-        }
-    }
-    w
-}
-
-/// The display lines of a rendered value: split at LF, a CR in front of the LF dropped, no
-/// empty line after a final line break.
-fn split_lines(z: &[u8]) -> Vec<&[u8]> {
-    let mut v: Vec<&[u8]> = z
-        .split(|&c| c == b'\n')
-        .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
-        .collect();
-    if v.len() > 1 && v.last().is_some_and(|l| l.is_empty()) {
-        v.pop();
-    }
-    v
-}
-
-/// Appends `z` with every tab expanded to the next multiple of eight
-/// (`qrfAppendWithTabs`).
-fn append_with_tabs(out: &mut Vec<u8>, z: &[u8]) {
-    let mut col = 0usize;
-    let mut start = 0usize;
-    for (i, &c) in z.iter().enumerate() {
-        if c == b'\t' {
-            out.extend_from_slice(&z[start..i]);
-            col += display_width(&z[start..i]);
-            let next = (col + 8) & !7;
-            out.resize(out.len() + (next - col), b' ');
-            col = next;
-            start = i + 1;
-        }
-    }
-    out.extend_from_slice(&z[start..]);
-}
-
-/// `qrfEscape(QRF_ESC_Ascii)`: a control character other than tab, newline and the CR of a
-/// CR-LF pair is shown as `^X`.
-fn escape_ctrl_into(out: &mut Vec<u8>, z: &[u8]) {
-    for (i, &c) in z.iter().enumerate() {
-        if c > 0x1f || c == b'\t' || c == b'\n' || (c == b'\r' && z.get(i + 1) == Some(&b'\n')) {
-            out.push(c);
-        } else {
-            out.push(b'^');
-            out.push(0x40 + c);
-        }
-    }
-}
-
-/// A value as the plain-text modes (list, line, box, table) show it: text ends at its first
-/// NUL like a C string, a blob is shown as text, control characters are escaped.
-fn render_plain_value(out: &mut Vec<u8>, v: &Value, null_str: &str) {
-    match v {
-        Value::Null => out.extend_from_slice(null_str.as_bytes()),
-        Value::Integer(i) => out.extend_from_slice(i.to_string().as_bytes()),
-        Value::Real(r) => out.extend_from_slice(format_sqlite_real(*r).as_bytes()),
-        Value::Text(s) => {
-            let b = s.as_bytes();
-            let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
-            escape_ctrl_into(out, &b[..end]);
-        }
-        Value::Blob(b) => escape_ctrl_into(out, b),
-    }
-}
-
-/// Box and table output (`qrfColumnar` without a screen-width limit): titles centred,
-/// numbers right-aligned, other values left-aligned; a value with line breaks makes every
-/// row multi-line and puts a separator between the rows.
-fn render_columnar<W: Write>(
-    out: &mut W,
-    cfg: &ShellConfig,
-    names: &[String],
-    rows: &[Vec<(Vec<u8>, bool)>],
-) {
-    let ncol = names.len();
-    let is_box = cfg.mode == OutputMode::Box;
-    let titles = cfg.headers;
-    if rows.is_empty() && !titles {
-        return;
-    }
-    let mut widths = vec![0usize; ncol];
-    let mut multi = false;
-    /// One table row: per column the display lines and whether the value is a number.
-    type GridRow<'g> = Vec<(Vec<&'g [u8]>, bool)>;
-    let mut grid: Vec<GridRow<'_>> = Vec::with_capacity(rows.len() + 1);
-    if titles {
-        grid.push(
-            names
-                .iter()
-                .map(|n| (split_lines(n.as_bytes()), false))
-                .collect(),
-        );
-    }
-    for r in rows {
-        grid.push(r.iter().map(|(t, num)| (split_lines(t), *num)).collect());
-    }
-    for r in &grid {
-        for (ci, (lines, _)) in r.iter().enumerate() {
-            if lines.len() > 1 {
-                multi = true;
-            }
-            for l in lines {
-                widths[ci] = widths[ci].max(display_width(l));
-            }
-        }
-    }
-    let sep_line = |out: &mut W, l: &str, m: &str, r: &str, h: &str| {
-        let mut line = String::from(l);
-        for (i, w) in widths.iter().enumerate() {
-            if i > 0 {
-                line.push_str(m);
-            }
-            line.push_str(&h.repeat(w + 2));
-        }
-        line.push_str(r);
-        let _ = writeln!(out, "{line}");
-    };
-    let bar: &[u8] = if is_box { "│".as_bytes() } else { b"|" };
-    if is_box {
-        sep_line(out, "╭", "┬", "╮", "─");
-    } else {
-        sep_line(out, "+", "+", "+", "-");
-    }
-    let n_grid = grid.len();
-    for (ri, r) in grid.iter().enumerate() {
-        let is_title = titles && ri == 0;
-        let height = r.iter().map(|(l, _)| l.len()).max().unwrap_or(1);
-        for li in 0..height {
-            let mut line: Vec<u8> = bar.to_vec();
-            for (ci, (lines, num)) in r.iter().enumerate() {
-                let text: &[u8] = lines.get(li).copied().unwrap_or(b"");
-                let ws = widths[ci].saturating_sub(display_width(text));
-                line.push(b' ');
-                let (before, after) = if is_title {
-                    (ws / 2, ws - ws / 2)
-                } else if *num {
-                    (ws, 0)
-                } else {
-                    (0, ws)
-                };
-                line.resize(line.len() + before, b' ');
-                append_with_tabs(&mut line, text);
-                line.resize(line.len() + after, b' ');
-                line.push(b' ');
-                line.extend_from_slice(bar);
-            }
-            line.push(b'\n');
-            let _ = out.write_all(&line);
-        }
-        if (ri == 0 || multi) && ri + 1 < n_grid {
-            if is_title {
-                if is_box {
-                    sep_line(out, "╞", "╪", "╡", "═");
-                } else {
-                    sep_line(out, "+", "+", "+", "-");
-                }
-            } else if multi {
-                if is_box {
-                    sep_line(out, "├", "┼", "┤", "─");
-                } else {
-                    sep_line(out, "+", "+", "+", "-");
-                }
-            }
-        }
-    }
-    if is_box {
-        if rows.is_empty() {
-            sep_line(out, "╘", "╧", "╛", "═");
-        } else {
-            sep_line(out, "╰", "┴", "╯", "─");
-        }
-    } else {
-        sep_line(out, "+", "+", "+", "-");
-    }
-}
-
-fn write_cell_value<W: Write>(out: &mut W, v: &Value, null_str: &str) {
-    match v {
-        Value::Null => {
-            let _ = out.write_all(null_str.as_bytes());
-        }
-        Value::Integer(i) => {
-            let mut buf = [0u8; 24];
-            let mut pos = buf.len();
-            let neg = *i < 0;
-            let mut mag: u64 = if neg {
-                i.wrapping_neg() as u64
-            } else {
-                *i as u64
-            };
-            loop {
-                pos -= 1;
-                buf[pos] = b'0' + (mag % 10) as u8;
-                mag /= 10;
-                if mag == 0 {
-                    break;
-                }
-            }
-            if neg {
-                pos -= 1;
-                buf[pos] = b'-';
-            }
-            let _ = out.write_all(&buf[pos..]);
-        }
-        Value::Real(r) => {
-            let mut buf = [0u8; sqliters::types::fp::REAL_TEXT_MAX];
-            let n = sqliters::types::write_real_text(*r, &mut buf);
-            let _ = out.write_all(&buf[..n]);
-        }
-        Value::Text(s) => {
-            // Text is a C string for the shell (ends at a NUL); control characters are
-            // shown as ^X. The common case has neither and is written as it is.
-            let b = s.as_bytes();
-            if b.iter().all(|&c| c > 0x1f || c == b'\t' || c == b'\n') {
-                let _ = out.write_all(b);
-            } else {
-                let mut esc = Vec::with_capacity(b.len() + 8);
-                render_plain_value(&mut esc, v, null_str);
-                let _ = out.write_all(&esc);
-            }
-        }
-        Value::Blob(b) => {
-            if b.iter().all(|&c| c > 0x1f || c == b'\t' || c == b'\n') {
-                let _ = out.write_all(b);
-            } else {
-                let mut esc = Vec::with_capacity(b.len() + 8);
-                escape_ctrl_into(&mut esc, b);
-                let _ = out.write_all(&esc);
-            }
-        }
-    }
-}
-
-fn format_cell_value(v: &Value, null_str: &str) -> String {
-    match v {
-        Value::Null => null_str.to_owned(),
-        Value::Integer(i) => i.to_string(),
-        Value::Real(r) => format_sqlite_real(*r),
-        Value::Text(s) => s.clone(),
-        Value::Blob(b) => String::from_utf8_lossy(b).into_owned(),
-    }
-}
-
-fn format_sql_literal(v: &Value) -> String {
-    match v {
-        Value::Null => "NULL".to_owned(),
-        Value::Integer(i) => i.to_string(),
-        Value::Real(r) => format_sqlite_real(*r),
-        Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
-        Value::Blob(b) => {
-            let mut out = String::with_capacity(b.len() * 2 + 3);
-            out.push_str("X'");
-            for byte in b {
-                out.push_str(&format!("{byte:02X}"));
-            }
-            out.push('\'');
-            out
-        }
-    }
-}
-
-/// CSV quoting of the C shell (`qrfCsvQuote`): a field is quoted when it holds a control
-/// character, a space, a quote character, an apostrophe, DEL or the separator. (C also quotes
-/// every field with a non-ASCII byte; `crates/sqliters-cli/tests/cli_smoke.rs` expects such
-/// text unquoted, so that part is not followed.)
-fn csv_escape(s: &str) -> String {
-    let needs = s.is_empty()
-        || s.bytes()
-            .any(|b| b <= 0x20 || b == b'"' || b == b'\'' || b == 0x7f || b == b',');
-    if needs {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s.to_owned()
-    }
-}
-
-/// CSV quoting for a list-style mode with another separator ("tabs"): as [`csv_escape`], and
-/// a field that contains the separator is quoted too.
-fn csv_escape_sep(s: &str, sep: &str) -> String {
-    let needs = s.is_empty()
-        || s.bytes()
-            .any(|b| b <= 0x20 || b == b'"' || b == b'\'' || b >= 0x7f)
-        || (!sep.is_empty() && s.contains(sep));
-    if needs {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s.to_owned()
-    }
-}
-
-fn json_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-fn json_value(v: &Value) -> String {
-    match v {
-        Value::Null => "null".to_owned(),
-        Value::Integer(i) => i.to_string(),
-        // QRF JSON style: `zFpFmt = "%0.16g"`.
-        Value::Real(r) => String::from_utf8_lossy(
-            &sqliters::vdbe::printf::sqlite_printf(b"%0.16g", std::slice::from_ref(v))
-                .unwrap_or_else(|_| format_sqlite_real(*r).into_bytes()),
-        )
-        .into_owned(),
-        Value::Text(s) => json_quote(s.split('\0').next().unwrap_or("")),
-        // QRF_BLOB_Json: every byte as \u00XX.
-        Value::Blob(b) => {
-            let mut out = String::with_capacity(b.len() * 6 + 2);
-            out.push('"');
-            for x in b {
-                out.push_str(&format!("\\u00{x:02x}"));
-            }
-            out.push('"');
-            out
-        }
-    }
-}
-
-fn print_cli_usage() {
-    println!("Usage: sqliters [OPTIONS] [FILENAME [SQL...]]");
-    println!("FILENAME is the name of an SQLite Format 3 database (default: :memory:).");
-    println!("Options:");
-    println!("  -bail                stop after hitting an error");
-    println!("  -batch               force batch I/O");
-    println!("  -box                 set output mode to 'box'");
-    println!("  -cmd COMMAND         run \"COMMAND\" before reading stdin");
-    println!("  -table               set output mode to 'table'");
-    println!("  -csv                 set output mode to 'csv'");
-    println!("  -json                set output mode to 'json'");
-    println!("  -line                set output mode to 'line'");
-    println!("  -list                set output mode to 'list'");
-    println!("  -header / -noheader  turn column headers on or off");
-    println!("  -readonly            open the database read-only");
-    println!("  -separator SEP       set output column separator");
-    println!("  -nullvalue TEXT      set text string for NULL values");
-    println!("  -version             show SQLite 3.54.1 version and exit");
-}
-
-fn print_dot_help<W: Write>(out: &mut W) {
-    let _ = writeln!(out, ".bail on|off           Stop after hitting an error");
-    let _ = writeln!(
-        out,
-        ".dbinfo                Show status information about the database header"
-    );
-    let _ = writeln!(
-        out,
-        ".dump                  Render database content as SQL text"
-    );
-    let _ = writeln!(out, ".exit / .quit          Exit this program");
-    let _ = writeln!(
-        out,
-        ".headers on|off        Turn display of headers on or off"
-    );
-    let _ = writeln!(out, ".help                  Show this help message");
-    let _ = writeln!(
-        out,
-        ".import FILE TABLE     Import data from FILE into TABLE"
-    );
-    let _ = writeln!(out, ".indexes ?TABLE?       Show names of indexes");
-    let _ = writeln!(
-        out,
-        ".mode MODE             Set output mode (box, table, list, csv, json, line)"
-    );
-    let _ = writeln!(
-        out,
-        ".nullvalue STRING      Use STRING in place of NULL values"
-    );
-    let _ = writeln!(
-        out,
-        ".open ?FILE?           Close existing database and reopen FILE"
-    );
-    let _ = writeln!(out, ".print STRING...       Print literal STRING");
-    let _ = writeln!(out, ".read FILE             Read input SQL from FILE");
-    let _ = writeln!(
-        out,
-        ".schema ?PATTERN?      Show the CREATE statements matching PATTERN"
-    );
-    let _ = writeln!(
-        out,
-        ".separator COL         Change the column separator used by list mode"
-    );
-    let _ = writeln!(
-        out,
-        ".tables ?TABLE?        List names of tables matching LIKE pattern TABLE"
-    );
+/// The `Value` an SQL literal argument denotes when it is used as text by a dot-command.
+pub fn text_of(v: &Value) -> String {
+    String::from_utf8_lossy(&qrf::value_text(v)).into_owned()
 }
