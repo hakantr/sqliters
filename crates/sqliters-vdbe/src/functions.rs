@@ -71,6 +71,9 @@ pub struct VmRuntimeContext {
     pub stmt_timestamp_ms: Option<i64>,
     /// Enables `testfixture` SQL functions (`randstr`, `sqlite/src/test_func.c`).
     pub enable_test_functions: bool,
+    /// Text encoding of the database (`sqlite3.enc`): `hex()` and `octet_length()` see the
+    /// stored bytes of a TEXT value, which are UTF-16 in a UTF-16 database.
+    pub text_encoding: sqliters_types::TextEncoding,
 }
 
 impl VmRuntimeContext {
@@ -351,7 +354,8 @@ fn eval_scalar_function_rt_upper(
                     has_null = true;
                     break;
                 }
-                if rv.value.cmp_sqlite(&best.value, Collation::Binary).is_lt() {
+                // minmaxFunc (func.c): min() moves to the later argument on a tie.
+                if rv.value.cmp_sqlite(&best.value, Collation::Binary).is_le() {
                     best = rv;
                 }
             }
@@ -396,19 +400,19 @@ fn eval_scalar_function_rt_upper(
             eval_json_extract(filtered, upper == "JSONB_EXTRACT")?
         }
         "JSON_INSERT" | "JSONB_INSERT" => {
-            check_arity_rt(name, filtered, 1, usize::MAX)?;
+            check_arity_rt(name, filtered, 0, usize::MAX)?;
             eval_json_edit(name, filtered, EditMode::Insert, upper == "JSONB_INSERT")?
         }
         "JSON_REPLACE" | "JSONB_REPLACE" => {
-            check_arity_rt(name, filtered, 1, usize::MAX)?;
+            check_arity_rt(name, filtered, 0, usize::MAX)?;
             eval_json_edit(name, filtered, EditMode::Replace, upper == "JSONB_REPLACE")?
         }
         "JSON_SET" | "JSONB_SET" => {
-            check_arity_rt(name, filtered, 1, usize::MAX)?;
+            check_arity_rt(name, filtered, 0, usize::MAX)?;
             eval_json_edit(name, filtered, EditMode::Set, upper == "JSONB_SET")?
         }
         "JSON_ARRAY_INSERT" | "JSONB_ARRAY_INSERT" => {
-            check_arity_rt(name, filtered, 1, usize::MAX)?;
+            check_arity_rt(name, filtered, 0, usize::MAX)?;
             eval_json_edit(
                 name,
                 filtered,
@@ -417,7 +421,7 @@ fn eval_scalar_function_rt_upper(
             )?
         }
         "JSON_REMOVE" | "JSONB_REMOVE" => {
-            check_arity_rt(name, filtered, 1, usize::MAX)?;
+            check_arity_rt(name, filtered, 0, usize::MAX)?;
             eval_json_remove(filtered, upper == "JSONB_REMOVE")?
         }
         "JSON_PATCH" | "JSONB_PATCH" => {
@@ -454,7 +458,20 @@ fn eval_scalar_function_plain(
     args: &[Value],
     ctx: &VmRuntimeContext,
 ) -> Result<Value> {
+    // Byte-exact ports of func.c; `None` = not ported or wrong argument count (the arms below
+    // then report the arity error).
+    if matches!(
+        upper.as_bytes().first(),
+        Some(b'C' | b'G' | b'H' | b'I' | b'L' | b'M' | b'O' | b'Q' | b'R' | b'S' | b'T' | b'U')
+    ) && let Some(r) = crate::func_c::eval(upper, args, ctx)
+    {
+        return r;
+    }
     match upper {
+        "CONCAT" | "CONCAT_WS" | "UNISTR" | "UNISTR_QUOTE" => Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("wrong number of arguments to function {name}()"),
+        )),
         "TYPEOF" => {
             check_arity(name, args, 1, 1)?;
             Ok(Value::Text(args[0].storage_class().typeof_str().to_owned()))
@@ -730,6 +747,10 @@ fn eval_scalar_function_plain(
             let rendered = match &args[0] {
                 Value::Null => "NULL".to_owned(),
                 Value::Integer(i) => i.to_string(),
+                // "%!0.17g": infinity is shown as 9.0e+999.
+                Value::Real(r) if r.is_infinite() => {
+                    if *r > 0.0 { "9.0e+999" } else { "-9.0e+999" }.to_owned()
+                }
                 Value::Real(r) => format_sqlite_real(*r),
                 Value::Text(s) => {
                     let before_nul = s.split('\0').next().unwrap_or("");
@@ -866,14 +887,29 @@ fn eval_scalar_function_plain(
             Ok(best.clone())
         }
         "PRINTF" | "FORMAT" => {
-            check_arity(name, args, 1, usize::MAX)?;
-            if args[0].is_null() {
+            // func.c printfFunc: no arguments or a NULL format give NULL.
+            if args.is_empty() || args[0].is_null() {
                 return Ok(Value::Null);
             }
-            Ok(Value::Text(simple_sqlite_printf(
-                &args[0].to_text_lossy(),
-                &args[1..],
-            )))
+            let fmt_owned;
+            let fmt: &[u8] = match &args[0] {
+                Value::Text(s) => s.as_bytes(),
+                Value::Blob(b) => b.as_slice(),
+                other => {
+                    fmt_owned = other.to_text_lossy();
+                    fmt_owned.as_bytes()
+                }
+            };
+            match crate::printf::sqlite_printf(fmt, &args[1..]) {
+                Ok(bytes) => Ok(Value::Text(match String::from_utf8(bytes) {
+                    Ok(s) => s,
+                    Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+                })),
+                Err(crate::printf::PrintfTooBig) => Err(SqliteError::new(
+                    ErrorCode::TooBig,
+                    "string or blob too big",
+                )),
+            }
         }
         "LIKE" => {
             check_arity(name, args, 2, 3)?;
@@ -1118,6 +1154,9 @@ fn scalar_function_arity_with_flag(
         "TEST_ERROR" if enable_test_functions => Some((1, 2)),
         "TEST_PLAIN_ARG_SUBTYPE" if enable_test_functions => Some((1, 1)),
         "REPLACE" => Some((3, 3)),
+        "UNISTR" | "UNISTR_QUOTE" => Some((1, 1)),
+        "CONCAT" => Some((1, usize::MAX)),
+        "CONCAT_WS" => Some((2, usize::MAX)),
         "TRIM" | "LTRIM" | "RTRIM" | "ROUND" | "UNHEX" | "LOG" | "JSON_ARRAY_LENGTH"
         | "JSON_TYPE" | "JSON_VALID" | "JSON_PRETTY" => Some((1, 2)),
         "SUBSTR" | "SUBSTRING" | "LIKE" => Some((2, 3)),
@@ -1126,7 +1165,7 @@ fn scalar_function_arity_with_flag(
         | "JSONB_EXTRACT" => Some((0, usize::MAX)),
         "PRINTF" | "FORMAT" | "JSON_INSERT" | "JSONB_INSERT" | "JSON_REPLACE" | "JSONB_REPLACE"
         | "JSON_SET" | "JSONB_SET" | "JSON_REMOVE" | "JSONB_REMOVE" | "JSON_ARRAY_INSERT"
-        | "JSONB_ARRAY_INSERT" => Some((1, usize::MAX)),
+        | "JSONB_ARRAY_INSERT" => Some((0, usize::MAX)),
         _ => None,
     }
 }
@@ -2241,468 +2280,6 @@ fn math_real_arg(v: &Value) -> Option<f64> {
     }
 }
 
-fn format_sqlite_float_sci(abs: f64, prec: usize, upper: bool, force_dot: bool) -> String {
-    let raw = format!("{abs:.prec$e}");
-    let Some((mant, exp_str)) = raw.split_once('e') else {
-        return raw;
-    };
-    let exp = exp_str.parse::<i32>().unwrap_or(0);
-    let mut m = mant.to_owned();
-    if prec == 0 && force_dot && !m.contains('.') {
-        m.push('.');
-    }
-    let e_ch = if upper { 'E' } else { 'e' };
-    let e_sign = if exp < 0 { '-' } else { '+' };
-    let abs_exp = exp.unsigned_abs();
-    format!("{m}{e_ch}{e_sign}{abs_exp:02}")
-}
-
-fn format_sqlite_float_g(
-    abs: f64,
-    prec: Option<usize>,
-    upper: bool,
-    alt_hash: bool,
-    alt_bang: bool,
-) -> String {
-    let p = prec.unwrap_or(6).max(1);
-    if abs == 0.0 {
-        if alt_hash {
-            if p > 1 {
-                return format!("0.{}", "0".repeat(p - 1));
-            }
-            return "0".to_owned();
-        }
-        if alt_bang {
-            return "0.0".to_owned();
-        }
-        return "0".to_owned();
-    }
-
-    let sig = if alt_bang { p.min(26) } else { p.min(15) };
-    let sci_prec = sig.saturating_sub(1);
-    let raw = format!("{abs:.sci_prec$e}");
-    let Some((mant, exp_str)) = raw.split_once('e') else {
-        return raw;
-    };
-    let exp = exp_str.parse::<i32>().unwrap_or(0);
-    let digits: String = mant.chars().filter(|&c| c != '.').collect();
-
-    if exp >= -4 && exp < (p as i32) {
-        if exp < 0 {
-            let leading_zeros = (-1 - exp) as usize;
-            let mut s = format!("0.{}{digits}", "0".repeat(leading_zeros));
-            if alt_hash {
-                if p > digits.len() {
-                    s.push_str(&"0".repeat(p - digits.len()));
-                }
-            } else {
-                while s.ends_with('0') {
-                    s.pop();
-                }
-                if s.ends_with('.') {
-                    if alt_bang {
-                        s.push('0');
-                    } else {
-                        s.pop();
-                    }
-                }
-            }
-            s
-        } else {
-            let int_digits = (exp + 1) as usize;
-            if int_digits < digits.len() {
-                let mut s = format!("{}.{}", &digits[..int_digits], &digits[int_digits..]);
-                if alt_hash {
-                    if p > digits.len() {
-                        s.push_str(&"0".repeat(p - digits.len()));
-                    }
-                } else {
-                    while s.ends_with('0') {
-                        s.pop();
-                    }
-                    if s.ends_with('.') {
-                        if alt_bang {
-                            s.push('0');
-                        } else {
-                            s.pop();
-                        }
-                    }
-                }
-                s
-            } else {
-                let mut s = format!("{digits}{}", "0".repeat(int_digits - digits.len()));
-                if alt_hash {
-                    if p > int_digits {
-                        s.push('.');
-                        s.push_str(&"0".repeat(p - int_digits));
-                    }
-                } else if alt_bang {
-                    s.push_str(".0");
-                }
-                s
-            }
-        }
-    } else {
-        let mut m = if digits.len() <= 1 {
-            digits.clone()
-        } else {
-            format!("{}.{}", &digits[..1], &digits[1..])
-        };
-        if alt_hash {
-            if digits.len() <= 1 && p > 1 {
-                m.push('.');
-                m.push_str(&"0".repeat(p - 1));
-            } else if p > digits.len() {
-                if !m.contains('.') {
-                    m.push('.');
-                }
-                m.push_str(&"0".repeat(p - digits.len()));
-            }
-        } else if m.contains('.') {
-            while m.ends_with('0') {
-                m.pop();
-            }
-            if m.ends_with('.') {
-                if alt_bang {
-                    m.push('0');
-                } else {
-                    m.pop();
-                }
-            }
-        } else if alt_bang {
-            m.push_str(".0");
-        }
-        let e_ch = if upper { 'E' } else { 'e' };
-        let e_sign = if exp < 0 { '-' } else { '+' };
-        let abs_exp = exp.unsigned_abs();
-        format!("{m}{e_ch}{e_sign}{abs_exp:02}")
-    }
-}
-
-fn insert_thousands_commas(digits: &str) -> String {
-    let len = digits.len();
-    if len <= 3 {
-        return digits.to_owned();
-    }
-    let mut out = String::with_capacity(len + (len - 1) / 3);
-    let first_group = len % 3;
-    let mut idx = 0;
-    if first_group > 0 {
-        out.push_str(&digits[..first_group]);
-        idx = first_group;
-    }
-    while idx < len {
-        if !out.is_empty() {
-            out.push(',');
-        }
-        out.push_str(&digits[idx..idx + 3]);
-        idx += 3;
-    }
-    out
-}
-
-fn simple_sqlite_printf(fmt: &str, args: &[Value]) -> String {
-    let mut out = String::with_capacity(fmt.len() + 16);
-    let bytes = fmt.as_bytes();
-    let mut i = 0usize;
-    let mut arg_idx = 0usize;
-
-    while i < bytes.len() {
-        if bytes[i] != b'%' {
-            let ch = fmt[i..].chars().next().unwrap();
-            out.push(ch);
-            i += ch.len_utf8();
-            continue;
-        }
-        i += 1;
-        if i < bytes.len() && bytes[i] == b'%' {
-            out.push('%');
-            i += 1;
-            continue;
-        }
-        let mut zero_pad = false;
-        let mut left_align = false;
-        let mut plus_sign = false;
-        let mut space_sign = false;
-        let mut alt_hash = false;
-        let mut alt_bang = false;
-        let mut comma_sep = false;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'0' => {
-                    zero_pad = true;
-                    i += 1;
-                }
-                b'-' => {
-                    left_align = true;
-                    i += 1;
-                }
-                b'+' => {
-                    plus_sign = true;
-                    i += 1;
-                }
-                b' ' => {
-                    space_sign = true;
-                    i += 1;
-                }
-                b'#' => {
-                    alt_hash = true;
-                    i += 1;
-                }
-                b'!' => {
-                    alt_bang = true;
-                    i += 1;
-                }
-                b',' => {
-                    comma_sep = true;
-                    i += 1;
-                }
-                _ => break,
-            }
-        }
-        let mut width = 0usize;
-        if i < bytes.len() && bytes[i] == b'*' {
-            i += 1;
-            let w = args.get(arg_idx).map_or(0, Value::to_integer_lossy);
-            arg_idx += 1;
-            if w < 0 {
-                left_align = true;
-                width = w.unsigned_abs() as usize;
-            } else {
-                width = w as usize;
-            }
-        } else {
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                width = width * 10 + (bytes[i] - b'0') as usize;
-                i += 1;
-            }
-        }
-        let mut prec: Option<usize> = None;
-        if i < bytes.len() && bytes[i] == b'.' {
-            i += 1;
-            if i < bytes.len() && bytes[i] == b'*' {
-                i += 1;
-                let p = args.get(arg_idx).map_or(0, Value::to_integer_lossy);
-                arg_idx += 1;
-                if p >= 0 {
-                    prec = Some(p as usize);
-                }
-            } else {
-                let mut p = 0usize;
-                while i < bytes.len() && bytes[i].is_ascii_digit() {
-                    p = p * 10 + (bytes[i] - b'0') as usize;
-                    i += 1;
-                }
-                prec = Some(p);
-            }
-        }
-        // Optional length modifiers (`l`, `ll`, `h`, `z`)
-        while i < bytes.len() && matches!(bytes[i], b'l' | b'h') {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        let spec = bytes[i] as char;
-        i += 1;
-        let val = args.get(arg_idx).cloned().unwrap_or(Value::Null);
-        arg_idx += 1;
-
-        let (prefix, body) = match spec {
-            'd' | 'i' => {
-                let n = val.to_integer_lossy();
-                let sign = if n < 0 {
-                    "-"
-                } else if plus_sign {
-                    "+"
-                } else if space_sign {
-                    " "
-                } else {
-                    ""
-                };
-                let mut digits = format!("{}", n.unsigned_abs());
-                if let Some(p) = prec {
-                    if p == 0 && digits == "0" {
-                        digits.clear();
-                    } else if digits.len() < p {
-                        digits = format!("{}{digits}", "0".repeat(p - digits.len()));
-                    }
-                }
-                if comma_sep && !digits.is_empty() {
-                    digits = insert_thousands_commas(&digits);
-                }
-                (sign.to_owned(), digits)
-            }
-            'u' => {
-                let mut digits = format!("{}", val.to_integer_lossy() as u64);
-                if let Some(p) = prec {
-                    if p == 0 && digits == "0" {
-                        digits.clear();
-                    } else if digits.len() < p {
-                        digits = format!("{}{digits}", "0".repeat(p - digits.len()));
-                    }
-                }
-                if comma_sep && !digits.is_empty() {
-                    digits = insert_thousands_commas(&digits);
-                }
-                (String::new(), digits)
-            }
-            'o' => {
-                let v = val.to_integer_lossy() as u64;
-                let mut digits = format!("{v:o}");
-                if let Some(p) = prec {
-                    if p == 0 && v == 0 {
-                        digits.clear();
-                    } else if digits.len() < p {
-                        digits = format!("{}{digits}", "0".repeat(p - digits.len()));
-                    }
-                }
-                let pfx = if alt_hash && v != 0 && !digits.starts_with('0') {
-                    "0"
-                } else {
-                    ""
-                };
-                (pfx.to_owned(), digits)
-            }
-            'x' | 'X' => {
-                let v = val.to_integer_lossy() as u64;
-                let mut digits = if spec == 'X' {
-                    format!("{v:X}")
-                } else {
-                    format!("{v:x}")
-                };
-                if let Some(p) = prec {
-                    if p == 0 && v == 0 {
-                        digits.clear();
-                    } else if digits.len() < p {
-                        digits = format!("{}{digits}", "0".repeat(p - digits.len()));
-                    }
-                }
-                let pfx = if alt_hash && v != 0 {
-                    if spec == 'X' { "0X" } else { "0x" }
-                } else {
-                    ""
-                };
-                (pfx.to_owned(), digits)
-            }
-            'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
-                let r = val.to_real_lossy();
-                if r.is_nan() {
-                    (String::new(), "NaN".to_owned())
-                } else {
-                    let is_neg = r < 0.0;
-                    let sign = if is_neg {
-                        "-"
-                    } else if plus_sign {
-                        "+"
-                    } else if space_sign {
-                        " "
-                    } else {
-                        ""
-                    };
-                    if r.is_infinite() {
-                        (sign.to_owned(), "Inf".to_owned())
-                    } else {
-                        let abs = if r == 0.0 { 0.0 } else { r.abs() };
-                        let rendered = match spec {
-                            'f' | 'F' => {
-                                let p = prec.unwrap_or(6);
-                                let mut s = format!("{abs:.p$}");
-                                if p == 0 && alt_hash && !s.contains('.') {
-                                    s.push('.');
-                                }
-                                s
-                            }
-                            'e' | 'E' => {
-                                let p = prec.unwrap_or(6);
-                                format_sqlite_float_sci(abs, p, spec == 'E', alt_hash)
-                            }
-                            _ => format_sqlite_float_g(abs, prec, spec == 'G', alt_hash, alt_bang),
-                        };
-                        (sign.to_owned(), rendered)
-                    }
-                }
-            }
-            'c' => {
-                let repeat = prec.unwrap_or(1).max(1);
-                let s = val.to_text_lossy();
-                let rendered = if let Some(ch) = s.chars().next() {
-                    let mut buf = String::with_capacity(ch.len_utf8() * repeat);
-                    for _ in 0..repeat {
-                        buf.push(ch);
-                    }
-                    buf
-                } else {
-                    String::new()
-                };
-                (String::new(), rendered)
-            }
-            'q' => {
-                let rendered = if val.is_null() {
-                    "(NULL)".to_owned()
-                } else {
-                    let s = val.to_text_lossy();
-                    let before_nul = s.split('\0').next().unwrap_or("");
-                    before_nul.replace('\'', "''")
-                };
-                (String::new(), rendered)
-            }
-            'Q' => {
-                let rendered = if val.is_null() {
-                    "NULL".to_owned()
-                } else {
-                    let s = val.to_text_lossy();
-                    let before_nul = s.split('\0').next().unwrap_or("");
-                    format!("'{}'", before_nul.replace('\'', "''"))
-                };
-                (String::new(), rendered)
-            }
-            's' | 'z' => {
-                let s = val.to_text_lossy();
-                let before_nul = s.split('\0').next().unwrap_or("");
-                let rendered = if let Some(p) = prec {
-                    before_nul.chars().take(p).collect()
-                } else {
-                    before_nul.to_owned()
-                };
-                (String::new(), rendered)
-            }
-            _ => (String::new(), val.to_text_lossy()),
-        };
-
-        let char_len = prefix.chars().count() + body.chars().count();
-        if char_len < width {
-            let pad = width - char_len;
-            if left_align {
-                out.push_str(&prefix);
-                out.push_str(&body);
-                for _ in 0..pad {
-                    out.push(' ');
-                }
-                continue;
-            }
-            let use_zero = zero_pad
-                && !matches!(spec, 's' | 'z' | 'c' | 'q' | 'Q')
-                && body != "Inf"
-                && body != "NaN";
-            if use_zero {
-                out.push_str(&prefix);
-                for _ in 0..pad {
-                    out.push('0');
-                }
-                out.push_str(&body);
-                continue;
-            }
-            for _ in 0..pad {
-                out.push(' ');
-            }
-        }
-        out.push_str(&prefix);
-        out.push_str(&body);
-    }
-    out
-}
-
 // ============================================================================
 // Aggregate Functions (`COUNT`, `SUM`, `TOTAL`, `AVG`, `MIN`, `MAX`, `GROUP_CONCAT`)
 // ============================================================================
@@ -3057,6 +2634,22 @@ pub struct AggregateAccumulator {
     json_accum: Option<Box<JsonGroupAccum>>,
 }
 
+/// Key under which `agg(DISTINCT x)` remembers a value with the BINARY collation. C keeps the
+/// values in an index, where an INTEGER and a REAL of the same numeric value are one key
+/// (`sqlite3VdbeRecordCompare`), so `1` and `1.0` are one distinct value.
+fn distinct_binary_key(v: &Value) -> Vec<u8> {
+    if let Value::Real(r) = v
+        && *r >= -9_223_372_036_854_775_808.0
+        && *r < 9_223_372_036_854_775_808.0
+    {
+        let i = *r as i64;
+        if (i as f64) == *r && sqliters_types::cmp_int_float(i, *r).is_eq() {
+            return sqliters_types::encode_record(&[Value::Integer(i)]);
+        }
+    }
+    sqliters_types::encode_record(std::slice::from_ref(v))
+}
+
 #[inline]
 fn value_to_text_in_encoding(v: &Value, encoding: TextEncoding) -> String {
     match v {
@@ -3143,7 +2736,7 @@ impl AggregateAccumulator {
                     return Ok(());
                 };
                 if self.collation == Collation::Binary {
-                    let key = sqliters_types::encode_record(std::slice::from_ref(first));
+                    let key = distinct_binary_key(first);
                     if !self.seen.insert(key) {
                         return Ok(());
                     }
@@ -3195,7 +2788,7 @@ impl AggregateAccumulator {
         }
         if self.distinct {
             if self.collation == Collation::Binary {
-                let key = sqliters_types::encode_record(std::slice::from_ref(first));
+                let key = distinct_binary_key(first);
                 if !self.seen.insert(key) {
                     return Ok(());
                 }

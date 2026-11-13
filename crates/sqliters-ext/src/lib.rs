@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 pub mod fts5;
-mod fts5_fp;
 mod fts5_tokenize;
 mod fts5_unicode;
 pub mod generate_series;

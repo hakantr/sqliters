@@ -2,7 +2,9 @@
 //! disassembler (`EXPLAIN`), and register-based execution machine ported from `sqlite/src/vdbe.c`.
 #![forbid(unsafe_code)]
 
+mod func_c;
 pub mod functions;
+pub mod printf;
 pub mod storage_api;
 
 use std::cmp::Ordering;

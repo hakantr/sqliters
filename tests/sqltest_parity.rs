@@ -553,7 +553,11 @@ fn test_column_limit_prepare_boundaries() {
             .prepare("ALTER TABLE t ADD COLUMN c5 INT;")
             .unwrap_err();
         assert_eq!(e_alter.code, ErrorCode::Error);
-        assert!(e_alter.message.contains("too many columns on t"));
+        assert!(
+            e_alter
+                .message
+                .contains("too many columns on sqlite_altertab_t")
+        );
 
         let e_idx = conn
             .prepare("CREATE INDEX idx_bad ON t(c1, c2, c3, c4, c1);")

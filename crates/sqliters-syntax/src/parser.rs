@@ -51,7 +51,41 @@ pub fn parse_one_with_spans(sql: &str) -> Result<(Option<Stmt>, IdentSpanMap, &s
 fn parse_one_inner(sql: &str, track_spans: bool) -> Result<(Option<Stmt>, IdentSpanMap, &str)> {
     let prefix_end = first_statement_end_offset(sql);
     let prefix = &sql[..prefix_end];
-    let mut tokens = tokenize(prefix)?;
+    let mut tokens = match tokenize(prefix) {
+        Ok(t) => t,
+        Err(tok_err) => {
+            // C runs the tokenizer and the parser together, so a syntax error in front of an
+            // unrecognized token is the one reported: parse the text before the bad token.
+            if let Some(off) = tok_err.offset
+                && off > 0
+                && prefix.is_char_boundary(off)
+                && let Ok(mut head) = tokenize(&prefix[..off])
+            {
+                disambiguate_window_keywords(&mut head);
+                let mut hp = Parser::new(&prefix[..off], &head, false);
+                while hp.eat(TokenKind::Semi) {}
+                if !hp.at(TokenKind::Eof) {
+                    match hp.parse_stmt() {
+                        Err(e)
+                            if e.offset.is_some_and(|o| o < off)
+                                && e.message.ends_with("syntax error") =>
+                        {
+                            return Err(e);
+                        }
+                        Ok(_) if !hp.at(TokenKind::Semi) && !hp.at(TokenKind::Eof) => {
+                            let tok = hp.peek();
+                            return Err(hp.syntax_err_at(
+                                tok,
+                                format!("near \"{}\": syntax error", tok.text),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            return Err(tok_err);
+        }
+    };
     disambiguate_window_keywords(&mut tokens);
     let mut parser = Parser::new(prefix, &tokens, track_spans);
     while parser.eat(TokenKind::Semi) {}
@@ -997,6 +1031,7 @@ impl<'a> Parser<'a> {
             None => String::new(),
         };
         let mut constraints = Vec::new();
+        let mut default_src: Option<String> = None;
         while self.is_column_constraint_start() || self.at(TokenKind::Null) {
             let cname = if self.eat(TokenKind::Constraint) {
                 Some(self.parse_ident()?)
@@ -1066,8 +1101,12 @@ impl<'a> Parser<'a> {
                 }
                 constraints.push(ColumnConstraint::Generated { expr: e, stored });
             } else if self.eat(TokenKind::Default) {
+                let mut span_start = self.peek().offset;
+                let mut span_end = None;
                 let expr = if self.eat(TokenKind::Lp) {
+                    span_start = self.peek().offset;
                     let e = self.parse_expr()?;
+                    span_end = Some(self.peek().offset);
                     self.expect(TokenKind::Rp)?;
                     e
                 } else if self.at(TokenKind::Plus) || self.at(TokenKind::Minus) {
@@ -1105,6 +1144,11 @@ impl<'a> Parser<'a> {
                         other => other,
                     }
                 };
+                let span_end = span_end.unwrap_or_else(|| self.prev_token_end());
+                default_src = self
+                    .sql
+                    .get(span_start..span_end.max(span_start))
+                    .map(|t| t.trim_matches(|c: char| c.is_ascii_whitespace()).to_owned());
                 constraints.push(ColumnConstraint::Default(expr));
             } else if self.eat(TokenKind::Collate) {
                 constraints.push(ColumnConstraint::Collate(self.parse_ident()?));
@@ -1137,6 +1181,7 @@ impl<'a> Parser<'a> {
             name,
             type_name,
             constraints,
+            default_src,
         })
     }
 

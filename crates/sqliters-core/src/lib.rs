@@ -5402,6 +5402,7 @@ impl ConnectionInner {
         expire_self_only: &mut bool,
         f: impl FnOnce(&mut ExecContext<'_>) -> R,
     ) -> R {
+        self.runtime.text_encoding = self.effective_encoding();
         let mut publish_fn = |rt: &VmRuntimeContext, exp: bool, imp: bool, rb: u64| {
             shared.publish_mirrors(rt, exp, imp, rb);
         };
@@ -5752,6 +5753,7 @@ impl ConnectionInner {
                 total_changes: 0,
                 stmt_timestamp_ms: stmt_ts,
                 enable_test_functions: self.runtime.enable_test_functions,
+                text_encoding: enc,
             };
             let svc_rt = vm_rt;
             let r = {
@@ -6173,14 +6175,14 @@ fn parse_simple_literal_insert_prefix<'a>(
                 if let Ok(iv) = num_str.parse::<i64>() {
                     *slot = Value::Integer(iv);
                 } else {
-                    let fv = num_str.parse::<f64>().ok()?;
+                    let fv = sqliters_types::sqlite_atof(num_str.as_bytes()).0;
                     if !fv.is_finite() {
                         return None;
                     }
                     *slot = Value::real(fv);
                 }
             } else {
-                let fv = num_str.parse::<f64>().ok()?;
+                let fv = sqliters_types::sqlite_atof(num_str.as_bytes()).0;
                 if !fv.is_finite() {
                     return None;
                 }
@@ -7450,6 +7452,7 @@ impl Statement {
             SmallInstVec::new(),
         );
         let mut vm_rt = inner.runtime;
+        vm_rt.text_encoding = inner.effective_encoding();
         if vm_rt.stmt_timestamp_ms.is_none() && prog.needs_stmt_timestamp() {
             vm_rt.stmt_timestamp_ms = Some(
                 inner
@@ -7883,6 +7886,7 @@ impl Statement {
                             SmallInstVec::new(),
                         );
                         let mut vm_rt = inner.runtime;
+                        vm_rt.text_encoding = inner.effective_encoding();
                         if vm_rt.stmt_timestamp_ms.is_none() && prog_final.needs_stmt_timestamp() {
                             vm_rt.stmt_timestamp_ms = Some(
                                 inner
@@ -10383,6 +10387,7 @@ fn try_fast_compiled_main_write_fields(
             total_changes: 0,
             stmt_timestamp_ms: stmt_ts,
             enable_test_functions: inner.runtime.enable_test_functions,
+            text_encoding: enc,
         };
         let svc_rt = vm_rt;
         let r = {
@@ -12546,6 +12551,8 @@ mod tests {
 
 #[cfg(test)]
 mod c_align_5g_tests;
+#[cfg(test)]
+mod c_align_5h_tests;
 /// Regression tests for behaviour that has to match C SQLite 3.54.1 (step 5e): every expected
 /// value below is what the reference `sqlite3` produces for the same statements.
 #[cfg(test)]
@@ -13168,16 +13175,9 @@ mod c_parity_tests {
                 Err(msg) => {
                     let err = res.expect_err(&what);
                     assert_eq!(err.message, msg, "{what}");
-                    // C returns SQLITE_ERROR for every one of these. The two failures of the
-                    // post-ALTER row check keep SQLITE_CONSTRAINT, which the integration test
-                    // for finding Y8 (`tests/bulgular_regressions.rs`) requires.
-                    let want_code = match msg {
-                        "CHECK constraint failed" | "NOT NULL constraint failed" => {
-                            ErrorCode::Constraint
-                        }
-                        _ => ErrorCode::Error,
-                    };
-                    assert_eq!(err.code, want_code, "{what}");
+                    // C returns SQLITE_ERROR for every one of these, the two failures of the
+                    // post-ALTER row check included (`raise(ABORT, ..)` outside a trigger).
+                    assert_eq!(err.code, ErrorCode::Error, "{what}");
                     assert_eq!(stored(&conn), before, "{what}: schema must be unchanged");
                 }
             }

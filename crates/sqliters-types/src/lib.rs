@@ -34,6 +34,7 @@ pub fn dtrace_enabled() -> bool {
 
 pub mod bitvec;
 pub mod error;
+pub mod fp;
 pub mod json;
 pub mod limits;
 pub mod record;
@@ -44,6 +45,7 @@ pub mod vtab_api;
 
 pub use bitvec::Bitvec;
 pub use error::{ConflictResolutionEffect, ErrorCode, Result, SqliteError, extended};
+pub use fp::{FpDecode, fp_decode, real_to_text, sqlite_atof, sqlite_atoi64, write_real_text};
 pub use json::{
     CompiledJsonArrowPath, eval_jsonb_value_into, parse_json_text_to_jsonb,
     parse_json_text_to_jsonb_into,

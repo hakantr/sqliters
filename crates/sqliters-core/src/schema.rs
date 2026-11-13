@@ -44,6 +44,8 @@ pub struct ColumnSchema {
     pub custom_collation: Option<String>,
     pub not_null: Option<ConflictAction>,
     pub default_expr: Option<Expr>,
+    /// Source text of `default_expr` as written in the schema (see `ColumnDef::default_src`).
+    pub default_src: Option<String>,
     pub generated: Option<(Expr, bool)>,
     pub is_primary_key: bool,
     /// `true` when the column has an inline `UNIQUE` column constraint (`COLFLAG_UNIQUE` in `sqliteInt.h`).
@@ -99,6 +101,63 @@ fn default_value_from_expr(expr: &Expr, affinity: TypeAffinity) -> Option<Value>
     }
 }
 
+/// `valueFromExpr` for a float literal default (optionally with one minus sign) of a
+/// TEXT-affinity column: C builds the value from the token text (`"%s%s", zNeg, zToken`) and
+/// TEXT affinity leaves that text alone, so a short row reads `'5.'` or `'1e3'` rather than the
+/// canonical rendering of the number.
+fn default_float_token_text(
+    expr: &Expr,
+    src: Option<&str>,
+    affinity: TypeAffinity,
+) -> Option<Value> {
+    use sqliters_syntax::UnaryOp;
+    if affinity != TypeAffinity::Text {
+        return None;
+    }
+    let mut e = expr;
+    while let Expr::Unary {
+        op: UnaryOp::Plus,
+        expr: inner,
+    } = e
+    {
+        e = inner;
+    }
+    let neg = match e {
+        Expr::Float(_) => false,
+        Expr::Unary {
+            op: UnaryOp::Negate,
+            expr: inner,
+        } if matches!(inner.as_ref(), Expr::Float(_)) => true,
+        _ => return None,
+    };
+    let mut t = src?.trim_matches(|c: char| c.is_ascii_whitespace());
+    loop {
+        let stripped = t
+            .strip_prefix('+')
+            .or_else(|| t.strip_prefix('('))
+            .map(|r| r.trim_start_matches(|c: char| c.is_ascii_whitespace()));
+        match stripped {
+            Some(r) => t = r,
+            None => break,
+        }
+    }
+    if neg {
+        t = t
+            .strip_prefix('-')?
+            .trim_start_matches(|c: char| c.is_ascii_whitespace());
+    }
+    let t = t.trim_end_matches(|c: char| c.is_ascii_whitespace() || c == ')');
+    if t.is_empty()
+        || !t
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
+    {
+        return None;
+    }
+    let tok: String = t.chars().filter(|&c| c != '_').collect();
+    Some(Value::Text(if neg { format!("-{tok}") } else { tok }))
+}
+
 impl ColumnSchema {
     pub fn collation_name(&self) -> &str {
         if let Some(ref cname) = self.custom_collation {
@@ -127,11 +186,10 @@ impl ColumnSchema {
     /// `OP_Column` when reading rows written prior to `ALTER TABLE ... ADD COLUMN`.
     pub fn default_p4_for_table(&self, table_strict: bool) -> P4 {
         // `sqlite3ColumnDefault` → `sqlite3ValueFromExpr(db, pDflt, enc, pCol->affinity, &v)`.
-        let Some(v) = self
-            .default_expr
-            .as_ref()
-            .and_then(|e| default_value_from_expr(e, self.affinity))
-        else {
+        let Some(v) = self.default_expr.as_ref().and_then(|e| {
+            default_float_token_text(e, self.default_src.as_deref(), self.affinity)
+                .or_else(|| default_value_from_expr(e, self.affinity))
+        }) else {
             return P4::None;
         };
         let mut coerced = v;
@@ -464,6 +522,7 @@ impl TableSchema {
             custom_collation: None,
             not_null: None,
             default_expr: None,
+            default_src: None,
             generated: None,
             is_primary_key: false,
             is_unique: false,
@@ -1052,7 +1111,12 @@ impl Schema {
             let obj_type = cols[0].as_str().unwrap_or("");
             let name = cols[1].as_str().unwrap_or("").to_owned();
             let tbl_name = cols[2].as_str().unwrap_or("").to_owned();
-            let rootpage = cols[3].as_i64().unwrap_or(0) as Pgno;
+            // sqlite3InitCallback reads the root page from the text of the column
+            // (`sqlite3GetUInt32(argv[3], ..)`), so a root page stored as TEXT still counts.
+            let rootpage = match &cols[3] {
+                Value::Text(t) => t.trim().parse::<u32>().unwrap_or(0),
+                other => other.as_i64().unwrap_or(0) as Pgno,
+            };
             let sql_opt = cols[4].as_str().map(str::to_owned);
 
             match obj_type {
@@ -1689,6 +1753,11 @@ pub fn build_table_schema_from_ast(
             collation,
             custom_collation: custom_collation.clone(),
             not_null,
+            default_src: if default_expr.is_some() {
+                cdef.default_src.clone()
+            } else {
+                None
+            },
             default_expr,
             generated,
             is_primary_key: is_pk,

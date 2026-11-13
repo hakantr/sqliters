@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::fts5_fp::real_to_text;
 use crate::fts5_tokenize::{FTS5_MAX_TOKEN_SIZE, Tokenizer, TokenizerError, TokenizerPattern};
+use sqliters_types::real_to_text;
 use sqliters_types::{
     ErrorCode, Result, SqliteError, VTabConfigOption, VTabConflictMode, VTabConstraintOp,
     VTabHostContext, VTabIndexInfo, VTabRiskFlags, VTabUpdateOperation, Value, VirtualCursor,
@@ -5942,6 +5942,31 @@ impl VirtualTableModule for Fts5Module {
             let _ = ctx.set_vtab_config(VTabConfigOption::ConstraintSupport);
         }
         let _ = ctx.set_vtab_config(VTabConfigOption::Innocuous);
+        // fts5InitVtab -> sqlite3Fts5ConfigLoad: the `version` row of %_config must be 4 or 5
+        // (5 = secure-delete has been used). A config table that cannot be read at this
+        // point is left to the first statement that needs it.
+        {
+            let db_q = quote_ident(ctx.db_name());
+            let config_q = quote_ident(&format!("{tbl_name}_config"));
+            if let Ok(rows) = ctx.query_sql(&format!("SELECT k, v FROM {db_q}.{config_q}"), &[]) {
+                let mut version = 0i64;
+                for r in &rows {
+                    if let (Some(k), Some(v)) = (r.first(), r.get(1))
+                        && k.to_text_lossy().eq_ignore_ascii_case("version")
+                    {
+                        version = i64::from(v.to_integer_lossy() as i32);
+                    }
+                }
+                if version != 4 && version != 5 {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!(
+                            "invalid fts5 file format (found {version}, expected 4 or 5) - run 'rebuild'"
+                        ),
+                    ));
+                }
+            }
+        }
         Ok(Box::new(Fts5Table {
             cfg,
             aux_registry: Arc::clone(&self.aux_registry),

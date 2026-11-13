@@ -2025,6 +2025,21 @@ impl RTreeTable {
                 m
             }
         };
+        if cur_max == i64::MAX {
+            // C allocates through `INSERT INTO %_rowid VALUES(NULL, NULL)`, i.e. OP_NewRowid:
+            // with the largest rowid in use, up to 100 random positive candidates are tried and
+            // the insert fails with SQLITE_FULL when all of them exist.
+            for _ in 0..100 {
+                let probe = (rtree_random_i64() & (i64::MAX >> 1)) + 1;
+                if self.read_rowid_nodeno(cache, ctx, probe)?.is_none() {
+                    return Ok(probe);
+                }
+            }
+            return Err(SqliteError::new(
+                ErrorCode::Full,
+                "database or disk is full",
+            ));
+        }
         let next_id = cur_max + 1;
         cache.record_max_rowid_before();
         cache.max_rowid = Some(next_id);
@@ -3392,47 +3407,27 @@ fn value_to_i32_clamped(v: &Value) -> i32 {
     i.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
+/// A pseudo-random 64-bit value for rowid probing (`sqlite3_randomness` in C; the values are
+/// not meant to be reproducible).
+fn rtree_random_i64() -> i64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static STATE: AtomicU64 = AtomicU64::new(0);
+    let mut x = STATE.load(Ordering::Relaxed);
+    if x == 0 {
+        x = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0x9e37_79b9_7f4a_7c15, |d| d.as_nanos() as u64)
+            | 1;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    STATE.store(x, Ordering::Relaxed);
+    x.wrapping_mul(0x2545_f491_4f6c_dd1d) as i64
+}
+
 fn parse_numeric_prefix_f64(s: &str) -> f64 {
-    let trimmed = s.trim_start();
-    if trimmed.is_empty() {
-        return 0.0;
-    }
-    let bytes = trimmed.as_bytes();
-    let mut end = 0;
-    if bytes.first().is_some_and(|c| *c == b'+' || *c == b'-') {
-        end += 1;
-    }
-    let mut saw_digit = false;
-    while end < bytes.len() && bytes[end].is_ascii_digit() {
-        saw_digit = true;
-        end += 1;
-    }
-    if end < bytes.len() && bytes[end] == b'.' {
-        end += 1;
-        while end < bytes.len() && bytes[end].is_ascii_digit() {
-            saw_digit = true;
-            end += 1;
-        }
-    }
-    if !saw_digit {
-        return 0.0;
-    }
-    if end < bytes.len() && (bytes[end] == b'e' || bytes[end] == b'E') {
-        let exp_start = end;
-        end += 1;
-        if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
-            end += 1;
-        }
-        let mut exp_digits = false;
-        while end < bytes.len() && bytes[end].is_ascii_digit() {
-            exp_digits = true;
-            end += 1;
-        }
-        if !exp_digits {
-            end = exp_start;
-        }
-    }
-    trimmed[..end].parse::<f64>().unwrap_or(0.0)
+    sqliters_types::parse_leading_f64(s)
 }
 
 fn parse_numeric_prefix_i64(s: &str) -> i64 {

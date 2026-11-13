@@ -1705,7 +1705,7 @@ fn test_bulgu_y8_alter_table_add_column_validates_existing_rows() {
         let err = conn
             .execute("ALTER TABLE t ADD COLUMN y INT CHECK(y > 0) DEFAULT -1;")
             .unwrap_err();
-        assert_eq!(err.code, ErrorCode::Constraint);
+        assert_eq!(err.code, ErrorCode::Error);
         assert!(err.message.contains("CHECK constraint failed"));
 
         // Schema must remain unchanged (`t` still has only column `x`)!
@@ -1717,7 +1717,7 @@ fn test_bulgu_y8_alter_table_add_column_validates_existing_rows() {
         let g_err = conn
             .execute("ALTER TABLE t ADD COLUMN z INT GENERATED ALWAYS AS (NULL) VIRTUAL NOT NULL;")
             .unwrap_err();
-        assert_eq!(g_err.code, ErrorCode::Constraint);
+        assert_eq!(g_err.code, ErrorCode::Error);
 
         // Valid `ADD COLUMN` with satisfied `CHECK` succeeds!
         conn.execute("ALTER TABLE t ADD COLUMN y INT CHECK(y > 0) DEFAULT 5;")

@@ -45,6 +45,8 @@ fn err_too_deep() -> SqliteError {
 #[cold]
 #[inline(never)]
 fn err_bad_path(z_path: &str) -> SqliteError {
+    // The path is a C string in json.c ("%Q"): it ends at the first NUL.
+    let z_path = z_path.split('\0').next().unwrap_or("");
     SqliteError::new(
         ErrorCode::Error,
         format!("bad JSON path: '{}'", z_path.replace('\'', "''")),
@@ -71,80 +73,8 @@ fn format_json_real(f: f64) -> &'static str {
 
 fn format_finite_json_real(f: f64) -> String {
     debug_assert!(f.is_finite());
-    if f == 0.0 {
-        return "0.0".to_owned();
-    }
-    let sign = if f.is_sign_negative() { "-" } else { "" };
-    let abs_f = f.abs();
-    // Shortest round-trip scientific form (matching Dragonbox / `%!0.17g` precision).
-    let sci = format!("{abs_f:e}");
-    let (mantissa, exp_str) = sci.split_once('e').expect("scientific format has 'e'");
-    let exp: i32 = exp_str.parse().expect("valid exponent");
-    let digits: Vec<u8> = mantissa.bytes().filter(|&b| b != b'.').collect();
-    // Trim trailing zeros down to at least 1 significant digit.
-    let mut sig_len = digits.len();
-    while sig_len > 1 && digits[sig_len - 1] == b'0' {
-        sig_len -= 1;
-    }
-    let sig = &digits[..sig_len];
-
-    if (-4..17).contains(&exp) {
-        let mut out = String::with_capacity(24);
-        out.push_str(sign);
-        if exp < 0 {
-            out.push_str("0.");
-            for _ in 0..(-exp - 1) {
-                out.push('0');
-            }
-            for &d in sig {
-                out.push(d as char);
-            }
-        } else {
-            let int_digits = (exp as usize) + 1;
-            if int_digits >= sig.len() {
-                for &d in sig {
-                    out.push(d as char);
-                }
-                for _ in 0..(int_digits - sig.len()) {
-                    out.push('0');
-                }
-                out.push_str(".0");
-            } else {
-                for &d in &sig[..int_digits] {
-                    out.push(d as char);
-                }
-                out.push('.');
-                for &d in &sig[int_digits..] {
-                    out.push(d as char);
-                }
-            }
-        }
-        out
-    } else {
-        let mut out = String::with_capacity(28);
-        out.push_str(sign);
-        out.push(sig[0] as char);
-        out.push('.');
-        if sig.len() == 1 {
-            out.push('0');
-        } else {
-            for &d in &sig[1..] {
-                out.push(d as char);
-            }
-        }
-        out.push('e');
-        if exp >= 0 {
-            out.push('+');
-        } else {
-            out.push('-');
-        }
-        let abs_exp = exp.unsigned_abs();
-        if abs_exp < 10 {
-            out.push('0');
-        }
-        out.push_str(&abs_exp.to_string());
-        out
-    }
+    // `jsonPrintf(100, p, "%!0.17g", r)`.
+    crate::fp::real_to_text(f)
 }
 
 #[inline]
@@ -1742,6 +1672,39 @@ fn append_edit_arg_as_jsonb(out: &mut Vec<u8>, arg: &RuntimeValue) -> Result<()>
     append_sql_arg_as_jsonb(out, arg)
 }
 
+/// Appends SQL text as a JSONB string the way C does for `jsonb_array()`, `jsonb_object()` and
+/// the group aggregates: the value first becomes a JSON string literal (`jsonAppendString`),
+/// which the text-to-JSONB translator then stores as `TEXT` when it has no escapes and as
+/// `TEXTJ` (escaped spelling kept) when it has.
+fn append_sql_text_as_jsonb(out: &mut Vec<u8>, s: &str) {
+    let plain = s.bytes().all(|b| is_json_plain_ok_byte(b) || b == b'\'');
+    if plain {
+        jsonb_append_node(out, JSONB_TEXT, s.as_bytes());
+        return;
+    }
+    let mut esc = Vec::with_capacity(s.len() + 8);
+    for &c in s.as_bytes() {
+        match c {
+            b'"' | b'\\' => {
+                esc.push(b'\\');
+                esc.push(c);
+            }
+            0x08 => esc.extend_from_slice(b"\\b"),
+            0x09 => esc.extend_from_slice(b"\\t"),
+            0x0a => esc.extend_from_slice(b"\\n"),
+            0x0c => esc.extend_from_slice(b"\\f"),
+            0x0d => esc.extend_from_slice(b"\\r"),
+            0..=0x1f => {
+                esc.extend_from_slice(b"\\u00");
+                esc.push(b"0123456789abcdef"[(c >> 4) as usize]);
+                esc.push(b"0123456789abcdef"[(c & 0xf) as usize]);
+            }
+            _ => esc.push(c),
+        }
+    }
+    jsonb_append_node(out, JSONB_TEXTJ, &esc);
+}
+
 pub fn append_sql_arg_as_jsonb(out: &mut Vec<u8>, arg: &RuntimeValue) -> Result<()> {
     match &arg.value {
         Value::Null => jsonb_append_node(out, JSONB_NULL, &[]),
@@ -1768,9 +1731,7 @@ pub fn append_sql_arg_as_jsonb(out: &mut Vec<u8>, arg: &RuntimeValue) -> Result<
                     Err(_) => return Err(err_malformed()),
                 }
             } else {
-                let plain = s.bytes().all(|b| is_json_plain_ok_byte(b) || b == b'\'');
-                let etype = if plain { JSONB_TEXT } else { JSONB_TEXTRAW };
-                jsonb_append_node(out, etype, s.as_bytes());
+                append_sql_text_as_jsonb(out, s);
             }
         }
         Value::Blob(b) => {
@@ -1863,7 +1824,11 @@ pub fn jsonb_node_to_sql_value(
                 }
             }
             let s = std::str::from_utf8(payload).map_err(|_| err_malformed())?;
-            let fv = s.parse::<f64>().unwrap_or(f64::INFINITY);
+            // C `jsonReturnFromBlob` to_double: `sqlite3AtoF` on the number text.
+            let (fv, rc) = crate::fp::sqlite_atof(s.as_bytes());
+            if rc <= 0 {
+                return Err(err_malformed());
+            }
             Ok(RuntimeValue::plain(Value::Real(fv)))
         }
         JSONB_INT5 => {
@@ -1905,25 +1870,23 @@ pub fn jsonb_node_to_sql_value(
                 return Err(err_malformed());
             }
             let s = std::str::from_utf8(payload).map_err(|_| err_malformed())?;
-            let fv = s.parse::<f64>().unwrap_or_else(|_| {
-                if s.starts_with('-') {
-                    f64::NEG_INFINITY
-                } else {
-                    f64::INFINITY
-                }
-            });
+            let (fv, rc) = crate::fp::sqlite_atof(s.as_bytes());
+            if rc <= 0 {
+                return Err(err_malformed());
+            }
             Ok(RuntimeValue::plain(Value::Real(fv)))
         }
         JSONB_FLOAT5 => {
             let mut canon = String::new();
             jsonb_node_to_text(blob, offset, 0, &mut canon)?;
-            let fv = canon.parse::<f64>().unwrap_or_else(|_| {
-                if canon.starts_with('-') {
+            let (mut fv, rc) = crate::fp::sqlite_atof(canon.as_bytes());
+            if rc <= 0 {
+                fv = if canon.starts_with('-') {
                     f64::NEG_INFINITY
                 } else {
                     f64::INFINITY
-                }
-            });
+                };
+            }
             Ok(RuntimeValue::plain(Value::Real(fv)))
         }
         JSONB_TEXT | JSONB_TEXTRAW | JSONB_TEXTJ | JSONB_TEXT5 => {
@@ -2691,12 +2654,7 @@ fn encode_new_label_jsonb(key: &str) -> Vec<u8> {
 
 fn encode_key_jsonb(key: &str) -> Vec<u8> {
     let mut raw = Vec::with_capacity(key.len() + 2);
-    let plain = key.bytes().all(|b| is_json_plain_ok_byte(b) || b == b'\'');
-    jsonb_append_node(
-        &mut raw,
-        if plain { JSONB_TEXT } else { JSONB_TEXTRAW },
-        key.as_bytes(),
-    );
+    append_sql_text_as_jsonb(&mut raw, key);
     raw
 }
 
@@ -2947,6 +2905,9 @@ pub fn eval_json_object(args: &[RuntimeValue], as_blob: bool) -> Result<RuntimeV
         ));
     }
     let mut children = Vec::new();
+    // jsonObjectFunc keeps going after a value error (`jsonAppendSqlValue` only records it), so a
+    // later non-TEXT label replaces the message: the last error wins.
+    let mut value_err: Option<SqliteError> = None;
     for pair in args.as_chunks::<2>().0 {
         let key_str = match &pair[0].value {
             Value::Text(s) => s.clone(),
@@ -2958,15 +2919,13 @@ pub fn eval_json_object(args: &[RuntimeValue], as_blob: bool) -> Result<RuntimeV
                 ));
             }
         };
-        let plain = key_str
-            .bytes()
-            .all(|b| is_json_plain_ok_byte(b) || b == b'\'');
-        jsonb_append_node(
-            &mut children,
-            if plain { JSONB_TEXT } else { JSONB_TEXTRAW },
-            key_str.as_bytes(),
-        );
-        append_sql_arg_as_jsonb(&mut children, &pair[1])?;
+        append_sql_text_as_jsonb(&mut children, &key_str);
+        if let Err(e) = append_sql_arg_as_jsonb(&mut children, &pair[1]) {
+            value_err = Some(e);
+        }
+    }
+    if let Some(e) = value_err {
+        return Err(e);
     }
     let mut out = Vec::with_capacity(children.len() + 5);
     jsonb_append_node(&mut out, JSONB_OBJECT, &children);
@@ -3608,10 +3567,19 @@ pub fn eval_json_edit(
     mode: EditMode,
     as_blob: bool,
 ) -> Result<RuntimeValue> {
-    if args.is_empty() || !(args.len() - 1).is_multiple_of(2) {
+    // json.c jsonSetFunc / jsonReplaceFunc / jsonArrayInsertFunc: no argument at all is NULL;
+    // the message always names the json_ spelling.
+    if args.is_empty() {
+        return Ok(RuntimeValue::plain(Value::Null));
+    }
+    if !(args.len() - 1).is_multiple_of(2) {
+        let lower = func_name.to_ascii_lowercase();
+        let base = lower
+            .strip_prefix("jsonb_")
+            .map_or_else(|| lower.clone(), |rest| format!("json_{rest}"));
         return Err(SqliteError::new(
             ErrorCode::Error,
-            format!("{func_name}() requires an odd number of arguments"),
+            format!("{base}() needs an odd number of arguments"),
         ));
     }
     let Some(jsonb) = parse_func_arg_to_jsonb(&args[0].value)? else {
@@ -3626,6 +3594,10 @@ pub fn eval_json_edit(
             continue;
         }
         let path_str = pair[0].value.to_text_lossy();
+        if !path_str.starts_with('$') {
+            // jsonInsertIntoBlob: `zPath[0]!='$'` is a path error before anything else.
+            return Err(err_bad_path(&path_str));
+        }
         if mode == EditMode::ArrayInsert && !path_str.ends_with(']') {
             return Err(err_not_array_element(&path_str));
         }
@@ -3768,8 +3740,10 @@ impl JsonGroupAccum {
                     entries.push_back(None);
                     return Ok(());
                 }
-                let key_str = args[0].value.to_text_lossy();
-                let key_node = encode_key_jsonb(&key_str);
+                // jsonObjectStep: the label is a C string (`sqlite3Strlen30(z)`).
+                let key_full = args[0].value.to_text_lossy();
+                let key_str = key_full.split('\0').next().unwrap_or("");
+                let key_node = encode_key_jsonb(key_str);
                 let val_arg = args
                     .get(1)
                     .cloned()

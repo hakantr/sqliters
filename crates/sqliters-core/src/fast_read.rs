@@ -3352,6 +3352,9 @@ struct HashGroupByPlan {
     where_pred: Option<FastExpr>,
     group_col: FastColSrc,
     group_collation: Collation,
+    /// The groups come out in descending key order when there is no ORDER BY: C walks an
+    /// index that leads with the group column in DESC order instead of sorting.
+    groups_desc: bool,
     aggs: Box<[FastAggSpec]>,
     projections: Box<[FastGroupProjExpr]>,
     order_by: Box<[GroupSortSpec]>,
@@ -3498,6 +3501,16 @@ impl HashGroupByPlan {
             finalized.push((gk, agg_vals));
         }
 
+        if self.order_by.is_empty() && finalized.len() > 1 {
+            // C groups through a sorter (or an index walk), so without ORDER BY the groups
+            // come out in ascending key order; the hash table above collected them in
+            // first-seen order. The sort is stable: the group keeps its first-seen key value.
+            let coll = self.group_collation;
+            finalized.sort_by(|(k_a, _), (k_b, _)| k_a.cmp_sqlite(k_b, coll));
+            if self.groups_desc {
+                finalized.reverse();
+            }
+        }
         if !self.order_by.is_empty() && finalized.len() > 1 {
             fallible_sort_by(&mut finalized, |(k_a, a_a), (k_b, a_b)| {
                 let ka_arr = [k_a.clone()];
@@ -3884,6 +3897,9 @@ struct EquiJoinGroupByPlan {
     post_join_where: Option<FastExpr>,
     group_col: FastColSrc,
     group_collation: Collation,
+    /// The groups come out in descending key order when there is no ORDER BY: C walks an
+    /// index that leads with the group column in DESC order instead of sorting.
+    groups_desc: bool,
     aggs: Box<[FastAggSpec]>,
     projections: Box<[FastGroupProjExpr]>,
     order_by: Box<[GroupSortSpec]>,
@@ -4162,6 +4178,16 @@ impl EquiJoinGroupByPlan {
             finalized.push((gk, agg_vals));
         }
 
+        if self.order_by.is_empty() && finalized.len() > 1 {
+            // C groups through a sorter (or an index walk), so without ORDER BY the groups
+            // come out in ascending key order; the hash table above collected them in
+            // first-seen order. The sort is stable: the group keeps its first-seen key value.
+            let coll = self.group_collation;
+            finalized.sort_by(|(k_a, _), (k_b, _)| k_a.cmp_sqlite(k_b, coll));
+            if self.groups_desc {
+                finalized.reverse();
+            }
+        }
         if !self.order_by.is_empty() && finalized.len() > 1 {
             fallible_sort_by(&mut finalized, |(k_a, a_a), (k_b, a_b)| {
                 let ka_arr = [k_a.clone()];
@@ -5704,6 +5730,34 @@ fn try_compile_single_table_core(
             }
         }
         let access = compile_fast_agg_access(&ap, tbl, &td, &exact_cols, needs_rowid)?;
+        // Without a WHERE clause C satisfies the GROUP BY by walking an index that leads
+        // with the group column when there is one; if every such index is DESC the groups
+        // come out in descending order.
+        let groups_desc = sub_where.is_none() && {
+            let mut any = false;
+            let mut all_desc = true;
+            for idx in slot_schema.indexes_for_table(&tbl.name) {
+                if idx.where_clause.is_some() {
+                    continue;
+                }
+                let Some(ic) = idx.columns.first() else {
+                    continue;
+                };
+                if ic.expr.is_none()
+                    && matches!(
+                        gb_rc.src,
+                        FastColSrc::RecordCol { col_idx, .. }
+                            if ic.col_idx == Some(col_idx as usize)
+                    )
+                    && ic.sort_order.custom_collation.is_none()
+                    && ic.sort_order.collation == gb_coll
+                {
+                    any = true;
+                    all_desc &= ic.sort_order.desc;
+                }
+            }
+            any && all_desc
+        };
         return Some(FastReadPlan {
             db_id,
             column_names: col_names,
@@ -5714,6 +5768,7 @@ fn try_compile_single_table_core(
                 where_pred: compiled_where,
                 group_col: gb_rc.src,
                 group_collation: gb_coll,
+                groups_desc,
                 aggs: aggs.into_boxed_slice(),
                 projections: projs.into_boxed_slice(),
                 order_by: sort_specs,
@@ -6380,6 +6435,7 @@ fn try_compile_two_table_join_core(
                 post_join_where: post_where,
                 group_col: gb_rc.src,
                 group_collation: gb_coll,
+                groups_desc: false,
                 aggs: aggs.into_boxed_slice(),
                 projections: projs.into_boxed_slice(),
                 order_by: sort_specs,

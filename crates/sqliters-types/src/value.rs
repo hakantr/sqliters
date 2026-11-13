@@ -682,30 +682,12 @@ pub fn cmp_int_float(i: i64, r: f64) -> Ordering {
     }
 }
 
-/// Formats a floating-point number similarly to SQLite's `printf("%!.15g")` text rendering:
-/// whole numbers still include `.0` (e.g. `1.0`, matching SQLite `CAST(1 AS REAL)` -> `'1.0'`).
+/// Formats a floating-point number exactly as C SQLite renders a REAL as text
+/// (`vdbeMemRenderNum`, `"%!.17g"` through `sqlite3FpDecode`): `1.0`, `1000000000000000.0`,
+/// `1.0e+100`, `1.0e-05`, `0.66666666666666663`. See [`crate::fp`].
+#[inline]
 pub fn format_sqlite_real(r: f64) -> String {
-    if r.is_infinite() {
-        return if r.is_sign_positive() {
-            "Inf".to_owned()
-        } else {
-            "-Inf".to_owned()
-        };
-    }
-    if r == 0.0 {
-        return "0.0".to_owned();
-    }
-    let abs = r.abs();
-    if !(1e-4..1e15).contains(&abs) {
-        let s = format!("{r:e}");
-        return s;
-    }
-    let s = format!("{r}");
-    if !s.contains('.') && !s.contains('e') && !s.contains('E') {
-        format!("{s}.0")
-    } else {
-        s
-    }
+    crate::fp::real_to_text(r)
 }
 
 /// Returns `true` iff `b` is ASCII whitespace recognized by C SQLite's `sqlite3Isspace`.
@@ -740,66 +722,39 @@ pub fn sqlite_trim_ascii(s: &str) -> &str {
     &s[start..end]
 }
 
-fn is_well_formed_sqlite_number(trimmed: &str) -> (bool, bool) {
-    let bytes = trimmed.as_bytes();
-    if bytes.is_empty() {
-        return (false, false);
-    }
-    let mut i = usize::from(bytes[0] == b'+' || bytes[0] == b'-');
-    let mut saw_digit = false;
-    let mut is_float_syntax = false;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        saw_digit = true;
-        i += 1;
-    }
-    if i < bytes.len() && bytes[i] == b'.' {
-        is_float_syntax = true;
-        i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            saw_digit = true;
-            i += 1;
-        }
-    }
-    if !saw_digit {
-        return (false, false);
-    }
-    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
-        is_float_syntax = true;
-        i += 1;
-        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
-            i += 1;
-        }
-        let exp_start = i;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-        }
-        if i == exp_start {
-            return (false, false);
-        }
-    }
-    (i == bytes.len(), is_float_syntax)
-}
-
-/// Parses a string into `Value::Integer` or `Value::Real` if the entire ASCII-trimmed string is
-/// well-formed SQLite numeric text (`sqlite3AtoF` / `sqlite3Atoi64`).
+/// Parses a string into `Value::Integer` or `Value::Real` if the whole string (ASCII
+/// whitespace aside) is numeric text, exactly as C's `applyNumericAffinity` decides it
+/// (`sqlite3AtoF` return code, `alsoAnInt`, `sqlite3Atoi64`).
 ///
 /// Overflowing decimal exponents such as `'1e309'` evaluate to `Some(Value::Real(±f64::INFINITY))`,
 /// whereas non-numeric words such as `'inf'` or `'nan'` return `None`.
 pub fn parse_numeric_text(s: &str) -> Option<Value> {
-    let trimmed = sqlite_trim_ascii(s);
-    let (valid, is_float_syntax) = is_well_formed_sqlite_number(trimmed);
-    if !valid {
+    let z = s.as_bytes();
+    let (r, rc) = crate::fp::sqlite_atof(z);
+    if rc <= 0 {
         return None;
     }
-    if !is_float_syntax && let Ok(i) = trimmed.parse::<i64>() {
-        return Some(Value::Integer(i));
+    if rc & 2 == 0 {
+        // alsoAnInt(): the text looks like an integer.
+        let iv = if r < -9_223_372_036_854_774_784.0 {
+            i64::MIN
+        } else if r > 9_223_372_036_854_774_784.0 {
+            i64::MAX
+        } else {
+            r as i64
+        };
+        if r == 0.0
+            || ((iv as f64).to_bits() == r.to_bits()
+                && (-2_251_799_813_685_248..2_251_799_813_685_248).contains(&iv))
+        {
+            return Some(Value::Integer(iv));
+        }
+        let (i, irc) = crate::fp::sqlite_atoi64(z);
+        if irc == 0 {
+            return Some(Value::Integer(i));
+        }
     }
-    if let Ok(r) = trimmed.parse::<f64>()
-        && !r.is_nan()
-    {
-        return Some(Value::real(r));
-    }
-    None
+    Some(Value::real(r))
 }
 
 /// If `r` is an exact integer within `i64` range (and within `2^53` or exact power representable),
@@ -848,42 +803,8 @@ pub fn parse_leading_i64(s: &str) -> i64 {
     }
 }
 
+/// The value of the longest numeric prefix of `s` (`sqlite3AtoF`; 0.0 when there is none).
+#[inline]
 pub fn parse_leading_f64(s: &str) -> f64 {
-    let trimmed = sqlite_trim_ascii_start(s);
-    let bytes = trimmed.as_bytes();
-    let mut end = 0;
-    if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
-        end += 1;
-    }
-    let mut saw_digit = false;
-    while end < bytes.len() && bytes[end].is_ascii_digit() {
-        saw_digit = true;
-        end += 1;
-    }
-    if end < bytes.len() && bytes[end] == b'.' {
-        end += 1;
-        while end < bytes.len() && bytes[end].is_ascii_digit() {
-            saw_digit = true;
-            end += 1;
-        }
-    }
-    if !saw_digit {
-        return 0.0;
-    }
-    if end < bytes.len() && (bytes[end] == b'e' || bytes[end] == b'E') {
-        let exp_start = end;
-        end += 1;
-        if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
-            end += 1;
-        }
-        let mut exp_digits = false;
-        while end < bytes.len() && bytes[end].is_ascii_digit() {
-            exp_digits = true;
-            end += 1;
-        }
-        if !exp_digits {
-            end = exp_start;
-        }
-    }
-    trimmed[..end].parse::<f64>().unwrap_or(0.0)
+    crate::fp::sqlite_atof(s.as_bytes()).0
 }

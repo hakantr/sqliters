@@ -8,8 +8,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use sqliters::{
-    Connection, OpenFlags, QueryResult, SQLITE_SOURCE_ID, SQLITE_VERSION, StepResult, Value,
-    is_complete, types::format_sqlite_real,
+    Connection, OpenFlags, SQLITE_SOURCE_ID, SQLITE_VERSION, StepResult, Value, is_complete,
+    types::format_sqlite_real,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +29,10 @@ struct ShellConfig {
     null_value: String,
     readonly: bool,
     bail: bool,
+    /// `-header` (QRF_Always): the title row is shown even when the query returns no row.
+    headers_always: bool,
+    /// "tabs" mode: list layout with CSV quoting of text (`aModeInfo[]`: eText = csv).
+    list_csv_quote: bool,
 }
 
 impl Default for ShellConfig {
@@ -40,6 +44,8 @@ impl Default for ShellConfig {
             null_value: String::new(),
             readonly: false,
             bail: false,
+            headers_always: false,
+            list_csv_quote: false,
         }
     }
 }
@@ -72,7 +78,10 @@ fn main() -> ExitCode {
     };
 
     let mut positional = Vec::new();
-    let mut init_cmds: Vec<String> = Vec::new();
+    // Index of each positional argument in argv (1-based like C's `argv[i]`): error messages
+    // name the argument ("in 2nd command line argument").
+    let mut positional_idx: Vec<usize> = Vec::new();
+    let mut init_cmds: Vec<(usize, String)> = Vec::new();
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -102,11 +111,20 @@ fn main() -> ExitCode {
             "-tabs" | "--tabs" => {
                 cfg.mode = OutputMode::List;
                 cfg.separator = "\t".to_owned();
+                cfg.list_csv_quote = true;
             }
             "-json" | "--json" => cfg.mode = OutputMode::Json,
             "-line" | "--line" => cfg.mode = OutputMode::Line,
-            "-list" | "--list" => cfg.mode = OutputMode::List,
-            "-header" | "--header" => cfg.headers = true,
+            "-list" | "--list" => {
+                // modeChange(): every mode switch sets its own separators.
+                cfg.mode = OutputMode::List;
+                cfg.separator = "|".to_owned();
+                cfg.list_csv_quote = false;
+            }
+            "-header" | "--header" => {
+                cfg.headers = true;
+                cfg.headers_always = true;
+            }
             "-noheader" | "--noheader" => cfg.headers = false,
             "-separator" | "--separator" if i + 1 < args.len() => {
                 i += 1;
@@ -118,13 +136,18 @@ fn main() -> ExitCode {
             }
             "-cmd" if i + 1 < args.len() => {
                 i += 1;
-                init_cmds.push(args[i].clone());
+                init_cmds.push((i + 1, args[i].clone()));
             }
             other if other.starts_with('-') => {
-                eprintln!("Error: unknown option: {other}");
+                let argv0 = env::args().next().unwrap_or_else(|| "sqliters".to_owned());
+                eprintln!("{argv0}: Error: unknown option: {other}");
+                eprintln!("Use -help for a list of options.");
                 return ExitCode::from(1);
             }
-            other => positional.push(other.to_owned()),
+            other => {
+                positional.push(other.to_owned());
+                positional_idx.push(i + 1);
+            }
         }
         i += 1;
     }
@@ -141,17 +164,27 @@ fn main() -> ExitCode {
 
     let mut stdout = BufWriter::with_capacity(64 * 1024, io::stdout());
 
-    for cmd in &init_cmds {
-        if let Err(exit) = execute_shell_input(&mut conn, &mut cfg, cmd, &mut stdout) {
+    // shell.c main(): a failing `-cmd` argument does not stop the shell and does not change
+    // the exit code (unless -bail is given).
+    for (argi, cmd) in &init_cmds {
+        let failed =
+            execute_shell_input(&mut conn, &mut cfg, cmd, &mut stdout, *argi, interactive).is_err();
+        if cfg.bail {
             let _ = stdout.flush();
-            return exit;
+            return if failed {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            };
         }
     }
 
     // One-shot command mode: `sqliters mydb.db "SELECT ..." "..."`
     if positional.len() > 1 {
-        for cmd in &positional[1..] {
-            if let Err(exit) = execute_shell_input(&mut conn, &mut cfg, cmd, &mut stdout) {
+        for (cmd, argi) in positional[1..].iter().zip(&positional_idx[1..]) {
+            if let Err(exit) =
+                execute_shell_input(&mut conn, &mut cfg, cmd, &mut stdout, *argi, false)
+            {
                 let _ = stdout.flush();
                 return exit;
             }
@@ -179,10 +212,24 @@ fn main() -> ExitCode {
     let stdin = io::stdin();
     let outcome = if interactive {
         let mut reader = stdin.lock();
-        process_input_stream(&mut conn, &mut cfg, &mut reader, &mut stdout, true)
+        process_input_stream(
+            &mut conn,
+            &mut cfg,
+            &mut reader,
+            &mut stdout,
+            true,
+            &InputSrc::Stdin,
+        )
     } else {
         let mut reader = BufReader::with_capacity(64 * 1024, stdin.lock());
-        process_input_stream(&mut conn, &mut cfg, &mut reader, &mut stdout, false)
+        process_input_stream(
+            &mut conn,
+            &mut cfg,
+            &mut reader,
+            &mut stdout,
+            false,
+            &InputSrc::Stdin,
+        )
     };
     let _ = stdout.flush();
 
@@ -242,16 +289,237 @@ fn is_effectively_empty_sql(sql: &str) -> bool {
     true
 }
 
+/// Where a piece of SQL came from; decides the prefix of its error messages
+/// (`runOneSqlLine` in shell.c).
+enum InputSrc {
+    /// Standard input: `near line N:`.
+    Stdin,
+    /// A script read with `.read`: `near line N of FILE:`.
+    File(String),
+    /// A command-line argument: `in <ordinal> command line argument:`.
+    CmdLine(usize),
+}
+
+/// A failed SQL "line" (`shell_exec`): the error, whether it came from preparing a statement,
+/// and the SQL text that was being prepared (for the caret context).
+struct ShellSqlError {
+    err: sqliters::SqliteError,
+    in_prepare: bool,
+    sql: String,
+}
+
+/// `shell_error_context()`: the two extra lines of a parse error that show the SQL around the
+/// error offset with a caret, or nothing when the engine reported no offset.
+fn shell_error_context(sql: &str, offset: Option<usize>) -> String {
+    let Some(mut off) = offset else {
+        return String::new();
+    };
+    // (The C shell joins the input lines with '\n' and has no newline after the last one.)
+    let sql = sql.trim_end_matches(['\r', '\n']);
+    let bytes = sql.as_bytes();
+    if off >= bytes.len() {
+        return String::new();
+    }
+    let mut start = 0usize;
+    while off > 50 {
+        off -= 1;
+        start += 1;
+        while start < bytes.len() && (bytes[start] & 0xc0) == 0x80 {
+            start += 1;
+            off = off.saturating_sub(1);
+        }
+    }
+    let rest = &bytes[start..];
+    let mut len = rest.len();
+    if len > 78 {
+        len = 78;
+        while len > 0 && (rest[len] & 0xc0) == 0x80 {
+            len -= 1;
+        }
+    }
+    let code: Vec<u8> = rest[..len]
+        .iter()
+        .map(|&c| {
+            if c.is_ascii_whitespace() || c == 0x0b {
+                b' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let code = String::from_utf8_lossy(&code);
+    if off < 25 {
+        format!("\n  {code}\n  {:off$}^--- error here", "")
+    } else {
+        format!("\n  {code}\n  {:w$}error here ---^", "", w = off - 14)
+    }
+}
+
+/// Where the C library would report the error offset (`sqlite3_error_offset`) for the
+/// messages that name a token, when the engine reported none. The engine does not record the
+/// position of the offending identifier for these, so the first matching token of the
+/// statement is taken: the first use of the column / function, or the name in a CREATE
+/// statement. `None` for every other message (C has no offset for those either, e.g. "no such
+/// table").
+fn guess_error_offset(sql: &str, msg: &str) -> Option<usize> {
+    use sqliters::syntax::{TokenKind, dequote, tokenize};
+    enum Want<'m> {
+        /// A (possibly qualified) column name.
+        Column(&'m str),
+        /// A function name followed by `(`.
+        Function(&'m str),
+        /// The object name of a CREATE statement.
+        Created(&'m str),
+    }
+    let want = if let Some(rest) = msg.strip_prefix("no such column: ") {
+        let name = rest.split(" - should this be").next().unwrap_or(rest);
+        Want::Column(name.trim_matches('"'))
+    } else if let Some(rest) = msg.strip_prefix("ambiguous column name: ") {
+        Want::Column(rest)
+    } else if let Some(rest) = msg.strip_prefix("no such function: ") {
+        Want::Function(rest)
+    } else if let Some(rest) = msg
+        .strip_prefix("wrong number of arguments to function ")
+        .or_else(|| msg.strip_prefix("misuse of aggregate function "))
+        .or_else(|| msg.strip_prefix("misuse of window function "))
+        .or_else(|| msg.strip_prefix("misuse of aggregate: "))
+    {
+        Want::Function(rest.strip_suffix("()")?)
+    } else {
+        let rest = msg.strip_suffix(" already exists")?;
+        let name = rest
+            .strip_prefix("table ")
+            .or_else(|| rest.strip_prefix("index "))
+            .or_else(|| rest.strip_prefix("view "))
+            .or_else(|| rest.strip_prefix("trigger "))?;
+        Want::Created(name)
+    };
+    let mut tokens = tokenize(sql).ok()?;
+    // Only the statement that failed (the text starts with it).
+    if let Some(semi) = tokens.iter().position(|t| t.kind == TokenKind::Semi) {
+        tokens.truncate(semi);
+    }
+    let is_name = |i: usize, name: &str| -> bool {
+        tokens.get(i).is_some_and(|t| {
+            (t.kind == TokenKind::Id
+                || t.kind == TokenKind::QuotedId
+                || (t.kind != TokenKind::StringLiteral
+                    && t.text
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    && !t.text.is_empty()
+                    && !t.text.as_bytes()[0].is_ascii_digit()))
+                && dequote(t.text).eq_ignore_ascii_case(name)
+        })
+    };
+    match want {
+        Want::Function(name) => (0..tokens.len())
+            .find(|&i| {
+                is_name(i, name) && tokens.get(i + 1).is_some_and(|t| t.kind == TokenKind::Lp)
+            })
+            .map(|i| tokens[i].offset),
+        Want::Created(name) => (0..tokens.len())
+            .find(|&i| is_name(i, name))
+            .map(|i| tokens[i].offset),
+        Want::Column(full) => {
+            let parts: Vec<&str> = full.split('.').collect();
+            (0..tokens.len())
+                .find(|&i| {
+                    parts.iter().enumerate().all(|(k, p)| {
+                        is_name(i + 2 * k, p)
+                            && (k == 0
+                                || tokens
+                                    .get(i + 2 * k - 1)
+                                    .is_some_and(|t| t.kind == TokenKind::Dot))
+                    }) && !tokens
+                        .get(i + 2 * parts.len() - 1)
+                        .is_some_and(|t| t.kind == TokenKind::Lp)
+                })
+                .map(|i| tokens[i].offset)
+        }
+    }
+}
+
+/// English ordinal as printf's `%r` renders it (1st, 2nd, 3rd, 4th, 11th ...).
+fn ordinal(n: usize) -> String {
+    let x = n % 10;
+    let suffix = if x >= 4 || (n / 10) % 10 == 1 {
+        "th"
+    } else {
+        ["th", "st", "nd", "rd"][x]
+    };
+    format!("{n}{suffix}")
+}
+
+/// Prints the message of a failed SQL line in the format of the C shell:
+/// `Parse error near line N: msg[ (rc)]` plus the caret context, or `Error near line N: msg`
+/// for an error raised while stepping (the query result formatter reports those).
+fn report_sql_error(e: &ShellSqlError, src: &InputSrc, startline: usize, interactive: bool) {
+    let kind = if e.in_prepare { "Parse error" } else { "Error" };
+    let prefix = if interactive {
+        format!("{kind}:")
+    } else {
+        match src {
+            InputSrc::Stdin => format!("{kind} near line {startline}:"),
+            InputSrc::File(name) => format!("{kind} near line {startline} of {name}:"),
+            InputSrc::CmdLine(i) => {
+                format!("{kind} in {} command line argument:", ordinal(*i))
+            }
+        }
+    };
+    let mut tail = e.err.message.clone();
+    if e.in_prepare {
+        let rc = e.err.code as i32;
+        if rc > 1 {
+            tail.push_str(&format!(" ({rc})"));
+        }
+        let offset = e
+            .err
+            .offset
+            .or_else(|| guess_error_offset(&e.sql, &e.err.message));
+        tail.push_str(&shell_error_context(&e.sql, offset));
+    }
+    eprintln!("{prefix} {tail}");
+}
+
+/// Runs one accumulated SQL "line" (`runOneSqlLine`); returns `true` when it failed.
+fn run_one_sql_line<W: Write>(
+    conn: &Connection,
+    cfg: &ShellConfig,
+    sql: &str,
+    out: &mut W,
+    src: &InputSrc,
+    startline: usize,
+    interactive: bool,
+) -> bool {
+    // The C shell joins input lines with '\n' and passes no newline after the last one.
+    let sql = sql
+        .strip_suffix('\n')
+        .map_or(sql, |t| t.strip_suffix('\r').unwrap_or(t));
+    match execute_sql_buffer(conn, cfg, sql, out) {
+        Ok(()) => false,
+        Err(e) => {
+            // (No flush here: like the C shell, standard output is flushed once per input
+            // line, so the message precedes rows of the same line that are still buffered.)
+            report_sql_error(&e, src, startline, interactive);
+            true
+        }
+    }
+}
+
 fn process_input_stream<R: BufRead, W: Write>(
     conn: &mut Connection,
     cfg: &mut ShellConfig,
     reader: &mut R,
     out: &mut W,
     interactive: bool,
+    src: &InputSrc,
 ) -> StreamOutcome {
     let mut outcome = StreamOutcome::default();
     let mut sql_buf = String::new();
     let mut raw_line = String::new();
+    let mut lineno = 0usize;
+    let mut startline = 0usize;
 
     if interactive {
         let _ = write!(out, "sqliters> ");
@@ -259,11 +527,12 @@ fn process_input_stream<R: BufRead, W: Write>(
     }
 
     loop {
+        // process_input(): `fflush(p->out)` before every line that is read.
+        let _ = out.flush();
         raw_line.clear();
         let n_read = match reader.read_line(&mut raw_line) {
             Ok(n) => n,
             Err(e) => {
-                let _ = out.flush();
                 eprintln!("Error: {e}");
                 outcome.err_count += 1;
                 if cfg.bail {
@@ -275,11 +544,23 @@ fn process_input_stream<R: BufRead, W: Write>(
         if n_read == 0 {
             break;
         }
+        lineno += 1;
 
         if sql_buf.is_empty() {
-            let trimmed_start = raw_line.trim_start_matches([' ', '\t']);
-            if trimmed_start.starts_with('.') {
-                let cmd_line = trimmed_start.trim_end_matches(['\r', '\n']);
+            if is_effectively_empty_sql(&raw_line) {
+                if interactive {
+                    let _ = write!(out, "sqliters> ");
+                    let _ = out.flush();
+                }
+                continue;
+            }
+            // A dot-command or a `#` comment starts in the first column (shell.c
+            // process_input: `zLine[0]=='.' || zLine[0]=='#'`).
+            if raw_line.starts_with('#') {
+                continue;
+            }
+            if raw_line.starts_with('.') {
+                let cmd_line = raw_line.trim_end_matches(['\r', '\n']);
                 let dot_out = handle_dot_command(conn, cfg, cmd_line, out);
                 outcome.err_count += dot_out.err_count;
                 if dot_out.bailed {
@@ -296,19 +577,10 @@ fn process_input_stream<R: BufRead, W: Write>(
                 }
                 continue;
             }
-
-            if is_effectively_empty_sql(&raw_line) {
-                if interactive {
-                    let _ = write!(out, "sqliters> ");
-                    let _ = out.flush();
-                }
-                continue;
-            }
+            startline = lineno;
 
             if is_complete(&raw_line) {
-                if let Err(e) = execute_sql_buffer(conn, cfg, &raw_line, out) {
-                    let _ = out.flush();
-                    eprintln!("Error: {e}");
+                if run_one_sql_line(conn, cfg, &raw_line, out, src, startline, interactive) {
                     outcome.err_count += 1;
                     if cfg.bail {
                         outcome.bailed = true;
@@ -343,9 +615,7 @@ fn process_input_stream<R: BufRead, W: Write>(
         }
 
         if is_complete(&sql_buf) {
-            if let Err(e) = execute_sql_buffer(conn, cfg, &sql_buf, out) {
-                let _ = out.flush();
-                eprintln!("Error: {e}");
+            if run_one_sql_line(conn, cfg, &sql_buf, out, src, startline, interactive) {
                 outcome.err_count += 1;
                 if cfg.bail {
                     outcome.bailed = true;
@@ -364,10 +634,8 @@ fn process_input_stream<R: BufRead, W: Write>(
     }
 
     if !is_effectively_empty_sql(&sql_buf) {
-        sql_buf.push(';');
-        if let Err(e) = execute_sql_buffer(conn, cfg, &sql_buf, out) {
-            let _ = out.flush();
-            eprintln!("Parse error: {e}");
+        // "This may be incomplete. Let the SQL parser deal with that."
+        if run_one_sql_line(conn, cfg, &sql_buf, out, src, startline, interactive) {
             outcome.err_count += 1;
             if cfg.bail {
                 outcome.bailed = true;
@@ -383,30 +651,32 @@ fn execute_shell_input<W: Write>(
     cfg: &mut ShellConfig,
     input: &str,
     out: &mut W,
+    arg_index: usize,
+    interactive: bool,
 ) -> Result<(), ExitCode> {
-    let trimmed = input.trim_start_matches([' ', '\t']);
-    if trimmed.trim().is_empty() {
+    let _ = interactive;
+    if input.trim().is_empty() {
         return Ok(());
     }
-    if trimmed.starts_with('.') {
-        let cmd_line = trimmed.trim_end_matches(['\r', '\n']);
+    if input.starts_with('.') {
+        let cmd_line = input.trim_end_matches(['\r', '\n']);
         let dot_out = handle_dot_command(conn, cfg, cmd_line, out);
         if dot_out.bailed || dot_out.err_count > 0 {
             return Err(ExitCode::from(1));
         }
         return Ok(());
     }
-    if !input.contains('\n') && !input.contains('\r') && is_complete(input) {
-        if let Err(e) = execute_sql_buffer(conn, cfg, input, out) {
-            let _ = out.flush();
-            eprintln!("Error: {e}");
-            return Err(ExitCode::from(1));
-        }
-        return Ok(());
-    }
-    let mut cursor = io::Cursor::new(input.as_bytes());
-    let outcome = process_input_stream(conn, cfg, &mut cursor, out, false);
-    if outcome.bailed || outcome.err_count > 0 {
+    // A command-line argument is one SQL "line" whatever it contains (`runOneSqlLine(&data,
+    // azCmd[i], "cmdline", aiCmd[i])`).
+    if run_one_sql_line(
+        conn,
+        cfg,
+        input,
+        out,
+        &InputSrc::CmdLine(arg_index),
+        0,
+        false,
+    ) {
         return Err(ExitCode::from(1));
     }
     Ok(())
@@ -565,117 +835,264 @@ fn execute_sql_buffer<W: Write>(
     cfg: &ShellConfig,
     mut sql: &str,
     out: &mut W,
-) -> sqliters::Result<()> {
+) -> Result<(), ShellSqlError> {
     if is_pure_non_returning_batch_sql(sql) {
-        return conn.execute_batch(sql);
+        return match conn.execute_batch(sql) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                // The batch stopped at its first failing statement. It consists of DML and
+                // transaction control only, so preparing the statements again tells whether
+                // that one failed to compile (C: "Parse error") or failed while running.
+                let mut rest = sql;
+                while !is_effectively_empty_sql(rest) {
+                    rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+                    match conn.prepare(rest) {
+                        Err(pe) => {
+                            return Err(ShellSqlError {
+                                err: pe,
+                                in_prepare: true,
+                                sql: rest.to_owned(),
+                            });
+                        }
+                        Ok(stmt) => {
+                            let tail_len = stmt.tail().len();
+                            let _ = stmt.finalize();
+                            if tail_len >= rest.len() {
+                                break;
+                            }
+                            rest = &rest[rest.len() - tail_len..];
+                        }
+                    }
+                }
+                Err(ShellSqlError {
+                    err,
+                    in_prepare: false,
+                    sql: String::new(),
+                })
+            }
+        };
     }
     while !is_effectively_empty_sql(sql) {
-        let mut stmt = conn.prepare(sql)?;
+        // shell_exec: `while( IsSpace(zSql[0]) ) zSql++;` (error offsets count from here).
+        sql = sql.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        let mut stmt = conn.prepare(sql).map_err(|err| ShellSqlError {
+            err,
+            in_prepare: true,
+            sql: sql.to_owned(),
+        })?;
         let tail_len = stmt.tail().len();
         let cur_len = sql.len();
-        if matches!(
-            cfg.mode,
-            OutputMode::List | OutputMode::Csv | OutputMode::Line
-        ) {
-            let col_names: Vec<String> = stmt.column_names().to_vec();
-            let has_cols = !col_names.is_empty();
-            let max_w = if cfg.mode == OutputMode::Line && has_cols {
-                col_names
-                    .iter()
-                    .map(|s| s.chars().count())
-                    .max()
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            let mut row_idx = 0usize;
-            let step_res = (|| -> sqliters::Result<()> {
-                while let StepResult::Row(r) = stmt.step()? {
-                    if !has_cols {
-                        continue;
-                    }
-                    match cfg.mode {
-                        OutputMode::List => {
-                            if row_idx == 0 && cfg.headers {
-                                let _ = writeln!(out, "{}", col_names.join(&cfg.separator));
-                            }
-                            let sep_bytes = cfg.separator.as_bytes();
-                            for (ci, v) in r.values().iter().enumerate() {
-                                if ci > 0 {
-                                    let _ = out.write_all(sep_bytes);
-                                }
-                                write_cell_value(out, v, &cfg.null_value);
-                            }
-                            let _ = out.write_all(b"\n");
-                        }
-                        OutputMode::Csv => {
-                            if row_idx == 0 && cfg.headers {
-                                let hdr: Vec<String> =
-                                    col_names.iter().map(|s| csv_escape(s)).collect();
-                                let _ = writeln!(out, "{}", hdr.join(","));
-                            }
-                            for (ci, v) in r.values().iter().enumerate() {
-                                if ci > 0 {
-                                    let _ = out.write_all(b",");
-                                }
-                                let esc = csv_escape(&format_cell_value(v, &cfg.null_value));
-                                let _ = out.write_all(esc.as_bytes());
-                            }
-                            let _ = out.write_all(b"\n");
-                        }
-                        OutputMode::Line => {
-                            if row_idx > 0 {
-                                let _ = out.write_all(b"\n");
-                            }
-                            for (ci, v) in r.values().iter().enumerate() {
-                                let val = format_cell_value(v, &cfg.null_value);
-                                let _ = writeln!(
-                                    out,
-                                    "{:>width$} = {val}",
-                                    col_names[ci],
-                                    width = max_w
-                                );
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
-                    row_idx += 1;
-                }
-                Ok(())
-            })();
-            let fin_res = stmt.finalize();
-            step_res?;
-            fin_res?;
-            if row_idx > 0 {
-                let _ = out.flush();
+        let col_names: Vec<String> = stmt.column_names().to_vec();
+        let mut printer = RowPrinter::new(cfg, &col_names);
+        let step_res = (|| -> sqliters::Result<()> {
+            while let StepResult::Row(r) = stmt.step()? {
+                printer.row(out, r.values());
             }
-        } else {
-            let step_res = (|| -> sqliters::Result<QueryResult> {
-                let mut rows = Vec::new();
-                while let StepResult::Row(r) = stmt.step()? {
-                    rows.push(r);
-                }
-                Ok(QueryResult {
-                    column_names: stmt.column_names().to_vec(),
-                    rows,
-                })
-            })();
-            let fin_res = stmt.finalize();
-            let qres = step_res?;
-            fin_res?;
-            if !qres.rows.is_empty()
-                || (cfg.headers && !qres.column_names.is_empty() && cfg.mode == OutputMode::Json)
-            {
-                render_query_result(&qres, cfg, out);
-                let _ = out.flush();
-            }
-        }
+            Ok(())
+        })();
+        // Rows that were produced before a runtime error are still shown (the C shell writes
+        // each row as it is stepped; columnar modes show nothing on an error).
+        printer.finish(out, step_res.is_ok());
+        let fin_res = stmt.finalize();
+        step_res.and(fin_res).map_err(|err| ShellSqlError {
+            err,
+            in_prepare: false,
+            sql: String::new(),
+        })?;
         if tail_len == cur_len {
             break;
         }
         sql = &sql[(cur_len - tail_len)..];
     }
     Ok(())
+}
+
+/// Per-statement output state: the simple modes write each row as it arrives, the columnar
+/// modes (box, table) collect the rows to size the columns.
+struct RowPrinter<'a> {
+    cfg: &'a ShellConfig,
+    names: &'a [String],
+    n_row: usize,
+    /// Rendered cells of the columnar modes: `(text bytes, is_number)`.
+    cells: Vec<Vec<(Vec<u8>, bool)>>,
+    line_width: usize,
+}
+
+impl<'a> RowPrinter<'a> {
+    fn new(cfg: &'a ShellConfig, names: &'a [String]) -> Self {
+        let line_width = names
+            .iter()
+            .map(|s| display_width(s.as_bytes()))
+            .max()
+            .unwrap_or(0);
+        Self {
+            cfg,
+            names,
+            n_row: 0,
+            cells: Vec::new(),
+            line_width,
+        }
+    }
+
+    fn row<W: Write>(&mut self, out: &mut W, vals: &[Value]) {
+        let cfg = self.cfg;
+        match cfg.mode {
+            OutputMode::List => {
+                if self.n_row == 0 {
+                    self.title(out);
+                }
+                // A statement without result columns still ends each row with the row
+                // separator (PRAGMA incremental_vacuum: one empty line per freed page).
+                let sep_bytes = cfg.separator.as_bytes();
+                for (ci, v) in vals.iter().enumerate() {
+                    if ci > 0 {
+                        let _ = out.write_all(sep_bytes);
+                    }
+                    match v {
+                        Value::Text(t) if cfg.list_csv_quote => {
+                            let t = t.split('\0').next().unwrap_or("");
+                            let mut b = Vec::new();
+                            escape_ctrl_into(&mut b, csv_escape_sep(t, &cfg.separator).as_bytes());
+                            let _ = out.write_all(&b);
+                        }
+                        _ => write_cell_value(out, v, &cfg.null_value),
+                    }
+                }
+                let _ = out.write_all(b"\n");
+            }
+            OutputMode::Csv => {
+                if self.n_row == 0 {
+                    self.title(out);
+                }
+                for (ci, v) in vals.iter().enumerate() {
+                    if ci > 0 {
+                        let _ = out.write_all(b",");
+                    }
+                    match v {
+                        // CSV: a NULL is empty, text is quoted when it needs to be, a blob
+                        // is written as it is (shell_exec: eBlob = text).
+                        Value::Null => {}
+                        Value::Blob(b) => {
+                            let mut e = Vec::with_capacity(b.len());
+                            escape_ctrl_into(&mut e, b);
+                            let _ = out.write_all(&e);
+                        }
+                        Value::Text(t) => {
+                            let t = t.split('\0').next().unwrap_or("");
+                            let mut e = Vec::with_capacity(t.len() + 2);
+                            escape_ctrl_into(&mut e, csv_escape(t).as_bytes());
+                            let _ = out.write_all(&e);
+                        }
+                        other => {
+                            let _ = out.write_all(format_cell_value(other, "").as_bytes());
+                        }
+                    }
+                }
+                let _ = out.write_all(b"\n");
+            }
+            OutputMode::Line => {
+                if self.names.is_empty() {
+                    self.n_row += 1;
+                    return;
+                }
+                if self.n_row > 0 {
+                    let _ = out.write_all(b"\n");
+                }
+                for (ci, v) in vals.iter().enumerate() {
+                    let name = &self.names[ci];
+                    let pad = self
+                        .line_width
+                        .saturating_sub(display_width(name.as_bytes()));
+                    let mut val = Vec::new();
+                    render_plain_value(&mut val, v, &cfg.null_value);
+                    // Continuation lines of a multi-line value are indented to the value.
+                    // (Line mode keeps a CR in front of the line break.)
+                    let mut pieces: Vec<&[u8]> = val.split(|&c| c == b'\n').collect();
+                    if pieces.len() > 1 && pieces.last().is_some_and(|l| l.is_empty()) {
+                        pieces.pop();
+                    }
+                    for (li, piece) in pieces.iter().enumerate() {
+                        if li == 0 {
+                            let _ = write!(out, "{:pad$}{name}: ", "");
+                        } else {
+                            let _ = write!(out, "{:w$}", "", w = self.line_width + 2);
+                        }
+                        let _ = out.write_all(piece);
+                        let _ = out.write_all(b"\n");
+                    }
+                }
+            }
+            OutputMode::Json => {
+                // (Rows are joined with "," on one line: `crates/sqliters-cli/tests/
+                // cli_smoke.rs` expects that layout; C puts each row on its own line.)
+                let _ = out.write_all(if self.n_row == 0 { b"[{" } else { b",{" });
+                for (ci, v) in vals.iter().enumerate() {
+                    if ci > 0 {
+                        let _ = out.write_all(b",");
+                    }
+                    let _ = write!(out, "{}:{}", json_quote(&self.names[ci]), json_value(v));
+                }
+                let _ = out.write_all(b"}");
+            }
+            OutputMode::Table | OutputMode::Box => {
+                let row = vals
+                    .iter()
+                    .map(|v| {
+                        let mut b = Vec::new();
+                        render_plain_value(&mut b, v, &cfg.null_value);
+                        (b, matches!(v, Value::Integer(_) | Value::Real(_)))
+                    })
+                    .collect();
+                self.cells.push(row);
+            }
+        }
+        self.n_row += 1;
+    }
+
+    /// The title row of the list and CSV modes (`qrfSimpleTitle`).
+    fn title<W: Write>(&self, out: &mut W) {
+        let cfg = self.cfg;
+        if !cfg.headers || self.names.is_empty() {
+            return;
+        }
+        let mut line = Vec::new();
+        for (i, n) in self.names.iter().enumerate() {
+            if i > 0 {
+                line.extend_from_slice(cfg.separator.as_bytes());
+            }
+            if cfg.mode == OutputMode::Csv {
+                line.extend_from_slice(csv_escape(n).as_bytes());
+            } else if cfg.list_csv_quote {
+                escape_ctrl_into(&mut line, csv_escape_sep(n, &cfg.separator).as_bytes());
+            } else {
+                escape_ctrl_into(&mut line, n.as_bytes());
+            }
+        }
+        line.push(b'\n');
+        let _ = out.write_all(&line);
+    }
+
+    fn finish<W: Write>(&mut self, out: &mut W, ok: bool) {
+        // `-header`: titles even for an empty result (QRF_Always).
+        if ok
+            && self.n_row == 0
+            && self.cfg.headers_always
+            && matches!(self.cfg.mode, OutputMode::List | OutputMode::Csv)
+        {
+            self.title(out);
+        }
+        match self.cfg.mode {
+            OutputMode::Json => {
+                if self.n_row > 0 {
+                    let _ = out.write_all(b"]\n");
+                }
+            }
+            OutputMode::Table | OutputMode::Box if ok && !self.names.is_empty() => {
+                render_columnar(out, self.cfg, self.names, &self.cells);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Parses a dot-command line using C `shell.c` quoting rules (`'...'` literal, `"..."` with
@@ -882,6 +1299,26 @@ fn handle_dot_command<W: Write>(
             }
             Err(e) => record_dot_error(&mut outcome, cfg, out, &format!("Error: {e}")),
         },
+        ".dbconfig" => {
+            // The C shell opens databases with SQLITE_DBCONFIG_DEFENSIVE on; this engine has no
+            // defensive mode, i.e. it always behaves like ".dbconfig defensive off". The
+            // command is accepted so that one script can drive both shells.
+            match (
+                parts.get(1).map(String::as_str),
+                parts.get(2).map(String::as_str),
+            ) {
+                (Some("defensive"), Some("off" | "0" | "no" | "false"))
+                | (Some("defensive"), None) => {
+                    let _ = writeln!(out, "{:>19} off", "defensive");
+                }
+                _ => record_dot_error(
+                    &mut outcome,
+                    cfg,
+                    out,
+                    "Error: only \".dbconfig defensive off\" is supported",
+                ),
+            }
+        }
         ".dbinfo" => match (
             conn.database_header(),
             conn.page_count(),
@@ -914,7 +1351,11 @@ fn handle_dot_command<W: Write>(
                 match m.to_ascii_lowercase().as_str() {
                     "box" => cfg.mode = OutputMode::Box,
                     "table" | "column" => cfg.mode = OutputMode::Table,
-                    "list" => cfg.mode = OutputMode::List,
+                    "list" => {
+                        cfg.mode = OutputMode::List;
+                        cfg.separator = "|".to_owned();
+                        cfg.list_csv_quote = false;
+                    }
                     "csv" => {
                         cfg.mode = OutputMode::Csv;
                         cfg.separator = ",".to_owned();
@@ -922,10 +1363,12 @@ fn handle_dot_command<W: Write>(
                     "tabs" => {
                         cfg.mode = OutputMode::List;
                         cfg.separator = "\t".to_owned();
+                        cfg.list_csv_quote = true;
                     }
                     "ascii" => {
                         cfg.mode = OutputMode::List;
                         cfg.separator = "\x1f".to_owned();
+                        cfg.list_csv_quote = false;
                     }
                     "json" => cfg.mode = OutputMode::Json,
                     "line" => cfg.mode = OutputMode::Line,
@@ -996,23 +1439,21 @@ fn handle_dot_command<W: Write>(
             };
             match std::fs::read(Path::new(fpath)) {
                 Ok(bytes) => {
-                    if cfg.bail
-                        && let Ok(sql_text) = std::str::from_utf8(&bytes)
-                        && is_pure_non_returning_batch_sql(sql_text)
-                    {
-                        if let Err(e) = conn.execute_batch(sql_text) {
-                            record_dot_error(&mut outcome, cfg, out, &format!("Error: {e}"));
-                        }
-                    } else {
-                        let mut cursor = io::Cursor::new(bytes.as_slice());
-                        let sub = process_input_stream(conn, cfg, &mut cursor, out, false);
-                        outcome.err_count += sub.err_count;
-                        if sub.bailed {
-                            outcome.bailed = true;
-                        }
-                        if sub.quit {
-                            outcome.quit = true;
-                        }
+                    let mut cursor = io::Cursor::new(bytes.as_slice());
+                    let sub = process_input_stream(
+                        conn,
+                        cfg,
+                        &mut cursor,
+                        out,
+                        false,
+                        &InputSrc::File(fpath.clone()),
+                    );
+                    outcome.err_count += sub.err_count;
+                    if sub.bailed {
+                        outcome.bailed = true;
+                    }
+                    if sub.quit {
+                        outcome.quit = true;
                     }
                 }
                 Err(e) => record_dot_error(
@@ -1521,158 +1962,232 @@ fn csv_read_record_streaming<R: BufRead>(
     }
 }
 
-fn render_query_result<W: Write>(res: &QueryResult, cfg: &ShellConfig, out: &mut W) {
-    let ncols = res.column_names.len();
-    if ncols == 0 {
+/// Display width in terminal cells of the code point `u` (`sqlite3_qrf_wcwidth`,
+/// simplified: East Asian wide characters count two, combining marks zero).
+fn char_width(u: u32) -> usize {
+    if u < 0x20 || (0x300..0x370).contains(&u) || (0x200b..=0x200f).contains(&u) {
+        0
+    } else if (0x1100..0x1160).contains(&u)
+        || (0x2e80..0xa4d0).contains(&u)
+        || (0xac00..0xd7a4).contains(&u)
+        || (0xf900..0xfb00).contains(&u)
+        || (0xfe30..0xfe70).contains(&u)
+        || (0xff00..0xff61).contains(&u)
+        || (0xffe0..0xffe7).contains(&u)
+        || (0x1f300..0x1f650).contains(&u)
+        || (0x1f900..0x1fa00).contains(&u)
+        || (0x20000..0x3fffe).contains(&u)
+    {
+        2
+    } else {
+        1
+    }
+}
+
+/// Display width of one line of text (`qrfDisplayWidth`): a tab moves to the next multiple
+/// of eight, a byte that is not part of valid UTF-8 counts as one cell.
+fn display_width(z: &[u8]) -> usize {
+    let mut w = 0usize;
+    let mut i = 0usize;
+    while i < z.len() {
+        let c = z[i];
+        if c == b'\t' {
+            w = (w + 8) & !7;
+            i += 1;
+        } else if c < 0x80 {
+            w += usize::from(c >= 0x20);
+            i += 1;
+        } else {
+            let len = match c {
+                0xc0..=0xdf => 2,
+                0xe0..=0xef => 3,
+                0xf0..=0xf7 => 4,
+                _ => 1,
+            };
+            match z.get(i..i + len).and_then(|b| std::str::from_utf8(b).ok()) {
+                Some(s) => {
+                    w += s.chars().next().map_or(1, |ch| char_width(ch as u32));
+                    i += len;
+                }
+                None => {
+                    w += 1;
+                    i += 1;
+                }
+            }
+        }
+    }
+    w
+}
+
+/// The display lines of a rendered value: split at LF, a CR in front of the LF dropped, no
+/// empty line after a final line break.
+fn split_lines(z: &[u8]) -> Vec<&[u8]> {
+    let mut v: Vec<&[u8]> = z
+        .split(|&c| c == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
+        .collect();
+    if v.len() > 1 && v.last().is_some_and(|l| l.is_empty()) {
+        v.pop();
+    }
+    v
+}
+
+/// Appends `z` with every tab expanded to the next multiple of eight
+/// (`qrfAppendWithTabs`).
+fn append_with_tabs(out: &mut Vec<u8>, z: &[u8]) {
+    let mut col = 0usize;
+    let mut start = 0usize;
+    for (i, &c) in z.iter().enumerate() {
+        if c == b'\t' {
+            out.extend_from_slice(&z[start..i]);
+            col += display_width(&z[start..i]);
+            let next = (col + 8) & !7;
+            out.resize(out.len() + (next - col), b' ');
+            col = next;
+            start = i + 1;
+        }
+    }
+    out.extend_from_slice(&z[start..]);
+}
+
+/// `qrfEscape(QRF_ESC_Ascii)`: a control character other than tab, newline and the CR of a
+/// CR-LF pair is shown as `^X`.
+fn escape_ctrl_into(out: &mut Vec<u8>, z: &[u8]) {
+    for (i, &c) in z.iter().enumerate() {
+        if c > 0x1f || c == b'\t' || c == b'\n' || (c == b'\r' && z.get(i + 1) == Some(&b'\n')) {
+            out.push(c);
+        } else {
+            out.push(b'^');
+            out.push(0x40 + c);
+        }
+    }
+}
+
+/// A value as the plain-text modes (list, line, box, table) show it: text ends at its first
+/// NUL like a C string, a blob is shown as text, control characters are escaped.
+fn render_plain_value(out: &mut Vec<u8>, v: &Value, null_str: &str) {
+    match v {
+        Value::Null => out.extend_from_slice(null_str.as_bytes()),
+        Value::Integer(i) => out.extend_from_slice(i.to_string().as_bytes()),
+        Value::Real(r) => out.extend_from_slice(format_sqlite_real(*r).as_bytes()),
+        Value::Text(s) => {
+            let b = s.as_bytes();
+            let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+            escape_ctrl_into(out, &b[..end]);
+        }
+        Value::Blob(b) => escape_ctrl_into(out, b),
+    }
+}
+
+/// Box and table output (`qrfColumnar` without a screen-width limit): titles centred,
+/// numbers right-aligned, other values left-aligned; a value with line breaks makes every
+/// row multi-line and puts a separator between the rows.
+fn render_columnar<W: Write>(
+    out: &mut W,
+    cfg: &ShellConfig,
+    names: &[String],
+    rows: &[Vec<(Vec<u8>, bool)>],
+) {
+    let ncol = names.len();
+    let is_box = cfg.mode == OutputMode::Box;
+    let titles = cfg.headers;
+    if rows.is_empty() && !titles {
         return;
     }
-
-    match cfg.mode {
-        OutputMode::List => {
-            if cfg.headers {
-                let _ = writeln!(out, "{}", res.column_names.join(&cfg.separator));
-            }
-            for r in &res.rows {
-                for (ci, v) in r.values().iter().enumerate() {
-                    if ci > 0 {
-                        let _ = write!(out, "{}", cfg.separator);
-                    }
-                    write_cell_value(out, v, &cfg.null_value);
-                }
-                let _ = writeln!(out);
-            }
-        }
-        OutputMode::Csv => {
-            if cfg.headers {
-                let hdr: Vec<String> = res.column_names.iter().map(|s| csv_escape(s)).collect();
-                let _ = writeln!(out, "{}", hdr.join(","));
-            }
-            for r in &res.rows {
-                let esc: Vec<String> = r
-                    .values()
-                    .iter()
-                    .map(|v| csv_escape(&format_cell_value(v, &cfg.null_value)))
-                    .collect();
-                let _ = writeln!(out, "{}", esc.join(","));
-            }
-        }
-        OutputMode::Line => {
-            let max_w = res
-                .column_names
+    let mut widths = vec![0usize; ncol];
+    let mut multi = false;
+    /// One table row: per column the display lines and whether the value is a number.
+    type GridRow<'g> = Vec<(Vec<&'g [u8]>, bool)>;
+    let mut grid: Vec<GridRow<'_>> = Vec::with_capacity(rows.len() + 1);
+    if titles {
+        grid.push(
+            names
                 .iter()
-                .map(|s| s.chars().count())
-                .max()
-                .unwrap_or(0);
-            for (ri, r) in res.rows.iter().enumerate() {
-                if ri > 0 {
-                    let _ = writeln!(out);
-                }
-                for (ci, v) in r.values().iter().enumerate() {
-                    let val = format_cell_value(v, &cfg.null_value);
-                    let _ = writeln!(
-                        out,
-                        "{:>width$} = {val}",
-                        res.column_names[ci],
-                        width = max_w
-                    );
-                }
+                .map(|n| (split_lines(n.as_bytes()), false))
+                .collect(),
+        );
+    }
+    for r in rows {
+        grid.push(r.iter().map(|(t, num)| (split_lines(t), *num)).collect());
+    }
+    for r in &grid {
+        for (ci, (lines, _)) in r.iter().enumerate() {
+            if lines.len() > 1 {
+                multi = true;
             }
-        }
-        OutputMode::Json => {
-            let _ = write!(out, "[");
-            for (ri, row) in res.rows.iter().enumerate() {
-                if ri > 0 {
-                    let _ = write!(out, ",");
-                }
-                let _ = write!(out, "{{");
-                for (ci, v) in row.values().iter().enumerate() {
-                    if ci > 0 {
-                        let _ = write!(out, ",");
-                    }
-                    let _ = write!(
-                        out,
-                        "{}:{}",
-                        json_quote(&res.column_names[ci]),
-                        json_value(v)
-                    );
-                }
-                let _ = write!(out, "}}");
-            }
-            let _ = writeln!(out, "]");
-        }
-        OutputMode::Table | OutputMode::Box => {
-            let formatted_rows: Vec<Vec<String>> = res
-                .rows
-                .iter()
-                .map(|r| {
-                    r.values()
-                        .iter()
-                        .map(|v| format_cell_value(v, &cfg.null_value))
-                        .collect()
-                })
-                .collect();
-
-            let mut widths: Vec<usize> = res
-                .column_names
-                .iter()
-                .map(|h| if cfg.headers { h.chars().count() } else { 0 })
-                .collect();
-            for r in &formatted_rows {
-                for (ci, cell) in r.iter().enumerate() {
-                    widths[ci] = widths[ci].max(cell.chars().count());
-                }
-            }
-
-            if cfg.mode == OutputMode::Box {
-                print_box_border(out, "┌", "┬", "┐", "─", &widths);
-                if cfg.headers {
-                    print_box_row(out, &res.column_names, &widths, "│");
-                    print_box_border(out, "├", "┼", "┤", "─", &widths);
-                }
-                for r in &formatted_rows {
-                    print_box_row(out, r, &widths, "│");
-                }
-                print_box_border(out, "╰", "┴", "╯", "─", &widths);
-            } else {
-                print_box_border(out, "+", "+", "+", "-", &widths);
-                if cfg.headers {
-                    print_box_row(out, &res.column_names, &widths, "|");
-                    print_box_border(out, "+", "+", "+", "-", &widths);
-                }
-                for r in &formatted_rows {
-                    print_box_row(out, r, &widths, "|");
-                }
-                print_box_border(out, "+", "+", "+", "-", &widths);
+            for l in lines {
+                widths[ci] = widths[ci].max(display_width(l));
             }
         }
     }
-}
-
-fn print_box_border<W: Write>(
-    out: &mut W,
-    left: &str,
-    mid: &str,
-    right: &str,
-    horiz: &str,
-    widths: &[usize],
-) {
-    let _ = write!(out, "{left}");
-    for (i, &w) in widths.iter().enumerate() {
-        if i > 0 {
-            let _ = write!(out, "{mid}");
+    let sep_line = |out: &mut W, l: &str, m: &str, r: &str, h: &str| {
+        let mut line = String::from(l);
+        for (i, w) in widths.iter().enumerate() {
+            if i > 0 {
+                line.push_str(m);
+            }
+            line.push_str(&h.repeat(w + 2));
         }
-        let _ = write!(out, "{}", horiz.repeat(w + 2));
+        line.push_str(r);
+        let _ = writeln!(out, "{line}");
+    };
+    let bar: &[u8] = if is_box { "│".as_bytes() } else { b"|" };
+    if is_box {
+        sep_line(out, "╭", "┬", "╮", "─");
+    } else {
+        sep_line(out, "+", "+", "+", "-");
     }
-    let _ = writeln!(out, "{right}");
-}
-
-fn print_box_row<W: Write>(out: &mut W, cells: &[String], widths: &[usize], sep: &str) {
-    let _ = write!(out, "{sep}");
-    for (i, cell) in cells.iter().enumerate() {
-        let pad = widths[i].saturating_sub(cell.chars().count());
-        let _ = write!(out, " {cell}{} {sep}", " ".repeat(pad));
+    let n_grid = grid.len();
+    for (ri, r) in grid.iter().enumerate() {
+        let is_title = titles && ri == 0;
+        let height = r.iter().map(|(l, _)| l.len()).max().unwrap_or(1);
+        for li in 0..height {
+            let mut line: Vec<u8> = bar.to_vec();
+            for (ci, (lines, num)) in r.iter().enumerate() {
+                let text: &[u8] = lines.get(li).copied().unwrap_or(b"");
+                let ws = widths[ci].saturating_sub(display_width(text));
+                line.push(b' ');
+                let (before, after) = if is_title {
+                    (ws / 2, ws - ws / 2)
+                } else if *num {
+                    (ws, 0)
+                } else {
+                    (0, ws)
+                };
+                line.resize(line.len() + before, b' ');
+                append_with_tabs(&mut line, text);
+                line.resize(line.len() + after, b' ');
+                line.push(b' ');
+                line.extend_from_slice(bar);
+            }
+            line.push(b'\n');
+            let _ = out.write_all(&line);
+        }
+        if (ri == 0 || multi) && ri + 1 < n_grid {
+            if is_title {
+                if is_box {
+                    sep_line(out, "╞", "╪", "╡", "═");
+                } else {
+                    sep_line(out, "+", "+", "+", "-");
+                }
+            } else if multi {
+                if is_box {
+                    sep_line(out, "├", "┼", "┤", "─");
+                } else {
+                    sep_line(out, "+", "+", "+", "-");
+                }
+            }
+        }
     }
-    let _ = writeln!(out);
+    if is_box {
+        if rows.is_empty() {
+            sep_line(out, "╘", "╧", "╛", "═");
+        } else {
+            sep_line(out, "╰", "┴", "╯", "─");
+        }
+    } else {
+        sep_line(out, "+", "+", "+", "-");
+    }
 }
 
 fn write_cell_value<W: Write>(out: &mut W, v: &Value, null_str: &str) {
@@ -1704,14 +2219,30 @@ fn write_cell_value<W: Write>(out: &mut W, v: &Value, null_str: &str) {
             let _ = out.write_all(&buf[pos..]);
         }
         Value::Real(r) => {
-            let s = format_sqlite_real(*r);
-            let _ = out.write_all(s.as_bytes());
+            let mut buf = [0u8; sqliters::types::fp::REAL_TEXT_MAX];
+            let n = sqliters::types::write_real_text(*r, &mut buf);
+            let _ = out.write_all(&buf[..n]);
         }
         Value::Text(s) => {
-            let _ = out.write_all(s.as_bytes());
+            // Text is a C string for the shell (ends at a NUL); control characters are
+            // shown as ^X. The common case has neither and is written as it is.
+            let b = s.as_bytes();
+            if b.iter().all(|&c| c > 0x1f || c == b'\t' || c == b'\n') {
+                let _ = out.write_all(b);
+            } else {
+                let mut esc = Vec::with_capacity(b.len() + 8);
+                render_plain_value(&mut esc, v, null_str);
+                let _ = out.write_all(&esc);
+            }
         }
         Value::Blob(b) => {
-            let _ = out.write_all(String::from_utf8_lossy(b).as_bytes());
+            if b.iter().all(|&c| c > 0x1f || c == b'\t' || c == b'\n') {
+                let _ = out.write_all(b);
+            } else {
+                let mut esc = Vec::with_capacity(b.len() + 8);
+                escape_ctrl_into(&mut esc, b);
+                let _ = out.write_all(&esc);
+            }
         }
     }
 }
@@ -1744,8 +2275,29 @@ fn format_sql_literal(v: &Value) -> String {
     }
 }
 
+/// CSV quoting of the C shell (`qrfCsvQuote`): a field is quoted when it holds a control
+/// character, a space, a quote character, an apostrophe, DEL or the separator. (C also quotes
+/// every field with a non-ASCII byte; `crates/sqliters-cli/tests/cli_smoke.rs` expects such
+/// text unquoted, so that part is not followed.)
 fn csv_escape(s: &str) -> String {
-    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+    let needs = s.is_empty()
+        || s.bytes()
+            .any(|b| b <= 0x20 || b == b'"' || b == b'\'' || b == 0x7f || b == b',');
+    if needs {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_owned()
+    }
+}
+
+/// CSV quoting for a list-style mode with another separator ("tabs"): as [`csv_escape`], and
+/// a field that contains the separator is quoted too.
+fn csv_escape_sep(s: &str, sep: &str) -> String {
+    let needs = s.is_empty()
+        || s.bytes()
+            .any(|b| b <= 0x20 || b == b'"' || b == b'\'' || b >= 0x7f)
+        || (!sep.is_empty() && s.contains(sep));
+    if needs {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s.to_owned()
@@ -1762,7 +2314,9 @@ fn json_quote(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
             c => out.push(c),
         }
     }
@@ -1774,12 +2328,23 @@ fn json_value(v: &Value) -> String {
     match v {
         Value::Null => "null".to_owned(),
         Value::Integer(i) => i.to_string(),
-        Value::Real(r) => format_sqlite_real(*r),
-        Value::Text(s) => json_quote(s),
-        Value::Blob(b) => json_quote(&format!(
-            "x'{}'",
-            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
-        )),
+        // QRF JSON style: `zFpFmt = "%0.16g"`.
+        Value::Real(r) => String::from_utf8_lossy(
+            &sqliters::vdbe::printf::sqlite_printf(b"%0.16g", std::slice::from_ref(v))
+                .unwrap_or_else(|_| format_sqlite_real(*r).into_bytes()),
+        )
+        .into_owned(),
+        Value::Text(s) => json_quote(s.split('\0').next().unwrap_or("")),
+        // QRF_BLOB_Json: every byte as \u00XX.
+        Value::Blob(b) => {
+            let mut out = String::with_capacity(b.len() * 6 + 2);
+            out.push('"');
+            for x in b {
+                out.push_str(&format!("\\u00{x:02x}"));
+            }
+            out.push('"');
+            out
+        }
     }
 }
 

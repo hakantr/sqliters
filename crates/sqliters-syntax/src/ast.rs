@@ -283,6 +283,10 @@ pub struct ColumnDef {
     pub name: String,
     pub type_name: String,
     pub constraints: Vec<ColumnConstraint>,
+    /// Source text of the (last) DEFAULT value as C keeps it (`sqlite3AddDefaultValue`: the span
+    /// of the term including a leading sign, or the text between the parentheses, trimmed).
+    /// `PRAGMA table_info` shows this text.
+    pub default_src: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

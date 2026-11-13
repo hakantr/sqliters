@@ -2419,6 +2419,7 @@ pub(crate) fn try_execute_compiled_insert(
         total_changes: 0,
         stmt_timestamp_ms: ctx.runtime.stmt_timestamp_ms,
         enable_test_functions: ctx.runtime.enable_test_functions,
+        text_encoding: enc,
     };
     let svc_rt = vm_rt;
     let run_res = {
@@ -7667,6 +7668,10 @@ fn open_filtered_vtab_cursor_inner(
     let null_rhs = Expr::Null;
     let mut rhs_exprs: Vec<Option<&Expr>> = Vec::new();
     let mut source_conjuncts: Vec<Option<&Expr>> = Vec::new();
+    // `x BETWEEN a AND b` is offered as the two constraints x>=a and x<=b; when the module
+    // consumes both with `omit` the BETWEEN itself is not evaluated again (C: the virtual
+    // child terms disable their parent).
+    let mut between_pairs: Vec<(usize, usize, &Expr)> = Vec::new();
 
     if !matches!(indexed_by, Some(IndexHint::NotIndexed)) {
         if let Some(args) = tvf_args {
@@ -7780,6 +7785,7 @@ fn open_filtered_vtab_cursor_inner(
                     } => {
                         if let Some(col_i) = resolve_vtab_col(be) {
                             let usable_low = expr_can_eval_with_cols(low, &[], cols, outer_scopes);
+                            between_pairs.push((constraints.len(), constraints.len() + 1, conj));
                             constraints.push(sqliters_types::VTabConstraint {
                                 i_column: col_i,
                                 op: sqliters_types::VTabConstraintOp::Ge,
@@ -7973,6 +7979,16 @@ fn open_filtered_vtab_cursor_inner(
             && let Some(Some(conj_expr)) = source_conjuncts.get(ci).copied()
             && !omitted_conjuncts.contains(conj_expr)
         {
+            omitted_conjuncts.push(conj_expr.clone());
+        }
+    }
+    for &(lo, hi, conj_expr) in &between_pairs {
+        let consumed = |i: usize| {
+            info.constraint_usage
+                .get(i)
+                .is_some_and(|u| u.omit && u.argv_index > 0)
+        };
+        if consumed(lo) && consumed(hi) && !omitted_conjuncts.contains(conj_expr) {
             omitted_conjuncts.push(conj_expr.clone());
         }
     }
@@ -22444,6 +22460,29 @@ fn run_view_insert_loop(
     })
 }
 
+/// `OP_VUpdate` (vdbe.c): a constraint error of a module that declared
+/// `SQLITE_VTAB_CONSTRAINT_SUPPORT` takes the statement's ON CONFLICT action as its error
+/// action (`p->errorAction = pOp->p5`, REPLACE counting as ABORT), so `INSERT OR FAIL` keeps the
+/// rows written before the failing one and `OR ROLLBACK` rolls the transaction back.
+fn vtab_constraint_error_action(
+    e: SqliteError,
+    constraint_support: bool,
+    mode: sqliters_types::VTabConflictMode,
+) -> SqliteError {
+    if !constraint_support || e.code != ErrorCode::Constraint {
+        return e;
+    }
+    match mode {
+        sqliters_types::VTabConflictMode::Fail => {
+            e.with_conflict_effect(ConflictResolutionEffect::Fail)
+        }
+        sqliters_types::VTabConflictMode::Rollback => {
+            e.with_conflict_effect(ConflictResolutionEffect::Rollback)
+        }
+        _ => e,
+    }
+}
+
 fn conflict_action_to_vtab_mode(act: Option<ConflictAction>) -> sqliters_types::VTabConflictMode {
     match act {
         Some(ConflictAction::Rollback) => sqliters_types::VTabConflictMode::Rollback,
@@ -22656,7 +22695,13 @@ fn run_vtab_insert_loop(
                 row_idx += 1;
                 continue;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                return Err(vtab_constraint_error_action(
+                    e,
+                    p.declared.constraint_support,
+                    vtab_conflict,
+                ));
+            }
         };
 
         let final_rowid = maybe_rowid
@@ -22948,7 +22993,13 @@ fn try_exec_fast_vtab_insert(
             {
                 continue;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                return Err(vtab_constraint_error_action(
+                    e,
+                    declared.constraint_support,
+                    vtab_conflict,
+                ));
+            }
         };
 
         let final_rowid = maybe_rowid
@@ -24430,7 +24481,13 @@ fn run_vtab_update_loop(
             {
                 continue;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                return Err(vtab_constraint_error_action(
+                    e,
+                    p.declared.constraint_support,
+                    vtab_conflict,
+                ));
+            }
         }
 
         *stmt_changes += 1;
@@ -25197,6 +25254,17 @@ fn validate_drop_or_alter_schema_table_in_set(
 }
 
 fn exec_create_table(ctx: &mut ExecContext<'_>, ct: &CreateTableStmt) -> Result<()> {
+    exec_create_table_started(ctx, ct, None)
+}
+
+/// [`exec_create_table`]; `started` is the `(root page, sqlite_schema rowid)` of a table whose
+/// root page and placeholder row already exist (`CREATE TABLE ... AS SELECT`: C's
+/// `sqlite3StartTable` runs before the SELECT, see [`exec_create_table_as`]).
+fn exec_create_table_started(
+    ctx: &mut ExecContext<'_>,
+    ct: &CreateTableStmt,
+    started: Option<(Pgno, i64)>,
+) -> Result<()> {
     let db_id = resolve_create_table_target(ctx.db_set, ct.temp, &ct.name)?;
     if !*ctx.writable_schema && is_reserved_sqlite_name(&ct.name.name) {
         return Err(SqliteError::new(
@@ -25211,6 +25279,46 @@ fn exec_create_table(ctx: &mut ExecContext<'_>, ct: &CreateTableStmt) -> Result<
     // Validate AST & inline autoindexes before opening write tx or allocating pages
     let (tbl_preview, pending_autos) = build_table_schema_from_ast(ct, 2)?;
     validate_table_collations(&tbl_preview, &pending_autos, ctx.collations)?;
+    // build.c sqlite3AddDefaultValue / sqlite3AddGenerated / sqlite3AddPrimaryKey: the clauses
+    // are checked in the order they are written.
+    for cdef in &ct.columns {
+        let mut has_default = false;
+        let mut is_generated = false;
+        for cons in &cdef.constraints {
+            match cons {
+                sqliters_syntax::ColumnConstraint::Default(_) => {
+                    if is_generated {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            "cannot use DEFAULT on a generated column",
+                        ));
+                    }
+                    has_default = true;
+                }
+                sqliters_syntax::ColumnConstraint::Generated { .. } => {
+                    if has_default {
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
+                            format!("error in generated column \"{}\"", cdef.name),
+                        ));
+                    }
+                    is_generated = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    if tbl_preview
+        .columns
+        .iter()
+        .any(|c| c.generated.is_some() && c.is_primary_key)
+    {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            "generated columns cannot be part of the PRIMARY KEY",
+        ));
+    }
+    validate_generated_columns(&tbl_preview, ctx.functions)?;
 
     ctx.ensure_write_db(db_id, true)?;
     {
@@ -25257,16 +25365,21 @@ fn exec_create_table(ctx: &mut ExecContext<'_>, ct: &CreateTableStmt) -> Result<
         .as_mut()
         .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
 
-    let tbl_root = if tbl_preview.without_rowid {
-        bt.create_index()?
-    } else {
-        bt.create_table()?
-    };
     // `sqlite3StartTable` inserts a placeholder row (five NULLs) for the table, the automatic
     // indexes add their rows while the column definitions are parsed, and `sqlite3EndTable`
     // then rewrites the placeholder with the real row (`UPDATE sqlite_schema ... WHERE
     // rowid=#N`). The rewritten cell therefore lands below the index rows on the page.
-    let tbl_rowid = crate::schema::insert_schema_placeholder(bt)?;
+    let (tbl_root, tbl_rowid) = match started {
+        Some(pre) => pre,
+        None => {
+            let root = if tbl_preview.without_rowid {
+                bt.create_index()?
+            } else {
+                bt.create_table()?
+            };
+            (root, crate::schema::insert_schema_placeholder(bt)?)
+        }
+    };
     for auto in pending_autos {
         let idx_root = bt.create_index()?;
         insert_schema_entry(bt, "index", &auto.name, &ct.name.name, idx_root, None)?;
@@ -25516,6 +25629,19 @@ fn exec_create_table_as(
     };
 
     let meta = infer_select_stmt_meta(query, &[], ctx.db_set, &CteStore::default());
+    // C runs `sqlite3StartTable` before the SELECT: the root page exists and sqlite_schema holds
+    // the placeholder row (five NULLs) while the query runs, so a query that reads
+    // sqlite_schema sees that row.
+    ctx.ensure_write_db(db_id, true)?;
+    let started = {
+        let bt = ctx
+            .db_set
+            .slot_mut(db_id)
+            .and_then(|s| s.btree.as_mut())
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        let root = bt.create_table()?;
+        (root, crate::schema::insert_schema_placeholder(bt)?)
+    };
     let q_out = exec_select(ctx, query, params, &[], &CteStore::default())?;
 
     let mut dedup_names: Vec<String> = Vec::with_capacity(q_out.column_names.len());
@@ -25556,16 +25682,33 @@ fn exec_create_table_as(
             name: cname,
             type_name: type_str.to_owned(),
             constraints: Vec::new(),
+            default_src: None,
         };
         rendered_cols.push(render_column_def_sql(&cdef));
         columns.push(cdef);
     }
 
-    let catalog_sql = format!(
-        "CREATE TABLE {}({})",
-        format_replacement_ident("", &name.name),
-        rendered_cols.join(",")
-    );
+    // build.c createTableStmt(): one line while the identifiers are short, otherwise one
+    // column per line.
+    let ident_len = |z: &str| z.len() + z.bytes().filter(|&b| b == b'"').count() + 2;
+    let n_ident: usize = columns
+        .iter()
+        .map(|c| ident_len(&c.name) + 5)
+        .sum::<usize>()
+        + ident_len(&name.name);
+    let catalog_sql = if n_ident < 50 {
+        format!(
+            "CREATE TABLE {}({})",
+            format_replacement_ident("", &name.name),
+            rendered_cols.join(",")
+        )
+    } else {
+        format!(
+            "CREATE TABLE {}(\n  {}\n)",
+            format_replacement_ident("", &name.name),
+            rendered_cols.join(",\n  ")
+        )
+    };
     let ct = CreateTableStmt {
         temp: false,
         if_not_exists,
@@ -25580,7 +25723,7 @@ fn exec_create_table_as(
         catalog_sql: catalog_sql.clone(),
         raw_sql: catalog_sql,
     };
-    exec_create_table(ctx, &ct)?;
+    exec_create_table_started(ctx, &ct, Some(started))?;
 
     let Some(tbl) = ctx
         .db_set
@@ -27248,6 +27391,94 @@ fn exec_reindex(ctx: &mut ExecContext<'_>, target: Option<&QualifiedName>) -> Re
     Ok(())
 }
 
+/// The checks C applies to the expressions of generated columns when a table is created or a
+/// column is added: `sqlite3ResolveSelfReference(.., NC_GenCol, ..)` for every generated column
+/// in table order (parameters, subqueries, the "." operator, non-deterministic functions and
+/// the rowid are not available), then the cycle test of the `SELECT * FROM tbl` that
+/// `sqlite3EndTable` runs: virtual columns are expanded depth-first and the error names the
+/// column that was reached while it was still being computed; the last virtual column in
+/// table order that runs into a loop wins.
+fn validate_generated_columns(tbl: &TableSchema, functions: &FunctionRegistry) -> Result<()> {
+    use std::cell::RefCell;
+    let refs_of = |e: &Expr| -> Vec<String> {
+        let names: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        expr_mentions_column(e, &|cref: &ColumnRef| {
+            names.borrow_mut().push(cref.column.clone());
+            false
+        });
+        names.into_inner()
+    };
+    let col_index = |name: &str| {
+        tbl.columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(name))
+    };
+    for col in &tbl.columns {
+        let Some((expr, _)) = &col.generated else {
+            continue;
+        };
+        validate_index_ddl_expr(expr, functions, "generated columns", true)?;
+        for name in refs_of(expr) {
+            let is_rowid_name = ["rowid", "oid", "_rowid_"]
+                .iter()
+                .any(|r| name.eq_ignore_ascii_case(r));
+            if is_rowid_name && col_index(&name).is_none() {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such column: {name}"),
+                ));
+            }
+        }
+    }
+    let deps: Vec<Option<Vec<usize>>> = tbl
+        .columns
+        .iter()
+        .map(|c| match &c.generated {
+            Some((e, false)) => Some(
+                refs_of(e)
+                    .iter()
+                    .filter_map(|n| col_index(n))
+                    .collect::<Vec<usize>>(),
+            ),
+            _ => None,
+        })
+        .collect();
+    fn visit(i: usize, deps: &[Option<Vec<usize>>], busy: &mut [bool]) -> Option<usize> {
+        let d = deps[i].as_ref()?;
+        busy[i] = true;
+        let mut hit = None;
+        for &j in d {
+            if deps[j].is_none() {
+                continue;
+            }
+            if busy[j] {
+                hit = Some(j);
+                break;
+            }
+            if let Some(h) = visit(j, deps, busy) {
+                hit = Some(h);
+                break;
+            }
+        }
+        busy[i] = false;
+        hit
+    }
+    let mut looped = None;
+    let mut busy = vec![false; tbl.columns.len()];
+    for i in 0..tbl.columns.len() {
+        if let Some(h) = visit(i, &deps, &mut busy) {
+            looped = Some(h);
+        }
+    }
+    if let Some(h) = looped {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            format!("generated column loop on \"{}\"", tbl.columns[h].name),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_index_ddl_expr(
     expr: &Expr,
     functions: &FunctionRegistry,
@@ -27270,7 +27501,7 @@ fn validate_index_ddl_expr(
             if in_index_expr && (cref.table.is_some() || cref.schema.is_some()) {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    "the \".\" operator prohibited in index expressions",
+                    format!("the \".\" operator prohibited in {context_label}"),
                 ));
             }
             Ok(())
@@ -27291,10 +27522,20 @@ fn validate_index_ddl_expr(
                 FunctionArgs::Exprs(v) => v.as_slice(),
                 FunctionArgs::Star => &[][..],
             };
-            if matches!(
-                fn_lower.as_str(),
-                "date" | "time" | "datetime" | "julianday" | "unixepoch" | "strftime" | "timediff"
-            ) {
+            // (A generated column may call the date functions; C objects to 'now' only when
+            // the column is computed.)
+            if context_label != "generated columns"
+                && matches!(
+                    fn_lower.as_str(),
+                    "date"
+                        | "time"
+                        | "datetime"
+                        | "julianday"
+                        | "unixepoch"
+                        | "strftime"
+                        | "timediff"
+                )
+            {
                 let min_args = if fn_lower == "strftime" { 2 } else { 1 };
                 let mut uses_now_or_tz = args.len() < min_args;
                 for arg in args {
@@ -30078,6 +30319,20 @@ fn exec_alter_table(
             if new_tbl.columns.len() != tbl.columns.len() + 1 {
                 return Err(reload_err("malformed database schema"));
             }
+            if let Some((ge, _)) = &new_tbl.columns[new_tbl.columns.len() - 1].generated {
+                // Only the new column is resolved again (the loop test of CREATE TABLE is not
+                // repeated by ALTER TABLE).
+                let mut only_new = new_tbl.clone();
+                for c in only_new.columns.iter_mut().rev().skip(1) {
+                    c.generated = None;
+                }
+                let _ = ge;
+                if let Err(e) = validate_generated_columns(&only_new, ctx.functions)
+                    && !e.message.starts_with("generated column loop")
+                {
+                    return Err(reload_err(&e.message));
+                }
+            }
             // The reload resolves the expressions of the new column against the new table.
             {
                 let new_scope = make_static_table_scope(&new_tbl, &schema_name, None);
@@ -30120,10 +30375,9 @@ fn exec_alter_table(
                     let new_col = &new_tbl.columns[new_col_idx];
                     if new_col.not_null.is_some() && vals[new_col_idx].is_null() {
                         // C raises this through `raise(ABORT, ...)` outside a trigger, i.e.
-                        // with SQLITE_ERROR; the code stays SQLITE_CONSTRAINT_NOTNULL here
-                        // because `tests/bulgular_regressions.rs` (finding Y8) pins it.
-                        return Err(SqliteError::constraint(
-                            extended::SQLITE_CONSTRAINT_NOTNULL,
+                        // with SQLITE_ERROR (rc 1, extended 1).
+                        return Err(SqliteError::new(
+                            ErrorCode::Error,
                             "NOT NULL constraint failed",
                         ));
                     }
@@ -30155,8 +30409,8 @@ fn exec_alter_table(
                             )?;
                             if cv.truthiness() == Some(false) {
                                 // Same remark as for NOT NULL above: C reports SQLITE_ERROR.
-                                return Err(SqliteError::constraint(
-                                    extended::SQLITE_CONSTRAINT_CHECK,
+                                return Err(SqliteError::new(
+                                    ErrorCode::Error,
                                     "CHECK constraint failed",
                                 ));
                             }
@@ -34156,10 +34410,8 @@ fn check_add_column_definition(
     use sqliters_syntax::ColumnConstraint as Cc;
     let err = |msg: String| Err(SqliteError::new(ErrorCode::Error, msg));
     if tbl.columns.len() + 1 > column_limit {
-        // C names its scratch copy of the table here ("too many columns on
-        // sqlite_altertab_<table>"); the plain table name is what
-        // `tests/sqltest_parity.rs` (`test_column_limit_prepare_boundaries`) expects.
-        return err(format!("too many columns on {}", tbl.name));
+        // C names its scratch copy of the table here.
+        return err(format!("too many columns on sqlite_altertab_{}", tbl.name));
     }
     if tbl.find_column(&cdef.name).is_some() {
         return err(format!("duplicate column name: {}", cdef.name));
@@ -35523,10 +35775,19 @@ fn exec_integrity_check(
             })
             .map(|o| &o.2)
             .collect();
+        // The schema table takes part in the row checks like any other table (C reports its
+        // rows under the name sqlite_master / sqlite_temp_master).
+        let mut schema_tbl = TableSchema::sqlite_schema_table();
+        schema_tbl.name = if cur_id == DatabaseId::TEMP {
+            "sqlite_temp_master".to_owned()
+        } else {
+            "sqlite_master".to_owned()
+        };
         let tables: Vec<(&TableSchema, Vec<Option<&IndexSchema>>)> = selected
             .iter()
             .filter_map(|o| match o {
                 Obj::Table(t) => Some((*t, c_index_list_order(&sch, t))),
+                Obj::SchemaTable => Some((&schema_tbl, Vec::new())),
                 _ => None,
             })
             .collect();
@@ -35610,7 +35871,7 @@ fn exec_integrity_check(
             if out.halted {
                 break;
             }
-            if t.root_pgno <= 1 {
+            if t.root_pgno == 0 {
                 continue;
             }
             let indexes: Vec<&IndexSchema> = t_indexes.iter().flatten().copied().collect();
@@ -35732,6 +35993,25 @@ fn record_header_is_sane(payload: &[u8], mx_col: usize) -> bool {
         }
     }
     !((pos >= end && (pos > end || offset != total)) || offset > total)
+}
+
+/// Number of fields of a record: the serial-type varints in its header.
+fn record_field_count(rec: &[u8]) -> usize {
+    let Ok((hdr_len, mut pos)) = sqliters_types::get_varint(rec) else {
+        return 0;
+    };
+    let end = (hdr_len as usize).min(rec.len());
+    let mut n = 0usize;
+    while pos < end {
+        match sqliters_types::get_varint(&rec[pos..end]) {
+            Ok((_, used)) if used > 0 => {
+                pos += used;
+                n += 1;
+            }
+            _ => break,
+        }
+    }
+    n
 }
 
 /// The row loop of `PRAGMA integrity_check` for one ordinary table (`pragma.c`): for every row,
@@ -35982,12 +36262,87 @@ fn integrity_check_table_rows(
                         .slot_mut(db_id)
                         .and_then(|s| s.btree.as_mut())
                         .ok_or_else(|| SqliteError::misuse("integrity_check: btree closed"))?;
-                    // An index entry must exist for the current table row.
-                    if !bt.index_contains_prefix_raw(idx.root_pgno, &keys, orders)? {
-                        if !out.emit(format!("row {n_row} missing from index {}", idx.name)) {
-                            return Ok(());
+                    // An index entry must exist for the current table row. The entry that is
+                    // found is examined in the same descent (pragma.c, after `ckUniq`): for a
+                    // rowid table the rowid must be the LAST field of the index record, and a
+                    // key column with a non-BINARY collation must hold exactly the value of
+                    // the table (the collation found the entry, e.g. 'ABC' for 'abc'). Either
+                    // finding ends the checks of this index for the row.
+                    {
+                        let n_all = keys.len();
+                        let needs_values = idx.columns.iter().any(|ic| {
+                            ic.sort_order.custom_collation.is_some()
+                                || ic.sort_order.collation != Collation::Binary
+                        });
+                        let mut present = false;
+                        let mut found: Option<Vec<Value>> = None;
+                        bt.seek_index_range_raw_cells(
+                            idx.root_pgno,
+                            &keys[..n_all],
+                            None,
+                            None,
+                            orders,
+                            false,
+                            |rec| {
+                                // A record with fewer fields than the key is not the entry.
+                                let n_fields = record_field_count(rec);
+                                if n_fields < n_all {
+                                    return Ok(std::ops::ControlFlow::Continue(()));
+                                }
+                                present = true;
+                                if needs_values || n_fields != n_all {
+                                    found = Some(sqliters_types::decode_record_with_encoding(
+                                        rec, enc,
+                                    )?);
+                                }
+                                Ok(std::ops::ControlFlow::Break(()))
+                            },
+                        )?;
+                        if !present {
+                            if !out.emit(format!("row {n_row} missing from index {}", idx.name)) {
+                                return Ok(());
+                            }
+                            continue;
                         }
-                        continue;
+                        if let Some(fields) = found {
+                            if !tbl.without_rowid
+                                && fields.last().is_some_and(
+                                    |last| !matches!(last, Value::Integer(i) if *i == rowid),
+                                )
+                            {
+                                if !out.emit(format!(
+                                    "rowid not at end-of-record for row {n_row} of index {}",
+                                    idx.name
+                                )) {
+                                    return Ok(());
+                                }
+                                continue;
+                            }
+                            let differs = idx.columns.iter().enumerate().any(|(kk, ic)| {
+                                let binary = ic.sort_order.custom_collation.is_none()
+                                    && ic.sort_order.collation == Collation::Binary;
+                                !binary
+                                    && match (fields.get(kk), keys.get(kk)) {
+                                        (Some(a), Some(b)) => {
+                                            !(a.is_null() && b.is_null())
+                                                && (a.is_null()
+                                                    || b.is_null()
+                                                    || a.cmp_sqlite(b, Collation::Binary)
+                                                        != Ordering::Equal)
+                                        }
+                                        _ => false,
+                                    }
+                            });
+                            if differs {
+                                if !out.emit(format!(
+                                    "row {n_row} values differ from index {}",
+                                    idx.name
+                                )) {
+                                    return Ok(());
+                                }
+                                continue;
+                            }
+                        }
                     }
                     // For UNIQUE indexes only one entry may exist with the current key. The
                     // entry is unique if a (nullable) key column is NULL or the entry after
@@ -36638,10 +36993,14 @@ fn exec_pragma(
                     visible_cid += 1;
                     c
                 };
-                let dflt = col
-                    .default_expr
-                    .as_ref()
-                    .map_or(Value::Null, |e| Value::Text(expr_column_label(e)));
+                // pragma.c: the DEFAULT text as written (`sqlite3ColumnExpr()->u.zToken`).
+                let dflt = col.default_expr.as_ref().map_or(Value::Null, |e| {
+                    Value::Text(
+                        col.default_src
+                            .clone()
+                            .unwrap_or_else(|| expr_column_label(e)),
+                    )
+                });
                 let mut row = vec![
                     Value::Integer(cid_val),
                     Value::Text(col.name.clone()),

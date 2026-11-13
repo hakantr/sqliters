@@ -2413,23 +2413,20 @@ impl Btree {
         }
     }
 
-    /// Allocates the next available `rowid` (`max_rowid + 1`, or `1` if empty; falls back to unused positive probe if `i64::MAX` is used).
+    /// Allocates the next available `rowid` as `OP_NewRowid` does (vdbe.c): largest rowid + 1,
+    /// or `1` for an empty table. When the largest rowid is already 2^63-1, up to 100 random
+    /// positive candidates (`v &= MAX_ROWID>>1; v++`) are tried; if every one of them exists the
+    /// result is `SQLITE_FULL`.
     pub fn next_rowid(&mut self, root_pgno: Pgno) -> Result<i64> {
         match self.max_table_rowid(root_pgno)? {
             None => Ok(1),
             Some(max_id) if max_id < i64::MAX => Ok(max_id + 1),
             Some(_) => {
-                let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+                let vfs = Arc::clone(self.pager().vfs());
                 for _ in 0..100 {
-                    state ^= state << 13;
-                    state ^= state >> 7;
-                    state ^= state << 17;
-                    let probe = ((state & 0x7fff_ffff_ffff_ffff) as i64).max(1);
-                    if self.seek_table_rowid(root_pgno, probe)?.is_none() {
-                        return Ok(probe);
-                    }
-                }
-                for probe in 1..10_000i64 {
+                    let mut buf = [0u8; 8];
+                    vfs.randomness(&mut buf);
+                    let probe = (i64::from_le_bytes(buf) & (i64::MAX >> 1)) + 1;
                     if self.seek_table_rowid(root_pgno, probe)?.is_none() {
                         return Ok(probe);
                     }

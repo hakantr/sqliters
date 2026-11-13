@@ -815,8 +815,18 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token<'_>>> {
                 }
                 let hex_len = i - hex_start;
                 if i >= bytes.len() || bytes[i] != b'\'' || !hex_len.is_multiple_of(2) {
+                    // tokenize.c: the TK_ILLEGAL token runs to the closing quote (or the end).
+                    while i < bytes.len() && bytes[i] != b'\'' {
+                        i += 1;
+                    }
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                    while !sql.is_char_boundary(i) {
+                        i += 1;
+                    }
                     return Err(SqliteError::syntax(
-                        format!("unrecognized blob literal starting at offset {start}"),
+                        format!("unrecognized token: \"{}\"", &sql[start..i]),
                         start,
                     ));
                 }
@@ -934,7 +944,13 @@ pub fn parse_int_literal(raw: &str) -> Result<Option<i64>> {
 /// Parses a floating-point token (with optional `_` separators).
 pub fn parse_float_literal(raw: &str) -> Result<f64> {
     let cleaned: String = raw.chars().filter(|&c| c != '_').collect();
-    cleaned
-        .parse::<f64>()
-        .map_err(|_| SqliteError::syntax(format!("invalid float literal: {raw}"), 0))
+    // C: `sqlite3AtoF` on the (dequoted) token text (expr.c `codeReal`).
+    let (r, rc) = sqliters_types::sqlite_atof(cleaned.as_bytes());
+    if rc <= 0 {
+        return Err(SqliteError::syntax(
+            format!("invalid float literal: {raw}"),
+            0,
+        ));
+    }
+    Ok(r)
 }
