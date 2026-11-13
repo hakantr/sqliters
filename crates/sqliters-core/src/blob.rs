@@ -790,10 +790,18 @@ impl Blob {
     /// releasing its B-tree lease and committing any autocommit write transaction if this handle
     /// was the last active writer.
     pub fn close(mut self) -> Result<()> {
+        if self.handle_id.is_none() {
+            return Ok(());
+        }
+        // Enter BEFORE giving up the handle id: when the entry is refused (`SQLITE_MISUSE` from
+        // inside a callback of this connection, `SQLITE_BUSY` while another thread is using it),
+        // `Drop` still owns the handle and queues the same cleanup on the connection. Taking the
+        // id first leaked the handle registration and its B-tree lease for good.
+        let shared = Arc::clone(&self.shared);
+        let mut session = shared.enter()?;
         let Some(hid) = self.handle_id.take() else {
             return Ok(());
         };
-        let mut session = self.shared.enter()?;
         let inner = session.inner_mut();
         inner.close_blob_handle(hid, self.schema_instance_id, self.read_write, &self.shared)
     }

@@ -3462,9 +3462,10 @@ impl Pager {
         patched_hdr.change_counter = next_cc;
         patched_hdr.version_valid_for = next_cc;
         patched_hdr.sqlite_version_number = SQLITE_VERSION_NUMBER;
-        if patched_hdr.schema_cookie <= self.tx_orig_header.schema_cookie {
-            patched_hdr.schema_cookie = self.tx_orig_header.schema_cookie.wrapping_add(1);
-        }
+        // `sqlite3BtreeUpdateMeta(p->pDest, 1, p->iDestSchema+1)` (`backup.c:456`): the copy's schema
+        // cookie is the destination's cookie at the start of its transaction plus one, whatever the
+        // source's cookie is.
+        patched_hdr.schema_cookie = self.tx_orig_header.schema_cookie.wrapping_add(1);
 
         self.ensure_journal_started()?;
 
@@ -3924,6 +3925,12 @@ impl Pager {
             self.cache.clear_all_dirty();
             self.commit_phase_one_done = true;
             self.notify_backup_self_commit();
+            if self.is_memdb_backing {
+                // `sqlite3PagerCommitPhaseOne` (`pager.c:6554-6560`): "If this is an in-memory db
+                // ... any backup in progress needs to be restarted." C does not feed the changed
+                // pages of an in-memory source to its backups, it restarts them at page 1.
+                self.notify_backup_restart();
+            }
         } else if self.locking_mode == LockingMode::Exclusive {
             self.lock_db_file(LockLevel::Exclusive)?;
         }

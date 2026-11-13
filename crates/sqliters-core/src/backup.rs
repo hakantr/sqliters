@@ -35,6 +35,15 @@ impl BackupStepResult {
 ///
 /// Holds `Arc` references to the source and destination connection states without holding
 /// connection locks between [`Backup::step`] calls.
+///
+/// [`Backup::init`], [`Backup::step`] and [`Backup::finish`] enter both connections
+/// (`ConnectionShared::enter_dual`). Like the C functions, which wait for the two connection
+/// mutexes, they wait while another thread is inside either connection instead of failing; the
+/// two connections are always taken in the same global order, so backups running in opposite
+/// directions between the same two connections cannot deadlock (they do in C). `SQLITE_BUSY`
+/// from `step` therefore means what it means in C: a source write transaction or a file lock.
+/// The one exception is a call made from inside a callback of some *other* connection while a
+/// second thread is using one of the two: that call does not wait and fails with `SQLITE_BUSY`.
 pub struct Backup {
     src: Arc<ConnectionShared>,
     src_instance_id: SchemaInstanceId,
@@ -215,8 +224,10 @@ impl Backup {
             dest_locked: false,
             is_done: false,
             fatal_error: None,
-            remaining: -1,
-            pagecount: -1,
+            // `sqlite3_backup_remaining()` / `sqlite3_backup_pagecount()` report 0 until the first
+            // step has counted the source pages (the C object is zero-initialised).
+            remaining: 0,
+            pagecount: 0,
             last_src_page_size: 0,
             last_src_cc: 0,
             last_src_wal: None,
@@ -341,7 +352,11 @@ impl Backup {
                 {
                     let _ = dst_bt.pager_mut().set_page_size(src_ps);
                 }
-                dst_bt.begin_write()?;
+                // `sqlite3BtreeBeginTrans(p->pDest, 2, ..)` (`backup.c:391-396`): wrflag 2 is an
+                // EXCLUSIVE transaction, so from the first step on no other connection can read
+                // the half-copied destination file (it gets `SQLITE_BUSY`), and the final commit
+                // can no longer be refused because of a reader.
+                dst_bt.begin_exclusive()?;
                 self.dest_locked = true;
                 dst_inner.activity.start_with_instances(
                     hid,
@@ -371,6 +386,27 @@ impl Backup {
                     "destination database is in WAL mode and page sizes differ",
                 ));
             }
+            // `backupOnePage` (`backup.c:249-254`): an in-memory destination cannot change its page
+            // size, so copying a page into one whose page size differs is `SQLITE_READONLY`. (An
+            // empty in-memory destination has already taken the source page size above.) The
+            // error is raised by the first page copy, not by a step that copies nothing.
+            let memdb_page_size_conflict = {
+                let dst_pager = dst_inner
+                    .db_set
+                    .slot(dst_db_id)
+                    .unwrap()
+                    .btree
+                    .as_ref()
+                    .unwrap()
+                    .pager();
+                dst_pager.is_memdb_backing() && src_ps != dst_orig_ps
+            };
+            let memdb_page_size_error = || {
+                SqliteError::new(
+                    ErrorCode::ReadOnly,
+                    "destination database is in-memory and page sizes differ",
+                )
+            };
 
             // 5. Inspect leaf `BackupTracker` and source snapshot metadata to determine whether
             // we must restart from page 1 or re-copy dirty pages `< self.i_next`.
@@ -442,6 +478,9 @@ impl Backup {
                 if is_lock_page {
                     continue;
                 }
+                if memdb_page_size_conflict {
+                    return Err(memdb_page_size_error());
+                }
                 let page_bytes = src_inner
                     .db_set
                     .slot_mut(src_db_id)
@@ -477,6 +516,9 @@ impl Backup {
                     .lock_byte_page()
                     == src_pgno;
                 if !is_lock_page {
+                    if memdb_page_size_conflict {
+                        return Err(memdb_page_size_error());
+                    }
                     let page_bytes = src_inner
                         .db_set
                         .slot_mut(src_db_id)
@@ -603,10 +645,20 @@ impl Backup {
     }
 
     fn cleanup_explicit(&mut self) -> Result<()> {
+        if self.dst_handle_id.is_none() {
+            return Ok(());
+        }
+        // Enter BEFORE giving up the handle id: when the entry is refused (`SQLITE_MISUSE` for a
+        // call made from inside a callback of one of the two connections, `SQLITE_BUSY` for a
+        // call made from inside a callback of a third connection while another thread is using
+        // one of the two), `self` is dropped by the caller and `Drop` hands the very same cleanup
+        // to the deferred-drop queues of both connections. Nothing may be leaked here: the
+        // registrations released below keep the destination "in use", keep both connections
+        // un-closable and keep the destination's write transaction open.
+        let mut session = ConnectionShared::enter_dual(&self.src, &self.dst)?;
         let Some(dst_hid) = self.dst_handle_id.take() else {
             return Ok(());
         };
-        let mut session = ConnectionShared::enter_dual(&self.src, &self.dst)?;
         let (src_inner, dst_inner) = session.src_and_dst_mut();
 
         if let Some(src_slot) = src_inner.db_set.slot_by_instance_mut(self.src_instance_id) {

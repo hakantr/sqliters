@@ -22,8 +22,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use sqliters_btree::{Btree, BtreeCursorState, CursorId};
 pub use sqliters_ext::{
@@ -94,6 +96,16 @@ pub use vtab::{DbStatModule, DeclaredVTabSchema, PragmaVTabModule, VTabInstanceK
 const SQLITE_MAX_SCHEMA_RETRY: usize = 50;
 
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Parking place of the threads waiting for a connection's execution gate
+/// ([`ConnectionShared::acquire_gate_blocking`]). Only the two-connection backup entry ever waits,
+/// and only while another thread is inside one of its two connections, so one process-wide
+/// lock/condvar pair is enough: a release that sees `gate_waiters != 0` on its own connection
+/// wakes all parked threads and each re-checks its own gate. Keeping the pair out of
+/// `ConnectionShared` leaves that struct's layout (and so the placement of the hot
+/// `ConnectionInner` fields) exactly as it was.
+static GATE_WAIT_LOCK: Mutex<()> = Mutex::new(());
+static GATE_WAIT_CV: Condvar = Condvar::new();
 
 thread_local! {
     static ACTIVE_CONN_TOP: Cell<(u64, u32)> = const { Cell::new((0, 0)) };
@@ -228,6 +240,20 @@ fn register_builtin_extension_functions(
             ))
         });
     }
+}
+
+/// `true` when the calling thread is currently inside the execution gate of *any* connection (it is
+/// running in a user callback, a hook or a deferred-drop drain of some connection). Such a caller
+/// must never block on another connection's gate: it already owns one, so waiting could close a
+/// cycle (see [`ConnectionShared::enter_dual`]).
+#[inline]
+fn is_any_conn_active_on_current_thread() -> bool {
+    ACTIVE_CONN_TOP
+        .try_with(|cell| {
+            let (top, extra) = cell.get();
+            top != 0 || extra != 0
+        })
+        .unwrap_or(true)
 }
 
 #[inline(always)]
@@ -990,6 +1016,10 @@ pub(crate) struct ConnectionShared {
     pub(crate) interrupt_flag: Arc<AtomicBool>,
     pub(crate) has_external_interrupt: AtomicBool,
     pub(crate) gate_busy: AtomicBool,
+    /// Number of threads parked in [`ConnectionShared::acquire_gate_blocking`] waiting for THIS
+    /// connection's gate. Only the two-connection backup entry waits for a gate; every gate
+    /// release checks this counter (one atomic load) and wakes the waiters when it is non-zero.
+    pub(crate) gate_waiters: AtomicU32,
     pub(crate) conn_state: AtomicU8,
     pub(crate) has_pending_drops: AtomicBool,
     pub(crate) mirror_last_insert_rowid: AtomicI64,
@@ -1044,6 +1074,75 @@ impl ConnectionShared {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Releases the execution gate and wakes any thread parked in
+    /// [`Self::acquire_gate_blocking`]. The store and the waiter-count load are both `SeqCst`, and
+    /// a waiter registers itself (`gate_waiters += 1`) *before* its own attempt on the gate, so
+    /// either this release sees the waiter or the waiter sees the released gate: no lost wake-up.
+    #[inline(always)]
+    fn release_gate(&self) {
+        self.gate_busy.store(false, Ordering::SeqCst);
+        if self.gate_waiters.load(Ordering::SeqCst) != 0 {
+            self.wake_gate_waiters();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn wake_gate_waiters(&self) {
+        // Taking the wait lock orders this notification after a waiter's failed attempt + park
+        // (the waiter holds the lock from its attempt until `Condvar::wait` releases it).
+        let _g = GATE_WAIT_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        GATE_WAIT_CV.notify_all();
+    }
+
+    #[inline]
+    fn try_acquire_gate(&self) -> bool {
+        self.gate_busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Acquires the execution gate, parking the calling thread until the current owner (another
+    /// thread) releases it. This is the counterpart of C's `sqlite3_mutex_enter(db->mutex)`; it is
+    /// used only by [`Self::enter_dual`], which guarantees the caller owns no other gate that a
+    /// gate owner could be waiting for.
+    #[cold]
+    #[inline(never)]
+    fn acquire_gate_blocking(&self) {
+        self.gate_waiters.fetch_add(1, Ordering::SeqCst);
+        let mut g = GATE_WAIT_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while self
+            .gate_busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            g = GATE_WAIT_CV.wait(g).unwrap_or_else(PoisonError::into_inner);
+        }
+        drop(g);
+        self.gate_waiters.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Acquires the gate for one half of a two-connection entry: waits for another thread to
+    /// leave when `may_wait`, otherwise fails with `SQLITE_BUSY` like [`Self::enter`].
+    #[inline]
+    fn acquire_gate_for_dual(&self, may_wait: bool) -> Result<()> {
+        if self.try_acquire_gate() {
+            return Ok(());
+        }
+        if !may_wait {
+            return Err(SqliteError::new(
+                ErrorCode::Busy,
+                "database connection is busy",
+            ));
+        }
+        self.acquire_gate_blocking();
+        Ok(())
+    }
+
     pub(crate) fn enter(&self) -> Result<ConnSession<'_>> {
         if is_conn_active_on_current_thread(self.conn_id) {
             return Err(SqliteError::misuse(
@@ -1090,6 +1189,25 @@ impl ConnectionShared {
         Ok(session)
     }
 
+    /// Enters two distinct connections at once (the online-backup entry: `sqlite3_backup_init`,
+    /// `sqlite3_backup_step` and `sqlite3_backup_finish` take `pSrcDb->mutex` and then
+    /// `pDestDb->mutex`, `sqlite/src/backup.c:164-165, 334-337, 606-609`).
+    ///
+    /// C blocks on both mutexes, in source-then-destination order; two backups running in
+    /// opposite directions between the same two handles therefore deadlock in C (ABBA). Here the
+    /// two gates are taken in one global order (ascending `conn_id`) and the caller **waits** for
+    /// a gate that another thread currently owns, exactly as C waits for the mutex, so a
+    /// momentary use of either connection by another thread never surfaces as `SQLITE_BUSY`
+    /// (C has no such result for these calls) and no wait cycle can form:
+    ///
+    /// * [`Self::enter`] and the deferred-drop path never wait for a gate;
+    /// * a thread that is already inside some connection's gate (it is running in a callback)
+    ///   does not wait here either, it gets `SQLITE_BUSY` at once; so
+    /// * the only waits are those of threads that own nothing but (possibly) the lower-numbered
+    ///   gate of their own pair, and such waits are ordered by `conn_id`.
+    ///
+    /// Re-entry from the thread that owns one of the two gates is `SQLITE_MISUSE`, as for
+    /// [`Self::enter`].
     pub(crate) fn enter_dual<'a>(src: &'a Self, dst: &'a Self) -> Result<DualConnSession<'a>> {
         if src.conn_id == dst.conn_id {
             return Err(SqliteError::new(
@@ -1111,30 +1229,24 @@ impl ConnectionShared {
             (dst, src, false)
         };
 
-        if first
-            .gate_busy
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            return Err(SqliteError::new(
-                ErrorCode::Busy,
-                "database connection is busy",
-            ));
-        }
+        let may_wait = !is_any_conn_active_on_current_thread();
+
+        first.acquire_gate_for_dual(may_wait)?;
         let mut first_unwind = GateReleaseOnUnwind {
             shared: first,
             armed: true,
         };
 
-        if second
-            .gate_busy
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            return Err(SqliteError::new(
-                ErrorCode::Busy,
-                "database connection is busy",
-            ));
+        #[cfg(test)]
+        dual_entry_test_hook::run(first.conn_id, second.conn_id);
+
+        if let Err(err) = second.acquire_gate_for_dual(may_wait) {
+            // Partial acquisition: give the first gate back. Work that other threads queued on it
+            // while it was ours must be drained now, not left for the next entry.
+            first_unwind.armed = false;
+            let _stack_guard = ActiveConnStackGuard::push(first.conn_id);
+            first.drain_and_release_gate();
+            return Err(err);
         }
         let mut second_unwind = GateReleaseOnUnwind {
             shared: second,
@@ -1210,7 +1322,7 @@ impl ConnectionShared {
 
     fn drain_and_release_gate(&self) {
         if !self.has_pending_drops.load(Ordering::SeqCst) {
-            self.gate_busy.store(false, Ordering::SeqCst);
+            self.release_gate();
             if !self.has_pending_drops.load(Ordering::SeqCst)
                 || self
                     .gate_busy
@@ -1230,7 +1342,7 @@ impl ConnectionShared {
                 let batch = std::mem::take(&mut *pq);
                 if batch.is_empty() {
                     self.has_pending_drops.store(false, Ordering::SeqCst);
-                    self.gate_busy.store(false, Ordering::SeqCst);
+                    self.release_gate();
                     gate_unwind.armed = false;
                     return;
                 }
@@ -1244,6 +1356,45 @@ impl ConnectionShared {
     }
 }
 
+/// Test-only pause point between the two gate acquisitions of [`ConnectionShared::enter_dual`],
+/// used to force the interleavings the backup locking tests need. A hook is keyed by the
+/// `conn_id` pair of the entry, so tests running in parallel in the same process do not see each
+/// other's hooks.
+#[cfg(test)]
+pub(crate) mod dual_entry_test_hook {
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+    static HOOKS: Mutex<Vec<(u64, u64, Hook)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn set(first_conn_id: u64, second_conn_id: u64, hook: Hook) {
+        HOOKS.lock().unwrap_or_else(PoisonError::into_inner).push((
+            first_conn_id,
+            second_conn_id,
+            hook,
+        ));
+    }
+
+    pub(crate) fn clear(first_conn_id: u64, second_conn_id: u64) {
+        HOOKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(f, s, _)| !(*f == first_conn_id && *s == second_conn_id));
+    }
+
+    pub(crate) fn run(first_conn_id: u64, second_conn_id: u64) {
+        let hook = HOOKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(f, s, _)| *f == first_conn_id && *s == second_conn_id)
+            .map(|(_, _, h)| Arc::clone(h));
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 struct GateReleaseOnUnwind<'a> {
     shared: &'a ConnectionShared,
     armed: bool,
@@ -1252,7 +1403,7 @@ struct GateReleaseOnUnwind<'a> {
 impl Drop for GateReleaseOnUnwind<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.shared.gate_busy.store(false, Ordering::Release);
+            self.shared.release_gate();
         }
     }
 }
@@ -2981,6 +3132,7 @@ impl Connection {
             interrupt_flag,
             has_external_interrupt: AtomicBool::new(false),
             gate_busy: AtomicBool::new(false),
+            gate_waiters: AtomicU32::new(0),
             conn_state: AtomicU8::new(CONN_STATE_OPEN),
             has_pending_drops: AtomicBool::new(false),
             mirror_last_insert_rowid: AtomicI64::new(0),
@@ -3020,7 +3172,12 @@ impl Connection {
             return Ok(());
         }
 
-        if !inner.open_handles.is_empty() {
+        // `connectionIsBusy()` (`main.c`): an unfinalized statement, or a database of this
+        // connection that is the SOURCE of an unfinished backup (`sqlite3BtreeIsInBackup`), makes
+        // `sqlite3_close` fail with SQLITE_BUSY. (A backup's destination is in `open_handles`.)
+        if !inner.open_handles.is_empty()
+            || inner.db_set.slots().iter().any(|s| s.active_backups > 0)
+        {
             drop(session);
             return Err(CloseError {
                 connection: self,
@@ -12549,6 +12706,10 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod backup_c_align_5i_tests;
+#[cfg(test)]
+mod backup_locking_tests;
 #[cfg(test)]
 mod c_align_5g_tests;
 #[cfg(test)]
