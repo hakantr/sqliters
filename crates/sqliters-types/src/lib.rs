@@ -75,9 +75,9 @@ pub use value::{
 };
 pub use varint::{get_varint, get_varint_i64, push_varint, put_varint, put_varint_i64, varint_len};
 pub use vtab_api::{
-    VTabConfigOption, VTabConflictMode, VTabConstraint, VTabConstraintOp, VTabConstraintUsage,
-    VTabHostContext, VTabIndexInfo, VTabOrderBy, VTabRiskFlags, VTabUpdateOperation, VirtualCursor,
-    VirtualTable, VirtualTableModule,
+    ShadowBlobRead, ShadowHint, VTabConfigOption, VTabConflictMode, VTabConstraint,
+    VTabConstraintOp, VTabConstraintUsage, VTabHostContext, VTabIndexInfo, VTabOrderBy,
+    VTabRiskFlags, VTabUpdateOperation, VirtualCursor, VirtualTable, VirtualTableModule,
 };
 
 #[cfg(test)]

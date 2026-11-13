@@ -67,6 +67,11 @@ pub struct VmRuntimeContext {
     pub last_insert_rowid: i64,
     pub last_changes: u64,
     pub total_changes: u64,
+    /// Rows changed by the nested statements of virtual-table modules (the statements a C
+    /// module steps on the host connection). Part of `total_changes()`; kept apart from
+    /// `total_changes` because C does not take these rows back when the statement that
+    /// caused them fails.
+    pub nested_changes: u64,
     /// UTC Unix epoch milliseconds captured at the start of statement execution (`sqlite3StmtCurrentTime`).
     pub stmt_timestamp_ms: Option<i64>,
     /// Enables `testfixture` SQL functions (`randstr`, `sqlite/src/test_func.c`).
@@ -955,7 +960,9 @@ fn eval_scalar_function_plain(
         }
         "TOTAL_CHANGES" => {
             check_arity(name, args, 0, 0)?;
-            Ok(Value::Integer(ctx.total_changes as i64))
+            Ok(Value::Integer(
+                (ctx.total_changes + ctx.nested_changes) as i64,
+            ))
         }
         "CURRENT_DATE" => {
             check_arity(name, args, 0, 0)?;

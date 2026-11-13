@@ -7859,7 +7859,163 @@ fn emit_explain_window_spec_literals(prog: &mut VdbeProgram, ws: &WindowSpec) {
 }
 
 /// Generates 4-column `EXPLAIN QUERY PLAN <stmt>` rows: `(id, parent, notused, detail)`.
+/// A `SCAN <name>` line of EXPLAIN QUERY PLAN that may belong to a virtual table: what
+/// `explain_query_plan_in_db_set` needs to ask the table's xBestIndex.
+struct VtabEqpRequest {
+    name: QualifiedName,
+    selection: Option<Expr>,
+    /// Names (aliases) of the tables earlier in the join order.
+    bound: Vec<String>,
+    /// `" LEFT-JOIN"` for the right table of a LEFT JOIN.
+    suffix: &'static str,
+}
+
+thread_local! {
+    static VTAB_EQP_REQUESTS: std::cell::RefCell<Vec<VtabEqpRequest>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Separates the text of a `SCAN <name>` line from the number of its [`VtabEqpRequest`].
+const VTAB_EQP_MARK: char = '\u{1}';
+
+fn register_vtab_eqp_request(
+    name: &QualifiedName,
+    suffix: &'static str,
+    selection: Option<&Expr>,
+    bound: &[String],
+) -> usize {
+    VTAB_EQP_REQUESTS.with(|r| {
+        let mut r = r.borrow_mut();
+        r.push(VtabEqpRequest {
+            name: name.clone(),
+            selection: selection.cloned(),
+            bound: bound.to_vec(),
+            suffix,
+        });
+        r.len() - 1
+    })
+}
+
+/// Completes (or just cleans) the marked `SCAN` lines: for a connected virtual table C prints
+/// `SCAN <name> VIRTUAL TABLE INDEX <idxNum>:<idxStr>` (where.c `sqlite3WhereExplainOneScan`).
+fn finish_vtab_eqp_rows(rows: &mut Vec<Vec<Value>>, db_set: Option<&DatabaseSet>) {
+    let reqs = VTAB_EQP_REQUESTS.with(|r| std::mem::take(&mut *r.borrow_mut()));
+    let mut next_id = rows
+        .iter()
+        .filter_map(|r| r.first().and_then(Value::as_i64))
+        .max()
+        .unwrap_or(1)
+        + 1;
+    let mut ri = 0;
+    while ri < rows.len() {
+        let row_id = rows[ri].first().and_then(Value::as_i64).unwrap_or(0);
+        let row = &mut rows[ri];
+        ri += 1;
+        let Some(Value::Text(detail)) = row.get_mut(3) else {
+            continue;
+        };
+        let Some(pos) = detail.find(VTAB_EQP_MARK) else {
+            continue;
+        };
+        let req_idx: Option<usize> = detail[pos + VTAB_EQP_MARK.len_utf8()..].parse().ok();
+        detail.truncate(pos);
+        let (Some(db_set), Some(req)) = (db_set, req_idx.and_then(|i| reqs.get(i))) else {
+            continue;
+        };
+        let Some((_, db_name, vt_name, declared)) =
+            db_set.find_connected_vtab_in_set(&req.name, false)
+        else {
+            continue;
+        };
+        let disp = detail.strip_prefix("SCAN ").unwrap_or("").to_owned();
+        let bound = &req.bound;
+        let is_bound = |t: &str| {
+            if t.is_empty() {
+                !bound.is_empty()
+            } else {
+                bound.iter().any(|b| b.eq_ignore_ascii_case(t))
+            }
+        };
+        // MULTI-INDEX OR: one `INDEX n` child per branch, each with its own scan line.
+        if let Some(wh) = req.selection.as_ref()
+            && let Some(or_plan) = crate::engine::choose_vtab_or_plan(
+                db_set, &db_name, &vt_name, declared, &disp, wh, &is_bound, true,
+            )
+        {
+            *detail = format!("MULTI-INDEX OR{}", req.suffix);
+            let mut extra: Vec<Vec<Value>> = Vec::new();
+            for (bi, (bw, n_own)) in or_plan.branch_wheres.iter().enumerate() {
+                let idx_id = next_id;
+                next_id += 1;
+                extra.push(vec![
+                    Value::Integer(idx_id),
+                    Value::Integer(row_id),
+                    Value::Integer(0),
+                    Value::Text(format!("INDEX {}", bi + 1)),
+                ]);
+                let text = match crate::engine::plan_vtab_scan_static(
+                    db_set,
+                    &db_name,
+                    &vt_name,
+                    declared,
+                    &disp,
+                    Some(bw),
+                    &is_bound,
+                    true,
+                    *n_own,
+                ) {
+                    Some(p) => format!(
+                        "SCAN {disp} VIRTUAL TABLE INDEX {}:{}",
+                        p.idx_num,
+                        p.idx_str.as_deref().unwrap_or("")
+                    ),
+                    None => format!("SCAN {disp}"),
+                };
+                extra.push(vec![
+                    Value::Integer(next_id),
+                    Value::Integer(idx_id),
+                    Value::Integer(0),
+                    Value::Text(text),
+                ]);
+                next_id += 1;
+            }
+            let n_extra = extra.len();
+            rows.splice(ri..ri, extra);
+            ri += n_extra;
+            continue;
+        }
+        let Some(plan) = crate::engine::plan_vtab_scan_static(
+            db_set,
+            &db_name,
+            &vt_name,
+            declared,
+            &disp,
+            req.selection.as_ref(),
+            &is_bound,
+            true,
+            0,
+        ) else {
+            continue;
+        };
+        detail.push_str(&format!(
+            " VIRTUAL TABLE INDEX {}:{}{}",
+            plan.idx_num,
+            plan.idx_str.as_deref().unwrap_or(""),
+            req.suffix
+        ));
+    }
+}
+
 pub fn explain_query_plan(stmt: &Stmt, schema: &Schema) -> Result<Vec<Vec<Value>>> {
+    VTAB_EQP_REQUESTS.with(|r| r.borrow_mut().clear());
+    let mut rows = explain_query_plan_schema_only(stmt, schema);
+    if let Ok(ref mut r) = rows {
+        finish_vtab_eqp_rows(r, None);
+    }
+    rows
+}
+
+fn explain_query_plan_schema_only(stmt: &Stmt, schema: &Schema) -> Result<Vec<Vec<Value>>> {
     explain_query_plan_core(stmt, |name| {
         if name
             .schema
@@ -7889,11 +8045,16 @@ pub fn explain_query_plan(stmt: &Stmt, schema: &Schema) -> Result<Vec<Vec<Value>
 
 /// Multi-database variant of [`explain_query_plan`].
 pub fn explain_query_plan_in_db_set(stmt: &Stmt, db_set: &DatabaseSet) -> Result<Vec<Vec<Value>>> {
-    explain_query_plan_core(stmt, |name| {
+    VTAB_EQP_REQUESTS.with(|r| r.borrow_mut().clear());
+    let mut rows = explain_query_plan_core(stmt, |name| {
         let (db_id, rel) = db_set.find_relation_in_set(name).ok().flatten()?;
         let slot = db_set.slot(db_id)?;
         Some((db_id, slot.name.as_str(), &slot.schema, rel))
-    })
+    });
+    if let Ok(ref mut r) = rows {
+        finish_vtab_eqp_rows(r, Some(db_set));
+    }
+    rows
 }
 
 fn plan_satisfies_order_by(
@@ -8950,7 +9111,34 @@ where
                                         .map(str::to_owned)
                                         .or_else(|| resolve_cte_target_name(name))
                                         .unwrap_or_else(|| name.name.clone());
-                                    let _ = push_node(scan_parent, format!("SCAN {disp_name}"));
+                                    if is_cte(name) {
+                                        let _ = push_node(scan_parent, format!("SCAN {disp_name}"));
+                                    } else {
+                                        // Possibly a virtual table: the caller that knows the
+                                        // connection completes the line (see
+                                        // `explain_query_plan_in_db_set`).
+                                        let is_left = jtype_opt == Some(JoinType::Left);
+                                        // `combined_where` already holds the ON terms of
+                                        // the inner joins after the WHERE terms, which is
+                                        // the order of C's WHERE clause (`sqlite3ProcessJoin`
+                                        // appends ON to WHERE): each term is offered once.
+                                        let pred = if is_left {
+                                            on_opt.cloned()
+                                        } else {
+                                            combined_where.clone()
+                                        };
+                                        let req = register_vtab_eqp_request(
+                                            name,
+                                            if is_left { " LEFT-JOIN" } else { "" },
+                                            pred.as_ref(),
+                                            &outer_bound_names,
+                                        );
+                                        let _ = push_node(
+                                            scan_parent,
+                                            format!("SCAN {disp_name}{VTAB_EQP_MARK}{req}"),
+                                        );
+                                        outer_bound_names.push(disp_name);
+                                    }
                                 }
                             }
                             TableOrSubquery::Subquery { .. } => {

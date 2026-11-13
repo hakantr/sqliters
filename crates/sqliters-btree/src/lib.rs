@@ -1031,6 +1031,7 @@ impl Btree {
                         if self.has_content_get(leaf_pgno) {
                             self.pager.write_page(leaf_pgno)?;
                         } else {
+                            self.pager.mark_no_content(leaf_pgno);
                             self.pager.write_page(leaf_pgno)?.fill(0);
                         }
                         if self.dtrace_persistent() {
@@ -2128,6 +2129,30 @@ impl Btree {
                 }
             }
         }
+    }
+
+    /// Calls `f` with the whole record of `rowid` in the Table B+Tree rooted at `root_pgno`
+    /// (`None` when there is no such row). A record that lies entirely on its leaf page is
+    /// passed in place, without a copy; one with overflow pages is assembled first.
+    pub fn with_table_row_payload<R>(
+        &mut self,
+        root_pgno: Pgno,
+        rowid: i64,
+        f: impl FnOnce(&[u8]) -> Result<R>,
+    ) -> Result<Option<R>> {
+        let Some((leaf_pgno, local_start, local_len, total_payload_len, overflow_page)) =
+            self.locate_table_leaf_cell_layout(root_pgno, rowid)?
+        else {
+            return Ok(None);
+        };
+        if overflow_page.is_none() && (local_len as u32) == total_payload_len {
+            let raw = self.pager.read_page(leaf_pgno)?;
+            return f(&raw[local_start..local_start + local_len]).map(Some);
+        }
+        let Some(full) = self.seek_table_rowid(root_pgno, rowid)? else {
+            return Ok(None);
+        };
+        f(&full).map(Some)
     }
 
     /// Zero-allocation fast path: checks whether `rowid` exists on a non-overflow leaf cell and

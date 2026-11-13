@@ -766,7 +766,7 @@ fn test_custom_vtab_lifecycle_shadow_tables_transactions_and_defensive_mode() {
             &conn,
             "SELECT name, sql FROM sqlite_schema WHERE type='table' AND name='kv_renamed';"
         ),
-        vec!["kv_renamed|CREATE VIRTUAL TABLE kv_renamed USING shadow_kv(arg1, 'arg 2')"]
+        vec!["kv_renamed|CREATE VIRTUAL TABLE \"kv_renamed\" USING shadow_kv(arg1, 'arg 2')"]
     );
 
     // 11. DROP TABLE kv_renamed invokes xDestroy and drops the shadow table `kv_renamed_data`

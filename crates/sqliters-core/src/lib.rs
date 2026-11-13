@@ -229,18 +229,25 @@ fn register_builtin_extension_functions(
             Ok(RuntimeValue::plain(sqliters_ext::eval_rtreenode(
                 &args[0].value,
                 &args[1].value,
+                // sqlite3_str_appendf(pOut, " %g", (double)cell.aCoord[jj].f)
+                &|out, v| {
+                    if let Ok(bytes) =
+                        sqliters_vdbe::printf::sqlite_printf(b"%g", &[Value::Real(v)])
+                    {
+                        out.push_str(&String::from_utf8_lossy(&bytes));
+                    }
+                },
             )?))
         },
     );
 
-    for arity in [1usize, 2usize] {
-        functions.register_scalar("rtreecheck", Some(arity), FunctionFlags::INNOCUOUS, |_| {
-            Err(SqliteError::new(
-                ErrorCode::Internal,
-                "__sqliters_builtin_rtreecheck__",
-            ))
-        });
-    }
+    // rtree.c registers rtreecheck with nArg = -1 and checks the count when it is called.
+    functions.register_scalar("rtreecheck", None, FunctionFlags::INNOCUOUS, |_| {
+        Err(SqliteError::new(
+            ErrorCode::Internal,
+            "__sqliters_builtin_rtreecheck__",
+        ))
+    });
 }
 
 /// `true` when the calling thread is currently inside the execution gate of *any* connection (it is
@@ -642,6 +649,10 @@ pub(crate) struct ActiveLease {
     pub(crate) is_writer: bool,
     pub(crate) read_instances: SmallInstVec,
     pub(crate) write_instances: SmallInstVec,
+    /// Keys (`engine::vtab_cursor_key`) of the virtual tables this statement has a cursor
+    /// positioned on a row of: it is a SELECT that streams its rows from them and has
+    /// returned a row without having finished.
+    pub(crate) vtab_cursors: Vec<u64>,
 }
 
 #[inline]
@@ -699,6 +710,7 @@ impl ActivityTracker {
             is_writer,
             read_instances: SmallInstVec::new(),
             write_instances: SmallInstVec::new(),
+            vtab_cursors: Vec::new(),
         };
         if let Some(slot) = self.leases.iter_mut().find(|(hid, _)| *hid == id) {
             slot.1 = lease;
@@ -725,6 +737,7 @@ impl ActivityTracker {
             is_writer: has_w,
             read_instances,
             write_instances,
+            vtab_cursors: Vec::new(),
         };
         if let Some(slot) = self.leases.iter_mut().find(|(hid, _)| *hid == id) {
             slot.1 = lease;
@@ -752,6 +765,14 @@ impl ActivityTracker {
         }
     }
 
+    /// Records the virtual tables statement `id` now has a positioned cursor on.
+    #[inline]
+    pub(crate) fn set_vtab_cursors(&mut self, id: HandleId, keys: Vec<u64>) {
+        if let Some((_, lease)) = self.leases.iter_mut().find(|(hid, _)| *hid == id) {
+            lease.vtab_cursors = keys;
+        }
+    }
+
     #[inline]
     pub(crate) fn remove(&mut self, id: HandleId) -> Option<ActiveLease> {
         if let Some(pos) = self.leases.iter().rposition(|&(hid, _)| hid == id) {
@@ -775,9 +796,20 @@ impl ActivityTracker {
         let mut other_writers = 0usize;
         let mut other_read_db_mask = 0u16;
         let mut other_write_db_mask = 0u16;
+        let mut other_vtab_cursors = [0u64; 4];
+        let mut n_vtab_cursors = 0usize;
         for &(hid, ref lease) in &self.leases {
             if hid == exclude {
                 continue;
+            }
+            for &k in &lease.vtab_cursors {
+                // (More than four at once: the last slot is overwritten with the catch-all 1.)
+                if n_vtab_cursors < other_vtab_cursors.len() {
+                    other_vtab_cursors[n_vtab_cursors] = k;
+                } else {
+                    other_vtab_cursors[3] = 1;
+                }
+                n_vtab_cursors += 1;
             }
             other_active += 1;
             if lease.is_reader {
@@ -805,6 +837,7 @@ impl ActivityTracker {
             other_writers,
             other_read_db_mask,
             other_write_db_mask,
+            other_vtab_cursors,
         }
     }
 
@@ -1061,7 +1094,7 @@ impl ConnectionShared {
         self.mirror_changes
             .store(rt.last_changes, Ordering::Release);
         self.mirror_total_changes
-            .store(rt.total_changes, Ordering::Release);
+            .store(rt.total_changes + rt.nested_changes, Ordering::Release);
         self.mirror_autocommit
             .store(!explicit_tx && !implicit_savepoint_tx, Ordering::Release);
         self.mirror_rollback_count
@@ -6052,6 +6085,7 @@ impl ConnectionInner {
                 last_insert_rowid: self.runtime.last_insert_rowid,
                 last_changes: 0,
                 total_changes: 0,
+                nested_changes: 0,
                 stmt_timestamp_ms: stmt_ts,
                 enable_test_functions: self.runtime.enable_test_functions,
                 text_encoding: enc,
@@ -8519,6 +8553,12 @@ impl Statement {
                         }
                         let mut iter = out.rows.into_iter();
                         if let Some(first_row) = iter.next() {
+                            // A row of a scan that streams from an r-tree is out: C's cursor
+                            // sits on it until the statement is stepped to its end or reset.
+                            let keys = engine::streaming_vtab_cursor_keys(stmt_ref, &inner.db_set);
+                            if !keys.is_empty() {
+                                inner.activity.set_vtab_cursors(hid, keys);
+                            }
                             self.lifecycle =
                                 StatementLifecycle::Running(RunningExec::MaterializedRead {
                                     rows: iter,
@@ -10740,6 +10780,7 @@ fn try_fast_compiled_main_write_fields(
             last_insert_rowid: inner.runtime.last_insert_rowid,
             last_changes: 0,
             total_changes: 0,
+            nested_changes: 0,
             stmt_timestamp_ms: stmt_ts,
             enable_test_functions: inner.runtime.enable_test_functions,
             text_encoding: enc,
@@ -12924,6 +12965,8 @@ mod c_align_h1b_tests;
 mod c_align_h2_tests;
 #[cfg(test)]
 mod c_align_h3_tests;
+#[cfg(test)]
+mod c_align_h4_tests;
 /// Regression tests for behaviour that has to match C SQLite 3.54.1 (step 5e): every expected
 /// value below is what the reference `sqlite3` produces for the same statements.
 #[cfg(test)]

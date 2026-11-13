@@ -166,6 +166,13 @@ impl ConnectedVTabEntry {
     }
 }
 
+/// ASCII-case-insensitive name comparison that first tries the names as they are (the usual
+/// case: the caller hands back the spelling the registry gave it).
+#[inline(always)]
+fn name_eq_ignore_case(a: &str, b: &str) -> bool {
+    a == b || a.eq_ignore_ascii_case(b)
+}
+
 const MAX_SUB_SQL_CACHE_ENTRIES: usize = 128;
 
 /// Up to this many distinct connected table names, [`VTabRegistry`] lookups scan the keys
@@ -194,6 +201,8 @@ pub struct VTabRegistry {
     /// The `SQLITE_WriteSchema` flag bit (see `DatabaseSet::writable_schema_flag`).
     pub writable_schema_flag: bool,
     pub internal_sql_depth: usize,
+    /// Recycled record buffer of the direct shadow-table writes (carries no state).
+    pub shadow_scratch: Vec<u8>,
 }
 
 impl std::fmt::Debug for VTabRegistry {
@@ -231,6 +240,7 @@ impl VTabRegistry {
             defensive_mode: false,
             writable_schema_flag: false,
             internal_sql_depth: 0,
+            shadow_scratch: Vec::new(),
         };
         reg.register_module(Arc::new(GenerateSeriesModule));
         reg.register_module(Arc::new(DbStatModule));
@@ -313,7 +323,7 @@ impl VTabRegistry {
             return self
                 .connected
                 .iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case(table_name))
+                .find(|(key, _)| name_eq_ignore_case(key, table_name))
                 .map(|(_, bucket)| bucket);
         }
         if !table_name.bytes().any(|b| b.is_ascii_uppercase()) {
@@ -333,7 +343,7 @@ impl VTabRegistry {
             return self
                 .connected
                 .iter_mut()
-                .find(|(key, _)| key.eq_ignore_ascii_case(table_name))
+                .find(|(key, _)| name_eq_ignore_case(key, table_name))
                 .map(|(_, bucket)| bucket);
         }
         if !table_name.bytes().any(|b| b.is_ascii_uppercase()) {
@@ -349,7 +359,7 @@ impl VTabRegistry {
     pub fn get_connected(&self, db_name: &str, table_name: &str) -> Option<&ConnectedVTabEntry> {
         self.get_bucket(table_name)?
             .iter()
-            .find(|e| e.db_name.eq_ignore_ascii_case(db_name))
+            .find(|e| name_eq_ignore_case(&e.db_name, db_name))
     }
 
     /// Returns `true` if a connected virtual table belongs to an eponymous-only read-only module.
@@ -368,7 +378,7 @@ impl VTabRegistry {
     ) -> Option<&mut ConnectedVTabEntry> {
         self.get_bucket_mut(table_name)?
             .iter_mut()
-            .find(|e| e.db_name.eq_ignore_ascii_case(db_name))
+            .find(|e| name_eq_ignore_case(&e.db_name, db_name))
     }
 
     /// Inserts a newly created or connected virtual table entry.
@@ -809,6 +819,104 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
 
     fn shadow_max_rowid(&mut self, shadow_table: &str) -> Result<Option<i64>> {
         crate::engine::shadow_max_rowid_direct(self.ctx, self.db_name, shadow_table)
+    }
+
+    fn execute_sql_counted(&mut self, sql: &str, params: &[Value]) -> Result<usize> {
+        crate::engine::execute_internal_vtab_sql_counted(self.ctx, sql, params)
+    }
+
+    fn vtab_cursor_positioned(&self) -> bool {
+        let slots = &self.ctx.activity.other_vtab_cursors;
+        if slots[0] == 0 {
+            return false;
+        }
+        let key = crate::engine::vtab_cursor_key(self.db_name, self.table_name);
+        slots.iter().any(|&k| k == key || k == 1)
+    }
+
+    fn shadow_blob_read(
+        &mut self,
+        shadow_table: &str,
+        hint: &mut sqliters_types::ShadowHint,
+        rowid: i64,
+        col_idx: usize,
+        out: &mut [u8],
+    ) -> Result<sqliters_types::ShadowBlobRead> {
+        crate::engine::shadow_blob_read_direct(
+            self.ctx,
+            self.db_name,
+            shadow_table,
+            hint,
+            rowid,
+            col_idx,
+            out,
+        )
+    }
+
+    fn shadow_int_read(
+        &mut self,
+        shadow_table: &str,
+        hint: &mut sqliters_types::ShadowHint,
+        rowid: i64,
+        col_idx: usize,
+    ) -> Result<Option<i64>> {
+        crate::engine::shadow_int_read_direct(
+            self.ctx,
+            self.db_name,
+            shadow_table,
+            hint,
+            rowid,
+            col_idx,
+        )
+    }
+
+    fn shadow_replace_blob(
+        &mut self,
+        shadow_table: &str,
+        hint: &mut sqliters_types::ShadowHint,
+        rowid: Option<i64>,
+        blob: &[u8],
+    ) -> Result<i64> {
+        crate::engine::shadow_replace_blob_direct(
+            self.ctx,
+            self.db_name,
+            shadow_table,
+            hint,
+            rowid,
+            blob,
+        )
+    }
+
+    fn shadow_replace_int(
+        &mut self,
+        shadow_table: &str,
+        hint: &mut sqliters_types::ShadowHint,
+        rowid: Option<i64>,
+        value: Option<i64>,
+    ) -> Result<i64> {
+        crate::engine::shadow_replace_int_direct(
+            self.ctx,
+            self.db_name,
+            shadow_table,
+            hint,
+            rowid,
+            value,
+        )
+    }
+
+    fn shadow_delete_counted(
+        &mut self,
+        shadow_table: &str,
+        hint: &mut sqliters_types::ShadowHint,
+        rowid: i64,
+    ) -> Result<()> {
+        crate::engine::shadow_delete_counted_direct(
+            self.ctx,
+            self.db_name,
+            shadow_table,
+            hint,
+            rowid,
+        )
     }
 }
 

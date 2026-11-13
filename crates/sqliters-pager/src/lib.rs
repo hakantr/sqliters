@@ -639,6 +639,10 @@ pub struct Pager {
     commit_phase_one_done: bool,
 
     subsavepoints: Vec<SubsavepointSlot>,
+    /// The first slot of `subsavepoints` stands for C's "transaction savepoint" (a `SAVEPOINT`
+    /// run in autocommit mode: `db->isTransactionSavepoint`). C does not count it in
+    /// `db->nSavepoint`, so its pager has no savepoint open for it (`Pager.nSavepoint`).
+    transaction_savepoint: bool,
     sp_slot_pool: Vec<SubsavepointSlot>,
     sp_page_buf_pool: Vec<Vec<u8>>,
     backup_trackers: Vec<Arc<Mutex<BackupTracker>>>,
@@ -868,6 +872,7 @@ impl Pager {
             set_super: false,
             commit_phase_one_done: false,
             subsavepoints: Vec::new(),
+            transaction_savepoint: false,
             sp_slot_pool: Vec::new(),
             sp_page_buf_pool: Vec::new(),
             backup_trackers: Vec::new(),
@@ -2660,6 +2665,10 @@ impl Pager {
         self.backup_raw_staging = None;
 
         self.state = TransactionState::Write;
+        if savepoint_depth == 0 {
+            // No SQL savepoint is open when this write transaction starts.
+            self.transaction_savepoint = false;
+        }
 
         // Open requested anonymous subsavepoint slots BEFORE empty-DB Page 1 initialization
         // so `SAVEPOINT s1; CREATE TABLE ...; ROLLBACK TO s1;` can roll back to 0 pages!
@@ -3045,6 +3054,30 @@ impl Pager {
         Ok(())
     }
 
+    /// `sqlite3PagerGet(.., PAGER_GET_NOCONTENT)` (`getPageNormal`): the b-tree layer takes
+    /// `pgno` off the free list and does not care what it held. C then calls
+    /// `addToSavepointBitvecs`: the page counts as already saved in every savepoint that is
+    /// open, so no image of it ever goes to the sub-journal for them and a rollback to one of
+    /// them (ROLLBACK TO, or a statement that fails) leaves the page with whatever was last
+    /// written to it — it is a free-list leaf again by then, so nothing reads it. Call before
+    /// the page is made writable.
+    pub fn mark_no_content(&mut self, pgno: Pgno) {
+        for sp in &mut self.subsavepoints {
+            if pgno <= sp.orig_page_count && !sp.saved_pages.contains_key(&pgno) {
+                sp.saved_pages.insert(pgno, Vec::new());
+            }
+        }
+    }
+
+    /// Tells the pager whether the first SQL savepoint of the connection is the "transaction
+    /// savepoint" (`SAVEPOINT` in autocommit mode). C keeps that one out of `db->nSavepoint`:
+    /// `sqlite3BtreeBeginTrans` opens `db->nSavepoint` pager savepoints, so while only the
+    /// transaction savepoint is open `Pager.nSavepoint` is 0 and `sqlite3PagerDontWrite` works
+    /// as in a `BEGIN` transaction. The slot this pager keeps for it is not counted there.
+    pub fn set_transaction_savepoint(&mut self, on: bool) {
+        self.transaction_savepoint = on;
+    }
+
     /// `sqlite3PagerDontWrite` (`pager.c`): the b-tree layer says the content of `pgno` no
     /// longer matters (it has just become a free-list leaf). A page this transaction dirtied
     /// is then not written to the database file at commit, exactly as in C: only for a
@@ -3056,7 +3089,7 @@ impl Pager {
         if self.state != TransactionState::Write
             || self.use_wal()
             || self.db_kind != DatabaseKind::NamedDisk
-            || !self.subsavepoints.is_empty()
+            || self.subsavepoints.len() > usize::from(self.transaction_savepoint)
         {
             return false;
         }
@@ -4572,7 +4605,9 @@ impl Pager {
         self.backup_raw_staging = None;
         self.cache.truncate_above(sp.orig_page_count);
         for (&pgno, orig_bytes) in &sp.saved_pages {
-            if pgno <= sp.orig_page_count {
+            // (An empty image marks a page fetched with `PAGER_GET_NOCONTENT`: see
+            // `Self::mark_no_content`. It is not played back.)
+            if pgno <= sp.orig_page_count && !orig_bytes.is_empty() {
                 self.cache.insert(pgno, orig_bytes.clone(), true);
             }
         }

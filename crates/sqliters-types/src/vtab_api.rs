@@ -258,6 +258,174 @@ pub trait VTabHostContext {
             _ => Ok(None),
         }
     }
+
+    // ---------------------------------------------------------------------------------------
+    // Nested module statements, as C runs them (`sqlite3_step` of a statement the module
+    // prepared on the host connection). Such a statement is a top-level statement of its own:
+    // when it halts, `sqlite3VdbeHalt` stores its row count in `db->nChange` and adds it to
+    // `db->nTotalChange`, and an `OP_Insert` it runs sets `db->lastRowid`. The methods below
+    // have exactly those effects; `execute_sql` / `shadow_put_rowid` / `shadow_delete_rowid`
+    // above hide them from the connection counters.
+    // ---------------------------------------------------------------------------------------
+
+    /// [`Self::execute_sql`] whose changes are counted on the connection (`changes()`,
+    /// `total_changes()`) and whose inserts set `last_insert_rowid()`, as a statement stepped
+    /// by a C module does.
+    fn execute_sql_counted(&mut self, sql: &str, params: &[Value]) -> Result<usize> {
+        self.execute_sql(sql, params)
+    }
+
+    /// Whether another statement of the connection that is still running has a cursor of
+    /// this virtual table positioned on a row (it is a scan that has returned a row and has
+    /// neither reached its end nor been reset).
+    fn vtab_cursor_positioned(&self) -> bool {
+        false
+    }
+
+    /// `sqlite3_blob_open(db, zDb, shadow_table, <column col_idx>, rowid, 0)` followed by
+    /// `sqlite3_blob_bytes` and, when the size equals `out.len()`, `sqlite3_blob_read` of the
+    /// whole value into `out`. `hint` is an opaque per-table cache slot owned by the caller
+    /// (start it at [`ShadowHint::NONE`]); the host uses it to reach the table without looking
+    /// its name up again.
+    fn shadow_blob_read(
+        &mut self,
+        shadow_table: &str,
+        _hint: &mut ShadowHint,
+        rowid: i64,
+        col_idx: usize,
+        out: &mut [u8],
+    ) -> Result<ShadowBlobRead> {
+        let Some(row) = self.shadow_get_rowid(shadow_table, rowid)? else {
+            return Ok(ShadowBlobRead::NoRow);
+        };
+        let bytes: &[u8] = match row.get(col_idx) {
+            Some(Value::Blob(b)) => b,
+            Some(Value::Text(s)) => s.as_bytes(),
+            _ => return Ok(ShadowBlobRead::NotBlob),
+        };
+        if bytes.len() == out.len() {
+            out.copy_from_slice(bytes);
+        }
+        Ok(ShadowBlobRead::Size(bytes.len()))
+    }
+
+    /// `SELECT <column col_idx> FROM shadow_table WHERE rowid = ?1` read with
+    /// `sqlite3_column_int64`: `None` when there is no such row.
+    fn shadow_int_read(
+        &mut self,
+        shadow_table: &str,
+        _hint: &mut ShadowHint,
+        rowid: i64,
+        col_idx: usize,
+    ) -> Result<Option<i64>> {
+        let Some(row) = self.shadow_get_rowid(shadow_table, rowid)? else {
+            return Ok(None);
+        };
+        Ok(Some(match row.get(col_idx) {
+            Some(Value::Integer(i)) => *i,
+            Some(Value::Real(f)) => *f as i64,
+            _ => 0,
+        }))
+    }
+
+    /// `INSERT OR REPLACE INTO shadow_table VALUES(?1, ?2)` on a two-column table whose first
+    /// column is the INTEGER PRIMARY KEY, with `?2` bound to a blob; `rowid == None` binds
+    /// NULL (a new rowid is chosen by `OP_NewRowid`). Counted as a nested statement; returns
+    /// the rowid written (`sqlite3_last_insert_rowid`).
+    fn shadow_replace_blob(
+        &mut self,
+        shadow_table: &str,
+        _hint: &mut ShadowHint,
+        rowid: Option<i64>,
+        blob: &[u8],
+    ) -> Result<i64> {
+        let db_q = quote_vtab_sql_ident(self.db_name());
+        let tbl_q = quote_vtab_sql_ident(shadow_table);
+        let sql = format!("INSERT OR REPLACE INTO {db_q}.{tbl_q} VALUES(?1, ?2)");
+        let key = rowid.map_or(Value::Null, Value::Integer);
+        self.execute_sql_counted(&sql, &[key, Value::Blob(blob.to_vec())])?;
+        match rowid {
+            Some(r) => Ok(r),
+            None => {
+                let rows = self.query_sql("SELECT last_insert_rowid()", &[])?;
+                Ok(rows
+                    .first()
+                    .and_then(|r| r.first())
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0))
+            }
+        }
+    }
+
+    /// `INSERT OR REPLACE INTO shadow_table VALUES(?1, ?2)` on a two-column table whose first
+    /// column is the INTEGER PRIMARY KEY, with `?2` bound to an integer or NULL. Counted as a
+    /// nested statement; returns the rowid written.
+    fn shadow_replace_int(
+        &mut self,
+        shadow_table: &str,
+        _hint: &mut ShadowHint,
+        rowid: Option<i64>,
+        value: Option<i64>,
+    ) -> Result<i64> {
+        let db_q = quote_vtab_sql_ident(self.db_name());
+        let tbl_q = quote_vtab_sql_ident(shadow_table);
+        let sql = format!("INSERT OR REPLACE INTO {db_q}.{tbl_q} VALUES(?1, ?2)");
+        let key = rowid.map_or(Value::Null, Value::Integer);
+        let val = value.map_or(Value::Null, Value::Integer);
+        self.execute_sql_counted(&sql, &[key, val])?;
+        match rowid {
+            Some(r) => Ok(r),
+            None => {
+                let rows = self.query_sql("SELECT last_insert_rowid()", &[])?;
+                Ok(rows
+                    .first()
+                    .and_then(|r| r.first())
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0))
+            }
+        }
+    }
+
+    /// `DELETE FROM shadow_table WHERE rowid = ?1`, counted as a nested statement.
+    fn shadow_delete_counted(
+        &mut self,
+        shadow_table: &str,
+        _hint: &mut ShadowHint,
+        rowid: i64,
+    ) -> Result<()> {
+        let db_q = quote_vtab_sql_ident(self.db_name());
+        let tbl_q = quote_vtab_sql_ident(shadow_table);
+        let sql = format!("DELETE FROM {db_q}.{tbl_q} WHERE rowid = ?1");
+        self.execute_sql_counted(&sql, &[Value::Integer(rowid)])?;
+        Ok(())
+    }
+}
+
+/// Opaque cache slot a module keeps per shadow table for the direct shadow-table methods of
+/// [`VTabHostContext`]. Only the host gives its fields a meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShadowHint {
+    pub slot: u32,
+    pub stamp: u64,
+}
+
+impl ShadowHint {
+    /// A hint that refers to nothing yet.
+    pub const NONE: Self = Self {
+        slot: u32::MAX,
+        stamp: 0,
+    };
+}
+
+/// Outcome of [`VTabHostContext::shadow_blob_read`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowBlobRead {
+    /// No row with that rowid (`sqlite3_blob_open` fails with SQLITE_ERROR).
+    NoRow,
+    /// The column holds NULL, an integer or a real ("cannot open value of type ...").
+    NotBlob,
+    /// Size of the value in bytes; the output buffer was filled iff it has that size.
+    Size(usize),
 }
 
 fn quote_vtab_sql_ident(ident: &str) -> String {
