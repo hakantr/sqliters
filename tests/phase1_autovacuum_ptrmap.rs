@@ -1664,8 +1664,10 @@ fn group51_vacuum_ast_into_modes_errors_and_rowid_semantics() {
             .unwrap();
         assert_eq!(run_c_sql(&out_subquery_db, "PRAGMA integrity_check;"), "ok");
 
-        // In-place `VACUUM main`: verify explicit IPK rowids preserved (`-50, 10, 999999`) AND
-        // implicit rowids reassigned sequentially (`1, 2, 3`) WITH secondary/unique indexes intact!
+        // In-place `VACUUM main`: verify explicit IPK rowids preserved (`-50, 10, 999999`) AND the
+        // implicit rowids of a table WITH indexes kept as they are (`1, 3, 5`): C SQLite renumbers
+        // the rows only of a table that has neither an INTEGER PRIMARY KEY nor an index
+        // (`xferOptimization`: `OP_NewRowid` when `pDest->pIndex==0`).
         conn.execute("VACUUM main;").unwrap();
         let ipk_rids: Vec<i64> = conn
             .query("SELECT rowid FROM ipk_tbl ORDER BY rowid;", &[])
@@ -1687,18 +1689,18 @@ fn group51_vacuum_ast_into_modes_errors_and_rowid_semantics() {
             imp_rids,
             vec![
                 (1, "a".to_owned()),
-                (2, "c".to_owned()),
-                (3, "e".to_owned())
+                (3, "c".to_owned()),
+                (5, "e".to_owned())
             ]
         );
-        // Index-ordered lookup on reassigned implicit rowids:
+        // Index-ordered lookup on the kept implicit rowids:
         let idx_hit = conn
             .query(
                 "SELECT rowid, k FROM imp_tbl WHERE n = 500 AND k = 'e';",
                 &[],
             )
             .unwrap();
-        assert_eq!(idx_hit.rows[0].get_i64(0), Some(3));
+        assert_eq!(idx_hit.rows[0].get_i64(0), Some(5));
         assert_eq!(
             conn.query("PRAGMA integrity_check;", &[]).unwrap().rows[0].get_str(0),
             Some("ok")

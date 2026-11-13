@@ -3025,6 +3025,26 @@ impl Pager {
         Ok(self.cache.entry_data_mut(slot))
     }
 
+    /// What C's cache holds for page `pgno` right after its content was moved to another page
+    /// number (`sqlite3PagerMovepage`) and the page is fetched again: the image the database
+    /// file (or the WAL) has — the content from before this transaction, or zeroes for a page
+    /// the transaction added. The page stays writable. (A page the transaction has not
+    /// journalled still equals its stored image; with the journal switched off there is no
+    /// pre-image and the content is left as it is.)
+    pub fn restore_stored_image(&mut self, pgno: Pgno) -> Result<()> {
+        let slot = self.mark_page_writable(pgno)?;
+        if pgno > self.tx_orig_page_count {
+            self.cache.entry_data_mut(slot).fill(0);
+        } else if let Some(orig) = self.tx_preimages.get(&pgno) {
+            let n = orig.len();
+            let d = self.cache.entry_data_mut(slot);
+            if d.len() == n {
+                d.copy_from_slice(orig);
+            }
+        }
+        Ok(())
+    }
+
     /// `sqlite3PagerDontWrite` (`pager.c`): the b-tree layer says the content of `pgno` no
     /// longer matters (it has just become a free-list leaf). A page this transaction dirtied
     /// is then not written to the database file at commit, exactly as in C: only for a

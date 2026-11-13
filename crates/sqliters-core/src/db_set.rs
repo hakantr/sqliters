@@ -227,6 +227,10 @@ pub struct DatabaseSet {
     temp_store: TempStoreMode,
     disk_vfs: Arc<dyn Vfs>,
     default_page_size: u32,
+    /// Page size of a database file created by ATTACH: the library default the connection
+    /// was opened with. `PRAGMA page_size` of another database does not change it (C:
+    /// `attachFunc` opens the b-tree without calling `sqlite3BtreeSetPageSize`).
+    attach_page_size: u32,
     lock_geometry: LockGeometry,
     interrupt_flag: Arc<AtomicBool>,
     temp_trigger_bindings: Vec<TempTriggerBinding>,
@@ -307,6 +311,7 @@ impl DatabaseSet {
             temp_store,
             disk_vfs,
             default_page_size,
+            attach_page_size: default_page_size,
             lock_geometry,
             interrupt_flag,
             temp_trigger_bindings: Vec::new(),
@@ -647,6 +652,12 @@ impl DatabaseSet {
     #[inline]
     pub const fn default_page_size(&self) -> u32 {
         self.default_page_size
+    }
+
+    /// Page size of a database file that ATTACH creates.
+    #[inline]
+    pub const fn attach_page_size(&self) -> u32 {
+        self.attach_page_size
     }
 
     /// Updates the connection default page size candidate.

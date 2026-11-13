@@ -2811,35 +2811,6 @@ pub(crate) fn scan_table_incremental_with_services(
     res
 }
 
-/// Scans all key payloads of an Index B-Tree using an incremental `BtreeCursor`,
-/// checking the connection interrupt flag on every entry and closing the cursor before returning.
-pub(crate) fn scan_index_incremental(
-    btree: &mut Btree,
-    root_pgno: Pgno,
-    orders: Vec<KeySortOrder>,
-) -> Result<Vec<Vec<u8>>> {
-    if root_pgno == 0 {
-        return Ok(Vec::new());
-    }
-    let cid = btree.open_index_cursor(root_pgno, orders, false);
-    let res = (|| {
-        let mut out = Vec::new();
-        if !btree.cursor_first(cid)? {
-            return Ok(out);
-        }
-        loop {
-            let payload = btree.cursor_payload(cid)?;
-            out.push(payload);
-            if !btree.cursor_next(cid)? {
-                break;
-            }
-        }
-        Ok(out)
-    })();
-    btree.close_cursor(cid);
-    res
-}
-
 /// Scans all key payloads of an Index B-Tree while driving `services` interrupt and progress
 /// ticks on every entry.
 pub(crate) fn scan_index_incremental_with_services(

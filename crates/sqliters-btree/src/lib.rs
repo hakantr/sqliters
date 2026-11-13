@@ -33,6 +33,7 @@ pub use cursor::{
     BTCURSOR_MAX_DEPTH, BtreeCursorState, CursorId, CursorKind, CursorPagePos, CursorStack,
     SavedCursorKey, SkipNext,
 };
+pub use insert::AppendCursor;
 pub use integrity::IntegrityReport;
 pub use page::{
     BtreePageType, IndexInteriorCell, IndexLeafCell, ParsedPage, PayloadBounds, RawIndexCell,
@@ -255,6 +256,16 @@ pub struct Btree {
     bal_sz: Vec<u16>,
     /// Decision trace only: an insert (not a delete) is running.
     tr_ins: bool,
+    /// `(table root, rowid, serial)` of rows a table insert replaced where they were, without
+    /// `balance()`, while no later write touched that tree: C's write cursor is then still
+    /// valid on the row with `BTCF_ValidNKey` set ([`Self::in_place_row`]). At most one entry
+    /// per tree; any modification of the tree drops its entry (`saveAllCursors`).
+    in_place_rows: Vec<(Pgno, i64, u64)>,
+    /// Source of the serial numbers in `in_place_rows`.
+    in_place_serial: u64,
+    /// The insert being run stores a cell prepared by `sqlite3BtreeTransferRow`
+    /// (`BTREE_PREFORMAT`): its overflow pages are allocated with `nearby = 0`.
+    preformat: bool,
     /// `BtShared.pHasContent`: the pages moved to the free list as leaves by the current
     /// transaction (bit set, sized to the page count when the first one was freed). Such a
     /// page keeps its content when it is allocated again before the transaction ends.
@@ -297,6 +308,9 @@ impl Btree {
             bal_ap: Vec::new(),
             bal_sz: Vec::new(),
             tr_ins: false,
+            in_place_rows: Vec::new(),
+            in_place_serial: 0,
+            preformat: false,
             has_content: None,
         }
     }
@@ -327,6 +341,14 @@ impl Btree {
     #[inline]
     fn dtrace_persistent(&self) -> bool {
         self.pager.db_kind() == sqliters_types::DatabaseKind::NamedDisk
+    }
+
+    /// Decision trace only (public form of the test above, for the trace points of the SQL
+    /// layer that have a C counterpart guarded by `!pPager->tempFile`).
+    #[inline]
+    #[must_use]
+    pub fn dtrace_traced(&self) -> bool {
+        self.dtrace_persistent()
     }
 
     /// Installs a new statement cookie state and returns the previous one (to be restored when
@@ -1152,62 +1174,6 @@ impl Btree {
     // Overflow Payload Chains (`btreeInt.h:198-204`)
     // ========================================================================
 
-    fn prepare_cell_payload(
-        &mut self,
-        bounds: PayloadBounds,
-        full_payload: &[u8],
-    ) -> Result<(u32, Vec<u8>, Option<Pgno>)> {
-        let total_len = u32::try_from(full_payload.len())
-            .map_err(|_| SqliteError::new(ErrorCode::TooBig, "row payload exceeds 4GiB"))?;
-        let local_len = bounds.local_len(total_len);
-        let local_bytes = full_payload[..local_len].to_vec();
-
-        if local_len == full_payload.len() {
-            return Ok((total_len, local_bytes, None));
-        }
-
-        let usable = bounds.usable_size as usize;
-        let chunk_cap = usable - 4;
-        let spilled = &full_payload[local_len..];
-        let chunks: Vec<&[u8]> = spilled.chunks(chunk_cap).collect();
-
-        // Allocate overflow pages in forward order and link them
-        // `fillInCell`: every overflow page is allocated near the previous page of the chain
-        // (`nearby` = 0 for the first one); in auto-vacuum mode the hint is the page after it,
-        // skipping pointer-map pages and the pending-byte page.
-        let mut ovfl_pages: Vec<Pgno> = Vec::with_capacity(chunks.len());
-        let auto_vac = self.is_auto_vacuum();
-        let lock_pg = self.lock_byte_page();
-        let mut nearby: Pgno = 0;
-        for _ in 0..chunks.len() {
-            if auto_vac {
-                nearby += 1;
-                while is_ptrmap_page(nearby, bounds.usable_size, lock_pg) || nearby == lock_pg {
-                    nearby += 1;
-                }
-            }
-            nearby = self.allocate_page_near(nearby)?;
-            ovfl_pages.push(nearby);
-        }
-
-        for (i, chunk) in chunks.iter().enumerate() {
-            let pgno = ovfl_pages[i];
-            let next_pgno = ovfl_pages.get(i + 1).copied().unwrap_or(0);
-            let buf = self.pager.write_page(pgno)?;
-            buf[..usable].fill(0);
-            buf[0..4].copy_from_slice(&next_pgno.to_be_bytes());
-            buf[4..4 + chunk.len()].copy_from_slice(chunk);
-        }
-
-        if self.is_auto_vacuum() && ovfl_pages.len() >= 2 {
-            for i in 1..ovfl_pages.len() {
-                self.ptrmap_put(ovfl_pages[i], PtrmapType::Overflow2, ovfl_pages[i - 1])?;
-            }
-        }
-
-        Ok((total_len, local_bytes, Some(ovfl_pages[0])))
-    }
-
     fn read_full_payload(
         &mut self,
         total_len: u32,
@@ -1335,6 +1301,10 @@ impl Btree {
                 )));
             }
             self.relocate_page(pgno_root, e_type, ptr_page, pgno_move, false)?;
+            // `btreeCreateTable`: the page object went to `pgnoMove` (`sqlite3PagerMovepage`)
+            // and `btreeGetPage(pgnoRoot)` reads the page again — from the file. `zeroPage`
+            // below rewrites only the header, so the rest of the new root is that image.
+            self.pager.restore_stored_image(pgno_root)?;
         }
 
         self.zero_root_page(pgno_root, flags)?;
@@ -2495,6 +2465,29 @@ impl Btree {
     /// are handled exactly as in C (`balance()`), `root_pgno` is preserved (including page 1).
     pub fn insert_table(&mut self, root_pgno: Pgno, rowid: i64, payload: &[u8]) -> Result<()> {
         self.insert_table_at(root_pgno, rowid, payload, None)
+    }
+
+    /// Whether any tree has a row replaced in place by its last write ([`Self::in_place_row`]).
+    #[must_use]
+    #[inline]
+    pub fn has_in_place_rows(&self) -> bool {
+        !self.in_place_rows.is_empty()
+    }
+
+    /// `(rowid, serial)` of the row of table `root_pgno` that the last write to that tree
+    /// replaced where it was, without rebalancing; `None` when the last write to the tree was
+    /// anything else. C's write cursor then stays on that row (`CURSOR_VALID`,
+    /// `BTCF_ValidNKey`), and a following `OP_NotExists` for the next rowid reaches its row
+    /// with `sqlite3BtreeNext` + `getCellInfo` (`sqlite3BtreeTableMoveto`: "the requested key
+    /// is one more than the previous key") — i.e. with the cell parsed. The serial number
+    /// tells two replacements of the same row apart.
+    #[must_use]
+    #[inline(never)]
+    pub fn in_place_row(&self, root_pgno: Pgno) -> Option<(i64, u64)> {
+        self.in_place_rows
+            .iter()
+            .find(|e| e.0 == root_pgno)
+            .map(|e| (e.1, e.2))
     }
 
     /// [`Self::insert_table`] for a caller that already located `rowid`: `position` is the
@@ -4612,307 +4605,77 @@ impl Btree {
         self.insert_index_c(root_pgno, record_bytes, orders, true)
     }
 
-    /// Bulk-loads pre-sorted, strictly distinct serialized index records into the Index B-Tree
-    /// rooted at `root_pgno` in a single bottom-up pass with zero page splits.
-    pub fn bulk_load_sorted_index<R: AsRef<[u8]>>(
+    /// `OP_SeekEnd` + `OP_IdxInsert` with `OPFLAG_USESEEKRESULT`: appends `record_bytes` after
+    /// the last entry of the index `ac` was opened on, without comparing keys (C: the sorted
+    /// output of the sorter in `sqlite3RefillIndex`, the index copy of VACUUM). `preformat`:
+    /// the cell comes from `sqlite3BtreeTransferRow` (`OPFLAG_PREFORMAT`).
+    pub fn append_index(
         &mut self,
-        root_pgno: Pgno,
-        sorted_records: &[R],
+        ac: &mut AppendCursor,
+        record_bytes: &[u8],
+        preformat: bool,
     ) -> Result<()> {
-        self.save_cursors_for_mutation(Some(root_pgno), None)?;
-
-        let usable = self.pager.usable_size();
-        let usable_usize = usable as usize;
-        {
-            let raw = self.pager.read_page(root_pgno)?;
-            let (ptype, n_cell, _) = raw_page_header(root_pgno, usable, raw)?;
-            if ptype != BtreePageType::IndexLeaf || n_cell != 0 {
-                self.clear_tree(root_pgno)?;
-            }
-        }
-        let total = sorted_records.len();
-        if total == 0 {
-            return Ok(());
-        }
-
-        let bounds = PayloadBounds::for_index(usable);
-        let max_local = bounds.max_local as usize;
-        let auto_vac = self.is_auto_vacuum();
-
-        let leaf_cell_encoded_len = |rec_len: usize| -> Result<usize> {
-            let total_u32 = u32::try_from(rec_len)
-                .map_err(|_| SqliteError::new(ErrorCode::TooBig, "row payload exceeds 4GiB"))?;
-            let raw_len = if rec_len <= max_local {
-                varint_len(rec_len as u64) + rec_len
-            } else {
-                let loc = bounds.local_len(total_u32);
-                varint_len(rec_len as u64) + loc + 4
-            };
-            Ok(raw_len.max(4))
-        };
-
-        let mut leaf_sizes = Vec::with_capacity(total);
-        let mut root_leaf_bytes: usize = (if root_pgno == 1 { 100usize } else { 0usize }) + 8;
-        for rec in sorted_records {
-            let clen = leaf_cell_encoded_len(rec.as_ref().len())?;
-            leaf_sizes.push(clen);
-            root_leaf_bytes = root_leaf_bytes.saturating_add(2 + clen);
-        }
-
-        if root_leaf_bytes <= usable_usize {
-            return self.write_sorted_index_leaf_slice(
-                root_pgno,
-                usable,
-                bounds,
-                sorted_records,
-                &leaf_sizes,
-                auto_vac,
-            );
-        }
-
-        let leaf_budget = ((usable_usize - 8) * 9) / 10;
-        let mut dividers: Vec<(Pgno, usize)> = Vec::new();
-        let mut rightmost_child: Pgno = 0;
-        let mut pos = 0usize;
-        while pos < total {
-            let mut used = 2 + leaf_sizes[pos];
-            let mut end = pos + 1;
-            while end < total && used + 2 + leaf_sizes[end] <= leaf_budget {
-                used += 2 + leaf_sizes[end];
-                end += 1;
-            }
-            if end + 1 == total && end > pos + 1 {
-                end -= 1;
-            }
-            let leaf_pgno = self.allocate_page_near(1)?;
-            self.write_sorted_index_leaf_slice(
-                leaf_pgno,
-                usable,
-                bounds,
-                &sorted_records[pos..end],
-                &leaf_sizes[pos..end],
-                auto_vac,
-            )?;
-            if end < total {
-                dividers.push((leaf_pgno, end));
-                pos = end + 1;
-            } else {
-                rightmost_child = leaf_pgno;
-                break;
-            }
-        }
-
-        let int_cell_len = |rec_idx: usize| -> usize { 4 + leaf_sizes[rec_idx] };
-        let root_int_hdr: usize = (if root_pgno == 1 { 100usize } else { 0usize }) + 12;
-        let int_budget = usable_usize - 12;
-
-        loop {
-            let m = dividers.len();
-            let mut root_int_bytes: usize = root_int_hdr;
-            for &(_, ridx) in &dividers {
-                root_int_bytes = root_int_bytes.saturating_add(2 + int_cell_len(ridx));
-            }
-            if root_int_bytes <= usable_usize {
-                return self.write_sorted_index_interior_slice(
-                    root_pgno,
-                    usable,
-                    bounds,
-                    sorted_records,
-                    &leaf_sizes,
-                    &dividers,
-                    rightmost_child,
-                    auto_vac,
-                );
-            }
-
-            let mut next_dividers: Vec<(Pgno, usize)> = Vec::new();
-            let mut next_rightmost: Pgno = 0;
-            let mut dpos = 0usize;
-            while dpos < m {
-                let mut used = 2 + int_cell_len(dividers[dpos].1);
-                let mut dend = dpos + 1;
-                while dend < m && used + 2 + int_cell_len(dividers[dend].1) <= int_budget {
-                    used += 2 + int_cell_len(dividers[dend].1);
-                    dend += 1;
-                }
-                if dend + 1 == m && dend > dpos + 1 {
-                    dend -= 1;
-                }
-                let int_pgno = self.allocate_page_near(1)?;
-                if dend < m {
-                    let rchild = dividers[dend].0;
-                    let promoted_ridx = dividers[dend].1;
-                    self.write_sorted_index_interior_slice(
-                        int_pgno,
-                        usable,
-                        bounds,
-                        sorted_records,
-                        &leaf_sizes,
-                        &dividers[dpos..dend],
-                        rchild,
-                        auto_vac,
-                    )?;
-                    next_dividers.push((int_pgno, promoted_ridx));
-                    dpos = dend + 1;
-                } else {
-                    self.write_sorted_index_interior_slice(
-                        int_pgno,
-                        usable,
-                        bounds,
-                        sorted_records,
-                        &leaf_sizes,
-                        &dividers[dpos..m],
-                        rightmost_child,
-                        auto_vac,
-                    )?;
-                    next_rightmost = int_pgno;
-                    break;
-                }
-            }
-            dividers = next_dividers;
-            rightmost_child = next_rightmost;
-        }
+        self.preformat = preformat;
+        let res = self.append_index_c(ac, record_bytes);
+        self.preformat = false;
+        res
     }
 
-    fn write_sorted_index_leaf_slice<R: AsRef<[u8]>>(
+    /// [`Self::insert_index_bulk`] for a caller that inserts keys in ascending order through
+    /// one cursor (`ac`, opened with `bulk`): a key greater than the last entry of the index
+    /// goes behind it without a search, as in `sqlite3BtreeIndexMoveto`.
+    pub fn insert_index_sorted(
         &mut self,
-        pgno: Pgno,
-        usable: u32,
-        bounds: PayloadBounds,
-        records: &[R],
-        cell_sizes: &[usize],
-        auto_vac: bool,
+        ac: &mut AppendCursor,
+        record_bytes: &[u8],
+        orders: &[KeySortOrder],
     ) -> Result<()> {
-        let usable_usize = usable as usize;
-        let max_local = bounds.max_local as usize;
-        let mut ovfl_entries: Vec<(usize, Pgno)> = Vec::new();
-        for (i, rec) in records.iter().enumerate() {
-            if rec.as_ref().len() > max_local {
-                let (_, _, Some(ovfl)) = self.prepare_cell_payload(bounds, rec.as_ref())? else {
-                    unreachable!()
-                };
-                ovfl_entries.push((i, ovfl));
-            }
-        }
-
-        let hdr_off = if pgno == 1 { 100 } else { 0 };
-        let ptr_base = hdr_off + 8;
-        let n_cell = records.len();
-        {
-            let raw = self.pager.write_page(pgno)?;
-            raw[hdr_off..usable_usize].fill(0);
-            let mut content_top = usable_usize;
-            let mut ovfl_cursor = 0usize;
-            for (i, (rec_ref, &clen)) in records.iter().zip(cell_sizes.iter()).enumerate() {
-                let rec = rec_ref.as_ref();
-                content_top -= clen;
-                let ip = ptr_base + 2 * i;
-                raw[ip..ip + 2].copy_from_slice(&(content_top as u16).to_be_bytes());
-                let mut pos = content_top;
-                pos += put_varint(&mut raw[pos..], rec.len() as u64);
-                if rec.len() <= max_local {
-                    raw[pos..pos + rec.len()].copy_from_slice(rec);
-                } else {
-                    let loc = bounds.local_len(rec.len() as u32);
-                    raw[pos..pos + loc].copy_from_slice(&rec[..loc]);
-                    pos += loc;
-                    let ovfl_pg = ovfl_entries[ovfl_cursor].1;
-                    ovfl_cursor += 1;
-                    raw[pos..pos + 4].copy_from_slice(&ovfl_pg.to_be_bytes());
-                }
-            }
-            raw[hdr_off] = BtreePageType::IndexLeaf as u8;
-            raw[hdr_off + 3..hdr_off + 5].copy_from_slice(&(n_cell as u16).to_be_bytes());
-            let encoded_top: u16 = if content_top == 65_536 {
-                0
-            } else {
-                content_top as u16
-            };
-            raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
-        }
-
-        if auto_vac {
-            for &(_, ovfl_pg) in &ovfl_entries {
-                self.ptrmap_put(ovfl_pg, PtrmapType::Overflow1, pgno)?;
-            }
-        }
-        Ok(())
+        self.insert_index_sorted_c(ac, record_bytes, orders)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn write_sorted_index_interior_slice<R: AsRef<[u8]>>(
+    /// [`Self::insert_table_transfer`] for a caller that inserts rows in ascending rowid order
+    /// through one cursor: a rowid greater than the last one of the table goes behind it
+    /// without a search, as in `sqlite3BtreeTableMoveto`.
+    pub fn insert_table_transfer_sorted(
         &mut self,
-        pgno: Pgno,
-        usable: u32,
-        bounds: PayloadBounds,
-        all_records: &[R],
-        leaf_sizes: &[usize],
-        dividers: &[(Pgno, usize)],
-        right_child: Pgno,
-        auto_vac: bool,
+        ac: &mut AppendCursor,
+        rowid: i64,
+        payload: &[u8],
     ) -> Result<()> {
-        let usable_usize = usable as usize;
-        let max_local = bounds.max_local as usize;
-        let mut ovfl_entries: Vec<(usize, Pgno)> = Vec::new();
-        for (i, &(_, ridx)) in dividers.iter().enumerate() {
-            let rec = all_records[ridx].as_ref();
-            if rec.len() > max_local {
-                let (_, _, Some(ovfl)) = self.prepare_cell_payload(bounds, rec)? else {
-                    unreachable!()
-                };
-                ovfl_entries.push((i, ovfl));
-            }
-        }
+        self.preformat = true;
+        let res = self.insert_table_sorted_c(ac, rowid, payload);
+        self.preformat = false;
+        res
+    }
 
-        let hdr_off = if pgno == 1 { 100 } else { 0 };
-        let ptr_base = hdr_off + 12;
-        let n_cell = dividers.len();
-        {
-            let raw = self.pager.write_page(pgno)?;
-            raw[hdr_off..usable_usize].fill(0);
-            let mut content_top = usable_usize;
-            let mut ovfl_cursor = 0usize;
-            for (i, &(left_child, ridx)) in dividers.iter().enumerate() {
-                let rec = all_records[ridx].as_ref();
-                let clen = 4 + leaf_sizes[ridx];
-                content_top -= clen;
-                let ip = ptr_base + 2 * i;
-                raw[ip..ip + 2].copy_from_slice(&(content_top as u16).to_be_bytes());
-                raw[content_top..content_top + 4].copy_from_slice(&left_child.to_be_bytes());
-                let mut pos = content_top + 4;
-                pos += put_varint(&mut raw[pos..], rec.len() as u64);
-                if rec.len() <= max_local {
-                    raw[pos..pos + rec.len()].copy_from_slice(rec);
-                } else {
-                    let loc = bounds.local_len(rec.len() as u32);
-                    raw[pos..pos + loc].copy_from_slice(&rec[..loc]);
-                    pos += loc;
-                    let ovfl_pg = ovfl_entries[ovfl_cursor].1;
-                    ovfl_cursor += 1;
-                    raw[pos..pos + 4].copy_from_slice(&ovfl_pg.to_be_bytes());
-                }
-            }
-            raw[hdr_off] = BtreePageType::IndexInterior as u8;
-            raw[hdr_off + 3..hdr_off + 5].copy_from_slice(&(n_cell as u16).to_be_bytes());
-            let encoded_top: u16 = if content_top == 65_536 {
-                0
-            } else {
-                content_top as u16
-            };
-            raw[hdr_off + 5..hdr_off + 7].copy_from_slice(&encoded_top.to_be_bytes());
-            raw[hdr_off + 8..hdr_off + 12].copy_from_slice(&right_child.to_be_bytes());
-        }
+    /// [`Self::append_index`] for every record `next` hands out, in that order. `next` may
+    /// fail (a uniqueness check between two records): the records before the failure are in
+    /// the index, as they are when C's loop aborts.
+    pub fn append_index_run<'r>(
+        &mut self,
+        ac: &mut AppendCursor,
+        preformat: bool,
+        next: &mut dyn FnMut() -> Result<Option<&'r [u8]>>,
+    ) -> Result<()> {
+        self.preformat = preformat;
+        let res = self.append_index_run_c(ac, next);
+        self.preformat = false;
+        res
+    }
 
-        if auto_vac {
-            for &(left_child, _) in dividers {
-                self.ptrmap_put(left_child, PtrmapType::BtreeNode, pgno)?;
-            }
-            self.ptrmap_put(right_child, PtrmapType::BtreeNode, pgno)?;
-            for &(_, ovfl_pg) in &ovfl_entries {
-                self.ptrmap_put(ovfl_pg, PtrmapType::Overflow1, pgno)?;
-            }
-        }
-        Ok(())
+    /// `OP_SeekEnd` + `OP_Insert` with `OPFLAG_APPEND|OPFLAG_USESEEKRESULT|OPFLAG_PREFORMAT`
+    /// (the table copy of VACUUM): appends the row after the last one of the table `ac` was
+    /// opened on.
+    pub fn append_table_transfer(
+        &mut self,
+        ac: &mut AppendCursor,
+        rowid: i64,
+        payload: &[u8],
+    ) -> Result<()> {
+        self.preformat = true;
+        let res = self.append_table_c(ac, rowid, payload);
+        self.preformat = false;
+        res
     }
 
     /// Deletes a matching serialized entry `record_bytes` from an Index B-Tree rooted at `root_pgno`

@@ -640,10 +640,23 @@ impl Btree {
         root_filter: Option<Pgno>,
         exclude: Option<CursorId>,
     ) -> Result<()> {
+        if !self.in_place_rows.is_empty() {
+            self.drop_in_place_rows(root_filter);
+        }
         if self.open_cursor_count == 0 {
             return Ok(());
         }
         self.save_all_cursors(root_filter, exclude)
+    }
+
+    /// The write cursor that replaced a row in place loses its position like any other cursor
+    /// on the tree being modified.
+    #[inline(never)]
+    fn drop_in_place_rows(&mut self, root_filter: Option<Pgno>) {
+        match root_filter {
+            Some(root) => self.in_place_rows.retain(|e| e.0 != root),
+            None => self.in_place_rows.clear(),
+        }
     }
 
     /// Trips open cursors on rollback (`sqlite3BtreeTripAllCursors`, `btree.c:4501-4527`):
@@ -1340,6 +1353,57 @@ impl Btree {
             }
         };
         self.read_cell_full_payload_at_stack(&stack)
+    }
+
+    /// [`Self::cursor_payload`] into `out` (cleared first), keeping its allocation.
+    pub fn cursor_payload_into(&mut self, id: CursorId, out: &mut Vec<u8>) -> Result<()> {
+        self.check_cursor_not_faulted(id)?;
+        if matches!(
+            self.get_cursor(id)?.state,
+            BtreeCursorState::RequireSeek { .. }
+        ) {
+            self.restore_cursor_position(id)?;
+        }
+        let top = {
+            let cur = self.get_cursor(id)?;
+            match &cur.state {
+                BtreeCursorState::Fault(code) => return Err(fault_error(*code)),
+                BtreeCursorState::Valid { stack, .. } => stack.last().copied(),
+                BtreeCursorState::Eof | BtreeCursorState::Invalid => {
+                    return Err(SqliteError::misuse(
+                        "cursor_payload called on unpositioned/EOF cursor",
+                    ));
+                }
+                BtreeCursorState::RequireSeek { .. } => unreachable!("restored above"),
+            }
+        };
+        out.clear();
+        if let Some(top) = top {
+            let usable = self.pager.usable_size();
+            let raw = self.pager.read_page(top.pgno)?;
+            let (ptype, n_cell, _) = raw_page_header(top.pgno, usable, raw)?;
+            let local = match ptype {
+                BtreePageType::TableLeaf => {
+                    let c = read_table_leaf_cell(top.pgno, usable, raw, n_cell, top.cell_idx)?;
+                    (c.overflow_page.is_none()
+                        && c.local_payload.len() >= c.total_payload_len as usize)
+                        .then(|| &c.local_payload[..c.total_payload_len as usize])
+                }
+                BtreePageType::IndexLeaf => {
+                    let c = read_index_leaf_cell(top.pgno, usable, raw, n_cell, top.cell_idx)?;
+                    (c.overflow_page.is_none()
+                        && c.local_payload.len() >= c.total_payload_len as usize)
+                        .then(|| &c.local_payload[..c.total_payload_len as usize])
+                }
+                _ => None,
+            };
+            if let Some(bytes) = local {
+                out.extend_from_slice(bytes);
+                return Ok(());
+            }
+        }
+        *out = self.cursor_payload(id)?;
+        Ok(())
     }
 
     /// Lazily decodes 0-based column `col_idx` of the current entry (`OP_Column`).

@@ -165,6 +165,7 @@ fn analyze_stat1_permissions_and_lifecycle() {
         .is_empty()
     );
 
+    // (C SQLite does not touch sqlite_stat1 when a table is renamed: the rows keep the old name)
     conn.execute_batch("ALTER TABLE t1 RENAME TO t1_renamed;")
         .unwrap();
     assert_eq!(
@@ -172,7 +173,7 @@ fn analyze_stat1_permissions_and_lifecycle() {
             &mut conn,
             "SELECT tbl FROM sqlite_stat1 WHERE idx = 't1_bc';"
         ),
-        vec!["t1_renamed".to_owned()]
+        vec!["t1".to_owned()]
     );
 
     conn.execute_batch("DROP TABLE t1_renamed;").unwrap();
@@ -184,11 +185,17 @@ fn analyze_stat1_permissions_and_lifecycle() {
         .is_empty()
     );
 
-    // VACUUM preserves sqlite_stat1
+    // VACUUM preserves sqlite_stat1 (the row that still names `t1` included: DROP TABLE removed
+    // only the rows of `t1_renamed`, of which there were none)
     conn.execute_batch("VACUUM;").unwrap();
     assert_eq!(
         eval_flat(&mut conn, "SELECT tbl, stat FROM sqlite_stat1;"),
-        vec!["t_unindexed".to_owned(), "3".to_owned()]
+        vec![
+            "t_unindexed".to_owned(),
+            "3".to_owned(),
+            "t1".to_owned(),
+            "4 2 2".to_owned()
+        ]
     );
 
     // User DROP TABLE sqlite_stat1 is allowed

@@ -1023,6 +1023,9 @@ pub(crate) struct ConnectionShared {
     pub(crate) gate_waiters: AtomicU32,
     pub(crate) conn_state: AtomicU8,
     pub(crate) has_pending_drops: AtomicBool,
+    /// `PRAGMA count_changes` as of the end of the last executed statement
+    /// ([`Connection::count_changes`] reads it without entering the connection).
+    pub(crate) mirror_count_changes: AtomicBool,
     pub(crate) mirror_last_insert_rowid: AtomicI64,
     pub(crate) mirror_changes: AtomicU64,
     pub(crate) mirror_total_changes: AtomicU64,
@@ -3207,6 +3210,7 @@ impl Connection {
             gate_waiters: AtomicU32::new(0),
             conn_state: AtomicU8::new(CONN_STATE_OPEN),
             has_pending_drops: AtomicBool::new(false),
+            mirror_count_changes: AtomicBool::new(false),
             mirror_last_insert_rowid: AtomicI64::new(0),
             mirror_changes: AtomicU64::new(0),
             mirror_total_changes: AtomicU64::new(0),
@@ -3361,12 +3365,26 @@ impl Connection {
                     continue;
                 }
             }
-            let mut stmt = Statement::prepare_in_session(
+            // (decision trace only: a caller that gets an error from a batch prepares the
+            // failing statement once more to classify it — the shell does —, and that second
+            // compilation is the one that reports.)
+            #[allow(unexpected_cfgs)]
+            {
+                #[cfg(sqliters_dtrace)]
+                DTRACE_IN_BATCH.with(|c| c.set(true));
+            }
+            let prepared = Statement::prepare_in_session(
                 &self.shared,
                 session.inner_mut(),
                 sql,
                 PrepareMode::V2,
-            )?;
+            );
+            #[allow(unexpected_cfgs)]
+            {
+                #[cfg(sqliters_dtrace)]
+                DTRACE_IN_BATCH.with(|c| c.set(false));
+            }
+            let mut stmt = prepared?;
             let next_tail_len = stmt.unparsed_tail.len();
             let cur_len = sql.len();
             let step_res = (|| -> Result<()> {
@@ -3813,6 +3831,12 @@ impl Connection {
         } else {
             false
         }
+    }
+
+    /// Whether `PRAGMA count_changes` is on: INSERT, UPDATE and DELETE statements then return
+    /// one row holding the number of rows they changed.
+    pub fn count_changes(&self) -> bool {
+        self.shared.mirror_count_changes.load(Ordering::Acquire)
     }
 
     /// Queries (`enabled = None`) or updates (`enabled = Some(...)`) `PRAGMA recursive_triggers`,
@@ -4882,6 +4906,11 @@ impl fmt::Debug for Statement {
     }
 }
 
+thread_local! {
+    /// Decision trace only: `execute_batch` is compiling a statement.
+    static DTRACE_IN_BATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 struct CompiledArtifacts {
     stmt: Option<Stmt>,
     requires_schema: bool,
@@ -5700,7 +5729,14 @@ impl ConnectionInner {
             trace_hook: &mut self.trace_hook,
             publish_mirrors: &mut publish_fn,
         };
-        f(&mut ctx)
+        let res = f(&mut ctx);
+        // (`PRAGMA count_changes` runs through this context: keep the lock-free copy current)
+        if shared.mirror_count_changes.load(Ordering::Relaxed) != self.count_changes {
+            shared
+                .mirror_count_changes
+                .store(self.count_changes, Ordering::Release);
+        }
+        res
     }
 
     fn end_autocommit_started_reads(&mut self, started_mask: u16, summary: ActivitySummary) {
@@ -6540,6 +6576,31 @@ impl Statement {
                 )
             };
 
+        // (decision trace only: the statement, to report what a failed compilation had
+        // decided before it failed)
+        #[allow(unexpected_cfgs)]
+        let tr_stmt: Option<Stmt> = {
+            #[cfg(sqliters_dtrace)]
+            {
+                stmt_opt.clone()
+            }
+            #[cfg(not(sqliters_dtrace))]
+            {
+                None
+            }
+        };
+        let tr_failed = |inner: &ConnectionInner| {
+            if !DTRACE_IN_BATCH.with(std::cell::Cell::get)
+                && let Some(Stmt::Insert(ins)) = &tr_stmt
+            {
+                engine::dtrace_xfer_decision_of_failed_compile(
+                    ins,
+                    &inner.db_set,
+                    inner.foreign_keys,
+                    inner.count_changes,
+                );
+            }
+        };
         let mut artifacts = match try_compile(inner, stmt_opt.clone()) {
             Ok(a) => a,
             Err(err)
@@ -6553,12 +6614,22 @@ impl Statement {
             {
                 // Cached schema might be stale due to an external writer: check on-disk cookies once!
                 if inner.ensure_schemas_loaded_for_prepare(true)? {
-                    try_compile(inner, stmt_opt)?
+                    match try_compile(inner, stmt_opt) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            tr_failed(inner);
+                            return Err(e);
+                        }
+                    }
                 } else {
+                    tr_failed(inner);
                     return Err(err);
                 }
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                tr_failed(inner);
+                return Err(err);
+            }
         };
 
         apply_prepare_auto_vacuum_pragma(inner, &mut artifacts);
@@ -12851,6 +12922,8 @@ mod c_align_h1_tests;
 mod c_align_h1b_tests;
 #[cfg(test)]
 mod c_align_h2_tests;
+#[cfg(test)]
+mod c_align_h3_tests;
 /// Regression tests for behaviour that has to match C SQLite 3.54.1 (step 5e): every expected
 /// value below is what the reference `sqlite3` produces for the same statements.
 #[cfg(test)]

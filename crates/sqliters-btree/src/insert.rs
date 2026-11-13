@@ -213,6 +213,33 @@ pub(crate) enum TableInsertMode {
     Unique,
 }
 
+/// A write cursor that only appends (C: a cursor driven by `OP_SeekEnd` followed by an insert
+/// with `OPFLAG_USESEEKRESULT`). It stays on the right-most leaf between appends and is
+/// re-seated from the root after an append that had to balance, as C's cursor is
+/// (`CURSOR_INVALID` after `balance()`, then `sqlite3BtreeLast`). While it is in use nothing
+/// else may modify its tree.
+pub struct AppendCursor {
+    root: Pgno,
+    cur: BalCursor,
+    valid: bool,
+    /// The read cursors on the tree have been saved (none can be opened in between).
+    saved: bool,
+}
+
+impl AppendCursor {
+    /// `bulk`: the cursor carries `BTREE_BULKLOAD` (`OPFLAG_BULKCSR`).
+    pub fn new(root: Pgno, bulk: bool) -> Self {
+        let mut cur = BalCursor::new(root);
+        cur.bulk = bulk;
+        Self {
+            root,
+            cur,
+            valid: false,
+            saved: false,
+        }
+    }
+}
+
 impl Btree {
     /// Decision trace only: `ins` inside an insert, `del` inside a delete (C: which of
     /// `sqlite3BtreeInsert` / `sqlite3BtreeDelete` is running).
@@ -235,9 +262,14 @@ impl Btree {
         let lock_pg = self.lock_byte_page();
         let mut first: Pgno = 0;
         let mut prev: Pgno = 0;
+        // `sqlite3BtreeTransferRow` (`BTREE_PREFORMAT`): every overflow page of a transferred
+        // cell is allocated with `nearby = 0`.
+        let transfer = self.preformat;
         for chunk in rest.chunks(chunk_cap) {
             let mut nearby = prev;
-            if auto_vac {
+            if transfer {
+                nearby = 0;
+            } else if auto_vac {
                 nearby += 1;
                 while is_ptrmap_page(nearby, usable, lock_pg) || nearby == lock_pg {
                     nearby += 1;
@@ -288,6 +320,18 @@ impl Btree {
             n += put_varint(&mut head[n..], rowid as u64);
         }
         let n_local = local_len(k, usable, n_payload) as usize;
+        if self.preformat && self.dtrace_persistent() {
+            sqliters_types::dtrace!(
+                "TR|xf|row|pay={} local={} o={}",
+                n_payload,
+                n_local,
+                if n_local == payload.len() {
+                    "local"
+                } else {
+                    "overflow"
+                }
+            );
+        }
         if n_local == payload.len() {
             return Ok(NewCell {
                 head,
@@ -496,6 +540,19 @@ impl Btree {
         Ok(())
     }
 
+    /// Records that the table row `rowid` of `root_pgno` was replaced where it was, without
+    /// `balance()` ([`Btree::in_place_row`]).
+    #[inline(never)]
+    fn note_in_place_row(&mut self, k: &PgKind, root_pgno: Pgno, rowid: i64) {
+        if !k.int_key {
+            return;
+        }
+        self.in_place_rows.retain(|e| e.0 != root_pgno);
+        self.in_place_serial += 1;
+        self.in_place_rows
+            .push((root_pgno, rowid, self.in_place_serial));
+    }
+
     /// The `loc==0` part of `sqlite3BtreeInsert`: cell `idx` of page `pgno` (a page of kind
     /// `k`) holds the key being inserted.
     ///
@@ -520,7 +577,6 @@ impl Btree {
         payload: &[u8],
         overwrite: bool,
     ) -> Result<bool> {
-        let _ = root_pgno;
         let usable = self.pager.usable_size() as usize;
         let hdr = hdr_of(pgno);
         let ptr0 = hdr + 8 + k.child_ptr;
@@ -598,6 +654,7 @@ impl Btree {
                 );
             }
             self.overwrite_cell(pgno, ptr0, off, &info, payload)?;
+            self.note_in_place_row(k, root_pgno, rowid);
             return Ok(true);
         }
 
@@ -632,6 +689,7 @@ impl Btree {
             }
             let d = self.pager.write_page(pgno)?;
             cell.write(&mut d[off..off + sz_new]);
+            self.note_in_place_row(k, root_pgno, rowid);
             return Ok(true);
         }
         if self.dtrace_persistent() {
@@ -661,6 +719,7 @@ impl Btree {
             )?;
         }
         if self.page_insert_cell(pgno, k, n_cell, idx, &cell)? {
+            self.note_in_place_row(k, root_pgno, rowid);
             return Ok(true);
         }
         let Some(cur) = cur else {
@@ -980,6 +1039,9 @@ impl Btree {
         let key = RawRecordKey::for_index_orders(record, orders);
         let mut cur = BalCursor::new(root_pgno);
         cur.bulk = bulk;
+        if bulk && self.dtrace_persistent() {
+            sqliters_types::dtrace!("TR|xf|ins|root={} app=0 bulk=1 pre=0", root_pgno);
+        }
         let leaf_kind = PgKind::decode(0x0a, usable as u32)?;
         let int_kind = PgKind::decode(0x02, usable as u32)?;
         // Size of the cell on a leaf when its payload is local (0 = payload spills).
@@ -1098,5 +1160,550 @@ impl Btree {
             );
         }
         self.insert_new_cell(&mut cur, &k, n_cell, idx, &cell)
+    }
+    /// `OP_SeekEnd`: puts `ac` on the right-most leaf of its tree (C keeps the cursor where
+    /// the previous insert left it unless that insert had to balance) and returns the leaf's
+    /// cell count.
+    fn append_seek_end(&mut self, ac: &mut AppendCursor, leaf_flag: u8) -> Result<usize> {
+        let usable = self.pager.usable_size() as usize;
+        if !ac.valid {
+            let bulk = ac.cur.bulk;
+            ac.cur = BalCursor::new(ac.root);
+            ac.cur.bulk = bulk;
+        }
+        loop {
+            let pgno = ac.cur.page();
+            let hdr = hdr_of(pgno);
+            let d = self.pager.read_page(pgno)?;
+            if hdr + 12 > d.len() || d.len() < usable {
+                return Err(corrupt("b-tree page buffer too small"));
+            }
+            let n_cell = get2(d, hdr + 3);
+            if d[hdr] == leaf_flag {
+                ac.valid = true;
+                return Ok(n_cell);
+            }
+            if d[hdr] != (leaf_flag & !0x08) || ac.valid {
+                return Err(corrupt(
+                    "unexpected page kind on the right edge of a b-tree",
+                ));
+            }
+            let child = get4(d, hdr + 8);
+            if child == 0 {
+                return Err(corrupt("interior page with a null right child"));
+            }
+            ac.cur.descend(n_cell, child)?;
+        }
+    }
+
+    /// `OP_SeekEnd` + `OP_IdxInsert` with `OPFLAG_USESEEKRESULT` on an index cursor: `record`
+    /// becomes the last entry of the tree whatever its key (`sqlite3BtreeInsert` with
+    /// `seekResult < 0`: no search, `idx = ++pCur->ix`).
+    pub(crate) fn append_index_c(&mut self, ac: &mut AppendCursor, record: &[u8]) -> Result<()> {
+        self.append_index_inner(ac, record, true)
+    }
+
+    /// [`Self::append_index_c`]; `app`: C got here with `seekResult < 0` (decision trace only —
+    /// `false` when the place was found by comparing with the last entry, see
+    /// [`Self::insert_index_sorted_c`]).
+    fn append_index_inner(
+        &mut self,
+        ac: &mut AppendCursor,
+        record: &[u8],
+        #[allow(unused_variables)] app: bool,
+    ) -> Result<()> {
+        self.tr_ins = true;
+        let root_pgno = ac.root;
+        if self.dtrace_persistent() {
+            sqliters_types::dtrace!("TR|w|ins|root={} len={}", root_pgno, record.len());
+        }
+        if !ac.saved {
+            self.save_cursors_for_mutation(Some(root_pgno), None)?;
+            ac.saved = self.open_cursor_count == 0;
+        }
+        let usable = self.pager.usable_size() as usize;
+        let k = PgKind::decode(0x0a, usable as u32)?;
+        // `OP_RowCell` (`sqlite3BtreeTransferRow`) runs before the insert: the overflow pages
+        // of a transferred cell are allocated first.
+        // (a record that stays on the page needs no preparation: `sqlite3BtreeTransferRow`
+        // then only copies it)
+        let local = record.len() <= k.max_local as usize;
+        let pre_cell = if self.preformat && !local {
+            Some(self.fill_in_cell(&k, [0; 4], 0, record)?)
+        } else {
+            None
+        };
+        if self.dtrace_persistent() {
+            if self.preformat && local {
+                sqliters_types::dtrace!(
+                    "TR|xf|row|pay={} local={} o=local",
+                    record.len(),
+                    record.len()
+                );
+            }
+            sqliters_types::dtrace!(
+                "TR|xf|ins|root={} app={} bulk={} pre={}",
+                root_pgno,
+                u8::from(app),
+                u8::from(ac.cur.bulk),
+                u8::from(self.preformat)
+            );
+        }
+        let n_cell = self.append_seek_end(ac, 0x0a)?;
+        let pgno = ac.cur.page();
+        let hdr = hdr_of(pgno);
+        if pre_cell.is_none() && local {
+            let sz = (varint_len(record.len() as u64) + record.len()).max(4);
+            let top = {
+                let d = self.pager.read_page(pgno)?;
+                if d[hdr + 1] == 0 && d[hdr + 2] == 0 {
+                    match get2(d, hdr + 5) {
+                        0 if usable == 65_536 => 65_536,
+                        t => t,
+                    }
+                } else {
+                    0
+                }
+            };
+            if top != 0 && hdr + 8 + 2 * n_cell + 2 + sz <= top && top <= usable {
+                let off = top - sz;
+                let d = self.pager.write_page(pgno)?;
+                let mut p = off;
+                p += put_varint(&mut d[p..], record.len() as u64);
+                d[p..p + record.len()].copy_from_slice(record);
+                p += record.len();
+                d[p..off + sz].fill(0);
+                put2(d, hdr + 8 + 2 * n_cell, off);
+                put2(d, hdr + 3, n_cell + 1);
+                put2(d, hdr + 5, off);
+                if self.dtrace_persistent() {
+                    sqliters_types::dtrace!(
+                        "TR|ins|cell|root={} pg={} idx={} o=new sz={}",
+                        root_pgno,
+                        pgno,
+                        n_cell,
+                        sz
+                    );
+                    sqliters_types::dtrace!(
+                        "TR|ins|slot|ctx=ins pg={} i={} sz={} o=gap off={}",
+                        pgno,
+                        n_cell,
+                        sz,
+                        off
+                    );
+                }
+                return Ok(());
+            }
+        }
+        let cell = match pre_cell {
+            Some(c) => c,
+            None => {
+                // (a local preformatted record was reported above: build its cell silently)
+                let pre = self.preformat;
+                self.preformat = pre && !local;
+                let c = self.fill_in_cell(&k, [0; 4], 0, record);
+                self.preformat = pre;
+                c?
+            }
+        };
+        if self.dtrace_persistent() {
+            sqliters_types::dtrace!(
+                "TR|ins|cell|root={} pg={} idx={} o=new sz={}",
+                root_pgno,
+                pgno,
+                n_cell,
+                cell.size
+            );
+        }
+        if self.page_insert_cell(pgno, &k, n_cell, n_cell, &cell)? {
+            return Ok(());
+        }
+        let mut ovfl = OvflCells::default();
+        ovfl.push_with(n_cell, cell.size, |dst| cell.write(dst))?;
+        ac.cur.set_ovfl(ac.cur.i_page, ovfl);
+        ac.valid = false;
+        self.balance(&mut ac.cur)
+    }
+
+    /// `OP_SeekEnd` + `OP_Insert` with `OPFLAG_APPEND|OPFLAG_USESEEKRESULT` on a table cursor:
+    /// the row becomes the last cell of the right-most leaf without a search.
+    pub(crate) fn append_table_c(
+        &mut self,
+        ac: &mut AppendCursor,
+        rowid: i64,
+        payload: &[u8],
+    ) -> Result<()> {
+        self.append_table_inner(ac, rowid, payload, true)
+    }
+
+    fn append_table_inner(
+        &mut self,
+        ac: &mut AppendCursor,
+        rowid: i64,
+        payload: &[u8],
+        #[allow(unused_variables)] app: bool,
+    ) -> Result<()> {
+        self.tr_ins = true;
+        let root_pgno = ac.root;
+        if self.dtrace_persistent() {
+            sqliters_types::dtrace!("TR|w|ins|root={} rowid={}", root_pgno, rowid);
+        }
+        if !ac.saved {
+            self.save_cursors_for_mutation(Some(root_pgno), None)?;
+            ac.saved = self.open_cursor_count == 0;
+        }
+        let usable = self.pager.usable_size() as usize;
+        let k = PgKind::decode(0x0d, usable as u32)?;
+        // `OP_RowCell` runs before `OP_Insert`: overflow pages first.
+        let cell = self.fill_in_cell(&k, [0; 4], rowid, payload)?;
+        if self.dtrace_persistent() {
+            sqliters_types::dtrace!(
+                "TR|xf|ins|root={} app={} bulk=0 pre={}",
+                root_pgno,
+                u8::from(app),
+                u8::from(self.preformat)
+            );
+        }
+        let n_cell = self.append_seek_end(ac, 0x0d)?;
+        let pgno = ac.cur.page();
+        if cell.ovfl == 0 {
+            // insertCell into the gap of a page without freeblocks.
+            let hdr = hdr_of(pgno);
+            let sz = cell.size;
+            let top = {
+                let d = self.pager.read_page(pgno)?;
+                if d[hdr + 1] == 0 && d[hdr + 2] == 0 {
+                    match get2(d, hdr + 5) {
+                        0 if usable == 65_536 => 65_536,
+                        t => t,
+                    }
+                } else {
+                    0
+                }
+            };
+            if top != 0 && hdr + 8 + 2 * n_cell + 2 + sz <= top && top <= usable {
+                let off = top - sz;
+                let d = self.pager.write_page(pgno)?;
+                cell.write(&mut d[off..off + sz]);
+                put2(d, hdr + 8 + 2 * n_cell, off);
+                put2(d, hdr + 3, n_cell + 1);
+                put2(d, hdr + 5, off);
+                if self.dtrace_persistent() {
+                    sqliters_types::dtrace!(
+                        "TR|ins|cell|root={} pg={} idx={} o=new sz={}",
+                        root_pgno,
+                        pgno,
+                        n_cell,
+                        sz
+                    );
+                    sqliters_types::dtrace!(
+                        "TR|ins|slot|ctx=ins pg={} i={} sz={} o=gap off={}",
+                        pgno,
+                        n_cell,
+                        sz,
+                        off
+                    );
+                }
+                return Ok(());
+            }
+        }
+        if self.dtrace_persistent() {
+            sqliters_types::dtrace!(
+                "TR|ins|cell|root={} pg={} idx={} o=new sz={}",
+                root_pgno,
+                pgno,
+                n_cell,
+                cell.size
+            );
+        }
+        if self.page_insert_cell(pgno, &k, n_cell, n_cell, &cell)? {
+            return Ok(());
+        }
+        let mut ovfl = OvflCells::default();
+        ovfl.push_with(n_cell, cell.size, |dst| cell.write(dst))?;
+        ac.cur.set_ovfl(ac.cur.i_page, ovfl);
+        ac.valid = false;
+        self.balance(&mut ac.cur)
+    }
+    /// `OP_RowCell` + `OP_Insert` with `OPFLAG_APPEND|OPFLAG_PREFORMAT` on a table cursor: the
+    /// cell is built first (`sqlite3BtreeTransferRow`: overflow pages allocated with
+    /// `nearby = 0`), then `sqlite3BtreeInsert` finds the place of `rowid` — which must be
+    /// absent — and stores the cell.
+    pub(crate) fn insert_table_preformat_c(
+        &mut self,
+        root_pgno: Pgno,
+        rowid: i64,
+        payload: &[u8],
+    ) -> Result<()> {
+        self.tr_ins = true;
+        if self.dtrace_persistent() {
+            sqliters_types::dtrace!("TR|w|ins|root={} rowid={}", root_pgno, rowid);
+        }
+        self.save_cursors_for_mutation(Some(root_pgno), None)?;
+        let usable = self.pager.usable_size() as usize;
+        let k = PgKind::decode(0x0d, usable as u32)?;
+        let cell = self.fill_in_cell(&k, [0; 4], rowid, payload)?;
+        if self.dtrace_persistent() {
+            sqliters_types::dtrace!("TR|xf|ins|root={} app=0 bulk=0 pre=1", root_pgno);
+        }
+        // sqlite3BtreeTableMoveto
+        let mut cur = BalCursor::new(root_pgno);
+        let (_leaf, n_cell, idx) = loop {
+            let pgno = cur.page();
+            let hdr = hdr_of(pgno);
+            let d = self.pager.read_page(pgno)?;
+            if hdr + 12 > d.len() || d.len() < usable {
+                return Err(corrupt("b-tree page buffer too small"));
+            }
+            match d[hdr] {
+                0x05 => {
+                    let (i, child, _) =
+                        find_table_interior_child_append_hint(pgno, usable as u32, d, rowid)?;
+                    cur.descend(i, child)?;
+                }
+                0x0d => {
+                    let n_cell = get2(d, hdr + 3);
+                    let (idx, found) = table_leaf_search(d, hdr, usable, n_cell, rowid)?;
+                    if found {
+                        return Err(corrupt("transferred row already exists"));
+                    }
+                    break (pgno, n_cell, idx);
+                }
+                _ => {
+                    return Err(SqliteError::corrupt(format!(
+                        "page {pgno} is not part of a table b-tree"
+                    )));
+                }
+            }
+        };
+        if self.dtrace_persistent() {
+            sqliters_types::dtrace!(
+                "TR|ins|cell|root={} pg={} idx={} o=new sz={}",
+                root_pgno,
+                _leaf,
+                idx,
+                cell.size
+            );
+        }
+        self.insert_new_cell(&mut cur, &k, n_cell, idx, &cell)
+    }
+    /// [`Self::append_index_c`] for a run of records: `next` hands out one record after the
+    /// other (or an error, which ends the run with the records before it stored). The outcome
+    /// is that of one `append_index_c` call per record; records that simply fit into the gap
+    /// of the right-most leaf are written without leaving the page.
+    pub(crate) fn append_index_run_c<'r>(
+        &mut self,
+        ac: &mut AppendCursor,
+        next: &mut dyn FnMut() -> Result<Option<&'r [u8]>>,
+    ) -> Result<()> {
+        let usable = self.pager.usable_size() as usize;
+        let k = PgKind::decode(0x0a, usable as u32)?;
+        let max_local = k.max_local as usize;
+        let root_pgno = ac.root;
+        #[allow(unused_variables)]
+        let traced = self.dtrace_persistent();
+        #[allow(unused_variables)]
+        let (tr_bulk, tr_pre) = (u8::from(ac.cur.bulk), u8::from(self.preformat));
+        loop {
+            let Some(first) = next()? else {
+                return Ok(());
+            };
+            // Does `first` simply fit on the right-most leaf?
+            let mut pending = Some(first);
+            if first.len() <= max_local {
+                self.tr_ins = true;
+                if !ac.saved {
+                    self.save_cursors_for_mutation(Some(root_pgno), None)?;
+                    ac.saved = self.open_cursor_count == 0;
+                }
+                let n_cell0 = self.append_seek_end(ac, 0x0a)?;
+                let pgno = ac.cur.page();
+                let hdr = hdr_of(pgno);
+                let fits = {
+                    let d = self.pager.read_page(pgno)?;
+                    let sz = (varint_len(first.len() as u64) + first.len()).max(4);
+                    let top = match get2(d, hdr + 5) {
+                        0 if usable == 65_536 => 65_536,
+                        t => t,
+                    };
+                    d[hdr + 1] == 0
+                        && d[hdr + 2] == 0
+                        && hdr + 8 + 2 * n_cell0 + 2 + sz <= top
+                        && top <= usable
+                };
+                if fits {
+                    let d = self.pager.write_page(pgno)?;
+                    let mut top = match get2(d, hdr + 5) {
+                        0 => 65_536,
+                        t => t,
+                    };
+                    let mut n_cell = n_cell0;
+                    let mut failed: Option<SqliteError> = None;
+                    while let Some(rec) = pending {
+                        if rec.len() > max_local {
+                            break;
+                        }
+                        let sz = (varint_len(rec.len() as u64) + rec.len()).max(4);
+                        if hdr + 8 + 2 * n_cell + 2 + sz > top {
+                            break;
+                        }
+                        let off = top - sz;
+                        let mut p = off;
+                        p += put_varint(&mut d[p..], rec.len() as u64);
+                        d[p..p + rec.len()].copy_from_slice(rec);
+                        p += rec.len();
+                        d[p..off + sz].fill(0);
+                        put2(d, hdr + 8 + 2 * n_cell, off);
+                        if traced {
+                            sqliters_types::dtrace!(
+                                "TR|w|ins|root={} len={}",
+                                root_pgno,
+                                rec.len()
+                            );
+                            if tr_pre != 0 {
+                                sqliters_types::dtrace!(
+                                    "TR|xf|row|pay={} local={} o=local",
+                                    rec.len(),
+                                    rec.len()
+                                );
+                            }
+                            sqliters_types::dtrace!(
+                                "TR|xf|ins|root={} app=1 bulk={} pre={}",
+                                root_pgno,
+                                tr_bulk,
+                                tr_pre
+                            );
+                            sqliters_types::dtrace!(
+                                "TR|ins|cell|root={} pg={} idx={} o=new sz={}",
+                                root_pgno,
+                                pgno,
+                                n_cell,
+                                sz
+                            );
+                            sqliters_types::dtrace!(
+                                "TR|ins|slot|ctx=ins pg={} i={} sz={} o=gap off={}",
+                                pgno,
+                                n_cell,
+                                sz,
+                                off
+                            );
+                        }
+                        n_cell += 1;
+                        top = off;
+                        pending = match next() {
+                            Ok(r) => r,
+                            Err(e) => {
+                                failed = Some(e);
+                                None
+                            }
+                        };
+                    }
+                    put2(d, hdr + 3, n_cell);
+                    put2(d, hdr + 5, top);
+                    if let Some(e) = failed {
+                        return Err(e);
+                    }
+                }
+            }
+            // The record that did not fit (page full, spilling payload, freeblocks on the page)
+            // takes the general path; the next one starts a new run.
+            match pending {
+                Some(rec) => self.append_index_c(ac, rec)?,
+                None => return Ok(()),
+            }
+        }
+    }
+    /// `OP_IdxInsert` without a usable seek result through a cursor that stays on the tree
+    /// (the index copy of the transfer optimisation, whose source delivers the keys in index
+    /// order). `sqlite3BtreeIndexMoveto` first looks whether the cursor is on the last entry
+    /// of the tree and the key is greater: then the key goes behind it without a search.
+    /// Any other key is placed by the ordinary search ([`Self::insert_index_c`]); the pages
+    /// are the same either way.
+    pub(crate) fn insert_index_sorted_c(
+        &mut self,
+        ac: &mut AppendCursor,
+        record: &[u8],
+        orders: &[KeySortOrder],
+    ) -> Result<()> {
+        let usable = self.pager.usable_size() as usize;
+        let n_cell = self.append_seek_end(ac, 0x0a)?;
+        let pgno = ac.cur.page();
+        let hdr = hdr_of(pgno);
+        let greater = if n_cell == 0 {
+            pgno == ac.root
+        } else {
+            let enc = self.encoding();
+            let k = PgKind::decode(0x0a, usable as u32)?;
+            let key = RawRecordKey::for_index_orders(record, orders);
+            let d = self.pager.read_page(pgno)?;
+            let off = get2(d, hdr + 8 + 2 * (n_cell - 1));
+            let mut gt = false;
+            if off >= hdr + 8 + 2 * n_cell && off < usable {
+                let b0 = d[off];
+                let parsed = if b0 < 0x80 {
+                    Some((u32::from(b0), 1usize))
+                } else {
+                    get_varint(&d[off..usable])
+                        .ok()
+                        .and_then(|(v, n)| u32::try_from(v).ok().map(|v| (v, n)))
+                };
+                if let Some((n_payload, n1)) = parsed
+                    && n_payload <= k.max_local
+                    && off + n1 + n_payload as usize <= usable
+                {
+                    let start = off + n1;
+                    // (`compare_stored` orders the stored record against the key)
+                    gt = matches!(
+                        key.compare_stored(&d[start..start + n_payload as usize], orders, enc),
+                        Ok(Ordering::Less)
+                    );
+                }
+            }
+            gt
+        };
+        if greater {
+            return self.append_index_inner(ac, record, false);
+        }
+        ac.valid = false;
+        self.insert_index_c(ac.root, record, orders, ac.cur.bulk)
+    }
+
+    /// `OP_RowCell` + `OP_Insert` with `OPFLAG_APPEND|OPFLAG_PREFORMAT` through a cursor that
+    /// stays on the table (the table copy of the transfer optimisation: the rowids arrive in
+    /// ascending order). `sqlite3BtreeTableMoveto` answers at once when the cursor is on the
+    /// last row and the new rowid is larger; any other rowid is placed by the ordinary search
+    /// ([`Self::insert_table_preformat_c`]).
+    pub(crate) fn insert_table_sorted_c(
+        &mut self,
+        ac: &mut AppendCursor,
+        rowid: i64,
+        payload: &[u8],
+    ) -> Result<()> {
+        let usable = self.pager.usable_size() as usize;
+        let n_cell = self.append_seek_end(ac, 0x0d)?;
+        let pgno = ac.cur.page();
+        let hdr = hdr_of(pgno);
+        let greater = if n_cell == 0 {
+            pgno == ac.root
+        } else {
+            let d = self.pager.read_page(pgno)?;
+            let off = get2(d, hdr + 8 + 2 * (n_cell - 1));
+            if off >= hdr + 8 + 2 * n_cell && off < usable {
+                let c = &d[off..usable];
+                let mut n = 0;
+                while n < 8 && n < c.len() && c[n] & 0x80 != 0 {
+                    n += 1;
+                }
+                n += 1;
+                matches!(c.get(n..).map(get_varint_i64), Some(Ok((last, _))) if rowid > last)
+            } else {
+                false
+            }
+        };
+        if greater {
+            return self.append_table_inner(ac, rowid, payload, false);
+        }
+        ac.valid = false;
+        self.insert_table_preformat_c(ac.root, rowid, payload)
     }
 }

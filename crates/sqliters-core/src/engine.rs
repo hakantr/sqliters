@@ -54,7 +54,7 @@ use crate::execution_context::{
 use crate::schema::{
     ColumnSchema, ForeignKeySchema, IndexSchema, IndexedColSchema, Schema, TableRowKey,
     TableSchema, ViewSchema, build_index_schema_from_ast, build_table_schema_from_ast,
-    delete_schema_entry, fix_permanent_view_select, insert_schema_entry, scan_index_incremental,
+    delete_schema_entry, fix_permanent_view_select, insert_schema_entry,
     scan_index_incremental_with_services, scan_table_incremental,
     scan_table_incremental_with_services, update_schema_entry, validate_table_collations,
     validate_view_no_parameters,
@@ -145,6 +145,17 @@ pub struct StmtTxTracker {
     /// clears the old one. (With an index, `sqlite3GenerateRowIndexDelete` reads the old row
     /// through the data cursor, which parses the cell.)
     pub replace_unparsed_row: Option<(Pgno, i64)>,
+    /// `(sub-program depth, table root, rowid, b-tree serial)` of the table row the statement
+    /// running at that depth wrote last, when it replaced an existing row in place (no
+    /// rebalance). C's write cursor is still on that row; when the next row to check has the
+    /// following rowid, `OP_NotExists` gets to it with `sqlite3BtreeNext` and parses its cell
+    /// (`sqlite3BtreeTableMoveto`), so the insert that follows does overwrite a record of the
+    /// same size — the "cursor not parsed" cases of `replace_unparsed_row` /
+    /// `update_unparsed_cursor` do not apply to that row. One entry per depth (a statement
+    /// has one write cursor on its table); dropped when the statement at that depth ends
+    /// ([`Self::close_write_cursor`]) and void once the b-tree no longer reports the row
+    /// (`Btree::in_place_row`: another cursor wrote to the tree).
+    pub in_place_cursors: Vec<(usize, Pgno, i64, u64)>,
     /// `(table root, sub-program depth)` of a running two-pass UPDATE whose second pass reads
     /// no column of the old row before `OP_Insert`: every column is assigned from expressions
     /// without column references, no index is rewritten, no trigger or foreign key needs the
@@ -185,6 +196,59 @@ pub struct StmtTxTracker {
     pub top_level_sql: Option<String>,
     /// Parent tables whose `SQLITE_READ` returned `SQLITE_IGNORE` during compile-time FK check (`fkey.c:984-985`).
     pub ignored_fk_parent_tables: Vec<(DatabaseId, String)>,
+}
+
+impl StmtTxTracker {
+    /// Whether the statement running at the current depth wrote the row before `rowid` of
+    /// table `root` last, replacing it in place, and nothing else has written to that tree
+    /// since (see `in_place_cursors`).
+    #[inline]
+    fn follows_in_place_row(&self, bt: Option<&Btree>, root: Pgno, rowid: i64) -> bool {
+        !self.in_place_cursors.is_empty() && self.follows_in_place_row_slow(bt, root, rowid)
+    }
+
+    #[inline(never)]
+    fn follows_in_place_row_slow(&self, bt: Option<&Btree>, root: Pgno, rowid: i64) -> bool {
+        let depth = self.subprogram_stack.len();
+        let Some(bt) = bt else {
+            return false;
+        };
+        self.in_place_cursors.iter().any(|&(d, r, k, serial)| {
+            d == depth
+                && r == root
+                && k.checked_add(1) == Some(rowid)
+                && bt.in_place_row(root) == Some((k, serial))
+        })
+    }
+
+    /// Notes the outcome of a table-row write by the statement running at the current depth.
+    #[inline]
+    fn note_table_row_written(&mut self, bt: &Btree, root: Pgno, rowid: i64) {
+        // An entry left from an earlier row is void without the b-tree's (see
+        // `follows_in_place_row_slow`), so there is nothing to do while the b-tree has none.
+        if bt.has_in_place_rows() {
+            self.note_table_row_written_slow(bt, root, rowid);
+        }
+    }
+
+    #[inline(never)]
+    fn note_table_row_written_slow(&mut self, bt: &Btree, root: Pgno, rowid: i64) {
+        let in_place = bt.in_place_row(root).filter(|&(k, _)| k == rowid);
+        let depth = self.subprogram_stack.len();
+        self.in_place_cursors.retain(|e| e.0 != depth);
+        if let Some((k, serial)) = in_place {
+            self.in_place_cursors.push((depth, root, k, serial));
+        }
+    }
+
+    /// A statement starts at the current depth (a trigger step, a foreign-key action): the
+    /// cursors of the statements that ran at this depth or below it before are closed.
+    fn close_write_cursor(&mut self) {
+        if !self.in_place_cursors.is_empty() {
+            let depth = self.subprogram_stack.len();
+            self.in_place_cursors.retain(|e| e.0 < depth);
+        }
+    }
 }
 
 /// See [`StmtTxTracker::autoinc`].
@@ -976,7 +1040,7 @@ fn exec_attach_database(
         let mem_vfs: Arc<dyn Vfs> =
             Arc::new(MemoryVfs::with_lock_geometry(ctx.db_set.lock_geometry()));
         let opts = PagerOpenOptions {
-            default_page_size: ctx.db_set.default_page_size(),
+            default_page_size: ctx.db_set.attach_page_size(),
             lock_geometry: Some(ctx.db_set.lock_geometry()),
             db_kind: Some(DatabaseKind::Memory),
             ..PagerOpenOptions::default()
@@ -995,7 +1059,7 @@ fn exec_attach_database(
             ))
         } else {
             let opts = PagerOpenOptions {
-                default_page_size: ctx.db_set.default_page_size(),
+                default_page_size: ctx.db_set.attach_page_size(),
                 lock_geometry: Some(ctx.db_set.lock_geometry()),
                 db_kind: Some(DatabaseKind::PrivateTemporary),
                 temp_in_memory: ctx.db_set.temp_store().is_memory(),
@@ -1008,7 +1072,7 @@ fn exec_attach_database(
     } else {
         let full_path = resolve_disk_path(ctx.working_dir, &parsed.path);
         let opts = PagerOpenOptions {
-            default_page_size: ctx.db_set.default_page_size(),
+            default_page_size: ctx.db_set.attach_page_size(),
             lock_geometry: Some(ctx.db_set.lock_geometry()),
             db_kind: Some(DatabaseKind::NamedDisk),
             immutable: parsed.immutable,
@@ -15692,26 +15756,6 @@ fn table_storage_value(tbl: &TableSchema, ci: usize, v: &Value, real_as_int: boo
     v.clone()
 }
 
-/// Storage form of a stored table record (physical values, integers not yet turned into
-/// reals): `true` when a REAL-affinity column holds an integer, i.e. the row was written in
-/// integer form; a row with no integral value in such a column reads the same either way.
-fn stored_real_form_is_int(tbl: &TableSchema, phys_vals: &[Value]) -> bool {
-    let mut slot = 0usize;
-    for (ci, col) in tbl.columns.iter().enumerate() {
-        if col.generated.as_ref().is_some_and(|(_, stored)| !*stored) {
-            continue;
-        }
-        if col.affinity == TypeAffinity::Real
-            && tbl.rowid_alias_col != Some(ci)
-            && matches!(phys_vals.get(slot), Some(Value::Integer(_)))
-        {
-            return true;
-        }
-        slot += 1;
-    }
-    false
-}
-
 /// Index keys of a STRICT table: integral reals of REAL columns in their integer form.
 fn strict_real_index_keys_as_int(tbl: &TableSchema, idx: &IndexSchema, keys: &mut [Value]) {
     for (k, ic) in idx.columns.iter().enumerate() {
@@ -16188,7 +16232,7 @@ fn remove_row_and_indexes_opt(
 
 /// Orders all indexes on `tbl` (including `WITHOUT ROWID` PK when applicable) in `pTab->pIndex`
 /// linked-list order (`sqlite/src/build.c:3980-4004`): non-`Replace` indexes in reverse creation
-/// order, followed by `Replace` indexes in creation order.
+/// order, followed by the `Replace` indexes, also in reverse creation order.
 fn ordered_table_indexes(tbl: &TableSchema, indexes: &[IndexSchema]) -> Vec<IndexSchema> {
     let parse_auto_num = |name: &str| -> usize {
         name.rsplit('_')
@@ -16231,8 +16275,11 @@ fn ordered_table_indexes(tbl: &TableSchema, indexes: &[IndexSchema]) -> Vec<Inde
     {
         out.push(idx.clone());
     }
+    // (a new REPLACE index is linked in at the head of the list and then moved down only past
+    // the non-REPLACE ones: it ends up in front of the older REPLACE indexes)
     for idx in creation_order
         .into_iter()
+        .rev()
         .filter(|i| i.conflict == ConflictAction::Replace)
     {
         out.push(idx);
@@ -16786,6 +16833,8 @@ fn run_single_trigger_body(
     }
     for idx in 0..trig.body.len() {
         ctx.step_tick()?;
+        // Each trigger step opens its own cursors.
+        ctx.stmt_tx.close_write_cursor();
         run_trigger_step(ctx, &trig.body[idx], outer_scopes, outer_or_conflict)?;
     }
     Ok(TriggerOutcome::Continue)
@@ -16978,6 +17027,11 @@ fn replace_conflict_delete_row(
         if keep_table_row
             && indexes.is_empty()
             && let TableRowKey::Rowid(rid) = ckey
+            && !ctx.stmt_tx.follows_in_place_row(
+                ctx.db_set.slot(db_id).and_then(|s| s.btree.as_ref()),
+                tbl.root_pgno,
+                *rid,
+            )
         {
             ctx.stmt_tx.replace_unparsed_row = Some((tbl.root_pgno, *rid));
         }
@@ -17572,14 +17626,20 @@ fn validate_and_write_row(
                 let pk_orders = tbl.without_rowid_pk_orders();
                 bt.insert_index(tbl.root_pgno, &phys_rec, &pk_orders)?;
             }
-        } else if ctx.stmt_tx.replace_unparsed_row.take() == Some((tbl.root_pgno, rowid))
-            || (update_in_place
-                && ctx.stmt_tx.update_unparsed_cursor
-                    == Some((tbl.root_pgno, ctx.stmt_tx.subprogram_stack.len())))
-        {
-            bt.insert_table_replace_unparsed(tbl.root_pgno, rowid, &phys_rec)?;
         } else {
-            bt.insert_table(tbl.root_pgno, rowid, &phys_rec)?;
+            if ctx.stmt_tx.replace_unparsed_row.take() == Some((tbl.root_pgno, rowid))
+                || (update_in_place
+                    && ctx.stmt_tx.update_unparsed_cursor
+                        == Some((tbl.root_pgno, ctx.stmt_tx.subprogram_stack.len()))
+                    && !ctx
+                        .stmt_tx
+                        .follows_in_place_row(Some(&*bt), tbl.root_pgno, rowid))
+            {
+                bt.insert_table_replace_unparsed(tbl.root_pgno, rowid, &phys_rec)?;
+            } else {
+                bt.insert_table(tbl.root_pgno, rowid, &phys_rec)?;
+            }
+            ctx.stmt_tx.note_table_row_written(bt, tbl.root_pgno, rowid);
         }
     }
 
@@ -18419,11 +18479,15 @@ fn autoinc_end(ctx: &mut ExecContext<'_>) -> Result<()> {
             &[Value::Text(c.table_name.clone()), Value::Integer(c.cur)],
             enc,
         );
-        let rid = match c.seq_rowid {
-            Some(r) => r,
-            None => bt.next_rowid(seq_tbl.root_pgno)?,
-        };
-        bt.insert_table(seq_tbl.root_pgno, rid, &rec)?;
+        // (`autoIncrementEnd` opens a new cursor on sqlite_sequence and inserts by rowid: the
+        // old cell is never parsed, so a row of the same size is replaced, not overwritten.)
+        match c.seq_rowid {
+            Some(r) => bt.insert_table_replace_unparsed(seq_tbl.root_pgno, r, &rec)?,
+            None => {
+                let r = bt.next_rowid(seq_tbl.root_pgno)?;
+                bt.insert_table(seq_tbl.root_pgno, r, &rec)?;
+            }
+        }
     }
     Ok(())
 }
@@ -18944,6 +19008,7 @@ where
         catch_infallible_callback_panic("trace_hook", || cb(sql))?;
     }
     ctx.stmt_tx.subprogram_stack.push(None);
+    ctx.stmt_tx.close_write_cursor();
     let saved_last_rowid = ctx.runtime.last_insert_rowid;
     let saved_last_changes = ctx.runtime.last_changes;
     let res = f(ctx);
@@ -20839,26 +20904,6 @@ fn prepare_proposed_insert_row(
     Ok(Some((rowid, final_key, raw_vals)))
 }
 
-fn is_table_btree_empty(
-    ctx: &mut ExecContext<'_>,
-    db_id: DatabaseId,
-    root_pgno: Pgno,
-) -> Result<bool> {
-    Ok(ctx.scan_table_in_db(db_id, root_pgno)?.is_empty())
-}
-
-fn scan_table_rowids_only(
-    ctx: &mut ExecContext<'_>,
-    db_id: DatabaseId,
-    root_pgno: Pgno,
-) -> Result<Vec<i64>> {
-    Ok(ctx
-        .scan_table_in_db(db_id, root_pgno)?
-        .into_iter()
-        .map(|(rid, _)| rid)
-        .collect())
-}
-
 fn expr_mentions_implicit_rowid(expr: &Expr, tbl: &TableSchema) -> bool {
     match expr {
         Expr::Column(cref) => tbl.is_implicit_rowid_name(&cref.column),
@@ -21181,7 +21226,27 @@ fn xfer_compatible_index(dest: &IndexSchema, src: &IndexSchema) -> bool {
     dest.where_clause == src.where_clause
 }
 
-fn check_insert_xfer_eligible(
+/// What `xferOptimization` (`insert.c`) decided when the statement was compiled.
+pub(crate) struct XferPlan {
+    src_db_id: DatabaseId,
+    src_tbl: TableSchema,
+    /// The transfer code is guarded by a run-time test that the destination is empty
+    /// (`emptyDestTest`): `xferOptimization` then returns 0 and the ordinary insert is coded
+    /// behind it.
+    needs_empty_dest: bool,
+    /// `onError` after its defaults were applied.
+    on_error: ConflictAction,
+}
+
+/// `xferOptimization` of `insert.c`, the compile-time half: can
+/// `INSERT INTO dest SELECT * FROM src` copy raw rows?
+///
+/// * `None`: C does not call the function (`pColumn!=0`, no SELECT, triggers on the
+///   destination — RETURNING is one —, or the multi-row VALUES forms).
+/// * `Some(Err(n))`: the n-th `return 0` of the C function fired (the conditions are tested in
+///   C's order; `karar_esligi.md` lists them).
+/// * `Some(Ok(plan))`: the transfer is coded.
+fn xfer_optimization(
     ins: &InsertStmt,
     dest_db_id: DatabaseId,
     dest_tbl: &TableSchema,
@@ -21189,148 +21254,668 @@ fn check_insert_xfer_eligible(
     db_set: &DatabaseSet,
     foreign_keys: bool,
     count_changes: bool,
-) -> Option<(DatabaseId, TableSchema)> {
+    or_conflict: Option<ConflictAction>,
+) -> Option<std::result::Result<XferPlan, u8>> {
+    let InsertSource::Select(sel) = &ins.source else {
+        return None;
+    };
     if dest_is_catalog
-        || !ins.ctes.is_empty()
         || ins.columns.is_some()
         || !ins.upsert_clauses.is_empty()
         || !ins.returning.is_empty()
-        || count_changes
-        || (foreign_keys && !dest_tbl.foreign_keys.is_empty())
         || db_set.has_active_triggers_for_event(
             dest_db_id,
             &dest_tbl.name,
             TriggerEventKind::Insert,
             None,
         )
-        || db_set.has_active_triggers_for_event(
-            dest_db_id,
-            &dest_tbl.name,
-            TriggerEventKind::Delete,
-            None,
-        )
     {
         return None;
     }
-    let InsertSource::Select(sel) = &ins.source else {
-        return None;
-    };
-    if !sel.ctes.is_empty()
-        || !sel.body.compounds.is_empty()
-        || !sel.order_by.is_empty()
-        || sel.limit.is_some()
-    {
-        return None;
-    }
+    // C looks at the right-most term of a compound SELECT.
+    let core = sel.body.compounds.last().map_or(&sel.body.head, |c| &c.1);
     let SelectCore::Select {
-        distinct: false,
+        distinct,
         projection,
-        from: Some(fc),
-        selection: None,
+        from,
+        selection,
         group_by,
-        having: None,
-        windows,
-    } = &sel.body.head
+        having: _,
+        windows: _,
+    } = core
     else {
         return None;
     };
-    if !group_by.is_empty()
-        || !windows.is_empty()
-        || !fc.joins.is_empty()
-        || projection.len() != 1
-        || !matches!(projection[0], ResultColumn::Star)
-    {
-        return None;
-    }
-    let TableOrSubquery::Table {
-        name: src_qn,
-        table_args: None,
-        ..
-    } = &fc.head
-    else {
-        return None;
-    };
-    let (src_db_id, src_tbl) = db_set.find_user_table_in_set(src_qn)?;
-    if src_db_id == dest_db_id && src_tbl.root_pgno == dest_tbl.root_pgno {
-        return None;
-    }
-    if dest_tbl.without_rowid != src_tbl.without_rowid
-        || dest_tbl.columns.len() != src_tbl.columns.len()
-        || dest_tbl.rowid_alias_col != src_tbl.rowid_alias_col
-    {
-        return None;
-    }
-    if dest_tbl.strict {
-        if !src_tbl.strict {
-            return None;
+    Some((|| -> std::result::Result<XferPlan, u8> {
+        if !ins.ctes.is_empty() || !sel.ctes.is_empty() {
+            return Err(1);
         }
-        for (dc, sc) in dest_tbl.columns.iter().zip(&src_tbl.columns) {
-            let dt = dc.type_name.trim().to_ascii_uppercase();
-            let st = sc.type_name.trim().to_ascii_uppercase();
-            let ok = dt == "ANY"
-                || dt == st
-                || (dt == "INT" && st == "INTEGER")
-                || (dt == "INTEGER" && st == "INT");
-            if !ok {
-                return None;
+        if dest_tbl.root_pgno == 0 {
+            return Err(2);
+        }
+        let mut on_error = or_conflict;
+        if on_error.is_none() && dest_tbl.rowid_alias_col.is_some() {
+            on_error = Some(dest_tbl.rowid_pk_conflict);
+        }
+        let on_error = on_error.unwrap_or(ConflictAction::Abort);
+        let Some(fc) = from else {
+            return Err(3);
+        };
+        if !fc.joins.is_empty() {
+            return Err(3);
+        }
+        if matches!(fc.head, TableOrSubquery::Subquery { .. }) {
+            return Err(4);
+        }
+        if selection.is_some() {
+            return Err(5);
+        }
+        if !sel.order_by.is_empty() {
+            return Err(6);
+        }
+        if !group_by.is_empty() {
+            return Err(7);
+        }
+        if sel.limit.is_some() {
+            return Err(8);
+        }
+        if !sel.body.compounds.is_empty() {
+            return Err(9);
+        }
+        if *distinct {
+            return Err(10);
+        }
+        if projection.len() != 1 {
+            return Err(11);
+        }
+        if !matches!(projection[0], ResultColumn::Star) {
+            return Err(12);
+        }
+        let TableOrSubquery::Table {
+            name: src_qn,
+            table_args: None,
+            ..
+        } = &fc.head
+        else {
+            // A table-valued function: an eponymous virtual table, with a rowid.
+            return Err(if dest_tbl.without_rowid { 15 } else { 16 });
+        };
+        let Some((src_db_id, src_tbl)) = db_set.find_user_table_in_set(src_qn) else {
+            // A view or a virtual table (both "have a rowid"), or nothing at all.
+            let exists = db_set.find_view_in_set(src_qn).is_some()
+                || db_set.find_virtual_table_in_set(src_qn).is_some();
+            return Err(if !exists {
+                13
+            } else if dest_tbl.without_rowid {
+                15
+            } else {
+                16
+            });
+        };
+        if src_db_id == dest_db_id && src_tbl.root_pgno == dest_tbl.root_pgno {
+            return Err(14);
+        }
+        if dest_tbl.without_rowid != src_tbl.without_rowid {
+            return Err(15);
+        }
+        if dest_tbl.columns.len() != src_tbl.columns.len() {
+            return Err(17);
+        }
+        if dest_tbl.rowid_alias_col != src_tbl.rowid_alias_col {
+            return Err(18);
+        }
+        if dest_tbl.strict {
+            if !src_tbl.strict {
+                return Err(19);
+            }
+            for (dc, sc) in dest_tbl.columns.iter().zip(&src_tbl.columns) {
+                let dt = dc.type_name.trim().to_ascii_uppercase();
+                let st = sc.type_name.trim().to_ascii_uppercase();
+                let ok = dt == "ANY"
+                    || dt == st
+                    || (dt == "INT" && st == "INTEGER")
+                    || (dt == "INTEGER" && st == "INT");
+                if !ok {
+                    return Err(20);
+                }
             }
         }
-    }
-    for (i, (dc, sc)) in dest_tbl.columns.iter().zip(&src_tbl.columns).enumerate() {
-        if dc.generated != sc.generated
-            || dc.affinity != sc.affinity
-            || dc.collation != sc.collation
-        {
-            return None;
-        }
-        if dc.not_null.is_some() && sc.not_null.is_none() {
-            return None;
-        }
-        if dc.generated.is_none() && i > 0 && dc.default_expr != sc.default_expr {
-            return None;
-        }
-    }
-    let mut dest_indexes = db_set
-        .slot(dest_db_id)
-        .map(|s| s.schema.indexes_for_table(&dest_tbl.name))
-        .unwrap_or_default();
-    if let Some(pk_idx) = dest_tbl.without_rowid_pk_as_index() {
-        dest_indexes.push(pk_idx);
-    }
-    let mut src_indexes = db_set
-        .slot(src_db_id)
-        .map(|s| s.schema.indexes_for_table(&src_tbl.name))
-        .unwrap_or_default();
-    if let Some(pk_idx) = src_tbl.without_rowid_pk_as_index() {
-        src_indexes.push(pk_idx);
-    }
-    for d_idx in &dest_indexes {
-        let matched = src_indexes
-            .iter()
-            .find(|s_idx| xfer_compatible_index(d_idx, s_idx))?;
-        if src_db_id == dest_db_id && matched.root_pgno == d_idx.root_pgno {
-            return None;
-        }
-    }
-    if !dest_tbl.checks.is_empty() {
-        if dest_tbl.checks.len() != src_tbl.checks.len() {
-            return None;
-        }
-        for (dc, sc) in dest_tbl.checks.iter().zip(&src_tbl.checks) {
-            if dc.expr != sc.expr {
-                return None;
+        for (i, (dc, sc)) in dest_tbl.columns.iter().zip(&src_tbl.columns).enumerate() {
+            if dc.generated.as_ref().map(|g| g.1) != sc.generated.as_ref().map(|g| g.1) {
+                return Err(21);
+            }
+            if dc.generated.as_ref().map(|g| &g.0) != sc.generated.as_ref().map(|g| &g.0) {
+                return Err(22);
+            }
+            if dc.affinity != sc.affinity {
+                return Err(23);
+            }
+            if dc.collation != sc.collation
+                || !dc
+                    .custom_collation
+                    .as_deref()
+                    .unwrap_or("")
+                    .eq_ignore_ascii_case(sc.custom_collation.as_deref().unwrap_or(""))
+            {
+                return Err(24);
+            }
+            if dc.not_null.is_some() && sc.not_null.is_none() {
+                return Err(25);
+            }
+            if dc.generated.is_none() && i > 0 {
+                // C compares the text of the DEFAULT clauses.
+                let same = match (&dc.default_src, &sc.default_src) {
+                    (Some(a), Some(b)) => a == b,
+                    (None, None) => dc.default_expr == sc.default_expr,
+                    _ => dc.default_expr.is_none() && sc.default_expr.is_none(),
+                };
+                if !same {
+                    return Err(26);
+                }
             }
         }
-        if dest_tbl.rowid_alias_col.is_none()
-            && dest_tbl
-                .checks
+        let (Some(dest_slot), Some(src_slot)) = (db_set.slot(dest_db_id), db_set.slot(src_db_id))
+        else {
+            return Err(13);
+        };
+        let mut dest_has_unique_idx = false;
+        let dest_list = c_index_list_order(&dest_slot.schema, dest_tbl);
+        let src_list = c_index_list_order(&src_slot.schema, src_tbl);
+        let src_pk = src_tbl.without_rowid_pk_as_index();
+        let dest_pk = dest_tbl.without_rowid_pk_as_index();
+        for d in &dest_list {
+            let Some(d_idx) = d.or(dest_pk.as_ref()) else {
+                continue;
+            };
+            if d_idx.unique {
+                dest_has_unique_idx = true;
+            }
+            let Some(matched) = src_list
                 .iter()
-                .any(|c| expr_mentions_implicit_rowid(&c.expr, dest_tbl))
+                .filter_map(|s| s.or(src_pk.as_ref()))
+                .find(|s_idx| xfer_compatible_index(d_idx, s_idx))
+            else {
+                return Err(27);
+            };
+            if src_db_id == dest_db_id && matched.root_pgno == d_idx.root_pgno {
+                return Err(28);
+            }
+        }
+        if !dest_tbl.checks.is_empty() {
+            let mut same = dest_tbl.checks.len() == src_tbl.checks.len()
+                && dest_tbl
+                    .checks
+                    .iter()
+                    .zip(&src_tbl.checks)
+                    .all(|(dc, sc)| dc.expr == sc.expr);
+            if same
+                && dest_tbl.rowid_alias_col.is_none()
+                && dest_tbl
+                    .checks
+                    .iter()
+                    .any(|c| expr_mentions_implicit_rowid(&c.expr, dest_tbl))
+            {
+                same = false;
+            }
+            if !same {
+                return Err(29);
+            }
+        }
+        if foreign_keys && !dest_tbl.foreign_keys.is_empty() {
+            return Err(30);
+        }
+        if count_changes {
+            return Err(31);
+        }
+        let needs_empty_dest = (dest_tbl.rowid_alias_col.is_none() && !dest_list.is_empty())
+            || dest_has_unique_idx
+            || (on_error != ConflictAction::Abort && on_error != ConflictAction::Rollback);
+        Ok(XferPlan {
+            src_db_id,
+            src_tbl: src_tbl.clone(),
+            needs_empty_dest,
+            on_error,
+        })
+    })())
+}
+
+/// Decision trace only: C runs `xferOptimization` while it compiles an INSERT, so its decision
+/// is on record even when the compilation fails afterwards (wrong number of columns, unknown
+/// table). Called for an INSERT whose compilation failed for good.
+#[allow(unused_variables)]
+pub(crate) fn dtrace_xfer_decision_of_failed_compile(
+    ins: &InsertStmt,
+    db_set: &DatabaseSet,
+    foreign_keys: bool,
+    count_changes: bool,
+) {
+    #[allow(unexpected_cfgs)]
+    {
+        #[cfg(sqliters_dtrace)]
         {
-            return None;
+            let Ok(Some((db_id, crate::db_set::ResolvedRelation::Table(tbl)))) =
+                db_set.find_relation_in_set(&ins.table)
+            else {
+                return;
+            };
+            match xfer_optimization(
+                ins,
+                db_id,
+                &tbl,
+                false,
+                db_set,
+                foreign_keys,
+                count_changes,
+                ins.or_conflict,
+            ) {
+                Some(Ok(plan)) => {
+                    sqliters_types::dtrace!(
+                        "TR|xfd|go|dest={} src={} empty={}",
+                        tbl.name,
+                        plan.src_tbl.name,
+                        u8::from(plan.needs_empty_dest)
+                    );
+                }
+                Some(Err(why)) => {
+                    sqliters_types::dtrace!("TR|xfd|no|why={}", why);
+                }
+                None => {}
+            }
         }
     }
-    Some((src_db_id, src_tbl.clone()))
+}
+
+/// Where the rows of a transfer go: a table of an open database, or (VACUUM) the b-tree file
+/// being built.
+enum XferDest<'x> {
+    Slot(DatabaseId),
+    External(&'x mut Btree),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum XferMode {
+    /// `INSERT INTO d SELECT * FROM s`.
+    Insert { on_error: ConflictAction },
+    /// The copy statements of `VACUUM` (`DBFLAG_Vacuum`); `into`: `DBFLAG_VacuumInto`.
+    Vacuum { into: bool },
+}
+
+/// One index of the destination and the index of the source it is filled from
+/// (`xferCompatibleIndex`).
+struct XferIndexPair {
+    dest_root: Pgno,
+    src_root: Pgno,
+    orders: Vec<KeySortOrder>,
+    /// Every column of the source index — the appended rowid / PRIMARY KEY columns included —
+    /// uses the BINARY collation.
+    all_binary: bool,
+    /// The PRIMARY KEY index of a WITHOUT ROWID table (the table itself): counts the changes.
+    is_table: bool,
+}
+
+fn xfer_btree<'a>(ctx: &'a mut ExecContext<'_>, db_id: DatabaseId) -> Result<&'a mut Btree> {
+    ctx.db_set
+        .slot_mut(db_id)
+        .and_then(|s| s.btree.as_mut())
+        .ok_or_else(|| SqliteError::misuse("database slot closed"))
+}
+
+fn xfer_dest_btree<'a>(
+    ctx: &'a mut ExecContext<'_>,
+    dest: &'a mut XferDest<'_>,
+) -> Result<&'a mut Btree> {
+    match dest {
+        XferDest::Slot(id) => xfer_btree(ctx, *id),
+        XferDest::External(bt) => Ok(bt),
+    }
+}
+
+/// The index pairs of a transfer in the order of the destination's `pTab->pIndex` list.
+/// `dest_roots` maps a source root page to the destination's (VACUUM: the same schema built
+/// again); without it the destination's own schema is searched for the compatible index.
+fn xfer_index_pairs(
+    db_set: &DatabaseSet,
+    dest: Option<(DatabaseId, &TableSchema)>,
+    src_db_id: DatabaseId,
+    src_tbl: &TableSchema,
+    dest_roots: &dyn Fn(Pgno) -> Option<Pgno>,
+) -> Vec<XferIndexPair> {
+    let Some(src_slot) = db_set.slot(src_db_id) else {
+        return Vec::new();
+    };
+    let src_pk = src_tbl.without_rowid_pk_as_index();
+    let src_list: Vec<&IndexSchema> = c_index_list_order(&src_slot.schema, src_tbl)
+        .into_iter()
+        .filter_map(|s| s.or(src_pk.as_ref()))
+        .collect();
+    let all_binary = |i: &IndexSchema| {
+        i.columns
+            .iter()
+            .chain(i.trailing_pk_cols.iter())
+            .all(|c| c.sort_order.collation_name().eq_ignore_ascii_case("BINARY"))
+    };
+    let mut out = Vec::new();
+    match dest {
+        None => {
+            for s_idx in src_list {
+                let Some(dest_root) = dest_roots(s_idx.root_pgno) else {
+                    continue;
+                };
+                out.push(XferIndexPair {
+                    dest_root,
+                    src_root: s_idx.root_pgno,
+                    orders: s_idx.key_sort_orders(),
+                    all_binary: all_binary(s_idx),
+                    is_table: s_idx.root_pgno == src_tbl.root_pgno,
+                });
+            }
+        }
+        Some((dest_db_id, dest_tbl)) => {
+            let Some(dest_slot) = db_set.slot(dest_db_id) else {
+                return Vec::new();
+            };
+            let dest_pk = dest_tbl.without_rowid_pk_as_index();
+            for d in c_index_list_order(&dest_slot.schema, dest_tbl) {
+                let Some(d_idx) = d.or(dest_pk.as_ref()) else {
+                    continue;
+                };
+                let Some(s_idx) = src_list
+                    .iter()
+                    .find(|s_idx| xfer_compatible_index(d_idx, s_idx))
+                else {
+                    continue;
+                };
+                out.push(XferIndexPair {
+                    dest_root: d_idx.root_pgno,
+                    src_root: s_idx.root_pgno,
+                    orders: d_idx.key_sort_orders(),
+                    all_binary: all_binary(s_idx),
+                    is_table: d_idx.root_pgno == dest_tbl.root_pgno,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The run-time half of `xferOptimization` (`insert.c`): the table rows are copied cell by
+/// cell (`OP_RowCell` → `sqlite3BtreeTransferRow`, `OP_Insert` with `OPFLAG_PREFORMAT`), then
+/// every index is copied entry by entry, in the order of the destination's index list,
+/// through a cursor opened with `OPFLAG_BULKCSR`.
+///
+/// * `XferMode::Insert`: with an INTEGER PRIMARY KEY every rowid is first looked up in the
+///   destination (`OP_NotExists`, `sqlite3RowidConstraint`); without one and without indexes
+///   the rows get new rowids (`OP_NewRowid`); otherwise the source rowid is kept. Index
+///   entries are inserted by key (`OP_IdxInsert` with `OPFLAG_APPEND` only).
+/// * `XferMode::Vacuum`: the destination is empty, rows and — for indexes whose columns all
+///   use BINARY — index entries are appended behind the last one (`OP_SeekEnd`,
+///   `OPFLAG_USESEEKRESULT|OPFLAG_PREFORMAT`); new rowids only for a table without INTEGER
+///   PRIMARY KEY and without index, and not for `VACUUM INTO`.
+#[allow(clippy::too_many_arguments)]
+fn xfer_copy(
+    ctx: &mut ExecContext<'_>,
+    src_db_id: DatabaseId,
+    src_tbl: &TableSchema,
+    dest: &mut XferDest<'_>,
+    dest_tbl: &TableSchema,
+    dest_root: Pgno,
+    pairs: &[XferIndexPair],
+    mode: XferMode,
+    changes: &mut u64,
+) -> Result<()> {
+    if let (XferMode::Vacuum { into }, XferDest::External(target)) = (mode, &mut *dest) {
+        return xfer_copy_vacuum(ctx, src_db_id, src_tbl, target, dest_root, pairs, into);
+    }
+    let vacuum = matches!(mode, XferMode::Vacuum { .. });
+    if !src_tbl.without_rowid {
+        let has_ipk = dest_tbl.rowid_alias_col.is_some();
+        // `OP_NotExists` on a rowid above the largest one of the destination needs no search
+        // (`sqlite3BtreeTableMoveto`: cursor on the last row, key greater).
+        let mut dest_max: Option<i64> = if has_ipk {
+            xfer_dest_btree(ctx, dest)?.max_table_rowid(dest_root)?
+        } else {
+            None
+        };
+        let new_rowids =
+            !has_ipk && pairs.is_empty() && !matches!(mode, XferMode::Vacuum { into: true });
+        let cid = xfer_btree(ctx, src_db_id)?.open_table_cursor(src_tbl.root_pgno, false);
+        let mut ac = sqliters_btree::AppendCursor::new(dest_root, false);
+        let mut n_rows = 0u64;
+        let mut payload: Vec<u8> = Vec::new();
+        let res = (|| -> Result<()> {
+            let mut has_row = xfer_btree(ctx, src_db_id)?.cursor_first(cid)?;
+            while has_row {
+                ctx.step_tick()?;
+                let src_rowid = {
+                    let sbt = xfer_btree(ctx, src_db_id)?;
+                    sbt.cursor_payload_into(cid, &mut payload)?;
+                    sbt.cursor_rowid(cid)?
+                };
+                let rowid = if has_ipk {
+                    if let XferMode::Insert { on_error } = mode {
+                        let above_all = dest_max.is_none_or(|m| src_rowid > m);
+                        if above_all {
+                            dest_max = Some(src_rowid);
+                        }
+                        let dbt = xfer_dest_btree(ctx, dest)?;
+                        if !above_all && dbt.seek_table_rowid(dest_root, src_rowid)?.is_some() {
+                            let ipk = dest_tbl.rowid_alias_col.unwrap_or(0);
+                            return Err(SqliteError::constraint(
+                                extended::SQLITE_CONSTRAINT_PRIMARYKEY,
+                                format!(
+                                    "UNIQUE constraint failed: {}.{}",
+                                    dest_tbl.name, dest_tbl.columns[ipk].name
+                                ),
+                            )
+                            .with_conflict_effect(conflict_action_to_effect(on_error)));
+                        }
+                        if dest_tbl.autoincrement
+                            && let XferDest::Slot(dest_db_id) = dest
+                        {
+                            autoinc_note_rowid(ctx, *dest_db_id, dest_tbl, src_rowid)?;
+                        }
+                    }
+                    src_rowid
+                } else if new_rowids {
+                    xfer_dest_btree(ctx, dest)?.next_rowid(dest_root)?
+                } else {
+                    src_rowid
+                };
+                let dbt = xfer_dest_btree(ctx, dest)?;
+                if vacuum {
+                    dbt.append_table_transfer(&mut ac, rowid, &payload)?;
+                } else {
+                    dbt.insert_table_transfer_sorted(&mut ac, rowid, &payload)?;
+                    *changes += 1;
+                    ctx.runtime.last_insert_rowid = rowid;
+                }
+                n_rows += 1;
+                has_row = xfer_btree(ctx, src_db_id)?.cursor_next(cid)?;
+            }
+            Ok(())
+        })();
+        if let Ok(sbt) = xfer_btree(ctx, src_db_id) {
+            sbt.close_cursor(cid);
+        }
+        res?;
+        if n_rows == 0 {
+            // `emptySrcTest`: an empty source table skips the index loops as well.
+            return Ok(());
+        }
+    }
+    for pair in pairs {
+        {
+            let dbt = xfer_dest_btree(ctx, dest)?;
+            if dbt.dtrace_traced() {
+                sqliters_types::dtrace!("TR|xf|open|root={} bulk=1", pair.dest_root);
+            }
+        }
+        let append = vacuum && pair.all_binary;
+        let cid = xfer_btree(ctx, src_db_id)?.open_index_cursor(
+            pair.src_root,
+            pair.orders.clone(),
+            false,
+        );
+        let mut ac = sqliters_btree::AppendCursor::new(pair.dest_root, true);
+        let mut rec: Vec<u8> = Vec::new();
+        let res = (|| -> Result<()> {
+            let mut has_row = xfer_btree(ctx, src_db_id)?.cursor_first(cid)?;
+            while has_row {
+                ctx.step_tick()?;
+                xfer_btree(ctx, src_db_id)?.cursor_payload_into(cid, &mut rec)?;
+                let dbt = xfer_dest_btree(ctx, dest)?;
+                if append {
+                    dbt.append_index(&mut ac, &rec, true)?;
+                } else {
+                    dbt.insert_index_sorted(&mut ac, &rec, &pair.orders)?;
+                }
+                if pair.is_table && !vacuum {
+                    *changes += 1;
+                }
+                has_row = xfer_btree(ctx, src_db_id)?.cursor_next(cid)?;
+            }
+            Ok(())
+        })();
+        if let Ok(sbt) = xfer_btree(ctx, src_db_id) {
+            sbt.close_cursor(cid);
+        }
+        res?;
+    }
+    Ok(())
+}
+
+/// [`xfer_copy`] for VACUUM (`XferMode::Vacuum` into the file being built): the source is read
+/// page by page and every row / index entry is appended to the new file.
+fn xfer_copy_vacuum(
+    ctx: &mut ExecContext<'_>,
+    src_db_id: DatabaseId,
+    src_tbl: &TableSchema,
+    target: &mut Btree,
+    dest_root: Pgno,
+    pairs: &[XferIndexPair],
+    into: bool,
+) -> Result<()> {
+    use std::ops::ControlFlow;
+    let interrupt_flag = ctx.interrupt_flag;
+    let progress = &mut *ctx.progress;
+    let src_bt = ctx
+        .db_set
+        .slot_mut(src_db_id)
+        .and_then(|s| s.btree.as_mut())
+        .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+    let mut tick = || -> Result<()> {
+        if interrupt_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(SqliteError::new(ErrorCode::Interrupt, "interrupted"));
+        }
+        progress.tick()
+    };
+    if !src_tbl.without_rowid {
+        let has_ipk = src_tbl.rowid_alias_col.is_some();
+        // `OP_NewRowid` for a table without INTEGER PRIMARY KEY and without index (not for
+        // VACUUM INTO); otherwise the rowid of the source row.
+        let new_rowids = !has_ipk && pairs.is_empty() && !into;
+        let mut ac = sqliters_btree::AppendCursor::new(dest_root, false);
+        let mut n_rows = 0u64;
+        let mut last_new: Option<i64> = None;
+        src_bt.scan_table_raw_cells(src_tbl.root_pgno, |src_rowid, payload| {
+            tick()?;
+            let rowid = if new_rowids {
+                let r = match last_new {
+                    Some(prev) if prev < i64::MAX => prev + 1,
+                    _ => target.next_rowid(dest_root)?,
+                };
+                last_new = Some(r);
+                r
+            } else {
+                src_rowid
+            };
+            n_rows += 1;
+            target.append_table_transfer(&mut ac, rowid, payload)
+        })?;
+        if n_rows == 0 {
+            // `emptySrcTest`: an empty source table skips the index loops as well.
+            return Ok(());
+        }
+    }
+    for pair in pairs {
+        if target.dtrace_traced() {
+            sqliters_types::dtrace!("TR|xf|open|root={} bulk=1", pair.dest_root);
+        }
+        let mut ac = sqliters_btree::AppendCursor::new(pair.dest_root, true);
+        if pair.all_binary {
+            // `OP_SeekEnd` + `OP_RowCell` + `OP_IdxInsert` (USESEEKRESULT|PREFORMAT).
+            src_bt.scan_index_raw_cells(pair.src_root, false, |rec| {
+                tick()?;
+                target.append_index(&mut ac, rec, true)?;
+                Ok(ControlFlow::Continue(()))
+            })?;
+        } else {
+            // `OP_RowData` + `OP_IdxInsert`: placed by key.
+            src_bt.scan_index_raw_cells(pair.src_root, false, |rec| {
+                tick()?;
+                target.insert_index_sorted(&mut ac, rec, &pair.orders)?;
+                Ok(ControlFlow::Continue(()))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Runs the transfer of `INSERT INTO dest SELECT * FROM src` when `plan` allows it at run
+/// time. `Ok(false)`: the destination had to be empty and is not (`emptyDestTest`) — the
+/// ordinary insert has to run.
+fn exec_insert_xfer(
+    ctx: &mut ExecContext<'_>,
+    plan: &XferPlan,
+    dest_db_id: DatabaseId,
+    dest_tbl: &TableSchema,
+    changes: &mut u64,
+) -> Result<bool> {
+    // `autoIncBegin`
+    if dest_tbl.autoincrement {
+        autoinc_counter(ctx, dest_db_id, dest_tbl)?;
+    }
+    ctx.db_set.record_xferopt();
+    if plan.needs_empty_dest {
+        let bt = xfer_btree(ctx, dest_db_id)?;
+        let empty = if dest_tbl.without_rowid {
+            let cid = bt.open_index_cursor(
+                dest_tbl.root_pgno,
+                dest_tbl.without_rowid_pk_orders(),
+                false,
+            );
+            let r = bt.cursor_first(cid);
+            bt.close_cursor(cid);
+            !r?
+        } else {
+            bt.max_table_rowid(dest_tbl.root_pgno)?.is_none()
+        };
+        if !empty {
+            return Ok(false);
+        }
+    }
+    let pairs = xfer_index_pairs(
+        ctx.db_set,
+        Some((dest_db_id, dest_tbl)),
+        plan.src_db_id,
+        &plan.src_tbl,
+        &|_| None,
+    );
+    let mut dest = XferDest::Slot(dest_db_id);
+    xfer_copy(
+        ctx,
+        plan.src_db_id,
+        &plan.src_tbl,
+        &mut dest,
+        dest_tbl,
+        dest_tbl.root_pgno,
+        &pairs,
+        XferMode::Insert {
+            on_error: plan.on_error,
+        },
+        changes,
+    )?;
+    Ok(true)
 }
 
 fn finalize_dml_step_result(
@@ -21583,10 +22168,8 @@ struct PreparedTableInsert<'a> {
     col_targets: Option<Vec<usize>>,
     implicit_non_gen_cols: Vec<usize>,
     source: PreparedInsertSource<'a>,
-    xfer_preserve_rowids: Option<Vec<i64>>,
     /// Transfer optimisation (`INSERT INTO t SELECT * FROM s`): per source row, whether its
     /// REAL-affinity columns are stored in integer form. C copies the records byte for byte.
-    xfer_real_as_int: Option<Vec<bool>>,
     ordered_uniques: Vec<IndexSchema>,
     upsert_steps: Vec<UpsertCheckStep>,
     resolved_do_updates: Vec<Vec<(Vec<usize>, bool, &'a Expr)>>,
@@ -21619,6 +22202,9 @@ struct PreparedVTabInsert<'a> {
 }
 
 enum PreparedInsert<'a> {
+    /// The transfer optimisation copied the rows already (`xferOptimization` returned 1): the
+    /// number of rows it counted (`OPFLAG_NCHANGE`).
+    XferDone(u64),
     Table(Box<PreparedTableInsert<'a>>),
     View(Box<PreparedViewInsert<'a>>),
     VirtualTable(Box<PreparedVTabInsert<'a>>),
@@ -21797,21 +22383,71 @@ fn prepare_insert_exec<'a>(
                 )?;
             }
 
-            let xfer_src = if outer_scopes.is_empty() {
-                check_insert_xfer_eligible(
-                    ins,
-                    db_id,
-                    &initial_tbl,
-                    is_catalog,
-                    ctx.db_set,
-                    *ctx.foreign_keys,
-                    *ctx.count_changes,
-                )
-            } else {
-                None
-            };
-            let mut xfer_preserve_rowids: Option<Vec<i64>> = None;
-            let mut xfer_real_as_int: Option<Vec<bool>> = None;
+            // `xferOptimization` (insert.c): `INSERT INTO d SELECT * FROM s` between tables of
+            // the same shape copies raw rows and index entries.
+            let xfer_args = (*ctx.foreign_keys, *ctx.count_changes);
+            let mut xfer = xfer_optimization(
+                ins,
+                db_id,
+                &initial_tbl,
+                is_catalog,
+                ctx.db_set,
+                xfer_args.0,
+                xfer_args.1,
+                effective_or_conflict,
+            );
+            match &xfer {
+                Some(Ok(_plan)) => {
+                    sqliters_types::dtrace!(
+                        "TR|xfd|go|dest={} src={} empty={}",
+                        initial_tbl.name,
+                        _plan.src_tbl.name,
+                        u8::from(_plan.needs_empty_dest)
+                    );
+                }
+                Some(Err(_why)) => {
+                    sqliters_types::dtrace!("TR|xfd|no|why={}", _why);
+                }
+                None => {}
+            }
+            if let Some(Ok(plan)) = &xfer {
+                // The statement's write transaction (and the read transaction on the source)
+                // start before anything is read; the schema may have been reloaded by that.
+                if db_id == DatabaseId::TEMP {
+                    let enc = ctx.encoding();
+                    ctx.db_set.ensure_temp_open(enc, *ctx.writable_schema)?;
+                }
+                let src_db_id = plan.src_db_id;
+                ctx.ensure_write_db(db_id, true)?;
+                if src_db_id != db_id {
+                    ctx.ensure_read_db(src_db_id, true)?;
+                }
+                let fresh_tbl = ctx
+                    .db_set
+                    .slot(db_id)
+                    .and_then(|sl| sl.schema.find_user_table(&initial_tbl.name).cloned());
+                xfer = fresh_tbl.as_ref().and_then(|t| {
+                    xfer_optimization(
+                        ins,
+                        db_id,
+                        t,
+                        is_catalog,
+                        ctx.db_set,
+                        xfer_args.0,
+                        xfer_args.1,
+                        effective_or_conflict,
+                    )
+                });
+                if let (Some(Ok(plan)), Some(dest_tbl)) = (&xfer, &fresh_tbl) {
+                    let mut n_changes = 0u64;
+                    let done = exec_insert_xfer(ctx, plan, db_id, dest_tbl, &mut n_changes);
+                    match done {
+                        Ok(true) => return Ok(PreparedInsert::XferDone(n_changes)),
+                        Ok(false) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
             let source = match &ins.source {
                 InsertSource::DefaultValues => PreparedInsertSource::Materialized(vec![Vec::new()]),
                 InsertSource::Values(expr_rows) => {
@@ -21858,50 +22494,7 @@ fn prepare_insert_exec<'a>(
                     }
                 }
                 InsertSource::Select(sel) => {
-                    let mut rows = exec_select(ctx, sel, params, outer_scopes, &dml_ctes)?.rows;
-                    if let Some((src_db_id, ref src_tbl)) = xfer_src {
-                        ctx.db_set.record_xferopt();
-                        if initial_tbl.columns.iter().any(|c| c.generated.is_some()) {
-                            for row in &mut rows {
-                                if row.len() == initial_tbl.columns.len() {
-                                    let mut filtered =
-                                        Vec::with_capacity(initial_tbl.columns.len());
-                                    for (i, val) in row.drain(..).enumerate() {
-                                        if initial_tbl.columns[i].generated.is_none() {
-                                            filtered.push(val);
-                                        }
-                                    }
-                                    *row = filtered;
-                                }
-                            }
-                        }
-                        if !initial_tbl.without_rowid
-                            && initial_tbl.rowid_alias_col.is_none()
-                            && let Ok(dest_empty) =
-                                is_table_btree_empty(ctx, db_id, initial_tbl.root_pgno)
-                            && dest_empty
-                            && let Ok(src_rids) =
-                                scan_table_rowids_only(ctx, src_db_id, src_tbl.root_pgno)
-                            && src_rids.len() == rows.len()
-                        {
-                            xfer_preserve_rowids = Some(src_rids);
-                        }
-                        if initial_tbl.has_real_col()
-                            && !initial_tbl.without_rowid
-                            && !src_tbl.without_rowid
-                        {
-                            let (src_enc, _) = slot_encoding_and_name(ctx, src_db_id);
-                            let raw = scan_table_raw_entries(ctx, src_db_id, src_tbl)?;
-                            if raw.len() == rows.len() {
-                                let mut forms = Vec::with_capacity(raw.len());
-                                for (_, payload) in &raw {
-                                    let phys = decode_record_with_encoding(payload, src_enc)?;
-                                    forms.push(stored_real_form_is_int(src_tbl, &phys));
-                                }
-                                xfer_real_as_int = Some(forms);
-                            }
-                        }
-                    }
+                    let rows = exec_select(ctx, sel, params, outer_scopes, &dml_ctes)?.rows;
                     PreparedInsertSource::Materialized(rows)
                 }
             };
@@ -21971,8 +22564,6 @@ fn prepare_insert_exec<'a>(
                 col_targets,
                 implicit_non_gen_cols,
                 source,
-                xfer_preserve_rowids,
-                xfer_real_as_int,
                 ordered_uniques,
                 upsert_steps,
                 resolved_do_updates,
@@ -22310,14 +22901,11 @@ fn prepare_table_insert_row_before(
     ctx: &mut ExecContext<'_>,
     p: &PreparedTableInsert<'_>,
     ins: &InsertStmt,
-    row_idx: usize,
+    _row_idx: usize,
     src_row: Vec<Value>,
     params: &[Value],
 ) -> Result<(Option<i64>, Vec<Value>, Option<Box<EvalRow>>)> {
-    let mut explicit_rowid: Option<i64> = p
-        .xfer_preserve_rowids
-        .as_ref()
-        .and_then(|rids| rids.get(row_idx).copied());
+    let mut explicit_rowid: Option<i64> = None;
     let mut col_vals = Vec::with_capacity(p.tbl.columns.len());
     for col in &p.tbl.columns {
         let def = match &col.default_expr {
@@ -22504,10 +23092,7 @@ fn execute_single_table_insert_row(
         return Ok(());
     }
 
-    ctx.stmt_tx.insert_real_as_int = p
-        .xfer_real_as_int
-        .as_ref()
-        .and_then(|forms| forms.get(row_idx).copied());
+    ctx.stmt_tx.insert_real_as_int = None;
     if ins.upsert_clauses.is_empty() {
         let Some(after_scope_opt) = write_plain_table_insert_and_build_after_scope(
             ctx,
@@ -22975,10 +23560,14 @@ fn execute_upsert_table_insert_row(
                 let pk_orders = p.tbl.without_rowid_pk_orders();
                 bt.insert_index(p.tbl.root_pgno, &phys_rec, &pk_orders)?;
             }
-        } else if ctx.stmt_tx.replace_unparsed_row.take() == Some((p.tbl.root_pgno, rowid)) {
-            bt.insert_table_replace_unparsed(p.tbl.root_pgno, rowid, &phys_rec)?;
         } else {
-            bt.insert_table(p.tbl.root_pgno, rowid, &phys_rec)?;
+            if ctx.stmt_tx.replace_unparsed_row.take() == Some((p.tbl.root_pgno, rowid)) {
+                bt.insert_table_replace_unparsed(p.tbl.root_pgno, rowid, &phys_rec)?;
+            } else {
+                bt.insert_table(p.tbl.root_pgno, rowid, &phys_rec)?;
+            }
+            ctx.stmt_tx
+                .note_table_row_written(bt, p.tbl.root_pgno, rowid);
         }
     }
     if let Some(slot) = ctx.db_set.slot(p.db_id)
@@ -23791,6 +24380,34 @@ fn exec_insert_internal(
     let mut stmt_changes: u64 = 0;
     let mut count_changes_rows: u64 = 0;
 
+    #[allow(unexpected_cfgs)]
+    {
+        // Decision trace: `xferOptimization` is also asked about a virtual-table destination
+        // (its 1st and 2nd tests).
+        #[cfg(sqliters_dtrace)]
+        {
+            if ins.columns.is_none()
+                && ins.returning.is_empty()
+                && let InsertSource::Select(sel) = &ins.source
+                && matches!(
+                    sel.body.compounds.last().map_or(&sel.body.head, |c| &c.1),
+                    SelectCore::Select { .. }
+                )
+                && ctx.db_set.find_virtual_table_in_set(&ins.table).is_some()
+                && ctx.db_set.find_user_table_in_set(&ins.table).is_none()
+            {
+                sqliters_types::dtrace!(
+                    "TR|xfd|no|why={}",
+                    if !ins.ctes.is_empty() || !sel.ctes.is_empty() {
+                        1
+                    } else {
+                        2
+                    }
+                );
+            }
+        }
+    }
+
     if ins.ctes.is_empty()
         && ins.upsert_clauses.is_empty()
         && ins.returning.is_empty()
@@ -23832,6 +24449,10 @@ fn exec_insert_internal(
 
     let step_res = match prepare_insert_exec(ctx, ins, effective_or_conflict, params, outer_scopes)
     {
+        Ok(PreparedInsert::XferDone(n)) => {
+            stmt_changes += n;
+            Ok(QueryOutput::default())
+        }
         Ok(PreparedInsert::Table(p)) => run_table_insert_loop(
             ctx,
             p,
@@ -27692,7 +28313,24 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
         .create_index()?;
     let mut idx_schema = build_index_schema_from_ast(ci, &tbl, idx_root)?;
     crate::schema::rebind_index_collations(&mut idx_schema, ctx.collations);
-    populate_index_btree(ctx, db_id, &tbl, &idx_schema)?;
+    // `sqlite3CreateIndex`: `OP_CreateBtree`, the `INSERT INTO sqlite_schema` of the index row,
+    // and only then `sqlite3RefillIndex`.
+    {
+        let bt = ctx
+            .db_set
+            .slot_mut(db_id)
+            .and_then(|s| s.btree.as_mut())
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        insert_schema_entry(
+            bt,
+            "index",
+            &ci.name.name,
+            &tbl.name,
+            idx_root,
+            Some(&ci.catalog_sql),
+        )?;
+    }
+    populate_index_btree(ctx, db_id, &tbl, &idx_schema, false)?;
 
     let slot = ctx
         .db_set
@@ -27702,14 +28340,6 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
         .btree
         .as_mut()
         .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-    insert_schema_entry(
-        bt,
-        "index",
-        &ci.name.name,
-        &tbl.name,
-        idx_root,
-        Some(&ci.catalog_sql),
-    )?;
     if bt.pager().page_count() > slot.max_page_count {
         return Err(SqliteError::new(
             ErrorCode::Full,
@@ -27728,99 +28358,93 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
     Ok(())
 }
 
-fn sort_raw_index_records(
-    records: &mut [Vec<u8>],
-    orders: &[sqliters_types::KeySortOrder],
-    enc: TextEncoding,
-) -> Result<()> {
-    if records.len() <= 1 {
-        return Ok(());
+/// One key waiting in the sorter of an index build: where its record is in the arena, and an
+/// order-preserving 64-bit digest of each of its first two key columns.
+///
+/// A digest is monotone in the column's value (NULL < numbers < text < blobs, numbers by
+/// value, text and blobs by their first seven bytes), so two keys whose digests differ compare
+/// the same way their columns do. `exact` (bit 0: first column, bit 1: second) says that the
+/// digest determines the value: equal digests of two exact columns mean equal values. Only
+/// columns that sort ascending with BINARY collation in a UTF-8 database have digests (see
+/// `SorterPrefix`); for the rest, and whenever digests cannot decide, the records are compared.
+#[derive(Clone, Copy)]
+struct SorterKey {
+    p0: u64,
+    p1: u64,
+    off: usize,
+    len: u32,
+    exact: u8,
+}
+
+/// The digest of a number (`SorterKey`): the IEEE bits in total order, 53 bits of them.
+#[inline(always)]
+fn sorter_digest_f64(f: f64) -> (u64, bool) {
+    let norm = if f == 0.0 { 0.0 } else { f };
+    let bits = norm.to_bits();
+    let ord = if (bits >> 63) != 0 {
+        !bits
+    } else {
+        bits ^ (1u64 << 63)
+    };
+    ((1u64 << 56) | (ord >> 11), bits & 0x7ff == 0)
+}
+
+#[inline(always)]
+fn sorter_digest_i64(i: i64) -> (u64, bool) {
+    let (d, low_zero) = sorter_digest_f64(i as f64);
+    (d, low_zero && i.unsigned_abs() < (1u64 << 53))
+}
+
+/// The digest of a text (`tag` 2) or blob (`tag` 3) value: its first seven bytes.
+#[inline(always)]
+fn sorter_digest_bytes(tag: u64, b: &[u8]) -> (u64, bool) {
+    let mut packed = 0u64;
+    let n = b.len().min(7);
+    let mut no_zero = true;
+    for (k, &byte) in b[..n].iter().enumerate() {
+        packed |= u64::from(byte) << (48 - k * 8);
+        no_zero &= byte != 0;
     }
-    if orders.iter().all(|o| o.custom_collation.is_none()) {
-        records.sort_unstable_by(|a, b| {
-            sqliters_types::compare_raw_records_with_encoding(a, b, None, orders, enc)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        return Ok(());
-    }
-    let mut sort_err: Option<SqliteError> = None;
-    records.sort_by(|a, b| {
-        if sort_err.is_some() {
-            return std::cmp::Ordering::Equal;
-        }
-        match sqliters_types::compare_raw_records_with_encoding(a, b, None, orders, enc) {
-            Ok(ord) => ord,
-            Err(e) => {
-                sort_err = Some(e);
-                std::cmp::Ordering::Equal
-            }
-        }
-    });
-    if let Some(e) = sort_err {
-        return Err(e);
-    }
-    Ok(())
+    ((tag << 56) | packed, b.len() <= 7 && no_zero)
 }
 
 #[inline]
-fn index_val_prefix_u64(val: &Value) -> u64 {
+fn sorter_digest_value(val: &Value) -> (u64, bool) {
     match val {
-        Value::Null => 0,
-        Value::Integer(i) => {
-            let f = if *i == 0 { 0.0 } else { *i as f64 };
-            let bits = f.to_bits();
-            let ord = if (bits >> 63) != 0 {
-                !bits
-            } else {
-                bits ^ (1u64 << 63)
-            };
-            (1u64 << 56) | (ord >> 11)
-        }
-        Value::Real(r) => {
-            let f = if *r == 0.0 { 0.0 } else { *r };
-            let bits = f.to_bits();
-            let ord = if (bits >> 63) != 0 {
-                !bits
-            } else {
-                bits ^ (1u64 << 63)
-            };
-            (1u64 << 56) | (ord >> 11)
-        }
-        Value::Text(s) => {
-            let b = s.as_bytes();
-            let mut packed = 0u64;
-            let n = b.len().min(7);
-            for (k, &byte) in b[..n].iter().enumerate() {
-                packed |= u64::from(byte) << (48 - k * 8);
-            }
-            (2u64 << 56) | packed
-        }
-        Value::Blob(b) => {
-            let mut packed = 0u64;
-            let n = b.len().min(7);
-            for (k, &byte) in b[..n].iter().enumerate() {
-                packed |= u64::from(byte) << (48 - k * 8);
-            }
-            (3u64 << 56) | packed
-        }
+        Value::Null => (0, true),
+        Value::Integer(i) => sorter_digest_i64(*i),
+        Value::Real(r) => sorter_digest_f64(*r),
+        Value::Text(s) => sorter_digest_bytes(2, s.as_bytes()),
+        Value::Blob(b) => sorter_digest_bytes(3, b),
     }
 }
 
+/// `sqlite3RefillIndex` (`build.c`): the table scan that feeds the sorter
+/// (`sqlite3GenerateIndexKey` for every row the partial-index WHERE accepts), then
+/// [`refill_index_from_sorter`]. `clear_first`: the index exists (`REINDEX`, `memRootPage<0`)
+/// and is emptied with `OP_Clear` after the scan.
 fn populate_index_btree(
     ctx: &mut ExecContext<'_>,
     db_id: DatabaseId,
     tbl: &TableSchema,
     idx_schema: &IndexSchema,
+    clear_first: bool,
 ) -> Result<()> {
     let (enc, schema_name) = slot_encoding_and_name(ctx, db_id);
     let orders = idx_schema.key_sort_orders();
     let n_key = idx_schema.columns.len();
-    let use_prefix_key = enc == TextEncoding::Utf8
-        && !orders.is_empty()
-        && !orders[0].desc
-        && !orders[0].nulls_last
-        && orders[0].collation == Collation::Binary
-        && orders[0].custom_collation.is_none();
+    // Which of the first two key columns get a digest (`SorterKey`).
+    let digest_ok = |k: usize| {
+        enc == TextEncoding::Utf8
+            && k < n_key
+            && orders.get(k).is_some_and(|o| {
+                !o.desc
+                    && !o.nulls_last
+                    && o.collation == Collation::Binary
+                    && o.custom_collation.is_none()
+            })
+    };
+    let use_prefix = [digest_ok(0), digest_ok(0) && digest_ok(1)];
 
     let can_fast_scan = !tbl.without_rowid
         && tbl.root_pgno > 0
@@ -27839,7 +28463,7 @@ fn populate_index_btree(
         });
 
     let mut arena: Vec<u8> = Vec::with_capacity(64 * 1024);
-    let mut descriptors: Vec<(u64, usize, usize)> = Vec::with_capacity(1024);
+    let mut descriptors: Vec<SorterKey> = Vec::with_capacity(1024);
 
     if can_fast_scan
         && n_key <= 15
@@ -27915,18 +28539,6 @@ fn populate_index_btree(
             }
         }
 
-        #[inline(always)]
-        fn f64_prefix_u64(f: f64) -> u64 {
-            let norm = if f == 0.0 { 0.0 } else { f };
-            let bits = norm.to_bits();
-            let ord = if (bits >> 63) != 0 {
-                !bits
-            } else {
-                bits ^ (1u64 << 63)
-            };
-            (1u64 << 56) | (ord >> 11)
-        }
-
         let mut col_specs = [(0usize, false); 15];
         let mut max_needed_col: Option<usize> = None;
         for (k, ic) in idx_schema.columns.iter().enumerate() {
@@ -27976,12 +28588,13 @@ fn populate_index_btree(
                 let mut out_src = [IdxFieldSrc::Empty; 16];
                 let mut serial_bytes_len = 0usize;
                 let mut body_len = 0usize;
-                let mut col0_prefix: u64 = 0;
+                // Digests of the first two key columns (NULL: 0, exact).
+                let mut dig = [(0u64, true); 2];
 
                 for (k, &(ci, is_ipk)) in specs.iter().enumerate() {
                     let (st, src) = if is_ipk {
-                        if k == 0 && use_prefix_key {
-                            col0_prefix = f64_prefix_u64(rowid as f64);
+                        if k < 2 && use_prefix[k] {
+                            dig[k] = sorter_digest_i64(rowid);
                         }
                         encode_i64_inline(rowid)
                     } else if ci >= parsed_cols {
@@ -27998,8 +28611,8 @@ fn populate_index_btree(
                             if f.is_nan() {
                                 (0, IdxFieldSrc::Empty)
                             } else {
-                                if k == 0 && use_prefix_key {
-                                    col0_prefix = f64_prefix_u64(f);
+                                if k < 2 && use_prefix[k] {
+                                    dig[k] = sorter_digest_f64(f);
                                 }
                                 if f == 0.0 {
                                     (7, IdxFieldSrc::Inline8([0; 8], 8))
@@ -28009,21 +28622,16 @@ fn populate_index_btree(
                             }
                         } else if st_in < 12 {
                             let iv = decode_raw_int(st_in, b);
-                            if k == 0 && use_prefix_key {
-                                col0_prefix = f64_prefix_u64(iv as f64);
+                            if k < 2 && use_prefix[k] {
+                                dig[k] = sorter_digest_i64(iv);
                             }
                             // Stored form kept (see the `OP_RealAffinity` note below): an
                             // integer stored for a REAL column stays an integer in the index.
                             encode_i64_inline(iv)
                         } else {
-                            if k == 0 && use_prefix_key {
-                                let mut packed = 0u64;
-                                let n = b.len().min(7);
-                                for (bi, &byte) in b[..n].iter().enumerate() {
-                                    packed |= u64::from(byte) << (48 - bi * 8);
-                                }
-                                let tag = if (st_in & 1) != 0 { 2u64 } else { 3u64 };
-                                col0_prefix = (tag << 56) | packed;
+                            if k < 2 && use_prefix[k] {
+                                dig[k] =
+                                    sorter_digest_bytes(if (st_in & 1) != 0 { 2 } else { 3 }, b);
                             }
                             (st_in, IdxFieldSrc::Slice(b))
                         }
@@ -28071,7 +28679,13 @@ fn populate_index_btree(
                         }
                     }
                 }
-                descriptors.push((col0_prefix, start, rec_total));
+                descriptors.push(SorterKey {
+                    p0: dig[0].0,
+                    p1: dig[1].0,
+                    off: start,
+                    len: rec_total as u32,
+                    exact: u8::from(dig[0].1) | (u8::from(dig[1].1) << 1),
+                });
                 Ok(())
             })?;
         }
@@ -28097,16 +28711,16 @@ fn populate_index_btree(
                             key_vals.push(val);
                         }
                     }
-                    let prefix = if use_prefix_key {
-                        index_val_prefix_u64(&key_vals[0])
-                    } else {
-                        0
-                    };
+                    let sk = sorter_key_of_values(&key_vals, use_prefix);
                     key_vals.push(Value::Integer(rowid));
                     sqliters_types::encode_record_into(&key_vals, enc, &mut rec_buf);
                     let start = arena.len();
                     arena.extend_from_slice(&rec_buf);
-                    descriptors.push((prefix, start, rec_buf.len()));
+                    descriptors.push(SorterKey {
+                        off: start,
+                        len: rec_buf.len() as u32,
+                        ..sk
+                    });
                     has_row = bt.cursor_next(cid)?;
                 }
                 Ok(())
@@ -28116,6 +28730,7 @@ fn populate_index_btree(
         }
     } else {
         let existing_rows = scan_table_raw_entries(ctx, db_id, tbl)?;
+        let has_real_col = tbl.has_real_col();
         descriptors.reserve(existing_rows.len());
         let mut rec_buf: Vec<u8> = Vec::with_capacity(64);
         for (rkey, payload) in existing_rows {
@@ -28132,240 +28747,474 @@ fn populate_index_btree(
             )? {
                 continue;
             }
-            let keys =
+            let mut keys =
                 eval_index_key_values(ctx, &schema_name, tbl, idx_schema, &rkey, &vals, &[])?;
-            let prefix = if use_prefix_key && !keys.is_empty() {
-                index_val_prefix_u64(&keys[0])
-            } else {
-                0
-            };
+            if has_real_col {
+                index_keys_take_stored_form(tbl, idx_schema, &payload, enc, &mut keys)?;
+            }
+            let sk = sorter_key_of_values(&keys, use_prefix);
             sqliters_types::encode_record_into(&keys, enc, &mut rec_buf);
             let start = arena.len();
             arena.extend_from_slice(&rec_buf);
-            descriptors.push((prefix, start, rec_buf.len()));
+            descriptors.push(SorterKey {
+                off: start,
+                len: rec_buf.len() as u32,
+                ..sk
+            });
         }
     }
 
+    refill_index_from_sorter(
+        ctx,
+        db_id,
+        tbl,
+        idx_schema,
+        &arena,
+        &mut descriptors,
+        n_key,
+        use_prefix,
+        clear_first,
+    )
+}
+
+/// The digests of the first two values of an index key (`SorterKey` without its position).
+fn sorter_key_of_values(keys: &[Value], use_prefix: [bool; 2]) -> SorterKey {
+    let d0 = match keys.first() {
+        Some(v) if use_prefix[0] => sorter_digest_value(v),
+        _ => (0, false),
+    };
+    let d1 = match keys.get(1) {
+        Some(v) if use_prefix[1] => sorter_digest_value(v),
+        _ => (0, false),
+    };
+    SorterKey {
+        p0: d0.0,
+        p1: d1.0,
+        off: 0,
+        len: 0,
+        exact: u8::from(d0.1) | (u8::from(d1.1) << 1),
+    }
+}
+
+/// The second half of `sqlite3RefillIndex` (`build.c`): `OP_Clear` for a REINDEX, then the
+/// keys collected from the table scan leave the sorter and go into the index.
+///
+/// * The sorter compares the first `n_key` (`Index.nKeyCol`) fields only and is stable
+///   (`sqlite3VdbeSorterInit` with `nField`): keys that are equal there come out in the order
+///   the table scan delivered them. `descriptors` are `(prefix, arena offset, length)` in scan
+///   order, so the arena offset is the tie-break.
+/// * For a UNIQUE index `OP_SorterCompare` compares every key but the first with the key
+///   before it on those `n_key` fields — a key with a NULL among them never matches — and the
+///   statement aborts on the first match, with the keys before it already inserted.
+/// * Every key is appended behind the last entry of the index through a cursor opened with
+///   `OPFLAG_BULKCSR` (`OP_SeekEnd`, `OP_IdxInsert` with `OPFLAG_USESEEKRESULT`), unless the
+///   index has `bAscKeyBug` set: then the key is inserted by an ordinary seek (same cursor
+///   hint).
+#[allow(clippy::too_many_arguments)]
+fn refill_index_from_sorter(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    idx_schema: &IndexSchema,
+    arena: &[u8],
+    descriptors: &mut [SorterKey],
+    n_key: usize,
+    use_prefix: [bool; 2],
+    clear_first: bool,
+) -> Result<()> {
+    let (enc, _) = slot_encoding_and_name(ctx, db_id);
+    let orders = idx_schema.key_sort_orders();
+    let key_orders = &orders[..n_key.min(orders.len())];
+    if clear_first
+        && let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut())
+    {
+        bt.clear_tree(idx_schema.root_pgno)?;
+    }
+    let bulk_seek_end = !index_has_asc_key_bug(tbl, idx_schema);
+    let traced = ctx
+        .db_set
+        .slot(db_id)
+        .and_then(|s| s.btree.as_ref())
+        .is_some_and(Btree::dtrace_traced);
+    if traced {
+        // `OP_OpenWrite` with `OPFLAG_BULKCSR`.
+        sqliters_types::dtrace!("TR|xf|open|root={} bulk=1", idx_schema.root_pgno);
+    }
     if descriptors.is_empty() {
         return Ok(());
     }
 
     if descriptors.len() > 1 {
-        if orders.iter().all(|o| o.custom_collation.is_none()) {
-            let arena_ref = arena.as_slice();
-            descriptors.sort_unstable_by(|a, b| {
-                a.0.cmp(&b.0).then_with(|| {
-                    sqliters_types::compare_raw_records_with_encoding(
-                        &arena_ref[a.1..a.1 + a.2],
-                        &arena_ref[b.1..b.1 + b.2],
-                        None,
-                        &orders,
-                        enc,
-                    )
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                })
-            });
-        } else {
-            let arena_ref = arena.as_slice();
-            let mut sort_err: Option<SqliteError> = None;
-            descriptors.sort_by(|a, b| {
-                if sort_err.is_some() {
-                    return std::cmp::Ordering::Equal;
-                }
-                let p_ord = a.0.cmp(&b.0);
+        let mut sort_err: Option<SqliteError> = None;
+        descriptors.sort_unstable_by(|a, b| {
+            if use_prefix[0] {
+                let p_ord = a.p0.cmp(&b.p0);
                 if p_ord != std::cmp::Ordering::Equal {
                     return p_ord;
                 }
-                match sqliters_types::compare_raw_records_with_encoding(
-                    &arena_ref[a.1..a.1 + a.2],
-                    &arena_ref[b.1..b.1 + b.2],
-                    None,
-                    &orders,
-                    enc,
-                ) {
-                    Ok(ord) => ord,
-                    Err(e) => {
-                        sort_err = Some(e);
-                        std::cmp::Ordering::Equal
+                if a.exact & b.exact & 1 != 0 {
+                    // The first columns are equal.
+                    if n_key == 1 {
+                        return a.off.cmp(&b.off);
+                    }
+                    if use_prefix[1] {
+                        let p_ord = a.p1.cmp(&b.p1);
+                        if p_ord != std::cmp::Ordering::Equal {
+                            return p_ord;
+                        }
+                        if n_key == 2 && a.exact & b.exact & 2 != 0 {
+                            return a.off.cmp(&b.off);
+                        }
                     }
                 }
-            });
-            if let Some(e) = sort_err {
-                return Err(e);
             }
+            if sort_err.is_some() {
+                return a.off.cmp(&b.off);
+            }
+            match sqliters_types::compare_raw_records_with_encoding(
+                &arena[a.off..a.off + a.len as usize],
+                &arena[b.off..b.off + b.len as usize],
+                Some(n_key),
+                key_orders,
+                enc,
+            ) {
+                Ok(std::cmp::Ordering::Equal) => a.off.cmp(&b.off),
+                Ok(ord) => ord,
+                Err(e) => {
+                    sort_err = Some(e);
+                    a.off.cmp(&b.off)
+                }
+            }
+        });
+        if let Some(e) = sort_err {
+            return Err(e);
         }
     }
 
-    let sorted_slices: Vec<&[u8]> = descriptors
-        .iter()
-        .map(|&(_, off, len)| &arena[off..off + len])
-        .collect();
-
-    if idx_schema.unique {
-        let key_orders = &orders[..n_key];
-        for pair in sorted_slices.windows(2) {
-            if !sqliters_types::raw_record_prefix_has_null(pair[0], n_key)?
-                && !sqliters_types::raw_record_prefix_has_null(pair[1], n_key)?
-                && sqliters_types::compare_raw_records_with_encoding(
-                    pair[0],
-                    pair[1],
-                    Some(n_key),
-                    key_orders,
-                    enc,
-                )? == std::cmp::Ordering::Equal
-            {
-                let ext_code = if idx_schema.origin == "pk" {
-                    extended::SQLITE_CONSTRAINT_PRIMARYKEY
-                } else {
-                    extended::SQLITE_CONSTRAINT_UNIQUE
-                };
-                return Err(SqliteError::constraint(
-                    ext_code,
-                    format_unique_index_failure(tbl, idx_schema),
-                ));
+    let Some(bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) else {
+        return Ok(());
+    };
+    let mut ac = sqliters_btree::AppendCursor::new(idx_schema.root_pgno, true);
+    let mut prev: Option<&[u8]> = None;
+    let mut n_out = 0usize;
+    let sorted: &[SorterKey] = descriptors;
+    // The loop of `sqlite3RefillIndex`: `OP_SorterCompare` (UNIQUE), `OP_SorterData`, insert.
+    let mut next = || -> Result<Option<&[u8]>> {
+        let Some(sk) = sorted.get(n_out) else {
+            return Ok(None);
+        };
+        let rec = &arena[sk.off..sk.off + sk.len as usize];
+        if idx_schema.unique
+            && let Some(prev_rec) = prev
+            && !sqliters_types::raw_record_prefix_has_null(rec, n_key)?
+            && sqliters_types::compare_raw_records_with_encoding(
+                prev_rec,
+                rec,
+                Some(n_key),
+                key_orders,
+                enc,
+            )? == std::cmp::Ordering::Equal
+        {
+            if traced {
+                sqliters_types::dtrace!("TR|ridx|dup|n={}", n_out);
             }
+            let ext_code = if idx_schema.origin == "pk" {
+                extended::SQLITE_CONSTRAINT_PRIMARYKEY
+            } else {
+                extended::SQLITE_CONSTRAINT_UNIQUE
+            };
+            return Err(SqliteError::constraint(
+                ext_code,
+                format_unique_index_failure(tbl, idx_schema),
+            ));
+        }
+        prev = Some(rec);
+        n_out += 1;
+        Ok(Some(rec))
+    };
+    if bulk_seek_end {
+        bt.append_index_run(&mut ac, false, &mut next)?;
+    } else {
+        while let Some(rec) = next()? {
+            bt.insert_index_bulk(idx_schema.root_pgno, rec, &orders)?;
         }
     }
-
-    if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
-        bt.bulk_load_sorted_index(idx_schema.root_pgno, &sorted_slices)?;
+    #[allow(unexpected_cfgs)]
+    {
+        // Decision trace: the order in which the keys left the sorter, as one hash.
+        #[cfg(sqliters_dtrace)]
+        {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for sk in descriptors.iter() {
+                for &b in &arena[sk.off..sk.off + sk.len as usize] {
+                    h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                h = (h ^ 0xff).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            if traced {
+                sqliters_types::dtrace!(
+                    "TR|ridx|sorted|root={} n={} h={:016x}",
+                    idx_schema.root_pgno,
+                    descriptors.len(),
+                    h
+                );
+            }
+        }
     }
     Ok(())
 }
 
-fn exec_reindex(ctx: &mut ExecContext<'_>, target: Option<&QualifiedName>) -> Result<()> {
-    let mut primary_without_rowid_tables: Vec<(DatabaseId, TableSchema)> = Vec::new();
-    let mut targets: Vec<(DatabaseId, IndexSchema)> = Vec::new();
-
-    match target {
-        None => {
-            for db_id in ctx.db_set.unqualified_search_order() {
-                if let Some(slot) = ctx.db_set.slot(db_id)
-                    && slot.btree.is_some()
-                {
-                    for t in slot.schema.tables.iter().filter(|t| t.without_rowid) {
-                        primary_without_rowid_tables.push((db_id, t.clone()));
-                    }
-                    for idx in &slot.schema.indexes {
-                        targets.push((db_id, idx.clone()));
-                    }
-                }
-            }
-        }
-        Some(qn) => {
-            if let Some(ref s) = qn.schema {
-                let db_id = ctx.db_set.resolve_schema_or_err(Some(s))?;
-                let Some(slot) = ctx.db_set.slot(db_id) else {
-                    return Err(SqliteError::new(
-                        ErrorCode::Error,
-                        "unable to identify the object to be reindexed",
-                    ));
-                };
-                if slot.btree.is_none() {
-                    return Err(SqliteError::new(
-                        ErrorCode::Error,
-                        "unable to identify the object to be reindexed",
-                    ));
-                }
-                if let Some(tbl) = slot.schema.find_user_table(&qn.name).cloned() {
-                    if tbl.without_rowid {
-                        primary_without_rowid_tables.push((db_id, tbl));
-                    }
-                    for idx in slot.schema.indexes_for_table(&qn.name) {
-                        targets.push((db_id, idx));
-                    }
-                } else if slot.schema.find_view(&qn.name).is_some() {
-                    return Ok(());
-                } else if let Some(idx) = slot.schema.find_index(&qn.name).cloned() {
-                    targets.push((db_id, idx));
-                } else {
-                    return Err(SqliteError::new(
-                        ErrorCode::Error,
-                        "unable to identify the object to be reindexed",
-                    ));
-                }
-            } else if Collation::from_name(&qn.name).is_some()
-                || ctx.collations.has_collation(&qn.name)
-            {
-                for db_id in ctx.db_set.unqualified_search_order() {
-                    if let Some(slot) = ctx.db_set.slot(db_id)
-                        && slot.btree.is_some()
-                    {
-                        for t in slot.schema.tables.iter().filter(|t| {
-                            t.without_rowid
-                                && t.without_rowid_pk_cols.iter().any(|c| {
-                                    c.sort_order.collation_name().eq_ignore_ascii_case(&qn.name)
-                                })
-                        }) {
-                            primary_without_rowid_tables.push((db_id, t.clone()));
-                        }
-                        for idx in slot.schema.indexes.iter().filter(|idx| {
-                            idx.columns.iter().any(|c| {
-                                c.sort_order.collation_name().eq_ignore_ascii_case(&qn.name)
-                            })
-                        }) {
-                            targets.push((db_id, idx.clone()));
-                        }
-                    }
-                }
-            } else if let Some((db_id, tbl_ref)) = ctx.db_set.find_user_table_in_set(qn) {
-                let tbl = tbl_ref.clone();
-                let idxs = ctx
-                    .db_set
-                    .slot(db_id)
-                    .map(|s| s.schema.indexes_for_table(&tbl.name))
-                    .unwrap_or_default();
-                if tbl.without_rowid {
-                    primary_without_rowid_tables.push((db_id, tbl));
-                }
-                for idx in idxs {
-                    targets.push((db_id, idx));
-                }
-            } else if ctx.db_set.find_view_in_set(qn).is_some() {
-                return Ok(());
-            } else if let Some((db_id, idx_ref)) = ctx.db_set.find_index_in_set(qn) {
-                targets.push((db_id, idx_ref.clone()));
-            } else {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    "unable to identify the object to be reindexed",
-                ));
-            }
-        }
-    }
-
-    for (db_id, mut tbl) in primary_without_rowid_tables {
-        ctx.ensure_write_db(db_id, true)?;
-        crate::schema::rebind_table_collations(&mut tbl, ctx.collations);
-        let (slot_enc, _) = slot_encoding_and_name(ctx, db_id);
-        let pk_orders = tbl.without_rowid_pk_orders();
-        let mut entries = ctx.scan_index_in_db(db_id, tbl.root_pgno, pk_orders.clone())?;
-        sort_raw_index_records(&mut entries, &pk_orders, slot_enc)?;
-        if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
-            bt.clear_tree(tbl.root_pgno)?;
-            if !entries.is_empty() {
-                bt.bulk_load_sorted_index(tbl.root_pgno, &entries)?;
-            }
-        }
-    }
-
-    for (db_id, mut idx) in targets {
-        ctx.ensure_write_db(db_id, true)?;
-        crate::schema::rebind_index_collations(&mut idx, ctx.collations);
-        let Some(mut tbl) = ctx
-            .db_set
-            .slot(db_id)
-            .and_then(|s| s.schema.find_user_table(&idx.table_name).cloned())
-        else {
+/// `sqlite3GenerateIndexKey` reads a stored column with `OP_Column` and drops the
+/// `OP_RealAffinity` behind it: the key of a REAL column whose value the table holds as an
+/// integer is that integer. `keys` were computed from the logical row (where such a value is
+/// a real); this puts the stored form back for the plain (not VIRTUAL) columns of the key.
+fn index_keys_take_stored_form(
+    tbl: &TableSchema,
+    idx: &IndexSchema,
+    payload: &[u8],
+    enc: TextEncoding,
+    keys: &mut [Value],
+) -> Result<()> {
+    let mut phys: Option<Vec<Value>> = None;
+    let key_cols = idx
+        .columns
+        .iter()
+        .map(|ic| if ic.expr.is_none() { ic.col_idx } else { None })
+        .chain(idx.trailing_pk_cols.iter().map(|ic| ic.col_idx));
+    for (k, ci) in key_cols.enumerate() {
+        let Some(ci) = ci else {
             continue;
         };
-        crate::schema::rebind_table_collations(&mut tbl, ctx.collations);
-        if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
-            bt.clear_tree(idx.root_pgno)?;
+        let Some(col) = tbl.columns.get(ci) else {
+            continue;
+        };
+        if col.affinity != TypeAffinity::Real
+            || col.generated.as_ref().is_some_and(|(_, stored)| !*stored)
+            || tbl.rowid_alias_col == Some(ci)
+            || !matches!(keys.get(k), Some(Value::Real(_)))
+        {
+            continue;
         }
-        populate_index_btree(ctx, db_id, &tbl, &idx)?;
+        if phys.is_none() {
+            phys = Some(decode_record_with_encoding(payload, enc)?);
+        }
+        let slot = if tbl.without_rowid {
+            tbl.physical_record_slot(ci)
+        } else {
+            tbl.columns[..ci]
+                .iter()
+                .filter(|c| !c.generated.as_ref().is_some_and(|(_, stored)| !*stored))
+                .count()
+        };
+        if let Some(Value::Integer(iv)) = phys.as_ref().and_then(|p| p.get(slot)) {
+            keys[k] = Value::Integer(*iv);
+        }
     }
     Ok(())
+}
+
+/// `Index.bAscKeyBug` (`build.c` `convertToWithoutRowidTable`, ticket bba7b69f9849b5bf): a
+/// UNIQUE-constraint index of a WITHOUT ROWID table to which a DESC column of the PRIMARY KEY
+/// was appended (as an ascending column). Its keys do not leave the sorter in index order, so
+/// `sqlite3RefillIndex` does not use `OP_SeekEnd` for it.
+fn index_has_asc_key_bug(tbl: &TableSchema, idx: &IndexSchema) -> bool {
+    tbl.without_rowid
+        && idx.is_autoindex
+        && idx.root_pgno != tbl.root_pgno
+        && idx.trailing_pk_cols.iter().any(|t| {
+            tbl.without_rowid_pk_cols.iter().any(|pk| {
+                pk.col_idx == t.col_idx
+                    && pk
+                        .sort_order
+                        .collation_name()
+                        .eq_ignore_ascii_case(t.sort_order.collation_name())
+                    && pk.sort_order.desc
+            })
+        })
+}
+
+/// `sqlite3Reindex` (`build.c`, 3.54): one walk over the databases (`db->aDb[]` order, or the
+/// named one), the tables of each in the order of the schema's table hash, and the indexes of
+/// each table in `pTab->pIndex` order (newest first, the PRIMARY KEY of a WITHOUT ROWID table
+/// at its place in the list). An index is rebuilt (`sqlite3RefillIndex(pParse, pIdx, -1)`)
+/// when the statement has no argument, or the unqualified name is `expressions` and the index
+/// has an expression (or VIRTUAL) column, or the unqualified name is a collation that one of
+/// the index's columns — the appended rowid / PRIMARY KEY columns included — uses, or (when
+/// the name is not a collation) its table or the index itself has that name.
+fn exec_reindex(ctx: &mut ExecContext<'_>, target: Option<&QualifiedName>) -> Result<()> {
+    // (database, table, index); `None` is the PRIMARY KEY of a WITHOUT ROWID table.
+    let mut plan: Vec<(DatabaseId, TableSchema, Option<IndexSchema>)> = Vec::new();
+
+    let mut only_db: Option<DatabaseId> = None;
+    let mut is_expr_idx = false;
+    let mut coll: Option<&str> = None;
+    // (database, lower-case name) of the table / index the name resolves to.
+    let mut re_tab: Option<(DatabaseId, String)> = None;
+    let mut re_idx: Option<(DatabaseId, String)> = None;
+    let mut matched = target.is_none();
+    if let Some(qn) = target {
+        if let Some(ref s) = qn.schema {
+            only_db = Some(ctx.db_set.resolve_schema_or_err(Some(s))?);
+        } else {
+            if qn.name.eq_ignore_ascii_case("expressions") {
+                is_expr_idx = true;
+                matched = true;
+            }
+            if Collation::from_name(&qn.name).is_some() || ctx.collations.has_collation(&qn.name) {
+                coll = Some(qn.name.as_str());
+                matched = true;
+            }
+        }
+        if coll.is_none() {
+            // `sqlite3FindTable`: an ordinary table, a view or a virtual table.
+            if let Some((db_id, t)) = ctx.db_set.find_user_table_in_set(qn) {
+                re_tab = Some((db_id, t.name.to_ascii_lowercase()));
+                matched = true;
+            } else if ctx.db_set.find_view_in_set(qn).is_some()
+                || ctx.db_set.find_virtual_table_in_set(qn).is_some()
+            {
+                matched = true;
+            }
+            if let Some((db_id, i)) = ctx.db_set.find_index_in_set(qn) {
+                re_idx = Some((db_id, i.name.to_ascii_lowercase()));
+                matched = true;
+            }
+        }
+    }
+    if !matched {
+        return Err(SqliteError::new(
+            ErrorCode::Error,
+            "unable to identify the object to be reindexed",
+        ));
+    }
+
+    // `collationMatch`: any of the index's `nColumn` columns uses the collation; the rowid a
+    // rowid-table index ends with is a BINARY column.
+    let coll_match = |tbl: &TableSchema, idx: Option<&IndexSchema>, coll: &str| -> bool {
+        match idx {
+            Some(i) => {
+                i.columns
+                    .iter()
+                    .chain(i.trailing_pk_cols.iter())
+                    .any(|c| c.sort_order.collation_name().eq_ignore_ascii_case(coll))
+                    || (!tbl.without_rowid && coll.eq_ignore_ascii_case("BINARY"))
+            }
+            None => {
+                tbl.without_rowid_pk_cols
+                    .iter()
+                    .any(|c| c.sort_order.collation_name().eq_ignore_ascii_case(coll))
+                    || (!tbl.without_rowid_extra_cols.is_empty()
+                        && coll.eq_ignore_ascii_case("BINARY"))
+            }
+        }
+    };
+    // `Index.bHasExpr`: an expression column, or a VIRTUAL generated column.
+    let has_expr = |tbl: &TableSchema, idx: Option<&IndexSchema>| -> bool {
+        idx.is_some_and(|i| {
+            i.columns.iter().any(|c| {
+                c.expr.is_some()
+                    || c.col_idx
+                        .and_then(|ci| tbl.columns.get(ci))
+                        .is_some_and(|col| {
+                            col.generated.as_ref().is_some_and(|(_, stored)| !*stored)
+                        })
+            })
+        })
+    };
+    {
+        let db_set: &DatabaseSet = ctx.db_set;
+        let mut ids = vec![DatabaseId::MAIN, DatabaseId::TEMP];
+        ids.extend(
+            db_set
+                .unqualified_search_order()
+                .into_iter()
+                .filter(|id| *id != DatabaseId::MAIN && *id != DatabaseId::TEMP),
+        );
+        for db_id in ids {
+            if only_db.is_some_and(|d| d != db_id) {
+                continue;
+            }
+            let Some(slot) = db_set.slot(db_id) else {
+                continue;
+            };
+            if slot.btree.is_none() {
+                continue;
+            }
+            for tbl in
+                crate::schema::c_table_hash_order(&slot.schema, db_id == DatabaseId::TEMP, true)
+            {
+                let is_re_tab = re_tab
+                    .as_ref()
+                    .is_some_and(|(d, n)| *d == db_id && tbl.name.eq_ignore_ascii_case(n));
+                for idx in c_index_list_order(&slot.schema, &tbl) {
+                    let is_re_idx = re_idx.as_ref().is_some_and(|(d, n)| {
+                        *d == db_id && idx.is_some_and(|i| i.name.eq_ignore_ascii_case(n))
+                    });
+                    if target.is_none()
+                        || is_re_tab
+                        || is_re_idx
+                        || (is_expr_idx && has_expr(&tbl, idx))
+                        || coll.is_some_and(|c| coll_match(&tbl, idx, c))
+                    {
+                        plan.push((db_id, tbl.clone(), idx.cloned()));
+                    }
+                }
+            }
+        }
+    }
+
+    for (db_id, mut tbl, idx) in plan {
+        ctx.ensure_write_db(db_id, true)?;
+        crate::schema::rebind_table_collations(&mut tbl, ctx.collations);
+        match idx {
+            Some(mut idx) => {
+                crate::schema::rebind_index_collations(&mut idx, ctx.collations);
+                populate_index_btree(ctx, db_id, &tbl, &idx, true)?;
+            }
+            None => refill_without_rowid_primary_key(ctx, db_id, &tbl)?,
+        }
+    }
+    Ok(())
+}
+
+/// `sqlite3RefillIndex` for the PRIMARY KEY index of a WITHOUT ROWID table, which is the table
+/// itself: every row goes to the sorter as it is stored (the index key of the PRIMARY KEY is
+/// the whole row), the b-tree is cleared and the rows are put back in sorter order.
+fn refill_without_rowid_primary_key(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+) -> Result<()> {
+    let Some(pk_idx) = tbl.without_rowid_pk_as_index() else {
+        return Ok(());
+    };
+    let pk_orders = tbl.without_rowid_pk_orders();
+    let n_key = pk_orders.len();
+    let entries = ctx.scan_index_in_db(db_id, tbl.root_pgno, pk_orders)?;
+    let mut arena: Vec<u8> = Vec::with_capacity(entries.iter().map(Vec::len).sum());
+    let mut descriptors: Vec<SorterKey> = Vec::with_capacity(entries.len());
+    for rec in &entries {
+        descriptors.push(SorterKey {
+            p0: 0,
+            p1: 0,
+            off: arena.len(),
+            len: rec.len() as u32,
+            exact: 0,
+        });
+        arena.extend_from_slice(rec);
+    }
+    drop(entries);
+    refill_index_from_sorter(
+        ctx,
+        db_id,
+        tbl,
+        &pk_idx,
+        &arena,
+        &mut descriptors,
+        n_key,
+        [false, false],
+        true,
+    )
 }
 
 /// The checks C applies to the expressions of generated columns when a table is created or a
@@ -29174,26 +30023,16 @@ fn exec_drop_index(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
             format!("no such index: {}", name.display_name()),
         ));
     };
-    let mv = {
+    // `sqlite3DropIndex` (build.c): the catalogue row is deleted first, then the index's rows
+    // of the statistics tables (`sqlite3ClearStatTables`), and the b-tree is destroyed last
+    // (`destroyRootPage`, which in auto-vacuum mode may move another root into the hole).
+    {
         let bt = slot
             .btree
             .as_mut()
             .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-        let mv = bt.drop_tree_relocating(idx.root_pgno)?;
         delete_schema_entry(bt, idx.schema_rowid)?;
-        mv
-    };
-    slot.schema
-        .indexes
-        .retain(|i| !i.name.eq_ignore_ascii_case(&idx.name));
-    if let Some(mv) = mv {
-        let bt = slot
-            .btree
-            .as_mut()
-            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-        apply_root_page_move(bt, &mut slot.schema, mv)?;
     }
-    // Per `sqlite/src/build.c:4564-4568`: remove rows for `idx.name` from `sqlite_stat1` in `db_id`.
     if let Some(stat_tbl) = slot.schema.find_user_table("sqlite_stat1").cloned()
         && !stat_tbl.without_rowid
         && let Some(ref mut bt) = slot.btree
@@ -29206,6 +30045,23 @@ fn exec_drop_index(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
                 bt.delete_table(stat_tbl.root_pgno, rid)?;
             }
         }
+    }
+    let mv = {
+        let bt = slot
+            .btree
+            .as_mut()
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        bt.drop_tree_relocating(idx.root_pgno)?
+    };
+    slot.schema
+        .indexes
+        .retain(|i| !i.name.eq_ignore_ascii_case(&idx.name));
+    if let Some(mv) = mv {
+        let bt = slot
+            .btree
+            .as_mut()
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        apply_root_page_move(bt, &mut slot.schema, mv)?;
     }
     if db_id == DatabaseId::TEMP {
         ctx.db_set.reload_temp_schema_preserving_bindings()?;
@@ -30063,12 +30919,19 @@ fn validate_table_and_indexes_static_after_alter(
     Ok(new_tbl)
 }
 
+/// The last part of `sqlite3AlterDropColumn` (alter.c, "Edit rows of table on disk"): every
+/// row is read through a write cursor, rebuilt without the dropped column (`OP_MakeRecord`)
+/// and stored back at the cursor's position (`OP_Insert` / `OP_IdxInsert` with
+/// `OPFLAG_SAVEPOSITION`): a record of the same size is written over the old one, any other
+/// replaces the cell where it is. `legacy_ints`: see [`rename_column_writes_legacy_ints`] —
+/// the statement has already opened a write cursor on the temp schema.
 fn rewrite_physical_rows_for_drop_column(
     ctx: &mut ExecContext<'_>,
     db_id: DatabaseId,
     old_tbl: &TableSchema,
     new_tbl: &TableSchema,
     dropped_col_idx: usize,
+    legacy_ints: bool,
 ) -> Result<()> {
     let (enc, _) = slot_encoding_and_name(ctx, db_id);
     let existing_rows = scan_table_raw_entries(ctx, db_id, old_tbl)?;
@@ -30121,12 +30984,11 @@ fn rewrite_physical_rows_for_drop_column(
             }
             old_logical.remove(dropped_col_idx);
             // `sqlite3AlterDropColumn` copies every value in the form it is stored in.
-            new_records.push(encode_table_physical_record(
-                new_tbl,
-                &old_logical,
-                enc,
-                false,
-            ));
+            let mut rec = encode_table_physical_record(new_tbl, &old_logical, enc, false);
+            if legacy_ints {
+                rec = record_with_one_byte_small_ints(&rec)?;
+            }
+            new_records.push(rec);
         }
         let pk_orders = new_tbl.without_rowid_pk_orders();
         let bt = ctx
@@ -30134,7 +30996,7 @@ fn rewrite_physical_rows_for_drop_column(
             .slot_mut(db_id)
             .and_then(|s| s.btree.as_mut())
             .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-        bt.clear_tree(new_tbl.root_pgno)?;
+        // The PRIMARY KEY of the row does not change: each new record replaces its old cell.
         for rec in new_records {
             bt.insert_index(new_tbl.root_pgno, &rec, &pk_orders)?;
         }
@@ -30181,7 +31043,10 @@ fn rewrite_physical_rows_for_drop_column(
             }
         }
         old_logical.remove(dropped_col_idx);
-        let new_rec = encode_table_physical_record(new_tbl, &old_logical, enc, false);
+        let mut new_rec = encode_table_physical_record(new_tbl, &old_logical, enc, false);
+        if legacy_ints {
+            new_rec = record_with_one_byte_small_ints(&new_rec)?;
+        }
         rewritten.push((rid, new_rec));
     }
 
@@ -30212,6 +31077,111 @@ fn rewrite_virtual_table_name_in_sql(raw_sql: &str, new_name: &str) -> String {
         }
     }
     raw_sql.to_owned()
+}
+
+/// `name LIKE 'sqliteX_%' ESCAPE 'X'`: the name starts with `sqlite_` (LIKE folds ASCII case).
+fn name_like_sqlite_prefix(name: &str) -> bool {
+    name.len() >= 7 && name.is_char_boundary(7) && name[..7].eq_ignore_ascii_case("sqlite_")
+}
+
+/// One of the nested `UPDATE sqlite_schema SET ... WHERE ...` statements of ALTER TABLE
+/// (alter.c). Such an UPDATE runs in two passes — the rowids the WHERE accepts are collected
+/// first — and then rewrites every one of those rows in rowid order through a cursor that is on
+/// the row and has read it (`sqlite3BtreeInsert`: a record of the same size is written over the
+/// old one, any other replaces the cell), whether its content changes or not.
+///
+/// `set` gets the rowid and the five values of a row (type, name, tbl_name, rootpage, sql),
+/// answers the WHERE clause and applies the SET clause.
+///
+/// `legacy_ints`: the statement's program has by now opened a write cursor on a database
+/// whose file format is below 4 (`Vdbe.minWriteFileFormat`, see
+/// [`rename_column_writes_legacy_ints`]): `OP_MakeRecord` then stores the integers 0 and 1 as
+/// one-byte integers instead of the serial types 8 and 9.
+fn update_schema_rows(
+    bt: &mut Btree,
+    legacy_ints: bool,
+    mut set: impl FnMut(i64, &mut Vec<Value>) -> bool,
+) -> Result<()> {
+    let enc = bt.encoding();
+    let rows = scan_table_incremental(bt, 1)?;
+    for (rowid, payload) in rows {
+        let mut vals = decode_record_with_encoding(&payload, enc)?;
+        vals.resize(5, Value::Null);
+        if set(rowid, &mut vals) {
+            let mut rec = encode_record_with_encoding(&vals, enc);
+            if legacy_ints {
+                rec = record_with_one_byte_small_ints(&rec)?;
+            }
+            bt.insert_table(1, rowid, &rec)?;
+        }
+    }
+    Ok(())
+}
+
+/// `rec` with every serial type 8 / 9 (the constants 0 and 1 of file format 4) turned into a
+/// one-byte integer, as `OP_MakeRecord` writes a record when `Vdbe.minWriteFileFormat < 4`.
+fn record_with_one_byte_small_ints(rec: &[u8]) -> Result<Vec<u8>> {
+    let (hdr_len, mut pos) = sqliters_types::get_varint(rec)?;
+    let hdr_len = usize::try_from(hdr_len)
+        .ok()
+        .filter(|&h| h <= rec.len() && pos <= h)
+        .ok_or_else(|| SqliteError::corrupt("record header out of bounds"))?;
+    let mut serials: Vec<u64> = Vec::new();
+    let mut body: Vec<u8> = Vec::with_capacity(rec.len() - hdr_len + 8);
+    let mut body_pos = hdr_len;
+    while pos < hdr_len {
+        let (st, used) = sqliters_types::get_varint(&rec[pos..hdr_len])?;
+        pos += used;
+        match st {
+            8 | 9 => {
+                serials.push(1);
+                body.push((st - 8) as u8);
+            }
+            _ => {
+                let len = sqliters_types::serial_type_len(st)?;
+                let end = body_pos
+                    .checked_add(len)
+                    .filter(|&e| e <= rec.len())
+                    .ok_or_else(|| SqliteError::corrupt("record payload truncated"))?;
+                serials.push(st);
+                body.extend_from_slice(&rec[body_pos..end]);
+                body_pos = end;
+            }
+        }
+    }
+    let serial_bytes: usize = serials
+        .iter()
+        .map(|&st| sqliters_types::varint_len(st))
+        .sum();
+    let mut new_hdr = serial_bytes + sqliters_types::varint_len((serial_bytes + 1) as u64);
+    if sqliters_types::varint_len(new_hdr as u64) + serial_bytes != new_hdr {
+        new_hdr = serial_bytes + sqliters_types::varint_len((serial_bytes + 2) as u64);
+    }
+    let mut out = Vec::with_capacity(new_hdr + body.len());
+    sqliters_types::push_varint(&mut out, new_hdr as u64);
+    for st in serials {
+        sqliters_types::push_varint(&mut out, st);
+    }
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// `ALTER TABLE ... RENAME COLUMN` (and `DROP COLUMN`) on a database other than temp codes
+/// `UPDATE temp.sqlite_schema ...` (`renameFixQuotes`) before the statement that rewrites the
+/// catalogue of the altered database. That first UPDATE opens a write cursor on the temp
+/// schema, and `OP_OpenWrite` lowers `Vdbe.minWriteFileFormat` to the temp database's file
+/// format — 1 as long as no table was ever created in it. From then on the program writes
+/// integers 0 and 1 the legacy way.
+fn rename_column_writes_legacy_ints(ctx: &ExecContext<'_>, db_id: DatabaseId) -> bool {
+    if db_id == DatabaseId::TEMP {
+        return false;
+    }
+    let temp_format = ctx
+        .db_set
+        .slot(DatabaseId::TEMP)
+        .and_then(|s| s.btree.as_ref())
+        .map_or(0, |bt| bt.pager().header().schema_format);
+    temp_format < 4
 }
 
 fn exec_alter_table(
@@ -30594,67 +31564,27 @@ fn exec_alter_table(
                     .as_mut()
                     .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
 
-                update_schema_entry(
-                    bt,
-                    tbl.schema_rowid,
-                    "table",
-                    new_name,
-                    new_name,
-                    tbl.root_pgno,
-                    Some(&new_sql),
-                )?;
-                let mut auto_n = 0usize;
+                // The new `sql` text of every catalogue row that changes, by rowid.
+                let mut sql_edits: HashMap<i64, String> = HashMap::new();
+                sql_edits.insert(tbl.schema_rowid, new_sql.clone());
                 for idx in indexes {
                     if idx.is_autoindex {
-                        auto_n += 1;
-                        let suffix_num = idx
-                            .name
-                            .rsplit('_')
-                            .next()
-                            .and_then(|s| s.parse::<usize>().ok())
-                            .unwrap_or(auto_n);
-                        let new_auto = format!("sqlite_autoindex_{new_name}_{suffix_num}");
-                        update_schema_entry(
-                            bt,
-                            idx.schema_rowid,
-                            "index",
-                            &new_auto,
+                        continue;
+                    }
+                    let live_idx_sql = live_sql_map
+                        .get(&idx.schema_rowid)
+                        .and_then(|o| o.as_deref())
+                        .or(idx.raw_sql.as_deref());
+                    if let Some(s) = live_idx_sql {
+                        let u = rewrite_table_name_in_create_index_sql(
+                            s,
+                            &schema_name,
+                            &tbl.name,
                             new_name,
-                            idx.root_pgno,
-                            None,
+                            rewrite_self_exprs,
                         )?;
-                    } else {
-                        let live_idx_sql = live_sql_map
-                            .get(&idx.schema_rowid)
-                            .and_then(|o| o.as_deref())
-                            .or(idx.raw_sql.as_deref());
-                        let updated_idx_sql = match live_idx_sql {
-                            Some(s) => {
-                                let u = rewrite_table_name_in_create_index_sql(
-                                    s,
-                                    &schema_name,
-                                    &tbl.name,
-                                    new_name,
-                                    rewrite_self_exprs,
-                                )?;
-                                updated_explicit_indexes.push((
-                                    idx.name.clone(),
-                                    idx.root_pgno,
-                                    u.clone(),
-                                ));
-                                Some(u)
-                            }
-                            None => None,
-                        };
-                        update_schema_entry(
-                            bt,
-                            idx.schema_rowid,
-                            "index",
-                            &idx.name,
-                            new_name,
-                            idx.root_pgno,
-                            updated_idx_sql.as_deref(),
-                        )?;
+                        updated_explicit_indexes.push((idx.name.clone(), idx.root_pgno, u.clone()));
+                        sql_edits.insert(idx.schema_rowid, u);
                     }
                 }
                 if rewrite_fks {
@@ -30666,32 +31596,72 @@ fn exec_alter_table(
                         if let Some(updated_other_sql) =
                             rewrite_fk_ref_table_in_create_table_sql(otbl_sql, &tbl.name, new_name)?
                         {
-                            update_schema_entry(
-                                bt,
-                                otbl.schema_rowid,
-                                "table",
-                                &otbl.name,
-                                &otbl.name,
-                                otbl.root_pgno,
-                                Some(&updated_other_sql),
-                            )?;
+                            sql_edits.insert(otbl.schema_rowid, updated_other_sql);
                         }
                     }
                 }
-                for (v_rowid, v_name, v_sql) in &same_db_view_edits {
-                    update_schema_entry(bt, *v_rowid, "view", v_name, v_name, 0, Some(v_sql))?;
+                for (v_rowid, _, v_sql) in &same_db_view_edits {
+                    sql_edits.insert(*v_rowid, v_sql.clone());
                 }
-                for (tr_rowid, tr_name, tr_tbl, tr_sql) in &same_db_trigger_edits {
-                    update_schema_entry(
-                        bt,
-                        *tr_rowid,
-                        "trigger",
-                        tr_name,
-                        tr_tbl,
-                        0,
-                        Some(tr_sql),
-                    )?;
+                for (tr_rowid, _, _, tr_sql) in &same_db_trigger_edits {
+                    sql_edits.insert(*tr_rowid, tr_sql.clone());
                 }
+
+                // `sqlite3AlterRenameTable` (alter.c) runs two UPDATE statements on the
+                // catalogue, each rewriting its rows in rowid order:
+                // (1) "UPDATE sqlite_schema SET sql = sqlite_rename_table(...) WHERE
+                //      (type!='index' OR tbl_name=<old> COLLATE nocase) AND name NOT LIKE
+                //      'sqlite\_%'" — every such row is written, changed or not;
+                let old_name_lc = tbl.name.to_ascii_lowercase();
+                update_schema_rows(bt, false, |rowid, row| {
+                    let in_scope = match (&row[0], &row[1], &row[2]) {
+                        (Value::Text(ty), Value::Text(name), tbl_name) => {
+                            (ty.as_str() != "index"
+                                || tbl_name
+                                    .as_str()
+                                    .is_some_and(|t| t.eq_ignore_ascii_case(&old_name_lc)))
+                                && !name_like_sqlite_prefix(name)
+                        }
+                        _ => false,
+                    };
+                    if in_scope && let Some(new_text) = sql_edits.get(&rowid) {
+                        row[4] = Value::Text(new_text.clone());
+                    }
+                    in_scope
+                })?;
+                // (2) "UPDATE sqlite_schema SET tbl_name = <new>, name = CASE WHEN type='table'
+                //      THEN <new> WHEN name LIKE 'sqlite\_autoindex%' AND type='index' THEN
+                //      'sqlite_autoindex_' || <new> || substr(name, <len(old)>+18) ELSE name END
+                //      WHERE tbl_name=<old> COLLATE nocase AND type IN ('table','index','trigger')".
+                let n_old_chars = tbl.name.chars().count();
+                update_schema_rows(bt, false, |_, row| {
+                    let (Value::Text(ty), Value::Text(tbl_name)) = (&row[0], &row[2]) else {
+                        return false;
+                    };
+                    if !tbl_name.eq_ignore_ascii_case(&old_name_lc)
+                        || !matches!(ty.as_str(), "table" | "index" | "trigger")
+                    {
+                        return false;
+                    }
+                    let new_obj_name = match (&row[1], ty.as_str()) {
+                        (_, "table") => Some(new_name.clone()),
+                        (Value::Text(name), "index")
+                            if name.len() >= 16
+                                && name[..16].eq_ignore_ascii_case("sqlite_autoindex") =>
+                        {
+                            let tail: String = name.chars().skip(n_old_chars + 17).collect();
+                            Some(format!("sqlite_autoindex_{new_name}{tail}"))
+                        }
+                        _ => None,
+                    };
+                    if let Some(n) = new_obj_name {
+                        row[1] = Value::Text(n);
+                    }
+                    row[2] = Value::Text(new_name.clone());
+                    true
+                })?;
+                crate::schema::bump_schema_cookie(bt)?;
+                // (3) "UPDATE sqlite_sequence SET name = <new> WHERE name = <old>".
                 if let Some(seq_tbl) = seq_tbl_opt {
                     let enc = bt.encoding();
                     let rows = scan_table_incremental(bt, seq_tbl.root_pgno)?;
@@ -30703,34 +31673,6 @@ fn exec_alter_table(
                                 enc,
                             );
                             bt.insert_table(seq_tbl.root_pgno, rid, &rec)?;
-                        }
-                    }
-                }
-                if let Some(stat_tbl) = slot.schema.find_user_table("sqlite_stat1").cloned()
-                    && !stat_tbl.without_rowid
-                {
-                    let enc = bt.encoding();
-                    let rows = scan_table_incremental(bt, stat_tbl.root_pgno)?;
-                    let old_auto_prefix = format!("sqlite_autoindex_{}_", tbl.name);
-                    for (rid, payload) in rows {
-                        let mut cols = decode_record_with_encoding(&payload, enc)?;
-                        if cols.first().and_then(Value::as_str) == Some(tbl.name.as_str()) {
-                            cols[0] = Value::Text(new_name.clone());
-                            if let Some(idx_str) = cols.get(1).and_then(Value::as_str) {
-                                if idx_str == tbl.name.as_str() {
-                                    cols[1] = Value::Text(new_name.clone());
-                                } else if idx_str.len() > old_auto_prefix.len()
-                                    && idx_str[..old_auto_prefix.len()]
-                                        .eq_ignore_ascii_case(&old_auto_prefix)
-                                {
-                                    let suffix = &idx_str[old_auto_prefix.len()..];
-                                    cols[1] = Value::Text(format!(
-                                        "sqlite_autoindex_{new_name}_{suffix}"
-                                    ));
-                                }
-                            }
-                            let rec = encode_record_with_encoding(&cols, enc);
-                            bt.insert_table(stat_tbl.root_pgno, rid, &rec)?;
                         }
                     }
                 }
@@ -30805,12 +31747,12 @@ fn exec_alter_table(
             }
             check_alter_rowid_alias(&tbl, old_name, "rename from")?;
             check_alter_rowid_alias(&tbl, new_name, "rename to")?;
-            if !old_name.eq_ignore_ascii_case(new_name) && tbl.find_column(new_name).is_some() {
-                return Err(SqliteError::new(
-                    ErrorCode::Error,
-                    format!("duplicate column name: {new_name}"),
-                ));
-            }
+            // C does not look for a clash with another column up front: the catalogue is
+            // rewritten and `renameTestSchema` then fails on the new CREATE TABLE text
+            // ("error in table t after rename: duplicate column name: x"); the statement's
+            // changes are rolled back.
+            let duplicate_col =
+                !old_name.eq_ignore_ascii_case(new_name) && tbl.find_column(new_name).is_some();
 
             // Both `renameTestSchema` (`!legacy_mode`) and `renameFixQuotes` (`legacy_mode`) run before `RENAME COLUMN`.
             validate_views_before_alter(
@@ -30932,6 +31874,7 @@ fn exec_alter_table(
             };
 
             let mut updated_explicit_indexes: Vec<(String, Pgno, String)> = Vec::new();
+            let legacy_ints = rename_column_writes_legacy_ints(ctx, db_id);
             {
                 let slot = ctx
                     .db_set
@@ -30950,16 +31893,8 @@ fn exec_alter_table(
                     .as_mut()
                     .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
 
-                update_schema_entry(
-                    bt,
-                    tbl.schema_rowid,
-                    "table",
-                    &tbl.name,
-                    &tbl.name,
-                    tbl.root_pgno,
-                    Some(&new_sql),
-                )?;
-
+                let mut sql_edits: HashMap<i64, String> = HashMap::new();
+                sql_edits.insert(tbl.schema_rowid, new_sql.clone());
                 for idx in indexes {
                     if idx.is_autoindex {
                         continue;
@@ -30984,19 +31919,10 @@ fn exec_alter_table(
                                     format!("error in index {} after rename", idx.name),
                                 ));
                             };
-                            update_schema_entry(
-                                bt,
-                                idx.schema_rowid,
-                                "index",
-                                &idx.name,
-                                &tbl.name,
-                                idx.root_pgno,
-                                Some(&new_idx_sql),
-                            )?;
+                            sql_edits.insert(idx.schema_rowid, new_idx_sql);
                         }
                     }
                 }
-
                 for otbl in other_tables {
                     let otbl_sql = live_sql_map
                         .get(&otbl.schema_rowid)
@@ -31005,31 +31931,55 @@ fn exec_alter_table(
                     if let Some(updated_child_sql) = rewrite_fk_ref_column_in_create_table_sql(
                         otbl_sql, &tbl.name, old_name, new_name,
                     )? {
-                        update_schema_entry(
-                            bt,
-                            otbl.schema_rowid,
-                            "table",
-                            &otbl.name,
-                            &otbl.name,
-                            otbl.root_pgno,
-                            Some(&updated_child_sql),
-                        )?;
+                        sql_edits.insert(otbl.schema_rowid, updated_child_sql);
                     }
                 }
-
-                for (v_rowid, v_name, v_sql) in &same_db_view_edits {
-                    update_schema_entry(bt, *v_rowid, "view", v_name, v_name, 0, Some(v_sql))?;
+                for (v_rowid, _, v_sql) in &same_db_view_edits {
+                    sql_edits.insert(*v_rowid, v_sql.clone());
                 }
-                for (tr_rowid, tr_name, tr_tbl, tr_sql) in &same_db_trigger_edits {
-                    update_schema_entry(
-                        bt,
-                        *tr_rowid,
-                        "trigger",
-                        tr_name,
-                        tr_tbl,
-                        0,
-                        Some(tr_sql),
-                    )?;
+                for (tr_rowid, _, _, tr_sql) in &same_db_trigger_edits {
+                    sql_edits.insert(*tr_rowid, tr_sql.clone());
+                }
+
+                // `sqlite3AlterRenameColumn` (alter.c) runs two UPDATE statements on the
+                // catalogue, each rewriting its rows in rowid order:
+                // (1) `renameFixQuotes`: "UPDATE sqlite_schema SET sql =
+                //      sqlite_rename_quotefix(<db>, sql) WHERE name NOT LIKE 'sqlite\_%' AND sql
+                //      NOT LIKE 'create virtual%'" (the text stays as it is here);
+                update_schema_rows(bt, false, |_, row| match (&row[1], &row[4]) {
+                    (Value::Text(name), Value::Text(sql)) => {
+                        !name_like_sqlite_prefix(name)
+                            && !(sql.len() >= 14
+                                && sql.is_char_boundary(14)
+                                && sql[..14].eq_ignore_ascii_case("create virtual"))
+                    }
+                    _ => false,
+                })?;
+                // (2) "UPDATE sqlite_schema SET sql = sqlite_rename_column(...) WHERE name NOT
+                //      LIKE 'sqlite\_%' AND (type != 'index' OR tbl_name = <table>)".
+                update_schema_rows(bt, legacy_ints, |rowid, row| {
+                    let in_scope = match (&row[0], &row[1], &row[2]) {
+                        (Value::Text(ty), Value::Text(name), tbl_name) => {
+                            !name_like_sqlite_prefix(name)
+                                && (ty.as_str() != "index"
+                                    || tbl_name.as_str() == Some(tbl.name.as_str()))
+                        }
+                        _ => false,
+                    };
+                    if in_scope && let Some(new_text) = sql_edits.get(&rowid) {
+                        row[4] = Value::Text(new_text.clone());
+                    }
+                    in_scope
+                })?;
+                crate::schema::bump_schema_cookie(bt)?;
+                if duplicate_col {
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        format!(
+                            "error in table {} after rename: duplicate column name: {new_name}",
+                            tbl.name
+                        ),
+                    ));
                 }
                 slot.reload_schema()?;
             }
@@ -31177,6 +32127,7 @@ fn exec_alter_table(
                 )?;
             }
 
+            let legacy_ints = rename_column_writes_legacy_ints(ctx, db_id);
             {
                 let slot = ctx
                     .db_set
@@ -31187,15 +32138,31 @@ fn exec_alter_table(
                         .btree
                         .as_mut()
                         .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-                    update_schema_entry(
-                        bt,
-                        tbl.schema_rowid,
-                        "table",
-                        &tbl.name,
-                        &tbl.name,
-                        tbl.root_pgno,
-                        Some(&new_sql),
-                    )?;
+                    // `sqlite3AlterDropColumn` (alter.c): `renameFixQuotes` rewrites every
+                    // catalogue row (the text stays as it is here), then
+                    // "UPDATE sqlite_schema SET sql = sqlite_drop_column(...) WHERE
+                    //  (type=='table' AND tbl_name=<table> COLLATE nocase)".
+                    update_schema_rows(bt, false, |_, row| match (&row[1], &row[4]) {
+                        (Value::Text(name), Value::Text(sql)) => {
+                            !name_like_sqlite_prefix(name)
+                                && !(sql.len() >= 14
+                                    && sql.is_char_boundary(14)
+                                    && sql[..14].eq_ignore_ascii_case("create virtual"))
+                        }
+                        _ => false,
+                    })?;
+                    update_schema_rows(bt, legacy_ints, |_, row| {
+                        let in_scope = matches!(
+                            (&row[0], &row[2]),
+                            (Value::Text(ty), Value::Text(tn))
+                                if ty.as_str() == "table" && tn.eq_ignore_ascii_case(&tbl.name)
+                        );
+                        if in_scope {
+                            row[4] = Value::Text(new_sql.clone());
+                        }
+                        in_scope
+                    })?;
+                    crate::schema::bump_schema_cookie(bt)?;
                 }
                 slot.reload_schema()?;
             }
@@ -31217,7 +32184,14 @@ fn exec_alter_table(
                     .ok_or_else(|| {
                         SqliteError::misuse("reloaded table missing after drop column")
                     })?;
-                rewrite_physical_rows_for_drop_column(ctx, db_id, &tbl, &new_tbl, col_idx)?;
+                rewrite_physical_rows_for_drop_column(
+                    ctx,
+                    db_id,
+                    &tbl,
+                    &new_tbl,
+                    col_idx,
+                    legacy_ints,
+                )?;
             }
             if let Some(inst_id) = ctx.db_set.slot(db_id).map(|s| s.schema_instance_id) {
                 ctx.db_set.invalidate_blobs_for_table(inst_id, &tbl.name);
@@ -35652,7 +36626,14 @@ fn build_vacuum_image(
     src_db_id: DatabaseId,
     orig_hdr: &sqliters_pager::DatabaseHeader,
     target_btree: &mut Btree,
+    into: bool,
 ) -> Result<()> {
+    let (_, schema_name) = slot_encoding_and_name(ctx, src_db_id);
+    // The database VACUUM builds is ATTACHed (vacuum.c:226): it takes over the secure-delete
+    // setting of the main database (`attachFunc`: `sqlite3BtreeSecureDelete(pNew->pBt,
+    // sqlite3BtreeSecureDelete(db->aDb[0].pBt,-1))`).
+    let main_secure_delete = ctx.db_set.main_btree_mut().secure_delete(None);
+    target_btree.secure_delete(Some(main_secure_delete));
     target_btree.begin_write()?;
     {
         let fhdr = target_btree.pager_mut().header_mut()?;
@@ -35674,262 +36655,306 @@ fn build_vacuum_image(
     }
     target_btree.replace_cookie_stmt(sqliters_btree::CookieStmt::Base(orig_hdr.schema_cookie));
 
-    let (_, schema_name) = slot_encoding_and_name(ctx, src_db_id);
-    let (tables_snapshot, indexes_snapshot, views_snapshot, triggers_snapshot, vtabs_snapshot) = {
-        let slot = ctx
-            .db_set
-            .slot(src_db_id)
-            .ok_or_else(|| SqliteError::misuse("vacuum source slot closed"))?;
-        (
-            slot.schema.tables.clone(),
-            slot.schema.indexes.clone(),
-            slot.schema.views.clone(),
-            slot.schema.triggers.clone(),
-            slot.schema.virtual_tables.clone(),
-        )
+    // `sqlite3RunVacuum` (vacuum.c) drives the copy with SQL statements; this is their effect
+    // on the new file, statement by statement.
+    let src_enc = xfer_btree(ctx, src_db_id)?.encoding();
+    // The rows of the source's `sqlite_schema` in rowid order: (type, name, tbl_name,
+    // rootpage, sql).
+    let src_rows: Vec<Vec<Value>> = {
+        let src_bt = xfer_btree(ctx, src_db_id)?;
+        let mut out = Vec::new();
+        if src_bt.pager().page_count() > 0 {
+            for (_, payload) in scan_table_incremental(src_bt, 1)? {
+                let mut vals = decode_record_with_encoding(&payload, src_enc)?;
+                vals.resize(5, Value::Null);
+                out.push(vals);
+            }
+        }
+        out
     };
-    // Phase A (`vacuum.c`: "SELECT sql FROM sqlite_schema WHERE type='table' AND
-    // name<>'sqlite_sequence' AND coalesce(rootpage,1)>0", executed as CREATE TABLE statements in
-    // rowid order): each table gets its root and its catalogue row, immediately followed by the
-    // roots and rows of its automatic indexes (they are created while the CREATE TABLE is
-    // parsed), and `sqlite_sequence` is created by the first AUTOINCREMENT table
-    // (`sqlite3EndTable`), right after that table's rows.
-    let mut tables_in_rowid_order = tables_snapshot;
-    tables_in_rowid_order.sort_by_key(|t| t.schema_rowid);
-    let mut indexes_in_rowid_order = indexes_snapshot;
-    indexes_in_rowid_order.sort_by_key(|i| i.schema_rowid);
-    let seq_table = tables_in_rowid_order
-        .iter()
-        .find(|t| t.name.eq_ignore_ascii_case("sqlite_sequence"))
-        .cloned();
+    let has_storage = |v: &Value| match v {
+        // coalesce(rootpage,1)>0
+        Value::Null => true,
+        Value::Integer(i) => *i > 0,
+        Value::Real(r) => *r > 0.0,
+        Value::Text(_) | Value::Blob(_) => true,
+    };
+    let trace_stmt = |_kind: &str, _text: &str| {
+        #[allow(unexpected_cfgs)]
+        {
+            #[cfg(sqliters_dtrace)]
+            {
+                let shown: String = _text
+                    .bytes()
+                    .take(60)
+                    .map(|b| {
+                        if (0x20..0x7f).contains(&b) {
+                            b as char
+                        } else {
+                            '?'
+                        }
+                    })
+                    .collect();
+                sqliters_types::dtrace!("TR|vac|stmt|{} {}", _kind, shown);
+            }
+        }
+    };
+
+    // (1) "SELECT sql FROM sqlite_schema WHERE type='table' AND name<>'sqlite_sequence' AND
+    // coalesce(rootpage,1)>0": every CREATE TABLE statement runs on the new file as it would
+    // on any database (`sqlite3StartTable` .. `sqlite3EndTable`): root page, placeholder row,
+    // the roots and rows of the automatic indexes, the final row; `sqlite_sequence` after the
+    // first AUTOINCREMENT table.
+    // Tables of the new file in the order of its own `sqlite_schema`: (name, root).
+    let mut new_tables: Vec<(String, Pgno)> = Vec::new();
+    // Index name (lower case) -> root page in the new file.
+    let mut new_index_roots: Vec<(String, Pgno)> = Vec::new();
     let mut seq_created = false;
-    let mut mapped_tables: Vec<(TableSchema, Pgno)> =
-        Vec::with_capacity(tables_in_rowid_order.len());
-    let mut mapped_indexes: Vec<(IndexSchema, Pgno)> =
-        Vec::with_capacity(indexes_in_rowid_order.len());
-    for tbl in tables_in_rowid_order {
-        if tbl.name.eq_ignore_ascii_case("sqlite_sequence") {
+    for row in &src_rows {
+        let (Value::Text(ty), Value::Text(name)) = (&row[0], &row[1]) else {
+            continue;
+        };
+        if ty.as_str() != "table" || name.as_str() == "sqlite_sequence" || !has_storage(&row[3]) {
             continue;
         }
-        let new_tbl_root = if tbl.without_rowid {
+        let Value::Text(sql) = &row[4] else {
+            continue;
+        };
+        if !sql.starts_with("CRE") {
+            continue;
+        }
+        trace_stmt("CRE", sql);
+        let Some(Stmt::CreateTable(ct)) = sqliters_syntax::parse_one(sql)?.0 else {
+            continue;
+        };
+        let (tbl_preview, pending_autos) = build_table_schema_from_ast(&ct, 2)?;
+        let tbl_root = if tbl_preview.without_rowid {
             target_btree.create_index()?
         } else {
             target_btree.create_table()?
         };
-        insert_schema_entry(
-            target_btree,
-            "table",
-            &tbl.name,
-            &tbl.name,
-            new_tbl_root,
-            Some(&tbl.raw_sql),
-        )?;
-        for idx in indexes_in_rowid_order
-            .iter()
-            .filter(|i| i.raw_sql.is_none() && i.table_name.eq_ignore_ascii_case(&tbl.name))
-        {
-            let new_idx_root = target_btree.create_index()?;
+        let tbl_rowid = crate::schema::insert_schema_placeholder(target_btree)?;
+        for auto in pending_autos {
+            let idx_root = target_btree.create_index()?;
             insert_schema_entry(
                 target_btree,
                 "index",
-                &idx.name,
-                &idx.table_name,
-                new_idx_root,
+                &auto.name,
+                &ct.name.name,
+                idx_root,
                 None,
             )?;
-            mapped_indexes.push((idx.clone(), new_idx_root));
+            new_index_roots.push((auto.name.to_ascii_lowercase(), idx_root));
         }
-        let wants_sequence = tbl.autoincrement && !seq_created;
-        mapped_tables.push((tbl, new_tbl_root));
-        if wants_sequence && let Some(seq) = seq_table.clone() {
-            // An orphaned `sqlite_sequence` (no AUTOINCREMENT table left) is not recreated
-            // (`vacuum2-1.1, 3.1`).
+        update_schema_entry(
+            target_btree,
+            tbl_rowid,
+            "table",
+            &ct.name.name,
+            &ct.name.name,
+            tbl_root,
+            Some(&ct.catalog_sql),
+        )?;
+        new_tables.push((ct.name.name.clone(), tbl_root));
+        if tbl_preview.autoincrement && !seq_created {
             let seq_root = target_btree.create_table()?;
-            insert_schema_entry(
+            crate::schema::insert_schema_entry_over_placeholder(
                 target_btree,
                 "table",
-                &seq.name,
-                &seq.name,
+                "sqlite_sequence",
+                "sqlite_sequence",
                 seq_root,
-                Some(&seq.raw_sql),
+                Some("CREATE TABLE sqlite_sequence(name,seq)"),
             )?;
-            mapped_tables.push((seq, seq_root));
+            new_tables.push(("sqlite_sequence".to_owned(), seq_root));
             seq_created = true;
         }
     }
 
-    // Phase B (`vacuum.c`: "SELECT sql FROM sqlite_schema WHERE sql LIKE 'CREATE%INDEX%'"):
-    // explicit indexes in rowid order.
-    for idx in indexes_in_rowid_order {
-        if idx.raw_sql.is_none() {
+    // (2) "SELECT sql FROM sqlite_schema WHERE type='index'": every CREATE INDEX statement —
+    // root page, catalogue row, and `sqlite3RefillIndex` over the still empty table (which
+    // only opens the bulk cursor).
+    for row in &src_rows {
+        let Value::Text(ty) = &row[0] else {
+            continue;
+        };
+        if ty.as_str() != "index" {
             continue;
         }
-        let new_idx_root = target_btree.create_index()?;
+        let Value::Text(sql) = &row[4] else {
+            continue;
+        };
+        if !sql.starts_with("CRE") {
+            continue;
+        }
+        trace_stmt("CRE", sql);
+        let Some(Stmt::CreateIndex(ci)) = sqliters_syntax::parse_one(sql)?.0 else {
+            continue;
+        };
+        let idx_root = target_btree.create_index()?;
+        // The catalogue row names the table as the schema knows it.
+        let tbl_name = new_tables
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(&ci.table_name))
+            .map_or(ci.table_name.as_str(), |(n, _)| n.as_str());
         insert_schema_entry(
             target_btree,
             "index",
-            &idx.name,
-            &idx.table_name,
-            new_idx_root,
-            idx.raw_sql.as_deref(),
+            &ci.name.name,
+            tbl_name,
+            idx_root,
+            Some(&ci.catalog_sql),
         )?;
-        mapped_indexes.push((idx, new_idx_root));
-    }
-
-    // Phase B2: Preserve all permanent views, triggers, and virtual tables (`rootpage = 0`) in `schema_rowid` order (`vacuum.c:333-339`)!
-    let mut non_storage_entries: Vec<(i64, &'static str, String, String, String)> =
-        Vec::with_capacity(views_snapshot.len() + triggers_snapshot.len() + vtabs_snapshot.len());
-    for view in views_snapshot {
-        non_storage_entries.push((
-            view.schema_rowid,
-            "view",
-            view.name.clone(),
-            view.name,
-            view.raw_sql,
-        ));
-    }
-    for trig in triggers_snapshot {
-        non_storage_entries.push((
-            trig.schema_rowid,
-            "trigger",
-            trig.name,
-            trig.tbl_name,
-            trig.raw_sql,
-        ));
-    }
-    for vt in vtabs_snapshot {
-        non_storage_entries.push((vt.schema_rowid, "table", vt.name.clone(), vt.name, vt.sql));
-    }
-    non_storage_entries.sort_by_key(|e| e.0);
-    for (_, ty, obj_name, tbl_name, sql) in non_storage_entries {
-        insert_schema_entry(target_btree, ty, &obj_name, &tbl_name, 0, Some(&sql))?;
-    }
-
-    // Phase C: Copy table rows & populate indexes (`vacuum.c:317-323`)!
-    for (tbl, new_tbl_root) in &mapped_tables {
-        let tbl_indexes: Vec<(IndexSchema, Pgno)> = mapped_indexes
-            .iter()
-            .filter(|(idx, _)| idx.table_name.eq_ignore_ascii_case(&tbl.name))
-            .cloned()
-            .collect();
-
-        if tbl.name.eq_ignore_ascii_case("sqlite_sequence") {
-            let rows = {
-                let src_bt = ctx
-                    .db_set
-                    .slot_mut(src_db_id)
-                    .and_then(|s| s.btree.as_mut())
-                    .ok_or_else(|| SqliteError::misuse("vacuum source btree closed"))?;
-                scan_table_incremental(src_bt, tbl.root_pgno)?
-            };
-            let mut next_rid = 0i64;
-            for (_, payload) in rows {
-                next_rid += 1;
-                target_btree.insert_table(*new_tbl_root, next_rid, &payload)?;
-            }
-        } else if tbl.without_rowid {
-            let pk_orders = tbl.without_rowid_pk_orders();
-            let entries = {
-                let src_bt = ctx
-                    .db_set
-                    .slot_mut(src_db_id)
-                    .and_then(|s| s.btree.as_mut())
-                    .ok_or_else(|| SqliteError::misuse("vacuum source btree closed"))?;
-                scan_index_incremental(src_bt, tbl.root_pgno, pk_orders.clone())?
-            };
-            for rec in entries {
-                target_btree.insert_index(*new_tbl_root, &rec, &pk_orders)?;
-            }
-            for (idx, new_idx_root) in &tbl_indexes {
-                let orders = idx.key_sort_orders();
-                let idx_entries = {
-                    let src_bt = ctx
-                        .db_set
-                        .slot_mut(src_db_id)
-                        .and_then(|s| s.btree.as_mut())
-                        .ok_or_else(|| SqliteError::misuse("vacuum source btree closed"))?;
-                    scan_index_incremental(src_bt, idx.root_pgno, orders.clone())?
-                };
-                for rec in idx_entries {
-                    target_btree.insert_index(*new_idx_root, &rec, &orders)?;
-                }
-            }
-        } else if tbl.rowid_alias_col.is_some() {
-            // Explicit `INTEGER PRIMARY KEY`: preserve exact rowids!
-            let rows = {
-                let src_bt = ctx
-                    .db_set
-                    .slot_mut(src_db_id)
-                    .and_then(|s| s.btree.as_mut())
-                    .ok_or_else(|| SqliteError::misuse("vacuum source btree closed"))?;
-                scan_table_incremental(src_bt, tbl.root_pgno)?
-            };
-            for (rid, payload) in rows {
-                target_btree.insert_table(*new_tbl_root, rid, &payload)?;
-            }
-            for (idx, new_idx_root) in &tbl_indexes {
-                let orders = idx.key_sort_orders();
-                let idx_entries = {
-                    let src_bt = ctx
-                        .db_set
-                        .slot_mut(src_db_id)
-                        .and_then(|s| s.btree.as_mut())
-                        .ok_or_else(|| SqliteError::misuse("vacuum source btree closed"))?;
-                    scan_index_incremental(src_bt, idx.root_pgno, orders.clone())?
-                };
-                for rec in idx_entries {
-                    target_btree.insert_index(*new_idx_root, &rec, &orders)?;
-                }
-            }
-        } else {
-            // Implicit rowid table without `INTEGER PRIMARY KEY`: reassign sequential rowids `1..=N`
-            // and rebuild secondary/unique index entries against the compacted rowids!
-            let rows = {
-                let src_bt = ctx
-                    .db_set
-                    .slot_mut(src_db_id)
-                    .and_then(|s| s.btree.as_mut())
-                    .ok_or_else(|| SqliteError::misuse("vacuum source btree closed"))?;
-                scan_table_incremental(src_bt, tbl.root_pgno)?
-            };
-            let mut next_rid = 0i64;
-            for (_, payload) in rows {
-                next_rid += 1;
-                target_btree.insert_table(*new_tbl_root, next_rid, &payload)?;
-                if !tbl_indexes.is_empty() {
-                    let new_rkey = TableRowKey::Rowid(next_rid);
-                    let vals =
-                        decode_table_logical_row(ctx, src_db_id, tbl, &new_rkey, &payload, &[])?;
-                    for (idx_schema, new_idx_root) in &tbl_indexes {
-                        if !index_row_passes_partial_where(
-                            ctx,
-                            &schema_name,
-                            tbl,
-                            idx_schema,
-                            next_rid,
-                            &vals,
-                            &[],
-                        )? {
-                            continue;
-                        }
-                        let keys = eval_index_key_values(
-                            ctx,
-                            &schema_name,
-                            tbl,
-                            idx_schema,
-                            &new_rkey,
-                            &vals,
-                            &[],
-                        )?;
-                        let orders = idx_schema.key_sort_orders();
-                        let idx_rec = encode_record_with_encoding(&keys, target_btree.encoding());
-                        target_btree.insert_index(*new_idx_root, &idx_rec, &orders)?;
-                    }
-                }
-            }
+        if target_btree.dtrace_traced() {
+            sqliters_types::dtrace!("TR|xf|open|root={} bulk=1", idx_root);
         }
+        new_index_roots.push((ci.name.name.to_ascii_lowercase(), idx_root));
     }
 
+    // (3) "INSERT INTO vacuum_db.x SELECT * FROM main.x" for every table of the NEW file's
+    // catalogue, in its rowid order: the transfer optimisation under `DBFLAG_Vacuum`.
+    for (name, new_root) in &new_tables {
+        let quoted = format!("'{}'", name.replace('\'', "''"));
+        trace_stmt(
+            "INS",
+            &format!(".{quoted} SELECT*FROM\"{schema_name}\".{quoted}"),
+        );
+        let Some(src_tbl) = ctx
+            .db_set
+            .slot(src_db_id)
+            .and_then(|s| s.schema.find_user_table(name).cloned())
+        else {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("no such table: {schema_name}.{name}"),
+            ));
+        };
+        sqliters_types::dtrace!("TR|xfd|go|dest={} src={} empty=0", name, src_tbl.name);
+        let pairs = {
+            let Some(src_slot) = ctx.db_set.slot(src_db_id) else {
+                return Err(SqliteError::misuse("vacuum source slot closed"));
+            };
+            let src_pk = src_tbl.without_rowid_pk_as_index();
+            let src_list: Vec<&IndexSchema> = c_index_list_order(&src_slot.schema, &src_tbl)
+                .into_iter()
+                .filter_map(|i| i.or(src_pk.as_ref()))
+                .collect();
+            let mut pairs = Vec::with_capacity(src_list.len());
+            for d_idx in &src_list {
+                // The index of the new file that was created from `d_idx`'s definition.
+                let dest_root = if d_idx.root_pgno == src_tbl.root_pgno {
+                    Some(*new_root)
+                } else {
+                    new_index_roots
+                        .iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(&d_idx.name))
+                        .map(|(_, r)| *r)
+                };
+                let Some(dest_root) = dest_root else {
+                    continue;
+                };
+                // `xferCompatibleIndex`: the first index of the source's list that fits.
+                let s_idx = src_list
+                    .iter()
+                    .find(|m| xfer_compatible_index(d_idx, m))
+                    .unwrap_or(d_idx);
+                pairs.push(XferIndexPair {
+                    dest_root,
+                    src_root: s_idx.root_pgno,
+                    orders: d_idx.key_sort_orders(),
+                    all_binary: s_idx
+                        .columns
+                        .iter()
+                        .chain(s_idx.trailing_pk_cols.iter())
+                        .all(|c| c.sort_order.collation_name().eq_ignore_ascii_case("BINARY")),
+                    is_table: d_idx.root_pgno == src_tbl.root_pgno,
+                });
+            }
+            pairs
+        };
+        let mut unused_changes = 0u64;
+        let mut dest = XferDest::External(target_btree);
+        xfer_copy(
+            ctx,
+            src_db_id,
+            &src_tbl,
+            &mut dest,
+            &src_tbl,
+            *new_root,
+            &pairs,
+            XferMode::Vacuum { into },
+            &mut unused_changes,
+        )?;
+    }
+
+    // (4) "INSERT INTO vacuum_db.sqlite_schema SELECT * FROM main.sqlite_schema WHERE type IN
+    // ('view','trigger') OR (type='table' AND rootpage=0)": an ordinary insert of the rows as
+    // they are, with new rowids; no CREATE statement runs, so nothing else changes.
+    // (this statement has a WHERE clause: `xferOptimization` gives up at its 5th test)
+    sqliters_types::dtrace!("TR|xfd|no|why=5");
+    for row in &src_rows {
+        let Value::Text(ty) = &row[0] else {
+            continue;
+        };
+        let keep = match ty.as_str() {
+            "view" | "trigger" => true,
+            "table" => {
+                matches!(row[3], Value::Integer(0)) || matches!(row[3], Value::Real(r) if r == 0.0)
+            }
+            _ => false,
+        };
+        if !keep {
+            continue;
+        }
+        if target_btree.pager().page_count() == 0 {
+            let _ = target_btree.create_table()?;
+        }
+        let rowid = target_btree.next_rowid(1)?;
+        let mut rec = encode_record_with_encoding(&row[..5], target_btree.encoding());
+        if target_btree.pager().header().schema_format < 4 {
+            // No CREATE TABLE has run on the new file: its schema still has file format 1
+            // (`Vdbe.minWriteFileFormat`), and the integers 0 and 1 are stored the legacy way.
+            rec = record_with_one_byte_small_ints(&rec)?;
+        }
+        target_btree.insert_table(1, rowid, &rec)?;
+    }
+
+    // (5) The meta values of `aCopy[]`, written last.
+    {
+        let fhdr = target_btree.pager_mut().header_mut()?;
+        fhdr.schema_cookie = orig_hdr.schema_cookie.wrapping_add(1);
+        fhdr.default_cache_size = orig_hdr.default_cache_size;
+        fhdr.text_encoding = orig_hdr.text_encoding;
+        fhdr.text_encoding_unset = orig_hdr.text_encoding_unset;
+        fhdr.user_version = orig_hdr.user_version;
+        fhdr.application_id = orig_hdr.application_id;
+    }
+    sqliters_types::dtrace!(
+        "TR|vac|meta|idx=1 val={}",
+        orig_hdr.schema_cookie.wrapping_add(1)
+    );
+    sqliters_types::dtrace!("TR|vac|meta|idx=3 val={}", orig_hdr.default_cache_size);
+    sqliters_types::dtrace!(
+        "TR|vac|meta|idx=5 val={}",
+        if orig_hdr.text_encoding_unset {
+            0
+        } else {
+            orig_hdr.text_encoding
+        }
+    );
+    sqliters_types::dtrace!("TR|vac|meta|idx=6 val={}", orig_hdr.user_version);
+    sqliters_types::dtrace!("TR|vac|meta|idx=8 val={}", orig_hdr.application_id);
+    sqliters_types::dtrace!(
+        "TR|vac|copy|into={} pages={} pgsz={} av={}",
+        u8::from(into),
+        target_btree.pager().page_count(),
+        target_btree.pager().page_size(),
+        match target_btree.auto_vacuum_mode() {
+            AutoVacuumMode::None => 0,
+            AutoVacuumMode::Full => 1,
+            AutoVacuumMode::Incremental => 2,
+        }
+    );
     sqliters_types::dtrace!("TR|cookie|vacuum-end|");
     Ok(())
 }
@@ -36091,7 +37116,7 @@ pub(crate) fn exec_vacuum_checked(
                 target_bt.pager_mut().set_reserved_bytes(target_reserve)?;
                 target_bt.pager_mut().set_encoding(orig_hdr.encoding())?;
                 let _ = target_bt.set_configured_auto_vacuum(target_autovac);
-                build_vacuum_image(ctx, db_id, &orig_hdr, &mut target_bt)?;
+                build_vacuum_image(ctx, db_id, &orig_hdr, &mut target_bt, true)?;
                 target_bt.commit_retaining_read(false)?;
                 return Ok(());
             }
@@ -36169,7 +37194,7 @@ pub(crate) fn exec_vacuum_checked(
                 target_bt.pager_mut().set_encoding(orig_hdr.encoding())?;
                 target_bt.pager_mut().set_synchronous(src_sync);
                 let _ = target_bt.set_configured_auto_vacuum(target_autovac);
-                build_vacuum_image(ctx, db_id, &orig_hdr, &mut target_bt)?;
+                build_vacuum_image(ctx, db_id, &orig_hdr, &mut target_bt, true)?;
                 target_bt.commit_retaining_read(false)?;
                 Ok(())
             })();
@@ -36280,7 +37305,7 @@ pub(crate) fn exec_vacuum_checked(
         fresh.pager_mut().set_encoding(orig_hdr.encoding())?;
         let _ = fresh.set_configured_auto_vacuum(target_autovac);
 
-        build_vacuum_image(ctx, db_id, &orig_hdr, &mut fresh)?;
+        build_vacuum_image(ctx, db_id, &orig_hdr, &mut fresh, false)?;
         fresh.commit_retaining_read(true)?;
         let vac_schema_name = ctx
             .db_set
@@ -39732,6 +40757,7 @@ pub(crate) fn validate_and_infer_columns(
                         sl.btree.is_some()
                             && (sl.schema.find_user_table(&qn.name).is_some()
                                 || sl.schema.find_view(&qn.name).is_some()
+                                || sl.schema.find_virtual_table(&qn.name).is_some()
                                 || sl.schema.find_index(&qn.name).is_some())
                     });
                     if !ok {
@@ -39741,10 +40767,13 @@ pub(crate) fn validate_and_infer_columns(
                         ));
                     }
                 } else {
-                    let ok = Collation::from_name(&qn.name).is_some()
+                    // (`sqlite3Reindex`: "expressions" always matches, like a collation name)
+                    let ok = qn.name.eq_ignore_ascii_case("expressions")
+                        || Collation::from_name(&qn.name).is_some()
                         || collations.has_collation(&qn.name)
                         || db_set.find_user_table_in_set(qn).is_some()
                         || db_set.find_view_in_set(qn).is_some()
+                        || db_set.find_virtual_table_in_set(qn).is_some()
                         || db_set.find_index_in_set(qn).is_some();
                     if !ok {
                         return Err(SqliteError::new(
@@ -40592,14 +41621,8 @@ pub(crate) fn validate_and_infer_columns(
                     }
                     check_alter_rowid_alias(&tbl, old_name, "rename from")?;
                     check_alter_rowid_alias(&tbl, new_name, "rename to")?;
-                    if !old_name.eq_ignore_ascii_case(new_name)
-                        && tbl.find_column(new_name).is_some()
-                    {
-                        return Err(SqliteError::new(
-                            ErrorCode::Error,
-                            format!("duplicate column name: {new_name}"),
-                        ));
-                    }
+                    // (a name that is already taken is found when the statement runs:
+                    // `renameTestSchema` after the catalogue was rewritten)
                 }
                 AlterTableAction::DropColumn(col_name) => {
                     let Some((_, col)) = tbl.find_column(col_name) else {
@@ -41764,16 +42787,22 @@ fn validate_insert_static_inner(
                         && ins.columns.is_none()
                         && tbl.columns.iter().any(|c| c.generated.is_some())
                         && sel_cols.len() == tbl.columns.len()
-                        && check_insert_xfer_eligible(
-                            ins,
-                            db_id,
-                            &tbl,
-                            is_catalog,
-                            db_set,
-                            false,
-                            count_changes,
-                        )
-                        .is_some();
+                        // Only a transfer that is not guarded by the empty-destination test
+                        // ends the compilation (`xferOptimization` returns 1); otherwise the
+                        // ordinary insert is coded too and counts the columns.
+                        && matches!(
+                            xfer_optimization(
+                                ins,
+                                db_id,
+                                &tbl,
+                                is_catalog,
+                                db_set,
+                                false,
+                                count_changes,
+                                None,
+                            ),
+                            Some(Ok(ref plan)) if !plan.needs_empty_dest
+                        );
                     if sel_cols.len() != expected_width && !xfer_gen_match {
                         if ins.columns.is_some() {
                             return Err(SqliteError::new(

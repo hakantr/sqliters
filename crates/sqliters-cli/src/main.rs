@@ -1223,7 +1223,8 @@ pub fn shell_exec(p: &mut ShellState, z_sql: &str) -> Result<(), ShellSqlError> 
         && A_MODE_INFO[usize::from(p.mode.e_mode)].e_style != qrf::QRF_STYLE_COUNT;
     // Statements that produce no rows and take no parameters go through the engine's batch
     // executor: the observable behaviour is the same, error classification included.
-    if plain && util::is_pure_non_returning_batch_sql(z_sql) {
+    // (with `PRAGMA count_changes` on, INSERT / UPDATE / DELETE return a row: not a batch)
+    if plain && util::is_pure_non_returning_batch_sql(z_sql) && !p.db().count_changes() {
         let db = p.db();
         return match db.execute_batch(z_sql) {
             Ok(()) => Ok(()),
