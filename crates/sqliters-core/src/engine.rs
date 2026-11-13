@@ -137,6 +137,20 @@ pub struct StmtTxTracker {
     /// Set while a one-pass DELETE removes a row: root of the index the scan runs on
     /// (`iIdxNoSeek` of `sqlite3GenerateRowDelete`), whose entry is deleted after the table row.
     pub delete_idx_no_seek: Option<Pgno>,
+    /// Set when REPLACE resolved a rowid conflict by keeping the table row (only its index
+    /// entries are deleted, `insert.c` `case OE_Replace`) on a table without any index:
+    /// `(table root, rowid)`. C's data cursor was then only positioned by `OP_NotExists` and
+    /// never parsed the old cell (`BtCursor.info.nSize==0`), so `sqlite3BtreeInsert` does not
+    /// use `btreeOverwriteCell` for a record of the same size — it builds the new cell and
+    /// clears the old one. (With an index, `sqlite3GenerateRowIndexDelete` reads the old row
+    /// through the data cursor, which parses the cell.)
+    pub replace_unparsed_row: Option<(Pgno, i64)>,
+    /// `(table root, sub-program depth)` of a running two-pass UPDATE whose second pass reads
+    /// no column of the old row before `OP_Insert`: every column is assigned from expressions
+    /// without column references, no index is rewritten, no trigger or foreign key needs the
+    /// old row. C's data cursor is then only positioned by `OP_NotExists` (cell not parsed),
+    /// so a record of the same size is not written over the old one (`btreeOverwriteCell`).
+    pub update_unparsed_cursor: Option<(Pgno, usize)>,
     /// `OP_Once`: scalar sub-selects of the running UPDATE's SET expressions that do not refer
     /// to the row being updated (address of the `SelectStmt`, cached value once computed). C
     /// codes such a sub-select so that it runs once, the first time a row needs it; the rows
@@ -16876,6 +16890,25 @@ fn replace_conflict_delete_row(
             None,
         );
 
+    // insert.c, `sqlite3GenerateConstraintChecks`: "Collision detection may be omitted if all
+    // of the following are true: (1) the conflict resolution algorithm is REPLACE, (2) the
+    // table is a WITHOUT ROWID table, (3) there are no secondary indexes on the table, (4) no
+    // delete triggers need to be fired if there is a conflict, (5) no FK constraint counters
+    // need to be updated if a conflict occurs." The row is then not deleted: the
+    // `OP_IdxInsert` of the new record finds the equal key and replaces the entry.
+    if tbl.without_rowid
+        && indexes.is_empty()
+        && !run_del_triggers
+        && !(*ctx.foreign_keys
+            && (!tbl.foreign_keys.is_empty()
+                || ctx
+                    .db_set
+                    .slot(db_id)
+                    .is_some_and(|s| !find_referencing_fks(&s.schema, &tbl.name).is_empty())))
+    {
+        return Ok(());
+    }
+
     let pinned_entry = if pin_data_cursor
         && run_del_triggers
         && let Some(slot) = ctx.db_set.slot(db_id)
@@ -16942,6 +16975,12 @@ fn replace_conflict_delete_row(
         // insert.c: `sqlite3GenerateRowDelete(.., iThisCur)` — the entry of the index the
         // conflict was found in (`iIdxNoSeek`) is deleted last, after the table row.
         ctx.stmt_tx.delete_idx_no_seek = conflict_index_root;
+        if keep_table_row
+            && indexes.is_empty()
+            && let TableRowKey::Rowid(rid) = ckey
+        {
+            ctx.stmt_tx.replace_unparsed_row = Some((tbl.root_pgno, *rid));
+        }
         let del_res = delete_row_via_pipeline_opt(
             ctx,
             db_id,
@@ -17376,9 +17415,13 @@ fn validate_and_write_row(
         // update.c: only the entries of the indexes the statement rewrites are deleted; the
         // table row itself is deleted only when its rowid changes (otherwise the new record
         // overwrites it in place).
-        update_in_place = !tbl.without_rowid
-            && old_key.rowid_or_zero() == rowid
-            && ctx
+        // (WITHOUT ROWID: `sqlite3GenerateRowIndexDelete` skips the PRIMARY KEY index; its
+        // entry is replaced by the `OP_IdxInsert` of the new record, which finds the equal key.)
+        update_in_place = (if tbl.without_rowid {
+            table_keys_equal(tbl, &final_key, old_key, enc)
+        } else {
+            old_key.rowid_or_zero() == rowid
+        }) && ctx
                 .stmt_tx
                 .update_index_rewrite
                 .as_ref()
@@ -17529,6 +17572,12 @@ fn validate_and_write_row(
                 let pk_orders = tbl.without_rowid_pk_orders();
                 bt.insert_index(tbl.root_pgno, &phys_rec, &pk_orders)?;
             }
+        } else if ctx.stmt_tx.replace_unparsed_row.take() == Some((tbl.root_pgno, rowid))
+            || (update_in_place
+                && ctx.stmt_tx.update_unparsed_cursor
+                    == Some((tbl.root_pgno, ctx.stmt_tx.subprogram_stack.len())))
+        {
+            bt.insert_table_replace_unparsed(tbl.root_pgno, rowid, &phys_rec)?;
         } else {
             bt.insert_table(tbl.root_pgno, rowid, &phys_rec)?;
         }
@@ -18104,8 +18153,14 @@ fn enter_update_row_storage_rules(
         modified_col_mask,
         rowid_changes,
     ) > 1;
+    // `chngPk` (update.c): a PRIMARY KEY column of a WITHOUT ROWID table is assigned.
+    let pk_changes = tbl.without_rowid
+        && tbl.without_rowid_pk_cols.iter().any(|ic| {
+            ic.col_idx
+                .is_some_and(|c| modified_col_mask.get(c).copied().unwrap_or(false))
+        });
     // (Also for a table without indexes: the row is then simply overwritten in place.)
-    if !tbl.without_rowid && !rowid_changes && !fk_forces {
+    if !rowid_changes && !pk_changes && !fk_forces {
         ctx.stmt_tx.update_index_rewrite = Some((
             tbl.root_pgno,
             indexes
@@ -22920,6 +22975,8 @@ fn execute_upsert_table_insert_row(
                 let pk_orders = p.tbl.without_rowid_pk_orders();
                 bt.insert_index(p.tbl.root_pgno, &phys_rec, &pk_orders)?;
             }
+        } else if ctx.stmt_tx.replace_unparsed_row.take() == Some((p.tbl.root_pgno, rowid)) {
+            bt.insert_table_replace_unparsed(p.tbl.root_pgno, rowid, &phys_rec)?;
         } else {
             bt.insert_table(p.tbl.root_pgno, rowid, &phys_rec)?;
         }
@@ -24353,7 +24410,29 @@ fn prepare_update_exec<'a>(
                         .iter()
                         .any(|idx| idx.root_pgno == root && rewrites(idx))
                 });
-                crate::dml_c::update_one_pass(scan, multirow_ok, scan_index_rewritten)
+                let one_pass =
+                    crate::dml_c::update_one_pass(scan, multirow_ok, scan_index_rewritten);
+                ctx.stmt_tx.update_unparsed_cursor = None;
+                if matches!(one_pass, crate::dml_c::OnePass::Off)
+                    && !tbl.without_rowid
+                    && !has_trigger
+                    && has_fk == 0
+                    && !chng_rowid
+                    && !tbl.columns.iter().any(|c| c.generated.is_some())
+                    && tbl
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .all(|(ci, _)| modified_col_mask[ci] || tbl.rowid_alias_col == Some(ci))
+                    && !indexes.iter().any(|idx| rewrites(idx))
+                    && !resolved_assigns.iter().any(|(_, _, e)| {
+                        crate::dml_c::expr_has_subquery(e) || expr_mentions_column(e, &|_| true)
+                    })
+                {
+                    ctx.stmt_tx.update_unparsed_cursor =
+                        Some((tbl.root_pgno, ctx.stmt_tx.subprogram_stack.len()));
+                }
+                one_pass
             };
             if ctx.stmt_tx.subprogram_stack.is_empty() {
                 sqliters_types::dtrace!(

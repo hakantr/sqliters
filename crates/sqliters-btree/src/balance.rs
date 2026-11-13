@@ -41,33 +41,33 @@ fn corrupt(msg: &'static str) -> SqliteError {
 }
 
 #[inline(always)]
-fn at(d: &[u8], i: usize) -> u8 {
+pub(crate) fn at(d: &[u8], i: usize) -> u8 {
     d.get(i).copied().unwrap_or(0)
 }
 
 #[inline(always)]
-fn get2(d: &[u8], i: usize) -> usize {
+pub(crate) fn get2(d: &[u8], i: usize) -> usize {
     (usize::from(at(d, i)) << 8) | usize::from(at(d, i + 1))
 }
 
 #[inline(always)]
-fn put2(d: &mut [u8], i: usize, v: usize) {
+pub(crate) fn put2(d: &mut [u8], i: usize, v: usize) {
     d[i] = (v >> 8) as u8;
     d[i + 1] = v as u8;
 }
 
 #[inline(always)]
-fn get4(d: &[u8], i: usize) -> u32 {
+pub(crate) fn get4(d: &[u8], i: usize) -> u32 {
     u32::from_be_bytes([at(d, i), at(d, i + 1), at(d, i + 2), at(d, i + 3)])
 }
 
 #[inline(always)]
-fn put4(d: &mut [u8], i: usize, v: u32) {
+pub(crate) fn put4(d: &mut [u8], i: usize, v: u32) {
     d[i..i + 4].copy_from_slice(&v.to_be_bytes());
 }
 
 #[inline(always)]
-const fn hdr_of(pgno: Pgno) -> usize {
+pub(crate) const fn hdr_of(pgno: Pgno) -> usize {
     if pgno == 1 { DB_HEADER_SIZE } else { 0 }
 }
 
@@ -181,6 +181,8 @@ pub(crate) struct CellInfo {
     pub n_payload: u32,
     pub n_local: u32,
     pub n_size: usize,
+    /// Offset of the payload inside the cell (`info.pPayload - pCell`).
+    pub n_hdr: usize,
 }
 
 /// `MemPage.xParseCell`.
@@ -195,6 +197,7 @@ pub(crate) fn parse_cell(k: &PgKind, usable: u32, d: &[u8], pc: usize) -> Result
             n_payload: 0,
             n_local: 0,
             n_size: 4 + n,
+            n_hdr: 4 + n,
         });
     }
     let mut it = pc + k.child_ptr;
@@ -231,6 +234,7 @@ pub(crate) fn parse_cell(k: &PgKind, usable: u32, d: &[u8], pc: usize) -> Result
             n_payload,
             n_local: n_payload,
             n_size,
+            n_hdr: head,
         })
     } else {
         let surplus = k.min_local + (n_payload - k.min_local) % (usable - 4);
@@ -244,6 +248,7 @@ pub(crate) fn parse_cell(k: &PgKind, usable: u32, d: &[u8], pc: usize) -> Result
             n_payload,
             n_local,
             n_size: usize::from((head as u32 + n_local) as u16) + 4,
+            n_hdr: head,
         })
     }
 }
@@ -490,10 +495,25 @@ fn defragment_page(
     Ok(())
 }
 
+/// How [`allocate_space`] found the room (decision trace): the gap between the cell pointer
+/// array and the cell content area, a freeblock, or the gap after defragmenting the page.
+pub(crate) const SLOT_GAP: u8 = 0;
+pub(crate) const SLOT_FREEBLOCK: u8 = 1;
+pub(crate) const SLOT_DEFRAG: u8 = 2;
+
+#[cfg(sqliters_dtrace)]
+pub(crate) const fn slot_name(how: u8) -> &'static str {
+    match how {
+        SLOT_FREEBLOCK => "freeblock",
+        SLOT_DEFRAG => "defrag",
+        _ => "gap",
+    }
+}
+
 /// `allocateSpace`: room for `n_byte` bytes of cell content; the caller guarantees that
-/// `n_byte + 2 <= n_free`.
+/// `n_byte + 2 <= n_free`. Returns the offset and how it was found (`SLOT_*`).
 #[allow(clippy::too_many_arguments)]
-fn allocate_space(
+pub(crate) fn allocate_space(
     d: &mut [u8],
     hdr: usize,
     k: &PgKind,
@@ -502,7 +522,8 @@ fn allocate_space(
     n_free: i32,
     n_byte: usize,
     tmp: &mut Vec<u8>,
-) -> Result<usize> {
+) -> Result<(usize, u8)> {
+    let mut how = SLOT_GAP;
     let gap = hdr + 8 + k.child_ptr + 2 * n_cell;
     let mut top = get2(d, hdr + 5);
     if gap > top {
@@ -520,7 +541,7 @@ fn allocate_space(
                 if g2 <= gap {
                     return Err(corrupt("freeblock inside the cell pointer array"));
                 }
-                return Ok(g2);
+                return Ok((g2, SLOT_FREEBLOCK));
             }
             (None, true) => return Err(corrupt("corrupt freeblock chain")),
             (None, false) => {}
@@ -529,6 +550,7 @@ fn allocate_space(
     if gap + 2 + n_byte > top {
         let n_max_frag = 4.min(n_free - (2 + n_byte as i32));
         defragment_page(d, hdr, k, usable, n_cell, n_free, n_max_frag, tmp)?;
+        how = SLOT_DEFRAG;
         top = {
             let t = get2(d, hdr + 5);
             if t == 0 { 65_536 } else { t }
@@ -539,7 +561,7 @@ fn allocate_space(
     }
     top -= n_byte;
     put2(d, hdr + 5, top);
-    Ok(top)
+    Ok((top, how))
 }
 
 /// `dropCell`: removes cell `idx` (`sz` bytes) from a page, updating `n_cell` / `n_free` the
@@ -584,7 +606,7 @@ pub(crate) fn drop_cell(
 }
 
 /// `zeroPage`.
-fn zero_page(d: &mut [u8], hdr: usize, flags: u8, usable: usize, secure: bool) {
+pub(crate) fn zero_page(d: &mut [u8], hdr: usize, flags: u8, usable: usize, secure: bool) {
     if secure {
         d[hdr..usable].fill(0);
     }
@@ -616,6 +638,26 @@ impl OvflCells {
         self.len[self.n] = cell.len() as u32;
         self.space.extend_from_slice(cell);
         // (C cells may be read up to a few bytes past their end by the size functions.)
+        self.n += 1;
+        Ok(())
+    }
+
+    /// [`Self::push`] for a cell of `len` bytes that `fill` writes in place.
+    pub(crate) fn push_with(
+        &mut self,
+        idx: usize,
+        len: usize,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Result<()> {
+        if self.n >= 4 {
+            return Err(corrupt("too many overflow cells on one page"));
+        }
+        let start = self.space.len();
+        self.space.resize(start + len, 0);
+        fill(&mut self.space[start..]);
+        self.idx[self.n] = idx as u16;
+        self.off[self.n] = start as u32;
+        self.len[self.n] = len as u32;
         self.n += 1;
         Ok(())
     }
@@ -1127,14 +1169,25 @@ impl Btree {
                 let o = ovfl.off[ovfl.n - 1] as usize;
                 put4(&mut ovfl.space, o, c);
             }
+            if self.dtrace_persistent() {
+                sqliters_types::dtrace!(
+                    "TR|ins|slot|ctx={} pg={} i={} sz={} o=overflow",
+                    self.tr_ctx(),
+                    pgno,
+                    i,
+                    sz
+                );
+            }
             return Ok(false);
         }
         let usable = self.pager.usable_size() as usize;
         let hdr = hdr_of(pgno);
         let mut tmp = std::mem::take(&mut self.bal_tmp);
+        let mut slot_how = SLOT_GAP;
         let res = (|| -> Result<usize> {
             let d = self.pager.write_page(pgno)?;
-            let idx = allocate_space(d, hdr, k, usable, *n_cell, *n_free, sz, &mut tmp)?;
+            let (idx, how) = allocate_space(d, hdr, k, usable, *n_cell, *n_free, sz, &mut tmp)?;
+            slot_how = how;
             *n_free -= 2 + sz as i32;
             match child {
                 Some(c) => {
@@ -1155,6 +1208,18 @@ impl Btree {
         })();
         self.bal_tmp = tmp;
         let idx = res?;
+        if self.dtrace_persistent() {
+            sqliters_types::dtrace!(
+                "TR|ins|slot|ctx={} pg={} i={} sz={} o={} off={}",
+                self.tr_ctx(),
+                pgno,
+                i,
+                sz,
+                slot_name(slot_how),
+                idx
+            );
+        }
+        let _ = slot_how;
         if self.is_auto_vacuum() {
             // The cell may point at an overflow page: that page now belongs to `pgno`.
             let info = {
@@ -1237,7 +1302,12 @@ impl Btree {
         self.bal_give_buf(cbuf);
         res?;
         if self.dtrace_persistent() {
-            sqliters_types::dtrace!("TR|bal|deeper|ctx=del root={} child={}", root, child);
+            sqliters_types::dtrace!(
+                "TR|bal|deeper|ctx={} root={} child={}",
+                self.tr_ctx(),
+                root,
+                child
+            );
         }
         Ok(child)
     }
@@ -1334,7 +1404,8 @@ impl Btree {
         self.bal_give_buf(nbuf);
         if self.dtrace_persistent() {
             sqliters_types::dtrace!(
-                "TR|bal|quick|ctx=del parent={} pg={} new={}",
+                "TR|bal|quick|ctx={} parent={} pg={} new={}",
+                self.tr_ctx(),
                 parent,
                 page,
                 pgno_new
@@ -1359,7 +1430,8 @@ impl Btree {
             if n_ovfl == 0 && n_free as usize * 3 <= usable * 2 {
                 if self.dtrace_persistent() {
                     sqliters_types::dtrace!(
-                        "TR|bal|step|ctx=del pg={} ovfl=0 nfree={} o=stop",
+                        "TR|bal|step|ctx={} pg={} ovfl=0 nfree={} o=stop",
+                        self.tr_ctx(),
                         pgno,
                         n_free
                     );
@@ -1371,7 +1443,8 @@ impl Btree {
                     self.another_valid_cursor(pgno)?;
                     if self.dtrace_persistent() {
                         sqliters_types::dtrace!(
-                            "TR|bal|step|ctx=del pg={} ovfl={} nfree={} o=deeper",
+                            "TR|bal|step|ctx={} pg={} ovfl={} nfree={} o=deeper",
+                            self.tr_ctx(),
                             pgno,
                             n_ovfl,
                             n_free
@@ -1387,7 +1460,8 @@ impl Btree {
                 }
                 if self.dtrace_persistent() {
                     sqliters_types::dtrace!(
-                        "TR|bal|step|ctx=del pg={} ovfl=0 nfree={} o=root-stop",
+                        "TR|bal|step|ctx={} pg={} ovfl=0 nfree={} o=root-stop",
+                        self.tr_ctx(),
                         pgno,
                         n_free
                     );
@@ -1410,7 +1484,8 @@ impl Btree {
             {
                 if self.dtrace_persistent() {
                     sqliters_types::dtrace!(
-                        "TR|bal|step|ctx=del pg={} ovfl=1 nfree={} o=quick",
+                        "TR|bal|step|ctx={} pg={} ovfl=1 nfree={} o=quick",
+                        self.tr_ctx(),
                         pgno,
                         n_free
                     );
@@ -1419,7 +1494,8 @@ impl Btree {
             } else {
                 if self.dtrace_persistent() {
                     sqliters_types::dtrace!(
-                        "TR|bal|step|ctx=del pg={} ovfl={} nfree={} o=nonroot",
+                        "TR|bal|step|ctx={} pg={} ovfl={} nfree={} o=nonroot",
+                        self.tr_ctx(),
                         pgno,
                         page_ovfl.n,
                         n_free
@@ -1824,7 +1900,8 @@ impl Btree {
                 let cnt: Vec<String> = (0..k).map(|i| cnt_new[i].to_string()).collect();
                 let szs: Vec<String> = (0..k).map(|i| sz_new[i].to_string()).collect();
                 sqliters_types::dtrace!(
-                    "TR|bal|sib|ctx=del parent={} idx={} nxdiv={} nold={} bulk={} old={}",
+                    "TR|bal|sib|ctx={} parent={} idx={} nxdiv={} nold={} bulk={} old={}",
+                    self.tr_ctx(),
                     parent,
                     i_parent_idx,
                     nx_div,
@@ -1833,7 +1910,8 @@ impl Btree {
                     old.join(",")
                 );
                 sqliters_types::dtrace!(
-                    "TR|bal|dist|ctx=del k={} leafdata={} ncell={} cnt={} sz={}",
+                    "TR|bal|dist|ctx={} k={} leafdata={} ncell={} cnt={} sz={}",
+                    self.tr_ctx(),
                     k,
                     u8::from(leaf_data),
                     n_cell,
@@ -1886,7 +1964,8 @@ impl Btree {
                 let np: Vec<String> = (0..n_new).map(|i| new_pgno[i].to_string()).collect();
                 let fp: Vec<String> = (n_new..n_old).map(|i| old_pgno[i].to_string()).collect();
                 sqliters_types::dtrace!(
-                    "TR|bal|pages|ctx=del new={} freed={}",
+                    "TR|bal|pages|ctx={} new={} freed={}",
+                    self.tr_ctx(),
                     np.join(","),
                     fp.join(",")
                 );
@@ -2019,7 +2098,8 @@ impl Btree {
             if self.dtrace_persistent() {
                 #[cfg(sqliters_dtrace)]
                 sqliters_types::dtrace!(
-                    "TR|bal|div|ctx=del i={} left={} sz={} key={} o={}",
+                    "TR|bal|div|ctx={} i={} left={} sz={} key={} o={}",
+                    self.tr_ctx(),
                     i,
                     new_pgno[i],
                     sz,
@@ -2062,7 +2142,8 @@ impl Btree {
                 new_nfree[ipg] = usable_space - sz_new[ipg];
                 if self.dtrace_persistent() {
                     sqliters_types::dtrace!(
-                        "TR|bal|edit|ctx=del pg={} ncell={} nfree={} o={}",
+                        "TR|bal|edit|ctx={} pg={} ncell={} nfree={} o={}",
+                        self.tr_ctx(),
                         new_pgno[ipg],
                         n_new_cell,
                         new_nfree[ipg],
@@ -2076,7 +2157,8 @@ impl Btree {
             // ---- balance-shallower: the root has no cell left; its only child moves into it.
             if self.dtrace_persistent() {
                 sqliters_types::dtrace!(
-                    "TR|bal|shallow|ctx=del root={} child={} o=shallower",
+                    "TR|bal|shallow|ctx={} root={} child={} o=shallower",
+                    self.tr_ctx(),
                     parent,
                     new_pgno[0]
                 );
@@ -2130,7 +2212,8 @@ impl Btree {
         } else {
             if self.dtrace_persistent() {
                 sqliters_types::dtrace!(
-                    "TR|bal|shallow|ctx=del root={} child={} o={}",
+                    "TR|bal|shallow|ctx={} root={} child={} o={}",
+                    self.tr_ctx(),
                     parent,
                     new_pgno[0],
                     if is_root && par_ncell == 0 {

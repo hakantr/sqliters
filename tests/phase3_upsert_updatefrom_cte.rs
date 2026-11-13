@@ -593,7 +593,9 @@ fn mutation_context_pipeline_traces_all_dml_upsert_replace_and_fk_origins() {
     )
     .unwrap();
     let evs = conn.take_mutation_trace().unwrap();
-    // kv_wor: ReplaceConflictDelete + TopLevelInsert
+    // kv_wor (WITHOUT ROWID, no secondary index, no delete trigger, no foreign key): TopLevelInsert only.
+    // C does not delete the conflicting row there (insert.c: "Collision detection may be omitted ...");
+    // the OP_IdxInsert of the new record replaces the PRIMARY KEY entry.
     // dept(2,'OPS') deleted via ReplaceConflictDelete -> triggers FkActionUpdate (SET NULL on emp.mgr_dept) -> TopLevelInsert dept(3)
     let origins: Vec<(&str, MutationOrigin)> = evs
         .iter()
@@ -602,7 +604,6 @@ fn mutation_context_pipeline_traces_all_dml_upsert_replace_and_fk_origins() {
     assert_eq!(
         origins,
         vec![
-            ("kv_wor", MutationOrigin::ReplaceConflictDelete),
             ("kv_wor", MutationOrigin::TopLevelInsert),
             ("dept", MutationOrigin::ReplaceConflictDelete),
             ("emp", MutationOrigin::FkActionUpdate),
