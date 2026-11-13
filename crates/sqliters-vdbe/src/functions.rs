@@ -483,7 +483,7 @@ fn eval_scalar_function_plain(
                 Value::Integer(i) => i
                     .checked_abs()
                     .map(Value::Integer)
-                    .ok_or_else(|| SqliteError::new(ErrorCode::Mismatch, "integer overflow")),
+                    .ok_or_else(|| SqliteError::new(ErrorCode::Error, "integer overflow")),
                 other => Ok(Value::real(other.to_real_lossy().abs())),
             }
         }
@@ -2589,7 +2589,7 @@ impl FastSumAccum {
         }
         if self.ctx.approx {
             if self.ctx.ovrfl {
-                Err(SqliteError::new(ErrorCode::Mismatch, "integer overflow"))
+                Err(SqliteError::new(ErrorCode::Error, "integer overflow"))
             } else {
                 Ok(Value::real(self.ctx.combined_f64()))
             }
@@ -2954,7 +2954,7 @@ impl AggregateAccumulator {
                 }
                 if self.sum_ctx.approx {
                     if self.sum_ctx.ovrfl {
-                        Err(SqliteError::new(ErrorCode::Mismatch, "integer overflow"))
+                        Err(SqliteError::new(ErrorCode::Error, "integer overflow"))
                     } else {
                         Ok(Value::real(self.sum_ctx.combined_f64()))
                     }

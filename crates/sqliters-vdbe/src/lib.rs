@@ -547,6 +547,7 @@ pub struct VdbeProgram {
     has_function_call: bool,
     needs_stmt_timestamp: bool,
     needs_stmt_subsavepoint: bool,
+    abort_safe_without_stmt_journal: bool,
     rowid_point_select: Option<RowidPointSelectPlan>,
     single_row_insert: Option<SingleRowInsertPlan>,
     rowid_point_update: Option<RowidPointUpdatePlan>,
@@ -566,6 +567,7 @@ impl VdbeProgram {
             has_function_call: false,
             needs_stmt_timestamp: false,
             needs_stmt_subsavepoint: true,
+            abort_safe_without_stmt_journal: true,
             rowid_point_select: None,
             single_row_insert: None,
             rowid_point_update: None,
@@ -611,6 +613,20 @@ impl VdbeProgram {
     #[inline]
     pub fn set_needs_stmt_subsavepoint(&mut self, needed: bool) {
         self.needs_stmt_subsavepoint = needed;
+    }
+
+    /// Whether the program may run inside a transaction without a statement savepoint: it
+    /// performs every check that can fail before its first write, so an abort leaves nothing
+    /// behind (which is what C relies on when it compiles a statement without a statement
+    /// journal).
+    #[inline(always)]
+    pub fn abort_safe_without_stmt_journal(&self) -> bool {
+        self.abort_safe_without_stmt_journal
+    }
+
+    #[inline]
+    pub fn set_abort_safe_without_stmt_journal(&mut self, safe: bool) {
+        self.abort_safe_without_stmt_journal = safe;
     }
 
     #[inline(always)]
@@ -2338,7 +2354,9 @@ pub fn eval_arith(op: Opcode, lhs: &Value, rhs: &Value) -> Value {
                     if ib == 0 {
                         Value::Null
                     } else {
-                        Value::Integer(ia.wrapping_rem(ib))
+                        // vdbe.c OP_Remainder, floating point branch: `rB = (double)(iB % iA)`
+                        // — the result is REAL when an operand is.
+                        Value::real(ia.wrapping_rem(ib) as f64)
                     }
                 }
                 _ => unreachable!(),
@@ -2363,7 +2381,15 @@ fn coerce_numeric_for_arith(v: &Value) -> Value {
         Value::Integer(_) | Value::Real(_) => v.clone(),
         Value::Text(s) => sqliters_types::parse_numeric_text(s)
             .unwrap_or_else(|| Value::Integer(v.to_integer_lossy())),
-        Value::Blob(_) => Value::Integer(v.to_integer_lossy()),
+        // vdbe.c `numericType`: a BLOB operand is read as text (`MEM_Str|MEM_Blob`).
+        Value::Blob(b) => {
+            let t = Value::Text(String::from_utf8_lossy(b).into_owned());
+            match &t {
+                Value::Text(s) => sqliters_types::parse_numeric_text(s)
+                    .unwrap_or_else(|| Value::Integer(t.to_integer_lossy())),
+                _ => Value::Integer(0),
+            }
+        }
         Value::Null => Value::Null,
     }
 }

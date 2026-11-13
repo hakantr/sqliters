@@ -854,8 +854,26 @@ fn choose_single_term_plan(
                 }
                 let better = if cost != best_cost {
                     cost < best_cost
-                } else {
+                } else if idx_sz != best_sz {
                     idx_sz < best_sz
+                } else if let AccessPlan::IndexFullScan {
+                    index: ref best_idx,
+                    ..
+                } = best_plan
+                {
+                    // Equal cost: C keeps the WhereLoop it built first, and it builds them in
+                    // `pTab->pIndex` order (newest index first).
+                    let order = crate::engine::dml_ordered_indexes(
+                        tbl,
+                        &schema.indexes_for_table(&tbl.name),
+                    );
+                    let pos = |name: &str| order.iter().position(|i| i.name == name);
+                    match (pos(&idx.name), pos(&best_idx.name)) {
+                        (Some(a), Some(b)) => a < b,
+                        _ => false,
+                    }
+                } else {
+                    false
                 };
                 if better {
                     best_cost = cost;
@@ -2707,7 +2725,35 @@ pub fn try_compile_insert_in_db_set(
     {
         return Ok(None);
     }
-    try_compile_insert_core(ins, target_db_id, slot_schema, &tbl, functions)
+    let Some(mut prog) = try_compile_insert_core(ins, target_db_id, slot_schema, &tbl, functions)?
+    else {
+        return Ok(None);
+    };
+    // The statement journal is C's decision (`isMultiWrite && mayAbort`). The program checks
+    // and writes one index after the other: with two or more UNIQUE indexes a row can fail
+    // after an index entry was written, which only a statement savepoint undoes.
+    // (A one-row VALUES insert without OR REPLACE into a table whose rowid is not declared ON
+    // CONFLICT REPLACE never sets `isMultiWrite` — insert.c:1012 with `pSelect == 0` and no
+    // trigger, and none of the REPLACE sites — so the full analysis is only run otherwise.)
+    let one_row_plain = matches!(&ins.source, InsertSource::Values(rows) if rows.len() == 1)
+        && ins.or_conflict != Some(ConflictAction::Replace)
+        && tbl.rowid_pk_conflict != ConflictAction::Replace;
+    let uses_journal = !one_row_plain
+        && crate::dml_c::compiled_dml_flags(db_set, crate::dml_c::CompiledDml::Insert(ins))
+            .uses_stmt_journal();
+    debug_assert!(
+        !one_row_plain
+            || !crate::dml_c::compiled_dml_flags(db_set, crate::dml_c::CompiledDml::Insert(ins))
+                .uses_stmt_journal()
+    );
+    let n_unique = slot_schema
+        .indexes
+        .iter()
+        .filter(|i| i.unique && i.table_name.eq_ignore_ascii_case(&tbl.name))
+        .count();
+    prog.set_needs_stmt_subsavepoint(uses_journal);
+    prog.set_abort_safe_without_stmt_journal(n_unique <= 1);
+    Ok(Some(prog))
 }
 
 #[derive(Clone, Copy)]
@@ -3601,9 +3647,14 @@ pub fn try_compile_delete_in_db_set(
     prog.emit(Instruction::new(Opcode::Close, tcur, 0, 0));
     let halt_addr = prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
     prog.patch_p2(init_addr, body_start);
-    if !prog.has_function_call() {
-        prog.set_needs_stmt_subsavepoint(false);
-    }
+    // delete.c: `rowid = ?` is ONEPASS_SINGLE and the table has neither triggers nor foreign
+    // keys, so `isMultiWrite` stays 0: C compiles this statement without a statement journal.
+    // (No analysis needed: with these preconditions `isMultiWrite` is never set.)
+    prog.set_needs_stmt_subsavepoint(false);
+    debug_assert!(
+        !crate::dml_c::compiled_dml_flags(db_set, crate::dml_c::CompiledDml::Delete(del))
+            .uses_stmt_journal()
+    );
     if is_pure_single_eq
         && db_id == DatabaseId::MAIN
         && n_cols <= POINT_DML_MAX_COLS
@@ -4050,9 +4101,22 @@ pub fn try_compile_update_in_db_set(
     }
 
     prog.patch_p2(init_addr, body_start);
-    if can_elide_stmt_sp {
-        prog.set_needs_stmt_subsavepoint(false);
-    }
+    // update.c: `rowid = ?` is ONEPASS_SINGLE (`isMultiWrite` stays 0 without triggers and
+    // foreign keys): no statement journal in C. The program deletes the old index entries
+    // before it checks the new ones, so with a rewritten UNIQUE index it is not abort-safe.
+    // (The full analysis is only needed when the rowid is declared ON CONFLICT REPLACE: a
+    // rowid change could then reach insert.c:2370.)
+    prog.set_needs_stmt_subsavepoint(
+        tbl.rowid_pk_conflict == ConflictAction::Replace
+            && crate::dml_c::compiled_dml_flags(db_set, crate::dml_c::CompiledDml::Update(upd))
+                .uses_stmt_journal(),
+    );
+    debug_assert!(
+        tbl.rowid_pk_conflict == ConflictAction::Replace
+            || !crate::dml_c::compiled_dml_flags(db_set, crate::dml_c::CompiledDml::Update(upd))
+                .uses_stmt_journal()
+    );
+    prog.set_abort_safe_without_stmt_journal(affected_indexes.iter().all(|i| !i.unique));
     if is_pure_single_eq
         && can_elide_stmt_sp
         && db_id == DatabaseId::MAIN

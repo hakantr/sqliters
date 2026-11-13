@@ -41,7 +41,7 @@ use sqliters_vfs::{MemoryVfs, OpenFlags, OsVfs, Vfs};
 
 use crate::compiler::{
     AccessPlan, QueryPlanContext, choose_access_plan_with_context,
-    choose_access_plan_with_schema_name, compile_for_explain_in_db_set,
+    compile_for_explain_in_db_set,
     explain_query_plan_in_db_set, expr_column_label, expr_contains_aggregate,
     expr_contains_subquery, expr_implies_partial_where,
 };
@@ -134,6 +134,34 @@ pub struct StmtTxTracker {
     /// Set while an UPDATE writes a row: whether this statement stores integral values of
     /// REAL-affinity columns as integers (see `real_cols_stored_as_int_on_update`).
     pub update_real_as_int: Option<bool>,
+    /// Set while a one-pass DELETE removes a row: root of the index the scan runs on
+    /// (`iIdxNoSeek` of `sqlite3GenerateRowDelete`), whose entry is deleted after the table row.
+    pub delete_idx_no_seek: Option<Pgno>,
+    /// `OP_Once`: scalar sub-selects of the running UPDATE's SET expressions that do not refer
+    /// to the row being updated (address of the `SelectStmt`, cached value once computed). C
+    /// codes such a sub-select so that it runs once, the first time a row needs it; the rows
+    /// updated after that see the same value even when the sub-select reads the table being
+    /// updated.
+    pub once_subqueries: Vec<(usize, Option<Value>)>,
+    /// `Parse.pAinc` (insert.c `AutoincInfo`): one counter per AUTOINCREMENT table the top-level
+    /// statement (or one of its triggers) inserts into. The counter is read from
+    /// `sqlite_sequence` once, raised by every rowid the statement computes (`OP_MemMax` /
+    /// `OP_NewRowid` P3 — also for rows a constraint then rejects), and written back when the
+    /// top-level statement completes (`sqlite3AutoincrementEnd`).
+    pub autoinc: Vec<AutoincCounter>,
+    /// `Parse.pAinc` as a list: the AUTOINCREMENT tables for which the statement's program holds
+    /// an INSERT (triggers included). `sqlite3AutoincrementEnd` stores a `sqlite_sequence` row
+    /// for each of them that has none yet, even when the statement inserted nothing.
+    pub autoinc_coded: Vec<(DatabaseId, String)>,
+    /// fkey.c `fkLookupParent`: "if this is an INSERT statement that will insert exactly one
+    /// row into the table, raise a constraint immediately instead of incrementing a counter"
+    /// — a top-level INSERT with `isMultiWrite == 0`: an immediate foreign key whose parent
+    /// row is missing halts the statement before the row is written.
+    pub insert_fk_halts_immediately: bool,
+    /// The statement runs inside a transaction (or beside another active statement) *without*
+    /// a statement journal, because C's code generator would not have opened one
+    /// (`Vdbe.usesStmtJournal == 0`): an ABORT leaves what the statement has written so far.
+    pub no_stmt_journal: bool,
     /// Top-level statement immediate FK suspects (`Vdbe::nFkConstraint` in `vdbeaux.c:3306-3309`).
     pub stmt_fk_suspects: Vec<(SchemaInstanceId, String, TableRowKey, usize)>,
     /// Table roots pinned by `OP_CursorLock` during `UPDATE` `OE_Replace` conflict delete triggers
@@ -143,6 +171,19 @@ pub struct StmtTxTracker {
     pub top_level_sql: Option<String>,
     /// Parent tables whose `SQLITE_READ` returned `SQLITE_IGNORE` during compile-time FK check (`fkey.c:984-985`).
     pub ignored_fk_parent_tables: Vec<(DatabaseId, String)>,
+}
+
+/// See [`StmtTxTracker::autoinc`].
+#[derive(Debug, Clone)]
+pub struct AutoincCounter {
+    pub db_id: DatabaseId,
+    pub table_name: String,
+    /// `memId+2`: the `sqlite_sequence.seq` value when the statement started (0 without a row).
+    pub orig: i64,
+    /// `memId`: the largest rowid so far.
+    pub cur: i64,
+    /// `memId+1`: rowid of the table's `sqlite_sequence` row, if it has one.
+    pub seq_rowid: Option<i64>,
 }
 
 /// Default WAL automatic checkpoint threshold (`SQLITE_DEFAULT_WAL_AUTOCHECKPOINT = 1000`).
@@ -2410,6 +2451,10 @@ pub(crate) fn try_execute_compiled_insert(
     {
         return Ok(None);
     }
+    if ctx.stmt_tx.no_stmt_journal && !prog.abort_safe_without_stmt_journal() {
+        // (the row-at-a-time executor checks every constraint before it writes)
+        return Ok(None);
+    }
     let target_db = prog.primary_write_db();
     ctx.ensure_write_db(target_db, false)?;
     let enc = ctx.encoding();
@@ -2461,6 +2506,58 @@ pub(crate) fn try_execute_compiled_insert(
     ctx.runtime.total_changes += vm_rt.last_changes;
     ctx.publish();
     Ok(Some(QueryOutput::default()))
+}
+
+/// vdbe.c `OP_Transaction`: a statement journal is opened only when the program was compiled
+/// with `usesStmtJournal` (`Parse.isMultiWrite && Parse.mayAbort`) — and only inside a
+/// transaction or beside another active statement, which is when the caller has reserved
+/// `stmt_tx.stmt_sp_slot`. For a DML statement whose code C generates without a statement
+/// journal the reserved slot is dropped here, before the first write: the statement then
+/// writes straight into the transaction and an ABORT leaves what it has written so far
+/// (`sqlite3VdbeHalt` -> `sqlite3VdbeCloseStatement` is a no-op when `p->iStatement == 0`).
+pub(crate) fn apply_stmt_journal_policy(ctx: &mut ExecContext<'_>, stmt: &Stmt) {
+    if !matches!(stmt, Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)) {
+        return;
+    }
+    #[allow(unexpected_cfgs)]
+    let tracing = {
+        #[cfg(sqliters_dtrace)]
+        {
+            sqliters_types::dtrace_enabled()
+        }
+        #[cfg(not(sqliters_dtrace))]
+        {
+            false
+        }
+    };
+    // (`Parse.pAinc` is needed whenever the database has AUTOINCREMENT tables at all.)
+    let has_autoinc = ctx.db_set.slots().iter().any(|s| {
+        s.btree.is_some() && s.schema.tables.iter().any(|t| t.autoincrement)
+    });
+    if ctx.stmt_tx.stmt_sp_slot.is_none() && !tracing && !has_autoinc {
+        return;
+    }
+    let (flags, autoinc) = crate::dml_c::dml_stmt_flags(
+        ctx.db_set,
+        stmt,
+        *ctx.foreign_keys,
+        *ctx.recursive_triggers,
+    );
+    ctx.stmt_tx.autoinc_coded = autoinc;
+    sqliters_types::dtrace!(
+        "TR|stmt|usj|v={} multi={} abort={}",
+        u8::from(flags.uses_stmt_journal()),
+        u8::from(flags.multi_write),
+        u8::from(flags.may_abort)
+    );
+    if ctx.stmt_tx.stmt_sp_slot.is_some() {
+        if flags.uses_stmt_journal() {
+            sqliters_types::dtrace!("TR|stmt|journal|open");
+        } else {
+            ctx.stmt_tx.stmt_sp_slot = None;
+            ctx.stmt_tx.no_stmt_journal = true;
+        }
+    }
 }
 
 /// Executes a `Write` statement body (`INSERT`, `UPDATE`, `DELETE`, DDL, `REINDEX`, or header-writing `PRAGMA`)
@@ -2917,9 +3014,19 @@ where
                     *ctx.schema_changed_in_tx = false;
                     ctx.deferred_fk_suspects.clear();
                     ctx.mutation_pipeline.truncate(prev_mutation_len);
-                    ctx.runtime.total_changes = prev_total_changes;
+                    if is_dml {
+                        ctx.runtime.total_changes = ctx
+                            .runtime
+                            .total_changes
+                            .saturating_sub(ctx.runtime.last_changes)
+                            .max(prev_total_changes);
+                    } else {
+                        ctx.runtime.total_changes = prev_total_changes;
+                    }
                     ctx.runtime.last_changes = abort_last_changes;
+                    if !is_dml {
                     ctx.runtime.last_insert_rowid = prev_last_rowid;
+                }
                     if *ctx.schema_generation != prev_schema_gen {
                         restore_prev_schemas(ctx.db_set, ctx.collations, &prev_schemas);
                         *ctx.schema_generation += 1;
@@ -2976,9 +3083,19 @@ where
                         *ctx.schema_changed_in_tx = false;
                         ctx.deferred_fk_suspects.clear();
                         ctx.mutation_pipeline.truncate(prev_mutation_len);
-                        ctx.runtime.total_changes = prev_total_changes;
+                        if is_dml {
+                            ctx.runtime.total_changes = ctx
+                                .runtime
+                                .total_changes
+                                .saturating_sub(ctx.runtime.last_changes)
+                                .max(prev_total_changes);
+                        } else {
+                            ctx.runtime.total_changes = prev_total_changes;
+                        }
                         ctx.runtime.last_changes = 0;
-                        ctx.runtime.last_insert_rowid = prev_last_rowid;
+                        if !is_dml {
+                    ctx.runtime.last_insert_rowid = prev_last_rowid;
+                }
                         if *ctx.schema_generation != prev_schema_gen {
                             restore_prev_schemas(ctx.db_set, ctx.collations, &prev_schemas);
                             *ctx.schema_generation += 1;
@@ -3015,9 +3132,13 @@ where
                 } else {
                     ctx.mutation_pipeline.clear();
                 }
-                ctx.runtime.total_changes = prev_total_changes;
+                if !is_dml {
+                    ctx.runtime.total_changes = prev_total_changes;
+                }
                 ctx.runtime.last_changes = abort_last_changes;
-                ctx.runtime.last_insert_rowid = prev_last_rowid;
+                if !is_dml {
+                    ctx.runtime.last_insert_rowid = prev_last_rowid;
+                }
                 if *ctx.schema_generation != prev_schema_gen {
                     restore_prev_schemas(ctx.db_set, ctx.collations, &prev_schemas);
                     *ctx.schema_generation += 1;
@@ -3052,9 +3173,13 @@ where
                 }
                 *ctx.deferred_fk_suspects = prev_deferred;
                 ctx.mutation_pipeline.truncate(prev_mutation_len);
-                ctx.runtime.total_changes = prev_total_changes;
+                if !is_dml {
+                    ctx.runtime.total_changes = prev_total_changes;
+                }
                 ctx.runtime.last_changes = abort_last_changes;
-                ctx.runtime.last_insert_rowid = prev_last_rowid;
+                if !is_dml {
+                    ctx.runtime.last_insert_rowid = prev_last_rowid;
+                }
                 if stmt_changed_schema {
                     restore_prev_schemas(ctx.db_set, ctx.collations, &prev_schemas);
                     *ctx.schema_generation += 1;
@@ -6971,22 +7096,27 @@ fn resolve_vtab_for_query(
 }
 
 #[derive(Debug, Default)]
-struct SingleVtabQueryInfo {
+struct SingleVtabQueryInfo<'a> {
     has_star: bool,
     has_fts5_text_aux: bool,
     col_names: Vec<String>,
+    /// For a plain single-table SELECT (no GROUP BY / HAVING / window): the result columns and
+    /// ORDER BY terms, so that a base table is planned with the same context the VDBE compiler
+    /// gives the planner (covering-index scans, ORDER BY through an index) — i.e. the rows come
+    /// in the order C's plan produces them.
+    plan_ctx: Option<(&'a [ResultColumn], &'a [OrderByTerm])>,
 }
 
-impl SingleVtabQueryInfo {
+impl<'a> SingleVtabQueryInfo<'a> {
     #[allow(clippy::too_many_arguments)]
     fn from_single_select(
-        projection: &[ResultColumn],
+        projection: &'a [ResultColumn],
         selection: Option<&Expr>,
         pre_where_selection: Option<&Expr>,
         group_by: &[Expr],
         having: Option<&Expr>,
         windows: &[(String, WindowSpec)],
-        order_by: &[OrderByTerm],
+        order_by: &'a [OrderByTerm],
         limit: Option<&LimitClause>,
     ) -> Self {
         let mut info = Self::default();
@@ -7019,6 +7149,9 @@ impl SingleVtabQueryInfo {
             if let Some(ref off) = lc.offset {
                 info.collect_expr(off);
             }
+        }
+        if group_by.is_empty() && having.is_none() && windows.is_empty() {
+            info.plan_ctx = Some((projection, order_by));
         }
         info
     }
@@ -7251,7 +7384,7 @@ fn compute_vtab_col_used(
     declared: &crate::vtab::VTabDeclaredSchema,
     tvf_args: Option<&[Expr]>,
     hidden_col_indices: &[usize],
-    vtab_query_info: Option<&SingleVtabQueryInfo>,
+    vtab_query_info: Option<&SingleVtabQueryInfo<'_>>,
 ) -> u64 {
     let Some(qinfo) = vtab_query_info else {
         let mut mask = 0u64;
@@ -7302,7 +7435,7 @@ fn eval_vtab_scan(
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
     omitted_conjuncts: &mut Vec<Expr>,
-    vtab_query_info: Option<&SingleVtabQueryInfo>,
+    vtab_query_info: Option<&SingleVtabQueryInfo<'_>>,
 ) -> Result<Vec<EvalRow>> {
     if let Some(IndexHint::IndexedBy(idx)) = indexed_by {
         return Err(SqliteError::new(
@@ -7633,7 +7766,7 @@ fn open_filtered_vtab_cursor_inner(
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
     omitted_conjuncts: &mut Vec<Expr>,
-    vtab_query_info: Option<&SingleVtabQueryInfo>,
+    vtab_query_info: Option<&SingleVtabQueryInfo<'_>>,
 ) -> Result<(Box<dyn sqliters_types::VirtualCursor>, u64)> {
     let resolve_vtab_col = |e: &Expr| -> Option<i32> {
         let Expr::Column(cref) = e else {
@@ -9225,7 +9358,7 @@ fn eval_table_or_subquery(
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
     omitted_conjuncts: &mut Vec<Expr>,
-    vtab_query_info: Option<&SingleVtabQueryInfo>,
+    vtab_query_info: Option<&SingleVtabQueryInfo<'_>>,
 ) -> Result<Vec<EvalRow>> {
     match tos {
         TableOrSubquery::TableFunction {
@@ -9589,12 +9722,18 @@ fn eval_table_or_subquery(
                         let p = if matches!(indexed_by, Some(IndexHint::NotIndexed)) {
                             AccessPlan::FullScan
                         } else {
-                            choose_access_plan_with_schema_name(
+                            let query_ctx = vtab_query_info.and_then(|q| q.plan_ctx);
+                            choose_access_plan_with_context(
                                 &tbl,
                                 &slot_ref.name,
                                 alias.as_deref(),
                                 where_hint,
                                 &slot_ref.schema,
+                                QueryPlanContext {
+                                    projection: query_ctx.map(|(p, _)| p),
+                                    order_by: query_ctx.map_or(&[], |(_, o)| o),
+                                    ..Default::default()
+                                },
                             )
                         };
                         Some((db_enc, p))
@@ -9679,13 +9818,14 @@ fn eval_table_or_subquery(
                     }
                 }
 
-                let raw_entries = read_table_with_plan(
+                let (raw_entries, _) = read_table_with_plan_ctx(
                     ctx,
                     db_id,
                     &tbl,
                     alias.as_deref(),
                     indexed_by.as_ref(),
                     where_hint,
+                    vtab_query_info.and_then(|q| q.plan_ctx),
                     params,
                     outer_scopes,
                     ctes,
@@ -9702,13 +9842,14 @@ fn eval_table_or_subquery(
                 return Ok(out);
             }
 
-            let raw_entries = read_table_with_plan(
+            let (raw_entries, _) = read_table_with_plan_ctx(
                 ctx,
                 db_id,
                 &tbl,
                 alias.as_deref(),
                 indexed_by.as_ref(),
                 where_hint,
+                vtab_query_info.and_then(|q| q.plan_ctx),
                 params,
                 outer_scopes,
                 ctes,
@@ -9762,8 +9903,10 @@ fn eval_table_or_subquery(
     }
 }
 
+/// Reads the rows of `tbl` that the access plan for `where_hint` selects (the WHERE clause is
+/// not applied here), reporting what C's `sqlite3WhereOkOnePass` would say about the loop (`WHERE_ONEROW`, the index it runs on) — see [`crate::dml_c::scan_info`].
 #[allow(clippy::too_many_arguments)]
-fn read_table_with_plan(
+fn read_table_with_plan_scan(
     ctx: &mut ExecContext<'_>,
     db_id: DatabaseId,
     tbl: &TableSchema,
@@ -9773,13 +9916,43 @@ fn read_table_with_plan(
     params: &[Value],
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
-) -> Result<Vec<(TableRowKey, Vec<u8>)>> {
+) -> Result<(Vec<(TableRowKey, Vec<u8>)>, crate::dml_c::ScanInfo)> {
+    read_table_with_plan_ctx(
+        ctx,
+        db_id,
+        tbl,
+        alias,
+        indexed_by,
+        where_hint,
+        None,
+        params,
+        outer_scopes,
+        ctes,
+    )
+}
+
+/// [`read_table_with_plan_scan`] with the result columns / ORDER BY of a plain single-table
+/// SELECT (`query_ctx`), which the planner needs to consider covering-index scans.
+#[allow(clippy::too_many_arguments)]
+fn read_table_with_plan_ctx(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    alias: Option<&str>,
+    indexed_by: Option<&IndexHint>,
+    where_hint: Option<&Expr>,
+    query_ctx: Option<(&[ResultColumn], &[OrderByTerm])>,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    ctes: &CteStore,
+) -> Result<(Vec<(TableRowKey, Vec<u8>)>, crate::dml_c::ScanInfo)> {
     ctx.ensure_read_db(db_id, true)?;
+    let no_scan = crate::dml_c::ScanInfo::default();
     let Some(slot_ref) = ctx.db_set.slot(db_id) else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), no_scan));
     };
     let Some(bt_ref) = slot_ref.btree.as_ref() else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), no_scan));
     };
     let db_page_count = bt_ref.pager().page_count();
     let db_enc = bt_ref.encoding();
@@ -9789,9 +9962,9 @@ fn read_table_with_plan(
         match hint {
             IndexHint::NotIndexed => {
                 if db_page_count == 0 {
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), no_scan));
                 }
-                return scan_table_raw_entries(ctx, db_id, tbl);
+                return scan_table_raw_entries(ctx, db_id, tbl).map(|r| (r, no_scan));
             }
             IndexHint::IndexedBy(idx_name) => {
                 let Some(idx) = slot_ref
@@ -9816,9 +9989,6 @@ fn read_table_with_plan(
                         ));
                     }
                 }
-                if db_page_count == 0 {
-                    return Ok(Vec::new());
-                }
                 let plan = choose_access_plan_with_context(
                     tbl,
                     &slot_name,
@@ -9826,10 +9996,16 @@ fn read_table_with_plan(
                     where_hint,
                     &slot_ref.schema,
                     QueryPlanContext {
+                        projection: query_ctx.map(|(p, _)| p),
+                        order_by: query_ctx.map_or(&[], |(_, o)| o),
                         indexed_by,
                         ..Default::default()
                     },
                 );
+                let scan = crate::dml_c::scan_info(&plan, tbl, true);
+                if db_page_count == 0 {
+                    return Ok((Vec::new(), scan));
+                }
                 return execute_access_plan(
                     ctx,
                     db_id,
@@ -9839,17 +10015,41 @@ fn read_table_with_plan(
                     params,
                     outer_scopes,
                     ctes,
-                );
+                )
+                .map(|r| (r, scan));
             }
         }
     }
 
-    if db_page_count == 0 {
-        return Ok(Vec::new());
+    let plan = choose_access_plan_with_context(
+        tbl,
+        &slot_name,
+        alias,
+        where_hint,
+        &slot_ref.schema,
+        QueryPlanContext {
+            projection: query_ctx.map(|(p, _)| p),
+            order_by: query_ctx.map_or(&[], |(_, o)| o),
+            ..Default::default()
+        },
+    );
+    let mut scan = crate::dml_c::scan_info(&plan, tbl, false);
+    if query_ctx.is_none()
+        && !scan.one_row
+        && where_hint.is_some_and(|w| {
+            crate::dml_c::where_names_one_rowid(tbl, &slot_ref.schema.indexes, alias, w)
+        })
+    {
+        // (DML only: `whereShortCut` on a rowid equality the access plan does not seek with)
+        scan.one_row = true;
+        scan.multi_or = false;
+        scan.index_root = None;
     }
-    let plan =
-        choose_access_plan_with_schema_name(tbl, &slot_name, alias, where_hint, &slot_ref.schema);
+    if db_page_count == 0 {
+        return Ok((Vec::new(), scan));
+    }
     execute_access_plan(ctx, db_id, db_enc, tbl, &plan, params, outer_scopes, ctes)
+        .map(|r| (r, scan))
 }
 
 pub(crate) fn eval_rowid_target_int(val: Value) -> Option<i64> {
@@ -14635,6 +14835,20 @@ fn eval_expr_rt(
             ctx.call_scalar_rt(name, &a_vals)
         }
         Expr::Subquery(sub) => {
+            let once_key = &**sub as *const SelectStmt as usize;
+            let once_slot = if ctx.stmt_tx.once_subqueries.is_empty() {
+                None
+            } else {
+                ctx.stmt_tx
+                    .once_subqueries
+                    .iter()
+                    .position(|(k, _)| *k == once_key)
+            };
+            if let Some(i) = once_slot
+                && let Some(v) = ctx.stmt_tx.once_subqueries[i].1.clone()
+            {
+                return Ok(RuntimeValue::plain(v));
+            }
             let sub_out = exec_select(ctx, sub, params, scopes, ctes)?;
             if sub_out.column_names.len() > 1 {
                 return Err(SqliteError::new(
@@ -14645,14 +14859,22 @@ fn eval_expr_rt(
                     ),
                 ));
             }
-            Ok(RuntimeValue::plain(
-                sub_out
-                    .rows
-                    .first()
-                    .and_then(|r| r.first())
-                    .cloned()
-                    .unwrap_or(Value::Null),
-            ))
+            let v = sub_out
+                .rows
+                .first()
+                .and_then(|r| r.first())
+                .cloned()
+                .unwrap_or(Value::Null);
+            if once_slot.is_some()
+                && let Some(i) = ctx
+                    .stmt_tx
+                    .once_subqueries
+                    .iter()
+                    .position(|(k, _)| *k == once_key)
+            {
+                ctx.stmt_tx.once_subqueries[i].1 = Some(v.clone());
+            }
+            Ok(RuntimeValue::plain(v))
         }
         Expr::Exists { subquery, negated } => {
             let sub_out = exec_select(ctx, subquery, params, scopes, ctes)?;
@@ -15061,7 +15283,16 @@ fn eval_binary_arith(op: BinaryOp, lhs: &Value, rhs: &Value) -> Value {
         Value::Integer(_) | Value::Real(_) => v.clone(),
         Value::Text(s) => sqliters_types::parse_numeric_text(s)
             .unwrap_or_else(|| Value::Integer(v.to_integer_lossy())),
-        Value::Blob(_) => Value::Integer(v.to_integer_lossy()),
+        // vdbe.c `numericType` / `computeNumericType`: a BLOB operand is read as text
+        // (`MEM_Str|MEM_Blob`), so x'312e35' - 1 is 0.5 like '1.5' - 1.
+        Value::Blob(b) => {
+            let t = Value::Text(String::from_utf8_lossy(b).into_owned());
+            match &t {
+                Value::Text(s) => sqliters_types::parse_numeric_text(s)
+                    .unwrap_or_else(|| Value::Integer(t.to_integer_lossy())),
+                _ => Value::Integer(0),
+            }
+        }
         Value::Null => Value::Null,
     };
     let a = coerce(lhs);
@@ -15117,7 +15348,9 @@ fn eval_binary_arith(op: BinaryOp, lhs: &Value, rhs: &Value) -> Value {
                     if ib == 0 {
                         Value::Null
                     } else {
-                        Value::Integer(ia.wrapping_rem(ib))
+                        // vdbe.c OP_Remainder, floating point branch: `rB = (double)(iB % iA)`
+                        // — the result is REAL when an operand is.
+                        Value::real(ia.wrapping_rem(ib) as f64)
                     }
                 }
                 _ => unreachable!(),
@@ -15216,6 +15449,36 @@ fn table_keys_equal(
     }
 }
 
+/// Sorts row keys the way the table's own b-tree orders them: rowids ascending; WITHOUT ROWID
+/// PRIMARY KEY values by the key's collations and ASC / DESC flags. Duplicates are dropped (a
+/// RowSet / ephemeral index holds each key once).
+fn sort_table_keys_in_tree_order(tbl: &TableSchema, keys: &mut Vec<TableRowKey>, enc: TextEncoding) {
+    let cmp = |a: &TableRowKey, b: &TableRowKey| -> Ordering {
+        match (a, b) {
+            (TableRowKey::Rowid(x), TableRowKey::Rowid(y)) => x.cmp(y),
+            (TableRowKey::WithoutRowidPk(x), TableRowKey::WithoutRowidPk(y)) => {
+                for ((v1, v2), ic) in x.iter().zip(y.iter()).zip(tbl.without_rowid_pk_cols.iter()) {
+                    let mut o = v1.cmp_sqlite_with_encoding(v2, ic.sort_order.collation, enc);
+                    if ic.sort_order.desc {
+                        o = o.reverse();
+                    }
+                    if o != Ordering::Equal {
+                        return o;
+                    }
+                }
+                Ordering::Equal
+            }
+            (TableRowKey::Rowid(_), TableRowKey::WithoutRowidPk(_)) => Ordering::Less,
+            (TableRowKey::WithoutRowidPk(_), TableRowKey::Rowid(_)) => Ordering::Greater,
+        }
+    };
+    if keys.windows(2).all(|w| cmp(&w[0], &w[1]) == Ordering::Less) {
+        return;
+    }
+    keys.sort_by(cmp);
+    keys.dedup_by(|a, b| cmp(a, b) == Ordering::Equal);
+}
+
 fn slot_encoding_and_name(ctx: &ExecContext<'_>, db_id: DatabaseId) -> (TextEncoding, String) {
     if let Some(slot) = ctx.db_set.slot(db_id) {
         let enc = slot
@@ -15282,7 +15545,7 @@ fn decode_table_logical_row(
             logical_vals[ci] = v;
             assigned[ci] = true;
         }
-        for ci in 0..tbl.columns.len() {
+        for ci in generated_col_eval_order(tbl) {
             if let Some((ref gexpr, false)) = tbl.columns[ci].generated {
                 let scope = make_single_table_scope(tbl, &schema_name, None, 0, &logical_vals);
                 let gv = eval_expr(ctx, gexpr, params, &[scope], &CteStore::default(), None)?;
@@ -15377,7 +15640,7 @@ fn decode_table_logical_row(
         }
     }
 
-    for ci in 0..tbl.columns.len() {
+    for ci in generated_col_eval_order(tbl) {
         if let Some((ref gexpr, false)) = tbl.columns[ci].generated {
             let scope = make_single_table_scope(tbl, &schema_name, None, rowid, &logical_vals);
             let gv = eval_expr(ctx, gexpr, params, &[scope], &CteStore::default(), None)?;
@@ -15844,14 +16107,45 @@ fn remove_row_and_indexes_opt(
     let (_, schema_name) = slot_encoding_and_name(ctx, db_id);
     let old_vals = decode_table_logical_row(ctx, db_id, tbl, rkey, &old_payload, params)?;
     let rowid = rkey.rowid_or_zero();
+    // sqlite3GenerateRowDelete: the index entries (`sqlite3GenerateRowIndexDelete`, skipping
+    // `iIdxNoSeek`), then the table row, then the entry of the index a one-pass scan is
+    // positioned on.
+    let no_seek_root = ctx.stmt_tx.delete_idx_no_seek.take();
+    let mut deferred_idx: Option<(Pgno, Vec<Value>, Vec<KeySortOrder>)> = None;
     for idx in indexes {
         if index_row_passes_partial_where(ctx, &schema_name, tbl, idx, rowid, &old_vals, params)? {
             let keys = eval_index_key_values(ctx, &schema_name, tbl, idx, rkey, &old_vals, params)?;
             let orders = idx.key_sort_orders();
+            if no_seek_root == Some(idx.root_pgno) && !keep_table_row {
+                deferred_idx = Some((idx.root_pgno, keys, orders));
+                continue;
+            }
             if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
                 bt.delete_index(idx.root_pgno, &keys, &orders)?;
             }
         }
+    }
+    if let Some((root, keys, orders)) = deferred_idx {
+        let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) else {
+            return Ok(false);
+        };
+        let removed = match rkey {
+            TableRowKey::Rowid(rid) => {
+                let removed = bt.delete_table(tbl.root_pgno, *rid)?;
+                bt.delete_index(root, &keys, &orders)?;
+                if removed && let Some(inst_id) = ctx.db_set.slot(db_id).map(|s| s.schema_instance_id) {
+                    ctx.db_set.expire_blobs_for_row(inst_id, &tbl.name, *rid);
+                }
+                removed
+            }
+            TableRowKey::WithoutRowidPk(pk) => {
+                let pk_orders = tbl.without_rowid_pk_orders();
+                let removed = bt.delete_index(tbl.root_pgno, pk, &pk_orders)?;
+                bt.delete_index(root, &keys, &orders)?;
+                removed
+            }
+        };
+        return Ok(removed);
     }
     let inst_id_opt = ctx.db_set.slot(db_id).map(|s| s.schema_instance_id);
     if keep_table_row {
@@ -15888,14 +16182,32 @@ fn ordered_table_indexes(tbl: &TableSchema, indexes: &[IndexSchema]) -> Vec<Inde
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(usize::MAX)
     };
-    let mut autos: Vec<IndexSchema> = indexes.iter().filter(|i| i.is_autoindex).cloned().collect();
-    if let Some(pk_idx) = tbl.without_rowid_pk_as_index() {
+    let mut autos: Vec<IndexSchema> = indexes
+        .iter()
+        .filter(|i| i.is_autoindex && !(tbl.without_rowid && i.root_pgno == tbl.root_pgno))
+        .cloned()
+        .collect();
+    if let Some(mut pk_idx) = tbl.without_rowid_pk_as_index() {
+        if parse_auto_num(&pk_idx.name) == usize::MAX {
+            // The automatic indexes of a table are numbered 1..n in declaration order: the
+            // PRIMARY KEY has the number the other ones leave free.
+            let used: Vec<usize> = autos.iter().map(|i| parse_auto_num(&i.name)).collect();
+            let n = (1..=autos.len() + 1)
+                .find(|k| !used.contains(k))
+                .unwrap_or(autos.len() + 1);
+            pk_idx.name = format!("sqlite_autoindex_{}_{n}", tbl.name);
+        }
         autos.push(pk_idx);
     }
     autos.sort_by_key(|i| parse_auto_num(&i.name));
 
+    // (`indexes` may arrive in any order — callers pass the `pTab->pIndex` order too: the
+    // CREATE INDEX indexes are put back into creation order by their `sqlite_schema` rowid.)
+    let mut explicit: Vec<IndexSchema> =
+        indexes.iter().filter(|i| !i.is_autoindex).cloned().collect();
+    explicit.sort_by_key(|i| i.schema_rowid);
     let mut creation_order = autos;
-    creation_order.extend(indexes.iter().filter(|i| !i.is_autoindex).cloned());
+    creation_order.extend(explicit);
 
     let mut out = Vec::with_capacity(creation_order.len());
     for idx in creation_order
@@ -16101,8 +16413,9 @@ fn recheck_uniqueness_abort(
             if let Some(hit_key) = hit_key_opt {
                 let is_self =
                     existing_self_key.is_some_and(|sk| table_keys_equal(tbl, &hit_key, sk, enc));
-                let is_same_target = table_keys_equal(tbl, &hit_key, final_key, enc);
-                if !is_self && !is_same_target {
+                // (No exemption for an entry that belongs to the row at the new key: C only
+                // skips the row being updated — `OP_Eq` against the old key, `isUpdate`.)
+                if !is_self {
                     let ext_code = if idx.origin == "pk" {
                         extended::SQLITE_CONSTRAINT_PRIMARYKEY
                     } else {
@@ -16145,14 +16458,22 @@ fn make_runtime_table_pseudo_scope(
                 name: c.name.clone(),
                 collation: c.collation,
                 custom_collation: c.custom_collation.clone(),
-                affinity: Some(c.affinity),
+                // expr.c `sqlite3ExprAffinity`: a TK_TRIGGER reference (`old.x` / `new.x`) is
+                // not a TK_COLUMN - it has no affinity (its collation is the column's).
+                affinity: None,
                 hidden_rowid: false,
                 omit_from_star: false,
                 merged_using: false,
                 is_vtab: false,
                 hidden_vtab: false,
             });
-            vals.push(rvals.get(i).cloned().unwrap_or(Value::Null));
+            // expr.c TK_TRIGGER: "If the column has REAL affinity, it may currently be stored
+            // as an integer. Use OP_RealAffinity to make sure it is really real."
+            let v = rvals.get(i).cloned().unwrap_or(Value::Null);
+            vals.push(match v {
+                Value::Integer(iv) if c.affinity == TypeAffinity::Real => Value::real(iv as f64),
+                other => other,
+            });
         }
         if !tbl.without_rowid {
             cols.push(ScopedColumn {
@@ -16161,7 +16482,7 @@ fn make_runtime_table_pseudo_scope(
                 name: "rowid".to_owned(),
                 collation: Collation::Binary,
                 custom_collation: None,
-                affinity: Some(TypeAffinity::Integer),
+                affinity: None,
                 hidden_rowid: true,
                 omit_from_star: false,
                 merged_using: false,
@@ -16203,14 +16524,19 @@ fn make_runtime_view_pseudo_scope(
                 name: cname.clone(),
                 collation: *coll,
                 custom_collation: None,
-                affinity: *aff,
+                affinity: None,
                 hidden_rowid: false,
                 omit_from_star: false,
                 merged_using: false,
                 is_vtab: false,
                 hidden_vtab: false,
             });
-            vals.push(rvals.get(i).cloned().unwrap_or(Value::Null));
+            // (OP_RealAffinity, as for a table column)
+            let v = rvals.get(i).cloned().unwrap_or(Value::Null);
+            vals.push(match v {
+                Value::Integer(iv) if *aff == Some(TypeAffinity::Real) => Value::real(iv as f64),
+                other => other,
+            });
         }
     };
     if let Some(ovals) = old_vals {
@@ -16255,6 +16581,50 @@ fn make_returning_view_scope(
     EvalRow::new(cols.into(), rvals)
 }
 
+/// The order in which generated columns have to be computed (`sqlite3ComputeGeneratedColumns`,
+/// insert.c): repeated passes in column order, a column being computed once no generated
+/// column its expression mentions is still pending — a generated column may refer to one
+/// declared after it. Tables without such forward references come back in column order.
+fn generated_col_eval_order(tbl: &TableSchema) -> Vec<usize> {
+    let gen_cols: Vec<usize> = (0..tbl.columns.len())
+        .filter(|&i| tbl.columns[i].generated.is_some())
+        .collect();
+    if gen_cols.len() < 2 {
+        return gen_cols;
+    }
+    let mut pending: Vec<bool> = tbl.columns.iter().map(|c| c.generated.is_some()).collect();
+    let mut order = Vec::with_capacity(gen_cols.len());
+    loop {
+        let mut progress = false;
+        for &i in &gen_cols {
+            if !pending[i] {
+                continue;
+            }
+            let Some((ref gexpr, _)) = tbl.columns[i].generated else {
+                continue;
+            };
+            let blocked = expr_mentions_column(gexpr, &|cref: &ColumnRef| {
+                tbl.find_column(&cref.column)
+                    .is_some_and(|(dep, _)| dep != i && pending[dep])
+            });
+            if !blocked {
+                pending[i] = false;
+                order.push(i);
+                progress = true;
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+    for &i in &gen_cols {
+        if pending[i] {
+            order.push(i);
+        }
+    }
+    order
+}
+
 fn apply_table_affinities_and_generated(
     ctx: &mut ExecContext<'_>,
     tbl: &TableSchema,
@@ -16279,7 +16649,7 @@ fn apply_table_affinities_and_generated(
             }
         }
     }
-    for i in 0..tbl.columns.len() {
+    for i in generated_col_eval_order(tbl) {
         if let Some((ref gexpr, _)) = tbl.columns[i].generated {
             let scope = make_single_table_scope(tbl, schema_name, None, rowid, raw_vals);
             let gv = eval_expr(ctx, gexpr, params, &[scope], &CteStore::default(), None)?;
@@ -16488,6 +16858,7 @@ fn replace_conflict_delete_row(
     is_catalog: bool,
     pin_data_cursor: bool,
     rowid_conflict: bool,
+    conflict_index_root: Option<Pgno>,
     params: &[Value],
     did_replace_delete: &mut bool,
     did_replace_trigger: &mut bool,
@@ -16568,7 +16939,10 @@ fn replace_conflict_delete_row(
                         .db_set
                         .slot(db_id)
                         .is_some_and(|s| !find_referencing_fks(&s.schema, &tbl.name).is_empty())));
-        delete_row_via_pipeline_opt(
+        // insert.c: `sqlite3GenerateRowDelete(.., iThisCur)` — the entry of the index the
+        // conflict was found in (`iIdxNoSeek`) is deleted last, after the table row.
+        ctx.stmt_tx.delete_idx_no_seek = conflict_index_root;
+        let del_res = delete_row_via_pipeline_opt(
             ctx,
             db_id,
             tbl,
@@ -16580,7 +16954,9 @@ fn replace_conflict_delete_row(
             is_catalog,
             params,
             keep_table_row,
-        )?;
+        );
+        ctx.stmt_tx.delete_idx_no_seek = None;
+        del_res?;
         *did_replace_delete = true;
         if *ctx.foreign_keys {
             apply_parent_delete_fk_actions(ctx, db_id, tbl, &cvals2, params)?;
@@ -16654,23 +17030,34 @@ fn validate_and_write_row(
         };
         if final_rowid.is_none() {
             final_rowid = Some(allocate_table_rowid(ctx, db_id, tbl)?);
+        } else if tbl.autoincrement
+            && existing_self_key.is_none()
+            && let Some(r) = final_rowid
+        {
+            autoinc_note_rowid(ctx, db_id, tbl, r)?;
         }
         final_rowid.unwrap()
     };
 
     apply_table_affinities_and_generated(ctx, tbl, &schema_name, rowid, &mut raw_vals, params)?;
 
-    // 2. STRICT type check
-    if tbl.strict {
-        let eff = stmt_conflict.unwrap_or(ConflictAction::Abort);
+    // 2. STRICT type check (`OP_TypeCheck`). It is not a constraint with a conflict clause: the
+    // error is raised by the opcode itself, so the statement's OR clause does not apply and the
+    // action is always ABORT. Where it runs is where `sqlite3TableAffinity` is first coded for
+    // the row (`bAffinityDone` in `sqlite3GenerateConstraintChecks`): with generated columns
+    // before everything (`sqlite3ComputeGeneratedColumns`), else before the first CHECK, else
+    // before the first index of the index loop (after the rowid check), else when the table
+    // record is built.
+    let mut strict_pending = tbl.strict;
+    let strict_check = |raw_vals: &[Value]| -> Result<()> {
         for (i, col) in tbl.columns.iter().enumerate() {
-            if let Err(err) = check_strict_column_type(&tbl.name, col, &raw_vals[i]) {
-                if eff == ConflictAction::Ignore {
-                    return Ok(None);
-                }
-                return Err(err.with_conflict_effect(conflict_action_to_effect(eff)));
-            }
+            check_strict_column_type(&tbl.name, col, &raw_vals[i])?;
         }
+        Ok(())
+    };
+    if strict_pending && tbl.columns.iter().any(|c| c.generated.is_some()) {
+        strict_check(&raw_vals)?;
+        strict_pending = false;
     }
 
     // 3. NOT NULL constraint check
@@ -16718,6 +17105,10 @@ fn validate_and_write_row(
 
     // 4. CHECK constraints (`NULL` or `true` passes in SQL; only `false` fails!)
     if !tbl.checks.is_empty() {
+        if strict_pending {
+            strict_check(&raw_vals)?;
+            strict_pending = false;
+        }
         let eff = stmt_conflict.unwrap_or(ConflictAction::Abort);
         let scope = make_single_table_scope(tbl, &schema_name, None, rowid, &raw_vals);
         for chk in &tbl.checks {
@@ -16781,6 +17172,7 @@ fn validate_and_write_row(
                         is_catalog,
                         false,
                         true,
+                        None,
                         params,
                         did_replace_delete,
                         did_replace_trigger,
@@ -16812,6 +17204,11 @@ fn validate_and_write_row(
         return Ok(None);
     }
 
+    if strict_pending && (tbl.without_rowid || !indexes.is_empty()) {
+        strict_check(&raw_vals)?;
+        strict_pending = false;
+    }
+
     for idx in &ordered_uniques {
         if idx.table_without_rowid && idx.origin == "pk" {
             let is_self =
@@ -16837,6 +17234,7 @@ fn validate_and_write_row(
                             is_catalog,
                             existing_self_key.is_some(),
                             false,
+                            None,
                             params,
                             &mut did_replace_delete,
                             &mut did_replace_trigger,
@@ -16883,8 +17281,11 @@ fn validate_and_write_row(
             if let Some(hit_key) = hit_key_opt {
                 let is_self =
                     existing_self_key.is_some_and(|sk| table_keys_equal(tbl, &hit_key, sk, enc));
-                let is_same_target = table_keys_equal(tbl, &hit_key, &final_key, enc);
-                if !is_self && !is_same_target {
+                // insert.c: after `OP_NoConflict` finds an entry, only an UPDATE compares the
+                // conflicting row with the row being updated (`OP_Eq` against the old key). A
+                // row that merely sits at the key the new row will get is a conflict of this
+                // index like any other.
+                if !is_self {
                     conflicting_keys.push(hit_key);
                 }
             }
@@ -16904,6 +17305,7 @@ fn validate_and_write_row(
                             is_catalog,
                             existing_self_key.is_some(),
                             false,
+                            (!(tbl.without_rowid && idx.root_pgno == tbl.root_pgno)).then_some(idx.root_pgno),
                             params,
                             &mut did_replace_delete,
                             &mut did_replace_trigger,
@@ -16929,6 +17331,10 @@ fn validate_and_write_row(
     if defer_ipk_replace && check_rowid_pk(ctx, &mut did_replace_delete, &mut did_replace_trigger)?
     {
         return Ok(None);
+    }
+
+    if strict_pending {
+        strict_check(&raw_vals)?;
     }
 
     // `addrRecheck` (`insert.c:2707-2725`): when `OR REPLACE` ran and `DELETE` triggers or FK actions
@@ -17023,6 +17429,19 @@ fn validate_and_write_row(
         None
     };
 
+    // `sqlite3FkCheck(pParse, pTab, 0, regIns, 0, 0)` runs between the constraint checks and
+    // `sqlite3CompleteInsertion`. For a one-row top-level INSERT (`isMultiWrite == 0`) a missing
+    // parent of an immediate constraint is `sqlite3HaltConstraint(.., OE_Abort, ..)` right
+    // there: the row is never written.
+    if ctx.stmt_tx.insert_fk_halts_immediately
+        && existing_self_key.is_none()
+        && ctx.stmt_tx.subprogram_stack.is_empty()
+        && *ctx.foreign_keys
+        && !tbl.foreign_keys.is_empty()
+    {
+        check_insert_fk_immediately(ctx, db_id, tbl, rowid, &raw_vals)?;
+    }
+
     // 8. Write table primary B-Tree record & secondary index records
     check_table_not_pinned(ctx, db_id, tbl.root_pgno)?;
     let real_as_int = tbl.has_real_col()
@@ -17098,6 +17517,12 @@ fn validate_and_write_row(
             }
         }
     }
+    // vdbe.c OP_Insert: `db->lastRowid = x.nKey` is assigned before `sqlite3BtreeInsert` runs,
+    // so an insert that then fails (SQLITE_FULL) has still set it.
+    if bump_last_rowid && !tbl.without_rowid {
+        ctx.runtime.last_insert_rowid = rowid;
+        ctx.publish();
+    }
     if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
         if tbl.without_rowid {
             if pk_pos >= indexes.len() {
@@ -17107,10 +17532,6 @@ fn validate_and_write_row(
         } else {
             bt.insert_table(tbl.root_pgno, rowid, &phys_rec)?;
         }
-    }
-
-    if tbl.autoincrement {
-        update_sqlite_sequence(ctx, db_id, &tbl.name, rowid)?;
     }
 
     if let Some(slot) = ctx.db_set.slot(db_id)
@@ -17126,11 +17547,6 @@ fn validate_and_write_row(
     // 9. Foreign key checks on child row, dispatch parent mutation, & cascading parent UPDATE actions
     if *ctx.foreign_keys {
         register_child_fk_checks(ctx, db_id, tbl, &final_key, &raw_vals)?;
-    }
-
-    if bump_last_rowid && !tbl.without_rowid {
-        ctx.runtime.last_insert_rowid = rowid;
-        ctx.publish();
     }
 
     if let Some((origin, excluded_row)) = mutation_dispatch {
@@ -17662,6 +18078,9 @@ fn enter_update_row_storage_rules(
     old_key: &TableRowKey,
 ) -> (Option<bool>, Option<(Pgno, Vec<bool>)>) {
     let saved_real_as_int = ctx.stmt_tx.update_real_as_int;
+    // update.c `chngRowid` is decided when the statement is compiled (the SET list names the
+    // rowid, whatever value it gets). The mask carries that for an INTEGER PRIMARY KEY column;
+    // an assignment to the implicit `rowid` name is only seen here when the value differs.
     let rowid_changes = tbl
         .rowid_alias_col
         .is_some_and(|c| modified_col_mask.get(c).copied().unwrap_or(false))
@@ -17674,8 +18093,19 @@ fn enter_update_row_storage_rules(
     } else {
         modified_col_mask
     };
+    // `hasFK > 1` (sqlite3FkRequired): a self-referencing child key or a parent key with an
+    // action is modified — like a rowid change, the old row is deleted (`OP_Delete`) and the
+    // new one inserted, and every index is rewritten.
+    let fk_forces = crate::dml_c::fk_required_update(
+        ctx.db_set,
+        db_id,
+        tbl,
+        *ctx.foreign_keys,
+        modified_col_mask,
+        rowid_changes,
+    ) > 1;
     // (Also for a table without indexes: the row is then simply overwritten in place.)
-    if !tbl.without_rowid {
+    if !tbl.without_rowid && !rowid_changes && !fk_forces {
         ctx.stmt_tx.update_index_rewrite = Some((
             tbl.root_pgno,
             indexes
@@ -17695,7 +18125,7 @@ fn enter_update_row_storage_rules(
             &all_indexes,
             modified_col_mask,
             rowid_changes,
-            false,
+            fk_forces,
         ));
     }
     (saved_real_as_int, saved_index_rewrite)
@@ -17815,80 +18245,130 @@ fn allocate_table_rowid(
         return bt.next_rowid(tbl.root_pgno);
     }
 
-    let (max_existing, seq_tbl_opt, enc) = {
-        let slot = ctx
+    // `OP_NewRowid` with P3 = the AUTOINCREMENT counter: one more than the largest rowid in
+    // the table, but never less than counter + 1; SQLITE_FULL once either has reached the
+    // largest possible rowid. The counter becomes the new rowid.
+    let ai = autoinc_counter(ctx, db_id, tbl)?;
+    let max_existing = {
+        let bt = ctx
             .db_set
             .slot_mut(db_id)
+            .and_then(|s| s.btree.as_mut())
             .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-        let seq_tbl = slot.schema.find_user_table("sqlite_sequence").cloned();
-        let bt = slot
-            .btree
-            .as_mut()
-            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-        let max_ex = bt.max_table_rowid(tbl.root_pgno)?.unwrap_or(0);
-        let enc = bt.encoding();
-        (max_ex, seq_tbl, enc)
+        bt.max_table_rowid(tbl.root_pgno)?.unwrap_or(0)
     };
+    let cur = ctx.stmt_tx.autoinc[ai].cur;
+    if cur == i64::MAX || max_existing == i64::MAX {
+        return Err(SqliteError::new(
+            ErrorCode::Full,
+            "database or disk is full",
+        ));
+    }
+    let next_id = cur.max(max_existing) + 1;
+    ctx.stmt_tx.autoinc[ai].cur = next_id;
+    Ok(next_id)
+}
 
-    let mut prev_seq = 0i64;
-    if let Some(seq_tbl) = seq_tbl_opt
-        && let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut())
+/// The statement's counter for AUTOINCREMENT table `tbl` (`sqlite3AutoincrementBegin`): created
+/// on first use from the table's `sqlite_sequence` row.
+fn autoinc_counter(ctx: &mut ExecContext<'_>, db_id: DatabaseId, tbl: &TableSchema) -> Result<usize> {
+    if let Some(i) = ctx
+        .stmt_tx
+        .autoinc
+        .iter()
+        .position(|a| a.db_id == db_id && a.table_name.eq_ignore_ascii_case(&tbl.name))
     {
+        return Ok(i);
+    }
+    let mut orig = 0i64;
+    let mut seq_rowid = None;
+    if let Some(slot) = ctx.db_set.slot_mut(db_id)
+        && let Some(seq_tbl) = slot.schema.find_user_table("sqlite_sequence").cloned()
+        && let Some(ref mut bt) = slot.btree
+    {
+        let enc = bt.encoding();
         let rows = scan_table_incremental(bt, seq_tbl.root_pgno)?;
-        for (_, payload) in rows {
+        for (seq_rid, payload) in rows {
             let cols = decode_record_with_encoding(&payload, enc)?;
             if cols.len() >= 2 && cols[0].as_str() == Some(tbl.name.as_str()) {
-                prev_seq = cols[1].to_integer_lossy();
+                orig = cols[1].to_integer_lossy();
+                seq_rowid = Some(seq_rid);
                 break;
             }
         }
     }
-    let next_id = prev_seq
-        .max(max_existing)
-        .checked_add(1)
-        .ok_or_else(|| SqliteError::new(ErrorCode::Full, "database or disk is full"))?;
-    update_sqlite_sequence(ctx, db_id, &tbl.name, next_id)?;
-    Ok(next_id)
+    ctx.stmt_tx.autoinc.push(AutoincCounter {
+        db_id,
+        table_name: tbl.name.clone(),
+        orig,
+        cur: orig,
+        seq_rowid,
+    });
+    Ok(ctx.stmt_tx.autoinc.len() - 1)
 }
 
-fn update_sqlite_sequence(
+/// `autoIncStep` (`OP_MemMax`): an INSERT that supplies the rowid raises the counter to it —
+/// right after the rowid is known, before any constraint is checked.
+fn autoinc_note_rowid(
     ctx: &mut ExecContext<'_>,
     db_id: DatabaseId,
-    tbl_name: &str,
+    tbl: &TableSchema,
     rowid: i64,
 ) -> Result<()> {
-    let Some(slot) = ctx.db_set.slot_mut(db_id) else {
+    let ai = autoinc_counter(ctx, db_id, tbl)?;
+    let c = &mut ctx.stmt_tx.autoinc[ai];
+    if rowid > c.cur {
+        c.cur = rowid;
+    }
+    Ok(())
+}
+
+/// `sqlite3AutoincrementEnd`: when the top-level statement completes, every counter that grew
+/// is stored in `sqlite_sequence` (the table's row is rewritten, or appended when it has none).
+fn autoinc_end(ctx: &mut ExecContext<'_>) -> Result<()> {
+    if ctx.stmt_tx.autoinc.is_empty() && ctx.stmt_tx.autoinc_coded.is_empty() {
         return Ok(());
-    };
-    let Some(seq_tbl) = slot.schema.find_user_table("sqlite_sequence").cloned() else {
-        return Ok(());
-    };
-    let Some(ref mut bt) = slot.btree else {
-        return Ok(());
-    };
-    let enc = bt.encoding();
-    let rows = scan_table_incremental(bt, seq_tbl.root_pgno)?;
-    for (seq_rid, payload) in rows {
-        let cols = decode_record_with_encoding(&payload, enc)?;
-        if cols.len() >= 2 && cols[0].as_str() == Some(tbl_name) {
-            let cur = cols[1].to_integer_lossy();
-            if rowid > cur {
-                let updated = encode_record_with_encoding(
-                    &[Value::Text(tbl_name.to_owned()), Value::Integer(rowid)],
-                    enc,
-                );
-                bt.insert_table(seq_tbl.root_pgno, seq_rid, &updated)?;
-            }
-            return Ok(());
+    }
+    // Every table an INSERT was coded for has a counter, read from `sqlite_sequence`.
+    let coded = std::mem::take(&mut ctx.stmt_tx.autoinc_coded);
+    for (db_id, name) in coded {
+        if let Some(tbl) = ctx
+            .db_set
+            .slot(db_id)
+            .and_then(|s| s.schema.find_user_table(&name).cloned())
+        {
+            autoinc_counter(ctx, db_id, &tbl)?;
         }
     }
-    if rowid > 0 {
-        let new_rid = bt.next_rowid(seq_tbl.root_pgno)?;
+    let counters = std::mem::take(&mut ctx.stmt_tx.autoinc);
+    for c in counters {
+        // `OP_Le memId+2, .., memId`: nothing to store when the counter did not grow — but
+        // without a `sqlite_sequence` row `memId+2` is NULL and the comparison never skips.
+        if c.cur <= c.orig && c.seq_rowid.is_some() {
+            continue;
+        }
+        // (the statement's program opened a write transaction on this database whatever its
+        // rows did: `OP_Transaction` with P2=1)
+        ctx.ensure_write_db(c.db_id, false)?;
+        let Some(slot) = ctx.db_set.slot_mut(c.db_id) else {
+            continue;
+        };
+        let Some(seq_tbl) = slot.schema.find_user_table("sqlite_sequence").cloned() else {
+            continue;
+        };
+        let Some(ref mut bt) = slot.btree else {
+            continue;
+        };
+        let enc = bt.encoding();
         let rec = encode_record_with_encoding(
-            &[Value::Text(tbl_name.to_owned()), Value::Integer(rowid)],
+            &[Value::Text(c.table_name.clone()), Value::Integer(c.cur)],
             enc,
         );
-        bt.insert_table(seq_tbl.root_pgno, new_rid, &rec)?;
+        let rid = match c.seq_rowid {
+            Some(r) => r,
+            None => bt.next_rowid(seq_tbl.root_pgno)?,
+        };
+        bt.insert_table(seq_tbl.root_pgno, rid, &rec)?;
     }
     Ok(())
 }
@@ -17896,6 +18376,16 @@ fn update_sqlite_sequence(
 // ============================================================================
 // Foreign Key Enforcement & Referential Actions (`sqlite/src/fkey.c`)
 // ============================================================================
+
+/// A RESTRICT action is the trigger step `SELECT RAISE(ABORT, 'FOREIGN KEY constraint failed')`
+/// (fkey.c `fkActionTrigger`): the message of a foreign key failure with the extended code of a
+/// trigger RAISE.
+fn fk_restrict_err() -> SqliteError {
+    SqliteError::constraint(
+        extended::SQLITE_CONSTRAINT_TRIGGER,
+        "FOREIGN KEY constraint failed",
+    )
+}
 
 fn fk_constraint_err() -> SqliteError {
     SqliteError::constraint(
@@ -18107,8 +18597,13 @@ fn register_child_fk_checks(
         return Ok(());
     };
     for fk in &tbl.foreign_keys {
-        let (ptbl, parent_col_idxs) =
-            resolve_fk_parent_cols(&slot_schema, &schema_name, &tbl.name, fk)?;
+        // (A constraint whose parent key cannot be located is reported when the statement is
+        // prepared, for exactly the statements C reports it for; here it is skipped.)
+        let Ok((ptbl, parent_col_idxs)) =
+            resolve_fk_parent_cols(&slot_schema, &schema_name, &tbl.name, fk)
+        else {
+            continue;
+        };
         if fk.from_cols.iter().any(|&ci| written_vals[ci].is_null()) {
             continue;
         }
@@ -18130,6 +18625,65 @@ fn register_child_fk_checks(
                     .stmt_fk_suspects
                     .push((inst_id, tbl.name.clone(), rkey.clone(), fk.id));
             }
+        }
+    }
+    Ok(())
+}
+
+/// The immediate form of the child-side foreign key check of an INSERT (see
+/// `StmtTxTracker::insert_fk_halts_immediately`): each non-deferred constraint of `tbl` whose
+/// child key is not NULL needs its parent row now. A row that references itself (the parent
+/// key columns of the new row equal its child key) is fine, as in `fkLookupParent`.
+fn check_insert_fk_immediately(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    rowid: i64,
+    new_vals: &[Value],
+) -> Result<()> {
+    let Some((schema_name, slot_schema)) = ctx
+        .db_set
+        .slot(db_id)
+        .map(|s| (s.name.clone(), s.schema.clone()))
+    else {
+        return Ok(());
+    };
+    let (enc, _) = slot_encoding_and_name(ctx, db_id);
+    for fk in &tbl.foreign_keys {
+        if fk.deferred {
+            continue;
+        }
+        // (A constraint whose parent key cannot be located is reported when the statement is
+        // prepared, for exactly the statements C reports it for; here it is skipped.)
+        let Ok((ptbl, parent_col_idxs)) =
+            resolve_fk_parent_cols(&slot_schema, &schema_name, &tbl.name, fk)
+        else {
+            continue;
+        };
+        if fk.from_cols.iter().any(|&ci| new_vals[ci].is_null()) {
+            continue;
+        }
+        if ptbl.name.eq_ignore_ascii_case(&tbl.name) {
+            // self-reference: compare the child key with the new row's own parent key
+            let same = fk.from_cols.iter().zip(parent_col_idxs.iter()).all(|(&ci, &pi)| {
+                // (a parent column index past the columns stands for the rowid)
+                let (pv, coll, aff) = match tbl.columns.get(pi) {
+                    Some(pc) if tbl.rowid_alias_col == Some(pi) => {
+                        (Value::Integer(rowid), pc.collation, TypeAffinity::Integer)
+                    }
+                    Some(pc) => (new_vals[pi].clone(), pc.collation, pc.affinity),
+                    None => (Value::Integer(rowid), Collation::Binary, TypeAffinity::Integer),
+                };
+                let cv = aff.apply(new_vals[ci].clone());
+                cv.cmp_sqlite_with_encoding(&pv, coll, enc) == Ordering::Equal
+            });
+            if same {
+                continue;
+            }
+        }
+        if !parent_row_exists_for_fk(ctx, db_id, &ptbl, &parent_col_idxs, new_vals, &fk.from_cols)?
+        {
+            return Err(fk_constraint_err());
         }
     }
     Ok(())
@@ -18157,8 +18711,13 @@ fn verify_fk_suspects(
             continue;
         };
         let cvals = decode_table_logical_row(ctx, db_id, &ctbl, ckey, &cpayload, &[])?;
-        let (ptbl, parent_col_idxs) =
-            resolve_fk_parent_cols(&slot_schema, &schema_name, &ctbl.name, &fk)?;
+        // (A constraint whose parent key cannot be located is reported when the statement is
+        // prepared, for exactly the statements C reports it for; here it is skipped.)
+        let Ok((ptbl, parent_col_idxs)) =
+            resolve_fk_parent_cols(&slot_schema, &schema_name, &ctbl.name, &fk)
+        else {
+            continue;
+        };
         if !parent_row_exists_for_fk(ctx, db_id, &ptbl, &parent_col_idxs, &cvals, &fk.from_cols)? {
             return Err(fk_constraint_err());
         }
@@ -18199,8 +18758,12 @@ fn check_parent_delete_restrict(
     };
     let (enc, _) = slot_encoding_and_name(ctx, db_id);
     for (ctbl, fk) in refs {
-        let (_, parent_col_idxs) =
-            resolve_fk_parent_cols(&slot_schema, &schema_name, &ctbl.name, &fk)?;
+        // (reported at prepare time where C reports it; skipped here)
+        let Ok((_, parent_col_idxs)) =
+            resolve_fk_parent_cols(&slot_schema, &schema_name, &ctbl.name, &fk)
+        else {
+            continue;
+        };
         if fk.on_delete != FkAction::Restrict {
             continue;
         }
@@ -18221,7 +18784,7 @@ fn check_parent_delete_restrict(
                 &fk.from_cols,
                 enc,
             ) {
-                return Err(fk_constraint_err());
+                return Err(fk_restrict_err());
             }
         }
     }
@@ -18267,8 +18830,12 @@ fn check_parent_update_restrict(
     };
     let (enc, _) = slot_encoding_and_name(ctx, db_id);
     for (ctbl, fk) in refs {
-        let (_, parent_col_idxs) =
-            resolve_fk_parent_cols(&slot_schema, &schema_name, &ctbl.name, &fk)?;
+        // (reported at prepare time where C reports it; skipped here)
+        let Ok((_, parent_col_idxs)) =
+            resolve_fk_parent_cols(&slot_schema, &schema_name, &ctbl.name, &fk)
+        else {
+            continue;
+        };
         if !parent_key_changed(
             ptbl,
             &parent_col_idxs,
@@ -18298,7 +18865,7 @@ fn check_parent_update_restrict(
                 &fk.from_cols,
                 enc,
             ) {
-                return Err(fk_constraint_err());
+                return Err(fk_restrict_err());
             }
         }
     }
@@ -18368,8 +18935,12 @@ fn apply_parent_delete_fk_actions(
     let (enc, _) = slot_encoding_and_name(ctx, db_id);
 
     for (ctbl, fk) in refs {
-        let (_, parent_col_idxs) =
-            resolve_fk_parent_cols(&slot_schema, &schema_name, &ctbl.name, &fk)?;
+        // (reported at prepare time where C reports it; skipped here)
+        let Ok((_, parent_col_idxs)) =
+            resolve_fk_parent_cols(&slot_schema, &schema_name, &ctbl.name, &fk)
+        else {
+            continue;
+        };
         if parent_col_idxs
             .iter()
             .any(|&pi| old_parent_vals[pi].is_null())
@@ -18633,8 +19204,12 @@ fn apply_parent_update_fk_actions(
     let (enc, _) = slot_encoding_and_name(ctx, db_id);
 
     for (ctbl, fk) in refs {
-        let (_, parent_col_idxs) =
-            resolve_fk_parent_cols(&slot_schema, &schema_name, &ctbl.name, &fk)?;
+        // (reported at prepare time where C reports it; skipped here)
+        let Ok((_, parent_col_idxs)) =
+            resolve_fk_parent_cols(&slot_schema, &schema_name, &ctbl.name, &fk)
+        else {
+            continue;
+        };
         if !parent_key_changed(
             ptbl,
             &parent_col_idxs,
@@ -18899,6 +19474,7 @@ fn resolve_dml_target_in_set(
     is_upsert: bool,
     event_kind: TriggerEventKind,
     modified_cols: Option<&[&str]>,
+    has_returning: bool,
 ) -> Result<DmlTarget> {
     if let Some(cat_db_id) = db_set.resolve_catalog_table(qn)? {
         if !writable_schema {
@@ -18946,6 +19522,11 @@ fn resolve_dml_target_in_set(
                 if is_upsert {
                     return Err(SqliteError::new(ErrorCode::Error, "cannot UPSERT a view"));
                 }
+                // delete.c `sqlite3IsReadOnly`: a view cannot be modified when
+                // `pTrigger==0 || (pTrigger->bReturning && pTrigger->pNext==0)`. RETURNING is
+                // itself a trigger, so with a RETURNING clause the statement is accepted as
+                // soon as the view has any other trigger — also one for a different event (the
+                // statement then changes nothing and only returns the rows).
                 if !db_set
                     .matching_triggers(
                         db_id,
@@ -18955,6 +19536,7 @@ fn resolve_dml_target_in_set(
                         modified_cols,
                     )
                     .is_empty()
+                    || (has_returning && !db_set.triggers_for_relation(db_id, &v.name).is_empty())
                 {
                     return Ok(DmlTarget::View {
                         db_id,
@@ -20109,6 +20691,10 @@ fn prepare_proposed_insert_row(
         };
         if final_rowid.is_none() {
             final_rowid = Some(allocate_table_rowid(ctx, db_id, tbl)?);
+        } else if tbl.autoincrement
+            && let Some(r) = final_rowid
+        {
+            autoinc_note_rowid(ctx, db_id, tbl, r)?;
         }
         final_rowid.unwrap()
     };
@@ -20116,14 +20702,9 @@ fn prepare_proposed_insert_row(
     apply_table_affinities_and_generated(ctx, tbl, schema_name, rowid, &mut raw_vals, params)?;
 
     if tbl.strict {
-        let eff = stmt_conflict.unwrap_or(ConflictAction::Abort);
+        // `OP_TypeCheck` raises its error itself: no conflict clause applies (always ABORT).
         for (i, col) in tbl.columns.iter().enumerate() {
-            if let Err(err) = check_strict_column_type(&tbl.name, col, &raw_vals[i]) {
-                if eff == ConflictAction::Ignore {
-                    return Ok(None);
-                }
-                return Err(err.with_conflict_effect(conflict_action_to_effect(eff)));
-            }
+            check_strict_column_type(&tbl.name, col, &raw_vals[i])?;
         }
     }
 
@@ -20312,7 +20893,7 @@ fn expr_mentions_implicit_rowid(expr: &Expr, tbl: &TableSchema) -> bool {
 
 /// Whether `expr` mentions a column for which `pred` holds (the expression forms a CHECK
 /// constraint, a partial-index WHERE clause or an indexed expression can take).
-fn expr_mentions_column(expr: &Expr, pred: &dyn Fn(&ColumnRef) -> bool) -> bool {
+pub(crate) fn expr_mentions_column(expr: &Expr, pred: &dyn Fn(&ColumnRef) -> bool) -> bool {
     match expr {
         Expr::Column(cref) => pred(cref),
         Expr::Unary { expr: e, .. }
@@ -20724,6 +21305,8 @@ fn finalize_dml_step_result(
         let suspects = std::mem::take(&mut ctx.stmt_tx.stmt_fk_suspects);
         match step_res {
             Ok(mut out) => {
+                // `sqlite3AutoincrementEnd` is the last thing the statement's program does.
+                autoinc_end(ctx)?;
                 if *ctx.foreign_keys && !suspects.is_empty() {
                     verify_fk_suspects(ctx, &suspects)?;
                 }
@@ -21001,6 +21584,7 @@ fn prepare_insert_exec<'a>(
         !ins.upsert_clauses.is_empty(),
         TriggerEventKind::Insert,
         None,
+        !ins.returning.is_empty(),
     )?;
     let dml_ctes = CteStore::default().with_scope_at(&ins.ctes, outer_scopes.len());
 
@@ -21973,6 +22557,7 @@ fn execute_upsert_table_insert_row(
                                 p.is_catalog,
                                 false,
                                 true,
+                                None,
                                 params,
                                 &mut did_replace_delete,
                                 &mut did_replace_trigger,
@@ -22025,6 +22610,7 @@ fn execute_upsert_table_insert_row(
                                     p.is_catalog,
                                     false,
                                     false,
+                                    None,
                                     params,
                                     &mut did_replace_delete,
                                     &mut did_replace_trigger,
@@ -22117,6 +22703,7 @@ fn execute_upsert_table_insert_row(
                                         p.is_catalog,
                                         false,
                                         false,
+                                        None,
                                         params,
                                         &mut did_replace_delete,
                                         &mut did_replace_trigger,
@@ -22253,6 +22840,14 @@ fn execute_upsert_table_insert_row(
         )?;
     }
 
+    if ctx.stmt_tx.insert_fk_halts_immediately
+        && ctx.stmt_tx.subprogram_stack.is_empty()
+        && *ctx.foreign_keys
+        && !p.tbl.foreign_keys.is_empty()
+    {
+        check_insert_fk_immediately(ctx, p.db_id, &p.tbl, rowid, &raw_vals)?;
+    }
+
     check_table_not_pinned(ctx, p.db_id, p.tbl.root_pgno)?;
     let real_as_int = p.tbl.has_real_col()
         && real_cols_stored_as_int_on_insert(
@@ -22328,9 +22923,6 @@ fn execute_upsert_table_insert_row(
         } else {
             bt.insert_table(p.tbl.root_pgno, rowid, &phys_rec)?;
         }
-    }
-    if p.tbl.autoincrement {
-        update_sqlite_sequence(ctx, p.db_id, &p.tbl.name, rowid)?;
     }
     if let Some(slot) = ctx.db_set.slot(p.db_id)
         && let Some(ref bt) = slot.btree
@@ -23107,6 +23699,29 @@ fn try_exec_fast_vtab_insert(
     }))
 }
 
+/// See `StmtTxTracker::insert_fk_halts_immediately`. (A function of its own: trigger programs
+/// recurse through `exec_insert_internal`, whose frame must stay small.)
+#[inline(never)]
+fn decide_insert_fk_halts_immediately(ctx: &mut ExecContext<'_>, ins: &InsertStmt) {
+    if matches!(&ins.source, InsertSource::Values(rows) if rows.len() == 1)
+        && ins.returning.is_empty()
+        && ctx
+            .db_set
+            .find_table_in_set(&ins.table)
+            .ok()
+            .flatten()
+            .is_some_and(|(_, t)| t.foreign_keys.iter().any(|fk| !fk.deferred))
+    {
+        let flags = crate::dml_c::dml_insert_flags(
+            ctx.db_set,
+            ins,
+            *ctx.foreign_keys,
+            *ctx.recursive_triggers,
+        );
+        ctx.stmt_tx.insert_fk_halts_immediately = !flags.multi_write;
+    }
+}
+
 #[inline(never)]
 fn exec_insert_internal(
     ctx: &mut ExecContext<'_>,
@@ -23152,6 +23767,10 @@ fn exec_insert_internal(
                 );
             }
         }
+    }
+
+    if is_top_level && *ctx.foreign_keys {
+        decide_insert_fk_halts_immediately(ctx, ins);
     }
 
     let step_res = match prepare_insert_exec(ctx, ins, effective_or_conflict, params, outer_scopes)
@@ -23301,6 +23920,7 @@ enum PreparedUpdate<'a> {
 fn prepare_update_exec<'a>(
     ctx: &mut ExecContext<'_>,
     upd: &'a UpdateStmt,
+    effective_or_conflict: Option<ConflictAction>,
     params: &[Value],
     outer_scopes: &[EvalRow],
 ) -> Result<PreparedUpdate<'a>> {
@@ -23312,6 +23932,7 @@ fn prepare_update_exec<'a>(
         false,
         TriggerEventKind::Update,
         Some(&mod_col_names),
+        !upd.returning.is_empty(),
     )?;
     let dml_ctes = CteStore::default().with_scope_at(&upd.ctes, outer_scopes.len());
     let has_set_agg = upd.from.is_some()
@@ -23658,7 +24279,7 @@ fn prepare_update_exec<'a>(
             } else {
                 None
             };
-            let candidates = read_table_with_plan(
+            let (candidates, scan) = read_table_with_plan_scan(
                 ctx,
                 db_id,
                 &tbl,
@@ -23669,6 +24290,82 @@ fn prepare_update_exec<'a>(
                 outer_scopes,
                 &dml_ctes,
             )?;
+            // update.c: the pass strategy (`eOnePass`) of a plain UPDATE.
+            let one_pass = if upd.from.is_some() {
+                crate::dml_c::OnePass::Off
+            } else {
+                let chng_rowid = resolved_assigns.iter().any(|(cols, _, _)| {
+                    cols.iter()
+                        .any(|&ci| ci == usize::MAX || tbl.rowid_alias_col == Some(ci))
+                });
+                let chng_pk = tbl.without_rowid
+                    && tbl
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .any(|(ci, c)| c.is_primary_key && modified_col_mask[ci]);
+                let with_generated = modified_cols_with_generated(&tbl, &modified_col_mask);
+                let has_fk = if is_catalog {
+                    0
+                } else {
+                    crate::dml_c::fk_required_update(
+                        ctx.db_set,
+                        db_id,
+                        &tbl,
+                        *ctx.foreign_keys,
+                        &with_generated,
+                        chng_rowid,
+                    )
+                };
+                let mod_names = collect_set_assignment_col_names(&upd.assignments);
+                let has_trigger = !upd.returning.is_empty()
+                    || (!is_catalog
+                        && ctx.db_set.has_active_triggers_for_event(
+                            db_id,
+                            &tbl.name,
+                            TriggerEventKind::Update,
+                            Some(&mod_names),
+                        ));
+                let eff_conf = effective_or_conflict.or(upd.or_conflict);
+                let rewrites = |idx: &IndexSchema| {
+                    chng_rowid
+                        || chng_pk
+                        || has_fk > 1
+                        || update_rewrites_index(&tbl, idx, &with_generated, chng_rowid, false)
+                };
+                // bReplace: OR REPLACE, or a rewritten UNIQUE index declared ON CONFLICT REPLACE.
+                let b_replace = eff_conf == Some(ConflictAction::Replace)
+                    || (eff_conf.is_none()
+                        && indexes.iter().any(|idx| {
+                            idx.unique && idx.conflict == ConflictAction::Replace && rewrites(idx)
+                        }));
+                let multirow_ok = !has_trigger
+                    && has_fk == 0
+                    && !chng_rowid
+                    && !chng_pk
+                    && !b_replace
+                    && !upd
+                        .selection
+                        .as_ref()
+                        .is_some_and(crate::dml_c::expr_has_subquery);
+                let scan_index_rewritten = scan.index_root.is_some_and(|root| {
+                    indexes
+                        .iter()
+                        .any(|idx| idx.root_pgno == root && rewrites(idx))
+                });
+                crate::dml_c::update_one_pass(scan, multirow_ok, scan_index_rewritten)
+            };
+            if ctx.stmt_tx.subprogram_stack.is_empty() {
+                sqliters_types::dtrace!(
+                    "TR|dml|update|tbl={} o={}",
+                    tbl.name,
+                    if upd.from.is_some() {
+                        "from-ephemeral"
+                    } else {
+                        one_pass.as_str()
+                    }
+                );
+            }
 
             let rows = if let Some(ref from_rows) = from_rows_opt {
                 if has_set_agg {
@@ -23870,6 +24567,11 @@ fn prepare_update_exec<'a>(
                         }
                     }
                     keys.push(old_key);
+                }
+                if one_pass == crate::dml_c::OnePass::Off {
+                    // Two passes: the ephemeral table keyed by rowid (or by the PRIMARY KEY of a
+                    // WITHOUT ROWID table) is read back in key order.
+                    sort_table_keys_in_tree_order(&tbl, &mut keys, enc);
                 }
                 PreparedTableUpdateRows::PlainKeys(keys)
             };
@@ -24217,6 +24919,16 @@ fn run_table_update_loop(
         }
         PreparedTableUpdateRows::PlainKeys(keys) => {
             let keys = keys.into_boxed_slice();
+            // (see `StmtTxTracker::once_subqueries`; an enclosing statement's entries are kept)
+            let once_base = ctx.stmt_tx.once_subqueries.len();
+            for sa in &upd.assignments {
+                crate::dml_c::collect_uncorrelated_scalar_subqueries(
+                    ctx.db_set,
+                    &sa.expr,
+                    &mut ctx.stmt_tx.once_subqueries,
+                );
+            }
+            let _ = once_base; // (dropped again by `exec_update_internal`, on every exit)
             for old_key in keys.iter() {
                 ctx.step_tick()?;
                 let Some((old_vals, new_rowid_opt, new_vals)) =
@@ -24263,6 +24975,22 @@ fn run_table_update_loop(
     })
 }
 
+/// update.c: `if( tmask&TRIGGER_BEFORE ){ sqlite3TableAffinity(v, pTab, regNew); ...` — an
+/// INSTEAD OF trigger is a BEFORE trigger, so the NEW row of an UPDATE on a view gets the
+/// affinities of the view's columns before the triggers see it. (An INSERT on a view does not:
+/// insert.c guards the same call with `!isView`.)
+fn apply_view_col_affinities(
+    col_specs: &[(String, Collation, Option<TypeAffinity>)],
+    new_vals: &mut [Value],
+) {
+    for (v, (_, _, aff)) in new_vals.iter_mut().zip(col_specs.iter()) {
+        if let Some(a) = aff {
+            let taken = std::mem::replace(v, Value::Null);
+            *v = a.apply(taken);
+        }
+    }
+}
+
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn run_view_update_loop(
@@ -24282,8 +25010,9 @@ fn run_view_update_loop(
     let mut ret_rows = Vec::new();
     match rows {
         PreparedViewUpdateRows::Precomputed(pairs) => {
-            for (old_vals, new_vals) in pairs {
+            for (old_vals, mut new_vals) in pairs {
                 ctx.step_tick()?;
+                apply_view_col_affinities(&p.col_specs, &mut new_vals);
                 let pscope =
                     make_runtime_view_pseudo_scope(&p.col_specs, Some(&old_vals), Some(&new_vals));
                 drop(old_vals);
@@ -24319,6 +25048,16 @@ fn run_view_update_loop(
             }
         }
         PreparedViewUpdateRows::PlainOldRows(old_rows) => {
+            // (`OP_Once`: see `StmtTxTracker::once_subqueries`.)
+            let once_base = ctx.stmt_tx.once_subqueries.len();
+            for sa in &upd.assignments {
+                crate::dml_c::collect_uncorrelated_scalar_subqueries(
+                    ctx.db_set,
+                    &sa.expr,
+                    &mut ctx.stmt_tx.once_subqueries,
+                );
+            }
+            let _ = once_base; // (dropped again by `exec_update_internal`, on every exit)
             for old_vals in old_rows {
                 ctx.step_tick()?;
                 let new_vals = {
@@ -24342,6 +25081,8 @@ fn run_view_update_loop(
                         params,
                     )?
                 };
+                let mut new_vals = new_vals;
+                apply_view_col_affinities(&p.col_specs, &mut new_vals);
                 let pscope =
                     make_runtime_view_pseudo_scope(&p.col_specs, Some(&old_vals), Some(&new_vals));
                 drop(old_vals);
@@ -24621,7 +25362,8 @@ fn exec_update_internal(
     let mut count_changes_rows: u64 = 0;
     let mod_col_names = collect_set_assignment_col_names(&upd.assignments).into_boxed_slice();
 
-    let step_res = match prepare_update_exec(ctx, upd, params, outer_scopes) {
+    let once_base = ctx.stmt_tx.once_subqueries.len();
+    let step_res = match prepare_update_exec(ctx, upd, effective_or_conflict, params, outer_scopes) {
         Ok(PreparedUpdate::Table(p)) => run_table_update_loop(
             ctx,
             p,
@@ -24654,6 +25396,8 @@ fn exec_update_internal(
         ),
         Err(e) => Err(e),
     };
+    // (`OP_Once` values live for one execution of the statement.)
+    ctx.stmt_tx.once_subqueries.truncate(once_base);
 
     finalize_dml_step_result(
         ctx,
@@ -24678,6 +25422,8 @@ struct PreparedTableDelete {
     is_catalog: bool,
     dml_ctes: CteStore,
     target_keys: Vec<TableRowKey>,
+    /// Root of the secondary index a one-pass DELETE scans (`aiCurOnePass[1]`), if any.
+    scan_index_root: Option<Pgno>,
     ret_col_names: Vec<String>,
     ret_expanded: Vec<(Expr, String, Option<String>)>,
 }
@@ -24717,6 +25463,7 @@ fn prepare_delete_exec(
         false,
         TriggerEventKind::Delete,
         None,
+        !del.returning.is_empty(),
     )?;
     let dml_ctes = CteStore::default().with_scope_at(&del.ctes, outer_scopes.len());
 
@@ -24797,15 +25544,28 @@ fn prepare_delete_exec(
                     None,
                 );
 
-            // Truncate optimization (`OP_Clear`, `delete.c:455-510`) is ONLY allowed when there is
-            // NO `WHERE`, NO `RETURNING`, NO `INDEXED BY`, NO active `DELETE` triggers, and NO FKs!
-            if !is_catalog
-                && del.selection.is_none()
-                && del.returning.is_empty()
-                && !*ctx.foreign_keys
-                && !has_del_triggers
-                && del.indexed_by.is_none()
+            // delete.c: `bComplex = pTrigger || sqlite3FkRequired(pParse, pTab, 0, 0)` (RETURNING
+            // is a trigger); a sub-query in the WHERE clause is added below.
+            let fk_required = !is_catalog
+                && crate::dml_c::fk_required_delete(ctx.db_set, db_id, &tbl, *ctx.foreign_keys);
+            let mut b_complex = has_del_triggers || !del.returning.is_empty() || fk_required;
+            if let Some(IndexHint::IndexedBy(ref idx_name)) = del.indexed_by
+                && !indexes
+                    .iter()
+                    .any(|i| !i.is_autoindex && i.name.eq_ignore_ascii_case(idx_name))
             {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    format!("no such index: {idx_name}"),
+                ));
+            }
+
+            // Truncate optimization (`OP_Clear`, delete.c:455-510): `rcauth==SQLITE_OK &&
+            // pWhere==0 && !bComplex && !IsVirtual(pTab)`.
+            if !is_catalog && del.selection.is_none() && !b_complex {
+                if ctx.stmt_tx.subprogram_stack.is_empty() {
+                    sqliters_types::dtrace!("TR|dml|delete|tbl={} o=truncate", tbl.name);
+                }
                 check_table_not_pinned(ctx, db_id, tbl.root_pgno)?;
                 // `OP_Clear` counts the rows while it frees the pages (`pnChange`).
                 let mut count = 0u64;
@@ -24825,7 +25585,7 @@ fn prepare_delete_exec(
                 return Ok(PreparedDelete::TruncateCleared(count));
             }
 
-            let candidates = read_table_with_plan(
+            let (candidates, scan) = read_table_with_plan_scan(
                 ctx,
                 db_id,
                 &tbl,
@@ -24836,6 +25596,25 @@ fn prepare_delete_exec(
                 outer_scopes,
                 &dml_ctes,
             )?;
+            if del
+                .selection
+                .as_ref()
+                .is_some_and(crate::dml_c::expr_has_subquery)
+            {
+                b_complex = true;
+            }
+            let one_pass = crate::dml_c::delete_one_pass(scan, b_complex);
+            if ctx.stmt_tx.subprogram_stack.is_empty() {
+                sqliters_types::dtrace!(
+                "TR|dml|delete|tbl={} o={}",
+                tbl.name,
+                match one_pass {
+                    crate::dml_c::OnePass::Off if tbl.without_rowid => "two-pass-ephemeral",
+                    crate::dml_c::OnePass::Off => "two-pass-rowset",
+                    other => other.as_str(),
+                }
+                );
+            }
 
             let mut target_keys = Vec::new();
             for (rkey, payload) in candidates {
@@ -24858,6 +25637,18 @@ fn prepare_delete_exec(
                 }
                 target_keys.push(rkey);
             }
+            if one_pass == crate::dml_c::OnePass::Off {
+                // Two passes: the RowSet (`OP_RowSetRead`) hands the rowids back in ascending
+                // order, the ephemeral table of a WITHOUT ROWID table in PRIMARY KEY order.
+                sort_table_keys_in_tree_order(&tbl, &mut target_keys, slot_encoding_and_name(ctx, db_id).0);
+            }
+            // `aiCurOnePass[1]`: in a one-pass DELETE the entry of the index the scan runs on is
+            // deleted last, after the table row (`iIdxNoSeek` in sqlite3GenerateRowDelete).
+            let scan_index_root = if one_pass == crate::dml_c::OnePass::Off {
+                None
+            } else {
+                scan.index_root
+            };
 
             let sample_scope =
                 make_returning_table_scope(&tbl, 0, &vec![Value::Null; tbl.columns.len()]);
@@ -24874,6 +25665,7 @@ fn prepare_delete_exec(
                 is_catalog,
                 dml_ctes,
                 target_keys,
+                scan_index_root,
                 ret_col_names,
                 ret_expanded,
             })))
@@ -24993,7 +25785,8 @@ fn delete_table_row_and_build_after_scope(
     if *ctx.foreign_keys {
         check_parent_delete_restrict(ctx, p.db_id, &p.tbl, &cur_old_vals, params)?;
     }
-    if !delete_row_via_pipeline(
+    ctx.stmt_tx.delete_idx_no_seek = p.scan_index_root;
+    let deleted = delete_row_via_pipeline(
         ctx,
         p.db_id,
         &p.tbl,
@@ -25004,7 +25797,9 @@ fn delete_table_row_and_build_after_scope(
         ConflictAction::Abort,
         p.is_catalog,
         params,
-    )? {
+    );
+    ctx.stmt_tx.delete_idx_no_seek = None;
+    if !deleted? {
         return Ok(None);
     }
     *stmt_changes += 1;
@@ -40382,6 +41177,120 @@ fn validate_matching_triggers_static(
 
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
+/// `sqlite3FkCheck` at code generation: every foreign key the statement has to check needs its
+/// parent table and the parent's UNIQUE index (`sqlite3FkLocateIndex`). A missing one is a
+/// compile error ("foreign key mismatch - ...", "no such table: ..."), i.e. raised by
+/// `sqlite3_prepare`, not by `sqlite3_step`.
+///
+/// `update`: the modified-column mask and `chngRowid` of an UPDATE (only constraints whose
+/// child or parent key is modified are checked). `insert_one_row`: a top-level INSERT with
+/// `isMultiWrite == 0` skips the immediate constraints that reference the table ("inserting a
+/// single row into a parent table cannot cause (or fix) an immediate foreign key violation").
+fn validate_fk_check_static(
+    db_set: &DatabaseSet,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    foreign_keys: bool,
+    update: Option<(&[bool], bool)>,
+    insert_one_row: bool,
+) -> Result<()> {
+    if !foreign_keys {
+        return Ok(());
+    }
+    let Some(slot) = db_set.slot(db_id).filter(|s| s.btree.is_some()) else {
+        return Ok(());
+    };
+    // (`pTab->u.tab.pFKey` and the `sqlite3FkReferences` chain both hold the constraint declared
+    // last first.)
+    for fk in tbl.foreign_keys.iter().rev() {
+        if let Some((modified, chng_rowid)) = update
+            && !fk.ref_table.eq_ignore_ascii_case(&tbl.name)
+            && !crate::dml_c::fk_child_is_modified(tbl, fk, modified, chng_rowid)
+        {
+            continue;
+        }
+        resolve_fk_parent_cols(&slot.schema, &slot.name, &tbl.name, fk)?;
+    }
+    for ctbl in slot.schema.tables.iter().rev() {
+        for fk in ctbl.foreign_keys.iter().rev() {
+            if !fk.ref_table.eq_ignore_ascii_case(&tbl.name) {
+                continue;
+            }
+            if let Some((modified, chng_rowid)) = update {
+                let changed = |ci: usize| -> bool {
+                    modified.get(ci).copied().unwrap_or(false)
+                        || (chng_rowid && tbl.rowid_alias_col == Some(ci))
+                };
+                if !crate::dml_c::fk_parent_is_modified(tbl, fk, &changed) {
+                    continue;
+                }
+            }
+            if insert_one_row && !fk.deferred {
+                continue;
+            }
+            resolve_fk_parent_cols(&slot.schema, &slot.name, &ctbl.name, fk)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `sqlite3GenerateConstraintChecks` codes a REPLACE row delete for this UPDATE: a
+/// rowid change resolved by REPLACE, or a UNIQUE index the statement rewrites (`aRegIdx != 0`)
+/// whose conflicts are resolved by REPLACE.
+fn update_codes_replace_delete(
+    db_set: &DatabaseSet,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    indexes: &[IndexSchema],
+    upd: &UpdateStmt,
+    foreign_keys: bool,
+    orconf: Option<ConflictAction>,
+) -> bool {
+    let mut modified = vec![false; tbl.columns.len()];
+    let mut chng_rowid = false;
+    for name in collect_set_assignment_col_names(&upd.assignments) {
+        match tbl.find_column(name) {
+            Some((ci, _)) => {
+                modified[ci] = true;
+                if tbl.rowid_alias_col == Some(ci) {
+                    chng_rowid = true;
+                }
+            }
+            None => chng_rowid |= !tbl.without_rowid && tbl.is_implicit_rowid_name(name),
+        }
+    }
+    let modified = modified_cols_with_generated(tbl, &modified);
+    let chng_pk = tbl.without_rowid
+        && tbl
+            .columns
+            .iter()
+            .enumerate()
+            .any(|(ci, c)| c.is_primary_key && modified[ci]);
+    let has_fk =
+        crate::dml_c::fk_required_update(db_set, db_id, tbl, foreign_keys, &modified, chng_rowid);
+    if chng_rowid
+        && !tbl.without_rowid
+        && orconf.unwrap_or(tbl.rowid_pk_conflict) == ConflictAction::Replace
+    {
+        return true;
+    }
+    if tbl.without_rowid
+        && chng_pk
+        && orconf.unwrap_or(tbl.without_rowid_pk_conflict) == ConflictAction::Replace
+    {
+        return true;
+    }
+    indexes.iter().any(|idx| {
+        idx.unique
+            && !(tbl.without_rowid && idx.root_pgno == tbl.root_pgno)
+            && orconf.unwrap_or(idx.conflict) == ConflictAction::Replace
+            && (chng_rowid
+                || chng_pk
+                || has_fk > 1
+                || update_rewrites_index(tbl, idx, &modified, chng_rowid, false))
+    })
+}
+
 fn validate_fk_actions_triggers_static(
     db_id: DatabaseId,
     ptbl_name: &str,
@@ -40425,6 +41334,9 @@ fn validate_fk_actions_triggers_static(
         match action {
             FkAction::NoAction | FkAction::Restrict => {}
             FkAction::Cascade if is_delete => {
+                // The action is `DELETE FROM child WHERE ..`: coded like any DELETE, with its
+                // own `sqlite3FkCheck`.
+                validate_fk_check_static(db_set, db_id, &ctbl, foreign_keys, None, false)?;
                 if trig_depth >= db_set.trigger_depth_limit() {
                     return Err(SqliteError::new(
                         ErrorCode::Error,
@@ -40453,6 +41365,28 @@ fn validate_fk_actions_triggers_static(
                 }
             }
             FkAction::Cascade | FkAction::SetNull | FkAction::SetDefault => {
+                // The action is `UPDATE child SET <child key> = ..`: its `sqlite3FkCheck` sees
+                // the child key columns as modified.
+                {
+                    let mut modified = vec![false; ctbl.columns.len()];
+                    for &ci in &fk.from_cols {
+                        if let Some(m) = modified.get_mut(ci) {
+                            *m = true;
+                        }
+                    }
+                    let chng_rowid = fk
+                        .from_cols
+                        .iter()
+                        .any(|&ci| ctbl.rowid_alias_col == Some(ci));
+                    validate_fk_check_static(
+                        db_set,
+                        db_id,
+                        &ctbl,
+                        foreign_keys,
+                        Some((&modified, chng_rowid)),
+                        false,
+                    )?;
+                }
                 if trig_depth >= db_set.trigger_depth_limit() {
                     return Err(SqliteError::new(
                         ErrorCode::Error,
@@ -40532,6 +41466,7 @@ fn validate_insert_static_inner(
         !ins.upsert_clauses.is_empty(),
         TriggerEventKind::Insert,
         None,
+        !ins.returning.is_empty(),
     )?;
     let dml_ctes = CteStore::default().with_scope_at(&ins.ctes, outer_scopes.len());
     let mut visited = Vec::new();
@@ -40878,6 +41813,9 @@ fn validate_insert_static_inner(
                 }
 
                 if table_may_use_replace(&tbl, &indexes, effective_or_conflict) {
+                    // (REPLACE conflict handling is `sqlite3GenerateRowDelete`, which codes the
+                    // `sqlite3FkCheck` of a DELETE.)
+                    validate_fk_check_static(db_set, db_id, &tbl, foreign_keys, None, false)?;
                     if recursive_triggers {
                         for tm in [TriggerTiming::Before, TriggerTiming::After] {
                             validate_matching_triggers_static(
@@ -40914,6 +41852,14 @@ fn validate_insert_static_inner(
                         trig_depth,
                     )?;
                 }
+            }
+
+            if !is_catalog {
+                let one_row = trig_depth == 0
+                    && foreign_keys
+                    && !crate::dml_c::dml_insert_flags(db_set, ins, foreign_keys, recursive_triggers)
+                        .multi_write;
+                validate_fk_check_static(db_set, db_id, &tbl, foreign_keys, None, one_row)?;
             }
 
             if !ins.returning.is_empty() {
@@ -41090,6 +42036,7 @@ fn validate_update_static_inner(
         false,
         TriggerEventKind::Update,
         Some(&mod_col_names),
+        !upd.returning.is_empty(),
     )?;
     let dml_ctes = CteStore::default().with_scope_at(&upd.ctes, outer_scopes.len());
     let mut visited = Vec::new();
@@ -41350,6 +42297,21 @@ fn validate_update_static_inner(
                 }
 
                 if table_may_use_replace(&tbl, &indexes, effective_or_conflict) {
+                    // (REPLACE conflict handling is `sqlite3GenerateRowDelete`, which codes the
+                    // `sqlite3FkCheck` of a DELETE — for the constraints this UPDATE checks.)
+                    if foreign_keys
+                        && update_codes_replace_delete(
+                            db_set,
+                            db_id,
+                            &tbl,
+                            &indexes,
+                            upd,
+                            foreign_keys,
+                            effective_or_conflict,
+                        )
+                    {
+                        validate_fk_check_static(db_set, db_id, &tbl, foreign_keys, None, false)?;
+                    }
                     if recursive_triggers {
                         for tm in [TriggerTiming::Before, TriggerTiming::After] {
                             validate_matching_triggers_static(
@@ -41399,6 +42361,31 @@ fn validate_update_static_inner(
                     collations,
                     coded_triggers,
                     trig_depth,
+                )?;
+            }
+
+            if !is_catalog && foreign_keys {
+                let mut modified = vec![false; tbl.columns.len()];
+                let mut chng_rowid = false;
+                for name in collect_set_assignment_col_names(&upd.assignments) {
+                    match tbl.find_column(name) {
+                        Some((ci, _)) => {
+                            modified[ci] = true;
+                            if tbl.rowid_alias_col == Some(ci) {
+                                chng_rowid = true;
+                            }
+                        }
+                        None => chng_rowid |= tbl.is_implicit_rowid_name(name),
+                    }
+                }
+                let modified = modified_cols_with_generated(&tbl, &modified);
+                validate_fk_check_static(
+                    db_set,
+                    db_id,
+                    &tbl,
+                    foreign_keys,
+                    Some((&modified, chng_rowid)),
+                    false,
                 )?;
             }
 
@@ -41565,6 +42552,7 @@ fn validate_delete_static_inner(
         false,
         TriggerEventKind::Delete,
         None,
+        !del.returning.is_empty(),
     )?;
     let dml_ctes = CteStore::default().with_scope_at(&del.ctes, outer_scopes.len());
     let mut visited = Vec::new();
@@ -41741,6 +42729,10 @@ fn validate_delete_static_inner(
                     coded_triggers,
                     trig_depth,
                 )?;
+            }
+
+            if !is_catalog {
+                validate_fk_check_static(db_set, db_id, &tbl, foreign_keys, None, false)?;
             }
 
             if !del.returning.is_empty() {

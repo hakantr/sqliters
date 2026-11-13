@@ -6,6 +6,7 @@ pub mod backup;
 pub mod blob;
 pub mod compiler;
 pub mod db_set;
+pub(crate) mod dml_c;
 pub mod driver;
 pub mod engine;
 pub mod execution_context;
@@ -2162,13 +2163,28 @@ impl ConnectionInner {
                         self.publish(shared);
                         return Err(self.poison_with(root_err));
                     }
+                    // `sqlite3VdbeHalt`, commit failed: `p->nChange = 0` (the statement's own
+                    // changes are never added to `nTotalChange`); `lastRowid` and the changes of
+                    // completed trigger steps stay.
+                    if abort_snapshot.is_dml {
+                        sqliters_types::dtrace!(
+                            "TR|stmt|halt|rc={} o=auto-rollback",
+                            (cm_err.code as i32) & 0xff
+                        );
+                        self.runtime.total_changes = self
+                            .runtime
+                            .total_changes
+                            .saturating_sub(self.runtime.last_changes)
+                            .max(abort_snapshot.rt_before.total_changes);
+                    } else {
+                        self.runtime.total_changes = abort_snapshot.rt_before.total_changes;
+                        self.runtime.last_insert_rowid = abort_snapshot.rt_before.last_insert_rowid;
+                    }
                     self.runtime.last_changes = if abort_snapshot.is_dml {
                         0
                     } else {
                         abort_snapshot.rt_before.last_changes
                     };
-                    self.runtime.total_changes = abort_snapshot.rt_before.total_changes;
-                    self.runtime.last_insert_rowid = abort_snapshot.rt_before.last_insert_rowid;
                     self.mutation_pipeline
                         .truncate(abort_snapshot.mutation_len_before);
                     self.deferred_fk_suspects.clear();
@@ -2227,20 +2243,43 @@ impl ConnectionInner {
             return self.poison_with(sim_err);
         }
 
-        // `SQLITE_FULL` in SQLite (`vdbeaux.c` / `btree.c`) rolls back the full transaction
-        // unless handled inside a savepoint? Wait: in `run_write_autocommit` (`engine.rs:2279`),
-        // `ErrorCode::Full` rolls back the full transaction! Check if `err.conflict_effect == Rollback` or `err.code == ErrorCode::Full`!
-        let effective_effect = if err.code == ErrorCode::Full
-            || (snap.stmt_sp_slot == Some(ELIDED_STMT_SP)
-                && matches!(
-                    err.code,
-                    ErrorCode::IoErr | ErrorCode::NoMem | ErrorCode::Corrupt
-                )) {
-            ConflictResolutionEffect::Rollback
-        } else {
-            err.conflict_effect
+        // vdbeaux.c `sqlite3VdbeHalt`, "special errors": SQLITE_IOERR and SQLITE_INTERRUPT of a
+        // write statement roll the whole transaction back; SQLITE_NOMEM and SQLITE_FULL roll
+        // back the statement when it has a statement journal (`p->usesStmtJournal`), else the
+        // whole transaction. Every other error keeps its action (ABORT unless a constraint or
+        // RAISE said FAIL / ROLLBACK); an ABORT without a statement journal rolls nothing back.
+        let has_stmt_journal = snap.stmt_sp_slot.is_some_and(|sp| sp != ELIDED_STMT_SP)
+            && (!self.is_autocommit() || summary.other_writers > 0);
+        let effective_effect = match err.code {
+            ErrorCode::IoErr | ErrorCode::Interrupt => ConflictResolutionEffect::Rollback,
+            ErrorCode::NoMem | ErrorCode::Full => {
+                if has_stmt_journal {
+                    ConflictResolutionEffect::Abort
+                } else {
+                    ConflictResolutionEffect::Rollback
+                }
+            }
+            _ => err.conflict_effect,
         };
 
+        #[allow(unexpected_cfgs)]
+        {
+            #[cfg(sqliters_dtrace)]
+            if snap.is_dml {
+            let auto_only = self.is_autocommit() && summary.other_writers == 0;
+            let o = match effective_effect {
+                ConflictResolutionEffect::Rollback if self.is_autocommit() => "auto-rollback",
+                ConflictResolutionEffect::Rollback => "txn-rollback",
+                ConflictResolutionEffect::Fail if auto_only => "auto-commit-fail",
+                ConflictResolutionEffect::Fail => "fail-keep",
+                _ if auto_only => "auto-rollback",
+                _ if snap.stmt_sp_slot == Some(ELIDED_STMT_SP) => "nothing",
+                _ if snap.stmt_sp_slot.is_some() => "stmt-rollback",
+                _ => "auto-rollback",
+            };
+            sqliters_types::dtrace!("TR|stmt|halt|rc={} o={}", (err.code as i32) & 0xff, o);
+            }
+        }
         match effective_effect {
             ConflictResolutionEffect::Rollback => {
                 let was_autocommit = self.is_autocommit();
@@ -2307,9 +2346,15 @@ impl ConnectionInner {
                 } else {
                     snap.rt_before.last_changes
                 };
-                self.runtime.last_insert_rowid = snap.rt_before.last_insert_rowid;
+                // vdbeaux.c `sqlite3VdbeHalt`: `db->lastRowid` and the `nTotalChange` added by
+                // completed trigger steps are not restored when a DML statement fails.
+                if !snap.is_dml {
+                    self.runtime.last_insert_rowid = snap.rt_before.last_insert_rowid;
+                }
                 if was_autocommit {
-                    self.runtime.total_changes = snap.rt_before.total_changes;
+                    if !snap.is_dml {
+                        self.runtime.total_changes = snap.rt_before.total_changes;
+                    }
                     self.mutation_pipeline.truncate(snap.mutation_len_before);
                 } else {
                     self.mutation_pipeline.clear();
@@ -2439,13 +2484,21 @@ impl ConnectionInner {
                             self.publish(shared);
                             return self.poison_with(root_err);
                         }
+                        if snap.is_dml {
+                            self.runtime.total_changes = self
+                                .runtime
+                                .total_changes
+                                .saturating_sub(self.runtime.last_changes)
+                                .max(snap.rt_before.total_changes);
+                        } else {
+                            self.runtime.total_changes = snap.rt_before.total_changes;
+                            self.runtime.last_insert_rowid = snap.rt_before.last_insert_rowid;
+                        }
                         self.runtime.last_changes = if snap.is_dml {
                             0
                         } else {
                             snap.rt_before.last_changes
                         };
-                        self.runtime.total_changes = snap.rt_before.total_changes;
-                        self.runtime.last_insert_rowid = snap.rt_before.last_insert_rowid;
                         self.mutation_pipeline.truncate(snap.mutation_len_before);
                         self.deferred_fk_suspects.clear();
                         if self.schema_changed_in_tx
@@ -2477,10 +2530,16 @@ impl ConnectionInner {
                 } else {
                     snap.rt_before.last_changes
                 };
-                self.runtime.total_changes = snap.rt_before.total_changes;
-                self.runtime.last_insert_rowid = snap.rt_before.last_insert_rowid;
+                if !snap.is_dml {
+                    self.runtime.total_changes = snap.rt_before.total_changes;
+                    self.runtime.last_insert_rowid = snap.rt_before.last_insert_rowid;
+                }
                 self.mutation_pipeline.truncate(snap.mutation_len_before);
-                self.deferred_fk_suspects = snap.fk_before;
+                if snap.stmt_sp_slot != Some(ELIDED_STMT_SP) {
+                    // (`vdbeCloseStatement` restores `nDeferredCons` only when it rolls the
+                    // statement back.)
+                    self.deferred_fk_suspects = snap.fk_before;
+                }
 
                 if let Some(sp_slot) = snap.stmt_sp_slot {
                     // Inside `BEGIN` / `SAVEPOINT` (or concurrent writer): roll back ONLY this
@@ -5805,6 +5864,14 @@ impl ConnectionInner {
             arc_prog
         };
 
+        if !self.is_autocommit()
+            && !prog.needs_stmt_subsavepoint()
+            && !prog.abort_safe_without_stmt_journal()
+        {
+            // No statement journal in C, and the program is not built to fail before its
+            // first write: leave the statement to the general executor.
+            return None;
+        }
         let base_sp_depth = self.savepoints.len();
         let prev_tx_state = self.db_set.main_btree().transaction_state();
         let opened_write_here = prev_tx_state != TransactionState::Write;
@@ -5848,17 +5915,17 @@ impl ConnectionInner {
         }
 
         let is_autocommit = self.is_autocommit();
-        let can_elide_sp = !prog.needs_stmt_subsavepoint()
-            && (!prog.has_function_call() || !self.functions.has_user_functions())
-            && !self.progress.is_enabled()
-            && !shared.has_external_interrupt.load(Ordering::Acquire)
-            && !self.active_interrupt_flag.load(Ordering::Relaxed)
-            && self.db_set.main_slot().max_page_count >= SQLITE_MAX_PAGE_COUNT;
+        // C opens a statement journal exactly when the statement was compiled with
+        // `usesStmtJournal`; without one an interrupt, SQLITE_FULL or I/O error rolls the whole
+        // transaction back (`sqlite3VdbeHalt`), which is what `ELIDED_STMT_SP` does.
+        let can_elide_sp = !prog.needs_stmt_subsavepoint();
+        sqliters_types::dtrace!("TR|stmt|usj|v={}", u8::from(!can_elide_sp));
         let stmt_sp_slot = if !is_autocommit {
             if can_elide_sp {
                 self.in_user_btree_tx = true;
                 Some(ELIDED_STMT_SP)
             } else {
+                sqliters_types::dtrace!("TR|stmt|journal|open");
                 let sp_idx = self.savepoints.len();
                 if let Err(e) = self.db_set.slots_mut()[0]
                     .btree
@@ -8772,7 +8839,14 @@ impl Statement {
                         }
                     }
 
-                    if !inner.is_autocommit() || pre_summary.other_writers > 0 {
+                    // (For INSERT / UPDATE / DELETE the statement savepoint is opened by
+                    // `ExecContext::ensure_write_db`, after `engine::apply_stmt_journal_policy`
+                    // has decided whether C would open a statement journal at all.)
+                    let stmt_is_dml = matches!(
+                        self.stmt.as_ref(),
+                        Some(Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_))
+                    );
+                    if !stmt_is_dml && (!inner.is_autocommit() || pre_summary.other_writers > 0) {
                         let sp_idx = inner.savepoints.len();
                         let ensure_res = inner
                             .db_set
@@ -8921,6 +8995,7 @@ impl Statement {
                     &mut stmt_tx,
                     &mut expire_self_only,
                     |ctx| {
+                        engine::apply_stmt_journal_policy(ctx, stmt_ref);
                         if let Some(sp_slot) = ctx.stmt_tx.stmt_sp_slot
                             && ctx.db_set.vtab_registry().has_any_in_tx()
                         {
@@ -8965,6 +9040,13 @@ impl Statement {
                     inner.in_user_btree_tx = true;
                 }
 
+                // (C generated this statement's code without a statement journal: see
+                // `engine::apply_stmt_journal_policy`.)
+                let stmt_sp_slot = if stmt_tx.no_stmt_journal {
+                    Some(ELIDED_STMT_SP)
+                } else {
+                    stmt_sp_slot
+                };
                 let abort_snapshot = WriteAbortSnapshot {
                     stmt_sp_slot,
                     touched_write_instances,
@@ -10363,6 +10445,12 @@ fn try_fast_compiled_main_write_fields(
     if prog.primary_write_db() != DatabaseId::MAIN || prog.referenced_db_mask() != 1u16 {
         return None;
     }
+    if !inner.is_autocommit()
+        && !prog.needs_stmt_subsavepoint()
+        && !prog.abort_safe_without_stmt_journal()
+    {
+        return None;
+    }
     if !inner.db_set.main_slot().schema.loaded {
         return None;
     }
@@ -10440,17 +10528,15 @@ fn try_fast_compiled_main_write_fields(
     }
 
     let is_autocommit = inner.is_autocommit();
-    let can_elide_sp = !prog.needs_stmt_subsavepoint()
-        && (!prog.has_function_call() || !inner.functions.has_user_functions())
-        && !inner.progress.is_enabled()
-        && !shared.has_external_interrupt.load(Ordering::Acquire)
-        && !inner.active_interrupt_flag.load(Ordering::Relaxed)
-        && inner.db_set.main_slot().max_page_count >= SQLITE_MAX_PAGE_COUNT;
+    // (C's `usesStmtJournal`; see `try_fast_exec_literal_insert_step`.)
+    let can_elide_sp = !prog.needs_stmt_subsavepoint();
+    sqliters_types::dtrace!("TR|stmt|usj|v={}", u8::from(!can_elide_sp));
     let stmt_sp_slot = if !is_autocommit {
         if can_elide_sp {
             inner.in_user_btree_tx = true;
             Some(ELIDED_STMT_SP)
         } else {
+            sqliters_types::dtrace!("TR|stmt|journal|open");
             let sp_idx = inner.savepoints.len();
             if let Err(e) = inner.db_set.slots_mut()[0]
                 .btree
@@ -12761,6 +12847,8 @@ mod c_align_5h_tests;
 mod c_align_5j_tests;
 #[cfg(test)]
 mod c_align_h1_tests;
+#[cfg(test)]
+mod c_align_h1b_tests;
 /// Regression tests for behaviour that has to match C SQLite 3.54.1 (step 5e): every expected
 /// value below is what the reference `sqlite3` produces for the same statements.
 #[cfg(test)]

@@ -738,6 +738,11 @@ impl IndexSchema {
                 None => 1,
             };
         }
+        if !self.table_without_rowid {
+            // build.c `estimateIndexWidth` sums over all `nColumn` entries of `aiColumn`: for a
+            // rowid table the last one is the rowid (`x < 0` counts 1).
+            w_index += 1;
+        }
         sqlite_log_est(w_index.max(1) * 4)
     }
 

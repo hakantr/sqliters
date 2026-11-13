@@ -2175,7 +2175,11 @@ fn test_audit3_autocommit_commit_ioerr_clean_rollback_no_false_poison_and_vacuum
         ("main".to_owned(), "unlocked".to_owned())
     );
     assert_eq!(conn.total_changes(), base_total);
-    assert_eq!(conn.last_insert_rowid(), base_rowid);
+    // C SQLite: `OP_Insert` assigns `db->lastRowid` and nothing restores it when the commit
+    // of the statement then fails (verified with the reference shell: a deferred foreign key
+    // failing at the autocommit COMMIT leaves last_insert_rowid() at the rejected row's rowid).
+    let _ = base_rowid;
+    assert_eq!(conn.last_insert_rowid(), 2);
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM ft;", &[])
             .unwrap()

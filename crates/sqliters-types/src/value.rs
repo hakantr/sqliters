@@ -84,7 +84,13 @@ impl TypeAffinity {
                     other => other,
                 };
                 match v {
-                    Value::Real(r) => real_to_exact_int(r).map_or(Value::Real(r), Value::Integer),
+                    // vdbemem.c `sqlite3VdbeIntegerAffinity`: "only mark the value as an
+                    // integer if (1) the round-trip conversion real->int->real is a no-op, and
+                    // (2) the integer is neither the largest nor the smallest possible
+                    // integer (ticket #3922)".
+                    Value::Real(r) => real_to_exact_int(r)
+                        .filter(|i| *i > i64::MIN && *i < i64::MAX)
+                        .map_or(Value::Real(r), Value::Integer),
                     other => other,
                 }
             }
