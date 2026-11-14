@@ -1509,6 +1509,9 @@ impl DatabaseSet {
             ));
         }
         btree.set_interrupt_flag(Some(Arc::clone(&self.interrupt_flag)));
+        // attach.c: "sqlite3BtreeSetPagerFlags(pNew->pBt, PAGER_SYNCHRONOUS_FULL | (db->flags &
+        // PAGER_FLAGS_MASK))" — the new database takes the connection's `cache_spill` setting.
+        btree.set_cache_spill(self.cache_spill);
         let instance_id = SchemaInstanceId(self.next_schema_instance_id);
         self.next_schema_instance_id += 1;
         let db_id = DatabaseId(self.slots.len());

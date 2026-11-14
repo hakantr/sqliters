@@ -6,6 +6,7 @@ pub mod backup;
 pub mod blob;
 pub mod compiler;
 pub mod db_set;
+pub(crate) mod cscan;
 pub(crate) mod dml_c;
 pub mod driver;
 pub mod engine;
@@ -1834,7 +1835,7 @@ impl ConnectionInner {
                     self.connection_encoding = bt.encoding();
                 }
                 let end_res = if can_end {
-                    bt.pager_mut().end_read_if_unused()
+                    bt.end_read_if_unused()
                 } else {
                     Ok(())
                 };
@@ -1974,7 +1975,7 @@ impl ConnectionInner {
                         && bt.pager().wal().is_none()))
             {
                 self.busy_policy.retry_btree(bt, |b| b.begin_read())?;
-                bt.pager_mut().end_read_if_unused()?;
+                bt.end_read_if_unused()?;
             }
             if bt.pager().wal().is_none() {
                 continue;
@@ -1997,6 +1998,15 @@ impl ConnectionInner {
     ) -> Result<()> {
         let _removed = self.activity.remove(hid);
         let summary = self.activity.summary_excluding(hid, &self.db_set);
+        if summary.other_active == 0 {
+            // `sqlite3VdbeHalt` → `closeAllCursors`: the cursors of the statement give their
+            // pages back before its transaction (if it owns one) ends.
+            for slot in self.db_set.slots_mut() {
+                if let Some(ref mut bt) = slot.btree {
+                    bt.statement_end();
+                }
+            }
+        }
 
         if let Some(sim_err) = self.take_simulated_cleanup_error() {
             match outcome {
@@ -2044,7 +2054,7 @@ impl ConnectionInner {
                                 && let Some(slot) = self.db_set.slot_mut(db_id)
                                 && let Some(ref mut bt) = slot.btree
                                 && bt.transaction_state() == TransactionState::Read
-                                && let Err(e) = bt.pager_mut().end_read_if_unused()
+                                && let Err(e) = bt.end_read_if_unused()
                             {
                                 return Err(self.poison_with(e));
                             }
@@ -2061,7 +2071,7 @@ impl ConnectionInner {
                         for slot in self.db_set.slots_mut() {
                             if let Some(ref mut bt) = slot.btree
                                 && bt.transaction_state() == TransactionState::Read
-                                && let Err(e) = bt.pager_mut().end_read_if_unused()
+                                && let Err(e) = bt.end_read_if_unused()
                             {
                                 return Err(self.poison_with(e));
                             }
@@ -2288,6 +2298,15 @@ impl ConnectionInner {
             shared.interrupt_flag.store(false, Ordering::SeqCst);
         }
         let summary = self.activity.summary_excluding(hid, &self.db_set);
+        if summary.other_active == 0 {
+            // `sqlite3VdbeHalt` → `closeAllCursors`: a statement that fails gives the pages of
+            // its cursors back like one that ends.
+            for slot in self.db_set.slots_mut() {
+                if let Some(ref mut bt) = slot.btree {
+                    bt.statement_end();
+                }
+            }
+        }
 
         if let Some(sim_err) = self.take_simulated_cleanup_error() {
             return self.poison_with(sim_err);
@@ -2669,7 +2688,7 @@ impl ConnectionInner {
                                 && let Some(slot) = self.db_set.slot_mut(db_id)
                                 && let Some(ref mut bt) = slot.btree
                                 && bt.transaction_state() == TransactionState::Read
-                                && let Err(end_err) = bt.pager_mut().end_read_if_unused()
+                                && let Err(end_err) = bt.end_read_if_unused()
                             {
                                 return self.poison_with(end_err);
                             }
@@ -3642,7 +3661,7 @@ impl Connection {
                 inner
                     .db_set
                     .main_btree_mut()
-                    .pager_mut()
+                    
                     .end_read_if_unused()?;
             }
             Ok(hdr)
@@ -3685,7 +3704,7 @@ impl Connection {
                 inner
                     .db_set
                     .main_btree_mut()
-                    .pager_mut()
+                    
                     .end_read_if_unused()?;
             }
             Ok(cnt)
@@ -5827,7 +5846,7 @@ impl ConnectionInner {
                 && let Some(ref mut bt) = self.db_set.slots_mut()[idx].btree
                 && bt.transaction_state() == TransactionState::Read
             {
-                let _ = bt.pager_mut().end_read_if_unused();
+                let _ = bt.end_read_if_unused();
             }
         }
     }
@@ -5975,9 +5994,15 @@ impl ConnectionInner {
             arc_prog
         };
 
+        // (the one-row plan tests every constraint before its first write, whatever the order
+        // of the indexes)
+        let plan_runs = prog.single_row_insert().is_some_and(|p| {
+            !p.has_builtin_jsonb || !self.functions.has_user_functions()
+        }) && !self.progress.is_enabled();
         if !self.is_autocommit()
             && !prog.needs_stmt_subsavepoint()
             && !prog.abort_safe_without_stmt_journal()
+            && !plan_runs
         {
             // No statement journal in C, and the program is not built to fail before its
             // first write: leave the statement to the general executor.
@@ -7461,7 +7486,7 @@ impl Statement {
                                                 && bt_mut.transaction_state()
                                                     == TransactionState::Read
                                             {
-                                                let _ = bt_mut.pager_mut().end_read_if_unused();
+                                                let _ = bt_mut.end_read_if_unused();
                                             }
                                         }
                                     }
@@ -7512,6 +7537,20 @@ impl Statement {
                                         PointOutcome::Hit(vals, read_instances)
                                     }
                                     Ok(None) => {
+                                        if !inner.is_autocommit() || inner.in_user_btree_tx {
+                                            // `sqlite3VdbeHalt` → `closeAllCursors`: the
+                                            // statement ends here, its cursor gives the pages
+                                            // of the failed seek back.
+                                            let sum = inner
+                                                .activity
+                                                .summary_excluding(hid, &inner.db_set);
+                                            if sum.other_active == 0
+                                                && let Some(ref mut bt) =
+                                                    inner.db_set.slots_mut()[0].btree
+                                            {
+                                                bt.statement_end();
+                                            }
+                                        }
                                         if !inner.is_autocommit() {
                                             inner.in_user_btree_tx = true;
                                             PointOutcome::Miss
@@ -7527,7 +7566,7 @@ impl Statement {
                                                 && let Some(ref mut bt) =
                                                     inner.db_set.slots_mut()[0].btree
                                                 && bt.transaction_state() == TransactionState::Read
-                                                && let Err(e) = bt.pager_mut().end_read_if_unused()
+                                                && let Err(e) = bt.end_read_if_unused()
                                             {
                                                 PointOutcome::HaltedErr(inner.poison_with(e))
                                             } else {
@@ -7547,7 +7586,7 @@ impl Statement {
                                                     inner.db_set.slots_mut()[0].btree
                                                 && bt.transaction_state() == TransactionState::Read
                                             {
-                                                let _ = bt.pager_mut().end_read_if_unused();
+                                                let _ = bt.end_read_if_unused();
                                             }
                                         }
                                         PointOutcome::HaltedErr(e)
@@ -7845,7 +7884,7 @@ impl Statement {
                         && let Some(ref mut bt_mut) = inner.db_set.slots_mut()[0].btree
                         && bt_mut.transaction_state() == TransactionState::Read
                     {
-                        let _ = bt_mut.pager_mut().end_read_if_unused();
+                        let _ = bt_mut.end_read_if_unused();
                     }
                 }
                 return None;
@@ -8136,7 +8175,7 @@ impl Statement {
                                         && let Some(ref mut bt) = slot.btree
                                         && bt.transaction_state() == TransactionState::Read
                                     {
-                                        let _ = bt.pager_mut().end_read_if_unused();
+                                        let _ = bt.end_read_if_unused();
                                     }
                                 }
                             }
@@ -9984,6 +10023,43 @@ fn execute_single_row_insert_plan(
 
         if !plan.indexes.is_empty() {
             let rid_val = Value::Integer(rowid);
+            // `sqlite3GenerateConstraintChecks`: every UNIQUE index is tested before anything
+            // is written (`OP_NoConflict` on its write cursor, in `pTab->pIndex` order; a key
+            // with a NULL is never in conflict). Nothing of the row exists if one fails.
+            if plan.indexes.iter().any(|i| i.unique.is_some()) {
+                bt.cc_clear_seek_hints();
+                for idx in &plan.indexes {
+                    let Some((ext_code, msg)) = idx.unique.as_ref() else {
+                        continue;
+                    };
+                    let mut key_vals: Vec<Value> = Vec::with_capacity(idx.col_slots.len());
+                    for &slot in &idx.col_slots {
+                        let v = match slot {
+                            None => &rid_val,
+                            Some(ci) => val_refs[ci],
+                        };
+                        if v.is_null() {
+                            break;
+                        }
+                        key_vals.push(v.clone());
+                    }
+                    if key_vals.len() != idx.col_slots.len() {
+                        continue;
+                    }
+                    let n_key = key_vals.len().min(idx.orders.len());
+                    let hits =
+                        bt.seek_index_no_conflict(idx.root_pgno, &key_vals, &idx.orders[..n_key])?;
+                    if !hits.is_empty() {
+                        return Err(SqliteError::constraint(*ext_code, msg.clone()));
+                    }
+                }
+            }
+            // (`OP_Close` at the end of the statement: the index cursors in the order of the
+            // list)
+            if plan.indexes.len() >= 2 && !bt.cc_index_order_has(plan.indexes[0].root_pgno) {
+                let roots: Vec<Pgno> = plan.indexes.iter().map(|i| i.root_pgno).collect();
+                bt.cc_index_order(&roots);
+            }
             let mut idx_refs: [&Value; 17] = [&Value::Null; 17];
             for idx in &plan.indexes {
                 let k_len = idx.col_slots.len();
@@ -10136,6 +10212,8 @@ fn execute_rowid_point_delete_plan(
         });
     };
     let mut spans = [RawFieldSpan::default(); POINT_DML_MAX_FIELDS];
+    // OP_SeekRowid on the table's write cursor (the loop of a `rowid = ?` statement).
+    bt.cc_seek_rowid(plan.root_pgno, sqliters_btree::VC_WRITE, rowid)?;
     let position = match point_dml_read_row(
         bt,
         plan.root_pgno,
@@ -10203,6 +10281,8 @@ fn execute_rowid_point_update_plan(
         });
     };
     let mut spans = [RawFieldSpan::default(); POINT_DML_MAX_FIELDS];
+    // OP_SeekRowid on the table's write cursor (the loop of a `rowid = ?` statement).
+    bt.cc_seek_rowid(plan.root_pgno, sqliters_btree::VC_WRITE, rowid)?;
     let position = match point_dml_read_row(
         bt,
         plan.root_pgno,
@@ -10404,7 +10484,7 @@ fn try_fast_read_plan_fields(
                     && let Some(ref mut bt_mut) = inner.db_set.slots_mut()[0].btree
                     && bt_mut.transaction_state() == TransactionState::Read
                 {
-                    let _ = bt_mut.pager_mut().end_read_if_unused();
+                    let _ = bt_mut.end_read_if_unused();
                 }
             }
             return None;
@@ -10420,7 +10500,7 @@ fn try_fast_read_plan_fields(
                 && let Some(ref mut bt) = inner.db_set.slots_mut()[0].btree
                 && bt.transaction_state() == TransactionState::Read
             {
-                let _ = bt.pager_mut().end_read_if_unused();
+                let _ = bt.end_read_if_unused();
             }
         }
         *lifecycle = StatementLifecycle::Halted {
@@ -10446,7 +10526,7 @@ fn try_fast_read_plan_fields(
                     && sum.other_writers == 0
                     && let Some(ref mut bt) = inner.db_set.slots_mut()[0].btree
                     && bt.transaction_state() == TransactionState::Read
-                    && let Err(e) = bt.pager_mut().end_read_if_unused()
+                    && let Err(e) = bt.end_read_if_unused()
                 {
                     let p_err = inner.poison_with(e);
                     *lifecycle = StatementLifecycle::Halted {
@@ -10551,7 +10631,7 @@ fn try_fast_read_plan_fields(
                     && let Some(ref mut bt) = inner.db_set.slots_mut()[0].btree
                     && bt.transaction_state() == TransactionState::Read
                 {
-                    let _ = bt.pager_mut().end_read_if_unused();
+                    let _ = bt.end_read_if_unused();
                 }
             }
             *lifecycle = StatementLifecycle::Halted {
@@ -10599,9 +10679,13 @@ fn try_fast_compiled_main_write_fields(
     if prog.primary_write_db() != DatabaseId::MAIN || prog.referenced_db_mask() != 1u16 {
         return None;
     }
+    let plan_runs = prog.single_row_insert().is_some_and(|p| {
+        !p.has_builtin_jsonb || !inner.functions.has_user_functions()
+    }) && !inner.progress.is_enabled();
     if !inner.is_autocommit()
         && !prog.needs_stmt_subsavepoint()
         && !prog.abort_safe_without_stmt_journal()
+        && !plan_runs
     {
         return None;
     }
@@ -13014,6 +13098,8 @@ mod c_align_h4_tests;
 mod c_align_h5_tests;
 #[cfg(test)]
 mod c_align_h6_tests;
+#[cfg(test)]
+mod c_align_h6b_tests;
 /// Regression tests for behaviour that has to match C SQLite 3.54.1 (step 5e): every expected
 /// value below is what the reference `sqlite3` produces for the same statements.
 #[cfg(test)]

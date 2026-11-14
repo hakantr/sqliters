@@ -48,7 +48,7 @@ pub use page::{
     seek_table_leaf_cell, table_interior_right_child, table_leaf_cell_has_rowid,
     try_delete_table_leaf_in_place,
 };
-pub use pins::{VC_READ, VC_READ2, VC_WRITE};
+pub use pins::{IdxScan, VC_READ, VC_READ2, VC_WRITE};
 pub use ptrmap::{PtrmapType, RootPageMove, is_ptrmap_page, ptrmap_offset, ptrmap_pageno};
 
 /// Column projection descriptor for single-row `rowid` point `SELECT` fast path.
@@ -283,6 +283,29 @@ pub struct Btree {
     /// the `OP_Insert` of exactly that row uses the cursor where `sqlite3BtreeLast` left it
     /// (`OPFLAG_USESEEKRESULT`) instead of seeking.
     pub(crate) new_rowid_hint: Option<(Pgno, i64)>,
+    /// `OPFLAG_SAVEPOSITION` of the `OP_Insert` / `OP_Delete` the statement runs on its table
+    /// write cursor (a one-pass UPDATE / DELETE over several rows).
+    pub(crate) c_save_position: Option<Pgno>,
+    /// `sqlite3BtreeIndexMoveto` took its first shortcut (the cursor is on the last cell of
+    /// the index and the key is not smaller): the search of that leaf that follows here only
+    /// places the cursor, C compared no other cell.
+    pub(crate) c_idx_search_quiet: bool,
+    /// Index scans run while the read functions were not moving C's cursors.
+    pub(crate) idx_scans: Vec<pins::IdxScan>,
+    pub(crate) c_defer_idx: bool,
+    /// Root of the index whose write cursor `OP_NoConflict` just placed for the key that is
+    /// about to be inserted (`OPFLAG_USESEEKRESULT`).
+    pub(crate) idx_seek_hint: Vec<Pgno>,
+    /// Roots of PRIMARY KEY b-trees of WITHOUT ROWID tables the statements touched.
+    pub(crate) wr_roots: Vec<Pgno>,
+    /// Index roots in `pTab->pIndex` order, for the tables the statement writes.
+    pub(crate) idx_order: Vec<Pgno>,
+    /// Per nested program frame: what `vc_frame_pop` puts back.
+    pub(crate) frame_saved: Vec<(u32, Option<Pgno>, usize)>,
+    /// The engine is reading rows ahead of C's program (see `pins::VC_SILENT`).
+    pub(crate) c_silent: u32,
+    /// Roots of the b-trees whose scans are delivering rows right now (innermost last).
+    pub(crate) read_scans: Vec<Pgno>,
     /// The cursor (index into `vcursors`) the write that is starting goes through: it keeps
     /// its pages when the other cursors on the tree are saved (`usize::MAX`: none).
     pub(crate) vc_keep: usize,
@@ -314,6 +337,16 @@ impl Btree {
             vc_frames: Vec::new(),
             schema_cache_size_set: false,
             new_rowid_hint: None,
+            c_save_position: None,
+            c_idx_search_quiet: false,
+            idx_scans: Vec::new(),
+            c_defer_idx: false,
+            idx_seek_hint: Vec::new(),
+            wr_roots: Vec::new(),
+            idx_order: Vec::new(),
+            frame_saved: Vec::new(),
+            c_silent: 0,
+            read_scans: Vec::new(),
             vc_keep: usize::MAX,
             cursor_slots: Vec::new(),
             free_cursor_slots: Vec::new(),
@@ -1346,6 +1379,36 @@ impl Btree {
         Ok(())
     }
 
+    /// `accessPayload(pCur, 0, nKey, buf, 0)` for a cell whose payload continues on overflow
+    /// pages (the key comparison of `sqlite3BtreeIndexMoveto`): each overflow page that holds
+    /// part of the `remaining` bytes is fetched through the page cache and released again
+    /// (`sqlite3PagerGet(.., PAGER_GET_READONLY)`, `sqlite3PagerUnref`) — unless it can be
+    /// read directly from the file (`sqlite3PagerDirectReadOk`).
+    pub(crate) fn c_overflow_refs(&mut self, first: Pgno, mut remaining: usize) -> Result<()> {
+        let usable = self.pager.usable_size() as usize;
+        let per_page = usable.saturating_sub(4).max(1);
+        let n_page = self.pager.page_count();
+        let mut next = first;
+        let mut hops = 0u32;
+        while remaining > 0 && next != 0 && next <= n_page && hops <= n_page {
+            hops += 1;
+            let direct = self.pager.direct_overflow_read_ok(next);
+            if !direct {
+                self.pager.page_ref(next)?;
+            }
+            let nxt = {
+                let raw = self.pager.read_page_unchecked(next)?;
+                u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]])
+            };
+            if !direct {
+                self.pager.page_unref(next);
+            }
+            remaining = remaining.saturating_sub(per_page);
+            next = nxt;
+        }
+        Ok(())
+    }
+
     fn read_full_payload(
         &mut self,
         total_len: u32,
@@ -1399,7 +1462,16 @@ impl Btree {
                 let raw = self.pager.read_page_unchecked(pgno)?;
                 u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]])
             };
-            self.free_page(pgno)?;
+            // `clearCellOverflow`: every page but the last is fetched (`getOverflowPage`, for
+            // its next pointer) and freed while referenced; the last one is only looked up.
+            if nxt != 0 {
+                self.pin(pgno)?;
+                let r = self.free_page_held(pgno);
+                self.unpin(pgno);
+                r?;
+            } else {
+                self.free_last_overflow_page(pgno)?;
+            }
             first_ovfl = if nxt == 0 { None } else { Some(nxt) };
         }
         Ok(())
@@ -1656,6 +1728,19 @@ impl Btree {
         Ok(())
     }
 
+    /// The last page of an overflow chain in `clearCellOverflow`: "pOvfl =
+    /// btreePageLookup(pBt, ovflPgno)" — the page is referenced only if the cache holds it —
+    /// then `freePage2(pBt, pOvfl, ovflPgno)` and the caller's `sqlite3PagerUnref(pOvfl)`.
+    fn free_last_overflow_page(&mut self, pgno: Pgno) -> Result<()> {
+        if self.pager.page_lookup(pgno) {
+            let r = self.free_page_held(pgno);
+            self.unpin(pgno);
+            r
+        } else {
+            self.free_page(pgno)
+        }
+    }
+
     /// `clearCellOverflow` (`btree.c`): frees the `n_ovfl` pages of the overflow chain starting
     /// at `first`. The next pointer is read from every page but the last, which is freed
     /// without being read.
@@ -1682,7 +1767,7 @@ impl Btree {
                 r?;
                 n
             } else {
-                self.free_page(pgno)?;
+                self.free_last_overflow_page(pgno)?;
                 0
             };
             pgno = next;
@@ -1704,7 +1789,12 @@ impl Btree {
         self.clear_database_page(root_pgno, false, 0, &mut 0)?;
 
         if !self.is_auto_vacuum() {
-            self.free_page(root_pgno)?;
+            // btreeDropTable: "rc = btreeGetPage(pBt, (Pgno)iTable, &pPage, 0); ...
+            // freePage(pPage, &rc); releasePage(pPage);"
+            self.pin(root_pgno)?;
+            let r = self.free_page_held(root_pgno);
+            self.unpin(root_pgno);
+            r?;
             return Ok(None);
         }
 
@@ -1758,7 +1848,7 @@ impl Btree {
         let mut visited = 0usize;
         // `sqlite3BtreeCount`: the cursor walks the tree depth first (`moveToChild` /
         // `moveToParent`) and ends on the root.
-        let vc = self.vc_open(root_pgno, pins::VC_READ);
+        let vc = self.vc_open_read(root_pgno);
         self.vc_move_to_root(vc)?;
         self.count_entries_page(root_pgno, max_pages, &mut visited)
     }
@@ -1839,7 +1929,7 @@ impl Btree {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        let vc = self.vc_open(root_pgno, pins::VC_READ);
+        let vc = self.vc_open_read(root_pgno);
         self.vc_move_to_root(vc)?;
         self.collect_table_entries(root_pgno, &mut out)?;
         Ok(out)
@@ -1882,6 +1972,7 @@ impl Btree {
 
     /// Point-lookup by `rowid` in O(log N) page reads (`sqlite3BtreeTableMoveto`).
     pub fn seek_table_rowid(&mut self, root_pgno: Pgno, rowid: i64) -> Result<Option<Vec<u8>>> {
+        self.emu_seek_rowid(root_pgno, rowid)?;
         if self.pager.page_count() == 0 {
             return Ok(None);
         }
@@ -1941,6 +2032,18 @@ impl Btree {
         }
         let usable = self.pager.usable_size();
         let mut cur_pgno = root_pgno;
+        // (The caller placed the statement's write cursor with `OP_SeekRowid` /
+        // `OP_NotExists` — `cc_seek_rowid`; when it is on the row, the row is read from the
+        // leaf the cursor holds.)
+        {
+            let vc = self.vc_open(root_pgno, pins::VC_WRITE);
+            if self.vcursors[vc].valid
+                && self.vcursors[vc].nkey == Some(rowid)
+                && self.vc_depth(vc) > 0
+            {
+                cur_pgno = self.vc_path(vc)[self.vc_depth(vc) - 1];
+            }
+        }
         for _ in 0..BTCURSOR_MAX_DEPTH {
             let raw = self.pager.read_page(cur_pgno)?;
             let (ptype, n_cell, _) = raw_page_header(cur_pgno, usable, raw)?;
@@ -1989,6 +2092,9 @@ impl Btree {
         rowid: i64,
         cols: &[PointProjCol],
     ) -> Result<Option<Vec<Value>>> {
+        let vc = self.emu_seek_start(root_pgno, rowid)?;
+        let mut child_idx = 0usize;
+        let mut hit_ix = usize::MAX;
         if self.pager.page_count() == 0 {
             return Ok(None);
         }
@@ -2010,8 +2116,9 @@ impl Btree {
                 }
                 match raw[hdr_off] {
                     x if x == BtreePageType::TableInterior as u8 => {
-                        let (_, next_pgno) =
+                        let (ci, next_pgno) =
                             find_table_interior_child(cur_pgno, usable, raw, rowid)?;
+                        child_idx = ci;
                         LookupStep::Descend(next_pgno)
                     }
                     x if x == BtreePageType::TableLeaf as u8 => {
@@ -2020,13 +2127,15 @@ impl Btree {
                             cur_pgno, usable, raw, n_cell, rowid,
                         )? {
                             Err(_) => LookupStep::Done(None),
-                            Ok((_, Some((p_start, p_end)))) => {
+                            Ok((cell_idx, Some((p_start, p_end)))) => {
+                                hit_ix = cell_idx;
                                 let payload = &raw[p_start as usize..p_end as usize];
                                 let vals =
                                     decode_projected_cols_from_record(payload, rowid, cols, enc)?;
                                 LookupStep::Done(Some(vals))
                             }
                             Ok((cell_idx, None)) => {
+                                hit_ix = cell_idx;
                                 let c =
                                     read_table_leaf_cell(cur_pgno, usable, raw, n_cell, cell_idx)?;
                                 LookupStep::Overflow(
@@ -2045,9 +2154,18 @@ impl Btree {
                 }
             };
             match step {
-                LookupStep::Descend(next_pgno) => cur_pgno = next_pgno,
-                LookupStep::Done(res) => return Ok(res),
+                LookupStep::Descend(next_pgno) => {
+                    self.emu_seek_child(vc, next_pgno, child_idx)?;
+                    cur_pgno = next_pgno;
+                }
+                LookupStep::Done(res) => {
+                    if hit_ix != usize::MAX {
+                        self.emu_seek_leaf(vc, hit_ix, rowid);
+                    }
+                    return Ok(res);
+                }
                 LookupStep::Overflow(total_len, local_copy, ovfl) => {
+                    self.emu_seek_leaf(vc, hit_ix, rowid);
                     let full = self.read_full_payload(total_len, &local_copy, ovfl)?;
                     let vals = decode_projected_cols_from_record(&full, rowid, cols, enc)?;
                     return Ok(Some(vals));
@@ -2067,6 +2185,9 @@ impl Btree {
     where
         F: FnOnce(&[u8]) -> Result<R>,
     {
+        let vc = self.emu_seek_start(root_pgno, rowid)?;
+        let mut child_idx = 0usize;
+        let mut hit_ix = usize::MAX;
         if self.pager.page_count() == 0 {
             return Ok(None);
         }
@@ -2088,8 +2209,9 @@ impl Btree {
                 }
                 match raw[hdr_off] {
                     x if x == BtreePageType::TableInterior as u8 => {
-                        let (_, next_pgno) =
+                        let (ci, next_pgno) =
                             find_table_interior_child(cur_pgno, usable, raw, rowid)?;
+                        child_idx = ci;
                         RawStep::Descend(next_pgno)
                     }
                     x if x == BtreePageType::TableLeaf as u8 => {
@@ -2098,12 +2220,14 @@ impl Btree {
                             cur_pgno, usable, raw, n_cell, rowid,
                         )? {
                             Err(_) => RawStep::Done(None),
-                            Ok((_, Some((p_start, p_end)))) => {
+                            Ok((cell_idx, Some((p_start, p_end)))) => {
+                                hit_ix = cell_idx;
                                 let payload = &raw[p_start as usize..p_end as usize];
                                 let f = visit_opt.take().unwrap();
                                 RawStep::Done(Some(f(payload)?))
                             }
                             Ok((cell_idx, None)) => {
+                                hit_ix = cell_idx;
                                 let c =
                                     read_table_leaf_cell(cur_pgno, usable, raw, n_cell, cell_idx)?;
                                 RawStep::Overflow(
@@ -2122,9 +2246,18 @@ impl Btree {
                 }
             };
             match step {
-                RawStep::Descend(next_pgno) => cur_pgno = next_pgno,
-                RawStep::Done(res) => return Ok(res),
+                RawStep::Descend(next_pgno) => {
+                    self.emu_seek_child(vc, next_pgno, child_idx)?;
+                    cur_pgno = next_pgno;
+                }
+                RawStep::Done(res) => {
+                    if hit_ix != usize::MAX {
+                        self.emu_seek_leaf(vc, hit_ix, rowid);
+                    }
+                    return Ok(res);
+                }
                 RawStep::Overflow(total_len, local_copy, ovfl) => {
+                    self.emu_seek_leaf(vc, hit_ix, rowid);
                     let full = self.read_full_payload(total_len, &local_copy, ovfl)?;
                     let f = visit_opt.take().unwrap();
                     return Ok(Some(f(&full)?));
@@ -2153,7 +2286,7 @@ impl Btree {
         stack.push((root_pgno, 0));
         // The read cursor of the scan (`OP_Rewind` / `OP_Next`): `moveToRoot`, `moveToChild`
         // on the way down, `moveToParent` when a page is exhausted; it ends on the root.
-        let vc = self.vc_open(root_pgno, pins::VC_READ);
+        let vc = self.vc_open_read(root_pgno);
         self.vc_move_to_root(vc)?;
 
         while let Some((pgno, next_idx)) = stack.pop() {
@@ -2309,6 +2442,7 @@ impl Btree {
         root_pgno: Pgno,
         rowid: i64,
     ) -> Result<Option<(Pgno, usize, usize, u32, Option<Pgno>)>> {
+        self.emu_seek_rowid(root_pgno, rowid)?;
         if self.pager.page_count() == 0 {
             return Ok(None);
         }
@@ -2718,7 +2852,15 @@ impl Btree {
             if leaf != 0 && leaf <= self.pager.page_count() && self.vc_on_last_page(vc, &mut ai)? {
                 let raw = self.pager.read_page(leaf)?;
                 if matches!(peek_page_type(leaf, usable, raw), Ok(BtreePageType::TableLeaf)) {
-                    return last_table_leaf_rowid(leaf, usable, raw);
+                    let hdr = if leaf == 1 { 100 } else { 0 };
+                    let n_cell = usize::from(u16::from_be_bytes([raw[hdr + 3], raw[hdr + 4]]));
+                    let last = last_table_leaf_rowid(leaf, usable, raw)?;
+                    // (the cursor is on the last cell and knows its rowid: `OP_NewRowid` reads
+                    // it with `sqlite3BtreeIntegerKey`)
+                    let c = &mut self.vcursors[vc];
+                    c.ix = n_cell.saturating_sub(1) as u16;
+                    c.nkey = last;
+                    return Ok(last);
                 }
             }
         }
@@ -2730,10 +2872,15 @@ impl Btree {
                 BtreePageType::TableLeaf => {
                     let last = last_table_leaf_rowid(cur_pgno, usable, raw)?;
                     if last.is_some() {
+                        let hdr = if cur_pgno == 1 { 100 } else { 0 };
+                        let n_cell =
+                            usize::from(u16::from_be_bytes([raw[hdr + 3], raw[hdr + 4]]));
                         // moveToRightmost succeeded: `pCur->curFlags |= BTCF_AtLast`
                         let c = &mut self.vcursors[vc];
                         c.valid = true;
                         c.at_last = true;
+                        c.ix = n_cell.saturating_sub(1) as u16;
+                        c.nkey = last;
                     }
                     return Ok(last);
                 }
@@ -2761,26 +2908,11 @@ impl Btree {
         if self.new_rowid_hint == Some((root_pgno, rowid)) || self.pager.page_count() == 0 {
             return Ok(());
         }
-        let usable = self.pager.usable_size();
+        // `sqlite3BtreeTableMoveto` on the write cursor (with its shortcuts); a row that is
+        // found is known to the cursor (`BTCF_ValidNKey`), so that the `OP_Insert` of an
+        // UPSERT / REPLACE that follows writes through it without another search.
         let vc = self.vc_open(root_pgno, pins::VC_WRITE);
-        self.vc_move_to_root(vc)?;
-        let mut cur_pgno = root_pgno;
-        loop {
-            let raw = self.pager.read_page(cur_pgno)?;
-            match peek_page_type(cur_pgno, usable, raw)? {
-                BtreePageType::TableLeaf => break,
-                BtreePageType::TableInterior => {
-                    let (i, child) = find_table_interior_child(cur_pgno, usable, raw, rowid)?;
-                    cur_pgno = child;
-                    self.vc_move_to_child_at(vc, child, i)?;
-                }
-                _ => {
-                    return Err(SqliteError::corrupt(format!(
-                        "expected table page at {cur_pgno}"
-                    )));
-                }
-            }
-        }
+        self.vc_table_moveto(vc, rowid, false)?;
         self.new_rowid_hint = Some((root_pgno, rowid));
         Ok(())
     }
@@ -2894,6 +3026,8 @@ impl Btree {
     /// returns the leaf `rowid` belongs on, or `None` when a row with that rowid exists.
     /// Nothing is modified. Pass the leaf to [`Self::insert_table_at_leaf`].
     pub fn probe_table_insert_leaf(&mut self, root_pgno: Pgno, rowid: i64) -> Result<Option<Pgno>> {
+        // OP_NotExists on the table's write cursor
+        self.write_cursor_not_exists(root_pgno, rowid)?;
         let usable = self.pager.usable_size();
         let mut cur_pgno = root_pgno;
         for _ in 0..=BTCURSOR_MAX_DEPTH {
@@ -2963,6 +3097,120 @@ impl Btree {
         )
     }
 
+    // ------------------------------------------------------------------------------------
+    // C's cursor operations, for the statement executors (see `pins.rs`).
+    // ------------------------------------------------------------------------------------
+
+    /// `OPFLAG_SAVEPOSITION` for the inserts / deletes that follow on the b-tree `root` (the
+    /// one the loop of a one-pass UPDATE / DELETE over several rows runs on); `None`
+    /// switches it off again.
+    pub fn cc_save_position(&mut self, root: Option<Pgno>) {
+        self.c_save_position = root;
+    }
+
+    /// `OP_Rewind` on the statement's cursor `(root, role)`: `false` when the tree is empty.
+    pub fn cc_rewind(&mut self, root: Pgno, role: u8) -> Result<bool> {
+        if self.pager.page_count() == 0 {
+            return Ok(false);
+        }
+        let vc = self.vc_open(root, role);
+        let ok = self.vc_first(vc)?;
+        if ok {
+            self.vc_note_rowid_if_table(vc)?;
+        }
+        Ok(ok)
+    }
+
+    /// `OP_Next`: `false` at the end.
+    pub fn cc_next(&mut self, root: Pgno, role: u8) -> Result<bool> {
+        if self.pager.page_count() == 0 {
+            return Ok(false);
+        }
+        let vc = self.vc_open(root, role);
+        let ok = self.vc_next(vc)?;
+        if ok {
+            self.vc_note_rowid_if_table(vc)?;
+        }
+        Ok(ok)
+    }
+
+    /// `n` times `OP_Next` (the rows in between are not looked at): how many of them reached
+    /// a row.
+    pub fn cc_next_n(&mut self, root: Pgno, role: u8, n: u64) -> Result<u64> {
+        if self.pager.page_count() == 0 || n == 0 {
+            return Ok(0);
+        }
+        let vc = self.vc_open(root, role);
+        let moved = self.vc_next_n(vc, n)?;
+        if moved > 0 {
+            self.vc_note_rowid_if_table(vc)?;
+        }
+        Ok(moved)
+    }
+
+    /// `OP_SeekRowid` / `OP_NotExists` on the cursor `(root, role)`: whether the row exists.
+    pub fn cc_seek_rowid(&mut self, root: Pgno, role: u8, rowid: i64) -> Result<bool> {
+        if self.pager.page_count() == 0 {
+            return Ok(false);
+        }
+        let vc = self.vc_open(root, role);
+        Ok(self.vc_table_moveto(vc, rowid, false)? == 0)
+    }
+
+    /// `OP_SeekGE` (`strict`: `OP_SeekGT`) on the table cursor `(root, role)`: whether the
+    /// cursor is on a row afterwards ("if( res<0 || (res==0 && oc==OP_SeekGT) )
+    /// sqlite3BtreeNext").
+    pub fn cc_seek_rowid_ge(&mut self, root: Pgno, role: u8, rowid: i64, strict: bool) -> Result<bool> {
+        if self.pager.page_count() == 0 {
+            return Ok(false);
+        }
+        let vc = self.vc_open(root, role);
+        let res = self.vc_table_moveto(vc, rowid, false)?;
+        if !self.vcursors[vc].valid {
+            // (empty tree)
+            return Ok(false);
+        }
+        let on = if res < 0 || (res == 0 && strict) { self.vc_next(vc)? } else { true };
+        if on {
+            self.vc_note_rowid_if_table(vc)?;
+        }
+        Ok(on)
+    }
+
+    /// `OP_Close` of the read cursors on `root` (the loop over a table that feeds an index
+    /// build is over).
+    pub fn cc_close_reads(&mut self, root: Pgno) {
+        self.vc_close_reads(root);
+    }
+
+    /// `OP_Close` (or the cursor number is opened again): the cursor gives its pages back.
+    pub fn cc_close(&mut self, root: Pgno, role: u8) {
+        self.vc_close(root, role);
+    }
+
+    /// The cursor read its row (`OP_Rowid` / `OP_Column` → `getCellInfo`).
+    fn vc_note_rowid_if_table(&mut self, vc: usize) -> Result<()> {
+        if self.vcursors[vc].valid && self.vc_depth(vc) > 0 {
+            let pg = self.vc_path(vc)[self.vc_depth(vc) - 1];
+            let hdr = if pg == 1 { 100 } else { 0 };
+            let is_table_leaf = self.pager.read_page(pg)?.get(hdr).copied() == Some(0x0d);
+            if is_table_leaf {
+                self.vc_note_rowid(vc)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The statement that held the read transaction is finished: its cursors are closed
+    /// (`sqlite3VdbeHalt` → `closeAllCursors`), then the read transaction ends if nothing else
+    /// uses it (see `Pager::end_read_if_unused`).
+    pub fn end_read_if_unused(&mut self) -> Result<()> {
+        if self.pager.transaction_state() == TransactionState::Read {
+            self.vc_close_all();
+        }
+        self.pager.end_read_if_unused()
+    }
+
     /// Deletes `rowid` from the Table B+Tree rooted at `root_pgno`. Returns `true` if a row was deleted.
     pub fn delete_table(&mut self, root_pgno: Pgno, rowid: i64) -> Result<bool> {
         self.delete_table_at(root_pgno, rowid, None)
@@ -2980,23 +3228,104 @@ impl Btree {
         rowid: i64,
         position: Option<(Pgno, usize)>,
     ) -> Result<bool> {
+        let _ = position;
         self.tr_ins = false;
         if self.dtrace_persistent() {
             sqliters_types::dtrace!("TR|w|del|root={} rowid={}", root_pgno, rowid);
         }
-        self.save_cursors_for_mutation(Some(root_pgno), None)?;
-        if let Some((leaf_pgno, cell_idx)) = position
-            && let Some(needs_balance) =
-                self.try_delete_table_row_at(root_pgno, leaf_pgno, cell_idx, rowid)?
-        {
-            self.dtrace_delete_decision(root_pgno, leaf_pgno);
-            if needs_balance {
-                let mut cur = self.table_path_to_leaf(root_pgno, rowid, leaf_pgno)?;
-                self.balance(&mut cur)?;
-            }
-            return Ok(true);
+        // OP_Delete: `sqlite3BtreeDelete` on the statement's write cursor, which is on the row
+        // (the one-pass scan is there, or `OP_NotExists` put it there; a caller that did
+        // neither gets the seek here).
+        let vc = self.vc_open(root_pgno, pins::VC_WRITE);
+        self.vc_keep = vc;
+        let saved = self.save_cursors_for_mutation(Some(root_pgno), None);
+        self.vc_keep = usize::MAX;
+        saved?;
+        if self.pager.page_count() == 0 {
+            return Ok(false);
         }
-        self.delete_table_descend(root_pgno, rowid)
+        if !(self.vcursors[vc].valid && self.vc_depth(vc) > 0) || self.vcursors[vc].nkey.is_none() {
+            if self.vcursors[vc].valid && self.vc_depth(vc) > 0 {
+                self.vc_note_rowid(vc)?;
+            }
+        }
+        if self.vc_table_moveto(vc, rowid, false)? != 0 {
+            return Ok(false);
+        }
+        if self.vc_depth(vc) == 0 || self.vc_rowid(vc)? != rowid {
+            // (the cursor's idea of where it is was out of date: search again)
+            let c = &mut self.vcursors[vc];
+            c.valid = false;
+            c.nkey = None;
+            if self.vc_table_moveto(vc, rowid, false)? != 0
+                || self.vc_depth(vc) == 0
+                || self.vc_rowid(vc)? != rowid
+            {
+                return Ok(false);
+            }
+        }
+        let usable = self.pager.usable_size() as usize;
+        let leaf = self.vc_path(vc)[self.vc_depth(vc) - 1];
+        let ix = usize::from(self.vcursors[vc].ix);
+        let is_root = self.vc_depth(vc) == 1;
+        let hdr_off = if leaf == 1 { 100 } else { 0 };
+        // "If the BTREE_SAVEPOSITION bit is on, then the cursor position must be preserved
+        // following this delete operation. If the current delete will cause a rebalance, then
+        // the cursor will need to be explicitly saved" (bPreserve 1), otherwise 2.
+        let mut preserve = 0u8;
+        if self.c_save_position == Some(root_pgno) {
+            let d = self.pager.read_page(leaf)?;
+            let (kind, n_cell, n_free) = balance::page_state(d, leaf, usable)?;
+            let p = hdr_off + 8 + 2 * ix;
+            let off = usize::from(u16::from_be_bytes([d[p], d[p + 1]]));
+            let sz = balance::cell_size(&kind, usable as u32, d, off);
+            preserve = if (n_free as usize + sz + 2) > usable * 2 / 3 || n_cell == 1 {
+                1
+            } else {
+                2
+            };
+        }
+        let mut needs_balance = match self.try_delete_table_row_at(root_pgno, leaf, ix, rowid)? {
+            Some(nb) => nb,
+            None => self.delete_leaf_cell_general(leaf, ix)? && !is_root,
+        };
+        if is_root {
+            needs_balance = false;
+        }
+        self.dtrace_delete_decision(root_pgno, leaf);
+        if needs_balance {
+            let mut cur = balance::BalCursor::new(root_pgno);
+            if !self.vc_to_bal_checked(vc, &mut cur)? {
+                return Err(SqliteError::corrupt(
+                    "table cursor does not describe the tree it deleted from",
+                ));
+            }
+            self.balance(&mut cur)?;
+        }
+        if preserve == 2 {
+            // CURSOR_SKIPNEXT: the entry after the deleted one moved into its slot.
+            let (_, n_cell) = {
+                let d = self.pager.read_page(leaf)?;
+                (d[hdr_off], balance::get2(d, hdr_off + 3))
+            };
+            let c = &mut self.vcursors[vc];
+            c.valid = false;
+            c.nkey = None;
+            if ix >= n_cell {
+                c.skip = -1;
+                c.ix = n_cell.saturating_sub(1) as u16;
+            } else {
+                c.skip = 1;
+            }
+        } else {
+            self.vc_move_to_root(vc)?;
+            if preserve == 1 {
+                // btreeReleaseAllCursorPages + CURSOR_REQUIRESSEEK with the saved key
+                self.vc_release_all(vc);
+                self.vcursors[vc].seek_rowid = Some(rowid);
+            }
+        }
+        Ok(true)
     }
 
     /// Decision trace only: the `nFree*3 > usableSize*2` test of `sqlite3BtreeDelete` for the
@@ -3033,38 +3362,6 @@ impl Btree {
                 }
             }
         }
-    }
-
-    /// The path from `root_pgno` to the leaf that holds (or would hold) `rowid`, which must be
-    /// `leaf_pgno`.
-    #[cold]
-    #[inline(never)]
-    fn table_path_to_leaf(
-        &mut self,
-        root_pgno: Pgno,
-        rowid: i64,
-        leaf_pgno: Pgno,
-    ) -> Result<balance::BalCursor> {
-        let usable = self.pager.usable_size();
-        let mut cur = balance::BalCursor::new(root_pgno);
-        loop {
-            let pgno = cur.page();
-            let raw = self.pager.read_page(pgno)?;
-            match peek_page_type(pgno, usable, raw)? {
-                BtreePageType::TableInterior => {
-                    let (idx, child) = find_table_interior_child(pgno, usable, raw, rowid)?;
-                    cur.descend(idx, child)?;
-                }
-                BtreePageType::TableLeaf => break,
-                _ => return Err(SqliteError::corrupt("expected table page in delete")),
-            }
-        }
-        if cur.page() != leaf_pgno {
-            return Err(SqliteError::corrupt(
-                "positioned table row is not on the leaf its rowid leads to",
-            ));
-        }
-        Ok(cur)
     }
 
     /// Deletes row `rowid` sitting at `cell_idx` of table leaf `leaf_pgno` in place (`dropCell`).
@@ -3117,66 +3414,6 @@ impl Btree {
             // `NotFound` and `Fallback` leave the page untouched: the general path takes over.
             _ => Ok(None),
         }
-    }
-
-    /// `sqlite3BtreeDelete` for a table row located by descending from the root.
-    fn delete_table_descend(&mut self, root_pgno: Pgno, rowid: i64) -> Result<bool> {
-        let usable = self.pager.usable_size();
-        let mut cur = balance::BalCursor::new(root_pgno);
-        loop {
-            let pgno = cur.page();
-            let raw = self.pager.read_page(pgno)?;
-            match peek_page_type(pgno, usable, raw)? {
-                BtreePageType::TableInterior => {
-                    let (idx, child) = find_table_interior_child(pgno, usable, raw, rowid)?;
-                    cur.descend(idx, child)?;
-                }
-                BtreePageType::TableLeaf => break,
-                _ => return Err(SqliteError::corrupt("expected table page in delete")),
-            }
-        }
-        let pgno = cur.page();
-        let is_root = cur.i_page == 0;
-        let hdr_off = if pgno == 1 { 100 } else { 0 };
-        // Probe existence first via read_page so missing-key deletes don't dirty pages!
-        let exists = {
-            let raw = self.pager.read_page(pgno)?;
-            seek_table_leaf_cell(pgno, usable, raw, rowid)?.is_some()
-        };
-        if !exists {
-            return Ok(false);
-        }
-        let (outcome, mut needs_balance) = {
-            let secure = self.zero_freed_cells();
-            let raw_mut = self.pager.write_page(pgno)?;
-            let outcome = try_delete_table_leaf_in_place(
-                pgno, usable, raw_mut, rowid, is_root, None, secure,
-            )?;
-            let needs = !is_root
-                && matches!(outcome, RawLeafDeleteOutcome::DeletedInPlace { .. })
-                && balance::leaf_needs_balance(raw_mut, hdr_off, usable as usize)?;
-            (outcome, needs)
-        };
-        match outcome {
-            RawLeafDeleteOutcome::NotFound => return Ok(false),
-            RawLeafDeleteOutcome::DeletedInPlace { overflow_page, .. } => {
-                self.free_overflow_chain(overflow_page)?;
-            }
-            RawLeafDeleteOutcome::Fallback => {
-                let ParsedPage::TableLeaf { cells } = self.read_parsed_page(pgno)? else {
-                    return Err(SqliteError::corrupt("expected table page in delete"));
-                };
-                let Ok(idx) = cells.binary_search_by_key(&rowid, |c| c.rowid) else {
-                    return Ok(false);
-                };
-                needs_balance = self.delete_leaf_cell_general(pgno, idx)? && !is_root;
-            }
-        }
-        self.dtrace_delete_decision(root_pgno, pgno);
-        if needs_balance {
-            self.balance(&mut cur)?;
-        }
-        Ok(true)
     }
 
     /// The leaf step of `sqlite3BtreeDelete` without shortcuts: `BTREE_CLEAR_CELL` (free the
@@ -3262,7 +3499,7 @@ impl Btree {
         let usable = self.pager.usable_size();
         let max_pages = (self.pager.page_count() as usize).saturating_add(2);
         let mut visited_pages = 0usize;
-        let vc = self.vc_open(root_pgno, pins::VC_READ);
+        let vc = self.vc_open_read(root_pgno);
         self.vc_move_to_root(vc)?;
         let _ = self.scan_index_raw_rec(
             root_pgno,
@@ -3817,7 +4054,9 @@ impl Btree {
         let max_local = bounds.max_local as usize;
         let max_pages = (self.pager.page_count() as usize).saturating_add(2);
         let mut visited_pages = 0usize;
-        let _ = self.scan_table_range_raw_rec(
+        // The read cursor of the loop: OP_Rewind / OP_SeekGE / OP_SeekGT, then OP_Next.
+        let mut ss = self.ss_begin_table(root_pgno, min_rowid)?;
+        let flow = self.scan_table_range_raw_rec(
             root_pgno,
             usable,
             bounds,
@@ -3826,8 +4065,12 @@ impl Btree {
             hi_inc,
             &mut visited_pages,
             max_pages,
+            &mut ss,
             &mut visit,
-        )?;
+        );
+        let broke = !matches!(flow, Ok(ControlFlow::Continue(())));
+        self.ss_end(ss, broke)?;
+        let _ = flow?;
         Ok(())
     }
 
@@ -3842,6 +4085,7 @@ impl Btree {
         hi_inc: Option<i64>,
         visited_pages: &mut usize,
         max_pages: usize,
+        ss: &mut pins::ScanSync,
         visit: &mut F,
     ) -> Result<ControlFlow<()>>
     where
@@ -3869,6 +4113,10 @@ impl Btree {
                 } else {
                     0
                 };
+                let first_ci = ci;
+                if ci < n_cell {
+                    self.ss_enter(ss, pgno)?;
+                }
 
                 while ci < n_cell {
                     enum TLeafStep {
@@ -3939,15 +4187,20 @@ impl Btree {
                     };
                     match step {
                         TLeafStep::Done => break,
-                        TLeafStep::Broke => return Ok(ControlFlow::Break(())),
+                        TLeafStep::Broke => {
+                            self.ss_leave(ss, pgno, (ci > first_ci).then(|| ci - 1));
+                            return Ok(ControlFlow::Break(()));
+                        }
                         TLeafStep::Overflow(rowid, tlen, local_copy, ovfl) => {
                             let full = self.read_full_payload(tlen, &local_copy, ovfl)?;
                             if visit(rowid, &full)?.is_break() {
+                                self.ss_leave(ss, pgno, (ci > first_ci).then(|| ci - 1));
                                 return Ok(ControlFlow::Break(()));
                             }
                         }
                     }
                 }
+                self.ss_leave(ss, pgno, (ci > first_ci).then(|| ci - 1));
                 Ok(ControlFlow::Continue(()))
             }
             BtreePageType::TableInterior => {
@@ -3985,6 +4238,7 @@ impl Btree {
                             hi_inc,
                             visited_pages,
                             max_pages,
+                            ss,
                             visit,
                         )?
                         .is_break()
@@ -4008,6 +4262,7 @@ impl Btree {
                         hi_inc,
                         visited_pages,
                         max_pages,
+                        ss,
                         visit,
                     )
                 } else {
@@ -4100,7 +4355,17 @@ impl Btree {
         let max_pages = (self.pager.page_count() as usize).saturating_add(2);
         let mut visited_pages = 0usize;
         let probe = IntRangeProbe::new(prefix_values, lower_bound, upper_bound, orders);
-        let _ = self.seek_index_range_raw_cells_rec(
+        // (what the scan visits, for the C cursor of the loop — see `pins::IdxScan`)
+        let mut first: Option<Vec<u8>> = None;
+        let mut n_seen: u64 = 0;
+        let mut counted = |rec: &[u8]| -> Result<ControlFlow<()>> {
+            if n_seen == 0 {
+                first = Some(rec.to_vec());
+            }
+            n_seen += 1;
+            visit(rec)
+        };
+        let flow = self.seek_index_range_raw_cells_rec(
             root_pgno,
             usable,
             prefix_values,
@@ -4112,8 +4377,31 @@ impl Btree {
             reverse,
             &mut visited_pages,
             max_pages,
-            &mut visit,
+            &mut counted,
         )?;
+        // (the lower bound as a record: needed only when nothing was in range)
+        let seek_rec = if n_seen == 0 {
+            let mut seek_vals: Vec<Value> = prefix_values.to_vec();
+            if let Some((v, _)) = if reverse { upper_bound } else { lower_bound } {
+                seek_vals.push(v.clone());
+            }
+            sqliters_types::record::encode_record_with_encoding(&seek_vals, enc)
+        } else {
+            Vec::new()
+        };
+        self.idx_scan_done(pins::IdxScan {
+            root: root_pgno,
+            first,
+            seek_rec,
+            orders: orders.to_vec(),
+            n: n_seen,
+            reverse,
+            eq_only: !prefix_values.is_empty() && lower_bound.is_none() && upper_bound.is_none(),
+            broke: flow.is_break(),
+            pos: 0,
+            started: false,
+            at_end: false,
+        })?;
         Ok(())
     }
 
@@ -5073,11 +5361,22 @@ impl Btree {
         if self.dtrace_persistent() {
             sqliters_types::dtrace!("TR|w|del|root={} len={}", root_pgno, record_bytes.len());
         }
-        self.save_cursors_for_mutation(Some(root_pgno), None)?;
+        let vc = self.vc_open(root_pgno, pins::VC_WRITE);
+        self.vcursors[vc].is_index = true;
+        self.vc_keep = vc;
+        let saved = self.save_cursors_for_mutation(Some(root_pgno), None);
+        self.vc_keep = usize::MAX;
+        saved?;
         let enc = self.encoding();
         let usable = self.pager.usable_size();
         let key = RawRecordKey::for_index_orders(record_bytes, orders);
         let mut cur = balance::BalCursor::new(root_pgno);
+        self.idx_seek_hint.retain(|&r| r != root_pgno);
+        // OP_IdxDelete: sqlite3BtreeIndexMoveto, then sqlite3BtreeDelete(BTREE_AUXDELETE).
+        self.index_moveto_start(vc, &mut cur, record_bytes, orders)?;
+        // (this descent compares on the raw pages only; a cell that continues on overflow
+        // pages sends it to the general path below)
+        self.c_idx_search_quiet = false;
         for _ in 0..BTCURSOR_MAX_DEPTH {
             let cur_pgno = cur.page();
             let hdr_off = if cur_pgno == 1 { 100 } else { 0 };
@@ -5134,7 +5433,7 @@ impl Btree {
             };
             match step {
                 RawDelStep::Descend(slot, child) => {
-                    if cur.descend(slot, child).is_err() {
+                    if self.bc_descend(&mut cur, slot, child).is_err() {
                         break;
                     }
                 }
@@ -5157,10 +5456,12 @@ impl Btree {
                     if needs_balance {
                         self.balance(&mut cur)?;
                     }
+                    self.vc_move_to_root(vc)?;
                     return Ok(true);
                 }
                 RawDelStep::DividerHit { cell_idx } => {
                     self.delete_index_interior_cell(&mut cur, cell_idx)?;
+                    self.vc_move_to_root(vc)?;
                     return Ok(true);
                 }
                 RawDelStep::Fallback => break,
@@ -5173,7 +5474,9 @@ impl Btree {
         } else {
             orders.len().min(vals.len())
         };
-        self.delete_index_impl(root_pgno, &vals[..key_len], orders)
+        // (the general path searches again, from the root)
+        self.vc_move_to_root(vc)?;
+        self.delete_index_impl(root_pgno, &vals[..key_len], orders, false, false)
     }
 
     /// Deletes a matching entry `key_vals` from an Index B-Tree rooted at `root_pgno`.
@@ -5186,7 +5489,110 @@ impl Btree {
         if self.dtrace_persistent() {
             sqliters_types::dtrace!("TR|w|del|root={} len=?", root_pgno);
         }
-        self.delete_index_impl(root_pgno, key_vals, orders)
+        self.delete_index_impl(root_pgno, key_vals, orders, true, false)
+    }
+
+    /// The uniqueness probe of an insert / update (`OP_NoConflict` on the write cursor of the
+    /// UNIQUE index): the entries whose first columns equal `key_vals`. The cursor is left
+    /// where the key belongs; an index insert of that key that follows uses the position
+    /// (`OPFLAG_USESEEKRESULT`), a `REPLACE` deletes the conflicting entry through it.
+    pub fn seek_index_no_conflict(
+        &mut self,
+        root_pgno: Pgno,
+        key_vals: &[Value],
+        orders: &[KeySortOrder],
+    ) -> Result<Vec<Vec<Value>>> {
+        let was = self.c_defer_idx;
+        self.c_defer_idx = true;
+        let n_before = self.idx_scans.len();
+        let hits = self.seek_index_equal(root_pgno, key_vals, orders);
+        self.idx_scans.truncate(n_before);
+        self.c_defer_idx = was;
+        let hits = hits?;
+        let vc = self.vc_open(root_pgno, pins::VC_WRITE);
+        self.vcursors[vc].is_index = true;
+        let rec = sqliters_types::record::encode_record_with_encoding(key_vals, self.encoding());
+        let res = self.vc_index_moveto(vc, &rec, orders)?;
+        self.idx_seek_hint.retain(|&r| r != root_pgno);
+        if res != 0 && self.vcursors[vc].valid {
+            self.idx_seek_hint.push(root_pgno);
+        }
+        Ok(hits)
+    }
+
+    /// [`Self::seek_index_equal`] for a check of the engine that has no counterpart in C's
+    /// program (no cursor moves).
+    pub fn seek_index_equal_quiet(
+        &mut self,
+        root_pgno: Pgno,
+        key_vals: &[Value],
+        orders: &[KeySortOrder],
+    ) -> Result<Vec<Vec<Value>>> {
+        let was = self.c_defer_idx;
+        self.c_defer_idx = true;
+        let n_before = self.idx_scans.len();
+        let hits = self.seek_index_equal(root_pgno, key_vals, orders);
+        self.idx_scans.truncate(n_before);
+        self.c_defer_idx = was;
+        hits
+    }
+
+    /// A new row is about to be checked and written: no index write cursor is where an
+    /// earlier `OP_NoConflict` of the statement left it for this row.
+    pub fn cc_clear_seek_hints(&mut self) {
+        self.idx_seek_hint.clear();
+    }
+
+    /// `OP_NoConflict` / `OP_NotFound` on the cursor `(root, role)` of an index (or of the
+    /// PRIMARY KEY b-tree of a WITHOUT ROWID table): `sqlite3BtreeIndexMoveto` to `key_vals`.
+    /// Nothing moves when the cursor is already on an entry with that key. With
+    /// `for_insert` an insert of the key that follows uses the position
+    /// (`OPFLAG_USESEEKRESULT`). Returns whether an entry with the key exists.
+    pub fn cc_index_moveto(
+        &mut self,
+        root_pgno: Pgno,
+        role: u8,
+        key_vals: &[Value],
+        orders: &[KeySortOrder],
+        for_insert: bool,
+    ) -> Result<bool> {
+        if self.pager.page_count() == 0 || root_pgno == 0 {
+            return Ok(false);
+        }
+        let vc = self.vc_open(root_pgno, role);
+        self.vcursors[vc].is_index = true;
+        let rec = sqliters_types::record::encode_record_with_encoding(key_vals, self.encoding());
+        if self.vcursors[vc].valid && self.vc_depth(vc) > 0 {
+            let pg = self.vc_path(vc)[self.vc_depth(vc) - 1];
+            let ix = usize::from(self.vcursors[vc].ix);
+            if self.index_cell_equals(pg, ix, &rec, orders)? {
+                return Ok(true);
+            }
+        }
+        let res = self.vc_index_moveto(vc, &rec, orders)?;
+        if for_insert {
+            self.idx_seek_hint.retain(|&r| r != root_pgno);
+            if res != 0 && self.vcursors[vc].valid {
+                self.idx_seek_hint.push(root_pgno);
+            }
+        }
+        Ok(res == 0)
+    }
+
+    /// `OP_Delete` on the index cursor a one-pass DELETE scans with (`iIdxNoSeek` of
+    /// `sqlite3GenerateRowDelete`): the cursor is on the entry, nothing is searched; with
+    /// `OPFLAG_SAVEPOSITION` (see [`Self::cc_save_position`]) the cursor keeps its place for
+    /// the `OP_Next` that follows.
+    pub fn delete_index_at_cursor(
+        &mut self,
+        root_pgno: Pgno,
+        key_vals: &[Value],
+        orders: &[KeySortOrder],
+    ) -> Result<bool> {
+        if self.dtrace_persistent() {
+            sqliters_types::dtrace!("TR|w|del|root={} len=?", root_pgno);
+        }
+        self.delete_index_impl(root_pgno, key_vals, orders, true, true)
     }
 
     /// General form of the index delete: locates the entry comparing decoded values (cells
@@ -5196,12 +5602,55 @@ impl Btree {
         root_pgno: Pgno,
         key_vals: &[Value],
         orders: &[KeySortOrder],
+        moveto: bool,
+        positioned: bool,
     ) -> Result<bool> {
         self.tr_ins = false;
-        self.save_cursors_for_mutation(Some(root_pgno), None)?;
+        let vc = self.vc_open(root_pgno, pins::VC_WRITE);
+        self.vcursors[vc].is_index = true;
+        self.vc_keep = vc;
+        let saved = self.save_cursors_for_mutation(Some(root_pgno), None);
+        self.vc_keep = usize::MAX;
+        saved?;
         let enc = self.encoding();
         let usable = self.pager.usable_size();
         let mut cur = balance::BalCursor::new(root_pgno);
+        cur.vc = vc;
+        self.idx_seek_hint.retain(|&r| r != root_pgno);
+        let mut on_entry = positioned && self.vcursors[vc].valid && self.vc_depth(vc) > 0;
+        if on_entry {
+            // the cursor must be on an entry with this key, else the entry is searched
+            let pg = self.vc_path(vc)[self.vc_depth(vc) - 1];
+            let ix = usize::from(self.vcursors[vc].ix);
+            let rec = sqliters_types::record::encode_record_with_encoding(key_vals, self.encoding());
+            on_entry = self.index_cell_equals(pg, ix, &rec, orders)?;
+        }
+        // bPreserve of sqlite3BtreeDelete (0: no BTREE_SAVEPOSITION)
+        let save = on_entry && self.c_save_position == Some(root_pgno);
+        let mut preserve: u8 = u8::from(save);
+        let key_rec = if save {
+            sqliters_types::record::encode_record_with_encoding(key_vals, enc)
+        } else {
+            Vec::new()
+        };
+        if on_entry && !self.vc_to_bal_checked(vc, &mut cur)? {
+            // (the cursor's stack is out of date: the entry is searched from the root)
+            on_entry = false;
+            cur = balance::BalCursor::new(root_pgno);
+            cur.vc = vc;
+        }
+        if on_entry {
+            // (the delete starts on the page the cursor is on)
+        } else if moveto {
+            // OP_IdxDelete: sqlite3BtreeIndexMoveto (the cursor may already be on the page;
+            // the key is needed as a record only to test that).
+            if self.vcursors[vc].valid && self.vc_depth(vc) > 0 {
+                let rec = sqliters_types::record::encode_record_with_encoding(key_vals, enc);
+                self.index_moveto_start(vc, &mut cur, &rec, orders)?;
+            } else {
+                self.index_moveto_start(vc, &mut cur, &[], orders)?;
+            }
+        }
         loop {
             let pgno = cur.page();
             // Raw probes first (no cell is decoded into heap values); pages they cannot judge
@@ -5238,11 +5687,22 @@ impl Btree {
             };
             match step {
                 Step::Descend(slot, child) => {
-                    cur.descend(slot, child)?;
+                    self.bc_descend(&mut cur, slot, child)?;
                     continue;
                 }
                 Step::NotFound => return Ok(false),
                 Step::LeafHit(idx, cell_off, cell_len) => {
+                    if save {
+                        let d = self.pager.read_page(pgno)?;
+                        let (_, n_cell, n_free) = balance::page_state(d, pgno, usable as usize)?;
+                        preserve = if (n_free as usize + cell_len + 2) > usable as usize * 2 / 3
+                            || n_cell == 1
+                        {
+                            1
+                        } else {
+                            2
+                        };
+                    }
                     let needs_balance = {
                         let secure = self.zero_freed_cells();
                         let raw_mut = self.pager.write_page(pgno)?;
@@ -5256,9 +5716,24 @@ impl Btree {
                     if needs_balance {
                         self.balance(&mut cur)?;
                     }
+                    self.idx_after_delete(vc, preserve, pgno, idx, &key_rec, orders)?;
                     return Ok(true);
                 }
-                Step::Parsed => {}
+                Step::Parsed => {
+                    // (a page with a cell that continues on overflow pages: C's binary search
+                    // reads each such cell it probes through the page cache — `accessPayload`
+                    // in `sqlite3BtreeIndexMoveto`; a cursor that is already on the entry
+                    // compares nothing)
+                    if !on_entry {
+                        let flag = self.pager.read_page(pgno)?.get(hdr_off).copied().unwrap_or(0);
+                        if flag == 0x0a || flag == 0x02 {
+                            let kind = crate::balance::PgKind::decode(flag, usable)?;
+                            let rec =
+                                sqliters_types::record::encode_record_with_encoding(key_vals, enc);
+                            let _ = self.index_page_search_full(pgno, &kind, &rec, orders, enc, true)?;
+                        }
+                    }
+                }
             }
             match self.read_parsed_page(pgno)? {
                 ParsedPage::IndexLeaf { cells } => {
@@ -5286,6 +5761,7 @@ impl Btree {
                     if needs_balance && cur.i_page != 0 {
                         self.balance(&mut cur)?;
                     }
+                    self.idx_after_delete(vc, preserve.min(1), pgno, idx, &key_rec, orders)?;
                     return Ok(true);
                 }
                 ParsedPage::IndexInterior { cells, right_child } => {
@@ -5300,6 +5776,7 @@ impl Btree {
                             Ordering::Less => {}
                             Ordering::Equal => {
                                 self.delete_index_interior_cell(&mut cur, ci)?;
+                                self.idx_after_delete(vc, preserve.min(1), pgno, ci, &key_rec, orders)?;
                                 return Ok(true);
                             }
                             Ordering::Greater => {
@@ -5308,11 +5785,45 @@ impl Btree {
                             }
                         }
                     }
-                    cur.descend(next.0, next.1)?;
+                    self.bc_descend(&mut cur, next.0, next.1)?;
                 }
                 _ => return Err(SqliteError::corrupt("expected index page")),
             }
         }
+    }
+
+    /// The end of `sqlite3BtreeDelete` for the index cursor `vc` (`preserve`: bPreserve).
+    fn idx_after_delete(
+        &mut self,
+        vc: usize,
+        preserve: u8,
+        pgno: Pgno,
+        idx: usize,
+        key_rec: &[u8],
+        orders: &[KeySortOrder],
+    ) -> Result<()> {
+        if preserve == 2 && self.vc_is_on(vc, pgno) {
+            // CURSOR_SKIPNEXT: the entry after the deleted one moved into its slot.
+            let hdr = if pgno == 1 { 100 } else { 0 };
+            let n_cell = balance::get2(self.pager.read_page(pgno)?, hdr + 3);
+            let c = &mut self.vcursors[vc];
+            c.valid = false;
+            if idx >= n_cell {
+                c.skip = -1;
+                c.ix = n_cell.saturating_sub(1) as u16;
+            } else {
+                c.skip = 1;
+                c.ix = idx as u16;
+            }
+            return Ok(());
+        }
+        self.vc_move_to_root(vc)?;
+        if preserve != 0 {
+            // btreeReleaseAllCursorPages + CURSOR_REQUIRESSEEK with the saved key
+            self.vc_release_all(vc);
+            self.vcursors[vc].seek_key = Some((key_rec.to_vec(), orders.to_vec()));
+        }
+        Ok(())
     }
 
     /// The interior-cell branch of `sqlite3BtreeDelete`: `cur` points at an interior index page
@@ -5362,7 +5873,7 @@ impl Btree {
         };
 
         // sqlite3BtreePrevious(): the right-most leaf below the left child of the cell.
-        cur.descend(i_cell_idx, child)?;
+        self.bc_descend(cur, i_cell_idx, child)?;
         loop {
             if child < 2 || child > self.pager.page_count() {
                 return Err(SqliteError::corrupt("child page number out of range"));
@@ -5373,7 +5884,7 @@ impl Btree {
                 BtreePageType::IndexInterior => {
                     let n = be2(d, 3);
                     let rc = be4(d, 8);
-                    cur.descend(n, rc)?;
+                    self.bc_descend(cur, n, rc)?;
                     child = rc;
                 }
                 _ => return Err(SqliteError::corrupt("expected index page")),
@@ -5476,6 +5987,13 @@ impl Btree {
             self.balance(cur)?;
         }
         if cur.i_page > i_cell_depth {
+            // "releasePageNotNull(pCur->pPage); pCur->iPage--; while( pCur->iPage>iCellDepth )
+            // releasePage(pCur->apPage[pCur->iPage--]);"
+            if cur.vc != usize::MAX {
+                while self.vc_depth(cur.vc) > i_cell_depth + 1 {
+                    self.vc_move_to_parent(cur.vc);
+                }
+            }
             cur.i_page = i_cell_depth;
             if self.dtrace_persistent() {
                 sqliters_types::dtrace!(

@@ -1096,7 +1096,7 @@ impl Schema {
         };
 
         if need_read_tx {
-            let _ = btree.pager_mut().end_read_if_unused();
+            let _ = btree.end_read_if_unused();
         }
         res
     }
@@ -2761,6 +2761,7 @@ pub(crate) fn scan_table_incremental(
         return Ok(Vec::new());
     }
     let cid = btree.open_table_cursor(root_pgno, false);
+    btree.cursor_mark_c(cid);
     let res = (|| {
         let mut out = Vec::new();
         if !btree.cursor_first(cid)? {
@@ -2793,6 +2794,7 @@ pub(crate) fn scan_table_incremental_with_services(
         return Ok(Vec::new());
     }
     let cid = btree.open_table_cursor(root_pgno, false);
+    btree.cursor_mark_c(cid);
     let res = (|| {
         let mut out = Vec::new();
         if !btree.cursor_first(cid)? {
@@ -2828,6 +2830,7 @@ pub(crate) fn scan_index_incremental_with_services(
         return Ok(Vec::new());
     }
     let cid = btree.open_index_cursor(root_pgno, orders, false);
+    btree.cursor_mark_c(cid);
     let res = (|| {
         let mut out = Vec::new();
         if !btree.cursor_first(cid)? {

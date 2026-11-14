@@ -667,7 +667,7 @@ impl Backup {
             && let Some(src_slot) = src_inner.db_set.slot_mut(src_db_id)
             && let Some(ref mut src_bt) = src_slot.btree
         {
-            let _ = src_bt.pager_mut().end_read_if_unused();
+            let _ = src_bt.end_read_if_unused();
         }
 
         step_result

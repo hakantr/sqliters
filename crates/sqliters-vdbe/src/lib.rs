@@ -455,6 +455,9 @@ pub struct SingleRowInsertIndex {
     pub orders: Vec<KeySortOrder>,
     /// Logical column index (`Some(ci)`) or `None` for the `INTEGER PRIMARY KEY` / `rowid`.
     pub col_slots: Vec<Option<usize>>,
+    /// A UNIQUE index: extended result code and message of its constraint. The plan tests
+    /// every such index before its first write (`OP_NoConflict`), in the order of the list.
+    pub unique: Option<(i32, String)>,
 }
 
 /// Precompiled direct single-row table `INSERT` plan (when no triggers, FKs, or unique secondary
@@ -1373,7 +1376,10 @@ fn step_ops_loop(
                     None
                 } else {
                     let btree = storage.btree_mut(db)?;
-                    Some(btree.open_table_cursor(root_pgno, false))
+                    let id = btree.open_table_cursor(root_pgno, false);
+                    // (OP_OpenRead: the cursor of C's program — its page references are C's)
+                    btree.cursor_mark_c(id);
+                    Some(id)
                 };
                 cursors[cid] = CursorState::Table {
                     db,
@@ -1398,10 +1404,9 @@ fn step_ops_loop(
                     (None, orders)
                 } else {
                     let btree = storage.btree_mut(db)?;
-                    (
-                        Some(btree.open_index_cursor(root_pgno, orders.to_vec(), false)),
-                        Arc::clone(&empty_orders),
-                    )
+                    let id = btree.open_index_cursor(root_pgno, orders.to_vec(), false);
+                    btree.cursor_mark_c(id);
+                    (Some(id), Arc::clone(&empty_orders))
                 };
                 cursors[cid] = CursorState::Index {
                     db,
@@ -1517,6 +1522,12 @@ fn step_ops_loop(
                     } => {
                         let (db, root, wr) = (*db, *root_pgno, *writable);
                         let btree = storage.btree_mut(db)?;
+                        if wr {
+                            // OP_NotExists / OP_SeekRowid on the table's write cursor (the
+                            // loop of a `rowid = ?` UPDATE / DELETE): the cursor C's program
+                            // writes through is moved to the row.
+                            btree.cc_seek_rowid(root, sqliters_btree::VC_WRITE, rowid)?;
+                        }
                         let id =
                             *cursor_id.get_or_insert_with(|| btree.open_table_cursor(root, wr));
                         (db, id)

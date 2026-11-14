@@ -39,9 +39,25 @@ impl OnePass {
     }
 }
 
+/// The kind of loop the planner picked for the one table of a DELETE / UPDATE (as far as the
+/// replay of its cursor movements needs to know, see `cscan.rs`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ScanShape {
+    #[default]
+    Other,
+    /// `OP_Rewind` .. `OP_Next` over the table b-tree (the PRIMARY KEY b-tree of a WITHOUT
+    /// ROWID table).
+    FullTable,
+    /// `OP_SeekGE` / `OP_SeekGT` (or `OP_Rewind`) .. `OP_Next` over a range of rowids.
+    RowidRange,
+    /// `OP_SeekRowid` for each value of `rowid IN (...)`, ascending.
+    RowidIn,
+}
+
 /// What `sqlite3WhereOkOnePass` reports about the single-table loop of a DELETE / UPDATE.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ScanInfo {
+    pub shape: ScanShape,
     /// `WHERE_ONEROW`: rowid equality, or equality on every column of a UNIQUE index.
     pub one_row: bool,
     /// `aiCurOnePass[1]`: root of the secondary index the loop runs on, if any.
@@ -49,6 +65,8 @@ pub(crate) struct ScanInfo {
     /// `WHERE_MULTI_OR`: the loop is a union of index scans (OR optimisation). An UPDATE then
     /// cannot run in one pass (a DELETE can: it passes `WHERE_DUPLICATES_OK`).
     pub multi_or: bool,
+    /// `rowid = X`: the loop is one `OP_NotExists` / `OP_SeekRowid` on the table cursor.
+    pub rowid_seek: bool,
 }
 
 /// `Index.uniqNotNull`: a UNIQUE index all of whose key columns are NOT NULL table columns.
@@ -69,20 +87,26 @@ fn index_uniq_not_null(tbl: &TableSchema, idx: &IndexSchema) -> bool {
 pub(crate) fn scan_info(plan: &AccessPlan, tbl: &TableSchema, hinted: bool) -> ScanInfo {
     match plan {
         AccessPlan::RowidSeek { .. } => ScanInfo {
+            shape: ScanShape::Other,
             one_row: true,
             index_root: None,
             multi_or: false,
+            rowid_seek: true,
         },
         // parse.y: `x IN (y)` with a single constant right-hand side is rewritten to `x == y`.
         AccessPlan::RowidIn { list } if list.len() == 1 => ScanInfo {
+            shape: ScanShape::Other,
             one_row: true,
             index_root: None,
             multi_or: false,
+            rowid_seek: false,
         },
         AccessPlan::MultiIndexOr { .. } => ScanInfo {
+            shape: ScanShape::Other,
             one_row: false,
             index_root: None,
             multi_or: true,
+            rowid_seek: false,
         },
         AccessPlan::IndexSeek {
             index,
@@ -97,22 +121,44 @@ pub(crate) fn scan_info(plan: &AccessPlan, tbl: &TableSchema, hinted: bool) -> S
             // whereLoopAddBtreeIndex: uniqNotNull, or a one-column UNIQUE index with `==`.
             let general = index_uniq_not_null(tbl, index) || index.columns.len() == 1;
             ScanInfo {
+                shape: ScanShape::Other,
                 one_row: all_eq && (shortcut || general || is_pk_tree),
                 index_root: (!is_pk_tree).then_some(index.root_pgno),
                 multi_or: false,
+                rowid_seek: false,
             }
         }
         AccessPlan::IndexFullScan { index, .. } | AccessPlan::IndexRangeScan { index, .. } => {
             let is_pk_tree = tbl.without_rowid && index.root_pgno == tbl.root_pgno;
             ScanInfo {
+                shape: ScanShape::Other,
                 one_row: false,
                 index_root: (!is_pk_tree).then_some(index.root_pgno),
                 multi_or: false,
+                rowid_seek: false,
             }
         }
-        AccessPlan::FullScan | AccessPlan::RowidRange { .. } | AccessPlan::RowidIn { .. } => {
-            ScanInfo::default()
-        }
+        // (a WITHOUT ROWID table: the loop runs on its PRIMARY KEY b-tree)
+        AccessPlan::FullScan => ScanInfo {
+            shape: ScanShape::FullTable,
+            ..ScanInfo::default()
+        },
+        AccessPlan::RowidRange { .. } => ScanInfo {
+            shape: if tbl.without_rowid {
+                ScanShape::Other
+            } else {
+                ScanShape::RowidRange
+            },
+            ..ScanInfo::default()
+        },
+        AccessPlan::RowidIn { .. } => ScanInfo {
+            shape: if tbl.without_rowid {
+                ScanShape::Other
+            } else {
+                ScanShape::RowidIn
+            },
+            ..ScanInfo::default()
+        },
     }
 }
 
@@ -675,7 +721,7 @@ pub(crate) fn collect_uncorrelated_scalar_subqueries(
     }
 }
 
-fn select_is_self_contained(db_set: &DatabaseSet, sel: &SelectStmt) -> bool {
+pub(crate) fn select_is_self_contained(db_set: &DatabaseSet, sel: &SelectStmt) -> bool {
     if !sel.ctes.is_empty() || !sel.body.compounds.is_empty() {
         return false;
     }

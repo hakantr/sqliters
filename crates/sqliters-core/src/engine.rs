@@ -140,6 +140,18 @@ pub struct StmtTxTracker {
     /// Set while a one-pass DELETE removes a row: root of the index the scan runs on
     /// (`iIdxNoSeek` of `sqlite3GenerateRowDelete`), whose entry is deleted after the table row.
     pub delete_idx_no_seek: Option<Pgno>,
+    /// Nesting of `execute_read_body` / `execute_write_body` (a statement run from inside
+    /// another one). The cursors of a statement are closed when the outermost one ends.
+    pub exec_depth: u32,
+    /// The rowids a `rowid IN (...)` loop seeks, ascending (left by the access plan for the
+    /// replay of the loop's cursor, `cscan.rs`).
+    pub c_rowid_in: Option<Vec<i64>>,
+    /// The rowid the `rowid = X` loop of the running DELETE / UPDATE seeks — `cscan.rs`.
+    pub c_rowid_seek: Option<i64>,
+    /// The lower bound the rowid-range loop of the running DELETE / UPDATE seeks
+    /// (`Some(None)`: the range has no lower bound, the loop starts with `OP_Rewind`; the
+    /// flag: `OP_SeekGT`) — `cscan.rs`.
+    pub c_rowid_lo: Option<Option<(i64, bool)>>,
     /// Set when REPLACE resolved a rowid conflict by keeping the table row (only its index
     /// entries are deleted, `insert.c` `case OE_Replace`) on a table without any index:
     /// `(table root, rowid)`. C's data cursor was then only positioned by `OP_NotExists` and
@@ -171,6 +183,12 @@ pub struct StmtTxTracker {
     /// updated after that see the same value even when the sub-select reads the table being
     /// updated.
     pub once_subqueries: Vec<(usize, Option<Value>)>,
+    /// `OP_Once` for the right-hand side of `x IN (SELECT ...)`: C fills the ephemeral index
+    /// of a sub-select that does not depend on the row once per run of the statement. Keyed by
+    /// the address of the sub-select; `None`: it depends on the row (it is run every time).
+    /// Only for the top-level statement (a trigger program runs its `OP_Once` once per
+    /// invocation).
+    pub once_in_subqueries: Vec<(usize, Option<Rc<QueryOutput>>)>,
     /// `Parse.pAinc` (insert.c `AutoincInfo`): one counter per AUTOINCREMENT table the top-level
     /// statement (or one of its triggers) inserts into. The counter is read from
     /// `sqlite_sequence` once, raised by every rowid the statement computes (`OP_MemMax` /
@@ -1258,7 +1276,7 @@ pub(crate) fn rollback_all_databases(
                 TransactionState::Read => {
                     let trip_res = bt.trip_cursors(extended::SQLITE_ABORT_ROLLBACK, write_only);
                     let end_res = if !retain_read {
-                        bt.pager_mut().end_read_if_unused()
+                        bt.end_read_if_unused()
                     } else {
                         Ok(())
                     };
@@ -2281,7 +2299,7 @@ pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
                                                 retain,
                                             );
                                         } else if !retain {
-                                            let _ = pbt.pager_mut().end_read_if_unused();
+                                            let _ = pbt.end_read_if_unused();
                                         }
                                     }
                                 }
@@ -2532,9 +2550,26 @@ pub(crate) fn execute_read_body(
     stmt: &Stmt,
     params: &[Value],
 ) -> Result<QueryOutput> {
+    ctx.stmt_tx.exec_depth += 1;
     let res = execute_read_body_inner(ctx, stmt, params);
+    c_statement_halt(ctx);
     note_corrupt_in_transaction(ctx, &res);
     res
+}
+
+/// `sqlite3VdbeHalt` → `closeAllCursors`: the statement's cursors give their pages back, before
+/// its statement journal is released and before an autocommit transaction ends.
+fn c_statement_halt(ctx: &mut ExecContext<'_>) {
+    ctx.stmt_tx.exec_depth = ctx.stmt_tx.exec_depth.saturating_sub(1);
+    if ctx.stmt_tx.exec_depth == 0 && ctx.stmt_tx.subprogram_stack.is_empty() {
+        ctx.stmt_tx.c_rowid_seek = None;
+        ctx.stmt_tx.c_rowid_lo = None;
+        for slot in ctx.db_set.slots_mut() {
+            if let Some(ref mut bt) = slot.btree {
+                bt.statement_end();
+            }
+        }
+    }
 }
 
 fn execute_read_body_inner(
@@ -3582,12 +3617,16 @@ pub(crate) fn execute_write_body(
         ));
     }
     if !changes_cookie {
+        ctx.stmt_tx.exec_depth += 1;
         let res = execute_write_body_inner(ctx, stmt, params);
+        c_statement_halt(ctx);
         note_corrupt_in_transaction(ctx, &res);
         return res;
     }
     let saved = ctx.db_set.cookie_scope_enter();
+    ctx.stmt_tx.exec_depth += 1;
     let res = execute_write_body_inner(ctx, stmt, params);
+    c_statement_halt(ctx);
     ctx.db_set.cookie_scope_exit(&saved);
     note_corrupt_in_transaction(ctx, &res);
     res
@@ -3907,7 +3946,7 @@ pub(crate) fn end_autocommit_reads_started_by_stmt(ctx: &mut ExecContext<'_>) {
             && let Some(ref mut bt) = ctx.db_set.slots_mut()[idx].btree
             && bt.transaction_state() == TransactionState::Read
         {
-            let _ = bt.pager_mut().end_read_if_unused();
+            let _ = bt.end_read_if_unused();
         }
     }
 }
@@ -12366,10 +12405,12 @@ fn execute_access_plan(
             materialize_index_hits(ctx, db_id, tbl, index, decoded_hits)
         }
         AccessPlan::RowidSeek { key_expr } => {
+            ctx.stmt_tx.c_rowid_seek = None;
             let kv = eval_expr(ctx, key_expr, params, outer_scopes, ctes, None)?;
             let Some(rid) = eval_rowid_target_int(kv) else {
                 return Ok(Vec::new());
             };
+            ctx.stmt_tx.c_rowid_seek = Some(rid);
             let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree else {
                 return Ok(Vec::new());
             };
@@ -12380,11 +12421,27 @@ fn execute_access_plan(
             }
         }
         AccessPlan::RowidRange { lower, upper } => {
+            ctx.stmt_tx.c_rowid_lo = None;
+            let mut c_lo: Option<(i64, bool)> = None;
             let low_bound = if let Some(lb) = lower {
                 let v = eval_expr(ctx, &lb.expr, params, outer_scopes, ctes, None)?;
+                // (the key C's OP_SeekGE / OP_SeekGT is given: a bound with a fraction is
+                // sought as "greater than its integer part")
+                let frac_bound = match &v {
+                    Value::Real(r)
+                        if r.is_finite()
+                            && r.floor() != *r
+                            && *r > i64::MIN as f64
+                            && *r < i64::MAX as f64 =>
+                    {
+                        Some((r.floor() as i64, true))
+                    }
+                    _ => None,
+                };
                 let Some(b) = eval_rowid_range_bound(v, lb.inclusive, true) else {
                     return Ok(Vec::new());
                 };
+                c_lo = frac_bound.or(b.map(|(k, inclusive)| (k, !inclusive)));
                 b
             } else {
                 None
@@ -12398,6 +12455,7 @@ fn execute_access_plan(
             } else {
                 None
             };
+            ctx.stmt_tx.c_rowid_lo = Some(c_lo);
             let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree else {
                 return Ok(Vec::new());
             };
@@ -12417,6 +12475,8 @@ fn execute_access_plan(
             }
             rids.sort_unstable();
             rids.dedup();
+            // (the values C's loop seeks, in the order of its ephemeral index — `cscan.rs`)
+            ctx.stmt_tx.c_rowid_in = Some(rids.clone());
             let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree else {
                 return Ok(Vec::new());
             };
@@ -16238,7 +16298,33 @@ fn eval_expr_rt(
             };
             let n = lv_vec.len();
             let sub_meta = infer_select_stmt_meta(subquery, scopes, ctx.db_set, ctes);
-            let sub_out = exec_select(ctx, subquery, params, scopes, ctes)?;
+            let sub_out: Rc<QueryOutput> = {
+                let key = &**subquery as *const SelectStmt as usize;
+                let top_level = ctx.stmt_tx.subprogram_stack.is_empty();
+                let slot = if top_level {
+                    ctx.stmt_tx
+                        .once_in_subqueries
+                        .iter()
+                        .position(|(k, _)| *k == key)
+                } else {
+                    None
+                };
+                match slot.map(|i| ctx.stmt_tx.once_in_subqueries[i].1.clone()) {
+                    Some(Some(done)) => done,
+                    Some(None) => Rc::new(exec_select(ctx, subquery, params, scopes, ctes)?),
+                    None => {
+                        let once = top_level
+                            && crate::dml_c::select_is_self_contained(ctx.db_set, subquery);
+                        let out = Rc::new(exec_select(ctx, subquery, params, scopes, ctes)?);
+                        if top_level {
+                            ctx.stmt_tx
+                                .once_in_subqueries
+                                .push((key, once.then(|| Rc::clone(&out))));
+                        }
+                        out
+                    }
+                }
+            };
             if !sub_out.column_names.is_empty() && sub_out.column_names.len() != n {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
@@ -18299,7 +18385,7 @@ fn remove_row_and_indexes_opt(
             TableRowKey::Rowid(rowid) => bt.delete_table(tbl.root_pgno, *rowid),
             TableRowKey::WithoutRowidPk(pk) => {
                 let pk_orders = tbl.without_rowid_pk_orders();
-                bt.delete_index(tbl.root_pgno, pk, &pk_orders)
+                bt.delete_index_at_cursor(tbl.root_pgno, pk, &pk_orders)
             }
         };
     }
@@ -18334,7 +18420,7 @@ fn remove_row_and_indexes_opt(
         let removed = match rkey {
             TableRowKey::Rowid(rid) => {
                 let removed = bt.delete_table(tbl.root_pgno, *rid)?;
-                bt.delete_index(root, &keys, &orders)?;
+                bt.delete_index_at_cursor(root, &keys, &orders)?;
                 if removed && let Some(inst_id) = ctx.db_set.slot(db_id).map(|s| s.schema_instance_id) {
                     ctx.db_set.expire_blobs_for_row(inst_id, &tbl.name, *rid);
                 }
@@ -18342,7 +18428,7 @@ fn remove_row_and_indexes_opt(
             }
             TableRowKey::WithoutRowidPk(pk) => {
                 let pk_orders = tbl.without_rowid_pk_orders();
-                let removed = bt.delete_index(tbl.root_pgno, pk, &pk_orders)?;
+                let removed = bt.delete_index_at_cursor(tbl.root_pgno, pk, &pk_orders)?;
                 bt.delete_index(root, &keys, &orders)?;
                 removed
             }
@@ -18369,7 +18455,7 @@ fn remove_row_and_indexes_opt(
         }
         TableRowKey::WithoutRowidPk(pk) => {
             let pk_orders = tbl.without_rowid_pk_orders();
-            bt.delete_index(tbl.root_pgno, pk, &pk_orders)
+            bt.delete_index_at_cursor(tbl.root_pgno, pk, &pk_orders)
         }
     }
 }
@@ -18519,6 +18605,12 @@ fn delete_row_via_pipeline_opt(
         None
     };
 
+    if matches!(origin, MutationOrigin::ReplaceConflictDelete) && !keep_table_row {
+        // insert.c `case OE_Replace` → `sqlite3GenerateRowDelete(.., ONEPASS_OFF, iThisCur)`:
+        // the row that is in the way is sought on the table cursor (`OP_NotExists`) before
+        // its index entries are deleted.
+        c_write_cursor_to_row(ctx, db_id, tbl, rkey)?;
+    }
     let deleted =
         remove_row_and_indexes_opt(ctx, db_id, tbl, indexes, rkey, params, keep_table_row)?;
     if deleted {
@@ -18581,6 +18673,9 @@ fn recheck_uniqueness_abort(
         if idx.table_without_rowid && idx.origin == "pk" {
             let is_self =
                 existing_self_key.is_some_and(|sk| table_keys_equal(tbl, final_key, sk, enc));
+            if !is_self {
+                c_wr_pk_no_conflict(ctx, db_id, tbl, final_key)?;
+            }
             if !is_self && seek_table_raw_entry(ctx, db_id, tbl, final_key)?.is_some() {
                 return Err(SqliteError::constraint(
                     extended::SQLITE_CONSTRAINT_PRIMARYKEY,
@@ -18599,11 +18694,25 @@ fn recheck_uniqueness_abort(
             continue;
         }
         let orders = idx.key_sort_orders();
+        // C runs `OP_NoConflict` for every UNIQUE index of an INSERT, and in an UPDATE only for
+        // the indexes it rewrites (`aRegIdx[]`).
+        let c_checks_index = match &ctx.stmt_tx.update_index_rewrite {
+            Some((root, mask)) if *root == tbl.root_pgno && existing_self_key.is_some() => {
+                None::<usize>
+                    .and_then(|p| mask.get(p).copied())
+                    .unwrap_or(true)
+            }
+            _ => true,
+        };
         let hits = if let Some(ref mut bt) =
             ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut())
             && bt.pager().page_count() > 0
         {
-            bt.seek_index_equal(idx.root_pgno, &indexed_vals, &orders[..indexed_vals.len()])?
+            if c_checks_index {
+                bt.seek_index_no_conflict(idx.root_pgno, &indexed_vals, &orders[..indexed_vals.len()])?
+            } else {
+                bt.seek_index_equal_quiet(idx.root_pgno, &indexed_vals, &orders[..indexed_vals.len()])?
+            }
         } else {
             Vec::new()
         };
@@ -19004,7 +19113,11 @@ fn run_single_trigger(
     let saved_last_rowid = ctx.runtime.last_insert_rowid;
     let saved_last_changes = ctx.runtime.last_changes;
 
+    // OP_Program: the trigger program runs in its own frame, with its own cursors, which are
+    // closed when it returns (`sqlite3VdbeFrameRestore`).
+    c_program_frame(ctx, true);
     let exec_res = run_single_trigger_body(ctx, trig, outer_scopes, outer_or_conflict);
+    c_program_frame(ctx, false);
 
     let _ = ctx.stmt_tx.subprogram_stack.pop();
     ctx.runtime.last_insert_rowid = saved_last_rowid;
@@ -19228,6 +19341,46 @@ fn replace_conflict_delete_row(
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn validate_and_write_row(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    indexes: &[IndexSchema],
+    candidate_rowid: Option<i64>,
+    raw_vals: Vec<Value>,
+    stmt_conflict: Option<ConflictAction>,
+    existing_self_key: Option<&TableRowKey>,
+    params: &[Value],
+    bump_last_rowid: bool,
+    mutation_dispatch: Option<(MutationOrigin, Option<MutationRow>)>,
+    is_catalog: bool,
+) -> Result<Option<(TableRowKey, Vec<Value>)>> {
+    // The lookups this function makes to check the row are the engine's own; C's program
+    // moves its write cursors (`OP_NotExists`, `OP_NoConflict`), which is done explicitly.
+    c_dml_silent(ctx, db_id, true);
+    c_register_index_order(ctx, db_id, tbl, indexes);
+    if let Some(bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
+        bt.cc_clear_seek_hints();
+    }
+    let res = validate_and_write_row_inner(
+        ctx,
+        db_id,
+        tbl,
+        indexes,
+        candidate_rowid,
+        raw_vals,
+        stmt_conflict,
+        existing_self_key,
+        params,
+        bump_last_rowid,
+        mutation_dispatch,
+        is_catalog,
+    );
+    c_dml_silent(ctx, db_id, false);
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_and_write_row_inner(
     ctx: &mut ExecContext<'_>,
     db_id: DatabaseId,
     tbl: &TableSchema,
@@ -19458,6 +19611,9 @@ fn validate_and_write_row(
         if idx.table_without_rowid && idx.origin == "pk" {
             let is_self =
                 existing_self_key.is_some_and(|sk| table_keys_equal(tbl, &final_key, sk, enc));
+            if !is_self {
+                c_wr_pk_no_conflict(ctx, db_id, tbl, &final_key)?;
+            }
             if !is_self
                 && let Some(conflict_payload) = seek_table_raw_entry(ctx, db_id, tbl, &final_key)?
             {
@@ -19506,11 +19662,25 @@ fn validate_and_write_row(
             continue;
         }
         let orders = idx.key_sort_orders();
+        // C runs `OP_NoConflict` for every UNIQUE index of an INSERT, and in an UPDATE only for
+        // the indexes it rewrites (`aRegIdx[]`).
+        let c_checks_index = match &ctx.stmt_tx.update_index_rewrite {
+            Some((root, mask)) if *root == tbl.root_pgno && existing_self_key.is_some() => {
+                indexes.iter().position(|i| i.root_pgno == idx.root_pgno)
+                    .and_then(|p| mask.get(p).copied())
+                    .unwrap_or(true)
+            }
+            _ => true,
+        };
         let hits = if let Some(ref mut bt) =
             ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut())
             && bt.pager().page_count() > 0
         {
-            bt.seek_index_equal(idx.root_pgno, &indexed_vals, &orders[..indexed_vals.len()])?
+            if c_checks_index {
+                bt.seek_index_no_conflict(idx.root_pgno, &indexed_vals, &orders[..indexed_vals.len()])?
+            } else {
+                bt.seek_index_equal_quiet(idx.root_pgno, &indexed_vals, &orders[..indexed_vals.len()])?
+            }
         } else {
             Vec::new()
         };
@@ -19615,6 +19785,17 @@ fn validate_and_write_row(
             return Ok(None);
         };
         let old_vals = decode_table_logical_row(ctx, db_id, tbl, old_key, &op, params)?;
+        // update.c: "if the PK of the row is changing, then the GenerateConstraintChecks()
+        // above may have moved cursor iDataCur. Reseek it." (`OP_NotExists` / `OP_NotFound`
+        // with the old key; the uniqueness test of the new key left the cursor there.)
+        let key_changes = if tbl.without_rowid {
+            !table_keys_equal(tbl, &final_key, old_key, enc)
+        } else {
+            old_key.rowid_or_zero() != rowid
+        };
+        if key_changes {
+            c_write_cursor_to_row(ctx, db_id, tbl, old_key)?;
+        }
         if *ctx.foreign_keys {
             check_parent_update_restrict(ctx, db_id, tbl, &old_vals, &raw_vals, params)?;
         }
@@ -19689,6 +19870,9 @@ fn validate_and_write_row(
         && !tbl.foreign_keys.is_empty()
     {
         check_insert_fk_immediately(ctx, db_id, tbl, rowid, &raw_vals)?;
+    }
+    if existing_self_key.is_none() && *ctx.foreign_keys && !tbl.foreign_keys.is_empty() {
+        c_fk_parent_lookups(ctx, db_id, tbl, rowid, &raw_vals)?;
     }
 
     // 8. Write table primary B-Tree record & secondary index records
@@ -21163,7 +21347,9 @@ where
     ctx.stmt_tx.close_write_cursor();
     let saved_last_rowid = ctx.runtime.last_insert_rowid;
     let saved_last_changes = ctx.runtime.last_changes;
+    c_program_frame(ctx, true);
     let res = f(ctx);
+    c_program_frame(ctx, false);
     let _ = ctx.stmt_tx.subprogram_stack.pop();
     ctx.runtime.last_insert_rowid = saved_last_rowid;
     ctx.runtime.last_changes = saved_last_changes;
@@ -23831,6 +24017,7 @@ fn xfer_copy(
         let new_rowids =
             !has_ipk && pairs.is_empty() && !matches!(mode, XferMode::Vacuum { into: true });
         let cid = xfer_btree(ctx, src_db_id)?.open_table_cursor(src_tbl.root_pgno, false);
+        xfer_btree(ctx, src_db_id)?.cursor_mark_c(cid);
         let mut ac = sqliters_btree::AppendCursor::new(dest_root, false);
         let mut n_rows = 0u64;
         let mut payload: Vec<u8> = Vec::new();
@@ -23887,7 +24074,7 @@ fn xfer_copy(
             Ok(())
         })();
         if let Ok(sbt) = xfer_btree(ctx, src_db_id) {
-            sbt.close_cursor(cid);
+            sbt.close_cursor_c(cid);
         }
         res?;
         if n_rows == 0 {
@@ -23908,6 +24095,7 @@ fn xfer_copy(
             pair.orders.clone(),
             false,
         );
+        xfer_btree(ctx, src_db_id)?.cursor_mark_c(cid);
         let mut ac = sqliters_btree::AppendCursor::new(pair.dest_root, true);
         let mut rec: Vec<u8> = Vec::new();
         let res = (|| -> Result<()> {
@@ -23929,7 +24117,7 @@ fn xfer_copy(
             Ok(())
         })();
         if let Ok(sbt) = xfer_btree(ctx, src_db_id) {
-            sbt.close_cursor(cid);
+            sbt.close_cursor_c(cid);
         }
         res?;
     }
@@ -23984,6 +24172,9 @@ fn xfer_copy_vacuum(
             n_rows += 1;
             target.append_table_transfer(&mut ac, rowid, payload)
         })?;
+        // `OP_Close iSrc` / `OP_Close iDest` end the loop over the table.
+        src_bt.cc_close(src_tbl.root_pgno, sqliters_btree::VC_READ);
+        target.cc_close(dest_root, sqliters_btree::VC_WRITE);
         if n_rows == 0 {
             // `emptySrcTest`: an empty source table skips the index loops as well.
             return Ok(());
@@ -24009,6 +24200,9 @@ fn xfer_copy_vacuum(
                 Ok(ControlFlow::Continue(()))
             })?;
         }
+        // `OP_Close iSrc` / `OP_Close iDest` end the loop over this index.
+        src_bt.cc_close(pair.src_root, sqliters_btree::VC_READ);
+        target.cc_close(pair.dest_root, sqliters_btree::VC_WRITE);
     }
     Ok(())
 }
@@ -25305,6 +25499,44 @@ fn execute_upsert_table_insert_row(
     count_changes_rows: &mut u64,
     ret_rows: &mut Vec<Vec<Value>>,
 ) -> Result<()> {
+    // (the lookups of the checks are the engine's own; C's write cursors are moved
+    // explicitly — see `validate_and_write_row`)
+    c_dml_silent(ctx, p.db_id, true);
+    c_register_index_order(ctx, p.db_id, &p.tbl, &p.indexes);
+    if let Some(bt) = ctx.db_set.slot_mut(p.db_id).and_then(|s| s.btree.as_mut()) {
+        bt.cc_clear_seek_hints();
+    }
+    let res = execute_upsert_table_insert_row_inner(
+        ctx,
+        p,
+        ins,
+        effective_or_conflict,
+        explicit_rowid,
+        col_vals,
+        params,
+        outer_scopes,
+        stmt_changes,
+        count_changes_rows,
+        ret_rows,
+    );
+    c_dml_silent(ctx, p.db_id, false);
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_upsert_table_insert_row_inner(
+    ctx: &mut ExecContext<'_>,
+    p: &PreparedTableInsert<'_>,
+    ins: &InsertStmt,
+    effective_or_conflict: Option<ConflictAction>,
+    explicit_rowid: Option<i64>,
+    col_vals: Vec<Value>,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    stmt_changes: &mut u64,
+    count_changes_rows: &mut u64,
+    ret_rows: &mut Vec<Vec<Value>>,
+) -> Result<()> {
     // UPSERT path (`upsert.c`)
     let Some((rowid, final_key, raw_vals)) = prepare_proposed_insert_row(
         ctx,
@@ -25327,6 +25559,10 @@ fn execute_upsert_table_insert_row(
     for step in &p.upsert_steps {
         match *step {
             UpsertCheckStep::RowidPk { clause_idx } => {
+                // OP_NotExists on the table's write cursor
+                if let Some(bt) = ctx.db_set.slot_mut(p.db_id).and_then(|s| s.btree.as_mut()) {
+                    bt.write_cursor_not_exists(p.tbl.root_pgno, rowid)?;
+                }
                 if let Some(cpayload) = seek_table_raw_entry(ctx, p.db_id, &p.tbl, &final_key)? {
                     let ckey = TableRowKey::Rowid(rowid);
                     if let Some(ci) = clause_idx {
@@ -25448,7 +25684,7 @@ fn execute_upsert_table_insert_row(
                     ctx.db_set.slot_mut(p.db_id).and_then(|s| s.btree.as_mut())
                     && bt.pager().page_count() > 0
                 {
-                    bt.seek_index_equal(
+                    bt.seek_index_no_conflict(
                         idx.root_pgno,
                         &indexed_vals,
                         &orders[..indexed_vals.len()],
@@ -26738,6 +26974,8 @@ struct PreparedTableUpdate<'a> {
     resolved_assigns: Vec<(Vec<usize>, bool, &'a Expr)>,
     modified_col_mask: Vec<bool>,
     rows: PreparedTableUpdateRows,
+    /// The scan cursor as C moves it (`cscan.rs`).
+    c_scan: Option<Box<crate::cscan::CScan>>,
     ret_col_names: Vec<String>,
     ret_expanded: Vec<(Expr, String, Option<String>)>,
 }
@@ -27140,6 +27378,9 @@ fn prepare_update_exec<'a>(
             } else {
                 None
             };
+            // (the rows are read ahead of the point at which C's loop visits them)
+            c_dml_silent(ctx, db_id, true);
+            c_register_index_order(ctx, db_id, &tbl, &indexes);
             let (candidates, scan) = read_table_with_plan_scan(
                 ctx,
                 db_id,
@@ -27250,6 +27491,7 @@ fn prepare_update_exec<'a>(
                 );
             }
 
+            let mut c_scan: Option<Box<crate::cscan::CScan>> = None;
             let rows = if let Some(ref from_rows) = from_rows_opt {
                 if has_set_agg {
                     let mut matched_keys: Vec<(TableRowKey, Vec<Value>)> = Vec::new();
@@ -27430,7 +27672,13 @@ fn prepare_update_exec<'a>(
             } else {
                 // Plain `UPDATE` (`update.c:819-830`): pass 1 collects matching `old_key`s only!
                 let mut keys = Vec::new();
-                for (old_key, payload) in candidates {
+                let mut key_ords: Vec<u32> = Vec::new();
+                let n_scanned = candidates.len();
+                let first_rowid = match candidates.first() {
+                    Some((TableRowKey::Rowid(r), _)) => Some(*r),
+                    _ => None,
+                };
+                for (ord, (old_key, payload)) in candidates.into_iter().enumerate() {
                     let old_vals =
                         decode_table_logical_row(ctx, db_id, &tbl, &old_key, &payload, params)?;
                     let scope = make_single_table_scope(
@@ -27450,7 +27698,19 @@ fn prepare_update_exec<'a>(
                         }
                     }
                     keys.push(old_key);
+                    key_ords.push(ord as u32);
                 }
+                c_scan = crate::cscan::CScan::new(
+                    ctx,
+                    db_id,
+                    tbl.root_pgno,
+                    scan,
+                    one_pass,
+                    false,
+                    n_scanned,
+                    key_ords,
+                    first_rowid,
+                );
                 if one_pass == crate::dml_c::OnePass::Off {
                     // Two passes: the ephemeral table keyed by rowid (or by the PRIMARY KEY of a
                     // WITHOUT ROWID table) is read back in key order.
@@ -27477,6 +27737,7 @@ fn prepare_update_exec<'a>(
                 resolved_assigns,
                 modified_col_mask,
                 rows,
+                c_scan,
                 ret_col_names,
                 ret_expanded,
             })))
@@ -27628,6 +27889,7 @@ fn prepare_plain_table_update_row(
     params: &[Value],
     outer_scopes: &[EvalRow],
 ) -> Result<Option<(Vec<Value>, Option<i64>, Vec<Value>)>> {
+    c_write_cursor_to_row(ctx, p.db_id, &p.tbl, old_key)?;
     let Some(cur_payload) = seek_table_raw_entry(ctx, p.db_id, &p.tbl, old_key)? else {
         return Ok(None);
     };
@@ -27815,8 +28077,15 @@ fn run_table_update_loop(
                 );
             }
             let _ = once_base; // (dropped again by `exec_update_internal`, on every exit)
-            for old_key in keys.iter() {
+            let mut c_scan = p.c_scan.take();
+            if let Some(cs) = c_scan.as_mut() {
+                cs.begin(ctx)?;
+            }
+            for (row_i, old_key) in keys.iter().enumerate() {
                 ctx.step_tick()?;
+                if let Some(cs) = c_scan.as_mut() {
+                    cs.at_row(ctx, row_i)?;
+                }
                 let Some((old_vals, new_rowid_opt, new_vals)) =
                     prepare_plain_table_update_row(ctx, &p, upd, old_key, params, outer_scopes)?
                 else {
@@ -27853,8 +28122,12 @@ fn run_table_update_loop(
                     },
                 )?;
             }
+            if let Some(cs) = c_scan.as_mut() {
+                cs.end(ctx)?;
+            }
         }
     }
+    c_dml_silent(ctx, p.db_id, false);
     Ok(QueryOutput {
         column_names: p.ret_col_names,
         rows: ret_rows,
@@ -28309,6 +28582,8 @@ struct PreparedTableDelete {
     target_keys: Vec<TableRowKey>,
     /// Root of the secondary index a one-pass DELETE scans (`aiCurOnePass[1]`), if any.
     scan_index_root: Option<Pgno>,
+    /// The scan cursor as C moves it (`cscan.rs`).
+    c_scan: Option<Box<crate::cscan::CScan>>,
     ret_col_names: Vec<String>,
     ret_expanded: Vec<(Expr, String, Option<String>)>,
 }
@@ -28470,6 +28745,9 @@ fn prepare_delete_exec(
                 return Ok(PreparedDelete::TruncateCleared(count));
             }
 
+            // (the rows are read ahead of the point at which C's loop visits them)
+            c_dml_silent(ctx, db_id, true);
+            c_register_index_order(ctx, db_id, &tbl, &indexes);
             let (candidates, scan) = read_table_with_plan_scan(
                 ctx,
                 db_id,
@@ -28502,7 +28780,13 @@ fn prepare_delete_exec(
             }
 
             let mut target_keys = Vec::new();
-            for (rkey, payload) in candidates {
+            let mut target_ords: Vec<u32> = Vec::new();
+            let n_scanned = candidates.len();
+            let first_rowid = match candidates.first() {
+                Some((TableRowKey::Rowid(r), _)) => Some(*r),
+                _ => None,
+            };
+            for (ord, (rkey, payload)) in candidates.into_iter().enumerate() {
                 let vals = decode_table_logical_row(ctx, db_id, &tbl, &rkey, &payload, params)?;
                 let scope = make_single_table_scope(
                     &tbl,
@@ -28521,7 +28805,19 @@ fn prepare_delete_exec(
                     }
                 }
                 target_keys.push(rkey);
+                target_ords.push(ord as u32);
             }
+            let c_scan = crate::cscan::CScan::new(
+                ctx,
+                db_id,
+                tbl.root_pgno,
+                scan,
+                one_pass,
+                true,
+                n_scanned,
+                target_ords,
+                first_rowid,
+            );
             if one_pass == crate::dml_c::OnePass::Off {
                 // Two passes: the RowSet (`OP_RowSetRead`) hands the rowids back in ascending
                 // order, the ephemeral table of a WITHOUT ROWID table in PRIMARY KEY order.
@@ -28551,6 +28847,7 @@ fn prepare_delete_exec(
                 dml_ctes,
                 target_keys,
                 scan_index_root,
+                c_scan,
                 ret_col_names,
                 ret_expanded,
             })))
@@ -28656,6 +28953,142 @@ fn prepare_delete_before_scope(
     ))))
 }
 
+/// Tells the b-tree layer the order of `tbl`'s index list (C numbers the index cursors of a
+/// statement in that order and closes them by number).
+fn c_register_index_order(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    indexes: &[IndexSchema],
+) {
+    // (with one index there is no order to tell)
+    if indexes.len() < 2 {
+        return;
+    }
+    let Some(bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) else {
+        return;
+    };
+    // (cheap test first: the statement registers a table once)
+    if bt.cc_index_order_has(indexes[0].root_pgno) {
+        return;
+    }
+    let roots: Vec<Pgno> = ordered_table_indexes(tbl, indexes)
+        .iter()
+        .map(|i| i.root_pgno)
+        .collect();
+    bt.cc_index_order(&roots);
+}
+
+/// A sub-program (trigger, foreign-key action) starts / returns: its cursors are its own.
+fn c_program_frame(ctx: &mut ExecContext<'_>, enter: bool) {
+    for slot in ctx.db_set.slots_mut() {
+        if let Some(ref mut bt) = slot.btree {
+            if enter {
+                bt.vc_frame_push();
+            } else {
+                bt.vc_frame_pop();
+            }
+        }
+    }
+}
+
+/// `sqlite3FkCheck` of an INSERT, as far as the page cache sees it: for every foreign key of
+/// `tbl` whose child key is not NULL and whose parent key is the parent's rowid —
+/// `fkLookupParent`: `OP_OpenRead` on the parent table, `OP_NotExists`, `OP_Close` — between
+/// the constraint checks and the writes. (Whether the parent exists is decided elsewhere; a
+/// parent key on a UNIQUE index is not followed here.)
+fn c_fk_parent_lookups(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    rowid: i64,
+    new_vals: &[Value],
+) -> Result<()> {
+    let Some((schema_name, slot_schema)) = ctx
+        .db_set
+        .slot(db_id)
+        .map(|s| (s.name.clone(), s.schema.clone()))
+    else {
+        return Ok(());
+    };
+    for fk in &tbl.foreign_keys {
+        let Ok((ptbl, parent_col_idxs)) =
+            resolve_fk_parent_cols(&slot_schema, &schema_name, &tbl.name, fk)
+        else {
+            continue;
+        };
+        if fk.from_cols.iter().any(|&ci| new_vals[ci].is_null())
+            || parent_col_idxs.len() != 1
+            || ptbl.rowid_alias_col != Some(parent_col_idxs[0])
+        {
+            continue;
+        }
+        let Value::Integer(target) = TypeAffinity::Integer.apply(new_vals[fk.from_cols[0]].clone())
+        else {
+            continue;
+        };
+        if ptbl.name.eq_ignore_ascii_case(&tbl.name) && target == rowid {
+            // (a row that references itself: C jumps over the lookup)
+            continue;
+        }
+        if let Some(bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
+            bt.cc_seek_rowid(ptbl.root_pgno, sqliters_btree::VC_READ2, target)?;
+            bt.cc_close(ptbl.root_pgno, sqliters_btree::VC_READ2);
+        }
+    }
+    Ok(())
+}
+
+/// See `Btree::cc_silent`.
+fn c_dml_silent(ctx: &mut ExecContext<'_>, db_id: DatabaseId, on: bool) {
+    if let Some(bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
+        bt.cc_silent(on);
+    }
+}
+
+/// `OP_NotExists` on the statement's table write cursor (C: the cursor of a one-pass scan is
+/// already on the row and nothing moves; after two passes the row is found again by rowid).
+fn c_write_cursor_to_row(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    rkey: &TableRowKey,
+) -> Result<()> {
+    let Some(bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) else {
+        return Ok(());
+    };
+    match rkey {
+        TableRowKey::Rowid(rowid) => {
+            bt.cc_seek_rowid(tbl.root_pgno, sqliters_btree::VC_WRITE, *rowid)?;
+        }
+        // `OP_NotFound` on the PRIMARY KEY b-tree of a WITHOUT ROWID table
+        TableRowKey::WithoutRowidPk(pk) => {
+            let pk_orders = tbl.without_rowid_pk_orders();
+            bt.cc_mark_wr_root(tbl.root_pgno);
+            bt.cc_index_moveto(tbl.root_pgno, sqliters_btree::VC_WRITE, pk, &pk_orders, false)?;
+        }
+    }
+    Ok(())
+}
+
+/// `OP_NoConflict` on the PRIMARY KEY b-tree of a WITHOUT ROWID table (the uniqueness check
+/// of an insert, or of an update that changes the key).
+fn c_wr_pk_no_conflict(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    key: &TableRowKey,
+) -> Result<()> {
+    if let TableRowKey::WithoutRowidPk(pk) = key
+        && let Some(bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut())
+    {
+        let pk_orders = tbl.without_rowid_pk_orders();
+        bt.cc_mark_wr_root(tbl.root_pgno);
+        bt.cc_index_moveto(tbl.root_pgno, sqliters_btree::VC_WRITE, pk, &pk_orders, true)?;
+    }
+    Ok(())
+}
+
 #[inline(never)]
 fn delete_table_row_and_build_after_scope(
     ctx: &mut ExecContext<'_>,
@@ -28666,6 +29099,7 @@ fn delete_table_row_and_build_after_scope(
     count_changes_rows: &mut u64,
     ret_rows: &mut Vec<Vec<Value>>,
 ) -> Result<Option<Box<EvalRow>>> {
+    c_write_cursor_to_row(ctx, p.db_id, &p.tbl, rkey)?;
     let Some(payload2) = seek_table_raw_entry(ctx, p.db_id, &p.tbl, rkey)? else {
         return Ok(None);
     };
@@ -28732,8 +29166,18 @@ fn run_table_delete_loop(
 ) -> Result<QueryOutput> {
     let target_keys = std::mem::take(&mut p.target_keys).into_boxed_slice();
     let mut ret_rows = Vec::new();
-    for rkey in target_keys.iter() {
+    let mut c_scan = p.c_scan.take();
+    if let Some(cs) = c_scan.as_mut() {
+        cs.begin(ctx)?;
+    }
+    for (row_i, rkey) in target_keys.iter().enumerate() {
         ctx.step_tick()?;
+        if let Some(cs) = c_scan.as_mut() {
+            cs.at_row(ctx, row_i)?;
+        }
+        // sqlite3GenerateRowDelete: the row is sought (`OP_NotExists`) before its old values
+        // are read and the BEFORE triggers run; it is sought again after them.
+        c_write_cursor_to_row(ctx, p.db_id, &p.tbl, rkey)?;
         let Some(before_scope_opt) = prepare_delete_before_scope(ctx, &p, rkey, params)? else {
             continue;
         };
@@ -28772,6 +29216,10 @@ fn run_table_delete_loop(
             )?;
         }
     }
+    if let Some(cs) = c_scan.as_mut() {
+        cs.end(ctx)?;
+    }
+    c_dml_silent(ctx, p.db_id, false);
     Ok(QueryOutput {
         column_names: p.ret_col_names,
         rows: ret_rows,
@@ -30897,6 +31345,7 @@ fn populate_index_btree(
     } else if can_fast_scan {
         if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
             let cid = bt.open_table_cursor(tbl.root_pgno, false);
+            bt.cursor_mark_c(cid);
             let scan_res = (|| -> Result<()> {
                 let mut key_vals: Vec<Value> = Vec::with_capacity(n_key + 1);
                 let mut rec_buf: Vec<u8> = Vec::with_capacity(64);
@@ -30969,7 +31418,7 @@ fn populate_index_btree(
         }
     }
 
-    refill_index_from_sorter(
+    let res = refill_index_from_sorter(
         ctx,
         db_id,
         tbl,
@@ -30979,7 +31428,14 @@ fn populate_index_btree(
         n_key,
         use_prefix,
         clear_first,
-    )
+    );
+    // sqlite3RefillIndex: "sqlite3VdbeAddOp1(v, OP_Close, iTab); sqlite3VdbeAddOp1(v, OP_Close,
+    // iIdx);" — the cursors of the build give their pages back before the statement goes on.
+    if let Some(bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
+        bt.cc_close_reads(tbl.root_pgno);
+        bt.cc_close(idx_schema.root_pgno, sqliters_btree::VC_WRITE);
+    }
+    res
 }
 
 /// The digests of the first two values of an index key (`SorterKey` without its position).
@@ -39031,6 +39487,15 @@ fn build_vacuum_image(
     // sqlite3BtreeSecureDelete(db->aDb[0].pBt,-1))`).
     let main_secure_delete = ctx.db_set.main_btree_mut().secure_delete(None);
     target_btree.secure_delete(Some(main_secure_delete));
+    // vacuum.c: "sqlite3BtreeSetCacheSize(pTemp, db->aDb[iDb].pSchema->cache_size);
+    // sqlite3BtreeSetSpillSize(pTemp, sqlite3BtreeSetSpillSize(pMain,0));" — the database
+    // VACUUM builds gets the cache limit and the spill limit of the one it copies.
+    if let Some(src_bt) = ctx.db_set.slot_mut(src_db_id).and_then(|s| s.btree.as_mut()) {
+        let cache_size = src_bt.cache_size();
+        let spill = src_bt.set_spill_size(0);
+        target_btree.set_cache_size(cache_size);
+        target_btree.set_spill_size(spill);
+    }
     target_btree.begin_write()?;
     {
         let fhdr = target_btree.pager_mut().header_mut()?;
@@ -39282,6 +39747,12 @@ fn build_vacuum_image(
             XferMode::Vacuum { into },
             &mut unused_changes,
         )?;
+        // (C runs one `INSERT INTO vacuum_db.x SELECT * FROM main.x` per table: the cursors
+        // of that statement are closed when it halts)
+        if let Some(src_bt) = ctx.db_set.slot_mut(src_db_id).and_then(|s| s.btree.as_mut()) {
+            src_bt.statement_end();
+        }
+        target_btree.statement_end();
     }
 
     // (4) "INSERT INTO vacuum_db.sqlite_schema SELECT * FROM main.sqlite_schema WHERE type IN
@@ -39608,7 +40079,7 @@ pub(crate) fn exec_vacuum_checked(
         if let Some(slot) = ctx.db_set.slot_mut(db_id) {
             slot.next_page_size = None;
             if opened_read && let Some(ref mut bt) = slot.btree {
-                let _ = bt.pager_mut().end_read_if_unused();
+                let _ = bt.end_read_if_unused();
             }
         }
         return into_res
@@ -42322,7 +42793,7 @@ fn exec_pragma(
                             && bt.pager().wal().is_none()))
                 {
                     ctx.busy_policy.retry_btree(bt, |b| b.begin_read())?;
-                    bt.pager_mut().end_read_if_unused()?;
+                    bt.end_read_if_unused()?;
                 }
                 if bt.pager().wal().is_none() {
                     WalCheckpointResult::not_wal()

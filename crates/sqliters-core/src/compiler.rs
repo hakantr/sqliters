@@ -2746,13 +2746,22 @@ pub fn try_compile_insert_in_db_set(
             || !crate::dml_c::compiled_dml_flags(db_set, crate::dml_c::CompiledDml::Insert(ins))
                 .uses_stmt_journal()
     );
-    let n_unique = slot_schema
+    // Without a statement journal the program must fail before its first write. It checks
+    // and writes one index after the other in `pTab->pIndex` order (newest index first), so
+    // that holds only when no UNIQUE index comes after another index: the one UNIQUE check
+    // is then the program's first index operation.
+    let tbl_indexes: Vec<IndexSchema> = slot_schema
         .indexes
         .iter()
-        .filter(|i| i.unique && i.table_name.eq_ignore_ascii_case(&tbl.name))
-        .count();
+        .filter(|i| i.table_name.eq_ignore_ascii_case(&tbl.name))
+        .cloned()
+        .collect();
+    let unique_after_another = crate::engine::dml_ordered_indexes(&tbl, &tbl_indexes)
+        .iter()
+        .skip(1)
+        .any(|i| i.unique);
     prog.set_needs_stmt_subsavepoint(uses_journal);
-    prog.set_abort_safe_without_stmt_journal(n_unique <= 1);
+    prog.set_abort_safe_without_stmt_journal(!unique_after_another);
     Ok(Some(prog))
 }
 
@@ -2934,6 +2943,7 @@ fn try_compile_insert_core(
     // `pTab->pIndex` order: the order in which C checks the UNIQUE constraints and writes or
     // deletes the index entries (newest index first, `ON CONFLICT REPLACE` ones last).
     indexes = crate::engine::dml_ordered_indexes(tbl, &indexes);
+    let has_indexes = !indexes.is_empty();
 
     let n_cols = tbl.columns.len();
     let mut seen_col = vec![false; n_cols];
@@ -3254,15 +3264,23 @@ fn try_compile_insert_core(
     let can_elide_stmt_sp = rows.len() == 1 && icurs.iter().all(|(_, idx, _)| !idx.unique);
     let can_build_single_row_plan = rows.len() == 1
         && n_cols <= 16
-        && icurs
-            .iter()
-            .all(|(_, idx, _)| !idx.unique && idx.columns.len() <= 16);
+        && icurs.iter().all(|(_, idx, _)| idx.columns.len() <= 16);
     let plan_indexes: Vec<SingleRowInsertIndex> = if can_build_single_row_plan {
         icurs
             .iter()
-            .map(|(_, idx, _)| SingleRowInsertIndex {
+            .map(|(_, idx, u_msg)| SingleRowInsertIndex {
                 root_pgno: idx.root_pgno,
                 orders: idx.key_sort_orders(),
+                unique: u_msg.as_ref().map(|m| {
+                    (
+                        if idx.origin == "pk" {
+                            sqliters_types::extended::SQLITE_CONSTRAINT_PRIMARYKEY
+                        } else {
+                            sqliters_types::extended::SQLITE_CONSTRAINT_UNIQUE
+                        },
+                        m.clone(),
+                    )
+                }),
                 col_slots: idx
                     .columns
                     .iter()
@@ -3379,6 +3397,14 @@ fn try_compile_insert_core(
                 dup_msg,
             }));
         }
+    }
+    // C checks every constraint of a row before its first write
+    // (`sqlite3GenerateConstraintChecks`, then `sqlite3CompleteInsertion`) and moves its
+    // cursors accordingly; this program checks and writes one index after the other. With
+    // indexes it is therefore only used through the one-row plan (no UNIQUE index, one
+    // row), whose page references are C's; everything else goes to the general executor.
+    if has_indexes && prog.single_row_insert().is_none() {
+        return Ok(None);
     }
     Ok(Some(prog))
 }
@@ -4165,6 +4191,12 @@ pub fn try_compile_update_in_db_set(
             ticks_hit: (halt_addr + 1) as u64,
             ticks_miss: (seek_addr + 1 + (halt_addr - done_addr + 1)) as u64,
         }));
+    }
+    // A rewritten UNIQUE index: C tests the new key (`OP_NoConflict`) before it deletes the
+    // old entries; this program deletes first and tests while it inserts. The general
+    // executor follows C's order.
+    if prog.rowid_point_update().is_none() && affected_indexes.iter().any(|i| i.unique) {
+        return Ok(None);
     }
     Ok(Some(prog))
 }
@@ -4987,13 +5019,17 @@ fn compile_single_table_select(
             // Single point lookup: falls straight through!
         }
         AccessPlan::IndexSeek { .. } => {
-            let adv_cur = seek_advance_cursor.expect("index seek cursor allocated");
-            prog.emit(Instruction::new(
-                Opcode::IndexMatchNext,
-                adv_cur,
-                loop_top as i32,
-                0,
-            ));
+            // `WHERE_ONEROW` (every column of a UNIQUE index constrained by `==`): C's loop
+            // has no OP_Next — the cursor stays on the one row it found.
+            if !crate::dml_c::scan_info(&plan, &tbl, false).one_row {
+                let adv_cur = seek_advance_cursor.expect("index seek cursor allocated");
+                prog.emit(Instruction::new(
+                    Opcode::IndexMatchNext,
+                    adv_cur,
+                    loop_top as i32,
+                    0,
+                ));
+            }
         }
         AccessPlan::RowidRange { .. }
         | AccessPlan::RowidIn { .. }

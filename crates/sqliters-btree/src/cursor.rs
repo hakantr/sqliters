@@ -244,12 +244,27 @@ pub(crate) struct BtreeCursor {
     pub(crate) writable: bool,
     pub(crate) state: BtreeCursorState,
     pub(crate) col_cache: CellColumnCache,
+    /// The cursor is the cursor of a loop of C's program (`OP_Rewind` .. `OP_Next`): a C
+    /// cursor follows it (see `rc_sync`). Other registry cursors are bookkeeping of this
+    /// engine and move nothing.
+    pub(crate) c_cursor: bool,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct CursorSlot {
     pub(crate) generation: u32,
     pub(crate) cursor: Option<BtreeCursor>,
+}
+
+/// What a registry cursor operation did, for the C cursor that follows it.
+#[derive(Copy, Clone)]
+enum RcMove {
+    /// A seek from the root (`OP_Rewind`, `OP_Last`, `OP_SeekXX`, a restored position).
+    Seek,
+    /// `OP_Next` / `OP_Prev`.
+    Step,
+    /// `saveCursorPosition`: the cursor gave its pages back.
+    Saved,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -311,6 +326,7 @@ impl Btree {
             writable,
             state: BtreeCursorState::Invalid,
             col_cache: CellColumnCache::empty(),
+            c_cursor: false,
         };
         let slot = if let Some(slot) = self.free_cursor_slots.pop() {
             let entry = &mut self.cursor_slots[slot as usize];
@@ -346,11 +362,170 @@ impl Btree {
         self.open_cursor(root_pgno, CursorKind::Index { orders }, writable)
     }
 
+    /// [`Self::cursor_first_rc`]; the C cursor of the statement follows the cursor.
+    pub fn cursor_first(&mut self, id: CursorId) -> Result<bool> {
+        let r = self.cursor_first_rc(id)?;
+        self.rc_sync(id, RcMove::Seek)?;
+        Ok(r)
+    }
+
+    /// [`Self::cursor_last_rc`]; the C cursor of the statement follows the cursor.
+    pub fn cursor_last(&mut self, id: CursorId) -> Result<bool> {
+        let r = self.cursor_last_rc(id)?;
+        self.rc_sync(id, RcMove::Seek)?;
+        Ok(r)
+    }
+
+    /// [`Self::cursor_next_rc`]; the C cursor of the statement follows the cursor.
+    pub fn cursor_next(&mut self, id: CursorId) -> Result<bool> {
+        let r = self.cursor_next_rc(id)?;
+        self.rc_sync(id, RcMove::Step)?;
+        Ok(r)
+    }
+
+    /// [`Self::cursor_prev_rc`]; the C cursor of the statement follows the cursor.
+    pub fn cursor_prev(&mut self, id: CursorId) -> Result<bool> {
+        let r = self.cursor_prev_rc(id)?;
+        self.rc_sync(id, RcMove::Step)?;
+        Ok(r)
+    }
+
+    /// [`Self::cursor_seek_rowid_rc`]; the C cursor of the statement follows the cursor.
+    pub fn cursor_seek_rowid(&mut self, id: CursorId, rowid: i64) -> Result<bool> {
+        let r = self.cursor_seek_rowid_rc(id, rowid)?;
+        self.rc_sync(id, RcMove::Seek)?;
+        Ok(r)
+    }
+
+    /// [`Self::cursor_seek_rowid_ge_rc`]; the C cursor of the statement follows the cursor.
+    pub fn cursor_seek_rowid_ge(&mut self, id: CursorId, target_rowid: i64) -> Result<bool> {
+        let r = self.cursor_seek_rowid_ge_rc(id, target_rowid)?;
+        self.rc_sync(id, RcMove::Seek)?;
+        Ok(r)
+    }
+
+    /// [`Self::cursor_seek_index_ge_rc`]; the C cursor of the statement follows the cursor.
+    pub fn cursor_seek_index_ge(&mut self, id: CursorId, key_values: &[Value]) -> Result<bool> {
+        let r = self.cursor_seek_index_ge_rc(id, key_values)?;
+        self.rc_sync(id, RcMove::Seek)?;
+        Ok(r)
+    }
+
+    /// [`Self::cursor_seek_index_equal_first_rc`]; the C cursor of the statement follows the cursor.
+    pub fn cursor_seek_index_equal_first(&mut self, id: CursorId, prefix_values: &[Value]) -> Result<bool> {
+        let r = self.cursor_seek_index_equal_first_rc(id, prefix_values)?;
+        self.rc_sync(id, RcMove::Seek)?;
+        Ok(r)
+    }
+
+    /// [`Self::save_cursor_position_rc`]; the C cursor of the statement follows the cursor.
+    pub fn save_cursor_position(&mut self, id: CursorId) -> Result<bool> {
+        let r = self.save_cursor_position_rc(id)?;
+        self.rc_sync(id, RcMove::Saved)?;
+        Ok(r)
+    }
+
+    /// [`Self::restore_cursor_position_rc`]; the C cursor of the statement follows the cursor.
+    pub fn restore_cursor_position(&mut self, id: CursorId) -> Result<bool> {
+        let r = self.restore_cursor_position_rc(id)?;
+        self.rc_sync(id, RcMove::Seek)?;
+        Ok(r)
+    }
+
+    /// The C cursor behind registry cursor `id` (`OP_OpenRead` / `OP_OpenWrite` of a
+    /// statement that runs through this registry) takes the position the cursor has now:
+    /// after a seek the way `moveToRoot` + the descent do it, after a step the way
+    /// `sqlite3BtreeNext` / `Previous` do, after a save by giving every page back.
+    fn rc_sync(&mut self, id: CursorId, mv: RcMove) -> Result<()> {
+        if self.c_silent > 0 || self.pager.page_count() == 0 {
+            // (an empty database file has no page a cursor could hold)
+            return Ok(());
+        }
+        let slot = (id.0 >> 32) as usize;
+        let Some(cur) = self.cursor_ref(id) else {
+            return Ok(());
+        };
+        if !cur.c_cursor {
+            return Ok(());
+        }
+        let root = cur.root_pgno;
+        if root == 0 || root > self.pager.page_count() {
+            return Ok(());
+        }
+        let is_index = matches!(cur.kind, CursorKind::Index { .. });
+        let role = 16 + (slot % 96) as u8;
+        // (C keeps a cursor that was only positioned by a failed seek as it is; a cursor that
+        // was never moved holds nothing)
+        let stack: Option<CursorStack> = match &cur.state {
+            BtreeCursorState::Valid { stack, .. } => Some(*stack),
+            BtreeCursorState::Eof => Some(CursorStack::new()),
+            BtreeCursorState::Invalid => {
+                if matches!(mv, RcMove::Seek) {
+                    Some(CursorStack::new())
+                } else {
+                    return Ok(());
+                }
+            }
+            BtreeCursorState::RequireSeek { .. } | BtreeCursorState::Fault(_) => None,
+        };
+        let vc = self.vc_open(root, role);
+        if is_index {
+            self.vcursors[vc].is_index = true;
+        }
+        match stack {
+            None => self.vc_release_all(vc),
+            Some(st) => {
+                let frames = st.as_slice();
+                let mut path = [(0 as Pgno, 0u16); BTCURSOR_MAX_DEPTH];
+                for (i, f) in frames.iter().enumerate() {
+                    path[i] = (f.pgno, f.cell_idx as u16);
+                }
+                self.vc_follow(vc, &path[..frames.len()], matches!(mv, RcMove::Seek))?;
+                // A forward index seek that ends on a divider of an interior page: C's search
+                // went down to the last leaf below the divider's left child, found every
+                // entry there smaller and stepped back up (`OP_SeekGE`: "if( res<0 )
+                // sqlite3BtreeNext").
+                if is_index && matches!(mv, RcMove::Seek) && !frames.is_empty() {
+                    let top = frames[frames.len() - 1].pgno;
+                    let hdr = if top == 1 { 100 } else { 0 };
+                    let interior =
+                        self.pager.read_page(top)?.get(hdr).is_some_and(|f| f & 0x08 == 0);
+                    if interior && self.vc_prev(vc)? {
+                        self.vc_next(vc)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Declares registry cursor `id` the cursor of a loop of C's program.
+    pub fn cursor_mark_c(&mut self, id: CursorId) {
+        if let Some(c) = self.cursor_mut(id) {
+            c.c_cursor = true;
+        }
+    }
+
+    /// `OP_Close` in the middle of a program (the transfer of a table, then of each index):
+    /// the C cursor behind `id` gives its pages back now; then [`Self::close_cursor`].
+    pub fn close_cursor_c(&mut self, id: CursorId) -> bool {
+        let slot = (id.0 >> 32) as usize;
+        if let Some(cur) = self.cursor_ref(id)
+            && cur.c_cursor
+        {
+            let root = cur.root_pgno;
+            self.vc_close(root, 16 + (slot % 96) as u8);
+        }
+        self.close_cursor(id)
+    }
+
     /// Closes a registered cursor, returning `true` if `id` was open.
     #[inline]
     pub fn close_cursor(&mut self, id: CursorId) -> bool {
         let slot = (id.0 >> 32) as usize;
         let cur_gen = id.0 as u32;
+        // (C's programs leave their cursors open until the statement halts — `closeAllCursors`;
+        // the C cursor behind this one keeps its pages until then.)
         if let Some(entry) = self.cursor_slots.get_mut(slot)
             && entry.generation == cur_gen
             && entry.cursor.is_some()
@@ -531,7 +706,7 @@ impl Btree {
 
     /// Saves a single cursor's current key into `RequireSeek` if it is currently `Valid` (`saveCursorPosition`).
     /// Returns `Ok(true)` if transitioned from `Valid` to `RequireSeek`, or `Ok(false)` if already non-`Valid`.
-    pub fn save_cursor_position(&mut self, id: CursorId) -> Result<bool> {
+    fn save_cursor_position_rc(&mut self, id: CursorId) -> Result<bool> {
         let (root_pgno, kind, stack, skip_next) = {
             let cur = self.get_cursor(id)?;
             match &cur.state {
@@ -625,10 +800,10 @@ impl Btree {
         }
 
         for &cid in &inline_ids[..inline_len] {
-            self.save_cursor_position(cid)?;
+            self.save_cursor_position_rc(cid)?;
         }
         for cid in overflow_ids {
-            self.save_cursor_position(cid)?;
+            self.save_cursor_position_rc(cid)?;
         }
         Ok(())
     }
@@ -704,7 +879,7 @@ impl Btree {
                     c.col_cache.clear();
                     c.state = BtreeCursorState::Fault(trip_code);
                 }
-            } else if is_valid && let Err(err) = self.save_cursor_position(cid) {
+            } else if is_valid && let Err(err) = self.save_cursor_position_rc(cid) {
                 let fault_code = err.extended_code;
                 for entry in &mut self.cursor_slots {
                     if let Some(ref mut cur) = entry.cursor {
@@ -720,7 +895,7 @@ impl Btree {
 
     /// Restores a cursor from `RequireSeek` if needed (`btreeRestoreCursorPosition`, `btree.c:9662-9745`).
     /// Returns `Ok(true)` if the cursor moved to a different row (or `Eof`) because its saved key was deleted.
-    pub fn restore_cursor_position(&mut self, id: CursorId) -> Result<bool> {
+    fn restore_cursor_position_rc(&mut self, id: CursorId) -> Result<bool> {
         let (root_pgno, kind, saved_key, prev_skip) = {
             let cur = self.get_cursor(id)?;
             match &cur.state {
@@ -804,7 +979,7 @@ impl Btree {
             self.get_cursor(id)?.state,
             BtreeCursorState::RequireSeek { .. }
         ) {
-            self.restore_cursor_position(id)?;
+            self.restore_cursor_position_rc(id)?;
         }
         let cur = self.get_cursor(id)?;
         Ok(matches!(
@@ -815,7 +990,7 @@ impl Btree {
 
     /// Positions `id` on the first entry in the B-tree (`sqlite3BtreeFirst` / `OP_Rewind`).
     /// Returns `Ok(true)` if non-empty, or `Ok(false)` (`Eof`) if the tree is empty.
-    pub fn cursor_first(&mut self, id: CursorId) -> Result<bool> {
+    fn cursor_first_rc(&mut self, id: CursorId) -> Result<bool> {
         self.check_cursor_not_faulted(id)?;
         self.check_interrupted()?;
         let (root_pgno, is_table) = {
@@ -854,7 +1029,7 @@ impl Btree {
 
     /// Positions `id` on the last entry in the B-tree (`sqlite3BtreeLast` / `OP_Last`).
     /// Returns `Ok(true)` if non-empty, or `Ok(false)` (`Eof`) if the tree is empty.
-    pub fn cursor_last(&mut self, id: CursorId) -> Result<bool> {
+    fn cursor_last_rc(&mut self, id: CursorId) -> Result<bool> {
         self.check_cursor_not_faulted(id)?;
         self.check_interrupted()?;
         let (root_pgno, is_table) = {
@@ -893,7 +1068,7 @@ impl Btree {
 
     /// Advances `id` to the next entry in sort order (`sqlite3BtreeNext` / `OP_Next`).
     /// Returns `Ok(true)` if positioned on a valid entry, or `Ok(false)` on `Eof`.
-    pub fn cursor_next(&mut self, id: CursorId) -> Result<bool> {
+    fn cursor_next_rc(&mut self, id: CursorId) -> Result<bool> {
         self.check_cursor_not_faulted(id)?;
         self.check_interrupted()?;
 
@@ -901,7 +1076,7 @@ impl Btree {
             self.get_cursor(id)?.state,
             BtreeCursorState::RequireSeek { .. }
         ) {
-            self.restore_cursor_position(id)?;
+            self.restore_cursor_position_rc(id)?;
         }
 
         let (is_table, mut stack, skip_next) = {
@@ -954,7 +1129,7 @@ impl Btree {
 
     /// Moves `id` to the previous entry in sort order (`sqlite3BtreePrevious` / `OP_Prev`).
     /// Returns `Ok(true)` if positioned on a valid entry, or `Ok(false)` on `Eof`.
-    pub fn cursor_prev(&mut self, id: CursorId) -> Result<bool> {
+    fn cursor_prev_rc(&mut self, id: CursorId) -> Result<bool> {
         self.check_cursor_not_faulted(id)?;
         self.check_interrupted()?;
 
@@ -962,7 +1137,7 @@ impl Btree {
             self.get_cursor(id)?.state,
             BtreeCursorState::RequireSeek { .. }
         ) {
-            self.restore_cursor_position(id)?;
+            self.restore_cursor_position_rc(id)?;
         }
 
         let (is_table, mut stack, skip_next) = {
@@ -1015,7 +1190,7 @@ impl Btree {
 
     /// Exact point-seek on a Table B+Tree cursor (`OP_SeekRowid`).
     /// Returns `Ok(true)` on exact `rowid` match (`Valid`), or `Ok(false)` on miss (`Invalid`).
-    pub fn cursor_seek_rowid(&mut self, id: CursorId, rowid: i64) -> Result<bool> {
+    fn cursor_seek_rowid_rc(&mut self, id: CursorId, rowid: i64) -> Result<bool> {
         self.check_interrupted()?;
         let root_pgno = {
             let cur = self.get_cursor(id)?;
@@ -1109,7 +1284,7 @@ impl Btree {
     }
 
     /// Lower-bound seek (`>= target_rowid`) on a Table B+Tree cursor (`OP_SeekGE`).
-    pub fn cursor_seek_rowid_ge(&mut self, id: CursorId, target_rowid: i64) -> Result<bool> {
+    fn cursor_seek_rowid_ge_rc(&mut self, id: CursorId, target_rowid: i64) -> Result<bool> {
         self.check_cursor_not_faulted(id)?;
         self.check_interrupted()?;
         let root_pgno = {
@@ -1146,7 +1321,7 @@ impl Btree {
     }
 
     /// Lower-bound seek (`>= key_values`) on an Index B-Tree cursor (`OP_SeekGE`).
-    pub fn cursor_seek_index_ge(&mut self, id: CursorId, key_values: &[Value]) -> Result<bool> {
+    fn cursor_seek_index_ge_rc(&mut self, id: CursorId, key_values: &[Value]) -> Result<bool> {
         self.check_cursor_not_faulted(id)?;
         self.check_interrupted()?;
         let (root_pgno, orders) = {
@@ -1186,7 +1361,7 @@ impl Btree {
 
     /// Positions an Index cursor on the FIRST entry matching `prefix_values` (`OP_SeekIndexEqual`).
     /// Transitions to `Eof` and returns `Ok(false)` if no entry matches `prefix_values`.
-    pub fn cursor_seek_index_equal_first(
+    fn cursor_seek_index_equal_first_rc(
         &mut self,
         id: CursorId,
         prefix_values: &[Value],
@@ -1284,7 +1459,7 @@ impl Btree {
             self.get_cursor(id)?.state,
             BtreeCursorState::RequireSeek { .. }
         ) {
-            self.restore_cursor_position(id)?;
+            self.restore_cursor_position_rc(id)?;
         }
 
         let (is_table, top, cached_rowid) = {
@@ -1341,7 +1516,7 @@ impl Btree {
             self.get_cursor(id)?.state,
             BtreeCursorState::RequireSeek { .. }
         ) {
-            self.restore_cursor_position(id)?;
+            self.restore_cursor_position_rc(id)?;
         }
 
         let stack = {
@@ -1367,7 +1542,7 @@ impl Btree {
             self.get_cursor(id)?.state,
             BtreeCursorState::RequireSeek { .. }
         ) {
-            self.restore_cursor_position(id)?;
+            self.restore_cursor_position_rc(id)?;
         }
         let top = {
             let cur = self.get_cursor(id)?;
@@ -1448,7 +1623,7 @@ impl Btree {
                     .last()
                     .ok_or_else(|| SqliteError::corrupt("empty valid cursor stack"))?,
                 BtreeCursorState::RequireSeek { .. } => {
-                    self.restore_cursor_position(id)?;
+                    self.restore_cursor_position_rc(id)?;
                     let cur = self.get_cursor(id)?;
                     match &cur.state {
                         BtreeCursorState::Fault(code) => return Err(fault_error(*code)),
@@ -1673,7 +1848,7 @@ impl Btree {
             self.get_cursor(id)?.state,
             BtreeCursorState::RequireSeek { .. }
         ) {
-            self.restore_cursor_position(id)?;
+            self.restore_cursor_position_rc(id)?;
         }
 
         let top = {

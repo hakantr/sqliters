@@ -848,7 +848,7 @@ fn cleanup_failed_open_tx(
                 retain_read,
             );
         } else if !read_write && bt.transaction_state() == TransactionState::Read {
-            let _ = bt.pager_mut().end_read_if_unused();
+            let _ = bt.end_read_if_unused();
         }
     }
 }

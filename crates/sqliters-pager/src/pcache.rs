@@ -154,6 +154,143 @@ pub(crate) enum Stage2 {
     Slot(u32),
 }
 
+/// Pages the engine looked at without C having a reference on them at that moment.
+///
+/// This engine evaluates statements with its own machinery (it materialises scans, looks rows
+/// up by key, walks trees by page number), so it reads pages at moments at which C's cursors
+/// hold no reference on them. Such a read must not change what the page cache does next: it
+/// may not load a page into the cache, recycle another one for it, or move a page in the LRU
+/// or dirty list. A page that is in the cache is read where it is; a page that is not comes
+/// from the database file (or the WAL) into this side store, which the cache never sees. The
+/// cache itself is driven only by the references the b-tree layer takes where C takes them.
+///
+/// The store holds what the file holds for this connection's snapshot: a page leaves it when
+/// it enters the cache (from then on the cache has the current image), and the whole store
+/// is emptied whenever the cache is emptied or pages are restored behind its back.
+pub(crate) struct Shadow {
+    map: FastPgnoMap<u32>,
+    ents: Vec<ShadowEnt>,
+    hand: usize,
+    cap: usize,
+}
+
+struct ShadowEnt {
+    pgno: Pgno,
+    data: Vec<u8>,
+    used: bool,
+}
+
+impl Shadow {
+    fn new() -> Self {
+        Self { map: FastPgnoMap::default(), ents: Vec::new(), hand: 0, cap: 16 }
+    }
+
+    #[inline]
+    pub(crate) fn find(&mut self, pgno: Pgno) -> Option<u32> {
+        let i = *self.map.get(&pgno)?;
+        self.ents[i as usize].used = true;
+        Some(i)
+    }
+
+    #[inline]
+    pub(crate) fn data(&self, i: u32) -> &[u8] {
+        &self.ents[i as usize].data
+    }
+
+    /// Whether the store is empty (the common case once the cache holds what is read).
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Moves the stored image of `pgno` into `dst` (same length) and drops it from the store.
+    /// `false`: the store has no image of the page.
+    pub(crate) fn take_into(&mut self, pgno: Pgno, dst: &mut [u8]) -> bool {
+        let Some(i) = self.map.remove(&pgno) else {
+            return false;
+        };
+        let e = &mut self.ents[i as usize];
+        let ok = e.data.len() == dst.len();
+        if ok {
+            dst.copy_from_slice(&e.data);
+        }
+        e.pgno = 0;
+        e.used = false;
+        ok
+    }
+
+    /// A buffer of `ps` bytes for `pgno` (the least recently used page gives way when the
+    /// store is full); the caller fills it.
+    pub(crate) fn alloc(&mut self, pgno: Pgno, ps: usize) -> u32 {
+        let i = if self.ents.len() < self.cap {
+            self.ents.push(ShadowEnt { pgno, data: vec![0; ps], used: true });
+            self.ents.len() - 1
+        } else {
+            // clock
+            loop {
+                if self.hand >= self.ents.len() {
+                    self.hand = 0;
+                }
+                let e = &mut self.ents[self.hand];
+                if e.used {
+                    e.used = false;
+                    self.hand += 1;
+                } else {
+                    break;
+                }
+            }
+            let i = self.hand;
+            self.hand += 1;
+            let old = self.ents[i].pgno;
+            self.map.remove(&old);
+            let e = &mut self.ents[i];
+            e.pgno = pgno;
+            e.used = true;
+            if e.data.len() != ps {
+                e.data.clear();
+                e.data.resize(ps, 0);
+            }
+            i
+        };
+        self.map.insert(pgno, i as u32);
+        i as u32
+    }
+
+    #[inline]
+    pub(crate) fn data_mut(&mut self, i: u32) -> &mut [u8] {
+        &mut self.ents[i as usize].data
+    }
+
+    /// `pgno` entered the cache (or its stored image changed): the side copy is dropped.
+    #[inline]
+    pub(crate) fn forget(&mut self, pgno: Pgno) {
+        if self.map.is_empty() {
+            return;
+        }
+        if let Some(i) = self.map.remove(&pgno) {
+            // the slot stays allocated; page number 0 never matches a request
+            let e = &mut self.ents[i as usize];
+            e.pgno = 0;
+            e.used = false;
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        if !self.ents.is_empty() {
+            self.map.clear();
+            self.ents.clear();
+            self.hand = 0;
+        }
+    }
+
+    fn set_cap(&mut self, n: usize) {
+        self.cap = n.clamp(16, 512);
+        if self.ents.len() > self.cap {
+            self.clear();
+        }
+    }
+}
+
 pub(crate) struct PageCache {
     // ---- storage, addressed by page number
     dense_slots: Vec<u32>,
@@ -197,6 +334,8 @@ pub(crate) struct PageCache {
     /// Trace id of the cache (C: order of opening among named database files; 0 = not traced).
     #[allow(dead_code)]
     pub(crate) tr_id: i32,
+    /// Pages read without a reference (see [`Shadow`]).
+    pub(crate) shadow: Shadow,
 }
 
 impl PageCache {
@@ -228,6 +367,7 @@ impl PageCache {
             lru_head: NIL,
             lru_tail: NIL,
             tr_id: 0,
+            shadow: Shadow::new(),
         };
         let n = c.number_of_cache_pages();
         c.pcache1_cachesize(n);
@@ -277,6 +417,11 @@ impl PageCache {
     }
 
     #[inline(always)]
+    /// `sqlite3PCacheIsDirty`: "return (pCache->pDirty!=0)".
+    pub(crate) fn has_dirty(&self) -> bool {
+        self.n_dirty > 0
+    }
+
     pub(crate) fn is_dirty(&self, pgno: Pgno) -> bool {
         self.slot_of(pgno)
             .is_some_and(|slot| self.entries[slot as usize].flags & PGHDR_DIRTY != 0)
@@ -431,6 +576,7 @@ impl PageCache {
             // `pGroup->mxPinned = pGroup->nMaxPage + 10 - pGroup->nMinPage`
             self.mx_pinned = n.wrapping_add(10).wrapping_sub(self.n_min);
             self.n_max = n;
+            self.shadow.set_cap(n as usize);
             self.n90pct = (u64::from(n) * 9 / 10) as u32;
             pctr!(
                 self,
@@ -553,6 +699,7 @@ impl PageCache {
         i.d_prev = NIL;
         i.d_next = NIL;
         self.hash_set(pgno, slot);
+        // (the caller drops the side copy of the page, after using it for the content)
         Stage2::Slot(slot)
     }
 
@@ -1112,6 +1259,7 @@ impl PageCache {
         self.n_recyclable = 0;
         self.lru_head = NIL;
         self.lru_tail = NIL;
+        self.shadow.clear();
     }
 
     /// `sqlite3PcacheClear` as `pager_reset` uses it: every page leaves the cache. (C keeps a
@@ -1125,6 +1273,7 @@ impl PageCache {
     /// greater than pgno" — dirty ones are made clean first.
     pub(crate) fn truncate(&mut self, pgno: Pgno) {
         pctr!(self, "TR|pc|trunc|c={} pgno={}", self.tr_id, pgno);
+        self.shadow.clear();
         // for(p=pCache->pDirty; p; p=pNext) if( p->pgno>pgno ) sqlite3PcacheMakeClean(p);
         let mut id = self.p_dirty;
         while id != NIL {

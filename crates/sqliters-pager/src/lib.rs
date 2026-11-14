@@ -1357,6 +1357,47 @@ impl Pager {
         self.pager_get(pgno, false).map(|_| ())
     }
 
+    /// `sqlite3PagerDirectReadOk` (SQLITE_DIRECT_OVERFLOW_READ): an overflow page can be read
+    /// straight from the database file, past the page cache, when the database is
+    /// file-backed, the cache holds no dirty page and the WAL has no frame of the page.
+    pub fn direct_overflow_read_ok(&self, pgno: Pgno) -> bool {
+        if self.is_memdb_backing || self.file.is_none() {
+            return false;
+        }
+        if self.cache.has_dirty() {
+            return false;
+        }
+        if let Some(wal) = self.wal.as_ref()
+            && !matches!(wal.find_frame(pgno), Ok(None))
+        {
+            return false;
+        }
+        true
+    }
+
+    /// [`Self::page_ref`] for a page that is used as a b-tree page (`getAndInitPage` →
+    /// `btreeInitPage`): with `PRAGMA cell_size_check` on, a page that has to be loaded is
+    /// validated; a page that fails is not kept and the call fails with `SQLITE_CORRUPT`.
+    #[inline]
+    pub fn page_ref_btree(&mut self, pgno: Pgno) -> Result<()> {
+        if pgno == 0 || pgno > self.page_count.max(self.db_size) {
+            return Err(SqliteError::corrupt("database disk image is malformed"));
+        }
+        if self.page_load_check.is_none() || self.cache.slot_of(pgno).is_some() {
+            return self.pager_get(pgno, false).map(|_| ());
+        }
+        let slot = self.pager_get(pgno, false)?;
+        if let Some(check) = self.page_load_check
+            && !check(pgno, self.header.usable_size(), self.cache.entry_data(slot))
+        {
+            self.cache.release(slot);
+            self.cache_drop(pgno);
+            // `SQLITE_CORRUPT_PAGE()` out of `btreeCellSizeCheck`.
+            return Err(SqliteError::corrupt("database disk image is malformed"));
+        }
+        Ok(())
+    }
+
     /// `sqlite3PagerGet(.., PAGER_GET_NOCONTENT)`: the caller does not care what the page
     /// holds (the b-tree layer takes it off the free list). The page is handed out zeroed,
     /// counts as journalled when it lies inside the original database image, and is entered
@@ -1469,7 +1510,15 @@ impl Pager {
             if no_content {
                 self.pager_get_no_content(pgno);
             }
+            self.cache.shadow.forget(pgno);
             self.cache.entry_data_mut(slot).fill(0);
+        } else if !self.cache.shadow.is_empty() && pgno != 1 && {
+            // (the engine looked at the page before C's cursor got there: the image it read
+            // from the file is the one `readDbPage` would read now)
+            let pcache::PageCache { entries, shadow, .. } = &mut self.cache;
+            shadow.take_into(pgno, entries[slot as usize].data.as_mut_slice())
+        } {
+            self.a_stat[PAGER_STAT_MISS] += 1;
         } else {
             self.a_stat[PAGER_STAT_MISS] += 1;
             if let Err(e) = self.read_db_page(slot, pgno) {
@@ -1669,6 +1718,16 @@ impl Pager {
             return;
         };
         let seq = self.subjournal_note(pgno, slot);
+        if seq != u32::MAX {
+            pcache::pctr!(
+                self.cache,
+                "TR|pc|subj|c={} pg={} nsub={} h={:08x}",
+                self.cache.tr_id,
+                pgno,
+                seq,
+                pcache::page_hash(self.cache.entry_data(slot))
+            );
+        }
         let cur_img = self.cache.entry_data(slot).to_vec();
         for sp in &mut self.subsavepoints {
             if pgno <= sp.orig_page_count && !sp.saved_pages.contains_key(&pgno) {
@@ -1904,6 +1963,7 @@ impl Pager {
                 Stage2::Refused => return,
             },
         };
+        self.cache.shadow.forget(pgno);
         self.cache.fetch_finish(slot);
         self.cache.entries[slot as usize].data = data;
         if dirty {
@@ -3269,13 +3329,75 @@ impl Pager {
         self.load_page_cold(pgno)
     }
 
-    /// A page access by a caller that holds no reference on the page and the page is not in
-    /// the cache: `sqlite3PagerGet`, with the reference given back at the next pager call.
+    /// A page is about to be written by a caller that holds no reference on it and the page
+    /// is not in the cache: `sqlite3PagerGet`, with the reference given back at the next
+    /// pager call.
     #[cold]
     fn load_page_cold(&mut self, pgno: Pgno) -> Result<u32> {
         let slot = self.pager_get(pgno, false)?;
         self.transient_pin = pgno;
         Ok(slot)
+    }
+
+    /// A read of a page that is not in the cache by a caller that holds no reference on it
+    /// (see [`pcache::Shadow`]): the image the file / the WAL holds, without the cache
+    /// noticing. `check`: the page is about to be used as a b-tree page (`btreeInitPage` with
+    /// `SQLITE_CellSizeCk`); a page that fails is not kept.
+    #[cold]
+    fn peek_page_cold(&mut self, pgno: Pgno, check: bool) -> Result<&[u8]> {
+        if self.file.is_none() {
+            // (in-memory database: every page lives in the cache, which never gives one up)
+            let slot = self.load_page_cold(pgno)?;
+            return Ok(self.cache.entry_data(slot));
+        }
+        if let Some(i) = self.cache.shadow.find(pgno) {
+            return Ok(self.cache.shadow.data(i));
+        }
+        let ps = self.header.page_size as usize;
+        let i = self.cache.shadow.alloc(pgno, ps);
+        let wal_frame = match self.wal.as_ref() {
+            Some(wal) => match wal.find_frame(pgno) {
+                Ok(f) => f,
+                Err(e) => {
+                    self.cache.shadow.forget(pgno);
+                    return Err(e);
+                }
+            },
+            None => None,
+        };
+        let res = if let Some(fno) = wal_frame {
+            self.wal
+                .as_ref()
+                .unwrap()
+                .read_frame(fno, self.cache.shadow.data_mut(i))
+        } else if self.page_count.max(self.db_size) < pgno {
+            self.cache.shadow.data_mut(i).fill(0);
+            Ok(())
+        } else {
+            let offset = u64::from(pgno - 1) * (ps as u64);
+            let buf = self.cache.shadow.data_mut(i);
+            match self.file.as_deref() {
+                Some(file) => file.read_at(buf, offset).map(|n| {
+                    if n < ps {
+                        buf[n..].fill(0);
+                    }
+                }),
+                None => Err(SqliteError::misuse("database file is not open")),
+            }
+        };
+        if let Err(e) = res {
+            self.cache.shadow.forget(pgno);
+            return Err(e);
+        }
+        if check
+            && let Some(chk) = self.page_load_check
+            && !chk(pgno, self.header.usable_size(), self.cache.shadow.data(i))
+        {
+            self.cache.shadow.forget(pgno);
+            // `SQLITE_CORRUPT_PAGE()` out of `btreeCellSizeCheck`.
+            return Err(SqliteError::corrupt("database disk image is malformed"));
+        }
+        Ok(self.cache.shadow.data(i))
     }
 
     /// Reads page `pgno` (1-based) into the page cache if needed and returns an immutable slice.
@@ -3299,8 +3421,10 @@ impl Pager {
                 "cannot read lock-byte page {pgno}"
             )));
         }
-        let slot = self.ensure_btree_page_cached(pgno)?;
-        Ok(self.cache.entry_data(slot))
+        if let Some(slot) = self.cache.slot_of(pgno) {
+            return Ok(self.cache.entry_data(slot));
+        }
+        self.peek_page_cold(pgno, true)
     }
 
     /// [`Self::read_page`] without the `PRAGMA cell_size_check` validation.
@@ -3318,32 +3442,10 @@ impl Pager {
                 "cannot read lock-byte page {pgno}"
             )));
         }
-        let slot = self.ensure_page_cached(pgno)?;
-        Ok(self.cache.entry_data(slot))
-    }
-
-    #[inline]
-    fn ensure_btree_page_cached(&mut self, pgno: Pgno) -> Result<u32> {
         if let Some(slot) = self.cache.slot_of(pgno) {
-            return Ok(slot);
+            return Ok(self.cache.entry_data(slot));
         }
-        self.load_btree_page_cold(pgno)
-    }
-
-    /// Loads a page that is about to be used as a b-tree page: `btreeInitPage` with
-    /// `SQLITE_CellSizeCk`. A page that fails is not kept, so every later read loads and
-    /// rejects it again (C leaves `MemPage.isInit` clear).
-    #[cold]
-    fn load_btree_page_cold(&mut self, pgno: Pgno) -> Result<u32> {
-        let slot = self.load_page_cold(pgno)?;
-        if let Some(check) = self.page_load_check
-            && !check(pgno, self.header.usable_size(), self.cache.entry_data(slot))
-        {
-            self.cache_drop(pgno);
-            // `SQLITE_CORRUPT_PAGE()` out of `btreeCellSizeCheck`.
-            return Err(SqliteError::corrupt("database disk image is malformed"));
-        }
-        Ok(slot)
+        self.peek_page_cold(pgno, false)
     }
 
     /// Journals the pre-image of `pgno` (if not yet journaled in this tx/subsavepoints) and marks it dirty.
@@ -3474,6 +3576,17 @@ impl Pager {
             }
             *self.cache.flags_mut(slot) |= PGHDR_WRITEABLE;
         }
+        // "if( pPager->nSavepoint>0 ) rc = subjournalPageIfRequired(pPg);"
+        if sub_seq != u32::MAX {
+            pcache::pctr!(
+                self.cache,
+                "TR|pc|subj|c={} pg={} nsub={} h={:08x}",
+                self.cache.tr_id,
+                pgno,
+                sub_seq,
+                pcache::page_hash(self.cache.entry_data(slot))
+            );
+        }
         self.commit_phase_one_done = false;
         self.cache_modified = true;
         self.notify_backup_page_write(pgno);
@@ -3494,6 +3607,7 @@ impl Pager {
     /// journalled still equals its stored image; with the journal switched off there is no
     /// pre-image and the content is left as it is.)
     pub fn restore_stored_image(&mut self, pgno: Pgno) -> Result<()> {
+        self.cache.shadow.clear();
         let slot = self.mark_page_writable(pgno)?;
         if self.journal_mode == JournalMode::Off && !self.use_wal() {
             return Ok(());
@@ -3526,14 +3640,7 @@ impl Pager {
             sp.truncate_on_release = false;
         }
         let _ = slot;
-        pcache::pctr!(
-            self.cache,
-            "TR|pc|subj|c={} pg={} nsub={} h={:08x}",
-            self.cache.tr_id,
-            pgno,
-            self.n_sub_rec,
-            pcache::page_hash(self.cache.entry_data(slot))
-        );
+        // (traced by the caller, after the journal decision — the order of `pager_write`)
         let seq = self.n_sub_rec;
         self.n_sub_rec += 1;
         seq
@@ -3703,6 +3810,7 @@ impl Pager {
     /// equal-page-size copies and page-size-changing raw byte copies while preserving rollback
     /// journaling in `self`'s pre-transaction page geometry.
     pub fn copy_pages_from(&mut self, src: &mut Pager) -> Result<()> {
+        self.cache.shadow.clear();
         self.ensure_not_closed()?;
         src.ensure_not_closed()?;
         if self.state != TransactionState::Write {
@@ -3802,18 +3910,32 @@ impl Pager {
 
             if pgsz_src == pgsz_dest {
                 let dest_lock_pg = self.lock_byte_page();
-                for pgno in 1..=self.page_count {
-                    if pgno != dest_lock_pg {
-                        self.mark_page_writable(pgno)?;
-                    }
-                }
+                let old_count = self.page_count;
+                // backup.c `backupOnePage`, page by page: "sqlite3PagerGet(pDestPager, iDest,
+                // &pDestPg, 0); sqlite3PagerWrite(pDestPg); memcpy(zOut, zIn, nCopy);
+                // sqlite3PagerUnref(pDestPg)" — a page has its new content from the moment it
+                // is journalled (the cache may write it out before the copy is complete).
                 for s_pgno in 1..=n_src_pages {
                     if s_pgno == dest_lock_pg {
                         continue;
                     }
                     let page_bytes = get_src_page(src, s_pgno)?;
-                    self.cache_put(s_pgno, page_bytes, true);
+                    if s_pgno > self.page_count {
+                        self.page_count = s_pgno;
+                    }
+                    self.page_ref(s_pgno)?;
+                    let res = self.mark_page_writable(s_pgno).map(|slot| {
+                        self.cache
+                            .entry_data_mut(slot)
+                            .copy_from_slice(&page_bytes);
+                    });
+                    self.page_unref(s_pgno);
+                    res?;
                 }
+                // (`sqlite3PagerTruncateImage`: pages of the old image past the new end are not
+                // journalled — the file is cut back only after the journal is finalized, and a
+                // rollback before that leaves them as they are.)
+                let _ = old_count;
                 self.cache.truncate(n_src_pages);
                 self.cache_drop(dest_lock_pg);
                 self.page_count = n_src_pages;
@@ -4393,12 +4515,14 @@ impl Pager {
                 // `sqlite3PcacheDirtyList`; pagerWalFrames(isCommit): "there is no point in
                 // writing any pages with page numbers greater than nTruncate into the WAL".
                 let mut dirty_pgnos = self.cache.dirty_pgnos_sorted();
+                // (the trace counts the list as `sqlite3PcacheDirtyList` hands it over)
+                let _n_list = dirty_pgnos.len();
                 dirty_pgnos.retain(|&p| p <= self.page_count && p != lock_byte_pgno);
                 pcache::pctr!(
                     self.cache,
                     "TR|pc|walfr|c={} n={} first={} commit=1 trunc={}",
                     self.cache.tr_id,
-                    dirty_pgnos.len(),
+                    _n_list,
                     dirty_pgnos.first().copied().unwrap_or(0),
                     self.page_count
                 );
@@ -4502,6 +4626,7 @@ impl Pager {
 
             let ps = u64::from(self.header.page_size);
             if let Some(ref pending) = self.pending_byte_copy {
+                self.cache.shadow.clear();
                 if let Some((tail_off, ref tail_bytes)) = pending.post_pending_tail {
                     self.db_file()?.write_at(tail_bytes, tail_off)?;
                 }
@@ -4729,6 +4854,7 @@ impl Pager {
 
     /// Rolls back the active transaction, releasing locks back to `TransactionState::Open`.
     pub fn rollback(&mut self) -> Result<()> {
+        self.cache.shadow.clear();
         self.rollback_retaining_read(false)
     }
 
@@ -5128,6 +5254,7 @@ impl Pager {
     /// slot `index` active (with its page set and records) on the stack. No-op if
     /// `state != Write` or `index >= subsavepoints.len()`.
     pub fn rollback_to_subsavepoint(&mut self, index: usize) -> Result<()> {
+        self.cache.shadow.clear();
         self.ensure_not_closed()?;
         if self.state != TransactionState::Write || index >= self.subsavepoints.len() {
             return Ok(());
@@ -5207,6 +5334,7 @@ impl Pager {
     /// (`sqlite3PcacheDrop`), a referenced one is read again (`readDbPage`). Returns whether
     /// the transaction had written frames.
     fn pager_rollback_wal(&mut self, orig_count: Pgno) -> Result<bool> {
+        self.cache.shadow.clear();
         self.release_transient();
         let mut reverted_pgnos = Vec::new();
         self.wal.as_mut().expect("use_wal checked").undo(|pgno| {
@@ -5225,7 +5353,14 @@ impl Pager {
             if self.cache.n_ref(slot) == 0 {
                 self.cache.drop_page(slot);
             } else if pgno <= orig_count {
-                let _ = self.read_db_page(slot, pgno);
+                let ok = self.read_db_page(slot, pgno).is_ok();
+                if pgno == 1 && ok {
+                    // `pagerUndoCallback` → `readDbPage`: "if( pgno==1 ) memcpy(&pPager->
+                    // dbFileVers, ..)" — the change counter of the committed page 1 is the
+                    // one the next commit counts on from.
+                    let d = self.cache.entry_data(slot);
+                    self.db_file_vers_cc = u32::from_be_bytes([d[24], d[25], d[26], d[27]]);
+                }
             } else {
                 self.cache.entry_data_mut(slot).fill(0);
             }
@@ -5248,6 +5383,7 @@ impl Pager {
     /// The database size goes back to the savepoint's; pages past it stay in the cache until
     /// the transaction ends (they are not written).
     fn apply_subsavepoint_undo(&mut self, sp: &SubsavepointSlot) -> Result<()> {
+        self.cache.shadow.clear();
         self.commit_phase_one_done = false;
         self.pending_byte_copy = None;
         self.staged_raw_copy = false;
@@ -5306,12 +5442,14 @@ impl Pager {
             let to_file = !wal && self.file.is_some() && self.db_file_modified && is_synced;
             pcache::pctr!(
                 self.cache,
-                "TR|pc|pb|c={} pg={} main={} synced={} incache={} o={} h={:08x}",
+                "TR|pc|pb|c={} pg={} main={} synced={} incache={} state={} o={} h={:08x}",
                 self.cache.tr_id,
                 pgno,
                 u8::from(kind == 0),
                 u8::from(is_synced),
                 u8::from(slot.is_some()),
+                // (`Pager.eState`: PAGER_WRITER_DBMOD once the database file was written)
+                if self.db_file_modified { 4 } else { 3 },
                 if to_file {
                     "file"
                 } else if kind == 1 && slot.is_none() {
@@ -5576,6 +5714,7 @@ impl Pager {
     /// `pager_playback` in `sqlite/src/pager.c`), called ONLY while holding at least
     /// `LockLevel::Shared` on the main database file!
     fn recover_hot_journal_under_shared_lock(&mut self) -> Result<bool> {
+        self.cache.shadow.clear();
         let Some(jpath) = self.journal_path.clone() else {
             return Ok(false);
         };

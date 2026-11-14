@@ -2914,7 +2914,7 @@ pub fn compute_dbstat_rows_for_slot(
             );
         }
         if need_read_tx {
-            let _ = btree.pager_mut().end_read_if_unused();
+            let _ = btree.end_read_if_unused();
         }
     }
 
