@@ -1232,7 +1232,7 @@ fn test_gate2_3_name_resolution_vdbe_vs_interpreter_c_parity_and_autovacuum() {
         // (`DatabaseId(2)` = `aux`) plus `OpenRead` + `OpenReadIdx`.
         let explain = r_conn
             .query(
-                "EXPLAIN SELECT aux.items.* FROM aux.items WHERE aux.items.code = 'BETA';",
+                "EXPLAIN SELECT items.* FROM aux.items WHERE aux.items.code = 'BETA';",
                 &[],
             )
             .unwrap();

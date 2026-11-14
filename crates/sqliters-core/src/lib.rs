@@ -4,6 +4,7 @@
 
 pub mod backup;
 pub mod blob;
+pub(crate) mod cgen;
 pub mod compiler;
 pub mod db_set;
 pub(crate) mod cscan;
@@ -4955,6 +4956,9 @@ pub struct Statement {
     category: Option<StmtCategory>,
     compiled_vdbe: Option<Arc<VdbeProgram>>,
     compiled_fast_read: Option<Arc<fast_read::FastReadPlan>>,
+    /// `EXPLAIN <stmt>` only: the program C's code generator builds for the statement, when
+    /// the port of the generator supports it (its listing is what `EXPLAIN` returns).
+    c_explain: Option<Arc<sqliters_vdbe::vdbeaux::Program>>,
     cached_read_vm: Option<VdbeVm>,
     write_vm_scratch: sqliters_vdbe::VdbeWriteScratch,
     compiled_schema_generation: u64,
@@ -4984,6 +4988,32 @@ impl fmt::Debug for Statement {
 thread_local! {
     /// Decision trace only: `execute_batch` is compiling a statement.
     static DTRACE_IN_BATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The column names of `EXPLAIN`.
+fn explain_column_names() -> Vec<String> {
+    sqliters_vdbe::vdbeaux::EXPLAIN_COLUMN_NAMES[..8].iter().map(|s| (*s).to_owned()).collect()
+}
+
+/// The artifacts of an `EXPLAIN <stmt>` statement whose listing comes from C's code generator
+/// while the engine's own validation rejected the inner statement.
+fn explain_artifacts(stmt: Option<Stmt>) -> CompiledArtifacts {
+    let mut max_param = 0usize;
+    let mut named_params = HashMap::new();
+    if let Some(st) = &stmt {
+        collect_stmt_params(st, &mut max_param, &mut named_params);
+    }
+    CompiledArtifacts {
+        stmt,
+        requires_schema: false,
+        category: Some(StmtCategory::Read),
+        compiled_vdbe: None,
+        compiled_fast_read: None,
+        column_names: explain_column_names(),
+        max_param,
+        named_params,
+        ignored_fk_parent_tables: Vec::new(),
+    }
 }
 
 struct CompiledArtifacts {
@@ -6625,13 +6655,57 @@ fn parse_simple_literal_insert_prefix<'a>(
 }
 
 impl Statement {
+    /// `EXPLAIN <stmt>` (not `EXPLAIN QUERY PLAN`): the program C's code generator builds for
+    /// the statement, `None` when the port of the generator does not support the statement
+    /// yet (the engine's own listing is then used), or C's compile error.
+    fn c_explain_of(
+        inner: &ConnectionInner,
+        stmt: Option<&Stmt>,
+        raw_sql: &str,
+    ) -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>> {
+        let Some(Stmt::Explain { query_plan: false, .. }) = stmt else {
+            return Ok(None);
+        };
+        match cgen::c_explain(inner, raw_sql) {
+            cgen::CExplain::Program(p) => Ok(Some(p)),
+            cgen::CExplain::Unsupported => Ok(None),
+            cgen::CExplain::Error { message, offset } => {
+                let e = SqliteError::new(ErrorCode::Error, message);
+                Err(if offset >= 0 { e.with_offset(offset as usize) } else { e })
+            }
+        }
+    }
+
     fn prepare_in_session(
         shared: &Arc<ConnectionShared>,
         inner: &mut ConnectionInner,
         sql: &str,
         mode: PrepareMode,
     ) -> Result<Self> {
-        let (stmt_opt, tail) = parse_one(sql)?;
+        // `EXPLAIN <stmt>` that the engine's parser rejects, while C's parser and code
+        // generator (the port) handle it: the listing (or the error) is C's. The statement
+        // object is then built around a stand-in parse tree; only C's program is listed.
+        let mut c_explain_of_rejected: Option<Arc<sqliters_vdbe::vdbeaux::Program>> = None;
+        let (stmt_opt, tail) = match parse_one(sql) {
+            Ok(x) => x,
+            Err(e) => {
+                if !cgen::is_explain(sql) {
+                    return Err(e);
+                }
+                match cgen::c_explain_tail(inner, sql) {
+                    (cgen::CExplain::Error { message, offset }, _) => {
+                        let ce = SqliteError::new(ErrorCode::Error, message);
+                        return Err(if offset >= 0 { ce.with_offset(offset as usize) } else { ce });
+                    }
+                    (cgen::CExplain::Program(prog), tail_ofs) => {
+                        c_explain_of_rejected = Some(prog);
+                        let (stand_in, _) = parse_one("EXPLAIN SELECT 1")?;
+                        (stand_in, &sql[tail_ofs.min(sql.len())..])
+                    }
+                    (cgen::CExplain::Unsupported, _) => return Err(e),
+                }
+            }
+        };
         let consumed_len = sql.len().saturating_sub(tail.len());
         let raw_sql = sql[..consumed_len].to_owned();
         let unparsed_tail = tail.to_owned();
@@ -6655,6 +6729,13 @@ impl Statement {
                 let _ = inner.ensure_schemas_loaded_for_prepare(false)?;
             }
         }
+
+        // `EXPLAIN <stmt>`: C's listing (or C's compile error) when the port of C's code
+        // generator supports the statement; the engine's own output otherwise.
+        let c_explain = match c_explain_of_rejected {
+            Some(prog) => Some(prog),
+            None => Self::c_explain_of(inner, stmt_opt.as_ref(), &raw_sql)?,
+        };
 
         let try_compile =
             |inner: &mut ConnectionInner, stmt_opt: Option<Stmt>| -> Result<CompiledArtifacts> {
@@ -6704,6 +6785,11 @@ impl Statement {
         };
         let mut artifacts = match try_compile(inner, stmt_opt.clone()) {
             Ok(a) => a,
+            // (C compiles the statement: an error of the engine's own validation is the
+            // engine's defect, not a reason for EXPLAIN to fail)
+            Err(err) if c_explain.is_some() && err.code == ErrorCode::Error => {
+                explain_artifacts(stmt_opt.clone())
+            }
             Err(err)
                 if needs_schema
                     && err.code == ErrorCode::Error
@@ -6734,6 +6820,15 @@ impl Statement {
         };
 
         apply_prepare_auto_vacuum_pragma(inner, &mut artifacts);
+        if let Some(prog) = &c_explain {
+            // The parameters of the statement as C numbers them.
+            artifacts.max_param = artifacts.max_param.max(prog.n_var as usize);
+            for (name, num) in &prog.p_vlist.a {
+                if !name.starts_with('?') {
+                    artifacts.named_params.entry(name.clone()).or_insert(*num as usize);
+                }
+            }
+        }
 
         let hid = inner.register_handle(HandleKind::Statement);
         Ok(Self {
@@ -6746,6 +6841,7 @@ impl Statement {
             category: artifacts.category,
             compiled_vdbe: artifacts.compiled_vdbe,
             compiled_fast_read: artifacts.compiled_fast_read,
+            c_explain,
             cached_read_vm: None,
             write_vm_scratch: sqliters_vdbe::VdbeWriteScratch::default(),
             compiled_schema_generation: inner.schema_generation,
@@ -7297,6 +7393,18 @@ impl Statement {
                     let _ = inner.ensure_schemas_loaded_for_prepare(false)?;
                 }
             }
+            let (parsed_stmt, c_explain) = match parsed_stmt {
+                None if cgen::is_explain(&self.raw_sql) => match cgen::c_explain(inner, &self.raw_sql) {
+                    cgen::CExplain::Program(prog) => {
+                        (parse_one("EXPLAIN SELECT 1").ok().and_then(|(st, _)| st), Some(prog))
+                    }
+                    _ => (None, None),
+                },
+                st => {
+                    let c = Self::c_explain_of(inner, st.as_ref(), &self.raw_sql)?;
+                    (st, c)
+                }
+            };
             let shared = Arc::clone(&self.shared);
             let try_compile = |inner: &mut ConnectionInner,
                                parsed_stmt: &Option<Stmt>|
@@ -7321,6 +7429,9 @@ impl Statement {
             };
             let mut artifacts = match try_compile(inner, &parsed_stmt) {
                 Ok(a) => a,
+                Err(err) if c_explain.is_some() && err.code == ErrorCode::Error => {
+                    explain_artifacts(parsed_stmt.clone())
+                }
                 Err(err)
                     if err.code == ErrorCode::Error
                         && inner.db_set.slots().iter().any(|s| {
@@ -7347,6 +7458,7 @@ impl Statement {
             self.category = artifacts.category;
             self.compiled_vdbe = artifacts.compiled_vdbe;
             self.compiled_fast_read = artifacts.compiled_fast_read;
+            self.c_explain = c_explain;
             self.column_names = artifacts.column_names;
             self.params = transferred;
             self.named_params = artifacts.named_params;
@@ -8616,6 +8728,15 @@ impl Statement {
                         execute_read_body(ctx, stmt_ref, &self.params)
                     },
                 );
+                // `EXPLAIN <stmt>` of a statement C's code generator (the port) supports: the
+                // rows are C's listing.
+                let exec_res = match &self.c_explain {
+                    Some(prog) => Ok(engine::QueryOutput {
+                        column_names: exec_res.map(|o| o.column_names).unwrap_or_else(|_| explain_column_names()),
+                        rows: prog.list(1),
+                    }),
+                    None => exec_res,
+                };
                 inner.runtime.stmt_timestamp_ms = prev_ts;
 
                 let extra_read = mask_to_instances(&inner.db_set, stmt_tx.read_db_mask);
@@ -13100,6 +13221,8 @@ mod c_align_h5_tests;
 mod c_align_h6_tests;
 #[cfg(test)]
 mod c_align_h6b_tests;
+#[cfg(test)]
+mod c_align_v1_tests;
 /// Regression tests for behaviour that has to match C SQLite 3.54.1 (step 5e): every expected
 /// value below is what the reference `sqlite3` produces for the same statements.
 #[cfg(test)]

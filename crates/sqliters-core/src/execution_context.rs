@@ -264,6 +264,21 @@ impl FunctionRegistry {
             .or_else(|| overloads.iter().find(|d| d.arity.is_none()))
     }
 
+    /// The (arity, flags) of every scalar function registered under `name` (any arity).
+    pub fn scalar_overloads(&self, name: &str) -> Vec<(Option<usize>, FunctionFlags)> {
+        with_ascii_upper_key(name, |k| self.scalars.get(k))
+            .map(|v| v.iter().map(|d| (d.arity, d.flags)).collect())
+            .unwrap_or_default()
+    }
+
+    /// The (arity, flags, supports_window) of every aggregate or window function registered
+    /// under `name` (any arity).
+    pub fn aggregate_overloads(&self, name: &str) -> Vec<(Option<usize>, FunctionFlags, bool)> {
+        with_ascii_upper_key(name, |k| self.aggregates.get(k))
+            .map(|v| v.iter().map(|d| (d.arity, d.flags, d.supports_window)).collect())
+            .unwrap_or_default()
+    }
+
     /// Registers or replaces an aggregate or window function (`sqlite3_create_function` / `sqlite3_create_window_function`).
     pub fn register_window_aggregate<F>(
         &mut self,
@@ -512,6 +527,12 @@ impl CollationRegistry {
     #[inline]
     pub fn get_custom(&self, name: &str) -> Option<CustomCollation> {
         self.custom.get(&name.to_ascii_uppercase()).cloned()
+    }
+
+    /// The name under which the application-defined collating sequence `name` was registered
+    /// (the lookup ignores ASCII case); `None` for built-in or unknown collations.
+    pub fn registered_name(&self, name: &str) -> Option<String> {
+        self.custom.get(&name.to_ascii_uppercase()).map(|c| c.name.to_string())
     }
 
     /// Returns `true` if `name` resolves to either a registered custom collation or a built-in

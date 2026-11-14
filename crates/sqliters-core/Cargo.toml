@@ -18,4 +18,5 @@ sqliters-pager = { path = "../sqliters-pager" }
 sqliters-btree = { path = "../sqliters-btree" }
 sqliters-syntax = { path = "../sqliters-syntax" }
 sqliters-vdbe = { path = "../sqliters-vdbe" }
+sqliters-codegen = { path = "../sqliters-codegen" }
 sqliters-ext = { path = "../sqliters-ext" }

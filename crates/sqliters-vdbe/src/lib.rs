@@ -4,8 +4,10 @@
 
 mod func_c;
 pub mod functions;
+pub mod opcodes;
 pub mod printf;
 pub mod storage_api;
+pub mod vdbeaux;
 
 use std::cmp::Ordering;
 use std::sync::Arc;

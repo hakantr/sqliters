@@ -138,6 +138,7 @@ fn test_acyclic_workspace_crate_dependency_graph() {
         ("sqliters-btree", "crates/sqliters-btree/Cargo.toml"),
         ("sqliters-syntax", "crates/sqliters-syntax/Cargo.toml"),
         ("sqliters-vdbe", "crates/sqliters-vdbe/Cargo.toml"),
+        ("sqliters-codegen", "crates/sqliters-codegen/Cargo.toml"),
         ("sqliters-ext", "crates/sqliters-ext/Cargo.toml"),
         ("sqliters-core", "crates/sqliters-core/Cargo.toml"),
         ("sqliters-cli", "crates/sqliters-cli/Cargo.toml"),

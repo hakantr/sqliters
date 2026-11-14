@@ -1,0 +1,1104 @@
+//! VDBE program representation and the program-building half of `vdbeaux.c` (SQLite 3.54.1).
+//!
+//! This module is the contract between the code generator (`sqliters-codegen`, a port of
+//! `build.c` / `select.c` / `expr.c` / …) and the virtual machine (a port of `vdbe.c`):
+//!
+//! * [`VdbeOp`] / [`P4`] — one instruction, exactly the fields of C's `struct VdbeOp`
+//!   (`opcode`, `p1`, `p2`, `p3`, `p4` + `p4type`, `p5`).
+//! * [`Vdbe`] — a program under construction (`Vdbe` in `VDBE_INIT_STATE`): the
+//!   `sqlite3VdbeAddOp*` family, labels, `sqlite3VdbeChangeP*`, `sqlite3VdbeJumpHere`, …
+//! * [`Program`] — the finished program (`sqlite3VdbeMakeReady`): resolved jump targets and the
+//!   sizing (`n_mem`, `n_cursor`, `n_var`, …) the machine allocates from.
+//! * [`SubProgram`] — a trigger sub-program (`OP_Program` P4).
+//! * [`Program::list`] — `sqlite3VdbeList()`: the rows of `EXPLAIN`.
+//!
+//! Function and field names follow C (in Rust spelling) so that the C source can be read next
+//! to this file. Opcode numbers are in [`crate::opcodes`].
+//!
+//! Differences in placement only (no behavioural difference): C keeps the label table in
+//! `Parse` (`Parse.nLabel`, `Parse.aLabel`); here it lives in [`Vdbe`] because the builder must
+//! not depend on the code generator's `Parse`.
+#![forbid(unsafe_code)]
+#![allow(non_upper_case_globals)]
+
+use std::sync::Arc;
+
+use sqliters_types::Value;
+
+use crate::opcodes::*;
+
+// ---------------------------------------------------------------------------------------------
+// P4 operand kinds
+// ---------------------------------------------------------------------------------------------
+
+/// Text encodings (`SQLITE_UTF8` …) as stored in `CollSeq.enc` / `KeyInfo.enc`.
+pub const SQLITE_UTF8: u8 = 1;
+pub const SQLITE_UTF16LE: u8 = 2;
+pub const SQLITE_UTF16BE: u8 = 3;
+
+/// `KeyInfo.aSortFlags[]` bits.
+pub const KEYINFO_ORDER_DESC: u8 = 0x01; // DESC sort order
+pub const KEYINFO_ORDER_BIGNULL: u8 = 0x02; // NULL is larger than any other value
+
+/// `struct CollSeq`: a collating sequence. The machine finds the comparison function by
+/// `name` in the connection's collation registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollSeq {
+    /// `zName`
+    pub name: String,
+    /// `enc`: `SQLITE_UTF8`, `SQLITE_UTF16LE` or `SQLITE_UTF16BE`
+    pub enc: u8,
+}
+
+/// `struct KeyInfo`: describes the key of an index / sorter / ephemeral table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyInfo {
+    /// `enc`
+    pub enc: u8,
+    /// `nKeyField`: number of key columns
+    pub n_key_field: u16,
+    /// `nAllField`: total columns, key plus others
+    pub n_all_field: u16,
+    /// `aSortFlags[]`, one per key field (`KEYINFO_ORDER_*`)
+    pub a_sort_flags: Vec<u8>,
+    /// `aColl[]`, one per key field; `None` is C's NULL (= BINARY)
+    pub a_coll: Vec<Option<Arc<CollSeq>>>,
+}
+
+impl KeyInfo {
+    /// `sqlite3KeyInfoAlloc(db, N, X)`: `N` key fields, `X` extra fields, everything zeroed.
+    pub fn alloc(enc: u8, n: usize, x: usize) -> KeyInfo {
+        KeyInfo {
+            enc,
+            n_key_field: n as u16,
+            n_all_field: (n + x) as u16,
+            a_sort_flags: vec![0; n + x],
+            a_coll: vec![None; n + x],
+        }
+    }
+}
+
+/// `struct FuncDef` as far as a program needs it: identity and flags. The machine finds the
+/// implementation by (`name`, `n_arg`) in the connection's function registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FuncDef {
+    /// `nArg`: number of arguments, -1 for any number
+    pub n_arg: i16,
+    /// `funcFlags`: `SQLITE_FUNC_*`
+    pub func_flags: u32,
+    /// `zName`
+    pub name: String,
+    /// `SQLITE_PTR_TO_INT(pUserData)`: the `INLINEFUNC_*` id of in-line functions, the
+    /// like/glob/case flags of LIKE-style functions, 0/1/2 of some built-ins; 0 otherwise
+    /// (-1 when C stores a real pointer).
+    pub user_data: i64,
+    /// `xFinalize!=0`: an aggregate (or window) function
+    pub x_finalize: bool,
+    /// `xValue!=0` (and `xInverse!=0`): usable as a window function
+    pub x_value: bool,
+}
+
+/// `struct sqlite3_context` as allocated by `sqlite3VdbeAddFunctionCall()` (`P4_FUNCCTX`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FuncCtx {
+    /// `pFunc`
+    pub p_func: Arc<FuncDef>,
+    /// `argc`
+    pub argc: u16,
+    /// `iOp`: address of the instruction this context belongs to
+    pub i_op: i32,
+}
+
+/// `struct SubrtnSig`: signature of a reusable subroutine materializing the RHS of an IN
+/// operator (`P4_SUBRTNSIG` on `OP_BeginSubrtn`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubrtnSig {
+    /// `selId`: SELECT-id of the SELECT on the RHS
+    pub sel_id: i32,
+    /// `bComplete`: fully coded and available for reuse
+    pub b_complete: bool,
+    /// `zAff`: affinity of the overall IN expression
+    pub z_aff: String,
+    /// `iTable`: ephemeral table generated by the subroutine
+    pub i_table: i32,
+    /// `iAddr`: subroutine entry address
+    pub i_addr: i32,
+    /// `regReturn`: register holding the return address
+    pub reg_return: i32,
+}
+
+/// What a program needs to know about a table named by a `P4_TABLE` operand
+/// (`OP_Insert`, `OP_Delete`, `OP_TypeCheck`, `OP_VCheck`, …). Later code-generator steps
+/// extend this as the machine needs more of C's `Table`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct P4Table {
+    /// `zName`
+    pub name: String,
+}
+
+/// What a program needs to know about an index named by a `P4_INDEX` operand.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct P4Index {
+    /// `zName`
+    pub name: String,
+}
+
+/// A virtual-table instance named by a `P4_VTAB` operand. `id` identifies the connected
+/// instance in the engine; `EXPLAIN` prints `vtab:<pointer>` for it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct P4Vtab {
+    pub id: u64,
+    pub name: String,
+}
+
+/// The P4 operand of an instruction: `p4type` and the `p4` union of C's `struct VdbeOp`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum P4 {
+    /// `P4_NOTUSED`
+    #[default]
+    NotUsed,
+    /// `P4_STATIC`: a string with static lifetime
+    Static(&'static str),
+    /// `P4_DYNAMIC` (and `P4_TRANSIENT`, which C copies into a dynamic string): a C string, or
+    /// for `OP_Blob` the blob bytes (the length is in P1)
+    Dynamic(Vec<u8>),
+    /// `P4_COLLSEQ`
+    CollSeq(Arc<CollSeq>),
+    /// `P4_INT32`
+    Int32(i32),
+    /// `P4_SUBPROGRAM`
+    SubProgram(Arc<SubProgram>),
+    /// `P4_TABLE` / `P4_TABLEREF`
+    Table(Arc<P4Table>),
+    /// `P4_INDEX`
+    Index(Arc<P4Index>),
+    /// `P4_FUNCDEF`
+    FuncDef(Arc<FuncDef>),
+    /// `P4_KEYINFO`
+    KeyInfo(Arc<KeyInfo>),
+    /// `P4_MEM`
+    Mem(Value),
+    /// `P4_VTAB`
+    Vtab(Arc<P4Vtab>),
+    /// `P4_INTARRAY`: the elements (C stores the count in front; here it is the length)
+    IntArray(Vec<u32>),
+    /// `P4_FUNCCTX`
+    FuncCtx(Box<FuncCtx>),
+    /// `P4_SUBRTNSIG`
+    SubrtnSig(Box<SubrtnSig>),
+}
+
+impl P4 {
+    /// A dynamic C-string operand (`sqlite3VdbeAddOp4(..., z, 0)` / `P4_DYNAMIC`).
+    pub fn dynamic(z: &str) -> P4 {
+        P4::Dynamic(z.as_bytes().to_vec())
+    }
+
+    /// `pOp->p4type != P4_NOTUSED`
+    #[inline]
+    pub fn is_used(&self) -> bool {
+        !matches!(self, P4::NotUsed)
+    }
+}
+
+/// `struct VdbeOp`: a single instruction of the virtual machine.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VdbeOp {
+    /// What operation to perform (`OP_*` of [`crate::opcodes`])
+    pub opcode: u8,
+    /// Fifth parameter, an unsigned 16-bit integer
+    pub p5: u16,
+    /// First operand
+    pub p1: i32,
+    /// Second parameter (often the jump destination)
+    pub p2: i32,
+    /// Third parameter
+    pub p3: i32,
+    /// Fourth parameter
+    pub p4: P4,
+}
+
+/// `struct VdbeOpList`: the compact form used by [`Vdbe::add_op_list`].
+#[derive(Debug, Clone, Copy)]
+pub struct VdbeOpList {
+    pub opcode: u8,
+    pub p1: i8,
+    pub p2: i8,
+    pub p3: i8,
+}
+
+/// `struct SubProgram`: a sub-routine implementing a trigger program.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SubProgram {
+    /// `aOp` / `nOp`
+    pub a_op: Vec<VdbeOp>,
+    /// `nMem`: number of memory cells required
+    pub n_mem: i32,
+    /// `nCsr`: number of cursors required
+    pub n_csr: i32,
+    /// Number of `OP_Once` flags (`aOnce` is allocated at run time by the machine)
+    pub n_once: i32,
+    /// `token`: id usable to detect recursive invocation of the same trigger
+    pub token: u64,
+}
+
+/// `INT32_TO_64(a,b)`: combine two int32 values into an int64, least significant first.
+#[inline]
+pub fn int32_to_64(a: i32, b: i32) -> i64 {
+    (((b as u32 as u64) << 32) | (a as u32 as u64)) as i64
+}
+/// `LOWER32(x)`
+#[inline]
+pub fn lower32(x: i64) -> i32 {
+    ((x as u64) & 0xffff_ffff) as u32 as i32
+}
+/// `UPPER32(x)`
+#[inline]
+pub fn upper32(x: i64) -> i32 {
+    ((x as u64) >> 32) as u32 as i32
+}
+
+/// `ADDR(X)`: index into the label table of label `X` (labels are negative numbers).
+#[inline]
+fn addr(x: i32) -> usize {
+    (!x) as usize
+}
+
+/// Column-name slots (`COLNAME_*`).
+pub const COLNAME_NAME: usize = 0;
+pub const COLNAME_DECLTYPE: usize = 1;
+pub const COLNAME_DATABASE: usize = 2;
+pub const COLNAME_TABLE: usize = 3;
+pub const COLNAME_COLUMN: usize = 4;
+/// Number of `COLNAME_*` slots kept per result column (`SQLITE_ENABLE_COLUMN_METADATA` is off
+/// in the reference build, so only NAME and DECLTYPE are stored).
+pub const COLNAME_N: usize = 2;
+
+/// `VList`: the names of the SQL parameters (`sqlite3VListAdd` / `sqlite3VListNumToName` /
+/// `sqlite3VListNameToNum`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VList {
+    /// (name, parameter number) in the order the names were added
+    pub a: Vec<(String, i32)>,
+}
+
+impl VList {
+    /// `sqlite3VListAdd(db, pIn, zName, nName, iVal)`
+    pub fn add(&mut self, name: &str, i_val: i32) {
+        self.a.push((name.to_owned(), i_val));
+    }
+    /// `sqlite3VListNumToName(pIn, iVal)`
+    pub fn num_to_name(&self, i_val: i32) -> Option<&str> {
+        self.a.iter().find(|(_, v)| *v == i_val).map(|(n, _)| n.as_str())
+    }
+    /// `sqlite3VListNameToNum(pIn, zName, nName)`; 0 if there is no such name.
+    pub fn name_to_num(&self, name: &str) -> i32 {
+        self.a.iter().find(|(n, _)| n == name).map_or(0, |(_, v)| *v)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Vdbe: a program under construction
+// ---------------------------------------------------------------------------------------------
+
+/// A prepared statement under construction (C's `Vdbe` in `VDBE_INIT_STATE`).
+#[derive(Debug, Clone, Default)]
+pub struct Vdbe {
+    /// `aOp` / `nOp`
+    pub a_op: Vec<VdbeOp>,
+    /// `Parse.nLabel`: the *negative* of the number of labels issued
+    pub n_label: i32,
+    /// `Parse.aLabel[]`: address each label resolves to (-1 while unresolved)
+    pub a_label: Vec<i32>,
+    /// `btreeMask`: bitmask of `db->aDb[]` entries referenced
+    pub btree_mask: u32,
+    /// `lockMask`: subset of `btree_mask` that requires a lock (shared-cache btrees)
+    pub lock_mask: u32,
+    /// `pProgram`: all sub-programs used by the VM, most recently linked first
+    pub p_program: Vec<Arc<SubProgram>>,
+    /// `minWriteFileFormat`
+    pub min_write_file_format: u8,
+    /// `expmask`: binding to these variables might invalidate the VM
+    pub expmask: u32,
+    /// `aColName` (`COLNAME_N` slots per result column) / `nResColumn` / `nResAlloc`
+    pub a_col_name: Vec<Option<String>>,
+    pub n_res_column: u16,
+    pub n_res_alloc: u16,
+    /// `prepFlags`
+    pub prep_flags: u8,
+    /// `Parse.nTempReg` / `Parse.nRangeReg` are reset by [`Vdbe::end_coroutine`]; the code
+    /// generator reads this flag after the call and clears its pools (C does it through
+    /// `v->pParse`).
+    pub coroutine_ended: bool,
+}
+
+impl Vdbe {
+    /// `sqlite3VdbeCreate(pParse)`: a new, empty program. (C adds `OP_Init` here as well; it
+    /// is added by the caller, `sqlite3GetVdbe`, to keep this type free of `Parse`.)
+    pub fn new() -> Vdbe {
+        Vdbe { min_write_file_format: 255, ..Vdbe::default() }
+    }
+
+    /// `p->nOp`
+    #[inline]
+    pub fn n_op(&self) -> i32 {
+        self.a_op.len() as i32
+    }
+
+    /// `sqlite3VdbeAddOp0(p, op)`
+    #[inline]
+    pub fn add_op0(&mut self, op: u8) -> i32 {
+        self.add_op3(op, 0, 0, 0)
+    }
+    /// `sqlite3VdbeAddOp1(p, op, p1)`
+    #[inline]
+    pub fn add_op1(&mut self, op: u8, p1: i32) -> i32 {
+        self.add_op3(op, p1, 0, 0)
+    }
+    /// `sqlite3VdbeAddOp2(p, op, p1, p2)`
+    #[inline]
+    pub fn add_op2(&mut self, op: u8, p1: i32, p2: i32) -> i32 {
+        self.add_op3(op, p1, p2, 0)
+    }
+    /// `sqlite3VdbeAddOp3(p, op, p1, p2, p3)`: append an instruction, return its address.
+    pub fn add_op3(&mut self, op: u8, p1: i32, p2: i32, p3: i32) -> i32 {
+        let i = self.a_op.len() as i32;
+        self.a_op.push(VdbeOp { opcode: op, p5: 0, p1, p2, p3, p4: P4::NotUsed });
+        i
+    }
+    /// `sqlite3VdbeAddOp4Int(p, op, p1, p2, p3, p4)`
+    pub fn add_op4_int(&mut self, op: u8, p1: i32, p2: i32, p3: i32, p4: i32) -> i32 {
+        let i = self.a_op.len() as i32;
+        self.a_op.push(VdbeOp { opcode: op, p5: 0, p1, p2, p3, p4: P4::Int32(p4) });
+        i
+    }
+    /// `sqlite3VdbeAddInt64(p, iDest, iVal)`: load a 64-bit integer into register `iDest`.
+    pub fn add_int64(&mut self, i_dest: i32, i_val: i64) -> i32 {
+        self.add_op3(OP_Int64, lower32(i_val), i_dest, upper32(i_val))
+    }
+    /// `sqlite3VdbeAddDouble(p, iDest, rVal)`: load a 64-bit float into register `iDest`.
+    pub fn add_double(&mut self, i_dest: i32, r_val: f64) -> i32 {
+        let i_val = r_val.to_bits() as i64;
+        self.add_op3(OP_Real, lower32(i_val), i_dest, upper32(i_val))
+    }
+    /// `sqlite3VdbeGoto(p, iDest)`
+    pub fn goto(&mut self, i_dest: i32) -> i32 {
+        self.add_op3(OP_Goto, 0, i_dest, 0)
+    }
+    /// `sqlite3VdbeLoadString(p, iDest, zStr)`
+    pub fn load_string(&mut self, i_dest: i32, z_str: &str) -> i32 {
+        self.add_op4(OP_String8, 0, i_dest, 0, P4::dynamic(z_str))
+    }
+    /// `sqlite3VdbeAddOp4(p, op, p1, p2, p3, zP4, p4type)`
+    pub fn add_op4(&mut self, op: u8, p1: i32, p2: i32, p3: i32, p4: P4) -> i32 {
+        let a = self.add_op3(op, p1, p2, p3);
+        self.change_p4(a, p4);
+        a
+    }
+    /// `sqlite3VdbeAddFunctionCall(pParse, p1, p2, p3, nArg, pFunc, eCallCtx)`: add an
+    /// `OP_Function` or `OP_PureFunc` opcode. `nc_self_ref` is `NC_SelfRef`. The caller does
+    /// `sqlite3MayAbort(pParse)` afterwards, as C does inside this function.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_function_call(
+        &mut self,
+        p1: i32,
+        p2: i32,
+        p3: i32,
+        n_arg: i32,
+        p_func: Arc<FuncDef>,
+        e_call_ctx: i32,
+        nc_self_ref: i32,
+    ) -> i32 {
+        let ctx = FuncCtx { p_func, argc: n_arg as u16, i_op: self.current_addr() };
+        let a = self.add_op4(
+            if e_call_ctx != 0 { OP_PureFunc } else { OP_Function },
+            p1,
+            p2,
+            p3,
+            P4::FuncCtx(Box::new(ctx)),
+        );
+        self.change_p5((e_call_ctx & nc_self_ref) as u16);
+        a
+    }
+    /// `sqlite3VdbeEndCoroutine(v, regYield)`: insert the end of a co-routine. The caller must
+    /// reset `Parse.nTempReg` and `Parse.nRangeReg` (see [`Vdbe::coroutine_ended`]).
+    pub fn end_coroutine(&mut self, reg_yield: i32) {
+        self.add_op1(OP_EndCoroutine, reg_yield);
+        self.coroutine_ended = true;
+    }
+
+    /// `sqlite3VdbeMakeLabel(pParse)`: a new symbolic label (a negative number) for an
+    /// instruction that has yet to be coded.
+    pub fn make_label(&mut self) -> i32 {
+        self.n_label -= 1;
+        self.n_label
+    }
+    /// `sqlite3VdbeResolveLabel(v, x)`: resolve label `x` to the address of the next
+    /// instruction to be inserted.
+    pub fn resolve_label(&mut self, x: i32) {
+        let j = addr(x);
+        debug_assert!((j as i32) < -self.n_label);
+        if self.a_label.len() <= j {
+            // resizeResolveLabel()
+            let n_new_size = (25 - self.n_label) as usize;
+            self.a_label.resize(n_new_size, -1);
+        }
+        self.a_label[j] = self.a_op.len() as i32;
+    }
+    /// `sqlite3VdbeRunOnlyOnce(p)`
+    pub fn run_only_once(&mut self) {
+        self.add_op2(OP_Expire, 1, 1);
+    }
+    /// `sqlite3VdbeReusable(p)`
+    pub fn reusable(&mut self) {
+        for i in 1..self.a_op.len() {
+            if self.a_op[i].opcode == OP_Expire {
+                self.a_op[1].opcode = OP_Noop;
+                break;
+            }
+        }
+    }
+
+    /// `resolveP2Values(p, &nMaxVtabArgs)`: resolve label P2 values to addresses, compute the
+    /// maximum number of xUpdate/xFilter arguments and the `readOnly` / `bIsReader` flags.
+    /// Returns `(read_only, b_is_reader)`.
+    fn resolve_p2_values(&mut self, p_max_vtab_args: &mut i32) -> (bool, bool) {
+        let mut n_max_vtab_args = *p_max_vtab_args;
+        let mut read_only = true;
+        let mut b_is_reader = false;
+        debug_assert!(self.a_op[0].opcode == OP_Init);
+        let mut i = self.a_op.len() - 1;
+        loop {
+            let opcode = self.a_op[i].opcode;
+            if opcode <= SQLITE_MX_JUMP_OPCODE {
+                let mut dflt = false;
+                match opcode {
+                    OP_Transaction => {
+                        if self.a_op[i].p2 != 0 {
+                            read_only = false;
+                        }
+                        b_is_reader = true;
+                    }
+                    OP_AutoCommit | OP_Savepoint => {
+                        b_is_reader = true;
+                    }
+                    OP_Checkpoint | OP_Vacuum | OP_JournalMode => {
+                        read_only = false;
+                        b_is_reader = true;
+                    }
+                    OP_Init => break,
+                    OP_VUpdate => {
+                        if self.a_op[i].p2 > n_max_vtab_args {
+                            n_max_vtab_args = self.a_op[i].p2;
+                        }
+                    }
+                    OP_VFilter => {
+                        // The instruction immediately prior to VFilter is an OP_Integer that
+                        // sets the "argc" value for the VFilter.
+                        debug_assert!(i >= 3 && self.a_op[i - 1].opcode == OP_Integer);
+                        let n = self.a_op[i - 1].p1;
+                        if n > n_max_vtab_args {
+                            n_max_vtab_args = n;
+                        }
+                        dflt = true;
+                    }
+                    _ => dflt = true,
+                }
+                if dflt && self.a_op[i].p2 < 0 {
+                    debug_assert!(OPCODE_PROPERTY[opcode as usize] & OPFLG_JUMP != 0);
+                    self.a_op[i].p2 = self.a_label[addr(self.a_op[i].p2)];
+                }
+            }
+            debug_assert!(i > 0);
+            i -= 1;
+        }
+        self.a_label = Vec::new();
+        self.n_label = 0;
+        *p_max_vtab_args = n_max_vtab_args;
+        (read_only, b_is_reader)
+    }
+
+    /// `sqlite3VdbeCurrentAddr(p)`: the address of the next instruction to be inserted.
+    #[inline]
+    pub fn current_addr(&self) -> i32 {
+        self.a_op.len() as i32
+    }
+
+    /// `sqlite3VdbeTakeOpArray(p, &nOp, &nMaxArg)`: resolve the labels and hand the opcode
+    /// array over (used to build a [`SubProgram`]).
+    pub fn take_op_array(&mut self, pn_max_arg: &mut i32) -> Vec<VdbeOp> {
+        debug_assert!(self.btree_mask == 0);
+        self.resolve_p2_values(pn_max_arg);
+        std::mem::take(&mut self.a_op)
+    }
+
+    /// `sqlite3VdbeAddOpList(p, nOp, aOp, iLineno)`: add a whole list of operations; non-zero
+    /// P2 arguments of jump instructions are made relative to the first operation inserted.
+    /// Returns the address of the first instruction added.
+    pub fn add_op_list(&mut self, a_op: &[VdbeOpList]) -> i32 {
+        let base = self.a_op.len() as i32;
+        for o in a_op {
+            let mut p2 = o.p2 as i32;
+            if OPCODE_PROPERTY[o.opcode as usize] & OPFLG_JUMP != 0 && o.p2 > 0 {
+                p2 += base;
+            }
+            self.a_op.push(VdbeOp {
+                opcode: o.opcode,
+                p5: 0,
+                p1: o.p1 as i32,
+                p2,
+                p3: o.p3 as i32,
+                p4: P4::NotUsed,
+            });
+        }
+        base
+    }
+
+    /// `sqlite3VdbeChangeOpcode(p, addr, iNewOpcode)`
+    pub fn change_opcode(&mut self, addr: i32, i_new_opcode: u8) {
+        self.a_op[addr as usize].opcode = i_new_opcode;
+    }
+    /// `sqlite3VdbeChangeP1(p, addr, val)`
+    pub fn change_p1(&mut self, addr: i32, val: i32) {
+        self.a_op[addr as usize].p1 = val;
+    }
+    /// `sqlite3VdbeChangeP2(p, addr, val)`
+    pub fn change_p2(&mut self, addr: i32, val: i32) {
+        self.a_op[addr as usize].p2 = val;
+    }
+    /// `sqlite3VdbeChangeP3(p, addr, val)`
+    pub fn change_p3(&mut self, addr: i32, val: i32) {
+        self.a_op[addr as usize].p3 = val;
+    }
+    /// `sqlite3VdbeChangeP5(p, p5)`: set P5 of the most recently added instruction.
+    pub fn change_p5(&mut self, p5: u16) {
+        if let Some(op) = self.a_op.last_mut() {
+            op.p5 = p5;
+        }
+    }
+    /// `sqlite3VdbeTypeofColumn(p, iDest)`: if the previous opcode is an `OP_Column` that
+    /// delivers results into register `iDest`, add the `OPFLAG_TYPEOFARG` flag to it.
+    pub fn typeof_column(&mut self, i_dest: i32, opflag_typeofarg: u16) {
+        if let Some(op) = self.a_op.last_mut()
+            && op.p3 == i_dest
+            && op.opcode == OP_Column
+        {
+            op.p5 |= opflag_typeofarg;
+        }
+    }
+    /// `sqlite3VdbeJumpHere(p, addr)`: make the P2 operand of instruction `addr` point to the
+    /// next instruction to be coded.
+    pub fn jump_here(&mut self, addr: i32) {
+        let n = self.a_op.len() as i32;
+        self.change_p2(addr, n);
+    }
+    /// `sqlite3VdbeJumpHereOrPopInst(p, addr)`: like `jump_here`, but if the jump is the
+    /// previous instruction (and thus a no-op) remove it instead.
+    pub fn jump_here_or_pop_inst(&mut self, addr: i32) {
+        if addr == self.a_op.len() as i32 - 1 {
+            self.a_op.pop();
+        } else {
+            let n = self.a_op.len() as i32;
+            self.change_p2(addr, n);
+        }
+    }
+    /// `sqlite3VdbeLinkSubProgram(pVdbe, p)`
+    pub fn link_sub_program(&mut self, p: Arc<SubProgram>) {
+        self.p_program.insert(0, p);
+    }
+    /// `sqlite3VdbeHasSubProgram(pVdbe)`
+    pub fn has_sub_program(&self) -> bool {
+        !self.p_program.is_empty()
+    }
+    /// `sqlite3VdbeChangeToNoop(p, addr)`: change the opcode at `addr` into `OP_Noop`.
+    pub fn change_to_noop(&mut self, addr: i32) -> bool {
+        let op = &mut self.a_op[addr as usize];
+        op.p4 = P4::NotUsed;
+        op.opcode = OP_Noop;
+        true
+    }
+    /// `sqlite3VdbeDeletePriorOpcode(p, op)`: if the last opcode is `op`, turn it into a
+    /// no-op. Returns true iff an opcode was removed.
+    pub fn delete_prior_opcode(&mut self, op: u8) -> bool {
+        match self.a_op.last() {
+            Some(last) if last.opcode == op => {
+                let a = self.a_op.len() as i32 - 1;
+                self.change_to_noop(a)
+            }
+            _ => false,
+        }
+    }
+    /// `sqlite3VdbeChangeP4(p, addr, zP4, n)`: set the P4 operand of instruction `addr`
+    /// (`addr < 0`: the most recently inserted instruction).
+    pub fn change_p4(&mut self, addr: i32, p4: P4) {
+        let a = if addr < 0 { self.a_op.len() - 1 } else { addr as usize };
+        self.a_op[a].p4 = p4;
+    }
+    /// `sqlite3VdbeAppendP4(p, pP4, n)`: set P4 of the most recently coded instruction, which
+    /// must not have one yet.
+    pub fn append_p4(&mut self, p4: P4) {
+        let op = self.a_op.last_mut().expect("append_p4 on empty program");
+        debug_assert!(!op.p4.is_used());
+        op.p4 = p4;
+    }
+    /// `sqlite3VdbeGetOp(p, addr)`
+    #[inline]
+    pub fn get_op(&self, addr: i32) -> &VdbeOp {
+        &self.a_op[addr as usize]
+    }
+    /// `sqlite3VdbeGetOp(p, addr)`, mutable
+    #[inline]
+    pub fn get_op_mut(&mut self, addr: i32) -> &mut VdbeOp {
+        &mut self.a_op[addr as usize]
+    }
+    /// `sqlite3VdbeGetLastOp(p)`
+    #[inline]
+    pub fn get_last_op(&self) -> &VdbeOp {
+        self.a_op.last().expect("get_last_op on empty program")
+    }
+    /// `sqlite3VdbeGetLastOp(p)`, mutable
+    #[inline]
+    pub fn get_last_op_mut(&mut self) -> &mut VdbeOp {
+        self.a_op.last_mut().expect("get_last_op on empty program")
+    }
+
+    /// `sqlite3VdbeUsesBtree(p, i)`: declare that the btree of `db->aDb[i]` is used.
+    /// `sharable` is `sqlite3BtreeSharable(db->aDb[i].pBt)`.
+    pub fn uses_btree(&mut self, i: i32, sharable: bool) {
+        self.btree_mask |= 1u32 << i;
+        if i != 1 && sharable {
+            self.lock_mask |= 1u32 << i;
+        }
+    }
+
+    /// `sqlite3VdbeSetNumCols(p, nResColumn)`
+    pub fn set_num_cols(&mut self, n_res_column: i32) {
+        self.n_res_column = n_res_column as u16;
+        self.n_res_alloc = n_res_column as u16;
+        self.a_col_name = vec![None; n_res_column as usize * COLNAME_N];
+    }
+    /// `sqlite3VdbeSetColName(p, idx, var, zName, xDel)`
+    pub fn set_col_name(&mut self, idx: i32, var: usize, z_name: Option<&str>) {
+        debug_assert!(var < COLNAME_N);
+        let n = self.n_res_alloc as usize;
+        if (idx as usize) < n {
+            self.a_col_name[idx as usize + var * n] = z_name.map(str::to_owned);
+        }
+    }
+
+    /// `sqlite3VdbeMakeReady(p, pParse)`: finish the program. `sizing` carries the `Parse`
+    /// fields the function reads.
+    pub fn make_ready(mut self, sizing: MakeReady) -> Program {
+        debug_assert!(!self.a_op.is_empty());
+        let n_var = sizing.n_var;
+        let mut n_mem = sizing.n_mem;
+        let n_cursor = sizing.n_tab;
+        let mut n_arg = sizing.n_max_arg;
+        // Each cursor uses a memory cell. The first cursor (cursor 0) can use aMem[0] which is
+        // not otherwise used by the VDBE program. Space at the end of aMem[] is for cursors 1
+        // and greater.
+        n_mem += n_cursor;
+        if n_cursor == 0 && n_mem > 0 {
+            n_mem += 1; // Space for aMem[0] even if not used
+        }
+        let (read_only, b_is_reader) = self.resolve_p2_values(&mut n_arg);
+        let uses_stmt_journal = sizing.is_multi_write && sizing.may_abort;
+        let mut n_res_column = self.n_res_column;
+        if sizing.explain != 0 {
+            if n_mem < 10 {
+                n_mem = 10;
+            }
+            n_res_column = 12 - 4 * sizing.explain as u16;
+        }
+        Program {
+            a_op: self.a_op,
+            n_mem,
+            n_cursor,
+            n_var,
+            n_arg,
+            p_vlist: sizing.p_vlist,
+            read_only,
+            b_is_reader,
+            uses_stmt_journal,
+            explain: sizing.explain,
+            n_res_column,
+            a_col_name: self.a_col_name,
+            n_res_alloc: self.n_res_alloc,
+            btree_mask: self.btree_mask,
+            lock_mask: self.lock_mask,
+            p_program: self.p_program,
+            min_write_file_format: self.min_write_file_format,
+            expmask: self.expmask,
+            prep_flags: self.prep_flags,
+        }
+    }
+}
+
+/// The `Parse` fields `sqlite3VdbeMakeReady()` reads.
+#[derive(Debug, Clone, Default)]
+pub struct MakeReady {
+    /// `pParse->nVar`: number of SQL parameters
+    pub n_var: i32,
+    /// `pParse->nMem`: number of memory cells used so far
+    pub n_mem: i32,
+    /// `pParse->nTab`: number of cursors allocated
+    pub n_tab: i32,
+    /// `pParse->nMaxArg`: max number of args to xUpdate / xFilter
+    pub n_max_arg: i32,
+    /// `pParse->isMultiWrite`
+    pub is_multi_write: bool,
+    /// `pParse->mayAbort`
+    pub may_abort: bool,
+    /// `pParse->explain`: 0 normal, 1 EXPLAIN, 2 EXPLAIN QUERY PLAN
+    pub explain: u8,
+    /// `pParse->pVList`: names of the parameters
+    pub p_vlist: VList,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Program: a finished program
+// ---------------------------------------------------------------------------------------------
+
+/// A finished program (C's `Vdbe` after `sqlite3VdbeMakeReady()`): what the machine executes
+/// and what `EXPLAIN` lists.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Program {
+    /// `aOp` / `nOp`: the instructions; all jump targets are addresses
+    pub a_op: Vec<VdbeOp>,
+    /// `nMem`: number of memory cells to allocate (`aMem[0..n_mem]`; cursors 1.. use the cells
+    /// at the end, see `allocateCursor()`)
+    pub n_mem: i32,
+    /// `nCursor`: number of cursor slots (`apCsr[]`)
+    pub n_cursor: i32,
+    /// `nVar`: number of SQL parameters (`aVar[]`)
+    pub n_var: i32,
+    /// Size of `apArg[]`: max number of arguments to xFilter / xUpdate
+    pub n_arg: i32,
+    /// `pVList`: names of the parameters
+    pub p_vlist: VList,
+    /// `readOnly`: true for statements that do not write
+    pub read_only: bool,
+    /// `bIsReader`: true for statements that read
+    pub b_is_reader: bool,
+    /// `usesStmtJournal`
+    pub uses_stmt_journal: bool,
+    /// `explain`: 0 normal, 1 EXPLAIN, 2 EXPLAIN QUERY PLAN
+    pub explain: u8,
+    /// `nResColumn`: number of columns in one row of the result set
+    pub n_res_column: u16,
+    /// `aColName`: `COLNAME_N * n_res_alloc` names, slot `idx + var*n_res_alloc`
+    pub a_col_name: Vec<Option<String>>,
+    /// `nResAlloc`
+    pub n_res_alloc: u16,
+    /// `btreeMask`
+    pub btree_mask: u32,
+    /// `lockMask`
+    pub lock_mask: u32,
+    /// `pProgram`: all sub-programs, most recently linked first
+    pub p_program: Vec<Arc<SubProgram>>,
+    /// `minWriteFileFormat`
+    pub min_write_file_format: u8,
+    /// `expmask`
+    pub expmask: u32,
+    /// `prepFlags`
+    pub prep_flags: u8,
+}
+
+/// Names of the result columns of `EXPLAIN` (`sqlite3VdbeSetColName` calls in
+/// `sqlite3Prepare`: `azColName[]`, first 8) and of `EXPLAIN QUERY PLAN` (last 4).
+pub const EXPLAIN_COLUMN_NAMES: [&str; 12] = [
+    "addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment", "id", "parent", "notused", "detail",
+];
+
+impl Program {
+    /// `sqlite3VdbeList(p)` run to completion: one row per instruction. With `explain==1` the
+    /// rows are `addr, opcode, p1, p2, p3, p4, p5, comment` — first the main program, then each
+    /// trigger sub-program in the order its `OP_Program` is first met; with `explain==2` the
+    /// rows are `id, parent, notused, detail` of the `OP_Explain` instructions.
+    ///
+    /// `explain` selects the mode independently of [`Program::explain`] so that a program can be
+    /// listed by tools.
+    pub fn list(&self, explain: u8) -> Vec<Vec<Value>> {
+        let mut rows = Vec::new();
+        for (i, op) in self.list_ops(explain) {
+            // C returns the P4 column as TEXT. The engine's TEXT value is a `String`, so a P4
+            // text that is not valid UTF-8 (only the bytes of a blob literal, `OP_Blob`, can be)
+            // is handed out as a BLOB holding the exact bytes: the shells print the same bytes
+            // for it as C does, but `typeof()` / the API column type of that one cell is BLOB
+            // where C says TEXT. `list_ops` + `sqlite3_vdbe_display_p4_bytes` give the bytes
+            // without that detour.
+            let p4v = match sqlite3_vdbe_display_p4_bytes(&op) {
+                Some(b) => match String::from_utf8(b) {
+                    Ok(s) => Value::Text(s),
+                    Err(e) => Value::Blob(e.into_bytes()),
+                },
+                None => Value::Null,
+            };
+            if explain == 2 {
+                rows.push(vec![
+                    Value::Integer(op.p1 as i64),
+                    Value::Integer(op.p2 as i64),
+                    Value::Integer(op.p3 as i64),
+                    p4v,
+                ]);
+            } else {
+                rows.push(vec![
+                    Value::Integer(i as i64),
+                    Value::Text(OPCODE_NAME[op.opcode as usize].to_owned()),
+                    Value::Integer(op.p1 as i64),
+                    Value::Integer(op.p2 as i64),
+                    Value::Integer(op.p3 as i64),
+                    p4v,
+                    Value::Integer(op.p5 as i64),
+                    Value::Null,
+                ]);
+            }
+        }
+        rows
+    }
+
+    /// `sqlite3VdbeNextOpcode()` run to completion: the instructions `sqlite3VdbeList` visits,
+    /// in order, each with the address it is listed under (`*piAddr`: the index within its own
+    /// program; main program first, then the sub-programs).
+    pub fn list_ops(&self, explain: u8) -> Vec<(usize, VdbeOp)> {
+        let mut rows = Vec::new();
+        // bListSubprogs = (p->explain==1 || (db->flags & SQLITE_TriggerEQP)!=0)
+        let b_list_subprogs = explain == 1;
+        let mut ap_sub: Vec<Arc<SubProgram>> = Vec::new();
+        let mut n_row = self.a_op.len();
+        let mut i_pc = 0usize;
+        loop {
+            // sqlite3VdbeNextOpcode()
+            let mut found: Option<(usize, VdbeOp)> = None;
+            loop {
+                let mut i = i_pc;
+                i_pc += 1;
+                if i >= n_row {
+                    break;
+                }
+                let op: VdbeOp = if i < self.a_op.len() {
+                    // The rowid is small enough that we are still in the main program.
+                    self.a_op[i].clone()
+                } else {
+                    // We are currently listing subprograms. Figure out which one and pick up
+                    // the appropriate opcode.
+                    i -= self.a_op.len();
+                    let mut j = 0;
+                    while i >= ap_sub[j].a_op.len() {
+                        i -= ap_sub[j].a_op.len();
+                        j += 1;
+                    }
+                    ap_sub[j].a_op[i].clone()
+                };
+                if b_list_subprogs
+                    && let P4::SubProgram(sp) = &op.p4
+                    && !ap_sub.iter().any(|s| Arc::ptr_eq(s, sp))
+                {
+                    ap_sub.push(sp.clone());
+                    n_row += sp.a_op.len();
+                }
+                if explain != 2 || op.opcode == OP_Explain || (op.opcode == OP_Init && i_pc > 1) {
+                    found = Some((i, op));
+                    break;
+                }
+            }
+            let Some(f) = found else { break };
+            rows.push(f);
+        }
+        rows
+    }
+}
+
+/// `sqlite3VdbeDisplayP4(db, pOp)` as text: [`sqlite3_vdbe_display_p4_bytes`] with bytes that
+/// are not valid UTF-8 replaced by U+FFFD (the engine's TEXT value is a `String`).
+pub fn sqlite3_vdbe_display_p4(op: &VdbeOp) -> Option<String> {
+    sqlite3_vdbe_display_p4_bytes(op).map(|b| match String::from_utf8(b) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    })
+}
+
+/// `sqlite3VdbeDisplayP4(db, pOp)`: the bytes `EXPLAIN` shows for the P4 operand, `None` where
+/// C produces a NULL (no P4 at all).
+pub fn sqlite3_vdbe_display_p4_bytes(op: &VdbeOp) -> Option<Vec<u8>> {
+    // a C string: up to the first NUL
+    fn cstr(b: &[u8]) -> Vec<u8> {
+        let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+        b[..end].to_vec()
+    }
+    let text = |s: String| Some(s.into_bytes());
+    match &op.p4 {
+        P4::NotUsed => None,
+        P4::KeyInfo(k) => {
+            let mut x = format!("k({}", k.n_key_field);
+            for j in 0..k.n_key_field as usize {
+                let z_coll = match &k.a_coll[j] {
+                    Some(c) => c.name.as_str(),
+                    None => "",
+                };
+                let z_coll = if z_coll == "BINARY" { "B" } else { z_coll };
+                x.push(',');
+                if k.a_sort_flags[j] & KEYINFO_ORDER_DESC != 0 {
+                    x.push('-');
+                }
+                if k.a_sort_flags[j] & KEYINFO_ORDER_BIGNULL != 0 {
+                    x.push_str("N.");
+                }
+                x.push_str(z_coll);
+            }
+            x.push(')');
+            text(x)
+        }
+        P4::CollSeq(c) => {
+            const ENCNAMES: [&str; 4] = ["?", "8", "16LE", "16BE"];
+            // "%.18s-%s": at most 18 bytes of the name (a multi-byte character may be cut)
+            let n = c.name.len().min(18);
+            let mut x = c.name.as_bytes()[..n].to_vec();
+            x.push(b'-');
+            x.extend_from_slice(ENCNAMES[(c.enc & 3) as usize].as_bytes());
+            Some(x)
+        }
+        P4::FuncDef(d) => text(format!("{}({})", d.name, d.n_arg)),
+        P4::FuncCtx(c) => text(format!("{}({})", c.p_func.name, c.p_func.n_arg)),
+        P4::Int32(i) => text(format!("{i}")),
+        P4::Mem(m) => match m {
+            Value::Text(s) => text(s.clone()),
+            Value::Integer(i) => text(format!("{i}")),
+            Value::Real(r) => {
+                Some(crate::printf::sqlite_printf(b"%.16g", &[Value::Real(*r)]).unwrap_or_default())
+            }
+            Value::Null => text("NULL".to_owned()),
+            Value::Blob(_) => text("(blob)".to_owned()),
+        },
+        P4::Vtab(v) => text(format!("vtab:{:#x}", v.id)),
+        P4::IntArray(ai) => {
+            let mut x = String::new();
+            for (i, v) in ai.iter().enumerate() {
+                x.push(if i == 0 { '[' } else { ',' });
+                x.push_str(&format!("{v}"));
+            }
+            x.push(']');
+            text(x)
+        }
+        P4::SubProgram(_) => text("program".to_owned()),
+        P4::Table(t) => text(t.name.clone()),
+        P4::Index(t) => text(t.name.clone()),
+        P4::SubrtnSig(s) => text(format!("subrtnsig:{},{}", s.sel_id, s.z_aff)),
+        P4::Static(s) => text((*s).to_owned()),
+        P4::Dynamic(b) => Some(cstr(b)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(rows: &[Vec<Value>]) -> Vec<String> {
+        rows.iter()
+            .map(|r| {
+                r.iter()
+                    .map(|v| match v {
+                        Value::Null => String::new(),
+                        Value::Integer(i) => i.to_string(),
+                        Value::Text(s) => s.clone(),
+                        _ => "?".to_owned(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect()
+    }
+
+    /// A small program built by hand: label resolution, `jump_here`, sizing and listing.
+    #[test]
+    fn select_1_listing() {
+        let mut v = Vdbe::new();
+        v.add_op2(OP_Init, 0, 1);
+        let lbl = v.make_label();
+        v.add_op2(OP_Integer, 1, 1);
+        v.add_op2(OP_If, 1, lbl);
+        v.add_op2(OP_ResultRow, 1, 1);
+        v.resolve_label(lbl);
+        v.add_op0(OP_Halt);
+        v.jump_here(0);
+        v.goto(1);
+        let p = v.make_ready(MakeReady { n_mem: 1, explain: 1, ..MakeReady::default() });
+        assert_eq!(
+            text(&p.list(1)),
+            [
+                "0|Init|0|5|0||0|",
+                "1|Integer|1|1|0||0|",
+                "2|If|1|4|0||0|",
+                "3|ResultRow|1|1|0||0|",
+                "4|Halt|0|0|0||0|",
+                "5|Goto|0|1|0||0|",
+            ]
+        );
+        assert_eq!(p.n_mem, 10);
+        assert_eq!(p.n_res_column, 8);
+        assert!(p.read_only && !p.b_is_reader);
+    }
+
+    #[test]
+    fn int64_and_real_operands() {
+        let mut v = Vdbe::new();
+        v.add_int64(3, -9223372036854775807 - 1);
+        assert_eq!((v.a_op[0].p1, v.a_op[0].p3), (0, i32::MIN));
+        assert_eq!(int32_to_64(v.a_op[0].p1, v.a_op[0].p3), i64::MIN);
+        v.add_double(4, 1.5);
+        assert_eq!(f64::from_bits(int32_to_64(v.a_op[1].p1, v.a_op[1].p3) as u64), 1.5);
+    }
+
+    #[test]
+    fn p4_display() {
+        let mut k = KeyInfo::alloc(SQLITE_UTF8, 3, 1);
+        k.a_coll[1] = Some(Arc::new(CollSeq { name: "NOCASE".into(), enc: SQLITE_UTF8 }));
+        k.a_coll[2] = Some(Arc::new(CollSeq { name: "BINARY".into(), enc: SQLITE_UTF8 }));
+        k.a_sort_flags[1] = KEYINFO_ORDER_DESC;
+        k.a_sort_flags[2] = KEYINFO_ORDER_DESC | KEYINFO_ORDER_BIGNULL;
+        let op = VdbeOp { p4: P4::KeyInfo(Arc::new(k)), ..VdbeOp::default() };
+        assert_eq!(sqlite3_vdbe_display_p4(&op).as_deref(), Some("k(3,,-NOCASE,-N.B)"));
+        let op = VdbeOp { p4: P4::IntArray(vec![]), ..VdbeOp::default() };
+        assert_eq!(sqlite3_vdbe_display_p4(&op).as_deref(), Some("]"));
+        let op = VdbeOp { p4: P4::IntArray(vec![3, 1]), ..VdbeOp::default() };
+        assert_eq!(sqlite3_vdbe_display_p4(&op).as_deref(), Some("[3,1]"));
+        let op = VdbeOp { p4: P4::dynamic(""), ..VdbeOp::default() };
+        assert_eq!(sqlite3_vdbe_display_p4(&op).as_deref(), Some(""));
+        assert_eq!(sqlite3_vdbe_display_p4(&VdbeOp::default()), None);
+    }
+
+    /// The P4 text of `OP_Blob` is the blob's bytes up to the first NUL (C prints `p4.z` as a
+    /// string). Bytes that are not valid UTF-8 are listed exactly (as a BLOB value, see `list`).
+    #[test]
+    fn p4_of_a_blob_literal_keeps_its_bytes() {
+        let op = VdbeOp { p4: P4::Dynamic(vec![0x41, 0xab, 0xcd, 0x42, 0, 0x43]), ..VdbeOp::default() };
+        assert_eq!(sqlite3_vdbe_display_p4_bytes(&op), Some(vec![0x41, 0xab, 0xcd, 0x42]));
+        assert_eq!(sqlite3_vdbe_display_p4(&op).as_deref(), Some("A\u{fffd}\u{fffd}B"));
+        let mut v = Vdbe::new();
+        v.add_op2(OP_Init, 0, 1);
+        v.add_op4(OP_Blob, 4, 1, 0, P4::Dynamic(vec![0x41, 0xab, 0xcd, 0x42]));
+        v.add_op4(OP_Blob, 2, 2, 0, P4::Dynamic(vec![0xc3, 0xa9]));
+        v.add_op0(OP_Halt);
+        let p = v.make_ready(MakeReady { n_mem: 2, explain: 1, ..MakeReady::default() });
+        let rows = p.list(1);
+        assert_eq!(rows[1][5], Value::Blob(vec![0x41, 0xab, 0xcd, 0x42]));
+        assert_eq!(rows[2][5], Value::Text("\u{e9}".to_owned()));
+        // "%.18s-%s" counts bytes
+        let c = CollSeq { name: "abcdefghijklmnopq\u{e9}x".into(), enc: SQLITE_UTF8 };
+        let op = VdbeOp { p4: P4::CollSeq(Arc::new(c)), ..VdbeOp::default() };
+        assert_eq!(sqlite3_vdbe_display_p4_bytes(&op), Some(b"abcdefghijklmnopq\xc3-8".to_vec()));
+    }
+
+    #[test]
+    fn jump_here_or_pop_inst() {
+        let mut v = Vdbe::new();
+        v.add_op2(OP_Init, 0, 1);
+        let a = v.add_op0(OP_Once);
+        v.jump_here_or_pop_inst(a);
+        assert_eq!(v.n_op(), 1);
+        let a = v.add_op0(OP_Once);
+        v.add_op0(OP_Noop);
+        v.jump_here_or_pop_inst(a);
+        assert_eq!(v.a_op[a as usize].p2, 3);
+    }
+}

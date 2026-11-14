@@ -34,10 +34,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqliters-codegen"
+version = "0.1.0"
+dependencies = [
+ "sqliters-types",
+ "sqliters-vdbe",
+]
+
+[[package]]
 name = "sqliters-core"
 version = "0.1.0"
 dependencies = [
  "sqliters-btree",
+ "sqliters-codegen",
  "sqliters-ext",
  "sqliters-pager",
  "sqliters-syntax",
