@@ -226,6 +226,8 @@ pub struct DatabaseSet {
     /// `db->flags & SQLITE_CorruptRdOnly`: a statement failed with SQLITE_CORRUPT inside the
     /// open transaction; writes are refused until the transaction ends.
     corrupt_rdonly: bool,
+    /// `db->flags & SQLITE_CacheSpill` (`PRAGMA cache_spill`; on by default).
+    pub(crate) cache_spill: bool,
     next_schema_instance_id: u64,
     temp_store: TempStoreMode,
     disk_vfs: Arc<dyn Vfs>,
@@ -310,6 +312,7 @@ impl DatabaseSet {
             column_limit: SQLITE_MAX_COLUMN,
             trigger_steps_limit: SQLITE_MAX_TRIGGER_STEPS,
             corrupt_rdonly: false,
+            cache_spill: true,
             trigger_depth_limit: SQLITE_MAX_TRIGGER_DEPTH,
             next_schema_instance_id: 3,
             temp_store,

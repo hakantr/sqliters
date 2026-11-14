@@ -265,6 +265,9 @@ impl Btree {
         // `sqlite3BtreeTransferRow` (`BTREE_PREFORMAT`): every overflow page of a transferred
         // cell is allocated with `nearby = 0`.
         let transfer = self.preformat;
+        // `pToRelease`: the overflow page being filled stays referenced until the next one is
+        // allocated ("releasePage(pToRelease); pToRelease = pOvfl").
+        let mut to_release: Pgno = 0;
         for chunk in rest.chunks(chunk_cap) {
             let mut nearby = prev;
             if transfer {
@@ -289,10 +292,17 @@ impl Btree {
             } else {
                 self.pager.write_page(prev)?[..4].copy_from_slice(&pg.to_be_bytes());
             }
+            if to_release != 0 {
+                self.unpin(to_release);
+            }
+            to_release = pg;
             let d = self.pager.write_page(pg)?;
             d[..4].fill(0);
             d[4..4 + chunk.len()].copy_from_slice(chunk);
             prev = pg;
+        }
+        if to_release != 0 {
+            self.unpin(to_release);
         }
         Ok(first)
     }
@@ -760,7 +770,10 @@ impl Btree {
         if mode != TableInsertMode::Unique && self.dtrace_persistent() {
             sqliters_types::dtrace!("TR|w|ins|root={} rowid={}", root_pgno, rowid);
         }
-        self.save_cursors_for_mutation(Some(root_pgno), None)?;
+        self.vc_keep = self.vc_open(root_pgno, crate::pins::VC_WRITE);
+        let saved = self.save_cursors_for_mutation(Some(root_pgno), None);
+        self.vc_keep = usize::MAX;
+        saved?;
         let usable = self.pager.usable_size() as usize;
         let overwrite = matches!(mode, TableInsertMode::Upsert { overwrite: true });
 
@@ -774,8 +787,16 @@ impl Btree {
             }
         }
 
-        // sqlite3BtreeTableMoveto
+        // sqlite3BtreeTableMoveto — unless the statement's write cursor is already where the
+        // row goes: `OP_NewRowid` left it on the last leaf (`sqlite3BtreeLast`) and `OP_Insert`
+        // uses that position (`OPFLAG_USESEEKRESULT`).
+        let vc = self.vc_open(root_pgno, crate::pins::VC_WRITE);
         let mut cur = BalCursor::new(root_pgno);
+        cur.vc = vc;
+        let use_seek_result = self.new_rowid_hint.take() == Some((root_pgno, rowid));
+        if !(use_seek_result && self.vc_resume(vc, &mut cur)?) {
+            self.vc_move_to_root(vc)?;
+        }
         // Size of the cell when its payload is local (0 = payload spills).
         let sz_local = if payload.len() <= usable - 35 {
             (varint_len(payload.len() as u64) + varint_len(rowid as u64) + payload.len()).max(4)
@@ -794,6 +815,7 @@ impl Btree {
                     let (i, child, _) =
                         find_table_interior_child_append_hint(pgno, usable as u32, d, rowid)?;
                     cur.descend(i, child)?;
+                    self.vc_move_to_child_at(vc, child, i)?;
                 }
                 0x0d => {
                     let n_cell = get2(d, hdr + 3);
@@ -856,6 +878,8 @@ impl Btree {
                         off
                     );
                 }
+                // (the cursor stays valid on the new cell)
+                self.vcursors[vc].valid = true;
                 return Ok(true);
             }
             let k = PgKind::decode(0x0d, usable as u32)?;
@@ -870,6 +894,10 @@ impl Btree {
                 );
             }
             self.insert_new_cell(&mut cur, &k, n_cell, idx, &cell)?;
+            if cur.i_page + 1 == self.vc_depth(vc) && self.vc_is_on(vc, leaf) && cur.ovfl.is_empty()
+            {
+                self.vcursors[vc].valid = true;
+            }
             return Ok(true);
         }
         if mode == TableInsertMode::Unique {
@@ -1033,12 +1061,17 @@ impl Btree {
         bulk: bool,
     ) -> Result<()> {
         self.tr_ins = true;
-        self.save_cursors_for_mutation(Some(root_pgno), None)?;
+        self.vc_keep = self.vc_open(root_pgno, crate::pins::VC_WRITE);
+        let saved = self.save_cursors_for_mutation(Some(root_pgno), None);
+        self.vc_keep = usize::MAX;
+        saved?;
         let enc = self.encoding();
         let usable = self.pager.usable_size() as usize;
         let key = RawRecordKey::for_index_orders(record, orders);
+        let vc = self.vc_open(root_pgno, crate::pins::VC_WRITE);
         let mut cur = BalCursor::new(root_pgno);
         cur.bulk = bulk;
+        cur.vc = vc;
         if bulk && self.dtrace_persistent() {
             sqliters_types::dtrace!("TR|xf|ins|root={} app=0 bulk=1 pre=0", root_pgno);
         }
@@ -1051,7 +1084,57 @@ impl Btree {
             0
         };
 
-        // sqlite3BtreeIndexMoveto
+        // sqlite3BtreeIndexMoveto. "Check to see if we can skip a lot of work. Two cases: (1)
+        // If the cursor is already pointing to the very last cell in the table and the
+        // pIdxKey search key is greater than or equal to that last cell, then no movement is
+        // required. (2) If the cursor is on the last page of the table and the first cell on
+        // that last page is less than or equal to the pIdxKey search key, then we can start
+        // the search on the current page without needing to go back to root." Either way the
+        // search below starts on the page the cursor is on; otherwise: moveToRoot, then down.
+        let mut bypass = false;
+        if self.vcursors[vc].valid && self.vc_depth(vc) > 0 {
+            let n = self.vc_depth(vc);
+            let leaf = self.vc_path(vc)[n - 1];
+            let ix = usize::from(self.vcursors[vc].ix);
+            let mut ai = [0u16; BTCURSOR_MAX_DEPTH];
+            if self.vc_on_last_page(vc, &mut ai)? {
+                let hdr = hdr_of(leaf);
+                let probe = {
+                    let d = self.pager.read_page(leaf)?;
+                    if d.len() >= usable && hdr + 8 <= d.len() && d[hdr] == 0x0a {
+                        let n_cell = get2(d, hdr + 3);
+                        Some((
+                            n_cell,
+                            index_page_search_raw(d, hdr, usable, &leaf_kind, &key, orders, enc)?,
+                        ))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((n_cell, hit)) = probe {
+                    let (idx, found) = match hit {
+                        Some(h) => h,
+                        None => {
+                            self.index_page_search_full(leaf, &leaf_kind, record, orders, enc)?
+                        }
+                    };
+                    // last cell <= key / first cell <= key
+                    let last_le = n_cell > 0 && (idx == n_cell || (found && idx == n_cell - 1));
+                    let first_le = n_cell > 0 && (idx > 0 || found);
+                    if (n_cell > 0 && ix == n_cell - 1 && last_le) || (n > 1 && first_le) {
+                        let path: Vec<Pgno> = self.vc_path(vc).to_vec();
+                        cur.pg[..n].copy_from_slice(&path);
+                        cur.ai[..n].copy_from_slice(&ai[..n]);
+                        cur.i_page = n - 1;
+                        bypass = true;
+                    }
+                }
+            }
+        }
+        if !bypass {
+            self.vc_move_to_root(vc)?;
+        }
+        self.vcursors[vc].valid = false;
         let (pgno, k, n_cell, idx, found, gap_top) = loop {
             let pgno = cur.page();
             let hdr = hdr_of(pgno);
@@ -1108,12 +1191,17 @@ impl Btree {
                 return Err(corrupt("index interior page with a null child"));
             }
             cur.descend(idx, child)?;
+            self.vc_move_to_child(vc, child)?;
         };
 
         if found {
             // `loc==0`: `if( pCur->info.nKey==pX->nKey ) return btreeOverwriteCell(...)`,
             // else the replace path.
             self.replace_cell(Some(&mut cur), root_pgno, pgno, &k, idx, 0, record, true)?;
+            if cur.i_page + 1 == self.vc_depth(vc) && self.vc_is_on(vc, pgno) {
+                // (no `balance()`: the cursor is still valid on the cell)
+                self.vc_set_valid(vc, idx);
+            }
             return Ok(());
         }
         if gap_top != 0 {
@@ -1147,6 +1235,7 @@ impl Btree {
                     off
                 );
             }
+            self.vc_set_valid(vc, idx);
             return Ok(());
         }
         let cell = self.fill_in_cell(&k, [0; 4], 0, record)?;
@@ -1159,7 +1248,12 @@ impl Btree {
                 cell.size
             );
         }
-        self.insert_new_cell(&mut cur, &k, n_cell, idx, &cell)
+        self.insert_new_cell(&mut cur, &k, n_cell, idx, &cell)?;
+        if cur.i_page + 1 == self.vc_depth(vc) && self.vc_is_on(vc, pgno) && cur.ovfl.is_empty() {
+            // (`insertCell` without `balance()`: the cursor stays valid on the new cell)
+            self.vc_set_valid(vc, idx);
+        }
+        Ok(())
     }
     /// `OP_SeekEnd`: puts `ac` on the right-most leaf of its tree (C keeps the cursor where
     /// the previous insert left it unless that insert had to balance) and returns the leaf's

@@ -674,6 +674,10 @@ pub(crate) struct BalCursor {
     pub ovfl: Vec<(usize, OvflCells)>,
     /// `pCur->hints & BTREE_BULKLOAD`.
     pub bulk: bool,
+    /// The C cursor whose page stack this path is (index into `Btree::vcursors`), or
+    /// `usize::MAX` when the caller has no cursor: the pages of the path are then not
+    /// referenced.
+    pub vc: usize,
 }
 
 impl BalCursor {
@@ -686,6 +690,7 @@ impl BalCursor {
             i_page: 0,
             ovfl: Vec::new(),
             bulk: false,
+            vc: usize::MAX,
         }
     }
 
@@ -770,6 +775,10 @@ struct NonRoot {
     /// `MemPage.nOverflow` / `aiOvfl[]` of each sibling (only the balanced page can have any).
     pg_novfl: [usize; NNEW],
     ai_ovfl: [u16; 4],
+    /// Pages `apOld[i]` / `apNew[i]` hold a reference on (0 = none), given back by
+    /// `balance_cleanup`.
+    pin_old: [Pgno; NB],
+    pin_new: [Pgno; NNEW],
 }
 
 impl NonRoot {
@@ -1402,6 +1411,8 @@ impl Btree {
             Ok(out)
         })();
         self.bal_give_buf(nbuf);
+        // "Release the reference to the new page": releasePage(pNew)
+        self.unpin(pgno_new);
         if self.dtrace_persistent() {
             sqliters_types::dtrace!(
                 "TR|bal|quick|ctx={} parent={} pg={} new={}",
@@ -1420,6 +1431,10 @@ impl Btree {
     #[inline(never)]
     pub(crate) fn balance(&mut self, cur: &mut BalCursor) -> Result<()> {
         let usable = self.pager.usable_size() as usize;
+        if cur.vc != usize::MAX {
+            // (callers: `pCur->eState = CURSOR_INVALID` after `balance()`)
+            self.vcursors[cur.vc].valid = false;
+        }
         loop {
             let pgno = cur.page();
             let (kind, n_cell, n_free) = {
@@ -1451,6 +1466,13 @@ impl Btree {
                         );
                     }
                     let child = self.balance_deeper(pgno)?;
+                    // "pCur->apPage[0] = pPage; pCur->pPage = pCur->apPage[1]": the cursor
+                    // takes over the reference `allocateBtreePage` handed out for the child.
+                    if cur.vc == usize::MAX {
+                        self.unpin(child);
+                    } else {
+                        self.vc_adopt_child(cur.vc, child);
+                    }
                     let o = cur.take_ovfl(0);
                     cur.i_page = 1;
                     cur.ai[0] = 0;
@@ -1505,7 +1527,12 @@ impl Btree {
                 self.balance_nonroot(parent, i_idx, par_in, page_ovfl, cur.i_page == 1, cur.bulk)?
             };
             cur.set_ovfl(cur.i_page - 1, par_out);
+            // "The next iteration of the do-loop balances the parent page."
+            // releasePage(pPage); pCur->iPage--;
             cur.i_page -= 1;
+            if cur.vc != usize::MAX {
+                self.vc_move_to_parent(cur.vc);
+            }
         }
         Ok(())
     }
@@ -1540,6 +1567,8 @@ impl Btree {
             pg_ncell: [0; NNEW],
             pg_novfl: [0; NNEW],
             ai_ovfl: page_ovfl.idx,
+            pin_old: [0; NB],
+            pin_new: [0; NNEW],
         };
         st.space1.clear();
         st.ap.clear();
@@ -1555,6 +1584,20 @@ impl Btree {
             bulk,
             page_size,
         );
+        // balance_cleanup: "for(i=0; i<nOld; i++) releasePage(apOld[i]); for(i=0; i<nNew; i++)
+        // releasePage(apNew[i]);" (an old page reused as a new one is released as the latter)
+        for i in 0..NB {
+            let pg = st.pin_old[i];
+            if pg != 0 {
+                self.unpin(pg);
+            }
+        }
+        for i in 0..NNEW {
+            let pg = st.pin_new[i];
+            if pg != 0 {
+                self.unpin(pg);
+            }
+        }
         self.bal_space1 = std::mem::take(&mut st.space1);
         self.bal_ap = std::mem::take(&mut st.ap);
         self.bal_sz = std::mem::take(&mut st.sz);
@@ -1652,6 +1695,8 @@ impl Btree {
             if old_pgno[i + 1..n_old].contains(&pgno) {
                 return Err(corrupt("page is its own sibling in balance_nonroot"));
             }
+            self.pin(pgno)?;
+            st.pin_old[i] = pgno;
             {
                 let d = self.pager.read_page(pgno)?;
                 st.bufs[i].copy_from_slice(d);
@@ -1927,11 +1972,15 @@ impl Btree {
         let n_new = k;
         for i in 0..k {
             if i < n_old {
+                // "pNew = apNew[i] = apOld[i]; apOld[i] = 0; sqlite3PagerWrite(pNew->pDbPage)"
                 new_pgno[i] = old_pgno[i];
+                st.pin_new[i] = old_pgno[i];
+                st.pin_old[i] = 0;
                 self.pager.write_page(old_pgno[i])?;
             } else {
                 let near = if bulk { 1 } else { pgno };
                 pgno = self.allocate_btree_page(AllocMode::Near(near))?;
+                st.pin_new[i] = pgno;
                 let mut b = self.bal_take_buf(page_size);
                 b.copy_from_slice(self.pager.read_page(pgno)?);
                 zero_page(&mut b, 0, page_flags, usable, secure);
@@ -1958,6 +2007,11 @@ impl Btree {
                 new_pgno.swap(i, i_b);
             }
         }
+        // (`sqlite3PagerRekey`: the page objects — their references and their place in the
+        // dirty list — take the sorted numbers.)
+        let (swaps, n_swaps) = self.pager.pages_rekey_balance(&a_pgno[..n_new]);
+        self.vc_renumber(&swaps[..n_swaps]);
+        st.pin_new[..n_new].copy_from_slice(&new_pgno[..n_new]);
         if self.dtrace_persistent() {
             #[cfg(sqliters_dtrace)]
             {
@@ -2208,7 +2262,7 @@ impl Btree {
                     .write_page(new_pgno[i])?
                     .copy_from_slice(&st.bufs[i]);
             }
-            self.free_page(new_pgno[0])?;
+            self.free_page_held(new_pgno[0])?;
         } else {
             if self.dtrace_persistent() {
                 sqliters_types::dtrace!(
@@ -2239,7 +2293,7 @@ impl Btree {
 
         // ---- Free any old pages that were not reused as new pages.
         for i in n_new..n_old {
-            self.free_page(old_pgno[i])?;
+            self.free_page_held(old_pgno[i])?;
         }
         Ok(out)
     }

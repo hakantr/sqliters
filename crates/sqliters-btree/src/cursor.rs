@@ -643,6 +643,11 @@ impl Btree {
         if !self.in_place_rows.is_empty() {
             self.drop_in_place_rows(root_filter);
         }
+        if !self.vcursors.is_empty() {
+            // (the page references of the other C cursors on the tree)
+            let keep = self.vc_keep;
+            self.vc_save_others(root_filter, keep);
+        }
         if self.open_cursor_count == 0 {
             return Ok(());
         }

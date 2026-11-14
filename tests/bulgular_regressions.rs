@@ -336,9 +336,12 @@ fn test_bulgu_2_active_journal_not_clobbered_and_crashed_hot_journal_recovered()
         .unwrap()
         .get_i64(0);
     assert_eq!(bal, Some(100));
+    // (C: the journal of a transaction that had not synced it yet starts with a zero byte, so
+    // it is not hot — `hasHotJournal` — and is left where it is; the database file was not
+    // touched by that transaction.)
     assert!(
-        !crash_tmp.journal_path().exists(),
-        "crashed hot journal should be replayed and unlinked once no writer holds a lock"
+        crash_tmp.journal_path().exists(),
+        "a journal whose header was never synced is not hot and stays in place"
     );
     drop(recovered);
     assert_eq!(

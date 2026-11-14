@@ -19394,6 +19394,14 @@ fn validate_and_write_row(
      -> Result<bool> {
         if !tbl.without_rowid
             && existing_self_key != Some(&final_key)
+            && let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut())
+        {
+            // `OP_NotExists` on the data cursor: the cursor stays on the leaf of the rowid and
+            // `OP_Insert` uses that position.
+            bt.write_cursor_not_exists(tbl.root_pgno, rowid)?;
+        }
+        if !tbl.without_rowid
+            && existing_self_key != Some(&final_key)
             && seek_table_raw_entry(ctx, db_id, tbl, &final_key)?.is_some()
         {
             let conflict_key = TableRowKey::Rowid(rowid);
@@ -40843,6 +40851,11 @@ fn exec_pragma(
         rows: vec![vec![v]],
     };
 
+    if upper == "JOURNAL_MODE" {
+        // `PragFlg_NeedSchema`: the schema is read before the pragma runs (`sqlite3InitOne`).
+        pragma_need_schema(ctx, db_id)?;
+    }
+
     // 1. Connection-global & multi-DB pragmas handled before forcing `temp` open:
     match upper.as_str() {
         "DATABASE_LIST" => {
@@ -42421,18 +42434,16 @@ fn exec_pragma(
             }
         }
         "CACHE_SIZE" => {
+            // `PragFlg_NeedSchema`: the schema is read first (which settles the cache size the
+            // first time, `sqlite3InitOne`).
+            pragma_need_schema(ctx, db_id)?;
             if let Some(pv) = value {
                 let sz = pragma_to_i64(pv).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
-                let bit = 1u16.checked_shl(db_id.index() as u32).unwrap_or(0);
-                let can_spill =
-                    ((ctx.activity.other_read_db_mask | ctx.activity.other_write_db_mask) & bit)
-                        == 0;
                 if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut())
                 {
+                    // `sqlite3BtreeSetCacheSize`: clean unreferenced pages beyond the new
+                    // limit leave the cache at once; nothing is written out here.
                     bt.set_cache_size(sz);
-                    if can_spill {
-                        bt.spill_if_over_cache_size()?;
-                    }
                 }
                 Ok(QueryOutput::default())
             } else {
@@ -42443,6 +42454,60 @@ fn exec_pragma(
                     .map_or(-2000, Btree::cache_size);
                 Ok(single_col("cache_size", Value::Integer(i64::from(cur))))
             }
+        }
+        "CACHE_SPILL" => {
+            // `PragTyp_CACHE_SPILL` (pragma.c): without a value the row is 0 when cache spill
+            // is off, else the spill size in force (`sqlite3BtreeSetSpillSize(pBt, 0)`). With a
+            // value: an integer sets the spill size (0 leaves it), and the value read as a
+            // boolean (default: the integer is non-zero) switches spilling on or off for every
+            // pager — applied at once only in autocommit mode (`setAllPagerFlags`).
+            pragma_need_schema(ctx, db_id)?;
+            if let Some(pv) = value {
+                let mut size: i32 = 1;
+                let int_val = match pv {
+                    PragmaValue::Integer(i) => i32::try_from(*i).ok(),
+                    PragmaValue::Ident(s) | PragmaValue::String(s) => pragma_get_int32(s),
+                };
+                if let Some(v) = int_val {
+                    size = v;
+                    if let Some(ref mut bt) =
+                        ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut())
+                    {
+                        bt.set_spill_size(size);
+                    }
+                }
+                let on = pragma_get_boolean(pv, size != 0);
+                ctx.db_set.cache_spill = on;
+                let autocommit = !*ctx.explicit_tx && !*ctx.implicit_savepoint_tx;
+                if autocommit {
+                    for slot in ctx.db_set.slots_mut() {
+                        if let Some(ref mut bt) = slot.btree {
+                            bt.set_cache_spill(on);
+                        }
+                    }
+                }
+                Ok(QueryOutput::default())
+            } else {
+                let on = ctx.db_set.cache_spill;
+                let cur = if on {
+                    ctx.db_set
+                        .slot_mut(db_id)
+                        .and_then(|s| s.btree.as_mut())
+                        .map_or(0, |bt| bt.set_spill_size(0))
+                } else {
+                    0
+                };
+                Ok(single_col("cache_spill", Value::Integer(i64::from(cur))))
+            }
+        }
+        "SHRINK_MEMORY" => {
+            // `sqlite3_db_release_memory(db)`: `sqlite3PagerShrink` for every database.
+            for slot in ctx.db_set.slots_mut() {
+                if let Some(ref mut bt) = slot.btree {
+                    bt.shrink_memory();
+                }
+            }
+            Ok(QueryOutput::default())
         }
         "DATA_VERSION" => {
             // `PragTyp_HEADER_VALUE` with `BTREE_DATA_VERSION`, `PragFlg_ReadOnly`: an
@@ -42505,6 +42570,25 @@ fn exec_pragma(
 /// starts with a digit is `sqlite3Atoi(z) != 0`; `on`/`yes`/`true` are true, `no`/`off`/`false`
 /// are false (case-insensitive); anything else — including a negative number, whose text starts
 /// with `-` — is `dflt`.
+/// `PragFlg_NeedSchema` (`sqlite3ReadSchema`): the schema of `db_id` is read if it has not been
+/// read yet, in a read transaction of its own (`sqlite3InitOne`).
+fn pragma_need_schema(ctx: &mut ExecContext<'_>, db_id: DatabaseId) -> Result<()> {
+    let Some(slot) = ctx.db_set.slot_mut(db_id) else {
+        return Ok(());
+    };
+    if slot.schema.loaded {
+        return Ok(());
+    }
+    let Some(ref mut bt) = slot.btree else {
+        return Ok(());
+    };
+    let slot_name = slot.name.clone();
+    slot.schema = crate::schema::Schema::load_for_schema(bt, Some(&slot_name))?;
+    slot.schema.rebind_collations(ctx.collations);
+    ctx.db_set.reconcile_temp_triggers()?;
+    Ok(())
+}
+
 fn pragma_get_boolean(pv: &PragmaValue, dflt: bool) -> bool {
     match pv {
         PragmaValue::Integer(i) => {
@@ -44298,6 +44382,13 @@ fn infer_pragma_columns(name: &str, value: Option<&PragmaValue>) -> Vec<String> 
                 Vec::new()
             } else {
                 vec!["cache_size".to_owned()]
+            }
+        }
+        "CACHE_SPILL" => {
+            if value.is_some() {
+                Vec::new()
+            } else {
+                vec!["cache_spill".to_owned()]
             }
         }
         "DATABASE_LIST" => vec!["seq".to_owned(), "name".to_owned(), "file".to_owned()],

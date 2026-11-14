@@ -1258,7 +1258,8 @@ fn test_journal_mode_persist_28_bytes_only_c_sqlite_interop_and_size_limit() {
     {
         let mut jbytes = fs::read(&j_path).unwrap();
         assert!(jbytes.len() >= 512);
-        assert_eq!(&jbytes[0..8], &JOURNAL_MAGIC);
+        // (C: `writeJournalHdr` leaves magic and record count zero; `syncJournal` writes them.)
+        assert_eq!(&jbytes[0..8], &[0u8; 8]);
         jbytes[28..512].fill(0xA5);
         fs::write(&j_path, &jbytes).unwrap();
     }

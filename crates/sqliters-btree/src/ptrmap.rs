@@ -464,6 +464,8 @@ impl Btree {
             if e_type == PtrmapType::FreePage {
                 if !is_commit {
                     let got = self.allocate_btree_page(AllocMode::Exact(i_last_pg))?;
+                    // releasePage(pFreePg)
+                    self.unpin(got);
                     if got != i_last_pg {
                         return Err(SqliteError::corrupt(format!(
                             "expected exact freelist extraction of {i_last_pg}, got {got}"
@@ -478,6 +480,9 @@ impl Btree {
                 };
                 let i_free = loop {
                     let candidate = self.allocate_btree_page(mode)?;
+                    // (auto-vacuum: the reference is given back at once; C holds it until
+                    // `relocatePage` is done)
+                    self.unpin(candidate);
                     if !is_commit || candidate <= n_fin {
                         break candidate;
                     }
@@ -496,7 +501,9 @@ impl Btree {
             while new_end > 1 && (new_end == lock_pg || is_ptrmap_page(new_end, usable, lock_pg)) {
                 new_end -= 1;
             }
-            self.pager.truncate_image(new_end.max(1))?;
+            // "pBt->bDoTruncate = 1; pBt->nPage = iLastPg": only the b-tree's image shrinks;
+            // the pager is told at commit (`sqlite3PagerTruncateImage`).
+            self.pager.shrink_page_count(new_end.max(1))?;
         }
 
         Ok(true)
@@ -1373,6 +1380,9 @@ mod tests {
             orig_page_count
         };
         let mut crashed_journal = raw_journal;
+        // (`syncJournal` writes the magic together with the record count: until then the
+        // header starts with twelve zero bytes, as in C.)
+        crashed_journal[0..8].copy_from_slice(&sqliters_pager::JOURNAL_MAGIC);
         crashed_journal[8..12].copy_from_slice(&expected_j_recs.to_be_bytes());
         let overwritten_db_bytes = read_vfs_bytes(&vfs, "src_1k.db");
 

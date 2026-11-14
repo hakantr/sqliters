@@ -1076,6 +1076,9 @@ impl Schema {
         if need_read_tx {
             btree.begin_read()?;
         }
+        // `sqlite3InitOne`: the cache size of the database is settled when its schema is
+        // first read (the header's default cache size, or the build default).
+        btree.init_schema_cache_size();
 
         let res = if btree.pager().page_count() == 0 {
             Ok(Self::from_data(SchemaData {

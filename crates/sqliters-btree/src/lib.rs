@@ -7,6 +7,7 @@ pub mod cursor;
 mod insert;
 mod integrity;
 pub mod page;
+mod pins;
 pub mod ptrmap;
 
 use std::cmp::Ordering;
@@ -47,6 +48,7 @@ pub use page::{
     seek_table_leaf_cell, table_interior_right_child, table_leaf_cell_has_rowid,
     try_delete_table_leaf_in_place,
 };
+pub use pins::{VC_READ, VC_READ2, VC_WRITE};
 pub use ptrmap::{PtrmapType, RootPageMove, is_ptrmap_page, ptrmap_offset, ptrmap_pageno};
 
 /// Column projection descriptor for single-row `rowid` point `SELECT` fast path.
@@ -270,6 +272,20 @@ pub struct Btree {
     /// transaction (bit set, sized to the page count when the first one was freed). Such a
     /// page keeps its content when it is allocated again before the transaction ends.
     has_content: Option<(Pgno, Vec<u64>)>,
+    /// The page stacks of the C cursors of the running statement (see `pins.rs`).
+    pub(crate) vcursors: Vec<pins::VCursor>,
+    /// Start index in `vcursors` of each nested statement frame.
+    pub(crate) vc_frames: Vec<usize>,
+    /// `Schema.cache_size != 0`: the cache size of this database was set — by the first
+    /// schema load (`sqlite3InitOne`) or by `PRAGMA cache_size`.
+    schema_cache_size_set: bool,
+    /// `(table root, rowid)` that `OP_NewRowid` just produced on the statement's write cursor:
+    /// the `OP_Insert` of exactly that row uses the cursor where `sqlite3BtreeLast` left it
+    /// (`OPFLAG_USESEEKRESULT`) instead of seeking.
+    pub(crate) new_rowid_hint: Option<(Pgno, i64)>,
+    /// The cursor (index into `vcursors`) the write that is starting goes through: it keeps
+    /// its pages when the other cursors on the tree are saved (`usize::MAX`: none).
+    pub(crate) vc_keep: usize,
 }
 
 /// How the next schema-cookie change of this database is computed.
@@ -294,6 +310,11 @@ impl Btree {
     pub fn new(pager: Pager) -> Self {
         Self {
             pager,
+            vcursors: Vec::new(),
+            vc_frames: Vec::new(),
+            schema_cache_size_set: false,
+            new_rowid_hint: None,
+            vc_keep: usize::MAX,
             cursor_slots: Vec::new(),
             free_cursor_slots: Vec::new(),
             open_cursor_count: 0,
@@ -608,6 +629,8 @@ impl Btree {
         super_journal: Option<&str>,
         retain_read_on_av_err: bool,
     ) -> Result<()> {
+        // (`sqlite3VdbeHalt`: the cursors of the statement are closed before it commits.)
+        self.vc_close_all();
         if self.pager.transaction_state() == TransactionState::Write
             && !self.pager.is_commit_phase_one_done()
             && !self.pager.has_staged_raw_copy()
@@ -660,6 +683,7 @@ impl Btree {
         retain_read: bool,
     ) -> Result<()> {
         let trip_res = self.trip_cursors(trip_code, write_only);
+        self.vc_close_all();
         // `btreeClearHasContent`
         self.has_content = None;
         let rb_res = self.pager.rollback_retaining_read(retain_read);
@@ -744,12 +768,23 @@ impl Btree {
 
     /// Spills currently dirty cache pages to `<db>-wal` as uncommitted frames (`is_commit = false`).
     pub fn spill_dirty_pages_to_wal(&mut self) -> Result<usize> {
+        // (a statement boundary: no cursor holds a page; `sqlite3PagerFlush` writes the dirty
+        // pages nobody refers to)
+        self.vc_close_all();
         self.pager.spill_dirty_pages_to_wal()
     }
 
     /// Spills dirty pages to `<db>-wal` when in a WAL write transaction and dirty pages exceed `cache_size`.
     pub fn spill_if_over_cache_size(&mut self) -> Result<usize> {
-        self.pager.spill_if_over_cache_size()
+        self.statement_end();
+        Ok(0)
+    }
+
+    /// A statement that ran inside a transaction has ended (`sqlite3VdbeHalt` →
+    /// `closeAllCursors`): every cursor gives its page references back.
+    #[inline]
+    pub fn statement_end(&mut self) {
+        self.vc_close_all();
     }
 
     /// Returns the configured page cache size (`PRAGMA cache_size`).
@@ -758,20 +793,58 @@ impl Btree {
         self.pager.cache_size()
     }
 
-    /// Updates the configured page cache size (`PRAGMA cache_size = N`).
+    /// Updates the configured page cache size (`PRAGMA cache_size = N`:
+    /// `pDb->pSchema->cache_size = size; sqlite3BtreeSetCacheSize(pDb->pBt, size)`).
     #[inline]
     pub fn set_cache_size(&mut self, size: i32) {
+        self.schema_cache_size_set = true;
         self.pager.set_cache_size(size);
     }
 
-    // ========================================================================
-    // Freelist & Page Allocation (`btreeInt.h:206-215`, `allocateBtreePage`)
-    // ========================================================================
+    /// `sqlite3InitOne`: "if( pDb->pSchema->cache_size==0 ){ size =
+    /// sqlite3AbsInt32(meta[BTREE_DEFAULT_CACHE_SIZE-1]); if( size==0 ) size =
+    /// SQLITE_DEFAULT_CACHE_SIZE; pDb->pSchema->cache_size = size;
+    /// sqlite3BtreeSetCacheSize(pDb->pBt, size); }" — the first time the schema of this
+    /// database is read (inside a read transaction: the header is loaded).
+    pub fn init_schema_cache_size(&mut self) {
+        if self.schema_cache_size_set {
+            return;
+        }
+        self.schema_cache_size_set = true;
+        let meta = self.pager.header().default_cache_size;
+        let size = if meta == 0 {
+            -2000
+        } else {
+            meta.checked_abs().unwrap_or(i32::MAX)
+        };
+        self.pager.set_cache_size(size);
+    }
+
+    /// `sqlite3BtreeSetSpillSize` (`PRAGMA cache_spill`): sets the spill size unless `size`
+    /// is 0 and returns the effective value.
+    #[inline]
+    pub fn set_spill_size(&mut self, size: i32) -> i32 {
+        self.pager.set_spill_size(size)
+    }
+
+    /// `sqlite3BtreeSetPagerFlags(.., PAGER_CACHESPILL)`.
+    #[inline]
+    pub fn set_cache_spill(&mut self, on: bool) {
+        self.pager.set_cache_spill(on);
+    }
+
+    /// `sqlite3PagerShrink` (`PRAGMA shrink_memory`).
+    #[inline]
+    pub fn shrink_memory(&mut self) {
+        self.pager.shrink_memory();
+    }
 
     /// Allocates a page either by popping from the freelist or extending the database file.
     #[inline]
     pub fn allocate_page(&mut self) -> Result<Pgno> {
-        self.allocate_btree_page(AllocMode::Any)
+        let pg = self.allocate_btree_page(AllocMode::Any)?;
+        self.unpin(pg);
+        Ok(pg)
     }
 
     /// Allocates a page, preferring — when the free list is not empty — the free page closest
@@ -779,11 +852,16 @@ impl Btree {
     /// the previous page of an overflow chain, the root when a root is split, 1 for a new root).
     #[inline]
     pub fn allocate_page_near(&mut self, nearby: Pgno) -> Result<Pgno> {
-        self.allocate_btree_page(AllocMode::Near(nearby))
+        let pg = self.allocate_btree_page(AllocMode::Near(nearby))?;
+        self.unpin(pg);
+        Ok(pg)
     }
 
     /// Allocates a B-tree/overflow page according to `mode` (`allocateBtreePage`,
     /// `btree.c:6545-6835`), automatically allocating any intervening pointer-map page at EOF.
+    ///
+    /// As in C the page comes back with a reference held (`*ppPage`): the caller gives it
+    /// back with `unpin` (`releasePage`) when it is done with the page.
     pub fn allocate_btree_page(&mut self, mode: AllocMode) -> Result<Pgno> {
         let mx_page = self.pager.page_count();
         let usable = self.pager.usable_size();
@@ -804,6 +882,9 @@ impl Btree {
         }
 
         if total_free > 0 {
+            // `sqlite3PagerWrite(pPage1->pDbPage)` comes first ("Decrement the free-list
+            // count by 1").
+            self.pager.header_mut()?;
             let search_list = match mode {
                 AllocMode::Any | AllocMode::Near(_) => false,
                 AllocMode::Le(_) => true,
@@ -839,15 +920,31 @@ impl Btree {
             let mut prev_trunk: Pgno = 0;
             let mut cur_trunk: Pgno = first_trunk;
             let mut n_search: u32 = 0;
+            // References as C holds them: `pTrunk` (taken by `btreeGetUnusedPage` at the top
+            // of each round) and `pPrevTrunk` (the trunk of the round before, given back at
+            // the end of the round). The page handed to the caller keeps its reference.
+            let mut pin_trunk: Pgno = 0;
+            let mut pin_prev: Pgno = 0;
 
-            loop {
+            let res: Result<Pgno> = 'alloc: loop {
                 if n_search > total_free {
-                    return Err(SqliteError::corrupt("cycle detected in freelist trunks"));
+                    break 'alloc Err(SqliteError::corrupt("cycle detected in freelist trunks"));
                 }
-                validate_free_pg(cur_trunk)?;
+                if let Err(e) = validate_free_pg(cur_trunk) {
+                    break 'alloc Err(e);
+                }
                 n_search += 1;
 
-                let trunk_bytes = self.pager.read_page_unchecked(cur_trunk)?.to_vec();
+                pin_prev = pin_trunk;
+                if let Err(e) = self.pin(cur_trunk) {
+                    pin_trunk = 0;
+                    break 'alloc Err(e);
+                }
+                pin_trunk = cur_trunk;
+                let trunk_bytes = match self.pager.read_page_unchecked(cur_trunk) {
+                    Ok(d) => d.to_vec(),
+                    Err(e) => break 'alloc Err(e),
+                };
                 let next_trunk = u32::from_be_bytes([
                     trunk_bytes[0],
                     trunk_bytes[1],
@@ -879,7 +976,8 @@ impl Btree {
                     if self.dtrace_persistent() {
                         sqliters_types::dtrace!("TR|alloc|page|pg={} o=empty-trunk", cur_trunk);
                     }
-                    return Ok(cur_trunk);
+                    pin_trunk = 0;
+                    break 'alloc Ok(cur_trunk);
                 }
 
                 let trunk_matches = search_list
@@ -914,6 +1012,9 @@ impl Btree {
                         {
                             // (C copies the trunk header and leaf list over the first leaf;
                             // the rest of that page is not cleared.)
+                            // btreeGetUnusedPage(pBt, iNewTrunk, &pNewTrunk, 0) ..
+                            // releasePage(pNewTrunk)
+                            self.pin(new_trunk)?;
                             let nt_buf = self.pager.write_page(new_trunk)?;
                             nt_buf[0..4].copy_from_slice(&next_trunk.to_be_bytes());
                             nt_buf[4..8].copy_from_slice(&rem_leaves.to_be_bytes());
@@ -922,6 +1023,7 @@ impl Btree {
                                     .copy_from_slice(&trunk_bytes[12..12 + rem_bytes_len]);
                             }
                         }
+                        self.unpin(new_trunk);
                         if prev_trunk == 0 {
                             let hdr = self.pager.header_mut()?;
                             hdr.first_freelist_trunk_page = new_trunk;
@@ -941,7 +1043,8 @@ impl Btree {
                             k
                         );
                     }
-                    return Ok(cur_trunk);
+                    pin_trunk = 0;
+                    break 'alloc Ok(cur_trunk);
                 }
 
                 if k > 0 {
@@ -1028,12 +1131,13 @@ impl Btree {
                         // list by this transaction keeps the content it had
                         // (`btreeGetHasContent`); any other leaf is handed out zeroed
                         // (`PAGER_GET_NOCONTENT`).
+                        // (The reference stays with the caller.)
                         if self.has_content_get(leaf_pgno) {
-                            self.pager.write_page(leaf_pgno)?;
+                            self.pin(leaf_pgno)?;
                         } else {
-                            self.pager.mark_no_content(leaf_pgno);
-                            self.pager.write_page(leaf_pgno)?.fill(0);
+                            self.pager.page_ref_nocontent(leaf_pgno)?;
                         }
+                        self.pager.write_page(leaf_pgno)?;
                         if self.dtrace_persistent() {
                             sqliters_types::dtrace!(
                                 "TR|alloc|page|pg={} o=leaf idx={} k={} trunk={} near={}",
@@ -1048,23 +1152,39 @@ impl Btree {
                                 }
                             );
                         }
-                        return Ok(leaf_pgno);
+                        break 'alloc Ok(leaf_pgno);
                     }
                 }
 
                 if !search_list || next_trunk == 0 {
-                    return Err(SqliteError::corrupt(
+                    break 'alloc Err(SqliteError::corrupt(
                         "target free page not found on freelist",
                     ));
                 }
+                // releasePage(pPrevTrunk)
+                if pin_prev != 0 {
+                    self.unpin(pin_prev);
+                    pin_prev = 0;
+                }
                 prev_trunk = cur_trunk;
                 cur_trunk = next_trunk;
+            };
+            // end_allocate_page: releasePage(pTrunk); releasePage(pPrevTrunk);
+            if pin_trunk != 0 {
+                self.unpin(pin_trunk);
             }
+            if pin_prev != 0 {
+                self.unpin(pin_prev);
+            }
+            return res;
         }
 
         loop {
             let allocated = self.pager.allocate_raw_page()?;
             if auto_vac && is_ptrmap_page(allocated, usable, lock_pg) {
+                // "allocate two new pages at the end of the file instead of one. The first
+                // allocated page becomes a new pointer-map page": releasePage(pPg).
+                self.unpin(allocated);
                 continue;
             }
             if self.dtrace_persistent() {
@@ -1074,8 +1194,20 @@ impl Btree {
         }
     }
 
-    /// Pushes `pgno` onto the database freelist (`freePage2` in `btree.c`).
+    /// Pushes `pgno` onto the database freelist (`freePage2(pBt, 0, iPage)`): the caller holds
+    /// no reference on the page. C then looks the page up in the cache
+    /// (`btreePageLookup`) and reads it only when it has to be written (secure delete, or
+    /// the page becomes a trunk).
     pub fn free_page(&mut self, pgno: Pgno) -> Result<()> {
+        self.free_page2(pgno, false)
+    }
+
+    /// `freePage(pPage)`: the caller holds a reference on the page being freed.
+    pub(crate) fn free_page_held(&mut self, pgno: Pgno) -> Result<()> {
+        self.free_page2(pgno, true)
+    }
+
+    fn free_page2(&mut self, pgno: Pgno, held: bool) -> Result<()> {
         let usable_u32 = self.pager.usable_size();
         let lock_pg = self.lock_byte_page();
         let auto_vac = self.is_auto_vacuum();
@@ -1084,12 +1216,63 @@ impl Btree {
                 "cannot push page {pgno} onto freelist"
             )));
         }
-        let usable = usable_u32 as usize;
+        // "if( pMemPage ){ pPage = pMemPage; sqlite3PagerRef(pPage->pDbPage); }else{ pPage =
+        // btreePageLookup(pBt, iPage); }"
+        let mut have_page = if held {
+            self.pin(pgno)?;
+            true
+        } else {
+            self.pager.page_lookup(pgno)
+        };
+        let mut pin_trunk: Pgno = 0;
+        let res = self.free_page2_body(pgno, &mut have_page, &mut pin_trunk);
+        // freepage_out: releasePage(pPage); releasePage(pTrunk);
+        if have_page {
+            self.unpin(pgno);
+        }
+        if pin_trunk != 0 {
+            self.unpin(pin_trunk);
+        }
+        res
+    }
+
+    fn free_page2_body(
+        &mut self,
+        pgno: Pgno,
+        have_page: &mut bool,
+        pin_trunk: &mut Pgno,
+    ) -> Result<()> {
+        let usable = self.pager.usable_size() as usize;
+        let auto_vac = self.is_auto_vacuum();
         // Max leaf entries per trunk page (usableSize/4 - 2 limit; leave 6 spare slots like btree.c)
         let max_leaves = ((usable / 4).saturating_sub(8)).max(1) as u32;
         let first_trunk = self.pager.header().first_freelist_trunk_page;
 
+        // "Increment the free page count on pPage1": `sqlite3PagerWrite(pPage1->pDbPage)`.
+        {
+            let hdr = self.pager.header_mut()?;
+            hdr.total_freelist_pages += 1;
+        }
+        // `BTS_SECURE_DELETE` (ON, not FAST): "always fully overwrite deleted information
+        // with zeros".
+        let zero = self.secure_delete == 1;
+        if zero {
+            if !*have_page {
+                self.pin(pgno)?;
+                *have_page = true;
+            }
+            self.pager.write_page(pgno)?.fill(0);
+        }
+        // "If the database supports auto-vacuum, write an entry in the pointer-map to
+        // indicate that the page is free."
+        if auto_vac {
+            self.ptrmap_put(pgno, PtrmapType::FreePage, 0)?;
+        }
+
         if first_trunk != 0 {
+            // btreeGetPage(pBt, iTrunk, &pTrunk, 0)
+            self.pin(first_trunk)?;
+            *pin_trunk = first_trunk;
             let trunk_ro = self.pager.read_page_unchecked(first_trunk)?;
             let leaf_count =
                 u32::from_be_bytes([trunk_ro[4], trunk_ro[5], trunk_ro[6], trunk_ro[7]]);
@@ -1101,13 +1284,12 @@ impl Btree {
                     w[4..8].copy_from_slice(&new_count.to_be_bytes());
                     w[off..off + 4].copy_from_slice(&pgno.to_be_bytes());
                 }
-                self.has_content_set(pgno);
                 // `freePage2`: a page that becomes a free-list leaf is neither journalled nor
                 // written — only its trunk changes — unless `secure_delete=ON`
                 // (`BTS_SECURE_DELETE`; not `FAST`), which overwrites it with zeros. A write the
-                // transaction already owed for the page is dropped (`sqlite3PagerDontWrite`).
-                if self.secure_delete == 1 {
-                    self.pager.write_page(pgno)?.fill(0);
+                // transaction already owed for the page is dropped (`sqlite3PagerDontWrite`) —
+                // when the page is in the cache.
+                if zero {
                     sqliters_types::dtrace!(
                         "TR|free|page|db={} pg={} o=leaf trunk={} zero=1",
                         u8::from(self.dtrace_persistent()),
@@ -1121,22 +1303,18 @@ impl Btree {
                         pgno,
                         first_trunk
                     );
-                    let _dropped = self.pager.dont_write(pgno);
-                    if self.dtrace_persistent() {
-                        sqliters_types::dtrace!(
-                            "TR|free|dontwrite|pg={} o={}",
-                            pgno,
-                            if _dropped { "write-dropped" } else { "no-op" }
-                        );
+                    if *have_page {
+                        let _dropped = self.pager.dont_write(pgno) && !self.pager.use_wal();
+                        if self.dtrace_persistent() {
+                            sqliters_types::dtrace!(
+                                "TR|free|dontwrite|pg={} o={}",
+                                pgno,
+                                if _dropped { "write-dropped" } else { "no-op" }
+                            );
+                        }
                     }
                 }
-                {
-                    let hdr = self.pager.header_mut()?;
-                    hdr.total_freelist_pages += 1;
-                }
-                if auto_vac {
-                    self.ptrmap_put(pgno, PtrmapType::FreePage, 0)?;
-                }
+                self.has_content_set(pgno);
                 return Ok(());
             }
         }
@@ -1145,11 +1323,12 @@ impl Btree {
         // `freePage2` rewrites only the 8-byte trunk header; the rest of the page keeps its
         // old content unless `secure_delete=ON` zeroed it.
         {
-            let zero = self.secure_delete == 1;
-            let w = self.pager.write_page(pgno)?;
-            if zero {
-                w.fill(0);
+            if !*have_page {
+                // btreeGetPage(pBt, iPage, &pPage, 0)
+                self.pin(pgno)?;
+                *have_page = true;
             }
+            let w = self.pager.write_page(pgno)?;
             w[0..4].copy_from_slice(&first_trunk.to_be_bytes());
             w[4..8].copy_from_slice(&0u32.to_be_bytes());
             sqliters_types::dtrace!(
@@ -1163,17 +1342,9 @@ impl Btree {
         {
             let hdr = self.pager.header_mut()?;
             hdr.first_freelist_trunk_page = pgno;
-            hdr.total_freelist_pages += 1;
-        }
-        if auto_vac {
-            self.ptrmap_put(pgno, PtrmapType::FreePage, 0)?;
         }
         Ok(())
     }
-
-    // ========================================================================
-    // Overflow Payload Chains (`btreeInt.h:198-204`)
-    // ========================================================================
 
     fn read_full_payload(
         &mut self,
@@ -1272,8 +1443,11 @@ impl Btree {
     fn create_root_page(&mut self, flags: u8) -> Result<Pgno> {
         if !self.is_auto_vacuum() {
             // `btreeCreateTable`: `allocateBtreePage(pBt, &pRoot, &pgnoRoot, 1, 0)`.
-            let pgno = self.allocate_page_near(1)?;
-            self.zero_root_page(pgno, flags)?;
+            let pgno = self.allocate_btree_page(AllocMode::Near(1))?;
+            let r = self.zero_root_page(pgno, flags);
+            // sqlite3PagerUnref(pRoot->pDbPage)
+            self.unpin(pgno);
+            r?;
             return Ok(pgno);
         }
 
@@ -1293,6 +1467,9 @@ impl Btree {
         }
 
         let pgno_move = self.allocate_btree_page(AllocMode::Exact(pgno_root))?;
+        // (auto-vacuum: the references of `btreeCreateTable` around `relocatePage` are not
+        // modelled; the allocated page is given back at once)
+        self.unpin(pgno_move);
         if pgno_move != pgno_root {
             self.save_cursors_for_mutation(None, None)?;
             let (e_type, ptr_page) = self.ptrmap_get(pgno_root)?;
@@ -1346,6 +1523,26 @@ impl Btree {
     /// (`free_page_flag`) or turns it into an empty leaf (`zeroPage`, which rewrites only the
     /// 8-byte page header unless a secure-delete mode zeroes the rest).
     fn clear_database_page(
+        &mut self,
+        pgno: Pgno,
+        free_page_flag: bool,
+        depth: u32,
+        n_entries: &mut u64,
+    ) -> Result<()> {
+        // `getAndInitPage(pBt, pgno, &pPage, 0)` .. `cleardatabasepage_out: releasePage(pPage)`
+        if pgno == 0 || pgno > self.pager.page_count() {
+            return Err(SqliteError::corrupt(format!(
+                "requested invalid page {pgno} (page_count = {})",
+                self.pager.page_count()
+            )));
+        }
+        self.pin(pgno)?;
+        let res = self.clear_database_page_pinned(pgno, free_page_flag, depth, n_entries);
+        self.unpin(pgno);
+        res
+    }
+
+    fn clear_database_page_pinned(
         &mut self,
         pgno: Pgno,
         free_page_flag: bool,
@@ -1428,7 +1625,8 @@ impl Btree {
             self.clear_database_page(right_child, true, depth + 1, n_entries)?;
         }
         if free_page_flag {
-            return self.free_page(pgno);
+            // freePage(pPage)
+            return self.free_page_held(pgno);
         }
         // `zeroPage(pPage, flags | PTF_LEAF)`
         let leaf_flag = match ptype {
@@ -1472,13 +1670,21 @@ impl Btree {
                     "overflow page {pgno} out of range"
                 )));
             }
+            // `clearCellOverflow`: "if( nOvfl ) getOverflowPage(pBt, ovflPgno, &pOvfl, &iNext)" —
+            // every page but the last is fetched (to read the next pointer) and freed while
+            // referenced; the last one is looked up in the cache only (`btreePageLookup`).
             let next = if remaining > 0 {
+                self.pin(pgno)?;
                 let raw = self.pager.read_page_unchecked(pgno)?;
-                u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]])
+                let n = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                let r = self.free_page_held(pgno);
+                self.unpin(pgno);
+                r?;
+                n
             } else {
+                self.free_page(pgno)?;
                 0
             };
-            self.free_page(pgno)?;
             pgno = next;
         }
         Ok(())
@@ -1550,6 +1756,10 @@ impl Btree {
         }
         let max_pages = self.pager.page_count() as usize + 1;
         let mut visited = 0usize;
+        // `sqlite3BtreeCount`: the cursor walks the tree depth first (`moveToChild` /
+        // `moveToParent`) and ends on the root.
+        let vc = self.vc_open(root_pgno, pins::VC_READ);
+        self.vc_move_to_root(vc)?;
         self.count_entries_page(root_pgno, max_pages, &mut visited)
     }
 
@@ -1615,7 +1825,10 @@ impl Btree {
         };
         let mut total = if ptype == 0x02 { n_cells as i64 } else { 0 };
         for child in children {
-            total += self.count_entries_page(child, max_pages, visited)?;
+            self.pin(child)?;
+            let r = self.count_entries_page(child, max_pages, visited);
+            self.unpin(child);
+            total += r?;
         }
         Ok(total)
     }
@@ -1626,6 +1839,8 @@ impl Btree {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
+        let vc = self.vc_open(root_pgno, pins::VC_READ);
+        self.vc_move_to_root(vc)?;
         self.collect_table_entries(root_pgno, &mut out)?;
         Ok(out)
     }
@@ -1648,9 +1863,15 @@ impl Btree {
             }
             ParsedPage::TableInterior { cells, right_child } => {
                 for c in cells {
-                    self.collect_table_entries(c.left_child, out)?;
+                    self.pin(c.left_child)?;
+                    let r = self.collect_table_entries(c.left_child, out);
+                    self.unpin(c.left_child);
+                    r?;
                 }
-                self.collect_table_entries(right_child, out)
+                self.pin(right_child)?;
+                let r = self.collect_table_entries(right_child, out);
+                self.unpin(right_child);
+                r
             }
             _ => Err(SqliteError::corrupt(format!(
                 "expected table B-tree page at {pgno}, found {:?}",
@@ -1666,6 +1887,8 @@ impl Btree {
         }
         let usable = self.pager.usable_size();
         let mut cur_pgno = root_pgno;
+        // (No cursor is modelled for this lookup: the engine uses it both where C seeks a
+        // read cursor and where C positions the write cursor with `OP_NotExists`.)
         loop {
             self.check_interrupted()?;
             let hit_or_next = {
@@ -1928,6 +2151,10 @@ impl Btree {
         let mut visited_pages = 0usize;
         let mut stack: Vec<(Pgno, usize)> = Vec::with_capacity(8);
         stack.push((root_pgno, 0));
+        // The read cursor of the scan (`OP_Rewind` / `OP_Next`): `moveToRoot`, `moveToChild`
+        // on the way down, `moveToParent` when a page is exhausted; it ends on the root.
+        let vc = self.vc_open(root_pgno, pins::VC_READ);
+        self.vc_move_to_root(vc)?;
 
         while let Some((pgno, next_idx)) = stack.pop() {
             if next_idx == 0 {
@@ -1935,6 +2162,9 @@ impl Btree {
                 visited_pages += 1;
                 if visited_pages > max_pages {
                     return Err(SqliteError::corrupt("cycle detected in table B+Tree"));
+                }
+                if pgno != root_pgno {
+                    self.vc_move_to_child(vc, pgno)?;
                 }
             }
 
@@ -2050,6 +2280,18 @@ impl Btree {
                             let full = self.read_full_payload(total_u32, &local_copy, ovfl)?;
                             visit(rowid, &full)?;
                         } else {
+                            break;
+                        }
+                    }
+                    // `sqlite3BtreeNext` at the end of a leaf: up to the first page that still
+                    // has a child to visit (or to the root).
+                    loop {
+                        if self.vc_depth(vc) <= 1 {
+                            break;
+                        }
+                        self.vc_move_to_parent(vc);
+                        let top = *self.vc_path(vc).last().unwrap_or(&root_pgno);
+                        if stack.last().is_some_and(|e| e.0 == top) {
                             break;
                         }
                     }
@@ -2459,14 +2701,104 @@ impl Btree {
         }
     }
 
+    /// `sqlite3BtreeLast` on the statement's write cursor of table `root_pgno` (the first
+    /// step of `OP_NewRowid`): the cursor goes to the root (`moveToRoot`) and down the
+    /// right-most children (`moveToRightmost`), and stays on the last leaf. Returns the
+    /// largest rowid.
+    fn last_rowid_on_write_cursor(&mut self, root_pgno: Pgno) -> Result<Option<i64>> {
+        if self.pager.page_count() == 0 {
+            return Ok(None);
+        }
+        let usable = self.pager.usable_size();
+        let vc = self.vc_open(root_pgno, pins::VC_WRITE);
+        // "If the cursor already points to the last entry, this is a no-op."
+        if self.vcursors[vc].valid && self.vcursors[vc].at_last && self.vc_depth(vc) > 0 {
+            let leaf = *self.vc_path(vc).last().unwrap_or(&root_pgno);
+            let mut ai = [0u16; 20];
+            if leaf != 0 && leaf <= self.pager.page_count() && self.vc_on_last_page(vc, &mut ai)? {
+                let raw = self.pager.read_page(leaf)?;
+                if matches!(peek_page_type(leaf, usable, raw), Ok(BtreePageType::TableLeaf)) {
+                    return last_table_leaf_rowid(leaf, usable, raw);
+                }
+            }
+        }
+        self.vc_move_to_root(vc)?;
+        let mut cur_pgno = root_pgno;
+        loop {
+            let raw = self.pager.read_page(cur_pgno)?;
+            match peek_page_type(cur_pgno, usable, raw)? {
+                BtreePageType::TableLeaf => {
+                    let last = last_table_leaf_rowid(cur_pgno, usable, raw)?;
+                    if last.is_some() {
+                        // moveToRightmost succeeded: `pCur->curFlags |= BTCF_AtLast`
+                        let c = &mut self.vcursors[vc];
+                        c.valid = true;
+                        c.at_last = true;
+                    }
+                    return Ok(last);
+                }
+                BtreePageType::TableInterior => {
+                    let hdr = if cur_pgno == 1 { 100 } else { 0 };
+                    let n_cell = usize::from(u16::from_be_bytes([raw[hdr + 3], raw[hdr + 4]]));
+                    cur_pgno = table_interior_right_child(cur_pgno, usable, raw)?;
+                    self.vc_move_to_child_at(vc, cur_pgno, n_cell)?;
+                }
+                _ => {
+                    return Err(SqliteError::corrupt(
+                        "expected table page in max_table_rowid",
+                    ));
+                }
+            }
+        }
+    }
+
+    /// `OP_NotExists` on the statement's write cursor of table `root_pgno` (the rowid check of
+    /// an INSERT with a given rowid, `sqlite3GenerateConstraintChecks`): the cursor seeks the
+    /// rowid (`sqlite3BtreeTableMoveto`: `moveToRoot`, then down) and stays there; the
+    /// `OP_Insert` of that rowid uses the position. Nothing happens for a rowid that
+    /// `OP_NewRowid` has just produced (C codes no check for it).
+    pub fn write_cursor_not_exists(&mut self, root_pgno: Pgno, rowid: i64) -> Result<()> {
+        if self.new_rowid_hint == Some((root_pgno, rowid)) || self.pager.page_count() == 0 {
+            return Ok(());
+        }
+        let usable = self.pager.usable_size();
+        let vc = self.vc_open(root_pgno, pins::VC_WRITE);
+        self.vc_move_to_root(vc)?;
+        let mut cur_pgno = root_pgno;
+        loop {
+            let raw = self.pager.read_page(cur_pgno)?;
+            match peek_page_type(cur_pgno, usable, raw)? {
+                BtreePageType::TableLeaf => break,
+                BtreePageType::TableInterior => {
+                    let (i, child) = find_table_interior_child(cur_pgno, usable, raw, rowid)?;
+                    cur_pgno = child;
+                    self.vc_move_to_child_at(vc, child, i)?;
+                }
+                _ => {
+                    return Err(SqliteError::corrupt(format!(
+                        "expected table page at {cur_pgno}"
+                    )));
+                }
+            }
+        }
+        self.new_rowid_hint = Some((root_pgno, rowid));
+        Ok(())
+    }
+
     /// Allocates the next available `rowid` as `OP_NewRowid` does (vdbe.c): largest rowid + 1,
     /// or `1` for an empty table. When the largest rowid is already 2^63-1, up to 100 random
     /// positive candidates (`v &= MAX_ROWID>>1; v++`) are tried; if every one of them exists the
     /// result is `SQLITE_FULL`.
     pub fn next_rowid(&mut self, root_pgno: Pgno) -> Result<i64> {
-        match self.max_table_rowid(root_pgno)? {
-            None => Ok(1),
-            Some(max_id) if max_id < i64::MAX => Ok(max_id + 1),
+        match self.last_rowid_on_write_cursor(root_pgno)? {
+            None => {
+                self.new_rowid_hint = Some((root_pgno, 1));
+                Ok(1)
+            }
+            Some(max_id) if max_id < i64::MAX => {
+                self.new_rowid_hint = Some((root_pgno, max_id + 1));
+                Ok(max_id + 1)
+            }
             Some(_) => {
                 let vfs = Arc::clone(self.pager().vfs());
                 for _ in 0..100 {
@@ -2930,6 +3262,8 @@ impl Btree {
         let usable = self.pager.usable_size();
         let max_pages = (self.pager.page_count() as usize).saturating_add(2);
         let mut visited_pages = 0usize;
+        let vc = self.vc_open(root_pgno, pins::VC_READ);
+        self.vc_move_to_root(vc)?;
         let _ = self.scan_index_raw_rec(
             root_pgno,
             usable,
@@ -2939,6 +3273,25 @@ impl Btree {
             &mut visit,
         )?;
         Ok(())
+    }
+
+    /// `moveToChild` .. `moveToParent` around the scan of one child page.
+    fn scan_index_raw_child<F>(
+        &mut self,
+        pgno: Pgno,
+        usable: u32,
+        reverse: bool,
+        visited_pages: &mut usize,
+        max_pages: usize,
+        visit: &mut F,
+    ) -> Result<ControlFlow<()>>
+    where
+        F: FnMut(&[u8]) -> Result<ControlFlow<()>>,
+    {
+        self.pin(pgno)?;
+        let r = self.scan_index_raw_rec(pgno, usable, reverse, visited_pages, max_pages, visit);
+        self.unpin(pgno);
+        r
     }
 
     fn scan_index_raw_rec<F>(
@@ -3059,7 +3412,7 @@ impl Btree {
                             read_index_interior_cell(pgno, usable, raw, n_cell, ci)?.0
                         };
                         if self
-                            .scan_index_raw_rec(
+                            .scan_index_raw_child(
                                 left_child,
                                 usable,
                                 false,
@@ -3095,7 +3448,7 @@ impl Btree {
                             }
                         }
                     }
-                    self.scan_index_raw_rec(
+                    self.scan_index_raw_child(
                         right_child,
                         usable,
                         false,
@@ -3105,7 +3458,7 @@ impl Btree {
                     )
                 } else {
                     if self
-                        .scan_index_raw_rec(
+                        .scan_index_raw_child(
                             right_child,
                             usable,
                             true,
@@ -3147,7 +3500,7 @@ impl Btree {
                             }
                         }
                         if self
-                            .scan_index_raw_rec(
+                            .scan_index_raw_child(
                                 left_child,
                                 usable,
                                 true,
@@ -5181,6 +5534,10 @@ pub fn commit_btrees_two_phase(
     let mut n_trans = 0usize;
     let mut need_xcommit = false;
 
+    // (`sqlite3VdbeHalt`: `closeAllCursors` comes before `vdbeCommit`.)
+    for bt in btrees.iter_mut() {
+        bt.vc_close_all();
+    }
     for bt in btrees.iter_mut() {
         if bt.transaction_state() == TransactionState::Write {
             need_xcommit = true;
