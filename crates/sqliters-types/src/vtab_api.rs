@@ -181,10 +181,58 @@ pub trait VTabHostContext {
     fn vtab_nochange(&self, _col_idx: usize) -> bool {
         false
     }
+    /// Runs `f` with a context of the same statement whose schema and table are those of
+    /// another table of the connection (a module that reads the shadow tables of a table
+    /// in another schema: `fts5vocab`).
+    fn with_table(
+        &mut self,
+        db_name: &str,
+        table_name: &str,
+        f: &mut dyn FnMut(&mut dyn VTabHostContext) -> Result<()>,
+    ) -> Result<()>;
     /// Executes an internal SQL statement within the active connection/transaction context.
     fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<usize>;
     /// Executes an internal SQL query within the active connection/transaction context and returns all rows.
     fn query_sql(&mut self, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>>;
+
+    /// The bytes of the blob (or text) stored in column `col_idx` of row `rowid` of a rowid
+    /// shadow table — one row lookup, like `sqlite3_blob_reopen` + `sqlite3_blob_read` of the
+    /// whole value. `None`: no such row, or the value is neither a blob nor text.
+    /// `hint`: see [`ShadowHint`] (one per table, kept by the caller).
+    fn shadow_blob_get(
+        &mut self,
+        shadow_table: &str,
+        _hint: &mut ShadowHint,
+        rowid: i64,
+        col_idx: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(mut row) = self.shadow_get_rowid(shadow_table, rowid)? else {
+            return Ok(None);
+        };
+        if col_idx >= row.len() {
+            return Ok(None);
+        }
+        Ok(match row.swap_remove(col_idx) {
+            Value::Blob(b) => Some(b),
+            Value::Text(s) => Some(s.into_bytes()),
+            _ => None,
+        })
+    }
+
+    /// One seek on a `WITHOUT ROWID` shadow table whose primary key is its first two
+    /// columns: the row with the largest second key column `<= k1` (`le`), or the smallest
+    /// one `> k1` (`!le`), among the rows whose first key column equals `k0` — what
+    /// `SELECT * FROM t WHERE c0=? AND c1<=? ORDER BY c1 DESC LIMIT 1` (or `c1>? ORDER BY c1
+    /// ASC LIMIT 1`) returns. `Ok(None)`: the host has no such path, the caller runs the SQL.
+    fn shadow_wr_seek(
+        &mut self,
+        _shadow_table: &str,
+        _k0: i64,
+        _k1: &[u8],
+        _le: bool,
+    ) -> Result<Option<Option<Vec<Value>>>> {
+        Ok(None)
+    }
 
     /// Point-reads a single row by `rowid` from a standard rowid shadow table in `self.db_name()`.
     /// Defaults to `query_sql` so custom/mock [`VTabHostContext`] implementations work unchanged.
@@ -284,6 +332,12 @@ pub trait VTabHostContext {
     /// as `fts5VocabOpenMethod` does with the FTS5 table it reads (`sqlite3Fts5FlushToDisk`).
     fn flush_vtab_pending(&mut self, _db_name: Option<&str>, _table: &str) -> Result<()> {
         Ok(())
+    }
+
+    /// Whether a scalar SQL function called `name` is known to the connection (a statement
+    /// that calls an unknown function cannot be prepared).
+    fn sql_function_exists(&self, _name: &str) -> bool {
+        true
     }
 
     /// `sqlite3_last_insert_rowid(db)`.
@@ -654,8 +708,37 @@ pub trait VirtualCursor: Send + Sync {
     /// Receives [`VTabIndexInfo::plan_hint`] of the chosen plan right before `filter`.
     fn set_plan_hint(&mut self, _hint: u64) {}
 
+    /// Tells the cursor, right before `filter`, which columns the statement can ask for
+    /// (bit `i` = column `i`, bit 63 = every column from 63 on).
+    fn set_fetch_mask(&mut self, _mask: u64) {}
+
+    /// Asks the cursor to work row by row: `filter` only positions it on the first row and
+    /// the host then calls [`Self::next_ctx`] / [`Self::column_ctx`] while it is on a row, as
+    /// `OP_VFilter` / `OP_VNext` / `OP_VColumn` do. Returns whether the cursor supports it
+    /// (a cursor that does not keeps answering from what `filter` read).
+    fn set_lazy(&mut self, _lazy: bool) -> bool {
+        false
+    }
+
+    /// Takes back [`Self::set_lazy`] on a filtered cursor that has not been stepped: the
+    /// rest of the scan is read now and the cursor answers from it afterwards.
+    fn unlazy(&mut self, _ctx: &mut dyn VTabHostContext) -> Result<()> {
+        Ok(())
+    }
+
     /// Advances the cursor to the next row (`xNext`).
     fn next(&mut self) -> Result<()>;
+
+    /// [`Self::next`] with access to the host (a cursor that reads its shadow tables as it
+    /// steps).
+    fn next_ctx(&mut self, _ctx: &mut dyn VTabHostContext) -> Result<()> {
+        self.next()
+    }
+
+    /// [`Self::column`] with access to the host.
+    fn column_ctx(&mut self, _ctx: &mut dyn VTabHostContext, col_idx: usize) -> Result<Value> {
+        self.column(col_idx)
+    }
 
     /// Returns true when the cursor has no current row (`xEof`).
     fn eof(&self) -> bool;

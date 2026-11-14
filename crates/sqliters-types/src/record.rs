@@ -1908,58 +1908,82 @@ pub fn raw_record_prefix_has_null(record: &[u8], prefix_cols: usize) -> Result<b
 
 /// Stable fallible merge sort for slices whose comparator may return `Err(SqliteError)`
 /// (e.g. custom collation errors or panics).
+///
+/// The merge runs on a permutation of positions (the elements are compared in place and
+/// moved once at the end), so no element is cloned.
 pub fn fallible_sort_by<T: Clone, F>(slice: &mut [T], mut compare: F) -> Result<()>
 where
     F: FnMut(&T, &T) -> Result<Ordering>,
 {
-    fn merge_sort_rec<T: Clone, F>(
-        slice: &mut [T],
-        scratch: &mut [T],
+    fn merge_sort_rec<T, F>(
+        items: &[T],
+        idx: &mut [usize],
+        scratch: &mut [usize],
         compare: &mut F,
     ) -> Result<()>
     where
         F: FnMut(&T, &T) -> Result<Ordering>,
     {
-        let len = slice.len();
+        let len = idx.len();
         if len <= 1 {
             return Ok(());
         }
         let mid = len / 2;
-        merge_sort_rec(&mut slice[..mid], &mut scratch[..mid], compare)?;
-        merge_sort_rec(&mut slice[mid..], &mut scratch[mid..], compare)?;
+        merge_sort_rec(items, &mut idx[..mid], &mut scratch[..mid], compare)?;
+        merge_sort_rec(items, &mut idx[mid..], &mut scratch[mid..], compare)?;
 
         let mut i = 0;
         let mut j = mid;
         let mut k = 0;
         while i < mid && j < len {
-            if compare(&slice[i], &slice[j])? != Ordering::Greater {
-                scratch[k] = slice[i].clone();
+            if compare(&items[idx[i]], &items[idx[j]])? != Ordering::Greater {
+                scratch[k] = idx[i];
                 i += 1;
             } else {
-                scratch[k] = slice[j].clone();
+                scratch[k] = idx[j];
                 j += 1;
             }
             k += 1;
         }
         while i < mid {
-            scratch[k] = slice[i].clone();
+            scratch[k] = idx[i];
             i += 1;
             k += 1;
         }
         while j < len {
-            scratch[k] = slice[j].clone();
+            scratch[k] = idx[j];
             j += 1;
             k += 1;
         }
-        slice.clone_from_slice(&scratch[..len]);
+        idx.copy_from_slice(&scratch[..len]);
         Ok(())
     }
 
-    if slice.len() <= 1 {
+    let len = slice.len();
+    if len <= 1 {
         return Ok(());
     }
-    let mut scratch = slice.to_vec();
-    merge_sort_rec(slice, &mut scratch, &mut compare)
+    // idx[k] = position (before the sort) of the element that belongs at position k
+    let mut idx: Vec<usize> = (0..len).collect();
+    let mut scratch = idx.clone();
+    merge_sort_rec(slice, &mut idx, &mut scratch, &mut compare)?;
+    // Apply the permutation in place, cycle by cycle.
+    for i in 0..len {
+        if idx[i] == i {
+            continue;
+        }
+        let mut cur = i;
+        loop {
+            let src = idx[cur];
+            idx[cur] = cur;
+            if src == i {
+                break;
+            }
+            slice.swap(cur, src);
+            cur = src;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

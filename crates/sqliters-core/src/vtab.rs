@@ -248,8 +248,8 @@ impl VTabRegistry {
         reg.register_module(Arc::new(JsonTreeModule));
         reg.register_module(Arc::new(JsonbEachModule));
         reg.register_module(Arc::new(JsonbTreeModule));
+        reg.register_module(Arc::new(Fts5VocabModule::new(Arc::clone(&fts5_aux))));
         reg.register_module(Arc::new(Fts5Module::new(fts5_aux)));
-        reg.register_module(Arc::new(Fts5VocabModule));
         reg.register_module(Arc::new(RTreeModule::new_f32()));
         reg.register_module(Arc::new(RTreeModule::new_i32()));
         reg
@@ -747,6 +747,16 @@ impl CoreVTabHostContext<'_, '_, '_> {
 }
 
 impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
+    fn with_table(
+        &mut self,
+        db_name: &str,
+        table_name: &str,
+        f: &mut dyn FnMut(&mut dyn VTabHostContext) -> Result<()>,
+    ) -> Result<()> {
+        let mut sub = CoreVTabHostContext::new(&mut *self.ctx, db_name, table_name);
+        f(&mut sub)
+    }
+
     fn db_name(&self) -> &str {
         self.db_name
     }
@@ -806,6 +816,33 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
         crate::engine::shadow_get_rowid_direct(self.ctx, self.db_name, shadow_table, rowid)
     }
 
+    fn shadow_blob_get(
+        &mut self,
+        shadow_table: &str,
+        hint: &mut sqliters_types::ShadowHint,
+        rowid: i64,
+        col_idx: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        crate::engine::shadow_blob_get_direct(
+            self.ctx,
+            self.db_name,
+            shadow_table,
+            hint,
+            rowid,
+            col_idx,
+        )
+    }
+
+    fn shadow_wr_seek(
+        &mut self,
+        shadow_table: &str,
+        k0: i64,
+        k1: &[u8],
+        le: bool,
+    ) -> Result<Option<Option<Vec<Value>>>> {
+        crate::engine::shadow_wr_seek_direct(self.ctx, self.db_name, shadow_table, k0, k1, le)
+    }
+
     fn shadow_put_rowid(
         &mut self,
         shadow_table: &str,
@@ -857,6 +894,12 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
     fn flush_vtab_pending(&mut self, db_name: Option<&str>, table: &str) -> Result<()> {
         let db = db_name.unwrap_or(self.db_name).to_owned();
         vtab_flush_one(self.ctx, &db, table)
+    }
+
+    fn sql_function_exists(&self, name: &str) -> bool {
+        self.ctx.functions.has_scalar_name(name)
+            || self.ctx.functions.has_aggregate_name(name)
+            || sqliters_vdbe::builtin_scalar_flags(name, true).is_some()
     }
 
     fn last_insert_rowid(&mut self) -> i64 {

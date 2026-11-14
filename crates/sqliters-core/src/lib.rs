@@ -170,33 +170,18 @@ fn register_builtin_extension_functions(
     functions: &mut FunctionRegistry,
     fts5_aux: Arc<Fts5AuxRegistry>,
 ) {
-    let aux_bm25 = Arc::clone(&fts5_aux);
-    functions.register_scalar("bm25", None, FunctionFlags::INNOCUOUS, move |args| {
-        if args.len() == 1 {
-            return Ok(RuntimeValue::plain(
-                aux_bm25.eval_bm25(std::slice::from_ref(&args[0].value))?,
-            ));
-        }
-        let vals: Vec<Value> = args.iter().map(|rv| rv.value.clone()).collect();
-        Ok(RuntimeValue::plain(aux_bm25.eval_bm25(&vals)?))
-    });
-
-    let aux_hl = Arc::clone(&fts5_aux);
-    functions.register_scalar(
-        "highlight",
-        Some(4),
-        FunctionFlags::INNOCUOUS,
-        move |args| {
-            let vals: Vec<Value> = args.iter().map(|rv| rv.value.clone()).collect();
-            Ok(RuntimeValue::plain(aux_hl.eval_highlight(&vals)?))
-        },
-    );
-
-    let aux_snip = fts5_aux;
-    functions.register_scalar("snippet", Some(6), FunctionFlags::INNOCUOUS, move |args| {
-        let vals: Vec<Value> = args.iter().map(|rv| rv.value.clone()).collect();
-        Ok(RuntimeValue::plain(aux_snip.eval_snippet(&vals)?))
-    });
+    // The auxiliary functions of FTS5 (`sqlite3_overload_function`): called with a column
+    // of an FTS5 table as first argument they run on that table's cursor (the engine
+    // dispatches those calls, `fts5ApiCallback`); anywhere else they are not usable.
+    let _ = fts5_aux;
+    for name in ["bm25", "highlight", "snippet", "fts5_get_locale"] {
+        functions.register_scalar(name, None, FunctionFlags::INNOCUOUS, move |_args| {
+            Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("unable to use function {name} in the requested context"),
+            ))
+        });
+    }
 
     functions.register_scalar(
         "fts5_source_id",
@@ -4968,6 +4953,9 @@ pub struct Statement {
     ignored_fk_parent_tables: Vec<(DatabaseId, String)>,
     unparsed_tail: String,
     lifecycle: StatementLifecycle,
+    /// The error of a scan that failed after it had produced rows: reported once the rows
+    /// are used up (see `StmtTxTracker::partial_rows`).
+    deferred_error: Option<SqliteError>,
 }
 
 impl fmt::Debug for Statement {
@@ -6759,6 +6747,7 @@ impl Statement {
             ignored_fk_parent_tables: artifacts.ignored_fk_parent_tables,
             unparsed_tail,
             lifecycle: StatementLifecycle::Ready,
+            deferred_error: None,
         })
     }
 
@@ -7127,6 +7116,7 @@ impl Statement {
     /// active execution (`sqlite3VdbeReset`), while leaving the statement rewound to `Ready`
     /// (unless cleanup I/O poisoned the connection).
     pub fn reset(&mut self) -> Result<()> {
+        self.deferred_error = None;
         if matches!(
             self.lifecycle,
             StatementLifecycle::Ready | StatementLifecycle::Halted { last_error: None }
@@ -8627,6 +8617,19 @@ impl Statement {
                     inner.in_user_btree_tx = true;
                 }
 
+                // A scan the engine stepped row by row failed after it had produced rows:
+                // they come out first (`sqlite3_step` returned SQLITE_ROW for each of
+                // them), the error when they are used up.
+                let exec_res = match exec_res {
+                    Err(e) => match stmt_tx.partial_rows.take() {
+                        Some((column_names, rows)) if !rows.is_empty() => {
+                            self.deferred_error = Some(e);
+                            Ok(QueryOutput { column_names, rows })
+                        }
+                        _ => Err(e),
+                    },
+                    ok => ok,
+                };
                 match exec_res {
                     Ok(out) => {
                         if !out.column_names.is_empty() {
@@ -9494,6 +9497,21 @@ impl Statement {
 
                 if let Some(vals) = rows.next() {
                     Ok(StepResult::Row(Row::new(vals)))
+                } else if let Some(e) = self.deferred_error.take() {
+                    let cursors = std::mem::take(lease_cursors);
+                    let r_insts = std::mem::take(read_instances);
+                    let _ = inner.finish_activity(
+                        hid,
+                        ActivityFinish::ReadAborted {
+                            lease_cursors: cursors,
+                            read_instances: r_insts,
+                        },
+                        shared,
+                    );
+                    self.lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(e.clone()),
+                    };
+                    Err(e)
                 } else {
                     let cursors = std::mem::take(lease_cursors);
                     let r_insts = std::mem::take(read_instances);
@@ -13098,6 +13116,8 @@ mod c_align_h4_tests;
 mod c_align_h5_tests;
 #[cfg(test)]
 mod c_align_h6_tests;
+#[cfg(test)]
+mod c_align_h7_tests;
 #[cfg(test)]
 mod c_align_h6b_tests;
 /// Regression tests for behaviour that has to match C SQLite 3.54.1 (step 5e): every expected
