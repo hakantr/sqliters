@@ -417,7 +417,18 @@ impl VTabRegistry {
     pub fn rename_connected(&mut self, db_name: &str, old_name: &str, new_name: &str) {
         if let Some(mut entry) = self.remove_connected(db_name, old_name) {
             entry.table_name = new_name.to_owned();
-            Arc::make_mut(&mut entry.declared).table_schema.name = new_name.to_owned();
+            let decl = Arc::make_mut(&mut entry.declared);
+            decl.table_schema.name = new_name.to_owned();
+            // C reconnects the table after a rename and the module declares its schema
+            // again: a hidden column named after the table (FTS5: `ft MATCH ...`) carries the
+            // new name from then on.
+            for (i, col) in decl.table_schema.columns.iter_mut().enumerate() {
+                if decl.hidden_cols.get(i).copied().unwrap_or(false)
+                    && col.name.eq_ignore_ascii_case(old_name)
+                {
+                    col.name = new_name.to_owned();
+                }
+            }
             self.insert_connected(entry);
         }
     }
@@ -719,6 +730,22 @@ impl<'a, 'b, 'c> CoreVTabHostContext<'a, 'b, 'c> {
     }
 }
 
+impl CoreVTabHostContext<'_, '_, '_> {
+    /// vdbe.c `OP_Transaction`: a statement that writes (the ones a module steps on its shadow
+    /// tables, an incremental-blob handle opened for writing) is refused with SQLITE_CORRUPT
+    /// while `SQLITE_CorruptRdOnly` is set.
+    #[inline]
+    fn refuse_write_after_corruption(&self) -> Result<()> {
+        if self.ctx.db_set.corrupt_rdonly() {
+            return Err(SqliteError::new(
+                ErrorCode::Corrupt,
+                "database disk image is malformed",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
     fn db_name(&self) -> &str {
         self.db_name
@@ -786,6 +813,7 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
         cols: &[Value],
         or_replace: bool,
     ) -> Result<()> {
+        self.refuse_write_after_corruption()?;
         crate::engine::shadow_put_rowid_direct(
             self.ctx,
             self.db_name,
@@ -797,6 +825,7 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
     }
 
     fn shadow_delete_rowid(&mut self, shadow_table: &str, rowid: i64) -> Result<bool> {
+        self.refuse_write_after_corruption()?;
         crate::engine::shadow_delete_rowid_direct(self.ctx, self.db_name, shadow_table, rowid)
     }
 
@@ -823,6 +852,19 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
 
     fn execute_sql_counted(&mut self, sql: &str, params: &[Value]) -> Result<usize> {
         crate::engine::execute_internal_vtab_sql_counted(self.ctx, sql, params)
+    }
+
+    fn flush_vtab_pending(&mut self, db_name: Option<&str>, table: &str) -> Result<()> {
+        let db = db_name.unwrap_or(self.db_name).to_owned();
+        vtab_flush_one(self.ctx, &db, table)
+    }
+
+    fn last_insert_rowid(&mut self) -> i64 {
+        self.ctx.runtime.last_insert_rowid
+    }
+
+    fn set_last_insert_rowid(&mut self, rowid: i64) {
+        self.ctx.runtime.last_insert_rowid = rowid;
     }
 
     fn vtab_cursor_positioned(&self) -> bool {
@@ -853,6 +895,28 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
         )
     }
 
+    fn shadow_blob_write(
+        &mut self,
+        shadow_table: &str,
+        hint: &mut sqliters_types::ShadowHint,
+        rowid: i64,
+        col_idx: usize,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<bool> {
+        self.refuse_write_after_corruption()?;
+        crate::engine::shadow_blob_write_direct(
+            self.ctx,
+            self.db_name,
+            shadow_table,
+            hint,
+            rowid,
+            col_idx,
+            offset,
+            data,
+        )
+    }
+
     fn shadow_int_read(
         &mut self,
         shadow_table: &str,
@@ -870,6 +934,28 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
         )
     }
 
+    fn shadow_insert_row(
+        &mut self,
+        shadow_table: &str,
+        hint: &mut sqliters_types::ShadowHint,
+        sql: &str,
+        rowid: Option<i64>,
+        values: &[Value],
+        replace: bool,
+    ) -> Result<i64> {
+        self.refuse_write_after_corruption()?;
+        crate::engine::shadow_insert_row_direct(
+            self.ctx,
+            self.db_name,
+            shadow_table,
+            hint,
+            sql,
+            rowid,
+            values,
+            replace,
+        )
+    }
+
     fn shadow_replace_blob(
         &mut self,
         shadow_table: &str,
@@ -877,6 +963,7 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
         rowid: Option<i64>,
         blob: &[u8],
     ) -> Result<i64> {
+        self.refuse_write_after_corruption()?;
         crate::engine::shadow_replace_blob_direct(
             self.ctx,
             self.db_name,
@@ -894,6 +981,7 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
         rowid: Option<i64>,
         value: Option<i64>,
     ) -> Result<i64> {
+        self.refuse_write_after_corruption()?;
         crate::engine::shadow_replace_int_direct(
             self.ctx,
             self.db_name,
@@ -910,6 +998,7 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
         hint: &mut sqliters_types::ShadowHint,
         rowid: i64,
     ) -> Result<()> {
+        self.refuse_write_after_corruption()?;
         crate::engine::shadow_delete_counted_direct(
             self.ctx,
             self.db_name,
@@ -1688,17 +1777,12 @@ fn ensure_qname_vtab_connected(
             }
         }
     }
-    if let Some((db_id, vt_name, vt_mod)) = ctx
+    if let Some((db_id, vt_name, vt_mod, vt_args)) = ctx
         .db_set
         .find_virtual_table_in_set(qname)
-        .map(|(id, v)| (id, v.name.clone(), v.module_name.clone()))
+        .map(|(id, v)| (id, v.name.clone(), v.module_name.clone(), v.args.clone()))
     {
-        if ctx.db_set.vtab_registry().internal_sql_depth == 0
-            && ctx.db_set.vtab_registry().has_any_in_tx()
-            && (vt_mod.eq_ignore_ascii_case("fts5vocab") || vt_mod.eq_ignore_ascii_case("dbstat"))
-        {
-            vtab_flush_shadow_all(ctx)?;
-        }
+        let _ = (&vt_mod, &vt_args);
         if let Some((_, connected_name, _, risk)) =
             ensure_vtab_connected(ctx, db_id, &vt_name, false)?
         {
@@ -2149,6 +2233,19 @@ fn ensure_expr_vtabs_connected(
     }
 }
 
+/// 1 when the outermost SQL savepoint is a transaction savepoint (`SAVEPOINT` issued in
+/// autocommit mode): C does not count it in `db->nSavepoint`, so the savepoint numbers a
+/// virtual table sees (`sqlite3VtabSavepoint`) are one lower than this engine's slot numbers
+/// while it is open; the transaction savepoint itself is number -1 (`usize::MAX` here).
+#[inline]
+fn vtab_tx_savepoint_offset(ctx: &ExecContext<'_>) -> usize {
+    usize::from(
+        ctx.savepoints
+            .first()
+            .is_some_and(|sp| sp.is_transaction_savepoint),
+    )
+}
+
 /// Ensures `VirtualTable::begin` has been called on `(db_name, table_name)` prior to `update`.
 #[inline]
 pub fn vtab_begin_if_needed(
@@ -2164,7 +2261,11 @@ pub fn vtab_begin_if_needed(
     if already_in_tx {
         return Ok(());
     }
-    let active_sp_depth = ctx.savepoints.len() + usize::from(ctx.stmt_tx.stmt_sp_slot.is_some());
+    // vtab.c `sqlite3VtabBegin`: `iSvpt = db->nStatement + db->nSavepoint`; when it is not
+    // zero the table is told about the innermost open savepoint only (`xSavepoint(iSvpt-1)`).
+    // A transaction savepoint (SAVEPOINT in autocommit mode) is not counted in nSavepoint.
+    let active_sp_depth = ctx.savepoints.len() - vtab_tx_savepoint_offset(ctx)
+        + usize::from(ctx.stmt_tx.stmt_sp_slot.is_some());
     let mut vt = ctx
         .db_set
         .vtab_registry_mut()
@@ -2172,14 +2273,11 @@ pub fn vtab_begin_if_needed(
     let res = {
         let mut host_ctx = CoreVTabHostContext::new(ctx, db_name, table_name);
         let mut res = catch_callback_panic("vtab xBegin", || vt.begin(&mut host_ctx));
-        if res.is_ok() {
-            for sp_idx in 0..active_sp_depth {
-                res =
-                    catch_callback_panic("vtab xSavepoint", || vt.savepoint(&mut host_ctx, sp_idx));
-                if res.is_err() {
-                    break;
-                }
-            }
+        if res.is_ok() && active_sp_depth > 0 {
+            res = catch_callback_panic("vtab xSavepoint", || {
+                vt.savepoint(&mut host_ctx, active_sp_depth - 1)
+            })
+            .map_err(vtab_savepoint_hook_error);
         }
         res
     };
@@ -2327,8 +2425,18 @@ pub fn vtab_rollback_all(ctx: &mut ExecContext<'_>) {
     }
 }
 
+/// vtab.c `sqlite3VtabSavepoint`: the result code of xSavepoint / xRelease / xRollbackTo is all
+/// the core takes — the module's `zErrMsg` is not imported (no `sqlite3VtabImportErrmsg`), so
+/// the statement fails with `sqlite3ErrStr(rc)`.
+#[cold]
+fn vtab_savepoint_hook_error(mut e: sqliters_types::SqliteError) -> sqliters_types::SqliteError {
+    e.message = e.code.as_str().to_owned();
+    e
+}
+
 /// Invokes `VirtualTable::savepoint` on all virtual tables participating in the current transaction.
 pub fn vtab_savepoint_all(ctx: &mut ExecContext<'_>, idx: usize) -> Result<()> {
+    let idx = idx.wrapping_sub(vtab_tx_savepoint_offset(ctx));
     let active = ctx.db_set.vtab_registry_mut().take_active_tx_vtabs();
     let mut result = Ok(());
     for (_, db_name, table_name) in &active {
@@ -2346,6 +2454,7 @@ pub fn vtab_savepoint_all(ctx: &mut ExecContext<'_>, idx: usize) -> Result<()> {
         let res = {
             let mut host_ctx = CoreVTabHostContext::new(ctx, db_name, table_name);
             catch_callback_panic("vtab xSavepoint", || vt.savepoint(&mut host_ctx, idx))
+                .map_err(vtab_savepoint_hook_error)
         };
         ctx.db_set
             .vtab_registry_mut()
@@ -2361,6 +2470,12 @@ pub fn vtab_savepoint_all(ctx: &mut ExecContext<'_>, idx: usize) -> Result<()> {
 
 /// Invokes `VirtualTable::release` on all virtual tables participating in the current transaction.
 pub fn vtab_release_all(ctx: &mut ExecContext<'_>, idx: usize) -> Result<()> {
+    // The statement savepoint being released is already closed on the pagers: a write a
+    // module makes from xRelease must not reopen it.
+    if ctx.stmt_tx.stmt_sp_slot == Some(idx) {
+        ctx.stmt_tx.stmt_sp_slot = None;
+    }
+    let idx = idx.wrapping_sub(vtab_tx_savepoint_offset(ctx));
     let active = ctx.db_set.vtab_registry_mut().take_active_tx_vtabs();
     let mut result = Ok(());
     for (_, db_name, table_name) in &active {
@@ -2378,6 +2493,7 @@ pub fn vtab_release_all(ctx: &mut ExecContext<'_>, idx: usize) -> Result<()> {
         let res = {
             let mut host_ctx = CoreVTabHostContext::new(ctx, db_name, table_name);
             catch_callback_panic("vtab xRelease", || vt.release(&mut host_ctx, idx))
+                .map_err(vtab_savepoint_hook_error)
         };
         ctx.db_set
             .vtab_registry_mut()
@@ -2393,6 +2509,7 @@ pub fn vtab_release_all(ctx: &mut ExecContext<'_>, idx: usize) -> Result<()> {
 
 /// Invokes `VirtualTable::rollback_to` on all virtual tables participating in the current transaction.
 pub fn vtab_rollback_to_all(ctx: &mut ExecContext<'_>, idx: usize) -> Result<()> {
+    let idx = idx.wrapping_sub(vtab_tx_savepoint_offset(ctx));
     let active = ctx.db_set.vtab_registry().active_tx_vtabs();
     for (db_name, table_name) in active {
         let mut vt = ctx
@@ -2402,6 +2519,7 @@ pub fn vtab_rollback_to_all(ctx: &mut ExecContext<'_>, idx: usize) -> Result<()>
         let res = {
             let mut host_ctx = CoreVTabHostContext::new(ctx, &db_name, &table_name);
             catch_callback_panic("vtab xRollbackTo", || vt.rollback_to(&mut host_ctx, idx))
+                .map_err(vtab_savepoint_hook_error)
         };
         ctx.db_set
             .vtab_registry_mut()
@@ -2411,35 +2529,44 @@ pub fn vtab_rollback_to_all(ctx: &mut ExecContext<'_>, idx: usize) -> Result<()>
     Ok(())
 }
 
-/// Flushes any buffered in-memory shadow mutations on active `in_tx` virtual tables before
-/// user-level SQL accesses shadow tables directly.
-pub fn vtab_flush_shadow_all(ctx: &mut ExecContext<'_>) -> Result<()> {
-    if ctx.db_set.vtab_registry().internal_sql_depth > 0
-        || !ctx.db_set.vtab_registry().has_any_in_tx()
+/// C never writes a module's pending data out because some SQL statement is about to read:
+/// what FTS5 holds in its pending-terms hash stays there until one of FTS5's own flush points
+/// (xSync, xSavepoint, a nested xRelease, `sqlite3Fts5IndexBeginWrite`). Kept as the single
+/// place the former call sites go through.
+#[inline]
+pub fn vtab_flush_shadow_all(_ctx: &mut ExecContext<'_>) -> Result<()> {
+    Ok(())
+}
+
+/// `fts5VocabOpenMethod` -> `sqlite3Fts5FlushToDisk(pFts5)`: a cursor on an `fts5vocab` table
+/// writes the pending data of the FTS5 table it describes (and of no other table) to disk.
+pub fn vtab_flush_one(ctx: &mut ExecContext<'_>, target_db: &str, target_tbl: &str) -> Result<()> {
+    // (With nothing pending the flush writes nothing; C still runs it on every cursor open.)
+    if ctx
+        .db_set
+        .vtab_registry()
+        .get_connected(target_db, target_tbl)
+        .is_none()
     {
         return Ok(());
     }
-    let active = ctx.db_set.vtab_registry().active_tx_vtabs();
-    for (db_name, table_name) in active {
-        let Ok(mut vt) = ctx
-            .db_set
-            .vtab_registry_mut()
-            .checkout_vtab_instance(&db_name, &table_name)
-        else {
-            continue;
-        };
-        let res = {
-            let mut host_ctx = CoreVTabHostContext::new(ctx, &db_name, &table_name);
-            catch_callback_panic("vtab flush_before_shadow_access", || {
-                vt.flush_before_shadow_access(&mut host_ctx)
-            })
-        };
-        ctx.db_set
-            .vtab_registry_mut()
-            .restore_vtab(&db_name, &table_name, vt);
-        res?;
-    }
-    Ok(())
+    let Ok(mut vt) = ctx
+        .db_set
+        .vtab_registry_mut()
+        .checkout_vtab_instance(target_db, target_tbl)
+    else {
+        return Ok(());
+    };
+    let res = {
+        let mut host_ctx = CoreVTabHostContext::new(ctx, target_db, target_tbl);
+        catch_callback_panic("vtab flush_before_shadow_access", || {
+            vt.flush_before_shadow_access(&mut host_ctx)
+        })
+    };
+    ctx.db_set
+        .vtab_registry_mut()
+        .restore_vtab(target_db, target_tbl, vt);
+    res
 }
 
 /// Flushes buffered `in_tx` virtual tables and invalidates clean shadow caches when user SQL

@@ -223,6 +223,9 @@ pub struct DatabaseSet {
     column_limit: usize,
     trigger_steps_limit: usize,
     trigger_depth_limit: usize,
+    /// `db->flags & SQLITE_CorruptRdOnly`: a statement failed with SQLITE_CORRUPT inside the
+    /// open transaction; writes are refused until the transaction ends.
+    corrupt_rdonly: bool,
     next_schema_instance_id: u64,
     temp_store: TempStoreMode,
     disk_vfs: Arc<dyn Vfs>,
@@ -306,6 +309,7 @@ impl DatabaseSet {
             max_column_ceiling: SQLITE_MAX_COLUMN,
             column_limit: SQLITE_MAX_COLUMN,
             trigger_steps_limit: SQLITE_MAX_TRIGGER_STEPS,
+            corrupt_rdonly: false,
             trigger_depth_limit: SQLITE_MAX_TRIGGER_DEPTH,
             next_schema_instance_id: 3,
             temp_store,
@@ -502,6 +506,17 @@ impl DatabaseSet {
     pub fn set_dqs_dml(&mut self, enabled: bool) -> bool {
         self.dqs_dml = enabled;
         self.dqs_dml
+    }
+
+    /// `SQLITE_CorruptRdOnly` (vdbe.c `abort_due_to_error`, `OP_Transaction`).
+    #[inline]
+    pub(crate) const fn corrupt_rdonly(&self) -> bool {
+        self.corrupt_rdonly
+    }
+
+    #[inline]
+    pub(crate) fn set_corrupt_rdonly(&mut self, on: bool) {
+        self.corrupt_rdonly = on;
     }
 
     /// Current `SQLITE_LIMIT_TRIGGER_STEPS` limit on this connection.

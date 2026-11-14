@@ -6,20 +6,22 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::fts5_index::{
+    Detail as IndexDetail, FTS5_CORRUPT, FTS5_CURRENT_VERSION, Fts5Index, IndexConfig,
+    get_varint as fts5_get_varint, get_varint32 as fts5_get_varint32,
+    put_varint as fts5_put_varint, rc_only,
+};
 use crate::fts5_tokenize::{FTS5_MAX_TOKEN_SIZE, Tokenizer, TokenizerError, TokenizerPattern};
+use sqliters_types::ShadowHint;
 use sqliters_types::real_to_text;
 use sqliters_types::{
     ErrorCode, Result, SqliteError, VTabConfigOption, VTabConflictMode, VTabConstraintOp,
     VTabHostContext, VTabIndexInfo, VTabRiskFlags, VTabUpdateOperation, Value, VirtualCursor,
-    VirtualTable, VirtualTableModule, get_varint, put_varint,
+    VirtualTable, VirtualTableModule, get_varint,
 };
 
 const FTS5_AVERAGES_ROWID: i64 = 1;
 const FTS5_STRUCTURE_ROWID: i64 = 10;
-const FTS5_LEAF_TARGET_PGSZ: usize = 4000;
-/// Hard upper bound for the bytes placed on one leaf by a single position list; a larger
-/// list continues on term-less leaves.
-const FTS5_LEAF_MAX_PGSZ: usize = 16_000;
 const FTS5_MAX_EXPR_DEPTH: usize = 256;
 const FTS5_AUX_RING_SLOTS: usize = 64;
 const FTS5_SOURCE_ID: &str =
@@ -49,12 +51,6 @@ fn quote_single(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-fn put_uvarint(buf: &mut Vec<u8>, v: u64) {
-    let mut tmp = [0u8; 9];
-    let n = put_varint(&mut tmp, v);
-    buf.extend_from_slice(&tmp[..n]);
-}
-
 fn get_uvarint(bytes: &[u8], pos: &mut usize) -> Option<u64> {
     if *pos >= bytes.len() {
         return None;
@@ -62,14 +58,6 @@ fn get_uvarint(bytes: &[u8], pos: &mut usize) -> Option<u64> {
     let (v, n) = get_varint(&bytes[*pos..]).ok()?;
     *pos += n;
     Some(v)
-}
-
-fn encode_varint_list(nums: &[u64]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(nums.len() * 2);
-    for &n in nums {
-        put_uvarint(&mut out, n);
-    }
-    out
 }
 
 fn decode_varint_list(bytes: &[u8]) -> Option<Vec<u64>> {
@@ -304,6 +292,10 @@ struct AuxRowEntry {
     /// The row is in the index but not in the content source (`fts5SeekCursor` fails): the
     /// functions that need its text report SQLITE_CORRUPT.
     missing_content: bool,
+    /// The table keeps a `%_docsize` row per document and this one has none (or one that does
+    /// not decode): `sqlite3Fts5StorageDocsize` reports FTS5_CORRUPT when a function asks for
+    /// the size of the row (`xColumnSize`: bm25, snippet).
+    missing_docsize: bool,
 }
 
 /// Per-query state of the auxiliary functions (the `Fts5Cursor` side of `Fts5ExtensionApi`).
@@ -342,8 +334,10 @@ impl AuxQueryContext {
         unknown_size_cols: Vec<bool>,
         rows: Vec<AuxRowEntry>,
     ) -> Self {
-        let n_row = total_rows as f64;
-        let avgdl = (total_tokens as f64) / n_row;
+        // (`sqlite3_int64 nRow, nToken`: the totals of a contentless table go below zero when
+        // 'delete' commands take out more than was put in)
+        let n_row = (total_rows as i64) as f64;
+        let avgdl = ((total_tokens as i64) as f64) / n_row;
         let phrase_idfs = phrase_doc_hits
             .iter()
             .map(|&hit| {
@@ -573,8 +567,8 @@ impl Fts5AuxRegistry {
             return Ok(Value::Null);
         };
         if row.missing_content {
-            return Err(SqliteError::new(
-                ErrorCode::Corrupt,
+            return Err(SqliteError::with_extended(
+                FTS5_CORRUPT,
                 "database disk image is malformed",
             ));
         }
@@ -617,8 +611,8 @@ impl Fts5AuxRegistry {
             return Ok(Value::Null);
         };
         if row.missing_content {
-            return Err(SqliteError::new(
-                ErrorCode::Corrupt,
+            return Err(SqliteError::with_extended(
+                FTS5_CORRUPT,
                 "database disk image is malformed",
             ));
         }
@@ -662,9 +656,12 @@ fn compute_bm25_for_row(
     };
     // `sqlite3Fts5StorageRowCount`: an index that claims to hold no rows is corrupt; so is a
     // row whose text is needed but missing from the content source.
-    if qctx.total_rows == 0 || (row.missing_content && qctx.bm25_needs_content) {
-        return Err(SqliteError::new(
-            ErrorCode::Corrupt,
+    if (qctx.total_rows as i64) <= 0
+        || (row.missing_content && qctx.bm25_needs_content)
+        || row.missing_docsize
+    {
+        return Err(SqliteError::with_extended(
+            FTS5_CORRUPT,
             "database disk image is malformed",
         ));
     }
@@ -964,6 +961,12 @@ fn render_snippet(
                 pos += 1;
             });
         }
+        if row.missing_docsize {
+            return Err(SqliteError::with_extended(
+                FTS5_CORRUPT,
+                "database disk image is malformed",
+            ));
+        }
         let n_docsize = qctx.col_size(row, i);
         for inst in row.instances.as_slice() {
             if inst.col_idx as usize != i {
@@ -1015,8 +1018,8 @@ fn render_snippet(
     }
 
     if corrupt {
-        return Err(SqliteError::new(
-            ErrorCode::Corrupt,
+        return Err(SqliteError::with_extended(
+            FTS5_CORRUPT,
             "database disk image is malformed",
         ));
     }
@@ -1028,6 +1031,12 @@ fn render_snippet(
         ));
     }
     if n_col_size == 0 {
+        if row.missing_docsize {
+            return Err(SqliteError::with_extended(
+                FTS5_CORRUPT,
+                "database disk image is malformed",
+            ));
+        }
         n_col_size = qctx.col_size(row, best_col);
     }
     let Some(text) = col_text(best_col) else {
@@ -1669,8 +1678,6 @@ impl Fts5Config {
 // ============================================================================
 
 type MergedIndexMap = BTreeMap<Vec<u8>, BTreeMap<i64, BTreeMap<usize, Vec<usize>>>>;
-type DocTermPostings = Vec<(Vec<u8>, BTreeMap<usize, Vec<usize>>)>;
-
 #[derive(Clone)]
 enum SmallBytes22 {
     Inline { len: u8, buf: [u8; 22] },
@@ -1678,14 +1685,6 @@ enum SmallBytes22 {
 }
 
 impl SmallBytes22 {
-    #[inline]
-    const fn empty() -> Self {
-        Self::Inline {
-            len: 0,
-            buf: [0u8; 22],
-        }
-    }
-
     #[inline]
     fn from_slice(s: &[u8]) -> Self {
         if s.len() <= 22 {
@@ -1706,11 +1705,6 @@ impl SmallBytes22 {
             Self::Inline { len, buf } => &buf[..(*len as usize)],
             Self::Heap(b) => b,
         }
-    }
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.as_slice().len()
     }
 }
 
@@ -1757,181 +1751,9 @@ impl std::fmt::Debug for SmallBytes22 {
     }
 }
 
-type EncodedDocTerms = Vec<(SmallBytes22, SmallBytes22)>;
-
-fn encode_empty_structure_record(v2: bool) -> Vec<u8> {
-    encode_empty_structure_record_with_cookie(v2, 0)
-}
-
-fn encode_empty_structure_record_with_cookie(v2: bool, cookie: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(11);
-    out.extend_from_slice(&cookie.to_be_bytes());
-    if v2 {
-        out.extend_from_slice(b"\xff\x00\x00\x01");
-    }
-    out.extend_from_slice(&[0, 0, 0]);
-    out
-}
-
-fn encode_single_seg_structure_record_with_cookie(
-    v2: Option<SegOrigin>,
-    cookie: u32,
-    segid: u64,
-    pgno_last: u64,
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(24);
-    out.extend_from_slice(&cookie.to_be_bytes());
-    if v2.is_some() {
-        out.extend_from_slice(b"\xff\x00\x00\x01");
-    }
-    put_uvarint(&mut out, 1); // nLevel = 1
-    put_uvarint(&mut out, 1); // nSegment = 1
-    put_uvarint(&mut out, pgno_last); // nWriteCounter
-    put_uvarint(&mut out, 0); // nMerge = 0
-    put_uvarint(&mut out, 1); // nSeg in level 0 = 1
-    put_uvarint(&mut out, segid);
-    put_uvarint(&mut out, 1); // pgnoFirst = 1
-    put_uvarint(&mut out, pgno_last);
-    if let Some(origin) = v2 {
-        put_uvarint(&mut out, origin.origin1);
-        put_uvarint(&mut out, origin.origin2);
-        put_uvarint(&mut out, 0); // nPgTombstone
-        put_uvarint(&mut out, 0); // nEntryTombstone
-        put_uvarint(&mut out, origin.n_entry);
-    }
-    out
-}
-
-/// Origin range and row count of a segment of a `contentless_delete=1` table (V2 structure
-/// record, `Fts5StructureSegment.iOrigin1/iOrigin2/nEntry`).
-#[derive(Debug, Clone, Copy)]
-struct SegOrigin {
-    origin1: u64,
-    origin2: u64,
-    n_entry: u64,
-}
-
-fn read_structure_cookie(ctx: &mut dyn VTabHostContext, data_shadow: &str) -> u32 {
-    if let Ok(Some(row)) = ctx.shadow_get_rowid(data_shadow, FTS5_STRUCTURE_ROWID)
-        && let Some(Value::Blob(b)) = row.get(1)
-        && b.len() >= 4
-    {
-        u32::from_be_bytes([b[0], b[1], b[2], b[3]])
-    } else {
-        0
-    }
-}
-
-fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
-    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
-}
-
-fn encode_poslist(detail: DetailMode, col_hits: &BTreeMap<usize, Vec<usize>>) -> Vec<u8> {
-    match detail {
-        DetailMode::None => Vec::new(),
-        DetailMode::Col => {
-            let mut body = Vec::new();
-            let mut prev_col = 0usize;
-            for (idx, &c) in col_hits.keys().enumerate() {
-                if idx == 0 {
-                    put_uvarint(&mut body, (c + 2) as u64);
-                } else {
-                    put_uvarint(&mut body, (c - prev_col + 2) as u64);
-                }
-                prev_col = c;
-            }
-            let mut out = Vec::with_capacity(body.len() + 2);
-            put_uvarint(&mut out, (body.len() as u64) << 1);
-            out.extend_from_slice(&body);
-            out
-        }
-        DetailMode::Full => {
-            let mut body = Vec::new();
-            for (&c, offs) in col_hits {
-                if c > 0 {
-                    body.push(0x01);
-                    put_uvarint(&mut body, c as u64);
-                }
-                let mut prev_off = 0usize;
-                for (k, &o) in offs.iter().enumerate() {
-                    if k == 0 {
-                        put_uvarint(&mut body, (o + 2) as u64);
-                    } else {
-                        put_uvarint(&mut body, (o - prev_off + 2) as u64);
-                    }
-                    prev_off = o;
-                }
-            }
-            let mut out = Vec::with_capacity(body.len() + 2);
-            put_uvarint(&mut out, (body.len() as u64) << 1);
-            out.extend_from_slice(&body);
-            out
-        }
-    }
-}
-
-/// True if a pending posting payload carries the delete flag: a pure delete (`01`, or `00`
-/// with detail=none) or an entry already marked by [`payload_with_delete_flag`].
-fn payload_has_delete_flag(detail: DetailMode, payload: &[u8]) -> bool {
-    match detail {
-        DetailMode::None => payload.first() == Some(&0x00),
-        DetailMode::Col | DetailMode::Full => {
-            // The size field is a varint; its last byte holds the low bits.
-            let mut i = 0;
-            while i < payload.len() && i < 8 && payload[i] & 0x80 != 0 {
-                i += 1;
-            }
-            payload.get(i).is_some_and(|b| b & 0x01 != 0)
-        }
-    }
-}
-
-/// `fts5HashAddPoslistSize` (fts5_hash.c): a row that is deleted and written again within
-/// one flush keeps the delete flag on its new entry - the size field becomes `nPos*2 + 1`,
-/// or with detail=none the entry is the two bytes `00 00`. The flag says "this entry hides
-/// an older one". C's secure-delete (`fts5DoSecureDelete`) depends on it: an entry without
-/// the flag is removed outright, an entry with it is turned into a delete marker, so a
-/// missing flag lets the older entry of the row reappear.
-fn payload_with_delete_flag(detail: DetailMode, payload: &[u8]) -> SmallBytes22 {
-    match detail {
-        DetailMode::None => {
-            if payload.is_empty() {
-                SmallBytes22::from_slice(&[0x00, 0x00])
-            } else {
-                SmallBytes22::from_slice(payload)
-            }
-        }
-        DetailMode::Col | DetailMode::Full => {
-            let mut v = payload.to_vec();
-            let mut i = 0;
-            while i < v.len() && i < 8 && v[i] & 0x80 != 0 {
-                i += 1;
-            }
-            if let Some(b) = v.get_mut(i) {
-                *b |= 0x01;
-            }
-            SmallBytes22::from_slice(&v)
-        }
-    }
-}
-
-fn encode_posting_payload(
-    detail: DetailMode,
-    deleted: bool,
-    col_hits: &BTreeMap<usize, Vec<usize>>,
-) -> Vec<u8> {
-    if deleted {
-        match detail {
-            DetailMode::None => vec![0x00],
-            DetailMode::Col | DetailMode::Full => vec![0x01],
-        }
-    } else {
-        encode_poslist(detail, col_hits)
-    }
-}
-
 fn decode_poslist_body(detail: DetailMode, body: &[u8]) -> Result<BTreeMap<usize, Vec<usize>>> {
-    let err_corrupt = || SqliteError::new(ErrorCode::Corrupt, "database disk image is malformed");
+    let err_corrupt =
+        || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
     let mut out: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     match detail {
         DetailMode::None => {
@@ -1985,504 +1807,30 @@ fn decode_poslist_body(detail: DetailMode, body: &[u8]) -> Result<BTreeMap<usize
     Ok(out)
 }
 
-type EncodedSegmentPages = (u64, Vec<(u64, Vec<u8>)>, Vec<(Vec<u8>, i64)>);
-
-fn decode_full_poslist_payload(
-    detail: DetailMode,
-    payload: &[u8],
-) -> Result<BTreeMap<usize, Vec<usize>>> {
-    if detail == DetailMode::None {
-        return decode_poslist_body(DetailMode::None, &[]);
-    }
-    let err_corrupt = || SqliteError::new(ErrorCode::Corrupt, "database disk image is malformed");
-    let mut pos = 0usize;
-    let _hdr = get_uvarint(payload, &mut pos).ok_or_else(err_corrupt)?;
-    decode_poslist_body(detail, &payload[pos..])
-}
-
-/// `fts5PoslistPrefix`: number of bytes of whole leading varints of `buf` that fit in
-/// `n_max` bytes (always at least the first varint).
-fn poslist_prefix_len(buf: &[u8], n_max: usize) -> usize {
-    let varint_len = |at: usize| -> usize {
-        let mut pos = at;
-        match get_uvarint(buf, &mut pos) {
-            Some(_) => pos - at,
-            None => buf.len() - at,
-        }
-    };
-    let mut ret = varint_len(0);
-    if ret < n_max {
-        while ret < buf.len() {
-            let i = varint_len(ret);
-            if ret + i > n_max {
-                break;
-            }
-            ret += i;
-        }
-    }
-    ret.max(1).min(buf.len())
-}
-
-fn encode_segment_pages_bytes<'a, I, D>(terms_iter: I) -> EncodedSegmentPages
-where
-    I: IntoIterator<Item = (&'a [u8], D)>,
-    D: IntoIterator<Item = (i64, &'a [u8])>,
-{
-    let mut pgno = 1u64;
-    let mut page_buf = Vec::with_capacity(FTS5_LEAF_TARGET_PGSZ + 256);
-    page_buf.extend_from_slice(&[0u8; 4]);
-    let mut pgidx = Vec::with_capacity(256);
-    let mut prev_pgidx_off = 0usize;
-    let mut prev_term_on_page: Vec<u8> = Vec::new();
-    let mut prev_term_in_seg: Vec<u8> = Vec::new();
-    let mut first_term_on_page = true;
-    let mut first_rowid_on_page = true;
-    let mut btterm: Option<(u64, Vec<u8>)> = Some((1, Vec::new()));
-    let mut leaves: Vec<(u64, Vec<u8>)> = Vec::new();
-    let mut idx_rows: Vec<(Vec<u8>, i64)> = Vec::new();
-
-    let flush_leaf = |page_buf: &mut Vec<u8>,
-                      pgidx: &mut Vec<u8>,
-                      prev_pgidx_off: &mut usize,
-                      prev_term_on_page: &mut Vec<u8>,
-                      pgno: &mut u64,
-                      first_term_on_page: &mut bool,
-                      first_rowid_on_page: &mut bool,
-                      leaves: &mut Vec<(u64, Vec<u8>)>| {
-        let footer_off = page_buf.len() as u16;
-        page_buf[2..4].copy_from_slice(&footer_off.to_be_bytes());
-        if !*first_term_on_page {
-            page_buf.extend_from_slice(pgidx);
-        }
-        let mut next_buf = Vec::with_capacity(FTS5_LEAF_TARGET_PGSZ + 256);
-        next_buf.extend_from_slice(&[0u8; 4]);
-        let finished = std::mem::replace(page_buf, next_buf);
-        leaves.push((*pgno, finished));
-        pgidx.clear();
-        *prev_pgidx_off = 0;
-        prev_term_on_page.clear();
-        *pgno += 1;
-        *first_term_on_page = true;
-        *first_rowid_on_page = true;
-    };
-
-    for (term, docs) in terms_iter {
-        if page_buf.len() + pgidx.len() + term.len() + 2 >= FTS5_LEAF_TARGET_PGSZ
-            && page_buf.len() > 4
-        {
-            flush_leaf(
-                &mut page_buf,
-                &mut pgidx,
-                &mut prev_pgidx_off,
-                &mut prev_term_on_page,
-                &mut pgno,
-                &mut first_term_on_page,
-                &mut first_rowid_on_page,
-                &mut leaves,
-            );
-        }
-
-        put_uvarint(&mut pgidx, (page_buf.len() - prev_pgidx_off) as u64);
-        prev_pgidx_off = page_buf.len();
-
-        if first_term_on_page {
-            if pgno != 1 {
-                if let Some((bt_pg, bt_key)) = btterm.take() {
-                    idx_rows.push((bt_key, (bt_pg as i64) << 1));
-                }
-                let split_len = if prev_term_in_seg.is_empty() {
-                    term.len()
-                } else {
-                    (1 + common_prefix_len(&prev_term_in_seg, term)).min(term.len())
-                };
-                btterm = Some((pgno, term[..split_len].to_vec()));
-            }
-            put_uvarint(&mut page_buf, term.len() as u64);
-            page_buf.extend_from_slice(term);
-        } else {
-            let n_prefix = common_prefix_len(&prev_term_on_page, term);
-            put_uvarint(&mut page_buf, n_prefix as u64);
-            put_uvarint(&mut page_buf, (term.len() - n_prefix) as u64);
-            page_buf.extend_from_slice(&term[n_prefix..]);
-        }
-
-        prev_term_on_page.clear();
-        prev_term_on_page.extend_from_slice(term);
-        prev_term_in_seg.clear();
-        prev_term_in_seg.extend_from_slice(term);
-        first_term_on_page = false;
-        first_rowid_on_page = false;
-
-        let mut first_rowid_in_doclist = true;
-        let mut prev_rowid = 0i64;
-
-        for (rowid, poslist) in docs {
-            if ((!first_rowid_in_doclist && page_buf.len() + pgidx.len() >= FTS5_LEAF_TARGET_PGSZ)
-                || page_buf.len() + pgidx.len() + 10 + poslist.len() >= 16_000)
-                && page_buf.len() > 4
-            {
-                flush_leaf(
-                    &mut page_buf,
-                    &mut pgidx,
-                    &mut prev_pgidx_off,
-                    &mut prev_term_on_page,
-                    &mut pgno,
-                    &mut first_term_on_page,
-                    &mut first_rowid_on_page,
-                    &mut leaves,
-                );
-            }
-            if first_rowid_on_page {
-                let roff = page_buf.len() as u16;
-                page_buf[0..2].copy_from_slice(&roff.to_be_bytes());
-            }
-            if first_rowid_in_doclist || first_rowid_on_page {
-                put_uvarint(&mut page_buf, rowid as u64);
-            } else {
-                put_uvarint(
-                    &mut page_buf,
-                    (rowid as u64).wrapping_sub(prev_rowid as u64),
-                );
-            }
-            prev_rowid = rowid;
-            first_rowid_in_doclist = false;
-            first_rowid_on_page = false;
-            if page_buf.len() + pgidx.len() + poslist.len() <= FTS5_LEAF_MAX_PGSZ {
-                page_buf.extend_from_slice(poslist);
-            } else {
-                // The position list does not fit on this leaf (`fts5FlushOneHash`): break it
-                // into sections, keeping every varint contiguous, and continue on term-less
-                // leaves. The 16-bit leaf header fields cannot describe a larger leaf.
-                let mut rest = poslist;
-                loop {
-                    let space = FTS5_LEAF_MAX_PGSZ.saturating_sub(page_buf.len() + pgidx.len());
-                    let n = if rest.len() <= space {
-                        rest.len()
-                    } else {
-                        poslist_prefix_len(rest, space)
-                    };
-                    page_buf.extend_from_slice(&rest[..n]);
-                    rest = &rest[n..];
-                    if rest.is_empty() {
-                        break;
-                    }
-                    flush_leaf(
-                        &mut page_buf,
-                        &mut pgidx,
-                        &mut prev_pgidx_off,
-                        &mut prev_term_on_page,
-                        &mut pgno,
-                        &mut first_term_on_page,
-                        &mut first_rowid_on_page,
-                        &mut leaves,
-                    );
-                }
-            }
-        }
-    }
-
-    if page_buf.len() > 4 {
-        flush_leaf(
-            &mut page_buf,
-            &mut pgidx,
-            &mut prev_pgidx_off,
-            &mut prev_term_on_page,
-            &mut pgno,
-            &mut first_term_on_page,
-            &mut first_rowid_on_page,
-            &mut leaves,
-        );
-    }
-    let pgno_last = pgno - 1;
-    if pgno_last >= 1
-        && let Some((bt_pg, bt_key)) = btterm.take()
-    {
-        idx_rows.push((bt_key, (bt_pg as i64) << 1));
-    }
-    (pgno_last, leaves, idx_rows)
-}
-
-fn encode_segment_pages_from_iter<'a, I, D>(
-    detail: DetailMode,
-    terms_iter: I,
-) -> EncodedSegmentPages
-where
-    I: IntoIterator<Item = (&'a [u8], D)>,
-    D: IntoIterator<Item = (i64, bool, &'a BTreeMap<usize, Vec<usize>>)>,
-{
-    let preencoded: Vec<_> = terms_iter
-        .into_iter()
-        .map(|(t, docs)| {
-            let enc_docs: Vec<(i64, Vec<u8>)> = docs
-                .into_iter()
-                .map(|(rid, del, ch)| (rid, encode_posting_payload(detail, del, ch)))
-                .collect();
-            (t, enc_docs)
-        })
-        .collect();
-    encode_segment_pages_bytes(
-        preencoded
-            .iter()
-            .map(|(t, docs)| (*t, docs.iter().map(|(rid, pl)| (*rid, pl.as_slice())))),
-    )
-}
-
-/// Writes `merged` into `<tbl>_data` and `<tbl>_idx` as a canonical C SQLite 3.54.1 FTS5 segment (`segid = 1`).
-fn write_c_fts5_index(
-    ctx: &mut dyn VTabHostContext,
-    db_q: &str,
-    tbl_name: &str,
-    cfg: &Fts5Config,
-    merged: &MergedIndexMap,
-    origin: Option<SegOrigin>,
-) -> Result<Vec<u8>> {
-    let data_shadow = format!("{tbl_name}_data");
-    let data_q = quote_ident(&data_shadow);
-    let idx_q = quote_ident(&format!("{tbl_name}_idx"));
-    let next_cookie = read_structure_cookie(ctx, &data_shadow).wrapping_add(1);
-
-    ctx.execute_sql(
-        &format!("DELETE FROM {db_q}.{data_q} WHERE id > {FTS5_STRUCTURE_ROWID}"),
-        &[],
-    )?;
-    ctx.execute_sql(&format!("DELETE FROM {db_q}.{idx_q}"), &[])?;
-
-    if merged.is_empty() {
-        let sblob = encode_empty_structure_record_with_cookie(cfg.contentless_delete, next_cookie);
-        ctx.shadow_put_rowid(
-            &data_shadow,
-            FTS5_STRUCTURE_ROWID,
-            &[
-                Value::Integer(FTS5_STRUCTURE_ROWID),
-                Value::Blob(sblob.clone()),
-            ],
-            true,
-        )?;
-        return Ok(sblob);
-    }
-
-    let segid = 1u64;
-    let (pgno_last, leaves, idx_rows) = encode_segment_pages_from_iter(
-        cfg.detail,
-        merged
-            .iter()
-            .map(|(t, docs)| (t.as_slice(), docs.iter().map(|(&rid, ch)| (rid, false, ch)))),
-    );
-
-    for (leaf_pgno, leaf_bytes) in leaves {
-        let lrid = fts5_segment_rowid(segid, leaf_pgno);
-        ctx.shadow_put_rowid(
-            &data_shadow,
-            lrid,
-            &[Value::Integer(lrid), Value::Blob(leaf_bytes)],
-            true,
-        )?;
-    }
-    let idx_ins_sql = format!("INSERT INTO {db_q}.{idx_q}(segid, term, pgno) VALUES(?1, ?2, ?3)");
-    for (bt_key, bt_pg_val) in idx_rows {
-        ctx.execute_sql(
-            &idx_ins_sql,
-            &[
-                Value::Integer(segid as i64),
-                Value::Blob(bt_key),
-                Value::Integer(bt_pg_val),
-            ],
-        )?;
-    }
-    let origin = if cfg.contentless_delete {
-        Some(origin.unwrap_or(SegOrigin {
-            origin1: 1,
-            origin2: 1,
-            n_entry: 0,
-        }))
-    } else {
-        None
-    };
-    let sblob =
-        encode_single_seg_structure_record_with_cookie(origin, next_cookie, segid, pgno_last);
-    ctx.shadow_put_rowid(
-        &data_shadow,
-        FTS5_STRUCTURE_ROWID,
-        &[
-            Value::Integer(FTS5_STRUCTURE_ROWID),
-            Value::Blob(sblob.clone()),
-        ],
-        true,
-    )?;
-    Ok(sblob)
-}
-
 #[derive(Debug, Clone)]
 struct Fts5SegRecord {
     segid: u64,
     pgno_first: u64,
     pgno_last: u64,
     n_tombstone_pages: u64,
-    origin1: u64,
-    origin2: u64,
-    n_entry_tombstone: u64,
-    n_entry: u64,
 }
 
-#[derive(Debug, Clone)]
-struct FullStructureRecord {
-    cookie: u32,
-    is_v2: bool,
-    write_counter: u64,
-    levels: Vec<(u64, Vec<Fts5SegRecord>)>,
-}
-
-impl FullStructureRecord {
-    fn total_segments(&self) -> usize {
-        self.levels.iter().map(|(_, s)| s.len()).sum()
-    }
-
-    fn max_segid(&self) -> u64 {
-        self.levels
-            .iter()
-            .flat_map(|(_, s)| s.iter().map(|r| r.segid))
-            .max()
-            .unwrap_or(0)
-    }
-
-    /// `Fts5Structure.nOriginCntr` of a V2 structure: the origin the next level-0 segment
-    /// gets (`fts5StructureDecode`: largest `iOrigin2` + 1).
-    fn origin_counter(&self) -> u64 {
-        self.levels
-            .iter()
-            .flat_map(|(_, s)| s.iter().map(|r| r.origin2))
-            .max()
-            .unwrap_or(0)
-            + 1
-    }
-
-    /// Smallest `iOrigin1` of any segment (`None` for an empty structure).
-    fn min_origin(&self) -> Option<u64> {
-        self.levels
-            .iter()
-            .flat_map(|(_, s)| s.iter().map(|r| r.origin1))
-            .min()
-    }
-
-    fn chronological_segments(&self) -> Vec<Fts5SegRecord> {
-        let mut chronological = Vec::with_capacity(self.total_segments());
-        for (_, lsegs) in self.levels.iter().rev() {
-            chronological.extend(lsegs.iter().cloned());
-        }
-        chronological
-    }
-
-    fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(32 + self.total_segments() * 12);
-        out.extend_from_slice(&self.cookie.to_be_bytes());
-        if self.is_v2 {
-            out.extend_from_slice(b"\xff\x00\x00\x01");
-        }
-        if self.levels.is_empty() || self.total_segments() == 0 {
-            out.extend_from_slice(&[0, 0, 0]);
-            return out;
-        }
-        put_uvarint(&mut out, self.levels.len() as u64);
-        put_uvarint(&mut out, self.total_segments() as u64);
-        put_uvarint(&mut out, self.write_counter);
-        for (n_merge, lsegs) in &self.levels {
-            put_uvarint(&mut out, *n_merge);
-            put_uvarint(&mut out, lsegs.len() as u64);
-            for seg in lsegs {
-                put_uvarint(&mut out, seg.segid);
-                put_uvarint(&mut out, seg.pgno_first);
-                put_uvarint(&mut out, seg.pgno_last);
-                if self.is_v2 {
-                    put_uvarint(&mut out, seg.origin1);
-                    put_uvarint(&mut out, seg.origin2);
-                    put_uvarint(&mut out, seg.n_tombstone_pages);
-                    put_uvarint(&mut out, seg.n_entry_tombstone);
-                    put_uvarint(&mut out, seg.n_entry);
-                }
-            }
-        }
-        out
-    }
-}
-
-fn decode_full_structure(blob: &[u8]) -> Result<FullStructureRecord> {
-    let err_corrupt = || SqliteError::new(ErrorCode::Corrupt, "database disk image is malformed");
-    if blob.len() < 7 {
-        return Err(err_corrupt());
-    }
-    let cookie = u32::from_be_bytes([blob[0], blob[1], blob[2], blob[3]]);
-    let is_v2 = blob.len() >= 11 && &blob[4..8] == b"\xff\x00\x00\x01";
-    let mut pos = if is_v2 { 8usize } else { 4usize };
-    let n_level = get_uvarint(blob, &mut pos).ok_or_else(err_corrupt)? as usize;
-    let _n_total_seg = get_uvarint(blob, &mut pos).ok_or_else(err_corrupt)?;
-    let write_counter = get_uvarint(blob, &mut pos).ok_or_else(err_corrupt)?;
-    if n_level > 128 {
-        return Err(err_corrupt());
-    }
-    let mut levels: Vec<(u64, Vec<Fts5SegRecord>)> = Vec::with_capacity(n_level);
-    for _ in 0..n_level {
-        let n_merge = get_uvarint(blob, &mut pos).ok_or_else(err_corrupt)?;
-        let n_seg = get_uvarint(blob, &mut pos).ok_or_else(err_corrupt)? as usize;
-        if n_seg > 65_536 {
-            return Err(err_corrupt());
-        }
-        let mut lsegs = Vec::with_capacity(n_seg);
-        for _ in 0..n_seg {
-            let segid = get_uvarint(blob, &mut pos).ok_or_else(err_corrupt)?;
-            let pgno_first = get_uvarint(blob, &mut pos).ok_or_else(err_corrupt)?;
-            let pgno_last = get_uvarint(blob, &mut pos).ok_or_else(err_corrupt)?;
-            // V2 (contentless_delete=1) segments carry five more varints
-            // (`fts5StructureDecode`): iOrigin1, iOrigin2, nPgTombstone, nEntryTombstone, nEntry.
-            let (origin1, origin2, n_tombstone_pages, n_entry_tombstone, n_entry) = if is_v2 {
-                let o1 = get_uvarint(blob, &mut pos).ok_or_else(err_corrupt)?;
-                let o2 = get_uvarint(blob, &mut pos).ok_or_else(err_corrupt)?;
-                let ntp = get_uvarint(blob, &mut pos).ok_or_else(err_corrupt)?;
-                let net = get_uvarint(blob, &mut pos).ok_or_else(err_corrupt)?;
-                let ne = get_uvarint(blob, &mut pos).ok_or_else(err_corrupt)?;
-                (o1, o2, ntp, net, ne)
-            } else {
-                (0, 0, 0, 0, 0)
-            };
-            lsegs.push(Fts5SegRecord {
-                segid,
-                pgno_first,
-                pgno_last,
-                n_tombstone_pages,
-                origin1,
-                origin2,
-                n_entry_tombstone,
-                n_entry,
+/// The segments of a structure record, oldest first (`fts5StructureDecode`; the levels
+/// from the last to the first, each level in its stored order).
+fn decode_structure_segments(blob: &[u8]) -> Result<Vec<Fts5SegRecord>> {
+    let (_, st) = crate::fts5_index::structure_decode(blob)?;
+    let mut out = Vec::with_capacity(st.n_segment.max(0) as usize);
+    for lvl in st.a_level.iter().rev() {
+        for seg in &lvl.a_seg {
+            out.push(Fts5SegRecord {
+                segid: seg.i_segid.max(0) as u64,
+                pgno_first: seg.pgno_first.max(0) as u64,
+                pgno_last: seg.pgno_last.max(0) as u64,
+                n_tombstone_pages: seg.n_pg_tombstone.max(0) as u64,
             });
         }
-        levels.push((n_merge, lsegs));
     }
-    if pos != blob.len() {
-        return Err(err_corrupt());
-    }
-    Ok(FullStructureRecord {
-        cookie,
-        is_v2,
-        write_counter,
-        levels,
-    })
-}
-
-fn read_full_structure(
-    ctx: &mut dyn VTabHostContext,
-    data_shadow: &str,
-) -> Result<FullStructureRecord> {
-    let srow = ctx.shadow_get_rowid(data_shadow, FTS5_STRUCTURE_ROWID)?;
-    let Some(Value::Blob(sblob)) = srow.as_ref().and_then(|r| r.get(1)) else {
-        return Err(SqliteError::new(
-            ErrorCode::Corrupt,
-            "database disk image is malformed",
-        ));
-    };
-    decode_full_structure(sblob)
-}
-
-fn decode_structure_segments(blob: &[u8]) -> Result<Vec<Fts5SegRecord>> {
-    Ok(decode_full_structure(blob)?.chronological_segments())
+    Ok(out)
 }
 
 fn load_segment_tombstones(
@@ -2491,7 +1839,8 @@ fn load_segment_tombstones(
     segid: u64,
     n_pages: u64,
 ) -> Result<BTreeSet<i64>> {
-    let err_corrupt = || SqliteError::new(ErrorCode::Corrupt, "database disk image is malformed");
+    let err_corrupt =
+        || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
     let mut out = BTreeSet::new();
     for ipg in 0..n_pages {
         let tid = fts5_tombstone_rowid(segid, ipg);
@@ -2540,7 +1889,7 @@ struct ParsedLeafPage {
 impl ParsedLeafPage {
     fn parse(raw: Vec<u8>, is_first_seg_page: bool) -> Result<Self> {
         let err_corrupt =
-            || SqliteError::new(ErrorCode::Corrupt, "database disk image is malformed");
+            || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
         if raw.len() < 4 {
             return Err(err_corrupt());
         }
@@ -2626,7 +1975,8 @@ fn parse_doclist_slice_on_block<F>(
 where
     F: FnMut(i64, bool, &[u8]) -> Result<()>,
 {
-    let err_corrupt = || SqliteError::new(ErrorCode::Corrupt, "database disk image is malformed");
+    let err_corrupt =
+        || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
     let mut pos = slice_start;
     if let Some((del, rem, mut pbuf)) = pending_poslist.take() {
         let avail = slice_end.saturating_sub(pos);
@@ -2700,24 +2050,12 @@ where
 /// Merges all active C SQLite 3.54.1 FTS5 segments in chronological order into `MergedIndexMap`.
 fn load_merged_index(
     ctx: &mut dyn VTabHostContext,
-    db_q: &str,
-    tbl_name: &str,
-    detail: DetailMode,
-) -> Result<MergedIndexMap> {
-    load_merged_index_with_deletes(ctx, db_q, tbl_name, detail, &[])
-}
-
-/// `load_merged_index` with additional tombstones: `(origin, rowid)` pairs hide `rowid` in
-/// every segment whose origin range contains `origin` (contentless_delete=1 deletes that
-/// are about to be applied).
-fn load_merged_index_with_deletes(
-    ctx: &mut dyn VTabHostContext,
     _db_q: &str,
     tbl_name: &str,
     detail: DetailMode,
-    origin_deletes: &[(u64, i64)],
 ) -> Result<MergedIndexMap> {
-    let err_corrupt = || SqliteError::new(ErrorCode::Corrupt, "database disk image is malformed");
+    let err_corrupt =
+        || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
     let data_shadow = format!("{tbl_name}_data");
     let srow = ctx.shadow_get_rowid(&data_shadow, FTS5_STRUCTURE_ROWID)?;
     let Some(Value::Blob(struct_blob)) = srow.as_ref().and_then(|r| r.get(1)) else {
@@ -2730,16 +2068,11 @@ fn load_merged_index_with_deletes(
         if seg.pgno_first == 0 || seg.pgno_last < seg.pgno_first {
             continue;
         }
-        let mut tombstones = if seg.n_tombstone_pages > 0 {
+        let tombstones = if seg.n_tombstone_pages > 0 {
             load_segment_tombstones(ctx, &data_shadow, seg.segid, seg.n_tombstone_pages)?
         } else {
             BTreeSet::new()
         };
-        for &(origin, rowid) in origin_deletes {
-            if seg.origin1 <= origin && origin <= seg.origin2 {
-                tombstones.insert(rowid);
-            }
-        }
 
         let mut cur_term: Option<Vec<u8>> = None;
         let mut cur_rowid: i64 = 0;
@@ -2826,13 +2159,6 @@ fn load_merged_index_with_deletes(
     Ok(merged)
 }
 
-fn make_term_key_bytes(prefix_slot: u8, term: &[u8]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(1 + term.len());
-    key.push(b'0' + prefix_slot);
-    key.extend_from_slice(term);
-    key
-}
-
 /// `sqlite3Fts5IndexCharlenToBytelen`: number of bytes taken by the first `n_char`
 /// characters of `p`, or 0 if `p` has fewer characters.
 fn charlen_to_bytelen(p: &[u8], n_char: usize) -> usize {
@@ -2867,268 +2193,6 @@ fn make_term_key(prefix_slot: u8, term: &str) -> Vec<u8> {
     key.push(b'0' + prefix_slot);
     key.extend_from_slice(term.as_bytes());
     key
-}
-
-fn build_doc_term_postings(
-    cfg: &Fts5Config,
-    col_vals: &[Value],
-    deleted: bool,
-) -> (DocTermPostings, Vec<u64>) {
-    let mut term_cols: HashMap<Vec<u8>, BTreeMap<usize, Vec<usize>>> = HashMap::new();
-    let mut col_sizes = vec![0u64; cfg.columns.len()];
-
-    for (col_idx, val) in col_vals.iter().enumerate().take(cfg.columns.len()) {
-        if cfg.unindexed[col_idx] {
-            continue;
-        }
-        let Some(text) = fts5_value_bytes(val) else {
-            continue;
-        };
-        let mut tok_pos = 0usize;
-        cfg.tokenizer.for_each_doc_token(&text, |term| {
-            let main_key = make_term_key_bytes(0, term);
-            record_posting_hit(
-                &mut term_cols,
-                main_key,
-                col_idx,
-                tok_pos,
-                cfg.detail,
-                deleted,
-            );
-            for (p_idx, &plen) in cfg.prefixes.iter().enumerate() {
-                let n_byte = charlen_to_bytelen(term, plen);
-                if n_byte > 0 {
-                    let p_key = make_term_key_bytes((p_idx + 1) as u8, &term[..n_byte]);
-                    record_posting_hit(
-                        &mut term_cols,
-                        p_key,
-                        col_idx,
-                        tok_pos,
-                        cfg.detail,
-                        deleted,
-                    );
-                }
-            }
-            tok_pos += 1;
-        });
-        col_sizes[col_idx] = tok_pos as u64;
-    }
-
-    (term_cols.into_iter().collect(), col_sizes)
-}
-
-fn record_posting_hit(
-    term_cols: &mut HashMap<Vec<u8>, BTreeMap<usize, Vec<usize>>>,
-    key: Vec<u8>,
-    col_idx: usize,
-    tok_pos: usize,
-    detail: DetailMode,
-    deleted: bool,
-) {
-    let by_col = term_cols.entry(key).or_default();
-    if deleted {
-        return;
-    }
-    match detail {
-        DetailMode::Full => {
-            by_col.entry(col_idx).or_default().push(tok_pos);
-        }
-        DetailMode::Col => {
-            by_col.entry(col_idx).or_default();
-        }
-        DetailMode::None => {
-            by_col.entry(0).or_default();
-        }
-    }
-}
-
-struct TermPosAcc {
-    last_col: u32,
-    last_off: u32,
-    has_any: bool,
-    inline_len: u8,
-    inline_buf: [u8; 22],
-    heap_body: Vec<u8>,
-}
-
-impl TermPosAcc {
-    #[inline]
-    fn new_active() -> Self {
-        Self {
-            last_col: 0,
-            last_off: 0,
-            has_any: false,
-            inline_len: 1,
-            inline_buf: [0u8; 22],
-            heap_body: Vec::new(),
-        }
-    }
-
-    #[inline]
-    fn push_bytes(&mut self, data: &[u8]) {
-        if self.inline_len > 0 {
-            let cur = self.inline_len as usize;
-            if cur + data.len() <= 22 {
-                self.inline_buf[cur..cur + data.len()].copy_from_slice(data);
-                self.inline_len = (cur + data.len()) as u8;
-                return;
-            }
-            self.heap_body.reserve((cur - 1 + data.len()).max(32));
-            self.heap_body.extend_from_slice(&self.inline_buf[1..cur]);
-            self.heap_body.extend_from_slice(data);
-            self.inline_len = 0;
-        } else {
-            self.heap_body.extend_from_slice(data);
-        }
-    }
-
-    #[inline]
-    fn push_byte(&mut self, b: u8) {
-        if self.inline_len > 0 && (self.inline_len as usize) < 22 {
-            self.inline_buf[self.inline_len as usize] = b;
-            self.inline_len += 1;
-        } else {
-            self.push_bytes(&[b]);
-        }
-    }
-
-    #[inline]
-    fn push_uvarint(&mut self, v: u64) {
-        if v < 0x80 && self.inline_len > 0 && (self.inline_len as usize) < 22 {
-            self.inline_buf[self.inline_len as usize] = v as u8;
-            self.inline_len += 1;
-            return;
-        }
-        let mut tmp = [0u8; 9];
-        let n = put_varint(&mut tmp, v);
-        self.push_bytes(&tmp[..n]);
-    }
-
-    #[inline]
-    fn record(&mut self, col_idx: u32, tok_pos: u32, detail: DetailMode, deleted: bool) {
-        if deleted || detail == DetailMode::None {
-            return;
-        }
-        match detail {
-            DetailMode::Col => {
-                if !self.has_any {
-                    self.push_uvarint(u64::from(col_idx) + 2);
-                    self.last_col = col_idx;
-                    self.has_any = true;
-                } else if col_idx > self.last_col {
-                    self.push_uvarint(u64::from(col_idx - self.last_col) + 2);
-                    self.last_col = col_idx;
-                }
-            }
-            DetailMode::Full => {
-                if !self.has_any {
-                    if col_idx > 0 {
-                        self.push_byte(0x01);
-                        self.push_uvarint(u64::from(col_idx));
-                    }
-                    self.push_uvarint(u64::from(tok_pos) + 2);
-                    self.last_col = col_idx;
-                    self.last_off = tok_pos;
-                    self.has_any = true;
-                } else if col_idx == self.last_col {
-                    self.push_uvarint(u64::from(tok_pos.saturating_sub(self.last_off)) + 2);
-                    self.last_off = tok_pos;
-                } else {
-                    self.push_byte(0x01);
-                    self.push_uvarint(u64::from(col_idx));
-                    self.push_uvarint(u64::from(tok_pos) + 2);
-                    self.last_col = col_idx;
-                    self.last_off = tok_pos;
-                }
-            }
-            DetailMode::None => {}
-        }
-    }
-
-    #[inline]
-    fn finish(mut self, detail: DetailMode, deleted: bool) -> SmallBytes22 {
-        if deleted {
-            return match detail {
-                DetailMode::None => SmallBytes22::from_slice(&[0x00]),
-                DetailMode::Col | DetailMode::Full => SmallBytes22::from_slice(&[0x01]),
-            };
-        }
-        if detail == DetailMode::None {
-            return SmallBytes22::empty();
-        }
-        if self.inline_len > 0 {
-            let body_len = (self.inline_len - 1) as usize;
-            self.inline_buf[0] = (body_len as u8) << 1;
-            SmallBytes22::Inline {
-                len: self.inline_len,
-                buf: self.inline_buf,
-            }
-        } else {
-            let mut out = Vec::with_capacity(self.heap_body.len() + 3);
-            put_uvarint(&mut out, (self.heap_body.len() as u64) << 1);
-            out.extend_from_slice(&self.heap_body);
-            SmallBytes22::Heap(out.into_boxed_slice())
-        }
-    }
-}
-
-fn build_doc_term_encoded_postings(
-    cfg: &Fts5Config,
-    col_vals: &[Value],
-    deleted: bool,
-) -> (EncodedDocTerms, Vec<u64>) {
-    let mut term_acc: HashMap<SmallBytes22, TermPosAcc> = HashMap::with_capacity(16);
-    let mut col_sizes = vec![0u64; cfg.columns.len()];
-    let mut key_buf: Vec<u8> = Vec::with_capacity(32);
-
-    let hit_key = |term_acc: &mut HashMap<SmallBytes22, TermPosAcc>,
-                   key_slice: &[u8],
-                   col_u32: u32,
-                   tok_u32: u32| {
-        if let Some(acc) = term_acc.get_mut(key_slice) {
-            acc.record(col_u32, tok_u32, cfg.detail, deleted);
-        } else {
-            let mut acc = TermPosAcc::new_active();
-            acc.record(col_u32, tok_u32, cfg.detail, deleted);
-            term_acc.insert(SmallBytes22::from_slice(key_slice), acc);
-        }
-    };
-
-    for (col_idx, val) in col_vals.iter().enumerate().take(cfg.columns.len()) {
-        if cfg.unindexed[col_idx] {
-            continue;
-        }
-        let Some(text) = fts5_value_bytes(val) else {
-            continue;
-        };
-        let col_u32 = col_idx as u32;
-        let mut tok_pos = 0u32;
-        cfg.tokenizer.for_each_doc_token(&text, |term| {
-            key_buf.clear();
-            key_buf.push(b'0');
-            key_buf.extend_from_slice(term);
-            hit_key(&mut term_acc, &key_buf, col_u32, tok_pos);
-
-            // `sqlite3Fts5IndexWrite`: one entry per prefix index the token is long enough for.
-            for (p_idx, &plen) in cfg.prefixes.iter().enumerate() {
-                let n_byte = charlen_to_bytelen(term, plen);
-                if n_byte > 0 {
-                    key_buf.clear();
-                    key_buf.push(b'0'.wrapping_add((p_idx + 1) as u8));
-                    key_buf.extend_from_slice(&term[..n_byte]);
-                    hit_key(&mut term_acc, &key_buf, col_u32, tok_pos);
-                }
-            }
-            tok_pos += 1;
-        });
-        col_sizes[col_idx] = u64::from(tok_pos);
-    }
-
-    let encoded: EncodedDocTerms = term_acc
-        .into_iter()
-        .map(|(k, acc)| (k, acc.finish(cfg.detail, deleted)))
-        .collect();
-    (encoded, col_sizes)
 }
 
 // ============================================================================
@@ -3963,7 +3027,8 @@ impl DocColHits {
 type TermPostings = Vec<(i64, DocColHits)>;
 
 fn decode_poslist_body_compact(detail: DetailMode, body: &[u8]) -> Result<DocColHits> {
-    let err_corrupt = || SqliteError::new(ErrorCode::Corrupt, "database disk image is malformed");
+    let err_corrupt =
+        || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
     let mut out = DocColHits::new();
     match detail {
         DetailMode::None => {
@@ -4522,10 +3587,6 @@ fn populate_instances_from_text(
 // `Fts5Module`, `Fts5SharedState`, & `Fts5Table`
 // ============================================================================
 
-const FTS5_PENDING_MAX_BYTES: usize = 4 * 1024 * 1024;
-const FTS5_PENDING_MAX_OPS: usize = 16_384;
-const FTS5_MAX_SEGMENTS_BEFORE_COMPACT: usize = 15;
-
 #[derive(Debug, Clone)]
 struct Fts5ShadowNames {
     table_name: String,
@@ -4549,64 +3610,6 @@ impl Fts5ShadowNames {
     }
 }
 
-#[derive(Debug, Clone)]
-enum PendingOp {
-    DocPostings {
-        rowid: i64,
-        is_delete: bool,
-        col_sizes: Vec<u64>,
-        doc_terms: EncodedDocTerms,
-    },
-    ContentlessRowidDelete {
-        rowid: i64,
-        old_col_sizes: Vec<u64>,
-        had_docsize: bool,
-        /// The origin recorded in the row's %_docsize record: only segments whose origin
-        /// range contains it lose the row (`sqlite3Fts5IndexContentlessDelete`).
-        origin: u64,
-    },
-}
-
-impl PendingOp {
-    fn approx_mem_bytes(&self) -> usize {
-        match self {
-            Self::DocPostings {
-                col_sizes,
-                doc_terms,
-                ..
-            } => {
-                let terms_sz: usize = doc_terms.iter().map(|(k, p)| 48 + k.len() + p.len()).sum();
-                64 + col_sizes.len() * 8 + terms_sz
-            }
-            Self::ContentlessRowidDelete { old_col_sizes, .. } => 64 + old_col_sizes.len() * 8,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct PendingSavepoint {
-    idx: usize,
-    ops_len: usize,
-    approx_bytes: usize,
-    flushed_since: bool,
-    flushed_pre_ops: Option<Vec<PendingOp>>,
-}
-
-#[derive(Debug, Default)]
-struct Fts5PendingBuffer {
-    ops: Vec<PendingOp>,
-    approx_bytes: usize,
-    savepoints: Vec<PendingSavepoint>,
-}
-
-impl Fts5PendingBuffer {
-    fn clear(&mut self) {
-        self.ops.clear();
-        self.approx_bytes = 0;
-        self.savepoints.clear();
-    }
-}
-
 type SegIdxEntries = Vec<(Vec<u8>, u64)>;
 
 const FTS5_EXACT_TERM_CACHE_MAX: usize = 4096;
@@ -4617,8 +3620,6 @@ struct Fts5ReadCache {
     structure_blob: Option<Vec<u8>>,
     segments: Vec<Fts5SegRecord>,
     averages: Option<Vec<u64>>,
-    configured_rank_weights: Option<Vec<f64>>,
-    secure_delete: Option<bool>,
     seg_tombstones: HashMap<u64, Arc<BTreeSet<i64>>>,
     seg_idx: HashMap<u64, Arc<SegIdxEntries>>,
     leaf_pages: HashMap<(u64, u64), Arc<ParsedLeafPage>>,
@@ -4677,15 +3678,7 @@ impl Fts5ReadCache {
     }
 
     fn clear_all(&mut self) {
-        self.structure_blob = None;
-        self.segments.clear();
-        self.averages = None;
-        self.configured_rank_weights = None;
-        self.secure_delete = None;
-        self.seg_tombstones.clear();
-        self.seg_idx.clear();
-        self.leaf_pages.clear();
-        self.exact_terms.clear();
+        self.clear_segment_maps();
         self.clear_docsize();
     }
 
@@ -4700,25 +3693,102 @@ impl Fts5ReadCache {
     }
 }
 
+/// The state of one FTS5 table: C's `Fts5Index` (pending-terms hash, cached structure,
+/// configuration), the totals of `Fts5Storage`, `Fts5FullTable.iSavepoint` and the read
+/// caches of this implementation.
 #[derive(Debug)]
 struct Fts5SharedState {
     shadows: Fts5ShadowNames,
-    in_tx: bool,
-    pending: Fts5PendingBuffer,
+    index: Fts5Index,
+    /// `Fts5Storage.bTotalsValid` / `nTotalRow` / `aTotalSize`.
+    b_totals_valid: bool,
+    n_total_row: i64,
+    a_total_size: Vec<i64>,
+    /// `Fts5FullTable.iSavepoint`.
+    i_savepoint: i64,
     read_cache: Fts5ReadCache,
+    /// Value of `Fts5Index::write_gen` the read cache was filled at.
+    read_gen: u64,
+    docsize_hint: ShadowHint,
+    /// What parameter 3 (`origin`) of the module's cached `REPLACE INTO %_docsize VALUES(?,?,?)`
+    /// statement is bound to. `fts5StorageInsertDocsize` binds it, `fts5StorageNewRowid` binds
+    /// only parameters 1 and 2 to NULL — the placeholder row it writes carries the origin of
+    /// the previous docsize row (`sqlite3_reset` keeps bindings); NULL until the first one.
+    docsize_origin_binding: Option<i64>,
+    content_hint: ShadowHint,
+    sql_replace_docsize3: String,
+    sql_replace_config: String,
+    sql_insert_content: String,
+    sql_replace_content: String,
+}
+
+fn index_detail(d: DetailMode) -> IndexDetail {
+    match d {
+        DetailMode::Full => IndexDetail::Full,
+        DetailMode::Col => IndexDetail::Columns,
+        DetailMode::None => IndexDetail::None,
+    }
 }
 
 impl Fts5SharedState {
-    fn new(tbl_name: &str) -> Self {
-        Self {
+    fn new(db_name: &str, tbl_name: &str, cfg: &Fts5Config) -> Self {
+        let icfg = IndexConfig::new(
+            index_detail(cfg.detail),
+            cfg.prefixes.clone(),
+            cfg.contentless_delete,
+            cfg.columns.len(),
+        );
+        let mut st = Self {
             shadows: Fts5ShadowNames::new(tbl_name),
-            in_tx: false,
-            pending: Fts5PendingBuffer::default(),
+            index: Fts5Index::new(db_name, tbl_name, icfg),
+            b_totals_valid: false,
+            n_total_row: 0,
+            a_total_size: vec![0; cfg.columns.len()],
+            i_savepoint: 0,
             read_cache: Fts5ReadCache::default(),
-        }
+            read_gen: 0,
+            docsize_hint: ShadowHint::NONE,
+            docsize_origin_binding: None,
+            content_hint: ShadowHint::NONE,
+            sql_replace_docsize3: String::new(),
+            sql_replace_config: String::new(),
+            sql_insert_content: String::new(),
+            sql_replace_content: String::new(),
+        };
+        st.set_names(db_name, tbl_name, cfg);
+        st
+    }
+
+    /// The statement texts of `Fts5Storage` (`fts5StorageGetStmt`).
+    fn set_names(&mut self, db_name: &str, tbl_name: &str, cfg: &Fts5Config) {
+        self.shadows = Fts5ShadowNames::new(tbl_name);
+        self.index.set_names(db_name, tbl_name);
+        self.docsize_hint = ShadowHint::NONE;
+        self.content_hint = ShadowHint::NONE;
+        // (a renamed table is connected anew: its statements are prepared afresh)
+        self.docsize_origin_binding = None;
+        let db_q = quote_ident(db_name);
+        let docsize_q = quote_ident(&self.shadows.docsize);
+        let config_q = quote_ident(&self.shadows.config);
+        let content_q = quote_ident(&self.shadows.content);
+        self.sql_replace_docsize3 = format!("REPLACE INTO {db_q}.{docsize_q} VALUES(?,?,?)");
+        self.sql_replace_config = format!("REPLACE INTO {db_q}.{config_q} VALUES(?,?)");
+        let n_content = cfg
+            .content_row(0, &vec![Value::Null; cfg.columns.len()])
+            .len();
+        let binds: Vec<String> = (1..=n_content).map(|i| format!("?{i}")).collect();
+        let binds = binds.join(",");
+        self.sql_insert_content = format!("INSERT INTO {db_q}.{content_q} VALUES({binds})");
+        self.sql_replace_content = format!("REPLACE INTO {db_q}.{content_q} VALUES({binds})");
     }
 
     fn ensure_structure_coherent(&mut self, ctx: &mut dyn VTabHostContext) -> Result<()> {
+        // Anything the index wrote since the cache was filled (leaves edited in place,
+        // tombstone pages, merges) makes the cached pages stale.
+        if self.read_gen != self.index.write_gen {
+            self.read_cache.clear_segment_maps();
+            self.read_gen = self.index.write_gen;
+        }
         if let Some(ref cur_sblob) = self.read_cache.structure_blob
             && ctx.shadow_rowid_blob_eq(&self.shadows.data, FTS5_STRUCTURE_ROWID, 1, cur_sblob)?
                 == Some(true)
@@ -4726,7 +3796,7 @@ impl Fts5SharedState {
             return Ok(());
         }
         let err_corrupt =
-            || SqliteError::new(ErrorCode::Corrupt, "database disk image is malformed");
+            || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
         let srow = ctx.shadow_get_rowid(&self.shadows.data, FTS5_STRUCTURE_ROWID)?;
         let Some(Value::Blob(sblob)) = srow.and_then(|mut r| {
             if r.len() >= 2 {
@@ -4747,123 +3817,95 @@ impl Fts5SharedState {
         Ok(())
     }
 
-    /// Drops the pending operations before the index is re-initialised (`'delete-all'`,
-    /// `'rebuild'`; `fts5IndexDiscardData`), keeping what open savepoints need to restore.
-    fn discard_pending_for_reset(&mut self) {
-        for sp in &mut self.pending.savepoints {
-            if sp.flushed_pre_ops.is_none() && sp.ops_len > 0 {
-                sp.flushed_pre_ops = Some(self.pending.ops[..sp.ops_len].to_vec());
-            }
-            sp.flushed_since = true;
-        }
-        self.pending.ops.clear();
-        self.pending.approx_bytes = 0;
-    }
-
-    /// The row count and per-column token totals as of now: the averages record plus the
-    /// operations that are still pending (`Fts5Storage.nTotalRow` / `aTotalSize`).
-    fn current_totals(
-        &mut self,
-        cfg: &Fts5Config,
-        ctx: &mut dyn VTabHostContext,
-    ) -> Result<Vec<i64>> {
-        let mut totals: Vec<i64> = self
-            .read_averages(cfg, ctx)?
-            .into_iter()
-            .map(|v| v as i64)
-            .collect();
-        for op in &self.pending.ops {
-            match op {
-                PendingOp::DocPostings {
-                    is_delete,
-                    col_sizes,
-                    ..
-                } => {
-                    let sign = if *is_delete { -1 } else { 1 };
-                    totals[0] += sign;
-                    for (i, &sz) in col_sizes.iter().enumerate() {
-                        totals[1 + i] += sign * sz as i64;
-                    }
-                }
-                PendingOp::ContentlessRowidDelete {
-                    old_col_sizes,
-                    had_docsize,
-                    ..
-                } => {
-                    for (i, &sz) in old_col_sizes.iter().enumerate() {
-                        totals[1 + i] -= sz as i64;
-                    }
-                    if *had_docsize {
-                        totals[0] -= 1;
-                    }
-                }
-            }
-        }
-        Ok(totals)
-    }
-
-    /// `sqlite3Fts5IndexSetCookie`: rewrites the structure record with the cookie
-    /// incremented (done after every configuration change).
-    fn bump_structure_cookie(&mut self, ctx: &mut dyn VTabHostContext) -> Result<()> {
-        let srow = ctx.shadow_get_rowid(&self.shadows.data, FTS5_STRUCTURE_ROWID)?;
-        let Some(Value::Blob(mut blob)) = srow.and_then(|mut r| {
-            if r.len() >= 2 {
-                Some(r.swap_remove(1))
-            } else {
-                None
-            }
-        }) else {
-            return Err(SqliteError::new(
-                ErrorCode::Corrupt,
-                "database disk image is malformed",
-            ));
-        };
-        if blob.len() < 4 {
-            return Err(SqliteError::new(
-                ErrorCode::Corrupt,
-                "database disk image is malformed",
-            ));
-        }
-        let coherent = self.read_cache.structure_blob.as_deref() == Some(blob.as_slice());
-        let cookie = u32::from_be_bytes([blob[0], blob[1], blob[2], blob[3]]).wrapping_add(1);
-        blob[..4].copy_from_slice(&cookie.to_be_bytes());
-        ctx.shadow_put_rowid(
-            &self.shadows.data,
-            FTS5_STRUCTURE_ROWID,
-            &[
-                Value::Integer(FTS5_STRUCTURE_ROWID),
-                Value::Blob(blob.clone()),
-            ],
-            true,
-        )?;
-        if coherent {
-            self.read_cache.structure_blob = Some(blob);
+    /// `fts5StorageLoadTotals(p, 1)`.
+    fn load_totals(&mut self, ctx: &mut dyn VTabHostContext) -> Result<()> {
+        if !self.b_totals_valid {
+            let (n_row, sizes) = self.index.get_averages(ctx)?;
+            self.n_total_row = n_row;
+            self.a_total_size = sizes;
+            self.b_totals_valid = true;
         }
         Ok(())
     }
 
-    /// `sqlite3Fts5IndexGetOrigin`: the origin value the next level-0 segment will get.
-    fn current_origin_counter(&mut self, ctx: &mut dyn VTabHostContext) -> Result<u64> {
-        self.ensure_structure_coherent(ctx)?;
-        Ok(self
-            .read_cache
-            .segments
-            .iter()
-            .map(|s| s.origin2)
-            .max()
-            .unwrap_or(0)
-            + 1)
+    /// `fts5StorageSaveTotals`.
+    fn save_totals(&mut self, ctx: &mut dyn VTabHostContext) -> Result<()> {
+        let mut buf: Vec<u8> = Vec::with_capacity(16);
+        fts5_put_varint(&mut buf, self.n_total_row as u64);
+        for &sz in &self.a_total_size {
+            fts5_put_varint(&mut buf, sz as u64);
+        }
+        self.read_cache.averages = None;
+        self.index.set_averages(ctx, &buf)
     }
 
+    /// `sqlite3Fts5StorageSync`.
+    fn storage_sync(&mut self, ctx: &mut dyn VTabHostContext) -> Result<()> {
+        let i_last_rowid = ctx.last_insert_rowid();
+        let mut res = Ok(());
+        if self.b_totals_valid {
+            res = self.save_totals(ctx);
+            if res.is_ok() {
+                self.b_totals_valid = false;
+            }
+        }
+        if res.is_ok() {
+            res = self.index.sync(ctx);
+        }
+        ctx.set_last_insert_rowid(i_last_rowid);
+        res
+    }
+
+    /// `sqlite3Fts5StorageRollback`.
+    fn storage_rollback(&mut self) {
+        self.b_totals_valid = false;
+        self.index.rollback();
+        self.read_cache.clear_all();
+    }
+
+    /// `sqlite3Fts5StorageConfigValue`.
+    fn storage_config_value(
+        &mut self,
+        ctx: &mut dyn VTabHostContext,
+        key: &str,
+        val: Option<&Value>,
+        i_val: i64,
+    ) -> Result<()> {
+        let bound = match val {
+            Some(v) => v.clone(),
+            None => Value::Integer(i_val),
+        };
+        ctx.execute_sql_counted(
+            &self.sql_replace_config,
+            &[Value::Text(key.to_owned()), bound],
+        )?;
+        if val.is_some() {
+            let i_new = self.index.config.i_cookie.wrapping_add(1);
+            self.index.set_cookie(ctx, i_new)?;
+            self.index.config.i_cookie = i_new;
+        }
+        Ok(())
+    }
+
+    /// The row count and per-column token totals as queries see them
+    /// (`fts5StorageLoadTotals(p, 0)`): the totals of the open transaction when it has
+    /// written, the averages record otherwise.
     fn read_averages(
         &mut self,
         cfg: &Fts5Config,
         ctx: &mut dyn VTabHostContext,
     ) -> Result<Vec<u64>> {
+        let n_expected = 1 + cfg.columns.len();
+        if self.b_totals_valid {
+            let mut out = Vec::with_capacity(n_expected);
+            out.push(self.n_total_row as u64);
+            out.extend(self.a_total_size.iter().map(|&v| v as u64));
+            out.resize(n_expected, 0);
+            return Ok(out);
+        }
         if let Some(ref avgs) = self.read_cache.averages {
             return Ok(avgs.clone());
         }
-        let n_expected = 1 + cfg.columns.len();
         let row = ctx.shadow_get_rowid(&self.shadows.data, FTS5_AVERAGES_ROWID)?;
         let avgs = if let Some(Value::Blob(b)) = row.as_ref().and_then(|r| r.get(1))
             && let Some(mut list) = decode_varint_list(b)
@@ -4877,419 +3919,53 @@ impl Fts5SharedState {
         Ok(avgs)
     }
 
-    fn write_averages(&mut self, ctx: &mut dyn VTabHostContext, avgs: &[u64]) -> Result<()> {
-        ctx.shadow_put_rowid(
-            &self.shadows.data,
-            FTS5_AVERAGES_ROWID,
-            &[
-                Value::Integer(FTS5_AVERAGES_ROWID),
-                Value::Blob(encode_varint_list(avgs)),
-            ],
-            true,
-        )?;
-        self.read_cache.averages = Some(avgs.to_vec());
-        Ok(())
-    }
-
-    fn is_secure_delete_enabled(&mut self, ctx: &mut dyn VTabHostContext) -> Result<bool> {
-        if let Some(sd) = self.read_cache.secure_delete {
-            return Ok(sd);
-        }
-        let db_q = quote_ident(ctx.db_name());
-        let config_q = quote_ident(&self.shadows.config);
-        let rows = ctx.query_sql(
-            &format!("SELECT v FROM {db_q}.{config_q} WHERE k = 'secure-delete'"),
-            &[],
-        )?;
-        let enabled = rows
-            .first()
-            .and_then(|r| r.first())
-            .is_some_and(|v| v.to_integer_lossy() != 0);
-        self.read_cache.secure_delete = Some(enabled);
-        Ok(enabled)
-    }
-
+    /// The weights of the configured `rank` function (`Fts5Config.zRankArgs`).
     fn get_configured_rank_weights(&mut self, ctx: &mut dyn VTabHostContext) -> Result<Vec<f64>> {
-        if let Some(ref w) = self.read_cache.configured_rank_weights {
-            return Ok(w.clone());
+        self.index.load_config(ctx)?;
+        match self.index.config.rank.as_deref() {
+            Some(s) => parse_rank_expression(s),
+            None => Ok(Vec::new()),
         }
-        let db_q = quote_ident(ctx.db_name());
-        let config_q = quote_ident(&self.shadows.config);
-        let rows = ctx.query_sql(
-            &format!("SELECT v FROM {db_q}.{config_q} WHERE k = 'rank'"),
-            &[],
-        )?;
-        let weights = if let Some(Value::Text(s)) = rows.first().and_then(|r| r.first()) {
-            parse_rank_expression(s)?
-        } else {
-            Vec::new()
-        };
-        self.read_cache.configured_rank_weights = Some(weights.clone());
-        Ok(weights)
     }
 
-    fn flush_pending_via_compaction(
-        &mut self,
-        cfg: &Fts5Config,
-        ctx: &mut dyn VTabHostContext,
-        ops: Vec<PendingOp>,
+    /// Applies the pending doclist of a key (`fts5SegIterHashInit`: the hash is the newest
+    /// source of a query) on top of the postings read from the segments.
+    fn apply_hash_doclist(
+        detail: DetailMode,
+        doclist: &[u8],
+        mut apply: impl FnMut(i64, bool, &[u8]) -> Result<()>,
     ) -> Result<()> {
-        let db_q = quote_ident(ctx.db_name());
-        // contentless_delete=1: the rewritten segment covers the origins of every segment it
-        // replaces plus, when this flush adds documents, the origin those documents were
-        // given in %_docsize (the current origin counter, see `current_origin_counter`).
-        let prev_struct = if cfg.contentless_delete {
-            Some(read_full_structure(ctx, &self.shadows.data)?)
-        } else {
-            None
-        };
-        let origin_cntr = prev_struct
-            .as_ref()
-            .map_or(0, FullStructureRecord::origin_counter);
-        // A contentless delete hides the row in the segments whose origin range holds the
-        // origin of its %_docsize record; rows of this flush carry the current counter.
-        let origin_deletes: Vec<(u64, i64)> = ops
-            .iter()
-            .filter_map(|op| match op {
-                PendingOp::ContentlessRowidDelete {
-                    rowid,
-                    had_docsize: true,
-                    origin,
-                    ..
-                } if *origin != origin_cntr => Some((*origin, *rowid)),
-                _ => None,
-            })
-            .collect();
-        let mut merged = load_merged_index_with_deletes(
-            ctx,
-            &db_q,
-            &self.shadows.table_name,
-            cfg.detail,
-            &origin_deletes,
-        )?;
-        let mut avgs = self.read_averages(cfg, ctx)?;
-        let has_inserts = ops.iter().any(|op| {
-            matches!(
-                op,
-                PendingOp::DocPostings {
-                    is_delete: false,
-                    ..
-                }
-            )
-        });
-
-        // The entries written by this flush, applied on top of the stored segments below.
-        let mut flushed: MergedIndexMap = BTreeMap::new();
-        for op in ops {
-            match op {
-                PendingOp::DocPostings {
-                    rowid,
-                    is_delete,
-                    col_sizes,
-                    doc_terms,
-                } => {
-                    for (term, poslist) in doc_terms {
-                        let key = term.as_slice().to_vec();
-                        if is_delete {
-                            if let Some(entry) = merged.get_mut(&key) {
-                                entry.remove(&rowid);
-                            }
-                            if let Some(entry) = flushed.get_mut(&key) {
-                                entry.remove(&rowid);
-                            }
-                        } else {
-                            let col_hits =
-                                decode_full_poslist_payload(cfg.detail, poslist.as_slice())?;
-                            flushed.entry(key).or_default().insert(rowid, col_hits);
-                        }
-                    }
-                    if is_delete {
-                        avgs[0] = avgs[0].saturating_sub(1);
-                        for (i, &sz) in col_sizes.iter().enumerate() {
-                            avgs[1 + i] = avgs[1 + i].saturating_sub(sz);
-                        }
+        let n = doclist.len();
+        let mut i_off = 0usize;
+        let mut rowid: i64 = 0;
+        while i_off < n {
+            let (delta, nb) = fts5_get_varint(doclist, i_off);
+            i_off += nb;
+            rowid = rowid.wrapping_add(delta as i64);
+            if detail == DetailMode::None {
+                // `00` = delete marker, `00 00` = deleted and inserted again.
+                let mut del = false;
+                let mut content = true;
+                if i_off < n && doclist[i_off] == 0 {
+                    del = true;
+                    i_off += 1;
+                    if i_off < n && doclist[i_off] == 0 {
+                        i_off += 1;
                     } else {
-                        avgs[0] = avgs[0].saturating_add(1);
-                        for (i, &sz) in col_sizes.iter().enumerate() {
-                            avgs[1 + i] = avgs[1 + i].saturating_add(sz);
-                        }
+                        content = false;
                     }
                 }
-                PendingOp::ContentlessRowidDelete {
-                    rowid,
-                    old_col_sizes,
-                    had_docsize,
-                    origin,
-                } => {
-                    // `fts5StorageContentlessDelete`: the column totals always shrink; the
-                    // row itself is removed when its %_docsize record names an origin.
-                    for (i, &sz) in old_col_sizes.iter().enumerate() {
-                        avgs[1 + i] = avgs[1 + i].saturating_sub(sz);
-                    }
-                    if had_docsize {
-                        if origin == origin_cntr {
-                            for docs in flushed.values_mut() {
-                                docs.remove(&rowid);
-                            }
-                        }
-                        avgs[0] = avgs[0].saturating_sub(1);
-                    }
-                }
-            }
-        }
-        for (term, docs) in flushed {
-            let entry = merged.entry(term).or_default();
-            for (rowid, hits) in docs {
-                entry.insert(rowid, hits);
-            }
-        }
-        merged.retain(|_, docs| !docs.is_empty());
-        let origin = prev_struct.map(|ps| {
-            let cntr = origin_cntr;
-            let origin1 = ps.min_origin().unwrap_or(cntr);
-            let origin2 = if has_inserts {
-                cntr
+                let _ = del;
+                apply(rowid, !content, &[])?;
             } else {
-                (cntr - 1).max(origin1)
-            };
-            SegOrigin {
-                origin1,
-                origin2,
-                n_entry: avgs[0],
-            }
-        });
-        let sblob = write_c_fts5_index(ctx, &db_q, &self.shadows.table_name, cfg, &merged, origin)?;
-        let segs = decode_structure_segments(&sblob)?;
-        self.write_averages(ctx, &avgs)?;
-        self.read_cache.clear_segment_maps();
-        self.read_cache.structure_blob = Some(sblob);
-        self.read_cache.segments = segs;
-        self.read_cache.averages = Some(avgs);
-        Ok(())
-    }
-
-    fn flush_pending(&mut self, cfg: &Fts5Config, ctx: &mut dyn VTabHostContext) -> Result<()> {
-        if self.pending.ops.is_empty() {
-            return Ok(());
-        }
-        for sp in &mut self.pending.savepoints {
-            if sp.flushed_pre_ops.is_none() && sp.ops_len > 0 {
-                sp.flushed_pre_ops = Some(self.pending.ops[..sp.ops_len].to_vec());
-            }
-            sp.flushed_since = true;
-        }
-        let ops = std::mem::take(&mut self.pending.ops);
-        self.pending.approx_bytes = 0;
-
-        let mut has_contentless_rowid_del = false;
-        let mut has_any_delete = false;
-        for op in &ops {
-            match op {
-                PendingOp::ContentlessRowidDelete { .. } => {
-                    has_contentless_rowid_del = true;
-                    has_any_delete = true;
-                }
-                PendingOp::DocPostings { is_delete, .. } => {
-                    if *is_delete {
-                        has_any_delete = true;
-                    }
-                }
+                let (n_sz, nb) = fts5_get_varint32(doclist, i_off);
+                i_off += nb;
+                let n_pos = (n_sz / 2).max(0) as usize;
+                let end = (i_off + n_pos).min(n);
+                apply(rowid, n_pos == 0, &doclist[i_off..end])?;
+                i_off = end;
             }
         }
-
-        if has_contentless_rowid_del || (has_any_delete && self.is_secure_delete_enabled(ctx)?) {
-            return self.flush_pending_via_compaction(cfg, ctx, ops);
-        }
-
-        let err_corrupt =
-            || SqliteError::new(ErrorCode::Corrupt, "database disk image is malformed");
-        let srow = ctx.shadow_get_rowid(&self.shadows.data, FTS5_STRUCTURE_ROWID)?;
-        let Some(Value::Blob(prev_sblob)) = srow.and_then(|mut r| {
-            if r.len() >= 2 {
-                Some(r.swap_remove(1))
-            } else {
-                None
-            }
-        }) else {
-            return Err(err_corrupt());
-        };
-        let mut full_struct = decode_full_structure(&prev_sblob)?;
-        if full_struct.total_segments() >= FTS5_MAX_SEGMENTS_BEFORE_COMPACT {
-            return self.flush_pending_via_compaction(cfg, ctx, ops);
-        }
-
-        let cache_was_coherent =
-            self.read_cache.structure_blob.as_deref() == Some(prev_sblob.as_slice());
-        if !cache_was_coherent {
-            self.read_cache.clear_segment_maps();
-        }
-
-        let mut avgs = self.read_averages(cfg, ctx)?;
-        let n_inserted_rows = ops
-            .iter()
-            .filter(|op| {
-                matches!(
-                    op,
-                    PendingOp::DocPostings {
-                        is_delete: false,
-                        ..
-                    }
-                )
-            })
-            .count() as u64;
-        #[allow(clippy::type_complexity)]
-        let mut seg_map: HashMap<SmallBytes22, Vec<(i64, bool, SmallBytes22)>> =
-            HashMap::with_capacity(ops.len().min(4096));
-        for op in ops {
-            if let PendingOp::DocPostings {
-                rowid,
-                is_delete,
-                col_sizes,
-                doc_terms,
-            } = op
-            {
-                for (term, poslist) in doc_terms {
-                    let entry = seg_map.entry(term).or_default();
-                    if entry.last().is_none_or(|last| rowid > last.0) {
-                        entry.push((rowid, is_delete, poslist));
-                    } else {
-                        match entry.binary_search_by_key(&rowid, |x| x.0) {
-                            Ok(idx) => {
-                                // Delete followed by insert of the same row in one flush:
-                                // the new entry keeps the delete flag, as in C's hash.
-                                let poslist = if !is_delete
-                                    && payload_has_delete_flag(cfg.detail, entry[idx].2.as_slice())
-                                {
-                                    payload_with_delete_flag(cfg.detail, poslist.as_slice())
-                                } else {
-                                    poslist
-                                };
-                                entry[idx] = (rowid, is_delete, poslist);
-                            }
-                            Err(idx) => entry.insert(idx, (rowid, is_delete, poslist)),
-                        }
-                    }
-                }
-                if is_delete {
-                    avgs[0] = avgs[0].saturating_sub(1);
-                    for (i, &sz) in col_sizes.iter().enumerate() {
-                        avgs[1 + i] = avgs[1 + i].saturating_sub(sz);
-                    }
-                } else {
-                    avgs[0] = avgs[0].saturating_add(1);
-                    for (i, &sz) in col_sizes.iter().enumerate() {
-                        avgs[1 + i] = avgs[1 + i].saturating_add(sz);
-                    }
-                }
-            }
-        }
-
-        self.write_averages(ctx, &avgs)?;
-
-        if seg_map.is_empty()
-            || (full_struct.total_segments() == 0
-                && seg_map
-                    .values()
-                    .all(|docs| docs.iter().all(|(_, del, _)| *del)))
-        {
-            if cache_was_coherent {
-                self.read_cache.structure_blob = Some(prev_sblob);
-            }
-            return Ok(());
-        }
-
-        let mut sorted_terms: Vec<_> = seg_map.into_iter().collect();
-        sorted_terms.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-
-        let new_segid = full_struct.max_segid() + 1;
-        let (pgno_last, leaves, idx_rows) =
-            encode_segment_pages_bytes(sorted_terms.iter().map(|(t, docs)| {
-                (
-                    t.as_slice(),
-                    docs.iter().map(|(rid, _del, pl)| (*rid, pl.as_slice())),
-                )
-            }));
-
-        for (leaf_pgno, leaf_bytes) in leaves {
-            let lrid = fts5_segment_rowid(new_segid, leaf_pgno);
-            ctx.shadow_put_rowid(
-                &self.shadows.data,
-                lrid,
-                &[Value::Integer(lrid), Value::Blob(leaf_bytes)],
-                true,
-            )?;
-        }
-
-        let db_q = quote_ident(ctx.db_name());
-        let idx_q = quote_ident(&self.shadows.idx);
-        let idx_ins_sql =
-            format!("INSERT INTO {db_q}.{idx_q}(segid, term, pgno) VALUES(?1, ?2, ?3)");
-        let mut cached_idx_vec = Vec::with_capacity(idx_rows.len());
-        for (bt_key, bt_pg_val) in idx_rows {
-            let pg_u64 = (bt_pg_val >> 1).max(1) as u64;
-            cached_idx_vec.push((bt_key.clone(), pg_u64));
-            ctx.execute_sql(
-                &idx_ins_sql,
-                &[
-                    Value::Integer(new_segid as i64),
-                    Value::Blob(bt_key),
-                    Value::Integer(bt_pg_val),
-                ],
-            )?;
-        }
-        self.read_cache
-            .seg_idx
-            .insert(new_segid, Arc::new(cached_idx_vec));
-
-        // `fts5FlushOneHash`: a new level-0 segment of a contentless_delete=1 table takes the
-        // current origin counter for both ends of its origin range and counts the rows
-        // written into it.
-        let origin_cntr = if full_struct.is_v2 {
-            full_struct.origin_counter()
-        } else {
-            0
-        };
-        let new_rec = Fts5SegRecord {
-            segid: new_segid,
-            pgno_first: 1,
-            pgno_last,
-            n_tombstone_pages: 0,
-            origin1: origin_cntr,
-            origin2: origin_cntr,
-            n_entry_tombstone: 0,
-            n_entry: if full_struct.is_v2 {
-                n_inserted_rows
-            } else {
-                0
-            },
-        };
-        full_struct.cookie = full_struct.cookie.wrapping_add(1);
-        full_struct.write_counter = full_struct.write_counter.saturating_add(pgno_last);
-        if full_struct.levels.is_empty() {
-            full_struct.levels.push((0, vec![new_rec.clone()]));
-        } else {
-            full_struct.levels[0].1.push(new_rec.clone());
-        }
-        let new_sblob = full_struct.encode();
-        ctx.shadow_put_rowid(
-            &self.shadows.data,
-            FTS5_STRUCTURE_ROWID,
-            &[
-                Value::Integer(FTS5_STRUCTURE_ROWID),
-                Value::Blob(new_sblob.clone()),
-            ],
-            true,
-        )?;
-
-        if cache_was_coherent {
-            self.read_cache.structure_blob = Some(new_sblob);
-            self.read_cache.segments.push(new_rec);
-        } else {
-            self.read_cache.structure_blob = Some(new_sblob);
-            self.read_cache.segments = full_struct.chronological_segments();
-        }
-        self.read_cache.exact_terms.clear();
-        self.read_cache.averages = Some(avgs);
         Ok(())
     }
 
@@ -5360,8 +4036,6 @@ impl Fts5SharedState {
         if let Some(lp) = self.read_cache.leaf_pages.get(&(segid, pgno)) {
             return Ok(Arc::clone(lp));
         }
-        let err_corrupt =
-            || SqliteError::new(ErrorCode::Corrupt, "database disk image is malformed");
         let lrid = fts5_segment_rowid(segid, pgno);
         let lrow = ctx.shadow_get_rowid(&self.shadows.data, lrid)?;
         let Some(Value::Blob(raw)) = lrow.and_then(|mut r| {
@@ -5371,7 +4045,14 @@ impl Fts5SharedState {
                 None
             }
         }) else {
-            return Err(err_corrupt());
+            // `fts5DataRead` -> FTS5_CORRUPT_ROWID
+            return Err(SqliteError::with_extended(
+                FTS5_CORRUPT,
+                format!(
+                    "fts5: corruption found reading blob {lrid} from table \"{}\"",
+                    self.shadows.table_name
+                ),
+            ));
         };
         let parsed = Arc::new(ParsedLeafPage::parse(raw, is_first_seg_page)?);
         self.read_cache
@@ -5396,7 +4077,7 @@ impl Fts5SharedState {
         target_docs: &mut BTreeMap<i64, BTreeMap<usize, Vec<usize>>>,
     ) -> Result<u64> {
         let err_corrupt =
-            || SqliteError::new(ErrorCode::Corrupt, "database disk image is malformed");
+            || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
         let (_, ds, de) = leaf.terms[term_idx];
         let mut cur_rowid = 0i64;
         let mut first_in_doclist = true;
@@ -5480,7 +4161,7 @@ impl Fts5SharedState {
         target_vec: &mut TermPostings,
     ) -> Result<()> {
         let err_corrupt =
-            || SqliteError::new(ErrorCode::Corrupt, "database disk image is malformed");
+            || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
         let (_, ds, de) = leaf.terms[term_idx];
         let mut cur_rowid = 0i64;
         let mut first_in_doclist = true;
@@ -5554,7 +4235,37 @@ impl Fts5SharedState {
         Ok(())
     }
 
+    /// The postings of one index key as a query sees them: the segments plus the pending
+    /// doclist of the key (`fts5MultiIterNew` adds the hash as the newest source).
     fn lookup_exact_term(
+        &mut self,
+        cfg: &Fts5Config,
+        ctx: &mut dyn VTabHostContext,
+        target_key: &[u8],
+    ) -> Result<Arc<TermPostings>> {
+        let base = self.lookup_exact_term_segments(cfg, ctx, target_key)?;
+        let Some(doclist) = self.index.hash_query(target_key) else {
+            return Ok(base);
+        };
+        let mut out: TermPostings = (*base).clone();
+        Self::apply_hash_doclist(cfg.detail, &doclist, |rid, empty, body| {
+            if empty {
+                if let Ok(pos) = out.binary_search_by_key(&rid, |&(r, _)| r) {
+                    out.remove(pos);
+                }
+            } else {
+                let hits = decode_poslist_body_compact(cfg.detail, body)?;
+                match out.binary_search_by_key(&rid, |&(r, _)| r) {
+                    Ok(pos) => out[pos].1 = hits,
+                    Err(pos) => out.insert(pos, (rid, hits)),
+                }
+            }
+            Ok(())
+        })?;
+        Ok(Arc::new(out))
+    }
+
+    fn lookup_exact_term_segments(
         &mut self,
         cfg: &Fts5Config,
         ctx: &mut dyn VTabHostContext,
@@ -5564,7 +4275,7 @@ impl Fts5SharedState {
             return Ok(Arc::clone(cached));
         }
         let err_corrupt =
-            || SqliteError::new(ErrorCode::Corrupt, "database disk image is malformed");
+            || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
         let segments = self.read_cache.segments.clone();
 
         let postings = if segments.len() == 1 {
@@ -5609,6 +4320,29 @@ impl Fts5SharedState {
             }
             vec_out
         } else {
+            // `fts5MultiIterNew` opens the segment iterators from the newest segment to the
+            // oldest, each on the leaf its term may be on: a page that cannot be read is
+            // reported in that order.
+            for seg in segments.iter().rev() {
+                if seg.pgno_first == 0 || seg.pgno_last < seg.pgno_first {
+                    continue;
+                }
+                let idx_entries = self.get_or_load_seg_idx(ctx, seg.segid)?;
+                let pos = idx_entries.partition_point(|(k, _)| k.as_slice() <= target_key);
+                let start_pg = if pos > 0 {
+                    idx_entries[pos - 1].1.max(seg.pgno_first)
+                } else {
+                    seg.pgno_first
+                };
+                if start_pg <= seg.pgno_last {
+                    self.get_or_load_leaf_page(
+                        ctx,
+                        seg.segid,
+                        start_pg,
+                        start_pg == seg.pgno_first,
+                    )?;
+                }
+            }
             let mut out: TermDocHitsMap = BTreeMap::new();
             for seg in &segments {
                 if seg.pgno_first == 0 || seg.pgno_last < seg.pgno_first {
@@ -5671,7 +4405,7 @@ impl Fts5SharedState {
         prefix_key: &[u8],
     ) -> Result<Arc<TermPostings>> {
         let err_corrupt =
-            || SqliteError::new(ErrorCode::Corrupt, "database disk image is malformed");
+            || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
         let segments = self.read_cache.segments.clone();
         let mut per_term: MergedIndexMap = BTreeMap::new();
 
@@ -5717,6 +4451,35 @@ impl Fts5SharedState {
                     }
                 }
                 pg = jump_to_pg + 1;
+            }
+        }
+
+        // The pending entries of the same terms are the newest source.
+        if self.index.has_hash() {
+            for (key, doclist) in self.index.hash_scan_copy(prefix_key) {
+                let entry = per_term.entry(key).or_default();
+                Self::apply_hash_doclist(cfg.detail, &doclist, |rid, empty, body| {
+                    if empty {
+                        entry.remove(&rid);
+                    } else {
+                        entry.insert(rid, decode_poslist_body(cfg.detail, body)?);
+                    }
+                    Ok(())
+                })?;
+            }
+            // `fts5SetupPrefixIter`: C scans the main index for the prefix, or - when a
+            // prefix index one character longer exists - looks the token itself up and
+            // scans that prefix index. Only the scan touches the hash.
+            let token = &prefix_key[1..];
+            let n_char = String::from_utf8_lossy(token).chars().count();
+            match cfg.prefixes.iter().position(|&n| n == n_char + 1) {
+                Some(pi) => {
+                    let mut k = Vec::with_capacity(prefix_key.len());
+                    k.push(b'0' + (pi as u8) + 1);
+                    k.extend_from_slice(token);
+                    self.index.hash_scan_touch(&k);
+                }
+                None => self.index.hash_scan_touch(prefix_key),
             }
         }
 
@@ -5847,6 +4610,7 @@ impl VirtualTableModule for Fts5Module {
         let idx_sq = quote_single(&format!("{tbl_name}_idx"));
         let config_sq = quote_single(&format!("{tbl_name}_config"));
 
+        // `sqlite3Fts5IndexOpen(bCreate)`
         ctx.execute_sql(
             &format!("CREATE TABLE {db_q}.{data_sq}(id INTEGER PRIMARY KEY, block BLOB)"),
             &[],
@@ -5857,7 +4621,10 @@ impl VirtualTableModule for Fts5Module {
             ),
             &[],
         )?;
+        let mut state = Fts5SharedState::new(&db_name, &tbl_name, &cfg);
+        state.index.reinit(ctx)?;
 
+        // `sqlite3Fts5StorageOpen(bCreate)`
         if cfg.has_content_table() {
             let content_sq = quote_single(&format!("{tbl_name}_content"));
             ctx.execute_sql(
@@ -5886,30 +4653,7 @@ impl VirtualTableModule for Fts5Module {
             &format!("CREATE TABLE {db_q}.{config_sq}(k PRIMARY KEY, v) WITHOUT ROWID"),
             &[],
         )?;
-        let config_iq = quote_ident(&format!("{tbl_name}_config"));
-        ctx.execute_sql(
-            &format!("INSERT INTO {db_q}.{config_iq}(k, v) VALUES('version', 4)"),
-            &[],
-        )?;
-
-        // Initialize `_data` averages (id=1) and structure record (id=10)
-        let empty_sblob = encode_empty_structure_record(cfg.contentless_delete);
-        let data_shadow = format!("{tbl_name}_data");
-        ctx.shadow_put_rowid(
-            &data_shadow,
-            FTS5_AVERAGES_ROWID,
-            &[Value::Integer(FTS5_AVERAGES_ROWID), Value::Blob(Vec::new())],
-            true,
-        )?;
-        ctx.shadow_put_rowid(
-            &data_shadow,
-            FTS5_STRUCTURE_ROWID,
-            &[
-                Value::Integer(FTS5_STRUCTURE_ROWID),
-                Value::Blob(empty_sblob.clone()),
-            ],
-            true,
-        )?;
+        state.storage_config_value(ctx, "version", None, i64::from(FTS5_CURRENT_VERSION))?;
 
         ctx.declare_vtab(&cfg.declare_sql(&tbl_name))?;
         if cfg.content_mode == ContentMode::Normal {
@@ -5917,11 +4661,8 @@ impl VirtualTableModule for Fts5Module {
         }
         let _ = ctx.set_vtab_config(VTabConfigOption::Innocuous);
 
-        let mut state = Fts5SharedState::new(&tbl_name);
-        state.read_cache.structure_blob = Some(empty_sblob);
-        state.read_cache.averages = Some(vec![0u64; 1 + cfg.columns.len()]);
-        state.read_cache.configured_rank_weights = Some(Vec::new());
-        state.read_cache.secure_delete = Some(false);
+        // "Load the initial configuration": `sqlite3Fts5ConfigLoad(pConfig, iCookie-1)`.
+        state.index.config_load(ctx, -1)?;
 
         Ok(Box::new(Fts5Table {
             cfg,
@@ -5942,35 +4683,21 @@ impl VirtualTableModule for Fts5Module {
             let _ = ctx.set_vtab_config(VTabConfigOption::ConstraintSupport);
         }
         let _ = ctx.set_vtab_config(VTabConfigOption::Innocuous);
-        // fts5InitVtab -> sqlite3Fts5ConfigLoad: the `version` row of %_config must be 4 or 5
-        // (5 = secure-delete has been used). A config table that cannot be read at this
-        // point is left to the first statement that needs it.
-        {
-            let db_q = quote_ident(ctx.db_name());
-            let config_q = quote_ident(&format!("{tbl_name}_config"));
-            if let Ok(rows) = ctx.query_sql(&format!("SELECT k, v FROM {db_q}.{config_q}"), &[]) {
-                let mut version = 0i64;
-                for r in &rows {
-                    if let (Some(k), Some(v)) = (r.first(), r.get(1))
-                        && k.to_text_lossy().eq_ignore_ascii_case("version")
-                    {
-                        version = i64::from(v.to_integer_lossy() as i32);
-                    }
-                }
-                if version != 4 && version != 5 {
-                    return Err(SqliteError::new(
-                        ErrorCode::Error,
-                        format!(
-                            "invalid fts5 file format (found {version}, expected 4 or 5) - run 'rebuild'"
-                        ),
-                    ));
-                }
+        // fts5InitVtab -> sqlite3Fts5ConfigLoad(pConfig, iCookie-1): the `version` row of
+        // %_config must be 4 or 5 (5 = secure-delete has been used). A config table that
+        // cannot be read at this point is left to the first statement that needs it.
+        let db_name = ctx.db_name().to_owned();
+        let mut state = Fts5SharedState::new(&db_name, &tbl_name, &cfg);
+        if let Err(e) = state.index.config_load(ctx, -1) {
+            if e.message.starts_with("invalid fts5 file format") {
+                return Err(e);
             }
+            state.index.config.pgsz = 0;
         }
         Ok(Box::new(Fts5Table {
             cfg,
             aux_registry: Arc::clone(&self.aux_registry),
-            state: Arc::new(Mutex::new(Fts5SharedState::new(&tbl_name))),
+            state: Arc::new(Mutex::new(state)),
         }))
     }
 }
@@ -5987,6 +4714,13 @@ const IDX_ROWID_EQ: i32 = 1;
 const IDX_MATCH: i32 = 2;
 const IDX_LIKE: i32 = 3;
 const IDX_GLOB: i32 = 4;
+
+// `FTS5_BI_ORDER_*`: the bits of the idxNum C reports.
+const FTS5_BI_ORDER_RANK: i32 = 0x0020;
+const FTS5_BI_ORDER_ROWID: i32 = 0x0040;
+const FTS5_BI_ORDER_DESC: i32 = 0x0080;
+const PLAN_HINT_NEEDS_CONTENT: u64 = 1;
+const PLAN_HINT_NEEDS_RANK_COL: u64 = 2;
 
 const IDX_FLAG_HAS_RANK_CFG: i32 = 0x100;
 const IDX_FLAG_ORDER_RANK_ASC: i32 = 0x200;
@@ -6043,21 +4777,30 @@ impl Fts5Table {
         }
     }
 
-    fn push_pending_and_maybe_flush(
+    /// `fts5StorageNewRowid`: `REPLACE INTO %_docsize VALUES(NULL, NULL[, NULL])` and the
+    /// rowid it was given. Without a %_docsize table the caller has to supply the rowid.
+    fn storage_new_rowid(
         &self,
         state: &mut Fts5SharedState,
         ctx: &mut dyn VTabHostContext,
-        op: PendingOp,
-    ) -> Result<()> {
-        state.pending.approx_bytes += op.approx_mem_bytes();
-        state.pending.ops.push(op);
-        if !state.in_tx
-            || state.pending.approx_bytes >= FTS5_PENDING_MAX_BYTES
-            || state.pending.ops.len() >= FTS5_PENDING_MAX_OPS
-        {
-            state.flush_pending(&self.cfg, ctx)?;
+    ) -> Result<i64> {
+        if !self.cfg.columnsize {
+            return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
         }
-        Ok(())
+        if self.cfg.contentless_delete {
+            let origin = state
+                .docsize_origin_binding
+                .map_or(Value::Null, Value::Integer);
+            ctx.execute_sql_counted(
+                &state.sql_replace_docsize3,
+                &[Value::Null, Value::Null, origin],
+            )
+            .map_err(rc_only)?;
+            Ok(ctx.last_insert_rowid())
+        } else {
+            let docsize = state.shadows.docsize.clone();
+            ctx.shadow_replace_int(&docsize, &mut state.docsize_hint, None, None)
+        }
     }
 
     /// `sqlite3Fts5StorageContentInsert`: stores the row in `%_content` (when the table has
@@ -6074,41 +4817,131 @@ impl Fts5Table {
             if let Some(Value::Integer(rid)) = new_rowid {
                 return Ok(*rid);
             }
-            // `fts5StorageNewRowid`: the next rowid of %_docsize; without that table the
-            // caller has to supply the rowid.
-            if !self.cfg.columnsize {
-                return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
-            }
-            return Ok(ctx
-                .shadow_max_rowid(&state.shadows.docsize)?
-                .map_or(1, |m| m.saturating_add(1)));
+            return self.storage_new_rowid(state, ctx);
         }
         if self.cfg.unindexed_content && self.cfg.locale {
             // C prepares `INSERT INTO %_content VALUES(...)` without the l<N> columns for a
             // contentless_unindexed=1 + locale=1 table and reports the failure as corruption;
             // no row can be written to such a table by either engine.
-            return Err(SqliteError::new(
-                ErrorCode::Corrupt,
+            return Err(SqliteError::with_extended(
+                FTS5_CORRUPT,
                 "database disk image is malformed",
             ));
         }
-        let rid = match content_rowid_from_value(new_rowid)? {
-            Some(r) => r,
-            None => ctx
-                .shadow_max_rowid(&state.shadows.content)?
-                .map_or(1, |m| m.saturating_add(1)),
+        // The rowid is bound as it was given (`sqlite3_bind_value(pInsert, 1, apVal[1])`):
+        // NULL lets the INSERT choose one.
+        let rid = content_rowid_from_value(new_rowid)?;
+        let sql = if replace {
+            &state.sql_replace_content
+        } else {
+            &state.sql_insert_content
         };
-        let row = self.cfg.content_row(rid, col_vals);
-        ctx.shadow_put_rowid(&state.shadows.content, rid, &row, replace)
-            .map_err(|e| {
-                if e.code == ErrorCode::Constraint {
-                    // the C module reports the bare result code of the %_content insert
-                    SqliteError::new(ErrorCode::Constraint, "constraint failed")
-                } else {
-                    e
+        sqliters_types::dtrace!("TR|f5|w|tbl=content replace={}", u8::from(replace));
+        let content = state.shadows.content.clone();
+        // the C module reports the bare result code of the %_content insert
+        if self.cfg.content_mode == ContentMode::Normal
+            && !self.cfg.locale
+            && col_vals.len() == self.cfg.columns.len()
+        {
+            // (the row is the column values as they are)
+            return ctx
+                .shadow_insert_row(
+                    &content,
+                    &mut state.content_hint,
+                    sql,
+                    rid,
+                    col_vals,
+                    replace,
+                )
+                .map_err(rc_only);
+        }
+        let row = self.cfg.content_row(0, col_vals);
+        ctx.shadow_insert_row(
+            &content,
+            &mut state.content_hint,
+            sql,
+            rid,
+            &row[1..],
+            replace,
+        )
+        .map_err(rc_only)
+    }
+
+    /// `fts5StorageInsertDocsize`.
+    fn insert_docsize(
+        &self,
+        state: &mut Fts5SharedState,
+        ctx: &mut dyn VTabHostContext,
+        rowid: i64,
+        buf: &[u8],
+    ) -> Result<()> {
+        if self.cfg.columnsize {
+            sqliters_types::dtrace!("TR|f5|w|tbl=docsize k={} n={}", rowid, buf.len());
+            if self.cfg.contentless_delete {
+                let origin = state.index.get_origin(ctx)?;
+                state.docsize_origin_binding = Some(origin);
+                ctx.execute_sql_counted(
+                    &state.sql_replace_docsize3,
+                    &[
+                        Value::Integer(rowid),
+                        Value::Blob(buf.to_vec()),
+                        Value::Integer(origin),
+                    ],
+                )
+                .map_err(rc_only)?;
+            } else {
+                let docsize = state.shadows.docsize.clone();
+                ctx.shadow_replace_blob(&docsize, &mut state.docsize_hint, Some(rowid), buf)
+                    .map_err(rc_only)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The tokenizer loop shared by `sqlite3Fts5StorageIndexInsert`, `sqlite3Fts5StorageRebuild`
+    /// (`delete == false`: tokens are added, the column sizes are appended to `buf` and added
+    /// to the totals) and `fts5StorageDeleteFromIndex` (`delete == true`: delete markers; the
+    /// totals shrink and may not become negative).
+    fn index_tokens(
+        &self,
+        state: &mut Fts5SharedState,
+        col_vals: &[Value],
+        delete: bool,
+        buf: &mut Vec<u8>,
+        sizes_out: &mut Vec<u64>,
+    ) -> Result<()> {
+        let mut res = Ok(());
+        for i_col in 0..self.cfg.columns.len() {
+            let mut sz_col: i32 = 0;
+            if !self.cfg.unindexed[i_col] {
+                if delete && res.is_err() {
+                    break;
                 }
-            })?;
-        Ok(rid)
+                if let Some(text) = col_vals.get(i_col).and_then(fts5_value_bytes) {
+                    let index = &mut state.index;
+                    let col_arg = if delete { -1 } else { i_col as i32 };
+                    self.cfg.tokenizer.for_each_doc_token(&text, |tok| {
+                        sz_col += 1;
+                        index.write(col_arg, sz_col - 1, tok);
+                    });
+                }
+                if delete {
+                    state.a_total_size[i_col] -= i64::from(sz_col);
+                    if state.a_total_size[i_col] < 0 {
+                        res = Err(SqliteError::with_extended(
+                            FTS5_CORRUPT,
+                            "database disk image is malformed",
+                        ));
+                    }
+                }
+            }
+            if !delete {
+                fts5_put_varint(buf, sz_col as u64);
+                state.a_total_size[i_col] += i64::from(sz_col);
+                sizes_out.push(sz_col as u64);
+            }
+        }
+        res
     }
 
     /// `sqlite3Fts5StorageIndexInsert`: index entries, `%_docsize` row and totals for a row.
@@ -6119,47 +4952,20 @@ impl Fts5Table {
         rowid: i64,
         col_vals: &[Value],
     ) -> Result<()> {
-        let (doc_terms, col_sizes) = build_doc_term_encoded_postings(&self.cfg, col_vals, false);
-
+        state.load_totals(ctx)?;
+        state.index.begin_write(ctx, false, rowid)?;
+        let mut buf: Vec<u8> = Vec::with_capacity(self.cfg.columns.len() + 4);
+        let mut sizes: Vec<u64> = Vec::with_capacity(self.cfg.columns.len());
+        self.index_tokens(state, col_vals, false, &mut buf, &mut sizes)?;
+        state.n_total_row += 1;
+        // Write the %_docsize record
+        self.insert_docsize(state, ctx, rowid, &buf)?;
         if self.cfg.columnsize {
-            let sz_blob = Value::Blob(encode_varint_list(&col_sizes));
-            if self.cfg.contentless_delete {
-                // `fts5StorageInsertDocsize`: the origin of the segment this row will be
-                // flushed into (`sqlite3Fts5IndexGetOrigin`).
-                let origin = state.current_origin_counter(ctx)?;
-                ctx.shadow_put_rowid(
-                    &state.shadows.docsize,
-                    rowid,
-                    &[
-                        Value::Integer(rowid),
-                        sz_blob,
-                        Value::Integer(origin as i64),
-                    ],
-                    true,
-                )?;
-            } else {
-                ctx.shadow_put_rowid(
-                    &state.shadows.docsize,
-                    rowid,
-                    &[Value::Integer(rowid), sz_blob],
-                    true,
-                )?;
-            }
             state
                 .read_cache
-                .insert_docsize(rowid, DocColSizes::from_u64_slice(&col_sizes));
+                .insert_docsize(rowid, DocColSizes::from_u64_slice(&sizes));
         }
-
-        self.push_pending_and_maybe_flush(
-            state,
-            ctx,
-            PendingOp::DocPostings {
-                rowid,
-                is_delete: false,
-                col_sizes,
-                doc_terms,
-            },
-        )
+        Ok(())
     }
 
     /// `fts5StorageInsert`.
@@ -6175,6 +4981,40 @@ impl Fts5Table {
         Ok(rid)
     }
 
+    /// `fts5StorageDeleteFromIndex`.
+    fn delete_from_index(
+        &self,
+        state: &mut Fts5SharedState,
+        ctx: &mut dyn VTabHostContext,
+        rowid: i64,
+        vals: Option<&[Value]>,
+    ) -> Result<()> {
+        let looked_up;
+        let old_vals: &[Value] = match vals {
+            Some(v) => v,
+            None => {
+                // FTS5_STMT_LOOKUP: without a row there is nothing to remove.
+                looked_up = self.read_content_row(state, ctx, rowid)?;
+                match looked_up.as_deref() {
+                    Some(v) => v,
+                    None => return Ok(()),
+                }
+            }
+        };
+        let mut buf = Vec::new();
+        let mut sizes = Vec::new();
+        let mut res = self.index_tokens(state, old_vals, true, &mut buf, &mut sizes);
+        if res.is_ok() && state.n_total_row < 1 {
+            res = Err(SqliteError::with_extended(
+                FTS5_CORRUPT,
+                "database disk image is malformed",
+            ));
+        } else {
+            state.n_total_row -= 1;
+        }
+        res
+    }
+
     /// `sqlite3Fts5StorageDelete`: removes row `rowid` from the index, `%_docsize` and
     /// `%_content`. `vals` are the values to remove from the index (the `'delete'` command);
     /// without them they are looked up in the content source, and a row that is not found
@@ -6186,64 +5026,31 @@ impl Fts5Table {
         rowid: i64,
         vals: Option<&[Value]>,
     ) -> Result<()> {
+        state.load_totals(ctx)?;
+        // Delete the index records
+        state.index.begin_write(ctx, true, rowid)?;
         if self.cfg.contentless_delete {
             self.contentless_delete_row(state, ctx, rowid)?;
         } else {
-            let looked_up;
-            let old_vals = match vals {
-                Some(v) => Some(v),
-                None => {
-                    looked_up = self.read_content_row(state, ctx, rowid)?;
-                    looked_up.as_deref()
-                }
-            };
-            if let Some(old_vals) = old_vals {
-                let (doc_terms, col_sizes) =
-                    build_doc_term_encoded_postings(&self.cfg, old_vals, true);
-                // `fts5StorageDeleteFromIndex`: the totals may not go negative.
-                let totals = state.current_totals(&self.cfg, ctx)?;
-                let corrupt =
-                    || SqliteError::new(ErrorCode::Corrupt, "database disk image is malformed");
-                for (i, &sz) in col_sizes.iter().enumerate() {
-                    if !self.cfg.unindexed[i] && totals[1 + i] < sz as i64 {
-                        return Err(corrupt());
-                    }
-                }
-                if totals[0] < 1 {
-                    return Err(corrupt());
-                }
-                self.push_pending_and_maybe_flush(
-                    state,
-                    ctx,
-                    PendingOp::DocPostings {
-                        rowid,
-                        is_delete: true,
-                        col_sizes,
-                        doc_terms,
-                    },
-                )?;
-            }
+            self.delete_from_index(state, ctx, rowid, vals)?;
         }
 
+        // Delete the %_docsize record
         if self.cfg.columnsize {
-            ctx.shadow_delete_rowid(&state.shadows.docsize, rowid)?;
+            sqliters_types::dtrace!("TR|f5|d|tbl=docsize k={}", rowid);
+            let docsize = state.shadows.docsize.clone();
+            ctx.shadow_delete_counted(&docsize, &mut state.docsize_hint, rowid)
+                .map_err(rc_only)?;
             state.read_cache.remove_docsize(rowid);
         }
+        // Delete the %_content record
         if self.cfg.has_content_table() {
-            ctx.shadow_delete_rowid(&state.shadows.content, rowid)?;
+            sqliters_types::dtrace!("TR|f5|d|tbl=content k={}", rowid);
+            let content = state.shadows.content.clone();
+            ctx.shadow_delete_counted(&content, &mut state.content_hint, rowid)
+                .map_err(rc_only)?;
         }
         Ok(())
-    }
-
-    /// `sqlite3Fts5StorageDelete` for the old row of an UPDATE that changes the rowid; the
-    /// new `%_content` row has already been written (`fts5UpdateMethod`, case 3).
-    fn storage_delete_keep_new_content(
-        &self,
-        state: &mut Fts5SharedState,
-        ctx: &mut dyn VTabHostContext,
-        old_rowid: i64,
-    ) -> Result<()> {
-        self.storage_delete(state, ctx, old_rowid, None)
     }
 
     /// `fts5StorageContentlessDelete`: a row of a contentless_delete=1 table is known by its
@@ -6254,31 +5061,51 @@ impl Fts5Table {
         ctx: &mut dyn VTabHostContext,
         rowid: i64,
     ) -> Result<()> {
-        let Some(row) = ctx.shadow_get_rowid(&state.shadows.docsize, rowid)? else {
-            return Ok(());
-        };
-        let n_cols = self.cfg.columns.len();
-        let sizes = match row.get(1) {
-            Some(Value::Blob(b)) => decode_varint_list(b).filter(|l| l.len() == n_cols),
-            _ => None,
-        };
-        let Some(old_col_sizes) = sizes else {
-            return Err(SqliteError::new(
-                ErrorCode::Corrupt,
-                "database disk image is malformed",
-            ));
-        };
-        let origin = row.get(2).map_or(0, Value::to_integer_lossy);
-        self.push_pending_and_maybe_flush(
-            state,
-            ctx,
-            PendingOp::ContentlessRowidDelete {
-                rowid,
-                old_col_sizes,
-                had_docsize: origin != 0,
-                origin: origin.max(0) as u64,
-            },
-        )
+        state.load_totals(ctx)?;
+        // Look up the origin of the document in the %_docsize table. Store this in stack
+        // variable iOrigin.
+        let mut i_origin: i64 = 0;
+        if let Some(row) = ctx.shadow_get_rowid(&state.shadows.docsize, rowid)? {
+            let n_cols = self.cfg.columns.len();
+            let blob: &[u8] = match row.get(1) {
+                Some(Value::Blob(b)) => b,
+                Some(Value::Text(s)) => s.as_bytes(),
+                _ => &[],
+            };
+            // fts5StorageDecodeSizeArray
+            let mut i_off = 0usize;
+            let mut bad = false;
+            let mut a_col: Vec<i64> = Vec::with_capacity(n_cols);
+            for _ in 0..n_cols {
+                if i_off >= blob.len() {
+                    bad = true;
+                    break;
+                }
+                let (v, nb) = fts5_get_varint32(blob, i_off);
+                i_off += nb;
+                a_col.push(i64::from(v));
+            }
+            if bad || i_off != blob.len() {
+                return Err(SqliteError::with_extended(
+                    FTS5_CORRUPT,
+                    "database disk image is malformed",
+                ));
+            }
+            for (ii, v) in a_col.iter().enumerate() {
+                state.a_total_size[ii] -= *v;
+            }
+            i_origin = i64::from(row.get(2).map_or(0, Value::to_integer_lossy) as i32);
+        }
+        if i_origin != 0 {
+            state.index.contentless_delete(ctx, i_origin, rowid)?;
+            state.n_total_row -= 1;
+        }
+        Ok(())
+    }
+
+    /// `sqlite3Fts5FlushToDisk`.
+    fn flush_to_disk(state: &mut Fts5SharedState, ctx: &mut dyn VTabHostContext) -> Result<()> {
+        state.storage_sync(ctx)
     }
 
     /// `fts5SpecialInsert` / `fts5SpecialDelete`: `INSERT INTO ft(ft, ...) VALUES(cmd, ...)`.
@@ -6307,6 +5134,7 @@ impl Fts5Table {
             return Ok(());
         }
 
+        let mut b_load_config = false;
         if cmd.eq_ignore_ascii_case("delete-all") {
             if self.cfg.content_mode == ContentMode::Normal {
                 return Err(SqliteError::new(
@@ -6314,387 +5142,319 @@ impl Fts5Table {
                     "'delete-all' may only be used with a contentless or external content fts5 table",
                 ));
             }
-            state.discard_pending_for_reset();
-            self.reset_index_storage(state, ctx)?;
-            if self.cfg.unindexed_content {
-                let db_q = quote_ident(ctx.db_name());
-                let content_q = quote_ident(&state.shadows.content);
-                ctx.execute_sql(&format!("DELETE FROM {db_q}.{content_q}"), &[])?;
-            }
-            return self.write_config_version(state, ctx);
-        }
-        if cmd.eq_ignore_ascii_case("rebuild") {
+            self.storage_delete_all(state, ctx)?;
+            b_load_config = true;
+        } else if cmd.eq_ignore_ascii_case("rebuild") {
             if contentless {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     "'rebuild' may not be used with a contentless fts5 table",
                 ));
             }
-            state.discard_pending_for_reset();
-            self.rebuild_index(state, ctx)?;
-            return self.write_config_version(state, ctx);
-        }
-        if cmd.eq_ignore_ascii_case("optimize") || cmd.eq_ignore_ascii_case("merge") {
-            return self.compact_segments(state, ctx);
-        }
-        if cmd.eq_ignore_ascii_case("integrity-check") {
+            self.storage_rebuild(state, ctx)?;
+            b_load_config = true;
+        } else if cmd.eq_ignore_ascii_case("optimize") {
+            state.index.optimize(ctx)?;
+        } else if cmd.eq_ignore_ascii_case("merge") {
+            let n_merge = rank_val.to_integer_lossy() as i32;
+            state.index.merge(ctx, n_merge)?;
+        } else if cmd.eq_ignore_ascii_case("integrity-check") {
             // `sqlite3Fts5StorageIntegrity(p, iArg)`: an external content table is only
             // compared with the index when the rank argument is non-zero.
             let check_external = rank_val.to_integer_lossy() as i32 != 0;
-            state.flush_pending(&self.cfg, ctx)?;
             return self.verify_integrity(state, ctx, check_external);
+        } else if cmd.eq_ignore_ascii_case("flush") {
+            Self::flush_to_disk(state, ctx)?;
+        } else {
+            // Everything else is a configuration setting (`sqlite3Fts5ConfigSetValue`); an
+            // unknown key or an out-of-range value is SQLITE_ERROR without a message.
+            Self::flush_to_disk(state, ctx)?;
+            state.index.load_config(ctx)?;
+            let mut b_error = !config_value_is_valid(cmd, &rank_val);
+            if !b_error || cmd.eq_ignore_ascii_case("deletemerge") {
+                // (C applies the value to the in-memory configuration first)
+                let ok =
+                    crate::fts5_index::config_set_value(&mut state.index.config, cmd, &rank_val)?;
+                if !ok {
+                    b_error = true;
+                }
+            }
+            if b_error {
+                return Err(SqliteError::new(ErrorCode::Error, "SQL logic error"));
+            }
+            state.storage_config_value(ctx, cmd, Some(&rank_val), 0)?;
         }
-        if cmd.eq_ignore_ascii_case("flush") {
-            return state.flush_pending(&self.cfg, ctx);
+        if b_load_config {
+            state.index.config.i_cookie = state.index.config.i_cookie.wrapping_sub(1);
+            state.index.load_config(ctx)?;
         }
-
-        // Everything else is a configuration setting (`sqlite3Fts5ConfigSetValue`); an
-        // unknown key or an out-of-range value is SQLITE_ERROR without a message.
-        state.flush_pending(&self.cfg, ctx)?;
-        if !config_value_is_valid(cmd, &rank_val) {
-            return Err(SqliteError::new(ErrorCode::Error, "SQL logic error"));
-        }
-        let db_q = quote_ident(ctx.db_name());
-        let config_q = quote_ident(&state.shadows.config);
-        ctx.execute_sql(
-            &format!("REPLACE INTO {db_q}.{config_q} VALUES(?1, ?2)"),
-            &[Value::Text(cmd.to_owned()), rank_val],
-        )?;
-        state.read_cache.configured_rank_weights = None;
-        state.read_cache.secure_delete = None;
-        // `sqlite3Fts5StorageConfigValue`: a configuration change bumps the cookie.
-        state.bump_structure_cookie(ctx)
-    }
-
-    /// `sqlite3Fts5StorageConfigValue(p, "version", 0, FTS5_CURRENT_VERSION)`.
-    fn write_config_version(
-        &self,
-        state: &Fts5SharedState,
-        ctx: &mut dyn VTabHostContext,
-    ) -> Result<()> {
-        let db_q = quote_ident(ctx.db_name());
-        let config_q = quote_ident(&state.shadows.config);
-        ctx.execute_sql(
-            &format!("REPLACE INTO {db_q}.{config_q} VALUES('version', 4)"),
-            &[],
-        )?;
         Ok(())
     }
 
-    fn reset_index_storage(
+    /// `sqlite3Fts5StorageDeleteAll`.
+    fn storage_delete_all(
         &self,
         state: &mut Fts5SharedState,
         ctx: &mut dyn VTabHostContext,
     ) -> Result<()> {
+        state.b_totals_valid = false;
         let db_q = quote_ident(ctx.db_name());
-        let next_cookie = read_structure_cookie(ctx, &state.shadows.data).wrapping_add(1);
         let data_q = quote_ident(&state.shadows.data);
         let idx_q = quote_ident(&state.shadows.idx);
-        ctx.execute_sql(&format!("DELETE FROM {db_q}.{data_q}"), &[])?;
-        ctx.execute_sql(&format!("DELETE FROM {db_q}.{idx_q}"), &[])?;
+        // Delete the contents of the %_data and %_docsize tables.
+        sqliters_types::dtrace!("TR|f5|deleteall|");
+        ctx.execute_sql_counted(&format!("DELETE FROM {db_q}.{data_q}"), &[])
+            .map_err(rc_only)?;
+        ctx.execute_sql_counted(&format!("DELETE FROM {db_q}.{idx_q}"), &[])
+            .map_err(rc_only)?;
+        state.index.write_gen = state.index.write_gen.wrapping_add(1);
         if self.cfg.columnsize {
             let docsize_q = quote_ident(&state.shadows.docsize);
-            ctx.execute_sql(&format!("DELETE FROM {db_q}.{docsize_q}"), &[])?;
+            ctx.execute_sql_counted(&format!("DELETE FROM {db_q}.{docsize_q}"), &[])
+                .map_err(rc_only)?;
         }
-        let empty_sblob =
-            encode_empty_structure_record_with_cookie(self.cfg.contentless_delete, next_cookie);
-        ctx.shadow_put_rowid(
-            &state.shadows.data,
-            FTS5_AVERAGES_ROWID,
-            &[Value::Integer(FTS5_AVERAGES_ROWID), Value::Blob(Vec::new())],
-            true,
-        )?;
-        ctx.shadow_put_rowid(
-            &state.shadows.data,
-            FTS5_STRUCTURE_ROWID,
-            &[
-                Value::Integer(FTS5_STRUCTURE_ROWID),
-                Value::Blob(empty_sblob.clone()),
-            ],
-            true,
-        )?;
-        state.read_cache.clear_segment_maps();
-        state.read_cache.clear_docsize();
-        state.read_cache.structure_blob = Some(empty_sblob);
-        state.read_cache.averages = Some(vec![0u64; 1 + self.cfg.columns.len()]);
-        Ok(())
+        if self.cfg.unindexed_content {
+            let content_q = quote_ident(&state.shadows.content);
+            ctx.execute_sql_counted(&format!("DELETE FROM {db_q}.{content_q}"), &[])
+                .map_err(rc_only)?;
+        }
+        state.read_cache.clear_all();
+        // Reinitialize the %_data table. This call creates the initial structure and
+        // averages records.
+        state.index.reinit(ctx)?;
+        state.storage_config_value(ctx, "version", None, i64::from(FTS5_CURRENT_VERSION))
     }
 
-    fn rebuild_index(
+    /// `sqlite3Fts5StorageRebuild`.
+    fn storage_rebuild(
         &self,
         state: &mut Fts5SharedState,
         ctx: &mut dyn VTabHostContext,
     ) -> Result<()> {
+        self.storage_delete_all(state, ctx)?;
+        state.load_totals(ctx)?;
+        // FTS5_STMT_SCAN: `SELECT <exprlist> FROM <content> AS T`
         let db_q = quote_ident(ctx.db_name());
         let src_rows = match &self.cfg.content_mode {
             ContentMode::Normal => {
                 let content_q = quote_ident(&state.shadows.content);
-                let mut cols = vec!["id".to_owned()];
+                let mut cols = vec!["T.id".to_owned()];
                 for i in 0..self.cfg.columns.len() {
-                    cols.push(format!("c{i}"));
+                    cols.push(format!("T.c{i}"));
                 }
                 ctx.query_sql(
-                    &format!(
-                        "SELECT {} FROM {db_q}.{content_q} ORDER BY id ASC",
-                        cols.join(", ")
-                    ),
+                    &format!("SELECT {} FROM {db_q}.{content_q} AS T", cols.join(", ")),
                     &[],
                 )?
             }
             ContentMode::External { table, rowid_col } => {
                 let ext_q = quote_ident(table);
                 let rid_q = quote_ident(rowid_col.as_deref().unwrap_or("rowid"));
-                let mut cols = vec![rid_q.clone()];
+                let mut cols = vec![format!("T.{rid_q}")];
                 for c in &self.cfg.columns {
-                    cols.push(quote_ident(c));
+                    cols.push(format!("T.{}", quote_ident(c)));
                 }
                 ctx.query_sql(
-                    &format!(
-                        "SELECT {} FROM {db_q}.{ext_q} ORDER BY {rid_q} ASC",
-                        cols.join(", ")
-                    ),
+                    &format!("SELECT {} FROM {db_q}.{ext_q} AS T", cols.join(", ")),
                     &[],
                 )?
             }
             ContentMode::Contentless => Vec::new(),
         };
 
-        self.reset_index_storage(state, ctx)?;
-        let mut merged: MergedIndexMap = BTreeMap::new();
-        let mut avgs = vec![0u64; 1 + self.cfg.columns.len()];
-
         for row in src_rows {
             let rid = row.first().map_or(0, Value::to_integer_lossy);
             let cvals = &row[1..];
-            let (doc_terms, col_sizes) = build_doc_term_postings(&self.cfg, cvals, false);
-            for (k, chits) in doc_terms {
-                merged.entry(k).or_default().insert(rid, chits);
-            }
+            state.index.begin_write(ctx, false, rid)?;
+            let mut buf: Vec<u8> = Vec::with_capacity(self.cfg.columns.len() + 4);
+            let mut sizes: Vec<u64> = Vec::with_capacity(self.cfg.columns.len());
+            self.index_tokens(state, cvals, false, &mut buf, &mut sizes)?;
+            state.n_total_row += 1;
+            self.insert_docsize(state, ctx, rid, &buf)?;
             if self.cfg.columnsize {
-                let sz_blob = Value::Blob(encode_varint_list(&col_sizes));
-                if self.cfg.contentless_delete {
-                    ctx.shadow_put_rowid(
-                        &state.shadows.docsize,
-                        rid,
-                        &[Value::Integer(rid), sz_blob, Value::Integer(1)],
-                        true,
-                    )?;
-                } else {
-                    ctx.shadow_put_rowid(
-                        &state.shadows.docsize,
-                        rid,
-                        &[Value::Integer(rid), sz_blob],
-                        true,
-                    )?;
-                }
                 state
                     .read_cache
-                    .insert_docsize(rid, DocColSizes::from_u64_slice(&col_sizes));
-            }
-            avgs[0] += 1;
-            for (i, &sz) in col_sizes.iter().enumerate() {
-                avgs[1 + i] += sz;
+                    .insert_docsize(rid, DocColSizes::from_u64_slice(&sizes));
             }
         }
-
-        let origin = self.cfg.contentless_delete.then_some(SegOrigin {
-            origin1: 1,
-            origin2: 1,
-            n_entry: avgs[0],
-        });
-        let sblob = write_c_fts5_index(
-            ctx,
-            &db_q,
-            &state.shadows.table_name,
-            &self.cfg,
-            &merged,
-            origin,
-        )?;
-        let segs = decode_structure_segments(&sblob)?;
-        state.write_averages(ctx, &avgs)?;
-        state.read_cache.clear_segment_maps();
-        state.read_cache.structure_blob = Some(sblob);
-        state.read_cache.segments = segs;
-        state.read_cache.averages = Some(avgs);
-        Ok(())
+        // Write the averages record
+        state.save_totals(ctx)
     }
 
-    fn compact_segments(
+    /// `sqlite3Fts5StorageIntegrity(p, iArg)`.
+    fn verify_integrity(
         &self,
         state: &mut Fts5SharedState,
         ctx: &mut dyn VTabHostContext,
-    ) -> Result<()> {
-        if !state.pending.ops.is_empty() {
-            for sp in &mut state.pending.savepoints {
-                if sp.flushed_pre_ops.is_none() && sp.ops_len > 0 {
-                    sp.flushed_pre_ops = Some(state.pending.ops[..sp.ops_len].to_vec());
-                }
-                sp.flushed_since = true;
-            }
-            let ops = std::mem::take(&mut state.pending.ops);
-            state.pending.approx_bytes = 0;
-            return state.flush_pending_via_compaction(&self.cfg, ctx, ops);
-        }
-        state.ensure_structure_coherent(ctx)?;
-        if state.read_cache.segments.len() <= 1
-            && state
-                .read_cache
-                .segments
-                .iter()
-                .all(|s| s.n_tombstone_pages == 0)
-        {
-            return Ok(());
-        }
-        let db_q = quote_ident(ctx.db_name());
-        let merged = load_merged_index(ctx, &db_q, &state.shadows.table_name, self.cfg.detail)?;
-        let origin = if self.cfg.contentless_delete {
-            let ps = read_full_structure(ctx, &state.shadows.data)?;
-            let cntr = ps.origin_counter();
-            let origin1 = ps.min_origin().unwrap_or(cntr);
-            let n_entry = ps
-                .levels
-                .iter()
-                .flat_map(|(_, segs)| segs.iter())
-                .map(|seg| seg.n_entry.saturating_sub(seg.n_entry_tombstone))
-                .sum();
-            Some(SegOrigin {
-                origin1,
-                origin2: (cntr - 1).max(origin1),
-                n_entry,
-            })
-        } else {
-            None
-        };
-        let sblob = write_c_fts5_index(
-            ctx,
-            &db_q,
-            &state.shadows.table_name,
-            &self.cfg,
-            &merged,
-            origin,
-        )?;
-        let segs = decode_structure_segments(&sblob)?;
-        state.read_cache.clear_segment_maps();
-        state.read_cache.structure_blob = Some(sblob);
-        state.read_cache.segments = segs;
-        Ok(())
-    }
-
-    fn verify_integrity(
-        &self,
-        state: &Fts5SharedState,
-        ctx: &mut dyn VTabHostContext,
         check_external: bool,
     ) -> Result<()> {
-        let db_q = quote_ident(ctx.db_name());
-        let actual = load_merged_index(ctx, &db_q, &state.shadows.table_name, self.cfg.detail)?;
-
-        let should_verify_content = match self.cfg.content_mode {
+        let corrupt =
+            || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
+        let n_cols = self.cfg.columns.len();
+        let mut a_total_size = vec![0i64; n_cols];
+        let mut cksum: u64 = 0;
+        let b_use_cksum = match self.cfg.content_mode {
             ContentMode::Normal => true,
             ContentMode::External { .. } => check_external,
             ContentMode::Contentless => false,
         };
-        if !should_verify_content {
-            return Ok(());
-        }
-
-        let src_rows = match &self.cfg.content_mode {
-            ContentMode::Normal => {
-                let content_q = quote_ident(&state.shadows.content);
-                let mut cols = vec!["id".to_owned()];
-                for i in 0..self.cfg.columns.len() {
-                    cols.push(format!("c{i}"));
+        if b_use_cksum {
+            // Generate the expected index checksum based on the contents of the %_content
+            // table. This block also checks that the %_docsize records match the content.
+            let db_q = quote_ident(ctx.db_name());
+            let src_rows = match &self.cfg.content_mode {
+                ContentMode::Normal => {
+                    let content_q = quote_ident(&state.shadows.content);
+                    let mut cols = vec!["T.id".to_owned()];
+                    for i in 0..n_cols {
+                        cols.push(format!("T.c{i}"));
+                    }
+                    ctx.query_sql(
+                        &format!("SELECT {} FROM {db_q}.{content_q} AS T", cols.join(", ")),
+                        &[],
+                    )?
                 }
-                ctx.query_sql(
-                    &format!(
-                        "SELECT {} FROM {db_q}.{content_q} ORDER BY id ASC",
-                        cols.join(", ")
-                    ),
-                    &[],
-                )?
-            }
-            ContentMode::External { table, rowid_col } => {
-                let ext_q = quote_ident(table);
-                let rid_q = quote_ident(rowid_col.as_deref().unwrap_or("rowid"));
-                let mut cols = vec![rid_q.clone()];
-                for c in &self.cfg.columns {
-                    cols.push(quote_ident(c));
+                ContentMode::External { table, rowid_col } => {
+                    let ext_q = quote_ident(table);
+                    let rid_q = quote_ident(rowid_col.as_deref().unwrap_or("rowid"));
+                    let mut cols = vec![format!("T.{rid_q}")];
+                    for c in &self.cfg.columns {
+                        cols.push(format!("T.{}", quote_ident(c)));
+                    }
+                    ctx.query_sql(
+                        &format!("SELECT {} FROM {db_q}.{ext_q} AS T", cols.join(", ")),
+                        &[],
+                    )?
                 }
-                ctx.query_sql(
-                    &format!(
-                        "SELECT {} FROM {db_q}.{ext_q} ORDER BY {rid_q} ASC",
-                        cols.join(", ")
-                    ),
-                    &[],
-                )?
-            }
-            ContentMode::Contentless => unreachable!(),
-        };
-
-        let corrupt = || SqliteError::new(ErrorCode::Corrupt, "database disk image is malformed");
-        let n_cols = self.cfg.columns.len();
-        let n_src_rows = src_rows.len() as u64;
-        let mut total_sizes = vec![0u64; n_cols];
-        let mut expected: MergedIndexMap = BTreeMap::new();
-        for row in src_rows {
-            let rid = row.first().map_or(0, Value::to_integer_lossy);
-            let cvals = &row[1..];
-            let (doc_terms, col_sizes) = build_doc_term_postings(&self.cfg, cvals, false);
-            for (term, chits) in doc_terms {
-                expected.entry(term).or_default().insert(rid, chits);
-            }
-            // `sqlite3Fts5StorageIntegrity`: the %_docsize record of every row must hold the
-            // token counts of its text.
-            if self.cfg.columnsize {
-                let stored =
-                    ctx.shadow_get_rowid(&state.shadows.docsize, rid)?
-                        .and_then(|r| match r.get(1) {
-                            Some(Value::Blob(b)) => decode_varint_list(b),
-                            _ => None,
+                ContentMode::Contentless => Vec::new(),
+            };
+            let detail = self.cfg.detail;
+            for row in src_rows {
+                let i_rowid = row.first().map_or(0, Value::to_integer_lossy);
+                let mut a_col_size: Vec<i64> = Vec::new();
+                if self.cfg.columnsize {
+                    // sqlite3Fts5StorageDocsize
+                    let stored = ctx.shadow_get_rowid(&state.shadows.docsize, i_rowid)?;
+                    let blob: Option<Vec<u8>> = stored.and_then(|r| match r.into_iter().nth(1) {
+                        Some(Value::Blob(b)) => Some(b),
+                        Some(Value::Text(t)) => Some(t.into_bytes()),
+                        Some(_) => Some(Vec::new()),
+                        None => None,
+                    });
+                    let mut ok = false;
+                    if let Some(blob) = blob {
+                        let mut i_off = 0usize;
+                        let mut bad = false;
+                        for _ in 0..n_cols {
+                            if i_off >= blob.len() {
+                                bad = true;
+                                break;
+                            }
+                            let (v, nb) = fts5_get_varint32(&blob, i_off);
+                            i_off += nb;
+                            a_col_size.push(i64::from(v));
+                        }
+                        ok = !bad && i_off == blob.len();
+                    }
+                    if !ok {
+                        return Err(corrupt());
+                    }
+                }
+                // (detail=none: one termset per row; detail=column: one per column)
+                let mut termset: std::collections::HashSet<(u8, Vec<u8>)> =
+                    std::collections::HashSet::new();
+                for i in 0..n_cols {
+                    if self.cfg.unindexed[i] {
+                        continue;
+                    }
+                    let mut sz_col: i64 = 0;
+                    if detail == DetailMode::Col {
+                        termset.clear();
+                    }
+                    if let Some(text) = row.get(i + 1).and_then(fts5_value_bytes) {
+                        let prefixes = &self.cfg.prefixes;
+                        self.cfg.tokenizer.for_each_doc_token(&text, |tok| {
+                            sz_col += 1;
+                            let (i_pos, i_col) = match detail {
+                                DetailMode::Full => ((sz_col - 1) as i32, i as i32),
+                                DetailMode::Col => (i as i32, 0),
+                                DetailMode::None => (0, 0),
+                            };
+                            let present =
+                                detail != DetailMode::Full && !termset.insert((0u8, tok.to_vec()));
+                            if !present {
+                                cksum ^=
+                                    crate::fts5_index::entry_cksum(i_rowid, i_col, i_pos, 0, tok);
+                            }
+                            for (ii, &n_char) in prefixes.iter().enumerate() {
+                                let n_byte = charlen_to_bytelen(tok, n_char);
+                                if n_byte != 0 {
+                                    let present = detail != DetailMode::Full
+                                        && !termset
+                                            .insert(((ii + 1) as u8, tok[..n_byte].to_vec()));
+                                    if !present {
+                                        cksum ^= crate::fts5_index::entry_cksum(
+                                            i_rowid,
+                                            i_col,
+                                            i_pos,
+                                            (ii + 1) as i32,
+                                            &tok[..n_byte],
+                                        );
+                                    }
+                                }
+                            }
                         });
-                if stored.as_deref() != Some(col_sizes.as_slice()) {
+                    }
+                    // If this is not a columnsize=0 database, check that the number of
+                    // tokens in the value matches the aColSize[] value read from the
+                    // %_docsize table.
+                    if self.cfg.columnsize && sz_col != a_col_size[i] {
+                        return Err(corrupt());
+                    }
+                    a_total_size[i] += sz_col;
+                }
+            }
+
+            // Test that the "totals" (sometimes called "averages") record looks Ok
+            // (`fts5StorageLoadTotals(p, 0)`: the totals of the open transaction, if any)
+            let avgs = state.read_averages(&self.cfg, ctx)?;
+            for i in 0..n_cols {
+                if avgs.get(1 + i).copied().unwrap_or(0) as i64 != a_total_size[i] {
                     return Err(corrupt());
                 }
             }
-            for (i, &sz) in col_sizes.iter().enumerate() {
-                total_sizes[i] += sz;
+            let n_total_row = avgs.first().copied().unwrap_or(0) as i64;
+
+            // Check that the %_docsize and %_content tables contain the expected number
+            // of rows.
+            if self.cfg.content_mode == ContentMode::Normal {
+                let content_q = quote_ident(&state.shadows.content);
+                let n_row = ctx
+                    .query_sql(&format!("SELECT count(*) FROM {db_q}.{content_q}"), &[])?
+                    .first()
+                    .and_then(|r| r.first())
+                    .map_or(0, Value::to_integer_lossy);
+                if n_row != n_total_row {
+                    return Err(corrupt());
+                }
+            }
+            if self.cfg.columnsize {
+                let docsize_q = quote_ident(&state.shadows.docsize);
+                let n_row = ctx
+                    .query_sql(&format!("SELECT count(*) FROM {db_q}.{docsize_q}"), &[])?
+                    .first()
+                    .and_then(|r| r.first())
+                    .map_or(0, Value::to_integer_lossy);
+                if n_row != n_total_row {
+                    return Err(corrupt());
+                }
             }
         }
-        // The totals record and the row counts of %_content / %_docsize must agree with
-        // the rows just scanned.
-        let avg_row = ctx.shadow_get_rowid(&state.shadows.data, FTS5_AVERAGES_ROWID)?;
-        let mut avgs = match avg_row.as_ref().and_then(|r| r.get(1)) {
-            Some(Value::Blob(b)) => decode_varint_list(b).unwrap_or_default(),
-            _ => Vec::new(),
-        };
-        avgs.resize(1 + n_cols, 0);
-        if avgs[1..] != total_sizes[..] {
-            return Err(corrupt());
-        }
-        if self.cfg.content_mode == ContentMode::Normal && n_src_rows != avgs[0] {
-            return Err(corrupt());
-        }
-        if self.cfg.columnsize {
-            let docsize_q = quote_ident(&state.shadows.docsize);
-            let n_docsize = ctx
-                .query_sql(&format!("SELECT count(*) FROM {db_q}.{docsize_q}"), &[])?
-                .first()
-                .and_then(|r| r.first())
-                .map_or(0, Value::to_integer_lossy);
-            if n_docsize as u64 != avgs[0] {
-                return Err(corrupt());
-            }
-        }
-        if actual != expected {
-            return Err(SqliteError::new(
-                ErrorCode::Corrupt,
-                format!(
-                    "fts5: checksum mismatch for table \"{}\"",
-                    state.shadows.table_name
-                ),
-            ));
-        }
-        Ok(())
+
+        // Pass the expected checksum down to the FTS index module. It will verify, amongst
+        // other things, that it matches the checksum generated by inspecting the index
+        // itself.
+        state.index.integrity_check(ctx, cksum, b_use_cksum)
     }
 }
 
@@ -6865,136 +5625,160 @@ fn parse_rank_expression(s: &str) -> Result<Vec<f64>> {
 }
 
 impl VirtualTable for Fts5Table {
+    /// `fts5BestIndexMethod`. `idxNum` carries the ORDER BY flags (`FTS5_BI_ORDER_*`), `idxStr`
+    /// one item per xFilter argument: `M<col>` (MATCH; col == number of columns for the table
+    /// itself), `r` (rank), `L<col>` / `G<col>` (LIKE / GLOB served by a trigram tokenizer),
+    /// `=`, `<`, `>` (rowid constraints).
     fn best_index(&self, info: &mut VTabIndexInfo) -> Result<()> {
-        let tbl_col = self.hidden_tbl_col();
+        let n_col = self.hidden_tbl_col();
         let rank_col = self.hidden_rank_col();
+        let mut idx_flags = 0i32;
+        let mut idx_str = String::new();
+        let mut i_cons = 0usize;
+        let mut b_seen_eq = false;
+        let mut b_seen_gt = false;
+        let mut b_seen_lt = false;
+        let mut n_seen_match = 0usize;
+        let mut b_seen_rank = false;
 
-        // `fts5BestIndexMethod`: every MATCH (or `ft = ?`) constraint is consumed; all of them
-        // are ANDed together. `rank MATCH ?` / `rank = ?` selects the ranking function.
-        let is_match_like = |c: &sqliters_types::VTabConstraint| {
-            c.op == VTabConstraintOp::Match
-                || (c.op == VTabConstraintOp::Eq && c.i_column >= tbl_col)
-        };
-        let mut plan: Vec<String> = Vec::new();
-        let mut argv_pos = 0usize;
-        let mut n_match = 0usize;
-        let mut seen_rank = false;
-        for (i, c) in info.constraints.iter().enumerate() {
-            if !is_match_like(c) {
-                continue;
-            }
-            if !c.usable || c.i_column < 0 {
-                // An unusable MATCH constraint makes this an unusable plan.
-                return Err(SqliteError::new(
-                    ErrorCode::Constraint,
-                    "unusable fts5 match constraint",
-                ));
-            }
-            if c.i_column == rank_col {
-                if seen_rank {
-                    continue;
+        for i in 0..info.constraints.len() {
+            let (op, i_col, usable) = {
+                let c = &info.constraints[i];
+                (c.op, c.i_column, c.usable)
+            };
+            if op == VTabConstraintOp::Match || (op == VTabConstraintOp::Eq && i_col >= n_col) {
+                // A MATCH operator or equivalent
+                if !usable || i_col < 0 {
+                    // As there exists an unusable MATCH constraint this is an unusable plan.
+                    return Err(SqliteError::new(
+                        ErrorCode::Constraint,
+                        "unusable fts5 match constraint",
+                    ));
                 }
-                seen_rank = true;
-                plan.push("r".to_owned());
-            } else {
-                n_match += 1;
-                plan.push(format!("M{}", c.i_column));
-            }
-            argv_pos += 1;
-            info.constraint_usage[i].argv_index = argv_pos;
-            info.constraint_usage[i].omit = true;
-        }
-
-        let mut idx_num = IDX_FULLSCAN;
-        let mut idx_str = None;
-        if n_match > 0 {
-            idx_num = IDX_MATCH;
-            idx_str = Some(plan.join(","));
-            if seen_rank {
-                idx_num |= IDX_FLAG_HAS_RANK_CFG;
-            }
-            info.estimated_cost = 10.0;
-            info.estimated_rows = 10;
-        } else {
-            // Without a MATCH the rank constraint is left to the caller (it never holds).
-            for (i, c) in info.constraints.iter().enumerate() {
-                if is_match_like(c) {
-                    info.constraint_usage[i].argv_index = 0;
-                    info.constraint_usage[i].omit = false;
-                }
-            }
-            argv_pos = 0;
-            let mut like_cidx: Option<(usize, VTabConstraintOp)> = None;
-            let mut rowid_eq_cidx: Option<usize> = None;
-            for (i, c) in info.constraints.iter().enumerate() {
-                if !c.usable || is_match_like(c) {
-                    continue;
-                }
-                if c.i_column == -1 && c.op == VTabConstraintOp::Eq {
-                    if rowid_eq_cidx.is_none() {
-                        rowid_eq_cidx = Some(i);
+                if i_col == rank_col {
+                    if b_seen_rank {
+                        continue;
                     }
-                } else if matches!(c.op, VTabConstraintOp::Like | VTabConstraintOp::Glob)
-                    && c.i_column >= 0
-                    && c.i_column < tbl_col
-                    && like_cidx.is_none()
-                {
-                    // `fts5UsePatternMatch`: a case-insensitive trigram tokenizer without
-                    // diacritic removal serves LIKE and GLOB, a case-sensitive one GLOB.
-                    let ok = match self.cfg.tokenizer.tok.pattern() {
+                    idx_str.push('r');
+                    b_seen_rank = true;
+                } else {
+                    n_seen_match += 1;
+                    idx_str.push('M');
+                    idx_str.push_str(&i_col.to_string());
+                }
+                i_cons += 1;
+                info.constraint_usage[i].argv_index = i_cons;
+                info.constraint_usage[i].omit = true;
+            } else if usable {
+                let pattern_ok = i_col >= 0
+                    && i_col < n_col
+                    && matches!(op, VTabConstraintOp::Like | VTabConstraintOp::Glob)
+                    && match self.cfg.tokenizer.tok.pattern() {
+                        // `fts5UsePatternMatch`: a case-insensitive trigram tokenizer without
+                        // diacritic removal serves LIKE and GLOB, a case-sensitive one GLOB.
                         TokenizerPattern::Like => true,
-                        TokenizerPattern::Glob => c.op == VTabConstraintOp::Glob,
+                        TokenizerPattern::Glob => op == VTabConstraintOp::Glob,
                         TokenizerPattern::None => false,
                     };
-                    if ok {
-                        like_cidx = Some((i, c.op));
+                if pattern_ok {
+                    idx_str.push(if op == VTabConstraintOp::Like {
+                        'L'
+                    } else {
+                        'G'
+                    });
+                    idx_str.push_str(&i_col.to_string());
+                    i_cons += 1;
+                    info.constraint_usage[i].argv_index = i_cons;
+                    n_seen_match += 1;
+                } else if !b_seen_eq && op == VTabConstraintOp::Eq && i_col < 0 {
+                    idx_str.push('=');
+                    b_seen_eq = true;
+                    i_cons += 1;
+                    info.constraint_usage[i].argv_index = i_cons;
+                    info.constraint_usage[i].omit = true;
+                }
+            }
+        }
+
+        if !b_seen_eq {
+            for i in 0..info.constraints.len() {
+                let (op, i_col, usable) = {
+                    let c = &info.constraints[i];
+                    (c.op, c.i_column, c.usable)
+                };
+                if i_col < 0 && usable {
+                    if matches!(op, VTabConstraintOp::Lt | VTabConstraintOp::Le) {
+                        if b_seen_lt {
+                            continue;
+                        }
+                        idx_str.push('<');
+                        i_cons += 1;
+                        info.constraint_usage[i].argv_index = i_cons;
+                        b_seen_lt = true;
+                    } else if matches!(op, VTabConstraintOp::Gt | VTabConstraintOp::Ge) {
+                        if b_seen_gt {
+                            continue;
+                        }
+                        idx_str.push('>');
+                        i_cons += 1;
+                        info.constraint_usage[i].argv_index = i_cons;
+                        b_seen_gt = true;
                     }
                 }
             }
-            if let Some((li, lop)) = like_cidx {
-                argv_pos += 1;
-                info.constraint_usage[li].argv_index = argv_pos;
-                info.constraint_usage[li].omit = false;
-                idx_num = if lop == VTabConstraintOp::Like {
-                    IDX_LIKE
-                } else {
-                    IDX_GLOB
-                };
-                info.estimated_cost = 10.0;
-                info.estimated_rows = 10;
-            } else if let Some(rqi) = rowid_eq_cidx {
-                argv_pos += 1;
-                info.constraint_usage[rqi].argv_index = argv_pos;
-                info.constraint_usage[rqi].omit = true;
-                idx_num = IDX_ROWID_EQ;
-                info.estimated_cost = 1.0;
-                info.estimated_rows = 1;
-            } else {
-                info.estimated_cost = 10_000.0;
-                info.estimated_rows = 1_000;
-            }
         }
-        let _ = argv_pos;
 
+        // Set idxFlags flags for the ORDER BY clause
         if info.order_by.len() == 1 {
-            let ob = &info.order_by[0];
-            if ob.i_column == rank_col && (idx_num & 0xff) == IDX_MATCH {
-                idx_num |= if ob.desc {
-                    IDX_FLAG_ORDER_RANK_DESC
-                } else {
-                    IDX_FLAG_ORDER_RANK_ASC
-                };
-                info.order_by_consumed = true;
+            let ob = info.order_by[0];
+            if ob.i_column == rank_col && n_seen_match > 0 {
+                idx_flags |= FTS5_BI_ORDER_RANK;
             } else if ob.i_column == -1 {
-                idx_num |= if ob.desc {
-                    IDX_FLAG_ORDER_ROWID_DESC
-                } else {
-                    IDX_FLAG_ORDER_ROWID_ASC
-                };
+                idx_flags |= FTS5_BI_ORDER_ROWID;
+            }
+            if (idx_flags & (FTS5_BI_ORDER_RANK | FTS5_BI_ORDER_ROWID)) != 0 {
                 info.order_by_consumed = true;
+                if ob.desc {
+                    idx_flags |= FTS5_BI_ORDER_DESC;
+                }
             }
         }
 
+        // Calculate the estimated cost based on the flags set in idxFlags.
+        if b_seen_eq {
+            info.estimated_cost = if n_seen_match > 0 { 25000.0 } else { 25.0 };
+            info.estimated_rows = 1;
+            info.idx_flags |= 1; // SQLITE_INDEX_SCAN_UNIQUE
+        } else {
+            let mut n_est_rows: i64;
+            if n_seen_match > 0 {
+                if b_seen_lt && b_seen_gt {
+                    info.estimated_cost = 50000.0;
+                } else if b_seen_lt || b_seen_gt {
+                    info.estimated_cost = 37500.0;
+                } else {
+                    info.estimated_cost = 50000.0;
+                }
+                n_est_rows = (info.estimated_cost / 40.0) as i64;
+                for _ in 1..n_seen_match {
+                    info.estimated_cost *= 2.5;
+                    n_est_rows /= 2;
+                }
+            } else {
+                if b_seen_lt && b_seen_gt {
+                    info.estimated_cost = 750_000.0;
+                } else if b_seen_lt || b_seen_gt {
+                    info.estimated_cost = 2_250_000.0;
+                } else {
+                    info.estimated_cost = 3_000_000.0;
+                }
+                n_est_rows = (info.estimated_cost / 4.0) as i64;
+            }
+            info.estimated_rows = n_est_rows;
+        }
+
+        // What C finds out lazily in xColumn, the cursor of this implementation has to
+        // know when it is filtered: whether column values and the rank are read at all.
         let n_vis = self.cfg.columns.len();
         let vis_mask = if n_vis == 0 {
             0u64
@@ -7003,19 +5787,20 @@ impl VirtualTable for Fts5Table {
         } else {
             (1u64 << n_vis) - 1
         };
+        let mut hint = 0u64;
         if (info.col_used & vis_mask) != 0 {
-            idx_num |= IDX_FLAG_NEEDS_CONTENT;
+            hint |= PLAN_HINT_NEEDS_CONTENT;
         }
         let rank_bit = 1u64 << (rank_col as usize).min(63);
-        if (info.col_used & rank_bit) != 0
-            || (idx_num & (IDX_FLAG_ORDER_RANK_ASC | IDX_FLAG_ORDER_RANK_DESC)) != 0
-            || (idx_num & IDX_FLAG_HAS_RANK_CFG) != 0
-        {
-            idx_num |= IDX_FLAG_NEEDS_RANK_COL;
+        // A `rank MATCH '...'` term alone does not make C call the ranking function: it is
+        // looked up when the rank column is read or the sorter statement is prepared.
+        if (info.col_used & rank_bit) != 0 || (idx_flags & FTS5_BI_ORDER_RANK) != 0 {
+            hint |= PLAN_HINT_NEEDS_RANK_COL;
         }
+        info.plan_hint = hint;
 
-        info.idx_num = idx_num;
-        info.idx_str = idx_str;
+        info.idx_num = idx_flags;
+        info.idx_str = Some(idx_str);
         Ok(())
     }
 
@@ -7026,98 +5811,114 @@ impl VirtualTable for Fts5Table {
             state: Arc::clone(&self.state),
             rows: Vec::new(),
             pos: 0,
+            plan_hint: 0,
         }))
     }
 
     fn begin(&mut self, _ctx: &mut dyn VTabHostContext) -> Result<()> {
+        // `fts5NewTransaction` -> `sqlite3Fts5IndexReset`: the cached structure is dropped
+        // when the database has changed since it was read. Nothing is pending when a
+        // transaction starts, so the structure is simply read again on first use.
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.in_tx = true;
+        st.index.structure_invalidate();
         Ok(())
     }
 
+    /// `fts5SyncMethod`.
     fn sync(&mut self, ctx: &mut dyn VTabHostContext) -> Result<()> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.flush_pending(&self.cfg, ctx)
+        Self::flush_to_disk(&mut st, ctx)
     }
 
+    /// `fts5CommitMethod`.
     fn commit(&mut self, _ctx: &mut dyn VTabHostContext) -> Result<()> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.in_tx = false;
-        st.pending.clear();
+        st.i_savepoint = 0;
         Ok(())
     }
 
+    /// `fts5RollbackMethod`.
     fn rollback(&mut self, _ctx: &mut dyn VTabHostContext) -> Result<()> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.in_tx = false;
-        st.pending.clear();
+        st.storage_rollback();
+        st.index.config.pgsz = 0;
+        st.i_savepoint = 0;
+        Ok(())
+    }
+
+    /// `fts5SavepointMethod`.
+    fn savepoint(&mut self, ctx: &mut dyn VTabHostContext, idx: usize) -> Result<()> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        sqliters_types::dtrace!("TR|f5|hook|savepoint i={}", idx as i64);
+        Self::flush_to_disk(&mut st, ctx)?;
+        st.i_savepoint = idx as i64 + 1;
+        Ok(())
+    }
+
+    /// `fts5ReleaseMethod`.
+    fn release(&mut self, ctx: &mut dyn VTabHostContext, idx: usize) -> Result<()> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let flush = (idx as i64 + 1) < st.i_savepoint;
+        sqliters_types::dtrace!(
+            "TR|f5|hook|release i={} flush={}",
+            idx as i64,
+            u8::from(flush)
+        );
+        if flush {
+            Self::flush_to_disk(&mut st, ctx)?;
+            st.i_savepoint = idx as i64;
+        }
+        Ok(())
+    }
+
+    /// `fts5RollbackToMethod`.
+    fn rollback_to(&mut self, _ctx: &mut dyn VTabHostContext, idx: usize) -> Result<()> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let discard = (idx as i64 + 1) <= st.i_savepoint;
+        sqliters_types::dtrace!(
+            "TR|f5|hook|rollbackto i={} discard={}",
+            idx as i64,
+            u8::from(discard)
+        );
+        if discard {
+            st.index.config.pgsz = 0;
+            st.storage_rollback();
+        }
+        // The shadow tables have gone back to the savepoint.
         st.read_cache.clear_all();
         Ok(())
     }
 
-    fn savepoint(&mut self, _ctx: &mut dyn VTabHostContext, idx: usize) -> Result<()> {
+    /// `fts5IntegrityMethod`: `sqlite3Fts5StorageIntegrity(pStorage, 0)`; the text of the
+    /// index's own error message if it left one, otherwise the generic message.
+    fn integrity(
+        &mut self,
+        ctx: &mut dyn VTabHostContext,
+        schema: &str,
+        table: &str,
+        _is_quick: bool,
+    ) -> Result<Option<String>> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.in_tx = true;
-        let ops_len = st.pending.ops.len();
-        let approx_bytes = st.pending.approx_bytes;
-        st.pending.savepoints.push(PendingSavepoint {
-            idx,
-            ops_len,
-            approx_bytes,
-            flushed_since: false,
-            flushed_pre_ops: None,
-        });
-        Ok(())
-    }
-
-    fn release(&mut self, _ctx: &mut dyn VTabHostContext, idx: usize) -> Result<()> {
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(pos) = st.pending.savepoints.iter().position(|sp| sp.idx >= idx) {
-            st.pending.savepoints.truncate(pos);
-        }
-        Ok(())
-    }
-
-    fn rollback_to(&mut self, _ctx: &mut dyn VTabHostContext, idx: usize) -> Result<()> {
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(pos) = st.pending.savepoints.iter().position(|sp| sp.idx >= idx) {
-            let any_flushed = st.pending.savepoints[pos..]
-                .iter()
-                .any(|sp| sp.flushed_since);
-            let target_len = st.pending.savepoints[pos].ops_len;
-            let target_bytes = st.pending.savepoints[pos].approx_bytes;
-            let keep_same = st.pending.savepoints[pos].idx == idx;
-            let pre_ops = st.pending.savepoints[pos].flushed_pre_ops.clone();
-
-            if keep_same {
-                st.pending.savepoints.truncate(pos + 1);
-                st.pending.savepoints[pos].flushed_since = false;
-                st.pending.savepoints[pos].flushed_pre_ops = None;
-            } else {
-                st.pending.savepoints.truncate(pos);
+        match self.verify_integrity(&mut st, ctx, false) {
+            Ok(()) => Ok(None),
+            Err(e) if e.code == ErrorCode::Corrupt => {
+                if e.message.starts_with("fts5: ") {
+                    Ok(Some(e.message))
+                } else {
+                    Ok(Some(format!(
+                        "malformed inverted index for FTS5 table {schema}.{table}"
+                    )))
+                }
             }
-
-            if any_flushed {
-                st.pending.ops = pre_ops.unwrap_or_default();
-                st.pending.approx_bytes =
-                    st.pending.ops.iter().map(PendingOp::approx_mem_bytes).sum();
-                st.read_cache.clear_all();
-            } else {
-                st.pending.ops.truncate(target_len);
-                st.pending.approx_bytes = target_bytes;
-                st.read_cache.clear_docsize();
-                st.read_cache.configured_rank_weights = None;
-                st.read_cache.secure_delete = None;
-            }
-        } else {
-            st.read_cache.clear_all();
+            Err(e) => Err(e),
         }
-        Ok(())
     }
 
+    /// The pending data of this table is written out before an `fts5vocab` cursor on it is
+    /// opened (`fts5VocabOpenMethod` -> `sqlite3Fts5FlushToDisk`).
     fn flush_before_shadow_access(&mut self, ctx: &mut dyn VTabHostContext) -> Result<()> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.flush_pending(&self.cfg, ctx)
+        Self::flush_to_disk(&mut st, ctx)
     }
 
     fn invalidate_shadow_cache(&mut self) {
@@ -7132,6 +5933,10 @@ impl VirtualTable for Fts5Table {
         op: VTabUpdateOperation,
     ) -> Result<Option<i64>> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.index.config.pgsz == 0 {
+            let cookie = st.index.config.i_cookie;
+            st.index.config_load(ctx, cookie)?;
+        }
         let n_cols = self.cfg.columns.len();
         let name = st.shadows.table_name.clone();
         // fts5IsContentless(pTab, 1)
@@ -7151,7 +5956,8 @@ impl VirtualTable for Fts5Table {
                 {
                     let cmd = fts5_value_text(cmd_val).unwrap_or_default().into_owned();
                     self.execute_special_command(&mut st, ctx, &cmd, new_rowid, &values)?;
-                    return Ok(None);
+                    // (xUpdate leaves *pRowid at 0: OP_VUpdate stores it in db->lastRowid)
+                    return Ok(Some(0));
                 }
                 let new_rowid = new_rowid.filter(|v| !v.is_null());
                 if conflict == VTabConflictMode::Replace
@@ -7231,7 +6037,7 @@ impl VirtualTable for Fts5Table {
                     } else {
                         // Detect a conflict on the new rowid before the index is touched.
                         self.content_insert(&mut st, ctx, false, Some(&new_val), col_vals)?;
-                        self.storage_delete_keep_new_content(&mut st, ctx, old_rid)?;
+                        self.storage_delete(&mut st, ctx, old_rid, None)?;
                         self.index_insert(&mut st, ctx, new_rid, col_vals)?;
                     }
                 } else if content_only {
@@ -7253,15 +6059,16 @@ impl VirtualTable for Fts5Table {
 
     fn rename(&mut self, ctx: &mut dyn VTabHostContext, new_name: &str) -> Result<()> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.flush_pending(&self.cfg, ctx)?;
+        // `sqlite3Fts5StorageRename`
+        st.storage_sync(ctx)?;
         let db_q = quote_ident(ctx.db_name());
         let old_name = st.shadows.table_name.clone();
         let mut suffixes = vec!["data", "idx", "config"];
-        if self.cfg.has_content_table() {
-            suffixes.push("content");
-        }
         if self.cfg.columnsize {
             suffixes.push("docsize");
+        }
+        if self.cfg.has_content_table() {
+            suffixes.push("content");
         }
         for suf in suffixes {
             let old_s = quote_ident(&format!("{old_name}_{suf}"));
@@ -7271,14 +6078,15 @@ impl VirtualTable for Fts5Table {
                 &[],
             )?;
         }
-        st.shadows = Fts5ShadowNames::new(new_name);
+        let db_name = ctx.db_name().to_owned();
+        st.set_names(&db_name, new_name, &self.cfg);
+        st.read_cache.clear_all();
         Ok(())
     }
 
     fn destroy(&mut self, ctx: &mut dyn VTabHostContext) -> Result<()> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.pending.clear();
-        st.read_cache.clear_all();
+        st.storage_rollback();
         let db_q = quote_ident(ctx.db_name());
         // `sqlite3Fts5DropAll`: data, idx, config, then docsize, then content.
         for suf in ["data", "idx", "config", "docsize", "content"] {
@@ -7304,6 +6112,8 @@ struct Fts5Cursor {
     state: Arc<Mutex<Fts5SharedState>>,
     rows: Vec<Fts5CursorRow>,
     pos: usize,
+    /// `VTabIndexInfo::plan_hint` of the plan being filtered.
+    plan_hint: u64,
 }
 
 impl Fts5Cursor {
@@ -7345,8 +6155,8 @@ impl Fts5Cursor {
     ) -> Result<Vec<Value>> {
         let db_name = ctx.db_name().to_owned();
         let missing = |content: String| {
-            SqliteError::new(
-                ErrorCode::Corrupt,
+            SqliteError::with_extended(
+                FTS5_CORRUPT,
                 format!("fts5: missing row {rowid} from content table {content}"),
             )
         };
@@ -7421,8 +6231,129 @@ fn extract_like_glob_runs(pat: &str, is_glob: bool) -> Vec<String> {
     runs
 }
 
-impl VirtualCursor for Fts5Cursor {
-    fn filter(
+impl Fts5Cursor {
+    /// `fts5FilterMethod`: decodes the plan of `fts5BestIndexMethod` and runs it.
+    fn filter_plan(
+        &mut self,
+        ctx: &mut dyn VTabHostContext,
+        idx_num: i32,
+        idx_str: Option<&str>,
+        args: &[Value],
+    ) -> Result<()> {
+        let z = idx_str.unwrap_or("").as_bytes();
+        let mut match_items: Vec<String> = Vec::new();
+        let mut match_args: Vec<Value> = Vec::new();
+        let mut like: Option<(bool, Value)> = None;
+        let mut rowid_eq: Option<&Value> = None;
+        let mut rowid_le: Option<&Value> = None;
+        let mut rowid_ge: Option<&Value> = None;
+        let mut has_rank = false;
+        let mut n_match = 0usize;
+        let mut i = 0usize;
+        let mut i_arg = 0usize;
+        while i < z.len() {
+            let c = z[i];
+            i += 1;
+            let arg = args.get(i_arg);
+            i_arg += 1;
+            match c {
+                b'r' => {
+                    has_rank = true;
+                    match_items.push("r".to_owned());
+                    match_args.push(arg.cloned().unwrap_or(Value::Null));
+                }
+                b'M' | b'L' | b'G' => {
+                    let start = i;
+                    while i < z.len() && z[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    let col = std::str::from_utf8(&z[start..i]).unwrap_or("0");
+                    if c == b'M' {
+                        n_match += 1;
+                        match_items.push(format!("M{col}"));
+                        match_args.push(arg.cloned().unwrap_or(Value::Null));
+                    } else if like.is_none() {
+                        like = Some((c == b'G', arg.cloned().unwrap_or(Value::Null)));
+                    }
+                }
+                b'=' => rowid_eq = arg,
+                b'<' => rowid_le = arg,
+                _ => rowid_ge = arg,
+            }
+        }
+
+        let b_desc = (idx_num & FTS5_BI_ORDER_DESC) != 0;
+        let mut legacy = 0i32;
+        if (idx_num & FTS5_BI_ORDER_RANK) != 0 {
+            legacy |= if b_desc {
+                IDX_FLAG_ORDER_RANK_DESC
+            } else {
+                IDX_FLAG_ORDER_RANK_ASC
+            };
+        } else if (idx_num & FTS5_BI_ORDER_ROWID) != 0 {
+            legacy |= if b_desc {
+                IDX_FLAG_ORDER_ROWID_DESC
+            } else {
+                IDX_FLAG_ORDER_ROWID_ASC
+            };
+        }
+        if (self.plan_hint & PLAN_HINT_NEEDS_CONTENT) != 0 {
+            legacy |= IDX_FLAG_NEEDS_CONTENT;
+        }
+        if (self.plan_hint & PLAN_HINT_NEEDS_RANK_COL) != 0 {
+            legacy |= IDX_FLAG_NEEDS_RANK_COL;
+        }
+        if has_rank {
+            legacy |= IDX_FLAG_HAS_RANK_CFG;
+        }
+
+        // Set the cursor upper and lower rowid limits (`fts5GetRowidLimit`: only an integer
+        // value limits the scan).
+        if rowid_eq.is_some() {
+            rowid_le = rowid_eq;
+            rowid_ge = rowid_eq;
+        }
+        let i_last = numeric_integer_value(rowid_le).unwrap_or(i64::MAX);
+        let i_first = numeric_integer_value(rowid_ge).unwrap_or(i64::MIN);
+
+        // `fts5OpenMethod` -> `fts5NewTransaction` -> `sqlite3Fts5IndexReset` (the cached
+        // structure is dropped when the database changed; with nothing pending it is simply
+        // read again) and `fts5FilterMethod` -> `sqlite3Fts5IndexLoadConfig`.
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.index.n_pending_data == 0
+                && st.index.n_contentless_delete == 0
+                && !st.b_totals_valid
+            {
+                st.index.structure_invalidate();
+            }
+            st.index.load_config(ctx)?;
+        }
+
+        let exact_rowid_plan;
+        if n_match > 0 {
+            exact_rowid_plan = false;
+            let plan = match_items.join(",");
+            self.filter_legacy(ctx, IDX_MATCH | legacy, Some(&plan), &match_args)?;
+        } else if let Some((is_glob, pat)) = like {
+            exact_rowid_plan = false;
+            let mode = if is_glob { IDX_GLOB } else { IDX_LIKE };
+            self.filter_legacy(ctx, mode | legacy, None, &[pat])?;
+        } else if let Some(eq) = rowid_eq {
+            exact_rowid_plan = true;
+            self.filter_legacy(ctx, IDX_ROWID_EQ | legacy, None, std::slice::from_ref(eq))?;
+        } else {
+            exact_rowid_plan = false;
+            self.filter_legacy(ctx, IDX_FULLSCAN | legacy, None, &[])?;
+        }
+        if !exact_rowid_plan && (i_first != i64::MIN || i_last != i64::MAX) {
+            self.rows
+                .retain(|r| r.rowid >= i_first && r.rowid <= i_last);
+        }
+        Ok(())
+    }
+
+    fn filter_legacy(
         &mut self,
         ctx: &mut dyn VTabHostContext,
         idx_num: i32,
@@ -7433,10 +6364,7 @@ impl VirtualCursor for Fts5Cursor {
         self.pos = 0;
 
         let shadows = {
-            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if !st.pending.ops.is_empty() {
-                st.flush_pending(&self.cfg, ctx)?;
-            }
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             st.shadows.clone()
         };
 
@@ -7588,7 +6516,7 @@ impl VirtualCursor for Fts5Cursor {
                 let pat = pat_val.to_text_lossy();
                 let runs = extract_like_glob_runs(&pat, mode == IDX_GLOB);
                 if runs.is_empty() {
-                    return self.filter(ctx, IDX_FULLSCAN | (idx_num & !0xff), None, &[]);
+                    return self.filter_legacy(ctx, IDX_FULLSCAN | (idx_num & !0xff), None, &[]);
                 }
                 let mut candidate_rowids: Option<BTreeSet<i64>> = None;
                 {
@@ -7668,6 +6596,19 @@ impl VirtualCursor for Fts5Cursor {
                 };
 
                 let need_rank_val = (idx_num & IDX_FLAG_NEEDS_RANK_COL) != 0;
+                // ORDER BY rank (`fts5CursorFirstSorted`): the index is read and the rank
+                // computed by the statement `SELECT rowid, rank FROM ft ORDER BY <rank>(ft)`
+                // the cursor steps. `sqlite3_step` hands back the primary result code only
+                // (`rc & db->errMask`) and the message of that statement is not passed on.
+                let sorted_by_rank =
+                    (idx_num & (IDX_FLAG_ORDER_RANK_ASC | IDX_FLAG_ORDER_RANK_DESC)) != 0;
+                let sorter_err = move |e: SqliteError| -> SqliteError {
+                    if sorted_by_rank {
+                        SqliteError::new(e.code, e.code.as_str())
+                    } else {
+                        e
+                    }
+                };
                 let contentless = self.cfg.content_mode == ContentMode::Contentless;
                 // detail=column / detail=none: phrase instances come from the row text.
                 let populate_from_text = self.cfg.detail != DetailMode::Full && !contentless;
@@ -7699,19 +6640,35 @@ impl VirtualCursor for Fts5Cursor {
                             }
                         };
                         if need_rank_val {
-                            parse_rank_expression(&spec)?
+                            parse_rank_expression(&spec)
                         } else {
-                            Vec::new()
+                            Ok(Vec::new())
                         }
                     } else if need_rank_val {
-                        st.get_configured_rank_weights(ctx)?
+                        st.get_configured_rank_weights(ctx)
                     } else {
-                        Vec::new()
+                        Ok(Vec::new())
+                    };
+                    // `fts5FindRankFunction` runs when the sorter statement is prepared
+                    // (`fts5CursorFirstSorted`, ORDER BY rank) or when the rank column of a
+                    // row is read (`fts5ColumnMethod`): without a row there is no error.
+                    let rw = match rw {
+                        Ok(v) => Ok(v),
+                        Err(e)
+                            if (idx_num & (IDX_FLAG_ORDER_RANK_ASC | IDX_FLAG_ORDER_RANK_DESC))
+                                != 0 =>
+                        {
+                            return Err(e);
+                        }
+                        Err(e) => Err(e),
                     };
 
                     let mut precomputed_phrases = Vec::with_capacity(phrases.len());
                     for (pi, ph) in phrases.iter().enumerate() {
-                        precomputed_phrases.push(st.eval_phrase_selective(&self.cfg, ctx, pi, ph)?);
+                        precomputed_phrases.push(
+                            st.eval_phrase_selective(&self.cfg, ctx, pi, ph)
+                                .map_err(sorter_err)?,
+                        );
                     }
                     let mut pd_hits = vec![0usize; phrases.len()];
                     let mdocs = eval_query_expr_precomputed(
@@ -7721,9 +6678,16 @@ impl VirtualCursor for Fts5Cursor {
                         &mut pd_hits,
                     );
 
-                    let avgs = st.read_averages(&self.cfg, ctx)?;
+                    let rw = match rw {
+                        Ok(v) => v,
+                        Err(e) if !mdocs.is_empty() => return Err(e),
+                        Err(_) => Vec::new(),
+                    };
+                    let avgs = st.read_averages(&self.cfg, ctx).map_err(sorter_err)?;
                     let tr = avgs[0];
-                    let tt: u64 = avgs[1..].iter().sum();
+                    // (`fts5ApiColumnTotalSize`: i64 additions; the totals of a contentless
+                    // table can have gone below zero through 'delete' commands)
+                    let tt: u64 = avgs[1..].iter().fold(0u64, |a, &b| a.wrapping_add(b));
                     (rw, pd_hits, mdocs, tr, tt)
                 };
 
@@ -7743,9 +6707,16 @@ impl VirtualCursor for Fts5Cursor {
                     let zero_sizes = DocColSizes::zeros(n_cols);
                     let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     for (rid, mut insts) in matched_docs {
-                        let col_sizes = match st.get_or_load_docsize(&self.cfg, ctx, rid)? {
+                        let mut missing_docsize = false;
+                        let col_sizes = match st
+                            .get_or_load_docsize(&self.cfg, ctx, rid)
+                            .map_err(sorter_err)?
+                        {
                             Some(sz) => sz,
-                            None => zero_sizes.clone(),
+                            None => {
+                                missing_docsize = self.cfg.columnsize;
+                                zero_sizes.clone()
+                            }
                         };
                         let slice = insts.as_mut_slice();
                         if !slice.is_sorted_by_key(inst_key) {
@@ -7762,6 +6733,7 @@ impl VirtualCursor for Fts5Cursor {
                             instances: insts,
                             texts: None,
                             missing_content: false,
+                            missing_docsize,
                         });
                     }
                 } else {
@@ -7801,11 +6773,18 @@ impl VirtualCursor for Fts5Cursor {
                             None
                         };
                         // `fts5ApiColumnSize`
+                        let mut missing_docsize = false;
                         let col_sizes = if self.cfg.columnsize {
                             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                            match st.get_or_load_docsize(&self.cfg, ctx, rid)? {
+                            match st
+                                .get_or_load_docsize(&self.cfg, ctx, rid)
+                                .map_err(sorter_err)?
+                            {
                                 Some(sz) => sz,
-                                None => DocColSizes::zeros(n_cols),
+                                None => {
+                                    missing_docsize = true;
+                                    DocColSizes::zeros(n_cols)
+                                }
                             }
                         } else if contentless {
                             DocColSizes::zeros(n_cols)
@@ -7847,6 +6826,7 @@ impl VirtualCursor for Fts5Cursor {
                             instances: insts,
                             texts,
                             missing_content,
+                            missing_docsize,
                         });
                     }
                 }
@@ -7867,7 +6847,10 @@ impl VirtualCursor for Fts5Cursor {
                 for (idx, r) in self.rows.iter_mut().enumerate() {
                     r.aux_handle = Fts5AuxRegistry::encode_handle(qid, idx);
                     if need_rank_val {
-                        r.rank = Some(compute_bm25_for_row(&qctx, Some(idx), &rank_weights)?);
+                        r.rank = Some(
+                            compute_bm25_for_row(&qctx, Some(idx), &rank_weights)
+                                .map_err(sorter_err)?,
+                        );
                     }
                 }
 
@@ -7918,11 +6901,15 @@ impl VirtualCursor for Fts5Cursor {
                         })
                         .collect()
                 };
+                let mut missing_docsize = false;
                 let col_sizes = if self.cfg.columnsize {
                     let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     match st.get_or_load_docsize(&self.cfg, ctx, r.rowid)? {
                         Some(sz) => sz,
-                        None => DocColSizes::zeros(n_cols),
+                        None => {
+                            missing_docsize = true;
+                            DocColSizes::zeros(n_cols)
+                        }
                     }
                 } else if contentless {
                     DocColSizes::zeros(n_cols)
@@ -7934,6 +6921,7 @@ impl VirtualCursor for Fts5Cursor {
                     instances: PhraseHits::new(),
                     texts: Some(Box::new(AuxRowTexts { col_texts })),
                     missing_content: false,
+                    missing_docsize,
                 });
             }
             let qctx = Arc::new(AuxQueryContext::build(
@@ -7956,6 +6944,22 @@ impl VirtualCursor for Fts5Cursor {
             }
         }
         Ok(())
+    }
+}
+
+impl VirtualCursor for Fts5Cursor {
+    fn set_plan_hint(&mut self, hint: u64) {
+        self.plan_hint = hint;
+    }
+
+    fn filter(
+        &mut self,
+        ctx: &mut dyn VTabHostContext,
+        idx_num: i32,
+        idx_str: Option<&str>,
+        args: &[Value],
+    ) -> Result<()> {
+        self.filter_plan(ctx, idx_num, idx_str, args)
     }
 
     fn next(&mut self) -> Result<()> {
@@ -8099,9 +7103,52 @@ struct Fts5VocabTable {
 }
 
 impl VirtualTable for Fts5VocabTable {
+    /// fts5_vocab.c `fts5VocabBestIndexMethod`: `idxNum` = the `colUsed` mask plus
+    /// `FTS5_VOCAB_TERM_EQ` (0x100) / `_GE` (0x200) / `_LE` (0x400) for the usable constraints
+    /// on the `term` column (the last one of each kind wins); cost 100 with an equality,
+    /// otherwise 1000000 halved per range end; `ORDER BY term [ASC]` alone is consumed. No
+    /// constraint is omitted, so the core tests every term again.
     fn best_index(&self, info: &mut VTabIndexInfo) -> Result<()> {
-        info.estimated_cost = 100.0;
-        info.estimated_rows = 100;
+        let mut i_term_eq = None;
+        let mut i_term_ge = None;
+        let mut i_term_le = None;
+        let mut idx_num = (info.col_used & 0xFF) as i32;
+        for (i, c) in info.constraints.iter().enumerate() {
+            if !c.usable || c.i_column != 0 {
+                continue;
+            }
+            match c.op {
+                VTabConstraintOp::Eq => i_term_eq = Some(i),
+                VTabConstraintOp::Le | VTabConstraintOp::Lt => i_term_le = Some(i),
+                VTabConstraintOp::Ge | VTabConstraintOp::Gt => i_term_ge = Some(i),
+                _ => {}
+            }
+        }
+        let mut n_arg = 0usize;
+        if let Some(i) = i_term_eq {
+            idx_num |= 0x0100;
+            n_arg += 1;
+            info.constraint_usage[i].argv_index = n_arg;
+            info.estimated_cost = 100.0;
+        } else {
+            info.estimated_cost = 1_000_000.0;
+            if let Some(i) = i_term_ge {
+                idx_num |= 0x0200;
+                n_arg += 1;
+                info.constraint_usage[i].argv_index = n_arg;
+                info.estimated_cost /= 2.0;
+            }
+            if let Some(i) = i_term_le {
+                idx_num |= 0x0400;
+                n_arg += 1;
+                info.constraint_usage[i].argv_index = n_arg;
+                info.estimated_cost /= 2.0;
+            }
+        }
+        if info.order_by.len() == 1 && info.order_by[0].i_column == 0 && !info.order_by[0].desc {
+            info.order_by_consumed = true;
+        }
+        info.idx_num = idx_num;
         Ok(())
     }
 
@@ -8203,12 +7250,38 @@ impl VirtualCursor for Fts5VocabCursor {
     fn filter(
         &mut self,
         ctx: &mut dyn VTabHostContext,
-        _idx_num: i32,
+        idx_num: i32,
         _idx_str: Option<&str>,
-        _args: &[Value],
+        args: &[Value],
     ) -> Result<()> {
         self.rows.clear();
         self.pos = 0;
+        // `fts5VocabFilterMethod`: the term limits xBestIndex asked for, in argument order
+        // EQ, GE, LE; a value that is not TEXT is no limit. With an equality only that term
+        // is visited (an IN list is run as one scan per value); otherwise the scan starts at
+        // the first term >= GE and stops after the last term <= LE (memcmp order).
+        let mut i_val = 0usize;
+        let mut next_text = |on: bool| -> Option<Vec<u8>> {
+            if !on {
+                return None;
+            }
+            let v = args.get(i_val);
+            i_val += 1;
+            match v {
+                Some(Value::Text(t)) => Some(t.as_bytes().to_vec()),
+                _ => None,
+            }
+        };
+        let term_eq = next_text((idx_num & 0x0100) != 0);
+        let term_ge = next_text((idx_num & 0x0200) != 0);
+        let term_le = next_text((idx_num & 0x0400) != 0);
+        let (term_ge, term_le) = if term_eq.is_some() {
+            (None, None)
+        } else {
+            (term_ge, term_le)
+        };
+        // `fts5VocabOpenMethod`: `sqlite3Fts5FlushToDisk(pFts5)`.
+        ctx.flush_vtab_pending(self.target_db.as_deref(), &self.target_tbl)?;
         let db_name = self.target_db.as_deref().unwrap_or_else(|| ctx.db_name());
         let db_q = quote_ident(db_name);
 
@@ -8234,6 +7307,13 @@ impl VirtualCursor for Fts5VocabCursor {
         for (tkey, docs) in merged {
             // Only main-index terms (`b'0'` prefix byte), skip prefix-index entries (`b'1'..`)
             if tkey.first().copied() != Some(b'0') {
+                continue;
+            }
+            let term_bytes = &tkey[1..];
+            if term_eq.as_deref().is_some_and(|t| t != term_bytes)
+                || term_ge.as_deref().is_some_and(|t| term_bytes < t)
+                || term_le.as_deref().is_some_and(|t| term_bytes > t)
+            {
                 continue;
             }
             let term_str = String::from_utf8_lossy(&tkey[1..]).into_owned();

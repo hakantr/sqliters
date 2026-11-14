@@ -1243,6 +1243,8 @@ pub(crate) fn rollback_all_databases(
     ctx: &mut ExecContext<'_>,
     reload_schemas_if_changed: bool,
 ) -> Result<()> {
+    // main.c `sqlite3RollbackAll`: `db->flags &= ~(SQLITE_DeferFKs|SQLITE_CorruptRdOnly)`.
+    ctx.db_set.set_corrupt_rdonly(false);
     ctx.db_set.invalidate_all_blobs();
     let write_only = !*ctx.schema_changed_in_tx;
     let mut first_err: Option<SqliteError> = None;
@@ -2114,6 +2116,27 @@ pub(crate) fn commit_transaction(ctx: &mut ExecContext<'_>) -> Result<()> {
         ));
     }
 
+    // vdbeaux.c `sqlite3VdbeHalt`: `else if( db->flags & SQLITE_CorruptRdOnly ){ rc =
+    // SQLITE_CORRUPT; db->flags &= ~SQLITE_CorruptRdOnly; }` — the commit is not attempted
+    // and the transaction is rolled back (`sqlite3RollbackAll`).
+    if ctx.db_set.corrupt_rdonly() {
+        ctx.db_set.set_corrupt_rdonly(false);
+        let rollback_res = rollback_all_databases(ctx, true);
+        *ctx.rollback_count += 1;
+        *ctx.explicit_tx = false;
+        *ctx.implicit_savepoint_tx = false;
+        *ctx.in_user_btree_tx = false;
+        ctx.savepoints.clear();
+        *ctx.schema_changed_in_tx = false;
+        ctx.deferred_fk_suspects.clear();
+        ctx.publish();
+        rollback_res?;
+        return Err(SqliteError::new(
+            ErrorCode::Corrupt,
+            "database disk image is malformed",
+        ));
+    }
+
     match commit_all_databases(ctx) {
         Ok(()) => {
             *ctx.explicit_tx = false;
@@ -2193,8 +2216,12 @@ pub(crate) fn release_savepoint_op(ctx: &mut ExecContext<'_>, sp_name: &str) -> 
                 bt.pager_mut().release_subsavepoint(slot_depth)?;
             }
         }
-        crate::vtab::vtab_release_all(ctx, slot_depth)?;
+        // vdbe.c OP_Savepoint: the savepoints are destroyed (`db->nSavepoint--`) before
+        // `sqlite3VtabSavepoint(db, SAVEPOINT_RELEASE, ..)` — what a module writes from
+        // xRelease (FTS5 flushes there after a nested savepoint) belongs to the enclosing
+        // level and must not reopen the released one.
         ctx.savepoints.truncate(pos);
+        crate::vtab::vtab_release_all(ctx, slot_depth)?;
         Ok(())
     }
 }
@@ -2368,8 +2395,11 @@ pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
                 ));
             }
             let was_autocommit = is_in_autocommit(ctx);
-            crate::vtab::vtab_flush_shadow_all(ctx)?;
             let slot_idx = ctx.savepoints.len();
+            // vdbe.c OP_Savepoint: `sqlite3VtabSavepoint(db, SAVEPOINT_BEGIN, ..)` runs before
+            // the savepoint exists — what a module writes from xSavepoint (FTS5 flushes its
+            // pending data) is outside the new savepoint and survives ROLLBACK TO.
+            crate::vtab::vtab_savepoint_all(ctx, slot_idx)?;
             for db_slot in ctx.db_set.slots_mut() {
                 if let Some(ref mut bt) = db_slot.btree {
                     if slot_idx == 0 {
@@ -2380,7 +2410,6 @@ pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
                     }
                 }
             }
-            crate::vtab::vtab_savepoint_all(ctx, slot_idx)?;
             let schemas_at_open = ctx
                 .db_set
                 .slots()
@@ -2483,7 +2512,32 @@ pub(crate) fn execute_nolock_stmt(
 
 /// Executes a `Read` statement body (`SELECT`, `EXPLAIN`, or read `PRAGMA`) lazily opening `Read`
 /// transactions on referenced `DatabaseSet` slots without ending them prematurely.
+/// vdbe.c `abort_due_to_error`: `if( rc==SQLITE_CORRUPT && db->autoCommit==0 ) db->flags |=
+/// SQLITE_CorruptRdOnly` — the result code without extended bits (a module's
+/// SQLITE_CORRUPT_VTAB does not count). From then on `OP_Transaction` refuses every write
+/// statement with SQLITE_CORRUPT, and COMMIT rolls the transaction back (`sqlite3VdbeHalt`).
+#[inline]
+fn note_corrupt_in_transaction<T>(ctx: &mut ExecContext<'_>, res: &Result<T>) {
+    if let Err(e) = res
+        && e.code == ErrorCode::Corrupt
+        && e.extended_code == ErrorCode::Corrupt as i32
+        && (*ctx.explicit_tx || *ctx.implicit_savepoint_tx)
+    {
+        ctx.db_set.set_corrupt_rdonly(true);
+    }
+}
+
 pub(crate) fn execute_read_body(
+    ctx: &mut ExecContext<'_>,
+    stmt: &Stmt,
+    params: &[Value],
+) -> Result<QueryOutput> {
+    let res = execute_read_body_inner(ctx, stmt, params);
+    note_corrupt_in_transaction(ctx, &res);
+    res
+}
+
+fn execute_read_body_inner(
     ctx: &mut ExecContext<'_>,
     stmt: &Stmt,
     params: &[Value],
@@ -2664,6 +2718,102 @@ pub(crate) fn apply_stmt_journal_policy(ctx: &mut ExecContext<'_>, stmt: &Stmt) 
     }
 }
 
+/// vdbe.c `OP_Transaction`: `sqlite3VtabSavepoint(db, SAVEPOINT_BEGIN, p->iStatement-1)` is
+/// called before `sqlite3BtreeBeginStmt` — what a module writes from xSavepoint (FTS5 flushes
+/// its pending data there) is not part of the statement and stays when the statement is
+/// rolled back. The statement's own savepoint is opened by its first write, as before.
+pub(crate) fn vtab_savepoint_before_stmt(ctx: &mut ExecContext<'_>, sp_slot: usize) -> Result<()> {
+    let saved_slot = ctx.stmt_tx.stmt_sp_slot.take();
+    let saved_mask = ctx.stmt_tx.touched_write_mask;
+    let res = crate::vtab::vtab_savepoint_all(ctx, sp_slot);
+    ctx.stmt_tx.touched_write_mask = saved_mask;
+    ctx.stmt_tx.stmt_sp_slot = saved_slot;
+    res
+}
+
+/// `OP_VBegin`: a DML statement whose target is a virtual table calls xBegin on it when the
+/// program starts — before any row is looked at, so also when the statement changes no row.
+/// From then on the table takes part in the transaction (statement savepoints, xSync,
+/// xCommit / xRollback).
+pub(crate) fn vtab_begin_for_dml(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Result<()> {
+    let (target, kind) = match stmt {
+        Stmt::Insert(i) => (&i.table, 0u8),
+        Stmt::Update(u) => (&u.table, 1u8),
+        Stmt::Delete(d) => (&d.table, 2u8),
+        _ => return Ok(()),
+    };
+    if ctx
+        .db_set
+        .slots()
+        .iter()
+        .all(|s| s.schema.virtual_tables.is_empty())
+    {
+        return Ok(());
+    }
+    let mut visited: Vec<(usize, String)> = Vec::new();
+    vtab_begin_for_target(ctx, target, kind, 0, &mut visited)
+}
+
+/// One target of [`vtab_begin_for_dml`]: a virtual table is begun; for an ordinary table the
+/// virtual tables its trigger programs write are (`sqlite3VtabMakeWritable` is called while
+/// the trigger program is coded, so their OP_VBegin run with the top-level statement).
+fn vtab_begin_for_target(
+    ctx: &mut ExecContext<'_>,
+    target: &QualifiedName,
+    kind: u8,
+    depth: usize,
+    visited: &mut Vec<(usize, String)>,
+) -> Result<()> {
+    if ctx.db_set.find_virtual_table_in_set(target).is_some()
+        && matches!(ctx.db_set.find_relation_ref_in_set(target), Ok(None))
+    {
+        let Ok(Some((_, db_name, vt_name, _))) = resolve_vtab_for_query(ctx, target, false) else {
+            return Ok(());
+        };
+        return crate::vtab::vtab_begin_if_needed(ctx, &db_name, &vt_name);
+    }
+    if depth > 8 || !ctx.db_set.has_any_triggers() {
+        return Ok(());
+    }
+    let Ok(Some((db_id, rel))) = ctx.db_set.find_relation_ref_in_set(target) else {
+        return Ok(());
+    };
+    let rel_name = match rel {
+        crate::db_set::RelationRef::Table(t) => t.name.clone(),
+        crate::db_set::RelationRef::View(v) => v.name.clone(),
+        crate::db_set::RelationRef::CatalogTable => return Ok(()),
+    };
+    let key = (db_id.index(), rel_name.to_ascii_lowercase());
+    if visited.contains(&key) {
+        return Ok(());
+    }
+    visited.push(key);
+    let mut steps: Vec<(QualifiedName, u8)> = Vec::new();
+    for (_, tr) in ctx.db_set.triggers_for_relation(db_id, &rel_name) {
+        let ev = match tr.event {
+            TriggerEvent::Insert => 0u8,
+            TriggerEvent::Update { .. } => 1u8,
+            TriggerEvent::Delete => 2u8,
+        };
+        // (a REPLACE / UPSERT can also run the DELETE / UPDATE programs)
+        if ev != kind && kind != 0 {
+            continue;
+        }
+        for st in &tr.body {
+            match st {
+                TriggerStep::Insert(i) => steps.push((i.table.clone(), 0)),
+                TriggerStep::Update(u) => steps.push((u.table.clone(), 1)),
+                TriggerStep::Delete(d) => steps.push((d.table.clone(), 2)),
+                TriggerStep::Select(_) => {}
+            }
+        }
+    }
+    for (t, k) in steps {
+        vtab_begin_for_target(ctx, &t, k, depth + 1, visited)?;
+    }
+    Ok(())
+}
+
 /// Identifies a virtual table in [`ActivitySummary::other_vtab_cursors`] (FNV-1a of the
 /// lower-cased schema and table names; never 0 or 1).
 pub(crate) fn vtab_cursor_key(db_name: &str, table_name: &str) -> u64 {
@@ -2830,6 +2980,8 @@ pub(crate) struct VtabStaticPlan {
     pub n_terms: usize,
     /// Number of constraints the module uses (`argvIndex > 0`).
     pub n_used: usize,
+    /// `sqlite3_index_info.orderByConsumed`
+    pub order_by_consumed: bool,
 }
 
 /// `sqlite3LogEstFromDouble`
@@ -3046,6 +3198,37 @@ pub(crate) fn plan_vtab_scan_static(
     select_ctx: bool,
     n_branch_terms: usize,
 ) -> Option<VtabStaticPlan> {
+    plan_vtab_scan_static_ob(
+        db_set,
+        db_name,
+        vt_name,
+        declared,
+        eff_alias,
+        where_expr,
+        is_bound_table,
+        select_ctx,
+        n_branch_terms,
+        &[],
+        None,
+    )
+}
+
+/// [`plan_vtab_scan_static`] with the ORDER BY of the statement (where.c `allocateIndexInfo`:
+/// offered when every term is a column of this table).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_vtab_scan_static_ob(
+    db_set: &DatabaseSet,
+    db_name: &str,
+    vt_name: &str,
+    declared: &crate::vtab::VTabDeclaredSchema,
+    eff_alias: &str,
+    where_expr: Option<&Expr>,
+    is_bound_table: &dyn Fn(&str) -> bool,
+    select_ctx: bool,
+    n_branch_terms: usize,
+    order_by_terms: &[OrderByTerm],
+    col_used: Option<u64>,
+) -> Option<VtabStaticPlan> {
     use sqliters_types::{VTabConstraint, VTabConstraintOp as VOp};
     let resolve_vtab_col = |e: &Expr| -> Option<i32> {
         let Expr::Column(cref) = e else {
@@ -3152,6 +3335,12 @@ pub(crate) fn plan_vtab_scan_static(
             let conj_class: u8 = match conj {
                 _ if virt.is_some() => 1,
                 Expr::Between { .. } => 1,
+                Expr::Like { negated: false, .. } => 1,
+                Expr::IsNull { negated: true, .. } => 1,
+                Expr::Binary {
+                    op: BinaryOp::Ne | BinaryOp::IsNot,
+                    ..
+                } => 1,
                 Expr::Binary { left, .. }
                     if resolve_vtab_col(left).is_none() && matches!(**left, Expr::Column(_)) =>
                 {
@@ -3254,7 +3443,26 @@ pub(crate) fn plan_vtab_scan_static(
     let crate::vtab::VTabInstanceState::Available(ref vt) = entry.state else {
         return None;
     };
-    let mut info = sqliters_types::VTabIndexInfo::new(constraints, Vec::new());
+    let mut vtab_order_by = Vec::new();
+    for ob in order_by_terms {
+        if ob.nulls_last.is_some() {
+            vtab_order_by.clear();
+            break;
+        }
+        if let Some(col_i) = resolve_vtab_col(&ob.expr) {
+            vtab_order_by.push(sqliters_types::VTabOrderBy {
+                i_column: col_i,
+                desc: ob.desc,
+            });
+        } else {
+            vtab_order_by.clear();
+            break;
+        }
+    }
+    let mut info = sqliters_types::VTabIndexInfo::new(constraints, vtab_order_by);
+    if let Some(cu) = col_used {
+        info.col_used = cu;
+    }
     crate::vtab::catch_callback_panic("vtab xBestIndex", || vt.best_index(&mut info)).ok()?;
     let uses_in = info
         .constraint_usage
@@ -3284,6 +3492,7 @@ pub(crate) fn plan_vtab_scan_static(
             .iter()
             .filter(|u| u.argv_index > 0)
             .count(),
+        order_by_consumed: info.order_by_consumed,
     })
 }
 
@@ -3346,12 +3555,41 @@ pub(crate) fn execute_write_body(
             | Stmt::AlterTable { .. }
             | Stmt::Analyze(_)
     );
+    // vdbe.c `OP_Transaction` (p2!=0): "Writes prohibited due to a prior SQLITE_CORRUPT in
+    // the current transaction".
+    if ctx.db_set.corrupt_rdonly()
+        && matches!(
+            stmt,
+            Stmt::Insert(_)
+                | Stmt::Update(_)
+                | Stmt::Delete(_)
+                | Stmt::CreateTable(_)
+                | Stmt::CreateTableAs { .. }
+                | Stmt::CreateVirtualTable { .. }
+                | Stmt::CreateView(_)
+                | Stmt::CreateTrigger(_)
+                | Stmt::CreateIndex(_)
+                | Stmt::DropTable { .. }
+                | Stmt::DropView { .. }
+                | Stmt::DropTrigger { .. }
+                | Stmt::DropIndex { .. }
+                | Stmt::AlterTable { .. }
+        )
+    {
+        return Err(SqliteError::new(
+            ErrorCode::Corrupt,
+            "database disk image is malformed",
+        ));
+    }
     if !changes_cookie {
-        return execute_write_body_inner(ctx, stmt, params);
+        let res = execute_write_body_inner(ctx, stmt, params);
+        note_corrupt_in_transaction(ctx, &res);
+        return res;
     }
     let saved = ctx.db_set.cookie_scope_enter();
     let res = execute_write_body_inner(ctx, stmt, params);
     ctx.db_set.cookie_scope_exit(&saved);
+    note_corrupt_in_transaction(ctx, &res);
     res
 }
 
@@ -3724,7 +3962,7 @@ where
     if let Some(sp_slot) = stmt_sp_slot
         && ctx.db_set.vtab_registry().has_any_in_tx()
     {
-        crate::vtab::vtab_savepoint_all(ctx, sp_slot)?;
+        vtab_savepoint_before_stmt(ctx, sp_slot)?;
     }
 
     let step_res = f(ctx);
@@ -3767,7 +4005,15 @@ where
                 }
             }
             if autocommit && ctx.activity.other_writers == 0 {
-                if let Err((commit_err, disp)) = commit_all_databases(ctx) {
+                // (`sqlite3VdbeHalt`: commit first, then `sqlite3VdbeSetChanges` of a DML)
+                let dml_changes = is_dml.then_some(ctx.runtime.last_changes);
+                let commit_res = commit_all_databases(ctx);
+                // Also when the commit failed: what is taken back below is the statement's own
+                // row count, not the count of the last statement `xSync` stepped.
+                if let Some(n) = dml_changes {
+                    ctx.runtime.last_changes = n;
+                }
+                if let Err((commit_err, disp)) = commit_res {
                     let had_write_tx = disp == CommitFailureDisposition::LeaveOpen
                         && ctx.db_set.any_in_write_transaction();
                     if disp == CommitFailureDisposition::LeaveOpen {
@@ -4549,12 +4795,26 @@ fn shadow_schema_stamp(ctx: &ExecContext<'_>, db_id: DatabaseId, fk: bool) -> u6
 /// through SQL (a trigger, an index, a foreign key, another shape, hooks that must see the
 /// rows). `hint` remembers where the table was found and under which schema stamp it was
 /// accepted, so the usual call costs one comparison of the name.
+#[inline]
 fn shadow_locate(
     ctx: &mut ExecContext<'_>,
     db_name: &str,
     shadow_table: &str,
     hint: &mut sqliters_types::ShadowHint,
     for_write: bool,
+) -> Option<ShadowTarget> {
+    shadow_locate_shape(ctx, db_name, shadow_table, hint, for_write, false)
+}
+
+/// [`shadow_locate`]; `wide`: the table may have any number of columns after the rowid alias,
+/// all without a declared type (the `%_content` table of FTS5).
+fn shadow_locate_shape(
+    ctx: &mut ExecContext<'_>,
+    db_name: &str,
+    shadow_table: &str,
+    hint: &mut sqliters_types::ShadowHint,
+    for_write: bool,
+    wide: bool,
 ) -> Option<ShadowTarget> {
     if for_write
         && ((ctx.is_connection_readonly && !db_name.eq_ignore_ascii_case("temp"))
@@ -4608,11 +4868,13 @@ fn shadow_locate(
         && !tbl.strict
         && !tbl.autoincrement
         && tbl.root_pgno > 0
-        && tbl.columns.len() == 2
+        && (tbl.columns.len() == 2 || (wide && tbl.columns.len() > 2))
         && tbl.rowid_alias_col == Some(0)
         && tbl.rowid_pk_conflict == ConflictAction::Abort
         && tbl.checks.is_empty()
-        && tbl.columns[1].affinity == TypeAffinity::Blob
+        && tbl.columns[1..]
+            .iter()
+            .all(|c| c.affinity == TypeAffinity::Blob)
         && tbl.columns.iter().all(|c| {
             c.generated.is_none()
                 && c.not_null.is_none()
@@ -4725,6 +4987,57 @@ pub fn shadow_blob_read_direct(
         out.copy_from_slice(bytes);
     }
     Ok(ShadowBlobRead::Size(bytes.len()))
+}
+
+/// `sqlite3_blob_open(.., 1)` + `sqlite3_blob_write` + `sqlite3_blob_close` on column
+/// `col_idx` of row `rowid` (see `VTabHostContext::shadow_blob_write`): the payload bytes are
+/// overwritten in place (`sqlite3BtreePutData`), no row is counted.
+#[allow(clippy::too_many_arguments)]
+pub fn shadow_blob_write_direct(
+    ctx: &mut ExecContext<'_>,
+    db_name: &str,
+    shadow_table: &str,
+    hint: &mut sqliters_types::ShadowHint,
+    rowid: i64,
+    col_idx: usize,
+    offset: usize,
+    data: &[u8],
+) -> Result<bool> {
+    if let Some(target) = shadow_locate(ctx, db_name, shadow_table, hint, true) {
+        shadow_ensure_write(ctx, target.db_id)?;
+        let Some(bt) = ctx
+            .db_set
+            .slot_mut(target.db_id)
+            .and_then(|s| s.btree.as_mut())
+        else {
+            return Err(SqliteError::new(ErrorCode::Error, "database is not open"));
+        };
+        let Some((col_off, live_len)) =
+            bt.inspect_table_row_column(target.root_pgno, rowid, col_idx)?
+        else {
+            return Ok(false);
+        };
+        if offset + data.len() > live_len {
+            return Ok(false);
+        }
+        bt.write_table_payload_slice(target.root_pgno, rowid, col_off + offset, data)?;
+        if !ctx.db_set.open_blobs().is_empty() {
+            ctx.db_set
+                .expire_blobs_for_row(target.inst_id, shadow_table, rowid);
+        }
+        return Ok(true);
+    }
+    let Some(mut row) = shadow_get_rowid_direct(ctx, db_name, shadow_table, rowid)? else {
+        return Ok(false);
+    };
+    match row.get_mut(col_idx) {
+        Some(Value::Blob(b)) if b.len() >= offset + data.len() => {
+            b[offset..offset + data.len()].copy_from_slice(data);
+        }
+        _ => return Ok(false),
+    }
+    shadow_put_rowid_direct(ctx, db_name, shadow_table, rowid, &row, true)?;
+    Ok(true)
 }
 
 /// `(serial type, offset, length)` of column `col_idx` in `record`; `None` when the record
@@ -4912,6 +5225,93 @@ fn shadow_replace_direct(
     };
     execute_internal_vtab_sql_counted(ctx, &sql, &[key, val])?;
     Ok(rowid.unwrap_or(ctx.runtime.last_insert_rowid))
+}
+
+/// See `VTabHostContext::shadow_insert_row`: the statement a C module steps on a table like
+/// FTS5's `%_content` — `OP_NewRowid` for a NULL key, `OP_NotExists` (an existing key is
+/// SQLITE_CONSTRAINT_PRIMARYKEY for INSERT; REPLACE writes over it with a cursor that has not
+/// parsed the old cell), `OP_Insert`, one row counted, `db->lastRowid` set.
+#[allow(clippy::too_many_arguments)]
+pub fn shadow_insert_row_direct(
+    ctx: &mut ExecContext<'_>,
+    db_name: &str,
+    shadow_table: &str,
+    hint: &mut sqliters_types::ShadowHint,
+    sql: &str,
+    rowid: Option<i64>,
+    values: &[Value],
+    replace: bool,
+) -> Result<i64> {
+    if values.len() < 31
+        && let Some(target) = shadow_locate_shape(ctx, db_name, shadow_table, hint, true, true)
+    {
+        shadow_ensure_write(ctx, target.db_id)?;
+        let mut scratch = std::mem::take(&mut ctx.db_set.vtab_registry_mut().shadow_scratch);
+        let res = (|| {
+            let Some(bt) = ctx
+                .db_set
+                .slot_mut(target.db_id)
+                .and_then(|s| s.btree.as_mut())
+            else {
+                return Err(SqliteError::new(ErrorCode::Error, "database is not open"));
+            };
+            // the record `(NULL, values...)`: the rowid alias is stored as NULL
+            let null = Value::Null;
+            let mut parts = [sqliters_types::RecordPart::Value(&null); 32];
+            for (slot, v) in parts[1..].iter_mut().zip(values) {
+                *slot = sqliters_types::RecordPart::Value(v);
+            }
+            sqliters_types::encode_record_parts_into(
+                &parts[..=values.len()],
+                bt.encoding(),
+                &mut scratch,
+            );
+            let key = match rowid {
+                Some(k) => k,
+                None => bt.next_rowid(target.root_pgno)?,
+            };
+            // vdbe.c OP_Insert: `db->lastRowid` is assigned before `sqlite3BtreeInsert`.
+            let prev_rowid = ctx.runtime.last_insert_rowid;
+            ctx.runtime.last_insert_rowid = key;
+            if replace {
+                bt.insert_table_replace_unparsed(target.root_pgno, key, &scratch)?;
+            } else if !bt.insert_table_unique(target.root_pgno, key, &scratch)? {
+                // (`OP_NotExists` found the key: the statement halts before `OP_Insert`)
+                ctx.runtime.last_insert_rowid = prev_rowid;
+                return Err(SqliteError::with_extended(
+                    extended::SQLITE_CONSTRAINT_PRIMARYKEY,
+                    "constraint failed",
+                ));
+            }
+            if bt.pager().page_count() > target.max_pages {
+                return Err(SqliteError::new(
+                    ErrorCode::Full,
+                    "database or disk is full",
+                ));
+            }
+            Ok(key)
+        })();
+        ctx.db_set.vtab_registry_mut().shadow_scratch = scratch;
+        return match res {
+            Ok(key) => {
+                if !ctx.db_set.open_blobs().is_empty() {
+                    ctx.db_set
+                        .expire_blobs_for_row(target.inst_id, shadow_table, key);
+                }
+                note_nested_statement_changes(ctx, 1);
+                Ok(key)
+            }
+            Err(e) => {
+                ctx.runtime.last_changes = 0;
+                Err(e)
+            }
+        };
+    }
+    let mut row = Vec::with_capacity(values.len() + 1);
+    row.push(rowid.map_or(Value::Null, Value::Integer));
+    row.extend(values.iter().cloned());
+    execute_internal_vtab_sql_counted(ctx, sql, &row)?;
+    Ok(ctx.runtime.last_insert_rowid)
 }
 
 /// See `VTabHostContext::shadow_replace_blob`.
@@ -6378,7 +6778,18 @@ fn exec_single_select_core(
                                 &fc.head,
                                 pre_where_selection.as_deref(),
                                 None,
-                                if group_by.is_empty() && windows.is_empty() {
+                                // (an aggregate query without GROUP BY has no ORDER BY
+                                // as far as the WHERE loop is concerned: select.c drops it)
+                                if group_by.is_empty()
+                                    && windows.is_empty()
+                                    && having.is_none()
+                                    && !projection.iter().any(|rc| match rc {
+                                        ResultColumn::Expr { expr, .. } => {
+                                            expr_contains_aggregate(expr)
+                                        }
+                                        _ => false,
+                                    })
+                                {
                                     order_by
                                 } else {
                                     &[]
@@ -8712,6 +9123,29 @@ impl<'a> SingleVtabQueryInfo<'a> {
     }
 }
 
+/// The column names a single SELECT refers to and whether it has a `*` — what
+/// `compute_vtab_col_used` turns into `colUsed` — for EXPLAIN QUERY PLAN, which plans the
+/// scan without opening it.
+pub(crate) fn select_col_use_for_eqp(
+    projection: &[ResultColumn],
+    selection: Option<&Expr>,
+    group_by: &[Expr],
+    having: Option<&Expr>,
+    order_by: &[OrderByTerm],
+) -> (bool, Vec<String>) {
+    let info = SingleVtabQueryInfo::from_single_select(
+        projection,
+        selection,
+        None,
+        group_by,
+        having,
+        &[],
+        order_by,
+        None,
+    );
+    (info.has_star, info.col_names)
+}
+
 fn compute_vtab_col_used(
     declared: &crate::vtab::VTabDeclaredSchema,
     tvf_args: Option<&[Expr]>,
@@ -8733,8 +9167,11 @@ fn compute_vtab_col_used(
             }
         }
     }
-    if tvf_args.is_some() {
-        for &idx in hidden_col_indices {
+    // where.c `sqlite3WhereTabFuncArgs`: one `hidden column = argument` term per argument,
+    // `pItem->colUsed |= sqlite3ExprColUsed(pColRef)` — the hidden columns that got an
+    // argument, not all of them.
+    if let Some(args) = tvf_args {
+        for &idx in hidden_col_indices.iter().take(args.len()) {
             mask |= 1u64 << idx.min(63);
         }
     }
@@ -9422,6 +9859,15 @@ fn open_filtered_vtab_cursor_inner(
                 let conj_class: u8 = match conj {
                     _ if virt.is_some() => 1,
                     Expr::Between { .. } => 1,
+                    // `isAuxiliaryVtabOperator`: MATCH / LIKE / GLOB / REGEXP, `!=`,
+                    // IS NOT and NOT NULL on a virtual-table column are offered through a
+                    // virtual WO_AUX term.
+                    Expr::Like { negated: false, .. } => 1,
+                    Expr::IsNull { negated: true, .. } => 1,
+                    Expr::Binary {
+                        op: BinaryOp::Ne | BinaryOp::IsNot,
+                        ..
+                    } => 1,
                     Expr::Binary { left, .. }
                         if resolve_vtab_col(left).is_none()
                             && matches!(**left, Expr::Column(_)) =>
@@ -9870,6 +10316,7 @@ fn open_filtered_vtab_cursor_inner(
         }
         if in_loops.is_empty() {
             let mut host_ctx = crate::vtab::CoreVTabHostContext::new(ctx, db_name, vt_name);
+            cursor.set_plan_hint(info.plan_hint);
             crate::vtab::catch_callback_panic("vtab xFilter", || {
                 cursor.filter(&mut host_ctx, info.idx_num, info.idx_str.as_deref(), &argv)
             })?;
@@ -9891,6 +10338,7 @@ fn open_filtered_vtab_cursor_inner(
                 }
                 {
                     let mut host_ctx = crate::vtab::CoreVTabHostContext::new(ctx, db_name, vt_name);
+                    cursor.set_plan_hint(info.plan_hint);
                     crate::vtab::catch_callback_panic("vtab xFilter", || {
                         cursor.filter(&mut host_ctx, info.idx_num, info.idx_str.as_deref(), &argv)
                     })?;
@@ -39861,6 +40309,39 @@ fn exec_integrity_check(
             };
             let is_rtree = vt.module_name.eq_ignore_ascii_case("rtree");
             let is_rtree_i32 = vt.module_name.eq_ignore_ascii_case("rtree_i32");
+            if vt.module_name.eq_ignore_ascii_case("fts5") {
+                // pragma.c: OP_VCheck -> xIntegrity, only for a table this connection has
+                // already connected (`pTab->u.vtab.p!=0`).
+                if ctx
+                    .db_set
+                    .vtab_registry()
+                    .get_connected(&slot_name, &vt.name)
+                    .is_none()
+                {
+                    continue;
+                }
+                let Ok(mut inst) = ctx
+                    .db_set
+                    .vtab_registry_mut()
+                    .checkout_vtab_instance(&slot_name, &vt.name)
+                else {
+                    continue;
+                };
+                let res = {
+                    let mut host_ctx =
+                        crate::vtab::CoreVTabHostContext::new(ctx, &slot_name, &vt.name);
+                    crate::vtab::catch_callback_panic("vtab xIntegrity", || {
+                        inst.integrity(&mut host_ctx, &slot_name, &vt.name, is_quick)
+                    })
+                };
+                ctx.db_set
+                    .vtab_registry_mut()
+                    .restore_vtab(&slot_name, &vt.name, inst);
+                if let Some(msg) = res? {
+                    out.emit(msg);
+                }
+                continue;
+            }
             if !is_rtree && !is_rtree_i32 {
                 continue;
             }

@@ -113,6 +113,9 @@ pub struct VTabIndexInfo {
     pub idx_flags: u32,
     /// Bitmask of columns referenced by the query (`colUsed`).
     pub col_used: u64,
+    /// Module-private value handed to [`VirtualCursor::set_plan_hint`] before `filter`; it is
+    /// not part of the plan the host reports (`idxNum` / `idxStr`).
+    pub plan_hint: u64,
 }
 
 impl VTabIndexInfo {
@@ -130,6 +133,7 @@ impl VTabIndexInfo {
             estimated_rows: 1_000_000,
             idx_flags: 0,
             col_used: u64::MAX,
+            plan_hint: 0,
         }
     }
 }
@@ -275,6 +279,28 @@ pub trait VTabHostContext {
         self.execute_sql(sql, params)
     }
 
+    /// Asks virtual table `table` of schema `db_name` (default: this table's schema) to write
+    /// its pending in-memory data to its shadow tables (`VirtualTable::flush_before_shadow_access`),
+    /// as `fts5VocabOpenMethod` does with the FTS5 table it reads (`sqlite3Fts5FlushToDisk`).
+    fn flush_vtab_pending(&mut self, _db_name: Option<&str>, _table: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// `sqlite3_last_insert_rowid(db)`.
+    fn last_insert_rowid(&mut self) -> i64 {
+        match self.query_sql("SELECT last_insert_rowid()", &[]) {
+            Ok(rows) => rows
+                .first()
+                .and_then(|r| r.first())
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            Err(_) => 0,
+        }
+    }
+
+    /// `sqlite3_set_last_insert_rowid(db, rowid)`.
+    fn set_last_insert_rowid(&mut self, _rowid: i64) {}
+
     /// Whether another statement of the connection that is still running has a cursor of
     /// this virtual table positioned on a row (it is a scan that has returned a row and has
     /// neither reached its end nor been reset).
@@ -309,6 +335,33 @@ pub trait VTabHostContext {
         Ok(ShadowBlobRead::Size(bytes.len()))
     }
 
+    /// `sqlite3_blob_open(db, zDb, shadow_table, <column col_idx>, rowid, 1)` followed by
+    /// `sqlite3_blob_write(pBlob, data, data.len(), offset)` and `sqlite3_blob_close`: the
+    /// bytes of the stored value are overwritten where they are. It is not a statement, so
+    /// nothing is counted. Returns `false` when there is no such row or the value is not a
+    /// blob / text of at least `offset + data.len()` bytes.
+    fn shadow_blob_write(
+        &mut self,
+        shadow_table: &str,
+        _hint: &mut ShadowHint,
+        rowid: i64,
+        col_idx: usize,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<bool> {
+        let Some(mut row) = self.shadow_get_rowid(shadow_table, rowid)? else {
+            return Ok(false);
+        };
+        match row.get_mut(col_idx) {
+            Some(Value::Blob(b)) if b.len() >= offset + data.len() => {
+                b[offset..offset + data.len()].copy_from_slice(data);
+            }
+            _ => return Ok(false),
+        }
+        self.shadow_put_rowid(shadow_table, rowid, &row, true)?;
+        Ok(true)
+    }
+
     /// `SELECT <column col_idx> FROM shadow_table WHERE rowid = ?1` read with
     /// `sqlite3_column_int64`: `None` when there is no such row.
     fn shadow_int_read(
@@ -326,6 +379,28 @@ pub trait VTabHostContext {
             Some(Value::Real(f)) => *f as i64,
             _ => 0,
         }))
+    }
+
+    /// `INSERT INTO shadow_table VALUES(?1, ?2, ...)` (`replace`: `REPLACE INTO`) on a table
+    /// whose first column is the INTEGER PRIMARY KEY and whose other columns have no declared
+    /// type: `?1` is `rowid` (`None` binds NULL: a new rowid is chosen by `OP_NewRowid`), the
+    /// rest `values`. `sql` is the text of that statement, used when the host cannot write
+    /// the table directly. Counted as a nested statement; returns the rowid written
+    /// (`sqlite3_last_insert_rowid`). An existing rowid without `replace` is SQLITE_CONSTRAINT.
+    fn shadow_insert_row(
+        &mut self,
+        _shadow_table: &str,
+        _hint: &mut ShadowHint,
+        sql: &str,
+        rowid: Option<i64>,
+        values: &[Value],
+        _replace: bool,
+    ) -> Result<i64> {
+        let mut row = Vec::with_capacity(values.len() + 1);
+        row.push(rowid.map_or(Value::Null, Value::Integer));
+        row.extend(values.iter().cloned());
+        self.execute_sql_counted(sql, &row)?;
+        Ok(self.last_insert_rowid())
     }
 
     /// `INSERT OR REPLACE INTO shadow_table VALUES(?1, ?2)` on a two-column table whose first
@@ -543,6 +618,19 @@ pub trait VirtualTable: Send + Sync {
         Ok(())
     }
 
+    /// `xIntegrity` (run by `PRAGMA integrity_check` / `quick_check` for a connected table):
+    /// `Ok(None)` when nothing is wrong, `Ok(Some(text))` for a problem to report as a result
+    /// row of the pragma, `Err` to fail the pragma.
+    fn integrity(
+        &mut self,
+        _ctx: &mut dyn VTabHostContext,
+        _schema: &str,
+        _table: &str,
+        _is_quick: bool,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Flushes any pending in-memory shadow mutations before external SQL reads or modifies a shadow table.
     fn flush_before_shadow_access(&mut self, _ctx: &mut dyn VTabHostContext) -> Result<()> {
         Ok(())
@@ -562,6 +650,9 @@ pub trait VirtualCursor: Send + Sync {
         idx_str: Option<&str>,
         args: &[Value],
     ) -> Result<()>;
+
+    /// Receives [`VTabIndexInfo::plan_hint`] of the chosen plan right before `filter`.
+    fn set_plan_hint(&mut self, _hint: u64) {}
 
     /// Advances the cursor to the next row (`xNext`).
     fn next(&mut self) -> Result<()>;

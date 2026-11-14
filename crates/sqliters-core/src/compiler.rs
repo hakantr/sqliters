@@ -7868,6 +7868,16 @@ struct VtabEqpRequest {
     bound: Vec<String>,
     /// `" LEFT-JOIN"` for the right table of a LEFT JOIN.
     suffix: &'static str,
+    /// The ORDER BY of the statement when this table is the whole FROM clause.
+    order_by: Vec<OrderByTerm>,
+    /// Arguments of the table-valued-function syntax (`ft('query')`): where.c
+    /// `sqlite3WhereTabFuncArgs` appends one `hidden column = arg` term per argument after
+    /// the terms of the WHERE clause. `None` for a plain table reference.
+    tvf_args: Option<Vec<Expr>>,
+    /// The columns the statement names (`pSrc->colUsed`, what xBestIndex reads as
+    /// `sqlite3_index_info.colUsed`): whether a `*` expands over the table, and the
+    /// column names it refers to. `None` when not collected.
+    col_use: Option<(bool, Vec<String>)>,
 }
 
 thread_local! {
@@ -7883,6 +7893,7 @@ fn register_vtab_eqp_request(
     suffix: &'static str,
     selection: Option<&Expr>,
     bound: &[String],
+    order_by: &[OrderByTerm],
 ) -> usize {
     VTAB_EQP_REQUESTS.with(|r| {
         let mut r = r.borrow_mut();
@@ -7891,6 +7902,9 @@ fn register_vtab_eqp_request(
             selection: selection.cloned(),
             bound: bound.to_vec(),
             suffix,
+            order_by: order_by.to_vec(),
+            tvf_args: None,
+            col_use: None,
         });
         r.len() - 1
     })
@@ -7917,15 +7931,74 @@ fn finish_vtab_eqp_rows(rows: &mut Vec<Vec<Value>>, db_set: Option<&DatabaseSet>
         let Some(pos) = detail.find(VTAB_EQP_MARK) else {
             continue;
         };
-        let req_idx: Option<usize> = detail[pos + VTAB_EQP_MARK.len_utf8()..].parse().ok();
+        // A line registered for the target of an UPDATE / DELETE exists only when the target
+        // turns out to be a virtual table.
+        let tail = detail[pos + VTAB_EQP_MARK.len_utf8()..].to_owned();
+        let (num, dml_only) = match tail.split_once(VTAB_EQP_MARK) {
+            Some((n, _)) => (n.to_owned(), true),
+            None => (tail, false),
+        };
+        let req_idx: Option<usize> = num.parse().ok();
         detail.truncate(pos);
-        let (Some(db_set), Some(req)) = (db_set, req_idx.and_then(|i| reqs.get(i))) else {
+        let found = match (db_set, req_idx.and_then(|i| reqs.get(i))) {
+            (Some(db_set), Some(req)) => db_set
+                .find_connected_vtab_in_set(&req.name, false)
+                .map(|f| (db_set, req, f)),
+            _ => None,
+        };
+        let Some((db_set, req, (_, db_name, vt_name, declared))) = found else {
+            if dml_only {
+                ri -= 1;
+                rows.remove(ri);
+            } else if req_idx
+                .and_then(|i| reqs.get(i))
+                .is_some_and(|r| r.tvf_args.is_some())
+            {
+                // a table-valued function that is not a connected table of this schema
+                detail.push_str(" VIRTUAL TABLE INDEX 0:");
+            }
             continue;
         };
-        let Some((_, db_name, vt_name, declared)) =
-            db_set.find_connected_vtab_in_set(&req.name, false)
-        else {
-            continue;
+        // `ft(arg, ...)`: one equality on a hidden column per argument, after the WHERE terms.
+        let tvf_selection: Option<Option<Expr>> = req.tvf_args.as_ref().map(|args| {
+            let disp_for_cols = detail.strip_prefix("SCAN ").unwrap_or("").to_owned();
+            let hidden: Vec<String> = declared
+                .table_schema
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| declared.is_hidden(*i))
+                .map(|(_, c)| c.name.clone())
+                .collect();
+            let mut sel = req.selection.clone();
+            for (k, arg) in args.iter().enumerate() {
+                let Some(hc) = hidden.get(k) else {
+                    break;
+                };
+                let term = Expr::Binary {
+                    left: Box::new(Expr::Column(ColumnRef {
+                        schema: None,
+                        table: Some(disp_for_cols.clone()),
+                        column: hc.clone(),
+                        double_quoted: false,
+                    })),
+                    op: BinaryOp::Eq,
+                    right: Box::new(arg.clone()),
+                };
+                sel = Some(match sel {
+                    Some(s) => Expr::Binary {
+                        left: Box::new(s),
+                        op: BinaryOp::And,
+                        right: Box::new(term),
+                    },
+                    None => term,
+                });
+            }
+            sel
+        });
+        let req_selection: Option<&Expr> = match tvf_selection.as_ref() {
+            Some(s) => s.as_ref(),
+            None => req.selection.as_ref(),
         };
         let disp = detail.strip_prefix("SCAN ").unwrap_or("").to_owned();
         let bound = &req.bound;
@@ -7937,7 +8010,7 @@ fn finish_vtab_eqp_rows(rows: &mut Vec<Vec<Value>>, db_set: Option<&DatabaseSet>
             }
         };
         // MULTI-INDEX OR: one `INDEX n` child per branch, each with its own scan line.
-        if let Some(wh) = req.selection.as_ref()
+        if let Some(wh) = req_selection
             && let Some(or_plan) = crate::engine::choose_vtab_or_plan(
                 db_set, &db_name, &vt_name, declared, &disp, wh, &is_bound, true,
             )
@@ -7984,16 +8057,29 @@ fn finish_vtab_eqp_rows(rows: &mut Vec<Vec<Value>>, db_set: Option<&DatabaseSet>
             ri += n_extra;
             continue;
         }
-        let Some(plan) = crate::engine::plan_vtab_scan_static(
+        // `colUsed`: bit per column the statement names (a `*` names the visible ones).
+        let col_used = req.col_use.as_ref().map(|(has_star, names)| {
+            let mut mask = 0u64;
+            for (idx, col) in declared.table_schema.columns.iter().enumerate() {
+                let named = names.iter().any(|n| n.eq_ignore_ascii_case(&col.name));
+                if named || (*has_star && !declared.is_hidden(idx)) {
+                    mask |= 1u64 << idx.min(63);
+                }
+            }
+            mask
+        });
+        let Some(plan) = crate::engine::plan_vtab_scan_static_ob(
             db_set,
             &db_name,
             &vt_name,
             declared,
             &disp,
-            req.selection.as_ref(),
+            req_selection,
             &is_bound,
             true,
             0,
+            &req.order_by,
+            col_used,
         ) else {
             continue;
         };
@@ -8003,6 +8089,16 @@ fn finish_vtab_eqp_rows(rows: &mut Vec<Vec<Value>>, db_set: Option<&DatabaseSet>
             plan.idx_str.as_deref().unwrap_or(""),
             req.suffix
         ));
+        if plan.order_by_consumed {
+            // The module delivers the rows in ORDER BY order: no sorter.
+            let parent = rows[ri - 1].get(1).and_then(Value::as_i64).unwrap_or(0);
+            if let Some(k) = rows.iter().skip(ri).position(|r| {
+                r.get(1).and_then(Value::as_i64) == Some(parent)
+                    && matches!(r.get(3), Some(Value::Text(t)) if t == "USE TEMP B-TREE FOR ORDER BY")
+            }) {
+                rows.remove(ri + k);
+            }
+        }
     }
 }
 
@@ -9127,12 +9223,42 @@ where
                                         } else {
                                             combined_where.clone()
                                         };
+                                        // The ORDER BY is offered to xBestIndex when the
+                                        // table is the whole FROM clause of a plain SELECT.
+                                        let ob_terms: &[OrderByTerm] = if join_items.len() == 1
+                                            && !has_window
+                                            && window_sort_groups.is_empty()
+                                            && group_by.is_empty()
+                                            && having.is_none()
+                                            && !projection.iter().any(|rc| match rc {
+                                                ResultColumn::Expr { expr, .. } => {
+                                                    expr_contains_aggregate(expr)
+                                                }
+                                                _ => false,
+                                            }) {
+                                            &sel.order_by
+                                        } else {
+                                            &[]
+                                        };
                                         let req = register_vtab_eqp_request(
                                             name,
                                             if is_left { " LEFT-JOIN" } else { "" },
                                             pred.as_ref(),
                                             &outer_bound_names,
+                                            ob_terms,
                                         );
+                                        let col_use = crate::engine::select_col_use_for_eqp(
+                                            projection,
+                                            combined_where.as_ref(),
+                                            group_by,
+                                            having.as_ref(),
+                                            &sel.order_by,
+                                        );
+                                        VTAB_EQP_REQUESTS.with(|r| {
+                                            if let Some(q) = r.borrow_mut().get_mut(req) {
+                                                q.col_use = Some(col_use);
+                                            }
+                                        });
                                         let _ = push_node(
                                             scan_parent,
                                             format!("SCAN {disp_name}{VTAB_EQP_MARK}{req}"),
@@ -9185,12 +9311,61 @@ where
                                         }
                                         m
                                     }
-                                    _ => 0,
+                                    _ => -1,
                                 };
-                                let _ = push_node(
-                                    scan_parent,
-                                    format!("SCAN {disp_name} VIRTUAL TABLE INDEX {idx_num}:"),
-                                );
+                                if idx_num < 0 {
+                                    // Possibly the table-valued-function syntax on a
+                                    // virtual table of the schema (`ft('query')`): the
+                                    // caller that knows the connection asks its xBestIndex.
+                                    let ob_terms: &[OrderByTerm] = if join_items.len() == 1
+                                        && !has_window
+                                        && window_sort_groups.is_empty()
+                                        && group_by.is_empty()
+                                        && having.is_none()
+                                        && !projection.iter().any(|rc| match rc {
+                                            ResultColumn::Expr { expr, .. } => {
+                                                expr_contains_aggregate(expr)
+                                            }
+                                            _ => false,
+                                        }) {
+                                        &sel.order_by
+                                    } else {
+                                        &[]
+                                    };
+                                    let qn = QualifiedName {
+                                        schema: None,
+                                        name: name.clone(),
+                                    };
+                                    let req = register_vtab_eqp_request(
+                                        &qn,
+                                        "",
+                                        combined_where.as_ref(),
+                                        &outer_bound_names,
+                                        ob_terms,
+                                    );
+                                    let col_use = crate::engine::select_col_use_for_eqp(
+                                        projection,
+                                        combined_where.as_ref(),
+                                        group_by,
+                                        having.as_ref(),
+                                        &sel.order_by,
+                                    );
+                                    VTAB_EQP_REQUESTS.with(|r| {
+                                        if let Some(q) = r.borrow_mut().get_mut(req) {
+                                            q.tvf_args = Some(args.clone());
+                                            q.col_use = Some(col_use);
+                                        }
+                                    });
+                                    let _ = push_node(
+                                        scan_parent,
+                                        format!("SCAN {disp_name}{VTAB_EQP_MARK}{req}"),
+                                    );
+                                } else {
+                                    let _ = push_node(
+                                        scan_parent,
+                                        format!("SCAN {disp_name} VIRTUAL TABLE INDEX {idx_num}:"),
+                                    );
+                                }
                             }
                         }
                     }
@@ -9203,7 +9378,18 @@ where
                 for _ in 0..total_window_sorts {
                     let _ = push_node(scan_parent, "USE TEMP B-TREE FOR ORDER BY".to_owned());
                 }
-            } else if !has_window && !sel.order_by.is_empty() && !order_by_satisfied {
+            } else if !has_window
+                && !sel.order_by.is_empty()
+                && !order_by_satisfied
+                // select.c: an aggregate query without GROUP BY returns one row, its ORDER BY
+                // is dropped (`sSort.pOrderBy = 0`) and no sorter is used.
+                && !(group_by.is_empty()
+                    && (having.is_some()
+                        || projection.iter().any(|rc| match rc {
+                            ResultColumn::Expr { expr, .. } => expr_contains_aggregate(expr),
+                            _ => false,
+                        })))
+            {
                 let _ = push_node(scan_parent, "USE TEMP B-TREE FOR ORDER BY".to_owned());
             }
             if has_window {
@@ -9286,6 +9472,14 @@ where
                         &mut push_node,
                     )?;
                 }
+            } else if upd.from.is_none() && resolve_relation(&upd.table).is_none() {
+                let disp = upd.alias.as_deref().unwrap_or(&upd.table.name).to_owned();
+                let req =
+                    register_vtab_eqp_request(&upd.table, "", upd.selection.as_ref(), &[], &[]);
+                let _ = push_node(
+                    0,
+                    format!("SCAN {disp}{VTAB_EQP_MARK}{req}{VTAB_EQP_MARK}dml"),
+                );
             }
         }
         Stmt::Delete(del) => {
@@ -9301,6 +9495,16 @@ where
                 );
                 let disp = del.alias.as_deref().unwrap_or(&del.table.name);
                 emit_plan_nodes(0, &plan, disp, "", &mut push_node);
+            } else if resolve_relation(&del.table).is_none() {
+                // Possibly a virtual table: the caller that knows the connection completes
+                // (or drops) the line.
+                let disp = del.alias.as_deref().unwrap_or(&del.table.name).to_owned();
+                let req =
+                    register_vtab_eqp_request(&del.table, "", del.selection.as_ref(), &[], &[]);
+                let _ = push_node(
+                    0,
+                    format!("SCAN {disp}{VTAB_EQP_MARK}{req}{VTAB_EQP_MARK}dml"),
+                );
             }
         }
         // Every other statement (DDL, PRAGMA, transaction control ...) has no query plan: like

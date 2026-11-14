@@ -208,6 +208,11 @@ struct SubsavepointSlot {
     saved_pages: FastPgnoMap<Vec<u8>>,
     /// 4-word WAL savepoint token (`[mx_frame, cksum0, cksum1, n_ckpt]`) when `use_wal` is active.
     wal_savepoint: Option<[u32; WAL_SAVEPOINT_NDATA]>,
+    /// `PagerSavepoint.bTruncateOnRelease`: true while every image saved since this savepoint
+    /// opened was needed only by it or by savepoints inside it. C then cuts the sub-journal
+    /// back to where the savepoint began when it is released; otherwise the records stay and
+    /// a later rollback to an outer savepoint plays them back.
+    truncate_on_release: bool,
 }
 
 struct CachedPage {
@@ -1957,6 +1962,7 @@ impl Pager {
         // Save pre-spill image into any open sub-savepoint slots (`subjournalPageIfRequired`)!
         for &pgno in &dirty_pgnos {
             let cur_img = self.cache.get_data(pgno).expect("dirty exists").to_vec();
+            self.note_subjournal_save(pgno);
             for sp in &mut self.subsavepoints {
                 if pgno <= sp.orig_page_count && !sp.saved_pages.contains_key(&pgno) {
                     sp.saved_pages.insert(pgno, cur_img.clone());
@@ -2971,6 +2977,15 @@ impl Pager {
             .iter()
             .any(|sp| pgno <= sp.orig_page_count && !sp.saved_pages.contains_key(&pgno));
 
+        // pager.c `pager_write`: a page that goes to the rollback journal now is entered in
+        // every savepoint's page set by `pagerAddPageToRollbackJournal` and gets no
+        // sub-journal record; only a page the transaction had already journalled (or one
+        // past the original end of the file, or any page in WAL mode) is sub-journalled.
+        if need_sp_preimage
+            && (self.use_wal() || pgno > self.tx_orig_page_count || self.tx_journaled.test(pgno))
+        {
+            self.note_subjournal_save(pgno);
+        }
         if need_tx_preimage || need_sp_preimage {
             let src = self.cache.entry_data(slot);
             if need_tx_preimage && !need_sp_preimage {
@@ -3052,6 +3067,26 @@ impl Pager {
             }
         }
         Ok(())
+    }
+
+    /// pager.c `subjRequiresPage`: an image of `pgno` is about to go to the sub-journal. The
+    /// outermost savepoint that still needs it decides: every savepoint inside that one can no
+    /// longer cut the sub-journal back when it is released (`bTruncateOnRelease = 0`). (The
+    /// slot of a transaction savepoint is not a pager savepoint in C.)
+    #[inline]
+    fn note_subjournal_save(&mut self, pgno: Pgno) {
+        let first = usize::from(self.transaction_savepoint);
+        if self.subsavepoints.len() <= first + 1 {
+            return;
+        }
+        if let Some(i) = self.subsavepoints[first..]
+            .iter()
+            .position(|sp| pgno <= sp.orig_page_count && !sp.saved_pages.contains_key(&pgno))
+        {
+            for sp in &mut self.subsavepoints[first + i + 1..] {
+                sp.truncate_on_release = false;
+            }
+        }
     }
 
     /// `sqlite3PagerGet(.., PAGER_GET_NOCONTENT)` (`getPageNormal`): the b-tree layer takes
@@ -4535,6 +4570,7 @@ impl Pager {
                 reused.orig_header = self.header.clone();
                 reused.saved_pages.clear();
                 reused.wal_savepoint = wsp;
+                reused.truncate_on_release = true;
                 reused
             } else {
                 SubsavepointSlot {
@@ -4542,6 +4578,7 @@ impl Pager {
                     orig_header: self.header.clone(),
                     saved_pages: FastPgnoMap::default(),
                     wal_savepoint: wsp,
+                    truncate_on_release: true,
                 }
             };
             self.subsavepoints.push(slot);
@@ -4569,9 +4606,33 @@ impl Pager {
         if self.state != TransactionState::Write || index >= self.subsavepoints.len() {
             return Ok(());
         }
+        // C keeps one sub-journal for all savepoints and a rollback does not shorten it: the
+        // records the inner savepoints wrote stay behind the target's first record and are
+        // played back again by the next rollback to the target (the first record of a page
+        // wins). Where the target itself holds no image of a page (fetched NOCONTENT while
+        // it was open) the earliest inner image therefore becomes the target's. A rollback
+        // of the transaction savepoint plays the main journal only.
+        let fold_inner = index >= usize::from(self.transaction_savepoint);
+        let mut folded: FastPgnoMap<()> = FastPgnoMap::default();
         while self.subsavepoints.len() > index + 1 {
             let sp = self.subsavepoints.pop().expect("len checked");
             self.apply_subsavepoint_undo(&sp);
+            if fold_inner {
+                // (innermost slot first: an outer slot's image is the earlier record)
+                let target = &mut self.subsavepoints[index];
+                for (&pgno, img) in &sp.saved_pages {
+                    if !img.is_empty()
+                        && pgno <= target.orig_page_count
+                        && target
+                            .saved_pages
+                            .get(&pgno)
+                            .is_some_and(|held| held.is_empty() || folded.contains_key(&pgno))
+                    {
+                        folded.insert(pgno, ());
+                        target.saved_pages.insert(pgno, img.clone());
+                    }
+                }
+            }
             self.recycle_subsavepoint_slot(sp);
         }
         if self.use_wal()
@@ -4588,11 +4649,9 @@ impl Pager {
         }
         let target = self.subsavepoints[index].clone();
         self.apply_subsavepoint_undo(&target);
-        for (_, buf) in self.subsavepoints[index].saved_pages.drain() {
-            if self.sp_page_buf_pool.len() < 64 {
-                self.sp_page_buf_pool.push(buf);
-            }
-        }
+        // The savepoint stays open with its page set (`pInSavepoint`) and its sub-journal
+        // records: a page already in the set is not saved again, and a page fetched
+        // NOCONTENT stays exempt from later rollbacks to this savepoint.
         // (C: a savepoint rollback restores the pages in the cache; backups are neither
         // restarted nor updated. The pages stay in the trackers' dirty sets.)
         Ok(())
@@ -4637,12 +4696,33 @@ impl Pager {
         if self.state != TransactionState::Write || index >= self.subsavepoints.len() {
             return Ok(());
         }
+        // `sqlite3PagerSavepoint(SAVEPOINT_RELEASE)`: the sub-journal is cut back to the first
+        // record of the released savepoint only if `bTruncateOnRelease` is still set. If not,
+        // the records stay: a later rollback to an outer savepoint that holds no image of a
+        // page itself (fetched NOCONTENT) restores the page from them. The slots are popped
+        // innermost first; an outer slot's image of a page is the earlier record.
+        let keep_records = index > usize::from(self.transaction_savepoint)
+            && !self.subsavepoints[index].truncate_on_release;
+        // (pages of the parent whose NOCONTENT marker this release replaced by an image)
+        let mut folded: FastPgnoMap<()> = FastPgnoMap::default();
         while self.subsavepoints.len() > index {
             let mut sp = self.subsavepoints.pop().expect("len > index");
             if index > 0 {
                 let parent = &mut self.subsavepoints[index - 1];
                 for (pgno, data) in sp.saved_pages.drain() {
-                    if pgno <= parent.orig_page_count && !parent.saved_pages.contains_key(&pgno) {
+                    let take = pgno <= parent.orig_page_count
+                        && match parent.saved_pages.get(&pgno) {
+                            None => true,
+                            Some(held) => {
+                                keep_records
+                                    && !data.is_empty()
+                                    && (held.is_empty() || folded.contains_key(&pgno))
+                            }
+                        };
+                    if take {
+                        if keep_records && parent.saved_pages.contains_key(&pgno) {
+                            folded.insert(pgno, ());
+                        }
                         parent.saved_pages.insert(pgno, data);
                     } else if self.sp_page_buf_pool.len() < 64 {
                         self.sp_page_buf_pool.push(data);

@@ -2174,9 +2174,23 @@ impl ConnectionInner {
                         trace_hook: &mut self.trace_hook,
                         publish_mirrors: &mut publish_fn,
                     };
+                    // vdbeaux.c `sqlite3VdbeHalt`: the statement commits (xSync of the virtual
+                    // tables may step nested statements) and only then stores its own row count
+                    // with `sqlite3VdbeSetChanges` — a DML statement's `changes()` is its own.
+                    let dml_changes = abort_snapshot.is_dml.then_some(ctx.runtime.last_changes);
                     match commit_all_databases(&mut ctx) {
-                        Ok(()) => Ok(()),
+                        Ok(()) => {
+                            if let Some(n) = dml_changes {
+                                ctx.runtime.last_changes = n;
+                            }
+                            Ok(())
+                        }
                         Err((cm_err, disp)) => {
+                            // The statements `xSync` stepped stay counted; what is taken
+                            // back below is the failed statement's own row count.
+                            if let Some(n) = dml_changes {
+                                ctx.runtime.last_changes = n;
+                            }
                             let rb_res = if disp == CommitFailureDisposition::LeaveOpen {
                                 rollback_all_databases(&mut ctx, false)
                             } else {
@@ -2496,9 +2510,18 @@ impl ConnectionInner {
                             trace_hook: &mut self.trace_hook,
                             publish_mirrors: &mut publish_fn,
                         };
+                        let dml_changes = snap.is_dml.then_some(ctx.runtime.last_changes);
                         match commit_all_databases(&mut ctx) {
-                            Ok(()) => Ok(()),
+                            Ok(()) => {
+                                if let Some(n) = dml_changes {
+                                    ctx.runtime.last_changes = n;
+                                }
+                                Ok(())
+                            }
                             Err((cm_err, disp)) => {
+                                if let Some(n) = dml_changes {
+                                    ctx.runtime.last_changes = n;
+                                }
                                 let rb_res = if disp == CommitFailureDisposition::LeaveOpen {
                                     rollback_all_databases(&mut ctx, false)
                                 } else {
@@ -5768,6 +5791,25 @@ impl ConnectionInner {
             shared
                 .mirror_count_changes
                 .store(self.count_changes, Ordering::Release);
+        }
+        // A statement that writes nothing itself can still have made a module step statements
+        // on its shadow tables (FTS5 flushing in xSavepoint / xRelease, or for an fts5vocab
+        // cursor): `sqlite3_changes()`, `sqlite3_total_changes()` and
+        // `sqlite3_last_insert_rowid()` read the lock-free copies.
+        let total = self.runtime.total_changes + self.runtime.nested_changes;
+        if shared.mirror_total_changes.load(Ordering::Relaxed) != total {
+            shared.mirror_total_changes.store(total, Ordering::Release);
+        }
+        if shared.mirror_changes.load(Ordering::Relaxed) != self.runtime.last_changes {
+            shared
+                .mirror_changes
+                .store(self.runtime.last_changes, Ordering::Release);
+        }
+        if shared.mirror_last_insert_rowid.load(Ordering::Relaxed) != self.runtime.last_insert_rowid
+        {
+            shared
+                .mirror_last_insert_rowid
+                .store(self.runtime.last_insert_rowid, Ordering::Release);
         }
         res
     }
@@ -9110,7 +9152,7 @@ impl Statement {
                         if let Some(sp_slot) = ctx.stmt_tx.stmt_sp_slot
                             && ctx.db_set.vtab_registry().has_any_in_tx()
                         {
-                            crate::vtab::vtab_savepoint_all(ctx, sp_slot)?;
+                            engine::vtab_savepoint_before_stmt(ctx, sp_slot)?;
                         }
                         if let (Some(prog), Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)) =
                             (compiled_prog_ref, stmt_ref)
@@ -9128,6 +9170,7 @@ impl Statement {
                                 Some(ctx.db_set.main_btree().pager().vfs().current_unix_millis());
                         }
                         crate::vtab::ensure_stmt_vtabs_connected(ctx, stmt_ref)?;
+                        engine::vtab_begin_for_dml(ctx, stmt_ref)?;
                         execute_write_body(ctx, stmt_ref, params_ref)
                     },
                 );
@@ -12967,6 +13010,8 @@ mod c_align_h2_tests;
 mod c_align_h3_tests;
 #[cfg(test)]
 mod c_align_h4_tests;
+#[cfg(test)]
+mod c_align_h5_tests;
 /// Regression tests for behaviour that has to match C SQLite 3.54.1 (step 5e): every expected
 /// value below is what the reference `sqlite3` produces for the same statements.
 #[cfg(test)]
