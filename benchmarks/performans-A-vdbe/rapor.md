@@ -13,7 +13,7 @@
 | :--- | :--- | :--- | ---: | ---: | :--- |
 | V1 — temel, ifadeler, `FROM`'suz `SELECT` | `bdffdc1` | program gösterimi ve kurucu, `EXPLAIN` listesi, C'nin ayrıştırma ağacı, `resolve.c`, `expr.c`, `VALUES`, işlem ifadeleri | 54.469 / 54.469 kabul edilen (144 desteklenmiyor) | 3.954 / 39.300 (%10,1) | 907 geçti, bilinen 4 başarısız, 337 yok sayıldı |
 | V2 — tablolar: şema bağdaştırıcısı, sıralayıcı, `where.c` ailesi, birleşimler | `c4efe5e` | `whereexpr.c`, `where.c`, `wherecode.c`, `select.c` (GROUP BY hariç), alt sorgu düzleştirme, görünümler, `EXPLAIN QUERY PLAN` | 35.525 / 35.526 kabul edilen (3.474 desteklenmiyor) | 13.659 / 39.300 (%34,8) | 929 geçti, bilinen 4 başarısız, 337 yok sayıldı |
-| V3 — şemanın C gibi yüklenmesi, GROUP BY / HAVING / FILTER, özyinelemeli CTE | (bu commit) | `build.c` tablo/indeks/görünüm kurucuları, `sqlite3Init`, `sqlite3AnalysisLoad`, GROUP BY sıralayıcı dalı, FILTER, `generateWithRecursiveQuery`, C bağlantı durumu (DBFLAG_EncodingFixed) | 87.000 / 87.000 kabul edilen (8 derlem; 0 farklı) | 14.133 / 39.300 (%36,0) | 979 geçti, bilinen 4 başarısız, 337 yok sayıldı |
+| V3 — şemanın C gibi yüklenmesi, GROUP BY / HAVING / FILTER, özyinelemeli CTE | `a0dfd44` | `build.c` tablo/indeks/görünüm kurucuları, `sqlite3Init`, `sqlite3AnalysisLoad`, GROUP BY sıralayıcı dalı, FILTER, `generateWithRecursiveQuery`, C bağlantı durumu (DBFLAG_EncodingFixed) | 87.000 / 87.000 kabul edilen (8 derlem; 0 farklı) | 14.133 / 39.300 (%36,0) | 979 geçti, bilinen 4 başarısız, 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -104,6 +104,57 @@ Ayrıntı: `karar_esligi_v1.md` (işlev eşlemesi, karar tabloları, kapsam tabl
 **Değişen test beklentileri.** `plan_tests.rs`: `unsupported_over_tables` yerine `unsupported_in_v3`; tablo üzerinde GROUP BY artık destekleniyor (C'nin listesi `group_by_in_index_order` ile sınanıyor). Başka beklenti değişmedi.
 
 **Bilinen eksikler ve sonraki adım.** Pencere işlevleri ve FROM içinde sanal tablolar / tablo değerli işlevler taşınmadı; öneri: V4a (`window.c`) ve V4b (`vtab.c`, `whereLoopAddVirtual`). Bu adımda görülen eski motor farkları `gorulen_farklar_v3.md`'de (D1–D29). **D23 veri farkı:** `SELECT 0.5 IS TRUE` motorda 0, C'de 1 — motor kuyruğunda öne alınmalı.
+
+## M1 — makine: `SELECT` programlarının C gibi çalıştırılması (dal `performans-A-vdbe-makine`)
+
+**Taşınan** (yaklaşık 7.150 satır; ayrıntı `karar_esligi_m1.md`).
+- `crates/sqliters-vdbe/src/vdbe.rs`: `sqlite3VdbeExec` — her `case OP_x` için bir kol; `vdbemem.rs` (`vdbemem.c`: dönüşümler, yakınlık, karşılaştırma); `vdbeaux_rt.rs` (kayıt çözme ve karşılaştırma, imleç geri yükleme, okuma ifadeleri için Halt); `vdbesort.rs` (`vdbesort.c` sıralama düzeni ve `rowset.c`).
+- `crates/sqliters-btree/src/btcursor.rs`: `btree.c` imlecinin okuma yarısı (`sqlite3BtreeCursor`, `First/Last/Next/Previous`, `TableMoveto`, `IndexMoveto`, `accessPayload`) — tek iniş hem veriyi buluyor hem C'nin sayfa başvurularını tutuyor.
+- İşlem kodu durumu (191): **119 doğrulandı**, 28 taşındı ama derlemlerde hiç çalışmadı, 44 henüz yok (yazma, işlem, tetikleyici, DDL ve sanal tablo kodları).
+- Geçici tanılama anahtarı `SQLITERS_VDBE_EXEC=1`: üretici ifadeyi destekliyor ve programın tüm kodları taşınmışsa okuma ifadesi makinede çalışır. Anahtar kapalıyken (varsayılan) hiçbir şey değişmez.
+
+**Kanıt (anahtar açık).**
+
+| Ölçüm | Sonuç |
+| :--- | :--- |
+| Sonuç farksalı (11 derlem) | makinede çalışan 108.473 ifade; makineye izlenen C farkı yok. Kalan farklar: eski yazma yolu, üretici (2 durum), motorun işlev kitaplığı, saat / `random()` |
+| Bağımsız kontrol (C'nin kurduğu 40 veri dolu şema, 2.400 sorgu: tek tablo, LEFT/RIGHT/FULL birleşimler, alt sorgular, bileşik seçimler, karışık tipli ve taşma sayfalı veri) | satırlar ve satır sırası C ile aynı 2.400 / 2.400; stderr 40 / 40 |
+| İşlem kodu izi (pc, kod, yazılan yazmaç özeti) | 32.954 ifadenin 30.978'inde akış eşit; eşit olmayanlar saat / `random()` ifadeleri, hata anındaki yazmaç gösterimi, motor işlev sonuçları, 6 plan farkı (üretici) |
+| Önbellek karar izi — yazma işlemi içindeki `SELECT`ler | H6b'nin `psx` ailesi (bütünlük kontrolü çıkarılınca) **5/5** (eski yol 0/5); beş yeni aile (birleşim, alt sorgu, sıralayıcı, bileşik, taşma) **25/25** (eski yol 0/25) |
+| C tarafı kapsamı (gcov) | satır %78,3, dal %63,4; alınmayan dal taşıyan 426 satır "doğrulanmadı" |
+| Anahtar kapalı | testler 940 geçti (11 yeni), bilinen 4 başarısız, 337 yok sayıldı; ayrışma bulucu 241 / 245; DML farksalı 377 / 400; speedbench toplamı 0,997x, özetler eşit |
+| Anahtar açık, test paketi | 937 geçti, 7 başarısız: bilinen 4 + 3 bulgu (iki test C'de olmayan davranışı sınıyor, biri hızlı yol sayacını) |
+
+**Makinenin hızı (anahtar açık; geçiş öncesi yapılacak iş).** Aynı programı çalıştırdığı halde makine şimdilik C'den yavaş: `W03` C'nin 2,5 katı, `W04` 2,8 katı, `W09` 5,0 katı, `W14` 2,0 katı; toplam eski yolun 1,50 katı. Henüz profil alınmadı; olası nedenler: her yürütmede yeni `Vdbe`, işlevlerin adla çağrılması ve argüman kopyaları.
+
+**C'den yapı gereği farklı / yapılmayan.** Okuma adımı makineyi sonuna kadar çalıştırıp satırları tutuyor (satır satır adımlama henüz yok); sıralayıcının disk birleştirmesi ve geçici dosyaları yok; geçici B-ağaçları diske taşmıyor; UTF-8 dışı kodlamalar; `OP_AutoCommit` / `OP_Savepoint` ve tüm yazma kodları. Görülen eski motor farkları: `gorulen_farklar_m1.md`.
+
+## M2 — makine: satır satır adımlama, yazma programları, tetikleyici çerçeveleri, yabancı anahtar sayaçları (dal `performans-A-vdbe-makine`)
+
+**Taşınan** (ayrıntı `karar_esligi_m2.md`).
+- Adımlama ve ifade ömrü: makine bir satır döndürünce durur, imleçleri B-ağacının imleç listesine girer (`saveAllCursors`, `sqlite3BtreeTripAllCursors`); `sqlite3_reset`, yeniden bağlama, `sqlite3_interrupt`, ilerleme işleyicisi C'nin aralığında, `sqlite3_stmt_status`, şema değişince yeniden hazırlama (`SQLITE_SCHEMA`).
+- Yazma kodları gerçek tablolarda: `OP_Transaction` (yazma), `OP_OpenWrite`, `OP_NewRowid`, `OP_Insert`, `OP_Delete`, `OP_IdxInsert`, `OP_IdxDelete`, `OP_Clear`, `OP_ResetCount`, `OP_TypeCheck`, `OP_CursorLock` / `OP_CursorUnlock` (`BTCF_Pinned`); `sqlite3BtreeInsert` / `Delete` / `ClearTable`'ın imleç kısmı (`btcursor.rs`); `OP_Halt` hata eylemi motorun ifade / işlem geri alımına bağlı.
+- Tetikleyici alt programları: `OP_Program` (`VdbeFrame`, `pRt` yazmacında tutulan çerçeve, özyineleme belirteci, "triggers nested too deep"), `OP_Param`, çerçevede `OP_Halt` (`sqlite3VdbeFrameRestore`, `OE_Ignore`), çerçevede `OP_Once` / `OP_NewRowid` P3 / `OP_MemMax`, `closeAllCursors`'ın çerçeve sırası.
+- Yabancı anahtar: `OP_FkCounter`, `OP_FkIfZero`, `OP_FkCheck`, `nFkConstraint`, `nDeferredCons` / `nDeferredImmCons` (ifade geri alımında, `SAVEPOINT` / `ROLLBACK TO`'da saklanır / geri yüklenir, `COMMIT`'te ve otomatik işlem sonunda denetlenir).
+- M1 artıkları: `window.c`'nin yerleşik pencere işlevleri (`row_number` … `nth_value`), `zeroblob()` (`MEM_Zero`), okuma programlarında `OP_TypeCheck`; M1 hatası `OP_NoConflict` NULL alan atlaması düzeltildi.
+- Sınama kâhini: C sürücüsü hazırladığı programı kayıpsız döker (`progdump.rs` yükler); makine DML ifadelerini C'nin kendi programıyla çalıştırır. Üretici DML / tetikleyici / pencere kodlamadığı için yazma yolu yalnızca bu kâhin üzerinden çalışıyor; `SQLITERS_VDBE_EXEC=1` CLI'de yalnızca `SELECT`'i makineye götürüyor.
+
+**Kanıt.**
+
+| Ölçüm | Sonuç |
+| :--- | :--- |
+| DML farksalı (dmlgen 600 betik, H6 sc6/sc7/sc8 betikleri; ifadeler C'nin programıyla makinede) | 600 betikten 596'sı stdout + dosya baytı C ile aynı (eski yol 560); 4 fark motorun DDL iletisi (`no such table: main.t1`); sc6 138/145 (eski yol 134), sc7 75/75 (65), sc8 20/20 (15); makinede 66.700'den fazla ifade, geri düşme yalnız sanal tablo yazmaları (90) |
+| İşlem kodu izi (sürücüler üzerinden, ifade ifade) | dml_a 11.275 / 11.275, dml_b 23.605 / 23.605, sc8 12.805 / 12.805, sc6 21.054 / 21.099 (fark: sanal tablo yazmaları geri düşüyor) |
+| Önbellek karar izi | eski yol ile aynı ya da daha iyi; kalan farkların tamamına yakını sayfalayıcının tam geri alımı (C günlüğü önbelleğe geri oynatıyor, Rust önbelleği bırakıyor; `gorulen_farklar_m2.md` E11). `pb` olayları çıkarılınca dml_a 197/200, dml_b 398/400 |
+| C kapsamı (gcov) | `OP_Program` 17/18 dal, `OP_FkIfZero` 8/10, `OP_FkCheck` 2/2, `closeCursorsInFrame` 4/4, `closeAllCursors` 7/8; alınmayanlar: bellek yetmezliği, `PRAGMA defer_foreign_keys` (motor desteklemiyor) |
+| Çökme takımları | sürücü üzerinden (makine yazıyor) 120 A + 648 B kurtarma, 0 hata; CLI `crash_h1` 288 + 2.654, `crash_stmt` 84 + 432, 0 hata (anahtar açık) |
+| API farksalı (adımlama, sıfırlama, kesme, ilerleme, şema) | 624 / 624 |
+| Anahtar kapalı | testler 948 geçti (12 yeni), bilinen 4 başarısız, 337 yok sayıldı; dmlfuzz 377/400 (M1 ile aynı); ayrışma bulucu 241 / 245, başvurudan farklı 0; speedbench M1'e göre toplam 1,002x (geomean 1,002x; en büyük W10 1,023x, ölçüm gürültüsü düzeyinde), özetler eşit |
+| Anahtar açık, test paketi | 943 geçti, 9 başarısız: bilinen 4 + M1'in 3 bulgusu + 2 test C'de olmayan davranışı sınıyor (ifade başlamadan verilen `sqlite3_interrupt` C'de sonraki ifadeyi durdurmuyor: `test_group3_entry_gate_…` ve `group46_…`; değiştirilmedi, anahtar kapalıyken eski yol bu davranışı veriyor) |
+
+**Hız (anahtar açık; ayrı adım olarak önerildi).** C'ye göre: `W03` 2,05x, `W04` 2,56x, `W09` 4,80x, `W10` 2,33x, `W14` 1,99x (M1 makinesine göre W03 0,81x, W04 0,85x). Profil: W09'da süre motorun işlev kitaplığına adla yapılan çağrılarda (`find_scalar`, argüman vektörü, metin dönüşümleri, `LIKE`); W03'te zamanın %30'u her ifadede alınan POSIX kilidinde (`fcntl`).
+
+**C'den yapı gereği farklı / yapılmayan.** `BEGIN` / `COMMIT` / `SAVEPOINT` / DDL programları (`OP_AutoCommit`, `OP_Savepoint`, `OP_SetCookie`, `OP_Expire`, `OP_CreateBtree` …) motorda kalıyor; sanal tablo yazmaları, `xfer` (`OPFLAG_PREFORMAT`), güncelleme kancaları; sıralayıcının disk birleştirmesi, geçici B-ağacının diske taşması, UTF-16. Görülen eski motor farkları: `gorulen_farklar_m2.md`.
 
 ## Bu adımda görülen, eski motora ait C farkları (dokunulmadı)
 

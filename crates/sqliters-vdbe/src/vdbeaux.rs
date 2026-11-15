@@ -242,6 +242,16 @@ pub struct SubProgram {
     pub token: u64,
 }
 
+impl SubProgram {
+    /// A reference to a sub-program that contains the instruction naming it (a recursive
+    /// trigger: `Arc` cannot express the cycle). A stub has no instructions and
+    /// `n_mem == -1`; `n_csr` is the index of the sub-program in `Program.p_program`, `token`
+    /// its token. The machine runs `Program.p_program[n_csr]`.
+    pub fn is_stub(&self) -> bool {
+        self.a_op.is_empty() && self.n_mem == -1
+    }
+}
+
 /// `INT32_TO_64(a,b)`: combine two int32 values into an int64, least significant first.
 #[inline]
 pub fn int32_to_64(a: i32, b: i32) -> i64 {

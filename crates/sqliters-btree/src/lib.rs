@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod balance;
+pub mod btcursor;
 pub mod cursor;
 mod insert;
 mod integrity;
@@ -272,6 +273,9 @@ pub struct Btree {
     /// transaction (bit set, sized to the page count when the first one was freed). Such a
     /// page keeps its content when it is allocated again before the transaction ends.
     has_content: Option<(Pgno, Vec<u64>)>,
+    /// The cursors of suspended statements of the machine (`BtShared.pCursor`, see
+    /// `btcursor.rs`).
+    pub(crate) bcs: Vec<btcursor::BcSlot>,
     /// The page stacks of the C cursors of the running statement (see `pins.rs`).
     pub(crate) vcursors: Vec<pins::VCursor>,
     /// Start index in `vcursors` of each nested statement frame.
@@ -333,6 +337,7 @@ impl Btree {
     pub fn new(pager: Pager) -> Self {
         Self {
             pager,
+            bcs: Vec::new(),
             vcursors: Vec::new(),
             vc_frames: Vec::new(),
             schema_cache_size_set: false,

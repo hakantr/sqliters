@@ -747,6 +747,13 @@ impl ProgressTracker {
         });
     }
 
+    /// Adds `n` executed instructions of the machine to the tick counter (the handler is
+    /// called by the machine itself, at C's cadence).
+    #[inline]
+    pub(crate) fn add_ops(&mut self, n: u64) {
+        self.op_count = self.op_count.wrapping_add(n);
+    }
+
     /// Returns the cumulative count of logical progress ticks recorded on this tracker.
     #[inline]
     pub fn op_count(&self) -> u64 {
@@ -779,6 +786,21 @@ impl ProgressTracker {
             }
         }
         Ok(())
+    }
+
+    /// `db->nProgressOps` when a progress handler is installed, else 0 (the port of C's
+    /// virtual machine calls the handler at C's cadence itself).
+    #[inline]
+    pub fn interval(&self) -> u64 {
+        self.handler.as_ref().map_or(0, |h| u64::from(h.interval))
+    }
+
+    /// `db->xProgress(db->pProgressArg)`: `true` asks for an interrupt.
+    pub fn invoke(&mut self) -> Result<bool> {
+        match &mut self.handler {
+            Some(h) => catch_infallible_callback_panic("progress_handler", || (h.callback)()),
+            None => Ok(false),
+        }
     }
 
     /// Batch-records `ticks` logical steps when no progress handler is installed.
