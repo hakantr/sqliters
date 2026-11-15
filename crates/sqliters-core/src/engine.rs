@@ -3722,7 +3722,16 @@ fn execute_write_body_inner(
             exec_delete(ctx, del, params)
         }
         Stmt::CreateTable(ct) => {
+            let c_db = resolve_create_table_target(ctx.db_set, ct.temp, &ct.name).ok();
+            let c_exists = |ctx: &ExecContext<'_>| {
+                c_db.and_then(|d| ctx.db_set.slot(d)).is_some_and(|s| s.schema.find_user_table(&ct.name.name).is_some())
+            };
+            let c_existed = c_exists(ctx);
             exec_create_table(ctx, ct)?;
+            if !c_existed && c_exists(ctx) && let Some(d) = c_db {
+                // C: the new objects come from OP_ParseSchema, not from a schema load
+                ctx.db_set.c_note_created(d.index(), &ct.name.name);
+            }
             ctx.db_set.rebind_all_collations(ctx.collations);
             Ok(QueryOutput::default())
         }
@@ -19802,8 +19811,12 @@ fn check_strict_column_type(tbl_name: &str, col: &ColumnSchema, val: &Value) -> 
             extended::SQLITE_CONSTRAINT_DATATYPE,
             format!(
                 "cannot store {} value in {} column {}.{}",
-                val.storage_class().typeof_str().to_ascii_uppercase(),
-                col.type_name,
+                // C: vdbeMemTypeName() ("INT" for an integer), sqlite3StdType[eCType-1]
+                match val {
+                    Value::Integer(_) => "INT".to_owned(),
+                    _ => val.storage_class().typeof_str().to_ascii_uppercase(),
+                },
+                upper,
                 tbl_name,
                 col.name
             ),
@@ -32530,7 +32543,8 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
                 }
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    format!("no such table: {s}.{}", ci.table_name),
+                    // C: the TEMP index's table name is not schema-fixed (sqlite3FixSrcList, bTemp)
+                    format!("no such table: {}", ci.table_name),
                 ));
             }
         } else {
@@ -32558,7 +32572,12 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
             if !has_tbl {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    format!("no such table: {s}.{}", ci.table_name),
+                    // C: aDb[iDb].zDbSName of the fixed schema (sqlite3LocateTableItem)
+                    format!(
+                        "no such table: {}.{}",
+                        ctx.db_set.slot(resolved).map_or(s.as_str(), |sl| sl.name.as_str()),
+                        ci.table_name
+                    ),
                 ));
             }
         }
@@ -32588,7 +32607,8 @@ fn exec_create_index(ctx: &mut ExecContext<'_>, ci: &CreateIndexStmt) -> Result<
                 }
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    format!("no such table: {}", ci.table_name),
+                    // C: an unqualified index name is fixed to the main schema before the lookup
+                    format!("no such table: main.{}", ci.table_name),
                 ));
             }
         }
@@ -34034,6 +34054,7 @@ fn analyze_one_db(
         .db_set
         .slot(db_id)
         .is_some_and(|s| s.schema.find_user_table("sqlite_stat1").is_some());
+    ctx.db_set.c_note_analyzed(db_id.index());
     let stat1_tbl = ensure_stat1_table_and_clear(ctx, db_id, only_tbl, only_idx)?;
     if only_tbl != Some("sqlite_master") {
         let tables_to_analyze: Vec<TableSchema> = ctx
@@ -34143,6 +34164,7 @@ fn analyze_one_table(
                 enc,
                 false,
                 analysis_limit,
+                false,
             ) {
                 results.push((tbl.name.clone(), Some(tbl.name.clone()), stat_str));
             }
@@ -34169,6 +34191,11 @@ fn analyze_one_table(
             enc,
             idx.where_clause.is_some(),
             analysis_limit,
+            // nColTest==1 && nKeyCol==1 && IsUniqueIndex: one key column plus the rowid, or
+            // plus exactly one PRIMARY KEY column of a WITHOUT ROWID table
+            idx.unique
+                && idx.columns.len() == 1
+                && (!tbl.without_rowid || idx.trailing_pk_cols.len() == 1),
         ) {
             results.push((tbl.name.clone(), Some(idx.name.clone()), stat_str));
         }
@@ -34185,6 +34212,11 @@ fn analyze_one_table(
     Ok(results)
 }
 
+/// `unique_single`: C's `nColTest==1 && pIdx->nKeyCol==1 && IsUniqueIndex(pIdx)` (analyze.c:
+/// "for a single-column UNIQUE index, once we have found a non-NULL row, we know that all
+/// the rest will be distinct, so skip subsequent distinctness tests"): after the first
+/// non-NULL key every row counts as a new value, also the NULLs that follow the non-NULL keys
+/// of a DESC index.
 fn compute_index_stat1_string(
     entries: &[Vec<Value>],
     n_key_col: usize,
@@ -34192,6 +34224,7 @@ fn compute_index_stat1_string(
     enc: TextEncoding,
     is_partial: bool,
     analysis_limit: i32,
+    unique_single: bool,
 ) -> Option<String> {
     let n_rows = entries.len();
     if n_rows == 0 {
@@ -34211,13 +34244,23 @@ fn compute_index_stat1_string(
             key_orders,
             enc,
             analysis_limit as u64,
+            unique_single,
         ));
     }
 
     let mut distinct_counts = vec![1usize; n_key_col];
+    // C's regPrev(0) is non-NULL (it is only assigned when a change is seen)
+    let mut prev_non_null = unique_single
+        && entries[0].first().is_some_and(|v| !matches!(v, Value::Null));
     for pair in entries.windows(2) {
         let prev = &pair[0];
         let curr = &pair[1];
+        if prev_non_null {
+            for cnt in &mut distinct_counts[..n_key_col] {
+                *cnt += 1;
+            }
+            continue;
+        }
         let mut first_diff = None;
         for i in 0..n_key_col {
             let pv = prev.get(i).unwrap_or(&Value::Null);
@@ -34234,6 +34277,9 @@ fn compute_index_stat1_string(
         if let Some(diff_idx) = first_diff {
             for cnt in &mut distinct_counts[diff_idx..n_key_col] {
                 *cnt += 1;
+            }
+            if unique_single && diff_idx == 0 {
+                prev_non_null = curr.first().is_some_and(|v| !matches!(v, Value::Null));
             }
         }
     }
@@ -34267,8 +34313,10 @@ fn compute_index_stat1_string_limited(
     key_orders: &[KeySortOrder],
     enc: TextEncoding,
     limit: u64,
+    unique_single: bool,
 ) -> String {
     let n_total = entries.len();
+    let mut prev_non_null = false;
     let differs = |a: &[Value], b: &[Value], i: usize| -> bool {
         let av = a.get(i).unwrap_or(&Value::Null);
         let bv = b.get(i).unwrap_or(&Value::Null);
@@ -34286,12 +34334,21 @@ fn compute_index_stat1_string_limited(
     while pos < n_total {
         let cur = &entries[pos];
         if let Some(p) = prev {
-            let chng = (0..n_key_col)
-                .find(|&i| differs(&entries[p], cur, i))
-                .unwrap_or(n_key_col);
+            let chng = if prev_non_null {
+                0
+            } else {
+                (0..n_key_col)
+                    .find(|&i| differs(&entries[p], cur, i))
+                    .unwrap_or(n_key_col)
+            };
             for cnt in &mut distinct_lt[chng..] {
                 *cnt += 1;
             }
+            if unique_single && chng == 0 {
+                prev_non_null = cur.first().is_some_and(|v| !matches!(v, Value::Null));
+            }
+        } else if unique_single {
+            prev_non_null = cur.first().is_some_and(|v| !matches!(v, Value::Null));
         }
         n_row += 1;
         prev = Some(pos);
@@ -46078,7 +46135,8 @@ pub(crate) fn validate_and_infer_columns(
                         }
                         return Err(SqliteError::new(
                             ErrorCode::Error,
-                            format!("no such table: {s}.{}", ci.table_name),
+                            // C: the TEMP index's table name is not schema-fixed (sqlite3FixSrcList, bTemp)
+                            format!("no such table: {}", ci.table_name),
                         ));
                     }
                 } else {
@@ -46097,7 +46155,12 @@ pub(crate) fn validate_and_infer_columns(
                     if !has_tbl {
                         return Err(SqliteError::new(
                             ErrorCode::Error,
-                            format!("no such table: {s}.{}", ci.table_name),
+                            // C: aDb[iDb].zDbSName of the fixed schema (sqlite3LocateTableItem)
+                            format!(
+                                "no such table: {}.{}",
+                                db_set.slot(resolved).map_or(s.as_str(), |sl| sl.name.as_str()),
+                                ci.table_name
+                            ),
                         ));
                     }
                 }
@@ -46116,7 +46179,8 @@ pub(crate) fn validate_and_infer_columns(
                     None => {
                         return Err(SqliteError::new(
                             ErrorCode::Error,
-                            format!("no such table: {}", ci.table_name),
+                            // C: an unqualified index name is fixed to the main schema before the lookup
+                            format!("no such table: main.{}", ci.table_name),
                         ));
                     }
                 }

@@ -136,6 +136,13 @@ pub struct DbSlot {
     /// `unordered` / `noskipscan` / `sz=` state of an index): the port reports them as
     /// unsupported until C's schema is reset.
     pub c_stat_stale: std::collections::HashSet<String>,
+    /// Tables (lower case) created by a CREATE TABLE statement of this connection since C last
+    /// ran `sqlite3AnalysisLoad()` on this database: their indexes still carry the row
+    /// estimates `sqlite3CreateIndex()` gave them (`sqlite3DefaultRowEst()` with the key
+    /// column count of that moment - before `convertToWithoutRowidTable()` removed redundant
+    /// PRIMARY KEY columns), because the "set appropriate defaults on all indexes not in the
+    /// sqlite_stat1 table" pass has not seen them yet.
+    pub c_incremental: std::collections::HashSet<String>,
     /// Deferred page size requested via `PRAGMA [schema.]page_size = N` for next `VACUUM`.
     pub next_page_size: Option<u32>,
     /// Deferred auto-vacuum mode requested via `PRAGMA [schema.]auto_vacuum = M` for next `VACUUM`.
@@ -276,6 +283,8 @@ pub struct DatabaseSet {
     c_case_sensitive_like: bool,
     c_prepare_unloaded: bool,
     c_cookie_ahead: Option<usize>,
+    c_analyzed: Vec<usize>,
+    c_encoding_fixed: bool,
 }
 
 impl std::fmt::Debug for DatabaseSet {
@@ -312,6 +321,7 @@ impl DatabaseSet {
             c_stat_dirty: false,
             c_stat_seen: Default::default(),
             c_stat_stale: Default::default(),
+            c_incremental: Default::default(),
                 next_page_size: None,
                 next_auto_vacuum: None,
                 max_page_count: SQLITE_MAX_PAGE_COUNT,
@@ -329,6 +339,7 @@ impl DatabaseSet {
             c_stat_dirty: false,
             c_stat_seen: Default::default(),
             c_stat_stale: Default::default(),
+            c_incremental: Default::default(),
                 next_page_size: None,
                 next_auto_vacuum: None,
                 max_page_count: SQLITE_MAX_PAGE_COUNT,
@@ -364,6 +375,8 @@ impl DatabaseSet {
             c_case_sensitive_like: false,
             c_prepare_unloaded: false,
             c_cookie_ahead: None,
+            c_analyzed: Vec::new(),
+            c_encoding_fixed: false,
             xferopt_delta: std::sync::atomic::AtomicU64::new(0),
             open_blobs: std::collections::HashMap::new(),
             vtab_registry: crate::vtab::VTabRegistry::new(),
@@ -699,7 +712,15 @@ impl DatabaseSet {
     /// schema): record which tables and indexes have statistics now; the ones that had some
     /// before and have none now keep stale values in C.
     pub fn c_note_stats(&mut self, after_analyze: bool) {
-        for slot in &mut self.slots {
+        let analyzed = std::mem::take(&mut self.c_analyzed);
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if after_analyze && !analyzed.contains(&i) {
+                // OP_LoadAnalysis ran on the analyzed databases only
+                continue;
+            }
+            if after_analyze {
+                slot.c_incremental.clear();
+            }
             let mut cur = std::collections::HashSet::new();
             for t in &slot.schema.tables {
                 if t.stat1.has_stat1 {
@@ -725,10 +746,51 @@ impl DatabaseSet {
         }
     }
 
+    /// C's `DBFLAG_EncodingFixed`: set by the first `sqlite3InitCallback()` call of the
+    /// connection (the first `sqlite_schema` row it reads, at a schema load or after a CREATE
+    /// statement) and never cleared. While it is clear, `cmd ::= select` calls
+    /// `sqlite3ReadSchema()` before `sqlite3Select()`. Called when a prepare starts: a loaded
+    /// schema with at least one object means a row was read.
+    pub fn c_note_encoding_fixed(&mut self) {
+        if !self.c_encoding_fixed
+            && self.slots.iter().any(|s| {
+                s.schema.loaded
+                    && (!s.schema.tables.is_empty()
+                        || !s.schema.indexes.is_empty()
+                        || !s.schema.views.is_empty()
+                        || !s.schema.virtual_tables.is_empty()
+                        || !s.schema.triggers.is_empty())
+            })
+        {
+            self.c_encoding_fixed = true;
+        }
+    }
+
+    /// C's `DBFLAG_EncodingFixed` (see [`Self::c_note_encoding_fixed`]).
+    pub const fn c_encoding_fixed(&self) -> bool {
+        self.c_encoding_fixed
+    }
+
+    /// ANALYZE codes `OP_LoadAnalysis` for database `i_db` (`loadAnalysis()`).
+    pub fn c_note_analyzed(&mut self, i_db: usize) {
+        if !self.c_analyzed.contains(&i_db) {
+            self.c_analyzed.push(i_db);
+        }
+    }
+
+    /// A CREATE TABLE statement of this connection created `table` in database `i_db`.
+    pub fn c_note_created(&mut self, i_db: usize, table: &str) {
+        if let Some(slot) = self.slots.get_mut(i_db) {
+            slot.c_incremental.insert(table.to_ascii_lowercase());
+        }
+    }
+
     /// A statement writes `sqlite_stat1`.
-    pub fn c_mark_stat_dirty(&mut self) {
-        for slot in &mut self.slots {
-            slot.c_stat_dirty = true;
+    pub fn c_mark_stat_dirty(&mut self, i_db: Option<usize>) {
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if i_db.is_none_or(|d| d == i) {
+                slot.c_stat_dirty = true;
+            }
         }
     }
 
@@ -758,6 +820,7 @@ impl DatabaseSet {
                     slot.c_stat_dirty = false;
                     slot.c_stat_seen.clear();
                     slot.c_stat_stale.clear();
+                    slot.c_incremental.clear();
                 }
                 if i_db == 1 {
                     break;
@@ -778,6 +841,7 @@ impl DatabaseSet {
                 slot.c_stat_dirty = false;
                 slot.c_stat_seen.clear();
                 slot.c_stat_stale.clear();
+                slot.c_incremental.clear();
             }
         }
     }
@@ -793,6 +857,7 @@ impl DatabaseSet {
                 slot.c_stat_dirty = false;
                 slot.c_stat_seen.clear();
                 slot.c_stat_stale.clear();
+                slot.c_incremental.clear();
             }
             if i_db == 1 {
                 break;
@@ -1720,6 +1785,7 @@ impl DatabaseSet {
             c_stat_dirty: false,
             c_stat_seen: Default::default(),
             c_stat_stale: Default::default(),
+            c_incremental: Default::default(),
             next_page_size: None,
             next_auto_vacuum: None,
             max_page_count: SQLITE_MAX_PAGE_COUNT,

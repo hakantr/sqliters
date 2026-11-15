@@ -795,7 +795,10 @@ fn expr_dup(p: &mut Parse, e: ExprId, dup_flags: i32) -> ExprId {
             let l = sqlite3_expr_list_dup(p, old.x_list(), if old.op != TK_ORDER { dup_flags } else { 0 });
             p.em(id).x = l.0;
         }
-        // (EP_WinFunc: window functions are not ported in step V1)
+        if old.has(EP_WinFunc) {
+            let wn = crate::window::sqlite3_window_dup(p, id, old.y_win);
+            p.em(id).y_win = wn;
+        }
         if old.op == TK_SELECT_COLUMN {
             p.em(id).p_left = old.p_left;
         } else {
@@ -864,6 +867,10 @@ pub fn sqlite3_src_list_dup(p: &mut Parse, src: SrcListId, flags: i32) -> SrcLis
         }
         if it.is_tab_func {
             it.p_func_arg = sqlite3_expr_list_dup(p, old_item.p_func_arg, flags);
+        }
+        if it.is_cte && it.p_cte_use != 0 {
+            // pNewItem->u2.pCteUse->nUse++
+            p.a_cte_use[it.p_cte_use as usize - 1].n_use += 1;
         }
         if old_item.p_s_tab.nn() {
             p.a_tab[old_item.p_s_tab.ix()].n_tab_ref += 1;
@@ -1924,6 +1931,9 @@ pub fn sqlite3_expr_compare(p: &Parse, use_parse: bool, a: ExprId, b: ExprId, i_
             if pa.has(EP_WinFunc) != pb.has(EP_WinFunc) {
                 return 2;
             }
+            if pa.has(EP_WinFunc) && crate::window::sqlite3_window_compare(p, use_parse, pa.y_win, pb.y_win, true) != 0 {
+                return 2;
+            }
         } else if pa.op == TK_NULL {
             return 0;
         } else if pa.op == TK_COLLATE {
@@ -2250,9 +2260,53 @@ fn analyze_aggregate(p: &mut Parse, w: &mut Walker, e: ExprId) -> i32 {
             }
         }
         _ => {
-            // (expressions covered by an index on an expression: Parse.pIdxEpr is only set by
-            // where.c, which is not ported in step V1)
-            WRC_Continue
+            if (p.nc(nc).nc_flags & NC_InAggFunc) == 0 {
+                return WRC_Continue;
+            }
+            if p.p_idx_epr.is_empty() {
+                return WRC_Continue;
+            }
+            // (C walks the list from its head: the entry added last comes first)
+            let mut found: Option<IndexedExpr> = None;
+            for k in (0..p.p_idx_epr.len()).rev() {
+                let i_data_cur = p.p_idx_epr[k].i_data_cur;
+                if i_data_cur < 0 {
+                    continue;
+                }
+                if sqlite3_expr_compare(p, false, e, p.p_idx_epr[k].p_expr, i_data_cur) == 0 {
+                    found = Some(p.p_idx_epr[k].clone());
+                    break;
+                }
+            }
+            let Some(ie) = found else {
+                return WRC_Continue;
+            };
+            if !p.e(e).use_y_tab() {
+                return WRC_Continue;
+            }
+            if !p.src(src_list).a.iter().any(|it| it.i_cursor == ie.i_data_cur) {
+                return WRC_Continue;
+            }
+            if p.e(e).p_agg_info.nn() {
+                return WRC_Continue; // Resolved by outer context
+            }
+            if p.n_err != 0 {
+                return WRC_Abort;
+            }
+
+            // If we reach this point, it means that expression pExpr can be translated into a
+            // reference to an index column as described by pIEpr.
+            let tmp = p.new_expr(Expr { op: TK_AGG_COLUMN, i_table: ie.i_idx_cur, i_column: ie.i_idx_col as i16, ..Expr::default() });
+            find_or_create_agg_info_column(p, agg, tmp);
+            if p.n_err != 0 {
+                return WRC_Abort;
+            }
+            let i_agg = p.e(tmp).i_agg;
+            p.aggm(agg).a_col[i_agg as usize].p_c_expr = e;
+            let x = p.em(e);
+            x.p_agg_info = agg;
+            x.i_agg = i_agg;
+            WRC_Prune
         }
     }
 }

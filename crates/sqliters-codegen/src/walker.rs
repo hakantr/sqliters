@@ -32,10 +32,41 @@ pub fn sqlite3_walk_expr_nn(p: &mut Parse, w: &mut Walker, mut e: ExprId) -> i32
                 if l.nn() && sqlite3_walk_expr_list(p, w, l) != 0 {
                     return WRC_Abort;
                 }
-                // (EP_WinFunc: walkWindowList — window functions are not ported in step V1)
+                if p.e(e).has(EP_WinFunc) && walk_window_list(p, w, p.e(e).y_win, true) != 0 {
+                    return WRC_Abort;
+                }
             }
         }
         break;
+    }
+    WRC_Continue
+}
+
+/// `walkWindowList(pWalker, pList, bOneOnly)`: walk all expressions linked into the list of
+/// Window objects passed as the second argument.
+fn walk_window_list(p: &mut Parse, w: &mut Walker, list: WindowId, b_one_only: bool) -> i32 {
+    let mut win = list;
+    while win.nn() {
+        let x = p.a_win[win.ix()].clone();
+        if sqlite3_walk_expr_list(p, w, x.p_order_by) != 0 {
+            return WRC_Abort;
+        }
+        if sqlite3_walk_expr_list(p, w, x.p_partition) != 0 {
+            return WRC_Abort;
+        }
+        if sqlite3_walk_expr(p, w, x.p_filter) != 0 {
+            return WRC_Abort;
+        }
+        if sqlite3_walk_expr(p, w, x.p_start) != 0 {
+            return WRC_Abort;
+        }
+        if sqlite3_walk_expr(p, w, x.p_end) != 0 {
+            return WRC_Abort;
+        }
+        if b_one_only {
+            break;
+        }
+        win = x.p_next_win;
     }
     WRC_Continue
 }

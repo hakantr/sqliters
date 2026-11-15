@@ -458,7 +458,7 @@ fn is_distinct_redundant(p: &mut Parse, w: &WhereInfo, tab_list: SrcListId, wc: 
         if !p.idx(idx).is_unique() {
             continue;
         }
-        if p.idx(idx).p_part_idx_where.nn() || p.idx(idx).b_partial {
+        if p.idx(idx).p_part_idx_where.nn() {
             continue;
         }
         let n_key = p.idx(idx).n_key_col as usize;
@@ -3585,7 +3585,7 @@ fn where_short_cut(p: &mut Parse, w: &mut WhereInfo, b: &mut WhereLoopBuilder) -
         for idx in idxs {
             {
                 let ix = p.idx(idx);
-                if !ix.is_unique() || ix.p_part_idx_where.nn() || ix.b_partial || ix.n_key_col > 3 {
+                if !ix.is_unique() || ix.p_part_idx_where.nn() || ix.n_key_col > 3 {
                     continue;
                 }
             }
@@ -3819,9 +3819,7 @@ fn where_add_indexed_expr(p: &mut Parse, idx: IndexId, i_idx_cur: i32, tab_list:
         if j == XN_EXPR {
             e = p.l(p.idx(idx).a_col_expr).a[i].p_expr;
         } else if j >= 0 && (p.tab(tab).a_col[j as usize].col_flags & COLFLAG_VIRTUAL as u16) != 0 {
-            // pExpr = sqlite3ColumnExpr(pTab, &pTab->aCol[j])
-            p.not_supported("index on a VIRTUAL generated column");
-            return;
+            e = crate::build_tab::sqlite3_column_expr(p, tab, j as usize);
         } else {
             continue;
         }

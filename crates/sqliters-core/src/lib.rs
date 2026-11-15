@@ -6721,6 +6721,7 @@ impl Statement {
         let mut c_explain_of_rejected: Option<Arc<sqliters_vdbe::vdbeaux::Program>> = None;
         // C's schema-load state (DB_SchemaLoaded) when this prepare starts
         let c_unloaded = inner.db_set.c_any_schema_unloaded();
+        inner.db_set.c_note_encoding_fixed();
         inner.db_set.set_c_prepare_unloaded(c_unloaded);
         let (stmt_opt, tail) = match parse_one(sql) {
             Ok(x) => x,
@@ -6751,14 +6752,18 @@ impl Statement {
         // differ until the next ANALYZE.
         {
             let target = match &stmt_opt {
-                Some(Stmt::Insert(i)) => Some(i.table.name.as_str()),
-                Some(Stmt::Update(u)) => Some(u.table.name.as_str()),
-                Some(Stmt::Delete(d)) => Some(d.table.name.as_str()),
-                Some(Stmt::DropTable { name, .. }) => Some(name.name.as_str()),
+                Some(Stmt::Insert(i)) => Some(&i.table),
+                Some(Stmt::Update(u)) => Some(&u.table),
+                Some(Stmt::Delete(d)) => Some(&d.table),
+                Some(Stmt::DropTable { name, .. }) => Some(name),
                 _ => None,
             };
-            if target.is_some_and(|t| t.eq_ignore_ascii_case("sqlite_stat1")) {
-                inner.db_set.c_mark_stat_dirty();
+            if let Some(t) = target
+                && t.name.eq_ignore_ascii_case("sqlite_stat1")
+            {
+                // (the database whose sqlite_stat1 it is; every database if that is not known)
+                let i_db = inner.db_set.find_relation_in_set(t).ok().flatten().map(|(id, _)| id.index());
+                inner.db_set.c_mark_stat_dirty(i_db);
             }
         }
         let c_first_load = (needs_schema || matches!(stmt_opt, Some(Stmt::AttachDatabase { .. })))
@@ -13374,6 +13379,8 @@ mod c_align_h6b_tests;
 mod c_align_v1_tests;
 #[cfg(test)]
 mod c_align_v2_tests;
+#[cfg(test)]
+mod c_align_v3_tests;
 /// Regression tests for behaviour that has to match C SQLite 3.54.1 (step 5e): every expected
 /// value below is what the reference `sqlite3` produces for the same statements.
 #[cfg(test)]

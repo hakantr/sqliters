@@ -321,7 +321,9 @@ impl YyParser {
             1 => p.explain = 2,  // explain ::= EXPLAIN QUERY PLAN
             2 => {
                 // cmdx ::= cmd
-                if p.capture_select.is_none() {
+                // (sqlite3FinishCoding(): while the schema is loaded there is no program:
+                // "if( db->init.busy ){ pParse->rc = SQLITE_DONE; return; }")
+                if !p.db.init_busy {
                     sqlite3_finish_coding(p)
                 }
             }
@@ -352,7 +354,7 @@ impl YyParser {
                 let t = m!(0).tok;
                 sqlite3_savepoint(p, SAVEPOINT_ROLLBACK, &t);
             }
-            26 => m!(1).tok = Token::EMPTY, // typetoken ::=
+            26 | 65 => m!(1).tok = Token::EMPTY, // typetoken ::= ; conslist_opt ::=
             27 => {
                 // typetoken ::= typename LP signed RP
                 let end = m!(0).tok.z + m!(0).tok.n;
@@ -379,10 +381,15 @@ impl YyParser {
                 // cmd ::= select
                 let mut dest = SelectDest { e_dest: SRT_Output as u8, ..SelectDest::default() };
                 // if( (db->mDbFlags & DBFLAG_EncodingFixed)!=0 || sqlite3ReadSchema(pParse)==SQLITE_OK )
-                // (the engine's schema is always loaded)
+                // (sqlite3ReadSchema() cannot fail here; when it has a schema to load, the
+                // error offset of an error found while parsing is lost)
                 let s = sl!(0);
-                if p.capture_select.is_some() {
-                    p.capture_select = Some(s);
+                if !p.db.init_busy && !p.db.encoding_fixed {
+                    crate::schema::sqlite3_read_schema(p);
+                }
+                if p.db.init_busy {
+                    // (a schema row that is a bare SELECT: C would report a corrupt schema)
+                    p.error_msg("");
                 } else {
                     crate::treedump::v1_dump_select(p, "P", s);
                     sqlite3_select(p, s, &mut dest);
@@ -488,7 +495,7 @@ impl YyParser {
             }
             98 => m!(0).i = SF_Distinct as i32, // distinct ::= DISTINCT
             99 => m!(0).i = SF_All as i32,      // distinct ::= ALL
-            100 | 246 => m!(1).i = 0,           // distinct ::= ; collate ::=
+            15 | 18 | 47 | 62 | 72 | 81 | 100 | 246 => m!(1).i = 0, // ifnotexists ::= ; temp ::= ; autoinc ::= ; init_deferred_pred_opt ::= ; defer_subclause_opt ::= ; ifexists ::= ; distinct ::= ; collate ::=
             101 | 134 | 144 | 234 | 237 | 242 => m!(1).id = 0, // sclp ::= ; orderby_opt ::= ; groupby_opt ::= ; exprlist ::= ; paren_exprlist ::= ; eidlist_opt ::=
             102 => {
                 // selcollist ::= sclp scanpt expr scanpt as
@@ -816,15 +823,27 @@ impl YyParser {
                 let t = m!(-3).tok;
                 m!(-3).id = sqlite3_expr_function(p, ExprListId::NULL, &t, 0).0;
             }
-            192..=194 => {
-                // function call with filter_over
-                p.not_supported("window function / FILTER clause");
-                let k = match yyruleno {
-                    192 => -5,
-                    193 => -8,
-                    _ => -4,
-                };
-                m!(k).id = 0;
+            192 => {
+                // expr ::= ID|INDEXED|JOIN_KW LP distinct exprlist RP filter_over
+                let t = m!(-5).tok;
+                let e = sqlite3_expr_function(p, el!(-2), &t, m!(-3).i);
+                crate::window::sqlite3_window_attach(p, e, WindowId(m!(0).id));
+                m!(-5).id = e.0;
+            }
+            193 => {
+                // expr ::= ID|INDEXED|JOIN_KW LP distinct exprlist ORDER BY sortlist RP filter_over
+                let t = m!(-8).tok;
+                let e = sqlite3_expr_function(p, el!(-5), &t, m!(-6).i);
+                crate::window::sqlite3_window_attach(p, e, WindowId(m!(0).id));
+                sqlite3_expr_add_function_order_by(p, e, el!(-2));
+                m!(-8).id = e.0;
+            }
+            194 => {
+                // expr ::= ID|INDEXED|JOIN_KW LP STAR RP filter_over
+                let t = m!(-4).tok;
+                let e = sqlite3_expr_function(p, ExprListId::NULL, &t, 0);
+                crate::window::sqlite3_window_attach(p, e, WindowId(m!(0).id));
+                m!(-4).id = e.0;
             }
             195 => {
                 // term ::= CTIME_KW
@@ -926,7 +945,7 @@ impl YyParser {
                 m!(-2).id = sqlite3_expr_function(p, p_list, &t, 0).0;
             }
             218 | 221 => m!(0).i = 0,        // between_op ::= BETWEEN ; in_op ::= IN
-            219 | 222 | 247 => m!(-1).i = 1, // between_op ::= NOT BETWEEN ; in_op ::= NOT IN ; collate ::= COLLATE ID|STRING
+            63 | 80 | 219 | 222 | 247 => m!(-1).i = 1, // init_deferred_pred_opt ::= INITIALLY DEFERRED ; ifexists ::= IF EXISTS ; between_op ::= NOT BETWEEN ; in_op ::= NOT IN ; collate ::= COLLATE ID|STRING
             220 => {
                 // expr ::= expr between_op expr AND expr
                 let mut p_list = sqlite3_expr_list_append(p, ExprListId::NULL, ex!(-2));
@@ -1082,7 +1101,7 @@ impl YyParser {
                 m!(-5).id = e.0;
             }
             280 => m!(0).i = OE_Rollback, // raisetype ::= ROLLBACK
-            281 => m!(0).i = OE_Abort,    // raisetype ::= ABORT
+            240 | 281 => m!(0).i = OE_Abort, // uniqueflag ::= UNIQUE ; raisetype ::= ABORT
             282 => m!(0).i = OE_Fail,     // raisetype ::= FAIL
             309 | 310 => {
                 // with ::= WITH wqlist ; with ::= WITH RECURSIVE wqlist   (DML prefix)
@@ -1126,9 +1145,27 @@ impl YyParser {
                 let t = m!(-2).tok;
                 m!(-2).id = parser_add_expr_id_list_term(p, ExprListId::NULL, &t, m!(-1).i, m!(0).i).0;
             }
-            318..=346 => {
-                // window definitions, frame specifications, OVER and FILTER clauses
+            343 => {
+                // filter_over ::= filter_clause
+                p.a_win.push(Window { e_frm_type: TK_FILTER as u8, p_filter: ex!(0), ..Window::default() });
+                m!(0).id = (p.a_win.len() - 1) as u32;
+            }
+            346 => {
+                // filter_clause ::= FILTER LP WHERE expr RP
+                m!(-4).id = m!(-1).id;
+            }
+            318..=342 | 344 | 345 => {
+                // window definitions, frame specifications and OVER clauses
                 p.not_supported("window function");
+                let k = match yyruleno {
+                    341 => -1,
+                    344 => -3,
+                    345 => -1,
+                    _ => 1,
+                };
+                if k <= 0 {
+                    m!(k).id = 0;
+                }
             }
             347 => {
                 // term ::= QNUMBER
@@ -1137,6 +1174,229 @@ impl YyParser {
                 sqlite3_dequote_number(p, e);
                 m!(0).id = e.0;
             }
+            13 => {
+                // create_table ::= createkw temp TABLE ifnotexists nm dbnm
+                let (n1, n2, temp, noerr) = (m!(-1).tok, m!(0).tok, m!(-4).i, m!(-2).i);
+                crate::build_tab::sqlite3_start_table(p, &n1, &n2, temp != 0, false, false, noerr != 0);
+            }
+            14 => {} // createkw ::= CREATE   (disableLookaside)
+            16 => m!(-2).i = 1, // ifnotexists ::= IF NOT EXISTS
+            17 => m!(0).i = (!p.db.init_busy) as i32, // temp ::= TEMP
+            19 => {
+                // create_table_args ::= LP columnlist conslist_opt RP table_option_set
+                let opts = m!(0).i as u32;
+                crate::build_tab::sqlite3_end_table(p, true, opts, SelectId::NULL);
+            }
+            20 => {
+                // create_table_args ::= AS select
+                let s = sl!(0);
+                if p.db.init_busy {
+                    crate::build_tab::sqlite3_end_table(p, false, 0, s);
+                } else {
+                    p.not_supported("statement kind (grammar rule not ported)");
+                }
+            }
+            21 => m!(1).i = 0, // table_option_set ::=
+            22 => {
+                // table_option_set ::= table_option_set COMMA table_option
+                let v = m!(-2).i | m!(0).i;
+                m!(-2).i = v;
+            }
+            23 => {
+                // table_option ::= WITHOUT nm
+                let t = m!(0).tok;
+                if p.tok_str(&t).eq_ignore_ascii_case("rowid") {
+                    m!(-1).i = (TF_WithoutRowid | TF_NoVisibleRowid) as i32;
+                } else {
+                    m!(-1).i = 0;
+                    let msg = format!("unknown table option: {}", p.tok_str(&t));
+                    p.error_msg(msg);
+                }
+            }
+            24 => {
+                // table_option ::= nm
+                let t = m!(0).tok;
+                if p.tok_str(&t).eq_ignore_ascii_case("strict") {
+                    m!(0).i = TF_Strict as i32;
+                } else {
+                    m!(0).i = 0;
+                    let msg = format!("unknown table option: {}", p.tok_str(&t));
+                    p.error_msg(msg);
+                }
+            }
+            25 => {
+                // columnname ::= nm typetoken
+                let (n, t) = (m!(-1).tok, m!(0).tok);
+                crate::build_tab::sqlite3_add_column(p, n, t);
+            }
+            32 | 67 => p.cr_constraint_name = m!(0).tok, // ccons ::= CONSTRAINT nm ; tcons ::= CONSTRAINT nm
+            33 => {
+                // ccons ::= DEFAULT scantok term
+                let (e, t) = (ex!(0), m!(-1).tok);
+                crate::build_tab::sqlite3_add_default_value(p, e, t.z as usize, (t.z + t.n) as usize);
+            }
+            34 => {
+                // ccons ::= DEFAULT LP expr RP
+                let (e, lp, rp) = (ex!(-1), m!(-2).tok, m!(0).tok);
+                crate::build_tab::sqlite3_add_default_value(p, e, lp.z as usize + 1, rp.z as usize);
+            }
+            35 => {
+                // ccons ::= DEFAULT PLUS scantok term
+                let (e, plus, t) = (ex!(0), m!(-2).tok, m!(-1).tok);
+                crate::build_tab::sqlite3_add_default_value(p, e, plus.z as usize, (t.z + t.n) as usize);
+            }
+            36 => {
+                // ccons ::= DEFAULT MINUS scantok term
+                let (e, minus, t) = (ex!(0), m!(-2).tok, m!(-1).tok);
+                let e = sqlite3_p_expr(p, TK_UMINUS, e, ExprId::NULL);
+                crate::build_tab::sqlite3_add_default_value(p, e, minus.z as usize, (t.z + t.n) as usize);
+            }
+            37 => {
+                // ccons ::= DEFAULT scantok ID|INDEXED
+                let t = m!(0).tok;
+                let e = token_expr(p, TK_STRING, t);
+                if e.nn() {
+                    sqlite3_expr_id_to_true_false(p, e);
+                }
+                crate::build_tab::sqlite3_add_default_value(p, e, t.z as usize, (t.z + t.n) as usize);
+            }
+            38 => {
+                // ccons ::= NOT NULL onconf
+                let oe = m!(0).i;
+                crate::build_tab::sqlite3_add_not_null(p, oe);
+            }
+            39 => {
+                // ccons ::= PRIMARY KEY sortorder onconf autoinc
+                let (oe, ai, so) = (m!(-1).i, m!(0).i, m!(-2).i);
+                crate::build_tab::sqlite3_add_primary_key(p, ExprListId::NULL, oe, ai, so);
+            }
+            40 => {
+                // ccons ::= UNIQUE onconf
+                let oe = m!(0).i;
+                crate::build_tab::sqlite3_create_index(p, None, None, SrcListId::NULL, ExprListId::NULL, oe, None, ExprId::NULL, 0, false, SQLITE_IDXTYPE_UNIQUE as u8);
+            }
+            41 => {
+                // ccons ::= CHECK LP expr RP
+                let (e, lp, rp) = (ex!(-1), m!(-2).tok, m!(0).tok);
+                crate::build_tab::sqlite3_add_check_constraint(p, e, lp.z as usize, rp.z as usize);
+            }
+            42 => {
+                // ccons ::= REFERENCES nm eidlist_opt refargs
+                let (to, cols, flags) = (m!(-2).tok, el!(-1), m!(0).i);
+                crate::build_tab::sqlite3_create_foreign_key(p, ExprListId::NULL, &to, cols, flags);
+            }
+            43 => {
+                // ccons ::= defer_subclause
+                let d = m!(0).i;
+                crate::build_tab::sqlite3_defer_foreign_key(p, d);
+            }
+            44 => {
+                // ccons ::= COLLATE ID|STRING
+                let t = m!(0).tok;
+                crate::build_tab::sqlite3_add_collate_type(p, &t);
+            }
+            45 => {
+                // generated ::= LP expr RP
+                let e = ex!(-1);
+                crate::build_tab::sqlite3_add_generated(p, e, None);
+            }
+            46 => {
+                // generated ::= LP expr RP ID
+                let (e, t) = (ex!(-2), m!(0).tok);
+                crate::build_tab::sqlite3_add_generated(p, e, Some(&t));
+            }
+            48 => m!(0).i = 1, // autoinc ::= AUTOINCR
+            49 => m!(1).i = OE_None * 0x0101, // refargs ::=
+            50 => {
+                // refargs ::= refargs refarg   (refarg: value in `i`, mask in `id`)
+                let (value, mask) = (m!(0).i, m!(0).id as i32);
+                let v = (m!(-1).i & !mask) | value;
+                m!(-1).i = v;
+            }
+            51 => {
+                // refarg ::= MATCH nm
+                m!(-1).i = 0;
+                m!(-1).id = 0;
+            }
+            52 => {
+                // refarg ::= ON INSERT refact
+                m!(-2).i = 0;
+                m!(-2).id = 0;
+            }
+            53 => {
+                // refarg ::= ON DELETE refact
+                let v = m!(0).i;
+                m!(-2).i = v;
+                m!(-2).id = 0x0000ff;
+            }
+            54 => {
+                // refarg ::= ON UPDATE refact
+                let v = m!(0).i << 8;
+                m!(-2).i = v;
+                m!(-2).id = 0x00ff00;
+            }
+            55 => m!(-1).i = OE_SetNull,  // refact ::= SET NULL
+            56 => m!(-1).i = OE_SetDflt,  // refact ::= SET DEFAULT
+            57 => m!(0).i = OE_Cascade,   // refact ::= CASCADE
+            58 => m!(0).i = OE_Restrict,  // refact ::= RESTRICT
+            59 => m!(-1).i = OE_None,     // refact ::= NO ACTION
+            60 => m!(-2).i = 0,           // defer_subclause ::= NOT DEFERRABLE init_deferred_pred_opt
+            61 => {
+                // defer_subclause ::= DEFERRABLE init_deferred_pred_opt
+                let v = m!(0).i;
+                m!(-1).i = v;
+            }
+            64 => m!(-1).i = 0, // init_deferred_pred_opt ::= INITIALLY IMMEDIATE
+            66 => p.cr_constraint_name = Token::EMPTY, // tconscomma ::= COMMA
+            68 => {
+                // tcons ::= PRIMARY KEY LP sortlist autoinc RP onconf
+                let (list, oe, ai) = (el!(-3), m!(0).i, m!(-2).i);
+                crate::build_tab::sqlite3_add_primary_key(p, list, oe, ai, 0);
+            }
+            69 => {
+                // tcons ::= UNIQUE LP sortlist RP onconf
+                let (list, oe) = (el!(-2), m!(0).i);
+                crate::build_tab::sqlite3_create_index(p, None, None, SrcListId::NULL, list, oe, None, ExprId::NULL, 0, false, SQLITE_IDXTYPE_UNIQUE as u8);
+            }
+            70 => {
+                // tcons ::= CHECK LP expr RP onconf
+                let (e, lp, rp) = (ex!(-2), m!(-3).tok, m!(-1).tok);
+                crate::build_tab::sqlite3_add_check_constraint(p, e, lp.z as usize, rp.z as usize);
+            }
+            71 => {
+                // tcons ::= FOREIGN KEY LP eidlist RP REFERENCES nm eidlist_opt refargs defer_subclause_opt
+                let (from, to, cols, flags, d) = (el!(-6), m!(-3).tok, el!(-2), m!(-1).i, m!(0).i);
+                crate::build_tab::sqlite3_create_foreign_key(p, from, &to, cols, flags);
+                crate::build_tab::sqlite3_defer_foreign_key(p, d);
+            }
+            73 | 75 => m!(1).i = OE_Default, // onconf ::= ; orconf ::=
+            74 => {
+                // onconf ::= ON CONFLICT resolvetype
+                let v = m!(0).i;
+                m!(-2).i = v;
+            }
+            77 => m!(0).i = OE_Ignore,  // resolvetype ::= IGNORE
+            78 => m!(0).i = OE_Replace, // resolvetype ::= REPLACE
+            82 => {
+                // cmd ::= createkw temp VIEW ifnotexists nm dbnm eidlist_opt AS select
+                let (n1, n2, cols, s, temp, noerr) = (m!(-4).tok, m!(-3).tok, el!(-2), sl!(0), m!(-7).i, m!(-5).i);
+                if p.db.init_busy {
+                    crate::build_tab::sqlite3_create_view(p, &n1, &n2, cols, s, temp != 0, noerr != 0);
+                } else {
+                    p.not_supported("statement kind (grammar rule not ported)");
+                }
+            }
+            239 => {
+                // cmd ::= createkw uniqueflag INDEX ifnotexists nm dbnm ON nm LP sortlist RP where_opt
+                let (n1, n2, tbl, list, oe, start, wh, noerr) = (m!(-7).tok, m!(-6).tok, m!(-4).tok, el!(-2), m!(-10).i, m!(-11).tok, ex!(0), m!(-8).i);
+                if p.db.init_busy {
+                    let src = sqlite3_src_list_append(p, SrcListId::NULL, Some(&tbl), None);
+                    crate::build_tab::sqlite3_create_index(p, Some(&n1), Some(&n2), src, list, oe, Some(&start), wh, SQLITE_SO_ASC, noerr != 0, SQLITE_IDXTYPE_APPDEF as u8);
+                } else {
+                    p.not_supported("statement kind (grammar rule not ported)");
+                }
+            }
+            241 => m!(1).i = OE_None, // uniqueflag ::=
             n if (n as i32) < YYNRULE_WITH_ACTION => {
                 // A rule with an action in parse.y that step V1 does not port: CREATE / DROP /
                 // ALTER, INSERT / UPDATE / DELETE, triggers, PRAGMA, VACUUM, ATTACH, ANALYZE,

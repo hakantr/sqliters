@@ -350,7 +350,7 @@ pub fn sqlite3_find_in_index(
                     }
                     let (n_column, n_key_col, partial, unique) = {
                         let ix = p.idx(idx);
-                        (ix.n_column as i32, ix.n_key_col as i32, ix.p_part_idx_where.nn() || ix.b_partial, ix.is_unique())
+                        (ix.n_column as i32, ix.n_key_col as i32, ix.p_part_idx_where.nn(), ix.is_unique())
                     };
                     if n_column < n_expr {
                         continue;
@@ -1155,17 +1155,43 @@ pub fn sqlite3_expr_code_load_index_column(p: &mut Parse, idx: IndexId, i_tab_cu
 /// table) then the value might have been stored as an integer. In that case, add an
 /// OP_RealAffinity opcode to make sure it has been converted into REAL.
 pub fn sqlite3_column_default(p: &mut Parse, tab: TableId, i: i32, i_reg: i32) {
-    let (has_dflt, dflt, aff) = {
+    let (has_dflt, aff) = {
         let c = &p.tab(tab).a_col[i as usize];
-        (c.i_dflt != 0, c.dflt_value.clone(), c.affinity)
+        (c.i_dflt != 0, c.affinity)
     };
-    if has_dflt
-        && let Some(v) = dflt
-    {
-        p.v.append_p4(P4::Mem(v));
+    if has_dflt {
+        // sqlite3ValueFromExpr(db, sqlite3ColumnExpr(pTab,pCol), enc, pCol->affinity, &pValue)
+        let x = crate::build_tab::sqlite3_column_expr(p, tab, i as usize);
+        if let Some(v) = crate::build_tab::sqlite3_value_from_expr(p, x, aff) {
+            p.v.append_p4(P4::Mem(v));
+        }
     }
     if aff == SQLITE_AFF_REAL {
         p.v.add_op1(OP_RealAffinity, i_reg);
+    }
+}
+
+/// `sqlite3ExprCodeGeneratedColumn(pParse, pTab, pCol, regOut)`: generate code that will
+/// compute the value of generated column pCol and store the result in register regOut.
+pub fn sqlite3_expr_code_generated_column(p: &mut Parse, tab: TableId, i_col: usize, reg_out: i32) {
+    let n_err = p.n_err;
+    let i_addr = if p.i_self_tab > 0 { p.v.add_op3(OP_IfNullRow, p.i_self_tab - 1, 0, reg_out) } else { 0 };
+    let x = crate::build_tab::sqlite3_column_expr(p, tab, i_col);
+    sqlite3_expr_code_copy(p, x, reg_out);
+    let (col_flags, aff) = (p.tab(tab).a_col[i_col].col_flags, p.tab(tab).a_col[i_col].affinity);
+    if (col_flags & COLFLAG_VIRTUAL as u16) != 0 && (p.tab(tab).tab_flags & TF_Strict) != 0 {
+        let p3 = 2 + i_col as i32;
+        let p4 = crate::schema::p4_table_of(p, tab);
+        p.v.add_op4(OP_TypeCheck, reg_out, 1, p3, p4);
+    } else if aff >= SQLITE_AFF_TEXT {
+        const Z_AFF: [&str; 5] = ["B", "C", "D", "E", "F"];
+        p.v.add_op4(OP_Affinity, reg_out, 1, 0, P4::Static(Z_AFF[(aff - b'B') as usize]));
+    }
+    if i_addr != 0 {
+        p.v.jump_here(i_addr);
+    }
+    if p.n_err > n_err {
+        p.err_byte_offset = -1;
     }
 }
 
@@ -1180,8 +1206,17 @@ pub fn sqlite3_expr_code_get_column_of_table(p: &mut Parse, tab: TableId, i_tab_
             p.v.add_op3(OP_VColumn, i_tab_cur, i_col, reg_out);
             return;
         } else if p.tab(tab).a_col[i_col as usize].col_flags & COLFLAG_VIRTUAL as u16 != 0 {
-            // sqlite3ExprCodeGeneratedColumn(): needs the AS expression of the column
-            p.not_supported("VIRTUAL generated column");
+            if p.tab(tab).a_col[i_col as usize].col_flags & COLFLAG_BUSY as u16 != 0 {
+                let msg = format!("generated column loop on \"{}\"", p.tab(tab).a_col[i_col as usize].z_cn_name);
+                p.error_msg(msg);
+            } else {
+                let saved_self_tab = p.i_self_tab;
+                p.tabm(tab).a_col[i_col as usize].col_flags |= COLFLAG_BUSY as u16;
+                p.i_self_tab = i_tab_cur + 1;
+                sqlite3_expr_code_generated_column(p, tab, i_col as usize, reg_out);
+                p.i_self_tab = saved_self_tab;
+                p.tabm(tab).a_col[i_col as usize].col_flags &= !(COLFLAG_BUSY as u16);
+            }
             return;
         } else if !p.tab(tab).has_rowid() {
             let pk = crate::schema::sqlite3_primary_key_index(p, tab);
